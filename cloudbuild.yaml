@@ -58,7 +58,10 @@ steps:
         set -euo pipefail
         curl -fsSL -o /tmp/packer.zip \
           "https://releases.hashicorp.com/packer/${_PACKER_VERSION}/packer_${_PACKER_VERSION}_linux_amd64.zip"
-        unzip -q -o /tmp/packer.zip -d /usr/local/bin
+        # python3, not unzip: the gcloud builder ships no unzip, and apt-getting
+        # one on every image build is a network dependency for nothing.
+        python3 -c "import zipfile;zipfile.ZipFile('/tmp/packer.zip').extractall('/usr/local/bin')"
+        chmod +x /usr/local/bin/packer
         cd packer
         packer init ci-host-image.pkr.hcl
         packer build \
