@@ -229,8 +229,11 @@ resource "google_compute_region_autoscaler" "hosts" {
     mode = "ONLY_UP"
 
     metric {
-      name   = "${var.metric_prefix}/ci_demand"
-      type   = "GAUGE"
+      name = "${var.metric_prefix}/ci_demand"
+      # No `type`: it maps to utilizationTargetType, which the API rejects
+      # outright alongside single_instance_assignment ("can't be set when
+      # single_instance_assignment is used") — the autoscaler create fails and
+      # the pool is left with a MIG and no scaling policy.
       filter = "resource.type = \"generic_node\" AND metric.labels.repo = \"${local.repo_full}\" AND metric.labels.pool = \"${var.name}\""
 
       # Demand is counted in JOBS; a host serves `slots_per_host` of them.
