@@ -80,12 +80,30 @@ expect drain "floor 0: the last idle host IS drained — scale-to-zero survives"
   RUNNING 0 1200 900 1 0 present
 
 # --- never-registered host (the reachable hazard in the old fleet) ------------
-expect drain "host that never registered is drained at once, not after grace" \
-  RUNNING 0 5 900 3 0 absent
+# "absent" is what a DEAD host reads — and equally what a healthy host reads for
+# the minutes it spends fetching a registration token and running config.sh per
+# slot. Telling them apart is the host's AGE, argument 8, measured against the
+# register grace in argument 9.
+expect drain "host that never registered is drained without waiting the idle grace" \
+  RUNNING 0 5 900 3 0 absent 900 600
+expect keep "…but a host still inside the register grace is BOOTING, not dead" \
+  RUNNING 0 5 900 3 0 absent 120 600
+expect drain "…and is drained once that window passes" \
+  RUNNING 0 5 900 3 0 absent 601 600
 expect keep "…but not below the floor" \
-  RUNNING 0 5 900 1 1 absent
+  RUNNING 0 5 900 1 1 absent 900 600
 expect keep "…and not while GitHub is unreachable" \
-  RUNNING 0 5 900 3 0 unknown
+  RUNNING 0 5 900 3 0 unknown 900 600
+# The regression this rule exists for: DataRetrival 2026-08-13T19:00-19:06Z shot
+# six freshly-created hosts as never-registered, one of them one second after it
+# picked up a job. With a register grace none of those verdicts is reachable.
+expect keep "a 44s-old host is never drainable as never-registered" \
+  RUNNING 0 0 900 3 0 absent 44 600
+# A caller that forgets the new arguments must not silently drain young hosts:
+# with no grace passed, absent still means dead, which is the OLD behaviour and
+# is why the controller passes both explicitly.
+expect drain "no age/grace supplied falls back to the pre-grace rule" \
+  RUNNING 0 5 900 3 0 absent
 
 # --- partial registration ------------------------------------------------------
 expect keep "partial registration with work in flight is left alone" \

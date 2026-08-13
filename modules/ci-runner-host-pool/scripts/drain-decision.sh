@@ -27,7 +27,8 @@
 # Tenancy-agnostic — no customer literals, no project/repo knowledge.
 
 # drain_decision <instance_status> <busy_slots> <idle_seconds> <grace_seconds> \
-#                <pool_size> <min_hosts> <registration_state>
+#                <pool_size> <min_hosts> <registration_state> \
+#                [age_seconds] [register_grace_seconds]
 #
 #   instance_status     : GCE instanceStatus (RUNNING, TERMINATED, ...).
 #   busy_slots          : how many of this host's K runner agents are executing
@@ -46,6 +47,13 @@
 #                           partial  = some agents registered, some missing
 #                           absent   = no agents registered at all
 #                           unknown  = could not be determined (API/token failure)
+#   age_seconds         : how long the controller has known this host. A host
+#                         boots, installs nothing (golden image) but still has
+#                         to fetch a registration token and config K agents, so
+#                         it reads absent for MINUTES while being perfectly
+#                         healthy. Default 0 keeps old callers honest: with no
+#                         age they get the pre-boot-grace behaviour.
+#   register_grace_seconds : how long absent is allowed to mean "still booting".
 #
 # Echoes "drain:<reason>" or "keep:<reason>". Always exits 0 -- the verdict is
 # the output, not the status, so a `set -e` caller cannot be tripped by a keep.
@@ -57,6 +65,8 @@ drain_decision() {
   local pool="${5:-0}"
   local floor="${6:-0}"
   local reg="${7:-unknown}"
+  local age="${8:-0}"
+  local reg_grace="${9:-0}"
 
   # 1. A host in a terminal power state can hold no job. Delete unconditionally.
   #    This is the path that reclaims a host that crashed or was stopped out of
@@ -98,10 +108,27 @@ drain_decision() {
 
   # 5. A host with NO agents registered never joined the pool (failed boot,
   #    bad token, image regression). It cannot receive work and it cannot
-  #    self-heal, so it is drained immediately rather than after the grace
-  #    window -- waiting only bills for a host that will never be useful.
+  #    self-heal, so it is drained rather than kept for the idle grace window --
+  #    waiting only bills for a host that will never be useful.
+  #
+  #    But "absent" is ALSO what a perfectly healthy host reads while it is
+  #    still booting: it fetches a registration token and runs config.sh K
+  #    times before the first agent appears. Draining on that read is not a
+  #    slow scale-in, it is a churn loop that never lets the pool reach usable
+  #    capacity -- and it is fatal, not merely wasteful, at the moment the
+  #    agents come up between the verdict and the delete: the host takes jobs
+  #    and is then deleted under them. Observed on the DataRetrival pool
+  #    2026-08-13T19:00-19:06Z: six hosts created and shot as never-registered
+  #    in six minutes, one of them (wz1f) one second after it picked up a job,
+  #    which died with "The runner has received a shutdown signal".
+  #
+  #    So absent only means dead once the host has had time to register.
   if [ "$reg" = "absent" ]; then
-    echo "drain:never-registered"
+    if [ "$age" -lt "$reg_grace" ]; then
+      echo "keep:booting age=${age}s<${reg_grace}s reg=absent"
+      return 0
+    fi
+    echo "drain:never-registered age=${age}s>=${reg_grace}s"
     return 0
   fi
 

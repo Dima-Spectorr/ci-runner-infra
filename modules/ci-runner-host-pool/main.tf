@@ -324,15 +324,16 @@ resource "google_compute_instance" "controller" {
     # The same key the hosts read. Demand is counted by GitHub's superset rule
     # against THIS list, so a controller without it matches no job at all,
     # reports zero demand forever, and the pool never leaves zero hosts.
-    "ci-runner-labels"       = local.runner_labels
-    "ci-mig-name"            = google_compute_region_instance_group_manager.hosts.name
-    "ci-region"              = var.region
-    "ci-slots"               = tostring(var.slots_per_host)
-    "ci-min-hosts"           = tostring(var.min_hosts)
-    "ci-max-hosts"           = tostring(var.max_hosts)
-    "ci-drain-grace-seconds" = tostring(var.drain_grace_seconds)
-    "ci-poll-seconds"        = tostring(var.poll_interval_seconds)
-    "ci-metric-prefix"       = var.metric_prefix
+    "ci-runner-labels"          = local.runner_labels
+    "ci-mig-name"               = google_compute_region_instance_group_manager.hosts.name
+    "ci-region"                 = var.region
+    "ci-slots"                  = tostring(var.slots_per_host)
+    "ci-min-hosts"              = tostring(var.min_hosts)
+    "ci-max-hosts"              = tostring(var.max_hosts)
+    "ci-drain-grace-seconds"    = tostring(var.drain_grace_seconds)
+    "ci-register-grace-seconds" = tostring(var.register_grace_seconds)
+    "ci-poll-seconds"           = tostring(var.poll_interval_seconds)
+    "ci-metric-prefix"          = var.metric_prefix
 
     "block-project-ssh-keys" = "true"
   }
