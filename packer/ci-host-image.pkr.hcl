@@ -317,11 +317,14 @@ build {
       # pip is a MODULE, not a binary on PATH — `command -v pip3` can succeed on
       # a host where `python3 -m pip` (what workflows actually write) does not.
       "sudo -u runner -i python3 -m pip --version",
-      # `pip --version` succeeds on an EXTERNALLY-MANAGED host — only an actual
-      # INSTALL proves the PEP 668 block is lifted, which is the form every
-      # workflow uses. Installed and removed here so the image ships unchanged.
-      "sudo -u runner -i python3 -m pip install --quiet --user wheel",
-      "sudo -u runner -i python3 -m pip uninstall --quiet --yes wheel",
+      # `pip --version` succeeds on an EXTERNALLY-MANAGED host — only an INSTALL
+      # path proves the PEP 668 block is lifted. Asserted by driving pip down
+      # that path and rejecting only the PEP 668 refusal: --no-index means the
+      # package is never resolved, so this needs no PyPI egress and installs
+      # nothing into the image. Any other failure (including "no matching
+      # distribution", which is the expected outcome) is fine.
+      "sudo -u runner -i python3 -m pip install --user --dry-run --no-index ci-host-pep668-probe 2>&1 | tee /tmp/pep668 || true",
+      "if grep -qi 'externally managed' /tmp/pep668; then echo 'PEP 668 still blocks pip install'; exit 1; fi; rm -f /tmp/pep668",
       # The shim shape that actually broke: resolved through env, as a script's
       # interpreter is, not as a login-shell builtin.
       "printf '#!/usr/bin/env node\\nconsole.log(\"shim ok\")\\n' > /tmp/shim && chmod +x /tmp/shim && sudo -u runner /tmp/shim && rm -f /tmp/shim",
