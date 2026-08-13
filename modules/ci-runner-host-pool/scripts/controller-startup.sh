@@ -54,6 +54,7 @@ MAX_HOSTS=$(md "instance/attributes/ci-max-hosts")
 GRACE=$(md "instance/attributes/ci-drain-grace-seconds")
 POLL=$(md "instance/attributes/ci-poll-seconds")
 METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
+RUNNER_LABELS=$(md "instance/attributes/ci-runner-labels")
 
 SLOTS=${SLOTS:-1}
 MIN_HOSTS=${MIN_HOSTS:-0}
@@ -62,6 +63,12 @@ GRACE=${GRACE:-900}
 POLL=${POLL:-20}
 METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/github}
 REPO_FULL="$OWNER/$REPO"
+
+# The exact label set this pool's agents register with, as a JSON array — the
+# left-hand side of GitHub's superset rule. Must stay identical to what
+# host-startup.sh passes to config.sh, which is why both read the same
+# metadata key rather than each building their own list.
+POOL_LABELS_JSON=$(printf '%s' "$RUNNER_LABELS" | jq -R -c 'split(",") | map(select(length > 0))')
 
 # --- GitHub ------------------------------------------------------------------
 
@@ -114,8 +121,15 @@ gh_api() {
 # queued makes the metric collapse to 0 the moment work starts, which tells the
 # autoscaler the pool is idle while every slot is busy.
 #
-# Only jobs whose `labels` select THIS pool are counted; a repository may have
-# more than one pool and GitHub-hosted jobs in the same run.
+# Only jobs THIS pool could actually serve are counted, using GitHub's own
+# rule: a job runs on an agent whose label set is a SUPERSET of the job's
+# `runs-on`. Matching on the pool name instead would count nothing at all —
+# workflows across this fleet ask for label sets like
+# [self-hosted, linux, gcp, <Repo>], which contain no pool name — and a pool
+# that reports zero demand never scales out, while looking healthy.
+#
+# A job asking for a label this pool does not carry belongs to another pool (or
+# to GitHub-hosted runners) and is correctly ignored.
 collect_demand() {
   local runs jobs
   DEMAND_TOTAL=0
@@ -139,10 +153,11 @@ collect_demand() {
     jobs=$(gh_api "repos/$REPO_FULL/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || continue
 
     local counted
-    counted=$(printf '%s' "$jobs" | jq -r --arg pool "$POOL" '
+    counted=$(printf '%s' "$jobs" | jq -r --argjson mine_labels "$POOL_LABELS_JSON" '
       [ .jobs[]?
         | select(.status == "queued" or .status == "in_progress")
-        | select((.labels // []) | index($pool))
+        | select( ((.labels // []) | length) > 0 )
+        | select( [ (.labels // [])[] | select( ($mine_labels | index(.)) == null ) ] | length == 0 )
       ] as $mine
       | [ ($mine | length),
           ([ $mine[] | select(.status == "queued") ] | length),
