@@ -31,6 +31,11 @@ jobs:
       - name: drain-decision self-test
         run: bash scripts/ci/drain-decision.selftest.sh
 
+      # Reaping a registration is irreversible for a live slot, so the rule is
+      # asserted here rather than discovered on the fleet.
+      - name: orphan-decision self-test
+        run: bash scripts/ci/orphan-decision.selftest.sh
+
       - name: demand-match self-test
         run: bash scripts/ci/demand-match.selftest.sh
 

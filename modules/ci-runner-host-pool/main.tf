@@ -55,13 +55,14 @@ locals {
   # only serves jobs and answers questions about itself.
   host_startup = file("${path.module}/scripts/host-startup.sh")
 
-  # The controller carries the decision rule and the telemetry publisher inline
-  # so a running controller never depends on fetching code at runtime. Both are
+  # The controller carries its decision rules and the telemetry publisher inline
+  # so a running controller never depends on fetching code at runtime. They are
   # separate files in the repo precisely so they can be unit-tested; embedding
   # them here is what puts the TESTED text on the box.
   controller_startup = join("\n", [
     "#!/usr/bin/env bash",
     file("${path.module}/scripts/drain-decision.sh"),
+    file("${path.module}/scripts/orphan-decision.sh"),
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/controller-startup.sh"),
   ])
@@ -332,6 +333,7 @@ resource "google_compute_instance" "controller" {
     "ci-max-hosts"              = tostring(var.max_hosts)
     "ci-drain-grace-seconds"    = tostring(var.drain_grace_seconds)
     "ci-register-grace-seconds" = tostring(var.register_grace_seconds)
+    "ci-orphan-confirm-ticks"   = tostring(var.orphan_confirm_ticks)
     "ci-poll-seconds"           = tostring(var.poll_interval_seconds)
     "ci-metric-prefix"          = var.metric_prefix
 
