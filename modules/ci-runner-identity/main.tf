@@ -108,7 +108,10 @@ resource "google_service_account" "job" {
   count = var.create_job_service_account ? 1 : 0
 
   project      = var.project_id
-  account_id   = "${var.account_id}-job"
+  # GCP caps an account id at 30 characters, and `-job` costs four of them, so
+  # a pool whose runner account is already long (ci-runner-host-dataretrival)
+  # would otherwise fail validation at plan time and block the whole pool.
+  account_id   = "${substr(var.account_id, 0, min(26, length(var.account_id)))}-job"
   display_name = "CI job identity (${var.name})"
   description  = "Identity handed to CI JOB code by the host credential broker. Deliberately weaker than the host account: it cannot read the GitHub App key or delete hosts."
 }
