@@ -25,7 +25,7 @@ substitutions:
   # Image STORAGE location. Empty lets GCE pick a multi-region, which
   # constraints/gcp.resourceLocations rejects — after the whole build has run.
   _IMAGE_STORAGE_LOCATION: ""
-  _RUNNER_VERSION: 2.319.1
+  _RUNNER_VERSION: 2.336.0
   # Optional path (in this repo) to a cache-warming script for the image.
   _WARM_CACHE_SCRIPT: ""
 

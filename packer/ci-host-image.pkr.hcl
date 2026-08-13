@@ -81,7 +81,12 @@ variable "image_version" {
 variable "runner_version" {
   type        = string
   description = "GitHub Actions runner agent version to bake, without the leading v."
-  default     = "2.319.1"
+  # GitHub hard-blocks deprecated agents: a stale one registers, prints
+  # "Listening for Jobs", then dies with "Forbidden Runner version ... is
+  # deprecated and cannot receive messages" — so the pool looks healthy while
+  # every slot is offline. Bump this and rebuild the image; --disableupdate
+  # means the host never self-heals.
+  default     = "2.336.0"
 }
 
 variable "source_image_family" {
