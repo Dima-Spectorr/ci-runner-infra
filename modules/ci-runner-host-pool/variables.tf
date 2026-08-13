@@ -273,3 +273,18 @@ variable "labels" {
   type        = map(string)
   default     = {}
 }
+
+variable "network_tags" {
+  type        = list(string)
+  default     = []
+  description = <<-EOT
+    Extra network tags for BOTH the hosts and the controller, on top of the
+    tags this module always applies ("ci-runner-host" / "ci-runner-controller"
+    and the pool name).
+
+    Pass the tag the project's firewall rules target. It is not decoration: the
+    controller verifies a host is truly idle over IAP-SSH before deleting it, so
+    a host the IAP rule does not reach fails that check, the drain aborts, and
+    the pool never scales in — the exact failure this module exists to fix.
+  EOT
+}

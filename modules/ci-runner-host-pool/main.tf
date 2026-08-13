@@ -71,7 +71,7 @@ resource "google_compute_instance_template" "host" {
 
   machine_type = var.machine_type
   labels       = local.common_labels
-  tags         = ["ci-runner-host", var.name]
+  tags         = concat(["ci-runner-host", var.name], var.network_tags)
 
   disk {
     source_image = var.image
@@ -235,7 +235,7 @@ resource "google_compute_instance" "controller" {
   zone         = length(var.zones) > 0 ? var.zones[0] : "${var.region}-a"
   machine_type = var.controller_machine_type
   labels       = local.common_labels
-  tags         = ["ci-runner-controller", var.name]
+  tags         = concat(["ci-runner-controller", var.name], var.network_tags)
 
   boot_disk {
     initialize_params {
