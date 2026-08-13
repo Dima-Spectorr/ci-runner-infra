@@ -1,4 +1,8 @@
+# shellcheck shell=bash
 # ci-runner-host-pool — the controller.
+#
+# No shebang on purpose: this file is CONCATENATED after drain-decision.sh and
+# telemetry.sh at apply time, and the shebang belongs to the combined script.
 #
 # WHY A CONTROLLER EXISTS AT ALL
 #
@@ -53,6 +57,7 @@ METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 
 SLOTS=${SLOTS:-1}
 MIN_HOSTS=${MIN_HOSTS:-0}
+MAX_HOSTS=${MAX_HOSTS:-0}
 GRACE=${GRACE:-900}
 POLL=${POLL:-20}
 METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/github}
@@ -218,7 +223,9 @@ host_facts() {
 # Idle age is kept on disk, not in memory, so a controller restart does not
 # reset every host's clock and hand the whole pool a fresh grace window.
 idle_seconds() {
-  local host="$1" busy="$2" f="$STATE_DIR/idle-$host" now
+  local host="$1" busy="$2"
+  local f="$STATE_DIR/idle-$host"
+  local now
   now=$(date +%s)
 
   if [ "$busy" -gt 0 ]; then
@@ -363,6 +370,9 @@ tick() {
   queue_series "ci_demand" "$DEMAND_TOTAL"
   queue_series "ci_demand_queued" "$DEMAND_QUEUED"
   queue_series "ci_hosts_running" "$pool_size"
+  # Published so saturation is expressible as a ratio in one alert policy that
+  # works for every pool, rather than a per-pool threshold copied by hand.
+  queue_series "ci_hosts_max" "$MAX_HOSTS"
   queue_series "ci_hosts_draining" "$draining"
   queue_series "ci_slots_total" "$((pool_size * SLOTS))"
   queue_series "ci_slots_busy" "$slots_busy"

@@ -45,6 +45,7 @@ output "metric_names" {
       "ci_demand",
       "ci_demand_queued",
       "ci_hosts_running",
+      "ci_hosts_max",
       "ci_hosts_draining",
       "ci_slots_total",
       "ci_slots_busy",

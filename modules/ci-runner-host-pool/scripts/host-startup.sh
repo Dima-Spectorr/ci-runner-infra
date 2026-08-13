@@ -44,7 +44,9 @@ HOSTNAME_SHORT=$(md "instance/name")
 
 SLOTS=${SLOTS:-1}
 
-[ -n "$OWNER" ] && [ -n "$REPO" ] || die "missing ci-github-owner/ci-github-repo metadata"
+if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
+  die "missing ci-github-owner/ci-github-repo metadata"
+fi
 [ -d "$RUNNER_HOME" ] || die "golden image is missing $RUNNER_HOME — this host was booted from the wrong image, and booting a bare image here would reintroduce the per-job install cost this pool removes"
 
 # --- GitHub App installation token -------------------------------------------
@@ -54,7 +56,7 @@ SLOTS=${SLOTS:-1}
 # Manager at boot and never written to disk unencrypted for longer than the
 # signing call.
 gh_token() {
-  local key jwt header payload now b64
+  local key jwt header payload now
   key=$(gcloud secrets versions access latest --secret="$KEY_SECRET" 2>/dev/null)
   [ -n "$key" ] || { log "could not read App key from secret $KEY_SECRET"; return 1; }
 
@@ -110,6 +112,10 @@ install_slot() {
   local group_arg=()
   [ -n "$RUNNER_GROUP" ] && group_arg=(--runnergroup "$RUNNER_GROUP")
 
+  # SC2024: the redirect is opened by THIS shell, which is root (startup-script
+  # runs as root); sudo only drops privilege for config.sh itself. Writing the
+  # log as root is intended — a job must not be able to rewrite the boot log.
+  # shellcheck disable=SC2024
   sudo -u runner "$dir/config.sh" \
     --unattended --replace \
     --url "https://github.com/$OWNER/$REPO" \
