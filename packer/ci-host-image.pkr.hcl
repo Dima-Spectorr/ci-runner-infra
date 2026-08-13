@@ -185,6 +185,18 @@ build {
       "export DEBIAN_FRONTEND=noninteractive",
       "apt-get update -qq",
       "apt-get install -y -qq curl jq git openssl ca-certificates gnupg unzip rsync python3-pip python3-venv",
+      # PEP 668: Ubuntu 24.04 marks its system python EXTERNALLY-MANAGED, so
+      # even with pip installed, `python3 -m pip install …` aborts with "This
+      # environment is externally managed" — a DIFFERENT failure from the
+      # missing-module one above, and the one DataRetrival's lint job hit on the
+      # v3-8-0 image. A GitHub-hosted image does not carry that marker, and the
+      # workflows in this fleet are written against that behaviour.
+      #
+      # A host is a disposable CI worker rebuilt from this image, not a machine
+      # whose system python has to survive a job, so the risk PEP 668 protects
+      # against does not apply here. Configured rather than deleting the marker
+      # so the reason stays visible on the box.
+      "printf '[global]\\nbreak-system-packages = true\\n' > /etc/pip.conf",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
@@ -305,6 +317,11 @@ build {
       # pip is a MODULE, not a binary on PATH — `command -v pip3` can succeed on
       # a host where `python3 -m pip` (what workflows actually write) does not.
       "sudo -u runner -i python3 -m pip --version",
+      # `pip --version` succeeds on an EXTERNALLY-MANAGED host — only an actual
+      # INSTALL proves the PEP 668 block is lifted, which is the form every
+      # workflow uses. Installed and removed here so the image ships unchanged.
+      "sudo -u runner -i python3 -m pip install --quiet --user wheel",
+      "sudo -u runner -i python3 -m pip uninstall --quiet --yes wheel",
       # The shim shape that actually broke: resolved through env, as a script's
       # interpreter is, not as a login-shell builtin.
       "printf '#!/usr/bin/env node\\nconsole.log(\"shim ok\")\\n' > /tmp/shim && chmod +x /tmp/shim && sudo -u runner /tmp/shim && rm -f /tmp/shim",
