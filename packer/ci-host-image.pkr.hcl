@@ -94,6 +94,21 @@ variable "source_image_family" {
   default = "ubuntu-2404-lts-amd64"
 }
 
+variable "node_major" {
+  type        = string
+  description = <<-EOT
+    Major version of the SYSTEM node installed on PATH. This is not a build
+    toolchain — repositories still pin their own via actions/setup-node. It
+    exists because a large share of marketplace actions install a shell shim
+    with `#!/usr/bin/env node` (pnpm/action-setup's `pnpm`,
+    hashicorp/setup-terraform's `terraform` wrapper) and then invoke it from a
+    `run:` step. The runner's own bundled node is deliberately NOT on PATH, so
+    on a host without a system node every one of those shims dies with
+    "/usr/bin/env: 'node': No such file or directory" and exit 127.
+  EOT
+  default     = "22"
+}
+
 variable "warm_cache_script" {
   type        = string
   description = <<-EOT
@@ -183,7 +198,37 @@ build {
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
-  # 3. The runner account and the agent itself.
+  # 3. System node.
+  #
+  #    GitHub-hosted images ship node on PATH, so marketplace actions assume it
+  #    and install `#!/usr/bin/env node` shims that a `run:` step then calls.
+  #    The runner agent bundles its own node under externals/, but that copy is
+  #    intentionally not on PATH — actions run against it via the agent, shims
+  #    do not. Without this layer:
+  #      pnpm/action-setup      -> "exec: node: not found",           exit 127
+  #      hashicorp/setup-terraform (terraform_wrapper: true)
+  #                             -> "/usr/bin/env: 'node': No such file", 127
+  #    Observed 2026-08-13 on DataRetrival (typecheck, lint) and
+  #    Telnet-Emulation (terraform fmt) the first time those repos ran on warm
+  #    hosts. This is a HOST BASELINE, not a toolchain choice: repositories
+  #    still select their build node with actions/setup-node, which prepends
+  #    its own to PATH.
+  provisioner "shell" {
+    inline = [
+      "set -eux",
+      "curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg",
+      "chmod a+r /etc/apt/keyrings/nodesource.gpg",
+      "echo \"deb [arch=amd64 signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${var.node_major}.x nodistro main\" > /etc/apt/sources.list.d/nodesource.list",
+      "apt-get update -qq",
+      "apt-get install -y -qq nodejs",
+      # corepack is what makes `pnpm`/`yarn` resolvable when a repo does not run
+      # a setup action at all; harmless when it does.
+      "corepack enable || true",
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
+  # 4. The runner account and the agent itself.
   #
   #    Baked UNCONFIGURED: the tarball is extracted here, and each host copies
   #    it once per slot and runs config.sh at boot with a short-lived token. No
@@ -204,7 +249,7 @@ build {
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
-  # 4. Repo-supplied cache warming. Optional, and deliberately the LAST layer:
+  # 5. Repo-supplied cache warming. Optional, and deliberately the LAST layer:
   #    everything above is identical for every consumer, so a change here does
   #    not invalidate the expensive layers.
   provisioner "shell" {
@@ -217,7 +262,26 @@ build {
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
-  # 5. Leave no build identity behind. The build VM's SSH user, logs and
+  # 6. Assert the host baseline, as the runner user and with the runner's PATH.
+  #
+  #    A missing baseline tool does not fail an image build — it fails every job
+  #    on every host that boots the image, hours later, as an opaque exit 127.
+  #    That is exactly how the node gap reached five repositories at once. Each
+  #    entry below is a binary some marketplace action or workflow step invokes
+  #    from a `run:` shell, so losing one is a fleet outage; catch it here.
+  provisioner "shell" {
+    inline = [
+      "set -eux",
+      "for b in node npm git jq curl unzip rsync openssl docker; do sudo -u runner -i command -v $b >/dev/null || { echo \"MISSING from runner PATH: $b\"; exit 1; }; done",
+      "sudo -u runner -i node --version",
+      # The shim shape that actually broke: resolved through env, as a script's
+      # interpreter is, not as a login-shell builtin.
+      "printf '#!/usr/bin/env node\\nconsole.log(\"shim ok\")\\n' > /tmp/shim && chmod +x /tmp/shim && sudo -u runner /tmp/shim && rm -f /tmp/shim",
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
+  # 7. Leave no build identity behind. The build VM's SSH user, logs and
   #    machine-id must not be part of an artifact that N hosts boot from.
   provisioner "shell" {
     inline = [
