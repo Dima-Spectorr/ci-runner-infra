@@ -237,6 +237,14 @@ resource "google_compute_instance" "controller" {
   labels       = local.common_labels
   tags         = concat(["ci-runner-controller", var.name], var.network_tags)
 
+  # A controller stopped by hand, by a maintenance action or by anything outside
+  # Terraform does NOT come back on its own — automatic_restart only covers host
+  # failures. Declaring the desired lifecycle state means the next apply repairs
+  # a stopped control plane instead of reporting no changes while nothing polls
+  # demand and nothing ever drains a host (SOAP-To-REST #1994, carried up from
+  # the copy that fix landed in).
+  desired_status = "RUNNING"
+
   boot_disk {
     initialize_params {
       image = var.controller_image

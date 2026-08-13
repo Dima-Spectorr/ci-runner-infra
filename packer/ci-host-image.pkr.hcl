@@ -152,7 +152,10 @@ build {
   provisioner "shell" {
     # An empty list runs nothing, which is how "toolchain-only image" is
     # expressed without a second build definition.
-    scripts         = compact([var.warm_cache_script])
+    # Never an empty list: Packer validates this block at PREPARE time and
+    # rejects "no scripts" outright, so "warm nothing" is a script that does
+    # nothing rather than an absent one.
+    scripts         = [var.warm_cache_script != "" ? var.warm_cache_script : "warm-cache/none.sh"]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
