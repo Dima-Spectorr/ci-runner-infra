@@ -60,11 +60,17 @@ has_metadata_fence() { # <file>
 }
 
 # --- the real script must satisfy both ---------------------------------------
-has_disableupdate "$SCRIPT" \
-  && ok || bad "config.sh is not passed --disableupdate — a forced self-update will take every slot on the host OFFLINE (#2281)"
+if has_disableupdate "$SCRIPT"; then
+  ok
+else
+  bad "config.sh is not passed --disableupdate — a forced self-update will take every slot on the host OFFLINE (#2281)"
+fi
 
-has_metadata_fence "$SCRIPT" \
-  && ok || bad "job code is not fenced off 169.254.169.254 for both the runner uid and DOCKER-USER, or the fence does not fail closed (#1958)"
+if has_metadata_fence "$SCRIPT"; then
+  ok
+else
+  bad "job code is not fenced off 169.254.169.254 for both the runner uid and DOCKER-USER, or the fence does not fail closed (#1958)"
+fi
 
 # --- mutation cases: prove the checks above can actually fail -----------------
 mutate() { # <description> <sed-program> <predicate> — predicate must go false

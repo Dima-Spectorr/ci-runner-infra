@@ -257,7 +257,7 @@ resource "google_compute_region_autoscaler" "hosts" {
 
 # --- controller ---------------------------------------------------------------
 
-# Not every region has an "-a" zone (europe-west1 starts at -b), so the
+# Not every region has an "-a" zone (some start at "-b"), so the
 # controller's zone is read from the region rather than assembled by hand — a
 # guessed zone name fails the create with a 403 that reads like a permissions
 # problem.
@@ -320,12 +320,12 @@ resource "google_compute_instance" "controller" {
     "ci-app-id"              = var.github_app_id
     "ci-app-installation-id" = var.github_app_installation_id
     "ci-app-key-secret"      = var.github_app_private_key_secret
-    "ci-pool" = var.name
+    "ci-pool"                = var.name
     # The same key the hosts read. Demand is counted by GitHub's superset rule
     # against THIS list, so a controller without it matches no job at all,
     # reports zero demand forever, and the pool never leaves zero hosts.
-    "ci-runner-labels" = local.runner_labels
-    "ci-mig-name"      = google_compute_region_instance_group_manager.hosts.name
+    "ci-runner-labels"       = local.runner_labels
+    "ci-mig-name"            = google_compute_region_instance_group_manager.hosts.name
     "ci-region"              = var.region
     "ci-slots"               = tostring(var.slots_per_host)
     "ci-min-hosts"           = tostring(var.min_hosts)

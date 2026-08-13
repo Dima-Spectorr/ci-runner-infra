@@ -107,7 +107,7 @@ resource "google_project_iam_member" "compute" {
 resource "google_service_account" "job" {
   count = var.create_job_service_account ? 1 : 0
 
-  project      = var.project_id
+  project = var.project_id
   # GCP caps an account id at 30 characters, and `-job` costs four of them, so
   # a pool whose runner account is already long (ci-runner-host-dataretrival)
   # would otherwise fail validation at plan time and block the whole pool.
