@@ -228,7 +228,28 @@ build {
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
-  # 4. The runner account and the agent itself.
+  # 4. PowerShell.
+  #
+  #    Also part of the GitHub-hosted baseline, and equally assumed: a workflow
+  #    may declare `shell: pwsh`, and a test suite may drive a .ps1 script
+  #    directly. Apigee-Portal's `Unit tests (packages)` failed 2026-08-13 with
+  #    "No PowerShell interpreter found (tried pwsh, powershell.exe,
+  #    powershell)" — and by design it does NOT skip when the interpreter is
+  #    missing, because the script under test guards an auto-approved
+  #    production apply.
+  provisioner "shell" {
+    inline = [
+      "set -eux",
+      "curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg",
+      "chmod a+r /etc/apt/keyrings/microsoft.gpg",
+      "echo \"deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/$(. /etc/os-release && echo $VERSION_ID)/prod $(. /etc/os-release && echo $VERSION_CODENAME) main\" > /etc/apt/sources.list.d/microsoft-prod.list",
+      "apt-get update -qq",
+      "apt-get install -y -qq powershell",
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
+  # 5. The runner account and the agent itself.
   #
   #    Baked UNCONFIGURED: the tarball is extracted here, and each host copies
   #    it once per slot and runs config.sh at boot with a short-lived token. No
@@ -249,7 +270,7 @@ build {
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
-  # 5. Repo-supplied cache warming. Optional, and deliberately the LAST layer:
+  # 6. Repo-supplied cache warming. Optional, and deliberately the LAST layer:
   #    everything above is identical for every consumer, so a change here does
   #    not invalidate the expensive layers.
   provisioner "shell" {
@@ -262,7 +283,7 @@ build {
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
-  # 6. Assert the host baseline, as the runner user and with the runner's PATH.
+  # 7. Assert the host baseline, as the runner user and with the runner's PATH.
   #
   #    A missing baseline tool does not fail an image build — it fails every job
   #    on every host that boots the image, hours later, as an opaque exit 127.
@@ -272,7 +293,7 @@ build {
   provisioner "shell" {
     inline = [
       "set -eux",
-      "for b in node npm git jq curl unzip rsync openssl docker; do sudo -u runner -i command -v $b >/dev/null || { echo \"MISSING from runner PATH: $b\"; exit 1; }; done",
+      "for b in node npm pwsh git jq curl unzip rsync openssl docker; do sudo -u runner -i command -v $b >/dev/null || { echo \"MISSING from runner PATH: $b\"; exit 1; }; done",
       "sudo -u runner -i node --version",
       # The shim shape that actually broke: resolved through env, as a script's
       # interpreter is, not as a login-shell builtin.
@@ -281,7 +302,7 @@ build {
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
-  # 7. Leave no build identity behind. The build VM's SSH user, logs and
+  # 8. Leave no build identity behind. The build VM's SSH user, logs and
   #    machine-id must not be part of an artifact that N hosts boot from.
   provisioner "shell" {
     inline = [
