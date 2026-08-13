@@ -47,6 +47,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 MD_ROOT = "http://169.254.169.254/computeMetadata/v1/"
 MD_HEADERS = {"Metadata-Flavor": "Google"}
 SA_PREFIX = "/computeMetadata/v1/instance/service-accounts/"
+# posixpath.normpath() below strips the trailing slash, so the directory listing
+# gcloud asks for FIRST — GET /instance/service-accounts/ — arrives here without
+# it and would miss the prefix test, fall through to the proxy, and be refused by
+# the "no identity paths are proxied" guard. gcloud reports that 403 as
+# "MetadataServerException: the metadata server is concealed" and every deploy
+# step on a warm host dies before its first API call.
+SA_ROOT = SA_PREFIX.rstrip("/")
 
 JOB_SA = os.environ.get("CI_JOB_SERVICE_ACCOUNT", "").strip()
 BIND_HOST = os.environ.get("CI_BROKER_HOST", "127.0.0.1")
@@ -138,6 +145,9 @@ class Handler(BaseHTTPRequestHandler):
             path = "/" + path
 
         try:
+            if path == SA_ROOT:
+                self._service_account("", query)
+                return
             if path.startswith(SA_PREFIX):
                 self._service_account(path[len(SA_PREFIX):], query)
                 return

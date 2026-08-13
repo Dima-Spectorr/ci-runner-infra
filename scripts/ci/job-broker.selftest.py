@@ -133,4 +133,25 @@ status, body = get(
 )
 check("foreign account is refused", status == 404, "status=%s" % status)
 
+# 6. The shapes gcloud actually asks for while resolving ADC, in order. The
+#    directory listing has a trailing slash that normalisation strips; serving it
+#    a 403 is what "the metadata server is concealed" means, and it kills every
+#    deploy step on a warm host before its first API call.
+status, body = get("/computeMetadata/v1/instance/service-accounts/")
+check(
+    "service-account listing is served, not proxied",
+    status == 200 and b"default" in body,
+    "status=%s body=%r" % (status, body),
+)
+
+status, body = get("/computeMetadata/v1/instance/service-accounts/default/?recursive=true")
+check(
+    "recursive default account describes the job identity",
+    status == 200 and b"job-sa@" in body and b"HOST-TOKEN-LEAKED" not in body,
+    "status=%s body=%r" % (status, body),
+)
+
+status, body = get("/computeMetadata/v1/instance/service-accounts/default/email")
+check("default email is the job account", status == 200 and b"job-sa@" in body, body)
+
 sys.exit(1 if failures else 0)
