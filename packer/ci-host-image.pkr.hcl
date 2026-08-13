@@ -172,12 +172,19 @@ build {
   sources = ["source.googlecompute.host"]
 
   # 1. Base packages the host scripts assume exist.
+  #
+  #    python3-pip and python3-venv are here for the same reason node and
+  #    PowerShell are below: a GitHub-hosted image has them, so workflows install
+  #    their python tooling with a bare `python3 -m pip install --user …` (CI
+  #    security scanners in particular — semgrep, checkov). Ubuntu ships python3
+  #    WITHOUT the pip module, so on a host that only has the interpreter that
+  #    line fails with "No module named pip" and the whole job stops.
   provisioner "shell" {
     inline = [
       "set -eux",
       "export DEBIAN_FRONTEND=noninteractive",
       "apt-get update -qq",
-      "apt-get install -y -qq curl jq git openssl ca-certificates gnupg unzip rsync",
+      "apt-get install -y -qq curl jq git openssl ca-certificates gnupg unzip rsync python3-pip python3-venv",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
@@ -293,8 +300,11 @@ build {
   provisioner "shell" {
     inline = [
       "set -eux",
-      "for b in node npm pwsh git jq curl unzip rsync openssl docker; do sudo -u runner -i command -v $b >/dev/null || { echo \"MISSING from runner PATH: $b\"; exit 1; }; done",
+      "for b in node npm pwsh python3 git jq curl unzip rsync openssl docker; do sudo -u runner -i command -v $b >/dev/null || { echo \"MISSING from runner PATH: $b\"; exit 1; }; done",
       "sudo -u runner -i node --version",
+      # pip is a MODULE, not a binary on PATH — `command -v pip3` can succeed on
+      # a host where `python3 -m pip` (what workflows actually write) does not.
+      "sudo -u runner -i python3 -m pip --version",
       # The shim shape that actually broke: resolved through env, as a script's
       # interpreter is, not as a login-shell builtin.
       "printf '#!/usr/bin/env node\\nconsole.log(\"shim ok\")\\n' > /tmp/shim && chmod +x /tmp/shim && sudo -u runner /tmp/shim && rm -f /tmp/shim",
