@@ -257,10 +257,20 @@ resource "google_compute_region_autoscaler" "hosts" {
 
 # --- controller ---------------------------------------------------------------
 
+# Not every region has an "-a" zone (europe-west1 starts at -b), so the
+# controller's zone is read from the region rather than assembled by hand — a
+# guessed zone name fails the create with a 403 that reads like a permissions
+# problem.
+data "google_compute_zones" "available" {
+  project = var.project_id
+  region  = var.region
+  status  = "UP"
+}
+
 resource "google_compute_instance" "controller" {
   project      = var.project_id
   name         = "${var.name}-controller"
-  zone         = length(var.zones) > 0 ? var.zones[0] : "${var.region}-a"
+  zone         = length(var.zones) > 0 ? var.zones[0] : data.google_compute_zones.available.names[0]
   machine_type = var.controller_machine_type
   labels       = local.common_labels
   tags         = concat(["ci-runner-controller", var.name], var.network_tags)
