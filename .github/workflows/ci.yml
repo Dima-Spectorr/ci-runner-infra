@@ -37,6 +37,11 @@ jobs:
       - name: host-startup self-test
         run: bash scripts/ci/host-startup.selftest.sh
 
+      # Routing bug here = job code gets the HOST identity, which reads the
+      # GitHub App key. Tested on every change, not only when the broker moves.
+      - name: job credential broker self-test
+        run: python3 scripts/ci/job-broker.selftest.py
+
   terraform:
     name: Terraform (fmt + validate)
     runs-on: ubuntu-latest

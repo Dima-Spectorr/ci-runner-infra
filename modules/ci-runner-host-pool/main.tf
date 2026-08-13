@@ -46,6 +46,11 @@ locals {
   # name is what lets a repository address THIS pool specifically.
   runner_labels = join(",", concat(["self-hosted", var.name], var.runner_labels))
 
+  # Controller and hosts SHOULD be different identities: the controller may
+  # delete instances, a host executes build input. Falling back keeps existing
+  # single-identity pools valid instead of failing their next apply.
+  controller_sa = var.controller_service_account_email != "" ? var.controller_service_account_email : var.service_account_email
+
   # The host script is self-contained — a host makes no drain decisions, it
   # only serves jobs and answers questions about itself.
   host_startup = file("${path.module}/scripts/host-startup.sh")
@@ -60,6 +65,19 @@ locals {
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/controller-startup.sh"),
   ])
+}
+
+# --- job identity ---------------------------------------------------------------
+
+# The host mints job tokens by impersonation, which needs exactly this grant and
+# nothing wider. Without it the broker starts, the host refuses to register, and
+# the pool stays empty rather than quietly serving jobs with no credentials.
+resource "google_service_account_iam_member" "job_token_creator" {
+  count = var.job_service_account_email != "" && var.manage_job_token_creator_binding ? 1 : 0
+
+  service_account_id = "projects/${var.project_id}/serviceAccounts/${var.job_service_account_email}"
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${var.service_account_email}"
 }
 
 # --- host template ------------------------------------------------------------
@@ -130,6 +148,13 @@ resource "google_compute_instance_template" "host" {
     "ci-slots"               = tostring(var.slots_per_host)
     "ci-pool"                = var.name
     "ci-metric-prefix"       = var.metric_prefix
+
+    # Job credentials. The broker source travels as metadata rather than being
+    # baked into the image, so ONE image keeps serving every pool while the
+    # broker stays reviewable and versioned with the module.
+    "ci-job-service-account" = var.job_service_account_email
+    "ci-job-broker-port"     = tostring(var.job_broker_port)
+    "ci-job-broker-py"       = file("${path.module}/scripts/job-metadata-broker.py")
 
     # Hosts are cattle managed by the controller; interactive login is not the
     # supported way to inspect one. Logs go to Cloud Logging.
@@ -263,7 +288,7 @@ resource "google_compute_instance" "controller" {
   }
 
   service_account {
-    email  = var.service_account_email
+    email  = local.controller_sa
     scopes = ["https://www.googleapis.com/auth/cloud-platform"]
   }
 

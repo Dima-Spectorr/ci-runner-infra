@@ -93,3 +93,22 @@ resource "google_project_iam_member" "compute" {
 # Deliberately NOT granted here: storage, artifact registry, deploy, or any
 # data-plane role. A pipeline that needs one asks for it explicitly in the
 # consuming stack, where the grant is visible in that repo's review.
+
+# --- job identity ---------------------------------------------------------------
+#
+# The account above is the HOST's, and job code never gets it: hosts fence job
+# code off the metadata server precisely because that account reads the App key.
+# What a job's `gcloud` sees instead is this account, vended over loopback by the
+# host's credential broker.
+#
+# It starts with NO grants at all. Every permission a workflow needs — push an
+# image, submit a build, describe a service — is granted to THIS account in the
+# consuming stack, where a reviewer sees exactly what CI can do.
+resource "google_service_account" "job" {
+  count = var.create_job_service_account ? 1 : 0
+
+  project      = var.project_id
+  account_id   = "${var.account_id}-job"
+  display_name = "CI job identity (${var.name})"
+  description  = "Identity handed to CI JOB code by the host credential broker. Deliberately weaker than the host account: it cannot read the GitHub App key or delete hosts."
+}

@@ -210,12 +210,61 @@ variable "github_app_private_key_secret" {
 
 variable "service_account_email" {
   description = <<-EOT
-    Service account for hosts AND controller. Scope it to the minimum: read the
-    App key secret, write custom metrics, write logs, and (controller only)
-    manage instances in this MIG. A CI host executes untrusted-by-default build
-    input; anything this account can reach, a build can reach.
+    Service account for the HOSTS. Scope it to the minimum: read the App key
+    secret (registration), write custom metrics and logs, and mint tokens for
+    `job_service_account_email`. It must NOT be able to delete instances —
+    deletion is the controller's job, and a host runs build input.
   EOT
   type        = string
+}
+
+variable "controller_service_account_email" {
+  description = <<-EOT
+    Service account for the CONTROLLER. Empty = reuse `service_account_email`,
+    which is the single-identity arrangement: acceptable, but it puts
+    instance-deletion rights on machines that execute build input. Give the
+    controller its own account wherever the project allows it.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "job_service_account_email" {
+  description = <<-EOT
+    Identity that JOB code gets, via the loopback credential broker on each host
+    (scripts/job-metadata-broker.py). Job code is fenced off the real metadata
+    server, so this — and only this — is what a workflow's `gcloud` sees.
+
+    Empty = jobs get no Google credentials at all. Correct for a repository
+    whose CI never touches GCP; wrong for one that deploys, where it turns every
+    deploy step into an auth failure.
+
+    NEVER set this to `service_account_email`: that hands build input the host
+    identity and undoes the fence.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.job_service_account_email == "" || var.job_service_account_email != var.service_account_email
+    error_message = "job_service_account_email must differ from service_account_email — otherwise job code holds the host identity, which can read the GitHub App key."
+  }
+}
+
+variable "job_broker_port" {
+  description = "Loopback port the job credential broker listens on."
+  type        = number
+  default     = 8081
+}
+
+variable "manage_job_token_creator_binding" {
+  description = <<-EOT
+    Let this module grant the host account `roles/iam.serviceAccountTokenCreator`
+    on `job_service_account_email`. Set false when that grant is owned elsewhere
+    (a central IAM module); the broker cannot mint job tokens without it.
+  EOT
+  type        = bool
+  default     = true
 }
 
 # --- network ------------------------------------------------------------------

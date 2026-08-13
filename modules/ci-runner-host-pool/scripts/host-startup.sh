@@ -40,7 +40,11 @@ LABELS=$(md "instance/attributes/ci-runner-labels")
 RUNNER_GROUP=$(md "instance/attributes/ci-runner-group")
 SLOTS=$(md "instance/attributes/ci-slots")
 POOL=$(md "instance/attributes/ci-pool")
+JOB_SA=$(md "instance/attributes/ci-job-service-account")
+BROKER_PORT=$(md "instance/attributes/ci-job-broker-port")
 HOSTNAME_SHORT=$(md "instance/name")
+
+BROKER_PORT=${BROKER_PORT:-8081}
 
 SLOTS=${SLOTS:-1}
 
@@ -122,6 +126,66 @@ fence_metadata() {
     || return 1
 }
 
+# --- job credential broker ----------------------------------------------------
+#
+# The fence above removes the host identity from job code. Deploy workflows in
+# this fleet legitimately need ADC (`gcloud builds submit`,
+# `gcloud run services describe`), so the credential comes back from a WEAKER
+# identity instead: the broker vends tokens for the job service account only.
+# See scripts/job-metadata-broker.py.
+#
+# No job service account configured = no ADC for jobs, and that is a valid pool
+# for a repository whose CI never touches GCP. It is never a silent downgrade to
+# the host identity.
+start_job_broker() {
+  local src
+  src=$(md "instance/attributes/ci-job-broker-py")
+  [ -n "$src" ] || { log "job broker source missing from metadata"; return 1; }
+
+  printf '%s' "$src" >/opt/ci/job-metadata-broker.py
+  chmod 0755 /opt/ci/job-metadata-broker.py
+
+  cat >/etc/systemd/system/ci-job-broker.service <<EOF
+[Unit]
+Description=CI job credential broker ($POOL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root, deliberately: the broker is the ONLY thing on this host that may talk to
+# the real metadata server on job code's behalf, and it hands back a token for a
+# different, weaker account.
+User=root
+Environment=CI_JOB_SERVICE_ACCOUNT=$JOB_SA
+Environment=CI_BROKER_HOST=127.0.0.1
+Environment=CI_BROKER_PORT=$BROKER_PORT
+ExecStart=/usr/bin/python3 /opt/ci/job-metadata-broker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now ci-job-broker.service >>/var/log/ci-host.log 2>&1 || return 1
+
+  # Prove it before any agent registers: a broker that looks up but vends
+  # nothing turns every deploy job into a confusing auth failure at step time.
+  local i
+  for i in $(seq 1 30); do
+    if curl -fsS -H "Metadata-Flavor: Google" \
+      "http://127.0.0.1:$BROKER_PORT/computeMetadata/v1/instance/service-accounts/default/token" \
+      >/dev/null 2>&1; then
+      log "job credential broker serving $JOB_SA on 127.0.0.1:$BROKER_PORT"
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 # --- slots --------------------------------------------------------------------
 #
 # One agent per slot, each in its own directory with its own work folder, so K
@@ -176,6 +240,7 @@ Wants=network-online.target
 Type=simple
 User=runner
 WorkingDirectory=$dir
+$BROKER_ENV
 ExecStart=$dir/run.sh
 # The controller drains a host by DEREGISTERING its agents through the GitHub
 # API, which GitHub refuses while an agent is executing a job. Restart=no here
@@ -200,6 +265,20 @@ main() {
 
   # Before any agent exists, so no job can ever race the fence.
   fence_metadata || die "could not fence job code off the metadata server — refusing to register agents"
+
+  # Also before any agent exists: an agent registered without the broker would
+  # pick up a deploy job that then fails on missing credentials.
+  BROKER_ENV=""
+  if [ -n "$JOB_SA" ]; then
+    start_job_broker || die "job service account $JOB_SA is configured but its credential broker did not come up"
+    # google-auth, gcloud and the Go/Java clients all resolve the metadata
+    # server through these; pointing them at loopback is what gives a fenced job
+    # ADC for the job identity and nothing else.
+    BROKER_ENV=$(printf 'Environment=GCE_METADATA_HOST=127.0.0.1:%s\nEnvironment=GCE_METADATA_IP=127.0.0.1:%s\nEnvironment=GCE_METADATA_ROOT=127.0.0.1:%s' \
+      "$BROKER_PORT" "$BROKER_PORT" "$BROKER_PORT")
+  else
+    log "no ci-job-service-account set — jobs on this host get no Google credentials"
+  fi
 
   local token
   token=$(registration_token) || die "could not obtain a registration token"

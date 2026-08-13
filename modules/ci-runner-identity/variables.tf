@@ -43,3 +43,14 @@ variable "labels" {
   type        = map(string)
   default     = {}
 }
+
+variable "create_job_service_account" {
+  description = <<-EOT
+    Create the weak identity that JOB code runs as (`<account_id>-job`). Leave
+    true unless the project already has one: without it, a pool has nothing safe
+    to hand jobs, and the only way to make `gcloud` work in a workflow becomes
+    removing the metadata fence.
+  EOT
+  type        = bool
+  default     = true
+}
