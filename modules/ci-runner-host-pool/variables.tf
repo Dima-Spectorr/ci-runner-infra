@@ -149,6 +149,29 @@ variable "register_grace_seconds" {
   default     = 600
 }
 
+variable "orphan_confirm_ticks" {
+  description = <<-EOT
+    How many CONSECUTIVE ticks a GitHub runner registration must be offline
+    with no instance behind it before the controller deletes it. Registrations
+    are left behind by every host death that does not go through the
+    controller's own drain — an operator `delete-instances`, a MIG recreate,
+    host maintenance — and they consume the repo's runner list, which is the
+    controller's own view of the pool.
+
+    The floor exists because a failed `list-instances` returns an EMPTY host
+    list, indistinguishable from a pool at zero. Requiring N ticks means one
+    bad API call cannot deregister a live fleet. Raise it if this project's
+    compute API is flaky; do not set it to 0.
+  EOT
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.orphan_confirm_ticks >= 1
+    error_message = "orphan_confirm_ticks must be at least 1: a single failed list-instances call would otherwise deregister every live agent in the pool."
+  }
+}
+
 variable "warm_schedules" {
   description = <<-EOT
     Optional autoscaler scaling schedules — a warm floor that applies only

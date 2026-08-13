@@ -56,6 +56,7 @@ POLL=$(md "instance/attributes/ci-poll-seconds")
 METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 RUNNER_LABELS=$(md "instance/attributes/ci-runner-labels")
 REGISTER_GRACE=$(md "instance/attributes/ci-register-grace-seconds")
+ORPHAN_CONFIRM_TICKS=$(md "instance/attributes/ci-orphan-confirm-ticks")
 
 SLOTS=${SLOTS:-1}
 MIN_HOSTS=${MIN_HOSTS:-0}
@@ -66,6 +67,11 @@ GRACE=${GRACE:-900}
 # 600s leaves room for a slow image pull or an API retry without letting a truly
 # dead host bill all night.
 REGISTER_GRACE=${REGISTER_GRACE:-600}
+# Consecutive ticks an offline agent must have NO instance behind it before its
+# registration is deleted. 3 ticks (~1 min at the default poll) is far longer
+# than a transient gcloud failure and far shorter than the hours a dead
+# registration otherwise occupies the repo's runner list.
+ORPHAN_CONFIRM_TICKS=${ORPHAN_CONFIRM_TICKS:-3}
 POLL=${POLL:-20}
 METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/github}
 REPO_FULL="$OWNER/$REPO"
@@ -214,6 +220,94 @@ collect_hosts() {
   HOSTS=$(gcloud compute instance-groups managed list-instances "$MIG" \
     --region="$REGION" --project="$PROJECT" \
     --format="value(instance.basename(),instanceStatus)" 2>/dev/null)
+}
+
+# One describe per tick for both facts we need from the MIG: the target size we
+# publish, and the baseInstanceName that bounds the orphan reaper to instances
+# THIS pool can create. Kept together so the reaper never costs an extra call.
+collect_mig() {
+  local line
+  line=$(gcloud compute instance-groups managed describe "$MIG" \
+    --region="$REGION" --project="$PROJECT" \
+    --format="value(baseInstanceName,targetSize)" 2>/dev/null)
+  MIG_BASE=$(printf '%s' "$line" | cut -f1)
+  MIG_TARGET=$(printf '%s' "$line" | cut -f2)
+  MIG_BASE=${MIG_BASE:-}
+  MIG_TARGET=${MIG_TARGET:-0}
+}
+
+# --- orphan registrations ----------------------------------------------------
+#
+# drain_host() deregisters before deleting, so the controller's own scale-in is
+# self-cleaning. Nothing else is: an operator `delete-instances`, a MIG
+# recreate, host maintenance, or a controller restart mid-drain all leave the
+# agents registered forever. The verdict rule lives in orphan-decision.sh; this
+# is only its I/O.
+reap_orphan_registrations() {
+  # No runner list means we cannot prove anything about any agent. Same
+  # fail-safe as the drain path: do nothing this tick.
+  [ -n "$RUNNERS_JSON" ] || return 0
+
+  local ORPHAN_TOKEN
+  ORPHAN_TOKEN=$(gh_token) || return 0
+
+  local live
+  live=$(printf '%s' "$HOSTS" | awk '{print $1}' | paste -sd, -)
+
+  local name status busy id verdict f misses
+  while IFS=$'\t' read -r id name status busy; do
+    [ -n "$name" ] || continue
+
+    f="$STATE_DIR/orphan-$name"
+    misses=$(cat "$f" 2>/dev/null)
+    misses=${misses:-0}
+
+    verdict=$(orphan_decision "$name" "$status" "$busy" "$MIG_BASE" "$live" \
+      "$misses" "$ORPHAN_CONFIRM_TICKS")
+
+    case "$verdict" in
+      reap:*)
+        local code
+        code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+          -H "Authorization: Bearer $ORPHAN_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/$REPO_FULL/actions/runners/$id")
+        case "$code" in
+          204 | 404)
+            rm -f "$f"
+            REAPED=$((REAPED + 1))
+            log "reap $name: $verdict (HTTP $code)"
+            ;;
+          *)
+            # 422 = GitHub says it is running a job. Our view was stale; forget
+            # the strikes so it has to re-qualify from scratch.
+            rm -f "$f"
+            log "reap $name: refused (HTTP $code) — registration kept"
+            ;;
+        esac
+        ;;
+      keep:unconfirmed*)
+        echo $((misses + 1)) >"$f"
+        ;;
+      *)
+        # Any other keep means the agent is demonstrably fine — clear its
+        # strikes so a host that flaps never accumulates its way to a reap.
+        rm -f "$f"
+        ;;
+    esac
+  done <<<"$(printf '%s' "$RUNNERS_JSON" | jq -r '
+    .runners[]? | [ (.id|tostring), .name, .status,
+                    (if .busy then "1" else "0" end) ] | @tsv' 2>/dev/null)"
+
+  # State files for names GitHub no longer lists at all (we deleted them, or
+  # someone else did) would otherwise accumulate on a controller that runs for
+  # months.
+  for f in "$STATE_DIR"/orphan-*; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f"); name=${name#orphan-}
+    printf '%s' "$RUNNERS_JSON" | jq -e --arg n "$name" \
+      '[.runners[]? | select(.name == $n)] | length > 0' >/dev/null 2>&1 || rm -f "$f"
+  done
 }
 
 # host_facts <host> -> sets HOST_BUSY, HOST_REG
@@ -393,10 +487,12 @@ drain_host() {
 tick() {
   DRAINED=0
   DRAIN_ABORTED=0
+  REAPED=0
 
   collect_demand
   collect_runners || log "GitHub runner list unavailable this tick — every host reads reg=unknown and nothing will be drained (fail-safe)"
   collect_hosts
+  collect_mig
 
   local pool_size=0 slots_busy=0 idle_max=0 draining=0
   local host status busy idle age verdict
@@ -432,10 +528,11 @@ tick() {
     esac
   done <<<"$HOSTS"
 
-  local target
-  target=$(gcloud compute instance-groups managed describe "$MIG" \
-    --region="$REGION" --project="$PROJECT" --format="value(targetSize)" 2>/dev/null)
-  target=${target:-0}
+  # Runs AFTER the drain loop: drain_host() deregisters the agents of the hosts
+  # it deletes, so reaping first would race its own bookkeeping.
+  reap_orphan_registrations
+
+  local target="$MIG_TARGET"
 
   # One request per tick, all series together.
   queue_series "ci_demand" "$DEMAND_TOTAL"
@@ -452,6 +549,10 @@ tick() {
   queue_series "ci_mig_target_size" "$target"
   queue_series "ci_drain_verdicts" "$DRAINED" '"outcome":"drained"'
   queue_series "ci_drain_verdicts" "$DRAIN_ABORTED" '"outcome":"aborted"'
+  # A pool at steady state reaps ~0. A series that keeps climbing means hosts
+  # are disappearing without going through drain_host() — worth an alert, not
+  # just a log line.
+  queue_series "ci_orphan_registrations_reaped" "$REAPED"
   # Heartbeat is published on EVERY tick including a bad one, so "no data" on
   # this series means the controller is down — a distinct alert from "the pool
   # is idle", which the other series cannot distinguish on their own.

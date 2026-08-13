@@ -76,6 +76,16 @@ controller is the only always-on cost per pool.
 4. It then verifies no `Runner.Worker` process remains, and only then deletes
    the instance from the MIG.
 
+5. Registrations left behind by a host that died *outside* this path — an
+   operator `delete-instances`, a MIG recreate, host maintenance, a controller
+   restart mid-drain — are reclaimed by `orphan_decision()`
+   (`scripts/orphan-decision.sh`, also pure and self-tested). It deletes a
+   registration only when the agent is offline, not busy, named for an instance
+   this MIG could have created, and has had no instance behind it for
+   `orphan_confirm_ticks` consecutive ticks. That last condition is the guard
+   against a failed `list-instances` — which returns an empty host list,
+   indistinguishable from a pool at zero — deregistering a live fleet.
+
 A `keep:` verdict is never an error. A host is kept when it is busy, when the
 pool is at its floor, when GitHub could not be asked, or when it is idle but
 still inside its warm window.
@@ -110,7 +120,11 @@ per-repo dashboard code.
 zero the moment work starts), `ci_demand_queued`, `ci_hosts_running`,
 `ci_hosts_draining`, `ci_slots_total`, `ci_slots_busy`,
 `ci_host_idle_seconds_max`, `ci_queue_wait_seconds_max`, `ci_mig_target_size`,
-`ci_drain_verdicts{outcome}`, `ci_poller_heartbeat`.
+`ci_drain_verdicts{outcome}`, `ci_orphan_registrations_reaped`,
+`ci_poller_heartbeat`.
+
+`ci_orphan_registrations_reaped` should sit at zero at steady state: a pool that
+keeps reaping is losing hosts without going through the drain path.
 
 `ci_poller_heartbeat` is published on every tick including a failed one:
 "no data" there means the controller is down, which no other series can
@@ -120,7 +134,8 @@ distinguish from "the pool is idle".
 
 ```
 modules/ci-runner-host-pool/     the module consumers reference
-  scripts/drain-decision.sh      pure decision rule (unit-tested)
+  scripts/drain-decision.sh      pure scale-in rule (unit-tested)
+  scripts/orphan-decision.sh     pure registration-reap rule (unit-tested)
   scripts/host-startup.sh        registers K agents; installs nothing
   scripts/controller-startup.sh  poll, publish, drain
   scripts/telemetry.sh           the single metric publisher
