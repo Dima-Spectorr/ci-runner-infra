@@ -19,6 +19,7 @@ FAIL=0
 
 # The filter, kept character-identical to controller-startup.sh. If you change
 # one, this test fails until you change the other — which is the point.
+# shellcheck disable=SC2016  # $mine_labels is a jq variable, not a shell one.
 FILTER='
   [ .jobs[]?
     | select(.status == "queued" or .status == "in_progress")
@@ -79,6 +80,7 @@ expect 0 "missing jobs key does not crash the tick" '{}'
 # the distinctive line is checked against the controller itself.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTROLLER="$HERE/../../modules/ci-runner-host-pool/scripts/controller-startup.sh"
+# shellcheck disable=SC2016  # matching jq source text literally, on purpose.
 if grep -qF 'select( [ (.labels // [])[] | select( ($mine_labels | index(.)) == null ) ] | length == 0 )' "$CONTROLLER"; then
   PASS=$((PASS + 1))
 else
