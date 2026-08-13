@@ -105,6 +105,10 @@ source "googlecompute" "host" {
   # and the provisioners' `sudo` needs that identity to hold osAdminLogin.
   use_os_login = true
 
+  # Required by the plugin even under OS Login, which then replaces it with the
+  # POSIX account name of the builder's service account.
+  ssh_username = "packer"
+
   machine_type        = "n2-standard-8"
   disk_size           = 200
   disk_type           = "pd-balanced"
