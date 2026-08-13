@@ -1,0 +1,12 @@
+# These scripts are checked out on Windows and EXECUTED on Linux VMs, embedded
+# verbatim into instance metadata by Terraform's file()/templatefile(). A CRLF
+# line ending survives that path and reaches the guest, where `#!/usr/bin/env
+# bash\r` is not an interpreter and every startup script fails at boot.
+#
+# Force LF regardless of the checkout platform's core.autocrlf.
+*.sh   text eol=lf
+*.tf   text eol=lf
+*.hcl  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
