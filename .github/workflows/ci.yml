@@ -42,12 +42,14 @@ jobs:
 
       - run: terraform fmt -check -recursive
 
-      - name: validate the module standalone
+      - name: validate every module standalone
         run: |
           set -euo pipefail
-          cd modules/ci-runner-host-pool
-          terraform init -backend=false
-          terraform validate
+          for m in modules/*/; do
+            echo "== $m"
+            terraform -chdir="$m" init -backend=false
+            terraform -chdir="$m" validate
+          done
 
   genericity:
     name: Genericity (no customer or repo literals)
