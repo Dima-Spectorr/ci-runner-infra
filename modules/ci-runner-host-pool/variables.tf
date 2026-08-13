@@ -135,6 +135,20 @@ variable "drain_grace_seconds" {
   default     = 900
 }
 
+variable "register_grace_seconds" {
+  description = <<-EOT
+    How long a host may show ZERO registered agents before the controller reads
+    that as a failed boot rather than a boot in progress. A booting host is
+    indistinguishable from a dead one by registration alone, and draining on
+    that read is a churn loop that never reaches usable capacity — and kills
+    jobs outright when the agents come up between the verdict and the delete.
+    Must stay above the worst-case time from instance creation to the last
+    agent registering (token fetch + config.sh per slot).
+  EOT
+  type        = number
+  default     = 600
+}
+
 variable "warm_schedules" {
   description = <<-EOT
     Optional autoscaler scaling schedules — a warm floor that applies only

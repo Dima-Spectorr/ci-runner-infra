@@ -55,11 +55,17 @@ GRACE=$(md "instance/attributes/ci-drain-grace-seconds")
 POLL=$(md "instance/attributes/ci-poll-seconds")
 METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 RUNNER_LABELS=$(md "instance/attributes/ci-runner-labels")
+REGISTER_GRACE=$(md "instance/attributes/ci-register-grace-seconds")
 
 SLOTS=${SLOTS:-1}
 MIN_HOSTS=${MIN_HOSTS:-0}
 MAX_HOSTS=${MAX_HOSTS:-0}
 GRACE=${GRACE:-900}
+# How long a host may read reg=absent before it counts as a failed boot rather
+# than a booting one. A golden-image host registers in well under two minutes;
+# 600s leaves room for a slow image pull or an API retry without letting a truly
+# dead host bill all night.
+REGISTER_GRACE=${REGISTER_GRACE:-600}
 POLL=${POLL:-20}
 METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/github}
 REPO_FULL="$OWNER/$REPO"
@@ -243,6 +249,28 @@ host_facts() {
   fi
 }
 
+# host_age_seconds <host>
+# How long THIS CONTROLLER has known the host, from a file stamped the first
+# tick it appears. Deliberately not the instance's creationTimestamp: that would
+# cost an API call per host per tick, and the direction this errs in is the safe
+# one — after a controller restart every host reads young, so the worst case is
+# that a genuinely dead host survives one register-grace window instead of a
+# live one being shot.
+host_age_seconds() {
+  local host="$1"
+  local f="$STATE_DIR/seen-$host"
+  local now first
+  now=$(date +%s)
+  if [ ! -f "$f" ]; then
+    echo "$now" >"$f"
+    echo 0
+    return 0
+  fi
+  first=$(cat "$f" 2>/dev/null)
+  [ -n "$first" ] || { echo "$now" >"$f"; echo 0; return 0; }
+  echo $((now - first))
+}
+
 # idle_seconds <host> <busy>
 # Idle age is kept on disk, not in memory, so a controller restart does not
 # reset every host's clock and hand the whole pool a fresh grace window.
@@ -285,6 +313,23 @@ drain_host() {
 
   local tok
   tok=$(gh_token) || { log "drain $host: no token, aborting drain"; return 1; }
+
+  # An "absent" host has no ids to deregister, so the 422 mid-job guard below
+  # has nothing to refuse and cannot protect it. Re-ask GitHub with a FRESH
+  # list first: if the agents came up between the verdict and now, the host is
+  # alive and may already be holding work.
+  if [ -z "$ids" ]; then
+    local fresh
+    fresh=$(gh_api "repos/$REPO_FULL/actions/runners?per_page=100" 2>/dev/null)
+    ids=$(printf '%s' "$fresh" | jq -r --arg h "$host" \
+      '.runners[]? | select(.name | startswith($h + "-s")) | .id' 2>/dev/null)
+    if [ -n "$ids" ]; then
+      log "drain $host: agents registered between the poll and the drain — aborting"
+      rm -f "$STATE_DIR/idle-$host"
+      DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
+      return 1
+    fi
+  fi
 
   for id in $ids; do
     local code
@@ -337,7 +382,7 @@ drain_host() {
       return 1
     }
 
-  rm -f "$STATE_DIR/idle-$host"
+  rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/seen-$host"
   log "drain $host: deregistered and deleted"
   DRAINED=$((DRAINED + 1))
   return 0
@@ -354,7 +399,7 @@ tick() {
   collect_hosts
 
   local pool_size=0 slots_busy=0 idle_max=0 draining=0
-  local host status busy idle verdict
+  local host status busy idle age verdict
 
   while read -r host status; do
     [ -n "$host" ] || continue
@@ -370,8 +415,10 @@ tick() {
 
     idle=$(idle_seconds "$host" "$busy")
     [ "$idle" -gt "$idle_max" ] && idle_max=$idle
+    age=$(host_age_seconds "$host")
 
-    verdict=$(drain_decision "$status" "$busy" "$idle" "$GRACE" "$pool_size" "$MIN_HOSTS" "$HOST_REG")
+    verdict=$(drain_decision "$status" "$busy" "$idle" "$GRACE" "$pool_size" "$MIN_HOSTS" "$HOST_REG" \
+      "$age" "$REGISTER_GRACE")
 
     case "$verdict" in
       drain:*)
