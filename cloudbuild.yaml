@@ -1,0 +1,73 @@
+# Builds the golden CI host image.
+#
+# Runs on Cloud Build, never on a workstation — a local image build saturates
+# the machine, and the artifact must come from a reproducible, auditable
+# builder rather than from whoever happened to run it.
+#
+# One image serves every repository and every pool. Substitutions below carry
+# only WHERE to build and WHICH version to stamp; nothing here can make the
+# image specific to a repository, customer or region.
+#
+#   gcloud builds submit --config cloudbuild.yaml \
+#     --substitutions=_ZONE=<zone>,_SUBNETWORK=<subnet>,_IMAGE_VERSION=v3-0-0 \
+#     --project=<project>
+
+substitutions:
+  _ZONE: ""
+  _SUBNETWORK: default
+  _IMAGE_VERSION: ""
+  _IMAGE_FAMILY: ci-runner-host
+  _RUNNER_VERSION: 2.319.1
+  # Optional path (in this repo) to a cache-warming script for the image.
+  _WARM_CACHE_SCRIPT: ""
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  # Packer drives a build VM; the builder itself needs no muscle.
+  machineType: E2_HIGHCPU_8
+
+steps:
+  - id: guard
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        # An unversioned image cannot be pinned by a consumer, and an image no
+        # consumer can pin is how a fleet ends up running N different hosts.
+        [ -n "${_IMAGE_VERSION}" ] || { echo "_IMAGE_VERSION is required"; exit 1; }
+        [ -n "${_ZONE}" ] || { echo "_ZONE is required"; exit 1; }
+
+  - id: packer
+    name: hashicorp/packer:latest
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -eu
+        cd packer
+        packer init ci-host-image.pkr.hcl
+        packer build \
+          -var "project_id=$PROJECT_ID" \
+          -var "zone=${_ZONE}" \
+          -var "subnetwork=${_SUBNETWORK}" \
+          -var "image_family=${_IMAGE_FAMILY}" \
+          -var "image_version=${_IMAGE_VERSION}" \
+          -var "runner_version=${_RUNNER_VERSION}" \
+          -var "warm_cache_script=${_WARM_CACHE_SCRIPT}" \
+          ci-host-image.pkr.hcl
+
+  - id: report
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        gcloud compute images describe "${_IMAGE_FAMILY}-${_IMAGE_VERSION}" \
+          --project="$PROJECT_ID" \
+          --format="value(name,status,diskSizeGb)"
+        echo "Pin this exact name in the pool's `image` variable — not the family."
+
+timeout: 3600s
