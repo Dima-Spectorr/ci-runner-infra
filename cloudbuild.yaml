@@ -14,7 +14,12 @@
 
 substitutions:
   _ZONE: ""
+  _NETWORK: ""
   _SUBNETWORK: default
+  # Must match the tag the project's IAP-SSH firewall rule targets, or the
+  # tunnel to the (external-IP-less) build VM cannot be established.
+  _NETWORK_TAG: ci-runner
+  _PACKER_VERSION: "1.11.2"
   _IMAGE_VERSION: ""
   _IMAGE_FAMILY: ci-runner-host
   _RUNNER_VERSION: 2.319.1
@@ -38,20 +43,30 @@ steps:
         # consumer can pin is how a fleet ends up running N different hosts.
         [ -n "${_IMAGE_VERSION}" ] || { echo "_IMAGE_VERSION is required"; exit 1; }
         [ -n "${_ZONE}" ] || { echo "_ZONE is required"; exit 1; }
+        [ -n "${_NETWORK_TAG}" ] || { echo "_NETWORK_TAG is required (IAP firewall target tag)"; exit 1; }
 
+  # Runs on the gcloud builder, NOT on hashicorp/packer: the build VM has no
+  # external IP, so Packer connects over an IAP tunnel, and Packer shells out to
+  # `gcloud compute start-iap-tunnel` to open it. The packer image has no gcloud,
+  # so that tunnel can never open there. Packer is fetched as a binary instead.
   - id: packer
-    name: hashicorp/packer:latest
-    entrypoint: sh
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
     args:
       - -c
       - |
-        set -eu
+        set -euo pipefail
+        curl -fsSL -o /tmp/packer.zip \
+          "https://releases.hashicorp.com/packer/${_PACKER_VERSION}/packer_${_PACKER_VERSION}_linux_amd64.zip"
+        unzip -q -o /tmp/packer.zip -d /usr/local/bin
         cd packer
         packer init ci-host-image.pkr.hcl
         packer build \
           -var "project_id=$PROJECT_ID" \
           -var "zone=${_ZONE}" \
+          -var "network=${_NETWORK}" \
           -var "subnetwork=${_SUBNETWORK}" \
+          -var "network_tags=[\"${_NETWORK_TAG}\"]" \
           -var "image_family=${_IMAGE_FAMILY}" \
           -var "image_version=${_IMAGE_VERSION}" \
           -var "runner_version=${_RUNNER_VERSION}" \

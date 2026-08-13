@@ -40,6 +40,23 @@ variable "subnetwork" {
   description = "Subnetwork for the build VM."
 }
 
+variable "network" {
+  type        = string
+  description = "Network for the build VM. Empty = infer from the subnetwork."
+  default     = ""
+}
+
+variable "network_tags" {
+  type        = list(string)
+  description = <<-EOT
+    Network tags the build VM carries. These MUST include the tag the project's
+    IAP-SSH firewall rule targets — the build VM has no external IP (org policy
+    compute.vmExternalIpAccess=DENY across this fleet), so Packer reaches it
+    only through the IAP tunnel, and an untagged VM is simply unreachable.
+  EOT
+  default     = []
+}
+
 variable "image_family" {
   type    = string
   default = "ci-runner-host"
@@ -77,12 +94,32 @@ variable "warm_cache_script" {
 source "googlecompute" "host" {
   project_id          = var.project_id
   zone                = var.zone
+  network             = var.network != "" ? var.network : null
   subnetwork          = var.subnetwork
+  tags                = var.network_tags
   source_image_family = var.source_image_family
-  ssh_username        = "packer"
+
+  # OS Login is enforced by org policy (compute.requireOsLogin), which makes
+  # metadata SSH keys inert — a metadata-key build would hang until it timed
+  # out. With this, Packer authenticates as the builder's own service account
+  # and the provisioners' `sudo` needs that identity to hold osAdminLogin.
+  use_os_login = true
+
   machine_type        = "n2-standard-8"
   disk_size           = 200
   disk_type           = "pd-balanced"
+
+  # No external IP, ever. `compute.vmExternalIpAccess` is DENY org-wide here, so
+  # a build VM that asks for one is rejected at create time — the build fails
+  # before a single provisioner runs. Egress still works: these VPCs peer to the
+  # landing-zone VPC and leave through the central firewall, which is how the
+  # runner hosts themselves reach GitHub without a Cloud NAT.
+  omit_external_ip = true
+
+  # Consequences of the line above: connect to the internal address, and get to
+  # it through the IAP tunnel, because the builder is not inside the VPC.
+  use_internal_ip = true
+  use_iap         = true
 
   image_name        = "${var.image_family}-${var.image_version}"
   image_family      = var.image_family
@@ -165,7 +202,10 @@ build {
     inline = [
       "set -eux",
       "apt-get clean",
-      "rm -rf /var/lib/apt/lists/* /home/packer/.ssh /root/.ssh /var/log/*.log",
+      # Every home, not /home/packer: under OS Login the build user is named
+      # after the builder's service account, so a hardcoded name would leave the
+      # build identity's authorized_keys inside an image N hosts boot from.
+      "rm -rf /var/lib/apt/lists/* /home/*/.ssh /root/.ssh /var/log/*.log",
       "truncate -s 0 /etc/machine-id",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
