@@ -91,6 +91,37 @@ registration_token() {
     | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
+# --- metadata fence -----------------------------------------------------------
+#
+# Job code must not be able to reach the instance metadata server. It would
+# otherwise mint an access token for THIS host's service account, which can read
+# the GitHub App private key out of Secret Manager and delete instances — i.e.
+# any workflow on a fork-able branch owns the fleet (the #1958 finding on the
+# pool this replaces).
+#
+# Two rules, because a job has two ways out: directly as the `runner` uid, and
+# from inside a container it starts (containers are the job isolation boundary
+# here, so DOCKER-USER is not optional). Root is deliberately NOT fenced — this
+# script and the controller's probes need metadata.
+#
+# Fails CLOSED: a host that cannot install the fence must not serve jobs.
+fence_metadata() {
+  local md_ip="169.254.169.254"
+
+  iptables -w -C OUTPUT -d "$md_ip" -m owner --uid-owner runner -j REJECT 2>/dev/null \
+    || iptables -w -I OUTPUT 1 -d "$md_ip" -m owner --uid-owner runner -j REJECT \
+    || return 1
+
+  # DOCKER-USER is created by dockerd and consulted before docker's own rules.
+  # Create it only as a fallback so the rule still exists if dockerd is late.
+  iptables -w -N DOCKER-USER 2>/dev/null || true
+  iptables -w -C FORWARD -j DOCKER-USER 2>/dev/null \
+    || iptables -w -I FORWARD 1 -j DOCKER-USER || return 1
+  iptables -w -C DOCKER-USER -d "$md_ip" -j REJECT 2>/dev/null \
+    || iptables -w -I DOCKER-USER 1 -d "$md_ip" -j REJECT \
+    || return 1
+}
+
 # --- slots --------------------------------------------------------------------
 #
 # One agent per slot, each in its own directory with its own work folder, so K
@@ -116,8 +147,15 @@ install_slot() {
   # runs as root); sudo only drops privilege for config.sh itself. Writing the
   # log as root is intended — a job must not be able to rewrite the boot log.
   # shellcheck disable=SC2024
+  # --disableupdate: GitHub otherwise forces an actions/runner self-update, which
+  # leaves run.sh alive while the agent is OFFLINE and undispatchable. On the
+  # pool this replaces that stalled CI for 90 minutes with VMs RUNNING and zero
+  # usable runners (DataRetrival #2281). It matters MORE here, not less: a warm
+  # host lives for hours, so a self-update takes K slots down at once instead of
+  # one short-lived VM. The image pins the agent version; upgrades ship by
+  # rebuilding the image, which is reviewable.
   sudo -u runner "$dir/config.sh" \
-    --unattended --replace \
+    --unattended --replace --disableupdate \
     --url "https://github.com/$OWNER/$REPO" \
     --token "$token" \
     --name "$name" \
@@ -159,6 +197,9 @@ EOF
 main() {
   mkdir -p "$SLOT_ROOT"
   id runner >/dev/null 2>&1 || die "golden image is missing the 'runner' user"
+
+  # Before any agent exists, so no job can ever race the fence.
+  fence_metadata || die "could not fence job code off the metadata server — refusing to register agents"
 
   local token
   token=$(registration_token) || die "could not obtain a registration token"

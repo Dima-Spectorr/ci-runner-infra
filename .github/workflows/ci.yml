@@ -34,6 +34,9 @@ jobs:
       - name: demand-match self-test
         run: bash scripts/ci/demand-match.selftest.sh
 
+      - name: host-startup self-test
+        run: bash scripts/ci/host-startup.selftest.sh
+
   terraform:
     name: Terraform (fmt + validate)
     runs-on: ubuntu-latest
