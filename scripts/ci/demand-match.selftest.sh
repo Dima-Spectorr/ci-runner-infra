@@ -24,7 +24,7 @@ FILTER='
   [ .jobs[]?
     | select(.status == "queued" or .status == "in_progress")
     | select( ((.labels // []) | length) > 0 )
-    | select( [ (.labels // [])[] | select( ($mine_labels | index(.)) == null ) ] | length == 0 )
+    | select( ((.labels // []) - $mine_labels) | length == 0 )
   ] | length'
 
 POOL_LABELS=$(printf '%s' "self-hosted,ci-runner-host-telnet,linux,gcp,Telnet-Emulation" \
@@ -81,7 +81,7 @@ expect 0 "missing jobs key does not crash the tick" '{}'
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTROLLER="$HERE/../../modules/ci-runner-host-pool/scripts/controller-startup.sh"
 # shellcheck disable=SC2016  # matching jq source text literally, on purpose.
-if grep -qF 'select( [ (.labels // [])[] | select( ($mine_labels | index(.)) == null ) ] | length == 0 )' "$CONTROLLER"; then
+if grep -qF 'select( ((.labels // []) - $mine_labels) | length == 0 )' "$CONTROLLER"; then
   PASS=$((PASS + 1))
 else
   FAIL=$((FAIL + 1))

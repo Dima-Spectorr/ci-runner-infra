@@ -157,7 +157,7 @@ collect_demand() {
       [ .jobs[]?
         | select(.status == "queued" or .status == "in_progress")
         | select( ((.labels // []) | length) > 0 )
-        | select( [ (.labels // [])[] | select( ($mine_labels | index(.)) == null ) ] | length == 0 )
+        | select( ((.labels // []) - $mine_labels) | length == 0 )
       ] as $mine
       | [ ($mine | length),
           ([ $mine[] | select(.status == "queued") ] | length),
