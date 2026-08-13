@@ -57,6 +57,17 @@ variable "network_tags" {
   default     = []
 }
 
+variable "image_storage_locations" {
+  type        = list(string)
+  description = <<-EOT
+    Where the produced image is STORED. Empty lets GCE choose, and its choice is
+    a multi-region ("eu") that `constraints/gcp.resourceLocations` rejects in
+    these projects — the build then runs to completion and fails only at image
+    creation, wasting the whole run. Pass the build region.
+  EOT
+  default     = []
+}
+
 variable "image_family" {
   type    = string
   default = "ci-runner-host"
@@ -127,6 +138,7 @@ source "googlecompute" "host" {
 
   image_name        = "${var.image_family}-${var.image_version}"
   image_family      = var.image_family
+  image_storage_locations = var.image_storage_locations
   image_description = "Warm CI host: runner agent + container runtime + toolchains + pre-warmed caches. Repo-agnostic; all identity arrives via instance metadata."
 
   image_labels = {

@@ -22,6 +22,9 @@ substitutions:
   _PACKER_VERSION: "1.11.2"
   _IMAGE_VERSION: ""
   _IMAGE_FAMILY: ci-runner-host
+  # Image STORAGE location. Empty lets GCE pick a multi-region, which
+  # constraints/gcp.resourceLocations rejects — after the whole build has run.
+  _IMAGE_STORAGE_LOCATION: ""
   _RUNNER_VERSION: 2.319.1
   # Optional path (in this repo) to a cache-warming script for the image.
   _WARM_CACHE_SCRIPT: ""
@@ -44,6 +47,10 @@ steps:
         [ -n "${_IMAGE_VERSION}" ] || { echo "_IMAGE_VERSION is required"; exit 1; }
         [ -n "${_ZONE}" ] || { echo "_ZONE is required"; exit 1; }
         [ -n "${_NETWORK_TAG}" ] || { echo "_NETWORK_TAG is required (IAP firewall target tag)"; exit 1; }
+        # Required, not optional: leaving it to GCE picks a multi-region that
+        # gcp.resourceLocations rejects, and it rejects it at the END of the
+        # build, after every provisioner has already run.
+        [ -n "${_IMAGE_STORAGE_LOCATION}" ] || { echo "_IMAGE_STORAGE_LOCATION is required (e.g. the build region)"; exit 1; }
 
   # Runs on the gcloud builder, NOT on hashicorp/packer: the build VM has no
   # external IP, so Packer connects over an IAP tunnel, and Packer shells out to
@@ -71,6 +78,7 @@ steps:
           -var "subnetwork=${_SUBNETWORK}" \
           -var "network_tags=[\"${_NETWORK_TAG}\"]" \
           -var "image_family=${_IMAGE_FAMILY}" \
+          -var "image_storage_locations=[\"${_IMAGE_STORAGE_LOCATION}\"]" \
           -var "image_version=${_IMAGE_VERSION}" \
           -var "runner_version=${_RUNNER_VERSION}" \
           -var "warm_cache_script=${_WARM_CACHE_SCRIPT}" \
