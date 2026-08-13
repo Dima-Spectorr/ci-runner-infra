@@ -176,7 +176,14 @@ class Handler(BaseHTTPRequestHandler):
         # rest is e.g. "" | "default/" | "default/token" | "default/email"
         parts = [p for p in rest.split("/") if p]
         if not parts:
-            self._send(200, "default/\n")
+            # Real GCE lists BOTH the alias and the account's own email, one per
+            # line, each with a trailing slash. gcloud builds its account list
+            # from this listing and then checks that its active account is in it;
+            # a listing of only "default/" yields an empty list, so gcloud fails
+            # with "Your current active account [...] does not have any valid
+            # credentials" WITHOUT ever asking for a token — the token endpoint
+            # looks healthy in the log while every job dies.
+            self._send(200, "default/\n%s/\n" % JOB_SA)
             return
 
         account = parts[0]

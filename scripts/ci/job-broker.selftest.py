@@ -143,6 +143,15 @@ check(
     status == 200 and b"default" in body,
     "status=%s body=%r" % (status, body),
 )
+# gcloud does not stop at "the listing answered": it builds its account list
+# from these lines and requires its active account to appear. A listing of only
+# "default/" is an empty list, and gcloud then reports "does not have any valid
+# credentials" without ever requesting a token.
+check(
+    "listing names the job account itself, not only the alias",
+    b"job-sa@" in body,
+    "status=%s body=%r" % (status, body),
+)
 
 status, body = get("/computeMetadata/v1/instance/service-accounts/default/?recursive=true")
 check(
