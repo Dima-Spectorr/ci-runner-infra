@@ -70,6 +70,15 @@ REPO_FULL="$OWNER/$REPO"
 # metadata key rather than each building their own list.
 POOL_LABELS_JSON=$(printf '%s' "$RUNNER_LABELS" | jq -R -c 'split(",") | map(select(length > 0))')
 
+# An empty label set silently matches NOTHING: every queued job is discarded as
+# "not mine", demand reads 0 on every tick, and the pool sits at zero hosts
+# while jobs queue. Fail loudly instead — a controller that cannot count demand
+# has no job to do.
+if [ "$POOL_LABELS_JSON" = "[]" ]; then
+  echo "ci-runner-labels metadata is missing or empty — cannot count demand" >&2
+  exit 1
+fi
+
 # --- GitHub ------------------------------------------------------------------
 
 GH_TOKEN=""
