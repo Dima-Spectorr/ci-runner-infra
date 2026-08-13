@@ -1,0 +1,71 @@
+name: CI
+
+# GitHub-hosted runners on purpose: this repo defines the self-hosted fleet, so
+# it must not need the fleet to be healthy in order to fix the fleet.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Shell (syntax + drain rule)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n every script
+        run: |
+          set -euo pipefail
+          find . -name '*.sh' -print0 | xargs -0 -n1 bash -n
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC1090/SC1091: sourced paths are resolved at runtime on the VM.
+          find . -name '*.sh' -print0 | xargs -0 shellcheck -e SC1090,SC1091
+
+      - name: drain-decision self-test
+        run: bash scripts/ci/drain-decision.selftest.sh
+
+  terraform:
+    name: Terraform (fmt + validate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - run: terraform fmt -check -recursive
+
+      - name: validate the module standalone
+        run: |
+          set -euo pipefail
+          cd modules/ci-runner-host-pool
+          terraform init -backend=false
+          terraform validate
+
+  genericity:
+    name: Genericity (no customer or repo literals)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: no hardcoded org, project, region or repo
+        run: |
+          set -uo pipefail
+          # This module is consumed by several repositories in more than one
+          # organisation, region and project. A literal here is a fork waiting
+          # to happen — it is exactly how the vendored predecessor drifted.
+          pattern='me-west1|europe-west1|mot-[a-z0-9-]+|Dima-Spectorr|\.gov\.il|gs://'
+          if grep -rInE "$pattern" \
+               --include='*.tf' --include='*.sh' --include='*.hcl' \
+               . ; then
+            echo "::error::customer/project/region literal in a shared module"
+            exit 1
+          fi
+          echo "clean"
