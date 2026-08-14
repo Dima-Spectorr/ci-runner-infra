@@ -298,6 +298,48 @@ almost always red consumes capacity and trains everyone to ignore it. Either
 fix it or quarantine it to non-required until it is fixed — leaving it as-is is
 the worst of the three options.
 
+### 5.2a `grep -q` inside a `pipefail` pipeline — a gate that inverts itself
+
+Every repo here writes shell gates, and the idiom they all reach for is
+
+```bash
+set -uo pipefail
+awk '…' file | grep -q 'the thing that must be there'
+```
+
+which is wrong. `grep -q` exits the moment it matches; the writer upstream then
+takes SIGPIPE and exits 141; `pipefail` propagates that as the pipeline's
+status. **A successful match is therefore reported as a failure** — and only
+sometimes, because it is a race with how much the writer had already buffered.
+That is precisely the shape that passes on a laptop and fails on a runner
+against a byte-identical file, so the first instinct is to hunt for a
+difference between the two machines that does not exist. It cost a full
+diagnosis cycle here on `host-startup.selftest.sh` before the assertion was made
+to print the text it had matched against, at which point the text plainly
+contained the string it claimed was missing.
+
+The dangerous direction is the inverted check — `if grep -q <bad-pattern>; then
+fail`. There the artefact turns a real regression into a silent `ok`, and
+nothing ever prints. `identity-split.selftest.sh` check 1 was that shape.
+
+Write the match against a string, never through a pipe into an early-exiting
+reader:
+
+```bash
+matches() { # <text> <ere> — grep -c reads to EOF, so nothing upstream is signalled
+  local n; n=$(printf '%s\n' "$1" | grep -cE -- "$2"); [ "${n:-0}" -gt 0 ]
+}
+matches "$(awk '…' file)" 'the thing that must be there'
+```
+
+The same applies to any early-exiting reader at the end of a pipeline under
+`pipefail` — `head -n`, `grep -m`, `sed q`. When the value is what you want and
+the status is ignored (`x=$(cmd | head -1)`), it is harmless; when the status is
+the verdict, it is a bug.
+
+Whenever a gate fails, print the input it judged, not only the verdict. A gate
+that says only "not found" cannot be told apart from a gate that is broken.
+
 ### 5.3 Retry granularity
 
 There is no flake-retry policy anywhere. When a flake occurs the whole workflow

@@ -23,20 +23,41 @@ fail=0
 ok()   { echo "  ok    $1"; }
 bad()  { echo "  FAIL  $1"; fail=1; }
 
+# Never `awk … | grep -q` under `set -o pipefail`. `grep -q` exits the moment it
+# matches, awk upstream takes SIGPIPE and exits 141, and pipefail then makes the
+# PIPELINE fail — so a match is reported as no-match, on a race with how much
+# awk had already buffered. Check 1 below is the dangerous shape: its match is
+# the FAILURE, so the artefact turns a real regression into a silent "ok".
+# `grep -c` reads to end of input, so nothing upstream is ever signalled.
+block()   { awk "/$1/,/^}/" "$2"; }          # <awk-start-re> <file>
+matches() { # <text> <ere>
+  local n
+  n=$(printf '%s\n' "$1" | grep -cE -- "$2")
+  [ "${n:-0}" -gt 0 ]
+}
+
 echo "identity-split self-test:"
+
+# The helper carries the trap it was written to avoid, so it is tested first. A
+# match on the FIRST line of a large input is the worst case: with `grep -q` the
+# writer is still pushing bytes when grep exits on the match, takes SIGPIPE, and
+# pipefail reports the successful match as a failure.
+if matches "$(seq 1 20000)" '^1$' && ! matches "$(seq 1 20000)" '^abc$'; then
+  ok "matches() is reliable on a large input"
+else
+  bad "matches() is unreliable on a large input — the pipefail/SIGPIPE trap is back, and every check below is now untrustworthy"
+fi
 
 # 1. The permissive default must not come back. A default here is not a style
 #    question: it silently picks the insecure side for anyone who says nothing.
-if awk '/^variable "controller_service_account_email"/,/^}/' "$POOL/variables.tf" \
-     | grep -qE '^  default'; then
+if matches "$(block '^variable "controller_service_account_email"' "$POOL/variables.tf")" '^  default'; then
   bad "controller_service_account_email has a default (it must be required)"
 else
   ok "controller_service_account_email is required"
 fi
 
 # 2. And the plan-time guard must still be there to reject a shared account.
-if awk '/^variable "controller_service_account_email"/,/^}/' "$POOL/variables.tf" \
-     | grep -q 'var.controller_service_account_email != var.service_account_email'; then
+if matches "$(block '^variable "controller_service_account_email"' "$POOL/variables.tf")" 'var\.controller_service_account_email != var\.service_account_email'; then
   ok "validation rejects controller == host account"
 else
   bad "validation no longer compares controller against service_account_email"
@@ -52,8 +73,7 @@ fi
 
 # 4. instance-admin belongs to the controller. Bound to the host account it is
 #    the original finding, exactly.
-if awk '/resource "google_project_iam_member" "compute"/,/^}/' "$IDENTITY/main.tf" \
-     | grep -q 'local.controller_email'; then
+if matches "$(block 'resource "google_project_iam_member" "compute"' "$IDENTITY/main.tf")" 'local\.controller_email'; then
   ok "instanceAdmin binds the controller account"
 else
   bad "instanceAdmin is not bound to local.controller_email"
@@ -76,8 +96,7 @@ fi
 # 6. A 30-character account id is a hard GCP cap, and a pool name is already
 #    close to it (ci-runner-host-dataretrival is 26). Without truncation the
 #    suffix pushes it over and the whole pool fails at plan time.
-if awk '/resource "google_service_account" "controller"/,/^}/' "$IDENTITY/main.tf" \
-     | grep -q 'substr(var.account_id, 0, min(26'; then
+if matches "$(block 'resource "google_service_account" "controller"' "$IDENTITY/main.tf")" 'substr\(var\.account_id, 0, min\(26'; then
   ok "controller account id is truncated to fit the 30-char cap"
 else
   bad "controller account id is not truncated — a long pool name will not plan"

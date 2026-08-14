@@ -45,28 +45,43 @@ bad()  { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
 # satisfy the check for the invariant.
 code_of() { grep -vE '^[[:space:]]*#' "$1"; }
 
+# Never `... | grep -q` under `set -o pipefail`. `grep -q` exits the moment it
+# matches, the writer upstream takes SIGPIPE and exits 141, and pipefail then
+# makes the PIPELINE fail — so a successful match is reported as a failure. It
+# is a race with how much the writer had already buffered, which is why this
+# passed on a laptop and failed on a runner against a byte-identical script.
+# Every predicate below therefore matches against a string, not through a pipe.
+# `grep -c` reads its input to the end, so nothing upstream is ever signalled.
+matches() { # <text> <ere>
+  local n
+  n=$(printf '%s\n' "$1" | grep -cE -- "$2")
+  [ "${n:-0}" -gt 0 ]
+}
+
 # --- the invariants, as pure predicates over a script's text -----------------
 
 # --disableupdate must sit in config.sh's own argument list. The list is
 # continued across lines with backslashes, so the run is joined first.
+joined_code_of() { # <file> — continuation lines folded into one line each
+  code_of "$1" | sed ':a;/\\$/{N;s/\\\n//;ba}'
+}
+
 has_disableupdate() { # <file>
-  code_of "$1" \
-    | sed ':a;/\\$/{N;s/\\\n//;ba}' \
-    | grep -qE 'config\.sh([^|;&]|\\)*--disableupdate'
+  matches "$(joined_code_of "$1")" 'config\.sh([^|;&]|\\)*--disableupdate'
 }
 
 has_metadata_fence() { # <file>
   local code
   code=$(code_of "$1")
-  printf '%s' "$code" | grep -q '169\.254\.169\.254' || return 1
-  printf '%s' "$code" | grep -q -- '--uid-owner "$u"' || return 1     # fenced per uid
-  printf '%s' "$code" | grep -qE '^[[:space:]]*fence_uid runner' || return 1  # the legacy job user
-  printf '%s' "$code" | grep -q 'DOCKER-USER' || return 1             # and its containers
+  matches "$code" '169\.254\.169\.254' || return 1
+  matches "$code" '--uid-owner "\$u"' || return 1                     # fenced per uid
+  matches "$code" '^[[:space:]]*fence_uid runner' || return 1         # the legacy job user
+  matches "$code" 'DOCKER-USER' || return 1                           # and its containers
   # Every SLOT user too — a job now runs as ci-s<idx>, not as `runner`, so a
   # fence that only names `runner` fences nobody who executes build code.
-  printf '%s' "$code" | grep -qE 'fence_uid "\$\(slot_user' || return 1
+  matches "$code" 'fence_uid "\$\(slot_user' || return 1
   # Fails closed: a host that cannot install the fence must not register agents.
-  printf '%s' "$code" | grep -qE 'fence_metadata[[:space:]]*\|\|[[:space:]]*die'
+  matches "$code" 'fence_metadata[[:space:]]*\|\|[[:space:]]*die'
 }
 
 # Per-slot container isolation (#10). Before this, every slot talked to the one
@@ -79,32 +94,40 @@ has_slot_isolation() { # <file>
   local code
   code=$(code_of "$1")
   # the agent's DOCKER_HOST is the slot's own socket, not the system one
-  printf '%s' "$code" | grep -qE 'Environment=DOCKER_HOST=unix:///run/\$u/docker\.sock' || return 1
+  matches "$code" 'Environment=DOCKER_HOST=unix:///run/\$u/docker\.sock' || return 1
   # a daemon per slot, started before the agent that will use it
-  printf '%s' "$code" | grep -q 'ci-dockerd@' || return 1
-  printf '%s' "$code" | grep -qE 'start_slot_dockerd "\$idx"[[:space:]]*\|\|[[:space:]]*return 1' || return 1
+  matches "$code" 'ci-dockerd@' || return 1
+  matches "$code" 'start_slot_dockerd "\$idx"[[:space:]]*\|\|[[:space:]]*return 1' || return 1
   # the shared rootful daemon is masked, not merely stopped
-  printf '%s' "$code" | grep -qE 'systemctl mask .*docker\.socket' || return 1
+  matches "$code" 'systemctl mask .*docker\.socket' || return 1
   # and the agent runs as the slot's own user
-  printf '%s' "$code" | grep -qE '^User=\$u$' || return 1
-  printf '%s' "$code" | grep -qE 'sudo -u "\$u" "\$dir/config\.sh"'
+  matches "$code" '^User=\$u$' || return 1
+  matches "$code" 'sudo -u "\$u" "\$dir/config\.sh"'
 }
+
+# The helper carries the trap it was written to avoid, so it is tested first.
+# A match on the FIRST line of a large input is the worst case: with `grep -q`
+# the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
+# and pipefail reports the successful match as a failure.
+if matches "$(seq 1 20000)" '^1$' && ! matches "$(seq 1 20000)" '^abc$'; then
+  ok
+else
+  bad "matches() is unreliable on a large input — the pipefail/SIGPIPE trap is back, and every predicate below is now untrustworthy"
+fi
 
 # --- the real script must satisfy both ---------------------------------------
 if has_disableupdate "$SCRIPT"; then
   ok
 else
   bad "config.sh is not passed --disableupdate — a forced self-update will take every slot on the host OFFLINE (#2281)"
-  # Show the joined invocation the predicate actually saw. This failure was
-  # reproduced in CI while the same commit passed locally, and with only the
-  # verdict printed there was nothing to tell a genuine regression apart from a
-  # line-ending or joining artefact. Print the evidence, so the next occurrence
-  # is read rather than guessed at.
-  printf '  saw: %s\n' "$(code_of "$SCRIPT" \
-    | sed ':a;/\\$/{N;s/\\\n//;ba}' \
+  # Show the joined invocation the predicate actually saw. The first occurrence
+  # of this failure was green locally and red in CI on a byte-identical script,
+  # and with only the verdict printed there was nothing to tell a genuine
+  # regression apart from an artefact of how the text was assembled. Print the
+  # evidence, so the next occurrence is read rather than guessed at.
+  printf '  saw: %s\n' "$(joined_code_of "$SCRIPT" \
     | grep -n 'config\.sh' \
-    | sed 's/\r/<CR>/g' \
-    | head -5)"
+    | sed -e 's/\r/<CR>/g' -e '6,$d')"
 fi
 
 if has_metadata_fence "$SCRIPT"; then
