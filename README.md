@@ -16,13 +16,18 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v3.0.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v4.2.0"
   # ...
 }
 ```
 
 A drift gate in each consuming repository fails CI if a local
 `infra/terraform/modules/ci-runner-*` directory reappears.
+
+**Putting a new repository on the fleet:**
+[`docs/onboarding-a-repository.md`](docs/onboarding-a-repository.md) — the whole
+sequence, including the label rule whose failure mode is a pull request that
+hangs rather than an error.
 
 ## What changed, and what it buys
 
@@ -170,6 +175,7 @@ modules/ci-runner-host-pool/     the module consumers reference
 packer/ci-host-image.pkr.hcl     the golden image; repo-agnostic
 scripts/ci/lane-decision.sh      pure CI-lane rule (unit-tested)
 scripts/ci/                      self-tests
+docs/onboarding-a-repository.md  how to put a NEW repo on the fleet
 docs/ci-lane-model.md            the lane contract consumers adopt
 docs/ci-optimization-catalog.md  the fleet audit behind that contract
 ```
