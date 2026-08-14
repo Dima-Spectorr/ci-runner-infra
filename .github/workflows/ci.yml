@@ -68,6 +68,14 @@ jobs:
       - name: demand-budget self-test
         run: bash scripts/ci/demand-budget.selftest.sh
 
+      # v5.1.4 shipped a global replace that gave gh_token() and idle_seconds()
+      # a variable belonging to collect_demand's scope. Under `set -u` the token
+      # path died on every tick: all seven pools blind, scale-in suspended, and
+      # every gate above green — because they all READ the controller text and
+      # none of them RAN it. This one runs the functions.
+      - name: controller-scope self-test
+        run: bash scripts/ci/controller-scope.selftest.sh
+
       - name: demand-match self-test
         run: bash scripts/ci/demand-match.selftest.sh
 
