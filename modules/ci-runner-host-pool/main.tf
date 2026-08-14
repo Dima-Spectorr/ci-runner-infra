@@ -181,6 +181,19 @@ resource "google_compute_instance_template" "host" {
       )
       error_message = "job_service_account_email must differ from controller_service_account_email — the controller holds roles/compute.instanceAdmin.v1, and job code receives the job identity through the loopback broker, so sharing them lets a pull request delete the fleet."
     }
+
+    # A demand sweep that can outlast the watchdog window is the silent-controller
+    # failure of 2026-08-14: the watchdog restarts the controller mid-tick, the
+    # restart prevents the heartbeat that would have stopped the restarting, and
+    # nothing is published at all. Blocked at plan time.
+    #
+    # Here rather than in the variable's own `validation` block because that
+    # could not read poll_interval_seconds before Terraform 1.9 and this module
+    # supports >= 1.5 — the same boundary the identity check above sits on.
+    precondition {
+      condition     = var.demand_budget_seconds <= max(300, var.poll_interval_seconds * 10) - 120
+      error_message = "demand_budget_seconds must leave at least 120s of the watchdog threshold (max(300, poll_interval_seconds * 10)) for the rest of the tick — otherwise the watchdog restarts the controller mid-tick, the restart prevents the heartbeat, and it never publishes again."
+    }
   }
 }
 
