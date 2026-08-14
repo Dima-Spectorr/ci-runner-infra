@@ -111,12 +111,24 @@ err() { local id="$1"; shift; echo "::error::[$id] $*"; fail=1; }
 # an unexported PY_BIN starts empty in every one of them, and the selftest pays a
 # fresh interpreter probe per fixture — measured at 87s against 36s.
 export PY_BIN="${PY_BIN:-}"
+py_usable() {
+  command -v "$1" >/dev/null 2>&1 &&
+    "$1" -c 'import sys, yaml; sys.exit(0 if sys.version_info >= (3, 7) and hasattr(sys.stdout, "reconfigure") else 1)' >/dev/null 2>&1
+}
+
 ensure_yaml() {
   local c
-  [ -n "$PY_BIN" ] && return 0
+  # A value already in PY_BIN is a CACHE, not an instruction: it may equally
+  # have come from the environment, where a stale path or a Python without
+  # PyYAML would skip the probe and surface later as CHECK0 on a valid config —
+  # the reader failing, reported as the configuration failing. So it is probed
+  # once and dropped if it does not work, leaving the loop below to run.
+  if [ -n "$PY_BIN" ]; then
+    py_usable "$PY_BIN" && return 0
+    PY_BIN=""
+  fi
   for c in python3 /usr/bin/python3 /usr/bin/python /usr/local/bin/python3 python; do
-    command -v "$c" >/dev/null 2>&1 || continue
-    if "$c" -c 'import sys, yaml; sys.exit(0 if sys.version_info >= (3, 7) and hasattr(sys.stdout, "reconfigure") else 1)' >/dev/null 2>&1; then
+    if py_usable "$c"; then
       PY_BIN="$c"
       return 0
     fi
@@ -542,6 +554,47 @@ def branches(node):
 DNF_LIMIT = 4096
 
 
+def neg_leaf(text):
+    """Mergify negates a condition with a leading `-`, so inversion is textual."""
+    stripped = str(text).strip()
+    return stripped[1:].strip() if stripped.startswith("-") else "-" + stripped
+
+
+def denot(item, negate=False, depth=0):
+    """The tree with every `not:` pushed down to the leaves, or None.
+
+    `not` used to be the end of reading: both the DNF and the base algebra
+    treated the subtree as unknown, and the base algebra then called it
+    UNCONSTRAINED — a rule spelled `not: {base = main}` serves everything except
+    main and was compared as if it served everything, so an admission list of
+    exactly `main` found it overlapping and passed. De Morgan is the whole of
+    the fix: negation swaps the connective and inverts the leaves, which invert
+    by the same `-` prefix Mergify itself uses.
+    """
+    if depth > MAX_DEPTH:
+        TRUNCATED.add("denot")
+        return None
+    kids = branches(item)
+    if kids is None:
+        if not isinstance(item, str):
+            return None if negate else item
+        return neg_leaf(item) if negate else item
+    connective, children = kids
+    if connective == "not":
+        if len(children) != 1:
+            return None
+        return denot(children[0], not negate, depth + 1)
+    out = []
+    for child in children:
+        sub = denot(child, negate, depth + 1)
+        if sub is None:
+            return None
+        out.append(sub)
+    flipped = "or" if connective == "and" else "and"
+    result = connective if not negate else flipped
+    return out if result == "and" else {"or": out}
+
+
 def dnf(node, depth=0):
     """The tree as a list of conjunctive terms, or None when not computable.
 
@@ -559,6 +612,9 @@ def dnf(node, depth=0):
     if kids is None:
         return [[node]] if isinstance(node, str) else [[]]
     connective, children = kids
+    if connective == "not":
+        inner = denot(node)
+        return None if inner is None else dnf(inner, depth + 1)
     if connective == "and":
         terms = [[]]
         for child in children:
@@ -585,23 +641,30 @@ def dnf(node, depth=0):
             if len(out) > DNF_LIMIT:
                 return None
         return out
-    return None  # `not` is not inverted: what this gate cannot read, it does not assert
+    return None  # an unknown connective: what this gate cannot read, it does not assert
 
 
 def satisfiable(term):
-    """False when the term contradicts itself, so no pull request takes it."""
-    bases = set()
+    """False when the term contradicts itself, so no pull request takes it.
+
+    The base half is the SET ALGEBRA rather than a count of `base =` clauses:
+    `base = main` beside `base != main` admits nothing, and neither does
+    `base = main` beside `base ~= ^release/`, while neither pair is two positive
+    equalities. A term left alive here is one `requires()` asks the check
+    question about and `#DRAFTCLASH` compares rules against — a dead one answers
+    for pull requests that cannot exist.
+    """
     drafts = set()
     for text in term:
-        negated, attr, op, value = parse_cond(text)
-        if attr == "base" and not negated and op in ("=", ":"):
-            bases.add(value)
         stripped = " ".join(str(text).split())
         if stripped in ("draft", "-draft"):
             drafts.add(stripped)
-    if len(bases) > 1:
-        return False  # a pull request targets exactly one branch
-    return len(drafts) < 2
+    if len(drafts) > 1:
+        return False
+    acc = UNIVERSE
+    for text in term:
+        acc = base_and(acc, base_set(text, set()))
+    return not base_empty(acc)
 
 
 def requires(node, predicate, depth=0):
@@ -773,6 +836,9 @@ def base_set(node, flags, depth=0):
             return ("re", frozenset([(value, negated)]))
         return None
     connective, children = kids
+    if connective == "not":
+        inner = denot(node)
+        return None if inner is None else base_set(inner, flags, depth + 1)
     if connective == "and":
         acc = UNIVERSE
         for child in children:
@@ -785,7 +851,10 @@ def base_set(node, flags, depth=0):
         for child in children:
             acc = base_or(acc, base_set(child, flags, depth + 1))
         return acc
-    return UNIVERSE
+    # Not UNIVERSE. Calling an unreadable node "unconstrained" is an ASSERTION
+    # that it admits every branch, and every comparison then runs on it; None
+    # declines the comparison instead.
+    return None
 
 
 def emit_bases(prefix, bases, flags, path):
@@ -976,7 +1045,7 @@ scan_file() {
   fi
   local badkeys; badkeys="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#BADKEY" { print $2 }' | sort -u | tr '\n' ' ')"
   if [ -n "${badkeys// /}" ]; then
-    err CHECK0 "\`$f\` contains a key this gate cannot address unambiguously: ${badkeys}. A key holding \`.\`, \`[\`, \`]\`, a tab or a newline collides with a genuinely nested path or with the record protocol itself — a top-level \`\"merge_queue.max_parallel_checks\"\` would read here exactly like the nested mapping Mergify requires, while Mergify itself sees an unknown top-level key and refuses the file. A \`(cycle)\` entry means a recursive alias, which no valid Mergify configuration has. Remove it."
+    err CHECK0 "\`$f\` contains a key this gate cannot address unambiguously: ${badkeys}. A key holding \`.\`, \`[\`, \`]\`, a tab, a carriage return or a newline collides with a genuinely nested path or with the record protocol itself — a top-level \`\"merge_queue.max_parallel_checks\"\` would read here exactly like the nested mapping Mergify requires, while Mergify itself sees an unknown top-level key and refuses the file. A \`(cycle)\` entry means a recursive alias, which no valid Mergify configuration has. Remove it."
     return
   fi
   local dups; dups="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DUP" { print $2 }' | sort -u | tr '\n' ' ')"
@@ -1519,6 +1588,29 @@ selftest() {
   # entirely and report PASS on a queue that cannot take a single pull request.
   expect rule-base-contradiction CHECK8 \
     'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - base = develop\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # `not:` is not the end of reading. This rule serves everything EXCEPT main,
+  # which is exactly the branch the admission list names, so nothing can queue.
+  # Read as an unknown connective the subtree used to answer UNCONSTRAINED — an
+  # assertion that it serves every branch — and the comparison passed.
+  expect rule-not-inverted-base CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - not:\n          base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # The same inversion where it must stay SILENT: `not: {base = develop}` serves
+  # main among everything else, so the admission list is served and the config is
+  # ordinary. An inversion that only ever raises findings is a broken reader with
+  # a lucky fixture.
+  expect rule-not-inverted-served '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - not:\n          base = develop\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # A `draft` branch that also carries `base = main` AND `base != main`. No pull
+  # request takes it, so it is not an admitted polarity to compare rules against.
+  # Counting only positive `base =` clauses left it alive and reported the
+  # `-draft` rule as deadlocked against a path that cannot exist.
+  expect amc-term-base-negation-dead '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - or:\n        - and:\n            - base = main\n            - base != main\n            - draft\n        - and:\n            - base = main\n            - -draft\n' || return 1
+  # An interpreter handed in through the environment is a CACHE, not an
+  # instruction. Trusted unprobed, a stale `PY_BIN` skips the probe and the
+  # reader dies inside a valid config — CHECK0 on a file that has nothing wrong
+  # with it. Probed and dropped, the candidate loop still finds a working one.
+  PY_BIN=/nonexistent/python expect stale-py-bin-env '' "$CLEAN" || return 1
   # A guarded key spelled CORRECTLY, at a position Mergify refuses. Every
   # exact-path reader here treats it as absent, and absent is a spelling several
   # of them accept.
