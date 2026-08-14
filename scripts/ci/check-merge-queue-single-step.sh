@@ -107,9 +107,13 @@ err() { local id="$1"; shift; echo "::error::[$id] $*"; fail=1; }
 # too old for `sys.stdout.reconfigure`, would import yaml and then die inside the
 # reader — which reads as CHECK0 on a valid config, the exact failure this loop
 # exists to prevent.
-PY_BIN=""
+# Exported, so the probe is paid ONCE. `expect` runs each fixture in a subshell:
+# an unexported PY_BIN starts empty in every one of them, and the selftest pays a
+# fresh interpreter probe per fixture — measured at 87s against 36s.
+export PY_BIN="${PY_BIN:-}"
 ensure_yaml() {
   local c
+  [ -n "$PY_BIN" ] && return 0
   for c in python3 /usr/bin/python3 /usr/bin/python /usr/local/bin/python3 python; do
     command -v "$c" >/dev/null 2>&1 || continue
     if "$c" -c 'import sys, yaml; sys.exit(0 if sys.version_info >= (3, 7) and hasattr(sys.stdout, "reconfigure") else 1)' >/dev/null 2>&1; then
@@ -142,11 +146,16 @@ ensure_yaml() {
 #   #RULEBASEANY\t<rule path>         the rule constrains no base
 #   #RULEBASEEMPTY\t<rule path>       the rule's base conditions admit nothing
 #   #RULEBASEREGEX\t<rule path>       `base ~=`: admissible set not enumerable
+#   #RULEBASENOT\t<rule path>\t<base>  a base the rule EXCLUDES (`base != x`)
 #   #RULEDRAFT\t<rule path>\t<draft|-draft>
-#   #AMCBASE / #AMCBASEANY / #AMCBASEEMPTY / #AMCBASEREGEX / #AMCDRAFT
+#   #AMCBASE / #AMCBASEANY / #AMCBASEEMPTY / #AMCBASEREGEX / #AMCBASENOT / #AMCDRAFT
+#   #AMCBASEUNSERVED\t<base>          admitted, but no queue rule takes it
+#   #DRAFTCLASH\t<draft|-draft>       admitted polarity no APPLICABLE rule takes
+#   #AMCBASEDISJOINT                  admission and rules share no branch
 #   #AMCCHECK\t<condition>            a check restated in the admission list
 #   #TYPOKEY\t<path>\t<guarded key>   a key one or two edits from a guarded one
 #   #BUDGET                           traversal exceeded its record budget
+#   #DEPTH                            a tree nests past the read depth
 #
 # `#RULE` is the identity verdict, taken on the constructed objects: an alias
 # yields the SAME list, two written-out lists never do, and an alias pointing at
@@ -231,7 +240,22 @@ def scalar(value):
 # sees an unknown top-level key and refuses the file. Rejected rather than
 # escaped: no legal Mergify key contains either character, so the honest verdict
 # is that the document is not addressable.
-BAD_KEY_CHARS = (".", "[", "]")
+# The tab and the newline are the RECORD's own delimiters, not the path's. A key
+# spelled `"max_parallel_checks\t1\tint"` is emitted verbatim into a
+# tab-separated stream, where `val_at` then decodes it as the required path
+# carrying the required value — a key Mergify rejects, certified by this gate as
+# the setting it is impersonating. Same verdict, same reason: not addressable.
+BAD_KEY_CHARS = (".", "[", "]", "\t", "\n", "\r")
+
+ESC = chr(92)
+
+
+def safe_key(text):
+    """A key REPORTED in a record must not carry the record's delimiters either."""
+    for raw, shown in ((ESC, ESC + ESC), (chr(9), ESC + "t"),
+                       (chr(13), ESC + "r"), (chr(10), ESC + "n")):
+        text = text.replace(raw, shown)
+    return text
 bad_keys = []
 typo_keys = []
 
@@ -340,11 +364,11 @@ except BudgetExceeded:
     # never below the records that look like a complete document.
     print("#BUDGET")
     for key in bad_keys:
-        print("#BADKEY\t%s" % key)
+        print("#BADKEY\t%s" % safe_key(key))
     sys.exit(0)
 
 for key in bad_keys:
-    print("#BADKEY\t%s" % key)
+    print("#BADKEY\t%s" % safe_key(key))
 
 for path, guarded in typo_keys:
     print("#TYPOKEY\t%s\t%s" % (path, guarded))
@@ -398,22 +422,49 @@ COND_OPS = ("!=", ">=", "<=", "~=", "=", ":", ">", "<")
 POSITIVE_CHECKS = ("check-success", "check-neutral", "check-skipped")
 ANY_CHECKS = POSITIVE_CHECKS + ("check-failure", "check-pending")
 MAX_DEPTH = 64
+# Set whenever a traversal stops AT that depth. Truncation is reported, never
+# absorbed: a `check-success` under 65 nested `and:` nodes is a restated check
+# that is really there, and a reader returning the cut subtree as empty turns a
+# finding into a PASS — the vacuous pass this gate exists to prevent. No config
+# a human writes nests that far, so failing closed on it costs nothing real.
+TRUNCATED = set()
 
 
 def parse_cond(text):
-    """(negated, attribute, operator, value) for one condition string."""
+    """(negated, attribute, operator, value) for one condition string.
+
+    The operator is the LEFTMOST one outside quotes, not the first one in
+    `COND_OPS`. Scanning by precedence finds the operator inside a quoted
+    value — `check-success = "lint != docs"` splits on the `!=` and yields
+    `check-success = "lint` as the attribute, which fails a valid rule and can
+    equally hide a restated check.
+    """
     body = " ".join(str(text).split())
     negated = False
     while body.startswith("-"):
         negated = not negated
         body = body[1:].strip()
-    for op in COND_OPS:
-        at = body.find(op)
-        if at > 0:
-            value = body[at + len(op):].strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            return negated, body[:at].strip(), op, value
+    quote = ""
+    i = 0
+    while i < len(body):
+        char = body[i]
+        if quote:
+            if char == quote:
+                quote = ""
+            i += 1
+            continue
+        if char in "\"'":
+            quote = char
+            i += 1
+            continue
+        if i > 0:
+            for op in COND_OPS:  # longest first AT THIS POSITION: `!=` before `=`
+                if body.startswith(op, i):
+                    value = body[i + len(op):].strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                        value = value[1:-1]
+                    return negated, body[:i].strip(), op, value
+        i += 1
     return negated, body, "", ""
 
 
@@ -430,29 +481,90 @@ def branches(node):
     return None
 
 
-def requires(node, predicate, depth=0):
-    """Does EVERY satisfiable path through this tree satisfy `predicate`?
+DNF_LIMIT = 4096
 
-    An AND requires it when ANY child requires it, since every child holds. An
-    OR requires it only when ALL branches do, since the pull request picks the
-    branch. `not` is answered False rather than inverted: a requirement this
-    gate cannot prove is not one it asserts.
+
+def dnf(node, depth=0):
+    """The tree as a list of conjunctive terms, or None when not computable.
+
+    Reducing an AND to "any child requires it" is not the same question. Two
+    disjunctions can imply a check JOINTLY —
+    `(base = main or check) and (base = develop or check)` requires the check on
+    every satisfiable path, because no pull request targets both bases — while
+    neither child requires it alone. Expanding to terms asks the actual
+    question, and the unsatisfiable term is where the joint implication lives.
     """
     if depth > MAX_DEPTH:
-        return False
+        TRUNCATED.add("dnf")
+        return None
     kids = branches(node)
     if kids is None:
-        return isinstance(node, str) and predicate(node)
+        return [[node]] if isinstance(node, str) else [[]]
     connective, children = kids
     if connective == "and":
-        return any(requires(k, predicate, depth + 1) for k in children)
+        terms = [[]]
+        for child in children:
+            sub = dnf(child, depth + 1)
+            if sub is None:
+                return None
+            product = []
+            for term in terms:
+                for extra in sub:
+                    product.append(term + extra)
+                    if len(product) > DNF_LIMIT:
+                        return None
+            terms = product
+        return terms
     if connective == "or":
-        return bool(children) and all(requires(k, predicate, depth + 1) for k in children)
-    return False
+        if not children:
+            return None
+        out = []
+        for child in children:
+            sub = dnf(child, depth + 1)
+            if sub is None:
+                return None
+            out.extend(sub)
+            if len(out) > DNF_LIMIT:
+                return None
+        return out
+    return None  # `not` is not inverted: what this gate cannot read, it does not assert
+
+
+def satisfiable(term):
+    """False when the term contradicts itself, so no pull request takes it."""
+    bases = set()
+    drafts = set()
+    for text in term:
+        negated, attr, op, value = parse_cond(text)
+        if attr == "base" and not negated and op in ("=", ":"):
+            bases.add(value)
+        stripped = " ".join(str(text).split())
+        if stripped in ("draft", "-draft"):
+            drafts.add(stripped)
+    if len(bases) > 1:
+        return False  # a pull request targets exactly one branch
+    return len(drafts) < 2
+
+
+def requires(node, predicate, depth=0):
+    """Does EVERY satisfiable term of this tree contain a matching condition?
+
+    An unreadable tree (a `not`, or an expansion past the term budget) answers
+    True: silence rather than a finding, because the alternative is failing a
+    configuration this gate merely could not read.
+    """
+    terms = dnf(node)
+    if terms is None:
+        return True
+    live = [t for t in terms if satisfiable(t)]
+    if not live:
+        return True  # nothing is admitted at all; the base checks own that case
+    return all(any(isinstance(c, str) and predicate(c) for c in t) for t in live)
 
 
 def leaves(node, out, depth=0):
     if depth > MAX_DEPTH:
+        TRUNCATED.add("leaves")
         return
     kids = branches(node)
     if kids is None:
@@ -477,61 +589,123 @@ def is_exactly(token):
     return lambda text: " ".join(str(text).split()) == token
 
 
+# The bases a condition tree admits, as a SET WITH A COMPLEMENT:
+#   ("in", {…})   exactly these branches
+#   ("out", {…})  every branch except these — ("out", set()) is unconstrained
+#   None          not enumerable (a regex), so no comparison is made
+# `base != main` is an ordinary Mergify condition and belongs to the algebra:
+# reading it as "unenumerable" disabled the comparison, and a rule serving
+# everything-but-main against an admission list of exactly `main` then passed
+# while nothing could ever queue.
+UNIVERSE = ("out", frozenset())
+
+
+def base_and(a, b):
+    if a is None or b is None:
+        return None
+    (ka, sa), (kb, sb) = a, b
+    if ka == "in" and kb == "in":
+        return ("in", sa & sb)
+    if ka == "in":
+        return ("in", sa - sb)
+    if kb == "in":
+        return ("in", sb - sa)
+    return ("out", sa | sb)
+
+
+def base_or(a, b):
+    if a is None or b is None:
+        return None
+    (ka, sa), (kb, sb) = a, b
+    if ka == "in" and kb == "in":
+        return ("in", sa | sb)
+    if ka == "in":
+        return ("out", sb - sa)
+    if kb == "in":
+        return ("out", sa - sb)
+    return ("out", sa & sb)
+
+
+def base_admits(bases, name):
+    if bases is None:
+        return True
+    kind, members = bases
+    return (name in members) if kind == "in" else (name not in members)
+
+
+def base_empty(bases):
+    return bases is not None and bases[0] == "in" and not bases[1]
+
+
+def base_overlaps(a, b):
+    """Can one pull request satisfy both? Only an empty IN set admits nothing."""
+    return not base_empty(base_and(a, b))
+
+
 def base_set(node, flags, depth=0):
-    """The bases this tree can admit: None = unconstrained, empty = nothing."""
     if depth > MAX_DEPTH:
+        TRUNCATED.add("base")
         return None
     kids = branches(node)
     if kids is None:
         if not isinstance(node, str):
-            return None
+            return UNIVERSE
         negated, attr, op, value = parse_cond(node)
-        if attr != "base" or negated:
-            return None
+        if attr != "base":
+            return UNIVERSE
         if op in ("=", ":"):
-            return frozenset([value])
-        # `base ~= ^release/` constrains the base to a set this gate cannot
-        # enumerate. Saying "unconstrained" would be a lie in the safe
-        # direction; the flag turns the comparisons off instead of guessing.
+            return ("out", frozenset([value])) if negated else ("in", frozenset([value]))
+        if op == "!=":
+            return ("in", frozenset([value])) if negated else ("out", frozenset([value]))
+        # `base ~= ^release/` is a set this gate cannot enumerate. Saying
+        # "unconstrained" would be a lie in the safe direction; the flag turns
+        # the comparisons off instead of guessing — and it propagates through
+        # the conjunction, so `base = main` ANDed with a regex is not reported
+        # as plainly admitting `main`.
         flags.add("regex")
         return None
     connective, children = kids
     if connective == "and":
-        acc = None
+        acc = UNIVERSE
         for child in children:
-            got = base_set(child, flags, depth + 1)
-            if got is None:
-                continue
-            acc = got if acc is None else (acc & got)
+            acc = base_and(acc, base_set(child, flags, depth + 1))
         return acc
     if connective == "or":
         if not children:
-            return None
-        acc = frozenset()
+            return UNIVERSE
+        acc = ("in", frozenset())
         for child in children:
-            got = base_set(child, flags, depth + 1)
-            if got is None:
-                return None  # one unconstrained branch admits anything
-            acc = acc | got
+            acc = base_or(acc, base_set(child, flags, depth + 1))
         return acc
-    return None
+    return UNIVERSE
 
 
-def emit_bases(prefix, node, path):
-    flags = set()
-    admitted = base_set(node, flags)
+def emit_bases(prefix, bases, flags, path):
     suffix = ("\t%s" % path) if path else ""
-    if admitted is None:
+    if bases is None:
         print("#%sBASEANY%s" % (prefix, suffix))
         if "regex" in flags:
             print("#%sBASEREGEX%s" % (prefix, suffix))
-    elif not admitted:
+    elif base_empty(bases):
         print("#%sBASEEMPTY%s" % (prefix, suffix))
-    else:
-        for base in sorted(admitted):
+    elif bases == UNIVERSE:
+        print("#%sBASEANY%s" % (prefix, suffix))
+    elif bases[0] == "in":
+        for base in sorted(bases[1]):
             print("#%sBASE%s\t%s" % (prefix, suffix, base))
+    else:
+        print("#%sBASEANY%s" % (prefix, suffix))
+        for base in sorted(bases[1]):
+            print("#%sBASENOT%s\t%s" % (prefix, suffix, base))
 
 
+def draft_state(node):
+    """'draft' / '-draft' when the tree pins it, None when it takes either."""
+    pinned = [t for t in ("draft", "-draft") if requires(node, is_exactly(t))]
+    return pinned[0] if len(pinned) == 1 else None
+
+
+rule_infos = []
 if isinstance(rules, list):
     for i, rule in enumerate(rules):
         if not isinstance(rule, dict) or "queue_conditions" not in rule:
@@ -539,10 +713,13 @@ if isinstance(rules, list):
         path = "queue_rules[%d]" % i
         qc = rule.get("queue_conditions")
         print("#QCCHECK\t%s\t%s" % (path, "yes" if requires(qc, is_required_check) else "no"))
-        emit_bases("RULE", qc, path)
-        for token in ("draft", "-draft"):
-            if requires(qc, is_exactly(token)):
-                print("#RULEDRAFT\t%s\t%s" % (path, token))
+        flags = set()
+        bases = base_set(qc, flags)
+        emit_bases("RULE", bases, flags, path)
+        state = draft_state(qc)
+        if state:
+            print("#RULEDRAFT\t%s\t%s" % (path, state))
+        rule_infos.append((path, bases, state))
 
 settings = doc.get("merge_protections_settings") if isinstance(doc, dict) else None
 amc = settings.get("auto_merge_conditions") if isinstance(settings, dict) else None
@@ -552,15 +729,65 @@ if amc is not None:
     for text in texts:
         if is_any_check(text):
             print("#AMCCHECK\t%s" % " ".join(str(text).split())[:200])
-    emit_bases("AMC", amc, "")
-    for token in ("draft", "-draft"):
-        if requires(amc, is_exactly(token)):
-            print("#AMCDRAFT\t%s" % token)
+    amc_flags = set()
+    amc_bases = base_set(amc, amc_flags)
+    emit_bases("AMC", amc_bases, amc_flags, "")
+    amc_draft = draft_state(amc)
+    if amc_draft:
+        print("#AMCDRAFT\t%s" % amc_draft)
+
+    # The comparisons live HERE, where both sides are still sets rather than
+    # lines of text. A rule is a candidate for an admitted pull request when
+    # its bases overlap the admission list's; the bash side would have to
+    # rebuild that from records to ask the same question.
+    if rule_infos and not base_empty(amc_bases):
+        if amc_bases is not None and amc_bases[0] == "in":
+            for base in sorted(amc_bases[1]):
+                if not any(base_admits(b, base) for _, b, _ in rule_infos):
+                    print("#AMCBASEUNSERVED\t%s" % base)
+        # The general case, which naming bases one at a time cannot reach: an
+        # admission list of `base != main` enumerates nothing to loop over, and a
+        # rule whose own base conditions are contradictory (`base = main` ANDed
+        # with `base = develop`) contributes no base to be compared against.
+        # Both admit NOTHING jointly and both used to read as PASS. Overlap is
+        # the same question in either spelling, and it survives the complement.
+        elif not any(base_overlaps(b, amc_bases) for _, b, _ in rule_infos):
+            print("#AMCBASEDISJOINT")
+    # Draft polarity, per ADMISSION PATH and against the APPLICABLE rules only.
+    #
+    # Both halves of that are load-bearing. A repository may serve `main` with
+    # `-draft` and `release` with `draft`: that is routing, not deadlock, and
+    # reading every rule's draft term at once fails it on the rule the admitted
+    # pull request never reaches. A rule pinning neither polarity takes both, so
+    # it clears the clash by itself.
+    #
+    # And the admission list has paths of its own. `(base = main and draft) or
+    # (base = release and -draft)` pins NO polarity as a whole, so asking the
+    # question once answers "unpinned" and says nothing — while the `main` path
+    # is deadlocked against a `main`/`-draft` rule exactly as if it had been
+    # written alone. Each satisfiable term carries its own base set and its own
+    # polarity, which is the pair the comparison needs.
+    amc_terms = dnf(amc)
+    live_terms = [t for t in (amc_terms or []) if satisfiable(t)]
+    seen_clash = set()
+    for term in live_terms:
+        term_draft = draft_state(term)
+        if not term_draft or term_draft in seen_clash:
+            continue
+        term_bases = base_set(term, set())
+        candidates = [r for r in rule_infos if base_overlaps(r[1], term_bases)]
+        opposite = "-draft" if term_draft == "draft" else "draft"
+        if candidates and all(state == opposite for _, _, state in candidates):
+            seen_clash.add(term_draft)
+            print("#DRAFTCLASH\t%s" % term_draft)
+
+if TRUNCATED:
+    print("#DEPTH")
 PY
 }
 
 scan_file() {
-  local f="$1" doc mpc misplaced rules r b state amc_base rule_bases
+  local f="$1" doc mpc misplaced rules r b
   if [ ! -f "$f" ]; then
     err CHECK0 "no Mergify configuration at $f. This gate cannot show that the queue checks in place, and a missing config is not an absent queue — Mergify falls back to its own defaults."
     return
@@ -588,9 +815,13 @@ scan_file() {
     err CHECK0 "\`$f\` expands past this gate's traversal budget. A cycle is not required for that: aliases that reference each other acyclically double the traversal each level, so a sub-kilobyte file can expand to millions of nodes — the gate then runs until the job times out, which reads as infrastructure flakiness rather than as a configuration finding. No valid Mergify configuration is that shape."
     return
   fi
+  if printf '%s\n' "$doc" | grep -qx '#DEPTH'; then
+    err CHECK0 "a condition list in \`$f\` nests deeper than this gate reads (64 levels). Everything below that point was NOT inspected, and reporting PASS on a tree it stopped reading is the vacuous pass this gate exists to prevent — a \`check-success\` under 65 nested \`and:\` nodes is restated whether or not the reader reached it. Flatten the conditions."
+    return
+  fi
   local badkeys; badkeys="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#BADKEY" { print $2 }' | sort -u | tr '\n' ' ')"
   if [ -n "${badkeys// /}" ]; then
-    err CHECK0 "\`$f\` contains a key this gate cannot address unambiguously: ${badkeys}. A key holding \`.\`, \`[\` or \`]\` collides with a genuinely nested path — a top-level \`\"merge_queue.max_parallel_checks\"\` would read here exactly like the nested mapping Mergify requires, while Mergify itself sees an unknown top-level key and refuses the file. A \`(cycle)\` entry means a recursive alias, which no valid Mergify configuration has. Remove it."
+    err CHECK0 "\`$f\` contains a key this gate cannot address unambiguously: ${badkeys}. A key holding \`.\`, \`[\`, \`]\`, a tab or a newline collides with a genuinely nested path or with the record protocol itself — a top-level \`\"merge_queue.max_parallel_checks\"\` would read here exactly like the nested mapping Mergify requires, while Mergify itself sees an unknown top-level key and refuses the file. A \`(cycle)\` entry means a recursive alias, which no valid Mergify configuration has. Remove it."
     return
   fi
   local dups; dups="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DUP" { print $2 }' | sort -u | tr '\n' ' ')"
@@ -770,72 +1001,48 @@ EOF
   # `[base = main, base = develop]` — a conjunction no pull request satisfies —
   # from `or: [base = main, base = develop]`, which is the ordinary way to serve
   # two branches, and the reading that treats them alike fails a correct config.
-  local amc_regex rules_any rules_regex
-  amc_base="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#AMCBASE" { print $2 }' | sort -u)"
+  local rule_bases
+  has() { printf '%s\n' "$doc" | awk -F'\t' -v k="$1" '$1 == k' | grep -q .; }
   rule_bases="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#RULEBASE" { print $3 }' | sort -u)"
-  amc_regex="$(printf '%s\n' "$doc" | grep -cx '#AMCBASEREGEX' || true)"
-  rules_any="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#RULEBASEANY"' | grep -c . || true)"
-  rules_regex="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#RULEBASEREGEX"' | grep -c . || true)"
 
   # An EMPTY admissible set is the impossible list, whatever spelling produced
   # it: two ANDed bases, or an `or:` every branch of which is ANDed against a
-  # different base. Each member is individually served by a rule, which is
+  # different base. Each base named is individually served by a rule, which is
   # exactly why it reads as correct.
-  if printf '%s\n' "$doc" | grep -qx '#AMCBASEEMPTY'; then
-    err CHECK8 "\`auto_merge_conditions\` admits NO base: its \`base\` conditions are ANDed and no pull request can target two branches at once, so nothing is ever queued — with every base named individually served by a rule, which is why this reads as correct. Write one base, or an explicit \`or:\`."
+  if has '#AMCBASEEMPTY'; then
+    err CHECK8 "\`auto_merge_conditions\` admits NO base: its \`base\` conditions are ANDed and no pull request can target two branches at once, so nothing is ever queued — while every base it names IS served by a rule, which is why this reads as correct. Write one base, or an explicit \`or:\`."
   fi
-  # A BASE-LESS list is the third spelling, and the comparison below cannot see
-  # it: with nothing to compare, the check passes. But if the rules DO constrain
-  # the base, an unconstrained auto-merge list matches pull requests targeting
-  # branches no rule admits — queued into nothing, green and unmerged, nothing
-  # red. Not demanded when a rule takes any base, and not when either side
-  # constrains the base by regex, whose admissible set is not enumerable here.
-  if [ -n "$amc_items" ] && printf '%s\n' "$doc" | grep -qx '#AMCBASEANY' \
-     && [ "$amc_regex" -eq 0 ] && [ -n "$rule_bases" ] \
-     && [ "$rules_any" -eq 0 ] && [ "$rules_regex" -eq 0 ]; then
+  # A BASE-LESS list is the third spelling. If the rules DO constrain the base,
+  # an unconstrained auto-merge list matches pull requests targeting branches no
+  # rule admits — queued into nothing, green and unmerged, nothing red. Not
+  # demanded when a rule takes any base, and not when either side constrains the
+  # base by regex or by exclusion, whose admissible set is not enumerable here.
+  if [ -n "$amc_items" ] && [ -n "$rule_bases" ] \
+     && has '#AMCBASEANY' && ! has '#AMCBASEREGEX' && ! has '#AMCBASENOT' \
+     && ! has '#RULEBASEANY' && ! has '#RULEBASEREGEX'; then
     err CHECK8 "\`auto_merge_conditions\` names no \`base\`, but the queue rules only admit: $(printf '%s' "$rule_bases" | tr '\n' ' '). Pull requests targeting any other branch are matched for auto-merge and then have no rule to queue into — they sit green and unmerged with no red check to say why. Name the base this repository queues."
   fi
-  if [ -n "$amc_base" ] && [ -n "$rule_bases" ] && [ "$rules_any" -eq 0 ] && [ "$rules_regex" -eq 0 ]; then
-    while read -r b; do
-      [ -n "$b" ] || continue
-      if ! printf '%s\n' "$rule_bases" | grep -qx -- "$b"; then
-        err CHECK8 "\`auto_merge_conditions\` queues pull requests based on \`$b\`, but no queue rule admits that base (the rules serve: $(printf '%s' "$rule_bases" | tr '\n' ' ')). Auto-queueing then matches pull requests no rule can take, or matches nothing at all — either way the pull request sits green and unmerged with no red check to say why."
-      fi
-    done <<EOF
-$amc_base
+
+  # Membership and draft polarity are both decided in the reader, where each
+  # side is still a SET (with a complement, so `base != main` participates)
+  # rather than lines of text, and where each rule's base and draft terms are
+  # still attached to each other. Rebuilding either correlation out here would
+  # be asking a different question with the same words.
+  local unserved
+  unserved="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#AMCBASEUNSERVED" { print $2 }' | sort -u)"
+  while read -r b; do
+    [ -n "$b" ] || continue
+    err CHECK8 "\`auto_merge_conditions\` queues pull requests based on \`$b\`, but no queue rule admits that base (the rules serve: $(printf '%s' "$rule_bases" | tr '\n' ' ')). Auto-queueing then matches pull requests no rule can take — they sit green and unmerged with no red check to say why."
+  done <<EOF
+$unserved
 EOF
+  if has '#AMCBASEDISJOINT'; then
+    err CHECK8 "\`auto_merge_conditions\` and the queue rules admit DISJOINT sets of branches: no pull request can satisfy both, so nothing is ever queued. Same failure as an unserved base, in a spelling that names no base to point at — an admission list written as an exclusion (\`base != x\`), or a queue rule whose own \`base\` conditions are ANDed together and therefore admit nothing at all."
   fi
-  # Draft polarity, on both sides and against the APPLICABLE rules only. A
-  # repository may serve `main` with `-draft` and `release` with `draft`; an
-  # admission list of `base = release` plus `draft` is then correct, and reading
-  # the union of every rule's draft terms fails it on the `main` rule, which the
-  # admitted pull request never reaches. So: take the rules that can admit a
-  # base this list admits (a rule taking any base, or constraining it by regex,
-  # is always a candidate), and demand the polarity clash across ALL of them —
-  # one rule refusing what another accepts is a routing choice, not a deadlock.
-  local applicable app_draft app_nodraft
-  if [ -n "$amc_base" ] && [ "$amc_regex" -eq 0 ]; then
-    applicable="$( { printf '%s\n' "$doc" | awk -F'\t' '$1 == "#RULEBASEANY" || $1 == "#RULEBASEREGEX" { print $2 }'
-                     printf '%s\n' "$doc" | awk -F'\t' -v bases="$amc_base" '
-                       BEGIN { n = split(bases, a, "\n"); for (i = 1; i <= n; i++) want[a[i]] = 1 }
-                       $1 == "#RULEBASE" && ($3 in want) { print $2 }'
-                   } | sort -u )"
-  else
-    # The list constrains no base it can enumerate, so every rule is reachable.
-    applicable="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#RULEDRAFT" { print $2 }' | sort -u)"
-  fi
-  app_draft="$(printf '%s\n' "$doc" | awk -F'\t' -v r="$applicable" '
-    BEGIN { n = split(r, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") ok[a[i]] = 1 }
-    $1 == "#RULEDRAFT" && ($2 in ok) && $3 == "draft"' | grep -c . || true)"
-  app_nodraft="$(printf '%s\n' "$doc" | awk -F'\t' -v r="$applicable" '
-    BEGIN { n = split(r, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") ok[a[i]] = 1 }
-    $1 == "#RULEDRAFT" && ($2 in ok) && $3 == "-draft"' | grep -c . || true)"
-  if printf '%s\n' "$doc" | awk -F'\t' '$1 == "#AMCDRAFT" && $2 == "draft"' | grep -q . \
-     && [ "$app_nodraft" -gt 0 ] && [ "$app_draft" -eq 0 ]; then
+  if printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DRAFTCLASH" && $2 == "draft"' | grep -q .; then
     err CHECK8 "\`auto_merge_conditions\` admits \`draft\` while every queue rule that can take those pull requests requires \`-draft\`. Only drafts are then auto-queued, and no rule accepts them: nothing merges, and nothing goes red."
   fi
-  if printf '%s\n' "$doc" | awk -F'\t' '$1 == "#AMCDRAFT" && $2 == "-draft"' | grep -q . \
-     && [ "$app_draft" -gt 0 ] && [ "$app_nodraft" -eq 0 ]; then
+  if printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DRAFTCLASH" && $2 == "-draft"' | grep -q .; then
     err CHECK8 "\`auto_merge_conditions\` requires \`-draft\` while every queue rule that can take those pull requests requires \`draft\`. The two admit disjoint sets of pull requests, so the queue takes nothing at all — the mirror image of the case above, and just as silent."
   fi
 }
@@ -843,6 +1050,26 @@ EOF
 selftest() {
   local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
   local cases=0
+  # Probe HERE, in the parent shell, so the exported result reaches every
+  # fixture's subshell. Probing inside `expect` sets it in a child that exits.
+  ensure_yaml || true
+
+  # An `auto_merge_conditions` holding one `check-success` under N nested `and:`
+  # nodes. Written out rather than escaped inline, because the indentation IS
+  # the nesting and a one-line spelling of it is unreadable.
+  deep_amc() {
+    local n="$1" i=0 pad
+    printf 'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n'
+    printf '    queue_conditions: &gate\n      - base = main\n      - -draft\n'
+    printf '      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\n'
+    printf 'merge_protections_settings:\n  auto_merge_conditions:\n'
+    while [ "$i" -lt "$n" ]; do
+      pad=$((4 + i * 4))
+      printf '%*s- and:\n' "$pad" ''
+      i=$((i + 1))
+    done
+    printf '%*s- check-success = "Lint"\n' $((4 + n * 4)) ''
+  }
 
   # expect <name> "<expected check ids, space-separated>" <config body>
   #
@@ -1042,6 +1269,56 @@ selftest() {
   # configuration — the false failure that teaches a reader to delete CHECK 8.
   expect amc-draft-polarity-other-rule '' \
     'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\n  - name: release\n    queue_conditions: &relgate\n      - base = release\n      - draft\n      - check-success = "Lint"\n    merge_conditions: *relgate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = release\n    - draft\n' || return 1
+  # A rule that pins NO draft polarity accepts both, so it clears the clash on
+  # its own — reading "no `-draft` term" as "requires the opposite" fails it.
+  expect amc-draft-unconstrained-rule '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - draft\n' || return 1
+  # `base != main` is DECIDABLE, and disjoint from `base = main`. The admission
+  # list takes everything but `main`; the only rule takes `main` alone.
+  expect amc-base-excluded CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base != main\n    - -draft\n' || return 1
+  # A rule constraining its base by REGEX has no enumerable admissible set, so
+  # the base-less admission list above it cannot be called unserved.
+  expect rule-base-regex-silences-baseless '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base ~= ^(main|release/.+)$\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - -draft\n' || return 1
+  # An AND of two ORs. No pull request targets two bases, so the terms pairing
+  # `base = main` with `base = develop` are unsatisfiable and drop out; every
+  # SURVIVING term names the check, which is what "required on every path" means.
+  # Asking `any(child requires)` per AND would answer no and raise CHECK4 here.
+  expect qc-and-of-ors-joint-check '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - or:\n          - base = develop\n          - check-success = "Lint"\n      - or:\n          - base = release\n          - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # The operator is the LEFTMOST one OUTSIDE quotes. A `!=` inside the quoted
+  # check name is part of the value; splitting on it reads the attribute as
+  # `check-success = "lint` and the condition stops counting as a required check.
+  expect quoted-value-holding-operator '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "lint != docs"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # The admission list has PATHS of its own. As a whole it pins no polarity, so
+  # asking the question once answers "unpinned" and says nothing — while its
+  # `draft` branch is deadlocked against the `main`/`-draft` rule exactly as if
+  # it had been written alone.
+  expect amc-draft-per-branch CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - or:\n        - and:\n            - base = main\n            - draft\n        - and:\n            - base = main\n            - -draft\n' || return 1
+  # A tab inside a mapping key is the record protocol delimiter itself. Emitted
+  # verbatim it decodes as the required path carrying the required value: a key
+  # Mergify refuses, certified here as the setting it is impersonating.
+  expect key-holding-tab CHECK0 \
+    'merge_queue:\n  max_parallel_checks: 1\n  "max_parallel_checks\\tx": 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # A regex ANDed with an exact base. The regex is not "unconstrained": keeping
+  # the exact set and dropping the regex would read this list as plainly
+  # admitting `develop`, and raise an unserved-base finding on a configuration
+  # whose real admissible set this gate cannot enumerate. Uncertainty propagates
+  # through the conjunction, so the comparison is declined instead.
+  expect amc-regex-and-exact '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base ~= ^release/\n    - base = develop\n    - -draft\n' || return 1
+  # The rule's OWN bases are ANDed, so it admits nothing and contributes no base
+  # to compare against. An empty `rule_bases` used to skip the comparison
+  # entirely and report PASS on a queue that cannot take a single pull request.
+  expect rule-base-contradiction CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - base = develop\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # Nesting past the read depth. The restated check is really in the file; a
+  # reader that stops before reaching it must say so rather than report clean.
+  expect deep-nesting CHECK0 \
+    "$(deep_amc 70)" || return 1
   # Aliases that reference each other ACYCLICALLY. The cycle guard does not fire
   # — there is no cycle — and each level doubles the traversal, so this
   # sub-kilobyte file expands past any timeout the job is given.

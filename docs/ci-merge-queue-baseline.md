@@ -263,15 +263,41 @@ The first is a **false failure**, and a gate that fails a correct configuration
 teaches its next reader that the gate can be deleted. The second is the
 dangerous direction: it reports a queue gated on CI over one that is not.
 
-So the base constraint is computed as an **admissible set** on the tree —
-intersection across ANDed items, union across `or:` branches, and unconstrained
-if any branch is — and the check requirement is "**every satisfiable path**
-names a `check-success`/`check-neutral`/`check-skipped`", which an `or:`
-satisfies only when *all* of its branches do. That keeps the skip-aware form the
-fleet actually uses (`or: [check-success = X, check-skipped = X]`) passing, and
-an impossible admission list fails as an **empty** admissible set whatever
-spelling produced it. `base ~=` constrains the base to a set that cannot be
-enumerated here, so it turns the comparison off rather than guessing.
+So the base constraint is computed as an **admissible set with a complement** on
+the tree — `("in", {…})` for the branches a condition names, `("out", {…})` for
+`base != x`, intersection across ANDed items and union across `or:` branches —
+and the check requirement is "**every satisfiable conjunctive term** names a
+`check-success`/`check-neutral`/`check-skipped`". The tree is expanded to those
+terms rather than reduced branch by branch, because two disjunctions can imply a
+check *jointly*: `(base = main or check) and (base = develop or check)` requires
+it on every satisfiable path, since no pull request targets two branches, while
+neither `or:` requires it alone. Terms that contradict themselves — two distinct
+bases, or both `draft` and `-draft` — are discarded before the question is asked.
+That keeps the skip-aware form the fleet actually uses
+(`or: [check-success = X, check-skipped = X]`) passing.
+
+Both sides of the comparison are then sets, so the ways a queue can admit
+nothing are one question rather than several spellings: an **empty** admissible
+set, an admission base **no rule admits**, or an admission list and a rule set
+that are simply **disjoint** — which is where `base != main` against a rule
+serving only `main`, and a rule whose own bases are ANDed together, both land.
+`base ~=` constrains the base to a set that cannot be enumerated here, so it
+turns the comparison off rather than guessing, and that uncertainty propagates
+through the conjunction instead of being dropped by the exact base beside it.
+
+Draft polarity is read the same way — **per satisfiable term**, not once for the
+whole tree. An admission list spelled `(base = main and draft) or (base = main
+and -draft)` pins no polarity as a whole, so a single question answers
+"unpinned" and says nothing, while its `draft` branch is deadlocked against a
+`-draft` rule exactly as if it had been written alone. Each term carries its own
+base set, and only rules whose admissible base overlaps that set are compared.
+
+What the reader **cannot** read, it does not assert: a `not:`, an expansion past
+the term budget, or a tree nested past the read depth. The first two answer
+"requirement satisfied" — silence rather than a finding, because the alternative
+is failing a configuration the gate merely could not parse. Depth is the
+exception and fails closed: a `check-success` under 65 nested `and:` nodes is
+really in the file, so a reader that stopped before reaching it says so.
 
 Conditions are also split on the **attribute**, never matched as a substring:
 `label != check-success-waived` names a label and restates no check, while
