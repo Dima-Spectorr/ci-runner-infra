@@ -285,6 +285,13 @@ serving only `main`, and a rule whose own bases are ANDed together, both land.
 turns the comparison off rather than guessing, and that uncertainty propagates
 through the conjunction instead of being dropped by the exact base beside it.
 
+Draft polarity is read the same way — **per satisfiable term**, not once for the
+whole tree. An admission list spelled `(base = main and draft) or (base = main
+and -draft)` pins no polarity as a whole, so a single question answers
+"unpinned" and says nothing, while its `draft` branch is deadlocked against a
+`-draft` rule exactly as if it had been written alone. Each term carries its own
+base set, and only rules whose admissible base overlaps that set are compared.
+
 What the reader **cannot** read, it does not assert: a `not:`, an expansion past
 the term budget, or a tree nested past the read depth. The first two answer
 "requirement satisfied" — silence rather than a finding, because the alternative

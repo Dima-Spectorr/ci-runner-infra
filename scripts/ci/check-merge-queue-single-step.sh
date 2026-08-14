@@ -240,7 +240,22 @@ def scalar(value):
 # sees an unknown top-level key and refuses the file. Rejected rather than
 # escaped: no legal Mergify key contains either character, so the honest verdict
 # is that the document is not addressable.
-BAD_KEY_CHARS = (".", "[", "]")
+# The tab and the newline are the RECORD's own delimiters, not the path's. A key
+# spelled `"max_parallel_checks\t1\tint"` is emitted verbatim into a
+# tab-separated stream, where `val_at` then decodes it as the required path
+# carrying the required value — a key Mergify rejects, certified by this gate as
+# the setting it is impersonating. Same verdict, same reason: not addressable.
+BAD_KEY_CHARS = (".", "[", "]", "\t", "\n", "\r")
+
+ESC = chr(92)
+
+
+def safe_key(text):
+    """A key REPORTED in a record must not carry the record's delimiters either."""
+    for raw, shown in ((ESC, ESC + ESC), (chr(9), ESC + "t"),
+                       (chr(13), ESC + "r"), (chr(10), ESC + "n")):
+        text = text.replace(raw, shown)
+    return text
 bad_keys = []
 typo_keys = []
 
@@ -349,11 +364,11 @@ except BudgetExceeded:
     # never below the records that look like a complete document.
     print("#BUDGET")
     for key in bad_keys:
-        print("#BADKEY\t%s" % key)
+        print("#BADKEY\t%s" % safe_key(key))
     sys.exit(0)
 
 for key in bad_keys:
-    print("#BADKEY\t%s" % key)
+    print("#BADKEY\t%s" % safe_key(key))
 
 for path, guarded in typo_keys:
     print("#TYPOKEY\t%s\t%s" % (path, guarded))
@@ -738,16 +753,33 @@ if amc is not None:
         # the same question in either spelling, and it survives the complement.
         elif not any(base_overlaps(b, amc_bases) for _, b, _ in rule_infos):
             print("#AMCBASEDISJOINT")
-    # Draft polarity, against the APPLICABLE rules only. A repository may serve
-    # `main` with `-draft` and `release` with `draft`: that is routing, not
-    # deadlock, and reading every rule's draft term at once fails it on the rule
-    # the admitted pull request never reaches. A rule that pins nothing takes
-    # both, so it clears the clash by itself.
-    if amc_draft:
-        candidates = [r for r in rule_infos if base_overlaps(r[1], amc_bases)]
-        opposite = "-draft" if amc_draft == "draft" else "draft"
+    # Draft polarity, per ADMISSION PATH and against the APPLICABLE rules only.
+    #
+    # Both halves of that are load-bearing. A repository may serve `main` with
+    # `-draft` and `release` with `draft`: that is routing, not deadlock, and
+    # reading every rule's draft term at once fails it on the rule the admitted
+    # pull request never reaches. A rule pinning neither polarity takes both, so
+    # it clears the clash by itself.
+    #
+    # And the admission list has paths of its own. `(base = main and draft) or
+    # (base = release and -draft)` pins NO polarity as a whole, so asking the
+    # question once answers "unpinned" and says nothing — while the `main` path
+    # is deadlocked against a `main`/`-draft` rule exactly as if it had been
+    # written alone. Each satisfiable term carries its own base set and its own
+    # polarity, which is the pair the comparison needs.
+    amc_terms = dnf(amc)
+    live_terms = [t for t in (amc_terms or []) if satisfiable(t)]
+    seen_clash = set()
+    for term in live_terms:
+        term_draft = draft_state(term)
+        if not term_draft or term_draft in seen_clash:
+            continue
+        term_bases = base_set(term, set())
+        candidates = [r for r in rule_infos if base_overlaps(r[1], term_bases)]
+        opposite = "-draft" if term_draft == "draft" else "draft"
         if candidates and all(state == opposite for _, _, state in candidates):
-            print("#DRAFTCLASH\t%s" % amc_draft)
+            seen_clash.add(term_draft)
+            print("#DRAFTCLASH\t%s" % term_draft)
 
 if TRUNCATED:
     print("#DEPTH")
@@ -789,7 +821,7 @@ scan_file() {
   fi
   local badkeys; badkeys="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#BADKEY" { print $2 }' | sort -u | tr '\n' ' ')"
   if [ -n "${badkeys// /}" ]; then
-    err CHECK0 "\`$f\` contains a key this gate cannot address unambiguously: ${badkeys}. A key holding \`.\`, \`[\` or \`]\` collides with a genuinely nested path — a top-level \`\"merge_queue.max_parallel_checks\"\` would read here exactly like the nested mapping Mergify requires, while Mergify itself sees an unknown top-level key and refuses the file. A \`(cycle)\` entry means a recursive alias, which no valid Mergify configuration has. Remove it."
+    err CHECK0 "\`$f\` contains a key this gate cannot address unambiguously: ${badkeys}. A key holding \`.\`, \`[\`, \`]\`, a tab or a newline collides with a genuinely nested path or with the record protocol itself — a top-level \`\"merge_queue.max_parallel_checks\"\` would read here exactly like the nested mapping Mergify requires, while Mergify itself sees an unknown top-level key and refuses the file. A \`(cycle)\` entry means a recursive alias, which no valid Mergify configuration has. Remove it."
     return
   fi
   local dups; dups="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DUP" { print $2 }' | sort -u | tr '\n' ' ')"
@@ -1260,6 +1292,17 @@ selftest() {
   # `check-success = "lint` and the condition stops counting as a required check.
   expect quoted-value-holding-operator '' \
     'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "lint != docs"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # The admission list has PATHS of its own. As a whole it pins no polarity, so
+  # asking the question once answers "unpinned" and says nothing — while its
+  # `draft` branch is deadlocked against the `main`/`-draft` rule exactly as if
+  # it had been written alone.
+  expect amc-draft-per-branch CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - or:\n        - and:\n            - base = main\n            - draft\n        - and:\n            - base = main\n            - -draft\n' || return 1
+  # A tab inside a mapping key is the record protocol delimiter itself. Emitted
+  # verbatim it decodes as the required path carrying the required value: a key
+  # Mergify refuses, certified here as the setting it is impersonating.
+  expect key-holding-tab CHECK0 \
+    'merge_queue:\n  max_parallel_checks: 1\n  "max_parallel_checks\\tx": 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
   # A regex ANDed with an exact base. The regex is not "unconstrained": keeping
   # the exact set and dropping the regex would read this list as plainly
   # admitting `develop`, and raise an unserved-base finding on a configuration
