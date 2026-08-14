@@ -247,6 +247,56 @@ aliases, so by the time the document exists the anchor names are gone — node
 identity is asserted on the constructed objects instead, which is the stronger
 statement anyway.
 
+### And the conditions are read as a tree, not as a list of strings
+
+A Mergify condition list is a **conjunction**, and `or:` / `and:` / `not:` are
+structure inside it. Flattening it to the scalars underneath — which is what
+"find a `base = …` anywhere below this path" does — gets two readings wrong, in
+opposite directions and both silently:
+
+| written as | flattened reading | actually |
+|---|---|---|
+| `or: [base = main, base = develop]` | two ANDed bases; impossible list | the ordinary way to serve two branches |
+| `or: [-draft, check-success = ci]` | the rule gates on CI | a non-draft PR takes the other branch and merges ungated |
+
+The first is a **false failure**, and a gate that fails a correct configuration
+teaches its next reader that the gate can be deleted. The second is the
+dangerous direction: it reports a queue gated on CI over one that is not.
+
+So the base constraint is computed as an **admissible set** on the tree —
+intersection across ANDed items, union across `or:` branches, and unconstrained
+if any branch is — and the check requirement is "**every satisfiable path**
+names a `check-success`/`check-neutral`/`check-skipped`", which an `or:`
+satisfies only when *all* of its branches do. That keeps the skip-aware form the
+fleet actually uses (`or: [check-success = X, check-skipped = X]`) passing, and
+an impossible admission list fails as an **empty** admissible set whatever
+spelling produced it. `base ~=` constrains the base to a set that cannot be
+enumerated here, so it turns the comparison off rather than guessing.
+
+Conditions are also split on the **attribute**, never matched as a substring:
+`label != check-success-waived` names a label and restates no check, while
+`check-success != X` and `-check-success = X` are restated checks whose operator
+an anchored `[=:~]` character class does not match.
+
+Three failures around the parse rather than in it, each with a fixture:
+
+- **The interpreter is chosen, not assumed.** `actions/setup-python` prepends a
+  Python that does not carry the image's `python3-yaml`, so a workflow that sets
+  up Python for an unrelated step turns this gate into "no YAML parser
+  available" on a runner that has one. The gate takes the first interpreter that
+  can actually `import yaml`.
+- **A key one or two edits from a guarded one is a finding.** `merge_conditons:
+  *gate` leaves `merge_conditions` *absent*, which is one of the two spellings
+  the identity check accepts — while Mergify refuses the file on the unknown key
+  and nothing queues at all. The test is a near miss, not a schema: rejecting
+  every unlisted key would fail configurations that use Mergify keys this gate
+  has never heard of.
+- **Traversal is budgeted.** The cycle guard stops a recursive alias, not an
+  acyclic one: aliases that reference each other double the traversal per level,
+  so a sub-kilobyte file expands past any timeout the job is given — and a gate
+  that runs out of time reads as infrastructure flakiness rather than as a
+  finding.
+
 ---
 
 ## What a consuming repository must not do
