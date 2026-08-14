@@ -130,20 +130,31 @@ token, and register nothing.
 
 ## 4. Apply, and read the plan
 
+The guard is **not** part of your repository — it ships with the modules, in
+`ci-runner-infra`. Clone that once and run it against your root; every git and
+terraform call it makes is `-C`/`-chdir`-scoped to the directory you pass, so it
+does not matter where you stand:
+
 ```bash
-terraform init -input=false                 # add -backend-config below if partial
-scripts/ci/tf-apply-guard.sh <runner-root-dir>
+ROOT=~/src/<your-repo>/infra/terraform/ci-runners
+terraform -chdir="$ROOT" init -input=false     # add -backend-config below if partial
+~/src/ci-runner-infra/scripts/ci/tf-apply-guard.sh "$ROOT"
 ```
 
-The guard plans, shows you the plan, refuses the two ways this has actually gone
-wrong, and only then applies **that** plan file:
+It plans, shows you the plan, refuses the ways this has actually gone wrong, and
+only then applies **that** plan file:
 
 | refusal | meaning | override |
 |---|---|---|
-| `dirty` | uncommitted changes in the root | commit them |
+| `dirty` | uncommitted changes in the root (including `.terraform.lock.hcl`) | commit them |
 | `stale` | HEAD is not `origin/HEAD` | fix the checkout; `TF_GUARD_ALLOW_UNMERGED=1` only to test a branch |
-| `refuse-protected` | the plan destroys a service account or the App-key secret | none — delete the module block on the default branch, in a PR |
-| `refuse-destroy` | the plan destroys N other resources | `TF_GUARD_CONFIRM_DESTROY=N` after reading all N |
+| `refuse-protected` | the plan destroys a service account or the App-key secret | `TF_GUARD_CONFIRM_PROTECTED=<digest>` — decommissioning a pool is legitimate, but it takes its own token |
+| `refuse-destroy` | the plan destroys other resources | `TF_GUARD_CONFIRM_DESTROY=<digest>` after reading every address it printed |
+
+Both tokens are a **hash of the destroyed addresses**, printed by the refusal
+that asks for them, not a count or a yes. A confirmation left exported by an
+earlier run therefore cannot wave through a different plan, and a plan that grows
+a resource between reading and confirming stops matching.
 
 **Never `apply -auto-approve` on a plan nobody read.** On 2026-08-14 a `git pull`
 failed inside a loop, the loop continued, and `terraform apply -auto-approve` ran

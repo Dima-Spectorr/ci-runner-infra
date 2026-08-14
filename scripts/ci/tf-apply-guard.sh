@@ -20,14 +20,22 @@
 #   1. CHECKOUT  -- HEAD must equal the remote default branch and the tree must be
 #                   clean. An apply is a statement about what is on the default
 #                   branch; if the tree is not that, the statement is false.
-#   2. PLAN      -- a plan that destroys a protected identity (service account,
-#                   App-key secret) is refused outright. Any other destroy needs
-#                   the operator to name the exact count, so "yes" cannot be typed
-#                   past a number nobody read.
+#   2. PLAN      -- destroys must be confirmed with a token DERIVED FROM THE PLAN
+#                   ITSELF, so a confirmation cannot be carried over from an
+#                   earlier run or reused by a plan that grew a resource.
 #
 # Usage:  scripts/ci/tf-apply-guard.sh <runner-root-dir> [terraform-args...]
-# Override (deliberate destroys): TF_GUARD_CONFIRM_DESTROY=<exact-count>
-# Override (checkout, e.g. testing a branch): TF_GUARD_ALLOW_UNMERGED=1
+#
+#   The script lives here, in ci-runner-infra; the runner roots live in the
+#   consuming repositories. Run it from this checkout and point it at the root:
+#     ~/src/ci-runner-infra/scripts/ci/tf-apply-guard.sh ~/src/<repo>/infra/terraform/ci-runners
+#   Every git and terraform call is made against that directory (`git -C` /
+#   `terraform -chdir`), never the current one.
+#
+# Confirmation tokens (printed by the refusal that asks for them):
+#   TF_GUARD_CONFIRM_DESTROY=<digest>    ordinary destroys
+#   TF_GUARD_CONFIRM_PROTECTED=<digest>  destroys an identity — see below
+#   TF_GUARD_ALLOW_UNMERGED=1            HEAD may differ from origin/HEAD (branch testing)
 
 set -euo pipefail
 
@@ -36,7 +44,13 @@ set -euo pipefail
 #   - a secret takes its versions with it, and the App-key PEM exists nowhere else
 #   - a service account id is unusable for 30 days after deletion, and every IAM
 #     binding that referenced it silently detaches
-PROTECTED_TYPES='google_secret_manager_secret|google_service_account'
+#
+# Matched ANCHORED against the whole type. Unanchored, this also caught
+# google_service_account_iam_member and google_secret_manager_secret_iam_member,
+# so routine IAM churn -- a binding replaced, a grant moved -- would have been
+# refused as identity destruction. A guard that cries wolf on ordinary applies is
+# a guard operators learn to override.
+PROTECTED_TYPES='^(google_secret_manager_secret|google_service_account)$'
 
 # ── pure decision functions (exercised by tf-apply-guard.selftest.sh) ─────────
 
@@ -49,15 +63,28 @@ checkout_verdict() {
   echo ok
 }
 
-# plan_verdict <destroy_count> <protected_destroy_count> <confirm_token>
+# plan_digest <newline-separated destroyed addresses> -> short content hash
+# The confirmation token is derived from WHAT is destroyed, not how many. A count
+# is reusable: an exported TF_GUARD_CONFIRM_DESTROY=3 from an earlier root would
+# wave through a different plan that also destroys three things. A digest changes
+# the moment the plan does.
+plan_digest() {
+  printf '%s\n' "$1" | LC_ALL=C sort | sha256sum | cut -c1-12
+}
+
+# plan_verdict <destroy_count> <protected_count> <digest> <confirm_destroy> <confirm_protected>
 # -> ok | refuse-protected | refuse-destroy
 plan_verdict() {
-  local destroys="$1" protected="$2" confirm="${3:-}"
-  # Protected destroys are refused unconditionally. There is no env var for this
-  # branch on purpose: the only correct way to remove an identity is to delete its
-  # module block on the default branch, in a reviewed PR, where the diff is visible.
-  [ "$protected" -gt 0 ] && { echo refuse-protected; return; }
-  if [ "$destroys" -gt 0 ] && [ "$confirm" != "$destroys" ]; then
+  local destroys="$1" protected="$2" digest="$3" confirm="${4:-}" confirm_protected="${5:-}"
+  if [ "$protected" -gt 0 ]; then
+    # Decommissioning a pool is a legitimate operation, so this cannot be an
+    # absolute refusal -- an operator who can only proceed by bypassing the guard
+    # bypasses it for everything. It takes its own token, which no ordinary
+    # destroy confirmation satisfies, and that token is bound to this exact plan.
+    [ -n "$confirm_protected" ] && [ "$confirm_protected" = "$digest" ] && { echo ok; return; }
+    echo refuse-protected; return
+  fi
+  if [ "$destroys" -gt 0 ] && [ "$confirm" != "$digest" ]; then
     echo refuse-destroy; return
   fi
   echo ok
@@ -77,20 +104,21 @@ command -v jq >/dev/null 2>&1 || die "jq is required to read the plan; refusing 
 # 1. checkout ------------------------------------------------------------------
 git -C "$dir" fetch --quiet origin
 # Resolve the remote default branch rather than assuming `main`: two of these
-# repos are still on `master`, and guessing wrong would compare against a ref
-# that does not exist and pass on an empty string.
+# repos are still on `master`. Re-resolve it on EVERY run -- `git fetch` does not
+# update an existing refs/remotes/origin/HEAD, so a repository whose default
+# branch moved after cloning would keep being compared against the old one, and a
+# checkout at that old tip would pass as current.
+git -C "$dir" remote set-head origin --auto >/dev/null 2>&1 || true
 default_ref="$(git -C "$dir" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
-if [ -z "$default_ref" ]; then
-  git -C "$dir" remote set-head origin --auto >/dev/null 2>&1 || true
-  default_ref="$(git -C "$dir" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
-fi
 [ -n "$default_ref" ] || die "cannot resolve origin/HEAD in $dir — refusing to apply from an unknown branch"
 
 head_sha="$(git -C "$dir" rev-parse HEAD)"
 remote_sha="$(git -C "$dir" rev-parse "$default_ref")"
-# Ignore Terraform's own working files: .terraform/ and the plan file this script
-# writes are not repository content and are always "dirty" during an apply.
-status="$(git -C "$dir" status --porcelain -- . | grep -v '\.terraform' || true)"
+# Exclude Terraform's own working DIRECTORY by pathspec, not by filtering the
+# porcelain output for the substring `.terraform`: that substring also matches
+# `.terraform.lock.hcl`, a tracked, reviewable file whose uncommitted edits are
+# exactly the kind of unreviewed provider change this gate exists to stop.
+status="$(git -C "$dir" status --porcelain -- . ':(exclude,glob)**/.terraform/**' ':(exclude,glob).terraform/**')"
 
 case "$(checkout_verdict "$head_sha" "$remote_sha" "$status" "${TF_GUARD_ALLOW_UNMERGED:-0}")" in
   dirty) die "working tree in $dir has uncommitted changes:
@@ -102,28 +130,39 @@ Fix the checkout — do not set TF_GUARD_ALLOW_UNMERGED unless you are deliberat
 esac
 
 # 2. plan ----------------------------------------------------------------------
-planfile="$(mktemp -u "${TMPDIR:-/tmp}/tfguard.XXXXXX.plan")"
-trap 'rm -f "$planfile" "$planfile.json"' EXIT
+# A private directory, not `mktemp -u`: that only prints an unused NAME, so on a
+# shared administration host another user can win the race and plant a symlink at
+# the path this script is about to redirect into. The plan JSON is the whole
+# configuration, including every attribute of every resource.
+workdir="$(mktemp -d)"; chmod 700 "$workdir"
+trap 'rm -rf "$workdir"' EXIT
+planfile="$workdir/tf.plan"
+
 terraform -chdir="$dir" plan -out="$planfile" "$@"
-terraform -chdir="$dir" show -json "$planfile" >"$planfile.json"
+terraform -chdir="$dir" show -json "$planfile" >"$workdir/plan.json"
 
-destroys="$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' "$planfile.json")"
-protected="$(jq --arg t "$PROTECTED_TYPES" \
-  '[.resource_changes[]? | select(.change.actions | index("delete")) | select(.type | test($t))] | length' \
-  "$planfile.json")"
+destroyed_addrs="$(jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address' "$workdir/plan.json")"
+protected_addrs="$(jq -r --arg t "$PROTECTED_TYPES" \
+  '.resource_changes[]? | select(.change.actions | index("delete")) | select(.type | test($t)) | .address' \
+  "$workdir/plan.json")"
+destroys="$(printf '%s' "$destroyed_addrs" | grep -c . || true)"
+protected="$(printf '%s' "$protected_addrs" | grep -c . || true)"
+digest="$(plan_digest "$destroyed_addrs")"
 
-case "$(plan_verdict "$destroys" "$protected" "${TF_GUARD_CONFIRM_DESTROY:-}")" in
+case "$(plan_verdict "$destroys" "$protected" "$digest" \
+          "${TF_GUARD_CONFIRM_DESTROY:-}" "${TF_GUARD_CONFIRM_PROTECTED:-}")" in
   refuse-protected)
-    jq -r --arg t "$PROTECTED_TYPES" \
-      '.resource_changes[]? | select(.change.actions | index("delete")) | select(.type | test($t)) | "  " + .address' \
-      "$planfile.json" >&2
+    printf '%s\n' "$protected_addrs" | sed 's/^/  /' >&2
     die "the plan destroys $protected protected identity resource(s), listed above.
 A secret takes its versions with it and a service-account id is unusable for 30 days.
-If this is genuinely intended, remove the module block on the default branch in a reviewed PR." ;;
+Decommissioning a pool is legitimate — but the removal must already be on the default
+branch (this checkout is, or you would not have got here). If every line above is meant
+to go, re-run with TF_GUARD_CONFIRM_PROTECTED=$digest" ;;
   refuse-destroy)
-    jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | "  " + .address' "$planfile.json" >&2
+    printf '%s\n' "$destroyed_addrs" | sed 's/^/  /' >&2
     die "the plan destroys $destroys resource(s), listed above.
-Re-run with TF_GUARD_CONFIRM_DESTROY=$destroys if every one of them is intended." ;;
+Re-run with TF_GUARD_CONFIRM_DESTROY=$digest if every one of them is intended.
+The token is a hash of that list, so it stops matching the moment the plan changes." ;;
 esac
 
 # 3. apply the plan that was inspected, never a fresh one ----------------------
