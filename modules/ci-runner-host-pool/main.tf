@@ -46,10 +46,11 @@ locals {
   # name is what lets a repository address THIS pool specifically.
   runner_labels = join(",", concat(["self-hosted", var.name], var.runner_labels))
 
-  # Controller and hosts SHOULD be different identities: the controller may
-  # delete instances, a host executes build input. Falling back keeps existing
-  # single-identity pools valid instead of failing their next apply.
-  controller_sa = var.controller_service_account_email != "" ? var.controller_service_account_email : var.service_account_email
+  # Controller and hosts are different identities: the controller may delete
+  # instances, a host executes build input. There is no fallback — the fallback
+  # that used to be here silently chose the weak side of that split for every
+  # consumer, so the variable is now required and validated instead.
+  controller_sa = var.controller_service_account_email
 
   # The host script is self-contained — a host makes no drain decisions, it
   # only serves jobs and answers questions about itself.

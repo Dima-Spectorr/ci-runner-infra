@@ -38,6 +38,23 @@ variable "grant_compute_admin" {
   default     = true
 }
 
+variable "create_controller_service_account" {
+  description = <<-EOT
+    Create a separate `<account_id>-ctl` identity for the pool CONTROLLER, and
+    put roles/compute.instanceAdmin.v1 on it instead of the host account.
+
+    Leave true. Setting false collapses the controller back onto the host
+    account, which puts instance-deletion rights on every machine that executes
+    pull-request code: job code escaping the container fence could delete the
+    pool it runs on, other repositories' hosts included. It exists only so a
+    project mid-migration can apply the module before its root passes
+    `controller_service_account_email` through to `ci-runner-host-pool` — not
+    as a supported end state.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "labels" {
   description = "Extra labels for the secret."
   type        = map(string)
