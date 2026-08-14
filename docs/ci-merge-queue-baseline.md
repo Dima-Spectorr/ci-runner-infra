@@ -62,6 +62,24 @@ green and unmerged with **no red check anywhere** to say why. That shipped once
 (DataRetrival #2378, fixed in #2384), which is why the gate asserts 5 as a pair
 with the queue-action ban.
 
+Property 5 has three spellings that satisfy the key and not the behaviour, so
+the gate rejects each of them: `auto_merge_conditions` present but **empty or
+null** (nothing matches an empty list), `autoqueue: false` on a queue rule
+(present, disabled), and an `auto_merge_conditions` whose `base = X` names a
+branch **no queue rule admits** — pull requests are then queued into a rule that
+cannot take them, or matched by nothing at all. The base is compared against the
+rules rather than against a literal, so `main` and `master` repositories share
+one gate.
+
+Alongside them the gate asserts what the condition list must still **contain**:
+every queue rule needs `queue_conditions` naming at least one `check-*`
+condition. Since `merge_conditions` is empty or identical by construction, that
+list is the only thing standing between a pull request and a merge — a rule that
+lost its checks admits on base/draft state alone and merges before CI has
+succeeded. Skip-aware requirements written as `or: [check-success = X,
+check-skipped = X]` satisfy it: the check is looked for anywhere in the
+condition subtree, not only at its top level.
+
 ---
 
 ## Identity is spelled as an anchor, not as two equal lists
@@ -78,8 +96,10 @@ Two separately written lists that agree today drift the next time a required
 check is added to one of them, and the drift is invisible: no error, no dequeue,
 every pull request merely pays a second full pass. The anchor makes them the
 same YAML node, so drift is impossible rather than unlikely. The gate therefore
-asserts the **anchor spelling**, per rule, not the values — a value comparison
-passes the exact file that is about to regress.
+asserts **node identity**, per rule — the two keys resolving to the same object
+after the parser expands aliases, which is what Mergify's schema means by
+"identical". A value comparison passes the exact file that is about to regress,
+and a text search for `&`/`*` passes a rule that aliases *another* rule's anchor.
 
 A `pull_request_rules` queue action is the same failure in another spelling: its
 `conditions:` are a third list, different by construction since it must carry
@@ -132,7 +152,12 @@ lane model, which reports `success` when its area was untouched. A check that
 
 `scripts/ci/check-merge-queue-single-step.sh` (published here; copy it in, same
 filename, so a diff against this copy is a one-liner) asserts all five
-properties plus the queue-action ban. Two rules about where it runs:
+properties plus the queue-action ban. A repository that already asserts them in
+its own suite keeps that instead of carrying both — DataRetrival does, in
+`Modernization/scripts/ci-gates.test.mjs` (tightened in its #2387 to node
+identity, non-empty `auto_merge_conditions`, and a base the queue rules admit).
+What is not optional is that something asserts them somewhere the required check
+reaches. Two rules about where it runs:
 
 - **An always-on job.** A `.mergify.yml` regression touches no service, so a
   path-filtered or draft-gated job never sees the change the gate exists to
@@ -153,12 +178,62 @@ Run `--selftest` immediately before the real invocation:
         run: bash scripts/ci/check-merge-queue-single-step.sh
 ```
 
-The self-test plants 13 fixtures and asserts each detector on its own count,
-because a config gate's characteristic failure is a **vacuous pass** — it reads
-a file it never matches and reports clean. The fixtures include a
-commented-out queue action (must satisfy neither the ban nor the
-something-queues check) and a two-rule file with one rule unanchored (a
-whole-file "an anchor exists" test passes it).
+The self-test plants 34 fixtures and asserts, for each one, the **set of check
+ids** it raises — not how many diagnostics appeared. A count-only assertion is
+itself a vacuous test: delete the queue-action detector and the fixture that
+exists to prove it stays green, because a different check emits one error
+instead. And a vacuous pass is this gate's characteristic failure — it reads a
+file it never matches and reports clean.
+
+The fixtures include a commented-out queue action (must satisfy neither the ban
+nor the something-queues check), a two-rule file with one rule unanchored (a
+whole-file "an anchor exists" test passes it), and one fixture per spelling that
+only a parser resolves: an inline `queue: {name: default}`, a quoted
+`"max_checks_retries"`, a `max_checks_retries` spliced in through a `<<` merge
+key, an `auto_merge_conditions` reached through an alias, a duplicate key, and a
+document that does not load.
+
+### It parses the file, and then matches paths, not key names
+
+Every assertion names an exact YAML path — `merge_queue.max_parallel_checks`,
+`queue_rules[1].batch_size` — never a key found somewhere in the text. The
+distinction is the gate: a key written one level too deep is not a value in an
+odd spot, it is a **file Mergify refuses to load**, and a keyword scan finds the
+value it was hoping for and reports in-place checking over a repository where
+nothing queues at all. The same shape recurs four ways, and each has a fixture:
+
+| written as | keyword scan says | actually |
+|---|---|---|
+| `max_parallel_checks` inside a queue rule | serial checking | file rejected, no rule loads |
+| `auto_merge_conditions` inside a queue rule | green PRs auto-queue | unknown key; nothing queues |
+| rule B omits `batch_size` while rule A declares `1` | unbatched | rule B batches on a throwaway branch |
+| rule B aliases rule A's anchor (`&low` / `*low`) | anchors and aliases balance | rule B's two lists are different nodes |
+
+The paths come from a **real YAML parser** (`python3` + PyYAML, which the gate
+pip-installs if the runner lacks it), and that is not an optimization — it is
+what makes the table above true. Reading the text structurally gets every row
+wrong in the same direction, the safe-looking one:
+
+- `queue: {name: default}` and `actions: {queue: …}` are the banned action, in
+  flow style. A line-oriented reader sees a scalar and reports clean.
+- `"max_checks_retries": 2` is the key, quoted.
+- `<<: *shared` splices keys into a rule from somewhere else in the file
+  entirely.
+- an alias is not a copy of a list, it is the SAME list — which is exactly the
+  distinction property 4 is about.
+- a mapping that declares the same key twice has one effective value, and it is
+  not the first one.
+
+So the parser is a **hard dependency**: without it the gate fails rather than
+degrading to a structural scan. A gate that reports PASS over a file Mergify
+cannot load is worse than no gate, and CHECK 0 also fails the run outright on a
+load error — an unterminated flow sequence three keys away leaves every other
+invariant matching while Mergify loads nothing at all.
+
+One thing is still read from the text: nothing else can be. The parser resolves
+aliases, so by the time the document exists the anchor names are gone — node
+identity is asserted on the constructed objects instead, which is the stronger
+statement anyway.
 
 ---
 
@@ -168,6 +243,9 @@ whole-file "an anchor exists" test passes it).
   The two halves land in one commit or not at all.
 - **Do not put `max_parallel_checks` inside a queue rule.** It rejects the file
   and the queue fails closed.
+- **Do not declare an invariant once and assume it covers every queue rule.**
+  `batch_size` and the anchor are per rule; a second rule that omits either is a
+  second place to lose in-place checking.
 - **Do not write `merge_conditions` out as a second list**, however carefully it
   matches today.
 - **Do not restate `check-success` conditions in `auto_merge_conditions`.**
