@@ -81,6 +81,20 @@ Recommended tiering, rather than all-or-nothing skipping:
 A draft still gets fast feedback; the pool stops paying for suites nobody reads
 until review.
 
+**Prerequisite, not a footnote — the heavy tier's job names must not be the
+required check names.** A job skipped on a draft records a real check-run with
+conclusion `skipped` on the head sha, and that run outlives the draft phase: the
+`ready_for_review` re-run adds a `success` run with the same name on the same
+sha, and Mergify reads the `skipped` one. On DataRetrival #2338 that reported
+`lint`, `typecheck`, `migrations` and `migration-harness` as failing with every
+job green, and `@mergifyio refresh` did not clear it — only a new head sha did.
+
+It only bites when `ready_for_review` is the last event on the sha, which is why
+it hides: a pull request with one more commit after being marked ready is spared,
+and the agent-authored one that was complete when opened is not. Adopt §3.1
+first, or draft tiering converts a saved pool slot into a stuck queue. Full
+write-up and the always-completing-shim fix: `docs/ci-lane-model.md`.
+
 ### 1.2 Workflow-level `paths-ignore` on satellite workflows
 
 Only 3 of ~90 PR-triggered workflows have any path filter at the trigger
