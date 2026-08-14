@@ -222,12 +222,23 @@ provision_slot_user() {
   u=$(slot_user "$idx")
 
   if ! id "$u" >/dev/null 2>&1; then
-    useradd -m -s /bin/bash "$u" || return 1
+    # --user-group, not the distro default: ci-dockerd@.service runs as
+    # User=ci-s%i Group=ci-s%i, and on an image whose /etc/login.defs sets
+    # USERGROUPS_ENAB no the slot would land in the shared `users` group and the
+    # unit would fail on an unknown group.
+    useradd -m --user-group -s /bin/bash "$u" || return 1
   fi
   # Group `ci` is how a slot reaches the shared warm cache without reaching the
   # other slots' homes (which stay 0750 and owned by their own user).
   getent group ci >/dev/null || groupadd ci
   usermod -aG ci "$u" || return 1
+  # Enforce the mode rather than inherit it. HOME_MODE / UMASK in login.defs
+  # decides what `useradd -m` creates, and a 0755 home is exactly the sibling
+  # readability this split exists to remove — an unenforced comment is not an
+  # isolation boundary.
+  getent group "$u" >/dev/null || return 1
+  chown "$u:$u" "/home/$u" || return 1
+  chmod 0750 "/home/$u" || return 1
 
   # useradd normally allocates these; allocate explicitly when it did not, well
   # clear of its default 100000 base so the two schemes cannot overlap.
@@ -339,7 +350,10 @@ Description=GitHub Actions runner slot $idx ($POOL)
 After=network-online.target ci-dockerd@$idx.service
 Wants=network-online.target
 # The agent is useless without its daemon, and must go down with it rather than
-# accept jobs that will fail at their first container step.
+# accept jobs that will fail at their first container step. BindsTo, not just
+# Requires: Requires only propagates an explicit stop, so a daemon that CRASHES
+# and exhausts its restarts would leave the agent online and still taking jobs.
+BindsTo=ci-dockerd@$idx.service
 Requires=ci-dockerd@$idx.service
 
 [Service]
@@ -378,7 +392,20 @@ main() {
   # exists, any slot that can reach it is back to full control of every other
   # slot's containers. Masked, not stopped — a package or a job must not be able
   # to start it again by touching the socket unit.
-  systemctl mask --now docker.service docker.socket >>/var/log/ci-host.log 2>&1 || true
+  # Fails CLOSED. A host that could not mask the rootful daemon must not
+  # register: with /var/run/docker.sock reachable, every slot is back to full
+  # control of every other slot's containers (#10), which is the whole exposure
+  # this model removes. A masked-but-already-dead unit still exits 0, so this is
+  # not a race with the image's own state.
+  systemctl mask --now docker.service docker.socket >>/var/log/ci-host.log 2>&1 \
+    || die "could not mask the rootful Docker daemon — refusing to register agents"
+  # Belt and braces — but on REACHABILITY, not on the file. A masked unit can
+  # leave the socket inode behind, and a host that refuses to boot over a dead
+  # file would be a self-inflicted fleet outage. What must be true is that
+  # nothing answers on it.
+  if [ -S /var/run/docker.sock ] && docker -H unix:///var/run/docker.sock info >/dev/null 2>&1; then
+    die "the rootful Docker daemon still answers on /var/run/docker.sock after masking — refusing to register agents"
+  fi
 
   local i
   for i in $(seq 1 "$SLOTS"); do

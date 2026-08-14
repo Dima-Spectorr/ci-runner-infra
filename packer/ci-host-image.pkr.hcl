@@ -330,6 +330,25 @@ build {
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
+  # 6b. Re-apply the shared-cache ownership AFTER warming.
+  #
+  #     The warm script runs as root under the default umask 022, so everything
+  #     it creates under /opt/ci-cache lands 0644 / 0755 owned by root. A slot
+  #     user can then READ the warmed cache but not update it, and package
+  #     managers fail on a partially warmed tree — which reads as a broken
+  #     repository, not a broken image. Repeating the chgrp/chmod here is
+  #     cheaper than making every consumer's warm script umask-aware.
+  provisioner "shell" {
+    inline = [
+      "set -eux",
+      "chgrp -R ci /opt/ci-cache",
+      "chmod -R g+w /opt/ci-cache",
+      # setgid on directories only, so new entries keep the `ci` group.
+      "find /opt/ci-cache -type d -exec chmod g+s {} +",
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
   # 7. Assert the host baseline, as the runner user and with the runner's PATH.
   #
   #    A missing baseline tool does not fail an image build — it fails every job

@@ -83,8 +83,17 @@ has_slot_isolation() { # <file>
   # a daemon per slot, started before the agent that will use it
   printf '%s' "$code" | grep -q 'ci-dockerd@' || return 1
   printf '%s' "$code" | grep -qE 'start_slot_dockerd "\$idx"[[:space:]]*\|\|[[:space:]]*return 1' || return 1
-  # the shared rootful daemon is masked, not merely stopped
+  # the shared rootful daemon is masked, not merely stopped — and the mask must
+  # be fatal. Ignoring its failure leaves /var/run/docker.sock reachable on a
+  # host that goes on to register agents, which is the #10 exposure intact.
   printf '%s' "$code" | grep -qE 'systemctl mask .*docker\.socket' || return 1
+  printf '%s' "$code" | grep -qE 'systemctl mask[^|]*(\\\n)?[^|]*\|\|[^|]*die|die "could not mask the rootful Docker daemon' || return 1
+  # the agent goes down with its daemon even when the daemon CRASHES (BindsTo);
+  # Requires alone only propagates an explicit stop, so a dead daemon would
+  # leave the agent taking jobs that fail at their first container step
+  printf '%s' "$code" | grep -qE '^BindsTo=ci-dockerd@' || return 1
+  # slot homes are 0750 and owned by the slot user, whatever login.defs says
+  printf '%s' "$code" | grep -qE 'chmod 0750 "/home/\$u"' || return 1
   # and the agent runs as the slot's own user
   printf '%s' "$code" | grep -qE '^User=\$u$' || return 1
   printf '%s' "$code" | grep -qE 'sudo -u "\$u" "\$dir/config\.sh"'
@@ -133,6 +142,9 @@ mutate "agent back on the shared daemon" 's|^Environment=DOCKER_HOST=unix:///run
 mutate "shared daemon left running" 's/systemctl mask --now docker.service docker.socket/systemctl stop docker.service/' has_slot_isolation
 mutate "slots share one account"   's/^User=\$u$/User=runner/'                     has_slot_isolation
 mutate "agent starts without its daemon" 's/start_slot_dockerd "\$idx" || return 1/start_slot_dockerd "$idx" || true/' has_slot_isolation
+mutate "mask failure ignored"      's/|| die "could not mask the rootful Docker daemon.*/|| true/'  has_slot_isolation
+mutate "agent survives a crashed daemon" 's/^BindsTo=ci-dockerd@/#BindsTo=ci-dockerd@/'             has_slot_isolation
+mutate "slot homes left world-readable"  's/chmod 0750 "\/home\/\$u"/chmod 0755 "\/home\/$u"/'      has_slot_isolation
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
