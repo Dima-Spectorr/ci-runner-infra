@@ -190,6 +190,39 @@ variable "orphan_confirm_ticks" {
   }
 }
 
+variable "demand_budget_seconds" {
+  description = <<-EOT
+    Seconds the controller may spend counting demand in one tick. Demand costs
+    one GitHub API call per active workflow run, so its cost is set by how busy
+    the repository is, not by anything this module controls — one pool in this
+    fleet measured a 212s tick against a 300s watchdog threshold on 2026-08-14.
+
+    A tick that outruns the watchdog is fatal rather than slow: the watchdog
+    restarts the controller, the restart kills the tick before it writes the
+    heartbeat, and the controller is restarted forever without publishing a
+    single metric. Keep this well under `poll_interval_seconds * 10` (the
+    watchdog threshold, floor 300s) with room for the rest of the tick.
+
+    Queued runs are counted first, so what an exhausted budget drops is
+    in-progress work — demand becomes a lower bound, never a wrong scale-out
+    signal. `ci_demand_runs_skipped` reports when that happens.
+  EOT
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.demand_budget_seconds >= 10
+    error_message = "demand_budget_seconds must be at least 10: a smaller budget can expire before the first run's job list returns, so demand would read 0 on every tick and the pool would never scale out."
+  }
+
+  # The failure mode this variable exists to prevent, blocked at plan time
+  # instead of discovered as a controller that publishes nothing.
+  validation {
+    condition     = var.demand_budget_seconds <= max(300, var.poll_interval_seconds * 10) - 120
+    error_message = "demand_budget_seconds must leave at least 120s of the watchdog threshold (max(300, poll_interval_seconds * 10)) for the rest of the tick — otherwise the watchdog restarts the controller mid-tick, the restart prevents the heartbeat, and it never publishes again."
+  }
+}
+
 variable "warm_schedules" {
   description = <<-EOT
     Optional autoscaler scaling schedules — a warm floor that applies only
