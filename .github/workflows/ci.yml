@@ -10,10 +10,28 @@ on:
 permissions:
   contents: read
 
+# A superseded push must release its slot rather than run to completion beside
+# its replacement. Keyed on the branch so the second push to a pull request
+# cancels the first.
+#
+# The fallback is `run_id`, NOT `github.ref`. On the `push` leg `head_ref` is
+# empty, so a `ref` fallback puts every merge to main in one group and the
+# second merge cancels the first commit's post-merge verification — the run
+# whose whole purpose is to say whether main is healthy. A unique `run_id`
+# gives each push its own group, so pull-request runs cancel and main runs
+# never do.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   shell:
     name: Shell (syntax + drain rule)
     runs-on: ubuntu-latest
+    # Without this a hung job inherits GitHub's 360-minute default. On a
+    # self-hosted pool that holds a host for six hours; here it merely wastes
+    # the wait, but the rule is fleet-wide and starts at home.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -47,9 +65,17 @@ jobs:
       - name: job credential broker self-test
         run: python3 scripts/ci/job-broker.selftest.py
 
+      # This rule decides whether a consuming repository runs CI at all, so a
+      # wrong verdict is the one that merges untested code while reporting
+      # green. Asserted here, in the repository that publishes it, rather than
+      # discovered in the fourteen repositories that consume it.
+      - name: lane-decision self-test
+        run: bash scripts/ci/lane-decision.selftest.sh
+
   terraform:
     name: Terraform (fmt + validate)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -70,6 +96,7 @@ jobs:
   genericity:
     name: Genericity (no customer or repo literals)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
