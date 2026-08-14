@@ -85,8 +85,9 @@ resource "google_secret_manager_secret" "app_key" {
 
 # Only this pool's identities may read the App key. The host and controller
 # grants are separate resources rather than one `for_each` keyed by email:
-# for_each would re-key the host's existing bindings from
-# `google_project_iam_member.metrics` to `…metrics["<email>"]`, and a computed
+# for_each would re-key the host's existing binding from
+# `google_secret_manager_secret_iam_member.runner_reads_key` to
+# `…runner_reads_key["<email>"]` (and the same for every other grant), and a computed
 # email cannot appear in a `moved` block, so every live pool would destroy and
 # recreate working IAM on its next apply for no behavioural gain.
 resource "google_secret_manager_secret_iam_member" "runner_reads_key" {
@@ -154,6 +155,21 @@ resource "google_project_iam_member" "compute" {
   count   = var.grant_compute_admin ? 1 : 0
   project = var.project_id
   role    = "roles/compute.instanceAdmin.v1"
+  member  = "serviceAccount:${local.controller_email}"
+}
+
+# The drain checks for live Runner.Worker processes over
+# `gcloud compute ssh --tunnel-through-iap` (controller-startup.sh) before it
+# deletes a host. That call needs iap.tunnelInstances.accessViaIAP, which
+# roles/compute.instanceAdmin.v1 does NOT include — so without this grant the
+# SSH fails, its failure is suppressed, the worker list comes back empty, and
+# the controller deletes the host having verified nothing. The pools that
+# predate the identity split carried the permission on the old runner account
+# and lost it when the controller moved to its own.
+resource "google_project_iam_member" "controller_iap_tunnel" {
+  count   = var.grant_compute_admin ? 1 : 0
+  project = var.project_id
+  role    = "roles/iap.tunnelResourceAccessor"
   member  = "serviceAccount:${local.controller_email}"
 }
 

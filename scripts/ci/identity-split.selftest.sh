@@ -25,6 +25,21 @@ bad()  { echo "  FAIL  $1"; fail=1; }
 
 echo "identity-split self-test:"
 
+# 0. Every check below is `if grep …; then ok; else bad`, and a grep against a
+#    MISSING file is also false — which lands in whichever branch the check
+#    happens to use. A renamed or moved file would therefore turn some checks
+#    green rather than red, i.e. quietly disable the guard this script exists to
+#    be. So assert the inputs exist before asserting anything about them.
+for f in "$POOL/variables.tf" "$POOL/main.tf" "$IDENTITY/main.tf" "$IDENTITY/outputs.tf"; do
+  if [ -r "$f" ]; then
+    ok "input readable: ${f#"$ROOT/"}"
+  else
+    bad "input MISSING: ${f#"$ROOT/"} — the checks below would be vacuous"
+    fail=1
+  fi
+done
+[ "$fail" -eq 0 ] || { echo "  identity split UNVERIFIABLE."; exit 1; }
+
 # 1. The permissive default must not come back. A default here is not a style
 #    question: it silently picks the insecure side for anyone who says nothing.
 if awk '/^variable "controller_service_account_email"/,/^}/' "$POOL/variables.tf" \
@@ -81,6 +96,24 @@ if awk '/resource "google_service_account" "controller"/,/^}/' "$IDENTITY/main.t
   ok "controller account id is truncated to fit the 30-char cap"
 else
   bad "controller account id is not truncated — a long pool name will not plan"
+fi
+
+# 7. The job identity must differ from the controller's too. Each variable's own
+#    validation only compares against the HOST account, so controller == job
+#    passes both; the pairing is rejected by a precondition in main.tf instead.
+if grep -q 'var.job_service_account_email != var.controller_service_account_email' "$POOL/main.tf"; then
+  ok "precondition rejects job == controller account"
+else
+  bad "nothing rejects job_service_account_email == controller_service_account_email"
+fi
+
+# 8. The drain verifies live workers over IAP before deleting a host. Without
+#    the tunnel role that SSH fails, the failure is suppressed, and the host is
+#    deleted having verified nothing — a silent downgrade, not an outage.
+if grep -q 'roles/iap.tunnelResourceAccessor' "$IDENTITY/main.tf"; then
+  ok "controller holds the IAP tunnel role the drain probe needs"
+else
+  bad "controller has no roles/iap.tunnelResourceAccessor — the drain's worker check cannot run"
 fi
 
 if [ "$fail" -eq 0 ]; then
