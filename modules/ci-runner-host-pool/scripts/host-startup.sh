@@ -447,8 +447,8 @@ WorkingDirectory=$dir
 # daemon is masked on this host.
 Environment=DOCKER_HOST=unix:///run/$u/docker.sock
 # The slot's private /tmp, and specifically the SAME one the daemon sees. A
-# `PrivateTmp=yes` of its own would isolate the agent from its siblings but
-# also from its own daemon, so `docker run -v /tmp/x:/x` would mount an empty
+# PrivateTmp=yes of its own would isolate the agent from its siblings but
+# also from its own daemon, so "docker run -v /tmp/x:/x" would mount an empty
 # directory instead of the file the step just wrote — a silent wrong answer,
 # which is worse than the collision being fixed here. JoinsNamespaceOf makes
 # the two share one namespace (declared in [Unit] above); the BindsTo there is
