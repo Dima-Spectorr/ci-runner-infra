@@ -58,13 +58,17 @@ to work around a reporting problem, not a preference.
 
 Fix the reporting problem instead. Name exactly one job in the branch ruleset
 and in `.mergify.yml`; that job `needs:` every gated job and runs
-`if: always()`:
+`if: ${{ !cancelled() }}`:
 
 ```yaml
   ci-success:
     name: CI
     needs: [lane, build, test, integration]
-    if: always()
+    # `!cancelled()`, NOT `always()` — see "A superseded run must not report"
+    # below. `always()` also means "run while this workflow run is being
+    # cancelled", which turns every superseded suite into a permanent red
+    # check-run for the one context the queue reads.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -241,6 +245,35 @@ genuinely-unrun gate count as green, which is the failure mode the required
 check exists to prevent — and on the `none` lane every heavy check is skipped
 by design, so the relaxation would apply exactly where it is least safe.
 
+### A superseded run must not report — `!cancelled()`, never `always()`
+
+Observed on DataRetrival #2350 (2026-08-14), immediately after the fix above
+was applied, and it is the same trap wearing a different conclusion.
+
+`always()` does not mean "after the needed jobs finish". It means "run even
+while this workflow run is being cancelled". Marking a pull request ready fires
+a second check suite on the same head sha, and `concurrency.cancel-in-progress`
+cancels the first — so every aggregate in the dying suite still executes, reads
+`cancelled` from its upstream jobs, and writes a terminal **failure** check-run
+for the required context:
+
+```
+Rule: Auto-queue non-draft PRs once required checks are green (queue)   fail
+```
+
+The second suite's `success` lands eight seconds later and does **not** displace
+it. Mergify sees both conclusions on the sha and reports the context failing —
+exactly the deadlock the aggregate was introduced to remove, with `cancelled`
+where `skipped` used to be. It is worse than the original, because it now
+reproduces on ordinary pushes too: any commit that supersedes an in-flight run
+leaves a red behind.
+
+`if: ${{ !cancelled() }}` fixes it. The aggregate is then cancelled together
+with its run rather than rendering a verdict on it, and it still runs for every
+real outcome — success, failure, skip — which is the case `always()` was there
+for. An upstream job cancelled on its own while its run continues still reports
+red, so nothing is loosened.
+
 ---
 
 ## Interaction with the merge queue
@@ -267,6 +300,10 @@ by design, so the relaxation would apply exactly where it is least safe.
   pool module is the mistake this repository was created to undo.
 - **Do not widen `none`.** If a path is arguably code, it is `partial`.
 - **Do not put the classifier on the pool.**
+- **Do not write the aggregate `if: always()`.** Use `!cancelled()`. `always()`
+  runs the job while its own run is being cancelled, so every superseded suite
+  leaves a terminal red on the required context — see "A superseded run must not
+  report".
 - **Do not make a gated job a required check directly.** Required checks name
   the aggregate job, and only the aggregate job. A gated job's `skipped`
   check-run outlives the draft phase and blocks the queue after

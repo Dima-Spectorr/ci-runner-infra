@@ -190,7 +190,9 @@ recommendation; the 97-minute tail may be cheaper to fix with faster scale-out.
 
 ### 3.1 One aggregate required check per repo (prerequisite for everything else)
 
-Specaria-Platform's `ci-success` job (`needs: [...]`, `if: always()`) is the
+Specaria-Platform's `ci-success` job (`needs: [...]`, `if: ${{ !cancelled() }}`
+— **not** `always()`, which reports a permanent red from every superseded run;
+see the lane model's "A superseded run must not report") is the
 pattern: individual jobs may skip freely, and the single job named in the branch
 ruleset and in `.mergify.yml` always reports. DataRetrival independently reached
 the same shape for `migration-harness` — its own comment records why:
