@@ -100,17 +100,25 @@ probe_unbounded() { # <file> -> count of unbounded curls
   echo "$n"
 }
 
-[ "$(probe_unbounded "$FIX/bad.sh")" -eq 1 ] \
-  && ok "detector flags an unbounded curl" \
-  || bad "detector did NOT flag an unbounded curl — every pass below is vacuous"
+# if/else rather than `A && ok || bad`: in that idiom the `||` branch also runs
+# when `ok` itself fails, so a broken reporter would be reported as a broken
+# detector. shellcheck SC2015 flags it, and this gate must pass its own repo's
+# lint.
+expect_eq() { # <actual> <expected> <ok-msg> <bad-msg>
+  if [ "$1" -eq "$2" ]; then ok "$3"; else bad "$4"; fi
+}
 
-[ "$(probe_unbounded "$FIX/partial.sh")" -eq 1 ] \
-  && ok "detector flags --max-time without --connect-timeout" \
-  || bad "detector accepts --max-time alone — a stalled CONNECT stays unbounded"
+expect_eq "$(probe_unbounded "$FIX/bad.sh")" 1 \
+  "detector flags an unbounded curl" \
+  "detector did NOT flag an unbounded curl — every pass below is vacuous"
 
-[ "$(probe_unbounded "$FIX/good.sh")" -eq 0 ] \
-  && ok "detector accepts bounded curls (array and explicit flags)" \
-  || bad "detector rejects a correctly bounded curl — it would be turned off, not fixed"
+expect_eq "$(probe_unbounded "$FIX/partial.sh")" 1 \
+  "detector flags --max-time without --connect-timeout" \
+  "detector accepts --max-time alone — a stalled CONNECT stays unbounded"
+
+expect_eq "$(probe_unbounded "$FIX/good.sh")" 0 \
+  "detector accepts bounded curls (array and explicit flags)" \
+  "detector rejects a correctly bounded curl — it would be turned off, not fixed"
 
 cat >"$FIX/unit-bad.sh" <<'UBEOF'
 cat >/etc/systemd/system/x.service <<'EOF'
@@ -133,16 +141,16 @@ units_missing_timeout() { # <file> -> 0/1
   local units timeouts
   units=$(oneshot_units "$1")
   timeouts=$(grep -cE '^TimeoutStartSec=' "$1")
-  [ "$units" -gt "$timeouts" ] && echo 1 || echo 0
+  if [ "$units" -gt "$timeouts" ]; then echo 1; else echo 0; fi
 }
 
-[ "$(units_missing_timeout "$FIX/unit-bad.sh")" -eq 1 ] \
-  && ok "detector flags a oneshot unit with no TimeoutStartSec" \
-  || bad "detector did NOT flag an unbounded oneshot unit"
+expect_eq "$(units_missing_timeout "$FIX/unit-bad.sh")" 1 \
+  "detector flags a oneshot unit with no TimeoutStartSec" \
+  "detector did NOT flag an unbounded oneshot unit"
 
-[ "$(units_missing_timeout "$FIX/unit-good.sh")" -eq 0 ] \
-  && ok "detector accepts a oneshot unit carrying TimeoutStartSec" \
-  || bad "detector rejects a correctly bounded oneshot unit"
+expect_eq "$(units_missing_timeout "$FIX/unit-good.sh")" 0 \
+  "detector accepts a oneshot unit carrying TimeoutStartSec" \
+  "detector rejects a correctly bounded oneshot unit"
 
 [ "$fail" -eq 0 ] || { echo "  bounded calls UNVERIFIABLE (detectors are broken)."; exit 1; }
 
