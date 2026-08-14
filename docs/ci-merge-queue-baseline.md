@@ -294,6 +294,23 @@ contradicting **itself** on every path: `base = main` beside both `draft` and
 read alone looks fine. That is the same finding as an empty set, and reported as
 one.
 
+Whether a term contradicts itself is answered by the **same set algebra**, not by
+counting `base =` clauses: `base = main` beside `base != main`, or beside
+`base ~= ^release/`, admits nothing though neither pair is two positive
+equalities. This matters in both directions — a dead term left alive is compared
+against rules on behalf of pull requests that cannot exist (a `-draft` rule
+reported as deadlocked against an impossible `draft` path), and a live term
+wrongly dropped takes a real requirement with it.
+
+`not:` is **inverted, not declined**. Negation pushes down to the leaves by De
+Morgan, and a leaf inverts with the same leading `-` Mergify itself uses, so
+`not: {base = main}` is the complement of `main` rather than an unreadable
+subtree. Read as unreadable it was previously called *unconstrained*, which is an
+assertion that the rule serves every branch: a rule serving everything except
+`main` then overlapped an admission list of exactly `main`, and a queue that
+could take nothing passed. An unknown connective still declines — but it now
+declines rather than claiming the universe.
+
 Draft polarity is read the same way — **per satisfiable term**, not once for the
 whole tree. An admission list spelled `(base = main and draft) or (base = main
 and -draft)` pins no polarity as a whole, so a single question answers
@@ -301,8 +318,8 @@ and -draft)` pins no polarity as a whole, so a single question answers
 `-draft` rule exactly as if it had been written alone. Each term carries its own
 base set, and only rules whose admissible base overlaps that set are compared.
 
-What the reader **cannot** read, it does not assert: a `not:`, an expansion past
-the term budget, or a tree nested past the read depth. The first two answer
+What the reader **cannot** read, it does not assert: an expansion past the term
+budget, or a tree nested past the read depth. The first answers
 "requirement satisfied" — silence rather than a finding, because the alternative
 is failing a configuration the gate merely could not parse. Depth is the
 exception and fails closed: a `check-success` under 65 nested `and:` nodes is
