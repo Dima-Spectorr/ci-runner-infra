@@ -106,12 +106,46 @@ classify_path() {
   local lower="${p,,}"
 
   # ---------------------------------------------------------------------------
+  # 0. Build inputs that WEAR a documentation costume. These must be tested
+  #    before the non-code rules below, because each one matches a rule there:
+  #    `requirements.txt` is a `.txt`, and `docs/package.json` /
+  #    `docs/conf.py` live under `docs/`. Classified as documentation, a
+  #    dependency-graph change would take the lane that runs NO CI at all —
+  #    the silent-narrow failure this file's self-test exists to prevent.
+  # ---------------------------------------------------------------------------
+  case "$lower" in
+    */requirements*.txt | requirements*.txt) echo full; return 0 ;;
+    */package.json | package.json) echo full; return 0 ;;
+    */pyproject.toml | pyproject.toml | */setup.py | setup.py | */setup.cfg | setup.cfg) echo full; return 0 ;;
+    */pipfile | pipfile | */pipfile.lock | pipfile.lock | */uv.lock | uv.lock) echo full; return 0 ;;
+    */cargo.toml | cargo.toml | */composer.json | composer.json | */composer.lock | composer.lock) echo full; return 0 ;;
+    */gemfile | gemfile | */gemfile.lock | gemfile.lock) echo full; return 0 ;;
+    # Sphinx/MkDocs build inputs: they live in the documentation tree but they
+    # execute, and a docs site is a deployable in several of these repositories.
+    */conf.py | conf.py | */mkdocs.yml | mkdocs.yml) echo full; return 0 ;;
+  esac
+
+  # ---------------------------------------------------------------------------
   # 1. Provably non-code. Nothing here is read by a build, a test, or a deploy.
+  #
+  #    Images are NOT skipped by extension alone. A `.svg` under `src/assets/`
+  #    or `public/` is a bundled production input, and one under a test fixture
+  #    directory is an assertion — only images inside a documentation tree are
+  #    provably non-code, so the image rule is nested under the docs rule.
+  #
+  #    The `docs/` rule is likewise restricted to documentation FILE TYPES
+  #    rather than the whole directory: a repository that generates its docs
+  #    site keeps executable inputs there too, and section 0 above cannot list
+  #    every one of them.
   # ---------------------------------------------------------------------------
   case "$lower" in
     *.md | *.mdx | *.txt | *.rst | *.adoc) echo none; return 0 ;;
-    *.png | *.jpg | *.jpeg | *.gif | *.svg | *.webp | *.ico | *.pdf) echo none; return 0 ;;
-    docs/* | */docs/*) echo none; return 0 ;;
+    docs/* | */docs/*)
+      case "$lower" in
+        *.png | *.jpg | *.jpeg | *.gif | *.svg | *.webp | *.ico | *.pdf) echo none; return 0 ;;
+        *.csv | *.drawio | *.puml | *.mmd | *.dot) echo none; return 0 ;;
+      esac
+      ;;
     .claude/*) echo none; return 0 ;;
     .github/issue_template/* | .github/pull_request_template*) echo none; return 0 ;;
     license | license.* | notice | authors | codeowners | .github/codeowners) echo none; return 0 ;;
@@ -131,15 +165,14 @@ classify_path() {
     */package-lock.json | package-lock.json | */yarn.lock | yarn.lock) echo full; return 0 ;;
     */pnpm-lock.yaml | pnpm-lock.yaml | */go.sum | go.sum | */go.mod | go.mod) echo full; return 0 ;;
     */cargo.lock | cargo.lock | */poetry.lock | poetry.lock) echo full; return 0 ;;
-    */requirements*.txt | requirements*.txt) echo full; return 0 ;;
     */pom.xml | pom.xml | */build.gradle* | build.gradle*) echo full; return 0 ;;
 
     # Build toolchain and packaging. Apigee-Portal's "Validator image boots and
     # serves" exists because a bundler flag, a target bump or a minifier change
     # is invisible to every source-reading gate.
-    dockerfile* | */dockerfile* | docker-compose*) echo full; return 0 ;;
-    cloudbuild*.yaml | cloudbuild*.yml | */cloudbuild*.yaml) echo full; return 0 ;;
-    makefile | */makefile | package.json | */package.json) echo full; return 0 ;;
+    dockerfile* | */dockerfile* | docker-compose* | */docker-compose*) echo full; return 0 ;;
+    cloudbuild*.yaml | cloudbuild*.yml | */cloudbuild*.yaml | */cloudbuild*.yml) echo full; return 0 ;;
+    makefile | */makefile) echo full; return 0 ;;
     turbo.json | nx.json | tsconfig*.json | */tsconfig*.json) echo full; return 0 ;;
     .nvmrc | .node-version | .tool-versions | .python-version) echo full; return 0 ;;
 
