@@ -135,7 +135,10 @@ has_container_runtime() { # <file>
   #    or the next regression of either half ships exactly as this one did.
   matches "$code" 'slot_runtime_usable "\$idx" "\$u"[[:space:]]*\|\|[[:space:]]*return 1' || return 1
   matches "$code" '/run/user/\$uid/bus' || return 1
-  matches "$code" 'sudo -u "\$u" getent ahostsv4'
+  # Resolution is proved from INSIDE the slot's network namespace, which is
+  # where a job runs: the host's systemd-resolved stub does not exist there, so
+  # a probe run in the host namespace answers a question nobody asked.
+  matches "$code" 'ip netns exec "\$ns" getent ahostsv4'
 }
 
 # Slots share a host, so they share /tmp unless something separates them. A CI
@@ -160,23 +163,42 @@ has_slot_tmp_isolation() { # <file>
 # with "PortManager.AddPort(): listen tcp4 0.0.0.0:32768: bind: address already
 # in use" (IntegrateIT #7749) — not a rare race, a near-certainty. The partition
 # is silent when broken: the daemon starts fine and only jobs fail, later.
-has_port_partition() { # <file>
+# Two attempts at slicing the ephemeral range per slot (v4.5.0, v4.5.1) both
+# failed on a live host, for a reason no static check could have caught: docker's
+# rootlesskit runs with --detach-netns, so the daemon stays in the HOST namespace
+# and there is no per-slot ip_local_port_range to write. What is checked here is
+# the replacement — a real namespace per slot — and the three ways it silently
+# reverts to the shared-netns behaviour it exists to remove.
+has_port_isolation() { # <file>
   local code
   code=$(code_of "$1")
-  # the range is written inside the slot's OWN netns
-  matches "$code" '/proc/sys/net/ipv4/ip_local_port_range' || return 1
-  # and the only process that runs there is the daemon, reached through PATH —
-  # so the shim has to come FIRST on it
-  matches "$code" '^Environment=PATH=/opt/ci/rootless-shim:' || return 1
-  # per SLOT, not one range for the host: a constant here restores the collision
-  # QUOTED: the value has a space in it, and systemd drops the second number as
-  # a stray assignment without the quotes � the shim then gets a half range the
-  # kernel refuses (shipped that way in v4.5.0).
-  matches "$code" '^Environment="CI_SLOT_PORT_RANGE=\$\(slot_port_range "\$idx"\)"$' || return 1
-  matches "$code" 'low=\$\(\( 33000 \+ \(idx - 1\) \* span \)\)' || return 1
-  # absolute path out of the shim: `exec dockerd` would re-find the shim on PATH
-  # and spin forever instead of starting a daemon
-  matches "$code" '^exec /usr/bin/dockerd "\$@"$'
+  # a namespace per SLOT: an index-free name gives every slot the same one
+  matches "$code" "slot_netns\(\) *{ *printf 'ci-s%s'" || return 1
+  # the daemon joins it…
+  matches "$code" '^NetworkNamespacePath=/run/netns/\$\(slot_netns "\$idx"\)$' || return 1
+  # …and so does the agent, or "localhost:PORT" stops reaching its own services
+  matches "$code" 'NetworkNamespacePath=/run/netns/\$\(slot_netns "\$idx"\)[[:space:]]*$' || return 1
+  # egress for the namespace, or the slot has no network at all
+  matches "$code" 'POSTROUTING -s 10\.99\.0\.0/16 -o "\$ifc" -j MASQUERADE' || return 1
+  # the metadata fence restated for FORWARDed traffic — the per-uid OUTPUT rules
+  # never see a namespaced packet — and the DNS exceptions must be INSERTED
+  # ABOVE the blanket reject, i.e. appear AFTER it in the script
+  matches "$code" 'FORWARD 1 -s 10\.99\.0\.0/16 -d "\$md_ip" -j REJECT' || return 1
+  matches "$code" 'FORWARD 1 -s 10\.99\.0\.0/16 -d "\$md_ip" -p "\$proto" --dport 53 -j ACCEPT' || return 1
+  local reject_ln accept_ln
+  reject_ln=$(printf '%s\n' "$code" | grep -n 'FORWARD 1 -s 10\.99\.0\.0/16 -d "\$md_ip" -j REJECT' | head -1 | cut -d: -f1)
+  accept_ln=$(printf '%s\n' "$code" | grep -n 'FORWARD 1 -s 10\.99\.0\.0/16 -d "\$md_ip" -p "\$proto" --dport 53 -j ACCEPT' | head -1 | cut -d: -f1)
+  [ -n "$reject_ln" ] && [ -n "$accept_ln" ] && [ "$accept_ln" -gt "$reject_ln" ] || return 1
+  # the per-slot veth rules must be APPENDED, never inserted: an insert lands
+  # above that reject and hands job code the host's identity back
+  matches "$code" '\-A FORWARD -i "\$veth" -j ACCEPT' || return 1
+  ! matches "$code" '\-I FORWARD 1 -i "\$veth"' || return 1
+  # the broker follows the slots out of loopback, and is closed on the VM's NIC
+  matches "$code" '^Environment=CI_BROKER_HOST=0\.0\.0\.0$' || return 1
+  matches "$code" 'INPUT 1 -i "\$ifc" -p tcp --dport "\$BROKER_PORT" -j REJECT' || return 1
+  matches "$code" 'GCE_METADATA_HOST=%s:%s' || return 1
+  # and the boot probe reads back where the daemon actually landed
+  matches "$code" 'readlink "/proc/\$dpid/ns/net"'
 }
 
 # The helper carries the trap it was written to avoid, so it is tested first.
@@ -222,10 +244,10 @@ else
   bad "slots share /tmp, or the agent does not share its daemon's — a fixed path there is owned by whichever slot ran first and every other slot gets EACCES on it (SOAP-To-REST #2017)"
 fi
 
-if has_port_partition "$SCRIPT"; then
+if has_port_isolation "$SCRIPT"; then
   ok
 else
-  bad "slots share one ephemeral port range — two slots publishing a service container's port race for the same number and one dies with 'address already in use' (IntegrateIT #7749)"
+  bad "slots share the host network namespace — two slots publishing a service container's port take the same number and one dies with 'address already in use' (IntegrateIT #7749), or the namespace has no egress / no metadata fence / no broker"
 fi
 
 if has_container_runtime "$SCRIPT"; then
@@ -265,15 +287,18 @@ mutate "DNS fenced with the token path"  's/dport 53 -m owner/dport 80 -m owner/
 mutate "slot no longer lingers"          's/loginctl enable-linger/# loginctl enable-linger/'          has_container_runtime
 mutate "daemon left on the system bus"   's|DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus|DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket|' has_container_runtime
 mutate "probe back to daemon-only"       's/slot_runtime_usable "\$idx" "\$u" || return 1/: /'         has_container_runtime
-mutate "DNS probe runs as root"          's/sudo -u "\$u" getent ahostsv4/getent ahostsv4/'            has_container_runtime
+mutate "DNS probe runs outside the netns" 's/ip netns exec "\$ns" getent ahostsv4/getent ahostsv4/'      has_container_runtime
 mutate "slots share /tmp again"          's/^PrivateTmp=yes$/PrivateTmp=no/'                           has_slot_tmp_isolation
 mutate "only the daemon gets a private /tmp" 's/^JoinsNamespaceOf=ci-dockerd@\$idx\.service$/#&/'      has_slot_tmp_isolation
 
-mutate "shim dropped off the daemon's PATH"  's|^Environment=PATH=/opt/ci/rootless-shim:|Environment=PATH=|'                    has_port_partition
-mutate "one range for every slot"            's|^Environment="CI_SLOT_PORT_RANGE=.*|Environment="CI_SLOT_PORT_RANGE=33000 60999"|' has_port_partition
-mutate "range value left unquoted"           's|^Environment="CI_SLOT_PORT_RANGE=|Environment=CI_SLOT_PORT_RANGE=|'            has_port_partition
-mutate "slot index dropped from the range"   's/(idx - 1)/(0)/'                                                                 has_port_partition
-mutate "shim re-execs itself through PATH"   's|^exec /usr/bin/dockerd "\$@"$|exec dockerd "$@"|'                               has_port_partition
+mutate "one namespace for every slot"        "s|printf 'ci-s%s'|printf 'ci-shared'|"                                         has_port_isolation
+mutate "daemon left in the host namespace"   's|^NetworkNamespacePath=/run/netns/\$(slot_netns "\$idx")$||'                     has_port_isolation
+mutate "slot namespace loses its egress NAT" 's|POSTROUTING -s 10.99.0.0/16 -o "$ifc" -j MASQUERADE|POSTROUTING -s 127.0.0.0/8 -o "$ifc" -j MASQUERADE|' has_port_isolation
+mutate "veth rule inserted above the fence"  's|-A FORWARD -i "$veth" -j ACCEPT|-I FORWARD 1 -i "$veth" -j ACCEPT|'             has_port_isolation
+mutate "broker left on host loopback only"   's|^Environment=CI_BROKER_HOST=0.0.0.0$|Environment=CI_BROKER_HOST=127.0.0.1|'     has_port_isolation
+mutate "broker port left open on the NIC"    's|INPUT 1 -i "$ifc" -p tcp --dport "$BROKER_PORT" -j REJECT|INPUT 1 -i "$ifc" -p tcp --dport 9 -j ACCEPT|' has_port_isolation
+mutate "boot probe stops checking the netns" 's|readlink "/proc/$dpid/ns/net"|readlink "/proc/self/ns/net"|'                    has_port_isolation
+mutate "namespaced DNS exception dropped"    's|-d "$md_ip" -p "$proto" --dport 53 -j ACCEPT|-d "$md_ip" -p "$proto" --dport 9 -j ACCEPT|' has_port_isolation
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

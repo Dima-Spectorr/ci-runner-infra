@@ -201,7 +201,12 @@ Type=simple
 # different, weaker account.
 User=root
 Environment=CI_JOB_SERVICE_ACCOUNT=$JOB_SA
-Environment=CI_BROKER_HOST=127.0.0.1
+# Every slot has its OWN loopback now (it has its own network namespace), so a
+# broker bound to 127.0.0.1 in the host namespace is unreachable from any of
+# them. It binds all addresses instead — including each slot's gateway address —
+# and setup_slot_networking REJECTs this port on the primary interface so
+# nothing off this host can reach it.
+Environment=CI_BROKER_HOST=0.0.0.0
 Environment=CI_BROKER_PORT=$BROKER_PORT
 ExecStart=/usr/bin/python3 /opt/ci/job-metadata-broker.py
 Restart=always
@@ -279,72 +284,140 @@ provision_slot_user() {
   loginctl enable-linger "$u" || return 1
 }
 
-# A `dockerd` that partitions the slot's ephemeral port range before exec'ing the
-# real one — installed FIRST on the daemon's PATH, which is the only hook there
-# is for this.
+# --- per-slot network namespace ----------------------------------------------
 #
-# THE FAULT (IntegrateIT #7749, reproduced on consecutive runs):
+# THE FAULT (IntegrateIT #7749, four shards failing together on consecutive runs):
 #   Error response from daemon: failed to set up container networking: driver
 #   failed programming external connectivity ... error while calling RootlessKit
 #   PortManager.AddPort(): listen tcp4 0.0.0.0:32768: bind: address already in use
 #
 # A service container with an unspecified host port (`ports: - 5432`, which is
-# what actions/runner emits for every `services:` block) makes the daemon pick
-# one from /proc/sys/net/ipv4/ip_local_port_range, and RootlessKit then binds
-# THAT NUMBER in the host netns so the job can reach it on localhost. Each slot
-# has its own daemon and its own netns, so each one reads the same default range
-# and picks the same first free port — and the parent bind they all end up
-# making is in the ONE shared host netns. Two slots starting a service container
-# at the same time is not a race that is unlikely to be lost; both start at
-# 32768, so it is close to guaranteed, which is why four shards failed together.
+# what actions/runner emits for every `services:` block) makes the daemon pick a
+# host port from /proc/sys/net/ipv4/ip_local_port_range, and RootlessKit then
+# binds THAT NUMBER so the job can reach it on localhost. Every slot's daemon
+# reads the same range and picks the same first free port — 32768 — so the
+# collision is near-deterministic rather than a race that is rarely lost.
 #
-# Giving each slot a disjoint slice of the range makes the numbers disjoint, so
-# the parent binds cannot collide. The write has to happen INSIDE the slot's
-# network namespace (ip_local_port_range is per-netns), and the only process
-# that runs there is the daemon itself: `dockerd-rootless.sh` re-execs itself
-# under rootlesskit and the child branch ends in `exec dockerd "$@"`, resolved
-# through PATH. Hence a shim rather than an ExecStartPre, which would run in the
-# host namespace and repartition the HOST.
-install_dockerd_shim() {
-  mkdir -p /opt/ci/rootless-shim
-  cat >/opt/ci/rootless-shim/dockerd <<'EOF'
-#!/bin/sh
-# Runs inside the slot's user+network namespace, as root there.
-# CI_SLOT_PORT_RANGE is set per slot by ci-dockerd@<idx>.service.d.
-if [ -n "${CI_SLOT_PORT_RANGE:-}" ]; then
-  if echo "$CI_SLOT_PORT_RANGE" >/proc/sys/net/ipv4/ip_local_port_range 2>/dev/null; then
-    printf 'applied %s\n' "$CI_SLOT_PORT_RANGE" >"${XDG_RUNTIME_DIR:-/tmp}/port-range"
-  else
-    # Loud, not fatal: a daemon that starts with the default range still serves
-    # jobs and only risks the collision above, whereas refusing to start would
-    # take the slot out entirely. start_slot_dockerd reads this marker and logs.
-    printf 'FAILED %s\n' "$CI_SLOT_PORT_RANGE" >"${XDG_RUNTIME_DIR:-/tmp}/port-range"
-    echo "ci-slot: could not set ip_local_port_range=$CI_SLOT_PORT_RANGE — published ports may collide with a sibling slot" >&2
-  fi
-fi
-exec /usr/bin/dockerd "$@"
-EOF
-  chmod 0755 /opt/ci/rootless-shim/dockerd
+# It cannot be fixed by giving each slot a slice of the range, which is what
+# v4.5.x tried twice and what a host proved wrong both times:
+#   * docker's rootlesskit is started with `--detach-netns`, so the DAEMON stays
+#     in the HOST network namespace and only containers get the detached one.
+#     There is no per-slot netns whose ip_local_port_range could differ.
+#   * /proc inside the slot is the host's procfs, propagated (`master:`), so the
+#     sysctl a shim reads and writes is the HOST's — the write is refused
+#     (EACCES) and a successful one would have repartitioned the whole host.
+#   * Bind-mounting a doctored file over /proc/sys/net/ipv4/ip_local_port_range
+#     DOES change what the daemon reads, and breaks every container on the host:
+#     a partially-covered procfs is no longer "fully visible", so runc's own
+#     `mount proc` fails with EPERM ("error mounting \"proc\" to rootfs").
+#   * The value is not read once at daemon start either, so staging the host
+#     sysctl around each start does nothing. Measured on a live host.
+#
+# So the slots get a real network namespace each, and the collision stops being
+# possible rather than being made unlikely: port 32768 in slot 1's netns and
+# port 32768 in slot 2's netns are different sockets. It also fixes the case a
+# range partition never could — two slots publishing the same FIXED host port,
+# which any workflow with `ports: - 5432:5432` does.
+#
+# Each namespace is a /30 veth to the host, NAT'd out of the primary interface.
+# The job reaches its service containers on localhost, exactly as before, because
+# the agent runs in the same namespace as its daemon.
+slot_netns()  { printf 'ci-s%s' "$1"; }          # namespace name
+slot_veth()   { printf 'cis%s' "$1"; }           # host-side interface (<=15 chars)
+slot_gw_ip()  { printf '10.99.%s.1' "$1"; }      # host end of the /30
+slot_ns_ip()  { printf '10.99.%s.2' "$1"; }      # slot end of the /30
+
+# The interface the default route leaves by, and its MTU. Both are read rather
+# than assumed: interface naming differs between images (ens4/eth0) and a veth
+# with the wrong MTU black-holes large TLS records instead of failing cleanly.
+primary_if()  { ip -o route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1; }
+primary_mtu() { cat "/sys/class/net/$(primary_if)/mtu" 2>/dev/null || echo 1460; }
+
+# Host-side plumbing shared by every slot namespace: forwarding, NAT, and the
+# metadata policy for namespaced traffic.
+#
+# The per-uid OUTPUT fence in fence_metadata() no longer sees a slot's packets —
+# they arrive on a veth and are FORWARDED, not originated locally — so the same
+# policy is restated here for the 10.99.0.0/16 supernet: DNS to 169.254.169.254
+# is allowed (it is also the VPC resolver, and a container's only nameserver),
+# everything else to that address is rejected. Fails CLOSED with the fence.
+setup_slot_networking() {
+  local ifc md_ip="169.254.169.254"
+  ifc=$(primary_if)
+  [ -n "$ifc" ] || { log "no default route — cannot NAT slot namespaces"; return 1; }
+
+  sysctl -qw net.ipv4.ip_forward=1 || return 1
+
+  iptables -w -t nat -C POSTROUTING -s 10.99.0.0/16 -o "$ifc" -j MASQUERADE 2>/dev/null \
+    || iptables -w -t nat -A POSTROUTING -s 10.99.0.0/16 -o "$ifc" -j MASQUERADE \
+    || return 1
+
+  # ORDER IS THE POLICY. Every insert goes to position 1, so the LAST insert is
+  # the FIRST rule matched: the blanket REJECT is installed first and the two DNS
+  # exceptions are pushed in above it. Installing them the other way round leaves
+  # the REJECT on top, which takes name resolution away from every slot — the
+  # same fault fence_uid() documents, one chain over.
+  iptables -w -C FORWARD -s 10.99.0.0/16 -d "$md_ip" -j REJECT 2>/dev/null \
+    || iptables -w -I FORWARD 1 -s 10.99.0.0/16 -d "$md_ip" -j REJECT \
+    || return 1
+  local proto
+  for proto in udp tcp; do
+    iptables -w -C FORWARD -s 10.99.0.0/16 -d "$md_ip" -p "$proto" --dport 53 -j ACCEPT 2>/dev/null \
+      || iptables -w -I FORWARD 1 -s 10.99.0.0/16 -d "$md_ip" -p "$proto" --dport 53 -j ACCEPT \
+      || return 1
+  done
+
+  # The broker listens on every slot's gateway address (see start_job_broker),
+  # which means it also listens on the VM's own address. Nothing outside this
+  # host may reach it — it vends tokens.
+  iptables -w -C INPUT -i "$ifc" -p tcp --dport "$BROKER_PORT" -j REJECT 2>/dev/null \
+    || iptables -w -I INPUT 1 -i "$ifc" -p tcp --dport "$BROKER_PORT" -j REJECT \
+    || return 1
 }
 
-# The slice of 33000-60999 belonging to slot <idx>, as `<low> <high>`.
-# 33000 and not the kernel's 32768: the host's own netns keeps the default
-# range, and starting above it keeps a slot's published ports clear of ports the
-# host picked for its own outbound sockets.
-slot_port_range() { # <idx>
-  local idx="$1" low high span
-  span=$(( (60999 - 33000 + 1) / SLOTS ))
-  low=$(( 33000 + (idx - 1) * span ))
-  high=$(( low + span - 1 ))
-  printf '%d %d' "$low" "$high"
+# Idempotent: a re-run of this script (or a slot restart) must find the
+# namespace it already made rather than tear a running slot's networking down.
+setup_slot_netns() { # <idx>
+  local idx="$1" ns veth gw nsip mtu
+  ns=$(slot_netns "$idx"); veth=$(slot_veth "$idx")
+  gw=$(slot_gw_ip "$idx"); nsip=$(slot_ns_ip "$idx"); mtu=$(primary_mtu)
+
+  ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$ns" || ip netns add "$ns" || return 1
+  ip link show "$veth" >/dev/null 2>&1 \
+    || ip link add "$veth" type veth peer name eth0 netns "$ns" || return 1
+
+  ip addr replace "$gw/30" dev "$veth" || return 1
+  ip link set "$veth" up mtu "$mtu" || return 1
+
+  ip netns exec "$ns" ip link set lo up || return 1
+  ip netns exec "$ns" ip link set eth0 up mtu "$mtu" || return 1
+  ip netns exec "$ns" ip addr replace "$nsip/30" dev eth0 || return 1
+  ip netns exec "$ns" ip route replace default via "$gw" || return 1
+
+  # The namespace has no systemd-resolved, so the host's 127.0.0.53 stub is
+  # meaningless in it: point it straight at the VPC resolver, which is the
+  # address the metadata policy above allows port 53 to. Without this, name
+  # resolution fails inside the slot and every checkout does too.
+  mkdir -p "/etc/netns/$ns"
+  {
+    printf 'nameserver 169.254.169.254\n'
+    sed -n 's/^search /search /p' /etc/resolv.conf
+    printf 'options timeout:2 attempts:3\n'
+  } >"/etc/netns/$ns/resolv.conf"
+
+  # APPENDED, never inserted: an insert would land above the metadata REJECT that
+  # setup_slot_networking put at the top of this chain and hand every slot the
+  # host's identity back.
+  iptables -w -C FORWARD -i "$veth" -j ACCEPT 2>/dev/null \
+    || iptables -w -A FORWARD -i "$veth" -j ACCEPT || return 1
+  iptables -w -C FORWARD -o "$veth" -j ACCEPT 2>/dev/null \
+    || iptables -w -A FORWARD -o "$veth" -j ACCEPT || return 1
 }
 
 # One rootless dockerd per slot, as a system template unit rather than a user
 # unit: a user unit needs a logind session (or lingering) to exist at boot, and
 # `RuntimeDirectory=` gives the daemon the XDG_RUNTIME_DIR it wants without one.
 install_dockerd_unit() {
-  install_dockerd_shim
-
   cat >/etc/systemd/system/ci-dockerd@.service <<'EOF'
 [Unit]
 Description=Rootless Docker daemon for CI slot %i
@@ -404,10 +477,31 @@ slot_runtime_usable() { # <idx> <user>
     return 1
   fi
 
-  # DNS to the address a container will be handed. Runs as the SLOT user on
-  # purpose: the fence is a per-uid rule, so root resolving fine proves nothing.
-  if ! sudo -u "$u" getent ahostsv4 metadata.google.internal >/dev/null 2>&1; then
-    log "slot $idx: $u cannot resolve through the VPC resolver — the metadata fence is blocking port 53"
+  # DNS as it will be seen by the job: from INSIDE the slot's namespace, where
+  # the host's systemd-resolved stub does not exist and the only nameserver is
+  # the VPC resolver the FORWARD policy allows port 53 to. Resolving as root in
+  # the host namespace proves nothing about either.
+  local ns; ns=$(slot_netns "$idx")
+  if ! ip netns exec "$ns" getent ahostsv4 metadata.google.internal >/dev/null 2>&1; then
+    log "slot $idx: cannot resolve inside $ns — the metadata policy is blocking port 53, or /etc/netns/$ns/resolv.conf is wrong"
+    return 1
+  fi
+
+  # The fence itself, proved from where job code runs rather than asserted: the
+  # token endpoint must NOT answer in the slot's namespace. A slot that can read
+  # it owns the fleet (#1958), so this is fatal, not a warning.
+  if ip netns exec "$ns" curl -fsS -m 5 -H "Metadata-Flavor: Google" \
+    "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token" >/dev/null 2>&1; then
+    log "slot $idx: the REAL metadata server answers inside $ns — refusing to serve jobs"
+    return 1
+  fi
+
+  # …and the broker, which is the credential job code is supposed to get, must
+  # answer on this slot's gateway address. Loopback is the namespace's OWN
+  # loopback now, so 127.0.0.1 would reach nothing.
+  if [ -n "$JOB_SA" ] && ! ip netns exec "$ns" curl -fsS -m 5 -H "Metadata-Flavor: Google" \
+    "http://$(slot_gw_ip "$idx"):$BROKER_PORT/computeMetadata/v1/instance/service-accounts/default/token" >/dev/null 2>&1; then
+    log "slot $idx: the job credential broker is unreachable from $ns at $(slot_gw_ip "$idx"):$BROKER_PORT"
     return 1
   fi
 }
@@ -427,20 +521,13 @@ start_slot_dockerd() {
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus
 EOF
 
-  # This slot's private slice of the ephemeral range, plus the PATH that puts
-  # the shim ahead of the real dockerd. PATH is re-declared here rather than
-  # edited into the template because a later Environment=PATH wins, and the
-  # shim directory must come first for `exec dockerd` inside the namespace to
-  # find it.
-  # QUOTED, because the value contains a space. Unquoted, systemd reads the
-  # second number as a second assignment, drops it as "Invalid environment
-  # assignment, ignoring: 39999", and hands the shim a HALF range — which the
-  # kernel rejects, because ip_local_port_range takes two integers. Caught on
-  # the first boot by the marker readback below, having shipped as v4.5.0.
-  cat >"/etc/systemd/system/ci-dockerd@$idx.service.d/20-port-range.conf" <<EOF
+  # The slot's own network namespace, created before the daemon that joins it.
+  # This is what makes two slots' published ports independent; see
+  # setup_slot_netns for why a shared netns could not be partitioned instead.
+  setup_slot_netns "$idx" || { log "slot $idx: could not create network namespace"; return 1; }
+  cat >"/etc/systemd/system/ci-dockerd@$idx.service.d/20-netns.conf" <<EOF
 [Service]
-Environment="CI_SLOT_PORT_RANGE=$(slot_port_range "$idx")"
-Environment=PATH=/opt/ci/rootless-shim:/usr/bin:/usr/sbin:/bin:/sbin
+NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
 EOF
   systemctl daemon-reload
 
@@ -452,14 +539,20 @@ EOF
   for i in $(seq 1 30); do
     if sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" docker info >/dev/null 2>&1; then
       slot_runtime_usable "$idx" "$u" || return 1
-      # The shim's verdict, read back rather than assumed: if the sysctl write
-      # was refused the daemon still came up healthy here and would only fail
-      # later, at some job's service container, as "address already in use" —
-      # the exact fault this partition exists to remove.
-      case "$(cat "/run/$u/port-range" 2>/dev/null)" in
-        applied*) log "slot $idx: published-port range $(slot_port_range "$idx")" ;;
-        *)        log "slot $idx: WARNING ip_local_port_range not partitioned — published ports may collide with a sibling slot" ;;
-      esac
+      # Read back where the daemon ACTUALLY landed rather than trusting the
+      # drop-in. A daemon that silently stayed in the host namespace looks
+      # perfectly healthy here and fails later, at some job's service container,
+      # as "address already in use" — the exact fault this namespace removes.
+      local dpid dns hostns
+      dpid=$(pgrep -u "$u" -x dockerd | head -1)
+      dns=$(readlink "/proc/$dpid/ns/net" 2>/dev/null)
+      hostns=$(readlink /proc/1/ns/net 2>/dev/null)
+      if [ -n "$dns" ] && [ "$dns" != "$hostns" ]; then
+        log "slot $idx: daemon in network namespace $(slot_netns "$idx") ($dns)"
+      else
+        log "slot $idx: daemon is in the HOST network namespace — published ports will collide with a sibling slot"
+        return 1
+      fi
       log "slot $idx: rootless docker ready for $u"
       return 0
     fi
@@ -476,6 +569,16 @@ install_slot() {
   local u; u=$(slot_user "$idx")
 
   start_slot_dockerd "$idx" || return 1
+
+  # google-auth, gcloud and the Go/Java clients all resolve the metadata server
+  # through these. Per SLOT, not per host: the address that reaches the broker
+  # from inside a namespace is that namespace's gateway, and 127.0.0.1 is now
+  # the slot's own loopback, where nothing listens.
+  local BROKER_ENV=""
+  if [ -n "$JOB_SA" ]; then
+    BROKER_ENV=$(printf 'Environment=GCE_METADATA_HOST=%s:%s\nEnvironment=GCE_METADATA_IP=%s:%s\nEnvironment=GCE_METADATA_ROOT=%s:%s' \
+      "$(slot_gw_ip "$idx")" "$BROKER_PORT" "$(slot_gw_ip "$idx")" "$BROKER_PORT" "$(slot_gw_ip "$idx")" "$BROKER_PORT")
+  fi
 
   mkdir -p "$dir"
   # Copy, not symlink: config.sh writes .runner/.credentials into the directory
@@ -541,6 +644,10 @@ Environment=DOCKER_HOST=unix:///run/$u/docker.sock
 # what keeps them in step, since a daemon that restarts gets a new namespace
 # and takes the agent down with it rather than leaving it on a stale one.
 PrivateTmp=yes
+# The SAME network namespace as its daemon, which is what keeps "service on
+# localhost:PORT" true for the job: actions/runner publishes service containers
+# on the daemon's host ports, and those are this namespace's ports now.
+NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
 $BROKER_ENV
 ExecStart=$dir/run.sh
 # The controller drains a host by DEREGISTERING its agents through the GitHub
@@ -596,17 +703,15 @@ main() {
 
   # Before any agent exists, so no job can ever race the fence.
   fence_metadata || die "could not fence job code off the metadata server — refusing to register agents"
+  # The same fence for namespaced traffic, plus the NAT that gives a slot egress
+  # at all. Also fails CLOSED: without it a slot either has no network or has an
+  # unfenced route to the metadata server.
+  setup_slot_networking || die "could not set up slot networking — refusing to register agents"
 
   # Also before any agent exists: an agent registered without the broker would
   # pick up a deploy job that then fails on missing credentials.
-  BROKER_ENV=""
   if [ -n "$JOB_SA" ]; then
     start_job_broker || die "job service account $JOB_SA is configured but its credential broker did not come up"
-    # google-auth, gcloud and the Go/Java clients all resolve the metadata
-    # server through these; pointing them at loopback is what gives a fenced job
-    # ADC for the job identity and nothing else.
-    BROKER_ENV=$(printf 'Environment=GCE_METADATA_HOST=127.0.0.1:%s\nEnvironment=GCE_METADATA_IP=127.0.0.1:%s\nEnvironment=GCE_METADATA_ROOT=127.0.0.1:%s' \
-      "$BROKER_PORT" "$BROKER_PORT" "$BROKER_PORT")
   else
     log "no ci-job-service-account set — jobs on this host get no Google credentials"
   fi
