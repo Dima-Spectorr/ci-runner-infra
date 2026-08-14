@@ -257,13 +257,27 @@ variable "service_account_email" {
 
 variable "controller_service_account_email" {
   description = <<-EOT
-    Service account for the CONTROLLER. Empty = reuse `service_account_email`,
-    which is the single-identity arrangement: acceptable, but it puts
-    instance-deletion rights on machines that execute build input. Give the
-    controller its own account wherever the project allows it.
+    Service account for the CONTROLLER. REQUIRED, and it must differ from
+    `service_account_email`.
+
+    This used to default to empty, meaning "reuse the host account", described
+    as acceptable-but-discouraged. Every consumer took the default, so the
+    instance-admin grant the controller needs in order to delete hosts sat on
+    the account attached to every host VM — machines whose purpose is to run
+    pull-request code. The permissive default WAS the deployed configuration in
+    every pool in the fleet; no consumer ever opted out of it. So it is not a default
+    any more: a root that does not answer the question fails at plan time rather
+    than silently choosing the weak side of it.
+
+    `ci-runner-identity` emits the right value as
+    `controller_service_account_email`.
   EOT
   type        = string
-  default     = ""
+
+  validation {
+    condition     = var.controller_service_account_email != "" && var.controller_service_account_email != var.service_account_email
+    error_message = "controller_service_account_email is required and must differ from service_account_email — sharing one account puts roles/compute.instanceAdmin.v1 on hosts that execute build input. Pass module.<identity>.controller_service_account_email."
+  }
 }
 
 variable "job_service_account_email" {
