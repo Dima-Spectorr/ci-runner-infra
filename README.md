@@ -200,6 +200,18 @@ requirements and the order they must be done in. The audit that produced it,
 with per-repository measurements, is in
 [`docs/ci-optimization-catalog.md`](docs/ci-optimization-catalog.md).
 
+## Releasing a version
+
+`VERSION` holds the tag this repository currently publishes. Bump it **in the
+same pull request as the change being released**, then tag the merge commit with
+that exact string. CI asserts that every module pin printed in the documentation
+names the version in `VERSION` (`scripts/ci/docs-pins.selftest.sh`) — the README
+quickstart had otherwise sat three minor versions behind the fleet, in the one
+line a new consumer is most likely to paste verbatim.
+
+Consumers move on their own schedule: bumping `VERSION` publishes a version, it
+does not repin anybody.
+
 ## Genericity
 
 No customer, repository, project or region literal appears anywhere in this
