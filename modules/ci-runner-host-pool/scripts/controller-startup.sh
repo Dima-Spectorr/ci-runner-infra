@@ -90,6 +90,14 @@ REGISTER_GRACE=${REGISTER_GRACE:-600}
 # registration otherwise occupies the repo's runner list.
 ORPHAN_CONFIRM_TICKS=${ORPHAN_CONFIRM_TICKS:-3}
 POLL=${POLL:-20}
+# Seconds the demand sweep may spend walking per-run job lists. It must stay far
+# below the watchdog threshold (10 polls, min 300s): a tick that outruns the
+# watchdog is restarted before it can write the heartbeat, and then restarted
+# again forever. 90s leaves room for the rest of the tick — the host walk, the
+# drains, the orphan reap and the flush — inside any legitimate threshold.
+DEMAND_BUDGET=$(md "instance/attributes/ci-demand-budget-seconds")
+DEMAND_BUDGET=${DEMAND_BUDGET:-90}
+DEMAND_RUNS_SKIPPED=0
 METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/github}
 REPO_FULL="$OWNER/$REPO"
 
@@ -199,16 +207,35 @@ collect_demand() {
   local runs_ip
   runs_ip=$(gh_api "repos/$REPO_FULL/actions/runs?status=in_progress&per_page=50" 2>/dev/null)
 
+  # QUEUED RUNS FIRST, and no `sort -u` across the two lists: the order decides
+  # what survives the budget below, and queued jobs are the ones the pool has to
+  # scale out FOR. `awk '!seen[$0]++'` keeps that order while still visiting a
+  # run that appears in both lists only once.
   local ids
   ids=$(printf '%s\n%s' "$runs" "$runs_ip" \
-    | jq -r '.workflow_runs[]?.id' 2>/dev/null | sort -u)
+    | jq -r '.workflow_runs[]?.id' 2>/dev/null | awk 'NF && !seen[$0]++')
   [ -n "$ids" ] || return 0
 
   local now
   now=$(date +%s)
 
+  # One API call per run, and the run count is whatever the repo happens to be
+  # doing — so this loop, alone, sets the tick duration. One pool in this fleet
+  # measured a 212s tick against a 300s watchdog threshold on 2026-08-14: not
+  # yet fatal, and only a busier hour away from being restarted mid-tick forever.
+  # The budget bounds the tick instead of hoping the repo stays quiet.
+  local deadline=$((now + DEMAND_BUDGET))
+  local examined=0 skipped=0
+
   local id
   for id in $ids; do
+    # Checked BEFORE the call, not after: a call started at the deadline still
+    # costs its full curl timeout.
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    examined=$((examined + 1))
     jobs=$(gh_api "repos/$REPO_FULL/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || continue
 
     local counted
@@ -239,6 +266,14 @@ collect_demand() {
       [ "$wait" -gt "$QUEUE_WAIT_MAX" ] && QUEUE_WAIT_MAX=$wait
     done
   done
+
+  # NEVER silently. A truncated sweep under-reports demand, and under-reported
+  # demand is a pool that does not scale out — the exact symptom this fleet keeps
+  # misreading as "the autoscaler is broken". Published as a series too, so the
+  # budget being too small for a repo is visible without reading a controller log.
+  DEMAND_RUNS_SKIPPED=$skipped
+  [ "$skipped" -gt 0 ] && log "demand budget ${DEMAND_BUDGET}s exhausted after $examined run(s): $skipped run(s) not examined this tick — demand is a LOWER BOUND"
+  return 0
 }
 
 # --- hosts -------------------------------------------------------------------
@@ -532,6 +567,9 @@ tick() {
   DRAIN_ABORTED=0
   REAPED=0
 
+  local tick_start
+  tick_start=$(date +%s)
+
   collect_demand
   # A blind tick is not an error, it is a SUSPENSION: every host reads
   # reg=unknown, so nothing drains. One is unremarkable; a run of them is a pool
@@ -616,6 +654,15 @@ tick() {
   # confusion this whole fleet keeps paying for. 0 means "the last tick could see
   # GitHub"; N means scale-in has been suspended for N consecutive ticks.
   queue_series "ci_runner_list_blind_ticks" "$BLIND_TICKS"
+  # How long this tick took, end to end. The fleet had no series for it and paid
+  # for that: a tick growing past the watchdog threshold is a controller about to
+  # be restarted mid-tick forever, and the only visible symptom was every OTHER
+  # series going absent at once. Published last so it also covers the work done
+  # after the drain loop.
+  queue_series "ci_tick_seconds" "$(( $(date +%s) - tick_start ))"
+  # >0 means ci_demand is a lower bound this tick, so a pool that looks
+  # under-scaled may simply not have been counted.
+  queue_series "ci_demand_runs_skipped" "$DEMAND_RUNS_SKIPPED"
   flush_series
 }
 
@@ -668,23 +715,54 @@ EOF
   local wd_threshold=$((POLL * 10))
   [ "$wd_threshold" -lt 300 ] && wd_threshold=300
 
-  cat >/opt/ci-controller/watchdog.sh <<WDEOF
-#!/usr/bin/env bash
-set -uo pipefail
+  # The decision rule is EMITTED FROM THE FUNCTION THIS PROCESS CARRIES, via
+  # `declare -f`, not re-typed into the heredoc. watchdog-decision.sh is
+  # concatenated into this script at apply time and unit-tested in CI, so the
+  # text on the box is the text the tests exercised. A second hand-written copy
+  # here would be the one that drifts — and its drift would be invisible, since
+  # the watchdog only speaks by restarting something.
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -uo pipefail'
+    declare -f watchdog_verdict
+    cat <<WDEOF
 HB="$STATE_DIR/heartbeat"
 THRESHOLD=$wd_threshold
-# No heartbeat file yet = the loop has not completed its first tick. That is a
-# normal boot, not a wedge, so hold off until one exists rather than restarting
-# a controller that is still starting up.
-[ -f "\$HB" ] || exit 0
+UNIT=ci-controller.service
+
 now=\$(date +%s)
-last=\$(stat -c %Y "\$HB" 2>/dev/null || echo "\$now")
-age=\$((now - last))
-if [ "\$age" -ge "\$THRESHOLD" ]; then
-  logger -t ci-controller-watchdog -- "heartbeat \${age}s old (>= \${THRESHOLD}s) — restarting ci-controller.service"
-  systemctl restart ci-controller.service
+present=0; age=0
+if [ -f "\$HB" ]; then
+  present=1
+  last=\$(stat -c %Y "\$HB" 2>/dev/null || echo "\$now")
+  age=\$((now - last))
 fi
+
+# How long the unit has been up. An inactive unit reports the zero timestamp and
+# systemd prints an empty value when it cannot answer at all; both become -1,
+# which watchdog_verdict treats as "old enough to judge" — an unreadable uptime
+# must not switch the watchdog off.
+uptime=-1
+started=\$(systemctl show "\$UNIT" -p ActiveEnterTimestamp --value 2>/dev/null)
+if [ -n "\$started" ] && [ "\$started" != "n/a" ]; then
+  epoch=\$(date -d "\$started" +%s 2>/dev/null || echo "")
+  [ -n "\$epoch" ] && [ "\$epoch" -gt 0 ] && uptime=\$((now - epoch))
+fi
+
+verdict=\$(watchdog_verdict "\$present" "\$age" "\$uptime" "\$THRESHOLD")
+case "\$verdict" in
+  restart)
+    logger -t ci-controller-watchdog -- "heartbeat \${age}s old (>= \${THRESHOLD}s) and unit up \${uptime}s — restarting \$UNIT"
+    systemctl restart "\$UNIT"
+    ;;
+  hold:restarted-*)
+    # Logged, unlike the other holds: this is the branch that was missing, and
+    # if a controller is being held every minute the operator should be able to
+    # see that the watchdog is deliberately not acting.
+    logger -t ci-controller-watchdog -- "heartbeat \${age}s old but \$verdict — holding"
+    ;;
+esac
 WDEOF
+  } >/opt/ci-controller/watchdog.sh
   chmod 0755 /opt/ci-controller/watchdog.sh
 
   cat >/etc/systemd/system/ci-controller-watchdog.service <<'WDSVCEOF'
@@ -740,13 +818,18 @@ WDTIMEOF
 run_loop() {
   log "controller loop starting"
   while true; do
+    # Written BEFORE the tick as well as after it. The heartbeat is LOCAL
+    # liveness — "this loop is turning" — and a tick can legitimately run for
+    # minutes on a repo with many active runs. Writing it only afterwards made
+    # a slow tick indistinguishable from a wedged one, and the watchdog's
+    # restart then killed the tick before it could write the file that would
+    # have stopped the restarting (see watchdog-decision.sh). A tick genuinely
+    # stuck on a call still ages this file out, because the write happens once
+    # per iteration, not once per second.
+    date +%s >"$STATE_DIR/heartbeat" 2>/dev/null || true
     tick || log "tick failed"
-    # LOCAL liveness, deliberately distinct from the `ci_poller_heartbeat`
-    # series: that one only reaches Monitoring if the tick got far enough to
-    # flush, so it cannot report a loop wedged BEFORE the flush — which is
-    # exactly the failure being guarded. Written after every tick, good or bad,
-    # because a tick that fails cleanly is a live loop; only a stopped one is
-    # the emergency. The watchdog below reads this file's mtime.
+    # After it too, so an ordinary tick keeps the file at most one tick old
+    # rather than one tick plus its own duration.
     date +%s >"$STATE_DIR/heartbeat" 2>/dev/null || true
     sleep "$POLL"
   done

@@ -65,6 +65,7 @@ locals {
     file("${path.module}/scripts/drain-decision.sh"),
     file("${path.module}/scripts/orphan-decision.sh"),
     file("${path.module}/scripts/telemetry.sh"),
+    file("${path.module}/scripts/watchdog-decision.sh"),
     file("${path.module}/scripts/controller-startup.sh"),
   ])
 }
@@ -351,6 +352,7 @@ resource "google_compute_instance" "controller" {
     "ci-register-grace-seconds" = tostring(var.register_grace_seconds)
     "ci-orphan-confirm-ticks"   = tostring(var.orphan_confirm_ticks)
     "ci-poll-seconds"           = tostring(var.poll_interval_seconds)
+    "ci-demand-budget-seconds"  = tostring(var.demand_budget_seconds)
     "ci-metric-prefix"          = var.metric_prefix
 
     "block-project-ssh-keys" = "true"
