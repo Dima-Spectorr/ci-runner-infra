@@ -111,6 +111,53 @@ else
   fails=$((fails + type_fails))
 fi
 
+# ── plan readers agree ────────────────────────────────────────────────────────
+# The guard reads the plan with jq, or with python3 where jq is absent (the
+# Windows administration host these roots are applied from has no jq, and a guard
+# that refuses every apply is a guard that gets skipped). Two implementations of
+# "what does this plan destroy" that disagree would be worse than one: the digest
+# the operator is told to re-run with is computed from that answer, so a reader
+# that misses a resource hands out a token which waves the miss through.
+plan_fixture="$(mktemp)"; trap 'rm -f "$plan_fixture"' EXIT
+cat >"$plan_fixture" <<'JSON'
+{"resource_changes":[
+  {"address":"module.id.google_secret_manager_secret.app_key","type":"google_secret_manager_secret","change":{"actions":["delete"]}},
+  {"address":"module.id.google_service_account.host","type":"google_service_account","change":{"actions":["delete","create"]}},
+  {"address":"module.id.google_service_account_iam_member.tokencreator","type":"google_service_account_iam_member","change":{"actions":["delete"]}},
+  {"address":"module.pool.google_compute_instance.controller","type":"google_compute_instance","change":{"actions":["update"]}},
+  {"address":"module.pool.google_compute_region_autoscaler.hosts","type":"google_compute_region_autoscaler","change":{"actions":["delete"]}}
+]}
+JSON
+
+reader_fails=0
+avail=""
+command -v jq      >/dev/null 2>&1 && avail="$avail jq"
+command -v python3 >/dev/null 2>&1 && avail="$avail python3"
+[ -n "$avail" ] || { printf 'FAIL neither jq nor python3 is available — the guard cannot read a plan here\n'; fails=$((fails + 1)); }
+
+for r in $avail; do
+  PLAN_READER="$r"
+  got_all="$(read_plan "$plan_fixture" all | sort | tr '\n' ',')"
+  got_prot="$(read_plan "$plan_fixture" protected | sort | tr '\n' ',')"
+  want_all='module.id.google_secret_manager_secret.app_key,module.id.google_service_account.host,module.id.google_service_account_iam_member.tokencreator,module.pool.google_compute_region_autoscaler.hosts,'
+  want_prot='module.id.google_secret_manager_secret.app_key,module.id.google_service_account.host,'
+  # The service account is a delete+create REPLACE. It must still count: a
+  # replaced service account is a new id, and every binding to the old one
+  # detaches silently.
+  if [ "$got_all" = "$want_all" ]; then
+    printf 'ok   %s lists every destroy, including a delete+create replacement\n' "$r"
+  else
+    printf 'FAIL %s destroy list: %s\n' "$r" "$got_all"; reader_fails=$((reader_fails + 1))
+  fi
+  if [ "$got_prot" = "$want_prot" ]; then
+    printf 'ok   %s counts only true identities as protected, not the iam_member\n' "$r"
+  else
+    printf 'FAIL %s protected list: %s\n' "$r" "$got_prot"; reader_fails=$((reader_fails + 1))
+  fi
+done
+unset PLAN_READER
+fails=$((fails + reader_fails))
+
 if [ "$fails" -eq 0 ]; then
   printf '\nPASS — a stale or dirty checkout, and any unconfirmed destroy, are refused before apply.\n'
 else
