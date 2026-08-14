@@ -61,6 +61,13 @@ jobs:
       - name: watchdog-decision self-test
         run: bash scripts/ci/watchdog-decision.selftest.sh
 
+      # A bound that is not a bound: a call allowed to START inside the budget
+      # spends its whole timeout beyond it, and a fixed alert threshold pages
+      # for a wider watchdog window it knows nothing about. Both were review
+      # findings on the restart-loop fix, both re-open the loop it closed.
+      - name: demand-budget self-test
+        run: bash scripts/ci/demand-budget.selftest.sh
+
       - name: demand-match self-test
         run: bash scripts/ci/demand-match.selftest.sh
 

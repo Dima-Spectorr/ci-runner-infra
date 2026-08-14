@@ -210,17 +210,19 @@ variable "demand_budget_seconds" {
   type        = number
   default     = 90
 
+  # Whole seconds only: the controller does bash integer arithmetic on this
+  # value (`deadline=$((now + DEMAND_BUDGET))`), which fails outright on 90.5 —
+  # and it fails inside the tick, where the consequence is the silent controller
+  # this variable exists to prevent.
   validation {
-    condition     = var.demand_budget_seconds >= 10
-    error_message = "demand_budget_seconds must be at least 10: a smaller budget can expire before the first run's job list returns, so demand would read 0 on every tick and the pool would never scale out."
+    condition     = var.demand_budget_seconds >= 10 && floor(var.demand_budget_seconds) == var.demand_budget_seconds
+    error_message = "demand_budget_seconds must be a whole number of seconds, at least 10: a smaller budget can expire before the first run's job list returns, so demand would read 0 on every tick and the pool would never scale out, and a fractional value breaks the controller's integer arithmetic."
   }
 
-  # The failure mode this variable exists to prevent, blocked at plan time
-  # instead of discovered as a controller that publishes nothing.
-  validation {
-    condition     = var.demand_budget_seconds <= max(300, var.poll_interval_seconds * 10) - 120
-    error_message = "demand_budget_seconds must leave at least 120s of the watchdog threshold (max(300, poll_interval_seconds * 10)) for the rest of the tick — otherwise the watchdog restarts the controller mid-tick, the restart prevents the heartbeat, and it never publishes again."
-  }
+  # The cross-variable check (against poll_interval_seconds) is NOT here: a
+  # variable validation may reference another variable only from Terraform 1.9,
+  # and this module supports >= 1.5. It lives as a precondition in main.tf,
+  # beside the identity-split check that hit the same boundary.
 }
 
 variable "warm_schedules" {

@@ -19,7 +19,11 @@
 # history and leaves a window with no policy at all.
 #
 # Usage:
-#   ensure-alert-policies.sh --project <id> --email <addr> [--account <sa-email>] [--dry-run]
+#   ensure-alert-policies.sh --project <id> --email <addr> [--account <sa-email>]
+#                            [--poll-interval-seconds <n>] [--dry-run]
+#
+#   --poll-interval-seconds must match the pool's `poll_interval_seconds`: the
+#   slow-tick threshold is derived from it, because the watchdog window is.
 #
 #   --account selects a per-command identity for a project in another
 #   organisation. It is never exported: GOOGLE_APPLICATION_CREDENTIALS is shared
@@ -27,17 +31,38 @@
 set -euo pipefail
 
 PROJECT=""; EMAIL=""; ACCOUNT=""; DRY=0
+# The slow-tick threshold is NOT a constant of the fleet. The watchdog fires at
+# max(300, poll_interval_seconds * 10), so a pool polling every 60s has a 600s
+# window and healthy 200s ticks there are fine — a fixed 150s would page for a
+# supported configuration, and the documented remedy (raise poll_interval_seconds)
+# would not clear it. Pass half the pool's watchdog threshold; the default is
+# half of the default window.
+POLL=20
 while [ $# -gt 0 ]; do
   case "$1" in
     --project) PROJECT="$2"; shift 2 ;;
     --email)   EMAIL="$2";   shift 2 ;;
     --account) ACCOUNT="$2"; shift 2 ;;
+    --poll-interval-seconds) POLL="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [ -n "$PROJECT" ] || { echo "--project is required" >&2; exit 2; }
 [ -n "$EMAIL" ]   || { echo "--email is required (the channel every policy notifies)" >&2; exit 2; }
+case "$POLL" in ''|*[!0-9]*) echo "--poll-interval-seconds must be a whole number of seconds" >&2; exit 2 ;; esac
+[ "$POLL" -ge 1 ] || { echo "--poll-interval-seconds must be >= 1" >&2; exit 2; }
+
+# Same expression the module and the watchdog use, as a pure function so the
+# self-test can exercise the deployed text rather than a copy of it.
+# watchdog_threshold <poll_interval_seconds> -> seconds
+watchdog_threshold() {
+  local t=$(( $1 * 10 ))
+  [ "$t" -lt 300 ] && t=300
+  echo "$t"
+}
+WATCHDOG_THRESHOLD="$(watchdog_threshold "$POLL")"
+SLOW_TICK=$(( WATCHDOG_THRESHOLD / 2 ))
 
 # The corporate proxy blackholes the token endpoint; without this every call
 # below fails as an auth error rather than a network one, which sends the reader
@@ -157,9 +182,9 @@ EOF
 { "displayName": "CI runners / tick approaching the watchdog threshold",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "A controller tick is taking longer than half the watchdog threshold (300s at the default poll). This is the precursor to a total blackout, not a slowdown: once a tick outlasts the threshold the watchdog restarts the controller mid-tick, the restart prevents the heartbeat that would have stopped it, and every series — heartbeat included — goes absent while systemd still reports active (running). Two pools in this fleet ran that way for hours on 2026-08-14. Demand costs one API call per active workflow run, so the usual cause is a busier repository; lower demand_budget_seconds or raise poll_interval_seconds. Check ci_demand_runs_skipped." },
-  "conditions": [ { "displayName": "ci_tick_seconds > 150 for 10m",
-    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 150.0, "duration": "600s",
+    "A controller tick is taking longer than ${SLOW_TICK}s — half this pool's watchdog threshold of ${WATCHDOG_THRESHOLD}s (max(300, poll_interval_seconds * 10), with poll_interval_seconds=${POLL}). This is the precursor to a total blackout, not a slowdown: once a tick outlasts the threshold the watchdog restarts the controller mid-tick, the restart prevents the heartbeat that would have stopped it, and every series — heartbeat included — goes absent while systemd still reports active (running). Two pools in this fleet ran that way for hours on 2026-08-14. Demand costs one API call per active workflow run, so the usual cause is a busier repository; lower demand_budget_seconds, or raise poll_interval_seconds AND re-run this script so the threshold follows the wider watchdog window. Check ci_demand_runs_skipped." },
+  "conditions": [ { "displayName": "ci_tick_seconds > ${SLOW_TICK} for 10m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": ${SLOW_TICK}.0, "duration": "600s",
       "filter": "metric.type=\"custom.googleapis.com/github/ci_tick_seconds\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }

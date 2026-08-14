@@ -49,7 +49,9 @@ log() {
 # metric reads as a value, not as a gap. The watchdog installed further down is
 # the second half of this fix: bounds stop one call from hanging, the watchdog
 # recovers the loop if anything else does.
-CURL_TIMEOUTS=(--connect-timeout 10 --max-time 30)
+CURL_MAX_TIME=30   # keep in step with --max-time below; the demand budget
+                   # reserves one of these before starting another call
+CURL_TIMEOUTS=(--connect-timeout 10 --max-time "$CURL_MAX_TIME")
 
 md() {
   curl "${CURL_TIMEOUTS[@]}" -fsS -H "Metadata-Flavor: Google" \
@@ -130,7 +132,7 @@ BLIND_TICKS=0
 
 gh_token() {
   local now
-  now=$(date +%s)
+  now=$sweep_start
   # Installation tokens live an hour; refresh with margin rather than on 401,
   # so a token expiring mid-tick cannot be mistaken for an API outage (which
   # would make every host reg=unknown and freeze all draining).
@@ -197,11 +199,33 @@ gh_api() {
 #
 # A job asking for a label this pool does not carry belongs to another pool (or
 # to GitHub-hosted runners) and is correctly ignored.
+# budget_allows_call <now> <deadline> <call_max_time> -> 0 = start the call
+#
+# A call must FIT inside the budget, not merely start inside it: curl will spend
+# its full timeout regardless of how little budget is left, so "start if now <
+# deadline" overruns by almost one timeout on the last call of every exhausted
+# sweep. Pure, and exercised by scripts/ci/demand-budget.selftest.sh.
+budget_allows_call() {
+  [ $(( $1 + $3 )) -le "$2" ]
+}
+
 collect_demand() {
   local runs jobs
   DEMAND_TOTAL=0
   DEMAND_QUEUED=0
   QUEUE_WAIT_MAX=0
+  # Reset HERE, with the other counters, not after the loop: every early return
+  # below would otherwise leave the previous tick's value in place and the
+  # controller would keep republishing "demand is truncated" forever.
+  DEMAND_RUNS_SKIPPED=0
+
+  # The deadline starts BEFORE the two run-list calls, because they are part of
+  # the sweep and each can cost a full curl timeout. Starting it after them let
+  # a 90s budget authorise 90s + two 30s list calls + one 30s job call = 180s of
+  # demand work, which eats the watchdog reserve the budget exists to protect.
+  local sweep_start deadline
+  sweep_start=$(date +%s)
+  deadline=$((sweep_start + DEMAND_BUDGET))
 
   runs=$(gh_api "repos/$REPO_FULL/actions/runs?status=queued&per_page=50" 2>/dev/null)
   local runs_ip
@@ -211,27 +235,35 @@ collect_demand() {
   # what survives the budget below, and queued jobs are the ones the pool has to
   # scale out FOR. `awk '!seen[$0]++'` keeps that order while still visiting a
   # run that appears in both lists only once.
+  #
+  # This is a PRIORITY, not a guarantee. A run flips to in_progress as soon as
+  # ONE of its jobs starts, so a matrix or a needs: chain can hold queued jobs
+  # inside an in_progress run — which sorts last and is dropped first. So an
+  # exhausted budget can under-report QUEUED demand too, not only in-progress
+  # work. That is why the truncation is published (ci_demand_runs_skipped) and
+  # logged rather than treated as harmless: the honest statement is that demand
+  # is a lower bound, full stop.
   local ids
   ids=$(printf '%s\n%s' "$runs" "$runs_ip" \
     | jq -r '.workflow_runs[]?.id' 2>/dev/null | awk 'NF && !seen[$0]++')
   [ -n "$ids" ] || return 0
 
   local now
-  now=$(date +%s)
+  now=$sweep_start
 
   # One API call per run, and the run count is whatever the repo happens to be
   # doing — so this loop, alone, sets the tick duration. One pool in this fleet
   # measured a 212s tick against a 300s watchdog threshold on 2026-08-14: not
   # yet fatal, and only a busier hour away from being restarted mid-tick forever.
   # The budget bounds the tick instead of hoping the repo stays quiet.
-  local deadline=$((now + DEMAND_BUDGET))
   local examined=0 skipped=0
 
   local id
   for id in $ids; do
-    # Checked BEFORE the call, not after: a call started at the deadline still
-    # costs its full curl timeout.
-    if [ "$(date +%s)" -ge "$deadline" ]; then
+    # The call must FIT, not merely start: one begun a second before the
+    # deadline still costs its full curl timeout, so the budget is overrun by
+    # almost a whole timeout every time. CURL_MAX_TIME is that timeout.
+    if ! budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME"; then
       skipped=$((skipped + 1))
       continue
     fi
@@ -272,7 +304,7 @@ collect_demand() {
   # misreading as "the autoscaler is broken". Published as a series too, so the
   # budget being too small for a repo is visible without reading a controller log.
   DEMAND_RUNS_SKIPPED=$skipped
-  [ "$skipped" -gt 0 ] && log "demand budget ${DEMAND_BUDGET}s exhausted after $examined run(s): $skipped run(s) not examined this tick — demand is a LOWER BOUND"
+  [ "$skipped" -gt 0 ] && log "demand budget ${DEMAND_BUDGET}s exhausted after $examined run(s): $skipped run(s) not examined this tick — demand is a LOWER BOUND, and a skipped in_progress run may still hold queued jobs"
   return 0
 }
 
@@ -450,7 +482,7 @@ idle_seconds() {
   local host="$1" busy="$2"
   local f="$STATE_DIR/idle-$host"
   local now
-  now=$(date +%s)
+  now=$sweep_start
 
   if [ "$busy" -gt 0 ]; then
     rm -f "$f"
