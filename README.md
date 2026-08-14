@@ -115,6 +115,17 @@ still inside its warm window.
   `controller_service_account_email` and rejects a value equal to
   `service_account_email`. It used to default to "reuse the host account", and
   every consumer took that default, so it is no longer a default at all.
+* **Slots on one host share a Docker daemon — so `slots_per_host > 1` is only
+  for repositories that do not run outside contributors' code.** Every agent on
+  a host talks to the same daemon, which is how the agent creates service
+  containers at all. A job that can reach that socket can enumerate the sibling
+  slots' containers, `exec` into them, and read their `GITHUB_TOKEN`, their
+  workspace and whatever the credential broker minted for them — and because the
+  host is warm, into later jobs too. The metadata fence does not contain this:
+  it blocks the metadata server, not the daemon. Until per-slot daemons land
+  (#10), this exposure is ACCEPTED, not absent, and it is accepted only where
+  every job is code a maintainer already trusts. A repository that takes pull
+  requests from outside runs `slots_per_host = 1`, or does not run them here.
 * **A warm cache is untrusted build input.** A poisoned cache entry survives to
   the next job, which the old destroy-per-job model made impossible. Caches are
   scoped per repository and rebuilt with the image.
