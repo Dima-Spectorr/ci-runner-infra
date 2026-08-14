@@ -79,6 +79,12 @@ jobs:
       - name: identity split self-test
         run: bash scripts/ci/identity-split.selftest.sh
 
+      # The README quickstart pinned v3.0.0 while the fleet ran v4.1.0 — the one
+      # copy-pasteable line in the repo, three minor versions stale, because
+      # nothing connected Markdown to a git tag. VERSION is that connection.
+      - name: docs pins self-test
+        run: bash scripts/ci/docs-pins.selftest.sh
+
   terraform:
     name: Terraform (fmt + validate)
     runs-on: ubuntu-latest
