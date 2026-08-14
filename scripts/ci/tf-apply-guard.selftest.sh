@@ -45,8 +45,8 @@ check "digest is stable for the same address set" "$d1" "$(plan_digest 'a
 b')"
 check "digest ignores address order" "$d1" "$(plan_digest 'b
 a')"
-[ "$d1" != "$d2" ] && printf 'ok   a plan that grows gets a different digest\n' \
-  || { printf 'FAIL a plan that grows kept its digest\n'; fails=$((fails + 1)); }
+if [ "$d1" != "$d2" ]; then printf 'ok   a plan that grows gets a different digest\n'
+else printf 'FAIL a plan that grows kept its digest\n'; fails=$((fails + 1)); fi
 
 # ── plan ──────────────────────────────────────────────────────────────────────
 check "create-only plan applies" \
@@ -93,17 +93,23 @@ fi
 # ── protected-type matching ───────────────────────────────────────────────────
 # Unanchored, PROTECTED_TYPES matched every *_iam_member of a secret or service
 # account, so routine IAM churn would have been refused as identity destruction.
+type_fails=0
 for t in google_secret_manager_secret google_service_account; do
-  echo "$t" | grep -qE "$PROTECTED_TYPES" \
-    || { printf 'FAIL %s is not matched as protected\n' "$t"; fails=$((fails + 1)); }
+  if ! echo "$t" | grep -qE "$PROTECTED_TYPES"; then
+    printf 'FAIL %s is not matched as protected\n' "$t"; type_fails=$((type_fails + 1))
+  fi
 done
 for t in google_service_account_iam_member google_secret_manager_secret_iam_member \
          google_secret_manager_secret_version google_service_account_key; do
   if echo "$t" | grep -qE "$PROTECTED_TYPES"; then
-    printf 'FAIL %s is matched as protected — IAM churn would be refused\n' "$t"; fails=$((fails + 1))
+    printf 'FAIL %s is matched as protected — IAM churn would be refused\n' "$t"; type_fails=$((type_fails + 1))
   fi
 done
-[ "$fails" -eq 0 ] && printf 'ok   protected types match exactly, not as a prefix of IAM types\n'
+if [ "$type_fails" -eq 0 ]; then
+  printf 'ok   protected types match exactly, not as a prefix of IAM types\n'
+else
+  fails=$((fails + type_fails))
+fi
 
 if [ "$fails" -eq 0 ]; then
   printf '\nPASS — a stale or dirty checkout, and any unconfirmed destroy, are refused before apply.\n'
