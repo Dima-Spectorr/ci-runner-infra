@@ -88,6 +88,14 @@ jobs:
       - name: bounded-calls self-test
         run: bash scripts/ci/bounded-calls.selftest.sh
 
+      # `systemctl enable --now` is a no-op on a unit that is already running,
+      # and the controller VM keeps its disk across a reset — so the old process
+      # kept serving the pool while the new file sat on disk, with terraform,
+      # the file hash and `systemctl status` all reporting success. Cost the
+      # v5.1.0 rollout its first delivery on 2026-08-14.
+      - name: installer-activation self-test
+        run: bash scripts/ci/installer-activation.selftest.sh
+
       # The README quickstart pinned v3.0.0 while the fleet ran v4.1.0 — the one
       # copy-pasteable line in the repo, three minor versions stale, because
       # nothing connected Markdown to a git tag. VERSION is that connection.
