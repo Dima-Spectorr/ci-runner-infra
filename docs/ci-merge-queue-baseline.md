@@ -153,12 +153,40 @@ Run `--selftest` immediately before the real invocation:
         run: bash scripts/ci/check-merge-queue-single-step.sh
 ```
 
-The self-test plants 13 fixtures and asserts each detector on its own count,
+The self-test plants 19 fixtures and asserts each detector on its own count,
 because a config gate's characteristic failure is a **vacuous pass** — it reads
 a file it never matches and reports clean. The fixtures include a
 commented-out queue action (must satisfy neither the ban nor the
 something-queues check) and a two-rule file with one rule unanchored (a
 whole-file "an anchor exists" test passes it).
+
+### It matches paths, not key names
+
+Every assertion names an exact YAML path — `merge_queue.max_parallel_checks`,
+`queue_rules[1].batch_size` — never a key found somewhere in the text. The
+distinction is the gate: a key written one level too deep is not a value in an
+odd spot, it is a **file Mergify refuses to load**, and a keyword scan finds the
+value it was hoping for and reports in-place checking over a repository where
+nothing queues at all. The same shape recurs four ways, and each has a fixture:
+
+| written as | keyword scan says | actually |
+|---|---|---|
+| `max_parallel_checks` inside a queue rule | serial checking | file rejected, no rule loads |
+| `auto_merge_conditions` inside a queue rule | green PRs auto-queue | unknown key; nothing queues |
+| rule B omits `batch_size` while rule A declares `1` | unbatched | rule B batches on a throwaway branch |
+| rule B aliases rule A's anchor (`&low` / `*low`) | anchors and aliases balance | rule B's two lists are different nodes |
+
+Queue actions are matched on the action path, so `queue:` as a block mapping and
+`queue: {name: default}` inline are one finding rather than one caught and one
+missed.
+
+Structural reading is still not parsing, so **CHECK 0 hands the file to a real
+YAML parser first** (`python3` + PyYAML) and fails on a load error: an
+unterminated flow sequence three keys away leaves all seven invariants matching
+while Mergify loads nothing. On a runner without a parser the gate says so in
+its output and asserts structure only — Mergify's own `Configuration changed`
+check is then what catches a malformed file, and the gate does not claim
+otherwise.
 
 ---
 
@@ -168,6 +196,9 @@ whole-file "an anchor exists" test passes it).
   The two halves land in one commit or not at all.
 - **Do not put `max_parallel_checks` inside a queue rule.** It rejects the file
   and the queue fails closed.
+- **Do not declare an invariant once and assume it covers every queue rule.**
+  `batch_size` and the anchor are per rule; a second rule that omits either is a
+  second place to lose in-place checking.
 - **Do not write `merge_conditions` out as a second list**, however carefully it
   matches today.
 - **Do not restate `check-success` conditions in `auto_merge_conditions`.**
