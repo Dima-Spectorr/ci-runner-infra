@@ -675,8 +675,25 @@ WantedBy=timers.target
 WDTIMEOF
 
   systemctl daemon-reload
-  systemctl enable --now ci-controller.service
-  systemctl enable --now ci-controller-watchdog.timer
+  systemctl enable ci-controller.service
+  systemctl enable ci-controller-watchdog.timer
+
+  # RESTART, not `enable --now`. The controller VM keeps its boot disk across a
+  # reset, so /opt/ci-controller/controller.sh from the PREVIOUS version is
+  # already on disk and its unit is already enabled: systemd starts the OLD code
+  # at boot, this script then overwrites the file, and `enable --now` sees a
+  # running unit and does nothing. The result is the worst possible shape of a
+  # rollout — the file on disk is the new version, `terraform apply` reports
+  # success, and the process serving the pool is still the old one. That is
+  # exactly how v5.1.0 reached the IntegrateIT controller on 2026-08-14 with the
+  # bounded curls and the watchdog present in the file and absent from the
+  # running loop (no heartbeat file, so the watchdog also stayed inert).
+  #
+  # Restarting unconditionally is safe: every tick recomputes from live GitHub
+  # and MIG state, and the drain/orphan state files are idempotent counters, so
+  # a tick started over loses nothing.
+  systemctl restart ci-controller.service
+  systemctl restart ci-controller-watchdog.timer
   log "controller installed for $REPO_FULL pool=$POOL mig=$MIG poll=${POLL}s grace=${GRACE}s slots=$SLOTS watchdog=${wd_threshold}s"
 }
 
