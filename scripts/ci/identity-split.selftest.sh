@@ -61,13 +61,17 @@ fi
 
 # 5. The controller account has to exist for any of the above to be reachable,
 #    and consumers need its email to pass through.
-grep -q 'resource "google_service_account" "controller"' "$IDENTITY/main.tf" \
-  && ok "controller service account is declared" \
-  || bad "controller service account is missing"
+if grep -q 'resource "google_service_account" "controller"' "$IDENTITY/main.tf"; then
+  ok "controller service account is declared"
+else
+  bad "controller service account is missing"
+fi
 
-grep -q 'output "controller_service_account_email"' "$IDENTITY/outputs.tf" \
-  && ok "controller email is exported" \
-  || bad "controller_service_account_email output is missing"
+if grep -q 'output "controller_service_account_email"' "$IDENTITY/outputs.tf"; then
+  ok "controller email is exported"
+else
+  bad "controller_service_account_email output is missing"
+fi
 
 # 6. A 30-character account id is a hard GCP cap, and a pool name is already
 #    close to it (ci-runner-host-dataretrival is 26). Without truncation the
@@ -79,5 +83,9 @@ else
   bad "controller account id is not truncated — a long pool name will not plan"
 fi
 
-[ "$fail" -eq 0 ] && echo "  identity split intact." || echo "  identity split BROKEN."
+if [ "$fail" -eq 0 ]; then
+  echo "  identity split intact."
+else
+  echo "  identity split BROKEN."
+fi
 exit "$fail"
