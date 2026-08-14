@@ -153,6 +153,29 @@ has_slot_tmp_isolation() { # <file>
   matches "$code" '^JoinsNamespaceOf=ci-dockerd@\$idx\.service$'
 }
 
+# Each slot's daemon picks a host port for a service container out of
+# /proc/sys/net/ipv4/ip_local_port_range, and RootlessKit binds that number in
+# the ONE shared host netns. Every slot reading the same default range picks the
+# same first free port, so two slots starting a service container together fail
+# with "PortManager.AddPort(): listen tcp4 0.0.0.0:32768: bind: address already
+# in use" (IntegrateIT #7749) — not a rare race, a near-certainty. The partition
+# is silent when broken: the daemon starts fine and only jobs fail, later.
+has_port_partition() { # <file>
+  local code
+  code=$(code_of "$1")
+  # the range is written inside the slot's OWN netns
+  matches "$code" '/proc/sys/net/ipv4/ip_local_port_range' || return 1
+  # and the only process that runs there is the daemon, reached through PATH —
+  # so the shim has to come FIRST on it
+  matches "$code" '^Environment=PATH=/opt/ci/rootless-shim:' || return 1
+  # per SLOT, not one range for the host: a constant here restores the collision
+  matches "$code" '^Environment=CI_SLOT_PORT_RANGE=\$\(slot_port_range "\$idx"\)$' || return 1
+  matches "$code" 'low=\$\(\( 33000 \+ \(idx - 1\) \* span \)\)' || return 1
+  # absolute path out of the shim: `exec dockerd` would re-find the shim on PATH
+  # and spin forever instead of starting a daemon
+  matches "$code" '^exec /usr/bin/dockerd "\$@"$'
+}
+
 # The helper carries the trap it was written to avoid, so it is tested first.
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -196,6 +219,12 @@ else
   bad "slots share /tmp, or the agent does not share its daemon's — a fixed path there is owned by whichever slot ran first and every other slot gets EACCES on it (SOAP-To-REST #2017)"
 fi
 
+if has_port_partition "$SCRIPT"; then
+  ok
+else
+  bad "slots share one ephemeral port range — two slots publishing a service container's port race for the same number and one dies with 'address already in use' (IntegrateIT #7749)"
+fi
+
 if has_container_runtime "$SCRIPT"; then
   ok
 else
@@ -236,6 +265,11 @@ mutate "probe back to daemon-only"       's/slot_runtime_usable "\$idx" "\$u" ||
 mutate "DNS probe runs as root"          's/sudo -u "\$u" getent ahostsv4/getent ahostsv4/'            has_container_runtime
 mutate "slots share /tmp again"          's/^PrivateTmp=yes$/PrivateTmp=no/'                           has_slot_tmp_isolation
 mutate "only the daemon gets a private /tmp" 's/^JoinsNamespaceOf=ci-dockerd@\$idx\.service$/#&/'      has_slot_tmp_isolation
+
+mutate "shim dropped off the daemon's PATH"  's|^Environment=PATH=/opt/ci/rootless-shim:|Environment=PATH=|'                    has_port_partition
+mutate "one range for every slot"            's|^Environment=CI_SLOT_PORT_RANGE=.*|Environment=CI_SLOT_PORT_RANGE=33000 60999|' has_port_partition
+mutate "slot index dropped from the range"   's/(idx - 1)/(0)/'                                                                 has_port_partition
+mutate "shim re-execs itself through PATH"   's|^exec /usr/bin/dockerd "\$@"$|exec dockerd "$@"|'                               has_port_partition
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
