@@ -161,8 +161,31 @@ modules/ci-runner-host-pool/     the module consumers reference
   scripts/controller-startup.sh  poll, publish, drain
   scripts/telemetry.sh           the single metric publisher
 packer/ci-host-image.pkr.hcl     the golden image; repo-agnostic
+scripts/ci/lane-decision.sh      pure CI-lane rule (unit-tested)
 scripts/ci/                      self-tests
+docs/ci-lane-model.md            the lane contract consumers adopt
+docs/ci-optimization-catalog.md  the fleet audit behind that contract
 ```
+
+## The CI lane model
+
+This repository also publishes *how much CI a pull request deserves*, for the
+same reason it publishes the pool: the rule had been re-derived in four
+repositories with four different path lists, and two of them evaluate it inside
+a `runs-on: [self-hosted, ...]` job — so a documentation-only pull request
+claims a pool slot in order to decide it has nothing to do.
+
+`scripts/ci/lane-decision.sh` is that rule as a pure function, asserted by
+`scripts/ci/lane-decision.selftest.sh` on every change here. Three lanes:
+`none` (no self-hosted job at all), `partial` (affected areas), `full` (diffs
+whose blast radius is not visible in the diff — lockfiles, Dockerfiles,
+workflows, infrastructure, migrations).
+
+Consumers adopt it by tag, never by copying — see
+[`docs/ci-lane-model.md`](docs/ci-lane-model.md) for the four adoption
+requirements and the order they must be done in. The audit that produced it,
+with per-repository measurements, is in
+[`docs/ci-optimization-catalog.md`](docs/ci-optimization-catalog.md).
 
 ## Genericity
 
