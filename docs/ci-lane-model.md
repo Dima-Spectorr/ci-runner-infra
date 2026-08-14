@@ -264,15 +264,24 @@ Rule: Auto-queue non-draft PRs once required checks are green (queue)   fail
 The second suite's `success` lands eight seconds later and does **not** displace
 it. Mergify sees both conclusions on the sha and reports the context failing —
 exactly the deadlock the aggregate was introduced to remove, with `cancelled`
-where `skipped` used to be. It is worse than the original, because it now
-reproduces on ordinary pushes too: any commit that supersedes an in-flight run
-leaves a red behind.
+where `skipped` used to be.
+
+The scope is **same-sha supersession**, and that is the whole hazard: an
+ordinary push moves the head, so the cancelled suite's red stays attached to the
+*previous* sha and the queue — which evaluates the head — never sees it. What
+starts a second suite on the SAME sha is `ready_for_review`, a re-run, a
+`workflow_dispatch` on that ref, or a queue re-entry. Diagnosing this by
+looking at the newest commit's checks will therefore find nothing; read the
+check-runs of the sha Mergify names.
 
 `if: ${{ !cancelled() }}` fixes it. The aggregate is then cancelled together
 with its run rather than rendering a verdict on it, and it still runs for every
 real outcome — success, failure, skip — which is the case `always()` was there
-for. An upstream job cancelled on its own while its run continues still reports
-red, so nothing is loosened.
+for. `!cancelled()` is itself a status-check function, so it replaces the
+implicit `success()` exactly as `always()` does: the aggregate still runs when a
+needed job FAILED or was SKIPPED. `always() && !cancelled()` is the same
+condition written twice. An upstream job cancelled on its own while its run
+continues still reports red, so nothing is loosened.
 
 ---
 
