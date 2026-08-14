@@ -90,6 +90,62 @@ plan_verdict() {
   echo ok
 }
 
+# The plan reader is jq if present, python3 otherwise. Not a nicety: the Windows
+# administration host these roots are applied from has no jq, so a jq-only guard
+# refuses every apply — and a guard that blocks the normal path is a guard that
+# gets skipped, which returns us to bare `terraform apply -auto-approve`, the
+# exact command that destroyed Print-Server's identity. There is no third
+# fallback: parsing the plan with grep would be guessing, and this script's whole
+# value is that it does not guess about what is being destroyed.
+#
+# Both readers are exercised by the self-test against the same fixture, on
+# whichever of them the machine has: two implementations of "what does this plan
+# destroy" that disagree would be worse than one, since the digest an operator is
+# told to re-run with is computed from the answer.
+pick_plan_reader() {
+  if command -v jq >/dev/null 2>&1; then echo jq
+  elif command -v python3 >/dev/null 2>&1; then echo python3
+  else echo none
+  fi
+}
+PLAN_READER="${PLAN_READER:-$(pick_plan_reader)}"
+
+# read_plan <plan.json> <mode: all|protected> -> destroyed addresses, one per line
+read_plan() {
+  if [ "$PLAN_READER" = jq ]; then
+    if [ "$2" = protected ]; then
+      jq -r --arg t "$PROTECTED_TYPES" \
+        '.resource_changes[]? | select(.change.actions | index("delete")) | select(.type | test($t)) | .address' "$1"
+    else
+      jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address' "$1"
+    fi
+  else
+    # shellcheck disable=SC2016  # the python source must NOT be shell-expanded:
+    # the pattern reaches it through the environment precisely so that its
+    # backslashes and `$` anchor survive intact.
+    PROTECTED_TYPES="$PROTECTED_TYPES" python3 -c '
+import json, os, re, sys
+# On Windows, text-mode stdout translates \n to \r\n. The trailing CR then rides
+# into every address, so the digest computed from this list differs from the one
+# jq would produce for the same plan -- two readers disagreeing on the token the
+# operator is told to re-run with.
+sys.stdout.reconfigure(newline="\n")
+mode = sys.argv[2]
+pat = re.compile(os.environ["PROTECTED_TYPES"])
+with open(sys.argv[1], encoding="utf-8") as fh:
+    plan = json.load(fh)
+for rc in plan.get("resource_changes") or []:
+    if "delete" not in (rc.get("change") or {}).get("actions", []):
+        continue
+    # `search`, matching jq test(): the pattern carries its own ^...$ anchors so
+    # that neighbouring types like google_service_account_iam_member do not match.
+    if mode == "protected" and not pat.search(rc.get("type", "")):
+        continue
+    print(rc["address"])
+' "$1" "$2"
+  fi
+}
+
 # Sourced by the self-test; everything below is the live path only.
 [ "${TF_APPLY_GUARD_LIB:-0}" = "1" ] && return 0
 
@@ -98,8 +154,7 @@ die() { printf 'tf-apply-guard: REFUSED — %s\n' "$*" >&2; exit 2; }
 
 dir="${1:?usage: tf-apply-guard.sh <runner-root-dir> [terraform-args...]}"; shift || true
 [ -d "$dir" ] || die "no such directory: $dir"
-
-command -v jq >/dev/null 2>&1 || die "jq is required to read the plan; refusing to apply blind"
+[ "$PLAN_READER" = none ] && die "need jq or python3 to read the plan JSON; refusing to apply blind"
 
 # 1. checkout ------------------------------------------------------------------
 git -C "$dir" fetch --quiet origin
@@ -141,10 +196,8 @@ planfile="$workdir/tf.plan"
 terraform -chdir="$dir" plan -out="$planfile" "$@"
 terraform -chdir="$dir" show -json "$planfile" >"$workdir/plan.json"
 
-destroyed_addrs="$(jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address' "$workdir/plan.json")"
-protected_addrs="$(jq -r --arg t "$PROTECTED_TYPES" \
-  '.resource_changes[]? | select(.change.actions | index("delete")) | select(.type | test($t)) | .address' \
-  "$workdir/plan.json")"
+destroyed_addrs="$(read_plan "$workdir/plan.json" all)"
+protected_addrs="$(read_plan "$workdir/plan.json" protected)"
 destroys="$(printf '%s' "$destroyed_addrs" | grep -c . || true)"
 protected="$(printf '%s' "$protected_addrs" | grep -c . || true)"
 digest="$(plan_digest "$destroyed_addrs")"
