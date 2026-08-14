@@ -270,8 +270,16 @@ work *across PRs*, whereas a path filter only ever helps within one PR.
 35 `actions/checkout` invocations in Apigee-Portal, 18 of them with an explicit
 `fetch-depth` — most of those are `fetch-depth: 0` because diff-based guards
 need history. A full clone per job, times 13 jobs, on every PR. Fetching only
-the merge-base (`git fetch --depth=1 origin $BASE_SHA`) gives the same diff at a
-fraction of the transfer.
+two commits (`fetch-depth: 2`, then `git diff --name-only HEAD^1 HEAD`) gives
+the same diff at a fraction of the transfer, because on a `pull_request` event
+HEAD is the merge commit GitHub built and HEAD^1 is its base.
+
+Do **not** reach for `git fetch --depth=1 origin $BASE_SHA` plus a triple-dot
+`git diff "$BASE_SHA"...HEAD`. Triple-dot asks git to compute a merge base, and
+each shallow fetch lands as its own grafted root with no shared ancestry, so it
+fails with `fatal: ... no merge base` — under `set -euo pipefail`, on every
+pull request. `--depth` deepens an existing shallow history; it does not
+reconnect two roots.
 
 ---
 
