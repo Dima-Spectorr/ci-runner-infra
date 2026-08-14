@@ -102,13 +102,20 @@ err() { local id="$1"; shift; echo "::error::[$id] $*"; fail=1; }
 # Python to PATH, and that one does not carry the image's `python3-yaml` — so a
 # workflow that sets up Python for an unrelated step turns this gate into CHECK0
 # "no YAML parser available" on a runner that has one. Pick the first interpreter
-# that can actually `import yaml`, image path included.
+# that can actually run the reader, image path included. The probe asks for
+# everything the reader uses, not just PyYAML: a Python 2 on `python`, or a 3.x
+# too old for `sys.stdout.reconfigure`, would import yaml and then die inside the
+# reader — which reads as CHECK0 on a valid config, the exact failure this loop
+# exists to prevent.
 PY_BIN=""
 ensure_yaml() {
   local c
   for c in python3 /usr/bin/python3 /usr/bin/python /usr/local/bin/python3 python; do
     command -v "$c" >/dev/null 2>&1 || continue
-    if "$c" -c 'import yaml' >/dev/null 2>&1; then PY_BIN="$c"; return 0; fi
+    if "$c" -c 'import sys, yaml; sys.exit(0 if sys.version_info >= (3, 7) and hasattr(sys.stdout, "reconfigure") else 1)' >/dev/null 2>&1; then
+      PY_BIN="$c"
+      return 0
+    fi
   done
   return 1
 }
@@ -426,9 +433,10 @@ def branches(node):
 def requires(node, predicate, depth=0):
     """Does EVERY satisfiable path through this tree satisfy `predicate`?
 
-    An AND is satisfied when any child is; an OR only when all of its branches
-    are, since the pull request picks the branch. `not` is answered False rather
-    than inverted: a requirement this gate cannot prove is not one it asserts.
+    An AND requires it when ANY child requires it, since every child holds. An
+    OR requires it only when ALL branches do, since the pull request picks the
+    branch. `not` is answered False rather than inverted: a requirement this
+    gate cannot prove is not one it asserts.
     """
     if depth > MAX_DEPTH:
         return False
@@ -582,7 +590,7 @@ scan_file() {
   fi
   local badkeys; badkeys="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#BADKEY" { print $2 }' | sort -u | tr '\n' ' ')"
   if [ -n "${badkeys// /}" ]; then
-    err CHECK0 "\`$f\` contains a key this gate cannot address unambiguously: ${badkeys}. A key holding \`.\` or \`[\` collides with a genuinely nested path — a top-level \`\"merge_queue.max_parallel_checks\"\` would read here exactly like the nested mapping Mergify requires, while Mergify itself sees an unknown top-level key and refuses the file. A \`(cycle)\` entry means a recursive alias, which no valid Mergify configuration has. Remove it."
+    err CHECK0 "\`$f\` contains a key this gate cannot address unambiguously: ${badkeys}. A key holding \`.\`, \`[\` or \`]\` collides with a genuinely nested path — a top-level \`\"merge_queue.max_parallel_checks\"\` would read here exactly like the nested mapping Mergify requires, while Mergify itself sees an unknown top-level key and refuses the file. A \`(cycle)\` entry means a recursive alias, which no valid Mergify configuration has. Remove it."
     return
   fi
   local dups; dups="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DUP" { print $2 }' | sort -u | tr '\n' ' ')"
@@ -797,18 +805,38 @@ EOF
 $amc_base
 EOF
   fi
-  # Draft polarity, per rule and on both sides. `draft` in the admission list
-  # against a rule requiring `-draft` queues exactly the pull requests that rule
-  # refuses — and the association is per rule, so the polarity is read from the
-  # rule's own tree rather than from every condition in the file at once.
+  # Draft polarity, on both sides and against the APPLICABLE rules only. A
+  # repository may serve `main` with `-draft` and `release` with `draft`; an
+  # admission list of `base = release` plus `draft` is then correct, and reading
+  # the union of every rule's draft terms fails it on the `main` rule, which the
+  # admitted pull request never reaches. So: take the rules that can admit a
+  # base this list admits (a rule taking any base, or constraining it by regex,
+  # is always a candidate), and demand the polarity clash across ALL of them —
+  # one rule refusing what another accepts is a routing choice, not a deadlock.
+  local applicable app_draft app_nodraft
+  if [ -n "$amc_base" ] && [ "$amc_regex" -eq 0 ]; then
+    applicable="$( { printf '%s\n' "$doc" | awk -F'\t' '$1 == "#RULEBASEANY" || $1 == "#RULEBASEREGEX" { print $2 }'
+                     printf '%s\n' "$doc" | awk -F'\t' -v bases="$amc_base" '
+                       BEGIN { n = split(bases, a, "\n"); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+                       $1 == "#RULEBASE" && ($3 in want) { print $2 }'
+                   } | sort -u )"
+  else
+    # The list constrains no base it can enumerate, so every rule is reachable.
+    applicable="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#RULEDRAFT" { print $2 }' | sort -u)"
+  fi
+  app_draft="$(printf '%s\n' "$doc" | awk -F'\t' -v r="$applicable" '
+    BEGIN { n = split(r, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") ok[a[i]] = 1 }
+    $1 == "#RULEDRAFT" && ($2 in ok) && $3 == "draft"' | grep -c . || true)"
+  app_nodraft="$(printf '%s\n' "$doc" | awk -F'\t' -v r="$applicable" '
+    BEGIN { n = split(r, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") ok[a[i]] = 1 }
+    $1 == "#RULEDRAFT" && ($2 in ok) && $3 == "-draft"' | grep -c . || true)"
   if printf '%s\n' "$doc" | awk -F'\t' '$1 == "#AMCDRAFT" && $2 == "draft"' | grep -q . \
-     && printf '%s\n' "$doc" | awk -F'\t' '$1 == "#RULEDRAFT" && $3 == "-draft"' | grep -q .; then
-    err CHECK8 "\`auto_merge_conditions\` admits \`draft\` while a queue rule requires \`-draft\`. Only drafts are then auto-queued, and that rule refuses them: nothing merges, and nothing goes red."
+     && [ "$app_nodraft" -gt 0 ] && [ "$app_draft" -eq 0 ]; then
+    err CHECK8 "\`auto_merge_conditions\` admits \`draft\` while every queue rule that can take those pull requests requires \`-draft\`. Only drafts are then auto-queued, and no rule accepts them: nothing merges, and nothing goes red."
   fi
   if printf '%s\n' "$doc" | awk -F'\t' '$1 == "#AMCDRAFT" && $2 == "-draft"' | grep -q . \
-     && printf '%s\n' "$doc" | awk -F'\t' '$1 == "#RULEDRAFT" && $3 == "draft"' | grep -q . \
-     && ! printf '%s\n' "$doc" | awk -F'\t' '$1 == "#RULEDRAFT" && $3 == "-draft"' | grep -q .; then
-    err CHECK8 "\`auto_merge_conditions\` requires \`-draft\` while every queue rule that constrains draft state requires \`draft\`. The two admit disjoint sets of pull requests, so the queue takes nothing at all — the mirror image of the case above, and just as silent."
+     && [ "$app_draft" -gt 0 ] && [ "$app_nodraft" -eq 0 ]; then
+    err CHECK8 "\`auto_merge_conditions\` requires \`-draft\` while every queue rule that can take those pull requests requires \`draft\`. The two admit disjoint sets of pull requests, so the queue takes nothing at all — the mirror image of the case above, and just as silent."
   fi
 }
 
@@ -1007,6 +1035,13 @@ selftest() {
   # every rule that constrains draft state requires one.
   expect amc-draft-polarity-mirror CHECK8 \
     'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # Two rules with OPPOSITE draft polarity, which is routing rather than
+  # deadlock: `main` takes non-drafts, `release` takes drafts, and the admission
+  # list names `release`. Reading the union of every rule's draft terms finds
+  # `-draft` on the rule this pull request never reaches and fails a correct
+  # configuration — the false failure that teaches a reader to delete CHECK 8.
+  expect amc-draft-polarity-other-rule '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\n  - name: release\n    queue_conditions: &relgate\n      - base = release\n      - draft\n      - check-success = "Lint"\n    merge_conditions: *relgate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = release\n    - draft\n' || return 1
   # Aliases that reference each other ACYCLICALLY. The cycle guard does not fire
   # — there is no cycle — and each level doubles the traversal, so this
   # sub-kilobyte file expands past any timeout the job is given.
