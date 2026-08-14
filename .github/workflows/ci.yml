@@ -104,6 +104,15 @@ jobs:
       - name: merge-queue single-step gate self-test
         run: bash scripts/ci/check-merge-queue-single-step.sh --selftest
 
+      # A stale checkout applied 2026-08-14 reverted Print-Server's runner infra
+      # to the retired architecture and destroyed the App-key secret. The tree was
+      # CLEAN — a failed `git pull` inside a loop left an old commit checked out —
+      # and `prevent_destroy` did not fire, because a config that lacks the module
+      # block lacks its lifecycle guard too. This gate keeps the apply wrapper's
+      # two refusals honest: wrong commit, and identity-destroying plan.
+      - name: tf-apply-guard self-test
+        run: bash scripts/ci/tf-apply-guard.selftest.sh
+
       # The README quickstart pinned v3.0.0 while the fleet ran v4.1.0 — the one
       # copy-pasteable line in the repo, three minor versions stale, because
       # nothing connected Markdown to a git tag. VERSION is that connection.
