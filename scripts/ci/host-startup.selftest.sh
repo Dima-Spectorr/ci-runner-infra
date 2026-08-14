@@ -22,6 +22,12 @@
 # a later edit plausibly would and asserts this test notices; a gate that only
 # passes on correct input is not evidence.
 
+# Every predicate and mutation below matches the TEXT of host-startup.sh, in
+# which `$u`, `$idx` and `$(slot_user …)` are the literal characters that must be
+# there. Expanding them here would compare against this test's own environment
+# and pass on any script at all — so the single quotes are the point.
+# shellcheck disable=SC2016
+
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
