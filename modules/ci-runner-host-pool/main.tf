@@ -165,6 +165,21 @@ resource "google_compute_instance_template" "host" {
 
   lifecycle {
     create_before_destroy = true
+
+    # The three identities must be three DIFFERENT accounts. Each variable's own
+    # `validation` block can only see itself (cross-variable validation needs
+    # Terraform 1.9 and this module supports >= 1.5), so a consumer could pass
+    # controller == job and satisfy both checks: each only compares against the
+    # host account. That configuration hands workflow code the controller's
+    # roles/compute.instanceAdmin.v1 — the exact escalation the split exists to
+    # prevent — so the pairing is rejected here, at plan time.
+    precondition {
+      condition = (
+        var.job_service_account_email == "" ||
+        var.job_service_account_email != var.controller_service_account_email
+      )
+      error_message = "job_service_account_email must differ from controller_service_account_email — the controller holds roles/compute.instanceAdmin.v1, and job code receives the job identity through the loopback broker, so sharing them lets a pull request delete the fleet."
+    }
   }
 }
 
