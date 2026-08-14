@@ -115,17 +115,24 @@ still inside its warm window.
   `controller_service_account_email` and rejects a value equal to
   `service_account_email`. It used to default to "reuse the host account", and
   every consumer took that default, so it is no longer a default at all.
-* **Slots on one host share a Docker daemon — so `slots_per_host > 1` is only
-  for repositories that do not run outside contributors' code.** Every agent on
-  a host talks to the same daemon, which is how the agent creates service
-  containers at all. A job that can reach that socket can enumerate the sibling
+* **Each slot is its own Linux user with its own rootless Docker daemon.** Slots
+  used to share the `runner` account and the one system daemon, so a job that
+  reached `/var/run/docker.sock` — which every job could, because that socket is
+  how an agent creates service containers at all — could enumerate the sibling
   slots' containers, `exec` into them, and read their `GITHUB_TOKEN`, their
-  workspace and whatever the credential broker minted for them — and because the
-  host is warm, into later jobs too. The metadata fence does not contain this:
-  it blocks the metadata server, not the daemon. Until per-slot daemons land
-  (#10), this exposure is ACCEPTED, not absent, and it is accepted only where
-  every job is code a maintainer already trusts. A repository that takes pull
-  requests from outside runs `slots_per_host = 1`, or does not run them here.
+  workspace and whatever the credential broker minted for them; and because the
+  host is warm, later jobs' too. The metadata fence never contained this: it
+  blocks the metadata server, not the daemon. Now slot `i` runs as `ci-s<i>`,
+  its daemon runs as that user with its socket in a 0700 `/run/ci-s<i>`, and the
+  rootful daemon is masked on the host, so there is no shared socket left to
+  reach (#10). The same split ends the shared `$HOME` that raced pnpm's store
+  install between concurrent slots. **This requires image `v3-11-0` or later** —
+  an older image has no `dockerd-rootless.sh`, and a host that boots one refuses
+  to register rather than quietly putting every slot back on one daemon.
+* **The shared warm cache is still shared, on purpose.** `/opt/ci-cache` is
+  group-writable to `ci`, which every slot user joins. That is the speed-up, and
+  it is why a pool serves one repository (see the first rule) — a poisoned cache
+  entry reaches the next job either way.
 * **A warm cache is untrusted build input.** A poisoned cache entry survives to
   the next job, which the old destroy-per-job model made impossible. Caches are
   scoped per repository and rebuilt with the image.
