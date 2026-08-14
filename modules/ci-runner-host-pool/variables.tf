@@ -60,6 +60,12 @@ variable "image" {
     daemon (README.md, isolation rules). An older image has no
     dockerd-rootless.sh, and a host booting one now fails closed — it refuses to
     register instead of silently returning every slot to a shared daemon.
+
+    Prefer v3-12-0 or later. v3-11-0 warms /opt/ci-cache as root under umask
+    022, so the slots can read the warmed tree and none of them can update it —
+    a package manager refreshing a partially warmed cache fails, and it fails
+    looking like a flaky upstream repository rather than like a bad image. This
+    is not fail-closed: v3-11-0 boots, registers and serves jobs.
   EOT
   type        = string
 }
@@ -80,7 +86,8 @@ variable "slots_per_host" {
     concurrent slots share no socket, no $HOME and no workspace — only the
     read-mostly cache at /opt/ci-cache. This needs image v3-11-0 or later; on an
     older image the host refuses to register rather than putting every slot back
-    on one daemon. See the isolation rules in README.md.
+    on one daemon. The cache is only WRITABLE by the slots from v3-12-0 on —
+    see `image`. See the isolation rules in README.md.
   EOT
   type        = number
   default     = 4

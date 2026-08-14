@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v4.2.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v4.2.1"
   # ...
 }
 ```
@@ -135,7 +135,11 @@ still inside its warm window.
   an older image has no `dockerd-rootless.sh`, and a host that boots one refuses
   to register rather than quietly putting every slot back on one daemon.
 * **The shared warm cache is still shared, on purpose.** `/opt/ci-cache` is
-  group-writable to `ci`, which every slot user joins. That is the speed-up, and
+  group-writable to `ci`, which every slot user joins — **from image `v3-12-0`
+  on**. `v3-11-0` warms the tree as root under umask 022, so the slots can read
+  it and none can update it; a package manager refreshing a partially warmed
+  cache fails there, looking like a flaky upstream repository. That is the
+  speed-up, and
   it is why a pool serves one repository (see the first rule) — a poisoned cache
   entry reaches the next job either way.
 * **A warm cache is untrusted build input.** A poisoned cache entry survives to

@@ -44,7 +44,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v4.2.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v4.2.1"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -53,7 +53,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v4.2.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v4.2.1"
 
   project_id = var.project_id
   region     = var.region
@@ -79,7 +79,7 @@ module "ci_runner_pool" {
   subnetwork   = var.subnet_self_link
   network_tags = [module.ci_runner_network.runner_network_tag]
 
-  image          = var.host_image        # e.g. ci-runner-host-v3-11-0
+  image          = var.host_image        # e.g. ci-runner-host-v3-12-0
   machine_type   = var.host_machine_type
   slots_per_host = var.slots_per_host
 
