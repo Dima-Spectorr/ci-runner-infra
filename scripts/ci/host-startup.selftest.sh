@@ -95,6 +95,16 @@ if has_disableupdate "$SCRIPT"; then
   ok
 else
   bad "config.sh is not passed --disableupdate — a forced self-update will take every slot on the host OFFLINE (#2281)"
+  # Show the joined invocation the predicate actually saw. This failure was
+  # reproduced in CI while the same commit passed locally, and with only the
+  # verdict printed there was nothing to tell a genuine regression apart from a
+  # line-ending or joining artefact. Print the evidence, so the next occurrence
+  # is read rather than guessed at.
+  printf '  saw: %s\n' "$(code_of "$SCRIPT" \
+    | sed ':a;/\\$/{N;s/\\\n//;ba}' \
+    | grep -n 'config\.sh' \
+    | sed 's/\r/<CR>/g' \
+    | head -5)"
 fi
 
 if has_metadata_fence "$SCRIPT"; then
