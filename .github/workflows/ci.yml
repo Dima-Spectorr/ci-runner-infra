@@ -79,6 +79,15 @@ jobs:
       - name: identity split self-test
         run: bash scripts/ci/identity-split.selftest.sh
 
+      # One unbounded socket stalls the controller's tick loop or a consumer's
+      # oneshot poller permanently, and the demand metric keeps its LAST value
+      # rather than going absent — so the pool stops scaling while every
+      # dashboard still shows a number. Cost a windows pool 2h55m at targetSize
+      # 0 on 2026-08-14. The reaper survived only because its author happened to
+      # pass --max-time; this removes the dependence on habit.
+      - name: bounded-calls self-test
+        run: bash scripts/ci/bounded-calls.selftest.sh
+
       # The README quickstart pinned v3.0.0 while the fleet ran v4.1.0 — the one
       # copy-pasteable line in the repo, three minor versions stale, because
       # nothing connected Markdown to a git tag. VERSION is that connection.

@@ -36,8 +36,15 @@ slot_user() { printf '%s%s' "$SLOT_USER_PREFIX" "$1"; }
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a /var/log/ci-host.log; logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true; }
 die() { log "FATAL: $*"; exit 1; }
 
+# Bounded, like every call this host makes. A host boot that HANGS is worse than
+# one that fails: it never registers an agent, never powers off, and bills at
+# warm-host size until the controller's register-grace expires — and while it
+# waits it counts as a host the pool already has, so the pool does not add the
+# one that would have taken the queued job.
+CURL_TIMEOUTS=(--connect-timeout 10 --max-time 30)
+
 md() {
-  curl -fsS -H "Metadata-Flavor: Google" \
+  curl "${CURL_TIMEOUTS[@]}" -fsS -H "Metadata-Flavor: Google" \
     "http://metadata.google.internal/computeMetadata/v1/$1" 2>/dev/null
 }
 
@@ -87,7 +94,7 @@ gh_token() {
     | openssl dgst -sha256 -sign <(printf '%s' "$key") | b64)
   jwt="$header.$payload.$sig"
 
-  curl -fsS -X POST \
+  curl "${CURL_TIMEOUTS[@]}" -fsS -X POST \
     -H "Authorization: Bearer $jwt" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" \
@@ -98,7 +105,7 @@ registration_token() {
   local tok
   tok=$(gh_token) || return 1
   [ -n "$tok" ] || return 1
-  curl -fsS -X POST \
+  curl "${CURL_TIMEOUTS[@]}" -fsS -X POST \
     -H "Authorization: Bearer $tok" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/$OWNER/$REPO/actions/runners/registration-token" \
@@ -223,7 +230,9 @@ EOF
   # nothing turns every deploy job into a confusing auth failure at step time.
   local i
   for i in $(seq 1 30); do
-    if curl -fsS -H "Metadata-Flavor: Google" \
+    # Bounded so a broker that ACCEPTS but never answers cannot turn a 30x2s
+    # readiness probe into an unbounded wait.
+    if curl "${CURL_TIMEOUTS[@]}" -fsS -H "Metadata-Flavor: Google" \
       "http://127.0.0.1:$BROKER_PORT/computeMetadata/v1/instance/service-accounts/default/token" \
       >/dev/null 2>&1; then
       log "job credential broker serving $JOB_SA on 127.0.0.1:$BROKER_PORT"
@@ -500,7 +509,7 @@ slot_runtime_usable() { # <idx> <user>
   # The fence itself, proved from where job code runs rather than asserted: the
   # token endpoint must NOT answer in the slot's namespace. A slot that can read
   # it owns the fleet (#1958), so this is fatal, not a warning.
-  if ip netns exec "$ns" curl -fsS -m 5 -H "Metadata-Flavor: Google" \
+  if ip netns exec "$ns" curl -fsS --connect-timeout 5 -m 5 -H "Metadata-Flavor: Google" \
     "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token" >/dev/null 2>&1; then
     log "slot $idx: the REAL metadata server answers inside $ns — refusing to serve jobs"
     return 1
@@ -509,7 +518,7 @@ slot_runtime_usable() { # <idx> <user>
   # …and the broker, which is the credential job code is supposed to get, must
   # answer on this slot's gateway address. Loopback is the namespace's OWN
   # loopback now, so 127.0.0.1 would reach nothing.
-  if [ -n "$JOB_SA" ] && ! ip netns exec "$ns" curl -fsS -m 5 -H "Metadata-Flavor: Google" \
+  if [ -n "$JOB_SA" ] && ! ip netns exec "$ns" curl -fsS --connect-timeout 5 -m 5 -H "Metadata-Flavor: Google" \
     "http://$(slot_gw_ip "$idx"):$BROKER_PORT/computeMetadata/v1/instance/service-accounts/default/token" >/dev/null 2>&1; then
     log "slot $idx: the job credential broker is unreachable from $ns at $(slot_gw_ip "$idx"):$BROKER_PORT"
     return 1
