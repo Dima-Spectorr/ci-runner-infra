@@ -281,9 +281,18 @@ nothing are one question rather than several spellings: an **empty** admissible
 set, an admission base **no rule admits**, or an admission list and a rule set
 that are simply **disjoint** — which is where `base != main` against a rule
 serving only `main`, and a rule whose own bases are ANDed together, both land.
-`base ~=` constrains the base to a set that cannot be enumerated here, so it
-turns the comparison off rather than guessing, and that uncertainty propagates
-through the conjunction instead of being dropped by the exact base beside it.
+`base ~=` names a set that cannot be enumerated, but it is still a **predicate**,
+and it is kept as one: applied to the branches the other side does enumerate it
+decides the question — `base = develop` ANDed with `base ~= ^release/` admits
+nothing, and a rule serving `^release/` does not stand in for the missing `main`
+rule. Only where there is nothing to apply it to, a regex against a complement
+(`base != main`), does the comparison decline rather than guess.
+
+An admission list can also queue nothing while every base it names is served, by
+contradicting **itself** on every path: `base = main` beside both `draft` and
+`-draft` leaves a non-empty base set and no satisfiable term, and each condition
+read alone looks fine. That is the same finding as an empty set, and reported as
+one.
 
 Draft polarity is read the same way — **per satisfiable term**, not once for the
 whole tree. An admission list spelled `(base = main and draft) or (base = main
@@ -316,7 +325,25 @@ Three failures around the parse rather than in it, each with a fixture:
   the identity check accepts — while Mergify refuses the file on the unknown key
   and nothing queues at all. The test is a near miss, not a schema: rejecting
   every unlisted key would fail configurations that use Mergify keys this gate
-  has never heard of.
+  has never heard of. Both this test and its mirror image below are asked **only
+  at the schema positions Mergify defines** — the top level, `merge_queue`, a
+  `queue_rules` entry, `merge_protections_settings`. A key two edits from
+  `merge_queue` inside some unrelated mapping is a misspelling of nothing,
+  because the correctly spelled key would mean nothing there either.
+- **A guarded key spelled correctly, in a position Mergify refuses, is the same
+  finding.** A top-level `merge_conditions: []` or `batch_size: 1` is not the
+  queue rule's setting "declared globally": the file is rejected on the unknown
+  top-level key, and every reader here — each of which asserts on an exact path —
+  sees the key as merely absent.
+- **A condition list must be a sequence.** An alias pointing at a scalar anchor
+  loads as a one-condition tree that reads like an ordinary, well-gated rule,
+  while Mergify refuses the file on the type and nothing queues.
+- **`check-skipped` alone is not a gate.** It says the check did not run, so
+  every path through such a rule is satisfied by a workflow that never reported.
+  It is safe only beside the success form (`or: [check-success = X,
+  check-skipped = X]`), which is how a path-filtered workflow is admitted — so
+  the question asked is whether the rule names a success *anywhere*, not what any
+  single branch holds.
 - **Traversal is budgeted.** The cycle guard stops a recursive alias, not an
   acyclic one: aliases that reference each other double the traversal per level,
   so a sub-kilobyte file expands past any timeout the job is given — and a gate

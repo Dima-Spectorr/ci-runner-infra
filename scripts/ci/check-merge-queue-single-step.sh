@@ -162,7 +162,7 @@ ensure_yaml() {
 # ANOTHER rule's anchor yields a list that is not this rule's.
 read_yaml() {
   "${PY_BIN:-python3}" - "$1" <<'PY'
-import sys, yaml
+import re, sys, yaml
 
 # LF only. On Windows `print` emits CRLF, and the trailing CR lands inside the
 # last field — so a type reads as `seq\r`, never equals `seq`, and the check
@@ -258,6 +258,7 @@ def safe_key(text):
     return text
 bad_keys = []
 typo_keys = []
+misplaced_keys = []
 
 # Keys this gate asserts on. A key MISSPELLED into one of these is the worst
 # shape a Mergify config takes here: `merge_conditons: *gate` is not a value in
@@ -297,14 +298,63 @@ def edit_distance(a, b, limit=2):
     return prev[-1]
 
 
-def near_miss(text):
+# WHERE a guarded key is a guarded key. Mergify accepts each of these in
+# exactly one position, and both questions below are meaningless outside it:
+# `scopes.source.files.merge-queue` in some other tool's config is two edits
+# from `merge_queue` and is not a misspelling of anything, while a top-level
+# `merge_conditions: []` is not the queue rule's key "spelled right" — Mergify
+# sees an unknown top-level key and refuses the file.
+LEGAL_KEYS = {
+    "root": {"merge_queue", "queue_rules", "merge_protections_settings",
+             "pull_request_rules", "defaults", "extends", "priority_rules",
+             "partition_rules", "commands_restrictions"},
+    "merge_queue": {"max_parallel_checks", "max_checks_retries"},
+    "queue_rule": {
+        "name", "queue_conditions", "merge_conditions", "batch_size",
+        "autoqueue", "priority", "conditions", "checks_timeout",
+        "max_checks_retries", "batch_max_wait_time", "speculative_checks",
+        "merge_method", "update_method", "queue_branch_merge_method",
+        "branch_protection_injection_mode", "allow_inplace_checks",
+        "disallow_checks_interruption_from_queues", "commit_message_template",
+    },
+    "merge_protections_settings": {"auto_merge_conditions", "autoqueue"},
+}
+# Reported by CHECK 1 / CHECK 3 / CHECK 6 with the reason each of them owns, so
+# the position check stays quiet on them rather than raising a second finding
+# on the same key.
+MISPLACED_ELSEWHERE = ("max_parallel_checks", "max_checks_retries",
+                       "auto_merge_conditions")
+
+
+def context_of(path):
+    """The schema position a mapping sits at, or None when unrecognised.
+
+    None is the answer for every key under `pull_request_rules`, under a
+    condition list, and under anything this gate has never heard of. Both
+    callers stay silent there: a position check that guesses at an unknown
+    context reports on other tools' files.
+    """
+    if path == "":
+        return "root"
+    if path in ("merge_queue", "merge_protections_settings"):
+        return path
+    if re.match(r"^queue_rules\[[0-9]+\]$", path):
+        return "queue_rule"
+    return None
+
+
+def near_miss(text, context):
     # Short keys are excluded: at four characters two edits reaches an unrelated
     # word, and a gate that renames a reader's correct key teaches them to
     # delete it.
-    if text in KNOWN_KEYS or len(text) < 6:
+    if context is None or text in KNOWN_KEYS or len(text) < 6:
         return None
+    legal = LEGAL_KEYS.get(context, set())
     for guarded in GUARDED_KEYS:
-        if edit_distance(text, guarded) <= 2:
+        # Only against keys that would MEAN something here. `merge_conditions`
+        # is not a candidate misspelling at the top level, because the correctly
+        # spelled key would be refused there too.
+        if guarded in legal and edit_distance(text, guarded) <= 2:
             return guarded
     return None
 
@@ -337,9 +387,14 @@ def walk(node, path, seen):
                 bad_keys.append(text)
                 continue
             child = "%s.%s" % (path, text) if path else text
-            guarded = near_miss(text)
+            context = context_of(path)
+            guarded = near_miss(text, context)
             if guarded:
                 typo_keys.append((child, guarded))
+            elif (context is not None and text in GUARDED_KEYS
+                    and text not in LEGAL_KEYS.get(context, set())
+                    and text not in MISPLACED_ELSEWHERE):
+                misplaced_keys.append((child, context))
         else:
             child = "%s[%d]" % (path, key)
         emitted[0] += 1
@@ -372,6 +427,9 @@ for key in bad_keys:
 
 for path, guarded in typo_keys:
     print("#TYPOKEY\t%s\t%s" % (path, guarded))
+
+for path, context in misplaced_keys:
+    print("#MISPLACED\t%s\t%s" % (path, context))
 
 rules = doc.get("queue_rules") if isinstance(doc, dict) else None
 # Which rule each condition list belongs to. Identity between a rule's OWN two
@@ -597,13 +655,51 @@ def is_exactly(token):
 # reading it as "unenumerable" disabled the comparison, and a rule serving
 # everything-but-main against an admission list of exactly `main` then passed
 # while nothing could ever queue.
+#   ("re", {(pattern, negated), …})  every branch matching all of these
+# A regex names no set this gate can enumerate, but it is still a PREDICATE, and
+# a predicate answers the only question asked of the rule side: does this rule
+# serve `main`? Collapsing it to "unknown" declined that question and let a rule
+# spelled `base ~= ^release/` stand in for the `main` rule that is missing.
 UNIVERSE = ("out", frozenset())
+EMPTY = ("in", frozenset())
+
+
+def re_admits(patterns, name):
+    for pattern, negated in patterns:
+        try:
+            hit = re.search(pattern, name) is not None
+        except re.error:
+            return None  # a pattern Mergify may accept and this gate cannot read
+        if hit == negated:
+            return False
+    return True
 
 
 def base_and(a, b):
     if a is None or b is None:
         return None
+    if a == UNIVERSE:
+        return b
+    if b == UNIVERSE:
+        return a
     (ka, sa), (kb, sb) = a, b
+    if ka == "re" and kb == "re":
+        return ("re", sa | sb)
+    if ka == "re" or kb == "re":
+        # A regex narrows an enumerated set by FILTERING it, which keeps the
+        # comparison enumerable. Against a complement there is nothing to
+        # filter, so the pair stays unknown.
+        patterns, other = (sa, b) if ka == "re" else (sb, a)
+        if other[0] != "in":
+            return None
+        kept = set()
+        for name in other[1]:
+            verdict = re_admits(patterns, name)
+            if verdict is None:
+                return None
+            if verdict:
+                kept.add(name)
+        return ("in", frozenset(kept))
     if ka == "in" and kb == "in":
         return ("in", sa & sb)
     if ka == "in":
@@ -616,7 +712,13 @@ def base_and(a, b):
 def base_or(a, b):
     if a is None or b is None:
         return None
+    if a == EMPTY:
+        return b
+    if b == EMPTY:
+        return a
     (ka, sa), (kb, sb) = a, b
+    if ka == "re" or kb == "re":
+        return None  # a union with a regex is not enumerable in either direction
     if ka == "in" and kb == "in":
         return ("in", sa | sb)
     if ka == "in":
@@ -630,6 +732,9 @@ def base_admits(bases, name):
     if bases is None:
         return True
     kind, members = bases
+    if kind == "re":
+        verdict = re_admits(members, name)
+        return True if verdict is None else verdict
     return (name in members) if kind == "in" else (name not in members)
 
 
@@ -657,12 +762,15 @@ def base_set(node, flags, depth=0):
             return ("out", frozenset([value])) if negated else ("in", frozenset([value]))
         if op == "!=":
             return ("in", frozenset([value])) if negated else ("out", frozenset([value]))
-        # `base ~= ^release/` is a set this gate cannot enumerate. Saying
-        # "unconstrained" would be a lie in the safe direction; the flag turns
-        # the comparisons off instead of guessing — and it propagates through
-        # the conjunction, so `base = main` ANDed with a regex is not reported
-        # as plainly admitting `main`.
-        flags.add("regex")
+        # `base ~= ^release/` is a set this gate cannot enumerate, but it is a
+        # predicate it CAN apply. Kept as one, it still narrows an enumerated
+        # set beside it — `base = main` ANDed with `base ~= ^release/` admits
+        # nothing — and it still answers whether a rule serves a named branch.
+        # Saying "unconstrained" would be a lie in the safe direction; saying
+        # "unknown" declines a question that has an answer.
+        if op == "~=":
+            flags.add("regex")
+            return ("re", frozenset([(value, negated)]))
         return None
     connective, children = kids
     if connective == "and":
@@ -688,6 +796,11 @@ def emit_bases(prefix, bases, flags, path):
             print("#%sBASEREGEX%s" % (prefix, suffix))
     elif base_empty(bases):
         print("#%sBASEEMPTY%s" % (prefix, suffix))
+    elif bases[0] == "re":
+        # Not enumerable, so nothing to NAME here; the comparisons still apply
+        # it as a predicate.
+        print("#%sBASEANY%s" % (prefix, suffix))
+        print("#%sBASEREGEX%s" % (prefix, suffix))
     elif bases == UNIVERSE:
         print("#%sBASEANY%s" % (prefix, suffix))
     elif bases[0] == "in":
@@ -712,7 +825,38 @@ if isinstance(rules, list):
             continue
         path = "queue_rules[%d]" % i
         qc = rule.get("queue_conditions")
+        # A condition list Mergify accepts is a SEQUENCE. A scalar there — most
+        # often an alias pointing at a string anchor — loads as a one-condition
+        # tree here and reads as a perfectly gated rule, while Mergify refuses
+        # the file on the type and nothing queues at all.
+        if not isinstance(qc, list):
+            print("#QCTYPE\t%s\t%s" % (path, kind(qc)))
+            continue
+        mc = rule.get("merge_conditions")
+        if "merge_conditions" in rule and mc is not None and not isinstance(mc, list):
+            print("#QCTYPE\t%s.merge_conditions\t%s" % (path, kind(mc)))
+            continue
         print("#QCCHECK\t%s\t%s" % (path, "yes" if requires(qc, is_required_check) else "no"))
+        # `check-skipped = X` says the check did not run. Alone it is not a
+        # gate: every path through the rule is satisfied by a check that never
+        # reported. It is legitimate only BESIDE the success form
+        # (`or: [check-success = X, check-skipped = X]`), which is how a
+        # path-filtered workflow is admitted — so the question is whether the
+        # rule names a success anywhere, not what any single branch holds.
+        rule_leaves = []
+        leaves(qc, rule_leaves)
+        success_named = False
+        skip_named = False
+        for text in rule_leaves:
+            negated, attr, op, _ = parse_cond(text)
+            if negated or op not in ("=", ":", "~="):
+                continue
+            if attr in ("check-success", "check-neutral"):
+                success_named = True
+            elif attr == "check-skipped":
+                skip_named = True
+        if skip_named and not success_named:
+            print("#QCSKIPONLY\t%s" % path)
         flags = set()
         bases = base_set(qc, flags)
         emit_bases("RULE", bases, flags, path)
@@ -723,7 +867,12 @@ if isinstance(rules, list):
 
 settings = doc.get("merge_protections_settings") if isinstance(doc, dict) else None
 amc = settings.get("auto_merge_conditions") if isinstance(settings, dict) else None
-if amc is not None:
+if amc is not None and not isinstance(amc, list):
+    # Same type rule as a queue rule's lists, and the same failure: Mergify
+    # refuses the file, while a scalar here loads as a one-condition tree that
+    # every check below reads as a working admission list.
+    print("#AMCTYPE\t%s" % kind(amc))
+elif amc is not None:
     texts = []
     leaves(amc, texts)
     for text in texts:
@@ -769,6 +918,12 @@ if amc is not None:
     # polarity, which is the pair the comparison needs.
     amc_terms = dnf(amc)
     live_terms = [t for t in (amc_terms or []) if satisfiable(t)]
+    # Every path through the list contradicts ITSELF — `base = main` beside both
+    # `draft` and `-draft`, or two bases in one term. The admissible base set is
+    # not empty (each condition is satisfiable on its own), so the base checks
+    # say nothing, and the list queues exactly as much as no list at all.
+    if amc_terms is not None and not live_terms and not base_empty(amc_bases):
+        print("#AMCDEAD")
     seen_clash = set()
     for term in live_terms:
         term_draft = draft_state(term)
@@ -839,6 +994,24 @@ scan_file() {
     [ -n "$p" ] || continue
     err CHECK11 "\`$f\` declares \`$p\`, which is within two characters of \`$guarded\` — the key this gate asserts on. If it is a misspelling, Mergify rejects the whole file on the unknown key and NOTHING queues, while every check here reads \`$guarded\` as merely absent, which several of them accept as a valid spelling. Fix the spelling, or rename the key so it is not a near miss."
   done < <(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#TYPOKEY"')
+
+  # --- CHECK 12: a guarded key spelled right, in a position Mergify refuses ---
+  # CHECK 11 catches the key one edit away; this is its mirror image, and every
+  # exact-path reader below is blind to it in the same way. A top-level
+  # `merge_conditions: []` or `batch_size: 1` is not the queue rule's setting
+  # "declared globally" — Mergify rejects the file on an unknown top-level key,
+  # nothing queues, and the per-rule checks here read the key as merely absent,
+  # which several of them accept.
+  local where
+  while IFS=$'\t' read -r _ p context; do
+    [ -n "$p" ] || continue
+    case "$context" in
+      root) where="at the top level" ;;
+      queue_rule) where="inside a \`queue_rules\` entry" ;;
+      *) where="inside \`$context\`" ;;
+    esac
+    err CHECK12 "\`$f\` declares \`$p\` $where, which is not a position Mergify accepts that key in. It is not a setting in an unusual place: the file is refused on the unknown key and NOTHING queues, while every check in this gate reads the key as absent at the path it does assert on. Move it to the position Mergify defines for it."
+  done < <(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#MISPLACED"')
 
   # Exact-path readers. `$1 == p` and nothing looser: a check that matches a
   # SUFFIX is a check that accepts the key one level too deep, which is the
@@ -916,6 +1089,23 @@ EOF
   # `merge_conditions` being absent or empty is a valid single-step spelling,
   # which makes `queue_conditions` the ONLY thing standing between a pull
   # request and a merge. A rule that names no check merges on base/draft state.
+  # A condition list that is not a SEQUENCE. Mergify's schema takes a list here
+  # and refuses the file otherwise; loaded, a scalar becomes a one-condition
+  # tree that reads as an ordinary — often perfectly gated — rule.
+  while IFS=$'\t' read -r _ p ktype; do
+    [ -n "$p" ] || continue
+    err CHECK9 "\`$p\` is a \`$ktype\`, not a list of conditions. Mergify requires a sequence there and refuses the whole file otherwise, so nothing queues — while loaded here the scalar reads as a single condition, which is how a rule with no gate at all can look gated. This is usually an alias (\`*name\`) pointing at a scalar anchor instead of at a condition list."
+  done < <(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#QCTYPE"')
+
+  # `check-skipped` says the check DID NOT RUN. A rule whose only check
+  # condition is the skipped form is satisfied by a workflow that never
+  # reported — the ungated merge CHECK 9 exists to prevent, spelled in the
+  # vocabulary CHECK 9 accepts.
+  while IFS=$'\t' read -r _ p; do
+    [ -n "$p" ] || continue
+    err CHECK9 "queue rule \`$p\` gates only on \`check-skipped\`, which is satisfied when the check never ran. Nothing has to SUCCEED for a pull request this rule admits to embark and merge. The skip-aware form is \`or: [check-success = X, check-skipped = X]\` — the success branch is what makes the skipped branch safe; alone it is not a gate."
+  done < <(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#QCSKIPONLY"')
+
   if [ -n "$rules" ]; then
     while read -r r; do
       [ -n "$r" ] || continue
@@ -989,7 +1179,7 @@ EOF
   # plain form, and the old `[=:~]` character class matched neither.
   local amc_checks; amc_checks="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#AMCCHECK" { print $2 }' | sort -u | tr '\n' ' ')"
   if [ -n "${amc_checks// /}" ]; then
-    err CHECK7 "\`auto_merge_conditions\` restates required checks (${amc_checks}). They belong once, in the anchored condition list, which is what decides when a queued pull request embarks; a second copy is one more list to keep in sync and it will drift. Keep this list to the \`base\`/\`-draft\`/label facts."
+    err CHECK7 "\`auto_merge_conditions\` carries check conditions (${amc_checks}) — any \`check-*\` attribute, whether it restates a required check or names a failure/pending state. They belong once, in the anchored condition list, which is what decides when a queued pull request embarks; a second copy is one more list to keep in sync and it will drift. Keep this list to the \`base\`/\`-draft\`/label facts."
   fi
 
   # --- CHECK 8: auto_merge_conditions must aim at a branch a rule serves -----
@@ -1036,6 +1226,15 @@ EOF
   done <<EOF
 $unserved
 EOF
+  # Every PATH through the list contradicts itself — `base = main` beside both
+  # `draft` and `-draft`. The base set stays non-empty, so the checks above see
+  # a list naming a served branch, and it still queues nothing.
+  if has '#AMCDEAD'; then
+    err CHECK8 "every path through \`auto_merge_conditions\` contradicts itself, so no pull request satisfies the list and nothing is ever queued. Each condition is satisfiable alone — which is why the base it names still looks served — but they cannot hold together (\`draft\` beside \`-draft\`, or two bases in one path). Split the mutually exclusive facts into an explicit \`or:\`."
+  fi
+  if has '#AMCTYPE'; then
+    err CHECK8 "\`merge_protections_settings.auto_merge_conditions\` is a \`$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#AMCTYPE" { print $2; exit }')\`, not a list of conditions. Mergify requires a sequence and refuses the whole file otherwise — nothing queues — while loaded here the scalar reads as a single working condition. Usually an alias pointing at a scalar anchor."
+  fi
   if has '#AMCBASEDISJOINT'; then
     err CHECK8 "\`auto_merge_conditions\` and the queue rules admit DISJOINT sets of branches: no pull request can satisfy both, so nothing is ever queued. Same failure as an unserved base, in a spelling that names no base to point at — an admission list written as an exclusion (\`base != x\`), or a queue rule whose own \`base\` conditions are ANDed together and therefore admit nothing at all."
   fi
@@ -1303,18 +1502,60 @@ selftest() {
   # Mergify refuses, certified here as the setting it is impersonating.
   expect key-holding-tab CHECK0 \
     'merge_queue:\n  max_parallel_checks: 1\n  "max_parallel_checks\\tx": 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
-  # A regex ANDed with an exact base. The regex is not "unconstrained": keeping
-  # the exact set and dropping the regex would read this list as plainly
-  # admitting `develop`, and raise an unserved-base finding on a configuration
-  # whose real admissible set this gate cannot enumerate. Uncertainty propagates
-  # through the conjunction, so the comparison is declined instead.
-  expect amc-regex-and-exact '' \
+  # A regex ANDed with an exact base. The regex is not "unconstrained", and it
+  # is not opaque either: applied to the one branch the list names, it decides
+  # the question — `develop` does not match `^release/`, so this list admits
+  # nothing at all and queues nothing. Dropping the regex would read it as
+  # plainly admitting `develop`; declining the comparison would report clean.
+  expect amc-regex-and-exact CHECK8 \
     'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base ~= ^release/\n    - base = develop\n    - -draft\n' || return 1
+  # ... and where the regex meets a COMPLEMENT there is nothing to apply it to:
+  # `base != main` enumerates no candidate to test the pattern against, so the
+  # pair stays unknown and the comparison is declined rather than guessed.
+  expect regex-against-exclusion '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base ~= ^release/\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base != main\n    - -draft\n' || return 1
   # The rule's OWN bases are ANDed, so it admits nothing and contributes no base
   # to compare against. An empty `rule_bases` used to skip the comparison
   # entirely and report PASS on a queue that cannot take a single pull request.
   expect rule-base-contradiction CHECK8 \
     'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - base = develop\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # A guarded key spelled CORRECTLY, at a position Mergify refuses. Every
+  # exact-path reader here treats it as absent, and absent is a spelling several
+  # of them accept.
+  expect misplaced-guarded-key 'CHECK12 CHECK12' \
+    "${CLEAN}merge_conditions: []\nbatch_size: 2\n" || return 1
+  # ... and the near-miss test asks the same question the other way round. A key
+  # two edits from `merge_queue` in a mapping that is not a Mergify object is
+  # not a misspelling of anything — the correctly spelled key would mean nothing
+  # there either.
+  expect near-miss-outside-schema '' \
+    "${CLEAN}scopes:\n  source:\n    files:\n      merge-queue: true\n" || return 1
+  # A condition list that is not a sequence. Mergify refuses the file on the
+  # type; loaded, the scalar is a one-condition tree that reads as a gated rule.
+  expect queue-conditions-scalar CHECK9 \
+    'merge_queue:\n  max_parallel_checks: 1\nanchors:\n  gate: &gate "check-success = Lint"\nqueue_rules:\n  - name: default\n    queue_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # `check-skipped` says the check did not run. Alone it gates nothing, and it
+  # is spelled in the exact vocabulary CHECK 9 accepts.
+  expect skipped-only-gate CHECK9 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-skipped = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # The skip-aware form the fleet actually uses. The success branch is what
+  # makes the skipped branch safe, so this must stay clean.
+  expect skip-aware-or '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - or:\n          - check-success = "Lint"\n          - check-skipped = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # An admission list every path of which contradicts ITSELF. The base set stays
+  # non-empty — `main` is named and served — so every base check reads correct,
+  # and the list queues nothing.
+  expect amc-self-contradictory CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - draft\n    - -draft\n' || return 1
+  # A regex is not "unknown": it is a PREDICATE, and applied to the branch the
+  # admission list names it decides the question. Declining the comparison let a
+  # rule serving `^release/` stand in for the missing `main` rule.
+  expect rule-regex-unserved-base CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base ~= ^release/\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - -draft\n' || return 1
+  # ... and the same predicate says this pair is FINE, which is what stops the
+  # check above from being a blanket rejection of regex rules.
+  expect rule-regex-served-base '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base ~= ^release/\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = release/2026\n    - -draft\n' || return 1
   # Nesting past the read depth. The restated check is really in the file; a
   # reader that stops before reaching it must say so rather than report clean.
   expect deep-nesting CHECK0 \
