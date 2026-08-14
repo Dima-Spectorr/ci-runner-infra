@@ -161,6 +161,15 @@ Labels are per repo, so a saturated `DataRetrival` pool cannot borrow an idle
 overflow label that any repo may target as a fallback would absorb bursts
 without raising steady-state host count.
 
+**Not adoptable as written.** One repository per pool is a SECURITY boundary
+here, not a capacity choice: hosts are warm and reused, so caches, checked-out
+trees and any credential material a job leaves behind outlive it. A label two
+repositories can both target puts one repository's job on a host the other just
+used. An overflow pool is viable only if its hosts are EPHEMERAL — destroyed
+after a single job — and take a repository-scoped identity at registration
+rather than holding a shared one. Cost that before treating this row as a
+recommendation; the 97-minute tail may be cheaper to fix with faster scale-out.
+
 ---
 
 ## 3. Structure tier — shape of the check graph

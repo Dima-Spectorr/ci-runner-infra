@@ -95,24 +95,35 @@ because its whole job is to decide whether a self-hosted slot is warranted.
     steps:
       - uses: actions/checkout@v4
         with:
-          # Only the merge base is needed — not the full history a
-          # `fetch-depth: 0` clone pays for on every job.
-          fetch-depth: 0
+          # Shallow on purpose. The classifier needs ONE extra commit — the
+          # base sha — not the repository's whole history, and this job runs
+          # on every pull request. `fetch-depth: 0` here is the full-clone cost
+          # the catalog recommends removing, paid to compute a filename list.
+          fetch-depth: 1
       - id: decide
         run: |
           set -euo pipefail
+          # Pinned to an immutable commit, NOT a tag. This shell is downloaded
+          # and SOURCED inside a checked-out CI job that may hold credentials;
+          # a moved or recreated tag would change executing code in every
+          # consuming repository with no pull request in any of them. The
+          # digest check is what makes the pin worth anything.
+          sha=<40-char-commit-sha>
           curl -fsSL -o /tmp/lane-decision.sh \
-            "https://raw.githubusercontent.com/<org>/ci-runner-infra/v3.1.0/scripts/ci/lane-decision.sh"
+            "https://raw.githubusercontent.com/<org>/ci-runner-infra/$sha/scripts/ci/lane-decision.sh"
+          echo "<sha256>  /tmp/lane-decision.sh" | sha256sum -c -
           # shellcheck source=/dev/null
           source /tmp/lane-decision.sh
           base="${{ github.event.pull_request.base.sha }}"
+          git fetch --no-tags --depth=1 origin "$base"
           verdict=$(git diff --name-only "$base"...HEAD | lane_decision)
           echo "lane=${verdict%%:*}" >> "$GITHUB_OUTPUT"
           echo "::notice::lane $verdict"
 ```
 
-Pin the tag. An unpinned rule changes what a repository tests without a pull
-request in that repository.
+Pin the COMMIT, and check the digest. A tag is mutable: pinning one still lets
+whoever can move it change what every consuming repository tests — and what
+code it sources into a credentialed job — with no pull request anywhere.
 
 ### 3. Gate at job level, never inside the job
 
@@ -155,7 +166,7 @@ The draft mechanism has two halves and both are load-bearing:
 ```yaml
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 ```
 
 ```yaml
@@ -165,6 +176,10 @@ on:
       || startsWith(github.head_ref, 'mergify/merge-queue/')
 ```
 
+- Without `converted_to_draft`, a pull request pushed back to draft leaves its
+  in-flight heavy run going: nothing re-fires, so concurrency has nothing to
+  supersede it with, and the pool keeps paying for a tier the pull request no
+  longer qualifies for.
 - Without `ready_for_review`, the draft-to-ready transition never re-fires and
   the guarded checks stay `SKIPPED` while the pull request reports
   `mergeStateStatus=CLEAN` — green-looking and untested.

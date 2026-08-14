@@ -83,6 +83,24 @@ expect full "a migration is evaluated against the whole schema" \
 expect full "a pinned toolchain version applies to every job" \
   .nvmrc
 
+# --- build inputs wearing a documentation costume ------------------------------
+# Each of these matches a NON-CODE rule textually. If the ordering in
+# classify_path ever regresses, they take the lane that runs no CI at all, and
+# nothing else in this suite notices.
+expect full "requirements.txt is a dependency graph, not a text file"   requirements.txt
+expect full "a nested dev requirements file is the same hazard"   services/api/requirements-dev.txt
+expect full "a package.json under docs/ is still a dependency manifest"   docs/package.json
+expect full "a Sphinx conf.py executes, wherever it lives"   docs/conf.py
+expect full "pyproject.toml carries dependencies and build backend"   pyproject.toml
+expect full "a nested Cloud Build config uses the .yml spelling too"   services/api/cloudbuild.yml
+expect full "a nested compose file changes the build outside any source filter"   services/api/docker-compose.yml
+
+# Images are only provably non-code inside a documentation tree. Elsewhere they
+# are bundled production inputs or visual-regression expectations.
+expect none "an image in the documentation tree is non-code"   docs/img/flow.svg
+expect partial "an image under src/ is a bundled production input"   src/assets/logo.svg
+expect partial "a test fixture image is an assertion, not decoration"   tests/visual/__snapshots__/header.png
+
 # --- fail-safe: unrecognised means tested, never skipped ----------------------
 expect partial "an unrecognised extension is tested, not skipped" \
   src/thing.zig
