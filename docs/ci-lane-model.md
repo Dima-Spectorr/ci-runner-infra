@@ -95,11 +95,12 @@ because its whole job is to decide whether a self-hosted slot is warranted.
     steps:
       - uses: actions/checkout@v4
         with:
-          # Shallow on purpose. The classifier needs ONE extra commit — the
-          # base sha — not the repository's whole history, and this job runs
-          # on every pull request. `fetch-depth: 0` here is the full-clone cost
+          # Shallow on purpose, and 2 rather than 1: the classifier diffs the
+          # merge commit against its base parent, so that parent has to be in
+          # the clone — but nothing older than it does, and this job runs on
+          # every pull request. `fetch-depth: 0` here is the full-clone cost
           # the catalog recommends removing, paid to compute a filename list.
-          fetch-depth: 1
+          fetch-depth: 2
       - id: decide
         run: |
           set -euo pipefail
@@ -114,9 +115,18 @@ because its whole job is to decide whether a self-hosted slot is warranted.
           echo "<sha256>  /tmp/lane-decision.sh" | sha256sum -c -
           # shellcheck source=/dev/null
           source /tmp/lane-decision.sh
-          base="${{ github.event.pull_request.base.sha }}"
-          git fetch --no-tags --depth=1 origin "$base"
-          verdict=$(git diff --name-only "$base"...HEAD | lane_decision)
+          # On a `pull_request` event HEAD is the merge commit GitHub built, so
+          # HEAD^1 IS the base and HEAD^1..HEAD is exactly the pull request's
+          # changes — no network round trip and no merge base to compute.
+          #
+          # The triple-dot form (`git diff "$base"...HEAD`) is what NOT to do
+          # here: it asks git for the merge base of two commits, and in a
+          # shallow clone each fetch creates its own grafted root with no
+          # shared ancestry. It fails with `fatal: ... no merge base`, and
+          # under `set -euo pipefail` that kills the classifier — on every
+          # pull request, in every adopting repository. `--depth` deepens an
+          # existing shallow history; it does not reconnect two roots.
+          verdict=$(git diff --name-only HEAD^1 HEAD | lane_decision)
           echo "lane=${verdict%%:*}" >> "$GITHUB_OUTPUT"
           echo "::notice::lane $verdict"
 ```
@@ -179,7 +189,11 @@ on:
 - Without `converted_to_draft`, a pull request pushed back to draft leaves its
   in-flight heavy run going: nothing re-fires, so concurrency has nothing to
   supersede it with, and the pool keeps paying for a tier the pull request no
-  longer qualifies for.
+  longer qualifies for. This only works if the consuming workflow declares a
+  `concurrency` group keyed on the head ref **with `cancel-in-progress` true
+  for `pull_request`** — the type merely produces the newer run; cancellation
+  is what stops the old one. With `cancel-in-progress` unset the redundant run
+  holds its slot to completion and the type buys nothing.
 - Without `ready_for_review`, the draft-to-ready transition never re-fires and
   the guarded checks stay `SKIPPED` while the pull request reports
   `mergeStateStatus=CLEAN` — green-looking and untested.
@@ -189,6 +203,43 @@ on:
 
 Apigee-Portal carries both, with the incident references. Copy it whole; do not
 re-derive half of it.
+
+### The stale-`skipped` trap, and why requirement 1 is not optional
+
+Observed on DataRetrival #2338 (2026-08-14), and it is the concrete cost of
+naming a *gated* job as a required check:
+
+A job skipped by that `if:` is not absent. GitHub records a real check-run with
+conclusion `skipped`, attached to the head sha. Marking the pull request ready
+fires a **second** check suite on the **same sha**, and that one succeeds — but
+the `skipped` run stays. The sha now carries two check-runs per context, one
+`skipped` and one `success`, and Mergify reads the skipped one:
+
+```
+The merge conditions cannot be satisfied due to failing checks
+- `lint` - `typecheck` - `generic-binary` - `migrations` - `test` - `migration-harness`
+```
+
+with every one of those jobs green in the second suite. `@mergifyio refresh`
+does not clear it. Only a new head sha does.
+
+It bites when `ready_for_review` is the **last** event on the sha. A pull
+request that gets one more commit after being marked ready produces a clean
+single-suite sha and never sees it — which is why the trap hides: it spares the
+hand-edited pull request and catches the agent-authored one that was complete
+when opened and simply flipped to ready.
+
+The fix is requirement 1, applied properly: the required NAME belongs to a
+cheap **always-running** aggregate that reports success, and the expensive work
+sits in a separate, differently-named job behind the draft/lane condition. Then
+a draft emits `success` for the context, the ready re-run emits `success` again,
+and the two suites cannot disagree. DataRetrival's `migration-harness` is the
+worked example, and its `.mergify.yml` states the reason in place.
+
+Do **not** instead relax the queue conditions to accept `skipped`. That makes a
+genuinely-unrun gate count as green, which is the failure mode the required
+check exists to prevent — and on the `none` lane every heavy check is skipped
+by design, so the relaxation would apply exactly where it is least safe.
 
 ---
 
@@ -217,4 +268,6 @@ re-derive half of it.
 - **Do not widen `none`.** If a path is arguably code, it is `partial`.
 - **Do not put the classifier on the pool.**
 - **Do not make a gated job a required check directly.** Required checks name
-  the aggregate job, and only the aggregate job.
+  the aggregate job, and only the aggregate job. A gated job's `skipped`
+  check-run outlives the draft phase and blocks the queue after
+  `ready_for_review` — see the stale-`skipped` trap above.

@@ -81,6 +81,20 @@ Recommended tiering, rather than all-or-nothing skipping:
 A draft still gets fast feedback; the pool stops paying for suites nobody reads
 until review.
 
+**Prerequisite, not a footnote — the heavy tier's job names must not be the
+required check names.** A job skipped on a draft records a real check-run with
+conclusion `skipped` on the head sha, and that run outlives the draft phase: the
+`ready_for_review` re-run adds a `success` run with the same name on the same
+sha, and Mergify reads the `skipped` one. On DataRetrival #2338 that reported
+`lint`, `typecheck`, `migrations` and `migration-harness` as failing with every
+job green, and `@mergifyio refresh` did not clear it — only a new head sha did.
+
+It only bites when `ready_for_review` is the last event on the sha, which is why
+it hides: a pull request with one more commit after being marked ready is spared,
+and the agent-authored one that was complete when opened is not. Adopt §3.1
+first, or draft tiering converts a saved pool slot into a stuck queue. Full
+write-up and the always-completing-shim fix: `docs/ci-lane-model.md`.
+
 ### 1.2 Workflow-level `paths-ignore` on satellite workflows
 
 Only 3 of ~90 PR-triggered workflows have any path filter at the trigger
@@ -256,8 +270,16 @@ work *across PRs*, whereas a path filter only ever helps within one PR.
 35 `actions/checkout` invocations in Apigee-Portal, 18 of them with an explicit
 `fetch-depth` — most of those are `fetch-depth: 0` because diff-based guards
 need history. A full clone per job, times 13 jobs, on every PR. Fetching only
-the merge-base (`git fetch --depth=1 origin $BASE_SHA`) gives the same diff at a
-fraction of the transfer.
+two commits (`fetch-depth: 2`, then `git diff --name-only HEAD^1 HEAD`) gives
+the same diff at a fraction of the transfer, because on a `pull_request` event
+HEAD is the merge commit GitHub built and HEAD^1 is its base.
+
+Do **not** reach for `git fetch --depth=1 origin $BASE_SHA` plus a triple-dot
+`git diff "$BASE_SHA"...HEAD`. Triple-dot asks git to compute a merge base, and
+each shallow fetch lands as its own grafted root with no shared ancestry, so it
+fails with `fatal: ... no merge base` — under `set -euo pipefail`, on every
+pull request. `--depth` deepens an existing shallow history; it does not
+reconnect two roots.
 
 ---
 
@@ -283,6 +305,48 @@ PR runs (252 s average, ~54 min of pool time in that window). A gate that is
 almost always red consumes capacity and trains everyone to ignore it. Either
 fix it or quarantine it to non-required until it is fixed — leaving it as-is is
 the worst of the three options.
+
+### 5.2a `grep -q` inside a `pipefail` pipeline — a gate that inverts itself
+
+Every repo here writes shell gates, and the idiom they all reach for is
+
+```bash
+set -uo pipefail
+awk '…' file | grep -q 'the thing that must be there'
+```
+
+which is wrong. `grep -q` exits the moment it matches; the writer upstream then
+takes SIGPIPE and exits 141; `pipefail` propagates that as the pipeline's
+status. **A successful match is therefore reported as a failure** — and only
+sometimes, because it is a race with how much the writer had already buffered.
+That is precisely the shape that passes on a laptop and fails on a runner
+against a byte-identical file, so the first instinct is to hunt for a
+difference between the two machines that does not exist. It cost a full
+diagnosis cycle here on `host-startup.selftest.sh` before the assertion was made
+to print the text it had matched against, at which point the text plainly
+contained the string it claimed was missing.
+
+The dangerous direction is the inverted check — `if grep -q <bad-pattern>; then
+fail`. There the artefact turns a real regression into a silent `ok`, and
+nothing ever prints. `identity-split.selftest.sh` check 1 was that shape.
+
+Write the match against a string, never through a pipe into an early-exiting
+reader:
+
+```bash
+matches() { # <text> <ere> — grep -c reads to EOF, so nothing upstream is signalled
+  local n; n=$(printf '%s\n' "$1" | grep -cE -- "$2"); [ "${n:-0}" -gt 0 ]
+}
+matches "$(awk '…' file)" 'the thing that must be there'
+```
+
+The same applies to any early-exiting reader at the end of a pipeline under
+`pipefail` — `head -n`, `grep -m`, `sed q`. When the value is what you want and
+the status is ignored (`x=$(cmd | head -1)`), it is harmless; when the status is
+the verdict, it is a bug.
+
+Whenever a gate fails, print the input it judged, not only the verdict. A gate
+that says only "not found" cannot be told apart from a gate that is broken.
 
 ### 5.3 Retry granularity
 
