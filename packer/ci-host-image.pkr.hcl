@@ -185,12 +185,18 @@ build {
   #    security scanners in particular — semgrep, checkov). Ubuntu ships python3
   #    WITHOUT the pip module, so on a host that only has the interpreter that
   #    line fails with "No module named pip" and the whole job stops.
+  #
+  #    python3-yaml is explicit for the opposite reason: it is ALREADY present,
+  #    but only because cloud-init depends on it. The merge-queue gate the
+  #    consuming repositories run (`scripts/ci/check-merge-queue-single-step.sh`)
+  #    needs it and deliberately installs nothing, so naming it here is what
+  #    stops a base-image change from turning a required check red fleet-wide.
   provisioner "shell" {
     inline = [
       "set -eux",
       "export DEBIAN_FRONTEND=noninteractive",
       "apt-get update -qq",
-      "apt-get install -y -qq curl jq git openssl ca-certificates gnupg unzip rsync python3-pip python3-venv",
+      "apt-get install -y -qq curl jq git openssl ca-certificates gnupg unzip rsync python3-pip python3-venv python3-yaml",
       # PEP 668: Ubuntu 24.04 marks its system python EXTERNALLY-MANAGED, so
       # even with pip installed, `python3 -m pip install …` aborts with "This
       # environment is externally managed" — a DIFFERENT failure from the
@@ -364,6 +370,11 @@ build {
       # pip is a MODULE, not a binary on PATH — `command -v pip3` can succeed on
       # a host where `python3 -m pip` (what workflows actually write) does not.
       "sudo -u runner -i python3 -m pip --version",
+      # PyYAML arrives with cloud-init even when nothing names it, so a host can
+      # pass every other assertion here and still fail the merge-queue gate in
+      # fourteen repositories. Imported, not apt-queried: what matters is that
+      # the interpreter a job runs can load it.
+      "sudo -u runner -i python3 -c 'import yaml'",
       # `pip --version` succeeds on an EXTERNALLY-MANAGED host — only an INSTALL
       # path proves the PEP 668 block is lifted. Asserted by driving pip down
       # that path and rejecting only the PEP 668 refusal: --no-index means the

@@ -96,13 +96,21 @@ jobs:
       - name: installer-activation self-test
         run: bash scripts/ci/installer-activation.selftest.sh
 
-      # This repository runs no Mergify queue, so there is no `.mergify.yml`
-      # here to scan — only the rule itself, which fourteen repositories copy
-      # in. A config gate's characteristic failure is a vacuous pass, so the
-      # fixtures are what is asserted: 13 of them, each detector on its own
-      # count.
+      # The fixtures first: a config gate's characteristic failure is a vacuous
+      # pass — it reads a file it never matches and reports clean — so the
+      # detectors are proved to fire before this repository's own config is
+      # believed. Each is asserted on the SET of check ids it plants, and the
+      # count is deliberately not repeated here: a number in prose beside a test
+      # that prints its own is a second source of truth, and it goes stale.
       - name: merge-queue single-step gate self-test
         run: bash scripts/ci/check-merge-queue-single-step.sh --selftest
+
+      # …and then the real config. Until this repository had a `.mergify.yml`
+      # only the fixtures ran here, which is the same vacuous pass one level up:
+      # the rule fourteen repositories copy in was asserted everywhere except
+      # where it is published from.
+      - name: merge-queue single-step gate
+        run: bash scripts/ci/check-merge-queue-single-step.sh
 
       # `ci_orphan_registrations_reaped` was published from the day the reaper
       # landed and never declared in the module output that dashboards and alert

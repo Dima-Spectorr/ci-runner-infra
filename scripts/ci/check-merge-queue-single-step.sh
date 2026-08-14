@@ -33,7 +33,7 @@
 #   walks lines gets each of those wrong in the safe-looking direction — it
 #   reports clean — and a config gate's characteristic failure is exactly that
 #   vacuous pass. So the file goes through a real YAML parser (`python3` +
-#   PyYAML, which this gate installs if the runner lacks it) and every check
+#   PyYAML, which the runner image carries — see `ensure_yaml`) and every check
 #   below reads the loaded document by EXACT PATH: `merge_queue.max_parallel_checks`,
 #   `queue_rules[1].batch_size`. Never a key name found somewhere in the text —
 #   `max_parallel_checks` one level too deep is not a value in an odd spot, it is
@@ -63,6 +63,12 @@
 #   request embarks; a second copy is a list to keep in sync, and the anchor
 #   exists precisely so that no such copy exists.
 #
+# CHECK 10 — and each rule must OWN the list it shares. Identity between one
+#   rule's two fields does not say the list is that rule's: a second rule can
+#   alias the FIRST rule's anchor for both of its fields, pass CHECK 4, and
+#   leave two rules sharing one list — where a check added for one base is
+#   silently required of the other.
+#
 # CHECK 9 — a queue rule with no `queue_conditions`, or with conditions naming
 #   no check at all, admits pull requests on base/draft state alone. The gate
 #   would then be certifying a queue that merges before CI succeeds.
@@ -84,10 +90,16 @@ err() { local id="$1"; shift; echo "::error::[$id] $*"; fail=1; }
 # --- the parser is a hard dependency, not a nice-to-have ---------------------
 # Made conditional, this is worse than useless: on a runner without PyYAML the
 # gate would report PASS over a file Mergify cannot load.
+#
+# It does NOT install anything. A required check that pip-installs an unpinned
+# package at gate time makes every pull request in fourteen repositories depend
+# on PyPI being up and shipping a compatible release — and it runs that install
+# on self-hosted hosts holding a GCP service identity. PyYAML is present on
+# `ubuntu-latest` and baked into the golden host image; if it is ever missing
+# the gate says so and fails, which is a runner-image bug with one owner rather
+# than a supply-chain surface on every merge.
 ensure_yaml() {
   command -v python3 >/dev/null 2>&1 || return 1
-  python3 -c 'import yaml' >/dev/null 2>&1 && return 0
-  python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1
   python3 -c 'import yaml' >/dev/null 2>&1
 }
 
@@ -176,7 +188,19 @@ def scalar(value):
     return str(value).replace("\t", " ").replace("\n", " ")
 
 
-def walk(node, path):
+# A path is only an address if one address means one node. `.` and `[` are this
+# encoding's separators, so a key that CONTAINS one collides with a real nesting:
+# a top-level key literally named `merge_queue.max_parallel_checks` emits the
+# record a nested `merge_queue: {max_parallel_checks: 1}` would, and the gate
+# then certifies a document in which the required mapping is absent — Mergify
+# sees an unknown top-level key and refuses the file. Rejected rather than
+# escaped: no legal Mergify key contains either character, so the honest verdict
+# is that the document is not addressable.
+BAD_KEY_CHARS = (".", "[", "]")
+bad_keys = []
+
+
+def walk(node, path, seen):
     if isinstance(node, dict):
         items = node.items()
     elif isinstance(node, list):
@@ -184,21 +208,49 @@ def walk(node, path):
     else:
         return
     for key, value in items:
-        child = "%s[%d]" % (path, key) if isinstance(node, list) else (
-            "%s.%s" % (path, key) if path else str(key)
-        )
+        if isinstance(node, dict):
+            text = str(key)
+            if any(c in text for c in BAD_KEY_CHARS):
+                bad_keys.append(text)
+                continue
+            child = "%s.%s" % (path, text) if path else text
+        else:
+            child = "%s[%d]" % (path, key)
         print("%s\t%s\t%s" % (child, scalar(value), kind(value)))
-        walk(value, child)
+        # A recursive alias (`loop: &loop [*loop]`) is legal YAML and loads into
+        # an object that contains itself. Walked naively this raises deep in the
+        # traversal, AFTER the required records have been printed — a traceback
+        # beside a full path stream, which reads as a usable document.
+        if isinstance(value, (dict, list)):
+            if id(value) in seen:
+                bad_keys.append("%s (cycle)" % child)
+                continue
+            walk(value, child, seen | {id(value)})
 
 
-walk(doc, "")
+walk(doc, "", {id(doc)})
+
+for key in bad_keys:
+    print("#BADKEY\t%s" % key)
 
 rules = doc.get("queue_rules") if isinstance(doc, dict) else None
+# Which rule each condition list belongs to. Identity between a rule's OWN two
+# fields does not say the rule owns its list: a second rule can point both of
+# its fields at the FIRST rule's anchor, and then every per-rule verdict below
+# reads `same` while the two rules are silently one list.
+owners = {}
 if isinstance(rules, list):
     for i, rule in enumerate(rules):
         if not isinstance(rule, dict):
             continue
         qc = rule.get("queue_conditions")
+        if isinstance(qc, list):
+            # The document stays referenced for the life of this process, so no
+            # id() is recycled underneath this map.
+            if id(qc) in owners:
+                print("#ALIAS\tqueue_rules[%d]\tqueue_rules[%d]" % (i, owners[id(qc)]))
+            else:
+                owners[id(qc)] = i
         if "merge_conditions" not in rule:
             state = "absent"
         else:
@@ -224,13 +276,25 @@ scan_file() {
 
   # --- CHECK 0: it has to load at all, and mean one thing --------------------
   if ! ensure_yaml; then
-    err CHECK0 "no YAML parser available (python3 with PyYAML, which this gate tries to pip-install). Without one it cannot tell a config Mergify loads from one it refuses, and reporting PASS on that basis is the vacuous pass this gate exists to prevent. Install python3 + PyYAML on the runner."
+    err CHECK0 "no YAML parser available (python3 with PyYAML, which the runner image is expected to carry — this gate deliberately installs nothing). Without one it cannot tell a config Mergify loads from one it refuses, and reporting PASS on that basis is the vacuous pass this gate exists to prevent. Install python3 + PyYAML on the runner."
     return
   fi
-  doc="$(read_yaml "$f")"
+  # The STATUS, not just the output. A reader that dies partway still leaves the
+  # records it managed to print, and every check below then reads a document it
+  # never finished loading — the vacuous pass again, this time with a traceback
+  # printed above the PASS line where nothing is looking.
+  if ! doc="$(read_yaml "$f")"; then
+    err CHECK0 "the YAML reader exited non-zero on \`$f\`, so the document was never fully inspected. Whatever it printed before dying is not a verdict; treat this as an unreadable configuration."
+    return
+  fi
 
   if printf '%s\n' "$doc" | grep -q '^#ERR	'; then
     err CHECK0 "\`$f\` is not loadable YAML, so nothing below it is worth asserting: Mergify refuses the whole file and NO pull request queues. Parser said: $(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#ERR" { print $2; exit }')"
+    return
+  fi
+  local badkeys; badkeys="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#BADKEY" { print $2 }' | sort -u | tr '\n' ' ')"
+  if [ -n "${badkeys// /}" ]; then
+    err CHECK0 "\`$f\` contains a key this gate cannot address unambiguously: ${badkeys}. A key holding \`.\` or \`[\` collides with a genuinely nested path — a top-level \`\"merge_queue.max_parallel_checks\"\` would read here exactly like the nested mapping Mergify requires, while Mergify itself sees an unknown top-level key and refuses the file. A \`(cycle)\` entry means a recursive alias, which no valid Mergify configuration has. Remove it."
     return
   fi
   local dups; dups="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DUP" { print $2 }' | sort -u | tr '\n' ' ')"
@@ -308,6 +372,16 @@ EOF
     err CHECK4 "queue rule \`$r\` does not share ONE node between \`queue_conditions\` and \`merge_conditions\`. Mergify checks a queued pull request in place only when \`merge_conditions\` is empty or IDENTICAL to \`queue_conditions\`; two separately written lists — or an alias pointing at another rule's anchor — match only until the next check is added to one of them, and the drift is silent: merges keep working, each pull request merely pays a second full CI run. Write \`queue_conditions: &<name>\` and \`merge_conditions: *<name>\` with THIS rule's own name, or drop \`merge_conditions\` entirely."
   done < <(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#RULE"')
 
+  # --- CHECK 10: each rule owns its condition list ---------------------------
+  # CHECK 4 asks whether a rule's two fields are one node; that says nothing
+  # about WHOSE node it is. A rule aliasing an earlier rule's anchor for both
+  # fields passes CHECK 4 cleanly while the two rules share one list — so a
+  # check added for one rule's base silently lands on the other's too.
+  while IFS=$'\t' read -r _ r owner; do
+    [ -n "$r" ] || continue
+    err CHECK10 "queue rule \`$r\` uses the SAME condition list object as \`$owner\` — it aliases that rule's anchor instead of declaring its own. The two rules are then one list: a check added for one rule's base is silently required of the other's, and removing it from one removes it from both. Give each rule its own \`&anchor\`."
+  done < <(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#ALIAS"')
+
   # --- CHECK 9: the queue rule actually gates on CI --------------------------
   # `merge_conditions` being absent or empty is a valid single-step spelling,
   # which makes `queue_conditions` the ONLY thing standing between a pull
@@ -317,7 +391,13 @@ EOF
       [ -n "$r" ] || continue
       if ! has_path "$r.queue_conditions"; then
         err CHECK9 "queue rule \`$r\` declares no \`queue_conditions\`. Entry to the queue is then decided by \`auto_merge_conditions\` alone — which carries base/draft facts and is forbidden from carrying checks — so a pull request can embark and merge before CI has succeeded."
-      elif ! subtree_vals "$r.queue_conditions" | grep -q 'check-'; then
+      # Same left-hand-operator anchor as CHECK 7, and here the loose spelling
+      # fails the DANGEROUS way: a rule whose only condition is
+      # `label = check-success-waived` would read as gated on CI. Negated forms
+      # are deliberately NOT accepted — `-check-failure = X` requires nothing to
+      # have succeeded.
+      elif ! subtree_vals "$r.queue_conditions" \
+        | grep -qE '^[[:space:]]*check-(success|neutral|skipped)[[:space:]]*[=:~]'; then
         err CHECK9 "queue rule \`$r\` has \`queue_conditions\` that name no check (\`check-success\`/\`check-neutral\`/\`check-skipped\`). This is the ONE list that decides when a queued pull request embarks, so with the checks gone it merges on base/draft state alone."
       fi
     done <<EOF
@@ -368,7 +448,14 @@ EOF
   # --- CHECK 7: auto_merge_conditions must not restate the checks ------------
   # Read from the loaded list, so an aliased `auto_merge_conditions: *admission`
   # is inspected like any other.
-  if subtree_vals merge_protections_settings.auto_merge_conditions | grep -q 'check-'; then
+  #
+  # Anchored on the LEFT-HAND OPERATOR, not a substring. `check-` occurs inside
+  # ordinary VALUES too — `label = check-success-waived` names a label, restates
+  # nothing — and a gate that rejects a correct config teaches its next reader
+  # to delete it. The leading `-?` keeps the negated form (`-check-success = X`)
+  # in scope, since that is a restated check as well.
+  if subtree_vals merge_protections_settings.auto_merge_conditions \
+    | grep -qE '^[[:space:]]*-?[[:space:]]*check-(success|neutral|skipped|failure|pending)[[:space:]]*[=:~]'; then
     err CHECK7 "\`auto_merge_conditions\` restates required checks. They belong once, in the anchored condition list, which is what decides when a queued pull request embarks; a second copy is one more list to keep in sync and it will drift. Keep this list to the \`base\`/\`-draft\`/label facts."
   fi
 
@@ -377,14 +464,24 @@ EOF
   # failure with the key present: the list exists, nothing ever matches it.
   amc_base="$(subtree_vals merge_protections_settings.auto_merge_conditions \
     | sed -n 's/^base[[:space:]]*=[[:space:]]*//p' | sed 's/^"//; s/"$//' | sort -u)"
-  rule_bases="$(while read -r r; do
+  local rule_bases_raw
+  rule_bases_raw="$(while read -r r; do
       [ -n "$r" ] || continue
       subtree_vals "$r.queue_conditions"
     done <<EOF
 $rules
 EOF
   )"
-  rule_bases="$(printf '%s\n' "$rule_bases" | sed -n 's/^base[[:space:]]*=[[:space:]]*//p' | sed 's/^"//; s/"$//' | sort -u)"
+  rule_bases="$(printf '%s\n' "$rule_bases_raw" | sed -n 's/^base[[:space:]]*=[[:space:]]*//p' | sed 's/^"//; s/"$//' | sort -u)"
+  # A BASE-LESS list is the third spelling, and the loop below cannot see it:
+  # with no `base = …` there is nothing to compare, so the check passes. But if
+  # the rules DO constrain the base, an unconstrained auto-merge list matches
+  # pull requests targeting branches no rule admits — queued into nothing, green
+  # and unmerged, nothing red. Only demanded when the rules constrain a base;
+  # rules that take any base have nothing for this to disagree with.
+  if [ -n "$amc_items" ] && [ -z "$amc_base" ] && [ -n "$rule_bases" ]; then
+    err CHECK8 "\`auto_merge_conditions\` names no \`base\`, but the queue rules only admit: $(printf '%s' "$rule_bases" | tr '\n' ' '). Pull requests targeting any other branch are matched for auto-merge and then have no rule to queue into — they sit green and unmerged with no red check to say why. Name the base this repository queues."
+  fi
   if [ -n "$amc_base" ] && [ -n "$rule_bases" ]; then
     while read -r b; do
       [ -n "$b" ] || continue
@@ -394,6 +491,19 @@ EOF
     done <<EOF
 $amc_base
 EOF
+  fi
+  # Two bases in ONE list is not "either base". `auto_merge_conditions` is a
+  # conjunction, so `base = main` and `base = develop` together are satisfied by
+  # no pull request at all — and each one on its own is admitted by a rule, so
+  # the loop above passes both. The list is the failure, not either member.
+  if [ "$(printf '%s\n' "$amc_base" | grep -c .)" -gt 1 ]; then
+    err CHECK8 "\`auto_merge_conditions\` names more than one base ($(printf '%s' "$amc_base" | tr '\n' ' ')). The list is ANDed, so no pull request can satisfy it and nothing is ever queued — with every base individually served by a rule, which is why this reads as correct. Write one base, or an explicit \`or:\`."
+  fi
+  # Draft polarity, for the same reason: `draft` in the admission list against
+  # `-draft` in the rule queues exactly the pull requests the rule refuses.
+  if subtree_vals merge_protections_settings.auto_merge_conditions | grep -qx 'draft' \
+     && printf '%s\n' "$rule_bases_raw" | grep -qx -- '-draft'; then
+    err CHECK8 "\`auto_merge_conditions\` admits \`draft\` while a queue rule requires \`-draft\`. Only drafts are then auto-queued, and every rule refuses them: nothing merges, and nothing goes red."
   fi
 }
 
@@ -516,11 +626,52 @@ selftest() {
     'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - or:\n        - check-success = "Lint"\n        - check-skipped = "Lint"\n' || return 1
   expect no-queue-conditions CHECK9 \
     'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n' || return 1
+  # Two rules, one list: the second aliases the first rule's anchor for BOTH of
+  # its fields, so every per-rule identity verdict is `same` and CHECK 4 is
+  # silent — while `release` in fact requires the check written for `main`.
+  expect shared-condition-list CHECK10 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\n  - name: release\n    queue_conditions: *gate\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n' || return 1
+  # `auto_merge_conditions` present, non-empty, and naming NO base. The orphan
+  # loop has nothing to compare and passes; the list matches pull requests on
+  # every branch, and the ones the rule does not admit queue into nothing.
+  expect amc-no-base CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - -draft\n' || return 1
+  # …but a base-less list is FINE when no rule constrains the base either:
+  # there is nothing for it to disagree with, and demanding a base here would
+  # reject a correct config.
+  expect amc-no-base-unconstrained-rules '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - -draft\n' || return 1
+  # `check-success` inside a VALUE, not as the operator. This is a label name;
+  # it restates no check, and rejecting it would teach the next reader that
+  # CHECK 7 fires on correct configurations and can be deleted.
+  expect amc-label-lookalike '' \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - label != check-success-waived\n' || return 1
+  # The same lookalike on the QUEUE side, where the loose reading fails the
+  # dangerous way: this rule gates on a label and nothing else, and a substring
+  # match reads it as gated on CI.
+  expect queue-label-lookalike CHECK9 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - label != check-success-waived\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n' || return 1
   # A duplicate key: which declaration wins is the loader's business, not this
   # gate's. Both findings are wanted — the second value is also non-compliant,
   # and a reader that stops at the first `max_parallel_checks: 1` reports clean.
   expect duplicate-key 'CHECK0 CHECK1' \
     'merge_queue:\n  max_parallel_checks: 1\n  max_parallel_checks: 5\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n' || return 1
+  # A top-level key literally NAMED `merge_queue.max_parallel_checks`. Mergify
+  # sees an unknown top-level key and refuses the file; a path built by joining
+  # raw keys sees the nested mapping it was looking for.
+  expect flat-dotted-key CHECK0 \
+    '"merge_queue.max_parallel_checks": 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n' || return 1
+  # A recursive alias. Legal YAML, no valid Mergify configuration, and walked
+  # naively it dies AFTER printing every record the checks below read.
+  expect recursive-alias CHECK0 "${CLEAN}loop: &loop\n  - *loop\n" || return 1
+  # Two bases in one ANDed list: each is served by a rule, so the orphan loop
+  # passes both, and no pull request satisfies the conjunction.
+  expect amc-two-bases CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\n  - name: dev\n    queue_conditions: &devgate\n      - base = develop\n      - check-success = "Lint"\n    merge_conditions: *devgate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - base = develop\n' || return 1
+  # Admission and rule disagree about drafts: only drafts are auto-queued, and
+  # the rule admits none of them.
+  expect amc-draft-polarity CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - draft\n' || return 1
   # Every invariant above still matches textually; the document does not load,
   # so Mergify refuses the file and the queue stops.
   expect unloadable CHECK0 "${CLEAN}broken: [\n" || return 1

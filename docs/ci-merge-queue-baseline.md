@@ -178,8 +178,8 @@ Run `--selftest` immediately before the real invocation:
         run: bash scripts/ci/check-merge-queue-single-step.sh
 ```
 
-The self-test plants 34 fixtures and asserts, for each one, the **set of check
-ids** it raises — not how many diagnostics appeared. A count-only assertion is
+The self-test plants a fixture per detector and asserts, for each one, the **set
+of check ids** it raises — not how many diagnostics appeared. A count-only assertion is
 itself a vacuous test: delete the queue-action detector and the fixture that
 exists to prove it stays green, because a different check emits one error
 instead. And a vacuous pass is this gate's characteristic failure — it reads a
@@ -191,7 +191,16 @@ whole-file "an anchor exists" test passes it), and one fixture per spelling that
 only a parser resolves: an inline `queue: {name: default}`, a quoted
 `"max_checks_retries"`, a `max_checks_retries` spliced in through a `<<` merge
 key, an `auto_merge_conditions` reached through an alias, a duplicate key, and a
-document that does not load.
+document that does not load. Two more cover documents that are legal YAML and
+still not addressable: a top-level key literally named
+`merge_queue.max_parallel_checks` (which would read here exactly like the nested
+mapping, while Mergify sees an unknown key and refuses the file), and a
+recursive alias (which walked naively dies *after* printing every record the
+checks read).
+
+The count is deliberately not written down anywhere: the self-test prints its
+own, and a number repeated in prose is a second source of truth that goes stale
+the next time a detector gains a fixture.
 
 ### It parses the file, and then matches paths, not key names
 
@@ -209,8 +218,11 @@ nothing queues at all. The same shape recurs four ways, and each has a fixture:
 | rule B omits `batch_size` while rule A declares `1` | unbatched | rule B batches on a throwaway branch |
 | rule B aliases rule A's anchor (`&low` / `*low`) | anchors and aliases balance | rule B's two lists are different nodes |
 
-The paths come from a **real YAML parser** (`python3` + PyYAML, which the gate
-pip-installs if the runner lacks it), and that is not an optimization — it is
+The paths come from a **real YAML parser** (`python3` + PyYAML, which the runner
+image is expected to carry — the gate installs nothing, because a required check
+that pip-installs an unpinned package puts every merge in every consuming
+repository behind PyPI, on hosts holding a service identity), and that is not an
+optimization — it is
 what makes the table above true. Reading the text structurally gets every row
 wrong in the same direction, the safe-looking one:
 
