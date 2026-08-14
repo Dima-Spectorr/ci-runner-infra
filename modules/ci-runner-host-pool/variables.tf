@@ -70,6 +70,12 @@ variable "slots_per_host" {
     Concurrent job slots per host — the number of runner agents each host
     registers. Also the autoscaler's `single_instance_assignment`, so demand of
     N jobs asks for ceil(N / slots_per_host) hosts.
+
+    Above 1 this is also a TRUST decision, not only a sizing one: the slots on a
+    host share one Docker daemon, so a job that reaches the socket can read the
+    sibling slots' containers, tokens and workspaces. Set 1 for a repository
+    that runs code from outside contributors. See the isolation rules in
+    README.md.
   EOT
   type        = number
   default     = 4
