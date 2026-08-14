@@ -169,7 +169,10 @@ has_port_partition() { # <file>
   # so the shim has to come FIRST on it
   matches "$code" '^Environment=PATH=/opt/ci/rootless-shim:' || return 1
   # per SLOT, not one range for the host: a constant here restores the collision
-  matches "$code" '^Environment=CI_SLOT_PORT_RANGE=\$\(slot_port_range "\$idx"\)$' || return 1
+  # QUOTED: the value has a space in it, and systemd drops the second number as
+  # a stray assignment without the quotes — the shim then gets a half range the
+  # kernel refuses (shipped that way in v4.5.0).
+  matches "$code" '^Environment="CI_SLOT_PORT_RANGE=\$\(slot_port_range "\$idx"\)"$' || return 1
   matches "$code" 'low=\$\(\( 33000 \+ \(idx - 1\) \* span \)\)' || return 1
   # absolute path out of the shim: `exec dockerd` would re-find the shim on PATH
   # and spin forever instead of starting a daemon
@@ -267,7 +270,8 @@ mutate "slots share /tmp again"          's/^PrivateTmp=yes$/PrivateTmp=no/'    
 mutate "only the daemon gets a private /tmp" 's/^JoinsNamespaceOf=ci-dockerd@\$idx\.service$/#&/'      has_slot_tmp_isolation
 
 mutate "shim dropped off the daemon's PATH"  's|^Environment=PATH=/opt/ci/rootless-shim:|Environment=PATH=|'                    has_port_partition
-mutate "one range for every slot"            's|^Environment=CI_SLOT_PORT_RANGE=.*|Environment=CI_SLOT_PORT_RANGE=33000 60999|' has_port_partition
+mutate "one range for every slot"            's|^Environment="CI_SLOT_PORT_RANGE=.*|Environment="CI_SLOT_PORT_RANGE=33000 60999"|' has_port_partition
+mutate "range value left unquoted"           's|^Environment="CI_SLOT_PORT_RANGE=|Environment=CI_SLOT_PORT_RANGE=|'            has_port_partition
 mutate "slot index dropped from the range"   's/(idx - 1)/(0)/'                                                                 has_port_partition
 mutate "shim re-execs itself through PATH"   's|^exec /usr/bin/dockerd "\$@"$|exec dockerd "$@"|'                               has_port_partition
 

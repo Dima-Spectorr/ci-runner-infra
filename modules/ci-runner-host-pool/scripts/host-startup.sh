@@ -432,9 +432,14 @@ EOF
   # edited into the template because a later Environment=PATH wins, and the
   # shim directory must come first for `exec dockerd` inside the namespace to
   # find it.
+  # QUOTED, because the value contains a space. Unquoted, systemd reads the
+  # second number as a second assignment, drops it as "Invalid environment
+  # assignment, ignoring: 39999", and hands the shim a HALF range — which the
+  # kernel rejects, because ip_local_port_range takes two integers. Caught on
+  # the first boot by the marker readback below, having shipped as v4.5.0.
   cat >"/etc/systemd/system/ci-dockerd@$idx.service.d/20-port-range.conf" <<EOF
 [Service]
-Environment=CI_SLOT_PORT_RANGE=$(slot_port_range "$idx")
+Environment="CI_SLOT_PORT_RANGE=$(slot_port_range "$idx")"
 Environment=PATH=/opt/ci/rootless-shim:/usr/bin:/usr/sbin:/bin:/sbin
 EOF
   systemctl daemon-reload
