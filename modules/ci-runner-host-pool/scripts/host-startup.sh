@@ -487,6 +487,16 @@ slot_runtime_usable() { # <idx> <user>
     return 1
   fi
 
+  # …and again the way the UNITS see it. `ip netns exec` bind-mounts
+  # /etc/netns/$ns/resolv.conf over /etc/resolv.conf; systemd does not, so the
+  # probe above passes on a host where every service is resolving against a
+  # 127.0.0.53 stub that is unreachable in this namespace. nsenter joins the
+  # namespace WITHOUT that convenience, which is exactly the units' view.
+  if ! nsenter --net="/run/netns/$ns" getent ahostsv4 metadata.google.internal >/dev/null 2>&1; then
+    log "slot $idx: services in $ns cannot resolve — the resolv.conf bind is missing from the unit drop-ins"
+    return 1
+  fi
+
   # The fence itself, proved from where job code runs rather than asserted: the
   # token endpoint must NOT answer in the slot's namespace. A slot that can read
   # it owns the fleet (#1958), so this is fatal, not a warning.
@@ -525,9 +535,20 @@ EOF
   # This is what makes two slots' published ports independent; see
   # setup_slot_netns for why a shared netns could not be partitioned instead.
   setup_slot_netns "$idx" || { log "slot $idx: could not create network namespace"; return 1; }
+  # BindReadOnlyPaths is NOT optional decoration. `/etc/netns/<ns>/resolv.conf`
+  # is an `ip netns exec` convention — that tool bind-mounts it over
+  # /etc/resolv.conf itself. systemd's NetworkNamespacePath= only joins the
+  # namespace, so without this line the unit keeps reading the HOST's
+  # /etc/resolv.conf, which names the systemd-resolved stub at 127.0.0.53 —
+  # a loopback address that means nothing inside another namespace. Shipped
+  # that way in v5.0.0: every slot registered and then sat in
+  # "Runner connect error: Resource temporarily unavailable" (a DNS TRY_AGAIN
+  # dressed as a socket error), while an `ip netns exec … curl` from the same
+  # host resolved fine and made the fault look like anything but DNS.
   cat >"/etc/systemd/system/ci-dockerd@$idx.service.d/20-netns.conf" <<EOF
 [Service]
 NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
+BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 EOF
   systemctl daemon-reload
 
@@ -648,6 +669,8 @@ PrivateTmp=yes
 # localhost:PORT" true for the job: actions/runner publishes service containers
 # on the daemon's host ports, and those are this namespace's ports now.
 NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
+# Joining the namespace does not carry its resolver — see the daemon drop-in.
+BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 $BROKER_ENV
 ExecStart=$dir/run.sh
 # The controller drains a host by DEREGISTERING its agents through the GitHub
