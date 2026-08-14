@@ -23,6 +23,16 @@ RUNNER_HOME="/opt/actions-runner"
 SLOT_ROOT="/opt/ci/slots"
 LOG_TAG="ci-host"
 
+# Each slot runs as its OWN Linux user, `ci-s<idx>`, with its OWN rootless
+# Docker daemon. Slots used to share the `runner` account and the one system
+# daemon, which meant a job could reach /var/run/docker.sock and from there
+# enumerate the sibling slots' containers, exec into them, and read their
+# GITHUB_TOKEN and workspace — and, because the host is warm, the next jobs'
+# too. It also made $HOME shared, which raced pnpm's store install between
+# concurrent slots (DataRetrival #2339). One user per slot fixes both (#10).
+SLOT_USER_PREFIX="ci-s"
+slot_user() { printf '%s%s' "$SLOT_USER_PREFIX" "$1"; }
+
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a /var/log/ci-host.log; logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true; }
 die() { log "FATAL: $*"; exit 1; }
 
@@ -103,18 +113,28 @@ registration_token() {
 # any workflow on a fork-able branch owns the fleet (the #1958 finding on the
 # pool this replaces).
 #
-# Two rules, because a job has two ways out: directly as the `runner` uid, and
-# from inside a container it starts (containers are the job isolation boundary
-# here, so DOCKER-USER is not optional). Root is deliberately NOT fenced — this
-# script and the controller's probes need metadata.
+# Fenced per JOB UID, and there is now one per slot: `runner` (the legacy job
+# account, still fenced so nothing that runs as it can reach metadata either)
+# plus `ci-s1..ci-sN`. A rootless container's traffic leaves through
+# slirp4netns as the slot user, so the OUTPUT owner rule covers a job's
+# containers as well as the job itself; the DOCKER-USER rule stays as the guard
+# for any rootful bridge traffic that still exists. Root is deliberately NOT
+# fenced — this script and the controller's probes need metadata.
 #
 # Fails CLOSED: a host that cannot install the fence must not serve jobs.
-fence_metadata() {
-  local md_ip="169.254.169.254"
+fence_uid() { # <user>
+  local md_ip="169.254.169.254" u="$1"
+  iptables -w -C OUTPUT -d "$md_ip" -m owner --uid-owner "$u" -j REJECT 2>/dev/null \
+    || iptables -w -I OUTPUT 1 -d "$md_ip" -m owner --uid-owner "$u" -j REJECT
+}
 
-  iptables -w -C OUTPUT -d "$md_ip" -m owner --uid-owner runner -j REJECT 2>/dev/null \
-    || iptables -w -I OUTPUT 1 -d "$md_ip" -m owner --uid-owner runner -j REJECT \
-    || return 1
+fence_metadata() {
+  local md_ip="169.254.169.254" i
+
+  fence_uid runner || return 1
+  for i in $(seq 1 "$SLOTS"); do
+    fence_uid "$(slot_user "$i")" || return 1
+  done
 
   # DOCKER-USER is created by dockerd and consulted before docker's own rules.
   # Create it only as a fallback so the rule still exists if dockerd is late.
@@ -188,21 +208,104 @@ EOF
 
 # --- slots --------------------------------------------------------------------
 #
-# One agent per slot, each in its own directory with its own work folder, so K
-# jobs on this host cannot collide in the workspace. They DO share the image's
-# caches by design — that sharing is the speed-up — which is exactly why a pool
-# serves one repository only (see README.md, isolation rules).
+# One agent per slot, each as its own USER, in its own directory, with its own
+# work folder and its own container daemon, so K jobs on this host collide in
+# nothing they can observe. They DO share the image's read-only caches by design
+# — that sharing is the speed-up — which is exactly why a pool serves one
+# repository only (see README.md, isolation rules).
+
+# The Linux account and the subordinate uid/gid range its rootless daemon needs.
+# Without a subuid/subgid range `dockerd-rootless.sh` cannot create a user
+# namespace and refuses to start, which is the whole isolation.
+provision_slot_user() {
+  local idx="$1" u base
+  u=$(slot_user "$idx")
+
+  if ! id "$u" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$u" || return 1
+  fi
+  # Group `ci` is how a slot reaches the shared warm cache without reaching the
+  # other slots' homes (which stay 0750 and owned by their own user).
+  getent group ci >/dev/null || groupadd ci
+  usermod -aG ci "$u" || return 1
+
+  # useradd normally allocates these; allocate explicitly when it did not, well
+  # clear of its default 100000 base so the two schemes cannot overlap.
+  base=$((500000 + idx * 65536))
+  grep -q "^$u:" /etc/subuid || printf '%s:%d:65536\n' "$u" "$base" >>/etc/subuid
+  grep -q "^$u:" /etc/subgid || printf '%s:%d:65536\n' "$u" "$base" >>/etc/subgid
+}
+
+# One rootless dockerd per slot, as a system template unit rather than a user
+# unit: a user unit needs a logind session (or lingering) to exist at boot, and
+# `RuntimeDirectory=` gives the daemon the XDG_RUNTIME_DIR it wants without one.
+install_dockerd_unit() {
+  cat >/etc/systemd/system/ci-dockerd@.service <<'EOF'
+[Unit]
+Description=Rootless Docker daemon for CI slot %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ci-s%i
+Group=ci-s%i
+# /run/ci-s%i, owned by the slot user and mode 0700: this is where the daemon's
+# socket lives, and the mode is what stops a sibling slot from connecting to it.
+RuntimeDirectory=ci-s%i
+RuntimeDirectoryMode=0700
+Environment=HOME=/home/ci-s%i
+Environment=XDG_RUNTIME_DIR=/run/ci-s%i
+Environment=PATH=/usr/bin:/usr/sbin:/bin:/sbin
+ExecStart=/usr/bin/dockerd-rootless.sh
+# Rootless dockerd needs its own cgroup subtree to set any resource limit;
+# without delegation it still runs, but every limit a job asks for is ignored.
+Delegate=yes
+Restart=always
+RestartSec=5
+# A job container must not outlive the daemon's stop by holding systemd open.
+KillMode=mixed
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+start_slot_dockerd() {
+  local idx="$1" u i
+  u=$(slot_user "$idx")
+
+  systemctl enable --now "ci-dockerd@$idx.service" >>/var/log/ci-host.log 2>&1 || return 1
+
+  # Prove the daemon answers before the agent registers. A slot whose daemon is
+  # down still takes jobs and fails each one at the first `docker` line, which
+  # reads as a flaky repository rather than a broken host.
+  for i in $(seq 1 30); do
+    if sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" docker info >/dev/null 2>&1; then
+      log "slot $idx: rootless docker ready for $u"
+      return 0
+    fi
+    sleep 2
+  done
+  log "slot $idx: rootless docker did not come up"
+  return 1
+}
 
 install_slot() {
   local idx="$1" token="$2"
   local dir="$SLOT_ROOT/$idx"
   local name="$HOSTNAME_SHORT-s$idx"
+  local u; u=$(slot_user "$idx")
+
+  start_slot_dockerd "$idx" || return 1
 
   mkdir -p "$dir"
   # Copy, not symlink: config.sh writes .runner/.credentials into the directory
   # it runs in, and K agents must not share one identity.
   cp -a "$RUNNER_HOME/." "$dir/"
-  chown -R runner:runner "$dir"
+  chown -R "$u:$u" "$dir"
+  chmod 0750 "$dir"
 
   local group_arg=()
   [ -n "$RUNNER_GROUP" ] && group_arg=(--runnergroup "$RUNNER_GROUP")
@@ -218,7 +321,7 @@ install_slot() {
   # host lives for hours, so a self-update takes K slots down at once instead of
   # one short-lived VM. The image pins the agent version; upgrades ship by
   # rebuilding the image, which is reviewable.
-  sudo -u runner "$dir/config.sh" \
+  sudo -u "$u" "$dir/config.sh" \
     --unattended --replace --disableupdate \
     --url "https://github.com/$OWNER/$REPO" \
     --token "$token" \
@@ -233,13 +336,20 @@ install_slot() {
   cat >"/etc/systemd/system/ci-runner@$idx.service" <<EOF
 [Unit]
 Description=GitHub Actions runner slot $idx ($POOL)
-After=network-online.target docker.service
+After=network-online.target ci-dockerd@$idx.service
 Wants=network-online.target
+# The agent is useless without its daemon, and must go down with it rather than
+# accept jobs that will fail at their first container step.
+Requires=ci-dockerd@$idx.service
 
 [Service]
 Type=simple
-User=runner
+User=$u
 WorkingDirectory=$dir
+# This slot's OWN daemon. It is the only one it can reach: the sockets of the
+# other slots sit in 0700 directories owned by their own users, and the rootful
+# daemon is masked on this host.
+Environment=DOCKER_HOST=unix:///run/$u/docker.sock
 $BROKER_ENV
 ExecStart=$dir/run.sh
 # The controller drains a host by DEREGISTERING its agents through the GitHub
@@ -262,6 +372,23 @@ EOF
 main() {
   mkdir -p "$SLOT_ROOT"
   id runner >/dev/null 2>&1 || die "golden image is missing the 'runner' user"
+  [ -x /usr/bin/dockerd-rootless.sh ] || die "golden image has no rootless docker (dockerd-rootless.sh) — a host without it can only give every slot the same daemon, which is the exposure #10 removed"
+
+  # The shared rootful daemon is the thing being removed: while its socket
+  # exists, any slot that can reach it is back to full control of every other
+  # slot's containers. Masked, not stopped — a package or a job must not be able
+  # to start it again by touching the socket unit.
+  systemctl mask --now docker.service docker.socket >>/var/log/ci-host.log 2>&1 || true
+
+  local i
+  for i in $(seq 1 "$SLOTS"); do
+    provision_slot_user "$i" || die "could not provision the user for slot $i"
+  done
+  install_dockerd_unit
+  # The template must be on disk AND known to systemd before the first
+  # `systemctl enable --now ci-dockerd@1`, or that call fails on a unit systemd
+  # has not read yet.
+  systemctl daemon-reload
 
   # Before any agent exists, so no job can ever race the fence.
   fence_metadata || die "could not fence job code off the metadata server — refusing to register agents"

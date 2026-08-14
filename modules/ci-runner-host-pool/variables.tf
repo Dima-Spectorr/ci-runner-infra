@@ -55,6 +55,11 @@ variable "image" {
     The entire point of this module is that a host does not install anything at
     boot. Pointing this at a bare distro image silently reintroduces the
     per-job install cost the pool exists to remove.
+
+    Minimum v3-11-0: from that image on, every slot gets its own rootless Docker
+    daemon (README.md, isolation rules). An older image has no
+    dockerd-rootless.sh, and a host booting one now fails closed — it refuses to
+    register instead of silently returning every slot to a shared daemon.
   EOT
   type        = string
 }
@@ -71,11 +76,11 @@ variable "slots_per_host" {
     registers. Also the autoscaler's `single_instance_assignment`, so demand of
     N jobs asks for ceil(N / slots_per_host) hosts.
 
-    Above 1 this is also a TRUST decision, not only a sizing one: the slots on a
-    host share one Docker daemon, so a job that reaches the socket can read the
-    sibling slots' containers, tokens and workspaces. Set 1 for a repository
-    that runs code from outside contributors. See the isolation rules in
-    README.md.
+    Each slot is a separate Linux user with its own rootless Docker daemon, so
+    concurrent slots share no socket, no $HOME and no workspace — only the
+    read-mostly cache at /opt/ci-cache. This needs image v3-11-0 or later; on an
+    older image the host refuses to register rather than putting every slot back
+    on one daemon. See the isolation rules in README.md.
   EOT
   type        = number
   default     = 4
