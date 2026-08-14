@@ -114,6 +114,30 @@ has_slot_isolation() { # <file>
   matches "$code" 'sudo -u "\$u" "\$dir/config\.sh"'
 }
 
+# A slot whose daemon is up but cannot START a container is the failure this
+# repository shipped for a day: `docker info` answered, the boot probe passed,
+# and every job that touched a container died at its first build step. Both
+# halves are asserted, because each one alone reproduces it.
+has_container_runtime() { # <file>
+  local code
+  code=$(code_of "$1")
+  # 1. DNS. The metadata address is ALSO the VPC resolver, and a container is
+  #    handed it as its only nameserver, so a blanket per-uid REJECT takes name
+  #    resolution away from every container a job starts. Port 53 must be let
+  #    through; port 80, the token path, must not.
+  matches "$code" 'dport 53 -m owner --uid-owner "\$u" -j ACCEPT' || return 1
+  # 2. The user manager. runc asks systemd for a cgroup scope in user.slice; a
+  #    slot that never logs in has no user manager to ask unless it lingers, and
+  #    the daemon has to be pointed at that manager's bus.
+  matches "$code" 'loginctl enable-linger "\$u"' || return 1
+  matches "$code" 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus' || return 1
+  # 3. And the boot probe has to assert the capability rather than the daemon,
+  #    or the next regression of either half ships exactly as this one did.
+  matches "$code" 'slot_runtime_usable "\$idx" "\$u"[[:space:]]*\|\|[[:space:]]*return 1' || return 1
+  matches "$code" '/run/user/\$uid/bus' || return 1
+  matches "$code" 'sudo -u "\$u" getent ahostsv4'
+}
+
 # The helper carries the trap it was written to avoid, so it is tested first.
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -151,6 +175,12 @@ else
   bad "slots do not get their own user and their own container daemon — a job can reach the sibling slots' containers, tokens and workspaces (#10)"
 fi
 
+if has_container_runtime "$SCRIPT"; then
+  ok
+else
+  bad "a slot can run a daemon but not a container — DNS is fenced off, or the slot has no user manager for runc's scope, or the boot probe still only asks whether the daemon is up"
+fi
+
 # --- mutation cases: prove the checks above can actually fail -----------------
 mutate() { # <description> <sed-program> <predicate> — predicate must go false
   local desc="$1" prog="$2" pred="$3" tmp
@@ -178,6 +208,11 @@ mutate "agent starts without its daemon" 's/start_slot_dockerd "\$idx" || return
 mutate "mask failure ignored"      's/|| die "could not mask the rootful Docker daemon.*/|| true/'  has_slot_isolation
 mutate "agent survives a crashed daemon" 's/^BindsTo=ci-dockerd@/#BindsTo=ci-dockerd@/'             has_slot_isolation
 mutate "slot homes left world-readable"  's/chmod 0750 "\/home\/\$u"/chmod 0755 "\/home\/$u"/'      has_slot_isolation
+mutate "DNS fenced with the token path"  's/dport 53 -m owner/dport 80 -m owner/'                    has_container_runtime
+mutate "slot no longer lingers"          's/loginctl enable-linger/# loginctl enable-linger/'          has_container_runtime
+mutate "daemon left on the system bus"   's|DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus|DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket|' has_container_runtime
+mutate "probe back to daemon-only"       's/slot_runtime_usable "\$idx" "\$u" || return 1/: /'         has_container_runtime
+mutate "DNS probe runs as root"          's/sudo -u "\$u" getent ahostsv4/getent ahostsv4/'            has_container_runtime
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

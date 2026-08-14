@@ -123,9 +123,32 @@ registration_token() {
 #
 # Fails CLOSED: a host that cannot install the fence must not serve jobs.
 fence_uid() { # <user>
-  local md_ip="169.254.169.254" u="$1"
+  local md_ip="169.254.169.254" u="$1" proto
+
   iptables -w -C OUTPUT -d "$md_ip" -m owner --uid-owner "$u" -j REJECT 2>/dev/null \
-    || iptables -w -I OUTPUT 1 -d "$md_ip" -m owner --uid-owner "$u" -j REJECT
+    || iptables -w -I OUTPUT 1 -d "$md_ip" -m owner --uid-owner "$u" -j REJECT \
+    || return 1
+
+  # ...except DNS, which lives on the SAME address. 169.254.169.254 is both the
+  # metadata server (HTTP, port 80) and the VPC resolver (port 53), and a
+  # container gets it as its only nameserver: the daemon copies the host's
+  # UPSTREAM resolver into the container, and on GCE that upstream is the
+  # metadata address.
+  #
+  # A blanket REJECT therefore took name resolution away from every container a
+  # job starts, while leaving it intact for the job itself — the job talks to
+  # systemd-resolved on 127.0.0.53, a container cannot. The symptom is
+  # `Temporary failure in name resolution` inside the container, which reads as
+  # a broken upstream registry rather than as host policy.
+  #
+  # Port 53 is not a credential path: the metadata server serves tokens over
+  # HTTP on port 80 only, and the REJECT above still covers it. Verified on a
+  # live host — names resolve inside the container, the token endpoint times out.
+  for proto in udp tcp; do
+    iptables -w -C OUTPUT -d "$md_ip" -p "$proto" --dport 53 -m owner --uid-owner "$u" -j ACCEPT 2>/dev/null \
+      || iptables -w -I OUTPUT 1 -d "$md_ip" -p "$proto" --dport 53 -m owner --uid-owner "$u" -j ACCEPT \
+      || return 1
+  done
 }
 
 fence_metadata() {
@@ -245,6 +268,15 @@ provision_slot_user() {
   base=$((500000 + idx * 65536))
   grep -q "^$u:" /etc/subuid || printf '%s:%d:65536\n' "$u" "$base" >>/etc/subuid
   grep -q "^$u:" /etc/subgid || printf '%s:%d:65536\n' "$u" "$base" >>/etc/subgid
+
+  # The slot never logs in, so without lingering it has no user systemd manager
+  # and no user D-Bus. runc — the thing that actually creates a container — asks
+  # systemd for a scope with `Slice=user.slice`; with no user manager to ask it
+  # falls through to the SYSTEM manager, which refuses an unprivileged caller
+  # with "Interactive authentication required". Image builds keep working
+  # (buildkit needs no scope) and starting a container does not, which is how
+  # this survived a boot probe that only asked the daemon whether it was up.
+  loginctl enable-linger "$u" || return 1
 }
 
 # One rootless dockerd per slot, as a system template unit rather than a user
@@ -283,9 +315,47 @@ WantedBy=multi-user.target
 EOF
 }
 
+# `docker info` answering means the DAEMON is up. It does not mean a job can
+# start a container: both faults this function checks left `docker info`
+# perfectly healthy and surfaced one layer up, as a failing build step.
+#
+# Deliberately does not start a container. That needs an image, so it would make
+# every host boot depend on a registry — turning a registry hiccup into a fleet
+# that refuses to register. These are the two host-side preconditions instead,
+# and both are free.
+slot_runtime_usable() { # <idx> <user>
+  local idx="$1" u="$2" uid
+  uid=$(id -u "$u") || return 1
+
+  # The user manager, so runc can create its scope.
+  if [ ! -S "/run/user/$uid/bus" ]; then
+    log "slot $idx: no user D-Bus at /run/user/$uid/bus — no container could create its cgroup scope"
+    return 1
+  fi
+
+  # DNS to the address a container will be handed. Runs as the SLOT user on
+  # purpose: the fence is a per-uid rule, so root resolving fine proves nothing.
+  if ! sudo -u "$u" getent ahostsv4 metadata.google.internal >/dev/null 2>&1; then
+    log "slot $idx: $u cannot resolve through the VPC resolver — the metadata fence is blocking port 53"
+    return 1
+  fi
+}
+
 start_slot_dockerd() {
-  local idx="$1" u i
+  local idx="$1" u i uid
   u=$(slot_user "$idx")
+  uid=$(id -u "$u") || return 1
+
+  # Written per slot with the RESOLVED uid rather than with the %U specifier:
+  # the value is a path that has to exist, and a wrong-but-plausible one here
+  # fails the way the fault above failed — at a job's first container, not at
+  # boot. `dockerd-rootless.sh` passes this through to runc.
+  mkdir -p "/etc/systemd/system/ci-dockerd@$idx.service.d"
+  cat >"/etc/systemd/system/ci-dockerd@$idx.service.d/10-user-bus.conf" <<EOF
+[Service]
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus
+EOF
+  systemctl daemon-reload
 
   systemctl enable --now "ci-dockerd@$idx.service" >>/var/log/ci-host.log 2>&1 || return 1
 
@@ -294,6 +364,7 @@ start_slot_dockerd() {
   # reads as a flaky repository rather than a broken host.
   for i in $(seq 1 30); do
     if sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" docker info >/dev/null 2>&1; then
+      slot_runtime_usable "$idx" "$u" || return 1
       log "slot $idx: rootless docker ready for $u"
       return 0
     fi
