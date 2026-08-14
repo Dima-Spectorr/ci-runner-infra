@@ -270,8 +270,30 @@ statement anyway.
 
 ## Fleet status (2026-08-14)
 
-Every repository in the fleet that runs a Mergify queue has been converted, or
-has the conversion open as a draft pull request: DataRetrival (#2384, landed),
-Apigee-Portal #2329, IntegrateIT #7778, Specaria-Platform #3225, Print-Server
-#1833, CarListPrice #14, SOAP-To-REST #2036, entity-platform #269, Atlas #1945,
-Telnet-Emulation #710, mot-face-blur #56.
+Every repository in the fleet that runs a Mergify queue has been converted.
+Landed: DataRetrival #2384, IntegrateIT #7778, Specaria-Platform #3225,
+Print-Server #1833, CarListPrice #14, SOAP-To-REST #2036, mot-face-blur #56,
+Telnet-Emulation #710, entity-platform #269. Open: Apigee-Portal #2329,
+Atlas #1945.
+
+The gate itself keeps moving, and a copy that stopped moving with it is the
+failure this whole document is about — a file that looks enforced. The version
+in this repository is canonical; the repositories that took an earlier copy are
+being resynced by a one-file pull request each (IntegrateIT #7814, Print-Server
+#1855, Specaria-Platform #3244, mot-face-blur #61, CarListPrice #16,
+SOAP-To-REST #2052).
+
+Two findings that came out of the conversion and are NOT fixed by it, tracked
+separately because they are properties of a repository's ruleset rather than of
+`.mergify.yml`:
+
+- **A required context with no producer** — Telnet-Emulation's ruleset requires
+  `generic-binary`, which no workflow in that repository emits, so every pull
+  request sits `BLOCKED` waiting for a conclusion that cannot arrive while
+  `gh pr checks` shows nothing failing. Filed as Telnet-Emulation #712. The
+  routine workaround is an admin bypass, which skips the gates that DO exist.
+- **A repository with no ruleset at all** — this one, until 2026-08-14. The
+  repository that publishes the fleet's CI rules was the one repository where
+  `main` took any push. Now `main-guardrails`: squash-only, linear history, no
+  deletion, no force-push, and the three CI contexts required, with
+  `strict_required_status_checks_policy` OFF so the queue can check in place.
