@@ -152,7 +152,12 @@ lane model, which reports `success` when its area was untouched. A check that
 
 `scripts/ci/check-merge-queue-single-step.sh` (published here; copy it in, same
 filename, so a diff against this copy is a one-liner) asserts all five
-properties plus the queue-action ban. Two rules about where it runs:
+properties plus the queue-action ban. A repository that already asserts them in
+its own suite keeps that instead of carrying both — DataRetrival does, in
+`Modernization/scripts/ci-gates.test.mjs` (tightened in its #2387 to node
+identity, non-empty `auto_merge_conditions`, and a base the queue rules admit).
+What is not optional is that something asserts them somewhere the required check
+reaches. Two rules about where it runs:
 
 - **An always-on job.** A `.mergify.yml` regression touches no service, so a
   path-filtered or draft-gated job never sees the change the gate exists to
