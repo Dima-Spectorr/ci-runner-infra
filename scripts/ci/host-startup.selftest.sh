@@ -197,6 +197,15 @@ has_port_isolation() { # <file>
   matches "$code" '^Environment=CI_BROKER_HOST=0\.0\.0\.0$' || return 1
   matches "$code" 'INPUT 1 -i "\$ifc" -p tcp --dport "\$BROKER_PORT" -j REJECT' || return 1
   matches "$code" 'GCE_METADATA_HOST=%s:%s' || return 1
+  # BOTH units must carry the resolver bind: joining a namespace does not bring
+  # /etc/netns/<ns>/resolv.conf with it — that is `ip netns exec`'s doing, not
+  # systemd's — and without it every service resolves against a 127.0.0.53 stub
+  # that does not exist in the namespace (the v5.0.0 fault: registered agents
+  # that never connected). Two occurrences: the daemon drop-in and the agent unit.
+  [ "$(printf '%s\n' "$code" | grep -c '^BindReadOnlyPaths=/etc/netns/\$(slot_netns "\$idx")/resolv\.conf:/etc/resolv\.conf$')" -ge 2 ] || return 1
+  # and the boot probe must check DNS the way a UNIT sees it, not the way
+  # `ip netns exec` does — the latter passes on exactly the broken host
+  matches "$code" 'nsenter --net="/run/netns/\$ns" getent ahostsv4' || return 1
   # and the boot probe reads back where the daemon actually landed
   matches "$code" 'readlink "/proc/\$dpid/ns/net"'
 }
@@ -298,6 +307,8 @@ mutate "veth rule inserted above the fence"  's|-A FORWARD -i "$veth" -j ACCEPT|
 mutate "broker left on host loopback only"   's|^Environment=CI_BROKER_HOST=0.0.0.0$|Environment=CI_BROKER_HOST=127.0.0.1|'     has_port_isolation
 mutate "broker port left open on the NIC"    's|INPUT 1 -i "$ifc" -p tcp --dport "$BROKER_PORT" -j REJECT|INPUT 1 -i "$ifc" -p tcp --dport 9 -j ACCEPT|' has_port_isolation
 mutate "boot probe stops checking the netns" 's|readlink "/proc/$dpid/ns/net"|readlink "/proc/self/ns/net"|'                    has_port_isolation
+mutate "resolver bind dropped from a unit"   '0,\|^BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf$|s|||' has_port_isolation
+mutate "unit-view DNS probe removed"         's|nsenter --net="/run/netns/$ns" getent ahostsv4|ip netns exec "$ns" getent ahostsv4|'      has_port_isolation
 mutate "namespaced DNS exception dropped"    's|-d "$md_ip" -p "$proto" --dport 53 -j ACCEPT|-d "$md_ip" -p "$proto" --dport 9 -j ACCEPT|' has_port_isolation
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

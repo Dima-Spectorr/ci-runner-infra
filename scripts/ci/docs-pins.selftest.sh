@@ -49,7 +49,11 @@ fi
 
 # Markdown only. The consumer roots that legitimately pin an older version live
 # in other repositories; this repo documents one version — its own.
-mapfile -t docs < <(find "$ROOT" -name '*.md' -not -path '*/.git/*' | sort)
+# TRACKED markdown only, not everything on disk. `find` also walked nested
+# checkouts that happen to live under the tree — a sibling worktree in
+# .claude/worktrees/ pinning an old version failed this gate for content this
+# repo does not ship and cannot fix from here.
+mapfile -t docs < <(cd "$ROOT" && git ls-files -z -- '*.md' | tr '\0' '\n' | sed "s|^|$ROOT/|" | sort)
 [ "${#docs[@]}" -gt 0 ] || { bad "no Markdown files found — the glob is wrong"; echo "  docs pins UNVERIFIABLE."; exit 1; }
 
 found=0
