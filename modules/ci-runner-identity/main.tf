@@ -34,6 +34,35 @@ resource "google_service_account" "runner" {
   description  = "Identity for CI runner hosts and the pool controller. Anything this account can reach, a CI job can reach."
 }
 
+# The CONTROLLER's identity, separate from the hosts'.
+#
+# The controller is the only thing that deletes a host — that is the entire
+# scale-in mechanism, since no autoscaler is allowed to pick a victim — and
+# deletion needs roles/compute.instanceAdmin.v1. While one account served both
+# roles, that grant sat on the account attached to every host VM, i.e. on
+# machines whose whole purpose is to execute pull-request code. Job code that
+# got out of the container fence could delete the pool it was running on,
+# including the hosts carrying other repositories' jobs, or create new
+# instances with the host identity attached. `ci-runner-host-pool`'s own
+# `service_account_email` description already forbade exactly this.
+#
+# The controller runs no build input, so instance-admin is bounded there.
+resource "google_service_account" "controller" {
+  count = var.create_controller_service_account ? 1 : 0
+
+  project = var.project_id
+  # 30-character cap on an account id, and `-ctl` costs four. Truncate the same
+  # way the job account does so a long pool name (ci-runner-host-dataretrival)
+  # fails at neither plan time nor apply.
+  account_id   = "${substr(var.account_id, 0, min(26, length(var.account_id)))}-ctl"
+  display_name = "CI pool controller (${var.name})"
+  description  = "Identity for the pool CONTROLLER only. Holds instance-admin so it can delete hosts; must never be attached to a host, which runs build input."
+}
+
+locals {
+  controller_email = var.create_controller_service_account ? google_service_account.controller[0].email : google_service_account.runner.email
+}
+
 resource "google_secret_manager_secret" "app_key" {
   project   = var.project_id
   secret_id = var.app_key_secret_id
@@ -54,7 +83,12 @@ resource "google_secret_manager_secret" "app_key" {
   }
 }
 
-# Only this pool's identity may read the App key.
+# Only this pool's identities may read the App key. The host and controller
+# grants are separate resources rather than one `for_each` keyed by email:
+# for_each would re-key the host's existing bindings from
+# `google_project_iam_member.metrics` to `…metrics["<email>"]`, and a computed
+# email cannot appear in a `moved` block, so every live pool would destroy and
+# recreate working IAM on its next apply for no behavioural gain.
 resource "google_secret_manager_secret_iam_member" "runner_reads_key" {
   project   = var.project_id
   secret_id = google_secret_manager_secret.app_key.secret_id
@@ -62,12 +96,32 @@ resource "google_secret_manager_secret_iam_member" "runner_reads_key" {
   member    = "serviceAccount:${google_service_account.runner.email}"
 }
 
+# The controller reads the key to mint an installation token for the queue
+# poll; a host reads it for its slots' registration tokens.
+resource "google_secret_manager_secret_iam_member" "controller_reads_key" {
+  count = var.create_controller_service_account ? 1 : 0
+
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.app_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.controller[0].email}"
+}
+
 # Publishing the demand metric is what makes the pool scale out at all, and
-# publishing the telemetry series is what makes it observable.
+# publishing the telemetry series is what makes it observable. The controller
+# publishes demand, each host publishes its own series, so both need this.
 resource "google_project_iam_member" "metrics" {
   project = var.project_id
   role    = "roles/monitoring.metricWriter"
   member  = "serviceAccount:${google_service_account.runner.email}"
+}
+
+resource "google_project_iam_member" "controller_metrics" {
+  count = var.create_controller_service_account ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.controller[0].email}"
 }
 
 resource "google_project_iam_member" "logs" {
@@ -76,8 +130,21 @@ resource "google_project_iam_member" "logs" {
   member  = "serviceAccount:${google_service_account.runner.email}"
 }
 
+resource "google_project_iam_member" "controller_logs" {
+  count = var.create_controller_service_account ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.controller[0].email}"
+}
+
 # The controller deletes hosts; that is the entire scale-in mechanism, since no
 # autoscaler is permitted to choose a victim.
+#
+# This lands on the CONTROLLER account, never the hosts' — see the comment on
+# google_service_account.controller. When the split is disabled the two
+# collapse and the grant is back on the host account, which is why disabling it
+# is documented as a migration step and not a supported end state.
 #
 # roles/compute.instanceAdmin.v1 is broader than "delete instances in one MIG"
 # — GCP has no predefined role that narrow. Where it matters, replace this with
@@ -87,7 +154,7 @@ resource "google_project_iam_member" "compute" {
   count   = var.grant_compute_admin ? 1 : 0
   project = var.project_id
   role    = "roles/compute.instanceAdmin.v1"
-  member  = "serviceAccount:${google_service_account.runner.email}"
+  member  = "serviceAccount:${local.controller_email}"
 }
 
 # Deliberately NOT granted here: storage, artifact registry, deploy, or any

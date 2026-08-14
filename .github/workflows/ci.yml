@@ -71,6 +71,13 @@ jobs:
       # discovered in the fourteen repositories that consume it.
       - name: lane-decision self-test
         run: bash scripts/ci/lane-decision.selftest.sh
+      # The real guard is a variable `validation`, but terraform evaluates
+      # module-input validation only at PLAN time — `terraform validate` below
+      # passes a root that shares one account between hosts and controller. So
+      # the properties that make the plan-time guard reachable are asserted
+      # statically here instead.
+      - name: identity split self-test
+        run: bash scripts/ci/identity-split.selftest.sh
 
   terraform:
     name: Terraform (fmt + validate)

@@ -105,6 +105,16 @@ still inside its warm window.
 * **The host service account is a job's service account.** Anything it can
   reach, a build can reach. Grant only: read the App key secret, write metrics,
   write logs.
+* **The controller has its own identity, and it is not the hosts'.** Scale-in
+  is the controller deleting hosts, which needs
+  `roles/compute.instanceAdmin.v1`; on a shared account that role rides every
+  host VM, so job code out of the container fence could delete the pool it runs
+  on — other repositories' in-flight jobs included — or create instances with
+  the host identity attached. `ci-runner-identity` creates `<account_id>-ctl`
+  and puts the grant there; `ci-runner-host-pool` REQUIRES
+  `controller_service_account_email` and rejects a value equal to
+  `service_account_email`. It used to default to "reuse the host account", and
+  every consumer took that default, so it is no longer a default at all.
 * **A warm cache is untrusted build input.** A poisoned cache entry survives to
   the next job, which the old destroy-per-job model made impossible. Caches are
   scoped per repository and rebuilt with the image.
