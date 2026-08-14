@@ -88,7 +88,7 @@ else
   echo "channel exists: $channel"
 fi
 
-# ── the five policies ─────────────────────────────────────────────────────────
+# ── the six policies ─────────────────────────────────────────────────────────
 # `duration` is what stops each of these paging on a blip. Every threshold below
 # is deliberately longer than one controller tick.
 policy_json() {  # <key> -> a full alertPolicy body on stdout
@@ -153,6 +153,18 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    slowtick) cat <<EOF
+{ "displayName": "CI runners / tick approaching the watchdog threshold",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "A controller tick is taking longer than half the watchdog threshold (300s at the default poll). This is the precursor to a total blackout, not a slowdown: once a tick outlasts the threshold the watchdog restarts the controller mid-tick, the restart prevents the heartbeat that would have stopped it, and every series — heartbeat included — goes absent while systemd still reports active (running). Two pools in this fleet ran that way for hours on 2026-08-14. Demand costs one API call per active workflow run, so the usual cause is a busier repository; lower demand_budget_seconds or raise poll_interval_seconds. Check ci_demand_runs_skipped." },
+  "conditions": [ { "displayName": "ci_tick_seconds > 150 for 10m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 150.0, "duration": "600s",
+      "filter": "metric.type=\"custom.googleapis.com/github/ci_tick_seconds\" AND resource.type=\"generic_node\"",
+      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
   esac
 }
 
@@ -210,10 +222,11 @@ ensure_descriptor ci_runner_list_blind_ticks "Consecutive ticks the controller c
 ensure_descriptor ci_host_idle_seconds_max   "Longest idle time across warm hosts."
 ensure_descriptor ci_queue_wait_seconds_max  "Longest time a queued job has waited for a slot."
 ensure_descriptor ci_drain_verdicts          "Drain-loop outcomes, labelled by outcome."
+ensure_descriptor ci_tick_seconds            "Controller tick duration. Approaching the watchdog threshold means an imminent restart loop in which nothing is published at all."
 
 existing="$(g alpha monitoring policies list --format='value(displayName,name)' 2>/dev/null || true)"
 
-for key in heartbeat blind idle queue drain; do
+for key in heartbeat blind idle queue drain slowtick; do
   policy_json "$key" >"$tmp/p.json"
   name="$(sed -n 's/.*"displayName": "\(CI runners \/ [^"]*\)".*/\1/p' "$tmp/p.json" | head -1)"
   id="$(printf '%s\n' "$existing" | awk -F'\t' -v n="$name" '$1==n {print $2}' | head -1)"

@@ -54,6 +54,13 @@ jobs:
       - name: orphan-decision self-test
         run: bash scripts/ci/orphan-decision.selftest.sh
 
+      # A wrong verdict here does not degrade the pool, it silences it: the
+      # watchdog restart kills the tick before its metrics flush, so a
+      # mis-restarted controller publishes nothing at all while systemd reports
+      # `active (running)`. Two of seven pools ran that way on 2026-08-14.
+      - name: watchdog-decision self-test
+        run: bash scripts/ci/watchdog-decision.selftest.sh
+
       - name: demand-match self-test
         run: bash scripts/ci/demand-match.selftest.sh
 

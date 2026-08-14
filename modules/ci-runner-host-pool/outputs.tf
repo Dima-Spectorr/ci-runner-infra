@@ -67,6 +67,16 @@ output "metric_names" {
       # runner list, so no host can be proven idle. Alert on a sustained run
       # (> 3 ticks), never on a single blip: one blind tick is normal API noise.
       "ci_runner_list_blind_ticks",
+      # Tick duration. A tick approaching the watchdog threshold is a controller
+      # about to be restarted mid-tick forever — and because every series is
+      # queued during the tick and flushed at its end, the only other symptom is
+      # ALL of them going absent at once, which reads identically to a project
+      # that has no pool. Alert well below the threshold, not at it.
+      "ci_tick_seconds",
+      # Runs the demand sweep ran out of budget for. > 0 means ci_demand is a
+      # lower bound, so an apparently under-scaled pool may simply not have been
+      # counted.
+      "ci_demand_runs_skipped",
     ] : m => "${var.metric_prefix}/${m}"
   }
 }
