@@ -1,0 +1,80 @@
+# The merge queue for this repository — the baseline it publishes, applied here.
+#
+# docs/ci-merge-queue-baseline.md is the fleet's copy-in configuration, and this
+# repository had none of it: no queue, no auto-merge, no branch protection. Its
+# pull requests were merged by hand. That is the shape the baseline exists to
+# remove, and shipping it from a repository that does not run it is how a
+# baseline stops being true.
+#
+# Mergify was installed and idle here, which reads as a configured queue
+# declining to act and was in fact no queue at all: `Mergify Merge Protections`
+# reported `neutral` with "No merge protections matched" on every pull request,
+# and nothing about that says "nothing will ever queue this".
+
+# ONE CI RUN PER PULL REQUEST.
+#
+# Mergify re-checks a queued pull request IN PLACE — on its own branch, reusing
+# the run that already happened — only when the queue is serial (this key),
+# unbatched, free of check retries, and the CI is SINGLE-STEP, which its schema
+# defines as `merge_conditions` being empty or IDENTICAL to `queue_conditions`.
+# Anything else is validated on a throwaway draft pushed to
+# `mergify/merge-queue/<sha>`, where every `pull_request` workflow runs a second
+# time for every pull request that merges.
+#
+# This key is TOP-LEVEL. Inside a queue rule Mergify rejects the whole file
+# (`Extra inputs are not permitted`) and the queue then fails CLOSED: every pull
+# request sits unmergeable behind a red check whose reason is a configuration
+# error rather than anything about the branch.
+merge_queue:
+  max_parallel_checks: 1
+
+queue_rules:
+  - name: default
+    merge_method: squash
+
+    # ONE CONDITION LIST, ANCHORED AND REUSED — read before splitting it.
+    #
+    # `merge_conditions` below is this same YAML node, not a second list that
+    # happens to agree with it. Two lists that match today drift the next time a
+    # check is added to one of them, and the drift is silent: the queue keeps
+    # merging, each pull request merely pays a second full CI run.
+    queue_conditions: &gate
+      - base = main
+      - -draft
+      - -conflict
+      # The three CI jobs, named individually because this repository has no
+      # aggregate job to name instead. All three run on every pull request with
+      # no path filter and no draft gate, so none of them can skip and leave the
+      # queue waiting for a conclusion that never comes.
+      - check-success = "Shell (syntax + drain rule)"
+      - check-success = "Terraform (fmt + validate)"
+      - check-success = "Genericity (no customer or repo literals)"
+
+    merge_conditions: *gate
+
+    batch_size: 1
+
+    # Pinned. Unset, it inherits an undeclared vendor default of roughly 42
+    # minutes, so a hung job surfaces as a silent dequeue rather than a red
+    # check. Every job here is `ubuntu-latest` shell and terraform validate,
+    # well inside this.
+    checks_timeout: 30 min
+
+# WHAT PUTS A PULL REQUEST INTO THE QUEUE.
+#
+# Not a `pull_request_rules` queue action: that action's `conditions:` are a
+# third list, different by construction since it has to carry `base`/`-draft`
+# itself, and a third list is the two-step shape described above.
+#
+# `auto_merge_conditions` is the supported replacement — it supersedes the
+# deprecated `queue_rules[].autoqueue`. It carries the base/draft facts only;
+# the checks live once, in the anchored list, which is what decides when a
+# queued pull request embarks. An empty list here would match nothing, and a
+# `base` no queue rule admits would queue into a rule that cannot take it —
+# both leave pull requests green and unmerged with no red check to say why.
+merge_protections_settings:
+  reporting_method: check-runs
+  auto_merge_conditions:
+    - base = main
+    - -draft
+    - -conflict
