@@ -96,6 +96,14 @@ jobs:
       - name: installer-activation self-test
         run: bash scripts/ci/installer-activation.selftest.sh
 
+      # This repository runs no Mergify queue, so there is no `.mergify.yml`
+      # here to scan — only the rule itself, which fourteen repositories copy
+      # in. A config gate's characteristic failure is a vacuous pass, so the
+      # fixtures are what is asserted: 13 of them, each detector on its own
+      # count.
+      - name: merge-queue single-step gate self-test
+        run: bash scripts/ci/check-merge-queue-single-step.sh --selftest
+
       # The README quickstart pinned v3.0.0 while the fleet ran v4.1.0 — the one
       # copy-pasteable line in the repo, three minor versions stale, because
       # nothing connected Markdown to a git tag. VERSION is that connection.
