@@ -122,7 +122,6 @@ fi
 
 GH_TOKEN=""
 GH_TOKEN_EXPIRY=0
-GH_HTTP_STATUS=""
 RUNNER_LIST_STATUS="ok"
 # Consecutive ticks that could not read the runner list. Reset on the first
 # successful read, published every tick. In-memory on purpose: a controller
@@ -164,7 +163,9 @@ gh_token() {
   printf '%s' "$GH_TOKEN"
 }
 
-# Body on stdout, and the reason on GH_HTTP_STATUS when there is no body. With
+# Body on stdout, and the reason in $STATE_DIR/api.status when there is no body.
+# A FILE, not a variable: callers assign the body with `X=$(gh_api …)`, so every
+# variable this function sets lives and dies in that subshell. With
 # `-f` the only thing a caller could learn from a failure was that it happened:
 # a rate limit, a revoked installation, and a firewall dropping egress all
 # produced the same empty string, and the drain path treats all three the same
@@ -176,12 +177,11 @@ gh_token() {
 # reaches them.
 gh_api() {
   local tok status
-  tok=$(gh_token) || { GH_HTTP_STATUS="no-token"; printf 'no-token' >"$STATE_DIR/api.status"; return 1; }
+  tok=$(gh_token) || { printf 'no-token' >"$STATE_DIR/api.status"; return 1; }
   status=$(curl "${CURL_TIMEOUTS[@]}" -sS -o "$STATE_DIR/api.body" -w '%{http_code}' \
     -H "Authorization: Bearer $tok" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/$1" 2>>"$LOG") || status="000"
-  GH_HTTP_STATUS="$status"
   printf '%s' "$status" >"$STATE_DIR/api.status"
   case "$status" in
     2*) cat "$STATE_DIR/api.body"; return 0 ;;
@@ -318,9 +318,9 @@ collect_demand() {
 collect_runners() {
   # One page of 100 covers max_hosts * slots for every pool in this fleet;
   # paginate rather than silently truncate if that stops being true.
-  # The status is read back from disk, not from GH_HTTP_STATUS: this call runs
-  # in a command substitution, so every assignment gh_api makes happens in a
-  # subshell and is gone by the time this line runs. That is why 36 consecutive
+  # The status is read back from disk because this call runs in a command
+  # substitution: an assignment gh_api made would happen in a subshell and be
+  # gone by the time this line runs. That is why 36 consecutive
   # blind ticks were logged as `status=` — the one field that says WHY the pool
   # stopped draining was the one field the subshell ate.
   RUNNERS_JSON=$(gh_api "repos/$REPO_FULL/actions/runners?per_page=100") || {

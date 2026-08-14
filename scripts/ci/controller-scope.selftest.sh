@@ -120,12 +120,15 @@ PY
 )"
 
 # ── the field that made the outage unreadable ────────────────────────────────
-# `X=$(gh_api …)` runs gh_api in a subshell, so GH_HTTP_STATUS never reaches the
-# caller: the blind-tick log line printed `status=` for 36 ticks straight.
+# `X=$(gh_api …)` runs gh_api in a subshell, so a status kept in a variable never
+# reaches the caller: the blind-tick log line printed `status=` for 36 ticks
+# straight. It goes through a file for exactly that reason.
+# shellcheck disable=SC2016
 grep -q 'printf .%s. "$status" >"$STATE_DIR/api.status"' "$CTRL" \
   && r=yes || r=no
 check "gh_api persists its status past the subshell" yes "$r"
 
+# shellcheck disable=SC2016
 grep -q 'RUNNER_LIST_STATUS="$(cat "$STATE_DIR/api.status"' "$CTRL" \
   && r=yes || r=no
 check "collect_runners reads the persisted status" yes "$r"
