@@ -50,9 +50,14 @@ code_of() { grep -vE '^[[:space:]]*#' "$1"; }
 # --disableupdate must sit in config.sh's own argument list. The list is
 # continued across lines with backslashes, so the run is joined first.
 has_disableupdate() { # <file>
-  code_of "$1" \
-    | sed ':a;/\\$/{N;s/\\\n//;ba}' \
-    | grep -qE 'config\.sh([^|;&]|\\)*--disableupdate'
+  local joined
+  # Buffered, not piped straight into grep: `grep -q` exits at the first match
+  # and closes the pipe, `sed` then dies of SIGPIPE, and `set -o pipefail` turns
+  # that into a FAILED predicate — so the check reported "--disableupdate is
+  # missing" precisely when it was present EARLY in the file. Where the match
+  # falls in the script is not supposed to change the answer.
+  joined=$(code_of "$1" | sed ':a;/\\$/{N;s/\\\n//;ba}')
+  printf '%s' "$joined" | grep -qE 'config\.sh([^|;&]|\\)*--disableupdate'
 }
 
 has_metadata_fence() { # <file>
