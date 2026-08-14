@@ -131,15 +131,27 @@ token, and register nothing.
 ## 4. Apply, and read the plan
 
 ```bash
-terraform init -input=false
-terraform plan -input=false -out=tf.plan   # read it
-terraform apply tf.plan
+terraform init -input=false                 # add -backend-config below if partial
+scripts/ci/tf-apply-guard.sh <runner-root-dir>
 ```
 
-**Never `apply -auto-approve` on a plan nobody read.** A stale checkout plus
-`-auto-approve` is exactly how this fleet once destroyed a working pool and
-rebuilt the retired one. Applying a saved plan file also guarantees you apply
-what you read.
+The guard plans, shows you the plan, refuses the two ways this has actually gone
+wrong, and only then applies **that** plan file:
+
+| refusal | meaning | override |
+|---|---|---|
+| `dirty` | uncommitted changes in the root | commit them |
+| `stale` | HEAD is not `origin/HEAD` | fix the checkout; `TF_GUARD_ALLOW_UNMERGED=1` only to test a branch |
+| `refuse-protected` | the plan destroys a service account or the App-key secret | none — delete the module block on the default branch, in a PR |
+| `refuse-destroy` | the plan destroys N other resources | `TF_GUARD_CONFIRM_DESTROY=N` after reading all N |
+
+**Never `apply -auto-approve` on a plan nobody read.** On 2026-08-14 a `git pull`
+failed inside a loop, the loop continued, and `terraform apply -auto-approve` ran
+against a months-old commit: 35 resources destroyed, including the Secret Manager
+secret holding the GitHub App key. The tree was *clean* — clean is not current.
+`prevent_destroy` was live on that secret and did nothing, because a configuration
+that has no module block has no lifecycle guard either. That is why the check sits
+in a wrapper above Terraform rather than inside the module.
 
 Some roots use a **partial backend** (`backend.tf` omits `bucket`); those need
 `-backend-config=bucket=<state-bucket>` on `init`. Without it, `init` fails with
