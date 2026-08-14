@@ -279,10 +279,72 @@ provision_slot_user() {
   loginctl enable-linger "$u" || return 1
 }
 
+# A `dockerd` that partitions the slot's ephemeral port range before exec'ing the
+# real one — installed FIRST on the daemon's PATH, which is the only hook there
+# is for this.
+#
+# THE FAULT (IntegrateIT #7749, reproduced on consecutive runs):
+#   Error response from daemon: failed to set up container networking: driver
+#   failed programming external connectivity ... error while calling RootlessKit
+#   PortManager.AddPort(): listen tcp4 0.0.0.0:32768: bind: address already in use
+#
+# A service container with an unspecified host port (`ports: - 5432`, which is
+# what actions/runner emits for every `services:` block) makes the daemon pick
+# one from /proc/sys/net/ipv4/ip_local_port_range, and RootlessKit then binds
+# THAT NUMBER in the host netns so the job can reach it on localhost. Each slot
+# has its own daemon and its own netns, so each one reads the same default range
+# and picks the same first free port — and the parent bind they all end up
+# making is in the ONE shared host netns. Two slots starting a service container
+# at the same time is not a race that is unlikely to be lost; both start at
+# 32768, so it is close to guaranteed, which is why four shards failed together.
+#
+# Giving each slot a disjoint slice of the range makes the numbers disjoint, so
+# the parent binds cannot collide. The write has to happen INSIDE the slot's
+# network namespace (ip_local_port_range is per-netns), and the only process
+# that runs there is the daemon itself: `dockerd-rootless.sh` re-execs itself
+# under rootlesskit and the child branch ends in `exec dockerd "$@"`, resolved
+# through PATH. Hence a shim rather than an ExecStartPre, which would run in the
+# host namespace and repartition the HOST.
+install_dockerd_shim() {
+  mkdir -p /opt/ci/rootless-shim
+  cat >/opt/ci/rootless-shim/dockerd <<'EOF'
+#!/bin/sh
+# Runs inside the slot's user+network namespace, as root there.
+# CI_SLOT_PORT_RANGE is set per slot by ci-dockerd@<idx>.service.d.
+if [ -n "${CI_SLOT_PORT_RANGE:-}" ]; then
+  if echo "$CI_SLOT_PORT_RANGE" >/proc/sys/net/ipv4/ip_local_port_range 2>/dev/null; then
+    printf 'applied %s\n' "$CI_SLOT_PORT_RANGE" >"${XDG_RUNTIME_DIR:-/tmp}/port-range"
+  else
+    # Loud, not fatal: a daemon that starts with the default range still serves
+    # jobs and only risks the collision above, whereas refusing to start would
+    # take the slot out entirely. start_slot_dockerd reads this marker and logs.
+    printf 'FAILED %s\n' "$CI_SLOT_PORT_RANGE" >"${XDG_RUNTIME_DIR:-/tmp}/port-range"
+    echo "ci-slot: could not set ip_local_port_range=$CI_SLOT_PORT_RANGE — published ports may collide with a sibling slot" >&2
+  fi
+fi
+exec /usr/bin/dockerd "$@"
+EOF
+  chmod 0755 /opt/ci/rootless-shim/dockerd
+}
+
+# The slice of 33000-60999 belonging to slot <idx>, as `<low> <high>`.
+# 33000 and not the kernel's 32768: the host's own netns keeps the default
+# range, and starting above it keeps a slot's published ports clear of ports the
+# host picked for its own outbound sockets.
+slot_port_range() { # <idx>
+  local idx="$1" low high span
+  span=$(( (60999 - 33000 + 1) / SLOTS ))
+  low=$(( 33000 + (idx - 1) * span ))
+  high=$(( low + span - 1 ))
+  printf '%d %d' "$low" "$high"
+}
+
 # One rootless dockerd per slot, as a system template unit rather than a user
 # unit: a user unit needs a logind session (or lingering) to exist at boot, and
 # `RuntimeDirectory=` gives the daemon the XDG_RUNTIME_DIR it wants without one.
 install_dockerd_unit() {
+  install_dockerd_shim
+
   cat >/etc/systemd/system/ci-dockerd@.service <<'EOF'
 [Unit]
 Description=Rootless Docker daemon for CI slot %i
@@ -364,6 +426,17 @@ start_slot_dockerd() {
 [Service]
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus
 EOF
+
+  # This slot's private slice of the ephemeral range, plus the PATH that puts
+  # the shim ahead of the real dockerd. PATH is re-declared here rather than
+  # edited into the template because a later Environment=PATH wins, and the
+  # shim directory must come first for `exec dockerd` inside the namespace to
+  # find it.
+  cat >"/etc/systemd/system/ci-dockerd@$idx.service.d/20-port-range.conf" <<EOF
+[Service]
+Environment=CI_SLOT_PORT_RANGE=$(slot_port_range "$idx")
+Environment=PATH=/opt/ci/rootless-shim:/usr/bin:/usr/sbin:/bin:/sbin
+EOF
   systemctl daemon-reload
 
   systemctl enable --now "ci-dockerd@$idx.service" >>/var/log/ci-host.log 2>&1 || return 1
@@ -374,6 +447,14 @@ EOF
   for i in $(seq 1 30); do
     if sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" docker info >/dev/null 2>&1; then
       slot_runtime_usable "$idx" "$u" || return 1
+      # The shim's verdict, read back rather than assumed: if the sysctl write
+      # was refused the daemon still came up healthy here and would only fail
+      # later, at some job's service container, as "address already in use" —
+      # the exact fault this partition exists to remove.
+      case "$(cat "/run/$u/port-range" 2>/dev/null)" in
+        applied*) log "slot $idx: published-port range $(slot_port_range "$idx")" ;;
+        *)        log "slot $idx: WARNING ip_local_port_range not partitioned — published ports may collide with a sibling slot" ;;
+      esac
       log "slot $idx: rootless docker ready for $u"
       return 0
     fi
