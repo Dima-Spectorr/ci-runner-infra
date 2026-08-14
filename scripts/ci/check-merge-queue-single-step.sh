@@ -188,7 +188,19 @@ def scalar(value):
     return str(value).replace("\t", " ").replace("\n", " ")
 
 
-def walk(node, path):
+# A path is only an address if one address means one node. `.` and `[` are this
+# encoding's separators, so a key that CONTAINS one collides with a real nesting:
+# a top-level key literally named `merge_queue.max_parallel_checks` emits the
+# record a nested `merge_queue: {max_parallel_checks: 1}` would, and the gate
+# then certifies a document in which the required mapping is absent — Mergify
+# sees an unknown top-level key and refuses the file. Rejected rather than
+# escaped: no legal Mergify key contains either character, so the honest verdict
+# is that the document is not addressable.
+BAD_KEY_CHARS = (".", "[", "]")
+bad_keys = []
+
+
+def walk(node, path, seen):
     if isinstance(node, dict):
         items = node.items()
     elif isinstance(node, list):
@@ -196,14 +208,30 @@ def walk(node, path):
     else:
         return
     for key, value in items:
-        child = "%s[%d]" % (path, key) if isinstance(node, list) else (
-            "%s.%s" % (path, key) if path else str(key)
-        )
+        if isinstance(node, dict):
+            text = str(key)
+            if any(c in text for c in BAD_KEY_CHARS):
+                bad_keys.append(text)
+                continue
+            child = "%s.%s" % (path, text) if path else text
+        else:
+            child = "%s[%d]" % (path, key)
         print("%s\t%s\t%s" % (child, scalar(value), kind(value)))
-        walk(value, child)
+        # A recursive alias (`loop: &loop [*loop]`) is legal YAML and loads into
+        # an object that contains itself. Walked naively this raises deep in the
+        # traversal, AFTER the required records have been printed — a traceback
+        # beside a full path stream, which reads as a usable document.
+        if isinstance(value, (dict, list)):
+            if id(value) in seen:
+                bad_keys.append("%s (cycle)" % child)
+                continue
+            walk(value, child, seen | {id(value)})
 
 
-walk(doc, "")
+walk(doc, "", {id(doc)})
+
+for key in bad_keys:
+    print("#BADKEY\t%s" % key)
 
 rules = doc.get("queue_rules") if isinstance(doc, dict) else None
 # Which rule each condition list belongs to. Identity between a rule's OWN two
@@ -251,10 +279,22 @@ scan_file() {
     err CHECK0 "no YAML parser available (python3 with PyYAML, which the runner image is expected to carry — this gate deliberately installs nothing). Without one it cannot tell a config Mergify loads from one it refuses, and reporting PASS on that basis is the vacuous pass this gate exists to prevent. Install python3 + PyYAML on the runner."
     return
   fi
-  doc="$(read_yaml "$f")"
+  # The STATUS, not just the output. A reader that dies partway still leaves the
+  # records it managed to print, and every check below then reads a document it
+  # never finished loading — the vacuous pass again, this time with a traceback
+  # printed above the PASS line where nothing is looking.
+  if ! doc="$(read_yaml "$f")"; then
+    err CHECK0 "the YAML reader exited non-zero on \`$f\`, so the document was never fully inspected. Whatever it printed before dying is not a verdict; treat this as an unreadable configuration."
+    return
+  fi
 
   if printf '%s\n' "$doc" | grep -q '^#ERR	'; then
     err CHECK0 "\`$f\` is not loadable YAML, so nothing below it is worth asserting: Mergify refuses the whole file and NO pull request queues. Parser said: $(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#ERR" { print $2; exit }')"
+    return
+  fi
+  local badkeys; badkeys="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#BADKEY" { print $2 }' | sort -u | tr '\n' ' ')"
+  if [ -n "${badkeys// /}" ]; then
+    err CHECK0 "\`$f\` contains a key this gate cannot address unambiguously: ${badkeys}. A key holding \`.\` or \`[\` collides with a genuinely nested path — a top-level \`\"merge_queue.max_parallel_checks\"\` would read here exactly like the nested mapping Mergify requires, while Mergify itself sees an unknown top-level key and refuses the file. A \`(cycle)\` entry means a recursive alias, which no valid Mergify configuration has. Remove it."
     return
   fi
   local dups; dups="$(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DUP" { print $2 }' | sort -u | tr '\n' ' ')"
@@ -424,14 +464,15 @@ EOF
   # failure with the key present: the list exists, nothing ever matches it.
   amc_base="$(subtree_vals merge_protections_settings.auto_merge_conditions \
     | sed -n 's/^base[[:space:]]*=[[:space:]]*//p' | sed 's/^"//; s/"$//' | sort -u)"
-  rule_bases="$(while read -r r; do
+  local rule_bases_raw
+  rule_bases_raw="$(while read -r r; do
       [ -n "$r" ] || continue
       subtree_vals "$r.queue_conditions"
     done <<EOF
 $rules
 EOF
   )"
-  rule_bases="$(printf '%s\n' "$rule_bases" | sed -n 's/^base[[:space:]]*=[[:space:]]*//p' | sed 's/^"//; s/"$//' | sort -u)"
+  rule_bases="$(printf '%s\n' "$rule_bases_raw" | sed -n 's/^base[[:space:]]*=[[:space:]]*//p' | sed 's/^"//; s/"$//' | sort -u)"
   # A BASE-LESS list is the third spelling, and the loop below cannot see it:
   # with no `base = …` there is nothing to compare, so the check passes. But if
   # the rules DO constrain the base, an unconstrained auto-merge list matches
@@ -450,6 +491,19 @@ EOF
     done <<EOF
 $amc_base
 EOF
+  fi
+  # Two bases in ONE list is not "either base". `auto_merge_conditions` is a
+  # conjunction, so `base = main` and `base = develop` together are satisfied by
+  # no pull request at all — and each one on its own is admitted by a rule, so
+  # the loop above passes both. The list is the failure, not either member.
+  if [ "$(printf '%s\n' "$amc_base" | grep -c .)" -gt 1 ]; then
+    err CHECK8 "\`auto_merge_conditions\` names more than one base ($(printf '%s' "$amc_base" | tr '\n' ' ')). The list is ANDed, so no pull request can satisfy it and nothing is ever queued — with every base individually served by a rule, which is why this reads as correct. Write one base, or an explicit \`or:\`."
+  fi
+  # Draft polarity, for the same reason: `draft` in the admission list against
+  # `-draft` in the rule queues exactly the pull requests the rule refuses.
+  if subtree_vals merge_protections_settings.auto_merge_conditions | grep -qx 'draft' \
+     && printf '%s\n' "$rule_bases_raw" | grep -qx -- '-draft'; then
+    err CHECK8 "\`auto_merge_conditions\` admits \`draft\` while a queue rule requires \`-draft\`. Only drafts are then auto-queued, and every rule refuses them: nothing merges, and nothing goes red."
   fi
 }
 
@@ -602,6 +656,22 @@ selftest() {
   # and a reader that stops at the first `max_parallel_checks: 1` reports clean.
   expect duplicate-key 'CHECK0 CHECK1' \
     'merge_queue:\n  max_parallel_checks: 1\n  max_parallel_checks: 5\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n' || return 1
+  # A top-level key literally NAMED `merge_queue.max_parallel_checks`. Mergify
+  # sees an unknown top-level key and refuses the file; a path built by joining
+  # raw keys sees the nested mapping it was looking for.
+  expect flat-dotted-key CHECK0 \
+    '"merge_queue.max_parallel_checks": 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n' || return 1
+  # A recursive alias. Legal YAML, no valid Mergify configuration, and walked
+  # naively it dies AFTER printing every record the checks below read.
+  expect recursive-alias CHECK0 "${CLEAN}loop: &loop\n  - *loop\n" || return 1
+  # Two bases in one ANDed list: each is served by a rule, so the orphan loop
+  # passes both, and no pull request satisfies the conjunction.
+  expect amc-two-bases CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\n  - name: dev\n    queue_conditions: &devgate\n      - base = develop\n      - check-success = "Lint"\n    merge_conditions: *devgate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - base = develop\n' || return 1
+  # Admission and rule disagree about drafts: only drafts are auto-queued, and
+  # the rule admits none of them.
+  expect amc-draft-polarity CHECK8 \
+    'merge_queue:\n  max_parallel_checks: 1\nqueue_rules:\n  - name: default\n    queue_conditions: &gate\n      - base = main\n      - -draft\n      - check-success = "Lint"\n    merge_conditions: *gate\n    batch_size: 1\nmerge_protections_settings:\n  auto_merge_conditions:\n    - base = main\n    - draft\n' || return 1
   # Every invariant above still matches textually; the document does not load,
   # so Mergify refuses the file and the queue stops.
   expect unloadable CHECK0 "${CLEAN}broken: [\n" || return 1
