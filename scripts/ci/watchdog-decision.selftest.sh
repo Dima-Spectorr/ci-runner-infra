@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The watchdog rule, tested against the loop it was written for.
 #
-# On 2026-08-14 two of seven controllers (mot-printing, specaria-apigee-portal-
-# deploy) were restarted every 60s for hours. Both were `active (running)`, both
+# On 2026-08-14 two of seven controllers in this fleet were restarted every 60s
+# for hours. Both were `active (running)`, both
 # consumed a full CPU-minute per minute, and both published no metric at all —
 # including ci_poller_heartbeat, the series whose absence is supposed to mean
 # "the controller is dead". The rule had one input, the heartbeat's age, and the
@@ -40,7 +40,7 @@ check "past the grace, a stale heartbeat still restarts" \
 check "fresh heartbeat, long-running unit: no action" \
   "hold:fresh-20s" "$(watchdog_verdict 1 20 86400 "$T")"
 
-# A 212s tick on a 300s threshold — measured on mot-printing. Slow is not stuck.
+# A 212s tick on a 300s threshold — measured on a busy pool. Slow is not stuck.
 check "a slow tick under the threshold is not restarted" \
   "hold:fresh-212s" "$(watchdog_verdict 1 212 86400 "$T")"
 
