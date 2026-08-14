@@ -289,6 +289,13 @@ continues still reports red, so nothing is loosened.
 
 - Lane `none` enters a `docs` queue with `priority: high` and no batching.
   Still serialized, so merge ordering holds — just never behind a heavy batch.
+- **A second queue rule is a second place to lose in-place checking.** Every
+  rule needs its own `batch_size: 1` and its own `queue_conditions: &anchor` /
+  `merge_conditions: *anchor`; one unanchored rule means every pull request
+  that rule admits pays a second full CI pass, on a file that reads as
+  compliant. The whole contract, and the gate that asserts it, is in
+  [`ci-merge-queue-baseline.md`](ci-merge-queue-baseline.md) — adopt it with
+  this model, not after it.
 - `checks_timeout` must be **pinned** in every `queue_rules` entry. Unpinned, it
   inherits an undeclared vendor default of roughly 42 minutes, so a hung job
   surfaces as a silent dequeue rather than a red check.

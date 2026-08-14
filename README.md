@@ -211,7 +211,10 @@ packer/ci-host-image.pkr.hcl     the golden image; repo-agnostic
 scripts/ci/lane-decision.sh      pure CI-lane rule (unit-tested)
 scripts/ci/                      self-tests
 docs/onboarding-a-repository.md  how to put a NEW repo on the fleet
+scripts/ci/check-merge-queue-single-step.sh
+                                 the merge-queue rule consumers copy in
 docs/ci-lane-model.md            the lane contract consumers adopt
+docs/ci-merge-queue-baseline.md  one CI run per PR: the queue config + gate
 docs/ci-optimization-catalog.md  the fleet audit behind that contract
 ```
 
@@ -234,6 +237,22 @@ Consumers adopt it by tag, never by copying — see
 requirements and the order they must be done in. The audit that produced it,
 with per-repository measurements, is in
 [`docs/ci-optimization-catalog.md`](docs/ci-optimization-catalog.md).
+
+## One CI run per pull request
+
+The lane model decides how much CI a pull request deserves; it does not decide
+how many times that CI runs. Mergify validates a queued pull request on a
+throwaway `mergify/merge-queue/<sha>` branch — firing every `pull_request`
+workflow a **second** time, on the fleet — unless the queue is serial,
+unbatched, retry-free and single-step, and the fleet was in that state on
+2026-08-14 (one repository's config was rejected outright and its queue was
+failing closed).
+
+`scripts/ci/check-merge-queue-single-step.sh` is that rule, self-tested here on
+13 fixtures and copied into each consuming repository under the same name.
+[`docs/ci-merge-queue-baseline.md`](docs/ci-merge-queue-baseline.md) has the
+reference `.mergify.yml`, the five properties, and where the gate must sit for
+a `.mergify.yml`-only change to reach it.
 
 ## Releasing a version
 
