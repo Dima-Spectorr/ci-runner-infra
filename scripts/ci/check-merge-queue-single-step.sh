@@ -81,7 +81,7 @@ strip_comment() {
 live_lines() { strip_comment <"$1" | sed 's/[[:space:]]*$//'; }
 
 scan_file() {
-  local f="$1" live mpc batch retries anchors aliases amc
+  local f="$1" live mpc batch amc
   if [ ! -f "$f" ]; then
     err "no Mergify configuration at $f. This gate cannot show that the queue checks in place, and a missing config is not an absent queue — Mergify falls back to its own defaults."
     return
