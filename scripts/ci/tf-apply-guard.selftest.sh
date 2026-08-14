@@ -136,6 +136,7 @@ command -v python3 >/dev/null 2>&1 && avail="$avail python3"
 [ -n "$avail" ] || { printf 'FAIL neither jq nor python3 is available — the guard cannot read a plan here\n'; fails=$((fails + 1)); }
 
 for r in $avail; do
+  # shellcheck disable=SC2034  # read_plan, sourced from the guard, reads this.
   PLAN_READER="$r"
   got_all="$(read_plan "$plan_fixture" all | sort | tr '\n' ',')"
   got_prot="$(read_plan "$plan_fixture" protected | sort | tr '\n' ',')"

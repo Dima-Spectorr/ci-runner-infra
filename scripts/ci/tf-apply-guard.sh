@@ -120,6 +120,9 @@ read_plan() {
       jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address' "$1"
     fi
   else
+    # shellcheck disable=SC2016  # the python source must NOT be shell-expanded:
+    # the pattern reaches it through the environment precisely so that its
+    # backslashes and `$` anchor survive intact.
     PROTECTED_TYPES="$PROTECTED_TYPES" python3 -c '
 import json, os, re, sys
 # On Windows, text-mode stdout translates \n to \r\n. The trailing CR then rides
