@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v4.2.1"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v4.3.0"
   # ...
 }
 ```
@@ -134,6 +134,28 @@ still inside its warm window.
   install between concurrent slots. **This requires image `v3-11-0` or later** —
   an older image has no `dockerd-rootless.sh`, and a host that boots one refuses
   to register rather than quietly putting every slot back on one daemon.
+* **The metadata fence stops at port 80, and that is deliberate.**
+  `169.254.169.254` is two services on one address: the metadata server over
+  HTTP on port 80, and the VPC resolver on port 53. A container is handed that
+  address as its only nameserver, so a blanket per-uid `REJECT` fences the token
+  endpoint *and* takes name resolution away from every container a job starts —
+  reported inside the container as `Temporary failure in name resolution`, which
+  reads as a broken upstream registry rather than as host policy. Port 53 is let
+  through per slot uid; port 80 is not, and the token endpoint still times out
+  from inside a job's containers.
+* **Each slot lingers.** A slot user never logs in, so it has no user systemd
+  manager and no user D-Bus. `runc` asks systemd for a cgroup scope in
+  `user.slice`; with no user manager to ask, it falls through to the system
+  manager, which refuses an unprivileged caller with *Interactive authentication
+  required*. Image builds keep working — buildkit needs no scope — and starting
+  a container does not. `loginctl enable-linger` plus a per-slot
+  `DBUS_SESSION_BUS_ADDRESS` is what makes the two agree.
+* **The boot probe asserts the capability, not the daemon.** Both faults above
+  left `docker info` answering, so a probe that only asked the daemon whether it
+  was up passed on hosts where no job could run a container. It now also
+  requires the slot's user bus to exist and the slot user to resolve a name. It
+  deliberately does not start a container: that would need an image, and would
+  turn a registry outage into a fleet that refuses to register.
 * **The shared warm cache is still shared, on purpose.** `/opt/ci-cache` is
   group-writable to `ci`, which every slot user joins — **from image `v3-12-0`
   on**. `v3-11-0` warms the tree as root under umask 022, so the slots can read
