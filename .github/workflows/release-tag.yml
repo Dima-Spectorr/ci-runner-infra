@@ -1,0 +1,40 @@
+name: Release tag
+
+# The pull-request check asserts that the DOCUMENTED pins match `VERSION`. It
+# cannot assert that the tag does, because at pull-request time the tag being
+# released does not exist yet. That leaves one gap open: tag `v4.5.0` pushed at
+# a commit whose `VERSION` still says `v4.4.0`. Every documented pin still
+# matches `VERSION`, the pull-request check is green, and consumers pasting
+# `?ref=v4.4.0` from the README get a version that is no longer the head of the
+# line — the same tag-versus-documentation drift, arriving through the one door
+# the other check cannot watch.
+#
+# So it is closed here, at the only moment the tag exists: on the tag push.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  version-matches-tag:
+    name: Tag matches VERSION
+    # GitHub-hosted, like the rest of this repo's CI: the repository that
+    # defines the self-hosted fleet must not need the fleet to release.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: the tag names the version this commit claims to publish
+        run: |
+          set -uo pipefail
+          want=$(tr -d '[:space:]' < VERSION)
+          got="${GITHUB_REF_NAME}"
+          echo "tag=$got VERSION=$want"
+          if [ "$got" != "$want" ]; then
+            echo "::error::tag $got was pushed at a commit whose VERSION says $want — either the release PR did not bump VERSION, or this tag is at the wrong commit. Every documented pin now names $want while the release is $got."
+            exit 1
+          fi
+          echo "tag and VERSION agree."

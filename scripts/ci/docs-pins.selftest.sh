@@ -35,10 +35,17 @@ else
 fi
 
 want=$(tr -d '[:space:]' < "$VERSION_FILE")
-case "$want" in
-  v[0-9]*.[0-9]*.[0-9]*) ok "VERSION is a tag-shaped version ($want)" ;;
-  *) bad "VERSION is not tag-shaped: '$want' (expected vMAJOR.MINOR.PATCH)"; echo "  docs pins UNVERIFIABLE."; exit 1 ;;
-esac
+# A regex, not a `case` glob. `v[0-9]*.[0-9]*.[0-9]*` reads as the intended
+# shape and is not: in a glob `*` matches anything, and `.` is a literal with no
+# quantifier attached to the digit class, so `v4x.2y.0junk` and `v4.2.0.1` both
+# pass it. The pins are then asserted against a value that is not a tag.
+if printf '%s' "$want" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  ok "VERSION is a tag-shaped version ($want)"
+else
+  bad "VERSION is not tag-shaped: '$want' (expected vMAJOR.MINOR.PATCH)"
+  echo "  docs pins UNVERIFIABLE."
+  exit 1
+fi
 
 # Markdown only. The consumer roots that legitimately pin an older version live
 # in other repositories; this repo documents one version — its own.
@@ -46,11 +53,13 @@ mapfile -t docs < <(find "$ROOT" -name '*.md' -not -path '*/.git/*' | sort)
 [ "${#docs[@]}" -gt 0 ] || { bad "no Markdown files found — the glob is wrong"; echo "  docs pins UNVERIFIABLE."; exit 1; }
 
 found=0
+readme_pins=0
 for f in "${docs[@]}"; do
   # Only pins of THIS repo's modules. A pin of some other module in an example
   # is not this check's business.
   while IFS= read -r line; do
     found=$((found + 1))
+    [ "$f" = "$ROOT/README.md" ] && readme_pins=$((readme_pins + 1))
     got=${line##*\?ref=}
     got=${got%%[\"\ )]*}
     if [ "$got" = "$want" ]; then
@@ -58,7 +67,7 @@ for f in "${docs[@]}"; do
     else
       bad "${f#"$ROOT/"}: pins $got, VERSION says $want"
     fi
-  done < <(grep -o 'ci-runner-infra\.git//modules/ci-runner-[a-z-]*?ref=[^"[:space:])]*' "$f")
+  done < <(grep -o 'ci-runner-infra\.git//modules/ci-runner-[a-z-]*?ref=[^"[:space:])]*' -- "$f")
 done
 
 # A check that finds nothing passes, which is how the README drifted in the
@@ -68,6 +77,17 @@ if [ "$found" -eq 0 ]; then
   bad "no module pins found in any Markdown file — the README quickstart is the reason this test exists"
 else
   ok "$found documented pin(s) checked"
+fi
+
+# Named specifically, because a count is not coverage. The README quickstart is
+# the one line a new consumer pastes, and the pins in docs/ are enough to keep
+# `found` above zero while it is deleted or edited into a shape the grep no
+# longer recognises — leaving this check green over the exact line it exists to
+# protect.
+if [ "$readme_pins" -eq 0 ]; then
+  bad "README.md documents no module pin of this repo — the quickstart snippet is gone or no longer matches, and the rest of the docs were hiding it"
+else
+  ok "README.md carries $readme_pins pin(s)"
 fi
 
 if [ "$fail" -eq 0 ]; then
