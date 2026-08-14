@@ -99,7 +99,7 @@ jobs:
       # The fixtures first: a config gate's characteristic failure is a vacuous
       # pass — it reads a file it never matches and reports clean — so the
       # detectors are proved to fire before this repository's own config is
-      # believed. 34 of them, each asserted on the set of check ids it plants.
+      # believed. 39 of them, each asserted on the set of check ids it plants.
       - name: merge-queue single-step gate self-test
         run: bash scripts/ci/check-merge-queue-single-step.sh --selftest
 

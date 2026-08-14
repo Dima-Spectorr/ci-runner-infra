@@ -209,8 +209,11 @@ nothing queues at all. The same shape recurs four ways, and each has a fixture:
 | rule B omits `batch_size` while rule A declares `1` | unbatched | rule B batches on a throwaway branch |
 | rule B aliases rule A's anchor (`&low` / `*low`) | anchors and aliases balance | rule B's two lists are different nodes |
 
-The paths come from a **real YAML parser** (`python3` + PyYAML, which the gate
-pip-installs if the runner lacks it), and that is not an optimization — it is
+The paths come from a **real YAML parser** (`python3` + PyYAML, which the runner
+image is expected to carry — the gate installs nothing, because a required check
+that pip-installs an unpinned package puts every merge in every consuming
+repository behind PyPI, on hosts holding a service identity), and that is not an
+optimization — it is
 what makes the table above true. Reading the text structurally gets every row
 wrong in the same direction, the safe-looking one:
 
