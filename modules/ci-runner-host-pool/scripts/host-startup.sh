@@ -300,6 +300,15 @@ RuntimeDirectoryMode=0700
 Environment=HOME=/home/ci-s%i
 Environment=XDG_RUNTIME_DIR=/run/ci-s%i
 Environment=PATH=/usr/bin:/usr/sbin:/bin:/sbin
+# A private /tmp, shared with this slot's runner agent and with nobody else.
+# Slots are separate users on one host, and `/tmp` is the one directory they
+# all still wrote to: a workflow step that names a fixed path there — and CI
+# scripts name fixed paths there constantly — creates it under whichever slot
+# ran first, and every later slot gets EACCES on a file it believes it owns.
+# The failure reads as a repository bug ("Permission denied" on the repo's own
+# scratch file) and moves between repositories with whichever slot got there
+# first, so it is worth fixing on the host rather than in every workflow.
+PrivateTmp=yes
 ExecStart=/usr/bin/dockerd-rootless.sh
 # Rootless dockerd needs its own cgroup subtree to set any resource limit;
 # without delegation it still runs, but every limit a job asks for is ignored.
@@ -426,6 +435,8 @@ Wants=network-online.target
 # and exhausts its restarts would leave the agent online and still taking jobs.
 BindsTo=ci-dockerd@$idx.service
 Requires=ci-dockerd@$idx.service
+# Share the daemon's private /tmp rather than getting a second, separate one.
+JoinsNamespaceOf=ci-dockerd@$idx.service
 
 [Service]
 Type=simple
@@ -435,6 +446,15 @@ WorkingDirectory=$dir
 # other slots sit in 0700 directories owned by their own users, and the rootful
 # daemon is masked on this host.
 Environment=DOCKER_HOST=unix:///run/$u/docker.sock
+# The slot's private /tmp, and specifically the SAME one the daemon sees. A
+# `PrivateTmp=yes` of its own would isolate the agent from its siblings but
+# also from its own daemon, so `docker run -v /tmp/x:/x` would mount an empty
+# directory instead of the file the step just wrote — a silent wrong answer,
+# which is worse than the collision being fixed here. JoinsNamespaceOf makes
+# the two share one namespace (declared in [Unit] above); the BindsTo there is
+# what keeps them in step, since a daemon that restarts gets a new namespace
+# and takes the agent down with it rather than leaving it on a stale one.
+PrivateTmp=yes
 $BROKER_ENV
 ExecStart=$dir/run.sh
 # The controller drains a host by DEREGISTERING its agents through the GitHub

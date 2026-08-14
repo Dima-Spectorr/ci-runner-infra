@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v4.3.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v4.4.0"
   # ...
 }
 ```
@@ -156,6 +156,15 @@ still inside its warm window.
   requires the slot's user bus to exist and the slot user to resolve a name. It
   deliberately does not start a container: that would need an image, and would
   turn a registry outage into a fleet that refuses to register.
+* **`/tmp` is per slot, and the slot's daemon shares it.** Slots are separate
+  users on one host, so a workflow step naming a fixed path under `/tmp` —
+  and CI scripts name fixed paths there constantly — creates it under whichever
+  slot ran first, and every later slot gets `Permission denied` on a file it
+  believes is its own. It reads as a bug in the repository rather than as host
+  policy, and it moves between repositories with whichever slot got there
+  first. Each slot's dockerd runs with `PrivateTmp=yes` and its runner agent
+  joins that same namespace, so `docker run -v /tmp/x:/x` still mounts the file
+  the step just wrote instead of an empty directory.
 * **The shared warm cache is still shared, on purpose.** `/opt/ci-cache` is
   group-writable to `ci`, which every slot user joins — **from image `v3-12-0`
   on**. `v3-11-0` warms the tree as root under umask 022, so the slots can read

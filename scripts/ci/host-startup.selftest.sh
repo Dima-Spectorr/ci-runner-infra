@@ -138,6 +138,21 @@ has_container_runtime() { # <file>
   matches "$code" 'sudo -u "\$u" getent ahostsv4'
 }
 
+# Slots share a host, so they share /tmp unless something separates them. A CI
+# step that names a fixed path there — `/tmp/lockfile-fresh.json`, and there are
+# many — creates it under whichever slot ran first, and every later slot gets
+# EACCES on a file it believes is its own (SOAP-To-REST #2017). The daemon and
+# its agent must land in the SAME private /tmp, or a bind mount of a path under
+# it silently mounts an empty directory instead of the file the step wrote.
+has_slot_tmp_isolation() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^PrivateTmp=yes$' || return 1
+  # Two of them: the daemon's and the agent's. One alone is the broken half.
+  [ "$(printf '%s\n' "$code" | grep -cE '^PrivateTmp=yes$')" -ge 2 ] || return 1
+  matches "$code" '^JoinsNamespaceOf=ci-dockerd@\$idx\.service$'
+}
+
 # The helper carries the trap it was written to avoid, so it is tested first.
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -173,6 +188,12 @@ if has_slot_isolation "$SCRIPT"; then
   ok
 else
   bad "slots do not get their own user and their own container daemon — a job can reach the sibling slots' containers, tokens and workspaces (#10)"
+fi
+
+if has_slot_tmp_isolation "$SCRIPT"; then
+  ok
+else
+  bad "slots share /tmp, or the agent does not share its daemon's — a fixed path there is owned by whichever slot ran first and every other slot gets EACCES on it (SOAP-To-REST #2017)"
 fi
 
 if has_container_runtime "$SCRIPT"; then
@@ -213,6 +234,8 @@ mutate "slot no longer lingers"          's/loginctl enable-linger/# loginctl en
 mutate "daemon left on the system bus"   's|DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus|DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket|' has_container_runtime
 mutate "probe back to daemon-only"       's/slot_runtime_usable "\$idx" "\$u" || return 1/: /'         has_container_runtime
 mutate "DNS probe runs as root"          's/sudo -u "\$u" getent ahostsv4/getent ahostsv4/'            has_container_runtime
+mutate "slots share /tmp again"          's/^PrivateTmp=yes$/PrivateTmp=no/'                           has_slot_tmp_isolation
+mutate "only the daemon gets a private /tmp" 's/^JoinsNamespaceOf=ci-dockerd@\$idx\.service$/#&/'      has_slot_tmp_isolation
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
