@@ -51,10 +51,22 @@ output "metric_names" {
       "ci_slots_busy",
       "ci_host_idle_seconds_max",
       "ci_queue_wait_seconds_max",
-      "ci_job_startup_seconds",
+      # `ci_job_startup_seconds` was declared here and never implemented — no
+      # code path has ever published it. Removed rather than stubbed: a declared
+      # series nothing writes produces an alert policy that cannot fire, which is
+      # read as "healthy". Time-to-first-job is already observable as
+      # ci_queue_wait_seconds_max; total wall time is a property of the workflow
+      # run, not of the pool, and belongs in the run report.
       "ci_mig_target_size",
       "ci_drain_verdicts",
+      # Published since the reaper landed but never listed here, so no dashboard
+      # or alert built from this contract could see it.
+      "ci_orphan_registrations_reaped",
       "ci_poller_heartbeat",
+      # Non-zero means scale-in is SUSPENDED — the controller cannot read the
+      # runner list, so no host can be proven idle. Alert on a sustained run
+      # (> 3 ticks), never on a single blip: one blind tick is normal API noise.
+      "ci_runner_list_blind_ticks",
     ] : m => "${var.metric_prefix}/${m}"
   }
 }

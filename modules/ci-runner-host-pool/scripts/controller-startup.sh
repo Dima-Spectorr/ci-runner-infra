@@ -112,6 +112,13 @@ fi
 
 GH_TOKEN=""
 GH_TOKEN_EXPIRY=0
+GH_HTTP_STATUS=""
+RUNNER_LIST_STATUS="ok"
+# Consecutive ticks that could not read the runner list. Reset on the first
+# successful read, published every tick. In-memory on purpose: a controller
+# restart genuinely starts a new run of ticks, and a counter surviving on disk
+# would report a suspension that is no longer happening.
+BLIND_TICKS=0
 
 gh_token() {
   local now
@@ -147,12 +154,24 @@ gh_token() {
   printf '%s' "$GH_TOKEN"
 }
 
+# Body on stdout, and the reason on GH_HTTP_STATUS when there is no body. With
+# `-f` the only thing a caller could learn from a failure was that it happened:
+# a rate limit, a revoked installation, and a firewall dropping egress all
+# produced the same empty string, and the drain path treats all three the same
+# way (do nothing) — so a pool frozen for an hour looked exactly like a pool
+# frozen for one tick. `000` is curl's own "never got a response".
 gh_api() {
-  local tok
-  tok=$(gh_token) || return 1
-  curl "${CURL_TIMEOUTS[@]}" -fsS -H "Authorization: Bearer $tok" \
+  local tok status
+  tok=$(gh_token) || { GH_HTTP_STATUS="no-token"; return 1; }
+  status=$(curl "${CURL_TIMEOUTS[@]}" -sS -o "$STATE_DIR/api.body" -w '%{http_code}' \
+    -H "Authorization: Bearer $tok" \
     -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/$1"
+    "https://api.github.com/$1" 2>>"$LOG") || status="000"
+  GH_HTTP_STATUS="$status"
+  case "$status" in
+    2*) cat "$STATE_DIR/api.body"; return 0 ;;
+  esac
+  return 1
 }
 
 # --- demand ------------------------------------------------------------------
@@ -227,11 +246,16 @@ collect_demand() {
 collect_runners() {
   # One page of 100 covers max_hosts * slots for every pool in this fleet;
   # paginate rather than silently truncate if that stops being true.
-  RUNNERS_JSON=$(gh_api "repos/$REPO_FULL/actions/runners?per_page=100" 2>/dev/null)
-  if [ -z "$RUNNERS_JSON" ]; then
+  RUNNERS_JSON=$(gh_api "repos/$REPO_FULL/actions/runners?per_page=100") || {
     RUNNERS_JSON=""
+    RUNNER_LIST_STATUS="$GH_HTTP_STATUS"
+    return 1
+  }
+  if [ -z "$RUNNERS_JSON" ]; then
+    RUNNER_LIST_STATUS="empty-body"
     return 1
   fi
+  RUNNER_LIST_STATUS="ok"
   return 0
 }
 
@@ -509,7 +533,18 @@ tick() {
   REAPED=0
 
   collect_demand
-  collect_runners || log "GitHub runner list unavailable this tick — every host reads reg=unknown and nothing will be drained (fail-safe)"
+  # A blind tick is not an error, it is a SUSPENSION: every host reads
+  # reg=unknown, so nothing drains. One is unremarkable; a run of them is a pool
+  # pinned at its current size, billing for hosts nobody is using, while the
+  # heartbeat keeps publishing 1 and every dashboard stays green. The counter is
+  # what makes the difference visible — it is published on every tick, and an
+  # alert on it fires on the run, not on the single blip.
+  if collect_runners; then
+    BLIND_TICKS=0
+  else
+    BLIND_TICKS=$((BLIND_TICKS + 1))
+    log "GitHub runner list unavailable this tick (status=$RUNNER_LIST_STATUS, consecutive=$BLIND_TICKS) — every host reads reg=unknown and nothing will be drained (fail-safe)"
+  fi
   collect_hosts
   collect_mig
 
@@ -576,6 +611,11 @@ tick() {
   # this series means the controller is down — a distinct alert from "the pool
   # is idle", which the other series cannot distinguish on their own.
   queue_series "ci_poller_heartbeat" "1"
+  # Published on EVERY tick, 0 included — a series that only appears when broken
+  # is indistinguishable from a controller that stopped publishing, which is the
+  # confusion this whole fleet keeps paying for. 0 means "the last tick could see
+  # GitHub"; N means scale-in has been suspended for N consecutive ticks.
+  queue_series "ci_runner_list_blind_ticks" "$BLIND_TICKS"
   flush_series
 }
 

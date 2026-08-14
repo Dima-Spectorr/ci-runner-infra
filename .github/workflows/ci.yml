@@ -104,6 +104,15 @@ jobs:
       - name: merge-queue single-step gate self-test
         run: bash scripts/ci/check-merge-queue-single-step.sh --selftest
 
+      # `ci_orphan_registrations_reaped` was published from the day the reaper
+      # landed and never declared in the module output that dashboards and alert
+      # policies are built from, so nothing looked at it. The reverse drift is
+      # worse: `ci_job_startup_seconds` was declared and never implemented, so an
+      # alert on it could never fire — and a policy that cannot fire reads as
+      # healthy forever.
+      - name: metric contract self-test
+        run: bash scripts/ci/metric-contract.selftest.sh
+
       # A stale checkout applied 2026-08-14 reverted Print-Server's runner infra
       # to the retired architecture and destroyed the App-key secret. The tree was
       # CLEAN — a failed `git pull` inside a loop left an old commit checked out —
