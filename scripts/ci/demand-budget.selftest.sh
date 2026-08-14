@@ -55,13 +55,17 @@ check "a 60s poll widens the window to 600s" 600 "$(watchdog_threshold 60)"
 check "half a 600s window is 300s, not 150s" 300 "$(( $(watchdog_threshold 60) / 2 ))"
 
 # ── structural: the tested text is the shipped text ──────────────────────────
-grep -q 'budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME"' "$CTRL" \
-  && check "the controller uses the tested budget rule" yes yes \
-  || check "the controller uses the tested budget rule" yes no
+# A grep for a literal line of shell: the $(…) and "$VAR" inside these patterns
+# are the text being searched for, not expansions — hence single quotes.
+found() { if grep -qF "$2" "$1"; then echo yes; else echo no; fi; }
 
-grep -q 'WATCHDOG_THRESHOLD="$(watchdog_threshold "$POLL")"' "$ALERTS" \
-  && check "the alert script uses the tested threshold rule" yes yes \
-  || check "the alert script uses the tested threshold rule" yes no
+# shellcheck disable=SC2016
+check "the controller uses the tested budget rule" yes \
+  "$(found "$CTRL" 'budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME"')"
+
+# shellcheck disable=SC2016
+check "the alert script uses the tested threshold rule" yes \
+  "$(found "$ALERTS" 'WATCHDOG_THRESHOLD="$(watchdog_threshold "$POLL")"')"
 
 # The deadline must cover the run-list calls too — starting it after them was
 # how the budget came to authorise twice its own value.
