@@ -34,8 +34,25 @@ log() {
   logger -t ci-controller -- "$*" 2>/dev/null || true
 }
 
+# Every outbound call in this file is bounded by these. The controller is a
+# `Type=simple` unit running `while true; do tick; sleep POLL; done`, so an
+# unbounded socket does not fail — it STOPS THE LOOP. The process stays alive, so
+# `Restart=always` never fires; the metric keeps its last published value, so
+# nothing looks absent; and the pool neither scales out for queued jobs nor
+# drains idle hosts, for as long as the connection hangs.
+#
+# This is not hypothetical. On 2026-08-14 the equivalent poller in the
+# IntegrateIT vendored pool (a `Type=oneshot` timer unit, where systemd will not
+# fire the next tick while the previous activation is still starting) sat in
+# `activating (start)` for 2h55m: `NEXT n/a`, MIG pinned at targetSize 0, a
+# windows job queued the whole time, and no alert anywhere — because a stale
+# metric reads as a value, not as a gap. The watchdog installed further down is
+# the second half of this fix: bounds stop one call from hanging, the watchdog
+# recovers the loop if anything else does.
+CURL_TIMEOUTS=(--connect-timeout 10 --max-time 30)
+
 md() {
-  curl -fsS -H "Metadata-Flavor: Google" \
+  curl "${CURL_TIMEOUTS[@]}" -fsS -H "Metadata-Flavor: Google" \
     "http://metadata.google.internal/computeMetadata/v1/$1" 2>/dev/null
 }
 
@@ -108,7 +125,9 @@ gh_token() {
   fi
 
   local key header payload sig jwt
-  key=$(gcloud secrets versions access latest --secret="$KEY_SECRET" 2>/dev/null)
+  # `timeout` for the same reason the curls are bounded: gcloud carries its own
+  # retry loop and can sit on a stalled TLS handshake far past a tick.
+  key=$(timeout 60 gcloud secrets versions access latest --secret="$KEY_SECRET" 2>/dev/null)
   [ -n "$key" ] || { log "cannot read App key secret $KEY_SECRET"; return 1; }
 
   _b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
@@ -118,7 +137,7 @@ gh_token() {
   jwt="$header.$payload.$sig"
 
   local resp
-  resp=$(curl -fsS -X POST -H "Authorization: Bearer $jwt" \
+  resp=$(curl "${CURL_TIMEOUTS[@]}" -fsS -X POST -H "Authorization: Bearer $jwt" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/app/installations/$INSTALL_ID/access_tokens") || return 1
 
@@ -131,7 +150,7 @@ gh_token() {
 gh_api() {
   local tok
   tok=$(gh_token) || return 1
-  curl -fsS -H "Authorization: Bearer $tok" \
+  curl "${CURL_TIMEOUTS[@]}" -fsS -H "Authorization: Bearer $tok" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/$1"
 }
@@ -268,7 +287,7 @@ reap_orphan_registrations() {
     case "$verdict" in
       reap:*)
         local code
-        code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+        code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
           -H "Authorization: Bearer $ORPHAN_TOKEN" \
           -H "Accept: application/vnd.github+json" \
           "https://api.github.com/repos/$REPO_FULL/actions/runners/$id")
@@ -427,7 +446,7 @@ drain_host() {
 
   for id in $ids; do
     local code
-    code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
       -H "Authorization: Bearer $tok" \
       -H "Accept: application/vnd.github+json" \
       "https://api.github.com/repos/$REPO_FULL/actions/runners/$id")
@@ -589,15 +608,89 @@ RestartSec=15
 WantedBy=multi-user.target
 EOF
 
+  # --- watchdog --------------------------------------------------------------
+  #
+  # `Restart=always` only fires when the process EXITS. The failure this fleet
+  # actually suffers is the opposite: the loop blocks on a call and the process
+  # stays perfectly alive, so systemd sees a healthy unit while the pool stops
+  # scaling out and stops draining. Bounded curls make that unlikely; this makes
+  # it self-correcting, because "unlikely" ran for 2h55m on 2026-08-14 and
+  # needed a human with SSH to end it.
+  #
+  # A separate unit on purpose — a watchdog inside the loop it watches shares
+  # its fate. Deliberately dumb: compare the heartbeat file's age against a
+  # threshold and restart, nothing else. Threshold is 10 polls (min 300s), far
+  # above any legitimate tick — a full tick is bounded by the curl timeouts
+  # times the hosts it walks — so a restart means genuinely stuck, not merely
+  # slow. Restarting is safe at any point: every tick recomputes from live
+  # GitHub and MIG state, and the drain/orphan state files are idempotent
+  # counters, so nothing is lost by starting the tick over.
+  local wd_threshold=$((POLL * 10))
+  [ "$wd_threshold" -lt 300 ] && wd_threshold=300
+
+  cat >/opt/ci-controller/watchdog.sh <<WDEOF
+#!/usr/bin/env bash
+set -uo pipefail
+HB="$STATE_DIR/heartbeat"
+THRESHOLD=$wd_threshold
+# No heartbeat file yet = the loop has not completed its first tick. That is a
+# normal boot, not a wedge, so hold off until one exists rather than restarting
+# a controller that is still starting up.
+[ -f "\$HB" ] || exit 0
+now=\$(date +%s)
+last=\$(stat -c %Y "\$HB" 2>/dev/null || echo "\$now")
+age=\$((now - last))
+if [ "\$age" -ge "\$THRESHOLD" ]; then
+  logger -t ci-controller-watchdog -- "heartbeat \${age}s old (>= \${THRESHOLD}s) — restarting ci-controller.service"
+  systemctl restart ci-controller.service
+fi
+WDEOF
+  chmod 0755 /opt/ci-controller/watchdog.sh
+
+  cat >/etc/systemd/system/ci-controller-watchdog.service <<'WDSVCEOF'
+[Unit]
+Description=CI controller watchdog — restarts the controller if its tick loop stalls
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ci-controller/watchdog.sh
+# This unit is itself a `Type=oneshot`, which has no start timeout by default and
+# whose timer will not re-fire while an activation is still starting — the very
+# trap it exists to catch. It only stats a file and calls systemctl, so anything
+# past a minute is stuck, not slow.
+TimeoutStartSec=60
+WDSVCEOF
+
+  cat >/etc/systemd/system/ci-controller-watchdog.timer <<'WDTIMEOF'
+[Unit]
+Description=Check the CI controller heartbeat every minute
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=60
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+WDTIMEOF
+
   systemctl daemon-reload
   systemctl enable --now ci-controller.service
-  log "controller installed for $REPO_FULL pool=$POOL mig=$MIG poll=${POLL}s grace=${GRACE}s slots=$SLOTS"
+  systemctl enable --now ci-controller-watchdog.timer
+  log "controller installed for $REPO_FULL pool=$POOL mig=$MIG poll=${POLL}s grace=${GRACE}s slots=$SLOTS watchdog=${wd_threshold}s"
 }
 
 run_loop() {
   log "controller loop starting"
   while true; do
     tick || log "tick failed"
+    # LOCAL liveness, deliberately distinct from the `ci_poller_heartbeat`
+    # series: that one only reaches Monitoring if the tick got far enough to
+    # flush, so it cannot report a loop wedged BEFORE the flush — which is
+    # exactly the failure being guarded. Written after every tick, good or bad,
+    # because a tick that fails cleanly is a live loop; only a stopped one is
+    # the emergency. The watchdog below reads this file's mtime.
+    date +%s >"$STATE_DIR/heartbeat" 2>/dev/null || true
     sleep "$POLL"
   done
 }

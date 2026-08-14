@@ -66,12 +66,19 @@ flush_series() {
   body="{\"timeSeries\":[$TELEMETRY_BUFFER]}"
   TELEMETRY_BUFFER=""
 
-  token=$(curl -fsS -H "Metadata-Flavor: Google" \
+  # Bounded, and spelled out rather than reusing the controller's CURL_TIMEOUTS:
+  # this file is concatenated BEFORE controller-startup.sh, so depending on a
+  # variable defined there would make the flush's safety a property of link
+  # order. The controller's tick loop is a plain `while true`, so a hang here
+  # does not fail — it stops every later tick, and with it demand publication
+  # and all scale-in, while the process still looks alive to systemd.
+  token=$(curl --connect-timeout 10 --max-time 30 -fsS -H "Metadata-Flavor: Google" \
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
     | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   [ -n "$token" ] || { log "telemetry: no access token"; return 1; }
 
-  http=$(curl -s -o /tmp/ts-response.json -w '%{http_code}' -X POST \
+  http=$(curl --connect-timeout 10 --max-time 30 \
+    -s -o /tmp/ts-response.json -w '%{http_code}' -X POST \
     -H "Authorization: Bearer $token" \
     -H "Content-Type: application/json" \
     "https://monitoring.googleapis.com/v3/projects/$PROJECT/timeSeries" \
