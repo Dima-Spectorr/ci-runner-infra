@@ -117,6 +117,12 @@ variable "warm_cache_script" {
     the build VM as root and must be idempotent and network-only — it may
     download, it must not embed credentials or customer data.
 
+    Warm a FILESYSTEM cache, not a docker image cache: each slot runs its own
+    rootless daemon with its own data root under the slot user's home, so
+    images pulled here into the build VM's root-owned /var/lib/docker are
+    invisible to every one of them. Pre-pulling would cost build minutes and
+    disk for nothing.
+
     Empty = build a toolchain-only image.
   EOT
   default     = ""
@@ -212,7 +218,25 @@ build {
       "echo \"deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable\" > /etc/apt/sources.list.d/docker.list",
       "apt-get update -qq",
       "apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
-      "systemctl enable docker",
+      # Rootless prerequisites. Each slot runs its OWN daemon as its own user
+      # (see host-startup.sh): newuidmap/newgidmap from uidmap give it a user
+      # namespace, slirp4netns gives it networking, fuse-overlayfs gives it a
+      # usable storage driver without root.
+      "apt-get install -y -qq uidmap slirp4netns fuse-overlayfs dbus-user-session docker-ce-rootless-extras",
+      # Ubuntu 24.04 restricts unprivileged user namespaces by AppArmor profile;
+      # with the restriction on, rootlesskit dies at start with "Operation not
+      # permitted" and every slot's daemon is down. Unprivileged low ports are
+      # allowed because service containers routinely publish 80/443 in CI.
+      "printf 'kernel.apparmor_restrict_unprivileged_userns=0\\nnet.ipv4.ip_unprivileged_port_start=0\\n' > /etc/sysctl.d/99-ci-rootless.conf",
+      # The SHARED daemon is disabled here and masked at boot. A job that can
+      # reach /var/run/docker.sock owns every other slot on the host — the
+      # exposure per-slot daemons exist to remove (#10). The CLI, buildx and
+      # compose plugins stay: they talk to whatever DOCKER_HOST points at.
+      "systemctl disable docker.service docker.socket || true",
+      # Shared warm cache: readable and writable through the `ci` group, which
+      # every slot user joins at boot. Slot HOMES are not shared — that sharing
+      # is what raced pnpm's store between concurrent slots.
+      "groupadd -f ci",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
@@ -285,6 +309,10 @@ build {
       "./bin/installdependencies.sh",
       "chown -R runner:runner /opt/actions-runner",
       "mkdir -p /opt/ci/slots /opt/ci-cache && chown -R runner:runner /opt/ci /opt/ci-cache",
+      # setgid + group-write so a file one slot writes into the shared cache
+      # stays group-owned by `ci` and is usable by the next slot, whichever user
+      # that is. The slot HOMES stay private; only this tree is shared.
+      "chgrp -R ci /opt/ci-cache && chmod 2775 /opt/ci-cache",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
@@ -328,6 +356,35 @@ build {
       # The shim shape that actually broke: resolved through env, as a script's
       # interpreter is, not as a login-shell builtin.
       "printf '#!/usr/bin/env node\\nconsole.log(\"shim ok\")\\n' > /tmp/shim && chmod +x /tmp/shim && sudo -u runner /tmp/shim && rm -f /tmp/shim",
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
+  # 7b. Prove a rootless daemon actually STARTS on this image.
+  #
+  #     Presence of dockerd-rootless.sh proves nothing: the failure mode here is
+  #     that the binary is installed and the daemon still dies at start because a
+  #     kernel knob (AppArmor's unprivileged-userns restriction), a setuid helper
+  #     (newuidmap) or a subuid range is missing. That failure surfaces hours
+  #     later as every slot on every host having no container runtime at all —
+  #     i.e. a fleet outage, delivered by an image build that reported success.
+  #     So start one here, as an unprivileged user, and ask it a question.
+  provisioner "shell" {
+    inline = [
+      "set -eux",
+      "for b in /usr/bin/dockerd-rootless.sh /usr/bin/newuidmap /usr/bin/newgidmap /usr/bin/slirp4netns /usr/bin/fuse-overlayfs; do [ -x $b ] || { echo \"MISSING: $b\"; exit 1; }; done",
+      # The sysctl file is written for the hosts; apply it here too, otherwise
+      # this probe tests a kernel configured differently from the one it ships.
+      "sysctl --system >/dev/null",
+      "useradd -m ci-rootless-probe || true",
+      "grep -q '^ci-rootless-probe:' /etc/subuid || echo 'ci-rootless-probe:900000:65536' >> /etc/subuid",
+      "grep -q '^ci-rootless-probe:' /etc/subgid || echo 'ci-rootless-probe:900000:65536' >> /etc/subgid",
+      "install -d -o ci-rootless-probe -g ci-rootless-probe -m 0700 /run/ci-rootless-probe",
+      "setsid sudo -u ci-rootless-probe env HOME=/home/ci-rootless-probe XDG_RUNTIME_DIR=/run/ci-rootless-probe PATH=/usr/bin:/usr/sbin:/bin:/sbin /usr/bin/dockerd-rootless.sh > /tmp/rootless.log 2>&1 < /dev/null &",
+      "ok=0; for i in $(seq 1 30); do if sudo -u ci-rootless-probe env DOCKER_HOST=unix:///run/ci-rootless-probe/docker.sock docker info >/dev/null 2>&1; then ok=1; break; fi; sleep 2; done",
+      "if [ \"$ok\" != 1 ]; then echo 'rootless dockerd did not come up on this image:'; cat /tmp/rootless.log; exit 1; fi",
+      "pkill -u ci-rootless-probe || true; sleep 2; userdel -r ci-rootless-probe || true; rm -rf /run/ci-rootless-probe /tmp/rootless.log",
+      "sed -i '/^ci-rootless-probe:/d' /etc/subuid /etc/subgid",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
