@@ -124,10 +124,16 @@ if not isinstance(jobs, dict):
     # `uses:` is exempt from pinning because the wrapper is immutable; what the
     # wrapper then reaches for is not.
     runs = doc.get("runs")
-    if isinstance(runs, dict) and isinstance(runs.get("steps"), list):
-        for i, step in enumerate(runs["steps"]):
-            if isinstance(step, dict) and isinstance(step.get("uses"), str):
-                out("#USES", "runs", i, step["uses"].strip())
+    if isinstance(runs, dict):
+        if isinstance(runs.get("steps"), list):
+            for i, step in enumerate(runs["steps"]):
+                if isinstance(step, dict) and isinstance(step.get("uses"), str):
+                    out("#USES", "runs", i, step["uses"].strip())
+        # `runs.using: docker` reaches its image through `runs.image`, not
+        # through a step — the same mutable remote code arriving by the one
+        # spelling a steps-only reader cannot see.
+        if isinstance(runs.get("image"), str):
+            out("#USES", "runs", "image", runs["image"].strip())
     sys.exit(0)
 
 for job_id, job in jobs.items():
@@ -230,10 +236,16 @@ check_file() {
     # SHA with no comment passed by standing next to the first. `actions/checkout`
     # appears three or four times in a typical workflow here, so that was not a
     # corner case, it was the common one.
+    #
+    # And the comment has to say a VERSION. `# TODO` is a `#`, and counting it
+    # satisfies the check while leaving the pin exactly as opaque as a bare SHA
+    # — no tag for a reviewer to recognise and no marker for Dependabot to
+    # rewrite. So the comment must carry a token containing a digit, which is
+    # what every tag in this fleet looks like (`v4`, `v4.4.0`, `2.1.13`).
     local ref_re n_uses n_commented
     ref_re="$(re_quote "$path@$version")"
     n_uses="$(grep -cE "uses:[[:space:]]*['\"]?${ref_re}['\"]?([[:space:]]|\$)" "$file")"
-    n_commented="$(grep -cE "uses:[[:space:]]*['\"]?${ref_re}['\"]?[[:space:]]*#" "$file")"
+    n_commented="$(grep -cE "uses:[[:space:]]*['\"]?${ref_re}['\"]?[[:space:]]*#[^#]*[A-Za-z0-9._-]*[0-9]" "$file")"
     if [ "$n_uses" -gt "$n_commented" ]; then
       err PIN2 "$rel: job '$job' step $step pins '$path' to $version with no version comment on $((n_uses - n_commented)) of $n_uses reference(s) — write '$path@$version # <tag>' on each so the bump is reviewable"
     fi
@@ -365,6 +377,31 @@ runs:
   steps:
     - uses: third/party@11bd71901bbe5b1630ceea73d27597364c9af683 # v1.2.3
       shell: bash'
+
+  # A container action reaches its image through `runs.image`, not through a
+  # step, so a steps-only reader called this manifest clean while a mutable
+  # `alpine:latest` executed through the local wrapper.
+  expect "a container action's image is a reference too" "PIN3" \
+'name: setup
+runs:
+  using: docker
+  image: docker://alpine:3.20'
+
+  expect "a container action pinned by digest is clean" "" \
+'name: setup
+runs:
+  using: docker
+  image: docker://alpine@sha256:1e6b5b5b0e1a0a1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081920'
+
+  # `# TODO` is a `#`, and counting it left the pin exactly as opaque as a bare
+  # SHA — nothing for a reviewer to recognise, nothing for Dependabot to bump.
+  expect "a comment that is not a version is not a version comment" "PIN2" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # TODO'
 
   expect "a reusable workflow on a branch" "PIN1" \
 'on: [push]

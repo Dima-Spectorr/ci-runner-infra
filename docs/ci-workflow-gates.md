@@ -123,6 +123,12 @@ Anything not recognised is unguarded — an unrecognised-but-correct guard costs
 one reported job and a reviewer's minute, where an unrecognised inversion costs
 the boundary.
 
+And the condition is read as a Boolean tree, not searched. `always() ||
+…head.repo.fork == false` contains the exclusion and runs for forks anyway,
+because the other alternative does not care. So for `||` **every** alternative
+has to exclude, for `&&` **one** conjunct excluding is enough, and what is left
+after that split is a leaf matched against the shapes above.
+
 ### Reachability crosses a local `uses:` call
 
 A `pull_request` workflow calling `./.github/workflows/build.yml` runs that
@@ -159,6 +165,10 @@ slot for six hours exactly as an undeclared one does. Key presence was the wrong
 question. The ceiling is 360 by default and `--max-timeout=<n>` lowers it for a
 consumer whose merge queue expires sooner — a job outliving `checks_timeout` is
 dequeued silently rather than turning red.
+
+`timeout-minutes: ${{ vars.JOB_TIMEOUT }}` is the same finding in a different
+spelling: the key is present, the value may be 360, and this gate cannot read
+the variable. Reported, not passed — the rule RUNNER5 already follows.
 
 ### What it decides that looks undecidable
 
@@ -198,7 +208,7 @@ bash scripts/ci/check-action-pins.sh [--selftest] [--allow=<owner>]... [<file>..
 |---|---|
 | `PIN0` | the file does not load, or the gate cannot run |
 | `PIN1` | a remote `uses:` names a 40-character commit SHA |
-| `PIN2` | and carries the version beside it as a comment |
+| `PIN2` | and carries the version beside it as a comment, on every line |
 | `PIN3` | a `docker://` step image is pinned by `@sha256:` digest |
 
 `@v4` is a tag, and a tag is a pointer its owner may move at any time. The
