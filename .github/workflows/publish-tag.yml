@@ -123,7 +123,42 @@ jobs:
           # Force, unlike the exact tag: a floating tag that could not be moved
           # would be pinned to the first release of the major forever, which is
           # worse than not publishing it at all.
+          #
+          # But "force" and "forward" are different things, and the comment above
+          # promised forward. A force-patch to whatever VERSION happens to say
+          # moves the tag wherever VERSION went — including BACKWARDS, on a
+          # revert, a bad cherry-pick, or a merge that restored an older VERSION.
+          # For an exact pin that is survivable; for the floating tag it is a
+          # silent fleet-wide DOWNGRADE, arriving at every consumer on its next
+          # apply with no pull request anywhere and nothing red. So the direction
+          # is asserted here, at the only moment both versions are known.
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$major" >/dev/null 2>&1; then
+            # The VERSION file at the commit the floating tag currently resolves
+            # to — which is what the tag actually promises consumers today.
+            cur=$(gh api "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$major" \
+                    -H "Accept: application/vnd.github.raw" 2>/dev/null | tr -d '[:space:]')
+
+            # Fail CLOSED on an unreadable current version. Allowing the move
+            # here would make a transient API failure the one path that CAN move
+            # the tag backwards — the exact case this guard exists for. A failed
+            # run is recoverable: the tag is already published, and the next push
+            # to main runs this again.
+            if [ -z "$cur" ]; then
+              echo "::error::$major exists but its VERSION could not be read — refusing to move it blind."
+              exit 1
+            fi
+
+            # `sort -V` on the numbers alone. Equal is allowed: re-pointing the
+            # tag at the same version is the no-op that makes this workflow safe
+            # to run on every push.
+            if [ "$cur" != "$want" ]; then
+              newest=$(printf '%s\n%s\n' "${cur#v}" "${want#v}" | sort -V | tail -1)
+              if [ "$newest" != "${want#v}" ]; then
+                echo "::error::$major currently points at $cur and VERSION says $want — refusing to move the floating tag BACKWARDS. Every consumer pinning ?ref=$major would be downgraded on its next apply. If this is intended, move $major by hand."
+                exit 1
+              fi
+            fi
+
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" \
               -F sha="$sha" -F force=true >/dev/null || {
               echo "::error::could not move $major to $want"

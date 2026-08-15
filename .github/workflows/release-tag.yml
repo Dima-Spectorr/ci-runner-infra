@@ -10,9 +10,18 @@ name: Release tag
 # the other check cannot watch.
 #
 # So it is closed here, at the only moment the tag exists: on the tag push.
+#
+# `v*.*.*`, not `v*`. publish-tag.yml also moves a FLOATING MAJOR tag (`v5`), and
+# `v*` matches it — so every release would push `v5`, land here, and fail the
+# assertion below, because `v5` is by construction never equal to VERSION. A
+# required check that is red on every successful release is worse than absent:
+# it trains everyone to ignore the one signal that says a tag sits at the wrong
+# commit. The floating tag has no exact version to agree with, so it is not this
+# check's business; what the floating tag must satisfy — that it only ever moves
+# forward — is asserted in publish-tag.yml, before the move.
 on:
   push:
-    tags: ['v*']
+    tags: ['v*.*.*']
 
 permissions:
   contents: read
