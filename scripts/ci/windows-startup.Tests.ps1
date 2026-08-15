@@ -186,7 +186,9 @@ Describe 'slot password' {
     # cannot be read off a console during an incident wastes the incident.
     It 'contains nothing that quotes, expands or reads ambiguously' {
         foreach ($i in 1..50) {
-            -join (Get-SlotPasswordCharacter -Length 40) | Should -Match '^[A-HJ-NP-Za-hj-km-np-z2-9_.~-]+$'
+            # I, O, l, o, 0 and 1 are out; lowercase i is not a homoglyph of
+            # anything in this alphabet once uppercase I is already gone.
+            -join (Get-SlotPasswordCharacter -Length 40) | Should -Match '^[A-HJ-NP-Za-km-np-z2-9_.~-]+$'
         }
     }
 
