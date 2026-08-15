@@ -142,6 +142,15 @@ A **remote** callee is a different answer: that document is not in this
 repository, so the RUNNER3 exemption a `uses:` job gets was handing the bound to
 jobs nobody read. That is RUNNER7.
 
+Reachability is a set membership, so both sides of every edge are canonicalised
+to one absolute spelling. They were not: the caller was keyed by whatever string
+the invocation passed — `.github/workflows/ci.yml` in the documented
+`<file>...` mode — while the `./…` call target was resolved to an absolute path.
+The two never compared equal, so on the invocation the usage line documents the
+whole computation produced nothing and every callee read as unreachable. The
+fixture missed it by only ever passing absolute paths; there is now one that
+passes relative ones.
+
 ### What it cannot decide
 
 `runs-on: ${{ vars.CI_RUNNER_LABEL }}` and `runs-on: {group: warm}` resolve
@@ -233,10 +242,18 @@ against whatever the repository holds at resolution time, which is the
 mutability the gate removes.
 
 A `uses:` beginning `./` is this repository's own tree at this repository's own
-commit, already immutable, and is exempt. `--allow=<owner>` exempts an owner a
-consumer has decided to trust by tag; it exists so adoption is never
-all-or-nothing, and each use is a visible argument in the consuming workflow
-rather than a silent default here.
+commit, already immutable, and is exempt — but only the **wrapper** is. That
+manifest's own `uses: third/party@main` runs inside the calling job, on the
+calling job's runner, with the calling job's token, so the exemption is paid for
+by opening the file. Discovery walks `.github/actions/**`; a local action may
+live anywhere, so `./tools/custom-action` was exempt here and unreachable there
+— invisible to both halves at once. Each `./…` reference is now resolved and
+read where it is USED, and a cycle of mutually-calling wrappers terminates on a
+seen-set rather than recursing.
+
+`--allow=<owner>` exempts an owner a consumer has decided to trust by tag; it
+exists so adoption is never all-or-nothing, and each use is a visible argument
+in the consuming workflow rather than a silent default here.
 
 ---
 
