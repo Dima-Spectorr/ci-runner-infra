@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.5.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.6.0"
   # ...
 }
 ```
@@ -184,15 +184,38 @@ a `generic_node` resource labelled `repo` and `pool`, through one publisher
 (`scripts/telemetry.sh`). One fleet dashboard covers every repository with no
 per-repo dashboard code.
 
-`ci_demand` (queued **and** in-progress — counting queued alone collapses to
-zero the moment work starts), `ci_demand_queued`, `ci_hosts_running`,
-`ci_hosts_draining`, `ci_slots_total`, `ci_slots_busy`,
-`ci_host_idle_seconds_max`, `ci_queue_wait_seconds_max`, `ci_mig_target_size`,
-`ci_drain_verdicts{outcome}`, `ci_orphan_registrations_reaped`,
-`ci_poller_heartbeat`.
+**The pool.** `ci_demand` (queued **and** in-progress — counting queued alone
+collapses to zero the moment work starts), `ci_demand_queued`,
+`ci_hosts_running`, `ci_hosts_max`, `ci_hosts_draining`, `ci_slots_total`,
+`ci_slots_busy`, `ci_host_idle_seconds_max`, `ci_queue_wait_seconds_max`,
+`ci_job_running_seconds_max`, `ci_mig_target_size`, `ci_drain_verdicts{outcome}`,
+`ci_orphan_registrations_reaped`, `ci_poller_heartbeat`.
+
+**The controller's own health.** `ci_tick_seconds`,
+`ci_runner_list_blind_ticks`, `ci_demand_runs_skipped`,
+`ci_outcome_runs_skipped`.
+
+**The work, not the pool.** `ci_jobs_completed{workflow,outcome}` and
+`ci_job_seconds{workflow}` — per-tick deltas on a gauge, so sum them over a
+window rather than averaging, and read them next to `ci_poller_heartbeat`
+because both are absent (not zero) when nothing finished.
+
+The full list is `metric_names` on the pool module; `scripts/ci/metric-contract.selftest.sh`
+fails if the code and that output ever disagree, in either direction.
 
 `ci_orphan_registrations_reaped` should sit at zero at steady state: a pool that
 keeps reaping is losing hosts without going through the drain path.
+
+`ci_queue_wait_seconds_max` and `ci_job_running_seconds_max` are the two halves
+of a job's wall clock — how long it waited for a runner, and how long it has
+held one. The second is what makes a wedged slot visible: when a runner agent
+stops taking steps mid-job, GitHub still reports the job in flight and the
+orphan reaper deliberately backs off from a busy runner, so nothing else in the
+system can see it until the job's own `timeout-minutes` cancels it and fails a
+required check. Threshold it per repository — there is no fleet-wide number that
+is right for both a lint job and an integration suite — and alert on it together
+with `ci_demand_runs_skipped`, because it rides the same sweep and is a lower
+bound whenever that sweep ran out of budget.
 
 `ci_poller_heartbeat` is published on every tick including a failed one:
 "no data" there means the controller is down, which no other series can
