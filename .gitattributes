@@ -4,7 +4,15 @@
 # bash\r` is not an interpreter and every startup script fails at boot.
 #
 # Force LF regardless of the checkout platform's core.autocrlf.
+#
+# `.ps1` is here for a different reason, and it is not "PowerShell needs LF" —
+# it parses either way. A Windows host's boot script is embedded into the
+# instance template the same way, so its bytes are part of the template's
+# identity: checked out with CRLF on one machine and LF on another, the same
+# commit produces two different templates, and the pool recycles every host to
+# adopt a change nobody made.
 *.sh   text eol=lf
+*.ps1  text eol=lf
 *.tf   text eol=lf
 *.hcl  text eol=lf
 *.yml  text eol=lf

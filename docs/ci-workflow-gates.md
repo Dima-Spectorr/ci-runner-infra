@@ -18,8 +18,14 @@ fixtures that must run BEFORE the real check — a workflow gate that reads no
 workflow reports clean, and that vacuous pass is worse than no gate because it
 is believed.
 
-The three that read YAML parse it with PyYAML rather than grepping it. The
-e2e gate cannot: its primary input is `playwright.config.ts`, which is TypeScript,
+Three of them — the runner-policy, action-pin and workflow-shell gates — parse
+the workflow with PyYAML rather than grepping it, because each one asks a
+question about the document's *structure*. The literals gate also reads
+`.yml`/`.yaml`, and deliberately does not parse them: its question is whether a
+value appears anywhere in a file somebody will copy, which is a question about
+text, and a parse would drop the comments that are just as copy-pasteable.
+
+The e2e gate cannot parse its input at all: it is `playwright.config.ts`, which is TypeScript,
 and a shell gate is not going to evaluate it. It reads that file lexically and
 says so — see its "what it cannot decide" section — and treats anything it
 cannot read as a FAILURE rather than a pass, because the two error directions
@@ -511,7 +517,7 @@ With no `<file>` arguments it reads every tracked `*.tf`, `*.tfvars`, `*.hcl`,
 
 | id | Rule |
 |---|---|
-| `LIT0` | the gate found nothing to read, or was handed a file it cannot read |
+| `LIT0` | the gate found nothing to read, was handed a file it cannot read, or its reader exited non-zero or warned |
 | `LIT1` | no customer/region/owner literal in an executable tree (`.tf`, `.tfvars`, `.hcl`, `.sh`, `.yml`, `.yaml`) |
 | `LIT2` | no such literal inside a Markdown fenced code block |
 
