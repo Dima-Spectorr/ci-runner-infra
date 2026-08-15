@@ -84,18 +84,72 @@ project, region, pool name, machine type, slot count, bounds — into a tracked
 secret: it is the shape of the pool, and the pool is described in this
 repository's README anyway. Anything that *is* a secret stays where it is.
 
-**2. A dedicated apply identity.** A service account bound to the repo's WIF
-provider, with admin on the pool's resources and write on the state bucket.
+**2. A dedicated apply identity** — `modules/ci-runner-apply-identity`.
+
+```hcl
+module "ci_runner_apply_identity" {
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.9.0"
+
+  project_id             = var.project_id
+  name                   = var.pool_name
+  account_id             = "${var.pool_name}-apply"
+  state_bucket           = "<the bucket holding this root's tfstate>"
+  workload_identity_pool = "projects/<num>/locations/global/workloadIdentityPools/<pool>"
+
+  # the accounts the apply attaches to instances — the pool's own, and no others
+  impersonable_service_accounts = [
+    module.ci_runner_identity.service_account_email,
+    module.ci_runner_identity.controller_service_account_email,
+  ]
+}
+```
 
 **Not the runtime service account.** A runtime SA is bound to what the
 application may touch; handing it authority to rebuild the compute the
-application runs on inverts that. It is also the wrong blast radius: an apply
-identity is assumable by any workflow run on the default branch, so it should be
-able to do exactly one thing.
+application runs on inverts that, and gives a data-plane credential a
+control-plane blast radius.
 
-Bind it with the tightest principal set the provider supports —
-`principalSet://.../attribute.repository/<owner>/<repo>` at minimum, and
-`attribute.ref` where the provider maps it, so a branch cannot assume it.
+**And not an account that can apply the whole root, either** — which is the part
+worth reading twice. This identity is assumable by a GitHub Actions run, so
+everything it can do, a workflow file can do. The root creates service accounts
+and project IAM bindings, so an account able to apply it end to end holds
+`resourcemanager.projectIamAdmin` — "can grant itself owner" — reachable from
+CI, in a fleet whose pull requests auto-merge on green.
+
+So the module grants **compute and nothing else**: instance templates, the
+group, the autoscaler, `actAs` on the pool's own accounts only, read-only on
+identity and secret *metadata* so terraform can refresh, and `objectAdmin` on
+one bucket. It is deliberately incomplete, and the split it relies on is the
+one the modules already have — `ci-runner-identity` exists to survive pool
+replacement and changes almost never; `ci-runner-host-pool` is what every
+release changes, and it is compute.
+
+**When an identity change does ship, the apply fails.** That is the design. It
+stops red, naming the resource, and a human runs that one apply. An account that
+never needs a human is an account that can grant itself anything.
+
+Access is bound to a single ref, not to the repository:
+
+```
+principalSet://iam.googleapis.com/<pool>/attribute.ref/refs/heads/main
+```
+
+`attribute.repository` binds *every* branch — including one pushed by anyone
+with write access, running a workflow file they wrote, which never goes near
+`main` and so never meets branch protection. If the shared provider does not map
+`attribute.ref` yet, add it: the mapping is additive, existing principalSets keep
+resolving, and it is a one-command fix rather than a reason to widen this.
+
+```bash
+gcloud iam workload-identity-pools providers update-oidc <provider> --project=<project> --location=global --workload-identity-pool=<pool> --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref"
+```
+
+The module itself is created by the **one** apply a human still runs — the
+bootstrap. After that the automation owns the pool.
+
+(The pin above is exact because this repo's docs are asserted against `VERSION`.
+Consumers pin the floating major, `?ref=v5`, so a release reaches them without a
+per-repo bump; that is the adoption half of the table at the top.)
 
 ## What "applied" does and does not mean
 
