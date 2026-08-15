@@ -388,6 +388,7 @@ schema half of actionlint remains worth having and is not this gate.
 
 ---
 
+## `check-e2e-policy.sh`
 
 ```
 bash scripts/ci/check-e2e-policy.sh [--selftest] [--root=<dir>]
