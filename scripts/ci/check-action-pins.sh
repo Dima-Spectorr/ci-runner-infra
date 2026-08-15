@@ -315,9 +315,11 @@ check_file() {
       # rule `check-runner-policy.sh` follows for a dynamic `runs-on` — and with
       # the same opt-out, because an image chosen by an admin-scoped variable is
       # a legitimate shape a consumer may have deliberately adopted.
+      # shellcheck disable=SC2016  # `${{` is the literal GitHub opener being
+      # matched; expanding it here is exactly the bug. The directive sits on the
+      # `case` rather than the branch — shellcheck accepts it only in front of a
+      # complete command.
       case "$ref" in
-        # shellcheck disable=SC2016  # `${{` is the literal GitHub opener being
-        # matched; expanding it here is exactly the bug.
         *'${{'*)
           if [ "$ALLOW_DYNAMIC_IMAGE" -eq 0 ]; then
             err PIN4 "$rel: job '$job' $loc selects its image by expression — this gate cannot decide whether it resolves to a digest (declare --allow-dynamic-image if the value is a repository variable your admins scope)"
