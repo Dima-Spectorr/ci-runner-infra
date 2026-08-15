@@ -210,6 +210,36 @@ has_port_isolation() { # <file>
   matches "$code" 'readlink "/proc/\$dpid/ns/net"'
 }
 
+# Job containers are pulled by the SLOT's own rootless daemon, which has no
+# credentials of its own. Without a credential helper every job declaring a
+# container image from a private Artifact Registry dies at "Initialize
+# containers" with "Unauthenticated request ... downloadArtifacts"
+# (Borsh-Tablet-App, first pool run) — before a single step of the job runs.
+has_registry_credentials() { # <file>
+  local code
+  code=$(code_of "$1")
+  # a helper binary on PATH…
+  matches "$code" '/usr/local/bin/docker-credential-cijob' || return 1
+  # …that vends a BEARER token, i.e. asks the broker each time rather than
+  # baking in one that expires an hour into a host's multi-day life
+  matches "$code" 'oauth2accesstoken' || return 1
+  matches "$code" 'service-accounts/default/token' || return 1
+  # …mapped at Google registries only. credsStore would apply it to EVERY
+  # registry, sending a Google access token to docker.io on the next public pull.
+  matches "$code" '"\*\.pkg\.dev": "cijob"' || return 1
+  ! matches "$code" '"credsStore"' || return 1
+  # …and degrading to an ANONYMOUS pull when there is no token, in docker's own
+  # vocabulary. A pool with no job service account starts no broker at all, and
+  # a hard failure here would stop it pulling even a public image.
+  matches "$code" 'credentials not found in native keychain' || return 1
+  # installed before the slot users that reference it, and fatal — a host that
+  # registers without it takes jobs it cannot start
+  matches "$code" 'install_registry_credential_helper[[:space:]]*\\?$|install_registry_credential_helper[^|]*\|\|' || return 1
+  matches "$code" 'die .could not install the registry credential helper' || return 1
+  # and every slot actually gets the config naming it
+  matches "$code" 'write_slot_docker_config "\$idx"[[:space:]]*\|\|[[:space:]]*return 1'
+}
+
 # The helper carries the trap it was written to avoid, so it is tested first.
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -265,6 +295,12 @@ else
   bad "a slot can run a daemon but not a container — DNS is fenced off, or the slot has no user manager for runc's scope, or the boot probe still only asks whether the daemon is up"
 fi
 
+if has_registry_credentials "$SCRIPT"; then
+  ok
+else
+  bad "job containers are pulled without credentials — every job whose image comes from a private registry fails at 'Initialize containers' with 'Unauthenticated request ... downloadArtifacts', or the helper is wired at every registry rather than Google's alone"
+fi
+
 # --- mutation cases: prove the checks above can actually fail -----------------
 mutate() { # <description> <sed-program> <predicate> — predicate must go false
   local desc="$1" prog="$2" pred="$3" tmp
@@ -310,6 +346,13 @@ mutate "boot probe stops checking the netns" 's|readlink "/proc/$dpid/ns/net"|re
 mutate "resolver bind dropped from a unit"   '0,\|^BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf$|s|||' has_port_isolation
 mutate "unit-view DNS probe removed"         's|nsenter --net="/run/netns/$ns" getent ahostsv4|ip netns exec "$ns" getent ahostsv4|'      has_port_isolation
 mutate "namespaced DNS exception dropped"    's|-d "$md_ip" -p "$proto" --dport 53 -j ACCEPT|-d "$md_ip" -p "$proto" --dport 9 -j ACCEPT|' has_port_isolation
+
+mutate "registry helper removed"          's|/usr/local/bin/docker-credential-cijob|/usr/local/bin/true|g'          has_registry_credentials
+mutate "no-token path made fatal"         's|credentials not found in native keychain|no credentials|'                      has_registry_credentials
+mutate "helper widened to every registry" 's|"credHelpers": {|"credsStore": "cijob", "x": {|'                      has_registry_credentials
+mutate "google mapping dropped"           's|"\*\.pkg\.dev": "cijob"|"*.pkg.dev": ""|'                             has_registry_credentials
+mutate "helper install not fatal"         's|\|\| die .could not install the registry credential helper.*|\|\| true|' has_registry_credentials
+mutate "slots left without the config"    's|write_slot_docker_config "\$idx" \|\| return 1|:|'                     has_registry_credentials
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

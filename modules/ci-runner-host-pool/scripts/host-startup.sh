@@ -243,6 +243,90 @@ EOF
   return 1
 }
 
+# --- registry credentials for job containers ----------------------------------
+#
+# THE FAULT (Borsh-Tablet-App, first pool run): every job declaring
+# `container: <region>-docker.pkg.dev/...` failed before its first step with
+#
+#   Error response from daemon: error from registry: Unauthenticated request.
+#   Unauthenticated requests do not have permission
+#   "artifactregistry.repositories.downloadArtifacts"
+#
+# The runner pulls the job container with the slot's own rootless docker, and
+# that daemon has no credentials at all. On the retired one-VM-per-job runners
+# the pull inherited the VM's identity, so this cost nothing to nobody and was
+# invisible until the identities were split.
+#
+# Handing docker a static token would be the wrong shape: it expires in an hour
+# while a host lives for days. A credential helper is asked on every pull, so
+# what it returns is as fresh as the broker.
+#
+# It returns the JOB identity, not the host's — the same account the rest of the
+# job gets. A registry the job account cannot read is a grant to add in the
+# consuming repository's Terraform, where it is reviewable, and NOT a reason to
+# reach for the host account, which can read the GitHub App private key.
+install_registry_credential_helper() {
+  cat >/usr/local/bin/docker-credential-cijob <<'HELPER'
+#!/bin/sh
+# Docker credential helper — vends a JOB-identity bearer token for Google
+# container registries. `get` is the only verb docker uses for pulls; `store`
+# and `erase` must exit cleanly or docker treats a plain `docker login` as a
+# failure.
+[ "$1" = "get" ] || exit 0
+host=$(cat)
+: "${GCE_METADATA_HOST:=127.0.0.1:${CI_BROKER_PORT:-8081}}"
+token=$(curl --fail --silent --max-time 10 -H 'Metadata-Flavor: Google' \
+  "http://${GCE_METADATA_HOST}/computeMetadata/v1/instance/service-accounts/default/token" \
+  | sed -n 's/.*"access_token"[^"]*"\([^"]*\)".*/\1/p')
+# No token — say so in docker's own vocabulary and let the pull go anonymous.
+#
+# The exact string matters: the docker CLI treats it as "this registry has no
+# stored credentials" and falls back; anything else is a hard client error. A
+# hard error here would mean a pool configured with NO job service account (the
+# broker is not started at all in that case) could no longer pull even a PUBLIC
+# image — trading one repository's private-registry failure for every
+# repository's.
+#
+# The private-registry case still fails, but at the registry, with the message
+# that names the missing permission — which is readable, and is what led here.
+[ -n "$token" ] || {
+  echo "docker-credential-cijob: no token from the job credential broker at ${GCE_METADATA_HOST}" >&2
+  echo "credentials not found in native keychain"
+  exit 1
+}
+printf '{"ServerURL":"%s","Username":"oauth2accesstoken","Secret":"%s"}\n' "$host" "$token"
+HELPER
+  chmod 0755 /usr/local/bin/docker-credential-cijob
+}
+
+# Per slot, because ~/.docker/config.json is read from the HOME of whoever runs
+# the docker client, and every slot is its own user.
+#
+# Wildcards rather than a literal registry host: the module is consumed across
+# regions and projects, so a `<region>-docker.pkg.dev` written out in full here
+# would be a customer literal that silently does nothing everywhere else — and a
+# missing credential shows up as a failed pull, not as a config error. Only
+# Google registries are
+# mapped — docker.io and ghcr.io must keep pulling anonymously, which a
+# `credsStore` (all registries) would have broken by offering them a Google
+# token.
+write_slot_docker_config() {
+  local idx="$1" u
+  u=$(slot_user "$idx")
+  install -d -o "$u" -g "$u" -m 0700 "/home/$u/.docker"
+  cat >"/home/$u/.docker/config.json" <<'DOCKERCFG'
+{
+  "credHelpers": {
+    "gcr.io": "cijob",
+    "*.gcr.io": "cijob",
+    "*.pkg.dev": "cijob"
+  }
+}
+DOCKERCFG
+  chown "$u:$u" "/home/$u/.docker/config.json"
+  chmod 0600 "/home/$u/.docker/config.json"
+}
+
 # --- slots --------------------------------------------------------------------
 #
 # One agent per slot, each as its own USER, in its own directory, with its own
@@ -291,6 +375,12 @@ provision_slot_user() {
   # (buildkit needs no scope) and starting a container does not, which is how
   # this survived a boot probe that only asked the daemon whether it was up.
   loginctl enable-linger "$u" || return 1
+
+  # Credentials for the slot's own rootless daemon. Written here rather than in
+  # install_slot because it belongs to the USER, and a slot user that exists
+  # without it pulls anonymously — which fails at "Initialize containers",
+  # before any step of the job runs.
+  write_slot_docker_config "$idx" || return 1
 }
 
 # --- per-slot network namespace ----------------------------------------------
@@ -722,6 +812,11 @@ main() {
   if [ -S /var/run/docker.sock ] && docker -H unix:///var/run/docker.sock info >/dev/null 2>&1; then
     die "the rootful Docker daemon still answers on /var/run/docker.sock after masking — refusing to register agents"
   fi
+
+  # Before the slot users, because provisioning one writes the config.json that
+  # names this helper.
+  install_registry_credential_helper \
+    || die 'could not install the registry credential helper — every job running in a container from a private registry would fail its pull'
 
   local i
   for i in $(seq 1 "$SLOTS"); do
