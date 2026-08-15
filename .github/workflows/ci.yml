@@ -109,6 +109,23 @@ jobs:
       # Concretely: Pester discovers `*.Tests.ps1`, and on Linux that match is
       # case-sensitive. A file named `.tests.ps1` is a green build over a suite
       # that never ran. Raise the floor in the same pull request that adds tests.
+      # Before Pester, and deliberately outside it. Pester reports a container
+      # failure as one opaque line, so when the beacon file refuses to import
+      # there is no way to tell a broken file from a broken test harness. This
+      # step answers that question in plain pwsh, where the error is the error.
+      # It is also the assertion behind the entry-point guard: dot-sourcing this
+      # file must define functions and run nothing.
+      - name: Windows scripts are dot-sourceable
+        shell: pwsh
+        run: |
+          $p = './modules/ci-runner-host-pool/scripts/windows-beacon-publisher.ps1'
+          Write-Output "1) InvocationName when dot-sourced, as the guard sees it"
+          & { . $p; Write-Output "   imported inside a scriptblock" }
+          Write-Output "2) dot-source at top level"
+          . $p
+          Write-Output "   Get-BeaconTimestamp -> $(Get-BeaconTimestamp)"
+          Write-Output "   Get-BoundedDuration -> $(Get-BoundedDuration -Requested 0 -Minimum 20 -Maximum 600)"
+
       - name: Windows script tests (Pester)
         shell: pwsh
         run: |
