@@ -257,6 +257,7 @@ strip_expressions() {
   # IS stdin, so `sys.stdin.read()` returns the empty string and every block
   # arrives at the checker blank — a gate that reports clean on an empty file it
   # emptied itself.
+  # shellcheck disable=SC2016  # the python program must NOT be shell-expanded.
   "${PY_BIN:-python3}" -c '
 import re, sys
 
@@ -386,6 +387,7 @@ selftest() {
   }
 
   # --- WFS1: it has to parse -------------------------------------------------
+  # shellcheck disable=SC2016  # the fixture is YAML; every `$` in it is data.
   expect "a syntax error in a run: block" "WFS1" \
 'on: [push]
 jobs:
@@ -409,6 +411,7 @@ jobs:
 
   # THE headline case of issue #68: a composite action has no `jobs:`, and every
   # reader in this repository that stopped at `jobs:` called it clean.
+  # shellcheck disable=SC2016  # the fixture is YAML; every `$` in it is data.
   expect "a composite action's run: block is read" "WFS1" \
 'name: playwright-ui
 runs:
@@ -488,6 +491,7 @@ jobs:
   # cannot find. The `for` below is on line 8 of the fixture and bash reports the
   # line it chokes on, which is the one after it — so the message must carry 9,
   # a number that only comes out right if the padding is exact.
+  # shellcheck disable=SC2016  # the fixture is YAML; every `$` in it is data.
   printf '%s\n' 'on: [push]
 jobs:
   build:
@@ -510,6 +514,7 @@ jobs:
 
   # --- shellcheck, which is the other half of the gate -----------------------
   if command -v shellcheck >/dev/null 2>&1; then
+    # shellcheck disable=SC2016  # the fixture is YAML; every `$` in it is data.
     expect "an unquoted expansion is a shellcheck finding" "WFS2" \
 'on: [push]
 jobs:
@@ -520,6 +525,7 @@ jobs:
           f=$1
           rm $f'
 
+    # shellcheck disable=SC2016  # the fixture is YAML; every `$` in it is data.
     expect "an inline shellcheck directive is honoured" "" \
 'on: [push]
 jobs:
@@ -534,6 +540,7 @@ jobs:
     # SC2154 is excluded on purpose: inside a `run:` block every `env:` value
     # and every `$GITHUB_*` arrives from the runner, so leaving it on would
     # bury the real findings under one code.
+    # shellcheck disable=SC2016  # the fixture is YAML; every `$` in it is data.
     expect "a runner-supplied variable is not an unassigned one" "" \
 'on: [push]
 jobs:
