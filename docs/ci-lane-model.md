@@ -296,6 +296,12 @@ continues still reports red, so nothing is loosened.
   compliant. The whole contract, and the gate that asserts it, is in
   [`ci-merge-queue-baseline.md`](ci-merge-queue-baseline.md) — adopt it with
   this model, not after it.
+- **A base move re-checks the lanes it can affect, not all of them.** The lane
+  rule answers how much CI a *diff* deserves; it does not answer what a move of
+  the default branch under an in-flight pull request deserves. That is the
+  per-lane suite reuse key in [`ci-suite-reuse.md`](ci-suite-reuse.md), which is
+  computed over the same `dorny/paths-filter` document the lane is gated on —
+  adopt this model first, it is where those declared paths come from.
 - `checks_timeout` must be **pinned** in every `queue_rules` entry. Unpinned, it
   inherits an undeclared vendor default of roughly 42 minutes, so a hung job
   surfaces as a silent dequeue rather than a red check.

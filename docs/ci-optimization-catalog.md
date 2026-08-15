@@ -385,6 +385,14 @@ Additional queue-level items:
 - **Single source of conditions.** Several configs duplicate the same check list
   in `queue_rules.merge_conditions` and in `pull_request_rules.conditions`.
   When the two drift, PRs stick with no visible error. Keep one list.
+- **Per-lane suite reuse.** The queue's re-check after a base move is legitimate
+  — it is how a semantic conflict between two independently-green PRs is caught
+  — but most merges cannot change most PRs. A documentation merge costs one full
+  suite per PR still in flight and provably cannot change an outcome.
+  Content-address each lane over its declared inputs in the merge-result tree
+  and reuse the recorded green result: `scripts/ci/suite-reuse-key.sh`, adopted
+  through [`ci-suite-reuse.md`](ci-suite-reuse.md). Fails closed on every doubt,
+  and no lane reuses across a CI-process change.
 
 ---
 
@@ -536,3 +544,4 @@ Ranked by saved pool-seconds per unit of work, with dependencies respected.
 | 12 | Build-once/reuse, Docker layer cache, remote monorepo cache | 3.4, 4.3, 4.4 |
 | 13 | SHA-pin actions — gate shipped v5.4.0, 344 findings to land | 7 |
 | 14 | Fast/heavy runner classes and shared overflow capacity | 2.3, 2.4 |
+| 15 | Per-lane suite reuse across base moves — rule shipped, adoption to land | 6 |
