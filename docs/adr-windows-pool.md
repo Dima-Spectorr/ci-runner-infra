@@ -3,6 +3,10 @@
 Status: **proposed** (design only; nothing here is implemented).
 Supersedes: the "Windows" section of `docs/onboarding-a-repository.md`, which
 records the current state rather than a decision.
+Amended 2026-08-16: **§3A supersedes phase 2 of §3 in full** and rewrites parts of
+§2, §4, §5, §6 and §7. Phase 2 as originally written cannot work — the mechanism
+is refuted by Microsoft's documented firewall rule precedence. Read §3A before
+acting on anything below that mentions "the fence".
 
 ## Why this is being written
 
@@ -200,8 +204,10 @@ And at boot, each of these makes the host register **nothing**:
   image without `dockerd-rootless.sh`, and for the same reason: an older image
   silently returns every slot to a shared state the split exists to remove;
 * any slot user not created, or its profile/workspace ACL not asserted;
-* the metadata fence not installed **or not proved from a slot user's own
-  context** (§3);
+* ~~the metadata fence not installed **or not proved from a slot user's own
+  context** (§3)~~ — **superseded by §3A**: there is no fence. Read instead: the
+  host identity not proved harmless from a slot user's own context — a host whose
+  service account can still read the App key secret registers nothing;
 * the job credential broker configured and not answering;
 * the per-job credential reset hooks not installed;
 * the liveness beacon not published at least once (§2).
@@ -339,9 +345,11 @@ attributes values including scripts and applications that don't have sudo or
 administrator level privileges."* Guest attributes are **not** a privilege
 boundary inside the VM.
 
-They do not need to be, for three reasons that compose:
+They do not need to be, for three reasons that compose. **Amended by §3A: reason 1
+is void — there is no fence — and reason 2 is narrower. Reason 3 carries this
+alone, and it can.**
 
-1. **The write goes through the fence.** The guest-attributes `PUT` is an
+1. ~~**The write goes through the fence.**~~ **Void (§3A).** The guest-attributes `PUT` is an
    ordinary call to the metadata server on `169.254.169.254:80` — the same
    address and the same port the metadata fence blocks. There is no separate
    channel. On a host whose fence is intact, job code cannot write a guest
@@ -508,6 +516,18 @@ in a surprise.
 
 ### Phase 2 — the metadata fence
 
+> **SUPERSEDED IN FULL BY §3A (2026-08-16).** The mechanism below cannot work:
+> Windows Firewall gives explicit block rules precedence over any conflicting
+> allow rule and supports no administrator-assigned ordering, so the three
+> `-Service` allow rules do not sit "above" the block — they lose to it, and the
+> rule set blocks the guest agent, the beacon and the broker. A second,
+> independent refutation is visible in the phase ordering here: phase 5 mints a
+> registration token, which needs a GCP access token, which needs the metadata
+> server — and the boot script is not one of the three exempt services, so phase 5
+> could not run either. The threat statement in the first paragraph is still
+> correct and still governs; everything after it is retained only so the argument
+> can be read against §3A's refutation.
+
 *The reason is unchanged and is the most important sentence in this document.*
 Job code that reaches `169.254.169.254:80` mints an access token for the host
 service account, which reads the GitHub App private key from Secret Manager and
@@ -575,8 +595,11 @@ keeps serving every pool while the broker stays versioned with the module and
 covered by `scripts/ci/job-broker.selftest.py`. What does not travel is the
 systemd unit.
 
-It runs as a Windows service named `ci-job-broker`, because the fence exemption is
-scoped to a service SID and a scheduled task does not have one. Windows has no
+It runs as a Windows service named `ci-job-broker`. ~~because the fence exemption
+is scoped to a service SID and a scheduled task does not have one~~ — **§3A: that
+reason is void; the remaining ones are lifecycle, not safety** (SCM start/stop and
+restart policy, a per-service environment block, and one uniform way to ask
+whether it is running). Windows has no
 in-box way to run an arbitrary interpreter as a service, so the golden image bakes
 a small generic service host — a service shim that starts one configured child
 process and stops it on `SERVICE_CONTROL_STOP` — compiled at image build from the
@@ -693,6 +716,11 @@ takes, and phase 6 is what stops a half-working version from registering.
 
 ### Phase 6 — the fail-closed boot probe
 
+> **The check list below is superseded by "What phase 6 must prove instead" in
+> §3A.** The principle survives verbatim; the first bullet is now false by design
+> and is replaced by a negative-capability assertion on the token the endpoint
+> yields.
+
 The Linux probe's principle is the one to carry: **assert the capability, not the
 daemon**. Both faults it was written for left `docker info` answering on hosts
 where no job could run a container. Every check below runs *as a slot user*,
@@ -717,6 +745,234 @@ Deliberately **not** in the probe: starting a container (there are none) and
 running a build (it would need the network and a repository, turning an upstream
 hiccup into a fleet that refuses to register). The Linux script's reasoning for
 what it leaves out applies unchanged.
+
+---
+
+## 3A. Amendment, 2026-08-16 — the fence has no Windows mechanism
+
+**This section supersedes phase 2 of §3 in full.** Phase 2 does not describe a
+control that can exist. What follows is the refutation, the re-derivation of what
+the fence was actually for, the candidates, and the decision.
+
+### The finding
+
+Phase 2 specifies one host-wide outbound **block** rule to `169.254.169.254`
+TCP/80 and, "above it", three `-Service`-scoped **allow** rules for `GCEAgent`,
+`ci-beacon` and `ci-job-broker`. Windows Firewall does not resolve that
+combination the way phase 2 assumes. Microsoft Learn, *Windows Firewall Rules*,
+"Rule precedence for inbound and outbound rules"
+(`https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/rules`):
+
+> 2. Explicit block rules take precedence over any conflicting allow rules.
+> 3. More specific rules take precedence over less specific rules, except if
+>    there are explicit block rules as mentioned in 2.
+
+and, in the same section:
+
+> Outbound rules follow the same precedence behaviors.
+>
+> Windows Firewall doesn't support weighted, administrator-assigned rule
+> ordering.
+
+There is no "above it". `-Service` is a match condition and nothing more —
+`New-NetFirewallRule`'s own reference
+(`https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule`)
+defines it as *"the short name of a Windows Server 2012 service to which the
+firewall rule applies"*, with no precedence semantics attached. Specificity does
+not help either, because clause 3 exempts itself in the presence of a block.
+
+The one documented way an allow defeats a block is `-OverrideBlockRules`, and its
+own reference closes the door:
+
+> Indicates that matching network traffic that would otherwise be blocked are
+> allowed. The network traffic must be authenticated by using a separate IPsec
+> rule. […] If this parameter is specified, then the *Authentication* parameter
+> cannot be set to NotRequired.
+
+The outbound wording relaxes one precondition and not the load-bearing one — *"No
+accounts are required in the RemoteMachine or RemoteUser parameter for an outbound
+bypass rule"* removes the **account** requirement, not the **authentication**
+requirement. An IPsec connection security rule to the GCE metadata server would
+need the metadata server to be an IKE peer. No primary source describes one, and
+Google documents the metadata server as a plain HTTP endpoint reached with a
+`Metadata-Flavor: Google` header. Treat it as unavailable.
+
+So the phase-2 rule set, installed exactly as written, blocks `GCEAgent`, the
+beacon and the broker along with the slot accounts. The instance loses its guest
+agent, the liveness gate of §2 stops publishing, and jobs lose ADC.
+
+**The shape of this mistake is the one phase 2 itself warned about, one level up.**
+Phase 2 rejected `-LocalUser` with the sentence *"a fence that installs cleanly
+and enforces nothing is worse than no fence, because it survives review"*. The
+replacement has the mirror flaw: it installs cleanly and enforces **everything**.
+Phase 6 would have caught it — the broker readiness check fails, the host refuses
+to register — which is the fail-closed design working as intended, and is also the
+point at which the correct conclusion becomes "we built the wrong mechanism"
+rather than "we mis-set a parameter". Discovering that after PRs 3–6 have shipped
+is the cost this amendment exists to avoid.
+
+### What the fence was actually for, and the two things phase 2 conflated
+
+The threat statement in phase 2 is still the most important sentence in this
+document, but it is two claims welded together, and they have different answers:
+
+**(a) Job code minting an access token for the host service account.** This is the
+fleet. Today the host account holds `roles/secretmanager.secretAccessor` on the
+GitHub App private key (`modules/ci-runner-identity/main.tf`,
+`google_secret_manager_secret_iam_member.runner_reads_key`), because
+`host-startup.sh` mints its own registration tokens: `gh_token()` runs
+`gcloud secrets versions access latest --secret="$KEY_SECRET"`, signs a JWT, and
+exchanges it for an installation token. Anything holding a host token holds the
+App key, and therefore holds every repository the App is installed on. It also
+holds `roles/monitoring.metricWriter` and `roles/logging.logWriter`
+project-wide — enough to write the demand series the autoscaler reads.
+
+**(b) Job code reading instance metadata attributes generally.** This is not the
+fleet, and today it is not even a secret. The attributes this module sets are
+`ci-github-owner`, `ci-github-repo`, `ci-app-id`, `ci-app-installation-id`,
+`ci-app-key-secret` (the *name* of a secret, not its value), `ci-runner-labels`,
+`ci-runner-group`, `ci-slots`, `ci-pool`, `ci-job-service-account`,
+`ci-job-broker-port`, `ci-job-broker-py`. A job that reads all of them learns
+which repository it is serving, which it already knows. Google is explicit that
+this class of read needs no privilege at all: *"Your compute instances
+automatically access this metadata through the metadata server API without
+needing additional authorization"*
+(`https://docs.cloud.google.com/compute/docs/metadata/querying-metadata`).
+
+The Linux fence closes (a) and (b) together because iptables owner-matching is
+cheap and there was no reason to separate them. On Windows there is no mechanism
+that closes either one, so the separation stops being academic: **(a) must be
+closed by removing the value, and (b) must be accepted and designed around.** The
+consequence of (b) being accepted is a rule, not a shrug: **no credential of any
+kind may be placed in instance metadata on a Windows pool**, and §3A's chosen
+option has to satisfy that while still getting a registration token to the host.
+
+### Candidates
+
+| mechanism | status | why |
+|---|---|---|
+| block + `-Service` allow exemptions (phase 2 as written) | **rejected** | refuted above. Explicit block beats any allow; no administrator-assigned ordering; `-OverrideBlockRules` needs IPsec the metadata server does not speak |
+| `-LocalUser` per-slot rules | **rejected** (unchanged from phase 2) | `-LocalUser` matches only packets *"authenticated as coming from or going to a principal"*; there is no authenticated channel to the metadata server |
+| **block** rule scoped `-Service` to the runner services, so job code inherits the match | **workaround, unprovable — treated as unavailable** | this is the only candidate that respects precedence: a block that simply does not match the exempt traffic, needing no allow at all. It rests on job processes carrying the runner service's SID and WFP examining it. **No primary source found** for either. Microsoft's own troubleshooting material describes the opposite cases — a service that impersonates binds in the *user's* context and WFP sees the user SID, and worker-thread I/O loses the service correlation (`https://learn.microsoft.com/en-us/windows/win32/fwp/wmi/wfascimprov/msft-netfirewallrulefilterbyservice`; the archived forum note at `https://learn.microsoft.com/en-us/archive/msdn-technet-forums/f2bf0f58-6332-44ec-81c9-61e2b42097dd`). It is also **unprovable by the phase-6 boot probe**, which does not run as a descendant of the runner service; proving it would require the assertion to move into `ACTIONS_RUNNER_HOOK_JOB_STARTED`, i.e. into every job. A boundary this repository cannot state a source for and cannot prove at boot is not a boundary |
+| profile-wide `Set-NetFirewallProfile -DefaultOutboundAction Block` plus an allow-list | **supported and documented, rejected on feasibility** | Microsoft names it and scopes it correctly: *"Changing the outbound rules to blocked can be considered for certain highly secure environments"*, requiring *"an inventory of all apps […] Administrators need to create new rules specific to each app that needs network connectivity"*. A CI host's job code is by definition an un-enumerable set of programs reaching an un-enumerable set of registries. The allow-list that makes CI work is `*`, at which point the default action buys nothing |
+| host-wide block with **no** exemptions | **supported and documented, rejected on cost** | this is the only firewall configuration that is both documented and effective, and it costs all three consumers at once: the guest agent (Google does not document a supported GCE Windows instance whose guest agent cannot reach the metadata server), the §2 beacon (guest attributes are written by `PUT` to the same endpoint on the same port), and job ADC (the broker mints via the real metadata server). Losing the beacon loses the delete gate, which loses scale-in, which is most of what this work is for |
+| deliver the registration token via **guest attributes** | **rejected — the channel does not exist in that direction** | Google is explicit: *"Users or service accounts outside of the VM cannot write to guest attributes metadata values"* (`https://docs.cloud.google.com/compute/docs/metadata/manage-guest-attributes`). Guest attributes are guest→outside only. The same page also says *"Any process running in the VM instance can write to the guest attributes values including scripts and applications that don't have sudo or administrator level privileges"* and *"Don't include sensitive information such as […] private keys or passwords in your guest attributes"* — so even if the direction worked, it would be the wrong place |
+| deliver the registration token via **instance metadata**, written per-instance by the controller | **supported and documented, chosen — with a bounded exposure stated below** | `compute.instances.setMetadata` on a running instance is within the controller's existing `roles/compute.instanceAdmin.v1`; the guest reads it, and `wait-for-change` is a documented way to block until it appears (`https://docs.cloud.google.com/compute/docs/metadata/querying-metadata`). It is readable by job code — see the residual-risk paragraph. GitHub bounds it independently: *"The token expires after one hour"* (`https://docs.github.com/en/rest/actions/self-hosted-runners`) |
+| **remove the value behind the endpoint** — a Windows pool host identity with nothing worth stealing | **supported and documented, chosen** | detailed below |
+| `--ephemeral` / `generate-jitconfig` runners, removing the registration token entirely | **rejected here** | JIT config is documented, but the recycle contract in §3 phase 5 and the README depend on agents *not* being ephemeral: a deregistered slot must stay deregistered so a cordoned host can retire. Changing that is a fleet-wide change to how hosts drain, not a Windows detail |
+| source-port, interface or route tricks to make the block rule miss the exempt traffic | **rejected** | a non-administrator can bind the same source port; Windows does not reserve low ports to administrators. No primary source treats any of these as an access-control boundary |
+| WFP callout driver, AppContainer-launched job processes, Windows containers | **rejected** | the first is a kernel driver this fleet would own forever; the second is not something the GitHub runner can be told to do and no primary source describes it; the third is refused in §4 for the reason the pool exists at all |
+
+### Decision
+
+**A Windows pool gets no egress fence.** Phase 2 is deleted rather than replaced,
+and its safety property is relocated into IAM, where Windows has a boundary that
+is real.
+
+1. **The Windows pool's host service account holds `roles/iam.serviceAccountTokenCreator`
+   on the job service account and nothing else.** No `secretmanager.secretAccessor`,
+   no `monitoring.metricWriter`, no `logging.logWriter`. TokenCreator is not an
+   escalation: the broker's entire purpose is to vend exactly that token to job
+   code, so a job that mints one directly has obtained what it was going to be
+   given. Everything else is removed because a Windows host cannot defend it.
+2. **The registration token is minted by the controller, not by the host.** The
+   controller already reads the App key (`controller_reads_key`) and already mints
+   installation tokens for the queue poll, so this moves a call rather than adding
+   a capability. It writes the repository registration token to a per-instance
+   metadata key, and **deletes that key** once the host's agents appear in
+   GitHub's runner list. The host reads it with `wait-for-change`.
+3. **Nothing else on a Windows host needs GCP permissions.** The beacon's guest-attribute
+   `PUT` is an unauthenticated call to the metadata server and needs no IAM. The
+   warm cache and the toolchains are baked by Packer, not pulled at boot. The
+   broker needs its impersonation call and that is item 1.
+4. **On Linux nothing changes.** The Linux fence works, is proved on a live host,
+   and the Linux host account keeps its Secret Manager grant and mints its own
+   registration tokens as it does today. This is a Windows-pool identity, selected
+   by `host_os`, not a fleet-wide re-plumbing.
+
+*Why not keep a credential in a SYSTEM-ACL'd file instead.* NTFS ACLs are the one
+enforcement boundary on this platform that does behave as documented — a
+non-administrator slot account genuinely cannot read a file granted only to SYSTEM
+and Administrators, and phase 1 and phase 4 already lean on exactly that. It does
+not help here. The credential the host needs is the App private key, and putting
+the App private key on a CI host in any form is a strictly worse posture than
+today's *"read it from Secret Manager, hold it for the length of one signing
+call"* — it converts a revocable, audited, short-lived read into a durable secret
+on a machine that executes pull-request code, defended by an ACL that one
+privilege-escalation bug undoes. A long-lived service-account key file is the same
+trade with an extra credential type nobody wants. The ACL is the right tool for
+the hook scripts and the slot profiles; it is the wrong tool for the key that owns
+the fleet.
+
+### Residual risk, honestly
+
+**Job code on a Windows host can reach the metadata server, and there is no
+mechanism in this design that stops it.** Concretely: a job can mint an access
+token for the host service account and impersonate the job service account —
+which the broker was going to hand it anyway, so this costs nothing beyond making
+the broker cosmetic on Windows. It can read every instance attribute, and every
+**project**-level metadata attribute, which is the one that is not this module's
+to control: project-wide SSH keys and any custom project metadata the consuming
+estate has set are visible to any Windows CI job, and an estate that keeps
+anything sensitive in project metadata must be told so in onboarding. It can read
+the host's Google-signed identity token, so any service that trusts the host
+service account's OIDC identity trusts a pull request. It can write and forge
+guest attributes, including the beacon. And during the window between the
+controller writing the registration token and the controller deleting the key —
+or, failing that, the token's one-hour expiry — it can read a repository
+registration token and register a runner with labels of its choosing, which is a
+job-interception attack against that one repository. What it can **not** do is
+read the GitHub App private key, write the demand metric the autoscaler reads, or
+touch any repository other than the one its own pool serves. That is the whole of
+the reduction, and it is the reduction that matters: the #1958 finding was "any
+workflow on a fork-able branch owns the fleet", and after this change the worst
+case is "a workflow can interfere with the repository it is already running for".
+The two rules §4 already calls load-bearing — **one repository per pool** and
+**fork pull requests never run on a warm host** — are now the only isolation
+boundary a Windows pool has, and they must be enforced, not documented.
+
+**What §2's beacon argument loses.** The subsection "Can job code forge the
+beacon?" gives three reasons the beacon need not be a privilege boundary. Reason 1
+("the write goes through the fence") is void — delete it. Reason 2 becomes
+narrower and still holds: an attacker who can forge a beacon can also mint a host
+token, and after this change that token is worth the job service account, which
+the broker vends regardless. Reason 3 is untouched and is now carrying the weight
+alone, which it can: GitHub refuses to deregister an agent that is executing a
+job, that refusal is issued from outside the host, and the beacon is only ever
+consulted *after* every agent on the host has already been deregistered. A forged
+`workers = 0` deletes a host that is idle, which is what was about to happen.
+
+### What phase 6 must prove instead
+
+The probe's principle is unchanged and is the reason it survives: **assert the
+capability, not the daemon.** But "a slot user cannot reach the token endpoint" is
+no longer a property this design has, so asserting it would fail every boot. It is
+replaced by the assertion that the token the endpoint yields is worthless. Run as a
+slot user, every one fatal:
+
+* The token endpoint **does** answer, and the token it returns **cannot** read the
+  secret named by `ci-app-key-secret` — assert a `403` from
+  `secretmanager.versions.access`. This is the phase-2 threat statement turned
+  into a live negative-capability check, and it is strictly better evidence than
+  the old probe: it tests the thing that actually matters (what the credential can
+  do) rather than a proxy for it (whether a socket opens).
+* That same token **cannot** write a time series — assert a `403` from
+  `monitoring.timeSeries.create`. The demand metric is what scales the pool.
+* No instance attribute contains a credential: assert that the
+  registration-token key is **absent** by the time the probe runs. This is the
+  check that keeps the "no credential in metadata" rule from decaying into a
+  comment, and it is also how the controller's delete-the-key step gets a witness.
+* The broker answers, and the identity in the token it vends is
+  `ci-job-service-account` and not the host account. Both halves, because a broker
+  that silently fell back to the host identity is the failure this whole design
+  exists to prevent.
+* Sibling profile and workspace reads are denied; the warm cache is writable; names
+  resolve; the beacon has published once and is fresh. Unchanged.
+
+A Windows pool whose host identity was not reduced fails the first two checks and
+refuses to register. That is deliberate: the misconfiguration cannot be caught at
+plan time (Terraform cannot see the IAM a caller's service account happens to
+hold), so it is caught at boot, by the host, in the identity it is worried about.
 
 ---
 
@@ -763,10 +1019,17 @@ variable. *Consequence for the pool operator:* a repository whose Windows jobs
 cannot do that runs `slots_per_host = 1` and still keeps the entire warm-boot and
 warm-cache saving, which is the bulk of what this change is for.
 
-**Per-user egress filtering.** The fence is host-wide with a service allow-list
-(§3), not per-slot. The practical difference is small — no slot is exempt, and
-SYSTEM is not exempt either — but it means the fence cannot express "slot 1 may
-reach X and slot 2 may not", which on Linux it could.
+**Egress filtering of any kind, including the metadata fence.** ~~The fence is
+host-wide with a service allow-list (§3), not per-slot.~~ **Superseded by §3A:**
+there is no fence at all. Windows has no documented mechanism that lets an allow
+rule survive a host-wide block, and no documented per-principal outbound filter
+that works without IPsec. A Windows CI job can reach `169.254.169.254:80` and mint
+a token for the host service account. The boundary is moved into IAM — that
+account is reduced until the token is worth only what the broker was going to hand
+the job anyway — and the full residual, including what a job *can* still read, is
+stated in §3A. *Consequence for the pool operator:* on a Windows pool, **one
+repository per pool** and **no fork pull requests on a warm host** are not defence
+in depth. They are the defence.
 
 **Spot.** Refused (§1).
 
@@ -810,14 +1073,22 @@ repository must never need the fleet to be healthy in order to fix the fleet:
    `scripts/ci/host-startup.selftest.sh`. It asserts the invariants whose
    breakage is silent, and — this is the part that makes it evidence rather than
    decoration — it breaks the script the way a later edit plausibly would and
-   asserts that it notices. The invariants: the fence is installed before any
-   agent is registered; the fence blocks port 80 and does not touch port 53; the
-   fence's allow rules are `-Service`-scoped and the exemption list is exactly the
-   three named services; `--disableupdate` is an argument to `config.cmd` and not
-   a word in a comment; service recovery actions are cleared; the hook path is set
-   unconditionally rather than only when a job service account exists; the beacon
-   is started before the first agent; the boot probe runs as a slot user and its
-   metadata check is fatal.
+   asserts that it notices. The invariants (**amended by §3A**: the four
+   fence-shaped mutations are deleted and four identity-shaped ones replace them,
+   because there is no fence to mutate): ~~the fence is installed before any agent
+   is registered; the fence blocks port 80 and does not touch port 53; the fence's
+   allow rules are `-Service`-scoped and the exemption list is exactly the three
+   named services~~ — the script contains **no** `New-NetFirewallRule` at all, so
+   a future edit cannot reintroduce a fence that reviews as working; the boot probe
+   asserts a **403** from the secret and time-series calls rather than a failed
+   connection, so an edit that reverts it to "the endpoint is unreachable" is
+   caught; the probe asserts the registration-token metadata key is absent; the
+   script never writes a credential to instance metadata or to guest attributes;
+   `--disableupdate` is an argument to `config.cmd` and not a word in a comment;
+   service recovery actions are cleared; the hook path is set unconditionally
+   rather than only when a job service account exists; the beacon is started
+   before the first agent; the boot probe runs as a slot user and every check is
+   fatal.
 4. **Pester**, run by `pwsh` on `ubuntu-latest`, over the script's *pure*
    functions — slot naming, the ACL descriptor construction, the beacon payload
    format, the metadata-attribute parsing. This requires the script to be
@@ -857,7 +1128,8 @@ existing files, and one of them should land before a single `.ps1` does:
 
 ## 6. Delivery
 
-Nine pull requests. Each is independently mergeable, each leaves the fleet
+~~Nine~~ **Ten** pull requests (§3A inserts 4b and shifts the versions after it).
+Each is independently mergeable, each leaves the fleet
 working, and a Linux consumer is unaffected at every step — the module's
 behaviour with `host_os` unset is byte-identical to today until PR 8, which is
 the only one that changes a code path an existing pool executes.
@@ -874,12 +1146,13 @@ publish a tag nobody can resolve.
 | 1 | v5.10.0 | **The gates learn to see PowerShell.** Genericity sweep includes `*.ps1`; parse + PSScriptAnalyzer steps; `bounded-calls` reads `.ps1`. Lands before any `.ps1` exists, so no window exists in which a literal or an unbounded call could enter unseen. | `.github/workflows/ci.yml`, `scripts/ci/bounded-calls.selftest.sh`, a fixture `.ps1` | ~130 | `bounded-calls` self-test gains fixtures proving it FAILS on an unbounded `Invoke-RestMethod` and passes on a bounded one — a detector that has not been seen to fire is not a detector |
 | 2 | v5.11.0 | **`beacon_decision()` as a pure rule**, plus its self-test. Nothing calls it. | `modules/ci-runner-host-pool/scripts/beacon-decision.sh`, `scripts/ci/beacon-decision.selftest.sh`, `ci.yml`, `README.md` | ~260 | the self-test, covering every row of the table in §2 including read-failed-vs-read-empty and the confirm-tick floor |
 | 3 | v5.12.0 | **Windows boot script, part 1**: preflight, image assertion, beacon publisher, slot accounts, ACLs, per-slot TEMP. Unreferenced by Terraform. | `modules/.../scripts/windows-host-startup.ps1` (new), `scripts/ci/windows-host-startup.selftest.sh` (new), Pester tests, `ci.yml` | ~380 | parse + analyzer + the structural mutations + Pester on the pure functions |
-| 4 | v5.13.0 | **Windows boot script, part 2**: the metadata fence and its proof, the broker service, the reset hooks. | same script, same self-test | ~340 | mutations asserting port-80-only, the exact `-Service` exemption list, fence-before-agents, hook-set-unconditionally |
-| 5 | v5.14.0 | **Windows boot script, part 3**: agent registration as a service, recovery actions cleared, the boot probe. | same script, same self-test | ~320 | mutations asserting `--disableupdate`, cleared recovery actions, probe-as-slot-user, probe-is-fatal |
-| 6 | v5.15.0 | **The Windows golden image.** Second Packer source, WinRM communicator, the service-host shim, the warm-cache ACL, the image version marker. Repo-agnostic. | `packer/ci-host-image-win.pkr.hcl`, `packer/warm-cache/none.ps1`, `ci.yml` | ~330 | `packer validate` on both templates (new step); the template's own in-build assertions, which are the Windows counterpart of the Linux "assert the host baseline" and "prove a rootless daemon starts" provisioners |
-| 7 | v5.16.0 | **The OS axis in Terraform.** `host_os`, the metadata-key selection, `ci-host-os`, every plan-time refusal from §1, the changed docstrings. A Windows pool becomes declarable. | `variables.tf`, `main.tf`, `scripts/ci/host-os-guard.selftest.sh` (new), `ci.yml` | ~300 | a self-test asserting that with `host_os` unset the rendered metadata key set is unchanged, and that each refusal in §1 is reachable — a precondition nothing can trip is not a precondition |
-| 8 | v5.17.0 | **The controller's Windows delete gate.** `drain_host()`'s second gate branches on `ci-host-os`: unchanged SSH text on linux, `beacon_decision()` on windows. New telemetry. | `scripts/controller-startup.sh`, `main.tf`, `outputs.tf`, `scripts/ci/metric-contract.selftest.sh`, `scripts/ci/controller-scope.selftest.sh` | ~260 | `controller-scope` self-test, which **runs** the function under both values rather than reading it — this is the one PR that can break a Linux pool, and reading the diff is exactly what failed to catch `v5.1.4` |
-| 9 | v5.18.0 | **Docs and the workflow gate.** `onboarding-a-repository.md` "Windows" rewritten from "the fleet is Linux only" to the adoption sequence; README isolation rules gain the Windows paragraph; `check-runner-policy.sh` rejects `container:`/`services:` on a Windows pool label. | `docs/onboarding-a-repository.md`, `README.md`, `scripts/ci/check-runner-policy.sh` | ~220 | the runner-policy gate's own `--selftest` fixtures, then this repository's own workflows; `docs-pins` self-test for the version in the new quickstart |
+| 4 | v5.13.0 | **Windows boot script, part 2** — **rescoped by §3A**: ~~the metadata fence and its proof~~, the broker service, the reset hooks. The fence half is deleted, not deferred; the PR shrinks to roughly half. | same script, same self-test | ~~~340~~ ~190 | ~~mutations asserting port-80-only, the exact `-Service` exemption list, fence-before-agents~~; mutations asserting the script contains no `New-NetFirewallRule`, writes no credential to metadata or guest attributes, and sets the hooks unconditionally |
+| **4b** | **v5.14.0** | **NEW, required by §3A: the reduced Windows host identity and controller-minted registration token.** A Windows pool's host account gets `serviceAccountTokenCreator` on the job account and nothing else; the controller mints the repository registration token, writes it to a per-instance metadata key, and deletes the key once the host's agents appear. The boot script waits for it with `wait-for-change` instead of reading Secret Manager. **This is the PR that carries the security property phase 2 was supposed to carry, and it is a mandatory security review.** | `modules/ci-runner-identity/{main,variables,outputs}.tf`, `modules/ci-runner-host-pool/{main,variables}.tf`, `scripts/controller-startup.sh`, `modules/.../scripts/windows-host-startup.ps1`, `scripts/ci/controller-scope.selftest.sh` | ~340 | a controller self-test that **runs** the mint-write-delete sequence against a fake compute API and asserts the key is deleted; a Terraform self-test asserting a Linux pool's identity and its Secret Manager grant are byte-identical to today |
+| 5 | v5.15.0 | **Windows boot script, part 3**: agent registration as a service, recovery actions cleared, the boot probe — **whose assertions are the §3A list, not the §3 list**. | same script, same self-test | ~320 | mutations asserting `--disableupdate`, cleared recovery actions, probe-as-slot-user, probe-is-fatal, and that the probe asserts a **403** rather than an unreachable endpoint |
+| 6 | v5.16.0 | **The Windows golden image.** Second Packer source, WinRM communicator, the service-host shim, the warm-cache ACL, the image version marker. Repo-agnostic. **§3A note:** the shim's justification was *"the fence exemption is scoped to a service SID and a scheduled task does not have one"*. That reason is gone. It stays for lifecycle reasons — SCM start/stop, recovery policy, a service environment block — and must be reviewed as a convenience, not as a safety boundary. | `packer/ci-host-image-win.pkr.hcl`, `packer/warm-cache/none.ps1`, `ci.yml` | ~330 | `packer validate` on both templates (new step); the template's own in-build assertions, which are the Windows counterpart of the Linux "assert the host baseline" and "prove a rootless daemon starts" provisioners |
+| 7 | v5.17.0 | **The OS axis in Terraform.** `host_os`, the metadata-key selection, `ci-host-os`, every plan-time refusal from §1, the changed docstrings. A Windows pool becomes declarable. **§3A adds one refusal:** `host_os = "windows"` fails at plan unless the pool declares controller-minted registration (the input added by PR 4b). Terraform cannot see what IAM a passed-in service account holds, so this is the only plan-time guard available and the real one is the boot probe. | `variables.tf`, `main.tf`, `scripts/ci/host-os-guard.selftest.sh` (new), `ci.yml` | ~320 | a self-test asserting that with `host_os` unset the rendered metadata key set is unchanged, and that each refusal in §1 and §3A is reachable — a precondition nothing can trip is not a precondition |
+| 8 | v5.18.0 | **The controller's Windows delete gate.** `drain_host()`'s second gate branches on `ci-host-os`: unchanged SSH text on linux, `beacon_decision()` on windows. New telemetry. | `scripts/controller-startup.sh`, `main.tf`, `outputs.tf`, `scripts/ci/metric-contract.selftest.sh`, `scripts/ci/controller-scope.selftest.sh` | ~260 | `controller-scope` self-test, which **runs** the function under both values rather than reading it — this is the one PR that can break a Linux pool, and reading the diff is exactly what failed to catch `v5.1.4` |
+| 9 | v5.19.0 | **Docs and the workflow gate.** `onboarding-a-repository.md` "Windows" rewritten from "the fleet is Linux only" to the adoption sequence; README isolation rules gain the Windows paragraph; `check-runner-policy.sh` rejects `container:`/`services:` on a Windows pool label. **§3A adds two obligations:** onboarding must state in the operator's own words that a Windows job can read the project's metadata and mint the host identity, so an estate keeping anything sensitive in project metadata knows before it opts in; and the "one repository per pool / no fork PRs on a warm host" rules must be written as Windows *requirements*, not recommendations. | `docs/onboarding-a-repository.md`, `README.md`, `scripts/ci/check-runner-policy.sh` | ~280 | the runner-policy gate's own `--selftest` fixtures, then this repository's own workflows; `docs-pins` self-test for the version in the new quickstart |
 
 PRs 3–5 grow one file across three merges. That is deliberate rather than
 regrettable: the alternative is one 900-line pull request, which the repository's
@@ -887,6 +1160,29 @@ own rule splits, and each of the three has an intent a reviewer can hold — the
 accounts and their boundaries, the fence and the credentials, the agents and the
 probe. None of them is reachable from Terraform until PR 7, so a half-built script
 on `main` is inert.
+
+**§3A: what changes in this order, and whether a Windows pool may exist before it
+lands.** Nine PRs become ten. PRs 1, 2, 3 and 8 are untouched — the gates, the
+pure decision rule, the boot script's accounts-and-ACLs half, and the controller's
+delete gate never depended on the fence. PR 4 loses its larger half and becomes
+broker-and-hooks. PR 4b is new and is the only PR in this sequence that carries a
+security property; it is a Terraform-and-controller change, not PowerShell, and it
+is a mandatory `security-reviewer` gate. PR 5's probe assertions are replaced. PR
+6 keeps its shim on a different justification. PR 7 gains one plan-time refusal
+and moves the real check to boot. PR 9 grows. Everything from 4b onward shifts one
+version.
+
+**A Windows pool must not exist before PR 4b.** The question is not close. With
+phase 2 deleted and nothing in its place, the first Windows host to run a
+pull-request job hands that pull request a host token that reads the GitHub App
+private key — which is the #1958 finding, verbatim, on a new OS. There is a small
+mercy in the arithmetic: the same reduction that closes the hole is what makes
+registration work at all, because a host account without Secret Manager cannot
+mint its own registration token, so the safe configuration and the working
+configuration are the same configuration. That is why PR 7's refusal is worth
+having even though it can only check a declaration: the unsafe pool is the one
+that happens to work today, so it has to be refused deliberately rather than left
+to fail.
 
 The first Windows pool is stood up after PR 7 with `min_hosts = 0` and
 `slots_per_host = 1`, alongside the existing ephemeral pool rather than in place of
@@ -938,14 +1234,22 @@ path never grows the habit. Removing it fleet-wide changes an input every
 consumer's root already names, so it is a breaking-input change of its own and
 is deliberately not folded into this work.
 
-**What is still open**, and both are contained by the boot probe rather than by
-hope: that `-Service`-scoped **outbound** firewall rules are honoured against the
-metadata address as documented (PR 4), and that the runner service runs as a
-**non-administrator** local account with the workspace ACLs of phase 1 (PR 5).
-GitHub does not document the latter configuration; the flags exist and are widely
-used, and the reported friction is precisely about directory permissions. In both
-cases a half-working implementation refuses to register the host rather than
-serving jobs from a broken boundary.
+**What is still open.** ~~Two things~~ — **one, as of §3A.** The first,
+*that `-Service`-scoped outbound firewall rules are honoured against the metadata
+address as documented*, is **closed, and the answer is no**: they are not, they
+cannot be, and no allow rule defeats a block on this platform. See §3A. It was
+never contained by the boot probe in the way this paragraph claimed — the probe
+would have caught the over-block, but only after the mechanism was built, which is
+a slower and more expensive way to learn it than reading the precedence rules
+first. That is the lesson worth keeping from this amendment: a mechanism this
+design leans on gets its primary source read *before* it earns a PR number, not
+after.
+
+What remains open is that the runner service runs as a **non-administrator** local
+account with the workspace ACLs of phase 1 (PR 5). GitHub does not document that
+configuration; the flags exist and are widely used, and the reported friction is
+precisely about directory permissions. A half-working implementation refuses to
+register the host rather than serving jobs from a broken boundary.
 
 ## 8. Risks, and the economics behind the decisions above
 
@@ -969,9 +1273,21 @@ twice over. `ci_queue_wait_seconds_max` on the Windows pool is the series that
 says whether that is tolerable, and it is the evidence that would justify either a
 warm schedule or a second slot. Neither needs a module change.
 
-**The two live-host unknowns** are restated in §7 and are not repeated here; both
-end in a host that refuses to register rather than one that serves jobs from a
-broken boundary.
+~~**The two live-host unknowns**~~ **The one remaining live-host unknown** is
+restated in §7 and is not repeated here; it ends in a host that refuses to
+register rather than one that serves jobs from a broken boundary. The other —
+whether a `-Service`-scoped outbound rule can fence the metadata server — was
+answered on paper and is now §3A.
+
+**The security posture of a Windows pool is materially weaker than a Linux pool's,
+and that is now a decision rather than a gap** (§3A). A Linux host fences job code
+off the metadata server and proves it on a live host. A Windows host cannot, so
+the host identity is stripped until the token is worth only the job service
+account the broker vends anyway. The cost is that a Windows CI job can read the
+project's metadata, mint the host identity, and forge its own beacon. The
+mitigation is not technical: it is **one repository per pool** and **no fork pull
+requests on a warm host**, and a Windows pool that violates either has no
+isolation left.
 
 **The Linux SSH gate stays** (§2). It is a known, named, deferred piece of debt
 with a migration shape already written down, not an oversight — and it is the
