@@ -265,7 +265,7 @@ pre-pull lands in a daemon no slot uses. Note that it is deliberately outside
 untrusted build input, but a cached *image* is executed in every slot on the
 host. See [`docs/ui-testing-on-the-fleet.md`](ui-testing-on-the-fleet.md).
 
-**Status (v5.10.0): half done, and the missing half was the larger one.** The gap
+**Status (v5.12.0): half done, and the missing half was the larger one.** The gap
 was never only that nothing warmed the tree — it was that nothing *used* it.
 `/opt/ci-cache` existed from image `v3-12-0`, and no tool on any host had ever
 been pointed at it: npm still wrote `~/.npm`, Go still wrote `~/go/pkg/mod`, and
@@ -273,7 +273,7 @@ both live in a slot `$HOME` that is private per slot and destroyed with the host
 Warming the tree first would have produced a measured saving of zero and read as
 "caching does not help here".
 
-v5.10.0 wires the tools to a cache (`host-startup.sh`, `cache_env()`), so it now
+v5.12.0 wires the tools to a cache (`host-startup.sh`, `cache_env()`), so it now
 accumulates across jobs on a warm host. **Not to the shared tree**: `/opt/ci-cache`
 became the root-owned read-only *master*, and each slot gets a private copy of it
 under `/var/lib/ci-cache/<idx>`. A cache several slot users can write is a

@@ -68,7 +68,7 @@ variable "image" {
     jobs download every dependency from upstream — slower, never broken, and not
     fail-closed: v3-11-0 boots, registers and serves jobs.
 
-    Images built before module v5.10.0 ship that tree group-writable, which is
+    Images built before module v5.12.0 ship that tree group-writable, which is
     the design this module has since rejected (a cache several slot users can
     write is a channel for one job to hand another job code to run). A host
     booting one of them re-owns the tree to root and strips its write bits before
