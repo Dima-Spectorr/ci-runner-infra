@@ -32,7 +32,7 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER0` | the file does not load, or the gate cannot run |
 | `RUNNER1` | a `runs-on` naming `self-hosted` also names a repository-scoping label |
 | `RUNNER2` | with `--scope=<label>`, it is THAT label |
-| `RUNNER3` | every job that runs steps declares `timeout-minutes` |
+| `RUNNER3` | every job that runs steps declares `timeout-minutes` (see the note below) |
 | `RUNNER4` | a fork-reachable workflow keeps self-hosted jobs behind a fork guard |
 | `RUNNER5` | the runner is selected dynamically — reported as UNDECIDED, not passed |
 
@@ -60,6 +60,20 @@ self-hosted linux windows macos x64 arm64 arm gcp aws azure on-prem
 matched case-insensitively, because GitHub treats runner labels that way and
 `Linux` vs `linux` must not read as a scope. `--scope=<label>` adds the
 stronger form for a consumer that wants it: not merely SOME scope, but its own.
+
+### What RUNNER3 does and does not bound
+
+`timeout-minutes` starts when the job starts. It does **not** bound the wait for
+a runner — a self-hosted job that never finds one is cancelled by GitHub after
+24 hours no matter what this key says. So RUNNER3 is about the job that starts
+and hangs: on a warm host that is a slot held for six hours, and where the merge
+queue's `checks_timeout` expires first the pull request is silently DEQUEUED
+rather than turning red, which reads as a pull request that simply stopped
+moving.
+
+A job pointed at a label no runner carries is a different defect with a
+different fix — the pool, or the `runs-on`. RUNNER1 and the onboarding doc's
+label rule are what catch that.
 
 ### `--forks` is declared, not guessed
 

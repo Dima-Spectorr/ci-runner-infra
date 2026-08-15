@@ -44,11 +44,13 @@
 #   warm host that is a slot held for six hours; and where the queue's
 #   `checks_timeout` expires first, the pull request is SILENTLY DEQUEUED rather
 #   than turning red. The catalog measured nine repositories with effectively no
-#   job timeouts at all. The failure mode that makes it a gate rather than
-#   advice is the one IntegrateIT is in today: `windows-agent.yml` points at a
-#   pool with zero registered runners, so its check does not fail — it stays
-#   pending until the default expires, and a job that cannot start is exactly
-#   the job whose missing timeout nobody notices.
+#   job timeouts at all.
+#
+#   What this does NOT bound is the wait for a runner: `timeout-minutes` starts
+#   when the job starts, and a self-hosted job that never finds a runner is
+#   cancelled by GitHub after 24 hours regardless. So RUNNER3 is about the job
+#   that STARTS and hangs — which is the one that holds a warm slot, and the one
+#   whose silent dequeue looks like a pull request that simply stopped moving.
 #
 # WHY RUNNER4 HAS TWO ANSWERS AND NOT ONE
 #   Fork code on a warm, credentialed, reused host is the attack the isolation
