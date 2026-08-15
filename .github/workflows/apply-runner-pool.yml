@@ -1,0 +1,183 @@
+name: Apply runner pool
+
+# Merging a version bump changes what the next apply will build. It does not
+# change anything that is running — and for the whole life of this fleet,
+# "the next apply" meant a person, on a laptop, with a gitignored tfvars.
+#
+# What that cost, measured: the fix that stops a job inheriting the previous
+# job's cloud credentials shipped in v5.7.0, was merged into nine repositories
+# the same day, and reached exactly one pool — the one whose apply somebody ran
+# by hand. Eight pools stayed on the old startup script with a live, expired,
+# deploy-capable credential in every slot home, and nothing anywhere said so.
+# A pin that is merged and not applied is indistinguishable, from the outside,
+# from a pin that was never bumped.
+#
+# So this is the other half of the release path: consumers call it, and it
+# applies their runner root.
+#
+# This is the reusable half; the CONSUMER's caller workflow owns the triggers,
+# and it needs three — the third being the one that matters:
+#
+#   push       the root itself changed — new machine type, new slot count.
+#   dispatch   a human wants it now.
+#   schedule   NOTHING in the consumer changed, and a new module version is
+#              waiting. A consumer pinning the floating major tag (?ref=v5)
+#              has no diff to merge when v5.7.1 ships, so a push-triggered
+#              apply would never fire and the release would sit forever. The
+#              schedule is what makes "follow the major tag" mean anything.
+#
+# docs/applying-runner-infra.md carries the caller to copy.
+#
+# Deliberately GitHub-hosted. The pool being applied is the pool the consumer's
+# own jobs run on; applying it from inside itself means the controller can
+# drain the host running the apply, leaving terraform's state lock held by a
+# process that no longer exists.
+on:
+  workflow_call:
+    inputs:
+      terraform_root:
+        description: Path to the consumer's runner terraform root, from the repo root.
+        required: true
+        type: string
+      workload_identity_provider:
+        description: Full resource name of the WIF provider to authenticate against.
+        required: true
+        type: string
+      service_account:
+        description: Service account to impersonate. Needs admin on the pool's resources and write on the state bucket.
+        required: true
+        type: string
+      region:
+        description: Region the pool's managed instance group lives in. Only used to report how many hosts still run the previous template.
+        required: false
+        type: string
+        default: ''
+      terraform_version:
+        description: Pinned so a provider-side change never arrives with an apply nobody triggered.
+        required: false
+        type: string
+        default: '1.15.2'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  apply:
+    name: terraform apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One apply at a time per consumer root. Terraform's own state lock would
+    # make the second run fail rather than corrupt anything, but a failed apply
+    # is a red check somebody has to read before knowing it was only a race.
+    # Not cancel-in-progress: cancelling terraform mid-apply is how a lock is
+    # left behind.
+    concurrency:
+      group: apply-runner-pool-${{ github.repository }}-${{ inputs.terraform_root }}
+      cancel-in-progress: false
+    steps:
+      # This job assumes an identity that can rebuild the compute the consumer's
+      # own CI runs on. Reached from a pull_request trigger it would apply
+      # terraform taken from the PR BRANCH — the reviewer's diff is not what
+      # runs, because a floating module ref and a `.auto.tfvars` in the branch
+      # both resolve from the checkout. A fork PR is separately starved of
+      # id-token, but a same-repo branch is not, and that is the whole attack.
+      #
+      # The WIF binding should already pin attribute.ref; this refuses anyway.
+      # A consumer copies the caller workflow and edits its triggers, and the
+      # copy is exactly where a `pull_request:` gets added by someone wanting
+      # "a plan on the PR" — which is a good thing to want and a different
+      # workflow to write. Refusing here, not just in the docs, because docs are
+      # not on the code path.
+      - name: refuse a pull-request-triggered apply
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+        run: |
+          echo "::error::apply-runner-pool must not be called from ${{ github.event_name }} — it would apply terraform from the pull request branch using an infra-admin identity"
+          exit 1
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.9
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          # The wrapper replaces terraform's exit code with its own and eats
+          # stderr into an output — an apply that failed then reads as a step
+          # that passed with an unread message.
+          terraform_wrapper: false
+
+      # -upgrade, not a plain init. A consumer pinning ?ref=v5 has the previous
+      # v5 already cached in .terraform from the last run on a fresh checkout it
+      # would not, but on any reused cache it would — and a plain init keeps
+      # what it has. Without this the scheduled run re-applies the same module
+      # forever and reports success every time.
+      - name: init
+        working-directory: ${{ inputs.terraform_root }}
+        run: terraform init -input=false -upgrade
+
+      # Separate from apply so the log shows what was about to change even when
+      # the apply then fails: a failed apply with no plan above it says only
+      # that something went wrong.
+      - name: plan
+        id: plan
+        working-directory: ${{ inputs.terraform_root }}
+        run: |
+          set -uo pipefail
+          terraform plan -input=false -lock-timeout=5m -detailed-exitcode -out=tf.plan
+          rc=$?
+          case "$rc" in
+            0) echo "changes=false" >> "$GITHUB_OUTPUT"; echo "no changes — nothing to apply" ;;
+            2) echo "changes=true"  >> "$GITHUB_OUTPUT"; echo "changes pending" ;;
+            *) echo "::error::terraform plan failed (exit $rc)"; exit "$rc" ;;
+          esac
+
+      # Applies the SAVED plan, never a re-planned one: between plan and apply
+      # the floating tag can move, and applying something nobody printed is the
+      # failure mode this whole workflow exists to remove.
+      - name: apply
+        if: steps.plan.outputs.changes == 'true'
+        working-directory: ${{ inputs.terraform_root }}
+        run: terraform apply -input=false -lock-timeout=5m tf.plan
+
+      # The MIG updates OPPORTUNISTIC-ally: a new instance template does NOT
+      # replace running hosts, so an apply that "succeeded" can leave every host
+      # on the old startup script until the controller drains them on idleness.
+      # Reporting the gap is the difference between "applied" and "in effect".
+      - name: report what is still on the old template
+        if: steps.plan.outputs.changes == 'true'
+        working-directory: ${{ inputs.terraform_root }}
+        run: |
+          set -uo pipefail
+          mig=$(terraform output -raw mig_name 2>/dev/null)
+          region='${{ inputs.region }}'
+
+          # Best-effort by design: this step reports, it does not gate. A
+          # consumer that passes no region, or a root with no mig_name output,
+          # still gets a successful apply — failing the run here would report
+          # "the apply failed" for a missing summary.
+          hosts='(not counted — pass the region input to report this)'
+          if [ -n "$mig" ] && [ -n "$region" ]; then
+            # gcloud's success is tested separately from the count: `grep -c`
+            # exits 1 on zero matches, so folding them together would report a
+            # genuinely empty pool as "could not read" — the one reading that
+            # sends somebody to debug credentials over a pool at min_hosts=0.
+            if out=$(gcloud compute instance-groups managed list-instances "$mig" \
+                       --region="$region" --format='value(name)' 2>/dev/null); then
+              hosts=$(printf '%s' "$out" | grep -c . || true)
+            else
+              hosts='(could not read the instance group)'
+            fi
+          fi
+          {
+            echo "### Applied"
+            echo
+            echo "Hosts do not restart on an apply. The group replaces them opportunistically,"
+            echo "as the controller drains idle ones, so until that happens they keep running"
+            echo "the PREVIOUS startup script — an apply is not the same thing as in effect."
+            echo
+            echo "Hosts currently up: **$hosts**"
+          } >> "$GITHUB_STEP_SUMMARY"
