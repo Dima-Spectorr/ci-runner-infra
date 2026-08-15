@@ -207,6 +207,9 @@ scan_file() {
   # arrive as `.gov.il` — every escaped dot silently widened to "any character",
   # with a warning on stderr nobody reads. `ENVIRON` hands the string over
   # unaltered.
+  # shellcheck disable=SC2016  # the single-quoted block is an awk program and its
+  # `$0` is awk's, not the shell's. Spelling the reader as `"$AWK"` is what makes
+  # shellcheck stop recognising the command and start reading the program as text.
   hits="$(PAT="$pattern" STRIP="$strip" FENCED="$fenced_only" "$AWK" '
     BEGIN { infence = 0; pat = ENVIRON["PAT"]; strip = ENVIRON["STRIP"]; fenced_only = ENVIRON["FENCED"] }
     {
