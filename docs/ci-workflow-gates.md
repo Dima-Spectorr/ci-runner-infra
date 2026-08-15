@@ -49,7 +49,7 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER4` | a fork-reachable workflow keeps fleet-reachable jobs behind a fork guard |
 | `RUNNER5` | the runner is selected dynamically — reported as UNDECIDED, not passed |
 | `RUNNER6` | and the declared timeout is below the default it replaces |
-| `RUNNER7` | a REMOTE reusable workflow's jobs are not in this repository |
+| `RUNNER7` | a REMOTE reusable workflow's jobs are not in this repository — UNDECIDED, declarable per callee |
 
 ### `self-hosted` is a label, not a requirement
 
@@ -172,6 +172,40 @@ across the whole file set before anything is judged, and transitively.
 A **remote** callee is a different answer: that document is not in this
 repository, so the RUNNER3 exemption a `uses:` job gets was handing the bound to
 jobs nobody read. That is RUNNER7.
+
+RUNNER7 refused every such call outright, and that was one step too far. Every
+repository on this fleet calls the reusable workflows in **this** repository —
+one copy, so a fix lands once instead of in nine drifting forks — and an
+unconditional refusal made the only way past it the vendoring the
+`No vendored CI runner module` job exists to prevent. Undecidable is not
+forbidden, so it is declarable, in a comment beside the call:
+
+```yaml
+jobs:
+  apply:
+    # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/apply-runner-pool.yml, #8160): the callee is reviewed in its own repository; it runs github-hosted with an explicit timeout
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/apply-runner-pool.yml@v5
+```
+
+The marker **names its callee**, so pointing the `uses:` at a different workflow
+or a different owner re-arms the check; the ref is deliberately excluded, since
+a pin bump does not change what this gate can read and whether the ref may float
+at all is `check-action-pins.sh`'s question. The issue number is not decoration:
+it is where the reading of the callee is recorded, so the acceptance has an
+owner and a place to be revisited, and a marker without one — or without a
+reason after the colon — is a waiver wearing a declaration's shape and does not
+count. It must be a real comment; the same text inside a `run:` string is not a
+declaration.
+
+What it asserts is narrow, and worth stating plainly so nobody reads it as more:
+a human read the callee and accepted its jobs' runner scope and timeouts. It
+does not verify them — nothing in this repository's copy of the gate can, which
+is the whole finding.
+
+This is a marker rather than a CLI flag like RUNNER5's `--allow-dynamic-runner`
+on purpose: a flag excuses every remote call in the repository at once, includes
+one a later unrelated change adds, and lives in the CI invocation where the
+reviewer of the call never sees it.
 
 A guard on the **calling job** is a guard on everything that job reaches, so an
 edge carries its caller and a guarded caller contributes none. Without that, the
