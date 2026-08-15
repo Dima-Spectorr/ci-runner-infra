@@ -21,8 +21,8 @@
 #           after the first literal did.
 #     LIT2  no literal in a Markdown FENCED CODE BLOCK — the copy-pasteable half
 #           of a document
-#     LIT0  the gate found nothing to read, or was asked to read a file it
-#           cannot — reported, never passed
+#     LIT0  the gate found nothing to read, was asked to read a file it cannot,
+#           or its reader failed or warned — reported, never passed
 #
 # WHY THE YAML AND THE MARKDOWN ARE NOT AN AFTERTHOUGHT (issue #69)
 #   Until this file existed the scan covered `*.tf`, `*.sh` and `*.hcl` and
@@ -96,6 +96,13 @@ err() { local id="$1"; shift; echo "::error::[$id] $*"; fail=1; }
 # Relative to the repository root, and asserted as a single entry by the
 # self-test — a growing exclusion list is how a denylist stops being one.
 SELF_EXCLUDE='scripts/ci/check-generic-literals.sh'
+
+# Indirected for ONE reason: so a fixture can hand the scan a reader that fails,
+# and assert that a failing reader is LIT0 rather than a clean file. A branch
+# whose whole point is "do not report clean when you did not read anything" is
+# the branch most worth having a test for, and it is unreachable while the reader
+# is spelled as a literal command name.
+AWK="${AWK:-awk}"
 
 # Concrete values that must not appear in a shared module. Regions, the
 # customer's project prefix, its domain, and a bucket URL — each one a value a
@@ -191,19 +198,26 @@ scan_pattern() {
 # repositories.
 scan_file() {
   local file="$1" rel="$2" fenced_only="$3" id="$4" pattern="$5" strip="$6"
-  local hits
+  local hits errfile status
 
   if [ ! -r "$file" ]; then
     err LIT0 "$rel: unreadable — a file this gate cannot open is not a file it checked"
     return
   fi
 
+  errfile="$(mktemp)" || { err LIT0 "$rel: no temp file for the reader's stderr"; return; }
+
   # The pattern travels through the ENVIRONMENT, not through `-v`. `awk -v`
   # processes escape sequences in the value it is handed, so `\.gov\.il` would
   # arrive as `.gov.il` — every escaped dot silently widened to "any character",
   # with a warning on stderr nobody reads. `ENVIRON` hands the string over
   # unaltered.
-  hits="$(PAT="$pattern" STRIP="$strip" FENCED="$fenced_only" awk '
+  # shellcheck disable=SC2016  # the single-quoted block is an awk program and its
+  # `$0` is awk's, not the shell's. Spelling the reader as `"$AWK"` is what stops
+  # the linter recognising the command, after which it reads the program as text.
+  # (Word order is load-bearing: a comment line beginning `# shellcheck ` IS a
+  # directive, and one that does not parse is an ERROR, not a comment.)
+  hits="$(PAT="$pattern" STRIP="$strip" FENCED="$fenced_only" "$AWK" '
     BEGIN { infence = 0; pat = ENVIRON["PAT"]; strip = ENVIRON["STRIP"]; fenced_only = ENVIRON["FENCED"] }
     {
       line = $0
@@ -214,7 +228,26 @@ scan_file() {
       if (strip != "") gsub(strip, "", line)
       if (line ~ pat) printf "%d\t%s\n", NR, substr(line, 1, 160)
     }
-  ' "$file" 2>/dev/null)"
+  ' "$file" 2>"$errfile")"
+  status=$?
+
+  # The reader's exit status IS the gate's, and its stderr is evidence rather
+  # than noise. Discarding both — the first version wrote `2>/dev/null` and
+  # never looked at `$?` — makes an awk that died on the pattern indistinguishable
+  # from a file with no literal in it: `hits` is empty either way and the gate
+  # reports clean. That is the vacuous pass this repository keeps naming, arriving
+  # through the one line that was meant to keep the output tidy.
+  #
+  # A WARNING with a zero exit counts too. gawk announces an unknown escape and
+  # carries on with a pattern that is not the one it was handed — silently wider,
+  # in the passing direction — so "the reader complained" and "the reader can be
+  # trusted" cannot both be true.
+  if [ "$status" -ne 0 ] || [ -s "$errfile" ]; then
+    err LIT0 "$rel: the reader exited $status and said: $(tr '\n' ' ' <"$errfile" | cut -c1-200)"
+    rm -f "$errfile"
+    return
+  fi
+  rm -f "$errfile"
 
   [ -n "$hits" ] || return 0
 
@@ -383,6 +416,37 @@ uses: acme/Apigee-Portal/.github/workflows/ci.yml@v1
     echo "ok   an unreadable file is reported, not passed [LIT0]"
   else
     echo "FAIL an unreadable file is reported, not passed: want [LIT0], got [$got]"
+    status=1
+  fi
+
+  # A reader that dies must not read as a clean file. Two shapes, because they
+  # fail differently and both used to pass: a non-zero exit, and a WARNING with
+  # a zero exit — gawk's "unknown escape", which means the pattern that ran was
+  # not the pattern it was handed.
+  local stub_tf="$tmp/reader.tf"
+  printf 'region = "eu-north-1"\n' >"$stub_tf"
+
+  local dying="$tmp/dying-awk"
+  printf '#!/usr/bin/env bash\necho "awk: cannot open file" >&2\nexit 2\n' >"$dying"
+  chmod +x "$dying"
+  out_text="$(fail=0; ROOT="$tmp"; AWK="$dying"; check_file "$stub_tf" 2>&1)"
+  got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr -d '\n')"
+  if [ "$got" = "LIT0" ]; then
+    echo "ok   a reader that exits non-zero is reported, not passed [LIT0]"
+  else
+    echo "FAIL a reader that exits non-zero is reported, not passed: want [LIT0], got [$got]"
+    status=1
+  fi
+
+  local warning="$tmp/warning-awk"
+  printf '#!/usr/bin/env bash\necho "awk: warning: escape sequence treated literally" >&2\nexit 0\n' >"$warning"
+  chmod +x "$warning"
+  out_text="$(fail=0; ROOT="$tmp"; AWK="$warning"; check_file "$stub_tf" 2>&1)"
+  got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr -d '\n')"
+  if [ "$got" = "LIT0" ]; then
+    echo "ok   a reader that warns is reported, not passed [LIT0]"
+  else
+    echo "FAIL a reader that warns is reported, not passed: want [LIT0], got [$got]"
     status=1
   fi
 
