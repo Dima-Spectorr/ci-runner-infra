@@ -293,7 +293,14 @@ check_file() {
     ref_re="$(re_quote "$path@$version")"
     n_uses="$(grep -cE "uses:[[:space:]]*['\"]?${ref_re}['\"]?([[:space:]]|\$)" "$file")"
     n_commented="$(grep -cE "uses:[[:space:]]*['\"]?${ref_re}['\"]?[[:space:]]*#[^#]*[A-Za-z0-9._-]*[0-9]" "$file")"
-    if [ "$n_uses" -gt "$n_commented" ]; then
+    # Zero raw lines for a reference the PARSER found is not a clean file, it is
+    # this check failing to run: a quoted, folded, or anchored scalar spells the
+    # same value in a way this line-oriented match does not see, and
+    # `n_uses > n_commented` is false at 0 > 0. That is the vacuous pass again,
+    # so it is reported rather than counted as agreement.
+    if [ "$n_uses" -eq 0 ]; then
+      err PIN2 "$rel: job '$job' step $step pins '$path' to $version, but no raw line matched that reference — the version comment cannot be read from a folded or quoted scalar; write it as a plain 'uses: $path@$version # <tag>'"
+    elif [ "$n_uses" -gt "$n_commented" ]; then
       err PIN2 "$rel: job '$job' step $step pins '$path' to $version with no version comment on $((n_uses - n_commented)) of $n_uses reference(s) — write '$path@$version # <tag>' on each so the bump is reviewable"
     fi
   done <<EOF
@@ -400,6 +407,18 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683'
+
+  # The parser saw a pinned reference and the raw-line match saw nothing, which
+  # is `0 > 0` — false, and reported clean. A check that cannot run is not a
+  # check that passed.
+  expect "a reference no raw line matches is not clean" "PIN2" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: >-
+          actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683'
 
   expect "a local action needs no pin" "" \
 'on: [push]

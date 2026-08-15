@@ -283,7 +283,17 @@ IF_EXCLUDES = re.compile(
 RUNS_ON_ROUTES = re.compile(
     r"(?:%s)\s*&&\s*'([^']*)'" % FORK, re.IGNORECASE
 )
-HOSTED_IMAGE = re.compile(r"^(?:ubuntu|windows|macos)-", re.IGNORECASE)
+# GitHub's hosted images are a finite, well-known family, and this must match
+# THAT family rather than its prefix: `ubuntu-pool-1` is an ordinary custom
+# label on a self-hosted runner, and reading it as a hosted image would let a
+# fork guard route fork code onto the fleet while this gate called it safe.
+# Anything outside the family is treated as a self-hosted label — the direction
+# that over-reports rather than the one that opens the boundary.
+HOSTED_IMAGE = re.compile(
+    r"^(?:ubuntu|windows|macos)-(?:latest|\d+(?:\.\d+)?)"
+    r"(?:-(?:arm|arm64|large|xlarge|xl|intel))?$",
+    re.IGNORECASE,
+)
 
 
 def split_top_level(expr, operator):
@@ -577,8 +587,13 @@ check_file() {
         hosted_only=0
       else
         # A label that is not a GitHub-hosted image is a label some runner in
-        # the fleet was registered with.
-        printf '%s' "$label" | grep -qiE "^(ubuntu|windows|macos)-" || hosted_only=0
+        # the fleet was registered with. Matched against the hosted FAMILY, not
+        # its prefix: `ubuntu-pool-1` is an ordinary custom label, and reading
+        # it as a hosted image would call a fleet job hosted and skip every
+        # isolation check on it. Same expression as `HOSTED_IMAGE` above.
+        printf '%s' "$label" |
+          grep -qiE "^(ubuntu|windows|macos)-(latest|[0-9]+(\.[0-9]+)?)(-(arm|arm64|large|xlarge|xl|intel))?$" ||
+          hosted_only=0
         printf '%s' "$label" | grep -qiE "^(${GENERIC})$" || scoped=1
       fi
     done <<EOF
@@ -808,6 +823,27 @@ jobs:
 jobs:
   check:
     runs-on: [self-hosted, Linux, gcp]
+    steps: [{run: "true"}]'
+
+  # `ubuntu-pool-1` is a custom label on a fleet runner, not a hosted image.
+  # Read by prefix it was hosted, and every isolation check was skipped on it.
+  # RUNNER4 is the discriminator: a hosted image is not fleet-reachable and is
+  # never asked for a fork guard, so this fixture fires only if the label is
+  # read as what it is — a custom label on a fleet runner.
+  expect "an OS-prefixed custom label is not a hosted image" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-pool-1
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "a real hosted image is still hosted" "" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
     steps: [{run: "true"}]'
 
   expect "case-insensitive platform labels are not scopes" "RUNNER1" "" allowed \
