@@ -266,6 +266,10 @@ Describe 'phase 1 ordering' {
 }
 
 Describe 'security policy rewriting' {
+    # The \r? in every anchored pattern below is load-bearing, not noise. The INF
+    # this code writes is CRLF on purpose (secedit reads nothing else), and .NET's
+    # multiline $ anchors before the \n with the \r still ahead of it, so a bare $
+    # never matches a line of the very file format under test.
     # A fresh image has no SeDenyNetworkLogonRight line at all. Skipping an absent
     # privilege is how a deny the code claims to apply ends up not applied, and
     # nothing downstream would report it: secedit imports the file happily and the
@@ -273,8 +277,8 @@ Describe 'security policy rewriting' {
     It 'adds a privilege the exported policy never had' {
         $inf = "[Unicode]`r`nUnicode=yes`r`n[Privilege Rights]`r`nSeServiceLogonRight = *S-1-5-80-0`r`n"
         $out = Edit-InfPrivilege -InfText $inf -Privilege 'SeDenyNetworkLogonRight' -Accounts @('*S-1-5-21-1-1-1-1001')
-        $out | Should -Match '(?m)^SeDenyNetworkLogonRight = \*S-1-5-21-1-1-1-1001$'
-        $out | Should -Match '(?m)^SeServiceLogonRight = \*S-1-5-80-0$'
+        $out | Should -Match '(?m)^SeDenyNetworkLogonRight = \*S-1-5-21-1-1-1-1001\r?$'
+        $out | Should -Match '(?m)^SeServiceLogonRight = \*S-1-5-80-0\r?$'
     }
 
     # REPLACED, not appended to. Appending leaves the previous membership in
@@ -283,21 +287,21 @@ Describe 'security policy rewriting' {
     It 'replaces an existing line instead of appending to it' {
         $inf = "[Privilege Rights]`r`nSeDenyNetworkLogonRight = *S-1-5-32-546`r`n"
         $out = Edit-InfPrivilege -InfText $inf -Privilege 'SeDenyNetworkLogonRight' -Accounts @('*S-1-5-21-9')
-        $out | Should -Match '(?m)^SeDenyNetworkLogonRight = \*S-1-5-21-9$'
+        $out | Should -Match '(?m)^SeDenyNetworkLogonRight = \*S-1-5-21-9\r?$'
         $out | Should -Not -Match 'S-1-5-32-546'
         ([regex]::Matches($out, 'SeDenyNetworkLogonRight')).Count | Should -Be 1
     }
 
     It 'creates the section when the export has none' {
         $out = Edit-InfPrivilege -InfText "[Unicode]`r`nUnicode=yes" -Privilege 'SeServiceLogonRight' -Accounts @('*S-1-5-21-7')
-        $out | Should -Match '(?m)^\[Privilege Rights\]$'
-        $out | Should -Match '(?m)^SeServiceLogonRight = \*S-1-5-21-7$'
+        $out | Should -Match '(?m)^\[Privilege Rights\]\r?$'
+        $out | Should -Match '(?m)^SeServiceLogonRight = \*S-1-5-21-7\r?$'
     }
 
     It 'writes every account on the one line secedit reads' {
         $out = Edit-InfPrivilege -InfText '[Privilege Rights]' -Privilege 'SeServiceLogonRight' `
             -Accounts @('*S-1-5-21-1', '*S-1-5-21-2', '*S-1-5-21-3')
-        $out | Should -Match '(?m)^SeServiceLogonRight = \*S-1-5-21-1,\*S-1-5-21-2,\*S-1-5-21-3$'
+        $out | Should -Match '(?m)^SeServiceLogonRight = \*S-1-5-21-1,\*S-1-5-21-2,\*S-1-5-21-3\r?$'
     }
 
     # An INF is a Windows file and secedit is a Windows tool: a rewrite that
@@ -317,8 +321,8 @@ Describe 'security policy rewriting' {
     It 'leaves every other line of the policy alone' {
         $inf = "[Unicode]`r`nUnicode=yes`r`n[Version]`r`nsignature=`"`$CHICAGO`$`"`r`n[Privilege Rights]`r`nSeBatchLogonRight = *S-1-5-32-544`r`n"
         $out = Edit-InfPrivilege -InfText $inf -Privilege 'SeServiceLogonRight' -Accounts @('*S-1-5-21-5')
-        $out | Should -Match '(?m)^Unicode=yes$'
+        $out | Should -Match '(?m)^Unicode=yes\r?$'
         $out | Should -Match '(?m)^signature='
-        $out | Should -Match '(?m)^SeBatchLogonRight = \*S-1-5-32-544$'
+        $out | Should -Match '(?m)^SeBatchLogonRight = \*S-1-5-32-544\r?$'
     }
 }
