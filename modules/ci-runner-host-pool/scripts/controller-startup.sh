@@ -76,6 +76,7 @@ METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 RUNNER_LABELS=$(md "instance/attributes/ci-runner-labels")
 REGISTER_GRACE=$(md "instance/attributes/ci-register-grace-seconds")
 ORPHAN_CONFIRM_TICKS=$(md "instance/attributes/ci-orphan-confirm-ticks")
+RECYCLE_MAX_UNAVAILABLE=$(md "instance/attributes/ci-recycle-max-unavailable")
 
 SLOTS=${SLOTS:-1}
 MIN_HOSTS=${MIN_HOSTS:-0}
@@ -91,6 +92,12 @@ REGISTER_GRACE=${REGISTER_GRACE:-600}
 # than a transient gcloud failure and far shorter than the hours a dead
 # registration otherwise occupies the repo's runner list.
 ORPHAN_CONFIRM_TICKS=${ORPHAN_CONFIRM_TICKS:-3}
+# Hosts that may be mid-recycle at once. The default is 0 — OFF — and that is
+# not timidity, it is the only correct default for a controller that may be
+# running against a template it did not expect: a controller restarted from an
+# old image, or a metadata key that failed to render, must not start deleting
+# hosts because a field was missing. Consumers opt in.
+RECYCLE_MAX_UNAVAILABLE=${RECYCLE_MAX_UNAVAILABLE:-0}
 POLL=${POLL:-20}
 # Seconds the demand sweep may spend walking per-run job lists. It must stay far
 # below the watchdog threshold (10 polls, min 300s): a tick that outruns the
@@ -128,6 +135,12 @@ RUNNER_LIST_STATUS="ok"
 # restart genuinely starts a new run of ticks, and a counter surviving on disk
 # would report a suspension that is no longer happening.
 BLIND_TICKS=0
+# The template the MIG currently builds from. EMPTY until collect_mig() has
+# succeeded, and empty is what template_state() reads as `unknown` — so under
+# `set -u` a controller that has not yet described its MIG, or whose describe
+# failed, recycles nothing rather than dying or, far worse, reading every host
+# as stale against an empty string.
+MIG_TEMPLATE=""
 
 gh_token() {
   local now
@@ -555,9 +568,18 @@ collect_runners() {
 }
 
 collect_hosts() {
+  # The third column is what makes a stale host visible at all. It costs
+  # nothing: the same call already returns it, and without it the controller
+  # cannot tell a host built from the current template from one built five
+  # releases ago — which is why a pool that never goes idle never upgrades.
+  #
+  # Basenames on both sides. The MIG reports a template as a full self-link and
+  # a managed instance reports it as a partial URL, so comparing the raw strings
+  # would read every host as stale — the single read that, applied uniformly,
+  # cordons the whole pool at once.
   HOSTS=$(gcloud compute instance-groups managed list-instances "$MIG" \
     --region="$REGION" --project="$PROJECT" \
-    --format="value(instance.basename(),instanceStatus)" 2>/dev/null)
+    --format="value(instance.basename(),instanceStatus,version.instanceTemplate.basename())" 2>/dev/null)
 }
 
 # One describe per tick for both facts we need from the MIG: the target size we
@@ -567,11 +589,30 @@ collect_mig() {
   local line
   line=$(gcloud compute instance-groups managed describe "$MIG" \
     --region="$REGION" --project="$PROJECT" \
-    --format="value(baseInstanceName,targetSize)" 2>/dev/null)
+    --format="value(baseInstanceName,targetSize,versions[0].instanceTemplate.basename())" 2>/dev/null)
   MIG_BASE=$(printf '%s' "$line" | cut -f1)
   MIG_TARGET=$(printf '%s' "$line" | cut -f2)
+  MIG_TEMPLATE=$(printf '%s' "$line" | cut -f3)
   MIG_BASE=${MIG_BASE:-}
   MIG_TARGET=${MIG_TARGET:-0}
+  # Empty means the describe failed or the field moved. Left empty on purpose so
+  # template_state() below reads `unknown` and NOTHING is recycled: the
+  # alternative — defaulting to some template name — would make every host stale
+  # against it and cordon the entire pool on a transient API failure.
+  MIG_TEMPLATE=${MIG_TEMPLATE:-}
+}
+
+# template_state <host_template> -> current | stale | unknown
+# Either side missing is `unknown`, never `stale`. See collect_mig().
+template_state() {
+  local host_tpl="${1:-}"
+  if [ -z "$host_tpl" ] || [ -z "$MIG_TEMPLATE" ]; then
+    echo "unknown"
+  elif [ "$host_tpl" = "$MIG_TEMPLATE" ]; then
+    echo "current"
+  else
+    echo "stale"
+  fi
 }
 
 # --- orphan registrations ----------------------------------------------------
@@ -820,12 +861,73 @@ drain_host() {
   return 0
 }
 
+# --- cordon ------------------------------------------------------------------
+#
+# Half a drain, and the half that makes "recreate the host without killing its
+# job" possible at all.
+#
+# drain_host() ABORTS on the first agent GitHub refuses to deregister, because
+# for an idle-based drain a refusal means our idle read was stale and the host
+# is working — the right answer there is to leave the whole host alone. For a
+# stale-template host the refusal means something else entirely: that agent is
+# finishing a job, and every OTHER agent should still go. So this walks the
+# whole list and treats 422 as the expected outcome rather than an abort.
+#
+# The effect is a host that cannot receive another job — its idle slots are gone
+# from the pool and agents here are not --ephemeral, with Restart=no units, so a
+# deregistered slot stays deregistered — while the job it is running finishes
+# untouched. It retires on a later tick, from recycle_decision's retire branch.
+#
+# The held slot is still registered, so for up to one poll interval after its
+# job lands it can be handed another one. That is why the cordon is re-issued
+# every tick instead of once: the next tick either finds it idle and removes it,
+# or finds it working again and refuses again. The host leaves a poll later than
+# the ideal — it never leaves with a job on it, which is the property that
+# matters.
+cordon_host() {
+  local host="$1"
+  local ids id gone=0 held=0
+
+  ids=$(printf '%s' "$RUNNERS_JSON" | jq -r --arg h "$host" \
+    '.runners[]? | select(.name | startswith($h + "-s")) | .id' 2>/dev/null)
+
+  local tok
+  tok=$(gh_token) || { log "cordon $host: no token, aborting cordon"; return 1; }
+
+  # Marked BEFORE the first deregistration, not after. A cordon that dies
+  # halfway has already removed slots from the pool; without the marker the next
+  # tick would not count this host against the budget and would cordon a second
+  # one beside it.
+  : >"$STATE_DIR/cordon-$host"
+
+  for id in $ids; do
+    local code
+    code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
+      -H "Authorization: Bearer $tok" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/$REPO_FULL/actions/runners/$id")
+    case "$code" in
+      204 | 404) gone=$((gone + 1)) ;;
+      *)
+        # 422: executing a job. Expected, and the entire mid-job guarantee.
+        held=$((held + 1))
+        ;;
+    esac
+  done
+
+  log "cordon $host: $gone slot(s) removed from the pool, $held still finishing work"
+  CORDONED=$((CORDONED + 1))
+  return 0
+}
+
 # --- tick --------------------------------------------------------------------
 
 tick() {
   DRAINED=0
   DRAIN_ABORTED=0
   REAPED=0
+  CORDONED=0
+  RETIRED=0
 
   local tick_start
   tick_start=$(date +%s)
@@ -846,15 +948,43 @@ tick() {
   collect_hosts
   collect_mig
 
-  local pool_size=0 slots_busy=0 idle_max=0 draining=0
-  local host status busy idle age verdict
+  local pool_size=0 slots_busy=0 idle_max=0 draining=0 stale_hosts=0
+  local host status host_tpl busy idle age verdict tpl cordoned recycling
 
-  while read -r host status; do
+  # Hosts already mid-recycle, counted BEFORE any decision this tick, so every
+  # host is judged against the same budget rather than against however many
+  # happened to be cordoned earlier in the loop.
+  #
+  # Markers for hosts the MIG no longer lists are cleared first: a retired host
+  # that left a marker behind would consume a slot of the budget forever, and
+  # the pool would silently stop upgrading after `max_unavailable` releases.
+  #
+  # Deliberately NOT `… | grep -qx`: under `pipefail` grep -q closes the pipe on
+  # the first match and the upstream awk dies of SIGPIPE, so the pipeline's
+  # status depends on WHERE in the list the host happened to sit. A live host
+  # matching on the last line would read as absent and lose its marker — and a
+  # lost marker is a budget slot handed back, which is how more hosts go
+  # unavailable at once than max_unavailable permits.
+  local f mname live_hosts
+  live_hosts=$(printf '%s\n' "$HOSTS" | awk '{ if ($1 != "") print $1 }')
+  for f in "$STATE_DIR"/cordon-*; do
+    [ -e "$f" ] || continue
+    mname=$(basename "$f")
+    mname=${mname#cordon-}
+    case $'\n'"$live_hosts"$'\n' in
+      *$'\n'"$mname"$'\n'*) ;;
+      *) rm -f "$f" ;;
+    esac
+  done
+  recycling=$(find "$STATE_DIR" -maxdepth 1 -name 'cordon-*' 2>/dev/null | wc -l)
+
+  while read -r host status host_tpl; do
     [ -n "$host" ] || continue
     [ "$status" = "RUNNING" ] && pool_size=$((pool_size + 1))
+    [ "$(template_state "$host_tpl")" = "stale" ] && stale_hosts=$((stale_hosts + 1))
   done <<<"$HOSTS"
 
-  while read -r host status; do
+  while read -r host status host_tpl; do
     [ -n "$host" ] || continue
 
     host_facts "$host"
@@ -864,6 +994,49 @@ tick() {
     idle=$(idle_seconds "$host" "$busy")
     [ "$idle" -gt "$idle_max" ] && idle_max=$idle
     age=$(host_age_seconds "$host")
+
+    # The recycle rule is asked FIRST, and a cordon/retire verdict ends this
+    # host's tick. Both rules delete, and only this one knows the host is
+    # obsolete: letting drain_decision also speak would mean a host being
+    # deliberately retired could instead be kept as "warm" — warm being the
+    # exact property that keeps the wrong startup script alive.
+    tpl=$(template_state "$host_tpl")
+    cordoned=0
+    [ -f "$STATE_DIR/cordon-$host" ] && cordoned=1
+
+    verdict=$(recycle_decision "$status" "$tpl" "$busy" "$HOST_REG" \
+      "$age" "$REGISTER_GRACE" "$recycling" "$RECYCLE_MAX_UNAVAILABLE" "$cordoned")
+
+    case "$verdict" in
+      cordon:*)
+        log "$host: $verdict"
+        if [ "$cordoned" -eq 0 ]; then
+          recycling=$((recycling + 1))
+        fi
+        # `|| log` is load-bearing, not defensive noise: the controller runs
+        # under `set -e`, and cordon_host returns 1 when no token could be
+        # minted. Bare, that failure would kill the tick — and a controller that
+        # dies mid-tick publishes none of the series it queued, so the pool goes
+        # dark rather than merely un-recycled. The marker is already written, so
+        # the next tick resumes this host's cordon where this one stopped.
+        cordon_host "$host" || log "$host: cordon incomplete — retrying next tick"
+        continue
+        ;;
+      retire:*)
+        log "$host: $verdict"
+        draining=$((draining + 1))
+        if [ "$cordoned" -eq 0 ]; then
+          recycling=$((recycling + 1))
+        fi
+        if drain_host "$host"; then
+          pool_size=$((pool_size - 1))
+          RETIRED=$((RETIRED + 1))
+          rm -f "$STATE_DIR/cordon-$host"
+        fi
+        continue
+        ;;
+      *) : ;;
+    esac
 
     verdict=$(drain_decision "$status" "$busy" "$idle" "$GRACE" "$pool_size" "$MIN_HOSTS" "$HOST_REG" \
       "$age" "$REGISTER_GRACE")
@@ -926,6 +1099,18 @@ tick() {
   queue_series "ci_mig_target_size" "$target"
   queue_series "ci_drain_verdicts" "$DRAINED" '"outcome":"drained"'
   queue_series "ci_drain_verdicts" "$DRAIN_ABORTED" '"outcome":"aborted"'
+  # The one series that says whether an APPLY reached machines. A pin lands, a
+  # template changes, and this climbs to the pool size and then falls back to
+  # zero as the hosts are replaced. Stuck above zero means a pool that keeps
+  # being told to upgrade and never does — which is precisely the state that was
+  # invisible on 2026-08-15, when v5.7.0 was applied and five hosts kept serving
+  # jobs from the previous template with nothing anywhere reporting it.
+  queue_series "ci_hosts_stale_template" "$stale_hosts"
+  # Per-tick deltas, like ci_drain_verdicts. `cordoned` climbing while `retired`
+  # stays flat is a pool whose jobs never end — the recycle is working and the
+  # hosts are not leaving.
+  queue_series "ci_recycle_verdicts" "$CORDONED" '"outcome":"cordoned"'
+  queue_series "ci_recycle_verdicts" "$RETIRED" '"outcome":"retired"'
   # A pool at steady state reaps ~0. A series that keeps climbing means hosts
   # are disappearing without going through drain_host() — worth an alert, not
   # just a log line.

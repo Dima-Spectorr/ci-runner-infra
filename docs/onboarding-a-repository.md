@@ -95,6 +95,14 @@ module "ci_runner_pool" {
   runner_labels = var.runner_labels
   min_hosts     = 0
   max_hosts     = var.max_hosts
+
+  # How many hosts may be mid-recycle at once when an apply changes the
+  # instance template. 0 — the default — means a busy pool NEVER adopts a new
+  # template, because the only other thing that replaces a host is the idle
+  # timeout and a pool with work does not go idle. Set it to 1 unless you have a
+  # reason not to; see "Getting a new template onto a busy host" in the README
+  # for the two-phase cordon/retire and why no running job is ever interrupted.
+  recycle_max_unavailable = 1
 }
 ```
 

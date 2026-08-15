@@ -61,6 +61,30 @@ check "gh_token computes its own clock" ok \
 check "idle_seconds computes its own clock" ok \
   "$(run_fn idle_seconds 'idle_seconds host 1' 'STATE_DIR=/tmp')"
 
+# template_state() decides whether a host is deleted for being obsolete, and it
+# reads a GLOBAL the tick may not have filled yet — collect_mig() runs before the
+# host walk, but a failed describe leaves MIG_TEMPLATE empty and a controller
+# restarted mid-tick has never assigned it at all. Under `set -u` an unassigned
+# global is a crash; worse than the crash would be it evaluating to "" and
+# matching nothing, which reads every host in the pool as stale at once.
+check "template_state survives an empty MIG template" unknown \
+  "$(bash -c "set -uo pipefail; MIG_TEMPLATE=''; $(fn template_state); template_state tpl-a" 2>&1)"
+check "template_state survives an empty host template" unknown \
+  "$(bash -c "set -uo pipefail; MIG_TEMPLATE=tpl-a; $(fn template_state); template_state ''" 2>&1)"
+check "template_state survives no argument at all" unknown \
+  "$(bash -c "set -uo pipefail; MIG_TEMPLATE=tpl-a; $(fn template_state); template_state" 2>&1)"
+check "template_state names a match current" current \
+  "$(bash -c "set -uo pipefail; MIG_TEMPLATE=tpl-a; $(fn template_state); template_state tpl-a" 2>&1)"
+check "template_state names a mismatch stale" stale \
+  "$(bash -c "set -uo pipefail; MIG_TEMPLATE=tpl-b; $(fn template_state); template_state tpl-a" 2>&1)"
+
+# The global must exist at FILE scope, not only inside collect_mig(). This is
+# the static half of the four checks above: they prove the function is safe when
+# the variable is empty, this proves it is never merely unbound.
+# shellcheck disable=SC2016
+grep -q '^MIG_TEMPLATE=""' "$CTRL" && r=yes || r=no
+check "MIG_TEMPLATE is initialised at file scope" yes "$r"
+
 # ── the scope rule, stated once ──────────────────────────────────────────────
 # The static half, and the general form of the bug: a function that READS a name
 # which is someone else's local, declares no local of its own for it, and is

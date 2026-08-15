@@ -95,6 +95,54 @@ A `keep:` verdict is never an error. A host is kept when it is busy, when the
 pool is at its floor, when GitHub could not be asked, or when it is idle but
 still inside its warm window.
 
+### Getting a new template onto a busy host
+
+`terraform apply` moves the *definition* of a host. It does not move a host. The
+MIG's `update_policy` is `OPPORTUNISTIC` on purpose — `PROACTIVE` would delete
+hosts to apply a new template, and an arbitrary victim here carries up to
+`slots_per_host` running jobs. So a new template sits there, and hosts adopt it
+only when something else happens to delete them.
+
+That "something else" was `drain_decision()`, which knows nothing about
+templates: it retires a host for being **idle** past the warm window. A pool with
+work never goes idle for fifteen minutes, so it can keep running the previous
+startup script indefinitely. Measured on 2026-08-15: v5.7.0 was applied to the
+IntegrateIT pool and five hosts created the day before kept serving jobs from the
+old template afterwards. The apply reported success. That was true, and it was
+not the question anyone was asking.
+
+`recycle_decision()`
+(`modules/ci-runner-host-pool/scripts/recycle-decision.sh`, pure and
+self-tested like the other two) closes that gap, and it never interrupts a job.
+It is two-phase, and the phases are ticks apart:
+
+* **cordon** — deregister the stale host's **idle** agents. GitHub refuses to
+  deregister an agent that is executing a job, and that refusal is the guard: the
+  working slot survives and its job runs to completion, while every idle slot
+  leaves the pool, so no *new* job can ever reach this host again. Agents here
+  are not `--ephemeral` and their unit is `Restart=no`, so a deregistered slot
+  stays deregistered.
+* **retire** — once the last job lands and the host is empty, it goes through the
+  ordinary drain sequence: deregister the remainder, verify no `Runner.Worker`
+  survives, delete. The autoscaler is `ONLY_UP` with `min_replicas = min_hosts`,
+  so it rebuilds the host from the **current** template. Retiring at the floor is
+  not churn — it is the replacement.
+
+Bounded by `recycle_max_unavailable`, which is how many hosts may be mid-recycle
+at once. A cordoned host's idle slots leave the pool immediately, so cordoning
+every stale host at once would remove the fleet's whole spare capacity in one
+tick and leave every queued job waiting on a boot. **The default is `0`, which
+disables the mechanism entirely** — every existing consumer of this module
+predates the feature, and a rule that deletes machines on nobody's trigger needs
+a switch that stops it without a rollback. Start at `1`.
+
+Two series make it observable. `ci_hosts_stale_template` climbs when a template
+lands and falls back to zero as hosts are replaced; **stuck** above zero is the
+state that was invisible on 2026-08-15 — alert on sustained non-zero, not on the
+spike, because the spike is a release working. `ci_recycle_verdicts` counts
+`cordoned` and `retired` per tick: `cordoned` climbing while `retired` stays flat
+means the recycle is working and the hosts are not leaving — jobs that never end.
+
 ## Isolation rules (not optional)
 
 * **One repository per pool.** Warm hosts share caches between jobs; that
@@ -202,7 +250,8 @@ collapses to zero the moment work starts), `ci_demand_queued`,
 `ci_hosts_running`, `ci_hosts_max`, `ci_hosts_draining`, `ci_slots_total`,
 `ci_slots_busy`, `ci_host_idle_seconds_max`, `ci_queue_wait_seconds_max`,
 `ci_job_running_seconds_max`, `ci_mig_target_size`, `ci_drain_verdicts{outcome}`,
-`ci_orphan_registrations_reaped`, `ci_poller_heartbeat`.
+`ci_orphan_registrations_reaped`, `ci_hosts_stale_template`,
+`ci_recycle_verdicts{outcome}`, `ci_poller_heartbeat`.
 
 **The controller's own health.** `ci_tick_seconds`,
 `ci_runner_list_blind_ticks`, `ci_demand_runs_skipped`,
@@ -241,6 +290,7 @@ modules/ci-runner-network/       the per-project firewall posture (no NAT)
 modules/ci-runner-host-pool/     the module consumers reference
   scripts/drain-decision.sh      pure scale-in rule (unit-tested)
   scripts/orphan-decision.sh     pure registration-reap rule (unit-tested)
+  scripts/recycle-decision.sh    pure stale-template recycle rule (unit-tested)
   scripts/host-startup.sh        registers K agents; installs nothing
   scripts/controller-startup.sh  poll, publish, drain
   scripts/telemetry.sh           the single metric publisher

@@ -74,6 +74,17 @@ output "metric_names" {
       # Published since the reaper landed but never listed here, so no dashboard
       # or alert built from this contract could see it.
       "ci_orphan_registrations_reaped",
+      # The only series that answers "did the apply reach machines". A pin
+      # lands, the template changes, this climbs to the pool size and falls back
+      # to zero as hosts are replaced. STUCK above zero is the state that was
+      # invisible on 2026-08-15: v5.7.0 applied, five hosts still serving jobs
+      # from the previous template, every other series green. Alert on sustained
+      # non-zero, not on the spike — the spike is a release working.
+      "ci_hosts_stale_template",
+      # Per-tick deltas, like ci_drain_verdicts: align with a sum over the
+      # window. `cordoned` climbing while `retired` stays flat means the recycle
+      # is working and the hosts are not leaving — jobs that never end.
+      "ci_recycle_verdicts",
       "ci_poller_heartbeat",
       # Non-zero means scale-in is SUSPENDED — the controller cannot read the
       # runner list, so no host can be proven idle. Alert on a sustained run
