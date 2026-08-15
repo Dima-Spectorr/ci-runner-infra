@@ -27,13 +27,14 @@
 # The version is pinned deliberately. Playwright refuses to run when the browser
 # build in the image does not match the `@playwright/test` the repository
 # installed, so "latest" would break every consumer the day it moved.
-# `check-playwright-pin.sh` holds this constant and the reusable workflow's
-# `container:` image to the same value.
+# `check-playwright-pin.sh` holds this constant and every image reference
+# written anywhere in this repository — the composite action, the docs, the
+# examples a consumer copies — to the same value.
 set -euo pipefail
 
 # Override at build time with a packer environment_var if a pool needs a
-# different release; keep it in step with the reusable workflow or the gate
-# fails the build.
+# different release; keep it in step with the image references the docs and the
+# composite action publish, or the gate fails the build.
 PLAYWRIGHT_VERSION="${PLAYWRIGHT_VERSION:-1.62.1}"
 PLAYWRIGHT_IMAGE="mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-noble"
 

@@ -830,8 +830,14 @@ EOF
   return 1
 }
 
-# Load any container image archives the IMAGE baked into the shared cache into
+# Load any container image archives the IMAGE baked into /opt/ci-images into
 # this slot's rootless daemon.
+#
+# NOT the shared cache. /opt/ci-cache is group-writable by design and documented
+# as untrusted build input; what is read here is `docker load`ed into every slot
+# on the host, so a job able to write it would be choosing the image every other
+# slot runs. The two trees are siblings for that reason, and this one is
+# root-owned.
 #
 # This exists because a pre-pulled image is per-DAEMON, and every slot runs its
 # own rootless daemon with its own data root under the slot user's home. An
