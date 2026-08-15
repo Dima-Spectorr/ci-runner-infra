@@ -490,12 +490,21 @@ for job_id, job in jobs.items():
             out("#GROUP", vid)
         else:
             labels = runs_on if isinstance(runs_on, list) else ([runs_on] if runs_on else [])
+            literal = []
             for label in labels:
                 text = str(label)
                 if "${{" in text:
                     out("#EXPR", vid)
                 else:
+                    literal.append(text.strip())
                     out("#LABEL", vid, text.strip())
+            # Whether every literal label is a GitHub-hosted image is decided
+            # HERE, once, against `HOSTED_IMAGE` — the same expression the fork
+            # guard's safe-destination test uses. It was decided twice, in two
+            # languages, and two spellings of one security rule drift apart on
+            # the first change to either.
+            if literal and all(HOSTED_IMAGE.match(t) for t in literal):
+                out("#HOSTEDONLY", vid)
 
         if guarded:
             out("#FORKGUARD", vid)
@@ -578,22 +587,16 @@ check_file() {
     [ -n "$job" ] || continue
     job_re="$(re_quote "$job")"
 
-    local labels self_hosted=0 scoped=0 hosted_only=1 label
+    local labels self_hosted=0 scoped=0 hosted_only=0 label
     labels="$(printf '%s\n' "$records" | sed -n "s/^#LABEL\t${job_re}\t//p")"
+    # "Every literal label is a GitHub-hosted image" is the reader's answer, not
+    # a second opinion computed here — see `#HOSTEDONLY`.
+    [ "$(printf '%s\n' "$records" | grep -c "^#HOSTEDONLY	${job_re}$")" -gt 0 ] && hosted_only=1
     while IFS= read -r label; do
       [ -n "$label" ] || continue
       if printf '%s' "$label" | grep -qiE "^self-hosted$"; then
         self_hosted=1
-        hosted_only=0
       else
-        # A label that is not a GitHub-hosted image is a label some runner in
-        # the fleet was registered with. Matched against the hosted FAMILY, not
-        # its prefix: `ubuntu-pool-1` is an ordinary custom label, and reading
-        # it as a hosted image would call a fleet job hosted and skip every
-        # isolation check on it. Same expression as `HOSTED_IMAGE` above.
-        printf '%s' "$label" |
-          grep -qiE "^(ubuntu|windows|macos)-(latest|[0-9]+(\.[0-9]+)?)(-(arm|arm64|large|xlarge|xl|intel))?$" ||
-          hosted_only=0
         printf '%s' "$label" | grep -qiE "^(${GENERIC})$" || scoped=1
       fi
     done <<EOF
