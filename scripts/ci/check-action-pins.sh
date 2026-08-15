@@ -197,6 +197,10 @@ $(printf '%s\n' "$records" | grep '^#USES	')
 EOF
 }
 
+# See the same directive in `check-runner-policy.sh`: the fixture runner scores
+# a planted failure inside `$( )` with its own `fail=0`, so the subshell is the
+# isolation rather than an accident.
+# shellcheck disable=SC2030
 selftest() {
   local tmp status=0
   tmp="$(mktemp -d)"
@@ -334,6 +338,10 @@ jobs:
   return "$status"
 }
 
+# SC2031: `fail` is read after the self-test's subshells wrote their own copies.
+# Intended — a fixture failure must not reach this exit status, and on the real
+# path `check_file` runs in this shell.
+# shellcheck disable=SC2031
 main() {
   local run_selftest=0 arg
   local -a files=() allow=()

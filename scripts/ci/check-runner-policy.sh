@@ -331,6 +331,12 @@ EOF
 # gives: a config gate's characteristic failure is a vacuous pass — it reads a
 # file it never matches and reports clean — so the detectors are proved to fire
 # before any repository's own workflows are believed.
+# SC2030/SC2016 are deliberate below and scoped to this function. The fixture
+# runner evaluates `check_file` inside `$( )` with `fail=0` so a planted failure
+# scores the fixture without poisoning the real run's exit status — the subshell
+# IS the isolation. And a fixture asserting the fleet's `${{ }}` routing idiom
+# must carry that text literally, so its single quotes are the point.
+# shellcheck disable=SC2030,SC2016
 selftest() {
   local tmp status=0
   tmp="$(mktemp -d)"
@@ -507,6 +513,11 @@ jobs:
 }
 
 # --- entry point -------------------------------------------------------------
+# SC2031: `fail` is read here after `selftest`'s subshells wrote their own copies
+# of it, which is exactly the intent — a fixture's planted failure must not reach
+# this exit status. On the real path `check_file` runs in THIS shell, so the
+# value read here is the one its `err()` calls set.
+# shellcheck disable=SC2031
 main() {
   local scope="" forks="allowed" run_selftest=0
   local -a files=()
