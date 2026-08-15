@@ -722,12 +722,22 @@ compute_reachable() {
        [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
       seed="$seed$f"$'\n'
     fi
-    while IFS= read -r line; do
-      [ -n "$line" ] || continue
+    # An edge carries its CALLER JOB, because a guard on the calling job is a
+    # guard on everything that job reaches: `if: …fork == false` on the `uses:`
+    # job means the callee's jobs never run for a fork through this edge. Read
+    # without it, the callee was asked for a guard it could not need, and the
+    # only way to satisfy the gate was to duplicate the caller's condition in a
+    # file that has no pull-request context of its own. A callee reached by ANY
+    # unguarded edge is still reachable — the guard has to hold on every path.
+    local cjob cjob_re
+    while IFS=$'\t' read -r cjob line; do
+      [ -n "${line:-}" ] || continue
+      cjob_re="$(re_quote "$cjob")"
+      [ "$(printf '%s\n' "$records" | grep -c "^#FORKGUARD	${cjob_re}$")" -gt 0 ] && continue
       target="$(cd "$(dirname "$f")/../.." 2>/dev/null && pwd)/${line#./}"
       edges="$edges$f	$target"$'\n'
     done <<EOF
-$(printf '%s\n' "$records" | sed -n 's/^#CALLS\t[^\t]*\t//p')
+$(printf '%s\n' "$records" | sed -n 's/^#CALLS\t//p')
 EOF
   done
 
@@ -1245,6 +1255,23 @@ jobs:
   pull_request:
 jobs:
   call:
+    uses: ./.github/workflows/callee.yml' \
+'on:
+  workflow_call:
+jobs:
+  build:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # A guard on the CALLING job is a guard on everything that job reaches, so the
+  # callee is not asked to repeat a condition its own file has no context for.
+  expect_pair "a guard on the calling job covers the callee" "" \
+'on:
+  pull_request:
+jobs:
+  call:
+    if: github.event.pull_request.head.repo.fork == false
     uses: ./.github/workflows/callee.yml' \
 'on:
   workflow_call:
