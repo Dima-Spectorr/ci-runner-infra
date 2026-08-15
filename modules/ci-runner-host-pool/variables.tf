@@ -455,3 +455,48 @@ variable "network_tags" {
     the pool never scales in — the exact failure this module exists to fix.
   EOT
 }
+
+variable "recycle_max_unavailable" {
+  description = <<-EOT
+    How many hosts may be MID-RECYCLE at once — cordoned, or being retired —
+    when their instance template no longer matches the one the MIG builds.
+
+    Why this exists: `terraform apply` moves the definition of a host, not a
+    host. `update_policy` is OPPORTUNISTIC on purpose (PROACTIVE would delete
+    hosts to apply a template, and an arbitrary victim here carries up to
+    `slots_per_host` running jobs), so a new template is adopted only when
+    something deletes the old hosts. Nothing did: the controller retires a host
+    for being IDLE past the grace window, and a pool with work never goes idle
+    for fifteen minutes. On 2026-08-15 v5.7.0 — the release that stops a job
+    inheriting the previous job's cloud credentials — was applied to a pool and
+    five hosts kept serving jobs from the previous template afterwards. The
+    apply reported success, and it was telling the truth.
+
+    No job is ever interrupted. A stale host is CORDONED — its idle agents are
+    deregistered, so it can never receive another job, while GitHub's refusal to
+    deregister an agent that is executing one keeps the working slot alive — and
+    it is deleted on a later tick, once that job lands.
+
+    Why the default is 0 (OFF): this is the only rule in the module that deletes
+    a host for a reason that is not about the host. A controller running against
+    an unexpected template — restarted from an old image, or handed a metadata
+    key that failed to render — must not start deleting hosts because a field
+    was missing. Opt in per pool.
+
+    1 is the value to start with: cordoning removes a host's idle slots from the
+    pool immediately, so recycling every stale host at once takes out the
+    fleet's whole spare capacity in a single tick and every queued job waits for
+    a boot. Raise it only on a pool with headroom.
+
+    Watch `ci_hosts_stale_template`: it climbs to the pool size when a release
+    lands and falls back to zero as hosts are replaced. Stuck above zero means a
+    pool that keeps being told to upgrade and never does.
+  EOT
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.recycle_max_unavailable >= 0
+    error_message = "recycle_max_unavailable cannot be negative; 0 disables stale-template recycling."
+  }
+}
