@@ -138,6 +138,16 @@ jobs:
       - name: host-startup self-test
         run: bash scripts/ci/host-startup.selftest.sh
 
+      # The dependency cache is the only layer here whose breakage produces no
+      # error at all: a job with a misconfigured cache still passes, it just
+      # re-downloads everything. That is how the image described itself as
+      # carrying "pre-warmed caches" for five minor versions while the warm
+      # script was a stub and no tool was pointed at the tree. The self-test also
+      # guards the ISOLATION half — that the cache never becomes one tree several
+      # slot users can write — which fails just as silently and much worse.
+      - name: dependency cache self-test
+        run: bash scripts/ci/shared-cache.selftest.sh
+
       # Routing bug here = job code gets the HOST identity, which reads the
       # GitHub App key. Tested on every change, not only when the broker moves.
       - name: job credential broker self-test

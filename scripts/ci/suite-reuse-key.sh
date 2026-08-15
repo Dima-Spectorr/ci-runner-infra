@@ -129,8 +129,19 @@ suite_reuse_key() {
     fi
 
     case "$section" in
-      pins) pins+="$line"$'\n' ;;
-      process) process+="$line"$'\n' ;;
+      # A whitespace-only line is not a pin and not a process path, and letting
+      # one through defeats the emptiness checks below: `%%pins` followed by two
+      # blank lines made `pins` non-empty, so `miss:pins-empty` did not fire and
+      # a key was computed over ZERO declared pins. Every caller emitting that
+      # document would agree with every other one — a hit across toolchains that
+      # were never compared. Dropped here rather than at the check, so the
+      # emptiness questions below stay answerable.
+      #
+      # Written as `if`, not `test && append`: this function is SOURCED, and a
+      # trailing false test would be the loop body's exit status in a caller
+      # running `set -e`.
+      pins) if [ -n "${line//[[:space:]]/}" ]; then pins+="$line"$'\n'; fi ;;
+      process) if [ -n "${line//[[:space:]]/}" ]; then process+="$line"$'\n'; fi ;;
       filters) filters+="$line"$'\n' ;;
       tree-merge) tree_merge+="$line"$'\n' ;;
       tree-base) tree_base+="$line"$'\n' ;;
@@ -247,11 +258,22 @@ _srk_lane_globs() {
 
     if [ -z "$indent" ]; then
       # Column-zero: a lane header, or nothing this parser understands.
+      # The first character and the name charset must agree. They did not: a
+      # lane spelled `.ci` is legal under the charset check below and was
+      # rejected by this one, which returns 1 — the whole document malformed,
+      # so EVERY lane misses over a name only one of them uses. `-` stays out
+      # of the leading set deliberately: a column-zero `-` is a list item, not
+      # a name.
       case "$trimmed" in
-        [A-Za-z0-9_]*:*) ;;
+        [A-Za-z0-9_.]*:*) ;;
         *) return 1 ;;
       esac
       name="${trimmed%%:*}"
+      # An empty name is not a lane. `:` alone cannot reach here — the leading
+      # class excludes it — but `${trimmed%%:*}` is spelled to be read beside
+      # the charset test, and a test that cannot state its own empty case is a
+      # test somebody widens later without noticing.
+      [ -n "$name" ] || return 1
       case "$name" in *[!A-Za-z0-9_.-]*) return 1 ;; esac
       rest="${trimmed#*:}"
       rest="${rest#"${rest%%[![:space:]]*}"}"

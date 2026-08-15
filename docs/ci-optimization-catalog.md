@@ -261,9 +261,41 @@ any image here and it helps only the repositories that run UI tests. It also
 shows the shape a **container** cache has to take — `docker save` to
 the root-owned `/opt/ci-images/`, loaded per slot at boot — because a plain
 pre-pull lands in a daemon no slot uses. Note that it is deliberately outside
-the group-writable `/opt/ci-cache`: a cached *file* is untrusted build input,
-but a cached *image* is executed in every slot on the host. See
-[`docs/ui-testing-on-the-fleet.md`](ui-testing-on-the-fleet.md).
+`/opt/ci-cache`, which reaches every slot as a writable copy: a cached *file* is
+untrusted build input, but a cached *image* is executed in every slot on the
+host. See [`docs/ui-testing-on-the-fleet.md`](ui-testing-on-the-fleet.md).
+
+**Status (v5.10.0): half done, and the missing half was the larger one.** The gap
+was never only that nothing warmed the tree — it was that nothing *used* it.
+`/opt/ci-cache` existed from image `v3-12-0`, and no tool on any host had ever
+been pointed at it: npm still wrote `~/.npm`, Go still wrote `~/go/pkg/mod`, and
+both live in a slot `$HOME` that is private per slot and destroyed with the host.
+Warming the tree first would have produced a measured saving of zero and read as
+"caching does not help here".
+
+v5.10.0 wires the tools to a cache (`host-startup.sh`, `cache_env()`), so it now
+accumulates across jobs on a warm host. **Not to the shared tree**: `/opt/ci-cache`
+became the root-owned read-only *master*, and each slot gets a private copy of it
+under `/var/lib/ci-cache/<idx>`. A cache several slot users can write is a
+code-execution channel between concurrent jobs — every package manager treats its
+own cache as already-verified input — and the per-slot boundary the pool is built
+on would be worth nothing with that channel through it. The cost of the copy is
+disk: K slots hold K copies. See README.md's isolation rules for the full
+argument.
+
+What this does not yet do is survive the host: a scale-out or a recycle still
+starts cold, which is exactly when the pool is under the pressure that made
+caching matter (§4.1). That is the snapshot layer — see the tracking issue — and
+it is deliberately *not* a bake: one image serves every pool while cache content
+is per-repository, and a baked cache freezes at build time. It hydrates the
+master, which is read-only and therefore the one place a snapshot can land
+without reopening the channel above.
+
+Note for whoever picks this up: `setup-*` actions re-downloading toolchains is
+**not** part of this and must not be folded into it. The Actions tool cache has
+no locking (actions/toolkit#804), so pointing concurrent slots at one is a
+documented corruption, not an optimization. It needs a tree nothing writes
+during a build.
 
 ### 4.3 Docker layer caching
 

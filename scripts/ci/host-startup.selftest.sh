@@ -328,10 +328,11 @@ has_baked_image_load() { # <file>
   joined=$(joined_code_of "$1")
 
   # 1. The archives come from the root-owned tree, never from the shared cache.
-  #    /opt/ci-cache is group-writable BY DESIGN (slots must update it) and is
-  #    documented as untrusted build input. Owning the files inside it would not
-  #    help: write+execute on a non-sticky parent is enough to rename the whole
-  #    directory aside and substitute another, checksums and all.
+  #    /opt/ci-cache is copied into a writable per-slot tree BY DESIGN (slots
+  #    must update their own) and is documented as untrusted build input. Owning
+  #    the files inside it would not help: write+execute on a non-sticky parent
+  #    is enough to rename the whole directory aside and substitute another,
+  #    checksums and all.
   matches "$code" 'dir="/opt/ci-images"' || return 1
   ! matches "$code" 'dir="/opt/ci-cache' || return 1
 

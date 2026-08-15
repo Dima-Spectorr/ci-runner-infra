@@ -61,11 +61,19 @@ variable "image" {
     dockerd-rootless.sh, and a host booting one now fails closed — it refuses to
     register instead of silently returning every slot to a shared daemon.
 
-    Prefer v3-12-0 or later. v3-11-0 warms /opt/ci-cache as root under umask
-    022, so the slots can read the warmed tree and none of them can update it —
-    a package manager refreshing a partially warmed cache fails, and it fails
-    looking like a flaky upstream repository rather than like a bad image. This
-    is not fail-closed: v3-11-0 boots, registers and serves jobs.
+    Prefer v3-12-0 or later, which is the first image that ships /opt/ci-cache
+    at all. That directory is the read-only MASTER dependency cache: the host
+    copies it into a private per-slot cache at boot and points each slot's
+    package managers there. An older image simply has no master to copy, so its
+    jobs download every dependency from upstream — slower, never broken, and not
+    fail-closed: v3-11-0 boots, registers and serves jobs.
+
+    Images built before module v5.10.0 ship that tree group-writable, which is
+    the design this module has since rejected (a cache several slot users can
+    write is a channel for one job to hand another job code to run). A host
+    booting one of them re-owns the tree to root and strips its write bits before
+    seeding, so an old image is corrected at boot rather than trusted — no image
+    rebuild is required to get the fix.
   EOT
   type        = string
 }
@@ -82,12 +90,17 @@ variable "slots_per_host" {
     registers. Also the autoscaler's `single_instance_assignment`, so demand of
     N jobs asks for ceil(N / slots_per_host) hosts.
 
-    Each slot is a separate Linux user with its own rootless Docker daemon, so
-    concurrent slots share no socket, no $HOME and no workspace — only the
-    read-mostly cache at /opt/ci-cache. This needs image v3-11-0 or later; on an
-    older image the host refuses to register rather than putting every slot back
-    on one daemon. The cache is only WRITABLE by the slots from v3-12-0 on —
-    see `image`. See the isolation rules in README.md.
+    Each slot is a separate Linux user with its own rootless Docker daemon and
+    its own dependency cache, so concurrent slots share no socket, no $HOME, no
+    workspace and nothing writable at all. This needs image v3-11-0 or later; on
+    an older image the host refuses to register rather than putting every slot
+    back on one daemon.
+
+    Note that the cache is per-slot COPIES of one master, so K slots hold K
+    copies of the warmed tree — this variable multiplies the cache's disk cost,
+    and `boot_disk_size_gb` has to carry it — there is no quota on the cache, so
+    a slot that fills the disk degrades every other slot on the host. See `image`
+    and the isolation rules in README.md.
   EOT
   type        = number
   default     = 4

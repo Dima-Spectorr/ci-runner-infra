@@ -47,8 +47,9 @@ The two failure directions are not symmetric, and neither is the rule:
 So:
 
 1. **Every lane's key covers the CI process**, whatever that lane declares:
-   `.github/workflows/**`, `.github/actions/**`, `scripts/ci/**`, `.mergify.yml`
-   and the caller-supplied pins. A workflow or gate-script change alters what
+   `.github/workflows/**`, `.github/actions/**`, `scripts/ci/**`, both spellings
+   of the queue config (`.mergify.yml` and `.mergify.yaml`) and the
+   caller-supplied pins. A workflow or gate-script change alters what
    "green" *means*; a lane that reused across one would be asserting a result
    its own definition no longer produces. This is not an optimisation to be
    relaxed later — it is the reason the gate holds.
