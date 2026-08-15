@@ -67,9 +67,18 @@ In the consuming repository:
 ```yaml
 jobs:
   ui:
+    # A fork must not reach this pool. The warm host is credentialed, reused
+    # between jobs, and — for UI tests specifically — carries a browser image
+    # cache shared by every slot on it. RUNNER4.
+    #
+    # The guard is an `if:` and not the expression `runs-on` form, even though
+    # RUNNER4 accepts both: an expression `runs-on` is what RUNNER5 refuses to
+    # read, so the other spelling satisfies one gate by tripping another.
+    if: github.event.pull_request.head.repo.fork == false
+
     # The repository-scoped label is not optional — every pool answers to
     # `self-hosted, linux, gcp`, so a job naming only those can be picked up by
-    # another repository's warm host. check-runner-policy.sh RUNNER1.
+    # another repository's warm host. RUNNER1.
     runs-on: [self-hosted, linux, gcp, <RepoLabel>]
     timeout-minutes: 30
     container:
@@ -84,6 +93,13 @@ jobs:
         with:
           playwright-version: "1.62.1"
 ```
+
+The fork guard makes this job **skip** on a fork pull request, so it must not be
+a required check by name. A skipped required check never reports, and the pull
+request sits in the queue until it is dequeued rather than turning red. Put it
+behind the aggregate check described in [ci-lane-model.md](ci-lane-model.md),
+which is the piece that reports a verdict for the lane whether or not every job
+in it ran.
 
 ### Why a composite action and not a reusable workflow
 
