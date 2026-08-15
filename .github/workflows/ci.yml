@@ -200,6 +200,15 @@ jobs:
       - name: publish-tag self-test
         run: bash scripts/ci/publish-tag.selftest.sh
 
+      # The other half of the same failure: publishing a tag nobody applies
+      # changes nothing. v5.7.0 merged into nine repositories and reached one
+      # pool — the one whose apply a person ran by hand. This asserts the
+      # properties that let an apply run unattended, because an apply nobody
+      # trusts is an apply somebody turns off, and then the fleet is back to a
+      # laptop and a gitignored tfvars.
+      - name: apply-runner-pool self-test
+        run: bash scripts/ci/apply-runner-pool.selftest.sh
+
   terraform:
     name: Terraform (fmt + validate)
     runs-on: ubuntu-latest
