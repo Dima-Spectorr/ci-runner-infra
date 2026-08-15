@@ -191,7 +191,10 @@ suite_reuse_key() {
     || { echo "miss:digest-unavailable"; return 0; }
   d_base=$(_srk_select "$norm_base" "$effective" | _srk_hash) \
     || { echo "miss:digest-unavailable"; return 0; }
-  [ -n "$d_merge" ] && [ -n "$d_base" ] || { echo "miss:digest-unavailable"; return 0; }
+  if [ -z "$d_merge" ] || [ -z "$d_base" ]; then
+    echo "miss:digest-unavailable"
+    return 0
+  fi
 
   # --- the preimage, in this order, and the version prefix that retires it ----
   #
