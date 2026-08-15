@@ -33,7 +33,7 @@ jobs:
     # the wait, but the rule is fleet-wide and starts at home.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: bash -n every script
         run: |
@@ -152,6 +152,25 @@ jobs:
       - name: tf-apply-guard self-test
         run: bash scripts/ci/tf-apply-guard.selftest.sh
 
+      # Which pool a job may claim. The fixtures first, same reason as above —
+      # a workflow gate that reads no workflow reports clean.
+      - name: runner policy self-test
+        run: bash scripts/ci/check-runner-policy.sh --selftest
+
+      # …and then this repository's own workflows. It publishes the rule, so it
+      # is the first place the rule must hold. `--forks=allowed` is the strict
+      # posture and this repository is PUBLIC, so it is also the true one.
+      - name: runner policy
+        run: bash scripts/ci/check-runner-policy.sh --forks=allowed
+
+      # A moved tag on a popular action is arbitrary code on every pool in the
+      # fleet, with no pull request in any consumer to review it.
+      - name: action pins self-test
+        run: bash scripts/ci/check-action-pins.sh --selftest
+
+      - name: action pins
+        run: bash scripts/ci/check-action-pins.sh
+
       # The README quickstart pinned v3.0.0 while the fleet ran v4.1.0 — the one
       # copy-pasteable line in the repo, three minor versions stale, because
       # nothing connected Markdown to a git tag. VERSION is that connection.
@@ -163,8 +182,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: 1.9.8
 
@@ -184,7 +203,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: no hardcoded org, project, region or repo
         run: |

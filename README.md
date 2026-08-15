@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.3.2"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.4.0"
   # ...
 }
 ```
@@ -214,6 +214,10 @@ scripts/ci/                      self-tests
 docs/onboarding-a-repository.md  how to put a NEW repo on the fleet
 scripts/ci/check-merge-queue-single-step.sh
                                  the merge-queue rule consumers copy in
+scripts/ci/check-runner-policy.sh
+                                 which pool a job may claim, and for how long
+scripts/ci/check-action-pins.sh  every third-party action pinned to a commit
+docs/ci-workflow-gates.md        those two gates: rules, flags, how to adopt
 docs/ci-lane-model.md            the lane contract consumers adopt
 docs/ci-merge-queue-baseline.md  one CI run per PR: the queue config + gate
 docs/ci-optimization-catalog.md  the fleet audit behind that contract

@@ -385,6 +385,13 @@ mutable tags (`@v4`, `@v7`). These actions run on self-hosted VMs that hold a
 GCP identity. Pin by SHA and let Dependabot propose the bumps; this also removes
 the surprise-breakage class of CI failure, which is itself wasted CI.
 
+**Shipped:** `scripts/ci/check-action-pins.sh` (v5.4.0) enforces it — PIN1 the
+commit SHA, PIN2 the version comment beside it so Dependabot's bumps stay
+reviewable, PIN3 `docker://` images by digest. Re-measured 2026-08-15 across the
+ten locally-cloned consumers: **344 unpinned references, zero repositories
+clean**. See `docs/ci-workflow-gates.md` for adoption, including the Dependabot
+config without which pinning becomes permanent staleness.
+
 ---
 
 ## 8. Governance tier — how this stays true
@@ -395,6 +402,16 @@ the surprise-breakage class of CI failure, which is itself wasted CI.
    against vendoring the Terraform module.
 2. **Add a drift gate** mirroring the existing `ci-runner-*` module drift check:
    fail if a consuming repo re-implements the classifier locally.
+2a. **Gate the pool boundary itself, not only the lane.** Item 2 above and §5.1
+   are both statements about a workflow file that nothing read.
+   `scripts/ci/check-runner-policy.sh` (v5.4.0) now does: RUNNER1 a self-hosted
+   `runs-on` carries a repository-scoping label, RUNNER3 every job declares
+   `timeout-minutes`, RUNNER4 fork code stays off a warm host, RUNNER5 a
+   dynamically selected runner is reported UNDECIDED rather than passed. The
+   finding that justifies it is the one no reader had found: exactly ONE job in
+   the fleet is self-hosted with no scope label, so it may be scheduled onto any
+   repository's warm host — which is the isolation rule in `README.md` failing
+   silently, because from GitHub's side it is a job that found a runner.
 3. **Budget the always-on set.** A PR that adds a new unconditional required
    job should have to justify it, in the same shape as the existing
    `Resident instruction context within budget` gate.
@@ -425,5 +442,5 @@ Ranked by saved pool-seconds per unit of work, with dependencies respected.
 | 10 | Real warm cache in the golden image | 4.2 |
 | 11 | Batch settings + scopes in every queue | 6 |
 | 12 | Build-once/reuse, Docker layer cache, remote monorepo cache | 3.4, 4.3, 4.4 |
-| 13 | SHA-pin actions | 7 |
+| 13 | SHA-pin actions — gate shipped v5.4.0, 344 findings to land | 7 |
 | 14 | Fast/heavy runner classes and shared overflow capacity | 2.3, 2.4 |
