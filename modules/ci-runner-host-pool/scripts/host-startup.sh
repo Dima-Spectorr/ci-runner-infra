@@ -371,10 +371,14 @@ write_slot_docker_config() {
 # TLS stream — never a size error. Small responses complete, large ones do not,
 # so the same build fails in a different place each run.
 #
-# `mtu` in the daemon config is the default for the bridge networks dockerd
-# creates, which includes the per-job `github_network_*` the runner makes for a
-# `container:` job. Setting it on the daemon rather than on a network is what
-# makes it apply to networks this script never sees.
+# TWO KEYS, because `mtu` is not the one that matters here. Measured on a live
+# host with docker 29.7.2: with `mtu` alone the default `docker0` bridge comes up
+# at 1460 and a `docker network create` bridge still comes up at 1500 — and the
+# network the runner creates for a `container:` job (`github_network_*`) is
+# exactly the second kind, so the setting that looks like the fix changes nothing
+# a job can observe. `default-network-opts` supplies the per-driver default that
+# those networks inherit. `mtu` is kept for the default bridge, which a job that
+# runs `docker run` without a network still lands on.
 #
 # Read from the primary interface, not written as 1460: an image or estate with
 # jumbo frames or a tunnel would be given the wrong number by a literal, and the
@@ -387,7 +391,8 @@ write_slot_daemon_config() {
 
   install -d -o "$u" -g "$u" -m 0700 "/home/$u/.config"
   install -d -o "$u" -g "$u" -m 0700 "/home/$u/.config/docker"
-  printf '{\n  "mtu": %s\n}\n' "$mtu" >"/home/$u/.config/docker/daemon.json"
+  printf '{\n  "mtu": %s,\n  "default-network-opts": {\n    "bridge": { "com.docker.network.driver.mtu": "%s" }\n  }\n}\n' \
+    "$mtu" "$mtu" >"/home/$u/.config/docker/daemon.json"
   chown "$u:$u" "/home/$u/.config/docker/daemon.json"
   chmod 0600 "/home/$u/.config/docker/daemon.json"
 }

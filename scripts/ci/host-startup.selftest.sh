@@ -259,6 +259,12 @@ has_container_mtu() { # <file>
   # `github_network_*` bridge the runner creates and this script never sees
   matches "$code" 'daemon\.json' || return 1
   matches "$code" '"mtu"' || return 1
+  # …and the per-driver default, which is the one the per-job network reads.
+  # `mtu` alone leaves a `docker network create` bridge at 1500 — measured, on a
+  # host, with docker 29.7.2 — and that is precisely the network the runner makes
+  # for a `container:` job, so the obvious key alone fixes nothing observable.
+  matches "$code" 'default-network-opts' || return 1
+  matches "$code" 'com\.docker\.network\.driver\.mtu' || return 1
   # from the primary interface, not a literal: a literal is wrong on any estate
   # with jumbo frames or a tunnel, and wrong here is invisible
   matches "$code" 'mtu=\$\(primary_mtu\)' || return 1
@@ -390,6 +396,8 @@ mutate "slots left without the config"    's|write_slot_docker_config "\$idx" \|
 
 mutate "daemon MTU config removed"        's|daemon\.json|daemon.txt|g'                                            has_container_mtu
 mutate "MTU key dropped"                  's|"mtu"|"debug"|'                                                       has_container_mtu
+mutate "per-driver default dropped"       's|default-network-opts|default-address-pools|'                          has_container_mtu
+mutate "driver MTU option dropped"        's|com\.docker\.network\.driver\.mtu|com.docker.network.driver.name|'    has_container_mtu
 mutate "MTU hardcoded"                    's|mtu=\$(primary_mtu)|mtu=1460|'                                        has_container_mtu
 mutate "slots left on the default MTU"    's|write_slot_daemon_config "\$idx" \|\| return 1|:|'                    has_container_mtu
 
