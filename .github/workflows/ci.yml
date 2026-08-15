@@ -101,6 +101,15 @@ jobs:
       - name: orphan-decision self-test
         run: bash scripts/ci/orphan-decision.selftest.sh
 
+      # The Windows half of the delete gate. Where the Linux rule reads an
+      # answer the controller fetched itself, this one reads a value the HOST
+      # published — so every failure of that publisher, its clock and the guest
+      # attributes API is an input to the verdict rather than an exception
+      # around it. Three of those failures look exactly like "idle" to a naive
+      # implementation, and each deletes a machine that may be running a job.
+      - name: beacon-decision self-test
+        run: bash scripts/ci/beacon-decision.selftest.sh
+
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a
       # mis-restarted controller publishes nothing at all while systemd reports
