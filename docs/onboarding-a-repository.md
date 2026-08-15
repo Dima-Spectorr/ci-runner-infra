@@ -43,8 +43,17 @@ Copy `main.tf` from any current consumer — the shape is identical everywhere �
 or start from this minimum:
 
 ```hcl
+module "ci_runner_network" {
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.2.0"
+
+  project_id         = var.project_id
+  network            = var.network
+  name_prefix        = var.pool_name
+  runner_network_tag = "${var.pool_name}-host"
+}
+
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.1.5"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.2.0"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -53,7 +62,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.1.5"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.2.0"
 
   project_id = var.project_id
   region     = var.region
@@ -89,9 +98,19 @@ module "ci_runner_pool" {
 }
 ```
 
-`module.ci_runner_network` (IAP-SSH + health-check firewall rules) is per
+`module.ci_runner_network` (IAP-SSH + health-check ingress, narrowed egress, an
+explicit deny-all, and database egress to private addresses only) is per
 *project*, not per pool. Instantiate it once; if the project already runs a pool,
 reuse the existing tag instead of declaring a second copy.
+
+Its `database_egress_ports` default is the common set — SQL Server, Oracle,
+MySQL, PostgreSQL, Redis, Cassandra, MongoDB — and not any one repository's
+port, because the failure it prevents is invisible: the egress allow is narrowed
+to 443 and DNS, so an integration test whose port is missing does not get a
+refusal, it gets a client that hangs until the job times out. The destination is
+what keeps it safe (`database_egress_ranges`, RFC1918 only), so adding a port is
+routine and widening the ranges is not. A project whose runners must reach no
+database at all sets `database_egress_ports = []` and no rule is created.
 
 **Do not vendor the modules.** A drift gate
 (`scripts/ci/check-no-vendored-ci-module.sh`) fails CI if a local
