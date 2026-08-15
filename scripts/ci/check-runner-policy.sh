@@ -79,6 +79,17 @@
 #   spelling that can quietly name any pool in the fleet, and silence there
 #   would be the vacuous pass this gate exists to prevent.
 #
+#   The other exception is `runs-on: ${{ fromJSON(matrix.<key>.<field>) }}`,
+#   where the label lists are LITERALS in the same file — apigee-portal's
+#   `unit-tests.yml` writes each leg's pool as `'["self-hosted", "linux", "gcp",
+#   "Apigee-Portal"]'`. Nothing about that is undecidable, and abstaining on it
+#   would be the gate declining to read a boundary written down in front of it.
+#   Each leg is resolved and judged SEPARATELY, as `<job>~leg<n>`: a union would
+#   let one scoped leg vouch for an unscoped one sharing the job. Resolution is
+#   refused — back to RUNNER5 — the moment it stops being a literal lookup: an
+#   `include:`/`exclude:` that can add or override legs, a value that is itself
+#   an expression, or anything that is not parseable JSON.
+#
 #   The one exception is the fleet's own fork-routing idiom —
 #   `runs-on: ${{ …head.repo.fork && 'ubuntu-latest' || vars.CI_RUNNER_LABEL }}`
 #   — which is an expression BECAUSE it is making the routing decision this gate
@@ -139,7 +150,8 @@ ensure_yaml() {
 #   #ERR\t<message>                  the document does not load
 #   #PR                              a `pull_request` trigger is present
 #   #PRTARGET                        a `pull_request_target` trigger is present
-#   #JOB\t<id>                       a job exists
+#   #JOB\t<id>                       a job exists (or one resolved matrix leg,
+#                                    as `<job>~leg<n>` — see the matrix note above)
 #   #REUSABLE\t<id>                  the job is a `uses:` call (takes no timeout)
 #   #TIMEOUT\t<id>\t<value>          the JOB's timeout-minutes, never a step's
 #   #LABEL\t<id>\t<label>            one literal label of a list/string runs-on
@@ -148,7 +160,11 @@ ensure_yaml() {
 #   #FORKGUARD\t<id>                 `head.repo.fork` decides this job
 read_workflow() {
   "${PY_BIN:-python3}" - "$1" <<'PY'
-import sys, yaml
+import json
+import re
+import sys
+
+import yaml
 
 # LF only. On Windows `print` emits CRLF, and the trailing CR lands inside the
 # last field — so a label reads as `IntegrateIT\r`, matches nothing, and the
@@ -191,46 +207,123 @@ if "pull_request" in names:
 if "pull_request_target" in names:
     out("#PRTARGET")
 
+# `runs-on: ${{ fromJSON(matrix.<key>[.<field>]) }}` and nothing else. The
+# anchors matter: a expression that merely CONTAINS a `fromJSON(matrix…)` is
+# doing something further with it, and this resolver would be guessing.
+MATRIX_RUNS_ON = re.compile(
+    r"^\s*\$\{\{\s*fromJSON\(\s*matrix\.([A-Za-z0-9_-]+)"
+    r"((?:\.[A-Za-z0-9_-]+)?)\s*\)\s*\}\}\s*$"
+)
+
+
+def resolve_matrix_legs(job):
+    """Label lists for each leg of a matrix-selected `runs-on`, or None.
+
+    None means "keep treating this as an expression" and is returned for every
+    shape that is not a plain lookup of a JSON literal — the resolver must never
+    be the reason a pool boundary goes unread, so anything it is not sure of
+    goes back to RUNNER5 rather than being resolved optimistically.
+    """
+    runs_on = job.get("runs-on")
+    if not isinstance(runs_on, str):
+        return None
+    hit = MATRIX_RUNS_ON.match(runs_on)
+    if not hit:
+        return None
+    key, field = hit.group(1), hit.group(2).lstrip(".")
+
+    matrix = (job.get("strategy") or {}).get("matrix")
+    if not isinstance(matrix, dict):
+        return None
+    # `include` can add legs and override a leg's fields; `exclude` removes
+    # them. Replicating GitHub's expansion order here would be a second
+    # implementation of it, and a wrong one is a gate that reports on legs that
+    # do not exist while missing the ones that do.
+    if "include" in matrix or "exclude" in matrix:
+        return None
+
+    entries = matrix.get(key)
+    if not isinstance(entries, list) or not entries:
+        return None
+
+    legs = []
+    for entry in entries:
+        if field:
+            if not isinstance(entry, dict) or field not in entry:
+                return None
+            value = entry[field]
+        else:
+            value = entry
+        if not isinstance(value, str) or "${{" in value:
+            return None
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        if isinstance(parsed, str):
+            parsed = [parsed]
+        if not isinstance(parsed, list) or not all(isinstance(x, str) for x in parsed):
+            return None
+        legs.append(parsed)
+    return legs
+
+
 jobs = doc.get("jobs")
 if not isinstance(jobs, dict):
     sys.exit(0)
 
 for job_id, job in jobs.items():
     job_id = str(job_id)
-    out("#JOB", job_id)
     if not isinstance(job, dict):
+        out("#JOB", job_id)
         continue
 
-    # A job that calls a reusable workflow accepts no `timeout-minutes` at all:
-    # requiring one there would fail a correct workflow, and the bound belongs
-    # to the called workflow's own jobs, which this gate reads separately.
-    if "uses" in job:
-        out("#REUSABLE", job_id)
-
-    if "timeout-minutes" in job:
-        out("#TIMEOUT", job_id, job.get("timeout-minutes"))
-
-    runs_on = job.get("runs-on")
-    if isinstance(runs_on, dict):
-        # `{group: …}` names a runner GROUP, whose membership lives in
-        # repository settings rather than in this file. Undecidable here, and
-        # reported as such rather than passed.
-        out("#GROUP", job_id)
+    # One record set per leg when a matrix decides the pool, so a scoped leg
+    # cannot vouch for an unscoped one sharing the job. `~` keeps the synthetic
+    # id free of regex metacharacters: these ids are interpolated into the
+    # `sed`/`grep` patterns that read these records back.
+    legs = resolve_matrix_legs(job)
+    if legs is None:
+        variants = [(job_id, job.get("runs-on"))]
     else:
-        labels = runs_on if isinstance(runs_on, list) else ([runs_on] if runs_on else [])
-        for label in labels:
-            text = str(label)
-            if "${{" in text:
-                out("#EXPR", job_id)
-            else:
-                out("#LABEL", job_id, text.strip())
+        variants = [("%s~leg%d" % (job_id, i + 1), lab) for i, lab in enumerate(legs)]
 
     # The fork guard may sit in either place, and both are load-bearing: `if:`
-    # skips the job, `runs-on` re-routes it. `strategy` is deliberately not
-    # read — a matrix cannot decide whether the head repository is a fork.
+    # skips the job, `runs-on` re-routes it. Read from the JOB, not the leg: a
+    # matrix cannot decide whether the head repository is a fork, so every leg
+    # inherits the one answer.
     guard = " ".join(str(job.get(k, "")) for k in ("if", "runs-on"))
-    if "head.repo.fork" in guard or "head_repository" in guard:
-        out("#FORKGUARD", job_id)
+    guarded = "head.repo.fork" in guard or "head_repository" in guard
+
+    for vid, runs_on in variants:
+        out("#JOB", vid)
+
+        # A job that calls a reusable workflow accepts no `timeout-minutes` at
+        # all: requiring one there would fail a correct workflow, and the bound
+        # belongs to the called workflow's own jobs, which this gate reads
+        # separately.
+        if "uses" in job:
+            out("#REUSABLE", vid)
+
+        if "timeout-minutes" in job:
+            out("#TIMEOUT", vid, job.get("timeout-minutes"))
+
+        if isinstance(runs_on, dict):
+            # `{group: …}` names a runner GROUP, whose membership lives in
+            # repository settings rather than in this file. Undecidable here,
+            # and reported as such rather than passed.
+            out("#GROUP", vid)
+        else:
+            labels = runs_on if isinstance(runs_on, list) else ([runs_on] if runs_on else [])
+            for label in labels:
+                text = str(label)
+                if "${{" in text:
+                    out("#EXPR", vid)
+                else:
+                    out("#LABEL", vid, text.strip())
+
+        if guarded:
+            out("#FORKGUARD", vid)
 PY
 }
 
@@ -489,6 +582,79 @@ jobs:
 jobs:
   build:
     runs-on: self-hosted
+    steps: [{run: "true"}]'
+
+  # The apigee-portal `unit-tests.yml` shape: the pool is chosen through the
+  # matrix, but every label list is a literal in the same file.
+  expect "matrix-selected runs-on resolves to its literal legs" "" "Apigee-Portal" blocked \
+'on: [push]
+jobs:
+  suite:
+    runs-on: ${{ fromJSON(matrix.suite.runs_on) }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        suite:
+          - {name: api, runs_on: '"'"'["self-hosted", "linux", "gcp", "Apigee-Portal"]'"'"'}
+          - {name: web, runs_on: '"'"'["ubuntu-latest"]'"'"'}
+    steps: [{run: "true"}]'
+
+  # The reason the legs are judged separately rather than unioned: unioned, the
+  # scoped leg below would supply the scope label the unscoped one is missing,
+  # and this file would report clean on a leg the whole fleet can claim.
+  expect "one unscoped leg is not covered by a scoped one" "RUNNER1" "" blocked \
+'on: [push]
+jobs:
+  suite:
+    runs-on: ${{ fromJSON(matrix.suite.runs_on) }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        suite:
+          - {name: api, runs_on: '"'"'["self-hosted", "linux", "gcp", "Apigee-Portal"]'"'"'}
+          - {name: web, runs_on: '"'"'["self-hosted", "linux", "gcp"]'"'"'}
+    steps: [{run: "true"}]'
+
+  expect "a matrix leg answers --scope like any other job" "RUNNER2" "OtherRepo" blocked \
+'on: [push]
+jobs:
+  suite:
+    runs-on: ${{ fromJSON(matrix.suite.runs_on) }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        suite:
+          - {name: api, runs_on: '"'"'["self-hosted", "linux", "gcp", "Apigee-Portal"]'"'"'}
+    steps: [{run: "true"}]'
+
+  # `include:` can add legs and override fields. Resolving anyway would mean
+  # reimplementing GitHub's expansion, so this goes back to undecided.
+  expect "include: refuses resolution rather than guessing" "RUNNER5" "" blocked \
+'on: [push]
+jobs:
+  suite:
+    runs-on: ${{ fromJSON(matrix.suite.runs_on) }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        suite:
+          - {name: api, runs_on: '"'"'["self-hosted", "linux", "gcp", "Apigee-Portal"]'"'"'}
+        include:
+          - {name: extra, runs_on: '"'"'["self-hosted", "linux", "gcp"]'"'"'}
+    steps: [{run: "true"}]'
+
+  # The matrix value is itself an expression, so the label list is still decided
+  # by configuration this gate cannot read.
+  expect "a matrix value that is an expression stays undecided" "RUNNER5" "" blocked \
+'on: [push]
+jobs:
+  suite:
+    runs-on: ${{ fromJSON(matrix.suite.runs_on) }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        suite:
+          - {name: api, runs_on: "${{ vars.CI_RUNNER_JSON }}"}
     steps: [{run: "true"}]'
 
   expect "unparseable document" "RUNNER0" "" allowed \

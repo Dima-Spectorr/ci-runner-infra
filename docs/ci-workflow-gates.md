@@ -103,6 +103,25 @@ against repository configuration this gate cannot see. Both are RUNNER5 —
 reported as undecidable rather than passed, because an expression is the one
 spelling that can quietly name any pool in the fleet.
 
+### What it decides that looks undecidable
+
+`runs-on: ${{ fromJSON(matrix.<key>.<field>) }}` is an expression whose label
+lists are **literals in the same file** — apigee-portal's `unit-tests.yml`
+writes each leg's pool as `'["self-hosted", "linux", "gcp", "Apigee-Portal"]'`.
+Nothing there is undecidable, and abstaining would be the gate declining to
+read a boundary written down in front of it. So the legs are resolved.
+
+Each leg is judged **separately**, as `<job>~leg<n>`. Unioning them would let a
+scoped leg supply the label an unscoped leg sharing the job is missing — the
+gate would then report clean on a leg the whole fleet can claim, which is the
+exact failure it exists to catch.
+
+Resolution is refused, back to RUNNER5, the moment it stops being a literal
+lookup: an `include:`/`exclude:` that can add or override legs, a value that is
+itself an expression, or anything that is not parseable JSON. Replicating
+GitHub's matrix expansion here would be a second implementation of it, and a
+wrong one reports on legs that do not exist while missing the ones that do.
+
 ### Why it parses
 
 `runs-on: self-hosted` is a string where `runs-on: [self-hosted]` is a list;
@@ -187,26 +206,43 @@ updates:
 
 ### Fleet state at adoption time (measured 2026-08-15)
 
-Both gates run in report mode over the ten locally-cloned consumers:
+Both gates run in report mode over the ten locally-cloned consumers, against
+each repository's **default branch** (`origin/main`, or `origin/master` for
+DataRetrival and Soap-to-Rest) rather than whatever the local working copy
+held. That distinction is not pedantry: an earlier revision of this table was
+measured against working copies carrying feature branches and uncommitted
+edits, and it reported findings for repositories that did not have them —
+apigee-portal in particular, credited with 20 × RUNNER3 against a default
+branch that already bounds every job.
 
-| Repo | runner policy | action pins |
-|---|---|---|
-| Atlas | clean | 24 × PIN1 |
-| Borsh-Tablet-App | 6 × RUNNER5 | 15 × PIN1 |
-| DataRetrival | 9 × RUNNER3 | 25 × PIN1 |
-| IntegrateIT | 1 × RUNNER1, 3 × RUNNER3 | 41 × PIN1 |
-| Print-Server | 22 × RUNNER3 | 36 × PIN1 |
-| Soap-to-Rest | 19 × RUNNER3 | 40 × PIN1 |
-| Specaria-Platform | 1 × RUNNER3 | 49 × PIN1 |
-| Telnet-Emulation | 13 × RUNNER3 | 25 × PIN1 |
-| apigee-portal | 20 × RUNNER3 | 58 × PIN1 |
-| entity-platform | 16 × RUNNER3, 3 × RUNNER5 | 31 × PIN1 |
+| Repo | files | runner policy | action pins |
+|---|---|---|---|
+| Atlas | 7 | clean | 26 × PIN1 |
+| Borsh-Tablet-App | 2 | 7 × RUNNER5 | 17 × PIN1 |
+| DataRetrival | 9 | clean | 39 × PIN1 |
+| IntegrateIT | 11 | 1 × RUNNER1, 3 × RUNNER3 | 41 × PIN1 |
+| Print-Server | 14 | 18 × RUNNER3 | 41 × PIN1 |
+| Soap-to-Rest | 15 | clean | 52 × PIN1 |
+| Specaria-Platform | 12 | clean | 55 × PIN1 |
+| Telnet-Emulation | 5 | 13 × RUNNER3 | 28 × PIN1 |
+| apigee-portal | 15 | clean | 93 × PIN1 |
+| entity-platform | 3 | 16 × RUNNER3, 3 × RUNNER5 | 31 × PIN1 |
 
-Two readings matter. PIN1 is universal — 344 unpinned references and not one
-repository clean, which is why this is a published gate rather than fourteen
-hand-edits. RUNNER1 is rare: exactly one job in the fleet is self-hosted
-without a scope label, which is the point — the finding a gate exists for is
-the one nobody would have found by reading.
+Three readings matter.
+
+PIN1 is universal — **423 unpinned references and not one repository clean**,
+which is why this is a published gate rather than ten hand-edits.
+
+RUNNER1 is rare: exactly one job in the fleet is self-hosted without a scope
+label. That is the point. The finding a gate exists for is the one nobody would
+have found by reading, and a check that fires everywhere is measuring a
+convention rather than a hazard.
+
+RUNNER5 is not a finding about the gate, it is a finding about the repository.
+Borsh-Tablet-App's seven and entity-platform's three are jobs whose pool is
+chosen by repository configuration; three of entity-platform's read
+`${{ vars.CI_RUNNER_LABEL }}` bare, with no fork guard and no fallback, so an
+unset variable resolved them to an **empty label set**.
 
 Run in report mode before enforcing:
 
