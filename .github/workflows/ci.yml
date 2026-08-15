@@ -209,6 +209,17 @@ jobs:
       - name: apply-runner-pool self-test
         run: bash scripts/ci/apply-runner-pool.selftest.sh
 
+      # The browser image a pool BAKES and the one a consumer is told to RUN are
+      # two different lines that must name one release. When they drift nothing
+      # fails — every UI job just quietly downloads two gigabytes it was meant
+      # to find warm, and the symptom is "browser tests are slow", which is the
+      # most believable wrong explanation there is.
+      - name: playwright pin self-test
+        run: bash scripts/ci/check-playwright-pin.sh --selftest
+
+      - name: playwright pin
+        run: bash scripts/ci/check-playwright-pin.sh
+
   terraform:
     name: Terraform (fmt + validate)
     runs-on: ubuntu-latest

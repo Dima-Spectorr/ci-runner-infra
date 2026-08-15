@@ -830,6 +830,51 @@ EOF
   return 1
 }
 
+# Load any container image archives the IMAGE baked into the shared cache into
+# this slot's rootless daemon.
+#
+# This exists because a pre-pulled image is per-DAEMON, and every slot runs its
+# own rootless daemon with its own data root under the slot user's home. An
+# image pulled at bake time lands in the build VM's root-owned /var/lib/docker
+# and is invisible to all K of them — so the only way to bake a container image
+# is to bake a FILE (docker save) and load it per slot, which is what this does.
+#
+# Deliberately generic: the host has no idea what is in the archives, and no
+# tool is named here. A pool that wants an image warm supplies a warm-cache
+# script that writes /opt/ci-cache/images/*.tar[.gz]; a pool that does not gets
+# an empty directory and pays nothing.
+#
+# Backgrounded and never fatal, for two reasons. A multi-gigabyte load takes
+# minutes, and blocking on it would keep the whole pool from registering while
+# a job queue builds. And a corrupt or half-written archive must degrade to "the
+# job pulls the image itself", which is merely slow — the alternative is a host
+# that refuses to register over a CACHE, which is the same class of fault as
+# making boot depend on a registry (see slot_runtime_usable).
+load_baked_images() {
+  local idx="$1" u; u=$(slot_user "$idx")
+  local dir="/opt/ci-cache/images"
+
+  [ -d "$dir" ] || return 0
+  # Nothing to do is the common case — most pools bake no images at all.
+  local archives; archives=$(find "$dir" -maxdepth 1 -type f \( -name '*.tar' -o -name '*.tar.gz' \) 2>/dev/null)
+  [ -n "$archives" ] || return 0
+
+  (
+    local a
+    printf '%s\n' "$archives" | while IFS= read -r a; do
+      [ -n "$a" ] || continue
+      # `docker load` reads gzip transparently, so a warm script may save either
+      # form; gzip trades boot CPU for image size and is the better default.
+      if sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
+           docker load -i "$a" >>/var/log/ci-host.log 2>&1; then
+        log "slot $idx: loaded baked image archive $(basename "$a")"
+      else
+        log "slot $idx: could not load $(basename "$a") — jobs will pull that image themselves"
+      fi
+    done
+  ) &
+}
+
 install_slot() {
   local idx="$1" token="$2"
   local dir="$SLOT_ROOT/$idx"
@@ -837,6 +882,10 @@ install_slot() {
   local u; u=$(slot_user "$idx")
 
   start_slot_dockerd "$idx" || return 1
+
+  # After the daemon is proven up, before the agent registers. Backgrounded, so
+  # the slot takes jobs while the cache warms behind it.
+  load_baked_images "$idx"
 
   # google-auth, gcloud and the Go/Java clients all resolve the metadata server
   # through these. Per SLOT, not per host: the address that reaches the broker

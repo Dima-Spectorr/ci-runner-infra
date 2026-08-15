@@ -123,6 +123,12 @@ variable "warm_cache_script" {
     invisible to every one of them. Pre-pulling would cost build minutes and
     disk for nothing.
 
+    A container image therefore has to be baked as a FILE, which is the one
+    form every slot can read: `docker save` it into /opt/ci-cache/images/ and
+    host-startup.sh's load_baked_images() loads it into each slot's daemon at
+    boot. `warm-cache/playwright.sh` is that pattern, for pools that run
+    browser tests.
+
     Empty = build a toolchain-only image.
   EOT
   default     = ""

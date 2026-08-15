@@ -1,0 +1,141 @@
+# Run a repository's Playwright suite on the fleet, inside the official
+# Playwright container.
+#
+# A composite ACTION, deliberately, and not a reusable workflow. A reusable
+# workflow would have to take `runs-on` as an input — the fleet's pools are
+# scoped per repository, so this repo cannot name one — and an expression
+# `runs-on` is exactly what RUNNER5 refuses to read. Worse, RUNNER7 records that
+# a REMOTE reusable workflow's jobs are not in the calling repository either, so
+# the pool boundary and the job timeout would be checked by NOBODY: not here,
+# where the labels are unknown, and not there, where the job does not appear.
+#
+# Shipping the steps instead of the job keeps `runs-on`, `timeout-minutes` and
+# `container:` in the consumer's own workflow, in a diff, where that repository's
+# own `check-runner-policy.sh` reads them as literals.
+#
+# USAGE — in the consuming repository:
+#
+#   jobs:
+#     ui:
+#       runs-on: [self-hosted, linux, gcp, <RepoLabel>]
+#       timeout-minutes: 30
+#       container:
+#         image: mcr.microsoft.com/playwright:v1.62.1-noble
+#         # Not tuning: Chromium's default 64MB /dev/shm in a container is not
+#         # enough for a real page, and the crash reads as a flaky suite rather
+#         # than a misconfigured container.
+#         options: --ipc=host
+#       steps:
+#         - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+#         - uses: <org>/ci-runner-infra/.github/actions/playwright-ui@v5.8.0
+#           with:
+#             playwright-version: "1.62.1"
+#
+# The image tag must match `playwright-version`, and both must match the
+# `@playwright/test` the repository installs — Playwright looks for an exact
+# browser revision and reports "Executable doesn't exist" otherwise. The first
+# step below turns that into one clear error instead of a per-spec launch
+# failure.
+name: Playwright UI tests
+description: >-
+  Install and run a Playwright suite inside the official Playwright container,
+  asserting the suite's version matches the container, and keeping the report
+  and traces from a failing run.
+
+inputs:
+  playwright-version:
+    description: >-
+      The Playwright release this job's container provides, without the leading
+      v. Must equal the `container.image` tag above. The fleet image bakes one
+      release (see packer/warm-cache/playwright.sh); a pool warmed for that
+      release starts this job without a pull, any other release still works and
+      simply downloads.
+    required: true
+  working-directory:
+    description: Directory holding package.json and the Playwright config.
+    required: false
+    default: "."
+  install-command:
+    description: Dependency install. Lockfile-exact, so the suite is reproducible.
+    required: false
+    default: "npm ci"
+  test-command:
+    description: The suite itself.
+    required: false
+    default: "npx playwright test"
+  artifact-retention-days:
+    description: How long the failure report and traces are kept.
+    required: false
+    default: "7"
+
+runs:
+  using: composite
+  steps:
+    # Refuses to run anywhere but a browser image. Without this, a job that
+    # forgot `container:` runs the suite on the HOST — where there is no
+    # browser, because this fleet deliberately bakes none — and the failure
+    # arrives as a Playwright launch error rather than as the missing line it
+    # actually is.
+    - name: Check this job has a browser container
+      shell: bash
+      run: |
+        set -eu
+        # Every location a browser bundle is known to live: the official image's
+        # baked path, an explicitly configured one, and the per-user cache.
+        # Checked as a SET, and it fails only when none of them exists — this
+        # step must never become the reason a job fails on an image that simply
+        # arranges its browsers somewhere else. A genuinely absent browser still
+        # fails a few steps later, with Playwright's own message.
+        for d in "${PLAYWRIGHT_BROWSERS_PATH:-}" /ms-playwright "$HOME/.cache/ms-playwright"; do
+          [ -n "$d" ] && [ -d "$d" ] && exit 0
+        done
+        echo "::error::no browser bundle found — this step must run in a job with"
+        echo "  container: { image: mcr.microsoft.com/playwright:v${{ inputs.playwright-version }}-noble, options: --ipc=host }"
+        echo "The fleet's host image carries no browsers; the container is where they live."
+        exit 1
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: ${{ inputs.install-command }}
+
+    # No actions/setup-node. The image ships the node its browsers were built
+    # against; installing another one on top is how the container's browser and
+    # the suite's Playwright drift apart.
+    - name: Check the suite matches the container
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -eu
+        want='${{ inputs.playwright-version }}'
+        got=$(npx playwright --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+        if [ -z "$got" ]; then
+          echo "::error::could not determine the installed Playwright version — is @playwright/test a dependency?"
+          exit 1
+        fi
+        if [ "$got" != "$want" ]; then
+          echo "::error::the suite installs Playwright $got but this job runs the v$want container."
+          echo "Set @playwright/test to $want, or move the job to the v$got container."
+          exit 1
+        fi
+
+    # `--with-deps` is deliberately NOT here: the container already carries the
+    # browsers and their system libraries, and re-installing them at job time
+    # would download on every run the pool was warmed to avoid.
+    - name: Run Playwright
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: ${{ inputs.test-command }}
+
+    # A UI failure with no trace is re-run rather than diagnosed, and re-running
+    # a flaky-looking suite is how a real regression gets merged.
+    - name: Upload the report and traces
+      if: ${{ failure() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: playwright-report-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          ${{ inputs.working-directory }}/playwright-report/
+          ${{ inputs.working-directory }}/test-results/
+        retention-days: ${{ inputs.artifact-retention-days }}
+        if-no-files-found: ignore
