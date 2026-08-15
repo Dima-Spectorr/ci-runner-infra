@@ -56,8 +56,19 @@ param(
     [int] $TimeoutSeconds = 10
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+# Strict mode and the error preference are deliberately NOT set here. Setting
+# them at script scope means dot-sourcing this file RECONFIGURES its host, and
+# the host is Pester: strict mode leaking into the test runner's own scope chain
+# aborted the entire container with a stray-`break` error and marked all eleven
+# tests failed, before one of them had run. The file's contract is that it is
+# dot-sourceable WITHOUT side effects, and two preference variables are side
+# effects.
+#
+# They are set instead at the entry point at the bottom, which is the only path
+# that runs this as a program. An `if` block is not a new scope in PowerShell,
+# so both still land in script scope and apply to the loop and everything it
+# calls, exactly as before -- what changes is that a caller who only wants the
+# functions no longer inherits the configuration meant for the service.
 
 $script:MetadataRoot = 'http://169.254.169.254/computeMetadata/v1'
 $script:GuestNamespace = 'ci'
@@ -298,5 +309,7 @@ function Invoke-BeaconLoop {
 # is the only way any Windows code in this repository gets RUN by a gate rather
 # than read by one.
 if ($MyInvocation.InvocationName -ne '.') {
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
     Invoke-BeaconLoop -IntervalSeconds $IntervalSeconds -TimeoutSeconds $TimeoutSeconds
 }

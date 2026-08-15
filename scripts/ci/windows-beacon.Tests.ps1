@@ -27,6 +27,28 @@ BeforeAll {
     . (Join-Path $scripts 'windows-beacon-publisher.ps1')
 }
 
+Describe 'dot-sourcing is inert' {
+    # This is a regression guard with a receipt. The script originally set
+    # `Set-StrictMode -Version Latest` and `$ErrorActionPreference = 'Stop'` at
+    # script scope, so dot-sourcing it RECONFIGURED its host -- and the host is
+    # Pester. Strict mode leaking into the runner's own scope chain aborted the
+    # whole container with a stray-`break` error (pester/pester#2669) and marked
+    # every test in this file failed before one of them had run.
+    #
+    # The file's header claims it is dot-sourceable without side effects. Two
+    # preference variables are side effects, and nothing but this asserts it.
+    It 'does not force the caller into Stop' {
+        $ErrorActionPreference | Should -Not -Be 'Stop'
+    }
+
+    It 'does not turn strict mode on in the caller' {
+        # Reading an unset variable throws under Set-StrictMode -Version Latest
+        # and yields $null without it. The scriptblock runs in a child scope,
+        # which inherits strict mode, so this probes the real thing.
+        { $script:ThisVariableIsDeliberatelyNeverSet } | Should -Not -Throw
+    }
+}
+
 Describe 'beacon payload' {
     # The controller parses this into epoch seconds and compares it with its own
     # clock. A local-time or offset-bearing stamp is not an error -- it is a
