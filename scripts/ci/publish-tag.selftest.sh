@@ -29,6 +29,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKFLOW="$HERE/../../.github/workflows/publish-tag.yml"
+RELEASE="$HERE/../../.github/workflows/release-tag.yml"
 
 PASS=0
 FAIL=0
@@ -114,6 +115,32 @@ advances_the_major_tag() {
   matches "$code" '-F force=true' || return 1
 }
 
+# "Force" and "forward" are not the same thing, and only the second is safe.
+# A force-patch to whatever VERSION says follows VERSION BACKWARDS on a revert or
+# a bad cherry-pick, and for the floating tag that is a silent fleet-wide
+# downgrade: it arrives at every consumer on its next apply, with no pull request
+# anywhere and nothing red. Now that every repository pins `?ref=v5`, this is the
+# single highest-blast-radius line in the repository.
+never_moves_the_major_backwards() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'contents/VERSION\?ref=\$major' || return 1
+  matches "$code" 'sort -V' || return 1
+  matches "$code" 'BACKWARDS' || return 1
+  # And an unreadable current version must not be the one path that permits it.
+  matches "$code" 'refusing to move it blind' || return 1
+}
+
+# release-tag.yml asserts a pushed tag equals VERSION. The floating major tag is
+# by construction never equal to VERSION, so a `v*` trigger makes every
+# successful release produce a failing run — and a check that is red on every
+# release is worse than no check, because it trains everyone to ignore the one
+# signal that says a tag sits at the wrong commit.
+release_check_ignores_the_floating_tag() {
+  local code; code=$(code_of "$1")
+  matches "$code" "tags: \['v\*\.\*\.\*'\]" || return 1
+  ! matches "$code" "tags: \['v\*'\]" || return 1
+}
+
 check() { # <predicate> <description>
   if "$1" "$WORKFLOW"; then ok; else bad "$2"; fi
 }
@@ -126,6 +153,11 @@ check refuses_an_unshaped_version   "an unshaped VERSION is not refused"
 check creates_an_annotated_tag      "the tag is not annotated"
 check never_moves_an_exact_tag      "a published exact tag can be moved"
 check advances_the_major_tag        "the floating major tag is not advanced"
+check never_moves_the_major_backwards "the floating major tag can be moved backwards"
+
+[ -f "$RELEASE" ] || { echo "FAIL: missing $RELEASE"; exit 1; }
+if release_check_ignores_the_floating_tag "$RELEASE"; then ok
+else bad "release-tag.yml fires on the floating major tag and will fail on every release"; fi
 
 mutate() { # <description> <sed-program> <predicate> — predicate must go false
   local desc="$1" prog="$2" pred="$3" tmp
@@ -157,6 +189,23 @@ mutate "major tag no longer derived from VERSION" \
   's|want%%|hardcoded_major_ignoring_|'                                  advances_the_major_tag
 mutate "major tag can no longer move forward" \
   's|-F force=true|-F force=false|'                                      advances_the_major_tag
+mutate "direction guard dropped, force-patch left in place" \
+  's|sort -V|cat|'                                                       never_moves_the_major_backwards
+mutate "the current version is no longer read from the tag" \
+  's|contents/VERSION?ref=\$major|contents/VERSION|'                     never_moves_the_major_backwards
+mutate "an unreadable current version fails open" \
+  's|refusing to move it blind|continuing anyway|'                       never_moves_the_major_backwards
+
+mutate_file() { # <description> <file> <sed-program> <predicate> — predicate must go false
+  local desc="$1" f="$2" prog="$3" pred="$4" tmp
+  tmp=$(mktemp)
+  sed "$prog" "$f" >"$tmp"
+  if "$pred" "$tmp"; then bad "mutation not detected: $desc"; else ok; fi
+  rm -f "$tmp"
+}
+
+mutate_file "release check widened back to every v* tag" "$RELEASE" \
+  "s|tags: \['v\*\.\*\.\*'\]|tags: ['v*']|" release_check_ignores_the_floating_tag
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -364,7 +364,13 @@ because every gate that could have seen it compares the docs to `VERSION`, and
 `VERSION` was right the whole time.
 
 A published exact tag is never moved: it is what a consumer pinned. Only the
-major tag floats.
+major tag floats, and it floats **forward only**. `publish-tag.yml` reads the
+`VERSION` at the commit `v5` currently resolves to and refuses to move the tag to
+anything older — a revert, a bad cherry-pick or a merge restoring an older
+`VERSION` would otherwise walk the floating tag backwards, and that is a
+fleet-wide downgrade that arrives at every consumer on its next apply with no
+pull request anywhere and nothing red. An unreadable current version fails the
+release rather than moving the tag blind; the next push to main retries it.
 
 Consumers choose how they adopt:
 
