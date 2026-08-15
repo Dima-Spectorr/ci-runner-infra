@@ -344,6 +344,33 @@ is_miss "a missing pins section misses — an undeclared pin is an uncovered inp
 is_miss "a pins section present but empty misses — it looks supplied and is not" \
   "$(printf '%%%%pins\n%%%%filters\n%s\n%%%%tree-merge\n%s\n%%%%tree-base\n%s\n' \
       "$FILTERS_DEFAULT" "$MERGE0" "$BASE0" | suite_reuse_key web)"
+# A section made of blank lines is the same lie as an empty one, and it used to
+# pass: the reader appended the blank lines, so `pins` was non-empty and the key
+# was computed over zero declared pins. Every caller emitting that document
+# would agree with every other one — a hit across toolchains never compared.
+is_miss "a pins section of blank lines misses — it is empty, whatever it looks like" \
+  "$(printf '%%%%pins\n   \n\n%%%%filters\n%s\n%%%%tree-merge\n%s\n%%%%tree-base\n%s\n' \
+      "$FILTERS_DEFAULT" "$MERGE0" "$BASE0" | suite_reuse_key web)"
+is_miss "a process section of blank lines misses on the same rule" \
+  "$(printf '%%%%pins\n%s\n%%%%process\n \n%%%%filters\n%s\n%%%%tree-merge\n%s\n%%%%tree-base\n%s\n' \
+      "$PINS_DEFAULT" "$FILTERS_DEFAULT" "$MERGE0" "$BASE0" | suite_reuse_key web)"
+
+# A blank line BETWEEN pins is ordinary formatting and must not change the key:
+# dropping whitespace-only lines has to be a normalisation, not a second way to
+# spell a different document.
+same "a blank line between pins does not change the key" "$WEB0" \
+  "$(k web "$(doc "$MERGE0" "$BASE0" "$(printf '%s\n\n%s' \
+      "${PINS_DEFAULT%%$'\n'*}" "${PINS_DEFAULT##*$'\n'}")")")"
+
+# The lane-name charset is one charset. A leading `.` is legal in the name test
+# and used to be rejected by the header test, which returns "malformed" — so
+# every OTHER lane missed as well, over a name only this one uses.
+DOTLANE=$(doc "$MERGE0" "$BASE0" "$PINS_DEFAULT" \
+  "$(printf '%s.ci:\n  - %s\n' "$FILTERS_DEFAULT" "'apps/web/**'")")
+is_key "a sibling lane named with a leading dot does not make the document malformed" \
+  "$(k web "$DOTLANE")"
+is_key "and that lane is itself usable" "$(k .ci "$DOTLANE")"
+
 is_miss "an empty base tree section misses" "$(k web "$(doc "$MERGE0" "")")"
 is_miss "an empty document misses" "$(printf '' | suite_reuse_key web)"
 is_miss "an unknown section name misses" \
