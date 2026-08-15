@@ -31,7 +31,18 @@ BeforeAll {
     if (-not (Test-Path -LiteralPath $script:PublisherPath)) {
         throw "the beacon publisher is not at $script:PublisherPath"
     }
+
+    # Sampled either side of the import, because the question is what the FILE
+    # changed, not what the preferences happen to be. Pester sets
+    # $ErrorActionPreference to Stop inside a test block on its own account, so
+    # asserting the value in an `It` measures Pester and calls it a result.
+    $script:EapBefore = $ErrorActionPreference
+    $script:StrictBefore = try { $null = $script:NeverAssigned; $false } catch { $true }
+
     . $script:PublisherPath
+
+    $script:EapAfter = $ErrorActionPreference
+    $script:StrictAfter = try { $null = $script:NeverAssigned; $false } catch { $true }
 }
 
 Describe 'dot-sourcing is inert' {
@@ -44,15 +55,14 @@ Describe 'dot-sourcing is inert' {
     #
     # The file's header claims it is dot-sourceable without side effects. Two
     # preference variables are side effects, and nothing but this asserts it.
-    It 'does not force the caller into Stop' {
-        $ErrorActionPreference | Should -Not -Be 'Stop'
+    It 'leaves the caller error preference exactly as it found it' {
+        $script:EapAfter | Should -Be $script:EapBefore
     }
 
     It 'does not turn strict mode on in the caller' {
-        # Reading an unset variable throws under Set-StrictMode -Version Latest
-        # and yields $null without it. The scriptblock runs in a child scope,
-        # which inherits strict mode, so this probes the real thing.
-        { $script:ThisVariableIsDeliberatelyNeverSet } | Should -Not -Throw
+        # Probed by reading an unset variable, which throws under
+        # Set-StrictMode -Version Latest and yields $null without it.
+        $script:StrictAfter | Should -Be $script:StrictBefore
     }
 }
 
@@ -134,8 +144,35 @@ Describe 'worker count' {
     # never by an error path. `$null` is the "we do not know" that
     # `Publish-BeaconOnce` turns into publishing nothing at all, which the
     # controller then reads as a stale beacon and keeps.
+    # Mocked, and the reason is worth recording: the first version of this test
+    # called the real Get-Process and asserted 0, and it failed with "expected
+    # 0, but got 1". The machine running the suite is a GitHub Actions runner,
+    # and a GitHub Actions runner executing a job has a Runner.Worker process --
+    # the very process this function counts. The environment the test runs in
+    # was the environment the test was pretending to describe.
     It 'reports a number when nothing is running, not a null' {
-        Get-BeaconWorkerCount | Should -Be 0
+        Mock -CommandName Get-Process -MockWith { }
+        $count = Get-BeaconWorkerCount
+        $count | Should -Be 0
+        $count | Should -BeOfType [int]
+    }
+
+    # The `@()` wrapper in the function is what makes this true, and without a
+    # test it looks like noise somebody could tidy away. A single object has no
+    # .Count in Windows PowerShell 5.1 -- which is the PowerShell that runs on
+    # the host -- so an unwrapped result would yield $null for exactly one busy
+    # worker: the beacon publishes nothing, the reading goes stale, and the one
+    # host actually running a job is the one the controller stops trusting.
+    It 'reports one, not a scalar with no Count' {
+        Mock -CommandName Get-Process -MockWith { [pscustomobject] @{ Id = 1 } }
+        Get-BeaconWorkerCount | Should -Be 1
+    }
+
+    It 'counts every worker it finds' {
+        Mock -CommandName Get-Process -MockWith {
+            [pscustomobject] @{ Id = 1 }, [pscustomobject] @{ Id = 2 }
+        }
+        Get-BeaconWorkerCount | Should -Be 2
     }
 
     It 'never reports zero from a failure' {
