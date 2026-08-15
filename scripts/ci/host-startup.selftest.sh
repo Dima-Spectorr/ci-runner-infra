@@ -314,6 +314,53 @@ has_container_mtu() { # <file>
   matches "$code" 'write_slot_daemon_config "\$idx"[[:space:]]*\|\|[[:space:]]*return 1'
 }
 
+# A baked container image is the one cached thing that is EXECUTED rather than
+# read: every archive is `docker load`ed into every slot's daemon at boot, so
+# whoever can write one runs their image in every slot on the host, for the rest
+# of its life, with no further access needed.
+#
+# Two properties keep that shut, and neither is visible in a passing build —
+# an image whose archives are writable builds exactly like one whose archives
+# are not, so nothing but this test stands between the two.
+has_baked_image_load() { # <file>
+  local code joined
+  code=$(code_of "$1")
+  joined=$(joined_code_of "$1")
+
+  # 1. The archives come from the root-owned tree, never from the shared cache.
+  #    /opt/ci-cache is group-writable BY DESIGN (slots must update it) and is
+  #    documented as untrusted build input. Owning the files inside it would not
+  #    help: write+execute on a non-sticky parent is enough to rename the whole
+  #    directory aside and substitute another, checksums and all.
+  matches "$code" 'dir="/opt/ci-images"' || return 1
+  ! matches "$code" 'dir="/opt/ci-cache' || return 1
+
+  # 2. The checksum line is selected by an EXACT filename field, not by looking
+  #    for the name anywhere in the file. A substring match lets a planted
+  #    `x.tar` borrow the entry belonging to the legitimate `x.tar.gz`:
+  #    sha256sum -c then verifies that OTHER file, reports success, and the
+  #    planted one is loaded unverified. Character 67 is where sha256sum's name
+  #    field begins.
+  matches "$code" 'substr\(\$0,67\)==f' || return 1
+  ! matches "$code" 'grep -qF " \$base"' || return 1
+  #    …and only a line whose first field is a hex digest counts, so GNU's
+  #    backslash-escaped forms shift the name and fall out rather than matching.
+  matches "$code" 'substr\(\$0,1,64\)' || return 1
+
+  # 3. Fail closed. An archive with no entry of its own, or with more than one,
+  #    is not loaded at all — every archive this fleet bakes gets exactly one.
+  matches "$code" '\$nmatch" -ne 1' || return 1
+  matches "$joined" 'sha256sum -c --status' || return 1
+
+  # 4. Backgrounded, but still waited for. main() collects the PIDs and waits
+  #    before returning: google-startup-scripts.service is a oneshot whose
+  #    default KillMode=control-group SIGKILLs whatever is left in the cgroup
+  #    when the script exits, which would kill these loads partway through and
+  #    leave a half-loaded image behind.
+  matches "$code" 'IMAGE_LOAD_PIDS' || return 1
+  matches "$code" 'wait \$\{IMAGE_LOAD_PIDS\}' || return 1
+}
+
 # The helper carries the trap it was written to avoid, so it is tested first.
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -387,6 +434,12 @@ else
   bad "job containers get dockerd's default 1500-byte MTU on a 1460-byte path — large TLS responses are black-holed and surface as a truncated handshake or a dependency that 'was not found', in a different place each run (Borsh-Tablet-App, first green pool run)"
 fi
 
+if has_baked_image_load "$SCRIPT"; then
+  ok
+else
+  bad "a job can choose the container image every OTHER slot on this host runs — the baked archives are loaded into every slot's daemon at boot, so an archive a slot can write (or a checksum line it can borrow from a neighbouring filename) is arbitrary code in every job that lands here afterwards"
+fi
+
 # --- mutation cases: prove the checks above can actually fail -----------------
 mutate() { # <description> <sed-program> <predicate> — predicate must go false
   local desc="$1" prog="$2" pred="$3" tmp
@@ -454,6 +507,13 @@ mutate "per-driver default dropped"       's|default-network-opts|default-addres
 mutate "driver MTU option dropped"        's|com\.docker\.network\.driver\.mtu|com.docker.network.driver.name|'    has_container_mtu
 mutate "MTU hardcoded"                    's|mtu=\$(primary_mtu)|mtu=1460|'                                        has_container_mtu
 mutate "slots left on the default MTU"    's|write_slot_daemon_config "\$idx" \|\| return 1|:|'                    has_container_mtu
+
+mutate "archives back in the shared cache"   's|/opt/ci-images|/opt/ci-cache/images|g'                              has_baked_image_load
+mutate "checksum match back to a substring"  's|substr(\$0,67)==f|index($0,f)|g'                                    has_baked_image_load
+mutate "hex-digest guard dropped"            's|substr(\$0,1,64)|substr($0,1,0)|g'                                  has_baked_image_load
+mutate "unchecked archives loaded again"     's|"\$nmatch" -ne 1|"$nmatch" -ge 0|'                                  has_baked_image_load
+mutate "digest no longer verified"           's|sha256sum -c --status|cat|'                                         has_baked_image_load
+mutate "loads left to the cgroup killer"     's|wait \${IMAGE_LOAD_PIDS}|:|'                                        has_baked_image_load
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
