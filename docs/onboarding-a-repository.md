@@ -44,7 +44,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.2.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.3.0"
 
   project_id         = var.project_id
   network            = var.network
@@ -53,7 +53,7 @@ module "ci_runner_network" {
 }
 
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.2.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.3.0"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -62,7 +62,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.2.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.3.0"
 
   project_id = var.project_id
   region     = var.region
@@ -111,6 +111,29 @@ refusal, it gets a client that hangs until the job times out. The destination is
 what keeps it safe (`database_egress_ranges`, RFC1918 only), so adding a port is
 routine and widening the ranges is not. A project whose runners must reach no
 database at all sets `database_egress_ports = []` and no rule is created.
+
+### If your jobs run in a container from a private registry
+
+`jobs.<id>.container` and `services:` images are pulled by the slot's own
+rootless daemon, which authenticates as the **JOB** account — the same identity
+the job itself gets, not the host's. The hosts install a credential helper for
+`*.pkg.dev` and `gcr.io` automatically, so nothing is needed in the workflow, but
+the JOB account still needs read access to the registry:
+
+```hcl
+resource "google_artifact_registry_repository_iam_member" "job_pull" {
+  project    = var.project_id
+  location   = var.region
+  repository = var.container_repository
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${module.ci_runner_identity.job_service_account_email}"
+}
+```
+
+Without it the job fails at **Initialize containers**, before any step runs, with
+`Unauthenticated request ... "artifactregistry.repositories.downloadArtifacts"`.
+Grant it to the JOB account and never to the host account — that one can read the
+GitHub App private key.
 
 **Do not vendor the modules.** A drift gate
 (`scripts/ci/check-no-vendored-ci-module.sh`) fails CI if a local
