@@ -126,24 +126,32 @@ selftest() {
 
   mkdir -p "$tmp/packer/warm-cache" "$tmp/docs"
 
+  # The fixtures below are assembled from this prefix rather than written out.
+  # A whole reference spelled literally here would be matched by the gate's own
+  # scan — this file is a `.sh` in the tree it walks — so the fixtures for the
+  # STALE cases would be reported as real drift on every run, and the gate would
+  # fail CI forever over its own test data. The prefix alone cannot match:
+  # IMAGE_RE requires a digit after the `v`.
+  local img='mcr.microsoft.com/playwright:v'
+
   # A tree that agrees with itself.
   cat >"$tmp/$WARM_SCRIPT" <<'FIX'
 PLAYWRIGHT_VERSION="${PLAYWRIGHT_VERSION:-1.62.1}"
 PLAYWRIGHT_IMAGE="mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-noble"
 FIX
-  echo 'use mcr.microsoft.com/playwright:v1.62.1-noble' >"$tmp/docs/ui.md"
+  echo "use ${img}1.62.1-noble" >"$tmp/docs/ui.md"
   run_case "agreeing tree is clean" ""
 
   # The drift this gate exists for: a doc left on the previous release.
-  echo 'use mcr.microsoft.com/playwright:v1.61.0-noble' >"$tmp/docs/ui.md"
+  echo "use ${img}1.61.0-noble" >"$tmp/docs/ui.md"
   run_case "a stale documented pin is reported" "PW2"
 
   # A matching version but a stale BASE — same silent miss, different spelling.
-  echo 'use mcr.microsoft.com/playwright:v1.62.1-jammy' >"$tmp/docs/ui.md"
+  echo "use ${img}1.62.1-jammy" >"$tmp/docs/ui.md"
   run_case "a stale codename is reported" "PW2"
 
   # An unreadable pin must not be spent as "no drift found".
-  echo 'use mcr.microsoft.com/playwright:v1.62.1-noble' >"$tmp/docs/ui.md"
+  echo "use ${img}1.62.1-noble" >"$tmp/docs/ui.md"
   echo 'PLAYWRIGHT_VERSION="latest"' >"$tmp/$WARM_SCRIPT"
   run_case "an unreadable pin is reported, not passed" "PW1"
 
