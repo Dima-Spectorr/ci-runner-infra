@@ -275,7 +275,7 @@ install_registry_credential_helper() {
 [ "$1" = "get" ] || exit 0
 host=$(cat)
 : "${GCE_METADATA_HOST:=127.0.0.1:${CI_BROKER_PORT:-8081}}"
-token=$(curl --fail --silent --max-time 10 -H 'Metadata-Flavor: Google' \
+token=$(curl --fail --silent --connect-timeout 3 --max-time 10 -H 'Metadata-Flavor: Google' \
   "http://${GCE_METADATA_HOST}/computeMetadata/v1/instance/service-accounts/default/token" \
   | sed -n 's/.*"access_token"[^"]*"\([^"]*\)".*/\1/p')
 # No token — say so in docker's own vocabulary and let the pull go anonymous.
