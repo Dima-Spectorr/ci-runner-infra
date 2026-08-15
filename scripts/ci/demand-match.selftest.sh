@@ -75,11 +75,92 @@ expect 0 "a job with no labels at all is not counted (it cannot be routed here)"
 expect 0 "empty job list" '{"jobs":[]}'
 expect 0 "missing jobs key does not crash the tick" '{}'
 
+# --- the two stamp lists the same sweep extracts -------------------------------
+#
+# The sweep splits its matched jobs into two time series that answer opposite
+# questions: field 3 is when the still-QUEUED jobs asked for a runner (how long
+# the pool made them wait), field 4 is when the IN-PROGRESS ones got one (how
+# long the pool has been running them). Crossing the two wires would be silent —
+# both are plausible ISO timestamps and both produce a plausible number of
+# seconds — so the split is pinned here rather than read back off the graph.
+# shellcheck disable=SC2016  # $mine_labels is a jq variable, not a shell one.
+STAMPS='
+  [ .jobs[]?
+    | select(.status == "queued" or .status == "in_progress")
+    | select( ((.labels // []) | length) > 0 )
+    | select( ((.labels // []) - $mine_labels) | length == 0 )
+  ] as $mine
+  | [ ($mine | length),
+      ([ $mine[] | select(.status == "queued") ] | length),
+      ([ $mine[] | select(.status == "queued") | .started_at // .created_at ] | join(" ")),
+      ([ $mine[] | select(.status == "in_progress") | .started_at // empty ] | join(" "))
+    ] | @tsv'
+
+# fields <want-pipe-joined> <description> <jobs-json>
+fields() {
+  local want="$1" desc="$2" jobs="$3" got
+  got=$(printf '%s' "$jobs" | jq -r --argjson mine_labels "$POOL_LABELS" "$STAMPS" \
+    | tr -d '\r' | tr '\t' '|')
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  want: %s\n  got:  %s\n' "$desc" "$want" "$got"
+  fi
+}
+
+fields '2|1|2026-08-15T16:15:00Z|2026-08-15T16:18:09Z' \
+  "a queued and a running job land in different fields, never the same one" \
+  '{"jobs":[
+     {"status":"queued","labels":["self-hosted"],"created_at":"2026-08-15T16:15:00Z"},
+     {"status":"in_progress","labels":["self-hosted"],"started_at":"2026-08-15T16:18:09Z"}]}'
+
+fields '1|0||2026-08-15T16:18:09Z' \
+  "a pool with nothing queued still reports how long its running job has been running" \
+  '{"jobs":[{"status":"in_progress","labels":["self-hosted"],"started_at":"2026-08-15T16:18:09Z"}]}'
+
+# `.started_at // empty` and not `// .created_at`: a job that GitHub has not
+# told us started has not been running for the time since it was created, and
+# reporting that difference as run time would raise a wedged-slot alert for
+# every job still sitting in the queue.
+fields '1|0||' \
+  "a running job with no start time contributes nothing rather than its queue age" \
+  '{"jobs":[{"status":"in_progress","labels":["self-hosted"],"created_at":"2026-08-15T16:15:00Z"}]}'
+
+# The incident this field exists for: one slot wedged, every sibling finished.
+# The completed jobs must not dilute it — they are not in flight.
+fields '1|0||2026-08-15T16:18:09Z' \
+  "finished siblings do not enter the in-flight age at all" \
+  '{"jobs":[
+     {"status":"completed","labels":["self-hosted"],"started_at":"2026-08-15T16:17:48Z"},
+     {"status":"completed","labels":["self-hosted"],"started_at":"2026-08-15T16:18:02Z"},
+     {"status":"in_progress","labels":["self-hosted"],"started_at":"2026-08-15T16:18:09Z"}]}'
+
+fields '1|0||' \
+  "a job wedged on ANOTHER pool's runner is not this pool's stuck job" \
+  '{"jobs":[
+     {"status":"in_progress","labels":["self-hosted","windows"],"started_at":"2026-08-15T16:18:09Z"},
+     {"status":"in_progress","labels":["self-hosted"]}]}'
+
 # --- the copy is really a copy -------------------------------------------------
 # A test of a copied expression tests nothing once the original moves on, so
 # the distinctive line is checked against the controller itself.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTROLLER="$HERE/../../modules/ci-runner-host-pool/scripts/controller-startup.sh"
+# shellcheck disable=SC2016  # matching jq source text literally, on purpose.
+for needle in \
+  'select(.status == "in_progress") | .started_at // empty' \
+  'running=$(printf '"'"'%s'"'"' "$counted" | cut -f4)' \
+  'RUNNING_MAX=$wait' \
+  'queue_series "ci_job_running_seconds_max" "$RUNNING_MAX"'
+do
+  if grep -qF "$needle" "$CONTROLLER"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: `%s` no longer appears in controller-startup.sh\n' "$needle"
+  fi
+done
 # shellcheck disable=SC2016  # matching jq source text literally, on purpose.
 if grep -qF 'select( ((.labels // []) - $mine_labels) | length == 0 )' "$CONTROLLER"; then
   PASS=$((PASS + 1))

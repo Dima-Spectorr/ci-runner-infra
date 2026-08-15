@@ -219,6 +219,7 @@ collect_demand() {
   DEMAND_TOTAL=0
   DEMAND_QUEUED=0
   QUEUE_WAIT_MAX=0
+  RUNNING_MAX=0
   # Reset HERE, with the other counters, not after the loop: every early return
   # below would otherwise leave the previous tick's value in place and the
   # controller would keep republishing "demand is truncated" forever.
@@ -254,7 +255,6 @@ collect_demand() {
   [ -n "$ids" ] || return 0
 
   local now
-  now=$sweep_start
 
   # One API call per run, and the run count is whatever the repo happens to be
   # doing — so this loop, alone, sets the tick duration. One pool in this fleet
@@ -284,23 +284,52 @@ collect_demand() {
       ] as $mine
       | [ ($mine | length),
           ([ $mine[] | select(.status == "queued") ] | length),
-          ([ $mine[] | select(.status == "queued") | .started_at // .created_at ] | join(" "))
+          ([ $mine[] | select(.status == "queued") | .started_at // .created_at ] | join(" ")),
+          ([ $mine[] | select(.status == "in_progress") | .started_at // empty ] | join(" "))
         ] | @tsv' 2>/dev/null)
 
     [ -n "$counted" ] || continue
-    local n q stamps
+    local n q stamps running
     n=$(printf '%s' "$counted" | cut -f1)
     q=$(printf '%s' "$counted" | cut -f2)
     stamps=$(printf '%s' "$counted" | cut -f3)
+    running=$(printf '%s' "$counted" | cut -f4)
 
     DEMAND_TOTAL=$((DEMAND_TOTAL + n))
     DEMAND_QUEUED=$((DEMAND_QUEUED + q))
+
+    # Read the clock HERE, per run, and not once before the sweep. Both ages
+    # below are measured against it, and `sweep_start` is captured before the
+    # two run-list calls — each of which can spend a full CURL_MAX_TIME — and
+    # before this run's own job fetch. Against that stale reading every age is
+    # short by however long the sweep has been running, which on a busy pool is
+    # most of DEMAND_BUDGET: the two series would understate the wait and the
+    # run time by up to a minute and a half, and understate them MOST on the
+    # pool under the most load, which is the pool being looked at.
+    now=$(date +%s)
 
     local s wait epoch
     for s in $stamps; do
       epoch=$(date -d "$s" +%s 2>/dev/null) || continue
       wait=$((now - epoch))
       [ "$wait" -gt "$QUEUE_WAIT_MAX" ] && QUEUE_WAIT_MAX=$wait
+    done
+
+    # Same arithmetic, different question: how long has the OLDEST job that is
+    # already executing been executing for. Free — these jobs are in the payload
+    # the demand sweep just paid for, and their start times were discarded.
+    #
+    # A job that started after this run's clock reading yields a negative age
+    # and loses the comparison. That is the right answer, not a swallowed one:
+    # the question is which job is OLDEST, and the job that just started is
+    # never it. The only value this can distort is a pool whose sole in-flight
+    # job began within the same second, reported as 0 rather than as 1 — on a
+    # gauge whose threshold is measured in minutes, and which is about to be
+    # correct on the next tick anyway.
+    for s in $running; do
+      epoch=$(date -d "$s" +%s 2>/dev/null) || continue
+      wait=$((now - epoch))
+      [ "$wait" -gt "$RUNNING_MAX" ] && RUNNING_MAX=$wait
     done
   done
 
@@ -876,6 +905,24 @@ tick() {
   queue_series "ci_slots_busy" "$slots_busy"
   queue_series "ci_host_idle_seconds_max" "$idle_max"
   queue_series "ci_queue_wait_seconds_max" "$QUEUE_WAIT_MAX"
+  # The other half of the wait. ci_queue_wait_seconds_max says how long a job
+  # waited to START; this says how long the oldest one that DID start has been
+  # running. A slot whose runner agent stops taking steps mid-job leaves GitHub
+  # believing the job is in flight, and nothing in this controller can see it:
+  # the orphan reaper deliberately backs off when GitHub reports a runner busy,
+  # which is exactly the state a wedged slot is in. So the job runs out its
+  # `timeout-minutes`, is reported as `cancelled`, and takes a required check —
+  # and the PR — with it. Observed 2026-08-15 on DataRetrival #2404: eighteen
+  # steps done in 35s, step nineteen never dispatched, fifteen minutes of
+  # nothing, every sibling job green.
+  #
+  # A max, not a count over a threshold: "too long" is per repository — an
+  # integration suite legitimately runs for half an hour where a lint job never
+  # exceeds two minutes — and a fleet-wide constant would either miss the wedge
+  # or cry wolf. A gauge of the oldest in-flight job lets each repo's alert
+  # policy pick its own number, and it degrades to the truth (the longest job
+  # this pool is running) rather than to a lie when nothing is wrong.
+  queue_series "ci_job_running_seconds_max" "$RUNNING_MAX"
   queue_series "ci_mig_target_size" "$target"
   queue_series "ci_drain_verdicts" "$DRAINED" '"outcome":"drained"'
   queue_series "ci_drain_verdicts" "$DRAIN_ABORTED" '"outcome":"aborted"'

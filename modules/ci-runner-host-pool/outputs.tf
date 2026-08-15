@@ -51,6 +51,18 @@ output "metric_names" {
       "ci_slots_busy",
       "ci_host_idle_seconds_max",
       "ci_queue_wait_seconds_max",
+      # How long the oldest job already EXECUTING has been executing. Pairs with
+      # ci_queue_wait_seconds_max, which only covers the wait before a job
+      # starts. A slot whose runner agent dies mid-job keeps GitHub believing
+      # the job is in flight — and the orphan reaper backs off precisely when
+      # GitHub reports a runner busy — so the wedge is invisible until the job's
+      # own `timeout-minutes` cancels it and fails a required check. Threshold
+      # this per repository against its own longest legitimate job; there is no
+      # fleet-wide right number. It rides the demand sweep, so it inherits the
+      # demand sweep's bound: when ci_demand_runs_skipped is non-zero this is a
+      # LOWER bound, and an alert on it can miss a wedge on exactly the busy
+      # pool where the sweep ran out of budget. Alert on the pair.
+      "ci_job_running_seconds_max",
       # `ci_job_startup_seconds` was declared here and never implemented — no
       # code path has ever published it. Removed rather than stubbed: a declared
       # series nothing writes produces an alert policy that cannot fire, which is

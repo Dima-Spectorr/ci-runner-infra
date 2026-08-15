@@ -444,6 +444,26 @@ config without which pinning becomes permanent staleness.
      this section, not this one. Workflow-level attribution is what is
      available without a cross-boundary contract, and it already answers where
      to spend next.
+4a. **See a wedged slot — shipped in v5.6.0.** `timeout-minutes` (item 2 above)
+   bounds what a stuck job costs; it does not make one visible, and the two are
+   easy to confuse. When a runner agent stops taking steps mid-job, GitHub still
+   reports the job in flight, and the orphan reaper deliberately backs off from
+   a runner GitHub calls busy — so the wedge is invisible until the timeout
+   cancels the job, fails a required check, and blocks the PR. Observed
+   2026-08-15 on DataRetrival #2404: eighteen steps in 35 seconds, step nineteen
+   never dispatched, fifteen minutes of nothing, every sibling job green, and
+   the only visible symptom a `migrations` gate failing closed on a
+   `cancelled` upstream.
+
+   `ci_job_running_seconds_max` closes that gap using job payloads the demand
+   sweep already pays for: the age of the oldest job this pool has actually
+   started. It is a max rather than a count over a threshold because "too long"
+   is per repository — a fleet-wide constant either misses the wedge on a repo
+   with a half-hour integration suite or cries wolf on one whose longest job is
+   a lint. Threshold it per repo, against that repo's own longest legitimate
+   job. `ci_jobs_completed{outcome="cancelled"}` is the same event after the
+   fact, and a rising cancel rate with no queue-cancel activity to explain it
+   points here.
 5. **Ship it as the new-project baseline** via the `scaffold` skill and
    `setup-github`, so a new repo starts with lanes rather than acquiring them
    at repo #15.
