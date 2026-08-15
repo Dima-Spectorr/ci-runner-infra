@@ -236,6 +236,8 @@ has_root_owned_namespace() { # <file>
 has_hostile_entry_refusal() { # <file>
   local code
   code=$(code_of "$1")
+  # shellcheck disable=SC1003  # the trailing `\\` is an ERE for the literal
+  # line-continuation backslash the scan is wrapped with, not a quote escape.
   matches "$code" 'find "\$CACHE_MASTER" \\'                        || return 1
   matches "$code" '\-type l -o -type b -o -type c -o -type p -o -type s' || return 1
   matches "$code" '\-perm /6000 -o \\\( -type f -a -links \+1 \\\)' || return 1
