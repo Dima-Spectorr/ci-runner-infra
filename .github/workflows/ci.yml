@@ -49,6 +49,13 @@ jobs:
       - name: drain-decision self-test
         run: bash scripts/ci/drain-decision.selftest.sh
 
+      # The only rule in the pool that deletes hosts on nobody's trigger, and
+      # the only one whose wrong verdict is uniform: every host reads stale by
+      # the same reasoning, so one bad template read cordons the entire fleet in
+      # a single tick. Asserted here, not discovered there.
+      - name: recycle-decision self-test
+        run: bash scripts/ci/recycle-decision.selftest.sh
+
       # Reaping a registration is irreversible for a live slot, so the rule is
       # asserted here rather than discovered on the fleet.
       - name: orphan-decision self-test
