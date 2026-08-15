@@ -303,7 +303,8 @@ scripts/ci/check-merge-queue-single-step.sh
 scripts/ci/check-runner-policy.sh
                                  which pool a job may claim, and for how long
 scripts/ci/check-action-pins.sh  every third-party action pinned to a commit
-docs/ci-workflow-gates.md        those two gates: rules, flags, how to adopt
+scripts/ci/check-e2e-policy.sh   does a consumer's browser suite report honestly, and fast
+docs/ci-workflow-gates.md        those gates: rules, flags, how to adopt
 docs/ci-lane-model.md            the lane contract consumers adopt
 docs/ci-merge-queue-baseline.md  one CI run per PR: the queue config + gate
 docs/ci-optimization-catalog.md  the fleet audit behind that contract
