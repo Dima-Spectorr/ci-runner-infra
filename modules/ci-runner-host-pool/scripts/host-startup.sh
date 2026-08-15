@@ -865,6 +865,11 @@ load_baked_images() {
       [ -n "$a" ] || continue
       # `docker load` reads gzip transparently, so a warm script may save either
       # form; gzip trades boot CPU for image size and is the better default.
+      #
+      # shellcheck disable=SC2024  # the redirect is the shell's, and this shell
+      # is root: a GCE startup script runs as root, which is also why every
+      # other write to this log in this file is spelled the same way. `sudo`
+      # here drops privilege for the daemon socket, it does not raise it.
       if sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
            docker load -i "$a" >>/var/log/ci-host.log 2>&1; then
         log "slot $idx: loaded baked image archive $(basename "$a")"

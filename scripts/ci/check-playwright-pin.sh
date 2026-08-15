@@ -59,6 +59,9 @@ check_tree() { # <root>
 
   # The default in the assignment, not a value the environment happens to hold:
   # this gate reads the file, it does not run it.
+  # shellcheck disable=SC2016  # the `$` is sed's, not the shell's: `\$` makes
+  # sed read a literal `$` instead of its end-of-line anchor, and the text being
+  # matched is the unexpanded `${PLAYWRIGHT_VERSION:-…}` as written in the file.
   pin=$(sed -n 's/^PLAYWRIGHT_VERSION="\${PLAYWRIGHT_VERSION:-\([0-9][0-9.]*\)}"$/\1/p' \
         "$root/$WARM_SCRIPT" | head -1)
 
