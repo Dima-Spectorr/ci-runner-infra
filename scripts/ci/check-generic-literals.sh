@@ -208,8 +208,10 @@ scan_file() {
   # with a warning on stderr nobody reads. `ENVIRON` hands the string over
   # unaltered.
   # shellcheck disable=SC2016  # the single-quoted block is an awk program and its
-  # `$0` is awk's, not the shell's. Spelling the reader as `"$AWK"` is what makes
-  # shellcheck stop recognising the command and start reading the program as text.
+  # `$0` is awk's, not the shell's. Spelling the reader as `"$AWK"` is what stops
+  # the linter recognising the command, after which it reads the program as text.
+  # (Word order is load-bearing: a comment line beginning `# shellcheck ` IS a
+  # directive, and one that does not parse is an ERROR, not a comment.)
   hits="$(PAT="$pattern" STRIP="$strip" FENCED="$fenced_only" "$AWK" '
     BEGIN { infence = 0; pat = ENVIRON["PAT"]; strip = ENVIRON["STRIP"]; fenced_only = ENVIRON["FENCED"] }
     {
