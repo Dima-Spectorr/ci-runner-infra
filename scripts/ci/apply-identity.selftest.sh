@@ -114,7 +114,12 @@ scopes_state_to_one_bucket() {
   local code; code=$(code_of "$1")
   matches "$code" 'google_storage_bucket_iam_member" "state"' || return 1
   matches "$code" 'bucket *= *var\.state_bucket'              || return 1
-  ! matches "$code" 'google_project_iam_member.*storage'      || return 1
+  # Per BLOCK, not per line. The role and the resource type are never on the
+  # same line in formatted HCL, so a same-line pattern only ever matched a
+  # resource somebody happened to NAME "storage" — and the grant that actually
+  # matters, `role = "roles/storage.objectAdmin"` inside a project binding
+  # called anything else, passed straight through.
+  ! matches "$(blocks 'google_project_iam_member' "$1")" 'roles/storage\.' || return 1
 }
 
 # 5. The security boundary itself. A principalSet on attribute.repository binds
@@ -189,6 +194,10 @@ mutate "'the apply needs the App key' — accessor added" "$MAIN" \
   's|roles/secretmanager.viewer|roles/secretmanager.secretAccessor|' reads_secrets_without_reading_values
 mutate "'state moved, easier to grant the project' — bucket scope dropped" "$MAIN" \
   's|bucket = var.state_bucket|bucket = "some-bucket"|'             scopes_state_to_one_bucket
+# The one the same-line pattern missed: a PROJECT-wide storage role, in a block
+# named nothing like "storage". This is the shape the real edit takes.
+mutate "'the apply cannot read the artifact bucket' — storage granted project-wide" "$MAIN" \
+  's|roles/secretmanager.viewer|roles/storage.objectAdmin|'         scopes_state_to_one_bucket
 # The `${...}` below are TERRAFORM interpolations being matched as literal text
 # in a .tf file. Single quotes are the point: expanding them in the shell would
 # substitute empty strings, the sed would match nothing, the mutation would not
