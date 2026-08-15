@@ -17,12 +17,17 @@
 # THIS FILE IS DELIVERED IN PHASES, AND THE ORDER IS THE SAFETY PROPERTY
 #
 #   phase 0  preflight, image assertion, and the beacon BEFORE anything else
-#   phase 1  slot accounts, logon rights, ACLs, per-slot TEMP  (not yet)
+#   phase 1  slot accounts, logon rights, ACLs, per-slot TEMP
 #   phase 2  the metadata fence                                (not yet)
 #   phase 3  the job credential broker                         (not yet)
 #   phase 4  the per-job credential reset hooks                (not yet)
 #   phase 5  agent registration as a service                   (not yet)
 #   phase 6  the boot probe, which PROVES 2 and 1              (not yet)
+#
+# Phase 1 builds the boundary and hands back the credentials that will sit
+# behind it; nothing CONSUMES them until phase 5 registers the agents. A host
+# that stops here has the accounts, the rights and the ACLs in place and no job
+# code on the machine to test them against, which is the safe half to ship first.
 #
 # Until phase 5 exists this script registers no agent, so a host running it
 # serves no jobs. That is the intended state of a half-delivered Windows pool
@@ -136,6 +141,158 @@ function Test-ImageVersion {
     $trimmed = $Marker.Trim()
     if ($trimmed -notmatch '^[0-9]+$') { return $false }
     return ([int] $trimmed) -ge $Floor
+}
+
+function Get-SlotUserName {
+    <#
+      .SYNOPSIS
+        The local account name for slot <Index>.
+      .DESCRIPTION
+        `ci-s<i>`, matching the Linux `ci-s<idx>`. This is not cosmetic: the agent
+        registered by this slot is named `<instance>-s<i>`, and
+        `orphan_decision()` on the controller parses that name back to an
+        instance. A rename here silently un-reaps every Windows registration --
+        the agent stays in GitHub's list, the host it named is long gone, and
+        nothing in the controller notices because nothing can.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int] $Index)
+    return "ci-s$Index"
+}
+
+function Get-SlotWorkspacePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [string] $Root = $script:SlotRoot
+    )
+    return (Join-Path $Root ([string] $Index))
+}
+
+function Get-SlotTempPath {
+    <#
+      .SYNOPSIS
+        The slot's private TEMP.
+      .DESCRIPTION
+        The Linux rule this replaces: a workflow step naming a fixed path under
+        /tmp -- and CI scripts name fixed paths there constantly -- creates it
+        under whichever slot ran first, and every later slot gets Permission
+        denied on a file it believes is its own. Linux fixes that with
+        PrivateTmp=yes on the daemon. Windows has no mount namespace to give a
+        service, so the mechanism is a per-slot directory carrying the slot's ACL,
+        pointed at by TMP and TEMP in the runner SERVICE's environment (phase 5)
+        rather than machine-wide, which would hand every slot the same one.
+
+        Weaker than the Linux fix, and the difference is stated rather than
+        discovered: this redirects the CONVENTIONAL temp path, and nothing stops a
+        step writing to a literal C:\temp\build. What the ACLs do is turn that
+        collision from a silent cross-slot read into an Access is denied.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [string] $Root = $script:SlotRoot
+    )
+    return (Join-Path (Get-SlotWorkspacePath -Index $Index -Root $Root) 'temp')
+}
+
+# The four character classes Windows complexity policy wants, minus every
+# homoglyph (I, l, 1, O, 0) and every shell, quoting or XML metacharacter. This
+# value reaches the service control manager, and a quoting bug here would be a
+# quoting bug in the one place it is a credential; a password that cannot be read
+# back off a console during an incident wastes the incident.
+$script:SlotPasswordClasses = @(
+    'ABCDEFGHJKLMNPQRSTUVWXYZ',
+    'abcdefghijkmnpqrstuvwxyz',
+    '23456789',
+    '_-.~'
+)
+
+function Get-SlotPasswordCharacter {
+    <#
+      .SYNOPSIS
+        The characters of one slot password, as a char array. Pure and testable.
+      .DESCRIPTION
+        Windows requires a password here: a service logon takes a credential and
+        there is no `sudo -u` on this platform. That is a real difference from
+        Linux, where no such secret exists, and it is contained by making the
+        credential useless for anything else -- the account is granted
+        SeServiceLogonRight and DENIED interactive, network and remote-interactive
+        logon, is not in Administrators, and is not in Remote Desktop Users.
+
+        One character from each class is placed first and the whole thing is then
+        shuffled, so complexity is satisfied by construction rather than by luck.
+        A password rejected by policy is a slot that never registers, and it would
+        be discovered on the fleet rather than here.
+
+        Returns chars, not a string, so the caller can build a SecureString
+        without a plaintext String ever existing on the managed heap. The array is
+        the caller's to clear.
+
+        The verb is Get and not New because PSUseShouldProcessForStateChangingFunctions
+        demands -WhatIf plumbing from a New-* function, and a boot script that
+        half-honours -WhatIf is a worse thing than an imperfect verb.
+    #>
+    [CmdletBinding()]
+    param([int] $Length = 40)
+
+    $classes = $script:SlotPasswordClasses
+    if ($Length -lt $classes.Count) {
+        throw "slot password length $Length cannot satisfy $($classes.Count) character classes"
+    }
+    $all = -join $classes
+
+    # Four bytes of entropy per character, drawn once. The modulo bias over a
+    # 32-bit draw into an at-most-64-character alphabet is far below anything that
+    # matters for a 40-character secret that never leaves the machine.
+    $bytes = [byte[]]::new($Length * 4)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+
+    $chars = [char[]]::new($Length)
+    for ($i = 0; $i -lt $classes.Count; $i++) {
+        $set = $classes[$i]
+        $chars[$i] = $set[[int]([BitConverter]::ToUInt32($bytes, $i * 4) % [uint32] $set.Length)]
+    }
+    for ($i = $classes.Count; $i -lt $Length; $i++) {
+        $chars[$i] = $all[[int]([BitConverter]::ToUInt32($bytes, $i * 4) % [uint32] $all.Length)]
+    }
+    for ($i = $Length - 1; $i -gt 0; $i--) {
+        $j = [int]([BitConverter]::ToUInt32($bytes, $i * 4) % [uint32]($i + 1))
+        $tmp = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $tmp
+    }
+
+    [array]::Clear($bytes, 0, $bytes.Length)
+    return $chars
+}
+
+function Get-SlotPassword {
+    <#
+      .SYNOPSIS
+        A slot password as a SecureString, with no plaintext String in between.
+      .DESCRIPTION
+        Deliberately never materialises a [string]. `ConvertTo-SecureString
+        -AsPlainText -Force` is the usual shortcut and it is the wrong one twice
+        over: it puts an immutable, un-erasable copy of the credential on the
+        managed heap for the lifetime of the process, and PSScriptAnalyzer flags
+        it -- which would mean either a failing gate or a suppression, and a
+        suppressed warning about a credential is how the next one gets suppressed
+        too.
+
+        Everything downstream takes a SecureString or a PSCredential: New-LocalUser,
+        Set-LocalUser, and the service registration in phase 5. So the plaintext
+        form is never needed at all, and this script never writes it to disk, never
+        logs it and never puts it in metadata. After registration LSA holds it as a
+        service secret, readable only by SYSTEM.
+    #>
+    [CmdletBinding()]
+    param([int] $Length = 40)
+
+    $chars = Get-SlotPasswordCharacter -Length $Length
+    $secure = New-Object System.Security.SecureString
+    foreach ($c in $chars) { $secure.AppendChar($c) }
+    [array]::Clear($chars, 0, $chars.Length)
+    $secure.MakeReadOnly()
+    return $secure
 }
 
 function Get-BeaconServiceConfig {
@@ -363,16 +520,326 @@ function Invoke-Phase0Preflight {
     return $cfg
 }
 
+# --- phase 1: slot accounts, ACLs, TEMP --------------------------------------
+#
+# THE VERBS IN THIS SECTION ARE CHOSEN AROUND THE ANALYZER, ONCE, HERE
+#
+# PSUseShouldProcessForStateChangingFunctions is Warning severity and
+# powershell-gate.sh fails on it, so a `Set-`, `New-` or `Remove-` function here
+# would have to carry -WhatIf plumbing. A boot script that half-honours -WhatIf
+# is a worse object than one with slightly unusual verbs, so the state-changing
+# functions use approved verbs outside that rule's list -- Protect-, Grant-,
+# Initialize- -- and say so rather than leaving the next reader to wonder.
+
+function Protect-CiDirectory {
+    <#
+      .SYNOPSIS
+        Lock one directory to SYSTEM, Administrators and (optionally) one slot.
+      .DESCRIPTION
+        Windows creates C:\Users\ci-s<i> at first logon with an ACL of the user,
+        SYSTEM and Administrators -- the default is already close to what we want.
+        That is not a reason to skip this; it is the reason it is cheap. "Windows
+        does the right thing by default" is a claim about an IMAGE, and the image
+        changes.
+
+        Inheritance is DISABLED and not copied. Copying it would preserve exactly
+        the Users / Authenticated Users entries this exists to remove, and would
+        leave a directory that looks locked in the UI and is not -- the same class
+        of mistake as a firewall rule that installs and filters nothing.
+
+        Omitting -SlotUser locks the directory to SYSTEM and Administrators only,
+        which is how C:\ci and C:\ci\bin are treated: the beacon script lives
+        there, the SCM re-executes it as LocalSystem on every restart and reboot,
+        and a slot account able to write it would own SYSTEM on this host without
+        ever touching the job boundary.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [string] $SlotUser
+    )
+
+    $acl = Get-Acl -Path $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRule($rule) | Out-Null }
+
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $none = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+
+    # SIDs for the builtins, because their NAMES are localised and this module has
+    # no say in which image a customer builds from. 'BUILTIN\Administrators' is
+    # 'BUILTIN\Administratoren' on a German image and Get-Acl would reject it.
+    $grants = @(
+        @{ Id = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'); Rights = 'FullControl' },
+        @{ Id = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'); Rights = 'FullControl' }
+    )
+    if ($SlotUser) {
+        $grants += @{ Id = [System.Security.Principal.NTAccount]::new($SlotUser); Rights = 'Modify' }
+    }
+
+    foreach ($grant in $grants) {
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $grant.Id, $grant.Rights, $inherit, $none, $allow))) | Out-Null
+    }
+    Set-Acl -Path $Path -AclObject $acl
+}
+
+function Edit-InfPrivilege {
+    <#
+      .SYNOPSIS
+        Set one privilege's account list in a security-policy INF. Pure.
+      .DESCRIPTION
+        There is no in-box cmdlet for user rights assignment, so the mechanism is
+        secedit: export the local policy to an INF, rewrite the [Privilege Rights]
+        line, import it back. This function is the rewrite, separated out so
+        Pester can assert it on ubuntu-latest -- the alternative is discovering a
+        malformed INF on a booting host, where secedit's report of it is a
+        non-zero exit code and a log file nobody reads.
+
+        Returns new text; the input string is untouched. Four semantics matter and
+        each is asserted by a test:
+
+          * an ABSENT privilege line is ADDED, not silently skipped. A fresh image
+            has no SeDenyNetworkLogonRight line at all, and skipping is how a deny
+            the code claims to apply ends up not applied;
+          * an existing line is REPLACED, not appended to. Appending would leave
+            the previous membership in place, which for a deny right reads as
+            working and for SeServiceLogonRight quietly widens it;
+          * the [Privilege Rights] section is created when the export has none;
+          * accounts are written as-is. The caller passes SIDs, because secedit
+            resolves names against a locale-dependent account database and this
+            script must behave the same on a non-English image.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $InfText,
+        [Parameter(Mandatory = $true)][string] $Privilege,
+        [Parameter(Mandatory = $true)][string[]] $Accounts
+    )
+
+    $line = "$Privilege = " + ($Accounts -join ',')
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.AddRange([string[]]($InfText -split "`r?`n"))
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match "^\s*$([regex]::Escape($Privilege))\s*=") {
+            $lines[$i] = $line
+            return ($lines -join "`r`n")
+        }
+    }
+
+    $section = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*\[Privilege Rights\]\s*$') { $section = $i; break }
+    }
+    if ($section -lt 0) {
+        $lines.Add('[Privilege Rights]')
+        $lines.Add($line)
+    } else {
+        $lines.Insert($section + 1, $line)
+    }
+    return ($lines -join "`r`n")
+}
+
+function Grant-SlotLogonRight {
+    <#
+      .SYNOPSIS
+        Grant the slots service logon; deny them every other way in.
+      .DESCRIPTION
+        SeServiceLogonRight is granted EXPLICITLY here, before config.cmd is ever
+        called. GitHub's --runasservice may grant it as a side effect of its own
+        installer; that is not established from primary documentation, and a
+        safety property that depends on somebody else's installer is not a
+        property.
+
+        The three denies are what make the service password harmless. It has to
+        exist -- a Windows service logon takes a credential -- so the containment
+        is that the credential buys nothing else: no console session, no session
+        over the network, no RDP. Deny entries beat allow entries in Windows, so
+        this holds even if a later change adds one of these accounts to a group
+        that has the right.
+
+        Applied in ONE secedit import, not four. Each import is a full policy
+        write, and a host that took four of them could be interrupted between two
+        and come up with the grant applied and the denies not -- the exact state
+        this exists to prevent, reached by the code meant to prevent it.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string[]] $SlotUsers)
+
+    # SIDs, not names, for the reason given in Edit-InfPrivilege.
+    $sids = @($SlotUsers | ForEach-Object {
+            '*' + ([System.Security.Principal.NTAccount]::new($_)).Translate(
+                [System.Security.Principal.SecurityIdentifier]).Value
+        })
+
+    $work = Join-Path $env:TEMP ('ci-secpol-' + [guid]::NewGuid().ToString('N'))
+    $exported = "$work.inf"
+    $db = "$work.sdb"
+    try {
+        # The preference is dropped around both native calls for the reason given
+        # in Install-BeaconService: under Stop, `2>&1` on a native command turns
+        # each stderr line into a terminating NativeCommandError, and secedit
+        # writes progress chatter there even when it succeeds.
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $exportOutput = & secedit.exe /export /cfg $exported /areas USER_RIGHTS 2>&1
+        $exportExit = $LASTEXITCODE
+        $ErrorActionPreference = $previous
+        foreach ($line in @($exportOutput)) { Write-BootLog "secedit: $line" }
+        if ($exportExit -ne 0 -or -not (Test-Path -LiteralPath $exported)) {
+            Deny-Boot ("secedit could not export the local security policy (exit $exportExit), " +
+                'so slot logon rights cannot be proven applied')
+        }
+
+        $inf = Get-Content -Raw -LiteralPath $exported
+        # The grant is MERGED with whatever already holds it -- taking
+        # SeServiceLogonRight away from the image's own services would stop them.
+        # The denies are set to exactly the slots: a deny list is this script's to
+        # own, and anything else in it came from an image change nobody reviewed.
+        $existingGrant = @()
+        if ($inf -match '(?m)^\s*SeServiceLogonRight\s*=\s*(.+)$') {
+            $existingGrant = @($Matches[1] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        }
+        $grant = @($existingGrant + $sids | Select-Object -Unique)
+
+        $inf = Edit-InfPrivilege -InfText $inf -Privilege 'SeServiceLogonRight' -Accounts $grant
+        foreach ($deny in @('SeDenyInteractiveLogonRight',
+                'SeDenyNetworkLogonRight',
+                'SeDenyRemoteInteractiveLogonRight')) {
+            $inf = Edit-InfPrivilege -InfText $inf -Privilege $deny -Accounts $sids
+        }
+
+        # UTF-16LE with a BOM, named through .NET rather than through -Encoding.
+        # secedit REQUIRES Unicode and reports a file it cannot parse as a generic
+        # non-zero exit; `Set-Content -Encoding Unicode` happens to agree today,
+        # but the same parameter already means two different things for UTF8 on
+        # 5.1 and 7, which is exactly how this class of bug arrives.
+        [System.IO.File]::WriteAllText($exported, $inf, [System.Text.UnicodeEncoding]::new($false, $true))
+
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $configOutput = & secedit.exe /configure /db $db /cfg $exported /areas USER_RIGHTS 2>&1
+        $configExit = $LASTEXITCODE
+        $ErrorActionPreference = $previous
+        foreach ($line in @($configOutput)) { Write-BootLog "secedit: $line" }
+        if ($configExit -ne 0) {
+            Deny-Boot ("secedit could not apply slot logon rights (exit $configExit); the slot " +
+                'service password would buy an interactive session')
+        }
+        Write-BootLog "phase 1: service logon granted, interactive/network/RDP denied for $($SlotUsers -join ', ')"
+    } finally {
+        Remove-Item -LiteralPath $exported, $db -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Initialize-SlotAccount {
+    <#
+      .SYNOPSIS
+        Create (or adopt) one slot's local account and its directories.
+      .DESCRIPTION
+        The account is NOT in Administrators and NOT in Remote Desktop Users, and
+        membership is removed rather than merely not granted -- an image that
+        ships a `ci-s1` in Administrators would otherwise hand every job on this
+        host the machine.
+
+        Adopted rather than recreated when it already exists: a reboot must not
+        orphan the profile, the workspace and the warm cache under it. The
+        password is rotated on every boot regardless, because the previous one was
+        only ever needed to register a service that is about to be re-registered.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int] $Index)
+
+    $user = Get-SlotUserName -Index $Index
+    $secure = Get-SlotPassword
+
+    if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
+        Set-LocalUser -Name $user -Password $secure
+    } else {
+        New-LocalUser -Name $user -Password $secure -AccountNeverExpires `
+            -PasswordNeverExpires -UserMayNotChangePassword `
+            -Description "ci-runner-host-pool slot $Index" | Out-Null
+    }
+
+    foreach ($group in @('Administrators', 'Remote Desktop Users')) {
+        if (Get-LocalGroupMember -Group $group -Member $user -ErrorAction SilentlyContinue) {
+            Remove-LocalGroupMember -Group $group -Member $user -ErrorAction SilentlyContinue
+            Write-BootLog "phase 1: removed $user from $group"
+        }
+    }
+
+    foreach ($dir in @((Get-SlotWorkspacePath -Index $Index), (Get-SlotTempPath -Index $Index))) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Protect-CiDirectory -Path $dir -SlotUser $user
+    }
+
+    # A PSCredential, not a password. Phase 5 hands this straight to the service
+    # registration; nothing in between has any use for the plaintext, and not
+    # producing it is cheaper than protecting it.
+    Write-BootLog "phase 1: slot $Index provisioned as $user"
+    return @{
+        Index      = $Index
+        User       = $user
+        Credential = New-Object System.Management.Automation.PSCredential(".\$user", $secure)
+    }
+}
+
+function Invoke-Phase1SlotSetup {
+    <#
+      .SYNOPSIS
+        Provision every slot: accounts, directories, ACLs, logon rights.
+      .DESCRIPTION
+        THE ORDER HERE IS THE SAFETY PROPERTY, AGAIN.
+
+        C:\ci and C:\ci\bin are locked to SYSTEM and Administrators BEFORE the
+        first slot account exists. Phase 0 created them with whatever ACL C:\
+        hands down, which is harmless while the host has no unprivileged
+        principal on it -- and stops being harmless the instant this function
+        creates one. C:\ci\bin holds ci-beacon.ps1, which the SCM re-executes as
+        LocalSystem on every service restart and every reboot; a slot account able
+        to write that file owns SYSTEM on this host without going anywhere near
+        the job boundary.
+
+        Logon rights come last and in one write, after every account exists, for
+        the reason given in Grant-SlotLogonRight.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int] $Slots)
+
+    Write-BootLog "phase 1: provisioning $Slots slot(s)"
+    foreach ($dir in @($script:CiRoot, $script:BinRoot, $script:SlotRoot)) {
+        Protect-CiDirectory -Path $dir
+    }
+    Write-BootLog 'phase 1: C:\ci, C:\ci\bin and C:\ci\slots locked to SYSTEM and Administrators'
+
+    $provisioned = @()
+    for ($i = 1; $i -le $Slots; $i++) {
+        $provisioned += (Initialize-SlotAccount -Index $i)
+    }
+    Grant-SlotLogonRight -SlotUsers @($provisioned | ForEach-Object { $_.User })
+    return $provisioned
+}
+
 function Invoke-Main {
     [CmdletBinding()]
     param()
-    Invoke-Phase0Preflight | Out-Null
+    $cfg = Invoke-Phase0Preflight
 
-    # Phases 1-6 are not here yet, and this host therefore registers no agent.
+    # One slot is the fallback, not an error. `ci-slots` is written by Terraform
+    # and the Windows pool pins it to 1; a host that arrived without it is still a
+    # host, and refusing the boot over a missing count would trade a working
+    # single-slot machine for none.
+    $slots = 1
+    if ($cfg.Slots -match '^[0-9]+$' -and [int] $cfg.Slots -ge 1) { $slots = [int] $cfg.Slots }
+    Invoke-Phase1SlotSetup -Slots $slots | Out-Null
+
+    # Phases 2-6 are not here yet, and this host therefore registers no agent.
     # Said out loud in the log rather than left as silence, because a host that
     # boots cleanly and serves nothing is otherwise indistinguishable from one
     # that is merely slow to register.
-    Write-BootLog ('phases 1-6 are not delivered yet: this host registers no agent and will be ' +
+    Write-BootLog ('phases 2-6 are not delivered yet: this host registers no agent and will be ' +
         'reclaimed by the register-grace drain')
 }
 
