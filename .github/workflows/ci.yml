@@ -282,17 +282,30 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: no hardcoded org, project, region or repo
-        run: |
-          set -uo pipefail
-          # This module is consumed by several repositories in more than one
-          # organisation, region and project. A literal here is a fork waiting
-          # to happen — it is exactly how the vendored predecessor drifted.
-          pattern='me-west1|europe-west1|mot-[a-z0-9-]+|Dima-Spectorr|\.gov\.il|gs://'
-          if grep -rInE "$pattern" \
-               --include='*.tf' --include='*.sh' --include='*.hcl' \
-               . ; then
-            echo "::error::customer/project/region literal in a shared module"
-            exit 1
-          fi
-          echo "clean"
+      # This scan used to be an inline `grep` over `*.tf`, `*.sh` and `*.hcl`,
+      # and it was blind to the file class with the widest blast radius:
+      # documentation and workflow YAML. `docs/onboarding-a-repository.md`
+      # exists to be copy-pasted into fourteen other repositories, so a literal
+      # that reaches it propagates BY DESIGN — while a region literal in a
+      # workflow `env:` decides what CI actually does. Neither was read.
+      #
+      # (This comment was itself the gate's first catch: it named the region it
+      # was describing, in a `.yml`, and failed the job. Left as a note, since a
+      # gate whose first finding is its own justification is a gate that works.)
+      #
+      # The inline version also wrote the GitHub owner into its own pattern, in
+      # a public repository. The script derives it from `GITHUB_REPOSITORY`
+      # instead, so the literal is gone and the rule self-adjusts in a fork.
+      #
+      # The rule that makes the widening safe rather than merely noisy is in the
+      # script: Markdown is scanned inside ``` fences only. A literal in prose
+      # is an incident reference and stays; a literal in a fence is something
+      # somebody will paste.
+      #
+      # Fixtures first — the inline version could not have any, which is the
+      # second reason it moved.
+      - name: generic literals gate self-test
+        run: bash scripts/ci/check-generic-literals.sh --selftest
+
+      - name: generic literals gate
+        run: bash scripts/ci/check-generic-literals.sh

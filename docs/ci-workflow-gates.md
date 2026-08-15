@@ -1,6 +1,6 @@
 # Workflow gates a consuming repository copies in
 
-Four shell checks published from this repository, in the same shape and for
+Five shell checks published from this repository, in the same shape and for
 the same reason as `check-merge-queue-single-step.sh`: the rule is written once
 where the fleet is defined, self-tested here, and copied into each consumer so
 it runs in that consumer's own required check.
@@ -11,14 +11,15 @@ it runs in that consumer's own required check.
 | `scripts/ci/check-action-pins.sh` | is every third-party action an immutable commit |
 | `scripts/ci/check-workflow-shell.sh` | does the shell INSIDE the YAML survive `bash -n` and shellcheck |
 | `scripts/ci/check-e2e-policy.sh` | does the browser suite report honestly, and fast |
+| `scripts/ci/check-generic-literals.sh` | does a customer, region or owner literal reach something copy-pasteable |
 
-All four address every finding by exact path, and all four carry `--selftest`
+All five address every finding by exact path, and all five carry `--selftest`
 fixtures that must run BEFORE the real check — a workflow gate that reads no
 workflow reports clean, and that vacuous pass is worse than no gate because it
 is believed.
 
-The first three parse the workflow with PyYAML rather than grepping it. The
-fourth cannot: its primary input is `playwright.config.ts`, which is TypeScript,
+The three that read YAML parse it with PyYAML rather than grepping it. The
+e2e gate cannot: its primary input is `playwright.config.ts`, which is TypeScript,
 and a shell gate is not going to evaluate it. It reads that file lexically and
 says so — see its "what it cannot decide" section — and treats anything it
 cannot read as a FAILURE rather than a pass, because the two error directions
@@ -498,6 +499,76 @@ guide to the container, the pool label and the `--shm-size` it needs.
 
 ---
 
+## `check-generic-literals.sh`
+
+```
+bash scripts/ci/check-generic-literals.sh [--selftest] [--self=<owner/repo>]
+                                          [--root=<dir>] [<file>...]
+```
+
+With no `<file>` arguments it reads every tracked `*.tf`, `*.tfvars`, `*.hcl`,
+`*.sh`, `*.yml`, `*.yaml`, `*.md` and `*.mdx`, and fails if it finds none.
+
+| id | Rule |
+|---|---|
+| `LIT0` | the gate found nothing to read, or was handed a file it cannot read |
+| `LIT1` | no customer/region/owner literal in an executable tree (`.tf`, `.tfvars`, `.hcl`, `.sh`, `.yml`, `.yaml`) |
+| `LIT2` | no such literal inside a Markdown fenced code block |
+
+This replaces an inline `grep` in `ci.yml` that covered `*.tf`, `*.sh` and
+`*.hcl` and stopped. Documentation and workflow YAML — the two file classes it
+never read — are where a region or an org name gets written down without anyone
+treating it as code. `docs/onboarding-a-repository.md` exists to be pasted into
+fourteen other repositories, so a literal reaching it propagates *by design*,
+and a region literal in a workflow `env:` decides what CI actually does.
+
+### Prose is exempt, a code fence is not
+
+This is the whole design, and a naive widening gets it backwards.
+
+A literal in **prose** is evidence. An incident id names an incident; naming
+the peered landing zone tells a reader inside it what they are looking at.
+Failing those makes the gate an obstacle to writing down why a rule exists —
+and a gate that punishes the incident record is a gate whose incident records
+stop being written.
+
+A literal inside a ``` fence is a **thing somebody will paste**. That is the
+direction damage travels, and the distinction is mechanically decidable, which
+is the only reason it can be a gate at all.
+
+Measured before the rule was written: a naive widening produced eleven findings
+on this tree — every fenced one was this module's own address, every prose one
+was incident evidence.
+
+### The owner is derived, not written down
+
+The predecessor hardcoded the GitHub owner **in its own pattern, in a public
+repository**. This one takes the slug from `GITHUB_REPOSITORY`, falling back to
+`git remote get-url origin` and overridable with `--self=`, and strips it from
+a line before matching. So this module's own address disappears — the
+quickstart needs it to be copy-pasteable — while any other repository under the
+same owner keeps that owner and fails. The rule self-adjusts in a fork or a
+consumer, and the literal is gone from the source.
+
+The self-exclusion list is exactly one path, this script, and the self-test
+asserts that it is exactly one: a denylist that skips a list of files is not a
+denylist.
+
+### A placeholder is not a literal
+
+The first real finding of the widening was a false one. `cloudbuild.yaml`
+documents its own invocation with `gs://<bucket-in-an-allowed-location>/source`
+— a placeholder written down precisely so nobody hardcodes theirs, which is the
+opposite of the defect. The banned thing is a bucket somebody owns, so the
+pattern asks for a bucket-name character after the scheme; `gs://$VAR` and
+`gs://<…>` are a caller's value by construction. A fixture holds that open.
+
+The `<org>` / `<Repo>` / `<40-char-commit-sha>` placeholders the docs use need
+no allowlist at all — none of them can match a pattern made of concrete values,
+so the placeholder shape stays legible for free.
+
+---
+
 ## Adopting them
 
 1. Copy the scripts into the consumer's `scripts/ci/` — the three workflow
@@ -524,6 +595,12 @@ guide to the container, the pool label and the `--shm-size` it needs.
       - name: e2e policy
         run: bash scripts/ci/check-e2e-policy.sh --job-timeout=25
 ```
+
+   `check-generic-literals.sh` is deliberately not on that list. Its pattern
+   encodes THIS module's customer, region and owner shapes, so a consumer that
+   legitimately *is* one customer would fail it on every line and learn
+   nothing. It is adopted only by a repository that is itself meant to be
+   portable.
 
 3. Put them on `ubuntu-latest`, not on the pool — they are near-zero-dependency
    guards (catalog §2.2), and a gate about pool safety should not need the pool
