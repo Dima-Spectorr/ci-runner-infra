@@ -142,7 +142,13 @@ re_quote() {
   for ((i = 0; i < ${#s}; i++)); do
     c="${s:i:1}"
     case "$c" in
-      '.'|'^'|'$'|'*'|'+'|'?'|'('|')'|'{'|'}'|'|'|'['|']'|'\\') out="$out\\$c" ;;
+      # The backslash is spelled BARE, not `'\\'`. Inside single quotes a case
+      # pattern is taken literally, so `'\\'` is a two-character string that a
+      # one-character `$c` can never equal — the branch was unreachable and a
+      # backslash went through unescaped. Bare `\\` is one escaped backslash and
+      # matches. Found by shellcheck (SC1003) on the first CI run of this file,
+      # which is a fair account of why the shell gates exist.
+      '.'|'^'|'$'|'*'|'+'|'?'|'('|')'|'{'|'}'|'|'|'['|']'|\\) out="$out\\$c" ;;
       *) out="$out$c" ;;
     esac
   done
@@ -323,6 +329,8 @@ region = "me-west1"
   expect "the same value in prose is evidence, not a leak" "" md \
 'This was first seen on mot-face-blur #56, in the me-west1 pool.'
 
+  # shellcheck disable=SC2016  # the fixture is Markdown; the backticks in it are
+  # the span this case is about, not a command substitution to expand.
   expect "an inline code span is still prose" "" md \
 'The peering to `mot-lz-vpc` goes through the central firewall.'
 
@@ -397,6 +405,9 @@ uses: acme/Apigee-Portal/.github/workflows/ci.yml@v1
 # PUBLISHES, and a literal in an untracked scratch file is nobody's problem —
 # while a `find` that walks `.terraform/` or a vendored provider reports on
 # somebody else's code and gets the gate switched off.
+# shellcheck disable=SC2031  # `ROOT` is reassigned inside each fixture subshell so
+# the fixture reads its own tree; the assignment is deliberately confined there,
+# and this function is only ever called with the real one in scope.
 discover() {
   git -C "$ROOT" ls-files -z -- \
     '*.tf' '*.tfvars' '*.hcl' '*.sh' '*.yml' '*.yaml' '*.md' '*.mdx' 2>/dev/null
