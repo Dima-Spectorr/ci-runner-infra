@@ -118,7 +118,12 @@ runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars
 ```
 
 The `runs-on` form counts only because its **fork-true branch names a hosted
-image**; written the other way round the same idiom hands forks the pool.
+image**; written the other way round the same idiom hands forks the pool. And
+"hosted image" is the finite GitHub family — `ubuntu|windows|macos` plus
+`latest` or a version, with an optional `-arm`/`-large` class suffix — not that
+prefix: `ubuntu-pool-1` is an ordinary custom label on a fleet runner, and
+reading it as hosted both skipped every isolation check on the job carrying it
+and made it a legal destination for fork code.
 Anything not recognised is unguarded — an unrecognised-but-correct guard costs
 one reported job and a reviewer's minute, where an unrecognised inversion costs
 the boundary.
@@ -141,6 +146,22 @@ across the whole file set before anything is judged, and transitively.
 A **remote** callee is a different answer: that document is not in this
 repository, so the RUNNER3 exemption a `uses:` job gets was handing the bound to
 jobs nobody read. That is RUNNER7.
+
+A guard on the **calling job** is a guard on everything that job reaches, so an
+edge carries its caller and a guarded caller contributes none. Without that, the
+callee was asked for a condition its own file has no pull-request context for,
+and the only way to satisfy the gate was to duplicate the caller's `if:`. A
+callee reached by **any** unguarded edge is still reachable — the guard has to
+hold on every path, not on one of them.
+
+Reachability is a set membership, so both sides of every edge are canonicalised
+to one absolute spelling. They were not: the caller was keyed by whatever string
+the invocation passed — `.github/workflows/ci.yml` in the documented
+`<file>...` mode — while the `./…` call target was resolved to an absolute path.
+The two never compared equal, so on the invocation the usage line documents the
+whole computation produced nothing and every callee read as unreachable. The
+fixture missed it by only ever passing absolute paths; there is now one that
+passes relative ones.
 
 ### What it cannot decide
 
@@ -232,11 +253,26 @@ An abbreviated SHA is rejected: it looks pinned and is not — GitHub resolves i
 against whatever the repository holds at resolution time, which is the
 mutability the gate removes.
 
+PIN2 compares two counts — raw lines naming the reference, raw lines carrying a
+version comment — and **zero of the first is a finding, not agreement**. A
+folded or quoted scalar spells the same value in a way a line-oriented match
+does not see, and `0 > 0` reported a check that could not run as a check that
+passed. That is the vacuous pass this whole design is arranged against, found in
+its own strictest rule.
+
 A `uses:` beginning `./` is this repository's own tree at this repository's own
-commit, already immutable, and is exempt. `--allow=<owner>` exempts an owner a
-consumer has decided to trust by tag; it exists so adoption is never
-all-or-nothing, and each use is a visible argument in the consuming workflow
-rather than a silent default here.
+commit, already immutable, and is exempt — but only the **wrapper** is. That
+manifest's own `uses: third/party@main` runs inside the calling job, on the
+calling job's runner, with the calling job's token, so the exemption is paid for
+by opening the file. Discovery walks `.github/actions/**`; a local action may
+live anywhere, so `./tools/custom-action` was exempt here and unreachable there
+— invisible to both halves at once. Each `./…` reference is now resolved and
+read where it is USED, and a cycle of mutually-calling wrappers terminates on a
+seen-set rather than recursing.
+
+`--allow=<owner>` exempts an owner a consumer has decided to trust by tag; it
+exists so adoption is never all-or-nothing, and each use is a visible argument
+in the consuming workflow rather than a silent default here.
 
 ---
 
@@ -307,9 +343,10 @@ convention rather than a hazard.
 
 RUNNER5 is not a finding about the gate, it is a finding about the repository.
 Borsh-Tablet-App's seven and entity-platform's seven are jobs whose pool is
-chosen by repository configuration; three of entity-platform's read
-`${{ vars.CI_RUNNER_LABEL }}` bare, with no fork guard and no fallback, so an
-unset variable resolved them to an **empty label set**.
+chosen by repository configuration: each reads `${{ vars.CI_RUNNER_LABEL }}`
+behind a fork guard and falls back to `'ubuntu-latest'` when the variable is
+unset, so the routing is correct — but correct-by-configuration is exactly what
+a gate reading the file cannot confirm.
 
 entity-platform's four extra appeared when the fork guard stopped silencing
 RUNNER5 (see above) — they were always dynamic, the guard was answering for

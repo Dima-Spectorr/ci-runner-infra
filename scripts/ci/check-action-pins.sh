@@ -53,6 +53,12 @@
 #   as well as `.github/workflows/*`, and the parser reads `runs.steps[].uses`
 #   for a document that has no `jobs:`.
 #
+#   Discovery alone was still not enough, because a local action may live
+#   anywhere — `./tools/custom-action` is an ordinary layout, and it was exempt
+#   here while unreachable there. Each `./…` reference is now resolved and
+#   checked where it is USED, so the exemption and the reading are the same
+#   decision.
+#
 # EXIT CODES
 #   0 — clean
 #   1 — an unpinned reference
@@ -63,6 +69,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 fail=0
 err() { local id="$1"; shift; echo "::error::[$id] $*"; fail=1; }
+
+# The tree a `uses: ./…` reference resolves against. It is the repository root
+# on the real path; the fixtures point it at their temporary directory, which is
+# what lets a local-action fixture exist at all.
+LOCAL_ROOT="${LOCAL_ROOT:-$REPO_ROOT}"
+# `|`-delimited set of manifests already checked or already scheduled, so a
+# manifest reached twice is reported once and a cycle terminates.
+LOCAL_SEEN="|"
 
 export PY_BIN="${PY_BIN:-}"
 py_usable() {
@@ -191,9 +205,42 @@ check_file() {
   while IFS=$'\t' read -r _ job step ref; do
     [ -n "${ref:-}" ] || continue
 
-    # This repository's own tree, at this repository's own commit.
+    # This repository's own tree, at this repository's own commit — the WRAPPER
+    # is immutable, what it reaches for is not, so the exemption is paid for by
+    # reading the manifest it names.
+    #
+    # Discovery walks `.github/actions/**`, and this reference may point
+    # anywhere: `./tools/custom-action` is a perfectly ordinary layout, and it
+    # was exempted here while never being discovered there — a local wrapper
+    # around `third/party@main` that no part of this gate ever opened. So the
+    # path is resolved and checked at the point of USE rather than left to
+    # discovery, and `LOCAL_SEEN` keeps a cycle of mutually-calling actions from
+    # recursing forever.
     case "$ref" in
-      ./*|.\\*) continue ;;
+      ./*|.\\*)
+        local lref manifest cand
+        lref="${ref#./}"
+        lref="${lref#.\\}"
+        lref="${lref%/}"
+        manifest=""
+        for cand in "$LOCAL_ROOT/$lref/action.yml" "$LOCAL_ROOT/$lref/action.yaml" \
+                    "$LOCAL_ROOT/$lref"; do
+          [ -f "$cand" ] && { manifest="$cand"; break; }
+        done
+        # No manifest is not this gate's finding: a `uses:` naming a path that
+        # does not exist fails the workflow itself, loudly, on the first run.
+        [ -n "$manifest" ] || continue
+        case "$LOCAL_SEEN" in
+          *"|$manifest|"*) continue ;;
+        esac
+        LOCAL_SEEN="$LOCAL_SEEN$manifest|"
+        if [ "${#allow[@]}" -gt 0 ]; then
+          check_file "$manifest" "${allow[@]}"
+        else
+          check_file "$manifest"
+        fi
+        continue
+        ;;
     esac
 
     if [ "${ref#docker://}" != "$ref" ]; then
@@ -246,7 +293,14 @@ check_file() {
     ref_re="$(re_quote "$path@$version")"
     n_uses="$(grep -cE "uses:[[:space:]]*['\"]?${ref_re}['\"]?([[:space:]]|\$)" "$file")"
     n_commented="$(grep -cE "uses:[[:space:]]*['\"]?${ref_re}['\"]?[[:space:]]*#[^#]*[A-Za-z0-9._-]*[0-9]" "$file")"
-    if [ "$n_uses" -gt "$n_commented" ]; then
+    # Zero raw lines for a reference the PARSER found is not a clean file, it is
+    # this check failing to run: a quoted, folded, or anchored scalar spells the
+    # same value in a way this line-oriented match does not see, and
+    # `n_uses > n_commented` is false at 0 > 0. That is the vacuous pass again,
+    # so it is reported rather than counted as agreement.
+    if [ "$n_uses" -eq 0 ]; then
+      err PIN2 "$rel: job '$job' step $step pins '$path' to $version, but no raw line matched that reference — the version comment cannot be read from a folded or quoted scalar; write it as a plain 'uses: $path@$version # <tag>'"
+    elif [ "$n_uses" -gt "$n_commented" ]; then
       err PIN2 "$rel: job '$job' step $step pins '$path' to $version with no version comment on $((n_uses - n_commented)) of $n_uses reference(s) — write '$path@$version # <tag>' on each so the bump is reviewable"
     fi
   done <<EOF
@@ -261,6 +315,9 @@ EOF
 selftest() {
   local tmp status=0
   tmp="$(mktemp -d)"
+  # `./…` resolves against the fixture tree, not this repository, so a fixture
+  # can own the local action it calls.
+  LOCAL_ROOT="$tmp"
 
   expect() {
     local name="$1" want="$2" body="$3"
@@ -351,6 +408,18 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683'
 
+  # The parser saw a pinned reference and the raw-line match saw nothing, which
+  # is `0 > 0` — false, and reported clean. A check that cannot run is not a
+  # check that passed.
+  expect "a reference no raw line matches is not clean" "PIN2" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: >-
+          actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683'
+
   expect "a local action needs no pin" "" \
 'on: [push]
 jobs:
@@ -358,6 +427,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: ./.github/actions/setup'
+
+  # A local action outside `.github/actions` is exempted by the `./` rule and
+  # was never reached by discovery, so the wrapper's own `third/party@main` was
+  # invisible to both halves of the gate at once.
+  mkdir -p "$tmp/tools/custom-action"
+  cat > "$tmp/tools/custom-action/action.yml" <<'FIXTURE'
+name: custom
+runs:
+  using: composite
+  steps:
+    - uses: third/party@main
+      shell: bash
+FIXTURE
+  expect "a local action outside .github/actions is still read" "PIN1" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./tools/custom-action'
+
+  # Two wrappers that call each other terminate rather than recurse forever.
+  mkdir -p "$tmp/tools/a" "$tmp/tools/b"
+  cat > "$tmp/tools/a/action.yml" <<'FIXTURE'
+name: a
+runs:
+  using: composite
+  steps:
+    - uses: ./tools/b
+FIXTURE
+  cat > "$tmp/tools/b/action.yml" <<'FIXTURE'
+name: b
+runs:
+  using: composite
+  steps:
+    - uses: ./tools/a
+FIXTURE
+  expect "a cycle between local actions terminates" "" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./tools/a'
 
   # The wrapper is immutable; what the wrapper reaches for is not. This runs on
   # the CALLING job's runner with the calling job's token, so exempting it
@@ -508,6 +621,13 @@ EOF
   fi
 
   local f
+  # Every file already on the list counts as seen, so a manifest that is both
+  # discovered and reached through a `uses: ./…` is reported once rather than
+  # twice.
+  for f in "${files[@]}"; do
+    LOCAL_SEEN="$LOCAL_SEEN$f|"
+  done
+
   for f in "${files[@]}"; do
     if [ "${#allow[@]}" -gt 0 ]; then
       check_file "$f" "${allow[@]}"

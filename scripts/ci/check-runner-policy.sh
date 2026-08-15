@@ -283,7 +283,17 @@ IF_EXCLUDES = re.compile(
 RUNS_ON_ROUTES = re.compile(
     r"(?:%s)\s*&&\s*'([^']*)'" % FORK, re.IGNORECASE
 )
-HOSTED_IMAGE = re.compile(r"^(?:ubuntu|windows|macos)-", re.IGNORECASE)
+# GitHub's hosted images are a finite, well-known family, and this must match
+# THAT family rather than its prefix: `ubuntu-pool-1` is an ordinary custom
+# label on a self-hosted runner, and reading it as a hosted image would let a
+# fork guard route fork code onto the fleet while this gate called it safe.
+# Anything outside the family is treated as a self-hosted label — the direction
+# that over-reports rather than the one that opens the boundary.
+HOSTED_IMAGE = re.compile(
+    r"^(?:ubuntu|windows|macos)-(?:latest|\d+(?:\.\d+)?)"
+    r"(?:-(?:arm|arm64|large|xlarge|xl|intel))?$",
+    re.IGNORECASE,
+)
 
 
 def split_top_level(expr, operator):
@@ -480,12 +490,21 @@ for job_id, job in jobs.items():
             out("#GROUP", vid)
         else:
             labels = runs_on if isinstance(runs_on, list) else ([runs_on] if runs_on else [])
+            literal = []
             for label in labels:
                 text = str(label)
                 if "${{" in text:
                     out("#EXPR", vid)
                 else:
+                    literal.append(text.strip())
                     out("#LABEL", vid, text.strip())
+            # Whether every literal label is a GitHub-hosted image is decided
+            # HERE, once, against `HOSTED_IMAGE` — the same expression the fork
+            # guard's safe-destination test uses. It was decided twice, in two
+            # languages, and two spellings of one security rule drift apart on
+            # the first change to either.
+            if literal and all(HOSTED_IMAGE.match(t) for t in literal):
+                out("#HOSTEDONLY", vid)
 
         if guarded:
             out("#FORKGUARD", vid)
@@ -498,6 +517,18 @@ PY
 # MORE records than intended — one job's timeout answering for another's, which
 # is an error in the direction that reports clean.
 re_quote() { printf '%s' "$1" | sed 's/[][\.^$*+?(){}|\\\/]/\\&/g'; }
+
+# One spelling for a file, so that a path used as a set KEY and a path used as a
+# set MEMBER compare equal. Falls back to the argument unchanged when the
+# directory cannot be entered, which is the reading a missing file deserves.
+abs_path() {
+  local d b
+  d="$(dirname -- "$1")"
+  b="$(basename -- "$1")"
+  d="$(cd -- "$d" 2>/dev/null && pwd)" || { printf '%s' "$1"; return; }
+  [ -n "$d" ] || { printf '%s' "$1"; return; }
+  printf '%s/%s' "$d" "$b"
+}
 
 # Files a `pull_request` workflow can reach through a local `uses:` call — see
 # `compute_reachable`. Newline-separated absolute paths.
@@ -547,7 +578,7 @@ check_file() {
   # …or reached from one. A callee declares only `workflow_call` and runs with
   # the caller's pull-request context, so judging it on its own triggers reads a
   # self-hosted job with no guard as unreachable by forks.
-  if [ "$has_pr" -eq 0 ] && printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$file"; then
+  if [ "$has_pr" -eq 0 ] && printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$(abs_path "$file")"; then
     has_pr=1
   fi
 
@@ -556,17 +587,16 @@ check_file() {
     [ -n "$job" ] || continue
     job_re="$(re_quote "$job")"
 
-    local labels self_hosted=0 scoped=0 hosted_only=1 label
+    local labels self_hosted=0 scoped=0 hosted_only=0 label
     labels="$(printf '%s\n' "$records" | sed -n "s/^#LABEL\t${job_re}\t//p")"
+    # "Every literal label is a GitHub-hosted image" is the reader's answer, not
+    # a second opinion computed here — see `#HOSTEDONLY`.
+    [ "$(printf '%s\n' "$records" | grep -c "^#HOSTEDONLY	${job_re}$")" -gt 0 ] && hosted_only=1
     while IFS= read -r label; do
       [ -n "$label" ] || continue
       if printf '%s' "$label" | grep -qiE "^self-hosted$"; then
         self_hosted=1
-        hosted_only=0
       else
-        # A label that is not a GitHub-hosted image is a label some runner in
-        # the fleet was registered with.
-        printf '%s' "$label" | grep -qiE "^(ubuntu|windows|macos)-" || hosted_only=0
         printf '%s' "$label" | grep -qiE "^(${GENERIC})$" || scoped=1
       fi
     done <<EOF
@@ -696,17 +726,36 @@ EOF
 compute_reachable() {
   local f records seed="" edges="" caller target changed=1 line
   for f in "$@"; do
+    # Both sides of every edge are canonicalised, because the two sides were
+    # spelled differently: the caller was whatever the invocation passed —
+    # `.github/workflows/ci.yml` in the documented `<file>...` mode — while a
+    # `./…` call target was resolved to an absolute path here. The seeds were
+    # then relative, the targets absolute, and `grep -qxF` matched neither
+    # against the other, so reachability silently computed to nothing on the
+    # exact invocation the usage line documents. `check_file` canonicalises the
+    # same way before asking whether its file is in the set.
+    f="$(abs_path "$f")"
     records="$(read_workflow "$f")" || continue
     if [ "$(printf '%s\n' "$records" | grep -c '^#PR$')" -gt 0 ] ||
        [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
       seed="$seed$f"$'\n'
     fi
-    while IFS= read -r line; do
-      [ -n "$line" ] || continue
+    # An edge carries its CALLER JOB, because a guard on the calling job is a
+    # guard on everything that job reaches: `if: …fork == false` on the `uses:`
+    # job means the callee's jobs never run for a fork through this edge. Read
+    # without it, the callee was asked for a guard it could not need, and the
+    # only way to satisfy the gate was to duplicate the caller's condition in a
+    # file that has no pull-request context of its own. A callee reached by ANY
+    # unguarded edge is still reachable — the guard has to hold on every path.
+    local cjob cjob_re
+    while IFS=$'\t' read -r cjob line; do
+      [ -n "${line:-}" ] || continue
+      cjob_re="$(re_quote "$cjob")"
+      [ "$(printf '%s\n' "$records" | grep -c "^#FORKGUARD	${cjob_re}$")" -gt 0 ] && continue
       target="$(cd "$(dirname "$f")/../.." 2>/dev/null && pwd)/${line#./}"
       edges="$edges$f	$target"$'\n'
     done <<EOF
-$(printf '%s\n' "$records" | sed -n 's/^#CALLS\t[^\t]*\t//p')
+$(printf '%s\n' "$records" | sed -n 's/^#CALLS\t//p')
 EOF
   done
 
@@ -777,6 +826,27 @@ jobs:
 jobs:
   check:
     runs-on: [self-hosted, Linux, gcp]
+    steps: [{run: "true"}]'
+
+  # `ubuntu-pool-1` is a custom label on a fleet runner, not a hosted image.
+  # Read by prefix it was hosted, and every isolation check was skipped on it.
+  # RUNNER4 is the discriminator: a hosted image is not fleet-reachable and is
+  # never asked for a fork guard, so this fixture fires only if the label is
+  # read as what it is — a custom label on a fleet runner.
+  expect "an OS-prefixed custom label is not a hosted image" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-pool-1
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "a real hosted image is still hosted" "" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
     steps: [{run: "true"}]'
 
   expect "case-insensitive platform labels are not scopes" "RUNNER1" "" allowed \
@@ -1188,6 +1258,64 @@ jobs:
 jobs:
   build:
     if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The same pair, judged the way the usage line documents: repository-relative
+  # paths. Reachability keyed the caller by the string it was handed and the
+  # callee by an absolute path it resolved itself, so the two never compared
+  # equal and the whole computation silently produced nothing — a fixture that
+  # only ever passed absolute paths could not see it.
+  expect_pair_rel() {
+    local name="$1" want="$2" caller_body="$3" callee_body="$4"
+    local got out_text dir="$tmp/pairrel"
+    rm -rf "$dir"; mkdir -p "$dir/.github/workflows"
+    printf '%s\n' "$caller_body" > "$dir/.github/workflows/caller.yml"
+    printf '%s\n' "$callee_body" > "$dir/.github/workflows/callee.yml"
+    out_text="$(fail=0
+      cd "$dir" || exit 1
+      compute_reachable .github/workflows/caller.yml .github/workflows/callee.yml
+      check_file .github/workflows/caller.yml "" allowed
+      check_file .github/workflows/callee.yml "" allowed 2>&1)"
+    got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr '\n' ' ')"
+    got="$(printf '%s' "$got" | sed 's/ *$//')"
+    if [ "$got" != "$want" ]; then
+      echo "FAIL $name: want ids [$want], got [$got]"
+      printf '%s\n' "$out_text" | sed 's/^/      /'
+      status=1
+    else
+      echo "ok   $name [$want]"
+    fi
+  }
+
+  expect_pair_rel "reachability holds when the paths are relative" "RUNNER4" \
+'on:
+  pull_request:
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml' \
+'on:
+  workflow_call:
+jobs:
+  build:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # A guard on the CALLING job is a guard on everything that job reaches, so the
+  # callee is not asked to repeat a condition its own file has no context for.
+  expect_pair "a guard on the calling job covers the callee" "" \
+'on:
+  pull_request:
+jobs:
+  call:
+    if: github.event.pull_request.head.repo.fork == false
+    uses: ./.github/workflows/callee.yml' \
+'on:
+  workflow_call:
+jobs:
+  build:
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 30
     steps: [{run: "true"}]'
