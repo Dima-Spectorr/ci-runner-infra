@@ -14,9 +14,15 @@
 # says so directly: each slot runs its own rootless daemon with its own data
 # root under the slot user's home, so an image pulled into this build VM's
 # root-owned /var/lib/docker is invisible to every one of them. A baked FILE is
-# visible to all of them, because /opt/ci-cache is the one tree slots share.
+# visible to all of them, because every slot user can read /opt/ci-images.
 # host-startup.sh's load_baked_images() loads every archive found here into each
 # slot's daemon at boot.
+#
+# NOT under /opt/ci-cache, which is the group-writable tree slots share. What is
+# written here is `docker load`ed into every slot on the host at every boot, so
+# a job able to write it would be running its own image in every other slot —
+# and write+execute on a non-sticky /opt/ci-cache is enough to swap this whole
+# directory out, checksums and all, however the files inside it are owned.
 #
 # The version is pinned deliberately. Playwright refuses to run when the browser
 # build in the image does not match the `@playwright/test` the repository
@@ -35,7 +41,7 @@ PLAYWRIGHT_IMAGE="mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-noble"
 # browser binaries in the image are linked against that release's system
 # libraries.
 
-IMAGE_DIR="/opt/ci-cache/images"
+IMAGE_DIR="/opt/ci-images"
 ARCHIVE="$IMAGE_DIR/playwright-v${PLAYWRIGHT_VERSION}-noble.tar.gz"
 
 echo "[warm-cache] baking $PLAYWRIGHT_IMAGE"
@@ -84,10 +90,11 @@ mv "$ARCHIVE.partial" "$ARCHIVE"
 #
 # The image build is the only moment this archive is known-good, so the digest
 # has to be taken here. It is defence in depth rather than the primary control
-# — `images/` is root-owned and read-only to slots — but it is the half that
-# still holds if that ownership is ever widened by a later change, and it turns
-# a truncated or half-copied archive into a clean skip instead of a `docker
-# load` failure nobody reads.
+# — the primary control is that /opt/ci-images and its parent are root-owned
+# and not writable by any slot — but it is the half that still holds if that
+# ownership is ever widened by a later change, and it turns a truncated or
+# half-copied archive into a clean skip instead of a `docker load` failure
+# nobody reads.
 # Appended, not rewritten: another warm script may have baked its own archive
 # into this directory, and its line must survive.
 ( cd "$IMAGE_DIR" && sha256sum "$(basename "$ARCHIVE")" >>SHA256SUMS )

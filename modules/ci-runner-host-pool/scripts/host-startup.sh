@@ -841,8 +841,15 @@ EOF
 #
 # Deliberately generic: the host has no idea what is in the archives, and no
 # tool is named here. A pool that wants an image warm supplies a warm-cache
-# script that writes /opt/ci-cache/images/*.tar[.gz]; a pool that does not gets
-# an empty directory and pays nothing.
+# script that writes /opt/ci-images/*.tar[.gz]; a pool that does not gets no
+# directory at all and pays nothing.
+#
+# /opt/ci-images is NOT under /opt/ci-cache, and that is the security boundary
+# rather than a filing choice. The shared cache is group-writable so slots can
+# update it, and everything in it is untrusted build input by design. These
+# archives are not input: they are loaded into every slot's daemon at boot, so
+# whoever can write one is running their image in every slot on the host for
+# the rest of its life. Root-owned tree, root-owned parent, no group write.
 #
 # Backgrounded and never fatal, for two reasons. A multi-gigabyte load takes
 # minutes, and blocking on it would keep the whole pool from registering while
@@ -852,7 +859,7 @@ EOF
 # making boot depend on a registry (see slot_runtime_usable).
 load_baked_images() {
   local idx="$1" u; u=$(slot_user "$idx")
-  local dir="/opt/ci-cache/images"
+  local dir="/opt/ci-images"
 
   [ -d "$dir" ] || return 0
   # Nothing to do is the common case — most pools bake no images at all.
@@ -866,18 +873,34 @@ load_baked_images() {
       base=$(basename "$a")
 
       # Verify against the digest recorded at bake time, when the archive was
-      # last known-good. This is defence in depth, not the primary control —
-      # `images/` is root-owned and read-only to slots — but it is the half
-      # that still holds if that ownership is ever widened by a later change,
-      # and it turns a truncated archive into a clean skip.
+      # last known-good. Defence in depth, not the primary control — the tree
+      # is root-owned and unwritable by slots — but it is the half that still
+      # holds if that ownership is ever widened, and it turns a truncated
+      # archive into a clean skip.
       #
-      # A missing SHA256SUMS is not a failure: an image baked before this
-      # existed simply has nothing to check against.
-      if [ -f "$dir/SHA256SUMS" ] && grep -qF " $base" "$dir/SHA256SUMS"; then
-        if ! ( cd "$dir" && grep -F " $base" SHA256SUMS | sha256sum -c --status - ); then
-          log "slot $idx: $base failed its checksum — NOT loading it; jobs will pull that image themselves"
-          continue
-        fi
+      # The line is selected by an EXACT filename field, not by searching for
+      # the name anywhere in the file. `grep -F " $base"` would match the line
+      # belonging to a DIFFERENT archive whose name merely contains this one —
+      # `x.tar` matching the entry for `x.tar.gz` — and then `sha256sum -c`
+      # would happily verify that other, legitimate file and report success,
+      # loading the unchecked one. Character 67 is where sha256sum's name
+      # field starts (64 hex digits + two separators).
+      #
+      # Fail closed: an archive with no line of its own, or with more than one,
+      # is not loaded. Every archive this fleet bakes gets exactly one line, so
+      # anything else is a tree nobody should be executing.
+      local sums="$dir/SHA256SUMS" nmatch=0
+      if [ -f "$sums" ]; then
+        nmatch=$(awk -v f="$base" 'substr($0,1,64) ~ /^[0-9a-f]+$/ && substr($0,67)==f' "$sums" | wc -l)
+      fi
+      if [ "$nmatch" -ne 1 ]; then
+        log "slot $idx: $base has no single checksum entry — NOT loading it; jobs will pull that image themselves"
+        continue
+      fi
+      if ! ( cd "$dir" && awk -v f="$base" 'substr($0,1,64) ~ /^[0-9a-f]+$/ && substr($0,67)==f' SHA256SUMS \
+               | sha256sum -c --status - ); then
+        log "slot $idx: $base failed its checksum — NOT loading it; jobs will pull that image themselves"
+        continue
       fi
 
       # `docker load` reads gzip transparently, so a warm script may save either
@@ -891,7 +914,7 @@ load_baked_images() {
       # is root: a GCE startup script runs as root, which is also why every
       # other write to this log in this file is spelled the same way. `sudo`
       # here drops privilege for the daemon socket, it does not raise it.
-      if timeout 1800 sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
+      if timeout 600 sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
            docker load -i "$a" >>/var/log/ci-host.log 2>&1; then
         log "slot $idx: loaded baked image archive $base"
       else

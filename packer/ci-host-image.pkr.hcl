@@ -124,9 +124,11 @@ variable "warm_cache_script" {
     disk for nothing.
 
     A container image therefore has to be baked as a FILE, which is the one
-    form every slot can read: `docker save` it into /opt/ci-cache/images/ and
+    form every slot can read: `docker save` it into /opt/ci-images/ and
     host-startup.sh's load_baked_images() loads it into each slot's daemon at
-    boot. `warm-cache/playwright.sh` is that pattern, for pools that run
+    boot. That directory is root-owned and read-only to slots, deliberately —
+    it is not part of the group-writable /opt/ci-cache, because its contents
+    are executed rather than read. `warm-cache/playwright.sh` is that pattern, for pools that run
     browser tests.
 
     Empty = build a toolchain-only image.
@@ -358,17 +360,23 @@ build {
       # setgid on directories only, so new entries keep the `ci` group.
       "find /opt/ci-cache -type d -exec chmod g+s {} +",
 
-      # …except `images/`, which is the one part of this tree that is EXECUTED
-      # rather than read. Every archive here is `docker load`ed into every
-      # slot's daemon at boot, so group-write would let a job in one slot
-      # replace an image that every other slot then runs — automatically, on
-      # the next reboot, for the rest of the host's life. The rest of the cache
-      # is untrusted build input by design (README "a warm cache is untrusted
-      # build input"); this part cannot be, because nothing re-verifies it.
+      # Baked image archives live in /opt/ci-images, NOT under /opt/ci-cache,
+      # and the separation is the control rather than a tidiness choice.
       #
-      # Root-owned and read-only to the slots. Nothing at runtime writes here:
-      # the archives are produced at bake time, by the warm script, as root.
-      "if [ -d /opt/ci-cache/images ]; then chown -R root:ci /opt/ci-cache/images && chmod 0755 /opt/ci-cache/images && find /opt/ci-cache/images -type f -exec chmod 0644 {} + ; fi",
+      # Every archive there is `docker load`ed into every slot's daemon at
+      # boot, so it is EXECUTED, not read — while /opt/ci-cache is untrusted
+      # build input by design (README: "a warm cache is untrusted build
+      # input") and is group-writable so slots can update it. Making the
+      # archives root-owned INSIDE that tree is not enough: write+execute on a
+      # non-sticky parent lets a job rename the whole directory away and put
+      # its own — with a matching SHA256SUMS — in its place, supplying both
+      # halves of the check. Ownership of an entry never protects it from the
+      # permissions of the directory holding it.
+      #
+      # So the archives sit in their own root-owned, non-group-writable tree.
+      # Nothing at runtime writes here; they are produced at bake time, by the
+      # warm script, as root.
+      "if [ -d /opt/ci-images ]; then chown -R root:root /opt/ci-images && chmod 0755 /opt/ci-images && find /opt/ci-images -type f -exec chmod 0644 {} + ; fi",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
