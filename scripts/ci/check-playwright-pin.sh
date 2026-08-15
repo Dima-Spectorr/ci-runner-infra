@@ -9,6 +9,12 @@
 #   PW1  the warm-cache script states a pin this gate can read.
 #   PW2  every `mcr.microsoft.com/playwright:v<x>-noble` written anywhere in the
 #        repository names that same release.
+#   PW3  the warm-cache script exists at all.
+#
+#   PW3 is separate from PW1 because a missing file and an unreadable pin need
+#   different words to act on, and because an id shared with PW1 would let the
+#   missing-file branch be deleted with every self-test case still passing —
+#   the fall-through reports PW1 anyway, just with the wrong explanation.
 #
 # WHY THIS IS A GATE AND NOT A STYLE RULE
 #   The pin exists twice by necessity and it cannot be collapsed into one place.
@@ -53,7 +59,7 @@ check_tree() { # <root>
   local pin codename want line file ref
 
   if [ ! -f "$root/$WARM_SCRIPT" ]; then
-    err PW1 "$WARM_SCRIPT is missing — the fleet's baked browser image has no declared version"
+    err PW3 "$WARM_SCRIPT is missing — the fleet's baked browser image has no declared version"
     return
   fi
 
@@ -85,8 +91,12 @@ check_tree() { # <root>
   # what the pool bakes.
   want="mcr.microsoft.com/playwright:v$pin-$codename"
 
-  # Every reference in the tree, the warm script included: it names the image it
-  # builds, so it has to agree with itself too.
+  # Every literal reference in the tree. Not the warm script's own
+  # PLAYWRIGHT_IMAGE line, despite it being scanned: that line spells the
+  # version as `${PLAYWRIGHT_VERSION}`, and IMAGE_RE needs a digit after the
+  # `v`, so it never matches. That is the correct outcome rather than a gap —
+  # the warm script is where `want` comes from, so comparing it to itself could
+  # only ever pass.
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     file="${line%%:*}"
@@ -97,6 +107,7 @@ check_tree() { # <root>
   done <<EOF
 $(grep -rEo "$IMAGE_RE" "$root" \
     --include='*.sh' --include='*.yml' --include='*.yaml' --include='*.md' --include='*.hcl' \
+    --include='*.tf' --include='*.tfvars' --include='*.json' \
     --exclude-dir=.git 2>/dev/null)
 EOF
 }
@@ -153,6 +164,29 @@ FIX
   echo "use ${img}1.62.1-jammy" >"$tmp/docs/ui.md"
   run_case "a stale codename is reported" "PW2"
 
+  # THE DIRECTION THIS GATE ACTUALLY EXISTS FOR, and the one the cases above do
+  # not cover: they all move the DOC while the warm script holds still, so a
+  # `want` hardcoded to the current image would satisfy every one of them and
+  # the gate would have stopped reading the pin without any case noticing. Here
+  # the warm script is the side that moves — a real version bump, with the doc
+  # left on the old release.
+  cat >"$tmp/$WARM_SCRIPT" <<'FIX'
+PLAYWRIGHT_VERSION="${PLAYWRIGHT_VERSION:-1.63.0}"
+PLAYWRIGHT_IMAGE="mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-noble"
+FIX
+  echo "use ${img}1.62.1-noble" >"$tmp/docs/ui.md"
+  run_case "a bumped warm script with a stale doc is reported" "PW2"
+
+  # The same, for the base: the fleet moves to a new Ubuntu release and the doc
+  # keeps the old codename. Pins the codename half of `want` to the warm script
+  # for the same reason.
+  cat >"$tmp/$WARM_SCRIPT" <<'FIX'
+PLAYWRIGHT_VERSION="${PLAYWRIGHT_VERSION:-1.62.1}"
+PLAYWRIGHT_IMAGE="mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-jammy"
+FIX
+  echo "use ${img}1.62.1-noble" >"$tmp/docs/ui.md"
+  run_case "a rebased warm script with a stale doc codename is reported" "PW2"
+
   # An unreadable pin must not be spent as "no drift found".
   echo "use ${img}1.62.1-noble" >"$tmp/docs/ui.md"
   echo 'PLAYWRIGHT_VERSION="latest"' >"$tmp/$WARM_SCRIPT"
@@ -167,7 +201,7 @@ FIX
   run_case "an unreadable image base is reported, not passed" "PW1"
 
   rm -f "$tmp/$WARM_SCRIPT"
-  run_case "a missing warm script is reported, not passed" "PW1"
+  run_case "a missing warm script is reported, not passed" "PW3"
 
   rm -rf "$tmp"; trap - EXIT
   echo "--- $t case(s), $f failure(s)"

@@ -70,6 +70,44 @@ docker info >/dev/null 2>&1 || {
   exit 1
 }
 
+# THE ASSERTION THIS WHOLE FEATURE RESTS ON.
+#
+# The runner does not check whether the `container:` image is already present —
+# it runs `docker pull` unconditionally before starting the job's container. So
+# baking the image saves the download only if that pull can recognise the loaded
+# layers as the ones it was about to fetch, and that is true only under the
+# containerd image store, which keeps each layer's registry blob digest through
+# a save/load round trip. The legacy graphdriver store does not: the image loads
+# fine, `docker images` looks right, and the pull then re-downloads every byte.
+#
+# Measured on a host booted from this image (docker 29.7.2, storage driver
+# `overlayfs`, driver-type `io.containerd.snapshotter.v1`): load 53s, and the
+# subsequent pull of the same tag returned "Image is up to date" in 2.1s having
+# transferred nothing.
+#
+# Nothing pins us to that store — docker-ce is installed unversioned and sets no
+# `features.containerd-snapshotter` — so this asserts it instead of assuming it.
+# Failing the bake is the only place the problem is visible: on a host the
+# feature would simply stop paying off, and the symptom is "the UI tests got
+# slow", which is the most believable wrong explanation there is.
+#
+# Checked on the BUILD VM's daemon, while the slot daemons that do the loading
+# are rootless and per-user. Neither sets the feature flag, so both follow the
+# same engine default and this is a faithful proxy — but it is a proxy, which is
+# why host-startup.sh logs the store it actually got on each slot at boot.
+image_store="$(docker info --format '{{.DriverStatus}}' 2>/dev/null || true)"
+case "$image_store" in
+  *io.containerd.snapshotter.v1*) : ;;
+  *)
+    echo "[warm-cache] this daemon is NOT using the containerd image store" >&2
+    echo "[warm-cache]   docker info DriverStatus: ${image_store:-<empty>}" >&2
+    echo "[warm-cache] a baked archive would load but the runner's own pull would" >&2
+    echo "[warm-cache] re-download the whole image, so the bake would cost ~900MB" >&2
+    echo "[warm-cache] of image size and buy nothing. Refusing to bake it." >&2
+    exit 1
+    ;;
+esac
+
 # The pull IS the check that the tag exists. Failing here costs one image build;
 # the alternative is discovering a typo'd tag on every host, hours later, as a
 # job that cannot start its container.
@@ -78,10 +116,14 @@ if ! docker pull "$PLAYWRIGHT_IMAGE"; then
   exit 1
 fi
 
-# Gzipped: it trades a little CPU at each slot's load for roughly a third of the
-# bytes in the image, and `docker load` reads gzip transparently. Written to a
-# temp path and moved, so an interrupted build cannot leave a truncated archive
-# that every host then fails to load.
+# `docker load` reads gzip transparently, and `-1` is the cheap end of the
+# trade: some saving for little CPU at each slot's load. Do not expect much from
+# it — under the containerd image store the layers in the archive are already
+# the registry's compressed blobs, so this is re-compressing compressed data.
+# The measured result for this tag is a 942MB archive, and the image reports
+# 3.52GB on disk once loaded. Written to a temp path and moved, so an
+# interrupted build cannot leave a truncated archive that every host then fails
+# to load.
 echo "[warm-cache] saving $PLAYWRIGHT_IMAGE to $ARCHIVE"
 docker save "$PLAYWRIGHT_IMAGE" | gzip -1 >"$ARCHIVE.partial"
 mv "$ARCHIVE.partial" "$ARCHIVE"

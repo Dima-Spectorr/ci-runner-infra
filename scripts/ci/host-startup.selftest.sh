@@ -359,6 +359,17 @@ has_baked_image_load() { # <file>
   #    leave a half-loaded image behind.
   matches "$code" 'IMAGE_LOAD_PIDS' || return 1
   matches "$code" 'wait \$\{IMAGE_LOAD_PIDS\}' || return 1
+
+  # 5. The load is recorded as USEFUL, not merely successful. The runner pulls
+  #    the job's `container:` image unconditionally, and that pull recognises
+  #    these layers only under the containerd image store, which preserves
+  #    registry blob digests across save/load. Under the legacy graphdriver
+  #    store every step here still succeeds and the job re-downloads the image
+  #    anyway — the archive becomes ~900MB of image that buys nothing, and the
+  #    only symptom is that UI jobs are slow. Nothing pins the store (docker-ce
+  #    is installed unversioned), so the slot logs the one it actually got.
+  matches "$code" 'io.containerd.snapshotter.v1' || return 1
+  matches "$joined" 'docker info --format' || return 1
 }
 
 # The helper carries the trap it was written to avoid, so it is tested first.
@@ -514,6 +525,7 @@ mutate "hex-digest guard dropped"            's|substr(\$0,1,64)|substr($0,1,0)|
 mutate "unchecked archives loaded again"     's|"\$nmatch" -ne 1|"$nmatch" -ge 0|'                                  has_baked_image_load
 mutate "digest no longer verified"           's|sha256sum -c --status|cat|'                                         has_baked_image_load
 mutate "loads left to the cgroup killer"     's|wait \${IMAGE_LOAD_PIDS}|:|'                                        has_baked_image_load
+mutate "image store no longer reported"      's|io.containerd.snapshotter.v1|containerd|g'                          has_baked_image_load
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

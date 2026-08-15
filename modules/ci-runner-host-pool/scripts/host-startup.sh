@@ -857,6 +857,15 @@ EOF
 # job pulls the image itself", which is merely slow — the alternative is a host
 # that refuses to register over a CACHE, which is the same class of fault as
 # making boot depend on a registry (see slot_runtime_usable).
+#
+# One load per SLOT, not one per host: the slot daemons have separate data
+# roots, so there is nothing for them to share and each pays the cost in full.
+# Measured single-threaded on a 4-vCPU host: ~53s to checksum and load a 942MB
+# archive. K slots run that concurrently against one disk, so the last one
+# finishes appreciably later than the first — that is accepted, not overlooked.
+# It is affordable only because nothing waits on it: slots register and take
+# jobs while these run in the background, and the first UI job to land before
+# its slot finished loading just pulls the image itself.
 load_baked_images() {
   local idx="$1" u; u=$(slot_user "$idx")
   local dir="/opt/ci-images"
@@ -925,6 +934,23 @@ load_baked_images() {
       if timeout 1800 sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
            docker load -i "$a" >>/var/log/ci-host.log 2>&1; then
         log "slot $idx: loaded baked image archive $base"
+        # Whether loading it SAVED anything is a separate question from whether
+        # it loaded. The runner pulls the job's `container:` image
+        # unconditionally, and that pull only recognises these layers under the
+        # containerd image store, which preserves registry blob digests across a
+        # save/load round trip. Under the legacy graphdriver store every step
+        # here still succeeds and the job re-downloads the image anyway.
+        # The bake asserts the store on the BUILD VM; this records the one that
+        # actually did the load, so a divergence is a line in this log rather
+        # than an unexplained slowdown discovered months later.
+        store=$(sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
+                  docker info --format '{{.DriverStatus}}' 2>/dev/null || true)
+        case "$store" in
+          *io.containerd.snapshotter.v1*)
+            log "slot $idx: containerd image store — the job's own pull will be a no-op" ;;
+          *)
+            log "slot $idx: WARNING: image store is not containerd (${store:-unknown}) — the baked archive will NOT save the job's download" ;;
+        esac
       else
         log "slot $idx: could not load $base — jobs will pull that image themselves"
       fi

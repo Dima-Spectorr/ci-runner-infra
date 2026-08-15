@@ -1,7 +1,16 @@
 # Running Playwright UI tests on the fleet
 
 Browser tests run in the **official Playwright container**, on a pool whose
-image has that container **baked in** so the job does not download it.
+image has that container **baked in**, so the job does not transfer it.
+
+The runner still runs `docker pull` for a `container:` image — it does that
+unconditionally, and nothing in a workflow can turn it off. What the bake
+changes is what that pull costs: the slot's daemon already holds the layers
+under their registry digests, so the pull resolves the tag and stops.
+Measured on a host booted from the warmed image: **2.1s, nothing transferred**,
+against roughly a gigabyte otherwise. If you read `Pulling from playwright` in a
+job log, that is the expected line, not a sign the cache missed — the tell is
+how long it takes.
 
 Two things have to line up, and one gate holds them together:
 
