@@ -21,7 +21,9 @@
 #     RUNNER4  a workflow reachable by fork code keeps that code off the pool.
 #     RUNNER5  the runner is selected dynamically — UNDECIDED, not passed.
 #     RUNNER6  and the declared timeout is actually below the default it replaces.
-#     RUNNER7  a REMOTE reusable workflow's jobs are not in this repository.
+#     RUNNER7  a REMOTE reusable workflow's jobs are not in this repository —
+#              UNDECIDED, and declarable with a `remote-reusable-allowed` marker
+#              naming the callee (see `remote_call_declared`).
 #
 # WHAT COUNTS AS REACHING THE FLEET
 #   `self-hosted` is a LABEL, not a requirement. GitHub routes a job to any
@@ -553,6 +555,36 @@ MAX_TIMEOUT=360
 # Declared acceptance of an undecidable pool — see RUNNER5.
 ALLOW_DYNAMIC=0
 
+# RUNNER7's escape hatch, and deliberately NOT RUNNER5's `--allow-dynamic-runner`.
+# A CLI flag excuses every remote call in the repository at once — including one
+# a later, unrelated change adds — and it lives in the CI invocation rather than
+# beside the call it excuses, so the reviewer of that call never sees it. This is
+# a marker in the workflow, and it NAMES ITS CALLEE:
+#
+#   # remote-reusable-allowed(<owner>/<repo>/.github/workflows/<file>, #<issue>): <reason>
+#
+# Point the `uses:` at a different workflow, or a different owner, and the marker
+# stops matching and the check re-arms. The REF is deliberately not part of it: a
+# pin bump does not change the fact this gate cannot read the callee's jobs, and
+# whether that ref may float at all is `check-action-pins.sh`'s question, not
+# this one.
+#
+# What the marker asserts is narrow, and worth stating so nobody reads it as
+# more: a human has read the callee and accepted its runner scope and timeouts.
+# It does not verify them — nothing here can, which is the whole finding. The
+# issue number is where that reading is recorded, so the acceptance has an owner
+# and a place to be revisited; a marker without one is not accepted.
+remote_call_declared() {
+  local file="$1" callee="$2" esc
+  # The callee is DATA, not a pattern. Unescaped, the `.` in `ci.yml` matches any
+  # character, so a marker for `ci.yml` would also excuse a call to `ciXyml`.
+  esc="$(printf '%s' "$callee" | sed 's/[][\.^$*+?(){}|]/\\&/g')"
+  # A file, not a pipe, so `-q`'s early exit cannot turn into a pipefail false
+  # negative. The trailing `[^[:space:]]` is the reason: `(...): ` with nothing
+  # after it is a waiver wearing the shape of a declaration.
+  grep -Eq "^[[:space:]]*#.*remote-reusable-allowed\([[:space:]]*${esc}[[:space:]]*,[[:space:]]*#[0-9]+[[:space:]]*\):[[:space:]]*[^[:space:]]" "$file"
+}
+
 # `scope` empty means RUNNER2 is not asserted; `forks` is the declared posture.
 check_file() {
   local file="$1" scope="$2" forks="$3"
@@ -716,10 +748,17 @@ EOF
     # reachability into them. For a REMOTE one it holds neither file nor
     # jobs, so the exemption was handing the property to a document nobody
     # checked. Undecided and said so, like RUNNER5.
+    #
+    # Undecidable is not the same as forbidden, and this gate had been reading it
+    # that way: the fleet's whole premise is ONE reusable workflow in
+    # `ci-runner-infra` called by every repository instead of nine drifting
+    # copies, so an unconditional refusal here made the only path past it the
+    # vendoring that another gate in this same run exists to prevent. The
+    # decision it cannot make is now declarable, next to the call, naming it.
     local remote
     remote="$(printf '%s\n' "$records" | sed -n "s/^#REMOTECALL\t${job_re}\t//p" | head -1)"
-    if [ -n "$remote" ]; then
-      err RUNNER7 "$rel: job '$job' calls the remote reusable workflow '$remote' — its jobs' runner scope and timeouts are not in this repository, so this gate cannot decide them"
+    if [ -n "$remote" ] && ! remote_call_declared "$file" "${remote%%@*}"; then
+      err RUNNER7 "$rel: job '$job' calls the remote reusable workflow '$remote' — its jobs' runner scope and timeouts are not in this repository, so this gate cannot decide them (read the callee, then declare it: '# remote-reusable-allowed(${remote%%@*}, #<issue>): <reason>')"
     fi
   done <<EOF
 $(printf '%s\n' "$records" | sed -n 's/^#JOB\t//p')
@@ -1250,6 +1289,63 @@ jobs:
 jobs:
   call:
     uses: owner/repo/.github/workflows/ci.yml@11bd71901bbe5b1630ceea73d27597364c9af683'
+
+  # ...and declaring it clears it. The fleet calls one shared reusable workflow
+  # on purpose, so "undecidable" has to be declarable or the only way past this
+  # check is to vendor the callee — which is what the fleet exists not to do.
+  expect "a declared remote reusable workflow is accepted" "" "" blocked \
+'on: [push]
+jobs:
+  call:
+    # remote-reusable-allowed(owner/repo/.github/workflows/ci.yml, #4141): a human read the callee and accepted its runner scope
+    uses: owner/repo/.github/workflows/ci.yml@11bd71901bbe5b1630ceea73d27597364c9af683'
+
+  # The ref is deliberately not part of the marker: a pin bump does not change
+  # what this gate can read. Asserted, so the omission stays a decision.
+  expect "the declaration survives a ref bump" "" "" blocked \
+'on: [push]
+jobs:
+  call:
+    # remote-reusable-allowed(owner/repo/.github/workflows/ci.yml, #4141): unchanged across the bump below
+    uses: owner/repo/.github/workflows/ci.yml@v9'
+
+  # The callee IS the scope. A marker earned by reading one workflow must not
+  # silently cover the next `uses:` somebody points at a different one.
+  expect "a declaration for another callee excuses nothing" "RUNNER7" "" blocked \
+'on: [push]
+jobs:
+  call:
+    # remote-reusable-allowed(owner/repo/.github/workflows/other.yml, #4141): a different workflow entirely
+    uses: owner/repo/.github/workflows/ci.yml@v9'
+
+  # Every element of the grammar carries weight, so each is proven to be load-
+  # bearing on its own. No issue: the acceptance has nowhere to be recorded and
+  # nobody to revisit it. No reason: a waiver wearing a declaration's shape.
+  expect "a declaration with no issue is not one" "RUNNER7" "" blocked \
+'on: [push]
+jobs:
+  call:
+    # remote-reusable-allowed(owner/repo/.github/workflows/ci.yml): reviewed, honest
+    uses: owner/repo/.github/workflows/ci.yml@v9'
+
+  expect "a declaration with no reason is not one" "RUNNER7" "" blocked \
+'on: [push]
+jobs:
+  call:
+    # remote-reusable-allowed(owner/repo/.github/workflows/ci.yml, #4141):
+    uses: owner/repo/.github/workflows/ci.yml@v9'
+
+  # And it must be a comment. The string is what a job would echo while doing
+  # exactly the thing the marker claims was reviewed.
+  expect "the marker in a run: step is not a declaration" "RUNNER7" "" blocked \
+'on: [push]
+jobs:
+  note:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps: [{run: "echo remote-reusable-allowed(owner/repo/.github/workflows/ci.yml, #4141): x"}]
+  call:
+    uses: owner/repo/.github/workflows/ci.yml@v9'
 
   expect "unparseable document" "RUNNER0" "" allowed \
 'jobs: [ this is not a workflow'
