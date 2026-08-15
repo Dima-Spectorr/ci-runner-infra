@@ -307,9 +307,10 @@ convention rather than a hazard.
 
 RUNNER5 is not a finding about the gate, it is a finding about the repository.
 Borsh-Tablet-App's seven and entity-platform's seven are jobs whose pool is
-chosen by repository configuration; three of entity-platform's read
-`${{ vars.CI_RUNNER_LABEL }}` bare, with no fork guard and no fallback, so an
-unset variable resolved them to an **empty label set**.
+chosen by repository configuration: each reads `${{ vars.CI_RUNNER_LABEL }}`
+behind a fork guard and falls back to `'ubuntu-latest'` when the variable is
+unset, so the routing is correct — but correct-by-configuration is exactly what
+a gate reading the file cannot confirm.
 
 entity-platform's four extra appeared when the fork guard stopped silencing
 RUNNER5 (see above) — they were always dynamic, the guard was answering for
