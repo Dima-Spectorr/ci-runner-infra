@@ -77,6 +77,7 @@ is_bounded() { # <command text>
 # PowerShell continues a line with a trailing BACKTICK, not a backslash, so the
 # folder above would judge a wrapped `Invoke-RestMethod` as several commands and
 # miss the `-TimeoutSec` on its last line.
+# shellcheck disable=SC2016  # `$ is sed's end-of-line anchor, not a shell expansion.
 fold_ps_lines() { sed -e :a -e '/`$/{N;s/`\n//;ta' -e '}' "$1"; }
 
 ps_web_cmds() { fold_ps_lines "$1" | grep -vE '^[[:space:]]*#' | grep -Ei '(^|[^[:alnum:]_-])Invoke-(RestMethod|WebRequest)([^[:alnum:]_-]|$)'; }
