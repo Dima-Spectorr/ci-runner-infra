@@ -189,8 +189,14 @@ mutate "'the apply needs the App key' — accessor added" "$MAIN" \
   's|roles/secretmanager.viewer|roles/secretmanager.secretAccessor|' reads_secrets_without_reading_values
 mutate "'state moved, easier to grant the project' — bucket scope dropped" "$MAIN" \
   's|bucket = var.state_bucket|bucket = "some-bucket"|'             scopes_state_to_one_bucket
+# The `${...}` below are TERRAFORM interpolations being matched as literal text
+# in a .tf file. Single quotes are the point: expanding them in the shell would
+# substitute empty strings, the sed would match nothing, the mutation would not
+# happen, and the mutation proof would "pass" having tested nothing.
+# shellcheck disable=SC2016
 mutate "'it fails from the release branch too' — bound to the repository" "$MAIN" \
   's|attribute.ref/\${var.allowed_ref}|attribute.repository/${var.repository}|' binds_to_one_ref_not_the_repository
+# shellcheck disable=SC2016  # terraform interpolation matched literally, as above
 mutate "'let any branch apply' — wildcard principalSet" "$MAIN" \
   's|attribute.ref/\${var.allowed_ref}|attribute.ref/*|'            binds_to_one_ref_not_the_repository
 mutate "'refs/ prefix is fiddly' — bare branch names allowed" "$VARS" \
