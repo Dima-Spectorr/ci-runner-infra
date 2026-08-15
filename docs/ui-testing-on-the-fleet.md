@@ -181,3 +181,10 @@ does still passes, it just downloads its container until the pool catches up.
 It cannot know the pin is *correct* — only that the repository tells one story
 about it. A wrong-but-consistent version fails at image build, where
 `docker pull` rejects the tag, which is the cheap place to find out.
+
+It also stops at this repository's boundary. The other half of the pin — that a
+consumer's `container:` names the same release as the `@playwright/test` in its
+`package.json` — lives in the consumer's repository, where
+[`check-e2e-policy.sh`](ci-workflow-gates.md) checks it as E2E7 and E2E8, along
+with the suite-configuration properties that keep a browser gate honest and
+fast. Adopt that gate with the suite, not after it.

@@ -310,6 +310,43 @@ continues still reports red, so nothing is loosened.
 
 ---
 
+## Where a browser suite sits in the lanes
+
+An end-to-end suite is the most expensive thing a pull request can run and the
+only thing that proves a user journey still works. Tiering it is not a nicety —
+an undifferentiated suite forces a choice between a gate nobody waits for and no
+gate at all, and repositories always pick the second.
+
+| Lane | Browser suite |
+|---|---|
+| `none` | none. A documentation edit cannot break a journey. |
+| `partial` | the `@smoke` tier: chromium only, sharded, budgeted at ≤3 min. |
+| `full` | `@smoke` on the pull request; the complete suite on the merge queue. |
+| merge queue | the complete suite, all browsers, once — the last point before `main`. |
+| nightly | the complete suite plus the slow matrix nobody should wait on. |
+
+Two things about this are easy to get wrong.
+
+**E2E is not path-scoped to `e2e/**`.** Scoping the suite to the directory the
+specs live in is the narrow-lane failure this whole document is about, wearing a
+plausible disguise: the change that breaks a journey is a change to the
+application, and the specs are the only files that did *not* change. The tier is
+chosen by lane, not by whether the diff touched a test.
+
+**The tier is chosen at the command, not in the config.** Tag at the test
+(`test('submits the application @smoke', …)`) and select at the invocation
+(`--grep @smoke --shard=…`). A config that hard-codes which tier it is has to be
+edited to run the other one, and a config edited per invocation is a config no
+gate can read — which is what `check-e2e-policy.sh` reads
+([`ci-workflow-gates.md`](ci-workflow-gates.md)).
+
+The `globalTimeout` rung in that gate is the same dequeue hazard as above,
+arriving through a file the queue never looks at: a suite with no ceiling of its
+own outlives `checks_timeout` and the pull request leaves the queue without a
+red check anywhere.
+
+---
+
 ## What a consuming repository must not do
 
 - **Do not vendor the rule.** Reference it by tag. Nine divergent copies of the

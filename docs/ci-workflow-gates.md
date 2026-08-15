@@ -1,6 +1,6 @@
 # Workflow gates a consuming repository copies in
 
-Three shell checks published from this repository, in the same shape and for
+Four shell checks published from this repository, in the same shape and for
 the same reason as `check-merge-queue-single-step.sh`: the rule is written once
 where the fleet is defined, self-tested here, and copied into each consumer so
 it runs in that consumer's own required check.
@@ -10,12 +10,20 @@ it runs in that consumer's own required check.
 | `scripts/ci/check-runner-policy.sh` | which pool a job may claim, and for how long |
 | `scripts/ci/check-action-pins.sh` | is every third-party action an immutable commit |
 | `scripts/ci/check-workflow-shell.sh` | does the shell INSIDE the YAML survive `bash -n` and shellcheck |
+| `scripts/ci/check-e2e-policy.sh` | does the browser suite report honestly, and fast |
 
-All three parse the workflow with PyYAML rather than grepping it, all three
-address every finding by exact path, and all three carry `--selftest` fixtures
-that must run BEFORE the real check — a workflow gate that reads no workflow
-reports clean, and that vacuous pass is worse than no gate because it is
-believed.
+All four address every finding by exact path, and all four carry `--selftest`
+fixtures that must run BEFORE the real check — a workflow gate that reads no
+workflow reports clean, and that vacuous pass is worse than no gate because it
+is believed.
+
+The first three parse the workflow with PyYAML rather than grepping it. The
+fourth cannot: its primary input is `playwright.config.ts`, which is TypeScript,
+and a shell gate is not going to evaluate it. It reads that file lexically and
+says so — see its "what it cannot decide" section — and treats anything it
+cannot read as a FAILURE rather than a pass, because the two error directions
+are not symmetric. A false failure costs one commit making a value literal; a
+false pass is a gate that quietly stopped gating.
 
 ---
 
@@ -380,9 +388,87 @@ schema half of actionlint remains worth having and is not this gate.
 
 ---
 
+## `check-e2e-policy.sh`
+
+```
+bash scripts/ci/check-e2e-policy.sh [--selftest] [--root=<dir>]
+                                    [--job-timeout=<minutes>]
+                                    [--image-codename=<noble>]
+                                    [<playwright.config file>...]
+```
+
+With no file arguments it finds every `playwright.config.*` within three levels
+of `--root` (default `.`), skipping `node_modules`.
+
+### Why this one is a gate and not a README
+
+Every other check in this repository catches something that eventually turns a
+run red. This one catches things that never do. That is the entire argument for
+it:
+
+| Mis-configuration | What CI reports | What actually happened |
+|---|---|---|
+| `test.only` committed | green, and fast | the suite ran one test |
+| no `globalTimeout` | *nothing* | the hung job outlived the queue's `checks_timeout` and the pull request was **dequeued**, not failed |
+| `trace: 'on'` | green | every passing test was recorded; the suite takes roughly twice as long for evidence nobody opens |
+| `container:` tag ≠ `@playwright/test` | green | the job downloaded ~2 GB of image the host already held baked, and ran one release's browsers under another release's client |
+| `reuseExistingServer: true` on CI | green | the suite tested a server the previous job left running |
+| unbounded `workers` | green | one repository's suite took the whole host and *other* repositories timed out |
+
+The dequeue row is not hypothetical for this fleet: it is the same failure the
+per-workspace < job `timeout-minutes` < `checks_timeout` ordering already exists
+to prevent, arriving through a config file no existing gate reads.
+
+### The checks
+
+| id | Asks | Why it is not tidiness |
+|---|---|---|
+| E2E0 | a suite or an E2E job exists, but no config governs it | the vacuous pass, named — "no config" is only legitimate when there is also no suite |
+| E2E1 | `forbidOnly` is set and not `false` | a committed `test.only` otherwise passes the suite by shrinking it |
+| E2E2 | `workers` is an explicit **literal** | the default is the host's core count, and a host runs several agent slots; a value that does not resolve *is* the default, behind a line that looks considered |
+| E2E3 | `expect` < test < `globalTimeout` < job `timeout-minutes` | each rung that is not below the next never binds; the top one missing is the silent dequeue |
+| E2E4 | trace/video/screenshot are failure-conditional | `'on'` records passing tests, which is pure runtime |
+| E2E5 | the reporter is machine-readable, and `blob` when sharding | an html-only report cannot be read by a gate or merged across shards, so a sharded run has N partial verdicts and no single one |
+| E2E6 | `reuseExistingServer` is off under CI | a warm host is the point of this fleet and exactly why a reused server is a stale one |
+| E2E7 | the job runs in `mcr.microsoft.com/playwright:v<x>-noble` — that codename, `--image-codename=` to override — and does not `playwright install` inside it | ~2 GB per job that every host on the pool already holds as a baked archive; `-jammy` runs and passes, it just downloads first |
+| E2E8 | that container's release equals the pinned `@playwright/test` | the one that decides whether any of the speed work survives a dependency bump |
+| E2E9 | no `waitForTimeout` / `sleep` in specs | the single largest source of both flake and wasted runtime |
+
+E2E7 and E2E8 only look at workflows that actually invoke the suite — a
+`playwright test` or an `e2e` script. Matching the *words* caught the workflow
+running this gate, whose own step is named "e2e policy", and then demanded that
+gate job run in a browser container.
+
+E2E3 only compares against the job when `--job-timeout=<minutes>` is passed: the
+job's ceiling is not knowable from the config alone, and inventing a default
+would make the check agree with itself.
+
+### Where it sits next to `check-playwright-pin.sh`
+
+The two are halves of one pin, and neither can do the other's job.
+`check-playwright-pin.sh` runs **here** and holds every
+`mcr.microsoft.com/playwright:` reference this repository publishes — the
+warm-cache bake, the composite action, the docs — to one release. It says
+outright that it cannot check the consumer's `container:` line, because that
+line lives in the consumer's repository next to the `@playwright/test` it must
+match.
+
+E2E7 and E2E8 are that half, and they run **there**. Between them: the fleet
+tells one story about which image it bakes, and each repository is held to
+running the image it actually declares a dependency on. Drift on either side is
+a green check and a slow one — the fleet bakes an archive nobody loads, or the
+job downloads two gigabytes that were already on the disk under it.
+
+[`ui-testing-on-the-fleet.md`](ui-testing-on-the-fleet.md) is the consumer-facing
+guide to the container, the pool label and the `--shm-size` it needs.
+
+---
+
 ## Adopting them
 
-1. Copy the scripts into the consumer's `scripts/ci/`.
+1. Copy the scripts into the consumer's `scripts/ci/` — the three workflow
+   gates always, and `check-e2e-policy.sh` if the repository has (or is about to
+   have) a browser suite.
 2. Wire the steps into the job behind the aggregate required check, **fixtures
    first**:
 
@@ -399,6 +485,10 @@ schema half of actionlint remains worth having and is not this gate.
         run: bash scripts/ci/check-workflow-shell.sh --selftest
       - name: workflow shell
         run: bash scripts/ci/check-workflow-shell.sh
+      - name: e2e policy self-test
+        run: bash scripts/ci/check-e2e-policy.sh --selftest
+      - name: e2e policy
+        run: bash scripts/ci/check-e2e-policy.sh --job-timeout=25
 ```
 
 3. Put them on `ubuntu-latest`, not on the pool — they are near-zero-dependency

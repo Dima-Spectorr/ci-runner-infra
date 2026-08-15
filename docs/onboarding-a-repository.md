@@ -257,6 +257,23 @@ a documentation-only pull request should not claim a slot in order to discover
 it has nothing to do. Four adoption requirements, in order, in
 [`ci-lane-model.md`](ci-lane-model.md).
 
+## 7. If the repository has browser tests
+
+Copy `scripts/ci/check-e2e-policy.sh` in alongside the other two workflow gates
+and wire it fixtures-first, per [`ci-workflow-gates.md`](ci-workflow-gates.md).
+
+Do this before the first suite lands, not after. Every failure it catches is one
+that keeps the check green — a committed `test.only`, a suite with no ceiling of
+its own being silently dequeued from the merge queue, browsers re-downloaded
+every job because the container tag drifted from the dependency pin. A suite
+that has been running for a month has already normalised whichever of those it
+has, and by then the evidence that it was ever faster is gone.
+
+Run the suite in the baked Playwright container rather than installing browsers
+on the pool — [`ui-testing-on-the-fleet.md`](ui-testing-on-the-fleet.md) is the
+consumer guide for that half — and tier it: `@smoke` on every pull request, the
+full suite on the merge queue.
+
 ## Windows
 
 The fleet's warm-host pool is **Linux only** — the golden image, the per-slot

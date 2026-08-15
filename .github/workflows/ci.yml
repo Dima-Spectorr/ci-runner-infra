@@ -204,6 +204,15 @@ jobs:
       - name: runner policy
         run: bash scripts/ci/check-runner-policy.sh --forks=allowed
 
+      # A browser suite is the one gate whose every mis-configuration is
+      # invisible in the run's status: a committed `test.only` passes over one
+      # test, a missing `globalTimeout` DEQUEUES the pull request instead of
+      # failing it, and a `container:` tag drifted from the repository's
+      # `@playwright/test` downloads ~2 GB the host already holds baked.
+      # Fixtures only here — this repository builds the image, it has no suite.
+      - name: e2e policy self-test
+        run: bash scripts/ci/check-e2e-policy.sh --selftest
+
       # A moved tag on a popular action is arbitrary code on every pool in the
       # fleet, with no pull request in any consumer to review it.
       - name: action pins self-test
