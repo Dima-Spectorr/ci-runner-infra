@@ -64,6 +64,28 @@ jobs:
       - name: workflow shell gate
         run: bash scripts/ci/check-workflow-shell.sh
 
+      # Those three sweeps read `*.sh` and `run:` blocks, and are blind to a
+      # `.ps1`. Windows hosts are driven by PowerShell, so the fleet is about to
+      # grow code that no gate in this file can read. These three steps land one
+      # pull request BEFORE the first `.ps1` does, so no window exists in which
+      # unparsed, unlinted Windows code sits on main looking gated.
+      #
+      # The install reaches PSGallery over the network, so it carries a bound.
+      # An unbounded fetch in a gate is the shape of the outage this repository
+      # spends a whole self-test file preventing on the hosts; the gate itself
+      # does not get an exemption.
+      - name: install PSScriptAnalyzer (pinned)
+        timeout-minutes: 5
+        run: |
+          pwsh -NoProfile -NonInteractive -Command \
+            "Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Repository PSGallery -Scope CurrentUser -Force"
+
+      - name: PowerShell gate self-test
+        run: bash scripts/ci/powershell-gate.sh --selftest
+
+      - name: PowerShell gate (parse + analyzer)
+        run: bash scripts/ci/powershell-gate.sh
+
       - name: drain-decision self-test
         run: bash scripts/ci/drain-decision.selftest.sh
 
