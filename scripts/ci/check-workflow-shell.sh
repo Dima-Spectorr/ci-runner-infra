@@ -295,7 +295,11 @@ check_block() {
   [ "$exact" = "1" ] || note=" (folded or plain scalar — YAML rewrote the line breaks, so this points at the block, not the line)"
 
   # WFS1 — does it parse at all. Cheap, and a syntax error makes every
-  # shellcheck message downstream of it noise.
+  # downstream shellcheck message noise.
+  #
+  # (Word order is load-bearing: a comment line beginning `# shellcheck ` IS a
+  # directive, and shellcheck rejected the earlier phrasing as an unparseable
+  # one — in this file, of all files. Caught by the gate one step above.)
   if ! out_text="$("$shell" -n "$tmp" 2>&1)"; then
     err WFS1 "$rel: job '$job' $where does not parse as $shell$note: $(printf '%s' "$out_text" | sed "s#$tmp#$rel#g" | head -3 | tr '\n' ' ')"
     rm -f "$tmp"
