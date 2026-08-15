@@ -464,6 +464,42 @@ config without which pinning becomes permanent staleness.
    job. `ci_jobs_completed{outcome="cancelled"}` is the same event after the
    fact, and a rising cancel rate with no queue-cancel activity to explain it
    points here.
+4b. **Stop a job inheriting the last job's credentials — shipped in v5.7.0.** A
+   slot user is an ordinary Linux account created once per host boot, so its
+   `$HOME` outlives every job the slot serves. Nothing cleared it, and no pool
+   set `CLOUDSDK_CONFIG`, so `setup-gcloud` — which runs
+   `gcloud auth login --cred-file=…` and makes the workload-identity account
+   gcloud's *active* account — left that credential in place for whatever job
+   landed on the slot next.
+
+   IntegrateIT paid for this continuously. `deploy.yml`,
+   `deploy-mcp-server.yml`, `cve-triage.yml` and `windows-agent.yml` all run on
+   the same pool as `pr-check.yml`, which authenticates nowhere and expects ADC
+   from the host broker. Instead its `gcloud storage` calls picked up the
+   leftover external account and failed with `Unable to retrieve Identity Pool
+   subject token … token is expired`. Every sampled run showed exactly five such
+   warnings — one cache publish, four shard pulls — so the Turbo remote cache
+   was cold on **every** run: shard 1 logged 229 `:build:` misses and 0 hits and
+   spent 10m54s of a 17m16s step rebuilding dependencies before its first test.
+
+   Worth separating the two costs, because only one of them is about speed. The
+   cache was dead, which is minutes per shard per run. The other is that a
+   deploy-capable identity sat in a shared home reachable by an arbitrary pull
+   request, and the only thing that stopped it being usable was the OIDC subject
+   token expiring. `install_job_hooks()` wires
+   `ACTIONS_RUNNER_HOOK_JOB_STARTED` and `..._COMPLETED` to a root-owned script
+   that removes the slot's `~/.config/gcloud` and `~/.gsutil` — both ends,
+   because the completed hook alone leaves a live credential on disk while the
+   slot idles and never runs at all when an agent is killed mid-job. It is
+   installed on every pool, including pools with no job service account, where
+   an inherited credential is worst because nothing there should hold Google
+   credentials at all.
+
+   The symmetric caution: a workflow that *relied* on a previous job's login now
+   fails. Nothing in this fleet does — every workflow that needs GCP either runs
+   `google-github-actions/auth` itself or uses the broker's ADC — but a repo
+   that authenticated once in a setup job and shelled out to `gcloud` in a later
+   job on the same pool would have been depending on the bug.
 5. **Ship it as the new-project baseline** via the `scaffold` skill and
    `setup-github`, so a new repo starts with lanes rather than acquiring them
    at repo #15.
