@@ -77,6 +77,23 @@ output "metric_names" {
       # lower bound, so an apparently under-scaled pool may simply not have been
       # counted.
       "ci_demand_runs_skipped",
+      # --- work, as opposed to pool ------------------------------------------
+      # Every series above describes the POOL. These two describe what it RAN,
+      # labelled by workflow, which is the only way the fleet-wide questions
+      # ("where do the runner seconds go", "which workflow is red") are
+      # answerable without reading run logs per repository by hand.
+      #
+      # Both are per-tick DELTAS on a GAUGE, like ci_drain_verdicts: align with
+      # a sum over the window, never with a mean. Both are ABSENT when nothing
+      # finished — there is no workflow name to label a zero with — so read them
+      # next to ci_poller_heartbeat, which separates an idle pool from a dead
+      # controller.
+      "ci_jobs_completed",
+      "ci_job_seconds",
+      # > 0 means completed runs went unread this tick and their outcomes are
+      # deferred, not lost. Sustained non-zero means OUTCOME_BUDGET is too small
+      # for this repository's throughput and the other two are lagging.
+      "ci_outcome_runs_skipped",
     ] : m => "${var.metric_prefix}/${m}"
   }
 }

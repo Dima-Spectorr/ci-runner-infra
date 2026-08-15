@@ -15,6 +15,30 @@
 
 TELEMETRY_BUFFER=""
 
+# ts_label_value <string> — echoes a string that is safe to paste into the JSON
+# label fragment below.
+#
+# Every label this file carried until now was a constant written by hand
+# ("drained", "aborted"). The outcome series carries workflow names, which come
+# from a repository's own YAML: arbitrary user text, reaching a JSON document
+# built by string concatenation. One `"` in a workflow name would not corrupt
+# one label — it would make the whole request unparseable and drop EVERY series
+# in that tick, including the one the autoscaler reads.
+#
+# Allowlist rather than escape. Escaping has to be right about every case
+# (quotes, backslashes, newlines, invalid UTF-8 from a truncated multi-byte
+# character); an allowlist has to be right about one. Anything outside it
+# becomes `_`, which is lossy in the harmless direction — a label that reads
+# slightly wrong beats a tick that publishes nothing.
+#
+# Capped at 64 characters because a label value is also a cardinality decision:
+# the tail of a long name is where the per-run junk lives.
+ts_label_value() {
+  local v="${1//[^A-Za-z0-9._\/ -]/_}"
+  v="${v:0:64}"
+  printf '%s' "${v:-unknown}"
+}
+
 # _ts_point <metric> <value> [<label-json-fragment>]
 _ts_point() {
   local metric="$1" value="$2" extra="${3:-}"

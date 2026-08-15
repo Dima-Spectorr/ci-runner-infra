@@ -313,6 +313,194 @@ collect_demand() {
   return 0
 }
 
+# --- outcomes ----------------------------------------------------------------
+#
+# WHAT THIS ANSWERS, AND WHY NOTHING ELSE DOES
+#
+# Every series above this line describes the POOL: how many hosts, how many
+# slots, how long the queue. None of them describes the WORK. So a fleet-wide
+# question the whole optimisation effort turns on — which workflow spends the
+# pool's seconds, and which one spends them failing — has no answer anywhere in
+# the metrics, and gets answered instead by reading run logs by hand, per repo,
+# which is why it is only ever answered for the loudest repo.
+#
+# WHY A SECOND SWEEP AND NOT A FREE RIDE ON THE DEMAND ONE
+#
+# collect_demand already holds a complete job payload for every run it examines,
+# so counting outcomes there looks free. It is not. That sweep only ever fetches
+# runs that are QUEUED or IN_PROGRESS, and a run leaves both lists the instant
+# its last job finishes — so the jobs it can count are every job EXCEPT the ones
+# that finished last, and the job that finishes last is very often the one that
+# failed. A red rate built from it would be biased in precisely the place it is
+# read.
+#
+# Completed runs are enumerated instead. A completed run is immutable and the
+# API lists it whether or not this controller ever saw it live, so the dedup key
+# is a run id, a tick this controller spent restarting is recoverable on the
+# next one, and the count does not depend on the poll interval.
+#
+# Seconds are the pool's, not GitHub's: jobs are filtered by the same
+# superset rule collect_demand uses, so a repository's GitHub-hosted jobs never
+# appear in a self-hosted pool's cost attribution.
+OUTCOME_STATE="$STATE_DIR/runs-counted"
+# Its own budget, on top of DEMAND_BUDGET. 90 + 30 stays well inside the
+# watchdog's 300s floor with the host walk and the drains still to pay for.
+OUTCOME_BUDGET=30
+# How many run ids to remember, NOT how long to remember them for. An age-based
+# cutoff looks equivalent and is not: a quiet repository's fifty most recent
+# completed runs can all be older than any sane retention, so every id would age
+# out while still being listed by the API, and the pool would republish
+# days-old outcomes as if they had just happened — a phantom burst, on a repo
+# with no activity to explain it. A count strictly greater than the page size
+# cannot do that: an id can only be forgotten after OUTCOME_KEEP later runs have
+# completed, by which point the API stopped listing it long ago.
+OUTCOME_KEEP=500
+# Seconds between sweeps. This is the one thing in the tick that is not a control
+# signal — nothing drains or scales on it — so it does not need the poll
+# interval. At the default 20s poll a per-tick sweep would spend 180 list calls
+# an hour of a 5000/hour installation budget to learn something that changes on
+# the timescale of a CI run; once every 300s costs 12 and loses nothing, because
+# a completed run stays in the 50-deep list far longer than that.
+OUTCOME_INTERVAL=300
+OUTCOME_LAST_SWEEP=0
+# Distinct workflow names to label. A workflow name is repository-authored text
+# and every distinct value is a billed time series, so the set is bounded here
+# rather than trusted; the overflow is not dropped, it is attributed to `other`.
+OUTCOME_MAX_WORKFLOWS=20
+OUTCOME_RUNS_SKIPPED=0
+declare -A OUTCOME_JOBS=()
+declare -A OUTCOME_SECONDS=()
+
+collect_outcomes() {
+  OUTCOME_JOBS=()
+  OUTCOME_SECONDS=()
+
+  local sweep_start deadline
+  sweep_start=$(date +%s)
+
+  # Not this tick's turn. The counters are deliberately NOT reset here:
+  # ci_outcome_runs_skipped keeps reporting what the last real sweep found,
+  # which is the true state of the attribution, rather than flickering to 0 on
+  # every tick in between and hiding a sustained shortfall.
+  [ $((sweep_start - OUTCOME_LAST_SWEEP)) -ge "$OUTCOME_INTERVAL" ] || return 0
+  OUTCOME_LAST_SWEEP=$sweep_start
+  OUTCOME_RUNS_SKIPPED=0
+
+  deadline=$((sweep_start + OUTCOME_BUDGET))
+
+  local runs ids
+  runs=$(gh_api "repos/$REPO_FULL/actions/runs?status=completed&per_page=50" 2>/dev/null) || return 0
+  ids=$(printf '%s' "$runs" | jq -r '.workflow_runs[]?.id' 2>/dev/null | awk 'NF && !seen[$0]++')
+  [ -n "$ids" ] || return 0
+
+  # FIRST BOOT SEEDS, IT DOES NOT BACKFILL. Without this the first tick finds
+  # fifty unseen runs, spends its whole budget fetching job lists for work that
+  # finished before this controller existed, and takes several more ticks to
+  # crawl out — publishing a burst of history as if it had just happened. The
+  # honest contract is that a pool reports the outcomes of runs that completed
+  # while it was watching.
+  if [ ! -f "$OUTCOME_STATE" ]; then
+    { local id; for id in $ids; do printf '%s %s\n' "$sweep_start" "$id"; done; } >"$OUTCOME_STATE"
+    log "outcome sweep seeded with $(printf '%s\n' "$ids" | grep -c .) already-completed run(s); outcomes are reported from now on"
+    return 0
+  fi
+
+  # Trim to the newest OUTCOME_KEEP ids before the membership test. Appended in
+  # completion order, so `tail` is newest-last and the ids dropped are the ones
+  # the API stopped listing long ago. Read fully before the file is rewritten:
+  # redirecting into a file that is also the input truncates it first.
+  local kept
+  kept=$(tail -n "$OUTCOME_KEEP" "$OUTCOME_STATE" 2>/dev/null)
+  printf '%s\n' "$kept" | awk 'NF' >"$OUTCOME_STATE"
+
+  local workflows=0
+  declare -A seen_workflow=()
+
+  local id
+  for id in $ids; do
+    grep -q " $id\$" "$OUTCOME_STATE" && continue
+
+    if ! budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME"; then
+      OUTCOME_RUNS_SKIPPED=$((OUTCOME_RUNS_SKIPPED + 1))
+      continue
+    fi
+
+    local jobs rows
+    jobs=$(gh_api "repos/$REPO_FULL/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || continue
+
+    # One line per job: workflow, conclusion, seconds. `completed_at` and
+    # `started_at` are both present on a completed job; a job that reports
+    # neither contributes 0 seconds rather than a negative number.
+    rows=$(printf '%s' "$jobs" | jq -r --argjson mine_labels "$POOL_LABELS_JSON" '
+      .jobs[]?
+      | select(.status == "completed")
+      | select( ((.labels // []) | length) > 0 )
+      | select( ((.labels // []) - $mine_labels) | length == 0 )
+      | [ (.workflow_name // "unknown"),
+          (.conclusion // "unknown"),
+          ( ( ((.completed_at // "") | if . == "" then 0 else fromdateiso8601 end)
+            - ((.started_at   // "") | if . == "" then 0 else fromdateiso8601 end) ) as $d
+            | if $d > 0 then $d else 0 end )
+        ] | @tsv' 2>/dev/null)
+
+    # Recorded whether or not it had any job of ours: the run was examined, and
+    # re-examining it every tick for the rest of the day would spend the budget
+    # that the runs we do care about need.
+    printf '%s %s\n' "$sweep_start" "$id" >>"$OUTCOME_STATE"
+    [ -n "$rows" ] || continue
+
+    local wf outcome secs
+    while IFS=$'\t' read -r wf outcome secs; do
+      [ -n "$outcome" ] || continue
+      wf=$(ts_label_value "$wf")
+      outcome=$(ts_label_value "$outcome")
+
+      if [ -z "${seen_workflow[$wf]:-}" ]; then
+        if [ "$workflows" -ge "$OUTCOME_MAX_WORKFLOWS" ]; then
+          wf="other"
+        else
+          workflows=$((workflows + 1))
+          seen_workflow[$wf]=1
+        fi
+      fi
+
+      # `${secs:-0}` and not `$secs`: an arithmetic expansion with an empty
+      # operand is a syntax error, and under `set -u`-adjacent shells a short
+      # row would abort the tick — the outcome sweep must never be able to take
+      # the scaling loop down with it.
+      secs="${secs:-0}"
+      OUTCOME_JOBS["$wf|$outcome"]=$(( ${OUTCOME_JOBS["$wf|$outcome"]:-0} + 1 ))
+      OUTCOME_SECONDS["$wf"]=$(( ${OUTCOME_SECONDS["$wf"]:-0} + ${secs%%.*} ))
+    done <<<"$rows"
+  done
+
+  [ "$OUTCOME_RUNS_SKIPPED" -gt 0 ] && log "outcome budget ${OUTCOME_BUDGET}s exhausted: $OUTCOME_RUNS_SKIPPED completed run(s) not read this tick — they are retried next tick, not lost"
+  return 0
+}
+
+# queue_outcome_series — the dimensioned points, if there are any.
+#
+# Unlike every other series here these are NOT published as a zero when nothing
+# happened, because "nothing happened" has no workflow name to label. That makes
+# absence ambiguous on its own, which is why ci_outcome_runs_skipped is
+# published unconditionally alongside ci_poller_heartbeat: heartbeat present and
+# no ci_jobs_completed means the pool ran no jobs, not that the controller died.
+#
+# Each point is the DELTA for this tick, on a GAUGE, exactly as
+# ci_drain_verdicts already is — sum it over a window to read a rate.
+queue_outcome_series() {
+  local key wf outcome
+  for key in "${!OUTCOME_JOBS[@]}"; do
+    wf="${key%%|*}"
+    outcome="${key##*|}"
+    queue_series "ci_jobs_completed" "${OUTCOME_JOBS[$key]}" \
+      "\"workflow\":\"$wf\",\"outcome\":\"$outcome\""
+  done
+  for wf in "${!OUTCOME_SECONDS[@]}"; do
+    queue_series "ci_job_seconds" "${OUTCOME_SECONDS[$wf]}" "\"workflow\":\"$wf\""
+  done
+}
+
 # --- hosts -------------------------------------------------------------------
 
 collect_runners() {
@@ -669,6 +857,13 @@ tick() {
 
   local target="$MIG_TARGET"
 
+  # Deliberately LAST, after every scaling decision this tick makes. It is the
+  # only work in the tick that nothing waits on — no host is drained and no MIG
+  # is resized on what it finds — so running it earlier would spend up to
+  # OUTCOME_BUDGET seconds delaying the flush that the autoscaler reads
+  # ci_demand from, in order to publish a number nobody is paged on.
+  collect_outcomes
+
   # One request per tick, all series together.
   queue_series "ci_demand" "$DEMAND_TOTAL"
   queue_series "ci_demand_queued" "$DEMAND_QUEUED"
@@ -706,6 +901,11 @@ tick() {
   # >0 means ci_demand is a lower bound this tick, so a pool that looks
   # under-scaled may simply not have been counted.
   queue_series "ci_demand_runs_skipped" "$DEMAND_RUNS_SKIPPED"
+  # Published on every tick, 0 included — it is what makes an ABSENT
+  # ci_jobs_completed readable as "no jobs finished" rather than "the outcome
+  # sweep never got to them".
+  queue_series "ci_outcome_runs_skipped" "$OUTCOME_RUNS_SKIPPED"
+  queue_outcome_series
   flush_series
 }
 

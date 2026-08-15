@@ -143,6 +143,15 @@ jobs:
       - name: metric contract self-test
         run: bash scripts/ci/metric-contract.selftest.sh
 
+      # The outcome series is the first one to carry a label the fleet does not
+      # write itself: a workflow name, repository-authored, reaching a JSON body
+      # built by concatenation. A single quote in one would not spoil one label
+      # — it would make the whole request unparseable and drop every series in
+      # that tick, `ci_demand` included, so the pool would stop scaling out
+      # because somebody renamed a workflow.
+      - name: outcome attribution self-test
+        run: bash scripts/ci/outcome-attribution.selftest.sh
+
       # A stale checkout applied 2026-08-14 reverted Print-Server's runner infra
       # to the retired architecture and destroyed the App-key secret. The tree was
       # CLEAN — a failed `git pull` inside a loop left an old commit checked out —
