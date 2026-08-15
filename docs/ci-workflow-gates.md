@@ -1,7 +1,7 @@
 # Workflow gates a consuming repository copies in
 
-Two shell checks published from this repository, in the same shape and for the
-same reason as `check-merge-queue-single-step.sh`: the rule is written once
+Three shell checks published from this repository, in the same shape and for
+the same reason as `check-merge-queue-single-step.sh`: the rule is written once
 where the fleet is defined, self-tested here, and copied into each consumer so
 it runs in that consumer's own required check.
 
@@ -9,11 +9,13 @@ it runs in that consumer's own required check.
 |---|---|
 | `scripts/ci/check-runner-policy.sh` | which pool a job may claim, and for how long |
 | `scripts/ci/check-action-pins.sh` | is every third-party action an immutable commit |
+| `scripts/ci/check-workflow-shell.sh` | does the shell INSIDE the YAML survive `bash -n` and shellcheck |
 
-Both parse the workflow with PyYAML rather than grepping it, both address every
-finding by exact path, and both carry `--selftest` fixtures that must run
-BEFORE the real check — a workflow gate that reads no workflow reports clean,
-and that vacuous pass is worse than no gate because it is believed.
+All three parse the workflow with PyYAML rather than grepping it, all three
+address every finding by exact path, and all three carry `--selftest` fixtures
+that must run BEFORE the real check — a workflow gate that reads no workflow
+reports clean, and that vacuous pass is worse than no gate because it is
+believed.
 
 ---
 
@@ -308,10 +310,80 @@ in the consuming workflow rather than a silent default here.
 
 ---
 
+## `check-workflow-shell.sh`
+
+```
+bash scripts/ci/check-workflow-shell.sh [--selftest] [--root=<dir>]
+                                        [--exclude=SC****]... [<file>...]
+```
+
+With no `<file>` arguments it reads every `.yml`/`.yaml` under
+`.github/workflows/` **and** every `action.yml`/`action.yaml` under
+`.github/actions/`, and fails if it finds none.
+
+| id | Rule |
+|---|---|
+| `WFS0` | the gate could not read a document, could not find shellcheck, or extracted nothing |
+| `WFS1` | every `run:` block parses under `bash -n` |
+| `WFS2` | shellcheck has nothing to say about it |
+
+A `run:` block is shell that happens to live in a `.yml`. The `shell` job here
+shellchecks every `*.sh` in the tree and read none of them — and the pull
+request that added `.github/actions/playwright-ui/action.yml` had real
+shellcheck findings in its `.sh` files sitting beside unread `run:` blocks. The
+tool catches what this project cares about; a whole class of shell was simply
+out of its reach.
+
+That class is the one with the widest blast radius, which is why it is a gate
+rather than a habit: this repository publishes actions that run in CONSUMERS'
+repositories, on their warm hosts, holding their job identity. A quoting bug
+there surfaces in a pull request whose owner did not write the line.
+
+### Line fidelity is what makes a finding actionable
+
+Each block is written to a temporary file padded with blank lines so that line
+*N* of the temp file is line *N* of the YAML, shellcheck runs `-f gcc`, and the
+path is rewritten back to the real file. A folded or plain scalar cannot be
+mapped character-for-character, so those get an explicit note instead of a
+confident wrong line — the gate says what it does not know rather than guessing.
+
+`${{ … }}` expressions are replaced character-for-character before checking, so
+line and column survive while the shell parser stops choking on a template.
+
+### The exemptions, each asserted by a fixture
+
+A non-bash `shell:`; a Windows `runs-on` without an explicit `shell: bash`
+(this fleet runs Windows pools, where the default is PowerShell); and the
+default exclusions `SC1090,SC1091,SC2154,SC2148`, extendable with `--exclude=`.
+
+SC2154 in particular is not laziness. Inside a `run:` block an unassigned
+variable is the normal case — `$GITHUB_OUTPUT`, `$GITHUB_ENV`, every job-level
+`env:` — and leaving it on buries every real finding under noise, which is the
+failure mode where a gate is technically green and actually unread.
+
+### Missing shellcheck is `WFS0`, never a pass
+
+`--allow-missing-shellcheck` exists only so a developer's local self-test can
+declare the gap out loud; CI never passes it. A gate that reports clean because
+its tool was absent is the exact vacuous pass this file opens with.
+
+### Why not actionlint
+
+actionlint does this natively and validates the workflow schema too, and it is
+the right answer for a repository that only needs to check itself. This one
+publishes its gates: fourteen repositories adopt them **by tag**, as shell they
+source, next to `lane-decision.sh` and `check-action-pins.sh` — which already
+parse workflow YAML for exactly this reason. A Go binary downloaded per
+consumer is a second supply chain to pin, in a fleet where an unpinned
+third-party artefact is the thing `check-action-pins.sh` exists to forbid. The
+schema half of actionlint remains worth having and is not this gate.
+
+---
+
 ## Adopting them
 
-1. Copy both scripts into the consumer's `scripts/ci/`.
-2. Wire four steps into the job behind the aggregate required check, **fixtures
+1. Copy the scripts into the consumer's `scripts/ci/`.
+2. Wire the steps into the job behind the aggregate required check, **fixtures
    first**:
 
 ```yaml
@@ -323,11 +395,17 @@ in the consuming workflow rather than a silent default here.
         run: bash scripts/ci/check-action-pins.sh --selftest
       - name: action pins
         run: bash scripts/ci/check-action-pins.sh
+      - name: workflow shell self-test
+        run: bash scripts/ci/check-workflow-shell.sh --selftest
+      - name: workflow shell
+        run: bash scripts/ci/check-workflow-shell.sh
 ```
 
-3. Put them on `ubuntu-latest`, not on the pool — they are zero-dependency
+3. Put them on `ubuntu-latest`, not on the pool — they are near-zero-dependency
    guards (catalog §2.2), and a gate about pool safety should not need the pool
-   to be healthy in order to run.
+   to be healthy in order to run. `ubuntu-latest` also ships shellcheck and
+   PyYAML preinstalled, which is what keeps `check-workflow-shell.sh` from
+   spending its first step installing the tool it fails closed without.
 4. Add Dependabot for the `github-actions` ecosystem in the same pull request,
    so PIN1 does not turn pinning into permanent staleness:
 
@@ -341,7 +419,8 @@ updates:
 
 ### Fleet state at adoption time (measured 2026-08-15)
 
-Both gates run in report mode over the ten locally-cloned consumers, against
+The runner-policy and action-pin gates ran in report mode over the ten
+locally-cloned consumers, against
 each repository's **default branch** (`origin/main`, or `origin/master` for
 DataRetrival and Soap-to-Rest) rather than whatever the local working copy
 held. That distinction is not pedantry: an earlier revision of this table was

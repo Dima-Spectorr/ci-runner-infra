@@ -46,6 +46,24 @@ jobs:
           # SC1090/SC1091: sourced paths are resolved at runtime on the VM.
           find . -name '*.sh' -print0 | xargs -0 shellcheck -e SC1090,SC1091
 
+      # The two steps above read every `*.sh` in the tree and nothing else — and
+      # a composite action's `run:` blocks are shell that lives in a `.yml`. The
+      # pull request that added `.github/actions/playwright-ui/action.yml` had
+      # two real shellcheck findings in its `.sh` files and several unread
+      # `run:` blocks beside them, so the tool catches what this project cares
+      # about; a whole class of shell was simply out of its reach. That shell
+      # runs in CONSUMERS' repositories, on their warm hosts, which is the least
+      # convenient place for a quoting bug to first appear.
+      #
+      # Fixtures first, as with every config gate here: `--allow-missing-shellcheck`
+      # is deliberately NOT passed, so a runner without the tool fails the gate
+      # instead of reporting a clean tree it never read.
+      - name: workflow shell gate self-test
+        run: bash scripts/ci/check-workflow-shell.sh --selftest
+
+      - name: workflow shell gate
+        run: bash scripts/ci/check-workflow-shell.sh
+
       - name: drain-decision self-test
         run: bash scripts/ci/drain-decision.selftest.sh
 
