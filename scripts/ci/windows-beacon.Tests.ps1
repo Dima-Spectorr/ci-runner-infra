@@ -1,0 +1,124 @@
+# Pester tests for the Windows liveness beacon's PURE functions.
+#
+# WHY THESE EXIST, AND WHAT THEY ARE NOT
+#
+# This repository's rule is that a gate which READS code is not a test. `v5.1.4`
+# passed every gate in `ci.yml` while every controller in the fleet died on its
+# first tick, because all of those gates read the controller's text and none of
+# them ran it. `scripts/ci/powershell-gate.sh` parses and lints the Windows
+# scripts; that is necessary and it is still only reading.
+#
+# So the decidable half of the Windows path is written as functions with no side
+# effects, and this file RUNS them -- on `ubuntu-latest`, because this repository
+# must never need the fleet to be healthy in order to fix the fleet.
+#
+# What this cannot cover is the half that only exists on a Windows host: the
+# service, the firewall exemption, Get-Process against a real worker. That half
+# is proved by the boot probe on the host, where a failure refuses registration
+# instead of serving jobs from a broken boundary.
+#
+# Dot-sourcing the script is what makes this possible, and it is why it ends
+# with `if ($MyInvocation.InvocationName -ne '.') { ... }`. That guard is a
+# requirement of the design, not a style preference.
+
+BeforeAll {
+    $repo = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+    $scripts = Join-Path $repo 'modules/ci-runner-host-pool/scripts'
+    . (Join-Path $scripts 'windows-beacon-publisher.ps1')
+}
+
+Describe 'beacon payload' {
+    # The controller parses this into epoch seconds and compares it with its own
+    # clock. A local-time or offset-bearing stamp is not an error -- it is a
+    # beacon that reads hours stale (a host that never scales in) or hours in
+    # the future (a staleness check defeated).
+    It 'is RFC3339 UTC with an explicit Z' {
+        Get-BeaconTimestamp -Instant ([DateTime]::new(2026, 8, 15, 10, 0, 0, [DateTimeKind]::Utc)) |
+        Should -Be '2026-08-15T10:00:00Z'
+    }
+
+    It 'converts a non-UTC instant rather than relabelling it' {
+        $local = [DateTime]::new(2026, 8, 15, 10, 0, 0, [DateTimeKind]::Local)
+        $stamp = Get-BeaconTimestamp -Instant $local
+        $stamp | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+        [DateTime]::Parse($stamp).ToUniversalTime().Ticks |
+        Should -Be $local.ToUniversalTime().Ticks
+    }
+
+    # Second precision, no fractional part: the controller parses this with
+    # `date -d`, and a stamp it cannot parse becomes ts=0, which
+    # `beacon_decision()` reads as `keep:unparseable-timestamp` -- a host that
+    # never scales in, on every host in the pool at once.
+    It 'carries no sub-second component for the controller to trip over' {
+        $t = [DateTime]::new(2026, 8, 15, 10, 0, 0, [DateTimeKind]::Utc).AddMilliseconds(456)
+        Get-BeaconTimestamp -Instant $t | Should -Be '2026-08-15T10:00:00Z'
+    }
+
+    It 'writes into the ci namespace on the metadata server' {
+        Get-GuestAttributeUri -Key 'workers' -Namespace 'ci' -Root 'http://169.254.169.254/computeMetadata/v1' |
+        Should -Be 'http://169.254.169.254/computeMetadata/v1/instance/guest-attributes/ci/workers'
+    }
+
+    # The three keys `beacon_decision()` reads. Spelled out here because the
+    # controller's side of this contract is a bash string literal in another
+    # file: nothing else in the build would notice them drifting apart.
+    It 'agrees with the controller on every key name' {
+        foreach ($k in @('workers', 'ts', 'boot')) {
+            Get-GuestAttributeUri -Key $k | Should -BeLike "*/guest-attributes/ci/$k"
+        }
+    }
+}
+
+Describe 'duration clamping' {
+    # Both durations reach this script from instance metadata, i.e. from a
+    # consuming repository's Terraform variables. The two values that matter are
+    # the ones that look harmless.
+    It 'leaves a sane value alone' {
+        Get-BoundedDuration -Requested 30 -Minimum 20 -Maximum 600 | Should -Be 30
+    }
+
+    # Interval 0 is a hot loop: it spins a CPU on a machine meant to be running
+    # somebody's build, and it burns the 10-queries-per-minute guest-attribute
+    # quota in the first second. Every write then fails, the beacon goes stale,
+    # and no host in the pool ever scales in again.
+    It 'refuses to turn a zero interval into a hot loop' {
+        Get-BoundedDuration -Requested 0 -Minimum 20 -Maximum 600 | Should -Be 20
+        Get-BoundedDuration -Requested -5 -Minimum 20 -Maximum 600 | Should -Be 20
+    }
+
+    # -TimeoutSec 0 is documented as INDEFINITE. One hung write and the
+    # publisher never reaches another, which is the same permanent staleness by
+    # a shorter path -- and the exact outage bounded-calls.selftest.sh exists to
+    # prevent one layer up.
+    It 'refuses to turn a zero timeout into an indefinite wait' {
+        Get-BoundedDuration -Requested 0 -Minimum 1 -Maximum 60 | Should -Be 1
+    }
+
+    It 'caps a value that would make the beacon look permanently dead' {
+        Get-BoundedDuration -Requested 86400 -Minimum 20 -Maximum 600 | Should -Be 600
+    }
+}
+
+Describe 'worker count' {
+    # Zero is the ONE value that authorises deleting the machine. It must be
+    # producible only by a successful enumeration that genuinely found nothing --
+    # never by an error path. `$null` is the "we do not know" that
+    # `Publish-BeaconOnce` turns into publishing nothing at all, which the
+    # controller then reads as a stale beacon and keeps.
+    It 'reports a number when nothing is running, not a null' {
+        Get-BeaconWorkerCount | Should -Be 0
+    }
+
+    It 'never reports zero from a failure' {
+        # Get-Process itself is what can fail -- on a real host, by access denial
+        # against a worker running as another slot's user. Exercised rather than
+        # argued about.
+        Mock -CommandName Get-Process -MockWith { throw 'access denied' }
+        # Assigned rather than piped: `$null | Should -Be $null` sends an empty
+        # pipeline and asserts nothing at all, which is how this test would
+        # pass while the function returned 0 and deleted a busy host.
+        $count = Get-BeaconWorkerCount
+        $count | Should -BeNullOrEmpty
+        0 | Should -Not -BeNullOrEmpty
+    }
+}
