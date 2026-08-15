@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.1.5"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.2.0"
   # ...
 }
 ```
@@ -201,6 +201,7 @@ distinguish from "the pool is idle".
 ## Layout
 
 ```
+modules/ci-runner-network/       the per-project firewall posture (no NAT)
 modules/ci-runner-host-pool/     the module consumers reference
   scripts/drain-decision.sh      pure scale-in rule (unit-tested)
   scripts/orphan-decision.sh     pure registration-reap rule (unit-tested)
