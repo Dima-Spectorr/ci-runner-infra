@@ -470,6 +470,386 @@ write_slot_daemon_config() {
   chmod 0600 "/home/$u/.config/docker/daemon.json"
 }
 
+# --- the dependency cache -----------------------------------------------------
+#
+# The golden image creates /opt/ci-cache, but until this layer existed nothing on
+# the host ever told a package manager the directory was there. The image's own
+# description promised "pre-warmed caches" while `packer/warm-cache/none.sh`
+# warmed nothing and no job could have used the result anyway: npm still wrote
+# ~/.npm, Go still wrote ~/go/pkg/mod, and both live in a slot HOME that is
+# private per slot and destroyed with the host. So every job on every host
+# re-downloaded the same dependency set, which is precisely the per-job cost this
+# pool exists to delete (docs/ci-optimization-catalog.md §4.2, priority 10).
+#
+# THE SHAPE OF THIS, AND WHY IT IS NOT ONE SHARED DIRECTORY.
+#
+# The obvious design — one tree, group `ci`, group-writable, every slot pointed at
+# it — is the one the image was already built for, and it is not defensible. Every
+# directory below is a place its own tool treats as ALREADY-VERIFIED input:
+# `npx` executes straight out of the npm cache, Maven skips checksum verification
+# for an artifact already in the local repository, pip does not re-hash a cached
+# wheel, NuGet verifies signatures on restore from the feed and not on a package
+# already extracted. So a writable shared tree is not a cache — it is a channel by
+# which one slot hands another slot code to run, as that slot's user, with that
+# slot's token. pnpm and uv make it worse rather than better: they HARDLINK from
+# the store into the workspace, so the two slots hold the same inode and a check
+# one slot performs can be invalidated by the other after it passed.
+#
+# That channel would cross the boundary the rest of this script exists to build —
+# separate uid, separate netns, separate container daemon per slot — and would
+# route around all of it. "One pool serves one repository" does not rescue it: a
+# fork's pull-request job and a main-branch deploy job holding the release
+# credential are the same repository and run CONCURRENTLY on one host.
+#
+# So the tree is split in two:
+#
+#   * $CACHE_MASTER (/opt/ci-cache) is the shared, root-owned, READ-ONLY master.
+#     It is what the image warms and what a future snapshot layer hydrates. No
+#     slot can write anywhere in it.
+#   * $CACHE_SLOTS/<idx> is one writable cache per slot, COPIED from the master
+#     and owned outright by that slot.
+#
+# A real copy, and not the hardlink copy (`cp -al`) that this obviously wants to
+# be. Hardlink seeding gets the security property for free — a shared root-owned
+# 0444 inode cannot be written by a slot that owns only the directory entry — and
+# it costs directory entries instead of bytes, so it was the first design here.
+# It does not work, for a reason worth writing down so nobody re-derives it:
+#
+#   `fs.protected_hardlinks=1` is the Ubuntu default, and it forbids an
+#   unprivileged process from creating a hardlink to a file it does not own
+#   unless it has BOTH read and write access to it. pnpm and uv exist to hardlink
+#   content out of their store into the workspace. A root-owned 0444 seeded file
+#   is readable and not writable, so every one of those links fails with EPERM —
+#   the tools are locked out of precisely the content the seeding exists to give
+#   them. Turning the sysctl off to make it work would remove a protection this
+#   multi-tenant host wants more than it wants the disk saving.
+#
+# So each slot gets its own bytes. Every tool then sees exactly what it sees on an
+# ordinary single-user machine — its own cache, owned by the user running it, with
+# no permission special case anywhere — which is also why this needs no per-tool
+# verification of what tolerates a foreign-owned entry. The price is disk: K slots
+# hold K copies. That price is zero today, because nothing warms the master yet;
+# it arrives with the snapshot layer, and sizing the boot disk for it belongs to
+# that change.
+CACHE_MASTER="/opt/ci-cache"
+CACHE_SLOTS="/var/lib/ci-cache"
+
+# One subdirectory per tool, named for the tool rather than for the language, so
+# a tree lifted off a host is self-describing.
+CACHE_DIRS=(npm yarn pnpm-store go-mod pip uv m2 nuget composer)
+
+# THE RULE THIS WHOLE SECTION IS BUILT ON: root never operates on a path inside a
+# directory an untrusted uid controls.
+#
+# That is the accurate form of a rule which is usually stated wrongly, including
+# in an earlier revision of this file. The folklore version — "`chown -R` follows
+# symlinks, so add -h" — is backwards on both halves. GNU chown walks with
+# FTS_PHYSICAL as soon as -R is given (coreutils src/chown.c), so the RECURSIVE
+# form has never dereferenced and -h adds nothing to it. The form that DOES
+# dereference is the plain, non-recursive one: `chown u:g some/path` where
+# `some/path` is a symlink re-owns the referent. So the dangerous call is the
+# innocuous-looking single chown, not the scary-looking recursive one — and no
+# flag makes it safe if the attacker can swap the name out from under it between
+# the check and the call.
+#
+# The structural fix is therefore ownership of the NAMESPACE, not flags on the
+# call. Every directory in which this script creates, renames or chowns an entry
+# is root-owned; a slot user owns only the leaves it needs to write:
+#
+#   $CACHE_MASTER (/opt/ci-cache)   root, read-only, shared, never slot-writable
+#   $CACHE_SLOTS  (/var/lib/ci-cache)        root 0755 — traversal only
+#   $CACHE_SLOTS/<idx>                       root 0755 — root's work area
+#   $CACHE_SLOTS/<idx>/<tool>                slot 0700 — the writable cache
+#
+# A slot can do anything it likes inside its own <tool> directories and cannot
+# create, delete or replace a name in the directory above them. Every root
+# operation below therefore happens in a namespace no slot can race.
+
+# Refuse the master outright if it holds anything a root-run recursive walk, or a
+# later `cp -a`, must not propagate. This is not defensive decoration: the script
+# is the instance's startup-script, it runs on EVERY boot over a /opt/ci-cache
+# that lives on the boot disk and survives a reset, and images before v5.10.0 ship
+# that tree group-writable — so its contents are, historically, attacker-writable
+# input.
+#
+# Deliberately NOT -xdev. Skipping other filesystems would let a bind mount under
+# the cache hide entries from the scan while `chown -R`/`chmod -R` below still
+# descend into it and re-own it. chmod has no --one-file-system at all, so the
+# scan and the walk cannot be given matching scopes; scanning everything the walk
+# will touch is the half that can actually be made true.
+cache_master_is_hostile() {
+  local bad
+  # Symlinks and setuid/setgid bits are the obvious two. The rest are here
+  # because `chmod -R go+rX` WIDENS permissions and `cp -a` preserves: a hardlink
+  # to a file outside the tree would be made world-readable in place (an
+  # unreadable /etc/shadow does not stay unreadable if something links it in
+  # here), and device, fifo and socket nodes have no business in a dependency
+  # cache. -links +1 is scoped to regular files because every directory has a
+  # link count above one by construction.
+  bad=$(find "$CACHE_MASTER" \
+    \( -type l -o -type b -o -type c -o -type p -o -type s \
+       -o -perm /6000 -o \( -type f -a -links +1 \) \) \
+    -print -quit 2>/dev/null)
+  if [ -n "$bad" ]; then
+    log "refusing $CACHE_MASTER: it holds a link, node or setuid entry ($bad)"
+    return 0
+  fi
+  # File capabilities are invisible to -perm, and `cp -a` copies xattrs, so a
+  # cap_setuid binary in the master would land in every slot's cache with its
+  # capability intact. getcap is in libcap2-bin and present on the image; if it
+  # ever is not, that is a gap to see in the log rather than to skip silently.
+  if command -v getcap >/dev/null 2>&1; then
+    # No pipe into head: this script runs under `set -o pipefail`, and head
+    # closing the pipe early can SIGPIPE getcap.
+    bad=$(getcap -r "$CACHE_MASTER" 2>/dev/null)
+    if [ -n "$bad" ]; then
+      log "refusing $CACHE_MASTER: it holds a file capability ($bad)"
+      return 0
+    fi
+  else
+    log "getcap not installed — $CACHE_MASTER not scanned for file capabilities"
+  fi
+  # A dependency cache holds content addressed by hash, never credentials. If a
+  # consumer's warm script left one behind, `chmod -R go+rX` would publish it to
+  # every uid on the host and `cp -a` would then hand a copy to every slot. Refuse
+  # rather than distribute it.
+  bad=$(find "$CACHE_MASTER" -type f \( \
+      -name '.npmrc' -o -name '.yarnrc' -o -name '.yarnrc.yml' -o -name '.netrc' \
+      -o -name '.pypirc' -o -name '.git-credentials' -o -name 'auth.json' \
+      -o -name 'settings.xml' -o -iname 'nuget.config' -o -name 'credentials' \
+    \) -print -quit 2>/dev/null)
+  if [ -n "$bad" ]; then
+    log "refusing $CACHE_MASTER: it holds what looks like a credential file ($bad)"
+    return 0
+  fi
+  return 1
+}
+
+# Make the master read-only to everything but root.
+lock_shared_cache() {
+  if cache_master_is_hostile; then
+    log "jobs will run without a seeded cache"
+    return 1
+  fi
+  # -R is what makes this walk physical; -h is belt-and-braces for the
+  # non-recursive case and costs nothing. See the rule at the top of the section.
+  # Status checked, not discarded. `go-w` leaves the OWNER write bit in place, so
+  # "root owns every entry" is now the whole of what makes the master unwritable
+  # by a slot — and images before module v5.10.0 ship this tree group-writable, so
+  # a slot-owned file in it is a reachable starting state rather than a
+  # hypothetical. A half-failed chown would leave exactly that file writable by
+  # the uid that owns it. Fail open, per this section's contract: no seeded cache
+  # is slow, a distributed one is a cross-slot channel.
+  if ! chown -Rh root:root "$CACHE_MASTER" 2>/dev/null; then
+    log "could not take ownership of $CACHE_MASTER — refusing to seed from it"
+    return 1
+  fi
+  # go-w,go+rX and NOT a-w,a+rX. The master is root-owned, so the owner write bit
+  # protects nothing here — root ignores it — but `cp -a` PRESERVES mode, so
+  # stripping it would hand every slot a copy of its own cache with no write bit
+  # on any directory: owner-`ci-sN`, mode 0555, EACCES on the first write. The
+  # bits that matter are group's and other's, and those are what this removes.
+  # +rX restores traversal and read for the slots, X being
+  # directory-or-already-executable so a data file does not become executable.
+  if ! chmod -R go-w,go+rX "$CACHE_MASTER" 2>/dev/null; then
+    log "could not seal $CACHE_MASTER read-only — refusing to seed from it"
+    return 1
+  fi
+}
+
+# Give slot $1 its own writable cache, seeded from the master.
+seed_slot_cache() {
+  local idx="$1" u d src dst
+  u=$(slot_user "$idx")
+  dst="$CACHE_SLOTS/$idx"
+
+  # ROOT-owned and slot-GROUP, mode 0710. Two separate properties, both
+  # load-bearing, and it is worth being explicit about which does what.
+  #
+  # Root OWNS it because everything below creates, renames and chowns names in
+  # $dst, and a slot that owned $dst could swap any of those names for a symlink
+  # between root's test and root's call.
+  #
+  # 0710 with the slot's group is what actually isolates one slot's cache from
+  # the others, and this is NOT belt-and-braces for the 0700 further down. That
+  # 0700 is on a directory the slot OWNS, and an owner may always chmod its own
+  # directory: one job on slot 1 running `chmod 0777` on its own cache directory
+  # would, with $dst world-traversable, hand every later job on every other slot
+  # write access to it — and a poisoned npm cache is executed by the next `npx`
+  # on slot 1 with slot 1's token. The bound has to sit on a directory the slot
+  # cannot chmod, so it sits here. The group is the slot's own single-member
+  # primary group, whose singleness provision_slot_user asserts before this runs;
+  # no r bit, because a tool opens its cache by absolute path and never needs to
+  # list the directory above it.
+  mkdir -p "$dst" || return 1
+  chown root:"$u" "$dst" || return 1
+  chmod 0710 "$dst" || return 1
+
+  # Cleared first and written last, so it means "every directory below is present
+  # and owned by this slot" rather than "seeding was attempted". It lives in the
+  # root-owned $dst, so a slot cannot forge it to be handed variables pointing at
+  # directories it cannot write.
+  rm -f "$dst/.ready"
+
+  for d in "${CACHE_DIRS[@]}"; do
+    src="$CACHE_MASTER/$d"
+    # Already seeded on an earlier boot: leave it exactly as the slot left it.
+    # Re-seeding would delete a warm cache to replace it with a colder one. The
+    # entry cannot have been substituted — $dst is root-owned — so this is the
+    # slot's own cache, poisoned only by its own earlier jobs, which is the
+    # bound the README states and the host's lifetime ends.
+    [ -d "$dst/$d" ] && continue
+    if [ -d "$src" ] && [ -n "$(ls -A "$src" 2>/dev/null)" ]; then
+      # Into a temporary name and then renamed, because the env var below names
+      # the final path: a tool that started while a half-copied tree sat there
+      # would read a truncated entry as a real one. rename is atomic, so the
+      # directory either is not there (cache miss, correct) or is complete. The
+      # staging name is in the root-owned $dst for the same reason as everything
+      # else here — in a slot-owned directory it could be pre-created as a
+      # symlink and `cp` would follow it, writing as root wherever it pointed.
+      #
+      # --no-preserve=ownership: the master is root-owned and this copy is the
+      # slot's own. Combined with the chown below it leaves no root-owned file in
+      # a tree the slot writes to, which is what keeps the tools' normal
+      # single-user assumptions true.
+      rm -rf "$dst/.seed-$d"
+      if cp -a --no-preserve=ownership "$src" "$dst/.seed-$d" 2>/dev/null; then
+        # A copy of a sealed tree arrives with the seal's modes, so the owner
+        # write bit is restored on DIRECTORIES here — a cache the tool cannot add
+        # an entry to is not a cache, it is an EACCES.
+        #
+        # BEFORE the chown, not after, and that ordering is the whole safety
+        # argument. `chmod` without -R dereferences, and `-exec … {} +` batches,
+        # so there is a real window between find's lstat and the chmod call. While
+        # the tree is still root-owned no other uid can create a name in it, so
+        # there is nothing to substitute during that window; one chown later it
+        # would be a root-privileged operation inside a uid-controlled namespace,
+        # which is the thing the rule at the top of this section forbids.
+        #
+        # Files are deliberately left alone. Go writes its module cache 0444 on
+        # purpose and owning it does not change that; every cache here is
+        # content-addressed and replaced by rename, which needs write on the
+        # parent directory and now has it.
+        find "$dst/.seed-$d" -type d -exec chmod u+rwx {} + 2>/dev/null || true
+        # Published at its final mode rather than widened-then-narrowed: a
+        # directory permission is checked at open(), so a slot that won the window
+        # between `mv -T` and a later chmod would keep a dirfd onto another slot's
+        # cache for the life of the host.
+        chmod 0700 "$dst/.seed-$d" 2>/dev/null || true
+        chown -R "$u:$u" "$dst/.seed-$d" 2>/dev/null || true
+        mv -T "$dst/.seed-$d" "$dst/$d" 2>/dev/null || rm -rf "$dst/.seed-$d"
+      else
+        rm -rf "$dst/.seed-$d"
+      fi
+    fi
+    # Either the master had nothing to give or the copy failed. Both are a cold
+    # cache, which is slow and correct; the directory still has to exist and be
+    # writable or the tool pointed at it fails instead of missing.
+    #
+    # `install -d` rather than mkdir+chown: one call that creates the directory
+    # with the right owner and mode, so there is no window in which it exists
+    # owned by root, and no separate chown to be aimed at a substituted name.
+    [ -d "$dst/$d" ] || install -d -o "$u" -g "$u" -m 0700 "$dst/$d" || return 1
+    # Unconditional, because `install -d -m 0700` above sets the mode only on the
+    # branch where it runs and a successful seed skips it, leaving the copy
+    # carrying the master's world-traversable directory mode.
+    #
+    # This is defence in depth and NOT the isolation control — the slot owns this
+    # directory and can chmod it back to 0777 whenever it likes. The bound that
+    # holds against a slot that wants to be reached is the 0710 on $dst, which
+    # only root can change. This line closes the accidental case, not the
+    # deliberate one.
+    chmod 0700 "$dst/$d" || return 1
+  done
+
+  : >"$dst/.ready" || return 1
+}
+
+provision_shared_cache() {
+  # Fails OPEN, unlike almost everything else in this script. A host with no
+  # usable cache is a SLOW host; a host that refuses to register over a cache
+  # problem is a missing host, and the pool responds to missing hosts by queueing
+  # jobs. Speed is worth less than capacity, so every failure here is logged and
+  # survived.
+  if [ ! -d "$CACHE_MASTER" ]; then
+    log "no $CACHE_MASTER on this image — jobs will run without a seeded cache (needs image v3-12-0 or later)"
+    return 1
+  fi
+  lock_shared_cache || return 1
+
+  mkdir -p "$CACHE_SLOTS" || { log "could not create $CACHE_SLOTS — jobs will run without a seeded cache"; return 1; }
+  # Root-owned traversal only. Each slot's directory one level down is root-owned
+  # 0710 with that slot's group, so a slot reaching this far still cannot enter
+  # any directory but its own — and cannot widen the one that stops it.
+  chown root:root "$CACHE_SLOTS" 2>/dev/null || true
+  chmod 0755 "$CACHE_SLOTS" 2>/dev/null || true
+
+  local i
+  for i in $(seq 1 "$SLOTS"); do
+    seed_slot_cache "$i" || log "slot $i: could not seed its cache — it will run cold"
+  done
+  log "dependency cache seeded for $SLOTS slot(s) from $CACHE_MASTER (${#CACHE_DIRS[@]} tool caches, read-only master)"
+}
+
+# The systemd `Environment=` lines that point slot $1's build tools at its own
+# cache.
+#
+# Every entry below is the variable the tool's own documentation names, and the
+# list is deliberately shorter than "every cache a CI host has". Two are EXCLUDED
+# on purpose, and each exclusion is a bug avoided rather than an oversight:
+#
+#   * GOCACHE (Go's BUILD cache) — golang/go#43645: concurrent builds sharing one
+#     GOCACHE is not safe. GOMODCACHE, the downloaded-module cache, is a
+#     different directory and is the one worth sharing, so only that is set.
+#   * RUNNER_TOOL_CACHE / AGENT_TOOLSDIRECTORY — the tool-cache library has no
+#     locking (actions/toolkit#804: two jobs extracting a JDK into one directory
+#     fail with "cannot remove ...: Directory not empty"). Per-slot seeding would
+#     in principle fix that, but the setup-* actions treat the tool cache as a
+#     place they OWN and prune, and a pruned hardlink tree is a slow rebuild for
+#     every slot rather than a shared saving. It stays per-slot and untouched.
+#
+# GOFLAGS=-modcacherw is deliberately NOT set. Go writes its module cache
+# read-only by design so that a build cannot edit a dependency after go.sum
+# verified the zip it came from — the extracted tree is never re-hashed, which is
+# why `go mod verify` exists as a separate command. In a tree shared by several
+# uids that read-only mode was the only thing standing between a hostile
+# co-tenant and an in-place edit of a module another slot compiles. Per-slot
+# caches make Go's own default both safe and sufficient, so the default stays.
+cache_env() {
+  local idx="$1" c="$CACHE_SLOTS/$1"
+  # The marker, not the directory. $c is created by the FIRST line of
+  # seed_slot_cache and the marker by its last, so testing the directory would
+  # emit all ten variables for a seeding run that failed half way — pointing a
+  # tool at a directory that is absent, or present with the wrong owner, which is
+  # a hard per-job failure rather than the cache miss this layer promises.
+  [ -f "$c/.ready" ] || return 0
+  cat <<EOF
+# npm reads any config key from a matching npm_config_* variable.
+Environment=npm_config_cache=$c/npm
+Environment=YARN_CACHE_FOLDER=$c/yarn
+# BOTH spellings, because the supported one changed: pnpm 11 reads
+# pnpm_config_store_dir and silently IGNORES the npm_config_ form it honoured
+# before — silently, meaning a single-spelling guess looks like it worked and
+# quietly stores nothing where we asked. Repositories pin their own pnpm, so
+# this host cannot assume which side of that change it is serving. The store also
+# has to sit on the same filesystem as the workspace or pnpm degrades from
+# hardlinking to copying without saying so; /var/lib and the slot work trees are
+# both on the boot disk, which is also why this is not an overlay mount.
+Environment=pnpm_config_store_dir=$c/pnpm-store
+Environment=npm_config_store_dir=$c/pnpm-store
+Environment=GOMODCACHE=$c/go-mod
+Environment=PIP_CACHE_DIR=$c/pip
+Environment=UV_CACHE_DIR=$c/uv
+# Maven has no environment variable for the local repository; the system property
+# is the supported route, and MAVEN_ARGS is how you deliver one from the
+# environment (Maven 3.9.0 and later). A repository that sets its own MAVEN_ARGS
+# overrides this, which is the correct precedence.
+Environment=MAVEN_ARGS=-Dmaven.repo.local=$c/m2
+Environment=NUGET_PACKAGES=$c/nuget
+Environment=COMPOSER_CACHE_DIR=$c/composer
+EOF
+}
+
 # --- slots --------------------------------------------------------------------
 #
 # One agent per slot, each as its own USER, in its own directory, with its own
@@ -492,15 +872,28 @@ provision_slot_user() {
     # unit would fail on an unknown group.
     useradd -m --user-group -s /bin/bash "$u" || return 1
   fi
-  # Group `ci` is how a slot reaches the shared warm cache without reaching the
-  # other slots' homes (which stay 0750 and owned by their own user).
-  getent group ci >/dev/null || groupadd ci
-  usermod -aG ci "$u" || return 1
+  # No shared supplementary group. A slot user belongs to nothing but its own
+  # single-member group: the dependency cache is delivered as a per-slot COPY
+  # (see "the dependency cache" above) rather than as one tree several uids can
+  # write, so there is nothing left for a group like `ci` to grant — and a group
+  # that grants nothing is just a boundary waiting to be widened by accident.
   # Enforce the mode rather than inherit it. HOME_MODE / UMASK in login.defs
   # decides what `useradd -m` creates, and a 0755 home is exactly the sibling
   # readability this split exists to remove — an unenforced comment is not an
   # isolation boundary.
   getent group "$u" >/dev/null || return 1
+  # The primary group must be this slot's OWN single-member group, asserted and
+  # not assumed. Everything above only creates the account when it is absent, so
+  # an image that ships a pre-made ci-sN — or a future path that creates one
+  # differently — could hand this slot a primary group it SHARES with the other
+  # slots, and then every "group" permission in this script means "all slots"
+  # instead of "nobody but me". That reading applies to the slot's own home and
+  # to its agent credentials, so it is a silent collapse of the whole per-slot
+  # boundary. Fail the slot rather than run it with the boundary gone.
+  [ "$(id -gn "$u")" = "$u" ] || {
+    log "slot $idx: primary group of $u is not $u — refusing to provision it"
+    return 1
+  }
   chown "$u:$u" "/home/$u" || return 1
   chmod 0750 "/home/$u" || return 1
 
@@ -833,8 +1226,9 @@ EOF
 # Load any container image archives the IMAGE baked into /opt/ci-images into
 # this slot's rootless daemon.
 #
-# NOT the shared cache. /opt/ci-cache is group-writable by design and documented
-# as untrusted build input; what is read here is `docker load`ed into every slot
+# NOT the dependency cache. /opt/ci-cache is copied into a writable per-slot tree
+# by design and documented as untrusted build input; what is read here is
+# `docker load`ed into every slot
 # on the host, so a job able to write it would be choosing the image every other
 # slot runs. The two trees are siblings for that reason, and this one is
 # root-owned.
@@ -851,8 +1245,9 @@ EOF
 # directory at all and pays nothing.
 #
 # /opt/ci-images is NOT under /opt/ci-cache, and that is the security boundary
-# rather than a filing choice. The shared cache is group-writable so slots can
-# update it, and everything in it is untrusted build input by design. These
+# rather than a filing choice. The dependency cache is copied per slot so each
+# can update its own, and everything in it is untrusted build input by design.
+# These
 # archives are not input: they are loaded into every slot's daemon at boot, so
 # whoever can write one is running their image in every slot on the host for
 # the rest of its life. Root-owned tree, root-owned parent, no group write.
@@ -1004,6 +1399,10 @@ install_slot() {
       "$(slot_gw_ip "$idx")" "$BROKER_PORT" "$(slot_gw_ip "$idx")" "$BROKER_PORT" "$(slot_gw_ip "$idx")" "$BROKER_PORT")
   fi
 
+  # Empty when this slot has no seeded cache, which leaves every tool on its own
+  # default under the slot's home — slower, and correct.
+  local CACHE_ENV; CACHE_ENV=$(cache_env "$idx")
+
   mkdir -p "$dir"
   # Copy, not symlink: config.sh writes .runner/.credentials into the directory
   # it runs in, and K agents must not share one identity.
@@ -1075,6 +1474,7 @@ NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
 # Joining the namespace does not carry its resolver — see the daemon drop-in.
 BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 $BROKER_ENV
+$CACHE_ENV
 # Wipe this slot's leftover cloud credential store before every job and after
 # every job. Set unconditionally, and NOT alongside BROKER_ENV: a pool with no
 # job service account is where an inherited credential is most dangerous, since
@@ -1134,6 +1534,12 @@ main() {
   for i in $(seq 1 "$SLOTS"); do
     provision_slot_user "$i" || die "could not provision the user for slot $i"
   done
+  # After the slot users, because each slot's cache is chowned to its user, and
+  # before install_slot, because that reads whether a slot has a cache to decide
+  # whether to point the agent at it. Fails OPEN: the return value is deliberately
+  # ignored.
+  provision_shared_cache || true
+
   install_dockerd_unit
   # The template must be on disk AND known to systemd before the first
   # `systemctl enable --now ci-dockerd@1`, or that call fails on a unit systemd

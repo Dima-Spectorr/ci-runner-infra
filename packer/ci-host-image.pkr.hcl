@@ -127,8 +127,8 @@ variable "warm_cache_script" {
     form every slot can read: `docker save` it into /opt/ci-images/ and
     host-startup.sh's load_baked_images() loads it into each slot's daemon at
     boot. That directory is root-owned and read-only to slots, deliberately —
-    it is not part of the group-writable /opt/ci-cache, because its contents
-    are executed rather than read. `warm-cache/playwright.sh` is that pattern, for pools that run
+    it is not part of /opt/ci-cache, which reaches every slot as a writable
+    per-slot copy, because its contents are executed rather than read. `warm-cache/playwright.sh` is that pattern, for pools that run
     browser tests.
 
     Empty = build a toolchain-only image.
@@ -322,11 +322,16 @@ build {
       "tar xzf runner.tar.gz && rm runner.tar.gz",
       "./bin/installdependencies.sh",
       "chown -R runner:runner /opt/actions-runner",
-      "mkdir -p /opt/ci/slots /opt/ci-cache && chown -R runner:runner /opt/ci /opt/ci-cache",
-      # setgid + group-write so a file one slot writes into the shared cache
-      # stays group-owned by `ci` and is usable by the next slot, whichever user
-      # that is. The slot HOMES stay private; only this tree is shared.
-      "chgrp -R ci /opt/ci-cache && chmod 2775 /opt/ci-cache",
+      "mkdir -p /opt/ci/slots && chown -R runner:runner /opt/ci",
+      # /opt/ci-cache is the READ-ONLY master cache, root-owned and writable by
+      # nobody. It is never a slot's working cache: each slot gets its own copy
+      # under /var/lib/ci-cache/<idx> at boot, because a tree several slot users
+      # can write is a channel by which one job hands another job code to run —
+      # `npx` executes out of the npm cache, Maven skips checksums for an
+      # artifact already in the local repository, pip does not re-hash a cached
+      # wheel. See host-startup.sh's "the dependency cache" section.
+      "mkdir -p /opt/ci-cache && chown -R root:root /opt/ci-cache",
+      "chmod 0755 /opt/ci-cache",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
@@ -344,21 +349,44 @@ build {
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
-  # 6b. Re-apply the shared-cache ownership AFTER warming.
+  # 6b. Seal the master cache AFTER warming.
   #
-  #     The warm script runs as root under the default umask 022, so everything
-  #     it creates under /opt/ci-cache lands 0644 / 0755 owned by root. A slot
-  #     user can then READ the warmed cache but not update it, and package
-  #     managers fail on a partially warmed tree — which reads as a broken
-  #     repository, not a broken image. Repeating the chgrp/chmod here is
-  #     cheaper than making every consumer's warm script umask-aware.
+  #     A consumer's warm script is arbitrary repo-supplied code running as root,
+  #     so what it leaves behind is not assumed: the tree is re-owned to root and
+  #     stripped of every write bit here, which is the state host-startup.sh
+  #     expects to find and copies from. Root ignores the missing write bit, so a
+  #     later warming layer still works; a slot user has read and traverse only.
+  #
+  #     The scan below is a real gate, and it is written the long way on purpose.
+  #     The obvious one-liner — `! find ... | grep -q .` — CANNOT fail a build:
+  #     `set -e` is defined to ignore the status of any command whose value is
+  #     inverted with `!`, and without `pipefail` a find that errors passes too.
+  #     So it would read as a guard, log as a guard, and ship the image anyway.
+  #     Capturing the output and testing it is what makes the build actually stop.
+  #
+  #     What it looks for is everything the two lines after it would PROPAGATE:
+  #     `chmod -R go+rX` widens permissions, so a hardlink to a file outside the
+  #     tree gets that file made world-readable in place; `cp -a` on the host
+  #     preserves xattrs, so a file capability would be handed to every slot. See
+  #     host-startup.sh's cache_master_is_hostile(), which repeats this at boot
+  #     because an image is not the only way content reaches this tree.
   provisioner "shell" {
     inline = [
-      "set -eux",
-      "chgrp -R ci /opt/ci-cache",
-      "chmod -R g+w /opt/ci-cache",
-      # setgid on directories only, so new entries keep the `ci` group.
-      "find /opt/ci-cache -type d -exec chmod g+s {} +",
+      "set -euxo pipefail",
+      "bad=$(find /opt/ci-cache \\( -type l -o -type b -o -type c -o -type p -o -type s -o -perm /6000 -o \\( -type f -a -links +1 \\) \\) -print -quit)",
+      "[ -z \"$bad\" ] || { echo \"warm cache holds a link, node or setuid entry: $bad\" >&2; exit 1; }",
+      # No pipe into head: under pipefail, head closing the pipe early can SIGPIPE
+      # getcap and abort the build over a cache that was perfectly fine.
+      "command -v getcap >/dev/null || { echo 'getcap missing: cannot scan the warm cache for file capabilities' >&2; exit 1; }",
+      "bad=$(getcap -r /opt/ci-cache 2>/dev/null)",
+      "[ -z \"$bad\" ] || { echo \"warm cache holds a file capability: $bad\" >&2; exit 1; }",
+      "chown -Rh root:root /opt/ci-cache",
+      # go-w, not a-w. The tree is root-owned, so the OWNER write bit protects
+      # nothing (root ignores it) — but the host copies this tree per slot with
+      # `cp -a`, which preserves mode, so stripping it would bake a cache no slot
+      # can write into. go+rX gives back traversal and read without making a data
+      # file executable (X is directory-or-already-executable).
+      "chmod -R go-w,go+rX /opt/ci-cache",
 
       # Baked image archives live in /opt/ci-images, NOT under /opt/ci-cache,
       # and the separation is the control rather than a tidiness choice.
@@ -366,16 +394,17 @@ build {
       # Every archive there is `docker load`ed into every slot's daemon at
       # boot, so it is EXECUTED, not read — while /opt/ci-cache is untrusted
       # build input by design (README: "a warm cache is untrusted build
-      # input") and is group-writable so slots can update it. Making the
-      # archives root-owned INSIDE that tree is not enough: write+execute on a
-      # non-sticky parent lets a job rename the whole directory away and put
-      # its own — with a matching SHA256SUMS — in its place, supplying both
-      # halves of the check. Ownership of an entry never protects it from the
-      # permissions of the directory holding it.
+      # input"), reaches every slot as a per-slot WRITABLE copy, and is the
+      # tree a snapshot hydrates into. Making the archives root-owned INSIDE
+      # that tree is not enough: a copy carries them into a directory the slot
+      # owns, and write+execute on a non-sticky parent lets a job rename the
+      # whole directory away and put its own — with a matching SHA256SUMS — in
+      # its place, supplying both halves of the check. Ownership of an entry
+      # never protects it from the permissions of the directory holding it.
       #
-      # So the archives sit in their own root-owned, non-group-writable tree.
-      # Nothing at runtime writes here; they are produced at bake time, by the
-      # warm script, as root.
+      # So the archives sit in their own root-owned tree that is never copied
+      # per slot. Nothing at runtime writes here; they are produced at bake
+      # time, by the warm script, as root.
       "if [ -d /opt/ci-images ]; then chown -R root:root /opt/ci-images && chmod 0755 /opt/ci-images && find /opt/ci-images -type f -exec chmod 0644 {} + ; fi",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"

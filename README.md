@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.9.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.10.0"
   # ...
 }
 ```
@@ -36,7 +36,7 @@ hangs rather than an error.
 | VM lifetime | one job | many jobs, hours |
 | per-job boot | 60–120 s | 0 |
 | per-job toolchain install | 1–5 min | 0 (baked) |
-| per-job dependency download | 1–4 min | ~0 (warm cache) |
+| per-job dependency download | 1–4 min | ~0 after the slot's first job (warm cache) |
 | isolation | destroy the VM | run the job in a container |
 | scale-out | autoscaler on job demand | same |
 | scale-in | VM self-deletes after its job | controller drains idle hosts |
@@ -226,17 +226,115 @@ means the recycle is working and the hosts are not leaving — jobs that never e
   first. Each slot's dockerd runs with `PrivateTmp=yes` and its runner agent
   joins that same namespace, so `docker run -v /tmp/x:/x` still mounts the file
   the step just wrote instead of an empty directory.
-* **The shared warm cache is still shared, on purpose.** `/opt/ci-cache` is
-  group-writable to `ci`, which every slot user joins — **from image `v3-12-0`
-  on**. `v3-11-0` warms the tree as root under umask 022, so the slots can read
-  it and none can update it; a package manager refreshing a partially warmed
-  cache fails there, looking like a flaky upstream repository. That is the
-  speed-up, and
-  it is why a pool serves one repository (see the first rule) — a poisoned cache
-  entry reaches the next job either way.
+* **The dependency cache is shared read-only and written per slot.** The tree
+  splits in two. `/opt/ci-cache` — **from image `v3-12-0` on** — is the master:
+  root-owned, stripped of group and other write, shared by all slots and writable
+  by none of them. `/var/lib/ci-cache/<idx>/<tool>` is one private cache per slot
+  and tool, owned by that slot user, copied from the master at boot, and it is
+  what the slot's package managers are actually pointed at.
+
+  **What separates one slot's cache from another's is `/var/lib/ci-cache/<idx>`,
+  not the cache directory itself.** That parent is `root:ci-s<idx>` mode `0710`:
+  root owns it, the slot's own single-member group is the only other principal
+  that may traverse it, and nothing can list it. The tool directory inside it is
+  `0700` too, but that mode is defence in depth and cannot be the bound — the
+  slot *owns* it, and an owner may always `chmod 0777` its own directory. A job
+  that did so on a world-traversable parent would leave its cache writable by
+  every later job on every other slot, and a poisoned npm cache is executed by
+  the next `npx` that reads it, as that slot's user, with that slot's token. The
+  control has to sit on a directory the job cannot change, so it does.
+
+  The master's seal takes `go-w` and deliberately **not** `a-w`. On a root-owned
+  tree the owner write bit protects nothing — root ignores it — but `cp -a`
+  preserves mode, so stripping it hands every slot a copy of its own cache with
+  no write bit on any directory: `EACCES` on the first install, from the copy
+  whose entire purpose is to make that install unnecessary.
+
+  **The directory *above* those is root's, not the slot's**, and that is a
+  security boundary rather than tidiness. Root creates, renames and chowns names
+  in `/var/lib/ci-cache/<idx>` on every boot; if the slot owned it, the slot
+  could swap any of those names for a symlink between root's test and root's
+  call and have root re-own the target. The usual statement of this hazard —
+  "`chown -R` follows symlinks, add `-h`" — is backwards on both halves: GNU
+  chown walks physically as soon as `-R` is given, and the form that *does*
+  dereference is the plain `chown u:g path`. No flag fixes that if the path can
+  be substituted, so the invariant here is about who owns the namespace, not
+  about which flags the call carries.
+
+  **One shared writable tree was the obvious design and it is not defensible.**
+  Every directory in a dependency cache is a place its own tool treats as
+  already-verified input: `npx` executes straight out of the npm cache, Maven
+  skips checksum verification for an artifact already in the local repository,
+  pip does not re-hash a cached wheel, NuGet verifies signatures on restore from
+  the feed and not on a package it has already extracted. So a tree several slot
+  users can write is not a cache — it is a channel by which one job hands another
+  job code to run, as that slot's user and with that slot's token, routing around
+  the separate uid, netns and container daemon the rest of this page describes.
+  "A pool serves one repository" does not rescue it: a fork's pull-request job
+  and a `main` deploy job holding the release credential are the same repository
+  and run *concurrently* on one host.
+
+  **The copy is a real copy, not a hardlink**, which costs disk in exchange for
+  ordinary single-user semantics — K slots hold K copies, so `slots_per_host`
+  multiplies the cache's footprint and `boot_disk_size_gb` has to carry it.
+  Hardlink seeding (`cp -al`) looks strictly better and is not: `fs.protected_hardlinks=1`
+  lets an unprivileged process link a file only if it owns it or can *write* it,
+  so the root-owned read-only inodes that make sharing safe are exactly the ones
+  a slot may not link — and pnpm and uv hardlink out of their stores into the
+  workspace as their normal mode of operation. pnpm degrades to a silent full
+  copy, uv can fail outright. Each slot owning its own copy removes the question.
+
+  **Which caches are wired is a shorter list than it looks.** Nine are:
+  npm, Yarn, pnpm's store, Go's *module* cache, pip, uv, Maven, NuGet, Composer.
+  Three are deliberately left alone. `GOCACHE`, Go's build cache, is not safe for
+  concurrent builds (golang/go#43645) and is a different directory from
+  `GOMODCACHE`. The Actions tool cache (`RUNNER_TOOL_CACHE`) has no locking at
+  all (actions/toolkit#804), and the `setup-*` actions treat it as a directory
+  they own and prune, so seeding it would buy a rebuild rather than a saving.
+  Gradle's `GRADLE_RO_DEP_CACHE` requires that nothing writes to it while builds
+  read it, which a slot's own live cache is not.
+
+  Go gets no `GOFLAGS=-modcacherw`. Go writes its module cache read-only by
+  design, because `go.sum` authenticates the module *zip* at download and the
+  build then compiles from the extracted tree without re-hashing it — that
+  read-only mode is the extracted tree's only protection, and per-slot caches
+  make Go's own default both safe and sufficient.
+
+  **A `container:` job gets no cache reuse.** These are systemd `Environment=`
+  lines on the agent unit, and the runner passes only the workflow's own
+  `container.env` (plus `HOME` and proxy vars) to `docker create` — nothing
+  sweeps the worker's process environment into a job container. So a container
+  job downloads its dependencies as before. It is not broken by this, just not
+  helped: no variable reaches it pointing at a path it cannot write.
+
+  **None of this can stop a host registering.** The cache layer fails open, alone
+  among the boot steps here: a pool answers a *missing* host by queueing jobs and
+  a *slow* host by being slow, so a cache fault is allowed to cost wall time and
+  never capacity. On an image with no `/opt/ci-cache` the host emits no cache
+  variables at all rather than variables pointing at a directory that is not
+  there — the latter is a hard per-job failure, i.e. a missing speed-up turned
+  into a broken pool.
 * **A warm cache is untrusted build input.** A poisoned cache entry survives to
-  the next job, which the old destroy-per-job model made impossible. Caches are
-  scoped per repository and rebuilt with the image.
+  the next job, which the old destroy-per-job model made impossible. Three
+  bounds keep that survival finite. A pool serves one repository, so an entry can
+  only reach jobs from the repository that produced it. The writable cache is per
+  slot, so it reaches *later jobs on that slot* and never a job running beside it
+  — that is the bound the rejected shared tree did not have. And it lives on the
+  host's own disk: `/var/lib/ci-cache` is built at boot, survives a reboot, and
+  dies when the instance is deleted, so a poisoned entry cannot outlive a
+  recycle.
+
+  Read the second bound precisely: agents are **not** `--ephemeral`, so "later
+  jobs on that slot" includes a `main` deploy job holding the release credential
+  running after a fork's pull-request job. That is not new — a slot's `~/.npm`,
+  `~/go/pkg/mod` and `~/.m2` already persisted across jobs in its `$HOME` — and
+  it is not what this layer changed. What this layer refused to do is widen it
+  from *later* to *concurrent*, which is what one shared writable tree would have
+  meant. Narrowing it further is an ephemeral-agent decision, not a cache one.
+
+  Any future layer that persists a cache off-host has to replace the third bound
+  with an explicit one — a maximum accepted snapshot age, not an implicit
+  lifetime.
 
 ## Telemetry
 
