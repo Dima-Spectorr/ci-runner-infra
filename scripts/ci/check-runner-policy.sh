@@ -289,9 +289,23 @@ RUNS_ON_ROUTES = re.compile(
 # fork guard route fork code onto the fleet while this gate called it safe.
 # Anything outside the family is treated as a self-hosted label — the direction
 # that over-reports rather than the one that opens the boundary.
+#
+# "Finite family" has to mean the versions GitHub actually ships, not any
+# number: `\d+(?:\.\d+)?` accepted `ubuntu-1`, `ubuntu-2204`, `windows-11` and
+# `macos-14.0`, none of which is a hosted image and every one of which is an
+# ordinary self-hosted naming convention. So each OS carries its own version
+# shape — Ubuntu ships LTS only (`24.04`), Windows a year (`2022`) or the ARM
+# preview, macOS a bare major (`15`).
+#
+# The list goes stale in the SAFE direction, on purpose: an image GitHub adds
+# later reads as self-hosted until this line is updated, which costs one
+# reported job. The other direction costs the boundary.
 HOSTED_IMAGE = re.compile(
-    r"^(?:ubuntu|windows|macos)-(?:latest|\d+(?:\.\d+)?)"
-    r"(?:-(?:arm|arm64|large|xlarge|xl|intel))?$",
+    r"^(?:"
+    r"ubuntu-(?:latest|\d{2}\.04)"
+    r"|windows-(?:latest|20\d{2}|11-arm)"
+    r"|macos-(?:latest|\d{2})"
+    r")(?:-(?:arm|arm64|large|xlarge))?$",
     re.IGNORECASE,
 )
 
@@ -846,6 +860,53 @@ jobs:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # A version-shaped suffix is not a version GitHub ships. `ubuntu-2204` is the
+  # dotless spelling a fleet uses for its own pool, `windows-11` is a desktop
+  # nobody hosts runners on, and `macos-14.0` is a point release where the
+  # hosted label is `macos-14`. Each was read as hosted by `\d+(\.\d+)?`, which
+  # skipped every isolation check on the job carrying it.
+  expect "a dotless Ubuntu version is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-2204
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "a bare Windows desktop version is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: windows-11
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "a macOS point release is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: macos-14.0
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # …and the shapes GitHub does ship stay hosted, so the tightening is not just
+  # "report everything".
+  expect "the shipped Windows and macOS images stay hosted" "" "" allowed \
+'on: [pull_request]
+jobs:
+  win:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  arm:
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  mac:
+    runs-on: macos-latest-xlarge
     timeout-minutes: 30
     steps: [{run: "true"}]'
 
