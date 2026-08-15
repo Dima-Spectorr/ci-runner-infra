@@ -350,6 +350,53 @@ write_slot_docker_config() {
   chmod 0600 "/home/$u/.docker/config.json"
 }
 
+# --- container MTU ------------------------------------------------------------
+#
+# THE FAULT (Borsh-Tablet-App, the run after the registry fix): a Gradle build
+# failed with
+#
+#   Plugin [id: 'org.cyclonedx.bom', version: '3.3.0'] was not found
+#
+# and, one step earlier, `Client network socket disconnected before secure TLS
+# connection was established`. Both are the same fault, and neither of them says
+# what it is. The same URL fetched fine from the host and fine from the job's own
+# container on a second attempt — which is the tell, because a blocked
+# destination fails every time and this one failed by size.
+#
+# The VM's interfaces are MTU 1460 (the GCE default) and setup_slot_netns already
+# matches the veth pair to it. The BRIDGE the daemon then creates inside that
+# namespace does not inherit it: dockerd defaults to 1500, so a container emits
+# 1500-byte frames onto a path whose next hop takes 1460. They are dropped, and
+# because the drop happens mid-handshake what the client reports is a truncated
+# TLS stream — never a size error. Small responses complete, large ones do not,
+# so the same build fails in a different place each run.
+#
+# TWO KEYS, because `mtu` is not the one that matters here. Measured on a live
+# host with docker 29.7.2: with `mtu` alone the default `docker0` bridge comes up
+# at 1460 and a `docker network create` bridge still comes up at 1500 — and the
+# network the runner creates for a `container:` job (`github_network_*`) is
+# exactly the second kind, so the setting that looks like the fix changes nothing
+# a job can observe. `default-network-opts` supplies the per-driver default that
+# those networks inherit. `mtu` is kept for the default bridge, which a job that
+# runs `docker run` without a network still lands on.
+#
+# Read from the primary interface, not written as 1460: an image or estate with
+# jumbo frames or a tunnel would be given the wrong number by a literal, and the
+# wrong number here fails exactly as invisibly as the default did.
+write_slot_daemon_config() {
+  local idx="$1" u mtu
+  u=$(slot_user "$idx")
+  mtu=$(primary_mtu)
+  [ -n "$mtu" ] || return 1
+
+  install -d -o "$u" -g "$u" -m 0700 "/home/$u/.config"
+  install -d -o "$u" -g "$u" -m 0700 "/home/$u/.config/docker"
+  printf '{\n  "mtu": %s,\n  "default-network-opts": {\n    "bridge": { "com.docker.network.driver.mtu": "%s" }\n  }\n}\n' \
+    "$mtu" "$mtu" >"/home/$u/.config/docker/daemon.json"
+  chown "$u:$u" "/home/$u/.config/docker/daemon.json"
+  chmod 0600 "/home/$u/.config/docker/daemon.json"
+}
+
 # --- slots --------------------------------------------------------------------
 #
 # One agent per slot, each as its own USER, in its own directory, with its own
@@ -404,6 +451,11 @@ provision_slot_user() {
   # without it pulls anonymously — which fails at "Initialize containers",
   # before any step of the job runs.
   write_slot_docker_config "$idx" || return 1
+
+  # …and the daemon's own config, which must exist before ci-dockerd@$idx starts:
+  # `mtu` is read at daemon start, so writing it later leaves the running daemon
+  # — and every network it has already created — on the wrong one.
+  write_slot_daemon_config "$idx" || return 1
 }
 
 # --- per-slot network namespace ----------------------------------------------

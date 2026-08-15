@@ -245,6 +245,35 @@ has_registry_credentials() { # <file>
   matches "$code" 'write_slot_docker_config "\$idx"[[:space:]]*\|\|[[:space:]]*return 1'
 }
 
+# The container bridge must be born on the host's MTU.
+#
+# The veth pair is already matched to it; the bridge dockerd creates inside the
+# namespace is not, and defaults to 1500 against a 1460 path. What that produces
+# is not a size error but a truncated TLS stream — "socket disconnected before
+# secure TLS connection was established", or a dependency that "was not found" —
+# on large responses only, so the same build fails somewhere new each run.
+has_container_mtu() { # <file>
+  local code
+  code=$(code_of "$1")
+  # set on the DAEMON, so it becomes the default for the per-job
+  # `github_network_*` bridge the runner creates and this script never sees
+  matches "$code" 'daemon\.json' || return 1
+  matches "$code" '"mtu"' || return 1
+  # …and the per-driver default, which is the one the per-job network reads.
+  # `mtu` alone leaves a `docker network create` bridge at 1500 — measured, on a
+  # host, with docker 29.7.2 — and that is precisely the network the runner makes
+  # for a `container:` job, so the obvious key alone fixes nothing observable.
+  matches "$code" 'default-network-opts' || return 1
+  matches "$code" 'com\.docker\.network\.driver\.mtu' || return 1
+  # from the primary interface, not a literal: a literal is wrong on any estate
+  # with jumbo frames or a tunnel, and wrong here is invisible
+  matches "$code" 'mtu=\$\(primary_mtu\)' || return 1
+  ! matches "$code" '"mtu": *1460' || return 1
+  # written before the daemon starts — `mtu` is read at start, so a later write
+  # leaves the running daemon and its existing networks on the old value
+  matches "$code" 'write_slot_daemon_config "\$idx"[[:space:]]*\|\|[[:space:]]*return 1'
+}
+
 # The helper carries the trap it was written to avoid, so it is tested first.
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -306,6 +335,12 @@ else
   bad "job containers are pulled without credentials — every job whose image comes from a private registry fails at 'Initialize containers' with 'Unauthenticated request ... downloadArtifacts', or the helper is wired at every registry rather than Google's alone"
 fi
 
+if has_container_mtu "$SCRIPT"; then
+  ok
+else
+  bad "job containers get dockerd's default 1500-byte MTU on a 1460-byte path — large TLS responses are black-holed and surface as a truncated handshake or a dependency that 'was not found', in a different place each run (Borsh-Tablet-App, first green pool run)"
+fi
+
 # --- mutation cases: prove the checks above can actually fail -----------------
 mutate() { # <description> <sed-program> <predicate> — predicate must go false
   local desc="$1" prog="$2" pred="$3" tmp
@@ -358,6 +393,13 @@ mutate "helper widened to every registry" 's|"credHelpers"|"credsStore": "cijob"
 mutate "back to a wildcard key"           's|\${HOST_REGION}-docker.pkg.dev|"*.pkg.dev"|'                          has_registry_credentials
 mutate "helper install not fatal"         's|\|\| die .could not install the registry credential helper.*|\|\| true|' has_registry_credentials
 mutate "slots left without the config"    's|write_slot_docker_config "\$idx" \|\| return 1|:|'                     has_registry_credentials
+
+mutate "daemon MTU config removed"        's|daemon\.json|daemon.txt|g'                                            has_container_mtu
+mutate "MTU key dropped"                  's|"mtu"|"debug"|'                                                       has_container_mtu
+mutate "per-driver default dropped"       's|default-network-opts|default-address-pools|'                          has_container_mtu
+mutate "driver MTU option dropped"        's|com\.docker\.network\.driver\.mtu|com.docker.network.driver.name|'    has_container_mtu
+mutate "MTU hardcoded"                    's|mtu=\$(primary_mtu)|mtu=1460|'                                        has_container_mtu
+mutate "slots left on the default MTU"    's|write_slot_daemon_config "\$idx" \|\| return 1|:|'                    has_container_mtu
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

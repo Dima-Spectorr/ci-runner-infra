@@ -44,7 +44,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.3.1"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.3.2"
 
   project_id         = var.project_id
   network            = var.network
@@ -53,7 +53,7 @@ module "ci_runner_network" {
 }
 
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.3.1"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.3.2"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -62,7 +62,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.3.1"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.3.2"
 
   project_id = var.project_id
   region     = var.region
@@ -117,8 +117,9 @@ database at all sets `database_egress_ports = []` and no rule is created.
 `jobs.<id>.container` and `services:` images are pulled by the slot's own
 rootless daemon, which authenticates as the **JOB** account — the same identity
 the job itself gets, not the host's. The hosts install a credential helper for
-`*.pkg.dev` and `gcr.io` automatically, so nothing is needed in the workflow, but
-the JOB account still needs read access to the registry:
+their own region's Artifact Registry and the Container Registry hosts
+automatically, so nothing is needed in the workflow, but the JOB account still
+needs read access to the registry:
 
 ```hcl
 resource "google_artifact_registry_repository_iam_member" "job_pull" {
@@ -134,6 +135,12 @@ Without it the job fails at **Initialize containers**, before any step runs, wit
 `Unauthenticated request ... "artifactregistry.repositories.downloadArtifacts"`.
 Grant it to the JOB account and never to the host account — that one can read the
 GitHub App private key.
+
+If the image lives in **another region or project**, add its hostname to the pool
+module's `extra_registry_hosts`. Docker matches credential helpers by exact
+hostname, so a pattern (`*.pkg.dev`) is never consulted — the pull goes out
+anonymous and fails with the same message as a missing grant, which is the more
+expensive of the two to diagnose.
 
 **Do not vendor the modules.** A drift gate
 (`scripts/ci/check-no-vendored-ci-module.sh`) fails CI if a local
@@ -266,3 +273,4 @@ host.
 | pool never scales in | the IAP firewall tag: the drain proves a host idle over IAP-SSH, and a host outside the rule fails that probe |
 | pool never scales out | the controller's demand labels, and `max_hosts` |
 | first host never registers | the App key secret version (§3) |
+| a build fails on a different download each run | container MTU. The hosts set the slot daemon's `mtu` from the primary interface, so this should not recur; a fork that dropped it black-holes large TLS responses and reports them as a truncated handshake or a "not found" dependency, never as a size error |
