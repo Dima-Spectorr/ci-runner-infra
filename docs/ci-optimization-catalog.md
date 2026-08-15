@@ -415,9 +415,35 @@ config without which pinning becomes permanent staleness.
 3. **Budget the always-on set.** A PR that adds a new unconditional required
    job should have to justify it, in the same shape as the existing
    `Resident instruction context within budget` gate.
-4. **Measure per-lane runner-minutes.** `modules/ci-runner-host-pool/scripts/telemetry.sh`
-   already reports from the hosts; emitting lane and repo turns the next round
-   of this work into measurement instead of audit.
+4. **Measure where the seconds go — shipped in v5.5.0.** Every series the pool
+   published described the *pool*: hosts, slots, queue depth. None described the
+   *work*, so "which workflow spends the runner seconds, and which one spends
+   them failing" was answerable only by reading run logs by hand, per
+   repository — which is why it had only ever been answered for the loudest one.
+   The controller now publishes `ci_jobs_completed{workflow,outcome}` and
+   `ci_job_seconds{workflow}` for every job it actually ran.
+
+   Three properties are worth knowing before reading them:
+
+   * **The unit is a job on this pool, not a job in the repo.** The same
+     superset rule that bounds demand bounds cost, so a repository's
+     GitHub-hosted jobs never appear in a self-hosted pool's attribution.
+     Otherwise the numbers would recommend warming a cache for work that never
+     touches a warm host.
+   * **Outcomes are read from the completed-runs list, not from the demand
+     sweep.** The demand sweep holds a full job payload already, so counting
+     there looks free — but it only ever fetches runs that are queued or in
+     progress, and a run leaves both lists the instant its last job finishes.
+     It can see every job except the ones that finished last, and the job that
+     finishes last is very often the one that failed. A red rate built that way
+     is biased exactly where it is read.
+   * **The label is a workflow, not a lane.** The lane verdict (§ below,
+     `scripts/ci/lane-decision.sh`) is computed inside the workflow; the
+     controller never sees it. Attributing seconds to `full` / `partial` /
+     `none` needs the workflow to report its own verdict, which is item 1 of
+     this section, not this one. Workflow-level attribution is what is
+     available without a cross-boundary contract, and it already answers where
+     to spend next.
 5. **Ship it as the new-project baseline** via the `scaffold` skill and
    `setup-github`, so a new repo starts with lanes rather than acquiring them
    at repo #15.
