@@ -125,6 +125,10 @@ jobs:
           . $p
           Write-Output "   Get-BeaconTimestamp -> $(Get-BeaconTimestamp)"
           Write-Output "   Get-BoundedDuration -> $(Get-BoundedDuration -Requested 0 -Minimum 20 -Maximum 600)"
+          $b = './modules/ci-runner-host-pool/scripts/windows-host-startup.ps1'
+          Write-Output "3) boot script imports and runs no phase"
+          . $b
+          Write-Output "   Test-ImageVersion 3/3 -> $(Test-ImageVersion -Marker '3' -Floor 3)"
 
       - name: Windows script tests (Pester)
         shell: pwsh
@@ -135,7 +139,7 @@ jobs:
           $cfg.Run.PassThru = $true
           $cfg.Output.Verbosity = 'Detailed'
           $r = Invoke-Pester -Configuration $cfg
-          $floor = 15
+          $floor = 28
           Write-Output "pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.TotalCount) discovered"
           if ($r.TotalCount -lt $floor) {
             throw "Pester discovered only $($r.TotalCount) test(s), fewer than the $floor this suite is known to contain — the suite did not run, whatever the exit code says"
