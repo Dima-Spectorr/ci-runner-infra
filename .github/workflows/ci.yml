@@ -118,6 +118,16 @@ jobs:
       # discovered in the fourteen repositories that consume it.
       - name: lane-decision self-test
         run: bash scripts/ci/lane-decision.selftest.sh
+
+      # The lane rule decides how much CI to run; this one decides whether to
+      # run it AT ALL, by claiming a lane's inputs are byte-identical to a tree
+      # already tested. A wrong verdict here is a green light over code nobody
+      # tested — strictly worse than paying for the run, and invisible, because
+      # the pull request looks like one whose checks passed. Every detector is
+      # proved to fire on a fixture before this repository's own trees would be
+      # believed.
+      - name: suite-reuse-key self-test
+        run: bash scripts/ci/suite-reuse-key.selftest.sh
       # The real guard is a variable `validation`, but terraform evaluates
       # module-input validation only at PLAN time — `terraform validate` below
       # passes a root that shares one account between hosts and controller. So
