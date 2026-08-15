@@ -1,0 +1,140 @@
+name: Publish tag
+
+# `VERSION` says which version this repository publishes; a git tag is what a
+# consumer can actually pin. Nothing connected the two, so the connection was a
+# human remembering to tag the merge commit — and it lapsed. Tags stopped at
+# v5.3.2 while `VERSION` said v5.7.0: v5.4.0, v5.5.0 and v5.6.0 merged, passed
+# every gate, updated every documented pin, and were unreachable. Four minor
+# versions of work that no consumer could adopt, and every `?ref=` in the
+# README named a tag that did not exist.
+#
+# `docs-pins.selftest.sh` could not catch it: it asserts the docs against
+# `VERSION`, and it is deliberately not asserted against `git tag` because at
+# pull-request time the tag being released does not exist yet. `release-tag.yml`
+# could not catch it either — it validates a tag that was pushed, and the whole
+# failure is that none was. The gap is only visible from main, after the merge,
+# which is where this runs.
+#
+# Deliberately NOT filtered on changes to `VERSION`. The filter would express
+# "tag when a release lands", which is the same promise the human made and
+# broke: one push that slips through the filter leaves the version untagged
+# forever, and nothing looks again. Running on every push and creating only what
+# is missing means a version that was somehow skipped is tagged by the next
+# push to touch the repository, at the commit main currently claims to publish.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+# Not cancel-in-progress: a cancelled run is a version left untagged, which is
+# the failure this exists to prevent. Two pushes in flight serialise instead,
+# and the second finds the tag already there.
+concurrency:
+  group: publish-tag
+  cancel-in-progress: false
+
+jobs:
+  publish-tag:
+    name: Tag what VERSION claims
+    # GitHub-hosted, like the rest of this repo's CI: the repository that
+    # defines the self-hosted fleet must not need the fleet to release.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: create the tag named by VERSION, if it does not exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          want=$(tr -d '[:space:]' < VERSION)
+
+          # Same shape assertion as docs-pins: an unshaped VERSION would create
+          # a ref named after whatever the file happened to contain, and a bad
+          # tag cannot be moved once a consumer has pinned it.
+          if ! printf '%s' "$want" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::VERSION is '$want', which is not vMAJOR.MINOR.PATCH — refusing to create a tag from it."
+            exit 1
+          fi
+
+          if have=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$want" --jq '.object.sha' 2>/dev/null); then
+            # Already published. Not an error even when it points elsewhere: the
+            # tag is the release and the release already happened, so moving it
+            # would change what a consumer already pinned. release-tag.yml is
+            # what asserts a pushed tag sits at a commit whose VERSION matches.
+            echo "$want already exists at $have — nothing to publish."
+            exit 0
+          fi
+
+          # Annotated, not lightweight: the tagger date is when the version was
+          # published, which is the one fact a lightweight tag cannot carry and
+          # the first thing anyone asks when auditing what the fleet was running.
+          obj=$(gh api "repos/$GITHUB_REPOSITORY/git/tags" \
+                  -f tag="$want" \
+                  -f message="$want" \
+                  -f object="$GITHUB_SHA" \
+                  -f type=commit \
+                  --jq '.sha') || {
+            echo "::error::could not create the tag object for $want"
+            exit 1
+          }
+
+          # 422 here means another run won the race between the read above and
+          # this write — the tag exists, which is the outcome we wanted.
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+                 -f ref="refs/tags/$want" -f sha="$obj" >/dev/null 2>&1; then
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$want" >/dev/null 2>&1; then
+              echo "$want was created concurrently — nothing to do."
+              exit 0
+            fi
+            echo "::error::could not create refs/tags/$want at $GITHUB_SHA"
+            exit 1
+          fi
+
+          echo "published $want at $GITHUB_SHA"
+
+      - name: move the floating major tag to the version just published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          want=$(tr -d '[:space:]' < VERSION)
+          major="${want%%.*}"
+
+          # `v5` alongside `v5.7.0`, the same contract `actions/checkout@v4`
+          # offers. A consumer that pins the exact version decides when to move
+          # and pays a pull request per release across nine repositories; a
+          # consumer that pins the major tag adopts at its next apply and pays
+          # none. Publishing both makes that a choice each repository makes for
+          # itself instead of one this repository makes for all of them.
+          #
+          # Only ever moved forward to what VERSION names, and only within a
+          # major: the promise is "the newest v5", not "the newest anything", so
+          # a breaking release cannot arrive at a consumer that never asked for
+          # it.
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$want" --jq '.object.sha') || {
+            echo "::error::$want does not exist — the step above should have created it"
+            exit 1
+          }
+
+          # Force, unlike the exact tag: a floating tag that could not be moved
+          # would be pinned to the first release of the major forever, which is
+          # worse than not publishing it at all.
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$major" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" \
+              -F sha="$sha" -F force=true >/dev/null || {
+              echo "::error::could not move $major to $want"
+              exit 1
+            }
+            echo "moved $major to $want"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$major" -f sha="$sha" >/dev/null || {
+              echo "::error::could not create $major at $want"
+              exit 1
+            }
+            echo "created $major at $want"
+          fi

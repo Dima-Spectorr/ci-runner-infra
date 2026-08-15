@@ -298,14 +298,33 @@ a `.mergify.yml`-only change to reach it.
 ## Releasing a version
 
 `VERSION` holds the tag this repository currently publishes. Bump it **in the
-same pull request as the change being released**, then tag the merge commit with
-that exact string. CI asserts that every module pin printed in the documentation
-names the version in `VERSION` (`scripts/ci/docs-pins.selftest.sh`) — the README
-quickstart had otherwise sat three minor versions behind the fleet, in the one
-line a new consumer is most likely to paste verbatim.
+same pull request as the change being released**. CI asserts that every module
+pin printed in the documentation names the version in `VERSION`
+(`scripts/ci/docs-pins.selftest.sh`) — the README quickstart had otherwise sat
+three minor versions behind the fleet, in the one line a new consumer is most
+likely to paste verbatim.
 
-Consumers move on their own schedule: bumping `VERSION` publishes a version, it
-does not repin anybody.
+**The tag is created for you.** On every push to main, `publish-tag.yml` reads
+`VERSION` and creates that annotated tag at the merge commit if it does not
+already exist, then advances the floating major tag (`v5`) to it. Tagging was a
+human step until v5.7.0 and it lapsed: tags stopped at v5.3.2 while `VERSION`
+said v5.7.0, so v5.4.0, v5.5.0 and v5.6.0 merged, passed every gate, updated
+every documented pin — and could not be pinned by anyone. Nothing went red,
+because every gate that could have seen it compares the docs to `VERSION`, and
+`VERSION` was right the whole time.
+
+A published exact tag is never moved: it is what a consumer pinned. Only the
+major tag floats.
+
+Consumers choose how they adopt:
+
+| pin | adopts | costs |
+|---|---|---|
+| `?ref=v5.7.0` | when the repository opens and merges a bump | one pull request per release, per repository |
+| `?ref=v5` | at its next `terraform apply` | nothing, and no review of what changed |
+
+Either way a release does not repin anybody, and **nothing applies Terraform** —
+a merged bump changes what the next apply will build, not what is running.
 
 ## Genericity
 
