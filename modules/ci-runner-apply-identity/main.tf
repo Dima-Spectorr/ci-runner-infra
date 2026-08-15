@@ -40,6 +40,22 @@
 # terraform refreshes everything in state before it plans anything. An account
 # that cannot read the service accounts cannot plan the pool either, and would
 # fail on every run rather than only the ones that change identity.
+#
+# WHAT THIS DOES NOT BOUND, stated plainly because the `actAs` scoping below
+# invites the wrong conclusion: roles/compute.admin is PROJECT-wide, and it
+# carries compute.instances.setMetadata. So this identity can add an SSH key to
+# any other VM in the project and reach whatever service account is attached to
+# it — a route to identities the enumerated actAs list deliberately excludes.
+# The list still earns its place (it bounds what a NEW instance may run as, at
+# plan time, visibly), but it is not the whole fence.
+#
+# The assumption this module therefore makes: the project holding the runner
+# pool contains nothing more privileged than the pool. That is true of a
+# dedicated runner project and NOT automatically true of a project shared with
+# the application — where the mitigation is an IAM condition narrowing
+# compute.admin to the pool's own resource names, or moving the pool to its own
+# project. Either is a bigger change than this module, and neither should be
+# assumed to have happened.
 
 terraform {
   required_version = ">= 1.5.0"
