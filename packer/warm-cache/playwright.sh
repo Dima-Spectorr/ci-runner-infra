@@ -80,6 +80,18 @@ echo "[warm-cache] saving $PLAYWRIGHT_IMAGE to $ARCHIVE"
 docker save "$PLAYWRIGHT_IMAGE" | gzip -1 >"$ARCHIVE.partial"
 mv "$ARCHIVE.partial" "$ARCHIVE"
 
+# A checksum recorded at bake time, verified by each slot before it loads.
+#
+# The image build is the only moment this archive is known-good, so the digest
+# has to be taken here. It is defence in depth rather than the primary control
+# — `images/` is root-owned and read-only to slots — but it is the half that
+# still holds if that ownership is ever widened by a later change, and it turns
+# a truncated or half-copied archive into a clean skip instead of a `docker
+# load` failure nobody reads.
+# Appended, not rewritten: another warm script may have baked its own archive
+# into this directory, and its line must survive.
+( cd "$IMAGE_DIR" && sha256sum "$(basename "$ARCHIVE")" >>SHA256SUMS )
+
 # Reclaim the build VM's copy: it is dead weight in the final image, and the
 # slots read the archive, never this.
 docker rmi "$PLAYWRIGHT_IMAGE" >/dev/null 2>&1 || true

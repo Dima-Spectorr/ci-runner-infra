@@ -860,24 +860,63 @@ load_baked_images() {
   [ -n "$archives" ] || return 0
 
   (
-    local a
+    local a base
     printf '%s\n' "$archives" | while IFS= read -r a; do
       [ -n "$a" ] || continue
+      base=$(basename "$a")
+
+      # Verify against the digest recorded at bake time, when the archive was
+      # last known-good. This is defence in depth, not the primary control —
+      # `images/` is root-owned and read-only to slots — but it is the half
+      # that still holds if that ownership is ever widened by a later change,
+      # and it turns a truncated archive into a clean skip.
+      #
+      # A missing SHA256SUMS is not a failure: an image baked before this
+      # existed simply has nothing to check against.
+      if [ -f "$dir/SHA256SUMS" ] && grep -qF " $base" "$dir/SHA256SUMS"; then
+        if ! ( cd "$dir" && grep -F " $base" SHA256SUMS | sha256sum -c --status - ); then
+          log "slot $idx: $base failed its checksum — NOT loading it; jobs will pull that image themselves"
+          continue
+        fi
+      fi
+
       # `docker load` reads gzip transparently, so a warm script may save either
       # form; gzip trades boot CPU for image size and is the better default.
+      #
+      # `timeout` so a wedged load cannot hold this script open indefinitely —
+      # main() waits for these before exiting, and an unbounded wait would keep
+      # google-startup-scripts.service active forever.
       #
       # shellcheck disable=SC2024  # the redirect is the shell's, and this shell
       # is root: a GCE startup script runs as root, which is also why every
       # other write to this log in this file is spelled the same way. `sudo`
       # here drops privilege for the daemon socket, it does not raise it.
-      if sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
+      if timeout 1800 sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
            docker load -i "$a" >>/var/log/ci-host.log 2>&1; then
-        log "slot $idx: loaded baked image archive $(basename "$a")"
+        log "slot $idx: loaded baked image archive $base"
       else
-        log "slot $idx: could not load $(basename "$a") — jobs will pull that image themselves"
+        log "slot $idx: could not load $base — jobs will pull that image themselves"
       fi
     done
   ) &
+  # Remembered so main() can wait for it. A GCE startup script runs under
+  # google-startup-scripts.service, a Type=oneshot unit, and systemd's default
+  # KillMode=control-group SIGKILLs whatever is still in the cgroup once the
+  # main process exits. Without this wait a multi-gigabyte load is killed
+  # mid-stream, silently — no success line, no error, and a warm-cache feature
+  # that does nothing while looking correct in review.
+  IMAGE_LOAD_PIDS="${IMAGE_LOAD_PIDS:-} $!"
+}
+
+# Waited at the very END of the run, never at the call site: by then every slot
+# has already registered, so the cost is that this script stays alive a few more
+# minutes, not that the pool is late to take jobs.
+wait_for_image_loads() {
+  [ -n "${IMAGE_LOAD_PIDS:-}" ] || return 0
+  log "waiting for baked image loads to finish before exiting"
+  # shellcheck disable=SC2086  # deliberate word splitting: a PID list.
+  wait ${IMAGE_LOAD_PIDS} 2>/dev/null || true
+  log "baked image loads finished"
 }
 
 install_slot() {
@@ -1079,6 +1118,10 @@ main() {
   fi
 
   log "host ready: $((SLOTS - failures))/$SLOTS slots serving $OWNER/$REPO (pool=$POOL)"
+
+  # AFTER the host is announced ready, so a slow image load delays nothing that
+  # matters: the agents are registered and already taking work by this point.
+  wait_for_image_loads
 }
 
 main "$@"

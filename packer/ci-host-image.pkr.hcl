@@ -357,6 +357,18 @@ build {
       "chmod -R g+w /opt/ci-cache",
       # setgid on directories only, so new entries keep the `ci` group.
       "find /opt/ci-cache -type d -exec chmod g+s {} +",
+
+      # …except `images/`, which is the one part of this tree that is EXECUTED
+      # rather than read. Every archive here is `docker load`ed into every
+      # slot's daemon at boot, so group-write would let a job in one slot
+      # replace an image that every other slot then runs — automatically, on
+      # the next reboot, for the rest of the host's life. The rest of the cache
+      # is untrusted build input by design (README "a warm cache is untrusted
+      # build input"); this part cannot be, because nothing re-verifies it.
+      #
+      # Root-owned and read-only to the slots. Nothing at runtime writes here:
+      # the archives are produced at bake time, by the warm script, as root.
+      "if [ -d /opt/ci-cache/images ]; then chown -R root:ci /opt/ci-cache/images && chmod 0755 /opt/ci-cache/images && find /opt/ci-cache/images -type f -exec chmod 0644 {} + ; fi",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }

@@ -24,7 +24,15 @@
 #         # Not tuning: Chromium's default 64MB /dev/shm in a container is not
 #         # enough for a real page, and the crash reads as a flaky suite rather
 #         # than a misconfigured container.
-#         options: --ipc=host
+#         #
+#         # `--shm-size`, NOT the `--ipc=host` Playwright's own docs suggest.
+#         # Upstream assumes a machine running one suite; a fleet host runs K
+#         # slots for K jobs, and `--ipc=host` would put them all in one IPC
+#         # namespace with one shared /dev/shm — where Chromium's page buffers
+#         # live. That is cross-slot visibility of rendered page content, and
+#         # one job able to exhaust /dev/shm for every other. A private, larger
+#         # /dev/shm fixes the same crash without sharing anything.
+#         options: --shm-size=1gb
 #       steps:
 #         - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 #         - uses: <org>/ci-runner-infra/.github/actions/playwright-ui@v5.8.0
@@ -56,17 +64,33 @@ inputs:
     required: false
     default: "."
   install-command:
-    description: Dependency install. Lockfile-exact, so the suite is reproducible.
+    description: >-
+      Dependency install. Lockfile-exact, so the suite is reproducible. This is
+      interpolated into a shell, so it must be a literal the workflow author
+      wrote — never anything derived from `github.event.*`, which would be
+      command injection onto a credentialed, reused host.
     required: false
     default: "npm ci"
   test-command:
-    description: The suite itself.
+    description: >-
+      The suite itself. Same rule as install-command: a literal, never event
+      data.
     required: false
     default: "npx playwright test"
-  artifact-retention-days:
-    description: How long the failure report and traces are kept.
+  upload-artifacts:
+    description: >-
+      Whether to upload the report and traces from a failing run. A trace is a
+      full recording of the run, including request and response headers and
+      bodies, and an artifact is readable by anyone who can read the repository.
+      Set false when the suite runs against an environment holding real data.
     required: false
-    default: "7"
+    default: "true"
+  artifact-retention-days:
+    description: >-
+      How long the failure report and traces are kept. Deliberately short: see
+      upload-artifacts for what these files actually contain.
+    required: false
+    default: "1"
 
 runs:
   using: composite
@@ -90,7 +114,7 @@ runs:
           [ -n "$d" ] && [ -d "$d" ] && exit 0
         done
         echo "::error::no browser bundle found — this step must run in a job with"
-        echo "  container: { image: mcr.microsoft.com/playwright:v${{ inputs.playwright-version }}-noble, options: --ipc=host }"
+        echo "  container: { image: mcr.microsoft.com/playwright:v${{ inputs.playwright-version }}-noble, options: --shm-size=1gb }"
         echo "The fleet's host image carries no browsers; the container is where they live."
         exit 1
 
@@ -108,7 +132,11 @@ runs:
       run: |
         set -eu
         want='${{ inputs.playwright-version }}'
-        got=$(npx playwright --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+        # --no-install: without it, `npx` FETCHES and runs `playwright` from the
+        # registry when the package is absent — which is precisely the case this
+        # step exists to detect. That turns a clear "it is not installed" into a
+        # silent unpinned download that then reports a plausible version.
+        got=$(npx --no-install playwright --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
         if [ -z "$got" ]; then
           echo "::error::could not determine the installed Playwright version — is @playwright/test a dependency?"
           exit 1
@@ -129,8 +157,13 @@ runs:
 
     # A UI failure with no trace is re-run rather than diagnosed, and re-running
     # a flaky-looking suite is how a real regression gets merged.
+    #
+    # But a trace is a full recording of the run — DOM, screenshots, and every
+    # request and response including headers and bodies — and an artifact is
+    # readable by anyone who can read the repository. Hence the opt-out and the
+    # short retention; see `upload-artifacts` above.
     - name: Upload the report and traces
-      if: ${{ failure() }}
+      if: ${{ failure() && inputs.upload-artifacts == 'true' }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: playwright-report-${{ github.run_id }}-${{ github.run_attempt }}

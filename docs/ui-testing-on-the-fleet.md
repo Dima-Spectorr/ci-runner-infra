@@ -86,13 +86,44 @@ jobs:
       # Not tuning. Chromium's default 64MB /dev/shm inside a container is not
       # enough for a real page, and the crash it produces looks like a flaky
       # suite rather than a misconfigured container.
-      options: --ipc=host
+      options: --shm-size=1gb
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: <org>/ci-runner-infra/.github/actions/playwright-ui@v5.8.0
         with:
           playwright-version: "1.62.1"
 ```
+
+### `--shm-size`, not `--ipc=host`
+
+Playwright's own documentation suggests `--ipc=host`, and on a laptop or a
+single-purpose CI box it is the right answer. It is the wrong answer here.
+
+A fleet host runs K slots for K different jobs. `--ipc=host` puts the container
+in the host's IPC namespace, so every slot's containers share one namespace and
+one `/dev/shm` — which is exactly where Chromium keeps rendered page buffers.
+That means one job's page content is reachable from another job's container, and
+any one job can exhaust `/dev/shm` for every other slot on the host.
+
+`--shm-size=1gb` solves the same crash — a 64MB `/dev/shm` is the actual cause —
+with a private filesystem and no shared namespace.
+
+### Traces are recordings, and artifacts are readable
+
+A Playwright trace is a complete recording of the run: DOM snapshots,
+screenshots, and every network request **including headers and bodies**. Nothing
+in Playwright redacts them, and `::add-mask::` does not apply to file contents
+inside an artifact. If the suite authenticates, the `Authorization` and `Cookie`
+headers are in the trace; if a response carried personal data, so is that.
+
+An uploaded artifact is downloadable by anyone with read access to the
+repository — everyone, if the repository is public. Before turning this on
+against an environment holding real data:
+
+- scrub credentials in a fixture (`page.route`, stripping `authorization` and
+  `cookie`), and use synthetic test data rather than real records;
+- keep the retention short — this action defaults to 1 day;
+- or set `upload-artifacts: false` and reproduce failures locally instead.
 
 The fork guard makes this job **skip** on a fork pull request, so it must not be
 a required check by name. A skipped required check never reports, and the pull
