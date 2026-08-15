@@ -118,7 +118,12 @@ runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars
 ```
 
 The `runs-on` form counts only because its **fork-true branch names a hosted
-image**; written the other way round the same idiom hands forks the pool.
+image**; written the other way round the same idiom hands forks the pool. And
+"hosted image" is the finite GitHub family — `ubuntu|windows|macos` plus
+`latest` or a version, with an optional `-arm`/`-large` class suffix — not that
+prefix: `ubuntu-pool-1` is an ordinary custom label on a fleet runner, and
+reading it as hosted both skipped every isolation check on the job carrying it
+and made it a legal destination for fork code.
 Anything not recognised is unguarded — an unrecognised-but-correct guard costs
 one reported job and a reviewer's minute, where an unrecognised inversion costs
 the boundary.
@@ -141,6 +146,13 @@ across the whole file set before anything is judged, and transitively.
 A **remote** callee is a different answer: that document is not in this
 repository, so the RUNNER3 exemption a `uses:` job gets was handing the bound to
 jobs nobody read. That is RUNNER7.
+
+A guard on the **calling job** is a guard on everything that job reaches, so an
+edge carries its caller and a guarded caller contributes none. Without that, the
+callee was asked for a condition its own file has no pull-request context for,
+and the only way to satisfy the gate was to duplicate the caller's `if:`. A
+callee reached by **any** unguarded edge is still reachable — the guard has to
+hold on every path, not on one of them.
 
 Reachability is a set membership, so both sides of every edge are canonicalised
 to one absolute spelling. They were not: the caller was keyed by whatever string
@@ -240,6 +252,13 @@ LINE, because a comment is not part of the loaded document.
 An abbreviated SHA is rejected: it looks pinned and is not — GitHub resolves it
 against whatever the repository holds at resolution time, which is the
 mutability the gate removes.
+
+PIN2 compares two counts — raw lines naming the reference, raw lines carrying a
+version comment — and **zero of the first is a finding, not agreement**. A
+folded or quoted scalar spells the same value in a way a line-oriented match
+does not see, and `0 > 0` reported a check that could not run as a check that
+passed. That is the vacuous pass this whole design is arranged against, found in
+its own strictest rule.
 
 A `uses:` beginning `./` is this repository's own tree at this repository's own
 commit, already immutable, and is exempt — but only the **wrapper** is. That
