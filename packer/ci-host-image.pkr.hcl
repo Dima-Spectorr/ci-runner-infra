@@ -123,6 +123,14 @@ variable "warm_cache_script" {
     invisible to every one of them. Pre-pulling would cost build minutes and
     disk for nothing.
 
+    A container image therefore has to be baked as a FILE, which is the one
+    form every slot can read: `docker save` it into /opt/ci-images/ and
+    host-startup.sh's load_baked_images() loads it into each slot's daemon at
+    boot. That directory is root-owned and read-only to slots, deliberately —
+    it is not part of the group-writable /opt/ci-cache, because its contents
+    are executed rather than read. `warm-cache/playwright.sh` is that pattern, for pools that run
+    browser tests.
+
     Empty = build a toolchain-only image.
   EOT
   default     = ""
@@ -351,6 +359,24 @@ build {
       "chmod -R g+w /opt/ci-cache",
       # setgid on directories only, so new entries keep the `ci` group.
       "find /opt/ci-cache -type d -exec chmod g+s {} +",
+
+      # Baked image archives live in /opt/ci-images, NOT under /opt/ci-cache,
+      # and the separation is the control rather than a tidiness choice.
+      #
+      # Every archive there is `docker load`ed into every slot's daemon at
+      # boot, so it is EXECUTED, not read — while /opt/ci-cache is untrusted
+      # build input by design (README: "a warm cache is untrusted build
+      # input") and is group-writable so slots can update it. Making the
+      # archives root-owned INSIDE that tree is not enough: write+execute on a
+      # non-sticky parent lets a job rename the whole directory away and put
+      # its own — with a matching SHA256SUMS — in its place, supplying both
+      # halves of the check. Ownership of an entry never protects it from the
+      # permissions of the directory holding it.
+      #
+      # So the archives sit in their own root-owned, non-group-writable tree.
+      # Nothing at runtime writes here; they are produced at bake time, by the
+      # warm script, as root.
+      "if [ -d /opt/ci-images ]; then chown -R root:root /opt/ci-images && chmod 0755 /opt/ci-images && find /opt/ci-images -type f -exec chmod 0644 {} + ; fi",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }

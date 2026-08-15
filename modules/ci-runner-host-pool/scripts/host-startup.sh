@@ -830,6 +830,158 @@ EOF
   return 1
 }
 
+# Load any container image archives the IMAGE baked into /opt/ci-images into
+# this slot's rootless daemon.
+#
+# NOT the shared cache. /opt/ci-cache is group-writable by design and documented
+# as untrusted build input; what is read here is `docker load`ed into every slot
+# on the host, so a job able to write it would be choosing the image every other
+# slot runs. The two trees are siblings for that reason, and this one is
+# root-owned.
+#
+# This exists because a pre-pulled image is per-DAEMON, and every slot runs its
+# own rootless daemon with its own data root under the slot user's home. An
+# image pulled at bake time lands in the build VM's root-owned /var/lib/docker
+# and is invisible to all K of them — so the only way to bake a container image
+# is to bake a FILE (docker save) and load it per slot, which is what this does.
+#
+# Deliberately generic: the host has no idea what is in the archives, and no
+# tool is named here. A pool that wants an image warm supplies a warm-cache
+# script that writes /opt/ci-images/*.tar[.gz]; a pool that does not gets no
+# directory at all and pays nothing.
+#
+# /opt/ci-images is NOT under /opt/ci-cache, and that is the security boundary
+# rather than a filing choice. The shared cache is group-writable so slots can
+# update it, and everything in it is untrusted build input by design. These
+# archives are not input: they are loaded into every slot's daemon at boot, so
+# whoever can write one is running their image in every slot on the host for
+# the rest of its life. Root-owned tree, root-owned parent, no group write.
+#
+# Backgrounded and never fatal, for two reasons. A multi-gigabyte load takes
+# minutes, and blocking on it would keep the whole pool from registering while
+# a job queue builds. And a corrupt or half-written archive must degrade to "the
+# job pulls the image itself", which is merely slow — the alternative is a host
+# that refuses to register over a CACHE, which is the same class of fault as
+# making boot depend on a registry (see slot_runtime_usable).
+#
+# One load per SLOT, not one per host: the slot daemons have separate data
+# roots, so there is nothing for them to share and each pays the cost in full.
+# Measured single-threaded on a 4-vCPU host: ~53s to checksum and load a 942MB
+# archive. K slots run that concurrently against one disk, so the last one
+# finishes appreciably later than the first — that is accepted, not overlooked.
+# It is affordable only because nothing waits on it: slots register and take
+# jobs while these run in the background, and the first UI job to land before
+# its slot finished loading just pulls the image itself.
+load_baked_images() {
+  local idx="$1" u; u=$(slot_user "$idx")
+  local dir="/opt/ci-images"
+
+  [ -d "$dir" ] || return 0
+  # Nothing to do is the common case — most pools bake no images at all.
+  local archives; archives=$(find "$dir" -maxdepth 1 -type f \( -name '*.tar' -o -name '*.tar.gz' \) 2>/dev/null)
+  [ -n "$archives" ] || return 0
+
+  (
+    local a base
+    printf '%s\n' "$archives" | while IFS= read -r a; do
+      [ -n "$a" ] || continue
+      base=$(basename "$a")
+
+      # Verify against the digest recorded at bake time, when the archive was
+      # last known-good. Defence in depth, not the primary control — the tree
+      # is root-owned and unwritable by slots — but it is the half that still
+      # holds if that ownership is ever widened, and it turns a truncated
+      # archive into a clean skip.
+      #
+      # The line is selected by an EXACT filename field, not by searching for
+      # the name anywhere in the file. `grep -F " $base"` would match the line
+      # belonging to a DIFFERENT archive whose name merely contains this one —
+      # `x.tar` matching the entry for `x.tar.gz` — and then `sha256sum -c`
+      # would happily verify that other, legitimate file and report success,
+      # loading the unchecked one. Character 67 is where sha256sum's name
+      # field starts (64 hex digits + two separators).
+      #
+      # Fail closed: an archive with no line of its own, or with more than one,
+      # is not loaded. Every archive this fleet bakes gets exactly one line, so
+      # anything else is a tree nobody should be executing.
+      local sums="$dir/SHA256SUMS" nmatch=0
+      if [ -f "$sums" ]; then
+        nmatch=$(awk -v f="$base" 'substr($0,1,64) ~ /^[0-9a-f]+$/ && substr($0,67)==f' "$sums" | wc -l)
+      fi
+      if [ "$nmatch" -ne 1 ]; then
+        log "slot $idx: $base has no single checksum entry — NOT loading it; jobs will pull that image themselves"
+        continue
+      fi
+      if ! ( cd "$dir" && awk -v f="$base" 'substr($0,1,64) ~ /^[0-9a-f]+$/ && substr($0,67)==f' SHA256SUMS \
+               | sha256sum -c --status - ); then
+        log "slot $idx: $base failed its checksum — NOT loading it; jobs will pull that image themselves"
+        continue
+      fi
+
+      # `docker load` reads gzip transparently, so a warm script may save either
+      # form; gzip trades boot CPU for image size and is the better default.
+      #
+      # `timeout` so a wedged load cannot hold this script open indefinitely —
+      # main() waits for these before exiting, and an unbounded wait would keep
+      # google-startup-scripts.service active forever.
+      #
+      # Generous on purpose. Nothing is waiting on this: the slots have already
+      # registered and the host is taking jobs while these run, so the only
+      # thing the ceiling bounds is how long a oneshot unit stays active. A
+      # browser archive is multiple gigabytes and every slot loads its own copy
+      # concurrently, so a tight ceiling would kill legitimate slow loads and
+      # cost every job on the host the download this exists to avoid — trading
+      # the whole feature for a tidier boot.
+      #
+      # shellcheck disable=SC2024  # the redirect is the shell's, and this shell
+      # is root: a GCE startup script runs as root, which is also why every
+      # other write to this log in this file is spelled the same way. `sudo`
+      # here drops privilege for the daemon socket, it does not raise it.
+      if timeout 1800 sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
+           docker load -i "$a" >>/var/log/ci-host.log 2>&1; then
+        log "slot $idx: loaded baked image archive $base"
+        # Whether loading it SAVED anything is a separate question from whether
+        # it loaded. The runner pulls the job's `container:` image
+        # unconditionally, and that pull only recognises these layers under the
+        # containerd image store, which preserves registry blob digests across a
+        # save/load round trip. Under the legacy graphdriver store every step
+        # here still succeeds and the job re-downloads the image anyway.
+        # The bake asserts the store on the BUILD VM; this records the one that
+        # actually did the load, so a divergence is a line in this log rather
+        # than an unexplained slowdown discovered months later.
+        store=$(sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
+                  docker info --format '{{.DriverStatus}}' 2>/dev/null || true)
+        case "$store" in
+          *io.containerd.snapshotter.v1*)
+            log "slot $idx: containerd image store — the job's own pull will be a no-op" ;;
+          *)
+            log "slot $idx: WARNING: image store is not containerd (${store:-unknown}) — the baked archive will NOT save the job's download" ;;
+        esac
+      else
+        log "slot $idx: could not load $base — jobs will pull that image themselves"
+      fi
+    done
+  ) &
+  # Remembered so main() can wait for it. A GCE startup script runs under
+  # google-startup-scripts.service, a Type=oneshot unit, and systemd's default
+  # KillMode=control-group SIGKILLs whatever is still in the cgroup once the
+  # main process exits. Without this wait a multi-gigabyte load is killed
+  # mid-stream, silently — no success line, no error, and a warm-cache feature
+  # that does nothing while looking correct in review.
+  IMAGE_LOAD_PIDS="${IMAGE_LOAD_PIDS:-} $!"
+}
+
+# Waited at the very END of the run, never at the call site: by then every slot
+# has already registered, so the cost is that this script stays alive a few more
+# minutes, not that the pool is late to take jobs.
+wait_for_image_loads() {
+  [ -n "${IMAGE_LOAD_PIDS:-}" ] || return 0
+  log "waiting for baked image loads to finish before exiting"
+  # shellcheck disable=SC2086  # deliberate word splitting: a PID list.
+  wait ${IMAGE_LOAD_PIDS} 2>/dev/null || true
+  log "baked image loads finished"
+}
+
 install_slot() {
   local idx="$1" token="$2"
   local dir="$SLOT_ROOT/$idx"
@@ -837,6 +989,10 @@ install_slot() {
   local u; u=$(slot_user "$idx")
 
   start_slot_dockerd "$idx" || return 1
+
+  # After the daemon is proven up, before the agent registers. Backgrounded, so
+  # the slot takes jobs while the cache warms behind it.
+  load_baked_images "$idx"
 
   # google-auth, gcloud and the Go/Java clients all resolve the metadata server
   # through these. Per SLOT, not per host: the address that reaches the broker
@@ -1025,6 +1181,10 @@ main() {
   fi
 
   log "host ready: $((SLOTS - failures))/$SLOTS slots serving $OWNER/$REPO (pool=$POOL)"
+
+  # AFTER the host is announced ready, so a slow image load delays nothing that
+  # matters: the agents are registered and already taking work by this point.
+  wait_for_image_loads
 }
 
 main "$@"

@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.8.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.9.0"
   # ...
 }
 ```
@@ -307,6 +307,9 @@ docs/ci-workflow-gates.md        those two gates: rules, flags, how to adopt
 docs/ci-lane-model.md            the lane contract consumers adopt
 docs/ci-merge-queue-baseline.md  one CI run per PR: the queue config + gate
 docs/ci-optimization-catalog.md  the fleet audit behind that contract
+packer/warm-cache/                optional baked caches, chosen per pool
+.github/actions/playwright-ui/   the steps a repo's browser suite runs
+docs/ui-testing-on-the-fleet.md  running Playwright UI tests on the fleet
 ```
 
 ## The CI lane model

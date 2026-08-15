@@ -125,6 +125,13 @@ jobs:
       # statically here instead.
       - name: identity split self-test
         run: bash scripts/ci/identity-split.selftest.sh
+      # The apply identity is assumable from a GitHub Actions run, so whatever it
+      # can do, a workflow file can do. Every permission error an unattended
+      # apply hits argues for one more role, and that road ends at "can grant
+      # itself owner" — reachable from CI, in a fleet that auto-merges on green.
+      # Nothing else here would notice: validate, plan and apply all succeed.
+      - name: apply identity self-test
+        run: bash scripts/ci/apply-identity.selftest.sh
 
       # One unbounded socket stalls the controller's tick loop or a consumer's
       # oneshot poller permanently, and the demand metric keeps its LAST value
@@ -226,6 +233,17 @@ jobs:
       # laptop and a gitignored tfvars.
       - name: apply-runner-pool self-test
         run: bash scripts/ci/apply-runner-pool.selftest.sh
+
+      # The browser image a pool BAKES and the one a consumer is told to RUN are
+      # two different lines that must name one release. When they drift nothing
+      # fails — every UI job just quietly downloads two gigabytes it was meant
+      # to find warm, and the symptom is "browser tests are slow", which is the
+      # most believable wrong explanation there is.
+      - name: playwright pin self-test
+        run: bash scripts/ci/check-playwright-pin.sh --selftest
+
+      - name: playwright pin
+        run: bash scripts/ci/check-playwright-pin.sh
 
   terraform:
     name: Terraform (fmt + validate)
