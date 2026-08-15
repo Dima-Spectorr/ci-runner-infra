@@ -9,8 +9,29 @@
 # image specific to a repository, customer or region.
 #
 #   gcloud builds submit --config cloudbuild.yaml \
-#     --substitutions=_ZONE=<zone>,_SUBNETWORK=<subnet>,_IMAGE_VERSION=v3-0-0 \
-#     --project=<project>
+#     --project=<project> \
+#     --region=<region> \
+#     --gcs-source-staging-dir=gs://<bucket-in-an-allowed-location>/source \
+#     --substitutions=_ZONE=<zone>,_SUBNETWORK=<subnet>,_IMAGE_VERSION=v3-0-0
+#
+# --region and --gcs-source-staging-dir are NOT optional on an estate with
+# constraints/gcp.resourceLocations. Without them gcloud stages the source to
+# the `us` multi-region and runs the build there, and the API rejects the
+# submission outright:
+#
+#   HTTPError 412: 'us' violates constraint 'constraints/gcp.resourceLocations'
+#
+# That failure arrives before a single step runs, which is the good case — the
+# same constraint applied to the IMAGE is what _IMAGE_STORAGE_LOCATION below
+# exists to prevent, and that one fails only after the whole build has run.
+#
+# A cache-warmed image adds one more:
+#
+#     --substitutions=...,_WARM_CACHE_SCRIPT=warm-cache/playwright.sh
+#
+# and, because a warmed image is substantially larger, a distinct
+# _IMAGE_FAMILY so pools tracking the toolchain-only family do not silently
+# inherit the extra gigabytes.
 
 substitutions:
   _ZONE: ""
