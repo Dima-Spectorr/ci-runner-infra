@@ -22,9 +22,16 @@
 # requirement of the design, not a style preference.
 
 BeforeAll {
-    $repo = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
-    $scripts = Join-Path $repo 'modules/ci-runner-host-pool/scripts'
-    . (Join-Path $scripts 'windows-beacon-publisher.ps1')
+    # $PSScriptRoot, not $PSCommandPath. Pester sets $PSScriptRoot to the test
+    # file's directory inside BeforeAll; $PSCommandPath is not guaranteed to be
+    # the test file there, and a wrong or empty value turns this into a
+    # container-level failure that reports itself as every test in the file
+    # failing at once, with no path in the message to point at the cause.
+    $script:PublisherPath = Join-Path $PSScriptRoot '../../modules/ci-runner-host-pool/scripts/windows-beacon-publisher.ps1'
+    if (-not (Test-Path -LiteralPath $script:PublisherPath)) {
+        throw "the beacon publisher is not at $script:PublisherPath"
+    }
+    . $script:PublisherPath
 }
 
 Describe 'dot-sourcing is inert' {
