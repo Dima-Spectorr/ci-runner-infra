@@ -132,3 +132,193 @@ Describe 'beacon service definition' {
         $script:Xml | Should -Match '<id>ci-beacon</id>'
     }
 }
+
+Describe 'slot naming' {
+    # The controller parses `<instance>-s<i>` back to an instance in
+    # orphan_decision(). A rename on this side does not fail: it silently stops
+    # every Windows registration from ever being reaped, and the agents pile up in
+    # GitHub's list pointing at hosts that no longer exist.
+    It 'matches the name orphan_decision parses back to an instance' {
+        Get-SlotUserName -Index 1 | Should -Be 'ci-s1'
+        Get-SlotUserName -Index 12 | Should -Be 'ci-s12'
+    }
+
+    It 'gives each slot its own workspace' {
+        $one = Get-SlotWorkspacePath -Index 1 -Root '/ci/slots'
+        $two = Get-SlotWorkspacePath -Index 2 -Root '/ci/slots'
+        $one | Should -Not -Be $two
+    }
+
+    # The temp directory is UNDER the workspace, not beside it, so the one ACL
+    # applied to the workspace covers it. A sibling directory is one more thing to
+    # remember to lock, and the one nobody does.
+    It 'puts the private temp inside the slot it belongs to' {
+        $ws = Get-SlotWorkspacePath -Index 3 -Root '/ci/slots'
+        $tmp = Get-SlotTempPath -Index 3 -Root '/ci/slots'
+        $tmp.StartsWith($ws) | Should -BeTrue
+        $tmp | Should -Not -Be $ws
+    }
+}
+
+Describe 'slot password' {
+    # Complexity is satisfied BY CONSTRUCTION, not by luck. A password Windows
+    # rejects is a slot that never registers, discovered on the fleet rather than
+    # here -- so this runs the generator enough times that a one-class-missing bug
+    # cannot hide behind a lucky draw.
+    It 'always carries all four character classes' {
+        foreach ($i in 1..50) {
+            $chars = -join (Get-SlotPasswordCharacter -Length 20)
+            $chars | Should -Match '[A-Z]'
+            $chars | Should -Match '[a-z]'
+            $chars | Should -Match '[0-9]'
+            $chars | Should -Match '[_\-.~]'
+        }
+    }
+
+    It 'is the length it was asked for' {
+        (Get-SlotPasswordCharacter -Length 40).Length | Should -Be 40
+        (Get-SlotPasswordCharacter -Length 16).Length | Should -Be 16
+    }
+
+    # This value reaches the service control manager. A quote, a backtick, a
+    # percent or an ampersand in it is a quoting bug in the one place where the
+    # string is a credential; the homoglyphs are out because a password that
+    # cannot be read off a console during an incident wastes the incident.
+    It 'contains nothing that quotes, expands or reads ambiguously' {
+        foreach ($i in 1..50) {
+            -join (Get-SlotPasswordCharacter -Length 40) | Should -Match '^[A-HJ-NP-Za-hj-km-np-z2-9_.~-]+$'
+        }
+    }
+
+    It 'refuses a length that cannot satisfy the classes' {
+        { Get-SlotPasswordCharacter -Length 3 } | Should -Throw
+    }
+
+    It 'does not hand out the same password twice' {
+        $first = -join (Get-SlotPasswordCharacter -Length 40)
+        $second = -join (Get-SlotPasswordCharacter -Length 40)
+        $first | Should -Not -Be $second
+    }
+
+    # Read-only matters: a SecureString still writable after the fact is one a
+    # later bug can extend or empty between generating it and registering the
+    # service with it.
+    It 'hands phase 5 a sealed SecureString, never a string' {
+        $secure = Get-SlotPassword -Length 24
+        $secure | Should -BeOfType [System.Security.SecureString]
+        $secure.Length | Should -Be 24
+        $secure.IsReadOnly() | Should -BeTrue
+    }
+}
+
+Describe 'phase 1 ordering' {
+    # THIS IS THE SECURITY TEST OF PHASE 1, AND IT IS ABOUT ORDER, NOT CONTENT.
+    #
+    # C:\ci\bin holds ci-beacon.ps1, which the SCM re-executes as LocalSystem on
+    # every service restart and every reboot. Phase 0 created that directory with
+    # whatever ACL C:\ hands down, which is harmless only while the host has no
+    # unprivileged principal on it. Create the slot accounts first and there is a
+    # window -- one that survives the reboot -- in which a slot can write the file
+    # that comes back as SYSTEM.
+    #
+    # Nothing about that ordering is visible in the code's shape, and a later
+    # refactor that groups "all the account work" together would reverse it
+    # without looking wrong. So the order is recorded and asserted.
+    BeforeEach {
+        $script:Calls = @()
+        Mock -CommandName Protect-CiDirectory -MockWith { $script:Calls += "protect:$Path" }
+        Mock -CommandName Initialize-SlotAccount -MockWith {
+            $script:Calls += "account:$Index"
+            @{ Index = $Index; User = "ci-s$Index" }
+        }
+        Mock -CommandName Grant-SlotLogonRight -MockWith { $script:Calls += 'rights' }
+        Mock -CommandName Write-BootLog -MockWith { }
+    }
+
+    It 'locks the beacon directory before any slot account exists' {
+        Invoke-Phase1SlotSetup -Slots 2 | Out-Null
+        $firstAccount = [array]::FindIndex([string[]] $script:Calls, [Predicate[string]] { $args[0] -like 'account:*' })
+        $lastProtect = [array]::FindLastIndex([string[]] $script:Calls, [Predicate[string]] { $args[0] -eq 'protect:C:\ci\bin' })
+        $lastProtect | Should -BeGreaterOrEqual 0
+        $firstAccount | Should -BeGreaterThan $lastProtect
+    }
+
+    It 'locks the root and the slot root too, not only the bin' {
+        Invoke-Phase1SlotSetup -Slots 1 | Out-Null
+        $script:Calls | Should -Contain 'protect:C:\ci'
+        $script:Calls | Should -Contain 'protect:C:\ci\slots'
+    }
+
+    # One policy write, after every account exists. Per-slot imports mean N full
+    # policy writes, any one of which is the one that gets interrupted -- leaving
+    # a host with the grant applied and the denies not, which is the state this
+    # whole section exists to prevent.
+    It 'applies logon rights once, after every account is made' {
+        Invoke-Phase1SlotSetup -Slots 3 | Out-Null
+        @($script:Calls | Where-Object { $_ -eq 'rights' }).Count | Should -Be 1
+        $script:Calls[-1] | Should -Be 'rights'
+    }
+
+    It 'provisions exactly the number of slots it was given' {
+        Invoke-Phase1SlotSetup -Slots 3 | Out-Null
+        @($script:Calls | Where-Object { $_ -like 'account:*' }).Count | Should -Be 3
+    }
+}
+
+Describe 'security policy rewriting' {
+    # A fresh image has no SeDenyNetworkLogonRight line at all. Skipping an absent
+    # privilege is how a deny the code claims to apply ends up not applied, and
+    # nothing downstream would report it: secedit imports the file happily and the
+    # slots keep the right they were supposed to lose.
+    It 'adds a privilege the exported policy never had' {
+        $inf = "[Unicode]`r`nUnicode=yes`r`n[Privilege Rights]`r`nSeServiceLogonRight = *S-1-5-80-0`r`n"
+        $out = Edit-InfPrivilege -InfText $inf -Privilege 'SeDenyNetworkLogonRight' -Accounts @('*S-1-5-21-1-1-1-1001')
+        $out | Should -Match '(?m)^SeDenyNetworkLogonRight = \*S-1-5-21-1-1-1-1001$'
+        $out | Should -Match '(?m)^SeServiceLogonRight = \*S-1-5-80-0$'
+    }
+
+    # REPLACED, not appended to. Appending leaves the previous membership in
+    # place, which for a deny right reads as working and for SeServiceLogonRight
+    # quietly widens who may log on as a service.
+    It 'replaces an existing line instead of appending to it' {
+        $inf = "[Privilege Rights]`r`nSeDenyNetworkLogonRight = *S-1-5-32-546`r`n"
+        $out = Edit-InfPrivilege -InfText $inf -Privilege 'SeDenyNetworkLogonRight' -Accounts @('*S-1-5-21-9')
+        $out | Should -Match '(?m)^SeDenyNetworkLogonRight = \*S-1-5-21-9$'
+        $out | Should -Not -Match 'S-1-5-32-546'
+        ([regex]::Matches($out, 'SeDenyNetworkLogonRight')).Count | Should -Be 1
+    }
+
+    It 'creates the section when the export has none' {
+        $out = Edit-InfPrivilege -InfText "[Unicode]`r`nUnicode=yes" -Privilege 'SeServiceLogonRight' -Accounts @('*S-1-5-21-7')
+        $out | Should -Match '(?m)^\[Privilege Rights\]$'
+        $out | Should -Match '(?m)^SeServiceLogonRight = \*S-1-5-21-7$'
+    }
+
+    It 'writes every account on the one line secedit reads' {
+        $out = Edit-InfPrivilege -InfText '[Privilege Rights]' -Privilege 'SeServiceLogonRight' `
+            -Accounts @('*S-1-5-21-1', '*S-1-5-21-2', '*S-1-5-21-3')
+        $out | Should -Match '(?m)^SeServiceLogonRight = \*S-1-5-21-1,\*S-1-5-21-2,\*S-1-5-21-3$'
+    }
+
+    # An INF is a Windows file and secedit is a Windows tool: a rewrite that
+    # emitted bare LF would be read back by an OS that expects CRLF, and the
+    # failure mode is a policy import that reports success having applied part of
+    # the file.
+    It 'keeps the line endings secedit expects' {
+        $out = Edit-InfPrivilege -InfText "[Privilege Rights]`r`nSeServiceLogonRight = *S-1-5-80-0`r`n" `
+            -Privilege 'SeDenyInteractiveLogonRight' -Accounts @('*S-1-5-21-4')
+        $out | Should -Match "`r`n"
+        ($out -split "`r`n" | Where-Object { $_ -match '^\[Privilege Rights\]$' }).Count | Should -Be 1
+    }
+
+    # Nothing outside the one line changes. secedit's INF carries sections this
+    # script has no business editing, and a rewrite that dropped [Unicode] gives
+    # an import failure whose message is about encoding.
+    It 'leaves every other line of the policy alone' {
+        $inf = "[Unicode]`r`nUnicode=yes`r`n[Version]`r`nsignature=`"`$CHICAGO`$`"`r`n[Privilege Rights]`r`nSeBatchLogonRight = *S-1-5-32-544`r`n"
+        $out = Edit-InfPrivilege -InfText $inf -Privilege 'SeServiceLogonRight' -Accounts @('*S-1-5-21-5')
+        $out | Should -Match '(?m)^Unicode=yes$'
+        $out | Should -Match '(?m)^signature='
+        $out | Should -Match '(?m)^SeBatchLogonRight = \*S-1-5-32-544$'
+    }
+}
