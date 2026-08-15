@@ -255,6 +255,16 @@ installs on every job — npm registry contents, Go module cache, Maven/Gradle
 artifacts, base container layers — is a candidate for baking. This is the one
 optimization that helps every repo without touching any repo's workflows.
 
+`packer/warm-cache/playwright.sh` is the first real one, and it is opt-in per
+pool rather than fleet-wide: the browser image is the largest thing baked into
+any image here and it helps only the repositories that run UI tests. It also
+shows the shape a **container** cache has to take — `docker save` to
+the root-owned `/opt/ci-images/`, loaded per slot at boot — because a plain
+pre-pull lands in a daemon no slot uses. Note that it is deliberately outside
+the group-writable `/opt/ci-cache`: a cached *file* is untrusted build input,
+but a cached *image* is executed in every slot on the host. See
+[`docs/ui-testing-on-the-fleet.md`](ui-testing-on-the-fleet.md).
+
 ### 4.3 Docker layer caching
 
 Image-building jobs (`image-smoke` at 138 s average, `docker-build` in
