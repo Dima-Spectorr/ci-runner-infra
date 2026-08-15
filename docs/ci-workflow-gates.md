@@ -21,7 +21,9 @@ and that vacuous pass is worse than no gate because it is believed.
 
 ```
 bash scripts/ci/check-runner-policy.sh [--selftest] [--scope=<label>]
-                                       [--forks=allowed|blocked] [<file>...]
+                                       [--forks=allowed|blocked]
+                                       [--max-timeout=<minutes>]
+                                       [--allow-dynamic-runner] [<file>...]
 ```
 
 With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
@@ -30,11 +32,27 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | id | Rule |
 |---|---|
 | `RUNNER0` | the file does not load, or the gate cannot run |
-| `RUNNER1` | a `runs-on` naming `self-hosted` also names a repository-scoping label |
+| `RUNNER1` | a fleet-reachable `runs-on` also names a repository-scoping label |
 | `RUNNER2` | with `--scope=<label>`, it is THAT label |
 | `RUNNER3` | every job that runs steps declares `timeout-minutes` (see the note below) |
-| `RUNNER4` | a fork-reachable workflow keeps self-hosted jobs behind a fork guard |
+| `RUNNER4` | a fork-reachable workflow keeps fleet-reachable jobs behind a fork guard |
 | `RUNNER5` | the runner is selected dynamically — reported as UNDECIDED, not passed |
+| `RUNNER6` | and the declared timeout is below the default it replaces |
+| `RUNNER7` | a REMOTE reusable workflow's jobs are not in this repository |
+
+### `self-hosted` is a label, not a requirement
+
+GitHub routes a job to any runner whose label set is a **superset** of what
+`runs-on` names, so `runs-on: Atlas` and `runs-on: [linux, gcp]` both reach this
+fleet without the marker appearing anywhere. An earlier revision gated
+RUNNER1/2/4 on seeing that literal, which made dropping one redundant label the
+cheapest way past all three at once.
+
+So the question is inverted. A job is fleet-reachable unless **every** label it
+names is a GitHub-hosted image (`ubuntu-*`, `windows-*`, `macos-*`), and a
+dynamically selected runner counts as reachable for the fork question — "not
+proven self-hosted" is not the same as "hosted", and spending it as such is an
+error in the passing direction.
 
 ### RUNNER1 is the security check
 
@@ -85,16 +103,38 @@ the consuming workflow where it is reviewable. `--forks=allowed` is the default
 and the strict reading; `--forks=blocked` is for a repository that has turned
 forking off, and is a claim its author is making in a diff.
 
-A guard counts when `head.repo.fork` or `head_repository` decides the job —
-in `if:` (which skips it) or in `runs-on` (which re-routes it):
+A guard counts by **direction, not mention**. The first version of this check
+asked whether `head.repo.fork` appeared in the job's `if:` or `runs-on`, which
+is a topic rather than a guard: `if: …head.repo.fork == true` names the fork and
+routes fork-authored code *exclusively* onto the warm pool — the precise attack
+RUNNER4 exists to stop, passing the check meant to stop it.
+
+Recognised as excluding a fork:
 
 ```yaml
+if: github.event.pull_request.head.repo.fork == false     # or != true, or !…fork
+if: github.event.pull_request.head.repo.full_name == github.repository
 runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNNER_LABEL }}
 ```
 
-That idiom is an expression, and it is clean rather than RUNNER5: the
-expression IS the routing decision RUNNER5 exists to ask about. An **unguarded**
-expression is still reported.
+The `runs-on` form counts only because its **fork-true branch names a hosted
+image**; written the other way round the same idiom hands forks the pool.
+Anything not recognised is unguarded — an unrecognised-but-correct guard costs
+one reported job and a reviewer's minute, where an unrecognised inversion costs
+the boundary.
+
+### Reachability crosses a local `uses:` call
+
+A `pull_request` workflow calling `./.github/workflows/build.yml` runs that
+callee's jobs in the caller's pull-request context. But the callee declares only
+`workflow_call`, so read alone it looks fork-unreachable and its self-hosted
+jobs are never asked for a guard — while the caller has no `runs-on` to judge.
+Both files clean, fork code on a warm host. Reachability is therefore computed
+across the whole file set before anything is judged, and transitively.
+
+A **remote** callee is a different answer: that document is not in this
+repository, so the RUNNER3 exemption a `uses:` job gets was handing the bound to
+jobs nobody read. That is RUNNER7.
 
 ### What it cannot decide
 
@@ -102,6 +142,23 @@ expression is still reported.
 against repository configuration this gate cannot see. Both are RUNNER5 —
 reported as undecidable rather than passed, because an expression is the one
 spelling that can quietly name any pool in the fleet.
+
+A fork guard used to silence RUNNER5 too, on the reasoning that the fleet's
+routing idiom *is* the decision RUNNER5 asks about. It is not: it decides where
+fork code goes and says nothing about which pool the other branch names, so fork
+isolation was standing in for pool scoping. The guard now settles RUNNER4 only,
+and a consumer whose pool genuinely comes from a repository variable its admins
+scope declares `--allow-dynamic-runner` in its own workflow — a claim in a diff,
+the same shape as `--forks=blocked`.
+
+### RUNNER6 — and the bound has to bind
+
+`timeout-minutes: 360` satisfies RUNNER3 and preserves in full the failure
+RUNNER3 exists to prevent: 360 **is** GitHub's default, so the job holds a warm
+slot for six hours exactly as an undeclared one does. Key presence was the wrong
+question. The ceiling is 360 by default and `--max-timeout=<n>` lowers it for a
+consumer whose merge queue expires sooner — a job outliving `checks_timeout` is
+dequeued silently rather than turning red.
 
 ### What it decides that looks undecidable
 
@@ -226,7 +283,7 @@ branch that already bounds every job.
 | Specaria-Platform | 12 | clean | 55 × PIN1 |
 | Telnet-Emulation | 5 | 13 × RUNNER3 | 28 × PIN1 |
 | apigee-portal | 15 | clean | 93 × PIN1 |
-| entity-platform | 3 | 16 × RUNNER3, 3 × RUNNER5 | 31 × PIN1 |
+| entity-platform | 3 | 16 × RUNNER3, 7 × RUNNER5 | 31 × PIN1 |
 
 Three readings matter.
 
@@ -239,10 +296,16 @@ have found by reading, and a check that fires everywhere is measuring a
 convention rather than a hazard.
 
 RUNNER5 is not a finding about the gate, it is a finding about the repository.
-Borsh-Tablet-App's seven and entity-platform's three are jobs whose pool is
+Borsh-Tablet-App's seven and entity-platform's seven are jobs whose pool is
 chosen by repository configuration; three of entity-platform's read
 `${{ vars.CI_RUNNER_LABEL }}` bare, with no fork guard and no fallback, so an
 unset variable resolved them to an **empty label set**.
+
+entity-platform's four extra appeared when the fork guard stopped silencing
+RUNNER5 (see above) — they were always dynamic, the guard was answering for
+them. Neither repository is expected to stay red: a consumer that has decided its variable is
+admin-scoped says so with `--allow-dynamic-runner`, which is a line in a diff
+someone approves rather than a gate quietly agreeing with itself.
 
 Run in report mode before enforcing:
 

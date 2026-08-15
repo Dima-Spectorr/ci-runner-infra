@@ -6,17 +6,34 @@
 #   bash scripts/ci/check-runner-policy.sh [--selftest]
 #                                          [--scope=<label>]
 #                                          [--forks=allowed|blocked]
+#                                          [--max-timeout=<minutes>]
+#                                          [--allow-dynamic-runner]
 #                                          [<file>...]
 #
 # PURPOSE
-#   Three properties of a `.github/workflows/*.yml` job, all of which have
-#   already gone wrong on this fleet and none of which any existing gate reads:
+#   Properties of a `.github/workflows/*.yml` job, all of which have already
+#   gone wrong on this fleet and none of which any existing gate reads:
 #
-#     RUNNER1  a `runs-on` that names `self-hosted` must also name a label that
-#              SCOPES it to one repository.
+#     RUNNER1  a fleet-reachable `runs-on` also names a label that SCOPES it to
+#              one repository.
 #     RUNNER2  and, with `--scope=<label>`, it must be THAT label.
 #     RUNNER3  every job declares `timeout-minutes`.
 #     RUNNER4  a workflow reachable by fork code keeps that code off the pool.
+#     RUNNER5  the runner is selected dynamically — UNDECIDED, not passed.
+#     RUNNER6  and the declared timeout is actually below the default it replaces.
+#     RUNNER7  a REMOTE reusable workflow's jobs are not in this repository.
+#
+# WHAT COUNTS AS REACHING THE FLEET
+#   `self-hosted` is a LABEL, not a requirement. GitHub routes a job to any
+#   runner whose label set is a SUPERSET of what `runs-on` names, so
+#   `runs-on: IntegrateIT` and `runs-on: [linux, gcp]` both reach this fleet
+#   without the marker ever appearing. An earlier revision gated RUNNER1/2/4 on
+#   seeing that literal, which made omitting one redundant label the cheapest
+#   way past all three. So the question is inverted: a job is treated as
+#   fleet-reachable unless EVERY label it names is a GitHub-hosted image
+#   (`ubuntu-*`, `windows-*`, `macos-*`), and a dynamically selected runner —
+#   an expression or a `{group:}` — counts as reachable for the fork question,
+#   because "not proven self-hosted" is not "hosted".
 #
 # WHY RUNNER1 IS A SECURITY CHECK AND NOT TIDINESS
 #   Every pool on this fleet answers to `self-hosted, <os>, gcp` plus ONE
@@ -59,8 +76,26 @@
 #   request teaches its readers to disable the gate. So the posture is DECLARED,
 #   once, in the consuming workflow where it is reviewable — `--forks=blocked`
 #   for a repository whose forking is off, `--forks=allowed` (the default) for
-#   every other, where each self-hosted job must then carry a guard naming
-#   `head.repo.fork` in its `if:` or in its `runs-on`.
+#   every other, where each self-hosted job must then carry a guard that
+#   EXCLUDES or RE-ROUTES forks in its `if:` or in its `runs-on`.
+#
+#   Direction, not mention. `if: …head.repo.fork == true` names the fork and
+#   selects fork-authored code exclusively onto the warm pool — the precise
+#   attack RUNNER4 exists to stop — so a check that looked for the substring
+#   passed the inversion of the thing it was checking. Only readable exclusions
+#   count (`== false`, `!= true`, `!<fork>`, a same-repository `full_name` test)
+#   and, in `runs-on`, only a route whose FORK-TRUE branch names a hosted image.
+#   Anything else is unguarded: an unrecognised-but-correct guard costs one
+#   reported job, where an unrecognised inversion costs the boundary.
+#
+# WHY REACHABILITY CROSSES A LOCAL `uses:` CALL
+#   A `pull_request` workflow that calls `./.github/workflows/build.yml` runs
+#   that callee's jobs in the caller's pull-request context — but the callee
+#   declares only `workflow_call`, so judged alone it looks fork-unreachable and
+#   its self-hosted jobs are never asked for a guard, while the caller has no
+#   `runs-on` to judge. Read apart, both files are clean and fork code is on a
+#   warm host. So reachability is computed over the whole file set first, and
+#   transitively.
 #
 # WHY IT PARSES INSTEAD OF GREPPING
 #   The same reason `check-merge-queue-single-step.sh` gives: the properties are
@@ -90,13 +125,16 @@
 #   `include:`/`exclude:` that can add or override legs, a value that is itself
 #   an expression, or anything that is not parseable JSON.
 #
-#   The one exception is the fleet's own fork-routing idiom —
+#   The fleet's own fork-routing idiom —
 #   `runs-on: ${{ …head.repo.fork && 'ubuntu-latest' || vars.CI_RUNNER_LABEL }}`
-#   — which is an expression BECAUSE it is making the routing decision this gate
-#   wants made. RUNNER5 stays quiet there. It has to: a gate that reports on the
-#   pattern it is asking every consumer to adopt is a gate they turn off, and
-#   what sits behind `vars.CI_RUNNER_LABEL` is a repository setting rather than
-#   a property of the file. An UNGUARDED expression is still reported.
+#   — used to silence RUNNER5 as well, on the reasoning that the expression IS
+#   the routing decision RUNNER5 asks about. It is not. It decides where FORK
+#   code goes and says nothing about which pool the other branch names, so fork
+#   isolation was standing in for pool scoping: two properties, one answer, and
+#   the answer belonged to the other question. The guard now settles RUNNER4
+#   only. A consumer whose pool genuinely comes from a repository variable its
+#   admins scope says so with `--allow-dynamic-runner` — in its own workflow,
+#   in a diff, the same shape as `--forks=blocked`.
 #
 # EXIT CODES
 #   0 — clean
@@ -215,6 +253,51 @@ MATRIX_RUNS_ON = re.compile(
     r"((?:\.[A-Za-z0-9_-]+)?)\s*\)\s*\}\}\s*$"
 )
 
+# --- fork guards, by DIRECTION and not by mention -----------------------------
+# The first version of this asked whether the text `head.repo.fork` appeared
+# anywhere in the job's `if:` or `runs-on`. That is not a guard, it is a topic:
+# `if: github.event.pull_request.head.repo.fork == true` mentions it and selects
+# fork-authored code EXCLUSIVELY onto the warm pool — the precise attack RUNNER4
+# exists to stop, passing the check meant to stop it.
+#
+# So only shapes that demonstrably EXCLUDE or RE-ROUTE forks count, and anything
+# else is unguarded. That direction is deliberate: an unrecognised-but-correct
+# guard costs one reported job and one reviewer's minute, where an unrecognised
+# inversion costs the boundary.
+FORK = r"(?:github\.event\.)?pull_request\.head\.repo\.fork|head\.repo\.fork"
+SAME_REPO = (
+    r"(?:head_repository|head\.repo)\.full_name\s*==\s*github\.repository"
+    r"|github\.repository\s*==\s*(?:[\w.]*\.)?(?:head_repository|head\.repo)\.full_name"
+)
+IF_EXCLUDES = re.compile(
+    # `fork == false`, `fork != true`, `!<...>fork`, or a same-repository test.
+    r"(?:(?:%s)\s*==\s*false"
+    r"|(?:%s)\s*!=\s*true"
+    r"|![\w.\s]*(?:%s)"
+    r"|%s)" % (FORK, FORK, FORK, SAME_REPO),
+    re.IGNORECASE,
+)
+# `${{ <fork> && 'ubuntu-latest' || vars.CI_RUNNER_LABEL }}` — the fleet's
+# routing idiom. What makes it a guard is that the FORK-TRUE branch names a
+# GitHub-hosted image; written the other way round it hands forks the pool.
+RUNS_ON_ROUTES = re.compile(
+    r"(?:%s)\s*&&\s*'([^']*)'" % FORK, re.IGNORECASE
+)
+HOSTED_IMAGE = re.compile(r"^(?:ubuntu|windows|macos)-", re.IGNORECASE)
+
+
+def fork_guarded(job):
+    """True only for a guard whose direction is readable and correct."""
+    condition = job.get("if")
+    if isinstance(condition, str) and IF_EXCLUDES.search(condition):
+        return True
+    runs_on = job.get("runs-on")
+    if isinstance(runs_on, str):
+        hit = RUNS_ON_ROUTES.search(runs_on)
+        if hit and HOSTED_IMAGE.match(hit.group(1).strip()):
+            return True
+    return False
+
 
 def resolve_matrix_legs(job):
     """Label lists for each leg of a matrix-selected `runs-on`, or None.
@@ -292,8 +375,7 @@ for job_id, job in jobs.items():
     # skips the job, `runs-on` re-routes it. Read from the JOB, not the leg: a
     # matrix cannot decide whether the head repository is a fork, so every leg
     # inherits the one answer.
-    guard = " ".join(str(job.get(k, "")) for k in ("if", "runs-on"))
-    guarded = "head.repo.fork" in guard or "head_repository" in guard
+    guarded = fork_guarded(job)
 
     for vid, runs_on in variants:
         out("#JOB", vid)
@@ -304,6 +386,20 @@ for job_id, job in jobs.items():
         # separately.
         if "uses" in job:
             out("#REUSABLE", vid)
+            # …and "separately" was doing unearned work. A LOCAL callee's own
+            # file declares only `workflow_call`, so it looked fork-unreachable
+            # while the caller — which has the `pull_request` trigger — has no
+            # `runs-on` to judge. Fork reachability therefore has to be carried
+            # ACROSS the call, which is what this record lets the caller do.
+            target = job["uses"] if isinstance(job.get("uses"), str) else ""
+            if target.strip().startswith("./"):
+                out("#CALLS", vid, target.strip().split("@")[0])
+            elif target.strip():
+                # Another repository's file, which this gate does not have. The
+                # RUNNER3 exemption above still applies — a `uses:` job accepts
+                # no timeout — but nothing here has read the jobs that exemption
+                # hands the bound to.
+                out("#REMOTECALL", vid, target.strip())
 
         if "timeout-minutes" in job:
             out("#TIMEOUT", vid, job.get("timeout-minutes"))
@@ -328,13 +424,38 @@ PY
 }
 
 # --- the checks --------------------------------------------------------------
+# `grep -E` metacharacters in a value that is about to become a pattern. A YAML
+# job id may legally contain `.`, `[`, `+` and more, and unescaped those match
+# MORE records than intended — one job's timeout answering for another's, which
+# is an error in the direction that reports clean.
+re_quote() { printf '%s' "$1" | sed 's/[][\.^$*+?(){}|\\\/]/\\&/g'; }
+
+# Files a `pull_request` workflow can reach through a local `uses:` call — see
+# `compute_reachable`. Newline-separated absolute paths.
+REACHABLE_PR=""
+# A `timeout-minutes` at or above this bounds nothing GitHub was not already
+# bounding. Overridable downwards by a consumer whose queue expires sooner.
+MAX_TIMEOUT=360
+# Declared acceptance of an undecidable pool — see RUNNER5.
+ALLOW_DYNAMIC=0
+
 # `scope` empty means RUNNER2 is not asserted; `forks` is the declared posture.
 check_file() {
   local file="$1" scope="$2" forks="$3"
-  local records rel
+  local records status rel
   rel="${file#"$REPO_ROOT"/}"
 
+  # The reader's exit status, not merely its output. Killed mid-write or dying
+  # on an interpreter-level fault it emits no `#ERR` and no records, and an
+  # empty record set is indistinguishable from a file with nothing wrong in it.
+  # That is precisely the vacuous pass this gate is arranged against, so it is
+  # caught rather than trusted.
   records="$(read_workflow "$file")"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    err RUNNER0 "$rel: the YAML reader exited $status without a verdict — treating as unreadable rather than clean"
+    return
+  fi
 
   # `grep -c`, not `grep -q`, for the reason spelled out at the next use of it
   # below: `-q` exits at the first match, the writer takes SIGPIPE, and
@@ -354,30 +475,63 @@ check_file() {
      [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
     has_pr=1
   fi
+  # …or reached from one. A callee declares only `workflow_call` and runs with
+  # the caller's pull-request context, so judging it on its own triggers reads a
+  # self-hosted job with no guard as unreachable by forks.
+  if [ "$has_pr" -eq 0 ] && printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$file"; then
+    has_pr=1
+  fi
 
-  local job
+  local job job_re
   while IFS= read -r job; do
     [ -n "$job" ] || continue
+    job_re="$(re_quote "$job")"
 
-    local labels self_hosted=0 scoped=0 label
-    labels="$(printf '%s\n' "$records" | sed -n "s/^#LABEL\t${job}\t//p")"
+    local labels self_hosted=0 scoped=0 hosted_only=1 label
+    labels="$(printf '%s\n' "$records" | sed -n "s/^#LABEL\t${job_re}\t//p")"
     while IFS= read -r label; do
       [ -n "$label" ] || continue
       if printf '%s' "$label" | grep -qiE "^self-hosted$"; then
         self_hosted=1
-      elif ! printf '%s' "$label" | grep -qiE "^(${GENERIC})$"; then
-        scoped=1
+        hosted_only=0
+      else
+        # A label that is not a GitHub-hosted image is a label some runner in
+        # the fleet was registered with.
+        printf '%s' "$label" | grep -qiE "^(ubuntu|windows|macos)-" || hosted_only=0
+        printf '%s' "$label" | grep -qiE "^(${GENERIC})$" || scoped=1
       fi
     done <<EOF
 $labels
 EOF
 
-    local has_expr=0 has_group=0 has_guard=0 has_timeout=0 reusable=0
-    [ "$(printf '%s\n' "$records" | grep -c "^#EXPR	${job}$")" -gt 0 ] && has_expr=1
-    [ "$(printf '%s\n' "$records" | grep -c "^#GROUP	${job}$")" -gt 0 ] && has_group=1
-    [ "$(printf '%s\n' "$records" | grep -c "^#FORKGUARD	${job}$")" -gt 0 ] && has_guard=1
-    [ "$(printf '%s\n' "$records" | grep -c "^#TIMEOUT	${job}	")" -gt 0 ] && has_timeout=1
-    [ "$(printf '%s\n' "$records" | grep -c "^#REUSABLE	${job}$")" -gt 0 ] && reusable=1
+    # `self-hosted` is a label, not a requirement. GitHub routes a job to any
+    # runner carrying a SUPERSET of what `runs-on` names, so `runs-on: Atlas`
+    # and `runs-on: [linux, gcp]` both reach this fleet without the marker —
+    # and gating every isolation check on the marker meant the cheapest way to
+    # bypass RUNNER1/2/4 was to omit one redundant label. So the question is
+    # inverted: a job is treated as fleet-reachable unless every label it names
+    # is a GitHub-hosted image.
+    if [ -n "$labels" ] && [ "$hosted_only" -eq 0 ]; then
+      self_hosted=1
+    fi
+
+    local has_expr=0 has_group=0 has_guard=0 has_timeout=0 reusable=0 timeout=""
+    [ "$(printf '%s\n' "$records" | grep -c "^#EXPR	${job_re}$")" -gt 0 ] && has_expr=1
+    [ "$(printf '%s\n' "$records" | grep -c "^#GROUP	${job_re}$")" -gt 0 ] && has_group=1
+    [ "$(printf '%s\n' "$records" | grep -c "^#FORKGUARD	${job_re}$")" -gt 0 ] && has_guard=1
+    [ "$(printf '%s\n' "$records" | grep -c "^#REUSABLE	${job_re}$")" -gt 0 ] && reusable=1
+    timeout="$(printf '%s\n' "$records" | sed -n "s/^#TIMEOUT\t${job_re}\t//p" | head -1)"
+    [ -n "$timeout" ] && has_timeout=1
+
+    # An expression or a group names no label this gate can read, so the label
+    # loop above proves nothing either way — and "not proven self-hosted" was
+    # being spent as "hosted", which is the passing direction. A dynamically
+    # selected runner may be any pool in the fleet, so it is treated as one for
+    # the fork question. RUNNER1/RUNNER2 stay quiet: those ask WHICH pool, and
+    # that genuinely is not decidable here.
+    if [ "$has_expr" -eq 1 ] || [ "$has_group" -eq 1 ]; then
+      self_hosted=1
+    fi
 
     # RUNNER3 — the bound on the slot. Asserted for every job that runs steps,
     # hosted or not: a hung GitHub-hosted job costs no pool slot but still holds
@@ -386,15 +540,25 @@ EOF
       err RUNNER3 "$rel: job '$job' declares no timeout-minutes (inherits GitHub's 360-minute default)"
     fi
 
+    # RUNNER6 — and the bound has to bind. `timeout-minutes: 360` satisfies
+    # RUNNER3 while preserving in full the failure it exists to prevent: it IS
+    # GitHub's default, so a job declaring it holds a warm slot for six hours
+    # exactly as an undeclared one does. Key presence was the wrong question.
+    if [ "$has_timeout" -eq 1 ] && printf '%s' "$timeout" | grep -qE '^[0-9]+$'; then
+      if [ "$timeout" -ge "$MAX_TIMEOUT" ]; then
+        err RUNNER6 "$rel: job '$job' declares timeout-minutes: $timeout, which is not below the $MAX_TIMEOUT-minute ceiling — it bounds nothing GitHub was not already bounding"
+      fi
+    fi
+
     if [ "$self_hosted" -eq 1 ]; then
       # RUNNER1 — the boundary. A pool is scoped by a label no other pool
       # carries; without one this job is offered to the whole fleet.
-      if [ "$scoped" -eq 0 ] && [ "$has_expr" -eq 0 ]; then
+      if [ "$scoped" -eq 0 ] && [ "$has_expr" -eq 0 ] && [ "$has_group" -eq 0 ]; then
         err RUNNER1 "$rel: job '$job' runs-on [$(printf '%s' "$labels" | tr '\n' ' ')] — self-hosted with no repository-scoped label, so ANY pool in the fleet may run it"
       fi
 
       # RUNNER2 — the stronger form, for a consumer that names its own pool.
-      if [ -n "$scope" ] && [ "$has_expr" -eq 0 ]; then
+      if [ -n "$scope" ] && [ "$has_expr" -eq 0 ] && [ "$has_group" -eq 0 ]; then
         if [ "$(printf '%s\n' "$labels" | grep -cix -- "$scope")" -eq 0 ]; then
           err RUNNER2 "$rel: job '$job' is self-hosted but does not carry the declared scope label '$scope'"
         fi
@@ -409,14 +573,80 @@ EOF
     # RUNNER5 — undecidable, and said out loud. An expression or a runner group
     # resolves against configuration this gate cannot read, and an expression is
     # the one spelling that can name any pool in the fleet.
+    #
+    # A fork guard used to silence this, on the reasoning that the fleet's
+    # routing idiom IS the decision RUNNER5 asks about. It is not: it decides
+    # where FORK code goes, and says nothing about which pool the other branch
+    # names. Fork isolation was standing in for pool scoping — two properties,
+    # one answer, and the answer belonged to the other question. So the guard
+    # now silences RUNNER4 only, and a consumer whose pool genuinely comes from
+    # a repository variable declares that with `--allow-dynamic-runner`, in its
+    # workflow, where it is reviewable — the same shape as `--forks=blocked`.
     if [ "$has_expr" -eq 1 ] || [ "$has_group" -eq 1 ]; then
-      if [ "$has_guard" -eq 0 ]; then
-        err RUNNER5 "$rel: job '$job' selects its runner dynamically and carries no fork guard — this gate cannot decide which pool it claims"
+      if [ "$ALLOW_DYNAMIC" -eq 0 ]; then
+        err RUNNER5 "$rel: job '$job' selects its runner dynamically — this gate cannot decide which pool it claims (declare --allow-dynamic-runner if the label is a repository variable your admins scope)"
       fi
+    fi
+
+    # RUNNER7 — the exemption above, made honest. A `uses:` job takes no
+    # timeout because the bound belongs to the called workflow's jobs; for a
+    # LOCAL callee this gate reads those jobs, and now carries fork
+    # reachability into them. For a REMOTE one it holds neither file nor
+    # jobs, so the exemption was handing the property to a document nobody
+    # checked. Undecided and said so, like RUNNER5.
+    local remote
+    remote="$(printf '%s\n' "$records" | sed -n "s/^#REMOTECALL\t${job_re}\t//p" | head -1)"
+    if [ -n "$remote" ]; then
+      err RUNNER7 "$rel: job '$job' calls the remote reusable workflow '$remote' — its jobs' runner scope and timeouts are not in this repository, so this gate cannot decide them"
     fi
   done <<EOF
 $(printf '%s\n' "$records" | sed -n 's/^#JOB\t//p')
 EOF
+}
+
+# --- fork reachability across local reusable workflows -----------------------
+# A `pull_request` workflow that calls `./.github/workflows/build.yml` runs that
+# callee's jobs in the caller's pull-request context, with the caller's ref
+# checked out — but the callee's own file declares `workflow_call` and nothing
+# else, so read alone it looks unreachable by forks and its self-hosted jobs are
+# never asked for a guard. Reachability is therefore computed over the whole
+# file set first, transitively, and only then are the files judged.
+#
+# It follows LOCAL calls only. A remote `uses:` is another repository's file,
+# which this gate does not have; that limitation is named in RUNNER7 rather than
+# assumed away.
+compute_reachable() {
+  local f records seed="" edges="" caller target changed=1 line
+  for f in "$@"; do
+    records="$(read_workflow "$f")" || continue
+    if [ "$(printf '%s\n' "$records" | grep -c '^#PR$')" -gt 0 ] ||
+       [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
+      seed="$seed$f"$'\n'
+    fi
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      target="$(cd "$(dirname "$f")/../.." 2>/dev/null && pwd)/${line#./}"
+      edges="$edges$f	$target"$'\n'
+    done <<EOF
+$(printf '%s\n' "$records" | sed -n 's/^#CALLS\t[^\t]*\t//p')
+EOF
+  done
+
+  REACHABLE_PR="$seed"
+  # Fixpoint rather than one hop: a caller may reach a callee that itself calls
+  # another, and the pool at the end of that chain is as reachable as the first.
+  while [ "$changed" -eq 1 ]; do
+    changed=0
+    while IFS=$'\t' read -r caller target; do
+      [ -n "${target:-}" ] || continue
+      printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$caller" || continue
+      printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$target" && continue
+      REACHABLE_PR="$REACHABLE_PR$target"$'\n'
+      changed=1
+    done <<EOF
+$edges
+EOF
+  done
 }
 
 # --- self-test ---------------------------------------------------------------
@@ -437,10 +667,10 @@ selftest() {
   # Asserts the SET of check ids a fixture produces. A count would let one
   # detector's regression hide behind another firing on the same file.
   expect() {
-    local name="$1" want="$2" scope="$3" forks="$4" body="$5"
+    local name="$1" want="$2" scope="$3" forks="$4" body="$5" dynamic="${6:-0}"
     local got out_text
     printf '%s\n' "$body" > "$tmp/wf.yml"
-    out_text="$(fail=0; check_file "$tmp/wf.yml" "$scope" "$forks" 2>&1)"
+    out_text="$(fail=0; ALLOW_DYNAMIC=$dynamic; check_file "$tmp/wf.yml" "$scope" "$forks" 2>&1)"
     got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr '\n' ' ')"
     got="$(printf '%s' "$got" | sed 's/ *$//')"
     if [ "$got" != "$want" ]; then
@@ -523,14 +753,77 @@ jobs:
     timeout-minutes: 30
     steps: [{run: "true"}]'
 
-  # The fleet's fork-routing idiom. It is an expression, and it is clean: the
-  # expression IS the routing decision RUNNER5 exists to ask about.
-  expect "fork guard by re-routing runs-on" "" "" allowed \
+  # The fleet's fork-routing idiom. The guard is real — forks go to a hosted
+  # image — so RUNNER4 is answered. RUNNER5 is NOT: which pool the other branch
+  # names is still a repository variable, and letting the guard answer both was
+  # fork isolation vouching for pool scoping.
+  expect "fork routing answers RUNNER4 and not RUNNER5" "RUNNER5" "" allowed \
 'on:
   pull_request:
 jobs:
   build:
     runs-on: ${{ github.event.pull_request.head.repo.fork && '"'"'ubuntu-latest'"'"' || vars.CI_RUNNER_LABEL }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "…and the consumer may declare that pool undecidable-but-accepted" "" "" allowed \
+'on:
+  pull_request:
+jobs:
+  build:
+    runs-on: ${{ github.event.pull_request.head.repo.fork && '"'"'ubuntu-latest'"'"' || vars.CI_RUNNER_LABEL }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]' 1
+
+  # Written the other way round, the SAME idiom hands forks the pool. The first
+  # version of this gate read both as guarded, because it looked for the topic
+  # rather than the direction.
+  expect "inverted routing sends forks TO the pool" "RUNNER4 RUNNER5" "" allowed \
+'on:
+  pull_request:
+jobs:
+  build:
+    runs-on: ${{ github.event.pull_request.head.repo.fork && vars.CI_RUNNER_LABEL || '"'"'ubuntu-latest'"'"' }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "an inverted if: guard is not a guard" "RUNNER4" "" allowed \
+'on:
+  pull_request:
+jobs:
+  build:
+    if: github.event.pull_request.head.repo.fork == true
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "mentioning the fork is not excluding it" "RUNNER4" "" allowed \
+'on:
+  pull_request:
+jobs:
+  build:
+    if: github.event.pull_request.head.repo.fork
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "negation is a guard" "" "" allowed \
+'on:
+  pull_request:
+jobs:
+  build:
+    if: "!github.event.pull_request.head.repo.fork"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "a same-repository test is a guard" "" "" allowed \
+'on:
+  pull_request:
+jobs:
+  build:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 30
     steps: [{run: "true"}]'
 
@@ -657,6 +950,53 @@ jobs:
           - {name: api, runs_on: "${{ vars.CI_RUNNER_JSON }}"}
     steps: [{run: "true"}]'
 
+  # `self-hosted` is a label, not a requirement: GitHub routes to any runner
+  # whose labels are a SUPERSET of what `runs-on` names. Dropping the marker was
+  # therefore the cheapest way past every check gated on it.
+  expect "a repository label alone still reaches the pool" "RUNNER4" "" allowed \
+'on:
+  pull_request:
+jobs:
+  build:
+    runs-on: ExampleRepo
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "platform labels alone reach the whole fleet" "RUNNER1" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: [linux, gcp]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "a hosted image is not the fleet" "" "" allowed \
+'on:
+  pull_request:
+jobs:
+  build:
+    runs-on: [ubuntu-24.04]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # RUNNER3 satisfied, RUNNER3 defeated: 360 IS the default it exists to
+  # replace, so the six-hour warm slot survives the check unchanged.
+  expect "a timeout equal to the default bounds nothing" "RUNNER6" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps: [{run: "true"}]'
+
+  # The RUNNER3 exemption for a `uses:` job hands the bound to the called
+  # workflow. For a remote callee that document is not in this repository.
+  expect "a remote reusable workflow is undecidable" "RUNNER7" "" blocked \
+'on: [push]
+jobs:
+  call:
+    uses: owner/repo/.github/workflows/ci.yml@11bd71901bbe5b1630ceea73d27597364c9af683'
+
   expect "unparseable document" "RUNNER0" "" allowed \
 'jobs: [ this is not a workflow'
 
@@ -668,6 +1008,76 @@ jobs:
 on:
   pull_request:
     types: [opened]
+jobs:
+  build:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # --- the two-file fixture --------------------------------------------------
+  # Fork reachability is a property of a PAIR of files, so it cannot be asserted
+  # with `expect`, which judges one. The caller has the `pull_request` trigger
+  # and no runner; the callee has the runner and only a `workflow_call` trigger.
+  # Read apart they are each clean, and fork-authored code reaches a warm host.
+  expect_pair() {
+    local name="$1" want="$2" caller_body="$3" callee_body="$4"
+    local got out_text dir="$tmp/pair"
+    rm -rf "$dir"; mkdir -p "$dir/.github/workflows"
+    printf '%s\n' "$caller_body" > "$dir/.github/workflows/caller.yml"
+    printf '%s\n' "$callee_body" > "$dir/.github/workflows/callee.yml"
+    out_text="$(fail=0
+      compute_reachable "$dir/.github/workflows/caller.yml" "$dir/.github/workflows/callee.yml"
+      check_file "$dir/.github/workflows/caller.yml" "" allowed
+      check_file "$dir/.github/workflows/callee.yml" "" allowed 2>&1)"
+    got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr '\n' ' ')"
+    got="$(printf '%s' "$got" | sed 's/ *$//')"
+    if [ "$got" != "$want" ]; then
+      echo "FAIL $name: want ids [$want], got [$got]"
+      printf '%s\n' "$out_text" | sed 's/^/      /'
+      status=1
+    else
+      echo "ok   $name [$want]"
+    fi
+  }
+
+  expect_pair "fork reachability crosses a local reusable-workflow call" "RUNNER4" \
+'on:
+  pull_request:
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml' \
+'on:
+  workflow_call:
+jobs:
+  build:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect_pair "…and the callee's own guard answers it" "" \
+'on:
+  pull_request:
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml' \
+'on:
+  workflow_call:
+jobs:
+  build:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # …and a callee nobody reaches from a pull request is not asked for a guard.
+  expect_pair "an unreached callee is not fork-reachable" "" \
+'on:
+  push:
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml' \
+'on:
+  workflow_call:
 jobs:
   build:
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
@@ -694,6 +1104,8 @@ main() {
       --selftest) run_selftest=1 ;;
       --scope=*)  scope="${arg#--scope=}" ;;
       --forks=*)  forks="${arg#--forks=}" ;;
+      --max-timeout=*) MAX_TIMEOUT="${arg#--max-timeout=}" ;;
+      --allow-dynamic-runner) ALLOW_DYNAMIC=1 ;;
       -*)         echo "::error::[RUNNER0] unknown option: $arg"; return 1 ;;
       *)          files+=("$arg") ;;
     esac
@@ -703,6 +1115,11 @@ main() {
     allowed|blocked) ;;
     *) echo "::error::[RUNNER0] --forks must be 'allowed' or 'blocked', got '$forks'"; return 1 ;;
   esac
+
+  if ! printf '%s' "$MAX_TIMEOUT" | grep -qE '^[1-9][0-9]*$'; then
+    echo "::error::[RUNNER0] --max-timeout must be a positive integer, got '$MAX_TIMEOUT'"
+    return 1
+  fi
 
   if ! ensure_yaml; then
     # Reported and failed, never skipped: a gate that cannot read is not a gate
@@ -732,6 +1149,10 @@ EOF
     echo "::error::[RUNNER0] no workflow files found under .github/workflows — nothing was checked"
     return 1
   fi
+
+  # Reachability across the whole set first — a callee's verdict depends on a
+  # caller this loop may not have reached yet.
+  compute_reachable "${files[@]}"
 
   local f
   for f in "${files[@]}"; do

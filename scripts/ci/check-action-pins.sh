@@ -44,6 +44,15 @@
 #   of it is a visible argument in the consuming workflow rather than a silent
 #   default here.
 #
+# WHY COMPOSITE ACTIONS ARE SCANNED TOO
+#   Exempting `./.github/actions/setup` is right — and it was also a hole. That
+#   action's own `action.yml` may `uses: third/party@main`, which then executes
+#   inside the calling job, on the calling job's runner, with the calling job's
+#   token. The exemption was reading "local, therefore immutable" when what is
+#   local is only the WRAPPER. So discovery covers `.github/actions/**` manifests
+#   as well as `.github/workflows/*`, and the parser reads `runs.steps[].uses`
+#   for a document that has no `jobs:`.
+#
 # EXIT CODES
 #   0 — clean
 #   1 — an unpinned reference
@@ -110,6 +119,15 @@ if not isinstance(doc, dict):
 
 jobs = doc.get("jobs")
 if not isinstance(jobs, dict):
+    # No `jobs:` — this may be a composite action manifest, whose `runs.steps`
+    # execute on the CALLING job's runner with the calling job's token. A local
+    # `uses:` is exempt from pinning because the wrapper is immutable; what the
+    # wrapper then reaches for is not.
+    runs = doc.get("runs")
+    if isinstance(runs, dict) and isinstance(runs.get("steps"), list):
+        for i, step in enumerate(runs["steps"]):
+            if isinstance(step, dict) and isinstance(step.get("uses"), str):
+                out("#USES", "runs", i, step["uses"].strip())
     sys.exit(0)
 
 for job_id, job in jobs.items():
@@ -131,16 +149,33 @@ PY
 
 # A 40-hex commit. Not `[0-9a-f]{7,}` — an abbreviated SHA is ambiguous by
 # construction and GitHub resolves it against whatever the repository holds at
-# resolution time, which is the mutability this gate exists to remove.
-SHA_RE='^[0-9a-f]{40}$'
+# resolution time, which is the mutability this gate exists to remove. Hex is
+# case-insensitive: git writes lowercase, but a pin pasted uppercase is still a
+# pin, and failing it would be this gate reporting on a house style.
+SHA_RE='^[0-9a-fA-F]{40}$'
+
+# `grep -E` metacharacters in a value that is about to become a pattern. Action
+# paths carry `.` routinely (`owner/action.js`), and unescaped that matches any
+# character — which reads as MORE lines matching, i.e. in the passing direction.
+re_quote() { printf '%s' "$1" | sed 's/[][\.^$*+?(){}|\\\/]/\\&/g'; }
 
 check_file() {
-  local file="$1" rel records job step ref owner path version
+  local file="$1" rel records status job step ref owner path version
   shift
   local -a allow=("$@")
   rel="${file#"$REPO_ROOT"/}"
 
+  # The parser's exit status, not just its output. Killed by the OOM killer or
+  # dying on an interpreter-level fault, it emits no `#ERR` and no records — and
+  # an empty record set is indistinguishable from a clean file. That is the
+  # vacuous pass this gate's whole design is arranged against, so it is caught
+  # here rather than trusted.
   records="$(read_uses "$file")"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    err PIN0 "$rel: the YAML reader exited $status without a verdict — treating as unreadable rather than clean"
+    return
+  fi
 
   if [ "$(printf '%s\n' "$records" | grep -c '^#ERR	')" -gt 0 ]; then
     err PIN0 "$rel: $(printf '%s\n' "$records" | sed -n 's/^#ERR\t//p' | head -1)"
@@ -186,11 +221,21 @@ check_file() {
     fi
 
     # PIN2 — the readable half, asserted on the raw line because a comment is
-    # not part of the loaded document. Matched on the SHA rather than on the
-    # line number: the loaded document has no line numbers, and a step's
-    # position in the list is not its position in the file.
-    if [ "$(grep -c -- "$version.*#" "$file")" -eq 0 ]; then
-      err PIN2 "$rel: job '$job' step $step pins '$path' to $version with no version comment — write '$path@$version # <tag>' so the bump is reviewable"
+    # not part of the loaded document.
+    #
+    # It is asserted on EVERY raw line naming this reference, and that plural is
+    # the whole correctness of it. An earlier revision asked whether the SHA
+    # appeared anywhere in the file beside a `#`, which is a file-wide question
+    # answered by any ONE commented occurrence — so a second `uses:` on the same
+    # SHA with no comment passed by standing next to the first. `actions/checkout`
+    # appears three or four times in a typical workflow here, so that was not a
+    # corner case, it was the common one.
+    local ref_re n_uses n_commented
+    ref_re="$(re_quote "$path@$version")"
+    n_uses="$(grep -cE "uses:[[:space:]]*['\"]?${ref_re}['\"]?([[:space:]]|\$)" "$file")"
+    n_commented="$(grep -cE "uses:[[:space:]]*['\"]?${ref_re}['\"]?[[:space:]]*#" "$file")"
+    if [ "$n_uses" -gt "$n_commented" ]; then
+      err PIN2 "$rel: job '$job' step $step pins '$path' to $version with no version comment on $((n_uses - n_commented)) of $n_uses reference(s) — write '$path@$version # <tag>' on each so the bump is reviewable"
     fi
   done <<EOF
 $(printf '%s\n' "$records" | grep '^#USES	')
@@ -272,6 +317,28 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683'
 
+  # An UPPERCASE pin is still a commit. Rejecting it would be this gate
+  # enforcing a house style under a security check's name.
+  expect "an uppercase sha is still a pin" "" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11BD71901BBE5B1630CEEA73D27597364C9AF683 # v4.2.2'
+
+  # The regression PIN2 was written to have and did not: one commented
+  # occurrence answering for an uncommented one on the same SHA. Two checkouts
+  # in a workflow is the ordinary case, not a contrived one.
+  expect "a repeated sha needs its comment on every line" "PIN2" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683'
+
   expect "a local action needs no pin" "" \
 'on: [push]
 jobs:
@@ -279,6 +346,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: ./.github/actions/setup'
+
+  # The wrapper is immutable; what the wrapper reaches for is not. This runs on
+  # the CALLING job's runner with the calling job's token, so exempting it
+  # because the path began `./` was exempting the wrong thing.
+  expect "a composite action's own dependency is pinned like any other" "PIN1" \
+'name: setup
+runs:
+  using: composite
+  steps:
+    - uses: third/party@main
+      shell: bash'
+
+  expect "a composite action pinned properly is clean" "" \
+'name: setup
+runs:
+  using: composite
+  steps:
+    - uses: third/party@11bd71901bbe5b1630ceea73d27597364c9af683 # v1.2.3
+      shell: bash'
 
   expect "a reusable workflow on a branch" "PIN1" \
 'on: [push]
@@ -366,11 +452,16 @@ main() {
   fi
 
   if [ "${#files[@]}" -eq 0 ]; then
+    # Composite action manifests are discovered alongside workflows, at any
+    # depth under `.github/actions`, because a local `uses:` is exempted from
+    # pinning and its own dependencies are not.
     while IFS= read -r arg; do
       [ -n "$arg" ] || continue
       files+=("$arg")
     done <<EOF
-$(find "$REPO_ROOT/.github/workflows" -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null | sort)
+$( { find "$REPO_ROOT/.github/workflows" -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null
+     find "$REPO_ROOT/.github/actions" -type f \( -name 'action.yml' -o -name 'action.yaml' \) 2>/dev/null
+   } | sort)
 EOF
   fi
 
