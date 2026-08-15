@@ -186,6 +186,13 @@ jobs:
       - name: docs pins self-test
         run: bash scripts/ci/docs-pins.selftest.sh
 
+      # Tags stopped at v5.3.2 while VERSION said v5.7.0 — four releases that
+      # merged, passed every gate above, and could not be pinned by anyone,
+      # because publishing the tag was a human step. docs-pins cannot see it:
+      # it asserts the docs against VERSION, which was correct the whole time.
+      - name: publish-tag self-test
+        run: bash scripts/ci/publish-tag.selftest.sh
+
   terraform:
     name: Terraform (fmt + validate)
     runs-on: ubuntu-latest
