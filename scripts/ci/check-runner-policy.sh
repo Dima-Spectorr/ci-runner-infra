@@ -499,6 +499,18 @@ PY
 # is an error in the direction that reports clean.
 re_quote() { printf '%s' "$1" | sed 's/[][\.^$*+?(){}|\\\/]/\\&/g'; }
 
+# One spelling for a file, so that a path used as a set KEY and a path used as a
+# set MEMBER compare equal. Falls back to the argument unchanged when the
+# directory cannot be entered, which is the reading a missing file deserves.
+abs_path() {
+  local d b
+  d="$(dirname -- "$1")"
+  b="$(basename -- "$1")"
+  d="$(cd -- "$d" 2>/dev/null && pwd)" || { printf '%s' "$1"; return; }
+  [ -n "$d" ] || { printf '%s' "$1"; return; }
+  printf '%s/%s' "$d" "$b"
+}
+
 # Files a `pull_request` workflow can reach through a local `uses:` call — see
 # `compute_reachable`. Newline-separated absolute paths.
 REACHABLE_PR=""
@@ -547,7 +559,7 @@ check_file() {
   # …or reached from one. A callee declares only `workflow_call` and runs with
   # the caller's pull-request context, so judging it on its own triggers reads a
   # self-hosted job with no guard as unreachable by forks.
-  if [ "$has_pr" -eq 0 ] && printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$file"; then
+  if [ "$has_pr" -eq 0 ] && printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$(abs_path "$file")"; then
     has_pr=1
   fi
 
@@ -696,6 +708,15 @@ EOF
 compute_reachable() {
   local f records seed="" edges="" caller target changed=1 line
   for f in "$@"; do
+    # Both sides of every edge are canonicalised, because the two sides were
+    # spelled differently: the caller was whatever the invocation passed —
+    # `.github/workflows/ci.yml` in the documented `<file>...` mode — while a
+    # `./…` call target was resolved to an absolute path here. The seeds were
+    # then relative, the targets absolute, and `grep -qxF` matched neither
+    # against the other, so reachability silently computed to nothing on the
+    # exact invocation the usage line documents. `check_file` canonicalises the
+    # same way before asking whether its file is in the set.
+    f="$(abs_path "$f")"
     records="$(read_workflow "$f")" || continue
     if [ "$(printf '%s\n' "$records" | grep -c '^#PR$')" -gt 0 ] ||
        [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
@@ -1188,6 +1209,47 @@ jobs:
 jobs:
   build:
     if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The same pair, judged the way the usage line documents: repository-relative
+  # paths. Reachability keyed the caller by the string it was handed and the
+  # callee by an absolute path it resolved itself, so the two never compared
+  # equal and the whole computation silently produced nothing — a fixture that
+  # only ever passed absolute paths could not see it.
+  expect_pair_rel() {
+    local name="$1" want="$2" caller_body="$3" callee_body="$4"
+    local got out_text dir="$tmp/pairrel"
+    rm -rf "$dir"; mkdir -p "$dir/.github/workflows"
+    printf '%s\n' "$caller_body" > "$dir/.github/workflows/caller.yml"
+    printf '%s\n' "$callee_body" > "$dir/.github/workflows/callee.yml"
+    out_text="$(fail=0
+      cd "$dir" || exit 1
+      compute_reachable .github/workflows/caller.yml .github/workflows/callee.yml
+      check_file .github/workflows/caller.yml "" allowed
+      check_file .github/workflows/callee.yml "" allowed 2>&1)"
+    got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr '\n' ' ')"
+    got="$(printf '%s' "$got" | sed 's/ *$//')"
+    if [ "$got" != "$want" ]; then
+      echo "FAIL $name: want ids [$want], got [$got]"
+      printf '%s\n' "$out_text" | sed 's/^/      /'
+      status=1
+    else
+      echo "ok   $name [$want]"
+    fi
+  }
+
+  expect_pair_rel "reachability holds when the paths are relative" "RUNNER4" \
+'on:
+  pull_request:
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml' \
+'on:
+  workflow_call:
+jobs:
+  build:
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 30
     steps: [{run: "true"}]'
