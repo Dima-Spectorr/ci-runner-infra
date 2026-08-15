@@ -18,11 +18,12 @@
 # host-startup.sh's load_baked_images() loads every archive found here into each
 # slot's daemon at boot.
 #
-# NOT under /opt/ci-cache, which is the group-writable tree slots share. What is
-# written here is `docker load`ed into every slot on the host at every boot, so
-# a job able to write it would be running its own image in every other slot —
-# and write+execute on a non-sticky /opt/ci-cache is enough to swap this whole
-# directory out, checksums and all, however the files inside it are owned.
+# NOT under /opt/ci-cache, which host-startup.sh copies into a writable per-slot
+# tree at boot. What is written here is `docker load`ed into every slot on the
+# host at every boot, so a job able to write it would be running its own image in
+# every other slot — and write+execute on the copy's non-sticky parent would be
+# enough to swap this whole directory out, checksums and all, however the files
+# inside it are owned.
 #
 # The version is pinned deliberately. Playwright refuses to run when the browser
 # build in the image does not match the `@playwright/test` the repository

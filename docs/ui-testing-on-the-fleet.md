@@ -47,12 +47,12 @@ At boot, `load_baked_images()` in `host-startup.sh` verifies each archive
 against its recorded digest and loads it into each slot's daemon.
 
 That directory is **root-owned and read-only to slots**, and deliberately not
-part of `/opt/ci-cache`. The shared cache is group-writable — it is untrusted
-build input by design — but these archives are not input: they are executed, in
-every slot, at every boot. A job that could write one would be running its own
-image in every other slot on the host. Owning the files would not be enough
-either; write access to the *parent* directory is enough to rename the whole
-tree away and substitute another, checksums included.
+part of `/opt/ci-cache`. The dependency cache reaches every slot as a writable
+per-slot copy — it is untrusted build input by design — but these archives are
+not input: they are executed, in every slot, at every boot. A job that could
+write one would be running its own image in every other slot on the host. Owning
+the files would not be enough either; write access to the *parent* directory is
+enough to rename the whole tree away and substitute another, checksums included.
 
 That load is **backgrounded and never fatal**. It takes minutes, and blocking a
 pool's registration on a cache would turn a slow disk into a fleet that will not
