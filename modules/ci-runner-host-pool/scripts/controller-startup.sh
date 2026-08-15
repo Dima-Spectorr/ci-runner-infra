@@ -255,7 +255,6 @@ collect_demand() {
   [ -n "$ids" ] || return 0
 
   local now
-  now=$sweep_start
 
   # One API call per run, and the run count is whatever the repo happens to be
   # doing — so this loop, alone, sets the tick duration. One pool in this fleet
@@ -299,6 +298,16 @@ collect_demand() {
     DEMAND_TOTAL=$((DEMAND_TOTAL + n))
     DEMAND_QUEUED=$((DEMAND_QUEUED + q))
 
+    # Read the clock HERE, per run, and not once before the sweep. Both ages
+    # below are measured against it, and `sweep_start` is captured before the
+    # two run-list calls — each of which can spend a full CURL_MAX_TIME — and
+    # before this run's own job fetch. Against that stale reading every age is
+    # short by however long the sweep has been running, which on a busy pool is
+    # most of DEMAND_BUDGET: the two series would understate the wait and the
+    # run time by up to a minute and a half, and understate them MOST on the
+    # pool under the most load, which is the pool being looked at.
+    now=$(date +%s)
+
     local s wait epoch
     for s in $stamps; do
       epoch=$(date -d "$s" +%s 2>/dev/null) || continue
@@ -309,6 +318,14 @@ collect_demand() {
     # Same arithmetic, different question: how long has the OLDEST job that is
     # already executing been executing for. Free — these jobs are in the payload
     # the demand sweep just paid for, and their start times were discarded.
+    #
+    # A job that started after this run's clock reading yields a negative age
+    # and loses the comparison. That is the right answer, not a swallowed one:
+    # the question is which job is OLDEST, and the job that just started is
+    # never it. The only value this can distort is a pool whose sole in-flight
+    # job began within the same second, reported as 0 rather than as 1 — on a
+    # gauge whose threshold is measured in minutes, and which is about to be
+    # correct on the next tick anyway.
     for s in $running; do
       epoch=$(date -d "$s" +%s 2>/dev/null) || continue
       wait=$((now - epoch))
