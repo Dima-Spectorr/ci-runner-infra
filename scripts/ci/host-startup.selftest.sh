@@ -226,7 +226,12 @@ has_registry_credentials() { # <file>
   matches "$code" 'service-accounts/default/token' || return 1
   # …mapped at Google registries only. credsStore would apply it to EVERY
   # registry, sending a Google access token to docker.io on the next public pull.
-  matches "$code" '"\*\.pkg\.dev": "cijob"' || return 1
+  matches "$code" 'credHelpers' || return 1
+  matches "$code" '\$\{HOST_REGION\}-docker\.pkg\.dev' || return 1
+  # …by EXACT hostname. docker resolves credHelpers as a map lookup on the
+  # registry host, so a `*.pkg.dev` key is not an error — it is simply never
+  # consulted, and the pull goes out anonymous exactly as with no config at all.
+  ! matches "$code" '"\*\.pkg\.dev"|"\*\.gcr\.io"' || return 1
   ! matches "$code" '"credsStore"' || return 1
   # …and degrading to an ANONYMOUS pull when there is no token, in docker's own
   # vocabulary. A pool with no job service account starts no broker at all, and
@@ -349,8 +354,8 @@ mutate "namespaced DNS exception dropped"    's|-d "$md_ip" -p "$proto" --dport 
 
 mutate "registry helper removed"          's|/usr/local/bin/docker-credential-cijob|/usr/local/bin/true|g'          has_registry_credentials
 mutate "no-token path made fatal"         's|credentials not found in native keychain|no credentials|'                      has_registry_credentials
-mutate "helper widened to every registry" 's|"credHelpers": {|"credsStore": "cijob", "x": {|'                      has_registry_credentials
-mutate "google mapping dropped"           's|"\*\.pkg\.dev": "cijob"|"*.pkg.dev": ""|'                             has_registry_credentials
+mutate "helper widened to every registry" 's|"credHelpers"|"credsStore": "cijob", "x"|'                            has_registry_credentials
+mutate "back to a wildcard key"           's|\${HOST_REGION}-docker.pkg.dev|"*.pkg.dev"|'                          has_registry_credentials
 mutate "helper install not fatal"         's|\|\| die .could not install the registry credential helper.*|\|\| true|' has_registry_credentials
 mutate "slots left without the config"    's|write_slot_docker_config "\$idx" \|\| return 1|:|'                     has_registry_credentials
 

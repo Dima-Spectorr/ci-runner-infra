@@ -159,6 +159,12 @@ resource "google_compute_instance_template" "host" {
     "ci-job-broker-port"     = tostring(var.job_broker_port)
     "ci-job-broker-py"       = file("${path.module}/scripts/job-metadata-broker.py")
 
+    # Registry hosts a job container may be pulled from as the JOB identity, on
+    # TOP of this host's own region and the Container Registry hosts, which the
+    # host always configures. Needed only when a repository pulls its builder
+    # image from another region or another project.
+    "ci-registry-hosts" = join(",", var.extra_registry_hosts)
+
     # Hosts are cattle managed by the controller; interactive login is not the
     # supported way to inspect one. Logs go to Cloud Logging.
     "block-project-ssh-keys" = "true"

@@ -60,6 +60,16 @@ POOL=$(md "instance/attributes/ci-pool")
 JOB_SA=$(md "instance/attributes/ci-job-service-account")
 BROKER_PORT=$(md "instance/attributes/ci-job-broker-port")
 HOSTNAME_SHORT=$(md "instance/name")
+# Registry hosts the job identity authenticates to. Comma-separated, set by the
+# module; see write_slot_docker_config for why the list is explicit.
+REGISTRY_HOSTS=$(md "instance/attributes/ci-registry-hosts")
+# The regional Artifact Registry of the host's OWN region is always included:
+# the overwhelmingly common case is a repository pulling a builder image it
+# publishes alongside its runners, and requiring every estate to spell that out
+# would make the failure it prevents the default.
+INSTANCE_ZONE=$(md "instance/zone")        # projects/<n>/zones/<region>-<x>
+INSTANCE_ZONE=${INSTANCE_ZONE##*/}
+HOST_REGION=${INSTANCE_ZONE%-*}
 
 BROKER_PORT=${BROKER_PORT:-8081}
 
@@ -302,27 +312,40 @@ HELPER
 # Per slot, because ~/.docker/config.json is read from the HOME of whoever runs
 # the docker client, and every slot is its own user.
 #
-# Wildcards rather than a literal registry host: the module is consumed across
-# regions and projects, so a `<region>-docker.pkg.dev` written out in full here
-# would be a customer literal that silently does nothing everywhere else — and a
-# missing credential shows up as a failed pull, not as a config error. Only
-# Google registries are
-# mapped — docker.io and ghcr.io must keep pulling anonymously, which a
-# `credsStore` (all registries) would have broken by offering them a Google
-# token.
+# EVERY KEY IS AN EXACT HOST. The first version of this wrote `"*.pkg.dev"`, on
+# the assumption that docker matches credHelpers by pattern. It does not: the
+# lookup is an exact map lookup on the registry hostname, so the wildcard entry
+# is not an error, it is simply never consulted — and the pull goes out
+# anonymous and fails exactly as it did with no config at all. That cost a
+# second round trip through a tag, an apply and a host replacement to find, and
+# the reason it was not obvious is that the helper itself tested fine by hand.
+#
+# The list is therefore built rather than written: the host's own region (the
+# common case — a repository pulling a builder image it publishes next to its
+# runners), the four Container Registry hosts, and whatever else the module was
+# given. Only Google registries appear, so docker.io and ghcr.io keep pulling
+# anonymously — which a `credsStore` (which DOES apply to every registry) would
+# have broken by offering them a Google access token.
 write_slot_docker_config() {
-  local idx="$1" u
+  local idx="$1" u hosts h first
   u=$(slot_user "$idx")
+
+  hosts="gcr.io us.gcr.io eu.gcr.io asia.gcr.io"
+  [ -n "$HOST_REGION" ] && hosts="$hosts ${HOST_REGION}-docker.pkg.dev"
+  [ -n "$REGISTRY_HOSTS" ] && hosts="$hosts $(printf '%s' "$REGISTRY_HOSTS" | tr ',' ' ')"
+
   install -d -o "$u" -g "$u" -m 0700 "/home/$u/.docker"
-  cat >"/home/$u/.docker/config.json" <<'DOCKERCFG'
-{
-  "credHelpers": {
-    "gcr.io": "cijob",
-    "*.gcr.io": "cijob",
-    "*.pkg.dev": "cijob"
-  }
-}
-DOCKERCFG
+  {
+    printf '{\n  "credHelpers": {\n'
+    first=1
+    for h in $hosts; do
+      [ -n "$h" ] || continue
+      [ "$first" = 1 ] || printf ',\n'
+      printf '    "%s": "cijob"' "$h"
+      first=0
+    done
+    printf '\n  }\n}\n'
+  } >"/home/$u/.docker/config.json"
   chown "$u:$u" "/home/$u/.docker/config.json"
   chmod 0600 "/home/$u/.docker/config.json"
 }

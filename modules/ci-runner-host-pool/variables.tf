@@ -361,6 +361,20 @@ variable "job_broker_port" {
   default     = 8081
 }
 
+variable "extra_registry_hosts" {
+  description = <<-EOT
+    Extra container-registry hostnames the job identity authenticates to, e.g.
+    an Artifact Registry in another region or project. The host's OWN regional
+    Artifact Registry and the Container Registry hosts are always configured, so
+    this is empty for the usual case of a repository pulling an image published
+    next to its runners. Hostnames only — docker matches these EXACTLY, and a
+    pattern like `*.pkg.dev` is silently never consulted, which shows up as a
+    job failing its pull rather than as a configuration error.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
 variable "manage_job_token_creator_binding" {
   description = <<-EOT
     Let this module grant the host account `roles/iam.serviceAccountTokenCreator`
