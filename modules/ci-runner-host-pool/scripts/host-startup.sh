@@ -568,7 +568,7 @@ CACHE_DIRS=(npm yarn pnpm-store go-mod pip uv m2 nuget composer)
 # Refuse the master outright if it holds anything a root-run recursive walk, or a
 # later `cp -a`, must not propagate. This is not defensive decoration: the script
 # is the instance's startup-script, it runs on EVERY boot over a /opt/ci-cache
-# that lives on the boot disk and survives a reset, and images before v5.10.0 ship
+# that lives on the boot disk and survives a reset, and images before v5.12.0 ship
 # that tree group-writable — so its contents are, historically, attacker-writable
 # input.
 #
@@ -635,7 +635,7 @@ lock_shared_cache() {
   # non-recursive case and costs nothing. See the rule at the top of the section.
   # Status checked, not discarded. `go-w` leaves the OWNER write bit in place, so
   # "root owns every entry" is now the whole of what makes the master unwritable
-  # by a slot — and images before module v5.10.0 ship this tree group-writable, so
+  # by a slot — and images before module v5.12.0 ship this tree group-writable, so
   # a slot-owned file in it is a reachable starting state rather than a
   # hypothetical. A half-failed chown would leave exactly that file writable by
   # the uid that owns it. Fail open, per this section's contract: no seeded cache
