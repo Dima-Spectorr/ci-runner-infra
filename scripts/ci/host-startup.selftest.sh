@@ -245,6 +245,46 @@ has_registry_credentials() { # <file>
   matches "$code" 'write_slot_docker_config "\$idx"[[:space:]]*\|\|[[:space:]]*return 1'
 }
 
+# A slot user's $HOME outlives every job the slot serves, so a workflow that
+# authenticates leaves its credential there for the next, unrelated job.
+#
+# IntegrateIT paid for this on every pr-check run: deploy.yml and friends run
+# google-github-actions/auth + setup-gcloud on this same pool, setup-gcloud
+# persists the external account as gcloud's ACTIVE account, and later jobs then
+# preferred it over the broker — failing with "Unable to retrieve Identity Pool
+# subject token ... token is expired" because the OIDC subject token had died
+# hours earlier. The visible cost was a permanently cold Turbo cache (229 misses,
+# 0 hits, ~11 minutes per shard). The real cost is that a deploy identity was
+# reachable by whatever pull request landed on the slot next, and only expiry
+# stopped it being usable.
+has_job_credential_reset() { # <file>
+  local code
+  code=$(code_of "$1")
+  # both ends of the job, on the AGENT unit
+  matches "$code" '^Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci/job-hooks/reset-credentials\.sh$' || return 1
+  matches "$code" '^Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/reset-credentials\.sh$' || return 1
+  # …and unconditionally, not folded into the JOB_SA branch that gates BROKER_ENV:
+  # a pool with no job identity is where an inherited credential is worst.
+  ! matches "$code" 'if \[ -n "\$JOB_SA" \].*ACTIONS_RUNNER_HOOK' || return 1
+  # the hook exists, root-owned and not writable by the slots that execute it —
+  # one file shared by every uid on the host
+  matches "$code" 'chown root:root /opt/ci/job-hooks/reset-credentials\.sh' || return 1
+  matches "$code" 'chmod 0755 /opt/ci/job-hooks/reset-credentials\.sh' || return 1
+  # installed before any agent registers, and fatal: an agent whose JOB_STARTED
+  # hook points at a missing file takes work and fails all of it
+  matches "$code" 'install_job_hooks \|\| die' || return 1
+  # it removes the gcloud credential store…
+  matches "$code" '\$home/\.config/gcloud' || return 1
+  # …deciding WHICH home from the passwd database rather than from a $HOME a job
+  # could have rewritten, and refusing anything that is not a slot home
+  matches "$code" 'home=.*getent passwd .*id -un' || return 1
+  matches "$code" 'refusing to clean' || return 1
+  # …and never ~/.docker/config.json, which the host itself wrote: removing that
+  # fails every container job at "Initialize containers" instead of fixing
+  # anything.
+  ! matches "$code" '\$home/\.docker' || return 1
+}
+
 # The container bridge must be born on the host's MTU.
 #
 # The veth pair is already matched to it; the bridge dockerd creates inside the
@@ -335,6 +375,12 @@ else
   bad "job containers are pulled without credentials — every job whose image comes from a private registry fails at 'Initialize containers' with 'Unauthenticated request ... downloadArtifacts', or the helper is wired at every registry rather than Google's alone"
 fi
 
+if has_job_credential_reset "$SCRIPT"; then
+  ok
+else
+  bad "a job inherits the previous job's cloud credentials — the slot home keeps ~/.config/gcloud between jobs, so a deploy workflow's identity is left active for whatever pull request lands on that slot next, and unrelated jobs fail on its expired token (IntegrateIT, permanently cold Turbo cache)"
+fi
+
 if has_container_mtu "$SCRIPT"; then
   ok
 else
@@ -394,7 +440,15 @@ mutate "back to a wildcard key"           's|\${HOST_REGION}-docker.pkg.dev|"*.p
 mutate "helper install not fatal"         's|\|\| die .could not install the registry credential helper.*|\|\| true|' has_registry_credentials
 mutate "slots left without the config"    's|write_slot_docker_config "\$idx" \|\| return 1|:|'                     has_registry_credentials
 
-mutate "daemon MTU config removed"        's|daemon\.json|daemon.txt|g'                                            has_container_mtu
+mutate "reset only after the job"         's|^Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=.*$||'                   has_job_credential_reset
+mutate "reset only before the job"        's|^Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=.*$||'                 has_job_credential_reset
+mutate "hook install no longer fatal"     's|install_job_hooks \|\| die.*|install_job_hooks \|\| true|'             has_job_credential_reset
+mutate "hook left slot-writable"          's|chmod 0755 /opt/ci/job-hooks/reset-credentials.sh|chmod 0777 /opt/ci/job-hooks/reset-credentials.sh|' has_job_credential_reset
+mutate "gcloud store no longer cleaned"   's@config/gcloud@cache/turbo@'                                          has_job_credential_reset
+mutate "home taken from the environment"  's@^home=.*getent passwd.*@home="$HOME"@'                                has_job_credential_reset
+mutate "the host's own docker config wiped" 's@\.gsutil@.docker@'                                                 has_job_credential_reset
+
+mutate "daemon MTU config removed"        's|daemon\.json|daemon.txt|g'                                          has_container_mtu
 mutate "MTU key dropped"                  's|"mtu"|"debug"|'                                                       has_container_mtu
 mutate "per-driver default dropped"       's|default-network-opts|default-address-pools|'                          has_container_mtu
 mutate "driver MTU option dropped"        's|com\.docker\.network\.driver\.mtu|com.docker.network.driver.name|'    has_container_mtu

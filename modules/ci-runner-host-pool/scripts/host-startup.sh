@@ -253,6 +253,79 @@ EOF
   return 1
 }
 
+# --- per-job credential reset -------------------------------------------------
+#
+# THE FAULT (IntegrateIT, every pr-check run for weeks): the Turbo remote cache
+# was dead on every sampled run. `gcloud storage cp` failed with
+#
+#   Unable to retrieve Identity Pool subject token
+#   {"source":"actions-run-service","statusCode":401,
+#    "errorMessage":"token has invalid claims: token is expired"}
+#
+# `source: actions-run-service` is GitHub's OIDC endpoint, so gcloud was using an
+# EXTERNAL_ACCOUNT credential — and the workflow that failed never authenticated
+# at all. It was reading a credential a DIFFERENT job had left behind: deploy.yml,
+# deploy-mcp-server.yml, cve-triage.yml and windows-agent.yml run on the same
+# pool and pair google-github-actions/auth with setup-gcloud, whose
+# `gcloud auth login --cred-file=...` writes the external account into the gcloud
+# config as the ACTIVE account. A slot user is an ordinary Linux account created
+# once per host boot, so its $HOME outlives every job the slot serves — and this
+# pool sets no CLOUDSDK_CONFIG and, until now, no job hooks. The credential
+# simply stayed. Later jobs then preferred it over the broker, because an
+# explicitly configured active account beats ADC-via-metadata, and it failed only
+# because its subject token had long since expired.
+#
+# So the cold cache is the symptom. The defect is that job-scoped credentials
+# outlive the job, and the SECURITY half of it does not depend on the expiry: a
+# deploy identity left in a shared home is reachable by whatever pull request
+# lands on that slot next. Nothing about it is specific to IntegrateIT or to
+# gcloud's failure mode, which is why it is fixed on the host rather than in a
+# workflow.
+#
+# Both hooks, deliberately. JOB_COMPLETED alone leaves a live credential sitting
+# on disk for however long the slot stays idle, and it does not run at all if the
+# agent is killed mid-job — exactly the case that leaves the most behind.
+# JOB_STARTED alone leaves the idle window open. Together, a job neither inherits
+# nor bequeaths one.
+install_job_hooks() {
+  mkdir -p /opt/ci/job-hooks || return 1
+  chown root:root /opt/ci/job-hooks || return 1
+  # Root-owned and not slot-writable: this one file is executed by every slot on
+  # the host, so a slot that could rewrite it would be running code in every
+  # OTHER slot's uid. The hook itself runs as the slot user and removes only that
+  # user's own files.
+  chmod 0755 /opt/ci/job-hooks || return 1
+
+  cat >/opt/ci/job-hooks/reset-credentials.sh <<EOF
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as the slot user, before every job starts
+# and after every job ends. See install_job_hooks() for why.
+set -uo pipefail
+
+# The passwd entry, not \$HOME: this runs inside the agent's environment, and the
+# directory being deleted should be decided by the host's account database rather
+# than by a variable a job could have changed.
+home=\$(getent passwd "\$(id -un)" | cut -d: -f6)
+case "\$home" in
+  /home/$SLOT_USER_PREFIX*) ;;
+  *) echo "credential reset: refusing to clean '\$home' — not a slot home" >&2; exit 1 ;;
+esac
+
+# Only credential stores that NOTHING on this host owns. ~/.docker/config.json is
+# deliberately absent: write_slot_docker_config puts the registry helper there,
+# and removing it would fail every container job at "Initialize containers"
+# instead of fixing anything.
+rc=0
+for d in "\$home/.config/gcloud" "\$home/.gsutil"; do
+  rm -rf -- "\$d" || { echo "credential reset: could not remove \$d" >&2; rc=1; }
+done
+exit \$rc
+EOF
+
+  chown root:root /opt/ci/job-hooks/reset-credentials.sh || return 1
+  chmod 0755 /opt/ci/job-hooks/reset-credentials.sh || return 1
+}
+
 # --- registry credentials for job containers ----------------------------------
 #
 # THE FAULT (Borsh-Tablet-App, first pool run): every job declaring
@@ -846,6 +919,14 @@ NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
 # Joining the namespace does not carry its resolver — see the daemon drop-in.
 BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 $BROKER_ENV
+# Wipe this slot's leftover cloud credential store before every job and after
+# every job. Set unconditionally, and NOT alongside BROKER_ENV: a pool with no
+# job service account is where an inherited credential is most dangerous, since
+# nothing there is supposed to have Google credentials at all. A failing hook
+# fails the job, which is the intended trade — a job that could not be given a
+# clean credential state must not run with a previous job's identity.
+Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci/job-hooks/reset-credentials.sh
+Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/reset-credentials.sh
 ExecStart=$dir/run.sh
 # The controller drains a host by DEREGISTERING its agents through the GitHub
 # API, which GitHub refuses while an agent is executing a job. Restart=no here
@@ -917,6 +998,12 @@ main() {
   else
     log "no ci-job-service-account set — jobs on this host get no Google credentials"
   fi
+
+  # Before the units that reference it exist, and fails CLOSED: an agent whose
+  # ACTIONS_RUNNER_HOOK_JOB_STARTED points at a missing file refuses to run any
+  # job, so a host that registered without the hook installed would take work and
+  # fail all of it.
+  install_job_hooks || die "could not install the per-job credential reset hook — refusing to register agents"
 
   local token
   token=$(registration_token) || die "could not obtain a registration token"
