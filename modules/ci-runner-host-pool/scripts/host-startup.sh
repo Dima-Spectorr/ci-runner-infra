@@ -910,11 +910,19 @@ load_baked_images() {
       # main() waits for these before exiting, and an unbounded wait would keep
       # google-startup-scripts.service active forever.
       #
+      # Generous on purpose. Nothing is waiting on this: the slots have already
+      # registered and the host is taking jobs while these run, so the only
+      # thing the ceiling bounds is how long a oneshot unit stays active. A
+      # browser archive is multiple gigabytes and every slot loads its own copy
+      # concurrently, so a tight ceiling would kill legitimate slow loads and
+      # cost every job on the host the download this exists to avoid — trading
+      # the whole feature for a tidier boot.
+      #
       # shellcheck disable=SC2024  # the redirect is the shell's, and this shell
       # is root: a GCE startup script runs as root, which is also why every
       # other write to this log in this file is spelled the same way. `sudo`
       # here drops privilege for the daemon socket, it does not raise it.
-      if timeout 600 sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
+      if timeout 1800 sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
            docker load -i "$a" >>/var/log/ci-host.log 2>&1; then
         log "slot $idx: loaded baked image archive $base"
       else
