@@ -316,6 +316,8 @@ check_file() {
       # the same opt-out, because an image chosen by an admin-scoped variable is
       # a legitimate shape a consumer may have deliberately adopted.
       case "$ref" in
+        # shellcheck disable=SC2016  # `${{` is the literal GitHub opener being
+        # matched; expanding it here is exactly the bug.
         *'${{'*)
           if [ "$ALLOW_DYNAMIC_IMAGE" -eq 0 ]; then
             err PIN4 "$rel: job '$job' $loc selects its image by expression — this gate cannot decide whether it resolves to a digest (declare --allow-dynamic-image if the value is a repository variable your admins scope)"
@@ -695,6 +697,8 @@ jobs:
   # `:latest`. Undecided and said out loud, rather than reported as a tag —
   # which is what it looked like before, since the expression text carries no
   # `@sha256:`.
+  #
+  # shellcheck disable=SC2016  # the fixture IS the unexpanded `${{ … }}` text.
   expect "an image chosen by expression is undecided" "PIN4" \
 'on: [push]
 jobs:
@@ -705,6 +709,7 @@ jobs:
       - run: echo hi'
 
   ALLOW_DYNAMIC_IMAGE=1
+  # shellcheck disable=SC2016  # same literal, now with the opt-in declared.
   expect "a declared dynamic image is accepted" "" \
 'on: [push]
 jobs:
