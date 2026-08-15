@@ -107,6 +107,13 @@ jobs:
       # statically here instead.
       - name: identity split self-test
         run: bash scripts/ci/identity-split.selftest.sh
+      # The apply identity is assumable from a GitHub Actions run, so whatever it
+      # can do, a workflow file can do. Every permission error an unattended
+      # apply hits argues for one more role, and that road ends at "can grant
+      # itself owner" — reachable from CI, in a fleet that auto-merges on green.
+      # Nothing else here would notice: validate, plan and apply all succeed.
+      - name: apply identity self-test
+        run: bash scripts/ci/apply-identity.selftest.sh
 
       # One unbounded socket stalls the controller's tick loop or a consumer's
       # oneshot poller permanently, and the demand metric keeps its LAST value
