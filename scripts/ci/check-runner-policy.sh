@@ -286,10 +286,79 @@ RUNS_ON_ROUTES = re.compile(
 HOSTED_IMAGE = re.compile(r"^(?:ubuntu|windows|macos)-", re.IGNORECASE)
 
 
+def split_top_level(expr, operator):
+    """Split on `operator` at paren depth 0, outside single/double quotes."""
+    parts, buf, depth, quote, i = [], [], 0, None, 0
+    while i < len(expr):
+        ch = expr[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf.append(ch)
+        elif ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth -= 1
+            buf.append(ch)
+        elif depth == 0 and expr[i:i + 2] == operator:
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def condition_excludes(expr):
+    """True when `expr` cannot be true for a fork, read as a Boolean tree.
+
+    A substring search is not enough. `always() || …fork == false` contains the
+    exclusion and runs for forks anyway, because the OTHER disjunct does not
+    care — so for `||` EVERY alternative has to exclude, while for `&&` ONE
+    conjunct excluding is enough to make the whole condition false for a fork.
+    Anything left after that is a leaf, and a leaf counts only if it matches a
+    recognised exclusion shape outright.
+    """
+    expr = expr.strip()
+    while expr.startswith("(") and expr.endswith(")"):
+        # Only peel a wrapper that really is one; `(a) && (b)` must not be peeled.
+        inner = expr[1:-1]
+        depth = 0
+        wraps = True
+        for j, ch in enumerate(inner):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 0:
+                    wraps = False
+                    break
+        if not wraps or depth != 0:
+            break
+        expr = inner.strip()
+
+    ors = split_top_level(expr, "||")
+    if len(ors) > 1:
+        return all(condition_excludes(part) for part in ors)
+    ands = split_top_level(expr, "&&")
+    if len(ands) > 1:
+        return any(condition_excludes(part) for part in ands)
+    return bool(IF_EXCLUDES.search(expr))
+
+
 def fork_guarded(job):
     """True only for a guard whose direction is readable and correct."""
     condition = job.get("if")
-    if isinstance(condition, str) and IF_EXCLUDES.search(condition):
+    if isinstance(condition, str) and condition_excludes(condition):
         return True
     runs_on = job.get("runs-on")
     if isinstance(runs_on, str):
@@ -544,9 +613,18 @@ EOF
     # RUNNER3 while preserving in full the failure it exists to prevent: it IS
     # GitHub's default, so a job declaring it holds a warm slot for six hours
     # exactly as an undeclared one does. Key presence was the wrong question.
-    if [ "$has_timeout" -eq 1 ] && printf '%s' "$timeout" | grep -qE '^[0-9]+$'; then
-      if [ "$timeout" -ge "$MAX_TIMEOUT" ]; then
-        err RUNNER6 "$rel: job '$job' declares timeout-minutes: $timeout, which is not below the $MAX_TIMEOUT-minute ceiling — it bounds nothing GitHub was not already bounding"
+    #
+    # A non-literal value is the same finding wearing a different spelling:
+    # `timeout-minutes: ${{ vars.JOB_TIMEOUT }}` satisfies the key-presence test
+    # and can resolve to 360, and this gate cannot read the variable. Reported
+    # rather than passed, on the same rule RUNNER5 follows for `runs-on`.
+    if [ "$has_timeout" -eq 1 ]; then
+      if printf '%s' "$timeout" | grep -qE '^[0-9]+$'; then
+        if [ "$timeout" -ge "$MAX_TIMEOUT" ]; then
+          err RUNNER6 "$rel: job '$job' declares timeout-minutes: $timeout, which is not below the $MAX_TIMEOUT-minute ceiling — it bounds nothing GitHub was not already bounding"
+        fi
+      else
+        err RUNNER6 "$rel: job '$job' declares timeout-minutes: $timeout, which this gate cannot resolve to a number — an expression that lands on $MAX_TIMEOUT or more bounds nothing, and nothing here can rule that out"
       fi
     fi
 
@@ -817,6 +895,41 @@ jobs:
     timeout-minutes: 30
     steps: [{run: "true"}]'
 
+  # A substring search finds the exclusion inside `always() || …fork == false`
+  # and calls it a guard, while the OTHER disjunct runs the job for forks
+  # regardless. `||` needs EVERY alternative to exclude.
+  expect "an exclusion beside an unconditional alternative is not a guard" "RUNNER4" "" allowed \
+'on:
+  pull_request:
+jobs:
+  build:
+    if: always() || github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # `&&` is the other direction: one conjunct excluding is enough, because the
+  # whole condition is then false for a fork whatever the rest says.
+  expect "an exclusion anded with anything is still a guard" "" "" allowed \
+'on:
+  pull_request:
+jobs:
+  build:
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "every alternative excluding is a guard" "" "" allowed \
+'on:
+  pull_request:
+jobs:
+  build:
+    if: (github.event_name == "push" && github.event.pull_request.head.repo.fork == false) || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
   expect "a same-repository test is a guard" "" "" allowed \
 'on:
   pull_request:
@@ -987,6 +1100,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    steps: [{run: "true"}]'
+
+  # And an unresolvable one is the same finding in a different spelling — the
+  # key is present, the value could be 360, and nothing here can rule it out.
+  expect "a timeout this gate cannot resolve is not a bound" "RUNNER6" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ vars.JOB_TIMEOUT }}
     steps: [{run: "true"}]'
 
   # The RUNNER3 exemption for a `uses:` job hands the bound to the called
