@@ -222,7 +222,8 @@ satisfied to a line reader — every mistake in the direction that reports clean
 ## `check-action-pins.sh`
 
 ```
-bash scripts/ci/check-action-pins.sh [--selftest] [--allow=<owner>]... [<file>...]
+bash scripts/ci/check-action-pins.sh [--selftest] [--allow=<owner>]...
+                                    [--allow-dynamic-image] [<file>...]
 ```
 
 | id | Rule |
@@ -230,7 +231,8 @@ bash scripts/ci/check-action-pins.sh [--selftest] [--allow=<owner>]... [<file>..
 | `PIN0` | the file does not load, or the gate cannot run |
 | `PIN1` | a remote `uses:` names a 40-character commit SHA |
 | `PIN2` | and carries the version beside it as a comment, on every line |
-| `PIN3` | a `docker://` step image is pinned by `@sha256:` digest |
+| `PIN3` | a container image is pinned by `@sha256:` digest — a `docker://` step, a job `container:`, or a `services.*.image` |
+| `PIN4` | an image chosen by expression is reported, not passed |
 
 `@v4` is a tag, and a tag is a pointer its owner may move at any time. The
 audit in `ci-optimization-catalog.md` §7 measured zero of ~375 third-party
@@ -259,6 +261,21 @@ folded or quoted scalar spells the same value in a way a line-oriented match
 does not see, and `0 > 0` reported a check that could not run as a check that
 passed. That is the vacuous pass this whole design is arranged against, found in
 its own strictest rule.
+
+A gate that reads only `uses:` reads only the references arriving by that key,
+and the two most privileged references in a workflow arrive by another. A job
+`container:` **is** the job — every step runs inside that image with the job's
+token mounted — and a `services.*.image` sits on the job's network for the job's
+whole life. Both are read, and both answer to PIN3, so `postgres:16` as a
+service is the same finding as `docker://postgres:16` as a step.
+
+An image chosen by an expression is neither: this gate has no repository
+variables, so calling `container: ${{ vars.CI_BUILDER_IMAGE }}` pinned and
+calling it unpinned are both answers to a question that was never asked. PIN4
+reports it as undecided — the same rule RUNNER5 follows for a dynamic
+`runs-on` — and `--allow-dynamic-image` is the consumer's declaration that the
+value comes from an admin-scoped variable, visible in the consuming workflow
+rather than defaulted here.
 
 A `uses:` beginning `./` is this repository's own tree at this repository's own
 commit, already immutable, and is exempt — but only the **wrapper** is. That

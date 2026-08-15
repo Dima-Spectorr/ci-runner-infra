@@ -3,7 +3,8 @@
 # check-action-pins.sh — a third-party action is code, and code is pinned
 #
 # USAGE
-#   bash scripts/ci/check-action-pins.sh [--selftest] [--allow=<owner>]... [<file>...]
+#   bash scripts/ci/check-action-pins.sh [--selftest] [--allow=<owner>]...
+#                                       [--allow-dynamic-image] [<file>...]
 #
 # PURPOSE
 #   Every `uses:` that leaves this repository must name an immutable commit,
@@ -11,7 +12,9 @@
 #
 #     PIN1  a remote `uses:` is pinned to a 40-character commit SHA
 #     PIN2  and carries the human-readable version beside it, as a comment
-#     PIN3  a `docker://` step image is pinned by digest, not by tag
+#     PIN3  a container image is pinned by digest, not by tag — a `docker://`
+#           step, a job `container:`, or any `services.*.image`
+#     PIN4  an image this gate cannot resolve is REPORTED, not passed
 #
 # WHY
 #   `@v4` is a tag, and a tag is a pointer its owner may move at any time. The
@@ -59,6 +62,24 @@
 #   checked where it is USED, so the exemption and the reading are the same
 #   decision.
 #
+# WHY CONTAINERS AND SERVICES ARE THE SAME QUESTION
+#   A gate that reads only `uses:` reads only the references that arrive by that
+#   key — and the two most privileged references in a workflow arrive by another.
+#   A job `container:` IS the job: every step runs inside that image, with the
+#   job's token mounted, so `alpine:latest` there is a moving target holding
+#   strictly more than any action does. A `services.*.image` sits on the job's
+#   network for the job's whole life. Both are read now, and both answer to PIN3.
+#
+# WHY AN UNREADABLE IMAGE IS PIN4 AND NOT A PASS
+#   `container: ${{ vars.CI_BUILDER_IMAGE }}` is a value this gate cannot
+#   resolve — it has no repository variables — so calling it pinned and calling
+#   it unpinned are both answers to a question that was never asked. It is
+#   reported as UNDECIDED, the same rule `check-runner-policy.sh` follows for a
+#   dynamic `runs-on` (RUNNER5). `--allow-dynamic-image` is the consumer's
+#   declaration that the value comes from an admin-scoped variable, and like
+#   `--allow=<owner>` it is a visible argument in the consuming workflow rather
+#   than a silent default here.
+#
 # EXIT CODES
 #   0 — clean
 #   1 — an unpinned reference
@@ -77,6 +98,8 @@ LOCAL_ROOT="${LOCAL_ROOT:-$REPO_ROOT}"
 # `|`-delimited set of manifests already checked or already scheduled, so a
 # manifest reached twice is reported once and a cycle terminates.
 LOCAL_SEEN="|"
+# Declared acceptance of an image this gate cannot resolve — see PIN4.
+ALLOW_DYNAMIC_IMAGE=0
 
 export PY_BIN="${PY_BIN:-}"
 py_usable() {
@@ -158,6 +181,36 @@ for job_id, job in jobs.items():
     # behind it changes under every consumer at once.
     if isinstance(job.get("uses"), str):
         out("#USES", job_id, "-", job["uses"].strip())
+
+    # A job `container:` and every `services.*.image` are remote code too, and
+    # they arrive by a key a uses-and-steps reader never looks at. The container
+    # image IS the job — every step runs inside it, with the job's token
+    # mounted — and a service container sits on the same network for the job's
+    # whole life. `alpine:latest` here is exactly the moving target PIN3 exists
+    # for, so it is routed to the same verdict: `docker://` is normalised on
+    # rather than off, because `container:` omits the scheme a step's
+    # `uses: docker://…` spells out.
+    def image_of(value):
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict) and isinstance(value.get("image"), str):
+            return value["image"]
+        return None
+
+    def emit_image(where, value):
+        text = (image_of(value) or "").strip()
+        if not text:
+            return
+        if text.startswith("docker://"):
+            text = text[len("docker://"):]
+        out("#USES", job_id, where, "docker://" + text)
+
+    emit_image("container", job.get("container"))
+    services = job.get("services")
+    if isinstance(services, dict):
+        for svc_name, svc in services.items():
+            emit_image("service '%s'" % svc_name, svc)
+
     steps = job.get("steps")
     if not isinstance(steps, list):
         continue
@@ -205,6 +258,17 @@ check_file() {
   while IFS=$'\t' read -r _ job step ref; do
     [ -n "${ref:-}" ] || continue
 
+    # Where in the job the reference sits. A step is an index; the other places
+    # a reference can appear are named (`container`, `service 'db'`, or `-` for
+    # the job-level `uses:`), and "step container" reads like a bug report about
+    # this gate rather than about the workflow.
+    local loc
+    case "$step" in
+      -) loc="its job-level uses" ;;
+      ''|*[!0-9]*) loc="$step" ;;
+      *) loc="step $step" ;;
+    esac
+
     # This repository's own tree, at this repository's own commit — the WRAPPER
     # is immutable, what it reaches for is not, so the exemption is paid for by
     # reading the manifest it names.
@@ -244,10 +308,25 @@ check_file() {
     esac
 
     if [ "${ref#docker://}" != "$ref" ]; then
+      # PIN4 — the image is chosen at run time. This gate cannot read a
+      # repository variable, so it cannot say whether what arrives is a digest
+      # or `:latest`, and calling it either would be an answer to a question
+      # that was not asked. Reported as UNDECIDED rather than passed, the same
+      # rule `check-runner-policy.sh` follows for a dynamic `runs-on` — and with
+      # the same opt-out, because an image chosen by an admin-scoped variable is
+      # a legitimate shape a consumer may have deliberately adopted.
+      case "$ref" in
+        *'${{'*)
+          if [ "$ALLOW_DYNAMIC_IMAGE" -eq 0 ]; then
+            err PIN4 "$rel: job '$job' $loc selects its image by expression — this gate cannot decide whether it resolves to a digest (declare --allow-dynamic-image if the value is a repository variable your admins scope)"
+          fi
+          continue
+          ;;
+      esac
       # PIN3 — a container image by tag is a moving target in exactly the same
       # way, and it runs as the step.
       if [ "${ref#*@sha256:}" = "$ref" ]; then
-        err PIN3 "$rel: job '$job' step $step uses '$ref' — a docker image by tag; pin it by @sha256: digest"
+        err PIN3 "$rel: job '$job' $loc uses '$ref' — a docker image by tag; pin it by @sha256: digest"
       fi
       continue
     fi
@@ -264,12 +343,12 @@ check_file() {
     path="${ref%@*}"
     version="${ref##*@}"
     if [ "$version" = "$ref" ]; then
-      err PIN1 "$rel: job '$job' step $step uses '$ref' with no ref at all — GitHub resolves it against the default branch"
+      err PIN1 "$rel: job '$job' $loc uses '$ref' with no ref at all — GitHub resolves it against the default branch"
       continue
     fi
 
     if ! printf '%s' "$version" | grep -qE "$SHA_RE"; then
-      err PIN1 "$rel: job '$job' step $step uses '$path@$version' — a tag or branch, not a commit; pin to a 40-character SHA"
+      err PIN1 "$rel: job '$job' $loc uses '$path@$version' — a tag or branch, not a commit; pin to a 40-character SHA"
       continue
     fi
 
@@ -299,9 +378,9 @@ check_file() {
     # `n_uses > n_commented` is false at 0 > 0. That is the vacuous pass again,
     # so it is reported rather than counted as agreement.
     if [ "$n_uses" -eq 0 ]; then
-      err PIN2 "$rel: job '$job' step $step pins '$path' to $version, but no raw line matched that reference — the version comment cannot be read from a folded or quoted scalar; write it as a plain 'uses: $path@$version # <tag>'"
+      err PIN2 "$rel: job '$job' $loc pins '$path' to $version, but no raw line matched that reference — the version comment cannot be read from a folded or quoted scalar; write it as a plain 'uses: $path@$version # <tag>'"
     elif [ "$n_uses" -gt "$n_commented" ]; then
-      err PIN2 "$rel: job '$job' step $step pins '$path' to $version with no version comment on $((n_uses - n_commented)) of $n_uses reference(s) — write '$path@$version # <tag>' on each so the bump is reviewable"
+      err PIN2 "$rel: job '$job' $loc pins '$path' to $version with no version comment on $((n_uses - n_commented)) of $n_uses reference(s) — write '$path@$version # <tag>' on each so the bump is reviewable"
     fi
   done <<EOF
 $(printf '%s\n' "$records" | grep '^#USES	')
@@ -555,6 +634,87 @@ jobs:
     steps:
       - uses: docker://alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 
+  # The container IS the job: every step runs inside it, holding the job's
+  # token. It reaches the runner through `container:`, never through a `uses:`,
+  # so a uses-and-steps reader called this workflow clean.
+  expect "a job container image by tag is a reference too" "PIN3" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - run: echo hi'
+
+  expect "a job container in mapping form is read too" "PIN3" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    steps:
+      - run: echo hi'
+
+  expect "a job container pinned by digest is clean" "" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    steps:
+      - run: echo hi'
+
+  # A service container sits on the job'"'"'s network for the job'"'"'s whole life, and
+  # `postgres:latest` moves under it exactly like any other tag.
+  expect "a service image by tag is a reference too" "PIN3" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:16
+    steps:
+      - run: echo hi'
+
+  expect "a service image by digest is clean" "" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    steps:
+      - run: echo hi'
+
+  # An image behind `${{ … }}` is the pin question this gate cannot answer: the
+  # value is a repository variable, and what it resolves to may be a digest or
+  # `:latest`. Undecided and said out loud, rather than reported as a tag —
+  # which is what it looked like before, since the expression text carries no
+  # `@sha256:`.
+  expect "an image chosen by expression is undecided" "PIN4" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ${{ vars.CI_BUILDER_IMAGE }}
+    steps:
+      - run: echo hi'
+
+  ALLOW_DYNAMIC_IMAGE=1
+  expect "a declared dynamic image is accepted" "" \
+'on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ${{ vars.CI_BUILDER_IMAGE }}
+    steps:
+      - run: echo hi'
+  ALLOW_DYNAMIC_IMAGE=0
+
   # The reason this gate parses. A `uses:` inside a shell heredoc is not a
   # reference GitHub resolves, and failing a repository for it is how a gate
   # gets deleted rather than fixed.
@@ -586,6 +746,7 @@ main() {
     case "$arg" in
       --selftest) run_selftest=1 ;;
       --allow=*)  allow+=("${arg#--allow=}") ;;
+      --allow-dynamic-image) ALLOW_DYNAMIC_IMAGE=1 ;;
       -*)         echo "::error::[PIN0] unknown option: $arg"; return 1 ;;
       *)          files+=("$arg") ;;
     esac
