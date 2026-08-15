@@ -123,6 +123,21 @@ jobs:
           if ($r.TotalCount -lt $floor) {
             throw "Pester discovered only $($r.TotalCount) test(s), fewer than the $floor this suite is known to contain — the suite did not run, whatever the exit code says"
           }
+          # A container-level failure -- BeforeAll throwing, a file that will not
+          # dot-source -- is reported by Pester as one line and every test in the
+          # file marked failed, which reads like thirteen bugs and is one. The
+          # cause lives in the container's own ErrorRecord and nowhere else, so
+          # it is printed rather than left for somebody to reproduce locally on a
+          # machine that has no pwsh.
+          foreach ($c in $r.Containers) {
+            if (-not $c.Result -or $c.Result -eq 'Passed') { continue }
+            Write-Output "--- container failed: $($c.Name)"
+            foreach ($e in @($c.ErrorRecord)) {
+              Write-Output ($e | Out-String)
+              if ($e.ScriptStackTrace) { Write-Output $e.ScriptStackTrace }
+              if ($e.Exception.InnerException) { Write-Output "inner: $($e.Exception.InnerException)" }
+            }
+          }
           if ($r.FailedCount -gt 0) { throw "$($r.FailedCount) Pester test(s) failed" }
 
       - name: drain-decision self-test
