@@ -13,7 +13,12 @@
 #   copies, so the gate refuses one.
 #
 #     LIT1  no literal in an executable tree — `*.tf`, `*.tfvars`, `*.hcl`,
-#           `*.sh`, and the workflow/config YAML that decides what CI does
+#           `*.sh`, `*.ps1`, and the workflow/config YAML that decides what
+#           CI does. `*.ps1` is here because a Windows host's boot script is
+#           delivered exactly as a Linux host's is, embedded verbatim into
+#           instance metadata, so a literal in it drifts exactly as far. It
+#           was added before the first PowerShell file existed, rather than
+#           after the first literal did.
 #     LIT2  no literal in a Markdown FENCED CODE BLOCK — the copy-pasteable half
 #           of a document
 #     LIT0  the gate found nothing to read, or was asked to read a file it
@@ -410,7 +415,7 @@ uses: acme/Apigee-Portal/.github/workflows/ci.yml@v1
 # and this function is only ever called with the real one in scope.
 discover() {
   git -C "$ROOT" ls-files -z -- \
-    '*.tf' '*.tfvars' '*.hcl' '*.sh' '*.yml' '*.yaml' '*.md' '*.mdx' 2>/dev/null
+    '*.tf' '*.tfvars' '*.hcl' '*.sh' '*.ps1' '*.yml' '*.yaml' '*.md' '*.mdx' 2>/dev/null
 }
 
 # shellcheck disable=SC2031  # `fail` is read after the fixtures wrote their own
