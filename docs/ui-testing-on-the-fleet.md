@@ -106,7 +106,7 @@ jobs:
       options: --shm-size=1gb
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: <org>/ci-runner-infra/.github/actions/playwright-ui@v5.8.0
+      - uses: <org>/ci-runner-infra/.github/actions/playwright-ui@v5
         with:
           playwright-version: "1.62.1"
 ```
