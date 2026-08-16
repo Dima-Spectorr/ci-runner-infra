@@ -485,15 +485,21 @@ Describe 'credential reset hook body' {
 
 Describe 'slot service environment' {
     # THE ASSERTION THIS WHOLE DESCRIBE EXISTS FOR. A pool with no job service
-    # account starts no broker and gets no GCE_METADATA_*, and it is the pool
-    # where an inherited credential is MOST dangerous: nothing on the host is
-    # competing with whatever the last workflow left behind, so the leftover is
-    # simply what the next job authenticates as.
+    # account starts no broker, and it is the pool where an inherited or ambient
+    # credential is MOST dangerous: nothing on the host is competing with whatever
+    # the last workflow left behind, so the leftover is simply what the next job
+    # authenticates as. The hooks clear the leftover; the GCE_METADATA_* values
+    # close the other door. All five are set here, and the second half is why:
+    # unset, GCE_METADATA_* does not withhold credentials, it hands ADC back to
+    # 169.254.169.254 and the HOST service account, because section 3A deleted the
+    # fence that gives Linux that property for free.
     It 'sets both hooks when there is no broker at all' {
         $block = Get-SlotServiceEnvironment -Index 1 -BrokerEndpoint '' -SlotRoot '/ci/slots'
         $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookPath
         $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookPath
-        $block.Contains('GCE_METADATA_HOST') | Should -BeFalse
+        $block['GCE_METADATA_HOST'] | Should -Be $script:ClosedMetadataEndpoint
+        $block['GCE_METADATA_IP'] | Should -Be $script:ClosedMetadataEndpoint
+        $block['GCE_METADATA_ROOT'] | Should -Be $script:ClosedMetadataEndpoint
     }
 
     It 'sets both hooks when there is one' {
