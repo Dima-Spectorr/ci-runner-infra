@@ -218,8 +218,10 @@ git -C "$REPO" commit -qm "document the image" >/dev/null 2>&1
 # still genuinely new in this same diff, so a bare `new-on-...` needle would be
 # satisfied by the row that is SUPPOSED to be there and assert nothing.
 run --base-ref "$BASE"
+# shellcheck disable=SC2016
 hasnt "prose describing a declaration does not adopt it" \
   '`packer/image.pkr.hcl` | new-on'
+# shellcheck disable=SC2016
 has "the untouched image declaration stays inherited" \
   '`packer/image.pkr.hcl` | maintenance-only-since-2025-10-21'
 
