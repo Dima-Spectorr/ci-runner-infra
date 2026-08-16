@@ -908,7 +908,10 @@ hydrate_shared_cache_bounded() {
   fi
 
   rm -rf "$CACHE_STAGE"
-  mkdir -p "$CACHE_STAGE" && chmod 0700 "$CACHE_STAGE" || { rm -rf "$tmp"; return 0; }
+  if ! mkdir -p "$CACHE_STAGE" || ! chmod 0700 "$CACHE_STAGE"; then
+    rm -rf "$tmp"
+    return 0
+  fi
   # --no-same-owner and --no-same-permissions: what is in the archive decides
   # nothing about ownership or mode. Everything lands root-owned under root's
   # umask, and the master's own lock re-applies the modes afterwards regardless.
