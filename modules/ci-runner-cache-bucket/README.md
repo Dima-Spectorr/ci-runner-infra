@@ -7,7 +7,7 @@ every pool in that project.
 
 ```hcl
 module "ci_cache" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-bucket?ref=v5.17.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-bucket?ref=v5.18.0"
 
   project_id = var.project_id
   name       = "${var.project_id}-ci-cache"
@@ -81,9 +81,23 @@ Two grants, therefore, not one:
 The host's grant is built by the host-pool module and is asserted by
 `scripts/ci/shared-cache.selftest.sh`: `roles/storage.objectViewer`, never
 `objectUser` or `objectAdmin`, so it carries no `storage.objects.create` and no
-`storage.objects.delete`. The producer's grant does not exist yet — nothing
-writes to this bucket, so a pool configured to read it simply finds no snapshot
-and runs on the cache its image baked.
+`storage.objects.delete`.
+
+The producer's grant is now `ci-runner-cache-publisher`: an account with no key,
+attached to no VM, assumable only through Workload Identity Federation by a run
+on the repository's default ref. It holds create — not overwrite — under its own
+pool's prefix, and may replace exactly one object, the pointer. The script that
+builds and uploads a snapshot does not exist yet, so nothing writes here in
+practice and a pool configured to read simply finds no snapshot and runs on the
+cache its image baked.
+
+This module also states the other half, which no per-pool grant can: three
+authoritative bindings with **empty** member lists, on every predefined role that
+carries `storage.objects.create` or `storage.objects.delete` at the bucket level.
+An additive grant says who may write; only an authoritative one says *and no one
+else*. A bucket-wide `objectAdmin` added by hand — the 2am stopgap for a failing
+publish — is taken back on the next apply and shows up in the plan instead of
+living forever unseen.
 
 ## The age bound is a security control
 
@@ -118,7 +132,11 @@ one stable key, `cache/<pool>/snapshot.tar.gz`, which is the obvious way to spel
 never expires. The control would still be configured and would still be doing
 nothing.
 
-So the not-yet-built publisher owes this module two things:
+So the publisher owes this module two things, and the first is now enforced
+rather than owed: its grant carries `storage.objects.create` and not
+`storage.objects.delete` under the prefix, and an overwrite in Cloud Storage
+needs delete — so a publisher that tries to refresh a stable key gets a 403
+instead of quietly producing an object that never expires.
 
 - snapshot objects carry a content hash or a timestamp in their name and are
   **written once, never overwritten**;
