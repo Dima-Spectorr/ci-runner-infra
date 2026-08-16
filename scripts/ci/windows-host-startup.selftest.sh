@@ -364,7 +364,24 @@ has_agent_registration() { # <file>
   matches "$code" 'Grant-ServiceLogonAccount -ServiceName \$serviceName -Credential \$Slot\.Credential' || return 1
   # The service name comes from the agent's own marker and is validated before it
   # reaches sc.exe — the file lives in a directory the slot account can write.
-  matches "$code" 'Get-RunnerServiceName -Marker \$marker' || return 1
+  matches "$code" 'Get-RunnerServiceName -Marker \$marker -AgentName \$name' || return 1
+  # …and validated against THIS slot's agent name, not just against the shape of
+  # a runner service name. A stale or restored marker naming a sibling's service
+  # otherwise gets this slot's logon account and environment applied to it.
+  matches "$code" 'EndsWith\("\.\$AgentName"' || return 1
+  # STOPPED between config.cmd and the identity change. config.cmd --runasservice
+  # starts what it installs, under the SCM default account, and neither the logon
+  # account nor the environment block reaches a process already running — while
+  # Start-Service on an already-running service reports success.
+  matches "$code" 'Stop-Service -Name \$serviceName -Force' || return 1
+  matches "$code" "WaitForStatus\\('Stopped'" || return 1
+  # Running is not the assertion; who it runs as is. This is the one check that
+  # can tell a correctly identity-switched agent from one that quietly kept the
+  # shared machine account.
+  matches "$code" 'Test-ServiceLogonAccount -StartName \$configured -SlotUser \$Slot\.User' || return 1
+  # The token never reaches the log verbatim, whatever config.cmd decides to
+  # print in a future version.
+  matches "$code" 'Get-RedactedLine -Line \(\[string\] \$line\) -Secret \$RegistrationToken' || return 1
   # The plaintext-password spellings this design exists to avoid. Every one of
   # them puts the slot credential in the process table of a host whose local
   # accounts run pull-request code.
@@ -645,6 +662,28 @@ mutate "the service left running as the SCM default identity" \
   has_agent_registration
 mutate "the slot password handed to config.cmd as plaintext" \
   's|^\$script:RunnerTemplate.*|$p = --windowslogonpassword|' \
+  has_agent_registration
+
+# 8b. The identity change applied to a service that never stopped, or to one that
+#     was never this slot's. Every one of these leaves a boot whose every log
+#     line says success.
+mutate "the service left running under the SCM default across the identity change" \
+  's|^        Stop-Service -Name \$serviceName -Force -ErrorAction Stop$||' \
+  has_agent_registration
+mutate "the stop fired but never waited for, so the config lands on a live process" \
+  "s|WaitForStatus('Stopped'|WaitForStatus('Running'|" \
+  has_agent_registration
+mutate "the marker trusted by shape alone, so a sibling's service can be claimed" \
+  's|Get-RunnerServiceName -Marker \$marker -AgentName \$name|Get-RunnerServiceName -Marker $marker -AgentName ""|' \
+  has_agent_registration
+mutate "the ownership suffix check dropped from the validator" \
+  's|EndsWith("\.\$AgentName"|EndsWith(""|' \
+  has_agent_registration
+mutate "Running accepted as proof of WHO it is running as" \
+  's|Test-ServiceLogonAccount -StartName \$configured -SlotUser \$Slot\.User|$true|' \
+  has_agent_registration
+mutate "the captured config.cmd output logged verbatim again" \
+  's|Get-RedactedLine -Line (\[string\] \$line) -Secret \$RegistrationToken|[string] $line|' \
   has_agent_registration
 
 # 9. The recovery actions come back, in each shape a "resilience" edit takes.

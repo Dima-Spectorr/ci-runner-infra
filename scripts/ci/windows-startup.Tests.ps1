@@ -714,25 +714,93 @@ Describe 'runner service name' {
     # name reaches sc.exe. Anything not vouched for comes back '' and the caller
     # denies the boot -- refused, never escaped.
     It 'accepts the name config.cmd records' {
-        Get-RunnerServiceName -Marker 'actions.runner.acme-infra.h-s1' |
+        Get-RunnerServiceName -Marker 'actions.runner.acme-infra.h-s1' -AgentName 'h-s1' |
             Should -Be 'actions.runner.acme-infra.h-s1'
     }
 
     It 'trims the trailing newline the marker file carries' {
-        Get-RunnerServiceName -Marker "actions.runner.a.b`r`n" | Should -Be 'actions.runner.a.b'
+        Get-RunnerServiceName -Marker "actions.runner.a.b`r`n" -AgentName 'b' |
+            Should -Be 'actions.runner.a.b'
     }
 
     It 'refuses a name a slot could use to reach another service' {
-        Get-RunnerServiceName -Marker 'actions.runner.a.b" delete "ci-beacon' | Should -Be ''
+        Get-RunnerServiceName -Marker 'actions.runner.a.b" delete "ci-beacon' -AgentName 'b' |
+            Should -Be ''
     }
 
     It 'refuses a name that is not a runner service at all' {
-        Get-RunnerServiceName -Marker 'ci-beacon' | Should -Be ''
+        Get-RunnerServiceName -Marker 'ci-beacon' -AgentName 'ci-beacon' | Should -Be ''
     }
 
     It 'refuses an empty or missing marker' {
-        Get-RunnerServiceName -Marker '' | Should -Be ''
-        Get-RunnerServiceName -Marker '   ' | Should -Be ''
+        Get-RunnerServiceName -Marker '' -AgentName 'h-s1' | Should -Be ''
+        Get-RunnerServiceName -Marker '   ' -AgentName 'h-s1' | Should -Be ''
+    }
+
+    # Shape alone accepts any well-formed name. A stale or restored marker naming
+    # a SIBLING slot's service would then get this slot's logon account, this
+    # slot's environment block and this slot's recovery policy -- applied to an
+    # agent that is already registered and running as somebody else.
+    It 'refuses a well-formed name belonging to another slot' {
+        Get-RunnerServiceName -Marker 'actions.runner.acme-infra.h-s2' -AgentName 'h-s1' |
+            Should -Be ''
+    }
+
+    # Suffix, not substring. `h-s1` must not be satisfied by `...h-s11`, which is
+    # a real neighbour on any host with ten or more slots.
+    It 'refuses a longer agent name that merely ends with this one' {
+        Get-RunnerServiceName -Marker 'actions.runner.acme-infra.h-s11' -AgentName 'h-s1' |
+            Should -Be ''
+    }
+}
+
+Describe 'service logon account' {
+    # Four spellings of one local account. Rejecting three of them reports a
+    # correctly configured service as a failed boot.
+    It 'accepts every spelling the SCM uses for a local account' {
+        Test-ServiceLogonAccount -StartName '.\ci-s1' -SlotUser 'ci-s1' | Should -BeTrue
+        Test-ServiceLogonAccount -StartName 'WIN-ABC\ci-s1' -SlotUser 'ci-s1' | Should -BeTrue
+        Test-ServiceLogonAccount -StartName 'ci-s1' -SlotUser 'ci-s1' | Should -BeTrue
+        Test-ServiceLogonAccount -StartName '.\CI-S1' -SlotUser 'ci-s1' | Should -BeTrue
+    }
+
+    # THE THREE THIS FUNCTION EXISTS FOR. Each is machine-wide and shared by every
+    # slot, and each is what the service runs as if the identity change did
+    # nothing at all.
+    It 'rejects each of the SCM defaults the identity change is meant to displace' {
+        Test-ServiceLogonAccount -StartName 'LocalSystem' -SlotUser 'ci-s1' | Should -BeFalse
+        Test-ServiceLogonAccount -StartName 'NT AUTHORITY\NetworkService' -SlotUser 'ci-s1' |
+            Should -BeFalse
+        Test-ServiceLogonAccount -StartName 'NT AUTHORITY\LocalService' -SlotUser 'ci-s1' |
+            Should -BeFalse
+    }
+
+    It 'rejects a sibling slot, which is the other account on this host' {
+        Test-ServiceLogonAccount -StartName '.\ci-s2' -SlotUser 'ci-s1' | Should -BeFalse
+    }
+
+    It 'reads an unreported account as not ours rather than as ours' {
+        Test-ServiceLogonAccount -StartName '' -SlotUser 'ci-s1' | Should -BeFalse
+        Test-ServiceLogonAccount -StartName $null -SlotUser 'ci-s1' | Should -BeFalse
+    }
+}
+
+Describe 'boot log redaction' {
+    It 'strikes the registration token out of a captured line' {
+        Get-RedactedLine -Line 'config: --token AABBCC ok' -Secret 'AABBCC' |
+            Should -Be 'config: --token *** ok'
+    }
+
+    # '' is a substring of every string. Redacting on it turns the whole boot log
+    # into asterisks, which is how a failing boot stops being diagnosable.
+    It 'leaves the line alone when there is no secret to strike' {
+        Get-RedactedLine -Line 'config: authenticated' -Secret '' |
+            Should -Be 'config: authenticated'
+    }
+
+    It 'strikes every occurrence, not just the first' {
+        Get-RedactedLine -Line 'T=AABBCC retry T=AABBCC' -Secret 'AABBCC' |
+            Should -Be 'T=*** retry T=***'
     }
 }
 

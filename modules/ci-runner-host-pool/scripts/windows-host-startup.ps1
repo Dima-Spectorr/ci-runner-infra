@@ -168,6 +168,12 @@ $script:RunnerTemplate = 'C:\ci\bin\actions-runner'
 $script:RegistrationWaitSeconds = 300
 $script:RegistrationPollSeconds = 5
 
+# How long to wait for the agent service config.cmd auto-started to stop again,
+# before its identity and environment are set. Bounded like everything else: a
+# service that will not stop is a slot that would run every job as the shared
+# machine account, and blocking forever hides that behind a hung boot.
+$script:ServiceStopSeconds = 60
+
 # Bounded, like every call this host makes. A host boot that HANGS is worse than
 # one that fails: it never registers an agent, never powers off, and bills at
 # warm-host size until the controller's register grace expires -- and while it
@@ -799,6 +805,66 @@ function Get-ServiceEnvironmentValue {
     return $entries.ToArray()
 }
 
+function Test-ServiceLogonAccount {
+    <#
+      .SYNOPSIS
+        Does a service's configured StartName name this slot's account? Pure.
+      .DESCRIPTION
+        The SCM reports a local account as `.\ci-s1`, and there are three other
+        spellings of the same account -- bare `ci-s1`, `<HOST>\ci-s1`, and the
+        `.\` form with different casing -- so a plain equality test against the
+        name phase 1 created reports a correctly configured service as wrong.
+
+        Everything ELSE must be rejected, and the ones that matter are the SCM
+        defaults this whole sequence exists to displace: LocalSystem,
+        `NT AUTHORITY\NetworkService` and `NT AUTHORITY\LocalService` are
+        machine-wide, shared by every slot, and each of them is what the service
+        runs as if the identity change silently did nothing.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $StartName,
+        [Parameter(Mandatory = $true)][string] $SlotUser
+    )
+
+    if ([string]::IsNullOrWhiteSpace($StartName)) { return $false }
+    $account = $StartName.Trim()
+    # Whatever precedes the last backslash is a machine or authority name; the
+    # account itself is what follows it. `.\ci-s1` and `WIN-ABC\ci-s1` both
+    # reduce to `ci-s1`, and `NT AUTHORITY\NetworkService` reduces to
+    # `NetworkService`, which is not a slot user and so fails the comparison.
+    $leaf = $account.Substring($account.LastIndexOf('\') + 1)
+    return ($leaf -eq $SlotUser)
+}
+
+function Get-RedactedLine {
+    <#
+      .SYNOPSIS
+        One captured output line with a known secret struck out of it. Pure.
+      .DESCRIPTION
+        config.cmd does not echo its --token today, and the boot log is
+        SYSTEM-and-Administrators-only while the serial console sits behind
+        project IAM. This exists so that none of those three sentences has to
+        stay true forever: the redaction is the only one of them this repository
+        controls.
+
+        A literal replace, not a regex, because the secret is not a pattern and
+        a pattern is what would miss it. An empty or absent secret returns the
+        line unchanged rather than redacting everything -- '' is a substring of
+        every string, and a log of nothing but asterisks is how a boot stops
+        being diagnosable.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Line,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Secret
+    )
+
+    if ([string]::IsNullOrEmpty($Line)) { return '' }
+    if ([string]::IsNullOrWhiteSpace($Secret)) { return $Line }
+    return $Line.Replace($Secret, '***')
+}
+
 function Get-RunnerServiceName {
     <#
       .SYNOPSIS
@@ -812,17 +878,34 @@ function Get-RunnerServiceName {
         service that does not exist -- while the agent that DOES exist starts with
         neither, takes jobs, and restarts itself out of a cordon.
 
-        VALIDATED, because the file is inside a directory the slot account can
-        write. The name reaches sc.exe, so anything that is not literally
-        `actions.runner.<...>` is refused rather than escaped. Returns '' on
-        anything it will not vouch for; the caller denies the boot.
+        VALIDATED TWICE, because the file is inside a directory the slot account
+        can write and the name it holds reaches sc.exe, Start-Service and an HKLM
+        service key:
+
+          * shape -- literally `actions.runner.<...>`, refused rather than
+            escaped;
+          * OWNERSHIP -- the name must end in this slot's own agent name.
+            GitHub's scheme is `actions.runner.<owner>-<repo>.<agent>` and the
+            agent name is `<instance>-s<i>`, unique per slot on this host. Shape
+            alone accepts any well-formed name, and a stale or restored `.service`
+            from a previous boot or a sibling slot would then send this slot's
+            logon account, environment block and recovery policy at ANOTHER
+            slot's already-registered service. Suffix, not equality: the owner and
+            repo halves are sanitised upstream and this file does not get to
+            encode how.
+
+        Returns '' on anything it will not vouch for; the caller denies the boot.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Marker)
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Marker,
+        [Parameter(Mandatory = $true)][string] $AgentName
+    )
 
     if ([string]::IsNullOrWhiteSpace($Marker)) { return '' }
     $name = $Marker.Trim()
     if ($name -notmatch '^actions\.runner\.[A-Za-z0-9._-]+$') { return '' }
+    if (-not $name.EndsWith(".$AgentName", [StringComparison]::Ordinal)) { return '' }
     return $name
 }
 
@@ -2024,15 +2107,19 @@ function Register-SlotAgent {
           2. config.cmd, ELEVATED. It creates a service and touches an account
              right, so it cannot run as the slot -- which is why step 4 exists;
           3. read the service name the agent itself recorded, and refuse anything
-             that is not one;
-          4. re-apply the ACL. config.cmd wrote `.runner` and `.credentials` as
+             that is not one, or that is not THIS slot's;
+          4. STOP it. config.cmd --runasservice starts the service it installs,
+             under the SCM default account, before this script has said anything
+             about identity -- and neither the logon account nor the environment
+             block reaches a process that is already running;
+          5. re-apply the ACL. config.cmd wrote `.runner` and `.credentials` as
              the elevated identity, so without this the agent cannot read its own
              credentials -- or, worse, a sibling can. The Linux script's
              `chown -R "$u:$u" "$dir"` is the same step;
-          5. environment, then recovery actions, then the logon account -- all
-             BEFORE the first start. A service started once with the SCM's default
+          6. environment, then recovery actions, then the logon account -- all
+             while it is stopped. A service started once with the SCM's default
              account has already written its own state as the wrong identity;
-          6. start, and verify it is Running rather than assume it.
+          7. start, and verify it is Running rather than assume it.
     #>
     [CmdletBinding()]
     param(
@@ -2081,7 +2168,15 @@ function Register-SlotAgent {
     $configOutput = & (Join-Path $agent 'config.cmd') @configArgs --token $RegistrationToken 2>&1
     $configExit = $LASTEXITCODE
     $ErrorActionPreference = $previous
-    foreach ($line in @($configOutput)) { Write-BootLog "slot $($Slot.Index) config: $line" }
+    # Redacted, and not because config.cmd is known to echo it. It is not, today.
+    # The log sink is SYSTEM-and-Administrators-only and the serial console is
+    # behind project IAM, so this is the third lock on a door that is already
+    # shut -- and the one that does not depend on upstream never changing its
+    # error text.
+    foreach ($line in @($configOutput)) {
+        Write-BootLog ("slot $($Slot.Index) config: " +
+            (Get-RedactedLine -Line ([string] $line) -Secret $RegistrationToken))
+    }
     if ($configExit -ne 0) {
         Deny-Boot "slot $($Slot.Index): config.cmd failed (exit $configExit)"
     }
@@ -2091,11 +2186,39 @@ function Register-SlotAgent {
     if (Test-Path -LiteralPath $markerPath) {
         $marker = Get-Content -Raw -LiteralPath $markerPath
     }
-    $serviceName = Get-RunnerServiceName -Marker $marker
+    $serviceName = Get-RunnerServiceName -Marker $marker -AgentName $name
     if (-not $serviceName) {
-        Deny-Boot ("slot $($Slot.Index): the agent did not record a usable service name in " +
+        Deny-Boot ("slot $($Slot.Index): the agent did not record a usable service name for $name in " +
             "$markerPath -- its environment, its logon account and its recovery policy would all " +
-            'be set on a service that does not exist, while the one that does starts with none of them')
+            'be set on a service that does not exist or belongs to another slot, while the one that ' +
+            'does starts with none of them')
+    }
+
+    # THE STEP WITHOUT WHICH EVERY STEP BELOW IT IS DECORATION
+    #
+    # `config.cmd --runasservice` does not just install the service, it STARTS
+    # it -- under the SCM default account, before this script has said a word
+    # about identity. ChangeServiceConfigW edits the registry, not a running
+    # process, and the SCM reads `Environment` at start; so a service left
+    # running here keeps the shared machine account and none of the environment
+    # block for its whole life, while `Start-Service` on an already-running
+    # service returns success and the Running check below agrees. The agent would
+    # take pull-request jobs as the wrong identity with no hooks, and every log
+    # line would say it worked.
+    #
+    # Inline rather than a helper, because the helper would be named
+    # Stop-Something and the analyzer demands a ShouldProcess block on that verb.
+    $installed = Get-Service -Name $serviceName -ErrorAction Stop
+    if ($installed.Status -ne 'Stopped') {
+        Write-BootLog ("slot $($Slot.Index): $serviceName came up under the SCM default account " +
+            'during config.cmd -- stopping it before its identity and environment are set')
+        Stop-Service -Name $serviceName -Force -ErrorAction Stop
+        $installed.WaitForStatus('Stopped', [timespan]::FromSeconds($script:ServiceStopSeconds))
+        $installed.Refresh()
+        if ($installed.Status -ne 'Stopped') {
+            Deny-Boot ("slot $($Slot.Index): $serviceName will not stop, so it would keep the shared " +
+                'machine account and none of the per-slot environment for the life of this host')
+        }
     }
 
     # After config.cmd, and re-proved rather than assumed. `.runner` and
@@ -2113,8 +2236,19 @@ function Register-SlotAgent {
     if ($svc.Status -ne 'Running') {
         Deny-Boot "slot $($Slot.Index): $serviceName is '$($svc.Status)', not Running"
     }
+
+    # Running is not the assertion. WHO it is running as is. Everything above
+    # this line is an attempt to make the answer be the slot account, and the
+    # failure this file spent the most care on -- an agent that quietly kept the
+    # SCM default -- looks exactly like success from the Status alone.
+    $configured = (Get-CimInstance -ClassName Win32_Service `
+            -Filter "Name='$serviceName'" -ErrorAction Stop).StartName
+    if (-not (Test-ServiceLogonAccount -StartName $configured -SlotUser $Slot.User)) {
+        Deny-Boot ("slot $($Slot.Index): $serviceName is running as '$configured', not $($Slot.User) " +
+            '-- every job on this slot would run as a machine-wide account shared with the other slots')
+    }
     Write-BootLog ("phase 5: slot $($Slot.Index) registered as $name, service $serviceName " +
-        "running as $($Slot.User), recovery actions cleared")
+        "running as $configured, recovery actions cleared")
 }
 
 function Invoke-Phase5Registration {
