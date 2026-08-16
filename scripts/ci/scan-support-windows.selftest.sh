@@ -184,6 +184,45 @@ has "…under a heading about the choice, not about the version" \
 has "the same version inherited elsewhere is still only maintenance-only" \
   'maintenance-only-since-2025-10-21'
 
+# --- "new" is a question about ONE file ---------------------------------------
+#
+# The regression this exists for. The first version pooled every added line in
+# the diff and matched a piece of evidence TEXT against it, so a declaration was
+# judged newly chosen because some unrelated file happened to contain the same
+# words. It fired for real on the pull request that shipped this scanner: the
+# evidence text for the Packer row was the literal string `node_major default`,
+# the scanner's own source contains it, and the report announced that the pull
+# request had just adopted the golden image's node 22 — a version the branch had
+# never touched.
+#
+# So: add a file that TALKS about the image's declaration without being it, and
+# leave the image itself alone. The two lines below are the two ways the match
+# can be fooled, and the fixture carries both deliberately:
+#
+#   1. the old evidence LABEL, contiguously — this is the exact string that
+#      fired in production, and prose that merely mentions `node_major` and
+#      `default` separately does NOT reproduce it;
+#   2. a verbatim copy of the declaration LINE, in a different file — which the
+#      label fix alone would not catch, and only per-file scoping does.
+mkdir -p "$REPO/docs"
+{
+  printf 'The image bakes a node major.\n'
+  printf 'The report used to label this row: node_major default\n'
+  printf 'The Packer file says:     default     = "22"\n'
+  printf 'The host OS family is ubuntu-2404-lts-amd64.\n'
+} >"$REPO/docs/how-the-image-works.md"
+git -C "$REPO" add -A >/dev/null 2>&1
+git -C "$REPO" commit -qm "document the image" >/dev/null 2>&1
+
+# Both needles name the Packer row specifically. The Dockerfile added earlier is
+# still genuinely new in this same diff, so a bare `new-on-...` needle would be
+# satisfied by the row that is SUPPOSED to be there and assert nothing.
+run --base-ref "$BASE"
+hasnt "prose describing a declaration does not adopt it" \
+  '`packer/image.pkr.hcl` | new-on'
+has "the untouched image declaration stays inherited" \
+  '`packer/image.pkr.hcl` | maintenance-only-since-2025-10-21'
+
 # --- an unreachable feed is UNDECIDED, never clean ---------------------------
 EMPTY="$WORK/empty-cache"
 mkdir -p "$EMPTY"

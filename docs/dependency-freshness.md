@@ -108,6 +108,20 @@ workflow checks out with `fetch-depth: 0` for this reason; a shallow clone makes
 every declaration look inherited and silently removes the finding the report
 leads with.
 
+**It is asked per file, about the declaration line itself** — not about a
+description of it, and not against a single pool of every line the diff added.
+Both shortcuts were tried and both are false-alarm generators: version strings
+like `18` and `22` appear incidentally in tables and changelogs, so a repo-wide
+match attributes them to whichever file happens to declare that version. The
+scan's own first live run got this wrong about itself, reporting that the pull
+request shipping the scanner had adopted the golden image's Node 22 — a file
+that pull request never touched.
+
+**The pull request comment is retracted, not just raised.** If a later push
+fixes the choice, the existing comment is rewritten to say so. A comment left
+standing after the branch fixed what it complained about is the same failure as
+an issue that never closes.
+
 ### What "the best available line" means
 
 Not the newest. The newest is routinely a line that has shipped but has not yet

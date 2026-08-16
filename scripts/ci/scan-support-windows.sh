@@ -152,7 +152,7 @@ emit() { # <product> <raw-version> <file> <text>
 }
 
 scan_inventory() {
-  local f line
+  local f line raw
 
   # `.nvmrc` / `.node-version` — one line, the whole file.
   for f in .nvmrc .node-version; do
@@ -216,15 +216,23 @@ scan_inventory() {
     # awk over the whole block, not `grep -A<n>`: a multi-line `description`
     # heredoc sits between the variable and its `default`, so any fixed context
     # window either misses the value or reads the next variable's.
-    line="$(awk '/^variable "node_major"/{inblock=1} inblock && /^[[:space:]]*default/{
-              gsub(/[^0-9.]/, "", $0); print; exit} inblock && /^}/{exit}' "$f" 2>/dev/null)"
-    [ -n "$line" ] && emit nodejs "$line" "${f#"$REPO_ROOT"/}" "node_major default"
+    # The RAW line is kept beside the value, because "did this pull request
+    # choose this?" can only be asked about the line itself. Asking it about a
+    # description of the line is what shipped broken: the evidence text used to
+    # be the literal words `node_major default`, this scanner's own source
+    # contains those words, and so the pull request that ADDED the scanner was
+    # told it had just adopted the golden image's node 22.
+    raw="$(awk '/^variable "node_major"/{inblock=1} inblock && /^[[:space:]]*default/{
+              print; exit} inblock && /^}/{exit}' "$f" 2>/dev/null)"
+    line="$(printf '%s' "$raw" | tr -cd '0-9.')"
+    [ -n "$line" ] && emit nodejs "$line" "${f#"$REPO_ROOT"/}" "$(trim "$raw")"
     # `ubuntu-2404-lts-amd64` — the host OS, whose end of life ends the security
     # updates for everything else baked on top of it.
-    line="$(grep -m1 -oE 'ubuntu-[0-9]{4}-lts' "$f" 2>/dev/null | head -n1)"
+    raw="$(grep -m1 -E 'ubuntu-[0-9]{4}-lts' "$f" 2>/dev/null | head -n1)"
+    line="$(printf '%s' "$raw" | grep -oE 'ubuntu-[0-9]{4}-lts' | head -n1)"
     if [ -n "$line" ]; then
       line="${line#ubuntu-}"; line="${line%-lts}"
-      emit ubuntu "${line:0:2}.${line:2:2}" "${f#"$REPO_ROOT"/}" "source_image_family"
+      emit ubuntu "${line:0:2}.${line:2:2}" "${f#"$REPO_ROOT"/}" "$(trim "$raw")"
     fi
   done < <(find "$REPO_ROOT/packer" -name '*.pkr.hcl' 2>/dev/null)
 
@@ -285,16 +293,38 @@ scan_inventory
 # A declaration is `new` when this pull request added the line that makes it.
 # Reversing a version choice is free on the day it is proposed and expensive a
 # year later, which is the entire reason the rule treats the two differently.
-ADDED="$CACHE/added.txt"
-: >"$ADDED"
+# Scoped to the DECLARING FILE. A single pool of every added line in the diff
+# means a line added in one file marks a declaration in another as newly
+# chosen, and the version strings involved — `18`, `22`, `1.21` — are exactly
+# the sort of text that appears incidentally in a table, a changelog or a
+# comment. The question is per-file or it is not being asked.
+ADDED_DIR="$CACHE/added"
+mkdir -p "$ADDED_DIR"
 if [ -n "$BASE_REF" ]; then
-  git -C "$REPO_ROOT" diff -U0 "$BASE_REF"...HEAD 2>/dev/null \
-    | grep -E '^\+[^+]' | sed 's/^+//' >"$ADDED" || :
+  git -C "$REPO_ROOT" diff -U0 "$BASE_REF"...HEAD 2>/dev/null | awk -v dir="$ADDED_DIR" '
+    /^\+\+\+ b\// { path = substr($0, 7); gsub(/[^A-Za-z0-9._-]/, "_", path)
+                    out = dir "/" path; next }
+    /^\+\+\+/     { out = ""; next }
+    /^\+/ && out != "" { print substr($0, 2) >>out }
+  ' || :
 fi
 
-adoption_of() { # <declaration-text>
-  [ -s "$ADDED" ] || { echo existing; return 0; }
-  if grep -qF -- "$1" "$ADDED" 2>/dev/null; then echo new; else echo existing; fi
+# Same sanitising as the awk above, so a path resolves to the same file on both
+# sides. `tr`, not `sed`, because a `sed 's/.../_/g'` here is a shellcheck
+# finding and this repository runs shellcheck with no severity filter.
+added_lines_for() { # <repo-relative path>
+  printf '%s/%s' "$ADDED_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+}
+
+adoption_of() { # <repo-relative file> <the declaration line itself>
+  local pool
+  # No base to compare against — a scheduled run, or a push. Everything is
+  # inherited, which is the quiet answer, and the right one: nothing here was
+  # chosen by an event that has a diff.
+  [ -n "$BASE_REF" ] || { echo existing; return 0; }
+  pool="$(added_lines_for "$1")"
+  [ -s "$pool" ] || { echo existing; return 0; }
+  if grep -qF -- "$2" "$pool" 2>/dev/null; then echo new; else echo existing; fi
 }
 
 RESULTS="$CACHE/results.tsv"
@@ -309,7 +339,7 @@ while IFS=$'\t' read -r product cycle source text; do
     IFS=$'\t' read -r eol support best_cycle best_eol <<<"$facts"
   fi
   verdict="$(support_verdict "$TODAY" "$WINDOW" "$cycle" "${eol:-}" "${support:-}" \
-             "${best_cycle:-}" "${best_eol:-}" "$(adoption_of "$text")")"
+             "${best_cycle:-}" "${best_eol:-}" "$(adoption_of "$source" "$text")")"
   printf '%s\t%s\t%s\t%s\t%s\n' "${verdict%%:*}" "$product" "$cycle" "$source" "$verdict" >>"$RESULTS"
 done <"$INVENTORY"
 

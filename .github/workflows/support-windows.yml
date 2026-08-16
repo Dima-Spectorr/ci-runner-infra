@@ -172,34 +172,50 @@ jobs:
       # own tree, and `pull_request_target` would hand a write-scoped token to
       # a job doing that, which is the standard way this class of workflow is
       # turned into arbitrary write access by a fork.
-      - name: raise a newly adopted short runway on the pull request
+      # NOT gated on `adopted != '0'`. The step has to run when the count is
+      # zero too, because that is the case where a comment already exists and
+      # the pull request has since fixed what it complained about. Skipping
+      # leaves that comment standing — the pull-request-shaped version of an
+      # issue that never closes, which this design refuses two steps above.
+      - name: raise, or retract, a newly adopted short runway on the pull request
         if: ${{ github.event_name == 'pull_request'
                 && github.event.pull_request.head.repo.full_name == github.repository
-                && inputs.comment-on-pull-request
-                && steps.scan.outputs.adopted != '0' }}
+                && inputs.comment-on-pull-request }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPORT: ${{ steps.scan.outputs.report }}
+          ADOPTED: ${{ steps.scan.outputs.adopted }}
           PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          body="$(mktemp)"
-          {
-            echo "<!-- support-window-scan-pr -->"
-            echo "### This pull request adopts a version with a shorter support runway than one already available"
-            echo
-            grep -F 'new-on-' "${REPORT}" || true
-            echo
-            echo "_Changing the choice now costs one line. After release it costs a migration._"
-            echo "_Not a required check — see \`docs/dependency-freshness.md\` for why._"
-          } >"${body}"
-
-          # Edited in place rather than appended to, so a pull request pushed to
-          # ten times carries one comment and not ten. The REST listing is used
-          # rather than `gh pr view --json comments`, whose ids are GraphQL node
-          # ids that the comments endpoint does not accept.
+          # The REST listing is used rather than `gh pr view --json comments`,
+          # whose ids are GraphQL node ids that the comments endpoint rejects.
           previous="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
             --jq 'map(select(.body | contains("support-window-scan-pr"))) | .[0].id // ""')"
+
+          body="$(mktemp)"
+          if [ "${ADOPTED:-0}" -eq 0 ]; then
+            [ -n "${previous}" ] || exit 0
+            {
+              echo "<!-- support-window-scan-pr -->"
+              echo "### No newly adopted version with a short support runway"
+              echo
+              echo "This pull request no longer chooses a line with less runway than one already available. Retracted by the scan itself, so the comment matches the branch rather than the moment it was first written."
+            } >"${body}"
+          else
+            {
+              echo "<!-- support-window-scan-pr -->"
+              echo "### This pull request adopts a version with a shorter support runway than one already available"
+              echo
+              grep -F 'new-on-' "${REPORT}" || true
+              echo
+              echo "_Changing the choice now costs one line. After release it costs a migration._"
+              echo "_Not a required check — see \`docs/dependency-freshness.md\` for why._"
+            } >"${body}"
+          fi
+
+          # Edited in place rather than appended to, so a pull request pushed to
+          # ten times carries one comment and not ten.
           if [ -n "${previous}" ]; then
             gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${previous}" \
               -F "body=@${body}" >/dev/null
