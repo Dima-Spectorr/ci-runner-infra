@@ -436,21 +436,6 @@ build {
       # time, by the warm script, as root.
       "if [ -d /opt/ci-images ]; then chown -R root:root /opt/ci-images && chmod 0755 /opt/ci-images && find /opt/ci-images -type f -exec chmod 0644 {} + ; fi",
     ]
-    # The ONE provisioner here that needs bash, and the only one that says so.
-    #
-    # `execute_command` below reads as though it picks the interpreter, and it
-    # does not: `bash -c '<path>'` runs the uploaded file as a PROGRAM, so the
-    # kernel honours the file's shebang instead. Packer writes that shebang from
-    # `inline_shebang`, whose default is `/bin/sh -e` — dash on Ubuntu. Every
-    # other provisioner survives that because `set -eux` is portable; this one
-    # opens with `set -euxo pipefail` and dash answers
-    #
-    #     set: Illegal option -o pipefail
-    #
-    # exiting 2 before a single guard runs. The comment above explains why
-    # pipefail is load-bearing here rather than decorative: without it a `find`
-    # that errors reads as a clean scan.
-    inline_shebang  = "/bin/bash -e"
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
