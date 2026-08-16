@@ -849,7 +849,10 @@ write_registration_token() {
 
   zone=${uri%/instances/*}; zone=${zone##*/}
   host=${uri##*/}
-  [ -n "$zone" ] && [ -n "$host" ] || { log "regtoken: cannot read a zone from $uri"; return 1; }
+  if [ -z "$zone" ] || [ -z "$host" ]; then
+    log "regtoken: cannot read a zone from $uri"
+    return 1
+  fi
 
   # --metadata-from-file, never --metadata: a token passed as an argument sits
   # in the process table, and on the pool this exists for one of the local
