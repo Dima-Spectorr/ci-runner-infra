@@ -133,6 +133,13 @@ locals {
     file("${path.module}/scripts/drain-decision.sh"),
     file("${path.module}/scripts/orphan-decision.sh"),
     file("${path.module}/scripts/recycle-decision.sh"),
+    # The Windows half of the second delete gate. Concatenated on EVERY pool,
+    # Linux included, and inert on one: nothing calls beacon_decision() unless a
+    # host reports `ci-host-os = windows`. Shipping it conditionally would make
+    # the controller a per-deployment variant, and the branch that decides
+    # whether a machine is deleted would then differ from the branch that was
+    # tested.
+    file("${path.module}/scripts/beacon-decision.sh"),
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/watchdog-decision.sh"),
     file("${path.module}/scripts/controller-startup.sh"),
