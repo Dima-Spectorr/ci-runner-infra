@@ -639,30 +639,168 @@ Describe 'closed metadata endpoint' {
     }
 }
 
+# --- phase 5 -----------------------------------------------------------------
+
+Describe 'runner config arguments' {
+    # The recycle contract and the 90-minute stall this pool replaces both live in
+    # this argument list, and every one of them is a silent loss: a runner that
+    # self-updates is alive, offline and undispatchable, and on a warm host that
+    # is K slots at once rather than one short-lived VM.
+    It 'pins the agent version by refusing the self-update' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels 'x' -WorkPath '/w'
+        $a | Should -Contain '--disableupdate'
+    }
+
+    # A rebooted host has an agent of this name already in GitHub's list, and a
+    # refused registration is a slot that never comes back.
+    It 'replaces the registration a reboot left behind' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels 'x' -WorkPath '/w'
+        $a | Should -Contain '--replace'
+        $a | Should -Contain '--unattended'
+        $a | Should -Contain '--runasservice'
+    }
+
+    # No account flags, ever. config.cmd takes a logon password as a plaintext
+    # argument, in the process table of a host whose local accounts run
+    # pull-request code; the logon account is set afterwards through
+    # ChangeServiceConfigW instead.
+    It 'passes no logon account and no password' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels 'x' -WorkPath '/w'
+        ($a -join ' ') | Should -Not -Match 'logon'
+        ($a -join ' ') | Should -Not -Match 'password'
+    }
+
+    It 'builds the repository url from the owner and repo' {
+        $a = Get-RunnerConfigArgument -Owner 'acme' -Repo 'infra' -Name 'h-s1' -Labels 'x' -WorkPath '/w'
+        $a[[array]::IndexOf($a, '--url') + 1] | Should -Be 'https://github.com/acme/infra'
+    }
+
+    # An empty label string must not become a `--labels ''` pair: PowerShell 5.1
+    # drops an empty native-command argument, so config.cmd would see `--labels`
+    # followed by whatever came next and register with the wrong flag value.
+    It 'omits labels entirely when there are none' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels '' -WorkPath '/w'
+        $a | Should -Not -Contain '--labels'
+    }
+
+    It 'omits the runner group when there is none' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels 'x' -WorkPath '/w'
+        $a | Should -Not -Contain '--runnergroup'
+    }
+
+    It 'passes the runner group when there is one' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels 'x' `
+            -WorkPath '/w' -RunnerGroup 'warm'
+        $a[[array]::IndexOf($a, '--runnergroup') + 1] | Should -Be 'warm'
+    }
+}
+
+Describe 'slot agent name' {
+    # orphan_decision() on the controller parses this name back to an instance, so
+    # a rename here silently un-reaps every Windows registration: the agent stays
+    # in GitHub's list, the host it names is gone, and nothing notices.
+    It 'is the instance name and the slot index' {
+        Get-SlotAgentName -InstanceName 'ci-w-abcd' -Index 2 | Should -Be 'ci-w-abcd-s2'
+    }
+
+    It 'gives two slots on one host two different names' {
+        (Get-SlotAgentName -InstanceName 'h' -Index 1) |
+            Should -Not -Be (Get-SlotAgentName -InstanceName 'h' -Index 2)
+    }
+}
+
 Describe 'runner service name' {
     # The marker file lives in a directory the slot account can write, and the
     # name reaches sc.exe. Anything not vouched for comes back '' and the caller
     # denies the boot -- refused, never escaped.
     It 'accepts the name config.cmd records' {
-        Get-RunnerServiceName -Marker 'actions.runner.acme-infra.h-s1' |
+        Get-RunnerServiceName -Marker 'actions.runner.acme-infra.h-s1' -AgentName 'h-s1' |
             Should -Be 'actions.runner.acme-infra.h-s1'
     }
 
     It 'trims the trailing newline the marker file carries' {
-        Get-RunnerServiceName -Marker "actions.runner.a.b`r`n" | Should -Be 'actions.runner.a.b'
+        Get-RunnerServiceName -Marker "actions.runner.a.b`r`n" -AgentName 'b' |
+            Should -Be 'actions.runner.a.b'
     }
 
     It 'refuses a name a slot could use to reach another service' {
-        Get-RunnerServiceName -Marker 'actions.runner.a.b" delete "ci-beacon' | Should -Be ''
+        Get-RunnerServiceName -Marker 'actions.runner.a.b" delete "ci-beacon' -AgentName 'b' |
+            Should -Be ''
     }
 
     It 'refuses a name that is not a runner service at all' {
-        Get-RunnerServiceName -Marker 'ci-beacon' | Should -Be ''
+        Get-RunnerServiceName -Marker 'ci-beacon' -AgentName 'ci-beacon' | Should -Be ''
     }
 
     It 'refuses an empty or missing marker' {
-        Get-RunnerServiceName -Marker '' | Should -Be ''
-        Get-RunnerServiceName -Marker '   ' | Should -Be ''
+        Get-RunnerServiceName -Marker '' -AgentName 'h-s1' | Should -Be ''
+        Get-RunnerServiceName -Marker '   ' -AgentName 'h-s1' | Should -Be ''
+    }
+
+    # Shape alone accepts any well-formed name. A stale or restored marker naming
+    # a SIBLING slot's service would then get this slot's logon account, this
+    # slot's environment block and this slot's recovery policy -- applied to an
+    # agent that is already registered and running as somebody else.
+    It 'refuses a well-formed name belonging to another slot' {
+        Get-RunnerServiceName -Marker 'actions.runner.acme-infra.h-s2' -AgentName 'h-s1' |
+            Should -Be ''
+    }
+
+    # Suffix, not substring. `h-s1` must not be satisfied by `...h-s11`, which is
+    # a real neighbour on any host with ten or more slots.
+    It 'refuses a longer agent name that merely ends with this one' {
+        Get-RunnerServiceName -Marker 'actions.runner.acme-infra.h-s11' -AgentName 'h-s1' |
+            Should -Be ''
+    }
+}
+
+Describe 'service logon account' {
+    # Four spellings of one local account. Rejecting three of them reports a
+    # correctly configured service as a failed boot.
+    It 'accepts every spelling the SCM uses for a local account' {
+        Test-ServiceLogonAccount -StartName '.\ci-s1' -SlotUser 'ci-s1' | Should -BeTrue
+        Test-ServiceLogonAccount -StartName 'WIN-ABC\ci-s1' -SlotUser 'ci-s1' | Should -BeTrue
+        Test-ServiceLogonAccount -StartName 'ci-s1' -SlotUser 'ci-s1' | Should -BeTrue
+        Test-ServiceLogonAccount -StartName '.\CI-S1' -SlotUser 'ci-s1' | Should -BeTrue
+    }
+
+    # THE THREE THIS FUNCTION EXISTS FOR. Each is machine-wide and shared by every
+    # slot, and each is what the service runs as if the identity change did
+    # nothing at all.
+    It 'rejects each of the SCM defaults the identity change is meant to displace' {
+        Test-ServiceLogonAccount -StartName 'LocalSystem' -SlotUser 'ci-s1' | Should -BeFalse
+        Test-ServiceLogonAccount -StartName 'NT AUTHORITY\NetworkService' -SlotUser 'ci-s1' |
+            Should -BeFalse
+        Test-ServiceLogonAccount -StartName 'NT AUTHORITY\LocalService' -SlotUser 'ci-s1' |
+            Should -BeFalse
+    }
+
+    It 'rejects a sibling slot, which is the other account on this host' {
+        Test-ServiceLogonAccount -StartName '.\ci-s2' -SlotUser 'ci-s1' | Should -BeFalse
+    }
+
+    It 'reads an unreported account as not ours rather than as ours' {
+        Test-ServiceLogonAccount -StartName '' -SlotUser 'ci-s1' | Should -BeFalse
+        Test-ServiceLogonAccount -StartName $null -SlotUser 'ci-s1' | Should -BeFalse
+    }
+}
+
+Describe 'boot log redaction' {
+    It 'strikes the registration token out of a captured line' {
+        Get-RedactedLine -Line 'config: --token AABBCC ok' -Secret 'AABBCC' |
+            Should -Be 'config: --token *** ok'
+    }
+
+    # '' is a substring of every string. Redacting on it turns the whole boot log
+    # into asterisks, which is how a failing boot stops being diagnosable.
+    It 'leaves the line alone when there is no secret to strike' {
+        Get-RedactedLine -Line 'config: authenticated' -Secret '' |
+            Should -Be 'config: authenticated'
+    }
+
+    It 'strikes every occurrence, not just the first' {
+        Get-RedactedLine -Line 'T=AABBCC retry T=AABBCC' -Secret 'AABBCC' |
+            Should -Be 'T=*** retry T=***'
     }
 }
 

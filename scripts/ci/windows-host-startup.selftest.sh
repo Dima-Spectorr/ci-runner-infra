@@ -281,6 +281,138 @@ has_job_hook_acl() { # <file>
   matches "$code" 'AppData.Roaming.gcloud' || return 1
 }
 
+# --- phase 5: the two obligations the controller cannot check ----------------
+#
+# The controller mints the registration token, writes it to this instance's
+# `ci-registration-token` key, and DELETES that key as soon as GitHub reports any
+# of the host's agents registered — `partial`, not only `present`. Both
+# consequences below are host-side, both are silent when broken, and neither is
+# visible from the controller.
+
+has_single_registration_token_read() { # <file>
+  local code n
+  code=$(code_of "$1")
+
+  # OBLIGATION (a). The read is a statement of Invoke-Phase5Registration's own
+  # body — four spaces — and its value is passed down. Moved inside the foreach
+  # it lands at eight, which is the whole invariant and is decidable from the
+  # text exactly as the job-hook indentation check is.
+  matches "$code" '^    \$regToken = Wait-RegistrationToken$' || return 1
+  ! matches "$code" '^        \$regToken = Wait-RegistrationToken' || return 1
+
+  # …and the loop consumes the VARIABLE. `-RegistrationToken (Wait-Registration…)`
+  # is the same bug spelled without moving a line: slot 1 registers, the
+  # controller's delete fires, and slot 2's call returns nothing.
+  matches "$code" '\-RegistrationToken \$regToken' || return 1
+  ! matches "$code" '\-RegistrationToken \(Wait-RegistrationToken' || return 1
+
+  # Exactly one assignment in the whole file. A second one anywhere is a second
+  # read, wherever it happens to be indented.
+  n=$(printf '%s\n' "$code" | grep -cE '\$regToken = Wait-RegistrationToken')
+  [ "${n:-0}" -eq 1 ] || return 1
+}
+
+has_blocking_registration_expiry() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # OBLIGATION (b). The wait's timeout arm DENIES THE BOOT. Returning '' instead
+  # is the tempting edit — it reads as graceful — and it is how a rebooted host
+  # past the token's deletion registers with an empty token instead of being
+  # reclaimed by the register-grace drain, which is the designed outcome.
+  matches "$code" 'Deny-Boot \("no \$script:RegistrationTokenKey on this instance' || return 1
+  # The wait is bounded, or the "block" is an unbounded hang: a host that never
+  # registers, never powers off, and counts against the pool's size the whole
+  # time. That is the 2h55m outage restated.
+  matches "$code" '\$deadline = \(Get-Date\)\.AddSeconds\(\$TimeoutSeconds\)' || return 1
+  matches "$code" 'if \(\(Get-Date\) -ge \$deadline\) \{ break \}' || return 1
+
+  # And the second half of the same obligation: config.cmd is never reached with
+  # an empty token even if something upstream stops denying the boot.
+  matches "$code" 'IsNullOrWhiteSpace\(\$RegistrationToken\)' || return 1
+  matches "$code" 'refusing to run config.cmd with an empty registration' || return 1
+}
+
+# --- phase 5: registration, and the recycle contract it must not break -------
+
+has_agent_registration() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # --disableupdate is an ARGUMENT, not a word in a comment. GitHub otherwise
+  # forces a runner self-update that leaves the process alive while the agent is
+  # offline and undispatchable — 90 minutes of stalled CI on the pool this
+  # replaces, and on a warm host it takes K slots down at once.
+  matches "$code" "'--unattended', '--replace', '--disableupdate', '--runasservice'" || return 1
+  # A rebooted host has an agent of this name already in GitHub's list, and a
+  # refused registration is a slot that never comes back.
+  matches "$code" "'--replace'" || return 1
+  # Copied per slot, never shared: config.cmd writes .runner and .credentials
+  # into the directory it runs in, so K agents in one directory share one
+  # identity.
+  matches "$code" 'Copy-Item -Path \(Join-Path \$script:RunnerTemplate' || return 1
+  # The ACL is re-applied AFTER config.cmd, which wrote those two files as the
+  # elevated identity. Without it the agent cannot read its own credentials —
+  # or, worse, a sibling can.
+  matches "$code" 'Protect-CiDirectory -Path \$agent -SlotUser \$Slot\.User' || return 1
+  # The environment is written on the SERVICE, before it is ever started. A
+  # service started once under the SCM default has already written its state as
+  # the wrong identity.
+  matches "$code" 'Write-ServiceEnvironment -ServiceName \$serviceName -Environment \$Environment' || return 1
+  # …and the account it ends up running as is the slot's, from the PSCredential
+  # phase 1 built.
+  matches "$code" 'Grant-ServiceLogonAccount -ServiceName \$serviceName -Credential \$Slot\.Credential' || return 1
+  # The service name comes from the agent's own marker and is validated before it
+  # reaches sc.exe — the file lives in a directory the slot account can write.
+  matches "$code" 'Get-RunnerServiceName -Marker \$marker -AgentName \$name' || return 1
+  # …and validated against THIS slot's agent name, not just against the shape of
+  # a runner service name. A stale or restored marker naming a sibling's service
+  # otherwise gets this slot's logon account and environment applied to it.
+  matches "$code" 'EndsWith\("\.\$AgentName"' || return 1
+  # STOPPED between config.cmd and the identity change. config.cmd --runasservice
+  # starts what it installs, under the SCM default account, and neither the logon
+  # account nor the environment block reaches a process already running — while
+  # Start-Service on an already-running service reports success.
+  matches "$code" 'Stop-Service -Name \$serviceName -Force' || return 1
+  matches "$code" "WaitForStatus\\('Stopped'" || return 1
+  # …and the expiry caught, because WaitForStatus throws rather than returning a
+  # stale status: uncaught, the one failure this block reports is reported as a
+  # bare .NET exception instead of the sentence naming the consequence.
+  matches "$code" 'did not stop within' || return 1
+  # Running is not the assertion; who it runs as is. This is the one check that
+  # can tell a correctly identity-switched agent from one that quietly kept the
+  # shared machine account.
+  matches "$code" 'Test-ServiceLogonAccount -StartName \$configured -SlotUser \$Slot\.User' || return 1
+  # The token never reaches the log verbatim, whatever config.cmd decides to
+  # print in a future version.
+  matches "$code" 'Get-RedactedLine -Line \(\[string\] \$line\) -Secret \$RegistrationToken' || return 1
+  # The plaintext-password spellings this design exists to avoid. Every one of
+  # them puts the slot credential in the process table of a host whose local
+  # accounts run pull-request code.
+  ! matches "$code" 'windowslogonpassword|password=[^\n]*\$|StartPassword' || return 1
+}
+
+has_cleared_recovery_actions() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # The Windows spelling of the Linux unit's `Restart=no`, and the README's
+  # recycle contract depends on it. Agents are not --ephemeral, so the controller
+  # drains a host by deregistering its agents; an agent the SCM restarts after a
+  # job-time failure re-registers, takes more work, and keeps a host the
+  # controller believes is draining alive forever.
+  matches "$code" 'sc\.exe failure[^\n]*reset= 0 actions=' || return 1
+  matches "$code" 'Clear-ServiceRecoveryAction -ServiceName \$serviceName' || return 1
+  # A failure to clear them is FATAL. "Best effort" here is a host that cannot be
+  # retired, discovered weeks later as a machine nobody can delete.
+  matches "$code" 'could not clear the recovery actions on \$ServiceName' || return 1
+  # The actions list is EMPTY. The beacon and the broker carry a restart action
+  # deliberately — those must come back — but writing one here is the exact
+  # regression, and `actions= restart/60000` is what a reader who thinks
+  # "services should be resilient" types.
+  ! matches "$code" 'actions=[^\n]*restart' || return 1
+}
+
 # --- the helper carries the trap it was written to avoid ---------------------
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -341,6 +473,30 @@ else
   bad "the reset hook is slot-writable, or resolves the profile from the job's own environment — one file is executed by every slot on the host, so a slot that can rewrite it runs code in every other slot's identity"
 fi
 
+if has_single_registration_token_read "$SCRIPT"; then
+  ok
+else
+  bad "the registration token is read per slot rather than once above the loop — the controller deletes the key the moment GitHub reports the host partial, so slot 1 registers, the key vanishes, and every later slot silently gets nothing on a host that looks healthy"
+fi
+
+if has_blocking_registration_expiry "$SCRIPT"; then
+  ok
+else
+  bad "a host that cannot get a registration token proceeds anyway — after the key is deleted a REBOOT must log and block so the register-grace drain reclaims the instance, not run config.cmd with an empty token"
+fi
+
+if has_agent_registration "$SCRIPT"; then
+  ok
+else
+  bad "agent registration is missing an argument the recycle contract depends on, shares one runner directory across slots, or hands the slot password to something that takes it as plaintext"
+fi
+
+if has_cleared_recovery_actions "$SCRIPT"; then
+  ok
+else
+  bad "the runner service keeps its SCM recovery actions — an agent the SCM restarts after a job-time failure re-registers and takes more work on a host the controller believes is draining, which is the Windows spelling of the Linux unit's Restart=no"
+fi
+
 # --- mutation cases: prove the checks above can actually fail -----------------
 #
 # Every one of these reverts the fix in place and asserts the covered case
@@ -351,6 +507,15 @@ mutate() { # <description> <sed-program> <predicate> — predicate must go false
   local desc="$1" prog="$2" pred="$3" tmp
   tmp=$(mktemp)
   sed "$prog" "$SCRIPT" >"$tmp"
+  # A sed program that matches NOTHING leaves the predicate true and reads as a
+  # detected mutation only because the file was never mutated. That is the same
+  # class of hole as the `describe --filter` stub: a green check over an
+  # assertion that was never made. Refuse to score a case that changed nothing.
+  if cmp -s "$tmp" "$SCRIPT"; then
+    bad "mutation changed nothing, so it asserts nothing: $desc"
+    rm -f "$tmp"
+    return
+  fi
   if "$pred" "$tmp"; then
     bad "mutation not detected: $desc"
   else
@@ -463,6 +628,81 @@ mutate "the not-a-slot-profile refusal removed" \
 mutate "the gcloud credential store no longer cleaned" \
   's|AppData\\Roaming\\gcloud|AppData\\Local\\Temp\\turbo|' \
   has_job_hook_acl
+
+# 6. OBLIGATION (a): the one read becomes a per-slot read, in both spellings.
+mutate "the token read moved inside the slot loop" \
+  's|^    \$regToken = Wait-RegistrationToken$|        $regToken = Wait-RegistrationToken|' \
+  has_single_registration_token_read
+mutate "the loop calling Wait-RegistrationToken inline per slot" \
+  's|-RegistrationToken \$regToken|-RegistrationToken (Wait-RegistrationToken)|' \
+  has_single_registration_token_read
+
+# 7. OBLIGATION (b): the reboot-after-expiry path stops blocking.
+mutate "the expired-token timeout returning empty instead of denying the boot" \
+  "s|Deny-Boot (\"no \$script:RegistrationTokenKey on this instance|return '' #(\"no \$script:RegistrationTokenKey on this instance|" \
+  has_blocking_registration_expiry
+mutate "the empty-token guard removed from Register-SlotAgent" \
+  's|if (\[string\]::IsNullOrWhiteSpace(\$RegistrationToken)) {|if ($false) {|' \
+  has_blocking_registration_expiry
+mutate "the wait made unbounded, so a token-less host hangs instead of blocking" \
+  's|if ((Get-Date) -ge \$deadline) { break }|$null = $deadline|' \
+  has_blocking_registration_expiry
+
+# 8. Registration loses an argument or a per-slot property the contract needs.
+mutate "--disableupdate dropped from the config arguments" \
+  "s|'--unattended', '--replace', '--disableupdate', '--runasservice'|'--unattended', '--replace', '--runasservice'|" \
+  has_agent_registration
+mutate "one runner directory shared by every slot" \
+  's|Copy-Item -Path (Join-Path \$script:RunnerTemplate|Copy-Item -Path (Join-Path $script:SlotRoot|' \
+  has_agent_registration
+mutate "the ACL not re-applied after config.cmd wrote .credentials" \
+  's|^    Protect-CiDirectory -Path \$agent -SlotUser \$Slot\.User$||' \
+  has_agent_registration
+mutate "the environment block never written to the service" \
+  's|^    Write-ServiceEnvironment -ServiceName \$serviceName -Environment \$Environment$||' \
+  has_agent_registration
+mutate "the service left running as the SCM default identity" \
+  's|^    Grant-ServiceLogonAccount -ServiceName \$serviceName -Credential \$Slot\.Credential$||' \
+  has_agent_registration
+mutate "the slot password handed to config.cmd as plaintext" \
+  's|^\$script:RunnerTemplate.*|$p = --windowslogonpassword|' \
+  has_agent_registration
+
+# 8b. The identity change applied to a service that never stopped, or to one that
+#     was never this slot's. Every one of these leaves a boot whose every log
+#     line says success.
+mutate "the service left running under the SCM default across the identity change" \
+  's|^        Stop-Service -Name \$serviceName -Force -ErrorAction Stop$||' \
+  has_agent_registration
+mutate "the stop fired but never waited for, so the config lands on a live process" \
+  "s|WaitForStatus('Stopped'|WaitForStatus('Running'|" \
+  has_agent_registration
+mutate "the stop timeout left to surface as a bare .NET exception" \
+  's|did not stop within|did not stop before|' \
+  has_agent_registration
+mutate "the marker trusted by shape alone, so a sibling's service can be claimed" \
+  's|Get-RunnerServiceName -Marker \$marker -AgentName \$name|Get-RunnerServiceName -Marker $marker -AgentName ""|' \
+  has_agent_registration
+mutate "the ownership suffix check dropped from the validator" \
+  's|EndsWith("\.\$AgentName"|EndsWith(""|' \
+  has_agent_registration
+mutate "Running accepted as proof of WHO it is running as" \
+  's|Test-ServiceLogonAccount -StartName \$configured -SlotUser \$Slot\.User|$true|' \
+  has_agent_registration
+mutate "the captured config.cmd output logged verbatim again" \
+  's|Get-RedactedLine -Line (\[string\] \$line) -Secret \$RegistrationToken|[string] $line|' \
+  has_agent_registration
+
+# 9. The recovery actions come back, in each shape a "resilience" edit takes.
+mutate "the clear removed from the registration path" \
+  's|^    Clear-ServiceRecoveryAction -ServiceName \$serviceName$||' \
+  has_cleared_recovery_actions
+mutate "a restart action written instead of an empty one" \
+  's|reset= 0 actions= |reset= 86400 actions= restart/60000|' \
+  has_cleared_recovery_actions
+mutate "a failed clear downgraded to a warning" \
+  's|Deny-Boot ("could not clear the recovery actions on \$ServiceName|Write-BootLog ("recovery actions not cleared on $ServiceName|' \
+  has_cleared_recovery_actions
 
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
