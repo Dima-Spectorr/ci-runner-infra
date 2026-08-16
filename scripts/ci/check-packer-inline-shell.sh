@@ -11,8 +11,13 @@
 #   script uses a bash-only construct, it must declare an `inline_shebang` that
 #   names bash.
 #
+#   The ids name the RULE, and are REPORTED when the rule is broken — the same
+#   shape as WFS1/WFS0 in check-workflow-shell.sh:
+#
 #     PIS1  an inline block using a bashism declares a bash inline_shebang
-#     PIS0  the gate found no packer template to read — reported, never passed
+#           (reported at the offending line when it does not)
+#     PIS0  the gate could not read a template, or found no inline provisioner,
+#           or has no python3 to read them with — reported, never passed
 #
 # WHY
 #   `execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"` reads as
@@ -58,6 +63,16 @@ for arg in "$@"; do
 done
 
 scan() {
+  # Named, not inherited from `command not found`. A gate that cannot run its
+  # own reader must say so in its own vocabulary, or the failure reads as "the
+  # script is broken" rather than "this runner has no python3" — and on a
+  # runner where the tool is genuinely absent, a generic 127 is the shape that
+  # gets "fixed" by making the step non-blocking.
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "::error::[PIS0] python3 is not on PATH — the gate has no reader, so it checked nothing"
+    return 1
+  fi
+
   python3 - "$1" <<'PY'
 import re, sys, pathlib
 
@@ -114,12 +129,20 @@ for path in files:
             if is_bash:
                 continue
             hitline = line0 + block[:hit.start()].count("\n")
+            # Relative to the scanned root, which in CI is the checkout: an
+            # absolute path in a workflow annotation does not resolve to a file
+            # in the diff, so the finding stops appearing on the line it is
+            # about and becomes a log message nobody scrolls to.
+            try:
+                shown = path.relative_to(root).as_posix()
+            except ValueError:
+                shown = path.as_posix()
             print(
                 "::error file=%s,line=%d::[PIS1] inline provisioner uses %s but "
                 "declares no bash inline_shebang, so it runs under the default "
                 "/bin/sh (dash) and dies at that line. Add: "
                 'inline_shebang = "/bin/bash -e"'
-                % (path.as_posix(), hitline, name)
+                % (shown, hitline, name)
             )
             fail = 1
             break
@@ -151,10 +174,23 @@ build {
   }
 }
 HCL
-  if scan "$tmp" >/dev/null 2>&1; then
+  local out
+  if out=$(scan "$tmp" 2>&1); then
     echo "::error::[PIS-SELFTEST] the gate PASSED a pipefail block with no bash shebang" >&2
     return 1
   fi
+
+  # The annotation has to land ON the line, which means a path relative to the
+  # scanned root. An absolute one still prints, still says the right thing, and
+  # silently stops being a finding attached to the diff — so the shape of the
+  # message is asserted, not just the exit code.
+  case "$out" in
+    *"file=packer/bad.pkr.hcl,line=4"*) : ;;
+    *)
+      echo "::error::[PIS-SELFTEST] expected an annotation at file=packer/bad.pkr.hcl,line=4, got: $out" >&2
+      return 1
+      ;;
+  esac
 
   # …and that the fix silences it, so the gate is not simply always-red.
   cat >"$tmp/packer/bad.pkr.hcl" <<'HCL'
