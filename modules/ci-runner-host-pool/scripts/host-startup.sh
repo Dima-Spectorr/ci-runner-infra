@@ -76,6 +76,7 @@ HOST_REGION=${INSTANCE_ZONE%-*}
 # host already knows the value: a second copy of the project id is a second
 # thing that can disagree with the machine it is running on.
 PROJECT=$(md "project/project-id")
+# shellcheck disable=SC2034  # read by telemetry.sh, concatenated ABOVE this file
 REGION=$HOST_REGION
 # Empty when either half is, rather than the "/" that concatenating two empty
 # reads would produce: the emitter below skips on an empty REPO_FULL, and "/" is
@@ -88,6 +89,7 @@ METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 # agent registering, and AFTER the hydrate's own budget has been accounted for —
 # so its worst case is added to that budget rather than covered by it. Two calls
 # at 10s is a bound worth stating out loud, not a boot silently doubled.
+# shellcheck disable=SC2034  # read by telemetry.sh, concatenated ABOVE this file
 TS_MAX_TIME=10
 
 BROKER_PORT=${BROKER_PORT:-8081}
@@ -847,10 +849,10 @@ hydrate_shared_cache_bounded() {
     # So ask for something every instance has. If that answers, the attribute is
     # genuinely absent; if it does not, the metadata server is what is broken.
     if [ -n "$(md "instance/id")" ]; then
-      CACHE_VERDICT=not-configured
+      CACHE_VERDICT="not-configured"
       log "no snapshot bucket configured — this host runs on the cache its image baked"
     else
-      CACHE_VERDICT=no-metadata-server
+      CACHE_VERDICT="no-metadata-server"
       log "metadata server unreachable — cannot tell whether a snapshot bucket is configured"
     fi
     return 0
@@ -862,7 +864,7 @@ hydrate_shared_cache_bounded() {
   # misconfigured pool.
   case "$CACHE_PREFIX" in
     */) : ;;
-    *) CACHE_VERDICT=bad-prefix; log "cache prefix '${CACHE_PREFIX:-}' is not a directory prefix — skipping hydrate"; return 0 ;;
+    *) CACHE_VERDICT="bad-prefix"; log "cache prefix '${CACHE_PREFIX:-}' is not a directory prefix — skipping hydrate"; return 0 ;;
   esac
 
   local budget max_age_hours max_bytes
@@ -895,24 +897,24 @@ hydrate_shared_cache_bounded() {
   CACHE_TOKEN=$(md "instance/service-accounts/default/token" \
     | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   if [ -z "${CACHE_TOKEN:-}" ]; then
-    CACHE_VERDICT=no-token
+    CACHE_VERDICT="no-token"
     log "no instance token — skipping cache hydrate"
     return 0
   fi
 
   local tmp
-  tmp=$(mktemp -d /opt/.ci-cache-dl.XXXXXX) || { CACHE_VERDICT=no-scratch; return 0; }
+  tmp=$(mktemp -d /opt/.ci-cache-dl.XXXXXX) || { CACHE_VERDICT="no-scratch"; return 0; }
   # Root-owned 0700 from creation. Nothing else on this host may read, still less
   # substitute, a name inside the directory root is about to unpack an archive
   # into — the rule the whole cache section is built on.
-  chmod 0700 "$tmp" || { CACHE_VERDICT=no-scratch; rm -rf "$tmp"; return 0; }
+  chmod 0700 "$tmp" || { CACHE_VERDICT="no-scratch"; rm -rf "$tmp"; return 0; }
 
   # The pointer names the current snapshot. It is a separate, tiny object because
   # the snapshots themselves must never be overwritten: the bucket measures age
   # per generation and an overwrite starts a new one at zero, so a snapshot key
   # rewritten in place would never reach the age bound and never expire.
   if ! cache_fetch "current" "$tmp/current" "$((deadline - $(date +%s)))"; then
-    CACHE_VERDICT=no-snapshot
+    CACHE_VERDICT="no-snapshot"
     log "no cache snapshot published for this pool yet — running on the baked cache"
     rm -rf "$tmp"
     return 0
@@ -930,7 +932,7 @@ hydrate_shared_cache_bounded() {
       # The rejected name is NOT echoed. It is the one fully attacker-controlled
       # string here, it has not been validated at the point this line runs, and
       # this log goes to a file an operator reads in a terminal.
-      CACHE_VERDICT=bad-pointer
+      CACHE_VERDICT="bad-pointer"
     log "the cache pointer does not name a snapshot in this pool's prefix (${#snap} bytes) — ignoring it"
       rm -rf "$tmp"
       return 0
@@ -942,7 +944,7 @@ hydrate_shared_cache_bounded() {
   # `timeCreated` is the service's own record of the generation, and the age
   # bound is worth having only if it reads the one that cannot be backdated.
   if ! cache_fetch "$snap" "$tmp/meta" "$((deadline - $(date +%s)))" "?fields=timeCreated,size,generation"; then
-    CACHE_VERDICT=unreadable
+    CACHE_VERDICT="unreadable"
     log "cache snapshot $snap is named by the pointer but could not be read — running on the baked cache"
     rm -rf "$tmp"
     return 0
@@ -960,7 +962,7 @@ hydrate_shared_cache_bounded() {
   gen=$(sed -n 's/.*"generation"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' "$tmp/meta")
   created=$(date -u -d "$created" +%s 2>/dev/null) || created=""
   if [ -z "$created" ] || [ -z "$size" ] || [ -z "$gen" ]; then
-    CACHE_VERDICT=no-metadata
+    CACHE_VERDICT="no-metadata"
     log "cache snapshot $snap has no readable size, generation or creation time — refusing it"
     rm -rf "$tmp"
     return 0
@@ -973,13 +975,13 @@ hydrate_shared_cache_bounded() {
   CACHE_SNAP_AGE_HOURS=$age
   CACHE_SNAP_BYTES=$size
   if [ "$age" -ge "$max_age_hours" ]; then
-    CACHE_VERDICT=too-old
+    CACHE_VERDICT="too-old"
     log "cache snapshot $snap is ${age}h old, past the ${max_age_hours}h bound — starting cold instead"
     rm -rf "$tmp"
     return 0
   fi
   if [ "$size" -gt "$max_bytes" ]; then
-    CACHE_VERDICT=too-big
+    CACHE_VERDICT="too-big"
     log "cache snapshot $snap is $size bytes, past the $max_bytes bound — refusing it"
     rm -rf "$tmp"
     return 0
@@ -992,7 +994,7 @@ hydrate_shared_cache_bounded() {
   local free_kb
   free_kb=$(df -Pk /opt | awk 'NR==2 {print $4}')
   if [ -z "${free_kb:-}" ] || [ "$((free_kb * 1024))" -lt "$((size * 8))" ]; then
-    CACHE_VERDICT=no-space
+    CACHE_VERDICT="no-space"
     log "not enough free space on /opt for a $size byte snapshot — starting cold instead"
     rm -rf "$tmp"
     return 0
@@ -1000,7 +1002,7 @@ hydrate_shared_cache_bounded() {
 
   if ! cache_fetch "$snap" "$tmp/snap.tar.gz" "$((deadline - $(date +%s)))" \
       "?alt=media&generation=$gen" "$size"; then
-    CACHE_VERDICT=download-timeout
+    CACHE_VERDICT="download-timeout"
     log "cache snapshot $snap did not download inside the ${budget}s budget — starting cold instead"
     rm -rf "$tmp"
     return 0
@@ -1008,7 +1010,7 @@ hydrate_shared_cache_bounded() {
 
   rm -rf "$CACHE_STAGE"
   if ! mkdir -p "$CACHE_STAGE" || ! chmod 0700 "$CACHE_STAGE"; then
-    CACHE_VERDICT=no-scratch
+    CACHE_VERDICT="no-scratch"
     rm -rf "$tmp"
     return 0
   fi
@@ -1053,7 +1055,7 @@ hydrate_shared_cache_bounded() {
       | tar -x -C "$CACHE_STAGE" \
           --no-same-owner --no-same-permissions --no-xattrs --no-acls \
           2>/dev/null; then
-    CACHE_VERDICT=unpack-timeout
+    CACHE_VERDICT="unpack-timeout"
     log "cache snapshot $snap did not unpack inside the ${budget}s budget — starting cold instead"
     rm -rf "$tmp" "$CACHE_STAGE"
     return 0
@@ -1064,7 +1066,7 @@ hydrate_shared_cache_bounded() {
   # passed through neither. A snapshot is the one way into this tree that no
   # reviewed build step stands in front of.
   if cache_master_is_hostile "$CACHE_STAGE" strict; then
-    CACHE_VERDICT=scan-refused
+    CACHE_VERDICT="scan-refused"
     log "cache snapshot $snap rejected by the same scan the image build runs — starting cold instead"
     rm -rf "$CACHE_STAGE"
     return 0
@@ -1113,7 +1115,7 @@ hydrate_shared_cache_bounded() {
   rm -rf "$CACHE_STAGE"
 
   took=$(( $(date +%s) - started ))
-  CACHE_VERDICT=hydrated
+  CACHE_VERDICT="hydrated"
   CACHE_DIRS_MOVED=$n
   log "cache hydrated from $snap: $n tool cache(s), $size bytes, ${age}h old, ${took}s of a ${budget}s budget"
 }

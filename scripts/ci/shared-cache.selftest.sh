@@ -450,7 +450,7 @@ has_observable_hydrate() { # <file>
   # to be accepted, and "the snapshot is too old" becomes unalertable.
   local order
   order=$(awk '/CACHE_SNAP_AGE_HOURS=/ { print "age"; exit }
-               /CACHE_VERDICT=too-old/ { print "bound"; exit }' <<<"$code")
+               /CACHE_VERDICT="too-old"/ { print "bound"; exit }' <<<"$code")
   [ "$order" = "age" ] || return 1
 
   # Label goes through the allowlist, not into the JSON raw.
@@ -1104,7 +1104,7 @@ mutate_file "$PUBDOC" 'the template becomes callable with inputs' has_split_publ
 # hosts boot, jobs run — and takes away the only thing that would have said the
 # cache stopped arriving.
 mutate 'an exit stops naming itself' has_observable_hydrate \
-  's@^    CACHE_VERDICT=too-old$@@'
+  's@^    CACHE_VERDICT="too-old"$@@'
 mutate 'the wrapper stops publishing the verdict' has_observable_hydrate \
   's@^  publish_cache_telemetry$@@'
 mutate 'the verdict survives into the next hydrate' has_observable_hydrate \
