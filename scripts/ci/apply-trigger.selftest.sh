@@ -207,14 +207,22 @@ mutate "'the apply cannot write state' — one small grant added here" "$MAIN" \
   's|resource "google_cloud_scheduler_job"|resource "google_storage_bucket_iam_member"|' mints_and_grants_nothing
 mutate "'every project uses the same CD account' — made a default" "$VARS" \
   's|^variable "service_account" {|variable "service_account" {\n  default = "cd@example.iam.gserviceaccount.com"|' takes_the_account_as_a_required_input
+# SC2016 off for the three below: the `${...}` is HCL interpolation being matched
+# LITERALLY in the module source. Expanding it in the shell is the bug the
+# warning describes in reverse — `${var.terraform_version}` would become empty,
+# the sed would match nothing, and the mutation would be silently vacuous:
+# a mutation that changes nothing always "goes false" and reports a pass.
+# shellcheck disable=SC2016
 mutate "'Saved plan is stale' — apply re-plans instead" "$MAIN" \
   's|terraform apply -input=false -lock-timeout=${var.lock_timeout} tf.plan|terraform apply -input=false -auto-approve|' applies_the_plan_it_printed
 mutate "'the scheduled run cannot find the branch' — the push regex reused for the run" "$MAIN" \
   's|source    = { branchName = var.branch }|source    = { branchName = local.branch_regex }|' derives_both_branch_spellings_from_one_input
 mutate "'logs are in Cloud Logging anyway' — the option dropped" "$MAIN" \
   's|logging = "CLOUD_LOGGING_ONLY"|logging = "NONE"|' declares_where_logs_go
+# shellcheck disable=SC2016
 mutate "'pin a version nobody has to bump' — floating image" "$MAIN" \
   's|hashicorp/terraform:${var.terraform_version}|hashicorp/terraform:latest|' pins_the_terraform_image
+# shellcheck disable=SC2016
 mutate "'one step instead of two' — terraform output moved into the gcloud image" "$MAIN" \
   's|mig=$(cat /workspace/.mig-name 2>/dev/null \|\| true)|mig=$(terraform output -raw mig_name)|' runs_each_tool_in_an_image_that_has_it
 mutate "'the tfvars live outside the root and the apply never fires' — scope removed" "$MAIN" \
