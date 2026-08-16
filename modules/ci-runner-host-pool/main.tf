@@ -46,6 +46,13 @@ locals {
   # name is what lets a repository address THIS pool specifically.
   runner_labels = join(",", concat(["self-hosted", var.name], var.runner_labels))
 
+  # ONE expression for this pool's slice of the shared cache bucket, read by both
+  # the IAM condition below and the host that fetches from it. Written twice they
+  # would eventually disagree, and the failure is quiet in the worst way: every
+  # request would land outside the pool's own grant and come back 403, which the
+  # host logs as a snapshot that has not been published yet.
+  cache_prefix = "cache/${var.name}/"
+
   # Controller and hosts are different identities: the controller may delete
   # instances, a host executes build input. There is no fallback — the fallback
   # that used to be here silently chose the weak side of that split for every
@@ -82,6 +89,39 @@ resource "google_service_account_iam_member" "job_token_creator" {
   service_account_id = "projects/${var.project_id}/serviceAccounts/${var.job_service_account_email}"
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = "serviceAccount:${var.service_account_email}"
+}
+
+# --- the cache snapshot this pool may read ---------------------------------------
+
+# READ, and only inside this pool's own prefix.
+#
+# `roles/storage.objectViewer` and deliberately not `objectUser` or `objectAdmin`:
+# the grant holds no `storage.objects.create` and no `storage.objects.delete`. A
+# host executes job code. A host that could publish a snapshot would let whatever
+# one job left in a cache become the starting cache of every later host in this
+# pool — one job handing code to every future job — which is the cross-slot
+# channel the per-slot cache copy closes, re-opened across hosts and across time.
+# Publishing belongs to an identity that never runs pull-request code.
+#
+# The condition is what keeps eight pools in one bucket from being one pool. It
+# also, by construction, denies `storage.objects.list`: listing is authorized
+# against the BUCKET, whose resource name does not start with an object prefix.
+# That is intended — the host fetches a pointer at a known name and then the
+# object that pointer names, and a host that cannot enumerate the bucket cannot
+# discover another pool's snapshots even if the condition were ever loosened by
+# accident.
+resource "google_storage_bucket_iam_member" "host_reads_cache" {
+  count = var.cache_snapshot_bucket == "" ? 0 : 1
+
+  bucket = var.cache_snapshot_bucket
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${var.service_account_email}"
+
+  condition {
+    title       = "only-this-pools-cache-prefix"
+    description = "Reads are confined to ${local.cache_prefix}, so one pool's hosts cannot read another pool's cache snapshots out of the shared bucket."
+    expression  = "resource.name.startsWith(\"projects/_/buckets/${var.cache_snapshot_bucket}/objects/${local.cache_prefix}\")"
+  }
 }
 
 # --- host template ------------------------------------------------------------
@@ -159,6 +199,16 @@ resource "google_compute_instance_template" "host" {
     "ci-job-service-account" = var.job_service_account_email
     "ci-job-broker-port"     = tostring(var.job_broker_port)
     "ci-job-broker-py"       = file("${path.module}/scripts/job-metadata-broker.py")
+
+    # The dependency-cache snapshot. Empty bucket = the layer is off, and the
+    # host says so in its log rather than failing; every one of these is read
+    # with a fallback on the host, so a host booting from an older template
+    # simply behaves as it did before the keys existed.
+    "ci-cache-bucket"         = var.cache_snapshot_bucket
+    "ci-cache-prefix"         = var.cache_snapshot_bucket == "" ? "" : local.cache_prefix
+    "ci-cache-max-age-hours"  = tostring(var.cache_snapshot_max_age_hours)
+    "ci-cache-budget-seconds" = tostring(var.cache_hydrate_budget_seconds)
+    "ci-cache-max-bytes"      = tostring(var.cache_snapshot_max_bytes)
 
     # Registry hosts a job container may be pulled from as the JOB identity, on
     # TOP of this host's own region and the Container Registry hosts, which the

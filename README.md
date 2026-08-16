@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.15.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.16.0"
   # ...
 }
 ```
@@ -332,9 +332,33 @@ means the recycle is working and the hosts are not leaving — jobs that never e
   from *later* to *concurrent*, which is what one shared writable tree would have
   meant. Narrowing it further is an ephemeral-agent decision, not a cache one.
 
-  Any future layer that persists a cache off-host has to replace the third bound
-  with an explicit one — a maximum accepted snapshot age, not an implicit
-  lifetime.
+  The snapshot layer is that future layer, and it replaces the third bound with
+  the explicit one: `cache_snapshot_max_age_hours`.
+* **A host hydrates its cache from a snapshot, and never publishes one.** Set
+  `cache_snapshot_bucket` and a booting host fetches this pool's current snapshot
+  out of a shared `ci-runner-cache-bucket` and unpacks it over the baked master,
+  so a scale-out under load does not hand every new host a cache as old as the
+  image. The pool's host account gets `roles/storage.objectViewer` conditioned on
+  `cache/<pool>/` — read only, this pool only.
+
+  **Read only is the design, not a starting point.** A host executes job code, so
+  a host that could publish a snapshot would let whatever one job left in a cache
+  become the starting cache of every later host in the pool: the cross-slot
+  channel the per-slot copy closes, re-opened across hosts and across time. A
+  fork pull request would need to run once. Publishing belongs to a separate
+  identity that never runs pull-request code, which does not exist yet — so
+  today a pool configured to read simply finds nothing and runs on the baked
+  cache.
+
+  What arrives is inspected before any of it is trusted: it is unpacked into a
+  staging tree outside the master, scanned by the same check the image build runs
+  (links, device nodes, setuid, file capabilities, credential files), bounded by
+  age, size and free disk, and then only the tool directories this host already
+  knows about are moved in — a snapshot cannot introduce a new top-level name.
+  The whole sequence runs against one budget (`cache_hydrate_budget_seconds`,
+  60s) and every failure inside it returns, because the layer fails open like the
+  rest of the cache path: a slow snapshot costs the first job a cold cache, a
+  host waiting on one costs the pool a host.
 
 ## Telemetry
 

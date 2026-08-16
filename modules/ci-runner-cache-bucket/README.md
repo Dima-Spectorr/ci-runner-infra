@@ -7,7 +7,7 @@ every pool in that project.
 
 ```hcl
 module "ci_cache" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-bucket?ref=v5.15.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-bucket?ref=v5.16.0"
 
   project_id = var.project_id
   name       = "${var.project_id}-ci-cache"
@@ -46,13 +46,12 @@ the next boot of every host in the project starts cold — but the blast radius
 is the project, and it is deliberately wider than the per-slot isolation the
 rest of the design is built on.
 
-> **Not yet built.** This module ships the bucket ahead of the host side. Until
-> the host-pool module grows that conditioned grant, nothing separates pools
-> inside this bucket, because nothing is writing to it yet either — an empty
-> bucket with no grants. Do not hand any identity a bucket-wide
-> `roles/storage.objectAdmin` here as a stopgap: that is precisely the grant the
-> prefix condition exists to avoid, and it is much harder to take back once a
-> pool depends on it.
+That grant now exists: set `cache_snapshot_bucket` on a pool and the host-pool
+module creates a `roles/storage.objectViewer` binding conditioned on
+`cache/<pool>/`. Do not hand any identity a bucket-wide
+`roles/storage.objectAdmin` as a stopgap — that is precisely the grant the prefix
+condition exists to avoid, and it is much harder to take back once a pool depends
+on it.
 
 ## Who may write here — decided, and it is not the hosts
 
@@ -79,9 +78,12 @@ Two grants, therefore, not one:
 | pool host | read only | conditioned on that pool's prefix |
 | snapshot producer | write | conditioned on that pool's prefix |
 
-Neither exists yet. When they are added, the thing to check is that the host's
-grant contains no `storage.objects.create` or `storage.objects.delete` —
-`roles/storage.objectViewer`, not `objectUser` and not `objectAdmin`.
+The host's grant is built by the host-pool module and is asserted by
+`scripts/ci/shared-cache.selftest.sh`: `roles/storage.objectViewer`, never
+`objectUser` or `objectAdmin`, so it carries no `storage.objects.create` and no
+`storage.objects.delete`. The producer's grant does not exist yet — nothing
+writes to this bucket, so a pool configured to read it simply finds no snapshot
+and runs on the cache its image baked.
 
 ## The age bound is a security control
 
@@ -102,10 +104,9 @@ because they fail differently: this one is enforced by the storage service and
 holds even if the host script is broken, and the host-side one holds even if this
 rule is edited away in the console.
 
-**Today only the bucket-side bound exists.** The host-side one arrives with the
-hydrate path. Until then this rule is the *only* thing expiring a snapshot, so
-lowering `snapshot_max_age_days` is the only lever available and there is no
-second bound behind it.
+Both bounds now exist. The host's is `cache_snapshot_max_age_hours` on the pool;
+keep it at or below `snapshot_max_age_days × 24`, or the host's number is
+decoration and the bucket's is the only one doing anything.
 
 ### What this demands of the publisher
 
