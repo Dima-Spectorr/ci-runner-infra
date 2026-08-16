@@ -135,6 +135,95 @@ else
   bad "controller has no roles/iap.tunnelResourceAccessor — the drain's worker check cannot run"
 fi
 
+# 9. The Windows host identity (ADR §3A). A Windows host cannot fence job code
+#    off the metadata server — Windows Firewall resolves an explicit block ahead
+#    of every conflicting allow, and the one documented override needs IPsec the
+#    metadata server does not speak — so job code can mint a token for whatever
+#    the host account is. The boundary is therefore the SIZE of that account:
+#    tokenCreator on the job account, and nothing else. Each grant below dropping
+#    out on `host_os = "windows"` is the whole control.
+for res in \
+  'resource "google_secret_manager_secret_iam_member" "runner_reads_key"' \
+  'resource "google_project_iam_member" "metrics"' \
+  'resource "google_project_iam_member" "logs"'; do
+  if matches "$(block "^${res}" "$IDENTITY/main.tf")" '^  count = local\.host_grants'; then
+    ok "host grant drops out on windows: ${res##* }"
+  else
+    bad "${res##* } is unconditional — a Windows host account keeps it, and any pull request running on that host can mint a token that holds it"
+  fi
+done
+
+if matches "$(block '^locals \{' "$IDENTITY/main.tf")" 'host_grants = var\.host_os == "windows" \? 0 : 1'; then
+  ok "host_grants is 0 on windows and 1 on linux"
+else
+  bad "host_grants no longer reduces the host account on windows"
+fi
+
+# 10. And Linux keeps every one of them. `host_os` defaults to linux, so a
+#     consumer that says nothing gets today's identity exactly; a default of
+#     "windows", or no default at all, would silently strip a working Linux
+#     fleet of the grant its hosts mint registration tokens with.
+if matches "$(block '^variable "host_os"' "$IDENTITY/variables.tf")" '^  default     = "linux"'; then
+  ok "host_os defaults to linux, so an existing pool is unchanged"
+else
+  bad "host_os does not default to linux — existing pools would change identity on their next apply"
+fi
+
+# 11. Making those three conditional adds `[0]` to their addresses, and
+#     Terraform treats `X` and `X[0]` as different objects. Without a `moved`
+#     block the next apply of every EXISTING pool destroys and recreates live
+#     IAM — a window in which hosts cannot read the App key and cannot register,
+#     caused by a change that is supposed to leave Linux alone.
+for addr in \
+  'google_secret_manager_secret_iam_member.runner_reads_key' \
+  'google_project_iam_member.metrics' \
+  'google_project_iam_member.logs'; do
+  if matches "$(grep -A2 '^moved {' "$IDENTITY/main.tf")" "to   = ${addr//./\\.}\[0\]"; then
+    ok "state move declared for $addr"
+  else
+    bad "no moved block for $addr — an existing pool will DESTROY and recreate this binding"
+  fi
+done
+
+# 12. The reduction only means anything while the controller is a separate
+#     account. Collapsed onto the host account, the App-key read and
+#     instance-admin are back on the machine that runs pull-request code, and
+#     every check above still passes.
+if matches "$(block 'resource "google_service_account" "runner"' "$IDENTITY/main.tf")" 'var\.host_os != "windows" \|\| var\.create_controller_service_account'; then
+  ok "a windows pool is refused without the controller split"
+else
+  bad "nothing stops host_os = windows with create_controller_service_account = false, which hands the App key straight back to job code"
+fi
+
+# 13. A Windows host account cannot read the App key, so it cannot mint its own
+#     registration token — the controller has to. The pool input that turns that
+#     on must exist and must default OFF, or every Linux controller starts
+#     writing credentials into instance metadata it has no reason to.
+if matches "$(block '^variable "controller_mints_registration_token"' "$POOL/variables.tf")" '^  default     = false'; then
+  ok "controller-minted registration is opt-in"
+else
+  bad "controller_mints_registration_token is missing or does not default to false"
+fi
+
+# 14. And the key it enables must be ABSENT from a pool that did not opt in. A
+#     `"false"` value would be a metadata diff on every existing controller,
+#     which is exactly the Linux churn this delivery promised not to cause. Both
+#     halves are asserted: a local that renders an EMPTY map when the pool says
+#     nothing, and that same local actually merged into the controller's
+#     metadata. Checking only the local would pass on a local nothing reads.
+if matches "$(grep -A2 'controller_registration_metadata = ' "$POOL/main.tf")" 'controller_mints_registration_token \? \{' &&
+  matches "$(grep -A2 'controller_registration_metadata = ' "$POOL/main.tf")" '\} : \{\}'; then
+  ok "the registration metadata local is empty unless the pool opts in"
+else
+  bad "the registration metadata key is rendered unconditionally — every existing controller gets a metadata diff"
+fi
+
+if matches "$(grep -c 'merge(local.controller_registration_metadata, {' "$POOL/main.tf")" '^1$'; then
+  ok "and it is merged into the controller's metadata"
+else
+  bad "local.controller_registration_metadata is not merged into the controller metadata — the key is defined and never rendered"
+fi
+
 if [ "$fail" -eq 0 ]; then
   echo "  identity split intact."
 else

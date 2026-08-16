@@ -398,6 +398,30 @@ variable "manage_job_token_creator_binding" {
   default     = true
 }
 
+variable "controller_mints_registration_token" {
+  description = <<-EOT
+    Have the CONTROLLER mint each host's runner registration token and deliver
+    it as a per-instance metadata key, instead of each host reading the GitHub
+    App key from Secret Manager and minting its own.
+
+    REQUIRED for a Windows pool: a Windows host account holds no Secret Manager
+    grant (ci-runner-identity's `host_os`), so it cannot mint anything — the safe
+    configuration and the working configuration are the same configuration.
+
+    Leave false on Linux. This path necessarily parks a credential in instance
+    metadata from the controller's write until its delete, and that window is
+    the host's whole boot — minutes, not seconds, and up to the register grace
+    for a host that only partly registers. It is bounded, not absent, and it is
+    read by anything holding compute.instances.get on the PROJECT, not only by
+    that host. A Linux host's metadata fence makes the trade pointless, and the
+    host-minted path is proved on a live fleet. The controller reads the App key
+    already, for the queue poll, so this moves a call rather than granting a new
+    capability.
+  EOT
+  type        = bool
+  default     = false
+}
+
 # --- network ------------------------------------------------------------------
 
 variable "network" {

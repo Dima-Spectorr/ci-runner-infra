@@ -77,6 +77,7 @@ RUNNER_LABELS=$(md "instance/attributes/ci-runner-labels")
 REGISTER_GRACE=$(md "instance/attributes/ci-register-grace-seconds")
 ORPHAN_CONFIRM_TICKS=$(md "instance/attributes/ci-orphan-confirm-ticks")
 RECYCLE_MAX_UNAVAILABLE=$(md "instance/attributes/ci-recycle-max-unavailable")
+MINT_REG=$(md "instance/attributes/ci-mint-registration-token")
 
 SLOTS=${SLOTS:-1}
 MIN_HOSTS=${MIN_HOSTS:-0}
@@ -98,6 +99,16 @@ ORPHAN_CONFIRM_TICKS=${ORPHAN_CONFIRM_TICKS:-3}
 # old image, or a metadata key that failed to render, must not start deleting
 # hosts because a field was missing. Consumers opt in.
 RECYCLE_MAX_UNAVAILABLE=${RECYCLE_MAX_UNAVAILABLE:-0}
+# Whether THIS controller mints its hosts' runner registration tokens. Absent
+# metadata reads empty, which is `false`, which is every pool that exists today:
+# a Linux host mints its own from Secret Manager and this whole path is inert.
+# See ci-runner-host-pool's `controller_mints_registration_token`.
+MINT_REG=${MINT_REG:-false}
+# The per-instance metadata key a minted token is written to, and DELETED from.
+# Hard-coded rather than an input: it is a contract between this file and the
+# host boot script in the same module, and a configurable name is one more way
+# for the delete to miss the key the write created.
+REG_TOKEN_KEY="ci-registration-token"
 POLL=${POLL:-20}
 # Seconds the demand sweep may spend walking per-run job lists. It must stay far
 # below the watchdog threshold (10 polls, min 300s): a tick that outruns the
@@ -577,9 +588,23 @@ collect_hosts() {
   # a managed instance reports it as a partial URL, so comparing the raw strings
   # would read every host as stale — the single read that, applied uniformly,
   # cordons the whole pool at once.
+  # The fourth column is the instance's own self-link, and it is here rather
+  # than fetched per host because it is the only place the controller learns a
+  # host's ZONE. A regional MIG spreads hosts across zones and every per-instance
+  # compute call needs one; the alternative is a describe per host per tick.
+  # Consumers read it with `${uri##*/zones/}` style expansion, never by guessing
+  # `<region>-a`.
+  # CSV, not `value()`, and the readers below split on `IFS=,`. `value()` is TAB
+  # separated, tab is IFS whitespace, and a run of IFS whitespace COLLAPSES — so
+  # one empty field shifts every later field left by one. `instanceStatus` is
+  # empty for an instance the MIG is still CREATING, i.e. on every scale-out,
+  # and with four columns that shift put the self-link into `host_tpl`:
+  # template_state would then read a booting host as `stale` instead of the
+  # `unknown` the recycle rule's fail-safe is built on, and the self-link would
+  # arrive empty. A comma is not IFS whitespace, so an empty field stays empty.
   HOSTS=$(gcloud compute instance-groups managed list-instances "$MIG" \
     --region="$REGION" --project="$PROJECT" \
-    --format="value(instance.basename(),instanceStatus,version.instanceTemplate.basename())" 2>/dev/null)
+    --format="csv[no-heading](instance.basename(),instanceStatus,version.instanceTemplate.basename(),instance)" 2>/dev/null)
 }
 
 # One describe per tick for both facts we need from the MIG: the target size we
@@ -631,7 +656,7 @@ reap_orphan_registrations() {
   ORPHAN_TOKEN=$(gh_token) || return 0
 
   local live
-  live=$(printf '%s' "$HOSTS" | awk '{print $1}' | paste -sd, -)
+  live=$(printf '%s' "$HOSTS" | awk -F, '{print $1}' | paste -sd, -)
 
   local name status busy id verdict f misses
   while IFS=$'\t' read -r id name status busy; do
@@ -769,6 +794,196 @@ idle_seconds() {
   since=$(cat "$f" 2>/dev/null)
   [ -n "$since" ] || { echo "$now" >"$f"; echo 0; return 0; }
   echo $((now - since))
+}
+
+# --- registration tokens -------------------------------------------------------
+#
+# Inert unless the pool set `controller_mints_registration_token`, which today
+# means: unless the pool's hosts are Windows.
+#
+# A Windows host cannot mint its own registration token — its service account
+# deliberately holds no Secret Manager grant, because a Windows host cannot
+# fence job code off the metadata server and anything that account can read, a
+# pull request running on that host can read. The controller reads the App key
+# already for the queue poll, so minting here MOVES a call rather than granting
+# a new capability.
+#
+# THE DELETE IS THE CONTROL, NOT THE CLEANUP. The token lands in instance
+# metadata, which on a Windows host the job can read. GitHub expires a
+# registration token in an hour; deleting the key the moment the host's agents
+# appear is what turns that hour into seconds. An edit that drops the delete
+# leaves every Windows host advertising a live registration token to the pull
+# request it is running — job interception against that repository.
+#
+# TWO markers, not one, and they are not the same fact:
+#
+#   regtoken-<host>  MINTED. Written once the host has been given a token, and
+#                    removed only by the sweep, when the host leaves the MIG.
+#                    It is what makes minting once-per-instance. Overloading it
+#                    with the delete's bookkeeping made "the key is gone" also
+#                    mean "mint another one", which on a cordoned host — still
+#                    executing a pull request, agents already deregistered, so
+#                    permanently `absent` — is a fresh hour-long credential
+#                    written into that job's own metadata every other tick.
+#   regkey-<host>    THE KEY MAY BE LIVE. Written before the metadata call and
+#                    removed only after a confirmed delete.
+#   regfail-<host>   Failed write attempts. Three, then stop asking GitHub.
+#
+# So every path below fails in the direction that keeps the key small: a write
+# that reports failure is followed by a delete in case it landed anyway, a
+# failed delete keeps regkey so the delete retries, and a `present` host whose
+# regkey state was lost is deleted from anyway rather than assumed clean.
+
+# write_registration_token <instance-self-link> <regkey-marker>
+write_registration_token() {
+  local uri="$1" keylive="$2"
+  local tok resp reg f zone host rc
+  tok=$(gh_token) || { log "regtoken: no installation token"; return 1; }
+
+  resp=$(curl "${CURL_TIMEOUTS[@]}" -fsS -X POST \
+    -H "Authorization: Bearer $tok" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$REPO_FULL/actions/runners/registration-token") || return 1
+  reg=$(printf '%s' "$resp" | jq -r '.token // empty')
+  [ -n "$reg" ] || return 1
+
+  zone=${uri%/instances/*}; zone=${zone##*/}
+  host=${uri##*/}
+  [ -n "$zone" ] && [ -n "$host" ] || { log "regtoken: cannot read a zone from $uri"; return 1; }
+
+  # --metadata-from-file, never --metadata: a token passed as an argument sits
+  # in the process table, and on the pool this exists for one of the local
+  # accounts reading that table is running the pull request. `600` on the temp
+  # file for the same reason, and it is removed on every path.
+  # Every early return is ABOVE this line, so the token file has exactly one
+  # creation point and one removal point and needs no trap to pair them. (A
+  # `trap … RETURN` would not survive the nested delete call below, and would
+  # not help against a kill anyway — 0600 on a controller that runs no build
+  # input is the bound there, and that is the honest limit.)
+  f=$(mktemp) || return 1
+  chmod 600 "$f" 2>/dev/null || true
+  rc=1
+  # An unchecked write is an EMPTY key on a full disk: the host reads a
+  # zero-length token, never registers, and the marker says it was served.
+  if printf '%s' "$reg" >"$f"; then
+    # The marker goes in BEFORE the call. `timeout 60` fires on a setMetadata
+    # that may already have committed server-side, and a key believed unwritten
+    # is a key nobody ever comes back to delete.
+    : >"$keylive"
+    # `timeout` for the reason every curl here is bounded: gcloud has its own
+    # retry loop and can outlive a tick on a stalled handshake.
+    timeout 60 gcloud compute instances add-metadata "$host" \
+      --project="$PROJECT" --zone="$zone" \
+      --metadata-from-file="$REG_TOKEN_KEY=$f" >/dev/null 2>&1
+    rc=$?
+  fi
+  rm -f "$f"
+  if [ "$rc" -ne 0 ]; then
+    # It may have landed regardless. Take it back, and only then forget it.
+    delete_registration_token "$uri" && rm -f "$keylive"
+  fi
+  return "$rc"
+}
+
+# delete_registration_token <instance-self-link>
+# Idempotent: removing a key that is not there succeeds, so this is safe to call
+# again on any tick whose previous delete failed.
+delete_registration_token() {
+  local uri="$1" zone host
+  zone=${uri%/instances/*}; zone=${zone##*/}
+  host=${uri##*/}
+  [ -n "$zone" ] && [ -n "$host" ] || return 1
+  timeout 60 gcloud compute instances remove-metadata "$host" \
+    --project="$PROJECT" --zone="$zone" \
+    --keys="$REG_TOKEN_KEY" >/dev/null 2>&1
+}
+
+# registration_token_step <host> <self-link> <reg-state> <age-seconds> <status>
+# The whole lifecycle in one function so it can be RUN by a self-test rather
+# than read: the delete is a security property, and a property nothing executes
+# is a comment.
+registration_token_step() {
+  local host="$1" uri="$2" reg="$3" age="$4" status="${5:-}"
+  local minted="$STATE_DIR/regtoken-$host"
+  local keylive="$STATE_DIR/regkey-$host"
+  local cordon="$STATE_DIR/cordon-$host"
+  local fails="$STATE_DIR/regfail-$host"
+  local n
+
+  case "$reg" in
+    present)
+      # Agents are in GitHub's runner list; the token has done its job. The
+      # delete is NOT conditional on this controller remembering it wrote the
+      # key: the sweep clears markers on an empty host list, a boot disk does
+      # not survive a controller replacement, and either would otherwise leave
+      # a live credential in metadata for GitHub's full hour. Deleting is
+      # idempotent, so the recovery path costs one call and then stops.
+      if [ ! -f "$minted" ] || [ -f "$keylive" ]; then
+        if delete_registration_token "$uri"; then
+          rm -f "$keylive"
+          : >"$minted"
+          log "regtoken $host: agents registered — $REG_TOKEN_KEY deleted"
+        else
+          log "regtoken $host: registered but $REG_TOKEN_KEY could not be deleted — retrying next tick"
+        fi
+      fi
+      ;;
+    absent | partial)
+      # `partial` means at least one slot IS registered and can already pick up
+      # a job, so it is grouped with `absent` only for the mint; the delete
+      # below does not wait on the remaining slots any differently.
+      if [ -f "$keylive" ]; then
+        # A cordoned host will never register again — its agents were removed
+        # on purpose and the job it is still running is the one the key would
+        # be stolen by. Past the grace the host is not coming up either. Either
+        # way the credential has no future use, so take it back now.
+        if [ -f "$cordon" ] || [ "$age" -ge "$REGISTER_GRACE" ]; then
+          if delete_registration_token "$uri"; then
+            rm -f "$keylive"
+            log "regtoken $host: no agents after ${age}s (cordoned=$([ -f "$cordon" ] && echo yes || echo no)) — $REG_TOKEN_KEY deleted"
+          fi
+        fi
+        return 0
+      fi
+      # ONE token per instance. Every guard below is a state in which this host
+      # was reachable by the branch above and must not be handed a second one:
+      # already minted for, cordoned (job code running, deregistered on
+      # purpose), not actually booting, or past the grace at which the recycle
+      # rule deletes it anyway.
+      [ -f "$minted" ] && return 0
+      [ -f "$cordon" ] && return 0
+      [ "$age" -ge "$REGISTER_GRACE" ] && return 0
+      case "$status" in
+        PROVISIONING | STAGING | RUNNING) ;;
+        *) return 0 ;;
+      esac
+      # THREE attempts, then stop. A write that keeps failing re-mints once a
+      # tick, and each attempt is a registration-token POST against the same App
+      # installation the queue poll depends on — the secondary-rate-limit path
+      # this file's header calls the blind-tick outage. Worse, the failure this
+      # retries hardest is `timeout 60` on a setMetadata that COMMITTED, so each
+      # cycle parks another live credential in job-readable metadata. The host
+      # is deleted at REGISTER_GRACE regardless, so the retries buy nothing.
+      n=$(cat "$fails" 2>/dev/null)
+      case "${n:-0}" in *[!0-9]*) n=0 ;; *) n=${n:-0} ;; esac
+      [ "$n" -ge 3 ] && return 0
+      if write_registration_token "$uri" "$keylive"; then
+        : >"$minted"
+        rm -f "$fails"
+        log "regtoken $host: minted and written to $REG_TOKEN_KEY"
+      else
+        printf '%s' "$((n + 1))" >"$fails"
+        log "regtoken $host: $REG_TOKEN_KEY could not be written (attempt $((n + 1)) of 3)"
+      fi
+      ;;
+    *)
+      # `unknown` — the runner list read failed this tick, so nothing is known
+      # about this host's agents. Do not hand out a credential on a guess, and
+      # do not pull one out from under a host that may be mid-registration.
+      :
+      ;;
+  esac
+  return 0
 }
 
 # --- drain -------------------------------------------------------------------
@@ -949,7 +1164,7 @@ tick() {
   collect_mig
 
   local pool_size=0 slots_busy=0 idle_max=0 draining=0 stale_hosts=0
-  local host status host_tpl busy idle age verdict tpl cordoned recycling
+  local host status host_tpl host_uri busy idle age verdict tpl cordoned recycling
 
   # Hosts already mid-recycle, counted BEFORE any decision this tick, so every
   # host is judged against the same budget rather than against however many
@@ -965,12 +1180,29 @@ tick() {
   # matching on the last line would read as absent and lose its marker — and a
   # lost marker is a budget slot handed back, which is how more hosts go
   # unavailable at once than max_unavailable permits.
+  #
+  # `regtoken-*` is swept by the same loop and for a stronger reason than
+  # tidiness: a marker left behind by a deleted host is this controller
+  # believing it already wrote that host's token, so a host whose name is ever
+  # reused would boot with no token and never register.
+  #
+  # And the sweep does not run on an EMPTY host list. collect_mig swallows its
+  # errors, so one API blip reads as "the pool has no hosts" — which would clear
+  # every marker in the fleet at once, including the regkey- ones that are the
+  # only record that a live registration token is sitting in an instance's
+  # metadata. A stale marker costs one host a recycle; a cleared one costs a
+  # credential. An actually-empty pool is swept on the next tick that reads one.
   local f mname live_hosts
-  live_hosts=$(printf '%s\n' "$HOSTS" | awk '{ if ($1 != "") print $1 }')
-  for f in "$STATE_DIR"/cordon-*; do
+  live_hosts=$(printf '%s\n' "$HOSTS" | awk -F, '{ if ($1 != "") print $1 }')
+  for f in "$STATE_DIR"/cordon-* "$STATE_DIR"/regtoken-* "$STATE_DIR"/regkey-* \
+    "$STATE_DIR"/regfail-*; do
+    [ -n "$live_hosts" ] || break
     [ -e "$f" ] || continue
     mname=$(basename "$f")
     mname=${mname#cordon-}
+    mname=${mname#regtoken-}
+    mname=${mname#regkey-}
+    mname=${mname#regfail-}
     case $'\n'"$live_hosts"$'\n' in
       *$'\n'"$mname"$'\n'*) ;;
       *) rm -f "$f" ;;
@@ -978,13 +1210,14 @@ tick() {
   done
   recycling=$(find "$STATE_DIR" -maxdepth 1 -name 'cordon-*' 2>/dev/null | wc -l)
 
-  while read -r host status host_tpl; do
+  # `IFS=,` on both walks, and it is not cosmetic — see collect_hosts.
+  while IFS=, read -r host status host_tpl host_uri; do
     [ -n "$host" ] || continue
     [ "$status" = "RUNNING" ] && pool_size=$((pool_size + 1))
     [ "$(template_state "$host_tpl")" = "stale" ] && stale_hosts=$((stale_hosts + 1))
   done <<<"$HOSTS"
 
-  while read -r host status host_tpl; do
+  while IFS=, read -r host status host_tpl host_uri; do
     [ -n "$host" ] || continue
 
     host_facts "$host"
@@ -994,6 +1227,16 @@ tick() {
     idle=$(idle_seconds "$host" "$busy")
     [ "$idle" -gt "$idle_max" ] && idle_max=$idle
     age=$(host_age_seconds "$host")
+
+    # Before any deletion verdict: a host that is still booting needs its
+    # registration token now, and a host that has registered needs the key gone
+    # now. Both are no-ops on a pool that mints on the host, and both are
+    # skipped when the MIG did not report a self-link, because without a zone
+    # there is no instance to address and a guessed one is a call against some
+    # other machine.
+    if [ "$MINT_REG" = "true" ] && [ -n "$host_uri" ]; then
+      registration_token_step "$host" "$host_uri" "$HOST_REG" "$age" "$status"
+    fi
 
     # The recycle rule is asked FIRST, and a cordon/retire verdict ends this
     # host's tick. Both rules delete, and only this one knows the host is
