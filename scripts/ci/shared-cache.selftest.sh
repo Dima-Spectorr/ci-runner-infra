@@ -73,6 +73,7 @@ POOLVARS="$HERE/../../modules/ci-runner-host-pool/variables.tf"
 PUBTF="$HERE/../../modules/ci-runner-cache-publisher/main.tf"
 PUBVARS="$HERE/../../modules/ci-runner-cache-publisher/variables.tf"
 BUCKETTF="$HERE/../../modules/ci-runner-cache-bucket/main.tf"
+TELEM="$HERE/../../modules/ci-runner-host-pool/scripts/telemetry.sh"
 PUBSH="$HERE/publish-cache-snapshot.sh"
 PUBDOC="$HERE/../../docs/publishing-a-cache-snapshot.md"
 
@@ -89,6 +90,7 @@ bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
 [ -f "$PUBTF" ] || { echo "FAIL: missing $PUBTF"; exit 1; }
 [ -f "$PUBVARS" ] || { echo "FAIL: missing $PUBVARS"; exit 1; }
 [ -f "$BUCKETTF" ] || { echo "FAIL: missing $BUCKETTF"; exit 1; }
+[ -f "$TELEM" ] || { echo "FAIL: missing $TELEM"; exit 1; }
 [ -f "$PUBSH" ] || { echo "FAIL: missing $PUBSH"; exit 1; }
 [ -f "$PUBDOC" ] || { echo "FAIL: missing $PUBDOC"; exit 1; }
 
@@ -398,6 +400,101 @@ has_bounded_hydrate() { # <file>
   # the caller could mistake for a reason to stop.
   matches "$code" 'hydrate_shared_cache \|\| true'            || return 1
   ! matches "$code" 'hydrate_shared_cache.*\|\| die'          || return 1
+}
+
+# A layer that fails open is a layer that reports nothing when it fails, unless
+# something makes it report. That is the whole content of this check: an expired
+# snapshot, a bucket that was never configured and a fleet-wide download timeout
+# produce the same observable — jobs slower than they were — so the verdict is
+# the only thing that separates them, and a verdict is only useful if EVERY exit
+# has one.
+has_observable_hydrate() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # Structural, not a count: every `return` inside the bounded body must be
+  # preceded by its own CACHE_VERDICT assignment, which is a property a new exit
+  # added next year either has or does not. A count would pass on an edit that
+  # added an exit and reused the verdict above it — the exact edit that produces
+  # a host reporting `too-old` for a failure that had nothing to do with age.
+  local unlabelled
+  unlabelled=$(awk '
+    /^hydrate_shared_cache_bounded\(\) \{/ { inbody = 1 }
+    inbody && /^\}$/                       { inbody = 0 }
+    !inbody                                { next }
+    /CACHE_VERDICT=/                       { pending = 1 }
+    /(^|[;[:space:]])return([[:space:]]|$)/ {
+      if (!pending) { print NR }
+      pending = 0
+    }
+  ' <<<"$code" | grep -c . )
+  [ "${unlabelled:-1}" = "0" ] || return 1
+
+  # And the publish is in the wrapper, on every path out, rather than at the
+  # return that decided the verdict — the same argument the `unset` already makes
+  # in this file: a rule repeated at every return is a rule missed at the next.
+  matches "$code" 'hydrate_shared_cache_bounded \|\| rc=\$\?' || return 1
+  matches "$code" '^  publish_cache_telemetry$'               || return 1
+  # Nothing may return between the two.
+  local between
+  between=$(awk '/hydrate_shared_cache_bounded \|\| rc=\$\?/ { seen = 1; next }
+                 seen && /publish_cache_telemetry/           { exit }
+                 seen && /return/                            { print }' <<<"$code" | grep -c .)
+  [ "${between:-1}" = "0" ] || return 1
+  # The verdict is cleared with the rest of the per-boot state, or a host that
+  # re-runs the hydrate reports the previous run's answer.
+  matches "$code" 'unset .*CACHE_VERDICT'                     || return 1
+
+  # Age and size are recorded BEFORE the bounds that reject on them. Recorded
+  # after, the only snapshots that ever publish an age are the ones young enough
+  # to be accepted, and "the snapshot is too old" becomes unalertable.
+  local order
+  order=$(awk '/CACHE_SNAP_AGE_HOURS=/ { print "age"; exit }
+               /CACHE_VERDICT="too-old"/ { print "bound"; exit }' <<<"$code")
+  [ "$order" = "age" ] || return 1
+
+  # Label goes through the allowlist, not into the JSON raw.
+  matches "$code" 'ts_label_value "\$\{CACHE_VERDICT:-unset\}"' || return 1
+  # And a telemetry failure changes nothing about the hydrate. The layer already
+  # fails open; an observability call that could fail a boot would make watching
+  # the cache riskier than not having it.
+  matches "$code" 'flush_series \|\| log'                       || return 1
+  ! matches "$code" 'publish_cache_telemetry \|\| die'          || return 1
+}
+
+# The same rule as has_token_out_of_argv, applied to the file that now runs
+# beside the hydrate. This predicate is the whole reason the publisher was worth
+# a second look: on the controller VM there are no untrusted users and argv is
+# nobody's channel, so the pattern was fine there for as long as it lived there.
+has_publisher_token_out_of_argv() { # <telemetry.sh>
+  local code
+  code=$(code_of "$1")
+  ! matches "$code" '\-H "Authorization: Bearer \$token'      || return 1
+  matches "$code" '\-K <\(printf .header = "Authorization: Bearer' || return 1
+  # And the response body does not land on a fixed path in a /tmp the host shares
+  # with job users: a symlink planted at a known name turns a root `curl -o` into
+  # a truncation of whatever it points at.
+  ! matches "$code" '\-o /tmp/'                               || return 1
+  matches "$code" 'out=\$\(mktemp\)'                          || return 1
+}
+
+# The publisher only exists on the host because it was concatenated there. This
+# is the line that puts it in front of the host's script the way it is already in
+# front of the controller's.
+has_host_telemetry_wiring() { # <main.tf>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'host_startup = join' || return 1
+  local block
+  block=$(awk '/host_startup = join/, /\]\)/' <<<"$code")
+  matches "$block" 'scripts/telemetry\.sh'     || return 1
+  matches "$block" 'scripts/host-startup\.sh'  || return 1
+  # Order matters: the host script calls queue_series at the top level of a
+  # function defined below it, so telemetry.sh must be the earlier member.
+  local first
+  first=$(awk '/telemetry\.sh/ { print "telemetry"; exit }
+               /host-startup\.sh/ { print "host"; exit }' <<<"$block")
+  [ "$first" = "telemetry" ] || return 1
 }
 
 # Everything a snapshot brings is inspected before a byte of it reaches the
@@ -719,6 +816,9 @@ run 'the bucket module grants no write of its own'       has_no_write_grant_on_t
 run 'a snapshot is built clean, scanned and written once' has_trusted_snapshot_build "$PUBSH"
 run 'both sides agree on which tool caches travel'       has_agreeing_cache_dirs   "$PUBSH"
 run 'the install never runs beside the publishing credential' has_split_publishing_workflow "$PUBDOC"
+run 'every hydrate exit says which one it was'           has_observable_hydrate    "$SCRIPT"
+run 'the host carries the telemetry publisher'           has_host_telemetry_wiring "$POOLTF"
+run 'the publisher keeps its token out of argv too'      has_publisher_token_out_of_argv "$TELEM"
 
 # --- the mutations --------------------------------------------------------------
 #
@@ -897,7 +997,7 @@ mutate 'the generation stops being pinned to what was measured' has_service_atte
 mutate 'the token goes back into the curl arguments' has_token_out_of_argv \
   's@^    -K <\(printf .*$@    -H "Authorization: Bearer $CACHE_TOKEN" \\@'
 mutate 'the token outlives the hydrate' has_token_out_of_argv \
-  's@^  unset CACHE_TOKEN CACHE_DEADLINE$@  :@'
+  's@^  unset CACHE_TOKEN @  unset @'
 mutate 'a response is bounded only by the deadline' has_token_out_of_argv \
   's@--max-filesize "\$\{5:-65536\}"@--silent@'
 
@@ -999,6 +1099,32 @@ mutate_file "$PUBDOC" 'the auth action goes back to a movable tag' has_split_pub
   's|google-github-actions/auth@[0-9a-f]{40} # v2\.[0-9]+\.[0-9]+|google-github-actions/auth@v2|'
 mutate_file "$PUBDOC" 'the template becomes callable with inputs' has_split_publishing_workflow \
   's@^  workflow_dispatch:$@  workflow_dispatch:\n  workflow_call:@'
+
+# The verdict plumbing. Every one of these leaves a hydrate that still works —
+# hosts boot, jobs run — and takes away the only thing that would have said the
+# cache stopped arriving.
+mutate 'an exit stops naming itself' has_observable_hydrate \
+  's@^    CACHE_VERDICT="too-old"$@@'
+mutate 'the wrapper stops publishing the verdict' has_observable_hydrate \
+  's@^  publish_cache_telemetry$@@'
+mutate 'the verdict survives into the next hydrate' has_observable_hydrate \
+  's@CACHE_VERDICT CACHE_STARTED@CACHE_STARTED@'
+mutate 'only accepted snapshots report their age' has_observable_hydrate \
+  's@^  CACHE_SNAP_AGE_HOURS=\$age$@@'
+mutate 'the verdict label goes into the JSON unfiltered' has_observable_hydrate \
+  's@\$\(ts_label_value "\$\{CACHE_VERDICT:-unset\}"\)@${CACHE_VERDICT}@'
+mutate 'a failed publish becomes a failed hydrate' has_observable_hydrate \
+  's@^  flush_series \|\| log .*$@  flush_series@'
+
+mutate_file "$TELEM" 'the publishing token goes back into argv' has_publisher_token_out_of_argv \
+  's@-K <\(printf .header = "Authorization: Bearer %s..n. "\$token"\)@-H "Authorization: Bearer $token"@'
+mutate_file "$TELEM" 'the response goes back to a fixed name in shared /tmp' has_publisher_token_out_of_argv \
+  's@-o "\$out"@-o /tmp/ts-response.json@'
+
+mutate_file "$POOLTF" 'the host loses the telemetry publisher' has_host_telemetry_wiring \
+  's@^    file\("\$\{path\.module\}/scripts/telemetry\.sh"\),$@@'
+mutate_file "$POOLTF" 'the host script goes back to standing alone' has_host_telemetry_wiring \
+  's@^  host_startup = join\(".{2}", \[$@  host_startup = file("${path.module}/scripts/host-startup.sh") # [@'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -183,6 +183,15 @@ error.
 gcloud storage cat gs://<bucket>/cache/<pool>/current
 ```
 
+You should not have to. The pools publish `ci_cache_snapshot_age_hours` from
+every host boot, and `ensure-alert-policies.sh` installs a policy that pages when
+it passes `--cache-stale-hours` (48 by default) — which is what a scheduled
+publish that quietly stopped looks like, days before hosts start refusing the
+snapshot and running cold. Read `ci_cache_hydrate_verdict` grouped by its label
+to see what the hosts actually did with what you published: `scan-refused` there
+means this script uploaded an archive the hosts' own scan rejects, and is the one
+verdict that points back at the publisher rather than at the pool.
+
 Then boot a host and read `/var/log/ci-runner-startup.log`: a successful hydrate
 logs the snapshot name, how many tool caches it moved in, its size, its age, and
 how much of the budget it spent. Every failure inside that budget is one line and

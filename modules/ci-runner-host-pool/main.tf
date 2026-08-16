@@ -59,9 +59,16 @@ locals {
   # consumer, so the variable is now required and validated instead.
   controller_sa = var.controller_service_account_email
 
-  # The host script is self-contained — a host makes no drain decisions, it
-  # only serves jobs and answers questions about itself.
-  host_startup = file("${path.module}/scripts/host-startup.sh")
+  # A host makes no drain decisions — it only serves jobs and answers questions
+  # about itself. It does carry the telemetry publisher, and that is the one
+  # thing it cannot delegate: the cache hydrate happens once, before the agent
+  # registers, and the controller never sees it. A controller that reported on a
+  # hydrate would be reporting on something it did not watch.
+  host_startup = join("\n", [
+    "#!/usr/bin/env bash",
+    file("${path.module}/scripts/telemetry.sh"),
+    file("${path.module}/scripts/host-startup.sh"),
+  ])
 
   # The controller carries its decision rules and the telemetry publisher inline
   # so a running controller never depends on fetching code at runtime. They are

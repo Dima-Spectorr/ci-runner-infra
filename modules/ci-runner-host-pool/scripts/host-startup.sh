@@ -71,6 +71,27 @@ INSTANCE_ZONE=$(md "instance/zone")        # projects/<n>/zones/<region>-<x>
 INSTANCE_ZONE=${INSTANCE_ZONE##*/}
 HOST_REGION=${INSTANCE_ZONE%-*}
 
+# What the telemetry publisher concatenated above this file expects, under the
+# names it expects. Spelled out here rather than passed in metadata where the
+# host already knows the value: a second copy of the project id is a second
+# thing that can disagree with the machine it is running on.
+PROJECT=$(md "project/project-id")
+# shellcheck disable=SC2034  # read by telemetry.sh, concatenated ABOVE this file
+REGION=$HOST_REGION
+# Empty when either half is, rather than the "/" that concatenating two empty
+# reads would produce: the emitter below skips on an empty REPO_FULL, and "/" is
+# not empty — it is a resource label that publishes and cannot be grouped by.
+REPO_FULL=""
+if [ -n "${OWNER:-}" ] && [ -n "${REPO:-}" ]; then REPO_FULL="$OWNER/$REPO"; fi
+METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
+# Tighter than the publisher's default 30. The controller's flush happens inside
+# a tick nobody waits on; this one happens on the boot path, in front of the
+# agent registering, and AFTER the hydrate's own budget has been accounted for —
+# so its worst case is added to that budget rather than covered by it. Two calls
+# at 10s is a bound worth stating out loud, not a boot silently doubled.
+# shellcheck disable=SC2034  # read by telemetry.sh, concatenated ABOVE this file
+TS_MAX_TIME=10
+
 BROKER_PORT=${BROKER_PORT:-8081}
 
 SLOTS=${SLOTS:-1}
@@ -758,17 +779,82 @@ cache_fetch() { # <object-suffix> <dest> <seconds> [<query>] [<max-bytes>]
 # has a dozen early returns and each one would need its own `unset`, so the
 # clearing happens here, once, on every path out — including the ones a later
 # edit adds.
+# WHY THE VERDICT IS PUBLISHED HERE AND NOT AT THE RETURN THAT DECIDED IT.
+#
+# The body has a dozen early returns, and the layer fails open, so all but one
+# of them log a line and return 0. That is the whole diagnostic problem: from
+# outside, a pool whose snapshot expired, a pool whose bucket was never
+# configured and a pool whose every host times out on the download are the same
+# observable — jobs that are slower than they were, and nothing red anywhere.
+#
+# So each return states its verdict in a variable and this wrapper publishes it,
+# once, on every path out — including the ones a later edit adds. The same
+# argument as the `unset` below, for the same reason: a rule that has to be
+# repeated at every return is a rule that will be missed at the next one.
 hydrate_shared_cache() {
   local rc=0
+  CACHE_VERDICT=""
+  CACHE_STARTED=$(date +%s)
   hydrate_shared_cache_bounded || rc=$?
-  unset CACHE_TOKEN CACHE_DEADLINE
+  publish_cache_telemetry
+  unset CACHE_TOKEN CACHE_DEADLINE CACHE_VERDICT CACHE_STARTED \
+        CACHE_SNAP_AGE_HOURS CACHE_SNAP_BYTES CACHE_DIRS_MOVED
   return "$rc"
+}
+
+# One point per series, one flush, and never a reason to fail the boot. A host
+# that cannot publish still registers: the metric exists to explain a slow pool,
+# and refusing to serve jobs because the explanation did not send would be the
+# monitoring deciding the availability.
+publish_cache_telemetry() {
+  # All four, not just the two the URL needs: POOL and REPO_FULL are the resource
+  # labels, and an empty one produces a request the API rejects whole — one
+  # missing metadata read would drop every series in this flush and log a 400
+  # nobody reads, rather than skipping cleanly.
+  [ -n "${METRIC_PREFIX:-}" ] && [ -n "${PROJECT:-}" ] \
+    && [ -n "${POOL:-}" ] && [ -n "${REPO_FULL:-}" ] || return 0
+
+  # An empty verdict means the function returned through a path that states
+  # none, which is a bug in this file rather than a state of the cache. Named
+  # rather than dropped, because a verdict that silently stops being published
+  # looks exactly like a pool that stopped hydrating.
+  queue_series "ci_cache_hydrate_verdict" 1 \
+    "\"verdict\":\"$(ts_label_value "${CACHE_VERDICT:-unset}")\""
+  queue_series "ci_cache_hydrate_seconds" "$(( $(date +%s) - CACHE_STARTED ))"
+  # Age, size and count are only published when a snapshot was actually read.
+  # A zero on a pool with no bucket configured would sit in the same series as a
+  # zero on a pool whose snapshot is fresh, and an alert cannot tell those apart.
+  [ -n "${CACHE_SNAP_AGE_HOURS:-}" ] \
+    && queue_series "ci_cache_snapshot_age_hours" "$CACHE_SNAP_AGE_HOURS"
+  [ -n "${CACHE_SNAP_BYTES:-}" ] \
+    && queue_series "ci_cache_snapshot_bytes" "$CACHE_SNAP_BYTES"
+  [ -n "${CACHE_DIRS_MOVED:-}" ] \
+    && queue_series "ci_cache_dirs_hydrated" "$CACHE_DIRS_MOVED"
+
+  flush_series || log "cache telemetry did not publish — the hydrate itself was unaffected"
+  return 0
 }
 
 hydrate_shared_cache_bounded() {
   CACHE_BUCKET=$(md "instance/attributes/ci-cache-bucket")
   if [ -z "${CACHE_BUCKET:-}" ]; then
-    log "no snapshot bucket configured — this host runs on the cache its image baked"
+    # `md` returns an empty string for BOTH "the attribute is not set" and "the
+    # metadata server did not answer", and those are opposite facts: the first is
+    # the correct steady state of a pool that never wanted this layer, and the
+    # alert on hydrate failures excludes it for exactly that reason. Reported the
+    # same way, a metadata read that failed at boot would file itself into the
+    # silenced bucket — a pool with a bucket configured, hydrating nothing,
+    # reporting the verdict that means "nothing to do".
+    #
+    # So ask for something every instance has. If that answers, the attribute is
+    # genuinely absent; if it does not, the metadata server is what is broken.
+    if [ -n "$(md "instance/id")" ]; then
+      CACHE_VERDICT="not-configured"
+      log "no snapshot bucket configured — this host runs on the cache its image baked"
+    else
+      CACHE_VERDICT="no-metadata-server"
+      log "metadata server unreachable — cannot tell whether a snapshot bucket is configured"
+    fi
     return 0
   fi
   CACHE_PREFIX=$(md "instance/attributes/ci-cache-prefix")
@@ -778,7 +864,7 @@ hydrate_shared_cache_bounded() {
   # misconfigured pool.
   case "$CACHE_PREFIX" in
     */) : ;;
-    *) log "cache prefix '${CACHE_PREFIX:-}' is not a directory prefix — skipping hydrate"; return 0 ;;
+    *) CACHE_VERDICT="bad-prefix"; log "cache prefix '${CACHE_PREFIX:-}' is not a directory prefix — skipping hydrate"; return 0 ;;
   esac
 
   local budget max_age_hours max_bytes
@@ -811,22 +897,24 @@ hydrate_shared_cache_bounded() {
   CACHE_TOKEN=$(md "instance/service-accounts/default/token" \
     | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   if [ -z "${CACHE_TOKEN:-}" ]; then
+    CACHE_VERDICT="no-token"
     log "no instance token — skipping cache hydrate"
     return 0
   fi
 
   local tmp
-  tmp=$(mktemp -d /opt/.ci-cache-dl.XXXXXX) || return 0
+  tmp=$(mktemp -d /opt/.ci-cache-dl.XXXXXX) || { CACHE_VERDICT="no-scratch"; return 0; }
   # Root-owned 0700 from creation. Nothing else on this host may read, still less
   # substitute, a name inside the directory root is about to unpack an archive
   # into — the rule the whole cache section is built on.
-  chmod 0700 "$tmp" || { rm -rf "$tmp"; return 0; }
+  chmod 0700 "$tmp" || { CACHE_VERDICT="no-scratch"; rm -rf "$tmp"; return 0; }
 
   # The pointer names the current snapshot. It is a separate, tiny object because
   # the snapshots themselves must never be overwritten: the bucket measures age
   # per generation and an overwrite starts a new one at zero, so a snapshot key
   # rewritten in place would never reach the age bound and never expire.
   if ! cache_fetch "current" "$tmp/current" "$((deadline - $(date +%s)))"; then
+    CACHE_VERDICT="no-snapshot"
     log "no cache snapshot published for this pool yet — running on the baked cache"
     rm -rf "$tmp"
     return 0
@@ -844,7 +932,8 @@ hydrate_shared_cache_bounded() {
       # The rejected name is NOT echoed. It is the one fully attacker-controlled
       # string here, it has not been validated at the point this line runs, and
       # this log goes to a file an operator reads in a terminal.
-      log "the cache pointer does not name a snapshot in this pool's prefix (${#snap} bytes) — ignoring it"
+      CACHE_VERDICT="bad-pointer"
+    log "the cache pointer does not name a snapshot in this pool's prefix (${#snap} bytes) — ignoring it"
       rm -rf "$tmp"
       return 0
       ;;
@@ -855,6 +944,7 @@ hydrate_shared_cache_bounded() {
   # `timeCreated` is the service's own record of the generation, and the age
   # bound is worth having only if it reads the one that cannot be backdated.
   if ! cache_fetch "$snap" "$tmp/meta" "$((deadline - $(date +%s)))" "?fields=timeCreated,size,generation"; then
+    CACHE_VERDICT="unreadable"
     log "cache snapshot $snap is named by the pointer but could not be read — running on the baked cache"
     rm -rf "$tmp"
     return 0
@@ -872,17 +962,26 @@ hydrate_shared_cache_bounded() {
   gen=$(sed -n 's/.*"generation"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' "$tmp/meta")
   created=$(date -u -d "$created" +%s 2>/dev/null) || created=""
   if [ -z "$created" ] || [ -z "$size" ] || [ -z "$gen" ]; then
+    CACHE_VERDICT="no-metadata"
     log "cache snapshot $snap has no readable size, generation or creation time — refusing it"
     rm -rf "$tmp"
     return 0
   fi
   age=$(( (started - created) / 3600 ))
+  # Recorded before the bounds below rather than after them: the age and size of
+  # a snapshot a host REFUSED are the two numbers that say why, and an alert on
+  # "the snapshot is too old" cannot be written from points only fresh snapshots
+  # publish.
+  CACHE_SNAP_AGE_HOURS=$age
+  CACHE_SNAP_BYTES=$size
   if [ "$age" -ge "$max_age_hours" ]; then
+    CACHE_VERDICT="too-old"
     log "cache snapshot $snap is ${age}h old, past the ${max_age_hours}h bound — starting cold instead"
     rm -rf "$tmp"
     return 0
   fi
   if [ "$size" -gt "$max_bytes" ]; then
+    CACHE_VERDICT="too-big"
     log "cache snapshot $snap is $size bytes, past the $max_bytes bound — refusing it"
     rm -rf "$tmp"
     return 0
@@ -895,6 +994,7 @@ hydrate_shared_cache_bounded() {
   local free_kb
   free_kb=$(df -Pk /opt | awk 'NR==2 {print $4}')
   if [ -z "${free_kb:-}" ] || [ "$((free_kb * 1024))" -lt "$((size * 8))" ]; then
+    CACHE_VERDICT="no-space"
     log "not enough free space on /opt for a $size byte snapshot — starting cold instead"
     rm -rf "$tmp"
     return 0
@@ -902,6 +1002,7 @@ hydrate_shared_cache_bounded() {
 
   if ! cache_fetch "$snap" "$tmp/snap.tar.gz" "$((deadline - $(date +%s)))" \
       "?alt=media&generation=$gen" "$size"; then
+    CACHE_VERDICT="download-timeout"
     log "cache snapshot $snap did not download inside the ${budget}s budget — starting cold instead"
     rm -rf "$tmp"
     return 0
@@ -909,6 +1010,7 @@ hydrate_shared_cache_bounded() {
 
   rm -rf "$CACHE_STAGE"
   if ! mkdir -p "$CACHE_STAGE" || ! chmod 0700 "$CACHE_STAGE"; then
+    CACHE_VERDICT="no-scratch"
     rm -rf "$tmp"
     return 0
   fi
@@ -953,6 +1055,7 @@ hydrate_shared_cache_bounded() {
       | tar -x -C "$CACHE_STAGE" \
           --no-same-owner --no-same-permissions --no-xattrs --no-acls \
           2>/dev/null; then
+    CACHE_VERDICT="unpack-timeout"
     log "cache snapshot $snap did not unpack inside the ${budget}s budget — starting cold instead"
     rm -rf "$tmp" "$CACHE_STAGE"
     return 0
@@ -963,6 +1066,7 @@ hydrate_shared_cache_bounded() {
   # passed through neither. A snapshot is the one way into this tree that no
   # reviewed build step stands in front of.
   if cache_master_is_hostile "$CACHE_STAGE" strict; then
+    CACHE_VERDICT="scan-refused"
     log "cache snapshot $snap rejected by the same scan the image build runs — starting cold instead"
     rm -rf "$CACHE_STAGE"
     return 0
@@ -1011,6 +1115,8 @@ hydrate_shared_cache_bounded() {
   rm -rf "$CACHE_STAGE"
 
   took=$(( $(date +%s) - started ))
+  CACHE_VERDICT="hydrated"
+  CACHE_DIRS_MOVED=$n
   log "cache hydrated from $snap: $n tool cache(s), $size bytes, ${age}h old, ${took}s of a ${budget}s budget"
 }
 
