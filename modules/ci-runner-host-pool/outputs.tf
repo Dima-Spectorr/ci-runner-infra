@@ -71,6 +71,21 @@ output "metric_names" {
       # run, not of the pool, and belongs in the run report.
       "ci_mig_target_size",
       "ci_drain_verdicts",
+      # The SECOND delete gate — the one that asks the host itself whether a job
+      # worker is still alive after every agent was deregistered. Read grouped
+      # BY its `outcome` label; the three are not interchangeable. `held` is the
+      # gate working. `undetermined` is the gate BLIND — the host's OS or its
+      # liveness facts could not be read, so the controller kept a host it could
+      # not ask about. Sustained non-zero `undetermined` is scale-in suspended
+      # while every host reads healthy, and it is the one to alert on.
+      "ci_worker_gate_verdicts",
+      # How many hosts per tick carried no `ci-host-os` at all and were resolved
+      # from the controller's own — the transitional arm in drain_host(). Every
+      # host predates the key on the day this ships, so this starts at the drain
+      # rate and must decay to zero as the pool recycles. Zero for a full recycle
+      # window is the signal that the arm can be deleted; still non-zero long
+      # after a rollout is a pool whose hosts are not being replaced.
+      "ci_worker_gate_os_fallback",
       # Published since the reaper landed but never listed here, so no dashboard
       # or alert built from this contract could see it.
       "ci_orphan_registrations_reaped",
