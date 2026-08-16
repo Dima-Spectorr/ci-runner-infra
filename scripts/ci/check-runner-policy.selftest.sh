@@ -110,6 +110,7 @@ mutate "the Windows label set widened to a second OS" \
 #    spellings, so `Windows` — which is how consumers actually write it — would
 #    stop being a Windows pool while `windows` kept working: the rule would hold
 #    for exactly half the fleet and nothing would say which half.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "the Windows label matched case-sensitively" \
   's@grep -qiE "^(${WINDOWS_LABEL})$"@grep -qE "^(${WINDOWS_LABEL})$"@'
 
@@ -118,8 +119,10 @@ mutate "the Windows label matched case-sensitively" \
 #      independently — `services:` is the one that fails at "Initialize
 #      containers" before a step runs, `container:` the one a job author is most
 #      likely to copy across from a Linux workflow.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "the services: half of the condition dropped" \
   's@\[ "$has_container" -eq 1 \] || \[ "$has_services" -eq 1 \]@[ "$has_container" -eq 1 ]@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "the container: half of the condition dropped" \
   's@\[ "$has_container" -eq 1 \] || \[ "$has_services" -eq 1 \]@[ "$has_services" -eq 1 ]@'
 
