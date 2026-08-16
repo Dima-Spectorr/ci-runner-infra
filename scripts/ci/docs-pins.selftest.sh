@@ -101,6 +101,42 @@ else
   ok "README.md carries $readme_pins pin(s)"
 fi
 
+# THE OTHER WAY THIS REPO IS REFERENCED, and one the scan above cannot see.
+#
+# A consumer reaches this repo two ways: a Terraform module `?ref=`, checked
+# above, and a workflow `uses:` — `<org>/ci-runner-infra/.github/{actions,
+# workflows}/<name>@<ref>`. The grep above only matches `//modules/...?ref=`, so
+# every documented `uses:` line was outside this gate entirely. It went stale
+# exactly as the README quickstart did: the UI-testing guide shipped pinned to
+# `@v5.8.0` and the repo published v5.19.1, eleven minors later, with nothing
+# reporting it.
+#
+# Asserted against the MAJOR, not against VERSION. This repo publishes a
+# floating major tag that moves forward on every release, and that is what the
+# other guides already tell a consumer to use — an exact `@vX.Y.Z` in a document
+# is stale the next time anything ships, which is the drift rather than the fix.
+major=${want%%.*}
+uses_found=0
+for f in "${docs[@]}"; do
+  while IFS= read -r ref; do
+    uses_found=$((uses_found + 1))
+    if [ "$ref" = "$major" ]; then
+      ok "${f#"$ROOT/"}: uses @$ref"
+    else
+      bad "${f#"$ROOT/"}: a workflow/action reference pins @$ref, but this repo publishes the floating major $major — an exact version here is stale on the next release"
+    fi
+  done < <(grep -oE 'ci-runner-infra/\.github/(actions|workflows)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*@[^"[:space:])]+' -- "$f" \
+             | sed 's/.*@//')
+done
+
+# Same rule as above: a scan that matches nothing is not a pass. If the shape of
+# these references changes, this must go red rather than quietly stop asserting.
+if [ "$uses_found" -eq 0 ]; then
+  bad "no workflow/action references of this repo found in any Markdown file — the guides publish them, so the grep no longer matches what the docs write"
+else
+  ok "$uses_found documented workflow/action reference(s) checked"
+fi
+
 if [ "$fail" -eq 0 ]; then
   echo "  docs pins match VERSION."
 else

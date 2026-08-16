@@ -55,6 +55,45 @@ variable "create_controller_service_account" {
   default     = true
 }
 
+variable "host_os" {
+  description = <<-EOT
+    Operating system of the HOSTS this identity serves: "linux" or "windows".
+    It selects how much the HOST account is allowed to hold, and nothing else —
+    the controller account is identical either way.
+
+    linux (the default, and unchanged from every pool that exists today): the
+    host account reads the App key from Secret Manager to mint its own runner
+    registration tokens, and writes metrics and logs. That is safe because a
+    Linux host fences job code off the metadata server by iptables owner-match,
+    so job code cannot mint a token for this account at all.
+
+    windows: there is no such fence, and no mechanism to build one — Windows
+    Firewall resolves an explicit block ahead of every conflicting allow,
+    `-Service` carries no precedence, and the one documented override needs
+    IPsec the metadata server does not speak. Job code therefore reaches the
+    metadata server and can mint an access token for whatever this account is.
+    So the account is reduced to nothing worth stealing: only
+    `roles/iam.serviceAccountTokenCreator` on the job account, which
+    ci-runner-host-pool grants and which the broker was going to vend to job
+    code anyway. The registration token is minted by the CONTROLLER instead —
+    set `controller_mints_registration_token` on the pool.
+
+    Terraform cannot see what IAM a caller's account holds elsewhere, so this is
+    a declaration, not an enforcement. The enforcement is the host's own boot
+    probe, which asserts a 403 on the secret from the token it is given — that
+    probe ships with the Windows host template and does not exist yet, so until
+    it does, `host_os = "windows"` reduces the grants this module writes and
+    proves nothing about grants written anywhere else.
+  EOT
+  type        = string
+  default     = "linux"
+
+  validation {
+    condition     = contains(["linux", "windows"], var.host_os)
+    error_message = "host_os must be \"linux\" or \"windows\"."
+  }
+}
+
 variable "labels" {
   description = "Extra labels for the secret."
   type        = map(string)

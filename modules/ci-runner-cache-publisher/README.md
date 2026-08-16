@@ -98,9 +98,19 @@ that.** Never archive a host's live cache:
   snapshot brought, so archiving it adds nothing and slowly compounds whatever
   an earlier snapshot got wrong.
 
-The publishing script that does this is not in this repo yet. Until it exists the
-grants sit unused, every pool finds no snapshot, and hosts run on the cache their
-image baked — a supported state, not a misconfiguration.
+The script that does this is `scripts/ci/publish-cache-snapshot.sh`, and
+`docs/publishing-a-cache-snapshot.md` is the workflow that runs it — two jobs,
+because the phase that installs dependencies runs third-party code and must not
+be the phase holding this identity's token. Until a
+repository adds that workflow the grants sit unused, every pool finds no
+snapshot, and hosts run on the cache their image baked — a supported state, not a
+misconfiguration.
+
+The script refuses to run from a `pull_request_target`, `workflow_run` or
+`issue_comment` event. That is not redundant with the binding: the binding pins
+repository, workflow file and ref, and cannot pin the **event** — those three
+assert the default ref while running untrusted code, so without the check an edit
+to the trigger would be handed a working credential.
 
 ## Size is a contract, not an accident
 
@@ -117,7 +127,7 @@ must grow.
 |---|---|---|---|
 | `project_id` | string | — | Same project as the pool. |
 | `name` | string | — | The pool name. Decides the prefix; must match the pool's. |
-| `account_id` | string | — | Base for the account id; `-cache` is appended, base truncated to fit 30 characters. |
+| `account_id` | string | — | Base for the account id; `-cache` is appended. 6–24 characters, validated rather than truncated — two bases differing past a truncation point would silently share one account. |
 | `cache_snapshot_bucket` | string | — | Bucket **name**, not a `gs://` URL. Validated, because it is interpolated into an IAM condition. |
 | `workload_identity_pool` | string | — | Full pool resource name, using the project **number**. Its provider must map `attribute.job_workflow_ref` and pin the org by numeric id. |
 | `repository` | string | — | `<owner>/<repo>`. No default: a guess would bind to somebody else's repository. |
