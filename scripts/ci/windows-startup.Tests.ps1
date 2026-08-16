@@ -125,10 +125,11 @@ Describe 'beacon service definition' {
         $script:Xml | Should -Match '-IntervalSeconds 45'
     }
 
-    # The service id is what phase 2 exempts from the metadata fence, by service
-    # SID, and what phase 0 starts by name. Three files have to agree on this
-    # string and only this test compares them.
-    It 'is named the same thing the fence and the starter use' {
+    # The service id is what phase 0 starts by name. It was ALSO what phase 2
+    # exempted from the metadata fence by service SID; section 3A deleted the fence, so
+    # this string now has two owners rather than three. Two files still have to
+    # agree on it and only this test compares them.
+    It 'is named the same thing the starter uses' {
         $script:Xml | Should -Match '<id>ci-beacon</id>'
     }
 }
@@ -326,5 +327,125 @@ Describe 'security policy rewriting' {
         $out | Should -Match '(?m)^Unicode=yes\r?$'
         $out | Should -Match '(?m)^signature='
         $out | Should -Match '(?m)^SeBatchLogonRight = \*S-1-5-32-544\r?$'
+    }
+}
+
+# --- phase 3, the job credential broker ---------------------------------------
+
+Describe 'job service account validation' {
+    # Instance metadata is a trust boundary on a Windows pool -- section 3A accepts that
+    # job code can read it and does not assume nothing can write it. The value
+    # lands in service XML and in a LocalSystem service's environment block, so
+    # the check is a whitelist of the shape, not a blacklist of characters.
+    It 'accepts a service-account address' {
+        Test-JobServiceAccountName -Name 'ci-job@example-project.iam.gserviceaccount.com' | Should -BeTrue
+    }
+
+    It 'rejects nothing at all' {
+        Test-JobServiceAccountName -Name '' | Should -BeFalse
+        Test-JobServiceAccountName -Name '   ' | Should -BeFalse
+        Test-JobServiceAccountName -Name $null | Should -BeFalse
+    }
+
+    # The two shapes that would turn a value into markup or into a second
+    # variable. Escaping handles the first anyway; this is the half that stops a
+    # WELL-FORMED document from saying something other than what phase 3 meant.
+    It 'rejects a value that could close an element or open a line' {
+        Test-JobServiceAccountName -Name 'a@b.com"/><env name="X" value="y' | Should -BeFalse
+        Test-JobServiceAccountName -Name "a@b.com`nCI_BROKER_PORT=1" | Should -BeFalse
+    }
+
+    It 'rejects something that is not an address' {
+        Test-JobServiceAccountName -Name 'ci-job' | Should -BeFalse
+        Test-JobServiceAccountName -Name 'ci-job@localhost' | Should -BeFalse
+    }
+}
+
+Describe 'broker port parsing' {
+    It 'takes a port metadata actually set' {
+        Get-BrokerPort -Value '9099' | Should -Be 9099
+    }
+
+    # Falling back is right for the port and would be WRONG for the account: a
+    # default port serves the same broker, a default identity is somebody else's.
+    It 'falls back when metadata says nothing' {
+        Get-BrokerPort -Value '' | Should -Be $script:DefaultBrokerPort
+        Get-BrokerPort -Value $null | Should -Be $script:DefaultBrokerPort
+    }
+
+    It 'falls back on anything that is not a whole number' {
+        Get-BrokerPort -Value '80 80' | Should -Be $script:DefaultBrokerPort
+        Get-BrokerPort -Value '-1' | Should -Be $script:DefaultBrokerPort
+        Get-BrokerPort -Value '8.0' | Should -Be $script:DefaultBrokerPort
+    }
+
+    It 'falls back outside the range a socket would accept' {
+        Get-BrokerPort -Value '0' | Should -Be $script:DefaultBrokerPort
+        Get-BrokerPort -Value '65536' | Should -Be $script:DefaultBrokerPort
+    }
+
+    # This case was a real defect, found by running the function rather than by
+    # reading it. All-digits is not the same thing as a number that fits, and
+    # `[int64] '99999999999999999999'` THROWS -- which under the entry point's
+    # $ErrorActionPreference = 'Stop' is a dead host with a cast error in its log
+    # instead of a live one on the default port.
+    It 'falls back on a number too large to be one, instead of throwing' {
+        { Get-BrokerPort -Value '99999999999999999999' } | Should -Not -Throw
+        Get-BrokerPort -Value '99999999999999999999' | Should -Be $script:DefaultBrokerPort
+    }
+}
+
+Describe 'broker service definition' {
+    BeforeAll {
+        $script:BrokerXml = Get-BrokerServiceConfig -ScriptPath 'C:\ci\bin\job-metadata-broker.py' `
+            -JobServiceAccount 'ci-job@example-project.iam.gserviceaccount.com' -Port 8081
+    }
+
+    # Loopback, not 0.0.0.0 as on Linux. Windows gives the slots no network
+    # namespace of their own, so binding the VM's address would widen who can
+    # reach a credential vendor without narrowing anything for the slots.
+    It 'binds loopback and never the host address' {
+        $script:BrokerXml | Should -Match '<env name="CI_BROKER_HOST" value="127\.0\.0\.1"/>'
+        $script:BrokerXml | Should -Not -Match '0\.0\.0\.0'
+    }
+
+    It 'vends the identity it was given, on the port it was given' {
+        $script:BrokerXml | Should -Match 'CI_JOB_SERVICE_ACCOUNT" value="ci-job@example-project\.iam\.gserviceaccount\.com"'
+        $script:BrokerXml | Should -Match 'CI_BROKER_PORT" value="8081"'
+    }
+
+    # Escaping is the half that survives a value the caller's validation did not
+    # see -- a future caller, a future metadata key. The angle bracket must come
+    # out as text, so the document still has exactly the elements phase 3 wrote.
+    It 'escapes a hostile value into text rather than markup' {
+        $xml = Get-BrokerServiceConfig -ScriptPath 'C:\ci\bin\b.py' `
+            -JobServiceAccount 'x"/><env name="EVIL" value="1' -Port 8081
+        $xml | Should -Not -Match '<env name="EVIL"'
+        $xml | Should -Match '&quot;|&lt;'
+    }
+
+    # A broker that dies stops every job on the host from authenticating. The
+    # service manager restarting it is the only thing watching.
+    It 'restarts itself rather than staying dead' {
+        $script:BrokerXml | Should -Match '<onfailure action="restart"'
+        $script:BrokerXml | Should -Match '<startmode>Automatic</startmode>'
+    }
+}
+
+# Phase 4's job hook will be a FILE locked by the same function that locks the
+# directories, and .NET does not let a file ACE carry inheritance flags --
+# AddAccessRule throws "No flags can be set" rather than ignoring them. Under
+# the entry point's 'Stop' preference that throw is a host that never finishes
+# booting, so the distinction is asserted here rather than discovered there.
+Describe 'acl inheritance flags' {
+    It 'makes a directory ACE inheritable' {
+        $flags = Get-AclInheritanceFlag -IsContainer $true
+        $flags.HasFlag([System.Security.AccessControl.InheritanceFlags]::ContainerInherit) | Should -BeTrue
+        $flags.HasFlag([System.Security.AccessControl.InheritanceFlags]::ObjectInherit) | Should -BeTrue
+    }
+
+    It 'gives a file ACE no flags at all, because .NET rejects any' {
+        Get-AclInheritanceFlag -IsContainer $false |
+            Should -Be ([System.Security.AccessControl.InheritanceFlags]::None)
     }
 }

@@ -18,34 +18,53 @@
 #
 #   phase 0  preflight, image assertion, and the beacon BEFORE anything else
 #   phase 1  slot accounts, logon rights, ACLs, per-slot TEMP
-#   phase 2  the metadata fence                                (not yet)
-#   phase 3  the job credential broker                         (not yet)
-#   phase 4  the per-job credential reset hooks                (not yet)
+#   phase 2  the metadata fence                                (DELETED, see below)
+#   phase 3  the job credential broker
+#   phase 4  the per-job credential reset hooks                 (not yet)
 #   phase 5  agent registration as a service                   (not yet)
-#   phase 6  the boot probe, which PROVES 2 and 1              (not yet)
+#   phase 6  the boot probe                                    (not yet)
 #
-# Phase 1 builds the boundary and hands back the credentials that will sit
-# behind it; nothing CONSUMES them until phase 5 registers the agents. A host
-# that stops here has the accounts, the rights and the ACLs in place and no job
-# code on the machine to test them against, which is the safe half to ship first.
+# THERE IS NO PHASE 2, AND THERE WILL NOT BE ONE
+#
+# Section 3A of docs/adr-windows-pool.md deletes the metadata fence rather than
+# deferring it: Windows Firewall gives an explicit block rule precedence over
+# every conflicting allow rule, supports no administrator-assigned ordering, and
+# offers no per-principal outbound filter that works without IPsec the metadata
+# server does not speak. A host-wide block installs cleanly and takes the guest
+# agent, the beacon and this broker down with the slot accounts. The safety
+# property moved into IAM instead -- a Windows pool's host account is reduced
+# until the token job code can mint is worth only what the broker was going to
+# hand it anyway -- and that reduction is PR 4b's, not this file's.
+#
+# The consequence for THIS file is a rule, and it is the one the self-test
+# guards: no credential of any kind is written to instance metadata or to guest
+# attributes, and no `New-NetFirewallRule` appears anywhere in it. A fence
+# reintroduced by a later edit would review as working and enforce the opposite
+# of what it claims.
+#
+# Phase 1 builds the boundary; phases 3 and 4 build what job code is given
+# INSIDE it -- a weaker credential, and a guarantee that it does not outlive the
+# job. Nothing CONSUMES the slot credentials until phase 5 registers the agents.
+# Phase 4 lands on top of this one: the ACL helper it needs is here, and its own
+# hook file, its slot environment block and their invariants are not.
 #
 # Until phase 5 exists this script registers no agent, so a host running it
 # serves no jobs. That is the intended state of a half-delivered Windows pool
 # and it is why `host_os` is not yet an input to the module.
 #
 # Every phase either succeeds or the host registers nothing. There is no partial
-# host: one that came up without its fence is a host on which any pull request
-# owns the fleet.
+# host: one that came up without its broker turns every deploy step into a
+# confusing auth failure, and one that came up without its hooks hands the next
+# pull request the last job's credentials.
 #
 # WHY THE BEACON IS PHASE 0 AND NOT PHASE 5
 #
-# Two orderings force it. First, there must be no instant in this host's life at
-# which a `Runner.Worker.exe` could exist without a publisher able to see it, and
-# the cheapest way to guarantee that is to start the publisher before anything
-# that could ever spawn one. Second, the phase-2 metadata fence exempts the
-# beacon by SERVICE SID, and a SID that does not exist yet cannot be exempted --
-# an ordering bug there would fence the beacon out of the metadata server and
-# strand every host in the pool.
+# There must be no instant in this host's life at which a `Runner.Worker.exe`
+# could exist without a publisher able to see it, and the cheapest way to
+# guarantee that is to start the publisher before anything that could ever spawn
+# one. (The second reason this file used to give -- that the phase-2 fence
+# exempted the beacon by service SID, and a SID that does not exist yet cannot be
+# exempted -- died with the fence. Section 3A, again.)
 
 [CmdletBinding()]
 param()
@@ -71,6 +90,19 @@ $script:MetadataRoot = 'http://169.254.169.254/computeMetadata/v1'
 # process. The shim is the thing that answers the SCM and supervises the script.
 $script:ServiceShim = 'C:\ci\bin\ci-service-shim.exe'
 $script:BeaconServiceName = 'ci-beacon'
+$script:BrokerServiceName = 'ci-job-broker'
+
+# The interpreter the broker runs under is an IMAGE component too, at a path this
+# module fixes rather than discovers. Resolving `python.exe` through PATH would
+# make the broker's identity depend on whatever the image last installed, and
+# PATH is the one input to a service start that a future image change can alter
+# without anybody reading this file.
+$script:PythonExe = 'C:\ci\bin\python\python.exe'
+$script:BrokerScript = 'C:\ci\bin\job-metadata-broker.py'
+
+# The loopback port the broker answers on when metadata does not name one. The
+# same default as the Linux broker, because it is the same broker.
+$script:DefaultBrokerPort = 8081
 
 # Bounded, like every call this host makes. A host boot that HANGS is worse than
 # one that fails: it never registers an agent, never powers off, and bills at
@@ -344,6 +376,120 @@ function Get-BeaconServiceConfig {
 "@
 }
 
+function Test-JobServiceAccountName {
+    <#
+      .SYNOPSIS
+        Is this a service-account address, and nothing else?
+      .DESCRIPTION
+        Instance metadata is a trust boundary: section 3A accepts that job code on a
+        Windows host can read it, and this module cannot assume nothing can write
+        it either. The value goes into the broker's service definition, which is
+        XML, and into the service's environment block, so a value carrying a
+        quote, an angle bracket or a newline is a way to add an element or a
+        variable to a service that runs as LocalSystem.
+
+        Escaping alone would be enough for the XML and is done anyway. This is
+        the other half: the only thing that may reach either place is something
+        shaped like the address the broker is going to impersonate.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    return ($Name.Trim() -match '^[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$')
+}
+
+function Get-BrokerPort {
+    <#
+      .SYNOPSIS
+        The broker's loopback port, or the default when metadata gives nothing.
+      .DESCRIPTION
+        Same trust-boundary reasoning as the account name, with a narrower range:
+        anything that is not a whole number in 1..65535 is a value the socket bind
+        would refuse LATER, at which point the broker is a service that installed
+        and never answered. Falling back is right here and would be wrong for the
+        account: a default port serves the same broker, a default identity would
+        be somebody else's.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Value,
+        [int] $Default = $script:DefaultBrokerPort
+    )
+    if ($Value -notmatch '^[0-9]+$') { return $Default }
+    # TryParse, not a cast. `[int64] '99999999999999999999'` THROWS, and under the
+    # entry point's $ErrorActionPreference = 'Stop' that throw is a dead host with
+    # a cast error in its log instead of a working one on the default port. An
+    # all-digits string is not the same thing as a number that fits, and the gap
+    # between the two is exactly what a metadata value can be set to.
+    [int64] $port = 0
+    if (-not [int64]::TryParse($Value, [ref] $port)) { return $Default }
+    if ($port -lt 1 -or $port -gt 65535) { return $Default }
+    return [int] $port
+}
+
+function Get-BrokerServiceConfig {
+    <#
+      .SYNOPSIS
+        The shim's service definition for the job credential broker, as XML text.
+      .DESCRIPTION
+        Pure, for the same reason Get-BeaconServiceConfig is: the parts that
+        decide whether job code gets the RIGHT identity are asserted by a test
+        rather than by a host that has already registered agents.
+
+        `CI_BROKER_HOST` is 127.0.0.1, and that is the one line here that looks
+        like a regression against Linux. On Linux the broker binds 0.0.0.0 and the
+        script then REJECTs the port on the primary interface, purely because each
+        slot has its own network namespace and therefore its own loopback, so a
+        broker on the host's 127.0.0.1 would be unreachable from every slot.
+        Windows has no per-slot namespace (section 4 of the ADR), every slot shares one
+        loopback, and binding the VM's address instead would add an exposure in
+        exchange for nothing.
+
+        The service runs as LocalSystem -- the shim's default, and deliberate. The
+        broker is the one process on this host whose job is to hold a host-level
+        credential briefly and hand back a weaker one; running it as a slot would
+        put that exchange inside the boundary it exists to cross.
+
+        Every value that comes from metadata is XML-escaped AND validated by the
+        caller. Escaping alone stops a malformed document; validation stops a
+        well-formed one that says something else.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $ScriptPath,
+        [Parameter(Mandatory = $true)][string] $JobServiceAccount,
+        [Parameter(Mandatory = $true)][int] $Port,
+        [string] $ServiceName = $script:BrokerServiceName,
+        [string] $PythonPath = $script:PythonExe
+    )
+    $esc = { param($v) [System.Security.SecurityElement]::Escape([string] $v) }
+    $exe = & $esc $PythonPath
+    $arg = & $esc "`"$ScriptPath`""
+    $sa = & $esc $JobServiceAccount
+    $svc = & $esc $ServiceName
+    return @"
+<service>
+  <id>$svc</id>
+  <name>$svc</name>
+  <description>Vends job-scoped Google credentials to CI job code on this host.</description>
+  <executable>$exe</executable>
+  <arguments>$arg</arguments>
+  <env name="CI_JOB_SERVICE_ACCOUNT" value="$sa"/>
+  <env name="CI_BROKER_HOST" value="127.0.0.1"/>
+  <env name="CI_BROKER_PORT" value="$Port"/>
+  <startmode>Automatic</startmode>
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="10 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>2</keepFiles>
+  </log>
+</service>
+"@
+}
+
 # --- phase 0 -----------------------------------------------------------------
 
 function Get-MetadataValue {
@@ -351,10 +497,12 @@ function Get-MetadataValue {
       .SYNOPSIS
         Read one metadata value. Empty string when absent.
       .DESCRIPTION
-        Called ONLY in phase 0, and that is a design constraint rather than an
-        accident of ordering: after the fence goes in (phase 2) this script's own
-        access to 169.254.169.254:80 is gone. Everything the boot needs is read
-        here, while the read still works.
+        Called ONLY in phase 0. The original reason was the phase-2 fence, which
+        would have taken this script's own access to 169.254.169.254:80 away; section 3A
+        deleted the fence, so the endpoint stays reachable all boot long. The
+        constraint survives on a different footing: one read site is one place to
+        look when a boot fails on a missing attribute, and a later phase that
+        reads its own metadata is a phase whose inputs no test can construct.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string] $Path)
@@ -463,6 +611,9 @@ function Invoke-Phase0Preflight {
         BeaconScript   = Get-MetadataValue 'instance/attributes/ci-beacon-script'
         BeaconInterval = Get-MetadataValue 'instance/attributes/ci-beacon-interval'
         InstanceName   = Get-MetadataValue 'instance/name'
+        JobSa          = Get-MetadataValue 'instance/attributes/ci-job-service-account'
+        BrokerPort     = Get-MetadataValue 'instance/attributes/ci-job-broker-port'
+        BrokerSource   = Get-MetadataValue 'instance/attributes/ci-job-broker-py'
     }
 
     if ([string]::IsNullOrWhiteSpace($cfg.Owner) -or [string]::IsNullOrWhiteSpace($cfg.Repo)) {
@@ -531,10 +682,38 @@ function Invoke-Phase0Preflight {
 # functions use approved verbs outside that rule's list -- Protect-, Grant-,
 # Initialize- -- and say so rather than leaving the next reader to wonder.
 
+function Get-AclInheritanceFlag {
+    <#
+      .SYNOPSIS
+        The InheritanceFlags an ACE may carry on this path. Pure.
+      .DESCRIPTION
+        A DIRECTORY ACE is inheritable: ContainerInherit + ObjectInherit is what
+        makes the lock apply to everything created underneath it later.
+
+        A FILE ACE may carry NO flags at all, and this is not a style preference.
+        FileSecurity.AddAccessRule REJECTS a rule with inheritance flags on a file:
+
+            Exception calling "AddAccessRule" with "1" argument(s):
+            "No flags can be set. Parameter name: inheritanceFlags"
+
+        That throw lands under the entry point's $ErrorActionPreference = 'Stop',
+        so the wrong constant here is not a cosmetically loose ACL -- it is a host
+        that never finishes booting. Separated out and returned rather than set,
+        so a test can assert both answers without an NTFS volume.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][bool] $IsContainer)
+
+    if ($IsContainer) {
+        return [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    }
+    return [System.Security.AccessControl.InheritanceFlags]::None
+}
+
 function Protect-CiDirectory {
     <#
       .SYNOPSIS
-        Lock one directory to SYSTEM, Administrators and (optionally) one slot.
+        Lock one directory or file to SYSTEM, Administrators and (optionally) one slot.
       .DESCRIPTION
         Windows creates C:\Users\ci-s<i> at first logon with an ACL of the user,
         SYSTEM and Administrators -- the default is already close to what we want.
@@ -552,18 +731,25 @@ function Protect-CiDirectory {
         there, the SCM re-executes it as LocalSystem on every restart and reboot,
         and a slot account able to write it would own SYSTEM on this host without
         ever touching the job boundary.
+
+        -ReadOnlyUser is the job-hook shape: every slot must be able to RUN the
+        file and none may rewrite it. One hook is executed by every slot on the
+        host, so a slot that could write it would be running code in every other
+        slot's identity -- this is the Windows spelling of `chown root:root` plus
+        `0755`, and it is not optional.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string] $Path,
-        [string] $SlotUser
+        [string] $SlotUser,
+        [string[]] $ReadOnlyUser = @()
     )
 
     $acl = Get-Acl -Path $Path
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRule($rule) | Out-Null }
 
-    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $inherit = Get-AclInheritanceFlag -IsContainer ((Get-Item -LiteralPath $Path).PSIsContainer)
     $none = [System.Security.AccessControl.PropagationFlags]::None
     $allow = [System.Security.AccessControl.AccessControlType]::Allow
 
@@ -576,6 +762,9 @@ function Protect-CiDirectory {
     )
     if ($SlotUser) {
         $grants += @{ Id = [System.Security.Principal.NTAccount]::new($SlotUser); Rights = 'Modify' }
+    }
+    foreach ($reader in @($ReadOnlyUser)) {
+        $grants += @{ Id = [System.Security.Principal.NTAccount]::new($reader); Rights = 'ReadAndExecute' }
     }
 
     foreach ($grant in $grants) {
@@ -822,6 +1011,181 @@ function Invoke-Phase1SlotSetup {
     return $provisioned
 }
 
+# --- phase 3: the job credential broker --------------------------------------
+#
+# WHAT THE BROKER IS FOR, NOW THAT THERE IS NO FENCE
+#
+# On Linux the fence removes the host identity from job code and the broker hands
+# back a weaker one. Section 3A is blunt about what that leaves on Windows: job code can
+# reach the metadata server regardless, so a job that wants the host token can
+# mint one, and the broker is therefore largely COSMETIC as a boundary. It is
+# still built, and the ADR is explicit about why rather than dropping it:
+#
+#   * it is what makes the reduced identity WORK. `gcloud builds submit` and
+#     friends need ADC, the host account has been stripped to
+#     serviceAccountTokenCreator on the job account, and the broker is what turns
+#     that grant into a credential a job's tooling finds without being rewritten;
+#   * a job that mints a host token and impersonates gets exactly what the broker
+#     was going to hand it, so the broker costs the attacker nothing and saves
+#     every honest workflow a rewrite;
+#   * it keeps ONE broker contract across both operating systems. The Python is
+#     byte-identical and stays covered by scripts/ci/job-broker.selftest.py.
+#
+# What it is NOT is a security control on this platform, and this comment exists
+# so nobody re-derives one from its presence.
+function Install-JobBrokerService {
+    <#
+      .SYNOPSIS
+        Materialise the broker source and run it under the image's shim.
+      .DESCRIPTION
+        The Python arrives as instance metadata, exactly as the beacon script
+        does and exactly as it does on Linux, so one image keeps serving every
+        pool while the broker stays versioned with the module. The interpreter and
+        the shim do NOT arrive that way: an executable delivered through a channel
+        any process on the VM can write is a different kind of thing entirely.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $SourceText,
+        [Parameter(Mandatory = $true)][string] $JobServiceAccount,
+        [Parameter(Mandatory = $true)][int] $Port
+    )
+
+    if (-not (Test-Path -LiteralPath $script:ServiceShim)) {
+        Deny-Boot ("the service shim $script:ServiceShim is missing -- this image cannot run the " +
+            'job credential broker')
+    }
+    if (-not (Test-Path -LiteralPath $script:PythonExe)) {
+        Deny-Boot ("no interpreter at $script:PythonExe -- this image predates the job credential " +
+            'broker, and a pool with a job service account whose jobs get no credentials fails ' +
+            'at every deploy step instead of at boot')
+    }
+
+    # UTF-8 WITHOUT a BOM. CPython accepts a BOM in a source file, but the broker
+    # is byte-identical to the Linux one by design and a Windows-only BOM would
+    # make the two copies differ for no reason anybody could later explain.
+    [System.IO.File]::WriteAllText($script:BrokerScript, $SourceText,
+        (New-Object System.Text.UTF8Encoding($false)))
+
+    # The config, by contrast, is read by the shim -- same encoding as the
+    # beacon's, for the same 5.1-decodes-a-BOM-less-file-as-ANSI reason.
+    $configPath = Join-Path $script:BinRoot 'ci-job-broker.xml'
+    [System.IO.File]::WriteAllText($configPath,
+        (Get-BrokerServiceConfig -ScriptPath $script:BrokerScript `
+                -JobServiceAccount $JobServiceAccount -Port $Port),
+        (New-Object System.Text.UTF8Encoding($true)))
+
+    # The preference is dropped around the native call for the reason given in
+    # Install-BeaconService: under Stop, `2>&1` on a native command turns each
+    # stderr line into a terminating NativeCommandError, so a shim that merely
+    # warns would abort the boot before the exit-code check below ever runs.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $shimOutput = & $script:ServiceShim 'install' $configPath 2>&1
+    $shimExit = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    foreach ($line in @($shimOutput)) { Write-BootLog "shim: $line" }
+    if ($shimExit -ne 0) {
+        Deny-Boot "the service shim refused to install the job credential broker (exit $shimExit)"
+    }
+
+    Start-Service -Name $script:BrokerServiceName -ErrorAction Stop
+    $svc = Get-Service -Name $script:BrokerServiceName -ErrorAction Stop
+    if ($svc.Status -ne 'Running') {
+        Deny-Boot "the job credential broker service is '$($svc.Status)', not Running"
+    }
+}
+
+function Test-JobBrokerReady {
+    <#
+      .SYNOPSIS
+        Does the broker actually VEND a token? Returns $true when it does.
+      .DESCRIPTION
+        Asserted before any agent registers, because a broker that LOOKS up and
+        vends nothing turns every deploy step into a confusing auth failure at job
+        time -- the Linux script proves the same thing for the same reason. This
+        is the capability, not the daemon: `Get-Service` returning Running is the
+        check that passed on the hosts where nothing worked.
+
+        Each attempt is bounded. A broker that ACCEPTS a connection and never
+        answers would otherwise turn a 30x2s readiness probe into an unbounded
+        wait, which is the 2h55m outage in miniature.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Port,
+        [int] $Attempts = 30,
+        [int] $DelaySeconds = 2
+    )
+    $uri = "http://127.0.0.1:$Port/computeMetadata/v1/instance/service-accounts/default/token"
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            $token = Invoke-RestMethod -Uri $uri `
+                -Headers @{ 'Metadata-Flavor' = 'Google' } `
+                -TimeoutSec $script:HttpTimeoutSeconds
+            # A body, not merely a 200. The broker answers 200 with an error
+            # document on some paths, and "it responded" is the weaker question.
+            if ($token -and $token.access_token) { return $true }
+        } catch {
+            $null = $_
+        }
+        Start-Sleep -Seconds $DelaySeconds
+    }
+    return $false
+}
+
+function Invoke-Phase3JobBroker {
+    <#
+      .SYNOPSIS
+        Start the broker, or decide deliberately that this pool has none.
+      .DESCRIPTION
+        An empty `ci-job-service-account` means no broker and no Google
+        credentials for jobs at all. That is a VALID pool -- a repository whose CI
+        never touches GCP -- and it is never a silent downgrade to the host
+        identity. Said in the log either way, because "no broker" and "broker that
+        failed" must not look the same to whoever reads the boot afterwards.
+
+        Returns the endpoint phase 5 points the slots at, or '' when there is no
+        broker. The empty string is what the slot environment block reads to omit
+        GCE_METADATA_*, which is why it is a return value rather than a flag.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $JobServiceAccount,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $BrokerSource,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $BrokerPort
+    )
+
+    if ([string]::IsNullOrWhiteSpace($JobServiceAccount)) {
+        Write-BootLog ('phase 3: no ci-job-service-account -- no broker, and job code gets no ' +
+            'Google credentials at all. A valid pool, and never a downgrade to the host identity.')
+        return ''
+    }
+
+    # Refused, not defaulted. A port that cannot be parsed serves the same broker;
+    # an identity that cannot be parsed would be somebody else's.
+    $account = $JobServiceAccount.Trim()
+    if (-not (Test-JobServiceAccountName -Name $account)) {
+        Deny-Boot ('ci-job-service-account is not a service-account address -- refusing to put it ' +
+            "in a service definition or a service environment block")
+    }
+
+    if ([string]::IsNullOrWhiteSpace($BrokerSource)) {
+        Deny-Boot ('a job service account is configured but ci-job-broker-py is empty -- every ' +
+            'deploy step on this host would fail at job time with an auth error')
+    }
+
+    $port = Get-BrokerPort -Value $BrokerPort
+    Install-JobBrokerService -SourceText $BrokerSource -JobServiceAccount $account -Port $port
+    if (-not (Test-JobBrokerReady -Port $port)) {
+        Deny-Boot ("the job credential broker did not vend a token on 127.0.0.1:$port -- a host " +
+            'that registers without it turns every deploy step into a confusing auth failure')
+    }
+
+    Write-BootLog "phase 3: job credential broker serving $account on 127.0.0.1:$port"
+    return "127.0.0.1:$port"
+}
+
 function Invoke-Main {
     [CmdletBinding()]
     param()
@@ -833,13 +1197,28 @@ function Invoke-Main {
     # single-slot machine for none.
     $slots = 1
     if ($cfg.Slots -match '^[0-9]+$' -and [int] $cfg.Slots -ge 1) { $slots = [int] $cfg.Slots }
-    Invoke-Phase1SlotSetup -Slots $slots | Out-Null
+    $provisioned = @(Invoke-Phase1SlotSetup -Slots $slots)
+    $slotUsers = @($provisioned | ForEach-Object { $_.User })
 
-    # Phases 2-6 are not here yet, and this host therefore registers no agent.
+    # Before phase 5, and that ordering is the same safety property the rest of
+    # this file is built on: an agent registered before its broker turns every
+    # deploy step into a confusing auth failure at job time.
+    $brokerEndpoint = Invoke-Phase3JobBroker `
+        -JobServiceAccount $cfg.JobSa -BrokerSource $cfg.BrokerSource -BrokerPort $cfg.BrokerPort
+
+    # Said out loud rather than returned into nothing: until phase 5 writes it
+    # onto each slot's service key, the endpoint is the one fact a half-delivered
+    # host can still report, and it is the difference between reading a boot log
+    # and reproducing a boot.
+    if ($brokerEndpoint) {
+        Write-BootLog "phase 3: slots would be pointed at the broker on $brokerEndpoint"
+    }
+
+    # Phases 4-6 are not here yet, and this host therefore registers no agent.
     # Said out loud in the log rather than left as silence, because a host that
     # boots cleanly and serves nothing is otherwise indistinguishable from one
     # that is merely slow to register.
-    Write-BootLog ('phases 2-6 are not delivered yet: this host registers no agent and will be ' +
+    Write-BootLog ('phases 4-6 are not delivered yet: this host registers no agent and will be ' +
         'reclaimed by the register-grace drain')
 }
 
