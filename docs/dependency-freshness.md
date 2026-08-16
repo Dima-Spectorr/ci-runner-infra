@@ -222,6 +222,13 @@ What the image *does* owe the fleet is a baseline that is still supported, and
 nothing was watching that. Now `support-windows-self.yml` does, weekly, and on
 any pull request that touches `packer/`.
 
+**Its first finding was acted on.** `node_major` moved from 22 to 24 on
+2026-08-16 — 22 had been out of active support since 2025-10-21, ten months
+during which no repository, no Dependabot alert and no image rebuild said
+anything. Not to 25, which is a Current line whose support has already ended,
+and not yet to 26, which becomes LTS on 2026-10-28. That date is the next move,
+and it is the scan rather than anyone's memory that will raise it.
+
 ## What it deliberately does not do
 
 **A library with no published support lifetime is not a finding.** Support
