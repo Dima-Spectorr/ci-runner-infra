@@ -135,6 +135,87 @@ else
   bad "controller has no roles/iap.tunnelResourceAccessor — the drain's worker check cannot run"
 fi
 
+# 9. The Windows host identity (ADR §3A). A Windows host cannot fence job code
+#    off the metadata server — Windows Firewall resolves an explicit block ahead
+#    of every conflicting allow, and the one documented override needs IPsec the
+#    metadata server does not speak — so job code can mint a token for whatever
+#    the host account is. The boundary is therefore the SIZE of that account:
+#    tokenCreator on the job account, and nothing else. Each grant below dropping
+#    out on `host_os = "windows"` is the whole control.
+for res in \
+  'resource "google_secret_manager_secret_iam_member" "runner_reads_key"' \
+  'resource "google_project_iam_member" "metrics"' \
+  'resource "google_project_iam_member" "logs"'; do
+  if matches "$(block "^${res}" "$IDENTITY/main.tf")" '^  count = local\.host_grants'; then
+    ok "host grant drops out on windows: ${res##* }"
+  else
+    bad "${res##* } is unconditional — a Windows host account keeps it, and any pull request running on that host can mint a token that holds it"
+  fi
+done
+
+if matches "$(block '^locals \{' "$IDENTITY/main.tf")" 'host_grants = var\.host_os == "windows" \? 0 : 1'; then
+  ok "host_grants is 0 on windows and 1 on linux"
+else
+  bad "host_grants no longer reduces the host account on windows"
+fi
+
+# 10. And Linux keeps every one of them. `host_os` defaults to linux, so a
+#     consumer that says nothing gets today's identity exactly; a default of
+#     "windows", or no default at all, would silently strip a working Linux
+#     fleet of the grant its hosts mint registration tokens with.
+if matches "$(block '^variable "host_os"' "$IDENTITY/variables.tf")" '^  default     = "linux"'; then
+  ok "host_os defaults to linux, so an existing pool is unchanged"
+else
+  bad "host_os does not default to linux — existing pools would change identity on their next apply"
+fi
+
+# 11. Making those three conditional adds `[0]` to their addresses, and
+#     Terraform treats `X` and `X[0]` as different objects. Without a `moved`
+#     block the next apply of every EXISTING pool destroys and recreates live
+#     IAM — a window in which hosts cannot read the App key and cannot register,
+#     caused by a change that is supposed to leave Linux alone.
+#
+#     BOTH addresses are asserted, and as a PAIR inside one block. Checking only
+#     the `to` line is the vacuous version of this test: a typo'd or stale `from`
+#     names an address that is not in state, so the move is a no-op, the real
+#     resource is still destroyed and recreated, and the check that was supposed
+#     to prevent exactly that still says ok. awk pairs them per block so a `from`
+#     borrowed from the neighbouring block cannot satisfy it either.
+moved_pair() { # <address> -> yes|no
+  awk -v a="$1" '
+    /^moved \{/ { f=""; t=""; inb=1; next }
+    inb && /^\}/ { if (f == a && t == a "[0]") { print "yes"; exit } inb=0; next }
+    inb && $1 == "from" { f=$3 }
+    inb && $1 == "to"   { t=$3 }
+  ' "$IDENTITY/main.tf"
+}
+for addr in \
+  'google_secret_manager_secret_iam_member.runner_reads_key' \
+  'google_project_iam_member.metrics' \
+  'google_project_iam_member.logs'; do
+  if matches "$(moved_pair "$addr")" '^yes$'; then
+    ok "state move declared for $addr"
+  else
+    bad "no moved block pairing $addr with ${addr}[0] — an existing pool will DESTROY and recreate this binding"
+  fi
+done
+
+# 12. The reduction only means anything while the controller is a separate
+#     account. Collapsed onto the host account, the App-key read and
+#     instance-admin are back on the machine that runs pull-request code, and
+#     every check above still passes.
+if matches "$(block 'resource "google_service_account" "runner"' "$IDENTITY/main.tf")" 'var\.host_os != "windows" \|\| var\.create_controller_service_account'; then
+  ok "a windows pool is refused without the controller split"
+else
+  bad "nothing stops host_os = windows with create_controller_service_account = false, which hands the App key straight back to job code"
+fi
+
+# Checks 13 and 14 — the pool's `controller_mints_registration_token` input and
+# the metadata key it gates — assert `modules/ci-runner-host-pool`, which this
+# pull request does not ship. They land with that module, in the controller-minted
+# registration pull request stacked on this one. A self-test asserting a file its
+# own pull request does not contain is a red gate on `main`, not coverage.
+
 if [ "$fail" -eq 0 ]; then
   echo "  identity split intact."
 else
