@@ -64,6 +64,20 @@ jobs:
       - name: workflow shell gate
         run: bash scripts/ci/check-workflow-shell.sh
 
+      # And those sweeps read the shell as shell, which leaves one interpreter
+      # question they cannot ask: a packer `inline` block is a script whose
+      # shebang is set by `inline_shebang`, defaulting to `/bin/sh` — dash on
+      # Ubuntu — no matter what `execute_command` says a line below it. A
+      # `set -o pipefail` there is valid shell that dies on the guest, four
+      # minutes into a forty-minute image build, and only for whoever builds an
+      # image next; nobody's CI runs packer, so nothing else in this file would
+      # ever have caught it.
+      - name: packer inline shell gate self-test
+        run: bash scripts/ci/check-packer-inline-shell.sh --selftest
+
+      - name: packer inline shell gate
+        run: bash scripts/ci/check-packer-inline-shell.sh
+
       # Those three sweeps read `*.sh` and `run:` blocks, and are blind to a
       # `.ps1`. Windows hosts are driven by PowerShell, so the fleet is about to
       # grow code that no gate in this file can read. These three steps land one
