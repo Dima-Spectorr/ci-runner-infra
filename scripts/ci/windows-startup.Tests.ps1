@@ -785,6 +785,132 @@ Describe 'service logon account' {
     }
 }
 
+Describe 'boot logging stays out of the success stream' {
+    # THIS IS THE ONE BLOCK IN THIS FILE THAT MUST NOT MOCK Write-BootLog.
+    #
+    # Every other impure test here does `Mock -CommandName Write-BootLog
+    # -MockWith { }`, and that mock is exactly what hid a boot-fatal bug for the
+    # life of this suite. Write-BootLog used `Write-Output`, which puts the line
+    # on the SUCCESS stream, so every function that logged and then returned a
+    # value returned an object[] of the log lines followed by the value:
+    # Invoke-Phase0Preflight could not dot-source the beacon path it had just
+    # captured, Register-SlotAgent's [string] -RegistrationToken received the
+    # array space-joined into one string with a timestamped log line on the
+    # front, and Invoke-Phase5Registration's [IDictionary] -Config would not
+    # bind at all. Mocking the logger away makes every one of those disappear.
+    #
+    # So these cases RUN the real Write-BootLog and assert on the shape of what
+    # a caller gets back. The bash gate (windows-host-startup.selftest.sh)
+    # asserts the text; this asserts the behaviour, on the runtime, where the
+    # array either is or is not there.
+    BeforeEach {
+        # The real path is C:\ci\ci-host.log, which does not exist on
+        # ubuntu-latest -- Write-BootLog would swallow the failure and the test
+        # would still be meaningful, but pointing it somewhere writable lets the
+        # last case assert the file half is still doing its job.
+        $script:LogPathBefore = $script:LogPath
+        $script:LogPath = Join-Path ([System.IO.Path]::GetTempPath()) `
+            ('ci-host-' + [guid]::NewGuid().ToString('N') + '.log')
+    }
+
+    AfterEach {
+        Remove-Item -LiteralPath $script:LogPath -Force -ErrorAction SilentlyContinue
+        $script:LogPath = $script:LogPathBefore
+    }
+
+    It 'lets a function that logs return its value as a scalar' {
+        # The shape of Install-BeaconService: log, log, return a path. Phase 0
+        # captures that path and dot-sources it, which an object[] cannot be.
+        function Invoke-LogThenReturnPath {
+            Write-BootLog 'shim: installed'
+            Write-BootLog 'phase 0: beacon service running, interval 30s'
+            return 'C:\ci\bin\ci-beacon.ps1'
+        }
+
+        $captured = Invoke-LogThenReturnPath
+        @($captured).Count | Should -Be 1
+        $captured | Should -BeOfType ([string])
+        $captured | Should -Be 'C:\ci\bin\ci-beacon.ps1'
+    }
+
+    It 'hands a captured token to a [string] parameter with no log line joined to it' {
+        # The shape of Wait-RegistrationToken into Register-SlotAgent. An
+        # object[] bound to [string] is joined with spaces rather than refused,
+        # which is why this failed silently: config.cmd got a real token with a
+        # timestamped log line in front of it and reported an auth error.
+        function Invoke-LogThenReturnToken {
+            Write-BootLog 'phase 5: registration token present'
+            return 'AABBCC112233'
+        }
+        function Test-TokenParameter {
+            param([Parameter(Mandatory = $true)][string] $RegistrationToken)
+            return $RegistrationToken
+        }
+
+        Test-TokenParameter -RegistrationToken (Invoke-LogThenReturnToken) |
+            Should -Be 'AABBCC112233'
+    }
+
+    It 'returns a config that still binds to an [IDictionary] parameter' {
+        # The shape of Invoke-Phase0Preflight into Invoke-Phase5Registration.
+        # Member access such as $cfg.Slots survives the pollution by member
+        # enumeration -- which is precisely why the fault read as working -- and
+        # the parameter bind is where it actually stops.
+        function Invoke-LogThenReturnConfig {
+            Write-BootLog 'phase 0: preflight'
+            Write-BootLog 'phase 0: image version 4 >= 1'
+            Write-BootLog 'phase 0: ci/boot published'
+            return [ordered] @{ Owner = 'owner'; Repo = 'repo' }
+        }
+        function Test-ConfigParameter {
+            param([Parameter(Mandatory = $true)][System.Collections.IDictionary] $Config)
+            return $Config.Owner
+        }
+
+        $cfg = Invoke-LogThenReturnConfig
+        @($cfg).Count | Should -Be 1
+        Test-ConfigParameter -Config $cfg | Should -Be 'owner'
+    }
+
+    It 'keeps a collected list of slot records free of log lines' {
+        # The shape of Invoke-Phase1SlotSetup: a loop that appends one hash
+        # table per slot while the callee logs. Polluted, the array carries
+        # strings between the records, $_.User is $null for each of them, and
+        # the phase 5 count is wrong on a host whose every log line says success.
+        function Invoke-LogThenReturnRecord {
+            param([int] $Index)
+            Write-BootLog "phase 1: slot $Index provisioned as ci-s$Index"
+            return @{ Index = $Index; User = "ci-s$Index" }
+        }
+
+        $collected = @()
+        for ($i = 1; $i -le 3; $i++) { $collected += (Invoke-LogThenReturnRecord -Index $i) }
+        $collected.Count | Should -Be 3
+        # Joined rather than compared element-wise: a polluted array yields a
+        # $null User for every log line it carries, and an empty segment in this
+        # string is exactly what that looks like.
+        (@($collected | ForEach-Object { $_.User }) -join ',') |
+            Should -Be 'ci-s1,ci-s2,ci-s3'
+    }
+
+    It 'still writes the line to the boot log, and still survives losing it' {
+        Write-BootLog 'phase 0: preflight'
+        (Get-Content -Raw -LiteralPath $script:LogPath) | Should -Match 'phase 0: preflight'
+
+        # The other half of Write-BootLog is deliberately unchanged: the log is
+        # diagnostics, and losing it must never stop a boot. Restored afterwards
+        # so AfterEach still cleans up the file the first half created.
+        $writable = $script:LogPath
+        try {
+            $script:LogPath = Join-Path ([System.IO.Path]::GetTempPath()) `
+                (Join-Path ('no-such-dir-' + [guid]::NewGuid().ToString('N')) 'ci-host.log')
+            { Write-BootLog 'phase 0: preflight' } | Should -Not -Throw
+        } finally {
+            $script:LogPath = $writable
+        }
+    }
+}
+
 Describe 'boot log redaction' {
     It 'strikes the registration token out of a captured line' {
         Get-RedactedLine -Line 'config: --token AABBCC ok' -Secret 'AABBCC' |
