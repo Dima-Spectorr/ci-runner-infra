@@ -70,6 +70,60 @@ locals {
     file("${path.module}/scripts/host-startup.sh"),
   ])
 
+  # The Windows boot script. Terraform evaluates both arms of a conditional, so
+  # this is read whatever the pool's OS is; one name for the text is worth the
+  # read.
+  windows_host_startup = file("${path.module}/scripts/windows-host-startup.ps1")
+
+  # EXACTLY ONE boot-script key, chosen by OS. This is the only thing `host_os`
+  # switches on the template itself; everything else it does is a refusal below.
+  #
+  # Getting the pair wrong is the worst-behaved failure in this system, and it
+  # does not present as a failure at all: the guest agent looks for the key that
+  # belongs to ITS platform and no other, so a Windows instance carrying
+  # `startup-script`, or a Linux one carrying `windows-startup-script-ps1`, runs
+  # NO boot script whatsoever. The host comes up healthy, registers zero agents,
+  # is drained at `register_grace_seconds` as a failed boot, is rebuilt from the
+  # same template, and the pool churns hosts at full price forever while every
+  # metric reads "hosts running". A script that never started cannot assert
+  # anything about the mistake, which is why the image pairing is refused at
+  # plan time instead.
+  boot_script_metadata = var.host_os == "windows" ? {
+    "windows-startup-script-ps1" = local.windows_host_startup
+    } : {
+    "startup-script" = local.host_startup
+  }
+
+  # Windows-only keys, MERGED IN rather than written with an empty value, so a
+  # Linux pool renders the same key set it renders today.
+  windows_host_metadata = var.host_os == "windows" ? {
+    # Guest attributes are off unless the instance asks for them, and the
+    # liveness beacon is a PUT to that namespace. Without this the host's first
+    # beacon write fails and it refuses to register — the designed outcome, for
+    # a reason nobody would find from the boot log alone.
+    "enable-guest-attributes" = "TRUE"
+
+    # The publisher travels as metadata for the same reason the broker source
+    # does: ONE image keeps serving every pool while the code stays versioned
+    # with the module and covered by the module's own tests.
+    "ci-beacon-script" = file("${path.module}/scripts/windows-beacon-publisher.ps1")
+
+    # The image CONTRACT floor. Absent, the boot script falls back to 1 and a
+    # host will boot from an image predating whatever the script now assumes,
+    # failing at the first service install rather than at phase 0 by name.
+    "ci-image-min-version" = tostring(var.windows_image_min_version)
+  } : {}
+
+  # A string check on the family name is a heuristic, not a proof. It catches
+  # the one mistake that actually happens — a consumer duplicates the Linux
+  # module block, sets `host_os`, and forgets the image — and its alternative is
+  # the silent churn loop above. `ci-runner-host-win` contains the Linux family
+  # as a substring, so the Windows test runs first and the Linux one is its
+  # complement; testing them independently would score every Windows image as
+  # both.
+  image_names_windows_family = can(regex("ci-runner-host-win", var.image))
+  image_names_linux_family   = can(regex("ci-runner-host", var.image)) && !local.image_names_windows_family
+
   # The controller carries its decision rules and the telemetry publisher inline
   # so a running controller never depends on fetching code at runtime. They are
   # separate files in the repo precisely so they can be unit-tested; embedding
@@ -191,8 +245,13 @@ resource "google_compute_instance_template" "host" {
     instance_termination_action = var.spot ? "DELETE" : null
   }
 
-  metadata = {
-    startup-script = local.host_startup
+  metadata = merge(local.boot_script_metadata, local.windows_host_metadata, {
+    # What this host IS, said rather than inferred. The boot script asserts it
+    # against the platform it is actually running on, and the controller reads
+    # it to choose which liveness gate applies to the host it is about to
+    # delete. Inferring an OS from the absence of a key is how a mis-wired pool
+    # gets a confident wrong answer.
+    "ci-host-os" = var.host_os
 
     # Everything the host needs to know about itself arrives as metadata, so
     # ONE image serves every pool in every repository and every project. There
@@ -234,7 +293,7 @@ resource "google_compute_instance_template" "host" {
     # Hosts are cattle managed by the controller; interactive login is not the
     # supported way to inspect one. Logs go to Cloud Logging.
     "block-project-ssh-keys" = "true"
-  }
+  })
 
   lifecycle {
     create_before_destroy = true
@@ -265,6 +324,76 @@ resource "google_compute_instance_template" "host" {
     precondition {
       condition     = var.demand_budget_seconds <= max(300, var.poll_interval_seconds * 10) - 120
       error_message = "demand_budget_seconds must leave at least 120s of the watchdog threshold (max(300, poll_interval_seconds * 10)) for the rest of the tick — otherwise the watchdog restarts the controller mid-tick, the restart prevents the heartbeat, and it never publishes again."
+    }
+
+    # --- what a Windows pool must refuse to plan with -------------------------
+    #
+    # A failure at plan costs a review comment; the same mistake at boot costs a
+    # churning MIG that reports itself as a healthy pool. Every one of these is
+    # here rather than in the variable's own `validation` block for the reason
+    # the two above are: cross-variable validation needs Terraform 1.9 and this
+    # module supports >= 1.5.
+
+    # The copy-paste error, in both directions. Neither host runs the other's
+    # boot script — it runs NOTHING, because the guest agent finds no key for
+    # its platform, and the pool churns hosts forever at full price while every
+    # metric reads "hosts running".
+    precondition {
+      condition     = var.host_os != "windows" || !local.image_names_linux_family
+      error_message = "host_os = \"windows\" was given the Linux golden image family — build the Windows image from packer/ci-host-image-win.pkr.hcl (family ci-runner-host-win). A Windows instance whose image expects `startup-script` runs no boot script at all, registers nothing, and is drained and rebuilt from the same template forever."
+    }
+
+    precondition {
+      condition     = var.host_os != "linux" || !local.image_names_windows_family
+      error_message = "host_os = \"linux\" was given the Windows golden image family (ci-runner-host-win) — a Linux instance carrying `windows-startup-script-ps1` runs no boot script at all, so the host boots healthy, registers zero agents, and the pool churns hosts at full price."
+    }
+
+    # Nothing on a Windows host reads this list: there is no container runtime,
+    # so no credential helper and no docker config to write it into. Accepting
+    # it would be the worst kind of no-op — the apply is clean and the failure
+    # arrives inside a job as an unauthenticated pull.
+    precondition {
+      condition     = var.host_os != "windows" || length(var.extra_registry_hosts) == 0
+      error_message = "extra_registry_hosts is not supported on host_os = \"windows\" — a Windows pool has no container runtime and nothing reads the list, so accepting it would apply clean and fail later as an unauthenticated pull inside a job."
+    }
+
+    # Spot is wrong for CI on any OS and is only being narrowed here, where no
+    # existing pool can break: a preemption takes every slot on the host with
+    # it, on a machine whose boot is measured in minutes, and Windows Server is
+    # billed per vCPU-hour whatever the provisioning model.
+    precondition {
+      condition     = var.host_os != "windows" || !var.spot
+      error_message = "spot = true is refused on host_os = \"windows\" — a preemption kills every slot on a host whose boot costs minutes, and Windows Server is licensed per vCPU-hour regardless of provisioning model, so the saving is smaller than the jobs it destroys."
+    }
+
+    # The 600s default is calibrated to a Linux boot plus K x config.sh. A
+    # Windows first boot plus K local-account creations plus K x
+    # `config.cmd --runasservice` does not fit in it, and the consequence of not
+    # fitting is precisely the churn loop this input exists to prevent — the
+    # controller reads a booting host as a dead one, sometimes between the
+    # verdict and the agents coming up.
+    precondition {
+      condition     = var.host_os != "windows" || var.register_grace_seconds >= 1200
+      error_message = "register_grace_seconds must be at least 1200 on host_os = \"windows\" — the default of 600 is calibrated to a Linux boot, and a controller that reads a still-booting Windows host as a dead one drains it, sometimes between the verdict and its agents coming up."
+    }
+
+    # Windows, plus the build toolchains, plus the warm cache, plus K
+    # workspaces, plus a pagefile. A host that fills its disk mid-job fails
+    # every slot at once and reports it as a repository problem.
+    precondition {
+      condition     = var.host_os != "windows" || var.boot_disk_size_gb >= 200
+      error_message = "boot_disk_size_gb must be at least 200 on host_os = \"windows\" — Windows plus the toolchains plus the warm cache plus a workspace per slot plus a pagefile does not fit below that, and a host that fills its disk mid-job fails every slot at once and reports it as a repository problem."
+    }
+
+    # The one guard available at plan time for the §3A reduction. A Windows host
+    # account holds no Secret Manager grant, so it cannot mint its own
+    # registration token — and a pool that DOES leave that grant in place is the
+    # one that happens to work today, which is exactly why it has to be refused
+    # deliberately rather than left to fail. Terraform cannot see what IAM a
+    # passed-in account holds; the real check is the host's own boot probe.
+    precondition {
+      condition     = var.host_os != "windows" || var.controller_mints_registration_token
+      error_message = "host_os = \"windows\" requires controller_mints_registration_token = true — a Windows host account is stripped of the App-key read (ci-runner-identity's host_os) because job code on a Windows host can mint a token for it, so a host left to mint its own registration token never registers, and one that CAN is the pool that hands a pull request the GitHub App private key."
     }
   }
 }
@@ -428,6 +557,7 @@ resource "google_compute_instance" "controller" {
     # against THIS list, so a controller without it matches no job at all,
     # reports zero demand forever, and the pool never leaves zero hosts.
     "ci-runner-labels"           = local.runner_labels
+    "ci-host-os"                 = var.host_os
     "ci-mig-name"                = google_compute_region_instance_group_manager.hosts.name
     "ci-region"                  = var.region
     "ci-slots"                   = tostring(var.slots_per_host)
