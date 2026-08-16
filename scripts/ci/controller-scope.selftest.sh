@@ -157,5 +157,447 @@ grep -q 'RUNNER_LIST_STATUS="$(cat "$STATE_DIR/api.status"' "$CTRL" \
   && r=yes || r=no
 check "collect_runners reads the persisted status" yes "$r"
 
+# ── the host row, and the empty field that silently shifts it ────────────────
+#
+# collect_hosts gained a fourth column (the instance self-link, the only place
+# the controller learns a host's zone). With gcloud's `value()` the columns are
+# TAB separated, tab is IFS whitespace, and a run of IFS whitespace COLLAPSES:
+# one empty field shifts every later field left by one. `instanceStatus` is
+# empty for an instance the MIG is still CREATING — every scale-out — so the
+# self-link would land in `host_tpl` and template_state would call a booting
+# host `stale` instead of the `unknown` the recycle fail-safe is built on.
+# CSV fixes it because a comma is not IFS whitespace. Both halves are asserted:
+# the format gcloud is asked for, and the IFS the readers actually use.
+row() { # <line> <ifs> -> a|b|c|d
+  printf '%s\n' "$1" | {
+    IFS="$2" read -r a b c d
+    printf '%s|%s|%s|%s' "$a" "$b" "$c" "$d"
+  }
+}
+check "host row: an empty status does not shift the later fields" \
+  "h1||tpl-a|https://x/zones/z/instances/h1" \
+  "$(row 'h1,,tpl-a,https://x/zones/z/instances/h1' ,)"
+# The negative control: the same row under the OLD separator, so the failure
+# this guards against is demonstrated rather than asserted.
+check "host row: the tab-separated shape really did shift" \
+  "h1|tpl-a|https://x/zones/z/instances/h1|" \
+  "$(row "$(printf 'h1\t\ttpl-a\thttps://x/zones/z/instances/h1')" "$(printf '\t')")"
+
+# shellcheck disable=SC2016
+grep -q 'format="csv\[no-heading\](instance.basename(),instanceStatus,' "$CTRL" && r=yes || r=no
+check "host row: collect_hosts asks gcloud for CSV" yes "$r"
+r=$(grep -c 'while IFS=, read -r host status host_tpl host_uri' "$CTRL")
+check "host row: both host walks split on the comma" 2 "$r"
+r=$(grep -c "awk -F, '{ *\(if (\$1 != \"\") \)\?print \$1" "$CTRL")
+check "host row: both awk readers split on the comma" 2 "$r"
+
+# ── the registration token, and the delete that is the whole point ───────────
+#
+# On a Windows pool the controller mints each host's runner registration token
+# and writes it to that instance's metadata, because the host account no longer
+# holds the Secret Manager grant it would need to mint its own (ADR §3A). Job
+# code on that host can READ instance metadata — there is no Windows mechanism
+# that stops it — so DELETING the key once the agents register is the security
+# property, not housekeeping. GitHub's own bound is a whole hour.
+#
+# Grepping for a `remove-metadata` would not prove it: the delete has to happen
+# on the right branch, only once the agents are really in GitHub's runner list,
+# and it has to survive the marker bookkeeping. So the sequence is RUN against a
+# fake compute API and judged on the calls it made. `gcloud`, `curl` and `jq`
+# are shell functions, so this needs no fixture directory and no network.
+# shellcheck disable=SC2016
+reg_seq() { # <reg> <age> <pre> <status> [busy] [add-rc] [del-rc] [mutation-sed]
+  #          [created-ago] [instance-key] [describe-rc] [facts-mutation-sed]
+  # <pre> is a comma list of pre-existing markers, from:
+  #   minted  keylive  cordon  fails=<n>
+  # <created-ago>, <instance-key> and <describe-rc> are the DURABLE facts — what
+  # the GCE API says, as opposed to what the controller's disk says. They default
+  # to the ordinary case: an instance created just now, carrying no registration
+  # token, readable. <instance-key> is `present`, `absent` or `none` (an instance
+  # with no metadata at all, which flattens to no output at exit 0).
+  # The last argument mutates `instance_durable_facts` rather than the step, so
+  # the gcloud invocation itself can be reverted and seen to fail.
+  # -> adds|removes|minted?|keylive?|fails=<n>
+  local reg="$1" age="$2" pre="${3:-}" status="${4:-RUNNING}" busy="${5:-0}"
+  local arc="${6:-0}" drc="${7:-0}" mut="${8:-}"
+  local cago="${9:-0}" ikey="${10:-absent}" derc="${11:-0}" dmut="${12:-}"
+  local dir out step facts m
+  dir=$(mktemp -d)
+  : >"$dir/calls"
+  for m in ${pre//,/ }; do
+    case "$m" in
+      minted) : >"$dir/regtoken-h1" ;;
+      keylive) : >"$dir/regkey-h1" ;;
+      cordon) : >"$dir/cordon-h1" ;;
+      fails=*) printf '%s' "${m#fails=}" >"$dir/regfail-h1" ;;
+    esac
+  done
+
+  step=$(fn registration_token_step)
+  [ -n "$mut" ] && step=$(printf '%s\n' "$step" | sed "$mut")
+  facts=$(fn instance_durable_facts)
+  [ -n "$dmut" ] && facts=$(printf '%s\n' "$facts" | sed "$dmut")
+
+  out=$(
+    bash -c "
+      set -uo pipefail
+      STATE_DIR='$dir'
+      REG_TOKEN_KEY=ci-registration-token
+      REGISTER_GRACE=600
+      PROJECT=test-project
+      REPO_FULL=test-owner/test-repo
+      CURL_TIMEOUTS=(--connect-timeout 10 --max-time 30)
+      log() { :; }
+      gh_token() { echo installation-token; }
+      curl() { echo '{\"token\":\"REGTOKEN\"}'; }
+      jq() { echo REGTOKEN; }
+      mktemp() { echo '$dir/tokfile'; }
+      chmod() { :; }
+      timeout() { shift; \"\$@\"; }
+      gcloud() {
+        echo \"\$*\" >>'$dir/calls'
+        # A stub that accepts every flag is not a test double, it is a blindfold.
+        # This one shipped a \`describe --filter\` — a list-family flag \`describe\`
+        # rejects with exit 2 — past 51 green checks, and the result would have
+        # been a pool where nothing ever minted and no host ever registered. So
+        # \`describe\` now takes an ALLOW-LIST, and anything else fails the way
+        # real gcloud fails.
+        case \"\$*\" in
+          *'instances describe'*)
+            local a
+            for a in \"\$@\"; do
+              case \"\$a\" in
+                compute | instances | describe | h1) ;;
+                --project=* | --zone=* | --format=* | --flatten=*) ;;
+                *)
+                  echo \"ERROR: (gcloud.compute.instances.describe) unrecognized arguments: \$a\" >&2
+                  return 2 ;;
+              esac
+            done ;;
+        esac
+        case \"\$*\" in
+          *add-metadata*) return $arc ;;
+          *remove-metadata*) return $drc ;;
+          # The GCE API's own answers. An RFC3339 stamp with fractional seconds
+          # and an offset, because that is the shape GCE returns and the parse
+          # has to survive it.
+          *creationTimestamp*)
+            [ $derc -eq 0 ] || return $derc
+            date -u -d \"@\$((\$(date -u +%s) - $cago))\" +%Y-%m-%dT%H:%M:%S.000-00:00
+            return 0 ;;
+          *metadata.items.key*)
+            [ $derc -eq 0 ] || return $derc
+            # The WHOLE key set, one per line — which is what the real
+            # projection returns, there being no --filter to narrow it. The
+            # absent case still prints a key, and one whose name CONTAINS the
+            # real one, so a substring match would read it as present.
+            case '$ikey' in
+              present) printf '%s\n' instance-template ci-registration-token created-by ;;
+              absent) printf '%s\n' instance-template ci-registration-token-old created-by ;;
+              none) : ;;
+            esac
+            return 0 ;;
+          *) return $drc ;;
+        esac
+      }
+      $(fn write_registration_token)
+      $(fn delete_registration_token)
+      $facts
+      $step
+      registration_token_step h1 https://c/zones/test-zone-a/instances/h1 '$reg' '$age' '$status' '$busy'
+    " 2>&1
+  )
+  [ -z "$out" ] || { printf 'shell-error: %s' "$(printf '%s' "$out" | head -1)"; rm -rf "$dir"; return; }
+
+  printf '%s|%s|%s|%s|%s' \
+    "$(grep -c 'add-metadata' "$dir/calls")" \
+    "$(grep -c 'remove-metadata' "$dir/calls")" \
+    "$([ -f "$dir/regtoken-h1" ] && echo minted || echo no-minted)" \
+    "$([ -f "$dir/regkey-h1" ] && echo keylive || echo no-keylive)" \
+    "fails=$(cat "$dir/regfail-h1" 2>/dev/null || echo 0)"
+  rm -rf "$dir"
+}
+
+# A host that has not registered yet gets exactly one token, and `minted` is
+# what stops the next tick minting a second.
+check "regtoken: absent host is minted a token" "1|0|minted|keylive|fails=0" "$(reg_seq absent 30)"
+check "regtoken: a token already written is not re-minted" "0|0|minted|keylive|fails=0" \
+  "$(reg_seq absent 30 minted,keylive)"
+
+# THE CHECK THIS FILE EXISTS FOR.
+check "regtoken: the key is DELETED once the agents register" "0|1|minted|no-keylive|fails=0" \
+  "$(reg_seq present 120 minted,keylive)"
+
+# …and it is deleted even when this controller has no record of writing it. The
+# markers live on a boot disk the controller can lose and a sweep can clear; if
+# the delete needed one, losing it would strand a live credential in metadata
+# for GitHub's whole hour with nothing left to come back for it.
+check "regtoken: a registered host with no marker is still cleaned" "0|1|minted|no-keylive|fails=0" \
+  "$(reg_seq present 120 '')"
+check "regtoken: a host already cleaned is not called about again" "0|0|minted|no-keylive|fails=0" \
+  "$(reg_seq present 120 minted)"
+
+# A host that never comes up must not sit on a live credential until GitHub
+# expires it an hour later — and must not be minted a fresh one either.
+check "regtoken: the key is deleted when the register grace expires" "0|1|minted|no-keylive|fails=0" \
+  "$(reg_seq absent 900 minted,keylive)"
+check "regtoken: inside the grace the key is left for the booting host" "0|0|minted|keylive|fails=0" \
+  "$(reg_seq absent 300 minted,keylive)"
+check "regtoken: past the grace no first token is minted either" "0|0|no-minted|no-keylive|fails=0" \
+  "$(reg_seq absent 900 '')"
+
+# A CORDONED host is the dangerous one: its agents were deregistered on purpose
+# so it reads `absent` forever, while the job it was running keeps executing.
+# Minting for it would write a fresh hour-long credential into the metadata of
+# the very pull request it is meant to be protected from — every other tick,
+# indefinitely.
+check "regtoken: a cordoned host is never minted a token" "0|0|no-minted|no-keylive|fails=0" \
+  "$(reg_seq absent 30 cordon)"
+check "regtoken: a cordoned host's live key is taken back at once" "0|1|minted|no-keylive|fails=0" \
+  "$(reg_seq absent 30 cordon,keylive)"
+
+# Only a host that is actually coming up. A TERMINATED instance the MIG still
+# lists has nothing to register with.
+check "regtoken: a terminated host is not minted a token" "0|0|no-minted|no-keylive|fails=0" \
+  "$(reg_seq absent 30 '' TERMINATED)"
+
+# PARTIAL — one slot registered, the rest not. This shipped in the same mint arm
+# as `absent`, and it is the more dangerous of the two: a registered slot can
+# ALREADY be executing a pull request, and that job reads the metadata key. And
+# it does not self-correct, because host_age_seconds is controller-local — a
+# replaced controller reads every host as age 0, so a SLOTS=2 host with slot 1
+# running a job and slot 2 dead reads `partial` indefinitely and never reaches
+# the `present` delete. Mint on `absent` only; on `partial`, take it back.
+check "regtoken: a partly registered host is NOT minted a token" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq partial 0 '')"
+check "regtoken: a partly registered host's key is taken back" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq partial 0 minted,keylive)"
+
+# M-4. The marker-less recovery delete used to read `present` only, and the
+# expiry chain above it is gated on `[ -f "$keylive" ]`. So a `partial` host that
+# lost its markers — the sweep, a replaced controller — had NO path to a delete
+# at all, and held a live key until GitHub expired it an hour later, on a host
+# where the registered slot may already be running the pull request that reads
+# it. The case above is that host: `partial`, no markers, and the second field
+# must be a 1.
+#
+# `unknown` stays excluded and this is the case that says so. Deleting on a
+# blind tick would strand a genuinely booting host with no way to register, and
+# that exposure is bounded by GitHub's own hour, which is the trade the ADR
+# already states.
+check "regtoken: M-4 — a marker-less blind tick is still NOT deleted from" \
+  "0|0|no-minted|no-keylive|fails=0" "$(reg_seq unknown 0 '')"
+
+# BUSY is the strongest statement that job code is executing right now, and it
+# is passed in rather than re-derived so the guard cannot be skipped by a caller.
+check "regtoken: a busy host is never minted a token" \
+  "0|0|no-minted|no-keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 1)"
+check "regtoken: a busy host's live key is taken back" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq absent 0 minted,keylive RUNNING 1)"
+
+# A blind tick knows nothing about this host's AGENTS. It must not hand out a
+# credential on a guess, nor pull one away from a host that may be mid-register.
+check "regtoken: an unreadable runner list mints nothing" "0|0|no-minted|no-keylive|fails=0" \
+  "$(reg_seq unknown 30 '')"
+check "regtoken: an unreadable runner list leaves a booting host alone" "0|0|minted|keylive|fails=0" \
+  "$(reg_seq unknown 120 minted,keylive)"
+
+# …but `unknown` is not an exemption from the EXPIRY. It is set for every host
+# at once whenever the runner list read fails, and this repo has seen 36
+# consecutive blind ticks; a rule that only expires on a known reg state leaves
+# a live token in job-readable metadata on every Windows host for the whole
+# outage, cordoned ones included. `cordon`, `busy` and `age` are all still known
+# locally during a blind tick, and the delete is idempotent.
+check "regtoken: a blind tick still takes back a cordoned host's key" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq unknown 99999 minted,keylive,cordon)"
+check "regtoken: a blind tick still expires a key past the grace" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq unknown 99999 minted,keylive)"
+check "regtoken: a blind tick still takes back a busy host's key" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq unknown 30 minted,keylive RUNNING 1)"
+
+# THE ERROR PATHS, which is where both of the review's blocking findings lived.
+# A write that reports failure may still have committed server-side, so it is
+# followed by a delete and the key is NOT recorded as written; a delete that
+# fails keeps `keylive` so the next tick tries again.
+check "regtoken: a failed write takes the key back and does not claim it" \
+  "1|1|no-minted|no-keylive|fails=1" "$(reg_seq absent 30 '' RUNNING 0 1 0)"
+
+# …and it gives up after three. Retrying a failed write once a tick is a
+# registration-token POST per tick against the App installation the queue poll
+# shares, and the failure it retries hardest — a `timeout` on a setMetadata that
+# committed anyway — parks another live credential each time round.
+check "regtoken: minting gives up after three failed writes" \
+  "0|0|no-minted|no-keylive|fails=3" "$(reg_seq absent 30 fails=3 RUNNING 0 1 0)"
+check "regtoken: a success clears the failure count" \
+  "1|0|minted|keylive|fails=0" "$(reg_seq absent 30 fails=2)"
+check "regtoken: a failed delete keeps the key on the books for a retry" \
+  "0|1|minted|keylive|fails=0" "$(reg_seq present 120 minted,keylive RUNNING 0 0 1)"
+
+# ── H-3: the controller replacement that defeats every local guard at once ────
+#
+# Each of the five guards on the mint path is either a marker file on the
+# controller's boot disk or an age measured from the controller's own boot, and
+# ONE event — replacing the controller — voids all five together. A host that is
+# cordoned and still executing a pull request then presents exactly this row:
+# `absent` and `busy=0` because cordoning deregistered its agents, `age` 0
+# because host_age_seconds starts at this controller's first sight of it,
+# `RUNNING`, and no markers because they went with the disk. Before the durable
+# gate that read `1|0|minted|keylive` — a fresh hour-long credential written
+# into the metadata of the job that host is running, and left there for a whole
+# REGISTER_GRACE, because the next tick sees `keylive` with no expiry reason.
+#
+# The durable facts are the GCE API's, so the replacement cannot touch them. The
+# instance was really created 4000s ago, which is past the 600s grace, so the
+# host is not booting whatever the controller's clock says.
+check "regtoken: H-3 — a controller replacement does not re-mint an old host" \
+  "0|0|minted|no-keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 4000)"
+
+# The other durable fact, and the one the `keylive` marker used to carry alone:
+# an instance that already holds the key is ADOPTED, never handed a second one.
+# `keylive` comes back so the expiry rule above owns it from the next tick — it
+# is the only code that ever deletes the key.
+check "regtoken: H-3 — a key already on the instance is adopted, not re-minted" \
+  "0|0|no-minted|keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 0 present)"
+
+# And an unreadable API mints nothing. A durable fact that could not be read is
+# not a licence to fall back on the disk the fix exists to distrust.
+#
+# The failure is CHARGED to the same three-attempt cap as a failed write — the
+# fifth field. It is the only refusal on this path that would otherwise leave no
+# trace, and it costs two instances.describe per host per tick for as long as it
+# lasts, which for a project-wide API outage means every host at once.
+check "regtoken: H-3 — unreadable instance facts mint nothing" \
+  "0|0|no-minted|no-keylive|fails=1" "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 0 absent 1)"
+check "regtoken: an unreadable read counts towards the same cap as a failed write" \
+  "0|0|no-minted|no-keylive|fails=3" "$(reg_seq absent 0 fails=2 RUNNING 0 0 0 '' 0 absent 1)"
+
+# …and once the cap is reached the describe is not even attempted. The cap sits
+# ABOVE the durable gate for that reason: a capped host must cost no API calls
+# at all, or an outage that trips the cap on every host keeps paying for it. The
+# read is unreadable here too, so had the order been the other way round this
+# would read `fails=4`.
+check "regtoken: a capped host makes no further instance reads" \
+  "0|0|no-minted|no-keylive|fails=3" "$(reg_seq absent 0 fails=3 RUNNING 0 0 0 '' 0 absent 1)"
+
+# A genuinely new host is still served. The gate must not be a blanket refusal:
+# that would be a pool that never registers, which is the failure mode a
+# security fix is most likely to ship by accident.
+check "regtoken: a durably new host is still minted a token" \
+  "1|0|minted|keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 30)"
+
+# An instance with NO metadata at all. The projection flattens to no output and
+# exits 0, and that is an ABSENT key, not an unreadable one — reading it as a
+# failure would permanently refuse to mint for a genuinely key-less host, which
+# is the never-registers outage in a smaller box.
+check "regtoken: an instance with no metadata at all is minted a token" \
+  "1|0|minted|keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 30 none)"
+
+# The durable age gate is asked BEFORE adoption, and it owns the key. An
+# instance that is really past the grace AND still carrying the key is deleted
+# from here, where the evidence is. Adopting first and leaving it to the expiry
+# rule was the earlier shape, and it held a live credential for a further whole
+# REGISTER_GRACE — the expiry chain only ever sees the controller-local age,
+# which a replacement reset to 0.
+check "regtoken: a durably old host still carrying the key is deleted from" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 4000 present)"
+
+# …and when that delete FAILS the key is still out there, so `keylive` goes on
+# the books for the expiry rule to retry — and `minted` deliberately does not.
+# Claiming the work is done is the one outcome a failed delete must never
+# produce, because `minted` is what stops the marker-less recovery arm looking
+# again.
+check "regtoken: a failed durable-age delete is retried, never marked done" \
+  "0|1|no-minted|keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 0 0 1 '' 4000 present)"
+
+# The detector has to be SEEN firing, or it is not a detector. The delete call
+# is replaced by a no-op that still succeeds — the shape of the plausible bad
+# edit, where the bookkeeping around the delete survives and only the compute
+# call is gone — and the SECOND field must drop from 1 to 0. If it does not, the
+# check above is reading something other than the shipping code, and a Windows
+# pool could ship with a live registration token in every host's metadata while
+# this file says ok.
+check "regtoken: the delete check FAILS when the delete is removed" "0|0|minted|no-keylive|fails=0" \
+  "$(reg_seq present 120 minted,keylive RUNNING 0 0 0 's/delete_registration_token/true/g')"
+
+# Same discipline for the two findings above: each fix is REVERTED in place and
+# the case that covers it must change its answer. A case that reads the same
+# with the fix gone is not covering the fix.
+#
+# H-3: the durable age gate is short-circuited — the shape of the plausible bad
+# edit, where the describe still happens and only the decision it feeds is gone
+# — and the old defect comes straight back: an add-metadata on a host that has
+# been alive for over an hour.
+# shellcheck disable=SC2016
+check "regtoken: the H-3 case FAILS when the durable age gate is reverted" \
+  "1|0|minted|keylive|fails=0" \
+  "$(reg_seq absent 0 '' RUNNING 0 0 0 's/if \[ "\$DUR_AGE" -ge "\$REGISTER_GRACE" \]; then/if false; then/' 4000)"
+
+# M-4: the recovery arm goes back to `present` only, and the `partial` host with
+# no markers stops being deleted from — the second field drops from 1 to 0,
+# which is the live key left in job-readable metadata for GitHub's whole hour.
+# shellcheck disable=SC2016
+check "regtoken: the M-4 case FAILS when the partial arm is reverted" \
+  "0|0|no-minted|no-keylive|fails=0" \
+  "$(reg_seq partial 0 '' RUNNING 0 0 0 's/|| \[ "\$reg" = "partial" \]; }/|| false; }/')"
+
+# F2: the durable age arm stops owning the key — the shape of the earlier code,
+# where an instance found to be an hour old was ADOPTED and left to the expiry
+# rule. The delete disappears and `minted` is written over a live credential,
+# which is the worst of the three outcomes: the marker-less recovery arm will
+# not look again either.
+# shellcheck disable=SC2016
+check "regtoken: the durable-age delete FAILS when that arm stops owning the key" \
+  "0|0|minted|no-keylive|fails=0" \
+  "$(reg_seq absent 0 '' RUNNING 0 0 0 's/^    if \[ "\$DUR_KEY" = "present" \]; then/    if false; then/' 4000 present)"
+
+# F3: the unreadable read stops being charged to the cap, and an outage that
+# affects every host at once buys two instances.describe per host per tick, for
+# as long as it lasts, with nothing on disk to show for it.
+# shellcheck disable=SC2016
+check "regtoken: the unreadable-read cap FAILS when the charge is removed" \
+  "0|0|no-minted|no-keylive|fails=0" \
+  "$(reg_seq absent 0 '' RUNNING 0 0 0 's/echo $((n + 1)) >"$fails"/:/' 0 absent 1)"
+
+# ── F4: the bug the stub above could not see ─────────────────────────────────
+#
+# `--filter` is a `list`-family flag; `describe` rejects it with `unrecognized
+# arguments` and exit 2. This shipped, and it meant `instance_durable_facts`
+# returned failure for every host on every tick — so nothing was ever minted and
+# no host ever registered. 51 checks passed over it, because the stub accepted
+# any flag. Reverting the flag must now break the mint, and the only reason it
+# does is the allow-list.
+# shellcheck disable=SC2016
+check "regtoken: F4 — the mint FAILS when the describe goes back to --filter" \
+  "0|0|no-minted|no-keylive|fails=1" \
+  "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 30 absent 0 's/--flatten="metadata.items\[\]"/--filter="metadata.items.key=$REG_TOKEN_KEY"/')"
+
+# …and the key match is a WHOLE LINE. With no `--filter` the projection returns
+# the instance's entire key set, so a substring test would read the neighbouring
+# `ci-registration-token-old` as the token itself — and the host would be
+# "adopted" against a key that does not exist and never register.
+# shellcheck disable=SC2016
+check "regtoken: F4 — a substring key match adopts the wrong key" \
+  "0|0|no-minted|keylive|fails=0" \
+  "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 30 absent 0 's/\[ "$k" = "$REG_TOKEN_KEY" \]/[[ "$k" == *"$REG_TOKEN_KEY"* ]]/')"
+
+# The whole path is opt-in, and the default is what every existing Linux
+# controller runs. Flipping either of these turns on credential-writing into
+# instance metadata for pools that have no reason for it and no Windows host to
+# consume it.
+# shellcheck disable=SC2016
+grep -q 'MINT_REG=${MINT_REG:-false}' "$CTRL" && r=yes || r=no
+check "regtoken: minting defaults OFF when the metadata key is absent" yes "$r"
+# shellcheck disable=SC2016
+grep -q 'if \[ "$MINT_REG" = "true" \] && \[ -n "$host_uri" \]' "$CTRL" && r=yes || r=no
+check "regtoken: the tick calls the step only on an opted-in pool" yes "$r"
+
+# Static, because the mint path above is stubbed and a stub cannot show where a
+# real token would go. `--metadata` puts the token on gcloud's argv, and on the
+# pool this exists for one of the local accounts reading the process table is
+# running the pull request.
+# shellcheck disable=SC2016
+grep -q -- '--metadata-from-file="$REG_TOKEN_KEY=$f"' "$CTRL" && r=yes || r=no
+check "regtoken: the token is passed by file, never on the command line" yes "$r"
+
 echo "controller-scope selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
