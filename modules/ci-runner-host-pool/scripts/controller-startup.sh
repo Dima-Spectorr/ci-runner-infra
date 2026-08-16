@@ -113,6 +113,14 @@ REG_TOKEN_KEY="ci-registration-token"
 # into, and the keys inside it. Hard-coded for the same reason REG_TOKEN_KEY is:
 # it is a contract between this file and the beacon publisher in this module.
 BEACON_NS="ci"
+# This CONTROLLER's own `ci-host-os`. It is NOT how the gate decides what a host
+# is — that is read per host, see instance_host_os() — it is used for exactly one
+# thing: resolving a host that predates the key at all. A pool is single-OS by
+# construction (one instance template, one `var.host_os`), so the controller's
+# value is what every host in it was built as. Anything but a value we recognise
+# leaves the fallback shut.
+CONTROLLER_HOST_OS=$(md "instance/attributes/ci-host-os")
+case "${CONTROLLER_HOST_OS:-}" in linux | windows) ;; *) CONTROLLER_HOST_OS="unknown" ;; esac
 # Seconds between the host publisher's writes. beacon_decision() derives its
 # staleness ceiling from this (3x), so a controller that guessed high would keep
 # reading a dead publisher as fresh. Read from metadata so a pool that tunes the
@@ -1301,7 +1309,7 @@ registration_token_step() {
 
 # --- the second delete gate, per OS ------------------------------------------
 #
-# instance_host_os <host> <zone> -> linux | windows | unknown
+# instance_host_os <host> <zone> -> linux | windows | absent | unknown
 #
 # READ FROM THE HOST, NOT FROM THIS CONTROLLER'S OWN METADATA.
 #
@@ -1315,10 +1323,16 @@ registration_token_step() {
 # host what it is turns a confident wrong answer into a per-host fact. The cost
 # is one describe per drain, on a path that already spends a list and an ssh.
 #
-# Unknown is a real answer and it is the one that must NOT be guessed. A host
-# from a template predating PR 7 carries no `ci-host-os` at all, and reading an
-# absent key as "linux" is exactly the inference this function exists to refuse
-# — the caller fails closed on `unknown`.
+# `absent` and `unknown` are SEPARATE answers and conflating them deadlocks the
+# fleet. `unknown` is "we did not get an answer" — no zone, or the describe
+# failed — and it is transient. `absent` is a definite answer: the describe
+# SUCCEEDED and this instance carries no `ci-host-os` at all, i.e. it predates
+# the template that publishes the key. Every host running today is `absent`, and
+# because the autoscaler is ONLY_UP, `update_policy` is OPPORTUNISTIC and
+# drain_host() is the only code path that deletes a host, an `absent` host that
+# is never drained is never replaced and so is never given the key. Treating
+# `absent` as undeterminable closes that loop and pins the pool at max hosts
+# forever. The caller resolves it; see the fallback arm in drain_host().
 #
 # `--format=json(metadata)` plus jq rather than a flattened key/value
 # projection: metadata VALUES are arbitrary text and the boot script is tens of
@@ -1341,6 +1355,10 @@ instance_host_os() {
 
   case "$os" in
     linux | windows) echo "$os" ;;
+    # Empty means the key is not there — a definite fact from a successful read.
+    # Any OTHER value is a key this controller does not understand, which is not
+    # a pre-key host and gets no fallback: `unknown`, and the host is kept.
+    '') echo "absent" ;;
     *) echo "unknown" ;;
   esac
   return 0
@@ -1500,6 +1518,33 @@ drain_host() {
     host_os=$(instance_host_os "$host" "$zone")
   fi
 
+  # TRANSITIONAL, AND REMOVABLE. Delete this arm — and `absent` with it — once no
+  # host can predate `ci-host-os`; ci_worker_gate_os_fallback reading zero across
+  # every pool for a full recycle window is the evidence that day has come.
+  #
+  # A host that carries no `ci-host-os` was built from the template that existed
+  # before the key, and on this pool that template is the controller's own OS:
+  # one MIG, one instance template, one `var.host_os`, published to the hosts and
+  # to the controller from the same variable. Without this arm the pool cannot
+  # scale in at all — see instance_host_os() for why that state is permanent
+  # rather than transient — and for a Linux pool the fallback is the gate that
+  # `main` runs today, so it is not a new risk, it is the absence of a new one.
+  #
+  # It is NOT the inference PR 7 refuses. That one was "a missing key means
+  # linux" with nothing else to go on. This is scoped to a template generation
+  # that is provably Linux-only: Windows pools did not exist before the key, so
+  # an absent key on a Windows controller is anomalous and keeps.
+  if [ "$host_os" = "absent" ]; then
+    if [ "$CONTROLLER_HOST_OS" = "linux" ]; then
+      log "drain $host: LEGACY HOST — no ci-host-os on the instance, resolving to linux from this controller's own ci-host-os; it will carry the key once this delete replaces it"
+      WORKER_GATE_OS_FALLBACK=$((WORKER_GATE_OS_FALLBACK + 1))
+      host_os="linux"
+    else
+      log "drain $host: no ci-host-os on the instance and this controller is ci-host-os=$CONTROLLER_HOST_OS, which cannot predate the key — leaving host up"
+      host_os="unknown"
+    fi
+  fi
+
   if [ "$host_os" = "windows" ]; then
     local verdict
     verdict=$(beacon_gate "$host" "$zone" "$regs")
@@ -1626,6 +1671,7 @@ tick() {
   WORKER_GATE_CLEAR=0
   WORKER_GATE_HELD=0
   WORKER_GATE_UNDETERMINED=0
+  WORKER_GATE_OS_FALLBACK=0
 
   local tick_start
   tick_start=$(date +%s)
@@ -1844,6 +1890,13 @@ tick() {
   queue_series "ci_worker_gate_verdicts" "$WORKER_GATE_CLEAR" '"outcome":"clear"'
   queue_series "ci_worker_gate_verdicts" "$WORKER_GATE_HELD" '"outcome":"held"'
   queue_series "ci_worker_gate_verdicts" "$WORKER_GATE_UNDETERMINED" '"outcome":"undetermined"'
+  # Not a fourth `outcome`: a fallback host goes on to reach `clear` or `held`
+  # like any other, so folding it into that label set would double-count. It is
+  # the countdown on a transitional arm — see drain_host(). Zero across every
+  # pool for a full recycle window means no host predates `ci-host-os` any more
+  # and the arm can be deleted; non-zero long after a rollout means a pool is not
+  # recycling and its hosts are still being resolved by inference.
+  queue_series "ci_worker_gate_os_fallback" "$WORKER_GATE_OS_FALLBACK"
   # The one series that says whether an APPLY reached machines. A pin lands, a
   # template changes, and this climbs to the pool size and then falls back to
   # zero as the hosts are replaced. Stuck above zero means a pool that keeps

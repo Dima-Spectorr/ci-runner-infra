@@ -65,7 +65,11 @@ floor "host-startup.sh" "$host_published" 3
 # therefore keeps it: scale-in silently suspended while every other series reads
 # healthy. Deleted from either side, the diff below reports it as ordinary
 # drift; here it reports it by name.
-for m in ci_worker_gate_verdicts; do
+# ci_worker_gate_os_fallback is named for the opposite reason: it is the only
+# countdown on a transitional arm that resolves a pre-`ci-host-os` host by
+# inference. Lose the series and the arm has no removal criterion and becomes
+# permanent.
+for m in ci_worker_gate_verdicts ci_worker_gate_os_fallback; do
   printf '%s\n' "$published" | grep -qx "$m" || {
     printf 'FAIL %s is not published by either script — the second delete gate has no telemetry\n' "$m"
     fails=$((fails + 1)); }
