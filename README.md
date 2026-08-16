@@ -409,7 +409,9 @@ bucket that was never configured, and a pool whose every host times out on the
 download are the same observable — jobs slower than they were, and nothing red
 anywhere. Group `ci_cache_hydrate_verdict` **by its label**; the value is always
 1 and means nothing alone. `hydrated` is the only good verdict, `not-configured`
-is the correct steady state for a pool with no bucket, and everything else
+is the correct steady state for a pool with no bucket (a host that could not
+*read* its configuration says `no-metadata-server`, which is a different fact
+and is alerted on), and everything else
 (`no-snapshot`, `bad-pointer`, `too-old`, `too-big`, `no-space`,
 `download-timeout`, `unpack-timeout`, `scan-refused`, …) names which exit was
 taken. Age and size are recorded **before** the bounds that may reject the

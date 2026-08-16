@@ -73,6 +73,7 @@ POOLVARS="$HERE/../../modules/ci-runner-host-pool/variables.tf"
 PUBTF="$HERE/../../modules/ci-runner-cache-publisher/main.tf"
 PUBVARS="$HERE/../../modules/ci-runner-cache-publisher/variables.tf"
 BUCKETTF="$HERE/../../modules/ci-runner-cache-bucket/main.tf"
+TELEM="$HERE/../../modules/ci-runner-host-pool/scripts/telemetry.sh"
 PUBSH="$HERE/publish-cache-snapshot.sh"
 PUBDOC="$HERE/../../docs/publishing-a-cache-snapshot.md"
 
@@ -89,6 +90,7 @@ bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
 [ -f "$PUBTF" ] || { echo "FAIL: missing $PUBTF"; exit 1; }
 [ -f "$PUBVARS" ] || { echo "FAIL: missing $PUBVARS"; exit 1; }
 [ -f "$BUCKETTF" ] || { echo "FAIL: missing $BUCKETTF"; exit 1; }
+[ -f "$TELEM" ] || { echo "FAIL: missing $TELEM"; exit 1; }
 [ -f "$PUBSH" ] || { echo "FAIL: missing $PUBSH"; exit 1; }
 [ -f "$PUBDOC" ] || { echo "FAIL: missing $PUBDOC"; exit 1; }
 
@@ -460,6 +462,22 @@ has_observable_hydrate() { # <file>
   ! matches "$code" 'publish_cache_telemetry \|\| die'          || return 1
 }
 
+# The same rule as has_token_out_of_argv, applied to the file that now runs
+# beside the hydrate. This predicate is the whole reason the publisher was worth
+# a second look: on the controller VM there are no untrusted users and argv is
+# nobody's channel, so the pattern was fine there for as long as it lived there.
+has_publisher_token_out_of_argv() { # <telemetry.sh>
+  local code
+  code=$(code_of "$1")
+  ! matches "$code" '\-H "Authorization: Bearer \$token'      || return 1
+  matches "$code" '\-K <\(printf .header = "Authorization: Bearer' || return 1
+  # And the response body does not land on a fixed path in a /tmp the host shares
+  # with job users: a symlink planted at a known name turns a root `curl -o` into
+  # a truncation of whatever it points at.
+  ! matches "$code" '\-o /tmp/'                               || return 1
+  matches "$code" 'out=\$\(mktemp\)'                          || return 1
+}
+
 # The publisher only exists on the host because it was concatenated there. This
 # is the line that puts it in front of the host's script the way it is already in
 # front of the controller's.
@@ -800,6 +818,7 @@ run 'both sides agree on which tool caches travel'       has_agreeing_cache_dirs
 run 'the install never runs beside the publishing credential' has_split_publishing_workflow "$PUBDOC"
 run 'every hydrate exit says which one it was'           has_observable_hydrate    "$SCRIPT"
 run 'the host carries the telemetry publisher'           has_host_telemetry_wiring "$POOLTF"
+run 'the publisher keeps its token out of argv too'      has_publisher_token_out_of_argv "$TELEM"
 
 # --- the mutations --------------------------------------------------------------
 #
@@ -1096,6 +1115,11 @@ mutate 'the verdict label goes into the JSON unfiltered' has_observable_hydrate 
   's@\$\(ts_label_value "\$\{CACHE_VERDICT:-unset\}"\)@${CACHE_VERDICT}@'
 mutate 'a failed publish becomes a failed hydrate' has_observable_hydrate \
   's@^  flush_series \|\| log .*$@  flush_series@'
+
+mutate_file "$TELEM" 'the publishing token goes back into argv' has_publisher_token_out_of_argv \
+  's@-K <\(printf .header = "Authorization: Bearer %s..n. "\$token"\)@-H "Authorization: Bearer $token"@'
+mutate_file "$TELEM" 'the response goes back to a fixed name in shared /tmp' has_publisher_token_out_of_argv \
+  's@-o "\$out"@-o /tmp/ts-response.json@'
 
 mutate_file "$POOLTF" 'the host loses the telemetry publisher' has_host_telemetry_wiring \
   's@^    file\("\$\{path\.module\}/scripts/telemetry\.sh"\),$@@'

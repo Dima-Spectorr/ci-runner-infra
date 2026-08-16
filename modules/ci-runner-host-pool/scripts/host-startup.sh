@@ -77,8 +77,18 @@ HOST_REGION=${INSTANCE_ZONE%-*}
 # thing that can disagree with the machine it is running on.
 PROJECT=$(md "project/project-id")
 REGION=$HOST_REGION
-REPO_FULL="$OWNER/$REPO"
+# Empty when either half is, rather than the "/" that concatenating two empty
+# reads would produce: the emitter below skips on an empty REPO_FULL, and "/" is
+# not empty — it is a resource label that publishes and cannot be grouped by.
+REPO_FULL=""
+if [ -n "${OWNER:-}" ] && [ -n "${REPO:-}" ]; then REPO_FULL="$OWNER/$REPO"; fi
 METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
+# Tighter than the publisher's default 30. The controller's flush happens inside
+# a tick nobody waits on; this one happens on the boot path, in front of the
+# agent registering, and AFTER the hydrate's own budget has been accounted for —
+# so its worst case is added to that budget rather than covered by it. Two calls
+# at 10s is a bound worth stating out loud, not a boot silently doubled.
+TS_MAX_TIME=10
 
 BROKER_PORT=${BROKER_PORT:-8081}
 
@@ -795,7 +805,12 @@ hydrate_shared_cache() {
 # and refusing to serve jobs because the explanation did not send would be the
 # monitoring deciding the availability.
 publish_cache_telemetry() {
-  [ -n "${METRIC_PREFIX:-}" ] && [ -n "${PROJECT:-}" ] || return 0
+  # All four, not just the two the URL needs: POOL and REPO_FULL are the resource
+  # labels, and an empty one produces a request the API rejects whole — one
+  # missing metadata read would drop every series in this flush and log a 400
+  # nobody reads, rather than skipping cleanly.
+  [ -n "${METRIC_PREFIX:-}" ] && [ -n "${PROJECT:-}" ] \
+    && [ -n "${POOL:-}" ] && [ -n "${REPO_FULL:-}" ] || return 0
 
   # An empty verdict means the function returned through a path that states
   # none, which is a bug in this file rather than a state of the cache. Named
@@ -821,8 +836,23 @@ publish_cache_telemetry() {
 hydrate_shared_cache_bounded() {
   CACHE_BUCKET=$(md "instance/attributes/ci-cache-bucket")
   if [ -z "${CACHE_BUCKET:-}" ]; then
-    CACHE_VERDICT=not-configured
-    log "no snapshot bucket configured — this host runs on the cache its image baked"
+    # `md` returns an empty string for BOTH "the attribute is not set" and "the
+    # metadata server did not answer", and those are opposite facts: the first is
+    # the correct steady state of a pool that never wanted this layer, and the
+    # alert on hydrate failures excludes it for exactly that reason. Reported the
+    # same way, a metadata read that failed at boot would file itself into the
+    # silenced bucket — a pool with a bucket configured, hydrating nothing,
+    # reporting the verdict that means "nothing to do".
+    #
+    # So ask for something every instance has. If that answers, the attribute is
+    # genuinely absent; if it does not, the metadata server is what is broken.
+    if [ -n "$(md "instance/id")" ]; then
+      CACHE_VERDICT=not-configured
+      log "no snapshot bucket configured — this host runs on the cache its image baked"
+    else
+      CACHE_VERDICT=no-metadata-server
+      log "metadata server unreachable — cannot tell whether a snapshot bucket is configured"
+    fi
     return 0
   fi
   CACHE_PREFIX=$(md "instance/attributes/ci-cache-prefix")

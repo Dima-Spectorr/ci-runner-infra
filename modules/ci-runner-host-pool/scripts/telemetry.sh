@@ -19,6 +19,8 @@
 # runs pull-request code.
 #
 # Expects: PROJECT, REGION, REPO_FULL, POOL, METRIC_PREFIX, and a `log`.
+# Optional: TS_MAX_TIME, the per-call bound (default 30). The host sets it lower
+# because its flush sits on the boot path, in front of the agent registering.
 
 TELEMETRY_BUFFER=""
 
@@ -93,7 +95,7 @@ queue_series() {
 flush_series() {
   [ -n "$TELEMETRY_BUFFER" ] || return 0
 
-  local body token http
+  local body token http out
   body="{\"timeSeries\":[$TELEMETRY_BUFFER]}"
   TELEMETRY_BUFFER=""
 
@@ -103,14 +105,33 @@ flush_series() {
   # order. The controller's tick loop is a plain `while true`, so a hang here
   # does not fail — it stops every later tick, and with it demand publication
   # and all scale-in, while the process still looks alive to systemd.
-  token=$(curl --connect-timeout 10 --max-time 30 -fsS -H "Metadata-Flavor: Google" \
+  token=$(curl --connect-timeout 10 --max-time "${TS_MAX_TIME:-30}" -fsS -H "Metadata-Flavor: Google" \
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
     | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   [ -n "$token" ] || { log "telemetry: no access token"; return 1; }
 
-  http=$(curl --connect-timeout 10 --max-time 30 \
-    -s -o /tmp/ts-response.json -w '%{http_code}' -X POST \
-    -H "Authorization: Bearer $token" \
+  # THE TOKEN IS NOT AN ARGUMENT. Same rule, same reason, as the hydrate's
+  # `cache_fetch`: `-H "Authorization: Bearer $token"` puts the instance's own
+  # token in this process's argv, and /proc/<pid>/cmdline is world-readable. On
+  # the controller that was a VM with no untrusted users; this file now runs on
+  # the HOST, where startup and the slot agents are NOT ordered against each
+  # other — on a reboot of a warm host, a lingering user unit left by a previous
+  # pull-request job is running while this does, and the metadata fence that
+  # keeps job code away from this token is installed later in the boot. The
+  # token impersonates the job account and reads the GitHub App key out of
+  # Secret Manager, so argv exposure here is the whole fleet.
+  #
+  # Over a pipe instead: /proc/<pid>/fd of a root process is root-only, and
+  # `printf` is a builtin, so the subshell execs nothing that carries the token
+  # in ITS argv either.
+  #
+  # And the response goes to a private file, not to a fixed path in a /tmp the
+  # host shares with job users: a pre-planted symlink at a known name is a root
+  # `curl -o` that truncates whatever it points at.
+  out=$(mktemp) || out=/dev/null
+  http=$(curl --connect-timeout 10 --max-time "${TS_MAX_TIME:-30}" \
+    -s -o "$out" -w '%{http_code}' -X POST \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
     -H "Content-Type: application/json" \
     "https://monitoring.googleapis.com/v3/projects/$PROJECT/timeSeries" \
     -d "$body")
@@ -119,9 +140,11 @@ flush_series() {
     # Loud, because a silent telemetry failure is worse than no telemetry: the
     # autoscaler reads ci_demand from here, so a pool that cannot publish is a
     # pool that stops scaling out while looking healthy.
-    log "telemetry: POST timeSeries -> HTTP $http: $(head -c 400 /tmp/ts-response.json)"
+    log "telemetry: POST timeSeries -> HTTP $http: $(head -c 400 "$out")"
+    [ "$out" = /dev/null ] || rm -f "$out"
     return 1
   fi
+  [ "$out" = /dev/null ] || rm -f "$out"
   return 0
 }
 
