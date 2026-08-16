@@ -304,6 +304,158 @@ bootstrap. After that the automation owns the pool.
 Consumers pin the floating major, `?ref=v5`, so a release reaches them without a
 per-repo bump; that is the adoption half of the table at the top.)
 
+## Rebuilding the host image on merge
+
+Everything above is about applying *terraform*. The other artifact this fleet
+runs on is the golden host image, and until now it had no automation at all: it
+came from a person typing `gcloud builds submit --config cloudbuild.yaml` with
+five substitutions, and it came out subtly different depending on which five
+they remembered. Forgetting `_IMAGE_STORAGE_LOCATION` is the expensive one —
+`constraints/gcp.resourceLocations` rejects the multi-region GCE picks by
+default, and it rejects it at *image creation*, an hour in, after every
+provisioner has already run.
+
+`modules/ci-host-image-trigger` makes a merge to this repository do it.
+
+```hcl
+module "ci_host_image_trigger" {
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.20.0"
+
+  project_id   = var.project_id
+  region       = "<region>"
+  github_owner = "<owner>"
+  # github_repo defaults to ci-runner-infra — the repo the image build lives in.
+
+  # 2nd-gen projects only. Omit it entirely on a 1st-gen project; see below,
+  # and read the generation off the project rather than copying this line.
+  github_connection = "<connection>"
+
+  # The EXISTING account the build runs as. This module mints no identity.
+  service_account = "<existing-image-builder-sa>@<project>.iam.gserviceaccount.com"
+
+  # Where Packer's build VM runs, and which network it must sit on for the
+  # project's IAP-SSH rule to reach it.
+  zone        = "<zone>"
+  network     = var.network
+  subnetwork  = var.subnet_name
+  network_tag = module.ci_runner_network.runner_network_tag
+
+  # Required. Empty is the failure that arrives at the END of the build.
+  image_storage_location = "<region>"
+}
+```
+
+**It runs this repository's own root `cloudbuild.yaml`, it does not reimplement
+it.** The trigger sets `filename` and passes substitutions; the steps stay next
+to the packer template they drive. That is the deliberate difference from
+`ci-runner-apply-trigger`, whose steps *are* inlined — there the alternative was
+nine copies in nine consumer repositories, here the original already lives in
+one place.
+
+### The image name, and why every build gets its own
+
+Leave `image_version` unset. The module then passes `_IMAGE_VERSION=g$SHORT_SHA`,
+so each merge produces `ci-runner-host-g<sha>` — unique, immutable, and traceable
+to the commit that built it. Two merges can never race for one name, and a
+rebuild of an old commit cannot overwrite the image somebody is running. The `g`
+prefix is git's own convention for an abbreviated object name (`git describe`
+prints `v1.2.3-4-gabc1234`) and it keeps the suffix starting with a letter, which
+a GCE image name must.
+
+That expansion works because Cloud Build resolves a substitution referenced
+inside another substitution's value when `dynamicSubstitutions` is on, and for a
+build invoked by a trigger it is always on. Typed into a manual
+`gcloud builds submit` the same value is literal text and produces an image
+named `ci-runner-host-g$SHORT_SHA` — which is why the manual path in the config
+file's header still passes an explicit `_IMAGE_VERSION`.
+
+### Two prerequisites, and the first is easy to assume satisfied
+
+**1. The project must be connected to GitHub, and the connection must cover
+`ci-runner-infra` — not merely the consumer's own repository.** Every other
+trigger in these projects watches the project's own service repo, so "the
+project is connected" is true and insufficient: this trigger watches a
+*different* repository, and it has to be authorized under the same connection.
+Read the generation off the project exactly as for the apply trigger
+(`gcloud builds connections list --project=<project> --region=<region> --quiet`);
+1st gen needs the Cloud Build GitHub App installed on `ci-runner-infra`, 2nd gen
+needs it registered under the connection, which the module does for you unless
+you pass `github_repository`. If another root registered it already, pass that
+root's `repository_id` output — a second registration of one remote is an
+`ALREADY_EXISTS` error, not a no-op. **This module exports `repository_id` for
+exactly that hand-off**, and the collision is likelier here than anywhere else
+in this repo, because the repository being registered is `ci-runner-infra`
+itself: a project that also runs `ci-runner-apply-trigger` against it, or two
+roots sharing one connection, hits it on the second apply rather than the first.
+
+**Creating the 2nd-gen connection itself is a step before any of this, and it
+fails with the wrong error message.** The connection stores its GitHub OAuth
+token in Secret Manager, and it is the *Cloud Build service agent* — not you and
+not the build account — that must be able to create it:
+
+```bash
+gcloud projects add-iam-policy-binding <project> --condition=None \
+  --member="serviceAccount:service-<project-number>@gcp-sa-cloudbuild.iam.gserviceaccount.com" \
+  --role=roles/secretmanager.admin
+```
+
+Without it the create fails with `could not assert Secret Manager permissions`,
+which reads as a problem with *your* permissions and sends you to check your own
+roles. A freshly created connection also sits in `PENDING_USER_OAUTH` until
+somebody completes the GitHub authorization in a browser — terraform will happily
+build a trigger against a connection in that state, and it will not fire until
+the authorization lands.
+
+**2. The build account needs the roles a Packer build actually uses, which are
+not the apply account's roles.** This build creates a GCE VM, logs into it, and
+creates an image; it never touches terraform state, IAM or secrets. Read that
+list off `packer/ci-host-image.pkr.hcl` rather than off the apply trigger:
+
+| role | why, in one line |
+|---|---|
+| `roles/compute.instanceAdmin.v1` | creates and deletes the build VM — and `compute.images.create`, which is in this role, is what produces the artifact |
+| `roles/iap.tunnelResourceAccessor` | `omit_external_ip = true`; Packer reaches the VM over an IAP tunnel, and without this it waits out its SSH timeout |
+| `roles/compute.osAdminLogin` | `use_os_login = true` (org policy enforces it), so the build account *is* the SSH identity, and the provisioners `sudo` |
+| `roles/iam.serviceAccountUser` | on the account attached to the build VM — creating a VM with a service account is `actAs` on that account |
+| `roles/logging.logWriter` | a build naming its own service account must write to Cloud Logging; without it the submission is refused, not merely quiet |
+
+The project also needs an IAP-SSH firewall rule targeting `network_tag` —
+`ci-runner-network` already creates one, and `network_tag` defaults to the tag
+it applies. A build VM on the wrong network or without the tag fails after boot,
+as an SSH timeout that reads like a broken image.
+
+### The third prerequisite is a branch rule, not a permission
+
+Say it plainly, because automation moves it and nothing in Google will enforce
+it: **after this, merge access to `ci-runner-infra`'s `main` is write access to
+the image every CI host in the fleet boots from.** That was true before too — a
+person with merge access could always change `packer/` and then ask for a
+rebuild — but the rebuild was a separate, deliberate act by a second person with
+build permissions, and this removes that step by design.
+
+What replaces it is the branch rule. Required review on `main` is the control
+here, not a nicety, and `included_files` is what decides which merges even reach
+the builder. The trigger itself watches ONE branch (`branch`, literal, `main` by
+default), so nothing on a fork or a feature branch can build an image; and every
+image is immutable and sha-named, so a bad one is identifiable and cannot
+overwrite a good one. What none of that does is stop a reviewed-by-nobody merge.
+
+### What a merge does to a running fleet: nothing
+
+This is the part to say out loud, because it looks like a gap. **A new image
+appears; no pool changes.** Pools pin an exact image *name* — `image =
+var.host_image` — never the family. So the trigger fires, an hour later
+`ci-runner-host-g<sha>` exists, and every host in the fleet keeps running
+whatever it was running until somebody bumps `host_image` in a consumer root and
+that root applies. An image that reached every pool the moment it built would be
+an untested image on every pool.
+
+List what is available before picking the next pin:
+
+```bash
+gcloud compute images list --project=<project> --filter="family=ci-runner-host" --sort-by=~creationTimestamp --format="table(name,creationTimestamp,status)"
+```
+
 ## What "applied" does and does not mean
 
 The apply reports a summary saying so, because it is the thing most likely to
