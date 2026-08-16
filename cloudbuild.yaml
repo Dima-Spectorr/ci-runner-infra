@@ -8,6 +8,16 @@
 # only WHERE to build and WHICH version to stamp; nothing here can make the
 # image specific to a repository, customer or region.
 #
+# NORMALLY NOTHING TYPES THIS. `modules/ci-host-image-trigger` wires a Cloud
+# Build trigger that runs this file on every merge to main and passes the
+# substitutions from terraform, so the image is a build artifact of a merge
+# rather than of whoever remembered the flags. See
+# docs/applying-runner-infra.md. The command below stays the way to build an
+# image OUT OF BAND — a warm-cache variant, a bisect, a one-off — and when it
+# is used, _IMAGE_VERSION must be passed explicitly: the trigger's
+# `g$SHORT_SHA` is expanded by Cloud Build only for a triggered build, and is
+# literal text here.
+#
 #   gcloud builds submit --config cloudbuild.yaml \
 #     --project=<project> \
 #     --region=<region> \

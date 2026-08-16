@@ -83,6 +83,14 @@ locals {
     file("${path.module}/scripts/watchdog-decision.sh"),
     file("${path.module}/scripts/controller-startup.sh"),
   ])
+
+  # Merged into the controller's metadata rather than written as a `"false"`
+  # key, so a pool that has not opted in renders the SAME key set it renders
+  # today and plans no change at all. A key whose value is the default is still
+  # a diff on every existing controller.
+  controller_registration_metadata = var.controller_mints_registration_token ? {
+    "ci-mint-registration-token" = "true"
+  } : {}
 }
 
 # --- job identity ---------------------------------------------------------------
@@ -407,7 +415,7 @@ resource "google_compute_instance" "controller" {
     on_host_maintenance = "MIGRATE"
   }
 
-  metadata = {
+  metadata = merge(local.controller_registration_metadata, {
     startup-script = local.controller_startup
 
     "ci-github-owner"        = var.github_owner
@@ -434,7 +442,7 @@ resource "google_compute_instance" "controller" {
     "ci-metric-prefix"           = var.metric_prefix
 
     "block-project-ssh-keys" = "true"
-  }
+  })
 
   allow_stopping_for_update = true
 }

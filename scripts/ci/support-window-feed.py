@@ -21,7 +21,15 @@ unmodified.
 
 import argparse
 import json
+import re
 import sys
+
+# Upstream dates are ISO-8601. Everything else in those fields is a sentinel,
+# and the comparisons below are lexicographic: without this, a stray
+# `"support": "unknown"` sorts ABOVE every real date and reads as supported
+# forever. That is the false clean this file is written to avoid, arriving
+# through a field nobody looked at.
+ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def raw(value):
@@ -51,22 +59,39 @@ def manifest(path):
     data = load(path)
     if not isinstance(data, dict):
         return
+    # A package routinely appears in more than one section — `react` as a
+    # dependency and again as a peerDependency is the normal shape of a library
+    # manifest. Printed twice it becomes two identical findings and two counts,
+    # and a report that says a thing twice reads as a report that cannot count.
+    # First section wins, so the runtime dependency outranks the dev one.
+    seen = set()
+    def once(name, version):
+        if name in seen:
+            return
+        seen.add(name)
+        print("%s\t%s" % (name, version))
+
     for field in ("dependencies", "devDependencies", "peerDependencies"):
         for name, version in (data.get(field) or {}).items():
             if isinstance(version, str):
-                print("%s\t%s" % (name, version))
+                once(name, version)
     engines = data.get("engines") or {}
     if isinstance(engines, dict) and isinstance(engines.get("node"), str):
-        print("node\t%s" % engines["node"])
+        once("node", engines["node"])
+
+
+def is_date(value):
+    return isinstance(value, str) and bool(ISO_DATE.match(value))
 
 
 def is_past(value, today):
     """A date already gone. `true`/`false`/absent are not dates and are not past."""
-    return isinstance(value, str) and value <= today
+    return is_date(value) and value <= today
 
 
 def is_future(value, today):
-    return isinstance(value, str) and value > today
+    """A date still ahead. A non-date is NOT future — see ISO_DATE above."""
+    return is_date(value) and value > today
 
 
 def best_line(cycles, today):
@@ -87,8 +112,10 @@ def best_line(cycles, today):
         return support is True or is_future(support, today)
 
     def eol_key(entry):
+        # Same reason as ISO_DATE: this is a lexicographic max, so a sentinel
+        # left in the field would outrank every real date and be recommended.
         eol = entry.get("eol")
-        return eol if isinstance(eol, str) else ""
+        return eol if is_date(eol) else ""
 
     lts_ready = [c for c in cycles if is_past(c.get("lts"), today) and supported(c)]
     pool = lts_ready or [c for c in cycles if supported(c)]

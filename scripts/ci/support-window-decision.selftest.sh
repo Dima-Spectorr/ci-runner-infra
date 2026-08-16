@@ -181,6 +181,25 @@ check "an impossible month is rejected, not wrapped" rejected "$r"
 iso_to_days true >/dev/null 2>&1 && r=accepted || r=rejected
 check "the 'true' sentinel is not a date" rejected "$r"
 
+# A day bounded only by 31 accepts 2026-02-30, and the civil-days arithmetic
+# converts it without complaint — into March 2nd, two days from what the feed
+# actually said. That is the invariant inverted: a malformed date has to be
+# REJECTED so the caller reports it undecided, rather than silently becoming a
+# different real date and carrying a verdict with it.
+iso_to_days 2026-02-30 >/dev/null 2>&1 && r=accepted || r=rejected
+check "February has no 30th, in any year" rejected "$r"
+iso_to_days 2026-04-31 >/dev/null 2>&1 && r=accepted || r=rejected
+check "a 31st in a thirty-day month is rejected" rejected "$r"
+iso_to_days 2026-02-29 >/dev/null 2>&1 && r=accepted || r=rejected
+check "2026 is not a leap year, so it has no 29th of February" rejected "$r"
+check "…but 2028 does, and it still parses" 21243 "$(iso_to_days 2028-02-29)"
+# The century rule in both directions, because a leap check that stops at
+# `% 4` is wrong twice a century and nobody notices for seventy-five years.
+iso_to_days 1900-02-29 >/dev/null 2>&1 && r=accepted || r=rejected
+check "1900 was not a leap year — divisible by 100, not by 400" rejected "$r"
+iso_to_days 2000-02-29 >/dev/null 2>&1 && r=accepted || r=rejected
+check "2000 was, being divisible by 400" accepted "$r"
+
 # --- the rule never fails its caller ----------------------------------------
 # A scan reads dozens of declarations. If an odd verdict could exit non-zero,
 # the first unrecognised product would end the scan and the report would be

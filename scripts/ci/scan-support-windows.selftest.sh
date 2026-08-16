@@ -58,6 +58,18 @@ cat >"$CACHE/react.json" <<'EOF'
 [{"cycle":"19","eol":false,"lts":false,"support":true},
  {"cycle":"18","eol":false,"lts":false,"support":"2024-12-05"}]
 EOF
+# Not a transcription: a product whose feed carries a NON-DATE string where a
+# date belongs. The comparisons that pick the best line are lexicographic, so
+# "unknown" sorts above every real date — it reads as supported forever, and as
+# the furthest end of life, which makes it the line the report RECOMMENDS.
+# Cycle 9 carries a real LTS date so that it reaches the pool at all, and a
+# sentinel in the two fields that decide the winner. That is what makes it a
+# reproduction rather than a fixture that merely looks wrong.
+cat >"$CACHE/vue.json" <<'EOF'
+[{"cycle":"3","eol":"2027-12-31","lts":"2020-09-18","support":"2027-12-31"},
+ {"cycle":"9","eol":"unknown","lts":"2020-01-01","support":"unknown"},
+ {"cycle":"2","eol":"2023-12-31","lts":"2016-09-30","support":"2023-12-31"}]
+EOF
 cat >"$CACHE/go.json" <<'EOF'
 [{"cycle":"1.24","eol":false,"lts":false,"support":true},
  {"cycle":"1.21","eol":"2024-08-13","lts":false,"support":"2024-02-06"}]
@@ -70,8 +82,24 @@ EOF
 echo '18.20.4' >"$REPO/.nvmrc"
 printf 'FROM node:20-bookworm\nFROM scratch\n' >"$REPO/Dockerfile"
 printf 'module example\n\ngo 1.21\n' >"$REPO/go.mod"
+# `vue` appears in TWO sections. A manifest that lists a framework as both a
+# runtime and a peer dependency is the normal shape of a library, and it must
+# still be one declaration and one row.
 cat >"$REPO/package.json" <<'EOF'
-{"dependencies":{"react":"^18.3.1","left-pad":"^1.3.0","lodash":"4.17.21"}}
+{"dependencies":{"react":"^18.3.1","left-pad":"^1.3.0","lodash":"4.17.21","vue":"^9.0.0"},
+ "devDependencies":{"vue":"^9.0.0"},
+ "peerDependencies":{"vue":"^9.0.0"}}
+EOF
+# Ordinary Dockerfile syntax that the first parser could not see: the token
+# after `FROM` is a flag, not the image. `--platform` is common enough in any
+# repository that builds for more than one architecture, and the failure is
+# silent — the base image is simply never scanned.
+mkdir -p "$REPO/build"
+cat >"$REPO/build/Dockerfile" <<'EOF'
+FROM --platform=$BUILDPLATFORM node:18-bookworm AS build
+FROM node:latest
+FROM node
+FROM scratch AS final
 EOF
 cat >"$REPO/.github/workflows/build.yml" <<'EOF'
 jobs:
@@ -141,6 +169,47 @@ has "the unsupported findings lead the report" 'Unsupported — running past end
 # alongside what is not is a report nobody finishes reading.
 # shellcheck disable=SC2016
 hasnt "a supported version is not reported" '`ubuntu`'
+
+# --- a base image behind a flag is still a base image ------------------------
+#
+# `FROM --platform=... node:18-bookworm AS build`. The naive reading takes the
+# image to be the second token and demands a colon in it, so the flag makes the
+# line fail its own grep and the declaration is skipped without a word. A base
+# image that is silently not scanned is a clean report about a version nobody
+# read.
+# shellcheck disable=SC2016
+has "a FROM behind a --platform flag is read, not skipped" '| `build/Dockerfile` |'
+
+# The two shapes that legitimately yield nothing, asserted so the fix above did
+# not turn "no version declared" into a version.
+hasnt "a floating tag declares no version" 'latest'
+has "…and the multi-stage stage name is not mistaken for an image" \
+  '1 declaration(s) are fully supported'
+
+# --- one package, named twice, is one declaration ----------------------------
+#
+# `vue` is listed as a dependency, a devDependency AND a peerDependency here,
+# which is the ordinary shape of a library manifest. Emitted once per section it
+# becomes three identical rows and three counts, and a report that says the same
+# thing three times reads as one that cannot count.
+# shellcheck disable=SC2016
+check "a package in three sections is counted once" 1 \
+  "$(grep -c '| `vue` |' "$REPORT")"
+
+# --- a non-date where a date belongs is not "supported forever" --------------
+#
+# Asserted against the feed reader directly, because the best line only reaches
+# the report on a newly-adopted row — and this defect is dangerous everywhere,
+# not only there.
+#
+# The comparisons that pick the best line are lexicographic, so the string
+# "unknown" sorts above every real date. It reads as still in active support,
+# and as the furthest end of life, which together make it the line the report
+# tells everyone to move TO. Vue 3 is the real answer; cycle 9 has no dates at
+# all and must lose to it.
+check "a sentinel in a date field is never the recommended line" 3 \
+  "$(python3 "$HERE/support-window-feed.py" --lifetime "$CACHE/vue.json" \
+       --cycle 3 --today "$TODAY" | cut -f3)"
 
 # --- a library with no published lifetime is NOT a finding -------------------
 # This is the line between a report people read and a report people mute. No

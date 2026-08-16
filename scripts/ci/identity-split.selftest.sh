@@ -210,11 +210,34 @@ else
   bad "nothing stops host_os = windows with create_controller_service_account = false, which hands the App key straight back to job code"
 fi
 
-# Checks 13 and 14 — the pool's `controller_mints_registration_token` input and
-# the metadata key it gates — assert `modules/ci-runner-host-pool`, which this
-# pull request does not ship. They land with that module, in the controller-minted
-# registration pull request stacked on this one. A self-test asserting a file its
-# own pull request does not contain is a red gate on `main`, not coverage.
+# 13. A Windows host account cannot read the App key, so it cannot mint its own
+#     registration token — the controller has to. The pool input that turns that
+#     on must exist and must default OFF, or every Linux controller starts
+#     writing credentials into instance metadata it has no reason to.
+if matches "$(block '^variable "controller_mints_registration_token"' "$POOL/variables.tf")" '^  default     = false'; then
+  ok "controller-minted registration is opt-in"
+else
+  bad "controller_mints_registration_token is missing or does not default to false"
+fi
+
+# 14. And the key it enables must be ABSENT from a pool that did not opt in. A
+#     `"false"` value would be a metadata diff on every existing controller,
+#     which is exactly the Linux churn this delivery promised not to cause. Both
+#     halves are asserted: a local that renders an EMPTY map when the pool says
+#     nothing, and that same local actually merged into the controller's
+#     metadata. Checking only the local would pass on a local nothing reads.
+if matches "$(grep -A2 'controller_registration_metadata = ' "$POOL/main.tf")" 'controller_mints_registration_token \? \{' &&
+  matches "$(grep -A2 'controller_registration_metadata = ' "$POOL/main.tf")" '\} : \{\}'; then
+  ok "the registration metadata local is empty unless the pool opts in"
+else
+  bad "the registration metadata key is rendered unconditionally — every existing controller gets a metadata diff"
+fi
+
+if matches "$(grep -c 'merge(local.controller_registration_metadata, {' "$POOL/main.tf")" '^1$'; then
+  ok "and it is merged into the controller's metadata"
+else
+  bad "local.controller_registration_metadata is not merged into the controller metadata — the key is defined and never rendered"
+fi
 
 if [ "$fail" -eq 0 ]; then
   echo "  identity split intact."
