@@ -131,7 +131,12 @@ selftest() {
       printf '%s\n' "$out" | sed 's/^/       /'
       f=$((f + 1))
     fi
-    fail=0
+    # `fail` is deliberately NOT reset here, and deliberately not consulted on
+    # this path: findings are the EXPECTED output of most fixtures, so the
+    # global the real run exits on says nothing about whether the self-test
+    # passed. `selftest` returns on `$f` — cases that did not match their
+    # expected id set — and `main` exits on that. A reset here would read as
+    # load-bearing while changing nothing.
   }
 
   tmp=$(mktemp -d)
