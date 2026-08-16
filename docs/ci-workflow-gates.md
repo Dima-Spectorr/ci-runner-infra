@@ -56,6 +56,7 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER5` | the runner is selected dynamically — reported as UNDECIDED, not passed |
 | `RUNNER6` | and the declared timeout is below the default it replaces |
 | `RUNNER7` | a REMOTE reusable workflow's jobs are not in this repository — UNDECIDED, declarable per callee |
+| `RUNNER8` | a job on a **Windows** pool label declares `container:` or `services:`, which that pool cannot run |
 
 ### `self-hosted` is a label, not a requirement
 
@@ -109,6 +110,25 @@ moving.
 A job pointed at a label no runner carries is a different defect with a
 different fix — the pool, or the `runs-on`. RUNNER1 and the onboarding doc's
 label rule are what catch that.
+
+### RUNNER8 is scoped to the label, not to the key
+
+A Windows pool on this fleet has no container runtime at all; job isolation
+there is one local Windows account per slot (`docs/adr-windows-pool.md` §4). So
+`container:` and `services:` cannot run on it, and the way they fail is why this
+is a gate rather than a lesson: a `services:` block fails at "Initialize
+containers" before a single step runs, with an error about docker on a host that
+has no docker, which every reader takes for a broken host — while the workflow
+itself looks entirely ordinary, because on `windows-latest` and on the Linux
+pool it is.
+
+The rule therefore reads the **label**. `container:` on the Linux pool is how
+that pool is meant to be used, and a hosted `windows-2022` image is not this
+fleet and does run containers; only a fleet-reachable job naming the `windows`
+platform label is refused, case-insensitively, and a matrix is judged per leg.
+`scripts/ci/check-runner-policy.selftest.sh` mutates the gate seven ways and
+asserts its fixture suite FAILS for each — a detector that has not been seen to
+fire is not a detector.
 
 ### `--forks` is declared, not guessed
 

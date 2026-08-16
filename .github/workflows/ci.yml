@@ -414,6 +414,14 @@ jobs:
       - name: runner policy self-test
         run: bash scripts/ci/check-runner-policy.sh --selftest
 
+      # …and the fixtures' own proof. A fixture asserting "this workflow
+      # produces RUNNER8" keeps passing while the detector behind it is
+      # weakened, so this mutates the gate seven ways and asserts the suite
+      # above FAILS for each. Runs after it, because a mutation "detected" by a
+      # suite that was already red asserts nothing either.
+      - name: runner policy mutation self-test
+        run: bash scripts/ci/check-runner-policy.selftest.sh
+
       # …and then this repository's own workflows. It publishes the rule, so it
       # is the first place the rule must hold. `--forks=allowed` is the strict
       # posture and this repository is PUBLIC, so it is also the true one.

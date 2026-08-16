@@ -18,6 +18,10 @@ one `e2-micro` controller.
 Concurrency is `max_hosts × slots_per_host`, **not** `max_hosts`. Two hosts of
 four slots serve eight concurrent jobs.
 
+The same module also serves **Windows** hosts (`host_os = "windows"`), warm and
+scaling to zero like these — but with a different isolation model and a security
+posture you opt into knowingly. Read [Windows](#windows) before you declare one.
+
 ## Before you start
 
 1. **The GitHub App is installed on the repository.** The fleet authenticates as
@@ -402,18 +406,213 @@ full suite on the merge queue.
 
 ## Windows
 
-The fleet's warm-host pool is **Linux only** — the golden image, the per-slot
-rootless Docker isolation and the slot model are all Linux. A repository that
-needs Windows jobs (today: IntegrateIT, for the WiX/`signtool` MSI build) runs a
-separate **ephemeral one-VM-per-job** Windows pool from the retired
-`ci-runner-pool` module, off a Windows golden image, in its own root. It works
-and it scales to zero, but it pays a full VM boot per job and has no warm cache.
-See `customer/mot/terraform/ci-runners/README.md` in IntegrateIT.
+Windows is a **first-class pool of the same module**. There is no separate
+Windows module and no vendored root: `ci-runner-host-pool` with
+`host_os = "windows"` gives you warm Windows hosts off a Windows golden image,
+with the same controller, the same autoscaler and the same scale-in path.
+The design, and every trade behind it, is [`adr-windows-pool.md`](adr-windows-pool.md).
 
-Keep Windows jobs on their own labels (`[self-hosted, windows, gcp, <Repo>]`)
-and their own demand metric series. The two pools must never answer the same
-labels — both would register, and GitHub would dispatch a Linux job to a Windows
-host.
+A Windows pool is **not** a Linux pool with a different image, and the four
+differences below are decisions rather than gaps. Read them before you decide to
+opt in, not after the first job.
+
+**Job isolation is one local Windows account per slot — there is no container
+anywhere.** On Linux each slot is a Linux user with its own rootless Docker
+daemon, and a job runs inside a container it cannot escape. On Windows each slot
+is a separate local Windows account with its own profile, workspace and TEMP,
+and that is the whole boundary. Everything below the account — installed SDKs,
+the registry, `C:\ProgramData`, the certificate stores, anything a job writes
+with the privileges it has — persists across jobs and is shared between slots.
+This is weaker than the Linux pool, and weaker than the ephemeral
+one-VM-per-job Windows pool it replaces, which destroyed the machine. It is the
+price of warmth and it was paid deliberately. Consequence for a job author:
+`container:` and `services:` in a workflow job **cannot** run on this pool.
+`scripts/ci/check-runner-policy.sh` refuses them (`RUNNER8`) in your own CI, so
+the answer arrives in a pull request rather than as an "Initialize containers"
+error about docker on a host that has none.
+
+**`slots_per_host = 1`.** Windows has no per-slot network namespace, so two
+concurrent slots share one loopback and one port space, and two jobs binding the
+same fixed port collide with no host-side fix — reported forever as a flaky
+build, never as host policy. One slot keeps every part of the warm-host saving
+and none of that risk. Two is expressible and is not where a first pool starts.
+
+**`min_hosts = 0`, always, with no warm schedule.** Windows Server is licensed
+per vCPU-hour on top of the machine, so a warm window pays that licence for
+every hour of the working day whether or not anyone pushes. The cost of the
+choice is real and you should expect it: the first Windows job after a quiet
+spell pays a full Windows boot, and `ci_queue_wait_seconds_max` on the pool will
+show it. What survives scale-to-zero is the saving that mattered anyway — the
+toolchain install and the warm cache, which a reused host keeps and a per-job VM
+never had. `warm_schedules` stays available and unset.
+
+**Windows Server with Desktop Experience, not Server Core.** CI job code is
+written against GitHub-hosted `windows-latest`, which is a Desktop Experience
+image, and the installers and test runners that assume a GUI subsystem is
+present fail on Core in ways that read as repository faults. The image is built
+by `packer/ci-host-image-win.pkr.hcl` into its own family, `ci-runner-host-win`,
+which is deliberately never the Linux family — a family points at its newest
+member, so sharing one would let build order hand a pool the wrong OS. The
+module refuses the mispairing at plan time, because the guest agent's answer to
+a Windows instance carrying a Linux boot key is to run **no boot script at all**
+and look healthy while it does it.
+
+### Two rules that stop being advice
+
+The README's [isolation rules](../README.md#isolation-rules-not-optional) apply
+to every pool. On a Windows pool, two of them are **requirements**, because they
+are the only isolation boundary left:
+
+* **One repository per pool.** Not one repository per pool *by convention* — a
+  second repository on a Windows pool has no boundary between it and the first.
+* **Fork pull requests never run on a warm host.** Route them to GitHub-hosted
+  runners. On Linux this is defence in depth behind the container and the
+  metadata fence; on Windows there is nothing behind it.
+
+Both are enforceable from your own repository, and should be: `RUNNER1` scopes
+each job to one pool label and `RUNNER4` demands a fork guard, both in
+[`ci-workflow-gates.md`](ci-workflow-gates.md).
+
+### What a Windows job can read, in plain terms
+
+This is the paragraph an estate has to weigh before opting in, and it is stated
+here rather than in the design because the operator is the person it concerns.
+
+**A build job on a Windows host can reach the machine's cloud identity, and no
+design in this repository stops it.** Windows has no working per-process egress
+filter — an explicit block outranks every conflicting allow, and the one
+documented override needs a protocol the metadata server does not speak — so job
+code can call the metadata server directly. Concretely, a Windows CI job can:
+
+* mint an access token for the **host** service account (which is why that
+  account is stripped down to almost nothing — see below);
+* read every instance attribute **and every project-level metadata attribute**.
+  That last one is not this module's to control: project-wide SSH keys and any
+  custom project metadata your estate has set are readable by any Windows CI
+  job. **An estate that keeps anything sensitive in project metadata must not
+  put a Windows pool in that project.**
+* read the host's Google-signed identity token, so any service that trusts the
+  host service account's OIDC identity effectively trusts a pull request;
+* write and forge its own liveness beacon.
+
+What it can **not** do is read the GitHub App private key, write the demand
+metric the autoscaler reads, or touch any repository other than the one its own
+pool serves.
+
+**The Windows host service account must never be granted Secret Manager
+access — not "should not", must not.** `ci-runner-identity` with
+`host_os = "windows"` strips that grant, leaving only
+`roles/iam.serviceAccountTokenCreator` on the job account, which is exactly what
+the credential broker was going to hand the job anyway. Do not restore the grant
+"for convenience" on a Windows pool, and do not attach a Windows host to a
+service account that holds it for some other reason. The reason is specific:
+**every host template carries the App key secret's address in metadata**
+(`ci-app-key-secret`), on Windows as on Linux, and a Windows job can read
+metadata. Today that is harmless — the value is a resource path, not key
+material, and the account holding it can access nothing. Grant the account
+Secret Manager and the address is already sitting where every job on the host
+can find it. The two halves of that safety property live in different modules,
+so nothing links them at review time; this paragraph is the link.
+
+The host's own boot probe is the enforcement. It runs as a slot user and asserts
+a **403** on the secret named by `ci-app-key-secret` and a **403** on writing a
+time series. A Windows pool whose host identity was not reduced fails that probe
+and refuses to register — deliberately, because Terraform cannot see what IAM a
+passed-in service account holds elsewhere.
+
+### The Terraform
+
+Alongside the Linux blocks in §1, not instead of them — the two pools are two
+instantiations with their own names, MIGs, controllers and labels.
+
+```hcl
+module "ci_runner_identity_win" {
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.22.1"
+
+  project_id        = var.project_id
+  name              = var.win_pool_name
+  account_id        = var.win_runner_account_id
+  app_key_secret_id = var.app_key_secret_id
+
+  # THE security input. It removes the Secret Manager grant from the host
+  # account, because a Windows host cannot defend it.
+  host_os = "windows"
+}
+
+module "ci_runner_pool_win" {
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.22.1"
+
+  # ... project_id, region, github_*, network, subnetwork and the three
+  # identities exactly as the Linux pool above, from the _win modules ...
+
+  host_os = "windows"
+  image   = var.win_host_image     # the ci-runner-host-win family, never ci-runner-host
+
+  # The host account cannot mint its own registration token — it has no Secret
+  # Manager grant. The CONTROLLER mints it and writes it to a per-instance
+  # metadata key, then deletes the key once the agents appear. Required on
+  # windows: the safe configuration and the working configuration are the same
+  # configuration, and the module refuses the pool without it.
+  controller_mints_registration_token = true
+
+  slots_per_host = 1
+  min_hosts      = 0
+  max_hosts      = var.win_max_hosts
+
+  # A Windows first boot plus account creation plus per-slot service
+  # registration does not fit the Linux 600s grace, and not fitting IS a churn
+  # loop that never reaches usable capacity. Floor of 1200, refused below it.
+  register_grace_seconds = 1200
+
+  # Windows, plus toolchains, plus the warm cache, plus workspaces, plus a
+  # pagefile. Floor of 200, refused below it.
+  boot_disk_size_gb = 200
+
+  # Its OWN labels. The two pools must never answer the same set — both would
+  # register, and GitHub would hand a Linux job to a Windows host.
+  runner_labels = ["windows", "gcp", var.repo_label]
+}
+```
+
+Four more inputs are **refused at plan time** on a Windows pool rather than
+accepted and ignored, so a copy-pasted Linux block fails in the plan and not in
+a job: `spot` (a preemption takes every slot with it, and the licence is per
+vCPU-hour whichever way the machine was bought), `extra_registry_hosts` (nothing
+on the host reads it — there is no container runtime and no credential helper),
+and the two floors above. `machine_type` has no Windows default of its own: the
+Linux default is sized for four concurrent slots, so a one-slot Windows pool
+should name something smaller in its own root rather than inherit a number
+chosen for a different shape.
+
+### A rebooted Windows host comes back dead, and that is the design
+
+Windows hosts reboot for updates. This is ordinary behaviour on the platform,
+not an edge case, so it is written down here rather than discovered.
+
+The controller mints a host's registration token **once** and deletes the
+metadata key as soon as GitHub reports the host registered. A host that reboots
+after that point finds no key, blocks at the wait for it, and never
+re-registers. Nothing is exposed — the credential is gone, which is the point —
+and it is self-healing: the host shows zero agents, passes
+`register_grace_seconds`, and the controller retires it; the MIG replaces it
+with a host that gets a fresh token. What you will see is a host that "came back
+wrong" and a short capacity dip, and the boot log says so by name. Do not treat
+it as a broken image.
+
+### Adoption sequence
+
+1. Build the Windows image (`packer/ci-host-image-win.pkr.hcl`) and note both
+   its `image_version` (the artifact) and its `image_contract_version` (the
+   contract the boot script asserts against `windows_image_min_version`).
+2. Stand the pool up **alongside** whatever runs your Windows jobs today, on its
+   own labels, with `min_hosts = 0` and `slots_per_host = 1`.
+3. Apply, and watch the first host register. A Windows host that boots silently
+   is the failure this module spends most of its refusals on; if it never
+   registers, the boot log names the phase.
+4. Move **one** workflow onto the new labels. Confirm it carries a fork guard
+   and a repository-scoped label first.
+5. Cut over the rest, then delete the old pool — in your repository, as the last
+   step rather than the first.
 
 ## When something is wrong
 
@@ -424,4 +623,7 @@ host.
 | pool never scales in | the IAP firewall tag: the drain proves a host idle over IAP-SSH, and a host outside the rule fails that probe |
 | pool never scales out | the controller's demand labels, and `max_hosts` |
 | first host never registers | the App key secret version (§3) |
+| a Windows job fails at "Initialize containers" | `container:`/`services:` on a Windows pool — there is no container runtime. `check-runner-policy.sh` (`RUNNER8`) catches this in your own CI |
+| a Windows host registers, reboots, and never comes back | expected after the registration token expires — the MIG replaces it at `register_grace_seconds` (see "A rebooted Windows host comes back dead") |
+| a Windows host boots, looks healthy, registers nothing | the image family. A Windows instance carrying the Linux boot key runs no boot script at all; the module refuses the mispairing at plan time, so check the `image` a running pool was applied with |
 | a build fails on a different download each run | container MTU. The hosts set the slot daemon's `mtu` from the primary interface, so this should not recur; a fork that dropped it black-holes large TLS responses and reports them as a truncated handshake or a "not found" dependency, never as a size error |
