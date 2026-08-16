@@ -1341,7 +1341,7 @@ registration_token_step() {
 # script. JSON escapes them and jq is already a hard dependency here.
 instance_host_os() {
   local host="$1" zone="$2" json os
-  [ -n "$host" ] && [ -n "$zone" ] || { echo "unknown"; return 0; }
+  if [ -z "$host" ] || [ -z "$zone" ]; then echo "unknown"; return 0; fi
 
   json=$(timeout 60 gcloud compute instances describe "$host" \
     --project="$PROJECT" --zone="$zone" \
