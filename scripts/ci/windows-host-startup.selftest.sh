@@ -36,22 +36,26 @@
 #                           the controller's to delete (controller-startup.sh);
 #                           this script writes neither it nor anything else.
 #
-# …plus phase 3's own invariants, whose breakage is loud at JOB time and silent
-# at boot: a broker bound off loopback, one proven only to answer rather than to
-# vend, or a pool whose empty job service account quietly downgrades to the host
-# identity instead of handing jobs no Google credentials at all.
+# …and one that DOES fail at boot, but only on the pools nobody tests:
 #
-# The per-job reset hooks add their own invariants to this file when phase 4
-# lands; they are not here yet because the hooks are not.
+#   hooks made conditional  The tempting edit folds ACTIONS_RUNNER_HOOK_JOB_* in
+#                           beside the GCE_METADATA_* values, since all five are
+#                           "credential plumbing". A pool with no job service
+#                           account then gets no reset hook — and that is the
+#                           pool where an inherited credential is WORST, because
+#                           nothing on the host competes with what a workflow
+#                           left behind, so the leftover is simply what the next
+#                           pull request authenticates as.
 #
 # Every mutation below breaks the script the way a later edit plausibly would and
 # asserts this test notices. A gate that only passes on correct input is not
 # evidence.
 
 # Every predicate and mutation below matches the TEXT of windows-host-startup.ps1,
-# in which the identifiers quoted are the literal characters that must be there.
-# Expanding them here would compare against this test's own environment and pass
-# on any script at all — so the single quotes are the point.
+# in which `$block`, `$HookPath` and `$script:JobHookPath` are the literal
+# characters that must be there. Expanding them here would compare against this
+# test's own environment and pass on any script at all — so the single quotes are
+# the point.
 # shellcheck disable=SC2016
 
 set -uo pipefail
@@ -147,6 +151,33 @@ has_no_credential_channel() { # <file>
   ! matches "$code" 'ConvertFrom-SecureString|NetworkCredential\(' || return 1
 }
 
+# --- invariant 3: the reset hooks are set unconditionally --------------------
+
+has_unconditional_job_hooks() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # Both ends of the job. COMPLETED alone leaves a live credential on disk for
+  # the whole idle window and does not run at all if the agent is killed mid-job,
+  # which is the case that leaves the most behind; STARTED alone leaves the idle
+  # window open.
+  matches "$code" "ACTIONS_RUNNER_HOOK_JOB_STARTED'\] = \\\$HookPath" || return 1
+  matches "$code" "ACTIONS_RUNNER_HOOK_JOB_COMPLETED'\] = \\\$HookPath" || return 1
+
+  # …at the FUNCTION's indentation, not the broker branch's. This is the whole
+  # invariant, and indentation is what makes it decidable from the text: the
+  # `if (-not …BrokerEndpoint)` body is indented one level deeper, so a hook
+  # assignment that moved inside it lands at 8 spaces instead of 4.
+  matches "$code" "^    \\\$block\['ACTIONS_RUNNER_HOOK_JOB_STARTED'\]" || return 1
+  matches "$code" "^    \\\$block\['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'\]" || return 1
+  ! matches "$code" "^        \\\$block\['ACTIONS_RUNNER_HOOK_JOB_" || return 1
+
+  # …and the install itself is unconditional too. A hook path in the environment
+  # of an agent whose hook file was never written takes work and fails all of it.
+  matches "$code" '^    \$hookPath = Invoke-Phase4JobHook -SlotUsers \$slotUsers$' || return 1
+  ! matches "$code" '^        \$hookPath = Invoke-Phase4JobHook' || return 1
+}
+
 # --- phase 3's own invariants ------------------------------------------------
 
 has_job_broker() { # <file>
@@ -230,6 +261,26 @@ has_owned_broker_socket() { # <file>
   return 0
 }
 
+has_job_hook_acl() { # <file>
+  local code
+  code=$(code_of "$1")
+  # One file executed by every slot on the host: read-and-execute for the slots,
+  # writable by none of them. A slot that could rewrite it would be running code
+  # in every OTHER slot's identity, and on a warm host in every later job's too.
+  matches "$code" 'Protect-CiDirectory -Path \$script:JobHookPath -ReadOnlyUser \$SlotUsers' || return 1
+  matches "$code" "Rights = 'ReadAndExecute'" || return 1
+  ! matches "$code" 'Protect-CiDirectory -Path \$script:JobHookPath -SlotUser' || return 1
+  # The profile is resolved from the ACCOUNT DATABASE, never from a variable the
+  # job could have rewritten — the hook runs inside the agent's environment.
+  matches "$code" 'ProfileImagePath' || return 1
+  ! matches "$code" '\$env:USERPROFILE|\$env:APPDATA' || return 1
+  # …and it refuses anything that is not a slot profile rather than recursing.
+  matches "$code" "notmatch '\^ci-s\[0-9\]\+\\\$'" || return 1
+  matches "$code" 'refusing to clean' || return 1
+  # The credential stores it removes, on Windows paths.
+  matches "$code" 'AppData.Roaming.gcloud' || return 1
+}
+
 # --- the helper carries the trap it was written to avoid ---------------------
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -254,6 +305,12 @@ else
   bad "the Windows boot script puts a credential where job code can read it — §3A accepts that a Windows job can read instance metadata and forge guest attributes, and the rule that makes that acceptable is that this host writes no credential to either"
 fi
 
+if has_unconditional_job_hooks "$SCRIPT"; then
+  ok
+else
+  bad "the per-job credential reset hooks are conditional — a pool with no job service account gets no hook, and that is the pool where an inherited credential is worst: nothing competes with what the last workflow left behind, so it is simply what the next pull request authenticates as"
+fi
+
 if has_job_broker "$SCRIPT"; then
   ok
 else
@@ -276,6 +333,12 @@ if has_owned_broker_socket "$SCRIPT"; then
   ok
 else
   bad "readiness trusts whoever answers on the broker's port — the port is free for ten seconds after any broker crash and every slot shares one loopback, so a process a previous job left behind can vend an attacker-chosen token, project and zone to every later job on this host"
+fi
+
+if has_job_hook_acl "$SCRIPT"; then
+  ok
+else
+  bad "the reset hook is slot-writable, or resolves the profile from the job's own environment — one file is executed by every slot on the host, so a slot that can rewrite it runs code in every other slot's identity"
 fi
 
 # --- mutation cases: prove the checks above can actually fail -----------------
@@ -324,7 +387,21 @@ mutate "the slot password converted out of its SecureString" \
   's|^\$script:BrokerServiceName.*|$plain = ConvertFrom-SecureString $secure -AsPlainText|' \
   has_no_credential_channel
 
-# 3. The broker regresses to the Linux shape, or to checking the daemon.
+# 3. The hooks become conditional — the exact edit the invariant exists for.
+mutate "hooks folded into the broker branch" \
+  "s|^    \\\$block\\['ACTIONS_RUNNER_HOOK_JOB_STARTED'\\]|        \\\$block['ACTIONS_RUNNER_HOOK_JOB_STARTED']|" \
+  has_unconditional_job_hooks
+mutate "JOB_STARTED dropped, leaving only the completion hook" \
+  "s|^    \\\$block\\['ACTIONS_RUNNER_HOOK_JOB_STARTED'\\].*||" \
+  has_unconditional_job_hooks
+mutate "JOB_COMPLETED dropped, leaving only the start hook" \
+  "s|^    \\\$block\\['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'\\].*||" \
+  has_unconditional_job_hooks
+mutate "hook install made conditional in Invoke-Main" \
+  's|^    \$hookPath = Invoke-Phase4JobHook -SlotUsers \$slotUsers$|        $hookPath = Invoke-Phase4JobHook -SlotUsers $slotUsers|' \
+  has_unconditional_job_hooks
+
+# 4. The broker regresses to the Linux shape, or to checking the daemon.
 mutate "broker bound on the VM's address" \
   's|CI_BROKER_HOST" value="127.0.0.1"|CI_BROKER_HOST" value="0.0.0.0"|' \
   has_job_broker
@@ -370,6 +447,22 @@ mutate "the owner matched by localisable name instead of SID" \
   's|S-1-5-18|NT AUTHORITY\\SYSTEM|g' \
   has_owned_broker_socket
 
+# 5. The hook loses its ACL or its account-database resolution.
+mutate "hook made slot-writable" \
+  's|Protect-CiDirectory -Path \$script:JobHookPath -ReadOnlyUser \$SlotUsers|Protect-CiDirectory -Path $script:JobHookPath -SlotUser $SlotUsers[0]|' \
+  has_job_hook_acl
+mutate "read-and-execute widened to modify" \
+  "s|Rights = 'ReadAndExecute'|Rights = 'Modify'|" \
+  has_job_hook_acl
+mutate "profile taken from the job's environment" \
+  's|(Get-ItemProperty -LiteralPath \$key -Name .ProfileImagePath.).ProfileImagePath|$env:USERPROFILE|' \
+  has_job_hook_acl
+mutate "the not-a-slot-profile refusal removed" \
+  "s|notmatch '\\^ci-s\\[0-9\\]+\\\$'|match '.'|" \
+  has_job_hook_acl
+mutate "the gcloud credential store no longer cleaned" \
+  's|AppData\\Roaming\\gcloud|AppData\\Local\\Temp\\turbo|' \
+  has_job_hook_acl
 
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
