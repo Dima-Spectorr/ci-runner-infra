@@ -64,6 +64,23 @@ using System.ServiceProcess;
 using System.Text;
 using System.Xml;
 
+// Every Windows tool this shim shells out to, named by ABSOLUTE PATH.
+//
+// A bare "sc.exe" is resolved by CreateProcess's search order, and this process
+// is LocalSystem. No slot-writable directory is known to sit earlier in that
+// order -- what this closes is the QUESTION, not a known hijack: proving the
+// absence of such a directory would mean re-proving it after every future change
+// to PATH, to the app-paths registry and to the image's directory ACLs, and the
+// absolute path makes the proof unnecessary instead of merely current.
+internal static class SystemPaths
+{
+    public static string Tool(string exe)
+    {
+        return Path.Combine(
+            System.Environment.GetFolderPath(System.Environment.SpecialFolder.System), exe);
+    }
+}
+
 internal sealed class ServiceDefinition
 {
     public string Id = "";
@@ -138,8 +155,50 @@ internal sealed class ServiceDefinition
 
         if (d.Id.Length == 0) { throw new InvalidDataException("<id> is empty"); }
         if (d.DisplayName.Length == 0) { d.DisplayName = d.Id; }
+
+        // <id> and <name> reach an sc.exe command line, so they are restricted
+        // HERE rather than escaped there. Nothing metadata-derived reaches them
+        // today -- both trace to hardcoded $script: constants in the boot script,
+        // and the one metadata-derived value only ever lands in an <env value=>
+        // attribute, which this shim passes through an environment block and
+        // never through a command line. But nothing in the code stops a future
+        // caller from routing a value here, and at that point the failure is
+        // command injection as LocalSystem.
+        //
+        // A character class is a stronger guarantee than correct quoting,
+        // because it holds no matter what the caller does and no matter what
+        // Win32's argv rules are. Every name this repository writes passes it:
+        // ci-beacon, ci-job-broker and ci-boot-probe, each of which is both the
+        // <id> and the <name> of its document.
+        RequireSafeName(d.Id, "<id>");
+        RequireSafeName(d.DisplayName, "<name>");
+
+        // <description> is prose, so a character class would be the wrong tool --
+        // but it reaches the same command line, so the two characters Quote()
+        // cannot be trusted with are dropped rather than escaped. Losing a quote
+        // mark from an SCM description costs nothing.
+        d.Description = d.Description.Replace("\"", "").Replace("\\", "");
         if (d.Executable.Length == 0) { throw new InvalidDataException("<executable> is empty"); }
         return d;
+    }
+
+    // [A-Za-z0-9_.-]+ by hand rather than by Regex: this runs before a service
+    // starts and the dependency is not worth the milliseconds, and the explicit
+    // set is what a reviewer checks against the names the boot script writes.
+    private static void RequireSafeName(string value, string element)
+    {
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
+            if (!ok)
+            {
+                throw new InvalidDataException(
+                    element + " may contain only letters, digits, '_', '.' and '-'; " +
+                    "it reaches an sc.exe command line. Rejected: '" + value + "'");
+            }
+        }
     }
 
     private static XmlElement First(XmlElement parent, string name)
@@ -257,7 +316,7 @@ internal sealed class ShimService : ServiceBase
             // and the broker's is python.exe; either can leave a grandchild
             // holding the log file or the broker's port, and a port still held
             // when the SCM restarts the service is a broker that never answers.
-            Process killer = Process.Start(new ProcessStartInfo("taskkill.exe",
+            Process killer = Process.Start(new ProcessStartInfo(SystemPaths.Tool("taskkill.exe"),
                 "/PID " + _child.Id + " /T /F")
             { UseShellExecute = false, CreateNoWindow = true });
             if (killer != null) { killer.WaitForExit(10000); }
@@ -381,6 +440,12 @@ internal static class Program
         return 0;
     }
 
+    // Deliberately simple, and NOT the thing that makes this safe: it escapes a
+    // quote but not a value ending in an odd run of backslashes, which is not
+    // correct Win32 argv quoting. What makes the command line safe is
+    // RequireSafeName in the loader, which never lets a character needing this
+    // treatment reach <id> or <name>. Do not relax that check on the strength of
+    // this function.
     private static string Quote(string value)
     {
         return "\"" + value.Replace("\"", "\\\"") + "\"";
@@ -397,7 +462,7 @@ internal static class Program
 
     private static int Sc(string arguments)
     {
-        Process p = Process.Start(new ProcessStartInfo("sc.exe", arguments)
+        Process p = Process.Start(new ProcessStartInfo(SystemPaths.Tool("sc.exe"), arguments)
         {
             UseShellExecute = false,
             RedirectStandardOutput = true,

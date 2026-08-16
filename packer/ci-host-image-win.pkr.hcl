@@ -200,6 +200,25 @@ variable "powershell_version" {
   default     = "7.6.5"
 }
 
+variable "powershell_sha256" {
+  type        = string
+  description = <<-EOT
+    SHA256 of PowerShell-<powershell_version>-win-x64.msi, from the hash table
+    the PowerShell team publishes in the release notes for that tag.
+
+    BUMPING THE VERSION MEANS BUMPING THIS HASH IN THE SAME COMMIT. A version
+    changed without its hash is a build that fails at the verify step, which is
+    the good outcome; the bad one is a reviewer who trusts a hash that was
+    checked against a different file.
+
+    Pinned as a literal rather than fetched from the vendor at build time on
+    purpose: a checksum retrieved over the same channel as the artifact verifies
+    the download, not the artifact. The point of the pin is that it is the value
+    review saw.
+  EOT
+  default     = "3A87C24E044EC792047D734C841917EE4323A535E25F645AE6C33141A35FCA8D"
+}
+
 variable "python_version" {
   type        = string
   description = <<-EOT
@@ -217,6 +236,21 @@ variable "python_version" {
   default     = "3.14.7"
 }
 
+variable "python_sha256" {
+  type        = string
+  description = <<-EOT
+    SHA256 of python-<python_version>-amd64.exe, from the checksum column of
+    python.org's release page for that version. Bump it in the same commit as
+    the version — see `powershell_sha256` for why this is a literal.
+
+    Python 3.14 and later ship no PGP signature (PEP 761); python.org publishes
+    this digest and a sigstore bundle. Verifying the sigstore bundle in the
+    build would need cosign in the image, which is a larger change than this
+    one; the pinned digest is the control that fits here.
+  EOT
+  default     = "9d9eb2709ef81bf5cd30db3c2096bdbc4ea10087c22e62f27d356b36f6ae9649"
+}
+
 variable "git_version" {
   type        = string
   description = <<-EOT
@@ -225,6 +259,16 @@ variable "git_version" {
     the Linux template's assertions exist to catch.
   EOT
   default     = "2.55.0.4"
+}
+
+variable "git_sha256" {
+  type        = string
+  description = <<-EOT
+    SHA256 of Git-<git_version>-64-bit.exe, from the checksum table in the Git
+    for Windows release notes for the matching tag. Bump it in the same commit
+    as the version — see `powershell_sha256` for why this is a literal.
+  EOT
+  default     = "0cbc0b34a74b3aff3ace0910328549155a770e228331b19cb1498218a120e7ff"
 }
 
 variable "warm_cache_script" {
@@ -380,6 +424,15 @@ build {
   #    $ProgressPreference is not cosmetic. Invoke-WebRequest under Windows
   #    PowerShell renders a progress bar per read, which turns a 100 MB download
   #    into a multi-minute one on a VM with plenty of bandwidth.
+  #
+  #    EVERY INSTALLER THIS TEMPLATE FETCHES IS HASH-VERIFIED BEFORE IT RUNS,
+  #    here and in the two steps below. The Linux template does not need this
+  #    because apt verifies GPG signatures on every package it installs; a bare
+  #    HTTPS download of a .msi and then running it elevated has no such control,
+  #    and an installer that every host in the fleet runs at image-build time is
+  #    the highest-leverage supply-chain position in this system. The comparison
+  #    is case-insensitive, which is what PowerShell's `-ne` does on strings:
+  #    vendors publish these digests in both cases.
   provisioner "powershell" {
     elevated_user     = build.User
     elevated_password = build.Password
@@ -390,6 +443,8 @@ build {
       # Bounded, like every call a host in this fleet makes: an unbounded fetch
       # in a build is an image build that hangs until Cloud Build's own timeout.
       "Invoke-WebRequest -UseBasicParsing -TimeoutSec 300 -Uri \"https://github.com/PowerShell/PowerShell/releases/download/v$v/PowerShell-$v-win-x64.msi\" -OutFile $msi",
+      "$got = (Get-FileHash -Algorithm SHA256 -LiteralPath $msi).Hash",
+      "if ($got -ne '${var.powershell_sha256}') { throw \"PowerShell $v installer hash mismatch. expected ${var.powershell_sha256}, got $got\" }",
       "$p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', $msi, '/quiet', '/norestart', 'ADD_PATH=1')",
       "if ($p.ExitCode -ne 0) { throw \"PowerShell 7 install failed with $($p.ExitCode)\" }",
       "Remove-Item -LiteralPath $msi -Force",
@@ -407,6 +462,8 @@ build {
       "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'",
       "$exe = \"$env:TEMP\\${local.git_setup}\"",
       "Invoke-WebRequest -UseBasicParsing -TimeoutSec 300 -Uri 'https://github.com/git-for-windows/git/releases/download/${local.git_tag}/${local.git_setup}' -OutFile $exe",
+      "$got = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash",
+      "if ($got -ne '${var.git_sha256}') { throw \"git installer hash mismatch. expected ${var.git_sha256}, got $got\" }",
       "$p = Start-Process $exe -Wait -PassThru -ArgumentList @('/VERYSILENT','/NORESTART','/NOCANCEL','/SP-','/SUPPRESSMSGBOXES','/COMPONENTS=gitlfs')",
       "if ($p.ExitCode -ne 0) { throw \"git install failed with $($p.ExitCode)\" }",
       "Remove-Item -LiteralPath $exe -Force",
@@ -429,6 +486,8 @@ build {
       "$v = '${var.python_version}'",
       "$exe = \"$env:TEMP\\python-$v-amd64.exe\"",
       "Invoke-WebRequest -UseBasicParsing -TimeoutSec 300 -Uri \"https://www.python.org/ftp/python/$v/python-$v-amd64.exe\" -OutFile $exe",
+      "$got = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash",
+      "if ($got -ne '${var.python_sha256}') { throw \"python $v installer hash mismatch. expected ${var.python_sha256}, got $got\" }",
       "$p = Start-Process $exe -Wait -PassThru -ArgumentList @('/quiet','InstallAllUsers=1','PrependPath=0','Include_launcher=0','Include_test=0','TargetDir=C:\\ci\\bin\\python')",
       "if ($p.ExitCode -ne 0) { throw \"python install failed with $($p.ExitCode)\" }",
       "Remove-Item -LiteralPath $exe -Force",
@@ -444,6 +503,12 @@ build {
   #    writes `.runner` and `.credentials` into the directory it runs in, and K
   #    agents must not share one identity. No credential, token or repository
   #    name is ever in this image.
+  #
+  #    NOT hash-verified, unlike the three installers above, and that asymmetry
+  #    is deliberate rather than an oversight: the runner archive is unverified
+  #    on the Linux template too, so pinning a digest here alone would fix half
+  #    a fleet-wide gap and make the other half look intentional. It is one
+  #    change across both templates, and it is not this one.
   provisioner "powershell" {
     elevated_user     = build.User
     elevated_password = build.Password
@@ -607,15 +672,29 @@ build {
   #     LOCAL ADMINISTRATOR whose password the plugin generated, which would
   #     otherwise be a standing account on every host in the fleet.
   #
-  #     Not generalised with GCESysprep, deliberately and with the trade stated:
-  #     sysprep shuts the guest down from inside, which drops the WinRM session
-  #     Packer is still holding, and the failure mode of getting that wrong is a
-  #     build that reports an error after forty minutes of work. Hosts from this
-  #     image therefore share a computer name until the guest agent renames them
-  #     from instance metadata at first boot. Nothing in this pool identifies a
-  #     host by computer name — the agent name comes from `instance/name` and the
-  #     beacon from guest attributes — so the cost is cosmetic, and it is written
-  #     here rather than discovered.
+  #     NOT GENERALISED WITH GCESysprep, deliberately, and the trade is bigger
+  #     than a name. Sysprep shuts the guest down from inside, which drops the
+  #     WinRM session Packer is still holding, and the failure mode of getting
+  #     that wrong is a build that reports an error after forty minutes of work.
+  #     What skipping it costs, stated in full rather than discovered later:
+  #
+  #       * A SHARED COMPUTER NAME, until the guest agent renames each instance
+  #         from metadata at first boot. Cosmetic here, and checked rather than
+  #         assumed: windows-host-startup.ps1 contains no $env:COMPUTERNAME, no
+  #         `hostname` call and no Rename-Computer — the agent name comes from
+  #         `instance/name` and the beacon from guest attributes.
+  #       * A SHARED MACHINE SID AND A SHARED DPAPI MACHINE KEY, fleet-wide, for
+  #         every host built from one image. Nothing today relies on either:
+  #         no component calls ProtectedData at machine scope, and WinRM and RDP
+  #         certificates are generated per instance by the guest agent's
+  #         windows-keys exchange rather than baked here.
+  #
+  #     THAT SECOND POINT IS A STANDING CONSTRAINT, NOT A FOOTNOTE. A machine-
+  #     scope DPAPI blob written on one host is readable on every other host in
+  #     the fleet. No component may start using ProtectedData at machine scope,
+  #     or cache a machine-protected credential on disk, without revisiting this
+  #     decision — at which point the answer is to generalise the image, not to
+  #     argue the blast radius is small.
   provisioner "powershell" {
     elevated_user     = build.User
     elevated_password = build.Password
