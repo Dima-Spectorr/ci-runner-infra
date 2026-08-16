@@ -58,12 +58,70 @@ variable "github_repo" {
 
 # --- the host -----------------------------------------------------------------
 
+variable "host_os" {
+  description = <<-EOT
+    Operating system of the HOSTS in this pool: "linux" or "windows". A pool has
+    an OS; the module does not. A consumer that wants both instantiates this
+    module twice, each with its own name, MIG, controller and labels — the two
+    pools must never answer the same labels, or GitHub hands a Linux job to a
+    Windows host.
+
+    In the template this selects exactly one thing: which metadata key carries
+    the boot script. `startup-script` on linux, `windows-startup-script-ps1` on
+    windows. It is also published as `ci-host-os`, so the host and the
+    controller read what they are instead of inferring it.
+
+    Everything else host_os does is a REFUSAL at plan time (main.tf). A Windows
+    pool has no container runtime, no metadata fence, no inbound path from the
+    controller and no Secret Manager grant on its host account, so several
+    inputs that are merely unwise on Linux are meaningless or unsafe here, and
+    each is rejected by name rather than accepted and ignored.
+
+    Pair it with `ci-runner-identity`'s `host_os` of the same value: that is
+    what strips the host account down to nothing worth stealing, which on
+    Windows is the whole security argument (docs/adr-windows-pool.md §3A).
+  EOT
+  type        = string
+  default     = "linux"
+
+  validation {
+    condition     = contains(["linux", "windows"], var.host_os)
+    error_message = "host_os must be \"linux\" or \"windows\"."
+  }
+}
+
+variable "windows_image_min_version" {
+  description = <<-EOT
+    Minimum golden-image CONTRACT version a Windows host may boot from,
+    published as `ci-image-min-version`. Ignored on linux.
+
+    The Windows Packer template writes an integer to the image; the boot script
+    reads it and refuses anything below this floor. It is a different number
+    from the image's own version suffix: that one names the artifact, this one
+    states which contract the artifact satisfies. Raise it in the same change
+    that makes the boot script assume a component — and never before an image
+    carrying that number exists, which is how a fleet stops booting.
+  EOT
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.windows_image_min_version >= 1 && floor(var.windows_image_min_version) == var.windows_image_min_version
+    error_message = "windows_image_min_version must be a whole number of at least 1 — the boot script compares it against an integer marker and refuses anything it cannot parse."
+  }
+}
+
 variable "image" {
   description = <<-EOT
     Self-link or family reference of the GOLDEN image the hosts boot from. The
     image is expected to already contain the runner agent, the container
     runtime, and the pre-warmed toolchain/dependency caches. Build it with
-    packer/ci-host-image.pkr.hcl.
+    packer/ci-host-image.pkr.hcl — or, for `host_os = "windows"`, with
+    packer/ci-host-image-win.pkr.hcl, whose family is `ci-runner-host-win` and
+    is deliberately never the Linux one: a family points at its newest member,
+    so sharing one would let build order hand a pool the wrong kernel. Naming
+    the family of the other OS is refused at plan time (main.tf), because the
+    guest agent's response to the mispairing is to run no boot script at all.
 
     The entire point of this module is that a host does not install anything at
     boot. Pointing this at a bare distro image silently reintroduces the
@@ -103,11 +161,24 @@ variable "slots_per_host" {
     registers. Also the autoscaler's `single_instance_assignment`, so demand of
     N jobs asks for ceil(N / slots_per_host) hosts.
 
-    Each slot is a separate Linux user with its own rootless Docker daemon and
-    its own dependency cache, so concurrent slots share no socket, no $HOME, no
-    workspace and nothing writable at all. This needs image v3-11-0 or later; on
-    an older image the host refuses to register rather than putting every slot
-    back on one daemon.
+    On `host_os = "linux"`, each slot is a separate Linux user with its own
+    rootless Docker daemon and its own dependency cache, so concurrent slots
+    share no socket, no $HOME, no workspace and nothing writable at all. This
+    needs image v3-11-0 or later; on an older image the host refuses to register
+    rather than putting every slot back on one daemon.
+
+    On `host_os = "windows"` the first half survives verbatim and the second has
+    no analogue: each slot is a separate local Windows account with its own
+    profile, workspace and TEMP, and there is NO container runtime at all. A
+    reader who carries the Linux sentence across concludes that jobs are
+    container-isolated on Windows, and they are not. Two consequences a Windows
+    consumer decides on rather than inherits: concurrent slots share one
+    loopback and one port space (Windows has no per-slot network namespace), so
+    two jobs binding the same fixed port collide and report it as a flaky test;
+    and a build slot's memory floor is set by MSBuild, not by a shell. The
+    default of 4 is shared and therefore unchanged — the Windows guidance is 2,
+    and 1 for a pool whose jobs bind fixed ports, which is where the first
+    Windows pool starts.
 
     Note that the cache is per-slot COPIES of one master, so K slots hold K
     copies of the warmed tree — this variable multiplies the cache's disk cost,
@@ -143,6 +214,13 @@ variable "spot" {
     Only safe for pools whose jobs are NOT merge-blocking: a preemption kills
     every job on the host at once, and with K slots the blast radius is K jobs,
     not one. Leave false for the pool that gates merges.
+
+    Refused outright on `host_os = "windows"`. Windows adds two reasons to the
+    fleet-wide one: a preemption takes K slots with it on a host whose boot is
+    measured in minutes, and Windows Server is licensed per vCPU-hour whatever
+    the provisioning model, so the saving is smaller than it looks. Removing it
+    from the Linux path is a breaking input change for every existing consumer
+    and is deliberately a separate change.
   EOT
   type        = bool
   default     = false
@@ -396,6 +474,11 @@ variable "extra_registry_hosts" {
     next to its runners. Hostnames only — docker matches these EXACTLY, and a
     pattern like `*.pkg.dev` is silently never consulted, which shows up as a
     job failing its pull rather than as a configuration error.
+
+    Refused outright on `host_os = "windows"`: there is no docker on a Windows
+    host and nothing reads the list. Accepting it would be the worst kind of
+    no-op — a consumer configures a private registry, Terraform applies clean,
+    and the failure arrives later as an unauthenticated pull inside a job.
   EOT
   type        = list(string)
   default     = []
@@ -499,10 +582,18 @@ variable "network_tags" {
     tags this module always applies ("ci-runner-host" / "ci-runner-controller"
     and the pool name).
 
-    Pass the tag the project's firewall rules target. It is not decoration: the
-    controller verifies a host is truly idle over IAP-SSH before deleting it, so
-    a host the IAP rule does not reach fails that check, the drain aborts, and
-    the pool never scales in — the exact failure this module exists to fix.
+    Pass the tag the project's firewall rules target. On `host_os = "linux"` it
+    is not decoration: the controller verifies a host is truly idle over IAP-SSH
+    before deleting it, so a host the IAP rule does not reach fails that check,
+    the drain aborts, and the pool never scales in — the exact failure this
+    module exists to fix.
+
+    That contract is Linux-only. A Windows pool's liveness gate is outbound —
+    the host publishes what it knows about itself to guest attributes and the
+    controller reads it through the compute API — so a Windows host needs NO
+    inbound path from the controller at all: no IAP-SSH rule, no tag, no
+    listener. A reader of a Windows pool should not go hunting for a firewall
+    rule that must not exist.
   EOT
 }
 

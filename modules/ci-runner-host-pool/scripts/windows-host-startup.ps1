@@ -347,8 +347,25 @@ function Get-SlotPasswordCharacter {
     # Four bytes of entropy per character, drawn once. The modulo bias over a
     # 32-bit draw into an at-most-64-character alphabet is far below anything that
     # matters for a 40-character secret that never leaves the machine.
+    #
+    # Instance + GetBytes(byte[]), never the static one-liner that takes a
+    # Span<byte>, and never the class's own bounded-integer helper. Both of those
+    # arrived with .NET Core and have no .NET Framework overload at all. This
+    # script is handed to the guest agent as `windows-startup-script-ps1`, which
+    # the agent runs with the in-box powershell.exe -- Windows PowerShell 5.1 on
+    # .NET Framework 4.8 -- so either would throw MethodNotFound right here and
+    # every host in the pool would fail phase 1 and deny its own boot. The Pester
+    # suite runs this function under pwsh 7, where both exist, so the runtime that
+    # actually matters is the one no test covers. Create(), GetBytes(byte[]) and
+    # Dispose() are present in every .NET Framework the fleet can boot on and in
+    # .NET Core, which makes this the one form that runs in both.
     $bytes = [byte[]]::new($Length * 4)
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    } finally {
+        $rng.Dispose()
+    }
 
     $chars = [char[]]::new($Length)
     for ($i = 0; $i -lt $classes.Count; $i++) {
