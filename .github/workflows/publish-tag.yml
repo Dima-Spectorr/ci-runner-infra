@@ -127,26 +127,11 @@ jobs:
           want=$(tr -d '[:space:]' < VERSION)
           major="${want%%.*}"
 
-          # `v5` alongside `v5.7.0`, the same contract `actions/checkout@v4`
-          # offers. A consumer that pins the exact version decides when to move
-          # and pays a pull request per release across nine repositories; a
-          # consumer that pins the major tag adopts at its next apply and pays
-          # none. Publishing both makes that a choice each repository makes for
-          # itself instead of one this repository makes for all of them.
-          #
-          # Only ever moved forward to what VERSION names, and only within a
-          # major: the promise is "the newest v5", not "the newest anything", so
-          # a breaking release cannot arrive at a consumer that never asked for
-          # it.
-          sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$want" --jq '.object.sha') || {
-            echo "::error::$want does not exist — the step above should have created it"
-            exit 1
-          }
-
-          # Both writes below go through this, because a transient failure on
-          # either is the same failure — the floating tag not moving — and the
-          # recovery is the same. On 2026-08-15 six consecutive runs went red
-          # here on `Resource not accessible by integration (HTTP 403)`, and the
+          # EVERY api call in this step goes through this, because a transient
+          # failure on any of them is the same failure — the floating tag not
+          # moving — and the recovery is the same. On 2026-08-15 six consecutive
+          # runs went red here on `Resource not accessible by integration (HTTP
+          # 403)`, and the
           # same call, with the same token, against the same ref, at the same
           # target, had succeeded twelve seconds before the first of them and
           # succeeded again seventy minutes after the last. No repository
@@ -189,6 +174,30 @@ jobs:
               sleep $((attempt * 10))
               attempt=$((attempt + 1))
             done
+          }
+
+          # `v5` alongside `v5.7.0`, the same contract `actions/checkout@v4`
+          # offers. A consumer that pins the exact version decides when to move
+          # and pays a pull request per release across nine repositories; a
+          # consumer that pins the major tag adopts at its next apply and pays
+          # none. Publishing both makes that a choice each repository makes for
+          # itself instead of one this repository makes for all of them.
+          #
+          # Only ever moved forward to what VERSION names, and only within a
+          # major: the promise is "the newest v5", not "the newest anything", so
+          # a breaking release cannot arrive at a consumer that never asked for
+          # it.
+          # Retried, and the reason is a 404 rather than a 403: the previous step
+          # created this tag SECONDS ago, and on 2026-08-16 this read came back
+          # `Not Found` for a tag that git ls-remote showed present the whole
+          # time. Read-after-write against the refs API is not immediate, so an
+          # unretried read here turns a successful publish into a red release
+          # and — worse — leaves the floating major behind while the exact tag is
+          # out, which is the one state the whole fleet notices and nothing
+          # reports.
+          sha=$(retry_api "repos/$GITHUB_REPOSITORY/git/ref/tags/$want" --jq '.object.sha') || {
+            echo "::error::$want still does not exist after three reads — the step above reported creating it, so either the write did not land or the refs API is not converging."
+            exit 1
           }
 
           # Force, unlike the exact tag: a floating tag that could not be moved
