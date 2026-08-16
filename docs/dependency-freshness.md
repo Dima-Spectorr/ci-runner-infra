@@ -8,6 +8,13 @@ scanner that feeds it is `scripts/ci/scan-support-windows.sh`, asserted by
 `scripts/ci/scan-support-windows.selftest.sh`. It is delivered as a reusable
 workflow, consumed by tag exactly as `modules/ci-runner-host-pool` is.
 
+The tag in the snippet below is the **floating major**, `@v5`, which is what
+this repository's guides publish and what its pin gate asserts — an exact
+`@vX.Y.Z` in a document is stale on the next release. It costs nothing here:
+the workflow resolves `github.job_workflow_sha` at run time, so a consumer
+still runs the scanner at the exact commit the tag pointed at when the job
+started, rather than whatever is on the default branch.
+
 ---
 
 ## What it is, and what already exists
@@ -153,7 +160,7 @@ concurrency:
 
 jobs:
   scan:
-    uses: <org>/ci-runner-infra/.github/workflows/support-windows.yml@v5.20.0
+    uses: <org>/ci-runner-infra/.github/workflows/support-windows.yml@v5
     permissions:
       contents: read
       issues: write

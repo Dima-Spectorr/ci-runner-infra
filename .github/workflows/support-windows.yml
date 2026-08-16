@@ -5,7 +5,7 @@ name: Support windows
 #
 #   jobs:
 #     support-windows:
-#       uses: <org>/ci-runner-infra/.github/workflows/support-windows.yml@v5.20.0
+#       uses: <org>/ci-runner-infra/.github/workflows/support-windows.yml@v5
 #       permissions:
 #         contents: read
 #         issues: write
