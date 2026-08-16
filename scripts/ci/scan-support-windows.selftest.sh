@@ -9,11 +9,14 @@
 # The feed fixtures below are real values transcribed from the API on
 # 2026-08-16, trimmed to the cycles each assertion needs.
 #
-# Several needles are single-quoted Markdown containing backticks, which
-# shellcheck reads as a command substitution nobody expanded (SC2016). They are
-# literal report text — the assertion is that the report says `.nvmrc`, backticks
-# and all — so those sites carry a bare disable rather than being rewritten into
-# something that no longer matches what a reader sees.
+# Several needles are single-quoted Markdown containing backticks, read as a
+# command substitution nobody expanded (SC2016). They are literal report text —
+# the assertion is that the report says `.nvmrc`, backticks and all — so those
+# sites carry a bare disable rather than being rewritten into something that no
+# longer matches what a reader sees.
+#
+# Note the wrapping: a comment line STARTING with the tool's own name is parsed
+# as a directive, so this paragraph never begins a line with it.
 
 set -uo pipefail
 
