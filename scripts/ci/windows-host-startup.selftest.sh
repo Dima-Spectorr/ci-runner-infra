@@ -447,6 +447,35 @@ has_worthless_host_identity_probe() { # <file>
   matches "$code" 'the broker vends' || return 1
 }
 
+has_probe_literal_guard() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # Get-ProbeScript builds PowerShell SOURCE, so every value it interpolates is
+  # code -- and the secret name and broker endpoint both arrive from instance
+  # metadata, which §3A says outright is writable by anything holding the
+  # machine's identity. One apostrophe closes the literal and appends statements
+  # to a payload running with a live, unreduced host token: a larger capability
+  # than the one the probe exists to disprove.
+  matches "$code" 'Test-ProbeLiteral' || return 1
+  matches "$code" 'interpolated as code' || return 1
+
+  # An allow-list per kind, and a THROW rather than a strip. A sanitized value
+  # still builds a payload, and a payload that quietly measured the wrong secret
+  # is worse than a boot that stops with the reason on the console.
+  matches "$code" "\\^\\[A-Za-z0-9_-\\]\\+\\\$" || return 1
+  matches "$code" 'throw \("probe ' || return 1
+
+  # Three sibling outcomes, not two. Get-ChildItem throws identically on a path
+  # this account may not read and a path that is not there, so folding them
+  # together lets a workspace that had not been created yet report as a proved
+  # ACL boundary -- the same absence-read-as-a-pass the missing-verdict case
+  # above refuses.
+  matches "$code" 'UnauthorizedAccessException' || return 1
+  matches "$code" 'ItemNotFoundException' || return 1
+  matches "$code" 'never tested' || return 1
+}
+
 # --- the helper carries the trap it was written to avoid ---------------------
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -505,6 +534,12 @@ if has_worthless_host_identity_probe "$SCRIPT"; then
   ok
 else
   bad "the boot probe no longer proves the host identity is worthless — §3A traded the metadata fence for an IAM reduction that Terraform cannot verify at plan time, so a Windows pool pointed at an unreduced host account applies clean and is only wrong once a pull request is running on it"
+fi
+
+if has_probe_literal_guard "$SCRIPT"; then
+  ok
+else
+  bad "the probe payload interpolates metadata-derived values without an allow-list, or folds a missing sibling workspace into a denied one — the first turns a defence probe into arbitrary code holding a live host token, the second reports an ACL boundary that was never tested as proved"
 fi
 
 if has_job_hook_acl "$SCRIPT"; then
@@ -764,6 +799,20 @@ mutate "a probe that wrote no verdict read as a probe that found nothing" \
 mutate "the broker identity accepted without checking whose it is" \
   's|the broker vends|the broker answered as|' \
   has_worthless_host_identity_probe
+
+# --- group 11: the payload builder trusts a metadata-derived value -----------
+mutate "the interpolation allow-list dropped altogether" \
+  's|Test-ProbeLiteral|Confirm-ProbeLiteral|g' \
+  has_probe_literal_guard
+mutate "a rejected value sanitized into a payload instead of stopping the boot" \
+  's|throw ("probe |Write-BootLog ("probe |' \
+  has_probe_literal_guard
+mutate "an absent sibling workspace read as a denied one" \
+  's|ItemNotFoundException|OperationCanceledException|' \
+  has_probe_literal_guard
+mutate "the untested-ACL sentence renamed out of the verdict" \
+  's|never tested|not checked|' \
+  has_probe_literal_guard
 
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -1093,12 +1093,24 @@ function Get-ProbeFailure {
         if (-not [string]::IsNullOrWhiteSpace($email)) {
             $fail.Add("a broker answered as '$email' on a pool that configured no job service account")
         }
-    } elseif ($email -ne $JobServiceAccount) {
+    } elseif ($email -cne $JobServiceAccount) {
+        # Case-sensitive on purpose. The claim being checked is "this is exactly
+        # the identity the pool configured", and -ne would accept a near-miss.
         $fail.Add("the broker vends '$email', not $JobServiceAccount")
     }
 
-    if ((& $get 'siblingDenied') -ne $true) {
+    # Three outcomes, not two. Get-ChildItem throws identically on a denied path
+    # and on a path that is not there, so folding them together would let a
+    # sibling workspace that simply had not been created yet report as a proved
+    # ACL boundary -- the same "absence read as a pass" this function refuses
+    # for a missing verdict file.
+    $sibling = [string] (& $get 'siblingStatus')
+    if ($sibling -eq 'allowed') {
         $fail.Add('a slot could read another slot''s workspace -- the per-slot ACLs are not holding')
+    } elseif ($sibling -eq 'missing') {
+        $fail.Add('the sibling workspace was not there to read, so the per-slot ACLs were never tested')
+    } elseif ($sibling -ne 'denied') {
+        $fail.Add("the sibling read neither succeeded nor was denied ('$sibling') -- the per-slot ACLs are unproved")
     }
     if ((& $get 'cacheWritable') -ne $true) {
         $fail.Add('the warm cache is not writable by a slot, so every job on this host repopulates it')
@@ -1107,6 +1119,36 @@ function Get-ProbeFailure {
         $fail.Add('name resolution failed from a slot context, so no agent on this host could reach GitHub')
     }
     return $fail.ToArray()
+}
+
+function Test-ProbeLiteral {
+    <#
+      .SYNOPSIS
+        Whether a value may be interpolated into the probe payload. Pure.
+      .DESCRIPTION
+        Get-ProbeScript builds PowerShell source text, so every value it
+        interpolates is code. The secret name and the broker endpoint both come
+        from instance metadata, which section 3A of the ADR says outright is
+        readable AND writable by anything with the machine's identity -- and a
+        single apostrophe closes the literal it lands in and appends statements
+        to a payload that runs holding a live, unreduced host token. That is a
+        larger capability than the one the probe exists to disprove.
+
+        Allow-list, and throw rather than sanitize. A stripped value would still
+        build a payload, and a payload that quietly measured the wrong secret is
+        worse than a boot that stops with the reason on the console.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Value,
+        [Parameter(Mandatory = $true)][ValidateSet('name', 'endpoint', 'path')][string] $Kind
+    )
+    if ([string]::IsNullOrEmpty($Value)) { return $true }
+    switch ($Kind) {
+        'name' { return ($Value -match '^[A-Za-z0-9_-]+$') }
+        'endpoint' { return ($Value -match '^[A-Za-z0-9._-]+:[0-9]+$') }
+        default { return ($Value -match '^[A-Za-z]:\\[A-Za-z0-9 \\._-]*$') }
+    }
 }
 
 function Get-ProbeScript {
@@ -1150,6 +1192,20 @@ function Get-ProbeScript {
         [int] $TimeoutSeconds = $script:HttpTimeoutSeconds
     )
 
+    # Every one of these becomes code. See Test-ProbeLiteral for why a metadata
+    # value reaching this point unchecked is worse than the finding it looks for.
+    foreach ($pair in @(
+            @{ n = 'SecretName'; v = $SecretName; k = 'name' },
+            @{ n = 'BrokerEndpoint'; v = $BrokerEndpoint; k = 'endpoint' },
+            @{ n = 'SiblingWorkspace'; v = $SiblingWorkspace; k = 'path' },
+            @{ n = 'CacheRoot'; v = $CacheRoot; k = 'path' },
+            @{ n = 'ResultPath'; v = $ResultPath; k = 'path' })) {
+        if (-not (Test-ProbeLiteral -Value $pair.v -Kind $pair.k)) {
+            throw ("probe $($pair.n) '$($pair.v)' is not a bare $($pair.k), so it would be " +
+                'interpolated as code into a payload that holds a host token')
+        }
+    }
+
     # OMITTED, not disabled. A runtime `if ('')` around the broker read would
     # leave the endpoint and the path in the payload text, where the only thing
     # that stops them being used is a condition somebody could later "simplify".
@@ -1170,7 +1226,7 @@ try {
 `$md = @{ 'Metadata-Flavor' = 'Google' }
 `$r = [ordered] @{
     hostToken = `$false; secretStatus = `$null; metricStatus = `$null
-    brokerEmail = ''; siblingDenied = `$false; cacheWritable = `$false; dnsResolved = `$false
+    brokerEmail = ''; siblingStatus = 'unrun'; cacheWritable = `$false; dnsResolved = `$false
 }
 
 # The real metadata server, deliberately. See Get-ProbeScript's description.
@@ -1216,10 +1272,20 @@ if (`$tok -and `$project -and '$SecretName') {
 
 $brokerBlock
 
-# Denial is the pass. Success here is a sibling's workspace this account read.
+# Denial is the pass, and 'missing' is NOT denial: Get-ChildItem throws the same
+# way for a path this account may not read and a path that is not there, so the
+# exception type is the only thing that separates a proved ACL from an untested
+# one. Get-ProbeFailure treats every value but 'denied' as a finding.
 try {
     `$null = Get-ChildItem -LiteralPath '$SiblingWorkspace' -Force -ErrorAction Stop
-} catch { `$r.siblingDenied = `$true }
+    `$r.siblingStatus = 'allowed'
+} catch [System.UnauthorizedAccessException] {
+    `$r.siblingStatus = 'denied'
+} catch [System.Management.Automation.ItemNotFoundException] {
+    `$r.siblingStatus = 'missing'
+} catch {
+    `$r.siblingStatus = 'error'
+}
 
 try {
     `$probe = Join-Path '$CacheRoot' ('probe-' + [guid]::NewGuid().ToString('N') + '.tmp')
