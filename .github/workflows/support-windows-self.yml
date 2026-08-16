@@ -1,0 +1,48 @@
+name: Support windows (this repository)
+
+# This repository publishes the support-window rule, so it is the first place
+# the rule has to hold — the same argument `ci.yml` already makes for running
+# `check-runner-policy.sh` against its own workflows.
+#
+# And it is not a formality here. The golden image bakes a system Node major in
+# `packer/ci-host-image.pkr.hcl` and a host OS release line beside it. Those two
+# declarations are inherited by every host in the fleet, are named in no
+# application manifest, and are covered by no Dependabot ecosystem: nothing
+# anywhere reports them ageing. They were the reason the scan was pointed at
+# Packer files at all.
+
+on:
+  schedule:
+    # Weekly. The findings move on release calendars, not on commits — a daily
+    # run would re-read the same four dates and re-file the same issue six more
+    # times a week. Monday morning, so a version that expired over the weekend
+    # is on the board before anyone starts a branch on it.
+    - cron: '17 6 * * 1'
+  pull_request:
+    # Only when something that could change the answer changes: the image
+    # definition, the scanner itself, or the workflow. Everything else in this
+    # repository is Terraform and shell that declares no runtime.
+    paths:
+      - 'packer/**'
+      - 'scripts/ci/scan-support-windows.sh'
+      - 'scripts/ci/support-window-*'
+      - '.github/workflows/support-windows*.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # `run_id` rather than a constant on the non-pull-request half: a scheduled
+  # run must never be cancelled by the next one, because the step it would be
+  # interrupted in is the one that upserts the issue.
+  group: support-windows-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    uses: ./.github/workflows/support-windows.yml
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write

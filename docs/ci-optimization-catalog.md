@@ -442,6 +442,35 @@ ten locally-cloned consumers: **344 unpinned references, zero repositories
 clean**. See `docs/ci-workflow-gates.md` for adoption, including the Dependabot
 config without which pinning becomes permanent staleness.
 
+### 7.1 Dependabot answers the other question — shipped
+
+Pinning plus Dependabot keeps a dependency *current*. Neither of them notices
+when a version stops being *supported*, and the fleet was full of the
+difference. Measured 2026-08-16, with no alert raised anywhere:
+
+- **Node 18** — end of life 2025-04-30, sixteen months past.
+- **Node 20** — end of life 2026-04-30, four months past.
+- **Node 22** — end of life 2027-04-30, so every end-of-life check reads it as
+  fine. Its ACTIVE support ended 2025-10-21, and new applications were being
+  started on it while Node 24 was available and supported for another year.
+- **The golden image itself** — `node_major` in `packer/ci-host-image.pkr.hcl`
+  was that same Node 22, inherited by every host in the fleet, named in no
+  application manifest and covered by no Dependabot ecosystem.
+
+The third bullet is the one no existing tool can reach: 22 is not "behind"
+anything a version check tracks, and its end-of-life date is eight months out.
+What is wrong is the *runway* of a line chosen for something new.
+
+**Shipped:** `scripts/ci/support-window-decision.sh` — SUP1 past end of support,
+SUP3 a NEW declaration on a shorter runway than an available line, SUP2 inside
+the migration window, SUP5 maintenance-only (informational), SUP4 undecided and
+never a pass. Delivered as the reusable workflow
+`.github/workflows/support-windows.yml`; it reports through an issue and a pull
+request comment rather than a required check, because none of its dates are
+moved by the pull request being checked. See `docs/dependency-freshness.md`,
+including why `eol: false` upstream means "no date announced" and reading it as
+a boolean reports the whole fleet clean.
+
 ---
 
 ## 8. Governance tier — how this stays true
