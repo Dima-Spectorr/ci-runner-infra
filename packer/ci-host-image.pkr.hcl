@@ -385,6 +385,21 @@ build {
   #     host-startup.sh's cache_master_is_hostile(), which repeats this at boot
   #     because an image is not the only way content reaches this tree.
   provisioner "shell" {
+    # `execute_command` below says `bash`, and that is NOT what interprets this
+    # script. Packer uploads an inline block to a file and `execute_command`
+    # runs it as a COMMAND, so the kernel honours the file's shebang — and the
+    # shebang Packer writes is `inline_shebang`, whose default is `/bin/sh -e`.
+    # On Ubuntu that is dash, and dash has no `pipefail`:
+    #
+    #   /tmp/script_3436.sh: 2: set: Illegal option -o pipefail
+    #
+    # Every other provisioner in this file gets away with the default because
+    # each one says `set -eux`, which dash accepts. This block is the first to
+    # need `pipefail` — and it needs it for a stated reason, that without it a
+    # `find` which errors still passes the guard — so the interpreter has to be
+    # the one that has it. Naming it here rather than globally keeps the change
+    # to the block that requires it.
+    inline_shebang = "/bin/bash -e"
     inline = [
       "set -euxo pipefail",
       "bad=$(find /opt/ci-cache \\( -type l -o -type b -o -type c -o -type p -o -type s -o -perm /6000 -o \\( -type f -a -links +1 \\) \\) -print -quit)",
