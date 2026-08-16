@@ -611,7 +611,7 @@ has_registration_token_witness() { # <file>
   # POLLED to a bound, not read once. The controller deletes on its own tick, so
   # a single read taken the instant the last agent came up fails on a healthy
   # fleet -- and an unbounded one is the 2h55m outage restated.
-  matches "$code" 'Get-JitteredSeconds -BaseSeconds \$script:TokenRemovalWaitSeconds' || return 1
+  matches "$code" 'Get-JitteredTimeout -BaseSeconds \$script:TokenRemovalWaitSeconds' || return 1
   matches "$code" 'if \(\(Get-Date\) -ge \$deadline\) \{ break \}' || return 1
 
   # …and the bound is SPREAD. One controller is the shared dependency of every
@@ -1325,7 +1325,7 @@ mutate "a live token left in metadata downgraded to a log line" \
   's|Deny-Boot ("\$script:RegistrationTokenKey is STILL on this instance|Write-BootLog ("$script:RegistrationTokenKey is STILL on this instance|' \
   has_registration_token_witness
 mutate "the witness reading once instead of polling the controller's own tick" \
-  's|Get-JitteredSeconds -BaseSeconds \$script:TokenRemovalWaitSeconds|0 * (0|' \
+  's|Get-JitteredTimeout -BaseSeconds \$script:TokenRemovalWaitSeconds|0 * (0|' \
   has_registration_token_witness
 mutate "the jittered bound tidied back into a constant every host crosses together" \
   's|\$script:TokenRemovalJitterSeconds = 300|$script:TokenRemovalJitterSeconds = 0|' \

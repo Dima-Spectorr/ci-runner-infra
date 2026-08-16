@@ -1147,24 +1147,24 @@ Describe 'jittered timeout' {
     # one that became unbounded. Both are invisible from a call site that rolls
     # its own dice, which is why the roll is a parameter.
     It 'never returns less than the base' {
-        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 300 -Roll 0.0 | Should -Be 600
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 300 -Roll 0.0 | Should -Be 600
     }
 
     It 'never exceeds base plus jitter' {
-        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 300 -Roll 1.0 | Should -Be 900
-        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 300 -Roll 0.5 | Should -Be 750
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 300 -Roll 1.0 | Should -Be 900
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 300 -Roll 0.5 | Should -Be 750
     }
 
     # Get-Random is documented as [0,1) but the clamp is not decoration: a caller
     # that hands this a ratio out of range must not widen the bound past what
     # the constant advertises.
     It 'clamps a roll outside zero-to-one' {
-        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 300 -Roll 7.5 | Should -Be 900
-        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 300 -Roll -2.0 | Should -Be 600
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 300 -Roll 7.5 | Should -Be 900
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 300 -Roll -2.0 | Should -Be 600
     }
 
     It 'degenerates to the base when there is no jitter window' {
-        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 0 -Roll 0.9 | Should -Be 600
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 0 -Roll 0.9 | Should -Be 600
     }
 }
 

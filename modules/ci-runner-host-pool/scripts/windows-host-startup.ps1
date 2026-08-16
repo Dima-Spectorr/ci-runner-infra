@@ -193,7 +193,7 @@ $script:RegistrationPollSeconds = 5
 $script:TokenRemovalWaitSeconds = 600
 $script:TokenRemovalJitterSeconds = 300
 
-function Get-JitteredSeconds {
+function Get-JitteredTimeout {
     <#
       .SYNOPSIS
         Spread a fixed timeout across a window, from a roll in [0,1). Pure.
@@ -2924,7 +2924,7 @@ function Wait-RegistrationTokenRemoved {
     #>
     [CmdletBinding()]
     param(
-        [int] $TimeoutSeconds = (Get-JitteredSeconds -BaseSeconds $script:TokenRemovalWaitSeconds `
+        [int] $TimeoutSeconds = (Get-JitteredTimeout -BaseSeconds $script:TokenRemovalWaitSeconds `
                 -JitterSeconds $script:TokenRemovalJitterSeconds -Roll (Get-Random -Minimum 0.0 -Maximum 1.0)),
         [int] $PollSeconds = $script:RegistrationPollSeconds
     )
