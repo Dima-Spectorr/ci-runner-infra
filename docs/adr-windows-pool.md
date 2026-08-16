@@ -906,6 +906,17 @@ the fleet.
 
 ### Residual risk, honestly
 
+**Accepted, 2026-08-16.** The paragraph below was put to the product owner in
+plain terms — a Windows build job can reach the machine's cloud identity, and no
+design in this repository stops it — together with the alternatives: drop the
+warm Windows pool, spend a few days proving the one undocumented mechanism, or
+restrict Windows to repositories that hold nothing sensitive. The decision is to
+**accept this residual with the identity stripped down**, i.e. the design below.
+The same decision explicitly leaves **Linux unchanged**: its fence is proved on a
+live host, and re-plumbing every existing host's identity does not belong in a
+delivery whose purpose is to add Windows. Taking the App key away from Linux
+hosts too is worth doing and is not scheduled here.
+
 **Job code on a Windows host can reach the metadata server, and there is no
 mechanism in this design that stops it.** Concretely: a job can mint an access
 token for the host service account and impersonate the job service account —
