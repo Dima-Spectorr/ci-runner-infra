@@ -192,6 +192,7 @@ has "…and the multi-stage stage name is not mistaken for an image" \
 # which is the ordinary shape of a library manifest. Emitted once per section it
 # becomes three identical rows and three counts, and a report that says the same
 # thing three times reads as one that cannot count.
+# shellcheck disable=SC2016
 check "a package in three sections is counted once" 1 \
   "$(grep -c '| `vue` |' "$REPORT")"
 
