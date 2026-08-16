@@ -359,9 +359,19 @@ resource "google_cloud_scheduler_job" "daily_apply" {
   # the API, and then fails at every fire with a permission error naming the
   # service agent rather than the account — a message that sends the reader to
   # the wrong project.
+  #
+  # The default compute account is the one shape this cannot prove. Its email
+  # carries the project NUMBER, not the project id, and resolving one to the
+  # other needs a `google_project` data source — a read this module does not
+  # otherwise perform, and adding it would make every already-working consumer
+  # depend on a permission it has never needed. So that shape is accepted on its
+  # form alone, and the residual gap is real and small: passing ANOTHER
+  # project's default compute account gets through here and fails at fire time
+  # with exactly the service-agent error this precondition exists to pre-empt —
+  # which the message below already explains.
   lifecycle {
     precondition {
-      condition     = endswith(coalesce(var.scheduler_service_account, var.service_account), "@${var.project_id}.iam.gserviceaccount.com")
+      condition     = endswith(coalesce(var.scheduler_service_account, var.service_account), "@${var.project_id}.iam.gserviceaccount.com") || can(regex("^[0-9]+-compute@developer\\.gserviceaccount\\.com$", coalesce(var.scheduler_service_account, var.service_account)))
       error_message = "The scheduler's account must live in ${var.project_id}: Cloud Scheduler mints its token through a per-project service agent, so a cross-project account fails at fire time with an error naming the service agent, not the account."
     }
   }
