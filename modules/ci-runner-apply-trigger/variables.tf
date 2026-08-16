@@ -22,7 +22,7 @@ variable "github_connection" {
   type        = string
   default     = null
   description = <<-EOT
-    Name of an EXISTING 2nd-gen Cloud Build connection in this project and region, e.g. `dataretrieval-github`. Null (the default) means the project links repositories the 1st-gen way, through the Cloud Build GitHub App, and the trigger is built with a `github {}` block.
+    Name of an EXISTING 2nd-gen Cloud Build connection in this project and region, e.g. `<project>-github`. Null (the default) means the project links repositories the 1st-gen way, through the Cloud Build GitHub App, and the trigger is built with a `github {}` block.
 
     THE TWO GENERATIONS ARE DIFFERENT APIS, NOT A VERSION FLAG. A 1st-gen trigger names owner/repo directly and resolves them against a project-level GitHub App install; a 2nd-gen trigger names a `google_cloudbuildv2_repository` resource under a connection. Neither block works against the other's link, and the failure is not a validation error — it is a trigger that is created successfully and never fires, because the push it is watching for arrives on a link it cannot see.
 
@@ -65,9 +65,23 @@ variable "service_account" {
     THE ONE SECURITY DECISION IN THIS MODULE. It should be the project's existing CD account, and it should NOT hold roles/iam.serviceAccountAdmin or roles/resourcemanager.projectIamAdmin: an account that can apply the runner root END TO END can grant itself owner, and a compute-scoped account instead stops red on the rare apply that changes an identity, which is the intended behaviour and not a gap.
   EOT
 
+  # The job here is to reject a RESOURCE NAME — `projects/p/serviceAccounts/x` —
+  # because the resource name is built from this value and a doubled prefix
+  # fails at apply with a message about a malformed path rather than about the
+  # input that produced it.
+  #
+  # The first spelling of it also rejected the DEFAULT COMPUTE account, which is
+  # a legal service account with a different shape: a numeric prefix, and
+  # `developer.gserviceaccount.com` rather than `<project>.iam.`. That was an
+  # accident of writing the pattern from the one example to hand, and it is not
+  # a security control standing in for a role check — a project whose CD runs as
+  # its default compute account typically holds compute.instanceAdmin.v1 and
+  # cloudscheduler.admin and neither serviceAccountAdmin nor projectIamAdmin,
+  # which is exactly the shape this module asks for. A validation that rejects
+  # a correct input teaches the reader to work around the validation.
   validation {
-    condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]+\\.iam\\.gserviceaccount\\.com$", var.service_account))
-    error_message = "service_account must be a service account EMAIL (name@project.iam.gserviceaccount.com), not a full projects/.../serviceAccounts/... resource name — the resource name is built from it."
+    condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]+\\.iam\\.gserviceaccount\\.com$", var.service_account)) || can(regex("^[0-9]+-compute@developer\\.gserviceaccount\\.com$", var.service_account))
+    error_message = "service_account must be a service account EMAIL — name@project.iam.gserviceaccount.com, or <number>-compute@developer.gserviceaccount.com for a project's default compute account — not a full projects/.../serviceAccounts/... resource name, which is built from it."
   }
 }
 
