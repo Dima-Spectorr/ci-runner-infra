@@ -7,7 +7,7 @@ every pool in that project.
 
 ```hcl
 module "ci_cache" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-bucket?ref=v5.17.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-bucket?ref=v5.18.0"
 
   project_id = var.project_id
   name       = "${var.project_id}-ci-cache"
@@ -81,9 +81,28 @@ Two grants, therefore, not one:
 The host's grant is built by the host-pool module and is asserted by
 `scripts/ci/shared-cache.selftest.sh`: `roles/storage.objectViewer`, never
 `objectUser` or `objectAdmin`, so it carries no `storage.objects.create` and no
-`storage.objects.delete`. The producer's grant does not exist yet — nothing
-writes to this bucket, so a pool configured to read it simply finds no snapshot
-and runs on the cache its image baked.
+`storage.objects.delete`.
+
+The producer's grant is now `ci-runner-cache-publisher`: an account with no key,
+attached to no VM, assumable only through Workload Identity Federation by a run
+of one named workflow file, in one named repository, on the default ref. It holds
+create — not overwrite — under its own pool's prefix, and may replace exactly one
+object, the pointer. The script that builds and uploads a snapshot does not exist
+yet, so nothing writes here in practice and a pool configured to read simply
+finds no snapshot and runs on the cache its image baked.
+
+**The other half — *and no one else* — this module does not state, and it says so
+in the code rather than implying it.** Only an authoritative binding with an empty
+member list could say it, and `setIamPolicy` has historically rejected a
+memberless binding, so shipping one unverified would trade a control this module
+does not have for an apply every consumer would have to fix. A bucket-wide
+`objectAdmin` added by hand — the 2am stopgap for a failing publish — is therefore
+still invisible to Terraform. Detect it with a periodic policy check or deny it
+above the bucket with an IAM deny policy; the role list to cover is wider than it
+looks, because `roles/storage.admin` and the legacy bucket/object roles also carry
+`storage.objects.create`/`delete` (uniform bucket-level access disables ACLs, not
+IAM roles), and project-level `roles/editor` confers two of them where no
+bucket-level binding could reach.
 
 ## The age bound is a security control
 
@@ -118,7 +137,11 @@ one stable key, `cache/<pool>/snapshot.tar.gz`, which is the obvious way to spel
 never expires. The control would still be configured and would still be doing
 nothing.
 
-So the not-yet-built publisher owes this module two things:
+So the publisher owes this module two things, and the first is now enforced
+rather than owed: its grant carries `storage.objects.create` and not
+`storage.objects.delete` under the prefix, and an overwrite in Cloud Storage
+needs delete — so a publisher that tries to refresh a stable key gets a 403
+instead of quietly producing an object that never expires.
 
 - snapshot objects carry a content hash or a timestamp in their name and are
   **written once, never overwritten**;
