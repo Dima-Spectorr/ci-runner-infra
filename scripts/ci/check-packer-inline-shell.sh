@@ -134,7 +134,7 @@ PY
 }
 
 selftest() {
-  local tmp rc
+  local tmp
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   mkdir -p "$tmp/packer"
