@@ -183,7 +183,7 @@ jobs:
           $cfg.Run.PassThru = $true
           $cfg.Output.Verbosity = 'Detailed'
           $r = Invoke-Pester -Configuration $cfg
-          $floor = 75
+          $floor = 83
           Write-Output "pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.TotalCount) discovered"
           if ($r.TotalCount -lt $floor) {
             throw "Pester discovered only $($r.TotalCount) test(s), fewer than the $floor this suite is known to contain — the suite did not run, whatever the exit code says"
@@ -261,9 +261,10 @@ jobs:
       # answer different questions. Pester (in the Windows job) executes the
       # functions and checks what they RETURN. This one reads the file as text
       # and checks what it must never CONTAIN — no firewall rule, no credential
-      # written to instance metadata or guest attributes, no broker off loopback.
-      # A behavioural test cannot express "this control was deleted and must not
-      # come back"; only a mutation against the source can.
+      # written to instance metadata or guest attributes, no broker off loopback,
+      # job hooks set on every slot unconditionally. A behavioural test cannot
+      # express "this control was deleted and must not come back"; only a
+      # mutation against the source can.
       - name: windows-host-startup self-test
         run: bash scripts/ci/windows-host-startup.selftest.sh
 

@@ -446,11 +446,87 @@ Describe 'broker service definition' {
     }
 }
 
-# Phase 4's job hook will be a FILE locked by the same function that locks the
-# directories, and .NET does not let a file ACE carry inheritance flags --
-# AddAccessRule throws "No flags can be set" rather than ignoring them. Under
-# the entry point's 'Stop' preference that throw is a host that never finishes
-# booting, so the distinction is asserted here rather than discovered there.
+# --- phase 4, the per-job credential reset hooks -------------------------------
+
+Describe 'credential reset hook body' {
+    BeforeAll { $script:Hook = Get-JobHookScript }
+
+    # The hook runs inside the agent's environment. %USERPROFILE% and %APPDATA%
+    # are values a job could have changed, so what gets deleted would be the
+    # job's decision rather than the host's. The account database is not.
+    It 'resolves the profile from the account database, not the environment' {
+        $script:Hook | Should -Match 'ProfileList'
+        $script:Hook | Should -Match 'ProfileImagePath'
+        $code = ($script:Hook -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+        $code | Should -Not -Match '\$env:USERPROFILE'
+        $code | Should -Not -Match '\$env:APPDATA'
+    }
+
+    # A resolution that somehow yields C:\Users\Administrator must abort, not
+    # recurse. This is the difference between a cleanup and an incident.
+    It 'refuses a profile that is not a slot profile' {
+        $script:Hook | Should -Match "notmatch '\^ci-s\[0-9\]\+\`$'"
+        $script:Hook | Should -Match 'exit 1'
+    }
+
+    It 'removes the credential state a previous job could have left' {
+        $script:Hook | Should -Match 'AppData\\Roaming\\gcloud'
+        $script:Hook | Should -Match 'AppData\\Roaming\\gsutil'
+        $script:Hook | Should -Match 'Remove-Item -LiteralPath \$target -Recurse -Force'
+    }
+
+    # A hook whose meaning a job's own preference variables could change is not a
+    # control. It sets its own.
+    It 'sets its own error handling rather than inheriting the agent''s' {
+        $script:Hook | Should -Match 'Set-StrictMode -Version Latest'
+        $script:Hook | Should -Match "\`$ErrorActionPreference = 'Stop'"
+    }
+}
+
+Describe 'slot service environment' {
+    # THE ASSERTION THIS WHOLE DESCRIBE EXISTS FOR. A pool with no job service
+    # account starts no broker and gets no GCE_METADATA_*, and it is the pool
+    # where an inherited credential is MOST dangerous: nothing on the host is
+    # competing with whatever the last workflow left behind, so the leftover is
+    # simply what the next job authenticates as.
+    It 'sets both hooks when there is no broker at all' {
+        $block = Get-SlotServiceEnvironment -Index 1 -BrokerEndpoint ''
+        $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookPath
+        $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookPath
+        $block.Contains('GCE_METADATA_HOST') | Should -BeFalse
+    }
+
+    It 'sets both hooks when there is one' {
+        $block = Get-SlotServiceEnvironment -Index 1 -BrokerEndpoint '127.0.0.1:8081'
+        $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookPath
+        $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookPath
+    }
+
+    # All three, or the client libraries disagree about where the metadata server
+    # is and one of them reaches the real one -- which answers with the HOST's
+    # identity, the exact downgrade the broker exists to prevent.
+    It 'points every metadata client at the broker when there is one' {
+        $block = Get-SlotServiceEnvironment -Index 2 -BrokerEndpoint '127.0.0.1:8081'
+        $block['GCE_METADATA_HOST'] | Should -Be '127.0.0.1:8081'
+        $block['GCE_METADATA_IP'] | Should -Be '127.0.0.1:8081'
+        $block['GCE_METADATA_ROOT'] | Should -Be '127.0.0.1:8081'
+    }
+
+    # Per service, never machine-wide: a machine-wide TMP hands every slot the
+    # same one, which is the collision the per-slot directory removes.
+    It 'gives each slot its own temp' {
+        $one = Get-SlotServiceEnvironment -Index 1
+        $two = Get-SlotServiceEnvironment -Index 2
+        $one['TMP'] | Should -Be $one['TEMP']
+        $one['TMP'] | Should -Not -Be $two['TMP']
+    }
+}
+
+# The job hook is a FILE locked by the same function that locks the directories,
+# and .NET does not let a file ACE carry inheritance flags -- AddAccessRule throws
+# "No flags can be set" rather than ignoring them. Under the entry point's
+# 'Stop' preference that throw is a host that never finishes booting, so the
+# distinction is asserted here rather than discovered there.
 Describe 'acl inheritance flags' {
     It 'makes a directory ACE inheritable' {
         $flags = Get-AclInheritanceFlag -IsContainer $true

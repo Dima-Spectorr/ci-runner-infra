@@ -20,7 +20,7 @@
 #   phase 1  slot accounts, logon rights, ACLs, per-slot TEMP
 #   phase 2  the metadata fence                                (DELETED, see below)
 #   phase 3  the job credential broker
-#   phase 4  the per-job credential reset hooks                 (not yet)
+#   phase 4  the per-job credential reset hooks
 #   phase 5  agent registration as a service                   (not yet)
 #   phase 6  the boot probe                                    (not yet)
 #
@@ -45,8 +45,6 @@
 # Phase 1 builds the boundary; phases 3 and 4 build what job code is given
 # INSIDE it -- a weaker credential, and a guarantee that it does not outlive the
 # job. Nothing CONSUMES the slot credentials until phase 5 registers the agents.
-# Phase 4 lands on top of this one: the ACL helper it needs is here, and its own
-# hook file, its slot environment block and their invariants are not.
 #
 # Until phase 5 exists this script registers no agent, so a host running it
 # serves no jobs. That is the intended state of a half-delivered Windows pool
@@ -99,6 +97,13 @@ $script:BrokerServiceName = 'ci-job-broker'
 # without anybody reading this file.
 $script:PythonExe = 'C:\ci\bin\python\python.exe'
 $script:BrokerScript = 'C:\ci\bin\job-metadata-broker.py'
+
+# The hooks do NOT live under C:\ci\bin. That directory is locked to SYSTEM and
+# Administrators with no slot ACE at all (phase 1), and a hook a slot cannot read
+# is a hook that fails every job on the host. They get their own directory with
+# their own ACL: SYSTEM and Administrators full, every slot read-and-execute.
+$script:JobHookRoot = 'C:\ci\job-hooks'
+$script:JobHookPath = 'C:\ci\job-hooks\reset-credentials.ps1'
 
 # The loopback port the broker answers on when metadata does not name one. The
 # same default as the Linux broker, because it is the same broker.
@@ -570,6 +575,140 @@ function Test-BrokerListenerSid {
     param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Sid)
     if ([string]::IsNullOrWhiteSpace($Sid)) { return $false }
     return ($Sid.Trim() -eq 'S-1-5-18')
+}
+
+function Get-JobHookScript {
+    <#
+      .SYNOPSIS
+        The body of the per-job credential reset hook.
+      .DESCRIPTION
+        THE FAULT THIS EXISTS FOR IS NOT gcloud-SPECIFIC AND WAS PAID FOR ON LINUX
+
+        A slot account's profile outlives every job the slot serves. An action
+        that persists a credential -- setup-gcloud writes the external account in
+        as the ACTIVE account -- leaves it for whatever pull request lands on that
+        slot next. On IntegrateIT that surfaced as a permanently cold remote cache
+        because the leftover subject token had expired; the security half does not
+        depend on the expiry at all.
+
+        Both ends of the job, for the reason the Linux comment gives: COMPLETED
+        alone leaves a live credential on disk for the whole idle window and does
+        not run at all if the agent is killed mid-job, which is the case that
+        leaves the most behind. STARTED alone leaves the idle window open.
+
+        TWO DETAILS ARE THE SECURITY HALF AND MUST NOT BE SIMPLIFIED AWAY
+
+        1. The profile directory is resolved from the ACCOUNT DATABASE -- the
+           SID's ProfileImagePath under the ProfileList key -- and never from
+           %USERPROFILE% or %APPDATA%. This runs inside the agent's environment,
+           and the directory being deleted must be decided by the host rather than
+           by a variable a job could have changed. The Linux hook reads
+           `getent passwd` for exactly this reason.
+        2. It refuses anything that is not a `ci-s<n>` profile. A resolution that
+           somehow yields C:\Users\Administrator must abort, not recurse.
+
+        A failing hook fails the job, and that is the intended trade: a job that
+        could not be given a clean credential state must not run with the previous
+        job's identity.
+
+        Returned as text rather than shipped as a file of its own because the
+        thing being installed is one file per host, ACL'd by the installer that
+        writes it; a second tracked `.ps1` would have to be fetched from somewhere
+        and the somewhere is the problem this avoids.
+    #>
+    [CmdletBinding()]
+    param()
+    # A single-quoted here-string: nothing in the body is interpolated by THIS
+    # script, so the hook reads on disk exactly as it reads here.
+    return @'
+# Installed by windows-host-startup.ps1 (phase 4). Runs as the slot user, before
+# every job starts and after every job ends. See Get-JobHookScript for why both.
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# The account database, not $env:USERPROFILE and not $env:APPDATA: this runs in
+# the agent's environment, and the directory being deleted is the host's decision.
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
+$raw = (Get-ItemProperty -LiteralPath $key -Name 'ProfileImagePath').ProfileImagePath
+# ProfileImagePath is REG_EXPAND_SZ; on a stock image it reads %SystemDrive%\Users\...
+$profileDir = [System.Environment]::ExpandEnvironmentVariables([string] $raw)
+
+if ((Split-Path -Leaf $profileDir) -notmatch '^ci-s[0-9]+$') {
+    [Console]::Error.WriteLine("credential reset: refusing to clean '$profileDir' -- not a slot profile")
+    exit 1
+}
+
+$rc = 0
+foreach ($leaf in @('AppData\Roaming\gcloud', 'AppData\Roaming\gsutil')) {
+    $target = Join-Path $profileDir $leaf
+    if (-not (Test-Path -LiteralPath $target)) { continue }
+    try {
+        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
+    } catch {
+        [Console]::Error.WriteLine("credential reset: could not remove $target -- $($_.Exception.Message)")
+        $rc = 1
+    }
+}
+exit $rc
+'@
+}
+
+function Get-SlotServiceEnvironment {
+    <#
+      .SYNOPSIS
+        The environment block phase 5 writes onto one slot's runner service.
+      .DESCRIPTION
+        Per SERVICE, never machine-wide. A machine-wide TMP would hand every slot
+        the same one, which is the collision the per-slot directory exists to
+        remove; machine-wide GCE_METADATA_* would point the host's own tooling at
+        the broker.
+
+        ALL FIVE VALUES ARE SET UNCONDITIONALLY, AND THAT IS THE POINT OF THIS
+        FUNCTION
+
+        The tempting shape makes both halves conditional on there being a broker,
+        since all five are "credential plumbing". That is exactly wrong, and it
+        is wrong twice. A pool with no job service account is the pool where an
+        inherited or ambient credential is MOST dangerous: nothing on the host
+        competes with whatever the last workflow left behind, so the leftover is
+        simply what the next job authenticates as.
+
+        The hooks clear the leftover. The GCE_METADATA_* values close the other
+        door -- unset, they do not withhold credentials, they hand ADC back to
+        169.254.169.254 and the HOST service account, because section 3A deleted
+        the fence that gives Linux that property for free. Phase 3 hands this
+        function the closed endpoint for exactly that reason.
+
+        Returns an ordered dictionary so the block phase 5 writes is stable, which
+        is what makes a service key comparable across two boots of one host.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [string] $HookPath = $script:JobHookPath,
+        [AllowEmptyString()][string] $BrokerEndpoint = ''
+    )
+
+    $temp = Get-SlotTempPath -Index $Index
+    $block = [ordered] @{
+        TMP  = $temp
+        TEMP = $temp
+    }
+
+    # What makes gcloud, google-auth and the Go and Java clients find the broker
+    # instead of the real metadata server -- and, on a pool with no broker, what
+    # makes them find NOTHING instead of the host identity. Never omitted: an
+    # unpointed client on Windows is not an unauthenticated one.
+    $endpoint = $BrokerEndpoint
+    if ([string]::IsNullOrWhiteSpace($endpoint)) { $endpoint = $script:ClosedMetadataEndpoint }
+    $block['GCE_METADATA_HOST'] = $endpoint
+    $block['GCE_METADATA_IP'] = $endpoint
+    $block['GCE_METADATA_ROOT'] = $endpoint
+
+    $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] = $HookPath
+    $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] = $HookPath
+    return $block
 }
 
 # --- phase 0 -----------------------------------------------------------------
@@ -1330,8 +1469,8 @@ function Invoke-Phase3JobBroker {
         must not look the same to whoever reads the boot afterwards.
 
         Returns the endpoint phase 5 points the slots at, or '' when there is no
-        broker. The empty string is what the slot environment block turns into
-        the closed endpoint, which is why it is a return value rather than a flag.
+        broker -- '' being what Get-SlotServiceEnvironment turns into the closed
+        endpoint, which is why it is a return value rather than a flag.
     #>
     [CmdletBinding()]
     param(
@@ -1372,6 +1511,56 @@ function Invoke-Phase3JobBroker {
     return "127.0.0.1:$port"
 }
 
+# --- phase 4: the per-job credential reset hooks ------------------------------
+
+function Install-JobHook {
+    <#
+      .SYNOPSIS
+        Write the reset hook and lock it: every slot may run it, none may edit it.
+      .DESCRIPTION
+        The ACL is the security half and it is not optional. ONE file is executed
+        by every slot on the host, so a slot that could rewrite it would be
+        running code in every other slot's identity -- and, the host being warm,
+        in every later job's too. This is the Windows spelling of `chown
+        root:root` plus `0755`.
+
+        Installed BEFORE any agent registers (phase 5), and fatal if it fails: an
+        agent whose JOB_STARTED hook points at a missing file takes work and fails
+        all of it.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string[]] $SlotUsers)
+
+    New-Item -ItemType Directory -Force -Path $script:JobHookRoot | Out-Null
+    [System.IO.File]::WriteAllText($script:JobHookPath, (Get-JobHookScript),
+        (New-Object System.Text.UTF8Encoding($true)))
+
+    # The directory and the file both. Locking only the file leaves a directory a
+    # slot could rename the hook out of, which fails every job rather than
+    # subverting one -- but it is the same missing-hook fault by a longer path.
+    Protect-CiDirectory -Path $script:JobHookRoot -ReadOnlyUser $SlotUsers
+    Protect-CiDirectory -Path $script:JobHookPath -ReadOnlyUser $SlotUsers
+    Write-BootLog ("phase 4: reset hook at $script:JobHookPath, runnable by " +
+        "$($SlotUsers -join ', ') and writable by none of them")
+}
+
+function Invoke-Phase4JobHook {
+    <#
+      .SYNOPSIS
+        Install the reset hook. Returns the path phase 5 points both hooks at.
+      .DESCRIPTION
+        UNCONDITIONAL, and that is the whole design decision in this phase. There
+        is no `if a job service account is configured` around it: a pool with no
+        broker is where an inherited credential is MOST dangerous, because nothing
+        on the host competes with whatever a workflow left behind and the leftover
+        is simply what the next job authenticates as.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string[]] $SlotUsers)
+    Install-JobHook -SlotUsers $SlotUsers
+    return $script:JobHookPath
+}
+
 function Invoke-Main {
     [CmdletBinding()]
     param()
@@ -1384,31 +1573,37 @@ function Invoke-Main {
     $slots = 1
     if ($cfg.Slots -match '^[0-9]+$' -and [int] $cfg.Slots -ge 1) { $slots = [int] $cfg.Slots }
     $provisioned = @(Invoke-Phase1SlotSetup -Slots $slots)
+    $slotUsers = @($provisioned | ForEach-Object { $_.User })
 
     # Named, not counted. Phase 5 registers one agent per account listed here, so
     # a boot log that says "3 slots" and a host that has ci-s1 and ci-s3 read the
     # same -- and the difference is which agent never came back.
-    Write-BootLog ('phase 1: slot accounts ' + (($provisioned | ForEach-Object { $_.User }) -join ', '))
+    Write-BootLog ('phase 1: slot accounts ' + ($slotUsers -join ', '))
 
-    # Before phase 5, and that ordering is the same safety property the rest of
-    # this file is built on: an agent registered before its broker turns every
-    # deploy step into a confusing auth failure at job time.
+    # Both before phase 5, and that ordering is the same safety property the rest
+    # of this file is built on: an agent registered before its broker turns every
+    # deploy step into an auth failure, and an agent registered before its hook
+    # takes work whose JOB_STARTED points at a file that is not there.
     $brokerEndpoint = Invoke-Phase3JobBroker `
         -JobServiceAccount $cfg.JobSa -BrokerSource $cfg.BrokerSource -BrokerPort $cfg.BrokerPort
+    $hookPath = Invoke-Phase4JobHook -SlotUsers $slotUsers
 
-    # Said out loud rather than returned into nothing: until phase 5 writes it
-    # onto each slot's service key, the endpoint is the one fact a half-delivered
-    # host can still report, and it is the difference between reading a boot log
-    # and reproducing a boot.
-    if ($brokerEndpoint) {
-        Write-BootLog "phase 3: slots would be pointed at the broker on $brokerEndpoint"
+    # Phase 5 is what WRITES this onto each slot's service key. Building it here
+    # and logging its shape means a half-delivered host still says out loud what
+    # the agents would have been given, which is the difference between reading a
+    # boot log and reproducing a boot.
+    foreach ($slot in $provisioned) {
+        $block = Get-SlotServiceEnvironment -Index $slot.Index `
+            -HookPath $hookPath -BrokerEndpoint $brokerEndpoint
+        Write-BootLog ("phase 4: slot $($slot.Index) service environment would be " +
+            ($block.Keys -join ', '))
     }
 
-    # Phases 4-6 are not here yet, and this host therefore registers no agent.
+    # Phases 5 and 6 are not here yet, and this host therefore registers no agent.
     # Said out loud in the log rather than left as silence, because a host that
     # boots cleanly and serves nothing is otherwise indistinguishable from one
     # that is merely slow to register.
-    Write-BootLog ('phases 4-6 are not delivered yet: this host registers no agent and will be ' +
+    Write-BootLog ('phases 5-6 are not delivered yet: this host registers no agent and will be ' +
         'reclaimed by the register-grace drain')
 }
 
