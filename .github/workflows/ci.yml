@@ -268,6 +268,16 @@ jobs:
       - name: windows-host-startup self-test
         run: bash scripts/ci/windows-host-startup.selftest.sh
 
+      # The Terraform half of the same boundary. `terraform validate` below
+      # evaluates neither variable validation nor resource preconditions — both
+      # are PLAN-time — so the module's OS axis has no other gate. What it
+      # guards: a Linux pool still renders the key set it renders today, and
+      # every refusal a Windows pool needs is reachable. A Windows instance
+      # carrying `startup-script` runs no boot script at all and churns hosts at
+      # full price while every metric reads "hosts running".
+      - name: host-os guard self-test
+        run: bash scripts/ci/host-os-guard.selftest.sh
+
       # The dependency cache is the only layer here whose breakage produces no
       # error at all: a job with a misconfigured cache still passes, it just
       # re-downloads everything. That is how the image described itself as
