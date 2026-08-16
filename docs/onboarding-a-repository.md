@@ -44,7 +44,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.17.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.18.0"
 
   project_id         = var.project_id
   network            = var.network
@@ -53,7 +53,7 @@ module "ci_runner_network" {
 }
 
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.17.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.18.0"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -62,7 +62,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.17.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.18.0"
 
   project_id = var.project_id
   region     = var.region
@@ -133,10 +133,40 @@ instead:
 
 That is the whole change. The module then grants this pool's HOST account
 `roles/storage.objectViewer` **conditioned on `cache/<pool>/`** — read only, this
-pool only. Nothing on a host ever writes there; publishing belongs to a separate
-identity that never runs pull-request code, and until that exists a pool
-configured this way finds no snapshot and runs on the baked cache. That is a
-supported state, not a misconfiguration.
+pool only. Nothing on a host ever writes there.
+
+Publishing is a **different identity**, `ci-runner-cache-publisher`, added next to
+the pool:
+
+```hcl
+module "ci_cache_publisher" {
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-publisher?ref=v5.18.0"
+
+  project_id             = var.project_id
+  name                   = "ci-runner-host-myrepo"   # the SAME pool name
+  account_id             = "ci-runner-myrepo"
+  cache_snapshot_bucket  = module.ci_cache.bucket_name
+  workload_identity_pool = var.github_workload_identity_pool
+  repository             = "<org>/<repo>"
+}
+```
+
+It has no key and is attached to no VM: the only way to hold it is a run of the
+**one workflow file** named by `publish_workflow_path`, in that repository, on the
+default ref. All three, because neither of the obvious two is enough on its own —
+a workload identity pool is normally shared by every repository in the org, and a
+`pull_request_target` or `workflow_run` run gets an OIDC token asserting the
+default branch while executing fork-authored code. The pool's OIDC provider must
+map `attribute.job_workflow_ref` and must pin the org by numeric id; the module
+cannot check either.
+
+It may create objects under this pool's prefix and may not overwrite them —
+`storage.objects.delete` is absent, which is what keeps the bucket's age bound
+real — and it may replace exactly one object, the `current` pointer.
+
+The script that builds and uploads a snapshot does not exist yet, so a pool
+configured this way still finds no snapshot and runs on the baked cache. That is
+a supported state, not a misconfiguration.
 
 Three bounds have defaults worth leaving alone unless you have a measurement:
 `cache_snapshot_max_age_hours` (168) is a security control and must stay at or
@@ -290,7 +320,7 @@ later apply:
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.17.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.18.0"
 
   project_id     = var.project_id
   region         = var.region

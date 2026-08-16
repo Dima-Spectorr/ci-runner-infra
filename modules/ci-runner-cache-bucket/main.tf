@@ -108,3 +108,30 @@ resource "google_storage_bucket" "cache" {
   # configuration that documented it.
   force_destroy = var.force_destroy
 }
+
+# WHAT THIS MODULE DOES NOT STATE, AND WHY IT SAYS SO OUT LOUD.
+#
+# Every legitimate write grant is conditioned on one pool's prefix and lives in
+# ci-runner-cache-publisher. The grant that breaks the design is the unconditioned
+# one — the stopgap added in the console at 2am because a publish failed, which
+# reads as "let the pipeline write" and means "any identity holding it may
+# replace any pool's snapshot, including with a fresh generation the age bound
+# will never expire".
+#
+# Nothing here takes that grant back. Terraform can only state "and no one else"
+# with an AUTHORITATIVE binding, and an authoritative binding with an empty member
+# list — the shape that would say it — is not known to survive
+# storage.buckets.setIamPolicy, which has historically rejected a binding with no
+# members. Shipping it unverified trades a control this module does not have for
+# an apply every consumer of this module would have to fix, so it stays out until
+# it has been applied against a real bucket. Tracked as a follow-up, with the role
+# list corrected: storage.objects.create/delete are also carried by
+# roles/storage.admin and by the legacy bucket/object roles, which keep working
+# under uniform bucket-level access (UBLA disables ACLs, not IAM roles) — and
+# project-level roles/editor confers two of them, which no bucket-level binding
+# could take back anyway.
+#
+# So the honest statement of the control today is: the write grants this repo
+# creates are prefix-conditioned, and an unconditioned one added by hand is
+# invisible to Terraform. Detect it with a periodic policy check, or deny it above
+# the bucket with an IAM deny policy; do not assume this file prevents it.

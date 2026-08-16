@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.17.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.18.0"
   # ...
 }
 ```
@@ -346,9 +346,16 @@ means the recycle is working and the hosts are not leaving — jobs that never e
   become the starting cache of every later host in the pool: the cross-slot
   channel the per-slot copy closes, re-opened across hosts and across time. A
   fork pull request would need to run once. Publishing belongs to a separate
-  identity that never runs pull-request code, which does not exist yet — so
-  today a pool configured to read simply finds nothing and runs on the baked
-  cache.
+  identity, `ci-runner-cache-publisher`: no key, attached to no VM, held only by
+  a run of one named workflow file, in one named repository, on the default ref —
+  all three in one claim, because a pool is shared across repositories and a
+  `pull_request_target` run asserts the default branch while running fork code. It
+  may create objects
+  under its pool's prefix and may not overwrite them — no `storage.objects.delete`
+  means "snapshots are written once" is enforced by IAM rather than trusted — and
+  may replace exactly one object, the pointer. The script that builds a snapshot
+  does not exist yet, so today a pool configured to read still finds nothing and
+  runs on the baked cache.
 
   What arrives is inspected before any of it is trusted: it is unpacked into a
   staging tree outside the master, scanned by the same check the image build runs
