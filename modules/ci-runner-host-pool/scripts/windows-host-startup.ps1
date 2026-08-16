@@ -687,10 +687,15 @@ function Get-SlotServiceEnvironment {
     param(
         [Parameter(Mandatory = $true)][int] $Index,
         [string] $HookPath = $script:JobHookPath,
-        [AllowEmptyString()][string] $BrokerEndpoint = ''
+        [AllowEmptyString()][string] $BrokerEndpoint = '',
+        # Injectable for the same reason Get-SlotTempPath's is: the Pester suite
+        # runs on ubuntu-latest, where `Join-Path 'C:\ci\slots' 1` does not build
+        # a string, it throws DriveNotFoundException. A pure function that cannot
+        # be called off Windows is a pure function nothing tests.
+        [string] $SlotRoot = $script:SlotRoot
     )
 
-    $temp = Get-SlotTempPath -Index $Index
+    $temp = Get-SlotTempPath -Index $Index -Root $SlotRoot
     $block = [ordered] @{
         TMP  = $temp
         TEMP = $temp

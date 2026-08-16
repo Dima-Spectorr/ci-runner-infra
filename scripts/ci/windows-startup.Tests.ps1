@@ -490,14 +490,14 @@ Describe 'slot service environment' {
     # competing with whatever the last workflow left behind, so the leftover is
     # simply what the next job authenticates as.
     It 'sets both hooks when there is no broker at all' {
-        $block = Get-SlotServiceEnvironment -Index 1 -BrokerEndpoint ''
+        $block = Get-SlotServiceEnvironment -Index 1 -BrokerEndpoint '' -SlotRoot '/ci/slots'
         $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookPath
         $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookPath
         $block.Contains('GCE_METADATA_HOST') | Should -BeFalse
     }
 
     It 'sets both hooks when there is one' {
-        $block = Get-SlotServiceEnvironment -Index 1 -BrokerEndpoint '127.0.0.1:8081'
+        $block = Get-SlotServiceEnvironment -Index 1 -BrokerEndpoint '127.0.0.1:8081' -SlotRoot '/ci/slots'
         $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookPath
         $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookPath
     }
@@ -506,7 +506,7 @@ Describe 'slot service environment' {
     # is and one of them reaches the real one -- which answers with the HOST's
     # identity, the exact downgrade the broker exists to prevent.
     It 'points every metadata client at the broker when there is one' {
-        $block = Get-SlotServiceEnvironment -Index 2 -BrokerEndpoint '127.0.0.1:8081'
+        $block = Get-SlotServiceEnvironment -Index 2 -BrokerEndpoint '127.0.0.1:8081' -SlotRoot '/ci/slots'
         $block['GCE_METADATA_HOST'] | Should -Be '127.0.0.1:8081'
         $block['GCE_METADATA_IP'] | Should -Be '127.0.0.1:8081'
         $block['GCE_METADATA_ROOT'] | Should -Be '127.0.0.1:8081'
@@ -515,8 +515,8 @@ Describe 'slot service environment' {
     # Per service, never machine-wide: a machine-wide TMP hands every slot the
     # same one, which is the collision the per-slot directory removes.
     It 'gives each slot its own temp' {
-        $one = Get-SlotServiceEnvironment -Index 1
-        $two = Get-SlotServiceEnvironment -Index 2
+        $one = Get-SlotServiceEnvironment -Index 1 -SlotRoot '/ci/slots'
+        $two = Get-SlotServiceEnvironment -Index 2 -SlotRoot '/ci/slots'
         $one['TMP'] | Should -Be $one['TEMP']
         $one['TMP'] | Should -Not -Be $two['TMP']
     }
