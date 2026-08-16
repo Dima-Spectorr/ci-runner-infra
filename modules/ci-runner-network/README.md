@@ -59,7 +59,7 @@ these rules apply to the pool's machines.
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.19.1"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.20.0"
 
   project_id         = var.project_id
   network            = var.network

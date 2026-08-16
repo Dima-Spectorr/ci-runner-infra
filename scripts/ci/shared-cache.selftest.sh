@@ -73,6 +73,8 @@ POOLVARS="$HERE/../../modules/ci-runner-host-pool/variables.tf"
 PUBTF="$HERE/../../modules/ci-runner-cache-publisher/main.tf"
 PUBVARS="$HERE/../../modules/ci-runner-cache-publisher/variables.tf"
 BUCKETTF="$HERE/../../modules/ci-runner-cache-bucket/main.tf"
+PUBSH="$HERE/publish-cache-snapshot.sh"
+PUBDOC="$HERE/../../docs/publishing-a-cache-snapshot.md"
 
 PASS=0
 FAIL=0
@@ -87,6 +89,8 @@ bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
 [ -f "$PUBTF" ] || { echo "FAIL: missing $PUBTF"; exit 1; }
 [ -f "$PUBVARS" ] || { echo "FAIL: missing $PUBVARS"; exit 1; }
 [ -f "$BUCKETTF" ] || { echo "FAIL: missing $BUCKETTF"; exit 1; }
+[ -f "$PUBSH" ] || { echo "FAIL: missing $PUBSH"; exit 1; }
+[ -f "$PUBDOC" ] || { echo "FAIL: missing $PUBDOC"; exit 1; }
 
 # Code only: full-line comments stripped, so the prose explaining an invariant
 # can never be what satisfies the check for it. This matters more here than
@@ -580,6 +584,107 @@ has_no_write_grant_on_the_bucket() { # <file>
   matches "$code" '^  public_access_prevention = "enforced"$' || return 1
 }
 
+# The publishing script is the only writer into the trusted path, so what it
+# refuses matters as much as what it does.
+has_trusted_snapshot_build() { # <file>
+  local code
+  code=$(code_of "$1")
+  # Built into a fresh staging tree, never from a host's cache. /opt/ci-cache is
+  # the master's path and must not appear at all: an archive of it would put a
+  # previous snapshot's content — or a slot's — back through the front door.
+  ! matches "$code" '/opt/ci-cache' || return 1
+  matches "$code" 'STAGE=\$\(mktemp -d\)' || return 1
+  matches "$code" 'export npm_config_cache="\$STAGE/npm"' || return 1
+  # Both pnpm spellings, the same reason the host emits both.
+  matches "$code" 'export pnpm_config_store_dir=' || return 1
+  matches "$code" 'export npm_config_store_dir='  || return 1
+  # The event guard. The IAM binding pins repository, workflow and ref and cannot
+  # pin the EVENT — and pull_request_target/workflow_run runs assert the default
+  # ref while executing fork code, so without this an edit to the trigger is a
+  # poisoned snapshot rather than a failed run.
+  matches "$code" 'GITHUB_EVENT_NAME' || return 1
+  matches "$code" "'' \| schedule \| workflow_dispatch \| push" || return 1
+  # The host's walks, with the host's rules — plus a content pass, because a
+  # filename list cannot see a token inside a cache entry whose name is a hash.
+  matches "$code" '\-perm /6000' || return 1
+  matches "$code" 'getcap -r' || return 1
+  matches "$code" "\-name '\.git-credentials'" || return 1
+  matches "$code" '_authToken' || return 1
+  # The host refuses a multi-linked file, so nothing may be packed as a link
+  # member; a staging tree legitimately has them (pnpm), which is why the bound
+  # is on the archive rather than on the tree.
+  matches "$code" '\-\-hard-dereference' || return 1
+  matches "$code" 'archive_is_flat "\$ARCHIVE"' || return 1
+  # The prepare command's own failure must be one: `sh -c` without -e publishes a
+  # half-populated cache with a zero exit.
+  matches "$code" 'sh -euc "\$CACHE_PREPARE"' || return 1
+  # The publishing phase re-scans what it received. The archive crossed a job
+  # boundary, and the job that scanned it first is the one that ran other
+  # people's code.
+  matches "$code" 'if \[ "\$BUILDING" = 0 \]' || return 1
+  matches "$code" 'head -c "\$\(\(size \* 8\)\)"' || return 1
+  # A missing getcap is a refusal, not a skip: on a snapshot the scan is the only
+  # opinion, and a check that can be skipped rather than failed is not a bound.
+  # Anchored, and the refusal with it: `if command -v getcap; then` still holds
+  # the same words while turning the requirement into a skip.
+  matches "$code" '^command -v getcap' || return 1
+  matches "$code" '^  \|\| die "getcap is not installed' || return 1
+  # Write-once, and the two bounds that keep it that way.
+  matches "$code" 'SNAP="\$\(date -u \+%Y%m%dT%H%M%SZ\)-\$\{digest\}\.tar\.gz"' || return 1
+  matches "$code" 'gcloud storage cp --if-generation-match=0' || return 1
+  matches "$code" 'gcloud storage cp --if-generation-match="\$gen"' || return 1
+  # Size, because a snapshot past the pools' bound is refused by every host and
+  # reads in their logs as "nothing published" rather than as an error.
+  matches "$code" 'CACHE_MAX_BYTES' || return 1
+}
+
+# The two sides derive the same list from nothing — the host's copy is embedded
+# in a startup script that cannot source this repository. A name on one list and
+# not the other is bytes shipped and dropped, or a directory published and never
+# accepted, and neither side would say so.
+has_agreeing_cache_dirs() { # <publish-script>
+  local a b
+  a=$(grep -m1 -E '^CACHE_DIRS=\(' "$1")
+  b=$(grep -m1 -E '^CACHE_DIRS=\(' "$SCRIPT")
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+
+# The workflow template consumers copy. It is documentation, and it is also the
+# thing that actually runs beside the credential, so it gets checked like code.
+# The split is the whole control: `CACHE_PREPARE` runs third-party code, and a
+# job with `id-token: write` hands that code the credential through
+# ACTIONS_ID_TOKEN_REQUEST_TOKEN no matter what the script does afterwards.
+has_split_publishing_workflow() { # <doc>
+  local build publish doc
+  doc=$(cat "$1")
+  # The two job blocks, by their own boundaries rather than by line count.
+  build=$(sed -n '/^  build:$/,/^  publish:$/p' "$1")
+  publish=$(sed -n '/^  publish:$/,/^```$/p' "$1")
+  [ -n "$build" ] && [ -n "$publish" ] || return 1
+
+  matches "$build" 'CACHE_PREPARE'      || return 1
+  ! matches "$build" 'id-token'         || return 1
+  ! matches "$build" 'google-github-actions/auth' || return 1
+
+  matches "$publish" 'id-token: write'  || return 1
+  matches "$publish" 'CACHE_ARCHIVE_IN' || return 1
+  ! matches "$publish" 'CACHE_PREPARE'  || return 1
+  matches "$publish" 'needs: build'     || return 1
+
+  # A top-level `id-token: write` would grant it to both jobs and void the split
+  # without touching either one.
+  matches "$(sed -n '1,/^jobs:$/p' "$1")" '^permissions: \{\}$' || return 1
+
+  # Every action pinned by commit, this repository's own rule: the auth action
+  # mints the publisher token, and a moved tag on it is root code on every host.
+  ! matches "$doc" 'uses: [^ ]*@v[0-9]' || return 1
+  matches "$doc" 'uses: google-github-actions/auth@[0-9a-f]{40} # v' || return 1
+
+  # A `workflow_call` here would let a caller pass an input that reaches
+  # CACHE_PREPARE while satisfying both the binding and the event guard.
+  ! matches "$doc" 'workflow_call:' || return 1
+}
+
 # --- the real script ------------------------------------------------------------
 
 run() { # <name> <fn> <file>
@@ -607,6 +712,9 @@ run 'the pool name cannot rewrite the IAM condition'     has_constrained_pool_na
 run 'the publisher may create but never overwrite a snapshot' has_write_once_publisher "$PUBTF"
 run 'only the default ref may become the publisher'      has_ref_bound_publisher   "$PUBVARS"
 run 'the bucket module grants no write of its own'       has_no_write_grant_on_the_bucket "$BUCKETTF"
+run 'a snapshot is built clean, scanned and written once' has_trusted_snapshot_build "$PUBSH"
+run 'both sides agree on which tool caches travel'       has_agreeing_cache_dirs   "$PUBSH"
+run 'the install never runs beside the publishing credential' has_split_publishing_workflow "$PUBDOC"
 
 # --- the mutations --------------------------------------------------------------
 #
@@ -831,6 +939,60 @@ mutate_file "$BUCKETTF" 'a bucket-wide write grant is added as a stopgap' has_no
   's@^resource "google_storage_bucket" "cache" \{@resource "google_storage_bucket_iam_member" "stopgap" \{ role = "roles/storage.objectAdmin" \}\nresource "google_storage_bucket" "cache" \{@'
 mutate_file "$BUCKETTF" 'ACLs come back and route around the prefix conditions' has_no_write_grant_on_the_bucket \
   's@^  uniform_bucket_level_access = true$@  uniform_bucket_level_access = false@'
+
+# The publishing script. Each of these is an edit that leaves a working script —
+# it still builds something and still uploads it — and changes what "trusted"
+# means. None of them would fail a run.
+mutate_file "$PUBSH" 'the snapshot is packed from a host cache instead' has_trusted_snapshot_build \
+  's@^STAGE=\$\(mktemp -d\)$@STAGE=/opt/ci-cache@'
+mutate_file "$PUBSH" 'pnpm loses the v11 spelling on the publishing side' has_trusted_snapshot_build \
+  's@^ *export pnpm_config_store_dir=.*$@@'
+mutate_file "$PUBSH" 'the event guard opens to every event' has_trusted_snapshot_build \
+  "s@^  '' \| schedule \| workflow_dispatch \| push \) : ;;\$@  * ) : ;;@"
+mutate_file "$PUBSH" 'a missing getcap becomes a skipped scan' has_trusted_snapshot_build \
+  's@^command -v getcap.*$@if command -v getcap >/dev/null 2>\&1; then :; fi@'
+mutate_file "$PUBSH" 'setuid entries stop being scanned for' has_trusted_snapshot_build \
+  's@-o -perm /6000 @@'
+mutate_file "$PUBSH" 'a hardlink may be packed as a link member' has_trusted_snapshot_build \
+  's@ --hard-dereference@@'
+mutate_file "$PUBSH" 'the shipped bytes stop being inspected' has_trusted_snapshot_build \
+  's@^archive_is_flat "\$ARCHIVE"$@@'
+mutate_file "$PUBSH" 'the embedded-credential pass is dropped' has_trusted_snapshot_build \
+  "s@-e '_authToken' \\\\@\\\\@"
+mutate_file "$PUBSH" 'a half-populated install publishes with a zero exit' has_trusted_snapshot_build \
+  's@sh -euc "\$CACHE_PREPARE"@sh -c "$CACHE_PREPARE"@'
+mutate_file "$PUBSH" 'the publishing job trusts the artifact it was handed' has_trusted_snapshot_build \
+  's@^if \[ "\$BUILDING" = 0 \]; then$@if false; then@'
+mutate_file "$PUBSH" 'the decompression stops being bounded' has_trusted_snapshot_build \
+  's@ \| head -c "\$\(\(size \* 8\)\)" \\@ \\@'
+mutate_file "$PUBSH" 'credential files stop being scanned for' has_trusted_snapshot_build \
+  "s@-o -name '\.git-credentials' @@"
+mutate_file "$PUBSH" 'the snapshot name becomes reusable' has_trusted_snapshot_build \
+  's@^SNAP="\$\(date -u \+%Y%m%dT%H%M%SZ\)-\$\{digest\}\.tar\.gz"$@SNAP="latest.tar.gz"@'
+mutate_file "$PUBSH" 'the upload may overwrite an existing snapshot' has_trusted_snapshot_build \
+  's@gcloud storage cp --if-generation-match=0 @gcloud storage cp @'
+mutate_file "$PUBSH" 'the pointer swap loses its precondition' has_trusted_snapshot_build \
+  's@gcloud storage cp --if-generation-match="\$gen" @gcloud storage cp @'
+mutate_file "$PUBSH" 'the size bound is dropped' has_trusted_snapshot_build \
+  's@CACHE_MAX_BYTES@CACHE_SIZE_HINT@g'
+mutate_file "$PUBSH" 'a directory is published that no host accepts' has_agreeing_cache_dirs \
+  's@^CACHE_DIRS=\(npm @CACHE_DIRS=(npm cargo @'
+
+# The workflow template. Each of these leaves a workflow that runs and publishes
+# a snapshot, and each hands the credential to something that should not have it.
+mutate_file "$PUBDOC" 'the two jobs are merged back into one' has_split_publishing_workflow \
+  's@^      id-token: write.*$@@'
+mutate_file "$PUBDOC" 'the install job gains the credential' has_split_publishing_workflow \
+  's@^      contents: read  .*$@      contents: read\n      id-token: write@'
+mutate_file "$PUBDOC" 'the token is granted workflow-wide instead' has_split_publishing_workflow \
+  's@^permissions: \{\}$@permissions:\n  id-token: write@'
+mutate_file "$PUBDOC" 'the publishing job stops waiting for the build' has_split_publishing_workflow \
+  's@^    needs: build$@@'
+# `|` as the delimiter: a pinned `uses:` contains an `@`.
+mutate_file "$PUBDOC" 'the auth action goes back to a movable tag' has_split_publishing_workflow \
+  's|google-github-actions/auth@[0-9a-f]{40} # v2\.1\.9|google-github-actions/auth@v2|'
+mutate_file "$PUBDOC" 'the template becomes callable with inputs' has_split_publishing_workflow \
+  's@^  workflow_dispatch:$@  workflow_dispatch:\n  workflow_call:@'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

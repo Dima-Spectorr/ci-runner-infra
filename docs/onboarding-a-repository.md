@@ -44,7 +44,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.19.1"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.20.0"
 
   project_id         = var.project_id
   network            = var.network
@@ -53,7 +53,7 @@ module "ci_runner_network" {
 }
 
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.19.1"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.20.0"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -62,7 +62,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.19.1"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.20.0"
 
   project_id = var.project_id
   region     = var.region
@@ -140,7 +140,7 @@ the pool:
 
 ```hcl
 module "ci_cache_publisher" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-publisher?ref=v5.19.1"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-publisher?ref=v5.20.0"
 
   project_id             = var.project_id
   name                   = "ci-runner-host-myrepo"   # the SAME pool name
@@ -164,9 +164,15 @@ It may create objects under this pool's prefix and may not overwrite them —
 `storage.objects.delete` is absent, which is what keeps the bucket's age bound
 real — and it may replace exactly one object, the `current` pointer.
 
-The script that builds and uploads a snapshot does not exist yet, so a pool
-configured this way still finds no snapshot and runs on the baked cache. That is
-a supported state, not a misconfiguration.
+The run that builds and uploads a snapshot is a scheduled workflow in *your*
+repository, at the path you gave `publish_workflow_path`.
+`docs/publishing-a-cache-snapshot.md` is the whole of it: copy the workflow — it
+is deliberately **two jobs**, and the one that installs your dependencies must
+never be the one holding the publishing credential — set
+`CACHE_PREPARE` to whatever installs your dependencies, and run it once by hand
+with `CACHE_DRY_RUN=1` to see the size. Until you add it, a pool configured this
+way finds no snapshot and runs on the baked cache — a supported state, not a
+misconfiguration.
 
 Three bounds have defaults worth leaving alone unless you have a measurement:
 `cache_snapshot_max_age_hours` (168) is a security control and must stay at or
@@ -320,7 +326,7 @@ later apply:
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.19.1"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.20.0"
 
   project_id     = var.project_id
   region         = var.region

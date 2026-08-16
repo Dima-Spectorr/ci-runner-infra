@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.19.1"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.20.0"
   # ...
 }
 ```
@@ -353,9 +353,13 @@ means the recycle is working and the hosts are not leaving — jobs that never e
   may create objects
   under its pool's prefix and may not overwrite them — no `storage.objects.delete`
   means "snapshots are written once" is enforced by IAM rather than trusted — and
-  may replace exactly one object, the pointer. The script that builds a snapshot
-  does not exist yet, so today a pool configured to read still finds nothing and
-  runs on the baked cache.
+  may replace exactly one object, the pointer. What it runs is
+  `scripts/ci/publish-cache-snapshot.sh`, from a scheduled workflow in the
+  consuming repository (`docs/publishing-a-cache-snapshot.md`): dependencies
+  installed from the default branch into an empty tree, scanned with the host's
+  own rules, packed and uploaded under a name never reused. A pool whose
+  repository has not added that workflow finds nothing and runs on the baked
+  cache.
 
   What arrives is inspected before any of it is trusted: it is unpacked into a
   staging tree outside the master, scanned by the same check the image build runs

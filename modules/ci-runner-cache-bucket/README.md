@@ -7,7 +7,7 @@ every pool in that project.
 
 ```hcl
 module "ci_cache" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-bucket?ref=v5.19.1"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-bucket?ref=v5.20.0"
 
   project_id = var.project_id
   name       = "${var.project_id}-ci-cache"
@@ -87,9 +87,10 @@ The producer's grant is now `ci-runner-cache-publisher`: an account with no key,
 attached to no VM, assumable only through Workload Identity Federation by a run
 of one named workflow file, in one named repository, on the default ref. It holds
 create — not overwrite — under its own pool's prefix, and may replace exactly one
-object, the pointer. The script that builds and uploads a snapshot does not exist
-yet, so nothing writes here in practice and a pool configured to read simply
-finds no snapshot and runs on the cache its image baked.
+object, the pointer. What it runs is `scripts/ci/publish-cache-snapshot.sh`, from
+a scheduled workflow in the consuming repository. Until that repository adds the
+workflow nothing writes here, and a pool configured to read simply finds no
+snapshot and runs on the cache its image baked.
 
 **The other half — *and no one else* — this module does not state, and it says so
 in the code rather than implying it.** Only an authoritative binding with an empty
