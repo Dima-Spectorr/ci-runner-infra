@@ -487,6 +487,325 @@ has_probe_literal_guard() { # <file>
   matches "$code" 'never tested' || return 1
 }
 
+# --- phase 6's harness: the half that ACTS on the verdict --------------------
+#
+# The pure half is asserted above (has_worthless_host_identity_probe,
+# has_probe_literal_guard). The three below are about the half that runs it, and
+# each covers a way the phase could keep every one of those checks and still
+# prove nothing:
+#
+#   proved too late   an agent registered before the probe finishes is an agent
+#                     GitHub can hand a job to while the proof is still running.
+#                     Phase 6's number is older than its position; only the ORDER
+#                     of the two calls in Invoke-Main carries the property, and
+#                     nothing in PowerShell notices if they swap.
+#
+#   proved and ignored a verdict nobody acts on is a comment. The two shapes that
+#                     look most like working code are a finding logged instead of
+#                     denied, and a probe that produced no verdict at all being
+#                     read as a probe that found nothing.
+#
+#   proved by the subject the verdict is written by the very account under test.
+#                     Without an ACL any slot could pre-answer it, and without a
+#                     freshness guarantee a file left by the PREVIOUS boot is a
+#                     complete, plausible, passing verdict for this one.
+
+# Line number of the first line of <code> matching <ere>, or '' when there is
+# none. Never `| head -1` -- head exits on the first line, the writer upstream
+# takes SIGPIPE, and pipefail turns a successful match into a failure. sed
+# consumes the whole stream, which is why it is the tool here.
+line_of() { # <text> <ere>
+  printf '%s\n' "$1" | grep -nE -- "$2" | sed -n '1s/^\([0-9][0-9]*\):.*/\1/p'
+}
+
+has_probe_before_registration() { # <file>
+  local code probe reg
+  code=$(code_of "$1")
+
+  # Both calls are single statements of Invoke-Main's own body -- four spaces --
+  # which is what makes the ordering decidable from the text at all, and what
+  # stops either being folded into a branch the way the job hooks nearly were.
+  matches "$code" '^    Invoke-Phase6BootProbe -Provisioned \$provisioned -Config \$cfg -BrokerEndpoint \$brokerEndpoint$' || return 1
+  matches "$code" '^    Invoke-Phase5Registration -Provisioned \$provisioned -Config \$cfg' || return 1
+  ! matches "$code" '^        Invoke-Phase6BootProbe' || return 1
+
+  probe=$(line_of "$code" '^    Invoke-Phase6BootProbe ')
+  reg=$(line_of "$code" '^    Invoke-Phase5Registration ')
+  [ -n "$probe" ] && [ -n "$reg" ] || return 1
+  [ "$probe" -lt "$reg" ] || return 1
+}
+
+has_fatal_boot_probe() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # The verdict is handed to the pure decider, and the decider's answer is acted
+  # on. Get-ProbeFailure already returns the missing-verdict case as a finding,
+  # so $null flows through this same branch -- there is no separate "no file"
+  # path that could be made lenient on its own.
+  matches "$code" 'Get-ProbeFailure -Result \$verdict -JobServiceAccount \$Config\.JobSa' || return 1
+  matches "$code" 'if \(\$findings\.Count -gt 0\) \{' || return 1
+  matches "$code" 'Deny-Boot \("the boot probe found ' || return 1
+
+  # A service that will not start is fatal WHERE IT HAPPENS. Both roads end in a
+  # denied boot, but only this one names the fault; the other reports "no verdict
+  # at all" three minutes later and sends the reader to the wrong place.
+  matches "$code" 'Deny-Boot \("the boot probe service would not start as \$SlotUser' || return 1
+
+  # …and the wait is BOUNDED, by a timeout short enough that the deny happens
+  # while the host is still booting rather than an hour into its life. Wait-
+  # ProbeVerdict's value IS its verdict, so the timeout is reported by the
+  # caller and the function itself emits nothing else.
+  matches "$code" '\[int\] \$TimeoutSeconds = \$script:ProbeWaitSeconds' || return 1
+  matches "$code" '\$script:ProbeWaitSeconds = 180' || return 1
+  matches "$code" 'if \(\(Get-Date\) -ge \$deadline\) \{ break \}' || return 1
+}
+
+has_probe_verdict_acl() { # <file>
+  local code prep inst
+  code=$(code_of "$1")
+
+  # ONE slot writes the verdict, and it is the slot being measured. -ReadOnlyUser
+  # would be the tidy-looking edit and it is the wrong one twice over: it hands
+  # every slot on the host read access to the file, and it takes the write away
+  # from the account that has to produce it.
+  matches "$code" 'Protect-CiDirectory -Path \$script:ProbeResultPath -SlotUser \$SlotUser' || return 1
+  ! matches "$code" 'Protect-CiDirectory -Path \$script:ProbeResultPath -ReadOnlyUser' || return 1
+
+  # FRESHNESS, and not staleness. A verdict left by the previous boot is a
+  # complete, plausible, passing document, and "is it old?" is a question decided
+  # from a timestamp the writer controls. Removed and re-created empty before the
+  # service exists; a removal that did not take denies the boot.
+  matches "$code" 'Remove-Item -LiteralPath \$script:ProbeResultPath -Force' || return 1
+  matches "$code" 'Deny-Boot \("could not remove a pre-existing \$script:ProbeResultPath' || return 1
+
+  # …and that happens BEFORE the service is installed, or the guarantee is that
+  # the file was fresh some time after the probe already ran.
+  prep=$(line_of "$code" 'Protect-ProbeVerdictFile -SlotUser \$slot\.User')
+  inst=$(line_of "$code" 'Install-BootProbeService -ScriptText \$payload')
+  [ -n "$prep" ] && [ -n "$inst" ] || return 1
+  [ "$prep" -lt "$inst" ] || return 1
+
+  # The payload the slot executes is readable by it and writable by nobody. A
+  # slot that could rewrite the payload decides what its own verdict says.
+  matches "$code" 'Protect-CiDirectory -Path \$script:ProbeScriptPath -ReadOnlyUser @\(\$SlotUser\)' || return 1
+}
+
+# --- §3A's third bullet: the token must be witnessed GONE --------------------
+#
+# The controller deletes `ci-registration-token` once GitHub reports the host
+# registered. Nothing proved it had. A key left behind is a live repository
+# registration token in instance metadata, which §3A says outright is readable by
+# anything holding this machine's identity -- and by the time phase 5 ends, that
+# includes pull-request code in a slot.
+
+has_registration_token_witness() { # <file>
+  local code reg wit
+  code=$(code_of "$1")
+
+  matches "$code" '^    Wait-RegistrationTokenRemoved$' || return 1
+  # FATAL, not a log line, AND not only fatal -- see has_registration_token_-
+  # containment for the half a bare throw does not buy here.
+  matches "$code" 'Deny-Boot \("\$script:RegistrationTokenKey is STILL on this instance' || return 1
+
+  # POLLED to a bound, not read once. The controller deletes on its own tick, so
+  # a single read taken the instant the last agent came up fails on a healthy
+  # fleet -- and an unbounded one is the 2h55m outage restated.
+  matches "$code" 'Get-JitteredTimeout -BaseSeconds \$script:TokenRemovalWaitSeconds' || return 1
+  matches "$code" 'if \(\(Get-Date\) -ge \$deadline\) \{ break \}' || return 1
+
+  # …and the bound is SPREAD. One controller is the shared dependency of every
+  # host booting at once, so a fixed deadline turns a controller hiccup during a
+  # scale-out into every host in the window denying together -- a fleet-wide
+  # refusal to serve at the moment capacity is being asked for. The jitter is
+  # the difference between that and a stagger nobody notices, and "tidy it back
+  # to a constant" is the edit this line exists to catch.
+  matches "$code" '\$script:TokenRemovalJitterSeconds = [1-9]' || return 1
+  matches "$code" '\-JitterSeconds \$script:TokenRemovalJitterSeconds' || return 1
+
+  # …and it looks AFTER the agents registered. Before them it asserts nothing:
+  # the key is supposed to still be there.
+  reg=$(line_of "$code" 'Register-SlotAgent -Slot \$slot -RegistrationToken \$regToken')
+  wit=$(line_of "$code" '^    Wait-RegistrationTokenRemoved$')
+  [ -n "$reg" ] && [ -n "$wit" ] || return 1
+  [ "$reg" -lt "$wit" ] || return 1
+}
+
+# --- and the witness is backed by an actual containment ----------------------
+#
+# Every OTHER Deny-Boot in the boot script fires before an agent exists, so the
+# host reads reg=absent at the controller and drain_decision's
+# `never-registered` arm reclaims it. THAT ARM IS NOT REACHABLE FROM HERE. By
+# the time the witness runs the agents have registered, so the host reads
+# `present`; and recycle_decision refuses anything whose instance template is
+# not `stale`, which registration state has no bearing on. A bare throw would
+# leave a host in the pool, taking jobs, with a live registration token in its
+# metadata and a FATAL line nobody is reading.
+#
+# Stopping the runner services is what closes that. GitHub dispatches nothing to
+# an offline runner; host_facts() counts by NAME so the host stays `present` and
+# busy=0; drain_decision's ordinary idle rule then retires it. Stopped and NOT
+# deregistered on purpose -- deregistering drops it to `absent`, where it is
+# drained as a failed boot, which is the wrong diagnosis and loses the logs.
+has_registration_token_containment() { # <file>
+  local code stop deny
+  code=$(code_of "$1")
+
+  matches "$code" '^    Stop-RunnerService$' || return 1
+  matches "$code" "NamePattern = 'actions\.runner\.\*'" || return 1
+
+  # The pattern is CONSTRAINED. Stop-Service -Force stops dependents too, so a
+  # widened pattern does not merely over-stop: a bare `*` takes the beacon and
+  # the job broker down with the agents, and the beacon is what tells the
+  # controller this host is alive. Nothing attacker-influenced reaches the
+  # parameter today, which is a fact about the call sites and not the function.
+  matches "$code" "ValidatePattern\('\^actions" || return 1
+  matches "$code" 'A-Za-z0-9\._\*-\]\+' || return 1
+
+  # BEFORE the throw. After it is dead code, and dead code here reads exactly
+  # like a containment that is present.
+  stop=$(line_of "$code" '^    Stop-RunnerService$')
+  deny=$(line_of "$code" 'Deny-Boot \("\$script:RegistrationTokenKey is STILL on this instance')
+  [ -n "$stop" ] && [ -n "$deny" ] || return 1
+  [ "$stop" -lt "$deny" ] || return 1
+}
+
+# --- the probe has to say WHO answered ---------------------------------------
+#
+# Every other field in the verdict -- hostToken, secretStatus, metricStatus,
+# dnsResolved -- is an answer from the metadata server, which answers the
+# MACHINE and does not care which local account asked. So a probe that silently
+# stayed LocalSystem passes all of them, and the one part of phase 6 with no
+# hardware behind it is the very part that would go unnoticed.
+#
+# It is caught today only by accident: Protect-CiDirectory always grants
+# S-1-5-18 FullControl, so a LocalSystem probe reads the sibling workspace and
+# `siblingStatus` comes back `allowed`. That is an ACL side effect, not a check,
+# and it dies the day someone adds a -ReadOnlyUser or widens C:\ci\bin.
+has_probe_identity_assertion() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # The process token, not the environment block. A service's environment is
+  # data the SCM copies in and this script rewrites elsewhere, so it can say one
+  # thing while the process runs as another -- the exact divergence being tested
+  # for. GetCurrent() reads the token the access checks are made against.
+  # Anchored on the ASSIGNMENT and not on the API: line 748 already calls
+  # WindowsIdentity::GetCurrent().User.Value for an unrelated reason, so the
+  # bare call is present whether the payload records anything or not.
+  matches "$code" "runningAs = ''; hostToken" || return 1
+  matches "$code" 'runningAs = \[string\] \(\[System.Security.Principal.WindowsIdentity\]::GetCurrent\(\).Name\)' || return 1
+
+  # MANDATORY and defaulted to nothing. A default would make the one assertion
+  # that distinguishes the two runs skippable by omission.
+  matches "$code" 'Mandatory = \$true\)\]\[AllowEmptyString\(\)\]\[string\] \$ExpectedIdentity' || return 1
+  matches "$code" "the probe ran as '\\\$ran' and not \\\$ExpectedIdentity" || return 1
+  matches "$code" 'the probe did not report which account it ran as' || return 1
+
+  # …and the harness hands it the account it actually repointed the service to,
+  # rather than a constant that would agree with itself.
+  matches "$code" '\-ExpectedIdentity \$slot\.User' || return 1
+}
+
+# --- the slot has to be able to LOAD the thing it is started as --------------
+#
+# The probe service's binPath is the shim itself, and phase 1 locks C:\ci,
+# C:\ci\bin and C:\ci\slots to SYSTEM and Administrators with inheritance
+# disabled -- so ci-service-shim.exe carries no ACE for any slot. Repointing the
+# service at the slot and starting it makes the SCM launch an image that token
+# may neither read nor execute: ERROR_ACCESS_DENIED, a 1053, and a Deny-Boot on
+# every host in the pool. The payload and its config were granted for exactly
+# this reason; the binary that reads them was missed, and the shape of the bug
+# is that the whole phase looks correct and denies every boot.
+has_probe_shim_loadable_by_slot() { # <file>
+  local code raw grant inst
+  code=$(code_of "$1")
+  # The bypass-traverse assertion below is the one thing in this file that has to
+  # be checked against the RAW text: it lives in a comment, and code_of strips
+  # exactly those. Everything else uses $code, so a comment can never satisfy it.
+  raw=$(cat "$1")
+
+  # READ AND EXECUTE, never Modify. A slot able to write this binary owns the
+  # beacon and the broker, which the SCM re-executes as LocalSystem next reboot.
+  matches "$code" 'Protect-CiDirectory -Path \$script:ServiceShim -ReadOnlyUser @\(\$SlotUser\)' || return 1
+  ! matches "$code" 'Protect-CiDirectory -Path \$script:ServiceShim -SlotUser' || return 1
+
+  # …and it is granted BEFORE the shim is asked to install the service, not after
+  # the SCM has already failed to load it.
+  grant=$(line_of "$code" 'Protect-CiDirectory -Path \$script:ServiceShim -ReadOnlyUser')
+  inst=$(line_of "$code" 'Grant-ServiceLogonAccount -ServiceName \$script:ProbeServiceName')
+  [ -n "$grant" ] && [ -n "$inst" ] || return 1
+  [ "$grant" -lt "$inst" ] || return 1
+
+  # The reliance on bypass-traverse-checking is WRITTEN DOWN. C:\ci and C:\ci\bin
+  # stay SYSTEM-and-Administrators-only, so a file-level ACE is reachable only
+  # because SeChangeNotifyPrivilege is granted to Everyone by default -- the kind
+  # of default a hardened image removes, and an undocumented dependency on it is
+  # how the next image bump becomes an unexplainable fleet-wide 1053.
+  matches "$raw" 'THIS RELIES ON BYPASS-TRAVERSE-CHECKING' || return 1
+}
+
+# --- and it must not still be able to afterwards -----------------------------
+#
+# Phase 6 hands the probing slot three grants; phase 5 then starts pull-request
+# code as that same account. No exploit route through them was found, and that
+# is a statement about today's layout rather than an invariant. Revoking makes
+# "no slot ACE anywhere under C:\ci" literally true instead of true-by-argument.
+has_probe_teardown_invariants() { # <file>
+  local code clear revoke
+  code=$(code_of "$1")
+
+  matches "$code" '^        Revoke-ProbeSlotAccess$' || return 1
+  matches "$code" '\$script:ProbeRoot, \$script:ProbeResultPath, \$script:ServiceShim' || return 1
+
+  # The revert is Protect-CiDirectory with NO -SlotUser. The function rewrites
+  # the ACL from scratch, so there is no ACE to remove by hand.
+  matches "$code" '^            Protect-CiDirectory -Path \$path$' || return 1
+
+  # FATAL, unlike the service delete. A service left installed runs nothing; an
+  # ACE left behind is a standing grant to the account about to run job code.
+  matches "$code" "Deny-Boot \\(\"could not take the boot probe's grant on \\\$path" || return 1
+
+  # AFTER the stop-and-delete, or it races the measurement, and inside the
+  # finally, because Install-BootProbeService's own denials pass through here.
+  clear=$(line_of "$code" '^        Clear-BootProbeService$')
+  revoke=$(line_of "$code" '^        Revoke-ProbeSlotAccess$')
+  [ -n "$clear" ] && [ -n "$revoke" ] || return 1
+  [ "$clear" -lt "$revoke" ] || return 1
+
+  # sc.exe by ABSOLUTE PATH. This process is LocalSystem and a bare name is
+  # resolved by CreateProcess's search order; SystemPaths.Tool in
+  # ci-service-shim.cs states the rule and this was the one call that broke it.
+  matches "$code" "Join-Path \\\$env:SystemRoot 'System32.sc\.exe'" || return 1
+  ! matches "$code" '& sc\.exe delete' || return 1
+}
+
+# --- the sibling verdict has to say WHICH exception it saw -------------------
+#
+# `denied` passes and `missing` denies the boot, and the payload tells them apart
+# by exception type. Which exception Windows PowerShell 5.1 raises for an
+# ACL-denied Get-ChildItem is NOT observed on a real host: it is documented as
+# UnauthorizedAccessException and also reported as surfacing item-not-found-
+# shaped. If the second is what happens, every host in the pool reports `missing`
+# and denies its boot -- the same fleet-wide outcome as an unloadable shim, from
+# a second unverified assumption on the same path. Recording the concrete type
+# means the first real boot answers the question instead of the next reader
+# re-deriving it, and is the difference between fixing phase 6 and weakening it.
+has_sibling_exception_type_recorded() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  matches "$code" "siblingStatus = 'unrun'; siblingErrorType = ''" || return 1
+  matches "$code" 'siblingErrorType = \[string\] .\$_\.Exception\.GetType\(\)\.FullName' || return 1
+
+  # Both non-denied findings carry it. A type recorded into a file nothing prints
+  # is a type nobody reads.
+  matches "$code" "\\\$siblingType = \\[string\\] \\(& \\\$get 'siblingErrorType'\\)" || return 1
+  matches "$code" 'the exception was \$siblingType' || return 1
+  matches "$code" '\-\- \$sawType, and if that names an access denial' || return 1
+  matches "$code" 'ACLs are unproved, and \$sawType' || return 1
+}
+
 # --- the runtime this script is actually executed by -------------------------
 #
 # The boot script reaches a host as the `windows-startup-script-ps1` metadata
@@ -602,6 +921,18 @@ has_5_1_compatible_apis() { # <file>
   # Split-Path -LeafBase: PowerShell 6.0. This script already calls
   # `Split-Path -Leaf` on a profile directory.
   ! matches "$code" '\-LeafBase' || return 1
+  # ConvertFrom-Json -Depth: PowerShell 6.2. Phase 6 parses the probe's verdict
+  # with ConvertFrom-Json, and -Depth is the first thing anybody reaches for the
+  # day a nested field is added to it.
+  # `.*` and not `[^\n]*`: grep is line-based, so a bracket expression written
+  # `[^\n]` is read as "not the letter n and not a backslash" -- which excludes
+  # the `n` in `-InputObject` and quietly stops the pattern matching anything.
+  ! matches "$code" 'ConvertFrom-Json.*-Depth' || return 1
+  # Get-Content -AsByteStream: PowerShell 6.0, where it replaced 5.1's
+  # `-Encoding Byte`. Phase 6 reads the verdict file back with `Get-Content
+  # -Raw` while another process may still be writing it, which is exactly the
+  # situation that invites a byte-level read.
+  ! matches "$code" '\-AsByteStream' || return 1
 
   # A deny-list on its own also passes a file that draws no entropy whatsoever,
   # so the compatible form has to be positively present. Create(), the instance
@@ -677,6 +1008,60 @@ if has_probe_literal_guard "$SCRIPT"; then
   ok
 else
   bad "the probe payload interpolates metadata-derived values without an allow-list, or folds a missing sibling workspace into a denied one — the first turns a defence probe into arbitrary code holding a live host token, the second reports an ACL boundary that was never tested as proved"
+fi
+
+if has_probe_before_registration "$SCRIPT"; then
+  ok
+else
+  bad "the boot probe does not run before agent registration — a host that proves its identity is not worthless must never accept a job, and an agent registered first can be handed one while the proof is still running"
+fi
+
+if has_fatal_boot_probe "$SCRIPT"; then
+  ok
+else
+  bad "a boot-probe finding, a probe service that will not start, or a verdict that never arrived no longer stops the boot — a probe that silently no-ops is worse than no probe, because it puts a phase-6 line in the boot log of a host nothing has ever proved anything about"
+fi
+
+if has_probe_verdict_acl "$SCRIPT"; then
+  ok
+else
+  bad "the boot probe's verdict file is writable by more than the slot under test, or is not proven to have been created by THIS boot — the file decides whether the host registers and is written by the account being measured, so a shared ACL lets a job pre-answer it and a leftover file answers it from the previous boot"
+fi
+
+if has_registration_token_witness "$SCRIPT"; then
+  ok
+else
+  bad "nothing witnesses that the registration token left this instance's metadata, or the wait for it is a constant every host crosses at the same instant — §3A requires the host to confirm the controller's delete, because a key left behind is a live repository registration token readable by every job on the host; and one controller is the shared dependency of every host booting at once, so an unjittered bound turns a controller hiccup during a scale-out into a fleet-wide refusal to serve"
+fi
+
+if has_registration_token_containment "$SCRIPT"; then
+  ok
+else
+  bad "the witness throws without stopping this host's runner services — no drain rule reclaims a host whose agents DID register, so a bare throw leaves it in the pool taking jobs with a live registration token in its metadata and a FATAL line nobody is reading"
+fi
+
+if has_probe_identity_assertion "$SCRIPT"; then
+  ok
+else
+  bad "the boot probe does not report or assert which account produced its verdict — every other field it writes is an answer from the metadata server, which answers the machine and not the caller, so a probe that silently stayed LocalSystem proves nothing about the boundary a job runs behind and says it proved everything"
+fi
+
+if has_probe_shim_loadable_by_slot "$SCRIPT"; then
+  ok
+else
+  bad "the probe service is repointed at a slot account that has no right to read or execute the shim the SCM must load for it — C:\\ci\\bin is SYSTEM-and-Administrators-only with inheritance disabled, so the start fails with a 1053 and phase 6 denies the boot of every host in the pool while every line of the phase reads as correct"
+fi
+
+if has_probe_teardown_invariants "$SCRIPT"; then
+  ok
+else
+  bad "the grants phase 6 hands the probing slot are still in place when phase 5 starts pull-request code as that same account, or the service delete resolves sc.exe from PATH in a LocalSystem process — 'no slot ACE under C:\\ci' has to be true of the host, not an argument about which of today's files happen to be exploitable"
+fi
+
+if has_sibling_exception_type_recorded "$SCRIPT"; then
+  ok
+else
+  bad "the sibling check maps an exception type to a pass-or-deny verdict without recording which exception it actually saw — an ACL-denied enumeration on 5.1 is unobserved and may surface item-not-found-shaped, in which case every host reports 'missing' and denies its boot, and the verdict file will not say whether the ACL held or the mapping is wrong"
 fi
 
 if has_5_1_compatible_apis "$SCRIPT"; then
@@ -997,8 +1382,91 @@ mutate "the generator leaked instead of disposed" \
 mutate "the byte draw removed, leaving a password built from an empty buffer" \
   's|\$rng\.GetBytes(\$bytes)||' \
   has_5_1_compatible_apis
+mutate "the verdict parse given a depth limit" \
+  's|ConvertFrom-Json -InputObject \$raw|ConvertFrom-Json -InputObject $raw -Depth 8|' \
+  has_5_1_compatible_apis
+mutate "the verdict read byte-wise to survive a partial write" \
+  's|Get-Content -Raw -LiteralPath \$script:ProbeResultPath|Get-Content -AsByteStream -LiteralPath $script:ProbeResultPath|' \
+  has_5_1_compatible_apis
 
-# --- group 13: the boot log goes back into the success stream ----------------
+# --- group 13: the probe proves the boundary too late, or not at all ---------
+#     sed cannot reorder, so the ordering case is spelled as a delete plus a
+#     re-insert of the identical call after phase 5 -- which is exactly the edit
+#     a reader "tidying the phases into numeric order" would make.
+mutate "the probe moved after registration, where a job can arrive mid-proof" \
+  's|^    Invoke-Phase6BootProbe .*||
+   s|^        -HookPath \$hookPath -BrokerEndpoint \$brokerEndpoint$|        -HookPath $hookPath -BrokerEndpoint $brokerEndpoint\n    Invoke-Phase6BootProbe -Provisioned $provisioned -Config $cfg -BrokerEndpoint $brokerEndpoint|' \
+  has_probe_before_registration
+mutate "the probe dropped from the boot altogether" \
+  's|^    Invoke-Phase6BootProbe .*||' \
+  has_probe_before_registration
+mutate "the probe folded into a branch, the way the job hooks nearly were" \
+  's|^    Invoke-Phase6BootProbe |        Invoke-Phase6BootProbe |' \
+  has_probe_before_registration
+
+# --- group 14: the verdict is reached and then ignored -----------------------
+mutate "a finding downgraded from a denied boot to a log line" \
+  's|Deny-Boot ("the boot probe found |Write-BootLog ("the boot probe found |' \
+  has_fatal_boot_probe
+mutate "the findings list tested against a threshold no verdict reaches" \
+  's|\$findings\.Count -gt 0|$findings.Count -gt 99|' \
+  has_fatal_boot_probe
+mutate "a probe service that would not start no longer stops the boot" \
+  's|Deny-Boot ("the boot probe service would not start as \$SlotUser|Write-BootLog ("the boot probe service would not start as $SlotUser|' \
+  has_fatal_boot_probe
+mutate "the verdict wait stretched past the boot it is supposed to gate" \
+  's|\$script:ProbeWaitSeconds = 180|$script:ProbeWaitSeconds = 86400|' \
+  has_fatal_boot_probe
+mutate "the verdict wait unbounded, so a stuck payload hangs the boot instead" \
+  's|if ((Get-Date) -ge \$deadline) { break }||' \
+  has_fatal_boot_probe
+
+# --- group 15: the verdict file stops being this boot's, or this slot's ------
+mutate "the verdict file made readable and writable across slots" \
+  's|Protect-CiDirectory -Path \$script:ProbeResultPath -SlotUser \$SlotUser|Protect-CiDirectory -Path $script:ProbeResultPath -ReadOnlyUser @($SlotUser)|' \
+  has_probe_verdict_acl
+mutate "the verdict file left on whatever ACL C:\\ci hands down" \
+  's|^    Protect-CiDirectory -Path \$script:ProbeResultPath -SlotUser \$SlotUser$||' \
+  has_probe_verdict_acl
+mutate "a passing verdict left by the previous boot accepted as this boot's" \
+  's|^    Remove-Item -LiteralPath \$script:ProbeResultPath -Force -ErrorAction SilentlyContinue$||' \
+  has_probe_verdict_acl
+mutate "a removal that did not take downgraded to a warning" \
+  's|Deny-Boot ("could not remove a pre-existing|Write-BootLog ("could not remove a pre-existing|' \
+  has_probe_verdict_acl
+mutate "the file prepared after the service that writes it was already started" \
+  's|^    Protect-ProbeVerdictFile -SlotUser \$slot\.User$||
+   s|^        \$verdict = Wait-ProbeVerdict$|        Protect-ProbeVerdictFile -SlotUser $slot.User\n        $verdict = Wait-ProbeVerdict|' \
+  has_probe_verdict_acl
+mutate "the payload made writable by the account it measures" \
+  's|Protect-CiDirectory -Path \$script:ProbeScriptPath -ReadOnlyUser @(\$SlotUser)|Protect-CiDirectory -Path $script:ProbeScriptPath -SlotUser $SlotUser|' \
+  has_probe_verdict_acl
+
+# --- group 16: §3A's third bullet stops being witnessed ----------------------
+mutate "the post-registration witness removed" \
+  's|^    Wait-RegistrationTokenRemoved$||' \
+  has_registration_token_witness
+mutate "a live token left in metadata downgraded to a log line" \
+  's|Deny-Boot ("\$script:RegistrationTokenKey is STILL on this instance|Write-BootLog ("$script:RegistrationTokenKey is STILL on this instance|' \
+  has_registration_token_witness
+mutate "the witness reading once instead of polling the controller's own tick" \
+  's|Get-JitteredTimeout -BaseSeconds \$script:TokenRemovalWaitSeconds|0 * (0|' \
+  has_registration_token_witness
+mutate "the jittered bound tidied back into a constant every host crosses together" \
+  's|\$script:TokenRemovalJitterSeconds = 300|$script:TokenRemovalJitterSeconds = 0|' \
+  has_registration_token_witness
+mutate "the spread dropped from the call while the constant stays, which reads as jittered" \
+  's| -JitterSeconds \$script:TokenRemovalJitterSeconds||' \
+  has_registration_token_witness
+mutate "the witness moved above registration, where the key is supposed to be there" \
+  's|^    Wait-RegistrationTokenRemoved$||
+   s|^    \$regToken = Wait-RegistrationToken$|    Wait-RegistrationTokenRemoved\n    $regToken = Wait-RegistrationToken|' \
+  has_registration_token_witness
+
+# --- group 17: the boot log goes back into the success stream ----------------
+#     Renumbered from 13 on the rebase: this branch had already taken 13-16 for
+#     the phase-6 harness, and two group 13s would make a failure report name a
+#     group the reader cannot find.
 #     The original regression plus the two other spellings of it. All three
 #     parse, all three lint (except Write-Host, which is the point of the third
 #     case being separate), and all three pass the Pester suite unchanged.
@@ -1014,6 +1482,91 @@ mutate "Write-Host, which is out-of-band but fails PSAvoidUsingWriteHost in powe
 mutate "the file write dropped, so a host that boots leaves no boot log behind" \
   's|Add-Content -Path \$script:LogPath -Value \$line -ErrorAction Stop||' \
   has_uncapturable_boot_log
+
+# --- group 18: the witness stops containing anything -------------------------
+mutate "the containment removed, leaving a FATAL line on a host still taking jobs" \
+  's|^    Stop-RunnerService$||' \
+  has_registration_token_containment
+mutate "the containment moved below the throw, where it is dead code that reads as present" \
+  's|^    Stop-RunnerService$||
+   s|^    Write-BootLog "phase 5: \$script:RegistrationTokenKey is gone|    Stop-RunnerService\n    Write-BootLog "phase 5: $script:RegistrationTokenKey is gone|' \
+  has_registration_token_containment
+mutate "the service pattern narrowed to something no runner service matches" \
+  "s|NamePattern = 'actions.runner.\\*'|NamePattern = 'ci-no-such-service'|" \
+  has_registration_token_containment
+
+# --- group 19: the probe stops saying who answered ---------------------------
+mutate "the identity check removed, so a LocalSystem probe passes every field" \
+  "s|the probe ran as '\\\$ran' and not \\\$ExpectedIdentity|the probe ran as somebody|" \
+  has_probe_identity_assertion
+mutate "the expected identity made optional, so omitting it skips the assertion" \
+  's|\[Parameter(Mandatory = \$true)\]\[AllowEmptyString()\]\[string\] \$ExpectedIdentity|[AllowEmptyString()][string] $ExpectedIdentity|' \
+  has_probe_identity_assertion
+mutate "the harness asserting a constant that agrees with itself instead of the slot" \
+  "s| -ExpectedIdentity \\\$slot\\.User| -ExpectedIdentity 'ci-s1'|" \
+  has_probe_identity_assertion
+mutate "the payload reading its account from the environment block it does not control" \
+  's|\[System.Security.Principal.WindowsIdentity\]::GetCurrent().Name|$env:USERNAME|' \
+  has_probe_identity_assertion
+mutate "an unattributed verdict no longer reported as a finding" \
+  's|the probe did not report which account it ran as|the probe was quiet about it|' \
+  has_probe_identity_assertion
+
+# --- group 20: the slot cannot load the image it is started as ---------------
+mutate "the shim grant dropped, which is the H1 regression: a 1053 on every host" \
+  's|^    Protect-CiDirectory -Path \$script:ServiceShim -ReadOnlyUser @(\$SlotUser)$||' \
+  has_probe_shim_loadable_by_slot
+mutate "the shim made slot-WRITABLE, which starts the service and hands away LocalSystem" \
+  's|Protect-CiDirectory -Path \$script:ServiceShim -ReadOnlyUser @(\$SlotUser)|Protect-CiDirectory -Path $script:ServiceShim -SlotUser $SlotUser|' \
+  has_probe_shim_loadable_by_slot
+mutate "the grant moved below the repoint, where the SCM has already failed to load it" \
+  's|^    Protect-CiDirectory -Path \$script:ServiceShim -ReadOnlyUser @(\$SlotUser)$||
+   s|^    Grant-ServiceLogonAccount -ServiceName \$script:ProbeServiceName -Credential \$Credential$|    Grant-ServiceLogonAccount -ServiceName $script:ProbeServiceName -Credential $Credential\n    Protect-CiDirectory -Path $script:ServiceShim -ReadOnlyUser @($SlotUser)|' \
+  has_probe_shim_loadable_by_slot
+mutate "the bypass-traverse dependency left undocumented for the next image bump" \
+  's|THIS RELIES ON BYPASS-TRAVERSE-CHECKING|The traversal works out|' \
+  has_probe_shim_loadable_by_slot
+
+# --- group 21: phase 6's grants outlive phase 6 ------------------------------
+mutate "the revocation removed, so job code inherits every ACE the probe needed" \
+  's|^        Revoke-ProbeSlotAccess$||' \
+  has_probe_teardown_invariants
+mutate "the revocation moved above the delete, where it races the running probe" \
+  's|^        Revoke-ProbeSlotAccess$||
+   s|^        Clear-BootProbeService$|        Revoke-ProbeSlotAccess\n        Clear-BootProbeService|' \
+  has_probe_teardown_invariants
+mutate "the shim left out of the revert, which is the one grant on an executable" \
+  's|\$script:ProbeRoot, \$script:ProbeResultPath, \$script:ServiceShim|$script:ProbeRoot, $script:ProbeResultPath|' \
+  has_probe_teardown_invariants
+mutate "a revert that did not take downgraded to a log line" \
+  's|Deny-Boot ("could not take|Write-BootLog ("could not take|' \
+  has_probe_teardown_invariants
+mutate "the revert given -SlotUser, so it re-grants what it claims to take back" \
+  's|^            Protect-CiDirectory -Path \$path$|            Protect-CiDirectory -Path $path -SlotUser $SlotUser|' \
+  has_probe_teardown_invariants
+mutate "sc.exe back to PATH resolution in a LocalSystem process" \
+  "s|\\\$sc = Join-Path \\\$env:SystemRoot 'System32.sc.exe'||
+   s|& \\\$sc delete|\& sc.exe delete|" \
+  has_probe_teardown_invariants
+
+# --- group 22: the sibling verdict stops saying what it saw ------------------
+mutate "the exception type no longer recorded, leaving the fleet-wide arm unexplained" \
+  's|`\$r.siblingErrorType = \[string\] `\$_.Exception.GetType().FullName|`$null = `$_|' \
+  has_sibling_exception_type_recorded
+mutate "the field dropped from the verdict shape" \
+  "s|siblingStatus = 'unrun'; siblingErrorType = ''|siblingStatus = 'unrun'|" \
+  has_sibling_exception_type_recorded
+mutate "the type recorded but never printed, so it reaches nobody" \
+  "s|\\\$siblingType = \\[string\\] (& \\\$get 'siblingErrorType')|\$siblingType = ''|" \
+  has_sibling_exception_type_recorded
+mutate "the missing-arm finding stripped back to the sentence that says nothing" \
+  's|-- \$sawType, and if that names an access denial|and nothing else|' \
+  has_sibling_exception_type_recorded
+
+# --- group 23: the stop pattern stops being constrained ----------------------
+mutate "the pattern validation removed, so a wildcard can take the beacon with it" \
+  's|^        \[ValidatePattern.*$||' \
+  has_registration_token_containment
 
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
