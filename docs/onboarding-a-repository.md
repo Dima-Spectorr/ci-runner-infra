@@ -343,6 +343,18 @@ module "ci_runner_apply_trigger" {
 }
 ```
 
+**If this root uses the partial backend described in step 4, pass the bucket
+here too** — the build's `init` hits the same wall the manual one did, with the
+same misleading message, on a schedule nobody is watching:
+
+```hcl
+  backend_config = { bucket = "<state-bucket>" }
+```
+
+Bucket and prefix only. Credential keys are rejected at plan time: the value
+would be stored in the trigger and printed in every build log, and the build
+already authenticates as the service account above.
+
 **If the project links GitHub the 2nd-gen way, add its connection**, and the
 module registers the repository under it rather than expecting a GitHub App
 install:
