@@ -24,6 +24,13 @@ name: Publish tag
 on:
   push:
     branches: [main]
+  # The recovery lever. Everything below is idempotent by construction, so the
+  # answer to "the tag did not get published, or the floating tag did not move"
+  # is to run this again — and without this trigger the only way to run it again
+  # is to push a commit to main, which is a release-shaped act performed for a
+  # non-release reason. Re-running the failed run works only while it is still
+  # retained; this does not expire.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -43,6 +50,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # `workflow_dispatch` lets the caller choose the ref, and everything below
+      # publishes a tag at the commit it is run on. Dispatched from a feature
+      # branch it would create the tag that branch's `VERSION` names, at an
+      # UNMERGED commit — permanently, because a published exact tag is never
+      # moved, and every consumer pinning it would get code that never passed
+      # the queue. The recovery lever may only ever re-run the release main
+      # already claims, so this refuses first and loudly rather than being an
+      # `if:` that greys the job out and says nothing.
+      - name: only ever release what main claims
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::publish-tag was run on $REF. It publishes the tag VERSION names at the commit it runs on, and a published exact tag is never moved — so it runs on the default branch only."
+          exit 1
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: create the tag named by VERSION, if it does not exist
@@ -120,6 +143,54 @@ jobs:
             exit 1
           }
 
+          # Both writes below go through this, because a transient failure on
+          # either is the same failure — the floating tag not moving — and the
+          # recovery is the same. On 2026-08-15 six consecutive runs went red
+          # here on `Resource not accessible by integration (HTTP 403)`, and the
+          # same call, with the same token, against the same ref, at the same
+          # target, had succeeded twelve seconds before the first of them and
+          # succeeded again seventy minutes after the last. No repository
+          # setting explains it: the only ruleset targets branches, there is no
+          # tag protection rule, and the workflow's own `contents: write` block
+          # overrides the read-only default and did not change. One attempt is
+          # not enough evidence to call a release broken.
+          #
+          # Three attempts over thirty seconds do not survive an hour-long
+          # window, and nothing inside a single run could. What they buy is that
+          # a blip stops costing a red release; what survives the window is that
+          # the exact tag is already published, the floating tag is only ever
+          # behind and never wrong, and the next push — or a manual run — moves
+          # it.
+          #
+          # The response body is printed on every attempt, including the last.
+          # `could not move` on its own told the next reader nothing — the
+          # status and the message are what turned this from a mystery into a
+          # measurement.
+          # stderr goes to a file rather than into `$out`, because callers below
+          # capture what this echoes: a warning gh happened to print would
+          # otherwise become the sha they compare against, and a corrupted value
+          # that still looks like a value is the failure mode this whole
+          # workflow is written against. Attempt reports go to stderr for the
+          # same reason — they are for the reader, not for the caller.
+          retry_api() {
+            local attempt=1 out errfile
+            errfile=$(mktemp)
+            while :; do
+              if out=$(gh api "$@" 2>"$errfile"); then
+                printf '%s' "$out"
+                rm -f "$errfile"
+                return 0
+              fi
+              echo "attempt $attempt of 3 failed: $(tr '\n' ' ' <"$errfile" | cut -c1-300)" >&2
+              if [ "$attempt" -ge 3 ]; then
+                rm -f "$errfile"
+                return 1
+              fi
+              sleep $((attempt * 10))
+              attempt=$((attempt + 1))
+            done
+          }
+
           # Force, unlike the exact tag: a floating tag that could not be moved
           # would be pinned to the first release of the major forever, which is
           # worse than not publishing it at all.
@@ -132,11 +203,45 @@ jobs:
           # silent fleet-wide DOWNGRADE, arriving at every consumer on its next
           # apply with no pull request anywhere and nothing red. So the direction
           # is asserted here, at the only moment both versions are known.
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$major" >/dev/null 2>&1; then
+          #
+          # One read, not an existence probe followed by a second read: whether
+          # the floating tag exists and what it points at are the same fact, and
+          # asking twice leaves room for the answer to change in between.
+          #
+          # Deliberately NOT retried: here a 404 is a real answer — the first
+          # release of a major has no floating tag yet — and retrying a
+          # deterministic 404 would put thirty seconds of backoff on the one
+          # path that is working exactly as intended.
+          at=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$major" --jq '.object.sha' 2>/dev/null) || at=''
+
+          if [ -n "$at" ]; then
+            # Nothing to write, and asked FIRST — before the direction guard,
+            # because there is no direction to argue about. `$major` already
+            # resolves to the object `$want` names, so the PATCH below could not
+            # change the repository, and a write that cannot change anything
+            # should not be issued. It is not free: it is the only call in this
+            # workflow that needs write access to a TAG ref, and five of the six
+            # runs that went red on 2026-08-15 were exactly this no-op,
+            # reporting a release that had already been published correctly.
+            # A release workflow that is red for a write nobody needed is the
+            # signal-destroying kind — the next real failure reads like the last
+            # five. Asking first also means the reads below, each of which can
+            # fail closed, are only paid for by a run that is actually moving
+            # the tag.
+            if [ "$at" = "$sha" ]; then
+              echo "$major is already at $want — nothing to move."
+              exit 0
+            fi
+
             # The VERSION file at the commit the floating tag currently resolves
             # to — which is what the tag actually promises consumers today.
-            cur=$(gh api "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$major" \
-                    -H "Accept: application/vnd.github.raw" 2>/dev/null | tr -d '[:space:]')
+            # Retried: unlike the read above, a failure here cannot mean "not
+            # there" — the tag exists, this run just read it. So every failure
+            # is transient, and every transient failure that reaches the guard
+            # below fails a release for a reason that has nothing to do with the
+            # release.
+            cur=$(retry_api "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$major" \
+                    -H "Accept: application/vnd.github.raw" | tr -d '[:space:]')
 
             # Fail CLOSED on an unreadable current version. Allowing the move
             # here would make a transient API failure the one path that CAN move
@@ -148,9 +253,11 @@ jobs:
               exit 1
             fi
 
-            # `sort -V` on the numbers alone. Equal is allowed: re-pointing the
-            # tag at the same version is the no-op that makes this workflow safe
-            # to run on every push.
+            # `sort -V` on the numbers alone. Equal is still allowed here even
+            # though the no-op above already returned: the floating tag can name
+            # the same VERSION from a different object — a release re-tagged, or
+            # a major tag pointed at a commit rather than the annotated tag — and
+            # that is a move forward to the canonical object, not a downgrade.
             if [ "$cur" != "$want" ]; then
               newest=$(printf '%s\n%s\n' "${cur#v}" "${want#v}" | sort -V | tail -1)
               if [ "$newest" != "${want#v}" ]; then
@@ -159,17 +266,29 @@ jobs:
               fi
             fi
 
-            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" \
-              -F sha="$sha" -F force=true >/dev/null || {
-              echo "::error::could not move $major to $want"
+            if ! retry_api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" \
+                   -F sha="$sha" -F force=true >/dev/null; then
+              echo "::error::could not move $major to $want — see the attempts above."
               exit 1
-            }
-            echo "moved $major to $want"
+            fi
           else
-            gh api "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f ref="refs/tags/$major" -f sha="$sha" >/dev/null || {
-              echo "::error::could not create $major at $want"
+            if ! retry_api "repos/$GITHUB_REPOSITORY/git/refs" \
+                   -f ref="refs/tags/$major" -f sha="$sha" >/dev/null; then
+              echo "::error::could not create $major at $want — see the attempts above."
               exit 1
-            }
-            echo "created $major at $want"
+            fi
           fi
+
+          # The write said it worked; this asks the repository. A 200 that did
+          # not land, and a concurrent run that pointed the tag somewhere else
+          # between the attempt and now, are otherwise indistinguishable from a
+          # published release — and nobody looks at the floating tag again until
+          # a consumer applies it, at which point the wrong answer is already in
+          # the fleet.
+          now=$(retry_api "repos/$GITHUB_REPOSITORY/git/ref/tags/$major" --jq '.object.sha') || now=''
+          if [ "$now" != "$sha" ]; then
+            echo "::error::$major reports '$now' after being pointed at $sha ($want) — the write reported success and did not land."
+            exit 1
+          fi
+
+          echo "$major now points at $want"
