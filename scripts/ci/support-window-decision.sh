@@ -66,9 +66,23 @@ iso_to_days() {
   y=$((10#${iso:0:4}))
   m=$((10#${iso:5:2}))
   d=$((10#${iso:8:2}))
-  if [ "$m" -lt 1 ] || [ "$m" -gt 12 ] || [ "$d" -lt 1 ] || [ "$d" -gt 31 ]; then
+  if [ "$m" -lt 1 ] || [ "$m" -gt 12 ] || [ "$d" -lt 1 ]; then
     return 1
   fi
+
+  # Days in THIS month, not 31 in every month. A bare `-gt 31` accepts
+  # 2026-02-30, and the civil-days arithmetic below happily converts it — into
+  # March 2nd, two days from where the feed said. A malformed date that silently
+  # becomes a real one is the invariant inverted: doubtful input has to be
+  # rejected here so the caller can report it undecided, not quietly shifted
+  # into a verdict.
+  local last=31
+  case "$m" in
+    4|6|9|11) last=30 ;;
+    2) if [ $((y % 4)) -eq 0 ] && { [ $((y % 100)) -ne 0 ] || [ $((y % 400)) -eq 0 ]; }
+       then last=29; else last=28; fi ;;
+  esac
+  [ "$d" -le "$last" ] || return 1
 
   if [ "$m" -le 2 ]; then y=$((y - 1)); fi
   era=$(((y >= 0 ? y : y - 399) / 400))
