@@ -442,7 +442,7 @@ ten locally-cloned consumers: **344 unpinned references, zero repositories
 clean**. See `docs/ci-workflow-gates.md` for adoption, including the Dependabot
 config without which pinning becomes permanent staleness.
 
-### 7.1 Dependabot answers the other question — shipped in v5.20.0
+### 7.1 Dependabot answers the other question — shipped
 
 Pinning plus Dependabot keeps a dependency *current*. Neither of them notices
 when a version stops being *supported*, and the fleet was full of the
