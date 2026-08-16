@@ -185,17 +185,35 @@ scan_inventory() {
   done < <(find "$REPO_ROOT/.github/workflows" -name '*.yml' -o -name '*.yaml' 2>/dev/null)
 
   # `FROM image:tag` — a base image is a runtime declaration wearing a hat.
+  #
+  # The image reference is NOT simply `$2`. `FROM --platform=linux/amd64
+  # node:20-bookworm AS build` is ordinary Dockerfile syntax, and both halves of
+  # the naive reading fail on it: the token after `FROM` is the flag, so a grep
+  # demanding a colon there never matches the line at all, and the whole
+  # declaration is skipped without a word. A base image that is silently not
+  # scanned is a clean report about a version nobody read — the exact failure
+  # this gate exists to end. So: match any `FROM`, then take the first token
+  # that is not a flag, and let the missing colon be the only thing that
+  # disqualifies a line.
   while IFS= read -r f; do
     while IFS= read -r line; do
       local ref image tag prod
-      ref="$(echo "$line" | awk '{print $2}')"
+      ref="$(printf '%s\n' "$line" |
+             awk '{ for (i = 2; i <= NF; i++) if ($i !~ /^--/) { print $i; exit } }')"
+      [ -n "$ref" ] || continue
       ref="${ref##*/}"
       image="${ref%%:*}"
       tag="${ref#*:}"
+      # No tag is no declaration: `FROM node` and `FROM node:latest` both name a
+      # version that is whatever the registry served that day.
       [ "$tag" = "$ref" ] && continue
       prod="$(product_for_image "$image")" || continue
-      emit "$prod" "$tag" "${f#"$REPO_ROOT"/}" "FROM $ref"
-    done < <(grep -hiE '^[[:space:]]*FROM[[:space:]]+[^[:space:]]+:' "$f" 2>/dev/null)
+      # The RAW line, not a reconstruction of it. "Did this pull request choose
+      # this?" is answered by matching the declaration against the diff, and a
+      # rebuilt `FROM node:20` never appears in a diff that added
+      # `FROM --platform=... node:20 AS build`.
+      emit "$prod" "$tag" "${f#"$REPO_ROOT"/}" "$(trim "$line")"
+    done < <(grep -hiE '^[[:space:]]*FROM[[:space:]]' "$f" 2>/dev/null)
   done < <(find "$REPO_ROOT" -iname 'Dockerfile*' -not -path '*/node_modules/*' 2>/dev/null)
 
   # The golden image's own baked versions.
