@@ -248,7 +248,7 @@ Warm hosts hide this — until a host is cold or newly scaled out, at which poin
 every dependency downloads again inside the burst that caused the scale-out.
 Caching matters *most* exactly when the pool is under pressure.
 
-### 4.2 The golden image's warm cache is a stub
+### 4.2 The golden image's warm cache is a stub (shipped as a boot-time layer)
 
 `packer/warm-cache/none.sh` in this repository is a no-op. Everything a repo
 installs on every job — npm registry contents, Go module cache, Maven/Gradle
@@ -283,13 +283,33 @@ on would be worth nothing with that channel through it. The cost of the copy is
 disk: K slots hold K copies. See README.md's isolation rules for the full
 argument.
 
-What this does not yet do is survive the host: a scale-out or a recycle still
-starts cold, which is exactly when the pool is under the pressure that made
-caching matter (§4.1). That is the snapshot layer — see the tracking issue — and
-it is deliberately *not* a bake: one image serves every pool while cache content
-is per-repository, and a baked cache freezes at build time. It hydrates the
-master, which is read-only and therefore the one place a snapshot can land
-without reopening the channel above.
+What v5.12.0 did not do was survive the host: a scale-out or a recycle still
+started cold, which is exactly when the pool is under the pressure that made
+caching matter (§4.1). That is the snapshot layer, and it is deliberately *not*
+a bake: one image serves every pool while cache content is per-repository, and a
+baked cache freezes at build time. It hydrates the master, which is read-only and
+therefore the one place a snapshot can land without reopening the channel above.
+
+**Status (v5.22.0): shipped, and per-pool adoption is what is left.** A booting
+host reads a pointer object under the pool's own prefix and unpacks the snapshot
+into the master before the agent registers; a trusted scheduled run — never a
+pull-request job — packs the next one and swaps the pointer under a generation
+precondition. The bound the persistent snapshot removed is restored explicitly:
+`cache_snapshot_max_age_hours` makes a stale snapshot get ignored rather than
+trusted, the bucket carries a matching lifecycle rule, and the read grant is
+conditioned on the pool's prefix so one pool cannot reach another's cache. The
+hydrate fails open under `cache_hydrate_budget_seconds` — a cache problem starts
+a host cold, it never stops it registering.
+
+That fail-open is also why this section can no longer be read as "done": a pool
+that never sets `cache_snapshot_bucket` behaves exactly as it did before, and so
+does a pool whose publishing run quietly stopped. Both are silent by
+construction, which is what `ci_cache_hydrate_verdict` and the `cachestale` /
+`cachefail` policies exist to say out loud — see
+[`docs/publishing-a-cache-snapshot.md`](publishing-a-cache-snapshot.md) for the
+wiring and README.md for the verdicts. Until a pool opts in and
+`ensure-alert-policies.sh` has run against its project, the saving here is still
+zero, and nothing will page about it.
 
 Note for whoever picks this up: `setup-*` actions re-downloading toolchains is
 **not** part of this and must not be folded into it. The Actions tool cache has
@@ -600,7 +620,7 @@ Ranked by saved pool-seconds per unit of work, with dependencies respected.
 | 7 | Fix or quarantine the permanently-red gate | 5.2 |
 | 8 | Non-code lane, in workflows and in a `docs` queue | 1.2, 6 |
 | 9 | Fork PRs off the self-hosted pool (security) | 1.5 |
-| 10 | Real warm cache in the golden image | 4.2 |
+| 10 | Real warm cache — snapshot layer shipped v5.22.0, per-pool adoption to land | 4.2 |
 | 11 | Batch settings + scopes in every queue | 6 |
 | 12 | Build-once/reuse, Docker layer cache, remote monorepo cache | 3.4, 4.3, 4.4 |
 | 13 | SHA-pin actions — gate shipped v5.4.0, 344 findings to land | 7 |

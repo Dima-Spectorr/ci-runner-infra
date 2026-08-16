@@ -1,10 +1,17 @@
 # Golden CI host image.
 #
 # This image is the wall-time saving. A host booting from it already has the
-# runner agent, the container runtime, the language toolchains and a pre-warmed
-# dependency cache, so a job starts working within seconds of being assigned
-# instead of after the boot + install + download sequence every job in this
-# fleet currently repeats.
+# runner agent, the container runtime and the language toolchains, so a job
+# starts working within seconds of being assigned instead of after the boot +
+# install sequence every job in this fleet used to repeat.
+#
+# The DEPENDENCY cache is deliberately not part of that list. One image serves
+# every pool while cache content is per-repository, and anything baked here
+# freezes at build time — so the cache arrives at boot from the pool's own
+# snapshot instead (modules/ci-runner-host-pool, `cache_snapshot_bucket`). The
+# `warm_cache_script` below is the narrow exception: content worth baking
+# because it is too large to hydrate per boot, browsers being the case that
+# earned it.
 #
 # ONE IMAGE, EVERY POOL. There is no per-repository image and no build flag
 # that makes the image "the Print-Server image" or "the Apigee image". Anything
@@ -187,7 +194,7 @@ source "googlecompute" "host" {
   image_name        = "${var.image_family}-${var.image_version}"
   image_family      = var.image_family
   image_storage_locations = var.image_storage_locations
-  image_description = "Warm CI host: runner agent + container runtime + toolchains + pre-warmed caches. Repo-agnostic; all identity arrives via instance metadata."
+  image_description = "Warm CI host: runner agent + container runtime + toolchains. Repo-agnostic; identity and the dependency cache both arrive at boot, via instance metadata and the pool's snapshot."
 
   image_labels = {
     component = "ci-runner-host-pool"
