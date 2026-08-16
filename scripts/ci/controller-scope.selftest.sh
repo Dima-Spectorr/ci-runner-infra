@@ -206,12 +206,12 @@ check "host row: both awk readers split on the comma" 2 "$r"
 # fake compute API and judged on the calls it made. `gcloud`, `curl` and `jq`
 # are shell functions, so this needs no fixture directory and no network.
 # shellcheck disable=SC2016
-reg_seq() { # <reg> <age> <pre> <status> [add-rc] [del-rc] [mutation-sed]
+reg_seq() { # <reg> <age> <pre> <status> [busy] [add-rc] [del-rc] [mutation-sed]
   # <pre> is a comma list of pre-existing markers, from:
   #   minted  keylive  cordon  fails=<n>
   # -> adds|removes|minted?|keylive?|fails=<n>
-  local reg="$1" age="$2" pre="${3:-}" status="${4:-RUNNING}"
-  local arc="${5:-0}" drc="${6:-0}" mut="${7:-}"
+  local reg="$1" age="$2" pre="${3:-}" status="${4:-RUNNING}" busy="${5:-0}"
+  local arc="${6:-0}" drc="${7:-0}" mut="${8:-}"
   local dir out step m
   dir=$(mktemp -d)
   : >"$dir/calls"
@@ -250,7 +250,7 @@ reg_seq() { # <reg> <age> <pre> <status> [add-rc] [del-rc] [mutation-sed]
       $(fn write_registration_token)
       $(fn delete_registration_token)
       $step
-      registration_token_step h1 https://c/zones/test-zone-a/instances/h1 '$reg' '$age' '$status'
+      registration_token_step h1 https://c/zones/test-zone-a/instances/h1 '$reg' '$age' '$status' '$busy'
     " 2>&1
   )
   [ -z "$out" ] || { printf 'shell-error: %s' "$(printf '%s' "$out" | head -1)"; rm -rf "$dir"; return; }
@@ -299,7 +299,7 @@ check "regtoken: past the grace no first token is minted either" "0|0|no-minted|
 # indefinitely.
 check "regtoken: a cordoned host is never minted a token" "0|0|no-minted|no-keylive|fails=0" \
   "$(reg_seq absent 30 cordon)"
-check "regtoken: a cordoned host's live key is taken back at once" "0|1|no-minted|no-keylive|fails=0" \
+check "regtoken: a cordoned host's live key is taken back at once" "0|1|minted|no-keylive|fails=0" \
   "$(reg_seq absent 30 cordon,keylive)"
 
 # Only a host that is actually coming up. A TERMINATED instance the MIG still
@@ -307,28 +307,62 @@ check "regtoken: a cordoned host's live key is taken back at once" "0|1|no-minte
 check "regtoken: a terminated host is not minted a token" "0|0|no-minted|no-keylive|fails=0" \
   "$(reg_seq absent 30 '' TERMINATED)"
 
-# A blind tick knows nothing about this host's agents. It must neither hand out
-# a credential on a guess nor pull one away from a host mid-registration.
-check "regtoken: an unreadable runner list does nothing" "0|0|minted|keylive|fails=0" \
+# PARTIAL — one slot registered, the rest not. This shipped in the same mint arm
+# as `absent`, and it is the more dangerous of the two: a registered slot can
+# ALREADY be executing a pull request, and that job reads the metadata key. And
+# it does not self-correct, because host_age_seconds is controller-local — a
+# replaced controller reads every host as age 0, so a SLOTS=2 host with slot 1
+# running a job and slot 2 dead reads `partial` indefinitely and never reaches
+# the `present` delete. Mint on `absent` only; on `partial`, take it back.
+check "regtoken: a partly registered host is NOT minted a token" \
+  "0|0|no-minted|no-keylive|fails=0" "$(reg_seq partial 0 '')"
+check "regtoken: a partly registered host's key is taken back" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq partial 0 minted,keylive)"
+
+# BUSY is the strongest statement that job code is executing right now, and it
+# is passed in rather than re-derived so the guard cannot be skipped by a caller.
+check "regtoken: a busy host is never minted a token" \
+  "0|0|no-minted|no-keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 1)"
+check "regtoken: a busy host's live key is taken back" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq absent 0 minted,keylive RUNNING 1)"
+
+# A blind tick knows nothing about this host's AGENTS. It must not hand out a
+# credential on a guess, nor pull one away from a host that may be mid-register.
+check "regtoken: an unreadable runner list mints nothing" "0|0|no-minted|no-keylive|fails=0" \
+  "$(reg_seq unknown 30 '')"
+check "regtoken: an unreadable runner list leaves a booting host alone" "0|0|minted|keylive|fails=0" \
   "$(reg_seq unknown 120 minted,keylive)"
+
+# …but `unknown` is not an exemption from the EXPIRY. It is set for every host
+# at once whenever the runner list read fails, and this repo has seen 36
+# consecutive blind ticks; a rule that only expires on a known reg state leaves
+# a live token in job-readable metadata on every Windows host for the whole
+# outage, cordoned ones included. `cordon`, `busy` and `age` are all still known
+# locally during a blind tick, and the delete is idempotent.
+check "regtoken: a blind tick still takes back a cordoned host's key" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq unknown 99999 minted,keylive,cordon)"
+check "regtoken: a blind tick still expires a key past the grace" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq unknown 99999 minted,keylive)"
+check "regtoken: a blind tick still takes back a busy host's key" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq unknown 30 minted,keylive RUNNING 1)"
 
 # THE ERROR PATHS, which is where both of the review's blocking findings lived.
 # A write that reports failure may still have committed server-side, so it is
 # followed by a delete and the key is NOT recorded as written; a delete that
 # fails keeps `keylive` so the next tick tries again.
 check "regtoken: a failed write takes the key back and does not claim it" \
-  "1|1|no-minted|no-keylive|fails=1" "$(reg_seq absent 30 '' RUNNING 1 0)"
+  "1|1|no-minted|no-keylive|fails=1" "$(reg_seq absent 30 '' RUNNING 0 1 0)"
 
 # …and it gives up after three. Retrying a failed write once a tick is a
 # registration-token POST per tick against the App installation the queue poll
 # shares, and the failure it retries hardest — a `timeout` on a setMetadata that
 # committed anyway — parks another live credential each time round.
 check "regtoken: minting gives up after three failed writes" \
-  "0|0|no-minted|no-keylive|fails=3" "$(reg_seq absent 30 fails=3 RUNNING 1 0)"
+  "0|0|no-minted|no-keylive|fails=3" "$(reg_seq absent 30 fails=3 RUNNING 0 1 0)"
 check "regtoken: a success clears the failure count" \
   "1|0|minted|keylive|fails=0" "$(reg_seq absent 30 fails=2)"
 check "regtoken: a failed delete keeps the key on the books for a retry" \
-  "0|1|minted|keylive|fails=0" "$(reg_seq present 120 minted,keylive RUNNING 0 1)"
+  "0|1|minted|keylive|fails=0" "$(reg_seq present 120 minted,keylive RUNNING 0 0 1)"
 
 # The detector has to be SEEN firing, or it is not a detector. The delete call
 # is replaced by a no-op that still succeeds — the shape of the plausible bad
@@ -338,7 +372,7 @@ check "regtoken: a failed delete keeps the key on the books for a retry" \
 # pool could ship with a live registration token in every host's metadata while
 # this file says ok.
 check "regtoken: the delete check FAILS when the delete is removed" "0|0|minted|no-keylive|fails=0" \
-  "$(reg_seq present 120 minted,keylive RUNNING 0 0 's/delete_registration_token/true/g')"
+  "$(reg_seq present 120 minted,keylive RUNNING 0 0 0 's/delete_registration_token/true/g')"
 
 # The whole path is opt-in, and the default is what every existing Linux
 # controller runs. Flipping either of these turns on credential-writing into

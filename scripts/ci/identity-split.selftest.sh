@@ -174,14 +174,29 @@ fi
 #     block the next apply of every EXISTING pool destroys and recreates live
 #     IAM — a window in which hosts cannot read the App key and cannot register,
 #     caused by a change that is supposed to leave Linux alone.
+#
+#     BOTH addresses are asserted, and as a PAIR inside one block. Checking only
+#     the `to` line is the vacuous version of this test: a typo'd or stale `from`
+#     names an address that is not in state, so the move is a no-op, the real
+#     resource is still destroyed and recreated, and the check that was supposed
+#     to prevent exactly that still says ok. awk pairs them per block so a `from`
+#     borrowed from the neighbouring block cannot satisfy it either.
+moved_pair() { # <address> -> yes|no
+  awk -v a="$1" '
+    /^moved \{/ { f=""; t=""; inb=1; next }
+    inb && /^\}/ { if (f == a && t == a "[0]") { print "yes"; exit } inb=0; next }
+    inb && $1 == "from" { f=$3 }
+    inb && $1 == "to"   { t=$3 }
+  ' "$IDENTITY/main.tf"
+}
 for addr in \
   'google_secret_manager_secret_iam_member.runner_reads_key' \
   'google_project_iam_member.metrics' \
   'google_project_iam_member.logs'; do
-  if matches "$(grep -A2 '^moved {' "$IDENTITY/main.tf")" "to   = ${addr//./\\.}\[0\]"; then
+  if matches "$(moved_pair "$addr")" '^yes$'; then
     ok "state move declared for $addr"
   else
-    bad "no moved block for $addr — an existing pool will DESTROY and recreate this binding"
+    bad "no moved block pairing $addr with ${addr}[0] — an existing pool will DESTROY and recreate this binding"
   fi
 done
 

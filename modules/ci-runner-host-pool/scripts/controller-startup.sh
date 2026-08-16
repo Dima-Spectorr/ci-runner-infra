@@ -838,6 +838,19 @@ idle_seconds() {
 write_registration_token() {
   local uri="$1" keylive="$2"
   local tok resp reg f zone host rc
+
+  # The parse comes FIRST, before anything is minted. A registration token is
+  # live from the moment GitHub issues it, so a self-link this cannot address —
+  # a MIG row with no instance URI, a format change — would otherwise burn an
+  # hour-long credential that no delete path can ever reach, because the delete
+  # needs the same zone this failed to read.
+  zone=${uri%/instances/*}; zone=${zone##*/}
+  host=${uri##*/}
+  if [ -z "$zone" ] || [ -z "$host" ]; then
+    log "regtoken: cannot read a zone from $uri"
+    return 1
+  fi
+
   tok=$(gh_token) || { log "regtoken: no installation token"; return 1; }
 
   resp=$(curl "${CURL_TIMEOUTS[@]}" -fsS -X POST \
@@ -846,13 +859,6 @@ write_registration_token() {
     "https://api.github.com/repos/$REPO_FULL/actions/runners/registration-token") || return 1
   reg=$(printf '%s' "$resp" | jq -r '.token // empty')
   [ -n "$reg" ] || return 1
-
-  zone=${uri%/instances/*}; zone=${zone##*/}
-  host=${uri##*/}
-  if [ -z "$zone" ] || [ -z "$host" ]; then
-    log "regtoken: cannot read a zone from $uri"
-    return 1
-  fi
 
   # --metadata-from-file, never --metadata: a token passed as an argument sits
   # in the process table, and on the pool this exists for one of the local
@@ -901,91 +907,129 @@ delete_registration_token() {
     --keys="$REG_TOKEN_KEY" >/dev/null 2>&1
 }
 
-# registration_token_step <host> <self-link> <reg-state> <age-seconds> <status>
+# registration_token_step <host> <self-link> <reg> <age-seconds> <status> <busy>
 # The whole lifecycle in one function so it can be RUN by a self-test rather
 # than read: the delete is a security property, and a property nothing executes
 # is a comment.
+#
+# EXPIRY FIRST, THEN MINT, and the expiry rule does not consult `reg` at all.
+# Deciding on `reg` alone is what shipped two High findings: `partial` shares a
+# mint arm with `absent` while meaning a slot is already registered and may be
+# running a job, and `unknown` — set for EVERY host at once whenever the runner
+# list read fails, for as long as the outage lasts — refused to take anything
+# back. `reg` describes GitHub's opinion of the agents; whether a live credential
+# should still be sitting in a job-readable metadata key is a different question,
+# and the answer is no as soon as the host is cordoned, busy, registered or out
+# of time, whatever GitHub happens to be saying this tick.
 registration_token_step() {
-  local host="$1" uri="$2" reg="$3" age="$4" status="${5:-}"
+  local host="$1" uri="$2" reg="$3" age="$4" status="${5:-}" busy="${6:-0}"
   local minted="$STATE_DIR/regtoken-$host"
   local keylive="$STATE_DIR/regkey-$host"
   local cordon="$STATE_DIR/cordon-$host"
   local fails="$STATE_DIR/regfail-$host"
-  local n
+  local n why=""
+  case "$busy" in *[!0-9]*) busy=0 ;; esac
 
-  case "$reg" in
-    present)
-      # Agents are in GitHub's runner list; the token has done its job. The
-      # delete is NOT conditional on this controller remembering it wrote the
-      # key: the sweep clears markers on an empty host list, a boot disk does
-      # not survive a controller replacement, and either would otherwise leave
-      # a live credential in metadata for GitHub's full hour. Deleting is
-      # idempotent, so the recovery path costs one call and then stops.
-      if [ ! -f "$minted" ] || [ -f "$keylive" ]; then
-        if delete_registration_token "$uri"; then
-          rm -f "$keylive"
-          : >"$minted"
-          log "regtoken $host: agents registered — $REG_TOKEN_KEY deleted"
-        else
-          log "regtoken $host: registered but $REG_TOKEN_KEY could not be deleted — retrying next tick"
-        fi
-      fi
-      ;;
-    absent | partial)
-      # `partial` means at least one slot IS registered and can already pick up
-      # a job, so it is grouped with `absent` only for the mint; the delete
-      # below does not wait on the remaining slots any differently.
-      if [ -f "$keylive" ]; then
-        # A cordoned host will never register again — its agents were removed
-        # on purpose and the job it is still running is the one the key would
-        # be stolen by. Past the grace the host is not coming up either. Either
-        # way the credential has no future use, so take it back now.
-        if [ -f "$cordon" ] || [ "$age" -ge "$REGISTER_GRACE" ]; then
-          if delete_registration_token "$uri"; then
-            rm -f "$keylive"
-            log "regtoken $host: no agents after ${age}s (cordoned=$([ -f "$cordon" ] && echo yes || echo no)) — $REG_TOKEN_KEY deleted"
-          fi
-        fi
-        return 0
-      fi
-      # ONE token per instance. Every guard below is a state in which this host
-      # was reachable by the branch above and must not be handed a second one:
-      # already minted for, cordoned (job code running, deregistered on
-      # purpose), not actually booting, or past the grace at which the recycle
-      # rule deletes it anyway.
-      [ -f "$minted" ] && return 0
-      [ -f "$cordon" ] && return 0
-      [ "$age" -ge "$REGISTER_GRACE" ] && return 0
-      case "$status" in
-        PROVISIONING | STAGING | RUNNING) ;;
-        *) return 0 ;;
-      esac
-      # THREE attempts, then stop. A write that keeps failing re-mints once a
-      # tick, and each attempt is a registration-token POST against the same App
-      # installation the queue poll depends on — the secondary-rate-limit path
-      # this file's header calls the blind-tick outage. Worse, the failure this
-      # retries hardest is `timeout 60` on a setMetadata that COMMITTED, so each
-      # cycle parks another live credential in job-readable metadata. The host
-      # is deleted at REGISTER_GRACE regardless, so the retries buy nothing.
-      n=$(cat "$fails" 2>/dev/null)
-      case "${n:-0}" in *[!0-9]*) n=0 ;; *) n=${n:-0} ;; esac
-      [ "$n" -ge 3 ] && return 0
-      if write_registration_token "$uri" "$keylive"; then
+  # --- expiry: one rule, and it runs on every reg state including `unknown` ---
+  #
+  #   registered   the token did its job.
+  #   partial      a registered slot can already be executing a pull request,
+  #                and that job reads this key. The host contract is that the
+  #                startup script reads the key ONCE and configures every slot
+  #                from that read, so a delete here cannot strand slot 2.
+  #   busy         a job is running on this host right now. Strictly stronger
+  #                than `partial`, and it is passed in rather than re-derived
+  #                so the guard is structural.
+  #   cordoned     agents deregistered on purpose; the host reads `absent`
+  #                forever while the job it was running keeps going.
+  #   past grace   not coming up. GitHub's own bound is an hour; ours is this.
+  #
+  # `unknown` is NOT an exemption. It means the runner list read failed, which
+  # is a controller-side outage — this repo has seen 36 consecutive blind ticks
+  # — and during it `cordon`, `busy` and `age` are all still known locally. Not
+  # minting on a guess is right; refusing to take a credential back is not, and
+  # the delete is idempotent so a needless one costs a call.
+  if [ -f "$keylive" ]; then
+    # Spelled as an if-chain, not `test && assign`, for the reason 151cfda gave:
+    # a bare `a && b` whose `b` is a failing test leaves the whole list non-zero,
+    # and this file runs under `set -e`. It survives today only because bash
+    # exempts a non-final member of an AND list — one reordering away from
+    # killing the tick.
+    if [ "$reg" = "present" ]; then
+      why="agents registered"
+    elif [ "$reg" = "partial" ]; then
+      why="a slot registered"
+    elif [ "$busy" -gt 0 ]; then
+      why="a job is running"
+    elif [ -f "$cordon" ]; then
+      why="host cordoned"
+    elif [ "$age" -ge "$REGISTER_GRACE" ]; then
+      why="no agents after ${age}s"
+    fi
+    if [ -n "$why" ]; then
+      if delete_registration_token "$uri"; then
+        rm -f "$keylive"
         : >"$minted"
-        rm -f "$fails"
-        log "regtoken $host: minted and written to $REG_TOKEN_KEY"
+        log "regtoken $host: $why — $REG_TOKEN_KEY deleted"
       else
-        printf '%s' "$((n + 1))" >"$fails"
-        log "regtoken $host: $REG_TOKEN_KEY could not be written (attempt $((n + 1)) of 3)"
+        log "regtoken $host: $why but $REG_TOKEN_KEY could not be deleted — retrying next tick"
       fi
-      ;;
-    *)
-      # `unknown` — the runner list read failed this tick, so nothing is known
-      # about this host's agents. Do not hand out a credential on a guess, and
-      # do not pull one out from under a host that may be mid-registration.
-      :
-      ;;
+    fi
+    return 0
+  fi
+
+  # No local record that a key is live — but local records are lost (the sweep,
+  # a replaced controller, a `timeout` on a write that committed). A host GitHub
+  # calls registered is the one state where a stray key is certainly finished
+  # with, so clean it once, unconditionally, and mark it done.
+  if [ "$reg" = "present" ] && [ ! -f "$minted" ]; then
+    if delete_registration_token "$uri"; then
+      : >"$minted"
+      log "regtoken $host: registered with no local record — $REG_TOKEN_KEY deleted"
+    fi
+    return 0
+  fi
+
+  # --- mint: `absent` ONLY ---
+  #
+  # Not `partial`. host_age_seconds is controller-local, so a replaced
+  # controller reads every host as age 0; a SLOTS=2 host with slot 1 running a
+  # pull request and slot 2 dead then reads `partial` indefinitely, and minting
+  # for it writes a fresh hour-long credential into the metadata of the job on
+  # slot 1. A host that is genuinely half-registered does not need a second
+  # token — it already had one.
+  [ "$reg" = "absent" ] || return 0
+
+  # ONE token per instance. Each guard is a state this host could reach and must
+  # not be handed a token in: already minted for, running a job, cordoned, not
+  # actually booting, or past the grace at which the recycle rule deletes it.
+  [ -f "$minted" ] && return 0
+  [ "$busy" -gt 0 ] && return 0
+  [ -f "$cordon" ] && return 0
+  [ "$age" -ge "$REGISTER_GRACE" ] && return 0
+  case "$status" in
+    PROVISIONING | STAGING | RUNNING) ;;
+    *) return 0 ;;
   esac
+
+  # THREE attempts, then stop. A write that keeps failing re-mints once a tick,
+  # and each attempt is a registration-token POST against the same App
+  # installation the queue poll depends on — the secondary-rate-limit path this
+  # file's header calls the blind-tick outage. Worse, the failure this retries
+  # hardest is `timeout 60` on a setMetadata that COMMITTED, so each cycle parks
+  # another live credential in job-readable metadata. The host is deleted at
+  # REGISTER_GRACE regardless, so the retries buy nothing.
+  n=$(cat "$fails" 2>/dev/null)
+  case "${n:-0}" in *[!0-9]*) n=0 ;; *) n=${n:-0} ;; esac
+  [ "$n" -ge 3 ] && return 0
+  if write_registration_token "$uri" "$keylive"; then
+    : >"$minted"
+    rm -f "$fails"
+    log "regtoken $host: minted and written to $REG_TOKEN_KEY"
+  else
+    printf '%s' "$((n + 1))" >"$fails"
+    log "regtoken $host: $REG_TOKEN_KEY could not be written (attempt $((n + 1)) of 3)"
+  fi
   return 0
 }
 
@@ -1232,13 +1276,19 @@ tick() {
     age=$(host_age_seconds "$host")
 
     # Before any deletion verdict: a host that is still booting needs its
-    # registration token now, and a host that has registered needs the key gone
-    # now. Both are no-ops on a pool that mints on the host, and both are
-    # skipped when the MIG did not report a self-link, because without a zone
-    # there is no instance to address and a guessed one is a call against some
-    # other machine.
+    # registration token now, and a host that has registered — or is running a
+    # job, or was cordoned, or ran out of time — needs the key gone now. Both
+    # are no-ops on a pool that mints on the host, and both are skipped when the
+    # MIG did not report a self-link, because without a zone there is no
+    # instance to address and a guessed one is a call against some other
+    # machine.
+    #
+    # `busy` is passed rather than re-derived inside the step: it is the
+    # strongest single statement that job code is executing on this host right
+    # now, and the step's expiry rule is the one place that has to be certain of
+    # it. It is read from HOST_BUSY above, after host_facts.
     if [ "$MINT_REG" = "true" ] && [ -n "$host_uri" ]; then
-      registration_token_step "$host" "$host_uri" "$HOST_REG" "$age" "$status"
+      registration_token_step "$host" "$host_uri" "$HOST_REG" "$age" "$status" "$busy"
     fi
 
     # The recycle rule is asked FIRST, and a cordon/retire verdict ends this
