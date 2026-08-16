@@ -1078,6 +1078,40 @@ Describe 'probe verdict' {
             Should -Match 'unproved'
     }
 
+    # Which exception Windows PowerShell 5.1 raises for an ACL-denied
+    # enumeration is UNOBSERVED on a real host, and the two candidates land in
+    # opposite arms: UnauthorizedAccessException passes, ItemNotFoundException
+    # denies the boot of every host in the pool. The finding therefore has to
+    # carry the type, or the first host to fail tells the operator the boundary
+    # is unproved and gives them nothing to prove it with.
+    It 'names the exception behind an absent sibling workspace' {
+        $r = & $script:CleanProbe
+        $r.siblingStatus = 'missing'
+        Add-Member -InputObject $r -NotePropertyName 'siblingErrorType' `
+            -NotePropertyValue 'System.Management.Automation.ItemNotFoundException'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'ItemNotFoundException'
+    }
+
+    It 'names the exception behind any other sibling outcome' {
+        $r = & $script:CleanProbe
+        $r.siblingStatus = 'error'
+        Add-Member -InputObject $r -NotePropertyName 'siblingErrorType' `
+            -NotePropertyValue 'System.IO.IOException'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'System.IO.IOException'
+    }
+
+    # An empty field says so in words. "the exception was " with nothing after
+    # it reads as a truncated log line, which is the one thing an operator
+    # staring at a denied boot must not have to interpret.
+    It 'says plainly when no exception type was recorded at all' {
+        $r = & $script:CleanProbe
+        $r.siblingStatus = 'missing'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'no exception was recorded'
+    }
+
     # Service-account emails are canonically lowercase, so a case difference is
     # a different identity being passed off as the configured one.
     It 'holds the broker to the exact identity, case included' {
@@ -1204,6 +1238,15 @@ Describe 'probe payload' {
 
     It 'writes its verdict where the boot script looks for it' {
         $script:Payload | Should -Match "Set-Content -LiteralPath 'C:\\ci\\boot-probe\.json'"
+    }
+
+    # The sibling arm decides pass-or-deny from an exception type nobody has
+    # observed on a real host, so it carries the type out with it. One catch,
+    # not three: a typed catch that never fires records nothing, and "nothing
+    # recorded" is indistinguishable from "the field was never added".
+    It 'carries the concrete sibling exception type out in the verdict' {
+        $script:Payload | Should -Match 'siblingErrorType'
+        $script:Payload | Should -Match '\$_\.Exception\.GetType\(\)\.FullName'
     }
 
     # Without this the repoint has no witness: every other field in the verdict

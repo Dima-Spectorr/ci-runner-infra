@@ -190,6 +190,23 @@ $script:RegistrationPollSeconds = 5
 # So the bound is widened AND spread. Base 600s with up to 300s of jitter is
 # still far inside any window in which an operator would notice the host, and
 # the spread means a controller that recovers inside five minutes costs nothing.
+#
+# WHY 900s IS ACCEPTABLE AS A SECURITY BOUND AND NOT ONLY A CAPACITY ONE. The
+# argument above is entirely about availability, so on its own it would justify
+# any number at all. The security half is that this deadline does not bound the
+# EXPOSURE, only the moment containment starts. The host cannot delete its own
+# metadata; while it waits the token is readable by job code either way, and
+# section 3A already accepts that window and bounds it elsewhere -- by the
+# controller's delete on its own tick, and failing that by the registration
+# token's one-hour expiry, which is the real ceiling and is not ours to move.
+# 900s is a quarter of that ceiling. Shortening to 300s would buy at most ten
+# minutes off a sixty-minute window that section 3A has already accepted, and
+# would pay for it in the correlated case above -- the one where a slow
+# controller, not a leaked token, is what actually happened.
+#
+# What this deadline DOES bound is how long a host keeps taking new jobs after
+# the controller has visibly failed to clean up, and that is what
+# Stop-RunnerService closes at the deadline.
 $script:TokenRemovalWaitSeconds = 600
 $script:TokenRemovalJitterSeconds = 300
 
@@ -1274,13 +1291,27 @@ function Get-ProbeFailure {
     # sibling workspace that simply had not been created yet report as a proved
     # ACL boundary -- the same "absence read as a pass" this function refuses
     # for a missing verdict file.
+    #
+    # The exception type the payload recorded is APPENDED to both non-denied
+    # findings, and it is the useful half of them. Which exception 5.1 actually
+    # raises for an ACL-denied enumeration is unobserved on a real host, and the
+    # two candidates land in different arms here -- so on the first host that
+    # denies its boot over this, the finding itself says whether the ACL held
+    # and the mapping is wrong, or the ACL did not hold. Without it the operator
+    # is told the boundary is unproved and given nothing to prove it with.
     $sibling = [string] (& $get 'siblingStatus')
+    $siblingType = [string] (& $get 'siblingErrorType')
+    $sawType = 'no exception was recorded'
+    if (-not [string]::IsNullOrWhiteSpace($siblingType)) { $sawType = "the exception was $siblingType" }
     if ($sibling -eq 'allowed') {
         $fail.Add('a slot could read another slot''s workspace -- the per-slot ACLs are not holding')
     } elseif ($sibling -eq 'missing') {
-        $fail.Add('the sibling workspace was not there to read, so the per-slot ACLs were never tested')
+        $fail.Add('the sibling workspace was not there to read, so the per-slot ACLs were never tested ' +
+            "-- $sawType, and if that names an access denial then 5.1 reported the denial " +
+            'item-not-found-shaped and this mapping, not the ACL, is what is wrong')
     } elseif ($sibling -ne 'denied') {
-        $fail.Add("the sibling read neither succeeded nor was denied ('$sibling') -- the per-slot ACLs are unproved")
+        $fail.Add("the sibling read neither succeeded nor was denied ('$sibling') -- the per-slot " +
+            "ACLs are unproved, and $sawType")
     }
     if ((& $get 'cacheWritable') -ne $true) {
         $fail.Add('the warm cache is not writable by a slot, so every job on this host repopulates it')
@@ -1398,7 +1429,8 @@ try {
 `$md = @{ 'Metadata-Flavor' = 'Google' }
 `$r = [ordered] @{
     runningAs = ''; hostToken = `$false; secretStatus = `$null; metricStatus = `$null
-    brokerEmail = ''; siblingStatus = 'unrun'; cacheWritable = `$false; dnsResolved = `$false
+    brokerEmail = ''; siblingStatus = 'unrun'; siblingErrorType = ''
+    cacheWritable = `$false; dnsResolved = `$false
 }
 
 # WHO IS ANSWERING. Every other field in this document queries the metadata
@@ -1461,15 +1493,28 @@ $brokerBlock
 # way for a path this account may not read and a path that is not there, so the
 # exception type is the only thing that separates a proved ACL from an untested
 # one. Get-ProbeFailure treats every value but 'denied' as a finding.
+#
+# THE TYPE NAME IS RECORDED, NOT ONLY THE VERDICT IT MAPPED TO. Which exception
+# 5.1 raises for an ACL-denied enumeration is NOT something this branch has
+# observed on a real host: it is documented as UnauthorizedAccessException and
+# it is also reported as surfacing item-not-found-shaped, and those two map to
+# opposite conclusions here -- 'denied' passes, 'missing' denies the boot on
+# every host in the pool. Guessing produces a fleet that will not boot and a
+# verdict file that does not say why. So the concrete type is carried out
+# alongside the status and Get-ProbeFailure prints it, and the first real boot
+# settles the question instead of leaving the next reader to re-derive it.
 try {
     `$null = Get-ChildItem -LiteralPath '$SiblingWorkspace' -Force -ErrorAction Stop
     `$r.siblingStatus = 'allowed'
-} catch [System.UnauthorizedAccessException] {
-    `$r.siblingStatus = 'denied'
-} catch [System.Management.Automation.ItemNotFoundException] {
-    `$r.siblingStatus = 'missing'
 } catch {
-    `$r.siblingStatus = 'error'
+    `$r.siblingErrorType = [string] `$_.Exception.GetType().FullName
+    if (`$_.Exception -is [System.UnauthorizedAccessException]) {
+        `$r.siblingStatus = 'denied'
+    } elseif (`$_.Exception -is [System.Management.Automation.ItemNotFoundException]) {
+        `$r.siblingStatus = 'missing'
+    } else {
+        `$r.siblingStatus = 'error'
+    }
 }
 
 try {
@@ -2853,8 +2898,18 @@ function Stop-RunnerService {
         difference between working and not -- but a function that reports its
         own outcome does not depend on that remaining true.
     #>
+    # THE PATTERN IS CONSTRAINED, and the parameter is only injectable at all so a
+    # test can drive it. Stop-Service -Force stops DEPENDENTS as well, so a widened
+    # pattern here does not merely stop too many services -- a bare `*` would take
+    # the beacon and the job broker down with the agents, and the beacon is what
+    # the controller reads to decide this host is alive. Nothing attacker-influenced
+    # reaches this today; the validation is what keeps that from being a property of
+    # the current call sites rather than of the function.
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
-    param([string] $NamePattern = 'actions.runner.*')
+    param(
+        [ValidatePattern('^actions\.runner\.[A-Za-z0-9._*-]+$')]
+        [string] $NamePattern = 'actions.runner.*'
+    )
 
     $stopped = 0
     foreach ($svc in @(Get-Service -Name $NamePattern -ErrorAction SilentlyContinue)) {
@@ -3095,6 +3150,29 @@ function Install-BootProbeService {
     Protect-CiDirectory -Path $script:ProbeScriptPath -ReadOnlyUser @($SlotUser)
     Protect-CiDirectory -Path $script:ProbeConfigPath -ReadOnlyUser @($SlotUser)
 
+    # AND THE BINARY THAT READS THEM, which is the one that was missed. The
+    # service's binPath is the shim itself, and phase 1 locks C:\ci, C:\ci\bin
+    # and C:\ci\slots to SYSTEM and Administrators with inheritance disabled --
+    # so ci-service-shim.exe carries no ACE for any slot. Repointing the service
+    # at the slot and starting it would make the SCM launch an image that token
+    # may neither read nor execute: ERROR_ACCESS_DENIED, a 1053 start failure,
+    # and a Deny-Boot on every host in the pool. Read-and-execute only, never
+    # Modify: a slot able to WRITE this file would own the beacon and the broker,
+    # which the SCM re-executes as LocalSystem on the next reboot.
+    #
+    # THIS RELIES ON BYPASS-TRAVERSE-CHECKING, and it is stated because it is the
+    # kind of default a hardened image removes. C:\ci and C:\ci\bin remain
+    # SYSTEM-and-Administrators-only, so a file-level ACE is reachable at all
+    # only because Windows grants SeChangeNotifyPrivilege to Everyone by default:
+    # a full path opens against the file's own ACL without any right on the
+    # directories above it. An image that revokes that privilege breaks this the
+    # same way it breaks the verdict file in C:\ci -- closed, as a service that
+    # will not start, not as a probe that quietly passes.
+    #
+    # Reverted by Revoke-ProbeSlotAccess once the verdict is in, so the "no slot
+    # ACE under C:\ci" invariant is true of the host phase 5 runs on.
+    Protect-CiDirectory -Path $script:ServiceShim -ReadOnlyUser @($SlotUser)
+
     # The preference is dropped around the native call for the reason given in
     # Install-BeaconService: under Stop, `2>&1` on a native command turns each
     # stderr line into a terminating NativeCommandError before the exit code is read.
@@ -3113,8 +3191,11 @@ function Install-BootProbeService {
     # asked to run as an unprivileged local account, and nothing in CI can boot a
     # GCE Windows instance to find out. The specific things not yet observed are
     # that the shim's own log append succeeds from C:\ci\boot-probe as the slot,
-    # and that the SCM accepts the account here given the SeServiceLogonRight
-    # phase 1 granted. Both fail CLOSED if the guess is wrong -- a service that
+    # that the SCM accepts the account here given the SeServiceLogonRight phase 1
+    # granted, and that the SCM's load of ci-service-shim.exe under the slot
+    # token succeeds on the file-level ACE granted above -- which is to say that
+    # bypass-traverse-checking is still granted to Everyone on this image. All
+    # three fail CLOSED if the guess is wrong -- a service that
     # will not start denies the boot below, and one that starts and writes
     # nothing denies it at the verdict wait -- so the failure mode of being wrong
     # is a Windows pool that refuses to serve, not one that serves unproved.
@@ -3195,15 +3276,69 @@ function Clear-BootProbeService {
     if (-not (Get-Service -Name $script:ProbeServiceName -ErrorAction SilentlyContinue)) { return }
     Stop-Service -Name $script:ProbeServiceName -Force -ErrorAction SilentlyContinue
 
+    # ABSOLUTE PATH, not a bare `sc.exe`. This process is LocalSystem and a bare
+    # name is resolved by CreateProcess's search order; SystemPaths.Tool in
+    # ci-service-shim.cs states the rule for the same reason and this was the one
+    # call in phase 6 that did not follow it. No hijackable directory is KNOWN to
+    # sit earlier in that order -- the point is not to rebut a known hijack but to
+    # stop the absence of one from having to be re-proved after every change to
+    # PATH, to the app-paths registry, or to the image's directory ACLs.
+    $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    $output = & sc.exe delete $script:ProbeServiceName 2>&1
+    $output = & $sc delete $script:ProbeServiceName 2>&1
     $exit = $LASTEXITCODE
     $ErrorActionPreference = $previous
     foreach ($line in @($output)) { Write-BootLog "sc: $line" }
     if ($exit -ne 0) {
         Write-BootLog "phase 6: could not delete $script:ProbeServiceName (exit $exit)"
     }
+}
+
+function Revoke-ProbeSlotAccess {
+    <#
+      .SYNOPSIS
+        Take back every ACE phase 6 granted a slot. Fatal if one does not revert.
+      .DESCRIPTION
+        THE INVARIANT IS "NO SLOT ACE ANYWHERE UNDER C:\ci", AND THIS IS WHAT
+        MAKES IT LITERALLY TRUE RATHER THAN TRUE BY ARGUMENT.
+
+        Phase 6 hands the probing slot three grants it does not need afterwards:
+        Modify on C:\ci\boot-probe (the shim appends its log there), Modify on
+        C:\ci\boot-probe.json (the slot writes the verdict), and ReadAndExecute
+        on the shim binary (the SCM loads it under the slot token). Phase 5 then
+        registers agents as that same account, so from that point on the holder
+        of these ACEs is pull-request code. No exploit route through them was
+        found -- the shim grant is read-only, and nothing re-executes the two
+        boot-probe paths -- but "we looked and found nothing" is a claim about
+        today's file layout, and the next writer under C:\ci does not get to
+        inherit it silently.
+
+        Reverting is the SAME call with no -SlotUser: Protect-CiDirectory
+        rewrites the whole ACL from scratch every time, so there is no ACE to
+        remove by hand and no ordering to get wrong.
+
+        FATAL, unlike Clear-BootProbeService, and the asymmetry is the point. A
+        service left installed runs nothing -- it is Manual and non-restarting.
+        An ACE left behind is a standing grant to the account phase 5 is about to
+        start job code as, and this is the last moment anything checks. Set-Acl
+        as SYSTEM on a file SYSTEM owns does not fail for benign reasons, so a
+        failure here is a fact about the host worth refusing to boot over.
+    #>
+    [CmdletBinding()]
+    param()
+
+    foreach ($path in @($script:ProbeRoot, $script:ProbeResultPath, $script:ServiceShim)) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        try {
+            Protect-CiDirectory -Path $path
+        } catch {
+            Deny-Boot ("could not take the boot probe's grant on $path back off the slot account " +
+                "($($_.Exception.Message)) -- phase 5 is about to run pull-request code as that " +
+                'account and this was the last thing standing between the two')
+        }
+    }
+    Write-BootLog 'phase 6: the probing slot no longer holds any grant under C:\ci'
 }
 
 function Invoke-Phase6BootProbe {
@@ -3269,6 +3404,14 @@ function Invoke-Phase6BootProbe {
         $verdict = Wait-ProbeVerdict
     } finally {
         Clear-BootProbeService
+        # AFTER the stop-and-delete, never before: the service is still loading
+        # the shim image and writing the verdict until Clear-BootProbeService
+        # returns, so revoking first would race the measurement this phase
+        # exists to take. In the finally rather than at the end of the function
+        # because Install-BootProbeService's own Deny-Boot paths pass through
+        # here too, and a denied boot is exactly when nobody is coming back to
+        # tidy up.
+        Revoke-ProbeSlotAccess
     }
     if ($null -eq $verdict) {
         Write-BootLog "phase 6: no verdict at $script:ProbeResultPath after $script:ProbeWaitSeconds s"

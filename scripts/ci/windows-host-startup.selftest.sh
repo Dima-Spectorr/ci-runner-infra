@@ -654,6 +654,14 @@ has_registration_token_containment() { # <file>
   matches "$code" '^    Stop-RunnerService$' || return 1
   matches "$code" "NamePattern = 'actions\.runner\.\*'" || return 1
 
+  # The pattern is CONSTRAINED. Stop-Service -Force stops dependents too, so a
+  # widened pattern does not merely over-stop: a bare `*` takes the beacon and
+  # the job broker down with the agents, and the beacon is what tells the
+  # controller this host is alive. Nothing attacker-influenced reaches the
+  # parameter today, which is a fact about the call sites and not the function.
+  matches "$code" "ValidatePattern\('\^actions" || return 1
+  matches "$code" 'A-Za-z0-9\._\*-\]\+' || return 1
+
   # BEFORE the throw. After it is dead code, and dead code here reads exactly
   # like a containment that is present.
   stop=$(line_of "$code" '^    Stop-RunnerService$')
@@ -697,6 +705,105 @@ has_probe_identity_assertion() { # <file>
   # …and the harness hands it the account it actually repointed the service to,
   # rather than a constant that would agree with itself.
   matches "$code" '\-ExpectedIdentity \$slot\.User' || return 1
+}
+
+# --- the slot has to be able to LOAD the thing it is started as --------------
+#
+# The probe service's binPath is the shim itself, and phase 1 locks C:\ci,
+# C:\ci\bin and C:\ci\slots to SYSTEM and Administrators with inheritance
+# disabled -- so ci-service-shim.exe carries no ACE for any slot. Repointing the
+# service at the slot and starting it makes the SCM launch an image that token
+# may neither read nor execute: ERROR_ACCESS_DENIED, a 1053, and a Deny-Boot on
+# every host in the pool. The payload and its config were granted for exactly
+# this reason; the binary that reads them was missed, and the shape of the bug
+# is that the whole phase looks correct and denies every boot.
+has_probe_shim_loadable_by_slot() { # <file>
+  local code raw grant inst
+  code=$(code_of "$1")
+  # The bypass-traverse assertion below is the one thing in this file that has to
+  # be checked against the RAW text: it lives in a comment, and code_of strips
+  # exactly those. Everything else uses $code, so a comment can never satisfy it.
+  raw=$(cat "$1")
+
+  # READ AND EXECUTE, never Modify. A slot able to write this binary owns the
+  # beacon and the broker, which the SCM re-executes as LocalSystem next reboot.
+  matches "$code" 'Protect-CiDirectory -Path \$script:ServiceShim -ReadOnlyUser @\(\$SlotUser\)' || return 1
+  ! matches "$code" 'Protect-CiDirectory -Path \$script:ServiceShim -SlotUser' || return 1
+
+  # …and it is granted BEFORE the shim is asked to install the service, not after
+  # the SCM has already failed to load it.
+  grant=$(line_of "$code" 'Protect-CiDirectory -Path \$script:ServiceShim -ReadOnlyUser')
+  inst=$(line_of "$code" 'Grant-ServiceLogonAccount -ServiceName \$script:ProbeServiceName')
+  [ -n "$grant" ] && [ -n "$inst" ] || return 1
+  [ "$grant" -lt "$inst" ] || return 1
+
+  # The reliance on bypass-traverse-checking is WRITTEN DOWN. C:\ci and C:\ci\bin
+  # stay SYSTEM-and-Administrators-only, so a file-level ACE is reachable only
+  # because SeChangeNotifyPrivilege is granted to Everyone by default -- the kind
+  # of default a hardened image removes, and an undocumented dependency on it is
+  # how the next image bump becomes an unexplainable fleet-wide 1053.
+  matches "$raw" 'THIS RELIES ON BYPASS-TRAVERSE-CHECKING' || return 1
+}
+
+# --- and it must not still be able to afterwards -----------------------------
+#
+# Phase 6 hands the probing slot three grants; phase 5 then starts pull-request
+# code as that same account. No exploit route through them was found, and that
+# is a statement about today's layout rather than an invariant. Revoking makes
+# "no slot ACE anywhere under C:\ci" literally true instead of true-by-argument.
+has_probe_teardown_invariants() { # <file>
+  local code clear revoke
+  code=$(code_of "$1")
+
+  matches "$code" '^        Revoke-ProbeSlotAccess$' || return 1
+  matches "$code" '\$script:ProbeRoot, \$script:ProbeResultPath, \$script:ServiceShim' || return 1
+
+  # The revert is Protect-CiDirectory with NO -SlotUser. The function rewrites
+  # the ACL from scratch, so there is no ACE to remove by hand.
+  matches "$code" '^            Protect-CiDirectory -Path \$path$' || return 1
+
+  # FATAL, unlike the service delete. A service left installed runs nothing; an
+  # ACE left behind is a standing grant to the account about to run job code.
+  matches "$code" "Deny-Boot \\(\"could not take the boot probe's grant on \\\$path" || return 1
+
+  # AFTER the stop-and-delete, or it races the measurement, and inside the
+  # finally, because Install-BootProbeService's own denials pass through here.
+  clear=$(line_of "$code" '^        Clear-BootProbeService$')
+  revoke=$(line_of "$code" '^        Revoke-ProbeSlotAccess$')
+  [ -n "$clear" ] && [ -n "$revoke" ] || return 1
+  [ "$clear" -lt "$revoke" ] || return 1
+
+  # sc.exe by ABSOLUTE PATH. This process is LocalSystem and a bare name is
+  # resolved by CreateProcess's search order; SystemPaths.Tool in
+  # ci-service-shim.cs states the rule and this was the one call that broke it.
+  matches "$code" "Join-Path \\\$env:SystemRoot 'System32.sc\.exe'" || return 1
+  ! matches "$code" '& sc\.exe delete' || return 1
+}
+
+# --- the sibling verdict has to say WHICH exception it saw -------------------
+#
+# `denied` passes and `missing` denies the boot, and the payload tells them apart
+# by exception type. Which exception Windows PowerShell 5.1 raises for an
+# ACL-denied Get-ChildItem is NOT observed on a real host: it is documented as
+# UnauthorizedAccessException and also reported as surfacing item-not-found-
+# shaped. If the second is what happens, every host in the pool reports `missing`
+# and denies its boot -- the same fleet-wide outcome as an unloadable shim, from
+# a second unverified assumption on the same path. Recording the concrete type
+# means the first real boot answers the question instead of the next reader
+# re-deriving it, and is the difference between fixing phase 6 and weakening it.
+has_sibling_exception_type_recorded() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  matches "$code" "siblingStatus = 'unrun'; siblingErrorType = ''" || return 1
+  matches "$code" 'siblingErrorType = \[string\] .\$_\.Exception\.GetType\(\)\.FullName' || return 1
+
+  # Both non-denied findings carry it. A type recorded into a file nothing prints
+  # is a type nobody reads.
+  matches "$code" "\\\$siblingType = \\[string\\] \\(& \\\$get 'siblingErrorType'\\)" || return 1
+  matches "$code" 'the exception was \$siblingType' || return 1
+  matches "$code" '\-\- \$sawType, and if that names an access denial' || return 1
+  matches "$code" 'ACLs are unproved, and \$sawType' || return 1
 }
 
 # --- the runtime this script is actually executed by -------------------------
@@ -937,6 +1044,24 @@ if has_probe_identity_assertion "$SCRIPT"; then
   ok
 else
   bad "the boot probe does not report or assert which account produced its verdict — every other field it writes is an answer from the metadata server, which answers the machine and not the caller, so a probe that silently stayed LocalSystem proves nothing about the boundary a job runs behind and says it proved everything"
+fi
+
+if has_probe_shim_loadable_by_slot "$SCRIPT"; then
+  ok
+else
+  bad "the probe service is repointed at a slot account that has no right to read or execute the shim the SCM must load for it — C:\\ci\\bin is SYSTEM-and-Administrators-only with inheritance disabled, so the start fails with a 1053 and phase 6 denies the boot of every host in the pool while every line of the phase reads as correct"
+fi
+
+if has_probe_teardown_invariants "$SCRIPT"; then
+  ok
+else
+  bad "the grants phase 6 hands the probing slot are still in place when phase 5 starts pull-request code as that same account, or the service delete resolves sc.exe from PATH in a LocalSystem process — 'no slot ACE under C:\\ci' has to be true of the host, not an argument about which of today's files happen to be exploitable"
+fi
+
+if has_sibling_exception_type_recorded "$SCRIPT"; then
+  ok
+else
+  bad "the sibling check maps an exception type to a pass-or-deny verdict without recording which exception it actually saw — an ACL-denied enumeration on 5.1 is unobserved and may surface item-not-found-shaped, in which case every host reports 'missing' and denies its boot, and the verdict file will not say whether the ACL held or the mapping is wrong"
 fi
 
 if has_5_1_compatible_apis "$SCRIPT"; then
@@ -1386,6 +1511,62 @@ mutate "the payload reading its account from the environment block it does not c
 mutate "an unattributed verdict no longer reported as a finding" \
   's|the probe did not report which account it ran as|the probe was quiet about it|' \
   has_probe_identity_assertion
+
+# --- group 20: the slot cannot load the image it is started as ---------------
+mutate "the shim grant dropped, which is the H1 regression: a 1053 on every host" \
+  's|^    Protect-CiDirectory -Path \$script:ServiceShim -ReadOnlyUser @(\$SlotUser)$||' \
+  has_probe_shim_loadable_by_slot
+mutate "the shim made slot-WRITABLE, which starts the service and hands away LocalSystem" \
+  's|Protect-CiDirectory -Path \$script:ServiceShim -ReadOnlyUser @(\$SlotUser)|Protect-CiDirectory -Path $script:ServiceShim -SlotUser $SlotUser|' \
+  has_probe_shim_loadable_by_slot
+mutate "the grant moved below the repoint, where the SCM has already failed to load it" \
+  's|^    Protect-CiDirectory -Path \$script:ServiceShim -ReadOnlyUser @(\$SlotUser)$||
+   s|^    Grant-ServiceLogonAccount -ServiceName \$script:ProbeServiceName -Credential \$Credential$|    Grant-ServiceLogonAccount -ServiceName $script:ProbeServiceName -Credential $Credential\n    Protect-CiDirectory -Path $script:ServiceShim -ReadOnlyUser @($SlotUser)|' \
+  has_probe_shim_loadable_by_slot
+mutate "the bypass-traverse dependency left undocumented for the next image bump" \
+  's|THIS RELIES ON BYPASS-TRAVERSE-CHECKING|The traversal works out|' \
+  has_probe_shim_loadable_by_slot
+
+# --- group 21: phase 6's grants outlive phase 6 ------------------------------
+mutate "the revocation removed, so job code inherits every ACE the probe needed" \
+  's|^        Revoke-ProbeSlotAccess$||' \
+  has_probe_teardown_invariants
+mutate "the revocation moved above the delete, where it races the running probe" \
+  's|^        Revoke-ProbeSlotAccess$||
+   s|^        Clear-BootProbeService$|        Revoke-ProbeSlotAccess\n        Clear-BootProbeService|' \
+  has_probe_teardown_invariants
+mutate "the shim left out of the revert, which is the one grant on an executable" \
+  's|\$script:ProbeRoot, \$script:ProbeResultPath, \$script:ServiceShim|$script:ProbeRoot, $script:ProbeResultPath|' \
+  has_probe_teardown_invariants
+mutate "a revert that did not take downgraded to a log line" \
+  's|Deny-Boot ("could not take|Write-BootLog ("could not take|' \
+  has_probe_teardown_invariants
+mutate "the revert given -SlotUser, so it re-grants what it claims to take back" \
+  's|^            Protect-CiDirectory -Path \$path$|            Protect-CiDirectory -Path $path -SlotUser $SlotUser|' \
+  has_probe_teardown_invariants
+mutate "sc.exe back to PATH resolution in a LocalSystem process" \
+  "s|\\\$sc = Join-Path \\\$env:SystemRoot 'System32.sc.exe'||
+   s|& \\\$sc delete|\& sc.exe delete|" \
+  has_probe_teardown_invariants
+
+# --- group 22: the sibling verdict stops saying what it saw ------------------
+mutate "the exception type no longer recorded, leaving the fleet-wide arm unexplained" \
+  's|`\$r.siblingErrorType = \[string\] `\$_.Exception.GetType().FullName|`$null = `$_|' \
+  has_sibling_exception_type_recorded
+mutate "the field dropped from the verdict shape" \
+  "s|siblingStatus = 'unrun'; siblingErrorType = ''|siblingStatus = 'unrun'|" \
+  has_sibling_exception_type_recorded
+mutate "the type recorded but never printed, so it reaches nobody" \
+  "s|\\\$siblingType = \\[string\\] (& \\\$get 'siblingErrorType')|\$siblingType = ''|" \
+  has_sibling_exception_type_recorded
+mutate "the missing-arm finding stripped back to the sentence that says nothing" \
+  's|-- \$sawType, and if that names an access denial|and nothing else|' \
+  has_sibling_exception_type_recorded
+
+# --- group 23: the stop pattern stops being constrained ----------------------
+mutate "the pattern validation removed, so a wildcard can take the beacon with it" \
+  's|^        \[ValidatePattern.*$||' \
+  has_registration_token_containment
 
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

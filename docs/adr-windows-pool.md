@@ -1010,16 +1010,70 @@ slot user, every one fatal:
   do) rather than a proxy for it (whether a socket opens).
 * That same token **cannot** write a time series — assert a `403` from
   `monitoring.timeSeries.create`. The demand metric is what scales the pool.
-* No instance attribute contains a credential: assert that the
-  registration-token key is **absent** by the time the probe runs. This is the
-  check that keeps the "no credential in metadata" rule from decaying into a
-  comment, and it is also how the controller's delete-the-key step gets a witness.
+* ~~No instance attribute contains a credential: assert that the
+  registration-token key is **absent** by the time the probe runs.~~ **Amended
+  during PR 5b (2026-08-17): the probe cannot assert this, and the witness moved
+  to the end of phase 5.** The bullet as written is unsatisfiable by
+  construction. The probe runs *before* phase 5 — deliberately, because a host
+  that has not proved the slot boundary must not be able to accept a job — and
+  at that moment the registration token is not merely present, it is *required*
+  to be: phase 5 has not spent it yet. A probe asserting the key is absent would
+  deny every boot in the pool.
+
+  What ships instead: **`Wait-RegistrationTokenRemoved`, at the end of phase 5,
+  after the agents are registered.** It polls instance metadata to a jittered
+  bound (base 600s, up to 300s of jitter — the reason it is spread, and the
+  reason the upper bound is acceptable against the token's own one-hour expiry,
+  is recorded at the constant in the boot script) and denies the boot if the key
+  is still there. The controller's delete does get a witness, which was the
+  bullet's second purpose; the first purpose — "no credential in metadata by the
+  time job code can run" — it does **not** deliver, and the difference must not
+  be glossed:
+
+  - **Detection lands 600–900s after the agents are live**, not before. For that
+    whole window the host is registered, GitHub can dispatch to it, and a job on
+    it can read the token. This is the residual §3A already accepts and bounds by
+    the token's expiry; the witness narrows *nothing* about it. What the witness
+    adds is that a controller which silently stopped deleting is detected at all,
+    on the host, rather than never.
+  - **The remedy is containment, not removal.** The host cannot delete its own
+    metadata. On timeout it calls `Stop-RunnerService`, which stops every
+    `actions.runner.*` service so GitHub dispatches nothing further here. That is
+    **best-effort**: it logs and continues past a service it cannot stop, and it
+    logs loudly when *nothing* matched, in which case only the FATAL line is left.
+  - **Stopped, not deregistered**, so `host_facts()` keeps counting this host's
+    runners by name and it stays out of `drain_decision`'s `never-registered`
+    arm, where it does not belong. It goes idle at busy=0 and the ordinary idle
+    rule retires it. The one gap: `keep:at-floor` pins it on a pool at
+    `min_hosts` until an operator or a template change moves it — a capacity
+    fault, not an exposure, since it takes no jobs in that state.
+
+  Deny-Boot's own docstring says a denied host is reclaimed because it reads
+  `reg = absent`. That is true of every *other* caller and false of this one, and
+  `recycle_decision` does not help either — it triggers on a stale instance
+  template, not on registration state.
 * The broker answers, and the identity in the token it vends is
   `ci-job-service-account` and not the host account. Both halves, because a broker
   that silently fell back to the host identity is the failure this whole design
   exists to prevent.
 * Sibling profile and workspace reads are denied; the warm cache is writable; names
-  resolve; the beacon has published once and is fresh. Unchanged.
+  resolve. Unchanged. **One caveat added during PR 5b:** the sibling check
+  distinguishes *denied* from *missing* by exception type, and which exception
+  Windows PowerShell 5.1 raises for an ACL-denied enumeration has not been
+  observed on a real host. The two candidates map to opposite conclusions here,
+  so the probe records the concrete type name in the verdict alongside the
+  status and every non-`denied` finding prints it. The first real boot settles it.
+* ~~The beacon has published once and is fresh.~~ **Struck during PR 5b: never
+  implemented, and it should not be.** It is redundant with §2 — a host whose
+  beacon never appears is already handled by `beacon_decision()`'s last row
+  (`delete:` past `register_grace_seconds`, with confirmation ticks), which is a
+  better remedy than a Deny-Boot because it is taken by the party that actually
+  needs the beacon. And it would be weak evidence even if it passed: §3A's own
+  residual states that job code on a Windows host can write and forge guest
+  attributes, so a slot reading a fresh beacon proves the value is there, not
+  that the publisher is alive. Nothing in the shipped payload reads guest
+  attributes, by design; this bullet is removed rather than left standing as an
+  unimplemented requirement.
 
 A Windows pool whose host identity was not reduced fails the first two checks and
 refuses to register. That is deliberate: the misconfiguration cannot be caught at
