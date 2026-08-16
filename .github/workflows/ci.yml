@@ -78,6 +78,36 @@ jobs:
       - name: packer inline shell gate
         run: bash scripts/ci/check-packer-inline-shell.sh
 
+      # "nobody's CI runs packer" is the sentence above, and it cost an image
+      # build to finish reading. Two pull requests fixed the SAME provisioner
+      # for the same reason within an hour, one inserting `inline_shebang`
+      # before `inline` and one before `execute_command`. Different offsets, so
+      # git merged them without a conflict, and every gate here stayed green
+      # because each reads the file as SHELL — none of them parses it as HCL,
+      # where `Attribute redefined` is unambiguous and immediate.
+      #
+      # So this repository's one deliverable was syntactically invalid on main
+      # and nothing said so until a real build spent its queue time to report
+      # it eighteen seconds in.
+      #
+      # `validate -syntax-only` is what makes this affordable: it parses, and it
+      # does not need plugins, credentials, a var file or a build VM. Packer is
+      # fetched pinned to `_PACKER_VERSION` from cloudbuild.yaml, bounded, so
+      # the gate cannot become the unbounded fetch it exists to prevent.
+      - name: install packer (pinned)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          ver="$(grep -oP '_PACKER_VERSION:\s*"\K[0-9.]+' cloudbuild.yaml)"
+          curl -fsSL --retry 3 --max-time 120 \
+            -o /tmp/packer.zip \
+            "https://releases.hashicorp.com/packer/${ver}/packer_${ver}_linux_amd64.zip"
+          unzip -q -o /tmp/packer.zip -d /tmp/packer-bin
+          /tmp/packer-bin/packer version
+
+      - name: packer parses
+        run: /tmp/packer-bin/packer validate -syntax-only packer/
+
       # Those three sweeps read `*.sh` and `run:` blocks, and are blind to a
       # `.ps1`. Windows hosts are driven by PowerShell, so the fleet is about to
       # grow code that no gate in this file can read. These three steps land one
