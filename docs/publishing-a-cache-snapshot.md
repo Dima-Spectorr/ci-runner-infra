@@ -32,6 +32,13 @@ and every host in the pool unpacks it as root. So the job that installs holds
 `contents: read` and nothing else; the job that publishes only downloads the
 archive, re-scans it and uploads it. Do not merge them back.
 
+You cannot, in fact, merge them back: the script refuses to run the install and
+hold the credential in one process, so a workflow that sets `CACHE_PREPARE` and
+`CACHE_UPLOAD_TO` together dies before the install starts. Build with
+`CACHE_ARCHIVE_OUT` (or `CACHE_DRY_RUN=1` to build and scan without keeping the
+artifact), publish with `CACHE_ARCHIVE_IN`, in two separate runs. The split was
+an argument the code did not previously make; now it is a control.
+
 ```yaml
 name: publish-cache-snapshot
 
@@ -64,11 +71,16 @@ jobs:
       # this repository's release process floats `v5` forward, and a tag that
       # moves changes the script that later runs beside the credential. Resolve
       # once with:
-      #   git ls-remote https://github.com/Dima-Spectorr/ci-runner-infra refs/tags/v5.20.0^{}
+      #   git ls-remote https://github.com/Dima-Spectorr/ci-runner-infra refs/tags/<tag>^{}
+      #
+      # Do NOT pin a release older than v5.26.0. Earlier ones ship a content
+      # scan the prepare command can switch off for a file by writing one NUL
+      # byte in front of the credential, and they let one process both run that
+      # command and hold the publishing credential.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of v5.20.0>   # v5.20.0
+          ref: <commit sha of the pinned tag>   # >= v5.26.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
@@ -95,7 +107,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of v5.20.0>   # v5.20.0
+          ref: <commit sha of the pinned tag>   # >= v5.26.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
@@ -130,6 +142,19 @@ from reaching the credential, but there is no reason to run it at all. It runs
 with every cache variable pointed at an empty staging tree, so what it downloads
 is what gets published.
 
+It also runs in a **process group of its own, under a timeout**, and that group
+is killed before anything is scanned. `sh -euc` returning is not evidence the
+install stopped — a lifecycle script that forks into the background keeps running
+as the same user with the staging tree in reach, which would make every scan a
+statement about a tree that is still being written. An install that legitimately
+needs longer than an hour sets `CACHE_PREPARE_TIMEOUT` (seconds); one that hits
+the limit fails the run rather than publishing a half-populated cache. It must
+be a positive whole number: `0` is the one value `timeout` reads as *no limit at
+all*, and it is also the one an operator reaches for to mean "don't wait", so the
+script refuses it instead of silently disarming the bound. If the group does not
+come up as its own, the run is refused too — an unreapable install is one this
+run cannot bound, and the digest pin below is the detector, not the fix.
+
 **Do not put a registry token in `CACHE_PREPARE`.** Repository *variables* are
 not masked in logs, and a credential that the install writes into the cache is a
 credential published to every host in the pool. The script scans for both, and
@@ -143,10 +168,12 @@ that scan is a floor, not a guarantee.
    earlier snapshot's. Archiving either re-admits untrusted output or compounds
    an earlier mistake.
 2. **Scanned with the host's own rules before upload** — links, device nodes,
-   setuid, file capabilities, credential files, and a content pass for embedded
-   registry tokens and private keys. A snapshot that a host would refuse fails
-   here instead: once, loudly, in a run someone is watching, rather than silently
-   on every boot of every host.
+   setuid, file capabilities and credential files. A snapshot that a host would
+   refuse fails here instead: once, loudly, in a run someone is watching, rather
+   than silently on every boot of every host. **Plus one pass the host does not
+   have**: a content pass for embedded registry tokens and private keys. A host
+   greps nothing — so whatever that pass lets through is unpacked as root on
+   every host in the pool with nothing downstream to catch it.
 3. **Scanned again in the publishing job, on what it received.** The archive
    crosses a job boundary, and the job that built it is the one that ran
    third-party code — so the job holding the credential unpacks it, with the
@@ -166,6 +193,25 @@ The script also refuses to run at all from a `pull_request_target`,
 while running fork-authored code, so the identity binding alone would still hand
 out the credential — this is the check that turns such an edit into a failed run.
 
+Two properties of the scan are worth knowing before you read a refusal:
+
+- **Every file is read, including the ones that look binary.** `grep` classifies
+  a file as binary from its first NUL byte and would skip it; the prepare command
+  is third-party install code, so letting it decide what gets scanned by writing
+  one NUL is not a bound. The cost is reading a few GiB of compressed blobs, and
+  a real risk of chance matches in them — which is why every pattern has to be
+  specific enough to survive random bytes. Measured: the URL rule without a
+  scheme in front of it matched random data roughly once per gibibyte, so it
+  carries an explicit scheme list. If you add a pattern, test it against
+  `/dev/urandom` before you rely on it, because a rule that refuses good
+  snapshots is a rule someone deletes.
+- **The archive is unpacked and scanned again, in every mode**, not just in the
+  credentialed job — and the archive's sha256 is pinned across the gap between
+  that scan and the upload. What gets shipped has to be what got scanned. The
+  prepare command runs in a process group of its own and that group is killed
+  before anything is scanned, so an install that daemonises cannot still be
+  writing; the second scan and the digest are what would catch it if it were.
+
 ## When the content scan refuses
 
 The credential pass finds a **file**, and in a dependency cache a file's name is
@@ -178,13 +224,38 @@ the embedded-credential pass matched in pnpm-store/v3/files/72/93a11b…
   file: 47 bytes, 3 line(s)
   url-embedded-basic-auth: 1 match(es), first on line 2
     scheme: mongodb
+  no digest is printed for this file. A digest is printed only for a
+  private-key-header hit of at least 1024 bytes; a registry token or a URL
+  password is never excusable at any size, and for a SMALLER private-key
+  fixture compute the digest yourself with CACHE_DRY_RUN=1 rather than reading
+  it from this log
 ```
+
+A digest is printed only for a `private-key-header` hit of at least 1024 bytes,
+and only a `private-key-header` hit can be excused. The size floor is on the
+PRINTING, not on the excusing: a 230-byte EC PEM fixture is excusable, its
+digest is simply not published into a CI log — run the `CACHE_DRY_RUN=1`
+invocation below and `sha256sum` the file yourself. It is not squeamishness about the other two: the lines above already
+give the byte count, the line count, the match line and the scheme, so for a
+47-byte `mongodb://user:pass@host` the digest would be an unsalted hash of an
+almost fully known plaintext — an offline oracle for the password, published into
+a log anyone who can read the repository can read. Key material has the entropy
+to survive that; a password does not.
 
 It never prints the matched text, and neither should you: a CI log is readable
 by everyone who can see the run, so pasting the line into an issue publishes the
 thing the gate just stopped. The scheme is the tell — `https` in front of a
 `user:pass@` on a registry URL is a real credential your prepare command wrote;
 `mongodb`, `postgres` or `git+ssh` is almost always a package's test fixture.
+
+One list drives both the match and the printing. It covers the schemes a
+credential actually travels in — `http(s)`, `ftp(s)`, `sftp`, `ssh`, the VCS
+family (`git`/`hg`/`bzr`/`svn`, each with an optional `+ssh`, `+http(s)` or
+`+file`), the database and broker schemes (`postgres`, `mysql`, `mariadb`,
+`mongodb(+srv)`, `redis(s)`, `amqp(s)`), object storage (`s3`, `gs`) and the
+directory and mail schemes (`ldap(s)`, `smtps`, `imap`). Adding a scheme widens
+what the gate catches, so a missing one is a real gap worth filing; the list is
+not an exclusion list.
 
 The scheme is printed only when it is one the script recognises, and *"not a
 recognised URL scheme"* is not a bug to fix by widening the list. Cache content
@@ -194,9 +265,57 @@ whole function exists not to print. It means: go and look at that line yourself.
 
 Either way the answer is not to widen the exclusions. Reproduce it locally with
 the `CACHE_DRY_RUN=1` invocation below, open that file at that line, and fix the
-cause: a real token means the prepare command is authenticating and must stop, a
-fixture means the pattern needs narrowing in `CREDENTIAL_PATTERNS` — as a code
-change, with the selftest's mutation for that rule still passing.
+cause: a real token means the prepare command is authenticating and must stop.
+
+### Excusing one PEM fixture by digest
+
+A dependency that ships a PEM test fixture will keep tripping the pass forever,
+and there is no pattern narrow enough to tell that fixture from a real key — the
+bytes are the same shape. Widening `CREDENTIAL_PATTERNS` to make it go away
+removes the rule for every future file too, which is how a gate stops catching
+anything. Excuse *that one file* instead:
+
+```yaml
+# in BOTH jobs of publish-cache-snapshot.yml
+env:
+  # <package>@<version> ships this PEM in its own test fixtures — confirmed
+  # present in the published tarball (`npm pack <package>@<version>`), so it is
+  # not something the prepare command wrote. Verified <date>.
+  CACHE_SCAN_ALLOW_DIGESTS: <the 64-hex sha256 the refusal printed>
+```
+
+Both jobs, because the credentialed job re-scans what it received and would
+otherwise refuse the archive the build job just approved. Entries are full
+64-character sha256 digests, separated by commas or whitespace; a prefix is
+rejected at startup, because a prefix excuses every file that happens to share
+it. The digest is the file's content, so the excusal stops applying the moment
+that package changes a byte — which is the point: an upgraded dependency that
+starts shipping a real key is refused again.
+
+**A literal in the workflow file, never `${{ vars.* }}`, a `workflow_dispatch`
+input, or another job's output.** This is the one input to a pipeline whose
+output every host unpacks as root; keeping it as a literal keeps changing it a
+diff that goes through code review and branch protection, which a repository
+variable is precisely not.
+
+Three bounds make this safe to have at all:
+
+- **It excuses `private-key-header` and nothing else.** A `registry-auth-token`
+  or a `url-embedded-basic-auth` hit is refused with the allowlist set, before
+  the digest is even computed. No dependency has a legitimate reason to ship
+  either, so there is nothing to excuse — and that is what stops an operator
+  allowlisting their way past a live credential.
+- **It reaches the content pass only.** The filename, symlink, setuid and
+  capability passes take no exceptions; a host refuses those outright, so an
+  archive that needs one of them excused is an archive no host would unpack.
+- **Every excusal is logged** by name and digest on the run that uses it, so a
+  snapshot published with an exception says so in its own log.
+
+What it does *not* have is a second opinion. The host runs no content pass, so an
+entry here is the last word on that file. Never add one justified only by "this
+hash was in the way": name the package in the comment, and confirm the file is in
+that package's *published* tarball rather than something your install produced.
+If you cannot say which dependency ships it, you have not finished diagnosing it.
 
 ## First run
 

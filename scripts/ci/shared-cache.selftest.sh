@@ -80,8 +80,13 @@ PUBDOC="$HERE/../../docs/publishing-a-cache-snapshot.md"
 PASS=0
 FAIL=0
 
+SKIP=0
+
 ok()  { PASS=$((PASS + 1)); }
 bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
+# Counted and printed, never silent: a skip that does not appear in the summary
+# is a check that stopped running without anyone deciding it should.
+skip() { SKIP=$((SKIP + 1)); printf 'SKIP: %s\n' "$1"; }
 
 [ -f "$SCRIPT" ] || { echo "FAIL: missing $SCRIPT"; exit 1; }
 [ -f "$PACKER" ] || { echo "FAIL: missing $PACKER"; exit 1; }
@@ -684,7 +689,7 @@ has_no_write_grant_on_the_bucket() { # <file>
 # The publishing script is the only writer into the trusted path, so what it
 # refuses matters as much as what it does.
 has_trusted_snapshot_build() { # <file>
-  local code
+  local code reporter labeller line rest form
   code=$(code_of "$1")
   # Built into a fresh staging tree, never from a host's cache. /opt/ci-cache is
   # the master's path and must not appear at all: an archive of it would put a
@@ -720,6 +725,104 @@ has_trusted_snapshot_build() { # <file>
   # commands from the job that holds the publishing credential.
   matches "$code" 'safe_path\(\) \{ printf' || return 1
   matches "$code" 'safe_path "\$bad"' || return 1
+  # The digest allowlist. It excuses the CONTENT pass and nothing else, and each
+  # of these is what keeps it an exception rather than an off switch: a full
+  # 64-character sha256 (a prefix would excuse everything sharing it), a hex-only
+  # entry, a line in the log every time one is used, and a walk over EVERY hit —
+  # stopping at the first would let an excused file stand in front of a real one.
+  matches "$code" '\[ "\$\{#d\}" = 64 \]' || return 1
+  matches "$code" '\*\[!0-9a-fA-F\]\*' || return 1
+  matches "$code" 'die "CACHE_SCAN_ALLOW_DIGESTS holds a non-hex entry' || return 1
+  matches "$code" '\[ "\$d" = "\$1" \]' || return 1
+  matches "$code" 'sha256sum is not on PATH' || return 1
+  matches "$code" 'log "the content scan excused \$\(safe_path' || return 1
+  ! matches "$code" '\$\{pass\[@\]\}.*\| head' || return 1
+  # ...and it excuses a PEM fixture ONLY. A registry token or a URL password is
+  # refused with the allowlist set, before a digest is even computed — those are
+  # shapes no dependency ships, so an entry that could excuse one would be an
+  # operator's route past a live credential rather than past a false positive.
+  matches "$code" 'if \[ "\$\(matched_labels "\$bad"\)" = private-key-header \]; then' || return 1
+  matches "$code" 'if \[ "\$\(matched_labels "\$file"\)" = private-key-header \]' || return 1
+  # One call site, in the content pass. Wired into the filename, link, setuid or
+  # capability pass it would excuse something a HOST refuses, and the archive
+  # would be published for every host to reject.
+  [ "$(printf '%s\n' "$code" | grep -c 'scan_digest_is_allowed')" = 2 ] || return 1
+  # grep says >=2 for "I broke", and a >=2 that goes unread reads exactly like a
+  # clean pass — on the one layer that sees an embedded credential.
+  matches "$code" 'die "the staged tree could not be scanned for embedded credentials' || return 1
+  # Nothing in the reporter may hand over the file's CONTENT — it may only report
+  # ABOUT it. An ALLOW-list of the forms that may touch "$file", not a ban on the
+  # commands that leak: `head -c` banned still leaves `head -n`, `$(<"$file")`,
+  # `sed -n 1p`, awk, cut, dd, base64 and read. The set below is closed, so a new
+  # way to print the bytes fails here whatever it is called. One occurrence per
+  # line, so a leak cannot ride along on the end of an allowed one.
+  reporter=$(printf '%s\n' "$code" | sed -n '/^explain_credential_hit() {/,/^}$/p')
+  local -a reads_about=(
+    'wc -c <"$file"'
+    'wc -l <"$file"'
+    'grep -ca -E -e "$pat" "$file"'
+    'grep -na -m1 -E -e "$pat" "$file"'
+    'grep -oEa -m1 -e "$pat" "$file"'
+    'matched_labels "$file"'
+    'sha256sum <"$file"'
+  )
+  while IFS= read -r line; do
+    rest="$line"
+    for form in "${reads_about[@]}"; do rest="${rest//"$form"/}"; done
+    case "$rest" in *'"$file"'* ) return 1 ;; esac
+  done < <(printf '%s\n' "$reporter" | grep -F '"$file"')
+  # The labeller behind the digest gate collects EVERY rule a file trips. An
+  # early exit there returns a shorter list, and a shorter list is what makes a
+  # file equal `private-key-header` and so excusable.
+  labeller=$(printf '%s\n' "$code" | sed -n '/^matched_labels() {/,/^}$/p')
+  ! matches "$labeller" '(^|[;&| ])(break|return|exit)([ ;&|]|$)' || return 1
+  matches "$labeller" '\[ "\$rc" -le 1 \]' || return 1
+  # The hit list is created with mktemp, so the prepare command — which runs as
+  # this uid, before the scan, knowing the temp root — cannot pre-create it as a
+  # symlink to /dev/null or as a directory and take the whole pass green.
+  matches "$code" 'hits=\$\(mktemp "\$ARCHIVE_DIR/hits\.XXXXXX"\)' || return 1
+  matches "$code" 'die "the content scan found matches it could not then read' || return 1
+  matches "$code" 'done <"\$hits"' || return 1
+  # NUL-separated, both ends. A newline is a legal filename byte, so a
+  # newline-separated hit list lets one planted name split into an excused
+  # record plus an empty one and never be opened. Asserted as a PAIR: either
+  # half alone silently drops every hit after the first.
+  matches "$code" 'grep -rlaZ -E' || return 1
+  matches "$code" "while IFS= read -r -d '' bad; do" || return 1
+  # `-a`, never `-I`. `-I` skips a file grep calls binary, and grep decides that
+  # on the first NUL byte -- so one leading NUL written by the install turns this
+  # pass off for that file, in BOTH jobs, because both call the same function.
+  #
+  # Pinned by CONSTRUCTION, not by banning one spelling of the mistake. A guard
+  # written as `! matches 'grep -rl[a-zA-Z]*I'` reads like it covers this and does
+  # not: `grep -rIlZ` and `grep -rlZ --binary-files=without-match` both walk past
+  # it and both publish the NUL exploit. So: the flag group is asserted exactly,
+  # and the two opt-outs are banned anywhere in the file, since neither has a
+  # legitimate use in a script whose only content pass must read every byte.
+  matches "$code" '^  grep -rlaZ -E "\$\{pass\[@\]\}" "\$root" >"\$hits"' || return 1
+  # Scoped to a grep's own short-option cluster, in any position: `-rIlZ` and
+  # `-rlIZ` are the same flag and neither may appear. Not a bare `-I` search --
+  # `kill -KILL` would trip that, and a guard that has to be loosened later gets
+  # loosened past the thing it guards.
+  ! matches "$code" 'grep( -[a-zA-Z]+)* -[a-zA-Z]*I' || return 1
+  ! matches "$code" 'grep .*[-]-binary-files=' || return 1
+  # Every other file this script writes into $ARCHIVE_DIR gets the same
+  # treatment as the hit list, for the same reason: a fixed name there is one
+  # the prepare command can pre-create as a symlink.
+  matches "$code" 'list=\$\(mktemp "\$ARCHIVE_DIR/listing\.XXXXXX"\)' || return 1
+  matches "$code" 'pointer_body=\$\(mktemp "\$ARCHIVE_DIR/current\.XXXXXX"\)' || return 1
+  ! matches "$code" '"\$ARCHIVE_DIR/(listing|snap\.tar\.gz|current)"' || return 1
+  # The archive is not created until the branch that packs it. An unguessable
+  # name is no defence for THIS file: mktemp randomises against guessing, and the
+  # prepare command can simply list the directory. What matters is that the file
+  # does not exist at all while untrusted code is still running.
+  matches "$code" '^ARCHIVE=""$' || return 1
+  # A digest is printed only for a file big enough to hold key material. This
+  # rule matches a HEADER; a 60-byte header plus a short string has no more
+  # entropy than the URL password whose digest is refused above.
+  matches "$code" '\[ "\$\(wc -c <"\$file"\)" -ge 1024 \]' || return 1
+  # `read` stops at the first newline whatever IFS says.
+  matches "$code" "read -rd '' -a SCAN_ALLOW_RAW" || return 1
   # The host refuses a multi-linked file, so nothing may be packed as a link
   # member; a staging tree legitimately has them (pnpm), which is why the bound
   # is on the archive rather than on the tree.
@@ -731,8 +834,104 @@ has_trusted_snapshot_build() { # <file>
   # The publishing phase re-scans what it received. The archive crossed a job
   # boundary, and the job that scanned it first is the one that ran other
   # people's code.
-  matches "$code" 'if \[ "\$BUILDING" = 0 \]' || return 1
+  # The bytes that get shipped are the bytes that get scanned. Unconditional and
+  # at the top level: gated on the phase, a single-phase run has exactly one scan
+  # and anything substituted after it reaches the bucket. Into a tree of its own,
+  # because $STAGE is what the install populated.
+  # The URL rule is anchored to a real scheme. Unanchored, `://x:y@` is five
+  # bytes of shape that random data produces about once a gibibyte -- and since
+  # the pass reads binaries, those land on hash-named compressed blobs that
+  # cannot be excused and cannot be inspected. A gate that refuses good snapshots
+  # is a gate someone removes, so the false-positive rate is a property of the
+  # rule, not a nuisance. ONE list drives both finding the hit and validating the
+  # scheme the refusal prints; two would drift.
+  matches "$code" "^URL_SCHEME_ALT='" || return 1
+  # The VCS schemes as a family, not a hand-picked few: pip and npm both take a
+  # VCS-pinned dependency over plain http, so a list with `git+https` and without
+  # `git+http` reads like policy and is an oversight.
+  matches "$code" '\(git\|hg\|bzr\|svn\)\(\\\+\(ssh\|https\?\|file\)\)\?' || return 1
+  matches "$code" 'url-embedded-basic-auth\|\(\^\|\[\^A-Za-z0-9\+\.-\]\)\(\$URL_SCHEME_ALT\)://' || return 1
+  matches "$code" 'grep -qE "\^\(\$URL_SCHEME_ALT\)\$"' || return 1
+
+  matches "$code" '^VERIFY=\$\(mktemp -d\)' || return 1
+  matches "$code" '^scan_or_die "\$VERIFY"$' || return 1
+  matches "$code" '\-C "\$VERIFY" --no-same-owner' || return 1
   matches "$code" 'head -c "\$\(\(size \* 8\)\)"' || return 1
+
+  # The install runs in a process group of its own, bounded, and the group is
+  # reaped BEFORE anything is scanned. `sh -euc` returning does not mean the
+  # install stopped -- a lifecycle script that daemonises keeps running as this
+  # uid with the staged tree in reach, and every "the scan bounds it" argument in
+  # that file is written against a process that by then no longer exists.
+  # Asserted as a set: `set -m` is what creates the group, the pgid check is what
+  # proves it, the two kills are what use it. Any one alone is decoration.
+  matches "$code" '^  set -m$' || return 1
+  matches "$code" '^  timeout -k 30 "\$CACHE_PREPARE_TIMEOUT" sh -euc "\$CACHE_PREPARE" &$' || return 1
+  matches "$code" 'prep_seen=\$\(pgid_of "\$prep_pgid" \|\| true\)' || return 1
+  # One source answers both questions. `kill -0` is not that source: bash's kill
+  # builtin reports a job it has already reaped as live, so pairing it with a
+  # `ps` lookup made every fast prepare on Linux look like a wrong group.
+  matches "$code" '\[ -z "\$prep_seen" \] \|\| \[ "\$prep_seen" = "\$prep_pgid" \]' || return 1
+  ! matches "$code" 'kill -0 "\$prep_pgid"' || return 1
+  # The refusal names the two values it compared. Without them the message is
+  # the same string whether `ps` answered nothing or answered the wrong group.
+  matches "$code" 'child pid \$prep_pgid, its group .\$prep_seen' || return 1
+  matches "$code" 'kill -TERM -- "-\$prep_pgid"' || return 1
+  matches "$code" 'kill -KILL -- "-\$prep_pgid"' || return 1
+  # ...and BEFORE the scan, which is the whole claim. A reap that runs after the
+  # staged tree has been read bounds nothing: the write it was supposed to
+  # prevent has already happened and already been scanned past. Order is the
+  # property here, so order is what gets asserted -- the presence of the kills
+  # says nothing on its own.
+  local reap_at scan_at
+  reap_at=$(printf '%s\n' "$code" | grep -nE 'kill -KILL -- "-\$prep_pgid"' | head -n1 | cut -d: -f1)
+  scan_at=$(printf '%s\n' "$code" | grep -nE '^  scan_or_die "\$STAGE"$' | head -n1 | cut -d: -f1)
+  [ -n "$reap_at" ] && [ -n "$scan_at" ] && [ "$reap_at" -lt "$scan_at" ] || return 1
+
+  # The bytes scanned are the bytes shipped. The verify pass reads a tree
+  # unpacked FROM the archive, while `cp` and `gcloud storage cp` re-open the
+  # archive itself -- so without a digest pinned across that gap, everything that
+  # was verified was verified about bytes that could since have been replaced.
+  # Both call sites, or the pin only covers the half that has one.
+  # ...and the credentialed phase never runs the install at all, which is what
+  # makes the pin a detector rather than the only thing standing between an
+  # escapee and the upload. `setsid` leaves the process group and `kill -- -$pgid`
+  # cannot follow it, so in a process that both builds and publishes there is
+  # always a racer for the gap between the last check and gcloud's own open.
+  # Removing the racer is the fix; shrinking the window is not.
+  matches "$code" '^\[ "\$BUILDING" = 0 \] \|\| \[ "\$PUBLISHING" = 0 \]' || return 1
+
+  matches "$code" '^ARCHIVE_SHA=\$\(sha256sum <"\$ARCHIVE" \| cut' || return 1
+  # BEFORE the size and layout verdicts, not after. `stat` and `tar -tvzf` each
+  # re-open the archive; rendered before the pin exists, their answers describe
+  # bytes nothing can later prove were the ones shipped -- and archive_is_flat is
+  # the ONLY pass that sees setuid and hardlink members, because the verify
+  # extraction drops modes and xattrs before its own scan can look.
+  local pin_at size_at flat_at
+  pin_at=$(printf '%s\n' "$code" | grep -nE '^ARCHIVE_SHA=' | head -n1 | cut -d: -f1)
+  size_at=$(printf '%s\n' "$code" | grep -nE '^size=\$\(stat' | head -n1 | cut -d: -f1)
+  flat_at=$(printf '%s\n' "$code" | grep -nE '^archive_is_flat "\$ARCHIVE"' | head -n1 | cut -d: -f1)
+  [ -n "$pin_at" ] && [ -n "$size_at" ] && [ -n "$flat_at" ] || return 1
+  [ "$pin_at" -lt "$size_at" ] && [ "$pin_at" -lt "$flat_at" ] || return 1
+  matches "$code" '^assert_archive_unchanged "the size and member-layout verdicts were trusted"' || return 1
+  matches "$code" '^assert_archive_unchanged\(\) \{' || return 1
+  matches "$code" '^  assert_archive_unchanged "the artifact was written"' || return 1
+  matches "$code" '^assert_archive_unchanged "the upload"' || return 1
+
+  # Every refusal that interpolates a path runs it through safe_path, including
+  # the one whose value is a workflow literal today. An unsanitised path in a
+  # die is an Actions workflow-command injection the day someone derives that
+  # value from job output, and "not attacker-controlled yet" is not a property
+  # the next edit preserves.
+  matches "$code" '^  \[ -f "\$CACHE_ARCHIVE_IN" \] \|\| die .*\$\(safe_path "\$CACHE_ARCHIVE_IN"\)' || return 1
+  ! matches "$code" 'die "[^"]*: \$CACHE_ARCHIVE_IN"' || return 1
+
+  # mkdir -p takes the ambient umask where mktemp -d gave 0700.
+  matches "$code" 'mkdir -p "\$STAGE"; chmod 0700 "\$STAGE"' || return 1
+  # ...and the name it uploads under is derived from that pinned digest rather
+  # than from a fresh read, which would name the file after bytes nothing checked.
+  matches "$code" '^digest=\$\{ARCHIVE_SHA:0:16\}$' || return 1
+  ! matches "$code" 'sha256sum "\$ARCHIVE"' || return 1
   # A missing getcap is a refusal, not a skip: on a snapshot the scan is the only
   # opinion, and a check that can be skipped rather than failed is not a bound.
   # Anchored, and the refusal with it: `if command -v getcap; then` still holds
@@ -1080,15 +1279,126 @@ mutate_file "$PUBSH" 'the embedded-credential pass is dropped' has_trusted_snaps
 # false positive without reproducing the whole install, and the predictable
 # response to a gate nobody can read is deleting it.
 mutate_file "$PUBSH" 'the credential refusal stops saying what it caught' has_trusted_snapshot_build \
-  's@explain_credential_hit "\$root" "\$bad"; @@'
+  's@^    explain_credential_hit "\$root" "\$bad"$@@'
+# The allowlist is the one place this script excuses a scan hit, so each of its
+# bounds gets a mutation. Every one of these leaves a script that still builds,
+# still scans and still publishes.
+mutate_file "$PUBSH" 'an allowlist entry may be a digest PREFIX' has_trusted_snapshot_build \
+  's@^    \[ "\$\{#d\}" = 64 \] \\$@    true \\@'
+mutate_file "$PUBSH" 'an excused file is excused silently' has_trusted_snapshot_build \
+  's@^          log "the content scan excused @          : "@'
+mutate_file "$PUBSH" 'the content pass stops at the first hit again' has_trusted_snapshot_build \
+  's@^  done <"\$hits"$@  done < <(head -n1 "$hits")@'
+# The prepare command runs first, as this uid, and is told where the temp root
+# is. A fixed name for the hit list is a symlink to /dev/null away from turning
+# the only pass that sees an embedded credential into a no-op.
+mutate_file "$PUBSH" 'the hit list gets a name the install can guess' has_trusted_snapshot_build \
+  's@^  hits=\$\(mktemp "\$ARCHIVE_DIR/hits\.XXXXXX"\).*$@  hits="$ARCHIVE_DIR/content-hits"@'
+mutate_file "$PUBSH" 'a hit list that vanished reads as a clean tree' has_trusted_snapshot_build \
+  's@^    || die "the content scan found matches it could not then read.*$@    || true@'
+# A newline is a legal filename byte. Either half of the NUL pair reverted puts
+# the parser back where a planted name can split one record into two.
+mutate_file "$PUBSH" 'the hit list goes back to newline-separated' has_trusted_snapshot_build \
+  's@grep -rlaZ -E@grep -rla -E@'
+# One NUL byte is all `-I` needs to classify a file as binary and skip it, which
+# turns the only pass that reads file CONTENT into a no-op for that file.
+mutate_file "$PUBSH" 'a leading NUL byte opts a file out of the content pass' has_trusted_snapshot_build \
+  's@grep -rlaZ -E@grep -rlIZ -E@'
+mutate_file "$PUBSH" 'the hit-list reader goes back to reading lines' has_trusted_snapshot_build \
+  "s@while IFS= read -r -d '' bad; do@while IFS= read -r bad; do@"
+# The same guessable-name argument, for the three other files this script writes
+# into the directory the prepare command can find.
+mutate_file "$PUBSH" 'the archive listing gets a name the install can guess' has_trusted_snapshot_build \
+  's@^  list=\$\(mktemp "\$ARCHIVE_DIR/listing\.XXXXXX"\).*$@  list="$ARCHIVE_DIR/listing"@'
+# Back to creating the archive before the install runs: the file is then there,
+# listable, and writable by anything the prepare command left behind.
+mutate_file "$PUBSH" 'the archive exists before the install does' has_trusted_snapshot_build \
+  's@^ARCHIVE=""$@ARCHIVE=$(mktemp "$ARCHIVE_DIR/snap.XXXXXX.tar.gz")@'
+mutate_file "$PUBSH" 'the pointer body gets a name the install can guess' has_trusted_snapshot_build \
+  's@^pointer_body=\$\(mktemp "\$ARCHIVE_DIR/current\.XXXXXX"\).*$@pointer_body="$ARCHIVE_DIR/current"@'
+# A shorter label list is what makes a file equal `private-key-header`, so an
+# early exit from the labeller is an excusal for a file holding a real token.
+mutate_file "$PUBSH" 'the labeller stops at the first rule it matches' has_trusted_snapshot_build \
+  's@out="\$out \$\{entry%%\|\*\}"; fi@out="$out ${entry%%|*}"; break; fi@'
+mutate_file "$PUBSH" 'a grep error in the labeller reads as no match' has_trusted_snapshot_build \
+  's@^    \[ "\$rc" -le 1 \] \\$@    true \\@'
+# The digest is an oracle for anything whose preimage is small, and this rule
+# matches a HEADER — the size floor is what keeps a 60-byte file out of the log.
+mutate_file "$PUBSH" 'a tiny private-key file still gets its digest printed' has_trusted_snapshot_build \
+  's@ -ge 1024 \]@ -ge 0 ]@'
+mutate_file "$PUBSH" 'the allowlist drops everything after the first newline' has_trusted_snapshot_build \
+  "s@read -rd '' -a SCAN_ALLOW_RAW@read -ra SCAN_ALLOW_RAW@"
+# The off switch. One legitimate entry would excuse every content hit there is,
+# and the run would still look exactly like a successful publish.
+mutate_file "$PUBSH" 'the allowlist matches every digest' has_trusted_snapshot_build \
+  's@^    \[ "\$d" = "\$1" \] && return 0$@    return 0@'
+mutate_file "$PUBSH" 'a digest matches as a prefix at compare time' has_trusted_snapshot_build \
+  's@^    \[ "\$d" = "\$1" \] && return 0$@    case "$1" in "$d"*) return 0 ;; esac@'
+mutate_file "$PUBSH" 'an allowlist entry need not be hex' has_trusted_snapshot_build \
+  's@\*\[!0-9a-fA-F\]\*@*[!-~]*@'
+mutate_file "$PUBSH" 'an allowlist that cannot be evaluated is ignored' has_trusted_snapshot_build \
+  's@^    || die "CACHE_SCAN_ALLOW_DIGESTS is set but sha256sum.*$@    || true@'
+# The two rules that keep the allowlist to PEM fixtures. Without them a digest
+# excuses a registry token or a URL password, and the refusal prints the sha256
+# of a nearly-known plaintext into a public log while it is at it.
+mutate_file "$PUBSH" 'a token or URL credential becomes excusable by digest' has_trusted_snapshot_build \
+  's@^      if \[ "\$\(matched_labels "\$bad"\)" = private-key-header \]; then$@      if true; then@'
+mutate_file "$PUBSH" 'the refusal prints a digest for every rule' has_trusted_snapshot_build \
+  's@"\$\(matched_labels "\$file"\)" = private-key-header@"x" != "y"@'
+mutate_file "$PUBSH" 'a broken content grep reads as a clean pass' has_trusted_snapshot_build \
+  's@^  \[ "\$rc" -le 1 \] \|\| die .*$@@'
+# The rule the whole reporter exists for: report ABOUT the file, never hand over
+# what is in it.
+mutate_file "$PUBSH" 'the refusal prints the head of what it caught' has_trusted_snapshot_build \
+  's@^    printf .  the matched text is deliberately not printed.*$@&\n    printf "  head: %s\\n" "$(head -c 200 "$file")"@'
 mutate_file "$PUBSH" 'the refusal echoes whatever sat in front of the ://' has_trusted_snapshot_build \
-  's@^            printf .    scheme: not a recognised URL scheme.*$@            printf "    scheme: %s\\n" "$scheme" ;;@'
+  's@^          printf .    scheme: not a recognised URL scheme.*$@          printf "    scheme: %s\\n" "$scheme"@'
 mutate_file "$PUBSH" 'a filename from the staged tree is printed raw' has_trusted_snapshot_build \
   's@\$\(safe_path "\$bad"\)@$bad@g'
 mutate_file "$PUBSH" 'a half-populated install publishes with a zero exit' has_trusted_snapshot_build \
   's@sh -euc "\$CACHE_PREPARE"@sh -c "$CACHE_PREPARE"@'
-mutate_file "$PUBSH" 'the publishing job trusts the artifact it was handed' has_trusted_snapshot_build \
-  's@^if \[ "\$BUILDING" = 0 \]; then$@if false; then@'
+# Both respellings of the -I mistake. Each one publishes a NUL-prefixed token,
+# and each one used to walk past the guard that claimed to forbid it.
+mutate_file "$PUBSH" 'the binary skip comes back spelled -rIlZ' has_trusted_snapshot_build \
+  's@grep -rlaZ -E@grep -rIlZ -E@'
+mutate_file "$PUBSH" 'the binary skip comes back as --binary-files' has_trusted_snapshot_build \
+  's@grep -rlaZ -E@grep -rlZ --binary-files=without-match -E@'
+mutate_file "$PUBSH" 'the URL rule loses its scheme anchor' has_trusted_snapshot_build \
+  's@\(\^\|\[\^A-Za-z0-9\+\.-\]\)\(\$URL_SCHEME_ALT\)://@://@'
+mutate_file "$PUBSH" 'one process may both run the install and hold the credential' has_trusted_snapshot_build \
+  '/^\[ "\$BUILDING" = 0 \] \|\| \[ "\$PUBLISHING" = 0 \]/,+1d'
+mutate_file "$PUBSH" 'the size and layout verdicts precede the digest pin' has_trusted_snapshot_build \
+  '/^ARCHIVE_SHA=/,+1d; s@^archive_is_flat "\$ARCHIVE"$@archive_is_flat "$ARCHIVE"\nARCHIVE_SHA=$(sha256sum <"$ARCHIVE" | cut -d" " -f1) \\\n  || die "the archive could not be digested"@'
+mutate_file "$PUBSH" 'the VCS schemes go back to a hand-picked few' has_trusted_snapshot_build \
+  's@[(]git[|]hg[|]bzr[|]svn[)][(][\][+][(]ssh[|]https[?][|]file[)][)][?]@git@'
+mutate_file "$PUBSH" 'a prepare command that exits quickly aborts the run' has_trusted_snapshot_build \
+  's@^  \[ -z "\$prep_seen" \] \|\| @  @'
+mutate_file "$PUBSH" 'the group the reap is aimed at goes unchecked' has_trusted_snapshot_build \
+  '/^  prep_seen=\$\(pgid_of/,+2d'
+mutate_file "$PUBSH" 'liveness goes back to asking bash instead of ps' has_trusted_snapshot_build \
+  's@^  prep_seen=\$\(pgid_of "\$prep_pgid" \|\| true\)$@  kill -0 "$prep_pgid" 2>/dev/null\n  prep_seen=$(pgid_of "$prep_pgid" || true)@'
+mutate_file "$PUBSH" 'the install keeps the run process group' has_trusted_snapshot_build \
+  's@^  set -m$@  :@'
+mutate_file "$PUBSH" 'nothing is reaped once the install returns' has_trusted_snapshot_build \
+  's@^  kill -TERM -- "-\$prep_pgid" 2>/dev/null \|\| true$@  :@'
+mutate_file "$PUBSH" 'the group is reaped only after the tree is scanned' has_trusted_snapshot_build \
+  '/^  kill -(TERM|KILL) -- "-\$prep_pgid"/d; s@^  scan_or_die "\$STAGE"$@  scan_or_die "$STAGE"\n  kill -KILL -- "-$prep_pgid" 2>/dev/null || true@'
+mutate_file "$PUBSH" 'the uploaded bytes are never re-checked' has_trusted_snapshot_build \
+  's@^assert_archive_unchanged "the upload"$@true@'
+mutate_file "$PUBSH" 'the CACHE_ARCHIVE_IN refusal echoes the path unfiltered' has_trusted_snapshot_build \
+  's@\$\(safe_path "\$CACHE_ARCHIVE_IN"\)@$CACHE_ARCHIVE_IN@'
+mutate_file "$PUBSH" 'the recreated stage keeps the ambient umask' has_trusted_snapshot_build \
+  's@mkdir -p "\$STAGE"; chmod 0700 "\$STAGE"@mkdir -p "$STAGE"@'
+mutate_file "$PUBSH" 'the written artifact is never re-checked' has_trusted_snapshot_build \
+  's@^  assert_archive_unchanged "the artifact was written"$@  :@'
+mutate_file "$PUBSH" 'the snapshot is named after a fresh read of the file' has_trusted_snapshot_build \
+  's@^digest=\$\{ARCHIVE_SHA:0:16\}$@digest=$(sha256sum "$ARCHIVE" | cut -c1-16)@'
+mutate_file "$PUBSH" 'the packed bytes are never scanned again' has_trusted_snapshot_build \
+  's@^scan_or_die "\$VERIFY"$@true@'
+# Gated on the phase again: the two-job flow still re-scans, and a single-phase
+# run goes back to one scan with a writable window behind it.
+mutate_file "$PUBSH" 'the re-scan happens only in the publishing phase' has_trusted_snapshot_build \
+  's@^scan_or_die "\$VERIFY"$@[ "$BUILDING" = 0 ] \&\& scan_or_die "$VERIFY"@'
 mutate_file "$PUBSH" 'the decompression stops being bounded' has_trusted_snapshot_build \
   's@ \| head -c "\$\(\(size \* 8\)\)" \\@ \\@'
 mutate_file "$PUBSH" 'credential files stop being scanned for' has_trusted_snapshot_build \
@@ -1148,5 +1458,278 @@ mutate_file "$POOLTF" 'the host loses the telemetry publisher' has_host_telemetr
 mutate_file "$POOLTF" 'the host script goes back to standing alone' has_host_telemetry_wiring \
   's@^  host_startup = join\(".{2}", \[$@  host_startup = file("${path.module}/scripts/host-startup.sh") # [@'
 
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+# --- the behavioural tests ------------------------------------------------------
+#
+# Everything above reads the script as TEXT. That is the right shape for "this
+# rule must still be here", and it is structurally incapable of catching a rule
+# that is present and wrong — which is how a hit list parsed by newline survived
+# a full static suite: no assertion over source can express "the record
+# separator must not be a legal filename byte".
+#
+# So these three RUN the real script, in dry-run, with a prepare command that
+# plants the tree. The first is the control: without it a harness that silently
+# stopped exercising the pass would make the other two pass by doing nothing.
+#
+# getcap is stubbed because it is not what is under test and it is absent on
+# most laptops; everything else is the real script.
+behave_setup() {
+  BEH="$TMP/beh"
+  rm -rf "$BEH"; mkdir -p "$BEH/stub"
+  printf '#!/bin/sh\nexit 0\n' >"$BEH/stub/getcap"
+  chmod +x "$BEH/stub/getcap"
+}
+
+# Runs the build phase against a prepare script. Echoes its output; returns its
+# status. The prepare command's cwd is the caller's, and the stage is one
+# dirname above $npm_config_cache — the same handle a real dependency has.
+behave_run() { # <prepare-body> [allow-digests]
+  local prep="$BEH/prepare.sh" rc=0 out
+  printf '%s' "$1" >"$prep"
+  # GITHUB_EVENT_NAME is pinned, not inherited. This suite runs on a PR, where
+  # the ambient value is `pull_request` — a trigger the script refuses outright,
+  # before it reaches a single control these tests are about. Inheriting it made
+  # all eight behavioural tests fail in CI for one reason that had nothing to do
+  # with any of them, while passing on a laptop where the variable is unset.
+  # `schedule` is the trigger a real snapshot is built by, so this exercises the
+  # gate's accept path rather than stepping around it.
+  out=$(PATH="$BEH/stub:$PATH" \
+        GITHUB_EVENT_NAME=schedule \
+        CACHE_PREPARE="bash '$prep'" \
+        CACHE_DRY_RUN=1 \
+        CACHE_ARCHIVE_OUT="$BEH/out.tar.gz" \
+        CACHE_SCAN_ALLOW_DIGESTS="${2:-}" \
+        bash "$PUBSH" 2>&1) || rc=$?
+  printf '%s\n' "$out"
+  return "$rc"
+}
+
+behave_setup
+
+# The PEM fixture the allowlist is for: a legitimate one, stored under a
+# hash-shaped name the way a pnpm store holds it, so no filename rule sees it.
+# 1024 bytes of body so it is the same shape as the real thing.
+BEH_PEM_BODY=$(printf -- '-----BEGIN PRIVATE KEY-----\n'; head -c 1200 /dev/zero | tr '\0' 'A' | fold -w 64; printf -- '\n-----END PRIVATE KEY-----\n')
+BEH_PEM_SHA=$(printf '%s\n' "$BEH_PEM_BODY" | sha256sum | cut -d' ' -f1)
+
+# CONTROL. An unexcused registry token must be refused — if this does not fail,
+# the two tests below prove nothing.
+if behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/npm/_cacache/content-v2/sha512/aa"
+printf "%s\n" "//registry.example.com/:_authToken=deadbeef" \
+  >"$stage/npm/_cacache/content-v2/sha512/aa/blob"
+' >"$TMP/beh.control.log" 2>&1; then
+  bad "behaviour: an embedded registry token was published"
+else
+  if matches "$(cat "$TMP/beh.control.log")" 'embedded credential'; then
+    ok
+  else
+    bad "behaviour: the run failed, but not on the content pass"
+  fi
+fi
+
+# The allowlist does what it claims: the PEM fixture alone publishes.
+if printf '%s\n' "$BEH_PEM_BODY" >"$TMP/pem" && behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/files/aa"
+cat '"'$TMP/pem'"' >"$stage/pnpm-store/files/aa/deadbeef"
+' "$BEH_PEM_SHA" >"$TMP/beh.excuse.log" 2>&1; then
+  if matches "$(cat "$TMP/beh.excuse.log")" 'excused'; then
+    ok
+  else
+    bad "behaviour: the fixture published, but no excusal was logged"
+  fi
+else
+  bad "behaviour: an allowlisted PEM fixture was still refused"
+fi
+
+# THE ONE THE STATIC SUITE CANNOT SEE. A sibling whose name is the excused
+# fixture's name plus a NEWLINE, holding a live token. With a newline-separated
+# hit list grep emits the excused path, then the same path again as the prefix of
+# this one, then an empty record the loop skips — two excusals, zero refusals,
+# and this file is packed. Needs a filesystem that allows a newline in a name,
+# which NTFS does not; skipped loudly there rather than passing.
+#
+# The probe is in two steps on purpose. One `2>/dev/null` around both swallows
+# "$TMP is not writable" as well, and that reads as a skip -- a harness that has
+# stopped being able to run anything at all reporting the same thing as a
+# platform that merely cannot spell the filename.
+if ! (cd "$TMP" && mkdir -p nlprobe && : >"nlprobe/plain"); then
+  bad "behaviour: the newline probe could not write to \$TMP at all"
+elif ! (cd "$TMP" && : >"nlprobe/a
+b") 2>/dev/null; then
+  skip "behaviour: this filesystem cannot hold a newline in a filename"
+else
+  if behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/files/aa"
+cat '"'$TMP/pem'"' >"$stage/pnpm-store/files/aa/deadbeef"
+printf "%s\n" "//registry.example.com/:_authToken=deadbeef" \
+  >"$stage/pnpm-store/files/aa/deadbeef
+"
+' "$BEH_PEM_SHA" >"$TMP/beh.newline.log" 2>&1; then
+    bad "behaviour: a newline in a filename split the hit list and published a token"
+  else
+    if matches "$(cat "$TMP/beh.newline.log")" 'embedded credential'; then
+      ok
+    else
+      bad "behaviour: the newline run failed, but not on the content pass"
+    fi
+  fi
+fi
+
+# THE OTHER ONE THE STATIC SUITE CANNOT SEE. `grep -I` decides a file is binary
+# from its first NUL byte and skips it, so a single leading NUL in front of the
+# credential opts that file out of the only pass that reads content -- in both
+# jobs, since both call the same function. No name is planted here and no
+# allowlist is set: the file is a plain registry token behind one NUL.
+if behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/npm/_cacache/content-v2/sha512/bb"
+printf "\000//registry.example.com/:_authToken=deadbeef\n" \
+  >"$stage/npm/_cacache/content-v2/sha512/bb/blob"
+' >"$TMP/beh.nul.log" 2>&1; then
+  bad "behaviour: a leading NUL byte hid a registry token from the content pass"
+else
+  if matches "$(cat "$TMP/beh.nul.log")" 'embedded credential'; then
+    ok
+  else
+    bad "behaviour: the NUL run failed, but not on the content pass"
+  fi
+fi
+
+# The URL rule must still catch a real embedded credential once anchored...
+if behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/npm/_cacache/content-v2/sha512/dd"
+printf "registry=https://bob:hunter2@npm.example.com/\n" \
+  >"$stage/npm/_cacache/content-v2/sha512/dd/blob"
+' >"$TMP/beh.url.log" 2>&1; then
+  bad "behaviour: an embedded https basic-auth credential was published"
+else
+  if matches "$(cat "$TMP/beh.url.log")" 'url-embedded-basic-auth'; then
+    ok
+  else
+    bad "behaviour: the URL run failed, but not on the URL rule"
+  fi
+fi
+
+# ...and must NOT fire on the same shape without a scheme in front of it. This is
+# what a compressed blob produces by chance, roughly once a gibibyte, on a
+# hash-named file nobody can excuse -- a refusal here is a gate that gets deleted.
+if behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/npm/_cacache/content-v2/sha512/ee"
+printf "\253\017Qz://k9:m2@\301\064\n" \
+  >"$stage/npm/_cacache/content-v2/sha512/ee/blob"
+' >"$TMP/beh.fp.log" 2>&1; then
+  ok
+else
+  if matches "$(cat "$TMP/beh.fp.log")" 'url-embedded-basic-auth'; then
+    bad "behaviour: random bytes shaped like ://x:y@ refused a clean snapshot"
+  else
+    bad "behaviour: the false-positive run failed for some other reason"
+  fi
+fi
+
+# A writer the install leaves behind must not reach the published bytes. This is
+# the shape of the attack the reap and the digest pin exist for: the prepare
+# command forks a child, `sh -euc` returns clean, and the child then rewrites the
+# packed archive with bytes carrying a token.
+#
+# TWO launchers, because they test different controls. `nohup ... &` stays in the
+# prepare command's process group, so `kill -- -$pgid` reaches it -- that probe
+# tests the REAP. `setsid` leaves the group, so the reap structurally cannot
+# follow it -- that probe tests the DIGEST PIN, which is the only thing left.
+#
+# The child records that it actually SAW an archive. Without that marker the test
+# passes whether or not the pin exists, because a child that was reaped before
+# the archive was ever created has attacked nothing; that is exactly how the
+# first version of this test reported a pass it had not earned. No marker is a
+# skip, loudly, not an ok.
+cat >"$BEH/attacker.sh" <<'ATTACKER'
+#!/bin/sh
+# $1 = the temp root to hunt in, $2 = the marker to touch on first sighting.
+end=$(( $(date +%s) + 10 ))
+while [ "$(date +%s)" -lt "$end" ]; do
+  for f in "$1"/*/snap.*.tar.gz; do
+    [ -f "$f" ] || continue
+    : >"$2"
+    printf '//registry.example.com/:_authToken=STOLEN\n' >"$f" 2>/dev/null || true
+  done
+  sleep 0.2
+done
+ATTACKER
+
+daemon_probe() { # <what it tests> <launcher>
+  local what="$1" launcher="$2" saw="$BEH/attacker.saw" log="$TMP/beh.$2.log"
+  if ! command -v "$launcher" >/dev/null 2>&1; then
+    skip "behaviour: no $launcher here, so this case cannot be launched ($what)"
+    return
+  fi
+  rm -f "$saw" "$saw.launched" "$BEH/out.tar.gz"
+  local body
+  # The LAUNCHER records the launch, not the child. A working reap kills the
+  # child inside the microseconds before it runs its first line, which from the
+  # child's side is indistinguishable from a launch that failed — so a marker
+  # written by the child would report the control working as "probe broken".
+  body=$(printf '%s\n' \
+    'set -eu' \
+    'stage=$(dirname "$npm_config_cache")' \
+    'mkdir -p "$stage/npm/_cacache/content-v2/sha512/cc"' \
+    'printf "harmless\n" >"$stage/npm/_cacache/content-v2/sha512/cc/blob"' \
+    "$launcher sh '$BEH/attacker.sh' \"\$(dirname \"\$stage\")\" '$saw' >/dev/null 2>&1 &" \
+    ": >'$saw.launched'")
+  if behave_run "$body" >"$log" 2>&1; then
+    if grep -qa 'STOLEN' "$BEH/out.tar.gz" 2>/dev/null; then
+      bad "behaviour: a writer left behind by the install replaced the published bytes ($what)"
+    elif [ ! -f "$saw.launched" ]; then
+      skip "behaviour: the install never reached the launch, so this proves nothing ($what)"
+    else
+      # A writer was launched and the published bytes are clean. Whether it was
+      # reaped before it ever saw an archive, or saw one and lost the race to
+      # the digest pin, the property under test held.
+      ok
+    fi
+  else
+    if matches "$(cat "$log")" 'changed between the scan and|embedded credential|did not unpack'; then
+      ok
+    else
+      bad "behaviour: the run failed, but not on a control that names why ($what)"
+    fi
+  fi
+  # Let the child expire before the next test, or its glob catches that run's
+  # archive too and the results stop belonging to the test that produced them.
+  sleep 11
+}
+
+daemon_probe 'the reap, on a child still in the group' 'nohup'
+daemon_probe 'the digest pin, on a child that left the group' 'setsid'
+
+# A behavioural failure says which control did not fire, and nothing about why
+# the run got there — the script's own output went to a log file nobody prints.
+# On a laptop you go read it; in CI the runner is gone by the time you look, so
+# a red behavioural test would otherwise be undiagnosable from the job page.
+if [ "$FAIL" -ne 0 ]; then
+  for l in "$TMP"/beh.*.log; do
+    [ -f "$l" ] || continue
+    printf '\n--- %s (last 20 lines) ---\n' "$(basename "$l")"
+    tail -20 "$l"
+  done
+fi
+
+printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+# A skip is a real result on a laptop and not one in CI: the behavioural tests
+# are the only instrument for this class of bug, and a green run that quietly
+# exercised none of them is the failure mode they exist to prevent.
+if [ -n "${CI:-}" ] && [ "$SKIP" -ne 0 ]; then
+  printf 'FAIL: %d test(s) skipped, and CI is set\n' "$SKIP"
+  exit 1
+fi
 [ "$FAIL" -eq 0 ]
