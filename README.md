@@ -395,8 +395,29 @@ collapses to zero the moment work starts), `ci_demand_queued`,
 window rather than averaging, and read them next to `ci_poller_heartbeat`
 because both are absent (not zero) when nothing finished.
 
+**The cache hydrate.** `ci_cache_hydrate_verdict{verdict}`,
+`ci_cache_hydrate_seconds`, `ci_cache_snapshot_age_hours`,
+`ci_cache_snapshot_bytes`, `ci_cache_dirs_hydrated`. These are the one group the
+**host** publishes rather than the controller, and once per boot rather than
+once per tick: the hydrate finishes before the runner agent registers, so the
+controller never sees the machine it would be reporting on. Both accounts
+already hold `roles/monitoring.metricWriter`, so this costs no new grant on a
+machine that runs pull-request code.
+
+They exist because the cache layer fails open on purpose. An expired snapshot, a
+bucket that was never configured, and a pool whose every host times out on the
+download are the same observable — jobs slower than they were, and nothing red
+anywhere. Group `ci_cache_hydrate_verdict` **by its label**; the value is always
+1 and means nothing alone. `hydrated` is the only good verdict, `not-configured`
+is the correct steady state for a pool with no bucket, and everything else
+(`no-snapshot`, `bad-pointer`, `too-old`, `too-big`, `no-space`,
+`download-timeout`, `unpack-timeout`, `scan-refused`, …) names which exit was
+taken. Age and size are recorded **before** the bounds that may reject the
+snapshot, so a `too-old` verdict arrives with the number that produced it.
+
 The full list is `metric_names` on the pool module; `scripts/ci/metric-contract.selftest.sh`
-fails if the code and that output ever disagree, in either direction.
+fails if the code and that output ever disagree, in either direction — reading
+both startup scripts, because the pool publishes from two.
 
 `ci_orphan_registrations_reaped` should sit at zero at steady state: a pool that
 keeps reaping is losing hosts without going through the drain path.
@@ -415,6 +436,17 @@ bound whenever that sweep ran out of budget.
 `ci_poller_heartbeat` is published on every tick including a failed one:
 "no data" there means the controller is down, which no other series can
 distinguish from "the pool is idle".
+
+`scripts/ci/ensure-alert-policies.sh --project <id> --email <addr>` brings one
+project's policies up to the fleet's, idempotently. Two of the eight watch the
+cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it
+below the pool's `cache_snapshot_max_age_hours`, or the first notice anyone gets
+is every host starting cold) and *hydrate failing on a configured pool*, which
+excludes `not-configured` so it cannot page a pool that never wanted the layer.
+Both are evaluated over a wide alignment window with no `duration`, unlike the
+controller policies: their series appear once per boot, and asking a sporadic
+series to hold a condition for ten minutes silences exactly the pool with few
+boots and every one of them broken.
 
 ## Layout
 

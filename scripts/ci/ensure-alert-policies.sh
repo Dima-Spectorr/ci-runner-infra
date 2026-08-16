@@ -20,10 +20,15 @@
 #
 # Usage:
 #   ensure-alert-policies.sh --project <id> --email <addr> [--account <sa-email>]
-#                            [--poll-interval-seconds <n>] [--dry-run]
+#                            [--poll-interval-seconds <n>] [--cache-stale-hours <n>]
+#                            [--dry-run]
 #
 #   --poll-interval-seconds must match the pool's `poll_interval_seconds`: the
 #   slow-tick threshold is derived from it, because the watchdog window is.
+#
+#   --cache-stale-hours must be BELOW the pool's `cache_snapshot_max_age_hours`.
+#   Set at or above it, the alert fires only once hosts have already started
+#   refusing the snapshot — which is the outage, not the warning.
 #
 #   --account selects a per-command identity for a project in another
 #   organisation. It is never exported: GOOGLE_APPLICATION_CREDENTIALS is shared
@@ -38,12 +43,18 @@ PROJECT=""; EMAIL=""; ACCOUNT=""; DRY=0
 # would not clear it. Pass half the pool's watchdog threshold; the default is
 # half of the default window.
 POLL=20
+# Well under the module's default cache_snapshot_max_age_hours of 168: a daily
+# publish that has missed two days is a broken publish, and the two days of
+# warning are the whole point — at 168 the first notification a human gets is
+# every host in the pool starting cold.
+CACHE_STALE_HOURS=48
 while [ $# -gt 0 ]; do
   case "$1" in
     --project) PROJECT="$2"; shift 2 ;;
     --email)   EMAIL="$2";   shift 2 ;;
     --account) ACCOUNT="$2"; shift 2 ;;
     --poll-interval-seconds) POLL="$2"; shift 2 ;;
+    --cache-stale-hours) CACHE_STALE_HOURS="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -52,6 +63,8 @@ done
 [ -n "$EMAIL" ]   || { echo "--email is required (the channel every policy notifies)" >&2; exit 2; }
 case "$POLL" in ''|*[!0-9]*) echo "--poll-interval-seconds must be a whole number of seconds" >&2; exit 2 ;; esac
 [ "$POLL" -ge 1 ] || { echo "--poll-interval-seconds must be >= 1" >&2; exit 2; }
+case "$CACHE_STALE_HOURS" in ''|*[!0-9]*) echo "--cache-stale-hours must be a whole number of hours" >&2; exit 2 ;; esac
+[ "$CACHE_STALE_HOURS" -ge 1 ] || { echo "--cache-stale-hours must be >= 1" >&2; exit 2; }
 
 # Same expression the module and the watchdog use, as a pure function so the
 # self-test can exercise the deployed text rather than a copy of it.
@@ -113,9 +126,18 @@ else
   echo "channel exists: $channel"
 fi
 
-# ── the six policies ─────────────────────────────────────────────────────────
-# `duration` is what stops each of these paging on a blip. Every threshold below
-# is deliberately longer than one controller tick.
+# ── the eight policies ───────────────────────────────────────────────────────
+# `duration` is what stops each of these paging on a blip, and every controller
+# threshold below is deliberately longer than one controller tick.
+#
+# The two CACHE policies are the exception, and deliberately: their series are
+# published once per host BOOT, not once per tick. A `duration` of 600s asks a
+# sporadic series to hold a condition across windows it publishes nothing in, so
+# it would silence exactly the pool that is failing quietly — few boots, every
+# one of them broken. They use duration 0s over a wide alignment window instead,
+# which is the same anti-blip guarantee expressed in the units the series has:
+# one bad boot in the window is enough, because one bad boot is already the
+# whole population.
 policy_json() {  # <key> -> a full alertPolicy body on stdout
   case "$1" in
     heartbeat) cat <<EOF
@@ -190,6 +212,30 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    cachestale) cat <<EOF
+{ "displayName": "CI runners / cache snapshot going stale",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "Hosts are booting on a shared-cache snapshot older than ${CACHE_STALE_HOURS}h, so the publishing run has stopped producing one. Nothing is broken yet — a stale snapshot is still hydrated, and hosts keep serving jobs — which is why this needs an alert: the failure is a scheduled workflow that quietly stopped, and it stays invisible until the age passes the pool's cache_snapshot_max_age_hours and every host starts cold. Check the publish-cache-snapshot workflow's last run and the pointer object (gcloud storage cat gs://<bucket>/cache/<pool>/current). Read next to ci_cache_snapshot_bytes: a snapshot that stopped growing is a publish that started failing before this did." },
+  "conditions": [ { "displayName": "ci_cache_snapshot_age_hours > ${CACHE_STALE_HOURS}",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": ${CACHE_STALE_HOURS}.0, "duration": "0s",
+      "filter": "metric.type=\"custom.googleapis.com/github/ci_cache_snapshot_age_hours\" AND resource.type=\"generic_node\"",
+      "aggregations": [ { "alignmentPeriod": "3600s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
+    cachefail) cat <<EOF
+{ "displayName": "CI runners / cache hydrate failing on a configured pool",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "Hosts in a pool that HAS a snapshot bucket are registering without the shared cache. The layer fails open by design, so nothing is red: jobs run, they just run cold, and the only other symptom is CI getting slower over weeks. The verdict label says which of the dozen exits was taken — no-snapshot and bad-pointer mean the publish side, too-old and too-big mean a bound, download-timeout and unpack-timeout mean cache_hydrate_budget_seconds is too small for the snapshot's size, scan-refused means the archive failed the host's own safety scan and SHOULD be investigated as a publish that produced something a host would not unpack. not-configured is excluded here: it is the correct steady state for a pool with no bucket, and paging on it would page every pool that never wanted this feature. Read /var/log/ci-runner-startup.log on a recent host." },
+  "conditions": [ { "displayName": "ci_cache_hydrate_verdict{verdict!=hydrated,not-configured} > 0",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "0s",
+      "filter": "metric.type=\"custom.googleapis.com/github/ci_cache_hydrate_verdict\" AND resource.type=\"generic_node\" AND metric.labels.verdict!=\"hydrated\" AND metric.labels.verdict!=\"not-configured\"",
+      "aggregations": [ { "alignmentPeriod": "3600s", "perSeriesAligner": "ALIGN_SUM" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
   esac
 }
 
@@ -248,10 +294,20 @@ ensure_descriptor ci_host_idle_seconds_max   "Longest idle time across warm host
 ensure_descriptor ci_queue_wait_seconds_max  "Longest time a queued job has waited for a slot."
 ensure_descriptor ci_drain_verdicts          "Drain-loop outcomes, labelled by outcome."
 ensure_descriptor ci_tick_seconds            "Controller tick duration. Approaching the watchdog threshold means an imminent restart loop in which nothing is published at all."
+# Published by the HOST once per boot, not by the controller per tick. Declared
+# here for the same reason as the rest — a pool that has never booted a host
+# still needs its alerting provisioned — and it matters more here: these series
+# are absent for long stretches by nature, so waiting for one to appear before
+# the policy can be created means the policy is created after the incident.
+ensure_descriptor ci_cache_hydrate_verdict   "1 per host boot, labelled by verdict. Every value but hydrated means the host registered without the shared cache."
+ensure_descriptor ci_cache_hydrate_seconds   "Seconds the shared-cache hydrate spent, whatever it decided. Approaching cache_hydrate_budget_seconds means hosts pay the full budget and start cold anyway."
+ensure_descriptor ci_cache_snapshot_age_hours "Age of the snapshot the host read about, recorded before the bounds that may reject it."
+ensure_descriptor ci_cache_snapshot_bytes    "Compressed size of that snapshot. A size that stops changing is a publish that stopped."
+ensure_descriptor ci_cache_dirs_hydrated     "Tool caches moved in. Zero alongside a hydrated verdict is a snapshot packed from an empty tree."
 
 existing="$(g alpha monitoring policies list --format='value(displayName,name)' 2>/dev/null || true)"
 
-for key in heartbeat blind idle queue drain slowtick; do
+for key in heartbeat blind idle queue drain slowtick cachestale cachefail; do
   policy_json "$key" >"$tmp/p.json"
   name="$(sed -n 's/.*"displayName": "\(CI runners \/ [^"]*\)".*/\1/p' "$tmp/p.json" | head -1)"
   id="$(printf '%s\n' "$existing" | awk -F'\t' -v n="$name" '$1==n {print $2}' | head -1)"

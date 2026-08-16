@@ -117,6 +117,32 @@ output "metric_names" {
       # deferred, not lost. Sustained non-zero means OUTCOME_BUDGET is too small
       # for this repository's throughput and the other two are lagging.
       "ci_outcome_runs_skipped",
+      # --- the cache hydrate --------------------------------------------------
+      # Published by the HOST, not the controller, and once per boot rather than
+      # per tick: the hydrate finishes before the runner agent registers, so the
+      # controller never sees the machine it would be reporting on.
+      #
+      # This block exists because the layer fails open by design. A pool whose
+      # snapshot expired, a pool whose bucket was never configured and a pool
+      # whose every host times out on the download all present as the same
+      # observable — jobs slower than they were, and nothing red anywhere. Read
+      # ci_cache_hydrate_verdict grouped BY its `verdict` label; the raw value is
+      # always 1 and means nothing on its own. `hydrated` is the only good one.
+      "ci_cache_hydrate_verdict",
+      # What the hydrate spent, whatever it decided. Approaching
+      # cache_hydrate_budget_seconds means hosts are paying the full budget and
+      # then registering cold — the worst of both.
+      "ci_cache_hydrate_seconds",
+      # Age and size of the snapshot the host READ ABOUT, recorded before the
+      # bounds that may reject it — so a `too-old` verdict comes with the number
+      # that produced it. Absent when there was no snapshot to describe, which is
+      # why the stale-snapshot alert is written on this and not on the verdict.
+      "ci_cache_snapshot_age_hours",
+      "ci_cache_snapshot_bytes",
+      # Tool caches actually moved in. Zero WITH a `hydrated` verdict is a
+      # snapshot built from an empty tree — a publish that succeeded at packing
+      # nothing.
+      "ci_cache_dirs_hydrated",
     ] : m => "${var.metric_prefix}/${m}"
   }
 }

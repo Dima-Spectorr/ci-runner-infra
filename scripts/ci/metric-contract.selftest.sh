@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Every metric the controller publishes must appear in the module's
-# `metric_names` output, and vice versa.
+# Every metric the pool publishes must appear in the module's `metric_names`
+# output, and vice versa.
+#
+# "The pool" is two scripts, not one. The controller publishes every tick; the
+# host publishes once, for the cache hydrate, because that finishes before the
+# runner agent registers and the controller never observes it. Both share
+# telemetry.sh, so both go through `queue_series` and both belong to this diff —
+# a check that read only the controller would have called the host's series
+# "declared and nothing publishes it".
 #
 # WHY: `ci_orphan_registrations_reaped` was published from the day the reaper
 # landed and was never added to the output. Dashboards and alert policies are
@@ -11,12 +18,19 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-controller="$here/../../modules/ci-runner-host-pool/scripts/controller-startup.sh"
+scripts="$here/../../modules/ci-runner-host-pool/scripts"
+controller="$scripts/controller-startup.sh"
+host="$scripts/host-startup.sh"
 outputs="$here/../../modules/ci-runner-host-pool/outputs.tf"
 
-# What the controller actually sends: every `queue_series "<name>"` call.
-published="$(grep -oE 'queue_series[[:space:]]+"[a-z0-9_]+"' "$controller" \
-  | sed 's/.*"\(.*\)"/\1/' | sort -u)"
+# What each script actually sends: every `queue_series "<name>"` call.
+names_in() {
+  grep -oE 'queue_series[[:space:]]+"[a-z0-9_]+"' "$1" \
+    | sed 's/.*"\(.*\)"/\1/' | sort -u
+}
+controller_published="$(names_in "$controller")"
+host_published="$(names_in "$host")"
+published="$(printf '%s\n%s\n' "$controller_published" "$host_published" | grep . | sort -u)"
 
 # What the module promises: the string list inside the metric_names output.
 declared="$(sed -n '/output "metric_names"/,/^}/p' "$outputs" \
@@ -27,9 +41,20 @@ fails=0
 # Prove the extractors see something before trusting either side of the diff:
 # two empty lists compare equal, and a broken grep would pass this gate
 # silently — the exact failure mode it exists to catch.
-[ "$(printf '%s\n' "$published" | grep -c .)" -ge 5 ] || {
-  printf 'FAIL extracted %s published metric(s) from the controller — the matcher is broken\n' \
-    "$(printf '%s\n' "$published" | grep -c .)"; fails=$((fails + 1)); }
+#
+# Floored PER SCRIPT, not on the union. The controller publishes twenty-odd
+# series and the host five, so a host matcher that silently stopped matching
+# would leave the union far above any single threshold — and the host's series
+# would then read as "declared and nothing publishes it", which is the same
+# message as the real drift this check is for.
+floor() { # <label> <list> <minimum>
+  local n; n="$(printf '%s\n' "$2" | grep -c . || true)"
+  [ "$n" -ge "$3" ] || {
+    printf 'FAIL extracted %s published metric(s) from %s — the matcher is broken\n' "$n" "$1"
+    fails=$((fails + 1)); }
+}
+floor "controller-startup.sh" "$controller_published" 5
+floor "host-startup.sh" "$host_published" 3
 [ "$(printf '%s\n' "$declared" | grep -c .)" -ge 5 ] || {
   printf 'FAIL extracted %s declared metric(s) from outputs.tf — the matcher is broken\n' \
     "$(printf '%s\n' "$declared" | grep -c .)"; fails=$((fails + 1)); }

@@ -10,8 +10,15 @@
 # Resource is `generic_node` labelled with repo + pool, so one dashboard can
 # group by repo, by pool, or by neither, without per-repo dashboard code.
 #
-# Sourced by controller-startup.sh. Expects: PROJECT, REGION, REPO_FULL, POOL,
-# METRIC_PREFIX.
+# Concatenated ahead of BOTH startup scripts — the controller's, which publishes
+# every tick, and the host's, which publishes once for the cache hydrate. The
+# host cannot delegate that one: the hydrate runs before the agent registers, so
+# the controller never observes it, and a controller reporting on it would be
+# reporting on something it did not watch. Both accounts already hold
+# roles/monitoring.metricWriter, so this costs no new grant on a machine that
+# runs pull-request code.
+#
+# Expects: PROJECT, REGION, REPO_FULL, POOL, METRIC_PREFIX, and a `log`.
 
 TELEMETRY_BUFFER=""
 
