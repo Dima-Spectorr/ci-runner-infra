@@ -412,7 +412,7 @@ Describe 'broker port parsing' {
 Describe 'broker service definition' {
     BeforeAll {
         $script:BrokerXml = Get-BrokerServiceConfig -ScriptPath 'C:\ci\bin\job-metadata-broker.py' `
-            -JobServiceAccount 'ci-job@example-project.iam.gserviceaccount.com' -Port 8081
+            -JobServiceAccount 'ci-job@example-project.iam.gserviceaccount.com' -ExpectedIdentity 'ci-s1' -Port 8081
     }
 
     # Loopback, not 0.0.0.0 as on Linux. Windows gives the slots no network
@@ -433,7 +433,7 @@ Describe 'broker service definition' {
     # out as text, so the document still has exactly the elements phase 3 wrote.
     It 'escapes a hostile value into text rather than markup' {
         $xml = Get-BrokerServiceConfig -ScriptPath 'C:\ci\bin\b.py' `
-            -JobServiceAccount 'x"/><env name="EVIL" value="1' -Port 8081
+            -JobServiceAccount 'x"/><env name="EVIL" value="1' -ExpectedIdentity 'ci-s1' -Port 8081
         $xml | Should -Not -Match '<env name="EVIL"'
         $xml | Should -Match '&quot;|&lt;'
     }
@@ -990,6 +990,7 @@ Describe 'probe verdict' {
     BeforeAll {
         $script:CleanProbe = {
             [pscustomobject] @{
+                runningAs     = 'CI-HOST-ABCD\ci-s1'
                 hostToken     = $true; secretStatus = 403; metricStatus = 403
                 brokerEmail   = 'jobs@p.iam.gserviceaccount.com'
                 siblingStatus = 'denied'; cacheWritable = $true; dnsResolved = $true
@@ -999,13 +1000,13 @@ Describe 'probe verdict' {
 
     It 'passes a host that proved every property' {
         Get-ProbeFailure -Result (& $script:CleanProbe) `
-            -JobServiceAccount 'jobs@p.iam.gserviceaccount.com' | Should -BeNullOrEmpty
+            -JobServiceAccount 'jobs@p.iam.gserviceaccount.com' -ExpectedIdentity 'ci-s1' | Should -BeNullOrEmpty
     }
 
     # The case the whole function exists to get right: a service that never
     # started writes no file, and "no file" must not read as "no findings".
     It 'reports a missing verdict as a failure rather than as a pass' {
-        $f = @(Get-ProbeFailure -Result $null -JobServiceAccount '')
+        $f = @(Get-ProbeFailure -Result $null -JobServiceAccount '' -ExpectedIdentity 'ci-s1')
         $f.Count | Should -Be 1
         $f[0] | Should -Match 'no verdict'
     }
@@ -1013,14 +1014,14 @@ Describe 'probe verdict' {
     It 'fails a host whose identity can still read the App key' {
         $r = & $script:CleanProbe
         $r.secretStatus = 200
-        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
             Should -Match 'secretmanager'
     }
 
     It 'fails a host whose identity can still write the demand metric' {
         $r = & $script:CleanProbe
         $r.metricStatus = 200
-        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
             Should -Match 'timeSeries'
     }
 
@@ -1028,7 +1029,7 @@ Describe 'probe verdict' {
     It 'fails a probe that never obtained a host token, whatever else it reported' {
         $r = & $script:CleanProbe
         $r.hostToken = $false
-        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
             Should -Match 'could not obtain a host token'
     }
 
@@ -1037,26 +1038,26 @@ Describe 'probe verdict' {
     It 'fails a broker that fell back to the host identity' {
         $r = & $script:CleanProbe
         $r.brokerEmail = 'host@p.iam.gserviceaccount.com'
-        (@(Get-ProbeFailure -Result $r -JobServiceAccount 'jobs@p.iam.gserviceaccount.com') -join "`n") |
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount 'jobs@p.iam.gserviceaccount.com' -ExpectedIdentity 'ci-s1') -join "`n") |
             Should -Match 'vends'
     }
 
     It 'fails a broker that answered at all on a pool that configured none' {
         $r = & $script:CleanProbe
-        (@(Get-ProbeFailure -Result $r -JobServiceAccount '') -join "`n") |
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount '' -ExpectedIdentity 'ci-s1') -join "`n") |
             Should -Match 'configured no job service account'
     }
 
     It 'passes a no-broker pool that reported no broker' {
         $r = & $script:CleanProbe
         $r.brokerEmail = ''
-        Get-ProbeFailure -Result $r -JobServiceAccount '' | Should -BeNullOrEmpty
+        Get-ProbeFailure -Result $r -JobServiceAccount '' -ExpectedIdentity 'ci-s1' | Should -BeNullOrEmpty
     }
 
     It 'fails a slot that could read a sibling workspace' {
         $r = & $script:CleanProbe
         $r.siblingStatus = 'allowed'
-        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
             Should -Match 'another slot'
     }
 
@@ -1066,14 +1067,14 @@ Describe 'probe verdict' {
     It 'refuses to read an absent sibling workspace as a proved boundary' {
         $r = & $script:CleanProbe
         $r.siblingStatus = 'missing'
-        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
             Should -Match 'never tested'
     }
 
     It 'reports any other sibling outcome as unproved' {
         $r = & $script:CleanProbe
         $r.siblingStatus = 'error'
-        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
             Should -Match 'unproved'
     }
 
@@ -1081,7 +1082,7 @@ Describe 'probe verdict' {
     # a different identity being passed off as the configured one.
     It 'holds the broker to the exact identity, case included' {
         $r = & $script:CleanProbe
-        (@(Get-ProbeFailure -Result $r -JobServiceAccount 'Jobs@p.iam.gserviceaccount.com') -join "`n") |
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount 'Jobs@p.iam.gserviceaccount.com' -ExpectedIdentity 'ci-s1') -join "`n") |
             Should -Match 'vends'
     }
 
@@ -1089,25 +1090,81 @@ Describe 'probe verdict' {
         $r = & $script:CleanProbe
         $r.cacheWritable = $false
         $r.dnsResolved = $false
-        @(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail).Count | Should -Be 2
+        @(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1').Count | Should -Be 2
     }
 
     # All of them, not the first. The operator gets one look at the serial
     # console before the controller reclaims the instance.
     It 'reports every reason at once' {
         $r = [pscustomobject] @{
+            runningAs     = 'CI-HOST-ABCD\ci-s1'
             hostToken     = $false; secretStatus = 200; metricStatus = 200
             brokerEmail   = ''; siblingStatus = 'allowed'; cacheWritable = $false; dnsResolved = $false
         }
-        @(Get-ProbeFailure -Result $r -JobServiceAccount 'jobs@p.iam.gserviceaccount.com').Count |
+        @(Get-ProbeFailure -Result $r -JobServiceAccount 'jobs@p.iam.gserviceaccount.com' -ExpectedIdentity 'ci-s1').Count |
             Should -Be 7
     }
 
     # A verdict written by an older image lacks fields this one reads. Absent is
     # not true, and an unknown property must not throw its way past the gate.
+    # SIX now, not five: a verdict with no runningAs is exactly the older-image
+    # case, and an unattributed verdict is itself a finding.
     It 'treats an absent field as unproved rather than throwing' {
-        $f = @(Get-ProbeFailure -Result ([pscustomobject] @{ hostToken = $true }) -JobServiceAccount '')
-        $f.Count | Should -Be 5
+        $f = @(Get-ProbeFailure -Result ([pscustomobject] @{ hostToken = $true }) -JobServiceAccount '' -ExpectedIdentity 'ci-s1')
+        $f.Count | Should -Be 6
+    }
+
+    # THE ONE THAT MAKES THE REPOINT FALSIFIABLE. Nothing else in the verdict
+    # can tell these two runs apart: every other check queries the metadata
+    # server, which answers the machine and not the account.
+    It 'fails a verdict produced by LocalSystem rather than by the slot' {
+        $r = & $script:CleanProbe
+        $r.runningAs = 'NT AUTHORITY\SYSTEM'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'never repointed'
+    }
+
+    It 'fails a verdict that does not say who produced it' {
+        $r = & $script:CleanProbe
+        $r.runningAs = ''
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'did not report which account'
+    }
+
+    # The machine half of WindowsIdentity.Name is the instance name, which the
+    # harness does not know and which says nothing about the boundary. Matching
+    # on it would deny every real boot.
+    It 'accepts the slot regardless of the machine prefix or case' {
+        $r = & $script:CleanProbe
+        $r.runningAs = 'SOME-OTHER-BOX\CI-S1'
+        Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity '.\ci-s1' |
+            Should -BeNullOrEmpty
+    }
+}
+
+Describe 'jittered timeout' {
+    # The failure mode of jitter is a bound that quietly became a constant, or
+    # one that became unbounded. Both are invisible from a call site that rolls
+    # its own dice, which is why the roll is a parameter.
+    It 'never returns less than the base' {
+        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 300 -Roll 0.0 | Should -Be 600
+    }
+
+    It 'never exceeds base plus jitter' {
+        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 300 -Roll 1.0 | Should -Be 900
+        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 300 -Roll 0.5 | Should -Be 750
+    }
+
+    # Get-Random is documented as [0,1) but the clamp is not decoration: a caller
+    # that hands this a ratio out of range must not widen the bound past what
+    # the constant advertises.
+    It 'clamps a roll outside zero-to-one' {
+        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 300 -Roll 7.5 | Should -Be 900
+        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 300 -Roll -2.0 | Should -Be 600
+    }
+
+    It 'degenerates to the base when there is no jitter window' {
+        Get-JitteredSeconds -BaseSeconds 600 -JitterSeconds 0 -Roll 0.9 | Should -Be 600
     }
 }
 
@@ -1147,6 +1204,16 @@ Describe 'probe payload' {
 
     It 'writes its verdict where the boot script looks for it' {
         $script:Payload | Should -Match "Set-Content -LiteralPath 'C:\\ci\\boot-probe\.json'"
+    }
+
+    # Without this the repoint has no witness: every other field in the verdict
+    # is a metadata answer and reads identically for any account on the host.
+    # Not $env:USERNAME -- a service's environment block is data the SCM copies
+    # in and this script rewrites elsewhere, so it can disagree with the process
+    # token, which is the exact divergence being tested for.
+    It 'records the account it is actually running as' {
+        $script:Payload | Should -Match 'WindowsIdentity\]::GetCurrent\(\)'
+        $script:Payload | Should -Not -Match '\$env:USERNAME'
     }
 
     It 'is valid PowerShell rather than merely a string' {
@@ -1249,6 +1316,41 @@ Describe 'probe service definition' {
 
     It 'is well-formed XML' {
         { [xml] $script:ProbeXml } | Should -Not -Throw
+    }
+}
+
+Describe 'probe sibling workspace' {
+    # The directory the probe must FAIL to read. Get-ProbeFailure treats a
+    # sibling that was 'missing' as a finding rather than a pass -- a path that
+    # is not there proves nothing about an ACL -- so choosing one that does not
+    # exist would deny every boot in the pool rather than none.
+    #
+    # Roots are injected, because Join-Path 'C:\ci\slots' 1 throws
+    # DriveNotFoundException on the ubuntu-latest runner this suite runs on.
+    It 'points a multi-slot host at another slot workspace' {
+        Get-ProbeSiblingWorkspace -Index 1 -SlotCount 2 -SlotRoot '/slots' -FallbackRoot '/bin' |
+            Should -Be (Join-Path '/slots' '2')
+    }
+
+    It 'points a slot that is not the first one back at the first' {
+        Get-ProbeSiblingWorkspace -Index 2 -SlotCount 2 -SlotRoot '/slots' -FallbackRoot '/bin' |
+            Should -Be (Join-Path '/slots' '1')
+    }
+
+    # The Windows pool pins ci-slots to 1, so this is the case almost every host
+    # takes. C:\ci\bin is not a weaker subject than a sibling workspace: it
+    # exists on every host, phase 1 locks it to SYSTEM and Administrators with
+    # no slot ACE, and it holds the beacon script the SCM re-runs as LocalSystem.
+    It 'falls back to a directory that exists on a single-slot host' {
+        Get-ProbeSiblingWorkspace -Index 1 -SlotCount 1 -SlotRoot '/slots' -FallbackRoot '/bin' |
+            Should -Be '/bin'
+    }
+
+    It 'never names the probing slot own workspace' {
+        foreach ($count in 1, 2, 4) {
+            Get-ProbeSiblingWorkspace -Index 1 -SlotCount $count -SlotRoot '/slots' -FallbackRoot '/bin' |
+                Should -Not -Be (Join-Path '/slots' '1')
+        }
     }
 }
 
