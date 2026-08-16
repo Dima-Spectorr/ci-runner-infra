@@ -175,7 +175,14 @@ internal sealed class ServiceDefinition
         if (digits.Length == 0) { return fallback; }
         int n = int.Parse(digits);
         string unit = v.Substring(i).Trim();
-        if (unit.StartsWith("ms")) { return n / 1000; }
+        // Milliseconds are kept as a unit but FLOORED AT ONE SECOND, because
+        // this type counts seconds and "500 ms" would otherwise integer-divide
+        // to the zero the paragraph above refuses. Dropping the unit instead
+        // would be worse than either: "500 ms" would fall through to the bare
+        // number and become a five-hundred-SECOND restart delay. Nothing this
+        // repository writes uses ms today; this is about what the next caller
+        // gets when it does.
+        if (unit.StartsWith("ms")) { int s = n / 1000; return s < 1 ? 1 : s; }
         if (unit.StartsWith("min")) { return n * 60; }
         if (unit.StartsWith("hour") || unit.StartsWith("hr")) { return n * 3600; }
         return n;

@@ -14,12 +14,12 @@
 # Linux template stays Linux-only and this one stays Windows-only.
 #
 # ONE IMAGE, EVERY POOL. There is no per-repository image and no build flag that
-# makes this "the MSI-signing image". Everything a host knows about which
-# repository it serves arrives as instance metadata at boot
+# makes this "the signing image". Everything a host knows about which repository
+# it serves arrives as instance metadata at boot
 # (modules/ci-runner-host-pool/main.tf), and a pool needing an extra SDK
-# contributes it through `warm_cache_script`, which runs last and is the only
-# layer a consumer supplies. Baking a repository, project, region or customer in
-# here would turn one artifact into N artifacts that drift apart.
+# contributes it MACHINE-WIDE through `warm_cache_script`, which runs last and is
+# the only layer a consumer supplies. Baking a repository, project, region or
+# customer in here would turn one artifact into N artifacts that drift apart.
 #
 # WHAT THE BOOT SCRIPT REQUIRES OF THIS IMAGE
 #
@@ -36,8 +36,9 @@
 #                                   `ci-image-min-version` by Test-ImageVersion
 #
 # The boot script creates C:\ci, C:\ci\bin and C:\ci\slots itself and locks them
-# in phase 1, so this image does not ACL them — the one tree it does own is the
-# warm cache, below.
+# in phase 1, so this image does not ACL them. It bakes no cache tree either:
+# unlike Linux, a Windows host has no host-wide warm cache and no per-slot copy
+# of one to read it (issue #150).
 #
 # Built by Cloud Build, never on a laptop.
 
@@ -229,22 +230,27 @@ variable "git_version" {
 variable "warm_cache_script" {
   type        = string
   description = <<-EOT
-    OPTIONAL path to a repo-supplied PowerShell script that pre-populates
-    dependency caches. It runs inside the build VM elevated and must be
-    idempotent and network-only — it may download, it must not embed credentials
-    or customer data.
+    OPTIONAL path to a repo-supplied PowerShell script that installs ADDITIONAL
+    MACHINE-WIDE TOOLCHAIN as the last build layer. It runs inside the build VM,
+    elevated, and must be idempotent and network-only — it may download, it must
+    not embed credentials or customer data. Whatever it installs must be
+    machine-wide to have any effect, because the slot accounts a job runs as do
+    not exist yet at image-build time.
 
-    It writes into C:\ci-cache, which is the MASTER cache: root-owned,
-    read-and-execute to everybody else, and never written at runtime. The Linux
-    rationale transfers unchanged — a cache tree several slot accounts can write
-    is a channel by which one job hands another job code to run, because `npx`
-    executes out of the npm cache and a package manager does not re-verify an
-    artifact it already has locally.
+    IT IS NOT A CACHE LAYER, DESPITE THE NAME IT SHARES WITH THE LINUX ONE.
+    There is no host-wide warm cache on a Windows host and nothing here can
+    create one: windows-host-startup.ps1 states outright that "CacheRoot is the
+    slot's OWN workspace root. There is no host-wide warm cache directory on
+    this image", and it has no counterpart to the Linux boot script's
+    CACHE_MASTER=/opt/ci-cache -> CACHE_SLOTS=/var/lib/ci-cache per-slot copy.
+    A tree baked here would be read by nothing, copied per slot by nothing, and
+    put on a job's PATH or into an npm/NuGet config by nothing. The name is kept
+    so the two templates take the same variable; the gap is tracked in issue
+    #150 and this description changes when that closes, not before.
 
-    There is no container half of this contract on Windows: section 4 of the ADR
+    There is no container half of this contract either: section 4 of the ADR
     states that a Windows pool runs no job containers, so the Linux template's
-    /opt/ci-images tree has no counterpart here and a warm script that tries to
-    bake one is warming nothing.
+    /opt/ci-images tree has no counterpart here.
 
     Empty = build a toolchain-only image.
   EOT
@@ -304,7 +310,7 @@ source "googlecompute" "host" {
 
   machine_type = "n2-standard-8"
   # 200 GB, matching the floor section 1 of the ADR puts on a Windows pool host:
-  # Windows, plus the toolchains, plus the warm cache, plus K workspaces, plus a
+  # Windows, plus the toolchains, plus K per-slot caches, plus K workspaces, plus a
   # pagefile. A host that fills its disk mid-job fails every slot at once and
   # reports it as a repository problem.
   disk_size = 200
@@ -478,20 +484,14 @@ build {
     ]
   }
 
-  # 7. The warm cache root, created BEFORE the consumer's script so the script
-  #    has somewhere to write, and sealed after it.
-  provisioner "powershell" {
-    elevated_user     = build.User
-    elevated_password = build.Password
-    inline = [
-      "$ErrorActionPreference = 'Stop'",
-      "New-Item -ItemType Directory -Force -Path 'C:\\ci-cache' | Out-Null",
-    ]
-  }
-
-  # 7b. Repo-supplied cache warming. Optional, and deliberately the LAST
-  #     installing layer: everything above is identical for every consumer, so a
-  #     change here does not invalidate the expensive layers.
+  # 7. Repo-supplied extra toolchain. Optional, and deliberately the LAST
+  #    installing layer: everything above is identical for every consumer, so a
+  #    change here does not invalidate the expensive layers.
+  #
+  #    Machine-wide or nothing — see the `warm_cache_script` description. This
+  #    image bakes no cache tree, because a Windows host has nothing that would
+  #    read one (issue #150); baking one anyway would be dead weight that reads
+  #    like a working feature, which is the more expensive of the two mistakes.
   provisioner "powershell" {
     # Never an empty list: Packer validates this at PREPARE time and rejects a
     # provisioner with no script, so "warm nothing" is a script that does
@@ -499,39 +499,6 @@ build {
     scripts           = [local.warm_script]
     elevated_user     = build.User
     elevated_password = build.Password
-  }
-
-  # 7c. Seal the master cache AFTER warming.
-  #
-  #     A consumer's warm script is arbitrary repo-supplied code running
-  #     elevated, so what it leaves behind is not assumed. The tree is re-owned
-  #     and reduced to read-and-execute for everyone who is not an administrator,
-  #     which is the Windows spelling of the Linux template's `chmod -R go-w` and
-  #     exists for the same reason: /opt/ci-cache reached every slot as a
-  #     writable per-slot copy, and a cache tree a job can write is a channel by
-  #     which one job hands the next one code to run.
-  #
-  #     WELL-KNOWN SIDS, NOT GROUP NAMES. `icacls ... /grant Administrators:` is
-  #     a lookup that fails on a localised Windows, and an icacls line that fails
-  #     is an ACL that was never applied — while the build carries on and the
-  #     image ships wide open. S-1-5-18 is SYSTEM, S-1-5-32-544 Administrators,
-  #     S-1-5-32-545 Users; none of them is translated.
-  #
-  #     The reparse-point scan is the counterpart of the Linux seal's hardlink
-  #     and setuid find, and it is a real gate rather than a comment: a junction
-  #     planted in the cache would point the ACL grant, and later every reader,
-  #     at a tree outside it.
-  provisioner "powershell" {
-    elevated_user     = build.User
-    elevated_password = build.Password
-    inline = [
-      "$ErrorActionPreference = 'Stop'",
-      "$links = @(Get-ChildItem -LiteralPath 'C:\\ci-cache' -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })",
-      "if ($links.Count -gt 0) { throw \"the warm cache holds a reparse point: $($links[0].FullName)\" }",
-      "& icacls 'C:\\ci-cache' /setowner '*S-1-5-32-544' /T /C | Out-Null",
-      "& icacls 'C:\\ci-cache' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /T /C | Out-Null",
-      "if ($LASTEXITCODE -ne 0) { throw 'the warm cache could not be sealed' }",
-    ]
   }
 
   # 8. The image version marker.
