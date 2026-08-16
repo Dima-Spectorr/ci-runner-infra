@@ -1,0 +1,208 @@
+name: Support windows
+
+# Published for consuming repositories to call by tag, exactly as
+# `modules/ci-runner-host-pool` is. The contract is docs/dependency-freshness.md.
+#
+#   jobs:
+#     support-windows:
+#       uses: <org>/ci-runner-infra/.github/workflows/support-windows.yml@v5.20.0
+#       permissions:
+#         contents: read
+#         issues: write
+#         pull-requests: write
+#
+# WHY THIS IS NOT A REQUIRED CHECK
+#
+# Every finding here has a date attached, and none of those dates are moved by
+# the pull request being checked. A repository that was green yesterday and red
+# this morning because Node reached a milestone overnight would be a repository
+# whose merge queue is blocked by the calendar. So the scan reports, and reports
+# where the finding survives being ignored for a week: an issue for the standing
+# state, a pull request comment for the one finding that is about a decision
+# being made right now.
+
+on:
+  workflow_call:
+    inputs:
+      window-days:
+        description: >-
+          How much notice a team gets before support ends. A migration is
+          planned in months, so this is a lead time and not a countdown; the
+          default is one release cycle's worth of warning.
+        type: number
+        default: 180
+        required: false
+      issue-label:
+        description: Label applied to the standing issue, so it can be found again.
+        type: string
+        default: support-window
+        required: false
+      scanner-repository:
+        description: >-
+          Where the scanner lives. Only needs setting when the consuming
+          repository is in a different organisation from ci-runner-infra.
+        type: string
+        default: ''
+        required: false
+      comment-on-pull-request:
+        description: >-
+          Whether a version newly adopted with a shorter runway than an
+          available one is raised on the pull request that adopts it. This is
+          the only finding whose fix is free at the moment it is reported.
+        type: boolean
+        default: true
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Versions past or near end of support
+    # ubuntu-latest, NOT the warm pool. This job clones a repository and reads
+    # text; docs/ci-optimization-catalog.md §2.2 is explicit that a
+    # zero-dependency guard must not claim a pool slot, and a scan that costs a
+    # slot on every repository in the fleet is the kind of cost that gets the
+    # whole thing switched off.
+    runs-on: ubuntu-latest
+    # Without this a hung job inherits GitHub's 360-minute default.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: check out the repository being scanned
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The "newly adopted" verdict is the difference between a version this
+          # pull request chose and one it inherited, so the base commit has to
+          # be reachable. A shallow clone makes every declaration look inherited
+          # and silently removes the finding this whole workflow leads with.
+          fetch-depth: 0
+
+      - name: check out the scanner at the exact commit of this workflow
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ inputs.scanner-repository || format('{0}/ci-runner-infra', github.repository_owner) }}
+          # `job_workflow_sha` is the commit of the REUSABLE workflow being run,
+          # which is this file. Checking the scripts out at that commit is what
+          # makes "consumed by tag" true: the rule a consumer runs is the rule
+          # that shipped in the tag it pinned, not whatever is on the default
+          # branch at the moment the job happens to start.
+          ref: ${{ github.job_workflow_sha }}
+          path: .support-windows-scanner
+          sparse-checkout: scripts/ci
+
+      - name: scan
+        id: scan
+        env:
+          WINDOW: ${{ inputs.window-days }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          args=(--repo-root . --window "${WINDOW:-180}" --out "${RUNNER_TEMP}/support-windows.md")
+          if [ -n "${BASE_SHA:-}" ]; then
+            args+=(--base-ref "${BASE_SHA}")
+          fi
+          bash .support-windows-scanner/scripts/ci/scan-support-windows.sh "${args[@]}"
+          # The report is the artefact the later steps read; the counts decide
+          # which of them do anything at all.
+          # The scanner publishes its own counts on line 2. Re-deriving them by
+          # counting table rows here would count the informational rows too, and
+          # an issue held open by those alone would never close.
+          counts="$(sed -n '2p' "${RUNNER_TEMP}/support-windows.md")"
+          actionable="$(printf '%s' "${counts}" | sed -n 's/.*actionable=\([0-9]*\).*/\1/p')"
+          adopted="$(printf '%s' "${counts}" | sed -n 's/.*SUP3=\([0-9]*\).*/\1/p')"
+          {
+            echo "report=${RUNNER_TEMP}/support-windows.md"
+            echo "findings=${actionable:-0}"
+            echo "adopted=${adopted:-0}"
+          } >>"${GITHUB_OUTPUT}"
+          cat "${RUNNER_TEMP}/support-windows.md" >>"${GITHUB_STEP_SUMMARY}"
+
+      # --- the standing state: one issue, kept up to date ----------------------
+      #
+      # Upserted, never re-opened as a new issue per run. A scheduled scan that
+      # files a fresh issue every night teaches everyone to filter the label,
+      # and a filtered label is the same as no scan at all.
+      - name: file or update the standing issue
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ steps.scan.outputs.report }}
+          FINDINGS: ${{ steps.scan.outputs.findings }}
+          LABEL: ${{ inputs.issue-label }}
+          TITLE: Versions past, or near, the end of their support
+        run: |
+          set -euo pipefail
+          gh label create "${LABEL}" --description "Runtime or framework outside its support window" \
+            --color BFD4F2 2>/dev/null || true
+
+          existing="$(gh issue list --state open --label "${LABEL}" \
+            --search '"support-window-scan" in:body' --json number --jq '.[0].number // ""')"
+
+          if [ "${FINDINGS:-0}" -eq 0 ]; then
+            # Nothing outstanding. Closing the issue is the half that makes the
+            # report trustworthy: an issue that only ever grows is a backlog,
+            # and nobody reads a backlog to find out today's state.
+            if [ -n "${existing}" ]; then
+              gh issue comment "${existing}" --body "Every declared version is inside its support window as of $(date -u +%Y-%m-%d). Closing."
+              gh issue close "${existing}"
+            fi
+            exit 0
+          fi
+
+          if [ -n "${existing}" ]; then
+            gh issue edit "${existing}" --body-file "${REPORT}"
+          else
+            gh issue create --title "${TITLE}" --label "${LABEL}" --body-file "${REPORT}"
+          fi
+
+      # --- the decision being made right now -----------------------------------
+      #
+      # A version newly adopted with a shorter runway than an available one is
+      # the only finding whose fix is one character on the day it is reported.
+      # An issue filed for it would be read weeks after the choice hardened, so
+      # it goes where the choice is being made.
+      # A fork's `pull_request` token is read-only, so this step would fail on
+      # one — a red step for a permission the event is DEFINED not to grant.
+      # The event stays `pull_request` rather than `pull_request_target` for
+      # exactly that reason: this job checks out and reads the pull request's
+      # own tree, and `pull_request_target` would hand a write-scoped token to
+      # a job doing that, which is the standard way this class of workflow is
+      # turned into arbitrary write access by a fork.
+      - name: raise a newly adopted short runway on the pull request
+        if: ${{ github.event_name == 'pull_request'
+                && github.event.pull_request.head.repo.full_name == github.repository
+                && inputs.comment-on-pull-request
+                && steps.scan.outputs.adopted != '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ steps.scan.outputs.report }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          body="$(mktemp)"
+          {
+            echo "<!-- support-window-scan-pr -->"
+            echo "### This pull request adopts a version with a shorter support runway than one already available"
+            echo
+            grep -F 'new-on-' "${REPORT}" || true
+            echo
+            echo "_Changing the choice now costs one line. After release it costs a migration._"
+            echo "_Not a required check — see \`docs/dependency-freshness.md\` for why._"
+          } >"${body}"
+
+          # Edited in place rather than appended to, so a pull request pushed to
+          # ten times carries one comment and not ten. The REST listing is used
+          # rather than `gh pr view --json comments`, whose ids are GraphQL node
+          # ids that the comments endpoint does not accept.
+          previous="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+            --jq 'map(select(.body | contains("support-window-scan-pr"))) | .[0].id // ""')"
+          if [ -n "${previous}" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${previous}" \
+              -F "body=@${body}" >/dev/null
+          else
+            gh pr comment "${PR}" --body-file "${body}"
+          fi

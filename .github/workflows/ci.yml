@@ -330,6 +330,23 @@ jobs:
       - name: runner policy
         run: bash scripts/ci/check-runner-policy.sh --forks=allowed
 
+      # Whether a version is still supported. The rule is asserted here rather
+      # than discovered on a fleet, because its wrong direction is a REPORT that
+      # says nothing: `eol: false` in the upstream feed means "no end-of-life
+      # date announced", and read as a boolean it marks every framework that
+      # publishes no dates — React, and most of the rest — permanently clean.
+      # A scan that always answers "fine" is indistinguishable from a healthy
+      # fleet, which is exactly the state this rule was written to end.
+      - name: support-window rule self-test
+        run: bash scripts/ci/support-window-decision.selftest.sh
+
+      # …and the scanner that feeds it, against a fixture repository and a
+      # pinned copy of the feed. Hermetic on purpose: the live scan reads a
+      # third-party API, and a gate that goes red because endoflife.date is
+      # down is a gate that gets deleted.
+      - name: support-window scanner self-test
+        run: bash scripts/ci/scan-support-windows.selftest.sh
+
       # A browser suite is the one gate whose every mis-configuration is
       # invisible in the run's status: a committed `test.only` passes over one
       # test, a missing `globalTimeout` DEQUEUES the pull request instead of
