@@ -601,6 +601,31 @@ check "regtoken: the H-4 case FAILS when the issued gate is reverted" \
 # this line in that event. It is defence in depth against a future caller, not a
 # behaviour this harness can reach — a check for it would assert nothing.
 
+# A creationTimestamp in the FUTURE — a controller whose clock is behind the
+# API's. The instance's real age is unknowable from here, so the durable age
+# reads as the refusing sentinel and nothing is minted; a key already on the
+# instance is taken back rather than left.
+check "regtoken: an instance created in the future is not treated as new" \
+  "0|0|minted|no-keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 0 0 0 '' -120 absent)"
+
+check "regtoken: and a key already on such an instance is deleted" \
+  "0|1|minted|no-keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 0 0 0 '' -120 present)"
+
+# The clamp goes back to 0 — the shape that shipped — and the negative age reads
+# as brand new, which is the single most mint-permissive answer the function can
+# give, handed to the host whose age it just failed to establish.
+# shellcheck disable=SC2016
+check "regtoken: the skew clamp FAILS when a negative age clamps to 0" \
+  "1|0|minted|keylive|fails=0" \
+  "$(reg_seq absent 0 '' RUNNING 0 0 0 '' -120 absent 0 's/|| DUR_AGE=999999999/|| DUR_AGE=0/')"
+
+# All THREE durable facts are reset before any early return. DUR_ISSUED is the
+# one that matters most and was the one missing: `absent` left over from another
+# host's successful read is a licence to mint.
+r=$(sed -n '/^instance_durable_facts()/,/^  zone=/p' "$CTRL" |
+  grep -c -E '^  DUR_(AGE|KEY|ISSUED)=')
+check "regtoken: every durable fact is reset before the first early return" 3 "$r"
+
 # ── F4: the bug the stub above could not see ─────────────────────────────────
 #
 # `--filter` is a `list`-family flag; `describe` rejects it with `unrecognized

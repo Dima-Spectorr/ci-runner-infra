@@ -975,6 +975,14 @@ instance_durable_facts() {
   # file-scope defaults.
   DUR_AGE=999999999
   DUR_KEY="unknown"
+  # DUR_ISSUED belongs in the reset for the same reason, and leaving it out was
+  # worse than the other two: it is the only one of the three whose stale value
+  # can be the PERMISSIVE one. A previous host's successful call leaves it
+  # `absent`, and a `return 1` here would hand that answer to the next host —
+  # "this instance was never issued a token" — about an instance nothing was
+  # read from. The current caller checks the return code, so this is not a live
+  # bug; it is the shape that makes the next caller's mistake unrecoverable.
+  DUR_ISSUED="unknown"
 
   zone=${uri%/instances/*}
   zone=${zone##*/}
@@ -993,8 +1001,15 @@ instance_durable_facts() {
   now=$(date -u +%s)
   DUR_AGE=$((now - created))
   # Clock skew between this controller and the API must not read as "brand new
-  # in the future"; the safe direction is old.
-  [ "$DUR_AGE" -ge 0 ] || DUR_AGE=0
+  # in the future"; the safe direction is old — and `0` is the opposite of old.
+  # A negative age means this controller's clock is BEHIND the API's, so every
+  # instance it sees is younger than it really is, and clamping the overflow to
+  # 0 handed the most mint-permissive answer to exactly the hosts whose real age
+  # is least knowable. Clamped to the same sentinel an unreadable fact gets:
+  # `>= REGISTER_GRACE`, so the arm below refuses, and — if the key is somehow
+  # still there — takes it back. The cost is that a badly-skewed controller
+  # mints for nobody, which is an outage the recycle rule already bounds.
+  [ "$DUR_AGE" -ge 0 ] || DUR_AGE=999999999
 
   # `--flatten` and NO `--filter`. `--filter` is a list-family flag; `describe`
   # rejects it with `unrecognized arguments` and exit 2, which this function
