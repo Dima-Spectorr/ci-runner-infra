@@ -250,6 +250,54 @@ Read `/var/log/ci-host.log` on the host over IAP-SSH.
 `0` in check 3 on an idle repository is scale-to-zero working, not a broken
 pool. Compare against the queue before treating it as an outage.
 
+## Hand the root to an unattended apply — do not skip this
+
+The apply above is the **only** one a human is supposed to run. If it is also the
+last one, the pool is frozen at whatever `ci-runner-infra` looked like today: a
+release that fixes a host defect lands in a tag and never reaches a machine, and
+nobody notices until the defect does something. A root pinned to `?ref=v5` is the
+sharper case — it has **no commit to make** when v5.7.1 ships, so there is not
+even a push to react to.
+
+Add the trigger to the same root, and let the project's own Cloud Build own every
+later apply:
+
+```hcl
+module "ci_runner_apply_trigger" {
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.16.0"
+
+  project_id     = var.project_id
+  region         = var.region
+  github_owner   = var.github_owner
+  github_repo    = var.github_repo
+  terraform_root = "infra/terraform/ci-runners"   # this root, repo-relative
+
+  # The project's EXISTING CD account. This module creates no identity.
+  service_account = "<cd-sa>@<project>.iam.gserviceaccount.com"
+
+  # Pick a minute no other repository in the fleet uses. Every scheduled apply
+  # firing on the hour is how a provider rate limit becomes a fleet-wide outage.
+  apply_schedule = "23 4 * * *"
+}
+```
+
+Then grant that account what a *refresh* needs — this is the step that gets
+skipped, and it fails at `plan` rather than at `apply`, so it looks like the
+module is broken when it is the grants that are missing. The full list, the
+reasoning, and why none of it widens the security boundary are in
+[`applying-runner-infra.md`](applying-runner-infra.md#the-cloud-build-caller).
+
+**Then run it once, by hand, and read the result.** A trigger that exists is not
+a trigger that works, and the difference is only visible if you look:
+
+```bash
+gcloud builds triggers run ci-runner-apply-<repo> --project=<project> --region=<region> --branch=main
+```
+
+Run it a **second** time and confirm it reports no changes. A run that keeps
+replacing the same resource is a perpetual diff, and on a nightly schedule that
+is not a cosmetic wart — it recreates that resource every night, forever.
+
 ## 6. Adopt the lane model
 
 Not required for the pool to work, but it is the other half of the cost saving:
