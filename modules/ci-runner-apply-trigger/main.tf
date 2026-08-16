@@ -84,7 +84,7 @@ locals {
   gen2 = var.github_connection != null
 
   # A bare name or a full resource id, both accepted, so a caller holding
-  # `google_cloudbuild_connection.x.id` can pass it straight through without
+  # `google_cloudbuildv2_connection.x.id` can pass it straight through without
   # slicing the last segment off it.
   connection_id = local.gen2 ? (
     startswith(coalesce(var.github_connection, ""), "projects/")
@@ -92,7 +92,7 @@ locals {
     : "projects/${var.project_id}/locations/${var.region}/connections/${var.github_connection}"
   ) : null
 
-  repository_id = local.gen2 ? coalesce(var.github_repository, try(google_cloudbuild_repository.repo[0].id, "")) : null
+  repository_id = local.gen2 ? coalesce(var.github_repository, try(google_cloudbuildv2_repository.repo[0].id, "")) : null
 }
 
 # Registered here rather than required as an input, because a connection is
@@ -105,7 +105,7 @@ locals {
 # twice under one connection is an ALREADY_EXISTS error rather than a no-op, and
 # a second root onboarding the same repository would otherwise fail on a
 # resource it did not know had been created.
-resource "google_cloudbuild_repository" "repo" {
+resource "google_cloudbuildv2_repository" "repo" {
   count = local.gen2 && var.github_repository == null ? 1 : 0
 
   project  = var.project_id
