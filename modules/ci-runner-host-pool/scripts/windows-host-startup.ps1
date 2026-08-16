@@ -716,6 +716,74 @@ function Get-SlotServiceEnvironment {
     return $block
 }
 
+function Get-ServiceEnvironmentValue {
+    <#
+      .SYNOPSIS
+        One slot's environment block as the REG_MULTI_SZ the SCM reads. Pure.
+      .DESCRIPTION
+        A service's per-service environment is the `Environment` value under its
+        own key, a REG_MULTI_SZ of `NAME=VALUE` strings. Built here rather than
+        inline so the two ways it can be silently wrong are asserted by a test:
+
+          * a NAME that is not an environment variable name. The values reaching
+            this come from Get-SlotServiceEnvironment, but the block is the last
+            thing standing between instance metadata and a service that starts as
+            a local account, and section 3A accepts that a Windows host cannot
+            assume its metadata is untampered.
+          * a VALUE carrying CR, LF or NUL. REG_MULTI_SZ is NUL-delimited, so an
+            embedded NUL does not corrupt the write -- it TRUNCATES the block at
+            that entry, and every variable after it silently disappears. On this
+            block the entries that would disappear are the reset hooks.
+
+        Both throw rather than sanitise. A registration this cannot describe
+        exactly is a registration that must not happen.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary] $Environment)
+
+    $entries = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in $Environment.Keys) {
+        $name = [string] $key
+        $value = [string] $Environment[$key]
+        if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+            throw "refusing to build a service environment block: '$name' is not an environment variable name"
+        }
+        if ($value -match "[`r`n`0]") {
+            throw ("refusing to build a service environment block: the value of $name carries a " +
+                'newline or a NUL, which would truncate every entry after it')
+        }
+        $entries.Add("$name=$value")
+    }
+    return $entries.ToArray()
+}
+
+function Get-RunnerServiceName {
+    <#
+      .SYNOPSIS
+        The runner service name from the agent's own `.service` marker. Pure.
+      .DESCRIPTION
+        `config.cmd --runasservice` records the service it installed in a
+        `.service` file in the runner directory; that file, not a name a script
+        reconstructs, is the answer. Reconstructing it would mean encoding
+        GitHub's naming scheme here, and a scheme that changes upstream would
+        leave the caller configuring the environment and the recovery policy of a
+        service that does not exist -- while the agent that DOES exist starts with
+        neither, takes jobs, and restarts itself out of a cordon.
+
+        VALIDATED, because the file is inside a directory the slot account can
+        write. The name reaches sc.exe, so anything that is not literally
+        `actions.runner.<...>` is refused rather than escaped. Returns '' on
+        anything it will not vouch for; the caller denies the boot.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Marker)
+
+    if ([string]::IsNullOrWhiteSpace($Marker)) { return '' }
+    $name = $Marker.Trim()
+    if ($name -notmatch '^actions\.runner\.[A-Za-z0-9._-]+$') { return '' }
+    return $name
+}
+
 # --- phase 0 -----------------------------------------------------------------
 
 function Get-MetadataValue {
@@ -1564,6 +1632,185 @@ function Invoke-Phase4JobHook {
     param([Parameter(Mandatory = $true)][string[]] $SlotUsers)
     Install-JobHook -SlotUsers $SlotUsers
     return $script:JobHookPath
+}
+
+# --- service plumbing phase 5 registers agents through -----------------------
+#
+# The three operations phase 5 has to perform on a service config.cmd installed,
+# separated from phase 5 itself because each is a distinct decision with a
+# distinct failure mode and none of them is about registration:
+#
+#   the logon account   set through ChangeServiceConfigW, because every
+#                       documented alternative takes the password as a string.
+#   the environment     written on the service's own key, because a machine-wide
+#                       block hands every slot the same TMP and points the host's
+#                       own tooling at the broker.
+#   the recovery policy CLEARED, because an agent that restarts itself out of a
+#                       cordon keeps a draining host alive forever.
+#
+# Nothing calls them yet; phase 5 does.
+
+function Grant-ServiceLogonAccount {
+    <#
+      .SYNOPSIS
+        Point one service at a slot's local account, without a plaintext password.
+      .DESCRIPTION
+        THE REASON THIS IS P/INVOKE AND NOT sc.exe OR config.cmd
+
+        Every documented way of setting a service's logon account takes the
+        password as a STRING: the sc.exe config form puts it in the process table,
+        config.cmd's own logon-password flag does the same, and
+        Win32_Service.Change takes a managed String that cannot be erased and
+        lives until the GC decides otherwise. On this host the process table is
+        readable by the very accounts whose credentials those are, and those
+        accounts run pull-request code.
+
+        ChangeServiceConfigW takes the password as a pointer.
+        SecureStringToGlobalAllocUnicode marshals it out of the SecureString into
+        unmanaged memory, ZeroFreeGlobalAllocUnicode wipes and frees it in a
+        `finally`, and no [string] of the password exists at any point. That is
+        what keeps the file's standing rule -- the slot password never leaves the
+        SecureString it was born in -- true through the one phase that has to
+        spend it.
+
+        SERVICE_NO_CHANGE for every field but the account, so this changes the
+        logon identity and nothing else about a service config.cmd just wrote.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $ServiceName,
+        [Parameter(Mandatory = $true)][System.Management.Automation.PSCredential] $Credential
+    )
+
+    if (-not ('CiHostPool.ServiceConfig' -as [type])) {
+        Add-Type -Namespace 'CiHostPool' -Name 'ServiceConfig' -MemberDefinition @'
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern IntPtr OpenSCManagerW(string machineName, string databaseName, uint access);
+
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern IntPtr OpenServiceW(IntPtr manager, string serviceName, uint access);
+
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern bool ChangeServiceConfigW(IntPtr service, uint serviceType, uint startType,
+    uint errorControl, string binaryPath, string loadOrderGroup, IntPtr tagId, string dependencies,
+    string startName, IntPtr password, string displayName);
+
+[DllImport("advapi32.dll", SetLastError = true)]
+public static extern bool CloseServiceHandle(IntPtr handle);
+'@
+    }
+
+    $noChange = [uint32]::MaxValue
+    $manager = [CiHostPool.ServiceConfig]::OpenSCManagerW($null, $null, 0x0001)
+    if ($manager -eq [IntPtr]::Zero) {
+        Deny-Boot "cannot open the service control manager (win32 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+    }
+    $service = [IntPtr]::Zero
+    $password = [IntPtr]::Zero
+    try {
+        # SERVICE_CHANGE_CONFIG only. Nothing here needs to start, stop or query
+        # the service, and a handle that could is a handle a later edit would use.
+        $service = [CiHostPool.ServiceConfig]::OpenServiceW($manager, $ServiceName, 0x0002)
+        if ($service -eq [IntPtr]::Zero) {
+            Deny-Boot ("cannot open service $ServiceName to set its logon account " +
+                "(win32 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))")
+        }
+        $password = [System.Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode(
+            $Credential.Password)
+        $ok = [CiHostPool.ServiceConfig]::ChangeServiceConfigW($service, $noChange, $noChange,
+            $noChange, $null, $null, [IntPtr]::Zero, $null, $Credential.UserName, $password, $null)
+        if (-not $ok) {
+            Deny-Boot ("cannot set $ServiceName to run as $($Credential.UserName) " +
+                "(win32 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())) -- an agent " +
+                'left on the SCM default would run every job on this slot as a shared machine account')
+        }
+    } finally {
+        if ($password -ne [IntPtr]::Zero) {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($password)
+        }
+        if ($service -ne [IntPtr]::Zero) { [CiHostPool.ServiceConfig]::CloseServiceHandle($service) | Out-Null }
+        [CiHostPool.ServiceConfig]::CloseServiceHandle($manager) | Out-Null
+    }
+}
+
+function Write-ServiceEnvironment {
+    <#
+      .SYNOPSIS
+        Write one service's own environment block. Per service, never machine-wide.
+      .DESCRIPTION
+        A machine-wide TMP hands every slot the same one, which is the collision
+        the per-slot directory exists to remove, and machine-wide GCE_METADATA_*
+        would point the HOST's own tooling at the broker -- including, on a later
+        boot, anything this script runs. The SCM reads `Environment` off the
+        service's own key and hands it to that process and nothing else.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $ServiceName,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary] $Environment
+    )
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    if (-not (Test-Path -LiteralPath $key)) {
+        Deny-Boot "no service key at $key -- the runner service was not installed under the name it reported"
+    }
+    New-ItemProperty -LiteralPath $key -Name 'Environment' `
+        -PropertyType MultiString -Force `
+        -Value (Get-ServiceEnvironmentValue -Environment $Environment) | Out-Null
+}
+
+function Clear-ServiceRecoveryAction {
+    <#
+      .SYNOPSIS
+        Take away the SCM's restart-on-failure policy for one runner service.
+      .DESCRIPTION
+        THIS IS THE WINDOWS SPELLING OF THE LINUX UNIT'S `Restart=no`, AND THE
+        README'S RECYCLE CONTRACT DEPENDS ON IT.
+
+        Agents here are not --ephemeral, so the controller drains a host by
+        DEREGISTERING its agents through the GitHub API -- which GitHub refuses
+        while an agent is executing a job, and which is exactly what makes a
+        cordoned host lose its idle slots permanently while its working slot
+        finishes. A deregistered slot must STAY deregistered.
+
+        A service installed by config.cmd carries the SCM's recovery actions. An
+        agent that auto-restarts after a job-time failure re-registers itself,
+        takes more work, and does it on a host the controller believes is draining
+        -- so the host that was supposed to be retiring never retires, and the
+        pool holds a machine nobody can delete. A cleanly exiting agent is not a
+        "failure" and should not trigger recovery at all; the guarantee this
+        design needs is not "should not".
+
+        `reset= 0 actions= ""` is empty-string-terminated on sc.exe's own command
+        line, and Windows PowerShell 5.1 DROPS an empty argument when it builds a
+        native command line -- so `& sc.exe ... 'actions=' ''` would send
+        `actions=` with nothing after it and sc.exe would reject the whole call.
+        Handing cmd.exe one string is what keeps the empty argument. $ServiceName
+        is safe to interpolate only because Get-RunnerServiceName refused anything
+        that was not literally `actions.runner.<...>`, and it came out of a file
+        the slot account can write.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $ServiceName)
+
+    if ((Get-RunnerServiceName -Marker $ServiceName) -ne $ServiceName) {
+        Deny-Boot "refusing to pass '$ServiceName' to sc.exe -- it is not a runner service name"
+    }
+
+    # The preference is dropped around the native call for the reason given in
+    # Install-BeaconService: under Stop, `2>&1` on a native command turns each
+    # stderr line into a terminating NativeCommandError before the exit code is
+    # ever read.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $output = & cmd.exe /c "sc.exe failure `"$ServiceName`" reset= 0 actions= `"`"" 2>&1
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    foreach ($line in @($output)) { Write-BootLog "sc: $line" }
+    if ($exit -ne 0) {
+        Deny-Boot ("could not clear the recovery actions on $ServiceName (exit $exit) -- an agent " +
+            'that restarts itself out of a cordon re-registers, takes more work, and keeps a host ' +
+            'the controller is draining alive forever')
+    }
 }
 
 function Invoke-Main {
