@@ -22,7 +22,7 @@ variable "github_connection" {
   type        = string
   default     = null
   description = <<-EOT
-    Name of an EXISTING 2nd-gen Cloud Build connection in this project and region, e.g. `dataretrieval-github`. Null (the default) means the project links repositories the 1st-gen way, through the Cloud Build GitHub App, and the trigger is built with a `github {}` block.
+    Name of an EXISTING 2nd-gen Cloud Build connection in this project and region, e.g. `<project>-github`. Null (the default) means the project links repositories the 1st-gen way, through the Cloud Build GitHub App, and the trigger is built with a `github {}` block.
 
     THE TWO GENERATIONS ARE DIFFERENT APIS, NOT A VERSION FLAG. A 1st-gen trigger names owner/repo directly and resolves them against a project-level GitHub App install; a 2nd-gen trigger names a `google_cloudbuildv2_repository` resource under a connection. Neither block works against the other's link, and the failure is not a validation error — it is a trigger that is created successfully and never fires, because the push it is watching for arrives on a link it cannot see.
 
@@ -74,10 +74,10 @@ variable "service_account" {
   # a legal service account with a different shape: a numeric prefix, and
   # `developer.gserviceaccount.com` rather than `<project>.iam.`. That was an
   # accident of writing the pattern from the one example to hand, and it is not
-  # a security control standing in for a role check — `mot-apps-modern` runs its
-  # CD as that account, and it holds compute.instanceAdmin.v1 and
+  # a security control standing in for a role check — a project whose CD runs as
+  # its default compute account typically holds compute.instanceAdmin.v1 and
   # cloudscheduler.admin and neither serviceAccountAdmin nor projectIamAdmin,
-  # which is the shape this module actually asks for. A validation that rejects
+  # which is exactly the shape this module asks for. A validation that rejects
   # a correct input teaches the reader to work around the validation.
   validation {
     condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]+\\.iam\\.gserviceaccount\\.com$", var.service_account)) || can(regex("^[0-9]+-compute@developer\\.gserviceaccount\\.com$", var.service_account))
