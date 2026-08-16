@@ -120,6 +120,32 @@ what keeps it safe (`database_egress_ranges`, RFC1918 only), so adding a port is
 routine and widening the ranges is not. A project whose runners must reach no
 database at all sets `database_egress_ports = []` and no rule is created.
 
+### If the project has a cache-snapshot bucket
+
+A host boots with the cache its image baked, which ages with the image. If the
+project runs `ci-runner-cache-bucket` (once per project, like the network), point
+the pool at it and a booting host hydrates from this pool's current snapshot
+instead:
+
+```hcl
+  cache_snapshot_bucket = module.ci_cache.bucket_name
+```
+
+That is the whole change. The module then grants this pool's HOST account
+`roles/storage.objectViewer` **conditioned on `cache/<pool>/`** — read only, this
+pool only. Nothing on a host ever writes there; publishing belongs to a separate
+identity that never runs pull-request code, and until that exists a pool
+configured this way finds no snapshot and runs on the baked cache. That is a
+supported state, not a misconfiguration.
+
+Three bounds have defaults worth leaving alone unless you have a measurement:
+`cache_snapshot_max_age_hours` (168) is a security control and must stay at or
+below the bucket's own `snapshot_max_age_days × 24`;
+`cache_hydrate_budget_seconds` (60) is the entire time a host will spend on this
+before giving up and registering anyway; `cache_snapshot_max_bytes` (4 GiB)
+refuses a snapshot too large to unpack safely. Every failure inside that budget
+is a log line and a cold first job, never a host that does not come up.
+
 ### If your jobs run in a container from a private registry
 
 `jobs.<id>.container` and `services:` images are pulled by the slot's own

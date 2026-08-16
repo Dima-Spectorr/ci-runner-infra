@@ -528,11 +528,18 @@ write_slot_daemon_config() {
 # ordinary single-user machine — its own cache, owned by the user running it, with
 # no permission special case anywhere — which is also why this needs no per-tool
 # verification of what tolerates a foreign-owned entry. The price is disk: K slots
-# hold K copies. That price is zero today, because nothing warms the master yet;
-# it arrives with the snapshot layer, and sizing the boot disk for it belongs to
-# that change.
+# hold K copies, and the master is now warmed from a snapshot rather than only by
+# what the image baked, so `boot_disk_size_gb` has to carry K+1 of them.
 CACHE_MASTER="/opt/ci-cache"
 CACHE_SLOTS="/var/lib/ci-cache"
+
+# Where a downloaded snapshot is unpacked and inspected before any of it is
+# allowed into the master. Under /opt and NOT under $CACHE_MASTER: the master is
+# scanned as a whole, and a staging tree inside it would be scanned along with
+# it — so a snapshot that failed inspection would still have made the master
+# hostile, and the boot would refuse to seed from a cache that was fine until the
+# rejected content was unpacked into it.
+CACHE_STAGE="/opt/.ci-cache-incoming"
 
 # One subdirectory per tool, named for the tool rather than for the language, so
 # a tree lifted off a host is self-describing.
@@ -577,8 +584,32 @@ CACHE_DIRS=(npm yarn pnpm-store go-mod pip uv m2 nuget composer)
 # descend into it and re-own it. chmod has no --one-file-system at all, so the
 # scan and the walk cannot be given matching scopes; scanning everything the walk
 # will touch is the half that can actually be made true.
-cache_master_is_hostile() {
-  local bad
+#
+# Takes the tree to scan, defaulting to the master. It is called on TWO trees and
+# that is the point of the argument: once on a freshly unpacked snapshot, before
+# a byte of it reaches the master, and once on the master itself at lock time. The
+# second is not redundant — the master also carries whatever the image baked and
+# whatever survived the last boot, and the tree a snapshot lands in is exactly the
+# tree this refuses to distribute.
+#
+# In `strict` mode each walk is also bounded by whatever is left of the hydrate's
+# deadline, and running out is a refusal. A scan is three full tree walks, and a
+# snapshot of many millions of tiny files passes both the compressed-size and the
+# unpacked-size bounds while costing minutes of `getcap -r` — the delay the whole
+# budget exists to prevent, reached by going around it rather than through it. The
+# master's own scan is not bounded: it is the tree this host already has, and
+# refusing it for being slow would cost every slot its cache for no gain.
+cache_scan() { # <seconds-or-0> <cmd...>
+  local limit="$1"; shift
+  if [ "$limit" -gt 0 ]; then timeout "$limit" "$@"; else "$@"; fi
+}
+
+cache_master_is_hostile() { # [<tree>] [strict]
+  local bad root="${1:-$CACHE_MASTER}" limit=0
+  if [ "${2:-}" = "strict" ]; then
+    limit=$(( ${CACHE_DEADLINE:-0} - $(date +%s) ))
+    [ "$limit" -gt 0 ] || limit=1
+  fi
   # Symlinks and setuid/setgid bits are the obvious two. The rest are here
   # because `chmod -R go+rX` WIDENS permissions and `cp -a` preserves: a hardlink
   # to a file outside the tree would be made world-readable in place (an
@@ -586,12 +617,15 @@ cache_master_is_hostile() {
   # here), and device, fifo and socket nodes have no business in a dependency
   # cache. -links +1 is scoped to regular files because every directory has a
   # link count above one by construction.
-  bad=$(find "$CACHE_MASTER" \
+  bad=$(cache_scan "$limit" find "$root" \
     \( -type l -o -type b -o -type c -o -type p -o -type s \
        -o -perm /6000 -o \( -type f -a -links +1 \) \) \
-    -print -quit 2>/dev/null)
+    -print -quit 2>/dev/null) || {
+    log "refusing $root: it could not be scanned inside the remaining budget"
+    return 0
+  }
   if [ -n "$bad" ]; then
-    log "refusing $CACHE_MASTER: it holds a link, node or setuid entry ($bad)"
+    log "refusing $root: it holds a link, node or setuid entry ($bad)"
     return 0
   fi
   # File capabilities are invisible to -perm, and `cp -a` copies xattrs, so a
@@ -601,28 +635,383 @@ cache_master_is_hostile() {
   if command -v getcap >/dev/null 2>&1; then
     # No pipe into head: this script runs under `set -o pipefail`, and head
     # closing the pipe early can SIGPIPE getcap.
-    bad=$(getcap -r "$CACHE_MASTER" 2>/dev/null)
+    bad=$(cache_scan "$limit" getcap -r "$root" 2>/dev/null) || {
+      log "refusing $root: it could not be scanned for file capabilities inside the remaining budget"
+      return 0
+    }
     if [ -n "$bad" ]; then
-      log "refusing $CACHE_MASTER: it holds a file capability ($bad)"
+      log "refusing $root: it holds a file capability ($bad)"
       return 0
     fi
+  elif [ "${2:-}" = "strict" ]; then
+    # For the baked master a missing getcap is a gap worth seeing in the log: that
+    # tree was produced by a reviewed image build, so the scan is a second opinion.
+    # For a snapshot it is the ONLY opinion — nothing reviewed stands in front of
+    # it — and a check that can be skipped rather than failed is not a bound. So
+    # the caller that hands this untrusted content says `strict`, and an
+    # unscannable tree is a refused tree.
+    log "refusing $root: getcap is not installed, so it cannot be scanned for file capabilities"
+    return 0
   else
-    log "getcap not installed — $CACHE_MASTER not scanned for file capabilities"
+    log "getcap not installed — $root not scanned for file capabilities"
   fi
   # A dependency cache holds content addressed by hash, never credentials. If a
   # consumer's warm script left one behind, `chmod -R go+rX` would publish it to
   # every uid on the host and `cp -a` would then hand a copy to every slot. Refuse
   # rather than distribute it.
-  bad=$(find "$CACHE_MASTER" -type f \( \
+  bad=$(cache_scan "$limit" find "$root" -type f \( \
       -name '.npmrc' -o -name '.yarnrc' -o -name '.yarnrc.yml' -o -name '.netrc' \
       -o -name '.pypirc' -o -name '.git-credentials' -o -name 'auth.json' \
       -o -name 'settings.xml' -o -iname 'nuget.config' -o -name 'credentials' \
-    \) -print -quit 2>/dev/null)
+    \) -print -quit 2>/dev/null) || {
+    log "refusing $root: it could not be scanned for credential files inside the remaining budget"
+    return 0
+  }
   if [ -n "$bad" ]; then
-    log "refusing $CACHE_MASTER: it holds what looks like a credential file ($bad)"
+    log "refusing $root: it holds what looks like a credential file ($bad)"
     return 0
   fi
   return 1
+}
+
+# --- the snapshot the image did not bake ----------------------------------------
+#
+# The baked master is as old as the image. A pool that scales out under load —
+# which is the only time it scales out — hands every new host a cache from
+# whenever the image was cut, and the queue that caused the scale-out is served
+# by the coldest hosts in the fleet. The snapshot closes that gap: a small,
+# regularly published tarball of the same tree, unpacked over the baked one at
+# boot.
+#
+# FOUR PROPERTIES, AND EACH IS LOAD-BEARING.
+#
+# 1. READ ONLY, ALWAYS. This host never writes to the bucket, and its service
+#    account is granted `roles/storage.objectViewer` conditioned on this pool's
+#    prefix — no create, no delete, no other pool. A host executes job code, so a
+#    host that could publish would let whatever one job left in a cache become
+#    the starting cache of every later host in the pool: the cross-slot channel
+#    the per-slot copy closes, re-opened across hosts and across time. The
+#    publisher is a separate identity that never runs pull-request code.
+#
+# 2. BOUNDED, THEN ABANDONED. Everything here runs against one deadline. A slow
+#    or missing snapshot costs the FIRST job on this host a cold cache; a host
+#    that waits on it costs the pool a host, and the pool answers a missing host
+#    by queueing jobs. So the budget is small and every failure returns.
+#
+# 3. AGED OUT HERE TOO. The bucket deletes snapshots at its own age bound, and
+#    this refuses one older than its own limit. Two bounds because they fail
+#    differently: the bucket's holds if this script is broken, this one holds if
+#    the lifecycle rule is edited away in the console — and lifecycle deletion is
+#    asynchronous, so the bucket's bound alone is soft by up to a day.
+#
+# 4. INSPECTED BEFORE IT IS TRUSTED. What arrives is untrusted build input that
+#    did not pass through the image build's gate, so it passes through the same
+#    scan at boot, in a staging tree, before anything reaches the master. The
+#    scan is cache_master_is_hostile() and this is the reason it takes an
+#    argument.
+
+# Fetch one object from this pool's prefix. Storage JSON API rather than
+# `gcloud storage`: it is one curl against a documented URL with the instance's
+# own token, with no dependency on which gcloud is on the image and no config
+# directory to leave behind.
+cache_fetch() { # <object-suffix> <dest> <seconds> [<query>] [<max-bytes>]
+  # Only `/` needs encoding. Every name reaching here is either this script's own
+  # literal or has been matched against a whitelist that permits nothing else
+  # outside [A-Za-z0-9._-], which is why a general percent-encoder is not needed
+  # and its absence is not a gap.
+  local enc
+  enc=$(printf '%s%s' "$CACHE_PREFIX" "$1" | sed 's|/|%2F|g')
+  [ "$3" -gt 0 ] || return 1
+  # THE TOKEN IS NOT AN ARGUMENT, AND THAT IS A SECURITY PROPERTY, NOT A STYLE.
+  # `-H "Authorization: Bearer $CACHE_TOKEN"` would put the instance's own
+  # cloud-platform token in this process's argv, and /proc/<pid>/cmdline is
+  # world-readable: a job step running as a slot user reads it with `cat`. That
+  # token is the HOST identity — it impersonates the job account and reads the
+  # GitHub App key out of Secret Manager — and the per-uid REJECT to the metadata
+  # server exists precisely so job code cannot obtain it. Handing it over in argv
+  # would route around that rule. Startup and the slot agents are not ordered
+  # against each other, so on a reboot of a warm host this runs while jobs run.
+  #
+  # So it goes over a pipe: curl reads its config from a file descriptor, and
+  # /proc/<pid>/fd of a root process is root-only. `printf` is a shell builtin, so
+  # the subshell never execs anything that could carry the token in ITS argv
+  # either. No temp file, so nothing to leave behind or to race.
+  #
+  # --max-filesize bounds the response before it lands on disk. Without it the
+  # only bound on a response is the deadline, and /opt is what fills.
+  #
+  # `Accept-Encoding: gzip` is not an optimisation. An object stored with
+  # `Content-Encoding: gzip` is decompressively transcoded by the service unless
+  # the client says it accepts gzip, and a transcoded response arrives chunked
+  # with no Content-Length — which is the one case --max-filesize cannot bound in
+  # advance. Asking for gzip means the bytes arrive exactly as stored, so the
+  # size the metadata reported is the size that lands.
+  curl --connect-timeout 5 --max-time "$3" -fsS \
+    --max-filesize "${5:-65536}" \
+    -K <(printf 'header = "Authorization: Bearer %s"\nheader = "Accept-Encoding: gzip"\n' "$CACHE_TOKEN") \
+    -o "$2" \
+    "https://storage.googleapis.com/storage/v1/b/$CACHE_BUCKET/o/$enc${4:-?alt=media}" \
+    2>/dev/null
+}
+
+# The token outlives no more of this script than it has to. hydrate_shared_cache
+# has a dozen early returns and each one would need its own `unset`, so the
+# clearing happens here, once, on every path out — including the ones a later
+# edit adds.
+hydrate_shared_cache() {
+  local rc=0
+  hydrate_shared_cache_bounded || rc=$?
+  unset CACHE_TOKEN CACHE_DEADLINE
+  return "$rc"
+}
+
+hydrate_shared_cache_bounded() {
+  CACHE_BUCKET=$(md "instance/attributes/ci-cache-bucket")
+  if [ -z "${CACHE_BUCKET:-}" ]; then
+    log "no snapshot bucket configured — this host runs on the cache its image baked"
+    return 0
+  fi
+  CACHE_PREFIX=$(md "instance/attributes/ci-cache-prefix")
+  # The prefix is what the read grant is conditioned on, so an empty one is not a
+  # harmless default: it would send every request outside the condition, and the
+  # 403s would read as "the snapshot is missing" in the log rather than as a
+  # misconfigured pool.
+  case "$CACHE_PREFIX" in
+    */) : ;;
+    *) log "cache prefix '${CACHE_PREFIX:-}' is not a directory prefix — skipping hydrate"; return 0 ;;
+  esac
+
+  local budget max_age_hours max_bytes
+  budget=$(md "instance/attributes/ci-cache-budget-seconds")
+  max_age_hours=$(md "instance/attributes/ci-cache-max-age-hours")
+  max_bytes=$(md "instance/attributes/ci-cache-max-bytes")
+  # Defaults live in Terraform, which validates them. These exist for the host
+  # that boots from an older template, where the key is simply absent.
+  case "$budget" in ''|*[!0-9]*) budget=60 ;; esac
+  case "$max_age_hours" in ''|*[!0-9]*) max_age_hours=168 ;; esac
+  case "$max_bytes" in ''|*[!0-9]*) max_bytes=4294967296 ;; esac
+  # The same ranges Terraform validates, applied again here, because metadata is
+  # not only written by Terraform: anyone who can set an instance's metadata can
+  # set `ci-cache-budget-seconds` to a number that holds registration open for as
+  # long as they like. A shape check alone accepts that number.
+  [ "$budget" -ge 10 ] || budget=10
+  [ "$budget" -le 300 ] || budget=300
+  [ "$max_age_hours" -ge 1 ] || max_age_hours=1
+  [ "$max_age_hours" -le 720 ] || max_age_hours=720
+  [ "$max_bytes" -ge 1048576 ] || max_bytes=1048576
+  [ "$max_bytes" -le 34359738368 ] || max_bytes=34359738368
+
+  local started deadline
+  started=$(date +%s)
+  deadline=$((started + budget))
+  # A global, because the inspection is bounded by the same deadline and it runs
+  # inside a function shared with the master's own lock. Cleared by the wrapper.
+  CACHE_DEADLINE=$deadline
+
+  CACHE_TOKEN=$(md "instance/service-accounts/default/token" \
+    | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ -z "${CACHE_TOKEN:-}" ]; then
+    log "no instance token — skipping cache hydrate"
+    return 0
+  fi
+
+  local tmp
+  tmp=$(mktemp -d /opt/.ci-cache-dl.XXXXXX) || return 0
+  # Root-owned 0700 from creation. Nothing else on this host may read, still less
+  # substitute, a name inside the directory root is about to unpack an archive
+  # into — the rule the whole cache section is built on.
+  chmod 0700 "$tmp" || { rm -rf "$tmp"; return 0; }
+
+  # The pointer names the current snapshot. It is a separate, tiny object because
+  # the snapshots themselves must never be overwritten: the bucket measures age
+  # per generation and an overwrite starts a new one at zero, so a snapshot key
+  # rewritten in place would never reach the age bound and never expire.
+  if ! cache_fetch "current" "$tmp/current" "$((deadline - $(date +%s)))"; then
+    log "no cache snapshot published for this pool yet — running on the baked cache"
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  local snap
+  snap=$(head -n 1 "$tmp/current" | tr -d '\r\n')
+  # A whitelist, not a sanitiser. The pointer is written by the trusted publisher,
+  # but it is still the one input here that names a path, and this is what keeps
+  # it from naming anything but a snapshot in this pool's own prefix: no `/`, so
+  # no traversal and no other pool; no `..`; nothing outside a character set that
+  # needs no encoding.
+  case "$snap" in
+    *[!A-Za-z0-9._-]* | '' | .* )
+      # The rejected name is NOT echoed. It is the one fully attacker-controlled
+      # string here, it has not been validated at the point this line runs, and
+      # this log goes to a file an operator reads in a terminal.
+      log "the cache pointer does not name a snapshot in this pool's prefix (${#snap} bytes) — ignoring it"
+      rm -rf "$tmp"
+      return 0
+      ;;
+  esac
+
+  # Size and creation time from the service, not from the name. A timestamp
+  # encoded in the object name is written by whoever wrote the object;
+  # `timeCreated` is the service's own record of the generation, and the age
+  # bound is worth having only if it reads the one that cannot be backdated.
+  if ! cache_fetch "$snap" "$tmp/meta" "$((deadline - $(date +%s)))" "?fields=timeCreated,size,generation"; then
+    log "cache snapshot $snap is named by the pointer but could not be read — running on the baked cache"
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  local created size age gen
+  created=$(sed -n 's/.*"timeCreated"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp/meta")
+  size=$(sed -n 's/.*"size"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' "$tmp/meta")
+  # The generation, so that what is measured is what is downloaded. Age, size and
+  # free space are asserted here and the bytes arrive later; without pinning, the
+  # object could be replaced in between and every one of those bounds would have
+  # been checked against a generation that no longer exists. "Snapshots are
+  # written once" is the publisher's convention — it is not a control this host
+  # can enforce, so this host does not rely on it.
+  gen=$(sed -n 's/.*"generation"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' "$tmp/meta")
+  created=$(date -u -d "$created" +%s 2>/dev/null) || created=""
+  if [ -z "$created" ] || [ -z "$size" ] || [ -z "$gen" ]; then
+    log "cache snapshot $snap has no readable size, generation or creation time — refusing it"
+    rm -rf "$tmp"
+    return 0
+  fi
+  age=$(( (started - created) / 3600 ))
+  if [ "$age" -ge "$max_age_hours" ]; then
+    log "cache snapshot $snap is ${age}h old, past the ${max_age_hours}h bound — starting cold instead"
+    rm -rf "$tmp"
+    return 0
+  fi
+  if [ "$size" -gt "$max_bytes" ]; then
+    log "cache snapshot $snap is $size bytes, past the $max_bytes bound — refusing it"
+    rm -rf "$tmp"
+    return 0
+  fi
+  # Eight times the compressed size, and the multiple is not arbitrary: the
+  # archive, the tree it unpacks to and the tree already in the master all sit on
+  # this disk at once, and a dependency cache compresses about threefold. Filling
+  # the boot disk to warm a cache would cost this host every job it was about to
+  # run, which is a far worse trade than starting cold.
+  local free_kb
+  free_kb=$(df -Pk /opt | awk 'NR==2 {print $4}')
+  if [ -z "${free_kb:-}" ] || [ "$((free_kb * 1024))" -lt "$((size * 8))" ]; then
+    log "not enough free space on /opt for a $size byte snapshot — starting cold instead"
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  if ! cache_fetch "$snap" "$tmp/snap.tar.gz" "$((deadline - $(date +%s)))" \
+      "?alt=media&generation=$gen" "$size"; then
+    log "cache snapshot $snap did not download inside the ${budget}s budget — starting cold instead"
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  rm -rf "$CACHE_STAGE"
+  if ! mkdir -p "$CACHE_STAGE" || ! chmod 0700 "$CACHE_STAGE"; then
+    rm -rf "$tmp"
+    return 0
+  fi
+  # --no-same-owner and --no-same-permissions: what is in the archive decides
+  # nothing about ownership or mode. Everything lands root-owned under root's
+  # umask, and the master's own lock re-applies the modes afterwards regardless.
+  # --no-xattrs --no-acls --no-selinux for the same reason one layer down, and
+  # this one is load-bearing rather than tidy: a `security.capability` xattr is
+  # invisible to the mode bits, survives the `chown -Rh root:root` the master lock
+  # applies, is published by `chmod -R go+rX` and is copied into every slot by
+  # `cp -a`. GNU tar does not restore xattrs unless asked, so the flags change
+  # nothing today — they are here so that a tar that decides otherwise, or an
+  # image that ships a different tar, does not silently change what a snapshot can
+  # carry. The scan below refuses capabilities as well; two layers, because the
+  # scan needs a tool on the image and this does not. (`--no-selinux` is not
+  # here: it is GNU-only, these images carry no SELinux, and an unknown option
+  # would make tar fail on every boot — a hydrate that never works, logged as a
+  # budget overrun.)
+  #
+  # WHAT MUST NEVER BE ADDED TO THIS LINE: `-P`/`--absolute-names`, and
+  # `--keep-directory-symlink`. The staging tree is what confines an adversarial
+  # archive, and it is tar's DEFAULTS that confine it — a leading `/` and a
+  # leading `../` are stripped, and a directory member landing on a symlink
+  # replaces it instead of following it. Each of those flags turns one of those
+  # defaults off, and the scan afterwards only sees what stayed inside the tree.
+  #
+  # `timeout` because tar is where a large or adversarial archive spends its time,
+  # and the budget has to bind the slowest step or it binds nothing. The clamp is
+  # not cosmetic: a budget already spent gives a negative number, and `timeout -3`
+  # is a parse error, which fails open by accident instead of on purpose.
+  #
+  # The decompression runs through `head -c` because `max_bytes` bounds the
+  # COMPRESSED archive and gzip expands by more than a thousandfold on the right
+  # input: a 4 MiB tarball can fill the boot disk, and the free-space check ahead
+  # of it reserved eight times the compressed size, not eight times whatever it
+  # holds. head closing the pipe truncates the stream, tar fails on a truncated
+  # archive, and the snapshot is refused — which is the wanted answer.
+  local left=$((deadline - $(date +%s)))
+  [ "$left" -gt 0 ] || left=1
+  if ! timeout "$left" gzip -dc "$tmp/snap.tar.gz" 2>/dev/null \
+      | head -c "$((size * 8))" \
+      | tar -x -C "$CACHE_STAGE" \
+          --no-same-owner --no-same-permissions --no-xattrs --no-acls \
+          2>/dev/null; then
+    log "cache snapshot $snap did not unpack inside the ${budget}s budget — starting cold instead"
+    rm -rf "$tmp" "$CACHE_STAGE"
+    return 0
+  fi
+  rm -rf "$tmp"
+
+  # The same scan the image build runs and the master lock runs, on content that
+  # passed through neither. A snapshot is the one way into this tree that no
+  # reviewed build step stands in front of.
+  if cache_master_is_hostile "$CACHE_STAGE" strict; then
+    log "cache snapshot $snap rejected by the same scan the image build runs — starting cold instead"
+    rm -rf "$CACHE_STAGE"
+    return 0
+  fi
+
+  # Only the tool directories this host knows about, by name. A snapshot cannot
+  # introduce a new top-level entry into the master: anything the archive holds
+  # that is not one of these is dropped with the staging tree, so a name added to
+  # the publisher has to be added here — and reviewed — before it can arrive.
+  #
+  # A directory is REPLACED rather than merged. The snapshot is produced from this
+  # same image, so it is a superset of what was baked; a merge would be slower,
+  # would not be atomic, and would leave entries from an expired snapshot alive in
+  # the master indefinitely, which is the age bound quietly failing.
+  # Unconditionally, and before the loop rather than inside it: a boot that died
+  # between the aside-move and the replacement leaves one of these behind, and a
+  # sweep that only runs for directories the NEXT snapshot happens to ship would
+  # leave it there indefinitely — a full duplicate cache tree that lock_shared_cache
+  # then publishes read-only to every uid on the host.
+  local stale
+  for stale in "$CACHE_MASTER"/.*.previous; do
+    [ -e "$stale" ] && rm -rf "$stale"
+  done
+
+  local d took=0 n=0
+  for d in "${CACHE_DIRS[@]}"; do
+    [ -d "$CACHE_STAGE/$d" ] || continue
+    # The baked directory is moved ASIDE, not deleted, and only dropped once its
+    # replacement is in place. Deleting first is one failed rename away from a
+    # host with neither copy — the snapshot path is allowed to leave the cache as
+    # cold as it found it, never colder.
+    if [ -d "$CACHE_MASTER/$d" ] \
+       && ! mv -T "$CACHE_MASTER/$d" "$CACHE_MASTER/.$d.previous" 2>/dev/null; then
+      continue
+    fi
+    # A rename, not a copy: same filesystem, so it costs nothing and cannot half
+    # finish. Nothing reads the master until seed_slot_cache runs later in this
+    # same script, so there is no reader to tear.
+    if mv -T "$CACHE_STAGE/$d" "$CACHE_MASTER/$d" 2>/dev/null; then
+      n=$((n + 1))
+    else
+      mv -T "$CACHE_MASTER/.$d.previous" "$CACHE_MASTER/$d" 2>/dev/null || true
+    fi
+    rm -rf "$CACHE_MASTER/.$d.previous"
+  done
+  rm -rf "$CACHE_STAGE"
+
+  took=$(( $(date +%s) - started ))
+  log "cache hydrated from $snap: $n tool cache(s), $size bytes, ${age}h old, ${took}s of a ${budget}s budget"
 }
 
 # Make the master read-only to everything but root.
@@ -1534,6 +1923,12 @@ main() {
   for i in $(seq 1 "$SLOTS"); do
     provision_slot_user "$i" || die "could not provision the user for slot $i"
   done
+  # Before provision_shared_cache, and the order is the security argument rather
+  # than a preference: everything a snapshot brings has to be in the master while
+  # the master is still being scanned and locked. Hydrating afterwards would land
+  # unscanned content in a tree already declared read-only and safe, and the seed
+  # would hand a copy of it to every slot. Fails OPEN, like everything else here.
+  hydrate_shared_cache || true
   # After the slot users, because each slot's cache is chowned to its user, and
   # before install_slot, because that reads whether a slot has a cache to decide
   # whether to point the agent at it. Fails OPEN: the return value is deliberately

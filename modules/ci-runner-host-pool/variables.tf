@@ -26,6 +26,19 @@ variable "name" {
     published metric. Must be unique within the project.
   EOT
   type        = string
+
+  validation {
+    # This is the string the cache prefix is built from, and that prefix is
+    # interpolated into a CEL expression inside a quoted literal on the read
+    # grant. A name carrying a double quote would close that literal and could
+    # rewrite the condition into one that matches everything — the isolation
+    # between one pool's snapshots and another's rests on this one value. The same
+    # name also reaches a URL the host builds at boot, where `?`, `&` and `#`
+    # would each mean something. So it is confined to the shape GCP resource names
+    # take anyway, which every existing pool already satisfies.
+    condition     = can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.name))
+    error_message = "name must be 1-63 characters, lowercase letters, digits and hyphens, starting with a letter and not ending in a hyphen."
+  }
 }
 
 variable "github_owner" {
@@ -511,5 +524,101 @@ variable "recycle_max_unavailable" {
   validation {
     condition     = var.recycle_max_unavailable >= 0
     error_message = "recycle_max_unavailable cannot be negative; 0 disables stale-template recycling."
+  }
+}
+
+# --- the cache snapshot ---------------------------------------------------------
+
+variable "cache_snapshot_bucket" {
+  description = <<-EOT
+    Name of the `ci-runner-cache-bucket` this pool hydrates its dependency cache
+    from at boot. Empty (the default) turns the whole snapshot layer off: no IAM
+    grant is created, no metadata is passed, and hosts run on the cache their
+    image baked.
+
+    Setting it grants this pool's HOST service account
+    `roles/storage.objectViewer` on that bucket, conditioned on this pool's own
+    object prefix. Read only, and never write: a host executes job code, so a
+    host that could publish a snapshot would let whatever one job left in a cache
+    become the starting cache of every later host in the pool. Publishing belongs
+    to a separate identity that never runs pull-request code.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    # The other half of the same door `name` closes. This value is interpolated
+    # into the read grant's CEL condition inside a quoted literal, so a bucket
+    # name carrying a double quote could close that literal and rewrite the
+    # expression into one that is unconditionally true — turning a grant scoped to
+    # this pool's prefix into bucket-wide `objectViewer` over every pool's
+    # snapshots. Validating the pool name and not this one would close one of two
+    # identical doors. The shape is GCS's own, which every real bucket satisfies.
+    condition     = var.cache_snapshot_bucket == "" || can(regex("^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$", var.cache_snapshot_bucket))
+    error_message = "cache_snapshot_bucket must be a bucket NAME (3-63 characters, lowercase letters, digits, dots, hyphens and underscores), not a gs:// URL, or empty to turn the snapshot layer off."
+  }
+}
+
+variable "cache_snapshot_max_age_hours" {
+  description = <<-EOT
+    Refuse a snapshot older than this at boot and start cold instead.
+
+    The second of two bounds on how long a poisoned cache entry can be served.
+    The bucket's lifecycle rule is the first; this one exists because the two
+    fail differently — the bucket's holds if the host script is broken, this one
+    holds if the lifecycle rule is edited away in the console, and lifecycle
+    deletion is asynchronous, so on its own the bucket's bound is soft by up to a
+    day.
+
+    Keep it at or below the bucket's `snapshot_max_age_days`. Above it the bound
+    is the bucket's and this number is decoration.
+  EOT
+  type        = number
+  default     = 168
+
+  validation {
+    condition     = var.cache_snapshot_max_age_hours >= 1 && var.cache_snapshot_max_age_hours <= 720
+    error_message = "cache_snapshot_max_age_hours must be between 1 and 720 (30 days), the range the bucket's own age bound can be set to."
+  }
+}
+
+variable "cache_hydrate_budget_seconds" {
+  description = <<-EOT
+    Total time a booting host may spend fetching, unpacking and inspecting a
+    snapshot before it gives up and registers with the cache it already has.
+
+    A missing or slow snapshot costs the FIRST job on this host a cold cache. A
+    host that waits on one costs the pool a host, and the pool answers a missing
+    host by queueing jobs — so the budget is deliberately small, and every step
+    inside it fails open.
+  EOT
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.cache_hydrate_budget_seconds >= 10 && var.cache_hydrate_budget_seconds <= 300
+    error_message = "cache_hydrate_budget_seconds must be between 10 and 300: below 10 no snapshot of a useful size can arrive, and above 300 a stuck download delays registration by longer than a cold boot would have cost."
+  }
+}
+
+variable "cache_snapshot_max_bytes" {
+  description = <<-EOT
+    Refuse a snapshot larger than this.
+
+    The archive, the tree it unpacks into and the tree already in the master all
+    sit on the boot disk at once, so this and `boot_disk_size_gb` are one
+    decision. Filling the disk to warm a cache costs the host every job it was
+    about to run, which is a far worse trade than starting cold.
+  EOT
+  type        = number
+  default     = 4294967296
+
+  validation {
+    # An upper bound as well as a lower one, so that the host's own clamp and this
+    # validation agree on the range rather than the host quietly being the only
+    # real bound. 32 GiB is past any dependency cache and short of any plausible
+    # boot disk.
+    condition     = var.cache_snapshot_max_bytes >= 1048576 && var.cache_snapshot_max_bytes <= 34359738368
+    error_message = "cache_snapshot_max_bytes must be between 1 MiB and 32 GiB; below that no real dependency cache fits, above it no boot disk does."
   }
 }

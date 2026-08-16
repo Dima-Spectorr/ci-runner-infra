@@ -68,6 +68,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/../../modules/ci-runner-host-pool/scripts/host-startup.sh"
 PACKER="$HERE/../../packer/ci-host-image.pkr.hcl"
+POOLTF="$HERE/../../modules/ci-runner-host-pool/main.tf"
+POOLVARS="$HERE/../../modules/ci-runner-host-pool/variables.tf"
 
 PASS=0
 FAIL=0
@@ -77,6 +79,8 @@ bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
 
 [ -f "$SCRIPT" ] || { echo "FAIL: missing $SCRIPT"; exit 1; }
 [ -f "$PACKER" ] || { echo "FAIL: missing $PACKER"; exit 1; }
+[ -f "$POOLTF" ] || { echo "FAIL: missing $POOLTF"; exit 1; }
+[ -f "$POOLVARS" ] || { echo "FAIL: missing $POOLVARS"; exit 1; }
 
 # Code only: full-line comments stripped, so the prose explaining an invariant
 # can never be what satisfies the check for it. This matters more here than
@@ -238,16 +242,21 @@ has_hostile_entry_refusal() { # <file>
   code=$(code_of "$1")
   # shellcheck disable=SC1003  # the trailing `\\` is an ERE for the literal
   # line-continuation backslash the scan is wrapped with, not a quote escape.
-  matches "$code" 'find "\$CACHE_MASTER" \\'                        || return 1
+  matches "$code" 'find "\$root" \\'                                || return 1
   matches "$code" '\-type l -o -type b -o -type c -o -type p -o -type s' || return 1
   matches "$code" '\-perm /6000 -o \\\( -type f -a -links \+1 \\\)' || return 1
-  matches "$code" 'getcap -r "\$CACHE_MASTER"'                      || return 1
+  matches "$code" 'getcap -r "\$root"'                              || return 1
   # A credential in a content-addressed cache is not cache content.
   matches "$code" "name '\.npmrc'"                                  || return 1
   # NOT -xdev on the scan. chmod has no --one-file-system, so the walk descends
   # into a bind mount whatever the scan does; a scan that skipped one would hide
   # exactly the entries the walk then re-owns and widens.
-  ! matches "$code" 'find "\$CACHE_MASTER" -xdev'                   || return 1
+  ! matches "$code" 'find "\$root" -xdev'                           || return 1
+  # The scan takes the tree as an argument and defaults to the master. This is
+  # what lets ONE scanner cover both the master and a freshly unpacked snapshot;
+  # a scanner hard-wired to the master would leave the snapshot — the only route
+  # into this tree that no reviewed build step stands in front of — unscanned.
+  matches "$code" 'local bad root="\$\{1:-\$CACHE_MASTER\}"'        || return 1
 }
 
 # A tool must never see a half-copied cache directory at the path it reads.
@@ -333,6 +342,162 @@ has_packer_gate_that_aborts() { # <file>
   matches "$code" 'chmod -R go-w,go\+rX /opt/ci-cache' || return 1
 }
 
+# --- the snapshot hydrate -------------------------------------------------------
+
+# A host READS the snapshot bucket and never writes it, and reads only its own
+# pool's prefix. This is the whole security argument for the snapshot layer, and
+# it lives in an IAM grant nobody looks at again after it is written — so it is
+# asserted here instead.
+has_read_only_cache_grant() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'role[[:space:]]+= "roles/storage\.objectViewer"' || return 1
+  # objectUser and objectAdmin both carry storage.objects.create and .delete. A
+  # host that can create an object in this bucket can publish what the next host
+  # boots from, which is one job handing code to every future job in the pool.
+  ! matches "$code" 'roles/storage\.objectUser'    || return 1
+  ! matches "$code" 'roles/storage\.objectAdmin'   || return 1
+  ! matches "$code" 'roles/storage\.objectCreator' || return 1
+  ! matches "$code" 'roles/storage\.admin'         || return 1
+  # Conditioned on the prefix, or eight pools in one bucket are one pool.
+  matches "$code" 'expression[[:space:]]+= "resource\.name\.startsWith' || return 1
+  matches "$code" '\$\{local\.cache_prefix\}'                          || return 1
+  # ONE expression for the prefix, shared by the condition and the host. Written
+  # twice they drift, and the drift is silent: every read lands outside the grant
+  # and 403s, which the host logs as "no snapshot published yet".
+  matches "$code" '^  cache_prefix = "cache/\$\{var\.name\}/"' || return 1
+  matches "$code" '"ci-cache-prefix"' || return 1
+}
+
+# The hydrate is bounded and every step inside it returns rather than aborting
+# the boot. A host that waits on a snapshot is a host the pool does not have, and
+# the pool answers a missing host by queueing jobs.
+has_bounded_hydrate() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'deadline=\$\(\(started \+ budget\)\)'      || return 1
+  # Every network call carries the remaining budget, and a call handed a budget
+  # already spent does not run at all.
+  matches "$code" 'curl --connect-timeout 5 --max-time "\$3"' || return 1
+  matches "$code" '\[ "\$3" -gt 0 \] \|\| return 1'           || return 1
+  # tar is where a large archive spends its time, so it is bounded too — with the
+  # clamp, because `timeout -3` is a parse error rather than a timeout.
+  matches "$code" 'timeout "\$left"'                          || return 1
+  matches "$code" '\[ "\$left" -gt 0 \] \|\| left=1'          || return 1
+  # Fails open at the call site and inside: no `die`, and no `return 1` path that
+  # the caller could mistake for a reason to stop.
+  matches "$code" 'hydrate_shared_cache \|\| true'            || return 1
+  ! matches "$code" 'hydrate_shared_cache.*\|\| die'          || return 1
+}
+
+# Everything a snapshot brings is inspected before a byte of it reaches the
+# master, and it is inspected by the SAME scan the image build runs. A snapshot
+# is the one route into this tree with no reviewed build step in front of it.
+has_snapshot_inspection() { # <file>
+  local code
+  code=$(code_of "$1")
+  # Staged outside the master. Inside it, a rejected snapshot would already have
+  # made the master hostile by the time the scan said so.
+  matches "$code" '^CACHE_STAGE="/opt/\.ci-cache-incoming"'      || return 1
+  matches "$code" 'tar -x -C "\$CACHE_STAGE"'                    || return 1
+  matches "$code" '\-\-no-same-owner --no-same-permissions --no-xattrs --no-acls' || return 1
+  # And nothing that turns off the tar defaults the staging tree relies on.
+  ! matches "$code" 'tar .*(--absolute-names|--keep-directory-symlink| -P )' || return 1
+  # The inspection is inside the deadline too: three tree walks over a snapshot of
+  # many millions of tiny files is the delay the budget exists to prevent, reached
+  # by going around it.
+  matches "$code" 'CACHE_DEADLINE=\$deadline'                    || return 1
+  matches "$code" 'cache_scan "\$limit" find "\$root"'           || return 1
+  matches "$code" 'cache_scan "\$limit" getcap -r "\$root"'      || return 1
+  # `strict`, because for a snapshot the scan is the only opinion there is: an
+  # unscannable tree has to be a refused tree, not a logged one.
+  matches "$code" 'cache_master_is_hostile "\$CACHE_STAGE" strict' || return 1
+  matches "$code" 'elif \[ "\$\{2:-\}" = "strict" \]'            || return 1
+  # max_bytes bounds the COMPRESSED archive and gzip expands by more than a
+  # thousandfold on the right input, so the decompressed stream is bounded too.
+  matches "$code" 'head -c "\$\(\(size \* 8\)\)"'                || return 1
+  # A whitelist on the way in: only the tool directories this host already knows
+  # about move, so a snapshot cannot introduce a new top-level name.
+  matches "$code" 'for d in "\$\{CACHE_DIRS\[@\]\}"; do'         || return 1
+  matches "$code" 'mv -T "\$CACHE_STAGE/\$d" "\$CACHE_MASTER/\$d"' || return 1
+  # And a whitelist on the pointer, the one input here that names a path.
+  matches "$code" '\*\[!A-Za-z0-9\._-\]\* \| .. \| \.\* \)'      || return 1
+  # The hydrate runs BEFORE the master is scanned and locked, or unscanned
+  # content lands in a tree already declared safe and is seeded to every slot.
+  matches "$code" 'hydrate_shared_cache \|\| true'               || return 1
+  # Which of the two comes FIRST, not merely that both are present. A here-string
+  # rather than a pipe: awk exits at the first match, and under `pipefail` a
+  # writer that takes SIGPIPE would turn a correct answer into a failure.
+  local first
+  first=$(awk '/^  (hydrate|provision)_shared_cache \|\| true$/ {print $1; exit}' <<<"$code")
+  [ "$first" = "hydrate_shared_cache" ] || return 1
+}
+
+# The age bound is read from the service, not from the object's name. A snapshot
+# whose name carries a timestamp is a snapshot whose age is asserted by whoever
+# wrote it; `timeCreated` is the service's own record of that generation.
+has_service_attested_age() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" '\?fields=timeCreated,size,generation'      || return 1
+  matches "$code" '"timeCreated"'                             || return 1
+  # And what was measured is what is downloaded. Without the generation pinned,
+  # age, size and free space are all asserted against a generation that need not
+  # be the one that arrives.
+  matches "$code" '\?alt=media&generation=\$gen'              || return 1
+  matches "$code" 'age=\$\(\( \(started - created\) / 3600 \)\)' || return 1
+  matches "$code" '\[ "\$age" -ge "\$max_age_hours" \]'       || return 1
+  # A size bound and a free-space bound, because filling the boot disk to warm a
+  # cache costs this host every job it was about to run.
+  matches "$code" '\[ "\$size" -gt "\$max_bytes" \]'          || return 1
+  matches "$code" 'df -Pk /opt'                               || return 1
+}
+
+# The instance token never becomes a process argument. /proc/<pid>/cmdline is
+# world-readable, the slot agents are not ordered against the startup script, and
+# that token is the HOST identity — it impersonates the job account and reads the
+# GitHub App key. The per-uid REJECT to the metadata server is the rule this would
+# route around.
+has_token_out_of_argv() { # <file>
+  local code
+  code=$(code_of "$1")
+  # Scoped to the cache token. The registration call and the App JWT above it put
+  # their own secrets in argv on the same channel; those predate this layer and
+  # are tracked separately, and widening this check to them would fail today for a
+  # reason that has nothing to do with the snapshot.
+  ! matches "$code" '\-H "Authorization: Bearer \$CACHE_TOKEN' || return 1
+  matches "$code" '\-K <\(printf .header = "Authorization: Bearer' || return 1
+  # Cleared on every path out of the hydrate, which is why the hydrate is a
+  # wrapper around the body rather than one function with a dozen early returns.
+  matches "$code" 'unset CACHE_TOKEN'                          || return 1
+  # A response is bounded before it lands on disk, not only by the deadline.
+  matches "$code" '\-\-max-filesize "\$\{5:-65536\}"'          || return 1
+  matches "$code" 'cache_fetch "\$snap" "\$tmp/snap\.tar\.gz"' || return 1
+}
+
+# The bounds a host applies are the bounds Terraform validated, applied again on
+# the host: metadata is not written only by Terraform, and a shape check accepts
+# any number at all.
+has_clamped_metadata_bounds() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" '\[ "\$budget" -le 300 \] \|\| budget=300'   || return 1
+  matches "$code" '\[ "\$max_age_hours" -le 720 \]'            || return 1
+  matches "$code" '\[ "\$max_bytes" -ge 1048576 \]'            || return 1
+}
+
+# The pool name is the string the cache prefix is built from, and that prefix is
+# interpolated into a CEL literal on the read grant. A quote in it rewrites the
+# condition.
+has_constrained_pool_name() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'regex\("\^\[a-z\]\(\[-a-z0-9\]\{0,61\}\[a-z0-9\]\)\?\$", var\.name\)' || return 1
+  # Both halves of the same door: the bucket name is interpolated into that same
+  # CEL literal, and validating one and not the other closes neither.
+  matches "$code" 'regex\(.*, var\.cache_snapshot_bucket\)'   || return 1
+}
+
 # --- the real script ------------------------------------------------------------
 
 run() { # <name> <fn> <file>
@@ -350,6 +515,13 @@ run 'the seed is published atomically'                   has_atomic_seed        
 run 'no concurrency-unsafe cache is shared'              has_no_unsafe_sharing     "$SCRIPT"
 run 'a cache failure never blocks registration'          has_fail_open             "$SCRIPT"
 run 'slot primary group is asserted'                     has_primary_group_assert  "$SCRIPT"
+run 'the host may read its own cache prefix and nothing else' has_read_only_cache_grant "$POOLTF"
+run 'the hydrate is bounded and fails open'              has_bounded_hydrate       "$SCRIPT"
+run 'a snapshot is inspected before it reaches the master' has_snapshot_inspection "$SCRIPT"
+run 'snapshot age comes from the service, not the name'  has_service_attested_age  "$SCRIPT"
+run 'the instance token never becomes a process argument' has_token_out_of_argv   "$SCRIPT"
+run 'metadata-supplied bounds are clamped on the host'   has_clamped_metadata_bounds "$SCRIPT"
+run 'the pool name cannot rewrite the IAM condition'     has_constrained_pool_name "$POOLVARS"
 
 # --- the mutations --------------------------------------------------------------
 #
@@ -433,15 +605,17 @@ mutate 'the 0700 goes back on the cold path only' has_usable_private_slot_cache 
   's@^(\s*)chmod 0700 "\$dst/\$d"@\1[ -d "$dst/$d" ] || chmod 0700 "$dst/$d"@'
 
 mutate 'the hostile-entry scan is dropped' has_hostile_entry_refusal \
-  's@^  bad=\$\(find "\$CACHE_MASTER" \\$@  bad=@'
+  's@^  bad=\$\(cache_scan "\$limit" find "\$root" \\$@  bad=@'
 mutate 'the scan stops looking for smuggled hardlinks' has_hostile_entry_refusal \
   's@-perm /6000 -o \\\( -type f -a -links \+1 \\\)@-perm /6000@'
 mutate 'file capabilities stop being scanned' has_hostile_entry_refusal \
-  's@getcap -r "\$CACHE_MASTER"@true "$CACHE_MASTER"@'
+  's@getcap -r "\$root"@true "$root"@'
+mutate 'the scan is hard-wired back to the master' has_hostile_entry_refusal \
+  's@^  local bad root="\$\{1:-\$CACHE_MASTER\}" limit=0$@  local bad@'
 mutate 'credentials stop being scanned' has_hostile_entry_refusal \
   "s@name '\\.npmrc'@name '.nothing'@"
 mutate 'the scan skips other filesystems again' has_hostile_entry_refusal \
-  's@^  bad=\$\(find "\$CACHE_MASTER" \\$@  bad=$(find "$CACHE_MASTER" -xdev \\@'
+  's@^  bad=\$\(cache_scan "\$limit" find "\$root" \\$@  bad=$(cache_scan "$limit" find "$root" -xdev \\@'
 
 mutate 'a torn seed becomes visible' has_atomic_seed \
   's|"\$dst/\.seed-\$d"|"$dst/$d"|g'
@@ -472,6 +646,73 @@ mutate_file "$PACKER" 'the image ships the cache group-writable' has_packer_gate
   's@^      "chown -Rh root:root /opt/ci-cache",$@      "chgrp -R ci /opt/ci-cache",@'
 mutate_file "$PACKER" 'the image bakes a cache no slot can write' has_packer_gate_that_aborts \
   's@chmod -R go-w,go\+rX /opt/ci-cache@chmod -R a-w,a+rX /opt/ci-cache@'
+
+# The snapshot layer. The first two are the exact edits that would turn a host
+# into a publisher, which is the whole thing this design exists to prevent.
+mutate_file "$POOLTF" 'the host grant becomes writable' has_read_only_cache_grant \
+  's@roles/storage\.objectViewer@roles/storage.objectUser@'
+mutate_file "$POOLTF" 'the grant stops being conditioned on the prefix' has_read_only_cache_grant \
+  's@^    expression  = "resource\.name\.startsWith.*$@    expression  = "true"@'
+mutate_file "$POOLTF" 'the prefix is written twice instead of once' has_read_only_cache_grant \
+  's@^  cache_prefix = "cache/\$\{var\.name\}/"$@  cache_prefix = "cache/${var.github_repo}/"@'
+
+mutate 'the hydrate stops being bounded' has_bounded_hydrate \
+  's@timeout "\$left" gzip@gzip@'
+mutate 'a spent budget becomes a parse error' has_bounded_hydrate \
+  's@^  \[ "\$left" -gt 0 \] \|\| left=1$@  true@'
+mutate 'a cache fetch ignores the remaining budget' has_bounded_hydrate \
+  's@^  \[ "\$3" -gt 0 \] \|\| return 1$@  true@'
+mutate 'a slow snapshot blocks registration' has_bounded_hydrate \
+  's@hydrate_shared_cache \|\| true@hydrate_shared_cache \|\| die "no snapshot"@'
+
+mutate 'a snapshot reaches the master unscanned' has_snapshot_inspection \
+  's@^  if cache_master_is_hostile "\$CACHE_STAGE" strict; then@  if false; then@'
+mutate 'a snapshot is unpacked straight into the master' has_snapshot_inspection \
+  's@^CACHE_STAGE="/opt/\.ci-cache-incoming"$@CACHE_STAGE="/opt/ci-cache/.incoming"@'
+mutate 'the archive decides its own ownership and modes' has_snapshot_inspection \
+  's@ --no-same-owner --no-same-permissions@@'
+mutate 'the archive may carry a capability in an xattr' has_snapshot_inspection \
+  's@ --no-xattrs --no-acls@@'
+mutate 'tar is allowed out of the staging tree' has_snapshot_inspection \
+  's@\| tar -x -C "\$CACHE_STAGE"@| tar -x -P -C "$CACHE_STAGE"@'
+mutate 'the snapshot inspection escapes the deadline' has_snapshot_inspection \
+  's@cache_scan "\$limit" getcap@getcap@'
+mutate 'the snapshot scan stops being strict' has_snapshot_inspection \
+  's@cache_master_is_hostile "\$CACHE_STAGE" strict@cache_master_is_hostile "$CACHE_STAGE"@'
+mutate 'an unscannable snapshot is logged rather than refused' has_snapshot_inspection \
+  's@^  elif \[ "\$\{2:-\}" = "strict" \]; then$@  elif false; then@'
+mutate 'the decompressed stream stops being bounded' has_snapshot_inspection \
+  's@\| head -c "\$\(\(size \* 8\)\)"@| cat@'
+mutate 'the pointer stops being whitelisted' has_snapshot_inspection \
+  's@^    \*\[!A-Za-z0-9\._-\]\* \| .. \| \.\* \)$@    nothing-at-all )@'
+mutate 'the hydrate runs after the master is locked' has_snapshot_inspection \
+  's@^  hydrate_shared_cache \|\| true$@@; s@^  provision_shared_cache \|\| true$@  provision_shared_cache \|\| true\n  hydrate_shared_cache \|\| true@'
+
+mutate 'snapshot age comes from the object name again' has_service_attested_age \
+  's@\?fields=timeCreated,size@?fields=size@'
+mutate 'the host-side age bound is dropped' has_service_attested_age \
+  's@\[ "\$age" -ge "\$max_age_hours" \]@[ "$age" -lt 0 ]@'
+mutate 'a snapshot may fill the boot disk' has_service_attested_age \
+  's@^  free_kb=\$\(df -Pk /opt.*$@  free_kb=999999999999@'
+mutate 'the generation stops being pinned to what was measured' has_service_attested_age \
+  's@\?alt=media&generation=\$gen@?alt=media@'
+
+mutate 'the token goes back into the curl arguments' has_token_out_of_argv \
+  's@^    -K <\(printf .*$@    -H "Authorization: Bearer $CACHE_TOKEN" \\@'
+mutate 'the token outlives the hydrate' has_token_out_of_argv \
+  's@^  unset CACHE_TOKEN CACHE_DEADLINE$@  :@'
+mutate 'a response is bounded only by the deadline' has_token_out_of_argv \
+  's@--max-filesize "\$\{5:-65536\}"@--silent@'
+
+mutate 'the host stops clamping a metadata-supplied budget' has_clamped_metadata_bounds \
+  's@^  \[ "\$budget" -le 300 \] \|\| budget=300$@  true@'
+mutate 'the age bound may be set past the bucket rule' has_clamped_metadata_bounds \
+  's@^  \[ "\$max_age_hours" -le 720 \].*$@  true@'
+
+mutate_file "$POOLVARS" 'the pool name stops being constrained' has_constrained_pool_name \
+  's@\^\[a-z\]\(\[-a-z0-9\]\{0,61\}\[a-z0-9\]\)\?\$@.*@'
+mutate_file "$POOLVARS" 'the bucket name stops being constrained' has_constrained_pool_name \
+  's@can\(regex\("\^\[a-z0-9\].*", var\.cache_snapshot_bucket\)\)@true@'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
