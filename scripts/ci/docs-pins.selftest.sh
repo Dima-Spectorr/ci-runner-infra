@@ -61,6 +61,13 @@ readme_pins=0
 for f in "${docs[@]}"; do
   # Only pins of THIS repo's modules. A pin of some other module in an example
   # is not this check's business.
+  #
+  # `ci-[a-z-]*`, not `ci-runner-[a-z-]*`: the narrower pattern was written when
+  # every module was named `ci-runner-*`, and it silently stopped covering the
+  # first one that was not (`ci-host-image-trigger`). A pin the gate does not
+  # match is a pin that can drift, and it drifts the same silent way the README
+  # did — the gate stays green because it never looked. The path prefix
+  # `ci-runner-infra.git//modules/` already scopes this to this repo.
   while IFS= read -r line; do
     found=$((found + 1))
     [ "$f" = "$ROOT/README.md" ] && readme_pins=$((readme_pins + 1))
@@ -71,7 +78,7 @@ for f in "${docs[@]}"; do
     else
       bad "${f#"$ROOT/"}: pins $got, VERSION says $want"
     fi
-  done < <(grep -o 'ci-runner-infra\.git//modules/ci-runner-[a-z-]*?ref=[^"[:space:])]*' -- "$f")
+  done < <(grep -o 'ci-runner-infra\.git//modules/ci-[a-z-]*?ref=[^"[:space:])]*' -- "$f")
 done
 
 # A check that finds nothing passes, which is how the README drifted in the
