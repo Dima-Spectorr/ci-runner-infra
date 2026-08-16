@@ -1198,7 +1198,11 @@ function Invoke-Main {
     $slots = 1
     if ($cfg.Slots -match '^[0-9]+$' -and [int] $cfg.Slots -ge 1) { $slots = [int] $cfg.Slots }
     $provisioned = @(Invoke-Phase1SlotSetup -Slots $slots)
-    $slotUsers = @($provisioned | ForEach-Object { $_.User })
+
+    # Named, not counted. Phase 5 registers one agent per account listed here, so
+    # a boot log that says "3 slots" and a host that has ci-s1 and ci-s3 read the
+    # same -- and the difference is which agent never came back.
+    Write-BootLog ('phase 1: slot accounts ' + (($provisioned | ForEach-Object { $_.User }) -join ', '))
 
     # Before phase 5, and that ordering is the same safety property the rest of
     # this file is built on: an agent registered before its broker turns every
