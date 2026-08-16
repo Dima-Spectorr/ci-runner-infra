@@ -105,8 +105,33 @@ jobs:
           unzip -q -o /tmp/packer.zip -d /tmp/packer-bin
           /tmp/packer-bin/packer version
 
+      # ONE TEMPLATE PER INVOCATION, not `validate packer/`.
+      #
+      # A directory argument is not "check each template in here". Packer merges
+      # every *.pkr.hcl in the folder into ONE configuration, so the moment a
+      # second template became a sibling of the first — the Windows image — the
+      # shared variable names collided and this gate failed with `Duplicate
+      # variable declaration` on two templates that are each perfectly valid.
+      # The tempting fixes are both wrong: renaming the variables makes the two
+      # templates gratuitously different, and moving one into a subdirectory
+      # makes the directory argument quietly stop reading it, which is a gate
+      # that passes because it looked at nothing.
+      #
+      # Reading nothing is a failure here for the same reason it is in every
+      # other gate in this file: the loop below counts what it parsed and exits
+      # non-zero when a rename or a move leaves it with no template.
       - name: packer parses
-        run: /tmp/packer-bin/packer validate -syntax-only packer/
+        run: |
+          set -euo pipefail
+          n=0
+          for t in packer/*.pkr.hcl; do
+            [ -f "$t" ] || continue
+            echo "== $t"
+            /tmp/packer-bin/packer validate -syntax-only "$t"
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "::error::no packer template was parsed"; exit 1; }
+          echo "parsed $n packer template(s)"
 
       # Those three sweeps read `*.sh` and `run:` blocks, and are blind to a
       # `.ps1`. Windows hosts are driven by PowerShell, so the fleet is about to
