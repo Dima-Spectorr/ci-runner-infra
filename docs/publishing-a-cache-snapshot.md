@@ -166,6 +166,38 @@ The script also refuses to run at all from a `pull_request_target`,
 while running fork-authored code, so the identity binding alone would still hand
 out the credential — this is the check that turns such an edit into a failed run.
 
+## When the content scan refuses
+
+The credential pass finds a **file**, and in a dependency cache a file's name is
+a content hash — `pnpm-store/v3/files/72/93a11b…` names nothing you can act on.
+So the refusal also prints which pattern fired, how many times, and on which
+line:
+
+```
+the embedded-credential pass matched in pnpm-store/v3/files/72/93a11b…
+  file: 47 bytes, 3 line(s)
+  url-embedded-basic-auth: 1 match(es), first on line 2
+    scheme: mongodb
+```
+
+It never prints the matched text, and neither should you: a CI log is readable
+by everyone who can see the run, so pasting the line into an issue publishes the
+thing the gate just stopped. The scheme is the tell — `https` in front of a
+`user:pass@` on a registry URL is a real credential your prepare command wrote;
+`mongodb`, `postgres` or `git+ssh` is almost always a package's test fixture.
+
+The scheme is printed only when it is one the script recognises, and *"not a
+recognised URL scheme"* is not a bug to fix by widening the list. Cache content
+is raw blobs and concatenated fields; the characters in front of a `://` are not
+reliably a scheme word, and echoing them unfiltered would print the bytes this
+whole function exists not to print. It means: go and look at that line yourself.
+
+Either way the answer is not to widen the exclusions. Reproduce it locally with
+the `CACHE_DRY_RUN=1` invocation below, open that file at that line, and fix the
+cause: a real token means the prepare command is authenticating and must stop, a
+fixture means the pattern needs narrowing in `CREDENTIAL_PATTERNS` — as a code
+change, with the selftest's mutation for that rule still passing.
+
 ## First run
 
 Run the build phase alone: `CACHE_PREPARE=… CACHE_DRY_RUN=1 bash
