@@ -95,6 +95,42 @@ that changes an identity, and a human runs that one. Beyond that it needs
 `roles/cloudscheduler.admin` for the job this module creates beside the
 trigger.
 
+**It also needs to READ every resource the root owns, and that is not the same
+list as the roles that let it write them.** Learned the expensive way on
+IntegrateIT, 2026-08-16: the first three unattended runs all failed **red at
+`plan`**, on three separate `403`s, none of which was a permission to change
+anything. `google_project_iam_member` calls `projects.getIamPolicy` just to
+refresh. `google_secret_manager_secret` calls `secretmanager.secrets.get`, which
+`roles/secretmanager.secretAccessor` does **not** grant — accessor reads a
+version's payload, not the secret's metadata. A CD account has the write roles
+already, because it deploys services; it has none of these, because deploying a
+service never refreshes somebody else's IAM binding.
+
+Grant the four read-only roles below **before** the first run, or spend three
+red builds rediscovering them one at a time, in the order Terraform happens to
+refresh:
+
+```bash
+gcloud iam roles create ciRunnerApplyIamReader --project=<project> \
+  --title="CI runner apply — IAM policy reader" \
+  --permissions=resourcemanager.projects.getIamPolicy --stage=GA
+
+for R in projects/<project>/roles/ciRunnerApplyIamReader \
+         roles/secretmanager.viewer roles/iam.serviceAccountViewer roles/monitoring.viewer; do
+  gcloud projects add-iam-policy-binding <project> --condition=None \
+    --member=serviceAccount:<sa>@<project>.iam.gserviceaccount.com --role="$R"
+done
+```
+
+The custom role exists rather than `roles/iam.securityReviewer` because
+`getIamPolicy` on the project is the single permission the refresh actually
+needs, and securityReviewer carries a large read surface for it. **Every one of
+these is read-only, so the security property is untouched**: none of them grants
+`setIamPolicy`, so an apply that would *change* a binding still stops red, which
+is the behaviour the whole design is for. A `viewer` role is what lets the applier
+*see* the binding it is not allowed to change — without it, it cannot tell the
+difference between "no drift" and "no access", and reports the second as failure.
+
 Verify before wiring it, rather than assuming a CD account is narrow:
 
 ```bash
