@@ -78,9 +78,36 @@ Three prerequisites, and the first is the same one the workflow has:
 **1. The variables must be in git** — see below; it is not specific to either
 path. An unattended apply has no `terraform.tfvars` either way.
 
-**2. The GitHub App connection must already cover the repository.** This module
-wires a trigger; it does not connect a repository. If the project already has
-push-to-main triggers for its services, it is connected.
+**2. The project must already be connected to GitHub — and you have to know
+which of the two ways.** This module wires a trigger; it does not authorize a
+GitHub account. If the project already has push-to-main triggers for its
+services, it is connected, and the remaining question is the generation:
+
+- **1st gen** — a project-level GitHub App install. The trigger names
+  `owner`/`repo` directly. This is the default; pass nothing extra.
+- **2nd gen** — a regional `cloudbuild connection` resource. The trigger names a
+  *repository resource* under it. Pass `github_connection = "<name>"` and the
+  module registers the repository and wires it.
+
+**Read the generation off the project rather than assuming it.** The two are
+separate APIs, and picking the wrong one does not fail validation: the trigger
+is created, reports healthy, and never fires, because the push it watches for
+arrives on a link it cannot see.
+
+```bash
+gcloud builds connections list --project=<project> --region=<region> --quiet
+```
+
+A name in the output means 2nd gen. Empty output plus working service triggers
+means 1st gen. **Pass `--region` every time** — 2nd-gen connections are
+regional, and a region-less list returns `[]` for a project with several, which
+reads exactly like "not connected". `--quiet` matters too: the first call in a
+project offers to enable the API and waits for an answer that never comes in an
+unattended shell.
+
+Surveyed 2026-08-16, the fleet is split: `mot-integrateit` is 1st gen,
+`mot-apps-modern` is 2nd gen (`dataretrieval-github`), and most remaining
+projects have neither yet.
 
 **3. The account must be the right shape, and that is the only security
 decision here.** It should be the project's existing CD account, and it should

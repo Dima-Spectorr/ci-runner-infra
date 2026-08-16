@@ -161,6 +161,38 @@ runs_each_tool_in_an_image_that_has_it() {
   ! matches "$sdk_step" 'terraform '                   || return 1
 }
 
+# 9. The two GitHub generations are separate APIs, and the wrong one is the
+#    quietest failure in this module: the trigger is CREATED, `describe` reports
+#    it healthy, and it never fires, because the push it watches for arrives on
+#    a link it cannot see. There is no red build to attribute — the symptom is
+#    an apply that simply never happened, which is indistinguishable from the
+#    problem this whole module exists to fix.
+#
+#    Three things hold it together. Both blocks must be conditional on the SAME
+#    predicate, inverted — either emitted unconditionally is a trigger with two
+#    source blocks, which the API rejects, and the plausible "fix" is to delete
+#    the other one and hard-code a generation for the whole fleet. And both must
+#    filter on the derived regex: a literal branch in the gen2 block passes
+#    check 4, which only reads the gen1 one.
+selects_one_github_generation() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'dynamic "github" *\{'                  || return 1
+  matches "$code" 'dynamic "repository_event_config" *\{' || return 1
+  matches "$code" 'for_each *= *local\.gen2 \? \[\] : \[1\]' || return 1
+  matches "$code" 'for_each *= *local\.gen2 \? \[1\] : \[\]' || return 1
+  # Two push filters, both derived — one per generation, neither literal.
+  [ "$(printf '%s\n' "$code" | grep -cE 'branch *= *local\.branch_regex')" -eq 2 ] || return 1
+}
+
+# 10. And gen1 stays the default. `github_connection` unset must keep producing
+#     exactly the trigger every already-onboarded root has today: a default here
+#     would silently move a connected 1st-gen project onto an API it has no
+#     connection for, at the next `-upgrade`, with no diff in the consumer root.
+defaults_to_the_generation_already_deployed() {
+  local block; block=$(var_block 'github_connection' "$1")
+  matches "$block" 'default *= *null' || return 1
+}
+
 echo "apply-trigger self-test:"
 
 # The helpers carry the traps they were written to avoid, so they are checked
@@ -190,6 +222,8 @@ check declares_where_logs_go                      "$MAIN" "no logging option —
 check pins_the_terraform_image                    "$MAIN" "the terraform image floats — an unattended apply can break with nothing merged"
 check fires_only_for_the_root_it_applies          "$MAIN" "the trigger fires on every commit in the repository"
 check runs_each_tool_in_an_image_that_has_it      "$MAIN" "a step calls a tool its image does not carry — the report fails with 'not found' and looks broken"
+check selects_one_github_generation               "$MAIN" "the trigger does not pick its GitHub generation from the project — the wrong one is created healthy and never fires"
+check defaults_to_the_generation_already_deployed "$VARS" "github_connection has a default — every already-onboarded 1st-gen root would move generation at its next -upgrade"
 
 mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
   local desc="$1" f="$2" prog="$3" pred="$4" tmp
@@ -227,6 +261,16 @@ mutate "'one step instead of two' — terraform output moved into the gcloud ima
   's|mig=$(cat /workspace/.mig-name 2>/dev/null \|\| true)|mig=$(terraform output -raw mig_name)|' runs_each_tool_in_an_image_that_has_it
 mutate "'the tfvars live outside the root and the apply never fires' — scope removed" "$MAIN" \
   's|included_files = local.included_files|included_files = []|' fires_only_for_the_root_it_applies
+# The gen2 push filter written the way somebody would type it while testing one
+# project — literal, correct there, and wrong on every root that watches another
+# branch. Check 4 reads the gen1 block only, so nothing else would catch it.
+mutate "'just watch main' — the 2nd-gen filter hard-coded" "$MAIN" \
+  '/dynamic "repository_event_config"/,/^  }/ s|branch = local.branch_regex|branch = "^main$"|' selects_one_github_generation
+# "One of them is dead code" — the reading that makes a fleet 1st-gen forever.
+mutate "'this project is 1st gen, drop the other block' — gen2 made unreachable" "$MAIN" \
+  's|for_each = local.gen2 ? \[1\] : \[\]|for_each = []|' selects_one_github_generation
+mutate "'new projects are all 2nd gen now' — made the default" "$VARS" \
+  '/^variable "github_connection"/,/^}/ s|default     = null|default     = "github"|' defaults_to_the_generation_already_deployed
 
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

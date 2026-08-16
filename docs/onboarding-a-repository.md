@@ -337,6 +337,22 @@ module "ci_runner_apply_trigger" {
 }
 ```
 
+**If the project links GitHub the 2nd-gen way, add its connection**, and the
+module registers the repository under it rather than expecting a GitHub App
+install:
+
+```hcl
+  github_connection = "dataretrieval-github"
+```
+
+Which one the project has is a fact to read, not a choice — a trigger built for
+the wrong generation is created successfully and never fires. One command
+answers it, and `--region` is not optional:
+
+```bash
+gcloud builds connections list --project=<project> --region=<region> --quiet
+```
+
 Then grant that account what a *refresh* needs — this is the step that gets
 skipped, and it fails at `plan` rather than at `apply`, so it looks like the
 module is broken when it is the grants that are missing. The full list, the
