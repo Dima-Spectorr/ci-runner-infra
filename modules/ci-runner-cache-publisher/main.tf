@@ -9,10 +9,10 @@
 # So the write side is a SEPARATE identity that never runs pull-request code, and
 # what makes that true is not a promise in a workflow file — it is where the
 # credential comes from. This account is assumable only through Workload Identity
-# Federation, and only by a run whose OIDC token asserts the repository's default
-# ref. A pull-request run's token asserts `refs/pull/<n>/merge`, which no binding
-# here names, so a fork PR that adds a publish step to its own workflow gets a
-# token GCP will not exchange.
+# Federation, and only by a run of ONE named workflow file, in ONE named
+# repository, on that repository's default ref. Everything else in the federation
+# — another repository under the same pool, another workflow in this one, the
+# same workflow on a branch — gets a token GCP will not exchange.
 #
 # WHAT THE PUBLISHER MAY DO, AND WHY IT IS THREE GRANTS RATHER THAN ONE
 #
@@ -65,9 +65,12 @@ locals {
 
 resource "google_service_account" "publisher" {
   project = var.project_id
-  # 30 characters is the cap, and `-cache` costs six. Truncated the same way the
-  # controller account is, so a long pool name fails at neither plan nor apply.
-  account_id   = "${substr(var.account_id, 0, min(24, length(var.account_id)))}-cache"
+  # 30 characters is the cap and `-cache` costs six, so the base is VALIDATED to
+  # 24 rather than truncated to it. Truncation is the silent failure: two pools
+  # whose ids differ only after the 24th character would resolve to one account,
+  # and whichever applied second would either collide or — if the account were
+  # ever adopted — hold both pools' prefix grants at once.
+  account_id   = "${var.account_id}-cache"
   display_name = "CI cache publisher (${var.name})"
   description  = "Publishes dependency-cache snapshots for the ${var.name} pool. Assumable only by a run on the repository's default ref; must NEVER be attached to a host, which executes pull-request code."
 }
@@ -76,17 +79,43 @@ resource "google_service_account" "publisher" {
 # snapshot layer, and it is one line, so it is the line most likely to be widened
 # by someone whose workflow will not run.
 #
-# `attribute.ref` and not `attribute.repository`: binding to the repository as a
-# whole would admit every branch and every workflow file in it, including one
-# pushed to a branch by anyone who can open a pull request — which is exactly the
-# identity this module exists to keep away from the write side. If a provider
-# does not map `attribute.ref` yet, adding `attribute.ref: assertion.ref` to its
-# mapping is additive and existing principalSets keep resolving; that is a
-# one-command fix, not a reason to bind wider.
+# `attribute.job_workflow_ref`, and NEITHER `attribute.repository` NOR
+# `attribute.ref` — because each of those alone is open in a direction that is
+# easy to miss:
+#
+#   attribute.repository admits every branch and every workflow file in the
+#   repository, including one pushed to a branch by anyone who can open a pull
+#   request. That is the identity this module exists to exclude.
+#
+#   attribute.ref is not "narrower than repository" — it is a DIFFERENT axis, and
+#   binding it alone is open twice over. GitHub uses one OIDC issuer for all of
+#   github.com and a pool is normally shared by every repository in the org, so
+#   `attribute.ref/refs/heads/main` matches a run on ANY of their default
+#   branches; and if the provider carries no attribute condition, any repository
+#   on GitHub. Worse, `refs/heads/main` is reachable from attacker-triggered
+#   events: for `pull_request_target`, `workflow_run`, `issue_comment` and
+#   `schedule`, GITHUB_REF — which the `ref` claim mirrors — is the DEFAULT
+#   BRANCH. The standard `pull_request_target` + checkout-the-head-sha pattern
+#   therefore runs fork-authored code inside a run whose token asserts
+#   refs/heads/main. Binding on ref alone hands that run the write grant.
+#
+# `job_workflow_ref` closes both, because one claim carries all three facts:
+# `<owner>/<repo>/.github/workflows/<file>@<ref>`. A fork cannot change that file
+# on the default ref, another repository cannot produce this repository's value,
+# and another workflow in this repository — including a `pull_request_target` one
+# — produces a different filename.
+#
+# TWO PREREQUISITES ON THE PROVIDER, which this module cannot express and does
+# not silently assume (see the README):
+#   1. the provider maps `attribute.job_workflow_ref = assertion.job_workflow_ref`.
+#      Adding a mapping is additive; existing principalSets keep resolving.
+#   2. the provider carries an attribute condition pinning the org, by NUMERIC id
+#      (`assertion.repository_owner_id == '<id>'`). Without it the pool federates
+#      all of GitHub, and the pin below is the only thing standing in the way.
 resource "google_service_account_iam_member" "workload_identity" {
   service_account_id = google_service_account.publisher.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${var.workload_identity_pool}/attribute.ref/${var.allowed_ref}"
+  member             = "principalSet://iam.googleapis.com/${var.workload_identity_pool}/attribute.job_workflow_ref/${var.repository}/${var.publish_workflow_path}@${var.allowed_ref}"
 }
 
 # Create, and only create. See the header: no delete means no overwrite, which is
@@ -121,6 +150,12 @@ resource "google_storage_bucket_iam_member" "publisher_reads_prefix" {
 # The ONE object that may be replaced. `==` and not `startsWith`, and the
 # difference is the whole point: a prefix condition here would hand back the
 # delete authority the split above spent two resources removing.
+#
+# objectAdmin on this one object also carries storage.objects.update and the
+# retention permissions, so a compromised publisher can pin a hold on the pointer
+# and stop the next legitimate publish from replacing it. That is availability
+# only — it cannot make a host read anything the publisher did not already write
+# — and it is the price of the object needing to be replaceable at all.
 #
 # `var.name` and `var.cache_snapshot_bucket` are both interpolated into a CEL
 # string literal, so both are validated to a charset that cannot carry a quote or

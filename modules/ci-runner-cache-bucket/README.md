@@ -85,19 +85,24 @@ The host's grant is built by the host-pool module and is asserted by
 
 The producer's grant is now `ci-runner-cache-publisher`: an account with no key,
 attached to no VM, assumable only through Workload Identity Federation by a run
-on the repository's default ref. It holds create — not overwrite — under its own
-pool's prefix, and may replace exactly one object, the pointer. The script that
-builds and uploads a snapshot does not exist yet, so nothing writes here in
-practice and a pool configured to read simply finds no snapshot and runs on the
-cache its image baked.
+of one named workflow file, in one named repository, on the default ref. It holds
+create — not overwrite — under its own pool's prefix, and may replace exactly one
+object, the pointer. The script that builds and uploads a snapshot does not exist
+yet, so nothing writes here in practice and a pool configured to read simply
+finds no snapshot and runs on the cache its image baked.
 
-This module also states the other half, which no per-pool grant can: three
-authoritative bindings with **empty** member lists, on every predefined role that
-carries `storage.objects.create` or `storage.objects.delete` at the bucket level.
-An additive grant says who may write; only an authoritative one says *and no one
-else*. A bucket-wide `objectAdmin` added by hand — the 2am stopgap for a failing
-publish — is taken back on the next apply and shows up in the plan instead of
-living forever unseen.
+**The other half — *and no one else* — this module does not state, and it says so
+in the code rather than implying it.** Only an authoritative binding with an empty
+member list could say it, and `setIamPolicy` has historically rejected a
+memberless binding, so shipping one unverified would trade a control this module
+does not have for an apply every consumer would have to fix. A bucket-wide
+`objectAdmin` added by hand — the 2am stopgap for a failing publish — is therefore
+still invisible to Terraform. Detect it with a periodic policy check or deny it
+above the bucket with an IAM deny policy; the role list to cover is wider than it
+looks, because `roles/storage.admin` and the legacy bucket/object roles also carry
+`storage.objects.create`/`delete` (uniform bucket-level access disables ACLs, not
+IAM roles), and project-level `roles/editor` confers two of them where no
+bucket-level binding could reach.
 
 ## The age bound is a security control
 

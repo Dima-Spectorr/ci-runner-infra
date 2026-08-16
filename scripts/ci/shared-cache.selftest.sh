@@ -526,11 +526,15 @@ has_write_once_publisher() { # <file>
   # same expression. An unconditioned write grant is every pool's cache.
   [ "$(printf '%s\n' "$code" | grep -cE 'expression  = "resource\.name\.startsWith')" -eq 2 ] || return 1
   matches "$code" '^  cache_prefix = "cache/\$\{var\.name\}/"' || return 1
-  # Assumable by a ref, never by a repository. attribute.repository admits every
-  # branch and every workflow file in it, including one pushed by anyone who can
-  # open a pull request — which is the identity this module exists to exclude.
-  matches "$code" 'principalSet://iam\.googleapis\.com/\$\{var\.workload_identity_pool\}/attribute\.ref/' || return 1
-  ! matches "$code" 'attribute\.repository' || return 1
+  # Assumable by ONE workflow file, in ONE repository, on ONE ref — all three in
+  # a single claim. Neither weaker axis alone is enough: attribute.repository
+  # admits every branch and every workflow file in it, and attribute.ref admits
+  # every OTHER repository federated by the same pool (one issuer serves all of
+  # github.com) as well as the pull_request_target and workflow_run events, whose
+  # tokens assert the DEFAULT BRANCH while running fork-authored code.
+  matches "$code" 'principalSet://iam\.googleapis\.com/\$\{var\.workload_identity_pool\}/attribute\.job_workflow_ref/\$\{var\.repository\}/\$\{var\.publish_workflow_path\}@\$\{var\.allowed_ref\}' || return 1
+  ! matches "$code" 'attribute\.repository/'   || return 1
+  ! matches "$code" 'attribute\.ref/'          || return 1
   # No key material. A downloadable key is a credential that outlives the run and
   # cannot be bound to a ref at all.
   ! matches "$code" 'google_service_account_key' || return 1
@@ -544,23 +548,36 @@ has_ref_bound_publisher() { # <file>
   code=$(code_of "$1")
   matches "$code" 'regex\("\^refs/heads/' || return 1
   matches "$code" 'default     = "refs/heads/main"' || return 1
+  # The two parts that make the ref mean anything. `repository` has no default,
+  # because a module that guessed it would bind to somebody else's repository;
+  # and both are interpolated into a principalSet whose parts are separated by
+  # `/` and `@`, so neither may carry a separator.
+  matches "$code" 'variable "repository"' || return 1
+  matches "$code" 'regex\(.*, var\.repository\)' || return 1
+  matches "$code" 'default     = "\.github/workflows/' || return 1
+  matches "$code" 'regex\("\^\\\\\.github/workflows/.*, var\.publish_workflow_path\)' || return 1
   # The same two CEL-literal inputs the pool validates, validated here too.
   matches "$code" 'regex\("\^\[a-z\]\(\[-a-z0-9\]\{0,61\}\[a-z0-9\]\)\?\$", var\.name\)' || return 1
   matches "$code" 'regex\(.*, var\.cache_snapshot_bucket\)' || return 1
 }
 
-# Who may write is stated by the publisher module; who may NOT is stateable only
-# here, and only by an authoritative binding. An additive resource cannot remove
-# a bucket-wide grant added by hand, and that grant is the one that undoes the
-# per-pool separation entirely.
-has_no_unconditional_write() { # <file>
+# The bucket module states who may write only by NOT granting it. An
+# authoritative empty binding — the shape that would say "and no one else" — is
+# not shipped, because setIamPolicy has historically rejected a memberless
+# binding and an unverified control is not worth an apply every consumer would
+# have to fix. What IS checkable here is that the bucket module grants no write
+# at all: a grant appearing in this file is unconditioned by construction, since
+# the per-pool grants live in the pool and publisher modules.
+has_no_write_grant_on_the_bucket() { # <file>
   local code
   code=$(code_of "$1")
-  matches "$code" 'resource "google_storage_bucket_iam_binding" "no_unconditional_write"' || return 1
-  matches "$code" '^  members = \[\]$'              || return 1
-  matches "$code" '"roles/storage\.objectAdmin",'   || return 1
-  matches "$code" '"roles/storage\.objectCreator",' || return 1
-  matches "$code" '"roles/storage\.objectUser",'    || return 1
+  ! matches "$code" 'roles/storage\.objectAdmin'   || return 1
+  ! matches "$code" 'roles/storage\.objectCreator' || return 1
+  ! matches "$code" 'roles/storage\.objectUser'    || return 1
+  ! matches "$code" 'roles/storage\.admin'         || return 1
+  # And the two settings that would route around a prefix condition entirely.
+  matches "$code" '^  uniform_bucket_level_access = true$' || return 1
+  matches "$code" '^  public_access_prevention = "enforced"$' || return 1
 }
 
 # --- the real script ------------------------------------------------------------
@@ -589,7 +606,7 @@ run 'metadata-supplied bounds are clamped on the host'   has_clamped_metadata_bo
 run 'the pool name cannot rewrite the IAM condition'     has_constrained_pool_name "$POOLVARS"
 run 'the publisher may create but never overwrite a snapshot' has_write_once_publisher "$PUBTF"
 run 'only the default ref may become the publisher'      has_ref_bound_publisher   "$PUBVARS"
-run 'nobody holds unconditional write on the bucket'     has_no_unconditional_write "$BUCKETTF"
+run 'the bucket module grants no write of its own'       has_no_write_grant_on_the_bucket "$BUCKETTF"
 
 # --- the mutations --------------------------------------------------------------
 #
@@ -788,8 +805,14 @@ mutate_file "$PUBTF" 'the publisher may overwrite a snapshot' has_write_once_pub
   's@role   = "roles/storage\.objectCreator"@role   = "roles/storage.objectUser"@'
 mutate_file "$PUBTF" 'the pointer grant widens to the whole prefix' has_write_once_publisher \
   's@== \\"\$\{local\.pointer_resource\}@.startsWith(\\"${local.prefix_resource}@'
-mutate_file "$PUBTF" 'any branch may become the publisher' has_write_once_publisher \
-  's@attribute\.ref/\$\{var\.allowed_ref\}@attribute.repository/${var.allowed_ref}@'
+# `|` rather than `@` as the delimiter here: the principalSet itself contains an
+# `@`, between the workflow path and the ref.
+mutate_file "$PUBTF" 'the whole repository may become the publisher' has_write_once_publisher \
+  's|attribute\.job_workflow_ref/\$\{var\.repository\}/\$\{var\.publish_workflow_path\}@\$\{var\.allowed_ref\}|attribute.repository/${var.repository}|'
+mutate_file "$PUBTF" 'the binding drops back to a bare ref' has_write_once_publisher \
+  's|attribute\.job_workflow_ref/\$\{var\.repository\}/\$\{var\.publish_workflow_path\}@|attribute.ref/|'
+mutate_file "$PUBTF" 'the workflow file stops being pinned' has_write_once_publisher \
+  's|/\$\{var\.publish_workflow_path\}||'
 mutate_file "$PUBTF" 'a create grant stops being conditioned on the prefix' has_write_once_publisher \
   's@expression  = "resource\.name\.startsWith\(\\"\$\{local\.prefix_resource\}\\"\)"@expression  = "true"@'
 mutate_file "$PUBTF" 'the publisher gets a downloadable key' has_write_once_publisher \
@@ -799,13 +822,15 @@ mutate_file "$PUBVARS" 'a tag may hold the write grant' has_ref_bound_publisher 
   's@\^refs/heads/@^refs/@'
 mutate_file "$PUBVARS" 'the default ref becomes a pull-request ref' has_ref_bound_publisher \
   's@default     = "refs/heads/main"@default     = "refs/pull/1/merge"@'
+mutate_file "$PUBVARS" 'the repository stops being validated' has_ref_bound_publisher \
+  's@, var\.repository\)@, var.name)@'
+mutate_file "$PUBVARS" 'the workflow path may point anywhere' has_ref_bound_publisher \
+  's@\^\\\\\.github/workflows/@^@'
 
-mutate_file "$BUCKETTF" 'the empty write bindings gain a member' has_no_unconditional_write \
-  's@^  members = \[\]$@  members = ["allAuthenticatedUsers"]@'
-mutate_file "$BUCKETTF" 'the authoritative binding becomes additive' has_no_unconditional_write \
-  's@google_storage_bucket_iam_binding" "no_unconditional_write"@google_storage_bucket_iam_member" "no_unconditional_write"@'
-mutate_file "$BUCKETTF" 'objectUser is left out of the roles taken back' has_no_unconditional_write \
-  's@^    "roles/storage\.objectUser",$@@'
+mutate_file "$BUCKETTF" 'a bucket-wide write grant is added as a stopgap' has_no_write_grant_on_the_bucket \
+  's@^resource "google_storage_bucket" "cache" \{@resource "google_storage_bucket_iam_member" "stopgap" \{ role = "roles/storage.objectAdmin" \}\nresource "google_storage_bucket" "cache" \{@'
+mutate_file "$BUCKETTF" 'ACLs come back and route around the prefix conditions' has_no_write_grant_on_the_bucket \
+  's@^  uniform_bucket_level_access = true$@  uniform_bucket_level_access = false@'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

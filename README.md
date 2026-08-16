@@ -347,7 +347,10 @@ means the recycle is working and the hosts are not leaving — jobs that never e
   channel the per-slot copy closes, re-opened across hosts and across time. A
   fork pull request would need to run once. Publishing belongs to a separate
   identity, `ci-runner-cache-publisher`: no key, attached to no VM, held only by
-  a run whose GitHub OIDC token asserts the default branch. It may create objects
+  a run of one named workflow file, in one named repository, on the default ref —
+  all three in one claim, because a pool is shared across repositories and a
+  `pull_request_target` run asserts the default branch while running fork code. It
+  may create objects
   under its pool's prefix and may not overwrite them — no `storage.objects.delete`
   means "snapshots are written once" is enforced by IAM rather than trusted — and
   may replace exactly one object, the pointer. The script that builds a snapshot

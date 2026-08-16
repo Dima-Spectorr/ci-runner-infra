@@ -147,11 +147,19 @@ module "ci_cache_publisher" {
   account_id             = "ci-runner-myrepo"
   cache_snapshot_bucket  = module.ci_cache.bucket_name
   workload_identity_pool = var.github_workload_identity_pool
+  repository             = "<org>/<repo>"
 }
 ```
 
-It has no key and is attached to no VM: the only way to hold it is a run whose
-GitHub OIDC token asserts the default branch, so a pull request cannot become it.
+It has no key and is attached to no VM: the only way to hold it is a run of the
+**one workflow file** named by `publish_workflow_path`, in that repository, on the
+default ref. All three, because neither of the obvious two is enough on its own —
+a workload identity pool is normally shared by every repository in the org, and a
+`pull_request_target` or `workflow_run` run gets an OIDC token asserting the
+default branch while executing fork-authored code. The pool's OIDC provider must
+map `attribute.job_workflow_ref` and must pin the org by numeric id; the module
+cannot check either.
+
 It may create objects under this pool's prefix and may not overwrite them —
 `storage.objects.delete` is absent, which is what keeps the bucket's age bound
 real — and it may replace exactly one object, the `current` pointer.

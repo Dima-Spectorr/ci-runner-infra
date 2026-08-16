@@ -109,7 +109,7 @@ resource "google_storage_bucket" "cache" {
   force_destroy = var.force_destroy
 }
 
-# NOBODY HOLDS UNCONDITIONAL WRITE ON THIS BUCKET.
+# WHAT THIS MODULE DOES NOT STATE, AND WHY IT SAYS SO OUT LOUD.
 #
 # Every legitimate write grant is conditioned on one pool's prefix and lives in
 # ci-runner-cache-publisher. The grant that breaks the design is the unconditioned
@@ -118,39 +118,20 @@ resource "google_storage_bucket" "cache" {
 # replace any pool's snapshot, including with a fresh generation the age bound
 # will never expire".
 #
-# These bindings are AUTHORITATIVE and their member list is empty, which is the
-# only shape that can say "and no one else". An additive `_member` resource can
-# state who may write; it cannot state who may not, so a grant added by hand
-# survives every apply and shows up in no plan. Terraform takes these back on the
-# next apply instead, and the drift is visible in the diff.
+# Nothing here takes that grant back. Terraform can only state "and no one else"
+# with an AUTHORITATIVE binding, and an authoritative binding with an empty member
+# list — the shape that would say it — is not known to survive
+# storage.buckets.setIamPolicy, which has historically rejected a binding with no
+# members. Shipping it unverified trades a control this module does not have for
+# an apply every consumer of this module would have to fix, so it stays out until
+# it has been applied against a real bucket. Tracked as a follow-up, with the role
+# list corrected: storage.objects.create/delete are also carried by
+# roles/storage.admin and by the legacy bucket/object roles, which keep working
+# under uniform bucket-level access (UBLA disables ACLs, not IAM roles) — and
+# project-level roles/editor confers two of them, which no bucket-level binding
+# could take back anyway.
 #
-# Authoritative here does NOT clobber the per-pool grants, and that is a provider
-# guarantee rather than a hope: the identity of a binding is the role PLUS the
-# condition (`iamBindingKey{Role, condition}` in the provider's IAM code, and the
-# resource's own documentation says the same in words). Each `_binding` below
-# therefore manages only the UNCONDITIONED binding for its role, leaving the
-# host's prefix-conditioned objectViewer and the publisher's three
-# prefix-conditioned grants alone.
-#
-# An empty list is a legal state and not an API error: the provider drops a
-# binding with no members while assembling the policy, so this sends "no
-# unconditioned binding for this role" rather than an empty one. On the next read
-# the binding is absent, which reads back as no members, and the resource is
-# quiet until someone adds a grant by hand.
-#
-# Roles rather than permissions, because that is what a policy holds. The three
-# below are every predefined role carrying storage.objects.create or
-# storage.objects.delete at the bucket level. `roles/storage.legacyBucketWriter`
-# is deliberately absent: it is meaningless with uniform bucket-level access on,
-# which this bucket enforces above.
-resource "google_storage_bucket_iam_binding" "no_unconditional_write" {
-  for_each = toset([
-    "roles/storage.objectAdmin",
-    "roles/storage.objectCreator",
-    "roles/storage.objectUser",
-  ])
-
-  bucket  = google_storage_bucket.cache.name
-  role    = each.value
-  members = []
-}
+# So the honest statement of the control today is: the write grants this repo
+# creates are prefix-conditioned, and an unconditioned one added by hand is
+# invisible to Terraform. Detect it with a periodic policy check, or deny it above
+# the bucket with an IAM deny policy; do not assume this file prevents it.
