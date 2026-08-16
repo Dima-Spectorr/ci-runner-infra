@@ -375,6 +375,10 @@ has_agent_registration() { # <file>
   # Start-Service on an already-running service reports success.
   matches "$code" 'Stop-Service -Name \$serviceName -Force' || return 1
   matches "$code" "WaitForStatus\\('Stopped'" || return 1
+  # …and the expiry caught, because WaitForStatus throws rather than returning a
+  # stale status: uncaught, the one failure this block reports is reported as a
+  # bare .NET exception instead of the sentence naming the consequence.
+  matches "$code" 'did not stop within' || return 1
   # Running is not the assertion; who it runs as is. This is the one check that
   # can tell a correctly identity-switched agent from one that quietly kept the
   # shared machine account.
@@ -672,6 +676,9 @@ mutate "the service left running under the SCM default across the identity chang
   has_agent_registration
 mutate "the stop fired but never waited for, so the config lands on a live process" \
   "s|WaitForStatus('Stopped'|WaitForStatus('Running'|" \
+  has_agent_registration
+mutate "the stop timeout left to surface as a bare .NET exception" \
+  's|did not stop within|did not stop before|' \
   has_agent_registration
 mutate "the marker trusted by shape alone, so a sibling's service can be claimed" \
   's|Get-RunnerServiceName -Marker \$marker -AgentName \$name|Get-RunnerServiceName -Marker $marker -AgentName ""|' \

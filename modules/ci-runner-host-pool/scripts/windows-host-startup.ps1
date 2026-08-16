@@ -2213,7 +2213,17 @@ function Register-SlotAgent {
         Write-BootLog ("slot $($Slot.Index): $serviceName came up under the SCM default account " +
             'during config.cmd -- stopping it before its identity and environment are set')
         Stop-Service -Name $serviceName -Force -ErrorAction Stop
-        $installed.WaitForStatus('Stopped', [timespan]::FromSeconds($script:ServiceStopSeconds))
+        # WaitForStatus THROWS on expiry rather than returning with a stale status,
+        # so without the catch the one failure this block exists to report is the
+        # one it reports worst: a raw System.ServiceProcess.TimeoutException instead
+        # of the sentence saying what it means for the host. It still fails closed
+        # either way -- the catch is for whoever reads the boot log afterwards.
+        try {
+            $installed.WaitForStatus('Stopped', [timespan]::FromSeconds($script:ServiceStopSeconds))
+        } catch {
+            Deny-Boot ("slot $($Slot.Index): $serviceName did not stop within " +
+                "$($script:ServiceStopSeconds)s ($($_.Exception.Message))")
+        }
         $installed.Refresh()
         if ($installed.Status -ne 'Stopped') {
             Deny-Boot ("slot $($Slot.Index): $serviceName will not stop, so it would keep the shared " +
