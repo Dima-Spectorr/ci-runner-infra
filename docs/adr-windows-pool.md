@@ -942,6 +942,31 @@ The two rules §4 already calls load-bearing — **one repository per pool** and
 **fork pull requests never run on a warm host** — are now the only isolation
 boundary a Windows pool has, and they must be enforced, not documented.
 
+**One token per instance, and the record of it lives on the instance.** Every
+guard on the controller's mint path was a marker file on the controller's boot
+disk or an age measured from the controller's own boot, and a single event — a
+controller **replacement** — erases all of them at once. A host that registered,
+was cordoned mid-job and had its token correctly deleted then presents to the
+replacement as brand new by every local measure: no agents (cordoning
+deregistered them), not busy (same reason), age 0 (`host_age_seconds` starts at
+this controller's first sight of it), no markers, and no token on the instance.
+Minting for it writes a fresh hour-long credential into the metadata of the pull
+request it is running — the interception above, arriving by way of a routine
+operational event.
+
+Two of the three questions the mint path now asks are therefore asked of the GCE
+API rather than of disk: **how old is this instance really** (past
+`register_grace`, that arm deletes the key itself rather than adopting it and
+holding it for another grace period) and **is the key on it right now** (adopt,
+never mint a second). The third closes the young-host case the age gate cannot
+reach: the write puts a **`<key>-issued` marker in the same `setMetadata` as the
+token**, nothing ever removes it — the delete names only the token key — and the
+mint is refused unless that marker is provably absent. It is the durable form of
+the local `minted` marker, it costs no extra API call because it comes out of the
+same key listing, and its value is the literal `1`, so unlike the token it may
+sit on the command line. A fourth marker file could not have expressed any of
+this: the problem was never which fact was recorded, it was where.
+
 **One copy of the token the delete cannot reach.** Writing the registration token
 with `compute.instances.setMetadata` produces an Admin Activity audit entry, and
 Admin Activity logging cannot be switched off and is retained for 400 days. If

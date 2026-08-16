@@ -153,10 +153,11 @@ BLIND_TICKS=0
 # as stale against an empty string.
 MIG_TEMPLATE=""
 
-# The two DURABLE facts about an instance — its real age and whether it already
-# carries a registration token — filled by instance_durable_facts() and read
-# only by the mint path. At file scope for the same reason as MIG_TEMPLATE: under
-# `set -u` a read before the first successful fill would kill the tick.
+# The three DURABLE facts about an instance — its real age, whether it already
+# carries a registration token, and whether it was EVER issued one — filled by
+# instance_durable_facts() and read only by the mint path. At file scope for the
+# same reason as MIG_TEMPLATE: under `set -u` a read before the first successful
+# fill would kill the tick.
 #
 # The age default is deliberately ENORMOUS, not 0. Today the only reader is
 # guarded by this function's return code, so the defaults are never consulted —
@@ -165,9 +166,12 @@ MIG_TEMPLATE=""
 # which is below every grace and therefore the most mint-permissive value
 # available; a huge age refuses instead. `unknown` is likewise not "absent": the
 # adoption arm tests for `present` and the mint arm for `absent`, so an
-# unfillable key fact matches neither and nothing happens.
+# unfillable key fact matches neither and nothing happens. DUR_ISSUED is read
+# the other way round — the mint is refused unless it is provably `absent` — so
+# that the same `unknown` refuses there too.
 DUR_AGE=999999999
 DUR_KEY="unknown"
+DUR_ISSUED="unknown"
 
 gh_token() {
   local now
@@ -909,8 +913,18 @@ write_registration_token() {
     : >"$keylive"
     # `timeout` for the reason every curl here is bounded: gcloud has its own
     # retry loop and can outlive a tick on a stalled handshake.
+    #
+    # The ISSUED marker goes in the SAME call, and that is the whole point of it.
+    # It is the durable form of the `minted` marker: one setMetadata, so if the
+    # token committed then so did the record that it was ever handed out, and no
+    # later controller can conclude otherwise. It is never deleted — the delete
+    # below names only $REG_TOKEN_KEY — so it outlives both the token and the
+    # controller that wrote it. `--metadata`, not `--metadata-from-file`, because
+    # the value is the literal `1` and carries no secret; the token beside it is
+    # still passed by file.
     timeout 60 gcloud compute instances add-metadata "$host" \
       --project="$PROJECT" --zone="$zone" \
+      --metadata="${REG_TOKEN_KEY}-issued=1" \
       --metadata-from-file="$REG_TOKEN_KEY=$f" >/dev/null 2>&1
     rc=$?
   fi
@@ -936,9 +950,10 @@ delete_registration_token() {
 }
 
 # instance_durable_facts <instance-self-link>
-# Fills DUR_AGE (seconds since GCE CREATED this instance) and DUR_KEY
-# (present|absent — whether $REG_TOKEN_KEY is on the instance right now).
-# Returns non-zero if either could not be read, and the caller must then mint
+# Fills DUR_AGE (seconds since GCE CREATED this instance), DUR_KEY
+# (present|absent — whether $REG_TOKEN_KEY is on the instance right now) and
+# DUR_ISSUED (present|absent — whether this instance was EVER handed a token).
+# Returns non-zero if any could not be read, and the caller must then mint
 # nothing: an unreadable fact is not a licence to guess.
 #
 # Both facts come from the GCE API on purpose. Everything else the mint path
@@ -1001,12 +1016,17 @@ instance_durable_facts() {
   # with no metadata at all flattens to nothing, and reporting that as a failure
   # would permanently refuse to mint for a genuinely key-less host — the same
   # never-registers outage in a smaller box. Only a non-zero exit returns 1.
+  #
+  # Both keys come out of the SAME list, so the third fact costs no extra call.
+  # No `break`: the loop has to see every line now, and the two keys can arrive
+  # in either order.
   DUR_KEY="absent"
+  DUR_ISSUED="absent"
   while IFS= read -r k; do
-    if [ "$k" = "$REG_TOKEN_KEY" ]; then
-      DUR_KEY="present"
-      break
-    fi
+    case "$k" in
+      "$REG_TOKEN_KEY") DUR_KEY="present" ;;
+      "${REG_TOKEN_KEY}-issued") DUR_ISSUED="present" ;;
+    esac
   done <<EOF
 $keyrow
 EOF
@@ -1213,6 +1233,31 @@ registration_token_step() {
   if [ "$DUR_KEY" = "present" ]; then
     : >"$keylive"
     log "regtoken $host: $REG_TOKEN_KEY already on the instance — adopted, not re-minted"
+    return 0
+  fi
+
+  # ONE TOKEN PER INSTANCE, EVER — and this is the durable form of the `minted`
+  # marker, which is why it is asked last, right before the write it guards.
+  #
+  # The age gate above only protects a host that is OLD. It leaves the young one:
+  # an instance created 30s ago that registered, was cordoned or lost its agents
+  # mid-job, and had its token correctly deleted by the previous controller. To a
+  # replacement controller that host reads `absent` (cordoning deregistered the
+  # agents), `busy=0` (same reason), `age=0` (host_age_seconds starts at this
+  # controller's first sight of it), no markers (they went with the boot disk),
+  # DUR_AGE under the grace and DUR_KEY genuinely absent — every guard satisfied,
+  # and indistinguishable from a host that has simply never registered. Minting
+  # writes a fresh hour-long credential into the metadata of the job it is
+  # running, which is the exact interception this whole path exists to prevent.
+  #
+  # The instance's own metadata is what tells the two apart, because the write
+  # put the marker there in the same setMetadata as the token and nothing ever
+  # removes it. `!= absent`, not `= present`: an unfillable fact is `unknown`,
+  # and the safe reading of "I could not tell whether this host already had one"
+  # is that it did.
+  if [ "$DUR_ISSUED" != "absent" ]; then
+    : >"$minted"
+    log "regtoken $host: already issued a token once (${REG_TOKEN_KEY}-issued) — not minting a second"
     return 0
   fi
 

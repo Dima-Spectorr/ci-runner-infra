@@ -213,8 +213,10 @@ reg_seq() { # <reg> <age> <pre> <status> [busy] [add-rc] [del-rc] [mutation-sed]
   # <created-ago>, <instance-key> and <describe-rc> are the DURABLE facts — what
   # the GCE API says, as opposed to what the controller's disk says. They default
   # to the ordinary case: an instance created just now, carrying no registration
-  # token, readable. <instance-key> is `present`, `absent` or `none` (an instance
-  # with no metadata at all, which flattens to no output at exit 0).
+  # token, readable. <instance-key> is `present`, `absent`, `issued` (the token
+  # was handed out once and has since been deleted — only the durable marker
+  # remains) or `none` (an instance with no metadata at all, which flattens to no
+  # output at exit 0).
   # The last argument mutates `instance_durable_facts` rather than the step, so
   # the gcloud invocation itself can be reverted and seen to fail.
   # -> adds|removes|minted?|keylive?|fails=<n>
@@ -291,9 +293,16 @@ reg_seq() { # <reg> <age> <pre> <status> [busy] [add-rc] [del-rc] [mutation-sed]
             # projection returns, there being no --filter to narrow it. The
             # absent case still prints a key, and one whose name CONTAINS the
             # real one, so a substring match would read it as present.
+            #
+            # \`issued\` is the state that outlives everything else: the token was
+            # handed out once and correctly deleted, and the marker the write put
+            # there in the same call is all that remains. It is deliberately
+            # listed BEFORE the token key in the \`present\` case, because the loop
+            # must see every line rather than stop at the first match.
             case '$ikey' in
-              present) printf '%s\n' instance-template ci-registration-token created-by ;;
+              present) printf '%s\n' instance-template ci-registration-token-issued ci-registration-token created-by ;;
               absent) printf '%s\n' instance-template ci-registration-token-old created-by ;;
+              issued) printf '%s\n' instance-template ci-registration-token-issued created-by ;;
               none) : ;;
             esac
             return 0 ;;
@@ -485,6 +494,28 @@ check "regtoken: a capped host makes no further instance reads" \
 check "regtoken: a durably new host is still minted a token" \
   "1|0|minted|keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 30)"
 
+# ── H-4: the YOUNG host the durable age gate does not reach ──────────────────
+#
+# The age gate only protects an instance that is OLD. This is the other half,
+# and the durable facts as first written could not see it: an instance created
+# 30s ago that registered, was cordoned mid-job, and had its token correctly
+# deleted by the previous controller. To a REPLACEMENT controller it reads
+# `absent` (cordoning deregistered the agents), `busy=0` (same reason), `age=0`
+# (host_age_seconds starts at this controller's first sight of it), no markers
+# (they went with the boot disk), DUR_AGE 30 — under the grace — and DUR_KEY
+# genuinely absent. Every guard satisfied, and identical to a host that has
+# simply never registered. The old code minted, which writes a fresh hour-long
+# credential into the metadata of the pull request that host is running.
+#
+# What tells them apart is on the instance: the write puts an ISSUED marker
+# there in the same setMetadata as the token, and nothing ever removes it.
+check "regtoken: H-4 — a young host that was already issued one is not minted again" \
+  "0|0|minted|no-keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 30 issued)"
+
+# The marker refuses a MINT and nothing else. The `present` fixture carries it
+# alongside a live key — which is the real pairing, since the write puts both
+# there in one call — so the adoption case above and the durably-old delete
+# below both run against a host that was issued one, and both must still act.
 # An instance with NO metadata at all. The projection flattens to no output and
 # exits 0, and that is an ABSENT key, not an unreadable one — reading it as a
 # failure would permanently refuse to mint for a genuinely key-less host, which
@@ -558,6 +589,18 @@ check "regtoken: the unreadable-read cap FAILS when the charge is removed" \
   "0|0|no-minted|no-keylive|fails=0" \
   "$(reg_seq absent 0 '' RUNNING 0 0 0 's/echo $((n + 1)) >"$fails"/:/' 0 absent 1)"
 
+# H-4: the issued gate is short-circuited, and the young cordoned host is minted
+# a second live credential — the defect the durable age gate alone left open.
+# shellcheck disable=SC2016
+check "regtoken: the H-4 case FAILS when the issued gate is reverted" \
+  "1|0|minted|keylive|fails=0" \
+  "$(reg_seq absent 0 '' RUNNING 0 0 0 's/if \[ "\$DUR_ISSUED" != "absent" \]; then/if false; then/' 30 issued)"
+
+# The `!= absent` spelling is not covered by a case, and deliberately: `unknown`
+# is only reachable when the facts read FAILED, and the caller returns before
+# this line in that event. It is defence in depth against a future caller, not a
+# behaviour this harness can reach — a check for it would assert nothing.
+
 # ── F4: the bug the stub above could not see ─────────────────────────────────
 #
 # `--filter` is a `list`-family flag; `describe` rejects it with `unrecognized
@@ -574,11 +617,14 @@ check "regtoken: F4 — the mint FAILS when the describe goes back to --filter" 
 # …and the key match is a WHOLE LINE. With no `--filter` the projection returns
 # the instance's entire key set, so a substring test would read the neighbouring
 # `ci-registration-token-old` as the token itself — and the host would be
-# "adopted" against a key that does not exist and never register.
+# "adopted" against a key that does not exist and never register. The issued
+# marker makes this sharper still: `ci-registration-token-issued` is a key the
+# controller itself writes next to the token, so a substring match now has a
+# guaranteed decoy on every host that ever registered.
 # shellcheck disable=SC2016
 check "regtoken: F4 — a substring key match adopts the wrong key" \
   "0|0|no-minted|keylive|fails=0" \
-  "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 30 absent 0 's/\[ "$k" = "$REG_TOKEN_KEY" \]/[[ "$k" == *"$REG_TOKEN_KEY"* ]]/')"
+  "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 30 absent 0 's/      "$REG_TOKEN_KEY") DUR_KEY="present" ;;/      *"$REG_TOKEN_KEY"*) DUR_KEY="present" ;;/')"
 
 # The whole path is opt-in, and the default is what every existing Linux
 # controller runs. Flipping either of these turns on credential-writing into
@@ -598,6 +644,24 @@ check "regtoken: the tick calls the step only on an opted-in pool" yes "$r"
 # shellcheck disable=SC2016
 grep -q -- '--metadata-from-file="$REG_TOKEN_KEY=$f"' "$CTRL" && r=yes || r=no
 check "regtoken: the token is passed by file, never on the command line" yes "$r"
+
+# The issued marker rides on the same call and IS on the command line, which is
+# fine only because its value is the literal `1`. This asserts that stays true:
+# the day someone puts anything else behind `--metadata=` on this call, it is on
+# the process table of a host running a pull request.
+# shellcheck disable=SC2016
+grep -c -- '--metadata=' "$CTRL" | grep -qx 1 && r=yes || r=no
+check "regtoken: exactly one --metadata on the mint call" yes "$r"
+# shellcheck disable=SC2016
+grep -q -- '--metadata="${REG_TOKEN_KEY}-issued=1"' "$CTRL" && r=yes || r=no
+check "regtoken: and it carries only the issued marker, never the token" yes "$r"
+
+# The delete names the token key and only the token key. Removing the issued
+# marker with it would put the durable fact back on the controller's disk, which
+# is the root cause every finding on this path has traced to.
+# shellcheck disable=SC2016
+grep -q -- '--keys="$REG_TOKEN_KEY"' "$CTRL" && r=yes || r=no
+check "regtoken: the delete never takes the issued marker with it" yes "$r"
 
 echo "controller-scope selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
