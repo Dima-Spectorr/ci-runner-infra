@@ -8,6 +8,12 @@
 #
 # The feed fixtures below are real values transcribed from the API on
 # 2026-08-16, trimmed to the cycles each assertion needs.
+#
+# Several needles are single-quoted Markdown containing backticks, which
+# shellcheck reads as a command substitution nobody expanded (SC2016). They are
+# literal report text — the assertion is that the report says `.nvmrc`, backticks
+# and all — so those sites carry a bare disable rather than being rewritten into
+# something that no longer matches what a reader sees.
 
 set -uo pipefail
 
@@ -93,8 +99,10 @@ run() { bash "$SCAN" --repo-root "$REPO" --cache "$CACHE" --today "$TODAY" \
 run
 check "the scan exits 0 — findings are the report, never the exit code" 0 "$?"
 
+# shellcheck disable=SC2016
 has "a .nvmrc runtime is read"            '`.nvmrc`'
 has "a Dockerfile base image is read"     'Dockerfile'
+# shellcheck disable=SC2016
 has "a go.mod language version is read"   '`go.mod`'
 has "a workflow setup-* step is read"     'build.yml'
 has "a tracked framework in package.json is read" 'package.json'
@@ -105,6 +113,7 @@ has "the golden image's baked node is read" 'image.pkr.hcl'
 
 # The `default` sits after a multi-line heredoc description — the shape that
 # defeated a `grep -A4` and reported the image clean.
+# shellcheck disable=SC2016
 has "the baked node major is 22, read past its heredoc description" '| `nodejs` | 22 |'
 
 # The host OS is supported, so its evidence is an ABSENCE. `ubuntu-2404-lts`
@@ -127,6 +136,7 @@ has "the unsupported findings lead the report" 'Unsupported — running past end
 # A supported declaration produces no row at all. Ubuntu 24.04 is supported
 # until 2029 and must be invisible here — a report that lists what is fine
 # alongside what is not is a report nobody finishes reading.
+# shellcheck disable=SC2016
 hasnt "a supported version is not reported" '`ubuntu`'
 
 # --- a library with no published lifetime is NOT a finding -------------------

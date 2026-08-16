@@ -31,7 +31,9 @@ N20_EOL=2026-04-30; N20_SUP=2024-10-22
 N22_EOL=2027-04-30; N22_SUP=2025-10-21
 N24_EOL=2028-04-30; N24_SUP=2026-10-20
 N25_EOL=2026-06-01; N25_SUP=2026-04-01
-N26_EOL=2029-04-30; N26_SUP=2027-10-27
+# 26 appears only ever as the BEST line, and the rule consults nothing but a
+# best line's end of life — so there is deliberately no `N26_SUP` beside it.
+N26_EOL=2029-04-30
 
 TODAY=2026-08-16
 W=180
