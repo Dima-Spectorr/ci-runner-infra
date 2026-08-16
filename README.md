@@ -474,6 +474,21 @@ fleet-wide downgrade that arrives at every consumer on its next apply with no
 pull request anywhere and nothing red. An unreadable current version fails the
 release rather than moving the tag blind; the next push to main retries it.
 
+**The move is attempted only when it would change something.** A push that does
+not bump `VERSION` finds the floating tag already at the object the exact tag
+names, says so, and writes nothing — that call is the only one in the workflow
+needing write access to a tag ref, and on 2026-08-15 six consecutive runs went
+red on a `403` from it, five of them for a write that could not have changed
+anything, over releases that had already been published correctly. A move that
+*is* needed is attempted three times with the API's own response in the log, and
+the tag is read back afterwards: a write that reports success and does not land
+looks exactly like a published release until a consumer applies it. The workflow
+is idempotent by construction and can be re-run by hand from the Actions tab
+(`workflow_dispatch`), so recovering a release never means pushing a commit to
+main for a non-release reason — and it refuses to run on any other ref, because
+it tags the commit it runs on and a tag published at an unmerged commit can
+never be taken back.
+
 Consumers choose how they adopt:
 
 | pin | adopts | costs |

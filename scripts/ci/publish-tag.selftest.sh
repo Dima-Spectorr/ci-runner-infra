@@ -130,6 +130,67 @@ never_moves_the_major_backwards() {
   matches "$code" 'refusing to move it blind' || return 1
 }
 
+# Running on every push means most runs have nothing to do, and the PATCH that
+# moves the floating tag is the ONLY call in the workflow needing write access to
+# a tag ref. On 2026-08-15 six consecutive runs went red on a 403 from it — five
+# of them writing the object the ref already held, over releases that had already
+# been published correctly. A write that cannot change anything must not be
+# attempted: a release workflow red for a write nobody needed is red in the way
+# that stops anyone reading it, and the sixth failure looked exactly like the
+# five.
+skips_a_pointless_move() {
+  local code; code=$(code_of "$1")
+  matches "$code" '\[ "\$at" = "\$sha" \]' || return 1
+  matches "$code" 'nothing to move' || return 1
+}
+
+# That 403 was transient: the same call, with the same token, against the same
+# ref, at the same target, succeeded twelve seconds before the window opened and
+# again seventy minutes after it closed, with no repository setting that any API
+# shows changing in between. One attempt is not evidence that a release is
+# broken — and a failure message without the API's own words is not evidence of
+# anything at all, which is why the diagnosis cost a day.
+retries_a_failed_write() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'retry_api\(\) \{' || return 1
+  matches "$code" 'sleep \$\(\(attempt' || return 1
+  matches "$code" 'of 3 failed: \$\(tr' || return 1
+  matches "$code" 'retry_api -X PATCH' || return 1
+}
+
+# The write reporting success and the tag actually pointing somewhere are two
+# facts, and only the second one reaches consumers. Nobody looks at the floating
+# tag again until a `terraform apply` resolves it, so a 200 that did not land —
+# or a concurrent run that repointed it in between — is indistinguishable from a
+# published release right up to the moment it is in the fleet.
+reads_the_tag_back() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'now=\$\(retry_api "repos/\$GITHUB_REPOSITORY/git/ref/tags/\$major"' || return 1
+  matches "$code" '\[ "\$now" != "\$sha" \]' || return 1
+  matches "$code" 'did not land' || return 1
+}
+
+# Everything here is idempotent, so the answer to a failed release is to run it
+# again. Without a manual trigger the only way to run it again is to push a
+# commit to main — a release-shaped act performed for a non-release reason — and
+# re-running the failed run works only while the run is still retained.
+can_be_re_run_by_hand() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^  workflow_dispatch:' || return 1
+}
+
+# ...and a manual trigger lets the caller pick the ref, while every step here
+# publishes a tag AT THE COMMIT IT RUNS ON. Dispatched from a feature branch it
+# would create the tag that branch's VERSION names at an unmerged commit —
+# permanently, since a published exact tag is never moved — and every consumer
+# pinning it would get code that never passed the queue. The lever that recovers
+# a release must not also be the lever that publishes one from anywhere.
+refuses_a_release_off_the_default_branch() {
+  local code; code=$(code_of "$1")
+  matches "$code" "if: github\.ref != 'refs/heads/main'" || return 1
+  matches "$code" 'runs on the default branch only' || return 1
+}
+
 # release-tag.yml asserts a pushed tag equals VERSION. The floating major tag is
 # by construction never equal to VERSION, so a `v*` trigger makes every
 # successful release produce a failing run — and a check that is red on every
@@ -154,6 +215,12 @@ check creates_an_annotated_tag      "the tag is not annotated"
 check never_moves_an_exact_tag      "a published exact tag can be moved"
 check advances_the_major_tag        "the floating major tag is not advanced"
 check never_moves_the_major_backwards "the floating major tag can be moved backwards"
+check skips_a_pointless_move        "a move that cannot change anything is attempted anyway"
+check retries_a_failed_write        "a single transient API failure fails the release, silently"
+check reads_the_tag_back            "the tag is not read back, so a write that did not land passes"
+check can_be_re_run_by_hand         "a failed release cannot be re-driven without pushing to main"
+check refuses_a_release_off_the_default_branch \
+                                    "a manual run from a feature branch would publish a tag at an unmerged commit"
 
 [ -f "$RELEASE" ] || { echo "FAIL: missing $RELEASE"; exit 1; }
 if release_check_ignores_the_floating_tag "$RELEASE"; then ok
@@ -195,6 +262,26 @@ mutate "the current version is no longer read from the tag" \
   's|contents/VERSION?ref=\$major|contents/VERSION|'                     never_moves_the_major_backwards
 mutate "an unreadable current version fails open" \
   's|refusing to move it blind|continuing anyway|'                       never_moves_the_major_backwards
+mutate "the already-there check no longer compares against the tag being published" \
+  's|\[ "\$at" = "\$sha" \]|[ "$at" = "something-else" ]|'               skips_a_pointless_move
+mutate "the no-op falls through to the write anyway" \
+  's|nothing to move|moving it regardless|'                              skips_a_pointless_move
+mutate "the retry wrapper is bypassed" \
+  's|retry_api|gh_api_once|'                                             retries_a_failed_write
+mutate "the backoff between attempts is dropped" \
+  's|^ *sleep .*|              :|'                                       retries_a_failed_write
+mutate "the API answer no longer reaches the log" \
+  's|of 3 failed: \$(tr|of 3 failed. #|'                                 retries_a_failed_write
+mutate "the tag is no longer read back after the write" \
+  's|^          now=\$(retry_api|          unused=$(retry_api|'          reads_the_tag_back
+mutate "a write that did not land is accepted" \
+  's|did not land|landed|'                                               reads_the_tag_back
+mutate "the manual re-run lever is removed" \
+  's|^  workflow_dispatch:||'                                            can_be_re_run_by_hand
+mutate "the branch guard is widened past the default branch" \
+  's|refs/heads/main|refs/heads/anything|'                               refuses_a_release_off_the_default_branch
+mutate "the branch guard can never fire" \
+  's|^        if: github.ref != .*|        if: false|'                   refuses_a_release_off_the_default_branch
 
 mutate_file() { # <description> <file> <sed-program> <predicate> — predicate must go false
   local desc="$1" f="$2" prog="$3" pred="$4" tmp
