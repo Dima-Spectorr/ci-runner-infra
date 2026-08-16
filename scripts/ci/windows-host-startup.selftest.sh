@@ -508,6 +508,75 @@ has_probe_literal_guard() { # <file>
 # in grep, and PSScriptAnalyzer's PSUseCompatibleSyntax would not have helped
 # either -- it checks language syntax, and `::Fill(...)` is valid 5.1 syntax for
 # a method 5.1 does not have.
+# --- invariant: the boot log never enters the success stream -----------------
+#
+# Write-BootLog is called 28 times and several of its callers CAPTURE the value
+# of the function that called it. `Write-Output` puts the line on the success
+# stream, so every one of those captures becomes an object[] of the log lines
+# followed by the value -- and that is boot-fatal in three separate places, none
+# of which is a diagnostics problem:
+#
+#   phase 0 never starts   Install-BeaconService logs and returns $scriptPath;
+#                          Invoke-Phase0Preflight dot-sources it with
+#                          `. $beaconPath`. Dot-sourcing an object[] fails, so
+#                          the FIRST phase denies the boot on every host.
+#
+#   every slot mis-registers  Wait-RegistrationToken logs and returns the token.
+#                          Register-SlotAgent takes [string], and PowerShell
+#                          coerces an object[] to a string by joining its
+#                          elements with a space -- so config.cmd's --token gets
+#                          a timestamped log line with the real token stuck on
+#                          the end.
+#
+#   phase 5 never binds    Invoke-Phase0Preflight returns $cfg, and
+#                          Invoke-Phase5Registration's -Config is
+#                          [System.Collections.IDictionary]. Member access like
+#                          $cfg.Slots survives by member enumeration, which is
+#                          precisely why this looks like it works, but the
+#                          parameter bind does not.
+#
+# The Pester suite cannot see any of this: it runs the pure functions, and the
+# one impure path it touches does `Mock -CommandName Write-BootLog -MockWith {}`,
+# which removes the pollution as a side effect of the mock. So the assertion
+# lives here, on the text, scoped to the function -- `Write-Output` elsewhere in
+# a 2700-line file is nobody's bug, and it is only inside this one function that
+# it poisons every caller's return value.
+bootlog_body_of() { # <file>
+  code_of "$1" | sed -n '/^function Write-BootLog {$/,/^}$/p'
+}
+
+has_uncapturable_boot_log() { # <file>
+  local body
+  body=$(bootlog_body_of "$1")
+
+  # The anchor first. A rename or a reformat that makes the range extract
+  # nothing would leave every check below vacuously true -- the same green-over-
+  # an-assertion-never-made hole the mutate() harness refuses to score.
+  matches "$body" '^function Write-BootLog \{$' || return 1
+
+  # The regression itself.
+  ! matches "$body" 'Write-Output' || return 1
+  # The same fault with no cmdlet to grep for: a bare `$line` on its own is an
+  # expression statement, and an expression statement IS the success stream.
+  ! matches "$body" '^[[:space:]]*\$line[[:space:]]*$' || return 1
+  # Behaviourally correct and CI-fatal: PSAvoidUsingWriteHost is Warning
+  # severity and powershell-gate.sh runs PSScriptAnalyzer at
+  # -Severity Error,Warning with no exclusions.
+  ! matches "$body" 'Write-Host' || return 1
+
+  # And the form that must be there. [Console]::Out writes to the process's own
+  # stdout handle -- which is what the guest agent captures, so the boot log is
+  # unchanged where anyone reads it -- and is unreachable from `$x = f`. It is
+  # .NET Framework 4.8-safe, so it does not need a has_5_1_compatible_apis
+  # entry; the same class is already used at [Console]::Error.WriteLine in the
+  # job-hook payload.
+  matches "$body" '\[Console\]::Out\.WriteLine\(\$line\)' || return 1
+
+  # Losing the log must still never stop a boot: the file write stays wrapped
+  # and its failure stays swallowed.
+  matches "$body" 'Add-Content -Path \$script:LogPath -Value \$line -ErrorAction Stop' || return 1
+}
+
 has_5_1_compatible_apis() { # <file>
   local code
   code=$(code_of "$1")
@@ -614,6 +683,12 @@ if has_5_1_compatible_apis "$SCRIPT"; then
   ok
 else
   bad "the boot script calls an API that PowerShell 7 has and Windows PowerShell 5.1 does not, or no longer draws its entropy the way both runtimes support — the guest agent runs this file with the in-box powershell.exe, so the call throws MethodNotFound at boot and every host in the pool denies itself, while the parser, the analyzer and a Pester suite running under pwsh 7 all stay green"
+fi
+
+if has_uncapturable_boot_log "$SCRIPT"; then
+  ok
+else
+  bad "Write-BootLog writes to the SUCCESS stream, so every function that logs and then returns a value returns an object[] of the log lines plus the value -- phase 0 cannot dot-source the beacon path it captured, config.cmd's --token receives a timestamped log line joined to the token, and the phase 0 config no longer binds to Invoke-Phase5Registration's [IDictionary]. The Pester suite cannot see this: it mocks Write-BootLog away on the one impure path it touches"
 fi
 
 if has_job_hook_acl "$SCRIPT"; then
@@ -922,6 +997,23 @@ mutate "the generator leaked instead of disposed" \
 mutate "the byte draw removed, leaving a password built from an empty buffer" \
   's|\$rng\.GetBytes(\$bytes)||' \
   has_5_1_compatible_apis
+
+# --- group 13: the boot log goes back into the success stream ----------------
+#     The original regression plus the two other spellings of it. All three
+#     parse, all three lint (except Write-Host, which is the point of the third
+#     case being separate), and all three pass the Pester suite unchanged.
+mutate "the original regression: Write-Output back in Write-BootLog" \
+  's|\[Console\]::Out\.WriteLine(\$line)|Write-Output $line|' \
+  has_uncapturable_boot_log
+mutate "the bare expression statement, which is the success stream with no cmdlet to grep for" \
+  's|\[Console\]::Out\.WriteLine(\$line)|$line|' \
+  has_uncapturable_boot_log
+mutate "Write-Host, which is out-of-band but fails PSAvoidUsingWriteHost in powershell-gate.sh" \
+  's|\[Console\]::Out\.WriteLine(\$line)|Write-Host $line|' \
+  has_uncapturable_boot_log
+mutate "the file write dropped, so a host that boots leaves no boot log behind" \
+  's|Add-Content -Path \$script:LogPath -Value \$line -ErrorAction Stop||' \
+  has_uncapturable_boot_log
 
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -185,7 +185,19 @@ function Write-BootLog {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Message)
     $line = '[{0}] {1}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $Message
-    Write-Output $line
+    # NOT Write-Output, and NOT Write-Host. Write-Output puts the line on the
+    # SUCCESS stream, so every function that logs and then returns a value
+    # returns the log lines PLUS the value as an object[] -- which is a
+    # boot-fatal fault, not a cosmetic one: `. $beaconPath` cannot dot-source an
+    # array, `--token` receives a timestamped log line joined to the token, and
+    # an object[] does not bind to an [IDictionary] parameter. Write-Host would
+    # be correct behaviourally and fails PSAvoidUsingWriteHost, which
+    # powershell-gate.sh runs at -Severity Error,Warning with no exclusions.
+    # [Console]::Out.WriteLine writes straight to the process's stdout handle --
+    # which is what the guest agent captures -- and can never be captured by
+    # `$x = Some-Function`. Available on .NET Framework 4.8 / Windows
+    # PowerShell 5.1, which is what runs this file.
+    [Console]::Out.WriteLine($line)
     try {
         Add-Content -Path $script:LogPath -Value $line -ErrorAction Stop
     } catch {
