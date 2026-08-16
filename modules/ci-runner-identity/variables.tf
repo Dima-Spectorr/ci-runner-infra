@@ -80,7 +80,10 @@ variable "host_os" {
 
     Terraform cannot see what IAM a caller's account holds elsewhere, so this is
     a declaration, not an enforcement. The enforcement is the host's own boot
-    probe, which asserts a 403 on the secret from the token it is given.
+    probe, which asserts a 403 on the secret from the token it is given — that
+    probe ships with the Windows host template and does not exist yet, so until
+    it does, `host_os = "windows"` reduces the grants this module writes and
+    proves nothing about grants written anywhere else.
   EOT
   type        = string
   default     = "linux"
