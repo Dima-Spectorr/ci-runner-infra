@@ -1141,12 +1141,13 @@ function Test-ProbeLiteral {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Value,
-        [Parameter(Mandatory = $true)][ValidateSet('name', 'endpoint', 'path')][string] $Kind
+        [Parameter(Mandatory = $true)][ValidateSet('name', 'endpoint', 'path', 'url')][string] $Kind
     )
     if ([string]::IsNullOrEmpty($Value)) { return $true }
     switch ($Kind) {
         'name' { return ($Value -match '^[A-Za-z0-9_-]+$') }
         'endpoint' { return ($Value -match '^[A-Za-z0-9._-]+:[0-9]+$') }
+        'url' { return ($Value -match '^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._-]+)*$') }
         default { return ($Value -match '^[A-Za-z]:\\[A-Za-z0-9 \\._-]*$') }
     }
 }
@@ -1199,7 +1200,8 @@ function Get-ProbeScript {
             @{ n = 'BrokerEndpoint'; v = $BrokerEndpoint; k = 'endpoint' },
             @{ n = 'SiblingWorkspace'; v = $SiblingWorkspace; k = 'path' },
             @{ n = 'CacheRoot'; v = $CacheRoot; k = 'path' },
-            @{ n = 'ResultPath'; v = $ResultPath; k = 'path' })) {
+            @{ n = 'ResultPath'; v = $ResultPath; k = 'path' },
+            @{ n = 'MetadataRoot'; v = $MetadataRoot; k = 'url' })) {
         if (-not (Test-ProbeLiteral -Value $pair.v -Kind $pair.k)) {
             throw ("probe $($pair.n) '$($pair.v)' is not a bare $($pair.k), so it would be " +
                 'interpolated as code into a payload that holds a host token')
