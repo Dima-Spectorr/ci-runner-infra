@@ -146,6 +146,21 @@ fires_only_for_the_root_it_applies() {
   matches "$code" 'included_files *= *local\.included_files'                    || return 1
 }
 
+# 8. Every step names its own image, and no image here has both tools: the
+#    terraform image has no gcloud, the cloud-sdk image has no terraform. The
+#    report step needs a terraform OUTPUT and a gcloud CALL, and the honest way
+#    across is the workspace. Written the obvious way it is `terraform: not
+#    found` in a step whose whole job is to print one sentence — a failure that
+#    looks like the report is broken, and gets fixed by deleting the report.
+runs_each_tool_in_an_image_that_has_it() {
+  local sdk_step
+  sdk_step=$(awk '/name .*cloudsdktool/,/^    }/' "$1")
+  # The step must exist, or this check is vacuous — and a vacuous check here
+  # reads as "the tools are correctly separated".
+  matches "$sdk_step" 'gcloud compute instance-groups' || return 1
+  ! matches "$sdk_step" 'terraform '                   || return 1
+}
+
 echo "apply-trigger self-test:"
 
 # The helpers carry the traps they were written to avoid, so they are checked
@@ -174,6 +189,7 @@ check derives_both_branch_spellings_from_one_input "$MAIN" "the scheduled run an
 check declares_where_logs_go                      "$MAIN" "no logging option — the build is refused at submit time, on the first push"
 check pins_the_terraform_image                    "$MAIN" "the terraform image floats — an unattended apply can break with nothing merged"
 check fires_only_for_the_root_it_applies          "$MAIN" "the trigger fires on every commit in the repository"
+check runs_each_tool_in_an_image_that_has_it      "$MAIN" "a step calls a tool its image does not carry — the report fails with 'not found' and looks broken"
 
 mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
   local desc="$1" f="$2" prog="$3" pred="$4" tmp
@@ -199,6 +215,8 @@ mutate "'logs are in Cloud Logging anyway' — the option dropped" "$MAIN" \
   's|logging = "CLOUD_LOGGING_ONLY"|logging = "NONE"|' declares_where_logs_go
 mutate "'pin a version nobody has to bump' — floating image" "$MAIN" \
   's|hashicorp/terraform:${var.terraform_version}|hashicorp/terraform:latest|' pins_the_terraform_image
+mutate "'one step instead of two' — terraform output moved into the gcloud image" "$MAIN" \
+  's|mig=$(cat /workspace/.mig-name 2>/dev/null \|\| true)|mig=$(terraform output -raw mig_name)|' runs_each_tool_in_an_image_that_has_it
 mutate "'the tfvars live outside the root and the apply never fires' — scope removed" "$MAIN" \
   's|included_files = local.included_files|included_files = []|' fires_only_for_the_root_it_applies
 

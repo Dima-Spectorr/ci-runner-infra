@@ -168,6 +168,27 @@ resource "google_cloudbuild_trigger" "apply" {
       ]
     }
 
+    # `terraform output` needs terraform, and the step that reads the instance
+    # group needs gcloud — no image on either side of this repository has both.
+    # So the value crosses on the workspace rather than the tool crossing into
+    # the wrong image. This is the failure that would have looked like a broken
+    # summary and been "fixed" by dropping the report: `terraform: not found`,
+    # in a step whose whole job is to print a sentence.
+    #
+    # Never fatal. A root with no `mig_name` output is a root this module can
+    # still apply.
+    step {
+      id         = "mig-name"
+      name       = "hashicorp/terraform:${var.terraform_version}"
+      entrypoint = "sh"
+      dir        = var.terraform_root
+      args = ["-c", <<-EOT
+        set -u
+        terraform output -raw mig_name > /workspace/.mig-name 2>/dev/null || : > /workspace/.mig-name
+      EOT
+      ]
+    }
+
     # The managed instance group updates OPPORTUNISTICally: a new instance
     # template does NOT replace running hosts, so an apply that "succeeded" can
     # leave every host on the previous startup script until the controller
@@ -181,13 +202,12 @@ resource "google_cloudbuild_trigger" "apply" {
       id         = "report"
       name       = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
       entrypoint = "sh"
-      dir        = var.terraform_root
       args = ["-c", <<-EOT
         set -u
         echo "Hosts do not restart on an apply. The group replaces them opportunistically,"
         echo "as the controller drains idle ones, so until that happens they keep running"
         echo "the PREVIOUS startup script — an apply is not the same thing as in effect."
-        mig=$(terraform output -raw mig_name 2>/dev/null) || mig=""
+        mig=$(cat /workspace/.mig-name 2>/dev/null || true)
         if [ -z "$mig" ]; then
           echo "Hosts currently up: (no mig_name output in this root — not counted)"
           exit 0
