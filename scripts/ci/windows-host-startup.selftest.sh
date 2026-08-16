@@ -413,6 +413,40 @@ has_cleared_recovery_actions() { # <file>
   ! matches "$code" 'actions=[^\n]*restart' || return 1
 }
 
+has_worthless_host_identity_probe() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # §3A replaced "the slot cannot reach the endpoint" -- a property this design
+  # does not have -- with "the token the endpoint yields is worthless". Both
+  # halves of the #1958 reduction are asserted, and the assertion is a 403 from
+  # the real API rather than anything about a socket.
+  matches "$code" 'secretmanager\.googleapis\.com' || return 1
+  matches "$code" 'monitoring\.googleapis\.com' || return 1
+  matches "$code" 'Test-NegativeCapability' || return 1
+
+  # 403 and ONLY 403. The three near-misses are each a different kind of wrong:
+  # 200 is the finding, $null is unproved, and 401 is a probe whose own token
+  # acquisition failed and which therefore answers 401 to everything -- a
+  # predicate that accepted "not 200" would score that boot perfect.
+  matches "$code" 'int\] \$StatusCode -eq 403' || return 1
+
+  # The token under test comes from the REAL metadata server. Minting it through
+  # the broker would measure the runner service's environment block instead of
+  # the host identity, which is the one thing this check is about.
+  matches "$code" "'\\\$MetadataRoot/instance/service-accounts/default/token'" || return 1
+
+  # The payload RECORDS; the boot script DECIDES. A verdict reached inside a
+  # service running as the account under test is not evidence about that
+  # account, and a verdict that failed to be written must not read as a clean
+  # one -- which is what the missing-file case below is.
+  matches "$code" 'the probe produced no verdict at all' || return 1
+
+  # Both halves of the broker identity. A broker that silently fell back to the
+  # host account looks like a working broker from every angle except this one.
+  matches "$code" 'the broker vends' || return 1
+}
+
 # --- the helper carries the trap it was written to avoid ---------------------
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -465,6 +499,12 @@ if has_owned_broker_socket "$SCRIPT"; then
   ok
 else
   bad "readiness trusts whoever answers on the broker's port — the port is free for ten seconds after any broker crash and every slot shares one loopback, so a process a previous job left behind can vend an attacker-chosen token, project and zone to every later job on this host"
+fi
+
+if has_worthless_host_identity_probe "$SCRIPT"; then
+  ok
+else
+  bad "the boot probe no longer proves the host identity is worthless — §3A traded the metadata fence for an IAM reduction that Terraform cannot verify at plan time, so a Windows pool pointed at an unreduced host account applies clean and is only wrong once a pull request is running on it"
 fi
 
 if has_job_hook_acl "$SCRIPT"; then
@@ -703,6 +743,27 @@ mutate "a restart action written instead of an empty one" \
 mutate "a failed clear downgraded to a warning" \
   's|Deny-Boot ("could not clear the recovery actions on \$ServiceName|Write-BootLog ("recovery actions not cleared on $ServiceName|' \
   has_cleared_recovery_actions
+
+# 10. The boot probe stops proving the reduction, in each shape that still reads
+#     like a passing probe.
+mutate "the negative capability check softened to anything-but-200" \
+  's|int\] \$StatusCode -eq 403|[int] $StatusCode -ne 200|' \
+  has_worthless_host_identity_probe
+mutate "the App-key capability no longer tried at all" \
+  's|secretmanager\.googleapis\.com|example\.invalid|' \
+  has_worthless_host_identity_probe
+mutate "the demand-metric capability no longer tried at all" \
+  's|monitoring\.googleapis\.com|example\.invalid|' \
+  has_worthless_host_identity_probe
+mutate "the probe spending a broker-minted token instead of the host's own" \
+  's|$MetadataRoot/instance/service-accounts/default/token|$BrokerEndpoint/computeMetadata/v1/instance/service-accounts/default/token|' \
+  has_worthless_host_identity_probe
+mutate "a probe that wrote no verdict read as a probe that found nothing" \
+  's|the probe produced no verdict at all|the probe reported nothing|' \
+  has_worthless_host_identity_probe
+mutate "the broker identity accepted without checking whose it is" \
+  's|the broker vends|the broker answered as|' \
+  has_worthless_host_identity_probe
 
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

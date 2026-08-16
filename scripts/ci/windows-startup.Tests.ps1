@@ -835,3 +835,203 @@ Describe 'service environment block' {
         ($v -join "`n") | Should -Match 'ACTIONS_RUNNER_HOOK_JOB_COMPLETED='
     }
 }
+
+Describe 'negative capability' {
+    # 403 is the only proof. Everything else is either the finding itself or an
+    # unproved check, and both must fail the boot.
+    It 'accepts a 403 and only a 403' {
+        Test-NegativeCapability -StatusCode 403 | Should -BeTrue
+        Test-NegativeCapability -StatusCode '403' | Should -BeTrue
+    }
+
+    It 'rejects a 200, which is the finding this phase exists to catch' {
+        Test-NegativeCapability -StatusCode 200 | Should -BeFalse
+    }
+
+    # A probe whose token acquisition failed answers 401 to everything and would
+    # otherwise report a perfect score.
+    It 'rejects a 401, which says nothing about what the credential can do' {
+        Test-NegativeCapability -StatusCode 401 | Should -BeFalse
+    }
+
+    It 'reads an unreachable endpoint as unproved rather than as proved' {
+        Test-NegativeCapability -StatusCode $null | Should -BeFalse
+        Test-NegativeCapability -StatusCode 'timeout' | Should -BeFalse
+    }
+}
+
+Describe 'probe verdict' {
+    BeforeAll {
+        $script:CleanProbe = {
+            [pscustomobject] @{
+                hostToken     = $true; secretStatus = 403; metricStatus = 403
+                brokerEmail   = 'jobs@p.iam.gserviceaccount.com'
+                siblingDenied = $true; cacheWritable = $true; dnsResolved = $true
+            }
+        }
+    }
+
+    It 'passes a host that proved every property' {
+        Get-ProbeFailure -Result (& $script:CleanProbe) `
+            -JobServiceAccount 'jobs@p.iam.gserviceaccount.com' | Should -BeNullOrEmpty
+    }
+
+    # The case the whole function exists to get right: a service that never
+    # started writes no file, and "no file" must not read as "no findings".
+    It 'reports a missing verdict as a failure rather than as a pass' {
+        $f = @(Get-ProbeFailure -Result $null -JobServiceAccount '')
+        $f.Count | Should -Be 1
+        $f[0] | Should -Match 'no verdict'
+    }
+
+    It 'fails a host whose identity can still read the App key' {
+        $r = & $script:CleanProbe
+        $r.secretStatus = 200
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+            Should -Match 'secretmanager'
+    }
+
+    It 'fails a host whose identity can still write the demand metric' {
+        $r = & $script:CleanProbe
+        $r.metricStatus = 200
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+            Should -Match 'timeSeries'
+    }
+
+    # Two perfect 401s are not two passes.
+    It 'fails a probe that never obtained a host token, whatever else it reported' {
+        $r = & $script:CleanProbe
+        $r.hostToken = $false
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+            Should -Match 'could not obtain a host token'
+    }
+
+    # The failure the broker exists to prevent, and the one that looks most like
+    # a working broker from every other angle.
+    It 'fails a broker that fell back to the host identity' {
+        $r = & $script:CleanProbe
+        $r.brokerEmail = 'host@p.iam.gserviceaccount.com'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount 'jobs@p.iam.gserviceaccount.com') -join "`n") |
+            Should -Match 'vends'
+    }
+
+    It 'fails a broker that answered at all on a pool that configured none' {
+        $r = & $script:CleanProbe
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount '') -join "`n") |
+            Should -Match 'configured no job service account'
+    }
+
+    It 'passes a no-broker pool that reported no broker' {
+        $r = & $script:CleanProbe
+        $r.brokerEmail = ''
+        Get-ProbeFailure -Result $r -JobServiceAccount '' | Should -BeNullOrEmpty
+    }
+
+    It 'fails a slot that could read a sibling workspace' {
+        $r = & $script:CleanProbe
+        $r.siblingDenied = $false
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail) -join "`n") |
+            Should -Match 'another slot'
+    }
+
+    It 'fails an unwritable cache and an unresolvable name' {
+        $r = & $script:CleanProbe
+        $r.cacheWritable = $false
+        $r.dnsResolved = $false
+        @(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail).Count | Should -Be 2
+    }
+
+    # All of them, not the first. The operator gets one look at the serial
+    # console before the controller reclaims the instance.
+    It 'reports every reason at once' {
+        $r = [pscustomobject] @{
+            hostToken     = $false; secretStatus = 200; metricStatus = 200
+            brokerEmail   = ''; siblingDenied = $false; cacheWritable = $false; dnsResolved = $false
+        }
+        @(Get-ProbeFailure -Result $r -JobServiceAccount 'jobs@p.iam.gserviceaccount.com').Count |
+            Should -Be 7
+    }
+
+    # A verdict written by an older image lacks fields this one reads. Absent is
+    # not true, and an unknown property must not throw its way past the gate.
+    It 'treats an absent field as unproved rather than throwing' {
+        $f = @(Get-ProbeFailure -Result ([pscustomobject] @{ hostToken = $true }) -JobServiceAccount '')
+        $f.Count | Should -Be 5
+    }
+}
+
+Describe 'probe payload' {
+    BeforeAll {
+        $script:Payload = Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '127.0.0.1:8081' `
+            -SiblingWorkspace 'C:\ci\slots\ci-s2\w' -CacheRoot 'C:\ci\slots\ci-s1\w' `
+            -ResultPath 'C:\ci\boot-probe.json'
+    }
+
+    # The real metadata server, never the broker. The question is what a job can
+    # reach behind the script's back; asking the broker would measure the
+    # environment block instead of the identity.
+    It 'spends a token minted by the real metadata server' {
+        $script:Payload |
+            Should -Match '169\.254\.169\.254/computeMetadata/v1/instance/service-accounts/default/token'
+    }
+
+    It 'tries both capabilities the reduction removed' {
+        $script:Payload | Should -Match 'secretmanager\.googleapis\.com'
+        $script:Payload | Should -Match 'monitoring\.googleapis\.com'
+    }
+
+    It 'names the secret it was told to try, not a placeholder' {
+        $script:Payload | Should -Match 'secrets/app-key/versions/latest:access'
+    }
+
+    It 'reads the broker at the endpoint it was given' {
+        $script:Payload | Should -Match 'http://127\.0\.0\.1:8081/computeMetadata'
+    }
+
+    # A payload that decides is a payload whose verdict came from the account
+    # under test. It records; Get-ProbeFailure decides.
+    It 'never denies a boot from inside the unprivileged payload' {
+        $script:Payload | Should -Not -Match 'Deny-Boot'
+    }
+
+    It 'writes its verdict where the boot script looks for it' {
+        $script:Payload | Should -Match "Set-Content -LiteralPath 'C:\\ci\\boot-probe\.json'"
+    }
+
+    It 'is valid PowerShell rather than merely a string' {
+        { [scriptblock]::Create($script:Payload) } | Should -Not -Throw
+    }
+
+    It 'omits the broker read entirely when there is no broker' {
+        $p = Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
+            -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1'
+        $p | Should -Not -Match 'service-accounts/default/email'
+    }
+}
+
+Describe 'probe service definition' {
+    BeforeAll {
+        $script:ProbeXml = Get-ProbeServiceConfig -ScriptPath 'C:\ci\bin\ci-boot-probe.ps1'
+    }
+
+    # Manual and non-restarting, unlike every other service this file installs.
+    # The probe is a one-shot measurement: Automatic re-runs it on a reboot the
+    # boot script is not driving, and a restart policy turns a payload that
+    # cannot start into a loop instead of the missing file the verdict needs.
+    It 'does not start itself on a later boot' {
+        $script:ProbeXml | Should -Match '<startmode>Manual</startmode>'
+    }
+
+    It 'has no restart policy, so a payload that cannot start stays not started' {
+        $script:ProbeXml | Should -Not -Match 'onfailure'
+    }
+
+    It 'runs the payload it was given, non-interactively' {
+        $script:ProbeXml | Should -Match 'ci-boot-probe\.ps1'
+        $script:ProbeXml | Should -Match '\-NonInteractive'
+    }
+
+    It 'is well-formed XML' {
+        { [xml] $script:ProbeXml } | Should -Not -Throw
+    }
+}

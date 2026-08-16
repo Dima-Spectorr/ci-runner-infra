@@ -22,7 +22,7 @@
 #   phase 3  the job credential broker
 #   phase 4  the per-job credential reset hooks
 #   phase 5  agent registration as a service
-#   phase 6  the boot probe                                    (not yet)
+#   phase 6  the boot probe                        (payload + verdict only)
 #
 # THE REGISTRATION TOKEN IS READ ONCE, AND A HOST THAT CANNOT GET ONE BLOCKS
 #
@@ -979,6 +979,298 @@ function Get-SlotAgentName {
         [Parameter(Mandatory = $true)][int] $Index
     )
     return "$InstanceName-s$Index"
+}
+
+# --- phase 6: the boot probe, pure half ---------------------------------------
+#
+# ASSERT THE CAPABILITY, NOT THE DAEMON -- AND, HERE, ASSERT ITS ABSENCE
+#
+# Section 3A of the ADR deleted the metadata fence, so the old probe's central
+# claim -- "a slot user cannot reach the token endpoint" -- is not a property
+# this design has, and a probe asserting it would fail every boot. What replaced
+# it is stronger evidence, not weaker: the endpoint DOES answer, and the token it
+# yields is worthless. `secretmanager.versions.access` on the GitHub App key must
+# come back 403, and `monitoring.timeSeries.create` must come back 403. Those two
+# are the whole of the #1958 reduction, expressed as something a host can check
+# about ITSELF, from inside the identity it is worried about.
+#
+# It has to be checked at boot because it cannot be checked anywhere earlier.
+# Terraform cannot see the IAM a caller's service account happens to hold, so a
+# Windows pool pointed at an unreduced host identity plans clean, applies clean,
+# and is only wrong once a pull request is running on it.
+#
+# This half is pure: the payload text, the shim definition, and the verdict. The
+# harness that runs the payload as a slot user, and the Deny-Boot that acts on
+# the verdict, are separate -- these functions are what Pester can execute on
+# ubuntu-latest, and they are the ones holding the decisions.
+
+$script:ProbeServiceName = 'ci-boot-probe'
+$script:ProbeResultPath = 'C:\ci\boot-probe.json'
+
+function Test-NegativeCapability {
+    <#
+      .SYNOPSIS
+        Does this HTTP status prove the host token CANNOT do the thing? Pure.
+      .DESCRIPTION
+        403 and nothing else. The three near-misses are each a different kind of
+        wrong and all three have to fail:
+
+        200 is the finding. The identity was not reduced, the host token still
+        reads the GitHub App key or still writes the demand metric, and every
+        repository the App is installed on is reachable from a pull request.
+
+        $null -- a DNS failure, a refused connection, a timeout -- is UNPROVED,
+        not proved. Reading it as a pass is how a boundary decays into a comment:
+        the one host where the check could not run is the one host nobody ever
+        looks at again.
+
+        401 is unproved too, and it is the subtle one. It means the request went
+        out without a usable credential, so it says nothing at all about what the
+        credential can do -- a probe whose token acquisition quietly failed
+        returns 401 for every call and would otherwise report a perfect score.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()] $StatusCode)
+    if ($null -eq $StatusCode) { return $false }
+    if ("$StatusCode" -notmatch '^[0-9]+$') { return $false }
+    return ([int] $StatusCode -eq 403)
+}
+
+function Get-ProbeFailure {
+    <#
+      .SYNOPSIS
+        Every reason this host must not register, from one probe verdict. Pure.
+      .DESCRIPTION
+        Returns an array of sentences; empty means the boot may continue. All of
+        them, not the first: a host that is wrong in three ways should say so
+        once, because the operator reading the serial console gets one look
+        before the controller reclaims the instance.
+
+        A missing or unparseable verdict is a failure with its own sentence,
+        and that is the case this function exists to get right. The probe runs as
+        an unprivileged account under a service that can fail to start; "no file"
+        and "no findings" are the same absence of output, and reporting the second
+        for the first is exactly the silent pass the whole phase exists to
+        prevent.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()] $Result,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $JobServiceAccount
+    )
+
+    if ($null -eq $Result) {
+        return , 'the probe produced no verdict at all -- nothing on this host has proved the slot boundary'
+    }
+    $fail = New-Object System.Collections.Generic.List[string]
+    $get = {
+        param($name)
+        if ($Result.PSObject.Properties.Name -contains $name) { return $Result.$name }
+        return $null
+    }
+
+    # The premise of the two checks below it. A probe that never got a host token
+    # cannot have proved anything about what a host token can do, and its two
+    # perfect 401s would read as two passes.
+    if ((& $get 'hostToken') -ne $true) {
+        $fail.Add('the probe could not obtain a host token, so neither negative capability was proved')
+    }
+    if (-not (Test-NegativeCapability -StatusCode (& $get 'secretStatus'))) {
+        $fail.Add(("secretmanager.versions.access answered '$(& $get 'secretStatus')' and not 403 -- " +
+                'this host identity can still read the GitHub App key, so a pull request on it owns ' +
+                'every repository the App is installed on'))
+    }
+    if (-not (Test-NegativeCapability -StatusCode (& $get 'metricStatus'))) {
+        $fail.Add(("monitoring.timeSeries.create answered '$(& $get 'metricStatus')' and not 403 -- " +
+                'this host identity can still write the demand series the autoscaler reads'))
+    }
+
+    # Both halves, because a broker that silently fell back to the host identity
+    # is the failure the broker exists to prevent, and it looks like a working
+    # broker from every angle except this one.
+    $email = [string] (& $get 'brokerEmail')
+    if ([string]::IsNullOrWhiteSpace($JobServiceAccount)) {
+        if (-not [string]::IsNullOrWhiteSpace($email)) {
+            $fail.Add("a broker answered as '$email' on a pool that configured no job service account")
+        }
+    } elseif ($email -ne $JobServiceAccount) {
+        $fail.Add("the broker vends '$email', not $JobServiceAccount")
+    }
+
+    if ((& $get 'siblingDenied') -ne $true) {
+        $fail.Add('a slot could read another slot''s workspace -- the per-slot ACLs are not holding')
+    }
+    if ((& $get 'cacheWritable') -ne $true) {
+        $fail.Add('the warm cache is not writable by a slot, so every job on this host repopulates it')
+    }
+    if ((& $get 'dnsResolved') -ne $true) {
+        $fail.Add('name resolution failed from a slot context, so no agent on this host could reach GitHub')
+    }
+    return $fail.ToArray()
+}
+
+function Get-ProbeScript {
+    <#
+      .SYNOPSIS
+        The payload the probe runs AS A SLOT USER, as PowerShell text. Pure.
+      .DESCRIPTION
+        It records; it does not decide. Every check writes a value into one JSON
+        document and nothing in here calls Deny-Boot, because the payload runs
+        unprivileged in a service the boot script does not share a process with:
+        a verdict it reached could not be trusted, and a verdict it failed to
+        write must not be mistaken for a clean one. Get-ProbeFailure decides,
+        back in the boot script, where "no file" is a finding.
+
+        Two details are load-bearing and neither is obvious.
+
+        The payload asks the REAL metadata server, 169.254.169.254, and never the
+        broker, for the token it then tries to spend. That is the point: the
+        question is what a job can reach behind this script's back, and pointing
+        it at the closed endpoint the runner service's environment sets would
+        measure the environment block instead of the identity.
+
+        Every call is wrapped and every failure lands in the document as $null
+        rather than as an exception. A payload that throws writes nothing, which
+        Get-ProbeFailure reports as "no verdict at all" -- correct, but it names
+        the wrong problem, and the operator loses the five checks that did run.
+
+        CacheRoot is the slot's OWN workspace root. There is no host-wide warm
+        cache directory on this image -- the caches the pool exists to keep warm
+        live under each slot's profile -- so "the warm cache is writable" is
+        proved where the cache actually is, by the account that has to write it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $SecretName,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $BrokerEndpoint,
+        [Parameter(Mandatory = $true)][string] $SiblingWorkspace,
+        [Parameter(Mandatory = $true)][string] $CacheRoot,
+        [string] $ResultPath = $script:ProbeResultPath,
+        [string] $MetadataRoot = $script:MetadataRoot,
+        [int] $TimeoutSeconds = $script:HttpTimeoutSeconds
+    )
+
+    # OMITTED, not disabled. A runtime `if ('')` around the broker read would
+    # leave the endpoint and the path in the payload text, where the only thing
+    # that stops them being used is a condition somebody could later "simplify".
+    # A no-broker pool's probe should not contain a broker read at all.
+    $brokerBlock = ''
+    if (-not [string]::IsNullOrWhiteSpace($BrokerEndpoint)) {
+        $brokerBlock = @"
+try {
+    `$r.brokerEmail = [string] (Invoke-RestMethod ``
+            -Uri 'http://$BrokerEndpoint/computeMetadata/v1/instance/service-accounts/default/email' ``
+            -Headers `$md -TimeoutSec $TimeoutSeconds)
+} catch { `$null = `$_ }
+"@
+    }
+
+    return @"
+`$ErrorActionPreference = 'Stop'
+`$md = @{ 'Metadata-Flavor' = 'Google' }
+`$r = [ordered] @{
+    hostToken = `$false; secretStatus = `$null; metricStatus = `$null
+    brokerEmail = ''; siblingDenied = `$false; cacheWritable = `$false; dnsResolved = `$false
+}
+
+# The real metadata server, deliberately. See Get-ProbeScript's description.
+`$tok = ''
+try {
+    `$t = Invoke-RestMethod -Uri '$MetadataRoot/instance/service-accounts/default/token' ``
+        -Headers `$md -TimeoutSec $TimeoutSeconds
+    if (`$t -and `$t.access_token) { `$tok = [string] `$t.access_token; `$r.hostToken = `$true }
+} catch { `$null = `$_ }
+
+`$project = ''
+try {
+    `$project = [string] (Invoke-RestMethod -Uri '$MetadataRoot/project/project-id' ``
+            -Headers `$md -TimeoutSec $TimeoutSeconds)
+} catch { `$null = `$_ }
+
+# A status, never a body. Both calls are EXPECTED to be refused, so the
+# interesting value is the refusal code and the payload must not be read.
+function Get-Status {
+    param(`$Uri, `$Method, `$Body)
+    try {
+        `$null = Invoke-WebRequest -Uri `$Uri -Method `$Method -Body `$Body ``
+            -ContentType 'application/json' -Headers @{ Authorization = "Bearer `$tok" } ``
+            -TimeoutSec $TimeoutSeconds -UseBasicParsing
+        return 200
+    } catch {
+        if (`$_.Exception.Response) { return [int] `$_.Exception.Response.StatusCode }
+        return `$null
+    }
+}
+
+if (`$tok -and `$project -and '$SecretName') {
+    `$r.secretStatus = Get-Status ``
+        -Uri "https://secretmanager.googleapis.com/v1/projects/`$project/secrets/$SecretName/versions/latest:access" ``
+        -Method 'GET' -Body `$null
+    # An empty series list. IAM is evaluated before the request body is, so a
+    # host that may not write gets 403 and a host that may gets 400 -- and 400
+    # is not 403, which is the finding either way.
+    `$r.metricStatus = Get-Status ``
+        -Uri "https://monitoring.googleapis.com/v3/projects/`$project/timeSeries" ``
+        -Method 'POST' -Body '{"timeSeries":[]}'
+}
+
+$brokerBlock
+
+# Denial is the pass. Success here is a sibling's workspace this account read.
+try {
+    `$null = Get-ChildItem -LiteralPath '$SiblingWorkspace' -Force -ErrorAction Stop
+} catch { `$r.siblingDenied = `$true }
+
+try {
+    `$probe = Join-Path '$CacheRoot' ('probe-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    Set-Content -LiteralPath `$probe -Value 'probe' -ErrorAction Stop
+    Remove-Item -LiteralPath `$probe -Force -ErrorAction SilentlyContinue
+    `$r.cacheWritable = `$true
+} catch { `$null = `$_ }
+
+try {
+    `$r.dnsResolved = [bool] ([System.Net.Dns]::GetHostEntry('github.com').AddressList.Count)
+} catch { `$null = `$_ }
+
+`$r | ConvertTo-Json -Compress | Set-Content -LiteralPath '$ResultPath' -Encoding ASCII
+"@
+}
+
+function Get-ProbeServiceConfig {
+    <#
+      .SYNOPSIS
+        The shim's service definition for the boot probe, as XML text. Pure.
+      .DESCRIPTION
+        Manual and non-restarting, and both differ from every other service this
+        file installs for the same reason: the probe is a one-shot measurement,
+        not a daemon. `Automatic` would re-run it on every reboot of a host whose
+        boot script is not running, writing a verdict nobody reads; `onfailure
+        restart` would turn a payload that cannot start into an infinite loop
+        instead of a missing file, and a missing file is precisely the signal
+        Get-ProbeFailure needs.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $ScriptPath,
+        [string] $ServiceName = $script:ProbeServiceName
+    )
+    $esc = { param($v) [System.Security.SecurityElement]::Escape([string] $v) }
+    $svc = & $esc $ServiceName
+    $shimArgs = & $esc "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`""
+    return @"
+<service>
+  <id>$svc</id>
+  <name>$svc</name>
+  <description>Proves this CI host's slot boundary from a slot's own context, once.</description>
+  <executable>powershell.exe</executable>
+  <arguments>$shimArgs</arguments>
+  <startmode>Manual</startmode>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>2</keepFiles>
+  </log>
+</service>
+"@
 }
 
 # --- phase 0 -----------------------------------------------------------------
@@ -2327,10 +2619,12 @@ function Invoke-Main {
     Invoke-Phase5Registration -Provisioned $provisioned -Config $cfg `
         -HookPath $hookPath -BrokerEndpoint $brokerEndpoint
 
-    # Phase 6 is not here yet. Said out loud rather than left as silence: until
-    # the probe exists, nothing on this host PROVES from a slot's own context that
-    # the boundaries above hold -- and a boundary nobody checks is a comment.
-    Write-BootLog ('phase 6 is not delivered yet: this host registers agents without proving the ' +
+    # Phase 6 is HALF here, and the half that is missing is the half that acts.
+    # The payload, the shim definition and the verdict exist above and are tested
+    # on ubuntu-latest; nothing yet runs them as a slot user or refuses a boot on
+    # what they say. Said out loud rather than left as silence, because a file
+    # containing Get-ProbeFailure reads exactly like a file that calls it.
+    Write-BootLog ('phase 6 is not wired yet: this host registers agents without proving the ' +
         'slot boundary from a slot context')
 }
 
