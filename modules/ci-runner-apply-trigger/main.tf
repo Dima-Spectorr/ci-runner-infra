@@ -75,6 +75,48 @@ locals {
   # busy repository would queue applies behind each other all day to discover
   # each time that nothing changed.
   included_files = concat(["${trim(var.terraform_root, "/")}/**"], var.extra_included_files)
+
+  # 2nd gen if the project has a connection, 1st gen otherwise. Not a preference
+  # and not a migration: it is a read of what the project already has. See the
+  # `github_connection` description — the two are separate APIs, and a trigger
+  # built against the generation the project does NOT use is created without
+  # complaint and never fires.
+  gen2 = var.github_connection != null
+
+  # A bare name or a full resource id, both accepted, so a caller holding
+  # `google_cloudbuild_connection.x.id` can pass it straight through without
+  # slicing the last segment off it.
+  connection_id = local.gen2 ? (
+    startswith(coalesce(var.github_connection, ""), "projects/")
+    ? var.github_connection
+    : "projects/${var.project_id}/locations/${var.region}/connections/${var.github_connection}"
+  ) : null
+
+  repository_id = local.gen2 ? coalesce(var.github_repository, try(google_cloudbuild_repository.repo[0].id, "")) : null
+}
+
+# Registered here rather than required as an input, because a connection is
+# authorized once for a whole GitHub account and its repositories are then
+# registered one at a time — so for a project that HAS a connection, this is the
+# only remaining step, and requiring it as a prerequisite would put a manual
+# action back in the path the connection was supposed to remove.
+#
+# Skipped when the caller names an existing one: registering the same remote
+# twice under one connection is an ALREADY_EXISTS error rather than a no-op, and
+# a second root onboarding the same repository would otherwise fail on a
+# resource it did not know had been created.
+resource "google_cloudbuild_repository" "repo" {
+  count = local.gen2 && var.github_repository == null ? 1 : 0
+
+  project  = var.project_id
+  location = var.region
+  # Every character GitHub allows in a repository name that a Google resource id
+  # does not — `_` and `.` are both common and both rejected. Folded rather than
+  # validated against, because the input is a real repository name the caller
+  # cannot change: `Some_Repo.v2` is a legal remote and an illegal resource id.
+  name              = lower(replace("${var.github_owner}-${var.github_repo}", "/[^a-zA-Z0-9-]/", "-"))
+  parent_connection = local.connection_id
+  remote_uri        = "https://github.com/${var.github_owner}/${var.github_repo}.git"
 }
 
 resource "google_cloudbuild_trigger" "apply" {
@@ -84,11 +126,27 @@ resource "google_cloudbuild_trigger" "apply" {
   description = "Unattended terraform apply of ${var.terraform_root} on push to ${var.branch}. Runner infra: a merged module pin only reaches machines when something applies it."
   disabled    = var.disabled
 
-  github {
-    owner = var.github_owner
-    name  = var.github_repo
-    push {
-      branch = local.branch_regex
+  # Exactly one of these exists per trigger — `dynamic` with a 0/1 iterator is
+  # the terraform spelling of "this block, conditionally", and both are written
+  # that way so neither reads as the special case.
+  dynamic "github" {
+    for_each = local.gen2 ? [] : [1]
+    content {
+      owner = var.github_owner
+      name  = var.github_repo
+      push {
+        branch = local.branch_regex
+      }
+    }
+  }
+
+  dynamic "repository_event_config" {
+    for_each = local.gen2 ? [1] : []
+    content {
+      repository = local.repository_id
+      push {
+        branch = local.branch_regex
+      }
     }
   }
 

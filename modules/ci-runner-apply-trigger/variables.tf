@@ -15,7 +15,36 @@ variable "github_owner" {
 
 variable "github_repo" {
   type        = string
-  description = "GitHub repository name. The project's GitHub App connection must already cover it — this module wires a trigger, it does not connect a repository."
+  description = "GitHub repository name. The project's GitHub connection must already cover it — this module wires a trigger, it does not authorize a GitHub account."
+}
+
+variable "github_connection" {
+  type        = string
+  default     = null
+  description = <<-EOT
+    Name of an EXISTING 2nd-gen Cloud Build connection in this project and region, e.g. `dataretrieval-github`. Null (the default) means the project links repositories the 1st-gen way, through the Cloud Build GitHub App, and the trigger is built with a `github {}` block.
+
+    THE TWO GENERATIONS ARE DIFFERENT APIS, NOT A VERSION FLAG. A 1st-gen trigger names owner/repo directly and resolves them against a project-level GitHub App install; a 2nd-gen trigger names a `google_cloudbuild_repository` resource under a connection. Neither block works against the other's link, and the failure is not a validation error — it is a trigger that is created successfully and never fires, because the push it is watching for arrives on a link it cannot see.
+
+    Which one a project has is a fact about the project, discovered rather than chosen (`gcloud builds connections list --project=<p> --region=<r>`, PER REGION — 2nd-gen connections are regional and a region-less list returns [] for a project that has several).
+
+    Full resource names are accepted as well as bare names, so `google_cloudbuild_connection.x.id` can be passed straight through.
+  EOT
+}
+
+variable "github_repository" {
+  type        = string
+  default     = null
+  description = <<-EOT
+    Full resource name of an EXISTING `google_cloudbuild_repository` under `github_connection` — `projects/p/locations/r/connections/c/repositories/x`. Only read when `github_connection` is set.
+
+    Null (the default) registers the repository under the connection instead. That is the common case: a connection is authorized once for a whole GitHub account, and the individual repositories under it are usually registered per trigger. Set this when the repository is already registered — by another root, or by hand — because registering the same remote twice under one connection is an ALREADY_EXISTS error, not a no-op.
+  EOT
+
+  validation {
+    condition     = var.github_repository == null || can(regex("^projects/[^/]+/locations/[^/]+/connections/[^/]+/repositories/[^/]+$", coalesce(var.github_repository, "x")))
+    error_message = "github_repository must be a full resource name: projects/<project>/locations/<region>/connections/<connection>/repositories/<name>."
+  }
 }
 
 variable "terraform_root" {
