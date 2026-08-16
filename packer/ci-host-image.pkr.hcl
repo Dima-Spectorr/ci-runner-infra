@@ -105,8 +105,22 @@ variable "node_major" {
     `run:` step. The runner's own bundled node is deliberately NOT on PATH, so
     on a host without a system node every one of those shims dies with
     "/usr/bin/env: 'node': No such file or directory" and exit 127.
+
+    A repository wanting a DIFFERENT major does not need this changed and does
+    not need to ask: setup-node puts its own toolchain ahead of this one on
+    PATH. So the only thing this value owes the fleet is to stay inside its
+    support window — and nothing was watching that until
+    support-windows-self.yml, which reads this very line weekly and on any pull
+    request touching packer/.
+
+    Why 24 and not 25 or 26: 24 became LTS on 2025-10-28 and is in active
+    support until 2026-10-20. 25 is a Current line, not an LTS one, and its
+    support already ended. 26 becomes LTS on 2026-10-28 — the next move for
+    this value, not today's.
   EOT
-  default     = "22"
+  # Was "22" until 2026-08-16. Active support for 22 ended 2025-10-21, ten
+  # months before anyone noticed, which is the whole argument for the scan.
+  default     = "24"
 }
 
 variable "warm_cache_script" {
