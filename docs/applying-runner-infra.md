@@ -21,12 +21,102 @@ outside, from a pin that was never bumped.**
 |---|---|---|
 | publish | `publish-tag.yml` in this repo | the tag exists the moment `VERSION` says it does |
 | adopt | `?ref=v5` in the consumer | the consumer resolves the newest v5 at its next `init` |
-| apply | `apply-runner-pool.yml`, called by the consumer | the newest v5 actually reaches machines |
+| apply | `apply-runner-pool.yml`, or `modules/ci-runner-apply-trigger` | the newest v5 actually reaches machines |
 
 Each is useless without the next. A published tag nobody pins is a tag; a pin
 nobody applies is a diff.
 
-## The caller
+## Two ways to run the apply, and which one to pick
+
+The apply half has two implementations. They do the same terraform — the same
+`init -upgrade`, the same printed plan, the same apply of the *saved* plan —
+and they differ entirely in **where the credential comes from**.
+
+| | `apply-runner-pool.yml` (GitHub Actions) | `modules/ci-runner-apply-trigger` (Cloud Build) |
+|---|---|---|
+| trigger | the consumer's own workflow triggers | a Cloud Build trigger on push to `main` |
+| credential | workload identity federation | none — the build runs inside the project |
+| per-repo setup | pool, provider, `attribute.ref` mapping, a bound SA | a trigger, and the GitHub App connection the project already has |
+| identity | `modules/ci-runner-apply-identity` creates one | **reuses the project's existing CD account; creates nothing** |
+| assumable from CI | yes, by design — that is what federation is | no |
+
+**Prefer Cloud Build wherever the project already runs its CD on it.** Not
+because federation is misconfigured — because the whole trust boundary stops
+existing rather than being defended. There is no provider to map, no
+`principalSet` to widen by accident, and no account that a `.github/workflows`
+file can assume. The push that fires it is observed by the same GitHub App
+connection that already deploys every service in the project.
+
+**Use the GitHub Actions workflow when the project has no Cloud Build** — a
+repository deploying somewhere else, or to more than one project. Then
+federation is the mechanism, and `ci-runner-apply-identity` plus a
+ref-scoped `principalSet` is how it is bounded. Read the section below.
+
+### The Cloud Build caller
+
+```hcl
+module "ci_runner_apply_trigger" {
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.16.0"
+
+  project_id     = var.project_id
+  region         = "<region>"
+  github_owner   = "<owner>"
+  github_repo    = "<repo>"
+  terraform_root = "customer/<customer>/terraform/ci-runner-hosts"
+
+  # The project's EXISTING CD account. This module mints no identity.
+  service_account = "<existing-cd-sa>@<project>.iam.gserviceaccount.com"
+
+  # The run that no push produces — see below. Not the hour, and not the same
+  # minute as any other repository in the fleet.
+  apply_schedule = "23 4 * * *"
+}
+```
+
+Three prerequisites, and the first is the same one the workflow has:
+
+**1. The variables must be in git** — see below; it is not specific to either
+path. An unattended apply has no `terraform.tfvars` either way.
+
+**2. The GitHub App connection must already cover the repository.** This module
+wires a trigger; it does not connect a repository. If the project already has
+push-to-main triggers for its services, it is connected.
+
+**3. The account must be the right shape, and that is the only security
+decision here.** It should be the project's existing CD account, and it should
+**not** hold `roles/iam.serviceAccountAdmin` or
+`roles/resourcemanager.projectIamAdmin`. The argument is the same one that
+shapes `ci-runner-apply-identity`, and it survives the move to Cloud Build for
+free — an account able to apply the runner root *end to end* can grant itself
+owner, and a compute-scoped account instead stops **red** on the rare apply
+that changes an identity, and a human runs that one. Beyond that it needs
+`roles/storage.objectAdmin` on the state bucket, `roles/cloudbuild.builds.builder`
+(or equivalent) to run at all, and — only if you set `apply_schedule` —
+`roles/cloudscheduler.admin` for the job this module creates beside the
+trigger.
+
+Verify before wiring it, rather than assuming a CD account is narrow:
+
+```bash
+gcloud projects get-iam-policy <project> --flatten="bindings[].members" --filter="bindings.members:<sa>@<project>.iam.gserviceaccount.com" --format="value(bindings.role)"
+```
+
+**The scheduled run is not optional on a repository that pins `?ref=v5`.** It
+has no commit to push when v5.7.1 ships, so the push trigger never fires and
+the release sits in the tag forever. `apply_schedule` is the only trigger that
+ever fires for that release — the push trigger cannot see it.
+
+**`tf-apply-guard.sh` does not run here, and that is deliberate.** The guard
+refuses an apply whose checkout is not the remote default branch, and demands a
+plan-derived token before a destroy — a human-at-a-laptop defence, and the
+right one for that case. Inside a build fired by a push to `main` the checkout
+*is* the merged commit, and no one can type a confirmation token. What bounds
+destruction instead is the account: the protected kinds the guard names —
+service accounts and secrets — are exactly what a compute-scoped CD account
+cannot delete. Which is why prerequisite 3 is not merely tidiness about where
+identities get created.
+
+## The GitHub Actions caller
 
 `apply-runner-pool.yml` is a reusable workflow — **the consumer owns the
 triggers**, and it needs three:
@@ -88,7 +178,7 @@ repository's README anyway. Anything that *is* a secret stays where it is.
 
 ```hcl
 module "ci_runner_apply_identity" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.15.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.16.0"
 
   project_id             = var.project_id
   name                   = var.pool_name

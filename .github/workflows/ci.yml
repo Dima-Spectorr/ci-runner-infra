@@ -369,6 +369,15 @@ jobs:
       - name: apply-runner-pool self-test
         run: bash scripts/ci/apply-runner-pool.selftest.sh
 
+      # The same apply, triggered by the project's own Cloud Build instead of by
+      # GitHub Actions — no federation, no principalSet, and no account a
+      # workflow file can assume. What replaces those defences is the account
+      # the consumer passes in and the plan the build printed, and both are one
+      # persuasive edit from gone: "the CD account is missing, let the module
+      # make one" and "Saved plan is stale, just -auto-approve it".
+      - name: apply-trigger self-test
+        run: bash scripts/ci/apply-trigger.selftest.sh
+
       # The browser image a pool BAKES and the one a consumer is told to RUN are
       # two different lines that must name one release. When they drift nothing
       # fails — every UI job just quietly downloads two gigabytes it was meant

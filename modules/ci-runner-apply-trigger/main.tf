@@ -1,0 +1,310 @@
+# ci-runner-apply-trigger — the unattended apply, run by the project's OWN
+# Cloud Build.
+#
+# The problem is the one `apply-runner-pool.yml` was written for: a merged
+# version bump changes what the NEXT apply will build and changes nothing that
+# is running, so a pin that is merged and never applied looks, from outside,
+# exactly like a pin that was never bumped. Measured cost, 2026-08-15: v5.7.0
+# merged into nine repositories the same day and reached one pool.
+#
+# WHY THIS EXISTS ALONGSIDE THAT WORKFLOW, which is the whole argument for the
+# module: the GitHub Actions path has to get a credential from GitHub into
+# Google, and the only sound way to do that is workload identity federation —
+# a pool, a provider, an attribute mapping, and a service account bound to a
+# principalSet. Every one of those is a thing to configure correctly per
+# repository, and the account at the end of it is, by construction,
+# ASSUMABLE FROM A WORKFLOW FILE. Everything it can do, a `.github/workflows`
+# file can do. That is not a flaw in the workflow; it is what federation means.
+#
+# Cloud Build runs INSIDE the project. There is no federation, no provider, no
+# principalSet, and no externally-assumable account — an entire trust boundary
+# stops existing rather than being defended. The push that triggers it is
+# observed by the GitHub App connection the project already uses to deploy
+# every one of its services. Nothing here is a new mechanism for these projects;
+# it is the mechanism they already run their CD on, pointed at their own infra.
+#
+# WHAT THIS MODULE DELIBERATELY DOES NOT DO: create a service account.
+#
+# It takes `service_account` as a required input and mints nothing. A module
+# that creates the identity its own builds run as is a module that decides its
+# own privileges, and the decision lands in whatever apply happens to run it.
+# The projects this targets already have a CD service account, already reviewed,
+# already used by every other trigger in the project — and, where it has been
+# checked, already WITHOUT `serviceAccountAdmin` or `projectIamAdmin`. That
+# matters more than the saved resource: it is the same property
+# `ci-runner-apply-identity` was built to construct. An apply that changes
+# compute succeeds; an apply that would change an identity stops red, naming
+# the resource, and a human runs that one. Preserved here for free, by reusing
+# an account that already cannot escalate, instead of granting anything new.
+#
+# The reviewer's obligation, therefore, moves rather than disappearing:
+# `service_account` is the security decision of this module, and the checklist
+# for it is in docs/applying-runner-infra.md.
+#
+# THE BUILD IS INLINE, not a `cloudbuild.*.yaml` in the consumer repository, and
+# for the same reason there is one reusable workflow instead of nine copies:
+# nine repositories carrying nine copies of the same apply steps is nine places
+# for a fix to land and eight places for it to be forgotten. The steps below
+# reproduce `apply-runner-pool.yml` deliberately — init -upgrade, a plan that is
+# printed, an apply of the SAVED plan, and a report that an apply is not the
+# same thing as in effect.
+
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = ">= 5.0"
+    }
+  }
+}
+
+locals {
+  # One literal branch in, both spellings derived. The push filter takes a
+  # REGEX and the triggers.run API refuses one ("Branch and tag names cannot
+  # consist of regular expressions"), so a module taking both as inputs has a
+  # state where the schedule fires on a branch the trigger does not watch —
+  # silently, because each field is individually valid. Deriving them makes
+  # that state unreachable.
+  branch_regex = "^${var.branch}$"
+
+  trigger_name = coalesce(var.name, "ci-runner-apply-${lower(replace(var.github_repo, "_", "-"))}")
+
+  # The root's own tree, plus anything the caller names. Scoped rather than
+  # firing on every commit: this trigger takes a terraform state lock, and a
+  # busy repository would queue applies behind each other all day to discover
+  # each time that nothing changed.
+  included_files = concat(["${trim(var.terraform_root, "/")}/**"], var.extra_included_files)
+}
+
+resource "google_cloudbuild_trigger" "apply" {
+  project     = var.project_id
+  location    = var.region
+  name        = local.trigger_name
+  description = "Unattended terraform apply of ${var.terraform_root} on push to ${var.branch}. Runner infra: a merged module pin only reaches machines when something applies it."
+  disabled    = var.disabled
+
+  github {
+    owner = var.github_owner
+    name  = var.github_repo
+    push {
+      branch = local.branch_regex
+    }
+  }
+
+  included_files = local.included_files
+  ignored_files  = var.ignored_files
+
+  # The account this runs as — an input, never created here. See the header.
+  service_account = "projects/${var.project_id}/serviceAccounts/${var.service_account}"
+
+  build {
+    timeout = var.build_timeout
+
+    # Not a default, and not optional: a build that names its own service
+    # account has no default log destination, and Cloud Build REFUSES it at
+    # submit time rather than running it and dropping the logs. The failure is
+    # legible enough ("build.service_account requires ... logging") but it
+    # arrives on the first push, which is the worst moment to learn it.
+    options {
+      logging = "CLOUD_LOGGING_ONLY"
+    }
+
+    # -upgrade, not a plain init. A consumer pinning the floating major (?ref=v5)
+    # has no diff when v5.7.1 ships; a plain init keeps whatever it resolved
+    # last and would re-apply the same module forever, reporting success every
+    # time. Cloud Build starts each build on a fresh workspace, so this is
+    # belt-and-braces here — and it is the line that would matter the day a
+    # cache is introduced, which is exactly when nobody re-reads this file.
+    step {
+      id         = "init"
+      name       = "hashicorp/terraform:${var.terraform_version}"
+      entrypoint = "terraform"
+      dir        = var.terraform_root
+      args       = ["init", "-input=false", "-upgrade"]
+    }
+
+    # Separate from the apply so the log shows what was ABOUT to change even
+    # when the apply then fails. A failed apply with no plan above it says only
+    # that something went wrong.
+    #
+    # The marker file carries the "there are changes" answer to the next step:
+    # Cloud Build steps have no conditionals, so the decision has to be data on
+    # the shared workspace rather than control flow.
+    step {
+      id         = "plan"
+      name       = "hashicorp/terraform:${var.terraform_version}"
+      entrypoint = "sh"
+      dir        = var.terraform_root
+      args = ["-c", <<-EOT
+        set -u
+        terraform plan -input=false -lock-timeout=${var.lock_timeout} -detailed-exitcode -out=tf.plan
+        rc=$?
+        case "$rc" in
+          0) echo "no changes — nothing to apply"; rm -f /workspace/.apply-pending ;;
+          2) echo "changes pending"; : > /workspace/.apply-pending ;;
+          *) echo "terraform plan failed (exit $rc)"; exit "$rc" ;;
+        esac
+      EOT
+      ]
+    }
+
+    # Applies the SAVED plan, never a re-planned one: between plan and apply a
+    # floating tag can move, and applying something nobody printed is the
+    # failure mode this whole arrangement exists to remove.
+    step {
+      id         = "apply"
+      name       = "hashicorp/terraform:${var.terraform_version}"
+      entrypoint = "sh"
+      dir        = var.terraform_root
+      args = ["-c", <<-EOT
+        set -eu
+        if [ ! -f /workspace/.apply-pending ]; then
+          echo "plan reported no changes — skipping apply"
+          exit 0
+        fi
+        terraform apply -input=false -lock-timeout=${var.lock_timeout} tf.plan
+      EOT
+      ]
+    }
+
+    # `terraform output` needs terraform, and the step that reads the instance
+    # group needs gcloud — no image on either side of this repository has both.
+    # So the value crosses on the workspace rather than the tool crossing into
+    # the wrong image. This is the failure that would have looked like a broken
+    # summary and been "fixed" by dropping the report: `terraform: not found`,
+    # in a step whose whole job is to print a sentence.
+    #
+    # Never fatal. A root with no `mig_name` output is a root this module can
+    # still apply.
+    step {
+      id         = "mig-name"
+      name       = "hashicorp/terraform:${var.terraform_version}"
+      entrypoint = "sh"
+      dir        = var.terraform_root
+      args = ["-c", <<-EOT
+        set -u
+        terraform output -raw mig_name > /workspace/.mig-name 2>/dev/null || : > /workspace/.mig-name
+      EOT
+      ]
+    }
+
+    # The managed instance group updates OPPORTUNISTICally: a new instance
+    # template does NOT replace running hosts, so an apply that "succeeded" can
+    # leave every host on the previous startup script until the controller
+    # drains them on idleness. Reporting the gap is the difference between
+    # "applied" and "in effect", and it is the sentence most often misread.
+    #
+    # Best-effort by design — it reports, it does not gate. A root with no
+    # `mig_name` output still gets a successful apply, because failing here
+    # would report "the apply failed" over a missing summary.
+    step {
+      id         = "report"
+      name       = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+      entrypoint = "sh"
+      args = ["-c", <<-EOT
+        set -u
+        echo "Hosts do not restart on an apply. The group replaces them opportunistically,"
+        echo "as the controller drains idle ones, so until that happens they keep running"
+        echo "the PREVIOUS startup script — an apply is not the same thing as in effect."
+        mig=$(cat /workspace/.mig-name 2>/dev/null || true)
+        if [ -z "$mig" ]; then
+          echo "Hosts currently up: (no mig_name output in this root — not counted)"
+          exit 0
+        fi
+        # gcloud's success is tested separately from the count: `grep -c` exits
+        # 1 on zero matches, so folding them together would report a genuinely
+        # empty pool as "could not read" — the reading that sends somebody to
+        # debug credentials over a pool sitting at min_hosts=0.
+        if out=$(gcloud compute instance-groups managed list-instances "$mig" \
+                   --region='${var.region}' --project='${var.project_id}' --format='value(name)' 2>/dev/null); then
+          echo "Hosts currently up: $(printf '%s' "$out" | grep -c . || true)"
+        else
+          echo "Hosts currently up: (could not read the instance group)"
+        fi
+      EOT
+      ]
+    }
+  }
+}
+
+# --- the run nothing pushes -----------------------------------------------------
+#
+# THE TRIGGER ABOVE CANNOT DELIVER A RELEASE ON ITS OWN, and this is the half
+# that is easy to leave out because everything looks green without it.
+#
+# A consumer pinning `?ref=v5` has NO DIFF when v5.7.1 ships. Nothing is pushed,
+# so a push trigger never fires, and the release sits in the tag forever. The
+# schedule is what makes "follow the floating major" mean anything at all — it
+# is not a redundant safety net over the push, it is the only path for the
+# release the push cannot see.
+#
+# Optional, and off by default, for one honest reason: creating this job needs
+# `cloudscheduler.jobs.create`, which a compute-scoped CD account does not have.
+# Leaving it on by default would make the FIRST apply of this module fail on
+# every project in the fleet, and a module whose default configuration cannot
+# apply teaches people to skim the error. Turn it on with the role in hand;
+# docs/applying-runner-infra.md names it.
+resource "google_cloud_scheduler_job" "daily_apply" {
+  count = var.apply_schedule == null ? 0 : 1
+
+  project     = var.project_id
+  region      = var.region
+  name        = "${local.trigger_name}-scheduled"
+  description = "Run ${local.trigger_name} on a schedule. A consumer pinning a floating module tag has no commit to push when a new version ships, so this is the only trigger that ever fires for it."
+  schedule    = var.apply_schedule
+  time_zone   = var.schedule_time_zone
+
+  http_target {
+    http_method = "POST"
+    uri         = "https://cloudbuild.googleapis.com/v1/projects/${var.project_id}/locations/${var.region}/triggers/${google_cloudbuild_trigger.apply.trigger_id}:run"
+
+    # A LITERAL branch, derived from the same input as the push regex above.
+    # The API rejects a regex here, and `^main$` as a branch name resolves to
+    # nothing — see local.branch_regex.
+    body = base64encode(jsonencode({
+      projectId = var.project_id
+      triggerId = google_cloudbuild_trigger.apply.trigger_id
+      source    = { branchName = var.branch }
+    }))
+
+    headers = {
+      "Content-Type" = "application/json"
+    }
+
+    # An OAuth token, not OIDC: this calls a Google API, which authenticates
+    # access tokens. The scope is the only one cloudbuild.googleapis.com
+    # accepts. The Cloud Scheduler service agent's ability to mint this token
+    # comes from roles/cloudscheduler.serviceAgent, granted automatically when
+    # the API is enabled — which is why the account must live in THIS project
+    # (validated in variables.tf) rather than being any account that happens to
+    # have build permissions.
+    oauth_token {
+      service_account_email = coalesce(var.scheduler_service_account, var.service_account)
+      scope                 = "https://www.googleapis.com/auth/cloud-platform"
+    }
+  }
+
+  # A missed run is not worth retrying hard. The next tick is at most a day
+  # away, and a build that failed because terraform held a lock will fail the
+  # same way three minutes later — retries here turn one red build into four.
+  retry_config {
+    retry_count = 1
+  }
+
+  # Cross-variable, so it cannot be a `validation` block on either one — and it
+  # only has to hold when the job is actually created, which a precondition on
+  # this resource expresses exactly.
+  #
+  # Cloud Scheduler mints the OAuth token through its own per-project service
+  # agent. An account in another project is accepted by terraform, accepted by
+  # the API, and then fails at every fire with a permission error naming the
+  # service agent rather than the account — a message that sends the reader to
+  # the wrong project.
+  lifecycle {
+    precondition {
+      condition     = endswith(coalesce(var.scheduler_service_account, var.service_account), "@${var.project_id}.iam.gserviceaccount.com")
+      error_message = "The scheduler's account must live in ${var.project_id}: Cloud Scheduler mints its token through a per-project service agent, so a cross-project account fails at fire time with an error naming the service agent, not the account."
+    }
+  }
+}
