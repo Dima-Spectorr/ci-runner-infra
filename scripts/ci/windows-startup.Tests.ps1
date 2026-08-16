@@ -1125,3 +1125,29 @@ Describe 'probe service definition' {
         { [xml] $script:ProbeXml } | Should -Not -Throw
     }
 }
+
+Describe 'recovery-policy guard' {
+    # These RUN the function rather than reading it, and that is the whole point.
+    # Clear-ServiceRecoveryAction shipped on main calling Get-RunnerServiceName
+    # without the -AgentName that had become mandatory: a ParameterBindingException
+    # in phase 5 on every Windows boot, in a function both text-reading gates
+    # happily parsed and linted. Nothing here reaches sc.exe -- every case is
+    # refused by the guard first, which is also why it can run on ubuntu-latest.
+    It 'refuses a name that is not a runner service at all' {
+        { Clear-ServiceRecoveryAction -ServiceName 'not-a-runner-service' -AgentName 'ci-abc-s1' } |
+            Should -Throw -ExpectedMessage '*not a runner service name*'
+    }
+
+    # Shape alone is not enough. A stale or restored .service file naming a
+    # SIBLING slot's service is well-formed, and clearing recovery there would
+    # take the policy off an agent this slot does not own.
+    It 'refuses a well-formed name belonging to another slot' {
+        { Clear-ServiceRecoveryAction -ServiceName 'actions.runner.o-r.ci-abc-s2' -AgentName 'ci-abc-s1' } |
+            Should -Throw -ExpectedMessage '*not a runner service name*'
+    }
+
+    It 'refuses an empty marker rather than passing it to sc.exe' {
+        { Clear-ServiceRecoveryAction -ServiceName ' ' -AgentName 'ci-abc-s1' } |
+            Should -Throw -ExpectedMessage '*not a runner service name*'
+    }
+}

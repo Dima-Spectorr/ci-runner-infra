@@ -2429,11 +2429,20 @@ function Clear-ServiceRecoveryAction {
         is safe to interpolate only because Get-RunnerServiceName refused anything
         that was not literally `actions.runner.<...>`, and it came out of a file
         the slot account can write.
+
+        AgentName is mandatory rather than optional on purpose. Get-RunnerServiceName
+        validates shape AND ownership, and ownership is the half that stops this
+        slot's recovery policy being cleared off a SIBLING slot's already-running
+        service. A default would make the re-check here weaker than the one the
+        caller already passed, which is the opposite of what a second check is for.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string] $ServiceName)
+    param(
+        [Parameter(Mandatory = $true)][string] $ServiceName,
+        [Parameter(Mandatory = $true)][string] $AgentName
+    )
 
-    if ((Get-RunnerServiceName -Marker $ServiceName) -ne $ServiceName) {
+    if ((Get-RunnerServiceName -Marker $ServiceName -AgentName $AgentName) -ne $ServiceName) {
         Deny-Boot "refusing to pass '$ServiceName' to sc.exe -- it is not a runner service name"
     }
 
@@ -2598,7 +2607,7 @@ function Register-SlotAgent {
     Protect-CiDirectory -Path $agent -SlotUser $Slot.User
 
     Write-ServiceEnvironment -ServiceName $serviceName -Environment $Environment
-    Clear-ServiceRecoveryAction -ServiceName $serviceName
+    Clear-ServiceRecoveryAction -ServiceName $serviceName -AgentName $name
     Grant-ServiceLogonAccount -ServiceName $serviceName -Credential $Slot.Credential
 
     Start-Service -Name $serviceName -ErrorAction Stop

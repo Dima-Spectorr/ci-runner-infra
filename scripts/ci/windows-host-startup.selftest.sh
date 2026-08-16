@@ -402,7 +402,17 @@ has_cleared_recovery_actions() { # <file>
   # job-time failure re-registers, takes more work, and keeps a host the
   # controller believes is draining alive forever.
   matches "$code" 'sc\.exe failure[^\n]*reset= 0 actions=' || return 1
-  matches "$code" 'Clear-ServiceRecoveryAction -ServiceName \$serviceName' || return 1
+  matches "$code" 'Clear-ServiceRecoveryAction -ServiceName \$serviceName -AgentName \$name' || return 1
+
+  # OWNERSHIP travels with the name, at every call site. -AgentName is mandatory
+  # on Get-RunnerServiceName because shape alone accepts a sibling slot's
+  # well-formed service name, and one caller kept the old two-argument form --
+  # a ParameterBindingException in phase 5 on every Windows boot, in a function
+  # the parse gate and the analyzer both read and passed. A gate that reads text
+  # cannot bind parameters, so the shape of the CALL is what it can check.
+  local bare
+  bare=$(printf '%s\n' "$code" | grep -E 'Get-RunnerServiceName -Marker' | grep -cvE '\-AgentName')
+  [ "${bare:-0}" -eq 0 ] || return 1
   # A failure to clear them is FATAL. "Best effort" here is a host that cannot be
   # retired, discovered weeks later as a machine nobody can delete.
   matches "$code" 'could not clear the recovery actions on \$ServiceName' || return 1
@@ -771,7 +781,13 @@ mutate "the captured config.cmd output logged verbatim again" \
 
 # 9. The recovery actions come back, in each shape a "resilience" edit takes.
 mutate "the clear removed from the registration path" \
-  's|^    Clear-ServiceRecoveryAction -ServiceName \$serviceName$||' \
+  's|^    Clear-ServiceRecoveryAction -ServiceName \$serviceName -AgentName \$name$||' \
+  has_cleared_recovery_actions
+mutate "the recovery clear given a name without the slot that owns it" \
+  's|Clear-ServiceRecoveryAction -ServiceName \$serviceName -AgentName \$name|Clear-ServiceRecoveryAction -ServiceName $serviceName|' \
+  has_cleared_recovery_actions
+mutate "the guard re-validating shape but no longer ownership" \
+  's|Get-RunnerServiceName -Marker \$ServiceName -AgentName \$AgentName|Get-RunnerServiceName -Marker $ServiceName|' \
   has_cleared_recovery_actions
 mutate "a restart action written instead of an empty one" \
   's|reset= 0 actions= |reset= 86400 actions= restart/60000|' \
