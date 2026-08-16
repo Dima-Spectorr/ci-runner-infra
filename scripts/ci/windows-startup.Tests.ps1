@@ -117,18 +117,33 @@ Describe 'beacon service definition' {
     # change that would not be re-tested, and an unquoted path there silently
     # truncates the argument list into a service that starts and does nothing.
     It 'quotes the script path against a directory with a space in it' {
+        # &quot;, not " -- the argument string is XML-escaped now, exactly as the
+        # broker's is, and the shim's parser decodes it back to a quote before
+        # anything sees it. Asserting the raw quote here would be asserting that
+        # the two service builders differ.
         Get-BeaconServiceConfig -ScriptPath 'C:\ci apps\bin\ci-beacon.ps1' |
-        Should -Match '-File "C:\\ci apps\\bin\\ci-beacon\.ps1"'
+        Should -Match '-File &quot;C:\\ci apps\\bin\\ci-beacon\.ps1&quot;'
+    }
+
+    # The beacon builder used to interpolate its inputs raw while the broker's
+    # escaped them. Both take module constants today, so neither was injectable;
+    # the divergence itself is the defect, because the next caller reuses
+    # whichever builder it finds first.
+    It 'escapes its inputs the same way the broker builder does' {
+        $xml = Get-BeaconServiceConfig -ScriptPath 'C:\ci\bin\b.ps1' `
+            -ServiceName 'x"/><env name="EVIL" value="1'
+        $xml | Should -Not -Match '<env name="EVIL"'
     }
 
     It 'passes the interval through instead of hardcoding one' {
         $script:Xml | Should -Match '-IntervalSeconds 45'
     }
 
-    # The service id is what phase 2 exempts from the metadata fence, by service
-    # SID, and what phase 0 starts by name. Three files have to agree on this
-    # string and only this test compares them.
-    It 'is named the same thing the fence and the starter use' {
+    # The service id is what phase 0 starts by name. It was ALSO what phase 2
+    # exempted from the metadata fence by service SID; section 3A deleted the fence, so
+    # this string now has two owners rather than three. Two files still have to
+    # agree on it and only this test compares them.
+    It 'is named the same thing the starter uses' {
         $script:Xml | Should -Match '<id>ci-beacon</id>'
     }
 }
@@ -326,5 +341,218 @@ Describe 'security policy rewriting' {
         $out | Should -Match '(?m)^Unicode=yes\r?$'
         $out | Should -Match '(?m)^signature='
         $out | Should -Match '(?m)^SeBatchLogonRight = \*S-1-5-32-544\r?$'
+    }
+}
+
+# --- phase 3, the job credential broker ---------------------------------------
+
+Describe 'job service account validation' {
+    # Instance metadata is a trust boundary on a Windows pool -- section 3A accepts that
+    # job code can read it and does not assume nothing can write it. The value
+    # lands in service XML and in a LocalSystem service's environment block, so
+    # the check is a whitelist of the shape, not a blacklist of characters.
+    It 'accepts a service-account address' {
+        Test-JobServiceAccountName -Name 'ci-job@example-project.iam.gserviceaccount.com' | Should -BeTrue
+    }
+
+    It 'rejects nothing at all' {
+        Test-JobServiceAccountName -Name '' | Should -BeFalse
+        Test-JobServiceAccountName -Name '   ' | Should -BeFalse
+        Test-JobServiceAccountName -Name $null | Should -BeFalse
+    }
+
+    # The two shapes that would turn a value into markup or into a second
+    # variable. Escaping handles the first anyway; this is the half that stops a
+    # WELL-FORMED document from saying something other than what phase 3 meant.
+    It 'rejects a value that could close an element or open a line' {
+        Test-JobServiceAccountName -Name 'a@b.com"/><env name="X" value="y' | Should -BeFalse
+        Test-JobServiceAccountName -Name "a@b.com`nCI_BROKER_PORT=1" | Should -BeFalse
+    }
+
+    It 'rejects something that is not an address' {
+        Test-JobServiceAccountName -Name 'ci-job' | Should -BeFalse
+        Test-JobServiceAccountName -Name 'ci-job@localhost' | Should -BeFalse
+    }
+}
+
+Describe 'broker port parsing' {
+    It 'takes a port metadata actually set' {
+        Get-BrokerPort -Value '9099' | Should -Be 9099
+    }
+
+    # Falling back is right for the port and would be WRONG for the account: a
+    # default port serves the same broker, a default identity is somebody else's.
+    It 'falls back when metadata says nothing' {
+        Get-BrokerPort -Value '' | Should -Be $script:DefaultBrokerPort
+        Get-BrokerPort -Value $null | Should -Be $script:DefaultBrokerPort
+    }
+
+    It 'falls back on anything that is not a whole number' {
+        Get-BrokerPort -Value '80 80' | Should -Be $script:DefaultBrokerPort
+        Get-BrokerPort -Value '-1' | Should -Be $script:DefaultBrokerPort
+        Get-BrokerPort -Value '8.0' | Should -Be $script:DefaultBrokerPort
+    }
+
+    It 'falls back outside the range a socket would accept' {
+        Get-BrokerPort -Value '0' | Should -Be $script:DefaultBrokerPort
+        Get-BrokerPort -Value '65536' | Should -Be $script:DefaultBrokerPort
+    }
+
+    # This case was a real defect, found by running the function rather than by
+    # reading it. All-digits is not the same thing as a number that fits, and
+    # `[int64] '99999999999999999999'` THROWS -- which under the entry point's
+    # $ErrorActionPreference = 'Stop' is a dead host with a cast error in its log
+    # instead of a live one on the default port.
+    It 'falls back on a number too large to be one, instead of throwing' {
+        { Get-BrokerPort -Value '99999999999999999999' } | Should -Not -Throw
+        Get-BrokerPort -Value '99999999999999999999' | Should -Be $script:DefaultBrokerPort
+    }
+}
+
+Describe 'broker service definition' {
+    BeforeAll {
+        $script:BrokerXml = Get-BrokerServiceConfig -ScriptPath 'C:\ci\bin\job-metadata-broker.py' `
+            -JobServiceAccount 'ci-job@example-project.iam.gserviceaccount.com' -Port 8081
+    }
+
+    # Loopback, not 0.0.0.0 as on Linux. Windows gives the slots no network
+    # namespace of their own, so binding the VM's address would widen who can
+    # reach a credential vendor without narrowing anything for the slots.
+    It 'binds loopback and never the host address' {
+        $script:BrokerXml | Should -Match '<env name="CI_BROKER_HOST" value="127\.0\.0\.1"/>'
+        $script:BrokerXml | Should -Not -Match '0\.0\.0\.0'
+    }
+
+    It 'vends the identity it was given, on the port it was given' {
+        $script:BrokerXml | Should -Match 'CI_JOB_SERVICE_ACCOUNT" value="ci-job@example-project\.iam\.gserviceaccount\.com"'
+        $script:BrokerXml | Should -Match 'CI_BROKER_PORT" value="8081"'
+    }
+
+    # Escaping is the half that survives a value the caller's validation did not
+    # see -- a future caller, a future metadata key. The angle bracket must come
+    # out as text, so the document still has exactly the elements phase 3 wrote.
+    It 'escapes a hostile value into text rather than markup' {
+        $xml = Get-BrokerServiceConfig -ScriptPath 'C:\ci\bin\b.py' `
+            -JobServiceAccount 'x"/><env name="EVIL" value="1' -Port 8081
+        $xml | Should -Not -Match '<env name="EVIL"'
+        $xml | Should -Match '&quot;|&lt;'
+    }
+
+    # A broker that dies stops every job on the host from authenticating. The
+    # service manager restarting it is the only thing watching.
+    It 'restarts itself rather than staying dead' {
+        $script:BrokerXml | Should -Match '<onfailure action="restart"'
+        $script:BrokerXml | Should -Match '<startmode>Automatic</startmode>'
+    }
+}
+
+# Phase 4's job hook will be a FILE locked by the same function that locks the
+# directories, and .NET does not let a file ACE carry inheritance flags --
+# AddAccessRule throws "No flags can be set" rather than ignoring them. Under
+# the entry point's 'Stop' preference that throw is a host that never finishes
+# booting, so the distinction is asserted here rather than discovered there.
+Describe 'acl inheritance flags' {
+    It 'makes a directory ACE inheritable' {
+        $flags = Get-AclInheritanceFlag -IsContainer $true
+        $flags.HasFlag([System.Security.AccessControl.InheritanceFlags]::ContainerInherit) | Should -BeTrue
+        $flags.HasFlag([System.Security.AccessControl.InheritanceFlags]::ObjectInherit) | Should -BeTrue
+    }
+
+    It 'gives a file ACE no flags at all, because .NET rejects any' {
+        Get-AclInheritanceFlag -IsContainer $false |
+            Should -Be ([System.Security.AccessControl.InheritanceFlags]::None)
+    }
+}
+
+# THE DISTINCTION THIS SUITE EXISTS FOR MOST
+#
+# Get-MetadataValue used to swallow every exception into '', which made a flaky
+# read indistinguishable from an unset attribute. Two attributes make that
+# fatal: an unread ci-job-service-account turns a broker pool into a no-broker
+# pool, and an unread ci-image-min-version drops the image floor to 1 and lets a
+# host boot from an image with no shim. Neither failure says anything in the log
+# that a healthy boot does not also say.
+Describe 'metadata read failures' {
+    It 'treats a 404 as an attribute that is genuinely not set' {
+        Test-MetadataAbsence -StatusCode 404 | Should -BeTrue
+    }
+
+    # The case the old handler got wrong, and the one that actually happens: a
+    # refused connection, a DNS failure or a read timeout never produces an HTTP
+    # status at all.
+    It 'refuses to read a transport failure as an unset attribute' {
+        Test-MetadataAbsence -StatusCode $null | Should -BeFalse
+    }
+
+    It 'refuses to read a server error as an unset attribute' {
+        Test-MetadataAbsence -StatusCode 500 | Should -BeFalse
+        Test-MetadataAbsence -StatusCode 503 | Should -BeFalse
+        Test-MetadataAbsence -StatusCode 403 | Should -BeFalse
+    }
+
+    It 'reads the status the same whether it arrives as an enum or a number' {
+        Test-MetadataAbsence -StatusCode ([System.Net.HttpStatusCode]::NotFound) | Should -BeTrue
+        Test-MetadataAbsence -StatusCode ([System.Net.HttpStatusCode]::InternalServerError) |
+            Should -BeFalse
+    }
+}
+
+# A vended token proves a broker is THERE, not that it is OURS. Every slot on a
+# Windows host shares one loopback, nothing reserves the broker's port, and the
+# shim's restart delay leaves it free for ten seconds after any crash -- long
+# enough for a process a previous job left behind to take it and answer with a
+# metadata document of its own choosing.
+Describe 'broker listener ownership' {
+    It 'accepts the one SID a slot account can never hold' {
+        Test-BrokerListenerSid -Sid 'S-1-5-18' | Should -BeTrue
+    }
+
+    It 'rejects a local account, which is what a squatter would be' {
+        Test-BrokerListenerSid -Sid 'S-1-5-21-1-2-3-1001' | Should -BeFalse
+    }
+
+    # Get-PortListenerSid returns '' for no listener, a process that exited
+    # between the two lookups, and a CIM call that did not answer. All three mean
+    # "not ours", and this is where that reading is made explicit.
+    It 'reads an unknown owner as not ours rather than as ours' {
+        Test-BrokerListenerSid -Sid '' | Should -BeFalse
+        Test-BrokerListenerSid -Sid '   ' | Should -BeFalse
+        Test-BrokerListenerSid -Sid $null | Should -BeFalse
+    }
+
+    It 'ignores the whitespace a CIM property arrives with' {
+        Test-BrokerListenerSid -Sid " S-1-5-18`n" | Should -BeTrue
+    }
+}
+
+# The reservation is the only thing that makes 127.0.0.1:1 a CLOSED endpoint
+# rather than a free one. A netsh call that names the wrong protocol or a range
+# of the wrong length protects nothing, and there is no way to notice that on a
+# host afterwards: the port is simply available the day somebody wants it.
+Describe 'closed metadata endpoint' {
+    It 'reserves exactly one TCP port, at the port it was given' {
+        $args1 = Get-PortReservationArgument -Port 1
+        $args1 | Should -Contain 'protocol=tcp'
+        $args1 | Should -Contain 'startport=1'
+        $args1 | Should -Contain 'numberofports=1'
+        $args1 | Should -Contain 'excludedportrange'
+    }
+
+    It 'passes the port through instead of hardcoding one' {
+        Get-PortReservationArgument -Port 9999 | Should -Contain 'startport=9999'
+    }
+
+    # The constant and the port must name the same socket. They are read in two
+    # different phases -- the port by phase 3's reservation, the endpoint by the
+    # slot environment block -- so nothing but this compares them.
+    It 'reserves the port the slots are actually pointed at' {
+        $script:ClosedMetadataEndpoint | Should -Be "127.0.0.1:$script:ClosedMetadataPort"
+    }
+
+    # Not the broker's default, and not the real metadata server. Either would
+    # turn the fail-closed endpoint back into a working one.
+    It 'is not a port anything on this host answers on' {
+        $script:ClosedMetadataPort | Should -Not -Be $script:DefaultBrokerPort
+        $script:ClosedMetadataEndpoint | Should -Not -Match '169\.254\.169\.254'
     }
 }
