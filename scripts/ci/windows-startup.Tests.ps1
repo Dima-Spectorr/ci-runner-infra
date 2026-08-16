@@ -412,7 +412,7 @@ Describe 'broker port parsing' {
 Describe 'broker service definition' {
     BeforeAll {
         $script:BrokerXml = Get-BrokerServiceConfig -ScriptPath 'C:\ci\bin\job-metadata-broker.py' `
-            -JobServiceAccount 'ci-job@example-project.iam.gserviceaccount.com' -ExpectedIdentity 'ci-s1' -Port 8081
+            -JobServiceAccount 'ci-job@example-project.iam.gserviceaccount.com' -Port 8081
     }
 
     # Loopback, not 0.0.0.0 as on Linux. Windows gives the slots no network
@@ -433,7 +433,7 @@ Describe 'broker service definition' {
     # out as text, so the document still has exactly the elements phase 3 wrote.
     It 'escapes a hostile value into text rather than markup' {
         $xml = Get-BrokerServiceConfig -ScriptPath 'C:\ci\bin\b.py' `
-            -JobServiceAccount 'x"/><env name="EVIL" value="1' -ExpectedIdentity 'ci-s1' -Port 8081
+            -JobServiceAccount 'x"/><env name="EVIL" value="1' -Port 8081
         $xml | Should -Not -Match '<env name="EVIL"'
         $xml | Should -Match '&quot;|&lt;'
     }
@@ -1213,7 +1213,15 @@ Describe 'probe payload' {
     # token, which is the exact divergence being tested for.
     It 'records the account it is actually running as' {
         $script:Payload | Should -Match 'WindowsIdentity\]::GetCurrent\(\)'
-        $script:Payload | Should -Not -Match '\$env:USERNAME'
+
+        # Comments stripped before the negative assertion, the same way code_of()
+        # does it in the bash self-tests. The claim under test is that no code
+        # path in the payload reads $env:USERNAME -- and the payload explains at
+        # length why it does not, naming the variable to do so. Asserting over
+        # the raw text makes that explanation the thing that fails, which would
+        # push the next author to delete the reasoning to get the bar green.
+        $code = ($script:Payload -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+        $code | Should -Not -Match '\$env:USERNAME'
     }
 
     It 'is valid PowerShell rather than merely a string' {
