@@ -21,12 +21,138 @@ outside, from a pin that was never bumped.**
 |---|---|---|
 | publish | `publish-tag.yml` in this repo | the tag exists the moment `VERSION` says it does |
 | adopt | `?ref=v5` in the consumer | the consumer resolves the newest v5 at its next `init` |
-| apply | `apply-runner-pool.yml`, called by the consumer | the newest v5 actually reaches machines |
+| apply | `apply-runner-pool.yml`, or `modules/ci-runner-apply-trigger` | the newest v5 actually reaches machines |
 
 Each is useless without the next. A published tag nobody pins is a tag; a pin
 nobody applies is a diff.
 
-## The caller
+## Two ways to run the apply, and which one to pick
+
+The apply half has two implementations. They do the same terraform — the same
+`init -upgrade`, the same printed plan, the same apply of the *saved* plan —
+and they differ entirely in **where the credential comes from**.
+
+| | `apply-runner-pool.yml` (GitHub Actions) | `modules/ci-runner-apply-trigger` (Cloud Build) |
+|---|---|---|
+| trigger | the consumer's own workflow triggers | a Cloud Build trigger on push to `main` |
+| credential | workload identity federation | none — the build runs inside the project |
+| per-repo setup | pool, provider, `attribute.ref` mapping, a bound SA | a trigger, and the GitHub App connection the project already has |
+| identity | `modules/ci-runner-apply-identity` creates one | **reuses the project's existing CD account; creates nothing** |
+| assumable from CI | yes, by design — that is what federation is | no |
+
+**Prefer Cloud Build wherever the project already runs its CD on it.** Not
+because federation is misconfigured — because the whole trust boundary stops
+existing rather than being defended. There is no provider to map, no
+`principalSet` to widen by accident, and no account that a `.github/workflows`
+file can assume. The push that fires it is observed by the same GitHub App
+connection that already deploys every service in the project.
+
+**Use the GitHub Actions workflow when the project has no Cloud Build** — a
+repository deploying somewhere else, or to more than one project. Then
+federation is the mechanism, and `ci-runner-apply-identity` plus a
+ref-scoped `principalSet` is how it is bounded. Read the section below.
+
+### The Cloud Build caller
+
+```hcl
+module "ci_runner_apply_trigger" {
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.16.0"
+
+  project_id     = var.project_id
+  region         = "<region>"
+  github_owner   = "<owner>"
+  github_repo    = "<repo>"
+  terraform_root = "customer/<customer>/terraform/ci-runner-hosts"
+
+  # The project's EXISTING CD account. This module mints no identity.
+  service_account = "<existing-cd-sa>@<project>.iam.gserviceaccount.com"
+
+  # The run that no push produces — see below. Not the hour, and not the same
+  # minute as any other repository in the fleet.
+  apply_schedule = "23 4 * * *"
+}
+```
+
+Three prerequisites, and the first is the same one the workflow has:
+
+**1. The variables must be in git** — see below; it is not specific to either
+path. An unattended apply has no `terraform.tfvars` either way.
+
+**2. The GitHub App connection must already cover the repository.** This module
+wires a trigger; it does not connect a repository. If the project already has
+push-to-main triggers for its services, it is connected.
+
+**3. The account must be the right shape, and that is the only security
+decision here.** It should be the project's existing CD account, and it should
+**not** hold `roles/iam.serviceAccountAdmin` or
+`roles/resourcemanager.projectIamAdmin`. The argument is the same one that
+shapes `ci-runner-apply-identity`, and it survives the move to Cloud Build for
+free — an account able to apply the runner root *end to end* can grant itself
+owner, and a compute-scoped account instead stops **red** on the rare apply
+that changes an identity, and a human runs that one. Beyond that it needs
+`roles/storage.objectAdmin` on the state bucket, `roles/cloudbuild.builds.builder`
+(or equivalent) to run at all, and — only if you set `apply_schedule` —
+`roles/cloudscheduler.admin` for the job this module creates beside the
+trigger.
+
+**It also needs to READ every resource the root owns, and that is not the same
+list as the roles that let it write them.** Learned the expensive way on
+IntegrateIT, 2026-08-16: the first three unattended runs all failed **red at
+`plan`**, on three separate `403`s, none of which was a permission to change
+anything. `google_project_iam_member` calls `projects.getIamPolicy` just to
+refresh. `google_secret_manager_secret` calls `secretmanager.secrets.get`, which
+`roles/secretmanager.secretAccessor` does **not** grant — accessor reads a
+version's payload, not the secret's metadata. A CD account has the write roles
+already, because it deploys services; it has none of these, because deploying a
+service never refreshes somebody else's IAM binding.
+
+Grant the four read-only roles below **before** the first run, or spend three
+red builds rediscovering them one at a time, in the order Terraform happens to
+refresh:
+
+```bash
+gcloud iam roles create ciRunnerApplyIamReader --project=<project> \
+  --title="CI runner apply — IAM policy reader" \
+  --permissions=resourcemanager.projects.getIamPolicy --stage=GA
+
+for R in projects/<project>/roles/ciRunnerApplyIamReader \
+         roles/secretmanager.viewer roles/iam.serviceAccountViewer roles/monitoring.viewer; do
+  gcloud projects add-iam-policy-binding <project> --condition=None \
+    --member=serviceAccount:<sa>@<project>.iam.gserviceaccount.com --role="$R"
+done
+```
+
+The custom role exists rather than `roles/iam.securityReviewer` because
+`getIamPolicy` on the project is the single permission the refresh actually
+needs, and securityReviewer carries a large read surface for it. **Every one of
+these is read-only, so the security property is untouched**: none of them grants
+`setIamPolicy`, so an apply that would *change* a binding still stops red, which
+is the behaviour the whole design is for. A `viewer` role is what lets the applier
+*see* the binding it is not allowed to change — without it, it cannot tell the
+difference between "no drift" and "no access", and reports the second as failure.
+
+Verify before wiring it, rather than assuming a CD account is narrow:
+
+```bash
+gcloud projects get-iam-policy <project> --flatten="bindings[].members" --filter="bindings.members:<sa>@<project>.iam.gserviceaccount.com" --format="value(bindings.role)"
+```
+
+**The scheduled run is not optional on a repository that pins `?ref=v5`.** It
+has no commit to push when v5.7.1 ships, so the push trigger never fires and
+the release sits in the tag forever. `apply_schedule` is the only trigger that
+ever fires for that release — the push trigger cannot see it.
+
+**`tf-apply-guard.sh` does not run here, and that is deliberate.** The guard
+refuses an apply whose checkout is not the remote default branch, and demands a
+plan-derived token before a destroy — a human-at-a-laptop defence, and the
+right one for that case. Inside a build fired by a push to `main` the checkout
+*is* the merged commit, and no one can type a confirmation token. What bounds
+destruction instead is the account: the protected kinds the guard names —
+service accounts and secrets — are exactly what a compute-scoped CD account
+cannot delete. Which is why prerequisite 3 is not merely tidiness about where
+identities get created.
+
+## The GitHub Actions caller
 
 `apply-runner-pool.yml` is a reusable workflow — **the consumer owns the
 triggers**, and it needs three:

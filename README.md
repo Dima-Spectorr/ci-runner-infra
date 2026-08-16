@@ -410,6 +410,7 @@ distinguish from "the pool is idle".
 ```
 modules/ci-runner-network/       the per-project firewall posture (no NAT)
 modules/ci-runner-cache-bucket/  where a pool's cache lives between hosts
+modules/ci-runner-apply-trigger/ the unattended apply, as the project's OWN Cloud Build
 modules/ci-runner-host-pool/     the module consumers reference
   scripts/drain-decision.sh      pure scale-in rule (unit-tested)
   scripts/orphan-decision.sh     pure registration-reap rule (unit-tested)

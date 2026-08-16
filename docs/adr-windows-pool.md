@@ -942,6 +942,22 @@ The two rules §4 already calls load-bearing — **one repository per pool** and
 **fork pull requests never run on a warm host** — are now the only isolation
 boundary a Windows pool has, and they must be enforced, not documented.
 
+**One copy of the token the delete cannot reach.** Writing the registration token
+with `compute.instances.setMetadata` produces an Admin Activity audit entry, and
+Admin Activity logging cannot be switched off and is retained for 400 days. If
+that entry carries the metadata *value* in `protoPayload.request` — GCE audit
+entries are known to carry metadata items, which is why startup-script contents
+appear in them — then `remove-metadata` does not redact it, and the token is
+readable for its remaining lifetime by anyone holding `roles/logging.viewer` on
+the project. That audience is operators, not job code, which is why this does not
+change the decision; it does mean "the delete is the control" is true of the
+metadata key and not of the log. It could not be confirmed here: no project
+reachable from this work had a `v1.compute.instances.setMetadata` entry to look
+at. Resolve it with one read on the consuming estate's own project —
+`gcloud logging read 'protoPayload.methodName="v1.compute.instances.setMetadata"' --limit=1 --format=json`
+— and if the value is present, onboarding must say so and log access on the CI
+project must be scoped accordingly. Until someone runs it, assume it is.
+
 **What §2's beacon argument loses.** The subsection "Can job code forge the
 beacon?" gives three reasons the beacon need not be a privilege boundary. Reason 1
 ("the write goes through the fence") is void — delete it. Reason 2 becomes

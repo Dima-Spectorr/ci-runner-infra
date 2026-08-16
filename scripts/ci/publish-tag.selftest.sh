@@ -158,6 +158,33 @@ retries_a_failed_write() {
   matches "$code" 'retry_api -X PATCH' || return 1
 }
 
+# The exact tag was created SECONDS ago, by the previous step, and reading it
+# back is what tells this step where to point the floating major. On 2026-08-16
+# that read returned `Not Found` for a tag `git ls-remote` showed present the
+# whole time: read-after-write on the refs API is not immediate.
+#
+# Unretried, that 404 fails the release AFTER the exact tag is published, which
+# is the single worst state this workflow can leave behind — v5.16.0 out, `v5`
+# still on v5.15.0, every consumer pinning the floating major silently resolving
+# yesterday's source, and the only thing saying so a red run on a workflow
+# nobody watches when the tag they wanted exists.
+#
+# The ordering half is not pedantry: `retry_api` is defined inside this step's
+# script, and a read placed above the definition is `command not found` — which
+# in a `set -uo pipefail` script without `-e` is a non-zero return that lands in
+# the `|| { exit 1 }` branch and reports the tag as missing. Same red run, and a
+# completely misleading message.
+reads_the_new_tag_with_a_retry() {
+  local code def use
+  code=$(code_of "$1")
+  matches "$code" 'sha=\$\(retry_api "repos/\$GITHUB_REPOSITORY/git/ref/tags/\$want"' || return 1
+  ! matches "$code" 'sha=\$\(gh api' || return 1
+
+  def=$(printf '%s\n' "$code" | grep -n '^ *retry_api() {' | head -1 | cut -d: -f1)
+  use=$(printf '%s\n' "$code" | grep -n 'sha=\$(retry_api' | head -1 | cut -d: -f1)
+  [ -n "$def" ] && [ -n "$use" ] && [ "$def" -lt "$use" ]
+}
+
 # The write reporting success and the tag actually pointing somewhere are two
 # facts, and only the second one reaches consumers. Nobody looks at the floating
 # tag again until a `terraform apply` resolves it, so a 200 that did not land —
@@ -217,6 +244,7 @@ check advances_the_major_tag        "the floating major tag is not advanced"
 check never_moves_the_major_backwards "the floating major tag can be moved backwards"
 check skips_a_pointless_move        "a move that cannot change anything is attempted anyway"
 check retries_a_failed_write        "a single transient API failure fails the release, silently"
+check reads_the_new_tag_with_a_retry "the just-published tag is read once, or read before retry_api exists — a slow refs API turns a good release into a stranded floating tag"
 check reads_the_tag_back            "the tag is not read back, so a write that did not land passes"
 check can_be_re_run_by_hand         "a failed release cannot be re-driven without pushing to main"
 check refuses_a_release_off_the_default_branch \
@@ -272,6 +300,15 @@ mutate "the backoff between attempts is dropped" \
   's|^ *sleep .*|              :|'                                       retries_a_failed_write
 mutate "the API answer no longer reaches the log" \
   's|of 3 failed: \$(tr|of 3 failed. #|'                                 retries_a_failed_write
+# SC2016 off: `$(` and `$GITHUB_REPOSITORY` are matched LITERALLY in the
+# workflow source. Expanding them in the shell would make the sed match nothing,
+# and a mutation that changes nothing always goes false — reporting a pass.
+# shellcheck disable=SC2016
+mutate "the just-created tag is read once, without the retry" \
+  's|sha=$(retry_api "repos/$GITHUB_REPOSITORY/git/ref/tags/$want"|sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$want"|' reads_the_new_tag_with_a_retry
+# shellcheck disable=SC2016
+mutate "retry_api is no longer defined above the read that calls it" \
+  's|^          retry_api() {|          moved_later_retry_api() {|'      reads_the_new_tag_with_a_retry
 mutate "the tag is no longer read back after the write" \
   's|^          now=\$(retry_api|          unused=$(retry_api|'          reads_the_tag_back
 mutate "a write that did not land is accepted" \
