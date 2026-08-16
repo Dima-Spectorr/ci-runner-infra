@@ -104,6 +104,23 @@ $script:BrokerScript = 'C:\ci\bin\job-metadata-broker.py'
 # same default as the Linux broker, because it is the same broker.
 $script:DefaultBrokerPort = 8081
 
+# Where a slot's ADC is pointed when this pool has NO broker.
+#
+# Not a placeholder, and the single most load-bearing constant in this file.
+# Leaving GCE_METADATA_* unset does NOT mean "no credentials": gcloud,
+# google-auth and the Go and Java clients all fall through to the real
+# 169.254.169.254 and authenticate as the HOST service account -- which is the
+# exact silent downgrade the no-broker path claims never to make. Linux gets
+# that property from fence_metadata, which runs unconditionally there and which
+# section 3A deleted here; nothing replaced it until this constant did.
+#
+# A loopback port that is RESERVED, and therefore permanently unbindable,
+# refuses the connection instantly. ADC then fails closed and says so, instead
+# of succeeding as somebody else. Port 1 is chosen because no service anybody
+# would run on a CI host wants it.
+$script:ClosedMetadataPort = 1
+$script:ClosedMetadataEndpoint = '127.0.0.1:1'
+
 # Bounded, like every call this host makes. A host boot that HANGS is worse than
 # one that fails: it never registers an agent, never powers off, and bills at
 # warm-host size until the controller's register grace expires -- and while it
@@ -354,12 +371,18 @@ function Get-BeaconServiceConfig {
         [string] $ServiceName = $script:BeaconServiceName,
         [int] $IntervalSeconds = 30
     )
-    $shimArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`" " +
-    "-IntervalSeconds $IntervalSeconds"
+    # Escaped, exactly as Get-BrokerServiceConfig escapes its inputs. Both of
+    # these are module constants today, so there is no live injection here; the
+    # point is that the two builders must not differ, because the next caller
+    # will reuse whichever one it finds first and will not read this comment.
+    $esc = { param($v) [System.Security.SecurityElement]::Escape([string] $v) }
+    $svc = & $esc $ServiceName
+    $shimArgs = & $esc ("-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`" " +
+        "-IntervalSeconds $IntervalSeconds")
     return @"
 <service>
-  <id>$ServiceName</id>
-  <name>$ServiceName</name>
+  <id>$svc</id>
+  <name>$svc</name>
   <description>Publishes this CI host's liveness to GCE guest attributes.</description>
   <executable>powershell.exe</executable>
   <arguments>$shimArgs</arguments>
@@ -490,6 +513,65 @@ function Get-BrokerServiceConfig {
 "@
 }
 
+function Test-MetadataAbsence {
+    <#
+      .SYNOPSIS
+        Does this metadata failure mean "not set", as opposed to "not readable"?
+      .DESCRIPTION
+        Pure, so the distinction the whole fail-closed rule rests on is asserted
+        by a test rather than by a host that has already registered agents. A
+        $null status is the case that matters most: it is what a DNS failure, a
+        refused connection or a read timeout looks like, and it is precisely the
+        case the old catch-everything handler reported as an empty attribute.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()] $StatusCode)
+    if ($null -eq $StatusCode) { return $false }
+    return ([int] $StatusCode -eq 404)
+}
+
+function Get-PortReservationArgument {
+    <#
+      .SYNOPSIS
+        The netsh argument vector that makes one TCP port unbindable, as an array.
+      .DESCRIPTION
+        Pure, because the arguments are the whole content: a reservation that
+        names the wrong protocol or a range of the wrong length is a reservation
+        that silently protects nothing, and there is no way to notice that on a
+        host afterwards -- the port is simply free again the day somebody wants
+        it.
+
+        Used for the closed-metadata port only. The BROKER's port is deliberately
+        not reserved: an excluded range blocks explicit binds too, so reserving
+        it would lock out the one process that is supposed to have it.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int] $Port)
+    return @(
+        'int', 'ipv4', 'add', 'excludedportrange',
+        'protocol=tcp', "startport=$Port", 'numberofports=1'
+    )
+}
+
+function Test-BrokerListenerSid {
+    <#
+      .SYNOPSIS
+        Is the process listening on the broker's port LocalSystem?
+      .DESCRIPTION
+        The readiness probe's other half, and pure for the same reason. Every
+        slot on a Windows host shares one loopback (section 4) and nothing
+        reserves the broker's port, so between a broker crash and the shim's
+        10-second restart the port is free -- and a process a job left behind can
+        take it and answer with a metadata-shaped document of its own choosing.
+        The token probe cannot tell the difference; the owner can. A slot account
+        cannot become S-1-5-18, so this is the property, not a heuristic.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Sid)
+    if ([string]::IsNullOrWhiteSpace($Sid)) { return $false }
+    return ($Sid.Trim() -eq 'S-1-5-18')
+}
+
 # --- phase 0 -----------------------------------------------------------------
 
 function Get-MetadataValue {
@@ -512,8 +594,23 @@ function Get-MetadataValue {
                 -Headers @{ 'Metadata-Flavor' = 'Google' } `
                 -TimeoutSec $script:HttpTimeoutSeconds)
     } catch {
-        $null = $_
-        return ''
+        # Fail CLOSED on anything that is not a 404. An earlier version of this
+        # function swallowed every exception into '', which made one flaky read
+        # indistinguishable from "the attribute is not set" -- and the two
+        # attributes where that matters are the two where '' is a decision, not
+        # a default: an unread ci-job-service-account silently converts a broker
+        # pool into a no-broker pool, and an unread ci-image-min-version drops
+        # the image floor to 1 and lets a host boot from an image with no shim.
+        # A transport error choosing which identity a pool runs as is not an
+        # error path anybody would have signed off on. Losing the host is the
+        # cheaper outcome, every time.
+        $status = $null
+        if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+            $status = $_.Exception.Response.StatusCode
+        }
+        if (Test-MetadataAbsence -StatusCode $status) { return '' }
+        Deny-Boot ("could not read metadata '$Path' ($($_.Exception.Message)) -- refusing to " +
+            'treat an unreadable attribute as an unset one')
     }
 }
 
@@ -863,7 +960,11 @@ function Grant-SlotLogonRight {
                 [System.Security.Principal.SecurityIdentifier]).Value
         })
 
-    $work = Join-Path $env:TEMP ('ci-secpol-' + [guid]::NewGuid().ToString('N'))
+    # C:\ci, not $env:TEMP. Under SYSTEM that resolves to C:\Windows\Temp, where
+    # unprivileged principals can create files -- and this is the file that
+    # decides who holds SeServiceLogonRight and the three deny rights. C:\ci is
+    # already SYSTEM-and-Administrators-only by the time this runs.
+    $work = Join-Path $script:CiRoot ('ci-secpol-' + [guid]::NewGuid().ToString('N'))
     $exported = "$work.inf"
     $db = "$work.sdb"
     try {
@@ -1110,6 +1211,12 @@ function Test-JobBrokerReady {
         Each attempt is bounded. A broker that ACCEPTS a connection and never
         answers would otherwise turn a 30x2s readiness probe into an unbounded
         wait, which is the 2h55m outage in miniature.
+
+        A vended token proves a broker is THERE, not that it is OURS. The owner
+        check after the loop is the second half, and it is deliberately outside
+        the retry: a squatter does not go away on attempt 12, and Deny-Boot
+        raised inside the `try` would be caught by the very handler that exists
+        to tolerate a broker that has not finished starting.
     #>
     [CmdletBinding()]
     param(
@@ -1118,6 +1225,7 @@ function Test-JobBrokerReady {
         [int] $DelaySeconds = 2
     )
     $uri = "http://127.0.0.1:$Port/computeMetadata/v1/instance/service-accounts/default/token"
+    $vended = $false
     for ($i = 1; $i -le $Attempts; $i++) {
         try {
             $token = Invoke-RestMethod -Uri $uri `
@@ -1125,13 +1233,83 @@ function Test-JobBrokerReady {
                 -TimeoutSec $script:HttpTimeoutSeconds
             # A body, not merely a 200. The broker answers 200 with an error
             # document on some paths, and "it responded" is the weaker question.
-            if ($token -and $token.access_token) { return $true }
+            if ($token -and $token.access_token) {
+                $vended = $true
+                break
+            }
         } catch {
             $null = $_
         }
         Start-Sleep -Seconds $DelaySeconds
     }
-    return $false
+    if (-not $vended) { return $false }
+
+    if (-not (Test-BrokerListenerSid -Sid (Get-PortListenerSid -Port $Port))) {
+        Deny-Boot ("something other than LocalSystem is listening on 127.0.0.1:$Port -- refusing " +
+            'to point job credentials at a socket this host does not own')
+    }
+    return $true
+}
+
+function Get-PortListenerSid {
+    <#
+      .SYNOPSIS
+        The SID of the process listening on a loopback port, or '' when none is.
+      .DESCRIPTION
+        Split out from the predicate so the predicate stays pure and testable.
+        Returns '' rather than throwing on every failure mode -- no listener, a
+        process that exited between the two lookups, a CIM call that did not
+        answer -- because Test-BrokerListenerSid treats '' as "not ours", which
+        is the fail-closed reading of every one of them.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int] $Port)
+    try {
+        $listener = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop)[0]
+        if (-not $listener) { return '' }
+        $proc = Get-CimInstance -ClassName Win32_Process `
+            -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction Stop
+        if (-not $proc) { return '' }
+        # The SID, not the account name. `NT AUTHORITY\SYSTEM` is localised and
+        # this image is only en-US until the day somebody builds one that is not.
+        return [string](Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid -ErrorAction Stop).Sid
+    } catch {
+        $null = $_
+        return ''
+    }
+}
+
+function Lock-LoopbackPort {
+    <#
+      .SYNOPSIS
+        Make one TCP port permanently unbindable on this host.
+      .DESCRIPTION
+        Used for the closed-metadata port, and the reason it is not merely
+        cosmetic: with GCE_METADATA_* now always set, a pool with no broker
+        points every slot's ADC at 127.0.0.1:1. If a job could BIND that port it
+        would be handing the next job on this warm host a token of its own
+        choosing -- the no-broker pool would go from "no credentials" to "the
+        previous pull request's credentials", which is worse than what this
+        change set out to fix.
+
+        Fatal when it fails, because the alternative is a host whose fail-closed
+        endpoint is open for anyone to answer on, and the boot log would say
+        nothing at all about it.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int] $Port)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $out = & netsh @(Get-PortReservationArgument -Port $Port) 2>&1
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    foreach ($line in @($out)) { Write-BootLog "netsh: $line" }
+    # Already reserved is success. The host may have been rebooted, and an
+    # excluded port range survives a reboot.
+    if ($code -ne 0 -and ($out -join ' ') -notmatch 'already|exists') {
+        Deny-Boot ("could not reserve loopback port $Port (netsh exit $code) -- a job could bind " +
+            "the endpoint this host's credential-free slots are pointed at")
+    }
 }
 
 function Invoke-Phase3JobBroker {
@@ -1141,13 +1319,19 @@ function Invoke-Phase3JobBroker {
       .DESCRIPTION
         An empty `ci-job-service-account` means no broker and no Google
         credentials for jobs at all. That is a VALID pool -- a repository whose CI
-        never touches GCP -- and it is never a silent downgrade to the host
-        identity. Said in the log either way, because "no broker" and "broker that
-        failed" must not look the same to whoever reads the boot afterwards.
+        never touches GCP -- but it is NOT self-enforcing on Windows, and that is
+        the correction here. There is no metadata fence (section 3A), so a slot
+        whose ADC is unpointed reaches 169.254.169.254 and authenticates as the
+        host. The no-broker path therefore has real work to do: it reserves the
+        closed loopback port that Get-SlotServiceEnvironment points those slots
+        at, so ADC is refused rather than redirected to the host identity.
+
+        Said in the log either way, because "no broker" and "broker that failed"
+        must not look the same to whoever reads the boot afterwards.
 
         Returns the endpoint phase 5 points the slots at, or '' when there is no
-        broker. The empty string is what the slot environment block reads to omit
-        GCE_METADATA_*, which is why it is a return value rather than a flag.
+        broker. The empty string is what the slot environment block turns into
+        the closed endpoint, which is why it is a return value rather than a flag.
     #>
     [CmdletBinding()]
     param(
@@ -1157,8 +1341,10 @@ function Invoke-Phase3JobBroker {
     )
 
     if ([string]::IsNullOrWhiteSpace($JobServiceAccount)) {
-        Write-BootLog ('phase 3: no ci-job-service-account -- no broker, and job code gets no ' +
-            'Google credentials at all. A valid pool, and never a downgrade to the host identity.')
+        Lock-LoopbackPort -Port $script:ClosedMetadataPort
+        Write-BootLog ('phase 3: no ci-job-service-account -- no broker. Slots are pointed at ' +
+            "$script:ClosedMetadataEndpoint, which is reserved and unbindable, so job code gets " +
+            'no Google credentials rather than the host identity.')
         return ''
     }
 

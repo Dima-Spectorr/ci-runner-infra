@@ -175,6 +175,61 @@ has_job_broker() { # <file>
   matches "$code" 'IsNullOrWhiteSpace\(\$JobServiceAccount\)' || return 1
 }
 
+# --- invariant 4: every ambiguous outcome resolves AWAY from a credential ----
+#
+# The Linux script gets this property structurally: fence_metadata blocks
+# 169.254.169.254 for every job whether or not a job SA exists, so a read that
+# fails, a pool with no broker and a squatted port all end in "no credentials".
+# §3A deleted the fence here, so on Windows each of those three has to be
+# decided in code — and each one was originally decided the wrong way.
+
+has_fail_closed_metadata() { # <file>
+  local code
+  code=$(code_of "$1")
+  # A read that FAILED is not an attribute that is UNSET. The old catch-all
+  # returned '' for both, and '' is a decision on two attributes: it turns a
+  # broker pool into a no-broker pool, and it drops the image floor to 1.
+  matches "$code" 'Test-MetadataAbsence -StatusCode \$status' || return 1
+  matches "$code" 'refusing to' || return 1
+  # …and the predicate itself must not read a missing status as a 404. $null is
+  # what a refused connection, a DNS failure and a read timeout all produce.
+  matches "$code" 'if \(\$null -eq \$StatusCode\) \{ return \$false \}' || return 1
+  return 0
+}
+
+has_closed_metadata_endpoint() { # <file>
+  local code
+  code=$(code_of "$1")
+  # The endpoint a no-broker pool points its slots at. Leaving GCE_METADATA_*
+  # unset does not withhold credentials on Windows: gcloud, google-auth and the
+  # Go and Java clients fall through to the real 169.254.169.254 and come back
+  # as the HOST service account. That is the silent downgrade the no-broker path
+  # claims never to make, and this constant is what makes the claim true.
+  matches "$code" '^\$script:ClosedMetadataEndpoint' || return 1
+  matches "$code" "^\\\$script:ClosedMetadataPort" || return 1
+  # Reserved, therefore unbindable. An OPEN closed-endpoint is worse than none:
+  # a job could bind it and hand the next pull request a token of its choosing.
+  matches "$code" 'Lock-LoopbackPort -Port \$script:ClosedMetadataPort' || return 1
+  matches "$code" 'excludedportrange' || return 1
+  return 0
+}
+
+has_owned_broker_socket() { # <file>
+  local code
+  code=$(code_of "$1")
+  # A vended token proves a broker is THERE, not that it is OURS. Between a
+  # broker crash and the shim's 10-second restart the port is free, and every
+  # slot shares one loopback (§4).
+  matches "$code" 'Test-BrokerListenerSid -Sid \(Get-PortListenerSid -Port \$Port\)' || return 1
+  # The SID, not the account name — `NT AUTHORITY\SYSTEM` is localised.
+  matches "$code" "S-1-5-18" || return 1
+  # Outside the retry loop. Deny-Boot raised inside the `try` would be caught by
+  # the handler that exists to tolerate a broker still starting, and the boot
+  # would go on to register agents pointed at the squatter.
+  matches "$code" '^    if \(-not \(Test-BrokerListenerSid' || return 1
+  return 0
+}
+
 # --- the helper carries the trap it was written to avoid ---------------------
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -203,6 +258,24 @@ if has_job_broker "$SCRIPT"; then
   ok
 else
   bad "the job credential broker is missing, bound off loopback, unvalidated, unbounded, or not proven to VEND a token before agents register — a broker that answers and vends nothing turns every deploy step into a confusing auth failure at job time"
+fi
+
+if has_fail_closed_metadata "$SCRIPT"; then
+  ok
+else
+  bad "a failed metadata read is treated as an unset attribute — one flaky read then silently turns a broker pool into a no-broker pool, or drops the image floor to 1, and the boot log says nothing a healthy boot does not also say"
+fi
+
+if has_closed_metadata_endpoint "$SCRIPT"; then
+  ok
+else
+  bad "a pool with no job service account leaves its slots' ADC unpointed — that is not 'no credentials', it is the HOST service account, because §3A deleted the fence that gives Linux this property for free"
+fi
+
+if has_owned_broker_socket "$SCRIPT"; then
+  ok
+else
+  bad "readiness trusts whoever answers on the broker's port — the port is free for ten seconds after any broker crash and every slot shares one loopback, so a process a previous job left behind can vend an attacker-chosen token, project and zone to every later job on this host"
 fi
 
 # --- mutation cases: prove the checks above can actually fail -----------------
@@ -270,6 +343,32 @@ mutate "a broker that never vended is no longer fatal" \
 mutate "no-broker pool silently downgraded to the host identity" \
   's|IsNullOrWhiteSpace(\$JobServiceAccount)|$false|' \
   has_job_broker
+
+# 4. An ambiguous outcome resolves TOWARD a credential again.
+mutate "the metadata read back to swallowing every failure" \
+  's|Test-MetadataAbsence -StatusCode \$status|$true|' \
+  has_fail_closed_metadata
+mutate "a transport failure read as an unset attribute" \
+  's|if ($null -eq \$StatusCode) { return \$false }|if ($null -eq $StatusCode) { return $true }|' \
+  has_fail_closed_metadata
+mutate "the closed endpoint deleted, leaving ADC pointed at nothing" \
+  's|^\$script:ClosedMetadataEndpoint.*||' \
+  has_closed_metadata_endpoint
+mutate "the closed endpoint left bindable by any job" \
+  's|Lock-LoopbackPort -Port \$script:ClosedMetadataPort||' \
+  has_closed_metadata_endpoint
+mutate "the reservation weakened to a no-op" \
+  's|excludedportrange|show|' \
+  has_closed_metadata_endpoint
+mutate "readiness back to trusting whoever answers" \
+  's|Test-BrokerListenerSid -Sid (Get-PortListenerSid -Port \$Port)|$true|' \
+  has_owned_broker_socket
+mutate "the owner check moved back inside the retry's try block" \
+  's|^    if (-not (Test-BrokerListenerSid|            if (-not (Test-BrokerListenerSid|' \
+  has_owned_broker_socket
+mutate "the owner matched by localisable name instead of SID" \
+  's|S-1-5-18|NT AUTHORITY\\SYSTEM|g' \
+  has_owned_broker_socket
 
 
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

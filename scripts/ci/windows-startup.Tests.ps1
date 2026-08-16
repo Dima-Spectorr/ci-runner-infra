@@ -117,8 +117,22 @@ Describe 'beacon service definition' {
     # change that would not be re-tested, and an unquoted path there silently
     # truncates the argument list into a service that starts and does nothing.
     It 'quotes the script path against a directory with a space in it' {
+        # &quot;, not " -- the argument string is XML-escaped now, exactly as the
+        # broker's is, and the shim's parser decodes it back to a quote before
+        # anything sees it. Asserting the raw quote here would be asserting that
+        # the two service builders differ.
         Get-BeaconServiceConfig -ScriptPath 'C:\ci apps\bin\ci-beacon.ps1' |
-        Should -Match '-File "C:\\ci apps\\bin\\ci-beacon\.ps1"'
+        Should -Match '-File &quot;C:\\ci apps\\bin\\ci-beacon\.ps1&quot;'
+    }
+
+    # The beacon builder used to interpolate its inputs raw while the broker's
+    # escaped them. Both take module constants today, so neither was injectable;
+    # the divergence itself is the defect, because the next caller reuses
+    # whichever builder it finds first.
+    It 'escapes its inputs the same way the broker builder does' {
+        $xml = Get-BeaconServiceConfig -ScriptPath 'C:\ci\bin\b.ps1' `
+            -ServiceName 'x"/><env name="EVIL" value="1'
+        $xml | Should -Not -Match '<env name="EVIL"'
     }
 
     It 'passes the interval through instead of hardcoding one' {
@@ -447,5 +461,98 @@ Describe 'acl inheritance flags' {
     It 'gives a file ACE no flags at all, because .NET rejects any' {
         Get-AclInheritanceFlag -IsContainer $false |
             Should -Be ([System.Security.AccessControl.InheritanceFlags]::None)
+    }
+}
+
+# THE DISTINCTION THIS SUITE EXISTS FOR MOST
+#
+# Get-MetadataValue used to swallow every exception into '', which made a flaky
+# read indistinguishable from an unset attribute. Two attributes make that
+# fatal: an unread ci-job-service-account turns a broker pool into a no-broker
+# pool, and an unread ci-image-min-version drops the image floor to 1 and lets a
+# host boot from an image with no shim. Neither failure says anything in the log
+# that a healthy boot does not also say.
+Describe 'metadata read failures' {
+    It 'treats a 404 as an attribute that is genuinely not set' {
+        Test-MetadataAbsence -StatusCode 404 | Should -BeTrue
+    }
+
+    # The case the old handler got wrong, and the one that actually happens: a
+    # refused connection, a DNS failure or a read timeout never produces an HTTP
+    # status at all.
+    It 'refuses to read a transport failure as an unset attribute' {
+        Test-MetadataAbsence -StatusCode $null | Should -BeFalse
+    }
+
+    It 'refuses to read a server error as an unset attribute' {
+        Test-MetadataAbsence -StatusCode 500 | Should -BeFalse
+        Test-MetadataAbsence -StatusCode 503 | Should -BeFalse
+        Test-MetadataAbsence -StatusCode 403 | Should -BeFalse
+    }
+
+    It 'reads the status the same whether it arrives as an enum or a number' {
+        Test-MetadataAbsence -StatusCode ([System.Net.HttpStatusCode]::NotFound) | Should -BeTrue
+        Test-MetadataAbsence -StatusCode ([System.Net.HttpStatusCode]::InternalServerError) |
+            Should -BeFalse
+    }
+}
+
+# A vended token proves a broker is THERE, not that it is OURS. Every slot on a
+# Windows host shares one loopback, nothing reserves the broker's port, and the
+# shim's restart delay leaves it free for ten seconds after any crash -- long
+# enough for a process a previous job left behind to take it and answer with a
+# metadata document of its own choosing.
+Describe 'broker listener ownership' {
+    It 'accepts the one SID a slot account can never hold' {
+        Test-BrokerListenerSid -Sid 'S-1-5-18' | Should -BeTrue
+    }
+
+    It 'rejects a local account, which is what a squatter would be' {
+        Test-BrokerListenerSid -Sid 'S-1-5-21-1-2-3-1001' | Should -BeFalse
+    }
+
+    # Get-PortListenerSid returns '' for no listener, a process that exited
+    # between the two lookups, and a CIM call that did not answer. All three mean
+    # "not ours", and this is where that reading is made explicit.
+    It 'reads an unknown owner as not ours rather than as ours' {
+        Test-BrokerListenerSid -Sid '' | Should -BeFalse
+        Test-BrokerListenerSid -Sid '   ' | Should -BeFalse
+        Test-BrokerListenerSid -Sid $null | Should -BeFalse
+    }
+
+    It 'ignores the whitespace a CIM property arrives with' {
+        Test-BrokerListenerSid -Sid " S-1-5-18`n" | Should -BeTrue
+    }
+}
+
+# The reservation is the only thing that makes 127.0.0.1:1 a CLOSED endpoint
+# rather than a free one. A netsh call that names the wrong protocol or a range
+# of the wrong length protects nothing, and there is no way to notice that on a
+# host afterwards: the port is simply available the day somebody wants it.
+Describe 'closed metadata endpoint' {
+    It 'reserves exactly one TCP port, at the port it was given' {
+        $args1 = Get-PortReservationArgument -Port 1
+        $args1 | Should -Contain 'protocol=tcp'
+        $args1 | Should -Contain 'startport=1'
+        $args1 | Should -Contain 'numberofports=1'
+        $args1 | Should -Contain 'excludedportrange'
+    }
+
+    It 'passes the port through instead of hardcoding one' {
+        Get-PortReservationArgument -Port 9999 | Should -Contain 'startport=9999'
+    }
+
+    # The constant and the port must name the same socket. They are read in two
+    # different phases -- the port by phase 3's reservation, the endpoint by the
+    # slot environment block -- so nothing but this compares them.
+    It 'reserves the port the slots are actually pointed at' {
+        $script:ClosedMetadataEndpoint | Should -Be "127.0.0.1:$script:ClosedMetadataPort"
+    }
+
+    # Not the broker's default, and not the real metadata server. Either would
+    # turn the fail-closed endpoint back into a working one.
+    It 'is not a port anything on this host answers on' {
+        $script:ClosedMetadataPort | Should -Not -Be $script:DefaultBrokerPort
+        $script:ClosedMetadataEndpoint | Should -Not -Match '169\.254\.169\.254'
     }
 }
