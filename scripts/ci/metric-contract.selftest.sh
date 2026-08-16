@@ -59,6 +59,21 @@ floor "host-startup.sh" "$host_published" 3
   printf 'FAIL extracted %s declared metric(s) from outputs.tf — the matcher is broken\n' \
     "$(printf '%s\n' "$declared" | grep -c .)"; fails=$((fails + 1)); }
 
+# Named, rather than left to the generic diff below, because this one series is
+# the only evidence a dashboard has that the SECOND delete gate still runs. Its
+# `undetermined` outcome is a controller that cannot establish a host's OS and
+# therefore keeps it: scale-in silently suspended while every other series reads
+# healthy. Deleted from either side, the diff below reports it as ordinary
+# drift; here it reports it by name.
+for m in ci_worker_gate_verdicts; do
+  printf '%s\n' "$published" | grep -qx "$m" || {
+    printf 'FAIL %s is not published by either script — the second delete gate has no telemetry\n' "$m"
+    fails=$((fails + 1)); }
+  printf '%s\n' "$declared" | grep -qx "$m" || {
+    printf 'FAIL %s is not declared in metric_names — no dashboard or alert can find the delete gate\n' "$m"
+    fails=$((fails + 1)); }
+done
+
 while read -r m; do
   [ -n "$m" ] || continue
   if printf '%s\n' "$declared" | grep -qx "$m"; then

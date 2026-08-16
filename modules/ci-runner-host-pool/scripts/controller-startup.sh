@@ -109,6 +109,18 @@ MINT_REG=${MINT_REG:-false}
 # host boot script in the same module, and a configurable name is one more way
 # for the delete to miss the key the write created.
 REG_TOKEN_KEY="ci-registration-token"
+# The guest-attribute namespace a Windows host publishes its liveness beacon
+# into, and the keys inside it. Hard-coded for the same reason REG_TOKEN_KEY is:
+# it is a contract between this file and the beacon publisher in this module.
+BEACON_NS="ci"
+# Seconds between the host publisher's writes. beacon_decision() derives its
+# staleness ceiling from this (3x), so a controller that guessed high would keep
+# reading a dead publisher as fresh. Read from metadata so a pool that tunes the
+# publisher can tune the reader with it; absent — which is every pool today —
+# reads empty and falls back to the publisher's own default of 30.
+BEACON_INTERVAL=$(md "instance/attributes/ci-beacon-interval")
+case "${BEACON_INTERVAL:-}" in '' | *[!0-9]*) BEACON_INTERVAL=30 ;; esac
+[ "$BEACON_INTERVAL" -gt 0 ] || BEACON_INTERVAL=30
 POLL=${POLL:-20}
 # Seconds the demand sweep may spend walking per-run job lists. It must stay far
 # below the watchdog threshold (10 polls, min 300s): a tick that outruns the
@@ -1287,6 +1299,129 @@ registration_token_step() {
   return 0
 }
 
+# --- the second delete gate, per OS ------------------------------------------
+#
+# instance_host_os <host> <zone> -> linux | windows | unknown
+#
+# READ FROM THE HOST, NOT FROM THIS CONTROLLER'S OWN METADATA.
+#
+# The controller carries `ci-host-os` too, and using it would cost nothing. It
+# would also be wrong for the one window in which this matters. `ci-host-os`
+# lives on the INSTANCE TEMPLATE, and a template change is applied to a running
+# MIG host by host: during any rollout — including the one that introduces the
+# key — the pool holds hosts from two templates at once, and the controller's
+# own metadata describes neither of them reliably (it is updated by the same
+# apply, and a controller is not restarted in step with its hosts). Asking each
+# host what it is turns a confident wrong answer into a per-host fact. The cost
+# is one describe per drain, on a path that already spends a list and an ssh.
+#
+# Unknown is a real answer and it is the one that must NOT be guessed. A host
+# from a template predating PR 7 carries no `ci-host-os` at all, and reading an
+# absent key as "linux" is exactly the inference this function exists to refuse
+# — the caller fails closed on `unknown`.
+#
+# `--format=json(metadata)` plus jq rather than a flattened key/value
+# projection: metadata VALUES are arbitrary text and the boot script is tens of
+# kilobytes of it, containing both commas and newlines, so any line-oriented
+# CSV/TSV parse of key+value is decided by the contents of somebody's shell
+# script. JSON escapes them and jq is already a hard dependency here.
+instance_host_os() {
+  local host="$1" zone="$2" json os
+  [ -n "$host" ] && [ -n "$zone" ] || { echo "unknown"; return 0; }
+
+  json=$(timeout 60 gcloud compute instances describe "$host" \
+    --project="$PROJECT" --zone="$zone" \
+    --format="json(metadata)" 2>/dev/null) || { echo "unknown"; return 0; }
+
+  # `[...][0]` rather than a `| head -1`: under `pipefail` head closes the pipe
+  # on the first line and jq dies of SIGPIPE, which would turn a perfectly good
+  # read into a failure some of the time, depending on buffering.
+  os=$(printf '%s' "$json" \
+    | jq -r '[.metadata.items[]? | select(.key == "ci-host-os") | .value][0] // ""' 2>/dev/null)
+
+  case "$os" in
+    linux | windows) echo "$os" ;;
+    *) echo "unknown" ;;
+  esac
+  return 0
+}
+
+# beacon_gate <host> <zone> <registrations> -> the beacon_decision() verdict
+#
+# The Windows half of the second gate: all of the I/O, none of the rule. The
+# rule is beacon_decision(), which ships unit-tested one release ahead of this
+# call site precisely so the code that deletes a machine is the code that was
+# proven.
+#
+# NO INBOUND PATH. The host publishes outbound into its own guest attributes and
+# this reads them through the same compute API the controller already calls —
+# no sshd, no IAP firewall rule, no admin session onto a box running
+# pull-request code.
+#
+# ONE call for the whole namespace, not one per key: guest attributes are rate
+# limited to 10 queries per minute per instance, and manufacturing that limit on
+# the busy pool would present as read-failed, which is a keep — a drain that
+# stops working when the fleet gets busy.
+beacon_gate() {
+  local host="$1" zone="$2" regs="$3"
+  local raw rc line key val present=0 workers="" ts_raw="" ts=0 now age misses
+  local mf="$STATE_DIR/beaconmiss-$host"
+
+  raw=$(timeout 60 gcloud compute instances get-guest-attributes "$host" \
+    --project="$PROJECT" --zone="$zone" --query-path="$BEACON_NS/" \
+    --format="csv[no-heading](key,value)" 2>/dev/null)
+  rc=$?
+
+  # FIRST occurrence of each key wins. Guest attributes are writable by any
+  # process on the VM, job code included — Google documents this plainly — so
+  # the reader must not let a later line overwrite an earlier one.
+  #
+  # `present` is set by SEEING the key, not by liking its value: an empty or
+  # malformed count is a broken publisher, and beacon_decision() answers `keep`
+  # for it. Treating it as absent would hand it to the never-booted arm instead.
+  while IFS= read -r line; do
+    key=${line%%,*}
+    val=${line#*,}
+    case "$key" in
+      workers) [ "$present" = "1" ] || { present=1; workers="$val"; } ;;
+      ts) [ -n "$ts_raw" ] || ts_raw="$val" ;;
+    esac
+  done <<EOF
+$raw
+EOF
+
+  now=$(date -u +%s)
+  if [ -n "$ts_raw" ]; then
+    ts=$(date -u -d "$ts_raw" +%s 2>/dev/null) || ts=0
+    # A negative epoch carries a `-` and is caught here, which is what the rule
+    # wants: 0 means "the caller could not parse it", and keeps.
+    case "${ts:-}" in '' | *[!0-9]*) ts=0 ;; esac
+  fi
+
+  age=$(host_age_seconds "$host")
+
+  misses=$(cat "$mf" 2>/dev/null)
+  case "${misses:-}" in '' | *[!0-9]*) misses=0 ;; esac
+
+  # The counter advances on the ONE branch it belongs to — a read that SUCCEEDED
+  # and found no beacon — and is cleared by anything else, so a failed read can
+  # never accumulate towards a deletion. Written after the verdict so this tick
+  # is judged on the count it entered with.
+  local verdict
+  verdict=$(beacon_decision "$rc" "$present" "$workers" "$ts" "$now" \
+    "$BEACON_INTERVAL" "$age" "$REGISTER_GRACE" "$regs" "$misses" \
+    "$ORPHAN_CONFIRM_TICKS")
+
+  if [ "$rc" = "0" ] && [ "$present" != "1" ]; then
+    printf '%s' "$((misses + 1))" >"$mf"
+  else
+    rm -f "$mf"
+  fi
+
+  printf '%s' "$verdict"
+  return 0
+}
+
 # --- drain -------------------------------------------------------------------
 #
 # The verdict from drain_decision() authorises this sequence and nothing less.
@@ -1320,6 +1455,13 @@ drain_host() {
     fi
   fi
 
+  # Counted BEFORE the deregistrations below, because after them GitHub's list
+  # is empty by construction. beacon_decision() reads this to tell "the boot
+  # script never ran" apart from "the publisher is broken on a host that DID
+  # register" — and asking GitHub after the drain answers 0 for both.
+  local regs
+  regs=$(printf '%s\n' "$ids" | grep -c '[0-9]')
+
   for id in $ids; do
     local code
     code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
@@ -1352,16 +1494,53 @@ drain_host() {
   zone=$(gcloud compute instances list --project="$PROJECT" \
     --filter="name=$host" --format="value(zone)" 2>/dev/null | head -1)
 
+  # WHICH question to ask is a property of the HOST. See instance_host_os().
+  local host_os="unknown"
   if [ -n "$zone" ]; then
+    host_os=$(instance_host_os "$host" "$zone")
+  fi
+
+  if [ "$host_os" = "windows" ]; then
+    local verdict
+    verdict=$(beacon_gate "$host" "$zone" "$regs")
+    case "$verdict" in
+      delete:*)
+        log "drain $host: beacon gate clear ($verdict)"
+        WORKER_GATE_CLEAR=$((WORKER_GATE_CLEAR + 1))
+        ;;
+      *)
+        log "drain $host: $verdict — leaving host up"
+        WORKER_GATE_HELD=$((WORKER_GATE_HELD + 1))
+        DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
+        return 1
+        ;;
+    esac
+  elif [ "$host_os" != "linux" ]; then
+    # FAIL CLOSED, and this is a deliberate change to the Linux path's DEGRADED
+    # case. Until now an unreadable zone skipped the second gate entirely and
+    # the host was deleted anyway — a delete on a host nothing had been able to
+    # ask about. There is now a second way to arrive here (the OS itself is
+    # unreadable), and both answers are the same one: an unknown host is kept.
+    # A wrong keep bills for one host until the next tick; a wrong delete costs
+    # up to slots_per_host merge-blocking jobs, and nobody finds out from here.
+    log "drain $host: cannot establish how to ask this host for live workers (ci-host-os=$host_os, zone=${zone:-unknown}) — leaving host up"
+    WORKER_GATE_UNDETERMINED=$((WORKER_GATE_UNDETERMINED + 1))
+    DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
+    return 1
+  fi
+
+  if [ "$host_os" = "linux" ]; then
     local workers
     workers=$(gcloud compute ssh "$host" --zone="$zone" --project="$PROJECT" \
       --tunnel-through-iap --command 'pgrep -fc "Runner.Worker" || true' \
       2>/dev/null | tr -d '[:space:]')
     if [ -n "$workers" ] && [ "$workers" != "0" ]; then
       log "drain $host: $workers job worker(s) still alive after deregistration — leaving host up"
+      WORKER_GATE_HELD=$((WORKER_GATE_HELD + 1))
       DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
       return 1
     fi
+    WORKER_GATE_CLEAR=$((WORKER_GATE_CLEAR + 1))
   fi
 
   gcloud compute instance-groups managed delete-instances "$MIG" \
@@ -1371,7 +1550,7 @@ drain_host() {
       return 1
     }
 
-  rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/seen-$host"
+  rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/seen-$host" "$STATE_DIR/beaconmiss-$host"
   log "drain $host: deregistered and deleted"
   DRAINED=$((DRAINED + 1))
   return 0
@@ -1444,6 +1623,9 @@ tick() {
   REAPED=0
   CORDONED=0
   RETIRED=0
+  WORKER_GATE_CLEAR=0
+  WORKER_GATE_HELD=0
+  WORKER_GATE_UNDETERMINED=0
 
   local tick_start
   tick_start=$(date +%s)
@@ -1496,7 +1678,7 @@ tick() {
   local f mname live_hosts
   live_hosts=$(printf '%s\n' "$HOSTS" | awk -F, '{ if ($1 != "") print $1 }')
   for f in "$STATE_DIR"/cordon-* "$STATE_DIR"/regtoken-* "$STATE_DIR"/regkey-* \
-    "$STATE_DIR"/regfail-*; do
+    "$STATE_DIR"/regfail-* "$STATE_DIR"/beaconmiss-*; do
     [ -n "$live_hosts" ] || break
     [ -e "$f" ] || continue
     mname=$(basename "$f")
@@ -1504,6 +1686,7 @@ tick() {
     mname=${mname#regtoken-}
     mname=${mname#regkey-}
     mname=${mname#regfail-}
+    mname=${mname#beaconmiss-}
     case $'\n'"$live_hosts"$'\n' in
       *$'\n'"$mname"$'\n'*) ;;
       *) rm -f "$f" ;;
@@ -1649,6 +1832,18 @@ tick() {
   queue_series "ci_mig_target_size" "$target"
   queue_series "ci_drain_verdicts" "$DRAINED" '"outcome":"drained"'
   queue_series "ci_drain_verdicts" "$DRAIN_ABORTED" '"outcome":"aborted"'
+  # The SECOND delete gate, split out of ci_drain_verdicts because "aborted"
+  # cannot distinguish the three things that stop a delete here, and only one of
+  # them is the system working. `held` is the gate doing its job — a worker is
+  # alive. `undetermined` is the gate UNABLE to do its job: the host's OS or its
+  # facts could not be read, so the controller fails closed and keeps a host it
+  # cannot ask about. Sustained non-zero `undetermined` is scale-in quietly
+  # suspended on hosts that all look healthy, which is the shape of every outage
+  # this controller has had; it is the value to alert on. Per-tick deltas, like
+  # ci_drain_verdicts — align with a sum over the window, never a mean.
+  queue_series "ci_worker_gate_verdicts" "$WORKER_GATE_CLEAR" '"outcome":"clear"'
+  queue_series "ci_worker_gate_verdicts" "$WORKER_GATE_HELD" '"outcome":"held"'
+  queue_series "ci_worker_gate_verdicts" "$WORKER_GATE_UNDETERMINED" '"outcome":"undetermined"'
   # The one series that says whether an APPLY reached machines. A pin lands, a
   # template changes, and this climbs to the pool size and then falls back to
   # zero as the hosts are replaced. Stuck above zero means a pool that keeps
