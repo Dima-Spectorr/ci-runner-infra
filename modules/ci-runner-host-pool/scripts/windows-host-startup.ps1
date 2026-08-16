@@ -21,8 +21,29 @@
 #   phase 2  the metadata fence                                (DELETED, see below)
 #   phase 3  the job credential broker
 #   phase 4  the per-job credential reset hooks
-#   phase 5  agent registration as a service                   (not yet)
+#   phase 5  agent registration as a service
 #   phase 6  the boot probe                                    (not yet)
+#
+# THE REGISTRATION TOKEN IS READ ONCE, AND A HOST THAT CANNOT GET ONE BLOCKS
+#
+# The controller mints the repository registration token, writes it to this
+# instance's `ci-registration-token` metadata key, and DELETES that key the
+# moment GitHub reports any of this host's agents registered -- `partial`, not
+# only `present`. Two host-side obligations follow from that, and the controller
+# cannot check either one:
+#
+#   (a) ONE read, above the slot loop. A per-slot read on a two-slot host reads
+#       the key for slot 1, registers it, the controller's delete fires, and
+#       slot 2 reads nothing -- a host stuck at half capacity with no error
+#       anywhere. The single read is what makes the `partial` expiry safe.
+#
+#   (b) After the key is gone, a reboot LOGS AND BLOCKS. Windows hosts reboot for
+#       updates, so this is ordinary behaviour here rather than an edge case: the
+#       key was deleted, the controller will not mint a second, and the honest
+#       outcome is a host that says so and registers nothing, so the register-
+#       grace drain reclaims it and the MIG replaces it. Registering with an
+#       empty token instead produces an agent-side failure that reads like a
+#       GitHub outage.
 #
 # THERE IS NO PHASE 2, AND THERE WILL NOT BE ONE
 #
@@ -125,6 +146,27 @@ $script:DefaultBrokerPort = 8081
 # would run on a CI host wants it.
 $script:ClosedMetadataPort = 1
 $script:ClosedMetadataEndpoint = '127.0.0.1:1'
+
+# The per-instance metadata key the controller writes the registration token to
+# and deletes it from. Hard-coded on BOTH sides for the same reason
+# controller-startup.sh hard-codes it: a configurable name is one more way for
+# the delete to miss the key the write created.
+$script:RegistrationTokenKey = 'ci-registration-token'
+
+# The unconfigured agent baked into the golden image. COPIED per slot, never
+# linked: config.cmd writes `.runner` and `.credentials` into the directory it
+# runs in, and K agents must not share one identity.
+$script:RunnerTemplate = 'C:\ci\bin\actions-runner'
+
+# How long phase 5 waits for the controller to write the registration token.
+# BOUNDED, and the bound is the whole point. `wait-for-change` on the metadata
+# server would block until the key appears, which on a rebooted host past the
+# expiry is forever -- and forever is the 2h55m outage: a host that never
+# registers, never powers off, and counts against the pool's size the whole
+# time. 300s is generous against a controller tick (POLL defaults to 20s) and
+# still far inside the register grace that reclaims a host which gave up.
+$script:RegistrationWaitSeconds = 300
+$script:RegistrationPollSeconds = 5
 
 # Bounded, like every call this host makes. A host boot that HANGS is worse than
 # one that fails: it never registers an agent, never powers off, and bills at
@@ -763,10 +805,10 @@ function Get-RunnerServiceName {
         The runner service name from the agent's own `.service` marker. Pure.
       .DESCRIPTION
         `config.cmd --runasservice` records the service it installed in a
-        `.service` file in the runner directory; that file, not a name a script
+        `.service` file in the runner directory; that file, not a name this script
         reconstructs, is the answer. Reconstructing it would mean encoding
         GitHub's naming scheme here, and a scheme that changes upstream would
-        leave the caller configuring the environment and the recovery policy of a
+        leave phase 5 configuring the environment and the recovery policy of a
         service that does not exist -- while the agent that DOES exist starts with
         neither, takes jobs, and restarts itself out of a cordon.
 
@@ -784,6 +826,78 @@ function Get-RunnerServiceName {
     return $name
 }
 
+function Get-RunnerConfigArgument {
+    <#
+      .SYNOPSIS
+        The config.cmd argument list for one slot, WITHOUT the token. Pure.
+      .DESCRIPTION
+        The token is appended by the caller and is deliberately not a parameter
+        here: a pure function that never receives the credential cannot leak it
+        into a test fixture, a log line or an error message, and this is the one
+        function in phase 5 a test calls directly.
+
+        --disableupdate transfers verbatim from Linux and matters MORE here.
+        GitHub otherwise forces a runner self-update that leaves the process alive
+        while the agent is offline and undispatchable -- 90 minutes of stalled CI
+        on the pool this replaces -- and on a warm host that takes K slots down at
+        once instead of one short-lived VM. The image pins the agent version;
+        upgrades ship by rebuilding the image, which is reviewable.
+
+        --replace, because a host that rebooted has an agent of this name already
+        in GitHub's list and a refused registration is a slot that never comes
+        back.
+
+        --runasservice with NO account flags. The ADR's sketch passes the pair of
+        logon-account flags config.cmd accepts, and the password one of them takes
+        is a PLAINTEXT argument -- in the process table of a host whose local
+        accounts run pull-request code. The service is installed under the SCM
+        default instead and its logon account is changed afterwards through
+        ChangeServiceConfigW, which takes the password as unmanaged memory
+        marshalled straight out of the SecureString. See Grant-ServiceLogonAccount.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Owner,
+        [Parameter(Mandatory = $true)][string] $Repo,
+        [Parameter(Mandatory = $true)][string] $Name,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $Labels,
+        [Parameter(Mandatory = $true)][string] $WorkPath,
+        [AllowEmptyString()][string] $RunnerGroup = ''
+    )
+
+    $configArgs = [System.Collections.Generic.List[string]]::new()
+    $configArgs.AddRange([string[]] @('--unattended', '--replace', '--disableupdate', '--runasservice'))
+    $configArgs.AddRange([string[]] @('--url', "https://github.com/$Owner/$Repo"))
+    $configArgs.AddRange([string[]] @('--name', $Name))
+    $configArgs.AddRange([string[]] @('--work', $WorkPath))
+    if (-not [string]::IsNullOrWhiteSpace($Labels)) {
+        $configArgs.AddRange([string[]] @('--labels', $Labels.Trim()))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RunnerGroup)) {
+        $configArgs.AddRange([string[]] @('--runnergroup', $RunnerGroup.Trim()))
+    }
+    return $configArgs.ToArray()
+}
+
+function Get-SlotAgentName {
+    <#
+      .SYNOPSIS
+        The agent name slot <Index> registers under. Pure.
+      .DESCRIPTION
+        `<instance>-s<i>`, and it is not cosmetic: `orphan_decision()` on the
+        controller parses this name back to an instance, so a rename here silently
+        un-reaps every Windows registration -- the agent stays in GitHub's list,
+        the host it named is long gone, and nothing in the controller notices
+        because nothing can.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $InstanceName,
+        [Parameter(Mandatory = $true)][int] $Index
+    )
+    return "$InstanceName-s$Index"
+}
+
 # --- phase 0 -----------------------------------------------------------------
 
 function Get-MetadataValue {
@@ -791,12 +905,21 @@ function Get-MetadataValue {
       .SYNOPSIS
         Read one metadata value. Empty string when absent.
       .DESCRIPTION
-        Called ONLY in phase 0. The original reason was the phase-2 fence, which
-        would have taken this script's own access to 169.254.169.254:80 away; section 3A
-        deleted the fence, so the endpoint stays reachable all boot long. The
-        constraint survives on a different footing: one read site is one place to
-        look when a boot fails on a missing attribute, and a later phase that
-        reads its own metadata is a phase whose inputs no test can construct.
+        Every STATIC attribute is read in phase 0, once. The original reason was
+        the phase-2 fence, which would have taken this script's own access to
+        169.254.169.254:80 away; section 3A deleted the fence, so the endpoint
+        stays reachable all boot long. The constraint survives on a different
+        footing: one read site is one place to look when a boot fails on a missing
+        attribute, and a later phase that reads its own metadata is a phase whose
+        inputs no test can construct.
+
+        There is exactly ONE other caller, Wait-RegistrationToken, and it is not
+        an exception to that rule -- it is the reason the rule says STATIC. The
+        registration token is written by the CONTROLLER, after this host has
+        started booting, and deleted again once the host registers; it is the one
+        attribute whose value at phase 0 says nothing about its value later. It is
+        still read once, above the slot loop, for the reason at the top of this
+        file.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string] $Path)
@@ -920,6 +1043,8 @@ function Invoke-Phase0Preflight {
         BeaconScript   = Get-MetadataValue 'instance/attributes/ci-beacon-script'
         BeaconInterval = Get-MetadataValue 'instance/attributes/ci-beacon-interval'
         InstanceName   = Get-MetadataValue 'instance/name'
+        Labels         = Get-MetadataValue 'instance/attributes/ci-runner-labels'
+        RunnerGroup    = Get-MetadataValue 'instance/attributes/ci-runner-group'
         JobSa          = Get-MetadataValue 'instance/attributes/ci-job-service-account'
         BrokerPort     = Get-MetadataValue 'instance/attributes/ci-job-broker-port'
         BrokerSource   = Get-MetadataValue 'instance/attributes/ci-job-broker-py'
@@ -927,6 +1052,22 @@ function Invoke-Phase0Preflight {
 
     if ([string]::IsNullOrWhiteSpace($cfg.Owner) -or [string]::IsNullOrWhiteSpace($cfg.Repo)) {
         Deny-Boot 'missing ci-github-owner/ci-github-repo metadata'
+    }
+
+    # An empty label set is the silent version of a dead pool. The controller
+    # exits outright on it, because demand would match nothing and the pool would
+    # sit at zero hosts while jobs queue; a HOST with no labels is the other half
+    # of the same fault -- it registers, GitHub sends it nothing, and the boot log
+    # reads as a success. An empty instance name is the same shape one layer down:
+    # the agent registers as `-s1`, which orphan_decision() cannot parse back to
+    # any instance, so the registration outlives the host forever.
+    if ([string]::IsNullOrWhiteSpace($cfg.Labels)) {
+        Deny-Boot ('ci-runner-labels metadata is missing or empty -- agents registered without ' +
+            'labels are never sent a job, and the host would look perfectly healthy doing nothing')
+    }
+    if ([string]::IsNullOrWhiteSpace($cfg.InstanceName)) {
+        Deny-Boot ('the metadata server did not name this instance -- an agent registered without ' +
+            'it cannot be traced back to a host and would never be reaped')
     }
 
     # The OS marker is asserted, not assumed. Terraform decides which metadata
@@ -1634,21 +1775,78 @@ function Invoke-Phase4JobHook {
     return $script:JobHookPath
 }
 
-# --- service plumbing phase 5 registers agents through -----------------------
-#
-# The three operations phase 5 has to perform on a service config.cmd installed,
-# separated from phase 5 itself because each is a distinct decision with a
-# distinct failure mode and none of them is about registration:
-#
-#   the logon account   set through ChangeServiceConfigW, because every
-#                       documented alternative takes the password as a string.
-#   the environment     written on the service's own key, because a machine-wide
-#                       block hands every slot the same TMP and points the host's
-#                       own tooling at the broker.
-#   the recovery policy CLEARED, because an agent that restarts itself out of a
-#                       cordon keeps a draining host alive forever.
-#
-# Nothing calls them yet; phase 5 does.
+# --- phase 5: agent registration as a per-slot service ------------------------
+
+function Wait-RegistrationToken {
+    <#
+      .SYNOPSIS
+        The controller-minted registration token, or a denied boot. Never ''.
+      .DESCRIPTION
+        CALLED ONCE PER HOST, ABOVE THE SLOT LOOP. See obligation (a) at the top
+        of this file: the controller deletes the key as soon as GitHub reports
+        ANY of this host's agents registered, so a second read taken after slot 1
+        comes up returns nothing and strands slot 2 silently.
+
+        A Windows host cannot mint its own token. Section 3A reduced its service
+        account to serviceAccountTokenCreator on the job account and nothing else
+        precisely because job code on this platform can reach the metadata server
+        and mint whatever the host can -- so the Secret Manager grant the Linux
+        host uses to sign its own App JWT is exactly the thing that must not be
+        here. The controller mints instead and writes the token to this instance.
+
+        OBLIGATION (b) IS THE TIMEOUT ARM, AND IT IS NOT AN ERROR PATH
+
+        A host that reboots after the key was deleted -- and Windows hosts reboot
+        for updates, so this is ordinary -- finds nothing here, and the controller
+        will not mint a second: the `<key>-issued` marker it wrote in the same
+        metadata call is never removed, and the mint is refused unless that
+        marker is provably absent. Blocking is therefore the DESIGNED outcome, not
+        a failure to handle one. The host registers nothing, the register-grace
+        drain reclaims it, and the MIG replaces it with an instance the controller
+        has never issued a token to.
+
+        The alternative -- carrying on with an empty token -- is strictly worse in
+        both directions: config.cmd fails with an authentication error that reads
+        like a GitHub outage, and if it ever did not, the host would be serving
+        jobs the controller believes it deregistered.
+
+        Polled rather than `wait-for-change`d. The long-poll would block until the
+        key appears, which on the reboot case above is forever, and forever is the
+        2h55m outage: a host that never registers, never powers off, and counts
+        against the pool's size the whole time it does not exist.
+    #>
+    [CmdletBinding()]
+    param(
+        [int] $TimeoutSeconds = $script:RegistrationWaitSeconds,
+        [int] $PollSeconds = $script:RegistrationPollSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $announced = $false
+    while ($true) {
+        $token = Get-MetadataValue "instance/attributes/$script:RegistrationTokenKey"
+        # Trimmed and tested for EMPTY, not for null. An interrupted controller
+        # write leaves a zero-length value, and a zero-length token is the case
+        # that must block rather than register.
+        if (-not [string]::IsNullOrWhiteSpace($token)) {
+            Write-BootLog 'phase 5: registration token present'
+            return $token.Trim()
+        }
+        if (-not $announced) {
+            Write-BootLog ("phase 5: waiting up to ${TimeoutSeconds}s for the controller to write " +
+                "$script:RegistrationTokenKey")
+            $announced = $true
+        }
+        if ((Get-Date) -ge $deadline) { break }
+        Start-Sleep -Seconds $PollSeconds
+    }
+
+    Deny-Boot ("no $script:RegistrationTokenKey on this instance after ${TimeoutSeconds}s. If this " +
+        'host has registered before, this is the EXPECTED transition after a reboot: the ' +
+        'controller deleted the key once the agents appeared and will not mint a second one for ' +
+        'this instance. Registering with an empty token is refused -- the host registers nothing, ' +
+        'the register-grace drain reclaims it, and the MIG replaces it.')
+}
 
 function Grant-ServiceLogonAccount {
     <#
@@ -1660,10 +1858,10 @@ function Grant-ServiceLogonAccount {
         Every documented way of setting a service's logon account takes the
         password as a STRING: the sc.exe config form puts it in the process table,
         config.cmd's own logon-password flag does the same, and
-        Win32_Service.Change takes a managed String that cannot be erased and
-        lives until the GC decides otherwise. On this host the process table is
-        readable by the very accounts whose credentials those are, and those
-        accounts run pull-request code.
+        Win32_Service.Change takes a managed String that cannot be
+        erased and lives until the GC decides otherwise. On this host the process
+        table is readable by the very accounts whose credentials those are, and
+        those accounts run pull-request code.
 
         ChangeServiceConfigW takes the password as a pointer.
         SecureStringToGlobalAllocUnicode marshals it out of the SecureString into
@@ -1813,6 +2011,146 @@ function Clear-ServiceRecoveryAction {
     }
 }
 
+function Register-SlotAgent {
+    <#
+      .SYNOPSIS
+        Configure and start one slot's agent as a service running as that slot.
+      .DESCRIPTION
+        The order is the safety property, again, and every step is fatal:
+
+          1. copy the baked agent, per slot. config.cmd writes `.runner` and
+             `.credentials` into the directory it runs in, so K agents sharing one
+             directory would share one identity;
+          2. config.cmd, ELEVATED. It creates a service and touches an account
+             right, so it cannot run as the slot -- which is why step 4 exists;
+          3. read the service name the agent itself recorded, and refuse anything
+             that is not one;
+          4. re-apply the ACL. config.cmd wrote `.runner` and `.credentials` as
+             the elevated identity, so without this the agent cannot read its own
+             credentials -- or, worse, a sibling can. The Linux script's
+             `chown -R "$u:$u" "$dir"` is the same step;
+          5. environment, then recovery actions, then the logon account -- all
+             BEFORE the first start. A service started once with the SCM's default
+             account has already written its own state as the wrong identity;
+          6. start, and verify it is Running rather than assume it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable] $Slot,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $RegistrationToken,
+        [Parameter(Mandatory = $true)][string] $Owner,
+        [Parameter(Mandatory = $true)][string] $Repo,
+        [Parameter(Mandatory = $true)][string] $InstanceName,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $Labels,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $RunnerGroup,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary] $Environment
+    )
+
+    # OBLIGATION (b), AT THE LAST POSSIBLE MOMENT. Wait-RegistrationToken already
+    # denies the boot rather than returning empty, so reaching here with nothing
+    # means a later edit made the token optional somewhere in between. config.cmd
+    # with an empty --token produces an agent-side authentication failure that
+    # reads like a GitHub outage; blocking produces a host the register-grace
+    # drain reclaims, which is the designed outcome.
+    if ([string]::IsNullOrWhiteSpace($RegistrationToken)) {
+        Deny-Boot ("slot $($Slot.Index): refusing to run config.cmd with an empty registration " +
+            'token -- a host that cannot register must block and be reclaimed, not register wrong')
+    }
+
+    if (-not (Test-Path -LiteralPath $script:RunnerTemplate)) {
+        Deny-Boot ("no agent at $script:RunnerTemplate -- this image predates the runner and a host " +
+            'that installed one at boot would have re-invented the per-job cost this pool removes')
+    }
+
+    $dir = Get-SlotWorkspacePath -Index $Slot.Index
+    $agent = Join-Path $dir 'runner'
+    $name = Get-SlotAgentName -InstanceName $InstanceName -Index $Slot.Index
+    New-Item -ItemType Directory -Force -Path $agent | Out-Null
+    Copy-Item -Path (Join-Path $script:RunnerTemplate '*') -Destination $agent -Recurse -Force
+
+    $configArgs = Get-RunnerConfigArgument -Owner $Owner -Repo $Repo -Name $name `
+        -Labels $Labels -WorkPath (Join-Path $agent '_work') -RunnerGroup $RunnerGroup
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    # The token is appended HERE and nowhere a test or a log can reach it. It is
+    # still an argument to config.cmd and therefore visible in this host's process
+    # table for the length of that call -- accepted, because section 3A already
+    # accepts that job code on this host can read the same value straight out of
+    # instance metadata, and the controller's delete is what bounds both.
+    $configOutput = & (Join-Path $agent 'config.cmd') @configArgs --token $RegistrationToken 2>&1
+    $configExit = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    foreach ($line in @($configOutput)) { Write-BootLog "slot $($Slot.Index) config: $line" }
+    if ($configExit -ne 0) {
+        Deny-Boot "slot $($Slot.Index): config.cmd failed (exit $configExit)"
+    }
+
+    $marker = ''
+    $markerPath = Join-Path $agent '.service'
+    if (Test-Path -LiteralPath $markerPath) {
+        $marker = Get-Content -Raw -LiteralPath $markerPath
+    }
+    $serviceName = Get-RunnerServiceName -Marker $marker
+    if (-not $serviceName) {
+        Deny-Boot ("slot $($Slot.Index): the agent did not record a usable service name in " +
+            "$markerPath -- its environment, its logon account and its recovery policy would all " +
+            'be set on a service that does not exist, while the one that does starts with none of them')
+    }
+
+    # After config.cmd, and re-proved rather than assumed. `.runner` and
+    # `.credentials` were written by the elevated identity; an agent that cannot
+    # read its own credentials never comes up, and a sibling that can read them is
+    # the boundary this whole design is built on.
+    Protect-CiDirectory -Path $agent -SlotUser $Slot.User
+
+    Write-ServiceEnvironment -ServiceName $serviceName -Environment $Environment
+    Clear-ServiceRecoveryAction -ServiceName $serviceName
+    Grant-ServiceLogonAccount -ServiceName $serviceName -Credential $Slot.Credential
+
+    Start-Service -Name $serviceName -ErrorAction Stop
+    $svc = Get-Service -Name $serviceName -ErrorAction Stop
+    if ($svc.Status -ne 'Running') {
+        Deny-Boot "slot $($Slot.Index): $serviceName is '$($svc.Status)', not Running"
+    }
+    Write-BootLog ("phase 5: slot $($Slot.Index) registered as $name, service $serviceName " +
+        "running as $($Slot.User), recovery actions cleared")
+}
+
+function Invoke-Phase5Registration {
+    <#
+      .SYNOPSIS
+        Register every slot's agent from ONE read of the registration token.
+      .DESCRIPTION
+        OBLIGATION (a) IS THE SHAPE OF THIS FUNCTION, NOT A CHECK INSIDE IT
+
+        The read is above the loop and its value is passed down. Moving it into
+        Register-SlotAgent -- which is the tidier-looking edit, since that is
+        where the token is used -- breaks a two-slot host in a way nothing on the
+        controller can see: slot 1 registers, GitHub reports the host `partial`,
+        the controller deletes the key, and slot 2's read comes back empty. The
+        host runs at half capacity and every log line says success. The bash
+        self-test asserts the read's position for exactly this reason.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][array] $Provisioned,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary] $Config,
+        [Parameter(Mandatory = $true)][string] $HookPath,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $BrokerEndpoint
+    )
+
+    $regToken = Wait-RegistrationToken
+    foreach ($slot in $Provisioned) {
+        $block = Get-SlotServiceEnvironment -Index $slot.Index `
+            -HookPath $HookPath -BrokerEndpoint $BrokerEndpoint
+        Register-SlotAgent -Slot $slot -RegistrationToken $regToken `
+            -Owner $Config.Owner -Repo $Config.Repo -InstanceName $Config.InstanceName `
+            -Labels $Config.Labels -RunnerGroup $Config.RunnerGroup -Environment $block
+    }
+    Write-BootLog "phase 5: $($Provisioned.Count) agent(s) registered"
+}
+
 function Invoke-Main {
     [CmdletBinding()]
     param()
@@ -1840,23 +2178,16 @@ function Invoke-Main {
         -JobServiceAccount $cfg.JobSa -BrokerSource $cfg.BrokerSource -BrokerPort $cfg.BrokerPort
     $hookPath = Invoke-Phase4JobHook -SlotUsers $slotUsers
 
-    # Phase 5 is what WRITES this onto each slot's service key. Building it here
-    # and logging its shape means a half-delivered host still says out loud what
-    # the agents would have been given, which is the difference between reading a
-    # boot log and reproducing a boot.
-    foreach ($slot in $provisioned) {
-        $block = Get-SlotServiceEnvironment -Index $slot.Index `
-            -HookPath $hookPath -BrokerEndpoint $brokerEndpoint
-        Write-BootLog ("phase 4: slot $($slot.Index) service environment would be " +
-            ($block.Keys -join ', '))
-    }
+    # LAST, and the only phase that makes this host reachable by a job. Everything
+    # above it is a boundary; this is what is let inside one.
+    Invoke-Phase5Registration -Provisioned $provisioned -Config $cfg `
+        -HookPath $hookPath -BrokerEndpoint $brokerEndpoint
 
-    # Phases 5 and 6 are not here yet, and this host therefore registers no agent.
-    # Said out loud in the log rather than left as silence, because a host that
-    # boots cleanly and serves nothing is otherwise indistinguishable from one
-    # that is merely slow to register.
-    Write-BootLog ('phases 5-6 are not delivered yet: this host registers no agent and will be ' +
-        'reclaimed by the register-grace drain')
+    # Phase 6 is not here yet. Said out loud rather than left as silence: until
+    # the probe exists, nothing on this host PROVES from a slot's own context that
+    # the boundaries above hold -- and a boundary nobody checks is a comment.
+    Write-BootLog ('phase 6 is not delivered yet: this host registers agents without proving the ' +
+        'slot boundary from a slot context')
 }
 
 # Dot-sourceable without side effects, so Pester can import the pure functions

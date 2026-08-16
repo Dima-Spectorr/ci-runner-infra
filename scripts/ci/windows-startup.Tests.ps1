@@ -639,6 +639,76 @@ Describe 'closed metadata endpoint' {
     }
 }
 
+# --- phase 5 -----------------------------------------------------------------
+
+Describe 'runner config arguments' {
+    # The recycle contract and the 90-minute stall this pool replaces both live in
+    # this argument list, and every one of them is a silent loss: a runner that
+    # self-updates is alive, offline and undispatchable, and on a warm host that
+    # is K slots at once rather than one short-lived VM.
+    It 'pins the agent version by refusing the self-update' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels 'x' -WorkPath '/w'
+        $a | Should -Contain '--disableupdate'
+    }
+
+    # A rebooted host has an agent of this name already in GitHub's list, and a
+    # refused registration is a slot that never comes back.
+    It 'replaces the registration a reboot left behind' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels 'x' -WorkPath '/w'
+        $a | Should -Contain '--replace'
+        $a | Should -Contain '--unattended'
+        $a | Should -Contain '--runasservice'
+    }
+
+    # No account flags, ever. config.cmd takes a logon password as a plaintext
+    # argument, in the process table of a host whose local accounts run
+    # pull-request code; the logon account is set afterwards through
+    # ChangeServiceConfigW instead.
+    It 'passes no logon account and no password' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels 'x' -WorkPath '/w'
+        ($a -join ' ') | Should -Not -Match 'logon'
+        ($a -join ' ') | Should -Not -Match 'password'
+    }
+
+    It 'builds the repository url from the owner and repo' {
+        $a = Get-RunnerConfigArgument -Owner 'acme' -Repo 'infra' -Name 'h-s1' -Labels 'x' -WorkPath '/w'
+        $a[[array]::IndexOf($a, '--url') + 1] | Should -Be 'https://github.com/acme/infra'
+    }
+
+    # An empty label string must not become a `--labels ''` pair: PowerShell 5.1
+    # drops an empty native-command argument, so config.cmd would see `--labels`
+    # followed by whatever came next and register with the wrong flag value.
+    It 'omits labels entirely when there are none' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels '' -WorkPath '/w'
+        $a | Should -Not -Contain '--labels'
+    }
+
+    It 'omits the runner group when there is none' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels 'x' -WorkPath '/w'
+        $a | Should -Not -Contain '--runnergroup'
+    }
+
+    It 'passes the runner group when there is one' {
+        $a = Get-RunnerConfigArgument -Owner 'o' -Repo 'r' -Name 'h-s1' -Labels 'x' `
+            -WorkPath '/w' -RunnerGroup 'warm'
+        $a[[array]::IndexOf($a, '--runnergroup') + 1] | Should -Be 'warm'
+    }
+}
+
+Describe 'slot agent name' {
+    # orphan_decision() on the controller parses this name back to an instance, so
+    # a rename here silently un-reaps every Windows registration: the agent stays
+    # in GitHub's list, the host it names is gone, and nothing notices.
+    It 'is the instance name and the slot index' {
+        Get-SlotAgentName -InstanceName 'ci-w-abcd' -Index 2 | Should -Be 'ci-w-abcd-s2'
+    }
+
+    It 'gives two slots on one host two different names' {
+        (Get-SlotAgentName -InstanceName 'h' -Index 1) |
+            Should -Not -Be (Get-SlotAgentName -InstanceName 'h' -Index 2)
+    }
+}
+
 Describe 'runner service name' {
     # The marker file lives in a directory the slot account can write, and the
     # name reaches sc.exe. Anything not vouched for comes back '' and the caller
