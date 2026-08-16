@@ -99,7 +99,7 @@ PUBLISHING=1
 [ -z "${CACHE_DRY_RUN:-}" ]     || PUBLISHING=0
 
 [ "$BUILDING" = 1 ] || [ "$PUBLISHING" = 1 ] \
-  || die "CACHE_ARCHIVE_IN with CACHE_ARCHIVE_OUT asks this to do nothing"
+  || die "CACHE_ARCHIVE_IN with CACHE_ARCHIVE_OUT or CACHE_DRY_RUN asks this to neither build nor publish"
 
 if [ "$BUILDING" = 1 ]; then
   : "${CACHE_PREPARE:?CACHE_PREPARE is required (the command that installs dependencies)}"

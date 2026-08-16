@@ -636,6 +636,10 @@ has_trusted_snapshot_build() { # <file>
   # Size, because a snapshot past the pools' bound is refused by every host and
   # reads in their logs as "nothing published" rather than as an error.
   matches "$code" 'CACHE_MAX_BYTES' || return 1
+  # And the split itself: a build-only run must stop before the first gcloud call.
+  # Everything above describes what a good snapshot is; this is the line that says
+  # the phase that ran other people's code does not get to upload one.
+  matches "$code" '^if \[ "\$PUBLISHING" = 0 \]; then' || return 1
 }
 
 # The two sides derive the same list from nothing — the host's copy is embedded
@@ -975,6 +979,8 @@ mutate_file "$PUBSH" 'the pointer swap loses its precondition' has_trusted_snaps
   's@gcloud storage cp --if-generation-match="\$gen" @gcloud storage cp @'
 mutate_file "$PUBSH" 'the size bound is dropped' has_trusted_snapshot_build \
   's@CACHE_MAX_BYTES@CACHE_SIZE_HINT@g'
+mutate_file "$PUBSH" 'the build phase falls through into the upload' has_trusted_snapshot_build \
+  's@^if \[ "\$PUBLISHING" = 0 \]; then$@if false; then@'
 mutate_file "$PUBSH" 'a directory is published that no host accepts' has_agreeing_cache_dirs \
   's@^CACHE_DIRS=\(npm @CACHE_DIRS=(npm cargo @'
 
@@ -990,7 +996,7 @@ mutate_file "$PUBDOC" 'the publishing job stops waiting for the build' has_split
   's@^    needs: build$@@'
 # `|` as the delimiter: a pinned `uses:` contains an `@`.
 mutate_file "$PUBDOC" 'the auth action goes back to a movable tag' has_split_publishing_workflow \
-  's|google-github-actions/auth@[0-9a-f]{40} # v2\.1\.9|google-github-actions/auth@v2|'
+  's|google-github-actions/auth@[0-9a-f]{40} # v2\.[0-9]+\.[0-9]+|google-github-actions/auth@v2|'
 mutate_file "$PUBDOC" 'the template becomes callable with inputs' has_split_publishing_workflow \
   's@^  workflow_dispatch:$@  workflow_dispatch:\n  workflow_call:@'
 

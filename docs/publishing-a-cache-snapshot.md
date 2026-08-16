@@ -105,7 +105,7 @@ jobs:
           name: cache-snapshot
           path: ${{ runner.temp }}
 
-      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.9
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           workload_identity_provider: ${{ vars.CACHE_WIF_PROVIDER }}
           service_account: ${{ vars.CACHE_PUBLISHER_SA }}
