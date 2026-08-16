@@ -170,7 +170,9 @@ out the credential — this is the check that turns such an edit into a failed r
 
 Run the build phase alone: `CACHE_PREPARE=… CACHE_DRY_RUN=1 bash
 scripts/ci/publish-cache-snapshot.sh`. It installs, scans and packs, prints the
-size, and uploads nothing — no credential is involved, so it runs on a laptop. The size is the number that matters: a snapshot past the pools'
+size, and uploads nothing — no credential is involved, so it runs on a laptop
+with `libcap2-bin` installed (the scan needs `getcap`, and a run that cannot scan
+is refused rather than skipped). The size is the number that matters: a snapshot past the pools'
 `cache_snapshot_max_bytes` (4 GiB by default, compressed) is refused by every
 host, which reads in their logs as *"no snapshot published"* rather than as an
 error.
