@@ -487,6 +487,63 @@ has_probe_literal_guard() { # <file>
   matches "$code" 'never tested' || return 1
 }
 
+# --- the runtime this script is actually executed by -------------------------
+#
+# The boot script reaches a host as the `windows-startup-script-ps1` metadata
+# key, and the guest agent runs that key with the in-box powershell.exe: Windows
+# PowerShell 5.1, on .NET Framework 4.8. Never pwsh. Nothing else in this
+# repository can see that, and all three existing gates are blind to it in the
+# same way: the parser and PSScriptAnalyzer only READ the text, and the Pester
+# suite runs the very same functions under pwsh 7 on a Linux runner, where the
+# whole .NET Core surface exists. So a .NET Core-only call passes every check
+# here and then throws MethodNotFound on the first real boot, in phase 1, before
+# a single slot account exists -- which is how `RandomNumberGenerator::Fill`
+# shipped and how every host in the pool came to deny its own boot.
+#
+# This is the third time a gate that reads has passed code that dies, so the
+# deny-list below is checked against the text the same way, and is deliberately
+# small: every entry is documented as absent from .NET Framework or from Windows
+# PowerShell 5.1, and every entry is something a reasonable person would reach
+# for while editing THIS file. A general "is it 5.1-safe" rule is not expressible
+# in grep, and PSScriptAnalyzer's PSUseCompatibleSyntax would not have helped
+# either -- it checks language syntax, and `::Fill(...)` is valid 5.1 syntax for
+# a method 5.1 does not have.
+has_5_1_compatible_apis() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # RandomNumberGenerator.Fill(Span<byte>): netcore-2.1 and netstandard-2.1
+  # onward, with no netframework moniker at all. The original bug.
+  ! matches "$code" 'RandomNumberGenerator\]::Fill' || return 1
+  # RandomNumberGenerator.GetInt32: netcore-3.0/netstandard-2.1 onward, also
+  # absent from .NET Framework. It is what the next reader reaches for to remove
+  # the modulo bias the slot-password comment discusses, and it fails the same
+  # way in the same function.
+  ! matches "$code" 'RandomNumberGenerator\]::GetInt32' || return 1
+  # ConvertFrom-Json -AsHashtable: introduced in PowerShell 6.0. The metadata
+  # reads in this script all parse JSON, so this one is a step away at all times.
+  ! matches "$code" '\-AsHashtable' || return 1
+  # -SkipHttpErrorCheck on Invoke-WebRequest/Invoke-RestMethod: PowerShell 7.0.
+  # This script catches WebException specifically BECAUSE 5.1 has no such switch,
+  # so "simplifying" that error handling is the obvious edit.
+  ! matches "$code" '\-SkipHttpErrorCheck' || return 1
+  # ForEach-Object -Parallel: PowerShell 7.0. Boot time is the thing every
+  # optimisation aims at, and the slot loops are the obvious target.
+  ! matches "$code" 'ForEach-Object[[:space:]]+-Parallel' || return 1
+  # Split-Path -LeafBase: PowerShell 6.0. This script already calls
+  # `Split-Path -Leaf` on a profile directory.
+  ! matches "$code" '\-LeafBase' || return 1
+
+  # A deny-list on its own also passes a file that draws no entropy whatsoever,
+  # so the compatible form has to be positively present. Create(), the instance
+  # GetBytes(byte[]) and Dispose() are in every .NET Framework this fleet can
+  # boot on and in .NET Core, which is what makes them the one form that runs in
+  # both runtimes.
+  matches "$code" 'RandomNumberGenerator\]::Create\(\)' || return 1
+  matches "$code" '\$rng\.GetBytes\(' || return 1
+  matches "$code" '\$rng\.Dispose\(\)' || return 1
+}
+
 # --- the helper carries the trap it was written to avoid ---------------------
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -551,6 +608,12 @@ if has_probe_literal_guard "$SCRIPT"; then
   ok
 else
   bad "the probe payload interpolates metadata-derived values without an allow-list, or folds a missing sibling workspace into a denied one — the first turns a defence probe into arbitrary code holding a live host token, the second reports an ACL boundary that was never tested as proved"
+fi
+
+if has_5_1_compatible_apis "$SCRIPT"; then
+  ok
+else
+  bad "the boot script calls an API that PowerShell 7 has and Windows PowerShell 5.1 does not, or no longer draws its entropy the way both runtimes support — the guest agent runs this file with the in-box powershell.exe, so the call throws MethodNotFound at boot and every host in the pool denies itself, while the parser, the analyzer and a Pester suite running under pwsh 7 all stay green"
 fi
 
 if has_job_hook_acl "$SCRIPT"; then
@@ -830,6 +893,35 @@ mutate "an absent sibling workspace read as a denied one" \
 mutate "the untested-ACL sentence renamed out of the verdict" \
   's|never tested|not checked|' \
   has_probe_literal_guard
+
+# --- group 12: a .NET Core-only API in a file 5.1 has to run -----------------
+#     Each of these is the edit that reintroduces one deny-list entry, plus the
+#     two that remove the compatible entropy draw. They all lint, parse and pass
+#     Pester under pwsh 7.
+mutate "the original regression: the static Fill back in place of Create()" \
+  's|RandomNumberGenerator\]::Create()|RandomNumberGenerator]::Fill($bytes)|' \
+  has_5_1_compatible_apis
+mutate "the modulo bias 'fixed' with the class's bounded-integer helper" \
+  's|RandomNumberGenerator\]::Create()|RandomNumberGenerator]::GetInt32(0, 255)|' \
+  has_5_1_compatible_apis
+mutate "a metadata response parsed straight into a hash table" \
+  's|Invoke-RestMethod|ConvertFrom-Json -AsHashtable|' \
+  has_5_1_compatible_apis
+mutate "the WebException handling simplified into an error-check switch" \
+  's|Invoke-WebRequest|Invoke-WebRequest -SkipHttpErrorCheck|' \
+  has_5_1_compatible_apis
+mutate "the slot loop parallelised to shorten boot" \
+  's|ForEach-Object {|ForEach-Object -Parallel {|' \
+  has_5_1_compatible_apis
+mutate "the profile name taken with the base-name switch" \
+  's|Split-Path -Leaf |Split-Path -LeafBase |' \
+  has_5_1_compatible_apis
+mutate "the generator leaked instead of disposed" \
+  's|\$rng\.Dispose()||' \
+  has_5_1_compatible_apis
+mutate "the byte draw removed, leaving a password built from an empty buffer" \
+  's|\$rng\.GetBytes(\$bytes)||' \
+  has_5_1_compatible_apis
 
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
