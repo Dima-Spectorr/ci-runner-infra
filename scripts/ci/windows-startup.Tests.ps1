@@ -638,3 +638,62 @@ Describe 'closed metadata endpoint' {
         $script:ClosedMetadataEndpoint | Should -Not -Match '169\.254\.169\.254'
     }
 }
+
+Describe 'runner service name' {
+    # The marker file lives in a directory the slot account can write, and the
+    # name reaches sc.exe. Anything not vouched for comes back '' and the caller
+    # denies the boot -- refused, never escaped.
+    It 'accepts the name config.cmd records' {
+        Get-RunnerServiceName -Marker 'actions.runner.acme-infra.h-s1' |
+            Should -Be 'actions.runner.acme-infra.h-s1'
+    }
+
+    It 'trims the trailing newline the marker file carries' {
+        Get-RunnerServiceName -Marker "actions.runner.a.b`r`n" | Should -Be 'actions.runner.a.b'
+    }
+
+    It 'refuses a name a slot could use to reach another service' {
+        Get-RunnerServiceName -Marker 'actions.runner.a.b" delete "ci-beacon' | Should -Be ''
+    }
+
+    It 'refuses a name that is not a runner service at all' {
+        Get-RunnerServiceName -Marker 'ci-beacon' | Should -Be ''
+    }
+
+    It 'refuses an empty or missing marker' {
+        Get-RunnerServiceName -Marker '' | Should -Be ''
+        Get-RunnerServiceName -Marker '   ' | Should -Be ''
+    }
+}
+
+Describe 'service environment block' {
+    It 'renders each entry as NAME=VALUE' {
+        $v = Get-ServiceEnvironmentValue -Environment ([ordered] @{ TMP = '/t'; TEMP = '/t' })
+        $v | Should -Contain 'TMP=/t'
+        $v.Count | Should -Be 2
+    }
+
+    # REG_MULTI_SZ is NUL-delimited: an embedded NUL does not corrupt the write,
+    # it TRUNCATES the block there, and on this block the entries that would
+    # disappear are the per-job credential reset hooks.
+    It 'refuses a value carrying a NUL, which would truncate the block' {
+        { Get-ServiceEnvironmentValue -Environment ([ordered] @{ TMP = "/t`0X=1" }) } | Should -Throw
+    }
+
+    It 'refuses a value carrying a newline' {
+        { Get-ServiceEnvironmentValue -Environment ([ordered] @{ TMP = "/t`nX=1" }) } | Should -Throw
+    }
+
+    # The block is the last thing between instance metadata and a service that
+    # starts as a local account, and section 3A accepts that a Windows host cannot
+    # assume its metadata is untampered.
+    It 'refuses a name that is not an environment variable name' {
+        { Get-ServiceEnvironmentValue -Environment ([ordered] @{ 'TMP X' = '/t' }) } | Should -Throw
+    }
+
+    It 'carries the reset hooks straight through from the slot block' {
+        $block = Get-SlotServiceEnvironment -Index 1 -BrokerEndpoint '' -SlotRoot '/ci/slots'
+        $v = Get-ServiceEnvironmentValue -Environment $block
+        ($v -join "`n") | Should -Match 'ACTIONS_RUNNER_HOOK_JOB_COMPLETED='
+    }
+}
