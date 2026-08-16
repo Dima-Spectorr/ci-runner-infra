@@ -400,7 +400,15 @@ has_snapshot_inspection() { # <file>
   # made the master hostile by the time the scan said so.
   matches "$code" '^CACHE_STAGE="/opt/\.ci-cache-incoming"'      || return 1
   matches "$code" 'tar -x -C "\$CACHE_STAGE"'                    || return 1
-  matches "$code" '\-\-no-same-owner --no-same-permissions --no-xattrs --no-acls --no-selinux' || return 1
+  matches "$code" '\-\-no-same-owner --no-same-permissions --no-xattrs --no-acls' || return 1
+  # And nothing that turns off the tar defaults the staging tree relies on.
+  ! matches "$code" 'tar .*(--absolute-names|--keep-directory-symlink| -P )' || return 1
+  # The inspection is inside the deadline too: three tree walks over a snapshot of
+  # many millions of tiny files is the delay the budget exists to prevent, reached
+  # by going around it.
+  matches "$code" 'CACHE_DEADLINE=\$deadline'                    || return 1
+  matches "$code" 'cache_scan "\$limit" find "\$root"'           || return 1
+  matches "$code" 'cache_scan "\$limit" getcap -r "\$root"'      || return 1
   # `strict`, because for a snapshot the scan is the only opinion there is: an
   # unscannable tree has to be a refused tree, not a logged one.
   matches "$code" 'cache_master_is_hostile "\$CACHE_STAGE" strict' || return 1
@@ -485,6 +493,9 @@ has_constrained_pool_name() { # <file>
   local code
   code=$(code_of "$1")
   matches "$code" 'regex\("\^\[a-z\]\(\[-a-z0-9\]\{0,61\}\[a-z0-9\]\)\?\$", var\.name\)' || return 1
+  # Both halves of the same door: the bucket name is interpolated into that same
+  # CEL literal, and validating one and not the other closes neither.
+  matches "$code" 'regex\(.*, var\.cache_snapshot_bucket\)'   || return 1
 }
 
 # --- the real script ------------------------------------------------------------
@@ -594,17 +605,17 @@ mutate 'the 0700 goes back on the cold path only' has_usable_private_slot_cache 
   's@^(\s*)chmod 0700 "\$dst/\$d"@\1[ -d "$dst/$d" ] || chmod 0700 "$dst/$d"@'
 
 mutate 'the hostile-entry scan is dropped' has_hostile_entry_refusal \
-  's@^  bad=\$\(find "\$root" \\$@  bad=@'
+  's@^  bad=\$\(cache_scan "\$limit" find "\$root" \\$@  bad=@'
 mutate 'the scan stops looking for smuggled hardlinks' has_hostile_entry_refusal \
   's@-perm /6000 -o \\\( -type f -a -links \+1 \\\)@-perm /6000@'
 mutate 'file capabilities stop being scanned' has_hostile_entry_refusal \
   's@getcap -r "\$root"@true "$root"@'
 mutate 'the scan is hard-wired back to the master' has_hostile_entry_refusal \
-  's@^  local bad root="\$\{1:-\$CACHE_MASTER\}"$@  local bad@'
+  's@^  local bad root="\$\{1:-\$CACHE_MASTER\}" limit=0$@  local bad@'
 mutate 'credentials stop being scanned' has_hostile_entry_refusal \
   "s@name '\\.npmrc'@name '.nothing'@"
 mutate 'the scan skips other filesystems again' has_hostile_entry_refusal \
-  's@^  bad=\$\(find "\$root" \\$@  bad=$(find "$root" -xdev \\@'
+  's@^  bad=\$\(cache_scan "\$limit" find "\$root" \\$@  bad=$(cache_scan "$limit" find "$root" -xdev \\@'
 
 mutate 'a torn seed becomes visible' has_atomic_seed \
   's|"\$dst/\.seed-\$d"|"$dst/$d"|g'
@@ -661,7 +672,11 @@ mutate 'a snapshot is unpacked straight into the master' has_snapshot_inspection
 mutate 'the archive decides its own ownership and modes' has_snapshot_inspection \
   's@ --no-same-owner --no-same-permissions@@'
 mutate 'the archive may carry a capability in an xattr' has_snapshot_inspection \
-  's@ --no-xattrs --no-acls --no-selinux@@'
+  's@ --no-xattrs --no-acls@@'
+mutate 'tar is allowed out of the staging tree' has_snapshot_inspection \
+  's@\| tar -x -C "\$CACHE_STAGE"@| tar -x -P -C "$CACHE_STAGE"@'
+mutate 'the snapshot inspection escapes the deadline' has_snapshot_inspection \
+  's@cache_scan "\$limit" getcap@getcap@'
 mutate 'the snapshot scan stops being strict' has_snapshot_inspection \
   's@cache_master_is_hostile "\$CACHE_STAGE" strict@cache_master_is_hostile "$CACHE_STAGE"@'
 mutate 'an unscannable snapshot is logged rather than refused' has_snapshot_inspection \
@@ -685,7 +700,7 @@ mutate 'the generation stops being pinned to what was measured' has_service_atte
 mutate 'the token goes back into the curl arguments' has_token_out_of_argv \
   's@^    -K <\(printf .*$@    -H "Authorization: Bearer $CACHE_TOKEN" \\@'
 mutate 'the token outlives the hydrate' has_token_out_of_argv \
-  's@^  unset CACHE_TOKEN$@  :@'
+  's@^  unset CACHE_TOKEN CACHE_DEADLINE$@  :@'
 mutate 'a response is bounded only by the deadline' has_token_out_of_argv \
   's@--max-filesize "\$\{5:-65536\}"@--silent@'
 
@@ -696,6 +711,8 @@ mutate 'the age bound may be set past the bucket rule' has_clamped_metadata_boun
 
 mutate_file "$POOLVARS" 'the pool name stops being constrained' has_constrained_pool_name \
   's@\^\[a-z\]\(\[-a-z0-9\]\{0,61\}\[a-z0-9\]\)\?\$@.*@'
+mutate_file "$POOLVARS" 'the bucket name stops being constrained' has_constrained_pool_name \
+  's@can\(regex\("\^\[a-z0-9\].*", var\.cache_snapshot_bucket\)\)@true@'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

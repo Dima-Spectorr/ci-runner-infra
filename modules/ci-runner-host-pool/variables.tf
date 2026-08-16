@@ -545,6 +545,18 @@ variable "cache_snapshot_bucket" {
   EOT
   type        = string
   default     = ""
+
+  validation {
+    # The other half of the same door `name` closes. This value is interpolated
+    # into the read grant's CEL condition inside a quoted literal, so a bucket
+    # name carrying a double quote could close that literal and rewrite the
+    # expression into one that is unconditionally true — turning a grant scoped to
+    # this pool's prefix into bucket-wide `objectViewer` over every pool's
+    # snapshots. Validating the pool name and not this one would close one of two
+    # identical doors. The shape is GCS's own, which every real bucket satisfies.
+    condition     = var.cache_snapshot_bucket == "" || can(regex("^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$", var.cache_snapshot_bucket))
+    error_message = "cache_snapshot_bucket must be a bucket NAME (3-63 characters, lowercase letters, digits, dots, hyphens and underscores), not a gs:// URL, or empty to turn the snapshot layer off."
+  }
 }
 
 variable "cache_snapshot_max_age_hours" {
@@ -602,7 +614,11 @@ variable "cache_snapshot_max_bytes" {
   default     = 4294967296
 
   validation {
-    condition     = var.cache_snapshot_max_bytes >= 1048576
-    error_message = "cache_snapshot_max_bytes must be at least 1 MiB; below that no real dependency cache fits and every snapshot is refused."
+    # An upper bound as well as a lower one, so that the host's own clamp and this
+    # validation agree on the range rather than the host quietly being the only
+    # real bound. 32 GiB is past any dependency cache and short of any plausible
+    # boot disk.
+    condition     = var.cache_snapshot_max_bytes >= 1048576 && var.cache_snapshot_max_bytes <= 34359738368
+    error_message = "cache_snapshot_max_bytes must be between 1 MiB and 32 GiB; below that no real dependency cache fits, above it no boot disk does."
   }
 }

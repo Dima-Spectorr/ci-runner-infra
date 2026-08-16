@@ -591,8 +591,25 @@ CACHE_DIRS=(npm yarn pnpm-store go-mod pip uv m2 nuget composer)
 # second is not redundant — the master also carries whatever the image baked and
 # whatever survived the last boot, and the tree a snapshot lands in is exactly the
 # tree this refuses to distribute.
-cache_master_is_hostile() { # [<tree>]
-  local bad root="${1:-$CACHE_MASTER}"
+#
+# In `strict` mode each walk is also bounded by whatever is left of the hydrate's
+# deadline, and running out is a refusal. A scan is three full tree walks, and a
+# snapshot of many millions of tiny files passes both the compressed-size and the
+# unpacked-size bounds while costing minutes of `getcap -r` — the delay the whole
+# budget exists to prevent, reached by going around it rather than through it. The
+# master's own scan is not bounded: it is the tree this host already has, and
+# refusing it for being slow would cost every slot its cache for no gain.
+cache_scan() { # <seconds-or-0> <cmd...>
+  local limit="$1"; shift
+  if [ "$limit" -gt 0 ]; then timeout "$limit" "$@"; else "$@"; fi
+}
+
+cache_master_is_hostile() { # [<tree>] [strict]
+  local bad root="${1:-$CACHE_MASTER}" limit=0
+  if [ "${2:-}" = "strict" ]; then
+    limit=$(( ${CACHE_DEADLINE:-0} - $(date +%s) ))
+    [ "$limit" -gt 0 ] || limit=1
+  fi
   # Symlinks and setuid/setgid bits are the obvious two. The rest are here
   # because `chmod -R go+rX` WIDENS permissions and `cp -a` preserves: a hardlink
   # to a file outside the tree would be made world-readable in place (an
@@ -600,10 +617,13 @@ cache_master_is_hostile() { # [<tree>]
   # here), and device, fifo and socket nodes have no business in a dependency
   # cache. -links +1 is scoped to regular files because every directory has a
   # link count above one by construction.
-  bad=$(find "$root" \
+  bad=$(cache_scan "$limit" find "$root" \
     \( -type l -o -type b -o -type c -o -type p -o -type s \
        -o -perm /6000 -o \( -type f -a -links +1 \) \) \
-    -print -quit 2>/dev/null)
+    -print -quit 2>/dev/null) || {
+    log "refusing $root: it could not be scanned inside the remaining budget"
+    return 0
+  }
   if [ -n "$bad" ]; then
     log "refusing $root: it holds a link, node or setuid entry ($bad)"
     return 0
@@ -615,7 +635,10 @@ cache_master_is_hostile() { # [<tree>]
   if command -v getcap >/dev/null 2>&1; then
     # No pipe into head: this script runs under `set -o pipefail`, and head
     # closing the pipe early can SIGPIPE getcap.
-    bad=$(getcap -r "$root" 2>/dev/null)
+    bad=$(cache_scan "$limit" getcap -r "$root" 2>/dev/null) || {
+      log "refusing $root: it could not be scanned for file capabilities inside the remaining budget"
+      return 0
+    }
     if [ -n "$bad" ]; then
       log "refusing $root: it holds a file capability ($bad)"
       return 0
@@ -636,11 +659,14 @@ cache_master_is_hostile() { # [<tree>]
   # consumer's warm script left one behind, `chmod -R go+rX` would publish it to
   # every uid on the host and `cp -a` would then hand a copy to every slot. Refuse
   # rather than distribute it.
-  bad=$(find "$root" -type f \( \
+  bad=$(cache_scan "$limit" find "$root" -type f \( \
       -name '.npmrc' -o -name '.yarnrc' -o -name '.yarnrc.yml' -o -name '.netrc' \
       -o -name '.pypirc' -o -name '.git-credentials' -o -name 'auth.json' \
       -o -name 'settings.xml' -o -iname 'nuget.config' -o -name 'credentials' \
-    \) -print -quit 2>/dev/null)
+    \) -print -quit 2>/dev/null) || {
+    log "refusing $root: it could not be scanned for credential files inside the remaining budget"
+    return 0
+  }
   if [ -n "$bad" ]; then
     log "refusing $root: it holds what looks like a credential file ($bad)"
     return 0
@@ -713,9 +739,16 @@ cache_fetch() { # <object-suffix> <dest> <seconds> [<query>] [<max-bytes>]
   #
   # --max-filesize bounds the response before it lands on disk. Without it the
   # only bound on a response is the deadline, and /opt is what fills.
+  #
+  # `Accept-Encoding: gzip` is not an optimisation. An object stored with
+  # `Content-Encoding: gzip` is decompressively transcoded by the service unless
+  # the client says it accepts gzip, and a transcoded response arrives chunked
+  # with no Content-Length — which is the one case --max-filesize cannot bound in
+  # advance. Asking for gzip means the bytes arrive exactly as stored, so the
+  # size the metadata reported is the size that lands.
   curl --connect-timeout 5 --max-time "$3" -fsS \
     --max-filesize "${5:-65536}" \
-    -K <(printf 'header = "Authorization: Bearer %s"\n' "$CACHE_TOKEN") \
+    -K <(printf 'header = "Authorization: Bearer %s"\nheader = "Accept-Encoding: gzip"\n' "$CACHE_TOKEN") \
     -o "$2" \
     "https://storage.googleapis.com/storage/v1/b/$CACHE_BUCKET/o/$enc${4:-?alt=media}" \
     2>/dev/null
@@ -728,7 +761,7 @@ cache_fetch() { # <object-suffix> <dest> <seconds> [<query>] [<max-bytes>]
 hydrate_shared_cache() {
   local rc=0
   hydrate_shared_cache_bounded || rc=$?
-  unset CACHE_TOKEN
+  unset CACHE_TOKEN CACHE_DEADLINE
   return "$rc"
 }
 
@@ -771,6 +804,9 @@ hydrate_shared_cache_bounded() {
   local started deadline
   started=$(date +%s)
   deadline=$((started + budget))
+  # A global, because the inspection is bounded by the same deadline and it runs
+  # inside a function shared with the master's own lock. Cleared by the wrapper.
+  CACHE_DEADLINE=$deadline
 
   CACHE_TOKEN=$(md "instance/service-accounts/default/token" \
     | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
@@ -805,7 +841,10 @@ hydrate_shared_cache_bounded() {
   # needs no encoding.
   case "$snap" in
     *[!A-Za-z0-9._-]* | '' | .* )
-      log "cache pointer names '$snap', which is not a snapshot in this pool's prefix — ignoring it"
+      # The rejected name is NOT echoed. It is the one fully attacker-controlled
+      # string here, it has not been validated at the point this line runs, and
+      # this log goes to a file an operator reads in a terminal.
+      log "the cache pointer does not name a snapshot in this pool's prefix (${#snap} bytes) — ignoring it"
       rm -rf "$tmp"
       return 0
       ;;
@@ -862,7 +901,7 @@ hydrate_shared_cache_bounded() {
   fi
 
   if ! cache_fetch "$snap" "$tmp/snap.tar.gz" "$((deadline - $(date +%s)))" \
-      "?alt=media&generation=$gen" "$max_bytes"; then
+      "?alt=media&generation=$gen" "$size"; then
     log "cache snapshot $snap did not download inside the ${budget}s budget — starting cold instead"
     rm -rf "$tmp"
     return 0
@@ -881,7 +920,17 @@ hydrate_shared_cache_bounded() {
   # nothing today — they are here so that a tar that decides otherwise, or an
   # image that ships a different tar, does not silently change what a snapshot can
   # carry. The scan below refuses capabilities as well; two layers, because the
-  # scan needs a tool on the image and this does not.
+  # scan needs a tool on the image and this does not. (`--no-selinux` is not
+  # here: it is GNU-only, these images carry no SELinux, and an unknown option
+  # would make tar fail on every boot — a hydrate that never works, logged as a
+  # budget overrun.)
+  #
+  # WHAT MUST NEVER BE ADDED TO THIS LINE: `-P`/`--absolute-names`, and
+  # `--keep-directory-symlink`. The staging tree is what confines an adversarial
+  # archive, and it is tar's DEFAULTS that confine it — a leading `/` and a
+  # leading `../` are stripped, and a directory member landing on a symlink
+  # replaces it instead of following it. Each of those flags turns one of those
+  # defaults off, and the scan afterwards only sees what stayed inside the tree.
   #
   # `timeout` because tar is where a large or adversarial archive spends its time,
   # and the budget has to bind the slowest step or it binds nothing. The clamp is
@@ -899,7 +948,7 @@ hydrate_shared_cache_bounded() {
   if ! timeout "$left" gzip -dc "$tmp/snap.tar.gz" 2>/dev/null \
       | head -c "$((size * 8))" \
       | tar -x -C "$CACHE_STAGE" \
-          --no-same-owner --no-same-permissions --no-xattrs --no-acls --no-selinux \
+          --no-same-owner --no-same-permissions --no-xattrs --no-acls \
           2>/dev/null; then
     log "cache snapshot $snap did not unpack inside the ${budget}s budget — starting cold instead"
     rm -rf "$tmp" "$CACHE_STAGE"
@@ -925,6 +974,16 @@ hydrate_shared_cache_bounded() {
   # same image, so it is a superset of what was baked; a merge would be slower,
   # would not be atomic, and would leave entries from an expired snapshot alive in
   # the master indefinitely, which is the age bound quietly failing.
+  # Unconditionally, and before the loop rather than inside it: a boot that died
+  # between the aside-move and the replacement leaves one of these behind, and a
+  # sweep that only runs for directories the NEXT snapshot happens to ship would
+  # leave it there indefinitely — a full duplicate cache tree that lock_shared_cache
+  # then publishes read-only to every uid on the host.
+  local stale
+  for stale in "$CACHE_MASTER"/.*.previous; do
+    [ -e "$stale" ] && rm -rf "$stale"
+  done
+
   local d took=0 n=0
   for d in "${CACHE_DIRS[@]}"; do
     [ -d "$CACHE_STAGE/$d" ] || continue
@@ -932,7 +991,6 @@ hydrate_shared_cache_bounded() {
     # replacement is in place. Deleting first is one failed rename away from a
     # host with neither copy — the snapshot path is allowed to leave the cache as
     # cold as it found it, never colder.
-    rm -rf "$CACHE_MASTER/.$d.previous"
     if [ -d "$CACHE_MASTER/$d" ] \
        && ! mv -T "$CACHE_MASTER/$d" "$CACHE_MASTER/.$d.previous" 2>/dev/null; then
       continue
