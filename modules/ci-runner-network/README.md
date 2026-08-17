@@ -19,9 +19,44 @@ Tenancy-agnostic — no customer literals.
 |---|---|---|
 | `<prefix>-allow-iap-ssh` | ingress | `tcp:22` from `35.235.240.0/20` only. Operators reach machines with no external address this way — and so does the controller's idle probe, which is why a host outside this rule can never be scaled in. |
 | `<prefix>-allow-health` | ingress | MIG / load-balancer health-check ranges → tagged hosts. |
-| `<prefix>-allow-egress` | egress | `tcp:443` + `tcp/udp:53`. GitHub, the package registries, Google APIs, DNS. |
-| `<prefix>-allow-egress-db` | egress | Common database ports, **RFC1918 destinations only**. |
-| `<prefix>-deny-egress` | egress, priority 65534 | Everything else. The implied deny only applies while no allow rule exists; stating it keeps a later broad allow on the VPC from silently widening what pull-request code can reach. |
+| `<prefix>-allow-egress` | egress | `tcp:443` + `tcp/udp:53`. GitHub, the package registries, Google APIs, DNS. **Logged** — this is the destination record. |
+| `<prefix>-allow-egress-db` | egress | Common database ports, **RFC1918 destinations only**. Logged. |
+| `<prefix>-deny-egress` | egress, priority 65534 | Everything else. The implied deny only applies while no allow rule exists; stating it keeps a later broad allow on the VPC from silently widening what pull-request code can reach. Logged, including at `firewall_logging = "denied"`. |
+
+### The egress is recorded, not only bounded
+
+The allow rule reaches `0.0.0.0/0` on 443 by necessity — GitHub, the package
+registries and Google APIs publish large, rotating, per-region ranges, and
+pinning them in a firewall rule breaks builds on every upstream rotation. The
+port narrowing is real defence; the destination is not bounded and is not going
+to be.
+
+What was missing was any record of it. A warm host holds a GCP identity and runs
+third-party code out of every lockfile it installs, and the pool could not
+answer "where did this connect out to" in either direction — there was no
+evidence of an exfiltration and no evidence against one.
+
+`firewall_logging` (default `all`) turns the rules into that record: one
+`compute.googleapis.com/firewall` entry per connection, carrying the destination
+address and port, the rule that decided, and the disposition.
+
+- **There is no Cloud NAT here to log.** This estate peers out through a central
+  firewall; the module deliberately creates no NAT.
+- **This module does not own the subnet**, so it cannot enable VPC flow logs.
+  It owns the rules, and the rules record the same 5-tuple.
+- **The health-check rule is never logged**, at any setting. Probes arrive every
+  few seconds per host, forever, and would bury the egress record they were
+  charged for.
+- `INCLUDE_ALL_METADATA`, deliberately: a bare destination IP is not an answer.
+  The metadata carries the remote ASN and country, which is what lets a reader
+  tell GitHub from a rented VPS.
+
+Set `firewall_logging = "denied"` for the cheap setting — but it is the cheap
+one, not the safe one. It answers what the rules stopped, and the interesting
+egress from a credentialed warm host is the egress that was allowed.
+
+Read `gcloud logging read 'logName:"compute.googleapis.com%2Ffirewall"'` in the
+pool's project.
 
 ### About the database rule
 
@@ -48,7 +83,8 @@ Adding a port is routine. Widening `database_egress_ranges` needs an argument.
 Required: `project_id`, `network`.
 Optional: `name_prefix`, `runner_network_tag`, `iap_source_range`,
 `health_check_source_ranges`, `egress_destination_ranges`, `egress_tcp_ports`,
-`egress_udp_ports`, `database_egress_ports`, `database_egress_ranges`.
+`egress_udp_ports`, `database_egress_ports`, `database_egress_ranges`,
+`firewall_logging`.
 
 ## Outputs
 
