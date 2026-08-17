@@ -307,7 +307,12 @@ check_file() {
     done
   fi
 
+  # SC2034: `writes` is read and never used. It is a POSITION, not a value —
+  # the record is fixed-width and dropping the field would shift `callee` and
+  # `secrets` into each other, which is the bug the `-` placeholders exist to
+  # prevent. Per-job writes are PERM2's business only at workflow level.
   local _ job state writes callee secrets
+  # shellcheck disable=SC2034
   while IFS=$'\t' read -r _ job state writes callee secrets; do
     [ -n "${job:-}" ] || continue
 
@@ -344,7 +349,11 @@ EOF
 # SC2031: `fail` is read after the self-test's subshells wrote their own copies.
 # Intended — a fixture failure must not reach this exit status, and on the real
 # path `check_file` runs in this shell.
-# shellcheck disable=SC2031
+#
+# SC2016: every fixture below is single-quoted on purpose. A `${{ … }}` in one
+# is the literal text the gate must classify as an expression; expanding it here
+# would delete the thing under test.
+# shellcheck disable=SC2030,SC2031,SC2016
 selftest() {
   local tmp status=0
   tmp="$(mktemp -d)"
@@ -593,7 +602,6 @@ jobs:
     secrets: inherit'
   ALLOW_INHERIT=0
 
-  # shellcheck disable=SC2016  # the fixture IS the unexpanded `${{ … }}` text.
   expect "a set chosen by an expression is undecided" "PERM4" \
 'on: [push]
 permissions: ${{ fromJSON(inputs.perms) }}
@@ -603,7 +611,6 @@ jobs:
     steps:
       - run: echo hi'
 
-  # shellcheck disable=SC2016  # same, one level down and inside the map.
   expect "a scope level chosen by an expression is undecided" "PERM4" \
 'on: [push]
 jobs:
