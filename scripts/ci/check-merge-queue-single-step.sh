@@ -85,6 +85,14 @@
 #   0 — clean
 #   1 — an invariant is broken
 # =============================================================================
+# `+e` is stated rather than assumed. This gate's whole shape is an aggregator —
+# every detector runs, `err` records, and the exit code comes from the tally at
+# the end — so a stray `errexit` would abort it mid-sweep on an EXPECTED non-zero
+# (a `grep -vx` that matches nothing) and report a failure with no finding
+# attached. Bash does not normally export `SHELLOPTS`, so a `run:` block's `-e`
+# does not reach a child script today; that is a default, not a contract, and the
+# cost of not depending on it is one word.
+set +e
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -327,6 +335,11 @@ GUARDED_KEYS = (
     "max_parallel_checks", "batch_size", "merge_conditions", "queue_conditions",
     "auto_merge_conditions", "queue_rules", "merge_queue", "max_checks_retries",
     "merge_protections_settings", "autoqueue", "pull_request_rules",
+    # Guarded since CHECK 2 began asserting on it. Misspelled, it is invisible
+    # twice over: Mergify refuses the file for the unknown key, and CHECK 2 —
+    # which only looks when the batch exceeds 1 — sees a Tier 0 rule and says
+    # nothing. Green gate, dead queue.
+    "batch_max_failure_resolution_attempts",
 )
 # Rejecting every UNKNOWN key would fail configurations that use Mergify keys
 # this gate has never heard of — a fleet-wide false failure, and the reason the
@@ -1137,6 +1150,11 @@ scan_file() {
   kind_at()  { printf '%s\n' "$doc" | awk -F'\t' -v p="$1" '$1 == p { print $3; exit }'; }
   has_path() { printf '%s\n' "$doc" | awk -F'\t' -v p="$1" '$1 == p { found = 1 } END { exit !found }'; }
   paths_re() { printf '%s\n' "$doc" | awk -F'\t' -v re="$1" '$1 ~ re { print $1 }'; }
+  # The immediate child KEYS of a mapping, by exact prefix rather than by regex:
+  # a rule path carries `[0]`, and every character class in it would have to be
+  # escaped to ask this question with `paths_re`.
+  child_keys() { printf '%s\n' "$doc" | awk -F'\t' -v pre="$1." '
+    index($1, pre) == 1 { rest = substr($1, length(pre) + 1); if (rest !~ /[.[]/) print rest }'; }
   # Condition SUBTREES are deliberately not read here. Flattening a condition
   # list to the scalars underneath loses the connectives, and the two readings
   # that costs are the ones this gate is for: an `or:` of bases read as a
@@ -1207,6 +1225,14 @@ scan_file() {
           err CHECK2 "queue rule \`$r\` sets \`batch_size\` to \`{min: $lo, max: $mx}\` — the maximum is below the minimum, which is not a range."
         elif [ "$mx" -gt "$BATCH_MAX" ]; then
           err CHECK2 "queue rule \`$r\` sets \`batch_size.max: $mx\`, above this repository's ceiling of $BATCH_MAX. The cost of a larger batch is not runners, it is BLAME: when the batch fails, every member waits through the bisect, and the wider the batch the longer that takes. Raise \`BATCH_MAX\` in this script only alongside the measurement in \`docs/ci-merge-queue-baseline.md\`."
+        # `min` and `max` are the whole schema here. An extra key is not a
+        # harmless annotation — Mergify refuses the document over it and NOTHING
+        # queues — and the checks above would not notice, because they ask what
+        # `min` and `max` hold rather than what else is present. This gate would
+        # then be green on a config the queue never loads, which is the one
+        # outcome it exists to make impossible.
+        elif [ -n "$(child_keys "$r.batch_size" | grep -vx -e min -e max)" ]; then
+          err CHECK2 "queue rule \`$r\` gives \`batch_size\` a key that is not \`min\` or \`max\`: $(child_keys "$r.batch_size" | grep -vx -e min -e max | tr '\n' ' '). Mergify's schema takes those two and refuses the whole file over anything else, so nothing queues at all."
         else
           hi="$mx"
         fi
@@ -1503,6 +1529,16 @@ selftest() {
     "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1\\n      max: 5/')" || return 1
   expect t1-batch-one-short CHECK2 \
     "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1\\n      max: 5\\n    batch_max_failure_resolution_attempts: 2/')" || return 1
+  # An extra key under `batch_size` satisfies every question the checks above
+  # ask — min is an int, max is an int, the range is sane, the bisect is paired —
+  # and Mergify still refuses the whole document over it.
+  expect t1-batch-extra-key CHECK2 \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1\\n      max: 5\\n      spread: true\\n    batch_max_failure_resolution_attempts: 3/')" || return 1
+  # The bisect budget MISSPELLED, on a Tier 0 rule. Before it was guarded this
+  # was the gate's quietest possible failure: CHECK 2 does not look at a batch of
+  # 1, so nothing here had an opinion, while Mergify refused the file outright.
+  expect attempts-misspelled CHECK11 \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size: 1\\n    batch_max_failure_resolution_attempt: 3/')" || return 1
   # `0` is not "unset" — it dequeues the whole batch on the first failure, which
   # is the innocent-pull-request outcome stated the other way round.
   expect t1-batch-attempts-zero CHECK2 \
