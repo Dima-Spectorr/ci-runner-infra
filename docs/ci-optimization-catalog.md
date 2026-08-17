@@ -424,6 +424,7 @@ is re-run, multiplying the cost of the flakiest suites. Retry at the test level.
 | Setting | Present in | Consequence where absent |
 |---|---|---|
 | `batch_size` | Apigee-Portal (5), DataRetrival (5) | speculative CI run per PR instead of per batch |
+| `batch_max_failure_resolution_attempts` | nowhere | unbounded bisection when a batch fails, or — set too low — innocent pull requests dequeued with the culprit. **Mandatory wherever `batch_size` exceeds 1**, at `ceil(log2(max))` or above |
 | `batch_max_wait_time` | DataRetrival (1 min) | lone PRs wait for companions that never come |
 | `checks_timeout` | Apigee-Portal (40 min) | inherits an undeclared ~42-min vendor default; hangs surface as silent dequeues |
 | `scopes` | IntegrateIT | batches mix unrelated areas, so a batch failure bisects across unrelated changes |
