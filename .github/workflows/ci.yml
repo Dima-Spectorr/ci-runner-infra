@@ -391,6 +391,14 @@ jobs:
       - name: metric contract self-test
         run: bash scripts/ci/metric-contract.selftest.sh
 
+      # The firewall now records where the pool connects out to, and a record
+      # nobody reads is a cost with no benefit. This exercises the aggregation
+      # against fixture log entries rather than a live project: the shape of a
+      # firewall LogEntry is the thing most likely to be wrong, and discovering
+      # that against a real pool costs a day of nobody noticing.
+      - name: egress destinations self-test
+        run: bash scripts/ci/egress-destinations.sh --selftest
+
       # The outcome series is the first one to carry a label the fleet does not
       # write itself: a workflow name, repository-authored, reaching a JSON body
       # built by concatenation. A single quote in one would not spoil one label
