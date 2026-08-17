@@ -1190,6 +1190,50 @@ function Test-NegativeCapability {
     return ([int] $StatusCode -eq 403)
 }
 
+function Test-PositiveCapability {
+    <#
+      .SYNOPSIS
+        Does this HTTP status prove the host token CAN do the thing? Pure.
+      .DESCRIPTION
+        THE WITNESS THE REST OF PHASE 6 DOES NOT HAVE.
+
+        Every other capability check here is negative, and a negative check
+        cannot tell "correctly refused" from "there was nothing to refuse".
+        Secret Manager answers 403 for a resource the caller may not read AND
+        for one that does not exist, so a `ci-app-key-secret` that is misspelled,
+        renamed or deleted scores exactly like a properly reduced identity. The
+        same shape is true of the whole payload: an identity that can do nothing
+        at all -- a token from a service account whose bindings were wiped, a
+        proxy answering 403 to everything -- passes both negative checks
+        perfectly. That is issue #157.
+
+        So one assertion runs the other way. The host token is supposed to hold
+        exactly one capability: `iam.serviceAccounts.getAccessToken` on the job
+        service account, which is how the broker vends job credentials without
+        the host holding any. If that answers 200, the token is live, the
+        network reaches Google, and IAM is being evaluated on this call -- which
+        is what makes the two 403s beside it mean refusal rather than absence.
+
+        200 and nothing else, and the near-misses invert cleanly:
+
+        403 is the finding. Either the grant is missing, in which case no job on
+        this host can obtain the credentials it was designed to get, or the
+        probe's whole picture is 403-shaped for a reason that has nothing to do
+        with IAM -- and in the second case the negative checks above proved
+        nothing.
+
+        $null and 401 are UNPROVED for the same reasons Test-NegativeCapability
+        rejects them, and they matter more here: this check exists to prove the
+        measurement apparatus works, so accepting a failure to measure would
+        make it the one assertion that certifies itself.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()] $StatusCode)
+    if ($null -eq $StatusCode) { return $false }
+    if ("$StatusCode" -notmatch '^[0-9]+$') { return $false }
+    return ([int] $StatusCode -eq 200)
+}
+
 function Get-ProbeFailure {
     <#
       .SYNOPSIS
@@ -1272,6 +1316,32 @@ function Get-ProbeFailure {
                 'this host identity can still write the demand series the autoscaler reads'))
     }
 
+    # THE POSITIVE CONTROL, and it is deliberately read right after the two
+    # negatives it qualifies. See Test-PositiveCapability: without it, an
+    # identity that can do nothing at all -- or a probe whose calls never reached
+    # Google -- answers 403 to both checks above and scores a perfect boundary.
+    #
+    # Only on a pool that HAS a job service account, and the two arms are not
+    # symmetric. With one configured, 200 is required. With none, the payload
+    # omits the call entirely, so a status arriving anyway means the payload on
+    # disk does not match the configuration this boot script was handed -- the
+    # same drift the broker arm below refuses, for the same reason.
+    $impersonate = & $get 'impersonateStatus'
+    $tries = & $get 'impersonateAttempts'
+    $after = ''
+    if ($null -ne $tries) { $after = " after $tries attempt(s)" }
+    if ([string]::IsNullOrWhiteSpace($JobServiceAccount)) {
+        if ($null -ne $impersonate) {
+            $fail.Add(("the probe tried to mint a job token ('$impersonate') on a pool that configured " +
+                    'no job service account, so the payload it ran is not the one this configuration builds'))
+        }
+    } elseif (-not (Test-PositiveCapability -StatusCode $impersonate)) {
+        $fail.Add(("iamcredentials.generateAccessToken on $JobServiceAccount answered '$impersonate' and " +
+                "not 200$after -- the host token cannot mint the job credentials the broker vends, and " +
+                'until it can, the two 403s above are not evidence of a reduced identity: an identity ' +
+                'that can do nothing at all answers 403 to everything'))
+    }
+
     # Both halves, because a broker that silently fell back to the host identity
     # is the failure the broker exists to prevent, and it looks like a working
     # broker from every angle except this one.
@@ -1342,12 +1412,18 @@ function Test-ProbeLiteral {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Value,
-        [Parameter(Mandatory = $true)][ValidateSet('name', 'endpoint', 'path', 'url')][string] $Kind
+        [Parameter(Mandatory = $true)][ValidateSet('name', 'endpoint', 'path', 'url', 'email')][string] $Kind
     )
     if ([string]::IsNullOrEmpty($Value)) { return $true }
     switch ($Kind) {
         'name' { return ($Value -match '^[A-Za-z0-9_-]+$') }
         'endpoint' { return ($Value -match '^[A-Za-z0-9._-]+:[0-9]+$') }
+        # A service-account email, and deliberately narrower than RFC 5322: it is
+        # about to be spliced into a URL inside a double-quoted PowerShell string
+        # in a payload holding a live host token, so the characters that matter
+        # are the ones that end a literal or start a subexpression. Nothing here
+        # admits a quote, a backtick, a `$` or a slash.
+        'email' { return ($Value -match '^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+$') }
         'url' { return ($Value -match '^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._-]+)*$') }
         default { return ($Value -match '^[A-Za-z]:\\[A-Za-z0-9 \\._-]*$') }
     }
@@ -1386,6 +1462,7 @@ function Get-ProbeScript {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][string] $SecretName,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $JobServiceAccount,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string] $BrokerEndpoint,
         [Parameter(Mandatory = $true)][string] $SiblingWorkspace,
         [Parameter(Mandatory = $true)][string] $CacheRoot,
@@ -1398,6 +1475,7 @@ function Get-ProbeScript {
     # value reaching this point unchecked is worse than the finding it looks for.
     foreach ($pair in @(
             @{ n = 'SecretName'; v = $SecretName; k = 'name' },
+            @{ n = 'JobServiceAccount'; v = $JobServiceAccount; k = 'email' },
             @{ n = 'BrokerEndpoint'; v = $BrokerEndpoint; k = 'endpoint' },
             @{ n = 'SiblingWorkspace'; v = $SiblingWorkspace; k = 'path' },
             @{ n = 'CacheRoot'; v = $CacheRoot; k = 'path' },
@@ -1407,6 +1485,42 @@ function Get-ProbeScript {
             throw ("probe $($pair.n) '$($pair.v)' is not a bare $($pair.k), so it would be " +
                 'interpolated as code into a payload that holds a host token')
         }
+    }
+
+    # The positive control, omitted on the same terms as the broker read below
+    # and for the same reason: a pool with no job service account has no
+    # impersonation to prove, and Get-ProbeFailure treats a status arriving from
+    # such a pool as payload-versus-configuration drift.
+    #
+    # RETRIED, unlike every other check in the payload. This is the one
+    # assertion whose subject is an IAM binding rather than a local ACL or a
+    # refusal, and a binding created seconds ago by the same apply that created
+    # the pool is not always in force yet. Every other check answers the same on
+    # attempt one and attempt three; this one can answer 403 on a host that is
+    # about to be correct. Without the retry, the first boot after a fresh apply
+    # denies itself, and `keep:at-floor` then pins that host at min_hosts.
+    #
+    # Bounded at three because a boot cannot wait on IAM indefinitely, and the
+    # attempt count is carried out so the finding can say whether the grant was
+    # missing for twenty seconds or was never there.
+    $impersonateBlock = ''
+    if (-not [string]::IsNullOrWhiteSpace($JobServiceAccount)) {
+        $impersonateBlock = @"
+if (`$tok) {
+    for (`$i = 1; `$i -le 3; `$i++) {
+        `$r.impersonateAttempts = `$i
+        # Get-Status DISCARDS the body, which here is a live access token for the
+        # job service account. The question is whether the call is permitted, and
+        # a probe that kept the answer would be writing a credential into a
+        # verdict file for the sake of a status code it already has.
+        `$r.impersonateStatus = Get-Status ``
+            -Uri 'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$JobServiceAccount`:generateAccessToken' ``
+            -Method 'POST' -Body '{"scope":["https://www.googleapis.com/auth/cloud-platform"]}'
+        if (`$r.impersonateStatus -eq 200) { break }
+        if (`$i -lt 3) { Start-Sleep -Seconds 10 }
+    }
+}
+"@
     }
 
     # OMITTED, not disabled. A runtime `if ('')` around the broker read would
@@ -1429,6 +1543,7 @@ try {
 `$md = @{ 'Metadata-Flavor' = 'Google' }
 `$r = [ordered] @{
     runningAs = ''; hostToken = `$false; secretStatus = `$null; metricStatus = `$null
+    impersonateStatus = `$null; impersonateAttempts = `$null
     brokerEmail = ''; siblingStatus = 'unrun'; siblingErrorType = ''
     cacheWritable = `$false; dnsResolved = `$false
 }
@@ -1486,6 +1601,8 @@ if (`$tok -and `$project -and '$SecretName') {
         -Uri "https://monitoring.googleapis.com/v3/projects/`$project/timeSeries" ``
         -Method 'POST' -Body '{"timeSeries":[]}'
 }
+
+$impersonateBlock
 
 $brokerBlock
 
@@ -3386,6 +3503,7 @@ function Invoke-Phase6BootProbe {
     try {
         $payload = Get-ProbeScript `
             -SecretName $Config.AppKeySecret `
+            -JobServiceAccount $Config.JobSa `
             -BrokerEndpoint $BrokerEndpoint `
             -SiblingWorkspace (Get-ProbeSiblingWorkspace -Index $slot.Index -SlotCount $Provisioned.Count) `
             -CacheRoot (Get-SlotWorkspacePath -Index $slot.Index)

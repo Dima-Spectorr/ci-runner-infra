@@ -513,6 +513,39 @@ found two workflow-level writes — both single-job, both correct — which is t
 measurement that produced the one-job exemption rather than an allowlist entry.
 See `docs/ci-workflow-gates.md`.
 
+### 7.3 Where the pool connects out to — shipped
+
+The supply chain does not end at what a lockfile installs; it ends at what the
+installed code then talks to. A warm host holds a GCP identity, runs
+third-party code out of every lockfile, and reaches `0.0.0.0/0` on 443 by
+necessity — the registries publish large rotating ranges and pinning them in a
+firewall rule breaks builds on every upstream rotation. Until now nothing wrote
+down a single destination, so "did anything leave this pool" had no evidence
+either way. An exfiltration and a clean pool looked identical.
+
+Two halves, and the second is what makes the first worth paying for.
+
+**Recording.** `modules/ci-runner-network` logs its rules
+(`firewall_logging`, default `all`, `INCLUDE_ALL_METADATA`) — one entry per
+connection with the destination, port, deciding rule and disposition. Not Cloud
+NAT logs (this estate peers out through a central firewall, there is no NAT
+here) and not VPC flow logs (the module does not own the subnet). It owns the
+rules, and the rules carry the same 5-tuple. The health-check rule is never
+logged at any setting: probes every few seconds per host forever would bury the
+record they were charged for.
+
+**Reading.** Refusals are alertable and are now an alert
+(`ci_egress_denied`, a log-based metric, and the *egress refused* policy) —
+before it, a blocked egress presented as a test client hanging until the job
+timed out. Allowed destinations are the interesting half and are *not*
+alertable: Cloud Monitoring knows *more*, not *new*, and the connection that
+matters is one packet. So `scripts/ci/egress-destinations.sh` diffs the window
+against a baseline committed under `docs/egress-baselines/`, keyed by owning
+ASN rather than address so a CDN rotation is one destination and a rented VPS
+is a different key on its first packet. A new destination is a pull request
+adding a line. A tool that updated its own baseline would agree with whatever
+happened last night, including the thing it exists to catch.
+
 ---
 
 ## 8. Governance tier — how this stays true

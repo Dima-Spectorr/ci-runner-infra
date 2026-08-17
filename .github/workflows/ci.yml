@@ -208,7 +208,7 @@ jobs:
           $cfg.Run.PassThru = $true
           $cfg.Output.Verbosity = 'Detailed'
           $r = Invoke-Pester -Configuration $cfg
-          $floor = 174
+          $floor = 189
           Write-Output "pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.TotalCount) discovered"
           if ($r.TotalCount -lt $floor) {
             throw "Pester discovered only $($r.TotalCount) test(s), fewer than the $floor this suite is known to contain — the suite did not run, whatever the exit code says"
@@ -390,6 +390,14 @@ jobs:
       # healthy forever.
       - name: metric contract self-test
         run: bash scripts/ci/metric-contract.selftest.sh
+
+      # The firewall now records where the pool connects out to, and a record
+      # nobody reads is a cost with no benefit. This exercises the aggregation
+      # against fixture log entries rather than a live project: the shape of a
+      # firewall LogEntry is the thing most likely to be wrong, and discovering
+      # that against a real pool costs a day of nobody noticing.
+      - name: egress destinations self-test
+        run: bash scripts/ci/egress-destinations.sh --selftest
 
       # The outcome series is the first one to carry a label the fleet does not
       # write itself: a workflow name, repository-authored, reaching a JSON body
