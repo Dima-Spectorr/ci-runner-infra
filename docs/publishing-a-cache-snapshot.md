@@ -318,6 +318,61 @@ hash was in the way": name the package in the comment, and confirm the file is i
 that package's *published* tarball rather than something your install produced.
 If you cannot say which dependency ships it, you have not finished diagnosing it.
 
+### Once there is more than a handful: `CACHE_SCAN_ALLOW_FILE`
+
+The paragraph above assumes one fixture. A real dependency tree does not stop
+there — a `pnpm install` of one production monorepo lands **71** files carrying a
+private-key header, 49 of them from `ssh2` alone, which ships a directory of real
+published test keys. Seventy-one hashes in a YAML scalar is a list nobody reads,
+and an allowlist nobody reads is the hole it was meant to close.
+
+Point at a file instead. Check it in next to the workflow, one digest per line,
+each with a comment naming the package:
+
+```yaml
+# in BOTH jobs
+env:
+  CACHE_SCAN_ALLOW_FILE: .github/cache-scan-allow.txt
+```
+
+```
+# ssh2@1.17.0 test/fixtures — published test keys, in the tarball on npm.
+a0b4c0a4...  # ssh2/test/fixtures/https_key.pem
+cf327148...  # ssh2/test/fixtures/openssh_new_rsa
+```
+
+**The comment is required, not encouraged.** A line holding a digest and nothing
+else is refused at startup, by line number. The rule everywhere else here is that
+a fixture is excused by the package that ships it and never by the hash alone;
+this is the one place that rule can be enforced rather than written down.
+
+Everything the variable guarantees, the file guarantees: full 64-character
+digests, `private-key-header` only, the content pass only, every use logged. Two
+further refusals are specific to it — a path naming no readable file, and a file
+holding nothing but comments. Both would otherwise excuse nothing while reading
+exactly like a list that worked, and the symptom is a publish that refuses on
+every run for a reason nobody can see.
+
+The file is read at startup, **before the prepare command runs**. The build job's
+checkout is writable by the install it is about to launch, so an allowlist parsed
+any later is one that install could have extended with a digest of its own.
+
+Both may be set; the entries are unioned. The same "literal in the repository,
+never `${{ vars.* }}`" rule applies — a checked-in file is a diff that goes
+through review, which is the whole reason to prefer it.
+
+To regenerate the list after a dependency bump, run the install and digest what
+the scan would stop on:
+
+```bash
+grep -rlaZ -E -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' "$(pnpm store path)" \
+  | xargs -0 -r sha256sum | cut -d' ' -f1 | sort -u
+```
+
+Then map each digest back to a package before you paste it in — the store names
+files by hash, so `sha256sum` over `node_modules/.pnpm` is what recovers the name
+the comment has to carry.
+
 ## First run
 
 Run the build phase alone: `CACHE_PREPARE=… CACHE_DRY_RUN=1 bash

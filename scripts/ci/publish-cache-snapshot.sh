@@ -97,6 +97,15 @@
 #                     which then lands unpacked as root on every host in the
 #                     pool. Set it in BOTH jobs, as a literal in the workflow
 #                     file. Every use is logged. The refusal prints the digest.
+#   CACHE_SCAN_ALLOW_FILE
+#                     optional. Path to a checked-in file holding the same
+#                     digests, one per line, EACH followed by a `#` comment
+#                     naming the package that ships it. Use this rather than the
+#                     variable once there is more than a handful: one real
+#                     monorepo's install lands 71 of them, and 71 hashes in a
+#                     YAML scalar is a list nobody can review. Both may be set;
+#                     the entries are unioned. Set it in BOTH jobs, for the same
+#                     reason as the variable.
 # =============================================================================
 set -euo pipefail
 
@@ -139,16 +148,75 @@ esac
 # run, forever. The two ways out that do not need this are deleting the pattern
 # and widening it into uselessness, which is how a scan stops being a bound.
 #
-# Read from the environment, not from a list in this repository: which fixture a
+# Read from the consumer, not from a list in this repository: which fixture a
 # consumer's dependency tree drags in is theirs to know, and the entry belongs in
-# their workflow, on a line next to a comment naming the package. It must be set
-# in BOTH jobs — the publishing job re-scans what it received, and one excused
-# only in the build job fails there instead.
+# their workflow or in a file beside it, on a line next to a comment naming the
+# package. It must be set in BOTH jobs — the publishing job re-scans what it
+# received, and one excused only in the build job fails there instead.
 #
 # Validated strictly. A malformed entry that quietly matched nothing would read
 # exactly like one that worked, and a SHORT one is the real hazard: treated as a
 # prefix it would excuse everything beginning with those characters.
 SCAN_ALLOW_DIGESTS=()
+
+# One entry, from either source. `where` names the source in every refusal, so an
+# operator staring at "non-hex entry" knows which of the two to go and edit.
+scan_allow_add() { # <digest> <where>
+  local d=$1 where=$2
+  case "$d" in
+    *[!0-9a-fA-F]* ) die "$where holds a non-hex entry: $(safe_path "$d")" ;;
+  esac
+  [ "${#d}" = 64 ] \
+    || die "$where entries are full sha256 digests — 64 hex characters, not ${#d}"
+  SCAN_ALLOW_DIGESTS+=("$(printf '%s' "$d" | tr 'A-F' 'a-f')")
+}
+
+# The same digests, from a file, because past a handful the variable stops being
+# reviewable. A YAML scalar cannot carry a comment per line, and a bare list of
+# 71 hashes is one nobody reads — which is how an allowlist becomes the hole it
+# was meant to close. The file gives every digest a line of its own and a name
+# beside it.
+#
+# The name is REQUIRED, not encouraged: a digest with no comment is refused. The
+# rule everywhere else in this layer is that a fixture is excused by the package
+# that ships it and never by the hash alone, and this is the one place that rule
+# can actually be enforced rather than written down.
+#
+# Parsed here, at the top, BEFORE the prepare command runs. The build job's
+# checkout is writable by the install it is about to run, so an allowlist read
+# after third-party code executed would be one that code could have extended.
+if [ -n "${CACHE_SCAN_ALLOW_FILE:-}" ]; then
+  [ -f "$CACHE_SCAN_ALLOW_FILE" ] \
+    || die "CACHE_SCAN_ALLOW_FILE names no readable file: $(safe_path "$CACHE_SCAN_ALLOW_FILE") — an allowlist that is not there excuses nothing and reads exactly like one that worked"
+  scan_allow_lineno=0
+  while IFS= read -r scan_allow_line || [ -n "$scan_allow_line" ]; do
+    scan_allow_lineno=$((scan_allow_lineno + 1))
+    # A whole-line comment or a blank line is structure, not an entry.
+    case "$scan_allow_line" in
+      '' | [$' \t']*'#'* | '#'* ) continue ;;
+    esac
+    scan_allow_digest=${scan_allow_line%%#*}
+    # Nothing before the `#`, or no `#` at all: either way there is a digest
+    # standing on its own authority.
+    [ "$scan_allow_digest" != "$scan_allow_line" ] \
+      || die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno excuses a digest with no comment naming the package that ships it — a hash on its own is one nobody can review: $(safe_path "$scan_allow_line")"
+    # Trailing `#` with nothing after it is a comment marker, not a name.
+    scan_allow_name=$(printf '%s' "${scan_allow_line#*#}" | tr -d '[:space:]')
+    [ -n "$scan_allow_name" ] \
+      || die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno has an empty comment — name the package that ships the file"
+    scan_allow_digest=$(printf '%s' "$scan_allow_digest" | tr -d '[:space:]')
+    [ -n "$scan_allow_digest" ] \
+      || die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno has a comment but no digest: $(safe_path "$scan_allow_line")"
+    scan_allow_add "$scan_allow_digest" "CACHE_SCAN_ALLOW_FILE (line $scan_allow_lineno)"
+  done <"$CACHE_SCAN_ALLOW_FILE"
+  scan_allow_count=${#SCAN_ALLOW_DIGESTS[@]}
+  [ "$scan_allow_count" -gt 0 ] \
+    || die "CACHE_SCAN_ALLOW_FILE is set but $(safe_path "$CACHE_SCAN_ALLOW_FILE") holds no digests — a file of nothing but comments is not an allowlist"
+  command -v sha256sum >/dev/null 2>&1 \
+    || die "CACHE_SCAN_ALLOW_FILE is set but sha256sum is not on PATH — the allowlist cannot be evaluated"
+  log "the content scan may excuse $scan_allow_count digest(s) named in $(safe_path "$CACHE_SCAN_ALLOW_FILE")"
+fi
+
 if [ -n "${CACHE_SCAN_ALLOW_DIGESTS:-}" ]; then
   # read -ra rather than unquoted expansion: the latter globs, and a digest is
   # attacker-adjacent input that should never reach pathname expansion.
@@ -158,12 +226,7 @@ if [ -n "${CACHE_SCAN_ALLOW_DIGESTS:-}" ]; then
   IFS=$', \n\t' read -rd '' -a SCAN_ALLOW_RAW <<<"$CACHE_SCAN_ALLOW_DIGESTS" || true
   for d in ${SCAN_ALLOW_RAW[@]+"${SCAN_ALLOW_RAW[@]}"}; do
     [ -n "$d" ] || continue
-    case "$d" in
-      *[!0-9a-fA-F]* ) die "CACHE_SCAN_ALLOW_DIGESTS holds a non-hex entry: $(safe_path "$d")" ;;
-    esac
-    [ "${#d}" = 64 ] \
-      || die "CACHE_SCAN_ALLOW_DIGESTS entries are full sha256 digests — 64 hex characters, not ${#d}"
-    SCAN_ALLOW_DIGESTS+=("$(printf '%s' "$d" | tr 'A-F' 'a-f')")
+    scan_allow_add "$d" CACHE_SCAN_ALLOW_DIGESTS
   done
   # A digest nobody can compute is a digest that excuses nothing, silently.
   command -v sha256sum >/dev/null 2>&1 \
