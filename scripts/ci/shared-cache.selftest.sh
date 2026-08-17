@@ -732,7 +732,36 @@ has_trusted_snapshot_build() { # <file>
   # stopping at the first would let an excused file stand in front of a real one.
   matches "$code" '\[ "\$\{#d\}" = 64 \]' || return 1
   matches "$code" '\*\[!0-9a-fA-F\]\*' || return 1
-  matches "$code" 'die "CACHE_SCAN_ALLOW_DIGESTS holds a non-hex entry' || return 1
+  matches "$code" 'die "\$where holds a non-hex entry' || return 1
+  # Both sources — the variable and the file — go through ONE validator. Two
+  # copies is how the file grows a shorter rule than the variable it replaced,
+  # on the path an operator actually uses once the list is long.
+  [ "$(printf '%s\n' "$code" | grep -c 'scan_allow_add ')" = 2 ] || return 1
+  # The file's own rule: a digest with no comment naming its package is refused.
+  # This is the one place the "excused by NAME, never by hash alone" convention
+  # can be enforced instead of written down, and 71 unlabelled hashes is exactly
+  # the list that gets rubber-stamped.
+  matches "$code" 'excuses a digest with no comment naming the package' || return 1
+  matches "$code" 'has an empty comment' || return 1
+  # The guards themselves, not only the sentences they die with. A `[ ... ]`
+  # replaced by `true` leaves the message in place, so a suite that reads only
+  # the message reports a script that no longer checks anything as intact.
+  matches "$code" '\[ "\$scan_allow_digest" != "\$scan_allow_line" \]' || return 1
+  matches "$code" '\[ -n "\$scan_allow_name" \]' || return 1
+  matches "$code" '\[ -f "\$CACHE_SCAN_ALLOW_FILE" \]' || return 1
+  matches "$code" '\[ "\$scan_allow_count" -gt 0 \]' || return 1
+  # A file that is not there, or holds nothing but comments, reads exactly like
+  # one that worked — the failure is a publish that refuses on every run.
+  matches "$code" 'CACHE_SCAN_ALLOW_FILE names no readable file' || return 1
+  matches "$code" 'holds no digests' || return 1
+  # ...and it is read BEFORE the prepare command runs. The build job's checkout
+  # is writable by the install it is about to run, so an allowlist parsed after
+  # third-party code executed is one that code could have extended — it would
+  # excuse its own planted file and the run would look like a clean publish.
+  local allow_at prep_at
+  allow_at=$(printf '%s\n' "$code" | grep -n 'CACHE_SCAN_ALLOW_FILE:-' | head -1 | cut -d: -f1)
+  prep_at=$(printf '%s\n' "$code" | grep -n 'timeout -k 30 "\$CACHE_PREPARE_TIMEOUT"' | head -1 | cut -d: -f1)
+  [ -n "$allow_at" ] && [ -n "$prep_at" ] && [ "$allow_at" -lt "$prep_at" ] || return 1
   matches "$code" '\[ "\$d" = "\$1" \]' || return 1
   matches "$code" 'sha256sum is not on PATH' || return 1
   matches "$code" 'log "the content scan excused \$\(safe_path' || return 1
@@ -1284,7 +1313,19 @@ mutate_file "$PUBSH" 'the credential refusal stops saying what it caught' has_tr
 # bounds gets a mutation. Every one of these leaves a script that still builds,
 # still scans and still publishes.
 mutate_file "$PUBSH" 'an allowlist entry may be a digest PREFIX' has_trusted_snapshot_build \
-  's@^    \[ "\$\{#d\}" = 64 \] \\$@    true \\@'
+  's@^  \[ "\$\{#d\}" = 64 \] \\$@  true \\@'
+# The file's rules. Each mutation leaves a script that still parses a list and
+# still publishes — the loss is only that nobody can tell what was excused.
+mutate_file "$PUBSH" 'a digest in the file needs no package name beside it' has_trusted_snapshot_build \
+  's@^    \[ "\$scan_allow_digest" != "\$scan_allow_line" \] \\$@    true \\@'
+mutate_file "$PUBSH" 'a bare `#` counts as naming the package' has_trusted_snapshot_build \
+  's@^    \[ -n "\$scan_allow_name" \] \\$@    true \\@'
+mutate_file "$PUBSH" 'an allowlist file that is not there excuses nothing, quietly' has_trusted_snapshot_build \
+  's@^  \[ -f "\$CACHE_SCAN_ALLOW_FILE" \] \\$@  true \\@'
+mutate_file "$PUBSH" 'a file of nothing but comments passes for an allowlist' has_trusted_snapshot_build \
+  's@^  \[ "\$scan_allow_count" -gt 0 \] \\$@  true \\@'
+mutate_file "$PUBSH" 'the file skips its own validator' has_trusted_snapshot_build \
+  's@^    scan_allow_add "\$scan_allow_digest" "CACHE_SCAN_ALLOW_FILE.*$@    SCAN_ALLOW_DIGESTS+=("$scan_allow_digest")@'
 mutate_file "$PUBSH" 'an excused file is excused silently' has_trusted_snapshot_build \
   's@^          log "the content scan excused @          : "@'
 mutate_file "$PUBSH" 'the content pass stops at the first hit again' has_trusted_snapshot_build \
@@ -1482,9 +1523,8 @@ behave_setup() {
 # Runs the build phase against a prepare script. Echoes its output; returns its
 # status. The prepare command's cwd is the caller's, and the stage is one
 # dirname above $npm_config_cache — the same handle a real dependency has.
-behave_run() { # <prepare-body> [allow-digests]
+behave_run() { # <prepare-body> [allow-digests] [allow-file]
   local prep="$BEH/prepare.sh" rc=0 out
-  printf '%s' "$1" >"$prep"
   # GITHUB_EVENT_NAME is pinned, not inherited. This suite runs on a PR, where
   # the ambient value is `pull_request` — a trigger the script refuses outright,
   # before it reaches a single control these tests are about. Inheriting it made
@@ -1492,12 +1532,14 @@ behave_run() { # <prepare-body> [allow-digests]
   # with any of them, while passing on a laptop where the variable is unset.
   # `schedule` is the trigger a real snapshot is built by, so this exercises the
   # gate's accept path rather than stepping around it.
+  printf '%s' "$1" >"$prep"
   out=$(PATH="$BEH/stub:$PATH" \
         GITHUB_EVENT_NAME=schedule \
         CACHE_PREPARE="bash '$prep'" \
         CACHE_DRY_RUN=1 \
         CACHE_ARCHIVE_OUT="$BEH/out.tar.gz" \
         CACHE_SCAN_ALLOW_DIGESTS="${2:-}" \
+        CACHE_SCAN_ALLOW_FILE="${3:-}" \
         bash "$PUBSH" 2>&1) || rc=$?
   printf '%s\n' "$out"
   return "$rc"
@@ -1543,6 +1585,53 @@ cat '"'$TMP/pem'"' >"$stage/pnpm-store/files/aa/deadbeef"
   fi
 else
   bad "behaviour: an allowlisted PEM fixture was still refused"
+fi
+
+# The same excusal, from a file. This is the form a real consumer uses — the
+# monorepo that drove this change lands 71 private-key-header hits, and a
+# variable cannot carry a package name beside each one.
+BEH_STAGE_PEM='
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/files/aa"
+cat '"'$TMP/pem'"' >"$stage/pnpm-store/files/aa/deadbeef"
+'
+printf '# ssh2@1.17.0 test/fixtures — a published test key, in the tarball on npm\n%s  # the fixture\n' \
+  "$BEH_PEM_SHA" >"$TMP/allow.txt"
+if behave_run "$BEH_STAGE_PEM" '' "$TMP/allow.txt" >"$TMP/beh.allowfile.log" 2>&1; then
+  if matches "$(cat "$TMP/beh.allowfile.log")" 'excused'; then
+    ok
+  else
+    bad "behaviour: the fixture published from a file, but no excusal was logged"
+  fi
+else
+  bad "behaviour: a PEM fixture allowlisted in a file was still refused"
+fi
+
+# A digest standing on its own authority. This is the whole point of the file
+# over the variable, so the run must die on the LIST rather than reach the scan
+# and quietly excuse it.
+printf '%s\n' "$BEH_PEM_SHA" >"$TMP/allow-bare.txt"
+if behave_run "$BEH_STAGE_PEM" '' "$TMP/allow-bare.txt" >"$TMP/beh.allowbare.log" 2>&1; then
+  bad "behaviour: an unnamed digest excused a file"
+else
+  if matches "$(cat "$TMP/beh.allowbare.log")" 'no comment naming the package'; then
+    ok
+  else
+    bad "behaviour: the unnamed digest was rejected, but not for being unnamed"
+  fi
+fi
+
+# An allowlist that is not there. Tolerated, it would excuse nothing and the
+# publish would refuse on every run — a misconfiguration that looks like a leak.
+if behave_run "$BEH_STAGE_PEM" '' "$TMP/allow-missing.txt" >"$TMP/beh.allowgone.log" 2>&1; then
+  bad "behaviour: a missing allowlist file was ignored"
+else
+  if matches "$(cat "$TMP/beh.allowgone.log")" 'names no readable file'; then
+    ok
+  else
+    bad "behaviour: the missing allowlist failed the run, but not on the file"
+  fi
 fi
 
 # THE ONE THE STATIC SUITE CANNOT SEE. A sibling whose name is the excused
