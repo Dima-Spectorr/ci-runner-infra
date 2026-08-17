@@ -210,7 +210,12 @@ run() {
   cut -f2 "$tmp/seen.tsv" | sort -u > "$tmp/seen.keys"
 
   if [ -f "$BASELINE" ]; then
-    grep -v '^\s*\(#\|$\)' "$BASELINE" | sort -u > "$tmp/base.keys"
+    # `grep -Ev` with a POSIX class, not `\s` and `\|`. Both are GNU
+    # extensions: they work on the runner and on a pool host, and they are
+    # silently literal on the BSD grep an operator reads this file with on a
+    # laptop — where a commented baseline line would become a destination key
+    # that matches nothing, so every real destination reports as new.
+    grep -Ev '^[[:space:]]*(#|$)' "$BASELINE" | sort -u > "$tmp/base.keys"
   else
     : > "$tmp/base.keys"
   fi
@@ -269,7 +274,11 @@ selftest() {
   tmp="$(mktemp -d)"
 
   entry() {  # <disposition> <direction> <ip> <port> [<asn> <country>]
-    if [ $# -ge 5 ]; then
+    # -ge 6, not -ge 5. The optional part is a PAIR, and at five arguments the
+    # branch below reads `$6` under `set -u` — an "unbound variable" from
+    # inside a fixture helper, which reads as the gate being broken rather than
+    # as the fixture being miswritten.
+    if [ $# -ge 6 ]; then
       printf '{"jsonPayload":{"disposition":"%s","rule_details":{"direction":"%s"},"connection":{"dest_ip":"%s","dest_port":%s},"remote_location":{"asn":%s,"country":"%s"}}}\n' \
         "$1" "$2" "$3" "$4" "$5" "$6"
     else
@@ -299,6 +308,17 @@ selftest() {
     entry ALLOWED EGRESS 20.201.28.151 443 36459 US
   } > "$tmp/rotate.ndjson"
   expect "an address rotation is one destination" "3	as:36459|US|443" "$tmp/rotate.ndjson"
+
+  # Identical keys arriving NON-ADJACENTLY still group. jq's `group_by` sorts
+  # before it groups, so this holds — but the claim is worth a fixture rather
+  # than a reader's memory of the jq manual, because if it were false the
+  # counts would be wrong only on real traffic (which interleaves) and never on
+  # a fixture whose matching entries happen to sit next to each other.
+  { entry ALLOWED EGRESS 140.82.121.4 443 36459 US
+    entry ALLOWED EGRESS 203.0.113.9 443 64512 RU
+    entry ALLOWED EGRESS 140.82.112.3 443 36459 US
+  } > "$tmp/interleaved.ndjson"
+  expect "interleaved keys still group"     "2	as:36459|US|443;1	as:64512|RU|443" "$tmp/interleaved.ndjson"
 
   # A different network on the same port is a different destination, which is
   # the case the whole report exists for.
