@@ -143,6 +143,48 @@ spike, because the spike is a release working. `ci_recycle_verdicts` counts
 `cordoned` and `retired` per tick: `cordoned` climbing while `retired` stays flat
 means the recycle is working and the hosts are not leaving — jobs that never end.
 
+### What is in the golden image, and whether it may ship
+
+Every warm host in this fleet boots one artifact, and until now the only account
+of its contents was `packer/ci-host-image.pkr.hcl` — which lists what was *asked
+for*, not what apt resolved, and says nothing at all about whether any of it is
+known-vulnerable. That gap has a measured cost already at one level up:
+`node_major` sat ten months past its support window because nothing was in a
+position to check it.
+
+So the build now scans itself, in this order and for a reason:
+
+1. **An SBOM of the finished filesystem** (`syft`, pinned and checksum-verified),
+   after the cleanup step, so it describes what ships rather than what the build
+   was holding. It is published to `_SBOM_BUCKET` **and** left on the image at
+   `/opt/ci-image-sbom/sbom.spdx.json` — when something is disclosed next month,
+   the question "is it in the image that pool is pinned to" has to be answerable
+   from the running host, long after the build workspace is gone.
+2. **A scan of that SBOM** (`grype`, likewise pinned).
+3. **A verdict** — `scripts/ci/image-vuln-verdict.sh`, which is where the policy
+   lives and is unit-tested against fixtures in this repo's own CI, because a
+   rule only observable inside a forty-minute image build that nobody's CI runs
+   is a rule nobody can change with confidence.
+
+The verdict blocks only on findings **with an available fix** at or above
+`_VULN_FAIL_ON` (default `critical`). Failing on something nobody can act on is
+how a gate earns an `|| true` within a month. Exceptions go in
+`docs/image-vuln-ignores.txt` and **carry an expiry date**: the day after it, the
+gate goes red and names the entry, which forces the decision again rather than
+letting the list grow quietly. A report that cannot be read, or that matched
+nothing at all, is a **failure** — never a clean image.
+
+It runs **before** the image is created, so a blocking finding means no image
+exists, rather than an image that exists and is documented as unusable. The
+report is downloaded to the build workspace *before* the failing check, because
+an aborted build is exactly the one whose report somebody needs.
+
+**Windows is not covered.** `packer/ci-host-image-win.pkr.hcl` builds a very
+different filesystem, and syft's catalogers would find almost nothing to
+enumerate on it — an SBOM listing four packages would read as "the Windows image
+is clean" while describing nothing. Saying so here is the honest state; giving
+that image a real answer is separate work, not a line in this one.
+
 ## Isolation rules (not optional)
 
 * **One repository per pool.** Warm hosts share caches between jobs; that
@@ -505,6 +547,8 @@ modules/ci-runner-host-pool/     the module consumers reference
   scripts/controller-startup.sh  poll, publish, drain
   scripts/telemetry.sh           the single metric publisher
 packer/ci-host-image.pkr.hcl     the golden image; repo-agnostic
+scripts/ci/image-vuln-verdict.sh what the image may ship with (unit-tested)
+docs/image-vuln-ignores.txt      the dated exceptions to that
 scripts/ci/lane-decision.sh      pure CI-lane rule (unit-tested)
 scripts/ci/                      self-tests
 docs/onboarding-a-repository.md  how to put a NEW repo on the fleet

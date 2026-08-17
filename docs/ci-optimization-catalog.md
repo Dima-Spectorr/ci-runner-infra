@@ -545,6 +545,49 @@ is a different key on its first packet. A new destination is a pull request
 adding a line. A tool that updated its own baseline would agree with whatever
 happened last night, including the thing it exists to catch.
 
+### 7.4 What the fleet actually RUNS ON — shipped
+
+7.1 and 7.2 both look at what a pull request pulls in. Neither looks below it.
+Every warm host in this fleet boots one golden image, and the only description
+of that image was the template that built it — a list of what was *asked for*,
+which stops being the same set the moment a transitive dependency moves, and
+which says nothing about whether any of it is known-vulnerable.
+
+That is not a hypothetical gap. `node_major` was pinned to 22 and sat ten months
+past the end of its support window before anyone noticed, and that value is
+written down in the template in plain text. Everything apt resolved underneath
+it was not written down anywhere at all.
+
+**Shipped:** the image build produces an SBOM of its own finished filesystem
+(`syft`, pinned + checksum-verified), scans it (`grype`, likewise), and refuses
+to create the image when the scan finds something **fixable** at or above
+`_VULN_FAIL_ON`. The SBOM is published to `_SBOM_BUCKET` and also left on the
+image at `/opt/ci-image-sbom/`, so a host that turns out to be affected by
+something disclosed later is answerable on the box.
+
+Three design choices, each against a specific way this kind of gate dies:
+
+- **Only fixable findings block.** A gate that fails on something nobody can act
+  on acquires an `|| true` within a month. Unfixable findings are still reported.
+- **Every exception expires.** `docs/image-vuln-ignores.txt` entries carry a
+  date; the day after it the gate goes red and names the entry. The failure mode
+  of a vulnerability gate is not missing something — it is becoming a file of
+  exceptions added under deadline and never revisited.
+- **The decision is a separate, unit-tested script.** `image-vuln-verdict.sh`
+  runs against fixtures in this repository's CI. The alternative is a policy
+  observable only inside a forty-minute image build that no consumer's CI runs —
+  which is how the `inline_shebang` defect in 7.2's neighbourhood survived.
+
+The floor starts at `critical`, not `high`, deliberately: the steady-state
+finding count for a full Ubuntu userspace plus docker, node and PowerShell is
+not yet known, and a gate that is red on its first run for reasons nobody
+intends to act on is a gate somebody removes. The reports this now publishes are
+what will justify lowering it.
+
+**Not covered:** the Windows image. syft has almost nothing to catalog on that
+filesystem, and an SBOM listing four packages would read as a clean result while
+describing nothing.
+
 ---
 
 ## 8. Governance tier — how this stays true
