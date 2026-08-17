@@ -1,6 +1,6 @@
 # Workflow gates a consuming repository copies in
 
-Five shell checks published from this repository, in the same shape and for
+Six shell checks published from this repository, in the same shape and for
 the same reason as `check-merge-queue-single-step.sh`: the rule is written once
 where the fleet is defined, self-tested here, and copied into each consumer so
 it runs in that consumer's own required check.
@@ -9,18 +9,19 @@ it runs in that consumer's own required check.
 |---|---|
 | `scripts/ci/check-runner-policy.sh` | which pool a job may claim, and for how long |
 | `scripts/ci/check-action-pins.sh` | is every third-party action an immutable commit |
+| `scripts/ci/check-workflow-permissions.sh` | does a job say what it may do to the repository, or inherit it |
 | `scripts/ci/check-workflow-shell.sh` | does the shell INSIDE the YAML survive `bash -n` and shellcheck |
 | `scripts/ci/check-e2e-policy.sh` | does the browser suite report honestly, and fast |
 | `scripts/ci/check-generic-literals.sh` | does a customer, region or owner literal reach something copy-pasteable |
 
-All five address every finding by exact path, and all five carry `--selftest`
+All six address every finding by exact path, and all six carry `--selftest`
 fixtures that must run BEFORE the real check — a workflow gate that reads no
 workflow reports clean, and that vacuous pass is worse than no gate because it
 is believed.
 
-Three of them — the runner-policy, action-pin and workflow-shell gates — parse
-the workflow with PyYAML rather than grepping it, because each one asks a
-question about the document's *structure*. The literals gate also reads
+Four of them — the runner-policy, action-pin, workflow-shell and
+workflow-permissions gates — parse the workflow with PyYAML rather than
+grepping it, because each one asks a question about the document's *structure*. The literals gate also reads
 `.yml`/`.yaml`, and deliberately does not parse them: its question is whether a
 value appears anywhere in a file somebody will copy, which is a question about
 text, and a parse would drop the comments that are just as copy-pasteable.
@@ -379,6 +380,117 @@ in the consuming workflow rather than a silent default here.
 
 ---
 
+## `check-workflow-permissions.sh`
+
+```
+bash scripts/ci/check-workflow-permissions.sh [--selftest]
+                                    [--allow-workflow-write=<scope>]...
+                                    [--allow-inherit] [<file>...]
+```
+
+| id | Rule |
+|---|---|
+| `PERM0` | the file does not load, or the gate cannot run |
+| `PERM1` | a job's effective permission set is stated — in the job or in the workflow above it |
+| `PERM2` | a write scope sits on the job that needs it, not on every job in the file; `write-all` is never that |
+| `PERM3` | a remote reusable workflow is not handed `secrets: inherit` |
+| `PERM4` | a set chosen by an expression is reported, not passed |
+
+This is the other half of `check-action-pins.sh`. Pinning decides what code
+ARRIVES on a pool; this decides what it may do once it runs. A pinned action
+with a write token is still a write token, and on this fleet the job's
+`GITHUB_TOKEN` is readable by every step in it — including the install scripts
+of every transitive dependency the job downloads, on a warm host sitting beside
+other jobs' caches and checked-out trees.
+
+### Stated, not small
+
+PERM1 does not ask a job to hold few permissions. Plenty of jobs genuinely need
+`contents: write`, and a gate that argued otherwise would be wrong about the
+repository rather than about the workflow. It asks that the answer be IN THE
+FILE.
+
+Omit `permissions:` and the job does not get nothing — it gets the
+**repository default**, a setting that lives in a web console, that no reviewer
+of the workflow can see, and that is `read-write` for every repository created
+before GitHub changed it. An unstated set is not a small set and not a large
+one; it is an unknown one, and it changes when somebody flips a repository
+setting for an unrelated reason. A gate that guessed the default would be
+asserting something it cannot read, so it asks for the declaration instead.
+
+One workflow-level `permissions: {contents: read}` answers for every job in the
+file, so the common case costs one line. `permissions: {}` — the explicit empty
+set, and the strongest declaration there is — passes, and is deliberately not
+collapsed into "absent": doing so would fail the safest workflow in the fleet.
+
+### Placement is the finding, and that is what keeps it quiet
+
+Refusing `contents: write` outright would fail every release workflow in the
+fleet, and a gate that fails correct code gets an `|| true` on it within the
+month. What is actually wrong is a write granted at the TOP of a file that also
+contains a lint job, a docs job and a matrix of test shards: they all inherit
+it, none of them needs it, and the blast radius of any one of them is the write.
+So PERM2's finding is placement, and its fix is mechanical — move the scope down
+onto the job that uses it.
+
+A **one-job file is exempt**: there, the top of the file and the job that needs
+it are the same scope, and there is nothing to move. Both of this repository's
+own findings on the gate's first run were that shape — `apply-runner-pool.yml`
+with `id-token: write` and `publish-tag.yml` with `contents: write`, each over a
+single job — and allowlisting them would have been recording a rule that was
+wrong. It starts applying the day a second job is added, which is the day the
+grant starts reaching something that does not need it.
+
+`write-all` is a finding at any job count. It is every scope at once, and "the
+job needs it" is never true of every scope.
+
+`--allow-workflow-write=<scope>` exempts one scope a consumer has decided to
+grant file-wide. Like `--allow=<owner>` on the pin gate, it is a visible
+argument in the consuming workflow rather than a silent default here, and it is
+per scope: declaring `contents` does not quietly accept the `id-token` beside
+it, which is the one that exchanges for cloud credentials on this fleet.
+
+### The token is not the only thing a call hands over
+
+`permissions:` governs `GITHUB_TOKEN` and says nothing about the repository's
+other secrets. `secrets: inherit` on a call to
+`owner/repo/.github/workflows/x.yml@<sha>` hands every one of them to a workflow
+this repository does not define and whose diff nobody here reviews — the token
+can be narrowed to `{}` and that call still passes the signing key. PERM3 asks
+for the secrets to be named. A LOCAL callee (`./.github/workflows/x.yml`) is
+this repository's own tree at this repository's own commit, reviewed in the same
+pull request, and is exempt for the same reason `./…` is exempt from PIN1.
+
+It does not read a remote callee's own `permissions:`. GitHub will not let a
+callee widen what the caller granted, so the caller's declaration is the
+ceiling, and the ceiling is what is checked.
+
+### Why it parses
+
+`permissions:` appears in `run:` scripts, in `with:` values and in comments. A
+fixture asserts that `echo "permissions: write-all"` inside a shell heredoc is
+PERM1 — unstated — and not PERM2: failing a repository for a string in a shell
+script is how a gate gets deleted rather than fixed.
+
+The parser's **exit status** is checked separately from its output, and a file
+it read but emitted no verdict for is `PERM0`, not clean. Records are emitted
+with a `-` placeholder in every otherwise-empty column: `read` with
+`IFS=$'\t'` still treats a tab as IFS *whitespace* and collapses a run of them,
+so one empty field silently shifts every field after it. That bug was live in
+the first draft — `secrets` arrived where the callee belonged, and PERM3 could
+not fire at all. It was caught by a fixture, which is the argument for the
+fixtures.
+
+### What it cannot decide
+
+Whether a job that legitimately holds `contents: write` deserves it. That is a
+review question about intent, and a gate that guessed would be wrong in the
+direction that matters. And `permissions: ${{ fromJSON(inputs.perms) }}` is a
+value it cannot resolve — PERM4 reports it as undecided rather than passing it,
+the rule RUNNER5 and PIN4 already follow.
+
+---
+
 ## `check-workflow-shell.sh`
 
 ```
@@ -597,7 +709,7 @@ so the placeholder shape stays legible for free.
 
 ## Adopting them
 
-1. Copy the scripts into the consumer's `scripts/ci/` — the three workflow
+1. Copy the scripts into the consumer's `scripts/ci/` — the four workflow
    gates always, and `check-e2e-policy.sh` if the repository has (or is about to
    have) a browser suite.
 2. Wire the steps into the job behind the aggregate required check, **fixtures
@@ -612,6 +724,10 @@ so the placeholder shape stays legible for free.
         run: bash scripts/ci/check-action-pins.sh --selftest
       - name: action pins
         run: bash scripts/ci/check-action-pins.sh
+      - name: workflow permissions self-test
+        run: bash scripts/ci/check-workflow-permissions.sh --selftest
+      - name: workflow permissions
+        run: bash scripts/ci/check-workflow-permissions.sh
       - name: workflow shell self-test
         run: bash scripts/ci/check-workflow-shell.sh --selftest
       - name: workflow shell
