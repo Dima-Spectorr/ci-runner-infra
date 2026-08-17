@@ -1010,6 +1010,33 @@ slot user, every one fatal:
   do) rather than a proxy for it (whether a socket opens).
 * That same token **cannot** write a time series — assert a `403` from
   `monitoring.timeSeries.create`. The demand metric is what scales the pool.
+* **Added 2026-08-17 (issue #157): that same token still *can* mint a token for
+  the job service account — assert a `200` from
+  `iamcredentials.generateAccessToken`.** This is the one positive control in
+  the list, and the two bullets above depend on it. A negative assertion cannot
+  distinguish "correctly refused" from "there was nothing to refuse": Secret
+  Manager answers `403` for a resource the caller may not read *and* for one
+  that does not exist, so a misspelled or renamed `ci-app-key-secret` scores
+  exactly like a properly reduced identity — and so does a host whose token can
+  do nothing at all. The impersonation grant is the single capability §3A leaves
+  the Windows host account, so proving it is live proves the refusals beside it
+  were IAM decisions rather than absences.
+
+  Two consequences worth stating rather than rediscovering. It is the only
+  assertion in the payload whose subject is an **IAM binding**, which does not
+  always take effect the instant the apply that created it returns — so it, and
+  only it, is retried (three attempts, ten seconds apart, the count carried into
+  the finding). And a pool that configures **no** job service account has no
+  impersonation to prove: the payload omits the call rather than disabling it,
+  and a verdict from such a pool that carries a status anyway is treated as
+  payload-versus-configuration drift, which is a finding.
+
+  This does **not** close the wrong-secret-name gap by itself — nothing the host
+  can ask distinguishes a 403-for-absent from a 403-for-denied. The pool has a
+  separate witness for that: the controller reads the **same**
+  `ci-app-key-secret` metadata value to mint registration tokens, so a wrong
+  name means no host on the pool ever registers, loudly. What the positive
+  control removes is the case where the probe itself is measuring nothing.
 * ~~No instance attribute contains a credential: assert that the
   registration-token key is **absent** by the time the probe runs.~~ **Amended
   during PR 5b (2026-08-17): the probe cannot assert this, and the witness moved
