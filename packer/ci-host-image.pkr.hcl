@@ -130,6 +130,52 @@ variable "node_major" {
   default     = "24"
 }
 
+variable "vuln_fail_on" {
+  type        = string
+  description = <<-EOT
+    Severity floor at which a FIXABLE vulnerability in the finished image stops
+    the build: critical | high | medium | low.
+
+    "critical" is the default, and it is deliberately not "high". This gate is
+    new and the image carries a full Ubuntu userspace plus docker, node and
+    PowerShell — a floor set below the level anyone would actually act on makes
+    the build red on the first run, and a build that is red for reasons nobody
+    intends to fix is a build somebody removes the gate from. Lower it once the
+    steady-state finding count is known, which is a thing the reports this build
+    now publishes will tell you.
+  EOT
+  default     = "critical"
+}
+
+# Pinned scanners. The VERSION and the CHECKSUM move together, always: bumping
+# one without the other either fails the build with a checksum mismatch (the
+# good case) or, if both are left stale, silently keeps scanning with a tool
+# whose vulnerability matching logic is a year old.
+#
+# The checksums are the published ones from each release's `*_checksums.txt`,
+# for the linux_amd64 tarball. They are not a nicety here: the scanner runs as
+# root inside the image build with network access, so an unverified download is
+# a supply-chain hole inside the thing that exists to close supply-chain holes.
+variable "syft_version" {
+  type    = string
+  default = "1.51.0"
+}
+
+variable "syft_sha256" {
+  type    = string
+  default = "2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f"
+}
+
+variable "grype_version" {
+  type    = string
+  default = "0.117.0"
+}
+
+variable "grype_sha256" {
+  type    = string
+  default = "38525dab1e06f162ebaa02f94d82d1f807076b011a44180cf2777edf1a7b9c26"
+}
+
 variable "warm_cache_script" {
   type        = string
   description = <<-EOT
@@ -521,6 +567,160 @@ build {
       # build identity's authorized_keys inside an image N hosts boot from.
       "rm -rf /var/lib/apt/lists/* /home/*/.ssh /root/.ssh /var/log/*.log",
       "truncate -s 0 /etc/machine-id",
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
+  # ── 9-14: what is actually IN this image, and whether it may ship ───────────
+  #
+  # Everything above installs; nothing above records. The fleet has been booting
+  # an image whose contents were describable only by re-reading this file — and
+  # this file lists what was ASKED for, not what apt resolved, which is a
+  # different set the moment a transitive dependency moves. `node_major` sat at
+  # 22 for ten months past its support window and nothing noticed, which is the
+  # same shape one level up: an unstated version nobody was in a position to
+  # check.
+  #
+  # So: an SBOM of the finished filesystem, a scan of that SBOM, and a gate that
+  # refuses to produce the image when the scan finds something fixable at or
+  # above the floor. The gate runs BEFORE the image is created, deliberately —
+  # a blocking finding means no image exists at all, rather than an image that
+  # exists and is documented as unusable, which is an image somebody pins.
+  #
+  # THE ORDER MATTERS AND IS NOT THE OBVIOUS ONE. The artifacts are downloaded
+  # to the build workspace (12) BEFORE the failing check (14): a build that
+  # aborts is exactly the build whose report someone needs to read, and a
+  # provisioner that fails ends the run with everything still on a VM that is
+  # then destroyed.
+  #
+  # This runs AFTER the cleanup above, so the SBOM describes the filesystem that
+  # ships rather than one with build leftovers in it. Steps 9-12 are themselves
+  # leftovers by that standard, and 13 removes them.
+
+  # 9. Pinned scanners, checksum-verified. See the syft_/grype_ variables.
+  provisioner "shell" {
+    inline_shebang = "/bin/bash -e"
+    inline = [
+      "set -euxo pipefail",
+      "cd /tmp",
+      "curl -fsSL -o syft.tgz \"https://github.com/anchore/syft/releases/download/v${var.syft_version}/syft_${var.syft_version}_linux_amd64.tar.gz\"",
+      "echo '${var.syft_sha256}  syft.tgz' | sha256sum -c -",
+      "curl -fsSL -o grype.tgz \"https://github.com/anchore/grype/releases/download/v${var.grype_version}/grype_${var.grype_version}_linux_amd64.tar.gz\"",
+      "echo '${var.grype_sha256}  grype.tgz' | sha256sum -c -",
+      "tar xzf syft.tgz syft && tar xzf grype.tgz grype",
+      "install -m 0755 syft grype /usr/local/bin/",
+      "rm -f syft grype syft.tgz grype.tgz",
+      "syft version && grype version",
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
+  # 10. The verdict script and its exception list, uploaded from this repo so the
+  #     decision is reviewed in version control rather than typed into an inline
+  #     block. Uploaded to /tmp as the SSH user; step 11 reads them as root.
+  provisioner "file" {
+    source      = "../scripts/ci/image-vuln-verdict.sh"
+    destination = "/tmp/image-vuln-verdict.sh"
+  }
+
+  provisioner "file" {
+    source      = "../docs/image-vuln-ignores.txt"
+    destination = "/tmp/image-vuln-ignores.txt"
+  }
+
+  # 11. SBOM, scan, verdict — recorded, not enforced. The enforcement is step 14,
+  #     after the artifacts are safely off the VM and the scanners are gone.
+  provisioner "shell" {
+    inline_shebang = "/bin/bash -e"
+    inline = [
+      "set -euxo pipefail",
+      "D=/tmp/ci-image-scan",
+      "mkdir -p $D",
+
+      # WHAT IS EXCLUDED, AND WHY IT IS NOT A LOOPHOLE.
+      #
+      # /proc, /sys, /dev and /run are kernel surfaces, not image content, and
+      # cataloguing them wastes minutes for nothing.
+      #
+      # /opt/ci-cache and /opt/ci-images are excluded on a real judgement: they
+      # are per-repository dependency content supplied by a consumer's warm
+      # script, they are re-hydrated at boot from the pool's own snapshot (so
+      # what is baked here is not what a host runs with), and nothing this build
+      # can do would fix a finding in them. Cataloguing them would bury the host
+      # baseline — the thing this gate exists to hold — under thousands of
+      # entries the image owner cannot act on, which is precisely how a scan
+      # becomes noise. The cache has its own controls: the seal in 6b, and
+      # cache_master_is_hostile() at boot.
+      #
+      # /tmp is excluded because this scan is running out of it.
+      "syft scan dir:/ -o spdx-json=$D/sbom.spdx.json -o syft-json=$D/sbom.syft.json --exclude './proc/**' --exclude './sys/**' --exclude './dev/**' --exclude './run/**' --exclude './tmp/**' --exclude './var/lib/docker/**' --exclude './opt/ci-cache/**' --exclude './opt/ci-images/**'",
+
+      # The DB cache lands under /tmp, not under root's home, so step 12 removing
+      # /tmp is enough to keep a 200MB vulnerability database out of the image.
+      "export GRYPE_DB_CACHE_DIR=$D/db",
+      # No --fail-on here on purpose: grype decides what it FOUND, the verdict
+      # script decides what BLOCKS. Keeping those apart is what makes the
+      # blocking rule testable off a fixture (19 of them, run in CI) instead of
+      # only observable during a forty-minute image build.
+      "grype sbom:$D/sbom.syft.json -o json --file $D/grype.json",
+
+      "rc=0",
+      "bash /tmp/image-vuln-verdict.sh --report $D/grype.json --fail-on ${var.vuln_fail_on} --ignores /tmp/image-vuln-ignores.txt > $D/verdict.txt 2>&1 || rc=$?",
+      "echo $rc > $D/verdict.rc",
+      "cat $D/verdict.txt",
+      "rm -rf $D/db",
+
+      # The SBOM ships INSIDE the image as well as out to the build. A running
+      # host that turns out to be affected by something disclosed next month is
+      # then answerable on the box — `image_version` alone tells an operator
+      # which build it was, not what is in it, and the build workspace is gone.
+      "install -d -m 0755 /opt/ci-image-sbom",
+      "install -m 0644 $D/sbom.spdx.json /opt/ci-image-sbom/sbom.spdx.json",
+      "install -m 0644 $D/verdict.txt /opt/ci-image-sbom/verdict.txt",
+      # Step 14 reads this one. It has to survive step 13 deleting /tmp, and a
+      # missing file there is treated as a failure rather than as a pass.
+      "install -m 0644 $D/verdict.rc /opt/ci-image-sbom/verdict.rc",
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
+  # 12. Retrieve the artifacts BEFORE anything can fail. `../image-scan/` is
+  #     relative to packer's working directory (packer/), so this lands in the
+  #     Cloud Build workspace root, where the publish step picks it up.
+  provisioner "file" {
+    direction   = "download"
+    source      = "/tmp/ci-image-scan/"
+    destination = "../image-scan/"
+  }
+
+  # 13. Un-ship the scanners. They were installed after the cleanup step, so
+  #     without this the image carries syft, grype and the scan's scratch tree —
+  #     two root-owned binaries that nothing at runtime needs and that would
+  #     themselves age out of support unnoticed.
+  provisioner "shell" {
+    inline = [
+      "set -eux",
+      "rm -f /usr/local/bin/syft /usr/local/bin/grype",
+      "rm -rf /tmp/ci-image-scan /tmp/image-vuln-verdict.sh /tmp/image-vuln-ignores.txt",
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
+  # 14. Now fail, if the verdict said to.
+  #
+  #     A separate provisioner from the scan itself so that the two things it
+  #     depends on — the artifacts being downloaded, the scanners being removed —
+  #     have already happened. Reading a recorded exit code rather than re-running
+  #     the decision keeps there being exactly one verdict per build.
+  provisioner "shell" {
+    inline = [
+      "set -eux",
+      # /opt/ci-image-sbom/verdict.txt, not the deleted scratch copy: 13 removed
+      # /tmp, and the verdict is worth printing again next to the failure rather
+      # than making somebody scroll a forty-minute log.
+      "rc=$(cat /opt/ci-image-sbom/verdict.rc 2>/dev/null || echo 9)",
+      "if [ \"$rc\" != 0 ]; then echo '=== image vulnerability verdict: BLOCKING ==='; cat /opt/ci-image-sbom/verdict.txt; echo \"No image will be created. Fix the finding, or add a dated line to docs/image-vuln-ignores.txt.\"; exit 1; fi",
+      "echo 'image vulnerability verdict: clear'",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }

@@ -133,6 +133,18 @@ jobs:
           [ "$n" -gt 0 ] || { echo "::error::no packer template was parsed"; exit 1; }
           echo "parsed $n packer template(s)"
 
+      # The image now scans itself and refuses to be created when the scan finds
+      # something fixable at or above the floor. That refusal is a DECISION —
+      # which findings block, which ignores are still live, what an unreadable
+      # report means — and the only place it would otherwise be observable is
+      # forty minutes into an image build that nobody's CI runs. So the decision
+      # lives in a script with no grype and no image behind it, and the fixtures
+      # exercise it here: a fixable critical, an unfixable one, a live ignore, an
+      # ignore a day past its expiry, an unreadable report, and a report that
+      # matched nothing at all — which is a failure, not a clean image.
+      - name: image vulnerability verdict self-test
+        run: bash scripts/ci/image-vuln-verdict.sh --selftest
+
       # Those three sweeps read `*.sh` and `run:` blocks, and are blind to a
       # `.ps1`. Windows hosts are driven by PowerShell, so the fleet is about to
       # grow code that no gate in this file can read. These three steps land one
