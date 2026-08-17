@@ -460,7 +460,7 @@ bound whenever that sweep ran out of budget.
 distinguish from "the pool is idle".
 
 `scripts/ci/ensure-alert-policies.sh --project <id> --email <addr>` brings one
-project's policies up to the fleet's, idempotently. Two of the eight watch the
+project's policies up to the fleet's, idempotently. Two of the nine watch the
 cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it
 below the pool's `cache_snapshot_max_age_hours`, or the first notice anyone gets
 is every host starting cold) and *hydrate failing on a configured pool*, which
@@ -469,6 +469,25 @@ Both are evaluated over a wide alignment window with no `duration`, unlike the
 controller policies: their series appear once per boot, and asking a sporadic
 series to hold a condition for ten minutes silences exactly the pool with few
 boots and every one of them broken.
+
+The ninth watches the egress record. `modules/ci-runner-network` logs the runner
+firewall rules, so a refused outbound connection is now an entry rather than a
+test client hanging until the job times out; a log-based metric counts those and
+*egress refused* pages on a sustained run. The refusals are the alertable half.
+The **allowed** destinations are the interesting half and no threshold can
+express them — "somewhere new" is not "more" — so they are a diff instead:
+
+```
+scripts/ci/egress-destinations.sh --project <id> --fail-on-new
+```
+
+reads the window, keys each destination by the owning network rather than the
+address (`as:36459|US|443` — a CDN rotation is one destination, a rented VPS is
+a different ASN on the first packet) and reports anything absent from the
+project's committed baseline under `docs/egress-baselines/`. A new destination
+is then a pull request adding a line, reviewed by somebody who knows whether the
+pool should be talking to it. `--update-baseline` seeds a pool's first one, and
+seeding it is an act of review rather than a formality.
 
 ## Layout
 
@@ -497,6 +516,10 @@ scripts/ci/check-action-pins.sh  every third-party action pinned to a commit
 scripts/ci/check-workflow-permissions.sh
                                  what a job may do to the repo, stated not inherited
 scripts/ci/check-e2e-policy.sh   does a consumer's browser suite report honestly, and fast
+scripts/ci/egress-destinations.sh
+                                 where the pool connected out to, diffed against
+                                 a reviewed baseline
+docs/egress-baselines/           that baseline, one file per project
 docs/ci-workflow-gates.md        those gates: rules, flags, how to adopt
 docs/ci-lane-model.md            the lane contract consumers adopt
 docs/ci-merge-queue-baseline.md  one CI run per PR: the queue config + gate
