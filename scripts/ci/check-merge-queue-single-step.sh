@@ -18,6 +18,14 @@
 #     4. SINGLE-STEP CI — `merge_conditions` is EMPTY or IDENTICAL to
 #        `queue_conditions`
 #
+#   That is Tier 0, and it is what `MPC_MAX=1` / `BATCH_MAX=1` below assert. A
+#   repository whose queue is genuinely its bottleneck raises those two
+#   constants into Tier 1 — see `docs/ci-merge-queue-baseline.md` for the
+#   measurement that justifies the move, and for why the knob to raise is
+#   `batch_size` and never `max_parallel_checks`. The logic is the same in both
+#   tiers; only the two numbers differ, so a diff against this canonical copy
+#   stays a two-liner.
+#
 #   The evidence is in the Mergify payload: a two-step pull request carries
 #   `speculative_check_pr: <n>` and shows a `mergify/merge-queue/*` workflow run
 #   alongside its own (measured on DataRetrival #2383, 2026-08-14). A single-step
@@ -80,6 +88,44 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# =============================================================================
+# THE TIER. These two constants are the ONLY things a consuming repository is
+# expected to change, and changing either moves it from Tier 0 to Tier 1 in
+# docs/ci-merge-queue-baseline.md. Everything else in this file is identical
+# across the fleet, so a diff against the canonical copy stays a two-liner.
+#
+# TIER 0 (both 1) — in place, one CI run per pull request. The default, and
+# right for every repository whose queue is not its bottleneck: twelve of
+# thirteen, surveyed 2026-08-17.
+#
+# TIER 1 — validation moves to a throwaway `mergify/merge-queue/<sha>` draft.
+# Justified only by the measurement in the baseline: merge cadence slower than
+# one CI run, so the queue rather than CI is what pull requests wait on.
+#
+# THEY ARE NOT THE SAME KIND OF NUMBER, and conflating them is the mistake this
+# gate exists to stop. Queue throughput is `batch_size × max_parallel_checks`,
+# but the RUNNER BILL is `max_parallel_checks` alone — each parallel check is
+# another concurrent CI run, while each extra pull request in a batch rides a
+# run already happening.
+#
+#   MPC_MAX   costs runners, LINEARLY, from a pool SHARED with every other
+#             repository. Raising it is a fleet-level change: recompute
+#             `Σ(max_parallel_checks × peak runners per run) <= runners ONLINE`
+#             in the same pull request, and online is not the autoscaler
+#             ceiling — the MIG is opportunistic and scale-up lags a burst.
+#   BATCH_MAX costs no runners at all. It is bounded by the BISECT: isolating
+#             one culprit from N takes ceil(log2(N)) further draft runs, which
+#             every pull request in the batch waits through.
+#
+# Wanting more throughput is an argument for BATCH_MAX. It is never an argument
+# for MPC_MAX.
+MPC_MAX=1
+BATCH_MAX=1
+# =============================================================================
+
+# ceil(log2(n)) for n >= 1, in integer shell arithmetic.
+ceil_log2() { local n="$1" r=0 p=1; while [ "$p" -lt "$n" ]; do p=$((p * 2)); r=$((r + 1)); done; printf '%s' "$r"; }
 
 fail=0
 # Every diagnostic carries its check id. The self-test asserts the ID SET a
@@ -295,6 +341,7 @@ KNOWN_KEYS = set(GUARDED_KEYS) | {
     "delete_head_branch", "dismiss_reviews", "edit", "github_actions", "rebase",
     "request_reviews", "squash", "update", "commit_message_template",
     "disallow_checks_interruption_from_queues", "allow_inplace_checks",
+    "batch_max_failure_resolution_attempts", "min", "max",
 }
 
 
@@ -328,6 +375,7 @@ LEGAL_KEYS = {
         "merge_method", "update_method", "queue_branch_merge_method",
         "branch_protection_injection_mode", "allow_inplace_checks",
         "disallow_checks_interruption_from_queues", "commit_message_template",
+        "batch_max_failure_resolution_attempts",
     },
     "merge_protections_settings": {"auto_merge_conditions", "autoqueue"},
 }
@@ -1104,14 +1152,31 @@ scan_file() {
     mpc="$(val_at merge_queue.max_parallel_checks)"
     if [ -z "$mpc" ]; then
       err CHECK1 "\`.mergify.yml\` declares no \`merge_queue.max_parallel_checks\`. Left unset it inherits a vendor default above 1, and parallel queue checks are performed on throwaway \`mergify/merge-queue/<sha>\` branches — a second full CI run per pull request."
-    elif [ "$mpc" != "1" ]; then
-      err CHECK1 "\`merge_queue.max_parallel_checks\` is \`$mpc\`, not 1. Anything above 1 makes Mergify check on throwaway \`mergify/merge-queue/<sha>\` branches instead of in place, which re-runs every \`pull_request\` workflow a second time."
+    elif [ "$(kind_at merge_queue.max_parallel_checks)" != "int" ]; then
+      err CHECK1 "\`merge_queue.max_parallel_checks\` is a \`$(kind_at merge_queue.max_parallel_checks)\`, not a whole number. Mergify rejects the file, so nothing queues."
+    elif [ "$mpc" -lt 1 ]; then
+      err CHECK1 "\`merge_queue.max_parallel_checks\` is \`$mpc\`. The smallest legal width is 1."
+    elif [ "$mpc" -gt "$MPC_MAX" ]; then
+      err CHECK1 "\`merge_queue.max_parallel_checks\` is \`$mpc\`, above this repository's ceiling of $MPC_MAX. Above 1, Mergify stops checking in place and validates on throwaway \`mergify/merge-queue/<sha>\` branches — a second CI run — and the width is how many of those run AT ONCE, so it multiplies the runners drawn from a pool shared with every other repository on the fleet. If the intent is more throughput, raise \`batch_size\` instead: a batch is validated by ONE draft run whatever its size, so batching buys throughput for no extra runners while the width costs a full concurrent run each. Raising \`MPC_MAX\` in this script is a fleet-capacity decision — recompute \`Σ(max_parallel_checks × peak runners per run)\` against runners ONLINE, in the same pull request."
     fi
   fi
 
   # --- CHECK 2: batch_size, once per rule ------------------------------------
   # Per rule, because the default is inherited PER RULE. A whole-file count says
   # `batch_size: 1` exists; the rule that omitted it still batches.
+  #
+  # Two legal shapes: a plain int, or a `{min, max}` mapping for dynamic
+  # batching. Both are read, and the ceiling applies to the largest batch the
+  # shape can produce.
+  #
+  # Above 1 the check also enforces the PAIRING. When a batch fails, Mergify
+  # bisects it — splitting and re-checking halves until a single-pull-request
+  # batch fails — and `batch_max_failure_resolution_attempts` caps the splits.
+  # Unset means UNLIMITED: one flaky test becomes an unbounded chain of draft
+  # runs. Too small ends the bisect with pull requests still unseparated, and
+  # Mergify dequeues all of them, so a pull request that never failed anything
+  # is thrown out for a neighbour's bug. Isolating one of N takes ceil(log2(N))
+  # splits, which is exactly the floor asserted below.
   rules="$(paths_re '^queue_rules\\[[0-9]+\\]' | sed -E 's/^(queue_rules\[[0-9]+\]).*/\1/' | sort -u)"
   if [ -z "$rules" ]; then
     err CHECK2 "\`.mergify.yml\` declares no \`queue_rules\`. Mergify then supplies its own defaults, which batch pull requests together and validate the batch on a throwaway queue branch — the second CI run this gate exists to prevent."
@@ -1119,10 +1184,45 @@ scan_file() {
     while read -r r; do
       [ -n "$r" ] || continue
       b="$(val_at "$r.batch_size")"
-      if [ -z "$b" ]; then
+      bk="$(kind_at "$r.batch_size")"
+      hi=""
+      if ! has_path "$r.batch_size"; then
         err CHECK2 "queue rule \`$r\` declares no \`batch_size\`. It inherits the batching default, and a batch is validated on a throwaway \`mergify/merge-queue/<sha>\` branch — every \`pull_request\` workflow runs a second time for any pull request this rule admits, whatever the other rules declare."
-      elif [ "$b" != "1" ]; then
-        err CHECK2 "queue rule \`$r\` sets \`batch_size: $b\`. Any batch larger than 1 is checked on a throwaway \`mergify/merge-queue/<sha>\` branch, re-running every \`pull_request\` workflow, and a failure anywhere in the batch sends every member back through CI."
+      elif [ "$bk" = "int" ]; then
+        if [ "$b" -lt 1 ]; then
+          err CHECK2 "queue rule \`$r\` sets \`batch_size: $b\`. The smallest legal batch is 1."
+        elif [ "$b" -gt "$BATCH_MAX" ]; then
+          err CHECK2 "queue rule \`$r\` sets \`batch_size: $b\`, above this repository's ceiling of $BATCH_MAX. The cost of a larger batch is not runners, it is BLAME: when the batch fails, every member waits through the bisect, and the wider the batch the longer that takes. Raise \`BATCH_MAX\` in this script only alongside the measurement in \`docs/ci-merge-queue-baseline.md\`."
+        else
+          hi="$b"
+        fi
+      elif [ "$bk" = "map" ]; then
+        lo="$(val_at "$r.batch_size.min")"
+        mx="$(val_at "$r.batch_size.max")"
+        if [ "$(kind_at "$r.batch_size.min")" != "int" ] || [ "$(kind_at "$r.batch_size.max")" != "int" ]; then
+          err CHECK2 "queue rule \`$r\` gives \`batch_size\` as a mapping but not as \`{min: <int>, max: <int>}\`. Mergify rejects the file and NOTHING queues."
+        elif [ "$lo" -lt 1 ]; then
+          err CHECK2 "queue rule \`$r\` sets \`batch_size.min: $lo\`. The smallest legal batch is 1."
+        elif [ "$mx" -lt "$lo" ]; then
+          err CHECK2 "queue rule \`$r\` sets \`batch_size\` to \`{min: $lo, max: $mx}\` — the maximum is below the minimum, which is not a range."
+        elif [ "$mx" -gt "$BATCH_MAX" ]; then
+          err CHECK2 "queue rule \`$r\` sets \`batch_size.max: $mx\`, above this repository's ceiling of $BATCH_MAX. The cost of a larger batch is not runners, it is BLAME: when the batch fails, every member waits through the bisect, and the wider the batch the longer that takes. Raise \`BATCH_MAX\` in this script only alongside the measurement in \`docs/ci-merge-queue-baseline.md\`."
+        else
+          hi="$mx"
+        fi
+      else
+        err CHECK2 "queue rule \`$r\` sets \`batch_size\` to a \`$bk\`. Mergify accepts a whole number or a \`{min, max}\` mapping and rejects anything else, taking the whole file with it."
+      fi
+      if [ -n "$hi" ] && [ "$hi" -gt 1 ]; then
+        need="$(ceil_log2 "$hi")"
+        a="$(val_at "$r.batch_max_failure_resolution_attempts")"
+        if ! has_path "$r.batch_max_failure_resolution_attempts"; then
+          err CHECK2 "queue rule \`$r\` batches up to $hi pull requests but declares no \`batch_max_failure_resolution_attempts\`. Unset means UNLIMITED bisection: one flaky test in a batch becomes an unbounded chain of draft runs, each a full CI run, while every pull request in the batch waits. Declare at least $need — ceil(log2($hi)), the splits it takes to isolate one culprit from $hi."
+        elif [ "$(kind_at "$r.batch_max_failure_resolution_attempts")" != "int" ]; then
+          err CHECK2 "queue rule \`$r\` sets \`batch_max_failure_resolution_attempts\` to a \`$(kind_at "$r.batch_max_failure_resolution_attempts")\`, not a whole number. Mergify rejects the file and nothing queues."
+        elif [ "$a" -lt "$need" ]; then
+          err CHECK2 "queue rule \`$r\` batches up to $hi pull requests but allows only $a failure-resolution attempt(s). Isolating one culprit from $hi takes $need splits, so the bisect ends early with pull requests still unseparated — and Mergify dequeues ALL of them, throwing out ones that never failed anything. Raise it to at least $need, or lower the batch."
+        fi
       fi
     done <<EOF
 $rules
@@ -1364,6 +1464,56 @@ selftest() {
   expect no-mpc CHECK1 "$(printf '%s' "$CLEAN" | sed 's/merge_queue:\\n  max_parallel_checks: 1\\n//')" || return 1
   expect mpc-5 CHECK1 "$(printf '%s' "$CLEAN" | sed 's/max_parallel_checks: 1/max_parallel_checks: 5/')" || return 1
   expect batch-5 CHECK2 "$(printf '%s' "$CLEAN" | sed 's/batch_size: 1/batch_size: 5/')" || return 1
+  # The `{min, max}` shape. A whole-file text search for `batch_size: <n>` finds
+  # nothing here, which is how an unbounded range passes for compliance —
+  # measured live on the fleet 2026-08-17, one repository was batching five deep
+  # with no attempt bound and no declared width at all.
+  #
+  # NOTE the sed replacements below are spelled out with `\\n` rather than built
+  # from a printf format. `printf` would collapse `\\n` to `\n`, and GNU sed then
+  # reads `\n` in the REPLACEMENT as a real newline — producing fixtures that are
+  # merely different from the ones intended, rather than failing and saying so.
+  expect batch-range-over CHECK2 \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1\\n      max: 5/')" || return 1
+  expect batch-range-one '' \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1\\n      max: 1/')" || return 1
+  expect batch-min-above-max CHECK2 \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 3\\n      max: 2/')" || return 1
+  expect batch-map-missing-max CHECK2 \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1/')" || return 1
+  expect batch-zero CHECK2 "$(printf '%s' "$CLEAN" | sed 's/batch_size: 1/batch_size: 0/')" || return 1
+  expect batch-not-a-number CHECK2 "$(printf '%s' "$CLEAN" | sed 's/batch_size: 1/batch_size: "1"/')" || return 1
+  expect mpc-zero CHECK1 "$(printf '%s' "$CLEAN" | sed 's/max_parallel_checks: 1/max_parallel_checks: 0/')" || return 1
+  expect mpc-not-a-number CHECK1 "$(printf '%s' "$CLEAN" | sed 's/max_parallel_checks: 1/max_parallel_checks: "1"/')" || return 1
+
+  # TIER 1, exercised HERE even though this repository is Tier 0. The bisect
+  # pairing is the rule most likely to be got wrong by whoever raises the
+  # constants, and it is unreachable while BATCH_MAX is 1 — so the fixtures
+  # below raise the ceilings for their own duration. A Tier 1 repository that
+  # raises the constants for real inherits detectors these fixtures already
+  # proved, instead of shipping them untested.
+  local T0_MPC="$MPC_MAX" T0_BATCH="$BATCH_MAX"
+  MPC_MAX=3 BATCH_MAX=5
+  expect t1-mpc-at-ceiling '' "$(printf '%s' "$CLEAN" | sed 's/max_parallel_checks: 1/max_parallel_checks: 3/')" || return 1
+  expect t1-mpc-over-ceiling CHECK1 "$(printf '%s' "$CLEAN" | sed 's/max_parallel_checks: 1/max_parallel_checks: 4/')" || return 1
+  # ceil(log2(5)) is 3, so five deep needs three attempts and no fewer.
+  expect t1-batch-paired '' \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1\\n      max: 5\\n    batch_max_failure_resolution_attempts: 3/')" || return 1
+  expect t1-batch-unbounded CHECK2 \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1\\n      max: 5/')" || return 1
+  expect t1-batch-one-short CHECK2 \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1\\n      max: 5\\n    batch_max_failure_resolution_attempts: 2/')" || return 1
+  # `0` is not "unset" — it dequeues the whole batch on the first failure, which
+  # is the innocent-pull-request outcome stated the other way round.
+  expect t1-batch-attempts-zero CHECK2 \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size: 5\\n    batch_max_failure_resolution_attempts: 0/')" || return 1
+  expect t1-batch-int-paired '' \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size: 4\\n    batch_max_failure_resolution_attempts: 2/')" || return 1
+  expect t1-batch-over-ceiling CHECK2 \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size: 6\\n    batch_max_failure_resolution_attempts: 3/')" || return 1
+  # A batch of exactly 1 never bisects, so it needs no attempt bound.
+  expect t1-batch-one-unpaired '' "$CLEAN" || return 1
+  MPC_MAX="$T0_MPC" BATCH_MAX="$T0_BATCH"
   expect retries CHECK3 "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size: 1\\n    max_checks_retries: 2/')" || return 1
   # The same key QUOTED, and the same key spliced in through a merge key. Both
   # are the setting; only a parser sees either.
@@ -1684,4 +1834,4 @@ if [ "$fail" -ne 0 ]; then
   echo "FAILED — the merge queue would check pull requests on a throwaway branch, or nothing would queue them at all."
   exit 1
 fi
-echo "PASS — the queue checks in place (serial, unbatched, no retries, one anchored condition list per rule), each rule gates on CI, and auto_merge_conditions queues green pull requests without a human."
+echo "PASS — the queue is within its tier (max_parallel_checks <= $MPC_MAX, batch_size <= $BATCH_MAX with the bisect bounded, no retries, one anchored condition list per rule), each rule gates on CI, and auto_merge_conditions queues green pull requests without a human."
