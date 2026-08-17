@@ -1827,7 +1827,15 @@ daemon_probe() { # <what it tests> <launcher>
       ok
     fi
   else
-    if matches "$(cat "$log")" 'changed between the scan and|embedded credential|did not unpack'; then
+    # `could not be listed` belongs here for the same reason the other three do.
+    # The escapee overwrites the packed archive with a line of plain text, so
+    # whichever inspection reaches those bytes first is the one that refuses:
+    # the digest pin if the swap landed after the scan, `tar -tvzf` if it landed
+    # before the listing, the scan itself if it landed before that. All four are
+    # the run declining to publish a tampered archive, which is the property
+    # under test; pinning the probe to one of them made it fail whenever the
+    # race resolved a different way, and CI resolved it that way twice running.
+    if matches "$(cat "$log")" 'changed between the scan and|embedded credential|did not unpack|could not be listed'; then
       ok
     else
       bad "behaviour: the run failed, but not on a control that names why ($what)"
