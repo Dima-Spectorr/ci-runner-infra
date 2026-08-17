@@ -105,8 +105,33 @@ jobs:
           unzip -q -o /tmp/packer.zip -d /tmp/packer-bin
           /tmp/packer-bin/packer version
 
+      # ONE TEMPLATE PER INVOCATION, not `validate packer/`.
+      #
+      # A directory argument is not "check each template in here". Packer merges
+      # every *.pkr.hcl in the folder into ONE configuration, so the moment a
+      # second template became a sibling of the first — the Windows image — the
+      # shared variable names collided and this gate failed with `Duplicate
+      # variable declaration` on two templates that are each perfectly valid.
+      # The tempting fixes are both wrong: renaming the variables makes the two
+      # templates gratuitously different, and moving one into a subdirectory
+      # makes the directory argument quietly stop reading it, which is a gate
+      # that passes because it looked at nothing.
+      #
+      # Reading nothing is a failure here for the same reason it is in every
+      # other gate in this file: the loop below counts what it parsed and exits
+      # non-zero when a rename or a move leaves it with no template.
       - name: packer parses
-        run: /tmp/packer-bin/packer validate -syntax-only packer/
+        run: |
+          set -euo pipefail
+          n=0
+          for t in packer/*.pkr.hcl; do
+            [ -f "$t" ] || continue
+            echo "== $t"
+            /tmp/packer-bin/packer validate -syntax-only "$t"
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "::error::no packer template was parsed"; exit 1; }
+          echo "parsed $n packer template(s)"
 
       # Those three sweeps read `*.sh` and `run:` blocks, and are blind to a
       # `.ps1`. Windows hosts are driven by PowerShell, so the fleet is about to
@@ -183,7 +208,7 @@ jobs:
           $cfg.Run.PassThru = $true
           $cfg.Output.Verbosity = 'Detailed'
           $r = Invoke-Pester -Configuration $cfg
-          $floor = 111
+          $floor = 174
           Write-Output "pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.TotalCount) discovered"
           if ($r.TotalCount -lt $floor) {
             throw "Pester discovered only $($r.TotalCount) test(s), fewer than the $floor this suite is known to contain — the suite did not run, whatever the exit code says"
@@ -267,6 +292,16 @@ jobs:
       # mutation against the source can.
       - name: windows-host-startup self-test
         run: bash scripts/ci/windows-host-startup.selftest.sh
+
+      # The Terraform half of the same boundary. `terraform validate` below
+      # evaluates neither variable validation nor resource preconditions — both
+      # are PLAN-time — so the module's OS axis has no other gate. What it
+      # guards: a Linux pool still renders the key set it renders today, and
+      # every refusal a Windows pool needs is reachable. A Windows instance
+      # carrying `startup-script` runs no boot script at all and churns hosts at
+      # full price while every metric reads "hosts running".
+      - name: host-os guard self-test
+        run: bash scripts/ci/host-os-guard.selftest.sh
 
       # The dependency cache is the only layer here whose breakage produces no
       # error at all: a job with a misconfigured cache still passes, it just
@@ -378,6 +413,14 @@ jobs:
       # a workflow gate that reads no workflow reports clean.
       - name: runner policy self-test
         run: bash scripts/ci/check-runner-policy.sh --selftest
+
+      # …and the fixtures' own proof. A fixture asserting "this workflow
+      # produces RUNNER8" keeps passing while the detector behind it is
+      # weakened, so this mutates the gate seven ways and asserts the suite
+      # above FAILS for each. Runs after it, because a mutation "detected" by a
+      # suite that was already red asserts nothing either.
+      - name: runner policy mutation self-test
+        run: bash scripts/ci/check-runner-policy.selftest.sh
 
       # …and then this repository's own workflows. It publishes the rule, so it
       # is the first place the rule must hold. `--forks=allowed` is the strict

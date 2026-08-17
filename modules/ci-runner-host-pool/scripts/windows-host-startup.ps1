@@ -21,8 +21,13 @@
 #   phase 2  the metadata fence                                (DELETED, see below)
 #   phase 3  the job credential broker
 #   phase 4  the per-job credential reset hooks
+#   phase 6  the boot probe, run as a slot account
 #   phase 5  agent registration as a service
-#   phase 6  the boot probe                                    (not yet)
+#
+# Phase 6 RUNS BEFORE PHASE 5, and the numbers are the order they were written
+# in, not the order they execute in. A host proves the slot boundary before it
+# accepts a job or it proves nothing worth having: an agent registered first is
+# an agent that can be handed work while the proof is still running.
 #
 # THE REGISTRATION TOKEN IS READ ONCE, AND A HOST THAT CANNOT GET ONE BLOCKS
 #
@@ -65,11 +70,9 @@
 #
 # Phase 1 builds the boundary; phases 3 and 4 build what job code is given
 # INSIDE it -- a weaker credential, and a guarantee that it does not outlive the
-# job. Nothing CONSUMES the slot credentials until phase 5 registers the agents.
-#
-# Until phase 5 exists this script registers no agent, so a host running it
-# serves no jobs. That is the intended state of a half-delivered Windows pool
-# and it is why `host_os` is not yet an input to the module.
+# job. Phase 6 is the first thing that SPENDS a slot credential, and it spends it
+# on proving the boundary rather than on serving a job; phase 5 spends it on the
+# agents.
 #
 # Every phase either succeeds or the host registers nothing. There is no partial
 # host: one that came up without its broker turns every deploy step into a
@@ -168,6 +171,72 @@ $script:RunnerTemplate = 'C:\ci\bin\actions-runner'
 $script:RegistrationWaitSeconds = 300
 $script:RegistrationPollSeconds = 5
 
+# How long phase 5 waits, AFTER its agents are registered, for the controller to
+# delete the registration-token key again. Section 3A requires the host to
+# witness that deletion rather than assume it. Polled and not read once: the
+# controller deletes on `partial`, which it learns on its own tick, so a single
+# read taken the instant the last agent came up would fail on a healthy fleet.
+#
+# JITTERED, AND THE JITTER IS NOT DECORATION -- DO NOT TIDY IT INTO A CONSTANT.
+# The thing being waited on is an action by ONE controller, so every host in a
+# scale-out is waiting on the same actor. A controller that is restarting,
+# backed up, or being rate-limited by the GitHub API makes every host booting in
+# that window cross the same fixed deadline within seconds of every other one,
+# and a hiccup becomes a fleet-wide refusal to serve at the moment capacity is
+# being asked for. A slow controller is also, by a wide margin, the likelier
+# event: a token that genuinely never gets deleted needs the controller to have
+# minted one and then never seen the host register at all.
+#
+# So the bound is widened AND spread. Base 600s with up to 300s of jitter is
+# still far inside any window in which an operator would notice the host, and
+# the spread means a controller that recovers inside five minutes costs nothing.
+#
+# WHY 900s IS ACCEPTABLE AS A SECURITY BOUND AND NOT ONLY A CAPACITY ONE. The
+# argument above is entirely about availability, so on its own it would justify
+# any number at all. The security half is that this deadline does not bound the
+# EXPOSURE, only the moment containment starts. The host cannot delete its own
+# metadata; while it waits the token is readable by job code either way, and
+# section 3A already accepts that window and bounds it elsewhere -- by the
+# controller's delete on its own tick, and failing that by the registration
+# token's one-hour expiry, which is the real ceiling and is not ours to move.
+# 900s is a quarter of that ceiling. Shortening to 300s would buy at most ten
+# minutes off a sixty-minute window that section 3A has already accepted, and
+# would pay for it in the correlated case above -- the one where a slow
+# controller, not a leaked token, is what actually happened.
+#
+# What this deadline DOES bound is how long a host keeps taking new jobs after
+# the controller has visibly failed to clean up, and that is what
+# Stop-RunnerService closes at the deadline.
+$script:TokenRemovalWaitSeconds = 600
+$script:TokenRemovalJitterSeconds = 300
+
+function Get-JitteredTimeout {
+    <#
+      .SYNOPSIS
+        Spread a fixed timeout across a window, from a roll in [0,1). Pure.
+      .DESCRIPTION
+        Split out from its caller so the spread itself is testable: the failure
+        mode of jitter is a bound that silently became a constant, or one that
+        became unbounded, and neither is visible from a call site that rolls its
+        own dice. The roll is a parameter for the same reason.
+
+        Not drawn from the crypto RNG this file uses for slot passwords. Jitter
+        is a scheduling property and not a secret -- nothing is defended by an
+        attacker being unable to predict when this host gives up -- and reaching
+        for the entropy path here would suggest to the next reader that it is.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $BaseSeconds,
+        [Parameter(Mandatory = $true)][int] $JitterSeconds,
+        [Parameter(Mandatory = $true)][double] $Roll
+    )
+
+    if ($JitterSeconds -le 0) { return $BaseSeconds }
+    $bounded = [Math]::Max(0.0, [Math]::Min(1.0, $Roll))
+    return ($BaseSeconds + [int] [Math]::Floor($bounded * $JitterSeconds))
+}
+
 # How long to wait for the agent service config.cmd auto-started to stop again,
 # before its identity and environment are set. Bounded like everything else: a
 # service that will not stop is a slot that would run every job as the shared
@@ -185,7 +254,19 @@ function Write-BootLog {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Message)
     $line = '[{0}] {1}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $Message
-    Write-Output $line
+    # NOT Write-Output, and NOT Write-Host. Write-Output puts the line on the
+    # SUCCESS stream, so every function that logs and then returns a value
+    # returns the log lines PLUS the value as an object[] -- which is a
+    # boot-fatal fault, not a cosmetic one: `. $beaconPath` cannot dot-source an
+    # array, `--token` receives a timestamped log line joined to the token, and
+    # an object[] does not bind to an [IDictionary] parameter. Write-Host would
+    # be correct behaviourally and fails PSAvoidUsingWriteHost, which
+    # powershell-gate.sh runs at -Severity Error,Warning with no exclusions.
+    # [Console]::Out.WriteLine writes straight to the process's stdout handle --
+    # which is what the guest agent captures -- and can never be captured by
+    # `$x = Some-Function`. Available on .NET Framework 4.8 / Windows
+    # PowerShell 5.1, which is what runs this file.
+    [Console]::Out.WriteLine($line)
     try {
         Add-Content -Path $script:LogPath -Value $line -ErrorAction Stop
     } catch {
@@ -347,8 +428,25 @@ function Get-SlotPasswordCharacter {
     # Four bytes of entropy per character, drawn once. The modulo bias over a
     # 32-bit draw into an at-most-64-character alphabet is far below anything that
     # matters for a 40-character secret that never leaves the machine.
+    #
+    # Instance + GetBytes(byte[]), never the static one-liner that takes a
+    # Span<byte>, and never the class's own bounded-integer helper. Both of those
+    # arrived with .NET Core and have no .NET Framework overload at all. This
+    # script is handed to the guest agent as `windows-startup-script-ps1`, which
+    # the agent runs with the in-box powershell.exe -- Windows PowerShell 5.1 on
+    # .NET Framework 4.8 -- so either would throw MethodNotFound right here and
+    # every host in the pool would fail phase 1 and deny its own boot. The Pester
+    # suite runs this function under pwsh 7, where both exist, so the runtime that
+    # actually matters is the one no test covers. Create(), GetBytes(byte[]) and
+    # Dispose() are present in every .NET Framework the fleet can boot on and in
+    # .NET Core, which makes this the one form that runs in both.
     $bytes = [byte[]]::new($Length * 4)
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    } finally {
+        $rng.Dispose()
+    }
 
     $chars = [char[]]::new($Length)
     for ($i = 0; $i -lt $classes.Count; $i++) {
@@ -981,6 +1079,496 @@ function Get-SlotAgentName {
     return "$InstanceName-s$Index"
 }
 
+# --- phase 6: the boot probe, pure half ---------------------------------------
+#
+# ASSERT THE CAPABILITY, NOT THE DAEMON -- AND, HERE, ASSERT ITS ABSENCE
+#
+# Section 3A of the ADR deleted the metadata fence, so the old probe's central
+# claim -- "a slot user cannot reach the token endpoint" -- is not a property
+# this design has, and a probe asserting it would fail every boot. What replaced
+# it is stronger evidence, not weaker: the endpoint DOES answer, and the token it
+# yields is worthless. `secretmanager.versions.access` on the GitHub App key must
+# come back 403, and `monitoring.timeSeries.create` must come back 403. Those two
+# are the whole of the #1958 reduction, expressed as something a host can check
+# about ITSELF, from inside the identity it is worried about.
+#
+# It has to be checked at boot because it cannot be checked anywhere earlier.
+# Terraform cannot see the IAM a caller's service account happens to hold, so a
+# Windows pool pointed at an unreduced host identity plans clean, applies clean,
+# and is only wrong once a pull request is running on it.
+#
+# This half is pure: the payload text, the shim definition, and the verdict.
+# The harness that runs the payload as a slot user, and the Deny-Boot that acts
+# on the verdict, live further down under "phase 6: the boot probe, the
+# harness". They are separated because these functions are the ones holding the
+# decisions, and these are the ones Pester can execute on ubuntu-latest.
+
+$script:ProbeServiceName = 'ci-boot-probe'
+$script:ProbeResultPath = 'C:\ci\boot-probe.json'
+
+# The payload does NOT live under C:\ci\bin, for the reason phase 4's hooks do
+# not either: that directory is locked to SYSTEM and Administrators with no slot
+# ACE at all, and a payload the probing slot cannot read is a service that never
+# starts. It gets its own directory, and that directory is slot-WRITABLE rather
+# than slot-readable -- the shim writes `<id>.out.log` beside the config it was
+# handed, and its append path catches IOException only, so a directory the
+# service account cannot write is a service that fails in OnStart. The two files
+# inside are re-locked to read-and-execute individually afterwards.
+$script:ProbeRoot = 'C:\ci\boot-probe'
+$script:ProbeScriptPath = 'C:\ci\boot-probe\ci-boot-probe.ps1'
+$script:ProbeConfigPath = 'C:\ci\boot-probe\ci-boot-probe.xml'
+
+# Bounded, like every wait in this file. A probe that never finishes must become
+# a missing verdict -- which Get-ProbeFailure already treats as the loudest
+# finding there is -- and not a boot that hangs at warm-host size until the
+# register grace expires.
+$script:ProbeWaitSeconds = 180
+$script:ProbePollSeconds = 2
+
+function Get-ProbeSiblingWorkspace {
+    <#
+      .SYNOPSIS
+        The directory the probe tries, and must fail, to read. Pure.
+      .DESCRIPTION
+        The check being made is "this account cannot read a directory it was not
+        given", and on a multi-slot host the honest subject is another SLOT's
+        workspace. The Windows pool pins ci-slots to 1, so on almost every host
+        there is no sibling slot at all -- and Get-ProbeFailure treats a sibling
+        that was 'missing' as a FINDING, not a pass, because a path that is not
+        there proves nothing about an ACL. Handing it a nonexistent sibling would
+        therefore deny every boot in the pool.
+
+        So a single-slot host is pointed at C:\ci\bin instead. That is not a
+        weaker subject, it is a stronger one: it exists on every host this module
+        boots, phase 1 locks it to SYSTEM and Administrators with no slot ACE,
+        and it holds ci-beacon.ps1 -- the script the SCM re-executes as
+        LocalSystem on every restart. A slot that can list it is a slot one step
+        from owning SYSTEM here, which is the exact escalation the per-slot ACLs
+        exist to refuse.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [Parameter(Mandatory = $true)][int] $SlotCount,
+        [string] $SlotRoot = $script:SlotRoot,
+        [string] $FallbackRoot = $script:BinRoot
+    )
+    if ($SlotCount -ge 2) {
+        $sibling = 1
+        if ($Index -eq 1) { $sibling = 2 }
+        return (Get-SlotWorkspacePath -Index $sibling -Root $SlotRoot)
+    }
+    return $FallbackRoot
+}
+
+function Test-NegativeCapability {
+    <#
+      .SYNOPSIS
+        Does this HTTP status prove the host token CANNOT do the thing? Pure.
+      .DESCRIPTION
+        403 and nothing else. The three near-misses are each a different kind of
+        wrong and all three have to fail:
+
+        200 is the finding. The identity was not reduced, the host token still
+        reads the GitHub App key or still writes the demand metric, and every
+        repository the App is installed on is reachable from a pull request.
+
+        $null -- a DNS failure, a refused connection, a timeout -- is UNPROVED,
+        not proved. Reading it as a pass is how a boundary decays into a comment:
+        the one host where the check could not run is the one host nobody ever
+        looks at again.
+
+        401 is unproved too, and it is the subtle one. It means the request went
+        out without a usable credential, so it says nothing at all about what the
+        credential can do -- a probe whose token acquisition quietly failed
+        returns 401 for every call and would otherwise report a perfect score.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()] $StatusCode)
+    if ($null -eq $StatusCode) { return $false }
+    if ("$StatusCode" -notmatch '^[0-9]+$') { return $false }
+    return ([int] $StatusCode -eq 403)
+}
+
+function Get-ProbeFailure {
+    <#
+      .SYNOPSIS
+        Every reason this host must not register, from one probe verdict. Pure.
+      .DESCRIPTION
+        Returns an array of sentences; empty means the boot may continue. All of
+        them, not the first: a host that is wrong in three ways should say so
+        once, because the operator reading the serial console gets one look
+        before the controller reclaims the instance.
+
+        A missing or unparseable verdict is a failure with its own sentence,
+        and that is the case this function exists to get right. The probe runs as
+        an unprivileged account under a service that can fail to start; "no file"
+        and "no findings" are the same absence of output, and reporting the second
+        for the first is exactly the silent pass the whole phase exists to
+        prevent.
+
+        ExpectedIdentity is MANDATORY and has no default. Every other check here
+        reads the same for LocalSystem as for a slot -- they all query the
+        metadata server, which does not care who asks -- so without this one the
+        phase would still pass if the repoint silently did not happen, and the
+        boot log would say the slot boundary was proved by the account that owns
+        the machine. A default would make the assertion skippable by omission,
+        which is the shape of every bug this file is written against.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()] $Result,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $JobServiceAccount,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $ExpectedIdentity
+    )
+
+    if ($null -eq $Result) {
+        return , 'the probe produced no verdict at all -- nothing on this host has proved the slot boundary'
+    }
+    $fail = New-Object System.Collections.Generic.List[string]
+    $get = {
+        param($name)
+        if ($Result.PSObject.Properties.Name -contains $name) { return $Result.$name }
+        return $null
+    }
+
+    # WHO ANSWERED, before anything it answered is believed. The repoint to the
+    # slot account is the one part of phase 6 with no hardware behind it, and a
+    # probe that quietly stayed LocalSystem would otherwise pass every remaining
+    # check: they all ask the metadata server, which answers the machine, not the
+    # account.
+    #
+    # Compared on the LEAF only. WindowsIdentity.Name is `<machine>\<account>`
+    # and the machine half is the instance name, which the harness would have to
+    # re-derive to assert and which says nothing about the boundary. Case-
+    # insensitive because Windows account names are, so a case difference here
+    # would be a false denial and not a finding.
+    $ran = [string] (& $get 'runningAs')
+    $ranLeaf = $ran
+    if ($ran.Contains('\')) { $ranLeaf = $ran.Substring($ran.LastIndexOf('\') + 1) }
+    $wantLeaf = $ExpectedIdentity
+    if ($wantLeaf.Contains('\')) { $wantLeaf = $wantLeaf.Substring($wantLeaf.LastIndexOf('\') + 1) }
+    if ([string]::IsNullOrWhiteSpace($ran)) {
+        $fail.Add(('the probe did not report which account it ran as, so nothing it reports is ' +
+                'attributable to a slot -- every other check reads the same for LocalSystem'))
+    } elseif ($ranLeaf -ine $wantLeaf) {
+        $fail.Add(("the probe ran as '$ran' and not $ExpectedIdentity -- the service was never " +
+                'repointed at the slot account, so the boundary a job runs behind is untested'))
+    }
+
+    # The premise of the two checks below it. A probe that never got a host token
+    # cannot have proved anything about what a host token can do, and its two
+    # perfect 401s would read as two passes.
+    if ((& $get 'hostToken') -ne $true) {
+        $fail.Add('the probe could not obtain a host token, so neither negative capability was proved')
+    }
+    if (-not (Test-NegativeCapability -StatusCode (& $get 'secretStatus'))) {
+        $fail.Add(("secretmanager.versions.access answered '$(& $get 'secretStatus')' and not 403 -- " +
+                'this host identity can still read the GitHub App key, so a pull request on it owns ' +
+                'every repository the App is installed on'))
+    }
+    if (-not (Test-NegativeCapability -StatusCode (& $get 'metricStatus'))) {
+        $fail.Add(("monitoring.timeSeries.create answered '$(& $get 'metricStatus')' and not 403 -- " +
+                'this host identity can still write the demand series the autoscaler reads'))
+    }
+
+    # Both halves, because a broker that silently fell back to the host identity
+    # is the failure the broker exists to prevent, and it looks like a working
+    # broker from every angle except this one.
+    $email = [string] (& $get 'brokerEmail')
+    if ([string]::IsNullOrWhiteSpace($JobServiceAccount)) {
+        if (-not [string]::IsNullOrWhiteSpace($email)) {
+            $fail.Add("a broker answered as '$email' on a pool that configured no job service account")
+        }
+    } elseif ($email -cne $JobServiceAccount) {
+        # Case-sensitive on purpose. The claim being checked is "this is exactly
+        # the identity the pool configured", and -ne would accept a near-miss.
+        $fail.Add("the broker vends '$email', not $JobServiceAccount")
+    }
+
+    # Three outcomes, not two. Get-ChildItem throws identically on a denied path
+    # and on a path that is not there, so folding them together would let a
+    # sibling workspace that simply had not been created yet report as a proved
+    # ACL boundary -- the same "absence read as a pass" this function refuses
+    # for a missing verdict file.
+    #
+    # The exception type the payload recorded is APPENDED to both non-denied
+    # findings, and it is the useful half of them. Which exception 5.1 actually
+    # raises for an ACL-denied enumeration is unobserved on a real host, and the
+    # two candidates land in different arms here -- so on the first host that
+    # denies its boot over this, the finding itself says whether the ACL held
+    # and the mapping is wrong, or the ACL did not hold. Without it the operator
+    # is told the boundary is unproved and given nothing to prove it with.
+    $sibling = [string] (& $get 'siblingStatus')
+    $siblingType = [string] (& $get 'siblingErrorType')
+    $sawType = 'no exception was recorded'
+    if (-not [string]::IsNullOrWhiteSpace($siblingType)) { $sawType = "the exception was $siblingType" }
+    if ($sibling -eq 'allowed') {
+        $fail.Add('a slot could read another slot''s workspace -- the per-slot ACLs are not holding')
+    } elseif ($sibling -eq 'missing') {
+        $fail.Add('the sibling workspace was not there to read, so the per-slot ACLs were never tested ' +
+            "-- $sawType, and if that names an access denial then 5.1 reported the denial " +
+            'item-not-found-shaped and this mapping, not the ACL, is what is wrong')
+    } elseif ($sibling -ne 'denied') {
+        $fail.Add("the sibling read neither succeeded nor was denied ('$sibling') -- the per-slot " +
+            "ACLs are unproved, and $sawType")
+    }
+    if ((& $get 'cacheWritable') -ne $true) {
+        $fail.Add('the warm cache is not writable by a slot, so every job on this host repopulates it')
+    }
+    if ((& $get 'dnsResolved') -ne $true) {
+        $fail.Add('name resolution failed from a slot context, so no agent on this host could reach GitHub')
+    }
+    return $fail.ToArray()
+}
+
+function Test-ProbeLiteral {
+    <#
+      .SYNOPSIS
+        Whether a value may be interpolated into the probe payload. Pure.
+      .DESCRIPTION
+        Get-ProbeScript builds PowerShell source text, so every value it
+        interpolates is code. The secret name and the broker endpoint both come
+        from instance metadata, which section 3A of the ADR says outright is
+        readable AND writable by anything with the machine's identity -- and a
+        single apostrophe closes the literal it lands in and appends statements
+        to a payload that runs holding a live, unreduced host token. That is a
+        larger capability than the one the probe exists to disprove.
+
+        Allow-list, and throw rather than sanitize. A stripped value would still
+        build a payload, and a payload that quietly measured the wrong secret is
+        worse than a boot that stops with the reason on the console.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Value,
+        [Parameter(Mandatory = $true)][ValidateSet('name', 'endpoint', 'path', 'url')][string] $Kind
+    )
+    if ([string]::IsNullOrEmpty($Value)) { return $true }
+    switch ($Kind) {
+        'name' { return ($Value -match '^[A-Za-z0-9_-]+$') }
+        'endpoint' { return ($Value -match '^[A-Za-z0-9._-]+:[0-9]+$') }
+        'url' { return ($Value -match '^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._-]+)*$') }
+        default { return ($Value -match '^[A-Za-z]:\\[A-Za-z0-9 \\._-]*$') }
+    }
+}
+
+function Get-ProbeScript {
+    <#
+      .SYNOPSIS
+        The payload the probe runs AS A SLOT USER, as PowerShell text. Pure.
+      .DESCRIPTION
+        It records; it does not decide. Every check writes a value into one JSON
+        document and nothing in here calls Deny-Boot, because the payload runs
+        unprivileged in a service the boot script does not share a process with:
+        a verdict it reached could not be trusted, and a verdict it failed to
+        write must not be mistaken for a clean one. Get-ProbeFailure decides,
+        back in the boot script, where "no file" is a finding.
+
+        Two details are load-bearing and neither is obvious.
+
+        The payload asks the REAL metadata server, 169.254.169.254, and never the
+        broker, for the token it then tries to spend. That is the point: the
+        question is what a job can reach behind this script's back, and pointing
+        it at the closed endpoint the runner service's environment sets would
+        measure the environment block instead of the identity.
+
+        Every call is wrapped and every failure lands in the document as $null
+        rather than as an exception. A payload that throws writes nothing, which
+        Get-ProbeFailure reports as "no verdict at all" -- correct, but it names
+        the wrong problem, and the operator loses the five checks that did run.
+
+        CacheRoot is the slot's OWN workspace root. There is no host-wide warm
+        cache directory on this image -- the caches the pool exists to keep warm
+        live under each slot's profile -- so "the warm cache is writable" is
+        proved where the cache actually is, by the account that has to write it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $SecretName,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $BrokerEndpoint,
+        [Parameter(Mandatory = $true)][string] $SiblingWorkspace,
+        [Parameter(Mandatory = $true)][string] $CacheRoot,
+        [string] $ResultPath = $script:ProbeResultPath,
+        [string] $MetadataRoot = $script:MetadataRoot,
+        [int] $TimeoutSeconds = $script:HttpTimeoutSeconds
+    )
+
+    # Every one of these becomes code. See Test-ProbeLiteral for why a metadata
+    # value reaching this point unchecked is worse than the finding it looks for.
+    foreach ($pair in @(
+            @{ n = 'SecretName'; v = $SecretName; k = 'name' },
+            @{ n = 'BrokerEndpoint'; v = $BrokerEndpoint; k = 'endpoint' },
+            @{ n = 'SiblingWorkspace'; v = $SiblingWorkspace; k = 'path' },
+            @{ n = 'CacheRoot'; v = $CacheRoot; k = 'path' },
+            @{ n = 'ResultPath'; v = $ResultPath; k = 'path' },
+            @{ n = 'MetadataRoot'; v = $MetadataRoot; k = 'url' })) {
+        if (-not (Test-ProbeLiteral -Value $pair.v -Kind $pair.k)) {
+            throw ("probe $($pair.n) '$($pair.v)' is not a bare $($pair.k), so it would be " +
+                'interpolated as code into a payload that holds a host token')
+        }
+    }
+
+    # OMITTED, not disabled. A runtime `if ('')` around the broker read would
+    # leave the endpoint and the path in the payload text, where the only thing
+    # that stops them being used is a condition somebody could later "simplify".
+    # A no-broker pool's probe should not contain a broker read at all.
+    $brokerBlock = ''
+    if (-not [string]::IsNullOrWhiteSpace($BrokerEndpoint)) {
+        $brokerBlock = @"
+try {
+    `$r.brokerEmail = [string] (Invoke-RestMethod ``
+            -Uri 'http://$BrokerEndpoint/computeMetadata/v1/instance/service-accounts/default/email' ``
+            -Headers `$md -TimeoutSec $TimeoutSeconds)
+} catch { `$null = `$_ }
+"@
+    }
+
+    return @"
+`$ErrorActionPreference = 'Stop'
+`$md = @{ 'Metadata-Flavor' = 'Google' }
+`$r = [ordered] @{
+    runningAs = ''; hostToken = `$false; secretStatus = `$null; metricStatus = `$null
+    brokerEmail = ''; siblingStatus = 'unrun'; siblingErrorType = ''
+    cacheWritable = `$false; dnsResolved = `$false
+}
+
+# WHO IS ANSWERING. Every other field in this document queries the metadata
+# server and reads identically for every local account on the host, so none of
+# them say anything about the account that ran this. The process token does, and
+# it is the one claim the slot-account repoint can be checked against.
+#
+# WindowsIdentity and not `$env:USERNAME: the environment block of a service is
+# data the SCM copies in and this script's own Write-ServiceEnvironment rewrites
+# elsewhere, so it can say one thing while the process runs as another --
+# precisely the divergence being tested for. GetCurrent() reads the token the
+# access checks are actually made against. It is in every .NET Framework this
+# fleet boots on.
+try { `$r.runningAs = [string] ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) } catch { `$null = `$_ }
+
+# The real metadata server, deliberately. See Get-ProbeScript's description.
+`$tok = ''
+try {
+    `$t = Invoke-RestMethod -Uri '$MetadataRoot/instance/service-accounts/default/token' ``
+        -Headers `$md -TimeoutSec $TimeoutSeconds
+    if (`$t -and `$t.access_token) { `$tok = [string] `$t.access_token; `$r.hostToken = `$true }
+} catch { `$null = `$_ }
+
+`$project = ''
+try {
+    `$project = [string] (Invoke-RestMethod -Uri '$MetadataRoot/project/project-id' ``
+            -Headers `$md -TimeoutSec $TimeoutSeconds)
+} catch { `$null = `$_ }
+
+# A status, never a body. Both calls are EXPECTED to be refused, so the
+# interesting value is the refusal code and the payload must not be read.
+function Get-Status {
+    param(`$Uri, `$Method, `$Body)
+    try {
+        `$null = Invoke-WebRequest -Uri `$Uri -Method `$Method -Body `$Body ``
+            -ContentType 'application/json' -Headers @{ Authorization = "Bearer `$tok" } ``
+            -TimeoutSec $TimeoutSeconds -UseBasicParsing
+        return 200
+    } catch {
+        if (`$_.Exception.Response) { return [int] `$_.Exception.Response.StatusCode }
+        return `$null
+    }
+}
+
+if (`$tok -and `$project -and '$SecretName') {
+    `$r.secretStatus = Get-Status ``
+        -Uri "https://secretmanager.googleapis.com/v1/projects/`$project/secrets/$SecretName/versions/latest:access" ``
+        -Method 'GET' -Body `$null
+    # An empty series list. IAM is evaluated before the request body is, so a
+    # host that may not write gets 403 and a host that may gets 400 -- and 400
+    # is not 403, which is the finding either way.
+    `$r.metricStatus = Get-Status ``
+        -Uri "https://monitoring.googleapis.com/v3/projects/`$project/timeSeries" ``
+        -Method 'POST' -Body '{"timeSeries":[]}'
+}
+
+$brokerBlock
+
+# Denial is the pass, and 'missing' is NOT denial: Get-ChildItem throws the same
+# way for a path this account may not read and a path that is not there, so the
+# exception type is the only thing that separates a proved ACL from an untested
+# one. Get-ProbeFailure treats every value but 'denied' as a finding.
+#
+# THE TYPE NAME IS RECORDED, NOT ONLY THE VERDICT IT MAPPED TO. Which exception
+# 5.1 raises for an ACL-denied enumeration is NOT something this branch has
+# observed on a real host: it is documented as UnauthorizedAccessException and
+# it is also reported as surfacing item-not-found-shaped, and those two map to
+# opposite conclusions here -- 'denied' passes, 'missing' denies the boot on
+# every host in the pool. Guessing produces a fleet that will not boot and a
+# verdict file that does not say why. So the concrete type is carried out
+# alongside the status and Get-ProbeFailure prints it, and the first real boot
+# settles the question instead of leaving the next reader to re-derive it.
+try {
+    `$null = Get-ChildItem -LiteralPath '$SiblingWorkspace' -Force -ErrorAction Stop
+    `$r.siblingStatus = 'allowed'
+} catch {
+    `$r.siblingErrorType = [string] `$_.Exception.GetType().FullName
+    if (`$_.Exception -is [System.UnauthorizedAccessException]) {
+        `$r.siblingStatus = 'denied'
+    } elseif (`$_.Exception -is [System.Management.Automation.ItemNotFoundException]) {
+        `$r.siblingStatus = 'missing'
+    } else {
+        `$r.siblingStatus = 'error'
+    }
+}
+
+try {
+    `$probe = Join-Path '$CacheRoot' ('probe-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    Set-Content -LiteralPath `$probe -Value 'probe' -ErrorAction Stop
+    Remove-Item -LiteralPath `$probe -Force -ErrorAction SilentlyContinue
+    `$r.cacheWritable = `$true
+} catch { `$null = `$_ }
+
+try {
+    `$r.dnsResolved = [bool] ([System.Net.Dns]::GetHostEntry('github.com').AddressList.Count)
+} catch { `$null = `$_ }
+
+`$r | ConvertTo-Json -Compress | Set-Content -LiteralPath '$ResultPath' -Encoding ASCII
+"@
+}
+
+function Get-ProbeServiceConfig {
+    <#
+      .SYNOPSIS
+        The shim's service definition for the boot probe, as XML text. Pure.
+      .DESCRIPTION
+        Manual and non-restarting, and both differ from every other service this
+        file installs for the same reason: the probe is a one-shot measurement,
+        not a daemon. `Automatic` would re-run it on every reboot of a host whose
+        boot script is not running, writing a verdict nobody reads; `onfailure
+        restart` would turn a payload that cannot start into an infinite loop
+        instead of a missing file, and a missing file is precisely the signal
+        Get-ProbeFailure needs.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $ScriptPath,
+        [string] $ServiceName = $script:ProbeServiceName
+    )
+    $esc = { param($v) [System.Security.SecurityElement]::Escape([string] $v) }
+    $svc = & $esc $ServiceName
+    $shimArgs = & $esc "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`""
+    return @"
+<service>
+  <id>$svc</id>
+  <name>$svc</name>
+  <description>Proves this CI host's slot boundary from a slot's own context, once.</description>
+  <executable>powershell.exe</executable>
+  <arguments>$shimArgs</arguments>
+  <startmode>Manual</startmode>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>2</keepFiles>
+  </log>
+</service>
+"@
+}
+
 # --- phase 0 -----------------------------------------------------------------
 
 function Get-MetadataValue {
@@ -1131,6 +1719,11 @@ function Invoke-Phase0Preflight {
         JobSa          = Get-MetadataValue 'instance/attributes/ci-job-service-account'
         BrokerPort     = Get-MetadataValue 'instance/attributes/ci-job-broker-port'
         BrokerSource   = Get-MetadataValue 'instance/attributes/ci-job-broker-py'
+        # Phase 6's subject, not phase 0's. The probe asks whether THIS host's
+        # identity can still read the GitHub App key, so it needs the key's
+        # name -- and it is read here with everything else static rather than
+        # from inside the phase, for the reason Get-MetadataValue gives.
+        AppKeySecret   = Get-MetadataValue 'instance/attributes/ci-app-key-secret'
     }
 
     if ([string]::IsNullOrWhiteSpace($cfg.Owner) -or [string]::IsNullOrWhiteSpace($cfg.Repo)) {
@@ -2069,11 +2662,20 @@ function Clear-ServiceRecoveryAction {
         is safe to interpolate only because Get-RunnerServiceName refused anything
         that was not literally `actions.runner.<...>`, and it came out of a file
         the slot account can write.
+
+        AgentName is mandatory rather than optional on purpose. Get-RunnerServiceName
+        validates shape AND ownership, and ownership is the half that stops this
+        slot's recovery policy being cleared off a SIBLING slot's already-running
+        service. A default would make the re-check here weaker than the one the
+        caller already passed, which is the opposite of what a second check is for.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string] $ServiceName)
+    param(
+        [Parameter(Mandatory = $true)][string] $ServiceName,
+        [Parameter(Mandatory = $true)][string] $AgentName
+    )
 
-    if ((Get-RunnerServiceName -Marker $ServiceName) -ne $ServiceName) {
+    if ((Get-RunnerServiceName -Marker $ServiceName -AgentName $AgentName) -ne $ServiceName) {
         Deny-Boot "refusing to pass '$ServiceName' to sc.exe -- it is not a runner service name"
     }
 
@@ -2238,7 +2840,7 @@ function Register-SlotAgent {
     Protect-CiDirectory -Path $agent -SlotUser $Slot.User
 
     Write-ServiceEnvironment -ServiceName $serviceName -Environment $Environment
-    Clear-ServiceRecoveryAction -ServiceName $serviceName
+    Clear-ServiceRecoveryAction -ServiceName $serviceName -AgentName $name
     Grant-ServiceLogonAccount -ServiceName $serviceName -Credential $Slot.Credential
 
     Start-Service -Name $serviceName -ErrorAction Stop
@@ -2259,6 +2861,148 @@ function Register-SlotAgent {
     }
     Write-BootLog ("phase 5: slot $($Slot.Index) registered as $name, service $serviceName " +
         "running as $configured, recovery actions cleared")
+}
+
+function Stop-RunnerService {
+    <#
+      .SYNOPSIS
+        Stop every runner service on this host. Reports; returns nothing.
+      .DESCRIPTION
+        THE CONTAINMENT THE DENY ON ITS OWN DOES NOT PROVIDE. Called only from
+        Wait-RegistrationTokenRemoved, on the one failure in this script that
+        happens AFTER the agents are already serving.
+
+        Stopped, not deregistered. GitHub does not dispatch to an offline runner,
+        so no further job reaches this host either way, and the two differ in
+        what the controller then sees. host_facts() in controller-startup.sh
+        counts this host's runners by NAME and not by status, so a stopped agent
+        still reads `present` -- which keeps the host out of drain_decision's
+        `never-registered` arm, where it does not belong, and lets it fall
+        through to the ordinary idle rule with busy=0. Deregistering instead
+        would drop it to `absent`, and an `absent` host past the register grace
+        is drained as a FAILED BOOT, which is a worse diagnosis than the true
+        one and loses the agents' own logs with it.
+
+        Matched by the `actions.runner.*` prefix rather than by re-deriving each
+        slot's service name. The names are built per slot inside Register-Slot-
+        Agent from a marker file and are not carried out of it; the prefix is
+        GitHub's own scheme and nothing else on this image uses it. Nothing here
+        reaches sc.exe, so Get-RunnerServiceName's refusal -- which exists to
+        keep an underived name out of a command line -- is not the relevant
+        guard. A zero count is LOGGED and not swallowed: it means the
+        containment did not happen and only the visibility is left.
+
+        Returns nothing on purpose, and the count is logged from in here rather
+        than handed back. Write-BootLog is uncapturable by construction now (see
+        the note at it, and has_uncapturable_boot_log), so this is no longer the
+        difference between working and not -- but a function that reports its
+        own outcome does not depend on that remaining true.
+    #>
+    # THE PATTERN IS CONSTRAINED, and the parameter is only injectable at all so a
+    # test can drive it. Stop-Service -Force stops DEPENDENTS as well, so a widened
+    # pattern here does not merely stop too many services -- a bare `*` would take
+    # the beacon and the job broker down with the agents, and the beacon is what
+    # the controller reads to decide this host is alive. Nothing attacker-influenced
+    # reaches this today; the validation is what keeps that from being a property of
+    # the current call sites rather than of the function.
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+    param(
+        [ValidatePattern('^actions\.runner\.[A-Za-z0-9._*-]+$')]
+        [string] $NamePattern = 'actions.runner.*'
+    )
+
+    $stopped = 0
+    foreach ($svc in @(Get-Service -Name $NamePattern -ErrorAction SilentlyContinue)) {
+        if (-not $PSCmdlet.ShouldProcess($svc.Name, 'Stop-Service')) { continue }
+        try {
+            Stop-Service -Name $svc.Name -Force -ErrorAction Stop
+            $stopped = $stopped + 1
+            Write-BootLog "phase 5: stopped $($svc.Name)"
+        } catch {
+            Write-BootLog "phase 5: could not stop $($svc.Name) ($($_.Exception.Message))"
+        }
+    }
+    if ($stopped -eq 0) {
+        Write-BootLog ("phase 5: NO runner service matched $NamePattern, so nothing was contained " +
+            '-- this host may still be able to take a job')
+    }
+}
+
+function Wait-RegistrationTokenRemoved {
+    <#
+      .SYNOPSIS
+        Witness that the registration token is gone from this instance's metadata.
+      .DESCRIPTION
+        THE THIRD BULLET OF SECTION 3A, AND THE ONE PR 5 SHIPPED WITHOUT
+
+        The controller deletes `ci-registration-token` the moment GitHub reports
+        any of this host's agents registered. Nothing on the host proves it did.
+        A key left behind is a LIVE repository registration token sitting in
+        instance metadata, which section 3A says outright is readable by anything
+        holding this machine's identity -- and by the time this runs, the things
+        holding this machine's identity include pull-request code in a slot. A
+        job that reads it can register an agent of its own into the repository.
+
+        Polled to a jittered bound, not read once, because the delete rides the
+        controller's tick and a single read taken here would fail on a perfectly
+        healthy fleet. The jitter is explained at the constant and is load-
+        bearing: one controller is the shared dependency of every host booting
+        at the same time.
+
+        WHY THE DENY IS NOT ENOUGH ON ITS OWN, AND WHAT IS DONE ABOUT IT
+
+        Every OTHER Deny-Boot in this script fires before the agents exist, so
+        the host reads reg=absent at the controller and drain_decision's
+        `never-registered` arm reclaims it past the register grace. Deny-Boot's
+        own docstring says so, and for those callers it is true.
+
+        IT IS NOT TRUE HERE, and assuming it was would be the expensive mistake.
+        By the time this runs the agents have registered, so the host reads
+        `present`, not `absent`, and that arm is never entered. recycle_decision
+        does not help either: it refuses anything whose instance template is not
+        `stale`, and registration state is not one of its triggers. A bare throw
+        here would leave a host in the pool, taking jobs, with a live
+        registration token in its metadata and a FATAL line nobody is reading.
+
+        So the runner services are STOPPED first, and that is the actual
+        containment: GitHub dispatches nothing to an offline runner, the host
+        goes idle at busy=0, and drain_decision's ordinary idle rule retires it
+        once idle passes the grace window. See Stop-RunnerService for why they
+        are stopped rather than deregistered.
+
+        Its one honest gap: drain_decision keeps a host at the floor
+        unconditionally (`keep:at-floor`), so on a pool sitting at min_hosts this
+        machine is not retired and occupies a floor slot until an operator or a
+        template change moves it. That is a capacity fault and not an exposure --
+        it takes no jobs in that state -- and it is the reason the deny stays,
+        because the FATAL line is what tells the operator which host to look at.
+    #>
+    [CmdletBinding()]
+    param(
+        [int] $TimeoutSeconds = (Get-JitteredTimeout -BaseSeconds $script:TokenRemovalWaitSeconds `
+                -JitterSeconds $script:TokenRemovalJitterSeconds -Roll (Get-Random -Minimum 0.0 -Maximum 1.0)),
+        [int] $PollSeconds = $script:RegistrationPollSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        if ([string]::IsNullOrWhiteSpace((Get-MetadataValue "instance/attributes/$script:RegistrationTokenKey"))) {
+            Write-BootLog "phase 5: $script:RegistrationTokenKey is gone from this instance's metadata"
+            return
+        }
+        if ((Get-Date) -ge $deadline) { break }
+        Start-Sleep -Seconds $PollSeconds
+    }
+
+    # BEFORE the throw, because the throw does not do this and the drain rules
+    # will not either -- a host whose agents registered never reads `absent`.
+    Stop-RunnerService
+
+    Deny-Boot ("$script:RegistrationTokenKey is STILL on this instance ${TimeoutSeconds}s after its " +
+        'agents registered. That value is a live repository registration token, readable by any ' +
+        'job on this host, and the controller was supposed to have deleted it. The token is not ' +
+        'removed by this -- the host cannot delete its own metadata -- but the runner services are ' +
+        'stopped above, so no further job can land here, and the host goes idle and is drained.')
 }
 
 function Invoke-Phase5Registration {
@@ -2293,6 +3037,394 @@ function Invoke-Phase5Registration {
             -Labels $Config.Labels -RunnerGroup $Config.RunnerGroup -Environment $block
     }
     Write-BootLog "phase 5: $($Provisioned.Count) agent(s) registered"
+
+    # Section 3A's third bullet. The token this phase spent must be gone from the
+    # metadata it was spent from, and the host is the only thing in a position to
+    # look. See Wait-RegistrationTokenRemoved for why the failure is fatal.
+    Wait-RegistrationTokenRemoved
+}
+
+# --- phase 6: the boot probe, the harness -------------------------------------
+#
+# WHY THE PAYLOAD RUNS AS A SERVICE AND NOT AS A PROCESS
+#
+# The claim phase 6 makes is about what a SLOT ACCOUNT can do, so the payload has
+# to run as one, and Windows has no `sudo -u`. Every ordinary way of starting a
+# process as another local account takes the password as a managed String --
+# Start-Process -Credential, `runas`, `schtasks /RP` -- and this file has a
+# standing rule that the slot password never leaves the SecureString it was born
+# in, because the accounts whose credentials those are run pull-request code and
+# can read this host's process table.
+#
+# Phase 5 already owns the one mechanism that honours that rule:
+# ChangeServiceConfigW, which takes the password as a pointer to unmanaged memory
+# that is zeroed in a `finally`. So the probe is installed as a service by the
+# image's shim, repointed at the slot account by the same Grant-ServiceLogonAccount
+# phase 5 uses, started once, and deleted. The FIRST slot account, not a
+# purpose-made one: a job runs as a slot account, and a probe run as anything
+# else measures something no job ever is.
+
+function Protect-ProbeVerdictFile {
+    <#
+      .SYNOPSIS
+        Create an empty, freshly-ACLed verdict file for exactly one slot to write.
+      .DESCRIPTION
+        TWO HOLES, AND THIS CLOSES BOTH.
+
+        The first is the ACL. The verdict decides whether this host registers, and
+        it is written by an unprivileged account; a file every slot could write is
+        a file any job on a multi-slot host could pre-answer. SYSTEM and
+        Administrators keep FullControl, the PROBING slot gets Modify, and no
+        other principal gets anything -- the same shape phase 1 gives a slot
+        workspace, applied to one file.
+
+        The second is freshness, and it is the one a stale-file check does not
+        close. The host reboots; a verdict from the previous boot is a real file
+        with real, possibly passing, content, and "the file is old" is a judgement
+        the harness would have to make from a timestamp the writer controls. So
+        the file is REMOVED and re-created empty here, before the service exists,
+        and a removal that does not take denies the boot. Anything read afterwards
+        was written by the probe this boot started, or the read finds the empty
+        file and Get-ProbeFailure reports no verdict at all.
+
+        The file sits directly in C:\ci, which the slot has no rights on at all.
+        That is deliberate and it works: Windows grants SeChangeNotifyPrivilege --
+        bypass traverse checking -- to Everyone by default, so a full path opens
+        against the file's own ACL without any right on the directories above it.
+        The slot can write this one file and cannot enumerate the directory
+        holding it.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $SlotUser)
+
+    Remove-Item -LiteralPath $script:ProbeResultPath -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $script:ProbeResultPath) {
+        Deny-Boot ("could not remove a pre-existing $script:ProbeResultPath -- this boot could not " +
+            'tell a verdict its own probe wrote from one left by an earlier boot, and reading the ' +
+            'wrong one is the silent pass phase 6 exists to prevent')
+    }
+    New-Item -ItemType File -Path $script:ProbeResultPath -Force | Out-Null
+    Protect-CiDirectory -Path $script:ProbeResultPath -SlotUser $SlotUser
+    Write-BootLog "phase 6: $script:ProbeResultPath is empty and writable by $SlotUser alone"
+}
+
+function Install-BootProbeService {
+    <#
+      .SYNOPSIS
+        Install the probe under the shim and repoint it at the slot account.
+      .DESCRIPTION
+        The payload and the shim config are written to C:\ci\boot-probe, whose ACL
+        is the awkward part and is explained at the constant: the directory has to
+        be slot-WRITABLE because the shim writes its own log beside the config it
+        was handed and its append path does not catch an access denial, so a
+        read-only directory is a service that fails inside OnStart with no verdict
+        and no explanation. The two files are then re-locked to read-and-execute
+        individually, which is the phase-4 hook shape.
+
+        A service that will not start is FATAL here rather than left to the
+        verdict wait. Both roads end in Deny-Boot, but only this one names the
+        actual fault; the other reports "no verdict at all" three minutes later.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $ScriptText,
+        [Parameter(Mandatory = $true)][string] $SlotUser,
+        [Parameter(Mandatory = $true)][System.Management.Automation.PSCredential] $Credential
+    )
+
+    if (-not (Test-Path -LiteralPath $script:ServiceShim)) {
+        Deny-Boot ("the service shim $script:ServiceShim is missing -- this image cannot run the " +
+            'boot probe, and a host that registers without proving the slot boundary has proved nothing')
+    }
+
+    # UTF-8 WITH a BOM, for the reason Install-BeaconService gives: `-Encoding
+    # UTF8` means with-BOM on 5.1 and without-BOM on 7, and a BOM-less file is
+    # decoded as ANSI by the 5.1 that runs it.
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+    New-Item -ItemType Directory -Force -Path $script:ProbeRoot | Out-Null
+    [System.IO.File]::WriteAllText($script:ProbeScriptPath, $ScriptText, $utf8Bom)
+    [System.IO.File]::WriteAllText($script:ProbeConfigPath,
+        (Get-ProbeServiceConfig -ScriptPath $script:ProbeScriptPath), $utf8Bom)
+
+    Protect-CiDirectory -Path $script:ProbeRoot -SlotUser $SlotUser
+    Protect-CiDirectory -Path $script:ProbeScriptPath -ReadOnlyUser @($SlotUser)
+    Protect-CiDirectory -Path $script:ProbeConfigPath -ReadOnlyUser @($SlotUser)
+
+    # AND THE BINARY THAT READS THEM, which is the one that was missed. The
+    # service's binPath is the shim itself, and phase 1 locks C:\ci, C:\ci\bin
+    # and C:\ci\slots to SYSTEM and Administrators with inheritance disabled --
+    # so ci-service-shim.exe carries no ACE for any slot. Repointing the service
+    # at the slot and starting it would make the SCM launch an image that token
+    # may neither read nor execute: ERROR_ACCESS_DENIED, a 1053 start failure,
+    # and a Deny-Boot on every host in the pool. Read-and-execute only, never
+    # Modify: a slot able to WRITE this file would own the beacon and the broker,
+    # which the SCM re-executes as LocalSystem on the next reboot.
+    #
+    # THIS RELIES ON BYPASS-TRAVERSE-CHECKING, and it is stated because it is the
+    # kind of default a hardened image removes. C:\ci and C:\ci\bin remain
+    # SYSTEM-and-Administrators-only, so a file-level ACE is reachable at all
+    # only because Windows grants SeChangeNotifyPrivilege to Everyone by default:
+    # a full path opens against the file's own ACL without any right on the
+    # directories above it. An image that revokes that privilege breaks this the
+    # same way it breaks the verdict file in C:\ci -- closed, as a service that
+    # will not start, not as a probe that quietly passes.
+    #
+    # Reverted by Revoke-ProbeSlotAccess once the verdict is in, so the "no slot
+    # ACE under C:\ci" invariant is true of the host phase 5 runs on.
+    Protect-CiDirectory -Path $script:ServiceShim -ReadOnlyUser @($SlotUser)
+
+    # The preference is dropped around the native call for the reason given in
+    # Install-BeaconService: under Stop, `2>&1` on a native command turns each
+    # stderr line into a terminating NativeCommandError before the exit code is read.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $shimOutput = & $script:ServiceShim 'install' $script:ProbeConfigPath 2>&1
+    $shimExit = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    foreach ($line in @($shimOutput)) { Write-BootLog "shim: $line" }
+    if ($shimExit -ne 0) {
+        Deny-Boot "the service shim refused to install the boot probe (exit $shimExit)"
+    }
+
+    # UNVERIFIED. No real Windows host has booted this path yet: the shim
+    # installs every other service in this file as LocalSystem and has never been
+    # asked to run as an unprivileged local account, and nothing in CI can boot a
+    # GCE Windows instance to find out. The specific things not yet observed are
+    # that the shim's own log append succeeds from C:\ci\boot-probe as the slot,
+    # that the SCM accepts the account here given the SeServiceLogonRight phase 1
+    # granted, and that the SCM's load of ci-service-shim.exe under the slot
+    # token succeeds on the file-level ACE granted above -- which is to say that
+    # bypass-traverse-checking is still granted to Everyone on this image. All
+    # three fail CLOSED if the guess is wrong -- a service that
+    # will not start denies the boot below, and one that starts and writes
+    # nothing denies it at the verdict wait -- so the failure mode of being wrong
+    # is a Windows pool that refuses to serve, not one that serves unproved.
+    Grant-ServiceLogonAccount -ServiceName $script:ProbeServiceName -Credential $Credential
+
+    try {
+        Start-Service -Name $script:ProbeServiceName -ErrorAction Stop
+    } catch {
+        Deny-Boot ("the boot probe service would not start as $SlotUser " +
+            "($($_.Exception.Message)) -- nothing on this host has proved the slot boundary")
+    }
+    Write-BootLog "phase 6: $script:ProbeServiceName started as $SlotUser"
+}
+
+function Wait-ProbeVerdict {
+    <#
+      .SYNOPSIS
+        The parsed verdict, or $null when none arrived in time.
+      .DESCRIPTION
+        Returns $null rather than throwing, because $null is a value
+        Get-ProbeFailure already knows how to read -- it is the loudest finding
+        it has -- and one decision point is better than two.
+
+        Both an unreadable file and an unparseable one keep waiting rather than
+        failing: the verdict is written by another process and this can catch it
+        mid-write, at which point ConvertFrom-Json throws on a truncated
+        document. Bounded, so a payload that never finishes becomes a missing
+        verdict instead of a hung boot.
+
+        NOTHING IS LOGGED FROM IN HERE, and that is not an oversight. This
+        function's value IS its verdict and the caller branches on $null, so it
+        emits the verdict and nothing else; the timeout is reported by the
+        caller. Write-BootLog no longer writes to the success stream, so this is
+        belt as well as braces -- but the belt is the one being relied on.
+    #>
+    [CmdletBinding()]
+    param(
+        [int] $TimeoutSeconds = $script:ProbeWaitSeconds,
+        [int] $PollSeconds = $script:ProbePollSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $raw = ''
+        try {
+            $raw = [string] (Get-Content -Raw -LiteralPath $script:ProbeResultPath -ErrorAction Stop)
+        } catch {
+            $null = $_
+        }
+        if (-not [string]::IsNullOrWhiteSpace($raw)) {
+            try {
+                return (ConvertFrom-Json -InputObject $raw)
+            } catch {
+                $null = $_
+            }
+        }
+        if ((Get-Date) -ge $deadline) { break }
+        Start-Sleep -Seconds $PollSeconds
+    }
+    return $null
+}
+
+function Clear-BootProbeService {
+    <#
+      .SYNOPSIS
+        Stop and delete the transient probe service. Never fatal.
+      .DESCRIPTION
+        The shim has no `delete` verb, so `sc.exe delete` is the removal. A
+        cleanup failure is LOGGED and not fatal, and that asymmetry is deliberate:
+        the verdict has already been reached by the time this runs, and denying a
+        boot whose probe passed because a service could not be deleted would trade
+        a proved host for none. The service is Manual and non-restarting
+        (Get-ProbeServiceConfig), so one left behind runs nothing.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (-not (Get-Service -Name $script:ProbeServiceName -ErrorAction SilentlyContinue)) { return }
+    Stop-Service -Name $script:ProbeServiceName -Force -ErrorAction SilentlyContinue
+
+    # ABSOLUTE PATH, not a bare `sc.exe`. This process is LocalSystem and a bare
+    # name is resolved by CreateProcess's search order; SystemPaths.Tool in
+    # ci-service-shim.cs states the rule for the same reason and this was the one
+    # call in phase 6 that did not follow it. No hijackable directory is KNOWN to
+    # sit earlier in that order -- the point is not to rebut a known hijack but to
+    # stop the absence of one from having to be re-proved after every change to
+    # PATH, to the app-paths registry, or to the image's directory ACLs.
+    $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $output = & $sc delete $script:ProbeServiceName 2>&1
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    foreach ($line in @($output)) { Write-BootLog "sc: $line" }
+    if ($exit -ne 0) {
+        Write-BootLog "phase 6: could not delete $script:ProbeServiceName (exit $exit)"
+    }
+}
+
+function Revoke-ProbeSlotAccess {
+    <#
+      .SYNOPSIS
+        Take back every ACE phase 6 granted a slot. Fatal if one does not revert.
+      .DESCRIPTION
+        THE INVARIANT IS "NO SLOT ACE ANYWHERE UNDER C:\ci", AND THIS IS WHAT
+        MAKES IT LITERALLY TRUE RATHER THAN TRUE BY ARGUMENT.
+
+        Phase 6 hands the probing slot three grants it does not need afterwards:
+        Modify on C:\ci\boot-probe (the shim appends its log there), Modify on
+        C:\ci\boot-probe.json (the slot writes the verdict), and ReadAndExecute
+        on the shim binary (the SCM loads it under the slot token). Phase 5 then
+        registers agents as that same account, so from that point on the holder
+        of these ACEs is pull-request code. No exploit route through them was
+        found -- the shim grant is read-only, and nothing re-executes the two
+        boot-probe paths -- but "we looked and found nothing" is a claim about
+        today's file layout, and the next writer under C:\ci does not get to
+        inherit it silently.
+
+        Reverting is the SAME call with no -SlotUser: Protect-CiDirectory
+        rewrites the whole ACL from scratch every time, so there is no ACE to
+        remove by hand and no ordering to get wrong.
+
+        FATAL, unlike Clear-BootProbeService, and the asymmetry is the point. A
+        service left installed runs nothing -- it is Manual and non-restarting.
+        An ACE left behind is a standing grant to the account phase 5 is about to
+        start job code as, and this is the last moment anything checks. Set-Acl
+        as SYSTEM on a file SYSTEM owns does not fail for benign reasons, so a
+        failure here is a fact about the host worth refusing to boot over.
+    #>
+    [CmdletBinding()]
+    param()
+
+    foreach ($path in @($script:ProbeRoot, $script:ProbeResultPath, $script:ServiceShim)) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        try {
+            Protect-CiDirectory -Path $path
+        } catch {
+            Deny-Boot ("could not take the boot probe's grant on $path back off the slot account " +
+                "($($_.Exception.Message)) -- phase 5 is about to run pull-request code as that " +
+                'account and this was the last thing standing between the two')
+        }
+    }
+    Write-BootLog 'phase 6: the probing slot no longer holds any grant under C:\ci'
+}
+
+function Invoke-Phase6BootProbe {
+    <#
+      .SYNOPSIS
+        Prove the slot boundary from a slot's own context, or deny the boot.
+      .DESCRIPTION
+        RUNS BEFORE PHASE 5, and that is the whole point of the phase. A host that
+        proves its identity is not worthless must never accept a job, and an agent
+        registered first is an agent GitHub can hand work to while the proof is
+        still running.
+
+        EVERY failure path ends in Deny-Boot, including the two that look like
+        absence rather than failure: a service that would not start, and a verdict
+        that never arrived. A probe that silently no-ops is worse than no probe --
+        it converts an unproved host into a host with a phase-6 line in its boot
+        log saying nothing went wrong.
+
+        The one thing that is NOT fatal is deleting the service afterwards. See
+        Clear-BootProbeService.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][array] $Provisioned,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary] $Config,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $BrokerEndpoint
+    )
+
+    if ($Provisioned.Count -lt 1) {
+        Deny-Boot 'phase 6 has no slot account to run the boot probe as, so the slot boundary is unproved'
+    }
+    if ([string]::IsNullOrWhiteSpace($Config.AppKeySecret)) {
+        # Both capability checks live behind the same guard in the payload, so an
+        # empty secret name does not degrade the probe to half a proof -- it
+        # removes the proof and leaves two blank statuses that Get-ProbeFailure
+        # would then report as two mysteries. Name the real fault here instead.
+        Deny-Boot ('phase 6 has no App-key secret name, so the probe cannot ask whether this host ' +
+            'can still read it, and the demand-metric check is gated on the same value')
+    }
+
+    $slot = $Provisioned[0]
+    Write-BootLog "phase 6: proving the slot boundary as $($slot.User)"
+
+    $payload = ''
+    try {
+        $payload = Get-ProbeScript `
+            -SecretName $Config.AppKeySecret `
+            -BrokerEndpoint $BrokerEndpoint `
+            -SiblingWorkspace (Get-ProbeSiblingWorkspace -Index $slot.Index -SlotCount $Provisioned.Count) `
+            -CacheRoot (Get-SlotWorkspacePath -Index $slot.Index)
+    } catch {
+        # Test-ProbeLiteral throws rather than sanitizes, and the throw is the
+        # finding: a metadata value that is not a bare literal would have been
+        # interpolated as code into a payload holding a live host token.
+        Deny-Boot "the boot probe payload could not be built: $($_.Exception.Message)"
+    }
+
+    Protect-ProbeVerdictFile -SlotUser $slot.User
+
+    $verdict = $null
+    try {
+        Install-BootProbeService -ScriptText $payload -SlotUser $slot.User -Credential $slot.Credential
+        $verdict = Wait-ProbeVerdict
+    } finally {
+        Clear-BootProbeService
+        # AFTER the stop-and-delete, never before: the service is still loading
+        # the shim image and writing the verdict until Clear-BootProbeService
+        # returns, so revoking first would race the measurement this phase
+        # exists to take. In the finally rather than at the end of the function
+        # because Install-BootProbeService's own Deny-Boot paths pass through
+        # here too, and a denied boot is exactly when nobody is coming back to
+        # tidy up.
+        Revoke-ProbeSlotAccess
+    }
+    if ($null -eq $verdict) {
+        Write-BootLog "phase 6: no verdict at $script:ProbeResultPath after $script:ProbeWaitSeconds s"
+    }
+
+    $findings = @(Get-ProbeFailure -Result $verdict -JobServiceAccount $Config.JobSa `
+            -ExpectedIdentity $slot.User)
+    foreach ($finding in $findings) { Write-BootLog "phase 6: FINDING -- $finding" }
+    if ($findings.Count -gt 0) {
+        Deny-Boot ("the boot probe found $($findings.Count) reason(s) this host must not take a " +
+            'job: ' + ($findings -join '; '))
+    }
+    Write-BootLog 'phase 6: slot boundary proved from a slot context'
 }
 
 function Invoke-Main {
@@ -2322,16 +3454,15 @@ function Invoke-Main {
         -JobServiceAccount $cfg.JobSa -BrokerSource $cfg.BrokerSource -BrokerPort $cfg.BrokerPort
     $hookPath = Invoke-Phase4JobHook -SlotUsers $slotUsers
 
+    # BEFORE PHASE 5, and the ordering is the safety property. The probe spends a
+    # slot credential to prove the boundary; phase 5 spends it on agents GitHub
+    # can hand a job to immediately. Proving second proves nothing.
+    Invoke-Phase6BootProbe -Provisioned $provisioned -Config $cfg -BrokerEndpoint $brokerEndpoint
+
     # LAST, and the only phase that makes this host reachable by a job. Everything
     # above it is a boundary; this is what is let inside one.
     Invoke-Phase5Registration -Provisioned $provisioned -Config $cfg `
         -HookPath $hookPath -BrokerEndpoint $brokerEndpoint
-
-    # Phase 6 is not here yet. Said out loud rather than left as silence: until
-    # the probe exists, nothing on this host PROVES from a slot's own context that
-    # the boundaries above hold -- and a boundary nobody checks is a comment.
-    Write-BootLog ('phase 6 is not delivered yet: this host registers agents without proving the ' +
-        'slot boundary from a slot context')
 }
 
 # Dot-sourceable without side effects, so Pester can import the pure functions

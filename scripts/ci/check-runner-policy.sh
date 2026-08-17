@@ -24,6 +24,8 @@
 #     RUNNER7  a REMOTE reusable workflow's jobs are not in this repository —
 #              UNDECIDED, and declarable with a `remote-reusable-allowed` marker
 #              naming the callee (see `remote_call_declared`).
+#     RUNNER8  a job on a WINDOWS pool label declares `container:` or
+#              `services:`, neither of which that pool can run.
 #
 # WHAT COUNTS AS REACHING THE FLEET
 #   `self-hosted` is a LABEL, not a requirement. GitHub routes a job to any
@@ -89,6 +91,28 @@
 #   and, in `runs-on`, only a route whose FORK-TRUE branch names a hosted image.
 #   Anything else is unguarded: an unrecognised-but-correct guard costs one
 #   reported job, where an unrecognised inversion costs the boundary.
+#
+# WHY RUNNER8 IS A GATE AND NOT A LESSON
+#   A Windows pool on this fleet has no container runtime at all — no daemon, no
+#   per-slot runtime, no registry credential helper. That is not an omission to
+#   be filled in later: the pool exists for a WiX/`signtool` packaging build,
+#   which needs the host's Win32 surface, and putting that build in a Windows
+#   container is what would break the one job the pool is for. Job isolation on
+#   a Windows pool is ONE LOCAL WINDOWS ACCOUNT PER SLOT, not a container
+#   (`docs/adr-windows-pool.md` §4).
+#
+#   So `container:` and `services:` cannot run there, and the way they fail is
+#   the reason this is a gate. A `services:` block fails at "Initialize
+#   containers" before a single step runs, with an error about docker on a host
+#   that has no docker — which every reader takes for a broken host and reports
+#   as a fleet fault. The same workflow reads as perfectly ordinary, because on
+#   GitHub-hosted `windows-latest` and on the Linux pool it is.
+#
+#   The rule is scoped to the label and not to the key: `container:` on a Linux
+#   pool is how that pool is MEANT to be used, so a blanket ban would be a gate
+#   the fleet's own consumers must disable. A `windows-2022` hosted image is not
+#   this fleet either, and it does run containers. Only a fleet-reachable job
+#   naming the `windows` platform label is refused.
 #
 # WHY REACHABILITY CROSSES A LOCAL `uses:` CALL
 #   A `pull_request` workflow that calls `./.github/workflows/build.yml` runs
@@ -159,6 +183,15 @@ err() { local id="$1"; shift; echo "::error::[$id] $*"; fail=1; }
 # provider a pool runs on, which several pools share.
 GENERIC='self-hosted|linux|windows|macos|x64|arm64|arm|gcp|aws|azure|on-prem'
 
+# The one platform label that names a WINDOWS pool, for RUNNER8. It is a subset
+# of GENERIC on purpose and must stay one: GENERIC answers "does this label
+# scope the job to a repository", which every OS label fails, while this answers
+# "which OS is on the other end". Widen it to a second OS and RUNNER8 starts
+# refusing `container:` on the Linux pool, which is how that pool is meant to be
+# used — so the self-test carries a Linux-pool-with-a-container fixture whose
+# only job is to fail if this line ever grows.
+WINDOWS_LABEL='windows'
+
 # --- the parser is a hard dependency, not a nice-to-have ---------------------
 # Conditional, it would be worse than useless: on a runner without PyYAML the
 # gate would report PASS over files it never opened. It installs nothing — see
@@ -198,6 +231,8 @@ ensure_yaml() {
 #   #EXPR\t<id>                      runs-on carries a `${{ }}` expression
 #   #GROUP\t<id>                     runs-on is a `{group: …}` mapping
 #   #FORKGUARD\t<id>                 `head.repo.fork` decides this job
+#   #CONTAINER\t<id>                 the job declares `container:`
+#   #SERVICES\t<id>                  the job declares `services:`
 read_workflow() {
   "${PY_BIN:-python3}" - "$1" <<'PY'
 import json
@@ -499,6 +534,19 @@ for job_id, job in jobs.items():
         if "timeout-minutes" in job:
             out("#TIMEOUT", vid, job.get("timeout-minutes"))
 
+        # KEY PRESENCE, and deliberately nothing more. `container: node:20` is a
+        # string and `container: {image: node:20}` is a mapping; a `services:`
+        # block is a mapping of names. All three mean the same thing to the
+        # runner — it will try to start a container — and a reader that looked
+        # at the VALUE would have to decide which shapes count, which is the
+        # kind of judgement that reports clean on the shape nobody thought of.
+        # Read from the JOB and emitted per leg: a matrix chooses the pool, not
+        # whether the job runs in a container.
+        if "container" in job:
+            out("#CONTAINER", vid)
+        if "services" in job:
+            out("#SERVICES", vid)
+
         if isinstance(runs_on, dict):
             # `{group: …}` names a runner GROUP, whose membership lives in
             # repository settings rather than in this file. Undecidable here,
@@ -633,13 +681,21 @@ check_file() {
     [ -n "$job" ] || continue
     job_re="$(re_quote "$job")"
 
-    local labels self_hosted=0 scoped=0 hosted_only=0 label
+    local labels self_hosted=0 scoped=0 hosted_only=0 windows_pool=0 label
     labels="$(printf '%s\n' "$records" | sed -n "s/^#LABEL\t${job_re}\t//p")"
     # "Every literal label is a GitHub-hosted image" is the reader's answer, not
     # a second opinion computed here — see `#HOSTEDONLY`.
     [ "$(printf '%s\n' "$records" | grep -c "^#HOSTEDONLY	${job_re}$")" -gt 0 ] && hosted_only=1
     while IFS= read -r label; do
       [ -n "$label" ] || continue
+      # RUNNER8's half of the label question: which OS is on the other end.
+      # Case-insensitively, for the same reason every other label test here is —
+      # GitHub does not distinguish `Windows` from `windows`, and a gate that
+      # did would read the capitalised spelling every consumer actually writes
+      # as some other pool entirely and say nothing about it.
+      if printf '%s' "$label" | grep -qiE "^(${WINDOWS_LABEL})$"; then
+        windows_pool=1
+      fi
       if printf '%s' "$label" | grep -qiE "^self-hosted$"; then
         self_hosted=1
       else
@@ -661,6 +717,9 @@ EOF
     fi
 
     local has_expr=0 has_group=0 has_guard=0 has_timeout=0 reusable=0 timeout=""
+    local has_container=0 has_services=0 rule8_keys=""
+    [ "$(printf '%s\n' "$records" | grep -c "^#CONTAINER	${job_re}$")" -gt 0 ] && has_container=1
+    [ "$(printf '%s\n' "$records" | grep -c "^#SERVICES	${job_re}$")" -gt 0 ] && has_services=1
     [ "$(printf '%s\n' "$records" | grep -c "^#EXPR	${job_re}$")" -gt 0 ] && has_expr=1
     [ "$(printf '%s\n' "$records" | grep -c "^#GROUP	${job_re}$")" -gt 0 ] && has_group=1
     [ "$(printf '%s\n' "$records" | grep -c "^#FORKGUARD	${job_re}$")" -gt 0 ] && has_guard=1
@@ -721,6 +780,21 @@ EOF
       # RUNNER4 — fork code never reaches a warm host.
       if [ "$has_pr" -eq 1 ] && [ "$forks" = "allowed" ] && [ "$has_guard" -eq 0 ]; then
         err RUNNER4 "$rel: job '$job' is self-hosted on a pull_request workflow with no fork guard (nothing keeps fork-authored code off a credentialed warm host)"
+      fi
+
+      # RUNNER8 — a Windows pool runs no containers, and this is the one place
+      # a job author finds that out before the pool does. Scoped to the WINDOWS
+      # label: `container:` on the Linux pool is how that pool is meant to be
+      # used, and a hosted `windows-2022` image is not this fleet and does run
+      # containers, so neither is touched.
+      if [ "$windows_pool" -eq 1 ] && { [ "$has_container" -eq 1 ] || [ "$has_services" -eq 1 ]; }; then
+        if [ "$has_container" -eq 1 ]; then
+          rule8_keys="container:"
+        fi
+        if [ "$has_services" -eq 1 ]; then
+          rule8_keys="${rule8_keys:+$rule8_keys and }services:"
+        fi
+        err RUNNER8 "$rel: job '$job' targets a Windows pool label and declares $rule8_keys — a Windows pool has NO container runtime (job isolation there is one local Windows account per slot, not a container), so this job fails at 'Initialize containers' before any step runs, with an error about docker on a host that has none"
       fi
     fi
 
@@ -1362,6 +1436,93 @@ jobs:
   build:
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # --- RUNNER8: containers on a Windows pool ---------------------------------
+  # The pool has no container runtime and never will (§4 of the ADR): the build
+  # it exists for needs the host's Win32 surface. `Windows` is capitalised here
+  # on purpose — GitHub does not distinguish the spellings and neither may this.
+  expect "container: on a Windows pool label" "RUNNER8" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: [self-hosted, Windows, gcp, ExampleRepo]
+    container: mcr.microsoft.com/windows/servercore:ltsc2022
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The one that fails at "Initialize containers" before a single step runs.
+  expect "services: on a Windows pool label" "RUNNER8" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: [self-hosted, windows, gcp, ExampleRepo]
+    timeout-minutes: 30
+    services:
+      db:
+        image: postgres:16
+    steps: [{run: "true"}]'
+
+  expect "both keys are one finding" "RUNNER8" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: [self-hosted, windows, gcp, ExampleRepo]
+    container: {image: node:20}
+    timeout-minutes: 30
+    services:
+      db:
+        image: postgres:16
+    steps: [{run: "true"}]'
+
+  # The rule is scoped to the LABEL, not to the key. On the Linux pool a
+  # container is how the pool is meant to be used, and a gate that refused it
+  # would be a gate the fleet's own consumers turn off. This fixture is the one
+  # that fails if the Windows label set ever widens.
+  expect "container: on a Linux pool is the intended usage" "" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    container: node:20
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # A GitHub-hosted Windows image is not this fleet, and it does run containers.
+  expect "container: on a hosted Windows image is not this pool" "" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: windows-2022
+    container: mcr.microsoft.com/windows/servercore:ltsc2022
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # …and a Windows pool job that asks for no container is simply clean, so the
+  # rule is not "the Windows label is suspicious".
+  expect "a Windows pool job with neither key is clean" "" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: [self-hosted, Windows, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # A matrix decides the pool; it does not decide whether the job runs in a
+  # container. The Windows leg is refused and the Linux leg is not, from one
+  # job-level `container:`.
+  expect "one Windows leg of a matrix is enough" "RUNNER8" "" blocked \
+'on: [push]
+jobs:
+  suite:
+    runs-on: ${{ fromJSON(matrix.suite.runs_on) }}
+    container: node:20
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        suite:
+          - {name: win, runs_on: '"'"'["self-hosted", "windows", "gcp", "ExampleRepo"]'"'"'}
+          - {name: lin, runs_on: '"'"'["self-hosted", "linux", "gcp", "ExampleRepo"]'"'"'}
     steps: [{run: "true"}]'
 
   # --- the two-file fixture --------------------------------------------------

@@ -707,6 +707,19 @@ has_trusted_snapshot_build() { # <file>
   matches "$code" 'getcap -r' || return 1
   matches "$code" "\-name '\.git-credentials'" || return 1
   matches "$code" '_authToken' || return 1
+  # The refusal has to be readable. The pass finds a FILE, and in a dependency
+  # cache that file's name is a content hash, so without this the log says only
+  # that something matched somewhere — indistinguishable from a false positive.
+  matches "$code" 'explain_credential_hit "\$root" "\$bad"' || return 1
+  # ...and readable without printing what it caught. What sits before `://` in a
+  # cache blob is not reliably a scheme word, so an unfiltered echo of it is the
+  # leak this function exists to avoid; only an allow-listed scheme is printed.
+  matches "$code" 'not a recognised URL scheme' || return 1
+  # Every path in a refusal came from third-party install code, and a filename
+  # may hold a newline. Raw, one carrying `\n::add-mask::` writes workflow
+  # commands from the job that holds the publishing credential.
+  matches "$code" 'safe_path\(\) \{ printf' || return 1
+  matches "$code" 'safe_path "\$bad"' || return 1
   # The host refuses a multi-linked file, so nothing may be packed as a link
   # member; a staging tree legitimately has them (pnpm), which is why the bound
   # is on the archive rather than on the tree.
@@ -1062,7 +1075,16 @@ mutate_file "$PUBSH" 'a hardlink may be packed as a link member' has_trusted_sna
 mutate_file "$PUBSH" 'the shipped bytes stop being inspected' has_trusted_snapshot_build \
   's@^archive_is_flat "\$ARCHIVE"$@@'
 mutate_file "$PUBSH" 'the embedded-credential pass is dropped' has_trusted_snapshot_build \
-  "s@-e '_authToken' \\\\@\\\\@"
+  's@^  "registry-auth-token\|_authToken"$@@'
+# A refusal that names only a content-addressed hash file cannot be told from a
+# false positive without reproducing the whole install, and the predictable
+# response to a gate nobody can read is deleting it.
+mutate_file "$PUBSH" 'the credential refusal stops saying what it caught' has_trusted_snapshot_build \
+  's@explain_credential_hit "\$root" "\$bad"; @@'
+mutate_file "$PUBSH" 'the refusal echoes whatever sat in front of the ://' has_trusted_snapshot_build \
+  's@^            printf .    scheme: not a recognised URL scheme.*$@            printf "    scheme: %s\\n" "$scheme" ;;@'
+mutate_file "$PUBSH" 'a filename from the staged tree is printed raw' has_trusted_snapshot_build \
+  's@\$\(safe_path "\$bad"\)@$bad@g'
 mutate_file "$PUBSH" 'a half-populated install publishes with a zero exit' has_trusted_snapshot_build \
   's@sh -euc "\$CACHE_PREPARE"@sh -c "$CACHE_PREPARE"@'
 mutate_file "$PUBSH" 'the publishing job trusts the artifact it was handed' has_trusted_snapshot_build \

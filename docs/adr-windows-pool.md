@@ -1010,16 +1010,70 @@ slot user, every one fatal:
   do) rather than a proxy for it (whether a socket opens).
 * That same token **cannot** write a time series — assert a `403` from
   `monitoring.timeSeries.create`. The demand metric is what scales the pool.
-* No instance attribute contains a credential: assert that the
-  registration-token key is **absent** by the time the probe runs. This is the
-  check that keeps the "no credential in metadata" rule from decaying into a
-  comment, and it is also how the controller's delete-the-key step gets a witness.
+* ~~No instance attribute contains a credential: assert that the
+  registration-token key is **absent** by the time the probe runs.~~ **Amended
+  during PR 5b (2026-08-17): the probe cannot assert this, and the witness moved
+  to the end of phase 5.** The bullet as written is unsatisfiable by
+  construction. The probe runs *before* phase 5 — deliberately, because a host
+  that has not proved the slot boundary must not be able to accept a job — and
+  at that moment the registration token is not merely present, it is *required*
+  to be: phase 5 has not spent it yet. A probe asserting the key is absent would
+  deny every boot in the pool.
+
+  What ships instead: **`Wait-RegistrationTokenRemoved`, at the end of phase 5,
+  after the agents are registered.** It polls instance metadata to a jittered
+  bound (base 600s, up to 300s of jitter — the reason it is spread, and the
+  reason the upper bound is acceptable against the token's own one-hour expiry,
+  is recorded at the constant in the boot script) and denies the boot if the key
+  is still there. The controller's delete does get a witness, which was the
+  bullet's second purpose; the first purpose — "no credential in metadata by the
+  time job code can run" — it does **not** deliver, and the difference must not
+  be glossed:
+
+  - **Detection lands 600–900s after the agents are live**, not before. For that
+    whole window the host is registered, GitHub can dispatch to it, and a job on
+    it can read the token. This is the residual §3A already accepts and bounds by
+    the token's expiry; the witness narrows *nothing* about it. What the witness
+    adds is that a controller which silently stopped deleting is detected at all,
+    on the host, rather than never.
+  - **The remedy is containment, not removal.** The host cannot delete its own
+    metadata. On timeout it calls `Stop-RunnerService`, which stops every
+    `actions.runner.*` service so GitHub dispatches nothing further here. That is
+    **best-effort**: it logs and continues past a service it cannot stop, and it
+    logs loudly when *nothing* matched, in which case only the FATAL line is left.
+  - **Stopped, not deregistered**, so `host_facts()` keeps counting this host's
+    runners by name and it stays out of `drain_decision`'s `never-registered`
+    arm, where it does not belong. It goes idle at busy=0 and the ordinary idle
+    rule retires it. The one gap: `keep:at-floor` pins it on a pool at
+    `min_hosts` until an operator or a template change moves it — a capacity
+    fault, not an exposure, since it takes no jobs in that state.
+
+  Deny-Boot's own docstring says a denied host is reclaimed because it reads
+  `reg = absent`. That is true of every *other* caller and false of this one, and
+  `recycle_decision` does not help either — it triggers on a stale instance
+  template, not on registration state.
 * The broker answers, and the identity in the token it vends is
   `ci-job-service-account` and not the host account. Both halves, because a broker
   that silently fell back to the host identity is the failure this whole design
   exists to prevent.
 * Sibling profile and workspace reads are denied; the warm cache is writable; names
-  resolve; the beacon has published once and is fresh. Unchanged.
+  resolve. Unchanged. **One caveat added during PR 5b:** the sibling check
+  distinguishes *denied* from *missing* by exception type, and which exception
+  Windows PowerShell 5.1 raises for an ACL-denied enumeration has not been
+  observed on a real host. The two candidates map to opposite conclusions here,
+  so the probe records the concrete type name in the verdict alongside the
+  status and every non-`denied` finding prints it. The first real boot settles it.
+* ~~The beacon has published once and is fresh.~~ **Struck during PR 5b: never
+  implemented, and it should not be.** It is redundant with §2 — a host whose
+  beacon never appears is already handled by `beacon_decision()`'s last row
+  (`delete:` past `register_grace_seconds`, with confirmation ticks), which is a
+  better remedy than a Deny-Boot because it is taken by the party that actually
+  needs the beacon. And it would be weak evidence even if it passed: §3A's own
+  residual states that job code on a Windows host can write and forge guest
+  attributes, so a slot reading a fresh beacon proves the value is there, not
+  that the publisher is alive. Nothing in the shipped payload reads guest
+  attributes, by design; this bullet is removed rather than left standing as an
+  unimplemented requirement.
 
 A Windows pool whose host identity was not reduced fails the first two checks and
 refuses to register. That is deliberate: the misconfiguration cannot be caught at
@@ -1202,7 +1256,7 @@ publish a tag nobody can resolve.
 | **4b** | **v5.14.0** | **NEW, required by §3A: the reduced Windows host identity and controller-minted registration token.** A Windows pool's host account gets `serviceAccountTokenCreator` on the job account and nothing else; the controller mints the repository registration token, writes it to a per-instance metadata key, and deletes the key once the host's agents appear. The boot script waits for it with `wait-for-change` instead of reading Secret Manager. **This is the PR that carries the security property phase 2 was supposed to carry, and it is a mandatory security review.** | `modules/ci-runner-identity/{main,variables,outputs}.tf`, `modules/ci-runner-host-pool/{main,variables}.tf`, `scripts/controller-startup.sh`, `modules/.../scripts/windows-host-startup.ps1`, `scripts/ci/controller-scope.selftest.sh` | ~340 | a controller self-test that **runs** the mint-write-delete sequence against a fake compute API and asserts the key is deleted; a Terraform self-test asserting a Linux pool's identity and its Secret Manager grant are byte-identical to today |
 | 5 | v5.15.0 | **Windows boot script, part 3**: agent registration as a service, recovery actions cleared, the boot probe — **whose assertions are the §3A list, not the §3 list**. **Two requirements the controller-minted token imposes on this phase, both testable, neither enforced by anything in the repo today because the host script does not exist yet.** (a) **The host reads `ci-registration-token` ONCE at boot, into a variable, and configures every slot from that one read** — not lazily per slot. The controller's expiry rule deletes the key as soon as GitHub reports *any* slot registered (`partial`, not only `present`), so a per-slot read strands slot 2 on a `SLOTS=2` host: slot 1 registers, the delete fires, slot 2 reads an absent key and the host never reaches full capacity. The single read is what makes the `partial` expiry safe, and it is a host-side obligation the controller cannot check. (b) **After expiry, a reboot cannot re-register.** The key is gone and the controller's `minted` marker is set, so a rebooted host blocks at the wait for the key until the recycle rule deletes it at `register_grace`. That is self-healing and availability-only — no credential is exposed, and the MIG replaces the host — but **Windows hosts reboot for updates**, so it is ordinary behaviour on this platform, not an edge case. It must be documented for the operator (phase 9's onboarding text) and shown as an expected transition in the boot log, rather than discovered as a host that mysteriously came back dead. | same script, same self-test | ~320 | mutations asserting `--disableupdate`, cleared recovery actions, probe-as-slot-user, probe-is-fatal, and that the probe asserts a **403** rather than an unreachable endpoint; **plus a mutation asserting the token is read once above the slot loop — moving the read inside the loop must fail the self-test — and a case asserting the reboot-after-expiry path logs and blocks rather than registering with an empty token** |
 | 6 | v5.16.0 | **The Windows golden image.** Second Packer source, WinRM communicator, the service-host shim, the warm-cache ACL, the image version marker. Repo-agnostic. **§3A note:** the shim's justification was *"the fence exemption is scoped to a service SID and a scheduled task does not have one"*. That reason is gone. It stays for lifecycle reasons — SCM start/stop, recovery policy, a service environment block — and must be reviewed as a convenience, not as a safety boundary. | `packer/ci-host-image-win.pkr.hcl`, `packer/warm-cache/none.ps1`, `ci.yml` | ~330 | `packer validate` on both templates (new step); the template's own in-build assertions, which are the Windows counterpart of the Linux "assert the host baseline" and "prove a rootless daemon starts" provisioners |
-| 7 | v5.17.0 | **The OS axis in Terraform.** `host_os`, the metadata-key selection, `ci-host-os`, every plan-time refusal from §1, the changed docstrings. A Windows pool becomes declarable. **§3A adds one refusal:** `host_os = "windows"` fails at plan unless the pool declares controller-minted registration (the input added by PR 4b). Terraform cannot see what IAM a passed-in service account holds, so this is the only plan-time guard available and the real one is the boot probe. | `variables.tf`, `main.tf`, `scripts/ci/host-os-guard.selftest.sh` (new), `ci.yml` | ~320 | a self-test asserting that with `host_os` unset the rendered metadata key set is unchanged, and that each refusal in §1 and §3A is reachable — a precondition nothing can trip is not a precondition |
+| 7 | v5.17.0 | **The OS axis in Terraform.** `host_os`, the metadata-key selection, `ci-host-os`, every plan-time refusal from §1, the changed docstrings. A Windows pool becomes declarable. **§3A adds one refusal:** `host_os = "windows"` fails at plan unless the pool declares controller-minted registration (the input added by PR 4b). Terraform cannot see what IAM a passed-in service account holds, so this is the only plan-time guard available and the real one is the boot probe. | `variables.tf`, `main.tf`, `scripts/ci/host-os-guard.selftest.sh` (new), `ci.yml` | ~320 | a self-test asserting that no Windows-*only* key escapes the `host_os == "windows"` conditional, so a Linux pool still renders `startup-script` and nothing it has never seen, and that each refusal in §1 and §3A is reachable — a precondition nothing can trip is not a precondition. **Amended during PR 7:** this row originally said the Linux key set is *unchanged*, and it is not — `ci-host-os` is published on every pool, Linux included. Making it Windows-only would force PR 8's delete gate to read an absent key as "linux", which is inferring an OS from a missing key: the confident wrong answer that the rest of this row exists to refuse. One extra key on the Linux template is an `OPPORTUNISTIC` template revision, so no running host is touched. |
 | 8 | v5.18.0 | **The controller's Windows delete gate.** `drain_host()`'s second gate branches on `ci-host-os`: unchanged SSH text on linux, `beacon_decision()` on windows. New telemetry. | `scripts/controller-startup.sh`, `main.tf`, `outputs.tf`, `scripts/ci/metric-contract.selftest.sh`, `scripts/ci/controller-scope.selftest.sh` | ~260 | `controller-scope` self-test, which **runs** the function under both values rather than reading it — this is the one PR that can break a Linux pool, and reading the diff is exactly what failed to catch `v5.1.4` |
 | 9 | v5.19.0 | **Docs and the workflow gate.** `onboarding-a-repository.md` "Windows" rewritten from "the fleet is Linux only" to the adoption sequence; README isolation rules gain the Windows paragraph; `check-runner-policy.sh` rejects `container:`/`services:` on a Windows pool label. **§3A adds two obligations:** onboarding must state in the operator's own words that a Windows job can read the project's metadata and mint the host identity, so an estate keeping anything sensitive in project metadata knows before it opts in; and the "one repository per pool / no fork PRs on a warm host" rules must be written as Windows *requirements*, not recommendations. | `docs/onboarding-a-repository.md`, `README.md`, `scripts/ci/check-runner-policy.sh` | ~280 | the runner-policy gate's own `--selftest` fixtures, then this repository's own workflows; `docs-pins` self-test for the version in the new quickstart |
 

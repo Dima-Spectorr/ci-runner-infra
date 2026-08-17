@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.22.1"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.23.0"
   # ...
 }
 ```
@@ -182,6 +182,26 @@ means the recycle is working and the hosts are not leaving — jobs that never e
   install between concurrent slots. **This requires image `v3-11-0` or later** —
   an older image has no `dockerd-rootless.sh`, and a host that boots one refuses
   to register rather than quietly putting every slot back on one daemon.
+* **On a Windows pool, the isolation model is one local Windows account per
+  slot — and there is no container under it.** Everything above about slot
+  users, rootless daemons and the per-uid metadata fence is Linux. Windows has
+  no container runtime on these hosts at all (the pool exists for a
+  WiX/`signtool` packaging build, which needs the host's Win32 surface and is
+  precisely what a Windows container breaks), and no working per-process egress
+  filter either — an explicit block outranks every conflicting allow, and the
+  one documented override needs IPsec the metadata server does not speak. So a
+  Windows slot gets a private account, profile, workspace and TEMP, and the
+  machine's system state below that — installed SDKs, the registry,
+  `C:\ProgramData`, the certificate stores — is shared and persists across jobs.
+  The boundary moves into IAM instead: the Windows host account is stripped to
+  `roles/iam.serviceAccountTokenCreator` on the job account and **nothing** else
+  — no Secret Manager, no metrics, no logs — because job code on a Windows host
+  can mint a token for whatever that account is, and the host's boot probe
+  proves it by asserting a 403 on both. Two consequences: `container:` and
+  `services:` cannot run on a Windows pool and are refused by
+  `scripts/ci/check-runner-policy.sh` (`RUNNER8`); and the first two rules in
+  this list are not defence in depth there, they are the entire defence. Full
+  residual: `docs/adr-windows-pool.md` §3A.
 * **A job never inherits the previous job's cloud credentials.** The slot user
   is a normal Linux account, so its `$HOME` outlives every job the slot serves —
   and `setup-gcloud` persists whatever `google-github-actions/auth` produced as

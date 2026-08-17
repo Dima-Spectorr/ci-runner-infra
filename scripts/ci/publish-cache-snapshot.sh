@@ -88,6 +88,15 @@ CACHE_DIRS=(npm yarn pnpm-store go-mod pip uv m2 nuget composer)
 die() { printf 'publish-cache-snapshot: %s\n' "$*" >&2; exit 1; }
 log() { printf 'publish-cache-snapshot: %s\n' "$*"; }
 
+# A path from the staged tree, made safe to print. The tree is populated by the
+# prepare command — third-party install code — and a Linux filename may legally
+# hold a newline or an escape sequence. Printed raw into an Actions log, one
+# carrying `\n::add-mask::` or `\n::error::` writes workflow commands from the job
+# that holds the publishing credential; more cheaply, a newline forges log lines
+# and hides the rest of the refusal. Non-printables become `?`, which keeps the
+# fact that something was there rather than quietly dropping it.
+safe_path() { printf '%s' "$1" | LC_ALL=C tr -c '[:print:]' '?'; }
+
 CACHE_MAX_BYTES="${CACHE_MAX_BYTES:-4294967296}"
 
 # Which phases this invocation is. Building and publishing are independent: the
@@ -150,6 +159,16 @@ chmod 0700 "$STAGE" "$ARCHIVE_DIR"
 
 # --- the scan --------------------------------------------------------------------
 #
+# The content patterns of the embedded-credential pass, each with the name its
+# failure reports. ONE list, used both to find a hit and to explain it: a second
+# copy would be a second thing that has to agree, which is the whole failure mode
+# this script's duplicated-but-selftested rules exist to avoid.
+CREDENTIAL_PATTERNS=(
+  "registry-auth-token|_authToken"
+  "url-embedded-basic-auth|://[^/@[:space:]\"]+:[^/@[:space:]\"]+@"
+  "private-key-header|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+)
+
 # The same walks a host runs on arrival, in the same order and with the same
 # rules. Deliberately duplicated rather than shared: the host's copy is embedded
 # in a startup script that cannot source anything from this repository, and the
@@ -164,15 +183,65 @@ chmod 0700 "$STAGE" "$ARCHIVE_DIR"
 # the clause here would make every pnpm publish fail on a condition that cannot
 # reach a host — and the predictable response to that is deleting the check.
 # What replaces it is `archive_is_flat`, which reads the bytes actually shipped.
+
+# Says what the content pass actually caught. It needs saying because the pass
+# finds a FILE, and in a dependency cache a file's name is a content hash —
+# `.../pnpm-store/v3/files/72/93a11b…e02` names nothing anyone can act on, so the
+# refusal reads identically whether it caught a leaked registry token or a
+# package's test fixture. A fail-closed gate nobody can read is one that gets
+# deleted the second time it fires.
+#
+# It prints WHERE and WHICH, never WHAT: the matched text is a candidate secret,
+# and a CI log is readable by everyone who can see the run, so echoing it there
+# would publish the very thing the gate exists to contain. Counts, line numbers
+# and a URL scheme are not the secret; the value on that line is, and it stays in
+# the file. Whoever investigates re-runs the install and looks locally.
+explain_credential_hit() { # <tree> <file>
+  local root="$1" file="$2" entry label pat n scheme
+  {
+    printf 'the embedded-credential pass matched in %s\n' "$(safe_path "${file#"$root"/}")"
+    printf '  file: %s bytes, %s line(s)\n' "$(wc -c <"$file")" "$(wc -l <"$file")"
+    for entry in "${CREDENTIAL_PATTERNS[@]}"; do
+      label="${entry%%|*}" pat="${entry#*|}"
+      n=$(grep -c -E -e "$pat" "$file" 2>/dev/null) || n=0
+      [ "$n" -gt 0 ] || continue
+      printf '  %s: %s match(es), first on line %s\n' \
+        "$label" "$n" "$(grep -n -m1 -E -e "$pat" "$file" 2>/dev/null | cut -d: -f1)"
+      # The one extra fact worth having: the scheme in front of a `user:pass@`
+      # tells a real registry credential (`https`) apart from a fixture
+      # connection string (`mongodb`, `postgres`, `git+ssh`).
+      #
+      # Printed ONLY when it is one of these, and that allow-list is the whole
+      # safety argument. What sits before `://` is not reliably a scheme word —
+      # cache content is raw blobs and concatenated fields, so the maximal run of
+      # `[A-Za-z0-9+.-]` there can be an adjacent token or part of the credential
+      # itself. Echoing whatever was found would leak exactly the bytes this
+      # function exists not to print. Anything unrecognised says so and stops.
+      if [ "$label" = url-embedded-basic-auth ]; then
+        scheme=$(grep -oE -m1 "[A-Za-z][A-Za-z0-9+.-]{0,31}$pat" "$file" 2>/dev/null | head -n1 | cut -d: -f1) || true
+        case "$scheme" in
+          http | https | ftp | ftps | ssh | git | git+ssh | git+https | svn | svn+ssh \
+          | mongodb | mongodb+srv | postgres | postgresql | mysql | mariadb | redis \
+          | rediss | amqp | amqps | s3 | gs | ldap | ldaps | smtp | smtps | imap )
+            printf '    scheme: %s\n' "$scheme" ;;
+          * )
+            printf '    scheme: not a recognised URL scheme — inspect that line locally\n' ;;
+        esac
+      fi
+    done
+    printf '  the matched text is deliberately not printed — reproduce the prepare command and inspect that line locally\n'
+  } >&2
+}
+
 scan_or_die() { # <tree>
   local root="$1" bad
   bad=$(find "$root" \
     \( -type l -o -type b -o -type c -o -type p -o -type s -o -perm /6000 \) \
     -print -quit 2>/dev/null) || die "the staged tree could not be scanned"
-  [ -z "$bad" ] || die "the staged tree holds a link, node or setuid entry ($bad) — a host would refuse this snapshot"
+  [ -z "$bad" ] || die "the staged tree holds a link, node or setuid entry ($(safe_path "$bad")) — a host would refuse this snapshot"
 
   bad=$(getcap -r "$root" 2>/dev/null) || die "the staged tree could not be scanned for file capabilities"
-  [ -z "$bad" ] || die "the staged tree holds a file capability ($bad) — a host would refuse this snapshot"
+  [ -z "$bad" ] || die "the staged tree holds a file capability ($(safe_path "$bad")) — a host would refuse this snapshot"
 
   # A dependency cache holds content addressed by hash, never credentials. The
   # prepare command usually authenticates to a registry, and this is where the
@@ -184,23 +253,22 @@ scan_or_die() { # <tree>
       -o -name 'gha-creds-*.json' -o -name '*.pem' -o -name 'id_rsa*' \
       -o -name 'gradle.properties' -o -name '.dockercfg' \
     \) -print -quit 2>/dev/null) || die "the staged tree could not be scanned for credential files"
-  [ -z "$bad" ] || die "the staged tree holds what looks like a credential file ($bad) — refusing to publish it"
+  [ -z "$bad" ] || die "the staged tree holds what looks like a credential file ($(safe_path "$bad")) — refusing to publish it"
 
   # A filename list only catches a credential a tool wrote to its own config. It
   # does not see one INSIDE cache content — npm's _cacache index entries keep
   # per-entry request metadata, pip's and uv's HTTP caches keep the request URL,
   # and a registry URL with embedded basic auth is a credential in a file whose
-  # name is a hash. These three patterns are the high-confidence ones; broader
+  # name is a hash. CREDENTIAL_PATTERNS holds the high-confidence ones; broader
   # ones (a bare `authorization:`, `"private_key"`) match package test fixtures
   # often enough that adding them would train someone to delete the check. This
   # pass is a floor, not a guarantee — the guarantee is not authenticating in the
   # prepare command at all.
-  bad=$(grep -rlI -E \
-    -e '_authToken' \
-    -e '://[^/@[:space:]"]+:[^/@[:space:]"]+@' \
-    -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' \
-    "$root" 2>/dev/null | head -n1) || true
-  [ -z "$bad" ] || die "the staged tree holds what looks like an embedded credential ($bad) — refusing to publish it"
+  local -a pass=()
+  local entry
+  for entry in "${CREDENTIAL_PATTERNS[@]}"; do pass+=(-e "${entry#*|}"); done
+  bad=$(grep -rlI -E "${pass[@]}" "$root" 2>/dev/null | head -n1) || true
+  [ -z "$bad" ] || { explain_credential_hit "$root" "$bad"; die "the staged tree holds what looks like an embedded credential ($(safe_path "$bad")) — refusing to publish it"; }
 }
 
 # What the host will actually receive. Every member must be a plain file or a
@@ -216,7 +284,7 @@ archive_is_flat() { # <archive>
   # FOUND violation would then be reported as "could not be listed".
   tar -tvzf "$1" >"$list" || die "the archive could not be listed"
   bad=$(awk '$1 !~ /^[-d]/ || $1 ~ /[sS]/ { print; exit }' "$list")
-  [ -z "$bad" ] || die "the archive holds a member that is not a plain file or directory, or is setuid ($bad) — a host would refuse it"
+  [ -z "$bad" ] || die "the archive holds a member that is not a plain file or directory, or is setuid ($(safe_path "$bad")) — a host would refuse it"
 }
 
 ARCHIVE="$ARCHIVE_DIR/snap.tar.gz"
