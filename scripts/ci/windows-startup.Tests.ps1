@@ -1400,6 +1400,19 @@ Describe 'probe payload' {
         $script:Payload | Should -Match 'impersonateStatus = Get-Status'
     }
 
+    # The source writes `$JobServiceAccount`:generateAccessToken inside a
+    # double-quoted here-string. The backtick is REQUIRED and is consumed at
+    # generation time: without it PowerShell reads $JobServiceAccount: as a
+    # scope qualifier and interpolates the variable 'generateAccessToken' from
+    # a scope named after the account, silently emitting a truncated URL. Read
+    # in the source alone it looks like a stray escape leaking into a
+    # single-quoted literal, and it has now been reported as one -- so assert
+    # the EMITTED text, which is the only place the answer actually lives.
+    It 'emits a plain colon before the generateAccessToken verb' {
+        $script:Payload | Should -Match ([regex]::Escape('.iam.gserviceaccount.com:generateAccessToken'))
+        $script:Payload | Should -Not -Match ([regex]::Escape('`:generateAccessToken'))
+    }
+
     # A binding created seconds ago by the same apply that created the pool is
     # not always in force yet, and this is the only assertion in the payload
     # whose subject is an IAM binding. Without the retry the first boot after a
