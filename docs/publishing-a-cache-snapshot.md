@@ -74,14 +74,14 @@ jobs:
       # once with:
       #   git ls-remote https://github.com/Dima-Spectorr/ci-runner-infra refs/tags/<tag>^{}
       #
-      # Do NOT pin a release older than v5.26.0. Earlier ones ship a content
+      # Do NOT pin a release older than v5.27.0. Earlier ones ship a content
       # scan the prepare command can switch off for a file by writing one NUL
       # byte in front of the credential, and they let one process both run that
       # command and hold the publishing credential.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of the pinned tag>   # >= v5.26.0
+          ref: <commit sha of the pinned tag>   # >= v5.27.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
@@ -108,7 +108,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of the pinned tag>   # >= v5.26.0
+          ref: <commit sha of the pinned tag>   # >= v5.27.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
