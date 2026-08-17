@@ -455,6 +455,22 @@ has_worthless_host_identity_probe() { # <file>
   # Both halves of the broker identity. A broker that silently fell back to the
   # host account looks like a working broker from every angle except this one.
   matches "$code" 'the broker vends' || return 1
+
+  # THE POSITIVE CONTROL, and the reason it is in the same function as the two
+  # negatives: it is what makes them mean anything. Secret Manager answers 403
+  # for a resource the caller may not read AND for one that does not exist, so a
+  # misspelled `ci-app-key-secret` scores exactly like a reduced identity -- and
+  # an identity that can do nothing at all scores perfect on both checks above.
+  # One assertion therefore runs the other way: the host token MUST still be
+  # able to mint a token for the job service account.
+  matches "$code" 'iamcredentials\.googleapis\.com' || return 1
+  matches "$code" 'Test-PositiveCapability' || return 1
+  matches "$code" 'int\] \$StatusCode -eq 200' || return 1
+
+  # 200 and only 200, for the mirror image of the reason 403 is the only
+  # negative pass: this is the check that certifies the measurement, so reading
+  # a failure to measure as a pass would make it certify itself.
+  matches "$code" 'not 200' || return 1
 }
 
 has_probe_literal_guard() { # <file>

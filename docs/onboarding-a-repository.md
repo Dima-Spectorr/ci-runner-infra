@@ -527,10 +527,19 @@ can find it. The two halves of that safety property live in different modules,
 so nothing links them at review time; this paragraph is the link.
 
 The host's own boot probe is the enforcement. It runs as a slot user and asserts
-a **403** on the secret named by `ci-app-key-secret` and a **403** on writing a
-time series. A Windows pool whose host identity was not reduced fails that probe
-and refuses to register — deliberately, because Terraform cannot see what IAM a
-passed-in service account holds elsewhere.
+a **403** on the secret named by `ci-app-key-secret`, a **403** on writing a
+time series, and — the one assertion that runs the other way — a **200** on
+minting a token for the job service account, which is the single capability a
+Windows host account is supposed to keep. A Windows pool whose host identity was
+not reduced fails that probe and refuses to register — deliberately, because
+Terraform cannot see what IAM a passed-in service account holds elsewhere.
+
+The positive assertion is not a nicety. Two `403`s prove a reduced identity only
+if the token could have done something in the first place: an account whose
+bindings were all stripped, or a host that cannot reach Google at all, answers
+`403` to both. So if you deliberately run a Windows pool with **no** job service
+account, that pool's probe has no positive control left, and its two refusals
+are correspondingly weaker evidence.
 
 ### The Terraform
 
