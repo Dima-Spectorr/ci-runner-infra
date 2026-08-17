@@ -57,6 +57,46 @@ variable "terraform_root" {
   }
 }
 
+variable "backend_config" {
+  type        = map(string)
+  default     = {}
+  description = <<-EOT
+    Extra `-backend-config=<key>=<value>` pairs for the build's `terraform init`. Empty by default, which is right for any root that names its backend fully in `backend.tf`.
+
+    Set it for a root that deliberately does not. The Specaria-owned CI roots keep the state bucket out of `backend.tf` because it is a vendor resource rather than a customer literal, and pass it at init time — and against such a root a bare `terraform init` fails with "querying Cloud Storage failed: storage: bucket doesn't exist", which reads as a deleted bucket rather than as one that was never passed.
+
+    NOT a place for a secret. Every value here is rendered into the trigger's build config, which is readable by anyone with `cloudbuild.builds.get` and is printed in the build log.
+  EOT
+
+  # A key with an `=` in it would produce `-backend-config=a=b=c`, which
+  # terraform parses as the value `b=c` for key `a` — accepted, wrong, and
+  # invisible until the state lands somewhere nobody looks for it.
+  validation {
+    condition     = alltrue([for k in keys(var.backend_config) : can(regex("^[A-Za-z_][A-Za-z0-9_]*$", k))])
+    error_message = "backend_config keys are terraform backend attribute names (letters, digits and underscores). A key containing '=' silently changes which attribute is set."
+  }
+
+  # The paragraph above says "not a place for a secret", and a paragraph is not
+  # a control. Every backend has a credential attribute sitting right next to
+  # the bucket in its own documentation, so reaching for one here is the
+  # obvious next step rather than a careless one — and it is unrecoverable in
+  # the quiet way: the value lands in the trigger's stored build config AND in
+  # every build log, both of which are readable by every builds.get holder and
+  # neither of which is anybody's idea of a secret store. Nothing goes red, so
+  # the leak is found by whoever reads a log for an unrelated reason.
+  #
+  # The build already has an identity — var.service_account — and that is the
+  # supported way to authorize the backend. `impersonate_service_account` is
+  # deliberately NOT in this list: it names an identity, it does not carry one.
+  validation {
+    condition = length(setintersection(
+      toset([for k in keys(var.backend_config) : lower(k)]),
+      toset(["credentials", "access_token", "encryption_key", "secret_key", "access_key", "token", "password", "client_secret", "sas_token"]),
+    )) == 0
+    error_message = "backend_config must not carry a credential — it is rendered into the trigger's build config and printed in the build log, neither of which is a secret store. The build authenticates to the backend as var.service_account; grant that account access to the state bucket instead."
+  }
+}
+
 variable "service_account" {
   type        = string
   description = <<-EOT
