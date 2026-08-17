@@ -1217,6 +1217,7 @@ scan_file() {
       elif [ "$bk" = "map" ]; then
         lo="$(val_at "$r.batch_size.min")"
         mx="$(val_at "$r.batch_size.max")"
+        extra_batch_keys="$(child_keys "$r.batch_size" | grep -vx -e min -e max | tr '\n' ' ')"
         if [ "$(kind_at "$r.batch_size.min")" != "int" ] || [ "$(kind_at "$r.batch_size.max")" != "int" ]; then
           err CHECK2 "queue rule \`$r\` gives \`batch_size\` as a mapping but not as \`{min: <int>, max: <int>}\`. Mergify rejects the file and NOTHING queues."
         elif [ "$lo" -lt 1 ]; then
@@ -1231,8 +1232,15 @@ scan_file() {
         # `min` and `max` hold rather than what else is present. This gate would
         # then be green on a config the queue never loads, which is the one
         # outcome it exists to make impossible.
-        elif [ -n "$(child_keys "$r.batch_size" | grep -vx -e min -e max)" ]; then
-          err CHECK2 "queue rule \`$r\` gives \`batch_size\` a key that is not \`min\` or \`max\`: $(child_keys "$r.batch_size" | grep -vx -e min -e max | tr '\n' ' '). Mergify's schema takes those two and refuses the whole file over anything else, so nothing queues at all."
+        #
+        # Held in a variable rather than asked twice: `grep -q` cannot report
+        # WHICH key offended, and the message is the whole value of the check.
+        # The extra key's own VALUE does not matter — the reader prints a record
+        # for every node, mappings and lists included, so `spread: {enabled:
+        # true}` and `spread: [true]` both surface as the child `spread`. The
+        # `t1-batch-extra-key-*` fixtures hold that.
+        elif [ -n "$extra_batch_keys" ]; then
+          err CHECK2 "queue rule \`$r\` gives \`batch_size\` a key that is not \`min\` or \`max\`: ${extra_batch_keys}. Mergify's schema takes those two and refuses the whole file over anything else, so nothing queues at all."
         else
           hi="$mx"
         fi
@@ -1534,6 +1542,16 @@ selftest() {
   # and Mergify still refuses the whole document over it.
   expect t1-batch-extra-key CHECK2 \
     "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1\\n      max: 5\\n      spread: true\\n    batch_max_failure_resolution_attempts: 3/')" || return 1
+  # The same key carrying a MAPPING and a LIST. Raised in review as a gap on the
+  # theory that `child_keys` suppresses non-scalars; it does not — the reader
+  # prints a record for every node, so the container itself is a child of
+  # `batch_size` and only its own descendants are filtered out. These two hold
+  # that reading, so a future change to the reader that stops emitting container
+  # nodes fails here instead of silently reopening the hole.
+  expect t1-batch-extra-key-map CHECK2 \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1\\n      max: 5\\n      spread:\\n        enabled: true\\n    batch_max_failure_resolution_attempts: 3/')" || return 1
+  expect t1-batch-extra-key-list CHECK2 \
+    "$(printf '%s' "$CLEAN" | sed 's/    batch_size: 1/    batch_size:\\n      min: 1\\n      max: 5\\n      spread:\\n        - true\\n    batch_max_failure_resolution_attempts: 3/')" || return 1
   # The bisect budget MISSPELLED, on a Tier 0 rule. Before it was guarded this
   # was the gate's quietest possible failure: CHECK 2 does not look at a batch of
   # 1, so nothing here had an opinion, while Mergify refused the file outright.
