@@ -424,6 +424,7 @@ is re-run, multiplying the cost of the flakiest suites. Retry at the test level.
 | Setting | Present in | Consequence where absent |
 |---|---|---|
 | `batch_size` | Apigee-Portal (5), DataRetrival (5) | speculative CI run per PR instead of per batch |
+| `batch_max_failure_resolution_attempts` | nowhere | unbounded bisection when a batch fails, or — set too low — innocent pull requests dequeued with the culprit. **Mandatory wherever `batch_size` exceeds 1**, at `ceil(log2(max))` or above |
 | `batch_max_wait_time` | DataRetrival (1 min) | lone PRs wait for companions that never come |
 | `checks_timeout` | Apigee-Portal (40 min) | inherits an undeclared ~42-min vendor default; hangs surface as silent dequeues |
 | `scopes` | IntegrateIT | batches mix unrelated areas, so a batch failure bisects across unrelated changes |
@@ -490,6 +491,103 @@ request comment rather than a required check, because none of its dates are
 moved by the pull request being checked. See `docs/dependency-freshness.md`,
 including why `eol: false` upstream means "no date announced" and reading it as
 a boolean reports the whole fleet clean.
+
+### 7.2 What the pinned code may DO — shipped
+
+Pinning decides what arrives on a pool. It says nothing about what that code is
+allowed to do once it runs, and the default answer is the worst one available:
+omit `permissions:` and a job does not get nothing, it gets the **repository
+default** — a value in a web console, invisible in the pull request, and
+`read-write` for every repository created before GitHub changed it. On this
+fleet the resulting `GITHUB_TOKEN` is readable by every step in the job,
+including the install scripts of every transitive dependency it downloads, on a
+warm host holding a GCP identity beside other jobs' caches and trees.
+
+**Shipped:** `scripts/ci/check-workflow-permissions.sh` — PERM1 the set is
+stated (in the job or the workflow above it) rather than inherited, PERM2 a
+write sits on the job that needs it rather than on every job in the file
+(`write-all` never does; a one-job file is exempt, because there is nothing to
+move), PERM3 no `secrets: inherit` to a remote reusable workflow, PERM4
+undecided and never a pass. Run against this repository on its first pass it
+found two workflow-level writes — both single-job, both correct — which is the
+measurement that produced the one-job exemption rather than an allowlist entry.
+See `docs/ci-workflow-gates.md`.
+
+### 7.3 Where the pool connects out to — shipped
+
+The supply chain does not end at what a lockfile installs; it ends at what the
+installed code then talks to. A warm host holds a GCP identity, runs
+third-party code out of every lockfile, and reaches `0.0.0.0/0` on 443 by
+necessity — the registries publish large rotating ranges and pinning them in a
+firewall rule breaks builds on every upstream rotation. Until now nothing wrote
+down a single destination, so "did anything leave this pool" had no evidence
+either way. An exfiltration and a clean pool looked identical.
+
+Two halves, and the second is what makes the first worth paying for.
+
+**Recording.** `modules/ci-runner-network` logs its rules
+(`firewall_logging`, default `all`, `INCLUDE_ALL_METADATA`) — one entry per
+connection with the destination, port, deciding rule and disposition. Not Cloud
+NAT logs (this estate peers out through a central firewall, there is no NAT
+here) and not VPC flow logs (the module does not own the subnet). It owns the
+rules, and the rules carry the same 5-tuple. The health-check rule is never
+logged at any setting: probes every few seconds per host forever would bury the
+record they were charged for.
+
+**Reading.** Refusals are alertable and are now an alert
+(`ci_egress_denied`, a log-based metric, and the *egress refused* policy) —
+before it, a blocked egress presented as a test client hanging until the job
+timed out. Allowed destinations are the interesting half and are *not*
+alertable: Cloud Monitoring knows *more*, not *new*, and the connection that
+matters is one packet. So `scripts/ci/egress-destinations.sh` diffs the window
+against a baseline committed under `docs/egress-baselines/`, keyed by owning
+ASN rather than address so a CDN rotation is one destination and a rented VPS
+is a different key on its first packet. A new destination is a pull request
+adding a line. A tool that updated its own baseline would agree with whatever
+happened last night, including the thing it exists to catch.
+
+### 7.4 What the fleet actually RUNS ON — shipped
+
+7.1 and 7.2 both look at what a pull request pulls in. Neither looks below it.
+Every warm host in this fleet boots one golden image, and the only description
+of that image was the template that built it — a list of what was *asked for*,
+which stops being the same set the moment a transitive dependency moves, and
+which says nothing about whether any of it is known-vulnerable.
+
+That is not a hypothetical gap. `node_major` was pinned to 22 and sat ten months
+past the end of its support window before anyone noticed, and that value is
+written down in the template in plain text. Everything apt resolved underneath
+it was not written down anywhere at all.
+
+**Shipped:** the image build produces an SBOM of its own finished filesystem
+(`syft`, pinned + checksum-verified), scans it (`grype`, likewise), and refuses
+to create the image when the scan finds something **fixable** at or above
+`_VULN_FAIL_ON`. The SBOM is published to `_SBOM_BUCKET` and also left on the
+image at `/opt/ci-image-sbom/`, so a host that turns out to be affected by
+something disclosed later is answerable on the box.
+
+Three design choices, each against a specific way this kind of gate dies:
+
+- **Only fixable findings block.** A gate that fails on something nobody can act
+  on acquires an `|| true` within a month. Unfixable findings are still reported.
+- **Every exception expires.** `docs/image-vuln-ignores.txt` entries carry a
+  date; the day after it the gate goes red and names the entry. The failure mode
+  of a vulnerability gate is not missing something — it is becoming a file of
+  exceptions added under deadline and never revisited.
+- **The decision is a separate, unit-tested script.** `image-vuln-verdict.sh`
+  runs against fixtures in this repository's CI. The alternative is a policy
+  observable only inside a forty-minute image build that no consumer's CI runs —
+  which is how the `inline_shebang` defect in 7.2's neighbourhood survived.
+
+The floor starts at `critical`, not `high`, deliberately: the steady-state
+finding count for a full Ubuntu userspace plus docker, node and PowerShell is
+not yet known, and a gate that is red on its first run for reasons nobody
+intends to act on is a gate somebody removes. The reports this now publishes are
+what will justify lowering it.
+
+**Not covered:** the Windows image. syft has almost nothing to catalog on that
+filesystem, and an SBOM listing four packages would read as a clean result while
+describing nothing.
 
 ---
 

@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.24.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.25.0"
   # ...
 }
 ```
@@ -142,6 +142,48 @@ state that was invisible on 2026-08-15 — alert on sustained non-zero, not on t
 spike, because the spike is a release working. `ci_recycle_verdicts` counts
 `cordoned` and `retired` per tick: `cordoned` climbing while `retired` stays flat
 means the recycle is working and the hosts are not leaving — jobs that never end.
+
+### What is in the golden image, and whether it may ship
+
+Every warm host in this fleet boots one artifact, and until now the only account
+of its contents was `packer/ci-host-image.pkr.hcl` — which lists what was *asked
+for*, not what apt resolved, and says nothing at all about whether any of it is
+known-vulnerable. That gap has a measured cost already at one level up:
+`node_major` sat ten months past its support window because nothing was in a
+position to check it.
+
+So the build now scans itself, in this order and for a reason:
+
+1. **An SBOM of the finished filesystem** (`syft`, pinned and checksum-verified),
+   after the cleanup step, so it describes what ships rather than what the build
+   was holding. It is published to `_SBOM_BUCKET` **and** left on the image at
+   `/opt/ci-image-sbom/sbom.spdx.json` — when something is disclosed next month,
+   the question "is it in the image that pool is pinned to" has to be answerable
+   from the running host, long after the build workspace is gone.
+2. **A scan of that SBOM** (`grype`, likewise pinned).
+3. **A verdict** — `scripts/ci/image-vuln-verdict.sh`, which is where the policy
+   lives and is unit-tested against fixtures in this repo's own CI, because a
+   rule only observable inside a forty-minute image build that nobody's CI runs
+   is a rule nobody can change with confidence.
+
+The verdict blocks only on findings **with an available fix** at or above
+`_VULN_FAIL_ON` (default `critical`). Failing on something nobody can act on is
+how a gate earns an `|| true` within a month. Exceptions go in
+`docs/image-vuln-ignores.txt` and **carry an expiry date**: the day after it, the
+gate goes red and names the entry, which forces the decision again rather than
+letting the list grow quietly. A report that cannot be read, or that matched
+nothing at all, is a **failure** — never a clean image.
+
+It runs **before** the image is created, so a blocking finding means no image
+exists, rather than an image that exists and is documented as unusable. The
+report is downloaded to the build workspace *before* the failing check, because
+an aborted build is exactly the one whose report somebody needs.
+
+**Windows is not covered.** `packer/ci-host-image-win.pkr.hcl` builds a very
+different filesystem, and syft's catalogers would find almost nothing to
+enumerate on it — an SBOM listing four packages would read as "the Windows image
+is clean" while describing nothing. Saying so here is the honest state; giving
+that image a real answer is separate work, not a line in this one.
 
 ## Isolation rules (not optional)
 
@@ -460,7 +502,7 @@ bound whenever that sweep ran out of budget.
 distinguish from "the pool is idle".
 
 `scripts/ci/ensure-alert-policies.sh --project <id> --email <addr>` brings one
-project's policies up to the fleet's, idempotently. Two of the eight watch the
+project's policies up to the fleet's, idempotently. Two of the nine watch the
 cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it
 below the pool's `cache_snapshot_max_age_hours`, or the first notice anyone gets
 is every host starting cold) and *hydrate failing on a configured pool*, which
@@ -470,10 +512,30 @@ controller policies: their series appear once per boot, and asking a sporadic
 series to hold a condition for ten minutes silences exactly the pool with few
 boots and every one of them broken.
 
+The ninth watches the egress record. `modules/ci-runner-network` logs the runner
+firewall rules, so a refused outbound connection is now an entry rather than a
+test client hanging until the job times out; a log-based metric counts those and
+*egress refused* pages on a sustained run. The refusals are the alertable half.
+The **allowed** destinations are the interesting half and no threshold can
+express them — "somewhere new" is not "more" — so they are a diff instead:
+
+```
+scripts/ci/egress-destinations.sh --project <id> --fail-on-new
+```
+
+reads the window, keys each destination by the owning network rather than the
+address (`as:36459|US|443` — a CDN rotation is one destination, a rented VPS is
+a different ASN on the first packet) and reports anything absent from the
+project's committed baseline under `docs/egress-baselines/`. A new destination
+is then a pull request adding a line, reviewed by somebody who knows whether the
+pool should be talking to it. `--update-baseline` seeds a pool's first one, and
+seeding it is an act of review rather than a formality.
+
 ## Layout
 
 ```
-modules/ci-runner-network/       the per-project firewall posture (no NAT)
+modules/ci-runner-network/       the per-project firewall posture (no NAT),
+                                 and the log of where the pool connects out to
 modules/ci-runner-cache-bucket/  where a pool's cache lives between hosts
 modules/ci-runner-apply-trigger/ the unattended apply, as the project's OWN Cloud Build
 modules/ci-host-image-trigger/   the golden image, rebuilt by a merge instead of by hand
@@ -485,6 +547,8 @@ modules/ci-runner-host-pool/     the module consumers reference
   scripts/controller-startup.sh  poll, publish, drain
   scripts/telemetry.sh           the single metric publisher
 packer/ci-host-image.pkr.hcl     the golden image; repo-agnostic
+scripts/ci/image-vuln-verdict.sh what the image may ship with (unit-tested)
+docs/image-vuln-ignores.txt      the dated exceptions to that
 scripts/ci/lane-decision.sh      pure CI-lane rule (unit-tested)
 scripts/ci/                      self-tests
 docs/onboarding-a-repository.md  how to put a NEW repo on the fleet
@@ -493,7 +557,13 @@ scripts/ci/check-merge-queue-single-step.sh
 scripts/ci/check-runner-policy.sh
                                  which pool a job may claim, and for how long
 scripts/ci/check-action-pins.sh  every third-party action pinned to a commit
+scripts/ci/check-workflow-permissions.sh
+                                 what a job may do to the repo, stated not inherited
 scripts/ci/check-e2e-policy.sh   does a consumer's browser suite report honestly, and fast
+scripts/ci/egress-destinations.sh
+                                 where the pool connected out to, diffed against
+                                 a reviewed baseline
+docs/egress-baselines/           that baseline, one file per project
 docs/ci-workflow-gates.md        those gates: rules, flags, how to adopt
 docs/ci-lane-model.md            the lane contract consumers adopt
 docs/ci-merge-queue-baseline.md  one CI run per PR: the queue config + gate
@@ -523,7 +593,7 @@ requirements and the order they must be done in. The audit that produced it,
 with per-repository measurements, is in
 [`docs/ci-optimization-catalog.md`](docs/ci-optimization-catalog.md).
 
-## One CI run per pull request
+## One CI run per pull request, or one per batch
 
 The lane model decides how much CI a pull request deserves; it does not decide
 how many times that CI runs. Mergify validates a queued pull request on a
@@ -533,11 +603,28 @@ unbatched, retry-free and single-step, and the fleet was in that state on
 2026-08-14 (one repository's config was rejected outright and its queue was
 failing closed).
 
-`scripts/ci/check-merge-queue-single-step.sh` is that rule, self-tested here on
-13 fixtures and copied into each consuming repository under the same name.
+That is **Tier 0**, and it is right for a repository whose pull requests wait
+on CI. A repository whose pull requests wait on the *queue* — merge cadence
+slower than one CI run — moves to **Tier 1**, where the second run is paid once
+per batch rather than once per pull request. The two tiers differ by two
+numbers in the gate, `MPC_MAX` and `BATCH_MAX`, and by nothing else.
+
+**They are not the same kind of number.** Queue throughput is
+`batch_size × max_parallel_checks`, but the runner bill is
+`max_parallel_checks` alone: each parallel check is another concurrent CI run
+drawn from the shared fleet, while each extra pull request in a batch rides a
+run that is already happening. Wanting more throughput is an argument for
+`batch_size`. It is never an argument for the width.
+
+`scripts/ci/check-merge-queue-single-step.sh` is that rule, self-tested here —
+including the Tier 1 detectors, which the fixtures exercise by raising the
+ceilings for their own duration, so a repository that moves tiers inherits
+proven checks rather than shipping untested ones. It is copied into each
+consuming repository under the same name.
 [`docs/ci-merge-queue-baseline.md`](docs/ci-merge-queue-baseline.md) has the
-reference `.mergify.yml`, the five properties, and where the gate must sit for
-a `.mergify.yml`-only change to reach it.
+reference `.mergify.yml` for both tiers, the five properties, the measurement
+that justifies a tier move, and where the gate must sit for a
+`.mergify.yml`-only change to reach it.
 
 ## Releasing a version
 

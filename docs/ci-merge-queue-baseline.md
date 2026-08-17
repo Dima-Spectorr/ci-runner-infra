@@ -1,4 +1,4 @@
-# The merge-queue baseline — one CI run per pull request
+# The merge-queue baseline — one CI run per pull request, or one per batch
 
 The lane model in [`ci-lane-model.md`](ci-lane-model.md) decides *how much* CI a
 pull request deserves. This decides *how many times it runs*. They are
@@ -10,6 +10,15 @@ Adopt this together with the lane model. It is copy-in, not by-tag: the file it
 governs (`.mergify.yml`) lives in the consuming repository, so what is published
 here is the required shape, the gate that asserts it, and where the gate must
 sit.
+
+**Revised 2026-08-17.** This document used to say one thing — *one CI run per
+pull request* — so a repository whose queue had become its bottleneck could only
+obey it or leave it. Twelve of the thirteen fleet repositories are still exactly
+right to obey it, and nothing below changes for them. The thirteenth found the
+way out; the way out is much narrower than "raise something", and the number it
+raised is not the one that looks obvious. Read
+[Two tiers](#two-tiers-and-the-only-way-to-move-between-them) before changing
+any value in this file.
 
 ---
 
@@ -33,11 +42,108 @@ whenever the configuration cannot guarantee the first run is still valid.
 
 ---
 
-## The five properties
+## Two tiers, and the only way to move between them
+
+### Tier 0 — in place. The default, and where twelve of thirteen repositories belong.
+
+`max_parallel_checks: 1`, `batch_size: 1`. One CI run per pull request. The five
+properties below are its definition. **Do not leave this tier to be faster in
+principle.** Leave it only on the measurement in the next paragraph.
+
+### Tier 1 — batched drafts. For a repository whose QUEUE is the bottleneck.
+
+The trigger is one specific, measurable thing, and it is not "CI is slow" or
+"there are a lot of PRs":
+
+> A strict queue re-validates its front entry against a main that every merge
+> has just moved, so at width 1 the next entry starts a **cold** run after each
+> merge. When *merge cadence is slower than one CI run*, the queue — not CI —
+> is what pull requests are waiting on.
+
+Measured on IntegrateIT #5293 (2026-07-31): its own CI was green at 15:47, it
+entered the queue at 15:49, and by 16:01 two successive queue drafts had each
+re-run the whole suite. The pull request was not slow; the queue was serialised
+behind its own merges.
+
+If merges keep up with CI, you are in Tier 0 and raising anything buys nothing.
+
+### The knob to raise is `batch_size`. It is not `max_parallel_checks`.
+
+This is the whole point of the tier, and the version of this document that
+existed before 2026-08-17 pushed readers the wrong way (see the retracted bullet
+under [What a consuming repository must not do](#what-a-consuming-repository-must-not-do)).
+
+|  | pull requests validated at once | concurrent CI runs |
+|---|---|---|
+| `max_parallel_checks: N` | ×N | **×N** |
+| `batch_size: N` | ×N | **×1** |
+
+A batch is validated by **one** draft run whatever its size, so each extra pull
+request in a batch rides a run that is already happening. Width buys the same
+throughput and bills a full CI run for each step. **Throughput is the product;
+the runner bill is the width alone.**
+
+IntegrateIT went 5/1 → 3/`{min: 1, max: 5}` on 2026-08-17: in-flight capacity 5
+→ 15 pull requests, peak runner demand ~25 → ~15, second-CI cost per pull
+request 1 → as little as 0.2 runs. It got three times the queue capacity while
+*returning* runners to the fleet.
+
+### Tier 1's mandatory companion: bound the bisect
+
+Batching's risk is not cost, it is **blame** — a batch fails as a unit. Mergify
+answers this by bisecting: it splits a failed batch and re-checks the halves
+until a single-PR batch fails, and that one is the culprit. The budget for that
+is `batch_max_failure_resolution_attempts`, and **both of its defaults are wrong
+for every repository here**:
+
+- unset → `null` → unlimited splits, so one flaky test becomes an unbounded
+  chain of draft runs while everything behind it waits;
+- `0` → the whole batch is dequeued on the first failure, punishing four pull
+  requests for a fifth.
+
+**The invariant is `attempts >= ceil(log2(batch_size.max))`**, per queue rule.
+Below it the bisect can end with pull requests still unseparated and all of them
+are dequeued for a failure one of them caused. `batch_size: {max: 5}` therefore
+requires `attempts: 3`.
+
+Do **not** reach for a second queue or for `scopes` as the isolation mechanism.
+`scopes` makes batches more *coherent*; it is a preference, not isolation, and
+Mergify will still batch across scopes when that is what the ready pool offers.
+A second queue is worse: its routing predicate lives in the condition list,
+which Mergify re-evaluates **at merge time against the speculative draft** — a
+branch carrying the other entries' files. IntegrateIT #8318 was dequeued twice,
+four hours apart, on `-files~=^(apps|packages|tests)/` for files it did not
+have.
+
+### The fleet runner budget — the invariant no single repository can see
+
+The self-hosted fleet is **shared**. Each repository's `max_parallel_checks`
+spends from the same pool, and a `.mergify.yml` reviewed inside one repository
+cannot see the others' claims. So:
+
+> **`Σ over repositories (max_parallel_checks × peak runners per CI run)` must
+> stay at or under the runners ONLINE, not under the autoscaler ceiling.**
+
+Online, not the ceiling: the MIG is `OPPORTUNISTIC` and scale-up lags a burst.
+On 2026-08-13 the fleet was ten online with nine busy while 42 ready pull
+requests competed for it, and four speculative validations were enough to starve
+ordinary PR CI into mass cancellation and queue churn. The autoscaler being
+allowed to reach 32 did not help, because it had not.
+
+Twelve repositories at width 1 are a small, roughly constant claim. **A width
+above 1 in a second repository is a fleet-level change and needs the sum
+recomputed, in the pull request that makes it.** This is also the reason Tier 1
+prefers batch size: raising `batch_size` does not appear in that sum at all.
+
+---
+
+## The five properties (Tier 0)
 
 In-place checking requires ALL of these. Break any one and the queue silently
 moves to the throwaway draft — merges keep working, only the runner bill
-changes.
+changes. A Tier 1 repository deliberately gives up 1 and 2 and **still owes 3,
+4 and 5**: those are about gates that must not disagree, which is a correctness
+property at any width.
 
 1. **`merge_queue.max_parallel_checks: 1`, as a TOP-LEVEL key.** Inside a queue
    rule it is not ignored — Mergify rejects the whole file with
@@ -47,7 +153,10 @@ changes.
    than anything about the branch. Found in that state in one fleet repository
    (Atlas, fixed in its #1945); the file had looked correct for months.
 2. **`batch_size: 1` in every queue rule.** A batch has to be assembled
-   somewhere, and that somewhere is a branch.
+   somewhere, and that somewhere is a branch. `batch_size` also accepts a
+   `{min, max}` mapping (dynamic batching), which counts as 1 only when both
+   bounds are 1 — a gate that understands only the integer form silently
+   accepts an unbounded range.
 3. **No `max_checks_retries`.** Retrying a check needs a branch to retry it ON.
 4. **Single-step CI** — Mergify's schema defines this as `merge_conditions`
    being EMPTY or IDENTICAL to `queue_conditions`.
@@ -113,7 +222,7 @@ what decides when a queued pull request embarks.
 
 ---
 
-## The reference configuration
+## The reference configuration (Tier 0)
 
 ```yaml
 merge_queue:
@@ -139,6 +248,27 @@ merge_protections_settings:
   auto_merge_conditions:
     - base = main
     - -draft
+```
+
+### …and the Tier 1 delta
+
+Only the two values change, and only together with the third:
+
+```yaml
+merge_queue:
+  # A FLEET-LEVEL number. Recompute the runner budget in the PR that moves it.
+  # Reaching for throughput? Raise batch_size instead — it is not in that sum.
+  max_parallel_checks: 3
+
+queue_rules:
+  - name: default
+    # ... everything above is unchanged ...
+    batch_size:
+      min: 1          # a light queue keeps single-PR latency
+      max: 5
+    # ceil(log2(max)). Unset means unlimited bisect splits; 0 dequeues the whole
+    # batch on first failure. Raise this WITH batch_size.max, never after.
+    batch_max_failure_resolution_attempts: 3
 ```
 
 The condition list mirrors the branch ruleset's required checks **exactly**, and
@@ -383,18 +513,52 @@ Three failures around the parse rather than in it, each with a fixture:
 - **Do not restate `check-success` conditions in `auto_merge_conditions`.**
 - **Do not host the gate in a path-filtered job.** It is the one gate whose
   subject matter guarantees the filter excludes it.
-- **Do not raise `batch_size` to drain a backlog.** It re-introduces the
-  throwaway draft, so the backlog is then draining at two CI runs per merge.
+- **Do not set `batch_size` above 1 without
+  `batch_max_failure_resolution_attempts >= ceil(log2(max))`.** The bisect then
+  ends with pull requests unseparated and dequeues ones that did not fail. This
+  is the shape found live in Manar on 2026-08-17: `batch_size: 5`, no attempt
+  bound, and `max_parallel_checks` unset so the width was the vendor's too.
+- **Do not raise `max_parallel_checks` to go faster.** It is the one knob whose
+  cost is linear in runners, it spends from a pool shared with every other
+  repository, and `batch_size` buys the same throughput for free. A width above
+  1 is a fleet-level change; recompute the runner budget in the same pull
+  request.
+
+> **Retracted 2026-08-17:** this list used to read *"Do not raise `batch_size`
+> to drain a backlog — it re-introduces the throwaway draft, so the backlog is
+> then draining at two CI runs per merge."* The premise was right and the
+> conclusion was backwards. A draft validates the whole **batch** in one run, so
+> a batch of five drains at 0.2 second-CI runs per merge, not two — and a reader
+> who accepted the bullet was left reaching for `max_parallel_checks`, which
+> genuinely does cost a full run per step. IntegrateIT sat at width 5 with
+> `batch_size: 1` for exactly this reason. Kept visible rather than deleted,
+> because the deleted version of a rule is the one that gets re-derived.
 
 ---
 
-## Fleet status (2026-08-14)
+## Fleet status (re-surveyed 2026-08-17)
 
-Every repository in the fleet that runs a Mergify queue has been converted.
-Landed: DataRetrival #2384, IntegrateIT #7778, Specaria-Platform #3225,
-Print-Server #1833, CarListPrice #14, SOAP-To-REST #2036, mot-face-blur #56,
-Telnet-Emulation #710, entity-platform #269. Open: Apigee-Portal #2329,
-Atlas #1945.
+Read live from each repository's `.mergify.yml`, not from the conversion PR list
+— a landed conversion is not evidence the file still says what it said.
+
+| repository | width | batch | attempts | tier |
+|---|---|---|---|---|
+| DataRetrival, Specaria-Platform, Print-Server, CarListPrice, SOAP-To-REST, mot-face-blur, Telnet-Emulation, entity-platform, Apigee-Portal, Atlas, ci-runner-infra | 1 | 1 | — | **0**, correctly |
+| IntegrateIT | 3 | `{1, 5}` | 3 | **1** |
+| **Manar** | **unset** | **5** | **none** | **broken** |
+
+**Manar is the fleet's one real defect, and it never appeared in the conversion
+list above.** It batches five pull requests with no bisect bound, so any batch
+failure dequeues all five; and with `max_parallel_checks` unset the width is the
+vendor's default rather than a number anyone here chose, which is an unbounded
+claim on the shared runner pool. It is the exact combination the two "must not"
+bullets above now name. Fixing it is a one-file change to Tier 0 — Manar's queue
+is not its bottleneck.
+
+Landed conversions, for history: DataRetrival #2384, IntegrateIT #7778,
+Specaria-Platform #3225, Print-Server #1833, CarListPrice #14, SOAP-To-REST
+#2036, mot-face-blur #56, Telnet-Emulation #710, entity-platform #269,
+Apigee-Portal #2329, Atlas #1945.
 
 The gate itself keeps moving, and a copy that stopped moving with it is the
 failure this whole document is about — a file that looks enforced. The version

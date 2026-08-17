@@ -290,12 +290,21 @@ continues still reports red, so nothing is loosened.
 - Lane `none` enters a `docs` queue with `priority: high` and no batching.
   Still serialized, so merge ordering holds — just never behind a heavy batch.
 - **A second queue rule is a second place to lose in-place checking.** Every
-  rule needs its own `batch_size: 1` and its own `queue_conditions: &anchor` /
+  rule needs its own `batch_size` **and** its own `queue_conditions: &anchor` /
   `merge_conditions: *anchor`; one unanchored rule means every pull request
   that rule admits pays a second full CI pass, on a file that reads as
-  compliant. The whole contract, and the gate that asserts it, is in
+  compliant. Batching is inherited PER RULE, so a rule that simply omits
+  `batch_size` batches at the vendor default however carefully its neighbours
+  are pinned. The whole contract, and the gate that asserts it, is in
   [`ci-merge-queue-baseline.md`](ci-merge-queue-baseline.md) — adopt it with
   this model, not after it.
+- **`batch_size: 1` is the Tier 0 value, not a universal one.** A repository
+  whose merge cadence is slower than one CI run has the queue, not CI, as its
+  bottleneck, and batches up to five — paired with a
+  `batch_max_failure_resolution_attempts` of at least `ceil(log2(max))` so a
+  failed batch bisects to the culprit instead of dequeuing its neighbours. The
+  measurement that justifies the move, and the reason the knob to raise is
+  `batch_size` and never `max_parallel_checks`, are in the same document.
 - **A base move re-checks the lanes it can affect, not all of them.** The lane
   rule answers how much CI a *diff* deserves; it does not answer what a move of
   the default branch under an in-flight pull request deserves. That is the

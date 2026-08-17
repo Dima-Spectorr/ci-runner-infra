@@ -126,7 +126,7 @@ else
   echo "channel exists: $channel"
 fi
 
-# ── the eight policies ───────────────────────────────────────────────────────
+# ── the nine policies ────────────────────────────────────────────────────────
 # `duration` is what stops each of these paging on a blip, and every controller
 # threshold below is deliberately longer than one controller tick.
 #
@@ -236,8 +236,46 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    egressdenied) cat <<EOF
+{ "displayName": "CI runners / egress refused",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "A warm host tried to open an outbound connection the runner firewall refused. Read the entries — logName compute.googleapis.com/firewall, jsonPayload.disposition=DENIED — for the destination address and port. Two very different causes, and the log tells them apart: an ordinary port the pool legitimately needs and nobody added (add it to egress_tcp_ports, or to database_egress_ports if it is a database on a private address), or a job reaching somewhere it has no business reaching, which is a warm host running third-party code from a lockfile. Before this metric existed the first case looked like a test client hanging until the job timed out, and the second looked like nothing at all. Fires on a sustained run, not a single refusal: one blocked probe is ordinary." },
+  "conditions": [ { "displayName": "ci_egress_denied > 0 for 15m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "900s",
+      "filter": "metric.type=\"logging.googleapis.com/user/ci_egress_denied\" AND resource.type=\"gce_instance\"",
+      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_SUM" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
   esac
 }
+
+# ── log-based metrics ─────────────────────────────────────────────────────────
+# The egress record is a LOG, not a series, so the one alertable fact in it has
+# to be counted into a metric first. Only the refusals: counting the allows
+# would be a metric that rises with build volume and says nothing, and the
+# allowed destinations are answered by egress-destinations.sh against a reviewed
+# baseline — a question about novelty, which no threshold can express.
+#
+# Created before the policy, because a policy naming a metric type Cloud
+# Monitoring has never seen is rejected outright.
+ensure_log_metric() {  # <name> <description> <filter>
+  local name="$1" desc="$2" filter="$3"
+  if g logging metrics describe "$name" >/dev/null 2>&1; then
+    if [ "$DRY" = "1" ]; then echo "$PROJECT: would update log metric $name"; return 0; fi
+    g logging metrics update "$name" --description="$desc" --log-filter="$filter" >/dev/null
+    echo "$PROJECT: updated  log metric $name"
+  else
+    if [ "$DRY" = "1" ]; then echo "$PROJECT: would create log metric $name"; return 0; fi
+    g logging metrics create "$name" --description="$desc" --log-filter="$filter" >/dev/null
+    echo "$PROJECT: created  log metric $name"
+  fi
+}
+
+ensure_log_metric ci_egress_denied \
+  "Outbound connections the CI runner firewall refused. Non-zero is either a port the pool needs and nobody added, or a job reaching somewhere it should not." \
+  'logName:"compute.googleapis.com%2Ffirewall" AND jsonPayload.rule_details.direction="EGRESS" AND jsonPayload.disposition="DENIED"'
 
 # ── metric descriptors ────────────────────────────────────────────────────────
 # An alert policy cannot be created against a metric type Cloud Monitoring has
@@ -307,7 +345,7 @@ ensure_descriptor ci_cache_dirs_hydrated     "Tool caches moved in. Zero alongsi
 
 existing="$(g alpha monitoring policies list --format='value(displayName,name)' 2>/dev/null || true)"
 
-for key in heartbeat blind idle queue drain slowtick cachestale cachefail; do
+for key in heartbeat blind idle queue drain slowtick cachestale cachefail egressdenied; do
   policy_json "$key" >"$tmp/p.json"
   name="$(sed -n 's/.*"displayName": "\(CI runners \/ [^"]*\)".*/\1/p' "$tmp/p.json" | head -1)"
   id="$(printf '%s\n' "$existing" | awk -F'\t' -v n="$name" '$1==n {print $2}' | head -1)"

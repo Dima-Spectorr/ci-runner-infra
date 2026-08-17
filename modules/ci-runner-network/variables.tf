@@ -98,3 +98,32 @@ variable "egress_udp_ports" {
   default     = ["53"]
   description = "UDP destination ports the runner VMs may egress to. 53 = DNS resolution."
 }
+
+variable "firewall_logging" {
+  type        = string
+  default     = "all"
+  description = <<-EOT
+    Whether the runner firewall rules record the connections they act on.
+
+      all     — both the allows and the deny. This is the only setting that
+                produces a record of WHERE the pool connects out to.
+      denied  — the deny rule only: what was refused, not what was reached.
+      off     — no record at all.
+
+    Default is `all`, because the destination inventory is the whole reason the
+    variable exists and a pool that logs nothing cannot be asked the question
+    later. It is a knob rather than a constant because the volume is real: one
+    log entry per connection, on hosts that talk to a package registry
+    thousands of times per job.
+
+    `denied` is the cheap setting, not the safe one. It answers "what did the
+    rules stop", which is the smaller half — the interesting egress from a warm
+    host holding a GCP identity is the egress that was ALLOWED, because the
+    rules allow 443 to 0.0.0.0/0.
+  EOT
+
+  validation {
+    condition     = contains(["all", "denied", "off"], var.firewall_logging)
+    error_message = "firewall_logging must be one of: all, denied, off."
+  }
+}

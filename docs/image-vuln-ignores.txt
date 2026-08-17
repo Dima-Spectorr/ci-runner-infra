@@ -1,0 +1,37 @@
+# Vulnerabilities the golden host image is allowed to ship with, and until when.
+#
+# Read by scripts/ci/image-vuln-verdict.sh, which runs inside the image build
+# (packer/ci-host-image.pkr.hcl, step 10). An entry here stops one finding from
+# blocking the build. Nothing else about it changes: the finding is still in the
+# SBOM, still in the grype report, and still printed by the verdict as `ignored`.
+#
+# FORMAT — three fields, whitespace-separated, the third running to end of line:
+#
+#   <vulnerability-id>  <expiry YYYY-MM-DD>  <reason>
+#
+# Blank lines and `#` comments are skipped. A line with fewer than three fields
+# FAILS the gate rather than being ignored — an exception nobody can read is not
+# an exception, it is a hole with a CVE number next to it.
+#
+# WHY EVERY ENTRY EXPIRES
+#   The failure mode of a vulnerability gate is not that it misses something. It
+#   is that it becomes a file of exceptions added under deadline and never
+#   revisited, at which point the build is green because the list grew, not
+#   because the image got better. So an entry is live until its expiry date
+#   INCLUSIVE, and the day after it the gate goes RED and names the entry —
+#   which forces the same decision again, with current information: is it fixed
+#   now, is the reason still true, or is this image simply shipping with it.
+#
+#   Pick the date by when you expect to look again, not by how long you want
+#   quiet. Ninety days is a large number here.
+#
+# WHAT DOES NOT BELONG HERE
+#   A finding with no available fix. Those never block in the first place — the
+#   verdict only blocks on findings grype reports as `fixed`, because a gate that
+#   fails on something nobody can act on gets an `|| true` on it within a month.
+#   Adding an unfixable CVE here says nothing and expires into a false alarm.
+#
+# ── entries ──────────────────────────────────────────────────────────────────
+# (none — the image currently ships with no accepted fixable findings at or
+#  above the severity floor. Keep it that way if you can; every line below this
+#  one is a promise to come back.)

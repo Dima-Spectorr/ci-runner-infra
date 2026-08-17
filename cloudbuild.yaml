@@ -59,6 +59,15 @@ substitutions:
   _RUNNER_VERSION: 2.336.0
   # Optional path (in this repo) to a cache-warming script for the image.
   _WARM_CACHE_SCRIPT: ""
+  # Severity floor at which a FIXABLE vulnerability in the finished image stops
+  # the build. See `vuln_fail_on` in packer/ci-host-image.pkr.hcl for why the
+  # default is critical rather than high.
+  _VULN_FAIL_ON: critical
+  # Where the SBOM and scan report are published. Empty keeps them in the build
+  # log only — which is enough to read once and useless three months later, when
+  # the question is "was CVE-X in the image that pool is pinned to". Point it at
+  # a bucket in an allowed location and the answer becomes a file lookup.
+  _SBOM_BUCKET: ""
 
 options:
   logging: CLOUD_LOGGING_ONLY
@@ -100,8 +109,18 @@ steps:
         # one on every image build is a network dependency for nothing.
         python3 -c "import zipfile;zipfile.ZipFile('/tmp/packer.zip').extractall('/usr/local/bin')"
         chmod +x /usr/local/bin/packer
+        # Packer downloads the SBOM and scan report into here (see provisioner
+        # 12). Created up front rather than relied on: a download destination
+        # that does not exist is a provisioner failure, at the end of a
+        # forty-minute build.
+        mkdir -p image-scan
         cd packer
         packer init ci-host-image.pkr.hcl
+        # $$ throughout: Cloud Build resolves `$name` as a substitution and
+        # rejects the build config outright when the name is not one it knows,
+        # so a plain shell variable here fails before a step ever runs. `$$`
+        # is the documented escape and reaches the shell as a single `$`.
+        rc=0
         packer build \
           -var "project_id=$PROJECT_ID" \
           -var "zone=${_ZONE}" \
@@ -113,7 +132,28 @@ steps:
           -var "image_version=${_IMAGE_VERSION}" \
           -var "runner_version=${_RUNNER_VERSION}" \
           -var "warm_cache_script=${_WARM_CACHE_SCRIPT}" \
-          ci-host-image.pkr.hcl
+          -var "vuln_fail_on=${_VULN_FAIL_ON}" \
+          ci-host-image.pkr.hcl || rc=$$?
+
+        # PUBLISHED HERE, NOT IN A LATER STEP, and that is the whole point.
+        #
+        # A blocking vulnerability finding aborts `packer build`, and a Cloud
+        # Build step that exits non-zero ends the build — every step after it is
+        # skipped. So a publish step of its own would run on exactly the builds
+        # whose report nobody needs, and never on the ones where the report IS
+        # the output. The exit code is held and re-raised below instead.
+        cd ..
+        if [ -n "${_SBOM_BUCKET}" ]; then
+          gcloud storage cp -r image-scan/* \
+            "gs://${_SBOM_BUCKET}/ci-host-image/${_IMAGE_FAMILY}-${_IMAGE_VERSION}/" \
+            --project="$PROJECT_ID" || echo "WARNING: publishing the SBOM failed; it is still in this log"
+          echo "SBOM + scan: gs://${_SBOM_BUCKET}/ci-host-image/${_IMAGE_FAMILY}-${_IMAGE_VERSION}/"
+        else
+          echo "WARNING: _SBOM_BUCKET is unset — the SBOM and scan report exist only in this build's workspace, which is discarded."
+        fi
+        cat image-scan/verdict.txt || true
+
+        exit $$rc
 
   - id: report
     name: gcr.io/cloud-builders/gcloud

@@ -133,6 +133,18 @@ jobs:
           [ "$n" -gt 0 ] || { echo "::error::no packer template was parsed"; exit 1; }
           echo "parsed $n packer template(s)"
 
+      # The image now scans itself and refuses to be created when the scan finds
+      # something fixable at or above the floor. That refusal is a DECISION —
+      # which findings block, which ignores are still live, what an unreadable
+      # report means — and the only place it would otherwise be observable is
+      # forty minutes into an image build that nobody's CI runs. So the decision
+      # lives in a script with no grype and no image behind it, and the fixtures
+      # exercise it here: a fixable critical, an unfixable one, a live ignore, an
+      # ignore a day past its expiry, an unreadable report, and a report that
+      # matched nothing at all — which is a failure, not a clean image.
+      - name: image vulnerability verdict self-test
+        run: bash scripts/ci/image-vuln-verdict.sh --selftest
+
       # Those three sweeps read `*.sh` and `run:` blocks, and are blind to a
       # `.ps1`. Windows hosts are driven by PowerShell, so the fleet is about to
       # grow code that no gate in this file can read. These three steps land one
@@ -208,7 +220,7 @@ jobs:
           $cfg.Run.PassThru = $true
           $cfg.Output.Verbosity = 'Detailed'
           $r = Invoke-Pester -Configuration $cfg
-          $floor = 174
+          $floor = 189
           Write-Output "pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.TotalCount) discovered"
           if ($r.TotalCount -lt $floor) {
             throw "Pester discovered only $($r.TotalCount) test(s), fewer than the $floor this suite is known to contain — the suite did not run, whatever the exit code says"
@@ -391,6 +403,14 @@ jobs:
       - name: metric contract self-test
         run: bash scripts/ci/metric-contract.selftest.sh
 
+      # The firewall now records where the pool connects out to, and a record
+      # nobody reads is a cost with no benefit. This exercises the aggregation
+      # against fixture log entries rather than a live project: the shape of a
+      # firewall LogEntry is the thing most likely to be wrong, and discovering
+      # that against a real pool costs a day of nobody noticing.
+      - name: egress destinations self-test
+        run: bash scripts/ci/egress-destinations.sh --selftest
+
       # The outcome series is the first one to carry a label the fleet does not
       # write itself: a workflow name, repository-authored, reaching a JSON body
       # built by concatenation. A single quote in one would not spoil one label
@@ -461,6 +481,19 @@ jobs:
 
       - name: action pins
         run: bash scripts/ci/check-action-pins.sh
+
+      # The other half of that rule. Pinning decides what code ARRIVES on a
+      # pool; this decides what it may do once it runs. Omit `permissions:` and
+      # a job does not get nothing — it gets the repository default, a value in
+      # a web console that no reviewer of the workflow can see, and `read-write`
+      # for every repository created before GitHub changed it. On a warm host
+      # that token is readable by every step, including the install scripts of
+      # every transitive dependency the job downloads.
+      - name: workflow permissions self-test
+        run: bash scripts/ci/check-workflow-permissions.sh --selftest
+
+      - name: workflow permissions
+        run: bash scripts/ci/check-workflow-permissions.sh
 
       # The README quickstart pinned v3.0.0 while the fleet ran v4.1.0 — the one
       # copy-pasteable line in the repo, three minor versions stale, because

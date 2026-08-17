@@ -48,7 +48,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.24.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.25.0"
 
   project_id         = var.project_id
   network            = var.network
@@ -57,7 +57,7 @@ module "ci_runner_network" {
 }
 
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.24.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.25.0"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -66,7 +66,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.24.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.25.0"
 
   project_id = var.project_id
   region     = var.region
@@ -144,7 +144,7 @@ the pool:
 
 ```hcl
 module "ci_cache_publisher" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-publisher?ref=v5.24.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-publisher?ref=v5.25.0"
 
   project_id             = var.project_id
   name                   = "ci-runner-host-myrepo"   # the SAME pool name
@@ -330,7 +330,7 @@ later apply:
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.24.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.25.0"
 
   project_id     = var.project_id
   region         = var.region
@@ -527,10 +527,19 @@ can find it. The two halves of that safety property live in different modules,
 so nothing links them at review time; this paragraph is the link.
 
 The host's own boot probe is the enforcement. It runs as a slot user and asserts
-a **403** on the secret named by `ci-app-key-secret` and a **403** on writing a
-time series. A Windows pool whose host identity was not reduced fails that probe
-and refuses to register — deliberately, because Terraform cannot see what IAM a
-passed-in service account holds elsewhere.
+a **403** on the secret named by `ci-app-key-secret`, a **403** on writing a
+time series, and — the one assertion that runs the other way — a **200** on
+minting a token for the job service account, which is the single capability a
+Windows host account is supposed to keep. A Windows pool whose host identity was
+not reduced fails that probe and refuses to register — deliberately, because
+Terraform cannot see what IAM a passed-in service account holds elsewhere.
+
+The positive assertion is not a nicety. Two `403`s prove a reduced identity only
+if the token could have done something in the first place: an account whose
+bindings were all stripped, or a host that cannot reach Google at all, answers
+`403` to both. So if you deliberately run a Windows pool with **no** job service
+account, that pool's probe has no positive control left, and its two refusals
+are correspondingly weaker evidence.
 
 ### The Terraform
 
@@ -539,7 +548,7 @@ instantiations with their own names, MIGs, controllers and labels.
 
 ```hcl
 module "ci_runner_identity_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.24.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.25.0"
 
   project_id        = var.project_id
   name              = var.win_pool_name
@@ -552,7 +561,7 @@ module "ci_runner_identity_win" {
 }
 
 module "ci_runner_pool_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.24.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.25.0"
 
   # ... project_id, region, github_*, network, subnetwork and the three
   # identities exactly as the Linux pool above, from the _win modules ...
