@@ -33,8 +33,9 @@ and every host in the pool unpacks it as root. So the job that installs holds
 archive, re-scans it and uploads it. Do not merge them back.
 
 You cannot, in fact, merge them back: the script refuses to run the install and
-hold the credential in one process, so a workflow that sets `CACHE_PREPARE` and
-`CACHE_UPLOAD_TO` together dies before the install starts. Build with
+hold the credential in one process, so a run that sets `CACHE_PREPARE` while
+setting neither `CACHE_ARCHIVE_OUT` nor `CACHE_DRY_RUN` — that is, one asking to
+build and then upload — dies before the install starts. Build with
 `CACHE_ARCHIVE_OUT` (or `CACHE_DRY_RUN=1` to build and scan without keeping the
 artifact), publish with `CACHE_ARCHIVE_IN`, in two separate runs. The split was
 an argument the code did not previously make; now it is a control.
