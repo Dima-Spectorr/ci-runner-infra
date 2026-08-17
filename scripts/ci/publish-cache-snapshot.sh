@@ -161,6 +161,7 @@ SCAN_ALLOW_DIGESTS=()
 
 # One entry, from either source. `where` names the source in every refusal, so an
 # operator staring at "non-hex entry" knows which of the two to go and edit.
+SCAN_ALLOW_WHERE=()
 scan_allow_add() { # <digest> <where>
   local d=$1 where=$2
   case "$d" in
@@ -169,6 +170,11 @@ scan_allow_add() { # <digest> <where>
   [ "${#d}" = 64 ] \
     || die "$where entries are full sha256 digests — 64 hex characters, not ${#d}"
   SCAN_ALLOW_DIGESTS+=("$(printf '%s' "$d" | tr 'A-F' 'a-f')")
+  # Kept beside the digest so the excusal can say WHERE the exception came from
+  # and, for the file form, what its line called the package. The log is the
+  # only artifact a reviewer has after the runner is gone; one that names
+  # neither is an audit trail back to a hash.
+  SCAN_ALLOW_WHERE+=("$where")
 }
 
 # The same digests, from a file, because past a handful the variable stops being
@@ -192,8 +198,17 @@ if [ -n "${CACHE_SCAN_ALLOW_FILE:-}" ]; then
   while IFS= read -r scan_allow_line || [ -n "$scan_allow_line" ]; do
     scan_allow_lineno=$((scan_allow_lineno + 1))
     # A whole-line comment or a blank line is structure, not an entry.
-    case "$scan_allow_line" in
-      '' | [$' \t']*'#'* | '#'* ) continue ;;
+    #
+    # Strip the leading whitespace and judge what is left, rather than trying to
+    # spell "optional indentation then `#`" as a glob. `[ \t]*'#'*` reads like
+    # that and is not: the bracket matches exactly ONE character and the `*`
+    # matches anything, so every indented line holding a `#` anywhere — an
+    # entry that an editor auto-indented, or one pasted out of the docs — was
+    # skipped as a comment. Silently: the digest simply never loaded, and the
+    # operator then watches the scan refuse a fixture they can see in the file.
+    scan_allow_bare=${scan_allow_line#"${scan_allow_line%%[![:space:]]*}"}
+    case "$scan_allow_bare" in
+      '' | '#'* ) continue ;;
     esac
     scan_allow_digest=${scan_allow_line%%#*}
     # Nothing before the `#`, or no `#` at all: either way there is a digest
@@ -202,12 +217,17 @@ if [ -n "${CACHE_SCAN_ALLOW_FILE:-}" ]; then
       || die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno excuses a digest with no comment naming the package that ships it — a hash on its own is one nobody can review: $(safe_path "$scan_allow_line")"
     # Trailing `#` with nothing after it is a comment marker, not a name.
     scan_allow_name=$(printf '%s' "${scan_allow_line#*#}" | tr -d '[:space:]')
+    scan_allow_label=$(printf '%s' "${scan_allow_line#*#}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     [ -n "$scan_allow_name" ] \
       || die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno has an empty comment — name the package that ships the file"
     scan_allow_digest=$(printf '%s' "$scan_allow_digest" | tr -d '[:space:]')
     [ -n "$scan_allow_digest" ] \
       || die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno has a comment but no digest: $(safe_path "$scan_allow_line")"
-    scan_allow_add "$scan_allow_digest" "CACHE_SCAN_ALLOW_FILE (line $scan_allow_lineno)"
+    # The line's own words go into the audit trail. safe_path, because this is
+    # a file on disk and the refusal it may end up in is printed by the job that
+    # holds the publishing credential.
+    scan_allow_where="CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno ($(safe_path "$scan_allow_label"))"
+    scan_allow_add "$scan_allow_digest" "$scan_allow_where"
   done <"$CACHE_SCAN_ALLOW_FILE"
   scan_allow_count=${#SCAN_ALLOW_DIGESTS[@]}
   [ "$scan_allow_count" -gt 0 ] \
@@ -233,10 +253,16 @@ if [ -n "${CACHE_SCAN_ALLOW_DIGESTS:-}" ]; then
     || die "CACHE_SCAN_ALLOW_DIGESTS is set but sha256sum is not on PATH — the allowlist cannot be evaluated"
 fi
 
+SCAN_ALLOW_MATCHED_WHERE=""
 scan_digest_is_allowed() { # <sha256>
-  local d
+  local i=0 d
+  SCAN_ALLOW_MATCHED_WHERE=""
   for d in ${SCAN_ALLOW_DIGESTS[@]+"${SCAN_ALLOW_DIGESTS[@]}"}; do
-    [ "$d" = "$1" ] && return 0
+    if [ "$d" = "$1" ]; then
+      SCAN_ALLOW_MATCHED_WHERE=${SCAN_ALLOW_WHERE[$i]}
+      return 0
+    fi
+    i=$((i + 1))
   done
   return 1
 }
@@ -456,7 +482,7 @@ explain_credential_hit() { # <tree> <file>
     elif [ "$(matched_labels "$file")" = private-key-header ] \
       && [ "$(wc -c <"$file")" -ge 1024 ]; then
       printf '  sha256: %s\n' "$(sha256sum <"$file" | cut -d' ' -f1)"
-      printf '  if this is a dependency test fixture and not a leak, put that digest on CACHE_SCAN_ALLOW_DIGESTS in BOTH jobs\n'
+      printf '  if this is a dependency test fixture and not a leak, put that digest on CACHE_SCAN_ALLOW_DIGESTS -- or, past a handful, in the file CACHE_SCAN_ALLOW_FILE names -- in BOTH jobs\n'
     else
       printf '  no digest is printed for this file. A digest is printed only for a private-key-header hit of at least 1024 bytes; a registry token or a URL password is never excusable at any size, and for a SMALLER private-key fixture compute the digest yourself with CACHE_DRY_RUN=1 rather than reading it from this log\n'
     fi
@@ -585,7 +611,7 @@ scan_or_die() { # <tree>
         if scan_digest_is_allowed "$digest"; then
           # Logged, never silent. An exception nobody sees is one nobody revisits
           # when the package that needed it is gone.
-          log "the content scan excused $(safe_path "${bad#"$root"/}") — sha256 $digest is on CACHE_SCAN_ALLOW_DIGESTS"
+          log "the content scan excused $(safe_path "${bad#"$root"/}") — sha256 $digest, excused by $SCAN_ALLOW_MATCHED_WHERE"
           excused=$((excused + 1))
           continue
         fi

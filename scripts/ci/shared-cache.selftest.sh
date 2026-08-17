@@ -750,6 +750,24 @@ has_trusted_snapshot_build() { # <file>
   matches "$code" '\[ -n "\$scan_allow_name" \]' || return 1
   matches "$code" '\[ -f "\$CACHE_SCAN_ALLOW_FILE" \]' || return 1
   matches "$code" '\[ "\$scan_allow_count" -gt 0 \]' || return 1
+  # Leading whitespace is stripped and the REMAINDER judged. Spelled as a glob
+  # — `[ \t]*'#'*` — the bracket matches exactly one character and the star
+  # matches anything, so every indented line containing a `#` anywhere is eaten
+  # as a comment and its digest never loads. Silently, which is the part that
+  # matters: the operator sees the scan refuse a fixture that is in the file.
+  matches "$code" 'scan_allow_bare=\$\{scan_allow_line#"\$\{scan_allow_line%%\[!\[:space:\]\]\*\}"\}' || return 1
+  ! matches "$code" "\\[\\\$' \\\\t'\\]\\*'#'\\*" || return 1
+  # The arms themselves. Stripping the indentation is only half of it; the other
+  # half is that what remains is judged as a WHOLE line, so `*"#"*` reintroduces
+  # the bug with the strip still in place.
+  matches "$code" "^      '' \\| '#'\\* \\) continue ;;\$" || return 1
+  # The excusal names its SOURCE, and for the file its line and what that line
+  # called the package. The log is the only artifact left once the runner is
+  # gone; one that says only "is on CACHE_SCAN_ALLOW_DIGESTS" is an audit trail
+  # back to a hash, on the layer that just excused a private-key header.
+  matches "$code" 'excused by \$SCAN_ALLOW_MATCHED_WHERE' || return 1
+  matches "$code" 'SCAN_ALLOW_MATCHED_WHERE=\$\{SCAN_ALLOW_WHERE\[\$i\]\}' || return 1
+  matches "$code" 'safe_path "\$scan_allow_label"' || return 1
   # A file that is not there, or holds nothing but comments, reads exactly like
   # one that worked — the failure is a publish that refuses on every run.
   matches "$code" 'CACHE_SCAN_ALLOW_FILE names no readable file' || return 1
@@ -1324,8 +1342,12 @@ mutate_file "$PUBSH" 'an allowlist file that is not there excuses nothing, quiet
   's@^  \[ -f "\$CACHE_SCAN_ALLOW_FILE" \] \\$@  true \\@'
 mutate_file "$PUBSH" 'a file of nothing but comments passes for an allowlist' has_trusted_snapshot_build \
   's@^  \[ "\$scan_allow_count" -gt 0 \] \\$@  true \\@'
+mutate_file "$PUBSH" 'an indented entry is eaten as a comment' has_trusted_snapshot_build \
+  's@^      .. \| .#.\* \) continue ;;$@      "" | *"#"* ) continue ;;@'
+mutate_file "$PUBSH" 'the excusal no longer says where the exception came from' has_trusted_snapshot_build \
+  's@, excused by \$SCAN_ALLOW_MATCHED_WHERE"@ is on CACHE_SCAN_ALLOW_DIGESTS"@'
 mutate_file "$PUBSH" 'the file skips its own validator' has_trusted_snapshot_build \
-  's@^    scan_allow_add "\$scan_allow_digest" "CACHE_SCAN_ALLOW_FILE.*$@    SCAN_ALLOW_DIGESTS+=("$scan_allow_digest")@'
+  's@^    scan_allow_add "\$scan_allow_digest" "\$scan_allow_where"$@    SCAN_ALLOW_DIGESTS+=("$scan_allow_digest"); SCAN_ALLOW_WHERE+=("$scan_allow_where")@'
 mutate_file "$PUBSH" 'an excused file is excused silently' has_trusted_snapshot_build \
   's@^          log "the content scan excused @          : "@'
 mutate_file "$PUBSH" 'the content pass stops at the first hit again' has_trusted_snapshot_build \
@@ -1372,9 +1394,9 @@ mutate_file "$PUBSH" 'the allowlist drops everything after the first newline' ha
 # The off switch. One legitimate entry would excuse every content hit there is,
 # and the run would still look exactly like a successful publish.
 mutate_file "$PUBSH" 'the allowlist matches every digest' has_trusted_snapshot_build \
-  's@^    \[ "\$d" = "\$1" \] && return 0$@    return 0@'
+  's@^    if \[ "\$d" = "\$1" \]; then$@    if true; then@'
 mutate_file "$PUBSH" 'a digest matches as a prefix at compare time' has_trusted_snapshot_build \
-  's@^    \[ "\$d" = "\$1" \] && return 0$@    case "$1" in "$d"*) return 0 ;; esac@'
+  's@^    if \[ "\$d" = "\$1" \]; then$@    if case "$1" in "$d"*) true ;; *) false ;; esac; then@'
 mutate_file "$PUBSH" 'an allowlist entry need not be hex' has_trusted_snapshot_build \
   's@\*\[!0-9a-fA-F\]\*@*[!-~]*@'
 mutate_file "$PUBSH" 'an allowlist that cannot be evaluated is ignored' has_trusted_snapshot_build \
@@ -1599,13 +1621,31 @@ cat '"'$TMP/pem'"' >"$stage/pnpm-store/files/aa/deadbeef"
 printf '# ssh2@1.17.0 test/fixtures — a published test key, in the tarball on npm\n%s  # the fixture\n' \
   "$BEH_PEM_SHA" >"$TMP/allow.txt"
 if behave_run "$BEH_STAGE_PEM" '' "$TMP/allow.txt" >"$TMP/beh.allowfile.log" 2>&1; then
-  if matches "$(cat "$TMP/beh.allowfile.log")" 'excused'; then
+  # ...and the excusal names its source, its line, and what that line called the
+  # package. A log saying only "excused" is the audit trail this whole change
+  # exists to avoid.
+  if matches "$(cat "$TMP/beh.allowfile.log")" 'excused by CACHE_SCAN_ALLOW_FILE line 2 \(the fixture\)'; then
     ok
   else
-    bad "behaviour: the fixture published from a file, but no excusal was logged"
+    bad "behaviour: the fixture published from a file, but the excusal did not name where it came from"
   fi
 else
   bad "behaviour: a PEM fixture allowlisted in a file was still refused"
+fi
+
+# An INDENTED entry. This is the one the first version got wrong: the
+# comment-skip glob ate every indented line holding a `#`, so an entry an editor
+# auto-indented never loaded and the scan refused a fixture visibly in the file.
+printf '# ssh2@1.17.0 test/fixtures\n    %s  # the fixture, indented\n' \
+  "$BEH_PEM_SHA" >"$TMP/allow-indent.txt"
+if behave_run "$BEH_STAGE_PEM" '' "$TMP/allow-indent.txt" >"$TMP/beh.allowindent.log" 2>&1; then
+  if matches "$(cat "$TMP/beh.allowindent.log")" 'excused'; then
+    ok
+  else
+    bad "behaviour: the indented entry published, but no excusal was logged"
+  fi
+else
+  bad "behaviour: an indented allowlist entry was dropped"
 fi
 
 # A digest standing on its own authority. This is the whole point of the file
