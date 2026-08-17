@@ -43,9 +43,10 @@
 #       earlier mistake.
 #     * scanned with the SAME rules the host applies on arrival, so a snapshot
 #       that a host would refuse fails here — loudly, once, in a run someone is
-#       watching — instead of silently on every boot of every host. The publish
-#       phase scans AGAIN, on what it actually received, because an artifact
-#       crossing a job boundary is input.
+#       watching — instead of silently on every boot of every host. The packed
+#       archive is then unpacked and scanned AGAIN, in every phase: an artifact
+#       that crossed a job boundary is input, and so is one this process packed,
+#       since only the second scan sees what the archive actually holds.
 #
 # WHAT IT WRITES
 #   gs://<bucket>/cache/<pool>/<UTC>-<digest>.tar.gz   write-once, never replaced
@@ -76,6 +77,26 @@
 #                     matching the pools' own default bound: a larger snapshot is
 #                     not a slow hydrate, it is one every host silently refuses.
 #   CACHE_DRY_RUN     optional. Build and scan, upload nothing. For a first run.
+#   CACHE_PREPARE_TIMEOUT
+#                     optional, seconds. Default 3600. The prepare command runs
+#                     in its own process group and the group is killed when it
+#                     returns or when this expires — an install that daemonises
+#                     must not outlive the scan that is supposed to bound it.
+#   CACHE_SCAN_ALLOW_DIGESTS
+#                     optional. Full sha256 digests, separated by commas or
+#                     whitespace, of files the EMBEDDED-CREDENTIAL CONTENT pass
+#                     may excuse — for a dependency that ships a PEM in its own
+#                     test fixtures, which lands under a hash name no filename
+#                     rule can see. It excuses a `private-key-header` hit and
+#                     NOTHING else: a registry token or a URL password is never
+#                     excusable, and the link, setuid, capability and
+#                     credential-filename passes are what a host itself enforces,
+#                     so an exception there would publish a snapshot every host
+#                     rejects. Note the asymmetry — a host runs no content pass
+#                     of its own, so an entry here is the LAST word on that file,
+#                     which then lands unpacked as root on every host in the
+#                     pool. Set it in BOTH jobs, as a literal in the workflow
+#                     file. Every use is logged. The refusal prints the digest.
 # =============================================================================
 set -euo pipefail
 
@@ -98,10 +119,67 @@ log() { printf 'publish-cache-snapshot: %s\n' "$*"; }
 safe_path() { printf '%s' "$1" | LC_ALL=C tr -c '[:print:]' '?'; }
 
 CACHE_MAX_BYTES="${CACHE_MAX_BYTES:-4294967296}"
+# An install that hangs on a registry must not hold the group open forever; the
+# reap below cannot run until this returns. One hour, well under the workflow's
+# own job timeout so the failure is this script's and names its own cause.
+# Validated, because `timeout 0` means NO timeout: the one value that turns this
+# bound off is also the one an operator reaches for to mean "don't wait".
+CACHE_PREPARE_TIMEOUT="${CACHE_PREPARE_TIMEOUT:-3600}"
+case "$CACHE_PREPARE_TIMEOUT" in
+  '' | 0 | *[!0-9]* ) die "CACHE_PREPARE_TIMEOUT must be a positive whole number of seconds (0 disables the timeout entirely, which is the one thing it may not do): $(safe_path "$CACHE_PREPARE_TIMEOUT")" ;;
+esac
+
+# The content digests the embedded-credential pass may excuse.
+#
+# It exists because a hit there is not automatically a leak. A dependency's
+# PAYLOAD can carry a PEM test fixture — `pnpm install` of one real monorepo
+# lands a 4 KiB private key from a package's own tests — and in a
+# content-addressed store it arrives under a hash name, so the credential-
+# FILENAME pass cannot see it and the content pass refuses that snapshot on every
+# run, forever. The two ways out that do not need this are deleting the pattern
+# and widening it into uselessness, which is how a scan stops being a bound.
+#
+# Read from the environment, not from a list in this repository: which fixture a
+# consumer's dependency tree drags in is theirs to know, and the entry belongs in
+# their workflow, on a line next to a comment naming the package. It must be set
+# in BOTH jobs — the publishing job re-scans what it received, and one excused
+# only in the build job fails there instead.
+#
+# Validated strictly. A malformed entry that quietly matched nothing would read
+# exactly like one that worked, and a SHORT one is the real hazard: treated as a
+# prefix it would excuse everything beginning with those characters.
+SCAN_ALLOW_DIGESTS=()
+if [ -n "${CACHE_SCAN_ALLOW_DIGESTS:-}" ]; then
+  # read -ra rather than unquoted expansion: the latter globs, and a digest is
+  # attacker-adjacent input that should never reach pathname expansion.
+  # -d '' as well as IFS: plain `read` stops at the first NEWLINE whatever IFS
+  # says, so a YAML block scalar holding three digests would parse one and drop
+  # two — unvalidated, unreported, and reading exactly like a list that worked.
+  IFS=$', \n\t' read -rd '' -a SCAN_ALLOW_RAW <<<"$CACHE_SCAN_ALLOW_DIGESTS" || true
+  for d in ${SCAN_ALLOW_RAW[@]+"${SCAN_ALLOW_RAW[@]}"}; do
+    [ -n "$d" ] || continue
+    case "$d" in
+      *[!0-9a-fA-F]* ) die "CACHE_SCAN_ALLOW_DIGESTS holds a non-hex entry: $(safe_path "$d")" ;;
+    esac
+    [ "${#d}" = 64 ] \
+      || die "CACHE_SCAN_ALLOW_DIGESTS entries are full sha256 digests — 64 hex characters, not ${#d}"
+    SCAN_ALLOW_DIGESTS+=("$(printf '%s' "$d" | tr 'A-F' 'a-f')")
+  done
+  # A digest nobody can compute is a digest that excuses nothing, silently.
+  command -v sha256sum >/dev/null 2>&1 \
+    || die "CACHE_SCAN_ALLOW_DIGESTS is set but sha256sum is not on PATH — the allowlist cannot be evaluated"
+fi
+
+scan_digest_is_allowed() { # <sha256>
+  local d
+  for d in ${SCAN_ALLOW_DIGESTS[@]+"${SCAN_ALLOW_DIGESTS[@]}"}; do
+    [ "$d" = "$1" ] && return 0
+  done
+  return 1
+}
 
 # Which phases this invocation is. Building and publishing are independent: the
-# workflow runs one of each, a local dry run is build-only, and running both at
-# once is what makes the script usable by hand.
+# workflow runs one of each, and a local dry run is build-only.
 BUILDING=1; [ -z "${CACHE_ARCHIVE_IN:-}" ] || BUILDING=0
 PUBLISHING=1
 [ -z "${CACHE_ARCHIVE_OUT:-}" ] || PUBLISHING=0
@@ -109,6 +187,26 @@ PUBLISHING=1
 
 [ "$BUILDING" = 1 ] || [ "$PUBLISHING" = 1 ] \
   || die "CACHE_ARCHIVE_IN with CACHE_ARCHIVE_OUT or CACHE_DRY_RUN asks this to neither build nor publish"
+
+# NEVER BOTH IN ONE PROCESS. This is the two-job split, enforced rather than
+# described — see WHY TWO JOBS in the header, which until now was an argument the
+# code did not make.
+#
+# Building means running CACHE_PREPARE: arbitrary third-party install code, as
+# this uid, in this process tree. Publishing means holding a credential that can
+# write the object every host in the fleet boots from. Together they put the OIDC
+# token inside the blast radius of a postinstall script, and they reopen the one
+# gap the digest pin can only narrow: between the last `assert_archive_unchanged`
+# and gcloud's own open of the file there are hundreds of milliseconds of Python
+# start-up, and a process that escaped the reap (`setsid` leaves the group, and
+# `kill -- -$pgid` cannot follow it) wins that race by polling. Splitting the
+# phases removes the racer instead of shrinking the window.
+#
+# The cost is that this cannot be run end-to-end by hand, which is the point.
+# CACHE_DRY_RUN=1 builds and scans; CACHE_ARCHIVE_OUT then CACHE_ARCHIVE_IN does
+# the same thing the workflow does, in two invocations.
+[ "$BUILDING" = 0 ] || [ "$PUBLISHING" = 0 ] \
+  || die "refusing to build and publish in one process: the phase that runs CACHE_PREPARE must not be the phase that holds the credential. Use CACHE_DRY_RUN=1 to build and scan, or CACHE_ARCHIVE_OUT here and CACHE_ARCHIVE_IN in a separate run."
 
 if [ "$BUILDING" = 1 ]; then
   : "${CACHE_PREPARE:?CACHE_PREPARE is required (the command that installs dependencies)}"
@@ -122,7 +220,7 @@ if [ "$PUBLISHING" = 1 ]; then
   # one step further down: this value becomes an object prefix, and a host refuses
   # a pointer naming anything outside its own prefix.
   case "$CACHE_POOL" in
-    *[!a-z0-9-]* | '' | -* | *- ) die "CACHE_POOL must be lowercase letters, digits and hyphens: $CACHE_POOL" ;;
+    *[!a-z0-9-]* | '' | -* | *- ) die "CACHE_POOL must be lowercase letters, digits and hyphens: $(safe_path "$CACHE_POOL")" ;;
   esac
   case "$CACHE_BUCKET" in
     gs://* ) die "CACHE_BUCKET is a bucket NAME, not a gs:// URL" ;;
@@ -146,7 +244,7 @@ fi
 # and is allowed to proceed.
 case "${GITHUB_EVENT_NAME:-}" in
   '' | schedule | workflow_dispatch | push ) : ;;
-  * ) die "refusing to publish from a '$GITHUB_EVENT_NAME' run — a snapshot may only be built by schedule, workflow_dispatch or push. Runs triggered by pull_request_target, workflow_run or issue_comment execute untrusted code while asserting the default branch." ;;
+  * ) die "refusing to publish from a '$(safe_path "$GITHUB_EVENT_NAME")' run — a snapshot may only be built by schedule, workflow_dispatch or push. Runs triggered by pull_request_target, workflow_run or issue_comment execute untrusted code while asserting the default branch." ;;
 esac
 
 command -v getcap >/dev/null 2>&1 \
@@ -154,7 +252,10 @@ command -v getcap >/dev/null 2>&1 \
 
 STAGE=$(mktemp -d)
 ARCHIVE_DIR=$(mktemp -d)
-trap 'rm -rf "$STAGE" "$ARCHIVE_DIR"' EXIT
+# Created only once the prepare command has returned, so it is named in the trap
+# before it exists.
+VERIFY=""
+trap 'rm -rf "$STAGE" "$ARCHIVE_DIR" ${VERIFY:+"$VERIFY"}' EXIT
 chmod 0700 "$STAGE" "$ARCHIVE_DIR"
 
 # --- the scan --------------------------------------------------------------------
@@ -163,9 +264,30 @@ chmod 0700 "$STAGE" "$ARCHIVE_DIR"
 # failure reports. ONE list, used both to find a hit and to explain it: a second
 # copy would be a second thing that has to agree, which is the whole failure mode
 # this script's duplicated-but-selftested rules exist to avoid.
+#
+# The URL schemes a `user:pass@` may follow. ONE definition, used to FIND the hit
+# and to validate the scheme the refusal prints, for the same reason the pattern
+# list itself is one list.
+#
+# The anchor is not cosmetic. Unanchored, `://[^/@ "]+:[^/@ "]+@` matches any 5
+# bytes in that shape, and since the pass reads binary files too (it must — see
+# the grep below) a dependency cache full of gzip and nupkg blobs trips it by
+# chance: measured over 4 GiB of random bytes, about three times. Those hits are
+# unexcusable by design and land on a hash-named compressed blob, so the operator
+# has no move left except deleting the rule — which is how a scan stops being a
+# bound. Requiring a real scheme costs the rule nothing, because embedded basic
+# auth is BY DEFINITION preceded by one.
+#
+# The VCS branch is `(git|hg|bzr|svn)(\+(ssh|https?|file))?` and not a hand-listed
+# few: pip and npm both accept VCS-pinned dependencies over plain http, so
+# `git+https` being on the list while `git+http` was not was an oversight, not a
+# policy. Widening it costs the false-positive rate nothing — every branch is
+# still a literal scheme followed by `://`.
+URL_SCHEME_ALT='https?|ftps?|sftp|ssh|(git|hg|bzr|svn)(\+(ssh|https?|file))?|mongodb(\+srv)?|postgres(ql)?|mysql|mariadb|rediss?|amqps?|s3|gs|ldaps?|smtps?|imap'
+
 CREDENTIAL_PATTERNS=(
   "registry-auth-token|_authToken"
-  "url-embedded-basic-auth|://[^/@[:space:]\"]+:[^/@[:space:]\"]+@"
+  "url-embedded-basic-auth|(^|[^A-Za-z0-9+.-])($URL_SCHEME_ALT)://[^/@[:space:]\"]+:[^/@[:space:]\"]+@"
   "private-key-header|-----BEGIN [A-Z ]*PRIVATE KEY-----"
 )
 
@@ -196,6 +318,27 @@ CREDENTIAL_PATTERNS=(
 # would publish the very thing the gate exists to contain. Counts, line numbers
 # and a URL scheme are not the secret; the value on that line is, and it stays in
 # the file. Whoever investigates re-runs the install and looks locally.
+# Which rules a file trips, space-separated. Two callers need this: the reporter
+# below, and the allowlist, which excuses `private-key-header` and NOTHING else.
+# EVERY label, never the first: the allowlist below excuses a file only when this
+# is exactly `private-key-header`, so a file holding a token AND a key header must
+# come back with both or it becomes excusable. And a grep that ERRORS must not
+# read as "did not match" — a dropped label is the direction that makes a file
+# excusable, so an error refuses. (`die` inside a command substitution exits only
+# that subshell, which yields an empty label string: no match, no excusal, and
+# the caller refuses. Fail-closed either way.)
+matched_labels() { # <file>
+  local file="$1" entry rc out=""
+  for entry in "${CREDENTIAL_PATTERNS[@]}"; do
+    rc=0
+    grep -qa -E -e "${entry#*|}" "$file" 2>/dev/null || rc=$?
+    [ "$rc" -le 1 ] \
+      || die "the content scan could not test $(safe_path "$file") against ${entry%%|*} (grep exited $rc)"
+    if [ "$rc" = 0 ]; then out="$out ${entry%%|*}"; fi
+  done
+  printf '%s' "${out# }"
+}
+
 explain_credential_hit() { # <tree> <file>
   local root="$1" file="$2" entry label pat n scheme
   {
@@ -203,10 +346,10 @@ explain_credential_hit() { # <tree> <file>
     printf '  file: %s bytes, %s line(s)\n' "$(wc -c <"$file")" "$(wc -l <"$file")"
     for entry in "${CREDENTIAL_PATTERNS[@]}"; do
       label="${entry%%|*}" pat="${entry#*|}"
-      n=$(grep -c -E -e "$pat" "$file" 2>/dev/null) || n=0
+      n=$(grep -ca -E -e "$pat" "$file" 2>/dev/null) || n=0
       [ "$n" -gt 0 ] || continue
       printf '  %s: %s match(es), first on line %s\n' \
-        "$label" "$n" "$(grep -n -m1 -E -e "$pat" "$file" 2>/dev/null | cut -d: -f1)"
+        "$label" "$n" "$(grep -na -m1 -E -e "$pat" "$file" 2>/dev/null | cut -d: -f1)"
       # The one extra fact worth having: the scheme in front of a `user:pass@`
       # tells a real registry credential (`https`) apart from a fixture
       # connection string (`mongodb`, `postgres`, `git+ssh`).
@@ -218,19 +361,76 @@ explain_credential_hit() { # <tree> <file>
       # itself. Echoing whatever was found would leak exactly the bytes this
       # function exists not to print. Anything unrecognised says so and stops.
       if [ "$label" = url-embedded-basic-auth ]; then
-        scheme=$(grep -oE -m1 "[A-Za-z][A-Za-z0-9+.-]{0,31}$pat" "$file" 2>/dev/null | head -n1 | cut -d: -f1) || true
-        case "$scheme" in
-          http | https | ftp | ftps | ssh | git | git+ssh | git+https | svn | svn+ssh \
-          | mongodb | mongodb+srv | postgres | postgresql | mysql | mariadb | redis \
-          | rediss | amqp | amqps | s3 | gs | ldap | ldaps | smtp | smtps | imap )
-            printf '    scheme: %s\n' "$scheme" ;;
-          * )
-            printf '    scheme: not a recognised URL scheme — inspect that line locally\n' ;;
-        esac
+        scheme=$(grep -oEa -m1 -e "$pat" "$file" 2>/dev/null | head -n1 \
+          | sed -E 's@^[^A-Za-z]*@@; s@://.*@@') || true
+        if printf '%s' "$scheme" | grep -qE "^($URL_SCHEME_ALT)$"; then
+          printf '    scheme: %s\n' "$scheme"
+        else
+          printf '    scheme: not a recognised URL scheme — inspect that line locally\n'
+        fi
       fi
     done
     printf '  the matched text is deliberately not printed — reproduce the prepare command and inspect that line locally\n'
+    # The digest an allowlist entry keys on, so a refusal that turns out to be a
+    # package fixture can be excused without anyone having to reproduce the
+    # install just to compute it.
+    #
+    # ONLY for a private-key-header hit, and one-wayness is not the reason why.
+    # Everything above already narrows the preimage hard — exact byte count, line
+    # count, match line, URL scheme — and for a 47-byte `mongodb://user:pass@host`
+    # that leaves one unknown field. An unsalted sha256 of a nearly-known
+    # plaintext is an offline oracle with no rate limit, so publishing it into a
+    # log anyone who can read the repository can read would hand out the very
+    # credential this pass just contained. Key material carries enough entropy
+    # that a whole-file digest is not guessable; a token or a URL password does
+    # not, and neither is excusable by digest anyway.
+    # The size test is part of the same argument: what this rule matches is a
+    # HEADER, and a 60-byte file that is a header plus a short string has as
+    # little entropy as the URL password above. Only a file big enough to hold
+    # actual key material gets its digest printed.
+    if ! command -v sha256sum >/dev/null 2>&1; then
+      printf '  no digest is printed: this machine has no sha256sum, so an allowlist entry for this file has to be computed somewhere that does\n'
+    elif [ "$(matched_labels "$file")" = private-key-header ] \
+      && [ "$(wc -c <"$file")" -ge 1024 ]; then
+      printf '  sha256: %s\n' "$(sha256sum <"$file" | cut -d' ' -f1)"
+      printf '  if this is a dependency test fixture and not a leak, put that digest on CACHE_SCAN_ALLOW_DIGESTS in BOTH jobs\n'
+    else
+      printf '  no digest is printed for this file. A digest is printed only for a private-key-header hit of at least 1024 bytes; a registry token or a URL password is never excusable at any size, and for a SMALLER private-key fixture compute the digest yourself with CACHE_DRY_RUN=1 rather than reading it from this log\n'
+    fi
   } >&2
+}
+
+# The process group a pid belongs to, or nothing. Two spellings because the
+# answer decides whether a reap is aimed at a real group or at nothing, and a
+# check that quietly fails to run is worse than no check: procps takes
+# `-o pgid=`, and the ps in Git Bash — where this file's behavioural tests run —
+# rejects `-o` outright but prints a PGID column.
+pgid_of() { # <pid>
+  local out
+  out=$(ps -o pgid= -p "$1" 2>/dev/null | tr -d ' ') || out=""
+  case "$out" in '' | *[!0-9]* ) : ;; * ) printf '%s' "$out"; return 0 ;; esac
+  out=$(ps 2>/dev/null | awk -v p="$1" \
+    'NR==1{for(i=1;i<=NF;i++){if($i=="PID")c1=i;if($i=="PGID")c2=i};next}
+     c1&&c2&&$c1==p{print $c2;exit}') || out=""
+  case "$out" in '' | *[!0-9]* ) return 1 ;; * ) printf '%s' "$out"; return 0 ;; esac
+}
+
+# Why the archive did not unpack, said accurately. `head` closing the pipe and a
+# corrupt archive both surface as the same tar failure, and blaming corruption
+# for a tree that merely compresses well sends the operator looking for a
+# hardware fault. The bound stays 8x the compressed size because that is the
+# bound the HOST applies on arrival: a snapshot past it is one every host would
+# silently refuse, so catching it here is the point rather than a side effect.
+unpack_failed() {
+  local expanded
+  # Bounded like the main path. An error handler that decompresses without a
+  # limit turns a gzip bomb into its own amplifier: the run that refused the
+  # archive would then be the run that filled the disk explaining why.
+  expanded=$( (gzip -dc "$ARCHIVE" || true) | head -c "$((size * 8 + 1))" | wc -c ) || expanded=0
+  if [ "$expanded" -gt "$((size * 8))" ]; then
+    die "the archive expands past the $((size * 8)) byte bound (8x its compressed size, which is the same bound every pool host applies on arrival) — this snapshot would be refused by every host, so it is refused here"
+  fi
+  die "the archive did not unpack — refusing to publish an archive this run cannot inspect"
 }
 
 scan_or_die() { # <tree>
@@ -265,10 +465,78 @@ scan_or_die() { # <tree>
   # pass is a floor, not a guarantee — the guarantee is not authenticating in the
   # prepare command at all.
   local -a pass=()
-  local entry
+  local entry digest excused=0 seen=0 hits rc=0
   for entry in "${CREDENTIAL_PATTERNS[@]}"; do pass+=(-e "${entry#*|}"); done
-  bad=$(grep -rlI -E "${pass[@]}" "$root" 2>/dev/null | head -n1) || true
-  [ -z "$bad" ] || { explain_credential_hit "$root" "$bad"; die "the staged tree holds what looks like an embedded credential ($(safe_path "$bad")) — refusing to publish it"; }
+  # Listed to a file, and the exit status is checked. grep says 0 for "found",
+  # 1 for "nothing", >=2 for "I broke" — and a >=2 that goes unread reads exactly
+  # like a clean pass. On a multi-GB tree walked to the end (see below) that is
+  # not theoretical: an unreadable path or a killed walk would otherwise publish.
+  #
+  # `mktemp`, never a fixed name under $ARCHIVE_DIR. The prepare command runs as
+  # this uid BEFORE the scan and is handed $STAGE, so it knows the temp root: a
+  # predictable name lets it pre-create `content-hits` as a symlink to /dev/null
+  # (grep writes nowhere, rc=0, the loop reads nothing) or as a directory (the
+  # redirection fails with status 1, indistinguishable from "no hits"). Either
+  # one turns the only pass that sees an embedded credential into a no-op, and in
+  # the single-phase mode there is no second scan to catch it. O_EXCL on an
+  # unguessable name is what closes that.
+  hits=$(mktemp "$ARCHIVE_DIR/hits.XXXXXX") || die "the content scan could not create its hit list"
+  # `-Z` and `read -d ''`: NUL-separated, because a Linux filename may legally
+  # hold a NEWLINE and this list is parsed. With a newline-terminated list, a
+  # file named `<excused-fixture>\n` splits into two records — the excused
+  # fixture's own path, then an empty line the loop skips — so the file whose
+  # name carried the newline is never opened, never digested, and is packed.
+  # The allowlist is what makes that fatal: the first record is excused rather
+  # than refused, so the pass ends green. NUL is the one byte a path cannot
+  # contain, which is why it is the only safe separator here.
+  #
+  # `-a` and NOT `-I`. `-I` skips a file grep classifies as binary, and grep
+  # classifies on the first NUL byte it reads — so the prepare command, which is
+  # untrusted third-party install code by this script's own threat model, opts
+  # any file out of this pass by writing one leading NUL in front of the
+  # credential. It defeats both jobs identically, because the publish job's
+  # re-scan of the unpacked archive calls this same function. What `-a` costs is
+  # a full read of the tree AND chance matches inside the compressed blobs it now
+  # reads — measured at roughly one per gibibyte for a rule as loose as
+  # `://x:y@`, on a 4 GiB cache, against files whose names are content hashes and
+  # which cannot be excused. That is the reason every pattern above is anchored
+  # to something a random byte stream does not produce; it is not a detail of the
+  # patterns, it is the condition on which reading binaries is affordable.
+  grep -rlaZ -E "${pass[@]}" "$root" >"$hits" 2>/dev/null || rc=$?
+  [ "$rc" -le 1 ] || die "the staged tree could not be scanned for embedded credentials (grep exited $rc)"
+  # EVERY hit, not just the first. With an allowlist in play, stopping at the
+  # first match would let an excused file stand in front of an unexcused one and
+  # take the whole pass green.
+  while IFS= read -r -d '' bad; do
+    [ -n "$bad" ] || continue
+    seen=$((seen + 1))
+    if [ "${#SCAN_ALLOW_DIGESTS[@]}" -gt 0 ]; then
+      # A digest excuses a PEM fixture and nothing else. The other two rules
+      # match a registry token and a URL password — shapes no dependency has a
+      # legitimate reason to ship, and shapes whose whole value is that they are
+      # never excused. Refuse before the digest is even computed, so no operator
+      # can allowlist their way past a live credential.
+      if [ "$(matched_labels "$bad")" = private-key-header ]; then
+        digest=$(sha256sum <"$bad" | cut -d' ' -f1) \
+          || die "the content scan could not digest $(safe_path "${bad#"$root"/}")"
+        if scan_digest_is_allowed "$digest"; then
+          # Logged, never silent. An exception nobody sees is one nobody revisits
+          # when the package that needed it is gone.
+          log "the content scan excused $(safe_path "${bad#"$root"/}") — sha256 $digest is on CACHE_SCAN_ALLOW_DIGESTS"
+          excused=$((excused + 1))
+          continue
+        fi
+      fi
+    fi
+    explain_credential_hit "$root" "$bad"
+    die "the staged tree holds what looks like an embedded credential ($(safe_path "${bad#"$root"/}")) — refusing to publish it"
+  done <"$hits"
+  # grep said it found something and the loop saw nothing: the list was truncated
+  # or never reached, and the difference between that and a clean tree is the
+  # whole pass. Refuse rather than reason about which.
+  [ "$rc" != 0 ] || [ "$seen" -gt 0 ] \
+    || die "the content scan found matches it could not then read — refusing to publish"
+  [ "$excused" = 0 ] || log "the content scan excused $excused file(s) by digest"
 }
 
 # What the host will actually receive. Every member must be a plain file or a
@@ -278,7 +546,12 @@ scan_or_die() { # <tree>
 # of whatever produced it — which is the point in the publish phase, where the
 # tree is gone and the archive came from another job.
 archive_is_flat() { # <archive>
-  local bad list="$ARCHIVE_DIR/listing"
+  # mktemp for the same reason the hit list uses it: a fixed name under
+  # $ARCHIVE_DIR is one the prepare command can pre-create as a symlink to
+  # /dev/null, and a listing that is written nowhere makes this check pass on
+  # every archive.
+  local bad list
+  list=$(mktemp "$ARCHIVE_DIR/listing.XXXXXX") || die "the archive could not be listed"
   # Listed to a file rather than piped into awk: under `pipefail` an awk that
   # stops at the first offending member takes the writer down with SIGPIPE, and a
   # FOUND violation would then be reported as "could not be listed".
@@ -287,7 +560,15 @@ archive_is_flat() { # <archive>
   [ -z "$bad" ] || die "the archive holds a member that is not a plain file or directory, or is setuid ($(safe_path "$bad")) — a host would refuse it"
 }
 
-ARCHIVE="$ARCHIVE_DIR/snap.tar.gz"
+# The archive is deliberately NOT created here. Creating it before the prepare
+# command runs put an attacker-writable file in a directory that command can
+# simply list: `mktemp` randomises a name against GUESSING, not against `ls`, and
+# `chmod 0700` is no barrier to the same uid. Each branch below creates it at the
+# point it packs. This is one of three parts and the weakest: what actually
+# bounds a process the install left behind is reaping its process group before
+# anything is scanned, and what catches a write that happened anyway is the
+# digest pinned across every later use of the file.
+ARCHIVE=""
 
 if [ "$BUILDING" = 1 ]; then
   for d in "${CACHE_DIRS[@]}"; do mkdir -p "$STAGE/$d"; done
@@ -319,7 +600,59 @@ if [ "$BUILDING" = 1 ]; then
   # workflows already run arbitrary commands. Splitting it here would be a false
   # safety. `-e` because a prepare joined with `;` instead of `&&` would otherwise
   # publish a half-populated cache with a zero exit.
-  sh -euc "$CACHE_PREPARE" || die "the prepare command failed — publishing an archive of a failed install would ship a cache that is worse than none"
+  #
+  # In its OWN PROCESS GROUP, under a timeout, and reaped before anything is
+  # scanned. `sh -euc` returning does not mean the install stopped: a lifecycle
+  # script that daemonises keeps running as this uid, with the staged tree and
+  # the temp root in reach, and every "the scan bounds it" argument in this file
+  # is written against a process that by then no longer exists. Removing the
+  # writer is the control; the digest pin further down is only the detector.
+  #
+  # `set -m` is what gives the job a group of its own — without it the child
+  # shares this script's group and `kill -- -$pid` would either fail or kill the
+  # run. That it worked is verified rather than assumed, because a reap aimed at
+  # the wrong group is a control that silently does nothing.
+  #
+  # `sh -euc` and not an array: the caller supplies a command line, usually with
+  # its own flags, and this runs on the default branch of a repository whose
+  # workflows already run arbitrary commands. Splitting it here would be a false
+  # safety. `-e` because a prepare joined with `;` instead of `&&` would otherwise
+  # publish a half-populated cache with a zero exit.
+  set -m
+  timeout -k 30 "$CACHE_PREPARE_TIMEOUT" sh -euc "$CACHE_PREPARE" &
+  prep_pgid=$!
+  set +m
+  # `ps` alone decides, both whether there is a child to judge and what group it
+  # is in. The earlier shape guarded this with `kill -0`, which is a different
+  # source: bash's kill BUILTIN answers from its own job table and calls a job it
+  # has already reaped live. On Linux every prepare that finishes quickly — which
+  # is all of them in this file's behavioural tests — took that branch with `ps`
+  # having nothing left to report, and the run died on a scheduling accident
+  # rather than on a fault.
+  #
+  # So: no group reported means no child left to bound, and there is nothing to
+  # refuse. A group reported that is not the child's own is the real fault — the
+  # reap would be aimed at this script's group — and that is what dies.
+  #
+  # The refusal names the two values it compared. A gate that says only "the
+  # group is wrong" is one nobody can act on from a CI job page once the runner
+  # is gone: "ps could not answer" and "the child landed in this script's group"
+  # have different fixes and read identically without them.
+  prep_seen=$(pgid_of "$prep_pgid" || true)
+  [ -z "$prep_seen" ] || [ "$prep_seen" = "$prep_pgid" ] \
+    || die "the prepare command did not get a process group of its own, so nothing it leaves running could be reaped — refusing to build a snapshot this run cannot bound (child pid $prep_pgid, its group '$prep_seen', this script's group $(pgid_of $$ || true))"
+  prep_rc=0
+  wait "$prep_pgid" || prep_rc=$?
+  # TERM, a moment, then KILL. Both are best-effort against an already-empty
+  # group, which is the normal case and not an error.
+  kill -TERM -- "-$prep_pgid" 2>/dev/null || true
+  sleep 1
+  kill -KILL -- "-$prep_pgid" 2>/dev/null || true
+  case "$prep_rc" in
+    0 ) : ;;
+    124 | 137 ) die "the prepare command ran past CACHE_PREPARE_TIMEOUT (${CACHE_PREPARE_TIMEOUT}s) and was killed — an install that cannot finish must not become a half-populated snapshot" ;;
+    * ) die "the prepare command failed — publishing an archive of a failed install would ship a cache that is worse than none" ;;
+  esac
 
   scan_or_die "$STAGE"
 
@@ -333,12 +666,46 @@ if [ "$BUILDING" = 1 ]; then
   # a multi-linked file as its own content instead of as a link member, so nothing
   # the host extracts has nlink > 1 — the condition its own scan refuses.
   log "packing"
+  # `.tar.gz` suffix: the name is what gzip's output is read back as by `tar -tvzf`.
+  ARCHIVE=$(mktemp "$ARCHIVE_DIR/snap.XXXXXX.tar.gz") || die "the archive file could not be created"
   tar -c -C "$STAGE" --owner=0 --group=0 --numeric-owner --sort=name --hard-dereference \
     -- "${CACHE_DIRS[@]}" | gzip -n -6 >"$ARCHIVE"
 else
-  [ -f "$CACHE_ARCHIVE_IN" ] || die "CACHE_ARCHIVE_IN does not name a file: $CACHE_ARCHIVE_IN"
+  # safe_path even though this one is a workflow literal today: it is the only
+  # refusal that interpolates a path, and the day someone derives it from job
+  # output is the day the exception becomes the injection.
+  [ -f "$CACHE_ARCHIVE_IN" ] || die "CACHE_ARCHIVE_IN does not name a file: $(safe_path "$CACHE_ARCHIVE_IN")"
+  ARCHIVE=$(mktemp "$ARCHIVE_DIR/snap.XXXXXX.tar.gz") || die "the archive file could not be created"
   cp -- "$CACHE_ARCHIVE_IN" "$ARCHIVE"
 fi
+
+# FIRST, before anything reads the archive for a verdict. The identity of the
+# bytes, taken once and re-checked at every later use.
+#
+# Every check below re-opens this file: `stat` for the size, `tar -tvzf` for the
+# member layout, `gzip -dc` for the scan, and finally `cp` and `gcloud storage cp`
+# for the bytes that ship. A verdict rendered before the pin exists is a verdict
+# about bytes nothing can later prove were these — the size bound would then be
+# computed from a stale length (and quoted in the expansion message, which is how
+# that reads as a factual claim about the wrong file), and the flatness check,
+# which is the ONLY pass that sees setuid and hardlink members, would have looked
+# at a different archive than the one uploaded.
+#
+# Detector, not control: what is supposed to leave nothing able to write here is
+# the reap above, plus the refusal to hold the credential in a process that ran
+# CACHE_PREPARE at all. If this ever fires, one of those failed, and the run
+# refuses rather than publishing.
+#
+# From stdin, so a filename is never an operand: GNU sha256sum escapes a name
+# holding a newline or a backslash and prefixes the line with one.
+ARCHIVE_SHA=$(sha256sum <"$ARCHIVE" | cut -d' ' -f1) \
+  || die "the archive could not be digested"
+assert_archive_unchanged() { # <what happens next>
+  local now
+  now=$(sha256sum <"$ARCHIVE" | cut -d' ' -f1) || die "the archive could not be re-digested before $1"
+  [ "$now" = "$ARCHIVE_SHA" ] \
+    || die "the archive changed between the scan and $1 — something is still writing in this run's temp directory, and nothing that was checked applies to these bytes"
+}
 
 size=$(stat -c %s "$ARCHIVE")
 if [ "$size" -gt "$CACHE_MAX_BYTES" ]; then
@@ -346,28 +713,57 @@ if [ "$size" -gt "$CACHE_MAX_BYTES" ]; then
 fi
 
 archive_is_flat "$ARCHIVE"
+assert_archive_unchanged "the size and member-layout verdicts were trusted"
 
-if [ "$BUILDING" = 0 ]; then
-  # An artifact that crossed a job boundary is input, and the job that scanned it
-  # the first time is the one that ran third-party code. Bounded the way the host
-  # bounds it: gzip expands by more than a thousandfold on the right input, so the
-  # compressed bound alone bounds nothing. `head` closing the pipe truncates the
-  # stream and tar fails, which is the wanted answer.
-  gzip -dc "$ARCHIVE" | head -c "$((size * 8))" \
-    | tar -x -C "$STAGE" --no-same-owner --no-same-permissions --no-xattrs --no-acls \
-    || die "the archive did not unpack — refusing to publish an archive this run cannot inspect"
-  scan_or_die "$STAGE"
-fi
+# The staged tree has served its purpose once the archive is packed and checked,
+# and holding it costs a second full copy of the cache on a runner whose disk is
+# smaller than two of them. It is also one fewer thing left writable.
+# chmod, because `mkdir -p` takes the ambient umask (0755 on a hosted runner)
+# where `mktemp -d` gave 0700. The directory stays empty, but it should not be a
+# world-readable one.
+if [ "$BUILDING" = 1 ]; then rm -rf "$STAGE"; mkdir -p "$STAGE"; chmod 0700 "$STAGE"; fi
+
+# UNCONDITIONAL, in both phases: what gets scanned has to be the bytes that get
+# shipped, not a tree those bytes were supposed to have come from. An artifact
+# that crossed a job boundary is plainly input — but so is one packed a few lines
+# up, so neither phase gets to skip it.
+#
+# On its own this does not close the write window, and it should not be read as
+# doing so. Four things together close it: the credentialed phase never runs
+# CACHE_PREPARE at all, so in that process there is no writer to race; the
+# install's process group is reaped before the first scan; this pass proves the
+# packed bytes are clean; and ARCHIVE_SHA proves the bytes uploaded are these.
+#
+# WHAT THIS PASS DOES NOT COVER: modes. The extraction below deliberately drops
+# permissions, xattrs and ACLs, so by the time `-perm /6000` and `getcap` run
+# over $VERIFY there is no setuid bit and no `security.capability` left to find.
+# Those two rules are load-bearing only in `archive_is_flat`, which reads the
+# archive's own member list — which is why it now runs inside the digest pin.
+# What this pass is for is links and CONTENT.
+#
+# Into a tree of its own, created only now: $STAGE is what the prepare command
+# populated, so unpacking over it would scan a union of the two.
+#
+# Bounded the way the host bounds it: gzip expands by more than a thousandfold on
+# the right input, so the compressed bound alone bounds nothing. `head` closing
+# the pipe truncates the stream and tar fails, which is the wanted answer.
+VERIFY=$(mktemp -d) || die "the archive could not be unpacked for verification"
+chmod 0700 "$VERIFY"
+gzip -dc "$ARCHIVE" | head -c "$((size * 8))" \
+  | tar -x -C "$VERIFY" --no-same-owner --no-same-permissions --no-xattrs --no-acls \
+  || unpack_failed
+scan_or_die "$VERIFY"
 
 # The name is the object's identity forever: the bucket expires it by age and
 # nothing ever replaces it. Timestamp first so a listing sorts chronologically,
 # digest second so two runs of the same content are visibly the same content.
 # Both halves stay inside the charset a host accepts in a pointer.
-digest=$(sha256sum "$ARCHIVE" | cut -c1-16)
+digest=${ARCHIVE_SHA:0:16}
 SNAP="$(date -u +%Y%m%dT%H%M%SZ)-${digest}.tar.gz"
 log "built $SNAP ($size bytes)"
 
 if [ -n "${CACHE_ARCHIVE_OUT:-}" ]; then
+  assert_archive_unchanged "the artifact was written"
   cp -- "$ARCHIVE" "$CACHE_ARCHIVE_OUT"
   log "wrote $CACHE_ARCHIVE_OUT — nothing uploaded, this phase holds no credential"
 fi
@@ -384,6 +780,7 @@ fi
 # turns a name collision into a precondition failure naming the object, rather
 # than a 403 that reads like a broken credential.
 PREFIX="cache/${CACHE_POOL}"
+assert_archive_unchanged "the upload"
 log "uploading gs://${CACHE_BUCKET}/${PREFIX}/${SNAP}"
 gcloud storage cp --if-generation-match=0 \
   "$ARCHIVE" "gs://${CACHE_BUCKET}/${PREFIX}/${SNAP}" \
@@ -397,9 +794,14 @@ POINTER="gs://${CACHE_BUCKET}/${PREFIX}/current"
 gen=$(gcloud storage objects describe "$POINTER" --format='value(generation)' 2>/dev/null || true)
 [ -n "$gen" ] || gen=0
 
-printf '%s\n' "$SNAP" >"$ARCHIVE_DIR/current"
+# mktemp: the pointer's body is the one file in this directory whose CONTENT is
+# what every host resolves a snapshot by, so a fixed name the prepare command
+# could pre-create as a symlink is the shortest path from a compromised install
+# to a pointer naming an object of its choosing.
+pointer_body=$(mktemp "$ARCHIVE_DIR/current.XXXXXX") || die "the pointer could not be staged"
+printf '%s\n' "$SNAP" >"$pointer_body"
 gcloud storage cp --if-generation-match="$gen" \
-  "$ARCHIVE_DIR/current" "$POINTER" \
+  "$pointer_body" "$POINTER" \
   || die "the pointer was not swapped (generation $gen): another publisher won the race, the pointer changed while this run was packing, or this identity cannot read it — check that the snapshot itself uploaded. The snapshot IS uploaded and will expire with the bucket's age bound; re-run to publish it."
 
 log "published $SNAP — hosts booting from now hydrate from it"
