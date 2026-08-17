@@ -1072,8 +1072,14 @@ Describe 'probe verdict' {
 
     It 'fails a broker that answered at all on a pool that configured none' {
         $r = & $script:CleanProbe
+        # The impersonation fields are cleared so this test still fails when the
+        # broker arm alone is broken: the drift arm below reports the SAME
+        # 'configured no job service account' phrase, and with the shared
+        # fixture's default 200 it would satisfy this assertion on its own.
+        $r.impersonateStatus = $null
+        $r.impersonateAttempts = $null
         (@(Get-ProbeFailure -Result $r -JobServiceAccount '' -ExpectedIdentity 'ci-s1') -join "`n") |
-            Should -Match 'configured no job service account'
+            Should -Match 'a broker answered as'
     }
 
     It 'passes a no-broker pool that reported no broker' {
