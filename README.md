@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.23.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.24.0"
   # ...
 }
 ```
@@ -473,7 +473,8 @@ boots and every one of them broken.
 ## Layout
 
 ```
-modules/ci-runner-network/       the per-project firewall posture (no NAT)
+modules/ci-runner-network/       the per-project firewall posture (no NAT),
+                                 and the log of where the pool connects out to
 modules/ci-runner-cache-bucket/  where a pool's cache lives between hosts
 modules/ci-runner-apply-trigger/ the unattended apply, as the project's OWN Cloud Build
 modules/ci-host-image-trigger/   the golden image, rebuilt by a merge instead of by hand
@@ -493,6 +494,8 @@ scripts/ci/check-merge-queue-single-step.sh
 scripts/ci/check-runner-policy.sh
                                  which pool a job may claim, and for how long
 scripts/ci/check-action-pins.sh  every third-party action pinned to a commit
+scripts/ci/check-workflow-permissions.sh
+                                 what a job may do to the repo, stated not inherited
 scripts/ci/check-e2e-policy.sh   does a consumer's browser suite report honestly, and fast
 docs/ci-workflow-gates.md        those gates: rules, flags, how to adopt
 docs/ci-lane-model.md            the lane contract consumers adopt

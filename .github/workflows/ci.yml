@@ -462,6 +462,19 @@ jobs:
       - name: action pins
         run: bash scripts/ci/check-action-pins.sh
 
+      # The other half of that rule. Pinning decides what code ARRIVES on a
+      # pool; this decides what it may do once it runs. Omit `permissions:` and
+      # a job does not get nothing — it gets the repository default, a value in
+      # a web console that no reviewer of the workflow can see, and `read-write`
+      # for every repository created before GitHub changed it. On a warm host
+      # that token is readable by every step, including the install scripts of
+      # every transitive dependency the job downloads.
+      - name: workflow permissions self-test
+        run: bash scripts/ci/check-workflow-permissions.sh --selftest
+
+      - name: workflow permissions
+        run: bash scripts/ci/check-workflow-permissions.sh
+
       # The README quickstart pinned v3.0.0 while the fleet ran v4.1.0 — the one
       # copy-pasteable line in the repo, three minor versions stale, because
       # nothing connected Markdown to a git tag. VERSION is that connection.

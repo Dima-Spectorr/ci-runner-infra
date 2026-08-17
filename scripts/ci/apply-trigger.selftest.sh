@@ -193,6 +193,50 @@ defaults_to_the_generation_already_deployed() {
   matches "$block" 'default *= *null' || return 1
 }
 
+# 11. The init step carries `backend_config` through, and carries it SORTED.
+#
+#     A root that supplies its state bucket at init time rather than in
+#     `backend.tf` — which the Specaria-owned CI roots do deliberately, the
+#     bucket being a vendor resource rather than a customer literal — gets no
+#     usable diagnosis when this is dropped. `terraform init` asks for the
+#     missing attribute, `-input=false` turns the question into an error, and
+#     the message names the backend, so the reader goes and looks at a
+#     `backend.tf` that is exactly as intended. Nothing points at this module.
+#
+#     Sorted because `for k, v in` over a map is unordered in terraform's
+#     evaluation only by convention: the args list is part of the trigger's
+#     stored build config, so an unstable order is a permanent diff — the
+#     trigger is rewritten on every apply, forever, and the plan that should be
+#     empty never is. That is the whole signal the nightly apply exists to give.
+passes_the_backend_config_through() {
+  local code; code=$(code_of "$1")
+  matches "$code" '\-backend-config=\$\{k\}=\$\{var\.backend_config\[k\]\}' || return 1
+  matches "$code" 'for k in sort\(keys\(var\.backend_config\)\)'            || return 1
+  # Still an -upgrade init, and still non-interactive: appending the pairs is
+  # the only change, and a rewrite that loses either is not caught above.
+  matches "$code" '"init", "-input=false", "-upgrade"'                      || return 1
+}
+
+# 12. `backend_config` refuses a credential, as a validation rather than as a
+#     sentence in its own description.
+#
+#     Every backend documents a credential attribute directly beside the bucket,
+#     so passing one here is the obvious next step and not a careless one. It is
+#     also unrecoverable in the quiet way: the value is stored in the trigger's
+#     build config and printed in every build log, and nothing goes red, so the
+#     leak is found by whoever next reads a log for an unrelated reason. A
+#     description that says "not a place for a secret" is read once, by the
+#     person who already knows.
+rejects_a_credential_in_backend_config() {
+  local block; block=$(var_block backend_config "$1")
+  matches "$block" 'setintersection'  || return 1
+  matches "$block" '"credentials"'    || return 1
+  matches "$block" '"access_token"'   || return 1
+  matches "$block" '"encryption_key"' || return 1
+  # Case-folded, or `Credentials` walks straight past the list.
+  matches "$block" 'lower\(k\)'       || return 1
+}
+
 echo "apply-trigger self-test:"
 
 # The helpers carry the traps they were written to avoid, so they are checked
@@ -224,6 +268,8 @@ check fires_only_for_the_root_it_applies          "$MAIN" "the trigger fires on 
 check runs_each_tool_in_an_image_that_has_it      "$MAIN" "a step calls a tool its image does not carry — the report fails with 'not found' and looks broken"
 check selects_one_github_generation               "$MAIN" "the trigger does not pick its GitHub generation from the project — the wrong one is created healthy and never fires"
 check defaults_to_the_generation_already_deployed "$VARS" "github_connection has a default — every already-onboarded 1st-gen root would move generation at its next -upgrade"
+check passes_the_backend_config_through           "$MAIN" "init drops backend_config, or builds it unsorted — a root that supplies its bucket at init time cannot use this module, or its trigger is rewritten on every apply"
+check rejects_a_credential_in_backend_config      "$VARS" "backend_config accepts a credential key — it would be stored in the trigger's build config and printed in every build log, with nothing going red"
 
 mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
   local desc="$1" f="$2" prog="$3" pred="$4" tmp
@@ -271,6 +317,22 @@ mutate "'this project is 1st gen, drop the other block' — gen2 made unreachabl
   's|for_each = local.gen2 ? \[1\] : \[\]|for_each = []|' selects_one_github_generation
 mutate "'new projects are all 2nd gen now' — made the default" "$VARS" \
   '/^variable "github_connection"/,/^}/ s|default     = null|default     = "github"|' defaults_to_the_generation_already_deployed
+# "Nobody passes it, and concat() is noise" — the simplification that silently
+# locks out every root whose backend is supplied at init time.
+# shellcheck disable=SC2016
+mutate "'no consumer sets backend_config' — init flattened back to a literal list" "$MAIN" \
+  's|\[for k in sort(keys(var.backend_config)) : "-backend-config=${k}=${var.backend_config\[k\]}"\],|[],|' passes_the_backend_config_through
+# The obvious way to write it, and the one that makes the trigger a permanent
+# diff: correct output, unstable order.
+mutate "'sort() is pointless on a map' — ordering dropped" "$MAIN" \
+  's|for k in sort(keys(var.backend_config))|for k in keys(var.backend_config)|' passes_the_backend_config_through
+# "The description already says not to" — the credential denylist deleted in
+# favour of the sentence it exists because nobody reads.
+mutate "'the docs cover it' — credential denylist removed" "$VARS" \
+  '/setintersection/,/^  }$/d' rejects_a_credential_in_backend_config
+# The version written from one backend's docs, which lets `Credentials` past.
+mutate "'keys are lowercase anyway' — case folding dropped" "$VARS" \
+  's|for k in keys(var.backend_config) : lower(k)|for k in keys(var.backend_config) : k|' rejects_a_credential_in_backend_config
 
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

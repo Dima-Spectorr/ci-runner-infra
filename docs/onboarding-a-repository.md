@@ -48,7 +48,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.23.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.24.0"
 
   project_id         = var.project_id
   network            = var.network
@@ -57,7 +57,7 @@ module "ci_runner_network" {
 }
 
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.23.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.24.0"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -66,7 +66,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.23.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.24.0"
 
   project_id = var.project_id
   region     = var.region
@@ -144,7 +144,7 @@ the pool:
 
 ```hcl
 module "ci_cache_publisher" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-publisher?ref=v5.23.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-publisher?ref=v5.24.0"
 
   project_id             = var.project_id
   name                   = "ci-runner-host-myrepo"   # the SAME pool name
@@ -330,7 +330,7 @@ later apply:
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.23.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.24.0"
 
   project_id     = var.project_id
   region         = var.region
@@ -346,6 +346,18 @@ module "ci_runner_apply_trigger" {
   apply_schedule = "23 4 * * *"
 }
 ```
+
+**If this root uses the partial backend described in step 4, pass the bucket
+here too** — the build's `init` hits the same wall the manual one did, with the
+same misleading message, on a schedule nobody is watching:
+
+```hcl
+  backend_config = { bucket = "<state-bucket>" }
+```
+
+Bucket and prefix only. Credential keys are rejected at plan time: the value
+would be stored in the trigger and printed in every build log, and the build
+already authenticates as the service account above.
 
 **If the project links GitHub the 2nd-gen way, add its connection**, and the
 module registers the repository under it rather than expecting a GitHub App
@@ -536,7 +548,7 @@ instantiations with their own names, MIGs, controllers and labels.
 
 ```hcl
 module "ci_runner_identity_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.23.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.24.0"
 
   project_id        = var.project_id
   name              = var.win_pool_name
@@ -549,7 +561,7 @@ module "ci_runner_identity_win" {
 }
 
 module "ci_runner_pool_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.23.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.24.0"
 
   # ... project_id, region, github_*, network, subnetwork and the three
   # identities exactly as the Linux pool above, from the _win modules ...

@@ -174,12 +174,28 @@ resource "google_cloudbuild_trigger" "apply" {
     # time. Cloud Build starts each build on a fresh workspace, so this is
     # belt-and-braces here — and it is the line that would matter the day a
     # cache is introduced, which is exactly when nobody re-reads this file.
+    #
+    # `backend_config` is appended because not every root bakes its backend into
+    # `backend.tf`. Two of the Specaria-owned roots deliberately leave the state
+    # bucket out of the file — it is a vendor resource, not a customer literal,
+    # and keeping it out is what lets the same root serve more than one estate —
+    # and supply it at init with `-backend-config=bucket=...`. Against a root
+    # like that a bare `terraform init` does not fail in a way anybody would
+    # connect to this module. The observed message — recorded in
+    # docs/onboarding-a-repository.md from the manual init that hits the same
+    # wall — is "querying Cloud Storage failed: storage: bucket doesn't exist",
+    # which reads as a deleted or misnamed bucket rather than as one that was
+    # never passed. Empty by default, so a root that does bake its bucket in is
+    # unchanged.
     step {
       id         = "init"
       name       = "hashicorp/terraform:${var.terraform_version}"
       entrypoint = "terraform"
       dir        = var.terraform_root
-      args       = ["init", "-input=false", "-upgrade"]
+      args = concat(
+        ["init", "-input=false", "-upgrade"],
+        [for k in sort(keys(var.backend_config)) : "-backend-config=${k}=${var.backend_config[k]}"],
+      )
     }
 
     # Separate from the apply so the log shows what was ABOUT to change even

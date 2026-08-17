@@ -56,7 +56,7 @@ ref-scoped `principalSet` is how it is bounded. Read the section below.
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.23.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.24.0"
 
   project_id     = var.project_id
   region         = "<region>"
@@ -72,6 +72,27 @@ module "ci_runner_apply_trigger" {
   apply_schedule = "23 4 * * *"
 }
 ```
+
+**If the root does not name its backend fully in `backend.tf`, add
+`backend_config`.** Most roots bake the bucket in and need nothing here. The
+Specaria-owned CI roots deliberately do not — the bucket is a vendor resource,
+not a customer literal, so it is supplied at init time — and against one of
+those a bare `terraform init` fails with "querying Cloud Storage failed:
+storage: bucket doesn't exist" — which reads as a deleted or misnamed bucket,
+not as one that was never passed. Nothing in it points at this trigger.
+
+```hcl
+  backend_config = {
+    bucket = "<state-bucket>"
+  }
+```
+
+Not a place for a secret: every value is rendered into the trigger's stored
+build config and printed in the build log. Credential keys — `credentials`,
+`access_token`, `encryption_key` and the rest — are rejected at plan time
+rather than left to the reader, because nothing about the leak goes red. The
+build authenticates to the backend as the service account you already gave it;
+grant that account access to the state bucket.
 
 Three prerequisites, and the first is the same one the workflow has:
 
@@ -241,7 +262,7 @@ repository's README anyway. Anything that *is* a secret stays where it is.
 
 ```hcl
 module "ci_runner_apply_identity" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.23.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.24.0"
 
   project_id             = var.project_id
   name                   = var.pool_name
@@ -319,7 +340,7 @@ provisioner has already run.
 
 ```hcl
 module "ci_host_image_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.23.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.24.0"
 
   project_id   = var.project_id
   region       = "<region>"

@@ -491,6 +491,27 @@ moved by the pull request being checked. See `docs/dependency-freshness.md`,
 including why `eol: false` upstream means "no date announced" and reading it as
 a boolean reports the whole fleet clean.
 
+### 7.2 What the pinned code may DO — shipped
+
+Pinning decides what arrives on a pool. It says nothing about what that code is
+allowed to do once it runs, and the default answer is the worst one available:
+omit `permissions:` and a job does not get nothing, it gets the **repository
+default** — a value in a web console, invisible in the pull request, and
+`read-write` for every repository created before GitHub changed it. On this
+fleet the resulting `GITHUB_TOKEN` is readable by every step in the job,
+including the install scripts of every transitive dependency it downloads, on a
+warm host holding a GCP identity beside other jobs' caches and trees.
+
+**Shipped:** `scripts/ci/check-workflow-permissions.sh` — PERM1 the set is
+stated (in the job or the workflow above it) rather than inherited, PERM2 a
+write sits on the job that needs it rather than on every job in the file
+(`write-all` never does; a one-job file is exempt, because there is nothing to
+move), PERM3 no `secrets: inherit` to a remote reusable workflow, PERM4
+undecided and never a pass. Run against this repository on its first pass it
+found two workflow-level writes — both single-job, both correct — which is the
+measurement that produced the one-job exemption rather than an allowlist entry.
+See `docs/ci-workflow-gates.md`.
+
 ---
 
 ## 8. Governance tier — how this stays true
