@@ -357,6 +357,15 @@ The file is read at startup, **before the prepare command runs**. The build job'
 checkout is writable by the install it is about to launch, so an allowlist parsed
 any later is one that install could have extended with a digest of its own.
 
+That is also a precondition the env-var form did not have, and it is on you to
+keep: **nothing the untrusted build job produced may land on top of the allowlist
+file.** In the workflow above it cannot — `download-artifact` unpacks into
+`${{ runner.temp }}`, not the workspace. Point that `path:` at the checkout and
+the build job's artifact can overwrite the list the credentialed job is about to
+scan with.
+
+Indentation is fine; leading whitespace is stripped before the line is judged.
+
 Both may be set; the entries are unioned. The same "literal in the repository,
 never `${{ vars.* }}`" rule applies — a checked-in file is a diff that goes
 through review, which is the whole reason to prefer it.
