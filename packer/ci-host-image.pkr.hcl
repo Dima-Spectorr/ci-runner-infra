@@ -628,8 +628,8 @@ build {
     destination = "/tmp/image-vuln-ignores.txt"
   }
 
-  # 11. SBOM, scan, verdict — recorded, not enforced. The enforcement is step 13,
-  #     after the artifacts are safely off the VM.
+  # 11. SBOM, scan, verdict — recorded, not enforced. The enforcement is step 14,
+  #     after the artifacts are safely off the VM and the scanners are gone.
   provisioner "shell" {
     inline_shebang = "/bin/bash -e"
     inline = [
@@ -660,7 +660,7 @@ build {
       "export GRYPE_DB_CACHE_DIR=$D/db",
       # No --fail-on here on purpose: grype decides what it FOUND, the verdict
       # script decides what BLOCKS. Keeping those apart is what makes the
-      # blocking rule testable off a fixture (18 of them, run in CI) instead of
+      # blocking rule testable off a fixture (19 of them, run in CI) instead of
       # only observable during a forty-minute image build.
       "grype sbom:$D/sbom.syft.json -o json --file $D/grype.json",
 

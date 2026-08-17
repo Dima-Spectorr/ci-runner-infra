@@ -115,7 +115,15 @@ if ignores_path:
                 if len(parts) < 3:
                     print("BADIGNORE line %d: %s" % (lineno, line), file=sys.stderr)
                     sys.exit(3)
-                ignores[parts[0]] = (parts[1], parts[2])
+                # The reason is emitted as the last field of a TAB-separated
+                # record and read back with IFS=$'\t'. `split(None, 2)` treats a
+                # tab as whitespace, so a reason containing one is legal input
+                # here and would add a column downstream — silently, and only
+                # for whoever wrote that one line. Folded to spaces at the
+                # boundary rather than rejected: the text is prose for a human,
+                # and refusing it over an invisible character would be a gate
+                # failing on something correct.
+                ignores[parts[0]] = (parts[1], parts[2].replace("\t", " "))
     except OSError as exc:
         print("UNREADABLE %s" % exc, file=sys.stderr)
         sys.exit(3)
@@ -168,6 +176,16 @@ run() {
   REPORT=""; FAIL_ON="critical"; IGNORES=""; TODAY=""; SELFTEST=0
 
   while [ $# -gt 0 ]; do
+    # `$2` is read under `set -u`, so a value-taking flag given last would die
+    # with "unbound variable" — a bash internal error where the caller needs a
+    # usage message, and one that reads as the gate being broken rather than as
+    # the invocation being wrong. Checked before the case, once, rather than in
+    # four places that could each be forgotten.
+    case "$1" in
+      --report|--fail-on|--ignores|--today)
+        [ $# -ge 2 ] || { echo "$1 needs a value" >&2; usage; }
+        ;;
+    esac
     case "$1" in
       --report)  REPORT="$2";  shift 2 ;;
       --fail-on) FAIL_ON="$2"; shift 2 ;;
@@ -320,6 +338,21 @@ selftest() {
     > "$tmp/nofixver.json"
   check "a fix with no version does not shift the columns" 1 "VULN1" \
     --report "$tmp/nofixver.json" --today 2026-01-01
+
+  # A reason with a TAB in it. `split(None, 2)` accepts it as ordinary
+  # whitespace, and the records are tab-separated — so an unfolded tab would add
+  # a column and the reader would take part of the prose for a field. Invisible
+  # in the file, wrong only for whoever wrote that one line.
+  printf 'CVE-1 2026-12-31 reviewed\tand\taccepted\n' > "$tmp/tabbed.txt"
+  check "a tab inside an ignore reason does not shift the columns" 1 "VULN2" \
+    --report "$tmp/fixable.json" --ignores "$tmp/tabbed.txt" --today 2027-01-01
+  check "…and the reason survives it, folded to spaces" 1 "reviewed and accepted" \
+    --report "$tmp/fixable.json" --ignores "$tmp/tabbed.txt" --today 2027-01-01
+
+  # A value-taking flag given last. Under `set -u` this used to die reading `$2`
+  # — a bash internal error where the caller needs a usage message.
+  check "a flag with no value is a usage error, not an unbound variable" 2 "needs a value" \
+    --report
 
   rm -rf "$tmp"
   [ "$status" -eq 0 ] && echo "image-vuln-verdict self-test: all fixtures pass"
