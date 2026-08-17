@@ -473,7 +473,8 @@ boots and every one of them broken.
 ## Layout
 
 ```
-modules/ci-runner-network/       the per-project firewall posture (no NAT)
+modules/ci-runner-network/       the per-project firewall posture (no NAT),
+                                 and the log of where the pool connects out to
 modules/ci-runner-cache-bucket/  where a pool's cache lives between hosts
 modules/ci-runner-apply-trigger/ the unattended apply, as the project's OWN Cloud Build
 modules/ci-host-image-trigger/   the golden image, rebuilt by a merge instead of by hand
