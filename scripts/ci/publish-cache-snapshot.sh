@@ -677,9 +677,14 @@ unpack_failed() {
 
 scan_or_die() { # <tree>
   local root="$1" bad
+  # `-printf '%y %M %p'`, as in host-startup.sh and packer: six predicates share
+  # the message below, and a bare path does not say which one fired. The one that
+  # fired in production was `-perm /6000` on a DIRECTORY, and the refusal read
+  # like a bad file. `d drwxrwsr-x <path>` cannot be misread. safe_path still
+  # gets the whole string, so a control character in a name is still neutered.
   bad=$(find "$root" \
     \( -type l -o -type b -o -type c -o -type p -o -type s -o -perm /6000 \) \
-    -print -quit 2>/dev/null) || die "the staged tree could not be scanned"
+    -printf '%y %M %p\n' -quit 2>/dev/null) || die "the staged tree could not be scanned"
   [ -z "$bad" ] || die "the staged tree holds a link, node or setuid entry ($(safe_path "$bad")) — a host would refuse this snapshot"
 
   bad=$(getcap -r "$root" 2>/dev/null) || die "the staged tree could not be scanned for file capabilities"

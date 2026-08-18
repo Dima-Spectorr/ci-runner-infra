@@ -357,6 +357,10 @@ has_packer_gate_that_aborts() { # <file>
   # private cache. The owner bit protects nothing on a root-owned tree anyway.
   ! matches "$code" 'chmod -R a-w'                    || return 1
   matches "$code" 'chmod -R go-w,go\+rX /opt/ci-cache' || return 1
+  # Third copy of the same scan, and it must say which predicate fired too. The
+  # image gate is the one place that can still refuse a hostile tree BEFORE any
+  # host boots from it, so its refusal is read by whoever is unblocking a build.
+  matches "$code" "\-printf '%y %M %p" || return 1
 }
 
 # --- the snapshot hydrate -------------------------------------------------------
@@ -520,6 +524,11 @@ has_snapshot_inspection() { # <file>
   # by going around it.
   matches "$code" 'CACHE_DEADLINE=\$deadline'                    || return 1
   matches "$code" 'cache_scan "\$limit" find "\$root"'           || return 1
+  # The refusal has to name the PREDICATE, not just the path. Six of them share
+  # one message, and the first time it fired in production it named the tree root
+  # twice and the cause not at all — a setgid directory the image had shipped,
+  # which read like a content problem and cost hours. `%y %M` is the whole fix.
+  matches "$code" "\-printf '%y %M %p" || return 1
   matches "$code" 'cache_scan "\$limit" getcap -r "\$root"'      || return 1
   # `strict`, because for a snapshot the scan is the only opinion there is: an
   # unscannable tree has to be a refused tree, not a logged one.
@@ -983,6 +992,10 @@ has_trusted_snapshot_build() { # <file>
 
   matches "$code" '^VERIFY=\$\(mktemp -d\)' || return 1
   matches "$code" '^scan_or_die "\$VERIFY"$' || return 1
+  # The publisher's copy of the scan says which predicate fired too — it is the
+  # same six sharing the same sentence, and an operator reading "holds a link,
+  # node or setuid entry" about a DIRECTORY has been sent the wrong way once.
+  matches "$code" "\-printf '%y %M %p" || return 1
   matches "$code" '\-C "\$VERIFY" --no-same-owner' || return 1
   matches "$code" 'head -c "\$\(\(size \* 8\)\)"' || return 1
 
@@ -1321,6 +1334,9 @@ mutate_file "$PACKER" 'the image ships the cache group-writable' has_packer_gate
   's@^      "chown -Rh root:root /opt/ci-cache",$@      "chgrp -R ci /opt/ci-cache",@'
 mutate_file "$PACKER" 'the image bakes a cache no slot can write' has_packer_gate_that_aborts \
   's@chmod -R go-w,go\+rX /opt/ci-cache@chmod -R a-w,a+rX /opt/ci-cache@'
+# `..n` and not `.n`: inside the HCL string the newline is written `\\n`.
+mutate_file "$PACKER" 'the image gate refusal names the path but not the reason' has_packer_gate_that_aborts \
+  "s@-printf '%y %M %p..n' -quit@-print -quit@"
 
 # The snapshot layer. The first two are the exact edits that would turn a host
 # into a publisher, which is the whole thing this design exists to prevent.
@@ -1352,6 +1368,8 @@ mutate 'tar is allowed out of the staging tree' has_snapshot_inspection \
   's@\| tar -x -C "\$CACHE_STAGE"@| tar -x -P -C "$CACHE_STAGE"@'
 mutate 'the snapshot inspection escapes the deadline' has_snapshot_inspection \
   's@cache_scan "\$limit" getcap@getcap@'
+mutate 'the refusal names the path but not the reason' has_snapshot_inspection \
+  "s@-printf '%y %M %p.n' -quit@-print -quit@"
 mutate 'the snapshot scan stops being strict' has_snapshot_inspection \
   's@cache_master_is_hostile "\$CACHE_STAGE" strict@cache_master_is_hostile "$CACHE_STAGE"@'
 mutate 'an unscannable snapshot is logged rather than refused' has_snapshot_inspection \
@@ -1425,6 +1443,8 @@ mutate_file "$BUCKETTF" 'ACLs come back and route around the prefix conditions' 
 # The publishing script. Each of these is an edit that leaves a working script —
 # it still builds something and still uploads it — and changes what "trusted"
 # means. None of them would fail a run.
+mutate_file "$PUBSH" 'the publisher refusal names the path but not the reason' has_trusted_snapshot_build \
+  "s@-printf '%y %M %p.n' -quit@-print -quit@"
 mutate_file "$PUBSH" 'the snapshot is packed from a host cache instead' has_trusted_snapshot_build \
   's@^STAGE=\$\(mktemp -d\)$@STAGE=/opt/ci-cache@'
 mutate_file "$PUBSH" 'pnpm loses the v11 spelling on the publishing side' has_trusted_snapshot_build \

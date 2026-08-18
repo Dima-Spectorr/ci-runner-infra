@@ -455,7 +455,10 @@ build {
     inline_shebang = "/bin/bash -e"
     inline = [
       "set -euxo pipefail",
-      "bad=$(find /opt/ci-cache \\( -type l -o -type b -o -type c -o -type p -o -type s -o -perm /6000 -o \\( -type f -a -links +1 \\) \\) -print -quit)",
+      # `-printf '%y %M %p'`, matching host-startup.sh: six predicates share the
+      # message below, so a bare path leaves the reader to guess which one fired.
+      # `d drwxrwsr-x /opt/ci-cache` says setgid directory and nothing else does.
+      "bad=$(find /opt/ci-cache \\( -type l -o -type b -o -type c -o -type p -o -type s -o -perm /6000 -o \\( -type f -a -links +1 \\) \\) -printf '%y %M %p\\n' -quit)",
       "[ -z \"$bad\" ] || { echo \"warm cache holds a link, node or setuid entry: $bad\" >&2; exit 1; }",
       # No pipe into head: under pipefail, head closing the pipe early can SIGPIPE
       # getcap and abort the build over a cache that was perfectly fine.
