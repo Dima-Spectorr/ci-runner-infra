@@ -374,8 +374,29 @@ chmod 0700 "$STAGE" "$ARCHIVE_DIR"
 # still a literal scheme followed by `://`.
 URL_SCHEME_ALT='https?|ftps?|sftp|ssh|(git|hg|bzr|svn)(\+(ssh|https?|file))?|mongodb(\+srv)?|postgres(ql)?|mysql|mariadb|rediss?|amqps?|s3|gs|ldaps?|smtps?|imap'
 
+# `_authToken` carries a left boundary for the same reason the URL rule carries
+# an anchor, and it was found the same way — on a real tree. Bare, it also
+# matches the TAIL of a longer identifier, and `googleapis` ships four doc
+# comments reading `"authToken": "my_authToken"` in a 456 KB `.d.ts`. That hit
+# is unexcusable by design and lands on a hash-named store object, so the
+# operator's only move is deleting the rule that guards the one credential
+# nothing may allowlist past. The forms an `_authToken` is actually written in
+# all keep matching — `//registry.example.com/:_authToken=…` in an `.npmrc`,
+# the same line indented, the same key in JSON, in `npm config` output, in a
+# URL query string. What stops matching, in the text forms above, is the tail
+# of a longer identifier, which is never the credential.
+#
+# A bracket expression is why EVERY grep that runs these patterns pins
+# `LC_ALL=C`, and that is not tidiness: with GNU grep on glibc in a UTF-8
+# locale `[^A-Za-z0-9]` matches a CHARACTER, so a byte that is not valid UTF-8
+# in front of the token makes the whole rule miss. The boundary is free under
+# the byte locale and a hole without it. Two of those greps decide whether a
+# file is refused; the three in `explain_credential_hit` only decide what the
+# refusal prints, and an unpinned one there means the gate refuses a file and
+# then cannot say which rule caught it — on exactly the bytes this boundary was
+# written for.
 CREDENTIAL_PATTERNS=(
-  "registry-auth-token|_authToken"
+  "registry-auth-token|(^|[^A-Za-z0-9])_authToken"
   "url-embedded-basic-auth|(^|[^A-Za-z0-9+.-])($URL_SCHEME_ALT)://[^/@[:space:]\"]+:[^/@[:space:]\"]+@"
   "private-key-header|-----BEGIN [A-Z ]*PRIVATE KEY-----"
 )
@@ -420,7 +441,12 @@ matched_labels() { # <file>
   local file="$1" entry rc out=""
   for entry in "${CREDENTIAL_PATTERNS[@]}"; do
     rc=0
-    grep -qa -E -e "${entry#*|}" "$file" 2>/dev/null || rc=$?
+    # LC_ALL=C, for the reason spelled out at the bulk grep in `scan_or_die`:
+    # a bracket expression is character-wise in a UTF-8 locale, so an invalid
+    # byte in front of a pattern makes it match nothing. Both greps or neither
+    # — this one decides which labels a file trips, and a label dropped here is
+    # a file that becomes excusable.
+    LC_ALL=C grep -qa -E -e "${entry#*|}" "$file" 2>/dev/null || rc=$?
     [ "$rc" -le 1 ] \
       || die "the content scan could not test $(safe_path "$file") against ${entry%%|*} (grep exited $rc)"
     if [ "$rc" = 0 ]; then out="$out ${entry%%|*}"; fi
@@ -434,7 +460,10 @@ matched_labels() { # <file>
 # `registry-auth-token` is absolute. An `_authToken` line in the cache is the
 # attack this whole pass exists for, and no dependency ships one as a fixture,
 # so there is nothing to trade off — an operator must not be able to allowlist
-# their way past a live registry credential.
+# their way past a live registry credential. Being absolute is what obliges the
+# pattern to be exact rather than generous: a rule with no escape hatch turns
+# every false positive into a demand to delete it, which is why the boundary on
+# `_authToken` above is part of this decision and not a tidy-up.
 #
 # `url-embedded-basic-auth` used to be absolute too, and that was wrong in a way
 # only the fleet's first real tree showed. A `user:password@` URL is what a
@@ -526,10 +555,10 @@ explain_credential_hit() { # <tree> <file>
     printf '  file: %s bytes, %s line(s)\n' "$(wc -c <"$file")" "$(wc -l <"$file")"
     for entry in "${CREDENTIAL_PATTERNS[@]}"; do
       label="${entry%%|*}" pat="${entry#*|}"
-      n=$(grep -ca -E -e "$pat" "$file" 2>/dev/null) || n=0
+      n=$(LC_ALL=C grep -ca -E -e "$pat" "$file" 2>/dev/null) || n=0
       [ "$n" -gt 0 ] || continue
       printf '  %s: %s match(es), first on line %s\n' \
-        "$label" "$n" "$(grep -na -m1 -E -e "$pat" "$file" 2>/dev/null | cut -d: -f1)"
+        "$label" "$n" "$(LC_ALL=C grep -na -m1 -E -e "$pat" "$file" 2>/dev/null | cut -d: -f1)"
       # The one extra fact worth having: the scheme in front of a `user:pass@`
       # tells a real registry credential (`https`) apart from a fixture
       # connection string (`mongodb`, `postgres`, `git+ssh`).
@@ -541,7 +570,7 @@ explain_credential_hit() { # <tree> <file>
       # itself. Echoing whatever was found would leak exactly the bytes this
       # function exists not to print. Anything unrecognised says so and stops.
       if [ "$label" = url-embedded-basic-auth ]; then
-        scheme=$(grep -oEa -m1 -e "$pat" "$file" 2>/dev/null | head -n1 \
+        scheme=$(LC_ALL=C grep -oEa -m1 -e "$pat" "$file" 2>/dev/null | head -n1 \
           | sed -E 's@^[^A-Za-z]*@@; s@://.*@@') || true
         if printf '%s' "$scheme" | grep -qE "^($URL_SCHEME_ALT)$"; then
           printf '    scheme: %s\n' "$scheme"
@@ -681,7 +710,14 @@ scan_or_die() { # <tree>
   # which cannot be excused. That is the reason every pattern above is anchored
   # to something a random byte stream does not produce; it is not a detail of the
   # patterns, it is the condition on which reading binaries is affordable.
-  grep -rlaZ -E "${pass[@]}" "$root" >"$hits" 2>/dev/null || rc=$?
+  # `LC_ALL=C` for the same reason `-a` is here: the pass reads bytes, not text.
+  # In a UTF-8 locale a bracket expression matches one CHARACTER, so a byte in
+  # 0x80-0xFF that is not valid UTF-8 is not a character and `[^A-Za-z0-9]`
+  # matches nothing in front of it — which turns `\xff_authToken=<token>` into a
+  # clean file. That is the leading-NUL trick above with one byte changed, and
+  # against the one label no allowlist may excuse. Measured on ubuntu-latest,
+  # whose image sets LANG=C.UTF-8: without this, that string is not found.
+  LC_ALL=C grep -rlaZ -E "${pass[@]}" "$root" >"$hits" 2>/dev/null || rc=$?
   [ "$rc" -le 1 ] || die "the staged tree could not be scanned for embedded credentials (grep exited $rc)"
   # EVERY hit, not just the first. With an allowlist in play, stopping at the
   # first match would let an excused file stand in front of an unexcused one and
