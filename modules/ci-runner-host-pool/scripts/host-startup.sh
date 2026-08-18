@@ -638,10 +638,22 @@ cache_master_is_hostile() { # [<tree>] [strict]
   # here), and device, fifo and socket nodes have no business in a dependency
   # cache. -links +1 is scoped to regular files because every directory has a
   # link count above one by construction.
+  # `-printf '%y %M %p'` and not `-print`, because the refusal has to say WHICH
+  # of those predicates matched. Six predicates share one message, and the one
+  # that actually fired here was `-perm /6000` on the tree ROOT — an image that
+  # shipped /opt/ci-cache as `drwxrwsr-x runner:ci` rather than root-owned 0755.
+  # `refusing /opt/ci-cache: it holds a link, node or setuid entry
+  # (/opt/ci-cache)` names the path twice and the cause not at all, so the whole
+  # pool ran cold while the log said something that read like a content problem.
+  # The type letter and the mode string cost nothing and answer it outright:
+  # `d drwxrwsr-x /opt/ci-cache`.
+  #
+  # GNU find, which is what the image ships and what packer's copy of this scan
+  # already assumes; this script runs on the Linux pool only.
   bad=$(cache_scan "$limit" find "$root" \
     \( -type l -o -type b -o -type c -o -type p -o -type s \
        -o -perm /6000 -o \( -type f -a -links +1 \) \) \
-    -print -quit 2>/dev/null) || {
+    -printf '%y %M %p\n' -quit 2>/dev/null) || {
     log "refusing $root: it could not be scanned inside the remaining budget"
     return 0
   }
