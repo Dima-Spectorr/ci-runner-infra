@@ -711,7 +711,14 @@ has_trusted_snapshot_build() { # <file>
   matches "$code" '\-perm /6000' || return 1
   matches "$code" 'getcap -r' || return 1
   matches "$code" "\-name '\.git-credentials'" || return 1
-  matches "$code" '_authToken' || return 1
+  matches "$code" '^  "registry-auth-token\|\(\^\|\[\^A-Za-z0-9\]\)_authToken"$' || return 1
+  # Every grep running these patterns reads BYTES, so every one pins the byte
+  # locale. A bracket expression is character-wise in a UTF-8 locale — which
+  # ubuntu-latest sets — so one invalid byte in front of the pattern makes the
+  # rule miss entirely. Pinned on each grep rather than exported once, because
+  # an export is a line someone moves. Two are asserted here because they decide
+  # refusal; the reporter's three are pinned by the closed allow-list below.
+  matches "$code" '^    LC_ALL=C grep -qa -E -e "\$\{entry#\*\|\}" "\$file"' || return 1
   # The refusal has to be readable. The pass finds a FILE, and in a dependency
   # cache that file's name is a content hash, so without this the log says only
   # that something matched somewhere — indistinguishable from a false positive.
@@ -873,9 +880,14 @@ has_trusted_snapshot_build() { # <file>
   local -a reads_about=(
     'wc -c <"$file"'
     'wc -l <"$file"'
-    'grep -ca -E -e "$pat" "$file"'
-    'grep -na -m1 -E -e "$pat" "$file"'
-    'grep -oEa -m1 -e "$pat" "$file"'
+    # Carrying `LC_ALL=C` makes this list pin the locale too: drop the prefix
+    # and the form stops matching, `"$file"` survives the strip, and the
+    # assertion fails. The reporter reads the same bytes under the same rules
+    # as the passes that refuse, or it reports on a different file than the one
+    # that was caught.
+    'LC_ALL=C grep -ca -E -e "$pat" "$file"'
+    'LC_ALL=C grep -na -m1 -E -e "$pat" "$file"'
+    'LC_ALL=C grep -oEa -m1 -e "$pat" "$file"'
     'matched_labels "$file"'
     # Asks about the file (which rules it tripped, how big it is) and answers
     # yes or no. It is on this list for the same reason `matched_labels` is:
@@ -917,7 +929,7 @@ has_trusted_snapshot_build() { # <file>
   # it and both publish the NUL exploit. So: the flag group is asserted exactly,
   # and the two opt-outs are banned anywhere in the file, since neither has a
   # legitimate use in a script whose only content pass must read every byte.
-  matches "$code" '^  grep -rlaZ -E "\$\{pass\[@\]\}" "\$root" >"\$hits"' || return 1
+  matches "$code" '^  LC_ALL=C grep -rlaZ -E "\$\{pass\[@\]\}" "\$root" >"\$hits"' || return 1
   # Scoped to a grep's own short-option cluster, in any position: `-rIlZ` and
   # `-rlIZ` are the same flag and neither may appear. Not a bare `-I` search --
   # `kill -KILL` would trip that, and a guard that has to be loosened later gets
@@ -1388,7 +1400,26 @@ mutate_file "$PUBSH" 'a hardlink may be packed as a link member' has_trusted_sna
 mutate_file "$PUBSH" 'the shipped bytes stop being inspected' has_trusted_snapshot_build \
   's@^archive_is_flat "\$ARCHIVE"$@@'
 mutate_file "$PUBSH" 'the embedded-credential pass is dropped' has_trusted_snapshot_build \
-  's@^  "registry-auth-token\|_authToken"$@@'
+  's@^  "registry-auth-token\|\(\^\|\[\^A-Za-z0-9\]\)_authToken"$@@'
+# Widening it back is not the same failure as dropping it, and it is the quieter
+# one: the scan still fires, the suite still passes its own token cases, and what
+# breaks is a real tree months later, on a rule that cannot be allowlisted past.
+mutate_file "$PUBSH" 'the token rule matches the tail of a longer word again' has_trusted_snapshot_build \
+  's@^  "registry-auth-token\|\(\^\|\[\^A-Za-z0-9\]\)_authToken"$@  "registry-auth-token|_authToken"@'
+# Dropping either locale pin re-opens the boundary as a hole rather than closing
+# it. Two mutations, not one: the two greps answer different questions — which
+# labels a file trips, and which files are looked at at all — and a suite that
+# only pins one of them accepts a script where they disagree.
+mutate_file "$PUBSH" 'the per-file credential grep loses its byte locale' has_trusted_snapshot_build \
+  's@^    LC_ALL=C grep -qa -E -e @    grep -qa -E -e @'
+mutate_file "$PUBSH" 'the tree-wide credential grep loses its byte locale' has_trusted_snapshot_build \
+  's@^  LC_ALL=C grep -rlaZ -E @  grep -rlaZ -E @'
+# The reporter's greps decide nothing, so dropping their pin is not a bypass —
+# it is a file the gate refuses and then cannot name a rule for, which reads as
+# a false positive and gets the rule deleted. Caught by the closed allow-list of
+# forms allowed to touch "$file", which now carries the prefix.
+mutate_file "$PUBSH" 'the credential reporter loses its byte locale' has_trusted_snapshot_build \
+  's@^      n=\$\(LC_ALL=C grep -ca @      n=$(grep -ca @'
 # A refusal that names only a content-addressed hash file cannot be told from a
 # false positive without reproducing the whole install, and the predictable
 # response to a gate nobody can read is deleting it.
@@ -1685,6 +1716,46 @@ else
     ok
   else
     bad "behaviour: the run failed, but not on the content pass"
+  fi
+fi
+
+# The other side of that control, and the reason the token rule carries a left
+# boundary. `googleapis` ships four doc comments of exactly this shape in one
+# 456 KB `.d.ts`, and `registry-auth-token` is the one label no allowlist may
+# excuse — so a bare `_authToken` pattern refuses that file permanently and the
+# only move left is deleting the rule. This publishes, with no allowlist at all.
+if behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/npm/_cacache/content-v2/sha512/ee"
+printf "%s\n" "         *       //   \"authToken\": \"my_authToken\"," \
+  >"$stage/npm/_cacache/content-v2/sha512/ee/blob"
+' >"$TMP/beh.docword.log" 2>&1; then
+  ok
+else
+  bad "behaviour: a doc comment naming my_authToken was refused as a registry token"
+fi
+
+# The other half of that boundary, and the reason the greps pin LC_ALL=C. This
+# is the leading-NUL opt-out with one byte changed: in a UTF-8 locale `\xff` is
+# not a character, so `[^A-Za-z0-9]` matches nothing in front of the token and a
+# live credential reads as a clean file. The prepare command is untrusted, so
+# writing that byte is within reach of the same code the `-a` flag exists for.
+# Run under a UTF-8 locale on purpose — under `C` this passes either way, which
+# is exactly how the hole stayed invisible.
+if LANG=C.UTF-8 LC_ALL=C.UTF-8 behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/npm/_cacache/content-v2/sha512/ff"
+printf "\377//registry.example.com/:_authToken=STOLEN\n" \
+  >"$stage/npm/_cacache/content-v2/sha512/ff/blob"
+' >"$TMP/beh.hibyte.log" 2>&1; then
+  bad "behaviour: a registry token behind one high-bit byte was published"
+else
+  if matches "$(cat "$TMP/beh.hibyte.log")" 'embedded credential'; then
+    ok
+  else
+    bad "behaviour: the high-bit token run failed, but not on the content pass"
   fi
 fi
 

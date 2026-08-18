@@ -337,6 +337,20 @@ Four bounds make this safe to have at all:
   connection strings with `user:password@` in them. The set is a whitelist, not
   "anything but the token rule": a pattern added to the scan later is
   unexcusable until someone decides otherwise in a diff.
+
+  Having no escape hatch is exactly why that rule's pattern has to be exact.
+  `_authToken` matches on a left boundary — a line start or a non-alphanumeric —
+  because bare, it also matches the tail of a longer identifier, and `googleapis`
+  ships four doc comments reading `"authToken": "my_authToken"`. An unexcusable
+  rule with a false positive in it is a rule someone deletes. Every grep that
+  runs these patterns — the two that decide refusal and the three that write the
+  refusal log — runs under `LC_ALL=C` for the same reason they run under `-a`:
+  they read bytes. With GNU grep on glibc in a UTF-8 locale — which
+  `ubuntu-latest` sets — a character class matches one *character*, so a byte
+  that is not valid UTF-8 in front of the pattern makes the rule miss, and the
+  prepare command that writes it is untrusted code. Unpinned, the two deciding
+  greps are a bypass; unpinned, the reporter's three are a refusal that cannot
+  name the rule that caused it.
 - **Every rule a file trips must be excusable**, and a `url-embedded-basic-auth`
   hit must additionally be in a file of at least 1024 bytes. See the table in
   the refusal section above.
