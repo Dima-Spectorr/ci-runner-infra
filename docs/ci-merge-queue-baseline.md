@@ -1,4 +1,4 @@
-# The merge-queue baseline — one CI run per pull request, or one per batch
+# The merge-queue baseline — one CI run per pull request, one pull request per batch
 
 The lane model in [`ci-lane-model.md`](ci-lane-model.md) decides *how much* CI a
 pull request deserves. This decides *how many times it runs*. They are
@@ -11,12 +11,22 @@ governs (`.mergify.yml`) lives in the consuming repository, so what is published
 here is the required shape, the gate that asserts it, and where the gate must
 sit.
 
-**Revised 2026-08-17.** This document used to say one thing — *one CI run per
-pull request* — so a repository whose queue had become its bottleneck could only
-obey it or leave it. Twelve of the thirteen fleet repositories are still exactly
-right to obey it, and nothing below changes for them. The thirteenth found the
-way out; the way out is much narrower than "raise something", and the number it
-raised is not the one that looks obvious. Read
+**Revised 2026-08-18. `batch_size: 1` IN EVERY REPOSITORY, AND THAT IS NOT A
+PER-REPOSITORY CHOICE.** One pull request per batch, so no pull request can be
+delayed, bisected or dequeued by a failure in somebody else's change. Tier 1
+below — batched drafts — is **retired**, not deleted: it is kept in full because
+none of its reasoning was found wrong, it was traded away for that isolation,
+and a rule whose reasoning is deleted is the one that gets re-derived. **Raising
+`batch_size` anywhere is a change to this document first.**
+
+*Revised 2026-08-17, superseded above.* This document used to say one thing —
+*one CI run per pull request* — so a repository whose queue had become its
+bottleneck could only obey it or leave it. Twelve of the thirteen fleet
+repositories were still exactly right to obey it. The thirteenth (IntegrateIT)
+found the way out, and the way out was much narrower than "raise something": the
+number to raise is `batch_size`, not the one that looks obvious. That remains
+true as an argument, and it is the argument to make here if the queue becomes a
+bottleneck again. Read
 [Two tiers](#two-tiers-and-the-only-way-to-move-between-them) before changing
 any value in this file.
 
@@ -44,13 +54,24 @@ whenever the configuration cannot guarantee the first run is still valid.
 
 ## Two tiers, and the only way to move between them
 
-### Tier 0 — in place. The default, and where twelve of thirteen repositories belong.
+### Tier 0 — in place. The default, and where every repository belongs.
 
 `max_parallel_checks: 1`, `batch_size: 1`. One CI run per pull request. The five
 properties below are its definition. **Do not leave this tier to be faster in
-principle.** Leave it only on the measurement in the next paragraph.
+principle.**
 
-### Tier 1 — batched drafts. For a repository whose QUEUE is the bottleneck.
+Since 2026-08-18 `batch_size: 1` is not the tier's choice to reverse: it holds
+account-wide even in the one repository that keeps a width above 1. IntegrateIT
+sits at `max_parallel_checks: 3` with `batch_size: 1` — outside Tier 0 on
+property 1, inside it on property 2.
+
+### Tier 1 — batched drafts. RETIRED 2026-08-18; kept as the argument, not as an option.
+
+**Nothing may move to this tier without changing the revision note at the top of
+this document.** It is recorded because it was right about the shape of the
+trade — the knob to raise is `batch_size`, never `max_parallel_checks` — and
+that is the reasoning any future queue-bottleneck argument has to start from.
+What it was for:
 
 The trigger is one specific, measurable thing, and it is not "CI is slow" or
 "there are a lot of PRs":
@@ -87,6 +108,14 @@ IntegrateIT went 5/1 → 3/`{min: 1, max: 5}` on 2026-08-17: in-flight capacity 
 → 15 pull requests, peak runner demand ~25 → ~15, second-CI cost per pull
 request 1 → as little as 0.2 runs. It got three times the queue capacity while
 *returning* runners to the fleet.
+
+**It went back to 3/1 on 2026-08-18** (IntegrateIT #9023), in the account-wide
+move to one pull request per batch. The measurement above was never
+contradicted; the capacity it bought was given up for isolation. What that
+costs, so the next argument starts from the real number: in-flight capacity
+15 → 3, second-CI cost 0.2 → 1 run per pull request. The width was **not** raised
+back to 5 to compensate — the fleet figure in the next section, not the batch
+size, is what bounds it.
 
 ### Tier 1's mandatory companion: bound the bisect
 
@@ -130,10 +159,14 @@ requests competed for it, and four speculative validations were enough to starve
 ordinary PR CI into mass cancellation and queue churn. The autoscaler being
 allowed to reach 32 did not help, because it had not.
 
-Twelve repositories at width 1 are a small, roughly constant claim. **A width
-above 1 in a second repository is a fleet-level change and needs the sum
-recomputed, in the pull request that makes it.** This is also the reason Tier 1
-prefers batch size: raising `batch_size` does not appear in that sum at all.
+Thirteen repositories at width 1 are a small, roughly constant claim, and one
+(IntegrateIT) is at 3. **A width above 1 in a second repository is a fleet-level
+change and needs the sum recomputed, in the pull request that makes it.** This
+is also the reason Tier 1 preferred batch size: raising `batch_size` does not
+appear in that sum at all. Since 2026-08-18 that escape is closed by policy
+rather than by arithmetic — `batch_size` is 1 everywhere — so a repository under
+queue pressure has no local move left, and the fix is an argument here, not an
+edit to its `.mergify.yml`.
 
 ---
 
@@ -250,9 +283,11 @@ merge_protections_settings:
     - -draft
 ```
 
-### …and the Tier 1 delta
+### …and the Tier 1 delta — RETIRED, do not apply
 
-Only the two values change, and only together with the third:
+Kept as the record of what the delta *was*. Since 2026-08-18 no repository may
+carry it without changing the revision note at the top of this document first.
+Only the two values changed, and only together with the third:
 
 ```yaml
 merge_queue:
@@ -513,11 +548,15 @@ Three failures around the parse rather than in it, each with a fixture:
 - **Do not restate `check-success` conditions in `auto_merge_conditions`.**
 - **Do not host the gate in a path-filtered job.** It is the one gate whose
   subject matter guarantees the filter excludes it.
-- **Do not set `batch_size` above 1 without
-  `batch_max_failure_resolution_attempts >= ceil(log2(max))`.** The bisect then
-  ends with pull requests unseparated and dequeues ones that did not fail. This
-  is the shape found live in Manar on 2026-08-17: `batch_size: 5`, no attempt
-  bound, and `max_parallel_checks` unset so the width was the vendor's too.
+- **Do not set `batch_size` above 1 at all** — one pull request per batch is an
+  account-wide decision (2026-08-18), so raising it is a change to the revision
+  note at the top of this document, not to a repository's `.mergify.yml`.
+- **And if it is ever raised, never without
+  `batch_max_failure_resolution_attempts >= ceil(log2(max))`.** The bisect
+  otherwise ends with pull requests unseparated and dequeues ones that did not
+  fail. This is the shape found live in Manar on 2026-08-17: `batch_size: 5`, no
+  attempt bound, and `max_parallel_checks` unset so the width was the vendor's
+  too.
 - **Do not raise `max_parallel_checks` to go faster.** It is the one knob whose
   cost is linear in runners, it spends from a pool shared with every other
   repository, and `batch_size` buys the same throughput for free. A width above
@@ -536,24 +575,33 @@ Three failures around the parse rather than in it, each with a fixture:
 
 ---
 
-## Fleet status (re-surveyed 2026-08-17)
+## Fleet status (re-surveyed 2026-08-18)
 
 Read live from each repository's `.mergify.yml`, not from the conversion PR list
 — a landed conversion is not evidence the file still says what it said.
 
 | repository | width | batch | attempts | tier |
 |---|---|---|---|---|
-| DataRetrival, Specaria-Platform, Print-Server, CarListPrice, SOAP-To-REST, mot-face-blur, Telnet-Emulation, entity-platform, Apigee-Portal, Atlas, ci-runner-infra | 1 | 1 | — | **0**, correctly |
-| IntegrateIT | 3 | `{1, 5}` | 3 | **1** |
-| **Manar** | **unset** | **5** | **none** | **broken** |
+| DataRetrival, Specaria-Platform, Print-Server, CarListPrice, SOAP-To-REST, mot-face-blur, Telnet-Emulation, entity-platform, Apigee-Portal, Atlas, ci-runner-infra, Borsh-Tablet-App | 1 | 1 | — | **0**, correctly |
+| IntegrateIT | 3 | 1 | 3 (redundant, kept) | **0** on batch, width 3 by fleet measurement |
+| Manar | unset | 1 | — | **0** on batch; width still the vendor's |
 
-**Manar is the fleet's one real defect, and it never appeared in the conversion
-list above.** It batches five pull requests with no bisect bound, so any batch
-failure dequeues all five; and with `max_parallel_checks` unset the width is the
-vendor's default rather than a number anyone here chose, which is an unbounded
-claim on the shared runner pool. It is the exact combination the two "must not"
-bullets above now name. Fixing it is a one-file change to Tier 0 — Manar's queue
-is not its bottleneck.
+Every repository now merges **one pull request per batch**. The two that did not
+were changed on 2026-08-18: IntegrateIT #9023 (`{1, 5}` → 1) and Manar #25
+(5 → 1).
+
+**Manar's remaining defect is its WIDTH, not its batch.** `max_parallel_checks`
+is still unset, so the width is the vendor's default rather than a number anyone
+here chose — an unbounded claim on the shared runner pool, and the thing the
+runner-budget invariant above cannot account for. Its batch is fixed; pin the
+width to 1 in the same shape as every other Tier 0 repository.
+
+**Nothing yet PREVENTS a repository-local raise back above 1.**
+`check-merge-queue-single-step.sh` enforces `BATCH_MAX` as a *ceiling* (5), so a
+repository setting `batch_size: 3` with the paired attempt bound passes the
+gate. Until the gate asserts the value rather than a ceiling, this document is
+the only thing holding the decision, and a document is not an enforcement
+mechanism.
 
 Landed conversions, for history: DataRetrival #2384, IntegrateIT #7778,
 Specaria-Platform #3225, Print-Server #1833, CarListPrice #14, SOAP-To-REST
