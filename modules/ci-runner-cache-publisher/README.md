@@ -82,7 +82,7 @@ place is a generation aged zero that never expires — the control would still b
 configured and would be doing nothing.
 
 The one object that must be rewritten is the pointer, and its grant names that
-object with `==` rather than a prefix. Swap it with `--if-generation-match` so
+object with `==` rather than a prefix. Swap it with a generation precondition so
 two publishers racing produce one winner and one loud failure, never a pointer
 naming a half-written snapshot.
 

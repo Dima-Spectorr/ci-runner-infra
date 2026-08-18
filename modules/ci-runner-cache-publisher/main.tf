@@ -31,7 +31,7 @@
 #      object rather than a prefix, so the authority to overwrite cannot reach a
 #      snapshot even by naming one.
 #
-# The pointer swap is conditional on that generation (`--if-generation-match`),
+# The pointer swap is conditional on that generation (`ifGenerationMatch`),
 # which is what makes two publishers racing produce one winner and one loud
 # failure rather than a pointer naming a snapshot that was never fully written.
 #
