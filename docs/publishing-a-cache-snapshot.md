@@ -74,16 +74,20 @@ jobs:
       # once with:
       #   git ls-remote https://github.com/Dima-Spectorr/ci-runner-infra refs/tags/<tag>^{}
       #
-      # Do NOT pin a release older than v5.28.0. Before v5.27.0 the content
+      # Do NOT pin a release older than v5.29.0. Before v5.27.0 the content
       # scan could be switched off for a file by the prepare command writing
       # one NUL byte in front of the credential, and one process could both run
       # that command and hold the publishing credential. v5.27.0 itself parses
       # CACHE_SCAN_ALLOW_FILE wrongly: an indented entry is silently dropped,
-      # so the scan refuses a digest that is visibly on the list.
+      # so the scan refuses a digest that is visibly on the list. v5.28.0 fixes
+      # that but prints a sha256 for every refused file at or above the size
+      # floor, including a `user:password@` URL whose remaining bytes are a
+      # published README -- a hash of a mostly-public carrier is an offline
+      # oracle for the one field that is not public.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of the pinned tag>   # >= v5.28.0
+          ref: <commit sha of the pinned tag>   # >= v5.29.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
@@ -110,7 +114,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of the pinned tag>   # >= v5.28.0
+          ref: <commit sha of the pinned tag>   # >= v5.29.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
