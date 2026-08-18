@@ -711,7 +711,9 @@ has_trusted_snapshot_build() { # <file>
   matches "$code" '\-perm /6000' || return 1
   matches "$code" 'getcap -r' || return 1
   matches "$code" "\-name '\.git-credentials'" || return 1
-  matches "$code" '^  "registry-auth-token\|\(\^\|\[\^A-Za-z0-9\]\)_authToken"$' || return 1
+  # Pinned whole and anchored, because every way this rule has gone wrong was a
+  # small edit to it: the left class, the right assignment, the boundary itself.
+  matches "$code" '^  "registry-auth-token\|\(\^\|\[\^A-Za-z0-9\.\\\$\]\)_authToken\(\[\[:space:\]\\"'"'"'\]\*\[=:\]\|\[\\"'"'"'\]\[\[:space:\]\]\+\[\\"'"'"'\]\)"$' || return 1
   # Every grep running these patterns reads BYTES, so every one pins the byte
   # locale. A bracket expression is character-wise in a UTF-8 locale — which
   # ubuntu-latest sets — so one invalid byte in front of the pattern makes the
@@ -1400,12 +1402,21 @@ mutate_file "$PUBSH" 'a hardlink may be packed as a link member' has_trusted_sna
 mutate_file "$PUBSH" 'the shipped bytes stop being inspected' has_trusted_snapshot_build \
   's@^archive_is_flat "\$ARCHIVE"$@@'
 mutate_file "$PUBSH" 'the embedded-credential pass is dropped' has_trusted_snapshot_build \
-  's@^  "registry-auth-token\|\(\^\|\[\^A-Za-z0-9\]\)_authToken"$@@'
+  's@^  "registry-auth-token\|.*_authToken.*$@@'
 # Widening it back is not the same failure as dropping it, and it is the quieter
 # one: the scan still fires, the suite still passes its own token cases, and what
 # breaks is a real tree months later, on a rule that cannot be allowlisted past.
+# Three ways to widen, because this rule has been widened wrongly twice: back to
+# a bare substring, back to a word with no assignment after it, and back to a
+# left class that lets `._authToken =` through. Each of the last two is a real
+# package — googleapis and neo4j-driver — and each would take the publish job
+# permanently red with no allowlist entry able to clear it.
 mutate_file "$PUBSH" 'the token rule matches the tail of a longer word again' has_trusted_snapshot_build \
-  's@^  "registry-auth-token\|\(\^\|\[\^A-Za-z0-9\]\)_authToken"$@  "registry-auth-token|_authToken"@'
+  's@^  "registry-auth-token\|.*_authToken.*$@  "registry-auth-token|_authToken"@'
+mutate_file "$PUBSH" 'the token rule stops requiring an assignment' has_trusted_snapshot_build \
+  's@_authToken\(\[\[:space:\].*\)"$@_authToken"@'
+mutate_file "$PUBSH" 'the token rule matches a property access again' has_trusted_snapshot_build \
+  's@\[\^A-Za-z0-9\.\\\$\]@[^A-Za-z0-9]@'
 # Dropping either locale pin re-opens the boundary as a hole rather than closing
 # it. Two mutations, not one: the two greps answer different questions — which
 # labels a file trips, and which files are looked at at all — and a suite that
@@ -1735,6 +1746,69 @@ printf "%s\n" "         *       //   \"authToken\": \"my_authToken\"," \
 else
   bad "behaviour: a doc comment naming my_authToken was refused as a registry token"
 fi
+
+# The second false positive this rule was widened wrongly into, and the reason
+# it now requires an ASSIGNMENT. `neo4j-driver` names a private field exactly
+# `_authToken` and ships it in eight files including a 570 KB minified bundle;
+# no word boundary can help, because the identifier IS the string. What tells
+# the two apart is that a field is read or bound, never given a value in place.
+# All three shapes below are in the real package. This publishes, with no
+# allowlist at all.
+if behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/npm/_cacache/content-v2/sha512/dd"
+printf "%s\n" "  this._authToken = _authToken;" \
+              "    return this._authToken;" \
+              "  function authTokenManager(_authToken) {" \
+  >"$stage/npm/_cacache/content-v2/sha512/dd/blob"
+' >"$TMP/beh.field.log" 2>&1; then
+  ok
+else
+  bad "behaviour: a private field named _authToken was refused as a registry token"
+fi
+
+# ...and the assignment requirement is not a hole: every shape a tool actually
+# writes the credential in still refuses. A commented-out line counts -- `;` is
+# an ini comment, and a token in a comment is a token on disk. The whitespace
+# and single-quote cases are here because `[[:space:]"']*` is the whole novelty
+# of this rule, and an untested class member is one a later edit deletes for
+# free. The yarn v1 pair is the one form with no operator at all: key and value
+# are separated by juxtaposition, which the `.yarnrc` FILENAME rule catches by
+# name and this rule has to catch inside a hash-named blob.
+toki=0
+for tokline in \
+  '//registry.example.com/:_authToken=npm_REAL' \
+  '_authToken=npm_REAL' \
+  '  _authToken=npm_REAL' \
+  ';_authToken=npm_REAL' \
+  '_authToken = npm_REAL' \
+  '_authToken	=	npm_REAL' \
+  "_authToken' : 'npm_REAL" \
+  'npm_config__authToken=npm_REAL' \
+  '"//registry.yarnpkg.com/:_authToken" "npm_REAL"' \
+  '"//registry.example.com/:_authToken": "npm_REAL"' \
+  '//npm.pkg.github.com/:_authToken=${NPM_TOKEN}'
+do
+  toki=$((toki + 1))
+  # The line goes over on disk rather than through the prepare body: it carries
+  # quotes and a `${...}`, and interpolating it into the body would have the
+  # outer shell expand exactly the shape being tested.
+  printf '%s\n' "$tokline" >"$TMP/tok.txt"
+  # Per-iteration log name: a single one is overwritten by the next case, so the
+  # log left behind after a failure belongs to whichever case ran last.
+  toklog="$TMP/beh.tok.$toki.log"
+  if behave_run "$(printf 'set -eu\nstage=$(dirname "$npm_config_cache")\nd="$stage/npm/_cacache/content-v2/sha512/cc"\nmkdir -p "$d"\ncp %s "$d/blob"\n' "'$TMP/tok.txt'")" \
+       >"$toklog" 2>&1; then
+    bad "behaviour: a registry token published, written as: $tokline"
+  else
+    if matches "$(cat "$toklog")" 'embedded credential'; then
+      ok
+    else
+      bad "behaviour: that token run failed, but not on the content pass: $tokline"
+    fi
+  fi
+done
 
 # The other half of that boundary, and the reason the greps pin LC_ALL=C. This
 # is the leading-NUL opt-out with one byte changed: in a UTF-8 locale `\xff` is
