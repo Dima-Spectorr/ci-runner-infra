@@ -74,7 +74,7 @@ jobs:
       # once with:
       #   git ls-remote https://github.com/Dima-Spectorr/ci-runner-infra refs/tags/<tag>^{}
       #
-      # Do NOT pin a release older than v5.30.0. Before v5.27.0 the content
+      # Do NOT pin a release older than v5.31.0. Before v5.27.0 the content
       # scan could be switched off for a file by the prepare command writing
       # one NUL byte in front of the credential, and one process could both run
       # that command and hold the publishing credential. v5.27.0 itself parses
@@ -89,11 +89,17 @@ jobs:
       # runner's UTF-8 locale a bracket expression matches characters, not
       # bytes. The prepare command that writes the cache is untrusted code, so
       # that is a bypass anything installed can reach. v5.30.0 pins the byte
-      # locale on every grep that runs a credential pattern.
+      # locale on every grep that runs a credential pattern, and matches
+      # `_authToken` as a bare substring -- which refuses a clean tree, because
+      # `neo4j-driver` names a private field exactly that in eight files. The
+      # registry-token rule has no allowlist escape on purpose, so each of those
+      # is a refusal nobody can clear, and the only way out an operator is left
+      # with is deleting the rule. v5.31.0 matches the token being GIVEN A VALUE
+      # instead of merely appearing.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of the pinned tag>   # >= v5.30.0
+          ref: <commit sha of the pinned tag>   # >= v5.31.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
@@ -120,7 +126,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of the pinned tag>   # >= v5.30.0
+          ref: <commit sha of the pinned tag>   # >= v5.31.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
@@ -344,11 +350,26 @@ Four bounds make this safe to have at all:
   "anything but the token rule": a pattern added to the scan later is
   unexcusable until someone decides otherwise in a diff.
 
-  Having no escape hatch is exactly why that rule's pattern has to be exact.
-  `_authToken` matches on a left boundary — a line start or a non-alphanumeric —
-  because bare, it also matches the tail of a longer identifier, and `googleapis`
-  ships four doc comments reading `"authToken": "my_authToken"`. An unexcusable
-  rule with a false positive in it is a rule someone deletes. Every grep that
+  Having no escape hatch is exactly why that rule's pattern has to be exact. An
+  unexcusable rule with a false positive in it is a rule someone deletes, and a
+  bare `_authToken` substring produced two, both on real trees. `googleapis`
+  ships four doc comments reading `"authToken": "my_authToken"`, where the token
+  is the tail of a longer identifier. `neo4j-driver` names a private field
+  exactly `_authToken` and ships it in eight files, where no word boundary helps
+  because the identifier *is* the string. So the rule matches `_authToken`
+  **given a value**: followed by `=` or `:` through optional quotes and space,
+  or by the quote-space-quote of yarn v1's `"…:_authToken" "token"`, which
+  separates key from value by juxtaposition. It must also not be preceded by
+  `.`, `$` or an alphanumeric. A field is read or bound; a credential is given
+  a value. Every form a tool actually writes is a case in the suite: an
+  `.npmrc` line, indented, spaces or tabs around the `=`, commented out with
+  `;`, quoted as a JSON key in `npm config ls --json`, assigned `${NPM_TOKEN}`,
+  npm's environment form `npm_config__authToken=`, and yarn's juxtaposed pair.
+  What it gives up is a key spelled with a dot — `registry.example.com._authToken=`
+  — which nothing writes, and which is the price of the one class member the
+  neo4j evidence requires.
+
+  Every grep that
   runs these patterns — the two that decide refusal and the three that write the
   refusal log — runs under `LC_ALL=C` for the same reason they run under `-a`:
   they read bytes. With GNU grep on glibc in a UTF-8 locale — which

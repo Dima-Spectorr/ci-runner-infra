@@ -374,17 +374,44 @@ chmod 0700 "$STAGE" "$ARCHIVE_DIR"
 # still a literal scheme followed by `://`.
 URL_SCHEME_ALT='https?|ftps?|sftp|ssh|(git|hg|bzr|svn)(\+(ssh|https?|file))?|mongodb(\+srv)?|postgres(ql)?|mysql|mariadb|rediss?|amqps?|s3|gs|ldaps?|smtps?|imap'
 
-# `_authToken` carries a left boundary for the same reason the URL rule carries
-# an anchor, and it was found the same way — on a real tree. Bare, it also
-# matches the TAIL of a longer identifier, and `googleapis` ships four doc
-# comments reading `"authToken": "my_authToken"` in a 456 KB `.d.ts`. That hit
-# is unexcusable by design and lands on a hash-named store object, so the
-# operator's only move is deleting the rule that guards the one credential
-# nothing may allowlist past. The forms an `_authToken` is actually written in
-# all keep matching — `//registry.example.com/:_authToken=…` in an `.npmrc`,
-# the same line indented, the same key in JSON, in `npm config` output, in a
-# URL query string. What stops matching, in the text forms above, is the tail
-# of a longer identifier, which is never the credential.
+# `_authToken` matches an ASSIGNMENT, not a word, and both halves of that were
+# paid for on a real tree. This rule can never be allowlisted past, so a false
+# positive in it lands on a hash-named store object with no way out, and the
+# operator's only remaining move is deleting the rule that guards the one
+# credential nothing may excuse. Twice now a bare substring has produced
+# exactly that:
+#
+#   `"authToken": "my_authToken"` — four doc comments in a 456 KB `googleapis`
+#   `.d.ts`. The token is the TAIL of a longer identifier, which the left
+#   boundary drops.
+#
+#   `this._authToken = _authToken` — eight files in `neo4j-driver`, which names
+#   a private field exactly `_authToken`. No word boundary helps here: the
+#   identifier IS the string. What separates it from a credential is that a
+#   field is read (`._authToken;`) or bound as a parameter (`(_authToken)`),
+#   while a credential is always assigned a value.
+#
+# So the rule is `_authToken` GIVEN A VALUE: followed by `=` or `:` through
+# optional quotes and space, or by the quote-space-quote of yarn v1's
+# `"…:_authToken" "token"`, which separates key from value by juxtaposition
+# rather than by an operator. It must also not be preceded by `.`, `$` or an
+# alphanumeric. The right half rejects the field read and the parameter; the
+# left half rejects the property access `._authToken =`, which IS an assignment
+# and would otherwise pass, and `$_authToken =`, which a minifier can emit.
+# Every form a tool actually writes still matches, and each is a case in the
+# suite: `//registry.example.com/:_authToken=…` in an `.npmrc`, indented, with
+# spaces or tabs around the `=`, commented out with `;`, quoted as a JSON key
+# in `npm config ls --json`, assigned `${NPM_TOKEN}`, npm's environment form
+# `npm_config__authToken=…`, and yarn's juxtaposed pair.
+#
+# `_` is deliberately NOT in the left class. Excluding it would cost
+# `npm_config__authToken=` and buy nothing: neither false positive above needs
+# it, since `.` alone rejects the property access.
+#
+# What is still given up is a key spelled with a dot — `registry.example.com._authToken=`
+# — which nothing writes; npm, pnpm and yarn all use `//host/path/:_authToken`.
+# The dot is the one class member the neo4j evidence actually requires, so that
+# is the trade, stated rather than glossed.
 #
 # A bracket expression is why EVERY grep that runs these patterns pins
 # `LC_ALL=C`, and that is not tidiness: with GNU grep on glibc in a UTF-8
@@ -396,7 +423,7 @@ URL_SCHEME_ALT='https?|ftps?|sftp|ssh|(git|hg|bzr|svn)(\+(ssh|https?|file))?|mon
 # then cannot say which rule caught it — on exactly the bytes this boundary was
 # written for.
 CREDENTIAL_PATTERNS=(
-  "registry-auth-token|(^|[^A-Za-z0-9])_authToken"
+  "registry-auth-token|(^|[^A-Za-z0-9.\$])_authToken([[:space:]\"']*[=:]|[\"'][[:space:]]+[\"'])"
   "url-embedded-basic-auth|(^|[^A-Za-z0-9+.-])($URL_SCHEME_ALT)://[^/@[:space:]\"]+:[^/@[:space:]\"]+@"
   "private-key-header|-----BEGIN [A-Z ]*PRIVATE KEY-----"
 )
