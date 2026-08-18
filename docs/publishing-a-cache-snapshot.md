@@ -344,11 +344,26 @@ Four bounds make this safe to have at all:
   "anything but the token rule": a pattern added to the scan later is
   unexcusable until someone decides otherwise in a diff.
 
-  Having no escape hatch is exactly why that rule's pattern has to be exact.
-  `_authToken` matches on a left boundary — a line start or a non-alphanumeric —
-  because bare, it also matches the tail of a longer identifier, and `googleapis`
-  ships four doc comments reading `"authToken": "my_authToken"`. An unexcusable
-  rule with a false positive in it is a rule someone deletes. Every grep that
+  Having no escape hatch is exactly why that rule's pattern has to be exact. An
+  unexcusable rule with a false positive in it is a rule someone deletes, and a
+  bare `_authToken` substring produced two, both on real trees. `googleapis`
+  ships four doc comments reading `"authToken": "my_authToken"`, where the token
+  is the tail of a longer identifier. `neo4j-driver` names a private field
+  exactly `_authToken` and ships it in eight files, where no word boundary helps
+  because the identifier *is* the string. So the rule matches `_authToken`
+  **given a value**: followed by `=` or `:` through optional quotes and space,
+  or by the quote-space-quote of yarn v1's `"…:_authToken" "token"`, which
+  separates key from value by juxtaposition. It must also not be preceded by
+  `.`, `$` or an alphanumeric. A field is read or bound; a credential is given
+  a value. Every form a tool actually writes is a case in the suite: an
+  `.npmrc` line, indented, spaces or tabs around the `=`, commented out with
+  `;`, quoted as a JSON key in `npm config ls --json`, assigned `${NPM_TOKEN}`,
+  npm's environment form `npm_config__authToken=`, and yarn's juxtaposed pair.
+  What it gives up is a key spelled with a dot — `registry.example.com._authToken=`
+  — which nothing writes, and which is the price of the one class member the
+  neo4j evidence requires.
+
+  Every grep that
   runs these patterns — the two that decide refusal and the three that write the
   refusal log — runs under `LC_ALL=C` for the same reason they run under `-a`:
   they read bytes. With GNU grep on glibc in a UTF-8 locale — which
