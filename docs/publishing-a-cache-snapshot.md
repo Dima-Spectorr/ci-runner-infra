@@ -74,7 +74,7 @@ jobs:
       # once with:
       #   git ls-remote https://github.com/Dima-Spectorr/ci-runner-infra refs/tags/<tag>^{}
       #
-      # Do NOT pin a release older than v5.29.0. Before v5.27.0 the content
+      # Do NOT pin a release older than v5.30.0. Before v5.27.0 the content
       # scan could be switched off for a file by the prepare command writing
       # one NUL byte in front of the credential, and one process could both run
       # that command and hold the publishing credential. v5.27.0 itself parses
@@ -83,11 +83,17 @@ jobs:
       # that but prints a sha256 for every refused file at or above the size
       # floor, including a `user:password@` URL whose remaining bytes are a
       # published README -- a hash of a mostly-public carrier is an offline
-      # oracle for the one field that is not public.
+      # oracle for the one field that is not public. v5.29.0 fixes that, and
+      # still misses a registry token written behind one byte that is not valid
+      # UTF-8: its `_authToken` rule is a bracket expression, and on the
+      # runner's UTF-8 locale a bracket expression matches characters, not
+      # bytes. The prepare command that writes the cache is untrusted code, so
+      # that is a bypass anything installed can reach. v5.30.0 pins the byte
+      # locale on every grep that runs a credential pattern.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of the pinned tag>   # >= v5.29.0
+          ref: <commit sha of the pinned tag>   # >= v5.30.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
@@ -114,7 +120,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of the pinned tag>   # >= v5.29.0
+          ref: <commit sha of the pinned tag>   # >= v5.30.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
