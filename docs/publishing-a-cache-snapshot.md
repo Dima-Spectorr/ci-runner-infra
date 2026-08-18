@@ -227,23 +227,44 @@ the embedded-credential pass matched in pnpm-store/v3/files/72/93a11b…
   file: 47 bytes, 3 line(s)
   url-embedded-basic-auth: 1 match(es), first on line 2
     scheme: mongodb
-  no digest is printed for this file. A digest is printed only for a
-  private-key-header hit of at least 1024 bytes; a registry token or a URL
-  password is never excusable at any size, and for a SMALLER private-key
-  fixture compute the digest yourself with CACHE_DRY_RUN=1 rather than reading
-  it from this log
+  no digest is printed for this file, and no list will excuse it at this size.
+  A registry token is never excusable; a URL credential is, but only in a file
+  of at least 1024 bytes, because below that its hash is an oracle for its own
+  contents. Fix the cause instead -- a prepare command that authenticates, or a
+  dependency that has no business being in the tree
 ```
 
-A digest is printed only for a `private-key-header` hit of at least 1024 bytes,
-and only a `private-key-header` hit can be excused. The size floor is on the
-PRINTING, not on the excusing: a 230-byte EC PEM fixture is excusable, its
-digest is simply not published into a CI log — run the `CACHE_DRY_RUN=1`
-invocation below and `sha256sum` the file yourself. It is not squeamishness about the other two: the lines above already
-give the byte count, the line count, the match line and the scheme, so for a
-47-byte `mongodb://user:pass@host` the digest would be an unsalted hash of an
-almost fully known plaintext — an offline oracle for the password, published into
-a log anyone who can read the repository can read. Key material has the entropy
-to survive that; a password does not.
+The refusal answers two different questions, and confusing them is how the
+digest itself becomes the leak:
+
+| Rule | May a list excuse it? | Does the log print its digest? |
+|---|---|---|
+| `registry-auth-token` | never | never |
+| `private-key-header` | yes, at any size | yes, at ≥1024 bytes |
+| `url-embedded-basic-auth` | yes, at ≥1024 bytes | never — compute it yourself |
+
+A file is excusable only if **every** rule it trips is: a README that documents
+both a registry token and a connection string is not half-excusable, and no list
+will take it.
+
+The asymmetry is about entropy, not size. Under a `private-key-header` the bytes
+are key material — even a 230-byte ed25519 fixture holds more than anyone can
+walk — so its digest gives an attacker nothing, and the 1024-byte floor there is
+only because the rule matches a *header*: sixty bytes of header in front of a
+short string is not key material. A `user:password@` URL is the opposite. It
+lives in a package's published README, `.d.ts` or parser test, so every byte
+except the credential is already on npm; the lines above add the exact byte
+count, the line count, the match line and the scheme, and an unsalted sha256 of
+a nearly-known plaintext is an offline oracle with no rate limit. So that class
+is excusable and its digest is still never printed: compute it off the log with
+the `CACHE_DRY_RUN=1` invocation below.
+
+Under 1024 bytes a URL hit has no escape hatch at all — a list entry is itself a
+published hash, and for a bare `mongodb://user:pass@host` writing it into the
+repository is the same disclosure as printing it. That is deliberate. A short
+file that is nothing but a credential is the one case where "it's only a
+fixture" and "it's a live secret" look identical from the outside, so the gate
+declines to be the thing that decides. Look at the file and fix the cause.
 
 It never prints the matched text, and neither should you: a CI log is readable
 by everyone who can see the run, so pasting the line into an issue publishes the
@@ -301,13 +322,20 @@ output every host unpacks as root; keeping it as a literal keeps changing it a
 diff that goes through code review and branch protection, which a repository
 variable is precisely not.
 
-Three bounds make this safe to have at all:
+Four bounds make this safe to have at all:
 
-- **It excuses `private-key-header` and nothing else.** A `registry-auth-token`
-  or a `url-embedded-basic-auth` hit is refused with the allowlist set, before
-  the digest is even computed. No dependency has a legitimate reason to ship
-  either, so there is nothing to excuse — and that is what stops an operator
-  allowlisting their way past a live credential.
+- **It excuses two rules, and never the third.** A `registry-auth-token` hit is
+  refused with the allowlist set, before the digest is even computed: no
+  dependency has a legitimate reason to ship one, so there is nothing to excuse,
+  and that is what stops an operator allowlisting their way past a live
+  credential. `private-key-header` and `url-embedded-basic-auth` can be excused,
+  because dependencies demonstrably ship both — published test keys, and README
+  connection strings with `user:password@` in them. The set is a whitelist, not
+  "anything but the token rule": a pattern added to the scan later is
+  unexcusable until someone decides otherwise in a diff.
+- **Every rule a file trips must be excusable**, and a `url-embedded-basic-auth`
+  hit must additionally be in a file of at least 1024 bytes. See the table in
+  the refusal section above.
 - **It reaches the content pass only.** The filename, symlink, setuid and
   capability passes take no exceptions; a host refuses those outright, so an
   archive that needs one of them excused is an archive no host would unpack.
@@ -325,8 +353,11 @@ If you cannot say which dependency ships it, you have not finished diagnosing it
 The paragraph above assumes one fixture. A real dependency tree does not stop
 there — a `pnpm install` of one production monorepo lands **71** files carrying a
 private-key header, 49 of them from `ssh2` alone, which ships a directory of real
-published test keys. Seventy-one hashes in a YAML scalar is a list nobody reads,
-and an allowlist nobody reads is the hole it was meant to close.
+published test keys, and a further **40** carrying a `user:password@` URL, every
+one of them a placeholder in a package's own documentation (`user:pass`,
+`guest:guest`, `${USER}:${PASS}`). A hundred-odd hashes in a YAML scalar is a
+list nobody reads, and an allowlist nobody reads is the hole it was meant to
+close.
 
 Point at a file instead. Check it in next to the workflow, one digest per line,
 each with a comment naming the package:
@@ -349,7 +380,8 @@ a fixture is excused by the package that ships it and never by the hash alone;
 this is the one place that rule can be enforced rather than written down.
 
 Everything the variable guarantees, the file guarantees: full 64-character
-digests, `private-key-header` only, the content pass only, every use logged. Two
+digests, the two excusable rules only, the per-rule floors, the content pass
+only, every use logged. Two
 further refusals are specific to it — a path naming no readable file, and a file
 holding nothing but comments. Both would otherwise excuse nothing while reading
 exactly like a list that worked, and the symptom is a publish that refuses on

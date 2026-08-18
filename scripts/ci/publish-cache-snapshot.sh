@@ -408,9 +408,9 @@ CREDENTIAL_PATTERNS=(
 # and a URL scheme are not the secret; the value on that line is, and it stays in
 # the file. Whoever investigates re-runs the install and looks locally.
 # Which rules a file trips, space-separated. Two callers need this: the reporter
-# below, and the allowlist, which excuses `private-key-header` and NOTHING else.
-# EVERY label, never the first: the allowlist below excuses a file only when this
-# is exactly `private-key-header`, so a file holding a token AND a key header must
+# below, and the allowlist, which excuses some labels and never others.
+# EVERY label, never the first: a file is excusable only when every rule it trips
+# is an excusable one, so a file holding a token AND a key header must
 # come back with both or it becomes excusable. And a grep that ERRORS must not
 # read as "did not match" — a dropped label is the direction that makes a file
 # excusable, so an error refuses. (`die` inside a command substitution exits only
@@ -426,6 +426,97 @@ matched_labels() { # <file>
     if [ "$rc" = 0 ]; then out="$out ${entry%%|*}"; fi
   done
   printf '%s' "${out# }"
+}
+
+# Whether a digest may excuse this file at all, asked before any digest is
+# computed. Three rules match; two of them are excusable and one never is.
+#
+# `registry-auth-token` is absolute. An `_authToken` line in the cache is the
+# attack this whole pass exists for, and no dependency ships one as a fixture,
+# so there is nothing to trade off — an operator must not be able to allowlist
+# their way past a live registry credential.
+#
+# `url-embedded-basic-auth` used to be absolute too, and that was wrong in a way
+# only the fleet's first real tree showed. A `user:password@` URL is what a
+# package's README, its `.d.ts` and its URL-parser tests are FULL of: measured on
+# one monorepo, 40 store objects trip it and every one is a published
+# placeholder — `got`'s readme, `@types/node`'s `url.d.ts`, `zod`'s parser tests,
+# `pg-pool`'s connection-string example. An unexcusable rule with a 40-file false
+# -positive floor does not get respected; it gets deleted, and then nothing
+# watches for the real thing. So it is excusable on the same terms as a PEM
+# fixture: by digest, named, in a diff someone reviewed.
+#
+# The floor is per-label, and the two labels get different numbers because the
+# thing that makes a digest safe is ENTROPY, not size, and only one of them has
+# any. An allowlist entry is itself a published hash — it is checked into the
+# repository — so the question for both is the same: given everything already
+# known about the file, does its sha256 narrow the secret?
+#
+#   private-key-header, floor 0. The bytes under that header are key material.
+#   Even a 230-byte ed25519 fixture has more entropy in it than an attacker can
+#   walk, so its digest tells them nothing they can use. Excusable at any size,
+#   which is what keeps `ssh2`'s smaller fixtures excusable at all.
+#
+#   url-embedded-basic-auth, floor 1024. Here the carrier is usually PUBLIC — a
+#   README, a `.d.ts`, a parser test, all of them in a tarball on npm — so the
+#   only unknown in the preimage is the credential itself. A 47-byte
+#   `mongodb://user:pass@host` is worse still: the refusal already prints byte
+#   count, line count, match line and scheme, which pins it to one field. Below
+#   the floor the hash is an offline oracle with no rate limit, so the entry
+#   that would excuse it is one nobody may write down.
+SCAN_EXCUSABLE_MIN_BYTES=1024
+# The floor for one label, or a refusal. The default arm is what makes this a
+# whitelist rather than "anything but the token rule": a rule added to the scan
+# later is unexcusable until someone gives it a number here, in a diff.
+scan_label_min_bytes() { # <label>
+  case "$1" in
+    private-key-header ) printf '0' ;;
+    url-embedded-basic-auth ) printf '%s' "$SCAN_EXCUSABLE_MIN_BYTES" ;;
+    * ) return 1 ;;
+  esac
+}
+
+# Whether a digest may excuse this file at all, asked before any digest is
+# computed. EVERY label the file trips must be excusable at that file's size: a
+# README documenting both a registry token and a connection string is a file no
+# list may excuse, however innocent either half looks alone.
+scan_hit_is_excusable() { # <file>
+  local labels label floor size
+  labels=$(matched_labels "$1")
+  # No label means the grep failed inside a subshell, not that the file is
+  # clean — this is only ever called on a file the scan already matched. The
+  # call sites are all `if` conditions, which switches `set -e` off for this
+  # whole body, so without this an errored grep would walk the empty loop and
+  # fall through to a size test that any real file passes.
+  [ -n "$labels" ] || return 1
+  size=$(wc -c <"$1") || return 1
+  for label in $labels; do
+    floor=$(scan_label_min_bytes "$label") || return 1
+    [ "$size" -ge "$floor" ] || return 1
+  done
+}
+
+# Whether the REFUSAL may print this file's digest — a strictly narrower question
+# than whether a list may excuse it, and the diff that fused the two was wrong.
+# Excusing costs an operator a reviewed line naming the package; printing costs
+# nothing and reaches everyone who can read the run. So the log offers a digest
+# only where the file's own bytes are the secret, which is the private-key case
+# and only it. For a URL credential the operator computes the digest off the log
+# with CACHE_DRY_RUN=1 — the same route a fixture has always had.
+SCAN_PRINTABLE_LABELS='private-key-header'
+scan_hit_digest_is_printable() { # <file>
+  local labels label
+  labels=$(matched_labels "$1")
+  [ -n "$labels" ] || return 1
+  for label in $labels; do
+    case " $SCAN_PRINTABLE_LABELS " in
+      *" $label "* ) ;;
+      * ) return 1 ;;
+    esac
+  done
+  # Size still matters here for the reason it always did: this rule matches a
+  # HEADER, and a 60-byte header in front of a short string is not key material.
+  [ "$(wc -c <"$1")" -ge "$SCAN_EXCUSABLE_MIN_BYTES" ]
 }
 
 explain_credential_hit() { # <tree> <file>
@@ -464,27 +555,26 @@ explain_credential_hit() { # <tree> <file>
     # package fixture can be excused without anyone having to reproduce the
     # install just to compute it.
     #
-    # ONLY for a private-key-header hit, and one-wayness is not the reason why.
-    # Everything above already narrows the preimage hard — exact byte count, line
-    # count, match line, URL scheme — and for a 47-byte `mongodb://user:pass@host`
-    # that leaves one unknown field. An unsalted sha256 of a nearly-known
-    # plaintext is an offline oracle with no rate limit, so publishing it into a
-    # log anyone who can read the repository can read would hand out the very
-    # credential this pass just contained. Key material carries enough entropy
-    # that a whole-file digest is not guessable; a token or a URL password does
-    # not, and neither is excusable by digest anyway.
-    # The size test is part of the same argument: what this rule matches is a
-    # HEADER, and a 60-byte file that is a header plus a short string has as
-    # little entropy as the URL password above. Only a file big enough to hold
-    # actual key material gets its digest printed.
+    # Three answers, in narrowing order, and the middle one is the point:
+    # whether a list MAY excuse this file and whether this log may print its
+    # digest are different questions with different answers, and the version of
+    # this script that asked one function for both handed out an oracle.
+    #
+    # One-wayness is not what withholds a digest. Everything above already
+    # narrows the preimage hard — exact byte count, line count, match line, URL
+    # scheme — and where the rest of the file is a package's published README the
+    # only unknown left is the credential. An unsalted sha256 of a nearly-known
+    # plaintext is an offline oracle with no rate limit, so printing it here
+    # would hand out the very thing this pass just contained.
     if ! command -v sha256sum >/dev/null 2>&1; then
       printf '  no digest is printed: this machine has no sha256sum, so an allowlist entry for this file has to be computed somewhere that does\n'
-    elif [ "$(matched_labels "$file")" = private-key-header ] \
-      && [ "$(wc -c <"$file")" -ge 1024 ]; then
+    elif scan_hit_digest_is_printable "$file"; then
       printf '  sha256: %s\n' "$(sha256sum <"$file" | cut -d' ' -f1)"
-      printf '  if this is a dependency test fixture and not a leak, put that digest on CACHE_SCAN_ALLOW_DIGESTS -- or, past a handful, in the file CACHE_SCAN_ALLOW_FILE names -- in BOTH jobs\n'
+      printf '  if this is a dependency fixture and not a leak, put that digest on CACHE_SCAN_ALLOW_DIGESTS -- or, past a handful, in the file CACHE_SCAN_ALLOW_FILE names -- in BOTH jobs\n'
+    elif scan_hit_is_excusable "$file"; then
+      printf '  a named digest CAN excuse this file, but the log does not print it. A digest is offered only where the secret IS the file -- enough key material that a hash of it is no use to anyone. This file is not that: either its rule matches a header in front of a short string, or the rest of its bytes are a package README anyone can read. Either way the byte count, line count and match line above already narrow the preimage, so compute the digest yourself with CACHE_DRY_RUN=1 and put it in the file CACHE_SCAN_ALLOW_FILE names, in BOTH jobs\n'
     else
-      printf '  no digest is printed for this file. A digest is printed only for a private-key-header hit of at least 1024 bytes; a registry token or a URL password is never excusable at any size, and for a SMALLER private-key fixture compute the digest yourself with CACHE_DRY_RUN=1 rather than reading it from this log\n'
+      printf '  no digest is printed for this file, and no list will excuse it at this size. A registry token is never excusable; a URL credential is, but only in a file of at least %s bytes, because below that its hash is an oracle for its own contents. Fix the cause instead -- a prepare command that authenticates, or a dependency that has no business being in the tree\n' "$SCAN_EXCUSABLE_MIN_BYTES"
     fi
   } >&2
 }
@@ -600,12 +690,9 @@ scan_or_die() { # <tree>
     [ -n "$bad" ] || continue
     seen=$((seen + 1))
     if [ "${#SCAN_ALLOW_DIGESTS[@]}" -gt 0 ]; then
-      # A digest excuses a PEM fixture and nothing else. The other two rules
-      # match a registry token and a URL password — shapes no dependency has a
-      # legitimate reason to ship, and shapes whose whole value is that they are
-      # never excused. Refuse before the digest is even computed, so no operator
-      # can allowlist their way past a live credential.
-      if [ "$(matched_labels "$bad")" = private-key-header ]; then
+      # Asked BEFORE the digest is computed, so a file no list may excuse never
+      # gets one — a registry token is refused here whatever is on the list.
+      if scan_hit_is_excusable "$bad"; then
         digest=$(sha256sum <"$bad" | cut -d' ' -f1) \
           || die "the content scan could not digest $(safe_path "${bad#"$root"/}")"
         if scan_digest_is_allowed "$digest"; then

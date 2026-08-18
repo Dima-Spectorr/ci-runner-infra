@@ -689,7 +689,7 @@ has_no_write_grant_on_the_bucket() { # <file>
 # The publishing script is the only writer into the trusted path, so what it
 # refuses matters as much as what it does.
 has_trusted_snapshot_build() { # <file>
-  local code reporter labeller line rest form
+  local code reporter labeller line rest form arg label
   code=$(code_of "$1")
   # Built into a fresh staging tree, never from a host's cache. /opt/ci-cache is
   # the master's path and must not appear at all: an archive of it would put a
@@ -784,12 +784,78 @@ has_trusted_snapshot_build() { # <file>
   matches "$code" 'sha256sum is not on PATH' || return 1
   matches "$code" 'log "the content scan excused \$\(safe_path' || return 1
   ! matches "$code" '\$\{pass\[@\]\}.*\| head' || return 1
-  # ...and it excuses a PEM fixture ONLY. A registry token or a URL password is
-  # refused with the allowlist set, before a digest is even computed — those are
-  # shapes no dependency ships, so an entry that could excuse one would be an
-  # operator's route past a live credential rather than past a false positive.
-  matches "$code" 'if \[ "\$\(matched_labels "\$bad"\)" = private-key-header \]; then' || return 1
-  matches "$code" 'if \[ "\$\(matched_labels "\$file"\)" = private-key-header \]' || return 1
+  # ...and a registry token is refused with the allowlist set, before a digest is
+  # even computed. That shape no dependency ships, so an entry that could excuse
+  # one would be an operator's route past a live credential rather than past a
+  # false positive. The other two rules are excusable, on DIFFERENT terms, and
+  # the two numbers are the whole argument: a PEM's bytes are key material, so
+  # its hash gives an attacker nothing and it is excusable at any size; a
+  # `user:password@` URL sits in a package's published README or `.d.ts`, so
+  # everything except the credential is already public and a hash of a short one
+  # is an offline oracle for the rest.
+  matches "$code" 'SCAN_EXCUSABLE_MIN_BYTES=1024' || return 1
+  matches "$code" '^    private-key-header \) printf .0. ;;$' || return 1
+  matches "$code" "^    url-embedded-basic-auth \\) printf '%s' \"\\\$SCAN_EXCUSABLE_MIN_BYTES\" ;;\$" || return 1
+  # The default arm is what makes the floor table a whitelist: a rule added to
+  # the scan later has no number here and so is unexcusable until someone writes
+  # one. Anchored to the whole line, because `* ) return 1 ;;` unanchored is also
+  # a substring of `*[!0-9]* ) return 1 ;;` elsewhere in the script -- the loose
+  # form went on passing with this arm deleted.
+  matches "$code" '^    \* \) return 1 ;;$' || return 1
+  # EVERY label, at THIS file's size. A file tripping two rules is excusable only
+  # if both are: a README documenting a registry token and a connection string is
+  # not half-excusable.
+  matches "$code" 'for label in \$labels; do' || return 1
+  matches "$code" 'floor=\$\(scan_label_min_bytes "\$label"\) \|\| return 1' || return 1
+  matches "$code" '\[ "\$size" -ge "\$floor" \] \|\| return 1' || return 1
+  matches "$code" '\[ -n "\$labels" \] \|\| return 1' || return 1
+  # Excusing and PRINTING are different questions, and the version that asked one
+  # function for both printed a digest for the class whose carrier bytes are
+  # public. The narrower one governs the log: private-key only, and still ≥1024
+  # because this rule matches a header, not the key.
+  matches "$code" "SCAN_PRINTABLE_LABELS='private-key-header'" || return 1
+  matches "$code" '\*" \$label "\* \) ;;' || return 1
+  matches "$code" '^      \* \) return 1 ;;$' || return 1
+  matches "$code" '\[ "\$\(wc -c <"\$1"\)" -ge "\$SCAN_EXCUSABLE_MIN_BYTES" \]' || return 1
+  # One predicate per question, each asked at exactly the sites that own it. The
+  # scan decides with the excusability one; the reporter offers a digest only
+  # under the printable one, and falls back to the excusability one to tell the
+  # operator a list would work if they computed the hash off the log.
+  matches "$code" 'if scan_hit_is_excusable "\$bad"; then' || return 1
+  matches "$code" 'elif scan_hit_digest_is_printable "\$file"; then' || return 1
+  matches "$code" 'elif scan_hit_is_excusable "\$file"; then' || return 1
+  [ "$(printf '%s\n' "$code" | grep -c 'scan_hit_is_excusable')" = 3 ] || return 1
+  [ "$(printf '%s\n' "$code" | grep -c 'scan_hit_digest_is_printable')" = 2 ] || return 1
+  # Neither predicate may hand over the file's bytes. They are called from inside
+  # the reporter, whose own body is walked below for exactly this — but that walk
+  # sees only the call, not what the callee does with what it reads.
+  #
+  # An ALLOW-list of the forms that may touch "$1", for the same reason the
+  # reporter's walk is one: a ban-list of the commands that leak is not closed.
+  # Banning printf/echo/cat still leaves `die "$(<"$1")"`, `die "$(grep . "$1")"`
+  # and `read -r x <"$1"; die "$x"`, all three of which put the content on stderr
+  # — `die` is allowed because it prints a sanitised PATH, and nothing about
+  # `die` forces its argument to be one.
+  local -a reads_arg=(
+    'matched_labels "$1"'
+    'wc -c <"$1"'
+  )
+  for form in scan_hit_is_excusable scan_hit_digest_is_printable; do
+    labeller=$(printf '%s\n' "$code" | sed -n "/^$form() {/,/^}\$/p")
+    matches "$labeller" "^$form\(\) \{" || return 1
+    while IFS= read -r line; do
+      rest="$line"
+      for arg in "${reads_arg[@]}"; do rest="${rest//"$arg"/}"; done
+      case "$rest" in *'"$1"'* ) return 1 ;; esac
+    done < <(printf '%s\n' "$labeller" | grep -F '"$1"')
+  done
+  # Printable must be a SUBSET of excusable, and structurally so. A label added
+  # to SCAN_PRINTABLE_LABELS with no row in the floor table would print a digest
+  # for a file no list can excuse — this round's defect, back through a different
+  # door — so every printable label is required to resolve to a floor.
+  for label in $(printf '%s\n' "$code" | sed -n "s/^SCAN_PRINTABLE_LABELS='\(.*\)'\$/\1/p"); do
+    matches "$code" "^    $label \) printf" || return 1
+  done
   # One call site, in the content pass. Wired into the filename, link, setuid or
   # capability pass it would excuse something a HOST refuses, and the archive
   # would be published for every host to reject.
@@ -811,6 +877,11 @@ has_trusted_snapshot_build() { # <file>
     'grep -na -m1 -E -e "$pat" "$file"'
     'grep -oEa -m1 -e "$pat" "$file"'
     'matched_labels "$file"'
+    # Asks about the file (which rules it tripped, how big it is) and answers
+    # yes or no. It is on this list for the same reason `matched_labels` is:
+    # both read the bytes and neither hands them to the log.
+    'scan_hit_is_excusable "$file"'
+    'scan_hit_digest_is_printable "$file"'
     'sha256sum <"$file"'
   )
   while IFS= read -r line; do
@@ -864,10 +935,6 @@ has_trusted_snapshot_build() { # <file>
   # prepare command can simply list the directory. What matters is that the file
   # does not exist at all while untrusted code is still running.
   matches "$code" '^ARCHIVE=""$' || return 1
-  # A digest is printed only for a file big enough to hold key material. This
-  # rule matches a HEADER; a 60-byte header plus a short string has no more
-  # entropy than the URL password whose digest is refused above.
-  matches "$code" '\[ "\$\(wc -c <"\$file"\)" -ge 1024 \]' || return 1
   # `read` stops at the first newline whatever IFS says.
   matches "$code" "read -rd '' -a SCAN_ALLOW_RAW" || return 1
   # The host refuses a multi-linked file, so nothing may be packed as a link
@@ -1385,10 +1452,11 @@ mutate_file "$PUBSH" 'the labeller stops at the first rule it matches' has_trust
   's@out="\$out \$\{entry%%\|\*\}"; fi@out="$out ${entry%%|*}"; break; fi@'
 mutate_file "$PUBSH" 'a grep error in the labeller reads as no match' has_trusted_snapshot_build \
   's@^    \[ "\$rc" -le 1 \] \\$@    true \\@'
-# The digest is an oracle for anything whose preimage is small, and this rule
-# matches a HEADER — the size floor is what keeps a 60-byte file out of the log.
-mutate_file "$PUBSH" 'a tiny private-key file still gets its digest printed' has_trusted_snapshot_build \
-  's@ -ge 1024 \]@ -ge 0 ]@'
+# The digest is an oracle for anything whose preimage is small, and one of these
+# rules matches a HEADER while another matches a 40-byte connection string — the
+# size floor is what keeps both out of the log and off the allowlist.
+mutate_file "$PUBSH" 'a tiny credential file becomes excusable and gets its digest printed' has_trusted_snapshot_build \
+  's@^SCAN_EXCUSABLE_MIN_BYTES=1024$@SCAN_EXCUSABLE_MIN_BYTES=0@'
 mutate_file "$PUBSH" 'the allowlist drops everything after the first newline' has_trusted_snapshot_build \
   "s@read -rd '' -a SCAN_ALLOW_RAW@read -ra SCAN_ALLOW_RAW@"
 # The off switch. One legitimate entry would excuse every content hit there is,
@@ -1401,13 +1469,40 @@ mutate_file "$PUBSH" 'an allowlist entry need not be hex' has_trusted_snapshot_b
   's@\*\[!0-9a-fA-F\]\*@*[!-~]*@'
 mutate_file "$PUBSH" 'an allowlist that cannot be evaluated is ignored' has_trusted_snapshot_build \
   's@^    || die "CACHE_SCAN_ALLOW_DIGESTS is set but sha256sum.*$@    || true@'
-# The two rules that keep the allowlist to PEM fixtures. Without them a digest
-# excuses a registry token or a URL password, and the refusal prints the sha256
-# of a nearly-known plaintext into a public log while it is at it.
-mutate_file "$PUBSH" 'a token or URL credential becomes excusable by digest' has_trusted_snapshot_build \
-  's@^      if \[ "\$\(matched_labels "\$bad"\)" = private-key-header \]; then$@      if true; then@'
+# The rule that keeps a registry token unexcusable. Without it a digest excuses
+# an `_authToken` line, and the refusal prints the sha256 of a nearly-known
+# plaintext into a public log while it is at it.
+mutate_file "$PUBSH" 'every credential shape becomes excusable by digest' has_trusted_snapshot_build \
+  's@^      if scan_hit_is_excusable "\$bad"; then$@      if true; then@'
 mutate_file "$PUBSH" 'the refusal prints a digest for every rule' has_trusted_snapshot_build \
-  's@"\$\(matched_labels "\$file"\)" = private-key-header@"x" != "y"@'
+  's@^    elif scan_hit_digest_is_printable "\$file"; then$@    elif true; then@'
+# The two questions fused back into one. This is the shape the first attempt at
+# this change had, and it prints a sha256 for a file that is a published README
+# with one credential substituted into it.
+mutate_file "$PUBSH" 'the log prints a digest for anything a list could excuse' has_trusted_snapshot_build \
+  's@^    elif scan_hit_digest_is_printable "\$file"; then$@    elif scan_hit_is_excusable "$file"; then@'
+mutate_file "$PUBSH" 'the URL class becomes printable too' has_trusted_snapshot_build \
+  "s@^SCAN_PRINTABLE_LABELS='private-key-header'\$@SCAN_PRINTABLE_LABELS='private-key-header url-embedded-basic-auth'@"
+# The whitelist walk in the printable set. Inverted, the ONE rule that must never
+# be printed is the only one that is.
+mutate_file "$PUBSH" 'the printable set is read as a blocklist' has_trusted_snapshot_build \
+  's@^      \*" \$label "\* \) ;;$@      *" $label "* ) return 1 ;;@'
+mutate_file "$PUBSH" 'a label nobody listed is printable by default' has_trusted_snapshot_build \
+  's@^      \* \) return 1 ;;$@      * ) ;;@'
+# The floor table. A label with no number must be unexcusable, not free.
+mutate_file "$PUBSH" 'a label nobody gave a floor is excusable by default' has_trusted_snapshot_build \
+  's@^    \* \) return 1 ;;$@    * ) printf 0 ;;@'
+mutate_file "$PUBSH" 'the URL class loses its floor' has_trusted_snapshot_build \
+  "s@^    url-embedded-basic-auth \\) printf '%s' \"\\\$SCAN_EXCUSABLE_MIN_BYTES\" ;;\$@    url-embedded-basic-auth ) printf '0' ;;@"
+mutate_file "$PUBSH" 'the size test drops out of the excusability walk' has_trusted_snapshot_build \
+  's@^    \[ "\$size" -ge "\$floor" \] \|\| return 1$@    true@'
+mutate_file "$PUBSH" 'an unrecognised label stops refusing the whole file' has_trusted_snapshot_build \
+  's@^    floor=\$\(scan_label_min_bytes "\$label"\) \|\| return 1$@    floor=$(scan_label_min_bytes "$label") || floor=0@'
+# A labeller that came back empty means its grep died in a subshell, on a file
+# the scan has already matched. Reading that as "no rule tripped" walks straight
+# into the whitelist loop with nothing to reject.
+mutate_file "$PUBSH" 'a labeller that failed reads as a file with nothing to excuse' has_trusted_snapshot_build \
+  's@^  \[ -n "\$labels" \] \|\| return 1$@  [ -n "$labels" ] || return 0@'
 mutate_file "$PUBSH" 'a broken content grep reads as a clean pass' has_trusted_snapshot_build \
   's@^  \[ "\$rc" -le 1 \] \|\| die .*$@@'
 # The rule the whole reporter exists for: report ABOUT the file, never hand over
@@ -1671,6 +1766,157 @@ else
     ok
   else
     bad "behaviour: the missing allowlist failed the run, but not on the file"
+  fi
+fi
+
+# A `user:password@` URL in a package's own documentation. This is the class the
+# fleet's first real tree brought: 40 store objects, every one a published
+# placeholder, and before this it could not be excused at any size. The file is
+# padded past the floor because a README is, and because the floor is what keeps
+# the printed digest from being an oracle for a short connection string.
+BEH_URL_BODY=$(printf 'Connect with `postgres://user:password@localhost:5432/db`.\n'; head -c 1400 /dev/zero | tr '\0' 'x' | fold -w 70)
+BEH_URL_SHA=$(printf '%s\n' "$BEH_URL_BODY" | sha256sum | cut -d' ' -f1)
+BEH_STAGE_URL='
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/files/bb"
+cat '"'$TMP/url'"' >"$stage/pnpm-store/files/bb/cafebabe"
+'
+printf '# pg-pool@3.13.0 README.md — the connection-string example\n%s  # pg-pool README\n' \
+  "$BEH_URL_SHA" >"$TMP/allow-url.txt"
+if printf '%s\n' "$BEH_URL_BODY" >"$TMP/url" \
+  && behave_run "$BEH_STAGE_URL" '' "$TMP/allow-url.txt" >"$TMP/beh.allowurl.log" 2>&1; then
+  if matches "$(cat "$TMP/beh.allowurl.log")" 'excused by CACHE_SCAN_ALLOW_FILE line 2 \(pg-pool README\)'; then
+    ok
+  else
+    bad "behaviour: the documented URL published, but the excusal did not name where it came from"
+  fi
+else
+  bad "behaviour: an allowlisted URL-credential fixture was still refused"
+fi
+
+# The same file, unexcused. A list COULD excuse it, and the report has to say so
+# — but it must not hand over the digest, because the rest of those bytes is a
+# README anyone can read and the hash would narrow the part that is not.
+if behave_run "$BEH_STAGE_URL" >"$TMP/beh.urlnodigest.log" 2>&1; then
+  bad "behaviour: an unexcused URL credential published"
+else
+  if matches "$(cat "$TMP/beh.urlnodigest.log")" 'a named digest CAN excuse this file, but the log does not print it' \
+    && ! matches "$(cat "$TMP/beh.urlnodigest.log")" "sha256: $BEH_URL_SHA"; then
+    ok
+  else
+    bad "behaviour: the URL fixture was refused, but the report either withheld the route or printed the digest"
+  fi
+fi
+
+# The other side of the per-label table, and the reason it is a table at all: a
+# small PEM stays excusable. `ssh2` ships ed25519 and ECDSA fixtures in the
+# 200-500 byte range, and a flat floor would have made every one of them
+# unexcusable overnight -- a publish wedged with no way out, on a fleet whose
+# allowlist already named them. The bytes under the header are key material, so
+# the digest is no use to anyone whatever the file's size.
+BEH_SPEM_BODY=$(printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\n'; head -c 160 /dev/zero | tr '\0' 'B' | fold -w 64; printf -- '\n-----END OPENSSH PRIVATE KEY-----\n')
+BEH_SPEM_SHA=$(printf '%s\n' "$BEH_SPEM_BODY" | sha256sum | cut -d' ' -f1)
+BEH_STAGE_SPEM='
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/files/ff"
+cat '"'$TMP/spem'"' >"$stage/pnpm-store/files/ff/5ma11pem"
+'
+printf '# ssh2@1.17.0 test/fixtures — a small published key, well under 1024 bytes\n%s  # ssh2 ed25519 fixture\n' \
+  "$BEH_SPEM_SHA" >"$TMP/allow-spem.txt"
+if printf '%s\n' "$BEH_SPEM_BODY" >"$TMP/spem" \
+  && behave_run "$BEH_STAGE_SPEM" '' "$TMP/allow-spem.txt" >"$TMP/beh.allowspem.log" 2>&1; then
+  if matches "$(cat "$TMP/beh.allowspem.log")" 'excused by CACHE_SCAN_ALLOW_FILE line 2 \(ssh2 ed25519 fixture\)'; then
+    ok
+  else
+    bad "behaviour: the small PEM published, but the excusal did not name where it came from"
+  fi
+else
+  bad "behaviour: a small allowlisted PEM fixture was refused -- the private-key floor is not 0"
+fi
+
+# ...and unexcused it is refused without its digest, because at that size the
+# rule has matched a header in front of a short string rather than a key.
+if behave_run "$BEH_STAGE_SPEM" >"$TMP/beh.spemnodigest.log" 2>&1; then
+  bad "behaviour: an unexcused small PEM published"
+else
+  if matches "$(cat "$TMP/beh.spemnodigest.log")" 'a named digest CAN excuse this file, but the log does not print it' \
+    && ! matches "$(cat "$TMP/beh.spemnodigest.log")" "sha256: $BEH_SPEM_SHA"; then
+    ok
+  else
+    bad "behaviour: the small PEM was refused, but the report either withheld the route or printed the digest"
+  fi
+fi
+
+# Two rules in one file, one of them the unexcusable one, and the file's digest
+# on the list. Under the old `= private-key-header` equality this was impossible
+# to get wrong; with two excusable labels the conjunction is the only thing
+# stopping a README that documents a registry token AND a connection string from
+# being excused for the half that is innocent.
+BEH_MIX_BODY=$(printf 'Set `//registry.example.com/:_authToken=deadbeefcafe`, then\n'; \
+  printf 'connect with `postgres://user:password@localhost:5432/db`.\n'; \
+  head -c 1400 /dev/zero | tr '\0' 'z' | fold -w 70)
+BEH_MIX_SHA=$(printf '%s\n' "$BEH_MIX_BODY" | sha256sum | cut -d' ' -f1)
+printf '# looks like a doc, trips two rules, one of them unexcusable\n%s  # the mixed file\n' \
+  "$BEH_MIX_SHA" >"$TMP/allow-mix.txt"
+if printf '%s\n' "$BEH_MIX_BODY" >"$TMP/mix" && behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/files/ee"
+cat '"'$TMP/mix'"' >"$stage/pnpm-store/files/ee/0ddba11"
+' '' "$TMP/allow-mix.txt" >"$TMP/beh.allowmix.log" 2>&1; then
+  bad "behaviour: a file tripping the unexcusable rule was excused for its other half"
+else
+  if matches "$(cat "$TMP/beh.allowmix.log")" 'no list will excuse it' \
+    && ! matches "$(cat "$TMP/beh.allowmix.log")" "sha256: $BEH_MIX_SHA"; then
+    ok
+  else
+    bad "behaviour: the mixed-label file was refused, but not as unexcusable"
+  fi
+fi
+
+# The same file, one byte under the floor. Its digest is an oracle for its own
+# content, so no list may excuse it and the refusal must not print one.
+BEH_URL_SMALL='mongodb://user:pass@db.example.com/x'
+BEH_URL_SMALL_SHA=$(printf '%s\n' "$BEH_URL_SMALL" | sha256sum | cut -d' ' -f1)
+printf '# a short connection string — must not be excusable\n%s  # too small to excuse\n' \
+  "$BEH_URL_SMALL_SHA" >"$TMP/allow-url-small.txt"
+if behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/files/cc"
+printf "%s\n" '"'$BEH_URL_SMALL'"' >"$stage/pnpm-store/files/cc/beefbeef"
+' '' "$TMP/allow-url-small.txt" >"$TMP/beh.allowurlsmall.log" 2>&1; then
+  bad "behaviour: a short URL credential was excused by digest"
+else
+  if matches "$(cat "$TMP/beh.allowurlsmall.log")" 'no list will excuse it' \
+    && ! matches "$(cat "$TMP/beh.allowurlsmall.log")" "sha256: $BEH_URL_SMALL_SHA"; then
+    ok
+  else
+    bad "behaviour: the short URL credential was refused, but the report offered its digest anyway"
+  fi
+fi
+
+# A registry token, large, with its own digest on the list. The one shape no
+# list may ever excuse — if this publishes, the allowlist is a route past a live
+# credential rather than past a false positive.
+BEH_TOK_BODY=$(printf '//registry.example.com/:_authToken=deadbeefcafe\n'; head -c 1400 /dev/zero | tr '\0' 'y' | fold -w 70)
+BEH_TOK_SHA=$(printf '%s\n' "$BEH_TOK_BODY" | sha256sum | cut -d' ' -f1)
+printf '# not a fixture — a live token, and the list must not care\n%s  # the token\n' \
+  "$BEH_TOK_SHA" >"$TMP/allow-tok.txt"
+if printf '%s\n' "$BEH_TOK_BODY" >"$TMP/tok" && behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/files/dd"
+cat '"'$TMP/tok'"' >"$stage/pnpm-store/files/dd/f00df00d"
+' '' "$TMP/allow-tok.txt" >"$TMP/beh.allowtok.log" 2>&1; then
+  bad "behaviour: an allowlisted registry token was published"
+else
+  if matches "$(cat "$TMP/beh.allowtok.log")" 'no list will excuse it'; then
+    ok
+  else
+    bad "behaviour: the allowlisted token was refused, but not for being unexcusable"
   fi
 fi
 
