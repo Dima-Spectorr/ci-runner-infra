@@ -58,7 +58,7 @@
 #   publisher's IAM grant carries create and not delete for the same reason, so
 #   an attempt to reuse a name fails with a 403 rather than quietly succeeding.
 #
-#   The pointer is swapped with --if-generation-match, so two publishers racing
+#   The pointer is swapped under an `ifGenerationMatch` precondition, so two publishers racing
 #   produce one winner and one loud failure, never a pointer naming a snapshot
 #   that was not fully written.
 #
@@ -286,8 +286,8 @@ PUBLISHING=1
 # write the object every host in the fleet boots from. Together they put the OIDC
 # token inside the blast radius of a postinstall script, and they reopen the one
 # gap the digest pin can only narrow: between the last `assert_archive_unchanged`
-# and gcloud's own open of the file there are hundreds of milliseconds of Python
-# start-up, and a process that escaped the reap (`setsid` leaves the group, and
+# and the uploader's own open of the file there is a window, and a process that
+# escaped the reap (`setsid` leaves the group, and
 # `kill -- -$pgid` cannot follow it) wins that race by polling. Splitting the
 # phases removes the racer instead of shrinking the window.
 #
@@ -317,6 +317,13 @@ if [ "$PUBLISHING" = 1 ]; then
   esac
 
   command -v gcloud >/dev/null 2>&1 || die "gcloud is not on PATH"
+  # Both are used only by the publish phase, and both are checked HERE — before
+  # anything is packed. Discovering at the upload that curl is missing costs the
+  # whole build and, worse, burns the snapshot's name: write-once means the run
+  # that retries must pick a new one.
+  command -v curl >/dev/null 2>&1 || die "curl is not on PATH"
+  command -v openssl >/dev/null 2>&1 \
+    || die "openssl is not on PATH — the upload sends the archive's digest so Cloud Storage can reject a corrupted transfer, and a snapshot nothing verified is one every host in the pool would unpack"
 fi
 
 # THE EVENT GUARD, AND IT IS NOT REDUNDANT WITH THE IAM BINDING.
@@ -922,8 +929,8 @@ fi
 # bytes, taken once and re-checked at every later use.
 #
 # Every check below re-opens this file: `stat` for the size, `tar -tvzf` for the
-# member layout, `gzip -dc` for the scan, and finally `cp` and `gcloud storage cp`
-# for the bytes that ship. A verdict rendered before the pin exists is a verdict
+# member layout, `gzip -dc` for the scan, and finally `openssl` for the digest
+# the upload declares and `curl` for the bytes that ship. A verdict rendered before the pin exists is a verdict
 # about bytes nothing can later prove were these — the size bound would then be
 # computed from a stale length (and quoted in the expansion message, which is how
 # that reads as a factual claim about the wrong file), and the flatness check,
@@ -1014,24 +1021,198 @@ fi
 
 # --- publish --------------------------------------------------------------------
 #
-# --if-generation-match=0 means "only if this object does not exist". The IAM
-# grant already refuses an overwrite, so this is the second of two bounds: it
-# turns a name collision into a precondition failure naming the object, rather
-# than a 403 that reads like a broken credential.
+# ifGenerationMatch=0 means "only if this object does not exist". The IAM grant
+# already refuses an overwrite, so this is the second of two bounds: it turns a
+# name collision into a precondition failure naming the object, rather than a 403
+# that reads like a broken credential.
+#
+# THE STORAGE JSON API RATHER THAN `gcloud storage cp`, AND THAT IS NOT A STYLE
+# CHOICE. `cp` lists the destination to work out whether it names an object or a
+# directory, and a LIST is authorised against the BUCKET — `resource.name` is
+# then the bucket, which never starts with an object path. Every one of the
+# publisher's grants is conditioned on an object prefix, so the list is refused
+# and the run dies at the last step, after packing, on a 403 naming
+# `storage.objects.list`. Measured, not reasoned: that is exactly how the first
+# real publish failed.
+#
+# Naming the object explicitly removes the question. The request needs
+# `storage.objects.create` and nothing else, so the fix lives here rather than in
+# a fourth IAM binding — and a list grant on a bucket that holds EVERY pool's
+# snapshots is not a thing to hand one pool's publisher. The read side already
+# works this way, and for the same reason; see `cache_fetch` in host-startup.sh.
 PREFIX="cache/${CACHE_POOL}"
 assert_archive_unchanged "the upload"
+
+# Both halves are validated above to charsets with no `/` and no `%`, so the only
+# character needing encoding in an object name is the separator this line writes.
+ENC_SNAP="cache%2F${CACHE_POOL}%2F${SNAP}"
+ENC_POINTER="cache%2F${CACHE_POOL}%2Fcurrent"
+
+# gcloud's own stderr is left visible on purpose: "authenticated to nothing" has
+# several causes (no credential, an expired one, a federation exchange the
+# provider refused) and they are not distinguishable from the exit status. The
+# token is printed on stdout, never on stderr, so nothing sensitive is exposed
+# by letting the diagnosis through.
+GCS_TOKEN=$(gcloud auth print-access-token) \
+  || die "no access token — the publish phase authenticated to nothing"
+
+# THE TOKEN IS NOT AN ARGUMENT, and that is a security property rather than a
+# style. `-H "Authorization: Bearer $GCS_TOKEN"` would put a token that may
+# create objects in the bucket every host in the pool trusts into this process's
+# argv, and /proc/<pid>/cmdline is world-readable. This phase runs no third-party
+# code by construction, but that is a property of the workflow's job split, not
+# of this script, and the split is one edit away from being undone. So the header
+# goes over a pipe: curl reads its config from a file descriptor, and `printf` is
+# a builtin, so nothing is ever exec'd with the token in ITS argv either.
+# `--proto '=https'` is part of the same property, not tidiness: the session URI
+# below arrives in a RESPONSE HEADER, so it is the one URL here this script did
+# not write. Pinning the scheme means a `Location:` naming http:// cannot make
+# curl send the bearer token in clear text. `--max-time` bounds the whole
+# request rather than just the handshake — a stalled connection that never
+# times out is how a publish run hangs until the job's own limit kills it,
+# after packing and with the snapshot name already burned.
+gcs_curl() { # <curl args...>
+  curl -sS --proto '=https' --connect-timeout 10 --max-time 1800 \
+    --speed-limit 1024 --speed-time 120 \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$GCS_TOKEN") "$@"
+}
+
+# The response headers, re-used by every call below. Inside ARCHIVE_DIR, so the
+# EXIT trap removes it on every path including a die.
+HDRS=$(mktemp "$ARCHIVE_DIR/hdr.XXXXXX") || die "the response headers could not be staged"
+
 log "uploading gs://${CACHE_BUCKET}/${PREFIX}/${SNAP}"
-gcloud storage cp --if-generation-match=0 \
-  "$ARCHIVE" "gs://${CACHE_BUCKET}/${PREFIX}/${SNAP}" \
-  || die "the snapshot did not upload — nothing was published, and the pointer still names the previous snapshot"
+
+# A resumable session rather than a single `uploadType=media` POST. At this size
+# a connection dropped near the end costs the whole transfer otherwise, and the
+# session also lets the service reject a size mismatch before any bytes move.
+# The object does not appear at all until the final PUT completes, so a host
+# reading the prefix mid-upload never sees a partial snapshot.
+#
+# `md5Hash` in the session metadata is what makes "uploaded" mean "uploaded
+# intact". Without it Cloud Storage stores whatever arrived, and a transfer
+# corrupted in flight becomes a snapshot the pointer then names — every host in
+# the pool unpacks it, and the tar failure reads as a broken publisher rather
+# than a bad byte. With it the finalising request fails and the pointer is never
+# swapped. It is the same digest discipline as `assert_archive_unchanged`,
+# extended across the wire.
+ARCHIVE_MD5=$(openssl dgst -md5 -binary "$ARCHIVE" | openssl base64 -A) \
+  || die "the archive digest could not be computed"
+
+code=$(gcs_curl -D "$HDRS" -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Content-Type: application/json; charset=UTF-8' \
+  -H 'X-Upload-Content-Type: application/gzip' \
+  -H "X-Upload-Content-Length: ${size}" \
+  --data "{\"md5Hash\":\"${ARCHIVE_MD5}\"}" \
+  "https://storage.googleapis.com/upload/storage/v1/b/${CACHE_BUCKET}/o?uploadType=resumable&name=${ENC_SNAP}&ifGenerationMatch=0") || true
+SESSION=$(tr -d '\r' <"$HDRS" | sed -n 's/^[Ll]ocation: //p' | tail -n 1)
+[ -n "$SESSION" ] || die "the upload session was refused (HTTP ${code:-none}) — nothing was published, and the pointer still names the previous snapshot"
+
+# The ONLY URL in this script that came from the network, and it is about to be
+# the destination of requests carrying a credential that may write the object
+# every host in the pool boots from. A `Location:` header is attacker-influenced
+# the moment anything sits between here and Cloud Storage — a proxy, a
+# misconfigured egress rule, a DNS answer — so it is checked against the
+# endpoint this script asked for rather than trusted because it arrived over
+# TLS. Without this, one redirect exfiltrates the publishing token.
+case "$SESSION" in
+  "https://storage.googleapis.com/upload/storage/v1/b/${CACHE_BUCKET}/o?"* ) : ;;
+  * ) die "the upload session URI is not the Cloud Storage upload endpoint this run addressed — refusing to send the credential to it" ;;
+esac
+
+uploaded=0
+offset=0
+part=
+for attempt in 1 2 3; do
+  if [ "$attempt" -gt 1 ]; then
+    # The retry re-reads the archive, so the digest pin is re-asserted here
+    # rather than only once before the first attempt — otherwise a file swapped
+    # between attempts ships under a verdict rendered about different bytes.
+    assert_archive_unchanged "the upload retry"
+
+    # Ask the session what it actually committed. A resumable session answers a
+    # zero-length PUT with `Range: bytes=0-<last>`, or with no Range at all when
+    # it holds nothing yet — and with 200/201 when it is already finalised,
+    # which is the case where the previous attempt succeeded and only its
+    # response was lost.
+    # `Content-Length: 0` is not decoration. `curl -X PUT` with no body sends NO
+    # Content-Length at all, and the Google frontend answers that shape with 411
+    # Length Required — which is neither 200/201 nor a 308 carrying a `Range:`,
+    # so `offset` would come back 0, the whole archive would be re-sent against a
+    # session that has already committed part of it, and every attempt would
+    # fail the same way. The resume path would be present and inert.
+    code=$(gcs_curl -D "$HDRS" -o /dev/null -w '%{http_code}' -X PUT \
+      -H 'Content-Length: 0' -H "Content-Range: bytes */${size}" "$SESSION") || true
+    case "$code" in
+      200 | 201 ) uploaded=1; break ;;
+    esac
+    committed=$(tr -d '\r' <"$HDRS" | sed -n 's/^[Rr]ange: bytes=0-//p' | tail -n 1)
+    case "$committed" in
+      '' | *[!0-9]* ) offset=0 ;;
+      * ) offset=$((committed + 1)) ;;
+    esac
+    # Every byte is committed and yet the object is not finalised. Never treat
+    # that as success: the pointer would then name an object that does not
+    # exist, and every host in the pool would cold-start silently.
+    [ "$offset" -lt "$size" ] \
+      || die "the upload session holds all $size bytes but has not finalised the object (HTTP $code) — nothing was published, and the pointer still names the previous snapshot"
+    log "resuming the upload at byte $offset (attempt $attempt)"
+  fi
+
+  if [ "$offset" = 0 ]; then
+    body=$ARCHIVE
+  else
+    # Only on the retry path, so the extra disk is not the normal cost. `-T` on a
+    # real file is what gives curl a Content-Length; a stream would go chunked,
+    # which a resumable session will not accept alongside a Content-Range.
+    [ -n "$part" ] || part=$(mktemp "$ARCHIVE_DIR/part.XXXXXX") \
+      || die "the remainder could not be staged"
+    tail -c "+$((offset + 1))" -- "$ARCHIVE" >"$part" || die "the remainder could not be staged"
+    body=$part
+  fi
+
+  # The status code decides, not curl's exit status. `-f` would call a `308
+  # Resume Incomplete` a success — the session is alive and the request was
+  # well formed, but the object is NOT finalised, and the next line would swap
+  # the pointer onto a name that resolves to nothing.
+  code=$(gcs_curl -o /dev/null -w '%{http_code}' -X PUT -T "$body" \
+    -H 'Content-Type: application/gzip' \
+    -H "Content-Range: bytes ${offset}-$((size - 1))/${size}" \
+    "$SESSION") || true
+  case "$code" in
+    200 | 201 ) uploaded=1; break ;;
+  esac
+  log "the upload answered HTTP ${code:-no response} (attempt $attempt)"
+done
+[ -z "$part" ] || rm -f -- "$part"
+[ "$uploaded" = 1 ] || die "the snapshot did not upload — nothing was published, and the pointer still names the previous snapshot"
 
 # THE POINTER IS SWAPPED LAST, and only after the snapshot is fully uploaded.
 # The order is the atomicity: a host that reads the pointer mid-publish gets the
 # previous snapshot, which is stale at worst. The reverse order gives it a name
 # that half exists.
-POINTER="gs://${CACHE_BUCKET}/${PREFIX}/current"
-gen=$(gcloud storage objects describe "$POINTER" --format='value(generation)' 2>/dev/null || true)
-[ -n "$gen" ] || gen=0
+#
+# `fields=generation` keeps the response to the one number this needs. A pointer
+# that does not exist yet answers 404 with an error body carrying no
+# `generation` line, so nothing parses out and 0 — the documented "must not
+# exist" precondition — is what the first publish into a fresh prefix needs.
+#
+# NO `-f`, AND `|| true` ON THE ASSIGNMENT, both load bearing under `set -euo
+# pipefail`: `-f` turns that 404 into exit 22, pipefail propagates it, and a
+# bare `x=$(...)` that fails TERMINATES THE SHELL. The first publish into a
+# fresh prefix would then die between the upload and the swap, with no message
+# and no pointer — after the snapshot name had already been burned by
+# write-once.
+#
+# The parse is anchored, because `metageneration` also ends in `generation` and
+# an unanchored match would put the wrong number in a precondition — which the
+# service answers with a refusal that reads like a lost race.
+gen=$(gcs_curl "https://storage.googleapis.com/storage/v1/b/${CACHE_BUCKET}/o/${ENC_POINTER}?fields=generation" \
+  | tr -d ' "' | sed -n 's/^generation:\([0-9][0-9]*\),*$/\1/p' | head -n 1) || true
+# Whatever came back is about to be interpolated into a URL. Digits or nothing.
+case "$gen" in
+  '' | *[!0-9]* ) gen=0 ;;
+esac
 
 # mktemp: the pointer's body is the one file in this directory whose CONTENT is
 # what every host resolves a snapshot by, so a fixed name the prepare command
@@ -1039,8 +1220,18 @@ gen=$(gcloud storage objects describe "$POINTER" --format='value(generation)' 2>
 # to a pointer naming an object of its choosing.
 pointer_body=$(mktemp "$ARCHIVE_DIR/current.XXXXXX") || die "the pointer could not be staged"
 printf '%s\n' "$SNAP" >"$pointer_body"
-gcloud storage cp --if-generation-match="$gen" \
-  "$pointer_body" "$POINTER" \
-  || die "the pointer was not swapped (generation $gen): another publisher won the race, the pointer changed while this run was packing, or this identity cannot read it — check that the snapshot itself uploaded. The snapshot IS uploaded and will expire with the bucket's age bound; re-run to publish it."
+# One request, not a session: the body is one line, and the pointer is the object
+# whose replacement must be as close to atomic as the API allows.
+code=$(gcs_curl -o /dev/null -w '%{http_code}' -X POST -T "$pointer_body" \
+  -H 'Content-Type: text/plain' \
+  "https://storage.googleapis.com/upload/storage/v1/b/${CACHE_BUCKET}/o?uploadType=media&name=${ENC_POINTER}&ifGenerationMatch=${gen}") || true
+case "$code" in
+  200 | 201 ) : ;;
+  * ) die "the pointer was not swapped (HTTP ${code:-none}, generation $gen): another publisher won the race, the pointer changed while this run was packing, or this identity cannot read it — check that the snapshot itself uploaded. The snapshot IS uploaded and will expire with the bucket's age bound; re-run to publish it." ;;
+esac
+
+# The credential's last use is above. Nothing after this point needs it, and the
+# environment of every later command is one place fewer it can leak from.
+unset GCS_TOKEN
 
 log "published $SNAP — hosts booting from now hydrate from it"

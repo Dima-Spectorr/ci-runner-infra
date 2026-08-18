@@ -10,5 +10,5 @@ output "cache_prefix" {
 
 output "pointer_object" {
   value       = "${local.cache_prefix}current"
-  description = "The one object the publisher may replace. Swap it with an --if-generation-match precondition; everything else under the prefix is write-once."
+  description = "The one object the publisher may replace. Swap it with a generation precondition; everything else under the prefix is write-once."
 }

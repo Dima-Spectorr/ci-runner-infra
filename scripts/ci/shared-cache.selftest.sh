@@ -1068,8 +1068,46 @@ has_trusted_snapshot_build() { # <file>
   matches "$code" '^  \|\| die "getcap is not installed' || return 1
   # Write-once, and the two bounds that keep it that way.
   matches "$code" 'SNAP="\$\(date -u \+%Y%m%dT%H%M%SZ\)-\$\{digest\}\.tar\.gz"' || return 1
-  matches "$code" 'gcloud storage cp --if-generation-match=0' || return 1
-  matches "$code" 'gcloud storage cp --if-generation-match="\$gen"' || return 1
+  matches "$code" 'uploadType=resumable&name=\$\{ENC_SNAP\}&ifGenerationMatch=0' || return 1
+  matches "$code" 'uploadType=media&name=\$\{ENC_POINTER\}&ifGenerationMatch=\$\{gen\}' || return 1
+  # ...and the upload names the object rather than letting a tool work it out.
+  # `gcloud storage cp` lists the destination to decide whether it is a directory,
+  # a list is authorised against the BUCKET, and every one of the publisher's
+  # grants is conditioned on an object prefix -- so a `cp` here is a 403 after the
+  # pack, or a fourth IAM binding that can list every other pool's snapshots.
+  ! matches "$code" 'gcloud storage cp' || return 1
+  # The token reaches curl over a pipe, never in argv.
+  matches "$code" '\-K <\(printf .header = "Authorization: Bearer' || return 1
+  ! matches "$code" '\-H "Authorization: Bearer' || return 1
+  # The session URI is the one URL here that arrived from the network, and it
+  # then receives requests carrying that token. It is checked against the
+  # endpoint this run addressed, and the scheme is pinned, so a `Location:`
+  # naming somewhere else cannot be handed the credential.
+  matches "$code" 'refusing to send the credential to it' || return 1
+  matches "$code" "curl -sS --proto '=https'" || return 1
+  # Success is the STATUS CODE, never curl's exit status: `-f` calls a 308
+  # Resume Incomplete a success, and the pointer would then name an object that
+  # was never finalised -- a fleet-wide silent cold start.
+  matches "$code" '200 \| 201 \) uploaded=1; break ;;' || return 1
+  matches "$code" 'has not finalised the object' || return 1
+  # ...and the resume probe declares a zero-length body. Without it curl sends no
+  # Content-Length, the frontend answers 411 rather than 308, no `Range:` comes
+  # back, and the resume path is present but can never resume.
+  matches "$code" "\-H 'Content-Length: 0' -H \"Content-Range: bytes \\*/" || return 1
+  # The archive's digest travels with the upload, so a transfer corrupted in
+  # flight is refused by the service instead of stored and then pointed at.
+  matches "$code" 'openssl dgst -md5 -binary "\$ARCHIVE"' || return 1
+  matches "$code" 'md5Hash' || return 1
+  # ...and the pin is re-asserted on a retry, which re-reads the file.
+  matches "$code" 'assert_archive_unchanged "the upload retry"' || return 1
+  # The pointer's generation: no `-f` and `|| true`, because under `set -euo
+  # pipefail` a bare failing assignment TERMINATES THE SHELL -- the first
+  # publish into a fresh prefix would die silently between the upload and the
+  # swap. And the parse is anchored, because `metageneration` ends in
+  # `generation` too, and digit-validated before it reaches a URL.
+  matches "$code" "sed -n 's/\\^generation:" || return 1
+  matches "$code" 'head -n 1\) \|\| true' || return 1
+  matches "$code" '\*\[!0-9\]\* \) gen=0 ;;' || return 1
   # Size, because a snapshot past the pools' bound is refused by every host and
   # reads in their logs as "nothing published" rather than as an error.
   matches "$code" 'CACHE_MAX_BYTES' || return 1
@@ -1606,9 +1644,38 @@ mutate_file "$PUBSH" 'credential files stop being scanned for' has_trusted_snaps
 mutate_file "$PUBSH" 'the snapshot name becomes reusable' has_trusted_snapshot_build \
   's@^SNAP="\$\(date -u \+%Y%m%dT%H%M%SZ\)-\$\{digest\}\.tar\.gz"$@SNAP="latest.tar.gz"@'
 mutate_file "$PUBSH" 'the upload may overwrite an existing snapshot' has_trusted_snapshot_build \
-  's@gcloud storage cp --if-generation-match=0 @gcloud storage cp @'
+  's@&ifGenerationMatch=0"@"@'
 mutate_file "$PUBSH" 'the pointer swap loses its precondition' has_trusted_snapshot_build \
-  's@gcloud storage cp --if-generation-match="\$gen" @gcloud storage cp @'
+  's@&ifGenerationMatch=\$\{gen\}"@"@'
+mutate_file "$PUBSH" 'the upload goes back to a tool that lists the bucket' has_trusted_snapshot_build \
+  's@^log "uploading gs://@gcloud storage cp "$ARCHIVE" "gs://x/y" || true\nlog "uploading gs://@'
+mutate_file "$PUBSH" 'the access token moves into argv' has_trusted_snapshot_build \
+  's@-K <\(printf .header = "Authorization: Bearer %s.\\n. "\$GCS_TOKEN"\)@-H "Authorization: Bearer $GCS_TOKEN"@'
+# The session URI arrives in a response header and is then handed the credential.
+mutate_file "$PUBSH" 'the session URI is trusted because it arrived over TLS' has_trusted_snapshot_build \
+  's@^  \* \) die "the upload session URI is not.*$@  * ) : ;;@'
+mutate_file "$PUBSH" 'curl stops pinning the scheme' has_trusted_snapshot_build \
+  "s@curl -sS --proto '=https' @curl -sS @"
+# A 308 is not a finalised object, and curl's exit status cannot tell them apart.
+mutate_file "$PUBSH" 'a resume-incomplete counts as a finished upload' has_trusted_snapshot_build \
+  's@200 \| 201 \) uploaded=1@200 | 201 | 308 ) uploaded=1@g'
+mutate_file "$PUBSH" 'the resume probe sends no Content-Length' has_trusted_snapshot_build \
+  "s@-H 'Content-Length: 0' @@"
+mutate_file "$PUBSH" 'a session holding every byte is called finalised' has_trusted_snapshot_build \
+  's@^      \|\| die "the upload session holds all.*$@      || { uploaded=1; break; }@'
+# Integrity across the wire, and the pin re-asserted on the read a retry makes.
+mutate_file "$PUBSH" 'the upload declares no digest' has_trusted_snapshot_build \
+  's@--data "\{.*md5Hash.*\}"@--data "{}"@'
+mutate_file "$PUBSH" 'a retry re-reads the archive without re-checking it' has_trusted_snapshot_build \
+  's@^    assert_archive_unchanged "the upload retry"$@    :@'
+# The generation read, and the two things that keep it from killing the shell or
+# reaching a URL as something other than digits.
+mutate_file "$PUBSH" 'a missing pointer kills the shell instead of reading as 0' has_trusted_snapshot_build \
+  's@ \| head -n 1\) \|\| true$@ | head -n 1)@'
+mutate_file "$PUBSH" 'the generation parse matches metageneration too' has_trusted_snapshot_build \
+  "s@s/\\^generation:@s/.*generation:@"
+mutate_file "$PUBSH" 'whatever came back reaches the URL unvalidated' has_trusted_snapshot_build \
+  's@^  .. \| .\[!0-9\]. \) gen=0 ;;$@  zzz ) gen=0 ;;@'
 mutate_file "$PUBSH" 'the size bound is dropped' has_trusted_snapshot_build \
   's@CACHE_MAX_BYTES@CACHE_SIZE_HINT@g'
 mutate_file "$PUBSH" 'the build phase falls through into the upload' has_trusted_snapshot_build \

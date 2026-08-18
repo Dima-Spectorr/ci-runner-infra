@@ -148,7 +148,7 @@ instead of quietly producing an object that never expires.
   **written once, never overwritten**;
 - the only rewritten object is the small pointer naming the current snapshot,
   which holds no cache content — its atomicity comes from an
-  `--if-generation-match` precondition, not from retaining generations.
+  `ifGenerationMatch` precondition, not from retaining generations.
 
 Expiry is also not instantaneous: Cloud Storage evaluates lifecycle rules
 asynchronously and an object can outlive its rule by up to a day. The host-side
