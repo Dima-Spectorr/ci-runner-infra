@@ -1648,7 +1648,7 @@ mutate_file "$PUBSH" 'the upload may overwrite an existing snapshot' has_trusted
 mutate_file "$PUBSH" 'the pointer swap loses its precondition' has_trusted_snapshot_build \
   's@&ifGenerationMatch=\$\{gen\}"@"@'
 mutate_file "$PUBSH" 'the upload goes back to a tool that lists the bucket' has_trusted_snapshot_build \
-  's@^log "uploading gs://@gcloud storage cp "$ARCHIVE" "gs://x/y" || true\nlog "uploading gs://@'
+  's@^log "uploading @gcloud storage cp "$ARCHIVE" "$dest" || true\nlog "uploading @'
 mutate_file "$PUBSH" 'the access token moves into argv' has_trusted_snapshot_build \
   's@-K <\(printf .header = "Authorization: Bearer %s.\\n. "\$GCS_TOKEN"\)@-H "Authorization: Bearer $GCS_TOKEN"@'
 # The session URI arrives in a response header and is then handed the credential.
