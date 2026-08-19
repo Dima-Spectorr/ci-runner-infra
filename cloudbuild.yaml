@@ -153,9 +153,22 @@ steps:
         # Guarded rather than assumed. This is packer's behaviour today, not a
         # documented contract, and a build must not start failing because a
         # future packer flattens it for us.
+        #
+        # `find -mindepth 1 -maxdepth 1`, not `mv dir/*`: a glob skips dotfiles,
+        # so one `.something` in the download would be left behind, `rmdir`
+        # would fail, and the extra path segment this exists to remove would
+        # reach the bucket anyway — quietly, because both halves were `|| true`.
+        # `rmdir` stays deliberately un-forced: it is the assertion that the
+        # move actually emptied the directory, and `rm -rf` here would delete
+        # scan artifacts on the day it did not.
         if [ -d image-scan/ci-image-scan ]; then
-          mv image-scan/ci-image-scan/* image-scan/ 2>/dev/null || true
-          rmdir image-scan/ci-image-scan 2>/dev/null || true
+          # Not allowed to abort the step: `set -e` is on, and the publish and
+          # the held packer exit code both live below this point. A tidy-up
+          # failing must not be what discards the scan report.
+          find image-scan/ci-image-scan -mindepth 1 -maxdepth 1 -exec mv -t image-scan/ {} + ||
+            echo "WARNING: flattening image-scan/ci-image-scan failed" >&2
+          rmdir image-scan/ci-image-scan ||
+            echo "WARNING: image-scan/ci-image-scan is not empty after flattening; the extra path segment will reach the bucket" >&2
         fi
         if [ -n "${_SBOM_BUCKET}" ]; then
           gcloud storage cp -r image-scan/* \
@@ -165,11 +178,22 @@ steps:
         else
           echo "WARNING: _SBOM_BUCKET is unset — the SBOM and scan report exist only in this build's workspace, which is discarded."
         fi
-        # `|| true` stays: the verdict is already in the packer output above and
-        # a failure to re-print it must not be what fails the build. But it is
-        # no longer silent about not finding it — that silence is what let this
-        # go unnoticed.
-        cat image-scan/verdict.txt || echo "WARNING: no verdict.txt in the workspace; the verdict is in the packer output above"
+        # Re-printing the verdict must not be what fails the build — it is
+        # already in the packer output above. But it is no longer silent about
+        # not finding it; that silence is what let this go unnoticed.
+        #
+        # `-f` rather than `cat || echo`: the two failures are different
+        # problems and an operator reading the log has to be able to tell them
+        # apart. A missing file is the packer-layout bug above; a `cat` that
+        # fails on a file that IS there is a broken workspace, and reporting it
+        # as "no verdict.txt" would send whoever reads this log looking in the
+        # wrong place. Both warnings go to stderr, where warnings belong.
+        if [ -f image-scan/verdict.txt ]; then
+          cat image-scan/verdict.txt ||
+            echo "WARNING: image-scan/verdict.txt exists but could not be read; the verdict is in the packer output above" >&2
+        else
+          echo "WARNING: no verdict.txt in the workspace; the verdict is in the packer output above" >&2
+        fi
 
         exit $$rc
 
