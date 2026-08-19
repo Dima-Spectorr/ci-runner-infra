@@ -585,7 +585,10 @@ Four design choices, each against a specific way this kind of gate dies:
   on the summary line, as `off-distro`. The cost is named rather than hidden: a
   genuinely vulnerable vendored module in an image-installed binary no longer
   fails the build, and closing that needs a scanner that understands binary
-  provenance — not a gate that is unconditionally red.
+  provenance — not a gate that is unconditionally red. **A finding whose
+  `artifact.type` the report does not state blocks**, exactly as a `deb` would:
+  the test is "distro package *or* provenance unknown", so the day grype renames
+  that field the gate goes red rather than quietly narrowing to nothing.
 - **Only fixable findings block.** A gate that fails on something nobody can act
   on acquires an `|| true` within a month. Unfixable findings are still reported.
 - **Every exception expires.** `docs/image-vuln-ignores.txt` entries carry a
@@ -603,9 +606,18 @@ bare EOF on two of the first three real image builds; implicitly, that surfaces
 as a WARN and then, two seconds later, `failed to load vulnerability db:
 database does not exist` — a build lost 25 minutes in, to a network blip. Five
 attempts with a growing backoff, then a hard failure, and `grype db status`
-after them to prove the file is actually on disk: a build that genuinely cannot
-reach the feed must still fail, because a scan with no database finds nothing
-and "found nothing" is exactly what a clean image looks like.
+after them to prove the file is actually on disk.
+
+Two separate reasons for that shape. The retries are for the blip: it is a
+transient EOF, and a 25-minute build should not die on one. The explicit
+`db status` is for the other end — `grype db update` exits 0 when it decides no
+update is needed, which on a cold cache whose listing fetch failed is
+indistinguishable from success. Today the scan that follows would error out
+(`database does not exist`), so the build fails loudly; but that is grype's
+current behaviour, not a contract, and the failure mode it protects against is
+a scan that reports zero findings for want of data. "Found nothing" and "a
+clean image" are the same line of output, so the build proves the database is
+there rather than inferring it from a scan that did not complain.
 
 The floor starts at `critical`, not `high`, deliberately: the steady-state
 finding count for a full Ubuntu userspace plus docker, node and PowerShell is
