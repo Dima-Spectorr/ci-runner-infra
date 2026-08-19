@@ -1132,8 +1132,63 @@ hydrate_shared_cache_bounded() {
   log "cache hydrated from $snap: $n tool cache(s), $size bytes, ${age}h old, ${took}s of a ${budget}s budget"
 }
 
+# Repair the master's own root directory, and nothing inside it.
+#
+# Images before v3-13-0 shipped /opt/ci-cache as `drwxrwsr-x runner:ci` — mode
+# 2775 — and `-perm /6000` in the scan above matches a setgid DIRECTORY, so every
+# host in the pool refused its own master and every job ran cold. The tree was
+# EMPTY; the refusal was about the container, not the contents. `chmod -R go-w`
+# below cannot undo it twice over: `go-w` does not clear the setgid bit, and it
+# runs only after the scan has already returned a refusal.
+#
+# So the one entry the IMAGE created is normalised here, before the scan, and it
+# is the only thing normalised. Everything under it is content; the scan is what
+# judges content; a hostile entry INSIDE the tree is still a refusal. Sanitising
+# those would turn the gate into a laundering step — the scan exists precisely so
+# that a setuid binary or a hardlink to /etc/shadow is refused rather than
+# quietly de-fanged and then copied into every slot.
+#
+# The staged snapshot tree never gets this. That one is untrusted by
+# construction and is scanned `strict`; a repair there would be repairing
+# something a job could have written.
+heal_cache_master_root() {
+  local before after
+  # A symlink is not a directory to repair, and both chown -h's target and
+  # chmod's would be resolved through it — chmod has no --no-dereference at all.
+  # Leave it untouched and let the scan refuse it by -type l, which is the whole
+  # reason that predicate is there.
+  if [ -L "$CACHE_MASTER" ]; then
+    return 0
+  fi
+  if [ ! -d "$CACHE_MASTER" ]; then
+    return 0
+  fi
+  before=$(stat -c '%a %U:%G' "$CACHE_MASTER" 2>/dev/null) || return 0
+  # 0755 root:root is what packer bakes (`chown -Rh root:root` + `chmod -R
+  # go-w,go+rX` on a 0775 tree). Matching it exactly means a healthy host does
+  # nothing and says nothing.
+  if [ "$before" = "755 root:root" ]; then
+    return 0
+  fi
+  chown -h root:root "$CACHE_MASTER" 2>/dev/null || true
+  # An explicit mode, not `go-w`: clearing setgid is the entire point, and
+  # `chmod -R go-w` is exactly the call that was already running and not doing it.
+  chmod 0755 "$CACHE_MASTER" 2>/dev/null || true
+  after=$(stat -c '%a %U:%G' "$CACHE_MASTER" 2>/dev/null) || after="unreadable"
+  if [ "$after" = "755 root:root" ]; then
+    log "normalised $CACHE_MASTER: $before -> $after"
+  else
+    # Not a refusal on its own — the scan runs next and decides. But an operator
+    # reading a later refusal needs to know this was tried and did not take.
+    log "could not normalise $CACHE_MASTER: still $after (was $before)"
+  fi
+}
+
 # Make the master read-only to everything but root.
 lock_shared_cache() {
+  # Before the scan, not after: the scan is what refuses a setgid root, so a
+  # repair that runs afterwards never runs at all.
+  heal_cache_master_root
   if cache_master_is_hostile; then
     log "jobs will run without a seeded cache"
     return 1
