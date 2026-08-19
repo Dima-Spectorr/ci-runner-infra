@@ -597,6 +597,16 @@ Four design choices, each against a specific way this kind of gate dies:
   observable only inside a forty-minute image build that no consumer's CI runs —
   which is how the `inline_shebang` defect in 7.2's neighbourhood survived.
 
+The vulnerability database is fetched as its own **retried** step before the
+scan, not left to grype's implicit auto-update. `grype.anchore.io` returned a
+bare EOF on two of the first three real image builds; implicitly, that surfaces
+as a WARN and then, two seconds later, `failed to load vulnerability db:
+database does not exist` — a build lost 25 minutes in, to a network blip. Five
+attempts with a growing backoff, then a hard failure, and `grype db status`
+after them to prove the file is actually on disk: a build that genuinely cannot
+reach the feed must still fail, because a scan with no database finds nothing
+and "found nothing" is exactly what a clean image looks like.
+
 The floor starts at `critical`, not `high`, deliberately: the steady-state
 finding count for a full Ubuntu userspace plus docker, node and PowerShell is
 not yet known, and a gate that is red on its first run for reasons nobody
