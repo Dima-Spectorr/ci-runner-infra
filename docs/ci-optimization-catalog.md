@@ -561,13 +561,31 @@ it was not written down anywhere at all.
 
 **Shipped:** the image build produces an SBOM of its own finished filesystem
 (`syft`, pinned + checksum-verified), scans it (`grype`, likewise), and refuses
-to create the image when the scan finds something **fixable** at or above
-`_VULN_FAIL_ON`. The SBOM is published to `_SBOM_BUCKET` and also left on the
-image at `/opt/ci-image-sbom/`, so a host that turns out to be affected by
-something disclosed later is answerable on the box.
+to create the image when the scan finds something **fixable, at or above
+`_VULN_FAIL_ON`, in an installed distro package**. The SBOM is published to
+`_SBOM_BUCKET` and also left on the image at `/opt/ci-image-sbom/`, so a host
+that turns out to be affected by something disclosed later is answerable on the
+box.
 
-Three design choices, each against a specific way this kind of gate dies:
+Four design choices, each against a specific way this kind of gate dies:
 
+- **Only findings grype matched through the distro's own feed block.** For a
+  `deb`, grype asks Ubuntu whether *this* package version is affected and Ubuntu
+  answers knowing what it backported. For anything syft found by reading a
+  binary — the `linux-kernel` cataloger, a Go module compiled into an executable
+  — there is no distro opinion to ask for, so grype compares the upstream
+  version against NVD/GHSA. Measured on this gate's first real run (build
+  `f5510d02`, 2026-08-18): 22,161 findings, 273 blocking, **all 273 from binary
+  catalogers** — 105 against `linux-kernel 6.17.0-1022-gcp` reported "fixed in
+  5.16, 6.2, 6.7…", and 168 against `golang.org/x/crypto v0.23.0` vendored
+  inside dockerd, containerd and snapd. The `deb` entries for those same kernels
+  produced thousands of matches and **zero** blocking, because there Ubuntu's
+  data reports the backport. Left as it was, the gate was red on every image
+  forever for findings nobody here can fix. They are still counted and printed,
+  on the summary line, as `off-distro`. The cost is named rather than hidden: a
+  genuinely vulnerable vendored module in an image-installed binary no longer
+  fails the build, and closing that needs a scanner that understands binary
+  provenance — not a gate that is unconditionally red.
 - **Only fixable findings block.** A gate that fails on something nobody can act
   on acquires an `|| true` within a month. Unfixable findings are still reported.
 - **Every exception expires.** `docs/image-vuln-ignores.txt` entries carry a

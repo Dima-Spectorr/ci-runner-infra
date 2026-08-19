@@ -71,9 +71,9 @@ usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" >&2; exit 2; }
 #
 #   #FINDING<TAB>id<TAB>severity<TAB>package<TAB>version<TAB>fix<TAB>state
 #   #EXPIRED<TAB>id<TAB>expiry<TAB>reason
-#   #COUNT<TAB>total<TAB>blocking<TAB>ignored<TAB>expired
+#   #COUNT<TAB>total<TAB>blocking<TAB>ignored<TAB>expired<TAB>offdistro
 #
-# `state` is blocking | ignored | reported. No field may be empty: `read` with
+# `state` is blocking | ignored | offdistro | reported. No field may be empty: `read` with
 # `IFS=$'\t'` still treats a tab as IFS WHITESPACE and collapses a run of them,
 # so one empty column silently shifts every column after it — which is how a
 # package with no fix version arrives as its own severity.
@@ -82,6 +82,37 @@ verdict() {
 import json, sys
 
 report_path, fail_on, ignores_path, today = sys.argv[1:5]
+
+# Which findings this gate can act on: the ones grype matched through a
+# DISTRO's own security feed.
+#
+# For a `deb`, grype asks Ubuntu whether THIS package version is affected, and
+# Ubuntu answers knowing what it backported. For anything syft found by reading
+# a binary — the `linux-kernel` cataloger, a Go module compiled into an
+# executable — grype has no distro opinion to ask for and falls back to matching
+# the upstream version against NVD/GHSA. Those two answers are not the same kind
+# of answer, and only one of them is actionable by rebuilding this image.
+#
+# Measured on the first real run of this gate (build f5510d02, 2026-08-18):
+# 22,161 findings, 273 blocking, and every one of the 273 came from a binary
+# cataloger — 105 against `linux-kernel 6.17.0-1022-gcp`, "fixed in 5.16, 6.2,
+# 6.7…" (upstream versions, meaningless for an Ubuntu ABI revision), and 168
+# against `golang.org/x/crypto v0.23.0` vendored inside dockerd, containerd and
+# snapd, which this build cannot upgrade independently of the distro packages
+# that ship them. The `deb` entries for those SAME kernels produced thousands of
+# matches and ZERO blocking, because there Ubuntu's data reports the backport.
+#
+# So the gate would have been red on every image, forever, for findings nobody
+# in this repository can fix — the exact death documented in
+# docs/ci-optimization-catalog.md §7.3. Nothing is hidden: these stay in the
+# SBOM, in the grype report, and in this script's own output, counted on their
+# own line and printed as `offdistro`.
+#
+# The cost is real and worth naming: a genuinely vulnerable vendored Go module
+# in an image-installed binary no longer fails the build. That is a gap to close
+# with a scanner that understands binary provenance, not by keeping a gate that
+# is unconditionally red.
+DISTRO_TYPES = {"deb", "rpm", "apk"}
 
 RANK = {"negligible": 0, "unknown": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 floor = RANK.get(fail_on.lower())
@@ -131,7 +162,7 @@ if ignores_path:
 def out(*fields):
     print("\t".join(str(f) if str(f) != "" else "-" for f in fields))
 
-total = blocking = ignored = expired = 0
+total = blocking = ignored = expired = offdistro = 0
 seen_expired = set()
 
 for m in matches:
@@ -145,9 +176,21 @@ for m in matches:
     total += 1
 
     at_or_above = RANK.get(sev, 0) >= floor
+    # A MISSING type still blocks. Fail closed: an artifact whose provenance
+    # the report does not state must not be the quiet way out of the gate, and
+    # "grype changed its field name" must show up as a red build rather than as
+    # a silently narrower gate.
+    atype = (art.get("type") or "").lower()
+    from_distro = atype == "" or atype in DISTRO_TYPES
     state = "reported"
 
-    if at_or_above and fixable:
+    if at_or_above and fixable and not from_distro:
+        # Counted separately, so "the gate found nothing" and "the gate cannot
+        # speak to what it found" never render as the same line.
+        state = "offdistro"
+        offdistro += 1
+
+    if at_or_above and fixable and from_distro:
         if vid in ignores:
             expiry, reason = ignores[vid]
             # An expired ignore does not fall back to ignoring. It is its own
@@ -168,7 +211,7 @@ for m in matches:
 
     out("#FINDING", vid, sev, art.get("name") or "-", art.get("version") or "-", fixed_in, state)
 
-out("#COUNT", total, blocking, ignored, expired)
+out("#COUNT", total, blocking, ignored, expired, offdistro)
 PY
 }
 
@@ -215,16 +258,20 @@ run() {
     return 2
   fi
 
-  local total blocking ignored expired
+  local total blocking ignored expired offdistro
   # shellcheck disable=SC2034
-  read -r _ total blocking ignored expired <<< "$(printf '%s\n' "$records" | grep '^#COUNT' | tr '\t' ' ')"
+  read -r _ total blocking ignored expired offdistro <<< "$(printf '%s\n' "$records" | grep '^#COUNT' | tr '\t' ' ')"
 
   if [ "${total:-0}" -eq 0 ]; then
     echo "::error::[VULN0] the scan matched nothing at all. A whole-filesystem scan of this image matching zero vulnerabilities is an empty SBOM or a scanner that did not run, not a clean image" >&2
     return 2
   fi
 
-  echo "image scan: $total finding(s), floor=$FAIL_ON, $blocking blocking, $ignored ignored, $expired expired ignore(s)"
+  # `offdistro` is on the summary line, not buried in the per-finding list. It
+  # is the count of things at or above the floor, with a fix, that this gate
+  # deliberately does not block on — the number whose growth means the gate is
+  # covering less than the reader assumes.
+  echo "image scan: $total finding(s), floor=$FAIL_ON, $blocking blocking, $ignored ignored, $expired expired ignore(s), $offdistro fixable off-distro (not blocking)"
 
   local _ id sev pkg ver fix state expiry reason
   while IFS=$'\t' read -r _ id expiry reason; do
@@ -235,6 +282,11 @@ run() {
     case "$state" in
       blocking) echo "::error::[VULN1] $sev $id in $pkg $ver — fixed in $fix. The image could have picked this up and did not." ;;
       ignored)  echo "  ignored  $sev $id in $pkg $ver (fixed in $fix)" ;;
+      # Not "reported": this one IS at or above the floor and IS fixable, and
+      # the only reason it does not block is that grype matched it off a binary
+      # rather than through the distro. Rendering it as an ordinary report would
+      # hide exactly the distinction this state exists to make.
+      offdistro) echo "  off-distro $sev $id in $pkg $ver (fixed in $fix) — matched off a binary, not an installed package; not blocking" ;;
       *)        echo "  reported $sev $id in $pkg $ver (fix: $fix)" ;;
     esac
   done < <(printf '%s\n' "$records" | grep '^#FINDING' || true)
@@ -248,9 +300,17 @@ selftest() {
   local tmp status=0
   tmp="$(mktemp -d)"
 
-  match() {  # <id> <severity> <fix-state> <fixed-in> <pkg> <version>
-    printf '{"vulnerability":{"id":"%s","severity":"%s","fix":{"state":"%s","versions":["%s"]}},"artifact":{"name":"%s","version":"%s"}}' \
-      "$1" "$2" "$3" "$4" "$5" "$6"
+  # <type> is optional and OMITTED entirely when absent, so every fixture
+  # written before this field existed keeps exercising the missing-type path —
+  # which is the fail-closed one, and is why none of them needed editing.
+  match() {  # <id> <severity> <fix-state> <fixed-in> <pkg> <version> [type]
+    if [ -n "${7:-}" ]; then
+      printf '{"vulnerability":{"id":"%s","severity":"%s","fix":{"state":"%s","versions":["%s"]}},"artifact":{"name":"%s","version":"%s","type":"%s"}}' \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+    else
+      printf '{"vulnerability":{"id":"%s","severity":"%s","fix":{"state":"%s","versions":["%s"]}},"artifact":{"name":"%s","version":"%s"}}' \
+        "$1" "$2" "$3" "$4" "$5" "$6"
+    fi
   }
   report() { printf '{"matches":[%s]}\n' "$(printf '%s' "$1")"; }
 
@@ -270,6 +330,67 @@ selftest() {
   # A fixable critical is the whole point: the build could have taken the fix.
   report "$(match CVE-1 critical fixed 1.2.3 libfoo 1.2.2)" > "$tmp/fixable.json"
   check "a fixable critical blocks the build" 1 "VULN1" --report "$tmp/fixable.json" --today 2026-01-01
+
+  # ── where the finding CAME FROM ────────────────────────────────────────────
+  # A `deb` is matched through Ubuntu's own data, which knows what Ubuntu
+  # backported. Everything else grype matched by reading a binary and comparing
+  # an upstream version, and this image cannot rebuild someone else's binary.
+
+  report "$(match CVE-10 critical fixed 1.2.3 libfoo 1.2.2 deb)" > "$tmp/deb.json"
+  check "a fixable critical in an installed package blocks" 1 "VULN1" \
+    --report "$tmp/deb.json" --today 2026-01-01
+
+  # The regression this whole change is about: 105 of these, every build,
+  # "fixed in 5.16,6.2,6.7" against an Ubuntu ABI revision.
+  report "$(match CVE-11 critical fixed 6.19.9 linux-kernel 6.17.0-1022-gcp linux-kernel)" > "$tmp/kern.json"
+  check "a fixable critical off the kernel binary does not block" 0 "off-distro" \
+    --report "$tmp/kern.json" --today 2026-01-01
+
+  # ...and the other 168: a Go module vendored inside dockerd.
+  report "$(match GHSA-x critical fixed 0.31.0 golang.org/x/crypto v0.23.0 go-module)" > "$tmp/gomod.json"
+  check "a fixable critical off a vendored module does not block" 0 "off-distro" \
+    --report "$tmp/gomod.json" --today 2026-01-01
+
+  # Not silently: it is on the summary line, so a gate that stops covering
+  # something says so in the one line an operator actually reads.
+  check "the off-distro count is on the summary line" 0 "1 fixable off-distro" \
+    --report "$tmp/gomod.json" --today 2026-01-01
+
+  # It is NOT rendered as an ordinary report. `reported` means "nothing to do
+  # here"; this one is fixable and above the floor and deliberately let through,
+  # which is a different sentence and has to read as one.
+  if run --report "$tmp/gomod.json" --today 2026-01-01 2>&1 | grep -q "reported critical GHSA-x"; then
+    echo "FAIL an off-distro finding renders as off-distro, not as reported"
+    status=1
+  else
+    echo "ok   an off-distro finding renders as off-distro, not as reported"
+  fi
+
+  # FAIL CLOSED on an unknown provenance. If grype renames the field or emits a
+  # type this script has never heard of, the gate goes red rather than quiet.
+  report "$(match CVE-12 critical fixed 1.2.3 libfoo 1.2.2)" > "$tmp/notype.json"
+  check "a finding with no artifact type still blocks" 1 "VULN1" \
+    --report "$tmp/notype.json" --today 2026-01-01
+
+  # An rpm/apk image is not this fleet's, but the rule is about distro feeds and
+  # not about Ubuntu, and a future base image must not silently stop being gated.
+  report "$(match CVE-13 critical fixed 1.2.3 libfoo 1.2.2 rpm)" > "$tmp/rpm.json"
+  check "an rpm is a distro package too" 1 "VULN1" --report "$tmp/rpm.json" --today 2026-01-01
+  report "$(match CVE-14 critical fixed 1.2.3 libfoo 1.2.2 apk)" > "$tmp/apk.json"
+  check "an apk is a distro package too" 1 "VULN1" --report "$tmp/apk.json" --today 2026-01-01
+
+  # An ignore is about a CVE; whether a finding blocks is about provenance, and
+  # provenance is decided first. So an ignore for an off-distro finding is dead
+  # weight, and an EXPIRED one does not turn it into a red build.
+  #
+  # This is deliberate and it is the one place the two mechanisms could have
+  # been wired the other way round. An expired ignore is loud because it is
+  # hiding something that would otherwise block; here it is hiding nothing, and
+  # failing the image over a stale line about a finding that cannot block is
+  # precisely the unactionable red this change exists to remove.
+  printf 'GHSA-x 2020-01-01 stale\n' > "$tmp/expired-offdistro.txt"
+  check "an expired ignore does not resurrect an off-distro finding" 0 "off-distro" \
+    --report "$tmp/gomod.json" --ignores "$tmp/expired-offdistro.txt" --today 2026-01-01
 
   # The same critical with no fix does NOT block. Nothing the build can do
   # about it, and blocking is what turns the gate into a file of exceptions.

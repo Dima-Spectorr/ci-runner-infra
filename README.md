@@ -166,9 +166,16 @@ So the build now scans itself, in this order and for a reason:
    rule only observable inside a forty-minute image build that nobody's CI runs
    is a rule nobody can change with confidence.
 
-The verdict blocks only on findings **with an available fix** at or above
-`_VULN_FAIL_ON` (default `critical`). Failing on something nobody can act on is
-how a gate earns an `|| true` within a month. Exceptions go in
+The verdict blocks only on findings **with an available fix**, at or above
+`_VULN_FAIL_ON` (default `critical`), **in an installed distro package** (`deb`,
+`rpm`, `apk` — or an artifact whose type the report does not state, which fails
+closed and blocks). Failing on something nobody can act on is how a gate earns
+an `|| true` within a month, and for anything `syft` found by reading a binary —
+the kernel image, a Go module compiled into `dockerd` — `grype` has no distro
+security data to consult, so it compares upstream version numbers and reports
+every backported fix as missing. The first real run of this gate produced 273
+blocking findings, all 273 of them that. They are still counted and named, as
+`off-distro`. Exceptions go in
 `docs/image-vuln-ignores.txt` and **carry an expiry date**: the day after it, the
 gate goes red and names the entry, which forces the decision again rather than
 letting the list grow quietly. A report that cannot be read, or that matched
