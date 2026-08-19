@@ -74,7 +74,7 @@ jobs:
       # once with:
       #   git ls-remote https://github.com/Dima-Spectorr/ci-runner-infra refs/tags/<tag>^{}
       #
-      # Do NOT pin a release older than v5.32.0. Before v5.27.0 the content
+      # Do NOT pin a release older than v5.33.0. Before v5.27.0 the content
       # scan could be switched off for a file by the prepare command writing
       # one NUL byte in front of the credential, and one process could both run
       # that command and hold the publishing credential. v5.27.0 itself parses
@@ -97,12 +97,12 @@ jobs:
       # with is deleting the rule. v5.31.0 matches the token being GIVEN A VALUE
       # instead of merely appearing, and still cannot upload: it published with
       # `gcloud storage cp`, which lists the destination bucket, and the
-      # publisher's grants are all conditioned on an object prefix. v5.32.0
+      # publisher's grants are all conditioned on an object prefix. v5.33.0
       # uploads through the Storage JSON API, naming the object.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of the pinned tag>   # >= v5.32.0
+          ref: <commit sha of the pinned tag>   # >= v5.33.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
@@ -129,7 +129,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of the pinned tag>   # >= v5.32.0
+          ref: <commit sha of the pinned tag>   # >= v5.33.0
           path: .ci-runner-infra
 
       - run: sudo apt-get update && sudo apt-get install -y libcap2-bin
