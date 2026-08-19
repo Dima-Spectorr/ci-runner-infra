@@ -1,0 +1,557 @@
+#!/usr/bin/env bash
+# =============================================================================
+# check-mergify-scopes.sh — the scope map covers the repository, exhaustively
+#
+# USAGE
+#   bash scripts/ci/check-mergify-scopes.sh            # the gate
+#   bash scripts/ci/check-mergify-scopes.sh --selftest # fixtures, run first
+#   bash scripts/ci/check-mergify-scopes.sh --fanout   # the barrier evidence
+#
+# WHY THIS EXISTS
+#   Under `merge_queue.mode: parallel`, Mergify groups queued pull requests by
+#   their EXACT set of scopes and tests groups that share no scope AT THE SAME
+#   TIME, with no dependency between them. (Under `serial` this gate's coverage
+#   check is deliberately inert, so a repository can carry it BEFORE the width
+#   rises rather than in the pull request that makes it matter.)
+#
+#   The failure mode that creates is silent and points the wrong way. A pull
+#   request whose files match NO scope carries the EMPTY scope set. An empty set
+#   overlaps nothing, so such a pull request runs concurrently with every other
+#   entry in the queue — unscoped is the MOST parallel state, not the safest
+#   one. Nothing in Mergify reports it: the queue stays green, the dashboard
+#   shows the scopes that were declared, and the uncovered half of the repo
+#   quietly stops being serialised against anything.
+#
+#   Before this gate existed (2026-08-19) that half was most of the repository:
+#   21 of 34 directories under apps/ and 62 of 68 under packages/ matched no
+#   scope, because the scope block had been written on 2026-08-17 as a BATCHING
+#   PREFERENCE, where partial coverage is merely a partial optimisation. Under
+#   parallel mode the same file is a correctness statement, and a partial one is
+#   wrong rather than incomplete.
+#
+#   So: every workspace package must be named by a scope or by a barrier, and
+#   adding a package must fail the build until somebody decides which.
+#
+# WHAT IT DOES NOT DO
+#   It does not judge whether two scopes are genuinely independent — no gate
+#   can. It asserts coverage, barrier sanity and capacity arithmetic, which are
+#   the three things that are decidable from the file plus the workspace graph.
+#
+# THE PARSER IS A HARD DEPENDENCY, for the same reason as in
+# check-merge-queue-single-step.sh: a key one level too deep is not a value in
+# an odd spot, it is a file Mergify REFUSES TO LOAD, and a keyword scan finds
+# the value it hoped for and reports a covered repository over a queue that
+# cannot start. python3 + PyYAML is expected on the runner image; the gate
+# installs nothing, because a required check that pip-installs an unpinned
+# package puts every merge behind PyPI on a host holding a service identity.
+# =============================================================================
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Pick an interpreter that can actually import yaml. `actions/setup-python`
+# prepends a Python that does not carry the image's python3-yaml, so a workflow
+# that set up Python for an unrelated step would otherwise turn this gate into
+# "no YAML parser available" on a runner that has one.
+PY=""
+for cand in python3 python /usr/bin/python3; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import yaml' >/dev/null 2>&1; then
+    PY="$cand"
+    break
+  fi
+done
+if [ -z "$PY" ]; then
+  echo "check-mergify-scopes: no python3 with PyYAML available" >&2
+  exit 1
+fi
+
+run_reader() { "$PY" - "$@" <<'PYEOF'
+import fnmatch
+import json
+import os
+import re
+import sys
+
+mode = sys.argv[1]
+root = sys.argv[2]
+cfg_path = os.path.join(root, '.mergify.yml')
+
+import yaml
+
+errors = []
+checks = []
+
+
+def fail(check_id, msg):
+    errors.append(check_id)
+    print("FAIL [%s] %s" % (check_id, msg))
+
+
+# --- the workspace graph -----------------------------------------------------
+def workspace_packages(root):
+    """Every directory holding a named package.json, from the pnpm globs.
+
+    Read from pnpm-workspace.yaml rather than hard-coded, so a new workspace
+    glob is covered the day it lands instead of the day somebody remembers this
+    file. A directory with a package.json that pnpm does NOT select is not a
+    build unit and is not required to be scoped.
+    """
+    ws = os.path.join(root, 'pnpm-workspace.yaml')
+    globs = []
+    if os.path.exists(ws):
+        doc = yaml.safe_load(open(ws, encoding='utf-8')) or {}
+        globs = doc.get('packages') or []
+    found = {}
+    for g in globs:
+        # pnpm globs here are one level deep ('apps/*') or a literal ('tests').
+        base = g.rstrip('/')
+        if base.endswith('/*'):
+            parent = os.path.join(root, base[:-2])
+            if not os.path.isdir(parent):
+                continue
+            entries = [os.path.join(base[:-2], d) for d in sorted(os.listdir(parent))]
+        else:
+            entries = [base]
+        for rel in entries:
+            pj = os.path.join(root, rel, 'package.json')
+            if not os.path.isfile(pj):
+                continue
+            try:
+                name = (json.load(open(pj, encoding='utf-8')) or {}).get('name')
+            except Exception:
+                name = None
+            if name:
+                found[rel.replace(os.sep, '/')] = name
+    return found
+
+
+def fanout(root, pkgs):
+    """Transitive dependent count per package, over workspace deps only."""
+    import collections
+    meta = {}
+    for rel, name in pkgs.items():
+        try:
+            meta[name] = json.load(open(os.path.join(root, rel, 'package.json'), encoding='utf-8'))
+        except Exception:
+            meta[name] = {}
+    names = set(meta)
+    rev = collections.defaultdict(set)
+    for name, j in meta.items():
+        deps = set()
+        for k in ('dependencies', 'devDependencies', 'peerDependencies'):
+            deps |= set((j.get(k) or {}).keys())
+        for d in deps & names:
+            rev[d].add(name)
+
+    def closure(t):
+        seen, stack = set(), [t]
+        while stack:
+            c = stack.pop()
+            for u in rev.get(c, ()):
+                if u not in seen:
+                    seen.add(u)
+                    stack.append(u)
+        return seen
+
+    by_name = {v: k for k, v in pkgs.items()}
+    return sorted(((len(closure(n)), by_name[n], n) for n in meta), reverse=True)
+
+
+# --- glob matching, Mergify's semantics --------------------------------------
+def to_regex(pat):
+    """`**` crosses directory separators, `*` and `?` do not.
+
+    fnmatch.translate is wrong here: it maps `*` to `.*`, which crosses `/`, so
+    `packages/*` would match `packages/connectors/aws-sqs` and the gate would
+    report a package covered by a pattern Mergify does not match it with. Every
+    coverage answer would be wrong in the permissive direction.
+    """
+    out = ['^']
+    i = 0
+    while i < len(pat):
+        c = pat[i]
+        if pat.startswith('**', i):
+            out.append('.*')
+            i += 2
+            if pat.startswith('/', i):
+                # `a/**/b` should also match `a/b`
+                out.append('/?')
+                i += 1
+            continue
+        if c == '*':
+            out.append('[^/]*')
+        elif c == '?':
+            out.append('[^/]')
+        else:
+            out.append(re.escape(c))
+        i += 1
+    out.append('$')
+    return re.compile(''.join(out))
+
+
+def matches(patterns, path):
+    return any(to_regex(p).match(path) for p in patterns or [])
+
+
+# --- read the configuration --------------------------------------------------
+try:
+    doc = yaml.safe_load(open(cfg_path, encoding='utf-8'))
+except Exception as exc:
+    print("FAIL [load] .mergify.yml does not load: %s" % exc)
+    sys.exit(1)
+if not isinstance(doc, dict):
+    print("FAIL [load] .mergify.yml is not a mapping")
+    sys.exit(1)
+
+mq = doc.get('merge_queue') or {}
+scopes = doc.get('scopes') or {}
+files = ((scopes.get('source') or {}).get('files')) or {}
+barriers = ((scopes.get('barrier_files') or {}).get('include')) or []
+queue_mode = mq.get('mode', 'serial')
+width = mq.get('max_parallel_checks')
+
+pkgs = workspace_packages(root)
+
+if mode == '--fanout':
+    tot = len(pkgs)
+    print("workspace packages: %d" % tot)
+    for count, rel, name in fanout(root, pkgs):
+        if tot and count * 100 // tot >= 5:
+            print("%6d %4d%%  %-50s (%s)" % (count, 100 * count // tot, rel, name))
+    sys.exit(0)
+
+# CHECK 1 — the mode is one Mergify knows, and is not `isolated`.
+#
+# `isolated` drops the dependency between batches ENTIRELY, scopes or not, so
+# two entries that pass alone and conflict together both merge and break main.
+# That is the one property a merge queue exists to provide, so it is banned
+# here rather than left to a reviewer to notice in a one-word diff.
+checks.append('mode')
+if queue_mode not in ('serial', 'parallel'):
+    if queue_mode == 'isolated':
+        fail('mode', "merge_queue.mode: isolated removes all batch dependencies; "
+                     "two entries that pass alone can merge and break main. Use `parallel`.")
+    else:
+        fail('mode', "merge_queue.mode: %r is not serial|parallel" % (queue_mode,))
+
+# CHECK 2 — parallel mode needs scopes to mean anything AT ALL.
+#
+# With no scopes every entry carries the empty set, every entry is therefore
+# non-overlapping with every other, and `parallel` degrades to `isolated` — the
+# banned mode, reached by omission instead of by declaration.
+checks.append('parallel-needs-scopes')
+if queue_mode == 'parallel' and not files:
+    fail('parallel-needs-scopes',
+         "merge_queue.mode is parallel but scopes.source.files declares nothing; "
+         "every pull request would carry the empty scope set and run concurrently "
+         "with every other, which is `isolated` by omission.")
+
+# CHECK 3 — parallel mode needs barriers.
+#
+# Build config, workflow files and wide-fan-out packages do not belong to one
+# area, and a scope for them would ASSERT that they do.
+checks.append('parallel-needs-barriers')
+if queue_mode == 'parallel' and not barriers:
+    fail('parallel-needs-barriers',
+         "merge_queue.mode is parallel but scopes.barrier_files.include is empty; "
+         "a change to build config or a widely-imported package would be tested "
+         "concurrently with the changes that depend on it.")
+
+# CHECK 4 — coverage is total.
+checks.append('coverage')
+uncovered = []
+for rel in sorted(pkgs):
+    probe = rel + '/package.json'
+    if matches(barriers, probe):
+        continue
+    hit = False
+    for _sname, sdef in (files or {}).items():
+        sdef = sdef or {}
+        if matches(sdef.get('include'), probe) and not matches(sdef.get('exclude'), probe):
+            hit = True
+            break
+    if not hit:
+        uncovered.append(rel)
+if uncovered and queue_mode == 'parallel':
+    fail('coverage',
+         "%d workspace package(s) match no scope and no barrier. In parallel mode "
+         "an unscoped pull request carries the empty scope set and runs "
+         "concurrently with EVERYTHING. Add each to a scope in .mergify.yml, or "
+         "to barrier_files if it is build/toolchain/wide-fan-out:\n  %s"
+         % (len(uncovered), "\n  ".join(uncovered)))
+
+# CHECK 5 — capacities are sub-limits, never a way to exceed the global width.
+#
+# Mergify takes the minimum, so a capacity above the width is not an error at
+# runtime — it is a number that reads like a raise and does nothing, which is
+# how a width increase gets "applied" in the wrong file and reported as applied.
+checks.append('capacity')
+if isinstance(width, int):
+    caps = dict((scopes.get('capacities') or {}))
+    dflt = scopes.get('default_capacity')
+    if isinstance(dflt, int):
+        caps['<default_capacity>'] = dflt
+    for sname, cval in caps.items():
+        if isinstance(cval, int) and cval > width:
+            fail('capacity',
+                 "scope capacity %s=%d exceeds merge_queue.max_parallel_checks=%d; "
+                 "a capacity is a sub-limit inside the global width, so this reads "
+                 "like a raise and changes nothing."
+                 % (sname, cval, width))
+
+# CHECK 6 — a capped scope name must exist.
+#
+# A capacity on a scope that was renamed or deleted is silently ignored, and the
+# scope it was meant to bound then runs at the full width.
+checks.append('capacity-names-a-scope')
+for sname in (scopes.get('capacities') or {}):
+    if sname not in files and sname != scopes.get('merge_queue_scope', 'merge-queue'):
+        fail('capacity-names-a-scope',
+             "scopes.capacities names %r, which is not a declared scope; the cap is "
+             "ignored and that scope runs at the full width." % (sname,))
+
+# CHECK 7 — the merge-queue scope name does not collide with a real scope.
+checks.append('merge-queue-scope-collision')
+mqs = scopes.get('merge_queue_scope', 'merge-queue')
+if mqs in files:
+    fail('merge-queue-scope-collision',
+         "scopes.merge_queue_scope=%r is also a declared scope; Mergify's own "
+         "drafts would then overlap that area's pull requests." % (mqs,))
+
+print("checks run: %s" % ",".join(checks))
+if errors:
+    print("FAILED: %s" % ",".join(sorted(set(errors))))
+    sys.exit(1)
+print("OK: %d workspace packages, all scoped or barriered; mode=%s width=%s"
+      % (len(pkgs), queue_mode, width))
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Self-test. One fixture per detector, asserting the SET of check ids raised —
+# not how many diagnostics appeared. A count-only assertion is itself vacuous:
+# delete a detector and the fixture that exists to prove it stays green, because
+# a different check emits one error instead.
+# -----------------------------------------------------------------------------
+selftest() {
+  local tmp rc out failed=0
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  make_fixture() { # $1 = dir, $2 = mergify body
+    mkdir -p "$1"
+    printf 'packages:\n  - %s\n' "'apps/*'" > "$1/pnpm-workspace.yaml"
+    mkdir -p "$1/apps/alpha" "$1/apps/beta"
+    printf '{"name":"@x/alpha"}' > "$1/apps/alpha/package.json"
+    printf '{"name":"@x/beta"}' > "$1/apps/beta/package.json"
+    printf '%s' "$2" > "$1/.mergify.yml"
+  }
+
+  expect() { # $1 = name, $2 = dir, $3 = expected failing ids (comma, sorted) or ""
+    set +e
+    out="$(run_reader --gate "$2" 2>&1)"
+    rc=$?
+    set -e
+    local got
+    got="$(printf '%s\n' "$out" | sed -n 's/^FAILED: //p')"
+    if [ "$got" != "$3" ]; then
+      echo "selftest FAIL: $1 — expected [$3] got [$got] (rc=$rc)"
+      printf '%s\n' "$out" | sed 's/^/    /'
+      failed=1
+    else
+      echo "selftest ok: $1"
+    fi
+  }
+
+  # Clean: both packages scoped, parallel, barrier present.
+  make_fixture "$tmp/clean" 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - package.json
+  default_capacity: 2
+  source:
+    files:
+      a:
+        include:
+          - apps/alpha/**
+      b:
+        include:
+          - apps/beta/**
+'
+  expect "clean" "$tmp/clean" ""
+
+  # An unscoped package under parallel mode — the finding this file exists for.
+  make_fixture "$tmp/uncovered" 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - package.json
+  source:
+    files:
+      a:
+        include:
+          - apps/alpha/**
+'
+  expect "uncovered package" "$tmp/uncovered" "coverage"
+
+  # The same file under serial mode is merely an unfinished optimisation, not a
+  # correctness problem — coverage must NOT fail there, or the gate blocks the
+  # very repositories that have not migrated yet.
+  make_fixture "$tmp/uncovered-serial" 'merge_queue:
+  mode: serial
+  max_parallel_checks: 1
+scopes:
+  source:
+    files:
+      a:
+        include:
+          - apps/alpha/**
+'
+  expect "uncovered under serial is not a finding" "$tmp/uncovered-serial" ""
+
+  # `*` must not cross a separator. `apps/*` names the directories, not the
+  # files inside them, so it must NOT cover apps/alpha/package.json.
+  make_fixture "$tmp/star-crosses" 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - package.json
+  source:
+    files:
+      a:
+        include:
+          - apps/*
+'
+  expect "single star does not cross /" "$tmp/star-crosses" "coverage"
+
+  # An exclude that removes a package from its only scope leaves it uncovered.
+  make_fixture "$tmp/excluded" 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - package.json
+  source:
+    files:
+      a:
+        include:
+          - apps/**
+        exclude:
+          - apps/beta/**
+'
+  expect "exclude leaves a hole" "$tmp/excluded" "coverage"
+
+  # isolated is banned outright.
+  make_fixture "$tmp/isolated" 'merge_queue:
+  mode: isolated
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - package.json
+  source:
+    files:
+      a:
+        include:
+          - apps/**
+'
+  expect "isolated banned" "$tmp/isolated" "mode"
+
+  # parallel with no scopes is `isolated` by omission — and every package is
+  # also uncovered, so both detectors must fire.
+  make_fixture "$tmp/no-scopes" 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+'
+  expect "parallel without scopes" "$tmp/no-scopes" "coverage,parallel-needs-barriers,parallel-needs-scopes"
+
+  # A capacity above the width reads like a raise and does nothing.
+  make_fixture "$tmp/cap-over" 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - package.json
+  capacities:
+    a: 5
+  source:
+    files:
+      a:
+        include:
+          - apps/**
+'
+  expect "capacity above width" "$tmp/cap-over" "capacity"
+
+  # A capacity naming a scope that no longer exists is silently ignored.
+  make_fixture "$tmp/cap-ghost" 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - package.json
+  capacities:
+    frontend: 1
+  source:
+    files:
+      a:
+        include:
+          - apps/**
+'
+  expect "capacity names a dead scope" "$tmp/cap-ghost" "capacity-names-a-scope"
+
+  # The queue's own scope name colliding with a real one.
+  make_fixture "$tmp/collide" 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  merge_queue_scope: a
+  barrier_files:
+    include:
+      - package.json
+  source:
+    files:
+      a:
+        include:
+          - apps/**
+'
+  expect "merge_queue_scope collides" "$tmp/collide" "merge-queue-scope-collision"
+
+  # A barrier may stand in for a scope: a package named only by barrier_files is
+  # covered, because a barrier is the strictest possible answer.
+  make_fixture "$tmp/barrier-covers" 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - apps/beta/**
+  source:
+    files:
+      a:
+        include:
+          - apps/alpha/**
+'
+  expect "barrier counts as coverage" "$tmp/barrier-covers" ""
+
+  if [ "$failed" -ne 0 ]; then
+    echo "check-mergify-scopes: SELF-TEST FAILED" >&2
+    return 1
+  fi
+  echo "check-mergify-scopes: self-test passed"
+}
+
+case "${1:-}" in
+  --selftest) selftest ;;
+  --fanout)   run_reader --fanout "$REPO_ROOT" ;;
+  *)          run_reader --gate "$REPO_ROOT" ;;
+esac

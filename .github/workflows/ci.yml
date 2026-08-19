@@ -394,6 +394,18 @@ jobs:
       - name: merge-queue single-step gate
         run: bash scripts/ci/check-merge-queue-single-step.sh
 
+      # The scope-coverage gate, published here on the same terms. Its coverage
+      # check is inert while this repository is `mode: serial`, and that is why
+      # it is wired in NOW: the gate has to be in place before a width raise, not
+      # arrive in the pull request that makes it matter. Its fixtures still fire,
+      # so a regression in the script is caught here even though this
+      # repository's own config cannot trip the check it guards.
+      - name: mergify scope-coverage gate self-test
+        run: bash scripts/ci/check-mergify-scopes.sh --selftest
+
+      - name: mergify scope-coverage gate
+        run: bash scripts/ci/check-mergify-scopes.sh
+
       # `ci_orphan_registrations_reaped` was published from the day the reaper
       # landed and never declared in the module output that dashboards and alert
       # policies are built from, so nothing looked at it. The reverse drift is
