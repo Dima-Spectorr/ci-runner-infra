@@ -291,7 +291,13 @@ that image a real answer is separate work, not a line in this one.
 * **The dependency cache is shared read-only and written per slot.** The tree
   splits in two. `/opt/ci-cache` — **from image `v3-12-0` on** — is the master:
   root-owned, stripped of group and other write, shared by all slots and writable
-  by none of them. `/var/lib/ci-cache/<idx>/<tool>` is one private cache per slot
+  by none of them. `v3-12-0` itself shipped that directory `drwxrwsr-x runner:ci`,
+  which the host's own hostility scan refuses (a setgid bit, on the tree root),
+  so every host on it ran cold. The host now normalises the master's root
+  directory — that one entry, non-recursively — before it scans, so a fleet on an
+  old image repairs itself at boot. Nothing *inside* the tree is ever repaired:
+  a hostile entry there is still a refusal, because a scan that sanitises what it
+  finds is not a gate. `/var/lib/ci-cache/<idx>/<tool>` is one private cache per slot
   and tool, owned by that slot user, copied from the master at boot, and it is
   what the slot's package managers are actually pointed at.
 

@@ -146,6 +146,42 @@ has_cache_env() { # <file>
 # The rejected design must not come back. Each of these is individually
 # sufficient to rebuild the shared writable tree: a group that spans slots, a
 # setgid group-writable mode on the cache, or a group-write umask on the agent.
+# The master's own root directory is repaired at boot; nothing inside it is.
+#
+# This is the one place in the cache path where the host FIXES something instead
+# of refusing it, so the whole value of the change is in its scope. Every check
+# below is about that scope, because a repair that grew a `-R` would silently
+# convert the hostility scan from a gate into a laundering step: the setuid
+# binary gets its bits stripped, the scan then finds nothing, and the tree is
+# copied into every slot with the gate reporting clean.
+has_master_root_heal() { # <file>
+  local code heal
+  code=$(code_of "$1")
+  matches "$code" '^heal_cache_master_root\(\)' || return 1
+  # Before the scan, or it never runs: the scan is what returns the refusal.
+  matches "$code" 'heal_cache_master_root$'     || return 1
+  matches "$code" '^lock_shared_cache\(\)'      || return 1
+
+  # The body, in isolation — a `-R` elsewhere in this script is legitimate and
+  # must not be what satisfies or fails this.
+  heal=$(printf '%s\n' "$code" | sed -n '/^heal_cache_master_root()/,/^}/p')
+  # Recursive in ANY spelling. `chmod -R` here is the whole failure mode.
+  ! matches "$heal" 'chmod[[:space:]]+(-[[:alnum:]]*R|--recursive)' || return 1
+  ! matches "$heal" 'chown[[:space:]]+(-[[:alnum:]]*R|--recursive)' || return 1
+  # It repairs the master and only the master. A staged snapshot is untrusted
+  # content and gets no repairs; taking a tree argument is how that would start.
+  ! matches "$heal" 'CACHE_STAGE'                                   || return 1
+  ! matches "$heal" '\$\{?1'                                        || return 1
+  # An explicit mode, because clearing setgid is the point and `go-w` — which is
+  # what was already running and not doing it — leaves the bit set.
+  matches "$heal" 'chmod[[:space:]]+0755'                           || return 1
+  ! matches "$heal" 'chmod[[:space:]]+[^0]*go-w'                    || return 1
+  # A symlink is refused by the scan, not followed by the repair. chmod has no
+  # --no-dereference, so without this the repair walks off the tree.
+  matches "$heal" '\[ -L "\$CACHE_MASTER" \]'                       || return 1
+  return 0
+}
+
 has_no_shared_writable_tree() { # <file>
   local code
   code=$(code_of "$1")
@@ -1189,6 +1225,7 @@ run 'master read-only, slot copy slot-owned'             has_ownership_split    
 run 'root only ever works in a root-owned directory'     has_root_owned_namespace  "$SCRIPT"
 run 'the seeded cache is writable by it and private to it' has_usable_private_slot_cache "$SCRIPT"
 run 'refuses a master holding a link, node or credential' has_hostile_entry_refusal "$SCRIPT"
+run 'the master root is repaired, its contents never'    has_master_root_heal      "$SCRIPT"
 run 'the image build aborts on a hostile warm cache'     has_packer_gate_that_aborts "$PACKER"
 run 'the seed is published atomically'                   has_atomic_seed           "$SCRIPT"
 run 'no concurrency-unsafe cache is shared'              has_no_unsafe_sharing     "$SCRIPT"
@@ -1249,6 +1286,20 @@ mutate 'the env block stops reaching the unit' has_cache_env \
   's|^\$CACHE_ENV$||'
 mutate 'cache_env stops being per-slot' has_cache_env \
   's|CACHE_ENV=\$\(cache_env "\$idx"\)|CACHE_ENV=$(cache_env)|'
+
+# The repair, mutated four ways — each one an edit that reads like a small
+# improvement and turns the hostility scan into a laundering step.
+mutate 'the root repair goes recursive' has_master_root_heal \
+  's@  chmod 0755 "\$CACHE_MASTER"@  chmod -R 0755 "$CACHE_MASTER"@'
+mutate 'the root repair takes ownership recursively' has_master_root_heal \
+  's@  chown -h root:root "\$CACHE_MASTER"@  chown -Rh root:root "$CACHE_MASTER"@'
+mutate 'the root repair goes back to go-w, which leaves setgid set' has_master_root_heal \
+  's@  chmod 0755 "\$CACHE_MASTER"@  chmod go-w "$CACHE_MASTER"@'
+mutate 'the root repair follows a symlink off the tree' has_master_root_heal \
+  's@  if \[ -L "\$CACHE_MASTER" \]; then@  if false; then@'
+# And the ordering: a repair after the scan is a repair that never runs.
+mutate 'the repair moves after the scan that refuses' has_master_root_heal \
+  's@^  heal_cache_master_root$@@'
 
 mutate 'the shared group-writable tree returns' has_no_shared_writable_tree \
   's|chmod -R go-w,go\+rX "\$CACHE_MASTER"|chmod 2775 "$CACHE_MASTER"|'
