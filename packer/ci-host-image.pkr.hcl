@@ -661,9 +661,28 @@ build {
       # The DB cache lands under /tmp, not under root's home, so step 12 removing
       # /tmp is enough to keep a 200MB vulnerability database out of the image.
       "export GRYPE_DB_CACHE_DIR=$D/db",
+
+      # Fetch the database as its own retried step, before the scan.
+      #
+      # grype.anchore.io returned a bare EOF on 2 of the first 3 real image
+      # builds (e50aab29, 44af5f30). Left to grype's implicit auto-update that
+      # is a WARN followed, two seconds later, by `failed to load vulnerability
+      # db: database does not exist` — a fatal error 25 minutes into a build,
+      # for a network blip. Retrying here is not weakening the gate: a build
+      # that cannot reach the feed still fails, it just no longer fails on the
+      # first packet loss.
+      "for attempt in 1 2 3 4 5; do if grype db update; then break; fi; if [ \"$attempt\" = 5 ]; then echo 'grype db update failed 5 times: the feed is unreachable, not flaky' >&2; exit 1; fi; sleep $((attempt * 15)); done",
+      # Proof it is actually on disk. `db update` exits 0 when it decides no
+      # update is needed, which on a cold cache whose listing fetch failed is
+      # indistinguishable from success until the scan says otherwise.
+      "grype db status",
+
+      # The scan uses the database the retried step above proved is there,
+      # rather than reaching for the network a second time.
+      "export GRYPE_DB_AUTO_UPDATE=false",
       # No --fail-on here on purpose: grype decides what it FOUND, the verdict
       # script decides what BLOCKS. Keeping those apart is what makes the
-      # blocking rule testable off a fixture (19 of them, run in CI) instead of
+      # blocking rule testable off a fixture (28 of them, run in CI) instead of
       # only observable during a forty-minute image build.
       "grype sbom:$D/sbom.syft.json -o json --file $D/grype.json",
 
