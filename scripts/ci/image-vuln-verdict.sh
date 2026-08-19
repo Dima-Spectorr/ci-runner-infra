@@ -181,16 +181,20 @@ for m in matches:
     # "grype changed its field name" must show up as a red build rather than as
     # a silently narrower gate.
     atype = (art.get("type") or "").lower()
-    from_distro = atype == "" or atype in DISTRO_TYPES
+    # Named for what it decides, not for what it usually means: it is TRUE for a
+    # distro package AND for an artifact of unstated provenance. Reading it as
+    # "this came from the distro" would make the missing-type case look like a
+    # bug rather than the deliberate fail-closed branch it is.
+    provenance_blocks = atype == "" or atype in DISTRO_TYPES
     state = "reported"
 
-    if at_or_above and fixable and not from_distro:
+    if at_or_above and fixable and not provenance_blocks:
         # Counted separately, so "the gate found nothing" and "the gate cannot
         # speak to what it found" never render as the same line.
         state = "offdistro"
         offdistro += 1
 
-    if at_or_above and fixable and from_distro:
+    if at_or_above and fixable and provenance_blocks:
         if vid in ignores:
             expiry, reason = ignores[vid]
             # An expired ignore does not fall back to ignoring. It is its own

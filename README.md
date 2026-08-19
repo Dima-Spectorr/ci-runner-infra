@@ -174,8 +174,8 @@ an `|| true` within a month, and for anything `syft` found by reading a binary â
 the kernel image, a Go module compiled into `dockerd` â€” `grype` has no distro
 security data to consult, so it compares upstream version numbers and reports
 every backported fix as missing. The first real run of this gate produced 273
-blocking findings, all 273 of them that. They are still counted and named, as
-`off-distro`. Exceptions go in
+blocking findings, and every one of the 273 was a match of exactly that kind.
+They are still counted and named, as `off-distro`. Exceptions go in
 `docs/image-vuln-ignores.txt` and **carry an expiry date**: the day after it, the
 gate goes red and names the entry, which forces the decision again rather than
 letting the list grow quietly. A report that cannot be read, or that matched
