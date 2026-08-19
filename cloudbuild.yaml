@@ -143,6 +143,20 @@ steps:
         # whose report nobody needs, and never on the ones where the report IS
         # the output. The exit code is held and re-raised below instead.
         cd ..
+        # Packer's directory download puts the tree under its own basename, so
+        # the artifacts land in image-scan/ci-image-scan/ rather than in
+        # image-scan/. Flatten before publishing: the extra path segment reached
+        # the bucket, and `cat image-scan/verdict.txt` below found nothing on
+        # every build so far — the one line an operator reads to learn whether
+        # the image may ship was `cat: ... No such file or directory`.
+        #
+        # Guarded rather than assumed. This is packer's behaviour today, not a
+        # documented contract, and a build must not start failing because a
+        # future packer flattens it for us.
+        if [ -d image-scan/ci-image-scan ]; then
+          mv image-scan/ci-image-scan/* image-scan/ 2>/dev/null || true
+          rmdir image-scan/ci-image-scan 2>/dev/null || true
+        fi
         if [ -n "${_SBOM_BUCKET}" ]; then
           gcloud storage cp -r image-scan/* \
             "gs://${_SBOM_BUCKET}/ci-host-image/${_IMAGE_FAMILY}-${_IMAGE_VERSION}/" \
@@ -151,7 +165,11 @@ steps:
         else
           echo "WARNING: _SBOM_BUCKET is unset — the SBOM and scan report exist only in this build's workspace, which is discarded."
         fi
-        cat image-scan/verdict.txt || true
+        # `|| true` stays: the verdict is already in the packer output above and
+        # a failure to re-print it must not be what fails the build. But it is
+        # no longer silent about not finding it — that silence is what let this
+        # go unnoticed.
+        cat image-scan/verdict.txt || echo "WARNING: no verdict.txt in the workspace; the verdict is in the packer output above"
 
         exit $$rc
 
