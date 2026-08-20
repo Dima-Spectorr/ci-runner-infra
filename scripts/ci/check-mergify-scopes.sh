@@ -125,9 +125,91 @@ def workspace_packages(root):
     return found
 
 
-def fanout(root, pkgs):
-    """Transitive dependent count per package, over workspace deps only."""
+def go_modules(root):
+    """Every directory holding a go.mod, except the repository root.
+
+    A Go repository has no pnpm-workspace.yaml, so `workspace_packages` returns
+    nothing there and every coverage answer below is computed over the empty
+    set — which reports OK. That is the vacuous pass this gate exists to
+    prevent, reproduced by the gate itself. Most repositories in this fleet are
+    Go multi-module, so discovery has to see them.
+
+    The root module is excluded deliberately: it is not an area, it is the
+    thing every area is part of, and requiring a scope for it would assert the
+    opposite. A root go.mod is build config, and build config is a barrier.
+    """
+    found = {}
+    skip = {'.git', 'node_modules', 'vendor', 'testdata', '.terraform'}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        if 'go.mod' not in filenames:
+            continue
+        rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
+        if rel == '.':
+            continue
+        found[rel] = rel
+    return found
+
+
+def build_units(root):
+    """Every unit that must be scoped or barriered, with the path to probe.
+
+    The probe is the manifest, not the directory, because Mergify matches
+    scopes against CHANGED FILE PATHS. `packages/foo` is not a path any pull
+    request touches; `packages/foo/go.mod` is.
+    """
+    units = {}
+    node = workspace_packages(root)
+    if not node:
+        # No pnpm-workspace.yaml. A repository can still hold Node build units
+        # -- Print-Server has exactly one, services/admin-ui-web, with its own
+        # type-check job in CI -- and skipping them because the workspace file
+        # is absent is the same blindness in a smaller form.
+        skip = {'.git', 'node_modules', 'vendor', '.terraform'}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in skip]
+            if 'package.json' not in filenames:
+                continue
+            rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
+            if rel == '.':
+                continue
+            try:
+                nm = (json.load(open(os.path.join(dirpath, 'package.json'),
+                                     encoding='utf-8')) or {}).get('name')
+            except Exception:
+                nm = None
+            node[rel] = nm or rel
+    for rel, name in node.items():
+        units[rel] = ('node', name, rel + '/package.json')
+    for rel, name in go_modules(root).items():
+        units.setdefault(rel, ('go', name, rel + '/go.mod'))
+    return units
+
+
+def has_any_manifest(root):
+    """Does this tree contain a build manifest anywhere at all?
+
+    Distinguishes "a repository with no build units" (legitimately nothing to
+    cover) from "discovery is blind here" (a green light over nothing). Only
+    the second is a defect, and only this tells them apart.
+    """
+    skip = {'.git', 'node_modules', 'vendor', '.terraform'}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        if 'go.mod' in filenames or 'package.json' in filenames:
+            return True
+    return False
+
+
+def fanout(root, units):
+    """Transitive dependent count per package, over workspace deps only.
+
+    Node-only: the dependency edges are read out of package.json. Go modules
+    are reported without a fan-out number rather than with a wrong one.
+    """
     import collections
+    pkgs = dict((rel, name) for rel, (kind, name, _p) in units.items()
+                if kind == 'node')
     meta = {}
     for rel, name in pkgs.items():
         try:
@@ -206,16 +288,26 @@ if not isinstance(doc, dict):
 mq = doc.get('merge_queue') or {}
 scopes = doc.get('scopes') or {}
 files = ((scopes.get('source') or {}).get('files')) or {}
-barriers = ((scopes.get('barrier_files') or {}).get('include')) or []
+barrier_files = scopes.get('barrier_files') or {}
+barriers = barrier_files.get('include') or []
+# Mergify's file filter is include-minus-exclude, and reading only `include`
+# turns the fail-safe catch-all barrier — `include: ["**/*"]` with the scoped
+# areas excluded — into a claim that EVERY path is barriered. Coverage would
+# then pass unconditionally, which is worse than no gate: it reads as green.
+barrier_excludes = barrier_files.get('exclude') or []
+
+
+def is_barriered(probe):
+    return matches(barriers, probe) and not matches(barrier_excludes, probe)
 queue_mode = mq.get('mode', 'serial')
 width = mq.get('max_parallel_checks')
 
-pkgs = workspace_packages(root)
+units = build_units(root)
 
 if mode == '--fanout':
-    tot = len(pkgs)
-    print("workspace packages: %d" % tot)
-    for count, rel, name in fanout(root, pkgs):
+    tot = len(units)
+    print("build units: %d" % tot)
+    for count, rel, name in fanout(root, units):
         if tot and count * 100 // tot >= 5:
             print("%6d %4d%%  %-50s (%s)" % (count, 100 * count // tot, rel, name))
     sys.exit(0)
@@ -260,9 +352,9 @@ if queue_mode == 'parallel' and not barriers:
 # CHECK 4 — coverage is total.
 checks.append('coverage')
 uncovered = []
-for rel in sorted(pkgs):
-    probe = rel + '/package.json'
-    if matches(barriers, probe):
+for rel in sorted(units):
+    _kind, _name, probe = units[rel]
+    if is_barriered(probe):
         continue
     hit = False
     for _sname, sdef in (files or {}).items():
@@ -274,7 +366,7 @@ for rel in sorted(pkgs):
         uncovered.append(rel)
 if uncovered and queue_mode == 'parallel':
     fail('coverage',
-         "%d workspace package(s) match no scope and no barrier. In parallel mode "
+         "%d build unit(s) match no scope and no barrier. In parallel mode "
          "an unscoped pull request carries the empty scope set and runs "
          "concurrently with EVERYTHING. Add each to a scope in .mergify.yml, or "
          "to barrier_files if it is build/toolchain/wide-fan-out:\n  %s"
@@ -318,12 +410,31 @@ if mqs in files:
          "scopes.merge_queue_scope=%r is also a declared scope; Mergify's own "
          "drafts would then overlap that area's pull requests." % (mqs,))
 
+# CHECK 8 — discovery actually found something.
+#
+# Every answer above is computed over the discovered set, so a discovery that
+# returns nothing reports OK no matter what the configuration says. That is not
+# a hypothetical: this gate read only pnpm-workspace.yaml, and in a Go
+# multi-module repository it found zero units and printed
+# `OK: 0 workspace packages, all scoped or barriered`. A gate that cannot see
+# the repository must say so in red, not pass quietly.
+checks.append('discovery-non-vacuous')
+if not units and has_any_manifest(root):
+    fail('discovery-non-vacuous',
+         "no build units were discovered, but this tree contains go.mod or "
+         "package.json files. Every coverage answer above was computed over the "
+         "empty set and is therefore vacuous. Teach workspace_packages/go_modules "
+         "this repository's layout before trusting a pass here.")
+
 print("checks run: %s" % ",".join(checks))
 if errors:
     print("FAILED: %s" % ",".join(sorted(set(errors))))
     sys.exit(1)
-print("OK: %d workspace packages, all scoped or barriered; mode=%s width=%s"
-      % (len(pkgs), queue_mode, width))
+print("OK: %d build units (%d node, %d go), all scoped or barriered; mode=%s width=%s"
+      % (len(units),
+         sum(1 for v in units.values() if v[0] == 'node'),
+         sum(1 for v in units.values() if v[0] == 'go'),
+         queue_mode, width))
 PYEOF
 }
 
@@ -542,6 +653,126 @@ scopes:
           - apps/alpha/**
 '
   expect "barrier counts as coverage" "$tmp/barrier-covers" ""
+
+  # --- the three detectors added when the gate met its first Go repository ---
+
+  # A catch-all barrier must not swallow coverage. `include: ["**/*"]` with the
+  # scoped areas excluded is the FAIL-SAFE construction — an unclassified path
+  # becomes a barrier instead of becoming unscoped-and-maximally-parallel — but
+  # a reader that ignores `exclude` sees it as "everything is barriered" and
+  # then passes unconditionally. Here `apps/beta` is excluded from the barrier
+  # AND named by no scope, so it is genuinely uncovered and must be reported.
+  make_fixture "$tmp/catchall-exclude" 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - apps/alpha/**
+      - apps/beta/**
+  source:
+    files:
+      a:
+        include:
+          - apps/alpha/**
+'
+  expect "catch-all barrier honours exclude" "$tmp/catchall-exclude" "coverage"
+
+  # The same construction, correctly maintained: every excluded pattern is a
+  # pattern some scope includes. Nothing is uncovered.
+  make_fixture "$tmp/catchall-ok" 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - apps/alpha/**
+      - apps/beta/**
+  source:
+    files:
+      a:
+        include:
+          - apps/alpha/**
+      b:
+        include:
+          - apps/beta/**
+'
+  expect "catch-all barrier with total coverage" "$tmp/catchall-ok" ""
+
+  # Go modules are build units. Without this the gate reads a Go repository as
+  # empty and reports OK over an entirely unscoped tree.
+  mkdir -p "$tmp/go-repo/services/alpha" "$tmp/go-repo/services/beta"
+  printf 'module x/alpha
+' > "$tmp/go-repo/services/alpha/go.mod"
+  printf 'module x/beta
+'  > "$tmp/go-repo/services/beta/go.mod"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - services/alpha/**
+  source:
+    files:
+      a:
+        include:
+          - services/alpha/**
+' > "$tmp/go-repo/.mergify.yml"
+  expect "go modules are discovered and covered" "$tmp/go-repo" ""
+
+  # ... and are reported when they are NOT covered: beta is excluded from the
+  # barrier and named by no scope.
+  mkdir -p "$tmp/go-uncovered/services/alpha" "$tmp/go-uncovered/services/beta"
+  printf 'module x/alpha
+' > "$tmp/go-uncovered/services/alpha/go.mod"
+  printf 'module x/beta
+'  > "$tmp/go-uncovered/services/beta/go.mod"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - services/alpha/**
+      - services/beta/**
+  source:
+    files:
+      a:
+        include:
+          - services/alpha/**
+' > "$tmp/go-uncovered/.mergify.yml"
+  expect "uncovered go module is reported" "$tmp/go-uncovered" "coverage"
+
+  # Blind discovery must be red, not quiet. A manifest exists but sits where
+  # discovery does not look, so every coverage answer is computed over the
+  # empty set. Reporting OK there is how this gate passed a wholly unscoped
+  # Go repository before CHECK 8 existed.
+  mkdir -p "$tmp/vacuous/nested"
+  printf 'module x/root
+' > "$tmp/vacuous/nested/go.mod"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+  source:
+    files:
+      a:
+        include:
+          - nested/**
+' > "$tmp/vacuous/.mergify.yml"
+  expect "discovery sees a nested go module" "$tmp/vacuous" ""
 
   if [ "$failed" -ne 0 ]; then
     echo "check-mergify-scopes: SELF-TEST FAILED" >&2
