@@ -901,10 +901,10 @@ behaves that a consuming repository needs to know before copying it in:
   A **root** manifest is never a unit — a root `go.mod`, root `pom.xml` or root
   `requirements.txt` is not an area, it is what every area is part of, so it
   belongs in the barrier. **The vacuity check follows the same rule** (fixed
-  2026-08-21): counting a root manifest there while discovery refuses to made an
-  ordinary single-package repository — one root `pom.xml`, one root Dockerfile —
-  fail CHECK 8 with a correct catch-all barrier in place and no way to satisfy
-  the message. Unsatisfiable red is how a real detector gets weakened to quieten
+  2026-08-21): when the vacuity check counted a root manifest that discovery
+  refuses to count, an ordinary single-package repository — one root `pom.xml`,
+  one root Dockerfile — failed CHECK 8 with a correct catch-all barrier in
+  place and no way to satisfy the message. Unsatisfiable red is how a real detector gets weakened to quieten
   it. What the root actually requires is asserted positively instead, in two
   checks that are deliberately separate:
 

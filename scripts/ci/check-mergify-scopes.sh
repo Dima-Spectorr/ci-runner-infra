@@ -317,6 +317,11 @@ def gradle_modules(root):
 GRADLE_INCLUDE_PAREN_RE = re.compile(r'''\binclude\s*\(([^)]*)\)''', re.S)
 GRADLE_INCLUDE_BARE_RE = re.compile(r'''^[^\S\n]*include[^\S\n]+(['"][^\n]*)''', re.M)
 GRADLE_PROJECT_RE = re.compile(r'''['"]:?([A-Za-z0-9_.\-:]+)['"]''')
+# `//` and `#` line comments, and `/* */` blocks. Deliberately crude: a `//`
+# inside a string literal in a settings file is not a shape worth carrying a
+# tokenizer for, and the cost of being wrong is one extra unit to scope.
+GRADLE_COMMENT_RE = re.compile(r'''/\*.*?\*/|//[^\n]*|^[^\S\n]*#[^\n]*''',
+                               re.S | re.M)
 
 # Reading a settings file must not fail open. An unreadable one yields "no
 # extra subprojects", which is indistinguishable from "there are none" — and if
@@ -350,6 +355,10 @@ def gradle_settings_projects(root):
         except Exception as exc:
             gradle_settings_unreadable.append("%s (%s)" % (fname, exc))
             continue
+        # Matching across lines means a commented-out `include(":old")` — the
+        # usual way a module is retired — would otherwise resurrect it as a unit
+        # and demand a scope for a directory that may not even exist any more.
+        text = GRADLE_COMMENT_RE.sub('', text)
         args = ([m.group(1) for m in GRADLE_INCLUDE_PAREN_RE.finditer(text)]
                 + [m.group(1) for m in GRADLE_INCLUDE_BARE_RE.finditer(text)])
         for chunk in args:
@@ -697,8 +706,10 @@ if not units and has_any_manifest(root):
 #
 # The root is exempt from being a UNIT, not from being covered, and that
 # distinction is the whole point: a root pom.xml, settings.gradle,
-# pnpm-workspace.yaml or lockfile is what every area is part of, so a change to
-# one can alter every module's build. Left out of the barrier it matches
+# pnpm-workspace.yaml is what every area is part of, so a change to one can
+# alter every module's build. (Lockfiles are not listed here: they belong in the
+# barrier for the same reason, but they are not a build DECLARATION and this
+# check is deliberately about the files discovery itself reads.) Left out of the barrier it matches
 # nothing, carries the empty scope set, and in parallel mode is tested beside
 # the very builds it just changed.
 #
@@ -728,8 +739,17 @@ if queue_mode == 'parallel':
 # only here, the sweep is over FILES: a root-only build is small by definition,
 # and a sampled answer would be exactly the partial coverage this gate exists to
 # refuse.
+#
+# It runs only when a ROOT MANIFEST exists. No units and no manifest anywhere is
+# a repository with no build at all — a docs or Terraform tree — and sweeping
+# every file there would demand a scope map for prose. Absence of sub-units is
+# not by itself evidence of a root build.
+#
+# Build outputs are skipped along with the vendored directories. They are not
+# paths a pull request touches, and a tracked artifact under `dist/` is a
+# problem of a different kind than this check reports.
 checks.append('root-build-covered')
-if queue_mode == 'parallel' and not units:
+if queue_mode == 'parallel' and not units and root_manifests(root):
     naked = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames
@@ -1507,6 +1527,55 @@ scopes:
 ' > "$tmp/root-src/.mergify.yml"
   expect "root-only build with unscoped sources is reported" "$tmp/root-src" \
          "root-build-covered"
+
+  # A commented-out include stays retired. Matching across lines costs the
+  # anchor that used to make this impossible, so `:app:gone` — whose directory
+  # is still on disk, unscoped and barrier-excluded — would come back as a unit
+  # and demand a scope for a module nobody builds.
+  mkdir -p "$tmp/gradle-commented/app/alpha" "$tmp/gradle-commented/app/gone"
+  printf 'plugins {}' > "$tmp/gradle-commented/app/alpha/build.gradle.kts"
+  printf 'rootProject.name = "x"\n// include(":app:gone")\n/* include(":app:gone") */\ninclude(":app:alpha")\n' \
+    > "$tmp/gradle-commented/settings.gradle.kts"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "*"
+      - "**/*"
+    exclude:
+      - app/alpha/**
+      - app/gone/**
+  source:
+    files:
+      a:
+        include:
+          - app/alpha/**
+' > "$tmp/gradle-commented/.mergify.yml"
+  expect "commented-out gradle include stays retired" "$tmp/gradle-commented" ""
+
+  # No units and no root manifest is a repository with no build at all — a docs
+  # or Terraform tree. CHECK 10 must not sweep its files and demand a scope map
+  # for prose: absence of sub-units is not evidence of a root build.
+  mkdir -p "$tmp/no-build/docs"
+  printf '# hello\n' > "$tmp/no-build/docs/readme.md"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "*"
+    exclude:
+      - docs/**
+  source:
+    files:
+      a:
+        include:
+          - apps/**
+' > "$tmp/no-build/.mergify.yml"
+  expect "repository with no build at all passes" "$tmp/no-build" ""
 
   # An unreadable settings.gradle fails closed rather than reporting "no extra
   # subprojects", which is what silently skipping the project list looks like.
