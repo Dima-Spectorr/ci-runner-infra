@@ -47,7 +47,16 @@
 # =============================================================================
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# WHERE THE REPOSITORY ROOT IS, ASKED RATHER THAN COUNTED. Guessing `../..` from
+# the script's own location assumes every repository vendors this at
+# `scripts/ci/`, and Borsh-Tablet-App keeps its gates in `ci/` — there the guess
+# lands one directory ABOVE the checkout, the config is not found, and the gate
+# fails with a path error rather than an answer. Ask git, and keep the guess as
+# the fallback for a tarball or a submodule with no work tree.
+REPO_ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$REPO_ROOT" ] || [ ! -f "$REPO_ROOT/.mergify.yml" ]; then
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fi
 
 # Pick an interpreter that can actually import yaml. `actions/setup-python`
 # prepends a Python that does not carry the image's python3-yaml, so a workflow
@@ -159,6 +168,143 @@ def go_modules(root):
     return found
 
 
+def maven_modules(root):
+    """Every directory holding a pom.xml, except the repository root.
+
+    Same blindness as the Go case, in the third language on this fleet:
+    SOAP-To-REST builds its admin-api, runtime, worker and four cloud adapters
+    with Maven, and none of them carries a package.json or a go.mod. Without
+    this, discovery there sees one Node package and three Go modules, reports
+    OK, and says nothing about the seven Java modules it never opened — a pass
+    computed over a fraction of the repository, which is the failure mode CHECK
+    8 catches only when the fraction is ZERO.
+
+    An aggregator pom (one whose directory is the parent of other modules) is
+    NOT special-cased away. It is a real file a pull request can touch, and
+    touching it affects every module beneath it, so it must be scoped or — the
+    usual answer — left to the catch-all barrier.
+    """
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and d != 'target']
+        if 'pom.xml' not in filenames:
+            continue
+        rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
+        if rel == '.':
+            continue
+        found[rel] = rel
+    return found
+
+
+PYTHON_MANIFESTS = ('pyproject.toml', 'setup.py', 'Pipfile')
+PYTHON_SKIP_DIRS = ('.venv', 'venv', '__pycache__', 'site-packages')
+
+
+def is_python_manifest(name):
+    """A Python manifest, INCLUDING the requirements-<flavour>.txt spellings.
+
+    Matching the bare `requirements.txt` alone was a near-miss of exactly the
+    kind this gate exists to catch: one repository on this fleet pins its
+    dependencies in `app/requirements-gpu.txt`, so an exact-name test found
+    nothing there, and
+    "no build units" over a repository of three deployable services reads as a
+    legitimate answer rather than as a blind spot. `requirements-dev.txt` and
+    friends are the same file for this purpose — evidence that a directory is a
+    Python build unit.
+    """
+    return (name in PYTHON_MANIFESTS
+            or (name.startswith('requirements') and name.endswith('.txt')))
+
+
+def docker_units(root):
+    """Every directory holding a Dockerfile, except the repository root.
+
+    The language-agnostic backstop, and the one that answers a container-only
+    repository: three separately built and separately deployed images under one
+    `app/` tree, where the ONLY file that says so is a
+    Dockerfile — there is no pyproject, no go.mod, nothing else to find. On this
+    fleet the OCI image is the deployable unit by policy, so a directory that
+    builds one is a build unit whatever language is inside it.
+
+    `Dockerfile.gpu`, `Dockerfile.cpu`, `Dockerfile.sweeper` all count: a
+    per-flavour suffix names a variant of the same unit, not a different place.
+    """
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        present = sorted(f for f in filenames if is_dockerfile(f))
+        if not present:
+            continue
+        rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
+        if rel == '.':
+            continue
+        found[rel] = present[0]
+    return found
+
+
+def is_dockerfile(name):
+    return name == 'Dockerfile' or name.startswith('Dockerfile.')
+
+
+def python_units(root):
+    """Every directory holding a Python manifest, except the repository root.
+
+    The fifth language, and the one where "no build units" is most convincing:
+    two repositories on this fleet are Python end to end, so before this the
+    gate found nothing, `has_any_manifest` agreed there was nothing, and CHECK 8
+    stayed quiet — a legitimate-looking "this repository has no build units to
+    cover" over repositories that plainly do.
+
+    A ROOT manifest is excluded for the same reason a root go.mod is: it is not
+    an area, it is what every area is part of, so it belongs in the barrier.
+    """
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in SKIP_DIRS and d not in PYTHON_SKIP_DIRS]
+        present = sorted(f for f in filenames if is_python_manifest(f))
+        if not present:
+            continue
+        rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
+        if rel == '.':
+            continue
+        found[rel] = present[0]
+    return found
+
+
+GRADLE_BUILD_FILES = ('build.gradle', 'build.gradle.kts')
+
+
+def gradle_modules(root):
+    """Every directory holding a build.gradle[.kts], except the repository root.
+
+    The fourth language on this fleet, and the one where blindness is total
+    rather than partial: Borsh-Tablet-App is Gradle end to end, with no
+    package.json, go.mod or pom.xml anywhere, so before this the gate found ZERO
+    units there — and `has_any_manifest` did not know about Gradle either, so
+    even CHECK 8 stayed quiet. Two blind spots that cancel out produce a green
+    light over a wholly unscoped repository, which is the exact failure this
+    file exists to prevent.
+
+    `settings.gradle[.kts]` marks the build root and is intentionally NOT a
+    unit: like a root go.mod, it is not an area, it is the thing every area is
+    part of, and it belongs in the barrier.
+    """
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and d != 'build']
+        if not any(f in filenames for f in GRADLE_BUILD_FILES):
+            continue
+        rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
+        if rel == '.':
+            continue
+        # Probe the file that actually exists, not a canonical name: the probe
+        # is matched against scope globs, and a scope that names
+        # `app/build.gradle.kts` would not match an invented `app/build.gradle`.
+        found[rel] = next(f for f in GRADLE_BUILD_FILES if f in filenames)
+    return found
+
+
 def build_units(root):
     """Every unit that must be scoped or barriered, with the path to probe.
 
@@ -190,6 +336,16 @@ def build_units(root):
         units[rel] = ('node', name, rel + '/package.json')
     for rel, name in go_modules(root).items():
         units.setdefault(rel, ('go', name, rel + '/go.mod'))
+    for rel, name in maven_modules(root).items():
+        units.setdefault(rel, ('maven', name, rel + '/pom.xml'))
+    for rel, fname in gradle_modules(root).items():
+        units.setdefault(rel, ('gradle', rel, rel + '/' + fname))
+    for rel, fname in python_units(root).items():
+        units.setdefault(rel, ('python', rel, rel + '/' + fname))
+    # LAST, so a directory a real toolchain already claimed keeps that kind: the
+    # Dockerfile is the backstop, not a competing answer.
+    for rel, fname in docker_units(root).items():
+        units.setdefault(rel, ('docker', rel, rel + '/' + fname))
     return units
 
 
@@ -202,7 +358,11 @@ def has_any_manifest(root):
     """
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        if 'go.mod' in filenames or 'package.json' in filenames:
+        if 'go.mod' in filenames or 'package.json' in filenames \
+                or 'pom.xml' in filenames \
+                or any(f in filenames for f in GRADLE_BUILD_FILES) \
+                or any(is_python_manifest(f) for f in filenames) \
+                or any(is_dockerfile(f) for f in filenames):
             return True
     return False
 
@@ -427,19 +587,25 @@ if mqs in files:
 checks.append('discovery-non-vacuous')
 if not units and has_any_manifest(root):
     fail('discovery-non-vacuous',
-         "no build units were discovered, but this tree contains go.mod or "
-         "package.json files. Every coverage answer above was computed over the "
-         "empty set and is therefore vacuous. Teach workspace_packages/go_modules "
-         "this repository's layout before trusting a pass here.")
+         "no build units were discovered, but this tree contains go.mod, "
+         "package.json, pom.xml, build.gradle, a Python manifest "
+         "(pyproject.toml / setup.py / requirements*.txt) or a Dockerfile. "
+         "Every coverage answer "
+         "above was computed over the empty set and is therefore vacuous. Teach "
+         "discovery (workspace_packages / go_modules / maven_modules / "
+         "gradle_modules / python_units / docker_units) this repository's "
+         "layout before "
+         "trusting a pass here.")
 
 print("checks run: %s" % ",".join(checks))
 if errors:
     print("FAILED: %s" % ",".join(sorted(set(errors))))
     sys.exit(1)
-print("OK: %d build units (%d node, %d go), all scoped or barriered; mode=%s width=%s"
+kinds = ('node', 'go', 'maven', 'gradle', 'python', 'docker')
+print("OK: %d build units (%s), all scoped or barriered; mode=%s width=%s"
       % (len(units),
-         sum(1 for v in units.values() if v[0] == 'node'),
-         sum(1 for v in units.values() if v[0] == 'go'),
+         ", ".join("%d %s" % (sum(1 for v in units.values() if v[0] == k), k)
+                   for k in kinds),
          queue_mode, width))
 PYEOF
 }
@@ -757,6 +923,238 @@ scopes:
           - services/alpha/**
 ' > "$tmp/go-uncovered/.mergify.yml"
   expect "uncovered go module is reported" "$tmp/go-uncovered" "coverage"
+
+  # Maven modules, the third language on this fleet. SOAP-To-REST's services
+  # carry neither a package.json nor a go.mod, so before pom.xml discovery the
+  # gate there saw a handful of Go and Node units, reported OK, and never opened
+  # the seven Java modules that are most of the repository. CHECK 8 could not
+  # catch it: discovery was not empty, only partial.
+  #
+  # `target/` is excluded from the walk for the same reason `node_modules` is —
+  # a build directory can hold a copied pom.xml, and a unit that exists only
+  # after a build is not a path a pull request touches.
+  mkdir -p "$tmp/mvn-repo/services/alpha" "$tmp/mvn-repo/services/beta" \
+           "$tmp/mvn-repo/services/alpha/target/classes"
+  printf '<project/>' > "$tmp/mvn-repo/services/alpha/pom.xml"
+  printf '<project/>' > "$tmp/mvn-repo/services/beta/pom.xml"
+  printf '<project/>' > "$tmp/mvn-repo/services/alpha/target/classes/pom.xml"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - services/alpha/**
+  source:
+    files:
+      a:
+        include:
+          - services/alpha/**
+' > "$tmp/mvn-repo/.mergify.yml"
+  expect "maven modules are discovered and covered" "$tmp/mvn-repo" ""
+
+  # ... and reported when uncovered, the direction that matters: without this
+  # the fixture above would also pass with discovery deleted.
+  mkdir -p "$tmp/mvn-uncovered/services/alpha" "$tmp/mvn-uncovered/services/beta"
+  printf '<project/>' > "$tmp/mvn-uncovered/services/alpha/pom.xml"
+  printf '<project/>' > "$tmp/mvn-uncovered/services/beta/pom.xml"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - services/alpha/**
+      - services/beta/**
+  source:
+    files:
+      a:
+        include:
+          - services/alpha/**
+' > "$tmp/mvn-uncovered/.mergify.yml"
+  expect "uncovered maven module is reported" "$tmp/mvn-uncovered" "coverage"
+
+  # Gradle, the fourth language — and the case where the two blind spots
+  # cancelled out. Borsh-Tablet-App carries no package.json, go.mod or pom.xml
+  # anywhere, so discovery found zero units AND `has_any_manifest` saw no
+  # manifest, which meant CHECK 8 stayed quiet too: a green light over a wholly
+  # unscoped repository. Both halves are fixed, and this fixture is the one that
+  # would go red if either regressed.
+  #
+  # `settings.gradle.kts` marks the build root and must NOT become a unit; the
+  # root of a build is not an area, it is what every area belongs to.
+  mkdir -p "$tmp/gradle-repo/app/alpha" "$tmp/gradle-repo/app/beta" \
+           "$tmp/gradle-repo/app/alpha/build/tmp"
+  printf 'rootProject.name = "x"' > "$tmp/gradle-repo/settings.gradle.kts"
+  printf 'plugins {}' > "$tmp/gradle-repo/app/alpha/build.gradle.kts"
+  printf 'plugins {}' > "$tmp/gradle-repo/app/beta/build.gradle"
+  printf 'plugins {}' > "$tmp/gradle-repo/app/alpha/build/tmp/build.gradle.kts"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - app/alpha/**
+  source:
+    files:
+      a:
+        include:
+          - app/alpha/**
+' > "$tmp/gradle-repo/.mergify.yml"
+  expect "gradle modules are discovered and covered" "$tmp/gradle-repo" ""
+
+  # The direction that proves discovery ran at all.
+  mkdir -p "$tmp/gradle-uncovered/app/alpha" "$tmp/gradle-uncovered/app/beta"
+  printf 'plugins {}' > "$tmp/gradle-uncovered/app/alpha/build.gradle.kts"
+  printf 'plugins {}' > "$tmp/gradle-uncovered/app/beta/build.gradle.kts"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - app/alpha/**
+      - app/beta/**
+  source:
+    files:
+      a:
+        include:
+          - app/alpha/**
+' > "$tmp/gradle-uncovered/.mergify.yml"
+  expect "uncovered gradle module is reported" "$tmp/gradle-uncovered" "coverage"
+
+  # A Gradle-only tree with NOTHING scoped must be red, not quiet. This is the
+  # literal pre-fix Borsh-Tablet-App shape: parallel mode, no scopes at all.
+  mkdir -p "$tmp/gradle-blind/app/alpha"
+  printf 'plugins {}' > "$tmp/gradle-blind/app/alpha/build.gradle.kts"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+' > "$tmp/gradle-blind/.mergify.yml"
+  # All three fire, and the third is the one this fixture is really about:
+  # `coverage` naming `app/alpha` proves discovery SAW the module. Without
+  # Gradle discovery the first two would still fire and the fixture would look
+  # like it was testing something.
+  expect "gradle repo with no scopes at all is reported" "$tmp/gradle-blind" \
+         "coverage,parallel-needs-barriers,parallel-needs-scopes"
+
+  # Python, the fifth language, and the one where "this repository has no build
+  # units" reads most convincingly: two repositories on this fleet are Python
+  # end to end and carry no package.json, go.mod, pom.xml or build.gradle
+  # anywhere, so before
+  # this discovery found nothing AND `has_any_manifest` agreed there was
+  # nothing to find — the same both-halves-blind shape Gradle had.
+  #
+  # A virtualenv is skipped: `.venv/**` is thousands of vendored manifests, and
+  # a scope map is not expected to name any of them.
+  mkdir -p "$tmp/py-repo/svc/alpha" "$tmp/py-repo/svc/beta" \
+           "$tmp/py-repo/.venv/lib/site-packages/thing"
+  printf 'requests\n' > "$tmp/py-repo/requirements.txt"
+  printf '[project]\nname = "alpha"\n' > "$tmp/py-repo/svc/alpha/pyproject.toml"
+  printf 'from setuptools import setup\n' > "$tmp/py-repo/svc/beta/setup.py"
+  printf 'x\n' > "$tmp/py-repo/.venv/lib/site-packages/thing/requirements.txt"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - svc/alpha/**
+  source:
+    files:
+      a:
+        include:
+          - svc/alpha/**
+' > "$tmp/py-repo/.mergify.yml"
+  # The ROOT requirements.txt is deliberately not a unit — like a root go.mod it
+  # is not an area, it is what every area is part of — so it must not show up as
+  # an uncovered `.`, and `svc/beta` must be barriered rather than invisible.
+  expect "python units are discovered and covered" "$tmp/py-repo" ""
+
+  # The direction that proves Python discovery ran at all.
+  mkdir -p "$tmp/py-uncovered/svc/alpha" "$tmp/py-uncovered/svc/beta"
+  printf '[project]\nname = "alpha"\n' > "$tmp/py-uncovered/svc/alpha/pyproject.toml"
+  printf '[project]\nname = "beta"\n' > "$tmp/py-uncovered/svc/beta/pyproject.toml"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - svc/alpha/**
+      - svc/beta/**
+  source:
+    files:
+      a:
+        include:
+          - svc/alpha/**
+' > "$tmp/py-uncovered/.mergify.yml"
+  expect "uncovered python unit is reported" "$tmp/py-uncovered" "coverage"
+
+  # The language-agnostic backstop, and the shape that motivated it. In
+  # a container-only repository, `app/merge` and `app/sweeper` are separately
+  # built and separately deployed images whose ONLY declaration is a Dockerfile —
+  # there is no pyproject, no go.mod, no package.json anywhere in the tree — and
+  # `app/` pins its dependencies in `requirements-gpu.txt`, which an exact-name
+  # `requirements.txt` test does not match. Both halves are asserted here: a
+  # flavoured requirements file IS a manifest, and a Dockerfile IS a build unit.
+  mkdir -p "$tmp/docker-repo/app/merge" "$tmp/docker-repo/app/sweeper"
+  printf 'torch\n' > "$tmp/docker-repo/app/requirements-gpu.txt"
+  printf 'FROM scratch\n' > "$tmp/docker-repo/app/Dockerfile.gpu"
+  printf 'FROM scratch\n' > "$tmp/docker-repo/app/merge/Dockerfile.cpu"
+  printf 'FROM scratch\n' > "$tmp/docker-repo/app/sweeper/Dockerfile"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - app/sweeper/**
+  source:
+    files:
+      s:
+        include:
+          - app/sweeper/**
+' > "$tmp/docker-repo/.mergify.yml"
+  expect "dockerfile-only units are discovered and covered" "$tmp/docker-repo" ""
+
+  # The direction that proves it ran: drop the barrier's catch-all so the two
+  # Dockerfile-only directories are neither scoped nor barriered.
+  mkdir -p "$tmp/docker-uncovered/svc/alpha" "$tmp/docker-uncovered/svc/beta"
+  printf 'FROM scratch\n' > "$tmp/docker-uncovered/svc/alpha/Dockerfile"
+  printf 'FROM scratch\n' > "$tmp/docker-uncovered/svc/beta/Dockerfile"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - svc/alpha/**
+      - svc/beta/**
+  source:
+    files:
+      a:
+        include:
+          - svc/alpha/**
+' > "$tmp/docker-uncovered/.mergify.yml"
+  expect "uncovered dockerfile unit is reported" "$tmp/docker-uncovered" "coverage"
 
   # Blind discovery must be red, not quiet. A manifest exists but sits where
   # discovery does not look, so every coverage answer is computed over the
