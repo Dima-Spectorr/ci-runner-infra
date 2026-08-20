@@ -117,17 +117,23 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # another concurrent CI run, while each extra pull request in a batch rides a
 # run already happening.
 #
-#   MPC_MAX   costs runners, LINEARLY, from a pool SHARED with every other
-#             repository. Raising it is a fleet-level change: recompute
-#             `Σ(max_parallel_checks × peak runners per run) <= runners ONLINE`
-#             in the same pull request, and online is not the autoscaler
-#             ceiling — the MIG is opportunistic and scale-up lags a burst.
+#   MPC_MAX   costs runners, LINEARLY, from THIS repository's own pool.
+#             Recompute `max_parallel_checks × peak runners per run` against
+#             that pool's ceiling in the same pull request, and take the
+#             ceiling from Terraform — `slots_per_host × max_hosts` in the
+#             pool's `.tfvars` — never from a live runner count. Every pool in
+#             the fleet runs `min_hosts = 0`, so an idle pool has deregistered
+#             every agent and GitHub reports zero runners for a pool that is
+#             fully provisioned. A survey that read that zero on 2026-08-19
+#             concluded eleven repositories had no self-hosted runners; ten of
+#             them do.
 #   BATCH_MAX costs no runners at all. It is bounded by the BISECT: isolating
 #             one culprit from N takes ceil(log2(N)) further draft runs, which
 #             every pull request in the batch waits through.
 #
-# Wanting more throughput is an argument for BATCH_MAX. It is never an argument
-# for MPC_MAX.
+# Wanting more throughput is an argument for BATCH_MAX — or, since 2026-08-19
+# and for free, for `merge_queue.mode: parallel` with a covering scope map,
+# which adds no drafts at all. It is never an argument for MPC_MAX.
 MPC_MAX=1
 BATCH_MAX=1
 # =============================================================================
@@ -1175,7 +1181,7 @@ scan_file() {
     elif [ "$mpc" -lt 1 ]; then
       err CHECK1 "\`merge_queue.max_parallel_checks\` is \`$mpc\`. The smallest legal width is 1."
     elif [ "$mpc" -gt "$MPC_MAX" ]; then
-      err CHECK1 "\`merge_queue.max_parallel_checks\` is \`$mpc\`, above this repository's ceiling of $MPC_MAX. Above 1, Mergify stops checking in place and validates on throwaway \`mergify/merge-queue/<sha>\` branches — a second CI run — and the width is how many of those run AT ONCE, so it multiplies the runners drawn from a pool shared with every other repository on the fleet. If the intent is more throughput, raise \`batch_size\` instead: a batch is validated by ONE draft run whatever its size, so batching buys throughput for no extra runners while the width costs a full concurrent run each. Raising \`MPC_MAX\` in this script is a fleet-capacity decision — recompute \`Σ(max_parallel_checks × peak runners per run)\` against runners ONLINE, in the same pull request."
+      err CHECK1 "\`merge_queue.max_parallel_checks\` is \`$mpc\`, above this repository's ceiling of $MPC_MAX. Above 1, Mergify stops checking in place and validates on throwaway \`mergify/merge-queue/<sha>\` branches — a second CI run — and the width is how many of those run AT ONCE, so it multiplies the runners drawn from a pool shared with every other repository on the fleet. If the intent is more throughput, raise \`batch_size\` instead: a batch is validated by ONE draft run whatever its size, so batching buys throughput for no extra runners while the width costs a full concurrent run each. If the intent is throughput rather than capacity, \`merge_queue.mode: parallel\` with a covering scope map buys it for NO extra runners — the width is still the ceiling; the mode only changes which entries may hold those slots. Raising \`MPC_MAX\` in this script is a capacity decision — show \`max_parallel_checks × peak runners per run\` against this repository's own pool ceiling (\`slots_per_host × max_hosts\` from its Terraform, never a live runner count: every pool scales to zero and reports zero while idle) in the same pull request."
     fi
   fi
 
