@@ -288,7 +288,8 @@ def gradle_modules(root):
 
     `settings.gradle[.kts]` marks the build root and is intentionally NOT a
     unit: like a root go.mod, it is not an area, it is the thing every area is
-    part of, and it belongs in the barrier.
+    part of, and it belongs in the barrier. It is still READ, though — see
+    `gradle_settings_projects`.
     """
     found = {}
     for dirpath, dirnames, filenames in os.walk(root):
@@ -302,7 +303,48 @@ def gradle_modules(root):
         # is matched against scope globs, and a scope that names
         # `app/build.gradle.kts` would not match an invented `app/build.gradle`.
         found[rel] = next(f for f in GRADLE_BUILD_FILES if f in filenames)
+    for rel in gradle_settings_projects(root):
+        found.setdefault(rel, 'build.gradle.kts')
     return found
+
+
+GRADLE_INCLUDE_RE = re.compile(r'''^\s*include\s*\(?\s*(?P<args>['"].*)''')
+GRADLE_PROJECT_RE = re.compile(r'''['"]:?([A-Za-z0-9_.\-:]+)['"]''')
+
+
+def gradle_settings_projects(root):
+    """Subprojects that only `settings.gradle[.kts]` declares.
+
+    A directory is a Gradle module because the settings file `include`s it, not
+    because it happens to hold a build file: a subproject configured entirely
+    from the root build (`subprojects { }`, a convention plugin) is a real,
+    separately buildable area with no `build.gradle` of its own. Walking for
+    build files alone therefore misses it — and misses it SILENTLY, because any
+    sibling that does have one keeps CHECK 8 quiet. Partial discovery is this
+    gate's characteristic failure, so the declaration is read, not inferred.
+
+    The probe is synthetic (`<dir>/build.gradle.kts`), and that is sound for
+    what the probe is for: it stands in for "a change under this subproject",
+    and every scope that claims a subproject claims it as `<dir>/**`.
+    """
+    names = set()
+    for fname in ('settings.gradle.kts', 'settings.gradle'):
+        path = os.path.join(root, fname)
+        if not os.path.exists(path):
+            continue
+        try:
+            text = open(path, encoding='utf-8', errors='replace').read()
+        except Exception:
+            continue
+        for line in text.splitlines():
+            m = GRADLE_INCLUDE_RE.match(line)
+            if not m:
+                continue
+            for proj in GRADLE_PROJECT_RE.findall(m.group('args')):
+                rel = proj.strip(':').replace(':', '/')
+                if rel and os.path.isdir(os.path.join(root, rel)):
+                    names.add(rel)
+    return sorted(names)
 
 
 def build_units(root):
@@ -355,9 +397,21 @@ def has_any_manifest(root):
     Distinguishes "a repository with no build units" (legitimately nothing to
     cover) from "discovery is blind here" (a green light over nothing). Only
     the second is a defect, and only this tells them apart.
+
+    The repository ROOT is skipped, and that is not a loosening — it is the
+    same rule discovery follows. Every detector deliberately refuses to make
+    `rel == '.'` a unit, because the root of a build is not an area. Counting a
+    root manifest here while discovery refuses to would make a perfectly
+    ordinary single-package repository — one root pom.xml, one root Dockerfile
+    — fail CHECK 8 forever, with a complete and correct catch-all barrier in
+    place and no way to satisfy the message. That kind of unsatisfiable red is
+    how a real detector gets weakened to quieten it. What the root manifest
+    DOES require is checked instead, and positively, by CHECK 9.
     """
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        if os.path.relpath(dirpath, root) == '.':
+            continue
         if 'go.mod' in filenames or 'package.json' in filenames \
                 or 'pom.xml' in filenames \
                 or any(f in filenames for f in GRADLE_BUILD_FILES) \
@@ -365,6 +419,26 @@ def has_any_manifest(root):
                 or any(is_dockerfile(f) for f in filenames):
             return True
     return False
+
+
+ROOT_MANIFEST_NAMES = ('go.mod', 'package.json', 'pom.xml') + GRADLE_BUILD_FILES
+
+
+def root_manifests(root):
+    """Build manifests sitting at the repository root, if any.
+
+    Never units — see `has_any_manifest` — but not nothing either: in a
+    single-package repository they ARE the build, so CHECK 9 requires them to
+    be barriered rather than left to match nothing.
+    """
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    return [n for n in names
+            if os.path.isfile(os.path.join(root, n))
+            and (n in ROOT_MANIFEST_NAMES
+                 or is_python_manifest(n) or is_dockerfile(n))]
 
 
 def fanout(root, units):
@@ -596,6 +670,28 @@ if not units and has_any_manifest(root):
          "gradle_modules / python_units / docker_units) this repository's "
          "layout before "
          "trusting a pass here.")
+
+# CHECK 9 — a root-only build is still a build.
+#
+# With no sub-unit anywhere, the repository IS one unit and CHECK 4 has nothing
+# to iterate: it passes over the empty set. That is the one place where "no
+# units" and "nothing to check" genuinely coincide in the configuration and
+# genuinely do not coincide in reality — every pull request here touches the
+# single build, so the catch-all barrier must actually claim the root manifest.
+# Asserting it positively is what keeps CHECK 8's root exemption from becoming
+# a hole: the root is exempt from being a UNIT, not from being covered.
+checks.append('root-build-barriered')
+if queue_mode == 'parallel' and not units:
+    loose = [m for m in root_manifests(root) if not is_barriered(m)]
+    if loose:
+        fail('root-build-barriered',
+             "this repository declares its build only at the root (%s) and has "
+             "no sub-units, so every pull request touches that one build — but "
+             "the root manifest is not barriered. In parallel mode it would "
+             "carry the empty scope set and run beside everything. Widen "
+             "scopes.barrier_files.include (the fail-safe shape is `**/*` minus "
+             "exactly the scope includes)."
+             % ", ".join(loose))
 
 print("checks run: %s" % ",".join(checks))
 if errors:
@@ -932,7 +1028,10 @@ scopes:
   #
   # `target/` is excluded from the walk for the same reason `node_modules` is —
   # a build directory can hold a copied pom.xml, and a unit that exists only
-  # after a build is not a path a pull request touches.
+  # after a build is not a path a pull request touches. The generated pom is
+  # placed where NEITHER the scope nor the barrier reaches it, which is what
+  # makes that claim testable: covered by the same `services/alpha/**` scope as
+  # the real module, it would stay green with the exclusion deleted.
   mkdir -p "$tmp/mvn-repo/services/alpha" "$tmp/mvn-repo/services/beta" \
            "$tmp/mvn-repo/services/alpha/target/classes"
   printf '<project/>' > "$tmp/mvn-repo/services/alpha/pom.xml"
@@ -952,6 +1051,8 @@ scopes:
       a:
         include:
           - services/alpha/**
+        exclude:
+          - services/alpha/target/**
 ' > "$tmp/mvn-repo/.mergify.yml"
   expect "maven modules are discovered and covered" "$tmp/mvn-repo" ""
 
@@ -1007,6 +1108,8 @@ scopes:
       a:
         include:
           - app/alpha/**
+        exclude:
+          - app/alpha/build/**
 ' > "$tmp/gradle-repo/.mergify.yml"
   expect "gradle modules are discovered and covered" "$tmp/gradle-repo" ""
 
@@ -1177,6 +1280,103 @@ scopes:
           - nested/**
 ' > "$tmp/vacuous/.mergify.yml"
   expect "discovery sees a nested go module" "$tmp/vacuous" ""
+
+  # A flavoured requirements file ALONE. The docker fixture above cannot prove
+  # `requirements*.txt` matching, because its Dockerfile.gpu creates the same
+  # `app` unit either way: delete the flavoured-requirements branch and that
+  # fixture stays green. Here there is no Dockerfile and no other manifest, so
+  # the file is the only thing that can produce a unit — and it is left
+  # unscoped, so the pass/fail turns on discovery having seen it.
+  mkdir -p "$tmp/py-flavoured/svc/alpha"
+  printf 'torch\n' > "$tmp/py-flavoured/svc/alpha/requirements-gpu.txt"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - svc/alpha/**
+  source:
+    files:
+      a:
+        include:
+          - svc/other/**
+' > "$tmp/py-flavoured/.mergify.yml"
+  expect "flavoured requirements file is a unit" "$tmp/py-flavoured" "coverage"
+
+  # A subproject declared ONLY by settings.gradle, configured from the root
+  # build. `app/beta` has no build file of its own, and `app/alpha` does — so
+  # without settings parsing discovery is not empty, CHECK 8 stays quiet, and
+  # an entire unscoped subproject enters the parallel queue behind an OK.
+  mkdir -p "$tmp/gradle-settings/app/alpha" "$tmp/gradle-settings/app/beta"
+  printf 'rootProject.name = "x"\ninclude(":app:alpha")\ninclude(":app:beta")\n' \
+    > "$tmp/gradle-settings/settings.gradle.kts"
+  printf 'plugins {}' > "$tmp/gradle-settings/app/alpha/build.gradle.kts"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - app/alpha/**
+      - app/beta/**
+  source:
+    files:
+      a:
+        include:
+          - app/alpha/**
+' > "$tmp/gradle-settings/.mergify.yml"
+  expect "settings-only gradle subproject is a unit" "$tmp/gradle-settings" "coverage"
+
+  # A root-only build: one manifest at the root, no sub-unit anywhere. The root
+  # is deliberately not a unit, so CHECK 8 must NOT fire — counting it there
+  # made this ordinary shape unsatisfiably red. The catch-all barrier claims it,
+  # so this is simply a pass.
+  mkdir -p "$tmp/root-only/src"
+  printf '<project/>' > "$tmp/root-only/pom.xml"
+  printf 'FROM scratch\n' > "$tmp/root-only/Dockerfile"
+  printf 'x\n' > "$tmp/root-only/src/Main.java"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+  source:
+    files:
+      a:
+        include:
+          - docs/**
+' > "$tmp/root-only/.mergify.yml"
+  expect "root-only build passes" "$tmp/root-only" ""
+
+  # ... and the exemption is not a hole: with the root manifest excluded from
+  # the barrier and named by no scope, that single build carries the empty
+  # scope set and runs beside everything. CHECK 9 is what says so.
+  mkdir -p "$tmp/root-loose"
+  printf '<project/>' > "$tmp/root-loose/pom.xml"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - pom.xml
+  source:
+    files:
+      a:
+        include:
+          - docs/**
+' > "$tmp/root-loose/.mergify.yml"
+  expect "unbarriered root-only build is reported" "$tmp/root-loose" \
+         "root-build-barriered"
 
   if [ "$failed" -ne 0 ]; then
     echo "check-mergify-scopes: SELF-TEST FAILED" >&2

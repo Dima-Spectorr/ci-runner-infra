@@ -867,7 +867,7 @@ behaves that a consuming repository needs to know before copying it in:
   reports OK over the rest, and CHECK 8 stays quiet because it did find
   something.
 
-  Five blind spots were found in three days, each looking exactly like a pass:
+  Six blind spots were found in three days, each looking exactly like a pass:
 
   | found | blind spot | what it silently approved |
   |---|---|---|
@@ -877,6 +877,7 @@ behaves that a consuming repository needs to know before copying it in:
   | 2026-08-21 | no Gradle build-file walk | a whole Android repository, both halves blind |
   | 2026-08-21 | `requirements.txt` matched exactly | `requirements-gpu.txt`, i.e. a Python service |
   | 2026-08-21 | no Dockerfile walk | three deployed containers with no other manifest |
+  | 2026-08-21 | Gradle read only build files | a subproject `settings.gradle` includes but the root build configures |
 
   Discovery now walks, in order: pnpm workspace packages → `go.mod` → `pom.xml` →
   `build.gradle[.kts]` → Python manifests (`pyproject.toml`, `setup.py`,
@@ -886,9 +887,22 @@ behaves that a consuming repository needs to know before copying it in:
   and it earns its place because on this fleet the OCI image is the deployable
   unit by policy.
 
+  Gradle is read from **both** sides: the build-file walk, and the `include`
+  lines of `settings.gradle[.kts]`. A subproject is a module because the
+  settings file declares it, not because it happens to hold a `build.gradle` —
+  one configured entirely from the root build has none, and a sibling that does
+  keeps CHECK 8 quiet about it.
+
   A **root** manifest is never a unit — a root `go.mod`, root `pom.xml` or root
   `requirements.txt` is not an area, it is what every area is part of, so it
-  belongs in the barrier.
+  belongs in the barrier. **The vacuity check follows the same rule** (fixed
+  2026-08-21): counting a root manifest there while discovery refuses to made an
+  ordinary single-package repository — one root `pom.xml`, one root Dockerfile —
+  fail CHECK 8 with a correct catch-all barrier in place and no way to satisfy
+  the message. Unsatisfiable red is how a real detector gets weakened to quieten
+  it. What a root-only build actually requires is asserted positively instead:
+  **CHECK 9 `root-build-barriered`** — no sub-units means the repository *is*
+  one unit, so the barrier must claim its root manifest.
 
   Two consequences for anyone extending this:
 
@@ -902,7 +916,16 @@ behaves that a consuming repository needs to know before copying it in:
      6 → 59, entity-platform 4 → 10, Print-Server 38 → 44, IntegrateIT 301 →
      310). Every newly discovered unit was already covered by its catch-all
      barrier — which is exactly what a catch-all is for, and why the fail-safe
-     barrier shape must land *before* discovery is widened.
+     barrier shape must land *before* discovery is widened. The Gradle-settings
+     + root-manifest change was measured the same way: all eleven repositories,
+     every unit count byte-identical, no repository regressed.
+  3. **A fixture that cannot fail is not a fixture.** Two of the originals could
+     not: the generated `target/classes/pom.xml` sat inside the same scope as
+     the real module, so deleting the `target` exclusion left it green, and the
+     flavoured-requirements probe shared a directory with a Dockerfile that
+     produced the same unit either way. Both were re-placed where only the
+     behaviour under test decides the outcome, and each detector is now
+     mutation-checked — break it, watch the named fixture go red.
 - **`*` does not cross `/`; `**` does.** `fnmatch.translate` gets this wrong, and
   wrong permissively — `packages/*` would report `packages/connectors/aws-sqs` as
   covered by a pattern Mergify never matches it with. A fixture pins the
