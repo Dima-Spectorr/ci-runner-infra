@@ -204,8 +204,9 @@ def is_python_manifest(name):
     """A Python manifest, INCLUDING the requirements-<flavour>.txt spellings.
 
     Matching the bare `requirements.txt` alone was a near-miss of exactly the
-    kind this gate exists to catch: mot-face-blur pins its dependencies in
-    `app/requirements-gpu.txt`, so an exact-name test found nothing there, and
+    kind this gate exists to catch: one repository on this fleet pins its
+    dependencies in `app/requirements-gpu.txt`, so an exact-name test found
+    nothing there, and
     "no build units" over a repository of three deployable services reads as a
     legitimate answer rather than as a blind spot. `requirements-dev.txt` and
     friends are the same file for this purpose — evidence that a directory is a
@@ -218,9 +219,9 @@ def is_python_manifest(name):
 def docker_units(root):
     """Every directory holding a Dockerfile, except the repository root.
 
-    The language-agnostic backstop, and the one that answers mot-face-blur:
-    `app/`, `app/merge/` and `app/sweeper/` are three separately built and
-    separately deployed containers, and the ONLY file that says so is a
+    The language-agnostic backstop, and the one that answers a container-only
+    repository: three separately built and separately deployed images under one
+    `app/` tree, where the ONLY file that says so is a
     Dockerfile — there is no pyproject, no go.mod, nothing else to find. On this
     fleet the OCI image is the deployable unit by policy, so a directory that
     builds one is a build unit whatever language is inside it.
@@ -249,8 +250,8 @@ def python_units(root):
     """Every directory holding a Python manifest, except the repository root.
 
     The fifth language, and the one where "no build units" is most convincing:
-    mot-face-blur and CarListPrice's backend are Python, so before this the gate
-    found nothing, `has_any_manifest` agreed there was nothing, and CHECK 8
+    two repositories on this fleet are Python end to end, so before this the
+    gate found nothing, `has_any_manifest` agreed there was nothing, and CHECK 8
     stayed quiet — a legitimate-looking "this repository has no build units to
     cover" over repositories that plainly do.
 
@@ -1047,8 +1048,9 @@ scopes:
          "coverage,parallel-needs-barriers,parallel-needs-scopes"
 
   # Python, the fifth language, and the one where "this repository has no build
-  # units" reads most convincingly: mot-face-blur and CarListPrice's backend
-  # carry no package.json, go.mod, pom.xml or build.gradle anywhere, so before
+  # units" reads most convincingly: two repositories on this fleet are Python
+  # end to end and carry no package.json, go.mod, pom.xml or build.gradle
+  # anywhere, so before
   # this discovery found nothing AND `has_any_manifest` agreed there was
   # nothing to find — the same both-halves-blind shape Gradle had.
   #
@@ -1103,8 +1105,8 @@ scopes:
   expect "uncovered python unit is reported" "$tmp/py-uncovered" "coverage"
 
   # The language-agnostic backstop, and the shape that motivated it. In
-  # mot-face-blur `app/merge` and `app/sweeper` are separately built and
-  # separately deployed containers whose ONLY declaration is a Dockerfile —
+  # a container-only repository, `app/merge` and `app/sweeper` are separately
+  # built and separately deployed images whose ONLY declaration is a Dockerfile —
   # there is no pyproject, no go.mod, no package.json anywhere in the tree — and
   # `app/` pins its dependencies in `requirements-gpu.txt`, which an exact-name
   # `requirements.txt` test does not match. Both halves are asserted here: a
