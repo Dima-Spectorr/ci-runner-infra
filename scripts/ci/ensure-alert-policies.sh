@@ -347,8 +347,19 @@ existing="$(g alpha monitoring policies list --format='value(displayName,name)' 
 
 for key in heartbeat blind idle queue drain slowtick cachestale cachefail egressdenied; do
   policy_json "$key" >"$tmp/p.json"
-  name="$(sed -n 's/.*"displayName": "\(CI runners \/ [^"]*\)".*/\1/p' "$tmp/p.json" | head -1)"
-  id="$(printf '%s\n' "$existing" | awk -F'\t' -v n="$name" '$1==n {print $2}' | head -1)"
+  # Neither of these ends in `| head -1`, and that is deliberate. This script
+  # runs `set -euo pipefail`; under both options a reader that stops early sends
+  # SIGPIPE to its writer, the writer exits 141, `pipefail` promotes 141 to the
+  # pipeline's status, and a BARE assignment's status is its substitution's — so
+  # `set -e` kills the script on a line that got the right answer. Whether it
+  # fires is a race with how much the writer had already buffered, which is what
+  # makes it a rare, unreproducible failure rather than a broken script. The
+  # writers here are `sed` and `awk`, so take the first line in the shell.
+  # Enforced by scripts/ci/check-pipefail-readers.sh (PFR1).
+  name_all="$(sed -n 's/.*"displayName": "\(CI runners \/ [^"]*\)".*/\1/p' "$tmp/p.json")"
+  name="${name_all%%$'\n'*}"
+  id_all="$(printf '%s\n' "$existing" | awk -F'\t' -v n="$name" '$1==n {print $2}')"
+  id="${id_all%%$'\n'*}"
 
   if [ "$DRY" = "1" ]; then
     printf '%s: would %s — %s\n' "$PROJECT" "$([ -n "$id" ] && echo update || echo create)" "$name"
