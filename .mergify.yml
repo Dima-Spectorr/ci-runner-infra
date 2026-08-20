@@ -28,6 +28,25 @@
 merge_queue:
   max_parallel_checks: 1
 
+  # THE THIRD NUMBER, added 2026-08-19. Inert at width 1 — with one check in
+  # flight there is nothing concurrent to schedule — and written anyway, because
+  # this is the setting the whole fleet held by SILENCE rather than by decision.
+  # Fourteen repositories inherited `serial` without one of them declaring it,
+  # and the one repository above width 1 was therefore buying a STACK: entry 2's
+  # draft carried entry 1's commits, so a dequeue at the front threw away
+  # everything behind it and each of those restarted cold.
+  #
+  # Whoever raises the width above 1 here must edit a line that already exists,
+  # and read docs/ci-merge-queue-baseline.md#scheduling-mode-the-third-number
+  # before doing it: `parallel` requires a scope map that covers the repository
+  # TOTALLY, because an unmatched pull request carries the empty scope set,
+  # which overlaps nothing and therefore runs beside everything.
+  #
+  # `isolated` is banned outright — it removes the dependency between batches
+  # entirely, so two entries that pass alone and conflict together both merge.
+  # check-mergify-scopes.sh rejects it.
+  mode: serial
+
 queue_rules:
   - name: default
     merge_method: squash
