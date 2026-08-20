@@ -198,32 +198,78 @@ rather than by arithmetic — `batch_size` is 1 everywhere.
 
 **Corrected 2026-08-19 — "shared" is one pool short of the truth, and it changes
 who may raise what.** Runners are registered **per repository**, not into one
-GitHub-wide pool. Re-measured across the fourteen repositories:
+GitHub-wide pool. Each repository stands up its own `ci-runner-host-<slug>` pool
+from the `ci-runner-host-pool` module in this repository.
 
-| runner host | repository | registered | online | busy at survey |
-|---|---|---|---|---|
-| `ci-runner-host-iit` | IntegrateIT | 29 | 28 | 22 |
-| `ci-runner-host-apigee` | Apigee-Portal | 12 | 12 | — |
-| `ci-runner-host-print` | Print-Server | 4 | 4 | — |
-| — | the other eleven | **0** | — | — |
+**Corrected again 2026-08-20, and this is the correction that matters — the
+first survey counted the wrong thing.** It asked GitHub
+`GET /repos/{owner}/{repo}/actions/runners` for each repository and read the
+registered count. **Every pool in the fleet runs `min_hosts = 0`** — scale to
+zero when idle — and a scaled-to-zero pool has *deregistered every runner*, so
+that endpoint returns `total_count: 0` for a pool that is fully provisioned and
+will have sixteen agents up two minutes into the next push. The survey therefore
+reported "eleven repositories have no self-hosted runners" when in fact eleven
+repositories *have pools* and were merely idle at the moment they were asked.
+Everything the first correction concluded from that zero — that those
+repositories run GitHub-hosted, that raising their width is a billing question,
+that they cannot starve anything — was **wrong**.
+
+> **Never size a queue against a live runner count.** It measures the weather.
+> Size it against `slots_per_host × max_hosts` from the pool's `.tfvars`, which
+> is the pool's real job concurrency and is what the module's own `max_hosts`
+> description calls it.
+
+Re-derived from Terraform (`slots_per_host × max_hosts`, every pool at
+`min_hosts = 0`):
+
+| repository | pool `.tfvars` | slots × hosts | **job ceiling** |
+|---|---|---|---|
+| IntegrateIT | `customer/mot/terraform/ci-runner-hosts` | 4 × 8 | **32** |
+| entity-platform | `infra/ci-runners` | 4 × 6 | 24 |
+| Print-Server | `infra/terraform/ci-runners` | 4 × 6 | 24 |
+| Specaria-Platform | `infra/terraform/ci-runners` | 4 × 4 | 16 |
+| DataRetrival | `infra/terraform/ci-runners` | 4 × 3 | 12 |
+| SOAP-To-REST | `infra/terraform/envs/specaria-soap-to-rest-deploy` | 4 × 3 | 12 |
+| Apigee-Portal | `infra/terraform/envs/specaria-apigee-portal-deploy` | 4 × 3 | 12 |
+| Telnet-Emulation | `infra/terraform/ci-runners` | 4 × 2 | 8 |
+| mot-claude | `infra/terraform/ci-runners` | 4 × 2 | 8 |
+| Borsh-Tablet-App | `infra/ci-runners` | 2 × 3 | 6 |
+| ci-runner-infra | *(none — GitHub-hosted)* | — | — |
+| Manar | **none, and its CI demands `self-hosted`** | — | see below |
+| Atlas | **none, and its CI demands `self-hosted`** | — | see below |
+
+The `29 / 28 / 22` figures in the first correction were not false, only
+incidental: IntegrateIT's ceiling is 32 and seven of its eight hosts happened to
+be up when it was sampled.
 
 So the sum above is not a single global constraint. It decomposes:
 
-- **A repository with its own runner host** spends only its own registrations.
-  The budget is real, local, and computable — width × peak runners per CI run
-  against that host's online count. What *is* still shared underneath is the GCP
+- **A repository with its own pool** spends only its own ceiling. The budget is
+  real, local, and computable — width × peak runners per CI run against
+  `slots_per_host × max_hosts`. What *is* still shared underneath is the GCP
   quota the managed instance groups draw from, which is what actually bit on
   2026-08-13; that is a slower, coarser bound than a runner count.
-- **The eleven repositories with zero self-hosted runners run on
-  GitHub-hosted.** Raising their width cannot starve this fleet at all. It is a
-  **billing** question, not a VM-starvation one, and it should be argued as such
-  rather than blocked by an invariant that does not apply to them.
+- **A width raise is bounded by that number and nothing else** — not by a
+  neighbouring repository, and not by a live count taken while the pool was
+  asleep.
 
-The rule that survives: **state which of the two you are spending, and show the
-number, in the pull request that raises the width.** What no longer holds is the
-blanket claim that a repository under queue pressure has no local move — since
-2026-08-19 it has one, and it is free: declare `mode: parallel` with a covering
-scope map before arguing for runners.
+**Manar and Atlas are the genuine defect this survey found.** Both name
+`runs-on: [self-hosted, linux, gcp, <Repo>]` in `.github/workflows/ci.yml`, and
+neither instantiates `ci-runner-host-pool` anywhere. There is no pool to scale
+up, so those jobs are not slow — they are **unassignable**. They queue with no
+runner, never start, and therefore never reach a conclusion, which is
+indistinguishable at the pull-request level from a check that is simply taking a
+long time. This is the actual root cause of Manar pull request #25 sitting
+`BLOCKED` for two days with twenty-seven contexts showing an empty conclusion;
+an earlier reading of the same symptom blamed path filters, and that reading was
+wrong. **A `runs-on` label with no pool behind it is a silent, permanent block,
+and nothing in GitHub's UI names it.**
+
+The rule that survives: **state which ceiling you are spending, and show the
+`slots_per_host × max_hosts` arithmetic, in the pull request that raises the
+width.** What no longer holds is the blanket claim that a repository under queue
+pressure has no local move — since 2026-08-19 it has one, and it is free:
+declare `mode: parallel` with a covering scope map before arguing for runners.
 
 ---
 
@@ -544,8 +590,10 @@ scopes:
       # safety. check-mergify-scopes.sh enforces totality.
 
 merge_queue:
-  # A per-repository number now, not a blanket fleet one: show which budget you
-  # are spending (own runner host vs GitHub-hosted billing) in the PR.
+  # A per-repository number now, not a blanket fleet one: show the arithmetic
+  # against this repository's own `slots_per_host * max_hosts` in the PR. Never
+  # against a live runner count — every pool scales to zero, so a count taken
+  # while the pool is idle reads 0 for a fully provisioned pool.
   max_parallel_checks: 4
   # Load-bearing above width 1. `serial` makes those 4 a stack; `parallel` makes
   # them 4 independent tests grouped by exact scope set.
@@ -904,13 +952,25 @@ The table gains a **mode** column, and every cell in it was empty at the survey:
 no repository in the fleet had ever declared `merge_queue.mode`. Fourteen
 defaults, zero decisions.
 
-| repository | runners | width | mode | batch | tier |
+The **job ceiling** column is `slots_per_host × max_hosts` from the pool's
+`.tfvars` — *not* a live runner count, for the reason given in
+[the fleet runner budget](#the-fleet-runner-budget--the-invariant-no-single-repository-can-see).
+
+| repository | job ceiling | width | mode | batch | tier |
 |---|---|---|---|---|---|
-| IntegrateIT | 29 own (`ci-runner-host-iit`) | 3 → **4** | *(none)* → **parallel** | 1 | **0** on batch; width by own-host budget |
-| Apigee-Portal | 12 own (`ci-runner-host-apigee`) | 1 | *(none)* = serial | 1 | **0**, correctly |
-| Print-Server | 4 own (`ci-runner-host-print`) | 1 | *(none)* = serial | 1 | **0**, correctly |
-| DataRetrival, Specaria-Platform, CarListPrice, SOAP-To-REST, mot-face-blur, Telnet-Emulation, entity-platform, Atlas, ci-runner-infra, Borsh-Tablet-App | **0** — GitHub-hosted | 1 | *(none)* = serial | 1 | **0**, correctly |
-| Manar | **0** — GitHub-hosted | **unset** | *(none)* = serial | **5** | **NOT converted — see below** |
+| IntegrateIT | **32** (4 × 8) | 3 → **4** | *(none)* → **parallel** | 1 | **0** on batch; width by own-pool ceiling |
+| entity-platform | 24 (4 × 6) | 1 | *(none)* = serial | 1 | **0**, correctly |
+| Print-Server | 24 (4 × 6) | 1 | *(none)* = serial | 1 | **0**, correctly |
+| Specaria-Platform | 16 (4 × 4) | 1 | *(none)* = serial | 1 | **0**, correctly |
+| DataRetrival | 12 (4 × 3) | 1 | *(none)* = serial | 1 | **0**, correctly |
+| SOAP-To-REST | 12 (4 × 3) | 1 | *(none)* = serial | 1 | **0**, correctly |
+| Apigee-Portal | 12 (4 × 3) | 1 | *(none)* = serial | 1 | **0**, correctly |
+| Telnet-Emulation | 8 (4 × 2) | 1 | *(none)* = serial | 1 | **0**, correctly |
+| mot-claude | 8 (4 × 2) | 1 | *(none)* = serial | 1 | **0**, correctly |
+| Borsh-Tablet-App | 6 (2 × 3) | 1 | *(none)* = serial | 1 | **0**, correctly |
+| ci-runner-infra, CarListPrice, mot-face-blur | *(no pool — GitHub-hosted)* | 1 | *(none)* = serial | 1 | **0**, correctly |
+| Atlas | **no pool, CI demands `self-hosted`** | 1 | *(none)* = serial | 1 | **0** on batch; **unassignable jobs** |
+| Manar | **no pool, CI demands `self-hosted`** | **unset** | *(none)* = serial | **5** | **NOT converted — see below** |
 
 Thirteen of the fourteen repositories merge **one pull request per batch**.
 
@@ -934,23 +994,29 @@ present at once:
 
 It is the only repository in the fleet still on the pre-baseline shape, and it is
 the one place where a width raise would be actively wrong: pinning the width is
-the smaller half of what it needs. Note also what the runner column corrects
-about the earlier framing — Manar registers **no self-hosted runners**, so the
-unbounded claim is on **GitHub-hosted minutes**, not on this fleet's VMs. A
-billing exposure rather than the starvation the earlier text asserted. Both are
-reasons to fix it; only one of them was true.
+the smaller half of what it needs.
+
+**And none of those six defects is why #25 is stuck.** Manar's `ci.yml` runs both
+its jobs on `[self-hosted, linux, gcp, Manar]`, and no `ci-runner-host-pool` is
+instantiated anywhere in the repository. The twenty-seven contexts with an empty
+conclusion are not slow and not path-filtered — they are **unassignable**, and
+they will stay pending forever. Fix the pool first; the `.mergify.yml` conversion
+cannot land until something can report a conclusion on a config-only diff.
+Atlas has the same missing pool against the same labels and should be checked in
+the same pass.
 
 The general lesson, since this document has now made the mistake it warns about:
 **an open pull request is not a landed change, and a survey that reads the PR
 list rather than the file will report the intention as the state.** Every row in
 this table was re-read from the live file on 2026-08-19.
 
-**The runner column is the correction of record.** Runners are registered per
-repository, not into one fleet-wide pool — see
-[the fleet runner budget](#the-fleet-runner-budget--the-invariant-no-single-repository-can-see).
-Three repositories have their own host; eleven have none and run GitHub-hosted.
-A width raise in one of those eleven cannot starve `ci-runner-host-iit`, and the
-argument for or against it is cost, not capacity.
+**The job-ceiling column is the correction of record, and it has now been wrong
+once.** Runners are registered per repository, not into one fleet-wide pool, and
+**ten of the fourteen repositories have their own pool** — see
+[the fleet runner budget](#the-fleet-runner-budget--the-invariant-no-single-repository-can-see)
+for why the first survey read eleven of them as zero. A width raise is bounded by
+that repository's own `slots_per_host × max_hosts` and by nothing else; it cannot
+starve IntegrateIT's pool, and it is a capacity argument, not a cost one.
 
 **Nothing yet PREVENTS a repository-local raise back above 1.**
 `check-merge-queue-single-step.sh` enforces `BATCH_MAX` as a *ceiling* (5), so a
