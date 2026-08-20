@@ -40,11 +40,30 @@ jobs:
           set -euo pipefail
           find . -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
+      # SPLIT FROM `shellcheck`, AND BOTH HALVES BOUNDED. Installing the tool and
+      # running it used to be one step whose only two commands are both quiet on
+      # success, so a hang produced a step that printed a group header, nothing
+      # else, and `The operation was canceled` fifteen minutes later. Twice, on
+      # #203, with no way to tell from the log which half was stuck — apt
+      # reaching an unreachable mirror and shellcheck looping look identical when
+      # neither says anything. Two steps with an explicit `timeout` each cost
+      # nothing and turn that into a named failure.
+      - name: install shellcheck
+        run: |
+          set -euo pipefail
+          timeout 300 sudo apt-get update -qq
+          timeout 300 sudo apt-get install -y -qq shellcheck
+          shellcheck --version
+
       - name: shellcheck
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          set -euo pipefail
           # SC1090/SC1091: sourced paths are resolved at runtime on the VM.
-          find . -name '*.sh' -print0 | xargs -0 shellcheck -e SC1090,SC1091
+          # `-n1` so the log names the file it was reading when it stopped; the
+          # per-file spawn cost is a few seconds across this tree and buys the
+          # one fact a hang otherwise destroys.
+          find . -name '*.sh' -print0 \
+            | timeout 300 xargs -0 -n1 shellcheck -e SC1090,SC1091
 
       # The two steps above read every `*.sh` in the tree and nothing else — and
       # a composite action's `run:` blocks are shell that lives in a `.yml`. The
