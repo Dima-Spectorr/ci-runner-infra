@@ -858,12 +858,51 @@ behaves that a consuming repository needs to know before copying it in:
   decides concurrency. A Tier 0 repository can carry the gate from day one and it
   will pass, which is the point — it is in place *before* the width rises, not
   added in the same pull request that makes it matter.
-- **Its inventory comes from `pnpm-workspace.yaml`.** On a repository that is not
-  a pnpm workspace it finds no packages and passes trivially. That is a **vacuous
-  pass**, this gate's characteristic failure mode, and it is called out here
-  rather than hidden: a non-pnpm repository moving to `mode: parallel` must first
-  teach the script where its units live (a Go module list, a Maven reactor, a
-  hand-written manifest) or it is protecting nothing.
+- **Its inventory is now six discoveries, and PARTIAL discovery is the failure
+  to fear** (revised 2026-08-21). The original text here warned about a *vacuous*
+  pass — pnpm-only inventory finding nothing at all. `CHECK 8
+  discovery-non-vacuous` closed that: it fails when the walk finds zero units but
+  a manifest exists anywhere. What it does **not** catch is the halfway case, and
+  that turned out to be the common one — discovery that sees *some* of a tree
+  reports OK over the rest, and CHECK 8 stays quiet because it did find
+  something.
+
+  Five blind spots were found in three days, each looking exactly like a pass:
+
+  | found | blind spot | what it silently approved |
+  |---|---|---|
+  | 2026-08-19 | pnpm workspaces only | every Go multi-module repository |
+  | 2026-08-20 | no Go module walk | — |
+  | 2026-08-21 | no Maven reactor walk | seven Java services, most of one tree |
+  | 2026-08-21 | no Gradle build-file walk | a whole Android repository, both halves blind |
+  | 2026-08-21 | `requirements.txt` matched exactly | `requirements-gpu.txt`, i.e. a Python service |
+  | 2026-08-21 | no Dockerfile walk | three deployed containers with no other manifest |
+
+  Discovery now walks, in order: pnpm workspace packages → `go.mod` → `pom.xml` →
+  `build.gradle[.kts]` → Python manifests (`pyproject.toml`, `setup.py`,
+  `Pipfile`, any `requirements*.txt`) → **Dockerfiles**. The Dockerfile walk runs
+  **last**, via `setdefault`, so a directory a real toolchain already claimed
+  keeps that kind; it is a language-agnostic backstop, not a competing answer,
+  and it earns its place because on this fleet the OCI image is the deployable
+  unit by policy.
+
+  A **root** manifest is never a unit — a root `go.mod`, root `pom.xml` or root
+  `requirements.txt` is not an area, it is what every area is part of, so it
+  belongs in the barrier.
+
+  Two consequences for anyone extending this:
+
+  1. **Fixtures in both directions, per language.** A covered fixture and an
+     uncovered one. The uncovered one is the only thing that proves discovery
+     actually ran, since a covered fixture passes just as happily when nothing
+     was found.
+  2. **Measure a discovery change against every configured repository before
+     committing it.** The Python + Dockerfile change was run against all eleven:
+     no repository regressed, and unit counts rose materially (Specaria-Platform
+     6 → 59, entity-platform 4 → 10, Print-Server 38 → 44, IntegrateIT 301 →
+     310). Every newly discovered unit was already covered by its catch-all
+     barrier — which is exactly what a catch-all is for, and why the fail-safe
+     barrier shape must land *before* discovery is widened.
 - **`*` does not cross `/`; `**` does.** `fnmatch.translate` gets this wrong, and
   wrong permissively — `packages/*` would report `packages/connectors/aws-sqs` as
   covered by a pattern Mergify never matches it with. A fixture pins the
@@ -942,6 +981,57 @@ Added 2026-08-19, all four about `mode`:
 > because the deleted version of a rule is the one that gets re-derived.
 
 ---
+
+## Fleet status (2026-08-21) — the scopes pass, completed
+
+Every repository that has a Mergify queue now **declares** `merge_queue.mode`,
+carries a **catch-all barrier plus a total scope map**, and runs
+`check-mergify-scopes.sh` fixtures-then-real as an always-on required check. The
+2026-08-19 survey below is kept as the before picture.
+
+Read live from each `.mergify.yml`, and the unit counts from the gate itself.
+`job ceiling` is `slots_per_host × max_hosts` from the pool's `.tfvars`, never a
+live runner count.
+
+| repository | job ceiling | peak pool jobs | width | mode | units |
+|---|---|---|---|---|---|
+| IntegrateIT | 32 (4 × 8) | 5 | **4** | parallel | 310 |
+| Print-Server | 24 (4 × 6) | 6 | **3** | parallel | 44 |
+| entity-platform | 24 (4 × 6) | 3 scoped | **3** | parallel | 10 |
+| DataRetrival | 16 (4 × 4) | 6 | **2** | parallel | 28 |
+| Specaria-Platform | 16 (4 × 4) | — | **2** | parallel | 59 |
+| Apigee-Portal | 12 (4 × 3) | 13 | 1 *(pool-blocked)* | parallel | 31 |
+| SOAP-To-REST | 12 (4 × 3) | 17 | 1 *(pool-blocked)* | parallel | 19 |
+| Telnet-Emulation | 8 (4 × 2) | 8 | 1 *(pool-blocked)* | parallel | 8 |
+| Borsh-Tablet-App | 6 (2 × 3) | 5 | 1 *(pool-blocked)* | parallel | 9 |
+| CarListPrice | *(GitHub-hosted)* | n/a | 1 *(by choice)* | parallel | 2 |
+| mot-face-blur | *(GitHub-hosted)* | n/a | 1 *(by choice)* | parallel | 3 |
+| mot-claude | 8 (4 × 2) | 6 | — | **no queue at all** | — |
+
+Three things this table is saying that are easy to misread:
+
+- **"pool-blocked" is a capacity fact, not a preference.** Those four repositories
+  have a *correct* scope map that is currently **inert**: one check already
+  oversubscribes the pool, so a second would queue behind the first rather than
+  run beside it. Raising the width there means raising `max_hosts` first, and each
+  has an issue filed against it. The map is what must already be true *before*
+  the width rises — which is the whole reason it lands first.
+- **"by choice" is the other constraint entirely.** CarListPrice and mot-face-blur
+  run every job on GitHub-hosted runners, so there is no pool to exhaust. What a
+  width above 1 costs them is **in-place checking**: every merging pull request
+  would pay a second full CI run on a throwaway draft. At their merge rate that is
+  a straight doubling of hosted minutes to buy concurrency nobody is waiting on,
+  so the width stays 1 and `check-merge-queue-single-step.sh` enforces it.
+- **mot-claude was deliberately left alone.** It has no `.mergify.yml` *and no
+  rulesets at all* — `gh api repos/.../rulesets` returns an empty list. Adding a
+  queue there would introduce merge governance where there is none rather than
+  optimise an existing queue, which is a decision to take and not a change to slip
+  in behind a config-only pull request. Proposed as an issue instead.
+
+Atlas and Manar are unchanged and still out of scope for this pass: both name
+`runs-on: [self-hosted, linux, gcp, <Repo>]` while instantiating no
+`ci-runner-host-pool`, so their jobs are unassignable and no queue setting can
+help until that is fixed.
 
 ## Fleet status (re-surveyed 2026-08-19)
 
