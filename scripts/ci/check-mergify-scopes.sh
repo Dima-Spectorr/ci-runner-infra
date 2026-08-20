@@ -47,7 +47,16 @@
 # =============================================================================
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# WHERE THE REPOSITORY ROOT IS, ASKED RATHER THAN COUNTED. Guessing `../..` from
+# the script's own location assumes every repository vendors this at
+# `scripts/ci/`, and Borsh-Tablet-App keeps its gates in `ci/` — there the guess
+# lands one directory ABOVE the checkout, the config is not found, and the gate
+# fails with a path error rather than an answer. Ask git, and keep the guess as
+# the fallback for a tarball or a submodule with no work tree.
+REPO_ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$REPO_ROOT" ] || [ ! -f "$REPO_ROOT/.mergify.yml" ]; then
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fi
 
 # Pick an interpreter that can actually import yaml. `actions/setup-python`
 # prepends a Python that does not carry the image's python3-yaml, so a workflow
@@ -187,6 +196,35 @@ def maven_modules(root):
     return found
 
 
+PYTHON_MANIFESTS = ('pyproject.toml', 'setup.py', 'requirements.txt')
+
+
+def python_units(root):
+    """Every directory holding a Python manifest, except the repository root.
+
+    The fifth language, and the one where "no build units" is most convincing:
+    mot-face-blur and CarListPrice's backend are Python, so before this the gate
+    found nothing, `has_any_manifest` agreed there was nothing, and CHECK 8
+    stayed quiet — a legitimate-looking "this repository has no build units to
+    cover" over repositories that plainly do.
+
+    A ROOT manifest is excluded for the same reason a root go.mod is: it is not
+    an area, it is what every area is part of, so it belongs in the barrier.
+    """
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in SKIP_DIRS and d not in ('.venv', 'venv', '__pycache__')]
+        present = [f for f in PYTHON_MANIFESTS if f in filenames]
+        if not present:
+            continue
+        rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
+        if rel == '.':
+            continue
+        found[rel] = present[0]
+    return found
+
+
 GRADLE_BUILD_FILES = ('build.gradle', 'build.gradle.kts')
 
 
@@ -255,6 +293,8 @@ def build_units(root):
         units.setdefault(rel, ('maven', name, rel + '/pom.xml'))
     for rel, fname in gradle_modules(root).items():
         units.setdefault(rel, ('gradle', rel, rel + '/' + fname))
+    for rel, fname in python_units(root).items():
+        units.setdefault(rel, ('python', rel, rel + '/' + fname))
     return units
 
 
@@ -269,7 +309,8 @@ def has_any_manifest(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         if 'go.mod' in filenames or 'package.json' in filenames \
                 or 'pom.xml' in filenames \
-                or any(f in filenames for f in GRADLE_BUILD_FILES):
+                or any(f in filenames for f in GRADLE_BUILD_FILES) \
+                or any(f in filenames for f in PYTHON_MANIFESTS):
             return True
     return False
 
@@ -495,22 +536,22 @@ checks.append('discovery-non-vacuous')
 if not units and has_any_manifest(root):
     fail('discovery-non-vacuous',
          "no build units were discovered, but this tree contains go.mod, "
-         "package.json, pom.xml or build.gradle files. Every coverage answer "
+         "package.json, pom.xml, build.gradle or Python manifest files "
+         "(pyproject.toml / setup.py / requirements.txt). Every coverage answer "
          "above was computed over the empty set and is therefore vacuous. Teach "
-         "workspace_packages/go_modules/maven_modules/gradle_modules this "
-         "repository's layout before trusting a pass here.")
+         "discovery (workspace_packages / go_modules / maven_modules / "
+         "gradle_modules / python_units) this repository's layout before "
+         "trusting a pass here.")
 
 print("checks run: %s" % ",".join(checks))
 if errors:
     print("FAILED: %s" % ",".join(sorted(set(errors))))
     sys.exit(1)
-print("OK: %d build units (%d node, %d go, %d maven, %d gradle), all scoped or "
-      "barriered; mode=%s width=%s"
+kinds = ('node', 'go', 'maven', 'gradle', 'python')
+print("OK: %d build units (%s), all scoped or barriered; mode=%s width=%s"
       % (len(units),
-         sum(1 for v in units.values() if v[0] == 'node'),
-         sum(1 for v in units.values() if v[0] == 'go'),
-         sum(1 for v in units.values() if v[0] == 'maven'),
-         sum(1 for v in units.values() if v[0] == 'gradle'),
+         ", ".join("%d %s" % (sum(1 for v in units.values() if v[0] == k), k)
+                   for k in kinds),
          queue_mode, width))
 PYEOF
 }
@@ -951,6 +992,62 @@ scopes:
   # like it was testing something.
   expect "gradle repo with no scopes at all is reported" "$tmp/gradle-blind" \
          "coverage,parallel-needs-barriers,parallel-needs-scopes"
+
+  # Python, the fifth language, and the one where "this repository has no build
+  # units" reads most convincingly: mot-face-blur and CarListPrice's backend
+  # carry no package.json, go.mod, pom.xml or build.gradle anywhere, so before
+  # this discovery found nothing AND `has_any_manifest` agreed there was
+  # nothing to find — the same both-halves-blind shape Gradle had.
+  #
+  # A virtualenv is skipped: `.venv/**` is thousands of vendored manifests, and
+  # a scope map is not expected to name any of them.
+  mkdir -p "$tmp/py-repo/svc/alpha" "$tmp/py-repo/svc/beta" \
+           "$tmp/py-repo/.venv/lib/site-packages/thing"
+  printf 'requests\n' > "$tmp/py-repo/requirements.txt"
+  printf '[project]\nname = "alpha"\n' > "$tmp/py-repo/svc/alpha/pyproject.toml"
+  printf 'from setuptools import setup\n' > "$tmp/py-repo/svc/beta/setup.py"
+  printf 'x\n' > "$tmp/py-repo/.venv/lib/site-packages/thing/requirements.txt"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - svc/alpha/**
+  source:
+    files:
+      a:
+        include:
+          - svc/alpha/**
+' > "$tmp/py-repo/.mergify.yml"
+  # The ROOT requirements.txt is deliberately not a unit — like a root go.mod it
+  # is not an area, it is what every area is part of — so it must not show up as
+  # an uncovered `.`, and `svc/beta` must be barriered rather than invisible.
+  expect "python units are discovered and covered" "$tmp/py-repo" ""
+
+  # The direction that proves Python discovery ran at all.
+  mkdir -p "$tmp/py-uncovered/svc/alpha" "$tmp/py-uncovered/svc/beta"
+  printf '[project]\nname = "alpha"\n' > "$tmp/py-uncovered/svc/alpha/pyproject.toml"
+  printf '[project]\nname = "beta"\n' > "$tmp/py-uncovered/svc/beta/pyproject.toml"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - svc/alpha/**
+      - svc/beta/**
+  source:
+    files:
+      a:
+        include:
+          - svc/alpha/**
+' > "$tmp/py-uncovered/.mergify.yml"
+  expect "uncovered python unit is reported" "$tmp/py-uncovered" "coverage"
 
   # Blind discovery must be red, not quiet. A manifest exists but sits where
   # discovery does not look, so every coverage answer is computed over the
