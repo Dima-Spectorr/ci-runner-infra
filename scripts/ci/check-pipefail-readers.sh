@@ -267,7 +267,7 @@ def opts_from_script(script):
 # Units to scan
 # --------------------------------------------------------------------------
 
-units = []  # (display path, line offset of the script's first line, script, errexit, pipefail)
+units = []  # (path, offset, script, errexit, pipefail, raw-file-text-or-None)
 errors = []
 
 for path in sorted(root.rglob("*.sh")):
@@ -279,7 +279,8 @@ for path in sorted(root.rglob("*.sh")):
         errors.append("%s: %s" % (path, exc))
         continue
     e, p = opts_from_script(text)
-    units.append((path, 0, text, e, p))
+    # raw=None: this IS the file, so a finding's line number is already absolute.
+    units.append((path, 0, text, e, p, None))
 
 
 def shell_opts(shell):
@@ -310,7 +311,7 @@ def add_steps(path, raw, steps, defaults_shell):
             continue
         e, p = opts
         se, sp = opts_from_script(script)
-        units.append((path, locate(raw, script), script, e or se, p or sp))
+        units.append((path, locate(raw, script), script, e or se, p or sp, raw))
 
 
 def locate(raw, script):
@@ -321,6 +322,22 @@ def locate(raw, script):
     needle = first.strip()
     found = [i for i, ln in enumerate(raw.split("\n"), 1) if ln.strip() == needle]
     return found[0] - 1 if len(found) == 1 else 0
+
+
+def anchor(raw, text, offset, lineno):
+    """The file line to annotate.
+
+    `yaml.safe_load` throws line numbers away, so a `run:` block's position has
+    to be recovered from the text. Prefer the OFFENDING line itself — it is far
+    more distinctive than the block's first line, which is `set -euo pipefail`
+    in most blocks and therefore matches everywhere. An annotation with no line
+    lands at the top of the file, which for a 900-line workflow is the
+    difference between a fix and a search.
+    """
+    if offset:
+        return offset + lineno
+    hits = [i for i, ln in enumerate(raw.split("\n"), 1) if ln.strip() == text]
+    return hits[0] if len(hits) == 1 else 0
 
 
 wf = []
@@ -361,7 +378,7 @@ if not units:
 fail = 1 if errors else 0
 count = 0
 
-for path, offset, script, errexit, pipefail in units:
+for path, offset, script, errexit, pipefail, raw in units:
     for lineno, rule, name, text in findings(script, errexit, pipefail):
         count += 1
         fail = 1
@@ -369,7 +386,8 @@ for path, offset, script, errexit, pipefail in units:
             shown = path.relative_to(root).as_posix()
         except ValueError:
             shown = path.as_posix()
-        where = "" if offset == 0 and path.suffix != ".sh" else ",line=%d" % (offset + lineno)
+        absline = lineno if raw is None else anchor(raw, text, offset, lineno)
+        where = ",line=%d" % absline if absline else ""
         print(
             "::error file=%s%s::[%s] `%s` ends this pipeline, and the block runs with "
             "-e and pipefail: the writer takes SIGPIPE, exits 141, and that becomes the "
