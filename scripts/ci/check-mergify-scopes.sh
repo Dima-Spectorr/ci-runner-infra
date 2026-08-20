@@ -159,6 +159,34 @@ def go_modules(root):
     return found
 
 
+def maven_modules(root):
+    """Every directory holding a pom.xml, except the repository root.
+
+    Same blindness as the Go case, in the third language on this fleet:
+    SOAP-To-REST builds its admin-api, runtime, worker and four cloud adapters
+    with Maven, and none of them carries a package.json or a go.mod. Without
+    this, discovery there sees one Node package and three Go modules, reports
+    OK, and says nothing about the seven Java modules it never opened — a pass
+    computed over a fraction of the repository, which is the failure mode CHECK
+    8 catches only when the fraction is ZERO.
+
+    An aggregator pom (one whose directory is the parent of other modules) is
+    NOT special-cased away. It is a real file a pull request can touch, and
+    touching it affects every module beneath it, so it must be scoped or — the
+    usual answer — left to the catch-all barrier.
+    """
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and d != 'target']
+        if 'pom.xml' not in filenames:
+            continue
+        rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
+        if rel == '.':
+            continue
+        found[rel] = rel
+    return found
+
+
 def build_units(root):
     """Every unit that must be scoped or barriered, with the path to probe.
 
@@ -190,6 +218,8 @@ def build_units(root):
         units[rel] = ('node', name, rel + '/package.json')
     for rel, name in go_modules(root).items():
         units.setdefault(rel, ('go', name, rel + '/go.mod'))
+    for rel, name in maven_modules(root).items():
+        units.setdefault(rel, ('maven', name, rel + '/pom.xml'))
     return units
 
 
@@ -202,7 +232,8 @@ def has_any_manifest(root):
     """
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        if 'go.mod' in filenames or 'package.json' in filenames:
+        if 'go.mod' in filenames or 'package.json' in filenames \
+                or 'pom.xml' in filenames:
             return True
     return False
 
@@ -427,19 +458,22 @@ if mqs in files:
 checks.append('discovery-non-vacuous')
 if not units and has_any_manifest(root):
     fail('discovery-non-vacuous',
-         "no build units were discovered, but this tree contains go.mod or "
-         "package.json files. Every coverage answer above was computed over the "
-         "empty set and is therefore vacuous. Teach workspace_packages/go_modules "
-         "this repository's layout before trusting a pass here.")
+         "no build units were discovered, but this tree contains go.mod, "
+         "package.json or pom.xml files. Every coverage answer above was "
+         "computed over the empty set and is therefore vacuous. Teach "
+         "workspace_packages/go_modules/maven_modules this repository's layout "
+         "before trusting a pass here.")
 
 print("checks run: %s" % ",".join(checks))
 if errors:
     print("FAILED: %s" % ",".join(sorted(set(errors))))
     sys.exit(1)
-print("OK: %d build units (%d node, %d go), all scoped or barriered; mode=%s width=%s"
+print("OK: %d build units (%d node, %d go, %d maven), all scoped or barriered; "
+      "mode=%s width=%s"
       % (len(units),
          sum(1 for v in units.values() if v[0] == 'node'),
          sum(1 for v in units.values() if v[0] == 'go'),
+         sum(1 for v in units.values() if v[0] == 'maven'),
          queue_mode, width))
 PYEOF
 }
@@ -757,6 +791,60 @@ scopes:
           - services/alpha/**
 ' > "$tmp/go-uncovered/.mergify.yml"
   expect "uncovered go module is reported" "$tmp/go-uncovered" "coverage"
+
+  # Maven modules, the third language on this fleet. SOAP-To-REST's services
+  # carry neither a package.json nor a go.mod, so before pom.xml discovery the
+  # gate there saw a handful of Go and Node units, reported OK, and never opened
+  # the seven Java modules that are most of the repository. CHECK 8 could not
+  # catch it: discovery was not empty, only partial.
+  #
+  # `target/` is excluded from the walk for the same reason `node_modules` is —
+  # a build directory can hold a copied pom.xml, and a unit that exists only
+  # after a build is not a path a pull request touches.
+  mkdir -p "$tmp/mvn-repo/services/alpha" "$tmp/mvn-repo/services/beta" \
+           "$tmp/mvn-repo/services/alpha/target/classes"
+  printf '<project/>' > "$tmp/mvn-repo/services/alpha/pom.xml"
+  printf '<project/>' > "$tmp/mvn-repo/services/beta/pom.xml"
+  printf '<project/>' > "$tmp/mvn-repo/services/alpha/target/classes/pom.xml"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - services/alpha/**
+  source:
+    files:
+      a:
+        include:
+          - services/alpha/**
+' > "$tmp/mvn-repo/.mergify.yml"
+  expect "maven modules are discovered and covered" "$tmp/mvn-repo" ""
+
+  # ... and reported when uncovered, the direction that matters: without this
+  # the fixture above would also pass with discovery deleted.
+  mkdir -p "$tmp/mvn-uncovered/services/alpha" "$tmp/mvn-uncovered/services/beta"
+  printf '<project/>' > "$tmp/mvn-uncovered/services/alpha/pom.xml"
+  printf '<project/>' > "$tmp/mvn-uncovered/services/beta/pom.xml"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - services/alpha/**
+      - services/beta/**
+  source:
+    files:
+      a:
+        include:
+          - services/alpha/**
+' > "$tmp/mvn-uncovered/.mergify.yml"
+  expect "uncovered maven module is reported" "$tmp/mvn-uncovered" "coverage"
 
   # Blind discovery must be red, not quiet. A manifest exists but sits where
   # discovery does not look, so every coverage answer is computed over the
