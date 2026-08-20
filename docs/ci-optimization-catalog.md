@@ -405,9 +405,50 @@ matches "$(awk '…' file)" 'the thing that must be there'
 ```
 
 The same applies to any early-exiting reader at the end of a pipeline under
-`pipefail` — `head -n`, `grep -m`, `sed q`. When the value is what you want and
-the status is ignored (`x=$(cmd | head -1)`), it is harmless; when the status is
-the verdict, it is a bug.
+`pipefail` — `head -n`, `grep -m`, `sed q`.
+
+**An earlier revision of this section carved out an exception, and the exception
+was wrong.** It said that when the value is what you want and the status is
+ignored — `x=$(cmd | head -1)` — the artefact is harmless. The status is not
+ignored. `x=$(…)` is a simple command whose exit status *is* the substitution's,
+so where `set -e` is also in effect the assignment is what dies:
+
+```bash
+$ bash -c 'set -euo pipefail; x="$(yes | head -1)"; echo reached'; echo $?
+141
+```
+
+That sentence is the one consumers copied. IntegrateIT's `pr-check` installs
+Terraform and then asserts the version it got with
+`got="$("$bindir/terraform" version | head -1)"`. Four of thirty consecutive
+failed runs died there with exit 141 — *after* printing
+`terraform_1.9.8_linux_amd64.zip: OK`, so the download and the checksum had both
+succeeded — and two of those four were inside a merge-queue speculative check,
+which dequeues the pull request and re-runs the whole batch.
+
+Three things let the shape survive review:
+
+- `set -e` and `pipefail` are usually established far from the offending line,
+  and GitHub's `shell: bash` is `bash --noprofile --norc -eo pipefail {0}`, so a
+  `run:` block can be in scope without the word `pipefail` appearing in it. The
+  default shell, with no `shell:` key, is `bash -e {0}` — errexit, no pipefail.
+  Whether the block is affected is decided by a key that is not there.
+- `local x=$(cmd | head -1)` **is** safe: `local` is a builtin with its own exit
+  status, which masks the substitution's. Identical text, opposite verdict, one
+  keyword apart. (Masking a failure is its own defect, but not this one.)
+- It is a buffering race, so it passes while the writer's output is small and
+  starts failing when the tool gets chattier or the machine gets busier.
+
+`scripts/ci/check-pipefail-readers.sh` (rules PFR1/PFR2) is the gate for this,
+wired into `ci.yml` beside the other shell sweeps. No linter has the rule —
+shellcheck does not model `pipefail` — and a plain grep for the idiom is mostly
+false positives, so the gate is narrow on purpose: only where **both** options
+are in effect, only bare assignments and bare pipeline statements, never a
+`local`, never a pipeline the author already guarded with `||`, and never an
+`if` condition. That last exemption is the important one: `set -e` is suspended
+in a condition, `if … | grep -q …` is idiomatic across all fourteen repositories,
+and a gate that lights up on hundreds of correct lines is a gate somebody
+deletes — which costs more than the findings are worth.
 
 Whenever a gate fails, print the input it judged, not only the verdict. A gate
 that says only "not found" cannot be told apart from a gate that is broken.

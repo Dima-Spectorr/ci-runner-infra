@@ -97,6 +97,30 @@ jobs:
       - name: packer inline shell gate
         run: bash scripts/ci/check-packer-inline-shell.sh
 
+      # The shell sweeps above ask whether the interpreter will ACCEPT the
+      # script. This one asks whether two options the script asked for will kill
+      # it: under `set -e` and `pipefail` together, a pipeline ending in `head`
+      # or `grep -q` exits 141 when the reader stops before the writer finishes.
+      #
+      # It is here rather than in a lint config because no linter has the rule —
+      # shellcheck does not model `pipefail`, and the shape is idiomatic enough
+      # that a grep for it is mostly false positives. And it is here rather than
+      # nowhere because the fleet already paid for it: `docs/ci-optimization-
+      # catalog.md` §5.2a described the defect and then declared the assignment
+      # form "harmless", which is exactly the form that dequeued an IntegrateIT
+      # pull request twice in one day, four times in thirty runs, after a
+      # terraform install that had already verified its own checksum.
+      #
+      # A gate whose findings are mostly noise gets deleted, so the rule is
+      # deliberately narrow: only where BOTH options are in effect, only the
+      # bare assignment and bare-pipeline forms, never an `if` condition, never
+      # a `local`, never a pipeline the author already guarded with `||`.
+      - name: pipefail reader gate self-test
+        run: bash scripts/ci/check-pipefail-readers.sh --selftest
+
+      - name: pipefail reader gate
+        run: bash scripts/ci/check-pipefail-readers.sh
+
       # "nobody's CI runs packer" is the sentence above, and it cost an image
       # build to finish reading. Two pull requests fixed the SAME provisioner
       # for the same reason within an hour, one inserting `inline_shebang`
