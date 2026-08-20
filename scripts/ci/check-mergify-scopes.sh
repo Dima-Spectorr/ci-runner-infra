@@ -196,7 +196,53 @@ def maven_modules(root):
     return found
 
 
-PYTHON_MANIFESTS = ('pyproject.toml', 'setup.py', 'requirements.txt')
+PYTHON_MANIFESTS = ('pyproject.toml', 'setup.py', 'Pipfile')
+PYTHON_SKIP_DIRS = ('.venv', 'venv', '__pycache__', 'site-packages')
+
+
+def is_python_manifest(name):
+    """A Python manifest, INCLUDING the requirements-<flavour>.txt spellings.
+
+    Matching the bare `requirements.txt` alone was a near-miss of exactly the
+    kind this gate exists to catch: mot-face-blur pins its dependencies in
+    `app/requirements-gpu.txt`, so an exact-name test found nothing there, and
+    "no build units" over a repository of three deployable services reads as a
+    legitimate answer rather than as a blind spot. `requirements-dev.txt` and
+    friends are the same file for this purpose — evidence that a directory is a
+    Python build unit.
+    """
+    return (name in PYTHON_MANIFESTS
+            or (name.startswith('requirements') and name.endswith('.txt')))
+
+
+def docker_units(root):
+    """Every directory holding a Dockerfile, except the repository root.
+
+    The language-agnostic backstop, and the one that answers mot-face-blur:
+    `app/`, `app/merge/` and `app/sweeper/` are three separately built and
+    separately deployed containers, and the ONLY file that says so is a
+    Dockerfile — there is no pyproject, no go.mod, nothing else to find. On this
+    fleet the OCI image is the deployable unit by policy, so a directory that
+    builds one is a build unit whatever language is inside it.
+
+    `Dockerfile.gpu`, `Dockerfile.cpu`, `Dockerfile.sweeper` all count: a
+    per-flavour suffix names a variant of the same unit, not a different place.
+    """
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        present = sorted(f for f in filenames if is_dockerfile(f))
+        if not present:
+            continue
+        rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
+        if rel == '.':
+            continue
+        found[rel] = present[0]
+    return found
+
+
+def is_dockerfile(name):
+    return name == 'Dockerfile' or name.startswith('Dockerfile.')
 
 
 def python_units(root):
@@ -214,8 +260,8 @@ def python_units(root):
     found = {}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames
-                       if d not in SKIP_DIRS and d not in ('.venv', 'venv', '__pycache__')]
-        present = [f for f in PYTHON_MANIFESTS if f in filenames]
+                       if d not in SKIP_DIRS and d not in PYTHON_SKIP_DIRS]
+        present = sorted(f for f in filenames if is_python_manifest(f))
         if not present:
             continue
         rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
@@ -295,6 +341,10 @@ def build_units(root):
         units.setdefault(rel, ('gradle', rel, rel + '/' + fname))
     for rel, fname in python_units(root).items():
         units.setdefault(rel, ('python', rel, rel + '/' + fname))
+    # LAST, so a directory a real toolchain already claimed keeps that kind: the
+    # Dockerfile is the backstop, not a competing answer.
+    for rel, fname in docker_units(root).items():
+        units.setdefault(rel, ('docker', rel, rel + '/' + fname))
     return units
 
 
@@ -310,7 +360,8 @@ def has_any_manifest(root):
         if 'go.mod' in filenames or 'package.json' in filenames \
                 or 'pom.xml' in filenames \
                 or any(f in filenames for f in GRADLE_BUILD_FILES) \
-                or any(f in filenames for f in PYTHON_MANIFESTS):
+                or any(is_python_manifest(f) for f in filenames) \
+                or any(is_dockerfile(f) for f in filenames):
             return True
     return False
 
@@ -536,18 +587,20 @@ checks.append('discovery-non-vacuous')
 if not units and has_any_manifest(root):
     fail('discovery-non-vacuous',
          "no build units were discovered, but this tree contains go.mod, "
-         "package.json, pom.xml, build.gradle or Python manifest files "
-         "(pyproject.toml / setup.py / requirements.txt). Every coverage answer "
+         "package.json, pom.xml, build.gradle, a Python manifest "
+         "(pyproject.toml / setup.py / requirements*.txt) or a Dockerfile. "
+         "Every coverage answer "
          "above was computed over the empty set and is therefore vacuous. Teach "
          "discovery (workspace_packages / go_modules / maven_modules / "
-         "gradle_modules / python_units) this repository's layout before "
+         "gradle_modules / python_units / docker_units) this repository's "
+         "layout before "
          "trusting a pass here.")
 
 print("checks run: %s" % ",".join(checks))
 if errors:
     print("FAILED: %s" % ",".join(sorted(set(errors))))
     sys.exit(1)
-kinds = ('node', 'go', 'maven', 'gradle', 'python')
+kinds = ('node', 'go', 'maven', 'gradle', 'python', 'docker')
 print("OK: %d build units (%s), all scoped or barriered; mode=%s width=%s"
       % (len(units),
          ", ".join("%d %s" % (sum(1 for v in units.values() if v[0] == k), k)
@@ -1048,6 +1101,58 @@ scopes:
           - svc/alpha/**
 ' > "$tmp/py-uncovered/.mergify.yml"
   expect "uncovered python unit is reported" "$tmp/py-uncovered" "coverage"
+
+  # The language-agnostic backstop, and the shape that motivated it. In
+  # mot-face-blur `app/merge` and `app/sweeper` are separately built and
+  # separately deployed containers whose ONLY declaration is a Dockerfile —
+  # there is no pyproject, no go.mod, no package.json anywhere in the tree — and
+  # `app/` pins its dependencies in `requirements-gpu.txt`, which an exact-name
+  # `requirements.txt` test does not match. Both halves are asserted here: a
+  # flavoured requirements file IS a manifest, and a Dockerfile IS a build unit.
+  mkdir -p "$tmp/docker-repo/app/merge" "$tmp/docker-repo/app/sweeper"
+  printf 'torch\n' > "$tmp/docker-repo/app/requirements-gpu.txt"
+  printf 'FROM scratch\n' > "$tmp/docker-repo/app/Dockerfile.gpu"
+  printf 'FROM scratch\n' > "$tmp/docker-repo/app/merge/Dockerfile.cpu"
+  printf 'FROM scratch\n' > "$tmp/docker-repo/app/sweeper/Dockerfile"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - app/sweeper/**
+  source:
+    files:
+      s:
+        include:
+          - app/sweeper/**
+' > "$tmp/docker-repo/.mergify.yml"
+  expect "dockerfile-only units are discovered and covered" "$tmp/docker-repo" ""
+
+  # The direction that proves it ran: drop the barrier's catch-all so the two
+  # Dockerfile-only directories are neither scoped nor barriered.
+  mkdir -p "$tmp/docker-uncovered/svc/alpha" "$tmp/docker-uncovered/svc/beta"
+  printf 'FROM scratch\n' > "$tmp/docker-uncovered/svc/alpha/Dockerfile"
+  printf 'FROM scratch\n' > "$tmp/docker-uncovered/svc/beta/Dockerfile"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - svc/alpha/**
+      - svc/beta/**
+  source:
+    files:
+      a:
+        include:
+          - svc/alpha/**
+' > "$tmp/docker-uncovered/.mergify.yml"
+  expect "uncovered dockerfile unit is reported" "$tmp/docker-uncovered" "coverage"
 
   # Blind discovery must be red, not quiet. A manifest exists but sits where
   # discovery does not look, so every coverage answer is computed over the
