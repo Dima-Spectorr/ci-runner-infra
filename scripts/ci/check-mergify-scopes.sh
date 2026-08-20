@@ -187,6 +187,39 @@ def maven_modules(root):
     return found
 
 
+GRADLE_BUILD_FILES = ('build.gradle', 'build.gradle.kts')
+
+
+def gradle_modules(root):
+    """Every directory holding a build.gradle[.kts], except the repository root.
+
+    The fourth language on this fleet, and the one where blindness is total
+    rather than partial: Borsh-Tablet-App is Gradle end to end, with no
+    package.json, go.mod or pom.xml anywhere, so before this the gate found ZERO
+    units there — and `has_any_manifest` did not know about Gradle either, so
+    even CHECK 8 stayed quiet. Two blind spots that cancel out produce a green
+    light over a wholly unscoped repository, which is the exact failure this
+    file exists to prevent.
+
+    `settings.gradle[.kts]` marks the build root and is intentionally NOT a
+    unit: like a root go.mod, it is not an area, it is the thing every area is
+    part of, and it belongs in the barrier.
+    """
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and d != 'build']
+        if not any(f in filenames for f in GRADLE_BUILD_FILES):
+            continue
+        rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
+        if rel == '.':
+            continue
+        # Probe the file that actually exists, not a canonical name: the probe
+        # is matched against scope globs, and a scope that names
+        # `app/build.gradle.kts` would not match an invented `app/build.gradle`.
+        found[rel] = next(f for f in GRADLE_BUILD_FILES if f in filenames)
+    return found
+
+
 def build_units(root):
     """Every unit that must be scoped or barriered, with the path to probe.
 
@@ -220,6 +253,8 @@ def build_units(root):
         units.setdefault(rel, ('go', name, rel + '/go.mod'))
     for rel, name in maven_modules(root).items():
         units.setdefault(rel, ('maven', name, rel + '/pom.xml'))
+    for rel, fname in gradle_modules(root).items():
+        units.setdefault(rel, ('gradle', rel, rel + '/' + fname))
     return units
 
 
@@ -233,7 +268,8 @@ def has_any_manifest(root):
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         if 'go.mod' in filenames or 'package.json' in filenames \
-                or 'pom.xml' in filenames:
+                or 'pom.xml' in filenames \
+                or any(f in filenames for f in GRADLE_BUILD_FILES):
             return True
     return False
 
@@ -459,21 +495,22 @@ checks.append('discovery-non-vacuous')
 if not units and has_any_manifest(root):
     fail('discovery-non-vacuous',
          "no build units were discovered, but this tree contains go.mod, "
-         "package.json or pom.xml files. Every coverage answer above was "
-         "computed over the empty set and is therefore vacuous. Teach "
-         "workspace_packages/go_modules/maven_modules this repository's layout "
-         "before trusting a pass here.")
+         "package.json, pom.xml or build.gradle files. Every coverage answer "
+         "above was computed over the empty set and is therefore vacuous. Teach "
+         "workspace_packages/go_modules/maven_modules/gradle_modules this "
+         "repository's layout before trusting a pass here.")
 
 print("checks run: %s" % ",".join(checks))
 if errors:
     print("FAILED: %s" % ",".join(sorted(set(errors))))
     sys.exit(1)
-print("OK: %d build units (%d node, %d go, %d maven), all scoped or barriered; "
-      "mode=%s width=%s"
+print("OK: %d build units (%d node, %d go, %d maven, %d gradle), all scoped or "
+      "barriered; mode=%s width=%s"
       % (len(units),
          sum(1 for v in units.values() if v[0] == 'node'),
          sum(1 for v in units.values() if v[0] == 'go'),
          sum(1 for v in units.values() if v[0] == 'maven'),
+         sum(1 for v in units.values() if v[0] == 'gradle'),
          queue_mode, width))
 PYEOF
 }
@@ -845,6 +882,75 @@ scopes:
           - services/alpha/**
 ' > "$tmp/mvn-uncovered/.mergify.yml"
   expect "uncovered maven module is reported" "$tmp/mvn-uncovered" "coverage"
+
+  # Gradle, the fourth language — and the case where the two blind spots
+  # cancelled out. Borsh-Tablet-App carries no package.json, go.mod or pom.xml
+  # anywhere, so discovery found zero units AND `has_any_manifest` saw no
+  # manifest, which meant CHECK 8 stayed quiet too: a green light over a wholly
+  # unscoped repository. Both halves are fixed, and this fixture is the one that
+  # would go red if either regressed.
+  #
+  # `settings.gradle.kts` marks the build root and must NOT become a unit; the
+  # root of a build is not an area, it is what every area belongs to.
+  mkdir -p "$tmp/gradle-repo/app/alpha" "$tmp/gradle-repo/app/beta" \
+           "$tmp/gradle-repo/app/alpha/build/tmp"
+  printf 'rootProject.name = "x"' > "$tmp/gradle-repo/settings.gradle.kts"
+  printf 'plugins {}' > "$tmp/gradle-repo/app/alpha/build.gradle.kts"
+  printf 'plugins {}' > "$tmp/gradle-repo/app/beta/build.gradle"
+  printf 'plugins {}' > "$tmp/gradle-repo/app/alpha/build/tmp/build.gradle.kts"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - app/alpha/**
+  source:
+    files:
+      a:
+        include:
+          - app/alpha/**
+' > "$tmp/gradle-repo/.mergify.yml"
+  expect "gradle modules are discovered and covered" "$tmp/gradle-repo" ""
+
+  # The direction that proves discovery ran at all.
+  mkdir -p "$tmp/gradle-uncovered/app/alpha" "$tmp/gradle-uncovered/app/beta"
+  printf 'plugins {}' > "$tmp/gradle-uncovered/app/alpha/build.gradle.kts"
+  printf 'plugins {}' > "$tmp/gradle-uncovered/app/beta/build.gradle.kts"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "**/*"
+    exclude:
+      - app/alpha/**
+      - app/beta/**
+  source:
+    files:
+      a:
+        include:
+          - app/alpha/**
+' > "$tmp/gradle-uncovered/.mergify.yml"
+  expect "uncovered gradle module is reported" "$tmp/gradle-uncovered" "coverage"
+
+  # A Gradle-only tree with NOTHING scoped must be red, not quiet. This is the
+  # literal pre-fix Borsh-Tablet-App shape: parallel mode, no scopes at all.
+  mkdir -p "$tmp/gradle-blind/app/alpha"
+  printf 'plugins {}' > "$tmp/gradle-blind/app/alpha/build.gradle.kts"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+' > "$tmp/gradle-blind/.mergify.yml"
+  # All three fire, and the third is the one this fixture is really about:
+  # `coverage` naming `app/alpha` proves discovery SAW the module. Without
+  # Gradle discovery the first two would still fire and the fixture would look
+  # like it was testing something.
+  expect "gradle repo with no scopes at all is reported" "$tmp/gradle-blind" \
+         "coverage,parallel-needs-barriers,parallel-needs-scopes"
 
   # Blind discovery must be red, not quiet. A manifest exists but sits where
   # discovery does not look, so every coverage answer is computed over the
