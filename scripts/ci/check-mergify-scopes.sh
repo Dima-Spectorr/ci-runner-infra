@@ -125,6 +125,14 @@ def workspace_packages(root):
     return found
 
 
+# ONE skip set, shared by discovery and by the vacuity check below. Two lists
+# that merely happen to agree today drift, and the drift is silent in the worst
+# direction: a manifest that discovery skips but the vacuity check counts makes
+# CHECK 8 fail on a repository that is in fact fully covered, and the obvious
+# way to quieten that is to weaken CHECK 8.
+SKIP_DIRS = {'.git', 'node_modules', 'vendor', 'testdata', '.terraform'}
+
+
 def go_modules(root):
     """Every directory holding a go.mod, except the repository root.
 
@@ -139,7 +147,7 @@ def go_modules(root):
     opposite. A root go.mod is build config, and build config is a barrier.
     """
     found = {}
-    skip = {'.git', 'node_modules', 'vendor', 'testdata', '.terraform'}
+    skip = SKIP_DIRS
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip]
         if 'go.mod' not in filenames:
@@ -165,9 +173,8 @@ def build_units(root):
         # -- Print-Server has exactly one, services/admin-ui-web, with its own
         # type-check job in CI -- and skipping them because the workspace file
         # is absent is the same blindness in a smaller form.
-        skip = {'.git', 'node_modules', 'vendor', '.terraform'}
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in skip]
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
             if 'package.json' not in filenames:
                 continue
             rel = os.path.relpath(dirpath, root).replace(os.sep, '/')
@@ -193,9 +200,8 @@ def has_any_manifest(root):
     cover) from "discovery is blind here" (a green light over nothing). Only
     the second is a defect, and only this tells them apart.
     """
-    skip = {'.git', 'node_modules', 'vendor', '.terraform'}
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in skip]
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         if 'go.mod' in filenames or 'package.json' in filenames:
             return True
     return False
