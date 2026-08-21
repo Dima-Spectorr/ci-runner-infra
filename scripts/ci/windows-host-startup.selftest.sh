@@ -204,6 +204,13 @@ has_job_broker() { # <file>
   # An empty job service account is a valid pool with NO broker, and must never
   # be a silent downgrade to the host identity.
   matches "$code" 'IsNullOrWhiteSpace\(\$JobServiceAccount\)' || return 1
+  # The broker LISTENS on this port, so the ephemeral range is out: a bind
+  # inside 49152-65535 succeeds and then loses the port to an outbound socket
+  # the host opened first, which reads in the log as a broker that installed
+  # and never answered. Availability, not a credential -- but this picker is
+  # the only place that can tell a chosen port from a handed-out one.
+  matches "$code" '^\$script:EphemeralPortFloor = 49152$' || return 1
+  matches "$code" 'if \(\$port -ge \$script:EphemeralPortFloor\) \{ return \$Default \}' || return 1
 }
 
 # --- invariant 4: every ambiguous outcome resolves AWAY from a credential ----
@@ -221,7 +228,13 @@ has_fail_closed_metadata() { # <file>
   # returned '' for both, and '' is a decision on two attributes: it turns a
   # broker pool into a no-broker pool, and it drops the image floor to 1.
   matches "$code" 'Test-MetadataAbsence -StatusCode \$status' || return 1
-  matches "$code" 'refusing to' || return 1
+  # Anchored to the CALL SITE rather than to the words. `refusing to` also
+  # appears in the job hook's text and in the account-name rejection, so the
+  # bare string stayed true with Get-MetadataValue's refusal reworded, moved
+  # or deleted outright -- a sub-check that could not go false, which reports
+  # ok forever.
+  matches "$code" 'Deny-Boot \("could not read metadata .* refusing to ' || return 1
+  matches "$code" 'treat an unreadable attribute as an unset one' || return 1
   # …and the predicate itself must not read a missing status as a 404. $null is
   # what a refused connection, a DNS failure and a read timeout all produce.
   matches "$code" 'if \(\$null -eq \$StatusCode\) \{ return \$false \}' || return 1
@@ -272,7 +285,11 @@ has_job_hook_acl() { # <file>
   ! matches "$code" 'Protect-CiDirectory -Path \$script:JobHookPath -SlotUser' || return 1
   # The profile is resolved from the ACCOUNT DATABASE, never from a variable the
   # job could have rewritten — the hook runs inside the agent's environment.
-  matches "$code" 'ProfileImagePath' || return 1
+  # Anchored to the CODE, because code_of keeps `<# ... #>` bodies and the
+  # docstring above the hook says ProfileImagePath too -- so the bare token
+  # was true whatever the hook actually read.
+  matches "$code" 'Get-ItemProperty -LiteralPath \$key -Name .ProfileImagePath.' || return 1
+  matches "$code" 'GetCurrent\(\)\.User\.Value' || return 1
   ! matches "$code" '\$env:USERPROFILE|\$env:APPDATA' || return 1
   # …and it refuses anything that is not a slot profile rather than recursing.
   matches "$code" "notmatch '\^ci-s\[0-9\]\+\\\$'" || return 1
@@ -1227,6 +1244,18 @@ mutate "the closed endpoint left bindable by any job" \
 mutate "the reservation weakened to a no-op" \
   's|excludedportrange|show|' \
   has_closed_metadata_endpoint
+mutate "the unreadable-metadata refusal reworded out of existence" \
+  's|could not read metadata|metadata was not available|' \
+  has_fail_closed_metadata
+mutate "the refusal stops saying what it will not do with the value" \
+  's|treat an unreadable attribute as an unset one|carry on|' \
+  has_fail_closed_metadata
+mutate "the broker may be handed an ephemeral port" \
+  '/-ge \$script:EphemeralPortFloor/d' \
+  has_job_broker
+mutate "the ephemeral floor moves above the range a socket accepts" \
+  's|EphemeralPortFloor = 49152|EphemeralPortFloor = 65536|' \
+  has_job_broker
 mutate "readiness back to trusting whoever answers" \
   's|Test-BrokerListenerSid -Sid (Get-PortListenerSid -Port \$Port)|$true|' \
   has_owned_broker_socket
@@ -1246,6 +1275,9 @@ mutate "read-and-execute widened to modify" \
   has_job_hook_acl
 mutate "profile taken from the job's environment" \
   's|(Get-ItemProperty -LiteralPath \$key -Name .ProfileImagePath.).ProfileImagePath|$env:USERPROFILE|' \
+  has_job_hook_acl
+mutate "the profile resolved without touching the account database" \
+  '/Get-ItemProperty -LiteralPath \$key -Name .ProfileImagePath./d' \
   has_job_hook_acl
 mutate "the not-a-slot-profile refusal removed" \
   "s|notmatch '\\^ci-s\\[0-9\\]+\\\$'|match '.'|" \
