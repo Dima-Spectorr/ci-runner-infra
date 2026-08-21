@@ -36,6 +36,25 @@ slot_user() { printf '%s%s' "$SLOT_USER_PREFIX" "$1"; }
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a /var/log/ci-host.log; logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true; }
 die() { log "FATAL: $*"; exit 1; }
 
+# For any text that came OUT of a scanned tree rather than out of this script.
+#
+# The cache scan refuses a tree and names the entry that tripped it, which is the
+# right thing to do — a refusal that names the tree root and not the cause once
+# cost a pool hours of running cold. But that entry's name is chosen by whoever
+# wrote the cache, and a filename may contain a newline. Interpolated raw, one
+# refusal becomes two log lines and the second can be shaped to look like any
+# other line this script emits, including a success verdict.
+#
+# It cannot change a verdict — the refusal has already happened by the time the
+# path is interpolated, and this text never reaches a shell. What it corrupts is
+# the log an operator reads when deciding whether a pool went cold for a benign
+# reason, which is the one moment that log has to be trustworthy. Length is
+# bounded for the same reason: `-quit` yields one entry, but one entry's path can
+# be as long as the tree is deep.
+safe_for_log() {
+  printf '%.300s' "$(printf '%s' "$1" | tr '\n\t' '  ' | tr -d '\000-\037')"
+}
+
 # Bounded, like every call this host makes. A host boot that HANGS is worse than
 # one that fails: it never registers an agent, never powers off, and bills at
 # warm-host size until the controller's register-grace expires — and while it
@@ -626,18 +645,16 @@ cache_scan() { # <seconds-or-0> <cmd...>
 }
 
 cache_master_is_hostile() { # [<tree>] [strict]
-  local bad root="${1:-$CACHE_MASTER}" limit=0
+  local bad ino root="${1:-$CACHE_MASTER}" limit=0
   if [ "${2:-}" = "strict" ]; then
     limit=$(( ${CACHE_DEADLINE:-0} - $(date +%s) ))
     [ "$limit" -gt 0 ] || limit=1
   fi
   # Symlinks and setuid/setgid bits are the obvious two. The rest are here
-  # because `chmod -R go+rX` WIDENS permissions and `cp -a` preserves: a hardlink
-  # to a file outside the tree would be made world-readable in place (an
+  # because `chmod -R go+rX` WIDENS permissions and `cp -a` preserves: an
   # unreadable /etc/shadow does not stay unreadable if something links it in
-  # here), and device, fifo and socket nodes have no business in a dependency
-  # cache. -links +1 is scoped to regular files because every directory has a
-  # link count above one by construction.
+  # here, and device, fifo and socket nodes have no business in a dependency
+  # cache. The hardlink case is NOT in this predicate — see the pass below.
   # `-printf '%y %M %p'` and not `-print`, because the refusal has to say WHICH
   # of those predicates matched. Six predicates share one message, and the one
   # that actually fired here was `-perm /6000` on the tree ROOT — an image that
@@ -651,14 +668,46 @@ cache_master_is_hostile() { # [<tree>] [strict]
   # GNU find, which is what the image ships and what packer's copy of this scan
   # already assumes; this script runs on the Linux pool only.
   bad=$(cache_scan "$limit" find "$root" \
-    \( -type l -o -type b -o -type c -o -type p -o -type s \
-       -o -perm /6000 -o \( -type f -a -links +1 \) \) \
+    \( -type l -o -type b -o -type c -o -type p -o -type s -o -perm /6000 \) \
     -printf '%y %M %p\n' -quit 2>/dev/null) || {
     log "refusing $root: it could not be scanned inside the remaining budget"
     return 0
   }
   if [ -n "$bad" ]; then
-    log "refusing $root: it holds a link, node or setuid entry ($bad)"
+    log "refusing $root: it holds a link, node or setuid entry ($(safe_for_log "$bad"))"
+    return 0
+  fi
+  # HARDLINKS, COUNTED RATHER THAN FORBIDDEN.
+  #
+  # The danger is a hardlink whose OTHER name is outside the tree: `chmod -R
+  # go+rX` widens the inode in place, so linking in something unreadable
+  # publishes it. A link count above one is not that danger, though, and the
+  # old `-links +1` predicate could not tell the two apart. A content-addressed
+  # store that hardlinks internally — pnpm's does exactly this — and any warm
+  # script that populated the master with `cp -al` both tripped it, and the
+  # refusal is silent in job output: the pool just runs cold, which nobody
+  # watches per job. Over-blocking a security check into permanent uselessness
+  # is a worse outcome than the check not existing.
+  #
+  # The exact question is answerable and cheap. Count how many of an inode's
+  # names live inside the tree and compare with its link count: equal means
+  # every name is in here and `chmod` reaches all of them, fewer means at least
+  # one name is somewhere this tree does not own. Measured on a live host, a
+  # full walk of 61k files costs 0.2s, so this is not worth an early exit.
+  #
+  # The counting pass prints NO paths — only two integers per name — because a
+  # path may contain a newline and would split one record into two, corrupting
+  # the counts. The offending path is looked up afterwards, by inode, and only
+  # on the refusal path.
+  ino=$(cache_scan "$limit" find "$root" -type f -links +1 -printf '%n %i\n' 2>/dev/null \
+    | awk '{ n[$2] = $1; c[$2]++ } END { for (i in c) if (c[i] < n[i]) { print i; exit } }') || {
+    log "refusing $root: it could not be scanned for hardlinks inside the remaining budget"
+    return 0
+  }
+  if [ -n "$ino" ]; then
+    bad=$(cache_scan "$limit" find "$root" -inum "$ino" -printf '%y %M %p\n' -quit 2>/dev/null) \
+      || bad="inode $ino"
+    log "refusing $root: it holds a hardlink to a file outside the tree ($(safe_for_log "$bad"))"
     return 0
   fi
   # File capabilities are invisible to -perm, and `cp -a` copies xattrs, so a
@@ -673,7 +722,7 @@ cache_master_is_hostile() { # [<tree>] [strict]
       return 0
     }
     if [ -n "$bad" ]; then
-      log "refusing $root: it holds a file capability ($bad)"
+      log "refusing $root: it holds a file capability ($(safe_for_log "$bad"))"
       return 0
     fi
   elif [ "${2:-}" = "strict" ]; then
@@ -692,16 +741,36 @@ cache_master_is_hostile() { # [<tree>] [strict]
   # consumer's warm script left one behind, `chmod -R go+rX` would publish it to
   # every uid on the host and `cp -a` would then hand a copy to every slot. Refuse
   # rather than distribute it.
-  bad=$(cache_scan "$limit" find "$root" -type f \( \
+  #
+  # BOUNDED TO THE TOP OF THE TREE, and the bound is what lets the name list be
+  # honest. Unbounded, this pass reads inside extracted package payloads, where
+  # a `.npmrc` or a `.pem` is a dependency's own test fixture rather than a leak
+  # — Yarn Classic extracts tarballs into its cache, so one package shipping one
+  # such file takes every host on every pool cold, and the symptom is a slow
+  # pool that nobody watches per job. A check that fires on correct content gets
+  # deleted, and then the real leak has nothing standing in front of it.
+  #
+  # Depth matches the threat. What this defends against is a warm script that
+  # dropped a credential where it works from: the cache root or a tool's own
+  # directory. That is depth 1 to 3. Nothing at that depth is package payload —
+  # measured on a live host, the whole tree above depth 3 is twelve entries and
+  # every one of them is a tool directory — so at this depth a match is a leak
+  # and refusing the whole master is the proportionate answer. Deeper than that,
+  # a match is somebody else's fixture and refusing the master is not.
+  bad=$(cache_scan "$limit" find "$root" -maxdepth 3 -type f \( \
       -name '.npmrc' -o -name '.yarnrc' -o -name '.yarnrc.yml' -o -name '.netrc' \
       -o -name '.pypirc' -o -name '.git-credentials' -o -name 'auth.json' \
       -o -name 'settings.xml' -o -iname 'nuget.config' -o -name 'credentials' \
+      -o -name '.dockercfg' -o -name '.pgpass' -o -name 'pip.conf' -o -name '.env' \
+      -o -name 'gradle.properties' -o -name 'application_default_credentials.json' \
+      -o -name 'id_rsa' -o -name 'id_dsa' -o -name 'id_ecdsa' -o -name 'id_ed25519' \
+      -o -name '*.pem' \
     \) -print -quit 2>/dev/null) || {
     log "refusing $root: it could not be scanned for credential files inside the remaining budget"
     return 0
   }
   if [ -n "$bad" ]; then
-    log "refusing $root: it holds what looks like a credential file ($bad)"
+    log "refusing $root: it holds what looks like a credential file ($(safe_for_log "$bad"))"
     return 0
   fi
   return 1
