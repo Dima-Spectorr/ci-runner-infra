@@ -888,21 +888,38 @@ behaves that a consuming repository needs to know before copying it in:
   unit by policy.
 
   Gradle is read from **both** sides: the build-file walk, and the `include`
-  lines of `settings.gradle[.kts]`. A subproject is a module because the
+  declarations of `settings.gradle[.kts]`. A subproject is a module because the
   settings file declares it, not because it happens to hold a `build.gradle` —
   one configured entirely from the root build has none, and a sibling that does
-  keeps CHECK 8 quiet about it.
+  keeps CHECK 8 quiet about it. The declarations are matched **across lines**,
+  because the ordinary Kotlin form is `include(` with one project per following
+  line, and a reader anchored to the `include` line finds nothing there. A
+  settings file that exists but cannot be read **fails the build**
+  (`CHECK 11 gradle-settings-readable`): "unreadable" yields the same empty
+  answer as "no subprojects", which is the whole failure family in one line.
 
   A **root** manifest is never a unit — a root `go.mod`, root `pom.xml` or root
   `requirements.txt` is not an area, it is what every area is part of, so it
   belongs in the barrier. **The vacuity check follows the same rule** (fixed
-  2026-08-21): counting a root manifest there while discovery refuses to made an
-  ordinary single-package repository — one root `pom.xml`, one root Dockerfile —
-  fail CHECK 8 with a correct catch-all barrier in place and no way to satisfy
-  the message. Unsatisfiable red is how a real detector gets weakened to quieten
-  it. What a root-only build actually requires is asserted positively instead:
-  **CHECK 9 `root-build-barriered`** — no sub-units means the repository *is*
-  one unit, so the barrier must claim its root manifest.
+  2026-08-21): when the vacuity check counted a root manifest that discovery
+  refuses to count, an ordinary single-package repository — one root `pom.xml`,
+  one root Dockerfile — failed CHECK 8 with a correct catch-all barrier in
+  place and no way to satisfy the message. Unsatisfiable red is how a real detector gets weakened to quieten
+  it. What the root actually requires is asserted positively instead, in two
+  checks that are deliberately separate:
+
+  - **CHECK 9 `root-build-barriered`** — the root manifests (`pom.xml`,
+    `go.mod`, `package.json`, `pnpm-workspace.yaml`, `settings.gradle[.kts]`,
+    root `build.gradle`) must be **barriered**, in every repository, not only
+    root-only ones. A root manifest belongs to no area, so unbarriered it
+    carries the empty scope set and is tested beside the very builds it just
+    changed. Conditioning this on "no sub-units" — the first version did —
+    switched it off precisely in the multi-module repositories where it matters.
+  - **CHECK 10 `root-build-covered`** — in a root-only build, barriering the
+    manifest is *not* coverage. `src/Main.java` is still unscoped, and source
+    changes are what most pull requests carry. So there, and only there, the
+    sweep is over **files**: a root-only build is small by definition, and a
+    sampled answer would be the partial coverage this gate exists to refuse.
 
   Two consequences for anyone extending this:
 

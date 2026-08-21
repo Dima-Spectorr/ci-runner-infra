@@ -308,8 +308,26 @@ def gradle_modules(root):
     return found
 
 
-GRADLE_INCLUDE_RE = re.compile(r'''^\s*include\s*\(?\s*(?P<args>['"].*)''')
+# Two forms, and the second is the one a line-oriented reader misses: Kotlin
+# settings files routinely write `include(` with one project per following line.
+# A regex anchored to the include LINE finds nothing there, and a sibling with a
+# build file keeps CHECK 8 quiet about it — partial discovery again, one level
+# down. `include(...)` is matched across lines; the Groovy `include ':a', ':b'`
+# form is matched to end of line.
+GRADLE_INCLUDE_PAREN_RE = re.compile(r'''\binclude\s*\(([^)]*)\)''', re.S)
+GRADLE_INCLUDE_BARE_RE = re.compile(r'''^[^\S\n]*include[^\S\n]+(['"][^\n]*)''', re.M)
 GRADLE_PROJECT_RE = re.compile(r'''['"]:?([A-Za-z0-9_.\-:]+)['"]''')
+# `//` and `#` line comments, and `/* */` blocks. Deliberately crude: a `//`
+# inside a string literal in a settings file is not a shape worth carrying a
+# tokenizer for, and the cost of being wrong is one extra unit to scope.
+GRADLE_COMMENT_RE = re.compile(r'''/\*.*?\*/|//[^\n]*|^[^\S\n]*#[^\n]*''',
+                               re.S | re.M)
+
+# Reading a settings file must not fail open. An unreadable one yields "no
+# extra subprojects", which is indistinguishable from "there are none" — and if
+# any sibling has a build file, CHECK 8 stays quiet too, so the gate reports OK
+# having silently skipped the only declaration of who the areas are.
+gradle_settings_unreadable = []
 
 
 def gradle_settings_projects(root):
@@ -334,13 +352,17 @@ def gradle_settings_projects(root):
             continue
         try:
             text = open(path, encoding='utf-8', errors='replace').read()
-        except Exception:
+        except Exception as exc:
+            gradle_settings_unreadable.append("%s (%s)" % (fname, exc))
             continue
-        for line in text.splitlines():
-            m = GRADLE_INCLUDE_RE.match(line)
-            if not m:
-                continue
-            for proj in GRADLE_PROJECT_RE.findall(m.group('args')):
+        # Matching across lines means a commented-out `include(":old")` — the
+        # usual way a module is retired — would otherwise resurrect it as a unit
+        # and demand a scope for a directory that may not even exist any more.
+        text = GRADLE_COMMENT_RE.sub('', text)
+        args = ([m.group(1) for m in GRADLE_INCLUDE_PAREN_RE.finditer(text)]
+                + [m.group(1) for m in GRADLE_INCLUDE_BARE_RE.finditer(text)])
+        for chunk in args:
+            for proj in GRADLE_PROJECT_RE.findall(chunk):
                 rel = proj.strip(':').replace(':', '/')
                 if rel and os.path.isdir(os.path.join(root, rel)):
                     names.add(rel)
@@ -421,15 +443,20 @@ def has_any_manifest(root):
     return False
 
 
-ROOT_MANIFEST_NAMES = ('go.mod', 'package.json', 'pom.xml') + GRADLE_BUILD_FILES
+ROOT_MANIFEST_NAMES = (('go.mod', 'package.json', 'pom.xml',
+                        'pnpm-workspace.yaml',
+                        'settings.gradle', 'settings.gradle.kts')
+                       + GRADLE_BUILD_FILES)
 
 
 def root_manifests(root):
     """Build manifests sitting at the repository root, if any.
 
-    Never units — see `has_any_manifest` — but not nothing either: in a
-    single-package repository they ARE the build, so CHECK 9 requires them to
-    be barriered rather than left to match nothing.
+    Never units — see `has_any_manifest` — but not nothing either: they are
+    what every area is part of, so CHECK 9 requires them to be barriered rather
+    than left to match nothing. `settings.gradle` and `pnpm-workspace.yaml`
+    count for exactly that reason: they carry plugin resolution, repositories
+    and the project list, so a change to one can alter every module's build.
     """
     try:
         names = sorted(os.listdir(root))
@@ -539,6 +566,18 @@ barrier_excludes = barrier_files.get('exclude') or []
 
 def is_barriered(probe):
     return matches(barriers, probe) and not matches(barrier_excludes, probe)
+
+
+def is_scoped(probe):
+    for _sname, sdef in (files or {}).items():
+        sdef = sdef or {}
+        if matches(sdef.get('include'), probe) and not matches(sdef.get('exclude'), probe):
+            return True
+    return False
+
+
+def is_covered(probe):
+    return is_barriered(probe) or is_scoped(probe)
 queue_mode = mq.get('mode', 'serial')
 width = mq.get('max_parallel_checks')
 
@@ -594,15 +633,7 @@ checks.append('coverage')
 uncovered = []
 for rel in sorted(units):
     _kind, _name, probe = units[rel]
-    if is_barriered(probe):
-        continue
-    hit = False
-    for _sname, sdef in (files or {}).items():
-        sdef = sdef or {}
-        if matches(sdef.get('include'), probe) and not matches(sdef.get('exclude'), probe):
-            hit = True
-            break
-    if not hit:
+    if not is_covered(probe):
         uncovered.append(rel)
 if uncovered and queue_mode == 'parallel':
     fail('coverage',
@@ -671,27 +702,85 @@ if not units and has_any_manifest(root):
          "layout before "
          "trusting a pass here.")
 
-# CHECK 9 — a root-only build is still a build.
+# CHECK 9 — the root manifest is barriered, whether or not sub-units exist.
 #
-# With no sub-unit anywhere, the repository IS one unit and CHECK 4 has nothing
-# to iterate: it passes over the empty set. That is the one place where "no
-# units" and "nothing to check" genuinely coincide in the configuration and
-# genuinely do not coincide in reality — every pull request here touches the
-# single build, so the catch-all barrier must actually claim the root manifest.
-# Asserting it positively is what keeps CHECK 8's root exemption from becoming
-# a hole: the root is exempt from being a UNIT, not from being covered.
+# The root is exempt from being a UNIT, not from being covered, and that
+# distinction is the whole point: a root pom.xml, settings.gradle,
+# pnpm-workspace.yaml is what every area is part of, so a change to one can
+# alter every module's build. (Lockfiles are not listed here: they belong in the
+# barrier for the same reason, but they are not a build DECLARATION and this
+# check is deliberately about the files discovery itself reads.) Left out of the barrier it matches
+# nothing, carries the empty scope set, and in parallel mode is tested beside
+# the very builds it just changed.
+#
+# Conditioning this on `not units` — as the first version did — disabled it in
+# exactly the repositories where it matters most: a multi-module tree with its
+# root manifest barrier-excluded reported OK because its children were
+# discovered.
 checks.append('root-build-barriered')
-if queue_mode == 'parallel' and not units:
+if queue_mode == 'parallel':
     loose = [m for m in root_manifests(root) if not is_barriered(m)]
     if loose:
         fail('root-build-barriered',
-             "this repository declares its build only at the root (%s) and has "
-             "no sub-units, so every pull request touches that one build — but "
-             "the root manifest is not barriered. In parallel mode it would "
-             "carry the empty scope set and run beside everything. Widen "
+             "root build manifest(s) not barriered: %s. A root manifest belongs "
+             "to no area — it is what every area is part of — so in parallel "
+             "mode it carries the empty scope set and runs beside everything, "
+             "including the builds it just changed. Widen "
              "scopes.barrier_files.include (the fail-safe shape is `**/*` minus "
              "exactly the scope includes)."
              % ", ".join(loose))
+
+# CHECK 10 — a root-only build is covered as a whole, not just at its manifest.
+#
+# With no sub-unit anywhere the repository IS one unit, and CHECK 4 has nothing
+# to iterate: it passes over the empty set. Barriering `pom.xml` alone does not
+# fix that — `src/Main.java` is still unscoped and unbarriered, and it is source
+# changes, not manifest changes, that most pull requests carry. So here, and
+# only here, the sweep is over FILES: a root-only build is small by definition,
+# and a sampled answer would be exactly the partial coverage this gate exists to
+# refuse.
+#
+# It runs only when a ROOT MANIFEST exists. No units and no manifest anywhere is
+# a repository with no build at all — a docs or Terraform tree — and sweeping
+# every file there would demand a scope map for prose. Absence of sub-units is
+# not by itself evidence of a root build.
+#
+# Build outputs are skipped along with the vendored directories. They are not
+# paths a pull request touches, and a tracked artifact under `dist/` is a
+# problem of a different kind than this check reports.
+checks.append('root-build-covered')
+if queue_mode == 'parallel' and not units and root_manifests(root):
+    naked = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in SKIP_DIRS and d not in PYTHON_SKIP_DIRS
+                       and d not in ('build', 'target', 'dist')]
+        for fn in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, fn), root)
+            rel = rel.replace(os.sep, '/')
+            if not is_covered(rel):
+                naked.append(rel)
+        if len(naked) > 25:
+            break
+    if naked:
+        fail('root-build-covered',
+             "this repository declares its build only at the root, so every "
+             "pull request touches that one build — but %d file(s) match no "
+             "scope and no barrier and would carry the empty scope set:\n  %s"
+             % (len(naked), "\n  ".join(sorted(naked)[:25])))
+
+# CHECK 11 — a settings file that could not be read fails closed.
+#
+# An unreadable settings.gradle yields "no extra subprojects", which is
+# indistinguishable from "there are none"; with one sibling build file, CHECK 8
+# stays quiet too, and the gate reports OK having skipped the only declaration
+# of who the areas are.
+checks.append('gradle-settings-readable')
+if gradle_settings_unreadable:
+    fail('gradle-settings-readable',
+         "could not read %s. Discovery would silently omit every subproject "
+         "declared only there; refusing to report coverage over a project list "
+         "this run never saw." % ", ".join(gradle_settings_unreadable))
 
 print("checks run: %s" % ",".join(checks))
 if errors:
@@ -749,6 +838,7 @@ selftest() {
 scopes:
   barrier_files:
     include:
+      - "*"
       - package.json
   default_capacity: 2
   source:
@@ -769,6 +859,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - package.json
   source:
     files:
@@ -801,6 +892,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - package.json
   source:
     files:
@@ -817,6 +909,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - package.json
   source:
     files:
@@ -835,6 +928,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - package.json
   source:
     files:
@@ -850,7 +944,11 @@ scopes:
   mode: parallel
   max_parallel_checks: 2
 '
-  expect "parallel without scopes" "$tmp/no-scopes" "coverage,parallel-needs-barriers,parallel-needs-scopes"
+  # `root-build-barriered` belongs in this set: with no barrier at all, the root
+  # pnpm-workspace.yaml — the file that decides what every package IS — is one
+  # more change carrying the empty scope set.
+  expect "parallel without scopes" "$tmp/no-scopes" \
+         "coverage,parallel-needs-barriers,parallel-needs-scopes,root-build-barriered"
 
   # A capacity above the width reads like a raise and does nothing.
   make_fixture "$tmp/cap-over" 'merge_queue:
@@ -859,6 +957,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - package.json
   capacities:
     a: 5
@@ -877,6 +976,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - package.json
   capacities:
     frontend: 1
@@ -896,6 +996,7 @@ scopes:
   merge_queue_scope: a
   barrier_files:
     include:
+      - "*"
       - package.json
   source:
     files:
@@ -913,6 +1014,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - apps/beta/**
   source:
     files:
@@ -936,6 +1038,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - apps/alpha/**
@@ -956,6 +1059,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - apps/alpha/**
@@ -984,6 +1088,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - services/alpha/**
@@ -1008,6 +1113,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - services/alpha/**
@@ -1043,6 +1149,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - services/alpha/**
@@ -1067,6 +1174,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - services/alpha/**
@@ -1100,6 +1208,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - app/alpha/**
@@ -1123,6 +1232,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - app/alpha/**
@@ -1171,6 +1281,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - svc/alpha/**
@@ -1195,6 +1306,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - svc/alpha/**
@@ -1225,6 +1337,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - app/sweeper/**
@@ -1247,6 +1360,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - svc/alpha/**
@@ -1272,6 +1386,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
   source:
     files:
@@ -1295,6 +1410,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - svc/alpha/**
@@ -1311,7 +1427,10 @@ scopes:
   # without settings parsing discovery is not empty, CHECK 8 stays quiet, and
   # an entire unscoped subproject enters the parallel queue behind an OK.
   mkdir -p "$tmp/gradle-settings/app/alpha" "$tmp/gradle-settings/app/beta"
-  printf 'rootProject.name = "x"\ninclude(":app:alpha")\ninclude(":app:beta")\n' \
+  # Written in the MULTILINE Kotlin form on purpose: a reader anchored to the
+  # `include` line finds no quoted project there and discovers nothing, while
+  # `app/alpha`'s build file keeps CHECK 8 quiet.
+  printf 'rootProject.name = "x"\ninclude(\n    ":app:alpha",\n    ":app:beta",\n)\n' \
     > "$tmp/gradle-settings/settings.gradle.kts"
   printf 'plugins {}' > "$tmp/gradle-settings/app/alpha/build.gradle.kts"
   printf '%s' 'merge_queue:
@@ -1320,6 +1439,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - app/alpha/**
@@ -1346,6 +1466,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
   source:
     files:
@@ -1366,6 +1487,7 @@ scopes:
 scopes:
   barrier_files:
     include:
+      - "*"
       - "**/*"
     exclude:
       - pom.xml
@@ -1375,8 +1497,109 @@ scopes:
         include:
           - docs/**
 ' > "$tmp/root-loose/.mergify.yml"
+  # Both fire, and they say different things: CHECK 9 that the manifest itself
+  # is loose, CHECK 10 that the file is loose as one of the build's files. The
+  # fixture below separates them.
   expect "unbarriered root-only build is reported" "$tmp/root-loose" \
-         "root-build-barriered"
+         "root-build-barriered,root-build-covered"
+
+  # Barriering the root manifest is NOT coverage of a root-only build. Here
+  # pom.xml is barriered and CHECK 9 is satisfied, yet `src/Main.java` — the
+  # kind of file most pull requests actually change — matches no scope and no
+  # barrier, so it would carry the empty scope set and run beside everything.
+  # That is why CHECK 10 sweeps files rather than the manifest.
+  mkdir -p "$tmp/root-src/src"
+  printf '<project/>' > "$tmp/root-src/pom.xml"
+  printf 'class Main {}' > "$tmp/root-src/src/Main.java"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - pom.xml
+      - .mergify.yml
+  source:
+    files:
+      a:
+        include:
+          - docs/**
+' > "$tmp/root-src/.mergify.yml"
+  expect "root-only build with unscoped sources is reported" "$tmp/root-src" \
+         "root-build-covered"
+
+  # A commented-out include stays retired. Matching across lines costs the
+  # anchor that used to make this impossible, so `:app:gone` — whose directory
+  # is still on disk, unscoped and barrier-excluded — would come back as a unit
+  # and demand a scope for a module nobody builds.
+  mkdir -p "$tmp/gradle-commented/app/alpha" "$tmp/gradle-commented/app/gone"
+  printf 'plugins {}' > "$tmp/gradle-commented/app/alpha/build.gradle.kts"
+  printf 'rootProject.name = "x"\n// include(":app:gone")\n/* include(":app:gone") */\ninclude(":app:alpha")\n' \
+    > "$tmp/gradle-commented/settings.gradle.kts"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "*"
+      - "**/*"
+    exclude:
+      - app/alpha/**
+      - app/gone/**
+  source:
+    files:
+      a:
+        include:
+          - app/alpha/**
+' > "$tmp/gradle-commented/.mergify.yml"
+  expect "commented-out gradle include stays retired" "$tmp/gradle-commented" ""
+
+  # No units and no root manifest is a repository with no build at all — a docs
+  # or Terraform tree. CHECK 10 must not sweep its files and demand a scope map
+  # for prose: absence of sub-units is not evidence of a root build.
+  mkdir -p "$tmp/no-build/docs"
+  printf '# hello\n' > "$tmp/no-build/docs/readme.md"
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "*"
+    exclude:
+      - docs/**
+  source:
+    files:
+      a:
+        include:
+          - apps/**
+' > "$tmp/no-build/.mergify.yml"
+  expect "repository with no build at all passes" "$tmp/no-build" ""
+
+  # An unreadable settings.gradle fails closed rather than reporting "no extra
+  # subprojects", which is what silently skipping the project list looks like.
+  mkdir -p "$tmp/gradle-unreadable/app/alpha"
+  printf 'plugins {}' > "$tmp/gradle-unreadable/app/alpha/build.gradle.kts"
+  mkdir -p "$tmp/gradle-unreadable/settings.gradle.kts"   # a directory: unreadable as a file
+  printf '%s' 'merge_queue:
+  mode: parallel
+  max_parallel_checks: 2
+scopes:
+  barrier_files:
+    include:
+      - "*"
+      - "**/*"
+    exclude:
+      - app/alpha/**
+  source:
+    files:
+      a:
+        include:
+          - app/alpha/**
+' > "$tmp/gradle-unreadable/.mergify.yml"
+  expect "unreadable gradle settings fails closed" "$tmp/gradle-unreadable" \
+         "gradle-settings-readable"
 
   if [ "$failed" -ne 0 ]; then
     echo "check-mergify-scopes: SELF-TEST FAILED" >&2
