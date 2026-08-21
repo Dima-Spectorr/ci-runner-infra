@@ -111,7 +111,7 @@ has_slot_isolation() { # <file>
   matches "$code" 'chmod 0750 "/home/\$u"' || return 1
   # and the agent runs as the slot's own user
   matches "$code" '^User=\$u$' || return 1
-  matches "$code" 'sudo -u "\$u" "\$dir/config\.sh"'
+  matches "$code" 'sudo -u "\$u" .*"\$dir/config\.sh"'
 }
 
 # A slot whose daemon is up but cannot START a container is the failure this
@@ -383,6 +383,50 @@ else
   bad "matches() is unreliable on a large input — the pipefail/SIGPIPE trap is back, and every predicate below is now untrustworthy"
 fi
 
+# Nothing that mints a token may be an ARGUMENT (#107). /proc/<pid>/cmdline is
+# world-readable, the slot units are not ordered against the startup script, and
+# on a reboot of a WARM host the script runs while agents from the previous boot
+# are executing job code — so a job can poll for the App JWT (which mints
+# installation tokens for the whole installation) and the registration token
+# (which joins an arbitrary machine to the pool) while they are being used.
+#
+# Silent when broken in both directions: the argv form works perfectly, and the
+# hardening below is invisible until someone goes looking for it.
+has_secrets_out_of_argv() { # <file>
+  local code joined
+  code=$(code_of "$1")
+  joined=$(joined_code_of "$1")
+
+  # The blanket rule, stated as the absence it is: no Authorization header on
+  # any command line in this script, whatever the token.
+  ! matches "$code" '-H "Authorization: Bearer' || return 1
+
+  # curl reads it from a config file on a fd this shell owns instead. `printf`
+  # is a builtin, so the value is never in any process's argv on the way there.
+  matches "$code" 'header = "Authorization: Bearer %s"' || return 1
+  matches "$code" '\-K <\(printf.*"\$jwt"\)' || return 1
+  matches "$code" '\-K <\(printf.*"\$tok"\)' || return 1
+
+  # config.sh is not curl. actions/runner takes every `configure` argument as
+  # ACTIONS_RUNNER_INPUT_<NAME> and clears it from its own environment block, so
+  # the token lands in /proc/<pid>/environ — owner-only — instead.
+  ! matches "$joined" 'config\.sh([^|;&]|\\)*--token' || return 1
+  matches "$code" '^  ACTIONS_RUNNER_INPUT_TOKEN="\$token"' || return 1
+  # The NAME in argv, the VALUE in the environment. `sudo VAR=value` would have
+  # put the token straight back into sudo's own cmdline.
+  matches "$code" 'sudo -u "\$u" --preserve-env=ACTIONS_RUNNER_INPUT_TOKEN' || return 1
+  # And fails closed: sudo's env_reset dropping the variable is silent, so a
+  # host that cannot carry it must not register rather than fall back to argv.
+  matches "$joined" 'sudo_passes_env "\$u".*return 1' || return 1
+
+  # Belt, so the next call site cannot reintroduce the class: both slot units
+  # (they share a mount namespace, so one-sided is a coin toss) plus the host
+  # /proc, which is what stops a `--pid=host` container from seeing around them.
+  [ "$(printf '%s\n' "$code" | grep -cE '^ProtectProc=invisible')" -eq 2 ] || return 1
+  matches "$code" 'remount,nosuid,nodev,noexec,hidepid=2 /proc' || return 1
+  matches "$code" '^  harden_proc$'
+}
+
 # --- the real script must satisfy both ---------------------------------------
 if has_disableupdate "$SCRIPT"; then
   ok
@@ -444,6 +488,12 @@ if has_container_mtu "$SCRIPT"; then
   ok
 else
   bad "job containers get dockerd's default 1500-byte MTU on a 1460-byte path — large TLS responses are black-holed and surface as a truncated handshake or a dependency that 'was not found', in a different place each run (Borsh-Tablet-App, first green pool run)"
+fi
+
+if has_secrets_out_of_argv "$SCRIPT"; then
+  ok
+else
+  bad "a token that mints other tokens is passed as an argument, or the argv of one uid is still readable by another — a job running on a warm host can read the App JWT or the registration token out of /proc while the startup script uses them (#107)"
 fi
 
 if has_baked_image_load "$SCRIPT"; then
@@ -527,6 +577,16 @@ mutate "unchecked archives loaded again"     's|"\$nmatch" -ne 1|"$nmatch" -ge 0
 mutate "digest no longer verified"           's|sha256sum -c --status|cat|'                                         has_baked_image_load
 mutate "loads left to the cgroup killer"     's|wait \${IMAGE_LOAD_PIDS}|:|'                                        has_baked_image_load
 mutate "image store no longer reported"      's|io.containerd.snapshotter.v1|containerd|g'                          has_baked_image_load
+
+mutate "App JWT back in curl argv"        's@-K <(printf.*\$jwt")@-H "Authorization: Bearer $jwt"@'          has_secrets_out_of_argv
+mutate "registration token back in curl argv" 's@-K <(printf.*\$tok")@-H "Authorization: Bearer $tok"@'          has_secrets_out_of_argv
+mutate "env prefix dropped from config.sh" '/^  ACTIONS_RUNNER_INPUT_TOKEN=/d'                                    has_secrets_out_of_argv
+mutate "sudo stops preserving the variable" 's@--preserve-env=ACTIONS_RUNNER_INPUT_TOKEN @@'                      has_secrets_out_of_argv
+mutate "--token added back alongside it"   's@--url "https://github.com/$OWNER@--token "$token" --url "https://github.com/$OWNER@' has_secrets_out_of_argv
+mutate "silent env drop no longer fatal"   '/sudo will not pass an environment variable/s@; return 1; }@; }@'     has_secrets_out_of_argv
+mutate "only one slot unit hides /proc"    '0,/^ProtectProc=invisible/s@^ProtectProc=invisible@#&@'               has_secrets_out_of_argv
+mutate "hidepid weakened to 1"             's@hidepid=2@hidepid=1@'                                               has_secrets_out_of_argv
+mutate "host /proc left readable"          '/^  harden_proc$/d'                                                   has_secrets_out_of_argv
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

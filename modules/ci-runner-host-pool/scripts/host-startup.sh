@@ -144,8 +144,18 @@ gh_token() {
     | openssl dgst -sha256 -sign <(printf '%s' "$key") | b64)
   jwt="$header.$payload.$sig"
 
+  # THE JWT IS NOT AN ARGUMENT, and that is the same security property cache_fetch
+  # spells out below: /proc/<pid>/cmdline is world-readable, the slot units are not
+  # ordered against google-startup-scripts.service, and on a reboot of a WARM host
+  # this runs while already-registered agents are executing job code. This token is
+  # worth more than the instance token that motivated the pattern — it mints
+  # installation tokens for the whole installation.
+  #
+  # `printf` is a shell builtin, so nothing execs with the JWT in ITS argv either,
+  # and the config file is a process substitution: the fd belongs to root, it has
+  # no name a slot user could open, and it is gone when curl exits.
   curl "${CURL_TIMEOUTS[@]}" -fsS -X POST \
-    -H "Authorization: Bearer $jwt" \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$jwt") \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" \
     | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
@@ -155,8 +165,11 @@ registration_token() {
   local tok
   tok=$(gh_token) || return 1
   [ -n "$tok" ] || return 1
+  # Out of argv for the same reason as the JWT above, and for one more: this token
+  # joins an arbitrary machine to the pool, so a job that read it off /proc could
+  # register a runner it controls and be handed other repositories' jobs.
   curl "${CURL_TIMEOUTS[@]}" -fsS -X POST \
-    -H "Authorization: Bearer $tok" \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$tok") \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/$OWNER/$REPO/actions/runners/registration-token" \
     | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
@@ -1841,6 +1854,15 @@ Environment=PATH=/usr/bin:/usr/sbin:/bin:/sbin
 # scratch file) and moves between repositories with whichever slot got there
 # first, so it is worth fixing on the host rather than in every workflow.
 PrivateTmp=yes
+# Hide every other uid's processes from this slot. Set here as well as on the
+# agent because the two SHARE a mount namespace (JoinsNamespaceOf), and /proc is
+# a property of that namespace rather than of either unit: setting it on one
+# side only would leave which view wins depending on which started first.
+#
+# Ignored with a warning by systemd older than 247, which is why it is not the
+# argument for anything — it is the belt over the tokens already being out of
+# argv, not a substitute for it.
+ProtectProc=invisible
 ExecStart=/usr/bin/dockerd-rootless.sh
 # Rootless dockerd needs its own cgroup subtree to set any resource limit;
 # without delegation it still runs, but every limit a job asks for is ignored.
@@ -2134,6 +2156,34 @@ wait_for_image_loads() {
   log "baked image loads finished"
 }
 
+# Can sudo carry a variable from THIS environment into the child's, without the
+# value ever being an argument? That is how the registration token reaches
+# config.sh (see install_slot), so the answer decides whether a slot may be
+# registered at all.
+#
+# It is probed rather than assumed because it is not this script's policy to
+# read: sudo's env_reset drops everything not explicitly preserved, and
+# --preserve-env=NAME is honoured only where sudoers grants SETENV — which it
+# implies for an entry whose command is ALL, as root's is on every image this
+# pool uses. If that ever stops being true the variable is dropped SILENTLY and
+# the runner asks for a token it will never get, which surfaces as an
+# unexplained "config.sh failed". Probed once: the policy is a property of the
+# invoking user, root, and does not vary by slot.
+#
+# 0 = not probed, 1 = works, 2 = does not.
+SUDO_ENV_PROBE=0
+sudo_passes_env() { # <user>
+  if [ "$SUDO_ENV_PROBE" -eq 0 ]; then
+    if CI_SUDO_ENV_PROBE=ok sudo -u "$1" --preserve-env=CI_SUDO_ENV_PROBE \
+         sh -c '[ "${CI_SUDO_ENV_PROBE:-}" = ok ]' 2>/dev/null; then
+      SUDO_ENV_PROBE=1
+    else
+      SUDO_ENV_PROBE=2
+    fi
+  fi
+  [ "$SUDO_ENV_PROBE" -eq 1 ]
+}
+
 install_slot() {
   local idx="$1" token="$2"
   local dir="$SLOT_ROOT/$idx"
@@ -2170,6 +2220,12 @@ install_slot() {
   local group_arg=()
   [ -n "$RUNNER_GROUP" ] && group_arg=(--runnergroup "$RUNNER_GROUP")
 
+  # Fails CLOSED, and before the copy is registered rather than after: a host
+  # where sudo will not carry the token through the environment has no way left
+  # to hand it to config.sh that does not publish it in argv. See the call below.
+  sudo_passes_env "$u" \
+    || { log "slot $idx: sudo will not pass an environment variable through, and the only other way to hand config.sh its registration token is world-readable argv"; return 1; }
+
   # SC2024: the redirect is opened by THIS shell, which is root (startup-script
   # runs as root); sudo only drops privilege for config.sh itself. Writing the
   # log as root is intended — a job must not be able to rewrite the boot log.
@@ -2181,10 +2237,27 @@ install_slot() {
   # host lives for hours, so a self-update takes K slots down at once instead of
   # one short-lived VM. The image pins the agent version; upgrades ship by
   # rebuilding the image, which is reviewable.
-  sudo -u "$u" "$dir/config.sh" \
+  # THE REGISTRATION TOKEN IS NOT AN ARGUMENT either, and this is the call the
+  # exposure was really about: config.sh is a long-lived .NET process, not a
+  # sub-second curl, and it runs while the slots that are already up serve jobs.
+  #
+  # actions/runner accepts every `configure` argument as ACTIONS_RUNNER_INPUT_<NAME>
+  # and deletes the variable from its own environment block before it configures
+  # anything (Runner.Listener CommandSettings), so the value sits in
+  # /proc/<pid>/environ — readable only by the owning uid — and not in
+  # /proc/<pid>/cmdline, which anyone on the host can read. `token` is on the
+  # runner's own secret-arg list, so its trace output is masked too.
+  #
+  # --preserve-env=NAME puts the NAME in argv and leaves the VALUE in the
+  # environment, which is the entire point; `sudo ACTIONS_RUNNER_INPUT_TOKEN=...`
+  # would have put the token straight back into sudo's own cmdline.
+  #
+  # Fails CLOSED: a host where sudo will not carry the variable has no way left to
+  # register that does not publish the token, so it does not register.
+  ACTIONS_RUNNER_INPUT_TOKEN="$token" \
+  sudo -u "$u" --preserve-env=ACTIONS_RUNNER_INPUT_TOKEN "$dir/config.sh" \
     --unattended --replace --disableupdate \
     --url "https://github.com/$OWNER/$REPO" \
-    --token "$token" \
     --name "$name" \
     --labels "$LABELS" \
     --work "$dir/_work" \
@@ -2240,6 +2313,10 @@ $CACHE_ENV
 # clean credential state must not run with a previous job's identity.
 Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci/job-hooks/reset-credentials.sh
 Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/reset-credentials.sh
+# The one that matters: this is the unit job code runs under, and everything a
+# job spawns inherits this mount namespace, so a step cannot read root's argv --
+# nor a sibling slot's — out of /proc. See the daemon unit for why both carry it.
+ProtectProc=invisible
 ExecStart=$dir/run.sh
 # The controller drains a host by DEREGISTERING its agents through the GitHub
 # API, which GitHub refuses while an agent is executing a job. Restart=no here
@@ -2258,10 +2335,40 @@ EOF
   log "slot $idx registered as $name"
 }
 
+# ProtectProc= covers the slot units, and a container is the hole it leaves: a
+# job can ask its own daemon for `--pid=host`, and a fresh procfs mount inside
+# that namespace would show the whole host again. The kernel refuses such a mount
+# unless it is at least as restrictive as the one already visible, so setting
+# hidepid on the host /proc is what makes the unit-level setting hold everywhere
+# below it.
+#
+# hidepid=2, not 1: 1 hides the contents of another uid's /proc/<pid> but still
+# lists the pid, and the argv of a boot-time process is exactly what must not be
+# enumerable. No gid= escape hatch — a group that can see everything is the
+# thing being removed.
+#
+# Fails OPEN, deliberately, and it is the only hardening here that does. The
+# security property is that the tokens are not in argv at all; this makes the
+# whole CLASS unreadable so a future call site cannot reintroduce it. A kernel
+# or a mount policy that will not take the option is a reason to log loudly, not
+# a reason to take a pool offline over a defence in depth.
+harden_proc() {
+  if mount -o remount,nosuid,nodev,noexec,hidepid=2 /proc 2>/dev/null; then
+    log "/proc remounted hidepid=2 — one uid cannot read another's argv"
+  else
+    log "WARNING: could not remount /proc with hidepid=2; argv stays world-readable on this host, so every future call site must keep its own secrets out of it"
+  fi
+}
+
 main() {
   mkdir -p "$SLOT_ROOT"
   id runner >/dev/null 2>&1 || die "golden image is missing the 'runner' user"
   [ -x /usr/bin/dockerd-rootless.sh ] || die "golden image has no rootless docker (dockerd-rootless.sh) — a host without it can only give every slot the same daemon, which is the exposure #10 removed"
+
+  # First, and before any slot exists: the window this closes is the one where
+  # THIS script holds a GitHub App JWT while agents from a previous boot are
+  # already serving jobs.
+  harden_proc
 
   # The shared rootful daemon is the thing being removed: while its socket
   # exists, any slot that can reach it is back to full control of every other
