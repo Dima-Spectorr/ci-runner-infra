@@ -792,7 +792,7 @@ has_no_write_grant_on_the_bucket() { # <file>
 # The publishing script is the only writer into the trusted path, so what it
 # refuses matters as much as what it does.
 has_trusted_snapshot_build() { # <file>
-  local code reporter labeller line rest form arg label
+  local code reporter labeller confirmer line rest form arg label
   code=$(code_of "$1")
   # Built into a fresh staging tree, never from a host's cache. /opt/ci-cache is
   # the master's path and must not appear at all: an archive of it would put a
@@ -926,7 +926,11 @@ has_trusted_snapshot_build() { # <file>
   # public. The narrower one governs the log: private-key only, and still ≥1024
   # because this rule matches a header, not the key.
   matches "$code" "SCAN_PRINTABLE_LABELS='private-key-header'" || return 1
-  matches "$code" '\*" \$label "\* \) ;;' || return 1
+  # Anchored to the walk's own indentation. Unanchored, the one-line case in
+  # scan_excusal_source_is_allowed contains this text too, and satisfies the
+  # assertion while the walk above it is inverted — which is exactly what it
+  # did until CI caught it.
+  matches "$code" '^      \*" \$label "\* \) ;;$' || return 1
   matches "$code" '^      \* \) return 1 ;;$' || return 1
   matches "$code" '\[ "\$\(wc -c <"\$1"\)" -ge "\$SCAN_EXCUSABLE_MIN_BYTES" \]' || return 1
   # One predicate per question, each asked at exactly the sites that own it. The
@@ -951,8 +955,14 @@ has_trusted_snapshot_build() { # <file>
   local -a reads_arg=(
     'matched_labels "$1"'
     'wc -c <"$1"'
+    # The confirmation stage reads the file too, and it is on the same walk for
+    # the same reason: it answers yes or no about the bytes and must never put
+    # them anywhere. Only two forms may touch its argument — the read that feeds
+    # awk, and the sanitised PATH in its own error.
+    'LC_ALL=C tr -d '"'"'\000'"'"' <"$1"'
+    'safe_path "$1"'
   )
-  for form in scan_hit_is_excusable scan_hit_digest_is_printable; do
+  for form in scan_hit_is_excusable scan_hit_digest_is_printable scan_file_holds_pem_block; do
     labeller=$(printf '%s\n' "$code" | sed -n "/^$form() {/,/^}\$/p")
     matches "$labeller" "^$form\(\) \{" || return 1
     while IFS= read -r line; do
@@ -972,6 +982,39 @@ has_trusted_snapshot_build() { # <file>
   # capability pass it would excuse something a HOST refuses, and the archive
   # would be published for every host to reject.
   [ "$(printf '%s\n' "$code" | grep -c 'scan_digest_is_allowed')" = 2 ] || return 1
+  # A digest is not enough on its own for the URL class: it has to have come from
+  # the file, where the entry names the package. Asserted at the call site AND in
+  # the table, because a table with an empty string in it silently allows
+  # everything and reads as if the rule were still there.
+  matches "$code" 'scan_digest_is_allowed "\$digest" && scan_excusal_source_is_allowed "\$labels"' || return 1
+  matches "$code" "SCAN_FILE_ONLY_LABELS='url-embedded-basic-auth'" || return 1
+  matches "$code" '"CACHE_SCAN_ALLOW_FILE"\* \) ;;' || return 1
+  # The prefilter's second question. The pattern stays the cheap one — asserted
+  # unchanged above — and the confirmation is what keeps 22 churning source files
+  # out of the allowlist. Guarded on the label being the ONLY one, so a file that
+  # also trips the token rule cannot ride out on an unconfirmed header.
+  matches "$code" '\[ "\$labels" = private-key-header \] && ! scan_file_holds_pem_block "\$bad"' || return 1
+  matches "$code" 'scan_file_holds_pem_block\(\) \{' || return 1
+  confirmer=$(printf '%s\n' "$code" | sed -n '/^scan_file_holds_pem_block() {/,/^}$/p')
+  # A body line is REQUIRED between the two markers — that is the whole rule, and
+  # a version that confirmed on BEGIN plus END alone would still flag every
+  # secret-detector source that names both.
+  matches "$confirmer" 'if \(body > 0\) found = 1' || return 1
+  # An encrypted OpenSSL key carries `Proc-Type:`/`DEK-Info:` and a blank line
+  # before its body. Drop either arm and a real encrypted key reads as
+  # unconfirmed and is published.
+  matches "$confirmer" 'inblock && /\^\[A-Za-z\]\[A-Za-z0-9-\]\*:/' || return 1
+  matches "$confirmer" 'inblock && /\^\[\[:space:\]\]\*\$/' || return 1
+  # NULs stripped, byte locale, and an errored awk refuses. Same three rules the
+  # passes that refuse already run under; a confirmation stage that fails open is
+  # a hole in the one direction that matters.
+  matches "$confirmer" "LC_ALL=C tr -d '\\\\000' <\"\\\$1\" \| LC_ALL=C awk" || return 1
+  matches "$confirmer" '\[ "\$rc" -le 1 \]' || return 1
+  # No early exit. `exit` mid-stream SIGPIPEs the `tr` in front of it and, under
+  # pipefail, turns a confirmed key into a scan error — which this file's own
+  # drain rule exists to prevent.
+  ! matches "$confirmer" 'inblock.*\{ *exit' || return 1
+  matches "$confirmer" 'END \{ exit\(found \? 0 : 1\) \}' || return 1
   # grep says >=2 for "I broke", and a >=2 that goes unread reads exactly like a
   # clean pass — on the one layer that sees an embedded credential.
   matches "$code" 'die "the staged tree could not be scanned for embedded credentials' || return 1
@@ -1726,6 +1769,29 @@ mutate_file "$PUBSH" 'a label nobody gave a floor is excusable by default' has_t
   's@^    \* \) return 1 ;;$@    * ) printf 0 ;;@'
 mutate_file "$PUBSH" 'the URL class loses its floor' has_trusted_snapshot_build \
   "s@^    url-embedded-basic-auth \\) printf '%s' \"\\\$SCAN_EXCUSABLE_MIN_BYTES\" ;;\$@    url-embedded-basic-auth ) printf '0' ;;@"
+# Where a digest was written. The variable enforces nothing but hex, so dropping
+# the source check hands the class most likely to be a live credential back to a
+# route no reviewer can read.
+mutate_file "$PUBSH" 'any route may excuse a URL credential again' has_trusted_snapshot_build \
+  's@ && scan_excusal_source_is_allowed "\$labels"@@'
+mutate_file "$PUBSH" 'the file-only table is emptied' has_trusted_snapshot_build \
+  "s@^SCAN_FILE_ONLY_LABELS='url-embedded-basic-auth'\$@SCAN_FILE_ONLY_LABELS=''@"
+mutate_file "$PUBSH" 'the variable counts as the file' has_trusted_snapshot_build \
+  's@^      "CACHE_SCAN_ALLOW_FILE"\* \) ;;$@      "CACHE_SCAN_ALLOW"* ) ;;@'
+# The confirmation stage. Each of these is a way the 22 churning source files
+# come back, or a way a real key stops being confirmed and walks out.
+mutate_file "$PUBSH" 'the key header is refused unconfirmed again' has_trusted_snapshot_build \
+  's@^    if \[ "\$labels" = private-key-header \] && ! scan_file_holds_pem_block "\$bad"; then$@    if false; then@'
+mutate_file "$PUBSH" 'a header with no body counts as a key' has_trusted_snapshot_build \
+  's@^      if \(body > 0\) found = 1$@      found = 1@'
+mutate_file "$PUBSH" 'an encrypted key loses its header lines' has_trusted_snapshot_build \
+  's@^    inblock && /\^\[A-Za-z\]\[A-Za-z0-9-\]\*:/ \{ next \}$@    inblock \&\& /^ZZZNEVER:/ { next }@'
+mutate_file "$PUBSH" 'an encrypted key loses its blank line' has_trusted_snapshot_build \
+  's@^    inblock && /\^\[\[:space:\]\]\*\$/ \{ next \}$@    inblock \&\& /^ZZZNEVER$/ { next }@'
+mutate_file "$PUBSH" 'the confirmation reads bytes as text' has_trusted_snapshot_build \
+  's@\| LC_ALL=C awk@\| awk@'
+mutate_file "$PUBSH" 'a broken confirmation reads as no key' has_trusted_snapshot_build \
+  's@^  \[ "\$rc" -le 1 \] \\$@  [ "$rc" -le 99 ] \\@'
 mutate_file "$PUBSH" 'the size test drops out of the excusability walk' has_trusted_snapshot_build \
   's@^    \[ "\$size" -ge "\$floor" \] \|\| return 1$@    true@'
 mutate_file "$PUBSH" 'an unrecognised label stops refusing the whole file' has_trusted_snapshot_build \
@@ -2211,6 +2277,95 @@ else
   else
     bad "behaviour: the small PEM was refused, but the report either withheld the route or printed the digest"
   fi
+fi
+
+# A source file that MENTIONS the header and holds no key. This is 22 of the 71
+# files the rule matched on the fleet's first real tree -- `jose`'s importer,
+# `oracledb`'s util, `googleapis`' generated `.d.ts`, `gtoken`'s README -- and
+# every one of them would otherwise need a digest that changes on the next
+# dependency bump, in a job that runs unattended at 03:17. This publishes, with
+# no allowlist at all. Both the BEGIN and the END string are here, because a
+# secret detector's own source carries both and confirming on BEGIN alone would
+# leave that file churning.
+#
+# Padded with INCOMPRESSIBLE bytes, and that is not decoration. This is the only
+# new case that has to reach the packing stage, and the archive bound there is
+# `8x the compressed size` — measured, a staging tree whose only content is
+# repetitive padding compresses to ~345 bytes, which puts the bound at ~2760
+# while the nine cache directories alone need 4608 bytes of tar headers. The
+# case then fails on the bound and never reports on the confirmation stage at
+# all. That floor is a real defect and it has its own issue (#191); random
+# padding routes around it here rather than quietly depending on it.
+BEH_MENTION_BODY=$(printf '%s\n' \
+  'const PEM_START = "-----BEGIN PRIVATE KEY-----";' \
+  'if (text.startsWith(PEM_START)) { return parsePrivateKey(text); }' \
+  'const PEM_END = "-----END PRIVATE KEY-----";'; \
+  head -c 20000 /dev/urandom | base64 | fold -w 70)
+printf '%s\n' "$BEH_MENTION_BODY" >"$TMP/mention"
+if behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/files/1a"
+cat '"'$TMP/mention'"' >"$stage/pnpm-store/files/1a/mentiononly"
+' >"$TMP/beh.pemmention.log" 2>&1; then
+  if matches "$(cat "$TMP/beh.pemmention.log")" 'names a PEM header but holds no key block'; then
+    ok
+  else
+    bad "behaviour: the header-mentioning source published, but the confirmation stage was not what let it through"
+  fi
+else
+  bad "behaviour: a source file naming a PEM header was refused as a key"
+fi
+
+# ...and confirmation is not a way past anything else. The same mention, in a
+# file that also carries a registry token: the key rule is unconfirmed, the token
+# rule is not, and the token rule is the one no list may excuse.
+if behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/files/1b"
+printf "%s\n" \
+  "const PEM_START = \"-----BEGIN PRIVATE KEY-----\";" \
+  "//registry.example.com/:_authToken=deadbeefcafe" \
+  >"$stage/pnpm-store/files/1b/mentionplus"
+' >"$TMP/beh.pemmix.log" 2>&1; then
+  bad "behaviour: an unconfirmed PEM header carried a registry token past the scan"
+else
+  if matches "$(cat "$TMP/beh.pemmix.log")" 'embedded credential'; then
+    ok
+  else
+    bad "behaviour: the mixed file failed the run, but not on the content pass"
+  fi
+fi
+
+# #183: the URL-credential class may be excused, but only from the file. The
+# variable enforces nothing but hex -- forty characters in a workflow env block
+# with nothing saying what they excuse -- and this is the class most likely to be
+# a live credential if an operator misclassifies one. Same digest, same fixture,
+# same run that passes through the file above: from the variable it refuses.
+if printf '%s\n' "$BEH_URL_BODY" >"$TMP/url" \
+  && behave_run "$BEH_STAGE_URL" "$BEH_URL_SHA" >"$TMP/beh.urlvar.log" 2>&1; then
+  bad "behaviour: a bare CACHE_SCAN_ALLOW_DIGESTS entry excused a URL credential"
+else
+  if matches "$(cat "$TMP/beh.urlvar.log")" 'will not excuse a url-embedded-basic-auth hit from CACHE_SCAN_ALLOW_DIGESTS'; then
+    ok
+  else
+    bad "behaviour: the URL credential was refused, but not for coming from the variable"
+  fi
+fi
+
+# ...and the narrowing is exactly one label wide. A PEM fixture is still
+# excusable from the variable, because its bytes ARE the secret and a reviewer
+# reading a hash of it learns nothing either way.
+if printf '%s\n' "$BEH_SPEM_BODY" >"$TMP/spem" \
+  && behave_run "$BEH_STAGE_SPEM" "$BEH_SPEM_SHA" >"$TMP/beh.spemvar.log" 2>&1; then
+  if matches "$(cat "$TMP/beh.spemvar.log")" 'excused by CACHE_SCAN_ALLOW_DIGESTS'; then
+    ok
+  else
+    bad "behaviour: the PEM fixture published from the variable, but no excusal was logged"
+  fi
+else
+  bad "behaviour: restricting the URL class to the file also took the PEM class with it"
 fi
 
 # Two rules in one file, one of them the unexcusable one, and the file's digest
