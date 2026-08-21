@@ -88,6 +88,88 @@ g() {
   else gcloud "$@" --project="$PROJECT"; fi
 }
 
+# ── the Monitoring API, over REST rather than `gcloud alpha` ─────────────────
+# Channels and policies used to go through `gcloud alpha monitoring`. That group
+# is not part of a default Cloud SDK install, and on a machine where the SDK
+# lives somewhere the operator cannot write — Program Files on Windows, a
+# root-owned /usr/lib on a locked-down host — `gcloud components install alpha`
+# fails outright. There is no fallback in that state: the script cannot run at
+# all, which is how this project ended up with six of its nine policies
+# provisioned and the three cache alerts missing for a week without anyone
+# noticing the script had stopped being runnable.
+#
+# The descriptor code below already spoke REST for its own reason (there is no
+# `gcloud monitoring metrics-descriptors` group in ANY track). Using the same
+# transport for channels and policies removes the surprise install dependency
+# and makes every call in this script fail the same way when auth is wrong.
+# Minted once, not per call. There are now upwards of twenty API calls in a full
+# run (nine policies, five descriptors, two listings), and `gcloud auth
+# print-access-token` is a Python process launch each time — on a machine behind
+# the corporate proxy that was the dominant cost of the run and, worse, twenty
+# more chances to fail on a network blip in the middle of provisioning. An
+# access token is good for an hour; a run that takes an hour has a bigger
+# problem than a stale token.
+_TOKEN=""
+api_token() {
+  if [ -z "$_TOKEN" ]; then
+    if [ -n "$ACCOUNT" ]; then _TOKEN="$(gcloud auth print-access-token --account="$ACCOUNT")"
+    else _TOKEN="$(gcloud auth print-access-token)"; fi
+  fi
+  printf '%s' "$_TOKEN"
+}
+
+MON_API="https://monitoring.googleapis.com/v3/projects"
+
+# mon <METHOD> <path-under-project> [body-file] — body to $tmp/api.out, prints
+# the HTTP status. The caller decides what a status means; nothing here treats a
+# non-2xx as success, because a policy that silently failed to create is exactly
+# the failure this whole script exists to prevent.
+mon() {
+  local method="$1" path="$2" body="${3:-}" token retry=()
+  token="$(api_token)"
+  [ -n "$token" ] || { echo "no access token — is the proxy bypass set?" >&2; return 1; }
+  # Retries on GET and PATCH only. Both are idempotent, and the observed failure
+  # here is a CONNECT timeout through the corporate proxy — a request that never
+  # reached the server, which is precisely what is safe to repeat. POST gets
+  # none: `curl --retry` also retries a 5xx, and a 5xx on `alertPolicies.create`
+  # may well have created the policy, so retrying it would leave two copies and
+  # page twice. A POST that fails is instead recovered by re-running the script,
+  # which lists first and finds whatever did get created.
+  case "$method" in
+    GET|PATCH) retry=(--retry 3 --retry-delay 3 --retry-connrefused) ;;
+  esac
+  if [ -n "$body" ]; then
+    curl -sS --connect-timeout 20 --max-time 60 "${retry[@]}" \
+      -o "$tmp/api.out" -w '%{http_code}' \
+      -X "$method" "$MON_API/$PROJECT/$path" \
+      -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+      --data-binary "@$body"
+  else
+    curl -sS --connect-timeout 20 --max-time 60 "${retry[@]}" \
+      -o "$tmp/api.out" -w '%{http_code}' \
+      -X "$method" "$MON_API/$PROJECT/$path" \
+      -H "Authorization: Bearer $token"
+  fi
+}
+
+# The two listings below need `displayName<TAB>name` pairs out of a JSON page.
+# Named rather than inlined twice, and fail-closed: a missing python3 must stop
+# the script, not read as "no channels and no policies exist" — which would
+# create a duplicate channel and a second copy of all nine policies.
+json_pairs() {  # <collection key> <name field> — reads $tmp/api.out
+  command -v python3 >/dev/null 2>&1 || {
+    echo "python3 is required to read the Monitoring API response" >&2; return 1; }
+  python3 - "$1" "$2" "$tmp/api.out" <<'PY'
+import json, sys
+key, field, path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, encoding="utf-8") as fh:
+    doc = json.load(fh)
+for item in doc.get(key) or []:
+    print("%s\t%s\t%s" % (item.get(field, ""), item.get("name", ""),
+                          (item.get("labels") or {}).get("email_address", "")))
+PY
+}
+
 tmp="$(mktemp -d)"; chmod 700 "$tmp"; trap 'rm -rf "$tmp"' EXIT
 
 # ── notification channel ──────────────────────────────────────────────────────
@@ -101,12 +183,20 @@ tmp="$(mktemp -d)"; chmod 700 "$tmp"; trap 'rm -rf "$tmp"' EXIT
 # that cannot page.
 #
 # Matched client-side. The server-side filter rejects an unquoted address --
-# `labels.email_address=a@b` reads `email` as a field reference -- and gcloud
-# reports that as INVALID_ARGUMENT, which under `2>/dev/null` is indistinguishable
+# `labels.email_address=a@b` reads `email` as a field reference -- and the API
+# reports that as INVALID_ARGUMENT, which when swallowed is indistinguishable
 # from "no such channel". The script would then create a duplicate channel on
 # every run and every alert would page twice.
-channel="$(g alpha monitoring channels list --format='value(name,type,labels.email_address)' 2>/dev/null \
-  | awk -F'\t' -v e="$EMAIL" '$2=="email" && $3==e {print $1; exit}' || true)"
+#
+# A LIST that fails must stop the script for the same reason: "the call errored"
+# and "there are no channels" are the same empty string, and guessing the second
+# is what produces the duplicate.
+ch_status="$(mon GET 'notificationChannels?pageSize=1000')"
+[ "$ch_status" = "200" ] || {
+  echo "$PROJECT: cannot list notification channels (HTTP $ch_status)" >&2
+  sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
+channel="$(json_pairs notificationChannels type \
+  | awk -F'\t' -v e="$EMAIL" '$1=="email" && $3==e {print $2; exit}')"
 
 if [ -z "$channel" ]; then
   if [ "$DRY" = "1" ]; then
@@ -118,8 +208,11 @@ if [ -z "$channel" ]; then
   "description": "Destination for every CI warm-host runner alert in this project.",
   "labels": { "email_address": "$EMAIL" } }
 EOF
-    channel="$(g alpha monitoring channels create --channel-content-from-file="$tmp/channel.json" \
-      --format='value(name)')"
+    cr_status="$(mon POST notificationChannels "$tmp/channel.json")"
+    [ "$cr_status" = "200" ] || {
+      echo "$PROJECT: cannot create the notification channel (HTTP $cr_status)" >&2
+      sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
+    channel="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["name"])' "$tmp/api.out")"
     echo "created channel $channel"
   fi
 else
@@ -294,11 +387,6 @@ ensure_log_metric ci_egress_denied \
 # 2>&1` therefore fails for EVERY metric, including the ones already there, and
 # the script silently re-POSTs on every run — the check reports "absent" whether
 # the descriptor is absent or the command does not exist.
-api_token() {
-  if [ -n "$ACCOUNT" ]; then gcloud auth print-access-token --account="$ACCOUNT"
-  else gcloud auth print-access-token; fi
-}
-
 ensure_descriptor() {  # <short name> <description>
   local short="$1" desc="$2" type="custom.googleapis.com/github/$1" token status
   token="$(api_token)"
@@ -343,7 +431,14 @@ ensure_descriptor ci_cache_snapshot_age_hours "Age of the snapshot the host read
 ensure_descriptor ci_cache_snapshot_bytes    "Compressed size of that snapshot. A size that stops changing is a publish that stopped."
 ensure_descriptor ci_cache_dirs_hydrated     "Tool caches moved in. Zero alongside a hydrated verdict is a snapshot packed from an empty tree."
 
-existing="$(g alpha monitoring policies list --format='value(displayName,name)' 2>/dev/null || true)"
+# Same fail-closed rule as the channel listing: a LIST that errored reads as an
+# empty inventory, and an empty inventory makes every policy below look absent —
+# so the script would create a SECOND copy of all nine and double every page.
+pl_status="$(mon GET 'alertPolicies?pageSize=1000')"
+[ "$pl_status" = "200" ] || {
+  echo "$PROJECT: cannot list alert policies (HTTP $pl_status)" >&2
+  sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
+existing="$(json_pairs alertPolicies displayName)"
 
 for key in heartbeat blind idle queue drain slowtick cachestale cachefail egressdenied; do
   policy_json "$key" >"$tmp/p.json"
@@ -367,15 +462,21 @@ for key in heartbeat blind idle queue drain slowtick cachestale cachefail egress
   fi
 
   if [ -n "$id" ]; then
-    # A full body with no `--fields` is a whole-policy replace, which is what is
+    # PATCH with NO updateMask is a whole-policy replace, which is what is
     # wanted: the file above is the intended state, so a threshold this script
-    # stopped setting must disappear rather than linger. (`--fields` here accepts
-    # only `disabled` and `notificationChannels`; it is not a field mask.)
-    g alpha monitoring policies update "$id" --policy-from-file="$tmp/p.json" \
-      --format='value(name)' >/dev/null
+    # stopped setting must disappear rather than linger. Supplying a mask here
+    # would silently preserve exactly the stale conditions this run is meant to
+    # remove. The policy name comes from the URL, so the body needs none.
+    up_status="$(mon PATCH "${id#projects/"$PROJECT"/}" "$tmp/p.json")"
+    [ "$up_status" = "200" ] || {
+      echo "$PROJECT: cannot update $name (HTTP $up_status)" >&2
+      sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
     printf '%s: updated  %s\n' "$PROJECT" "$name"
   else
-    g alpha monitoring policies create --policy-from-file="$tmp/p.json" --format='value(name)' >/dev/null
+    cp_status="$(mon POST alertPolicies "$tmp/p.json")"
+    [ "$cp_status" = "200" ] || {
+      echo "$PROJECT: cannot create $name (HTTP $cp_status)" >&2
+      sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
     printf '%s: created  %s\n' "$PROJECT" "$name"
   fi
 done
