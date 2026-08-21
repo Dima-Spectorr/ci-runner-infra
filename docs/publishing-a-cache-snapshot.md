@@ -272,7 +272,7 @@ digest itself becomes the leak:
 |---|---|---|
 | `registry-auth-token` | never | never |
 | `private-key-header` | yes, at any size | yes, at ≥1024 bytes |
-| `url-embedded-basic-auth` | yes, at ≥1024 bytes | never — compute it yourself |
+| `url-embedded-basic-auth` | yes, at ≥1024 bytes — **`CACHE_SCAN_ALLOW_FILE` only** | never — compute it yourself |
 
 A file is excusable only if **every** rule it trips is: a README that documents
 both a registry token and a connection string is not half-excusable, and no list
@@ -361,7 +361,8 @@ Four bounds make this safe to have at all:
   and that is what stops an operator allowlisting their way past a live
   credential. `private-key-header` and `url-embedded-basic-auth` can be excused,
   because dependencies demonstrably ship both — published test keys, and README
-  connection strings with `user:password@` in them. The set is a whitelist, not
+  connection strings with `user:password@` in them — though the second is
+  reachable only from `CACHE_SCAN_ALLOW_FILE`, for the reason below. The set is a whitelist, not
   "anything but the token rule": a pattern added to the scan later is
   unexcusable until someone decides otherwise in a diff.
 
@@ -396,6 +397,18 @@ Four bounds make this safe to have at all:
 - **Every rule a file trips must be excusable**, and a `url-embedded-basic-auth`
   hit must additionally be in a file of at least 1024 bytes. See the table in
   the refusal section above.
+- **A `url-embedded-basic-auth` hit can only be excused through
+  `CACHE_SCAN_ALLOW_FILE` — never `CACHE_SCAN_ALLOW_DIGESTS`.** The two routes
+  are not interchangeable for it, and the reason is one row up: the refusal log
+  deliberately does not print that rule's digest, because a connection string is
+  short and low-entropy enough that its sha256 is walkable back to the password.
+  So a digest that would excuse such a file is one somebody computed *from a
+  copy of the credential they already hold*, arriving as a bare 64-hex literal
+  with no filename attached — a shape review cannot check. The allow-*file*
+  route names the path, so the entry says what is being excused. A digest that
+  matches a `url-embedded-basic-auth` file is refused with the allowlist set,
+  the same way a `registry-auth-token` hit is, and no `CACHE_SCAN_ALLOW_DIGESTS`
+  entry can change that.
 - **It reaches the content pass only.** The filename, symlink, setuid and
   capability passes take no exceptions; a host refuses those outright, so an
   archive that needs one of them excused is an archive no host would unpack.
