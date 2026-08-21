@@ -589,24 +589,51 @@ matched_labels() { # <file>
 # OpenSSL key has; without both, an encrypted key reads as unconfirmed and walks
 # straight out to every host in the pool. A blank line buys nothing on its own —
 # `body` still has to reach one — so BEGIN followed by END stays unconfirmed.
+#
+# Leading whitespace is allowed on the header and body lines, because the BEGIN
+# and END lines never required it to be absent and a key does not stop being a
+# key for being indented. The shape that matters is a YAML block scalar — a
+# `key: |` followed by an indented PEM is how every one of these deployment
+# formats carries a private key, and YAML strips the common indentation before
+# the consumer ever sees it, so that file holds a usable key by any definition
+# an attacker cares about. Anchored at column zero, the body lines missed, the
+# block aborted, and the file went out as an unconfirmed hit. This widens the
+# rule towards CONFIRMING, which is the fail-closed direction: the cost of a
+# wrong confirmation is a digest someone has to name in a reviewed diff.
 scan_file_holds_pem_block() { # <file>
-  local rc=0
-  LC_ALL=C tr -d '\000' <"$1" | LC_ALL=C awk '
+  local pipes reader parser
+  # The reader's status is captured SEPARATELY, and that is the whole point of
+  # the if/else. Under `pipefail` a `tr` that could not open the file and an awk
+  # that reached END with no key both leave 1, and those are opposite verdicts:
+  # the second is a clean file, the first is a file that changed under us between
+  # the bulk grep and this confirmation — which is exactly the move an escaped
+  # prepare process would make to put a credential back before the pack. Reading
+  # PIPESTATUS in the branch body is the only place it is still the pipeline's:
+  # any other command, an assignment included, overwrites it.
+  if LC_ALL=C tr -d '\000' <"$1" | LC_ALL=C awk '
     /-----BEGIN [A-Z ]*PRIVATE KEY-----/ { inblock = 1; body = 0; next }
     inblock && /-----END [A-Z ]*PRIVATE KEY-----/ {
       if (body > 0) found = 1
       inblock = 0
       next
     }
-    inblock && /^[A-Za-z][A-Za-z0-9-]*:/ { next }
+    inblock && /^[[:space:]]*[A-Za-z][A-Za-z0-9-]*:/ { next }
     inblock && /^[[:space:]]*$/ { next }
-    inblock && /^[A-Za-z0-9+\/=]+[[:space:]]*$/ { body++; next }
+    inblock && /^[[:space:]]*[A-Za-z0-9+\/=]+[[:space:]]*$/ { body++; next }
     inblock { inblock = 0 }
     END { exit(found ? 0 : 1) }
-  ' || rc=$?
-  [ "$rc" -le 1 ] \
-    || die "the content scan could not confirm whether $(safe_path "$1") holds a key block (exit $rc)"
-  [ "$rc" = 0 ]
+  '; then
+    pipes="${PIPESTATUS[*]}"
+  else
+    pipes="${PIPESTATUS[*]}"
+  fi
+  reader=${pipes%% *}
+  parser=${pipes##* }
+  [ "$reader" = 0 ] \
+    || die "the content scan could not READ $(safe_path "$1") to confirm whether it holds a key block (tr exited $reader) — a file that cannot be read is not a file without a key in it"
+  [ "$parser" -le 1 ] \
+    || die "the content scan could not confirm whether $(safe_path "$1") holds a key block (exit $parser)"
+  [ "$parser" = 0 ]
 }
 
 # Whether a digest may excuse this file at all, asked before any digest is

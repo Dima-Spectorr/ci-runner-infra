@@ -1112,13 +1112,30 @@ has_trusted_snapshot_build() { # <file>
   # An encrypted OpenSSL key carries `Proc-Type:`/`DEK-Info:` and a blank line
   # before its body. Drop either arm and a real encrypted key reads as
   # unconfirmed and is published.
-  matches "$confirmer" 'inblock && /\^\[A-Za-z\]\[A-Za-z0-9-\]\*:/' || return 1
+  matches "$confirmer" 'inblock && /\^\[\[:space:\]\]\*\[A-Za-z\]\[A-Za-z0-9-\]\*:/' || return 1
   matches "$confirmer" 'inblock && /\^\[\[:space:\]\]\*\$/' || return 1
+  # Indentation does not stop a key being a key. A PEM in a YAML block scalar
+  # arrives indented and YAML gives it back unindented, so anchoring the body at
+  # column zero made every one of those read as unconfirmed — and unconfirmed is
+  # the direction that publishes.
+  matches "$confirmer" 'inblock && /\^\[\[:space:\]\]\*\[A-Za-z0-9\+\\/=\]\+\[\[:space:\]\]\*\$/' || return 1
+  ! matches "$confirmer" '/\^\[A-Za-z0-9\+\\/=\]' || return 1
   # NULs stripped, byte locale, and an errored awk refuses. Same three rules the
   # passes that refuse already run under; a confirmation stage that fails open is
   # a hole in the one direction that matters.
   matches "$confirmer" "LC_ALL=C tr -d '\\\\000' <\"\\\$1\" \| LC_ALL=C awk" || return 1
-  matches "$confirmer" '\[ "\$rc" -le 1 \]' || return 1
+  # The reader's status read SEPARATELY from the parser's. Under pipefail a `tr`
+  # that could not open the file and an awk that found no key both leave 1, and
+  # those are opposite verdicts — the second is a clean file, the first is a file
+  # that changed under the scan between the grep and the confirmation.
+  matches "$confirmer" '^  if LC_ALL=C tr -d' || return 1
+  matches "$confirmer" 'pipes="\$\{PIPESTATUS\[\*\]\}"' || return 1
+  matches "$confirmer" '^  reader=\$\{pipes%% \*\}' || return 1
+  matches "$confirmer" '^  parser=\$\{pipes##\* \}' || return 1
+  matches "$confirmer" '\[ "\$reader" = 0 \]' || return 1
+  matches "$confirmer" '\[ "\$parser" -le 1 \]' || return 1
+  matches "$confirmer" '\[ "\$parser" = 0 \]' || return 1
+  ! matches "$confirmer" '\[ "\$rc" -le 1 \]' || return 1
   # No early exit. `exit` mid-stream SIGPIPEs the `tr` in front of it and, under
   # pipefail, turns a confirmed key into a scan error — which this file's own
   # drain rule exists to prevent.
@@ -2063,13 +2080,30 @@ mutate_file "$PUBSH" 'the key header is refused unconfirmed again' has_trusted_s
 mutate_file "$PUBSH" 'a header with no body counts as a key' has_trusted_snapshot_build \
   's@^      if \(body > 0\) found = 1$@      found = 1@'
 mutate_file "$PUBSH" 'an encrypted key loses its header lines' has_trusted_snapshot_build \
-  's@^    inblock && /\^\[A-Za-z\]\[A-Za-z0-9-\]\*:/ \{ next \}$@    inblock \&\& /^ZZZNEVER:/ { next }@'
+  's@^    inblock && /\^\[\[:space:\]\]\*\[A-Za-z\]\[A-Za-z0-9-\]\*:/ \{ next \}$@    inblock \&\& /^ZZZNEVER:/ { next }@'
 mutate_file "$PUBSH" 'an encrypted key loses its blank line' has_trusted_snapshot_build \
   's@^    inblock && /\^\[\[:space:\]\]\*\$/ \{ next \}$@    inblock \&\& /^ZZZNEVER$/ { next }@'
+# The indented shapes. An anchored body expression is what shipped, so both the
+# header rule and the body rule get a mutation that puts the anchor back.
+mutate_file "$PUBSH" 'the body must start in column zero again' has_trusted_snapshot_build \
+  's@^    inblock && /\^\[\[:space:\]\]\*\[A-Za-z0-9\+\\/=\]\+\[\[:space:\]\]\*\$/ \{ body\+\+; next \}$@    inblock \&\& /^[A-Za-z0-9+\\/=]+[[:space:]]*$/ { body++; next }@'
+mutate_file "$PUBSH" 'an indented header line stops being a header line' has_trusted_snapshot_build \
+  's@^    inblock && /\^\[\[:space:\]\]\*\[A-Za-z\]\[A-Za-z0-9-\]\*:/ \{ next \}$@    inblock \&\& /^[A-Za-z][A-Za-z0-9-]*:/ { next }@'
 mutate_file "$PUBSH" 'the confirmation reads bytes as text' has_trusted_snapshot_build \
   's@\| LC_ALL=C awk@\| awk@'
+# The reader and the parser share an exit status again — the shape where an
+# unopenable file reads as a file with no key in it.
 mutate_file "$PUBSH" 'a broken confirmation reads as no key' has_trusted_snapshot_build \
-  's@^  \[ "\$rc" -le 1 \] \\$@  [ "$rc" -le 99 ] \\@'
+  's@^  \[ "\$parser" -le 1 \] \\$@  [ "$parser" -le 99 ] \\@'
+mutate_file "$PUBSH" 'an unreadable file reads as a file without a key' has_trusted_snapshot_build \
+  's@^  \[ "\$reader" = 0 \] \\$@  [ "$reader" -le 99 ] \\@'
+mutate_file "$PUBSH" 'the reader and the parser collapse into one status' has_trusted_snapshot_build \
+  's@^  reader=\$\{pipes%% \*\}$@  reader=${pipes##* }@'
+# PIPESTATUS survives exactly one command. Read it anywhere but in the branch
+# body — an assignment counts — and the array is the assignment's, not the
+# pipeline's, so `reader` becomes 0 for every file including the unreadable one.
+mutate_file "$PUBSH" 'the statuses are read after the pipeline is gone' has_trusted_snapshot_build \
+  's@^    pipes="\$\{PIPESTATUS\[\*\]\}"$@    pipes="0 0"@'
 mutate_file "$PUBSH" 'the size test drops out of the excusability walk' has_trusted_snapshot_build \
   's@^    \[ "\$size" -ge "\$floor" \] \|\| return 1$@    true@'
 mutate_file "$PUBSH" 'an unrecognised label stops refusing the whole file' has_trusted_snapshot_build \
