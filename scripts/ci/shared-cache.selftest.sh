@@ -410,10 +410,20 @@ has_fail_open() { # <file>
 # rewrites. Reduce slots_per_host and `/var/lib/ci-cache/<idx>` above the new
 # count keeps its whole tree and its marker; raise the count again and the
 # seeding loop meets a directory that already claims to be complete. The sweep
-# runs BEFORE the seeding loop, or it deletes what it has just seeded.
+# runs BEFORE the hydrate, which is upstream of the seeding loop and is also the
+# step that decides from `df` whether there is room for a snapshot.
 has_retired_slot_prune() { # <file>
   local code
   code=$(code_of "$1")
+  matches "$code" '^prune_retired_slot_caches\(\) \{'       || return 1
+  # The guard that keeps an `rm -rf` off a number this script invented. The
+  # fallback for an unreadable `ci-slots` is 1, so without this a single
+  # transient metadata failure presents a four-slot host as a one-slot host and
+  # the sweep removes three warm caches — on the boot where metadata was already
+  # failing, and with no way back.
+  matches "$code" '^SLOTS_FROM_METADATA=1'                  || return 1
+  matches "$code" "^  ''\\|\\*\\[!0-9\\]\\*\\|0\\) SLOTS_FROM_METADATA=0 ;;" || return 1
+  matches "$code" '\[ "\$\{SLOTS_FROM_METADATA:-0\}" != 1 \]' || return 1
   # Bounded by what is on disk — the previous slot count is recorded nowhere on
   # this host, so a `seq` over a guessed range cannot be right.
   matches "$code" '^  for d in "\$CACHE_SLOTS"/\*; do'  || return 1
@@ -430,14 +440,16 @@ has_retired_slot_prune() { # <file>
   # …and it fails open like everything else here: a slot that cannot be removed
   # is logged, never fatal.
   ! matches "$code" 'rm -rf "\$d".*\|\| die'                 || return 1
-  local prune_at seed_at
-  prune_at=$(printf '%s\n' "$code" | grep -nE '^  for d in "\$CACHE_SLOTS"/\*; do' | head -n1 | cut -d: -f1)
-  # The seeding CALL, not the `for i in $(seq 1 "$SLOTS")` header — that header
-  # appears four times in this script and the first one is a thousand lines
-  # above the cache layer, so an ordering check anchored on it compares the
-  # sweep against an unrelated loop and fails whatever the sweep does.
-  seed_at=$(printf '%s\n' "$code" | grep -nE '^    seed_slot_cache "\$i" \|\| log' | head -n1 | cut -d: -f1)
-  [ -n "$prune_at" ] && [ -n "$seed_at" ] && [ "$prune_at" -lt "$seed_at" ] || return 1
+  # The sweep runs before the HYDRATE, not merely before the seeding loop. The
+  # hydrate asks `df` whether the disk has room for a snapshot, and a retired
+  # tree still on that disk is room it is told it does not have — so a sweep
+  # placed after it frees the space one step too late to be counted, in exactly
+  # the case the sweep was written for. Anchored on the two CALLS in main, whose
+  # order is the thing being asserted.
+  local prune_at hydrate_at
+  prune_at=$(printf '%s\n' "$code" | grep -nE '^  prune_retired_slot_caches \|\| true' | head -n1 | cut -d: -f1)
+  hydrate_at=$(printf '%s\n' "$code" | grep -nE '^  hydrate_shared_cache \|\| true' | head -n1 | cut -d: -f1)
+  [ -n "$prune_at" ] && [ -n "$hydrate_at" ] && [ "$prune_at" -lt "$hydrate_at" ] || return 1
 }
 
 # Every "group" permission in this script means "nobody but this slot" only
@@ -574,15 +586,27 @@ has_observable_hydrate() { # <file>
   matches "$code" 'hydrate_shared_cache_bounded \|\| rc=\$\?' || return 1
   matches "$code" '^  publish_cache_telemetry$'               || return 1
   # "The attribute is not set" and "the metadata server did not answer" are
-  # opposite facts and `md` returns an empty string for both, so the exit code
-  # is what separates them: curl -f gives 22 for a 404, and 6/7/28 for DNS,
-  # refused and timed out. This is an OBSERVABILITY invariant, which is why it
-  # is asserted here: `not-configured` is the verdict that means "nothing to
-  # do", so a broken metadata server reported under it is a fleet-wide outage
-  # that no alert can see. Reading the code also costs nothing, where the second
-  # probe it replaced cost up to 30 seconds of boot before `deadline` existed.
-  matches "$code" 'CACHE_BUCKET=\$\(md "instance/attributes/ci-cache-bucket"\) \|\| bucket_rc=\$\?' || return 1
-  matches "$code" '^    if \[ "\$bucket_rc" = 22 \] \|\| \[ "\$bucket_rc" = 0 \]; then' || return 1
+  # opposite facts, and every way of asking that throws the HTTP status away
+  # reports them identically. This is an OBSERVABILITY invariant, which is why it
+  # is asserted here: `not-configured` is the verdict that means "nothing to do",
+  # so a broken metadata server reported under it is a fleet-wide outage no alert
+  # can see. Reading the status costs nothing — it is the same one request —
+  # where the second probe it replaced cost up to 30 seconds of boot before
+  # `deadline` existed.
+  #
+  # The status and not curl's EXIT CODE: `-f` reports every HTTP error as 22, so
+  # a 404 and a 503 come back as the same number and the distinction is lost
+  # again one layer down.
+  matches "$code" '^  probe=\$\(curl "\$\{CURL_TIMEOUTS\[@\]\}" -sS -H "Metadata-Flavor: Google"' || return 1
+  matches "$code" '\-w .[^ ]*%\{http_code\}'                  || return 1
+  matches "$code" '^  status=\$\{probe##\*'                   || return 1
+  matches "$code" '^  CACHE_BUCKET=\$\{probe%'                || return 1
+  matches "$code" '^    if \[ "\$status" = 404 \] \|\| \[ "\$status" = 200 \]; then' || return 1
+  # Without -f an error response still has a body, and the metadata server's 404
+  # text would read as a bucket name. Non-200 has to clear the value before
+  # anything below can hydrate from it.
+  matches "$code" '^  \[ "\$status" = 200 \] \|\| CACHE_BUCKET=' || return 1
+  ! matches "$code" 'CACHE_BUCKET=\$\(md "instance/attributes/ci-cache-bucket"\)' || return 1
   # No second metadata call may decide it, and rc 0 with an empty value is a
   # pool that did not configure this layer, not an unreachable server.
   ! matches "$code" 'md "instance/id"'                        || return 1
@@ -1676,12 +1700,12 @@ mutate 'the ready marker is never written' has_fail_open \
 mutate 'a stale ready marker survives a reseed' has_fail_open \
   's@^  rm -f "\$dst/\.ready"$@@'
 
-# The retired-slot sweep, in the four shapes that read as correct. The ordering
-# the predicate pins is not mutated here because sed cannot move a loop past
-# another one, but it is the defect that matters most: a sweep placed AFTER the
-# seeding loop deletes what the run has just built, and looks identical in a
-# diff. The last mutation below is its cheap cousin — a sweep aimed at a name
-# that never matches, which reads as present and does nothing.
+# The retired-slot sweep, in the shapes that read as correct. The ordering the
+# predicate pins is not mutated here because sed cannot move one call past
+# another, but it is the defect that matters most: a sweep placed after the
+# hydrate frees the disk one step too late to be counted, and looks identical in
+# a diff. The `.none` mutation is its cheap cousin — a sweep aimed at a name that
+# never matches, which reads as present and does nothing.
 mutate 'the retired slot sweep is dropped' has_retired_slot_prune \
   's@^  for d in "\$CACHE_SLOTS"/\*; do$@  for d in; do@'
 mutate 'the sweep deletes the live slots too' has_retired_slot_prune \
@@ -1692,16 +1716,30 @@ mutate 'a failed removal is reported as a success' has_retired_slot_prune \
   's@^    if rm -rf "\$d"; then$@    if rm -rf "$d" || true; then@'
 mutate 'the sweep is aimed at a name that never exists' has_retired_slot_prune \
   's@^  for d in "\$CACHE_SLOTS"/\*; do$@  for d in "$CACHE_SLOTS"/.none; do@'
+# The guard that keeps the sweep off a slot count this script invented — the one
+# irreversible step in a boot path that otherwise survives a wrong count.
+mutate 'the sweep trusts a slot count nobody supplied' has_retired_slot_prune \
+  's@^  if \[ "\$\{SLOTS_FROM_METADATA:-0\}" != 1 \]; then$@  if false; then@'
+mutate 'an unreadable slot count is recorded as metadata' has_retired_slot_prune \
+  "s@^  ''\\|\\*\\[!0-9\\]\\*\\|0\\) SLOTS_FROM_METADATA=0 ;;\$@  zzz) SLOTS_FROM_METADATA=0 ;;@"
 
-# The metadata rc classification: every one of these turns a transient metadata
+# The metadata classification: every one of these turns a transient metadata
 # failure into "not-configured", which is the verdict that means "nothing to do"
-# and therefore the one nothing alerts on.
-mutate 'the metadata exit code is thrown away' has_observable_hydrate \
-  's@^  CACHE_BUCKET=\$\(md "instance/attributes/ci-cache-bucket"\) \|\| bucket_rc=\$\?$@  CACHE_BUCKET=$(md "instance/attributes/ci-cache-bucket") || true@'
-mutate 'any metadata failure means not-configured' has_observable_hydrate \
-  's@^    if \[ "\$bucket_rc" = 22 \] \|\| \[ "\$bucket_rc" = 0 \]; then$@    if true; then@'
+# and therefore the one nothing alerts on. The first two are the shapes that
+# threw the HTTP status away — `md` hides it behind `curl -f`, which reports a
+# 404 and a 503 as the same exit code.
+mutate 'the bucket value comes back from md' has_observable_hydrate \
+  's@^  status=\$\{probe##\*.*$@  status=200; CACHE_BUCKET=$(md "instance/attributes/ci-cache-bucket")@'
+mutate 'the request stops asking for the status' has_observable_hydrate \
+  's@%\{http_code\}@%{size_download}@'
+mutate 'any metadata answer means not-configured' has_observable_hydrate \
+  's@^    if \[ "\$status" = 404 \] \|\| \[ "\$status" = 200 \]; then$@    if true; then@'
 mutate 'the second metadata probe comes back' has_observable_hydrate \
-  's@^    if \[ "\$bucket_rc" = 22 \] \|\| \[ "\$bucket_rc" = 0 \]; then$@    if [ -n "$(md "instance/id")" ]; then@'
+  's@^    if \[ "\$status" = 404 \] \|\| \[ "\$status" = 200 \]; then$@    if [ -n "$(md "instance/id")" ]; then@'
+# An error response has a BODY without -f, so a 404 page would hydrate as a
+# bucket name if the value were not cleared.
+mutate 'a 404 body is kept as the bucket name' has_observable_hydrate \
+  's@^  \[ "\$status" = 200 \] \|\| CACHE_BUCKET=.*$@  true@'
 
 mutate 'the primary-group assertion is dropped' has_primary_group_assert \
   's|\[ "\$\(id -gn "\$u"\)" = "\$u" \]|true|'

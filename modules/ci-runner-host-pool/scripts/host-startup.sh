@@ -113,6 +113,19 @@ TS_MAX_TIME=10
 
 BROKER_PORT=${BROKER_PORT:-8081}
 
+# Whether $SLOTS is the pool's answer or this script's fallback, recorded because
+# exactly one caller cannot afford the difference: prune_retired_slot_caches
+# DELETES the cache tree of every index above $SLOTS. `ci-slots` is read above
+# through the metadata server's ordinary failure modes, and the fallback is 1, so
+# a transient failure on a warm reboot would make a four-slot host look like a
+# one-slot host — and the sweep would take slots 2, 3 and 4's warm caches with
+# it. Everything else here survives a wrong count: fewer agents register and the
+# pool notices. `0` and a non-numeric value count as "not from metadata" for the
+# same reason — neither is a count this script may delete by.
+SLOTS_FROM_METADATA=1
+case "${SLOTS:-}" in
+  ''|*[!0-9]*|0) SLOTS_FROM_METADATA=0 ;;
+esac
 SLOTS=${SLOTS:-1}
 
 if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
@@ -953,8 +966,27 @@ publish_cache_telemetry() {
 }
 
 hydrate_shared_cache_bounded() {
-  local bucket_rc=0
-  CACHE_BUCKET=$(md "instance/attributes/ci-cache-bucket") || bucket_rc=$?
+  # Not `md` for this one attribute: `curl -f` collapses EVERY HTTP error into
+  # exit 22, so "404, this pool did not configure the layer" and "429 or 503, the
+  # metadata server is not answering right now" arrive identical — and telling
+  # those two apart is the whole reason this branch exists. Asking for the status
+  # is the same single request, just one that reports what it got.
+  local probe status
+  probe=$(curl "${CURL_TIMEOUTS[@]}" -sS -H "Metadata-Flavor: Google" \
+    -w '\n%{http_code}' \
+    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/ci-cache-bucket" \
+    2>/dev/null) || probe=''
+  # `-w` appends the status on a line of its own, so the last line is the status
+  # and everything above it is the value. A transport failure — DNS, refused,
+  # timed out — prints nothing at all, which leaves both empty; an empty status
+  # is not 404, so it lands in the unreachable branch, which is where it belongs.
+  status=${probe##*$'\n'}
+  CACHE_BUCKET=${probe%$'\n'*}
+  # Without `-f` an error response still has a BODY, and the metadata server's
+  # 404 text would read here as a bucket name. Anything that is not a 200 has its
+  # value discarded before a single line below can look at it: a hydrate aimed at
+  # an error page is worse than no hydrate at all.
+  [ "$status" = 200 ] || CACHE_BUCKET=''
   if [ -z "${CACHE_BUCKET:-}" ]; then
     # `md` returns an empty string for BOTH "the attribute is not set" and "the
     # metadata server did not answer", and those are opposite facts: the first is
@@ -964,28 +996,29 @@ hydrate_shared_cache_bounded() {
     # silenced bucket — a pool with a bucket configured, hydrating nothing,
     # reporting the verdict that means "nothing to do".
     #
-    # The exit code already carries the distinction, with no second call. `md`
-    # returns curl's status, and `-f` gives 22 for an HTTP 404 — the attribute
-    # is genuinely not set — where a DNS failure, a refused connection or a
-    # timeout give 6, 7 and 28. A second probe cannot do better and is wrong in
-    # the common case: one transient failure followed by a probe that succeeds a
-    # moment later — which is what "transient" means — still reported
-    # not-configured. It also cost up to 30 seconds of boot before `deadline` was
-    # computed, so the hydrate's own budget did not cover it.
+    # The HTTP status carries the distinction, with no second call. A second
+    # probe cannot do better and is wrong in the common case: one transient
+    # failure followed by a probe that succeeds a moment later — which is what
+    # "transient" means — still reported not-configured. It also cost up to 30
+    # seconds of boot before `deadline` was computed, so the hydrate's own budget
+    # did not cover it.
     #
     # The sustained case this was written for is mostly unreachable anyway: a
     # metadata server already dead at boot makes this script `die` a thousand
     # lines above, and `flush_series` mints its token from the same server, so a
     # correct no-metadata-server verdict cannot be delivered regardless.
-    # 0 as well as 22: an attribute that exists and is empty is a pool that did
-    # not configure this layer, exactly like one with no attribute at all. Only a
-    # code that says the REQUEST failed may claim the server is unreachable.
-    if [ "$bucket_rc" = 22 ] || [ "$bucket_rc" = 0 ]; then
+    #
+    # 200 as well as 404: an attribute that exists and is empty is a pool that
+    # did not configure this layer, exactly like one with no attribute at all.
+    # Every other status — 429, 500, 503, or none at all because nothing
+    # answered — says the QUESTION failed, and a question that failed may not be
+    # reported as an answer of "no".
+    if [ "$status" = 404 ] || [ "$status" = 200 ]; then
       CACHE_VERDICT="not-configured"
       log "no snapshot bucket configured — this host runs on the cache its image baked"
     else
       CACHE_VERDICT="no-metadata-server"
-      log "metadata server unreachable — cannot tell whether a snapshot bucket is configured"
+      log "metadata server answered '${status:-nothing}' for ci-cache-bucket — cannot tell whether a snapshot bucket is configured"
     fi
     return 0
   fi
@@ -1467,6 +1500,62 @@ seed_slot_cache() {
   : >"$dst/.ready" || return 1
 }
 
+# Remove the cache tree of an index this host no longer has a slot for.
+#
+# `slots_per_host` can be reduced, and `/var/lib/ci-cache/<idx>` for an index
+# above the new count keeps its tree and — worse — its `.ready` marker, which
+# says "every tool directory below is present and owned by this slot". Nothing
+# reads it while the index is retired, so this is hygiene rather than a live bug;
+# but the marker stops being true the moment the count goes back up and the
+# seeding loop finds a directory that already claims to be ready. It is also a
+# full duplicate cache tree per retired slot.
+#
+# Its own function, called BEFORE the hydrate rather than inside
+# provision_shared_cache, and that is not tidiness. The hydrate sizes itself
+# against `df` on this same disk: a retired tree still sitting there is space the
+# snapshot is told it does not have, so a sweep that runs afterwards frees it one
+# step too late to be counted — the case the sweep exists for is exactly the case
+# where the hydrate is most likely to refuse for room.
+#
+# No lock. lock_shared_cache guards $CACHE_MASTER; this touches $CACHE_SLOTS,
+# which nothing but this script ever writes.
+prune_retired_slot_caches() {
+  # A slot count this script invented is not a count to delete caches by. The
+  # fallback for an unreadable `ci-slots` is 1, so one transient metadata failure
+  # on a warm reboot would present a four-slot host as a one-slot host and this
+  # sweep would remove slots 2, 3 and 4's warm caches — irreversibly, and on the
+  # boot where the metadata server was already having a bad time. Every other
+  # consequence of a wrong count is recoverable by rebooting; this one is not, so
+  # this is the step that refuses.
+  if [ "${SLOTS_FROM_METADATA:-0}" != 1 ]; then
+    log "slot count did not come from metadata — not sweeping retired slot caches"
+    return 0
+  fi
+  [ -d "$CACHE_SLOTS" ] || return 0
+
+  # Bounded by what is THERE, not by a guess at the old count: the previous value
+  # of `ci-slots` is not recorded anywhere on this host, so the sweep reads the
+  # directory. Only names that are entirely digits are considered, and only ones
+  # above $SLOTS are removed — anything else in $CACHE_SLOTS was not put there by
+  # this script and is not this script's to delete.
+  local d idx
+  for d in "$CACHE_SLOTS"/*; do
+    [ -d "$d" ] || continue
+    idx=${d##*/}
+    case "$idx" in ''|*[!0-9]*) continue ;; esac
+    [ "$idx" -gt "$SLOTS" ] || continue
+    # if/else and not `&& … || …`: the second form runs the failure branch when
+    # the LOG fails, which would report a removal that succeeded as one that did
+    # not — and the log is the only record this sweep leaves.
+    if rm -rf "$d"; then
+      log "slot $idx: retired (this host now has $SLOTS), its cache copy removed"
+    else
+      log "slot $idx: retired, but its cache copy could not be removed"
+    fi
+  done
+  return 0
+}
+
 provision_shared_cache() {
   # Fails OPEN, unlike almost everything else in this script. A host with no
   # usable cache is a SLOW host; a host that refuses to register over a cache
@@ -1485,36 +1574,6 @@ provision_shared_cache() {
   # any directory but its own — and cannot widen the one that stops it.
   chown root:root "$CACHE_SLOTS" 2>/dev/null || true
   chmod 0755 "$CACHE_SLOTS" 2>/dev/null || true
-
-  # Retired indices go before the live ones are seeded. `slots_per_host` can be
-  # reduced, and `/var/lib/ci-cache/<idx>` for an index above the new count keeps
-  # its tree and — worse — its `.ready` marker, which says "every tool directory
-  # below is present and owned by this slot". Nothing reads it while the index is
-  # retired, so this is hygiene rather than a live bug; but the marker stops being
-  # true the moment the count goes back up and the seeding loop finds a directory
-  # that already claims to be ready. It is also a full duplicate cache tree per
-  # retired slot, on the disk the hydrate reserves space on.
-  #
-  # Bounded by what is THERE, not by a guess at the old count: the previous value
-  # of `ci-slots` is not recorded anywhere on this host, so the sweep reads the
-  # directory. Only names that are entirely digits are considered, and only ones
-  # above $SLOTS are removed — anything else in $CACHE_SLOTS was not put there by
-  # this function and is not this function's to delete.
-  local d idx
-  for d in "$CACHE_SLOTS"/*; do
-    [ -d "$d" ] || continue
-    idx=${d##*/}
-    case "$idx" in ''|*[!0-9]*) continue ;; esac
-    [ "$idx" -gt "$SLOTS" ] || continue
-    # if/else and not `&& … || …`: the second form runs the failure branch when
-    # the LOG fails, which would report a removal that succeeded as one that did
-    # not — and the log is the only record this sweep leaves.
-    if rm -rf "$d"; then
-      log "slot $idx: retired (this host now has $SLOTS), its cache copy removed"
-    else
-      log "slot $idx: retired, but its cache copy could not be removed"
-    fi
-  done
 
   local i
   for i in $(seq 1 "$SLOTS"); do
@@ -2271,6 +2330,9 @@ main() {
   # the master is still being scanned and locked. Hydrating afterwards would land
   # unscanned content in a tree already declared read-only and safe, and the seed
   # would hand a copy of it to every slot. Fails OPEN, like everything else here.
+  # Before the hydrate, because the hydrate decides whether there is room for a
+  # snapshot from `df` on the disk these retired trees are occupying.
+  prune_retired_slot_caches || true
   hydrate_shared_cache || true
   # After the slot users, because each slot's cache is chowned to its user, and
   # before install_slot, because that reads whether a slot has a cache to decide
