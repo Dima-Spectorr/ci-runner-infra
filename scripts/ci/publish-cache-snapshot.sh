@@ -267,6 +267,43 @@ scan_digest_is_allowed() { # <sha256>
   return 1
 }
 
+# WHERE a digest was written, not just that it was. The two routes are not
+# equally reviewable: `CACHE_SCAN_ALLOW_FILE` forces a comment naming the package
+# that ships each fixture and fails the run without one, while
+# `CACHE_SCAN_ALLOW_DIGESTS` enforces nothing but hex — forty characters in a
+# workflow env block with nothing saying what they excuse.
+#
+# For a PEM fixture that difference is tolerable. For `url-embedded-basic-auth`
+# it is not: that is the class most likely to be a LIVE credential if an operator
+# misclassifies one, and it is also the class with a forty-file false-positive
+# floor, so it is the one an operator is most likely to excuse in bulk while
+# tired. A bare hash cannot be reviewed, and a reviewer cannot tell a `got`
+# README from a real connection string by its sha256.
+#
+# So this narrows, and only in one direction: that label may be excused, but only
+# from the file, where the entry has to name what it is. Nothing that was
+# excusable by a named, commented entry stops being excusable.
+SCAN_FILE_ONLY_LABELS='url-embedded-basic-auth'
+scan_excusal_source_is_allowed() { # <labels>
+  local label
+  for label in $1; do
+    # One line, and deliberately not the same shape as the printable-label walk
+    # above: two identical `*" $label "* ) ;;` lines would make every mutation
+    # aimed at one of them silently hit both, and a mutation that changes two
+    # rules proves neither.
+    case " $SCAN_FILE_ONLY_LABELS " in *" $label "* ) ;; * ) continue ;; esac
+    case "$SCAN_ALLOW_MATCHED_WHERE" in
+      "CACHE_SCAN_ALLOW_FILE"* ) ;;
+      * )
+        log "the content scan will not excuse a $label hit from $SCAN_ALLOW_MATCHED_WHERE — that class needs an entry in the file CACHE_SCAN_ALLOW_FILE names, where the comment says which package ships it"
+        return 1 ;;
+    esac
+  done
+  # Explicit, because a `for` whose body ended on a `continue` carries the status
+  # of whatever ran last, and this function's answer is "yes" by default.
+  return 0
+}
+
 # Which phases this invocation is. Building and publishing are independent: the
 # workflow runs one of each, and a local dry run is build-only.
 BUILDING=1; [ -z "${CACHE_ARCHIVE_IN:-}" ] || BUILDING=0
@@ -486,6 +523,56 @@ matched_labels() { # <file>
     if [ "$rc" = 0 ]; then out="$out ${entry%%|*}"; fi
   done
   printf '%s' "${out# }"
+}
+
+# CONFIRMATION, NOT WIDENING. `private-key-header` matches the string
+# `-----BEGIN … PRIVATE KEY-----`, and a source file that MENTIONS that string
+# is not a file that holds a key. Measured on one real dependency tree: 71 store
+# objects trip the rule, 49 are `ssh2`'s published key fixtures and the other 22
+# hold no key material at all — `jose`'s importer, `oracledb`'s util, `mongodb`'s
+# crypto callbacks, `googleapis`' generated `.d.ts`, `gtoken`'s README. Each one
+# has to be excused by digest, and a digest changes on every dependency bump.
+# The publish runs unattended at 03:17 UTC; the morning after a routine upgrade
+# it goes red, nothing else reports it, and the fleet quietly drifts back to cold
+# starts. A gate whose false positives churn is a gate that gets rubber-stamped.
+#
+# So the pattern stays exactly as it is and stays the cheap prefilter — this asks
+# the second question, only of the files it flagged: is there an actual PEM block
+# here? A BEGIN line, at least one line of base64 body, and a matching END. That
+# still catches all 49 real fixtures and drops all 22 churning ones, and it
+# narrows nothing about what a real key looks like.
+#
+# Fail-closed in both directions that matter. An awk that ERRORS is not "no
+# block" — it refuses, like every other probe in this pass. NULs are stripped
+# first because the tree holds compressed blobs and the bulk grep reads them with
+# `-a`; awk's line handling around a NUL is not something to bet a credential
+# gate on. And there is deliberately NO early exit: awk reads to EOF and reports
+# in END, because `exit` mid-stream would SIGPIPE `tr` and, under `pipefail`,
+# turn a confirmed key into a scan error.
+#
+# `Proc-Type:` / `DEK-Info:` header lines AND the blank line after them are
+# allowed between BEGIN and body, because that is the exact shape an encrypted
+# OpenSSL key has; without both, an encrypted key reads as unconfirmed and walks
+# straight out to every host in the pool. A blank line buys nothing on its own —
+# `body` still has to reach one — so BEGIN followed by END stays unconfirmed.
+scan_file_holds_pem_block() { # <file>
+  local rc=0
+  LC_ALL=C tr -d '\000' <"$1" | LC_ALL=C awk '
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/ { inblock = 1; body = 0; next }
+    inblock && /-----END [A-Z ]*PRIVATE KEY-----/ {
+      if (body > 0) found = 1
+      inblock = 0
+      next
+    }
+    inblock && /^[A-Za-z][A-Za-z0-9-]*:/ { next }
+    inblock && /^[[:space:]]*$/ { next }
+    inblock && /^[A-Za-z0-9+\/=]+[[:space:]]*$/ { body++; next }
+    inblock { inblock = 0 }
+    END { exit(found ? 0 : 1) }
+  ' || rc=$?
+  [ "$rc" -le 1 ] \
+    || die "the content scan could not confirm whether $(safe_path "$1") holds a key block (exit $rc)"
+  [ "$rc" = 0 ]
 }
 
 # Whether a digest may excuse this file at all, asked before any digest is
@@ -712,7 +799,7 @@ scan_or_die() { # <tree>
   # pass is a floor, not a guarantee — the guarantee is not authenticating in the
   # prepare command at all.
   local -a pass=()
-  local entry digest excused=0 seen=0 hits rc=0
+  local entry digest labels excused=0 unconfirmed=0 seen=0 hits rc=0
   for entry in "${CREDENTIAL_PATTERNS[@]}"; do pass+=(-e "${entry#*|}"); done
   # Listed to a file, and the exit status is checked. grep says 0 for "found",
   # 1 for "nothing", >=2 for "I broke" — and a >=2 that goes unread reads exactly
@@ -764,13 +851,24 @@ scan_or_die() { # <tree>
   while IFS= read -r -d '' bad; do
     [ -n "$bad" ] || continue
     seen=$((seen + 1))
+    # The prefilter's second question, asked before anything else. Only for a
+    # file whose ONLY complaint is the key header: one that also trips a token
+    # or a URL credential is refused on that, whatever the header turns out to
+    # be. An EMPTY label string means `matched_labels` hit an errored grep, and
+    # that is not this branch — it falls through and refuses, as it must.
+    labels=$(matched_labels "$bad")
+    if [ "$labels" = private-key-header ] && ! scan_file_holds_pem_block "$bad"; then
+      log "the content scan looked past $(safe_path "${bad#"$root"/}") — it names a PEM header but holds no key block"
+      unconfirmed=$((unconfirmed + 1))
+      continue
+    fi
     if [ "${#SCAN_ALLOW_DIGESTS[@]}" -gt 0 ]; then
       # Asked BEFORE the digest is computed, so a file no list may excuse never
       # gets one — a registry token is refused here whatever is on the list.
       if scan_hit_is_excusable "$bad"; then
         digest=$(sha256sum <"$bad" | cut -d' ' -f1) \
           || die "the content scan could not digest $(safe_path "${bad#"$root"/}")"
-        if scan_digest_is_allowed "$digest"; then
+        if scan_digest_is_allowed "$digest" && scan_excusal_source_is_allowed "$labels"; then
           # Logged, never silent. An exception nobody sees is one nobody revisits
           # when the package that needed it is gone.
           log "the content scan excused $(safe_path "${bad#"$root"/}") — sha256 $digest, excused by $SCAN_ALLOW_MATCHED_WHERE"
@@ -788,6 +886,11 @@ scan_or_die() { # <tree>
   [ "$rc" != 0 ] || [ "$seen" -gt 0 ] \
     || die "the content scan found matches it could not then read — refusing to publish"
   [ "$excused" = 0 ] || log "the content scan excused $excused file(s) by digest"
+  # Counted and reported for the same reason the excusals are: a confirmation
+  # stage that quietly drops most of what the prefilter flags is one nobody can
+  # tell apart from a prefilter that stopped working.
+  [ "$unconfirmed" = 0 ] \
+    || log "the content scan looked past $unconfirmed file(s) that name a PEM header but hold no key block"
 }
 
 # What the host will actually receive. Every member must be a plain file or a
