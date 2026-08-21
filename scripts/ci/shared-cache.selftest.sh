@@ -642,7 +642,7 @@ has_snapshot_inspection() { # <file>
   # pipe is not a refusal: tar exits 0 on a stream cut at a member boundary, so a
   # bound enforced only by tar's status leaves this host with part of a snapshot
   # it believes is whole — and the scan then passes on a subset of what arrived.
-  matches "$code" 'expanded=\$\( \{ timeout "\$left" gzip -dc "\$tmp/snap.tar.gz" 2>/dev/null \|\| true; \} \\' || return 1
+  matches "$code" 'expanded=\$\( \{ timeout "\$left" gzip -dc "\$tmp/snap.tar.gz" 2>/dev/null \|\| true; \} [\]' || return 1
   matches "$code" '\| head -c "\$\(\(bound \+ 1\)\)" \| wc -c \) \|\| expanded=\$\(\(bound \+ 1\)\)' || return 1
   matches "$code" '^  if \[ "\$expanded" -gt "\$bound" \]; then$' || return 1
   matches "$code" 'CACHE_VERDICT="too-big-expanded"'             || return 1
@@ -650,7 +650,7 @@ has_snapshot_inspection() { # <file>
   # postmortem on a tree already written.
   local count_at unpack_at
   count_at=$(printf '%s\n' "$code" | grep -nE '^  if \[ "\$expanded" -gt "\$bound" \]' | head -n1 | cut -d: -f1)
-  unpack_at=$(printf '%s\n' "$code" | grep -nE '\| head -c "\$bound" \\' | head -n1 | cut -d: -f1)
+  unpack_at=$(printf '%s\n' "$code" | grep -nE '\| head -c "\$bound" [\]' | head -n1 | cut -d: -f1)
   [ -n "$count_at" ] && [ -n "$unpack_at" ] && [ "$count_at" -lt "$unpack_at" ] || return 1
   # The free-space check reserves EXACTLY what the unpack may write. Reserving
   # the unfloored product while unpacking to the floored bound is how a host

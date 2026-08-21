@@ -952,6 +952,10 @@ if [ "$BUILDING" = 1 ]; then
   prep_pgid_file=$(mktemp "$ARCHIVE_DIR/pgid.XXXXXX") \
     || die "the prepare command's process group could not be staged"
   set -m
+  # shellcheck disable=SC2016  # the single quotes are the point: $CACHE_PREPARE_CMD
+  # and $CACHE_PREPARE_PGID_FILE are read by the CHILD from its environment, so the
+  # prepare command never becomes text this shell expands — that is what keeps it
+  # off the child's argv and out of this script's own word-splitting.
   CACHE_PREPARE_PGID_FILE="$prep_pgid_file" CACHE_PREPARE_CMD="$CACHE_PREPARE" \
     timeout -k 30 "$CACHE_PREPARE_TIMEOUT" sh -euc '
       { ps -o pgid= -p $$ 2>/dev/null || cut -d" " -f5 /proc/self/stat; } \
