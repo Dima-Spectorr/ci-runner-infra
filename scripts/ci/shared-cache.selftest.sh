@@ -918,6 +918,19 @@ has_trusted_snapshot_build() { # <file>
   # poisoned snapshot rather than a failed run.
   matches "$code" 'GITHUB_EVENT_NAME' || return 1
   matches "$code" "'' \| schedule \| workflow_dispatch \| push" || return 1
+  # The two names the publish phase is aimed at are validated BEFORE anything is
+  # packed, and they are validated the way the modules validate them — first
+  # character included. A pool name opening with a digit cannot exist, and the
+  # 403 it earns at the upload is the same 403 a missing binding, a wrong pool
+  # and an expired federation all give: fails closed either way, and the whole
+  # tree is packed first.
+  matches "$code" '^    \*\[!a-z0-9-\]\* \| .. \| \*- \) die "CACHE_POOL' || return 1
+  matches "$code" '^    \[!a-z\]\* \) die "CACHE_POOL must start with a lowercase letter' || return 1
+  matches "$code" '^  \[ "\$\{#CACHE_POOL\}" -le 63 \]' || return 1
+  matches "$code" '^    gs://\* \) die "CACHE_BUCKET is a bucket NAME' || return 1
+  matches "$code" '^    \*\[!a-z0-9\._-\]\* \| .. \| \.\* \| -\* \| \*\. \| \*- \| \*\.\.\* \) die "CACHE_BUCKET' || return 1
+  matches "$code" '^  \[ "\$\{#CACHE_BUCKET\}" -ge 3 \]' || return 1
+  matches "$code" '^  \[ "\$\{#CACHE_BUCKET\}" -le 63 \]' || return 1
   # The host's walks, with the host's rules — plus a content pass, because a
   # filename list cannot see a token inside a cache entry whose name is a hash.
   matches "$code" '\-perm /6000' || return 1
@@ -2228,6 +2241,26 @@ mutate_file "$PUBSH" 'the two listing statuses collapse into one' has_trusted_sn
 # that died before the kill.
 mutate_file "$PUBSH" 'the run gives up on an unrecorded group before reaping it' has_trusted_snapshot_build \
   '/^  kill -(TERM|KILL) -- "-\$prep_pgid"/d; /^  sleep 1$/d; s@^  case "\$prep_rc" in$@  kill -TERM -- "-$prep_pgid" 2>/dev/null || true\n  sleep 1\n  kill -KILL -- "-$prep_pgid" 2>/dev/null || true\n  case "$prep_rc" in@'
+# The names the publish run is aimed at, checked before the tree is packed. Each
+# of these is a value that cannot name anything the modules can create, so the
+# only question is whether the operator learns that here or from a 403 that
+# four different faults share.
+mutate_file "$PUBSH" 'a pool name may open with a digit' has_trusted_snapshot_build \
+  '/^    \[!a-z\]\* \) die "CACHE_POOL must start/d'
+mutate_file "$PUBSH" 'the pool name loses its length bound' has_trusted_snapshot_build \
+  '/^  \[ "\$\{#CACHE_POOL\}" -le 63 \]/,+1d'
+mutate_file "$PUBSH" 'the bucket name loses its length bound' has_trusted_snapshot_build \
+  '/^  \[ "\$\{#CACHE_BUCKET\}" -ge 3 \]/,+1d'
+mutate_file "$PUBSH" 'the bucket name may be longer than a bucket name' has_trusted_snapshot_build \
+  '/^  \[ "\$\{#CACHE_BUCKET\}" -le 63 \]/,+1d'
+mutate_file "$PUBSH" 'the pool name stops being validated at all' has_trusted_snapshot_build \
+  '/^  case "\$CACHE_POOL" in$/,+3d'
+mutate_file "$PUBSH" 'the bucket name stops being validated at all' has_trusted_snapshot_build \
+  '/^  case "\$CACHE_BUCKET" in$/,+3d'
+# The verification unpack is the publisher reading back what it is about to ship,
+# and it reads it back under the same refusals a host would apply.
+mutate_file "$PUBSH" 'the verification unpack lets the archive pick its owner' has_trusted_snapshot_build \
+  's@-C "\$VERIFY" --no-same-owner @-C "$VERIFY" @'
 mutate_file "$PUBSH" 'credential files stop being scanned for' has_trusted_snapshot_build \
   "s@-o -name '\.git-credentials' @@"
 mutate_file "$PUBSH" 'the snapshot name becomes reusable' has_trusted_snapshot_build \

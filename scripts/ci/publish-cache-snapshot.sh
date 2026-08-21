@@ -70,7 +70,10 @@
 #                     runs third-party code; see WHY TWO JOBS.
 #   CACHE_POOL        required when publishing. The pool name — the same value the
 #                     pool and publisher modules were given. Decides the prefix.
-#   CACHE_BUCKET      required when publishing. The bucket NAME, not a gs:// URL.
+#                     Checked against the module's own rule: a lowercase letter,
+#                     then letters, digits and hyphens, at most 63.
+#   CACHE_BUCKET      required when publishing. The bucket NAME, not a gs:// URL,
+#                     and 3 to 63 characters like any bucket name.
 #   CACHE_ARCHIVE_OUT optional. Build, scan, pack to this path, upload nothing.
 #   CACHE_ARCHIVE_IN  optional. Skip the install; verify and publish this archive.
 #   CACHE_MAX_BYTES   optional. Refuse an archive larger than this. Default 4 GiB,
@@ -379,13 +382,32 @@ if [ "$PUBLISHING" = 1 ]; then
   # The same charset the pool and publisher modules validate, for the same reason
   # one step further down: this value becomes an object prefix, and a host refuses
   # a pointer naming anything outside its own prefix.
+  #
+  # THE SAME charset means the same FIRST character too. The pool module accepts
+  # `^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$`, so a pool whose name opens with a digit
+  # cannot exist — and a publish aimed at one used to get all the way to the
+  # upload before Cloud Storage answered 403, which is the same answer a missing
+  # binding, a wrong pool and an expired federation all give. It fails closed
+  # either way; the difference is whether the operator is told which of the four
+  # it was. The length bound is the same regex's, for the same reason.
   case "$CACHE_POOL" in
-    *[!a-z0-9-]* | '' | -* | *- ) die "CACHE_POOL must be lowercase letters, digits and hyphens: $(safe_path "$CACHE_POOL")" ;;
+    *[!a-z0-9-]* | '' | *- ) die "CACHE_POOL must be lowercase letters, digits and hyphens, and must not end in one: $(safe_path "$CACHE_POOL")" ;;
+    [!a-z]* ) die "CACHE_POOL must start with a lowercase letter — the pool module accepts nothing else, so no pool by this name can exist: $(safe_path "$CACHE_POOL")" ;;
   esac
+  [ "${#CACHE_POOL}" -le 63 ] \
+    || die "CACHE_POOL is ${#CACHE_POOL} characters; the pool module accepts at most 63, so no pool by this name can exist"
   case "$CACHE_BUCKET" in
     gs://* ) die "CACHE_BUCKET is a bucket NAME, not a gs:// URL" ;;
     *[!a-z0-9._-]* | '' | .* | -* | *. | *- | *..* ) die "CACHE_BUCKET is not a valid bucket name" ;;
   esac
+  # 3..63 is the bucket-name length Cloud Storage itself enforces, and the same
+  # bound the publisher module's regex carries. Refusing here costs one line and
+  # saves a run that would otherwise pack a whole tree before the upload rejects
+  # the name it was addressed to.
+  [ "${#CACHE_BUCKET}" -ge 3 ] \
+    || die "CACHE_BUCKET is ${#CACHE_BUCKET} characters; a bucket name is 3 to 63"
+  [ "${#CACHE_BUCKET}" -le 63 ] \
+    || die "CACHE_BUCKET is ${#CACHE_BUCKET} characters; a bucket name is 3 to 63"
 
   command -v gcloud >/dev/null 2>&1 || die "gcloud is not on PATH"
   # Both are used only by the publish phase, and both are checked HERE — before
