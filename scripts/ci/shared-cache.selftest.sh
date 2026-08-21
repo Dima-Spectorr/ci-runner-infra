@@ -405,6 +405,41 @@ has_fail_open() { # <file>
   matches "$code" ': >"\$dst/\.ready"'                   || return 1
 }
 
+# The other half of the marker contract, and the reason this predicate sits next
+# to has_fail_open: `.ready` under a RETIRED slot index is a marker nothing
+# rewrites. Reduce slots_per_host and `/var/lib/ci-cache/<idx>` above the new
+# count keeps its whole tree and its marker; raise the count again and the
+# seeding loop meets a directory that already claims to be complete. The sweep
+# runs BEFORE the seeding loop, or it deletes what it has just seeded.
+has_retired_slot_prune() { # <file>
+  local code
+  code=$(code_of "$1")
+  # Bounded by what is on disk — the previous slot count is recorded nowhere on
+  # this host, so a `seq` over a guessed range cannot be right.
+  matches "$code" '^  for d in "\$CACHE_SLOTS"/\*; do'  || return 1
+  # Digits only, and only above the live count. Everything else in $CACHE_SLOTS
+  # was not put there by this function and is not this function's to remove —
+  # this is an `rm -rf` in a directory root also writes its own state into.
+  matches "$code" 'case "\$idx" in .*\[!0-9\]\*\) continue ;; esac' || return 1
+  matches "$code" '\[ "\$idx" -gt "\$SLOTS" \] \|\| continue' || return 1
+  # if/else, not `rm && log || log`: the second form runs the failure branch
+  # when the LOG fails, and the log is the only record this sweep leaves.
+  matches "$code" '^    if rm -rf "\$d"; then'                || return 1
+  matches "$code" 'log "slot \$idx: retired \(this host now has \$SLOTS\)' || return 1
+  matches "$code" 'log "slot \$idx: retired, but its cache copy could not be removed"' || return 1
+  # …and it fails open like everything else here: a slot that cannot be removed
+  # is logged, never fatal.
+  ! matches "$code" 'rm -rf "\$d".*\|\| die'                 || return 1
+  local prune_at seed_at
+  prune_at=$(printf '%s\n' "$code" | grep -nE '^  for d in "\$CACHE_SLOTS"/\*; do' | head -n1 | cut -d: -f1)
+  # The seeding CALL, not the `for i in $(seq 1 "$SLOTS")` header — that header
+  # appears four times in this script and the first one is a thousand lines
+  # above the cache layer, so an ordering check anchored on it compares the
+  # sweep against an unrelated loop and fails whatever the sweep does.
+  seed_at=$(printf '%s\n' "$code" | grep -nE '^    seed_slot_cache "\$i" \|\| log' | head -n1 | cut -d: -f1)
+  [ -n "$prune_at" ] && [ -n "$seed_at" ] && [ "$prune_at" -lt "$seed_at" ] || return 1
+}
+
 # Every "group" permission in this script means "nobody but this slot" only
 # while each slot's primary group is its own single-member group. Asserted in
 # the script, not assumed in a comment.
@@ -538,6 +573,19 @@ has_observable_hydrate() { # <file>
   # in this file: a rule repeated at every return is a rule missed at the next.
   matches "$code" 'hydrate_shared_cache_bounded \|\| rc=\$\?' || return 1
   matches "$code" '^  publish_cache_telemetry$'               || return 1
+  # "The attribute is not set" and "the metadata server did not answer" are
+  # opposite facts and `md` returns an empty string for both, so the exit code
+  # is what separates them: curl -f gives 22 for a 404, and 6/7/28 for DNS,
+  # refused and timed out. This is an OBSERVABILITY invariant, which is why it
+  # is asserted here: `not-configured` is the verdict that means "nothing to
+  # do", so a broken metadata server reported under it is a fleet-wide outage
+  # that no alert can see. Reading the code also costs nothing, where the second
+  # probe it replaced cost up to 30 seconds of boot before `deadline` existed.
+  matches "$code" 'CACHE_BUCKET=\$\(md "instance/attributes/ci-cache-bucket"\) \|\| bucket_rc=\$\?' || return 1
+  matches "$code" '^    if \[ "\$bucket_rc" = 22 \] \|\| \[ "\$bucket_rc" = 0 \]; then' || return 1
+  # No second metadata call may decide it, and rc 0 with an empty value is a
+  # pool that did not configure this layer, not an unreachable server.
+  ! matches "$code" 'md "instance/id"'                        || return 1
   # Nothing may return between the two.
   local between
   between=$(awk '/hydrate_shared_cache_bounded \|\| rc=\$\?/ { seen = 1; next }
@@ -569,16 +617,39 @@ has_observable_hydrate() { # <file>
 # beside the hydrate. This predicate is the whole reason the publisher was worth
 # a second look: on the controller VM there are no untrusted users and argv is
 # nobody's channel, so the pattern was fine there for as long as it lived there.
+#
+# Stated as properties of the POST call read as a unit, not as a list of exact
+# strings that happen to be in the file. The strings were the defect: `! matches
+# '-H "Authorization: Bearer $token'` bans one spelling, so `-H "authorization:
+# bearer $token"`, `--header "Authorization: Bearer $token"` and a `$tok` renamed
+# a line earlier all read as clean, and the required `-K <(printf` could sit in a
+# different function entirely while the call beside it still carried the header.
+# So: extract the call, and assert on THAT.
 has_publisher_token_out_of_argv() { # <telemetry.sh>
-  local code
+  local code call
   code=$(code_of "$1")
-  ! matches "$code" '\-H "Authorization: Bearer \$token'      || return 1
-  matches "$code" '\-K <\(printf .header = "Authorization: Bearer' || return 1
-  # And the response body does not land on a fixed path in a /tmp the host shares
-  # with job users: a symlink planted at a known name turns a root `curl -o` into
-  # a truncation of whatever it points at.
-  ! matches "$code" '\-o /tmp/'                               || return 1
+  # The call, from `http=$(curl` to the line that closes it. Same awk-range
+  # technique has_host_telemetry_wiring uses on the join block.
+  call=$(awk '/http=\$\(curl/ { in_call = 1 }
+              in_call             { print }
+              in_call && /-d "\$body"\)/ { exit }' <<<"$code")
+  [ -n "$call" ] || return 1
+  # The token reaches curl through a config file on a pipe, which never becomes
+  # a process argument…
+  matches "$call" '\-K <\(printf .header = "Authorization: Bearer %s' || return 1
+  # …and no header option anywhere in this file carries a bearer token, in any
+  # spelling curl accepts and whatever the variable holding it is called.
+  ! matches "$code" '(-H|--header)[[:space:]]+"[Aa]uthorization: *[Bb]earer' || return 1
+  # The response body goes to a private file. Anything else — a fixed name, a
+  # path built from a variable this predicate cannot follow — is a root `curl -o`
+  # aimed at a name a job user may have pre-planted a symlink at.
+  matches "$call" '\-o "\$out"'                               || return 1
   matches "$code" 'out=\$\(mktemp\)'                          || return 1
+  # And it is removed on BOTH exits. The failure path is the one that gets
+  # forgotten, and it is also the only one that reads the file back into a log.
+  local removals
+  removals=$(printf '%s\n' "$code" | grep -cE '^[[:space:]]*\[ "\$out" = /dev/null \] \|\| rm -f "\$out"')
+  [ "${removals:-0}" -ge 2 ]                                  || return 1
 }
 
 # The publisher only exists on the host because it was concatenated there. This
@@ -1440,6 +1511,7 @@ run 'the image build aborts on a hostile warm cache'     has_packer_gate_that_ab
 run 'the seed is published atomically'                   has_atomic_seed           "$SCRIPT"
 run 'no concurrency-unsafe cache is shared'              has_no_unsafe_sharing     "$SCRIPT"
 run 'a cache failure never blocks registration'          has_fail_open             "$SCRIPT"
+run 'a retired slot cache is removed before seeding'     has_retired_slot_prune    "$SCRIPT"
 run 'slot primary group is asserted'                     has_primary_group_assert  "$SCRIPT"
 run 'the host may read its own cache prefix and nothing else' has_read_only_cache_grant "$POOLTF"
 run 'the hydrate is bounded and fails open'              has_bounded_hydrate       "$SCRIPT"
@@ -1603,6 +1675,33 @@ mutate 'the ready marker is never written' has_fail_open \
   's@^  : >"\$dst/\.ready".*$@  true@'
 mutate 'a stale ready marker survives a reseed' has_fail_open \
   's@^  rm -f "\$dst/\.ready"$@@'
+
+# The retired-slot sweep, in the four shapes that read as correct. The ordering
+# the predicate pins is not mutated here because sed cannot move a loop past
+# another one, but it is the defect that matters most: a sweep placed AFTER the
+# seeding loop deletes what the run has just built, and looks identical in a
+# diff. The last mutation below is its cheap cousin — a sweep aimed at a name
+# that never matches, which reads as present and does nothing.
+mutate 'the retired slot sweep is dropped' has_retired_slot_prune \
+  's@^  for d in "\$CACHE_SLOTS"/\*; do$@  for d in; do@'
+mutate 'the sweep deletes the live slots too' has_retired_slot_prune \
+  's@^    \[ "\$idx" -gt "\$SLOTS" \] \|\| continue$@@'
+mutate 'the sweep stops checking the name is a slot index' has_retired_slot_prune \
+  's@^    case "\$idx" in .*esac$@@'
+mutate 'a failed removal is reported as a success' has_retired_slot_prune \
+  's@^    if rm -rf "\$d"; then$@    if rm -rf "$d" || true; then@'
+mutate 'the sweep is aimed at a name that never exists' has_retired_slot_prune \
+  's@^  for d in "\$CACHE_SLOTS"/\*; do$@  for d in "$CACHE_SLOTS"/.none; do@'
+
+# The metadata rc classification: every one of these turns a transient metadata
+# failure into "not-configured", which is the verdict that means "nothing to do"
+# and therefore the one nothing alerts on.
+mutate 'the metadata exit code is thrown away' has_observable_hydrate \
+  's@^  CACHE_BUCKET=\$\(md "instance/attributes/ci-cache-bucket"\) \|\| bucket_rc=\$\?$@  CACHE_BUCKET=$(md "instance/attributes/ci-cache-bucket") || true@'
+mutate 'any metadata failure means not-configured' has_observable_hydrate \
+  's@^    if \[ "\$bucket_rc" = 22 \] \|\| \[ "\$bucket_rc" = 0 \]; then$@    if true; then@'
+mutate 'the second metadata probe comes back' has_observable_hydrate \
+  's@^    if \[ "\$bucket_rc" = 22 \] \|\| \[ "\$bucket_rc" = 0 \]; then$@    if [ -n "$(md "instance/id")" ]; then@'
 
 mutate 'the primary-group assertion is dropped' has_primary_group_assert \
   's|\[ "\$\(id -gn "\$u"\)" = "\$u" \]|true|'
@@ -2111,6 +2210,15 @@ mutate_file "$TELEM" 'the publishing token goes back into argv' has_publisher_to
   's@-K <\(printf .header = "Authorization: Bearer %s..n. "\$token"\)@-H "Authorization: Bearer $token"@'
 mutate_file "$TELEM" 'the response goes back to a fixed name in shared /tmp' has_publisher_token_out_of_argv \
   's@-o "\$out"@-o /tmp/ts-response.json@'
+# The three the old string-matching version let through: a header in a spelling
+# nobody banned, a response path this predicate cannot follow, and a failure exit
+# that leaves the body on disk — the one exit that has already logged from it.
+mutate_file "$TELEM" 'the token header comes back spelled --header' has_publisher_token_out_of_argv \
+  's@-K <\(printf .header = "Authorization: Bearer %s..n. "\$token"\)@--header "authorization: bearer $token"@'
+mutate_file "$TELEM" 'the response goes to a path the file builds itself' has_publisher_token_out_of_argv \
+  's@-o "\$out"@-o "${TMPDIR:-/tmp}/ts-$$.json"@'
+mutate_file "$TELEM" 'the failure exit leaves the response body on disk' has_publisher_token_out_of_argv \
+  's@^    \[ "\$out" = /dev/null \] \|\| rm -f "\$out"$@@'
 
 mutate_file "$POOLTF" 'the host loses the telemetry publisher' has_host_telemetry_wiring \
   's@^    file\("\$\{path\.module\}/scripts/telemetry\.sh"\),$@@'
