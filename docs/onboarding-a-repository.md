@@ -648,3 +648,33 @@ it as a broken image.
 | a Windows host registers, reboots, and never comes back | expected after the registration token expires — the MIG replaces it at `register_grace_seconds` (see "A rebooted Windows host comes back dead") |
 | a Windows host boots, looks healthy, registers nothing | the image family. A Windows instance carrying the Linux boot key runs no boot script at all; the module refuses the mispairing at plan time, so check the `image` a running pool was applied with |
 | a build fails on a different download each run | container MTU. The hosts set the slot daemon's `mtu` from the primary interface, so this should not recur; a fork that dropped it black-holes large TLS responses and reports them as a truncated handshake or a "not found" dependency, never as a size error |
+| `go clean -modcache` or `uv cache clean` fails with `EACCES` | the warm cache, working as designed — see "Cleaning a warm cache" below |
+
+### Cleaning a warm cache
+
+A slot's dependency cache is seeded by copying the host's sealed master, and it
+arrives with the seal's modes: every **file** read-only, every **directory**
+writable, all of it owned by the slot. So the cache works normally — tools add,
+replace and remove entries, which needs write on the parent directory — but a
+command that rewrites cached content *in place* gets a permission error on files
+it can see it owns. `go clean -modcache` and `uv cache clean` are the cases
+repositories have hit.
+
+Nothing is broken, and the read-only mode is not incidental: `go.sum`
+authenticates the module zip at download and the build compiles from the
+extracted tree without re-hashing it, so those file modes are the only thing
+between one job's write and the next job's compile.
+
+If a job genuinely needs to clean, make the tree writable first. The slot owns
+every file, so this always succeeds:
+
+```yaml
+- name: Clean the Go module cache
+  run: |
+    chmod -R u+w "$GOMODCACHE"
+    go clean -modcache
+```
+
+Keep it in the job that needs it. The modes are per-slot, the next boot re-seeds
+from the master regardless, and a repository that cleans on every run is paying
+for the warm cache and then throwing it away.

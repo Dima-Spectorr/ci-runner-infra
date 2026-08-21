@@ -1420,6 +1420,17 @@ has_split_publishing_workflow() { # <doc>
   # A `workflow_call` here would let a caller pass an input that reaches
   # CACHE_PREPARE while satisfying both the binding and the event guard.
   ! matches "$doc" 'workflow_call:' || return 1
+
+  # No checkout leaves the job's GITHUB_TOKEN in `.git/config`. Counted rather
+  # than matched once, because the one that matters is the BUILD job's — that
+  # workspace is where CACHE_PREPARE runs third-party install code, and the
+  # premise of the whole split is that this job holds nothing worth stealing.
+  # Every checkout in this file gets it, so every checkout must carry the flag.
+  local checkouts persists
+  checkouts=$(printf '%s\n' "$doc" | grep -cE '^ *- uses: actions/checkout@')
+  persists=$(printf '%s\n' "$doc" | grep -cE '^ *persist-credentials: false$')
+  [ "${checkouts:-0}" -gt 0 ] && [ "$persists" = "$checkouts" ] || return 1
+  matches "$build" 'persist-credentials: false' || return 1
 }
 
 # --- the real script ------------------------------------------------------------
@@ -2090,6 +2101,14 @@ mutate_file "$PUBDOC" 'the auth action goes back to a movable tag' has_split_pub
   's|google-github-actions/auth@[0-9a-f]{40} # v2\.[0-9]+\.[0-9]+|google-github-actions/auth@v2|'
 mutate_file "$PUBDOC" 'the template becomes callable with inputs' has_split_publishing_workflow \
   's@^  workflow_dispatch:$@  workflow_dispatch:\n  workflow_call:@'
+# The token back in a workspace, in the two shapes it comes back in: every
+# checkout reverted at once, and — the one a reviewer would actually miss — a
+# single checkout left on the defaults while the others still carry the flag.
+# The second is why the assertion counts instead of matching once.
+mutate_file "$PUBDOC" 'every checkout goes back to the defaults' has_split_publishing_workflow \
+  's@^          persist-credentials: false$@@'
+mutate_file "$PUBDOC" 'the build job alone keeps the token in its workspace' has_split_publishing_workflow \
+  '0,/^          persist-credentials: false$/{/^          persist-credentials: false$/d}'
 
 # The verdict plumbing. Every one of these leaves a hydrate that still works —
 # hosts boot, jobs run — and takes away the only thing that would have said the
