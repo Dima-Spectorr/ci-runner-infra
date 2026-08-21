@@ -398,6 +398,15 @@ Describe 'broker port parsing' {
         Get-BrokerPort -Value '65536' | Should -Be $script:DefaultBrokerPort
     }
 
+    # The ephemeral range binds fine and then loses the port to an outbound socket,
+    # which reads in the log as a broker that installed and never answered. 49151 is
+    # here so the boundary is asserted rather than the direction.
+    It 'falls back inside the ephemeral range, and only inside it' {
+        Get-BrokerPort -Value '49152' | Should -Be $script:DefaultBrokerPort
+        Get-BrokerPort -Value '65535' | Should -Be $script:DefaultBrokerPort
+        Get-BrokerPort -Value '49151' | Should -Be 49151
+    }
+
     # This case was a real defect, found by running the function rather than by
     # reading it. All-digits is not the same thing as a number that fits, and
     # `[int64] '99999999999999999999'` THROWS -- which under the entry point's

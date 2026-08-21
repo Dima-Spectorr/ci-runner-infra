@@ -132,6 +132,9 @@ $script:JobHookPath = 'C:\ci\job-hooks\reset-credentials.ps1'
 # The loopback port the broker answers on when metadata does not name one. The
 # same default as the Linux broker, because it is the same broker.
 $script:DefaultBrokerPort = 8081
+# The bottom of the Windows dynamic/ephemeral port range. A listener placed inside
+# it is one an outbound connection can take first; see Get-BrokerPort.
+$script:EphemeralPortFloor = 49152
 
 # Where a slot's ADC is pointed when this pool has NO broker.
 #
@@ -580,9 +583,11 @@ function Get-BrokerPort {
         Same trust-boundary reasoning as the account name, with a narrower range:
         anything that is not a whole number in 1..65535 is a value the socket bind
         would refuse LATER, at which point the broker is a service that installed
-        and never answered. Falling back is right here and would be wrong for the
-        account: a default port serves the same broker, a default identity would
-        be somebody else's.
+        and never answered. The ephemeral range 49152-65535 is excluded for the
+        same outcome by a different route: the bind succeeds until an outbound
+        socket gets there first. Falling back is right here and would be wrong for
+        the account: a default port serves the same broker, a default identity
+        would be somebody else's.
     #>
     [CmdletBinding()]
     param(
@@ -598,6 +603,13 @@ function Get-BrokerPort {
     [int64] $port = 0
     if (-not [int64]::TryParse($Value, [ref] $port)) { return $Default }
     if ($port -lt 1 -or $port -gt 65535) { return $Default }
+    # ...and not the EPHEMERAL range either. Windows draws outbound source ports
+    # from 49152-65535, so a broker told to listen there is racing every socket the
+    # host opens -- and it loses the race silently, as a service that installed and
+    # then did not answer on the port the log says it is on. Availability only, but
+    # this picker is the only place that can tell the difference between a port
+    # somebody chose and one the stack hands out.
+    if ($port -ge $script:EphemeralPortFloor) { return $Default }
     return [int] $port
 }
 
