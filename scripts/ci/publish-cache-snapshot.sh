@@ -128,6 +128,40 @@ log() { printf 'publish-cache-snapshot: %s\n' "$*"; }
 safe_path() { printf '%s' "$1" | LC_ALL=C tr -c '[:print:]' '?'; }
 
 CACHE_MAX_BYTES="${CACHE_MAX_BYTES:-4294967296}"
+
+# How far a snapshot is allowed to expand, and why it has a floor. This is the
+# bound EVERY POOL HOST applies on arrival (`host-startup.sh`, cache_expand_bound),
+# and it is applied here for exactly that reason: an archive past it is one every
+# host would silently refuse, so catching it at publish time is the point rather
+# than a side effect. The two copies must not drift, and the self-test asserts
+# both.
+#
+# Eight times the compressed size is the ratio — a host holds the archive, the
+# tree it unpacks to and the tree already in its master at once, and a dependency
+# cache compresses about threefold.
+#
+# The floor is what stops the ratio from refusing a valid archive. Tar's default
+# blocking factor is 20 512-byte records, so nothing it writes is shorter than
+# 10240 bytes, and the nine cache directories alone cost 4608 bytes of headers
+# before one file goes in. Scaled all the way down the bound lands below that: a
+# staging tree that gzips to 400 bytes gets a 3200-byte bound and `head` cuts the
+# stream mid-archive. The result is not the refusal it looks like: measured on GNU
+# tar 1.35, a stream cut at a member boundary leaves the rest of tar's 10240-byte
+# record as zeros, two zero blocks are how an archive says it ended, and tar
+# extracts the PREFIX and exits 0 — a nine-directory tree cut at 2256 bytes yields
+# four of the nine, silently. The scan below would then run over a subset of the
+# bytes this run is about to publish. 64 KiB is six times tar's minimum and far
+# below any tree with a dependency in it, so the ratio still governs everything
+# that matters, and nothing small enters the truncating case at all.
+#
+# Because tar's status cannot be trusted to report a cut, the bound is enforced by
+# COUNTING before anything unpacks — see assert_expands_within_bound.
+CACHE_EXPAND_FLOOR_BYTES=65536
+cache_expand_bound() { # <compressed bytes>
+  local bound=$(($1 * 8))
+  [ "$bound" -ge "$CACHE_EXPAND_FLOOR_BYTES" ] || bound=$CACHE_EXPAND_FLOOR_BYTES
+  printf '%s' "$bound"
+}
 # An install that hangs on a registry must not hold the group open forever; the
 # reap below cannot run until this returns. One hour, well under the workflow's
 # own job timeout so the failure is this script's and names its own cause.
@@ -744,22 +778,22 @@ pgid_of() { # <pid>
   case "$out" in '' | *[!0-9]* ) return 1 ;; * ) printf '%s' "$out"; return 0 ;; esac
 }
 
-# Why the archive did not unpack, said accurately. `head` closing the pipe and a
-# corrupt archive both surface as the same tar failure, and blaming corruption
-# for a tree that merely compresses well sends the operator looking for a
-# hardware fault. The bound stays 8x the compressed size because that is the
-# bound the HOST applies on arrival: a snapshot past it is one every host would
-# silently refuse, so catching it here is the point rather than a side effect.
-unpack_failed() {
+# Whether the archive fits its expansion bound, decided BEFORE anything unpacks
+# it and by counting rather than by reading tar's status. tar exits 0 on a stream
+# cut at a member boundary (see cache_expand_bound), so `head` closing the pipe is
+# not a refusal on its own: the verification tree would hold a prefix of the
+# archive, the credential scan would pass on that prefix, and the whole archive
+# would be published. Counting is the only part of this that cannot be fooled.
+#
+# The count is itself bounded — `head -c $((bound + 1))` is enough to answer
+# "more than bound?" and nothing more. An expansion check that decompresses
+# without a limit turns a gzip bomb into its own amplifier: the run that refused
+# the archive would be the run that filled the disk explaining why.
+assert_expands_within_bound() { # <bound>
   local expanded
-  # Bounded like the main path. An error handler that decompresses without a
-  # limit turns a gzip bomb into its own amplifier: the run that refused the
-  # archive would then be the run that filled the disk explaining why.
-  expanded=$( (gzip -dc "$ARCHIVE" || true) | head -c "$((size * 8 + 1))" | wc -c ) || expanded=0
-  if [ "$expanded" -gt "$((size * 8))" ]; then
-    die "the archive expands past the $((size * 8)) byte bound (8x its compressed size, which is the same bound every pool host applies on arrival) — this snapshot would be refused by every host, so it is refused here"
-  fi
-  die "the archive did not unpack — refusing to publish an archive this run cannot inspect"
+  expanded=$( (gzip -dc "$ARCHIVE" || true) | head -c "$(($1 + 1))" | wc -c ) || expanded=$(($1 + 1))
+  [ "$expanded" -le "$1" ] \
+    || die "the archive expands past the $1 byte bound (8x its compressed size, floored at $CACHE_EXPAND_FLOOR_BYTES, which is the same bound every pool host applies on arrival) — this snapshot would be refused by every host, so it is refused here"
 }
 
 scan_or_die() { # <tree>
@@ -904,12 +938,35 @@ archive_is_flat() { # <archive>
   # $ARCHIVE_DIR is one the prepare command can pre-create as a symlink to
   # /dev/null, and a listing that is written nowhere makes this check pass on
   # every archive.
-  local bad list
+  local bad list cap tar_rc=0 written
   list=$(mktemp "$ARCHIVE_DIR/listing.XXXXXX") || die "the archive could not be listed"
   # Listed to a file rather than piped into awk: under `pipefail` an awk that
   # stops at the first offending member takes the writer down with SIGPIPE, and a
   # FOUND violation would then be reported as "could not be listed".
-  tar -tvzf "$1" >"$list" || die "the archive could not be listed"
+  #
+  # Bounded, because "to a file" is otherwise unbounded: an archive with an
+  # enormous member count writes a multi-gigabyte listing onto the publish runner
+  # before anything reads a line of it. Over the bound is a REFUSAL, never a
+  # silent trim — a truncated listing is one whose offending member may be in the
+  # part that was cut.
+  #
+  # The bound is the archive's own expansion bound, which is the one number that
+  # cannot refuse a legitimate archive: every member costs at least a 512-byte
+  # header in the stream and produces at most one line here, so a listing longer
+  # than the stream it describes is not a listing of an archive this run would
+  # publish anyway.
+  #
+  # `head` may SIGPIPE tar, so tar's status comes out of PIPESTATUS — and the
+  # BYTE COUNT, not that status, decides which of the two refusals is printed.
+  # Reading the status alone would report a 141 as a corrupt archive.
+  cap=$(cache_expand_bound "$(stat -c %s "$1")") || die "the archive could not be measured"
+  if ! tar -tvzf "$1" | head -c "$((cap + 1))" >"$list"; then
+    tar_rc=${PIPESTATUS[0]}
+  fi
+  written=$(wc -c <"$list") || die "the archive's listing could not be measured"
+  [ "$written" -le "$cap" ] \
+    || die "the archive's member listing passes the $cap byte bound — refusing to inspect an archive with a member count this large rather than filling this runner's disk describing it"
+  [ "$tar_rc" = 0 ] || die "the archive could not be listed"
   bad=$(awk '$1 !~ /^[-d]/ || $1 ~ /[sS]/ { print; exit }' "$list")
   [ -z "$bad" ] || die "the archive holds a member that is not a plain file or directory, or is setuid ($(safe_path "$bad")) — a host would refuse it"
 }
@@ -972,31 +1029,55 @@ if [ "$BUILDING" = 1 ]; then
   # workflows already run arbitrary commands. Splitting it here would be a false
   # safety. `-e` because a prepare joined with `;` instead of `&&` would otherwise
   # publish a half-populated cache with a zero exit.
+  # The child records its OWN group, first thing, into a file this script made.
+  #
+  # Asking `ps` from the parent could not answer in the one case the assertion
+  # exists for. A prepare that finishes before `ps` observes it reports no group
+  # at all, and "no group reported" has to pass or every fast install dies on a
+  # scheduling accident — but a child bash has already reaped is also the shape
+  # most likely to have left a daemonised descendant alive in that group. The
+  # assertion was therefore silently not made precisely when it mattered most.
+  #
+  # A file the child wrote is not a race: it is there whether or not the process
+  # still is. Read after `wait` for the same reason — before it, empty means "not
+  # yet", which is the very ambiguity this replaces.
+  #
+  # `ps` first and /proc as the fallback, because the two disagree about nothing
+  # and neither is guaranteed present. Field 5 of /proc/<pid>/stat is pgrp, and
+  # `cut` reads it in its own process, which shares the group.
+  #
+  # The path is unset before the prepare command is exec'd. That is a bar, not a
+  # wall — the prepare runs as this uid and `mktemp` randomises a name against
+  # GUESSING, not against `ls` — and it is not asked to be a wall: what bounds an
+  # install that means harm is the reap itself plus the digest pinned across
+  # every later use of the archive. This is the detector that says the reap was
+  # aimed somewhere real.
+  prep_pgid_file=$(mktemp "$ARCHIVE_DIR/pgid.XXXXXX") \
+    || die "the prepare command's process group could not be staged"
   set -m
-  timeout -k 30 "$CACHE_PREPARE_TIMEOUT" sh -euc "$CACHE_PREPARE" &
+  # shellcheck disable=SC2016  # the single quotes are the point: $CACHE_PREPARE_CMD
+  # and $CACHE_PREPARE_PGID_FILE are read by the CHILD from its environment, so the
+  # prepare command never becomes text this shell expands — that is what keeps it
+  # off the child's argv and out of this script's own word-splitting.
+  CACHE_PREPARE_PGID_FILE="$prep_pgid_file" CACHE_PREPARE_CMD="$CACHE_PREPARE" \
+    timeout -k 30 "$CACHE_PREPARE_TIMEOUT" sh -euc '
+      { ps -o pgid= -p $$ 2>/dev/null || cut -d" " -f5 /proc/self/stat; } \
+        | tr -dc 0-9 >"$CACHE_PREPARE_PGID_FILE" || true
+      cmd=$CACHE_PREPARE_CMD
+      unset CACHE_PREPARE_PGID_FILE CACHE_PREPARE_CMD
+      exec sh -euc "$cmd"' &
   prep_pgid=$!
   set +m
-  # `ps` alone decides, both whether there is a child to judge and what group it
-  # is in. The earlier shape guarded this with `kill -0`, which is a different
-  # source: bash's kill BUILTIN answers from its own job table and calls a job it
-  # has already reaped live. On Linux every prepare that finishes quickly — which
-  # is all of them in this file's behavioural tests — took that branch with `ps`
-  # having nothing left to report, and the run died on a scheduling accident
-  # rather than on a fault.
-  #
-  # So: no group reported means no child left to bound, and there is nothing to
-  # refuse. A group reported that is not the child's own is the real fault — the
-  # reap would be aimed at this script's group — and that is what dies.
-  #
-  # The refusal names the two values it compared. A gate that says only "the
-  # group is wrong" is one nobody can act on from a CI job page once the runner
-  # is gone: "ps could not answer" and "the child landed in this script's group"
-  # have different fixes and read identically without them.
-  prep_seen=$(pgid_of "$prep_pgid" || true)
-  [ -z "$prep_seen" ] || [ "$prep_seen" = "$prep_pgid" ] \
-    || die "the prepare command did not get a process group of its own, so nothing it leaves running could be reaped — refusing to build a snapshot this run cannot bound (child pid $prep_pgid, its group '$prep_seen', this script's group $(pgid_of $$ || true))"
   prep_rc=0
   wait "$prep_pgid" || prep_rc=$?
+  # An empty file and a wrong group are different faults with different fixes,
+  # and a gate that says only "the group is wrong" is one nobody can act on from
+  # a CI job page once the runner is gone. Both refusals name what they compared.
+  prep_seen=$(tr -dc 0-9 <"$prep_pgid_file") || prep_seen=""
+  [ -n "$prep_seen" ] \
+    || die "the prepare command never recorded the process group it ran in, so nothing it leaves running could be reaped — refusing to build a snapshot this run cannot bound (child pid $prep_pgid, this script's group $(pgid_of $$ || true))"
+  [ "$prep_seen" = "$prep_pgid" ] \
+    || die "the prepare command did not get a process group of its own, so nothing it leaves running could be reaped — refusing to build a snapshot this run cannot bound (child pid $prep_pgid, its group '$prep_seen', this script's group $(pgid_of $$ || true))"
   # TERM, a moment, then KILL. Both are best-effort against an already-empty
   # group, which is the normal case and not an error.
   kill -TERM -- "-$prep_pgid" 2>/dev/null || true
@@ -1099,13 +1180,17 @@ if [ "$BUILDING" = 1 ]; then rm -rf "$STAGE"; mkdir -p "$STAGE"; chmod 0700 "$ST
 # populated, so unpacking over it would scan a union of the two.
 #
 # Bounded the way the host bounds it: gzip expands by more than a thousandfold on
-# the right input, so the compressed bound alone bounds nothing. `head` closing
-# the pipe truncates the stream and tar fails, which is the wanted answer.
+# the right input, so the compressed bound alone bounds nothing. The bound is
+# decided by the count above the unpack, not by whether tar objects to being cut;
+# `head` here only makes sure a bomb cannot be written out while the run is
+# finding that out.
 VERIFY=$(mktemp -d) || die "the archive could not be unpacked for verification"
 chmod 0700 "$VERIFY"
-gzip -dc "$ARCHIVE" | head -c "$((size * 8))" \
+verify_bound=$(cache_expand_bound "$size")
+assert_expands_within_bound "$verify_bound"
+gzip -dc "$ARCHIVE" | head -c "$verify_bound" \
   | tar -x -C "$VERIFY" --no-same-owner --no-same-permissions --no-xattrs --no-acls \
-  || unpack_failed
+  || die "the archive did not unpack — refusing to publish an archive this run cannot inspect"
 scan_or_die "$VERIFY"
 
 # The name is the object's identity forever: the bucket expires it by age and

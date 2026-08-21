@@ -630,7 +630,36 @@ has_snapshot_inspection() { # <file>
   matches "$code" 'elif \[ "\$\{2:-\}" = "strict" \]'            || return 1
   # max_bytes bounds the COMPRESSED archive and gzip expands by more than a
   # thousandfold on the right input, so the decompressed stream is bounded too.
-  matches "$code" 'head -c "\$\(\(size \* 8\)\)"'                || return 1
+  matches "$code" 'head -c "\$bound"'                            || return 1
+  # ...and the bound has a FLOOR, because tar writes nothing shorter than 20
+  # 512-byte records however little it holds. Scaled all the way down, 8x lands
+  # below that and `head` cuts a valid archive in half. The floor is asserted as a
+  # number: an arithmetic tidy-up that removes it brings the same defect back
+  # looking like a simplification.
+  matches "$code" '^CACHE_EXPAND_FLOOR_BYTES=65536$'             || return 1
+  matches "$code" '\[ "\$bound" -ge "\$CACHE_EXPAND_FLOOR_BYTES" \] \|\| bound=\$CACHE_EXPAND_FLOOR_BYTES' || return 1
+  # And the bound is decided by COUNTING, before the unpack. `head` closing the
+  # pipe is not a refusal: tar exits 0 on a stream cut at a member boundary, so a
+  # bound enforced only by tar's status leaves this host with part of a snapshot
+  # it believes is whole — and the scan then passes on a subset of what arrived.
+  matches "$code" 'expanded=\$\( \{ timeout "\$left" gzip -dc "\$tmp/snap.tar.gz" 2>/dev/null \|\| true; \} [\]' || return 1
+  matches "$code" '\| head -c "\$\(\(bound \+ 1\)\)" \| wc -c \) \|\| expanded=\$\(\(bound \+ 1\)\)' || return 1
+  matches "$code" '^  if \[ "\$expanded" -gt "\$bound" \]; then$' || return 1
+  matches "$code" 'CACHE_VERDICT="too-big-expanded"'             || return 1
+  # The count runs BEFORE the unpack, or it is not a bound at all — it is a
+  # postmortem on a tree already written.
+  local count_at unpack_at
+  count_at=$(printf '%s\n' "$code" | grep -nE '^  if \[ "\$expanded" -gt "\$bound" \]' | head -n1 | cut -d: -f1)
+  unpack_at=$(printf '%s\n' "$code" | grep -nE '\| head -c "\$bound" [\]' | head -n1 | cut -d: -f1)
+  [ -n "$count_at" ] && [ -n "$unpack_at" ] && [ "$count_at" -lt "$unpack_at" ] || return 1
+  # The free-space check reserves EXACTLY what the unpack may write. Reserving
+  # the unfloored product while unpacking to the floored bound is how a host
+  # fills its own boot disk warming a cache.
+  matches "$code" '^  bound=\$\(cache_expand_bound "\$size"\)$'  || return 1
+  matches "$code" '\[ "\$\(\(free_kb \* 1024\)\)" -lt "\$bound" \]' || return 1
+  # Nothing computes the bound by hand any more. One arithmetic site, or the two
+  # copies of it drift and the host refuses what the publisher accepted.
+  ! matches "$code" 'head -c "\$\(\(size \* 8\)\)"'              || return 1
   # A whitelist on the way in: only the tool directories this host already knows
   # about move, so a snapshot cannot introduce a new top-level name.
   matches "$code" 'for d in "\$\{CACHE_DIRS\[@\]\}"; do'         || return 1
@@ -1102,9 +1131,31 @@ has_trusted_snapshot_build() { # <file>
   # is on the archive rather than on the tree.
   matches "$code" '\-\-hard-dereference' || return 1
   matches "$code" 'archive_is_flat "\$ARCHIVE"' || return 1
+  # ...and the listing it writes is bounded. Unbounded, an archive with an
+  # enormous member count puts a multi-gigabyte file on the publish runner before
+  # a line of it is read. Bounded but TRIMMED would be worse than either: the
+  # offending member could be in the part that was cut, so the check would pass
+  # on exactly the archive it was written to catch. Over the bound is a refusal.
+  matches "$code" 'cap=\$\(cache_expand_bound "\$\(stat -c %s "\$1"\)"\)' || return 1
+  matches "$code" 'tar -tvzf "\$1" \| head -c "\$\(\(cap \+ 1\)\)" >"\$list"' || return 1
+  matches "$code" 'tar_rc=\$\{PIPESTATUS\[0\]\}' || return 1
+  matches "$code" '\[ "\$written" -le "\$cap" \]' || return 1
+  # And the BYTE COUNT decides which refusal is printed, not tar's status. `head`
+  # closing the pipe kills tar with SIGPIPE, so reading the status alone reports
+  # every over-long listing as a corrupt archive and sends the operator looking
+  # for a hardware fault — the same misdiagnosis unpack_failed exists to avoid.
+  local flat trunc_at rc_at
+  flat=$(printf '%s\n' "$code" | sed -n '/^archive_is_flat() {/,/^}$/p')
+  trunc_at=$(printf '%s\n' "$flat" | grep -nE '\[ "\$written" -le "\$cap" \]' | head -n1 | cut -d: -f1)
+  rc_at=$(printf '%s\n' "$flat" | grep -nE '\[ "\$tar_rc" = 0 \]' | head -n1 | cut -d: -f1)
+  [ -n "$trunc_at" ] && [ -n "$rc_at" ] && [ "$trunc_at" -lt "$rc_at" ] || return 1
   # The prepare command's own failure must be one: `sh -c` without -e publishes a
-  # half-populated cache with a zero exit.
-  matches "$code" 'sh -euc "\$CACHE_PREPARE"' || return 1
+  # half-populated cache with a zero exit. Asserted on the shell that actually
+  # runs it — the wrapper that records the process group execs into this one, so
+  # a `-e` dropped HERE is the one that matters, and the wrapper carrying `-euc`
+  # would otherwise satisfy a laxer pattern.
+  matches "$code" 'exec sh -euc "\$cmd"' || return 1
+  matches "$code" '^      cmd=\$CACHE_PREPARE_CMD$' || return 1
   # The publishing phase re-scans what it received. The archive crossed a job
   # boundary, and the job that scanned it first is the one that ran other
   # people's code.
@@ -1134,7 +1185,39 @@ has_trusted_snapshot_build() { # <file>
   # node or setuid entry" about a DIRECTORY has been sent the wrong way once.
   matches "$code" "\-printf '%y %M %p" || return 1
   matches "$code" '\-C "\$VERIFY" --no-same-owner' || return 1
-  matches "$code" 'head -c "\$\(\(size \* 8\)\)"' || return 1
+  # The SAME bound a host applies, computed by the same function, floored by the
+  # same number. The point of bounding here at all is that an archive past the
+  # bound is one every host would silently refuse; a publisher whose bound has
+  # drifted from the fleet's is checking nothing anyone will act on. The floor
+  # exists because tar writes nothing shorter than 10240 bytes, so 8x of a tiny
+  # tree cuts a perfectly valid archive.
+  matches "$code" '^verify_bound=\$\(cache_expand_bound "\$size"\)$' || return 1
+  matches "$code" 'head -c "\$verify_bound"' || return 1
+  matches "$code" '^CACHE_EXPAND_FLOOR_BYTES=65536$' || return 1
+  matches "$code" '\[ "\$bound" -ge "\$CACHE_EXPAND_FLOOR_BYTES" \] \|\| bound=\$CACHE_EXPAND_FLOOR_BYTES' || return 1
+  # The bound is enforced by COUNTING, before the unpack, because tar exits 0 on a
+  # stream cut at a member boundary: the verification tree would then hold a
+  # prefix, the credential scan would pass on the prefix, and the whole archive
+  # would be published. The count is itself bounded — an expansion check that
+  # decompresses without a limit is the gzip bomb's amplifier.
+  matches "$code" '^assert_expands_within_bound\(\) \{ # <bound>$' || return 1
+  matches "$code" 'expanded=\$\( \(gzip -dc "\$ARCHIVE" \|\| true\) \| head -c "\$\(\(\$1 \+ 1\)\)" \| wc -c \) \|\| expanded=\$\(\(\$1 \+ 1\)\)' || return 1
+  matches "$code" '\[ "\$expanded" -le "\$1" \]' || return 1
+  matches "$code" '^assert_expands_within_bound "\$verify_bound"$' || return 1
+  # ...and the refusal quotes both halves of the bound — an operator who reads
+  # only "past the 3152 byte bound" cannot tell a gzip bomb from a fixture that
+  # packed to 394 bytes.
+  matches "$code" 'floored at \$CACHE_EXPAND_FLOOR_BYTES' || return 1
+  ! matches "$code" 'size \* 8' || return 1
+  # Counting before unpacking, not after. Below the unpack it is a postmortem on
+  # a tree the scan has already been handed.
+  local assert_at verify_at
+  assert_at=$(printf '%s\n' "$code" | grep -nE '^assert_expands_within_bound "\$verify_bound"$' | head -n1 | cut -d: -f1)
+  verify_at=$(printf '%s\n' "$code" | grep -nE 'head -c "\$verify_bound"' | head -n1 | cut -d: -f1)
+  [ -n "$assert_at" ] && [ -n "$verify_at" ] && [ "$assert_at" -lt "$verify_at" ] || return 1
+  # A tar that says nothing is not a tar that succeeded, so its status can no
+  # longer be the thing that decides the bound.
+  ! matches "$code" 'unpack_failed' || return 1
 
   # The install runs in a process group of its own, bounded, and the group is
   # reaped BEFORE anything is scanned. `sh -euc` returning does not mean the
@@ -1144,15 +1227,40 @@ has_trusted_snapshot_build() { # <file>
   # Asserted as a set: `set -m` is what creates the group, the pgid check is what
   # proves it, the two kills are what use it. Any one alone is decoration.
   matches "$code" '^  set -m$' || return 1
-  matches "$code" '^  timeout -k 30 "\$CACHE_PREPARE_TIMEOUT" sh -euc "\$CACHE_PREPARE" &$' || return 1
-  matches "$code" 'prep_seen=\$\(pgid_of "\$prep_pgid" \|\| true\)' || return 1
-  # One source answers both questions. `kill -0` is not that source: bash's kill
-  # builtin reports a job it has already reaped as live, so pairing it with a
-  # `ps` lookup made every fast prepare on Linux look like a wrong group.
-  matches "$code" '\[ -z "\$prep_seen" \] \|\| \[ "\$prep_seen" = "\$prep_pgid" \]' || return 1
+  matches "$code" '^  CACHE_PREPARE_PGID_FILE="\$prep_pgid_file" CACHE_PREPARE_CMD="\$CACHE_PREPARE"' || return 1
+  matches "$code" '^    timeout -k 30 "\$CACHE_PREPARE_TIMEOUT" sh -euc .$' || return 1
+  # The child records its own group; the parent does not interrogate a pid that
+  # may already be reaped. Asking `ps` from here could not answer in the one case
+  # the assertion exists for — a prepare that finished before `ps` saw it reports
+  # nothing, "nothing" has to pass, and a reaped child is also the shape most
+  # likely to have left a daemon in the group. A file the child wrote is there
+  # whether or not the process is.
+  matches "$code" 'tr -dc 0-9 >"\$CACHE_PREPARE_PGID_FILE"' || return 1
+  matches "$code" 'cut -d" " -f5 /proc/self/stat' || return 1
+  matches "$code" 'prep_seen=\$\(tr -dc 0-9 <"\$prep_pgid_file"\)' || return 1
+  ! matches "$code" 'prep_seen=\$\(pgid_of "\$prep_pgid"' || return 1
+  # `kill -0` is not a source for this either: bash's kill builtin reports a job
+  # it has already reaped as live, so pairing it with a `ps` lookup made every
+  # fast prepare on Linux look like a wrong group.
   ! matches "$code" 'kill -0 "\$prep_pgid"' || return 1
+  # An unrecorded group and a wrong group are separate refusals. Collapsed into
+  # `[ -z "$prep_seen" ] || [ ... ]` — which is what this replaced — an empty
+  # value PASSES, and empty is now the interesting case rather than the benign
+  # one, so that shape must not come back.
+  matches "$code" '^  \[ -n "\$prep_seen" \]' || return 1
+  matches "$code" '^  \[ "\$prep_seen" = "\$prep_pgid" \]' || return 1
+  ! matches "$code" '\[ -z "\$prep_seen" \] \|\|' || return 1
+  # Read AFTER the wait, or empty means "not yet" and the ambiguity is back.
+  local pgid_at wait_at
+  pgid_at=$(printf '%s\n' "$code" | grep -nE 'prep_seen=\$\(tr -dc 0-9' | head -n1 | cut -d: -f1)
+  wait_at=$(printf '%s\n' "$code" | grep -nE '^  wait "\$prep_pgid"' | head -n1 | cut -d: -f1)
+  [ -n "$pgid_at" ] && [ -n "$wait_at" ] && [ "$wait_at" -lt "$pgid_at" ] || return 1
+  # The path is out of the environment before the prepare command is exec'd. Not
+  # a wall — same uid, and `ls` finds an mktemp name — but the obvious forgery
+  # should not be handed over in a variable.
+  matches "$code" 'unset CACHE_PREPARE_PGID_FILE CACHE_PREPARE_CMD' || return 1
   # The refusal names the two values it compared. Without them the message is
-  # the same string whether `ps` answered nothing or answered the wrong group.
+  # the same string whether nothing was recorded or the wrong group was.
   matches "$code" 'child pid \$prep_pgid, its group .\$prep_seen' || return 1
   matches "$code" 'kill -TERM -- "-\$prep_pgid"' || return 1
   matches "$code" 'kill -KILL -- "-\$prep_pgid"' || return 1
@@ -1550,7 +1658,28 @@ mutate 'the snapshot scan stops being strict' has_snapshot_inspection \
 mutate 'an unscannable snapshot is logged rather than refused' has_snapshot_inspection \
   's@^  elif \[ "\$\{2:-\}" = "strict" \]; then$@  elif false; then@'
 mutate 'the decompressed stream stops being bounded' has_snapshot_inspection \
-  's@\| head -c "\$\(\(size \* 8\)\)"@| cat@'
+  's@\| head -c "\$bound"@| cat@'
+# The floor. Without it a valid archive of a small tree is cut by `head` -- and
+# tar does not object, because the cut lands at a member boundary and the record's
+# zero padding reads as an end-of-archive marker. The host hydrates four of nine
+# directories and calls it a hit. That is issue #191 exactly.
+mutate 'the expansion bound loses its floor on the host' has_snapshot_inspection \
+  's@^  \[ "\$bound" -ge "\$CACHE_EXPAND_FLOOR_BYTES" \] \|\| bound=\$CACHE_EXPAND_FLOOR_BYTES$@  :@'
+mutate 'the host floors the bound at nothing' has_snapshot_inspection \
+  's@^CACHE_EXPAND_FLOOR_BYTES=65536$@CACHE_EXPAND_FLOOR_BYTES=0@'
+# Reserve less than the unpack may write and the host fills its own boot disk
+# warming a cache -- the one outcome the reservation exists to prevent.
+mutate 'the free-space check reserves the unfloored product' has_snapshot_inspection \
+  's@^  if \[ -z "\$\{free_kb:-\}" \] \|\| \[ "\$\(\(free_kb \* 1024\)\)" -lt "\$bound" \]; then$@  if [ -z "${free_kb:-}" ] || [ "$((free_kb * 1024))" -lt "$((size * 8))" ]; then@'
+# The count is what makes the bound a bound; tar's silence is not agreement.
+mutate 'the host stops counting what it decompressed' has_snapshot_inspection \
+  's@^  if \[ "\$expanded" -gt "\$bound" \]; then$@  if false; then@'
+mutate 'the count is removed from the hydrate altogether' has_snapshot_inspection \
+  '/^  local expanded$/,/^  fi$/d'
+mutate 'a partial hydrate stops having a verdict of its own' has_snapshot_inspection \
+  's@CACHE_VERDICT="too-big-expanded"@CACHE_VERDICT="unpack-timeout"@'
+mutate 'the count itself becomes unbounded' has_snapshot_inspection \
+  's@\| head -c "\$\(\(bound \+ 1\)\)" \| wc -c \)@| wc -c )@'
 mutate 'the pointer stops being whitelisted' has_snapshot_inspection \
   's@^    \*\[!A-Za-z0-9\._-\]\* \| .. \| \.\* \)$@    nothing-at-all )@'
 mutate 'the hydrate runs after the master is locked' has_snapshot_inspection \
@@ -1812,7 +1941,7 @@ mutate_file "$PUBSH" 'the refusal echoes whatever sat in front of the ://' has_t
 mutate_file "$PUBSH" 'a filename from the staged tree is printed raw' has_trusted_snapshot_build \
   's@\$\(safe_path "\$bad"\)@$bad@g'
 mutate_file "$PUBSH" 'a half-populated install publishes with a zero exit' has_trusted_snapshot_build \
-  's@sh -euc "\$CACHE_PREPARE"@sh -c "$CACHE_PREPARE"@'
+  's@exec sh -euc "\$cmd"@exec sh -c "$cmd"@'
 # Both respellings of the -I mistake. Each one publishes a NUL-prefixed token,
 # and each one used to walk past the guard that claimed to forbid it.
 mutate_file "$PUBSH" 'the binary skip comes back spelled -rIlZ' has_trusted_snapshot_build \
@@ -1827,12 +1956,26 @@ mutate_file "$PUBSH" 'the size and layout verdicts precede the digest pin' has_t
   '/^ARCHIVE_SHA=/,+1d; s@^archive_is_flat "\$ARCHIVE"$@archive_is_flat "$ARCHIVE"\nARCHIVE_SHA=$(sha256sum <"$ARCHIVE" | cut -d" " -f1) \\\n  || die "the archive could not be digested"@'
 mutate_file "$PUBSH" 'the VCS schemes go back to a hand-picked few' has_trusted_snapshot_build \
   's@[(]git[|]hg[|]bzr[|]svn[)][(][\][+][(]ssh[|]https[?][|]file[)][)][?]@git@'
-mutate_file "$PUBSH" 'a prepare command that exits quickly aborts the run' has_trusted_snapshot_build \
-  's@^  \[ -z "\$prep_seen" \] \|\| @  @'
 mutate_file "$PUBSH" 'the group the reap is aimed at goes unchecked' has_trusted_snapshot_build \
-  '/^  prep_seen=\$\(pgid_of/,+2d'
-mutate_file "$PUBSH" 'liveness goes back to asking bash instead of ps' has_trusted_snapshot_build \
-  's@^  prep_seen=\$\(pgid_of "\$prep_pgid" \|\| true\)$@  kill -0 "$prep_pgid" 2>/dev/null\n  prep_seen=$(pgid_of "$prep_pgid" || true)@'
+  '/^  prep_seen=\$\(tr -dc 0-9/,+4d'
+# The shape this replaced. `[ -z "$prep_seen" ] ||` had to be there while the
+# value came from `ps`, because a finished child reports nothing — and that is
+# exactly why the check never fired on the case it was written for.
+mutate_file "$PUBSH" 'an unrecorded process group passes again' has_trusted_snapshot_build \
+  's@^  \[ -n "\$prep_seen" \] \\$@  [ -z "$prep_seen" ] || \\@'
+mutate_file "$PUBSH" 'the group comes back from ps instead of from the child' has_trusted_snapshot_build \
+  's@^  prep_seen=\$\(tr -dc 0-9 <"\$prep_pgid_file"\) \|\| prep_seen=""$@  prep_seen=$(pgid_of "$prep_pgid" || true)@'
+mutate_file "$PUBSH" 'the child stops recording the group it ran in' has_trusted_snapshot_build \
+  's@^        \| tr -dc 0-9 >"\$CACHE_PREPARE_PGID_FILE" \|\| true$@        | cat >/dev/null || true@'
+mutate_file "$PUBSH" 'the /proc fallback goes away, so a host without ps refuses every run' has_trusted_snapshot_build \
+  's@ \|\| cut -d" " -f5 /proc/self/stat@@'
+# Read before the wait and "empty" means "not yet" again — the file is there but
+# the child has not reached its first line, and the run dies on a scheduling
+# accident, which is the fault the ps version had.
+mutate_file "$PUBSH" 'the recorded group is read before the install finishes' has_trusted_snapshot_build \
+  '/^  prep_seen=\$\(tr -dc 0-9/d; s@^  prep_rc=0$@  prep_seen=$(tr -dc 0-9 <"$prep_pgid_file") || prep_seen=""\n  prep_rc=0@'
+mutate_file "$PUBSH" 'the pgid file path is left in the prepare command environment' has_trusted_snapshot_build \
+  's@^      unset CACHE_PREPARE_PGID_FILE CACHE_PREPARE_CMD$@      :@'
 mutate_file "$PUBSH" 'the install keeps the run process group' has_trusted_snapshot_build \
   's@^  set -m$@  :@'
 mutate_file "$PUBSH" 'nothing is reaped once the install returns' has_trusted_snapshot_build \
@@ -1856,7 +1999,38 @@ mutate_file "$PUBSH" 'the packed bytes are never scanned again' has_trusted_snap
 mutate_file "$PUBSH" 'the re-scan happens only in the publishing phase' has_trusted_snapshot_build \
   's@^scan_or_die "\$VERIFY"$@[ "$BUILDING" = 0 ] \&\& scan_or_die "$VERIFY"@'
 mutate_file "$PUBSH" 'the decompression stops being bounded' has_trusted_snapshot_build \
-  's@ \| head -c "\$\(\(size \* 8\)\)" \\@ \\@'
+  's@ \| head -c "\$verify_bound" \\@ \\@'
+# The count, which is the only part of the bound tar cannot fool. Without it a cut
+# stream that happens to end on a member boundary extracts a PREFIX and exits 0 --
+# the scan then passes on a subset of the bytes about to be published.
+mutate_file "$PUBSH" 'the expansion bound goes back to trusting tar' has_trusted_snapshot_build \
+  's@^assert_expands_within_bound "\$verify_bound"$@:@'
+mutate_file "$PUBSH" 'the count is compared the wrong way round' has_trusted_snapshot_build \
+  's@^  \[ "\$expanded" -le "\$1" \] \\@  [ "$expanded" -gt "$1" ] \\@'
+mutate_file "$PUBSH" 'the expansion count is taken after the unpack' has_trusted_snapshot_build \
+  's@^assert_expands_within_bound "\$verify_bound"$@:@; s@^scan_or_die "\$VERIFY"$@assert_expands_within_bound "$verify_bound"\nscan_or_die "$VERIFY"@'
+mutate_file "$PUBSH" 'the expansion count itself becomes unbounded' has_trusted_snapshot_build \
+  's@ \| head -c "\$\(\(\$1 \+ 1\)\)" \| wc -c \)@ | wc -c )@'
+# The publisher's copy of the floor. Drifting from the fleet's is the same defect
+# in the other direction: the gate exists to refuse here what a host would refuse
+# on arrival, and two different bounds refuse two different sets.
+mutate_file "$PUBSH" 'the expansion bound loses its floor in the publisher' has_trusted_snapshot_build \
+  's@^  \[ "\$bound" -ge "\$CACHE_EXPAND_FLOOR_BYTES" \] \|\| bound=\$CACHE_EXPAND_FLOOR_BYTES$@  :@'
+mutate_file "$PUBSH" 'the publisher floors the bound at nothing' has_trusted_snapshot_build \
+  's@^CACHE_EXPAND_FLOOR_BYTES=65536$@CACHE_EXPAND_FLOOR_BYTES=0@'
+mutate_file "$PUBSH" 'the two bounds are computed by hand again' has_trusted_snapshot_build \
+  's@^verify_bound=\$\(cache_expand_bound "\$size"\)$@verify_bound=$((size * 8))@'
+# The listing. Unbounded it is a self-DoS; bounded but TRIMMED it is worse than
+# unbounded, because the member it was written to catch can be in the part that
+# was cut and the check passes.
+mutate_file "$PUBSH" 'the archive listing goes back to unbounded' has_trusted_snapshot_build \
+  's@^  if ! tar -tvzf "\$1" \| head -c "\$\(\(cap \+ 1\)\)" >"\$list"; then$@  if ! tar -tvzf "$1" >"$list"; then@'
+mutate_file "$PUBSH" 'a truncated listing is inspected instead of refused' has_trusted_snapshot_build \
+  's@^  \[ "\$written" -le "\$cap" \] \\$@  [ "$written" -ge 0 ] \\@'
+# Order: tar's status read first reports every over-long listing as a corrupt
+# archive, because `head` closing the pipe kills tar with SIGPIPE.
+mutate_file "$PUBSH" 'tar exit status decides before the byte count does' has_trusted_snapshot_build \
+  '/^  \[ "\$tar_rc" = 0 \]/d; s@^  written=\$\(wc -c <"\$list"\).*$@  [ "$tar_rc" = 0 ] || die "the archive could not be listed"\n&@'
 mutate_file "$PUBSH" 'credential files stop being scanned for' has_trusted_snapshot_build \
   "s@-o -name '\.git-credentials' @@"
 mutate_file "$PUBSH" 'the snapshot name becomes reusable' has_trusted_snapshot_build \
@@ -2529,6 +2703,36 @@ else
     bad "behaviour: random bytes shaped like ://x:y@ refused a clean snapshot"
   else
     bad "behaviour: the false-positive run failed for some other reason"
+  fi
+fi
+
+# The smallest tree anyone could stage, and it must PUBLISH.
+#
+# Nothing here trips a scan: one file of repeated 'q'. What it exercises is the
+# expansion bound's floor. Tar writes 20 512-byte records minimum and the nine
+# cache directories cost 4608 bytes of headers before a file goes in, so a tree
+# this compressible packs to a few hundred bytes — and eight times a few hundred
+# bytes is LESS than the archive itself. Unfloored, `head` cuts the stream, tar
+# reports an unexpected EOF, and the run refuses a perfectly good snapshot while
+# announcing that it expanded too far.
+#
+# That is issue #191, and it was found the hard way: the case that caught it was
+# an unrelated one whose fixture happened to compress well, and it went red
+# intermittently — the archive carries a timestamped name, so its gzipped size
+# wobbles across the threshold between runs. Deliberately compressible here, so
+# the case is about the floor and not about whatever a fixture happens to weigh.
+if behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/files/aa"
+head -c 64 /dev/zero | tr "\0" "q" >"$stage/pnpm-store/files/aa/tiny"
+' >"$TMP/beh.tiny.log" 2>&1; then
+  ok
+else
+  if matches "$(cat "$TMP/beh.tiny.log")" 'expands past the'; then
+    bad "behaviour: a tree too small to fill tar's minimum archive was refused for expanding past the bound"
+  else
+    bad "behaviour: the smallest possible staged tree did not publish"
   fi
 fi
 

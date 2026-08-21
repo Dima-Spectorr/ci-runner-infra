@@ -585,6 +585,42 @@ CACHE_STAGE="/opt/.ci-cache-incoming"
 # a tree lifted off a host is self-describing.
 CACHE_DIRS=(npm yarn pnpm-store go-mod pip uv m2 nuget composer)
 
+# How far a snapshot is allowed to expand, and why it has a floor.
+#
+# Eight times the compressed size is the ratio, and the ratio is not arbitrary:
+# the archive, the tree it unpacks to and the tree already in the master all sit
+# on this disk at once, and a dependency cache compresses about threefold.
+#
+# But tar's default blocking factor is 20 512-byte records, so no archive is
+# shorter than 10240 bytes however little it holds, and the nine directories
+# above already cost 4608 bytes of headers before one file goes in. Scaled all
+# the way down, the bound lands BELOW what a valid, nearly-empty archive weighs:
+# a tree that gzips to 400 bytes gets a 3200-byte bound and `head` cuts the stream
+# mid-archive. What happens next is worse than a wrong refusal. Measured on GNU
+# tar 1.35: cut the stream at a member boundary and the rest of tar's 10240-byte
+# record reads as zeros, two zero blocks are how an archive says it ended, and tar
+# extracts the PREFIX and exits 0 — no warning, no non-zero status. A nine-
+# directory tree cut at 2256 bytes yields four of the nine and a clean exit. So a
+# too-small bound does not reliably refuse the snapshot; it silently hydrates part
+# of one and reports success. The floor keeps the ratio governing everything that
+# matters — a real snapshot is tens of megabytes — while no archive is ever cut
+# for being short. 64 KiB is six times tar's minimum and far below any tree with a
+# dependency in it.
+#
+# The floor is not the whole answer, only the part that keeps small archives out
+# of the truncating case at all. Because tar's status cannot be trusted to report
+# a cut, the unpack below is preceded by a COUNT: see hydrate_shared_cache_bounded.
+#
+# The publisher applies the identical bound (`scripts/ci/publish-cache-snapshot.sh`)
+# so that what it accepts and what a host accepts are the same set. The two
+# copies must not drift, and the self-test asserts both.
+CACHE_EXPAND_FLOOR_BYTES=65536
+cache_expand_bound() { # <compressed bytes>
+  local bound=$(($1 * 8))
+  [ "$bound" -ge "$CACHE_EXPAND_FLOOR_BYTES" ] || bound=$CACHE_EXPAND_FLOOR_BYTES
+  printf '%s' "$bound"
+}
+
 # THE RULE THIS WHOLE SECTION IS BUILT ON: root never operates on a path inside a
 # directory an untrusted uid controls.
 #
@@ -1067,14 +1103,14 @@ hydrate_shared_cache_bounded() {
     rm -rf "$tmp"
     return 0
   fi
-  # Eight times the compressed size, and the multiple is not arbitrary: the
-  # archive, the tree it unpacks to and the tree already in the master all sit on
-  # this disk at once, and a dependency cache compresses about threefold. Filling
-  # the boot disk to warm a cache would cost this host every job it was about to
-  # run, which is a far worse trade than starting cold.
-  local free_kb
+  # Reserve exactly what the unpack below is allowed to write — see
+  # cache_expand_bound. Filling the boot disk to warm a cache would cost this
+  # host every job it was about to run, which is a far worse trade than starting
+  # cold; reserving LESS than the unpack bound would let that happen anyway.
+  local free_kb bound
+  bound=$(cache_expand_bound "$size")
   free_kb=$(df -Pk /opt | awk 'NR==2 {print $4}')
-  if [ -z "${free_kb:-}" ] || [ "$((free_kb * 1024))" -lt "$((size * 8))" ]; then
+  if [ -z "${free_kb:-}" ] || [ "$((free_kb * 1024))" -lt "$bound" ]; then
     CACHE_VERDICT="no-space"
     log "not enough free space on /opt for a $size byte snapshot — starting cold instead"
     rm -rf "$tmp"
@@ -1126,13 +1162,33 @@ hydrate_shared_cache_bounded() {
   # The decompression runs through `head -c` because `max_bytes` bounds the
   # COMPRESSED archive and gzip expands by more than a thousandfold on the right
   # input: a 4 MiB tarball can fill the boot disk, and the free-space check ahead
-  # of it reserved eight times the compressed size, not eight times whatever it
-  # holds. head closing the pipe truncates the stream, tar fails on a truncated
-  # archive, and the snapshot is refused — which is the wanted answer.
+  # of it reserved cache_expand_bound "$size", not eight times whatever it holds.
+  # Same $bound as that check, deliberately: unpacking past what was reserved is
+  # the failure the reservation exists to prevent.
+  #
+  # But `head` closing the pipe is not, by itself, a refusal. tar exits 0 on a
+  # stream cut at a member boundary — the record's zero padding reads as an
+  # end-of-archive marker (see cache_expand_bound) — so a bound enforced only by
+  # `head` can leave this host with a PARTIAL cache it believes is whole, and the
+  # scan below would then pass on a subset of what the snapshot carries. The bound
+  # is therefore decided by COUNTING the decompressed bytes first, and tar's
+  # status is only the second opinion. One extra decompression pass, bounded by
+  # the same number and inside the same budget.
   local left=$((deadline - $(date +%s)))
   [ "$left" -gt 0 ] || left=1
+  local expanded
+  expanded=$( { timeout "$left" gzip -dc "$tmp/snap.tar.gz" 2>/dev/null || true; } \
+    | head -c "$((bound + 1))" | wc -c ) || expanded=$((bound + 1))
+  if [ "$expanded" -gt "$bound" ]; then
+    CACHE_VERDICT="too-big-expanded"
+    log "cache snapshot $snap expands past the $bound byte bound — refusing it rather than unpacking part of it"
+    rm -rf "$tmp" "$CACHE_STAGE"
+    return 0
+  fi
+  left=$((deadline - $(date +%s)))
+  [ "$left" -gt 0 ] || left=1
   if ! timeout "$left" gzip -dc "$tmp/snap.tar.gz" 2>/dev/null \
-      | head -c "$((size * 8))" \
+      | head -c "$bound" \
       | tar -x -C "$CACHE_STAGE" \
           --no-same-owner --no-same-permissions --no-xattrs --no-acls \
           2>/dev/null; then
