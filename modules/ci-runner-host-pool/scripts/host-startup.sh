@@ -1189,14 +1189,39 @@ hydrate_shared_cache_bounded() {
   # is therefore decided by COUNTING the decompressed bytes first, and tar's
   # status is only the second opinion. One extra decompression pass, bounded by
   # the same number and inside the same budget.
+  #
+  # The counting pass's own status is kept, in a file, because it is upstream in
+  # a pipe inside a command substitution and `|| true` used to eat it. `timeout`
+  # exits 124 when the hydrate deadline expires mid-decompression, and a 124
+  # read as success turns an UNMEASURED archive into a count that is
+  # comfortably within bounds — after which the extraction below gets a fresh
+  # one-second floor and tar accepts a prefix ending at a member boundary. That
+  # is the partial hydrate this count exists to prevent, reached through the
+  # count. A 141 is the normal over-bound case and never gets here: the byte
+  # count decides that one first, above.
   local left=$((deadline - $(date +%s)))
   [ "$left" -gt 0 ] || left=1
-  local expanded
-  expanded=$( { timeout "$left" gzip -dc "$tmp/snap.tar.gz" 2>/dev/null || true; } \
+  local expanded count_rc
+  expanded=$( { timeout "$left" gzip -dc "$tmp/snap.tar.gz" 2>/dev/null; echo "$?" >"$tmp/count.rc"; } \
     | head -c "$((bound + 1))" | wc -c ) || expanded=$((bound + 1))
+  count_rc=$(tr -dc 0-9 <"$tmp/count.rc" 2>/dev/null) || count_rc=''
   if [ "$expanded" -gt "$bound" ]; then
     CACHE_VERDICT="too-big-expanded"
     log "cache snapshot $snap expands past the $bound byte bound — refusing it rather than unpacking part of it"
+    rm -rf "$tmp" "$CACHE_STAGE"
+    return 0
+  fi
+  if [ "${count_rc:-}" != 0 ]; then
+    case "${count_rc:-}" in
+      124 | 137 )
+        CACHE_VERDICT="unpack-timeout"
+        log "cache snapshot $snap could not be measured inside the ${budget}s budget — starting cold rather than unpacking an archive nothing bounded"
+        ;;
+      * )
+        CACHE_VERDICT="unreadable"
+        log "cache snapshot $snap could not be decompressed to measure it (exit ${count_rc:-unknown}) — starting cold instead"
+        ;;
+    esac
     rm -rf "$tmp" "$CACHE_STAGE"
     return 0
   fi
