@@ -868,7 +868,11 @@ has_trusted_snapshot_build() { # <file>
   # public. The narrower one governs the log: private-key only, and still ≥1024
   # because this rule matches a header, not the key.
   matches "$code" "SCAN_PRINTABLE_LABELS='private-key-header'" || return 1
-  matches "$code" '\*" \$label "\* \) ;;' || return 1
+  # Anchored to the walk's own indentation. Unanchored, the one-line case in
+  # scan_excusal_source_is_allowed contains this text too, and satisfies the
+  # assertion while the walk above it is inverted — which is exactly what it
+  # did until CI caught it.
+  matches "$code" '^      \*" \$label "\* \) ;;$' || return 1
   matches "$code" '^      \* \) return 1 ;;$' || return 1
   matches "$code" '\[ "\$\(wc -c <"\$1"\)" -ge "\$SCAN_EXCUSABLE_MIN_BYTES" \]' || return 1
   # One predicate per question, each asked at exactly the sites that own it. The
