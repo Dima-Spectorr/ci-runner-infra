@@ -1506,8 +1506,14 @@ provision_shared_cache() {
     idx=${d##*/}
     case "$idx" in ''|*[!0-9]*) continue ;; esac
     [ "$idx" -gt "$SLOTS" ] || continue
-    rm -rf "$d" && log "slot $idx: retired (this host now has $SLOTS), its cache copy removed" \
-      || log "slot $idx: retired, but its cache copy could not be removed"
+    # if/else and not `&& … || …`: the second form runs the failure branch when
+    # the LOG fails, which would report a removal that succeeded as one that did
+    # not — and the log is the only record this sweep leaves.
+    if rm -rf "$d"; then
+      log "slot $idx: retired (this host now has $SLOTS), its cache copy removed"
+    else
+      log "slot $idx: retired, but its cache copy could not be removed"
+    fi
   done
 
   local i

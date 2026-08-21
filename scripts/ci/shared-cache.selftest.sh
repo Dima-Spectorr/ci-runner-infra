@@ -422,7 +422,11 @@ has_retired_slot_prune() { # <file>
   # this is an `rm -rf` in a directory root also writes its own state into.
   matches "$code" 'case "\$idx" in .*\[!0-9\]\*\) continue ;; esac' || return 1
   matches "$code" '\[ "\$idx" -gt "\$SLOTS" \] \|\| continue' || return 1
-  matches "$code" 'rm -rf "\$d" && log "slot \$idx: retired' || return 1
+  # if/else, not `rm && log || log`: the second form runs the failure branch
+  # when the LOG fails, and the log is the only record this sweep leaves.
+  matches "$code" '^    if rm -rf "\$d"; then'                || return 1
+  matches "$code" 'log "slot \$idx: retired \(this host now has \$SLOTS\)' || return 1
+  matches "$code" 'log "slot \$idx: retired, but its cache copy could not be removed"' || return 1
   # …and it fails open like everything else here: a slot that cannot be removed
   # is logged, never fatal.
   ! matches "$code" 'rm -rf "\$d".*\|\| die'                 || return 1
@@ -1684,6 +1688,8 @@ mutate 'the sweep deletes the live slots too' has_retired_slot_prune \
   's@^    \[ "\$idx" -gt "\$SLOTS" \] \|\| continue$@@'
 mutate 'the sweep stops checking the name is a slot index' has_retired_slot_prune \
   's@^    case "\$idx" in .*esac$@@'
+mutate 'a failed removal is reported as a success' has_retired_slot_prune \
+  's@^    if rm -rf "\$d"; then$@    if rm -rf "$d" || true; then@'
 mutate 'the sweep is aimed at a name that never exists' has_retired_slot_prune \
   's@^  for d in "\$CACHE_SLOTS"/\*; do$@  for d in "$CACHE_SLOTS"/.none; do@'
 
