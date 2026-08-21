@@ -953,7 +953,8 @@ publish_cache_telemetry() {
 }
 
 hydrate_shared_cache_bounded() {
-  CACHE_BUCKET=$(md "instance/attributes/ci-cache-bucket")
+  local bucket_rc=0
+  CACHE_BUCKET=$(md "instance/attributes/ci-cache-bucket") || bucket_rc=$?
   if [ -z "${CACHE_BUCKET:-}" ]; then
     # `md` returns an empty string for BOTH "the attribute is not set" and "the
     # metadata server did not answer", and those are opposite facts: the first is
@@ -963,9 +964,23 @@ hydrate_shared_cache_bounded() {
     # silenced bucket — a pool with a bucket configured, hydrating nothing,
     # reporting the verdict that means "nothing to do".
     #
-    # So ask for something every instance has. If that answers, the attribute is
-    # genuinely absent; if it does not, the metadata server is what is broken.
-    if [ -n "$(md "instance/id")" ]; then
+    # The exit code already carries the distinction, with no second call. `md`
+    # returns curl's status, and `-f` gives 22 for an HTTP 404 — the attribute
+    # is genuinely not set — where a DNS failure, a refused connection or a
+    # timeout give 6, 7 and 28. A second probe cannot do better and is wrong in
+    # the common case: one transient failure followed by a probe that succeeds a
+    # moment later — which is what "transient" means — still reported
+    # not-configured. It also cost up to 30 seconds of boot before `deadline` was
+    # computed, so the hydrate's own budget did not cover it.
+    #
+    # The sustained case this was written for is mostly unreachable anyway: a
+    # metadata server already dead at boot makes this script `die` a thousand
+    # lines above, and `flush_series` mints its token from the same server, so a
+    # correct no-metadata-server verdict cannot be delivered regardless.
+    # 0 as well as 22: an attribute that exists and is empty is a pool that did
+    # not configure this layer, exactly like one with no attribute at all. Only a
+    # code that says the REQUEST failed may claim the server is unreachable.
+    if [ "$bucket_rc" = 22 ] || [ "$bucket_rc" = 0 ]; then
       CACHE_VERDICT="not-configured"
       log "no snapshot bucket configured — this host runs on the cache its image baked"
     else
@@ -1470,6 +1485,30 @@ provision_shared_cache() {
   # any directory but its own — and cannot widen the one that stops it.
   chown root:root "$CACHE_SLOTS" 2>/dev/null || true
   chmod 0755 "$CACHE_SLOTS" 2>/dev/null || true
+
+  # Retired indices go before the live ones are seeded. `slots_per_host` can be
+  # reduced, and `/var/lib/ci-cache/<idx>` for an index above the new count keeps
+  # its tree and — worse — its `.ready` marker, which says "every tool directory
+  # below is present and owned by this slot". Nothing reads it while the index is
+  # retired, so this is hygiene rather than a live bug; but the marker stops being
+  # true the moment the count goes back up and the seeding loop finds a directory
+  # that already claims to be ready. It is also a full duplicate cache tree per
+  # retired slot, on the disk the hydrate reserves space on.
+  #
+  # Bounded by what is THERE, not by a guess at the old count: the previous value
+  # of `ci-slots` is not recorded anywhere on this host, so the sweep reads the
+  # directory. Only names that are entirely digits are considered, and only ones
+  # above $SLOTS are removed — anything else in $CACHE_SLOTS was not put there by
+  # this function and is not this function's to delete.
+  local d idx
+  for d in "$CACHE_SLOTS"/*; do
+    [ -d "$d" ] || continue
+    idx=${d##*/}
+    case "$idx" in ''|*[!0-9]*) continue ;; esac
+    [ "$idx" -gt "$SLOTS" ] || continue
+    rm -rf "$d" && log "slot $idx: retired (this host now has $SLOTS), its cache copy removed" \
+      || log "slot $idx: retired, but its cache copy could not be removed"
+  done
 
   local i
   for i in $(seq 1 "$SLOTS"); do
