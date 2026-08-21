@@ -297,10 +297,30 @@ has_hostile_entry_refusal() { # <file>
   # line-continuation backslash the scan is wrapped with, not a quote escape.
   matches "$code" 'find "\$root" \\'                                || return 1
   matches "$code" '\-type l -o -type b -o -type c -o -type p -o -type s' || return 1
-  matches "$code" '\-perm /6000 -o \\\( -type f -a -links \+1 \\\)' || return 1
+  matches "$code" '\-o -perm /6000 \\\)'                            || return 1
   matches "$code" 'getcap -r "\$root"'                              || return 1
+  # HARDLINKS ARE COUNTED, NOT FORBIDDEN. `-links +1` alone cannot tell an
+  # internal store (pnpm hardlinks its content-addressed files; `cp -al` does
+  # too) from a link reaching outside the tree, and only the second widens
+  # anything under `chmod -R go+rX`. Comparing in-tree name count with link
+  # count answers the actual question, so the blunt predicate must be GONE —
+  # leaving it in place alongside would restore the over-block on its own.
+  ! matches "$code" '\-type f -a -links \+1'                        || return 1
+  matches "$code" 'find "\$root" -type f -links \+1 -printf' || return 1
+  matches "$code" 'c\[\$2\]\+\+ } END { for \(i in c\) if \(c\[i\] < n\[i\]\)' || return 1
+  # The counting pass prints integers only. A path may contain a newline, which
+  # would split one record into two and corrupt every count that follows it.
+  ! matches "$code" "links \+1 -printf '%n %i %p" || return 1
   # A credential in a content-addressed cache is not cache content.
   matches "$code" "name '\.npmrc'"                                  || return 1
+  # ...but the pass is bounded to the top of the tree, and the bound is what
+  # makes the name list safe to widen. Unbounded it reads inside extracted
+  # package payloads, where a `.npmrc` or a `.pem` is a dependency's own test
+  # fixture — one such package would take every host on every pool cold.
+  matches "$code" '\-maxdepth 3 -type f'                            || return 1
+  matches "$code" "name '\*\.pem'"                                  || return 1
+  matches "$code" "name 'id_rsa'"                                   || return 1
+  matches "$code" "name '\.pgpass'"                                 || return 1
   # NOT -xdev on the scan. chmod has no --one-file-system, so the walk descends
   # into a bind mount whatever the scan does; a scan that skipped one would hide
   # exactly the entries the walk then re-owns and widens.
@@ -309,7 +329,35 @@ has_hostile_entry_refusal() { # <file>
   # what lets ONE scanner cover both the master and a freshly unpacked snapshot;
   # a scanner hard-wired to the master would leave the snapshot — the only route
   # into this tree that no reviewed build step stands in front of — unscanned.
-  matches "$code" 'local bad root="\$\{1:-\$CACHE_MASTER\}"'        || return 1
+  matches "$code" 'local bad ino root="\$\{1:-\$CACHE_MASTER\}"'    || return 1
+}
+
+# THE SCANNED TREE IS UNTRUSTED, SO ITS FILENAMES ARE UNTRUSTED TEXT.
+#
+# Every refusal names the entry that tripped it — that is deliberate, and a
+# refusal that named only the tree root once cost a pool hours of running cold.
+# But a filename may contain a newline, and interpolated raw it turns one
+# refusal into two log lines, the second of which can be shaped to read like a
+# success verdict from this same script. It cannot change what the host DOES;
+# it corrupts the record an operator reads when deciding why a pool went cold.
+has_sanitized_refusal_logging() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'safe_for_log\(\) \{'                             || return 1
+  # Control characters removed, not merely escaped, and the result bounded —
+  # `-quit` yields one entry, but one entry's path can be as long as the tree.
+  matches "$code" "tr '\\\\n\\\\t' '  '"                            || return 1
+  matches "$code" "tr -d '\\\\000-\\\\037'"                         || return 1
+  matches "$code" "printf '%\.300s'"                                || return 1
+  # Every site that interpolates scan output goes through it. Asserting the
+  # helper exists proves nothing if a refusal still reaches the log raw, and
+  # these four are all of them.
+  matches "$code" 'link, node or setuid entry \(\$\(safe_for_log "\$bad"\)\)'  || return 1
+  matches "$code" 'hardlink to a file outside the tree \(\$\(safe_for_log "\$bad"\)\)' || return 1
+  matches "$code" 'a file capability \(\$\(safe_for_log "\$bad"\)\)'           || return 1
+  matches "$code" 'looks like a credential file \(\$\(safe_for_log "\$bad"\)\)' || return 1
+  ! matches "$code" 'entry \(\$bad\)'                               || return 1
+  ! matches "$code" 'credential file \(\$bad\)'                     || return 1
 }
 
 # A tool must never see a half-copied cache directory at the path it reads.
@@ -397,6 +445,16 @@ has_packer_gate_that_aborts() { # <file>
   # image gate is the one place that can still refuse a hostile tree BEFORE any
   # host boots from it, so its refusal is read by whoever is unblocking a build.
   matches "$code" "\-printf '%y %M %p" || return 1
+  # THE TWO COPIES MUST NOT DRIFT. This gate and host-startup.sh scan the same
+  # tree for the same reasons, and a fix applied to one of them is a fix the
+  # fleet only half has — the image would keep failing builds over a pnpm store
+  # that every booted host now accepts, or worse, accept one every host refuses.
+  ! matches "$code" '\-type f -a -links \+1'                                || return 1
+  matches "$code" 'c\[\$2\]\+\+ } END { for \(i in c\) if \(c\[i\] < n\[i\]\)' || return 1
+  # CACHE_PREPARE is consumer-supplied, so an entry's name is untrusted text
+  # here exactly as it is at boot.
+  matches "$code" 'clean\(\) \{'                                            || return 1
+  matches "$code" 'clean \\"\$bad\\"'                                       || return 1
 }
 
 # --- the snapshot hydrate -------------------------------------------------------
@@ -1268,6 +1326,7 @@ run 'master read-only, slot copy slot-owned'             has_ownership_split    
 run 'root only ever works in a root-owned directory'     has_root_owned_namespace  "$SCRIPT"
 run 'the seeded cache is writable by it and private to it' has_usable_private_slot_cache "$SCRIPT"
 run 'refuses a master holding a link, node or credential' has_hostile_entry_refusal "$SCRIPT"
+run 'a refusal cannot forge a log line'                  has_sanitized_refusal_logging "$SCRIPT"
 run 'the master root is repaired, its contents never'    has_master_root_heal      "$SCRIPT"
 run 'the image build aborts on a hostile warm cache'     has_packer_gate_that_aborts "$PACKER"
 run 'the seed is published atomically'                   has_atomic_seed           "$SCRIPT"
@@ -1389,13 +1448,35 @@ mutate 'the 0700 goes back on the cold path only' has_usable_private_slot_cache 
 mutate 'the hostile-entry scan is dropped' has_hostile_entry_refusal \
   's@^  bad=\$\(cache_scan "\$limit" find "\$root" \\$@  bad=@'
 mutate 'the scan stops looking for smuggled hardlinks' has_hostile_entry_refusal \
-  's@-perm /6000 -o \\\( -type f -a -links \+1 \\\)@-perm /6000@'
+  's@^  ino=\$\(cache_scan "\$limit" find "\$root" -type f -links \+1 -printf@  ino=$(: @'
+# The counting comparison IS the check. Flip it to `<=` and every inode reports
+# as reaching outside; flip it to `>` and none ever does. The second is the one
+# that matters, because it is silent.
+mutate 'the hardlink comparison can never fire' has_hostile_entry_refusal \
+  's@if \(c\[i\] < n\[i\]\)@if (c[i] > n[i])@'
+# The blunt predicate coming BACK is a regression too — it re-blocks every
+# legitimate internal store, which is what took pools cold before.
+mutate 'the blunt hardlink predicate returns' has_hostile_entry_refusal \
+  's@-type l -o -type b@-type f -a -links +1 -o -type l -o -type b@'
 mutate 'file capabilities stop being scanned' has_hostile_entry_refusal \
   's@getcap -r "\$root"@true "$root"@'
 mutate 'the scan is hard-wired back to the master' has_hostile_entry_refusal \
-  's@^  local bad root="\$\{1:-\$CACHE_MASTER\}" limit=0$@  local bad@'
+  's@^  local bad ino root="\$\{1:-\$CACHE_MASTER\}" limit=0$@  local bad@'
 mutate 'credentials stop being scanned' has_hostile_entry_refusal \
   "s@name '\\.npmrc'@name '.nothing'@"
+# Unbounded, the credential pass reads inside extracted package payloads and one
+# dependency's test fixture takes the whole fleet cold. The bound is not tidiness.
+mutate 'the credential pass loses its depth bound' has_hostile_entry_refusal \
+  's@-maxdepth 3 -type f@-type f@'
+mutate 'the widened credential names are dropped' has_hostile_entry_refusal \
+  "s@-o -name '\\*\\.pem' @@"
+
+mutate 'refusals interpolate the raw path again' has_sanitized_refusal_logging \
+  's@\$\(safe_for_log "\$bad"\)@$bad@g'
+mutate 'the sanitizer stops stripping control characters' has_sanitized_refusal_logging \
+  "s@tr -d '\\\\000-\\\\037'@cat@"
+mutate 'the sanitizer stops bounding length' has_sanitized_refusal_logging \
+  "s@printf '%\\.300s'@printf '%s'@"
 mutate 'the scan skips other filesystems again' has_hostile_entry_refusal \
   's@^  bad=\$\(cache_scan "\$limit" find "\$root" \\$@  bad=$(cache_scan "$limit" find "$root" -xdev \\@'
 
