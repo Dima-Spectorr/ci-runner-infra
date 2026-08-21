@@ -458,8 +458,22 @@ build {
       # `-printf '%y %M %p'`, matching host-startup.sh: six predicates share the
       # message below, so a bare path leaves the reader to guess which one fired.
       # `d drwxrwsr-x /opt/ci-cache` says setgid directory and nothing else does.
-      "bad=$(find /opt/ci-cache \\( -type l -o -type b -o -type c -o -type p -o -type s -o -perm /6000 -o \\( -type f -a -links +1 \\) \\) -printf '%y %M %p\\n' -quit)",
-      "[ -z \"$bad\" ] || { echo \"warm cache holds a link, node or setuid entry: $bad\" >&2; exit 1; }",
+      # The tree is written by CACHE_PREPARE, which is consumer-supplied, so an
+      # entry's NAME is untrusted text. One `tr` before it reaches the build log
+      # for the same reason host-startup.sh has safe_for_log(): a filename may
+      # hold a newline, and a refusal that splits into two lines can be shaped
+      # to read like any other line this build emits.
+      "clean() { printf '%.300s' \"$(printf '%s' \"$1\" | tr '\\n\\t' '  ' | tr -d '\\000-\\037')\"; }",
+      "bad=$(find /opt/ci-cache \\( -type l -o -type b -o -type c -o -type p -o -type s -o -perm /6000 \\) -printf '%y %M %p\\n' -quit)",
+      "[ -z \"$bad\" ] || { echo \"warm cache holds a link, node or setuid entry: $(clean \"$bad\")\" >&2; exit 1; }",
+      # Hardlinks are COUNTED, not forbidden, and host-startup.sh carries the
+      # long form of why: `-links +1` cannot tell a pnpm-style internal store or
+      # a `cp -al` warm script from a link reaching outside the tree, and only
+      # the second one is a danger. An inode whose in-tree name count equals its
+      # link count has every name in here, so `chmod -R go+rX` below reaches all
+      # of them and widens nothing that is not already ours.
+      "ino=$(find /opt/ci-cache -type f -links +1 -printf '%n %i\\n' | awk '{ n[$2] = $1; c[$2]++ } END { for (i in c) if (c[i] < n[i]) { print i; exit } }')",
+      "[ -z \"$ino\" ] || { echo \"warm cache holds a hardlink to a file outside the tree: $(clean \"$(find /opt/ci-cache -inum \"$ino\" -printf '%y %M %p\\n' -quit)\")\" >&2; exit 1; }",
       # No pipe into head: under pipefail, head closing the pipe early can SIGPIPE
       # getcap and abort the build over a cache that was perfectly fine.
       "command -v getcap >/dev/null || { echo 'getcap missing: cannot scan the warm cache for file capabilities' >&2; exit 1; }",
