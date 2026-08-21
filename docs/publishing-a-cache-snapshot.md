@@ -66,7 +66,17 @@ jobs:
     permissions:
       contents: read           # and nothing else — this job runs the install
     steps:
+      # `persist-credentials: false` on every checkout in this file, and it
+      # matters most here. The default writes the job's `GITHUB_TOKEN` into
+      # `.git/config`, in the same workspace where `CACHE_PREPARE` runs
+      # third-party install code — and the stated premise of the two-job split
+      # is that this job holds nothing worth stealing. The token is scoped to
+      # `contents: read`, so what it would cost is source disclosure rather
+      # than a write; neither job uses it for anything, so turning it off costs
+      # nothing at all.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # The scripts live in the fleet repository. Pin the COMMIT, not the tag:
       # this repository's release process floats `v5` forward, and a tag that
@@ -101,6 +111,7 @@ jobs:
       # uploads through the Storage JSON API, naming the object.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           repository: Dima-Spectorr/ci-runner-infra
           ref: <commit sha of the pinned tag>   # >= v5.33.0
           path: .ci-runner-infra
@@ -128,6 +139,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           repository: Dima-Spectorr/ci-runner-infra
           ref: <commit sha of the pinned tag>   # >= v5.33.0
           path: .ci-runner-infra
