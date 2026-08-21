@@ -275,9 +275,11 @@ declare `mode: parallel` with a covering scope map before arguing for runners.
 
 ## Scheduling mode: the third number
 
-`merge_queue.mode` is a **top-level** key, alongside `max_parallel_checks`, with
-three values. Left undeclared it is `serial`, which is where every repository in
-this fleet sat until 2026-08-19 — not by decision, by omission.
+`mode` is a key of the **top-level `merge_queue` block**, a sibling of
+`max_parallel_checks` — written as `merge_queue.mode`, and **never** inside a
+`queue_rules` entry, where Mergify rejects the whole file. It has three values.
+Left undeclared it is `serial`, which is where every repository in this fleet
+sat until 2026-08-19 — not by decision, by omission.
 
 | mode | scopes needed | batches depend on each other | safety |
 |---|---|---|---|
@@ -304,8 +306,8 @@ away when the one in front of it failed.
 `max_parallel_checks` remains the **global ceiling** on concurrent speculative
 checks. Parallel mode adds **not one draft** and therefore **not one runner**. It
 changes only which entries may hold those slots at the same time, and whether one
-entry's failure poisons the others. It does not appear in the fleet runner-budget
-sum below, in exactly the way `batch_size` does not.
+entry's failure poisons the others. It is absent from the fleet runner-budget
+arithmetic entirely, in exactly the way `batch_size` is.
 
 So the guidance in [the knob to raise](#the-knob-to-raise-is-batch_size-it-is-not-max_parallel_checks)
 gains a term. The order to reach for throughput is now:

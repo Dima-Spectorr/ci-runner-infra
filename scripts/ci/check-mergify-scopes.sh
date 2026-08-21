@@ -62,9 +62,18 @@ fi
 # prepends a Python that does not carry the image's python3-yaml, so a workflow
 # that set up Python for an unrelated step would otherwise turn this gate into
 # "no YAML parser available" on a runner that has one.
+#
+# THE PROBE ASSERTS THE VERSION TOO, not only the import. `python` is a real
+# candidate here and on an older image it is Python 2 — which imports yaml
+# perfectly well, is then selected, and dies further down on the first
+# `open(..., encoding=...)`. That failure arrives as a TypeError mid-run rather
+# than as this function's clean "no parser" exit, so the gate looks broken
+# instead of unsatisfied. A candidate that cannot run the reader is not a
+# candidate.
 PY=""
 for cand in python3 python /usr/bin/python3; do
-  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import yaml' >/dev/null 2>&1; then
+  if command -v "$cand" >/dev/null 2>&1 \
+     && "$cand" -c 'import sys, yaml; sys.exit(0 if sys.version_info[:2] >= (3, 6) else 1)' >/dev/null 2>&1; then
     PY="$cand"
     break
   fi
@@ -538,8 +547,21 @@ def to_regex(pat):
     return re.compile(''.join(out))
 
 
+# Memoised: the pattern set is tiny and fixed, the probe set is not. IntegrateIT
+# asks ~310 units against every scope include and the catch-all's excludes, so
+# the same dozen patterns get compiled thousands of times for one answer.
+_REGEX_CACHE = {}
+
+
+def cached_regex(pat):
+    rx = _REGEX_CACHE.get(pat)
+    if rx is None:
+        rx = _REGEX_CACHE[pat] = to_regex(pat)
+    return rx
+
+
 def matches(patterns, path):
-    return any(to_regex(p).match(path) for p in patterns or [])
+    return any(cached_regex(p).match(path) for p in patterns or [])
 
 
 # --- read the configuration --------------------------------------------------
