@@ -965,7 +965,7 @@ archive_is_flat() { # <archive>
   # $ARCHIVE_DIR is one the prepare command can pre-create as a symlink to
   # /dev/null, and a listing that is written nowhere makes this check pass on
   # every archive.
-  local bad list cap tar_rc=0 written
+  local bad list cap tar_rc=0 written list_pipes
   list=$(mktemp "$ARCHIVE_DIR/listing.XXXXXX") || die "the archive could not be listed"
   # Listed to a file rather than piped into awk: under `pipefail` an awk that
   # stops at the first offending member takes the writer down with SIGPIPE, and a
@@ -986,10 +986,25 @@ archive_is_flat() { # <archive>
   # `head` may SIGPIPE tar, so tar's status comes out of PIPESTATUS — and the
   # BYTE COUNT, not that status, decides which of the two refusals is printed.
   # Reading the status alone would report a 141 as a corrupt archive.
+  #
+  # `head`'s OWN status is read too, and it is the one that was being dropped.
+  # It is the last stage, so nothing SIGPIPEs it; every failure it can report is
+  # a failure to WRITE $list, and ENOSPC on a publish runner is the ordinary
+  # one. A small producer can already have exited 0 by then, so the pair is
+  # `(0 1)`, and a listing that stopped early measures comfortably under the cap
+  # — after which the flatness scan below passes on a PREFIX, and a setuid or
+  # non-flat member sitting past the truncation point is never looked at. That
+  # is the whole failure this bound exists to prevent, reached through the bound
+  # itself.
   cap=$(cache_expand_bound "$(stat -c %s "$1")") || die "the archive could not be measured"
-  if ! tar -tvzf "$1" | head -c "$((cap + 1))" >"$list"; then
-    tar_rc=${PIPESTATUS[0]}
+  if tar -tvzf "$1" | head -c "$((cap + 1))" >"$list"; then
+    list_pipes="${PIPESTATUS[*]}"
+  else
+    list_pipes="${PIPESTATUS[*]}"
   fi
+  tar_rc=${list_pipes%% *}
+  [ "${list_pipes##* }" = 0 ] \
+    || die "the archive's member listing could not be written (the listing limiter exited ${list_pipes##* }) — a listing this run could not finish writing is one whose offending member may be in the part that is missing"
   written=$(wc -c <"$list") || die "the archive's listing could not be measured"
   [ "$written" -le "$cap" ] \
     || die "the archive's member listing passes the $cap byte bound — refusing to inspect an archive with a member count this large rather than filling this runner's disk describing it"
@@ -1097,19 +1112,31 @@ if [ "$BUILDING" = 1 ]; then
   set +m
   prep_rc=0
   wait "$prep_pgid" || prep_rc=$?
-  # An empty file and a wrong group are different faults with different fixes,
-  # and a gate that says only "the group is wrong" is one nobody can act on from
-  # a CI job page once the runner is gone. Both refusals name what they compared.
   prep_seen=$(tr -dc 0-9 <"$prep_pgid_file") || prep_seen=""
-  [ -n "$prep_seen" ] \
-    || die "the prepare command never recorded the process group it ran in, so nothing it leaves running could be reaped — refusing to build a snapshot this run cannot bound (child pid $prep_pgid, this script's group $(pgid_of $$ || true))"
-  [ "$prep_seen" = "$prep_pgid" ] \
-    || die "the prepare command did not get a process group of its own, so nothing it leaves running could be reaped — refusing to build a snapshot this run cannot bound (child pid $prep_pgid, its group '$prep_seen', this script's group $(pgid_of $$ || true))"
+  # THE REAP COMES FIRST, and the refusals come after it. `$prep_pgid` is this
+  # shell's own child, so its group id is known here whatever the recorder wrote
+  # — and every reason the record can be missing or wrong is a reason to want
+  # the group reaped MORE, not less: both probes failed, the write was
+  # interrupted, or same-uid prepare code truncated the file to make this run
+  # give up before the kill. Dying on the record ahead of the kill left
+  # daemonized descendants running on exactly the fail-closed path that exists
+  # to report the group could not be verified.
+  #
   # TERM, a moment, then KILL. Both are best-effort against an already-empty
   # group, which is the normal case and not an error.
   kill -TERM -- "-$prep_pgid" 2>/dev/null || true
   sleep 1
   kill -KILL -- "-$prep_pgid" 2>/dev/null || true
+  # An empty file and a wrong group are different faults with different fixes,
+  # and a gate that says only "the group is wrong" is one nobody can act on from
+  # a CI job page once the runner is gone. Both refusals name what they compared.
+  # A wrong group means the reap above went somewhere this run cannot vouch for,
+  # so the refusal still stands — it is now a refusal with the known group
+  # already cleaned up behind it.
+  [ -n "$prep_seen" ] \
+    || die "the prepare command never recorded the process group it ran in, so nothing it leaves running could be reaped — refusing to build a snapshot this run cannot bound (child pid $prep_pgid, this script's group $(pgid_of $$ || true))"
+  [ "$prep_seen" = "$prep_pgid" ] \
+    || die "the prepare command did not get a process group of its own, so nothing it leaves running could be reaped — refusing to build a snapshot this run cannot bound (child pid $prep_pgid, its group '$prep_seen', this script's group $(pgid_of $$ || true))"
   case "$prep_rc" in
     0 ) : ;;
     124 | 137 ) die "the prepare command ran past CACHE_PREPARE_TIMEOUT (${CACHE_PREPARE_TIMEOUT}s) and was killed — an install that cannot finish must not become a half-populated snapshot" ;;

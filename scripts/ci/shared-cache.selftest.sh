@@ -713,7 +713,16 @@ has_snapshot_inspection() { # <file>
   # pipe is not a refusal: tar exits 0 on a stream cut at a member boundary, so a
   # bound enforced only by tar's status leaves this host with part of a snapshot
   # it believes is whole — and the scan then passes on a subset of what arrived.
-  matches "$code" 'expanded=\$\( \{ timeout "\$left" gzip -dc "\$tmp/snap.tar.gz" 2>/dev/null \|\| true; \} [\]' || return 1
+  matches "$code" 'expanded=\$\( \{ timeout "\$left" gzip -dc "\$tmp/snap.tar.gz" 2>/dev/null; echo "\$\?" >"\$tmp/count.rc"; \} [\]' || return 1
+  # ...and the counting pass's OWN status is kept, in a file, because `|| true`
+  # used to eat it. `timeout` leaves 124 when the hydrate deadline expires
+  # mid-decompression, and a 124 read as success turns an UNMEASURED archive
+  # into a count comfortably within bounds — after which the extraction gets a
+  # fresh one-second floor and tar accepts a prefix ending at a member boundary.
+  matches "$code" '^  count_rc=\$\(tr -dc 0-9 <"\$tmp/count.rc" 2>/dev/null\)' || return 1
+  matches "$code" '^  if \[ "\$\{count_rc:-\}" != 0 \]; then$' || return 1
+  matches "$code" '^      124 \| 137 \)$' || return 1
+  ! matches "$code" 'gzip -dc "\$tmp/snap.tar.gz" 2>/dev/null \|\| true' || return 1
   matches "$code" '\| head -c "\$\(\(bound \+ 1\)\)" \| wc -c \) \|\| expanded=\$\(\(bound \+ 1\)\)' || return 1
   matches "$code" '^  if \[ "\$expanded" -gt "\$bound" \]; then$' || return 1
   matches "$code" 'CACHE_VERDICT="too-big-expanded"'             || return 1
@@ -1226,7 +1235,15 @@ has_trusted_snapshot_build() { # <file>
   # on exactly the archive it was written to catch. Over the bound is a refusal.
   matches "$code" 'cap=\$\(cache_expand_bound "\$\(stat -c %s "\$1"\)"\)' || return 1
   matches "$code" 'tar -tvzf "\$1" \| head -c "\$\(\(cap \+ 1\)\)" >"\$list"' || return 1
-  matches "$code" 'tar_rc=\$\{PIPESTATUS\[0\]\}' || return 1
+  # BOTH statuses, and the limiter's is the one that was dropped. It is the last
+  # stage, so nothing SIGPIPEs it: every failure it reports is a failure to
+  # WRITE the listing, ENOSPC first among them, and a listing that stopped early
+  # measures comfortably under the cap. The flatness scan then passes on a
+  # PREFIX, and a setuid member past the cut is never looked at.
+  matches "$code" 'list_pipes="\$\{PIPESTATUS\[\*\]\}"' || return 1
+  matches "$code" '^  tar_rc=\$\{list_pipes%% \*\}' || return 1
+  matches "$code" '\[ "\$\{list_pipes##\* \}" = 0 \]' || return 1
+  ! matches "$code" 'tar_rc=\$\{PIPESTATUS\[0\]\}' || return 1
   matches "$code" '\[ "\$written" -le "\$cap" \]' || return 1
   # And the BYTE COUNT decides which refusal is printed, not tar's status. `head`
   # closing the pipe kills tar with SIGPIPE, so reading the status alone reports
@@ -1357,10 +1374,20 @@ has_trusted_snapshot_build() { # <file>
   # prevent has already happened and already been scanned past. Order is the
   # property here, so order is what gets asserted -- the presence of the kills
   # says nothing on its own.
-  local reap_at scan_at
+  local reap_at scan_at refuse_at
   reap_at=$(printf '%s\n' "$code" | grep -nE 'kill -KILL -- "-\$prep_pgid"' | head -n1 | cut -d: -f1)
   scan_at=$(printf '%s\n' "$code" | grep -nE '^  scan_or_die "\$STAGE"$' | head -n1 | cut -d: -f1)
   [ -n "$reap_at" ] && [ -n "$scan_at" ] && [ "$reap_at" -lt "$scan_at" ] || return 1
+  # ...and before the REFUSALS too, which is the harder half. `$prep_pgid` is
+  # this shell's own child, so the group to kill is known here whatever the
+  # recorder managed to write — and every reason the record can be missing is a
+  # reason to want the group reaped MORE: both probes failed, the write was
+  # interrupted, or same-uid prepare code truncated the file precisely so this
+  # run would give up before the kill. Dying on the record ahead of the kill
+  # left daemonized descendants running on the one path that exists to report
+  # the group could not be verified.
+  refuse_at=$(printf '%s\n' "$code" | grep -nE '^  \[ -n "\$prep_seen" \]' | head -n1 | cut -d: -f1)
+  [ -n "$refuse_at" ] && [ "$reap_at" -lt "$refuse_at" ] || return 1
 
   # The bytes scanned are the bytes shipped. The verify pass reads a tree
   # unpacked FROM the archive, while `cp` and `gcloud storage cp` re-open the
@@ -1802,11 +1829,23 @@ mutate 'the free-space check reserves the unfloored product' has_snapshot_inspec
 mutate 'the host stops counting what it decompressed' has_snapshot_inspection \
   's@^  if \[ "\$expanded" -gt "\$bound" \]; then$@  if false; then@'
 mutate 'the count is removed from the hydrate altogether' has_snapshot_inspection \
-  '/^  local expanded$/,/^  fi$/d'
+  '/^  local expanded count_rc$/,/^  fi$/d'
 mutate 'a partial hydrate stops having a verdict of its own' has_snapshot_inspection \
   's@CACHE_VERDICT="too-big-expanded"@CACHE_VERDICT="unpack-timeout"@'
 mutate 'the count itself becomes unbounded' has_snapshot_inspection \
   's@\| head -c "\$\(\(bound \+ 1\)\)" \| wc -c \)@| wc -c )@'
+# A 124 read as success is an UNMEASURED archive presented as a small one: the
+# extraction below then gets a fresh one-second floor, and tar takes a prefix
+# ending at a member boundary without complaint. That is the partial hydrate
+# this count exists to prevent, reached through the count.
+mutate 'the counting pass swallows its own exit code again' has_snapshot_inspection \
+  's@; echo "\$\?" >"\$tmp/count\.rc"; \}@ || true; }@'
+mutate 'a timed-out measurement is read as a small archive' has_snapshot_inspection \
+  's@^  if \[ "\$\{count_rc:-\}" != 0 \]; then$@  if false; then@'
+mutate 'a timeout and a corrupt stream stop being told apart' has_snapshot_inspection \
+  's@^      124 \| 137 \)$@      zzz )@'
+mutate 'the recorded status is never read back' has_snapshot_inspection \
+  's@^  count_rc=\$\(tr -dc 0-9 <"\$tmp/count\.rc" 2>/dev/null\) \|\| count_rc=..$@  count_rc=0@'
 mutate 'the pointer stops being whitelisted' has_snapshot_inspection \
   's@^    \*\[!A-Za-z0-9\._-\]\* \| .. \| \.\* \)$@    nothing-at-all )@'
 mutate 'the hydrate runs after the master is locked' has_snapshot_inspection \
@@ -2168,13 +2207,27 @@ mutate_file "$PUBSH" 'the two bounds are computed by hand again' has_trusted_sna
 # unbounded, because the member it was written to catch can be in the part that
 # was cut and the check passes.
 mutate_file "$PUBSH" 'the archive listing goes back to unbounded' has_trusted_snapshot_build \
-  's@^  if ! tar -tvzf "\$1" \| head -c "\$\(\(cap \+ 1\)\)" >"\$list"; then$@  if ! tar -tvzf "$1" >"$list"; then@'
+  's@^  if tar -tvzf "\$1" \| head -c "\$\(\(cap \+ 1\)\)" >"\$list"; then$@  if tar -tvzf "$1" >"$list"; then@'
 mutate_file "$PUBSH" 'a truncated listing is inspected instead of refused' has_trusted_snapshot_build \
   's@^  \[ "\$written" -le "\$cap" \] \\$@  [ "$written" -ge 0 ] \\@'
 # Order: tar's status read first reports every over-long listing as a corrupt
 # archive, because `head` closing the pipe kills tar with SIGPIPE.
 mutate_file "$PUBSH" 'tar exit status decides before the byte count does' has_trusted_snapshot_build \
   '/^  \[ "\$tar_rc" = 0 \]/d; s@^  written=\$\(wc -c <"\$list"\).*$@  [ "$tar_rc" = 0 ] || die "the archive could not be listed"\n&@'
+# The limiter is the last stage, so its only failures are failures to WRITE the
+# listing. Dropped, an ENOSPC truncation measures under the cap and the flatness
+# scan passes on a prefix.
+mutate_file "$PUBSH" 'the listing limiter goes back to having no status' has_trusted_snapshot_build \
+  '/list_pipes##\* \}" = 0 \]/,+1d'
+mutate_file "$PUBSH" 'only the producer of the listing is checked' has_trusted_snapshot_build \
+  's@^  tar_rc=\$\{list_pipes%% \*\}$@  tar_rc=${PIPESTATUS[0]}@'
+mutate_file "$PUBSH" 'the two listing statuses collapse into one' has_trusted_snapshot_build \
+  's@^  tar_rc=\$\{list_pipes%% \*\}$@  tar_rc=${list_pipes##* }@'
+# The reap must precede the REFUSALS, not just the scan. An unrecorded group is
+# the shape most likely to have left a daemon behind, and it was the one shape
+# that died before the kill.
+mutate_file "$PUBSH" 'the run gives up on an unrecorded group before reaping it' has_trusted_snapshot_build \
+  '/^  kill -(TERM|KILL) -- "-\$prep_pgid"/d; /^  sleep 1$/d; s@^  case "\$prep_rc" in$@  kill -TERM -- "-$prep_pgid" 2>/dev/null || true\n  sleep 1\n  kill -KILL -- "-$prep_pgid" 2>/dev/null || true\n  case "$prep_rc" in@'
 mutate_file "$PUBSH" 'credential files stop being scanned for' has_trusted_snapshot_build \
   "s@-o -name '\.git-credentials' @@"
 mutate_file "$PUBSH" 'the snapshot name becomes reusable' has_trusted_snapshot_build \
