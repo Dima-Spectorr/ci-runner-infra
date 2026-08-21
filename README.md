@@ -375,6 +375,26 @@ that image a real answer is separate work, not a line in this one.
   read-only mode is the extracted tree's only protection, and per-slot caches
   make Go's own default both safe and sufficient.
 
+  **A seeded cache does not behave like one the job downloaded itself, and the
+  difference shows up as `EACCES`.** A slot's copy arrives with the seal's modes:
+  every FILE read-only, every DIRECTORY writable, all of it owned by the slot.
+  Adding, replacing and removing entries all work — those need write on the
+  parent directory, and it has it — but *rewriting a cached file in place* does
+  not, and a job that does it gets a permission error on content it can plainly
+  see it owns. `go clean -modcache` and `uv cache clean` are the reported cases.
+  This is the correct trade rather than an oversight: `go.sum` authenticates the
+  module *zip* at download and the build never re-hashes the extracted tree, so
+  read-only files are the only thing standing between one job's write and the
+  next job's compile. The workaround is one line before the command, and it
+  always succeeds because the slot owns every file in the tree:
+
+  ```bash
+  chmod -R u+w "$GOMODCACHE" && go clean -modcache
+  ```
+
+  Do it in the job that needs it, not fleet-wide: the mode is per-slot and the
+  host rebuilds it on the next boot either way.
+
   **A `container:` job gets no cache reuse.** These are systemd `Environment=`
   lines on the agent unit, and the runner passes only the workflow's own
   `container.env` (plus `HOME` and proxy vars) to `docker create` — nothing
