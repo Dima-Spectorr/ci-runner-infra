@@ -511,9 +511,44 @@ chown -R "\$u:\$u" "\$home" || { say "slot \$idx: could not chown \$home"; rc=1;
 chmod 0750 "\$home" || { say "slot \$idx: could not chmod \$home"; rc=1; }
 
 # THE WORK FOLDER. Absent until the slot's first job, which is not a failure.
+#
+# The slot OWNS $SLOT_ROOT/$idx -- install_slot chowns the whole runner copy to
+# it, because config.sh writes .runner and .credentials there -- so the slot can
+# create, rename and replace names inside it, including _work itself. That makes
+# every path below a name an untrusted account controls, and root is the one
+# walking them. Two things follow, and this is the same namespace-ownership rule
+# provision_slot_user states on $SLOT_STATE/$idx: root operates on a leaf inside
+# a directory root owns, never inside one the slot owns.
+#
+# So _work is RENAMED into a root-owned holding directory for the duration and
+# renamed back at the end. rename(2) is atomic and carries every open handle
+# with it, so the runner keeps the workspace it already prepared; what it does
+# not carry is the slot's ability to swap a name mid-loop. Without this the
+# remove-then-recreate below is a root-owned TOCTOU: a second process of the
+# same slot can plant a symlink at $e between the rm and the install.
 work="\$SLOT_ROOT/\$idx/_work"
-if [ -d "\$work" ]; then
-  for e in "\$work"/* "\$work"/.[!.]* "\$work"/..?*; do
+held="\$SLOT_ROOT/.reset/\$idx/_work"
+took=0
+if [ -L "\$work" ]; then
+  # Checked BEFORE anything follows it. -d is true through a symlink, so a slot
+  # that replaced _work with a link to / would have had root walk and empty
+  # whatever it pointed at. There is no reset to perform here, only a slot to
+  # refuse: the marker is not written and the next job on it is failed.
+  say "slot \$idx: \$work is a symlink -- refusing to reset through it"
+  rc=1
+elif [ -d "\$work" ]; then
+  # A holding directory left behind by a reset that died mid-flight. It is under
+  # a root-owned 0700 parent, so nothing in it came from a slot.
+  rm -rf -- "\$held"
+  if mv -T -- "\$work" "\$held"; then
+    took=1
+  else
+    say "slot \$idx: could not take \$work for the reset"
+    rc=1
+  fi
+fi
+if [ "\$took" = 1 ]; then
+  for e in "\$held"/* "\$held"/.[!.]* "\$held"/..?*; do
     # -e is FALSE for a dangling symlink, so -L is asked too: a link left pointing
     # at a path that no longer exists would otherwise survive every reset, still be
     # recorded clean, and break the next job when the runner prepares or enters that
@@ -538,6 +573,20 @@ if [ -d "\$work" ]; then
       install -d -o "\$u" -g "\$u" -m 0755 "\$e" || { say "slot \$idx: could not recreate \$e"; rc=1; }
     fi
   done
+  # Handed back. The slot still owns the parent, so it could have created a NEW
+  # _work at the vacated name while root worked in the holding directory; that
+  # name is not ours to remove, so the reset is refused instead and the slot is
+  # left without a marker. Fail closed: the next started reset wipes everything
+  # and fails that job, which is the outcome this hook exists to produce.
+  if [ -e "\$work" ] || [ -L "\$work" ]; then
+    say "slot \$idx: something recreated \$work while it was being reset -- refusing to hand it back"
+    rc=1
+  elif mv -T -- "\$held" "\$work"; then
+    chown "\$u:\$u" "\$work" || { say "slot \$idx: could not chown \$work"; rc=1; }
+  else
+    say "slot \$idx: could not return \$work to slot \$idx"
+    rc=1
+  fi
 fi
 
 # Written LAST and only on success, into a directory no slot can write. It is
@@ -1922,6 +1971,11 @@ provision_slot_user() {
   # the `clean` marker that decides whether its next job is allowed to run.
   install -d -o root -g root -m 0755 "$SLOT_STATE" || return 1
   install -d -o root -g root -m 0755 "$SLOT_STATE/$idx" || return 1
+  # Where slot-reset.sh holds _work while it empties it. Root-owned and 0700 on
+  # both levels, because the whole point is a directory the slot cannot create a
+  # name in while root is walking one.
+  install -d -o root -g root -m 0700 "$SLOT_ROOT/.reset" || return 1
+  install -d -o root -g root -m 0700 "$SLOT_ROOT/.reset/$idx" || return 1
   install -d -o "$u" -g "$u" -m 0700 "$SLOT_STATE/$idx/docker" || return 1
 
   # The home's CONTENT — the registry credential helpers and the daemon's mtu
@@ -1934,6 +1988,20 @@ provision_slot_user() {
   # Fails the slot: a home that is not in the state the template describes is a
   # home nobody can describe, and the next thing to happen to it is an agent
   # being registered against it.
+  #
+  # NOT under a live agent. On a WARM reboot the ci-runner@ units are already
+  # enabled and start independently of google-startup-scripts.service -- the same
+  # hazard gh_token spells out -- so an agent can be registered and executing a
+  # job by the time this line is reached, and a boot reset would empty that live
+  # job's home, _actions, _temp and workspace and then record the slot clean.
+  # Skipping is not a compromise: the unit carries its own
+  # ExecStartPre=+slot-reset.sh boot, so a slot whose agent is up has ALREADY
+  # been reset by the path that owns that decision, and doing it a second time
+  # from here can only destroy work.
+  if systemctl is-active --quiet "ci-runner@$idx.service"; then
+    log "slot $idx: its agent is already running (warm reboot) — its unit's own boot reset stands; not resetting under a possibly live job"
+    return 0
+  fi
   /opt/ci/job-hooks/slot-reset.sh boot "$idx" || return 1
 }
 

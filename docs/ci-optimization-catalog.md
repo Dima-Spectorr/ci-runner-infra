@@ -820,6 +820,26 @@ describing nothing.
    predecessor never reached its completed hook is failed loudly rather than run
    over an untrusted `_actions` tree.
 
+   Root does not walk a name the slot can swap. The slot owns
+   `/opt/ci/slots/<idx>` — `config.sh` writes `.runner` and `.credentials`
+   there — so `_work` is renamed into a root-owned 0700 holding directory for
+   the duration of the reset and renamed back at the end. `rename(2)` is atomic
+   and carries the runner's open handles with it, so the workspace it already
+   prepared survives; what it does not carry is the slot's ability to plant a
+   symlink at a name between root's `rm -rf` and its `install -d`. A `_work`
+   that is already a symlink is refused rather than followed, and a `_work` the
+   slot recreated while root worked in the holding directory is refused rather
+   than removed — both leave the marker unwritten, which fails the next job.
+
+   The `boot` reset in `provision_slot_user` is skipped when that slot's agent
+   is already running. On a warm reboot the `ci-runner@` units start
+   independently of `google-startup-scripts.service`, so an agent can be
+   executing a job while the startup script is still walking the slots, and a
+   reset there would empty a live job and then record the slot clean. Skipping
+   loses nothing: the unit carries its own `ExecStartPre=+slot-reset.sh boot`,
+   so a slot whose agent is up has already been reset by the path that owns
+   that decision.
+
    The symmetric caution: a workflow that *relied* on a previous job's login now
    fails. Nothing in this fleet does — every workflow that needs GCP either runs
    `google-github-actions/auth` itself or uses the broker's ADC — but a repo
