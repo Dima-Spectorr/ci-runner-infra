@@ -1212,5 +1212,48 @@ mutate "the hold forgets which boot"        's@boot=%s@host=%s@'                
 mutate "a hold honoured across a reboot"    's@releasing it as orphaned@keeping it@'                                 has_pin_hold
 mutate "a plain pin takes its slot away"    's@\[ "\\\$reserve" = 1 \] && \[ -f@[ -f@'                                     has_pin_hold
 
+# --- no comment in an UNQUOTED heredoc may spell a live backtick --------------
+#
+# Everything this script installs is written by heredocs, and most of them are
+# unquoted because they interpolate a Terraform value. In one of those a
+# backtick is not punctuation, it is a command substitution: a comment reading
+# `docker ps` timing out RUNS docker ps while the file is being written -- at
+# boot, as root. The habit that produces it is ordinary markdown, two commits
+# have now shipped it, and a reviewer's eye slides straight over a comment.
+#
+# The rule is mechanical, so the check is too: inside an unquoted heredoc every
+# backtick is escaped. A quoted heredoc is exempt, nothing in it expands. This
+# found eleven live ones the day it was written.
+_live=$(awk -v SQ="'" '
+  BEGIN { inhd = 0; BT = sprintf("%c", 96); BS = sprintf("%c", 92) }
+  inhd == 0 {
+    p = index($0, "<<")
+    if (p > 0) {
+      rest = substr($0, p + 2)
+      sub(/^-/, "", rest)
+      sub(/^[ 	]+/, "", rest)
+      q = 0
+      if (substr(rest, 1, 1) == SQ) { q = 1; rest = substr(rest, 2) }
+      if (match(rest, /^[A-Za-z_][A-Za-z0-9_]*/)) {
+        delim = substr(rest, 1, RLENGTH)
+        inhd = 1
+      }
+    }
+    next
+  }
+  { line = $0; sub(/^[ 	]+/, "", line); sub(/[ 	]+$/, "", line) }
+  line == delim { inhd = 0; next }
+  q == 0 {
+    for (i = 1; i <= length($0); i++) {
+      if (substr($0, i, 1) == BT && substr($0, i - 1, 1) != BS) { print FNR; next }
+    }
+  }
+' "$SCRIPT")
+if [ -z "$_live" ]; then
+  ok
+else
+  bad "a backtick inside an unquoted heredoc is a command substitution the boot would run, not prose -- line(s): $(echo $_live)"
+fi
+
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

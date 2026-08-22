@@ -425,15 +425,15 @@ set -uo pipefail
 # that stopped granting this must fail the job at once rather than hang it until
 # the job's own timeout.
 # The hold is renewed by the HOST, not by the workflow, and this is the only
-# place that can do it: a consumer running inside a `container:` cannot reach
+# place that can do it: a consumer running inside a \`container:\` cannot reach
 # /usr/local/bin/ci-pin-hold at all, and those are precisely the jobs whose runs
 # last long enough for a TTL to matter. Never fatal — a hold that fails to
 # extend expires, and the sweeper puts the slot back; failing a job over the
 # fleet's own bookkeeping would be the worse outcome by far.
 #
-# STARTED only, and named. On `completed` a renewal extends the hold past the
+# STARTED only, and named. On \`completed\` a renewal extends the hold past the
 # end of the last job of the run, for a full TTL, over a host nothing is using.
-# `--run` is what keeps a job of some OTHER run from renewing this one's hold;
+# \`--run\` is what keeps a job of some OTHER run from renewing this one's hold;
 # the helper refuses when the ids differ.
 $renew
 exec sudo -n /opt/ci/job-hooks/slot-reset.sh $stage
@@ -665,8 +665,8 @@ fi
 # and the marker is exactly the claim it must not get.
 # A HELD slot is spared, and that is rule 2 of the shared-infra contract meeting
 # rule 1. Under one host per pull request the run's later jobs land on THIS
-# slot and reuse what the anchor built — and a stack built by `docker compose
-# build` carries no RepoDigest and was not baked at boot, which is exactly the
+# slot and reuse what the anchor built — and a stack built by \`docker compose
+# build\` carries no RepoDigest and was not baked at boot, which is exactly the
 # shape below removes. Pruning between two jobs of one run would delete the
 # run's own images out from under it.
 #
@@ -703,7 +703,7 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
     # THE CONTAINERS, and they go BEFORE the tags -- a running container holds a
     # reference to its image and the untag below would fail on it.
     #
-    # A stack brought up the documented way, `docker compose up -d` in the
+    # A stack brought up the documented way, \`docker compose up -d\` in the
     # anchor job, does not stop when the job that started it ends: nothing in
     # the runner's lifecycle reaches into a detached rootless container. Before
     # #258 that was untidy. With a PERSISTENT port band it is a correctness bug
@@ -719,15 +719,15 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
     #
     # So the reclamation is host-side and boundary-driven, not a TTL: it happens
     # at 'completed' and at 'boot', which is every point at which no job of this
-    # slot is running. A HELD slot is spared by the same `prune` gate that
+    # slot is running. A HELD slot is spared by the same \`prune\` gate that
     # spares its image tags -- the run's later jobs land here and reuse the
     # stack, which is rule 2 of the contract -- and the sweeper's teardown runs
     # this same reset once the hold has expired, so nothing a run brought up
     # outlives the run.
     #
-    # `docker rm -f -v`, not `compose down`: root has no compose project name
+    # \`docker rm -f -v\`, not \`compose down\`: root has no compose project name
     # here, and a job is free to have started containers without compose at all.
-    # `-v` takes the anonymous volumes with them, which is where a database that
+    # \`-v\` takes the anonymous volumes with them, which is where a database that
     # was never meant to persist put its data.
     cids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
              docker ps --all --quiet --no-trunc 2>/dev/null | sort -u)
@@ -753,8 +753,8 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
     timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
       docker network prune --force >/dev/null 2>&1 ||
       { say "slot \$idx: could not prune the last job's networks"; rc=1; }
-    # `--all` covers NAMED volumes and not merely anonymous ones, which is the
-    # half that matters: `docker compose` names its volumes after the project,
+    # \`--all\` covers NAMED volumes and not merely anonymous ones, which is the
+    # half that matters: \`docker compose\` names its volumes after the project,
     # so the next run under the same project name would inherit the last pull
     # request's database. The flag arrived in Docker 23 and this fleet's hosts
     # are newer -- but a host that is not would fail the flag, fail this reset,
