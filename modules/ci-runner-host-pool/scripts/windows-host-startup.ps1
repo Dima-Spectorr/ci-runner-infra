@@ -2893,13 +2893,19 @@ function Invoke-CacheFetch {
         $file.Close(); $file = $null
         return $true
     } catch {
-        if ($file) { try { $file.Close() } catch { } }
+        # The eight discards below are deliberate and the analyzer is right to
+        # make them say so. A Dispose that throws during cleanup would REPLACE
+        # the real failure with a cleanup failure, and on this function's paths
+        # it must not be logged at all: the exception carries the request URI,
+        # and the only Authorization header this host ever builds is on the
+        # request that produced it.
+        if ($file) { try { $file.Close() } catch { $null = $_ } }
         Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
         return $false
     } finally {
-        if ($file) { try { $file.Dispose() } catch { } }
-        if ($stream) { try { $stream.Dispose() } catch { } }
-        if ($response) { try { $response.Close() } catch { } }
+        if ($file) { try { $file.Dispose() } catch { $null = $_ } }
+        if ($stream) { try { $stream.Dispose() } catch { $null = $_ } }
+        if ($response) { try { $response.Close() } catch { $null = $_ } }
     }
 }
 
@@ -2952,8 +2958,8 @@ function Measure-CacheArchiveExpansion {
     } catch {
         return [long] (-1)
     } finally {
-        if ($gzip) { try { $gzip.Dispose() } catch { } }
-        if ($raw) { try { $raw.Dispose() } catch { } }
+        if ($gzip) { try { $gzip.Dispose() } catch { $null = $_ } }
+        if ($raw) { try { $raw.Dispose() } catch { $null = $_ } }
     }
 }
 
@@ -2987,7 +2993,11 @@ function Remove-CacheTreeSafely {
         and it never returns the starting item, which is why the root is added by
         hand -- a tree whose ROOT is a junction is exactly the case that matters.
     #>
-    [CmdletBinding()]
+    # ConfirmImpact stays Low deliberately. This runs unattended at boot, where
+    # $ConfirmPreference is High and nothing prompts -- the declaration is what
+    # lets -WhatIf report the delete instead of doing it. Raising the impact
+    # would turn a cleanup into a host that never registers.
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
     param([Parameter(Mandatory = $true)][string] $Path)
 
     if (-not (Test-Path -LiteralPath $Path)) { return }
@@ -3006,6 +3016,7 @@ function Remove-CacheTreeSafely {
         Write-BootLog "phase 7: $Path is left on disk -- $reason, and a recursive delete would follow it"
         return
     }
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Remove-Item -Recurse')) { return }
     Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
 }
 
@@ -3217,14 +3228,14 @@ function Expand-CacheSnapshot {
             -ArgumentList @('-x', '-z', '-f', $Archive, '-C', $Stage) `
             -NoNewWindow -PassThru
         if (-not $proc.WaitForExit($seconds * 1000)) {
-            try { $proc.Kill() } catch { }
+            try { $proc.Kill() } catch { $null = $_ }
             return $false
         }
         return ($proc.ExitCode -eq 0)
     } catch {
         return $false
     } finally {
-        if ($proc) { try { $proc.Dispose() } catch { } }
+        if ($proc) { try { $proc.Dispose() } catch { $null = $_ } }
     }
 }
 
@@ -3263,7 +3274,9 @@ function Update-CacheMasterFromStage {
         ship would leave it there indefinitely -- a full duplicate cache tree that
         Protect-CacheMaster then publishes read-and-execute to every slot.
     #>
-    [CmdletBinding()]
+    # Same reasoning as Remove-CacheTreeSafely: declared so -WhatIf is honest,
+    # Low so an unattended boot never stops to ask.
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
     param(
         [Parameter(Mandatory = $true)][string] $Stage,
         [string] $Master = $script:CacheMaster
@@ -3278,6 +3291,7 @@ function Update-CacheMasterFromStage {
     foreach ($dir in $script:CacheDirs) {
         $source = Join-Path $Stage $dir
         if (-not (Test-Path -LiteralPath $source)) { continue }
+        if (-not $PSCmdlet.ShouldProcess($dir, 'publish into the cache master')) { continue }
         $target = Join-Path $Master $dir
         $aside = Join-Path $Master ".$dir.previous"
         if (Test-Path -LiteralPath $target) {
