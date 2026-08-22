@@ -263,7 +263,7 @@ jobs:
           $cfg.Run.PassThru = $true
           $cfg.Output.Verbosity = 'Detailed'
           $r = Invoke-Pester -Configuration $cfg
-          $floor = 189
+          $floor = 253
           Write-Output "pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.TotalCount) discovered"
           if ($r.TotalCount -lt $floor) {
             throw "Pester discovered only $($r.TotalCount) test(s), fewer than the $floor this suite is known to contain — the suite did not run, whatever the exit code says"
@@ -388,6 +388,15 @@ jobs:
       - name: dependency cache self-test
         run: bash scripts/ci/shared-cache.selftest.sh
 
+      # The Windows half of the same layer, and the same silence: a build phase
+      # that loses its bound, its reap or its two-job split still produces an
+      # archive, and the archive is what every host in the pool unpacks as
+      # SYSTEM. The Pester suite runs this script's pure functions; nothing but
+      # this file checks that they are CALLED, or that the reap happens before
+      # the tree is read.
+      - name: Windows snapshot build-phase self-test
+        run: bash scripts/ci/build-cache-snapshot.selftest.sh
+
       # Routing bug here = job code gets the HOST identity, which reads the
       # GitHub App key. Tested on every change, not only when the broker moves.
       - name: job credential broker self-test
@@ -511,7 +520,7 @@ jobs:
 
       # …and the fixtures' own proof. A fixture asserting "this workflow
       # produces RUNNER8" keeps passing while the detector behind it is
-      # weakened, so this mutates the gate seven ways and asserts the suite
+      # weakened, so this mutates the gate sixteen ways and asserts the suite
       # above FAILS for each. Runs after it, because a mutation "detected" by a
       # suite that was already red asserts nothing either.
       - name: runner policy mutation self-test
@@ -520,6 +529,14 @@ jobs:
       # …and then this repository's own workflows. It publishes the rule, so it
       # is the first place the rule must hold. `--forks=allowed` is the strict
       # posture and this repository is PUBLIC, so it is also the true one.
+      #
+      # `--shared-infra` is deliberately NOT passed yet. This repository's own
+      # workflows have not been consolidated onto an anchor, so turning the
+      # rules on here would fail this pipeline on the commit that adds them —
+      # and a gate whose first act is to redden its own repository is a gate
+      # nobody adopts. It goes on in the pull request that does the
+      # consolidation (phase 7 of docs/adr-pr-host-affinity.md); until then the
+      # fixtures above are what prove the rules work.
       - name: runner policy
         run: bash scripts/ci/check-runner-policy.sh --forks=allowed
 

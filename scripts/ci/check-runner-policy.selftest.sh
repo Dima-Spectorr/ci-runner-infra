@@ -132,5 +132,68 @@ mutate "the container: half of the condition dropped" \
 mutate "the diagnostic never emitted" \
   's@        err RUNNER8 @        : RUNNER8 @'
 
+# --- RUNNER9/10/11 -------------------------------------------------------------
+# Same argument as the eight above, applied to the three rules that decide how
+# many hosts and how many databases a pull request gets. Each of these is a
+# plausible edit — a refactor, a "tightening" of a regex, a threshold nudged
+# while debugging — and none of them changes how the gate reads.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+
+# 8. The reader stops reporting the resolution. The bash rule is untouched and
+#    reviews as correct; it is simply never handed the fact it branches on, so
+#    every correctly pinned consumer in the fleet is reported as unpinned — and
+#    RUNNER9 firing everywhere is how RUNNER9 gets turned off everywhere.
+mutate "the reader no longer reports the anchor resolution" \
+  's@out("#RUNSONNEEDS", vid, m.group(1))@pass@'
+
+# 9. The resolution is read only up to the first `||`. A plain consumer still
+#    passes, so most fixtures stay green — but the fleet's fork-routing idiom
+#    puts the resolution in the SECOND branch, and that is the spelling every
+#    consumer in a public repository writes.
+mutate "the anchor resolution read only before the fork branch" \
+  's@NEEDS_OUTPUT.finditer(text)@NEEDS_OUTPUT.finditer(text.split("||")[0])@'
+
+# 10. The band regex stops covering the band. `localhost:35100` becomes a port
+#     like any other, and the Windows job that cannot possibly work is reported
+#     clean — RUNNER11's whole subject restored by one character class.
+mutate "the loopback band regex no longer covers the band" \
+  's@(3\[5-9\]\[0-9\]{3}@(9[5-9][0-9]{3}@'
+
+# 11-12. Each finding computed and never reported. A gate that decides
+#        correctly and says nothing is indistinguishable from a clean
+#        repository, and it is the state a refactor reaches by deleting a line.
+mutate "the RUNNER9 diagnostic never emitted" \
+  's@            err RUNNER9 @            : RUNNER9 @'
+mutate "the RUNNER11 diagnostic never emitted" \
+  's@            err RUNNER11 @            : RUNNER11 @'
+
+# 13. The owner threshold nudged by one. Two stacks in one run — the precise
+#     thing rule 2 forbids — becomes the passing case, and nothing else changes.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the owner count tolerates a second stack" \
+  's@\[ "$owners" -gt 1 \]@[ "$owners" -gt 2 ]@'
+
+# 14. Windows loses its exemption from RUNNER9. Rule 1's whole exception is that
+#     a Windows job IS a second host, on purpose; a gate that demands it pin to
+#     the Linux anchor is asking for a job that cannot run.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "Windows no longer exempt from the pinning rule" \
+  's@if \[ "$windows_pool" -eq 0 \] && \[ "$pins_to_anchor" -eq 0 \]@if [ "$pins_to_anchor" -eq 0 ]@'
+
+# 15. The exemption stops being read. Every declared exception goes red at once,
+#     which is the other way a gate gets disabled: not by missing a finding, but
+#     by refusing an answer the repository already argued for in writing.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a declared exemption is no longer honoured" \
+  's@          if ! shared_infra_marker "$file" exempt "$job"; then@          if true; then@'
+
+# 16. The marker stops being bound to its job, so a marker naming ANY job in the
+#     file excuses every job in it — including one added later that nobody
+#     weighed against the exemption's reasoning, which is the whole reason the
+#     job id is in the marker.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the marker no longer has to name the job it excuses" \
+  's@${esc}${tail}@[^)]*@'
+
 printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

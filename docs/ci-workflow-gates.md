@@ -41,7 +41,8 @@ false pass is a gate that quietly stopped gating.
 bash scripts/ci/check-runner-policy.sh [--selftest] [--scope=<label>]
                                        [--forks=allowed|blocked]
                                        [--max-timeout=<minutes>]
-                                       [--allow-dynamic-runner] [<file>...]
+                                       [--allow-dynamic-runner] [--shared-infra]
+                                       [<file>...]
 ```
 
 With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
@@ -58,16 +59,96 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER6` | and the declared timeout is below the default it replaces |
 | `RUNNER7` | a REMOTE reusable workflow's jobs are not in this repository — UNDECIDED, declarable per callee |
 | `RUNNER8` | a job on a **Windows** pool label declares `container:` or `services:`, which that pool cannot run |
-| `RUNNER9` | *(proposed)* a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the anchor job's output, or is the anchor, or carries a declared exemption |
-| `RUNNER10` | *(proposed)* at most **one** job across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# ci: shared-infra-owner` markers counted together, because a repository that has adopted the contract has no `services:` left to count |
-| `RUNNER11` | *(proposed)* a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
+| `RUNNER9` | with `--shared-infra`, a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the anchor job's output, or is the anchor, or carries a declared exemption |
+| `RUNNER10` | with `--shared-infra`, at most **one** job across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# shared-infra-owner(<job>)` markers counted together, because a repository that has adopted the contract has no `services:` left to count |
+| `RUNNER11` | with `--shared-infra`, a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
 
 `RUNNER9`–`RUNNER11` are designed in
 [`adr-pr-host-affinity.md`](adr-pr-host-affinity.md) and specified for consumers
-in [`ci-pr-shared-infra.md`](ci-pr-shared-infra.md). They are **not implemented
-yet**, and when they are they will be opt-in behind a flag until fleet adoption
-completes: a gate that fails every repository the day it merges is a gate
-disabled in every repository the day after — the same posture as `--forks`.
+in [`ci-pr-shared-infra.md`](ci-pr-shared-infra.md). They are **opt-in behind
+`--shared-infra`**, and stay opt-in until fleet adoption completes: a gate that
+fails every repository the day it merges is a gate disabled in every repository
+the day after — the same posture as `--forks`. A repository turns the flag on in
+the same pull request that consolidates its workflows onto an anchor, so the
+rules go green in the commit that makes them true.
+
+### One host per pull request, and what a job has to say to get one
+
+Rule 1 is a scheduling property GitHub will not give you by accident. `runs-on:
+[self-hosted, linux, gcp, ExampleRepo]` offers the job to *any* free agent
+carrying those labels, so a run with two such jobs is a run on two hosts — and
+the second host cannot see the database the first one started, because the
+stack is bound to one host's address and the band's firewall admits the paired
+hosts rather than a bystander. What the author sees is a connection refused in
+a job they did not change.
+
+So a run names its host once. The first fleet job — the **anchor** — publishes
+the host it landed on, and every later job resolves its pool from that output:
+
+```yaml
+runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
+```
+
+`RUNNER9` asks for exactly that, and accepts three answers: the job resolves
+`runs-on` from another job's `outputs`, or it **is** an anchor, or it carries a
+declared exemption. The match on the resolution is a substring, not an anchored
+pattern, because the fleet's fork-routing idiom wraps it —
+
+```yaml
+runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON(needs.anchor.outputs.runs-on) }}
+```
+
+— and an anchored match would report the one shape that had already got this
+right.
+
+**Windows is exempt, by design rather than by omission.** A Windows job is a
+second host on purpose; it reaches the run's stack across the port band
+(`adr-pr-host-affinity.md` §3.3) instead of sharing a machine with it.
+
+### The two markers, and why each names its job
+
+```
+# shared-infra-owner(<job-id>): <what it brings up>
+# shared-infra-exempt(<job-id>, #<issue>): <why this job may name a pool>
+```
+
+An **owner** declaration is for a stack a YAML reader cannot see: `services:`
+is visible, `docker compose up -d` in a `run:` step is not, and the second is
+what an anchor becomes once it outgrows `services:`. Declaring it makes the job
+an anchor for `RUNNER9` and an owner for `RUNNER10` — the same fact, used by
+both rules.
+
+An **exemption** is `RUNNER7`'s shape reused: beside the job, naming the job,
+with an issue. It answers both rules the job can be the subject of, because a
+marker that silenced one while leaving the other red would be read as the gate
+being broken rather than as a distinction.
+
+Both name their job because a YAML reader has discarded comments by the time it
+yields a job, so a bare marker cannot be attributed to one — and a bare marker
+is also un-reviewable: it would excuse whatever the file contains after the next
+change, including a job added later that nobody weighed.
+
+### `RUNNER10` is counted across files, and reported once
+
+"One stack per run" is a property of the **run**, and a run spans every workflow
+the event triggers. Two `pull_request` workflows each holding one `services:`
+job are two stacks on two hosts, and a per-file count reads that as clean twice.
+So owners accumulate across the whole file set and the verdict is reported after
+the last file, naming every owner rather than only the surplus one — which of
+two is the mistake is a question the repository answers, not the gate.
+
+### `RUNNER11` is the Windows half of rule 3
+
+A Windows job reaches the stack at the **Linux** host's address, on the slot's
+band port, both exported into the job's environment (`CI_SHARED_INFRA_ADDR`,
+`CI_SHARED_INFRA_PORT_MIN`). `localhost:35100` on a Windows host is the Windows
+host, where nothing is listening: it fails as a refusal or a hang, in a job
+whose code is correct on every other runner it has ever run on.
+
+The port band is what makes this decidable — `localhost` on 8080 is a service
+the job started itself and is left alone; `localhost` in 35100–44099 is the
+mistake. It is read from the whole job rather than from `run:` blocks alone,
+because the shape it actually takes is a connection string in `env:`.
 
 ### `self-hosted` is a label, not a requirement
 
