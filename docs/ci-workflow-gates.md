@@ -58,8 +58,8 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER6` | and the declared timeout is below the default it replaces |
 | `RUNNER7` | a REMOTE reusable workflow's jobs are not in this repository — UNDECIDED, declarable per callee |
 | `RUNNER8` | a job on a **Windows** pool label declares `container:` or `services:`, which that pool cannot run |
-| `RUNNER9` | *(proposed)* a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the host lease, or carries a declared exemption |
-| `RUNNER10` | *(proposed)* at most **one** job across a repository's `pull_request` workflows declares `services:` — infrastructure is brought up once per pull request |
+| `RUNNER9` | *(proposed)* a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the anchor job's output, or is the anchor, or carries a declared exemption |
+| `RUNNER10` | *(proposed)* at most **one** job across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# ci: shared-infra-owner` markers counted together, because a repository that has adopted the contract has no `services:` left to count |
 | `RUNNER11` | *(proposed)* a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
 
 `RUNNER9`–`RUNNER11` are designed in
