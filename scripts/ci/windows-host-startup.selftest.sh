@@ -1684,6 +1684,14 @@ has_cache_master_sealed_readonly() { # <file>
   # empty $reason a genuinely clean tree does.
   matches "$code" '-ErrorVariable scanErrors' || return 1
   matches "$code" 'if \(\$scanErrors\.Count -gt 0\)' || return 1
+
+  # A DACL is not a limit on the OWNER: Windows hands an object's owner
+  # READ_CONTROL and WRITE_DAC with no ace saying so, and the owner check is
+  # satisfied by a GROUP sid in the token. A master left owned by BUILTIN\Users
+  # is therefore a master every slot can re-grant itself write on, whatever the
+  # seal below says -- so ownership is taken, and a failure to take it refuses.
+  matches "$code" "icacls\.exe \\\$Master '/setowner'" || return 1
+  matches "$code" 'if \(\$ownerExit -ne 0\)' || return 1
 }
 
 has_slot_cache_isolation() { # <file>
@@ -1760,11 +1768,33 @@ has_slot_cache_isolation() { # <file>
   matches "$code" '\$stage = Join-Path \$dst \(' || return 1
   matches "$code" '-f \$tool, \[guid\]::NewGuid' || return 1
 
+
+  # A stale staging tree is scanned before it is deleted, for the same reason the
+  # retired-slot sweep is: $dst is SYSTEM's, but the stage CONTENTS carry the
+  # slot's Modify grant, so a job could have planted a junction inside a stage a
+  # previous boot left behind -- and 5.1's Remove-Item follows it.
+  local stale_scan_at stale_del_at
+  stale_scan_at=$(printf '%s\n' "$code" | grep -nE '\$staleReason = Get-CacheHostileReason' | head -1 | cut -d: -f1)
+  stale_del_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$stale\.FullName -Recurse' | head -1 | cut -d: -f1)
+  [ -n "$stale_scan_at" ] && [ -n "$stale_del_at" ] || return 1
+  [ "$stale_scan_at" -lt "$stale_del_at" ] || return 1
+
   # The cache variables are emitted only for a slot that actually got a cache.
   # Unconditional, they would name directories phase 7 never built — and a tool
   # that cannot open the cache it was told to use fails the job rather than
   # missing it.
   matches "$code" 'if \(-not \[string\]::IsNullOrWhiteSpace\(\$CachePath\)\)' || return 1
+
+  # Both limits are re-read BETWEEN copies, not once for the host. The floor was
+  # measured against a sum of file LENGTHS -- not allocated size, not alternate
+  # data streams, which /COPY:DAT copies and Get-CacheMasterSize never counted --
+  # so a master built to understate itself passes the check and then overruns it
+  # onto the volume every other slot's job is running on. The budget is the same
+  # shape in time: nine copies per slot, K slots, all of it before phase 5
+  # registers anything, and an agent-less host is a DRAINED host once the grace
+  # runs out.
+  matches "$code" 'Test-CacheSeedBudgetExpired -ElapsedSeconds \$spent' || return 1
+  matches "$code" 'elseif \(\(Get-CacheVolumeFreeByte\) -lt \$script:CacheFreeFloorBytes\)' || return 1
 }
 
 if has_cache_master_sealed_readonly "$SCRIPT"; then
@@ -1833,6 +1863,11 @@ mutate "a retired slot's cache tree deleted recursively without being scanned" \
 mutate "a partly-unreadable master scanned and sealed as though it were clean"   's|if (\$scanErrors.Count -gt 0) {|if ($false) {|'   has_cache_master_sealed_readonly
 mutate "the scan errors discarded, so an unreadable tree reads as an empty one"   's|-ErrorAction SilentlyContinue -ErrorVariable scanErrors)|-ErrorAction SilentlyContinue)|'   has_cache_master_sealed_readonly
 mutate "the staging directory back to a fixed name a failed cleanup can leave behind"   "s|('\.seed-{0}-{1}' -f \$tool, \[guid\]::NewGuid().ToString('N'))|\".seed-\$tool\"|"   has_slot_cache_isolation
+mutate "a stale staging tree deleted recursively without being scanned first"   's|$staleReason = Get-CacheHostileReason|$staleReason = $null; $null = (|'   has_slot_cache_isolation
+mutate "the master left owned by whoever the warm script left it to"   "s|'/setowner'|'/nothing'|"   has_cache_master_sealed_readonly
+mutate "the ownership exit code dropped, so a slot-owned entry seals green"   's|^    if (\$ownerExit -ne 0) {$|    if ($false) {|'   has_cache_master_sealed_readonly
+mutate "the seeding budget never consulted, so a large image outlasts the registration grace"   's|-ElapsedSeconds \$spent `|-ElapsedSeconds 0 `|'   has_slot_cache_isolation
+mutate "the volume measured once for the host instead of between copies"   's|} elseif ((Get-CacheVolumeFreeByte) -lt \$script:CacheFreeFloorBytes) {|} elseif ($false) {|'   has_slot_cache_isolation
 mutate "the cache variables emitted for a slot that never got a cache" \
   's|if (-not \[string\]::IsNullOrWhiteSpace(\$CachePath)) {|if ($true) {|' \
   has_slot_cache_isolation
