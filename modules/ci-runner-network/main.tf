@@ -260,6 +260,34 @@ resource "google_compute_firewall" "egress_deny" {
 # whose pools share a network — the normal deployment, since the module takes
 # the network as an input — would each match the other's rule. One repository's
 # job could then open a socket on another repository's database.
+#
+# THE BOUNDARY THIS ENFORCES IS THE REPOSITORY, AND NOT THE RUN. Say so here,
+# because the rule reads as though it were per-run and is not: a network tag is
+# static VM metadata, so every host of one repository's pool carries the same
+# source tag and every stack host the same target tag, for as long as the pool
+# exists. Two pull requests of the SAME repository running concurrently on
+# different hosts therefore match each other's rule, and either can reach the
+# other's band — including, in the example the contract documents, a
+# passwordless PostgreSQL.
+#
+# What that is and is not:
+#
+#   not a fork exposure   fork-authored code does not run on this fleet at all.
+#                         RUNNER4 fails a pull_request job that reaches a warm
+#                         host without a fork guard, and the pools are
+#                         additionally set to refuse fork workflows. The code on
+#                         both sides of this boundary is code with write access
+#                         to the repository already.
+#   still a real gap      a job that is merely BUGGY -- a fixed port, a stale
+#                         connection string, a test that scans the band -- can
+#                         reach a concurrent run's database and corrupt a result
+#                         nobody will connect to this rule.
+#
+# Closing it needs authorization the network layer cannot express, because the
+# run id is not a tag: host-side filtering that admits only the pair holding the
+# same run, which is what the pin hold already records per host. Tracked in
+# issue #265; until it lands, this rule is a repository-scoped boundary and is
+# documented as one in docs/ci-pr-shared-infra.md.
 
 locals {
   # Slot i owns 100 host ports at 35000 + i*100, and slots are numbered from
