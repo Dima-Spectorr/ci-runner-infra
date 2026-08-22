@@ -384,7 +384,13 @@ A slot's published port lands in the slot's network namespace. From outside the
 host — and from a sibling slot — it does not exist. Two things are added:
 
 **A per-slot port band.** Slot `idx` owns host ports `35000 + idx*100` through
-`35000 + idx*100 + 99`. Disjoint by construction, so two slots publishing the
+`35000 + idx*100 + 99`. Slot indices start at **one** (`seq 1 "$SLOTS"`), so the
+lowest band is 35100 and the **band span** — the range the firewall and the
+conntrack allow are written against — is `35100` through
+`35000 + slots_per_host*100 + 99`. It is computed from the same two functions
+that place each band rather than restated as a formula: a firewall range and a
+DNAT range that disagree fail as "the connection hangs", which is unreadable.
+Disjoint by construction, so two slots publishing the
 "same" service never collide — the collision that
 [`setup_slot_netns`](../modules/ci-runner-host-pool/scripts/host-startup.sh)
 was written for in the first place. The number of bands follows
@@ -425,7 +431,7 @@ than to an interface pair:
 ```
 FORWARD -m conntrack --ctstate DNAT \
         --ctorigdst <host primary address> \
-        --ctorigdstport 35000:35000+slots_per_host*100-1  -j ACCEPT
+        --ctorigdstport <band span>                       -j ACCEPT
 FORWARD -m conntrack --ctstate ESTABLISHED,RELATED        -j ACCEPT
 ```
 
@@ -463,11 +469,11 @@ symmetrical**, because GCP's two directions do not offer the same controls:
 ```
 INGRESS  source_tags        = [ci-shared-infra-<pool>]
          target_tags        = [ci-shared-infra-<pool>]
-         tcp: 35000 .. 35000 + slots_per_host*100 - 1
+         tcp: <band span>
 
 EGRESS   target_tags        = [ci-shared-infra-<pool>] # the SOURCE VMs
          destination_ranges = [the pool subnet's CIDR] # ranges only
-         tcp: 35000 .. 35000 + slots_per_host*100 - 1
+         tcp: <band span>
 ```
 
 **A dedicated tag, not `network_tags`.** Both rules select VMs by tag, and a
