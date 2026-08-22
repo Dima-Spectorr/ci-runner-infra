@@ -1,0 +1,298 @@
+# One host per workflow run, one infrastructure stack on it — published contract
+
+This is the contract consuming repositories adopt. The decision behind it, with
+the measurements and the rejected alternatives, is
+[`adr-pr-host-affinity.md`](adr-pr-host-affinity.md). The enforcement is
+`RUNNER9`/`RUNNER10`/`RUNNER11` in `scripts/ci/check-runner-policy.sh`
+([`ci-workflow-gates.md`](ci-workflow-gates.md)).
+
+Adopt it **after** [`ci-lane-model.md`](ci-lane-model.md). The lane rule decides
+how much CI a diff deserves; this decides where that CI runs. A repository that
+pins jobs to a host before it has an aggregate required check has pinned the
+wrong set of jobs.
+
+---
+
+## The three rules
+
+1. **One pull request's self-hosted work runs on one host.** A pull request that
+   also needs the Windows pool uses two: one Linux host, one Windows host.
+2. **Infrastructure — database, broker, cache — is brought up once per pull
+   request**, by one job, and shared by every test and every container in it.
+3. **A Windows job reaches that stack over the VPC**, at the Linux host's
+   address. There is no container runtime on a Windows host and this contract
+   does not add one.
+
+### The unit is a workflow run, and that is a precondition, not a detail
+
+`needs:` and job outputs do not cross workflow runs. Two workflows triggered by
+the same `pull_request` event cannot read each other's anchor, so they cannot
+agree on a host without a lease store — and a lease store is the thing this
+design exists to avoid ([`adr-pr-host-affinity.md`](adr-pr-host-affinity.md)
+§2.2).
+
+So the enforceable unit is **one workflow run**. "One host per pull request" is
+true exactly when a repository's `pull_request` CI is one workflow, which the
+lane model already pushes it toward. **Consolidate first.** A repository that
+adopts this with three parallel `pull_request` workflows gets three hosts and
+three stacks, and the contract will have made nothing better.
+
+---
+
+## 1. The anchor job
+
+There is no API call and no lease. The first fleet job runs **unpinned**, and
+whichever host it lands on becomes this workflow run's host. It reports that
+host from its own environment, and every later job pins to it.
+
+```yaml
+  anchor:
+    name: Host anchor
+    needs: lane
+    if: needs.lane.outputs.lane != 'none'
+    runs-on: [self-hosted, linux, gcp, '<Repo>']   # deliberately unpinned
+    timeout-minutes: 10
+    outputs:
+      # A JSON ARRAY, consumed with fromJSON — see "Why an array" below.
+      runs-on: ${{ steps.anchor.outputs.runs-on }}
+      host: ${{ steps.anchor.outputs.host }}
+    steps:
+      - id: anchor
+        run: |
+          set -euo pipefail
+          # Set by the host at boot, alongside CI_SHARED_INFRA_*. Absent means
+          # the host predates this contract — degrade, do not fail.
+          if [ -z "${CI_HOST_LABEL:-}" ]; then
+            echo 'runs-on=["self-hosted","linux","gcp","<Repo>"]' >> "$GITHUB_OUTPUT"
+            echo "host=" >> "$GITHUB_OUTPUT"
+            echo "::notice::host predates the affinity contract — running unpinned"
+            exit 0
+          fi
+          printf 'runs-on=["self-hosted","linux","gcp","<Repo>","%s"]\n' \
+            "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
+          printf 'host=%s\n' "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
+```
+
+**Why an anchor and not a runner-list lookup.** Reading the runner list is
+repository administration, and `administration` is not a job-level `permissions:`
+key — `GITHUB_TOKEN` cannot be granted it at all. A design that depended on it
+was not adoptable, only plausible. The anchor needs no token and no permission.
+It also answers a question the API cannot: the host it names is demonstrably
+**alive and busy right now**, because a job of yours is running on it.
+
+**Why this closes the drain window.** The pin hold (§6) is written by the anchor
+job itself, on the host, before any pinned job exists. A design that discovers
+the host out-of-band leaves a gap between picking a host and running anything on
+it, and a host can drain inside that gap.
+
+**Why an array.** Appending an empty label to a literal list yields
+`[self-hosted, linux, gcp, <Repo>, ""]`, and an empty label matches no runner —
+turning a degraded run into a queue-until-cancelled hang. The anchor emits the
+whole array so "unpinned" is a shorter array, not a blank element.
+
+**Make the anchor do real work.** The anchor occupies a slot, so a repository
+with shared infrastructure should make its **infra owner job the anchor** (§3)
+rather than paying for a job that only echoes a variable.
+
+## 2. Consuming the anchor
+
+```yaml
+  test:
+    needs: [lane, anchor]
+    if: needs.lane.outputs.lane != 'none'
+    runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+```
+
+Every fleet-reachable Linux job in a `pull_request` workflow does this, except
+the anchor itself. `RUNNER9` checks it.
+
+This is dynamic runner selection, which `RUNNER5` reports as UNDECIDED, so the
+gate is run with `--allow-dynamic-runner` once this contract is adopted.
+`RUNNER9` supplies the specificity that flag gives up: not merely an expression,
+but one naming the anchor job's output.
+
+## 3. The infrastructure owner job
+
+Exactly one job in the workflow brings the stack up, and it is the anchor.
+`RUNNER10` fails a second owner.
+
+```yaml
+  anchor:
+    name: Shared infra (anchor)
+    needs: lane
+    if: needs.lane.outputs.lane != 'none'
+    # ci: shared-infra-owner    <- the marker RUNNER10 counts
+    runs-on: [self-hosted, linux, gcp, '<Repo>']
+    timeout-minutes: 15
+    outputs:
+      runs-on: ${{ steps.up.outputs.runs-on }}
+      addr: ${{ steps.up.outputs.addr }}
+      pg: ${{ steps.up.outputs.pg }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - id: up
+        run: |
+          set -euo pipefail
+          # The band is the slot's, set by the host at boot. A port outside it
+          # resolves on this slot's own loopback and NOWHERE else — which fails
+          # later, in the Windows job, as "connection refused" with nothing
+          # nearby to read. So assert it here, where the message can be useful.
+          : "${CI_SHARED_INFRA_ADDR:?host is too old for this contract — needs the port-band boot}"
+          pg=$(( CI_SHARED_INFRA_PORT_MIN + 0 ))
+          [ "$pg" -le "$CI_SHARED_INFRA_PORT_MAX" ] || { echo "band exhausted"; exit 1; }
+
+          # Project name per pull request: two stacks for one pull request (two
+          # workflows, or a re-run) are then two complete stacks rather than one
+          # half-initialised shared one.
+          export COMPOSE_PROJECT_NAME="pr-${{ github.event.pull_request.number }}"
+          PG_PORT="$pg" docker compose -f ci/compose.yaml up -d --wait
+
+          # Migrate and seed ONCE. This is the line the whole contract exists
+          # for: it used to run in every job that needed a database.
+          ./scripts/db-migrate.sh "postgres://ci@127.0.0.1:${pg}/app"
+
+          printf 'runs-on=["self-hosted","linux","gcp","<Repo>","%s"]\n' \
+            "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
+          echo "addr=${CI_SHARED_INFRA_ADDR}" >> "$GITHUB_OUTPUT"
+          echo "pg=${pg}"                     >> "$GITHUB_OUTPUT"
+```
+
+### Teardown is the host's job, not a workflow's
+
+**Do not write a teardown job.** A consuming job runs as a different uid on a
+different slot; the owner's rootless daemon socket lives in a mode-0700
+`/run/ci-s<i>` it cannot open. A teardown step in the last consuming job cannot
+reach the stack it is trying to remove, and an `if: always()` step that silently
+fails is worse than none.
+
+The stack is reclaimed **host-side**, by the owner slot's own between-jobs
+cleanup and by a band TTL sweep — the same slot, the same uid, the only context
+that can talk to that daemon. A stack outliving its workflow run holds its band
+until the sweep, and no longer.
+
+### What replaces `services:`
+
+`services:` is per-job by construction: the agent creates the containers at
+"Initialize containers" and destroys them when the job ends. There is no variant
+of it that is shared. A repository adopting this contract declares its
+infrastructure in `ci/compose.yaml` and brings it up in the owner job.
+
+`services:` on a **Windows** pool label was already refused by `RUNNER8`, and for
+a harder reason: the pool has no container runtime at all.
+
+## 4. Consuming the stack
+
+**From another Linux slot on the same host** — the sibling slot has its own
+network namespace, so `127.0.0.1` is the wrong address there:
+
+```yaml
+  integration:
+    needs: [anchor]
+    runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: postgres://ci@${{ needs.anchor.outputs.addr }}:${{ needs.anchor.outputs.pg }}/app
+```
+
+**From the Windows host** — identical, which is the point:
+
+```yaml
+  package:
+    needs: [anchor]
+    runs-on: [self-hosted, windows, gcp, '<Repo>']
+    timeout-minutes: 45
+    env:
+      DATABASE_URL: postgres://ci@${{ needs.anchor.outputs.addr }}:${{ needs.anchor.outputs.pg }}/app
+```
+
+`localhost` and `127.0.0.1` in a Windows fleet job are refused by `RUNNER11`.
+Not style: the Linux snippet is correct on Linux and there is nothing listening
+on the Windows host's loopback, so the copy-paste fails as a connection timeout
+inside a 45-minute packaging job.
+
+**The Windows job is the only reason a pull request holds two hosts.** A
+repository with no Windows pool has one host per workflow run, full stop.
+
+**More than one Windows job costs more than one Windows host.** `slots_per_host`
+is 1 on that pool, so two unpinned Windows jobs land on two machines. Pinning
+them to one host — by having a Windows anchor of their own — serializes them
+instead. The pool exists for a single packaging build, so neither answer is
+wrong and the contract does not choose for you: `RUNNER9` covers Linux jobs and
+does not require a Windows anchor. Decide explicitly and say so in the workflow.
+
+### Sharing a stack safely
+
+One Postgres serving six suites can race in ways six private ones cannot, and
+the failure reads as flake. The contract is a schema or a database per suite
+inside the one server — created by the suite, dropped by it. No gate can check
+this; it is the obligation that comes with the saving.
+
+## 5. What the host provides
+
+Set by the boot script in every Linux slot's environment:
+
+| variable | meaning |
+|---|---|
+| `CI_HOST_LABEL` | this host's affinity label, `host-<instance-name>` — what the anchor publishes |
+| `CI_SHARED_INFRA_ADDR` | the host's primary VPC address — what siblings and the Windows host connect to |
+| `CI_SHARED_INFRA_PORT_MIN` | first host port DNAT'd into this slot |
+| `CI_SHARED_INFRA_PORT_MAX` | last one; the band is 100 ports and disjoint per slot |
+
+A host that does not set them is older than this contract. The anchor degrades
+to unpinned on a missing `CI_HOST_LABEL`; the owner job fails on a missing
+`CI_SHARED_INFRA_ADDR` (`:?` above) rather than defaulting to `127.0.0.1`, which
+works in the owner job and fails everywhere else.
+
+Ports outside the band are **not** DNAT'd and are not a bug — the band is what
+the pool's firewall rule permits between hosts, and a wider one would be a wider
+rule.
+
+## 6. What the pool does for you
+
+You do not configure any of this; it is stated so the behaviour is not a
+surprise.
+
+- **The anchor job writes a pin hold on its host**, naming the workflow run and
+  an expiry. The controller will not drain *or cordon-for-recycle* a host under
+  an unexpired hold, so the host that answered the anchor is still there when the
+  pinned jobs arrive.
+- **A pinned job does not ask the autoscaler for a new host.** It cannot use
+  one — only the named host can serve it. The controller recognises the affinity
+  label, keeps the pinned job out of scale-out demand, and still counts its host
+  as busy. Genuine scale-out demand still comes from anchors, which are
+  unpinned.
+
+## 7. Adoption order
+
+1. The aggregate required check and the lane model — [`ci-lane-model.md`](ci-lane-model.md).
+2. **Consolidate `pull_request` CI into one workflow.** Without this, everything
+   below is per-workflow and the pull request still holds several hosts.
+3. The anchor job, with every other fleet Linux job consuming it. Merge this
+   alone and confirm the pull request still runs when the pool is cold.
+4. Move `services:` into `ci/compose.yaml` and make the anchor the owner.
+5. Point the Windows job at the outputs.
+6. Turn the gate on: add `--allow-dynamic-runner --pr-affinity` to the
+   `check-runner-policy.sh` invocation.
+
+Step 6 last, deliberately. The rules are opt-in by flag so that a repository
+mid-adoption is not a repository with a red gate teaching its readers to
+disable it.
+
+## 8. What a consuming repository must not do
+
+- **Do not vendor the anchor job's logic and then edit it.** Nine divergent
+  copies of the pool module is the mistake this repository exists to undo.
+- **Do not pin the anchor.** It is the job that discovers the host; pinning it
+  to a host that may not exist is the deadlock this design removes.
+- **Do not use a PAT to read the runner list.** The anchor makes the API
+  unnecessary; a fleet-wide token in a repository that runs pull-request code is
+  a worse trade than any scheduling gain.
+- **Do not write a teardown job.** See §3 — it cannot reach the daemon it
+  targets.
+- **Do not publish outside your slot's band.** It works in the job that does it
+  and in no other job, which is the worst place for a failure to appear.
+- **Do not write `localhost` in a Windows fleet job.** See `RUNNER11`.
+- **Do not add a second `services:` job or a second owner marker "just for this
+  one suite".** That is the per-job database this contract removed, re-entering
+  under a smaller name.

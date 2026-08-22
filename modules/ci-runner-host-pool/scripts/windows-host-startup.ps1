@@ -1081,6 +1081,52 @@ function Test-CacheSeedBudgetExpired {
     return ($ElapsedSeconds -ge $BudgetSeconds)
 }
 
+function Get-CacheSeedSecondsLeft {
+    <#
+      .SYNOPSIS
+        Whole seconds left in phase 7's budget. Never negative. Pure.
+      .DESCRIPTION
+        This is what bounds a single native call. Test-CacheSeedBudgetExpired
+        answers "may another copy start", which is only ever asked BETWEEN calls;
+        a call already running is answerable by nothing, so each one is given the
+        time that is left and killed when it is gone. The floor is 0 rather than
+        a small positive number on purpose: a call given 0 seconds is not started
+        at all, which is the correct behaviour once the budget is spent.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][double] $ElapsedSeconds,
+        [Parameter(Mandatory = $true)][double] $BudgetSeconds
+    )
+    $left = [int] [math]::Floor($BudgetSeconds - $ElapsedSeconds)
+    if ($left -lt 0) { return 0 }
+    return $left
+}
+
+function Format-NativeErrorText {
+    <#
+      .SYNOPSIS
+        One log-safe line out of a native command's stderr. Pure.
+      .DESCRIPTION
+        Control characters folded to spaces and the result capped, for the reason
+        the master scan caps $scanErrors: this text comes from a tool reporting on
+        a tree job code could have written, so it is attacker-influenced input on
+        its way into the boot log, and a boot log is read with the eye rather than
+        with a parser. The first non-empty line is the one that names the cause;
+        the rest of an icacls or robocopy failure is per-file repetition.
+    #>
+    [CmdletBinding()]
+    param([string] $Text)
+    if (-not $Text) { return '' }
+    foreach ($line in ($Text -split "`r?`n")) {
+        $clean = ($line -replace '[\x00-\x1f]', ' ').Trim()
+        if (-not $clean) { continue }
+        if ($clean.Length -gt 300) { $clean = $clean.Substring(0, 300) }
+        return $clean
+    }
+    return ''
+}
+
 function Test-CacheSeedAffordable {
     <#
       .SYNOPSIS
@@ -2650,6 +2696,105 @@ function Invoke-Phase1SlotSetup {
 # $ErrorActionPreference = 'Stop', so an unexpected throw anywhere in here would
 # take the boot down -- which is exactly the trade this phase exists not to make.
 
+function Invoke-BoundedNative {
+    <#
+      .SYNOPSIS
+        Run a native executable under a wall-clock bound. Returns a result with
+        .ExitCode (-1 when it was killed or could not be started) and .Error.
+      .DESCRIPTION
+        THE CALL OPERATOR CANNOT BE ASKED TO GIVE UP
+
+        An `icacls ... /T` or a `robocopy` run through the call operator blocks
+        until the child exits, and once it is running there is no timeout to
+        consult and no handle to wait on with one. Phase 7's budget is re-read BETWEEN copies, so it
+        bounds a cache that is LARGE and nothing else: one call that wedges -- a
+        filter driver, an AV scanner, a handle nobody releases -- still holds the
+        boot open indefinitely. All of it happens before phase 5 registers an
+        agent, and past the 1,200s registration grace drain_decision.sh reads an
+        agent-less host as never registered, so the replacement is built from the
+        same image and the pool rebuilds hosts forever over one stuck call.
+
+        Start-Process -PassThru hands back a Process, and a Process CAN be waited
+        on with a deadline and killed. That is the whole reason this exists.
+
+        It also retires the $ErrorActionPreference dance every one of these call
+        sites carried: under `Stop`, `2>&1` on a native command turns each stderr
+        line into a terminating NativeCommandError, and icacls writes a per-file
+        line there on a tree of any size. Start-Process does not merge the child's
+        streams into the pipeline at all -- they go to files, which are read only
+        when the call failed, and the first line of that file is the thing a
+        reader of the boot log actually wants.
+
+        -1 for both failures to launch and for a kill, because every caller has to
+        refuse on both and both existing checks already read -1 as failure:
+        `$exit -ne 0` for icacls, and Test-RobocopySuccess, which rejects a
+        negative code precisely because a killed robocopy exits with one. .NET's
+        Kill() terminates the child with -1, so this names what the child would
+        have reported anyway rather than inventing a sentinel.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $FilePath,
+        [Parameter(Mandatory = $true)][string[]] $ArgumentList,
+        [Parameter(Mandatory = $true)][int] $TimeoutSeconds,
+        [Parameter(Mandatory = $true)][string] $What
+    )
+
+    # A bound of zero or less reads as ALREADY OVER, never as unbounded -- the
+    # same reading Test-CacheSeedBudgetExpired takes, for the same reason.
+    if ($TimeoutSeconds -le 0) {
+        return [pscustomobject] @{ ExitCode = -1; Error = "no time left in the phase 7 budget to run $What" }
+    }
+
+    # The arguments are passed as a list and NOT quoted. Every path that reaches
+    # here is one this file owns -- C:\ci-cache and the staging names built under
+    # C:\ci\cache -- so none of them contains a space, and quoting them would be
+    # actively wrong for robocopy, which reads a trailing backslash before a quote
+    # as an escape and swallows the closing one.
+    $out = [System.IO.Path]::GetTempFileName()
+    $err = [System.IO.Path]::GetTempFileName()
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -NoNewWindow `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+        if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+            # The short second wait is so the exit code and the handles are
+            # settled before the finally block disposes it. Neither call can
+            # change the verdict -- the call is refused either way -- but a
+            # child that exited on its own between the deadline and the Kill(),
+            # and one this process is not allowed to signal, both throw here and
+            # they are not the same fact, so the log says which.
+            $fate = 'was killed'
+            try {
+                $proc.Kill()
+                [void] $proc.WaitForExit(5000)
+            } catch {
+                $fate = "could not be killed: $($_.Exception.Message)"
+            }
+            return [pscustomobject] @{
+                ExitCode = -1
+                Error    = "$What did not finish within $TimeoutSeconds" + "s and $fate"
+            }
+        }
+        # The no-argument wait after the bounded one is not redundant: the timed
+        # overload can return once the process object sees the exit while the
+        # redirected streams are still being drained, and ExitCode is only settled
+        # after the full wait.
+        $proc.WaitForExit()
+        $text = ''
+        if ($proc.ExitCode -ne 0) {
+            $text = Format-NativeErrorText -Text ([string] (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue))
+        }
+        return [pscustomobject] @{ ExitCode = $proc.ExitCode; Error = $text }
+    } catch {
+        return [pscustomobject] @{ ExitCode = -1; Error = "$What could not be started: $($_.Exception.Message)" }
+    } finally {
+        if ($proc) { $proc.Dispose() }
+        Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $err -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-CacheHydrateBound {
     <#
       .SYNOPSIS
@@ -3053,6 +3198,7 @@ function Protect-CacheMaster {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string[]] $SlotUsers,
+        [datetime] $StartedUtc = [datetime]::UtcNow,
         [string] $Master = $script:CacheMaster
     )
 
@@ -3085,6 +3231,17 @@ function Protect-CacheMaster {
     # which way this fails: it fails the CACHE, not the BOOT -- the host still
     # registers and its jobs run cold, exactly as every other phase-7 refusal
     # does. Fail-closed on the gate is not fail-closed on the host.
+    # AND IT IS NOT BOUNDED, DELIBERATELY. The three native calls below run in
+    # child processes, and a child process can be killed; this enumeration runs on
+    # this thread, inside the filesystem. Windows PowerShell 5.1 offers no way to
+    # abandon it -- a runspace with a deadline moves the block to another thread
+    # without releasing it, and the host process does not exit while that thread
+    # holds an open directory handle, so the "bound" would only change which
+    # thread the boot is stuck on. It is also a different failure: the three calls
+    # can wedge on a filter driver, an AV scanner or a handle another process
+    # holds, whereas this reads a local NTFS tree the IMAGE built, and a volume
+    # that cannot be enumerated is a host on which nothing else makes progress
+    # either. Recorded rather than fixed (#239 item 4).
     $scanErrors = @()
     $entries = @($root) + @(Get-ChildItem -LiteralPath $Master -Recurse -Force `
             -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
@@ -3103,10 +3260,6 @@ function Protect-CacheMaster {
         return $false
     }
 
-    # The preference is dropped around the native call for the reason given in
-    # Install-BeaconService: under Stop, `2>&1` on a native command turns each
-    # stderr line into a terminating NativeCommandError, and icacls writes a
-    # per-file progress line there on a tree of any size.
     # OWNERSHIP FIRST, BECAUSE A DACL IS NOT A LIMIT ON THE OWNER
     #
     # Neither /reset nor the grant below changes who OWNS an entry, and Windows
@@ -3121,21 +3274,36 @@ function Protect-CacheMaster {
     # It runs after the scan for the same reason the reset does: /T follows a
     # junction, and an ownership change applied to the wrong tree outlives the
     # boot that applied it.
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    & icacls.exe $Master '/setowner' '*S-1-5-32-544' '/T' '/Q' 2>&1 | Out-Null
-    $ownerExit = $LASTEXITCODE
-    & icacls.exe $Master '/reset' '/T' '/Q' 2>&1 | Out-Null
-    $exit = $LASTEXITCODE
-    $ErrorActionPreference = $previous
-    if ($ownerExit -ne 0) {
-        Write-BootLog ("phase 7: icacls could not take ownership of $Master (exit $ownerExit) -- " +
+    # BOTH WALKS ARE BOUNDED, and by what is LEFT of phase 7's budget rather than
+    # by a constant: two /T walks over the same tree plus one robocopy per tool
+    # per slot share one deadline, so giving each call the remainder is what keeps
+    # the phase as a whole inside it. See Invoke-BoundedNative for why the call
+    # operator could not be asked to give up, and for where the
+    # $ErrorActionPreference dance that used to wrap these two lines went.
+    $left = Get-CacheSeedSecondsLeft -ElapsedSeconds (([datetime]::UtcNow - $StartedUtc).TotalSeconds) `
+        -BudgetSeconds $script:CacheSeedBudgetSeconds
+    $owner = Invoke-BoundedNative -FilePath 'icacls.exe' -TimeoutSeconds $left `
+        -ArgumentList @($Master, '/setowner', '*S-1-5-32-544', '/T', '/Q') `
+        -What "icacls /setowner on $Master"
+    if ($owner.ExitCode -ne 0) {
+        $detail = ''
+        if ($owner.Error) { $detail = ": $($owner.Error)" }
+        Write-BootLog ("phase 7: icacls could not take ownership of $Master " +
+            "(exit $($owner.ExitCode)$detail) -- " +
             'an entry a slot still owns is an entry that slot can re-grant itself, so nothing ' +
             'is seeded from this tree; cold cache')
         return $false
     }
-    if ($exit -ne 0) {
-        Write-BootLog ("phase 7: icacls could not reset the ACLs under $Master (exit $exit) -- " +
+    $left = Get-CacheSeedSecondsLeft -ElapsedSeconds (([datetime]::UtcNow - $StartedUtc).TotalSeconds) `
+        -BudgetSeconds $script:CacheSeedBudgetSeconds
+    $reset = Invoke-BoundedNative -FilePath 'icacls.exe' -TimeoutSeconds $left `
+        -ArgumentList @($Master, '/reset', '/T', '/Q') `
+        -What "icacls /reset on $Master"
+    if ($reset.ExitCode -ne 0) {
+        $detail = ''
+        if ($reset.Error) { $detail = ": $($reset.Error)" }
+        Write-BootLog ("phase 7: icacls could not reset the ACLs under $Master " +
+            "(exit $($reset.ExitCode)$detail) -- " +
             'refusing to seed from a tree whose permissions are not proven; cold cache')
         return $false
     }
@@ -3731,12 +3899,19 @@ function Initialize-SlotCache {
             # Protect-CacheMaster already refuses the whole master over one, so
             # this is the second line of the same defence, and it is cheap: without
             # it robocopy descends into a junction and copies what it names.
-            $previous = $ErrorActionPreference
-            $ErrorActionPreference = 'Continue'
-            & robocopy.exe $src $stage '/E' '/COPY:DAT' '/XJ' '/R:1' '/W:1' `
-                '/NFL' '/NDL' '/NJH' '/NJS' '/NP' 2>&1 | Out-Null
-            $exit = $LASTEXITCODE
-            $ErrorActionPreference = $previous
+            # Bounded by what is left of the budget, for the reason given in
+            # Invoke-BoundedNative: the check above this loop is only asked
+            # BETWEEN copies, and one copy that wedges is a host that never
+            # registers. A killed robocopy reports -1, which Test-RobocopySuccess
+            # already rejects -- that rejection was written for a crashed one and
+            # covers this for the same reason.
+            $left = Get-CacheSeedSecondsLeft -ElapsedSeconds (([datetime]::UtcNow - $StartedUtc).TotalSeconds) `
+                -BudgetSeconds $script:CacheSeedBudgetSeconds
+            $copy = Invoke-BoundedNative -FilePath 'robocopy.exe' -TimeoutSeconds $left `
+                -ArgumentList @($src, $stage, '/E', '/COPY:DAT', '/XJ', '/R:1', '/W:1',
+                    '/NFL', '/NDL', '/NJH', '/NJS', '/NP') `
+                -What "robocopy $tool into slot $Index"
+            $exit = $copy.ExitCode
 
             if (Test-RobocopySuccess -ExitCode $exit) {
                 # Renamed into place rather than copied into place, because the
@@ -3747,7 +3922,9 @@ function Initialize-SlotCache {
                 # is correct) or is complete.
                 Move-Item -LiteralPath $stage -Destination $final
             } else {
-                Write-BootLog "phase 7: slot $Index -- robocopy $tool exited $exit, that cache stays cold"
+                $detail = ''
+                if ($copy.Error) { $detail = " -- $($copy.Error)" }
+                Write-BootLog "phase 7: slot $Index -- robocopy $tool exited $exit$detail, that cache stays cold"
                 Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
@@ -3793,7 +3970,7 @@ function Invoke-Phase7DependencyCache {
         $null = Invoke-CacheHydrate
 
         $slotUsers = @($Provisioned | ForEach-Object { $_.User })
-        if (-not (Protect-CacheMaster -SlotUsers $slotUsers)) { return $paths }
+        if (-not (Protect-CacheMaster -SlotUsers $slotUsers -StartedUtc $startedUtc)) { return $paths }
 
         New-Item -ItemType Directory -Force -Path $script:CacheSlots | Out-Null
         Protect-CiDirectory -Path $script:CacheSlots

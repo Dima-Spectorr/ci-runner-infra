@@ -1699,7 +1699,7 @@ has_cache_master_sealed_readonly() { # <file>
   # earlier in the file than the reset.
   local scan_at seal_at
   scan_at=$(printf '%s\n' "$code" | grep -nE 'Get-CacheHostileReason -Entries \$entries' | head -1 | cut -d: -f1)
-  seal_at=$(printf '%s\n' "$code" | grep -nE 'icacls\.exe \$Master' | head -1 | cut -d: -f1)
+  seal_at=$(printf '%s\n' "$code" | grep -nE "FilePath 'icacls\\.exe'" | head -1 | cut -d: -f1)
   [ -n "$scan_at" ] && [ -n "$seal_at" ] || return 1
   [ "$scan_at" -lt "$seal_at" ] || return 1
 
@@ -1709,11 +1709,14 @@ has_cache_master_sealed_readonly() { # <file>
   # either, so neutering this one would leave the assertion green.
   matches "$code" '^    if \(\$reason\) \{$' || return 1
 
-  # `/C` makes icacls continue past per-file errors AND still exit 0, which turns
-  # "half the tree kept its inherited ACE" into a silent success.
-  ! matches "$code" "icacls\.exe \\\$Master.*'/C'" || return 1
+  # BOTH ARGUMENT LISTS IN FULL, which is how `/C` stays out. `/C` makes icacls
+  # continue past per-file errors AND still exit 0, turning "half the tree kept
+  # its inherited ACE" into a silent success -- and a list asserted element by
+  # element cannot have one inserted into it.
+  matches "$code" "-ArgumentList @\\(\\\$Master, '/setowner', '\\*S-1-5-32-544', '/T', '/Q'\\)" || return 1
+  matches "$code" "-ArgumentList @\\(\\\$Master, '/reset', '/T', '/Q'\\)" || return 1
   # And the exit code is checked at all.
-  matches "$code" 'if \(\$exit -ne 0\)' || return 1
+  matches "$code" 'if \(\$reset\.ExitCode -ne 0\)' || return 1
 
   # The root itself is scanned, not only its children: a master that IS a junction
   # is the case where everything below it already belongs to another tree.
@@ -1732,8 +1735,44 @@ has_cache_master_sealed_readonly() { # <file>
   # satisfied by a GROUP sid in the token. A master left owned by BUILTIN\Users
   # is therefore a master every slot can re-grant itself write on, whatever the
   # seal below says -- so ownership is taken, and a failure to take it refuses.
-  matches "$code" "icacls\.exe \\\$Master '/setowner'" || return 1
-  matches "$code" 'if \(\$ownerExit -ne 0\)' || return 1
+  matches "$code" 'if \(\$owner\.ExitCode -ne 0\)' || return 1
+}
+
+has_bounded_native_calls() { # <file>
+  local code count
+  code=$(code_of "$1")
+
+  # THE BUDGET IS RE-READ BETWEEN COPIES, WHICH BOUNDS A CACHE THAT IS LARGE AND
+  # NOTHING ELSE. Between two of those reads the phase sits inside a native call,
+  # and the call operator offers nothing to ask: once the child is running there
+  # is no timeout to consult and no handle to wait on with one. One wedged call is
+  # therefore a host that never registers, all of it before phase 5 -- and past
+  # the registration grace drain_decision.sh reads an agent-less host as never
+  # registered, so the pool rebuilds hosts forever over one stuck icacls.
+  #
+  # So none of the three long calls goes through the call operator any more.
+  ! matches "$code" '& (icacls|robocopy)\.exe' || return 1
+  matches "$code" "Invoke-BoundedNative -FilePath 'icacls\\.exe' -TimeoutSeconds \\\$left" || return 1
+  matches "$code" "Invoke-BoundedNative -FilePath 'robocopy\\.exe' -TimeoutSeconds \\\$left" || return 1
+  # …and all three of them, not two: a call site left behind is the one that
+  # hangs.
+  count=$(printf '%s\n' "$code" | grep -cE 'Invoke-BoundedNative -FilePath')
+  [ "${count:-0}" -eq 3 ] || return 1
+
+  # The wait has a deadline and the deadline is acted on. Without the kill the
+  # wrapper is an ordinary blocking call with extra words.
+  matches "$code" 'WaitForExit\(\$TimeoutSeconds \* 1000\)' || return 1
+  matches "$code" '\$proc\.Kill\(\)' || return 1
+
+  # A bound of zero reads as ALREADY OVER, never as unbounded -- the reading
+  # Test-CacheSeedBudgetExpired takes, for the reason it gives.
+  matches "$code" 'if \(\$TimeoutSeconds -le 0\)' || return 1
+  matches "$code" 'if \(\$left -lt 0\) \{ return 0 \}' || return 1
+
+  # And the seal is measured against the PHASE clock rather than its own: its two
+  # tree walks are the expensive half, and a seal that started its own clock would
+  # hand the copies a budget that had already been spent.
+  matches "$code" 'Protect-CacheMaster -SlotUsers \$slotUsers -StartedUtc \$startedUtc' || return 1
 }
 
 has_slot_cache_isolation() { # <file>
@@ -1845,6 +1884,12 @@ else
   bad "the master dependency cache is not sealed read-only before it is scanned, or a slot can write it — C:\\ci-cache is copied into every slot, so a slot that can write it hands the next job on every other slot code to run, and a seal applied before the reparse-point scan applies that grant to whatever a junction names"
 fi
 
+if has_bounded_native_calls "$SCRIPT"; then
+  ok
+else
+  bad "phase 7 runs a long native call the boot cannot give up on — icacls /T and robocopy block until the child exits, the seeding budget is only read between calls, and every second of it is spent before phase 5 registers an agent, so one wedged call is a host drain_decision.sh reads as never registered and replaces from the same image"
+fi
+
 if has_slot_cache_isolation "$SCRIPT"; then
   ok
 else
@@ -1859,10 +1904,10 @@ mutate "the hostile-content scan computed and never acted on" \
   's|^    if (\$reason) {$|    if ($false) {|' \
   has_cache_master_sealed_readonly
 mutate "icacls given /C, so a half-applied reset still exits 0" \
-  "s|& icacls.exe \\\$Master '/reset'|\& icacls.exe \$Master '/C' '/reset'|" \
+  "s|@(\\\$Master, '/reset'|@(\\\$Master, '/C', '/reset'|" \
   has_cache_master_sealed_readonly
 mutate "the icacls exit code dropped" \
-  's|^    if (\$exit -ne 0) {$|    if ($false) {|' \
+  's|^    if (\$reset.ExitCode -ne 0) {$|    if ($false) {|' \
   has_cache_master_sealed_readonly
 mutate "the root left out of the scan, so a junction as the master is walked into" \
   's|\$entries = @(\$root) + @(Get-ChildItem|$entries = @(Get-ChildItem|' \
@@ -1907,7 +1952,27 @@ mutate "the scan errors discarded, so an unreadable tree reads as an empty one" 
 mutate "the staging directory back to a fixed name a failed cleanup can leave behind"   "s|('\.seed-{0}-{1}' -f \$tool, \[guid\]::NewGuid().ToString('N'))|\".seed-\$tool\"|"   has_slot_cache_isolation
 mutate "a stale staging tree deleted recursively without being scanned first"   's|$staleReason = Get-CacheHostileReason|$staleReason = $null; $null = (|'   has_slot_cache_isolation
 mutate "the master left owned by whoever the warm script left it to"   "s|'/setowner'|'/nothing'|"   has_cache_master_sealed_readonly
-mutate "the ownership exit code dropped, so a slot-owned entry seals green"   's|^    if (\$ownerExit -ne 0) {$|    if ($false) {|'   has_cache_master_sealed_readonly
+mutate "the ownership exit code dropped, so a slot-owned entry seals green"   's|^    if (\$owner.ExitCode -ne 0) {$|    if ($false) {|'   has_cache_master_sealed_readonly
+
+# --- group 24b: a native call phase 7 cannot give up on ----------------------
+mutate "the call operator back, so a wedged child cannot be killed" \
+  's|Invoke-BoundedNative -FilePath|\& icacls.exe #|' \
+  has_bounded_native_calls
+mutate "the wait given no deadline" \
+  's|WaitForExit($TimeoutSeconds \* 1000)|WaitForExit()|' \
+  has_bounded_native_calls
+mutate "the timed-out child left running" \
+  's|^ *\$proc\.Kill()$|                $null = $proc|' \
+  has_bounded_native_calls
+mutate "a spent budget read as unbounded rather than as already over" \
+  's|if ($TimeoutSeconds -le 0) {|if ($false) {|' \
+  has_bounded_native_calls
+mutate "seconds-left allowed to go negative, which reads as unbounded downstream" \
+  's|if ($left -lt 0) { return 0 }|$null = $left|' \
+  has_bounded_native_calls
+mutate "the seal given its own clock, so its two tree walks escape the budget" \
+  's|-SlotUsers $slotUsers -StartedUtc $startedUtc|-SlotUsers $slotUsers|' \
+  has_bounded_native_calls
 mutate "the seeding budget never consulted, so a large image outlasts the registration grace"   's|-ElapsedSeconds \$spent `|-ElapsedSeconds 0 `|'   has_slot_cache_isolation
 mutate "the volume measured once for the host instead of between copies"   's|} elseif ((Get-CacheVolumeFreeByte) -lt \$script:CacheFreeFloorBytes) {|} elseif ($false) {|'   has_slot_cache_isolation
 mutate "the cache variables emitted for a slot that never got a cache" \

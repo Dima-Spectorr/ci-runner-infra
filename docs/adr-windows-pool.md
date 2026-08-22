@@ -3,6 +3,10 @@
 Status: **proposed** (design only; nothing here is implemented).
 Supersedes: the "Windows" section of `docs/onboarding-a-repository.md`, which
 records the current state rather than a decision.
+Amended 2026-08-22: §4's refusal of a container runtime is re-affirmed, and the
+gap it leaves — a Windows job needing a database — is answered by
+[`adr-pr-host-affinity.md`](adr-pr-host-affinity.md) with reachability rather
+than a runtime. Nothing in this document changes.
 Amended 2026-08-22: phase 7, the per-slot dependency cache *and its snapshot hydrate*, is added to
 §3 and closes issue #150; it supersedes the "warm cache" half of what §4 says
 Windows does not get.
@@ -867,9 +871,33 @@ for a related reason: it was measured against a sum of file *lengths*, which
 counts neither allocated size nor the alternate data streams `/COPY:DAT`
 copies, so a master built to understate itself passes the check once and then
 overruns it. Asking the volume again between copies bounds that overrun to a
-single tool directory. What a budget of this shape does **not** bound is one
-native call that hangs rather than runs long; that needs a process-level
-deadline and is tracked separately.
+single tool directory.
+
+**And each of the three long native calls carries the remainder of that budget
+as its own deadline.** A budget re-read *between* copies bounds a cache that is
+**large**; it does not bound one call that **hangs**, and between two reads the
+phase sits inside `icacls /setowner /T`, `icacls /reset /T` or a `robocopy`.
+The call operator offers nothing to ask -- once the child is running there is no
+timeout to consult and no handle to wait on with one -- so all three now go
+through `Invoke-BoundedNative`, which starts the child with
+`Start-Process -PassThru`, waits with `WaitForExit(ms)`, and kills it when the
+deadline passes. A killed child is a **refusal**, not a failure of the boot: the
+cache stays cold and the host registers, which is what every other phase-7
+refusal does. The bound is the *remaining* budget rather than a constant,
+because the three calls share one deadline, and a bound at or below zero means
+the call is not started at all. A killed `robocopy` reports `-1`, which
+`Test-RobocopySuccess` already rejects -- that rejection was written for a
+crashed copy and covers this for the same reason.
+
+The recursive scan of the master is **deliberately not** bounded this way. It
+runs on this thread, inside the filesystem, and Windows PowerShell 5.1 offers no
+way to abandon it: a runspace with a deadline moves the block to another thread
+without releasing it, and the host process does not exit while that thread holds
+an open directory handle, so the "bound" would only change which thread the boot
+is stuck on. It is also a different failure -- the three calls can wedge on a
+filter driver, an AV scanner or a handle another process holds, whereas this
+reads a local NTFS tree the image built, and a volume that cannot be enumerated
+is a host on which nothing else makes progress either.
 
 **Reducing `ci-slots` is the one recursive delete that reaches job-written
 files.** A retired index's tree is swept before the live ones are seeded, and
@@ -1351,6 +1379,14 @@ should be a gate, not a lesson: `scripts/ci/check-runner-policy.sh` gains a rule
 that a job whose `runs-on` names a Windows pool label and which declares
 `container:` or `services:` fails in the consuming repository's own CI, where the
 author can see it.
+
+*Amended 2026-08-22:* that leaves a Windows job needing a database with nowhere
+to get one, and [`adr-pr-host-affinity.md`](adr-pr-host-affinity.md) answers it
+without touching this decision — the pull request's shared stack runs on its
+Linux host, is published into a per-slot host port band, and the Windows job
+connects to it over the VPC. A container runtime for this pool was reconsidered
+as part of that decision and **re-affirmed as refused**: the paragraph above is
+unchanged, and reachability is what was missing, not a runtime.
 
 **The isolation the container boundary provided.** On Linux the sentence "job
 isolation is provided by running each job in a container instead of by destroying

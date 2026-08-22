@@ -1771,6 +1771,57 @@ Describe 'cache seeding budget' {
     }
 }
 
+Describe 'the bound a single native call is given' {
+    # Test-CacheSeedBudgetExpired answers "may another copy start", which is only
+    # ever asked BETWEEN calls. This one answers "how long may THIS call run",
+    # which is the half that was missing: a wedged icacls or robocopy held the
+    # boot open indefinitely, before phase 5 registered anything.
+    It 'gives a call what is left of the budget' {
+        Get-CacheSeedSecondsLeft -ElapsedSeconds 20 -BudgetSeconds 420 | Should -Be 400
+    }
+
+    It 'rounds down rather than up, so the bound never exceeds the budget' {
+        Get-CacheSeedSecondsLeft -ElapsedSeconds 0.4 -BudgetSeconds 420 | Should -Be 419
+    }
+
+    It 'returns 0 at the deadline' {
+        Get-CacheSeedSecondsLeft -ElapsedSeconds 420 -BudgetSeconds 420 | Should -Be 0
+    }
+
+    It 'returns 0 past the deadline rather than a negative number' {
+        # The number goes to Invoke-BoundedNative, which reads anything at or below
+        # zero as ALREADY OVER and does not start the call at all. A negative would
+        # be handed to WaitForExit(ms) as a negative millisecond count -- which .NET
+        # reads as INFINITE -- so a bound that had been exceeded would become no
+        # bound at all, the exact failure this pair of functions exists to stop.
+        Get-CacheSeedSecondsLeft -ElapsedSeconds 900 -BudgetSeconds 420 | Should -Be 0
+    }
+
+    It 'returns 0 for a budget of zero' {
+        Get-CacheSeedSecondsLeft -ElapsedSeconds 0 -BudgetSeconds 0 | Should -Be 0
+    }
+}
+
+Describe 'a native command''s error text on its way into the boot log' {
+    It 'takes the first line that says something' {
+        Format-NativeErrorText -Text "`r`n`r`nAccess is denied.`r`nAccess is denied." |
+            Should -Be 'Access is denied.'
+    }
+
+    It 'folds control characters, which reach it from a path job code chose' {
+        Format-NativeErrorText -Text "bad`tname`u{0001}here" | Should -Be 'bad name here'
+    }
+
+    It 'caps the line, because a boot log is read with the eye' {
+        (Format-NativeErrorText -Text ('x' * 5000)).Length | Should -Be 300
+    }
+
+    It 'gives an empty string for nothing at all' {
+        Format-NativeErrorText -Text '' | Should -Be ''
+        Format-NativeErrorText -Text "`r`n  `r`n" | Should -Be ''
+    }
+}
+
 Describe 'slot cache environment' {
     BeforeAll {
         $script:CacheBlock = Get-SlotCacheEnvironment -CachePath 'C:\ci\cache\2'
