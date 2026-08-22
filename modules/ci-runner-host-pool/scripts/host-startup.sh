@@ -1036,9 +1036,9 @@ case "\${1:-}" in
     run=""; ttl_text=""; reserve=0; slot_to_write=""; expiry_to_write=""
     while [ "\$#" -gt 0 ]; do
       case "\$1" in
-        # `shift 2 || break` accepted a flag with no value and fell through
+        # \`shift 2 || break\` accepted a flag with no value and fell through
         # to the default TTL, or to an empty run id caught much later by the
-        # shape check. A workflow that wrote `--ttl` and forgot the duration got
+        # shape check. A workflow that wrote \`--ttl\` and forgot the duration got
         # a hold it did not ask for, and no diagnostic saying so.
         --run) [ "\$#" -ge 2 ] || { say "refusing: --run needs a value"; exit 1; }; run="\$2"; shift 2 ;;
         --ttl) [ "\$#" -ge 2 ] || { say "refusing: --ttl needs a value"; exit 1; }; ttl_text="\$2"; shift 2 ;;
@@ -1125,7 +1125,7 @@ case "\${1:-}" in
     # binary at all, so the renewal is made by the host's job-started hook,
     # which has no view of a workflow-level env:.
     #
-    # `--run` is how that hook says WHICH run it is renewing for. Without it,
+    # \`--run\` is how that hook says WHICH run it is renewing for. Without it,
     # every job on the host renewed whatever hold it found: once the owning run
     # finished or was cancelled, an unrelated job landing on any slot pushed the
     # expiry forward again, and the stopped slot, the surviving stack and the
@@ -1389,7 +1389,7 @@ fi
 # home and _work, which is where the compose file was, not where the stack is.
 sock="/run/\$u/docker.sock"
 if [ -S "\$sock" ]; then
-  # A FAILED enumeration is not an empty one. `docker ps` timing out or erroring
+  # A FAILED enumeration is not an empty one. \`docker ps\` timing out or erroring
   # left ids empty with the failure dropped, so the removal was skipped, the
   # teardown was called a success, the hold was deleted and the agent came back
   # over a still-live stack -- handing the next job the previous run's daemon.
