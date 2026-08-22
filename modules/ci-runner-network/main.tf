@@ -342,4 +342,21 @@ resource "google_compute_firewall" "shared_infra_egress" {
       metadata = local.firewall_log_metadata
     }
   }
+
+  # A PRECONDITION and not a `variable` validation, because the check needs two
+  # variables at once and a validation condition could not reference a second
+  # variable before Terraform 1.9. This repository supports 1.5, and the module
+  # is loaded by every consumer whether or not it sets `shared_infra_pairs` — so
+  # a cross-variable validation here would not merely reject a bad pair, it
+  # would refuse to load, and every plan in every 1.5-1.8 consumer would fail on
+  # a feature they never turned on.
+  #
+  # The egress name is the longer of the two the pair generates, so checking it
+  # covers the ingress name as well.
+  lifecycle {
+    precondition {
+      condition     = length("${var.name_prefix}-allow-si-eg-${each.key}") <= 63
+      error_message = "name_prefix and the shared_infra_pairs key '${each.key}' together exceed GCP's 63-character resource-name limit for `${var.name_prefix}-allow-si-eg-${each.key}`. Shorten one of them: otherwise the apply reaches the API and fails there, after the plan looked clean."
+    }
+  }
 }

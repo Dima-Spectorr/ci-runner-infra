@@ -182,14 +182,6 @@ variable "shared_infra_pairs" {
 
   validation {
     condition = alltrue([
-      for k in keys(var.shared_infra_pairs) :
-      length("${var.name_prefix}-allow-si-eg-${k}") <= 63
-    ])
-    error_message = "name_prefix and a shared_infra_pairs key together exceed GCP's 63-character resource-name limit for the generated egress rule (`<name_prefix>-allow-si-eg-<key>`, the longer of the two names). Shorten one of them: otherwise the apply reaches the API and fails there, after the plan looked clean."
-  }
-
-  validation {
-    condition = alltrue([
       for v in values(var.shared_infra_pairs) :
       v.slots_per_host >= 1 && v.slots_per_host <= 90 && floor(v.slots_per_host) == v.slots_per_host
     ])

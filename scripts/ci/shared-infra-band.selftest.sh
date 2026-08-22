@@ -198,6 +198,17 @@ else
   bad "shared_infra_pairs is not empty by default — a project that asked for no pair gets new firewall rules"
 fi
 
+# The generated rule NAME is length-checked, and checked where a second variable
+# is legal to read. A `variable` validation cannot reference `var.name_prefix`
+# before Terraform 1.9, and this repository supports 1.5 — written there it
+# would refuse to LOAD the module for every 1.5-1.8 consumer, including the ones
+# that never set a pair.
+if grep -qE 'condition += +length\("\$\{var\.name_prefix\}-allow-si-eg-\$\{each\.key\}"\) <= 63' "$NET_TF"; then
+  ok "the rule name's 63-character limit is checked at plan time"
+else
+  bad "the generated egress rule's name is not length-checked in the resource — either the check is gone, or it moved back into a variable validation where a 1.5 consumer cannot load it"
+fi
+
 # --- mutations ----------------------------------------------------------------
 #
 # Every assertion above is a grep or a comparison, and both fail open in the
@@ -241,9 +252,14 @@ mutate "ingress targets the source tag"      net  's/target_tags *= *\[each.valu
 mutate "ingress sources the stack tag"       net  's/source_tags *= *\[each.value.source_tag\]/source_tags = [each.value.stack_tag]/'
 mutate "ports written as a literal span"     net  's/ports *= *\[each.value.band_span\]/ports = ["35100-35499"]/'
 mutate "egress left un-keyed"                net  '/shared_infra_egress/,$ s/for_each = local.shared_infra$/count = 1/'
+# `${k}` is sed pattern text, not a shell expansion -- the single quotes are
+# the point.
+# shellcheck disable=SC2016
 mutate "source tag no longer built from key" net  's/source_tag = "ci-shared-infra-\${k}"/source_tag = "ci-shared-infra"/'
+# shellcheck disable=SC2016
 mutate "stack tag no longer built from key"  net  's/stack_tag  = "ci-shared-infra-stack-\${k}"/stack_tag  = "ci-shared-infra-stack"/'
 mutate "pairs default to a populated map"    vars 's/^  default = {}$/  default = { demo = { slots_per_host = 4 } }/'
+mutate "the name-length precondition removed"  net  '/precondition {/,/^    }$/d'
 mutate "stack tag no longer gated on linux"  pool 's/var.host_os == "linux" ? /true ? /'
 
 if [ "$fail" -eq 0 ]; then
