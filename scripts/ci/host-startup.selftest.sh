@@ -310,7 +310,18 @@ has_slot_reset() { # <file>
   # reaches ..name as well as .name — either one left behind is an entry that
   # survives every reset while the slot is still recorded clean
   matches "$code" '\[ -e "\\\$e" \] \|\| \[ -L "\\\$e" \] \|\| continue' || return 1
-  matches "$code" '"\\\$work"/\.\[!\.\]\* "\\\$work"/\.\.\?\*' || return 1
+  matches "$code" '"\\\$held"/\.\[!\.\]\* "\\\$held"/\.\.\?\*' || return 1
+  # root never walks a name the slot can swap. _work is renamed into a root-owned
+  # 0700 holding directory for the duration and renamed back at the end, and a
+  # _work that is already a symlink is refused rather than followed.
+  matches "$code" 'held="\\\$SLOT_ROOT/\.reset/\\\$idx/_work"' || return 1
+  matches "$code" 'if \[ -L "\\\$work" \]' || return 1
+  matches "$code" 'mv -T -- "\\\$work" "\\\$held"' || return 1
+  matches "$code" 'mv -T -- "\\\$held" "\\\$work"' || return 1
+  matches "$code" 'install -d -o root -g root -m 0700 "\$SLOT_ROOT/\.reset/\$idx"' || return 1
+  # and the boot reset in provision_slot_user does not run under an agent that a
+  # warm reboot already brought up — that unit ran its own boot reset
+  matches "$code" 'systemctl is-active --quiet "ci-runner@\$idx\.service"' || return 1
   # and the workspace the runner already prepared for the STARTING job is
   # emptied, not unlinked — a plain `run:` step chdirs into it
   matches "$code" 'install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"' || return 1
@@ -637,7 +648,12 @@ mutate "prepared workspace unlinked"      's@install -d -o "\\\$u" -g "\\\$u" -m
 mutate "credentials kept across the boundary" 's@_temp) \[ "\\\$keep_temp" = 1 \] && continue ;;@_temp) continue ;;@'  has_slot_reset
 mutate "_temp wiped under the starting job" 's@\[ "\\\$stage" = started \] && keep_temp=1@keep_temp=0@'                    has_slot_reset
 mutate "dangling symlink survives the reset" 's@\[ -e "\\\$e" \] || \[ -L "\\\$e" \] || continue@[ -e "\\\$e" ] || continue@' has_slot_reset
-mutate "double-dot names never enumerated" 's@ "\\\$work"/\.\.?\*@@'                                                has_slot_reset
+mutate "double-dot names never enumerated" 's@ "\\\$held"/\.\.?\*@@'                                                has_slot_reset
+mutate "root walks a name the slot can swap" 's@mv -T -- "\\\$work" "\\\$held"@true@'                              has_slot_reset
+mutate "a symlinked work folder followed" 's@if \[ -L "\\\$work" \]@if false@'                                            has_slot_reset
+mutate "the workspace never handed back" 's@mv -T -- "\\\$held" "\\\$work"@true@'                                    has_slot_reset
+mutate "holding directory left slot-writable" 's@install -d -o root -g root -m 0700 "\$SLOT_ROOT/.reset/\$idx"@install -d -o "\$u" -g "\$u" -m 0700 "\$SLOT_ROOT/.reset/\$idx"@' has_slot_reset
+mutate "boot reset runs under a live agent" 's|systemctl is-active --quiet "ci-runner@\$idx.service"|false|'                                  has_slot_reset
 mutate "data root back inside the home"   's@ --data-root=/var/lib/ci-slot/%i/docker@@'                            has_slot_reset
 
 mutate "daemon MTU config removed"        's|daemon\.json|daemon.txt|g'                                          has_container_mtu
