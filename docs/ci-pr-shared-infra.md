@@ -99,6 +99,19 @@ whole array so "unpinned" is a shorter array, not a blank element.
 with shared infrastructure should make its **infra owner job the anchor** (§3)
 rather than paying for a job that only echoes a variable.
 
+**If the host disappears, your run is cancelled — deliberately.** A pin names
+one machine, and a machine that is replaced comes back under a new name, so a
+job pinned to a host that no longer exists is not slow, it is unservable:
+nothing will ever carry that label again. Left alone it holds its concurrency
+group until GitHub times it out a day later. The controller instead fails the
+run within minutes of the host going away, with the reason in its log. **Re-run
+it** — the next anchor picks a live host, and there is nothing to clean up.
+
+This should be rare, because hosts are drained rather than yanked and the pin
+hold blocks the drain for the length of your run. A run of these means hosts are
+disappearing under live work — a recycle policy that is too aggressive, or
+preemption — and the series `ci_pinned_runs_cancelled` is where that shows up.
+
 ## 2. Consuming the anchor
 
 ```yaml
