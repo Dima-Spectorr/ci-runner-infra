@@ -150,8 +150,8 @@ Windows guidance is `2`, and `1` for a pool whose jobs bind fixed ports. See
 
 **`extra_registry_hosts` — rejected outright on Windows.** It exists to name the
 registries the *job identity* authenticates to, and it is consumed by
-`write_slot_docker_config()` writing a `credHelpers` map into each slot's
-`~/.docker/config.json`. There is no docker on a Windows host and nothing reads
+`write_docker_cred_helpers()` writing a `credHelpers` map into the template
+every Linux slot's `~/.docker/config.json` is rebuilt from. There is no docker on a Windows host and nothing reads
 the list. Accepting it would be the worst kind of no-op: a consumer configures a
 private registry, Terraform applies clean, and the failure arrives later as an
 unauthenticated pull inside a job — which is precisely the shape of the bug that

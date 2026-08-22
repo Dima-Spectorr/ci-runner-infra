@@ -764,14 +764,42 @@ describing nothing.
    cache was dead, which is minutes per shard per run. The other is that a
    deploy-capable identity sat in a shared home reachable by an arbitrary pull
    request, and the only thing that stopped it being usable was the OIDC subject
-   token expiring. `install_job_hooks()` wires
-   `ACTIONS_RUNNER_HOOK_JOB_STARTED` and `..._COMPLETED` to a root-owned script
-   that removes the slot's `~/.config/gcloud` and `~/.gsutil` — both ends,
-   because the completed hook alone leaves a live credential on disk while the
-   slot idles and never runs at all when an agent is killed mid-job. It is
-   installed on every pool, including pools with no job service account, where
-   an inherited credential is worst because nothing there should hold Google
-   credentials at all.
+   token expiring.
+
+   Removing the two credential stores by name was the first fix and it was a
+   denylist: the same home also carries a `~/.gitconfig` that can name a
+   `core.hooksPath`, a `~/.bashrc` every subsequent shell sources, a `~/.local/bin`
+   on `PATH`, and — one level up, in `_work` — the previous job's checkout with
+   its own `.git/hooks` and a `_tool` directory the runner puts on `PATH`. Those
+   are *executed*, not read, and the list is wrong the moment a tool picks a new
+   path. `install_job_hooks()` therefore **replaces** the home rather than
+   cleaning it: `ACTIONS_RUNNER_HOOK_JOB_STARTED` and `..._COMPLETED` both run a
+   root-owned `slot-reset.sh` that empties `$HOME` and rebuilds it from a
+   root-owned template, and removes the previous job's workspace and tool cache.
+   Both ends, because the completed hook alone leaves a live credential on disk
+   while the slot idles; and a third reset as `ExecStartPre=+` on the agent unit,
+   because neither hook runs when an agent is killed mid-job or the host reboots
+   warm. It is installed on every pool, including pools with no job service
+   account, where an inherited credential is worst because nothing there should
+   hold Google credentials at all.
+
+   Three things make wholesale replacement affordable, and each is why the reset
+   is cheap rather than a cold start. The warm caches live under `/opt/ci-cache`,
+   not in the home. The rootless daemon's data root is passed explicitly as
+   `--data-root=/var/lib/ci-slot/<idx>/docker`, so every image the host has warmed
+   survives a reset — without it dockerd defaults to `$HOME/.local/share/docker`,
+   inside the tree being deleted. And `_actions`/`_temp` are kept at
+   `started` only, because the runner fills them *before* it calls that hook.
+
+   The reset runs as root through a `sudoers.d` rule that names the two permitted
+   argument forms literally; which slot is reset comes from `SUDO_UID`, never from
+   an argument, so a slot can only reset itself. Root is not a convenience: a
+   job's rootless containers write through a user namespace, so the directories
+   they leave are owned by subordinate uids and `rm -rf` as the slot user returns
+   `EACCES` on exactly the leftovers that matter. A `clean` marker in a
+   root-owned directory closes the last gap — a job that starts on a slot whose
+   predecessor never reached its completed hook is failed loudly rather than run
+   over an untrusted `_actions` tree.
 
    The symmetric caution: a workflow that *relied* on a previous job's login now
    fails. Nothing in this fleet does — every workflow that needs GCP either runs

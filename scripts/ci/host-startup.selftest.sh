@@ -241,48 +241,101 @@ has_registry_credentials() { # <file>
   # registers without it takes jobs it cannot start
   matches "$code" 'install_registry_credential_helper[[:space:]]*\\?$|install_registry_credential_helper[^|]*\|\|' || return 1
   matches "$code" 'die .could not install the registry credential helper' || return 1
-  # and every slot actually gets the config naming it
-  matches "$code" 'write_slot_docker_config "\$idx"[[:space:]]*\|\|[[:space:]]*return 1'
+  # and every slot actually gets the config naming it. It is written ONCE, into
+  # the template every slot's home is built and rebuilt from (#110), rather than
+  # into each home directly — a home written a second way is a home that drifts
+  # from what a reset restores.
+  matches "$code" 'write_docker_cred_helpers >"\$SLOT_TEMPLATE/\.docker/config\.json"'
 }
 
-# A slot user's $HOME outlives every job the slot serves, so a workflow that
-# authenticates leaves its credential there for the next, unrelated job.
+# A slot user's $HOME outlives every job the slot serves, so anything a job
+# leaves there is inherited by the next, unrelated job — a credential to reuse,
+# or a hook, a dotfile or a shadowing binary to EXECUTE.
 #
-# IntegrateIT paid for this on every pr-check run: deploy.yml and friends run
-# google-github-actions/auth + setup-gcloud on this same pool, setup-gcloud
-# persists the external account as gcloud's ACTIVE account, and later jobs then
-# preferred it over the broker — failing with "Unable to retrieve Identity Pool
-# subject token ... token is expired" because the OIDC subject token had died
-# hours earlier. The visible cost was a permanently cold Turbo cache (229 misses,
-# 0 hits, ~11 minutes per shard). The real cost is that a deploy identity was
-# reachable by whatever pull request landed on the slot next, and only expiry
+# It started as a credential story: a deploy workflow left ~/.config/gcloud
+# behind and later jobs failed with "Unable to retrieve Identity Pool subject
+# token ... token is expired", because the OIDC subject token had died hours
+# earlier. The visible cost was a permanently cold Turbo cache (229 misses, 0
+# hits, ~11 minutes per shard). The real cost was that a deploy identity was
+# reachable by whatever pull request landed on that slot next, and only expiry
 # stopped it being usable.
-has_job_credential_reset() { # <file>
+#
+# Removing those two credential stores fixed one path and left the class (#110).
+# What this pins now is the shape that closes the class: the home is REPLACED
+# from a root-owned template rather than cleaned of known-bad paths, so
+# `.gitconfig` core.hooksPath, `.bashrc`, `.local/bin` and a leftover
+# workspace's `.git/hooks` all go without anyone having had to name them.
+has_slot_reset() { # <file>
   local code
   code=$(code_of "$1")
+
   # both ends of the job, on the AGENT unit
-  matches "$code" '^Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci/job-hooks/reset-credentials\.sh$' || return 1
-  matches "$code" '^Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/reset-credentials\.sh$' || return 1
+  matches "$code" '^Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci/job-hooks/job-started\.sh$' || return 1
+  matches "$code" '^Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/job-completed\.sh$' || return 1
   # …and unconditionally, not folded into the JOB_SA branch that gates BROKER_ENV:
   # a pool with no job identity is where an inherited credential is worst.
   ! matches "$code" 'if \[ -n "\$JOB_SA" \].*ACTIONS_RUNNER_HOOK' || return 1
-  # the hook exists, root-owned and not writable by the slots that execute it —
-  # one file shared by every uid on the host
-  matches "$code" 'chown root:root /opt/ci/job-hooks/reset-credentials\.sh' || return 1
-  matches "$code" 'chmod 0755 /opt/ci/job-hooks/reset-credentials\.sh' || return 1
+  # plus the third reset, which is the one the two hooks cannot cover: an agent
+  # killed mid-job never ran its completed hook, and a warm host reboots over
+  # the previous boot's leftovers. `+` is what runs it as root despite User=.
+  matches "$code" '^ExecStartPre=\+/opt/ci/job-hooks/slot-reset\.sh boot \$idx$' || return 1
+
+  # the files exist, root-owned and not writable by the slots that execute them —
+  # one set shared by every uid on the host, and one of them runs as root
+  matches "$code" 'chown root:root "/opt/ci/job-hooks/job-\$stage\.sh"' || return 1
+  matches "$code" 'chmod 0755 "/opt/ci/job-hooks/job-\$stage\.sh"' || return 1
+  matches "$code" 'chown root:root /opt/ci/job-hooks/slot-reset\.sh' || return 1
+  matches "$code" 'chmod 0755 /opt/ci/job-hooks/slot-reset\.sh' || return 1
   # installed before any agent registers, and fatal: an agent whose JOB_STARTED
   # hook points at a missing file takes work and fails all of it
   matches "$code" 'install_job_hooks \|\| die' || return 1
-  # it removes the gcloud credential store…
-  matches "$code" '\$home/\.config/gcloud' || return 1
-  # …deciding WHICH home from the passwd database rather than from a $HOME a job
-  # could have rewritten, and refusing anything that is not a slot home
-  matches "$code" 'home=.*getent passwd .*id -un' || return 1
-  matches "$code" 'refusing to clean' || return 1
-  # …and never ~/.docker/config.json, which the host itself wrote: removing that
-  # fails every container job at "Initialize containers" instead of fixing
-  # anything.
-  ! matches "$code" '\$home/\.docker' || return 1
+  # and the template it restores from is built before the slot users that need it
+  matches "$code" 'seed_slot_template \|\| die' || return 1
+
+  # REPLACEMENT, not cleaning. The home is emptied and the template copied back;
+  # a predicate that only looked for an `rm` would have passed on the denylist
+  # this replaces, so both halves are pinned.
+  matches "$code" 'find "\\\$home" -mindepth 1 -maxdepth 1 -exec rm -rf' || return 1
+  matches "$code" 'cp -a "\\\$SLOT_TEMPLATE/\." "\\\$home/"' || return 1
+  # …and the previous job's workspace and tool cache go with it
+  matches "$code" 'work="\\\$SLOT_ROOT/\\\$idx/_work"' || return 1
+  # …while _temp and, at job start only, _actions stay: the runner fills both
+  # BEFORE the started hook runs, so wiping them there breaks the starting job
+  matches "$code" '_temp\) continue ;;' || return 1
+  matches "$code" '\[ "\\\$stage" = started \] && keep_actions=1' || return 1
+  # and the workspace the runner already prepared for the STARTING job is
+  # emptied, not unlinked — a plain `run:` step chdirs into it
+  matches "$code" 'install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"' || return 1
+
+  # WHO gets reset is never the caller's choice when the caller is a slot: sudo
+  # sets SUDO_UID from the real invoking user, so slot 2 cannot name slot 3.
+  matches "$code" 'if \[ -n "\\\$\{SUDO_UID:-\}" \]' || return 1
+  matches "$code" 'NOPASSWD: /opt/ci/job-hooks/slot-reset\.sh started, /opt/ci/job-hooks/slot-reset\.sh completed' || return 1
+  # sudoers is validated before it is installed — a file there that does not
+  # parse does not fail open on one rule, it stops every sudo on the host
+  matches "$code" 'visudo -cqf "\$tmp"' || return 1
+
+  # the tree being deleted as root comes from the account database, not from a
+  # $HOME a job could have rewritten, and still has to look like a slot home
+  matches "$code" 'home=\\\$\(getent passwd "\\\$u"' || return 1
+  matches "$code" 'not a slot home' || return 1
+
+  # a slot cannot forge its own clean bill of health: the marker lives in a
+  # root-owned directory, and only the daemon's data root below it is slot-owned
+  matches "$code" 'marker="\\\$SLOT_STATE/\\\$idx/clean"' || return 1
+  matches "$code" 'install -d -o root -g root -m 0755 "\$SLOT_STATE/\$idx"' || return 1
+  matches "$code" 'install -d -o "\$u" -g "\$u" -m 0700 "\$SLOT_STATE/\$idx/docker"' || return 1
+  # …and a slot whose previous job never completed does not get to run the next
+  # one: that is the single state in which _actions cannot be trusted either
+  matches "$code" 'fail_after=1' || return 1
+
+  # the daemon's data root is OUT of the home, which is what makes the home
+  # disposable at all — leave it in and a reset deletes the store of a daemon
+  # that is still holding it open
+  matches "$code" 'ExecStart=/usr/bin/dockerd-rootless\.sh --data-root=/var/lib/ci-slot/%i/docker' || return 1
+
+  # and the denylist this replaces is gone, not merely lengthened
+  ! matches "$code" 'for d in "\\\$home/\.config/gcloud"' || return 1
 }
 
 # The container bridge must be born on the host's MTU.
@@ -310,8 +363,9 @@ has_container_mtu() { # <file>
   matches "$code" 'mtu=\$\(primary_mtu\)' || return 1
   ! matches "$code" '"mtu": *1460' || return 1
   # written before the daemon starts — `mtu` is read at start, so a later write
-  # leaves the running daemon and its existing networks on the old value
-  matches "$code" 'write_slot_daemon_config "\$idx"[[:space:]]*\|\|[[:space:]]*return 1'
+  # leaves the running daemon and its existing networks on the old value — and
+  # into the template, because the home it lands in is replaced between jobs
+  matches "$code" '>"\$SLOT_TEMPLATE/\.config/docker/daemon\.json"'
 }
 
 # A baked container image is the one cached thing that is EXECUTED rather than
@@ -478,10 +532,10 @@ else
   bad "job containers are pulled without credentials — every job whose image comes from a private registry fails at 'Initialize containers' with 'Unauthenticated request ... downloadArtifacts', or the helper is wired at every registry rather than Google's alone"
 fi
 
-if has_job_credential_reset "$SCRIPT"; then
+if has_slot_reset "$SCRIPT"; then
   ok
 else
-  bad "a job inherits the previous job's cloud credentials — the slot home keeps ~/.config/gcloud between jobs, so a deploy workflow's identity is left active for whatever pull request lands on that slot next, and unrelated jobs fail on its expired token (IntegrateIT, permanently cold Turbo cache)"
+  bad "a job inherits whatever the previous job left in the same slot — the home is not rebuilt from the template between jobs, so a leftover ~/.gitconfig hooksPath, ~/.bashrc, ~/.local/bin entry or workspace .git/hooks is executed by the next, unrelated job, and a deploy credential is left active for whatever pull request lands there next (#110)"
 fi
 
 if has_container_mtu "$SCRIPT"; then
@@ -553,22 +607,33 @@ mutate "no-token path made fatal"         's|credentials not found in native key
 mutate "helper widened to every registry" 's|"credHelpers"|"credsStore": "cijob", "x"|'                            has_registry_credentials
 mutate "back to a wildcard key"           's|\${HOST_REGION}-docker.pkg.dev|"*.pkg.dev"|'                          has_registry_credentials
 mutate "helper install not fatal"         's|\|\| die .could not install the registry credential helper.*|\|\| true|' has_registry_credentials
-mutate "slots left without the config"    's|write_slot_docker_config "\$idx" \|\| return 1|:|'                     has_registry_credentials
+mutate "template left without the config" 's@write_docker_cred_helpers >"\$SLOT_TEMPLATE/\.docker/config\.json"@true >"$SLOT_TEMPLATE/.docker/config.json"@' has_registry_credentials
 
-mutate "reset only after the job"         's|^Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=.*$||'                   has_job_credential_reset
-mutate "reset only before the job"        's|^Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=.*$||'                 has_job_credential_reset
-mutate "hook install no longer fatal"     's|install_job_hooks \|\| die.*|install_job_hooks \|\| true|'             has_job_credential_reset
-mutate "hook left slot-writable"          's|chmod 0755 /opt/ci/job-hooks/reset-credentials.sh|chmod 0777 /opt/ci/job-hooks/reset-credentials.sh|' has_job_credential_reset
-mutate "gcloud store no longer cleaned"   's@config/gcloud@cache/turbo@'                                          has_job_credential_reset
-mutate "home taken from the environment"  's@^home=.*getent passwd.*@home="$HOME"@'                                has_job_credential_reset
-mutate "the host's own docker config wiped" 's@\.gsutil@.docker@'                                                 has_job_credential_reset
+mutate "reset only after the job"         's@^Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=.*$@@'                   has_slot_reset
+mutate "reset only before the job"        's@^Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=.*$@@'                 has_slot_reset
+mutate "boot reset dropped"               's@^ExecStartPre=+/opt/ci/job-hooks/slot-reset.sh boot \$idx$@@'         has_slot_reset
+mutate "hook install no longer fatal"     's@install_job_hooks || die.*@install_job_hooks || true@'                has_slot_reset
+mutate "template build no longer fatal"   's@seed_slot_template || die.*@seed_slot_template || true@'              has_slot_reset
+mutate "reset script left slot-writable"  's@chmod 0755 /opt/ci/job-hooks/slot-reset.sh@chmod 0777 /opt/ci/job-hooks/slot-reset.sh@' has_slot_reset
+mutate "home cleaned, never replaced"     's@^cp -a "\\\$SLOT_TEMPLATE/\." "\\\$home/".*@:@'                       has_slot_reset
+mutate "home never emptied"               's@^find "\\\$home" -mindepth 1.*@:@'                                    has_slot_reset
+mutate "home taken from the environment"  's@^home=\\\$(getent passwd.*@home="\$HOME"@'                           has_slot_reset
+mutate "slot names its own index"         's@if \[ -n "\\\${SUDO_UID:-}" \]@if [ -n "\${CI_SLOT:-}" ]@'           has_slot_reset
+mutate "sudoers widened to any argument"  's@ started, /opt/ci/job-hooks/slot-reset.sh completed@@'                has_slot_reset
+mutate "sudoers installed unvalidated"    's@visudo -cqf "\$tmp"@true@'                                            has_slot_reset
+mutate "marker left forgeable by the slot" 's@install -d -o root -g root -m 0755 "\$SLOT_STATE/\$idx"@install -d -o "\$u" -g "\$u" -m 0755 "\$SLOT_STATE/\$idx"@' has_slot_reset
+mutate "dirty slot allowed to run anyway" 's@^  fail_after=1$@  fail_after=0@'                                     has_slot_reset
+mutate "work folder left alone"           's@work="\\\$SLOT_ROOT/\\\$idx/_work"@work="\$SLOT_ROOT/\$idx/_none"@'  has_slot_reset
+mutate "starting job loses its actions"   's@keep_actions=1@keep_actions=0@'                                     has_slot_reset
+mutate "prepared workspace unlinked"      's@install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"@true@'                     has_slot_reset
+mutate "data root back inside the home"   's@ --data-root=/var/lib/ci-slot/%i/docker@@'                            has_slot_reset
 
 mutate "daemon MTU config removed"        's|daemon\.json|daemon.txt|g'                                          has_container_mtu
 mutate "MTU key dropped"                  's|"mtu"|"debug"|'                                                       has_container_mtu
 mutate "per-driver default dropped"       's|default-network-opts|default-address-pools|'                          has_container_mtu
 mutate "driver MTU option dropped"        's|com\.docker\.network\.driver\.mtu|com.docker.network.driver.name|'    has_container_mtu
 mutate "MTU hardcoded"                    's|mtu=\$(primary_mtu)|mtu=1460|'                                        has_container_mtu
-mutate "slots left on the default MTU"    's|write_slot_daemon_config "\$idx" \|\| return 1|:|'                    has_container_mtu
+mutate "template left on the default MTU" 's@>"\$SLOT_TEMPLATE/\.config/docker/daemon\.json"@>/dev/null@'          has_container_mtu
 
 mutate "archives back in the shared cache"   's|/opt/ci-images|/opt/ci-cache/images|g'                              has_baked_image_load
 mutate "checksum match back to a substring"  's|substr(\$0,67)==f|index($0,f)|g'                                    has_baked_image_load

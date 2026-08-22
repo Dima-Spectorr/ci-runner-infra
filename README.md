@@ -251,19 +251,29 @@ that image a real answer is separate work, not a line in this one.
   `scripts/ci/check-runner-policy.sh` (`RUNNER8`); and the first two rules in
   this list are not defence in depth there, they are the entire defence. Full
   residual: `docs/adr-windows-pool.md` §3A.
-* **A job never inherits the previous job's cloud credentials.** The slot user
-  is a normal Linux account, so its `$HOME` outlives every job the slot serves —
-  and `setup-gcloud` persists whatever `google-github-actions/auth` produced as
-  gcloud's *active* account. Nothing cleared it, so a deploy workflow left a
-  deploy-capable identity in a home that the next pull-request job on that slot
-  read as its own. Every pool now runs a root-owned reset hook
-  (`ACTIONS_RUNNER_HOOK_JOB_STARTED` and `..._COMPLETED`) that removes
-  `~/.config/gcloud` and `~/.gsutil` at both ends of every job, including on
-  pools with no job service account, where an inherited credential is worst.
-  Found because it also broke the thing nobody was watching: IntegrateIT's
-  `pr-check` authenticates nowhere and expects the broker's ADC, picked up the
-  stale external account instead, and ran with a permanently cold Turbo remote
-  cache — a `token is expired` warning per cache call on every single run.
+* **A job never inherits anything the previous job left in the slot.** The slot
+  user is a normal Linux account, so its `$HOME` outlives every job the slot
+  serves — and `setup-gcloud` persists whatever `google-github-actions/auth`
+  produced as gcloud's *active* account. Nothing cleared it, so a deploy workflow
+  left a deploy-capable identity in a home that the next pull-request job on that
+  slot read as its own. Found because it also broke the thing nobody was
+  watching: IntegrateIT's `pr-check` authenticates nowhere and expects the
+  broker's ADC, picked up the stale external account instead, and ran with a
+  permanently cold Turbo remote cache — a `token is expired` warning per cache
+  call on every single run.
+
+  A credential store is only the most visible thing a home carries, though: a
+  `~/.gitconfig` naming a `core.hooksPath`, a line appended to `~/.bashrc`, a
+  shadowing binary dropped in `~/.local/bin` and a previous workspace's
+  `.git/hooks` are all *executed* by the next, unrelated job, and naming them one
+  by one is a denylist that is wrong the moment a tool picks a new path. So the
+  home is **replaced**, not cleaned: every pool runs a root-owned reset
+  (`ACTIONS_RUNNER_HOOK_JOB_STARTED`, `..._COMPLETED`, and an `ExecStartPre` that
+  covers an agent killed mid-job or a warm reboot) that empties the home and
+  rebuilds it from a root-owned template, and takes the previous job's workspace
+  and tool cache with it. Installed on every pool, including pools with no job
+  service account, where an inherited credential is worst. A slot that cannot be
+  shown to have been left clean fails its next job rather than running it.
 * **The metadata fence stops at port 80, and that is deliberate.**
   `169.254.169.254` is two services on one address: the metadata server over
   HTTP on port 80, and the VPC resolver on port 53. A container is handed that
