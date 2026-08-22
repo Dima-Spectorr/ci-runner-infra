@@ -52,29 +52,29 @@ Describe 'dot-sourcing is inert' {
 
 Describe 'the bound on the install' {
     It 'defaults to an hour when nothing is set' {
-        Get-PrepareTimeoutSeconds -Raw '' | Should -Be 3600
+        Get-PrepareTimeout -Raw '' | Should -Be 3600
     }
 
     It 'takes a positive whole number of seconds' {
-        Get-PrepareTimeoutSeconds -Raw '900' | Should -Be 900
+        Get-PrepareTimeout -Raw '900' | Should -Be 900
     }
 
     It 'ignores surrounding whitespace rather than refusing a YAML scalar' {
-        Get-PrepareTimeoutSeconds -Raw "  900 `n" | Should -Be 900
+        Get-PrepareTimeout -Raw "  900 `n" | Should -Be 900
     }
 
     # The one value that must not be honoured: `timeout 0` is no limit at all,
     # and 0 is also what an operator reaches for to mean "do not wait".
     It 'refuses zero instead of reading it as no limit' {
-        { Get-PrepareTimeoutSeconds -Raw '0' } | Should -Throw '*positive*'
+        { Get-PrepareTimeout -Raw '0' } | Should -Throw '*positive*'
     }
 
     It 'refuses a negative value' {
-        { Get-PrepareTimeoutSeconds -Raw '-1' } | Should -Throw '*positive*'
+        { Get-PrepareTimeout -Raw '-1' } | Should -Throw '*positive*'
     }
 
     It 'refuses something that is not a number at all' {
-        { Get-PrepareTimeoutSeconds -Raw '10m' } | Should -Throw '*whole number*'
+        { Get-PrepareTimeout -Raw '10m' } | Should -Throw '*whole number*'
     }
 }
 
