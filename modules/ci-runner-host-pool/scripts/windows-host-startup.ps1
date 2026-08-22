@@ -2747,12 +2747,30 @@ function Initialize-SlotCache {
 
     # Staging trees from a boot that died mid-copy. Swept here, once, rather than
     # per tool: a stage is only ever published by rename, so anything still
-    # wearing the prefix is by definition a copy that never completed. Only
-    # SYSTEM can create a name in $dst, so these are our own leftovers and not
-    # something a slot planted. Best effort -- a stage that will not delete costs
-    # disk, and the unique names below mean it cannot be mistaken for a new one.
-    Get-ChildItem -LiteralPath $dst -Filter '.seed-*' -Force -ErrorAction SilentlyContinue |
-        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    # wearing the prefix is by definition a copy that never completed.
+    #
+    # AND EACH ONE IS SCANNED BEFORE IT IS DELETED, for the same reason the
+    # retired-slot sweep in Invoke-Phase7DependencyCache is. Only SYSTEM can
+    # create the stage DIRECTORY -- $dst is SYSTEM's -- but the stage's CONTENTS
+    # carry the slot's Modify grant, because Protect-CiDirectory puts it there
+    # before robocopy runs so every copied file inherits it. So a job that ran
+    # while a stage was left behind could have planted a junction inside it, and
+    # this Remove-Item runs as SYSTEM under Windows PowerShell 5.1, which follows
+    # one and deletes what it POINTS AT (PowerShell/PowerShell#621).
+    #
+    # A stale stage that cannot be shown to be safe is therefore left on disk.
+    # It costs disk and is logged; the unique names below mean it can never be
+    # mistaken for a stage this boot created, so leaving it is inert.
+    foreach ($stale in @(Get-ChildItem -LiteralPath $dst -Filter '.seed-*' -Force -ErrorAction SilentlyContinue)) {
+        $inside = @(Get-ChildItem -LiteralPath $stale.FullName -Recurse -Force -ErrorAction SilentlyContinue)
+        $staleReason = Get-CacheHostileReason -Entries (@($stale) + $inside)
+        if ($staleReason) {
+            Write-BootLog ("phase 7: slot $Index -- a stale staging tree is NOT being removed -- " +
+                $staleReason)
+            continue
+        }
+        Remove-Item -LiteralPath $stale.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
 
     foreach ($tool in $script:CacheDirs) {
         $final = Join-Path $dst $tool

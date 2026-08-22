@@ -1760,6 +1760,17 @@ has_slot_cache_isolation() { # <file>
   matches "$code" '\$stage = Join-Path \$dst \(' || return 1
   matches "$code" '-f \$tool, \[guid\]::NewGuid' || return 1
 
+
+  # A stale staging tree is scanned before it is deleted, for the same reason the
+  # retired-slot sweep is: $dst is SYSTEM's, but the stage CONTENTS carry the
+  # slot's Modify grant, so a job could have planted a junction inside a stage a
+  # previous boot left behind -- and 5.1's Remove-Item follows it.
+  local stale_scan_at stale_del_at
+  stale_scan_at=$(printf '%s\n' "$code" | grep -nE '\$staleReason = Get-CacheHostileReason' | head -1 | cut -d: -f1)
+  stale_del_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$stale\.FullName -Recurse' | head -1 | cut -d: -f1)
+  [ -n "$stale_scan_at" ] && [ -n "$stale_del_at" ] || return 1
+  [ "$stale_scan_at" -lt "$stale_del_at" ] || return 1
+
   # The cache variables are emitted only for a slot that actually got a cache.
   # Unconditional, they would name directories phase 7 never built — and a tool
   # that cannot open the cache it was told to use fails the job rather than
@@ -1833,6 +1844,7 @@ mutate "a retired slot's cache tree deleted recursively without being scanned" \
 mutate "a partly-unreadable master scanned and sealed as though it were clean"   's|if (\$scanErrors.Count -gt 0) {|if ($false) {|'   has_cache_master_sealed_readonly
 mutate "the scan errors discarded, so an unreadable tree reads as an empty one"   's|-ErrorAction SilentlyContinue -ErrorVariable scanErrors)|-ErrorAction SilentlyContinue)|'   has_cache_master_sealed_readonly
 mutate "the staging directory back to a fixed name a failed cleanup can leave behind"   "s|('\.seed-{0}-{1}' -f \$tool, \[guid\]::NewGuid().ToString('N'))|\".seed-\$tool\"|"   has_slot_cache_isolation
+mutate "a stale staging tree deleted recursively without being scanned first"   's|$staleReason = Get-CacheHostileReason|$staleReason = $null; $null = (|'   has_slot_cache_isolation
 mutate "the cache variables emitted for a slot that never got a cache" \
   's|if (-not \[string\]::IsNullOrWhiteSpace(\$CachePath)) {|if ($true) {|' \
   has_slot_cache_isolation

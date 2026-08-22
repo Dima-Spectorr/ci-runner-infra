@@ -818,15 +818,19 @@ established pattern here rather than a new bet.
 **The master is untrusted build input.** `warm_cache_script` is arbitrary
 repo-supplied code running elevated in the build VM (§6), and what it leaves
 behind is both ACL-walked and copied K times. The Linux scan refuses five
-things; four have no Windows spelling, and the one that does is the **reparse
-point** — refused by the Packer template at step 7b and again by
+things; three have no Windows spelling. Of the two that do, the **reparse
+point** is refused by the Packer template at step 7b and again by
 `Get-CacheHostileReason` at boot, because an image is not the only way content
-reaches that tree. Both operations that follow the scan would honour a junction:
-`icacls` with `(OI)(CI)` applies the grant to whatever it names, and an ACL
-applied to the wrong tree outlives the boot; `robocopy` descends into it. The
-scan therefore runs **before** the seal, and it includes the root itself, since
-a master that *is* a junction is the case where everything below it already
-belongs to another tree.
+reaches that tree. The other, an **NTFS hardlink whose other name lies outside
+the master**, is not refused: a file's security descriptor lives on its MFT
+record, so `icacls /reset /T` rewrites it at that other name too. Detecting it
+needs a link count, which `Get-ChildItem` does not carry; #238 holds the
+options and their boot-time cost. Both operations that follow the scan would
+honour a junction: `icacls` with `(OI)(CI)` applies the grant to whatever it
+names, and an ACL applied to the wrong tree outlives the boot; `robocopy`
+descends into it. The scan therefore runs **before** the seal, and it includes
+the root itself, since a master that *is* a junction is the case where
+everything below it already belongs to another tree.
 
 The scan asserts an **absence**, so it only means anything if the enumeration
 succeeded: a directory that could not be listed is not an entry that came back
