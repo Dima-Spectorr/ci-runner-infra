@@ -63,13 +63,17 @@ for pair in "host_base:$host_base" "host_width:$host_width" "tf_base:$tf_base" "
 done
 [ "$fail" -eq 0 ] || { echo "shared-infra-band: FAILED"; exit 1; }
 
-[ "$host_base" = "$tf_base" ] \
-  && ok "band base agrees ($host_base)" \
-  || bad "band base differs: host-startup.sh says $host_base, ci-runner-network says $tf_base"
+if [ "$host_base" = "$tf_base" ]; then
+  ok "band base agrees ($host_base)"
+else
+  bad "band base differs: host-startup.sh says $host_base, ci-runner-network says $tf_base"
+fi
 
-[ "$host_width" = "$tf_width" ] \
-  && ok "band width agrees ($host_width)" \
-  || bad "band width differs: host-startup.sh says $host_width, ci-runner-network says $tf_width"
+if [ "$host_width" = "$tf_width" ]; then
+  ok "band width agrees ($host_width)"
+else
+  bad "band width differs: host-startup.sh says $host_width, ci-runner-network says $tf_width"
+fi
 
 # --- the span endpoints, for several pool sizes -------------------------------
 #
@@ -97,20 +101,26 @@ for slots in 1 2 4 8 16; do
   # And the last slot's band must actually be inside the span. This is the
   # assertion the ADR's original formula failed.
   last_slot_max=$(( host_base + slots * host_width + host_width - 1 ))
-  [ "$last_slot_max" -le "$got_max" ] \
-    && ok "slots=$slots last slot's band ends inside the span" \
-    || bad "slots=$slots: slot $slots ends at $last_slot_max, past the span's $got_max"
+  if [ "$last_slot_max" -le "$got_max" ]; then
+    ok "slots=$slots last slot's band ends inside the span"
+  else
+    bad "slots=$slots: slot $slots ends at $last_slot_max, past the span's $got_max"
+  fi
 done
 
 # --- the span is built from the constants, not written out as a literal -------
 
-grep -qE 'shared_infra_band_base \+ var\.shared_infra_slots_per_host \* local\.shared_infra_band_width' "$NET_TF" \
-  && ok "the span's upper end follows slots_per_host" \
-  || bad "the span's upper end no longer follows slots_per_host — a fixed span silently drops the slots above it"
+if grep -qE 'shared_infra_band_base \+ var\.shared_infra_slots_per_host \* local\.shared_infra_band_width' "$NET_TF"; then
+  ok "the span's upper end follows slots_per_host"
+else
+  bad "the span's upper end no longer follows slots_per_host — a fixed span silently drops the slots above it"
+fi
 
-grep -qE 'ports +?= +?\[local\.shared_infra_band_span\]' "$NET_TF" \
-  && ok "both rules take their ports from the computed span" \
-  || bad "a band rule names its ports literally instead of using local.shared_infra_band_span"
+if grep -qE 'ports +?= +?\[local\.shared_infra_band_span\]' "$NET_TF"; then
+  ok "both rules take their ports from the computed span"
+else
+  bad "a band rule names its ports literally instead of using local.shared_infra_band_span"
+fi
 
 # --- the tags: source on both pools, stack tag on Linux only ------------------
 #
@@ -119,21 +129,31 @@ grep -qE 'ports +?= +?\[local\.shared_infra_band_span\]' "$NET_TF" \
 # the inbound path the Windows ADR exists to deny — from a one-line change in a
 # file that says nothing about Windows.
 
-grep -q 'ci-shared-infra-\${var.shared_infra_id}' "$POOL_TF" \
-  && ok "the source tag is built from shared_infra_id" \
-  || bad "the source tag is not built from shared_infra_id — a tag derived per module differs between the two pools of a pair"
+# shellcheck disable=SC2016  # the ${...} here is Terraform interpolation in the file being searched, not a shell expansion
+if grep -q 'ci-shared-infra-\${var.shared_infra_id}' "$POOL_TF"; then
+  ok "the source tag is built from shared_infra_id"
+else
+  bad "the source tag is not built from shared_infra_id — a tag derived per module differs between the two pools of a pair"
+fi
 
-grep -q 'var.host_os == "linux" ? \["ci-shared-infra-stack-\${var.shared_infra_id}"\]' "$POOL_TF" \
-  && ok "the stack tag is conditional on host_os == linux" \
-  || bad "the stack tag is not gated on host_os — a Windows host carrying it becomes an ingress TARGET"
+# shellcheck disable=SC2016  # the ${...} here is Terraform interpolation in the file being searched, not a shell expansion
+if grep -q 'var.host_os == "linux" ? \["ci-shared-infra-stack-\${var.shared_infra_id}"\]' "$POOL_TF"; then
+  ok "the stack tag is conditional on host_os == linux"
+else
+  bad "the stack tag is not gated on host_os — a Windows host carrying it becomes an ingress TARGET"
+fi
 
-grep -qE 'target_tags +?= +?\[local\.shared_infra_stack_tag\]' "$NET_TF" \
-  && ok "the ingress rule targets the stack tag, not the source tag" \
-  || bad "the ingress rule does not target the stack tag — with the source tag as target it admits traffic TO every host of the pair, Windows included"
+if grep -qE 'target_tags +?= +?\[local\.shared_infra_stack_tag\]' "$NET_TF"; then
+  ok "the ingress rule targets the stack tag, not the source tag"
+else
+  bad "the ingress rule does not target the stack tag — with the source tag as target it admits traffic TO every host of the pair, Windows included"
+fi
 
-grep -qE 'source_tags +?= +?\[local\.shared_infra_source_tag\]' "$NET_TF" \
-  && ok "the ingress rule's source is the pair-wide tag" \
-  || bad "the ingress rule's source is not the pair-wide tag — the Windows host would match no source and rule 3 would fail closed"
+if grep -qE 'source_tags +?= +?\[local\.shared_infra_source_tag\]' "$NET_TF"; then
+  ok "the ingress rule's source is the pair-wide tag"
+else
+  bad "the ingress rule's source is not the pair-wide tag — the Windows host would match no source and rule 3 would fail closed"
+fi
 
 # --- disabled by default ------------------------------------------------------
 #
@@ -142,9 +162,11 @@ grep -qE 'source_tags +?= +?\[local\.shared_infra_source_tag\]' "$NET_TF" \
 # moment a longer name is added beside it — and it breaks as a red gate on an
 # unrelated change, which is how a gate gets deleted rather than fixed.
 
-grep -qE 'shared_infra_enabled +?= +?var\.shared_infra_id != ""' "$NET_TF" \
-  && ok "the rules are gated on shared_infra_id" \
-  || bad "the band rules are not gated — a project that asked for no pair gets new firewall rules"
+if grep -qE 'shared_infra_enabled +?= +?var\.shared_infra_id != ""' "$NET_TF"; then
+  ok "the rules are gated on shared_infra_id"
+else
+  bad "the band rules are not gated — a project that asked for no pair gets new firewall rules"
+fi
 
 # --- mutations ----------------------------------------------------------------
 #
