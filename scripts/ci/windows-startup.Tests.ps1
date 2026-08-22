@@ -1607,3 +1607,242 @@ Describe 'recovery-policy guard' {
             Should -Throw -ExpectedMessage '*not a runner service name*'
     }
 }
+
+Describe 'robocopy exit code' {
+    # ROBOCOPY DOES NOT RETURN 0 ON SUCCESS. Its exit code is a bitmap, and the
+    # ordinary successful seed of a non-empty tree returns 1. Every other native
+    # call in the boot script is checked with `-ne 0`, correctly, so this is the
+    # one place the habit is wrong -- and being wrong here means every slot on
+    # every host runs cold while the log reports a failed copy.
+    It 'accepts 0, which is "nothing needed copying"' {
+        Test-RobocopySuccess -ExitCode 0 | Should -BeTrue
+    }
+
+    It 'accepts 1, which is what a successful seed actually returns' {
+        Test-RobocopySuccess -ExitCode 1 | Should -BeTrue
+    }
+
+    It 'accepts the extra-files and mismatch bits below 8' {
+        foreach ($code in 2, 3, 4, 5, 6, 7) {
+            Test-RobocopySuccess -ExitCode $code | Should -BeTrue
+        }
+    }
+
+    It 'refuses 8, which is "some files could not be copied"' {
+        Test-RobocopySuccess -ExitCode 8 | Should -BeFalse
+    }
+
+    It 'refuses 16 rather than reading it as a combination of lower bits' {
+        # 16 is reported ALONE, not combined, so a `-band 8` test would pass it.
+        Test-RobocopySuccess -ExitCode 16 | Should -BeFalse
+    }
+
+    It 'refuses a negative code, which is how a killed robocopy exits' {
+        # The whole reason this is a function and not `-lt 8` written inline: an
+        # NTSTATUS-as-negative-integer is less than 8, so the inline form would
+        # publish the partial tree a crashed copy left behind as a complete cache.
+        Test-RobocopySuccess -ExitCode -1 | Should -BeFalse
+        Test-RobocopySuccess -ExitCode -1073741510 | Should -BeFalse
+    }
+}
+
+Describe 'hostile cache content' {
+    # The Windows half of the Linux scan. Four of the five things /opt/ci-cache is
+    # scanned for have no spelling here; the reparse point is the one that does,
+    # and it is refused because both operations that follow -- the ACL walk and
+    # the per-slot copy -- follow it.
+    It 'passes a tree with nothing in it' {
+        Get-CacheHostileReason -Entries @() | Should -Be ''
+    }
+
+    It 'passes ordinary directories and files' {
+        $entries = @(
+            [pscustomobject] @{ FullName = 'C:\ci-cache'; Attributes = 'Directory' },
+            [pscustomobject] @{ FullName = 'C:\ci-cache\npm\_cacache'; Attributes = 'Directory' },
+            [pscustomobject] @{ FullName = 'C:\ci-cache\npm\index'; Attributes = 'Archive, ReadOnly' }
+        )
+        Get-CacheHostileReason -Entries $entries | Should -Be ''
+    }
+
+    It 'refuses a junction anywhere in the tree' {
+        $entries = @(
+            [pscustomobject] @{ FullName = 'C:\ci-cache'; Attributes = 'Directory' },
+            [pscustomobject] @{ FullName = 'C:\ci-cache\nuget'; Attributes = 'Directory, ReparsePoint' }
+        )
+        Get-CacheHostileReason -Entries $entries | Should -Match 'reparse point'
+    }
+
+    It 'refuses the master root itself being a junction' {
+        # The caller passes the root as the first entry for exactly this case: a
+        # scan that only looked at children would enumerate the tree the junction
+        # names in order to decide whether to refuse it.
+        $entries = @([pscustomobject] @{ FullName = 'C:\ci-cache'; Attributes = 'Directory, ReparsePoint' })
+        Get-CacheHostileReason -Entries $entries | Should -Match 'C:\\ci-cache'
+    }
+
+    It 'names the entry, because six predicates sharing one message cost hours once' {
+        $entries = @([pscustomobject] @{ FullName = 'C:\ci-cache\pip'; Attributes = 'Directory, ReparsePoint' })
+        Get-CacheHostileReason -Entries $entries | Should -Be 'reparse point: C:\ci-cache\pip'
+    }
+
+    It 'strips control characters out of the name it logs' {
+        # The tree is written by repo-supplied code, so an entry's NAME is
+        # untrusted text. A refusal that splits into two lines can be shaped to
+        # read like any other line the boot log emits.
+        $entries = @([pscustomobject] @{
+                FullName   = "C:\ci-cache\a`nphase 7: sealed"
+                Attributes = 'Directory, ReparsePoint'
+            })
+        $reason = Get-CacheHostileReason -Entries $entries
+        $reason | Should -Not -Match "`n"
+        $reason | Should -Be 'reparse point: C:\ci-cache\a phase 7: sealed'
+    }
+
+    It 'bounds the name it logs' {
+        $entries = @([pscustomobject] @{
+                FullName   = 'C:\ci-cache\' + ('a' * 900)
+                Attributes = 'Directory, ReparsePoint'
+            })
+        (Get-CacheHostileReason -Entries $entries).Length | Should -Be ('reparse point: '.Length + 300)
+    }
+
+    It 'skips a null entry rather than throwing on one' {
+        # A one-element array holding $null binds as $null, not as an array of
+        # one -- which is why AllowNull is on the parameter and not just the
+        # $null check inside the loop.
+        Get-CacheHostileReason -Entries @($null) | Should -Be ''
+    }
+
+    It 'still finds a hostile entry sitting behind a null one' {
+        # Two elements, so this really does arrive as an array and the skip
+        # inside the loop is the thing under test rather than the binder.
+        $entries = @($null, [pscustomobject] @{
+                FullName   = 'C:\ci-cache\npm'
+                Attributes = 'Directory, ReparsePoint'
+            })
+        Get-CacheHostileReason -Entries $entries | Should -Be 'reparse point: C:\ci-cache\npm'
+    }
+}
+
+Describe 'cache seed affordability' {
+    It 'seeds when the copy leaves the floor intact' {
+        Test-CacheSeedAffordable -MasterBytes 10GB -FreeBytes 60GB -FloorBytes 25GB | Should -BeTrue
+    }
+
+    It 'seeds at exactly the floor' {
+        Test-CacheSeedAffordable -MasterBytes 10GB -FreeBytes 35GB -FloorBytes 25GB | Should -BeTrue
+    }
+
+    It 'refuses when the copy would eat into the floor' {
+        Test-CacheSeedAffordable -MasterBytes 10GB -FreeBytes 34GB -FloorBytes 25GB | Should -BeFalse
+    }
+
+    It 'refuses a copy larger than the whole free space' {
+        # Not the same case as the one above, and worth its own assertion: this is
+        # the one where a subtraction that went unsigned would wrap into a very
+        # large positive number and seed anyway.
+        Test-CacheSeedAffordable -MasterBytes 100GB -FreeBytes 10GB -FloorBytes 25GB | Should -BeFalse
+    }
+}
+
+Describe 'slot cache environment' {
+    BeforeAll {
+        $script:CacheBlock = Get-SlotCacheEnvironment -CachePath 'C:\ci\cache\2'
+    }
+
+    It 'points every tool at the slot''s own copy' {
+        $script:CacheBlock['npm_config_cache'] | Should -Be 'C:\ci\cache\2\npm'
+        $script:CacheBlock['YARN_CACHE_FOLDER'] | Should -Be 'C:\ci\cache\2\yarn'
+        $script:CacheBlock['GOMODCACHE'] | Should -Be 'C:\ci\cache\2\go-mod'
+        $script:CacheBlock['PIP_CACHE_DIR'] | Should -Be 'C:\ci\cache\2\pip'
+        $script:CacheBlock['UV_CACHE_DIR'] | Should -Be 'C:\ci\cache\2\uv'
+        $script:CacheBlock['NUGET_PACKAGES'] | Should -Be 'C:\ci\cache\2\nuget'
+        $script:CacheBlock['COMPOSER_CACHE_DIR'] | Should -Be 'C:\ci\cache\2\composer'
+    }
+
+    It 'sets BOTH pnpm store spellings' {
+        # pnpm 11 reads pnpm_config_store_dir and silently IGNORES the npm_config_
+        # form it honoured before -- silently, meaning a single-spelling guess
+        # looks like it worked and stores nothing where we asked. Repositories pin
+        # their own pnpm, so this host cannot assume which side it is serving.
+        $script:CacheBlock['pnpm_config_store_dir'] | Should -Be 'C:\ci\cache\2\pnpm-store'
+        $script:CacheBlock['npm_config_store_dir'] | Should -Be 'C:\ci\cache\2\pnpm-store'
+    }
+
+    It 'delivers the Maven local repository as a system property' {
+        # Maven has no environment variable for it; MAVEN_ARGS is the supported
+        # route from the environment, from Maven 3.9.0.
+        $script:CacheBlock['MAVEN_ARGS'] | Should -Be '-Dmaven.repo.local=C:\ci\cache\2\m2'
+    }
+
+    It 'sets GOMODCACHE and never GOCACHE' {
+        # golang/go#43645: concurrent builds sharing one build cache is not safe.
+        # The downloaded-module cache is a different directory and is the one
+        # worth keeping warm.
+        $script:CacheBlock.Contains('GOCACHE') | Should -BeFalse
+    }
+
+    It 'leaves the runner tool cache alone' {
+        # actions/toolkit#804: the tool-cache library has no locking, and the
+        # setup-* actions treat that directory as one they own and prune.
+        $script:CacheBlock.Contains('RUNNER_TOOL_CACHE') | Should -BeFalse
+        $script:CacheBlock.Contains('AGENT_TOOLSDIRECTORY') | Should -BeFalse
+    }
+
+    It 'names one directory per tool cache the boot script builds' {
+        # The list here and $script:CacheDirs are two spellings of one thing, and
+        # a variable pointing at a directory phase 7 never creates is a hard
+        # per-job failure rather than a cache miss.
+        $named = @($script:CacheBlock.Values |
+                ForEach-Object { ($_ -replace '^-Dmaven\.repo\.local=', '') } |
+                ForEach-Object { $_.Split('\')[-1] } |
+                Select-Object -Unique)
+        foreach ($leaf in $named) { $script:CacheDirs | Should -Contain $leaf }
+    }
+
+    It 'tolerates a trailing separator on the path it is given' {
+        (Get-SlotCacheEnvironment -CachePath 'C:\ci\cache\2\')['npm_config_cache'] |
+            Should -Be 'C:\ci\cache\2\npm'
+    }
+}
+
+Describe 'slot cache path' {
+    It 'gives each slot its own directory' {
+        Get-SlotCachePath -Index 1 -Root '/tmp/cache' | Should -Be (Join-Path '/tmp/cache' '1')
+        Get-SlotCachePath -Index 2 -Root '/tmp/cache' | Should -Be (Join-Path '/tmp/cache' '2')
+    }
+}
+
+Describe 'cache variables on the service environment' {
+    It 'emits them for a slot that got a cache' {
+        $block = Get-SlotServiceEnvironment -Index 1 -SlotRoot '/ci/slots' -CachePath 'C:\ci\cache\1'
+        $block['npm_config_cache'] | Should -Be 'C:\ci\cache\1\npm'
+        $block['NUGET_PACKAGES'] | Should -Be 'C:\ci\cache\1\nuget'
+    }
+
+    It 'emits none at all for a slot that did not' {
+        # The one conditional block in that function, and the contrast with the
+        # five unconditional values is the point: an unset npm_config_cache means
+        # npm uses its own default, which is a cold cache and entirely correct.
+        # Pointing it at a directory phase 7 did not finish building is the
+        # harmful move -- a tool that cannot open its cache fails the job.
+        $block = Get-SlotServiceEnvironment -Index 1 -SlotRoot '/ci/slots'
+        $block.Contains('npm_config_cache') | Should -BeFalse
+        $block.Contains('NUGET_PACKAGES') | Should -BeFalse
+    }
+
+    It 'still sets the credential plumbing for a slot with no cache' {
+        # The cache being absent must not take the five unconditional values with
+        # it: an unset GCE_METADATA_HOST does not withhold a credential, it hands
+        # ADC back to the real metadata server and the HOST service account.
+        $block = Get-SlotServiceEnvironment -Index 1 -SlotRoot '/ci/slots'
+        $block['GCE_METADATA_HOST'] | Should -Be $script:ClosedMetadataEndpoint
+        $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookPath
+    }
+
+    It 'does not let a cache variable shadow the credential plumbing' {
+        $block = Get-SlotServiceEnvironment -Index 1 -SlotRoot '/ci/slots' -CachePath 'C:\ci\cache\1'
+        $block['GCE_METADATA_HOST'] | Should -Be $script:ClosedMetadataEndpoint
+        $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookPath
+    }
+}

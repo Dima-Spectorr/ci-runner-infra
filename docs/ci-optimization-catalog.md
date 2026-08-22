@@ -311,6 +311,21 @@ wiring and README.md for the verdicts. Until a pool opts in and
 `ensure-alert-policies.sh` has run against its project, the saving here is still
 zero, and nothing will page about it.
 
+**Status (Windows, 2026-08-22): the layer now exists on both operating systems.**
+Until issue #150 closed, everything above was Linux-only: a Windows host had no
+master, no per-slot copy and no tool pointed anywhere, so a Windows pool paid the
+per-job download on every job of every host and the saving in the table below was
+literally zero there. `windows-host-startup.ps1` phase 7 is the counterpart --
+`C:\ci-cache` sealed read-and-execute to the slot accounts, a real per-slot copy
+under `C:\ci\cache\<idx>`, and the same nine tool directories under the same ten
+environment variables. Three things differ and each is forced rather than chosen:
+the copy is a genuine copy because NTFS hardlinks share one ACL across every link
+and block cloning is ReFS-only; affordability is re-checked per slot against a
+25 GB floor on the 200 GB boot disk, so the slots that fit are seeded and the
+rest run cold; and the snapshot layer above is **not** wired to Windows yet, so a
+Windows host still starts cold after a scale-out or a recycle. That last one is
+the Windows half of "per-pool adoption is what is left", tracked separately.
+
 Note for whoever picks this up: `setup-*` actions re-downloading toolchains is
 **not** part of this and must not be folded into it. The Actions tool cache has
 no locking (actions/toolkit#804), so pointing concurrent slots at one is a
@@ -827,7 +842,7 @@ Ranked by saved pool-seconds per unit of work, with dependencies respected.
 | 7 | Fix or quarantine the permanently-red gate | 5.2 |
 | 8 | Non-code lane, in workflows and in a `docs` queue | 1.2, 6 |
 | 9 | Fork PRs off the self-hosted pool (security) | 1.5 |
-| 10 | Real warm cache — snapshot layer shipped v5.22.0, per-pool adoption to land | 4.2 |
+| 10 | Real warm cache — snapshot layer shipped v5.22.0; Windows per-slot layer shipped 2026-08-22; per-pool adoption and a Windows snapshot to land | 4.2 |
 | 11 | Batch settings + scopes in every queue | 6 |
 | 12 | Build-once/reuse, Docker layer cache, remote monorepo cache | 3.4, 4.3, 4.4 |
 | 13 | SHA-pin actions — gate shipped v5.4.0, 344 findings to land | 7 |

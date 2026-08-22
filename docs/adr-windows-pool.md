@@ -3,6 +3,9 @@
 Status: **proposed** (design only; nothing here is implemented).
 Supersedes: the "Windows" section of `docs/onboarding-a-repository.md`, which
 records the current state rather than a decision.
+Amended 2026-08-22: phase 7, the per-slot dependency cache, is added to
+§3 and closes issue #150; it supersedes the "warm cache" half of what §4 says
+Windows does not get.
 Amended 2026-08-16: **§3A supersedes phase 2 of §3 in full** and rewrites parts of
 §2, §4, §5, §6 and §7. Phase 2 as originally written cannot work — the mechanism
 is refuted by Microsoft's documented firewall rule precedence. Read §3A before
@@ -436,7 +439,7 @@ what it was for.
 This is the contract `windows-host-startup.ps1` must satisfy. It is written in
 the same order the script must execute in, because in several places the order
 *is* the safety property. Every phase either succeeds or the host registers
-nothing.
+nothing -- with one deliberate exception, phase 7, which fails open and says why.
 
 The script installs nothing. Every expensive thing — the runner agent, the build
 toolchains, the warm cache — is in the golden image, for the same reason it is on
@@ -745,6 +748,124 @@ Deliberately **not** in the probe: starting a container (there are none) and
 running a build (it would need the network and a repository, turning an upstream
 hiccup into a fleet that refuses to register). The Linux script's reasoning for
 what it leaves out applies unchanged.
+
+### Phase 7 — the per-slot dependency cache
+
+Added 2026-08-22, closing issue #150. §4 below said Windows "does not get" the
+warm cache; it now does, and this subsection is what replaced that gap. It runs
+after phase 1 (which creates the slot users the master is sealed to) and before
+phase 5 (which writes the environment block that names the cache), and it is
+**the only phase that does not end in `Deny-Boot`.**
+
+**The split.** `C:\ci-cache` is the master: baked by the image, sealed to
+SYSTEM and Administrators with read-and-execute for `Users`, writable by no
+slot. `C:\ci\cache\<idx>\<tool>` is one private cache per slot and tool, copied
+from the master at boot, granted `Modify` to that slot's account, and named by
+ten environment variables on the slot's service. The nine tool subdirectories
+are byte-for-byte the Linux list — `npm`, `yarn`, `pnpm-store`, `go-mod`, `pip`,
+`uv`, `m2`, `nuget`, `composer` — so a tree lifted off either host is
+self-describing and the two boot scripts can be diffed.
+
+**Why a real copy, when the Linux side agonised over the same question.** K
+copies of a warmed tree is the cost that decides this, so all three cheaper
+layouts were considered and all three are refused:
+
+* A **junction** is one tree wearing K names. Read-only master: every package
+  manager fails its first write. Writable master: the cross-slot channel this
+  design exists to prevent, with extra steps.
+* **NTFS hardlinks** cannot express per-slot write at all. A file's security
+  descriptor lives on its MFT record, not on the directory entry, so *every
+  hardlink to a file shares one ACL*. A slot's "own" copy would carry the
+  master's ACL; it could not be granted write for one slot alone, and granting
+  it would grant it to all. On Linux the equivalent hazard is a sysctl you can
+  trade away (`fs.protected_hardlinks`); here there is nothing to trade.
+* **Block cloning** is ReFS. §1 provisions one 200 GB NTFS boot disk and no
+  second volume, and adding a volume to get a cheaper copy is a larger change
+  than the copy costs.
+
+**Affordability is per slot, inside the loop**, against a 25 GB floor. The
+answer changes as the copies land, and on a host where two of four fit, seeding
+two and leaving two cold is strictly better than either filling the volume or
+refusing all four. Running out of disk mid-copy leaves a partial tree that reads
+as a complete cache and fails the *other* slots' jobs, which a cold cache never
+does. Each tool directory is staged under `.seed-<tool>` and **published by
+rename**, so what the environment variables name is either absent — a cache
+miss, which is correct — or complete.
+
+**Why it fails open.** A host with no cache is slow. A host that refuses to
+register is missing, and the pool answers a missing host by queueing jobs
+indefinitely — the exact 2h55m failure in "Why this is being written". The whole
+phase sits in one `try`/`catch` because the entry point runs under
+`$ErrorActionPreference = 'Stop'`. An image with no `C:\ci-cache` is a supported
+image, which is why this shipped without an `image_contract_version` bump.
+
+**Namespace ownership, ported.** `host-startup.sh`'s rule is that root never
+creates, renames or re-owns a name inside a directory an untrusted account
+controls, and it survives the port intact: `C:\ci-cache`, `C:\ci\cache` and
+`C:\ci\cache\<idx>` are all SYSTEM-and-Administrators, and the slot's `Modify`
+grant lands only on the `<tool>` leaves. The `.ready` marker therefore sits one
+level **above** where a naive port would put it — in `<idx>`, not in the tool
+directory — because phase 5 reads it to decide whether to emit those ten
+variables, and a slot that could create names in `<idx>` could forge it.
+
+A slot has no ACE on `C:\ci\cache` or on its own `<idx>`, and still opens
+`<idx>\npm`. That is not an oversight: traversal is governed by
+`SeChangeNotifyPrivilege` ("bypass traverse checking"), granted to Everyone by
+default, so a path is reachable when its **last** component grants access. It is
+the same property `C:\ci\slots\<idx>` already depends on, so this is the
+established pattern here rather than a new bet.
+
+**The master is untrusted build input.** `warm_cache_script` is arbitrary
+repo-supplied code running elevated in the build VM (§6), and what it leaves
+behind is both ACL-walked and copied K times. The Linux scan refuses five
+things; four have no Windows spelling, and the one that does is the **reparse
+point** — refused by the Packer template at step 7b and again by
+`Get-CacheHostileReason` at boot, because an image is not the only way content
+reaches that tree. Both operations that follow the scan would honour a junction:
+`icacls` with `(OI)(CI)` applies the grant to whatever it names, and an ACL
+applied to the wrong tree outlives the boot; `robocopy` descends into it. The
+scan therefore runs **before** the seal, and it includes the root itself, since
+a master that *is* a junction is the case where everything below it already
+belongs to another tree.
+
+The scan asserts an **absence**, so it only means anything if the enumeration
+succeeded: a directory that could not be listed is not an entry that came back
+clean. The enumeration errors are captured and any of them refuses the seed,
+which is the same correction the Linux publisher scan needed (`de69516`, "stop
+reading an unreadable file as clean"). Note which way that fails -- it fails the
+**cache**, not the **boot**. The host still registers and its jobs run cold,
+exactly as every other phase-7 refusal does; fail-closed on the gate is not
+fail-closed on the host.
+
+**Reducing `ci-slots` is the one recursive delete that reaches job-written
+files.** A retired index's tree is swept before the live ones are seeded, and
+`<idx>\<tool>` is precisely where the retired slot had `Modify` — so a job that
+ran before the count came down could have left a junction there. Windows
+PowerShell 5.1, which runs this file, follows one on `Remove-Item -Recurse` and
+deletes what it points at rather than the link
+(PowerShell/PowerShell#621, fixed in 6.0 and never backported); aimed at
+`C:\Windows\System32` that is an unrecoverable host, deleted by SYSTEM, from a
+cleanup path whose whole job is hygiene. The sweep therefore runs the same
+reparse-point scan first and, on a hit, **leaves the tree on disk and says so**.
+A stale cache costs disk; the other branch costs the machine.
+
+**The one native call whose success is not `exit 0`.** Robocopy's exit code is a
+bitmap — 1 files copied, 2 extra, 4 mismatched, 8 some could not be copied, 16 a
+serious error — so `-ne 0` would report every successful seed as a failure and
+every slot would run cold while the log claimed the copy failed. Below 8 is
+success, written as a comparison rather than `-band 8` because 16 is reported
+alone. A **negative** code is a failure too and is not hypothetical: a killed
+robocopy exits with the NTSTATUS as a negative integer, and a bare `-lt 8` would
+accept it and publish a partial tree as a complete cache. Both halves are pinned
+by `Test-RobocopySuccess` and by two mutations in
+`scripts/ci/windows-host-startup.selftest.sh`.
+
+The copy is `/COPY:DAT` and never `/COPYALL` — data, attributes, timestamps, but
+**not** the security descriptor. That is the Windows spelling of
+`cp -a --no-preserve=ownership`, and omitting `S` is precisely what lets the
+staging directory's inherited slot ACE survive; `/COPYALL` would hand every slot
+a copy of its own cache that it cannot write, which is the Windows form of the
+`EACCES`-on-first-install trap the Linux `go-w`/`a-w` note describes.
 
 ---
 

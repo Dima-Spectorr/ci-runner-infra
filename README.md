@@ -251,6 +251,65 @@ that image a real answer is separate work, not a line in this one.
   `scripts/ci/check-runner-policy.sh` (`RUNNER8`); and the first two rules in
   this list are not defence in depth there, they are the entire defence. Full
   residual: `docs/adr-windows-pool.md` §3A.
+* **The Windows dependency cache is a real per-slot copy, and the three cheaper
+  layouts are all unsafe here.** The split is the same shape as the Linux one —
+  `C:\ci-cache` is the master, baked by the image, sealed to SYSTEM and
+  Administrators with read-and-execute for the slot accounts and writable by
+  none of them; `C:\ci\cache\<idx>\<tool>` is one private cache per slot and
+  tool, copied from the master at boot by phase 7 of `windows-host-startup.ps1`,
+  and it is what the slot's package managers are pointed at. What differs is the
+  copy, and it is not a matter of taste:
+
+  * A **junction** is one tree wearing K names. A read-only master means every
+    package manager fails its first write; a writable one is the cross-slot
+    channel with extra steps.
+  * **NTFS hardlinks** — the Linux fallback of last resort — cannot work at all.
+    A file's security descriptor lives on its MFT record, not on the directory
+    entry, so *every hardlink to a file shares one ACL*. A slot's "own" copy
+    would carry the master's ACL, could not be granted write for one slot alone,
+    and granting it would grant it to all. On Linux this trade-off is a sysctl
+    (`fs.protected_hardlinks`); on Windows there is nothing to trade.
+  * **Block cloning** is a ReFS feature. The module provisions one 200 GB NTFS
+    boot disk and no second volume.
+
+  So each slot gets a real copy, and because K copies of a warmed tree is a real
+  cost on a 200 GB disk, affordability is checked **per slot inside the loop**:
+  the slots that fit are seeded and the rest run cold. Running out of disk
+  halfway through the last copy is strictly worse than a cold cache — it leaves
+  a partial tree that reads as a complete one, and it fails the *other* slots'
+  jobs, which a cold cache never does.
+
+  **Phase 7 is the one phase that fails open.** Every other phase ends in
+  `Deny-Boot`. A host with no cache is slow; a host that refuses to register is
+  missing, and the pool answers a missing host by queueing jobs. An image with
+  no `C:\ci-cache` is therefore a supported image and needs no contract bump.
+
+  **The parent directories are SYSTEM's, not the slot's**, for the reason the
+  Linux side states about `/var/lib/ci-cache/<idx>`: root never creates,
+  renames or re-ACLs a name inside a directory an untrusted account controls.
+  The layering is `C:\ci-cache` and `C:\ci\cache` and `C:\ci\cache\<idx>` all
+  SYSTEM-and-Administrators, with the slot's `Modify` grant only on the
+  `<tool>` leaves. The `.ready` marker sits one level *above* where a naive
+  port would put it, in `<idx>`, precisely so a slot cannot forge it — phase 5
+  reads that marker to decide whether to point ten environment variables at the
+  tree. A slot has no ACE on `C:\ci\cache` or on its own `<idx>` and still opens
+  `<idx>\npm` fine, because traversal is governed by `SeChangeNotifyPrivilege`
+  ("bypass traverse checking"), which is granted to Everyone by default: a path
+  is reachable when its **last** component grants access. That is already what
+  makes `C:\ci\slots\<idx>` work, so it is the established pattern here rather
+  than a new bet.
+
+  **A warm cache is untrusted build input on Windows too.** `warm_cache_script`
+  is arbitrary repo-supplied code running elevated in the build VM, and the tree
+  it leaves behind is both ACL-walked and copied K times. The Linux scan refuses
+  five things; four of them have no Windows spelling, and the one that does is
+  the **reparse point**, refused at build time and again at boot. `icacls`
+  with `(OI)(CI)` follows a junction, so a junction aimed at `C:\Windows` is a
+  read-and-execute grant applied *there* — and an ACL applied to the wrong tree
+  is not undone by the next boot. `robocopy` follows one too, turning a cache
+  seed into a per-slot copy of whatever it names. The root itself is scanned
+  first, because a master that *is* a junction is the case where everything
+  below it already belongs to another tree.
 * **A job never inherits anything the previous job left in the slot.** The slot
   user is a normal Linux account, so its `$HOME` outlives every job the slot
   serves — and `setup-gcloud` persists whatever `google-github-actions/auth`
