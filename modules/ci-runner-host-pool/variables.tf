@@ -747,3 +747,42 @@ variable "cache_snapshot_max_bytes" {
     error_message = "cache_snapshot_max_bytes must be between 1 MiB and 32 GiB; below that no real dependency cache fits, above it no boot disk does."
   }
 }
+
+variable "shared_infra_id" {
+  description = <<-EOT
+    Identifier of the shared-infrastructure PAIR this pool belongs to — one
+    value per consuming repository, passed IDENTICALLY to that repository's
+    Linux and Windows pool instances.
+
+    It exists because the two pools are separate module instances with separate
+    `name` values, so anything derived from a pool's own name gives the paired
+    hosts DIFFERENT tags — and the ingress rule below would then reject exactly
+    the Windows-to-Linux traffic the shared-infrastructure contract is about
+    (docs/adr-pr-host-affinity.md §3.3). The pair has to be named by whoever
+    declares the pair, because only they know it is a pair.
+
+    Set, this pool's hosts carry:
+
+      ci-shared-infra-<id>        both pools — the ingress SOURCE and the
+                                  egress target (which selects the SENDING VM)
+      ci-shared-infra-stack-<id>  linux only — the ingress TARGET
+
+    Two tags rather than one, because with a single tag on both pools the
+    ingress rule's target_tags would name the Windows hosts too, permitting
+    inbound connections to them: the path docs/adr-windows-pool.md exists to
+    deny, reintroduced by the rule meant to preserve it. A Windows host carries
+    the first tag and not the second, so it may reach a Linux stack and nothing
+    may reach it.
+
+    Empty (the default) means this pool takes part in no shared-infrastructure
+    pair and carries neither tag. The matching rules live in
+    `ci-runner-network`; a tag with no rule does nothing.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.shared_infra_id == "" || can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.shared_infra_id))
+    error_message = "shared_infra_id must be a valid GCP network-tag component: lowercase letters, digits and dashes, starting with a letter. It is concatenated into a tag name, and an invalid one fails the apply at the API rather than at the plan."
+  }
+}

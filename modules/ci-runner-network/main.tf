@@ -230,3 +230,102 @@ resource "google_compute_firewall" "egress_deny" {
     }
   }
 }
+
+# --- the shared-infrastructure band -------------------------------------------
+#
+# Rule 3 of the fleet's shared-infrastructure contract: a job on the Windows
+# host must be able to reach the database on the LINUX host of the same pull
+# request (docs/adr-pr-host-affinity.md §3.3, docs/ci-pr-shared-infra.md).
+#
+# Nothing above permits it. There is no ingress rule letting one pool host reach
+# another, and `deny-egress` at 65534 takes everything the allows do not name —
+# so without these two rules the Windows job's connection to the stack is
+# refused, and refused as a hang: the client waits until the job's timeout.
+#
+# The two rules are NOT symmetrical, because GCP's two directions do not offer
+# the same controls. Ingress can name the tag that may be REACHED; egress can
+# only name a destination RANGE. So the ingress rule is the half that bounds who
+# may answer, and the egress rule only stops a slot dialling the band of a host
+# outside the estate's own networks.
+#
+# The tags are the whole safety argument and they are described in the host
+# pool's var.shared_infra_id. In short: `ci-shared-infra-<id>` is carried by
+# both pools and is the SOURCE; `ci-shared-infra-stack-<id>` is carried by the
+# Linux pool only and is the ingress TARGET. A Windows host matches no ingress
+# rule anywhere, which is what keeps docs/adr-windows-pool.md's "no inbound
+# path" true through a change that is entirely about inbound paths.
+#
+# A literal, un-scoped `ci-shared-infra` would have been fleet-wide: network
+# tags match across every VM in the VPC that carries them, and two repositories
+# whose pools share a network — the normal deployment, since the module takes
+# the network as an input — would each match the other's rule. One repository's
+# job could then open a socket on another repository's database.
+
+locals {
+  # Slot i owns 100 host ports at 35000 + i*100, and slots are numbered from
+  # ONE (`seq 1 "$SLOTS"` in host-startup.sh), so the span starts at 35100 and
+  # not at 35000. Asserted against the script by
+  # scripts/ci/shared-infra-band.selftest.sh.
+  shared_infra_band_base  = 35000
+  shared_infra_band_width = 100
+  shared_infra_band_span = format(
+    "%d-%d",
+    local.shared_infra_band_base + local.shared_infra_band_width,
+    local.shared_infra_band_base + var.shared_infra_slots_per_host * local.shared_infra_band_width + local.shared_infra_band_width - 1,
+  )
+
+  shared_infra_enabled    = var.shared_infra_id != ""
+  shared_infra_source_tag = "ci-shared-infra-${var.shared_infra_id}"
+  shared_infra_stack_tag  = "ci-shared-infra-stack-${var.shared_infra_id}"
+}
+
+resource "google_compute_firewall" "shared_infra_ingress" {
+  count = local.shared_infra_enabled ? 1 : 0
+
+  project = var.project_id
+  name    = "${var.name_prefix}-allow-shared-infra"
+  network = var.network
+
+  direction   = "INGRESS"
+  source_tags = [local.shared_infra_source_tag]
+  target_tags = [local.shared_infra_stack_tag]
+
+  allow {
+    protocol = "tcp"
+    ports    = [local.shared_infra_band_span]
+  }
+
+  # Which host reached which stack, on which port. This is a rule that opens a
+  # path between two CI hosts, so the connections it permits are exactly the
+  # ones an incident would ask about.
+  dynamic "log_config" {
+    for_each = local.log_allowed ? [1] : []
+    content {
+      metadata = local.firewall_log_metadata
+    }
+  }
+}
+
+resource "google_compute_firewall" "shared_infra_egress" {
+  count = local.shared_infra_enabled ? 1 : 0
+
+  project = var.project_id
+  name    = "${var.name_prefix}-allow-egress-shared-infra"
+  network = var.network
+
+  direction          = "EGRESS"
+  destination_ranges = var.shared_infra_destination_ranges
+  target_tags        = [local.shared_infra_source_tag] # the SENDING VMs
+
+  allow {
+    protocol = "tcp"
+    ports    = [local.shared_infra_band_span]
+  }
+
+  dynamic "log_config" {
+    for_each = local.log_allowed ? [1] : []
+    content {
+      metadata = local.firewall_log_metadata
+    }
+  }
+}
