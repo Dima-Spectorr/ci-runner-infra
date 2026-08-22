@@ -259,6 +259,14 @@ has_hardlink_flattening() { # <file>
   # pack exactly the members this pass exists to remove.
   code "$1" | grepq 'if ($links -lt 0) {' || return 1
   code "$1" | grepq 'return -1;' || return 1
+  # THE SCRATCH NAME IS NOT A NAME THE TREE MAY ALREADY HOLD. The cache is
+  # written by third-party install code, so a package shipping `foo` beside
+  # `foo.ci-flatten` had the second one overwritten and then unlinked -- a real
+  # cache file deleted by the pass that exists to make the archive packable.
+  # A fresh GUID plus a copy that refuses to overwrite turns that into an error.
+  code "$1" | grepq "'.ci-flatten-' + \[guid\]::NewGuid()" || return 1
+  code "$1" | grepq 'Copy($f.FullName, $candidate, $false)' || return 1
+  ! code "$1" | grepq 'Copy($f.FullName, $spare, $true)' || return 1
   # BEFORE TAR, because tar is what records the link.
   local flat pack
   flat=$(code "$1" | grep -n 'Resolve-StagedHardLink -Files $files' | cut -d: -f1 | sed -n 1p)
@@ -281,7 +289,15 @@ has_unquiesced_stage_kept() { # <file>
   flag=$(code "$1" | grep -n 'if ($script:StageNotQuiesced) {' | cut -d: -f1 | sed -n 1p)
   del=$(code "$1" | grep -n 'Remove-Item -LiteralPath $Path -Recurse' | cut -d: -f1 | sed -n 1p)
   [ -n "$flag" ] && [ -n "$del" ] || return 1
-  [ "$flag" -lt "$del" ]
+  [ "$flag" -lt "$del" ] || return 1
+  # AND THE KILL IS INSIDE THAT TRY. TerminateJobObject can report failure and
+  # the wrapper raises when it does; thrown from IN FRONT of the try, that
+  # skipped the flag entirely -- so the one path where the members were never
+  # even asked to stop was the one path that left the stage looking quiesced.
+  # Adjacency is the check: the kill and the drain wait are the same try block.
+  local after
+  after=$(code "$1" | grep -A1 -F '[CiJobObject]::Kill($job)' | sed -n 2p)
+  printf '%s\n' "$after" | grepq 'Wait-JobObjectDrained -Job $job' || return 1
 }
 has_credential_name_scan() { # <file>
   # WHY THIS PASS EXISTS ON THIS SIDE AT ALL. The publish job scans the tree
@@ -448,7 +464,7 @@ mutate "the prepare command started outside the job" \
   has_job_object_reap
 
 mutate "the job closed without being terminated first" \
-  's|^        \[CiJobObject\]::Kill($job)$|        $null = $job|' \
+  's|^            \[CiJobObject\]::Kill($job)$|            $null = $job|' \
   has_job_object_reap
 
 mutate "a job object created with no limits at all" \
@@ -517,6 +533,12 @@ mutate "the hard-link flattening dropped from the pack path" \
 mutate "an unreadable link count treated as a flat file" \
   's@^        if ($links -lt 0) {$@        if ($false) {@' \
   has_hardlink_flattening
+mutate "the flattening scratch file overwriting a cache file of that name" \
+  's@\[System.IO.File\]::Copy($f.FullName, $candidate, $false)@[System.IO.File]::Copy($f.FullName, $candidate, $true)@' \
+  has_hardlink_flattening
+mutate "the kill moved back in front of the try that records a stage still being written" \
+  '/^            \[CiJobObject\]::Kill($job)$/d; s@^        try {$@        [CiJobObject]::Kill($job)\n        try {@' \
+  has_unquiesced_stage_kept
 mutate "the failed drain never recorded" \
   's@$script:StageNotQuiesced = $true@$null = $job@' \
   has_unquiesced_stage_kept

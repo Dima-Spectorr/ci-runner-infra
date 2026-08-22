@@ -321,8 +321,31 @@ function Resolve-StagedHardLink {
         }
         if ($links -le 1) { continue }
         if (-not $PSCmdlet.ShouldProcess($f.FullName, 'break the hard link by copying')) { continue }
-        $spare = $f.FullName + '.ci-flatten'
-        [System.IO.File]::Copy($f.FullName, $spare, $true)
+        # A NAME NOTHING IN THE TREE CAN ALREADY OWN. `<name>.ci-flatten` is a
+        # path inside the cache, and the cache is written by third-party install
+        # code: a package shipping both `foo` and `foo.ci-flatten` had the second
+        # one OVERWRITTEN by the copy and then unlinked by the move -- a real
+        # cache file deleted, and its stale $Files entry then either fails the
+        # link-count read below or is silently dropped from the archive. So the
+        # scratch sibling is a fresh GUID and the copy refuses to overwrite:
+        # a collision is an error to retry, never a file to replace.
+        $spare = $null
+        for ($i = 0; $i -lt 8 -and -not $spare; $i++) {
+            $candidate = $f.FullName + '.ci-flatten-' + [guid]::NewGuid().ToString('n')
+            try {
+                [System.IO.File]::Copy($f.FullName, $candidate, $false)
+                $spare = $candidate
+            } catch [System.IO.IOException] {
+                # Only a name that turned out to exist is retried. Anything else
+                # -- no space, a denied path -- is the real failure and is raised.
+                if (-not ([System.IO.File]::Exists($candidate) -or
+                          [System.IO.Directory]::Exists($candidate))) { throw }
+            }
+        }
+        if (-not $spare) {
+            throw ("no free scratch name could be found next to $(Get-SafeText $f.FullName), so its " +
+                'hard link cannot be broken -- and the publish job refuses an archive that still has one')
+        }
         [System.IO.File]::Delete($f.FullName)
         [System.IO.File]::Move($spare, $f.FullName)
         $flattened++
@@ -907,18 +930,26 @@ function Invoke-PrepareInJob {
             $exit = [CiJobObject]::ExitCodeOf($handle)
         }
     } finally {
-        # Kill THEN close: closing alone would kill on the last handle anyway, but
-        # only once every handle to the job had gone, and "the tree is quiet now"
-        # has to be true at the point the next line reads it.
-        [CiJobObject]::Kill($job)
         try {
+            # Kill THEN close: closing alone would kill on the last handle anyway,
+            # but only once every handle to the job had gone, and "the tree is
+            # quiet now" has to be true at the point the next line reads it.
+            #
+            # INSIDE the try, not before it. TerminateJobObject can report
+            # failure, and the wrapper now raises when it does -- which, thrown
+            # from in front of the try, skipped both the flag below and the
+            # handle-closing finally, and handed Remove-StageSafely the exact
+            # state the flag exists to keep it away from.
+            [CiJobObject]::Kill($job)
             Wait-JobObjectDrained -Job $job -TimeoutSeconds 60
         } catch {
             # THE ONE STATE THE CLEANUP MUST NOT ACT ON. Everything
             # Remove-StageSafely does is safe because the tree is quiet: it scans
             # for reparse points and then recursively deletes what scanned clean.
-            # A drain that did not finish is the statement that the tree is NOT
-            # quiet -- a surviving process can plant a junction in the window
+            # A drain that did not finish -- or a kill that was never carried
+            # out, which is the same statement one step earlier -- is the
+            # statement that the tree is NOT quiet: a surviving process can
+            # plant a junction in the window
             # between that scan and the delete, and 5.1's Remove-Item follows it.
             # The scan cannot be made atomic, so the delete is given up instead.
             # This runner is ephemeral; the stage goes when the machine does.
