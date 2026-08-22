@@ -1,6 +1,7 @@
 # One workflow run, one host — and one shared infrastructure stack on it
 
-Status: **proposed** (design only; nothing here is implemented).
+Status: **accepted** 2026-08-22. Implementation lands phase by phase; the
+delivery table in §6 is the record of what is live.
 Scope: every repository on the fleet, both pools.
 Related: [`ci-lane-model.md`](ci-lane-model.md) decides *how much* CI a diff
 deserves; this decides *where* that CI runs and *what it shares*.
