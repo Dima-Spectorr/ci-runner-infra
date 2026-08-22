@@ -18,14 +18,49 @@ output "autoscaler_name" {
   value       = google_compute_region_autoscaler.hosts.name
 }
 
+# `one()` and not `[0]`: with manage_controller = false there is no controller,
+# and an index into an empty list fails the PLAN with an error about the output
+# rather than about the pool. Null is the honest answer — this pool's controller
+# is somewhere else.
 output "controller_instance" {
-  description = "Name of the always-on controller VM (poller, drainer, metric publisher)."
-  value       = google_compute_instance.controller.name
+  description = "Name of the always-on controller VM, or null when a shared controller serves this pool."
+  value       = one(google_compute_instance.controller[*].name)
 }
 
 output "controller_zone" {
-  description = "Zone of the controller VM."
-  value       = google_compute_instance.controller.zone
+  description = "Zone of the controller VM, or null when a shared controller serves this pool."
+  value       = one(google_compute_instance.controller[*].zone)
+}
+
+# THE POOL, AS THE CONTROLLER'S TABLE WANTS IT.
+#
+# A consumer wiring four pools to one controller passes
+# `pools = [for m in [module.lin_ci, module.win_ci, ...] : m.pool_descriptor]`
+# and retypes nothing. That matters more than it looks: `mig` is the MIG's
+# GENERATED name, not `var.name`, and a descriptor written by hand gets it wrong
+# in a way that produces a controller which lists an empty instance group
+# forever and reports a perfectly healthy empty pool.
+#
+# Keys the table gives a safe default are deliberately ABSENT rather than
+# restated — `role`, `beacon_interval`, `pin_orphan_grace_seconds`. One default,
+# in pool-table.sh, where the self-test can reach it.
+output "pool_descriptor" {
+  description = "This pool as one row of a controller's `ci-pools` table. Feed to modules/ci-runner-controller."
+  value = {
+    name                     = var.name
+    mig                      = google_compute_region_instance_group_manager.hosts.name
+    region                   = var.region
+    slots                    = var.slots_per_host
+    min_hosts                = var.min_hosts
+    max_hosts                = var.max_hosts
+    drain_grace_seconds      = var.drain_grace_seconds
+    register_grace_seconds   = var.register_grace_seconds
+    orphan_confirm_ticks     = var.orphan_confirm_ticks
+    recycle_max_unavailable  = var.recycle_max_unavailable
+    host_os                  = var.host_os
+    mints_registration_token = var.controller_mints_registration_token
+    runner_labels            = local.runner_labels
+  }
 }
 
 output "runner_labels" {
