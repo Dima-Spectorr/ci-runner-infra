@@ -3,6 +3,10 @@
 Status: **proposed** (design only; nothing here is implemented).
 Supersedes: the "Windows" section of `docs/onboarding-a-repository.md`, which
 records the current state rather than a decision.
+Amended 2026-08-22: §4's refusal of a container runtime is re-affirmed, and the
+gap it leaves — a Windows job needing a database — is answered by
+[`adr-pr-host-affinity.md`](adr-pr-host-affinity.md) with reachability rather
+than a runtime. Nothing in this document changes.
 Amended 2026-08-22: phase 7, the per-slot dependency cache, is added to
 §3 and closes issue #150; it supersedes the "warm cache" half of what §4 says
 Windows does not get.
