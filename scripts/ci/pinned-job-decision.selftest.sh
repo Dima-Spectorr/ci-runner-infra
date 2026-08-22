@@ -156,8 +156,18 @@ else
   printf 'FAIL %s
 ' "only $_inc paths count pinned demand -- a refused or un-retried cancel reports zero"; fail=1
 fi
+# BOTH SIDES SUBTRACT A LABEL SET before calling a job pinned, and neither reads
+# a bare `host-` prefix as one. They subtract different sets on purpose: demand
+# is computed per pool and asks about THIS pool's labels, while the pin sweep
+# runs once for every pool in the table and so asks about their union. A pool
+# that carries `host-large` therefore keeps its jobs on ci_demand, and the sweep
+# does not report them as pins on nobody's behalf.
 # shellcheck disable=SC2016  # a jq fragment: `$mine_labels` is jq's variable, not the shell's
-src_has "the pin filter and the demand filter agree on what a pin is" '- $mine_labels | length) > 0 )'
+src_has "the demand filter subtracts this pool's own labels" '- $mine_labels | length) == 0 )'
+# shellcheck disable=SC2016  # a jq fragment: `$known_labels` is jq's variable, not the shell's
+src_has "the pin filter subtracts every label the pool table knows" '- $known_labels | length) > 0 )'
+# shellcheck disable=SC2016  # a jq fragment: `$pools` is jq's variable, not the shell's
+src_has "and that set is the union over the pool table" '([ $pools | to_entries[] | .value[] ] | unique) as $known_labels'
 src_has "a pinned record falls back to started_at when created_at is absent" '(.created_at // .started_at // "")'
 
 [ "$fail" = 0 ] && printf '\npinned-job-decision: all cases pass\n'
