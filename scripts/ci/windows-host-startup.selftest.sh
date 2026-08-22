@@ -1762,7 +1762,13 @@ has_bounded_native_calls() { # <file>
   # The wait has a deadline and the deadline is acted on. Without the kill the
   # wrapper is an ordinary blocking call with extra words.
   matches "$code" 'WaitForExit\(\$TimeoutSeconds \* 1000\)' || return 1
-  matches "$code" '\$proc\.Kill\(\)' || return 1
+  # ANCHORED ON ITS OWN LINE, because phase 7's snapshot fetch now has a
+  # $proc.Kill() of its own -- spelled `try { $proc.Kill() } catch { ... }`, all
+  # on one line. Unanchored, that second site kept this assertion green while
+  # Invoke-BoundedNative's deadline did nothing but log, which is the exact
+  # failure the wrapper exists to prevent. The mutation below targets the
+  # standalone-line form; the match has to be the same shape or it tests nothing.
+  matches "$code" '^ *\$proc\.Kill\(\)$' || return 1
 
   # A bound of zero reads as ALREADY OVER, never as unbounded -- the reading
   # Test-CacheSeedBudgetExpired takes, for the reason it gives.
