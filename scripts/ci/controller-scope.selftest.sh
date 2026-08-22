@@ -660,9 +660,24 @@ check "regtoken: F4 — a substring key match adopts the wrong key" \
 # controller runs. Flipping either of these turns on credential-writing into
 # instance metadata for pools that have no reason for it and no Windows host to
 # consume it.
-# shellcheck disable=SC2016
-grep -q 'MINT_REG=${MINT_REG:-false}' "$CTRL" && r=yes || r=no
-check "regtoken: minting defaults OFF when the metadata key is absent" yes "$r"
+# It used to default here, from one metadata key. It now arrives per POOL, off
+# a table row, so the default has TWO halves and both are asserted: the file
+# scope the controller starts from, and the parser that fills the row. Either
+# one alone can be true while a pool still mints — a row is only as safe as the
+# column it did not set.
+grep -q '^MINT_REG=false$' "$CTRL" && r=yes || r=no
+check "regtoken: minting is OFF at file scope, before any pool is selected" yes "$r"
+
+# And the column itself: the parser emits the literal string `false` for
+# anything that is not boolean true or the string "true". This is where a
+# hand-written table's `mints_registration_token: "no"` — truthy to jq, and to
+# nothing else — is turned into a refusal rather than a licence to write
+# credentials into instance metadata for a pool that has no host to read them.
+r=$(printf '%s' '[{"name":"p","mig":"m","region":"r","runner_labels":"l",
+                   "mints_registration_token":"no"}]' |
+  { . "$ROOT/modules/ci-runner-host-pool/scripts/pool-table.sh"
+    pool_table_parse 2>/dev/null | cut -f12; })
+check "regtoken: the pool table refuses a non-true mint column" false "$r"
 # shellcheck disable=SC2016
 grep -q 'if \[ "$MINT_REG" = "true" \] && \[ -n "$host_uri" \]' "$CTRL" && r=yes || r=no
 check "regtoken: the tick calls the step only on an opted-in pool" yes "$r"

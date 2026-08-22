@@ -285,6 +285,20 @@ jobs:
           }
           if ($r.FailedCount -gt 0) { throw "$($r.FailedCount) Pester test(s) failed" }
 
+      # Ahead of every decision rule below, because all of them run against a
+      # row this parser produced. A dropped row is not a failure the fleet
+      # reports: that pool simply stops being ticked, and its ONLY_UP autoscaler
+      # holds its last size forever while every dashboard stays green.
+      - name: pool-table self-test
+        run: bash scripts/ci/pool-table.selftest.sh
+
+      # The three ways one controller serving four pools can corrupt a pool it
+      # is not currently ticking — a stale MIG template, another pool's state
+      # markers, another pool's recycle budget — plus the pre-table controller
+      # still booting. None of them is visible in a boot log.
+      - name: multi-pool self-test
+        run: bash scripts/ci/multi-pool.selftest.sh
+
       - name: drain-decision self-test
         run: bash scripts/ci/drain-decision.selftest.sh
 
