@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# Every predicate below is invoked through its NAME, held in a variable, by
+# assert() and mutate() -- which is the whole design: the same predicate has to
+# run against the real file and against a mutated copy, and a caller that named
+# it directly could not do both. shellcheck's reachability pass sees no direct
+# call and reports the entire file as dead code.
+# shellcheck disable=SC2317
 # Self-test for the Windows snapshot BUILD phase's structural invariants.
 #
 # Its companions are the Pester suite over the pure functions
@@ -45,13 +51,6 @@
 
 set -uo pipefail
 
-# Every predicate below is invoked through its NAME, held in a variable, by
-# assert() and mutate() -- which is the whole design: the same predicate has to
-# run against the real file and against a mutated copy, and a caller that named
-# it directly could not do both. shellcheck's reachability pass sees no direct
-# call and reports the entire file as dead code.
-# shellcheck disable=SC2317
-
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/build-cache-snapshot.ps1"
 HOST_SCRIPT="$HERE/../../modules/ci-runner-host-pool/scripts/windows-host-startup.ps1"
@@ -88,7 +87,7 @@ has_event_guard() { # <file>
 
 has_job_object_reap() { # <file>
   code "$1" | grep -q '\[CiJobObject\]::CreateKillOnClose()' || return 1
-  code "$1" | grep -q '\[CiJobObject\]::Assign($job, $proc.Handle)' || return 1
+  code "$1" | grep -q '\[CiJobObject\]::StartSuspendedInJob($job, $line, $WorkingDirectory)' || return 1
   # Kill and Close BOTH, and in the finally: closing alone reaps only when the
   # .NET finalizer gets round to the handle, which is not a point in time this
   # script can name.
@@ -105,7 +104,7 @@ has_kill_on_close_flag() { # <file>
 }
 
 has_bounded_prepare() { # <file>
-  code "$1" | grep -q 'WaitForExit($TimeoutSeconds \* 1000)' || return 1
+  code "$1" | grep -q '\[CiJobObject\]::Wait($handle, $TimeoutSeconds \* 1000)' || return 1
   # And the timeout is treated as a failure rather than logged: a half-populated
   # cache that publishes is worse than no snapshot.
   code "$1" | grep -q 'if ($run.TimedOut)' || return 1
@@ -133,7 +132,7 @@ has_hostile_scan_before_pack() { # <file>
   pack_line=$(grep -n '& \$tar -czf' "$1" | head -1 | cut -d: -f1)
   [ -n "$scan_line" ] && [ -n "$pack_line" ] || return 1
   [ "$scan_line" -lt "$pack_line" ] || return 1
-  code "$1" | grep -q 'if ($hostile) {' || return 1
+  code "$1" | grep -q '^        if ($hostile) {' || return 1
   code "$1" | grep -q 'throw "refusing to pack: $hostile"' || return 1
 }
 
@@ -149,8 +148,23 @@ has_hostile_stage_left_alone() { # <file>
   # Windows PowerShell 5.1's Remove-Item -Recurse DESCENDS a directory junction.
   # Deleting a tree that was just proved to contain one deletes the junction's
   # TARGET -- as the cleanup for refusing it.
-  code "$1" | grep -q '$keepStage = $true' || return 1
-  code "$1" | grep -q 'if ($keepStage) {' || return 1
+  #
+  # And the cleanup runs on the FAILURE paths too, which never reach the
+  # pack-time scan: a prepare command that timed out or exited non-zero is the
+  # likeliest one to have left a junction behind. So the scan lives in the
+  # cleanup, and the ONE recursive delete in this file is downstream of it.
+  local code delete_line scan_line
+  code=$(code "$1")
+  printf '%s' "$code" | grep -q 'Remove-StageSafely -Path $stage' || return 1
+  # exactly one recursive delete of the stage, and it is inside that function
+  [ "$(printf '%s\n' "$code" | grep -c 'Remove-Item -LiteralPath $Path -Recurse')" = 1 ] || return 1
+  [ "$(printf '%s\n' "$code" | grep -c 'Remove-Item -LiteralPath $stage -Recurse')" = 0 ] || return 1
+  scan_line=$(grep -n 'Get-StagedTreeRefusal -Entries $entries' "$1" | head -1 | cut -d: -f1)
+  delete_line=$(grep -n 'Remove-Item -LiteralPath $Path -Recurse' "$1" | head -1 | cut -d: -f1)
+  [ -n "$scan_line" ] && [ -n "$delete_line" ] || return 1
+  [ "$scan_line" -lt "$delete_line" ] || return 1
+  # a tree that could not be READ is not a tree that came back clean
+  printf '%s' "$code" | grep -q 'rootErrors.Count -gt 0 -or $treeErrors.Count -gt 0' || return 1
 }
 
 has_drain_after_kill() { # <file>
@@ -166,11 +180,34 @@ has_drain_after_kill() { # <file>
   code "$1" | grep -q 'ActiveProcesses' || return 1
 }
 
-has_unassigned_child_killed() { # <file>
-  # AssignProcessToJobObject can fail with the command already running. Dispose()
-  # frees a handle; it does not end a process. Without an explicit kill the
-  # prepare command outlives both the deadline and the tree it is writing into.
-  code "$1" | grep -q '$proc.Kill()' || return 1
+has_suspended_start() { # <file>
+  # The window between "the process is running" and "the process is in the job"
+  # is the window in which cmd.exe spawns the package manager OUTSIDE the job:
+  # unbounded by the deadline, unreached by kill-on-close, still writing into
+  # the tree while it is packed. CREATE_SUSPENDED closes it by construction.
+  local code create_line assign_line resume_line
+  code=$(code "$1")
+  printf '%s' "$code" | grep -q 'CreateSuspended = 0x00000004' || return 1
+  printf '%s' "$code" | grep -q 'StartSuspendedInJob' || return 1
+  # ...and Start-Process is gone: it has no suspended start to offer. The C#
+  # block comments explain why, and code() strips only #-comments, so the //
+  # ones go here.
+  ! printf '%s\n' "$code" | grep -v '^[[:space:]]*//' | grep -q 'Start-Process' || return 1
+  create_line=$(grep -n 'CreateSuspended, IntPtr.Zero, workingDirectory' "$1" | head -1 | cut -d: -f1)
+  assign_line=$(grep -n 'AssignProcessToJobObject(job, pi.Process)' "$1" | head -1 | cut -d: -f1)
+  resume_line=$(grep -n 'ResumeThread(pi.Thread)' "$1" | head -1 | cut -d: -f1)
+  [ -n "$create_line" ] && [ -n "$assign_line" ] && [ -n "$resume_line" ] || return 1
+  [ "$create_line" -lt "$assign_line" ] || return 1
+  [ "$assign_line" -lt "$resume_line" ] || return 1
+  # a process that could not be assigned never runs at all
+  printf '%s' "$code" | grep -q 'TerminateProcess(pi.Process, 1)' || return 1
+}
+
+has_packed_file_count() { # <file>
+  # tar packs the named cache directories. Counting every file under the staging
+  # root instead lets one stray marker stand in for a warm cache, and publishes
+  # an archive of empty directories that every host unpacks over its master.
+  code "$1" | grep -q 'script:CacheDirs -contains $_.FullName.Substring($prefix.Length)' || return 1
 }
 
 has_local_staging_root() { # <file>
@@ -194,7 +231,14 @@ has_archive_rooted_at_the_tool_names() { # <file>
 }
 
 has_stage_cleanup() { # <file>
-  code "$1" | grep -q 'Remove-Item -LiteralPath $stage -Recurse -Force' || return 1
+  # In the finally, so a throw between staging and packing does not leave the
+  # tree behind -- and THROUGH Remove-StageSafely, which is the only delete that
+  # first proves the tree is free of reparse points. A direct Remove-Item here
+  # would still clean up; it would just do it by following whatever a prepare
+  # command pointed at.
+  code "$1" | grep -q 'Remove-StageSafely -Path $stage' || return 1
+  code "$1" | grep -q 'Remove-Item -LiteralPath $stage' && return 1
+  return 0
 }
 
 has_inert_dot_source() { # <file>
@@ -241,7 +285,8 @@ assert "the tool list matches the host's, name for name and in order" has_matchi
 assert "the staging root itself is scanned, not only its descendants" has_root_in_hostile_scan
 assert "a tree with a reparse point is left, not recursively deleted"  has_hostile_stage_left_alone
 assert "the job is drained before the tree is read"                    has_drain_after_kill
-assert "a child that could not be assigned to the job is killed"       has_unassigned_child_killed
+assert "the prepare command is in the job before it can run"           has_suspended_start
+assert "the emptiness check counts only what tar packs"                has_packed_file_count
 assert "there is a staging root off Actions too"                       has_local_staging_root
 
 # --- mutations ---------------------------------------------------------------
@@ -271,8 +316,8 @@ mutate "the event guard dropped" \
   's|^    if (-not (Test-SnapshotEventAllowed.*$|    if ($false) {|' \
   has_event_guard
 
-mutate "the process assigned to no job object" \
-  's|^ *\[CiJobObject\]::Assign($job, $proc.Handle)$|        $null = $job|' \
+mutate "the prepare command started outside the job" \
+  's|^        $started = \[CiJobObject\]::StartSuspendedInJob(.*$|        $null = $job|' \
   has_job_object_reap
 
 mutate "the job closed without being terminated first" \
@@ -284,7 +329,7 @@ mutate "a job object created with no limits at all" \
   has_kill_on_close_flag
 
 mutate "the deadline replaced by an unbounded wait" \
-  's|WaitForExit($TimeoutSeconds \* 1000)|WaitForExit()|' \
+  's|Wait($handle, $TimeoutSeconds \* 1000)|Wait($handle, -1)|' \
   has_bounded_prepare
 
 mutate "a timeout logged instead of failing the build" \
@@ -308,16 +353,28 @@ mutate "only the staged tree's descendants scanned" \
   has_root_in_hostile_scan
 
 mutate "a hostile tree recursively deleted anyway" \
-  's|^            $keepStage = $true$|            $null = $stage|' \
+  's|^        Remove-StageSafely -Path $stage$|        Remove-Item -LiteralPath $stage -Recurse -Force|' \
+  has_hostile_stage_left_alone
+
+mutate "an unreadable tree deleted as if it were clean" \
+  's|^    if ($rootErrors.Count -gt 0 -or $treeErrors.Count -gt 0) {$|    if ($false) {|' \
   has_hostile_stage_left_alone
 
 mutate "the job terminated but never drained" \
   's|^        Wait-JobObjectDrained -Job $job -TimeoutSeconds 60$|        $null = $job|' \
   has_drain_after_kill
 
-mutate "an unassignable child left running" \
-  's|^                $proc.Kill()$|                $null = $proc|' \
-  has_unassigned_child_killed
+mutate "the prepare command started running before it is assigned" \
+  's|CreateSuspended, IntPtr.Zero, workingDirectory|0, IntPtr.Zero, workingDirectory|' \
+  has_suspended_start
+
+mutate "resumed before it is in the job" \
+  's|^            if (!AssignProcessToJobObject(job, pi.Process))$|            if (ResumeThread(pi.Thread) == 0 \&\& !AssignProcessToJobObject(job, pi.Process))|' \
+  has_suspended_start
+
+mutate "every staged file counted, not only the packed ones" \
+  's|($script:CacheDirs -contains $_.FullName.Substring($prefix.Length).Split(.\\.)\[0\])|$true|' \
+  has_packed_file_count
 
 mutate "no staging root off Actions" \
   's|\[System.IO.Path\]::GetTempPath()|$env:RUNNER_TEMP|' \
@@ -332,7 +389,7 @@ mutate "the archive rooted at the staging path instead of the tool names" \
   has_archive_rooted_at_the_tool_names
 
 mutate "the staging tree left on disk" \
-  's|^ *Remove-Item -LiteralPath $stage -Recurse -Force.*$|            $null = $stage|' \
+  's|^        Remove-StageSafely -Path $stage$|        $null = $stage|' \
   has_stage_cleanup
 
 mutate "the entry-point guard removed, so dot-sourcing runs main" \

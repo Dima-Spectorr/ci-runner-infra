@@ -136,10 +136,19 @@ Describe 'the cache variables the install runs under' {
         $vars['npm_config_store_dir'] | Should -Be 'C:\stage\pnpm-store'
     }
 
-    # Maven takes a -D on the command line rather than a variable of its own.
+    # Maven takes a -D on the command line rather than a variable of its own,
+    # and mvn.cmd re-splits MAVEN_ARGS on whitespace: the staging root is under
+    # RUNNER_TEMP on Actions but under a user profile on a local build, and
+    # 'C:\Users\Some One\AppData\...' unquoted is two arguments and a Maven
+    # repository somewhere nobody packs.
     It 'passes the maven repository as an argument, not as a path' {
         (Get-CacheToolEnvironment -Root 'C:\stage')['MAVEN_ARGS'] |
-            Should -Be '-Dmaven.repo.local=C:\stage\m2'
+            Should -Be '-Dmaven.repo.local="C:\stage\m2"'
+    }
+
+    It 'quotes a staging root containing a space' {
+        (Get-CacheToolEnvironment -Root 'C:\Users\Some One\stage')['MAVEN_ARGS'] |
+            Should -Be '-Dmaven.repo.local="C:\Users\Some One\stage\m2"'
     }
 
     # The list here and the host's $script:CacheDirs are two copies of one fact:

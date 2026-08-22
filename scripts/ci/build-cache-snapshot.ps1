@@ -179,7 +179,13 @@ function Get-CacheToolEnvironment {
         GOMODCACHE            = "$Root\go-mod"
         PIP_CACHE_DIR         = "$Root\pip"
         UV_CACHE_DIR          = "$Root\uv"
-        MAVEN_ARGS            = "-Dmaven.repo.local=$Root\m2"
+        # QUOTED, where the host's copy is not. mvn.cmd expands MAVEN_ARGS onto a
+        # command line, so an unquoted path containing a space becomes two
+        # arguments and Maven writes its repository somewhere else -- or fails.
+        # The host's slot caches live at C:\ci\cache\<idx>\m2, a path this
+        # module chooses and which cannot contain a space; a staging root can sit
+        # under a user profile, which routinely can.
+        MAVEN_ARGS            = "-Dmaven.repo.local=`"$Root\m2`""
         NUGET_PACKAGES        = "$Root\nuget"
         COMPOSER_CACHE_DIR    = "$Root\composer"
     }
@@ -263,10 +269,32 @@ public static class CiJobObject
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length, out uint returned);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateProcess(
+        string applicationName, System.Text.StringBuilder commandLine,
+        IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles,
+        uint creationFlags, IntPtr environment, string currentDirectory,
+        ref StartupInformation startupInformation, out ProcessInformation processInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr thread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
 
     private const int BasicAccountingInformation = 1;
+    private const uint CreateSuspended = 0x00000004;
+    private const uint WaitTimeout = 0x00000102;
+    private const uint StillActive = 259;
     private const int ExtendedLimitInformation = 9;
     private const int LimitKillOnJobClose = 0x2000;
 
@@ -297,6 +325,38 @@ public static class CiJobObject
         public UIntPtr Affinity;
         public uint PriorityClass;
         public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ProcessInformation
+    {
+        public IntPtr Process;
+        public IntPtr Thread;
+        public int ProcessId;
+        public int ThreadId;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct StartupInformation
+    {
+        public int Cb;
+        public string Reserved;
+        public string Desktop;
+        public string Title;
+        public int X;
+        public int Y;
+        public int XSize;
+        public int YSize;
+        public int XCountChars;
+        public int YCountChars;
+        public int FillAttribute;
+        public int Flags;
+        public short ShowWindow;
+        public short Reserved2Length;
+        public IntPtr Reserved2;
+        public IntPtr StdInput;
+        public IntPtr StdOutput;
+        public IntPtr StdError;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -352,6 +412,91 @@ public static class CiJobObject
         }
 
         return job;
+    }
+
+    // START SUSPENDED, ASSIGN, THEN RESUME -- IN THAT ORDER, AND THE ORDER IS
+    // THE WHOLE POINT.
+    //
+    // Start-Process returns a RUNNING process, and AssignProcessToJobObject adds
+    // that process to the job without retroactively adopting anything it has
+    // already spawned. cmd.exe's first act is to spawn the package manager, so a
+    // start-then-assign is a real race whose loser is a descendant OUTSIDE the
+    // job: unbounded by the deadline, unreached by kill-on-close, and still
+    // writing into the staged tree while it is scanned and packed. The archive
+    // digest cannot see it -- it hashes whatever was produced, partial or not.
+    //
+    // CREATE_SUSPENDED closes the window by construction rather than narrowing
+    // it: the process exists, has a pid and a handle, and has not executed one
+    // instruction. It is in the job before it is allowed to run, so every
+    // descendant it ever has is in the job too.
+    //
+    // The command LINE is built by the caller, not an argument array, for the
+    // same reason the Linux side uses `sh -euc`: CACHE_PREPARE arrives as a
+    // command line with its own flags and quoting. `cmd /s /c "<line>"` strips
+    // exactly the first and last quote and takes the rest literally, which is
+    // what a caller writing a shell command expects -- and is NOT what .NET's
+    // argument escaping would have produced for a command containing quotes.
+    public static ProcessInformation StartSuspendedInJob(IntPtr job, string commandLine, string workingDirectory)
+    {
+        StartupInformation si = new StartupInformation();
+        si.Cb = Marshal.SizeOf(typeof(StartupInformation));
+        ProcessInformation pi;
+        System.Text.StringBuilder line = new System.Text.StringBuilder(commandLine);
+        if (!CreateProcess(null, line, IntPtr.Zero, IntPtr.Zero, false,
+                CreateSuspended, IntPtr.Zero, workingDirectory, ref si, out pi))
+        {
+            throw new InvalidOperationException("CreateProcess failed: " + Marshal.GetLastWin32Error());
+        }
+
+        try
+        {
+            if (!AssignProcessToJobObject(job, pi.Process))
+            {
+                throw new InvalidOperationException("AssignProcessToJobObject failed: " + Marshal.GetLastWin32Error());
+            }
+            if (ResumeThread(pi.Thread) == 0xFFFFFFFF)
+            {
+                throw new InvalidOperationException("ResumeThread failed: " + Marshal.GetLastWin32Error());
+            }
+        }
+        catch
+        {
+            // It never ran, so there is nothing of it anywhere else -- but the
+            // handles are ours, and a suspended process nobody resumes would sit
+            // there holding the staging tree open.
+            TerminateProcess(pi.Process, 1);
+            CloseHandle(pi.Thread);
+            CloseHandle(pi.Process);
+            throw;
+        }
+
+        CloseHandle(pi.Thread);
+        pi.Thread = IntPtr.Zero;
+        return pi;
+    }
+
+    // The process HANDLE, never the pid. It is held for the whole life of the
+    // call, which is what keeps Windows from recycling the pid underneath us --
+    // a Get-Process by pid after the resume could name a different process.
+    public static bool Wait(IntPtr process, int milliseconds)
+    {
+        return WaitForSingleObject(process, (uint)milliseconds) != WaitTimeout;
+    }
+
+    public static int ExitCodeOf(IntPtr process)
+    {
+        uint code;
+        if (!GetExitCodeProcess(process, out code))
+        {
+            throw new InvalidOperationException("GetExitCodeProcess failed: " + Marshal.GetLastWin32Error());
+        }
+        if (code == StillActive) { return -1; }
+        return unchecked((int)code);
+    }
+
+    public static void CloseProcess(IntPtr process)
+    {
+        if (process != IntPtr.Zero) { CloseHandle(process); }
     }
 
     public static void Assign(IntPtr job, IntPtr process)
@@ -436,6 +581,54 @@ function Wait-JobObjectDrained {
     }
 }
 
+function Remove-StageSafely {
+    <#
+      .SYNOPSIS
+        Delete the staging tree, unless it cannot be shown to be safe to delete.
+      .DESCRIPTION
+        Windows PowerShell 5.1's `Remove-Item -Recurse` DESCENDS a directory
+        junction and deletes what it POINTS AT (PowerShell/PowerShell#621, fixed
+        in 6.0 and never backported). The staging tree is written by CACHE_PREPARE
+        -- third-party install code -- so "is there a reparse point in here" is
+        not a question the cleanup may skip.
+
+        And it may not skip it on the FAILURE paths either, which is the whole
+        reason this is a function rather than a flag on the success path. A
+        prepare command that times out, exits non-zero, or plants a junction over
+        the staging root reaches the cleanup without the pack-time scan ever
+        having run -- and those are exactly the runs most likely to have left one.
+
+        The scan must SUCCEED before its result means anything: an entry that
+        could not be read is not an entry that came back clean. So a scan error
+        leaves the tree too. What is left costs the runner some disk until its own
+        teardown reclaims it; the other branch costs whatever the junction named.
+
+        Get-ChildItem -Recurse does not descend a reparse point unless
+        -FollowSymlink is given, so the scan itself is safe on the tree it judges.
+    #>
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    $rootErrors = @()
+    $treeErrors = @()
+    $entries = @(Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue -ErrorVariable rootErrors) +
+        @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable treeErrors)
+    if ($rootErrors.Count -gt 0 -or $treeErrors.Count -gt 0) {
+        Write-BuildLog ("left $Path on disk: $($rootErrors.Count + $treeErrors.Count) entr(ies) could not be " +
+            'read, so it cannot be shown to be free of reparse points and a recursive delete might follow one')
+        return
+    }
+
+    $hostile = Get-StagedTreeRefusal -Entries $entries
+    if ($hostile) {
+        Write-BuildLog "left $Path on disk: $hostile, and a recursive delete would follow it"
+        return
+    }
+
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 function Invoke-PrepareInJob {
     <#
       .SYNOPSIS
@@ -455,55 +648,31 @@ function Invoke-PrepareInJob {
 
     Initialize-CiJobObjectType
     $job = [CiJobObject]::CreateKillOnClose()
-    $proc = $null
+    $handle = [IntPtr]::Zero
     $timedOut = $false
     $exit = -1
     try {
-        # cmd.exe /d /s /c, because the caller supplies a command LINE with its
-        # own flags and quoting -- the same decision, for the same reason, as the
-        # Linux side's `sh -euc` rather than an array. /d skips AutoRun, which is
-        # a registry value any earlier step could have written.
-        $proc = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" `
-            -ArgumentList @('/d', '/s', '/c', $Command) `
-            -WorkingDirectory $WorkingDirectory -PassThru -NoNewWindow
+        # cmd.exe /d /s /c: /d skips AutoRun, which is a registry value any
+        # earlier step could have written. The quoting is /s's contract -- see
+        # StartSuspendedInJob for why a command LINE and not an argument array.
+        $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+        $line = '"' + $cmd + '" /d /s /c "' + $Command + '"'
+        $started = [CiJobObject]::StartSuspendedInJob($job, $line, $WorkingDirectory)
+        $handle = $started.Process
 
-        # Assigned AFTER the start and that is a real, narrow race: a process that
-        # forks a descendant before it is assigned leaves that descendant outside
-        # the job. Windows PowerShell 5.1 cannot start a process suspended without
-        # a second P/Invoke of CreateProcess itself, which would replace this
-        # whole function; the window is microseconds of process startup, and the
-        # digest pin on the archive is the detector for what it cannot bound.
-        try {
-            [CiJobObject]::Assign($job, $proc.Handle)
-        } catch {
-            # The command is RUNNING and outside the job: kill-on-close will not
-            # reach it, the deadline below would not bound it, and it would go on
-            # writing into a tree this script is about to delete. The managed
-            # Dispose() in the finally frees a handle, it does not end a process,
-            # so the kill has to be explicit and has to happen here.
-            try {
-                $proc.Kill()
-                $null = $proc.WaitForExit(30000)
-            } catch {
-                Write-BuildLog "could not kill the unassigned prepare command: $($_.Exception.Message)"
-            }
-            throw
-        }
-
-        if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+        if (-not [CiJobObject]::Wait($handle, $TimeoutSeconds * 1000)) {
             $timedOut = $true
         } else {
-            $proc.WaitForExit()
-            $exit = $proc.ExitCode
+            $exit = [CiJobObject]::ExitCodeOf($handle)
         }
     } finally {
         # Kill THEN close: closing alone would kill on the last handle anyway, but
-        # only once the .NET finalizer got round to the process handle, and "the
-        # tree is quiet now" has to be true at the point the next line reads it.
+        # only once every handle to the job had gone, and "the tree is quiet now"
+        # has to be true at the point the next line reads it.
         [CiJobObject]::Kill($job)
         Wait-JobObjectDrained -Job $job -TimeoutSeconds 60
         [CiJobObject]::Close($job)
-        if ($proc) { $proc.Dispose() }
+        [CiJobObject]::CloseProcess($handle)
     }
 
     return [pscustomobject] @{
@@ -550,7 +719,6 @@ function Invoke-Main {
     $tempRoot = $env:RUNNER_TEMP
     if (-not $tempRoot) { $tempRoot = [System.IO.Path]::GetTempPath() }
     $stage = Join-Path $tempRoot ('cache-stage-' + [guid]::NewGuid().ToString('N'))
-    $keepStage = $false
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     foreach ($d in $script:CacheDirs) {
         New-Item -ItemType Directory -Path (Join-Path $stage $d) -Force | Out-Null
@@ -589,16 +757,35 @@ function Invoke-Main {
             @(Get-ChildItem -LiteralPath $stage -Recurse -Force -ErrorAction Stop)
         $hostile = Get-StagedTreeRefusal -Entries $entries
         if ($hostile) {
-            # Left on disk deliberately. Windows PowerShell 5.1's `Remove-Item
-            # -Recurse` DESCENDS a directory junction, so deleting a tree that was
-            # just proved to contain one would delete the junction's target -- the
-            # workspace, a profile, whatever it points at -- as the cleanup for
-            # refusing it. The runner's own teardown reclaims the stage.
-            $keepStage = $true
+            # Not deleted here, and not deleted by the cleanup either:
+            # Remove-StageSafely re-runs this same scan and leaves what it refuses.
             throw "refusing to pack: $hostile"
         }
 
-        $files = @($entries | Where-Object { -not $_.PSIsContainer })
+        # ONLY WHAT TAR WILL PACK COUNTS. The tar line names the cache
+        # directories, so a file the prepare command drops anywhere else under the
+        # staging root -- a log, a marker, a lockfile -- is silently absent from
+        # the archive. Counted as evidence of a warm cache it turns "every cache
+        # directory is empty" into a published snapshot of nothing but empty
+        # directories, which the Linux publish phase accepts and every host in the
+        # pool then unpacks OVER its warm master. This check is the only thing
+        # between an install that populated nothing and that outcome, so it counts
+        # the same set of files tar does.
+        $prefix = $stage.TrimEnd('\') + '\'
+        $files = @($entries | Where-Object {
+                -not $_.PSIsContainer -and
+                $_.FullName.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) -and
+                ($script:CacheDirs -contains $_.FullName.Substring($prefix.Length).Split('\')[0])
+            })
+        # Logged, not refused: tar drops them, so they change nothing about what is
+        # published -- but a prepare command whose output lands outside every cache
+        # directory is the shape of a misconfigured CACHE_PREPARE, and the
+        # emptiness throw below says nothing about where the files went.
+        $strays = @($entries | Where-Object { -not $_.PSIsContainer }).Count - $files.Count
+        if ($strays -gt 0) {
+            Write-BuildLog ("$strays file(s) under the staging root are outside every cache directory " +
+                'and are NOT packed -- check that CACHE_PREPARE honours the cache variables')
+        }
         Write-BuildLog "staged $($files.Count) file(s) across $($script:CacheDirs.Count) tool director(ies)"
         if ($files.Count -eq 0) {
             throw ('the staged tree is empty: CACHE_PREPARE installed nothing, or installed it somewhere ' +
@@ -630,11 +817,7 @@ function Invoke-Main {
         Write-BuildLog "archive $bytes byte(s), sha256 $digest"
         Write-BuildLog 'built. The publish job scans this archive and uploads it; this job holds no credential.'
     } finally {
-        if ($keepStage) {
-            Write-BuildLog "left $stage on disk: it contains a reparse point, and a recursive delete would follow it"
-        } else {
-            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        Remove-StageSafely -Path $stage
     }
 }
 
