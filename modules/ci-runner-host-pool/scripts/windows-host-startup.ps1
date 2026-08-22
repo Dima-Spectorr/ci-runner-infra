@@ -194,6 +194,23 @@ $script:CacheDirs = @('npm', 'yarn', 'pnpm-store', 'go-mod', 'pip', 'uv', 'm2', 
 # pool running cold because the last one would not have fitted.
 $script:CacheFreeFloorBytes = 25GB
 
+# HOW LONG PHASE 7 MAY SPEND BEFORE IT GIVES UP AND LETS THE HOST REGISTER.
+#
+# Every expensive thing in this phase -- the recursive scan of the master, the
+# two icacls tree walks, one robocopy per tool per slot -- takes time that is a
+# property of the IMAGE rather than of this code, and all of it is spent BEFORE
+# phase 5 registers an agent. A big enough cache therefore stops being slow and
+# starts being invisible: drain_decision.sh calls an agent-less host never
+# registered once the grace expires, the replacement is built from the same
+# image, and the pool rebuilds hosts forever over a cache that was only large.
+#
+# So the seeding is budgeted. When the budget is gone the remaining slots and
+# tools get empty directories -- the same cold cache every other phase-7 refusal
+# produces -- and the boot moves on. It is deliberately well under the
+# registration grace, because phase 7 is not the only thing that still has to
+# happen.
+$script:CacheSeedBudgetSeconds = 420
+
 # The loopback port the broker answers on when metadata does not name one. The
 # same default as the Linux broker, because it is the same broker.
 $script:DefaultBrokerPort = 8081
@@ -983,6 +1000,25 @@ function Test-RobocopySuccess {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][int] $ExitCode)
     return ($ExitCode -ge 0 -and $ExitCode -lt 8)
+}
+
+function Test-CacheSeedBudgetExpired {
+    <#
+      .SYNOPSIS
+        Whether phase 7 has spent its seeding budget. Pure.
+      .DESCRIPTION
+        A budget of zero or less reads as ALREADY EXPIRED rather than as "no
+        limit". The two readings are both defensible and only one of them is
+        safe: a bound that silently means unbounded is the failure this exists to
+        prevent, and the cost of the other mistake is a cold cache.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][double] $ElapsedSeconds,
+        [Parameter(Mandatory = $true)][double] $BudgetSeconds
+    )
+    if ($BudgetSeconds -le 0) { return $true }
+    return ($ElapsedSeconds -ge $BudgetSeconds)
 }
 
 function Test-CacheSeedAffordable {
@@ -2641,11 +2677,33 @@ function Protect-CacheMaster {
     # Install-BeaconService: under Stop, `2>&1` on a native command turns each
     # stderr line into a terminating NativeCommandError, and icacls writes a
     # per-file progress line there on a tree of any size.
+    # OWNERSHIP FIRST, BECAUSE A DACL IS NOT A LIMIT ON THE OWNER
+    #
+    # Neither /reset nor the grant below changes who OWNS an entry, and Windows
+    # gives an object's owner READ_CONTROL and WRITE_DAC whether or not any ACE
+    # says so. The owner check is satisfied by a GROUP SID in the token as well
+    # as by the user's own, so a warm_cache_script that leaves the tree owned by
+    # BUILTIN\Users -- which every slot account is in -- hands each slot the
+    # ability to rewrite the ACL of the read-only master and poison what the next
+    # boot copies into every other slot. Sealing the DACL without sealing the
+    # owner seals nothing.
+    #
+    # It runs after the scan for the same reason the reset does: /T follows a
+    # junction, and an ownership change applied to the wrong tree outlives the
+    # boot that applied it.
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    & icacls.exe $Master '/setowner' '*S-1-5-32-544' '/T' '/Q' 2>&1 | Out-Null
+    $ownerExit = $LASTEXITCODE
     & icacls.exe $Master '/reset' '/T' '/Q' 2>&1 | Out-Null
     $exit = $LASTEXITCODE
     $ErrorActionPreference = $previous
+    if ($ownerExit -ne 0) {
+        Write-BootLog ("phase 7: icacls could not take ownership of $Master (exit $ownerExit) -- " +
+            'an entry a slot still owns is an entry that slot can re-grant itself, so nothing ' +
+            'is seeded from this tree; cold cache')
+        return $false
+    }
     if ($exit -ne 0) {
         Write-BootLog ("phase 7: icacls could not reset the ACLs under $Master (exit $exit) -- " +
             'refusing to seed from a tree whose permissions are not proven; cold cache')
@@ -2735,6 +2793,7 @@ function Initialize-SlotCache {
         [Parameter(Mandatory = $true)][int] $Index,
         [Parameter(Mandatory = $true)][string] $User,
         [Parameter(Mandatory = $true)][bool] $Seed,
+        [datetime] $StartedUtc = [datetime]::UtcNow,
         [string] $Master = $script:CacheMaster
     )
 
@@ -2747,14 +2806,62 @@ function Initialize-SlotCache {
 
     # Staging trees from a boot that died mid-copy. Swept here, once, rather than
     # per tool: a stage is only ever published by rename, so anything still
-    # wearing the prefix is by definition a copy that never completed. Only
-    # SYSTEM can create a name in $dst, so these are our own leftovers and not
-    # something a slot planted. Best effort -- a stage that will not delete costs
-    # disk, and the unique names below mean it cannot be mistaken for a new one.
-    Get-ChildItem -LiteralPath $dst -Filter '.seed-*' -Force -ErrorAction SilentlyContinue |
-        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    # wearing the prefix is by definition a copy that never completed.
+    #
+    # AND EACH ONE IS SCANNED BEFORE IT IS DELETED, for the same reason the
+    # retired-slot sweep in Invoke-Phase7DependencyCache is. Only SYSTEM can
+    # create the stage DIRECTORY -- $dst is SYSTEM's -- but the stage's CONTENTS
+    # carry the slot's Modify grant, because Protect-CiDirectory puts it there
+    # before robocopy runs so every copied file inherits it. So a job that ran
+    # while a stage was left behind could have planted a junction inside it, and
+    # this Remove-Item runs as SYSTEM under Windows PowerShell 5.1, which follows
+    # one and deletes what it POINTS AT (PowerShell/PowerShell#621).
+    #
+    # A stale stage that cannot be shown to be safe is therefore left on disk.
+    # It costs disk and is logged; the unique names below mean it can never be
+    # mistaken for a stage this boot created, so leaving it is inert.
+    foreach ($stale in @(Get-ChildItem -LiteralPath $dst -Filter '.seed-*' -Force -ErrorAction SilentlyContinue)) {
+        $inside = @(Get-ChildItem -LiteralPath $stale.FullName -Recurse -Force -ErrorAction SilentlyContinue)
+        $staleReason = Get-CacheHostileReason -Entries (@($stale) + $inside)
+        if ($staleReason) {
+            Write-BootLog ("phase 7: slot $Index -- a stale staging tree is NOT being removed -- " +
+                $staleReason)
+            continue
+        }
+        Remove-Item -LiteralPath $stale.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
 
     foreach ($tool in $script:CacheDirs) {
+        # THE BUDGET AND THE FLOOR ARE BOTH RE-READ PER TOOL, NOT ONCE PER SLOT.
+        #
+        # Both quantities move while this loop runs and both were measured before
+        # it started. The floor was checked against `Get-CacheMasterSize`, which
+        # sums file LENGTH -- not allocated size, not alternate data streams, and
+        # robocopy /COPY:DAT copies streams it did not count. A master built to
+        # understate itself therefore passes the check and then overruns it, and
+        # the volume it fills is the one every OTHER slot's job is running on.
+        # Asking the volume again between copies costs one stat and bounds the
+        # overrun to a single tool directory: the one that overran does not get
+        # published, and the rest of the tools go cold.
+        #
+        # The budget is the same shape in time. Nine copies per slot, K slots,
+        # all before phase 5 registers anything -- see $script:CacheSeedBudgetSeconds.
+        if ($Seed) {
+            $spent = ([datetime]::UtcNow - $StartedUtc).TotalSeconds
+            if (Test-CacheSeedBudgetExpired -ElapsedSeconds $spent `
+                    -BudgetSeconds $script:CacheSeedBudgetSeconds) {
+                Write-BootLog ("phase 7: slot $Index -- the $([int] $script:CacheSeedBudgetSeconds)s " +
+                    "seeding budget is spent after $([int] $spent)s; $tool and everything after it " +
+                    'stay cold so this host can register')
+                $Seed = $false
+            } elseif ((Get-CacheVolumeFreeByte) -lt $script:CacheFreeFloorBytes) {
+                Write-BootLog ("phase 7: slot $Index -- the volume is under " +
+                    "$([int] ($script:CacheFreeFloorBytes / 1GB)) GB free part-way through the copy; " +
+                    "$tool and everything after it stay cold")
+                $Seed = $false
+            }
+        }
+
         $final = Join-Path $dst $tool
         # Already seeded on an earlier boot: leave it exactly as the slot left it.
         # Re-seeding would delete a warm cache to replace it with a colder one, and
@@ -2844,6 +2951,7 @@ function Invoke-Phase7DependencyCache {
     param([Parameter(Mandatory = $true)][array] $Provisioned)
 
     $paths = @{}
+    $startedUtc = [datetime]::UtcNow
     try {
         $slotUsers = @($Provisioned | ForEach-Object { $_.User })
         if (-not (Protect-CacheMaster -SlotUsers $slotUsers)) { return $paths }
@@ -2901,6 +3009,10 @@ function Invoke-Phase7DependencyCache {
 
         $masterBytes = Get-CacheMasterSize
         foreach ($slot in $Provisioned) {
+            # The clock started before the scan and the seal, not here: those are
+            # the two tree walks whose cost is set by the image, and a budget that
+            # excused them would be measuring the cheap half.
+
             $free = Get-CacheVolumeFreeByte
             $seed = Test-CacheSeedAffordable -MasterBytes $masterBytes -FreeBytes $free `
                 -FloorBytes $script:CacheFreeFloorBytes
@@ -2910,7 +3022,8 @@ function Invoke-Phase7DependencyCache {
                     "cache directories and warms from its own jobs instead")
             }
             try {
-                $paths[$slot.Index] = Initialize-SlotCache -Index $slot.Index -User $slot.User -Seed $seed
+                $paths[$slot.Index] = Initialize-SlotCache -Index $slot.Index -User $slot.User `
+                    -Seed $seed -StartedUtc $startedUtc
             } catch {
                 Write-BootLog "phase 7: slot $($slot.Index) -- could not build its cache: $($_.Exception.Message)"
             }

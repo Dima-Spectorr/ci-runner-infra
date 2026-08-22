@@ -631,6 +631,30 @@ build {
       # bounded before it reaches the build log — the same reason the Linux
       # template pipes its refusal through `tr`.
       "if ($bad.Count -gt 0) { $n = ($bad[0].FullName -replace '[\\x00-\\x1f]', ' '); throw \"the warm cache holds a reparse point: $($n.Substring(0, [Math]::Min(300, $n.Length)))\" }",
+      # OWNERSHIP BEFORE ACLS, because a DACL does not bind the owner. Windows
+      # gives an object's owner READ_CONTROL and WRITE_DAC with no ace saying so,
+      # and the owner check accepts a GROUP sid in the token, so a tree
+      # warm_cache_script left owned by BUILTIN\Users -- which every slot account
+      # is a member of -- is a tree each slot can re-grant itself write on after
+      # the seal below has "sealed" it. Same ordering rule as everything else in
+      # this block: it is after the scan, because /T follows a junction.
+      "& icacls.exe 'C:\\ci-cache' /setowner '*S-1-5-32-544' /T /Q | Out-Null",
+      "if ($LASTEXITCODE -ne 0) { throw \"icacls could not take ownership of C:\\ci-cache (exit $LASTEXITCODE)\" }",
+      # /reset /T next, and it is not redundant with /inheritance:r. The two do
+      # different things: /inheritance:r drops INHERITED aces, while an explicit
+      # ace written by warm_cache_script -- an elevated, repo-supplied script --
+      # survives it, and the three /grant operations only touch the three SIDs
+      # they name. A leftover `Everyone:(F)` on the root or on any descendant
+      # would therefore outlive this block and ship inside the image as a master
+      # every slot can write, which is the exact property this seal exists to
+      # deny. /reset /T clears the descendants to nothing but inheritance before
+      # the root ACL below becomes the only thing they inherit.
+      #
+      # It runs AFTER the reparse-point scan above, never before: /reset /T
+      # follows a junction, and an ACL applied to the wrong tree is not undone by
+      # anything later.
+      "& icacls.exe 'C:\\ci-cache' /reset /T /Q | Out-Null",
+      "if ($LASTEXITCODE -ne 0) { throw \"icacls could not clear the ACLs under C:\\ci-cache (exit $LASTEXITCODE)\" }",
       "& icacls.exe 'C:\\ci-cache' /inheritance:r /grant '*S-1-5-18:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-5-32-545:(OI)(CI)RX' /Q | Out-Null",
       "if ($LASTEXITCODE -ne 0) { throw \"icacls could not seal C:\\ci-cache (exit $LASTEXITCODE)\" }",
     ]

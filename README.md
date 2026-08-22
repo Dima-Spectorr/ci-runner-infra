@@ -302,8 +302,11 @@ that image a real answer is separate work, not a line in this one.
   **A warm cache is untrusted build input on Windows too.** `warm_cache_script`
   is arbitrary repo-supplied code running elevated in the build VM, and the tree
   it leaves behind is both ACL-walked and copied K times. The Linux scan refuses
-  five things; four of them have no Windows spelling, and the one that does is
-  the **reparse point**, refused at build time and again at boot. `icacls`
+  five things; three of them have no Windows spelling. Of the two that do, the
+  **reparse point** is refused at build time and again at boot; the out-of-tree
+  **NTFS hardlink** is not refused at all, and the seal rewrites the shared
+  security descriptor at the file's other name -- a known gap, tracked as #238,
+  because a link count needs a per-file `fsutil` call or a P/Invoke. `icacls`
   with `(OI)(CI)` follows a junction, so a junction aimed at `C:\Windows` is a
   read-and-execute grant applied *there* — and an ACL applied to the wrong tree
   is not undone by the next boot. `robocopy` follows one too, turning a cache
