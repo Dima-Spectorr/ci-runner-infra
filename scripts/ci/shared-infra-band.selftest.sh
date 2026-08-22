@@ -28,6 +28,7 @@ HOST_SH="${BAND_HOST_SH:-$ROOT/modules/ci-runner-host-pool/scripts/host-startup.
 NET_TF="${BAND_NET_TF:-$ROOT/modules/ci-runner-network/main.tf}"
 POOL_TF="${BAND_POOL_TF:-$ROOT/modules/ci-runner-host-pool/main.tf}"
 NET_VARS="${BAND_NET_VARS:-$ROOT/modules/ci-runner-network/variables.tf}"
+POOL_VARS="${BAND_POOL_VARS:-$ROOT/modules/ci-runner-host-pool/variables.tf}"
 
 fail=0
 ok()  { echo "  ok    $1"; }
@@ -35,7 +36,7 @@ bad() { echo "  FAIL  $1"; fail=1; }
 
 echo "shared-infra-band self-test:"
 
-for f in "$HOST_SH" "$NET_TF" "$POOL_TF" "$NET_VARS"; do
+for f in "$HOST_SH" "$NET_TF" "$POOL_TF" "$NET_VARS" "$POOL_VARS"; do
   if [ ! -r "$f" ]; then
     echo "  FAIL  missing $f — every check below would be vacuous"
     exit 1
@@ -276,6 +277,33 @@ else
   bad "the generated egress rule's name is not length-checked in the resource — either the check is gone, or it moved back into a variable validation where a 1.5 consumer cannot load it"
 fi
 
+# ---------------------------------------------------------------------------
+# The tag namespace is RESERVED, not merely conventional.
+#
+# `ci-shared-infra-src-<id>` and `ci-shared-infra-stack-<id>` are the whole
+# boundary: the firewall rules match on those strings and on nothing else. But
+# the pool name is applied to every host as a network tag too, and so is every
+# entry in var.network_tags. A pool named `ci-shared-infra-src-checkout` -- a
+# name the existing 63-char validation is perfectly happy with -- is thereby an
+# authorized source for pair `checkout`, in a pull request that never requested
+# it and quite possibly another repository's. Nothing downstream can tell that
+# tag from a minted one, because it IS the minted one.
+#
+# So the check has to live where names are accepted. Both doors, because a
+# caller writing the tag into var.network_tags by hand does not need a
+# plausible pool name at all.
+if grep -qF 'startswith(var.name, "ci-shared-infra-")' "$POOL_VARS"; then
+  ok "a pool may not NAME itself into a shared-infra tag namespace"
+else
+  bad "var.name accepts a ci-shared-infra- prefix — a pool name alone can join a pair's firewall rules"
+fi
+
+if grep -qF 'for t in var.network_tags : !startswith(t, "ci-shared-infra-")' "$POOL_VARS"; then
+  ok "a caller may not hand-write a shared-infra tag into network_tags"
+else
+  bad "network_tags accepts a ci-shared-infra- tag — the reservation on var.name is then just a speed bump"
+fi
+
 # --- mutations ----------------------------------------------------------------
 #
 # Every assertion above is a grep or a comparison, and both fail open in the
@@ -295,14 +323,15 @@ mutate() {
   # mutate <label> <file-key> <sed-expression>
   local label="$1" key="$2" expr="$3" out
   cp "$HOST_SH" "$tmp/host.sh"; cp "$NET_TF" "$tmp/net.tf"; cp "$POOL_TF" "$tmp/pool.tf"
-  cp "$NET_VARS" "$tmp/net-vars.tf"
+  cp "$NET_VARS" "$tmp/net-vars.tf"; cp "$POOL_VARS" "$tmp/pool-vars.tf"
   case "$key" in
     host) sed -i "$expr" "$tmp/host.sh" ;;
     net)  sed -i "$expr" "$tmp/net.tf"  ;;
     pool) sed -i "$expr" "$tmp/pool.tf" ;;
     vars) sed -i "$expr" "$tmp/net-vars.tf" ;;
+    poolvars) sed -i "$expr" "$tmp/pool-vars.tf" ;;
   esac
-  out=$(BAND_SELFTEST_CHILD=1 BAND_HOST_SH="$tmp/host.sh" BAND_NET_TF="$tmp/net.tf" BAND_POOL_TF="$tmp/pool.tf" BAND_NET_VARS="$tmp/net-vars.tf"         bash "${BASH_SOURCE[0]}" 2>&1)
+  out=$(BAND_SELFTEST_CHILD=1 BAND_HOST_SH="$tmp/host.sh" BAND_NET_TF="$tmp/net.tf" BAND_POOL_TF="$tmp/pool.tf" BAND_NET_VARS="$tmp/net-vars.tf" BAND_POOL_VARS="$tmp/pool-vars.tf" bash "${BASH_SOURCE[0]}" 2>&1)
   if [ -n "$out" ] && printf '%s' "$out" | grep -q FAIL; then
     ok "mutation caught: $label"
   else
@@ -334,6 +363,8 @@ mutate "stack tag no longer built from key"  net  's/stack_tag  = "ci-shared-inf
 mutate "pairs default to a populated map"    vars 's/^  default = {}$/  default = { demo = { slots_per_host = 4 } }/'
 mutate "the name-length precondition removed"  net  '/precondition {/,/^    }$/d'
 mutate "stack tag no longer gated on linux"  pool 's/var.host_os == "linux" ? /true ? /'
+mutate "the pool name may enter the namespace" poolvars 's/!startswith(var.name, "ci-shared-infra-")/true/'
+mutate "network_tags may enter the namespace"  poolvars 's/!startswith(t, "ci-shared-infra-")/true/'
 
 if [ "$fail" -eq 0 ]; then
   echo "shared-infra-band: all checks pass"

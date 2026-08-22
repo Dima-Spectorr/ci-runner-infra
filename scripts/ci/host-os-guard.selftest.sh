@@ -263,7 +263,14 @@ has_every_windows_refusal() { # <main.tf>
 
   # And every one of them says why it matters. A precondition whose message is
   # the condition restated sends the consumer back to the module source.
-  [ "$(count_of "$code" '^      error_message = ".*host_os')" -ge 6 ] || return 1
+  #
+  # `host_os = \"` and not a bare `host_os`: main.tf has other preconditions
+  # that mention var.host_os in passing -- the network-tag budget names it to
+  # say how many shared-infra tags a Linux pool adds -- and counting those made
+  # the total survive a refusal message being gutted. The seven messages under
+  # test all quote the OS they refuse, which is exactly the part a restated
+  # condition loses.
+  [ "$(count_of "$code" '^      error_message = ".*host_os = \\"')" -ge 6 ] || return 1
 }
 
 # --- the helper carries the trap it was written to avoid ---------------------

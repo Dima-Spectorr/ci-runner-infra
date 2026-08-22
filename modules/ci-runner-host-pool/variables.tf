@@ -39,6 +39,19 @@ variable "name" {
     condition     = can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.name))
     error_message = "name must be 1-63 characters, lowercase letters, digits and hyphens, starting with a letter and not ending in a hyphen."
   }
+
+  validation {
+    # The pool name is applied to the hosts as a network tag, and
+    # `ci-shared-infra-` is the namespace the shared-infra firewall rules are
+    # keyed on. A pool named `ci-shared-infra-src-checkout` is therefore an
+    # authorized source for pair `checkout` -- and `ci-shared-infra-stack-...`
+    # an ingress target -- in a pull request that never asked for it and a
+    # repository it may not belong to. Nothing else in the module notices,
+    # because the tag is perfectly well-formed; the boundary is the tag string
+    # and only reserving the prefix keeps ordinary naming from spelling it.
+    condition     = !startswith(var.name, "ci-shared-infra-")
+    error_message = "name must not start with \"ci-shared-infra-\" — that prefix is reserved for the tags shared_infra_id mints, and a pool wearing one joins that pair's firewall rules as a source or a target."
+  }
 }
 
 variable "github_owner" {
@@ -604,7 +617,18 @@ variable "network_tags" {
     inbound path from the controller at all: no IAP-SSH rule, no tag, no
     listener. A reader of a Windows pool should not go hunting for a firewall
     rule that must not exist.
+
+    Reserved: no tag here may start with `ci-shared-infra-`. That namespace
+    belongs to `shared_infra_id`, and a tag passed in by hand is the other way
+    a pool can be enrolled in a pair it does not belong to.
   EOT
+
+  validation {
+    # Same boundary as var.name, reached through the other door. A caller
+    # naming the tag directly does not even need a plausible pool name.
+    condition     = alltrue([for t in var.network_tags : !startswith(t, "ci-shared-infra-")])
+    error_message = "network_tags must not contain a tag starting with \"ci-shared-infra-\" — that prefix is minted from shared_infra_id, and passing one by hand puts this pool inside another pair's firewall rules."
+  }
 }
 
 variable "recycle_max_unavailable" {
