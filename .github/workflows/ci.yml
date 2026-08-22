@@ -300,6 +300,12 @@ jobs:
       - name: orphan-decision self-test
         run: bash scripts/ci/orphan-decision.selftest.sh
 
+      # Cancelling somebody's workflow run is irreversible in the same way, and
+      # this rule is the only thing between a MIG listing that blipped and a
+      # cancelled build. Most of its cases assert what must NOT happen.
+      - name: pinned-job-decision self-test
+        run: bash scripts/ci/pinned-job-decision.selftest.sh
+
       # The Windows half of the delete gate. Where the Linux rule reads an
       # answer the controller fetched itself, this one reads a value the HOST
       # published — so every failure of that publisher, its clock and the guest
