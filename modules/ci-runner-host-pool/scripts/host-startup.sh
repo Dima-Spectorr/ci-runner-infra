@@ -134,6 +134,26 @@ SLOTS=${SLOTS:-1}
 if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
   die "missing ci-github-owner/ci-github-repo metadata"
 fi
+
+# --- host affinity label ------------------------------------------------------
+#
+# Every agent on this host also answers to `host-<instance-name>`, which is what
+# lets a workflow run keep all of its jobs on the host its first job landed on
+# (docs/adr-pr-host-affinity.md). GitHub sends a job to any runner whose label
+# set is a SUPERSET of `runs-on`, so an extra label costs nothing to a workflow
+# that does not name it, and is the only thing that will serve one that does.
+#
+# Appended here rather than set in metadata, because the module cannot know an
+# instance name a MIG assigns at creation time.
+#
+# Fails closed. A host that could not read its own name would register agents
+# indistinguishable from every other host's, and a pinned job would then queue
+# against a label nothing answers until GitHub cancels it a day later. Every
+# other value on this path comes from the same metadata server, so this is not a
+# new dependency — only a new reason to insist it answered.
+[ -n "${HOSTNAME_SHORT:-}" ] || die "could not read instance/name from metadata — without it this host cannot publish its affinity label, and a pinned job would queue against a label nothing answers"
+HOST_LABEL="host-$HOSTNAME_SHORT"
+LABELS="${LABELS:+$LABELS,}$HOST_LABEL"
 [ -d "$RUNNER_HOME" ] || die "golden image is missing $RUNNER_HOME — this host was booted from the wrong image, and booting a bare image here would reintroduce the per-job install cost this pool removes"
 
 # --- GitHub App installation token -------------------------------------------
@@ -2794,6 +2814,12 @@ BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 $BROKER_ENV
 $CACHE_ENV
 $SHARE_ENV
+# The label a job pins the rest of its workflow run to. Read by the anchor job,
+# which publishes it as the runs-on list for every later job in the run. A slot
+# that does not know it degrades to unpinned scheduling rather than failing,
+# which is why the anchor tests for it -- but on this host it is always set,
+# because the boot dies above without it.
+Environment=CI_HOST_LABEL=$HOST_LABEL
 # Reset this slot before every job and after every job: the home is emptied and
 # rebuilt from $SLOT_TEMPLATE, and the previous job's workspace and tool cache go
 # with it. Set unconditionally, and NOT alongside BROKER_ENV: a pool with no job
