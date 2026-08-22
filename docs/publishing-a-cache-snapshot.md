@@ -237,6 +237,26 @@ Windows; the archive crossed a job boundary, so the publish job treats it as
 input and applies all four to it exactly as it does to a Linux one. There is one
 copy of those rules and it is on the side that already had them.
 
+**With one exception, and it is about the artifact, not about Windows.** The
+publish job's refusal happens *after* `upload-artifact` has already stored the
+archive, and a stored artifact is downloadable by anyone who can read the
+repository from that moment on. Refusing to publish it does not take it back. So
+the *name* half of the credential scan — the fifteen filenames a tool writes its
+own credentials into: `.npmrc`, `.netrc`, `gha-creds-*.json`, `*.pem` and the
+rest — also runs in the build job, in `build-cache-snapshot.ps1`, before the
+archive is written at all. The list is deliberately a second copy of the one in
+`publish-cache-snapshot.sh`, because the build job has no reachable `find`; what
+keeps a duplicate honest is that `build-cache-snapshot.selftest.sh` reads both
+lists and fails if they differ by a single name.
+
+The *content* half — `CREDENTIAL_PATTERNS` over the bytes of every cached file —
+still runs only in the publish job. It needs a regex engine the build job does
+not have, and unlike the name pass it is not cheap. Closing that gap by
+extracting the content pass into a script both sides can call is tracked
+separately; until then the honest statement is that a credential embedded in
+cache *content* is caught after the artifact exists, and one written into a
+tool's *config* is caught before it does.
+
 **The key needs nothing new.** `host_os` is a property of a *pool* and pool names
 are unique, so a Windows pool is its own `cache/<pool>/` and cannot collide with a
 Linux pool's objects by construction. Set `CACHE_POOL` to the Windows pool's name

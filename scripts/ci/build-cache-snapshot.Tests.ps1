@@ -192,6 +192,57 @@ Describe 'a staged tree that must not be packed' {
     }
 }
 
+Describe 'a credential the install left in the staged tree' {
+    # This pass exists on the BUILD side because `upload-artifact` makes the
+    # archive downloadable the moment it is stored -- the publish job's refusal
+    # comes after that and cannot take it back.
+    It 'packs a tree with no credential file in it' {
+        $entries = @(
+            [pscustomobject] @{ Name = 'index.json'; FullName = 'C:\stage\npm\index.json'; PSIsContainer = $false }
+            [pscustomobject] @{ Name = 'npm'; FullName = 'C:\stage\npm'; PSIsContainer = $true }
+        )
+        Get-CredentialFileRefusal -Entries $entries | Should -BeNullOrEmpty
+    }
+
+    It 'refuses the config a tool writes its own token into, naming the file' {
+        $entries = @(
+            [pscustomobject] @{ Name = 'index.json'; FullName = 'C:\stage\npm\index.json'; PSIsContainer = $false }
+            [pscustomobject] @{ Name = '.npmrc'; FullName = 'C:\stage\npm\.npmrc'; PSIsContainer = $false }
+        )
+        Get-CredentialFileRefusal -Entries $entries | Should -Match '\.npmrc'
+        Get-CredentialFileRefusal -Entries $entries | Should -Match 'credential file'
+    }
+
+    # The wildcard entries are the ones a literal comparison would miss, and they
+    # are the ones that matter most: a service-account JSON and a private key.
+    It 'refuses a wildcard match as readily as a literal one' {
+        foreach ($name in @('gha-creds-0123abcd.json', 'server.pem', 'id_rsa', 'id_rsa.pub')) {
+            $entries = @([pscustomobject] @{ Name = $name; FullName = "C:\stage\npm\$name"; PSIsContainer = $false })
+            Get-CredentialFileRefusal -Entries $entries | Should -Not -BeNullOrEmpty
+        }
+    }
+
+    # NTFS is case-insensitive, so `NuGet.Config` and `nuget.config` are one file.
+    # That is the same answer publish-cache-snapshot.sh reaches by spelling that
+    # one entry `-iname`, and a case-sensitive match here would open the gap the
+    # shell side deliberately closed.
+    It 'refuses a credential file whatever its case' {
+        $entries = @([pscustomobject] @{ Name = 'NuGet.Config'; FullName = 'C:\stage\nuget\NuGet.Config'; PSIsContainer = $false })
+        Get-CredentialFileRefusal -Entries $entries | Should -Not -BeNullOrEmpty
+    }
+
+    # A DIRECTORY called `credentials` is a directory, not a credential store,
+    # and refusing it would refuse the whole snapshot over a name.
+    It 'says nothing about a directory that shares a name with one' {
+        $entries = @([pscustomobject] @{ Name = 'credentials'; FullName = 'C:\stage\pip\credentials'; PSIsContainer = $true })
+        Get-CredentialFileRefusal -Entries $entries | Should -BeNullOrEmpty
+    }
+
+    It 'has nothing to say about an empty tree' {
+        Get-CredentialFileRefusal -Entries @() | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'a name from the staged tree on its way into the log' {
     # A file name is written by third-party install code. Printed raw into an
     # Actions log, one carrying a newline forges log lines, and one carrying
