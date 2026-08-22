@@ -89,7 +89,7 @@ code() { # <file>
 # failed in CI (64 KiB pipe, GNU grep, ~2000-line input) while the same commit
 # passed on a laptop. `-c` reads to end of input, so nothing upstream is ever cut
 # off, and it still exits 1 when there is no match.
-grepq() { grep -c -- "$@" >/dev/null; }
+grepq() { grep -c "$@" >/dev/null; }
 
 # --- predicates --------------------------------------------------------------
 
@@ -132,7 +132,7 @@ has_bounded_prepare() { # <file>
 has_no_publish_surface() { # <file>
   # This job holds no credential, so it must hold no uploader either. Checked as
   # an absence because that is the only way to notice one being added.
-  if code "$1" | grep -Eq 'gcloud|gsutil|storage\.googleapis|Invoke-WebRequest|Invoke-RestMethod|curl\.exe'; then
+  if code "$1" | grepq -E 'gcloud|gsutil|storage\.googleapis|Invoke-WebRequest|Invoke-RestMethod|curl\.exe'; then
     return 1
   fi
 }
@@ -367,7 +367,7 @@ has_inert_dot_source() { # <file>
   code "$1" | grepq "if (\$MyInvocation.InvocationName -ne '.')" || return 1
   # Nothing at column 0 may change the caller's state or compile a type: the
   # Pester suite dot-sources this file on Linux, where kernel32 does not exist.
-  if code "$1" | grep -Eq '^(Set-StrictMode|\$ErrorActionPreference|Add-Type)'; then
+  if code "$1" | grepq -E '^(Set-StrictMode|\$ErrorActionPreference|Add-Type)'; then
     return 1
   fi
 }
