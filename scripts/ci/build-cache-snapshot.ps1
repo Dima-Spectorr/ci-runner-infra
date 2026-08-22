@@ -191,6 +191,68 @@ function Get-CacheToolEnvironment {
     }
 }
 
+# THE SAME FILENAMES `publish-cache-snapshot.sh` REFUSES, AND THE SELF-TEST PINS
+# THE TWO LISTS EQUAL.
+#
+# Duplicated rather than shared for the reason the host's copy of the hostility
+# scan is: this script runs under Windows PowerShell on a runner that has no
+# POSIX shell in the path it is invoked from, and `find -name` is not reachable
+# from here. What makes a duplicate safe is that it cannot drift silently, so
+# `has_agreeing_credential_names` in shared-cache.selftest.sh reads both lists
+# and refuses if they differ by one name.
+#
+# WHY IT RUNS HERE AT ALL, when the publish job scans everything again. Between
+# the two jobs the archive is an `upload-artifact`, and an artifact is
+# downloadable by anyone who can read the repository the moment it is stored --
+# a refusal in the publish job comes AFTER that and cannot take it back. So the
+# cheap half of the credential scan runs on the side that produced the tree,
+# before the archive exists.
+#
+# It is the cheap half only, and that is stated rather than glossed: this catches
+# a credential a tool wrote to its OWN CONFIG, which is the common case (an
+# `.npmrc` left behind by `npm login`, a `.netrc`, a service-account JSON). It
+# does not see one embedded in cache CONTENT under a hash-named file, which is
+# what `CREDENTIAL_PATTERNS` is for and which needs the shell script's regex
+# engine. That pass still runs only in the publish job, and closing it on this
+# side is tracked as its own issue.
+$script:CredentialFileNames = @(
+    '.npmrc', '.yarnrc', '.yarnrc.yml', '.netrc', '.pypirc', '.git-credentials',
+    'auth.json', 'settings.xml', 'nuget.config', 'credentials',
+    'gha-creds-*.json', '*.pem', 'id_rsa*', 'gradle.properties', '.dockercfg'
+)
+
+function Get-CredentialFileRefusal {
+    <#
+      .SYNOPSIS
+        Why a staged tree must not be packed because of a file's NAME, or $null.
+        Pure over what it is given.
+      .DESCRIPTION
+        Names only. The name is compared case-insensitively because NTFS is, so
+        `NuGet.Config` and `nuget.config` are one file here -- which is the same
+        answer the shell side reaches by spelling that one entry `-iname`.
+
+        The refusal names the file and nothing else. A path is not a secret; the
+        bytes on the line are, and a CI log is readable by everyone who can see
+        the run.
+
+        Given entries rather than a path for the same reason Get-StagedTreeRefusal
+        is: the walk stays in the caller, and this stays testable off Windows.
+    #>
+    param($Entries)
+    if (-not $Entries) { return $null }
+    foreach ($e in $Entries) {
+        if ($e.PSIsContainer) { continue }
+        foreach ($pattern in $script:CredentialFileNames) {
+            if ($e.Name -like $pattern) {
+                return ("the staged tree holds what looks like a credential file at " +
+                    "$(Get-SafeText $e.FullName) (matched '$pattern') -- refusing to pack it, " +
+                    'because the artifact this job uploads is downloadable before the publish job ever scans it')
+            }
+        }
+    }
+    return $null
+}
+
 function Get-StagedTreeRefusal {
     <#
       .SYNOPSIS
@@ -214,6 +276,81 @@ function Get-StagedTreeRefusal {
         }
     }
     return $null
+}
+
+function Resolve-StagedHardLink {
+    <#
+      .SYNOPSIS
+        Give every packed file its own bytes, so the archive has no hard-link
+        members. Returns how many names had to be broken apart.
+      .DESCRIPTION
+        WHY THE ARCHIVE MAY NOT CARRY ONE. `publish-cache-snapshot.sh` builds its
+        own archives with GNU tar's `--hard-dereference`, and `archive_is_flat`
+        rejects any member that is a hard link -- deliberately, because a host
+        unpacking one gets two names over a single inode inside a tree that is
+        then copied per slot and sealed read-only, and the seal on one name is
+        the seal on the other. That rule is not re-derived for Windows; the
+        publish job applies it to whatever arrives.
+
+        So an archive built here with a hard-link member is not a security
+        problem, it is a WASTED RUN: the build reports success, uploads its
+        artifact, and the publish job refuses it deterministically. Breaking the
+        links here is what makes the Windows archive satisfy the same plain-file
+        layout the Linux one does. Windows tar.exe is bsdtar, which has no
+        `--hard-dereference` to pass, so the flattening happens on the tree.
+
+        Copy, delete, rename -- in that order, and never in place. The copy is a
+        second inode with the same bytes; deleting the original name drops the
+        link count of the shared inode by one; the rename puts the name back over
+        the new bytes. Two names sharing an inode therefore cost one copy, not
+        two: after the first is broken the second reports a count of 1 and is
+        skipped.
+
+        A link count that could not be READ is a refusal, not a pass. See
+        CiJobObject.LinkCount for why -1 is its own answer.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
+    param([Parameter(Mandatory = $true)] $Files)
+
+    $flattened = 0
+    foreach ($f in $Files) {
+        $links = [CiJobObject]::LinkCount($f.FullName)
+        if ($links -lt 0) {
+            throw ("the link count of $(Get-SafeText $f.FullName) could not be read, so this archive " +
+                'cannot be shown to be free of hard links -- and the publish job refuses one that is not')
+        }
+        if ($links -le 1) { continue }
+        if (-not $PSCmdlet.ShouldProcess($f.FullName, 'break the hard link by copying')) { continue }
+        # A NAME NOTHING IN THE TREE CAN ALREADY OWN. `<name>.ci-flatten` is a
+        # path inside the cache, and the cache is written by third-party install
+        # code: a package shipping both `foo` and `foo.ci-flatten` had the second
+        # one OVERWRITTEN by the copy and then unlinked by the move -- a real
+        # cache file deleted, and its stale $Files entry then either fails the
+        # link-count read below or is silently dropped from the archive. So the
+        # scratch sibling is a fresh GUID and the copy refuses to overwrite:
+        # a collision is an error to retry, never a file to replace.
+        $spare = $null
+        for ($i = 0; $i -lt 8 -and -not $spare; $i++) {
+            $candidate = $f.FullName + '.ci-flatten-' + [guid]::NewGuid().ToString('n')
+            try {
+                [System.IO.File]::Copy($f.FullName, $candidate, $false)
+                $spare = $candidate
+            } catch [System.IO.IOException] {
+                # Only a name that turned out to exist is retried. Anything else
+                # -- no space, a denied path -- is the real failure and is raised.
+                if (-not ([System.IO.File]::Exists($candidate) -or
+                          [System.IO.Directory]::Exists($candidate))) { throw }
+            }
+        }
+        if (-not $spare) {
+            throw ("no free scratch name could be found next to $(Get-SafeText $f.FullName), so its " +
+                'hard link cannot be broken -- and the publish job refuses an archive that still has one')
+        }
+        [System.IO.File]::Delete($f.FullName)
+        [System.IO.File]::Move($spare, $f.FullName)
+        $flattened++
+    }
+    return $flattened
 }
 
 function Get-ArchiveDigest {
@@ -277,6 +414,9 @@ public static class CiJobObject
         ref StartupInformation startupInformation, out ProcessInformation processInformation);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int stdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint ResumeThread(IntPtr thread);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -291,17 +431,52 @@ public static class CiJobObject
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFile(string fileName, uint access, uint share,
+        IntPtr security, uint disposition, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(IntPtr file, out ByHandleFileInformation info);
+
     private const int BasicAccountingInformation = 1;
     private const uint CreateSuspended = 0x00000004;
     private const uint WaitTimeout = 0x00000102;
     private const uint StillActive = 259;
     private const int ExtendedLimitInformation = 9;
     private const int LimitKillOnJobClose = 0x2000;
+    private const int UseStdHandles = 0x00000100;
+    private const int StdInputHandle = -10;
+    private const int StdOutputHandle = -11;
+    private const int StdErrorHandle = -12;
+    private static readonly IntPtr InvalidHandle = new IntPtr(-1);
+    private const uint OpenExisting = 3;
+    private const uint ShareAll = 7;
+    private const uint BackupSemantics = 0x02000000;
+    private const uint OpenReparsePoint = 0x00200000;
 
     // The two structures are laid out by hand because the managed shape has to
     // match the native one byte for byte on both 32- and 64-bit; getting it
     // wrong does not fail loudly, it sets a limit the kernel reads from the
     // wrong offset.
+    // GetFileInformationByHandle's shape, and the only field of it anyone here
+    // wants: NumberOfLinks. Laid out by hand for the same reason the two job
+    // structures below are -- a mismatched offset does not fail, it reads the
+    // wrong four bytes and reports a flat file.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct IoCounters
     {
@@ -436,13 +611,78 @@ public static class CiJobObject
     // exactly the first and last quote and takes the rest literally, which is
     // what a caller writing a shell command expects -- and is NOT what .NET's
     // argument escaping would have produced for a command containing quotes.
+    private static IntPtr Usable(IntPtr handle)
+    {
+        return handle == InvalidHandle ? IntPtr.Zero : handle;
+    }
+
+    // HOW MANY NAMES THIS FILE HAS, or -1 if that could not be established.
+    //
+    // .NET has no answer for this and neither does PowerShell 5.1: FileInfo
+    // exposes length, attributes and times, and nothing that distinguishes one
+    // name from two. NTFS hard links are a property of the FILE, not of either
+    // name, so the only way to ask is to open a handle and ask the volume.
+    //
+    // Access 0 asks for metadata only -- no read, no write -- so a file another
+    // process holds open exclusively still answers. FILE_SHARE 7 (read|write|
+    // delete) is the matching promise in the other direction. BACKUP_SEMANTICS
+    // lets a directory be opened, and OPEN_REPARSE_POINT means a link is asked
+    // about ITSELF rather than about what it names -- which matters because the
+    // caller's job is to decide about the entry in the staged tree, not about
+    // whatever lives at the far end of it.
+    //
+    // -1 IS NOT ZERO AND IT IS NOT ONE. A file that could not be opened is a
+    // file whose link count is unknown, and the caller must treat that as a
+    // refusal: "I could not check" and "it is flat" are the same value only in
+    // code that has stopped distinguishing them.
+    public static int LinkCount(string path)
+    {
+        IntPtr handle = CreateFile(path, 0, ShareAll, IntPtr.Zero, OpenExisting,
+            BackupSemantics | OpenReparsePoint, IntPtr.Zero);
+        if (handle == InvalidHandle) { return -1; }
+        try
+        {
+            ByHandleFileInformation info;
+            if (!GetFileInformationByHandle(handle, out info)) { return -1; }
+            return (int) info.NumberOfLinks;
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
+    }
+
     public static ProcessInformation StartSuspendedInJob(IntPtr job, string commandLine, string workingDirectory)
     {
+        // HAND THE CHILD THIS PROCESS'S STANDARD HANDLES, EXPLICITLY.
+        //
+        // A zeroed STARTUPINFO with bInheritHandles=FALSE gives the child no
+        // usable standard handles at all, and every byte the prepare command
+        // writes goes nowhere: not to the workflow log, not to the job summary,
+        // not into a file. A prepare step that fails would fail SILENTLY, and
+        // the only evidence left would be an exit code. That is precisely the
+        // failure this whole script exists to make visible.
+        //
+        // STARTF_USESTDHANDLES is what makes CreateProcess read the three
+        // fields, and it is only honoured together with bInheritHandles=TRUE --
+        // the flag alone is ignored. Inheriting is safe here because this
+        // process is a workflow-job PowerShell whose only other open handles are
+        // its own; there is no privileged handle to leak into the prepare
+        // command, and the command is already running as this same user.
+        //
+        // A handle that comes back INVALID_HANDLE_VALUE is passed through as
+        // IntPtr.Zero rather than as -1: -1 would be inherited as a broken
+        // handle the child could still try to write to, while zero reads as "no
+        // such stream", which is what it actually is.
         StartupInformation si = new StartupInformation();
         si.Cb = Marshal.SizeOf(typeof(StartupInformation));
+        si.Flags = UseStdHandles;
+        si.StdInput = Usable(GetStdHandle(StdInputHandle));
+        si.StdOutput = Usable(GetStdHandle(StdOutputHandle));
+        si.StdError = Usable(GetStdHandle(StdErrorHandle));
         ProcessInformation pi;
         System.Text.StringBuilder line = new System.Text.StringBuilder(commandLine);
-        if (!CreateProcess(null, line, IntPtr.Zero, IntPtr.Zero, false,
+        if (!CreateProcess(null, line, IntPtr.Zero, IntPtr.Zero, true,
                 CreateSuspended, IntPtr.Zero, workingDirectory, ref si, out pi))
         {
             throw new InvalidOperationException("CreateProcess failed: " + Marshal.GetLastWin32Error());
@@ -581,6 +821,11 @@ function Wait-JobObjectDrained {
     }
 }
 
+# Set only by the drain failure in Invoke-PrepareInJob, read only by
+# Remove-StageSafely. Script scope rather than a parameter because the cleanup is
+# in a `finally` that the throwing path does not get to pass anything to.
+$script:StageNotQuiesced = $false
+
 function Remove-StageSafely {
     <#
       .SYNOPSIS
@@ -616,6 +861,18 @@ function Remove-StageSafely {
 
     if (-not (Test-Path -LiteralPath $Path)) { return }
 
+    # THE SCAN BELOW IS ONLY EVIDENCE ABOUT A TREE NOTHING IS WRITING. If the
+    # job object did not drain, a member of it may still be alive with this path
+    # in reach, and it can create a junction in the window between the scan and
+    # the delete -- which 5.1's Remove-Item then follows out of the tree. There
+    # is no ordering that closes that window, so the delete is not attempted.
+    if ($script:StageNotQuiesced) {
+        Write-BuildLog ("left $Path on disk: the prepare command's job object never drained, so a process " +
+            'may still be writing this tree and a recursive delete could follow a reparse point planted ' +
+            'after the scan. This runner is ephemeral; its teardown reclaims the disk.')
+        return
+    }
+
     $rootErrors = @()
     $treeErrors = @()
     $entries = @(Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue -ErrorVariable rootErrors) +
@@ -632,6 +889,7 @@ function Remove-StageSafely {
         return
     }
 
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Remove-Item -Recurse')) { return }
     Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
 }
 
@@ -672,13 +930,35 @@ function Invoke-PrepareInJob {
             $exit = [CiJobObject]::ExitCodeOf($handle)
         }
     } finally {
-        # Kill THEN close: closing alone would kill on the last handle anyway, but
-        # only once every handle to the job had gone, and "the tree is quiet now"
-        # has to be true at the point the next line reads it.
-        [CiJobObject]::Kill($job)
-        Wait-JobObjectDrained -Job $job -TimeoutSeconds 60
-        [CiJobObject]::Close($job)
-        [CiJobObject]::CloseProcess($handle)
+        try {
+            # Kill THEN close: closing alone would kill on the last handle anyway,
+            # but only once every handle to the job had gone, and "the tree is
+            # quiet now" has to be true at the point the next line reads it.
+            #
+            # INSIDE the try, not before it. TerminateJobObject can report
+            # failure, and the wrapper now raises when it does -- which, thrown
+            # from in front of the try, skipped both the flag below and the
+            # handle-closing finally, and handed Remove-StageSafely the exact
+            # state the flag exists to keep it away from.
+            [CiJobObject]::Kill($job)
+            Wait-JobObjectDrained -Job $job -TimeoutSeconds 60
+        } catch {
+            # THE ONE STATE THE CLEANUP MUST NOT ACT ON. Everything
+            # Remove-StageSafely does is safe because the tree is quiet: it scans
+            # for reparse points and then recursively deletes what scanned clean.
+            # A drain that did not finish -- or a kill that was never carried
+            # out, which is the same statement one step earlier -- is the
+            # statement that the tree is NOT quiet: a surviving process can
+            # plant a junction in the window
+            # between that scan and the delete, and 5.1's Remove-Item follows it.
+            # The scan cannot be made atomic, so the delete is given up instead.
+            # This runner is ephemeral; the stage goes when the machine does.
+            $script:StageNotQuiesced = $true
+            throw
+        } finally {
+            [CiJobObject]::Close($job)
+            [CiJobObject]::CloseProcess($handle)
+        }
     }
 
     return [pscustomobject] @{
@@ -768,6 +1048,17 @@ function Invoke-Main {
             throw "refusing to pack: $hostile"
         }
 
+        # BEFORE THE COUNT AND BEFORE THE PACK, because what this refuses must
+        # never become the artifact. The emptiness throw below is about whether
+        # there is a cache worth publishing; this is about whether there is one
+        # that may leave the machine at all, and that question comes first.
+        $credential = Get-CredentialFileRefusal -Entries $entries
+        if ($credential) {
+            # Same treatment as a hostile tree: thrown, not deleted here.
+            # Remove-StageSafely decides what may be recursively removed.
+            throw "refusing to pack: $credential"
+        }
+
         # ONLY WHAT TAR WILL PACK COUNTS. The tar line names the cache
         # directories, so a file the prepare command drops anywhere else under the
         # staging root -- a log, a marker, a lockfile -- is silently absent from
@@ -809,6 +1100,14 @@ function Invoke-Main {
         # `npm/...` and not `Users/runneradmin/...`. The host unpacks it expecting
         # exactly the top-level names in $script:CacheDirs and drops everything else,
         # so a path prefix here is a snapshot that arrives and hydrates nothing.
+        # BEFORE TAR, because tar is what would record the link. bsdtar has no
+        # --hard-dereference, so the tree is what gets flattened.
+        $flattened = Resolve-StagedHardLink -Files $files
+        if ($flattened -gt 0) {
+            Write-BuildLog ("$flattened staged file(s) shared an inode with another name and were copied " +
+                'apart -- the publish job refuses an archive with hard-link members')
+        }
+
         Write-BuildLog "packing $out"
         & $tar -czf $out -C $stage $script:CacheDirs
         if ($LASTEXITCODE -ne 0) {

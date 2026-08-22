@@ -93,6 +93,15 @@ REGISTER_GRACE=${REGISTER_GRACE:-600}
 # than a transient gcloud failure and far shorter than the hours a dead
 # registration otherwise occupies the repo's runner list.
 ORPHAN_CONFIRM_TICKS=${ORPHAN_CONFIRM_TICKS:-3}
+
+# How long a job pinned to a host this pool cannot see may wait before the run
+# is failed. Read from metadata like everything else, but NO pool sets the key
+# today and none has to: an absent attribute reads empty and takes the default,
+# so this adds no Terraform surface and changes no plan. The default is
+# deliberately long relative to a boot — the cost of waiting one extra tick is a
+# tick, and the cost of being wrong is a cancelled build.
+PIN_ORPHAN_GRACE=$(md "instance/attributes/ci-pin-orphan-grace-seconds")
+PIN_ORPHAN_GRACE=${PIN_ORPHAN_GRACE:-900}
 # Hosts that may be mid-recycle at once. The default is 0 — OFF — and that is
 # not timidity, it is the only correct default for a controller that may be
 # running against a template it did not expect: a controller restarted from an
@@ -288,6 +297,10 @@ collect_demand() {
   # below would otherwise leave the previous tick's value in place and the
   # controller would keep republishing "demand is truncated" forever.
   DEMAND_RUNS_SKIPPED=0
+  # Same reason, and it matters more for this one: a stale pinned-job list is
+  # not a stale number, it is a set of run ids that classify_pinned would judge
+  # against a host list from a later tick — and cancel.
+  PINNED_JOBS=""
 
   # The deadline starts BEFORE the two run-list calls, because they are part of
   # the sweep and each can cost a full curl timeout. Starting it after them let
@@ -344,6 +357,7 @@ collect_demand() {
       [ .jobs[]?
         | select(.status == "queued" or .status == "in_progress")
         | select( ((.labels // []) | length) > 0 )
+        | select( ((.labels // []) | map(select(startswith("host-"))) | length) == 0 )
         | select( ((.labels // []) - $mine_labels) | length == 0 )
       ] as $mine
       | [ ($mine | length),
@@ -361,6 +375,35 @@ collect_demand() {
 
     DEMAND_TOTAL=$((DEMAND_TOTAL + n))
     DEMAND_QUEUED=$((DEMAND_QUEUED + q))
+
+    # The pinned half of the same payload, kept rather than counted.
+    #
+    # It is NOT filtered against this pool's labels here. Stripping the affinity
+    # label before the subset test, deciding whether the named host is even ours
+    # to reason about, and deciding whether a run is unservable are one rule, and
+    # that rule lives in pinned_job_decision() where it is unit-tested. A second,
+    # partial copy of it in jq is how the two drift.
+    #
+    # It is also not classified here, because it cannot be: the host list this
+    # tick is collected AFTER the demand sweep, so at this point the controller
+    # does not yet know which hosts are alive. Judging a pin against last tick's
+    # list would make the first tick after a restart — when the list is empty —
+    # the one that cancels every pinned run in the repo.
+    local pinned_recs
+    # The jq variable is $rid and not $run: the controller-scope gate reads
+    # every $name in a function against every other function's locals, and
+    # classify_pinned owns a local called `run`. A jq variable is invisible to
+    # that check as anything other than a collision.
+    pinned_recs=$(printf '%s' "$jobs" | jq -r --arg rid "$id" '
+      .jobs[]?
+      | select(.status == "queued" or .status == "in_progress")
+      | select( ((.labels // []) | map(select(startswith("host-"))) | length) > 0 )
+      | [ $rid, .status, ((.labels // []) | join(",")), (.created_at // "") ]
+      | @tsv' 2>/dev/null)
+    if [ -n "$pinned_recs" ]; then
+      PINNED_JOBS="${PINNED_JOBS}${pinned_recs}
+"
+    fi
 
     # Read the clock HERE, per run, and not once before the sweep. Both ages
     # below are measured against it, and `sweep_start` is captured before the
@@ -687,6 +730,110 @@ template_state() {
 # recreate, host maintenance, or a controller restart mid-drain all leave the
 # agents registered forever. The verdict rule lives in orphan-decision.sh; this
 # is only its I/O.
+# --- pinned jobs -------------------------------------------------------------
+#
+# The demand sweep set PINNED_JOBS aside because it ran before the host list.
+# This is the other half: with the list in hand, every pinned job gets one
+# verdict from pinned_job_decision(), and the two that matter are the ones that
+# do NOT count as scale-out demand and the one that cannot run at all.
+#
+# WHY A RUN IS CANCELLED RATHER THAN LEFT ALONE
+#
+# A job pinned to a host that no longer exists is not slow, it is unservable:
+# no runner will ever carry that label again — a MIG replacement comes back
+# under a new name — so nothing retries it, nothing scales for it, and it holds
+# its concurrency group until GitHub times it out 24 hours later. Failing it in
+# minutes turns a silent day-long wedge into a re-run.
+#
+# Which makes a false positive expensive, so three separate things have to be
+# true before anything is cancelled: the host must be one THIS pool could have
+# created, the job must have been queued longer than the grace window, and the
+# host list must be non-empty. The last is the fail-safe that matters most —
+# see below.
+classify_pinned() {
+  DEMAND_PINNED=0
+  PIN_ORPHANED=0
+
+  [ -n "${PINNED_JOBS:-}" ] || return 0
+
+  local live
+  live=$(printf '%s' "$HOSTS" | awk -F, '{print $1}' | paste -sd, -)
+
+  # AN EMPTY HOST LIST IS NOT AN EMPTY POOL. collect_hosts can come back with
+  # nothing because the pool genuinely scaled to zero, or because the list call
+  # failed — and those are indistinguishable here. Under the first reading every
+  # pinned job in the repo is orphaned; under the second, every one of those
+  # cancellations is wrong. Same fail-safe the drain path and the reaper take:
+  # a tick that cannot see is a tick that does not act. Pinned work is still
+  # counted, so the metric does not collapse to zero at the same moment.
+  local blind=0
+  [ -n "$live" ] || blind=1
+
+  local now run status labels created age epoch verdict token code
+  now=$(date +%s)
+
+  while IFS=$(printf '\t') read -r run status labels created; do
+    [ -n "$run" ] || continue
+
+    # An unparseable timestamp yields age 0, which reads as "just queued" and
+    # therefore as "wait". Erring toward the grace window is the whole posture.
+    age=0
+    if epoch=$(date -d "$created" +%s 2>/dev/null); then
+      age=$((now - epoch))
+      [ "$age" -lt 0 ] && age=0
+    fi
+
+    verdict=$(pinned_job_decision "$status" "$labels" "$RUNNER_LABELS" "$MIG_BASE" \
+      "$live" "$age" "$PIN_ORPHAN_GRACE")
+
+    case "$verdict" in
+      pinned:* | wait:*)
+        # Counted as work in flight and NOT added to ci_demand: only the host
+        # named in the label can serve it, so an autoscaler whose one move is
+        # "add a host" would buy a machine per tick that the job cannot use.
+        DEMAND_PINNED=$((DEMAND_PINNED + 1))
+        ;;
+      orphan:*)
+        # The run id is interpolated into an API path, and everything else on
+        # this line is derived from a payload a pull request can influence. It
+        # is an integer from GitHub or it is not used — a value carrying a slash
+        # would address a different endpoint entirely.
+        case "$run" in
+          "" | *[!0-9]*) log "pinned run '$run': $verdict — id is not numeric, not cancelled"; continue ;;
+        esac
+        if [ "$blind" = 1 ]; then
+          DEMAND_PINNED=$((DEMAND_PINNED + 1))
+          log "pinned run $run: $verdict — NOT cancelled, this tick has no host list (fail-safe)"
+          continue
+        fi
+        token=$(gh_token) || { log "pinned run $run: $verdict — no token, not cancelled"; continue; }
+        code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X POST \
+          -H "Authorization: Bearer $token" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/$REPO_FULL/actions/runs/$run/cancel")
+        case "$code" in
+          202 | 409)
+            # 409 = already finishing. The run is leaving either way, and
+            # counting it as handled is what stops the log repeating per tick.
+            PIN_ORPHANED=$((PIN_ORPHANED + 1))
+            log "pinned run $run: $verdict — cancelled (HTTP $code)"
+            ;;
+          *)
+            # Most likely the app lacks Actions: write. Say so once per tick
+            # rather than retrying: the job still cannot run, and a wedge nobody
+            # can see is exactly what this function exists to prevent.
+            log "pinned run $run: $verdict — cancel REFUSED (HTTP $code); the run will wait for GitHub's own timeout"
+            ;;
+        esac
+        ;;
+    esac
+  done <<PINNED_EOF
+$PINNED_JOBS
+PINNED_EOF
+
+  return 0
+}
+
 reap_orphan_registrations() {
   # No runner list means we cannot prove anything about any agent. Same
   # fail-safe as the drain path: do nothing this tick.
@@ -1690,6 +1837,10 @@ tick() {
     log "GitHub runner list unavailable this tick (status=$RUNNER_LIST_STATUS, consecutive=$BLIND_TICKS) — every host reads reg=unknown and nothing will be drained (fail-safe)"
   fi
   collect_hosts
+  # AFTER collect_hosts, and that ordering is the whole reason this is not part
+  # of collect_demand: classify_pinned decides whether a pinned run is servable,
+  # which is a question about which hosts are alive.
+  classify_pinned
   collect_mig
 
   local pool_size=0 slots_busy=0 idle_max=0 draining=0 stale_hosts=0
@@ -1847,6 +1998,12 @@ tick() {
 
   # One request per tick, all series together.
   queue_series "ci_demand" "$DEMAND_TOTAL"
+  # Deliberately a SEPARATE series and not part of ci_demand: the autoscaler
+  # consumes ci_demand, and a pinned job cannot be served by the host it would
+  # buy. Published so that "the pool looks idle" and "the pool is full of work
+  # nothing can scale for" stop reading identically on a dashboard.
+  queue_series "ci_demand_pinned" "${DEMAND_PINNED:-0}"
+  queue_series "ci_pinned_runs_cancelled" "${PIN_ORPHANED:-0}"
   queue_series "ci_demand_queued" "$DEMAND_QUEUED"
   queue_series "ci_hosts_running" "$pool_size"
   # Published so saturation is expressible as a ratio in one alert policy that

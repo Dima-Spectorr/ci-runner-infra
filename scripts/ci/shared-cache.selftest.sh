@@ -1530,25 +1530,41 @@ has_agreeing_cache_dirs() { # <publish-script>
 # Closing on the fence alone is not enough either -- both jobs of the reference
 # workflow live in ONE fenced block, so `build:` would swallow `publish:` and
 # with it the credential the whole split exists to keep out of the build job.
-yaml_job_block() { # <file> <key>
-  awk -v key="  $2:" '
-    $0 == key { inb = 1; print; next }
+yaml_job_block() { # <file> <key> [occurrence, default 1]
+  awk -v key="  $2:" -v want="${3:-1}" '
+    $0 == key { n++; if (n == want) { inb = 1; print } next }
     inb && ($0 == "```" || $0 ~ /^  [A-Za-z_][A-Za-z0-9_-]*:[ 	]*$/) { inb = 0; next }
     inb { print }
   ' "$1"
 }
 
 has_split_publishing_workflow() { # <doc>
-  local build publish doc
+  local build publish winbuild doc
   doc=$(cat "$1")
   # The job blocks, by their own boundaries rather than by line count.
-  build=$(yaml_job_block "$1" build)
+  # The FIRST `build:` and the SECOND are both build jobs -- the reference
+  # workflow's and the Windows pool's -- and the claim below is about BOTH. The
+  # Windows one runs CACHE_PREPARE too, so every reason the Linux build job may
+  # hold no credential applies to it unchanged; a split that holds on one
+  # platform and not the other is not a split.
+  build=$(yaml_job_block "$1" build 1)
+  winbuild=$(yaml_job_block "$1" build 2)
   publish=$(yaml_job_block "$1" publish)
-  [ -n "$build" ] && [ -n "$publish" ] || return 1
+  [ -n "$build" ] && [ -n "$publish" ] && [ -n "$winbuild" ] || return 1
 
   matches "$build" 'CACHE_PREPARE'      || return 1
   ! matches "$build" 'id-token'         || return 1
   ! matches "$build" 'google-github-actions/auth' || return 1
+
+  matches "$winbuild" 'CACHE_PREPARE'   || return 1
+  ! matches "$winbuild" 'id-token'      || return 1
+  ! matches "$winbuild" 'google-github-actions/auth' || return 1
+  matches "$winbuild" 'persist-credentials: false'   || return 1
+  # It hands the archive on rather than uploading it: an OUT, never an IN, and
+  # never a bucket. The Windows job is the one that runs third-party install
+  # code, so it is the one that must not be able to reach the bucket at all.
+  matches "$winbuild" 'CACHE_ARCHIVE_OUT' || return 1
+  ! matches "$winbuild" 'CACHE_BUCKET'  || return 1
 
   matches "$publish" 'id-token: write'  || return 1
   matches "$publish" 'CACHE_ARCHIVE_IN' || return 1
@@ -2335,9 +2351,8 @@ mutate_file "$PUBDOC" 'the install job gains the credential' has_split_publishin
 # `publish:` after it -- was never inside the text being judged at all: a
 # credential could be granted to a documented install job and the split's own
 # test would pass. The two blocks are the same claim, so both are mutated.
-mutate_file "$PUBDOC" 'the Windows install job gains the credential' has_split_publishing_workflow   's@^    runs-on: windows-latest$@    runs-on: windows-latest
-    permissions:
-      id-token: write@'
+mutate_file "$PUBDOC" 'the Windows install job gains the credential' has_split_publishing_workflow \
+  's@^    runs-on: windows-latest$@    runs-on: windows-latest\n    permissions:\n      id-token: write@'
 mutate_file "$PUBDOC" 'the token is granted workflow-wide instead' has_split_publishing_workflow \
   's@^permissions: \{\}$@permissions:\n  id-token: write@'
 mutate_file "$PUBDOC" 'the publishing job stops waiting for the build' has_split_publishing_workflow \
@@ -2355,6 +2370,20 @@ mutate_file "$PUBDOC" 'every checkout goes back to the defaults' has_split_publi
   's@^          persist-credentials: false$@@'
 mutate_file "$PUBDOC" 'the build job alone keeps the token in its workspace' has_split_publishing_workflow \
   '0,/^          persist-credentials: false$/{/^          persist-credentials: false$/d}'
+# The Windows build job, read as a build job. Each of these leaves the Linux
+# pair untouched and would have passed unnoticed while the platform that runs
+# the install held the credential.
+mutate_file "$PUBDOC" 'the Windows build job gains the credential' has_split_publishing_workflow \
+  's@^      contents: read           .*$@      contents: read\n      id-token: write@'
+# NOT `/^  build:$/,/^  publish:$/!`, which is what this said first and which
+# matched nothing: a sed range re-opens at EVERY match of its opening address, so
+# the second `build:` -- the Windows one -- starts a range that finds no further
+# `publish:` and therefore runs to end of file. The negation then excluded the
+# very line the mutation was aimed at, and `mutate_file` reported "matched
+# nothing". The Windows path is spelled with a backslash and the Linux one with a
+# slash, so that is what tells them apart here.
+mutate_file "$PUBDOC" 'the Windows build job publishes directly' has_split_publishing_workflow \
+  's@^          CACHE_ARCHIVE_OUT: .*\\snap\.tar\.gz$@          CACHE_BUCKET: some-bucket@'
 
 # The verdict plumbing. Every one of these leaves a hydrate that still works —
 # hosts boot, jobs run — and takes away the only thing that would have said the

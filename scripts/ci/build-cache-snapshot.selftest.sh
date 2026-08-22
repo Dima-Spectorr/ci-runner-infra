@@ -54,6 +54,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/build-cache-snapshot.ps1"
 HOST_SCRIPT="$HERE/../../modules/ci-runner-host-pool/scripts/windows-host-startup.ps1"
+PUBSH="$HERE/publish-cache-snapshot.sh"
 
 PASS=0
 FAIL=0
@@ -63,6 +64,7 @@ bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
 
 [ -f "$SCRIPT" ] || { echo "FAIL: missing $SCRIPT"; exit 1; }
 [ -f "$HOST_SCRIPT" ] || { echo "FAIL: missing $HOST_SCRIPT"; exit 1; }
+[ -f "$PUBSH" ] || { echo "FAIL: missing $PUBSH"; exit 1; }
 
 # Code only: full-line comments stripped, so prose ABOUT an invariant can never
 # satisfy the check FOR it. This does not strip `<# … #>` doc-comment bodies,
@@ -77,15 +79,16 @@ code() { # <file>
 # carry it above their `matches` helper -- and this file was the one that did not
 # follow it.
 #
-# `-q` exits on the first match, which closes the pipe under it; whatever is
-# writing into that pipe -- `printf` here, `code`'s own `grep -v` there -- then
-# dies of EPIPE, and `set -o pipefail` reports the WHOLE pipeline as failed. A
-# predicate that FOUND its text returns false. It is non-deterministic by
-# construction: it only fires when the match lands early enough that the writer
-# has not already finished, so it depends on where in the file the text sits and
-# on how much the pipe buffers. That is why checks failed in CI (64 KiB pipe, GNU
-# grep) while the same commit passed on a laptop. `-c` reads to end of input, so
-# nothing upstream is ever cut off, and it still exits 1 when there is no match.
+# `-q` exits on the first match, which closes the
+# pipe under it; whatever is writing into that pipe -- `printf` here, `code`'s
+# own `grep -v` there -- then dies of EPIPE, and `set -o pipefail` reports the
+# WHOLE pipeline as failed. A predicate that FOUND its text returns false. It is
+# non-deterministic by construction: it only fires when the match lands early
+# enough that the writer has not already finished, so it depends on where in the
+# file the text sits and on how much the pipe buffers. That is why five checks
+# failed in CI (64 KiB pipe, GNU grep, ~2000-line input) while the same commit
+# passed on a laptop. `-c` reads to end of input, so nothing upstream is ever cut
+# off, and it still exits 1 when there is no match.
 grepq() { grep -c "$@" >/dev/null; }
 
 # --- predicates --------------------------------------------------------------
@@ -219,6 +222,125 @@ has_suspended_start() { # <file>
   printf '%s' "$code" | grepq 'TerminateProcess(pi.Process, 1)' || return 1
 }
 
+has_inherited_std_handles() { # <file>
+  # A zeroed STARTUPINFO with bInheritHandles=FALSE leaves the child with no
+  # usable standard handles, so every byte the prepare command writes is
+  # discarded: a prepare step that fails, fails silently, and the workflow log
+  # shows nothing but an exit code. STARTF_USESTDHANDLES is what makes the three
+  # fields be read, and it is ignored unless handles are inherited too -- so
+  # both halves are pinned, and so is the order (the fields are filled before
+  # the call that reads them).
+  local code create_line flags_line
+  code=$(code "$1")
+  printf '%s' "$code" | grepq 'UseStdHandles = 0x00000100' || return 1
+  printf '%s' "$code" | grepq 'si.Flags = UseStdHandles;' || return 1
+  printf '%s' "$code" | grepq 'si.StdOutput = Usable(GetStdHandle(StdOutputHandle));' || return 1
+  printf '%s' "$code" | grepq 'si.StdError = Usable(GetStdHandle(StdErrorHandle));' || return 1
+  printf '%s' "$code" | grepq 'CreateProcess(null, line, IntPtr.Zero, IntPtr.Zero, true,' || return 1
+  # INVALID_HANDLE_VALUE is passed on as zero, not as -1: a child handed -1 can
+  # still try to write to it, while zero reads as "no such stream".
+  printf '%s' "$code" | grepq 'handle == InvalidHandle ? IntPtr.Zero : handle' || return 1
+  flags_line=$(grep -n -m1 'si.Flags = UseStdHandles;' "$1" | cut -d: -f1)
+  create_line=$(grep -n -m1 'CreateProcess(null, line, IntPtr.Zero, IntPtr.Zero, true,' "$1" | cut -d: -f1)
+  [ -n "$flags_line" ] && [ -n "$create_line" ] || return 1
+  [ "$flags_line" -lt "$create_line" ] || return 1
+}
+
+has_hardlink_flattening() { # <file>
+  # The publish job builds its own archives with `--hard-dereference` and
+  # `archive_is_flat` rejects a hard-link member. That rule is not re-derived for
+  # Windows -- the publish job applies it to whatever arrives -- so a Windows
+  # archive carrying one is a run that succeeds, uploads, and is then refused
+  # deterministically at the far end. bsdtar has no --hard-dereference to pass,
+  # so the tree is what gets flattened.
+  code "$1" | grepq 'Resolve-StagedHardLink -Files $files' || return 1
+  # -1 IS ITS OWN ANSWER. A link count that could not be read is not a file shown
+  # to be flat, and a predicate that lets `-lt 0` fall through to `-le 1` would
+  # pack exactly the members this pass exists to remove.
+  code "$1" | grepq 'if ($links -lt 0) {' || return 1
+  code "$1" | grepq 'return -1;' || return 1
+  # THE SCRATCH NAME IS NOT A NAME THE TREE MAY ALREADY HOLD. The cache is
+  # written by third-party install code, so a package shipping `foo` beside
+  # `foo.ci-flatten` had the second one overwritten and then unlinked -- a real
+  # cache file deleted by the pass that exists to make the archive packable.
+  # A fresh GUID plus a copy that refuses to overwrite turns that into an error.
+  code "$1" | grepq "'.ci-flatten-' + \[guid\]::NewGuid()" || return 1
+  code "$1" | grepq 'Copy($f.FullName, $candidate, $false)' || return 1
+  ! code "$1" | grepq 'Copy($f.FullName, $spare, $true)' || return 1
+  # BEFORE TAR, because tar is what records the link.
+  local flat pack
+  flat=$(code "$1" | grep -n 'Resolve-StagedHardLink -Files $files' | cut -d: -f1 | sed -n 1p)
+  pack=$(code "$1" | grep -n 'tar -czf $out -C $stage' | cut -d: -f1 | sed -n 1p)
+  [ -n "$flat" ] && [ -n "$pack" ] || return 1
+  [ "$flat" -lt "$pack" ]
+}
+has_unquiesced_stage_kept() { # <file>
+  # Remove-StageSafely is safe because the tree is QUIET: it scans for reparse
+  # points and then recursively deletes what scanned clean. A job object that
+  # never drained is the statement that the tree is not quiet -- a surviving
+  # process can plant a junction between the scan and the delete, and 5.1's
+  # Remove-Item follows it. No ordering closes that window, so the delete has to
+  # be given up rather than re-ordered.
+  code "$1" | grepq '$script:StageNotQuiesced = $true' || return 1
+  code "$1" | grepq 'if ($script:StageNotQuiesced) {' || return 1
+  # And the flag is read BEFORE the recursive delete, or it is a record of
+  # something that already happened.
+  local flag del
+  flag=$(code "$1" | grep -n 'if ($script:StageNotQuiesced) {' | cut -d: -f1 | sed -n 1p)
+  del=$(code "$1" | grep -n 'Remove-Item -LiteralPath $Path -Recurse' | cut -d: -f1 | sed -n 1p)
+  [ -n "$flag" ] && [ -n "$del" ] || return 1
+  [ "$flag" -lt "$del" ] || return 1
+  # AND THE KILL IS INSIDE THAT TRY. TerminateJobObject can report failure and
+  # the wrapper raises when it does; thrown from IN FRONT of the try, that
+  # skipped the flag entirely -- so the one path where the members were never
+  # even asked to stop was the one path that left the stage looking quiesced.
+  # Adjacency is the check: the kill and the drain wait are the same try block.
+  local after
+  after=$(code "$1" | grep -A1 -F '[CiJobObject]::Kill($job)' | sed -n 2p)
+  printf '%s\n' "$after" | grepq 'Wait-JobObjectDrained -Job $job' || return 1
+}
+has_credential_name_scan() { # <file>
+  # WHY THIS PASS EXISTS ON THIS SIDE AT ALL. The publish job scans the tree
+  # again and refuses far more thoroughly -- but between the two jobs the
+  # archive is an `upload-artifact`, and an artifact is downloadable by anyone
+  # who can read the repository from the moment it is stored. A refusal in the
+  # publish job happens after that and cannot take it back. So the name half of
+  # the scan has to run on the side that produced the tree.
+  code "$1" | grepq 'Get-CredentialFileRefusal -Entries $entries' || return 1
+  # Computed and ignored is the same as not computed: both the guard that reads
+  # the verdict and the throw that acts on it, or a scan whose answer goes
+  # nowhere passes this predicate while packing the credential.
+  code "$1" | grepq 'if ($credential) {' || return 1
+  code "$1" | grepq 'throw "refusing to pack: $credential"' || return 1
+  # ORDER: before the archive is written, or it is a refusal of a file that has
+  # already been packed.
+  local cred pack
+  cred=$(code "$1" | grep -n 'Get-CredentialFileRefusal -Entries $entries' | cut -d: -f1 | sed -n 1p)
+  pack=$(code "$1" | grep -n 'tar -czf $out -C $stage' | cut -d: -f1 | sed -n 1p)
+  [ -n "$cred" ] && [ -n "$pack" ] || return 1
+  [ "$cred" -lt "$pack" ]
+}
+has_agreeing_credential_names() { # <file>
+  # Two copies of one security rule. The shell side spells it as `find -name`
+  # predicates because that is what it has; this side spells it as PowerShell
+  # wildcards because git-bash's find is not reachable from the build job. What
+  # makes the duplicate safe is that neither may move without the other: a name
+  # dropped here is a credential the artifact carries out of the build job, and
+  # a name dropped there is one the bucket accepts.
+  #
+  # Compared as SETS, sorted, because the two files order their lists to read
+  # well in their own syntax and pinning the order would be pinning formatting.
+  # `-iname` and `-name` collapse to the same entry deliberately: NTFS matching
+  # is case-insensitive, so the one entry the shell has to spell `-iname` is
+  # already what PowerShell's `-like` does to every entry.
+  local mine theirs
+  mine=$(sed -n '/^\$script:CredentialFileNames = @(/,/^)/p' "$1" |
+    grep -oE "'[^']+'" | tr -d "'" | sort)
+  theirs=$(sed -n '/-name/p' "$PUBSH" |
+    grep -oE -- "-i?name '[^']+'" | grep -oE "'[^']+'" | tr -d "'" | sort -u)
+  [ -n "$mine" ] && [ -n "$theirs" ] || return 1
+  [ "$mine" = "$theirs" ]
+}
 has_packed_file_count() { # <file>
   # tar packs the named cache directories. Counting every file under the staging
   # root instead lets one stray marker stand in for a warm cache, and publishes
@@ -302,6 +424,11 @@ assert "the staging root itself is scanned, not only its descendants" has_root_i
 assert "a tree with a reparse point is left, not recursively deleted"  has_hostile_stage_left_alone
 assert "the job is drained before the tree is read"                    has_drain_after_kill
 assert "the prepare command is in the job before it can run"           has_suspended_start
+assert "the prepare command's output reaches the workflow log"         has_inherited_std_handles
+assert "hard links are broken before the archive is written"          has_hardlink_flattening
+assert "a stage that never drained is left on disk, not deleted"      has_unquiesced_stage_kept
+assert "a credential file is refused before the archive is written"    has_credential_name_scan
+assert "the refused filenames are the same ones the publish job refuses" has_agreeing_credential_names
 assert "the emptiness check counts only what tar packs"                has_packed_file_count
 assert "there is a staging root off Actions too"                       has_local_staging_root
 
@@ -337,7 +464,7 @@ mutate "the prepare command started outside the job" \
   has_job_object_reap
 
 mutate "the job closed without being terminated first" \
-  's|^        \[CiJobObject\]::Kill($job)$|        $null = $job|' \
+  's|^            \[CiJobObject\]::Kill($job)$|            $null = $job|' \
   has_job_object_reap
 
 mutate "a job object created with no limits at all" \
@@ -377,7 +504,7 @@ mutate "an unreadable tree deleted as if it were clean" \
   has_hostile_stage_left_alone
 
 mutate "the job terminated but never drained" \
-  's|^        Wait-JobObjectDrained -Job $job -TimeoutSeconds 60$|        $null = $job|' \
+  's|^ *Wait-JobObjectDrained -Job $job -TimeoutSeconds 60$|            $null = $job|' \
   has_drain_after_kill
 
 mutate "the prepare command started running before it is assigned" \
@@ -388,6 +515,45 @@ mutate "resumed before it is in the job" \
   's|^            if (!AssignProcessToJobObject(job, pi.Process))$|            if (ResumeThread(pi.Thread) == 0 \&\& !AssignProcessToJobObject(job, pi.Process))|' \
   has_suspended_start
 
+mutate "the prepare command started with no standard handles" \
+  's|CreateProcess(null, line, IntPtr.Zero, IntPtr.Zero, true,|CreateProcess(null, line, IntPtr.Zero, IntPtr.Zero, false,|' \
+  has_inherited_std_handles
+
+mutate "the handle fields filled but never read" \
+  's|^        si.Flags = UseStdHandles;$|        si.Flags = 0;|' \
+  has_inherited_std_handles
+
+mutate "an invalid handle inherited as -1" \
+  's|handle == InvalidHandle ? IntPtr.Zero : handle|handle|' \
+  has_inherited_std_handles
+
+mutate "the hard-link flattening dropped from the pack path" \
+  's@^        $flattened = Resolve-StagedHardLink -Files $files$@        $flattened = 0@' \
+  has_hardlink_flattening
+mutate "an unreadable link count treated as a flat file" \
+  's@^        if ($links -lt 0) {$@        if ($false) {@' \
+  has_hardlink_flattening
+mutate "the flattening scratch file overwriting a cache file of that name" \
+  's@\[System.IO.File\]::Copy($f.FullName, $candidate, $false)@[System.IO.File]::Copy($f.FullName, $candidate, $true)@' \
+  has_hardlink_flattening
+mutate "the kill moved back in front of the try that records a stage still being written" \
+  '/^            \[CiJobObject\]::Kill($job)$/d; s@^        try {$@        [CiJobObject]::Kill($job)\n        try {@' \
+  has_unquiesced_stage_kept
+mutate "the failed drain never recorded" \
+  's@$script:StageNotQuiesced = $true@$null = $job@' \
+  has_unquiesced_stage_kept
+mutate "the cleanup run over a tree that never drained" \
+  's@^    if ($script:StageNotQuiesced) {$@    if ($false) {@' \
+  has_unquiesced_stage_kept
+mutate "the credential filename scan computed and ignored" \
+  's@^        if ($credential) {$@        if ($false) {@' \
+  has_credential_name_scan
+mutate "the credential scan dropped from the pack path" \
+  's@^        $credential = Get-CredentialFileRefusal -Entries $entries$@@' \
+  has_credential_name_scan
+mutate "one credential filename quietly dropped from this side" \
+  "s@'.netrc', @@" \
+  has_agreeing_credential_names
 mutate "every staged file counted, not only the packed ones" \
   's|($script:CacheDirs -contains $_.FullName.Substring($prefix.Length).Split(.\\.)\[0\])|$true|' \
   has_packed_file_count

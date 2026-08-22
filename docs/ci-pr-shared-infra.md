@@ -272,9 +272,8 @@ network namespace, so `127.0.0.1` is the wrong address there:
     env:
       DATABASE_URL: postgres://ci@${{ needs.anchor.outputs.addr }}:${{ needs.anchor.outputs.pg }}/app
     steps:
-      # Renew first, before any work. Re-writing the hold moves its expiry, so
-      # the deadline tracks the last job to START rather than the anchor.
-      - run: ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL"
+      # Nothing to renew here: the host renews the hold before this job's first
+      # step runs. See "Sizing the TTL".
 ```
 
 ### Sizing the TTL
@@ -285,10 +284,32 @@ its database mid-test -- the failure this contract exists to prevent, arriving
 through the door the contract opened. Two rules keep that from happening, and
 both are needed:
 
-**Every pinned consumer renews the hold as its first step.** Re-writing a hold
-for the same run id moves the expiry forward, so the TTL only ever has to cover
-*one job plus the gap before the next*, not the whole run. It is unprivileged
-and idempotent, so there is no reason for a pinned job not to do it.
+**The host renews the hold when a pinned job starts.** Re-writing a hold for
+the same run id moves the expiry forward, so the TTL only ever has to cover *one
+job plus the gap before the next*, not the whole run.
+
+Renewal is **not** a step the workflow writes. It was, in an earlier draft, and
+that draft was wrong twice over. A job with a `container:` — the normal shape
+for a consumer of a containerised stack, and the shape this contract's own
+examples encourage — runs its steps *inside* the container, where the
+host-installed `ci-pin-hold` does not exist: the renewal step would fail
+`command not found`, or, written defensively, would silently succeed while
+renewing nothing, and the stack would then be torn down under a run that had
+done everything asked of it. And there is no gate that could catch either: a
+step's *presence* is checkable, but the phase-5 gates read workflow YAML, and
+whether `ci-pin-hold` resolves inside an arbitrary image is not a property of
+the YAML.
+
+So renewal belongs where the binary is: `ACTIONS_RUNNER_HOOK_JOB_STARTED`, on
+the host, outside any container, before the job's first step. The hook already
+runs on every job on these hosts. It renews when the job carries a `host-*`
+label naming this host and a hold for that run exists; otherwise it does
+nothing. It renews with **the TTL the anchor recorded in the hold**, not with
+`CI_PIN_TTL`: a hook runs outside the job's step environment and cannot rely on
+seeing a workflow-level `env:`, and a hold that renewed itself with a defaulted
+duration would silently stop honouring the number the workflow chose. That makes renewal automatic for every pinned consumer including the
+containerised ones, unforgettable rather than merely documented, and removes
+the gate that could not have worked.
 
 **The TTL must still exceed the longest single hop.** Renewal does not help
 across a hop nothing renews: a Windows consumer runs on a *different* host and
@@ -354,8 +375,8 @@ And one command, on `PATH` in every slot:
 
 | command | meaning |
 |---|---|
-| `ci-pin-hold --run <id> --ttl <duration>` | write (or renew) this host's pin hold as a guest attribute; the controller reads it before acting on a drain, cordon or retire verdict, and vetoes the removal while the hold is live. The TTL runs from now — see "Sizing the TTL" |
-| `ci-pin-hold … --reserve-slot` | additionally reserve **this slot** for the run. Unprivileged — it writes a record. `slot-reset.sh` then spares this slot's containers while still wiping its workspace, and the controller stops the slot's agent so nothing else lands on its uid or its daemon. Released, torn down and restored host-side when the run ends or the TTL lapses |
+| `ci-pin-hold --run <id> --ttl <duration>` | write (or renew) this host's pin hold as a guest attribute; the controller reads it before acting on a drain, cordon or retire verdict, and vetoes the removal while the hold is live. The TTL runs from now — see "Sizing the TTL". Called by the anchor, and thereafter by the host's job-started hook: a workflow never needs to call it to renew, and a job inside a `container:` could not |
+| `ci-pin-hold … --reserve-slot` | additionally reserve **this slot** for the run. Unprivileged — it writes a record. `slot-reset.sh` then spares this slot's containers while still wiping its workspace, and the host-side sweeper stops the slot's agent so nothing else lands on its uid or its daemon. **Refuses** when the host already holds a reservation for a different run — first anchor wins, and the loser continues unpinned. Released, torn down and restored host-side when the run ends or the TTL lapses |
 
 A host that does not set them is older than this contract. The anchor degrades
 to unpinned on a missing `CI_HOST_LABEL`; the owner job fails on a missing
