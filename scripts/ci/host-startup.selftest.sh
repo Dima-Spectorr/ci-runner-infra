@@ -303,6 +303,9 @@ has_slot_reset() { # <file>
   # BEFORE the started hook runs, so wiping them there breaks the starting job
   matches "$code" '_temp\) continue ;;' || return 1
   matches "$code" '\[ "\\\$stage" = started \] && keep_actions=1' || return 1
+  # and the workspace the runner already prepared for the STARTING job is
+  # emptied, not unlinked — a plain `run:` step chdirs into it
+  matches "$code" 'install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"' || return 1
 
   # WHO gets reset is never the caller's choice when the caller is a slot: sudo
   # sets SUDO_UID from the real invoking user, so slot 2 cannot name slot 3.
@@ -622,6 +625,7 @@ mutate "marker left forgeable by the slot" 's@install -d -o root -g root -m 0755
 mutate "dirty slot allowed to run anyway" 's@^  fail_after=1$@  fail_after=0@'                                     has_slot_reset
 mutate "work folder left alone"           's@work="\\\$SLOT_ROOT/\\\$idx/_work"@work="\$SLOT_ROOT/\$idx/_none"@'  has_slot_reset
 mutate "starting job loses its actions"   's@keep_actions=1@keep_actions=0@'                                     has_slot_reset
+mutate "prepared workspace unlinked"      's@install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"@true@'                     has_slot_reset
 mutate "data root back inside the home"   's@ --data-root=/var/lib/ci-slot/%i/docker@@'                            has_slot_reset
 
 mutate "daemon MTU config removed"        's|daemon\.json|daemon.txt|g'                                          has_container_mtu

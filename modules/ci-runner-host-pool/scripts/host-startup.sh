@@ -509,7 +509,19 @@ if [ -d "\$work" ]; then
       _temp) continue ;;
       _actions) [ "\$keep_actions" = 1 ] && continue ;;
     esac
+    # A directory is recreated EMPTY rather than left absent. At `started` the
+    # runner has ALREADY prepared the pipeline workspace — JobExtension creates
+    # it while initializing the job, well before it appends this hook to the
+    # pre-job steps — so a job whose first step is a plain `run:` would chdir
+    # into a path that had stopped existing. The CONTENT is what belongs to the
+    # previous job; the directory itself belongs to this one, and _tool is on
+    # PATH the same way.
+    d=0
+    [ -d "\$e" ] && d=1
     rm -rf -- "\$e" || { say "slot \$idx: could not remove \$e"; rc=1; }
+    if [ "\$d" = 1 ] && [ "\$stage" = started ]; then
+      install -d -o "\$u" -g "\$u" -m 0755 "\$e" || { say "slot \$idx: could not recreate \$e"; rc=1; }
+    fi
   done
 fi
 
