@@ -68,6 +68,11 @@ host from its own environment, and every later job pins to it.
             echo "::notice::host predates the affinity contract — running unpinned"
             exit 0
           fi
+          # Hold the host against drain and recycle for the rest of this run.
+          # `ci-pin-hold` is on PATH in every slot; the expiry is a ceiling, not
+          # a promise, and a lapsed hold degrades to today's behaviour.
+          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl 90m
+
           printf 'runs-on=["self-hosted","linux","gcp","<Repo>","%s"]\n' \
             "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
           printf 'host=%s\n' "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
@@ -117,6 +122,11 @@ but one naming the anchor job's output.
 Exactly one job in the workflow brings the stack up, and it is the anchor.
 `RUNNER10` fails a second owner.
 
+**The owner job does not exit when the stack is up.** It stays running until its
+consumers are done, and that is deliberate — see "Why the owner holds its slot"
+below. Its `timeout-minutes` therefore has to cover the whole run, not just the
+bring-up.
+
 ```yaml
   anchor:
     name: Shared infra (anchor)
@@ -124,7 +134,13 @@ Exactly one job in the workflow brings the stack up, and it is the anchor.
     if: needs.lane.outputs.lane != 'none'
     # ci: shared-infra-owner    <- the marker RUNNER10 counts
     runs-on: [self-hosted, linux, gcp, '<Repo>']
-    timeout-minutes: 15
+    timeout-minutes: 90          # covers the whole run, not the bring-up
+    permissions:
+      # Declaring the block drops every scope not named here to none, so the
+      # checkout needs saying too.
+      contents: read
+      # To watch its own run's jobs. Unlike `administration`, this one exists.
+      actions: read
     outputs:
       runs-on: ${{ steps.up.outputs.runs-on }}
       addr: ${{ steps.up.outputs.addr }}
@@ -152,24 +168,57 @@ Exactly one job in the workflow brings the stack up, and it is the anchor.
           # for: it used to run in every job that needed a database.
           ./scripts/db-migrate.sh "postgres://ci@127.0.0.1:${pg}/app"
 
+          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl 90m
+
           printf 'runs-on=["self-hosted","linux","gcp","<Repo>","%s"]\n' \
             "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
           echo "addr=${CI_SHARED_INFRA_ADDR}" >> "$GITHUB_OUTPUT"
           echo "pg=${pg}"                     >> "$GITHUB_OUTPUT"
+
+      # Outputs are published when the STEP ends, so consumers start now while
+      # this step keeps the job — and therefore the slot and the stack — alive.
+      - id: hold
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Wait for every other job in this run to reach a terminal state.
+          while :; do
+            pending=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs" \
+              --jq '[.jobs[] | select(.name != "Shared infra (anchor)")
+                             | select(.status != "completed")] | length')
+            [ "$pending" -eq 0 ] && break
+            sleep 15
+          done
+          # Same uid, same daemon: the only context that can do this.
+          docker compose -f ci/compose.yaml down -v || true
 ```
 
-### Teardown is the host's job, not a workflow's
+### Why the owner holds its slot
 
-**Do not write a teardown job.** A consuming job runs as a different uid on a
-different slot; the owner's rootless daemon socket lives in a mode-0700
-`/run/ci-s<i>` it cannot open. A teardown step in the last consuming job cannot
-reach the stack it is trying to remove, and an `if: always()` step that silently
-fails is worse than none.
+A job's slot is released the instant the job ends, and the next job to land on
+it runs as the **same uid against the same rootless daemon**. If the owner
+exited once the stack was up, that next job — another pull request's, on a
+single-repository pool — could list, `exec` into, mutate or stop a stack its
+consumers were still using. And the slot's between-jobs reset would do the same
+thing on purpose. Either way the stack dies, or is exposed, while jobs depend on
+it.
 
-The stack is reclaimed **host-side**, by the owner slot's own between-jobs
-cleanup and by a band TTL sweep — the same slot, the same uid, the only context
-that can talk to that daemon. A stack outliving its workflow run holds its band
-until the sweep, and no longer.
+Host affinity does not help here: it pins a *host*, and the owner's problem is
+its *slot*. So the owner reserves the slot the only way GitHub offers — by not
+finishing. It watches its own run's jobs (`actions: read`, a permission that
+actually exists), and exits when they are done.
+
+The cost is one slot occupied for the run, mostly idle. That is the price of the
+stack existing at all, and it is inside the budget rule 1 already sets: the pull
+request holds one host either way.
+
+**Teardown is the owner's last step**, for the same reason nobody else can do
+it: a consuming job is a different uid and cannot open a mode-0700
+`/run/ci-s<i>`. A host-side TTL sweep over the band remains as the backstop for
+an owner that was cancelled or killed before its final step ran.
 
 ### What replaces `services:`
 
@@ -239,6 +288,12 @@ Set by the boot script in every Linux slot's environment:
 | `CI_SHARED_INFRA_PORT_MIN` | first host port DNAT'd into this slot |
 | `CI_SHARED_INFRA_PORT_MAX` | last one; the band is 100 ports and disjoint per slot |
 
+And one command, on `PATH` in every slot:
+
+| command | meaning |
+|---|---|
+| `ci-pin-hold --run <id> --ttl <duration>` | write this host's pin hold; the controller reads it on the IAP-SSH probe it already makes, and refuses to drain or cordon the host until the hold lapses |
+
 A host that does not set them is older than this contract. The anchor degrades
 to unpinned on a missing `CI_HOST_LABEL`; the owner job fails on a missing
 `CI_SHARED_INFRA_ADDR` (`:?` above) rather than defaulting to `127.0.0.1`, which
@@ -262,6 +317,14 @@ surprise.
   label, keeps the pinned job out of scale-out demand, and still counts its host
   as busy. Genuine scale-out demand still comes from anchors, which are
   unpinned.
+- **If the host disappears anyway, your run fails instead of hanging.** The pin
+  hold covers drain and recycle; it does not cover a crash or a manual delete,
+  and a MIG replacement comes back under a different name and therefore a
+  different label. A pinned job whose host no longer exists can never be
+  served — and because it is excluded from scale-out demand, nothing will even
+  try. The controller detects that case and fails the run within a bounded
+  window rather than leaving it to GitHub's 24-hour queue timeout. Re-run the
+  workflow: the next anchor picks a live host.
 
 ## 7. Adoption order
 
@@ -288,8 +351,10 @@ disable it.
 - **Do not use a PAT to read the runner list.** The anchor makes the API
   unnecessary; a fleet-wide token in a repository that runs pull-request code is
   a worse trade than any scheduling gain.
-- **Do not write a teardown job.** See §3 — it cannot reach the daemon it
-  targets.
+- **Do not tear the stack down from a consuming job.** See §3 — it cannot reach
+  the daemon it targets. The owner does it.
+- **Do not make the owner job exit early to "free the slot".** The slot is the
+  stack's lifetime.
 - **Do not publish outside your slot's band.** It works in the job that does it
   and in no other job, which is the worst place for a failure to appear.
 - **Do not write `localhost` in a Windows fleet job.** See `RUNNER11`.
