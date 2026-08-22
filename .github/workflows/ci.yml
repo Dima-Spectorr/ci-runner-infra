@@ -506,7 +506,7 @@ jobs:
 
       # …and the fixtures' own proof. A fixture asserting "this workflow
       # produces RUNNER8" keeps passing while the detector behind it is
-      # weakened, so this mutates the gate seven ways and asserts the suite
+      # weakened, so this mutates the gate sixteen ways and asserts the suite
       # above FAILS for each. Runs after it, because a mutation "detected" by a
       # suite that was already red asserts nothing either.
       - name: runner policy mutation self-test
@@ -515,6 +515,14 @@ jobs:
       # …and then this repository's own workflows. It publishes the rule, so it
       # is the first place the rule must hold. `--forks=allowed` is the strict
       # posture and this repository is PUBLIC, so it is also the true one.
+      #
+      # `--shared-infra` is deliberately NOT passed yet. This repository's own
+      # workflows have not been consolidated onto an anchor, so turning the
+      # rules on here would fail this pipeline on the commit that adds them —
+      # and a gate whose first act is to redden its own repository is a gate
+      # nobody adopts. It goes on in the pull request that does the
+      # consolidation (phase 7 of docs/adr-pr-host-affinity.md); until then the
+      # fixtures above are what prove the rules work.
       - name: runner policy
         run: bash scripts/ci/check-runner-policy.sh --forks=allowed
 
