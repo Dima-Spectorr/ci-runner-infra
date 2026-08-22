@@ -82,13 +82,15 @@ pinned_job_decision() {
   #     carrying pattern syntax is not classified at all. A real label cannot
   #     contain these: GitHub restricts runner labels to plain text.
   #
-  #     The backslash is built with printf rather than written literally in
-  #     the pattern list: shellcheck reads *'\'* as a botched attempt to
-  #     escape a single quote (SC1003) and fails the build over it. A quoted
-  #     expansion in a `case` pattern is matched literally, which is what is
-  #     wanted here in any event.
+  #     The backslash is built from its octal code rather than written as a
+  #     character: shellcheck reads a backslash sitting just inside a closing
+  #     single quote as a botched attempt to escape that quote (SC1003) and
+  #     fails the build over it -- in the pattern list and in a printf of a
+  #     lone backslash alike. '\0134' keeps the backslash away from the quote,
+  #     so there is nothing to misread. A quoted expansion in a `case` pattern
+  #     is matched literally, which is what is wanted here in any event.
   local _bs
-  _bs=$(printf '\\')
+  _bs=$(printf '%b' '\0134')
   case "$job_labels" in
     *'*'* | *'?'* | *'['* | *']'* | *"$_bs"*)
       echo "ignore:labels contain pattern syntax"; return 0 ;;
