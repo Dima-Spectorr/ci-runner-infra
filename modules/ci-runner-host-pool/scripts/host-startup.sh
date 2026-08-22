@@ -2815,10 +2815,10 @@ $BROKER_ENV
 $CACHE_ENV
 $SHARE_ENV
 # The label a job pins the rest of its workflow run to. Read by the anchor job,
-# which publishes it as `runs-on` for every later job in the run. A slot that
-# does not know it degrades to unpinned scheduling rather than failing, which is
-# why the anchor tests for it -- but on this host it is always set, because the
-# boot dies above without it.
+# which publishes it as the runs-on list for every later job in the run. A slot
+# that does not know it degrades to unpinned scheduling rather than failing,
+# which is why the anchor tests for it -- but on this host it is always set,
+# because the boot dies above without it.
 Environment=CI_HOST_LABEL=$HOST_LABEL
 # Reset this slot before every job and after every job: the home is emptied and
 # rebuilt from $SLOT_TEMPLATE, and the previous job's workspace and tool cache go
