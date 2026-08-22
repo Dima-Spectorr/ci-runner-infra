@@ -1,6 +1,7 @@
 # One workflow run, one host — and one shared infrastructure stack on it
 
-Status: **proposed** (design only; nothing here is implemented).
+Status: **accepted** 2026-08-22. Implementation lands phase by phase; the
+delivery table in §6 is the record of what is live.
 Scope: every repository on the fleet, both pools.
 Related: [`ci-lane-model.md`](ci-lane-model.md) decides *how much* CI a diff
 deserves; this decides *where* that CI runs and *what it shares*.
@@ -114,7 +115,10 @@ What it must not do is rely on the path that already exists by accident — see
 
 The same fence decides **who may tear a stack down**: only the owning slot's uid
 can open its own daemon socket, so teardown cannot be a downstream job's
-`if: always()` step. It is host-side, and §3.5 says so.
+`if: always()` step — and it cannot be the owner's either, because the owner is
+a job, and a job that has ended cannot run a cleanup for the jobs that follow
+it. Teardown therefore belongs to the only actor that outlives every job on the
+host and can still enter a slot's uid: the host-side sweeper of §3.5.
 
 ---
 
@@ -206,14 +210,72 @@ idle agents, and a cordoned host stops answering its own affinity label while
 the run pinned to it still has jobs to place.
 
 So: a host carries a **pin hold** — a marker naming the workflow run and an
-expiry, written by the anchor job. **Both** `recycle_decision()` and
-`drain_decision()` take it as an input, and both treat an unexpired hold as
-not-removable. They stay pure functions of their arguments, which is how every
-other decision in this module is tested.
+expiry, written by the anchor job. The hold is a **veto on the verdict**, not an
+argument to it: `recycle_decision()` and `drain_decision()` keep their current
+signatures and stay pure functions of their arguments, and the controller,
+having reached a `cordon:`, `retire:` or `drain:` verdict for a host, reads that
+host's hold and downgrades the verdict to a no-op when the hold is live. Both
+paths are covered because both funnel through the same veto.
+
+Placing it after the verdict rather than inside it is what makes the cost
+bounded. A hold passed as an argument would have to be read for **every** host on
+**every** tick, since `recycle_decision()` is consulted for every host; read as a
+veto it is fetched only for a host the controller is about to remove, which is
+rare. That is the same shape as the existing `beacon_gate()`, which vetoes a
+delete rather than feeding the decision that produced it.
 
 The expiry is what makes the hold safe to write from job context: the worst a
 forged or abandoned hold can do is keep one host warm until it lapses, which is
 the same cost as a slow job, and the orphan rules are unchanged above it.
+
+**Something has to write it.** A guarantee with no writer is a sentence, so the
+hold is a concrete pair: `ci-pin-hold --run <id> --ttl <duration>`, a bounded
+host helper on `PATH` in every slot, which the anchor invokes before it
+publishes the label — with `--reserve-slot` when it also owns shared
+infrastructure (§3.1); and a reader in the controller.
+
+**The helper publishes the hold as a guest attribute**, and the controller reads
+it with `gcloud compute instances get-guest-attributes` — the same channel and
+the same call `beacon_gate()` already uses (`controller-startup.sh:1388`). Three
+reasons it is that and not an SSH read. Guest attributes are writable by any
+process on the VM, job code included, so the helper needs no privilege the job
+does not already have — which is the whole premise of §3.4. The controller needs
+no shell on the host to answer a question about it. And the mechanism is already
+in the module, already gated, already tested.
+
+An earlier draft claimed the read was free because the controller already
+SSHes to each host. It is not: that probe (`pgrep -fc Runner.Worker`,
+`controller-startup.sh:1579`) lives **inside** `drain_host()`, which runs *after*
+the verdict and *after* the host's agents have been deregistered. It could not
+inform a decision that had already been made, and by the time it ran the host
+had already stopped answering its affinity label. The veto owns a real round
+trip — one per host being removed, per the paragraph above.
+
+The reader inherits `beacon_gate()`'s two defences verbatim, for the same
+reason: first occurrence of a key wins, because job code can append; and the
+expiry is **clamped to a configured maximum** on read, because job code can also
+write one ten years out. Seeing a malformed hold means keeping the host, not
+dropping the hold — a broken publisher must not read as consent to delete.
+
+The helper ships with the host in phase 3, the veto in phase 4 — the delivery
+table says so, because a hold whose writer is nobody's phase is how this arrives
+half-built.
+
+### 2.6 A host that disappears must fail the run, not hang it
+
+The hold covers the two *intentional* removals. It does not cover a crash, a
+manual delete, or a MIG replacement — and a replacement comes back under a new
+instance name, so it answers a different label. §2.5 then makes the failure
+silent by design: the pinned jobs are excluded from scale-out demand, so nothing
+even tries to serve them, and the run sits in GitHub's queue until the 24-hour
+cancellation. That is exactly the unrecoverable-without-an-operator shape §2.2
+exists to avoid, arriving through a different door.
+
+So the controller — which already lists queued jobs and already knows its live
+hosts — treats *a pinned queued job whose `host-*` label matches no live host*
+as a bounded, reportable fault: surfaced on the existing demand series, and the
+run failed within a small multiple of a tick rather than a day. Failing fast is
+the whole point; a re-run anchors somewhere alive.
 
 ### 2.5 The controller must not go blind to pinned work
 
@@ -250,6 +312,67 @@ rootless daemon with a compose project name derived from the pull-request
 number, migrates and seeds it once, publishes the endpoints as job outputs, and
 every other job — Linux or Windows — consumes those outputs.
 
+**And then it exits — while its slot stays reserved.** Those are two separate
+requirements, and the obvious way to satisfy the second breaks the first.
+
+A slot is released the instant its job ends, and the next job to land there runs
+as the *same uid against the same rootless daemon* — free to list, `exec` into,
+mutate or stop a stack that other jobs are still using; the slot's between-jobs
+reset would destroy it outright. Host affinity does not help: it pins a host,
+and this is a *slot* problem.
+
+The tempting reservation — keep the owner job running — is unbuildable. Job
+outputs reach `needs.<job>.outputs.*` only on completion, and a dependent job
+waits for its whole `needs:` list to complete. An owner that lingers to guard
+the stack is holding the endpoints its consumers are queued for, while waiting
+for those same consumers: every adopting workflow deadlocks on its first run.
+This is the same failure shape as the runner-list lease in §2.2 — a mechanism
+whose description reads fine and which cannot exist — and it is worth stating
+plainly rather than quietly replacing.
+
+So the reservation is host-side, where slots are actually a concept. It is two
+mechanisms, and the split is forced rather than chosen.
+
+The owner calls `ci-pin-hold --reserve-slot`, which writes a record into the
+slot's own state directory. **Unprivileged, deliberately.** A slot's sudoers
+grant is an allowlist of two literal command lines (`slot-reset.sh started`,
+`slot-reset.sh completed`), and the index is taken from `SUDO_UID` so a slot
+cannot even name another. Adding a rule that lets PR-authored code stop a
+systemd unit would undo the most carefully argued fence on the host to save
+writing a file.
+
+`slot-reset.sh` — already root, already invoked before and after every job —
+reads that record and spares this slot's containers while performing its wipe of
+the workspace, home and credentials unchanged. The **controller** stops the
+slot's agent, on the per-host probe it already makes, so no further work is
+scheduled onto that uid or that daemon.
+
+The stop cannot be the hook's. `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` executes
+inside `ci-runner@<idx>.service`; a hook that stopped its own unit would have
+systemd SIGTERM the agent mid-report, so the slot would be reserved and the job
+would be lost. That leaves a window of one controller tick in which a job can
+still land on the reserved slot — which is exactly why the reset half is
+load-bearing and not an optimisation: the newcomer gets a clean tree, and the
+stack survives it.
+
+One of `slots_per_host` is unavailable for the run either way; that is the price
+of the stack existing at all, and it is inside the budget rule 1 already sets.
+
+**Which makes `slots_per_host = 1` unadoptable, and the module permits it**
+(`variables.tf`: the validation is `>= 1`, and the Windows guidance is 1 for a
+pool whose jobs bind fixed ports). On a one-slot host the owner reserves the
+only agent, every consumer is pinned to that host, and nothing can run until the
+TTL sweep releases the slot — at which point it tears down the stack those
+consumers were queued for. A deadlock resolved by destroying its own subject.
+
+A Terraform validation cannot catch it: the pool does not know whether the
+repository has adopted the contract. So the check belongs to the only actor that
+knows both facts at once — `ci-pin-hold --reserve-slot` refuses on a host with
+one slot and fails the run there, in the anchor, with the pool's name and the
+reason. Adoption therefore requires `slots_per_host >= 2`, and consumer
+concurrency is `slots_per_host - 1`, which is the number the budget in §1 should
+be read against for an adopting repository.
+
 `services:` is the shape being replaced. A `services:` block is per-job by
 definition and there is no version of it that is shared, so a repository that
 has adopted this contract declares infrastructure in exactly one place. That is
@@ -261,7 +384,13 @@ A slot's published port lands in the slot's network namespace. From outside the
 host — and from a sibling slot — it does not exist. Two things are added:
 
 **A per-slot port band.** Slot `idx` owns host ports `35000 + idx*100` through
-`35000 + idx*100 + 99`. Disjoint by construction, so two slots publishing the
+`35000 + idx*100 + 99`. Slot indices start at **one** (`seq 1 "$SLOTS"`), so the
+lowest band is 35100 and the **band span** — the range the firewall and the
+conntrack allow are written against — is `35100` through
+`35000 + slots_per_host*100 + 99`. It is computed from the same two functions
+that place each band rather than restated as a formula: a firewall range and a
+DNAT range that disagree fail as "the connection hangs", which is unreadable.
+Disjoint by construction, so two slots publishing the
 "same" service never collide — the collision that
 [`setup_slot_netns`](../modules/ci-runner-host-pool/scripts/host-startup.sh)
 was written for in the first place. The number of bands follows
@@ -284,8 +413,33 @@ address instead admits both while still declining anything not addressed to this
 host.
 
 The `FORWARD` chain already accepts `-o cis<idx>`, so nothing in the forwarding
-policy loosens. What is new is one PREROUTING entry per slot, bounded to 100
-ports, and nothing else on the host becomes reachable.
+policy loosens today. What is new is one PREROUTING entry per slot, bounded to
+100 ports, and nothing else on the host becomes reachable.
+
+**But "already accepts" is exactly what [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249)
+removes, and this path depends on it.** A sibling slot's packet to the host
+address is DNATed in `PREROUTING` and then traverses `FORWARD` from its own
+`cis<N>` to the owner's veth — the same forward that #249 exists to reject. The
+two changes therefore cannot be sequenced independently: closing the broad
+accepts first makes every same-host Linux consumer unable to reach the stack,
+and shipping the band first leaves #249 with a path it must not simply keep
+open.
+
+The band needs its own allow, scoped to what the DNAT actually produced rather
+than to an interface pair:
+
+```
+FORWARD -m conntrack --ctstate DNAT \
+        --ctorigdst <host primary address> \
+        --ctorigdstport <band span>                       -j ACCEPT
+FORWARD -m conntrack --ctstate ESTABLISHED,RELATED        -j ACCEPT
+```
+
+Original-destination matching is the point: it admits precisely the traffic that
+entered through a band DNAT and nothing that a slot addressed to a sibling's
+`10.99.<n>.2` directly. That rule is installed **before** #249's reject, and
+#249's own acceptance criterion becomes "a sibling reaches the band, and reaches
+nothing else" — which is stronger than what either change asserts alone.
 
 The slot learns its own band, its host label and the host's address the same way
 it learns its cache paths — environment, set by the boot script:
@@ -313,14 +467,39 @@ So rule 3 needs two narrow rules, not a posture change — and they are **not
 symmetrical**, because GCP's two directions do not offer the same controls:
 
 ```
-INGRESS  source_tags        = [runner_network_tag]
-         target_tags        = [runner_network_tag]
-         tcp: 35000 .. 35000 + slots_per_host*100 - 1
+INGRESS  source_tags        = [ci-shared-infra-<pool>]
+         target_tags        = [ci-shared-infra-<pool>]
+         tcp: <band span>
 
-EGRESS   target_tags        = [runner_network_tag]     # the SOURCE VMs
+EGRESS   target_tags        = [ci-shared-infra-<pool>] # the SOURCE VMs
          destination_ranges = [the pool subnet's CIDR] # ranges only
-         tcp: 35000 .. 35000 + slots_per_host*100 - 1
+         tcp: <band span>
 ```
+
+**A dedicated tag, not `network_tags`.** Both rules select VMs by tag, and a
+Windows host carries no tag at all — deliberately: `adr-windows-pool.md` scopes
+the `network_tags` contract to Linux precisely so a Windows host has **no
+inbound path from anywhere**, no IAP-SSH rule and no listener. Reusing that tag
+would have left the Windows host matching neither rule, so `deny-egress` at
+65534 would take every connection to the stack and rule 3 — the whole reason
+this section exists — would fail closed on the one case it was written for.
+
+So the band gets its own tag, applied to both pools' hosts — and the tag is
+**scoped to the repository's pool pair, not to the fleet**:
+`ci-shared-infra-<pool>`, derived from the same name the module already uses for
+its MIG. A literal `ci-shared-infra` would have been a fleet-wide tag, and
+network tags match across every VM in the VPC that carries them: two
+repositories whose pools share a network — which is the normal deployment, since
+the module takes the network as an input — would each match the other's ingress
+rule, and one repository's job could open a socket on another repository's
+database. The tag must name *these* hosts. The Linux and Windows pools of one
+repository deliberately share it, because rule 3 is precisely the statement that
+those two may reach each other's band.
+
+It **does not** reintroduce an inbound path to Windows: the tag appears as an
+ingress *source* and as an egress *target* (which selects the sending VM). No
+ingress rule anywhere targets a Windows host, and the Windows ADR's decision
+stands unchanged.
 
 **An egress rule cannot scope its destination by network tag.** GCP egress
 destinations are IP ranges, full stop; `target_tags` on an egress rule selects
@@ -352,17 +531,61 @@ single packaging build, so both answers are defensible and neither is imposed:
 `RUNNER9` covers Linux jobs only. A repository that runs several Windows jobs
 chooses in its own workflow.
 
-### 3.5 Teardown is host-side
+### 3.4a A reboot ends the run; it must not quietly resume it
 
-A downstream job cannot tear the stack down: it runs as a different uid and the
-owner's daemon socket is in a mode-0700 `/run/ci-s<i>`. An `if: always()`
-teardown step in the last consuming job fails silently, which is worse than no
-teardown at all.
+A reservation that lives only in a stopped unit does not survive a restart.
+`ci-runner@<idx>` is `systemctl enable`d, so a rebooted host starts it again,
+and its `ExecStartPre=+slot-reset.sh boot <idx>` wipes the slot before the agent
+becomes schedulable. Nothing in that sequence knows a hold existed: the slot
+comes back schedulable, another pull request's job lands on the owner's uid and
+daemon, and the run that was pinned there is still waiting for a stack that a
+reboot destroyed anyway — rootless containers do not survive the guest.
 
-The stack is reclaimed by the owning slot — its between-jobs cleanup, plus a TTL
-sweep over the band so a stack whose workflow run ended does not hold ports
-until the host is recycled. Same slot, same uid, the only context that can
-address that daemon.
+So the hold is a file, not a process state, and it records the boot it was
+written under. The `boot` path of the reset — which already runs before the
+agent can take work, and is therefore the right place — compares them. A hold
+from a previous boot is not honoured and not silently dropped either: the host
+performs the full reset, releases the slot, and marks the hold **orphaned** for
+the controller to read on the probe it already makes.
+
+That last step matters because §2.6 would otherwise miss this. §2.6 fires when
+no live host answers a pinned label, and after a reboot the label is answered
+again by the same instance. The orphan mark is what turns "the stack you were
+promised no longer exists" into a failed run in a bounded window instead of a
+pinned queue that drains at GitHub's 24-hour timeout.
+
+### 3.5 Teardown is host-side, and so is the release
+
+A downstream job cannot do it: different uid, and the owner's daemon socket is
+in a mode-0700 `/run/ci-s<i>`. An `if: always()` teardown step in the last
+consuming job fails silently, which is worse than no teardown at all. Nor can
+the owner do it, for the reason §3.1 gives: it has to exit for its consumers to
+start, so it is long gone before the last of them finishes.
+
+The host owns both ends. Releasing the slot hold *is* the teardown: the sweeper
+brings the stack down as the slot's own user, runs the container reset that the
+hold had been sparing, and starts the agent again.
+
+**And it needs a terminal branch, because those three steps can fail.** A daemon
+that will not stop, a compose project that will not come down, a reset that
+returns non-zero: each leaves the slot in a state with no good local move.
+Restarting the agent would hand the next job a live stack and an unreset tree.
+Leaving it stopped strands capacity past the TTL the contract advertises, and
+expiring the *host* pin does not recover it — ordinary drain holds the fleet at
+`min_hosts`, so the host stays, broken, with one slot fewer.
+
+So release fails closed to host replacement: the host marks itself unhealthy
+with the failing step named, the controller retires it — the `retire:` branch of
+`recycle_decision`, which replaces rather than drains and is therefore not
+bounded by `min_hosts` — and the MIG brings up a clean one. Bounded: one sweep
+interval to detect, one recycle to replace. Visible: the failure is a reason
+string on the same series as the holds, not a slot that silently stopped
+existing. A host that cannot clean a slot is a host, and hosts here are
+disposable; a slot is not. It fires when the controller observes
+the run finished — it already lists that run's jobs — or when the TTL lapses,
+whichever comes first. The TTL is the backstop that keeps a controller outage
+from stranding a slot, and a band sweep catches a stack whose hold record was
+lost.
 
 ---
 
@@ -421,7 +644,20 @@ named port band on the host address precisely so that the sanctioned path is the
 one workflows are written against, and so that closing the accidental one later
 breaks nothing. **Filed as
 [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249); it lands
-before or with phase 3.**
+before or with phase 3, and §3.2's conntrack allow lands with it** — the two are
+one change in two files, because the band's same-host path runs through the
+forward that #249 closes.
+
+**The reservation is not instant, so a stack can briefly have a co-tenant.**
+Between the owner's exit and the controller's next tick, another pull request's
+job can be scheduled onto the reserved slot and will share that slot's daemon
+for its duration. The reset protects the newcomer's workspace and the hold
+protects the stack from the reset, but nothing stops that job from reaching the
+daemon socket it legitimately owns. The exposure is bounded by the same rule
+that bounds the port band — one repository per pool — and it is the reason a
+shared stack must never hold a secret. Shrinking the window means the controller
+learning about a hold sooner than its tick, which is a cost this design declines
+to pay for a risk this rule already contains.
 
 **A shared stack is a shared mutable object.** Six jobs against one Postgres can
 race in ways six private Postgres instances cannot, and the failure looks like
@@ -445,6 +681,20 @@ this is slower. That is the trade being made deliberately: #205's evidence is
 that the unbounded case is what produces the 291 s waits and the displaced
 required checks, and a predictable four is worth more than an occasional eight.
 
+**The owner's slot is reserved and idle.** For the length of the run, one of
+`slots_per_host` accepts no work. The alternatives are a stack that dies when
+its owner exits, or one a stranger's job can reach on the recycled slot; both
+are worse. It also means a repository whose stack is needed by one job should
+not adopt the owner pattern at all — a plain `services:` block on that job is
+cheaper and this contract is not for it.
+
+**A reserved slot depends on the release path running.** The agent is stopped by
+the controller and started by the sweeper, so a bug or an outage between the two
+subtracts a slot from the pool until the TTL fires. The TTL is what bounds it,
+and the reserved-slot count belongs on the same demand series as the pin holds
+so a leak is visible rather than inferred from capacity that quietly went
+missing.
+
 **The anchor serializes the start of a run.** Nothing pinned can begin until the
 anchor has landed on a host, so a cold pool pays one boot before any pinned job
 starts, where today several jobs would queue in parallel for the same boot. The
@@ -458,15 +708,15 @@ added is an environment read and not a job's worth of scheduling.
 Each phase is independently landable and independently useful. Nothing before
 phase 5 changes any consuming repository's behaviour.
 
-| # | Phase | Touches | Ships without |
-|---|---|---|---|
-| 1 | This ADR and the published contract | `docs/` | — |
-| 2 | Affinity label at boot + `CI_HOST_LABEL`, both pools; **`collect_demand` recognises it (§2.5)** | `host-startup.sh`, `windows-host-startup.ps1`, `controller-startup.sh`, self-tests | any workflow using it |
-| 3 | Port band, per-slot DNAT, `CI_SHARED_INFRA_*`, TTL sweep; **[#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) first** | `host-startup.sh`, self-tests | any firewall change |
-| 4 | Ingress/egress band rules; pin hold in **both** `recycle_decision` and `drain_decision` (§2.4) | `ci-runner-network`, `recycle-decision.sh`, `drain-decision.sh`, self-tests | any workflow using it |
-| 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) |
-| 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — |
-| 7 | Per-repository adoption, workflow consolidation first | consuming repositories, one pull request each | — |
+| # | Phase | Touches | Ships without | Status |
+|---|---|---|---|---|
+| 1 | This ADR and the published contract | `docs/` | — | [#247](https://github.com/Dima-Spectorr/ci-runner-infra/pull/247) merged; the rest in [#255](https://github.com/Dima-Spectorr/ci-runner-infra/pull/255) |
+| 2 | Affinity label at boot + `CI_HOST_LABEL`, both pools; **`collect_demand` recognises it (§2.5)**; **orphaned-pin detection (§2.6)** | `host-startup.sh`, `windows-host-startup.ps1`, `controller-startup.sh`, self-tests | any workflow using it | [#253](https://github.com/Dima-Spectorr/ci-runner-infra/pull/253) for the label; [#256](https://github.com/Dima-Spectorr/ci-runner-infra/pull/256) for §2.5 + §2.6 |
+| 3 | Port band, per-slot DNAT, **the conntrack band allow paired with [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) in one change**, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper, publishing the hold as a guest attribute, and its `--reserve-slot` record** (refusing a one-slot host), **`slot-reset.sh` sparing a held slot's containers and releasing a hold from a previous boot as orphaned** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), sweeper teardown + reset + agent start with **fail-closed retire** when any of the three fails, TTL sweep | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** | not started |
+| 4 | Ingress/egress band rules on the new per-pool `ci-shared-infra-<pool>` tag, **applied to both of the repository's pools**; pin-hold veto read from guest attributes and applied to the `cordon:`/`retire:`/`drain:` verdicts of **both** `recycle_decision` and `drain_decision` (§2.4) | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `controller-startup.sh`, self-tests | any workflow using it | not started |
+| 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) | not started |
+| 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — | not started |
+| 7 | Per-repository adoption, workflow consolidation first | consuming repositories, one pull request each | — | not started |
 
 Phase 5 lands the rules behind a flag for the same reason `--forks` is a flag: a
 gate that fails every repository on the day it merges is a gate that gets
@@ -485,17 +735,35 @@ disabled in every repository on the day after.
   no lease store. A host that predates the contract is a **supported answer**
   that degrades to today's behaviour.
 - The controller will not drain **or cordon-for-recycle** a host holding an
-  unexpired pin hold, and `collect_demand` must recognise the affinity label
-  before the label ships.
+  unexpired pin hold. The hold has a named writer (`ci-pin-hold`, invoked by the
+  anchor and renewed by each pinned consumer) and a named reader (a guest-
+  attribute read on the removal path, one round trip per host being removed).
+- `collect_demand` must recognise the affinity label before the label ships, and
+  a pinned job whose host no longer exists fails its run within a bounded window
+  instead of queueing for a day.
 - Shared infrastructure is owned by exactly one job — the anchor — published
   into a per-slot port band, DNAT'd on the host address, and reached by everyone
-  else at that address. Teardown is host-side; a downstream job cannot reach the
-  owner's daemon socket.
+  else at that address. **The owner exits immediately** (its outputs are
+  unreadable until it does, so a lingering owner deadlocks its consumers) and
+  **the host reserves its slot for the run** — root's reset spares the held
+  slot's containers, and the controller stops that slot's agent — because a
+  released slot is reused by the next job under the same uid and the same
+  daemon. The hold itself is unprivileged; job code gains no new sudo rule.
+  Teardown and release are the same host-side act, and a release that cannot
+  complete retires the host rather than restarting the agent over a stack it
+  failed to remove.
+- Adoption requires `slots_per_host >= 2` — a one-slot pool would reserve its
+  only agent — and consumer concurrency is `slots_per_host - 1`. A reboot
+  releases the hold as orphaned and fails the run, because the stack did not
+  survive it either.
 - The Windows pool gets no container runtime. This was reconsidered as part of
   this decision and re-affirmed: `adr-windows-pool.md` §4's reasoning is
   unchanged, and rule 3 is satisfied by reachability, not by a runtime. Windows
   jobs are not pinned.
-- The firewall gains two narrow rules for the band — ingress scoped by tag,
-  egress scoped by the pool subnet's range because GCP egress cannot scope by
-  tag — and no widening of `database_egress_ports`.
+- The firewall gains two narrow rules for the band on a **new
+  `ci-shared-infra-<pool>` tag carried by both of a repository's pools and by no
+  other repository's** — ingress scoped by tag, egress scoped by the pool
+  subnet's range because GCP egress cannot scope by tag — and no widening of
+  `database_egress_ports`. Windows gains no inbound path; the tag is only ever
+  an ingress source or an egress target.
 - The gate rules are opt-in by flag until phase 7 completes.
