@@ -1520,16 +1520,39 @@ has_agreeing_cache_dirs() { # <publish-script>
 # job with `id-token: write` hands that code the credential through
 # ACTIONS_ID_TOKEN_REQUEST_TOKEN no matter what the script does afterwards.
 has_split_publishing_workflow() { # <doc>
-  local build publish doc
+  local build publish winbuild doc
   doc=$(cat "$1")
-  # The two job blocks, by their own boundaries rather than by line count.
-  build=$(sed -n '/^  build:$/,/^  publish:$/p' "$1")
+  # The job blocks, by their own boundaries rather than by line count.
+  #
+  # THE FIRST `build:` ONLY, and awk rather than a sed range, because the
+  # document now carries a SECOND one: the Windows variant further down. A sed
+  # range re-triggers on every match of its opening address, so `/build:/,/publish:/`
+  # opened again at the Windows block and, finding no later `publish:`, ran to
+  # end of file -- handing the refusals below several hundred lines of prose to
+  # read as job YAML. The predicate did not become wrong when the Windows block
+  # was added; it had always been one heading away from it.
+  build=$(awk '/^  build:$/ { f = 1 } f { print } /^  publish:$/ { exit }' "$1")
   publish=$(sed -n '/^  publish:$/,/^```$/p' "$1")
-  [ -n "$build" ] && [ -n "$publish" ] || return 1
+  # And the Windows build job gets the SAME reading rather than being skipped.
+  # It runs CACHE_PREPARE, so every reason the Linux build job may hold no
+  # credential applies to it unchanged; a split that holds on one platform and
+  # not the other is not a split.
+  winbuild=$(awk '/^  build:$/ { n++ } n == 2 { print } n == 2 && /^```$/ { exit }' "$1")
+  [ -n "$build" ] && [ -n "$publish" ] && [ -n "$winbuild" ] || return 1
 
   matches "$build" 'CACHE_PREPARE'      || return 1
   ! matches "$build" 'id-token'         || return 1
   ! matches "$build" 'google-github-actions/auth' || return 1
+
+  matches "$winbuild" 'CACHE_PREPARE'   || return 1
+  ! matches "$winbuild" 'id-token'      || return 1
+  ! matches "$winbuild" 'google-github-actions/auth' || return 1
+  matches "$winbuild" 'persist-credentials: false'   || return 1
+  # It hands the archive on rather than uploading it: an OUT, never an IN, and
+  # never a bucket. The Windows job is the one that runs third-party install
+  # code, so it is the one that must not be able to reach the bucket at all.
+  matches "$winbuild" 'CACHE_ARCHIVE_OUT' || return 1
+  ! matches "$winbuild" 'CACHE_BUCKET'  || return 1
 
   matches "$publish" 'id-token: write'  || return 1
   matches "$publish" 'CACHE_ARCHIVE_IN' || return 1
@@ -2328,6 +2351,20 @@ mutate_file "$PUBDOC" 'every checkout goes back to the defaults' has_split_publi
   's@^          persist-credentials: false$@@'
 mutate_file "$PUBDOC" 'the build job alone keeps the token in its workspace' has_split_publishing_workflow \
   '0,/^          persist-credentials: false$/{/^          persist-credentials: false$/d}'
+# The Windows build job, read as a build job. Each of these leaves the Linux
+# pair untouched and would have passed unnoticed while the platform that runs
+# the install held the credential.
+mutate_file "$PUBDOC" 'the Windows build job gains the credential' has_split_publishing_workflow \
+  's@^      contents: read           .*$@      contents: read\n      id-token: write@'
+# NOT `/^  build:$/,/^  publish:$/!`, which is what this said first and which
+# matched nothing: a sed range re-opens at EVERY match of its opening address, so
+# the second `build:` -- the Windows one -- starts a range that finds no further
+# `publish:` and therefore runs to end of file. The negation then excluded the
+# very line the mutation was aimed at, and `mutate_file` reported "matched
+# nothing". The Windows path is spelled with a backslash and the Linux one with a
+# slash, so that is what tells them apart here.
+mutate_file "$PUBDOC" 'the Windows build job publishes directly' has_split_publishing_workflow \
+  's@^          CACHE_ARCHIVE_OUT: .*\\snap\.tar\.gz$@          CACHE_BUCKET: some-bucket@'
 
 # The verdict plumbing. Every one of these leaves a hydrate that still works —
 # hosts boot, jobs run — and takes away the only thing that would have said the
