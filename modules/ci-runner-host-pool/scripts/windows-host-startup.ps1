@@ -1176,6 +1176,10 @@ function Get-SlotServiceEnvironment {
         # one. See the block at the end of this function for why this is the one
         # value here that is allowed to be conditional.
         [AllowEmptyString()][string] $CachePath = '',
+        # The host's affinity label, `host-<instance-name>`. Phase 5 always has
+        # one -- Read-Config denies the boot on an unnamed instance -- so the
+        # empty default exists for the suite, not for a host.
+        [AllowEmptyString()][string] $HostLabel = '',
         # Injectable for the same reason Get-SlotTempPath's is: the Pester suite
         # runs on ubuntu-latest, where `Join-Path 'C:\ci\slots' 1` does not build
         # a string, it throws DriveNotFoundException. A pure function that cannot
@@ -1201,6 +1205,14 @@ function Get-SlotServiceEnvironment {
 
     $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] = $HookPath
     $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] = $HookPath
+
+    # The label the rest of a workflow run pins itself to, read by the anchor
+    # job (docs/adr-pr-host-affinity.md). Absent, the anchor runs the workflow
+    # unpinned -- a degradation, not a failure, which is why this one is allowed
+    # to be conditional where the five above are not.
+    if (-not [string]::IsNullOrWhiteSpace($HostLabel)) {
+        $block['CI_HOST_LABEL'] = $HostLabel
+    }
 
     # THE ONE CONDITIONAL BLOCK, AND THE CONTRAST WITH THE FIVE ABOVE IS THE POINT
     #
@@ -2194,6 +2206,8 @@ function Invoke-Phase0Preflight {
         BeaconInterval = Get-MetadataValue 'instance/attributes/ci-beacon-interval'
         InstanceName   = Get-MetadataValue 'instance/name'
         Labels         = Get-MetadataValue 'instance/attributes/ci-runner-labels'
+        # Derived below from InstanceName, once it is known to be non-empty.
+        HostLabel      = ''
         RunnerGroup    = Get-MetadataValue 'instance/attributes/ci-runner-group'
         JobSa          = Get-MetadataValue 'instance/attributes/ci-job-service-account'
         BrokerPort     = Get-MetadataValue 'instance/attributes/ci-job-broker-port'
@@ -2224,6 +2238,17 @@ function Invoke-Phase0Preflight {
         Deny-Boot ('the metadata server did not name this instance -- an agent registered without ' +
             'it cannot be traced back to a host and would never be reaped')
     }
+
+    # Every agent on this host also answers to `host-<instance-name>`, which is
+    # what lets a workflow run keep its later jobs on the host its first job
+    # landed on (docs/adr-pr-host-affinity.md). GitHub routes a job to any runner
+    # whose label set is a SUPERSET of `runs-on`, so this costs nothing to a
+    # workflow that does not name it. Appended after both checks above, because
+    # it is only well-defined once the instance has a name and the pool has
+    # labels -- and the module cannot pass it in metadata, since a MIG assigns
+    # the instance name at creation.
+    $cfg.HostLabel = "host-$($cfg.InstanceName)"
+    $cfg.Labels = "$($cfg.Labels),$($cfg.HostLabel)"
 
     # The OS marker is asserted, not assumed. Terraform decides which metadata
     # key carries which boot script; a mis-wired pool would otherwise deliver
@@ -4109,7 +4134,8 @@ function Invoke-Phase5Registration {
         $cache = ''
         if ($CachePaths.Contains($slot.Index)) { $cache = [string] $CachePaths[$slot.Index] }
         $block = Get-SlotServiceEnvironment -Index $slot.Index `
-            -HookPath $HookPath -BrokerEndpoint $BrokerEndpoint -CachePath $cache
+            -HookPath $HookPath -BrokerEndpoint $BrokerEndpoint -CachePath $cache `
+            -HostLabel $Config.HostLabel
         Register-SlotAgent -Slot $slot -RegistrationToken $regToken `
             -Owner $Config.Owner -Repo $Config.Repo -InstanceName $Config.InstanceName `
             -Labels $Config.Labels -RunnerGroup $Config.RunnerGroup -Environment $block

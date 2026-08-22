@@ -580,6 +580,55 @@ has_slot_share() { # <file>
   matches "$code" '^\$SHARE_ENV$'
 }
 
+
+# The shared-infrastructure port band (adr-pr-host-affinity.md §3.2). Four parts,
+# and every one of them is silent when broken: a slot that publishes a database
+# nobody can reach fails as "the Windows job cannot connect", which reads as a
+# firewall problem, a DNS problem, or a flaky test -- anything but the missing
+# rule that caused it.
+has_shared_infra_band() { # <file>
+  local code
+  code=$(code_of "$1")
+  # the band is derived from $SLOTS, not from a hardcoded slot count
+  matches "$code" '^slot_band_min\(\)' || return 1
+  matches "$code" '^slot_band_max\(\)' || return 1
+  matches "$code" 'slot_band_max "\$SLOTS"' || return 1
+  # a 1:1 DNAT per slot, matched on the host ADDRESS. An `-i` match here would
+  # exclude a sibling slot, whose packets arrive on cis<N> -- the main consumer.
+  matches "$code" 'PREROUTING -d "\$addr" -p tcp --dport "\$bmin:\$bmax"' || return 1
+  matches "$code" 'DNAT --to-destination "\$nsip"' || return 1
+  # the forward allow is scoped to what the DNAT produced, not to an interface
+  # pair, so it survives #249 removing the broad per-veth accepts
+  matches "$code" 'ctstate DNAT --ctorigdst "\$baddr"' || return 1
+  matches "$code" 'ctorigdstport "\$bspan_min:\$bspan_max"' || return 1
+  # and the slot is told its own band, or a job cannot know where to publish
+  matches "$code" '^Environment=CI_SHARED_INFRA_ADDR=' || return 1
+  matches "$code" '^Environment=CI_SHARED_INFRA_PORT_MIN=' || return 1
+  matches "$code" '^Environment=CI_SHARED_INFRA_PORT_MAX=' || return 1
+}
+
+# The arithmetic itself, EVALUATED rather than matched. A text predicate cannot
+# tell 35000+idx*100 from 35000+idx*10, and the second one overlaps every band
+# with the next -- two slots publishing the same port, which is the collision
+# the whole design exists to make impossible.
+band_arithmetic_disjoint() { # <file>
+  local defs i j amin amax bmin bmax
+  defs=$(sed -n '/^CI_BAND_BASE=/,/^slot_band_max()/p' "$1")
+  ( eval "$defs"
+    for i in 1 2 3 4 5 6 7 8; do
+      amin=$(slot_band_min "$i"); amax=$(slot_band_max "$i")
+      # a band is 100 wide and starts where the formula says
+      [ "$amin" -eq $((35000 + i * 100)) ] || exit 1
+      [ $((amax - amin)) -eq 99 ]          || exit 1
+      for j in 1 2 3 4 5 6 7 8; do
+        [ "$i" -lt "$j" ] || continue
+        bmin=$(slot_band_min "$j"); bmax=$(slot_band_max "$j")
+        # disjoint, in both directions
+        { [ "$amax" -lt "$bmin" ] || [ "$bmax" -lt "$amin" ]; } || exit 1
+      done
+    done )
+}
+
 # --- the real script must satisfy both ---------------------------------------
 if has_disableupdate "$SCRIPT"; then
   ok
@@ -659,6 +708,18 @@ if has_local_tag_prune "$SCRIPT"; then
   ok
 else
   bad "a job can leave an image name behind for the next, unrelated job on the same slot to run as if it had fetched it — the store survives the reset by design (#231) and nothing drops the tags no registry digest and no boot manifest vouches for (#233)"
+fi
+
+if has_shared_infra_band "$SCRIPT"; then
+  ok
+else
+  bad "the shared-infrastructure port band is not published: a slot's stack is unreachable from a sibling slot and from the Windows host, which is the whole of rule 3 (adr-pr-host-affinity.md §3.2)"
+fi
+
+if band_arithmetic_disjoint "$SCRIPT"; then
+  ok
+else
+  bad "the per-slot port bands are not 100 wide and disjoint — two slots can be handed the same host port, which is the collision the slot netns exists to prevent"
 fi
 
 # --- mutation cases: prove the checks above can actually fail -----------------
@@ -794,6 +855,14 @@ mutate "share hardcoded"              's@Environment=CI_SLOT_VCPUS=\$(( cpus / S
 mutate "memory share dropped"         '/^Environment=CI_SLOT_MEM_MB=/d'                           has_slot_share
 mutate "host totals dropped"          '/^Environment=CI_HOST_VCPUS=/d'                            has_slot_share
 mutate "slot count dropped"           '/^Environment=CI_HOST_SLOTS=/d'                            has_slot_share
+
+mutate "band DNAT dropped"            '/PREROUTING -d "\$addr" -p tcp --dport/,+3d'          has_shared_infra_band
+mutate "DNAT matched on the interface" 's@PREROUTING -d "\$addr" -p tcp@PREROUTING -i "$ifc" -p tcp@g' has_shared_infra_band
+mutate "forward allow scoped to a veth" 's@ctstate DNAT --ctorigdst "\$baddr"@ctstate NEW -i "$veth"@g' has_shared_infra_band
+mutate "span hardcoded to four slots"  's@slot_band_max "\$SLOTS"@slot_band_max 4@'               has_shared_infra_band
+mutate "slot never told its band"      '/^Environment=CI_SHARED_INFRA_PORT_MIN=/d'                 has_shared_infra_band
+mutate "bands overlap"                 's@CI_BAND_WIDTH=100@CI_BAND_WIDTH=10@'                     band_arithmetic_disjoint
+mutate "band width off by one"         's@+ CI_BAND_WIDTH - 1 ))@+ CI_BAND_WIDTH ))@'              band_arithmetic_disjoint
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

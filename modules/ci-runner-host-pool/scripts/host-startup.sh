@@ -134,6 +134,26 @@ SLOTS=${SLOTS:-1}
 if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
   die "missing ci-github-owner/ci-github-repo metadata"
 fi
+
+# --- host affinity label ------------------------------------------------------
+#
+# Every agent on this host also answers to `host-<instance-name>`, which is what
+# lets a workflow run keep all of its jobs on the host its first job landed on
+# (docs/adr-pr-host-affinity.md). GitHub sends a job to any runner whose label
+# set is a SUPERSET of `runs-on`, so an extra label costs nothing to a workflow
+# that does not name it, and is the only thing that will serve one that does.
+#
+# Appended here rather than set in metadata, because the module cannot know an
+# instance name a MIG assigns at creation time.
+#
+# Fails closed. A host that could not read its own name would register agents
+# indistinguishable from every other host's, and a pinned job would then queue
+# against a label nothing answers until GitHub cancels it a day later. Every
+# other value on this path comes from the same metadata server, so this is not a
+# new dependency — only a new reason to insist it answered.
+[ -n "${HOSTNAME_SHORT:-}" ] || die "could not read instance/name from metadata — without it this host cannot publish its affinity label, and a pinned job would queue against a label nothing answers"
+HOST_LABEL="host-$HOSTNAME_SHORT"
+LABELS="${LABELS:+$LABELS,}$HOST_LABEL"
 [ -d "$RUNNER_HOME" ] || die "golden image is missing $RUNNER_HOME — this host was booted from the wrong image, and booting a bare image here would reintroduce the per-job install cost this pool removes"
 
 # --- GitHub App installation token -------------------------------------------
@@ -2160,6 +2180,22 @@ slot_ns_ip()  { printf '10.99.%s.2' "$1"; }      # slot end of the /30
 # with the wrong MTU black-holes large TLS records instead of failing cleanly.
 primary_if()  { ip -o route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1; }
 primary_mtu() { cat "/sys/class/net/$(primary_if)/mtu" 2>/dev/null || echo 1460; }
+primary_addr() { ip -o -4 addr show dev "$(primary_if)" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1; }
+
+# The shared-infrastructure port band. Slot <idx> owns 100 host ports and no
+# other slot owns any of them, so two slots publishing the "same" service never
+# collide -- the collision setup_slot_netns exists for, restated at the level a
+# sibling slot and a Windows host can both address.
+#
+# Derived from $SLOTS, never from a hardcoded four. Slot indices here start at
+# ONE (seq 1 "$SLOTS"), so the lowest band is 35100 and the whole span is
+# `slot_band_min 1` .. `slot_band_max $SLOTS`. The span is computed from these
+# two functions rather than restated as a formula: a firewall range and a DNAT
+# range that disagree fail as "the connection hangs", which is unreadable.
+CI_BAND_BASE=35000
+CI_BAND_WIDTH=100
+slot_band_min() { printf '%s' "$(( CI_BAND_BASE + $1 * CI_BAND_WIDTH ))"; }
+slot_band_max() { printf '%s' "$(( CI_BAND_BASE + $1 * CI_BAND_WIDTH + CI_BAND_WIDTH - 1 ))"; }
 
 # Host-side plumbing shared by every slot namespace: forwarding, NAT, and the
 # metadata policy for namespaced traffic.
@@ -2175,6 +2211,37 @@ setup_slot_networking() {
   [ -n "$ifc" ] || { log "no default route — cannot NAT slot namespaces"; return 1; }
 
   sysctl -qw net.ipv4.ip_forward=1 || return 1
+
+  # The band's forward allow, scoped to what the DNAT actually produced.
+  #
+  # A sibling slot's packet to the host address is DNATed in PREROUTING and then
+  # traverses FORWARD from its own cis<N> to the owner's veth. Today the broad
+  # per-veth accepts in setup_slot_netns already permit that, but those accepts
+  # are what #249 removes, and this path must survive their removal -- so the
+  # band states its own case rather than living on someone else's rule.
+  #
+  # Original-destination matching is the point: --ctorigdst/--ctorigdstport
+  # admit precisely the traffic that entered through a band DNAT, and nothing a
+  # slot addressed to a sibling's 10.99.<n>.2 directly. When #249 lands, its
+  # reject goes BELOW these two and its acceptance criterion becomes "a sibling
+  # reaches the band, and reaches nothing else".
+  #
+  # APPENDED, never inserted, for the same reason the per-veth accepts are: an
+  # insert would land above the metadata REJECT below and hand a slot the host's
+  # identity back.
+  local baddr bspan_min bspan_max
+  baddr=$(primary_addr)
+  bspan_min=$(slot_band_min 1); bspan_max=$(slot_band_max "$SLOTS")
+  if [ -n "$baddr" ]; then
+    iptables -w -C FORWARD -m conntrack --ctstate DNAT --ctorigdst "$baddr" \
+      --ctorigdstport "$bspan_min:$bspan_max" -j ACCEPT 2>/dev/null \
+      || iptables -w -A FORWARD -m conntrack --ctstate DNAT --ctorigdst "$baddr" \
+        --ctorigdstport "$bspan_min:$bspan_max" -j ACCEPT || return 1
+    iptables -w -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null \
+      || iptables -w -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+  else
+    log "no primary address -- shared-infrastructure band not forwarded"
+  fi
 
   iptables -w -t nat -C POSTROUTING -s 10.99.0.0/16 -o "$ifc" -j MASQUERADE 2>/dev/null \
     || iptables -w -t nat -A POSTROUTING -s 10.99.0.0/16 -o "$ifc" -j MASQUERADE \
@@ -2206,9 +2273,10 @@ setup_slot_networking() {
 # Idempotent: a re-run of this script (or a slot restart) must find the
 # namespace it already made rather than tear a running slot's networking down.
 setup_slot_netns() { # <idx>
-  local idx="$1" ns veth gw nsip mtu
+  local idx="$1" ns veth gw nsip mtu addr bmin bmax
   ns=$(slot_netns "$idx"); veth=$(slot_veth "$idx")
   gw=$(slot_gw_ip "$idx"); nsip=$(slot_ns_ip "$idx"); mtu=$(primary_mtu)
+  addr=$(primary_addr); bmin=$(slot_band_min "$idx"); bmax=$(slot_band_max "$idx")
 
   ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$ns" || ip netns add "$ns" || return 1
   ip link show "$veth" >/dev/null 2>&1 \
@@ -2240,6 +2308,29 @@ setup_slot_netns() { # <idx>
     || iptables -w -A FORWARD -i "$veth" -j ACCEPT || return 1
   iptables -w -C FORWARD -o "$veth" -j ACCEPT 2>/dev/null \
     || iptables -w -A FORWARD -o "$veth" -j ACCEPT || return 1
+
+  # The band's DNAT: anything addressed to THIS HOST on slot <idx>'s 100 ports
+  # is rewritten to the slot's namespace address.
+  #
+  # Matched on destination ADDRESS, not on `-i <primary_if>`. The main consumer
+  # of this path is a sibling slot on the same host, whose packets arrive on
+  # cis<N> and never on the primary interface; an input-interface match would
+  # silently exclude the traffic the rule exists for, handing the Windows case a
+  # working path and the same-host case a connection refused. Matching the
+  # host's own address admits both and still declines anything not addressed
+  # here.
+  #
+  # A host with no primary address is not a host that can serve a band, but it
+  # is also not a reason to fail the slot: everything else about the slot works,
+  # and a job that needs the band asserts CI_SHARED_INFRA_ADDR itself.
+  if [ -n "$addr" ]; then
+    iptables -w -t nat -C PREROUTING -d "$addr" -p tcp --dport "$bmin:$bmax" \
+      -j DNAT --to-destination "$nsip" 2>/dev/null \
+      || iptables -w -t nat -A PREROUTING -d "$addr" -p tcp --dport "$bmin:$bmax" \
+        -j DNAT --to-destination "$nsip" || return 1
+  else
+    log "slot $idx: no primary address -- shared-infrastructure band not published"
+  fi
 }
 
 # One rootless dockerd per slot, as a system template unit rather than a user
@@ -2794,6 +2885,21 @@ BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 $BROKER_ENV
 $CACHE_ENV
 $SHARE_ENV
+# The label a job pins the rest of its workflow run to. Read by the anchor job,
+# which publishes it as the runs-on list for every later job in the run. A slot
+# that does not know it degrades to unpinned scheduling rather than failing,
+# which is why the anchor tests for it -- but on this host it is always set,
+# because the boot dies above without it.
+Environment=CI_HOST_LABEL=$HOST_LABEL
+# The shared-infrastructure band this slot may publish on, and the address a
+# sibling slot or a Windows host reaches it at. A service published inside the
+# band is reachable from both; one published outside it resolves on this slot's
+# own localhost and nowhere else, which fails as "the Windows job cannot
+# connect" rather than as anything readable -- so the owner job asserts the
+# range before it publishes.
+Environment=CI_SHARED_INFRA_ADDR=$(primary_addr)
+Environment=CI_SHARED_INFRA_PORT_MIN=$(slot_band_min "$idx")
+Environment=CI_SHARED_INFRA_PORT_MAX=$(slot_band_max "$idx")
 # Reset this slot before every job and after every job: the home is emptied and
 # rebuilt from $SLOT_TEMPLATE, and the previous job's workspace and tool cache go
 # with it. Set unconditionally, and NOT alongside BROKER_ENV: a pool with no job
