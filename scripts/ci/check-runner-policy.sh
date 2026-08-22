@@ -2068,6 +2068,10 @@ jobs:
 # check_file: it is a count over the whole set. A function rather than a block
 # in main() so the fixtures can drive it over two files, which is the shape it
 # exists to catch and the one a single-file fixture cannot express.
+# SC2031: same story as main() below -- the selftest's fixtures run check_file in
+# subshells that write their own copies of these, and the real path sets them in
+# THIS shell, which is the copy this verdict reads.
+# shellcheck disable=SC2031
 shared_infra_owner_verdict() {
   [ "$SHARED_INFRA" -eq 1 ] || return 0
   local owners
