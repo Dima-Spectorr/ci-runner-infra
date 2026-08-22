@@ -459,7 +459,7 @@ has_local_tag_prune() { # <file>
 
   # 1. At the resets that END a job, never at the one that starts it — at
   #    `started` the runner has already loaded the image the job is about to use.
-  matches "$code" 'if \[ "\\\$stage" != started \]; then' || return 1
+  matches "$code" 'if \[ "\\\$stage" != started \] && \[ "\\\$prune" = 1 \]; then' || return 1
 
   # 2. A REGISTRY DIGEST is what buys a tag its life, and a job cannot write one:
   #    `docker tag` and `docker build -t` produce none; only a pull or a push does.
@@ -722,6 +722,162 @@ else
   bad "the per-slot port bands are not 100 wide and disjoint — two slots can be handed the same host port, which is the collision the slot netns exists to prevent"
 fi
 
+# --- the pin hold ------------------------------------------------------------
+#
+# One workflow run keeps one host (adr-pr-host-affinity.md §3.1), and every
+# failure of that mechanism is SILENT in the way this file exists to catch: a
+# hold that is never taken gives a pull request two hosts and a database the
+# second one cannot reach, and a hold that is never released leaves a host
+# serving nobody until the controller retires it hours later. Neither reports an
+# error at boot; both look like a slow fleet.
+#
+# The properties below are the ones a later edit is most likely to undo while
+# leaving the script reading as correct.
+has_pin_hold() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # installed, and FATAL. A host that registered agents without this takes work
+  # it cannot be pinned to, which is the failure with no error message.
+  matches "$code" 'install_pin_hold \|\| die' || return 1
+
+  # MONOTONIC. There is no verb that shortens or removes a hold: a co-tenant
+  # slot must be able to keep the host alive and must not be able to hand
+  # somebody else's run away mid-run. Expiry is the only end there is.
+  matches "$code" 'expected --run <id> \[--ttl <duration>\] \[--reserve-slot\], or renew, or status' || return 1
+  ! matches "$code" 'pin-hold\.sh release' || return 1
+  # …and renew extends by the TTL RECORDED IN THE HOLD, never one the caller
+  # supplies, so "renew" cannot be spelled as "expire in one second".
+  matches "$code" 'new=\\\$\(\(now \+ R_TTL\)\)' || return 1
+  matches "$code" '\[ "\\\$new" -gt "\\\$R_EXPIRY" \] \|\| new=\\\$R_EXPIRY' || return 1
+
+  # ADMISSION, not request. A second run asking for a host that is already held
+  # is REFUSED and continues unpinned. Granting both is how several runs
+  # starting together take every slot on one host and then wait out each
+  # other TTLs — a deadlock assembled entirely out of successful steps.
+  matches "$code" 'may not reserve this host' || return 1
+  # and the refusal is exit 0 with pinned=0, because an anchor that cannot pin
+  # still has a run to do
+  matches "$code" 'echo "pinned=0"' || return 1
+
+  # WHICH slot is speaking is never an argument, exactly as in slot-reset.sh
+  matches "$code" 'refusing: reserve must come from a slot' || return 1
+  matches "$code" 'is not a slot user' || return 1
+  # and the run id reaches a file, a log line and a guest attribute, so it is
+  # shape-checked rather than quoted and hoped for
+  matches "$code" 'is not a usable run id' || return 1
+  # the TTL is clamped: a job does not get to hold a host for a day
+  matches "$code" '\[ "\\\$ttl" -le "\\\$PIN_MAX_TTL" \] \|\| ttl=\\\$PIN_MAX_TTL' || return 1
+
+  # the record is root-owned and readable, never slot-writable — a slot that
+  # could write it could pin the host to a run of its choosing, or unpin one
+  matches "$code" 'chown root:root "\$PIN_DIR"' || return 1
+  matches "$code" 'chmod 0755 "\$PIN_DIR"' || return 1
+  # …and replaced by rename, never written over in place: a reader that saw a
+  # truncated record would read it as NO hold, which is the one reading that
+  # releases a host somebody is using
+  matches "$code" 'mv -f -- "\\\$tmp" "\\\$RECORD"' || return 1
+  # an unreadable record is KEPT and the host left alone, for the same reason
+  matches "$code" 'the hold record does not parse' || return 1
+
+  # sudoers grants the three verbs and nothing else, and is validated before it
+  # is installed
+  matches "$code" 'NOPASSWD: /opt/ci/job-hooks/pin-hold\.sh --run \*, /opt/ci/job-hooks/pin-hold\.sh renew, /opt/ci/job-hooks/pin-hold\.sh status' || return 1
+  matches "$code" 'visudo -cqf "\$tmp"' || return 1
+
+  # THE HOST RENEWS, NOT THE WORKFLOW. A consumer job running inside a
+  # `container:` cannot reach /usr/local/bin/ci-pin-hold at all, and those are
+  # the runs long enough for a TTL to matter — so the renewal is in the job hook
+  # every job goes through, and it is never fatal.
+  matches "$code" 'sudo -n /opt/ci/job-hooks/pin-hold\.sh renew >/dev/null 2>&1 \|\| true' || return 1
+
+  # A HELD slot keeps its local image tags. The run's later jobs land on this
+  # slot and reuse what the anchor built, and a compose-built image carries no
+  # RepoDigest and was not baked at boot — precisely what the prune removes.
+  matches "$code" 'held by a live run' || return 1
+  matches "$code" 'if \[ "\\\$stage" != started \] && \[ "\\\$prune" = 1 \]' || return 1
+
+  # A DURATION, because that is what the contract publishes (`CI_PIN_TTL: 90m`)
+  # and what a workflow author writes beside a timeout-minutes they already own.
+  matches "$code" 'is not a duration' || return 1
+  matches "$code" '\*\[0-9\]m\) n="\\\${t%m}"; unit=60 ;;' || return 1
+
+  # A ONE-SLOT HOST CANNOT RESERVE. The reservation takes the slot out of
+  # service, and taking the only slot out of service is a host that serves
+  # nobody — including the run that asked. Refused, not silently downgraded.
+  matches "$code" 'refusing --reserve-slot: this host has one slot' || return 1
+
+  # A HOLD DOES NOT SURVIVE A REBOOT. Rootless containers do not outlive the
+  # guest, so a hold carried across one pins a live host to a stack that is
+  # already gone, and fails the run slowly instead of at once.
+  matches "$code" "printf 'boot=%s" || return 1
+  matches "$code" 'releasing it as orphaned' || return 1
+
+  # THE SWEEPER IS THE ONLY THING THAT ENDS A HOLD, and it runs on a timer
+  # because expiry is not an event anybody delivers.
+  matches "$code" '^OnUnitActiveSec=30$' || return 1
+  matches "$code" '^AccuracySec=5$' || return 1
+  matches "$code" 'systemctl enable --now ci-pin-sweep\.timer' || return 1
+
+  # It takes a held slot out of service once its job ends — not the completed
+  # hook, which runs inside the agent unit and would SIGTERM itself mid-report,
+  # and not the controller, which never opens a shell on a host that is healthy
+  # and busy. Gated on the clean marker, which is what makes "idle" a fact
+  # rather than a guess: a slot running a job has no marker.
+  matches "$code" '\[ "\\\$reserve" = 1 \] && \[ -f "\\\$marker" \] && systemctl is-active --quiet "ci-runner@\\\$slot\.service"' || return 1
+  matches "$code" 'systemctl stop "ci-runner@\\\$slot\.service"' || return 1
+
+  # …and at expiry it tears the run's stack down, resets, and only THEN clears
+  # the record and starts the agent. FAIL CLOSED: a teardown that did not finish
+  # leaves the agent DOWN and the hold in place for the next sweep, because a
+  # slot handed back on a clean bill of health nobody earned is worse than a
+  # slot that is missing.
+  matches "$code" 'docker rm --force' || return 1
+  matches "$code" '/opt/ci/job-hooks/slot-reset\.sh completed "\\\$slot"' || return 1
+  matches "$code" 'if \[ "\\\$rc" = 0 \]; then' || return 1
+  matches "$code" 'rm -f -- "\\\$RECORD"' || return 1
+  matches "$code" 'the agent stays DOWN' || return 1
+  matches "$code" 'systemctl start "ci-runner@\\\$slot\.service"' || return 1
+}
+
+# The two scripts this boot script WRITES are never run by anything here, so a
+# syntax error in either survives every text predicate above and first appears
+# on a live host as a slot that will not pin — or, worse, a sweeper that exits
+# before it can hand one back. So they are extracted and parsed.
+#
+# `\$` in the heredoc is a runtime `$`; unescaping it is what turns the emitted
+# text back into the file the host actually gets.
+generated_scripts_parse() { # <file>
+  local name body tmp rc=0
+  for name in pin-hold pin-sweep; do
+    body=$(awk -v n="$name" '
+      $0 == "  cat >/opt/ci/job-hooks/" n ".sh <<EOF" { on = 1; next }
+      on && $0 == "EOF" { exit }
+      on { print }
+    ' "$1" | sed 's/\\\$/$/g')
+    # An empty extraction means the anchor moved, and an empty file parses
+    # clean — which would report a missing check as a passing one.
+    [ -n "$body" ] || { rc=1; continue; }
+    tmp=$(mktemp)
+    printf '%s\n' "$body" >"$tmp"
+    bash -n "$tmp" >/dev/null 2>&1 || rc=1
+    rm -f "$tmp"
+  done
+  [ "$rc" = 0 ]
+}
+
+if has_pin_hold "$SCRIPT"; then
+  ok
+else
+  bad "a workflow run cannot keep the host it landed on, or cannot give it back — an unpinnable host hands one pull request two of them and a database the second cannot reach, and a hold nobody ends leaves a host serving nobody until the controller retires it (adr-pr-host-affinity.md §3.1)"
+fi
+
+if generated_scripts_parse "$SCRIPT"; then
+  ok
+else
+  bad "one of the pin-hold scripts this boot script writes does not parse — every text check above still passes, and the failure first appears as a host that silently will not pin"
+fi
+
 # --- mutation cases: prove the checks above can actually fail -----------------
 if has_slot_share "$SCRIPT"; then
   ok
@@ -829,7 +985,7 @@ mutate "digest no longer verified"           's|sha256sum -c --status|cat|'     
 mutate "loads left to the cgroup killer"     's|wait \${IMAGE_LOAD_PIDS}|:|'                                        has_baked_image_load
 mutate "image store no longer reported"      's|io.containerd.snapshotter.v1|containerd|g'                          has_baked_image_load
 
-mutate "prune moved onto the starting job"   's|if \[ "\\$stage" != started \]; then|if [ "\\$stage" = started ]; then|' has_local_tag_prune
+mutate "prune moved onto the starting job"   's|if \[ "\\$stage" != started \] && \[ "\\$prune" = 1 \]; then|if [ "\\$stage" = started ]; then|' has_local_tag_prune
 mutate "digest-bearing images untagged too"  's|\[ "\\$ndig" = 0 \] \|\| continue|[ "\\$ndig" -ge 0 ] \|\| continue|'    has_local_tag_prune
 mutate "boot manifest no longer consulted"   's|grep -qxF -- "\\$id" "\\$baked"|grep -qxF -- "zzz" "\\$baked"|'          has_local_tag_prune
 mutate "manifest keyed by name, not id"      's|--format .{{[.]Id}}. -- "$ref"|--format NAME -- "$ref"|'         has_local_tag_prune
@@ -863,6 +1019,36 @@ mutate "span hardcoded to four slots"  's@slot_band_max "\$SLOTS"@slot_band_max 
 mutate "slot never told its band"      '/^Environment=CI_SHARED_INFRA_PORT_MIN=/d'                 has_shared_infra_band
 mutate "bands overlap"                 's@CI_BAND_WIDTH=100@CI_BAND_WIDTH=10@'                     band_arithmetic_disjoint
 mutate "band width off by one"         's@+ CI_BAND_WIDTH - 1 ))@+ CI_BAND_WIDTH ))@'              band_arithmetic_disjoint
+
+mutate "hold install no longer fatal"       's@install_pin_hold || die.*@install_pin_hold || true@'                        has_pin_hold
+mutate "renew takes a TTL from the caller"  's@new=\\\$((now + R_TTL))@new=\\\$((now + 60))@'                              has_pin_hold
+mutate "renew allowed to move backwards"    's@\[ "\\\$new" -gt "\\\$R_EXPIRY" \] || new=\\\$R_EXPIRY@:@'                  has_pin_hold
+mutate "every asker granted the host"       's@may not reserve this host@would like this host@'                            has_pin_hold
+mutate "reserve accepts a slotless caller"  's@refusing: reserve must come from a slot@no slot, no problem@'               has_pin_hold
+mutate "the run id no longer shape-checked" 's@is not a usable run id@is fine by us@'                                      has_pin_hold
+mutate "the TTL clamp removed"              's@\[ "\\\$ttl" -le "\\\$PIN_MAX_TTL" \] || ttl=\\\$PIN_MAX_TTL@:@'            has_pin_hold
+mutate "the record left slot-writable"      's@chmod 0755 "\$PIN_DIR"@chmod 0777 "$PIN_DIR"@'                              has_pin_hold
+mutate "the record written in place"        's@mv -f -- "\\\$tmp" "\\\$RECORD"@cp -f -- "\\\$tmp" "\\\$RECORD"@'           has_pin_hold
+mutate "an unparseable record swept away"   's@the hold record does not parse@unreadable, removing@'                       has_pin_hold
+mutate "sudoers widened to any verb"        's@pin-hold.sh --run \*, /opt/ci/job-hooks/pin-hold.sh renew, /opt/ci/job-hooks/pin-hold.sh status@pin-hold.sh *@' has_pin_hold
+mutate "the host stops renewing the hold"   's@sudo -n /opt/ci/job-hooks/pin-hold.sh renew >/dev/null 2>&1 || true@:@'     has_pin_hold
+mutate "a held slot pruned between jobs"    's@if \[ "\\\$stage" != started \] && \[ "\\\$prune" = 1 \]@if [ "\\\$stage" != started ]@' has_pin_hold
+mutate "the sweeper runs once at boot"      's@^OnUnitActiveSec=30$@@'                                                     has_pin_hold
+mutate "the sweep left to systemd to time"  's@^AccuracySec=5$@@'                                                          has_pin_hold
+mutate "the timer installed but not armed"  's@systemctl enable --now ci-pin-sweep.timer@systemctl enable ci-pin-sweep.timer@' has_pin_hold
+mutate "a busy slot stopped mid-job"        's@\[ -f "\\\$marker" \] && systemctl is-active@systemctl is-active@'          has_pin_hold
+mutate "the held slot never taken out"      's|systemctl stop "ci-runner@\\\$slot.service"|true|'                          has_pin_hold
+mutate "the stack survives expiry"          's@docker rm --force@docker ps --filter@'                                      has_pin_hold
+mutate "no reset after the hold"            's@/opt/ci/job-hooks/slot-reset.sh completed "\\\$slot"@true@'                  has_pin_hold
+mutate "the hold cleared even on failure"   's@^if \[ "\\\$rc" = 0 \]; then$@if true; then@'                                has_pin_hold
+mutate "a failed teardown back in service"  's@the agent stays DOWN@the agent is restarted anyway@'                        has_pin_hold
+
+mutate "the TTL suffix silently ignored"    's@is not a duration@is close enough@'                                  has_pin_hold
+mutate "minutes read as seconds"            's@unit=60 ;;@unit=1 ;;@'                                              has_pin_hold
+mutate "a one-slot host allowed to reserve" 's@refusing --reserve-slot: this host has one slot@reserving the only slot on@' has_pin_hold
+mutate "the hold forgets which boot"        's@boot=%s@host=%s@'                                              has_pin_hold
+mutate "a hold honoured across a reboot"    's@releasing it as orphaned@keeping it@'                                 has_pin_hold
+mutate "a plain pin takes its slot away"    's@\[ "\\\$reserve" = 1 \] && \[ -f@[ -f@'                                     has_pin_hold
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

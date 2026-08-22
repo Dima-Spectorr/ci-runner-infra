@@ -420,6 +420,13 @@ set -uo pipefail
 # -n: never prompt. There is no tty and nobody to answer it, so a sudoers file
 # that stopped granting this must fail the job at once rather than hang it until
 # the job's own timeout.
+# The hold is renewed by the HOST, not by the workflow, and this is the only
+# place that can do it: a consumer running inside a `container:` cannot reach
+# /usr/local/bin/ci-pin-hold at all, and those are precisely the jobs whose runs
+# last long enough for a TTL to matter. Never fatal — a hold that fails to
+# extend expires, and the sweeper puts the slot back; failing a job over the
+# fleet's own bookkeeping would be the worse outcome by far.
+sudo -n /opt/ci/job-hooks/pin-hold.sh renew >/dev/null 2>&1 || true
 exec sudo -n /opt/ci/job-hooks/slot-reset.sh $stage
 EOF
     chown root:root "/opt/ci/job-hooks/job-$stage.sh" || return 1
@@ -441,6 +448,7 @@ SLOT_ROOT="$SLOT_ROOT"
 SLOT_STATE="$SLOT_STATE"
 SLOT_TEMPLATE="$SLOT_TEMPLATE"
 SLOT_USER_PREFIX="$SLOT_USER_PREFIX"
+PIN_DIR="$PIN_DIR"
 
 say() { logger -t ci-slot-reset -- "\$*" 2>/dev/null || true; echo "slot reset: \$*" >&2; }
 
@@ -646,7 +654,32 @@ fi
 # turn a slot with no dockerd into a slot that also fails every job for a reason
 # it does not name. A tag that will not go IS a failure: that slot is poisoned,
 # and the marker is exactly the claim it must not get.
-if [ "\$stage" != started ]; then
+# A HELD slot is spared, and that is rule 2 of the shared-infra contract meeting
+# rule 1. Under one host per pull request the run's later jobs land on THIS
+# slot and reuse what the anchor built — and a stack built by `docker compose
+# build` carries no RepoDigest and was not baked at boot, which is exactly the
+# shape below removes. Pruning between two jobs of one run would delete the
+# run's own images out from under it.
+#
+# Deferred, never waived: the sweeper's teardown at expiry runs this same reset
+# with the hold already past its expiry, so the tags go then. Nothing a run
+# built outlives the run.
+prune=1
+if [ -f "\$PIN_DIR/host" ]; then
+  h_slot=""; h_expiry=""
+  while IFS='=' read -r hk hv; do
+    case "\$hk" in slot) h_slot="\$hv" ;; expiry) h_expiry="\$hv" ;; esac
+  done <"\$PIN_DIR/host"
+  case "\$h_slot:\$h_expiry" in
+    [0-9]*:[0-9]*)
+      if [ "\$h_slot" = "\$idx" ] && [ "\$h_expiry" -gt "\$(date +%s)" ]; then
+        prune=0
+        say "slot \$idx is held by a live run -- keeping its local image tags until the hold expires"
+      fi
+      ;;
+  esac
+fi
+if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
   sock="/run/\$u/docker.sock"
   baked="\$SLOT_STATE/\$idx/baked-images"
   if [ -S "\$sock" ]; then
@@ -735,6 +768,498 @@ install_slot_reset_sudoers() {
   fi
   install -o root -g root -m 0440 "$tmp" "$f" || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
+}
+
+# --- the pin hold -------------------------------------------------------------
+#
+# One workflow run keeps one host for as long as it needs it
+# (adr-pr-host-affinity.md §3.1, ci-pr-shared-infra.md §6). The mechanism is a
+# single root-owned record on the host naming the run that holds it and the
+# moment the hold expires, republished into a guest attribute so the controller
+# can see it without an SSH probe it has no place to make.
+#
+# The consumer-facing spelling is the one the contract publishes, and it is a
+# flag form rather than a verb because a workflow author writes it by hand:
+#
+#   ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL" [--reserve-slot]
+#
+# `renew` and `status` are bare verbs because nothing outside this host calls
+# them. Four properties are load-bearing, and each is a decision the ADR argues
+# rather than an implementation detail:
+#
+#   ADMISSION, NOT REQUEST.  A reserve refuses when the host already carries a
+#   hold for a DIFFERENT live run, and the refusal is exit 0 with `pinned=0` —
+#   the loser continues unpinned, which this design already supports. If every
+#   anchor that asked were granted, several runs starting together would take
+#   every slot on one host and each would then wait out the others' TTLs on the
+#   stack it was blocking: a deadlock built entirely out of successful steps.
+#
+#   MONOTONIC.  There is no verb that shortens or removes a hold. `renew`
+#   extends by the TTL RECORDED IN THE HOLD, never by one the caller supplies,
+#   and any slot on the host may call it — a co-tenant must be able to keep a
+#   host alive and must not be able to release someone else's. Expiry is the
+#   only way a hold ends, and the sweeper is the only thing that acts on it.
+#
+#   THE INDEX IS NEVER AN ARGUMENT.  Same rule slot-reset.sh states: which slot
+#   is speaking comes from SUDO_UID, which sudo sets itself and env_reset
+#   strips from the caller's environment.
+#
+#   A HOLD DOES NOT SURVIVE A REBOOT.  It records the boot it was written under.
+#   Rootless containers do not outlive the guest, so a hold carried across a
+#   warm reboot would pin a host to a stack that no longer exists and fail the
+#   run slowly instead of quickly. A stale hold is released as orphaned.
+PIN_DIR="$SLOT_STATE/.pin"
+# 30 minutes by default and 2 hours at most. The default is long enough for the
+# tail of an ordinary run and short enough that a run which died without ever
+# reaching a completed hook does not hold a host through a lunch break; the
+# clamp is what stops a job asking for a day, and it is also how long an
+# abandoned hold can pin a host. A hold is renewed at the start of every job on
+# a held host, so the TTL bounds the GAP between jobs, not the run.
+PIN_DEFAULT_TTL=1800
+PIN_MAX_TTL=7200
+
+install_pin_hold() {
+  mkdir -p "$PIN_DIR" || return 1
+  chown root:root "$PIN_DIR" || return 1
+  # 0755, not 0700: a job may READ the record — that is how a consumer learns
+  # which run holds the host it is on — and no job may write it.
+  chmod 0755 "$PIN_DIR" || return 1
+
+  cat >/opt/ci/job-hooks/pin-hold.sh <<EOF
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as root. See install_pin_hold().
+set -uo pipefail
+
+SLOT_STATE="$SLOT_STATE"
+SLOT_USER_PREFIX="$SLOT_USER_PREFIX"
+PIN_DIR="$PIN_DIR"
+PIN_DEFAULT_TTL=$PIN_DEFAULT_TTL
+PIN_MAX_TTL=$PIN_MAX_TTL
+SLOTS=$SLOTS
+HOST_LABEL="$HOST_LABEL"
+
+RECORD="\$PIN_DIR/host"
+
+say() { logger -t ci-pin-hold -- "\$*" 2>/dev/null || true; echo "pin hold: \$*" >&2; }
+
+boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
+
+# The guest attribute the controller reads. Best effort by design: the hold on
+# disk is the truth this host acts on, and a metadata server that did not answer
+# must not turn into a host that forgets it is holding a run. The controller's
+# own reader is monotonic (§2.4), so a PUT that is late is merely late.
+publish() {
+  curl --silent --show-error --fail --connect-timeout 3 --max-time 10 \
+    -X PUT --data "\$1" -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/ci/pin-hold" \
+    >/dev/null 2>&1 || say "could not publish the hold to guest attributes (the record on disk still stands)"
+}
+
+# The contract publishes a DURATION -- 'CI_PIN_TTL: 90m' -- because that is what
+# a workflow author writes next to a timeout-minutes they already own. Seconds
+# are accepted bare so the host's own callers need no suffix.
+parse_ttl() { # <text> -> seconds on stdout; non-zero on refusal
+  local t="\$1" n unit
+  case "\$t" in
+    *[0-9]s) n="\${t%s}"; unit=1 ;;
+    *[0-9]m) n="\${t%m}"; unit=60 ;;
+    *[0-9]h) n="\${t%h}"; unit=3600 ;;
+    *[0-9])  n="\$t";     unit=1 ;;
+    *) return 1 ;;
+  esac
+  case "\$n" in '' | *[!0-9]*) return 1 ;; esac
+  [ "\${#n}" -le 9 ] || return 1
+  printf '%s' "\$((n * unit))"
+}
+
+# Sets R_RUN R_SLOT R_TTL R_EXPIRY R_RESERVE R_BOOT. Returns 1 when there is no
+# usable record, and 2 when there is one but it belongs to an earlier boot.
+#
+# A record that does not parse is treated as ABSENT here and as PRESENT by the
+# sweeper, and the asymmetry is deliberate: refusing to grant a new hold over
+# something unreadable would wedge the host forever, while sweeping something
+# unreadable away would be the one path by which a corrupted byte releases a
+# live run's host.
+read_record() {
+  R_RUN=""; R_SLOT=""; R_TTL=""; R_EXPIRY=""; R_RESERVE=0; R_BOOT=""
+  [ -f "\$RECORD" ] || return 1
+  local k v
+  while IFS='=' read -r k v; do
+    case "\$k" in
+      run) R_RUN="\$v" ;;
+      slot) R_SLOT="\$v" ;;
+      ttl) R_TTL="\$v" ;;
+      expiry) R_EXPIRY="\$v" ;;
+      reserve) R_RESERVE="\$v" ;;
+      boot) R_BOOT="\$v" ;;
+    esac
+  done <"\$RECORD"
+  case "\$R_RUN:\$R_SLOT:\$R_TTL:\$R_EXPIRY:\$R_RESERVE" in
+    ?*:[0-9]*:[0-9]*:[0-9]*:[01]) ;;
+    *) return 1 ;;
+  esac
+  [ "\$R_BOOT" = "\$(boot_id)" ] || return 2
+  return 0
+}
+
+# The record is replaced by RENAME, never by writing over the live file. A
+# reader that opened it between a truncate and a write would see a hold with no
+# expiry, and read_record would call that absent — which is the one reading that
+# releases a host somebody is using.
+write_record() { # <run> <slot> <ttl> <expiry> <reserve>
+  local tmp
+  tmp=\$(mktemp "\$PIN_DIR/.host.XXXXXX") || return 1
+  {
+    printf 'run=%s\n' "\$1"
+    printf 'slot=%s\n' "\$2"
+    printf 'ttl=%s\n' "\$3"
+    printf 'expiry=%s\n' "\$4"
+    printf 'reserve=%s\n' "\$5"
+    printf 'boot=%s\n' "\$(boot_id)"
+  } >"\$tmp" || { rm -f "\$tmp"; return 1; }
+  chmod 0644 "\$tmp" || { rm -f "\$tmp"; return 1; }
+  mv -f -- "\$tmp" "\$RECORD" || { rm -f "\$tmp"; return 1; }
+}
+
+idx=""
+if [ -n "\${SUDO_UID:-}" ]; then
+  u=\$(getent passwd "\$SUDO_UID" | cut -d: -f1)
+  case "\$u" in
+    "\$SLOT_USER_PREFIX"[0-9]*) idx=\${u#"\$SLOT_USER_PREFIX"} ;;
+    *) say "refusing: uid \$SUDO_UID (\$u) is not a slot user"; exit 1 ;;
+  esac
+fi
+
+now=\$(date +%s)
+
+case "\${1:-}" in
+  --run)
+    [ -n "\$idx" ] || { say "refusing: reserve must come from a slot"; exit 1; }
+    run=""; ttl_text=""; reserve=0
+    while [ "\$#" -gt 0 ]; do
+      case "\$1" in
+        --run) run="\${2:-}"; shift 2 || break ;;
+        --ttl) ttl_text="\${2:-}"; shift 2 || break ;;
+        --reserve-slot) reserve=1; shift ;;
+        *) say "refusing: unknown argument '\$1'"; exit 1 ;;
+      esac
+    done
+
+    # The run id lands in a file, a log line and a guest attribute. Shape-checked
+    # rather than quoted-and-hoped: GITHUB_RUN_ID is a number today, and the
+    # workflows that pass it are not this repository's to police.
+    case "\$run" in
+      '' | *[!A-Za-z0-9._-]*) say "refusing: '\$run' is not a usable run id"; exit 1 ;;
+    esac
+    [ "\${#run}" -le 64 ] || { say "refusing: run id is longer than 64 characters"; exit 1; }
+
+    ttl=""
+    if [ -n "\$ttl_text" ]; then
+      ttl=\$(parse_ttl "\$ttl_text") || { say "refusing: '\$ttl_text' is not a duration"; exit 1; }
+    fi
+    [ -n "\$ttl" ] || ttl=\$PIN_DEFAULT_TTL
+    [ "\$ttl" -ge 60 ] || ttl=60
+    [ "\$ttl" -le "\$PIN_MAX_TTL" ] || ttl=\$PIN_MAX_TTL
+
+    # A one-slot host cannot reserve: the reservation takes the slot out of
+    # service, and taking the only slot out of service is a host that serves
+    # nobody, including the run that asked. Refused rather than downgraded, so
+    # the workflow learns it needs a pool with room instead of losing its stack
+    # to the next job that lands.
+    if [ "\$reserve" = 1 ] && [ "\$SLOTS" -lt 2 ]; then
+      say "refusing --reserve-slot: this host has one slot, and reserving it would leave the run nowhere to run"
+      exit 1
+    fi
+
+    read_record; rr=\$?
+    if [ "\$rr" = 0 ] && [ "\$R_RUN" != "\$run" ] && [ "\$R_EXPIRY" -gt "\$now" ]; then
+      # The admission decision, and the whole reason this is not a request.
+      say "slot \$idx: run \$run may not reserve this host — run \$R_RUN holds it for another \$((R_EXPIRY - now))s"
+      echo "pinned=0"
+      exit 0
+    fi
+    # A run that already holds this host keeps its reservation when it re-pins
+    # without the flag: a later consumer renewing the hold must not quietly
+    # un-reserve the owner's slot.
+    if [ "\$rr" = 0 ] && [ "\$R_RUN" = "\$run" ] && [ "\$R_RESERVE" = 1 ]; then
+      reserve=1
+    fi
+
+    write_record "\$run" "\$idx" "\$ttl" "\$((now + ttl))" "\$reserve" \
+      || { say "could not write the hold"; exit 1; }
+    publish "\$run \$((now + ttl))"
+    say "slot \$idx: run \$run holds this host for \${ttl}s (reserve=\$reserve)"
+    echo "pinned=1"
+    echo "host_label=\$HOST_LABEL"
+    echo "reserved=\$reserve"
+    ;;
+
+  renew)
+    # No arguments, and none accepted. The TTL comes from the record because the
+    # renewing job is not always the job that reserved: a consumer inside a
+    # 'container:' cannot reach this binary at all, so the renewal is made by the
+    # host's job-started hook, which has no view of a workflow-level env:.
+    read_record || { echo "pinned=0"; exit 0; }
+    [ "\$R_EXPIRY" -gt "\$now" ] || { echo "pinned=0"; exit 0; }
+    # Monotonic: only ever forward, and never past the clamp.
+    new=\$((now + R_TTL))
+    [ "\$new" -gt "\$R_EXPIRY" ] || new=\$R_EXPIRY
+    write_record "\$R_RUN" "\$R_SLOT" "\$R_TTL" "\$new" "\$R_RESERVE" || exit 1
+    publish "\$R_RUN \$new"
+    echo "pinned=1"
+    echo "run=\$R_RUN"
+    ;;
+
+  status)
+    read_record || { echo "pinned=0"; exit 0; }
+    echo "pinned=1"
+    echo "run=\$R_RUN"
+    echo "slot=\$R_SLOT"
+    echo "reserved=\$R_RESERVE"
+    echo "expires_in=\$((R_EXPIRY - now))"
+    ;;
+
+  *)
+    say "refusing: expected --run <id> [--ttl <duration>] [--reserve-slot], or renew, or status"
+    exit 1
+    ;;
+esac
+exit 0
+EOF
+  chown root:root /opt/ci/job-hooks/pin-hold.sh || return 1
+  chmod 0755 /opt/ci/job-hooks/pin-hold.sh || return 1
+
+  # On PATH, because a workflow step should not have to know where this host
+  # keeps its hooks. The shim is what the sudoers rules name.
+  cat >/usr/local/bin/ci-pin-hold <<'EOF'
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as the slot user. See install_pin_hold().
+set -uo pipefail
+exec sudo -n /opt/ci/job-hooks/pin-hold.sh "$@"
+EOF
+  chown root:root /usr/local/bin/ci-pin-hold || return 1
+  chmod 0755 /usr/local/bin/ci-pin-hold || return 1
+
+  install_pin_hold_sudoers || return 1
+  install_pin_sweep || return 1
+}
+
+install_pin_hold_sudoers() {
+  local f=/etc/sudoers.d/ci-pin-hold tmp i u
+  tmp=$(mktemp) || return 1
+  {
+    echo "# Written by host-startup.sh. Lets a slot take, extend and read the"
+    echo "# host's pin hold. There is no verb here that shortens or removes one:"
+    echo "# a co-tenant must be able to keep a host alive and must not be able to"
+    echo "# release somebody else's run. Expiry is the only end, and the sweeper"
+    echo "# is the only thing that acts on it."
+    echo "#"
+    echo "# The reserve form takes a wildcard because its arguments are a run id"
+    echo "# and a duration nobody can enumerate here. What bounds it is the first"
+    echo "# argument being pinned to --run, and pin-hold.sh validating every"
+    echo "# field it then reads: sudo matches argv, so there is no shell for the"
+    echo "# wildcard to reach, and no argument that names another slot."
+    for i in $(seq 1 "$SLOTS"); do
+      u=$(slot_user "$i")
+      printf '%s ALL=(root) NOPASSWD: /opt/ci/job-hooks/pin-hold.sh --run *, /opt/ci/job-hooks/pin-hold.sh renew, /opt/ci/job-hooks/pin-hold.sh status\n' "$u"
+    done
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0440 "$tmp" || { rm -f "$tmp"; return 1; }
+  if ! visudo -cqf "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    log "refusing to install $f: it does not pass visudo"
+    return 1
+  fi
+  install -o root -g root -m 0440 "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+}
+
+# --- the sweeper --------------------------------------------------------------
+#
+# The one actor that can end a hold. The contract's first draft gave this to the
+# controller, and it cannot have it: the controller's only per-host shell lives
+# inside drain_host() and runs AFTER a removal verdict, so a host that is
+# healthy, current-template and busy is never probed at all — which is every
+# host a live hold is on. The job-completed hook cannot have it either, because
+# it executes inside ci-runner@<idx>.service and stopping that unit would have
+# systemd SIGTERM the agent while it is still reporting the job's result.
+#
+# So it is a timer on the host, and that also gets the other half for free: a
+# hold ends by EXPIRING, and expiry is not an event anybody delivers.
+install_pin_sweep() {
+  cat >/opt/ci/job-hooks/pin-sweep.sh <<EOF
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as root on a timer. See install_pin_sweep().
+set -uo pipefail
+
+SLOT_STATE="$SLOT_STATE"
+SLOT_USER_PREFIX="$SLOT_USER_PREFIX"
+PIN_DIR="$PIN_DIR"
+
+RECORD="\$PIN_DIR/host"
+
+say() { logger -t ci-pin-sweep -- "\$*" 2>/dev/null || true; echo "pin sweep: \$*" >&2; }
+
+[ -f "\$RECORD" ] || exit 0
+
+run=""; slot=""; expiry=""; reserve=0; boot=""
+while IFS='=' read -r k v; do
+  case "\$k" in
+    run) run="\$v" ;; slot) slot="\$v" ;; expiry) expiry="\$v" ;;
+    reserve) reserve="\$v" ;; boot) boot="\$v" ;;
+  esac
+done <"\$RECORD"
+
+# Unreadable is KEPT, and the host is left alone. The opposite reading — sweep
+# what you cannot parse — makes a corrupted byte into a released host, under a
+# run that is still using it.
+case "\$run:\$slot:\$expiry:\$reserve" in
+  ?*:[0-9]*:[0-9]*:[01]) ;;
+  *) say "the hold record does not parse — leaving it, and this host, alone"; exit 0 ;;
+esac
+
+now=\$(date +%s)
+u="\$SLOT_USER_PREFIX\$slot"
+marker="\$SLOT_STATE/\$slot/clean"
+
+# A hold from an earlier boot is ORPHANED, not honoured. Rootless containers do
+# not survive the guest, so the stack it protects is already gone: keeping it
+# would pin a live host to nothing and fail the run slowly instead of at once.
+# There is nothing to tear down, so this is a release and not a teardown.
+if [ "\$boot" != "\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]; then
+  say "run \$run's hold was written before this boot — releasing it as orphaned; its containers did not survive the reboot"
+  rm -f -- "\$RECORD"
+  systemctl start "ci-runner@\$slot.service" >/dev/null 2>&1 || true
+  exit 0
+fi
+
+if [ "\$expiry" -gt "\$now" ]; then
+  # Live. Republish, because a guest attribute is not durable across everything
+  # that can reset one, and the controller reads the attribute rather than this
+  # file.
+  curl --silent --show-error --fail --connect-timeout 3 --max-time 10 \
+    -X PUT --data "\$run \$expiry" -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/ci/pin-hold" \
+    >/dev/null 2>&1 || true
+
+  # And take a RESERVED slot out of service the moment it goes idle. The stack
+  # belongs to this slot's rootless daemon and this slot's uid; a released slot
+  # is handed to the next job under both, which would hand another run a live
+  # database and a warm docker socket it never created.
+  #
+  # 'Idle' is the clean marker, which slot-reset.sh writes at 'completed' and
+  # never at 'started'. That is what keeps this from stopping an agent mid-job:
+  # a slot running a job has no marker.
+  #
+  # Only when the hold asked for it. A pinned consumer that never brought a
+  # stack up has nothing to protect, and stopping its agent would subtract a
+  # slot from the pool for the length of a run that was not using it.
+  if [ "\$reserve" = 1 ] && [ -f "\$marker" ] && systemctl is-active --quiet "ci-runner@\$slot.service"; then
+    if systemctl stop "ci-runner@\$slot.service" >/dev/null 2>&1; then
+      say "slot \$slot reserved by run \$run and now idle — agent stopped so the run's stack is not handed to the next job"
+    else
+      say "slot \$slot: could not stop the agent holding run \$run's stack"
+    fi
+  fi
+  exit 0
+fi
+
+# --- expired ------------------------------------------------------------------
+say "run \$run's hold on slot \$slot expired \$((now - expiry))s ago"
+
+# A hold that reserved nothing owns no stack and no slot: the slot's own
+# job-completed reset already cleaned it, and it never left service. Releasing
+# is the whole of the work.
+if [ "\$reserve" != 1 ]; then
+  rm -f -- "\$RECORD"
+  curl --silent --show-error --fail --connect-timeout 3 --max-time 10 \
+    -X PUT --data "" -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/ci/pin-hold" \
+    >/dev/null 2>&1 || true
+  say "released — the host is available to the next run"
+  exit 0
+fi
+
+# Teardown, reset, agent back. FAIL CLOSED on each: a slot whose stack would not
+# die, or whose reset did not finish, is a slot that must not take another job,
+# so the agent is left DOWN rather than started over an unknown state. A host
+# whose slots are down takes no work and stops vetoing its own removal, which is
+# the only retirement this host has a channel to ask for.
+say "tearing run \$run's stack down on slot \$slot"
+
+rc=0
+
+# The containers first. Nothing else here stops them: slot-reset.sh empties the
+# home and _work, which is where the compose file was, not where the stack is.
+sock="/run/\$u/docker.sock"
+if [ -S "\$sock" ]; then
+  ids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" docker ps --quiet 2>/dev/null)
+  if [ -n "\$ids" ]; then
+    # word-splitting \$ids is the point -- one id per argument.
+    # shellcheck disable=SC2086
+    timeout 120 sudo -u "\$u" DOCKER_HOST="unix://\$sock" docker rm --force \$ids >/dev/null 2>&1 \
+      || { say "slot \$slot: could not remove the run's containers"; rc=1; }
+  fi
+else
+  say "slot \$slot: no docker socket at \$sock — no container was stopped"
+fi
+
+# The record is still in place here, and deliberately: the reset reads it, sees
+# an EXPIRED hold, and prunes the image tags it spared while the hold was live.
+/opt/ci/job-hooks/slot-reset.sh completed "\$slot" >/dev/null 2>&1 \
+  || { say "slot \$slot: the reset after the hold did not finish"; rc=1; }
+
+# The record goes only when the teardown succeeded. A hold left in place is
+# swept again on the next tick, which is a retry; a hold removed over a slot
+# that is still dirty is a slot handed back to the fleet on a clean bill of
+# health nobody earned.
+if [ "\$rc" = 0 ]; then
+  rm -f -- "\$RECORD"
+  curl --silent --show-error --fail --connect-timeout 3 --max-time 10 \
+    -X PUT --data "" -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/ci/pin-hold" \
+    >/dev/null 2>&1 || true
+  if systemctl start "ci-runner@\$slot.service" >/dev/null 2>&1; then
+    say "slot \$slot: torn down, reset and back in service"
+  else
+    say "slot \$slot: torn down and reset, but the agent would not start — leaving it down"
+  fi
+else
+  say "slot \$slot: teardown incomplete — the agent stays DOWN and the hold stays in place for the next sweep"
+fi
+exit 0
+EOF
+  chown root:root /opt/ci/job-hooks/pin-sweep.sh || return 1
+  chmod 0755 /opt/ci/job-hooks/pin-sweep.sh || return 1
+
+  cat >/etc/systemd/system/ci-pin-sweep.service <<'EOF'
+[Unit]
+Description=Expire this host's pin hold and return the held slot to service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ci/job-hooks/pin-sweep.sh
+EOF
+
+  # Every 30 seconds, which is the window between a hold expiring and the slot
+  # coming back. AccuracySec pins it: systemd coalesces timers by up to a minute
+  # by default, and a sweep that drifts is a slot idle and unavailable for
+  # longer than anything says it should be.
+  cat >/etc/systemd/system/ci-pin-sweep.timer <<'EOF'
+[Unit]
+Description=Sweep this host's pin hold every 30 seconds
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
+  systemctl enable --now ci-pin-sweep.timer >>/var/log/ci-host.log 2>&1 || return 1
 }
 
 # --- registry credentials for job containers ----------------------------------
@@ -3004,6 +3529,12 @@ main() {
   # there refuses to run any job at all — so a host that registered without this
   # would take work and fail every bit of it.
   install_job_hooks || die "could not install the per-job slot reset — refusing to register agents"
+
+  # After the hooks, because job-started.sh renews a hold through it, and before
+  # any agent exists, because a host that took a job without this is a host that
+  # cannot be pinned — and an unpinnable host silently gives a pull request two
+  # of them, which is the whole failure this fleet is being changed to prevent.
+  install_pin_hold || die "could not install the pin hold — refusing to register agents"
 
   local i
   for i in $(seq 1 "$SLOTS"); do
