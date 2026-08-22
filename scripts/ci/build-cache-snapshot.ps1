@@ -93,7 +93,7 @@ function Get-SafeText {
     return ($Text -replace '[^\x20-\x7e]', '?')
 }
 
-function Get-PrepareTimeoutSeconds {
+function Get-PrepareTimeout {
     <#
       .SYNOPSIS
         CACHE_PREPARE_TIMEOUT as a positive whole number of seconds. Pure.
@@ -606,6 +606,12 @@ function Remove-StageSafely {
         Get-ChildItem -Recurse does not descend a reparse point unless
         -FollowSymlink is given, so the scan itself is safe on the tree it judges.
     #>
+    # ConfirmImpact stays Low deliberately. This runs unattended in a workflow
+    # job, and $ConfirmPreference is High there, so nothing prompts -- the
+    # declaration is what lets -WhatIf report the delete instead of doing it, and
+    # the analyzer is right that a function whose name says Remove should support
+    # that. Raising the impact would turn every clean-up into a hang.
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
     param([Parameter(Mandatory = $true)][string] $Path)
 
     if (-not (Test-Path -LiteralPath $Path)) { return }
@@ -701,7 +707,7 @@ function Invoke-Main {
         throw 'CACHE_ARCHIVE_OUT is required (where to write the archive this job hands to the publish job)'
     }
 
-    $timeout = Get-PrepareTimeoutSeconds -Raw $env:CACHE_PREPARE_TIMEOUT
+    $timeout = Get-PrepareTimeout -Raw $env:CACHE_PREPARE_TIMEOUT
 
     # tar.exe is bsdtar, in System32 on every supported Windows build and on every
     # windows-latest image. Checked before the install rather than after it: an hour

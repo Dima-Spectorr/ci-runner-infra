@@ -72,42 +72,58 @@ code() { # <file>
   grep -v '^[[:space:]]*#' "$1"
 }
 
+# grep -q, MINUS THE SIGPIPE. The rule is already written down three times in
+# this directory -- apply-identity, apply-runner-pool and apply-trigger each
+# carry it above their `matches` helper -- and this file was the one that did not
+# follow it.
+#
+# `-q` exits on the first match, which closes the pipe under it; whatever is
+# writing into that pipe -- `printf` here, `code`'s own `grep -v` there -- then
+# dies of EPIPE, and `set -o pipefail` reports the WHOLE pipeline as failed. A
+# predicate that FOUND its text returns false. It is non-deterministic by
+# construction: it only fires when the match lands early enough that the writer
+# has not already finished, so it depends on where in the file the text sits and
+# on how much the pipe buffers. That is why checks failed in CI (64 KiB pipe, GNU
+# grep) while the same commit passed on a laptop. `-c` reads to end of input, so
+# nothing upstream is ever cut off, and it still exits 1 when there is no match.
+grepq() { grep -c -- "$@" >/dev/null; }
+
 # --- predicates --------------------------------------------------------------
 
 has_build_phase_guard() { # <file>
-  code "$1" | grep -q 'Get-BuildPhaseRefusal -Pool' || return 1
+  code "$1" | grepq 'Get-BuildPhaseRefusal -Pool' || return 1
   # The call without the throw is the same as no call at all.
-  code "$1" | grep -q 'if ($refusal) { throw' || return 1
+  code "$1" | grepq 'if ($refusal) { throw' || return 1
 }
 
 has_event_guard() { # <file>
-  code "$1" | grep -q 'if (-not (Test-SnapshotEventAllowed -EventName $env:GITHUB_EVENT_NAME))' || return 1
-  code "$1" | grep -q "refusing to build a snapshot from a" || return 1
+  code "$1" | grepq 'if (-not (Test-SnapshotEventAllowed -EventName $env:GITHUB_EVENT_NAME))' || return 1
+  code "$1" | grepq "refusing to build a snapshot from a" || return 1
 }
 
 has_job_object_reap() { # <file>
-  code "$1" | grep -q '\[CiJobObject\]::CreateKillOnClose()' || return 1
-  code "$1" | grep -q '\[CiJobObject\]::StartSuspendedInJob($job, $line, $WorkingDirectory)' || return 1
+  code "$1" | grepq '\[CiJobObject\]::CreateKillOnClose()' || return 1
+  code "$1" | grepq '\[CiJobObject\]::StartSuspendedInJob($job, $line, $WorkingDirectory)' || return 1
   # Kill and Close BOTH, and in the finally: closing alone reaps only when the
   # .NET finalizer gets round to the handle, which is not a point in time this
   # script can name.
-  code "$1" | grep -q '\[CiJobObject\]::Kill($job)' || return 1
-  code "$1" | grep -q '\[CiJobObject\]::Close($job)' || return 1
+  code "$1" | grepq '\[CiJobObject\]::Kill($job)' || return 1
+  code "$1" | grepq '\[CiJobObject\]::Close($job)' || return 1
 }
 
 has_kill_on_close_flag() { # <file>
   # The flag's value and its use. A constant declared and never assigned to
   # LimitFlags creates a job object with no limits at all, which reaps nothing.
-  code "$1" | grep -q 'LimitKillOnJobClose = 0x2000' || return 1
-  code "$1" | grep -q 'info.BasicLimitInformation.LimitFlags = LimitKillOnJobClose' || return 1
-  code "$1" | grep -q 'ExtendedLimitInformation = 9' || return 1
+  code "$1" | grepq 'LimitKillOnJobClose = 0x2000' || return 1
+  code "$1" | grepq 'info.BasicLimitInformation.LimitFlags = LimitKillOnJobClose' || return 1
+  code "$1" | grepq 'ExtendedLimitInformation = 9' || return 1
 }
 
 has_bounded_prepare() { # <file>
-  code "$1" | grep -q '\[CiJobObject\]::Wait($handle, $TimeoutSeconds \* 1000)' || return 1
+  code "$1" | grepq '\[CiJobObject\]::Wait($handle, $TimeoutSeconds \* 1000)' || return 1
   # And the timeout is treated as a failure rather than logged: a half-populated
   # cache that publishes is worse than no snapshot.
-  code "$1" | grep -q 'if ($run.TimedOut)' || return 1
+  code "$1" | grepq 'if ($run.TimedOut)' || return 1
 }
 
 has_no_publish_surface() { # <file>
@@ -120,20 +136,20 @@ has_no_publish_surface() { # <file>
 
 has_reap_before_read() { # <file>
   local run_line read_line
-  run_line=$(grep -n '\$run = Invoke-PrepareInJob' "$1" | head -1 | cut -d: -f1)
-  read_line=$(grep -n '\$entries = @(Get-Item -LiteralPath \$stage' "$1" | head -1 | cut -d: -f1)
+  run_line=$(grep -n -m1 '\$run = Invoke-PrepareInJob' "$1" | cut -d: -f1)
+  read_line=$(grep -n -m1 '\$entries = @(Get-Item -LiteralPath \$stage' "$1" | cut -d: -f1)
   [ -n "$run_line" ] && [ -n "$read_line" ] || return 1
   [ "$run_line" -lt "$read_line" ] || return 1
 }
 
 has_hostile_scan_before_pack() { # <file>
   local scan_line pack_line
-  scan_line=$(grep -n 'Get-StagedTreeRefusal -Entries \$entries' "$1" | head -1 | cut -d: -f1)
-  pack_line=$(grep -n '& \$tar -czf' "$1" | head -1 | cut -d: -f1)
+  scan_line=$(grep -n -m1 'Get-StagedTreeRefusal -Entries \$entries' "$1" | cut -d: -f1)
+  pack_line=$(grep -n -m1 '& \$tar -czf' "$1" | cut -d: -f1)
   [ -n "$scan_line" ] && [ -n "$pack_line" ] || return 1
   [ "$scan_line" -lt "$pack_line" ] || return 1
-  code "$1" | grep -q '^        if ($hostile) {' || return 1
-  code "$1" | grep -q 'throw "refusing to pack: $hostile"' || return 1
+  code "$1" | grepq '^        if ($hostile) {' || return 1
+  code "$1" | grepq 'throw "refusing to pack: $hostile"' || return 1
 }
 
 has_root_in_hostile_scan() { # <file>
@@ -141,7 +157,7 @@ has_root_in_hostile_scan() { # <file>
   # never the starting item, so a prepare command that replaces $stage with a
   # junction produces a tree that scans clean while tar packs from elsewhere.
   # The root is the one entry the scan cannot afford to omit.
-  code "$1" | grep -q '@(Get-Item -LiteralPath $stage -Force' || return 1
+  code "$1" | grepq '@(Get-Item -LiteralPath $stage -Force' || return 1
 }
 
 has_hostile_stage_left_alone() { # <file>
@@ -155,29 +171,29 @@ has_hostile_stage_left_alone() { # <file>
   # cleanup, and the ONE recursive delete in this file is downstream of it.
   local code delete_line scan_line
   code=$(code "$1")
-  printf '%s' "$code" | grep -q 'Remove-StageSafely -Path $stage' || return 1
+  printf '%s' "$code" | grepq 'Remove-StageSafely -Path $stage' || return 1
   # exactly one recursive delete of the stage, and it is inside that function
   [ "$(printf '%s\n' "$code" | grep -c 'Remove-Item -LiteralPath $Path -Recurse')" = 1 ] || return 1
   [ "$(printf '%s\n' "$code" | grep -c 'Remove-Item -LiteralPath $stage -Recurse')" = 0 ] || return 1
-  scan_line=$(grep -n 'Get-StagedTreeRefusal -Entries $entries' "$1" | head -1 | cut -d: -f1)
-  delete_line=$(grep -n 'Remove-Item -LiteralPath $Path -Recurse' "$1" | head -1 | cut -d: -f1)
+  scan_line=$(grep -n -m1 'Get-StagedTreeRefusal -Entries $entries' "$1" | cut -d: -f1)
+  delete_line=$(grep -n -m1 'Remove-Item -LiteralPath $Path -Recurse' "$1" | cut -d: -f1)
   [ -n "$scan_line" ] && [ -n "$delete_line" ] || return 1
   [ "$scan_line" -lt "$delete_line" ] || return 1
   # a tree that could not be READ is not a tree that came back clean
-  printf '%s' "$code" | grep -q 'rootErrors.Count -gt 0 -or $treeErrors.Count -gt 0' || return 1
+  printf '%s' "$code" | grepq 'rootErrors.Count -gt 0 -or $treeErrors.Count -gt 0' || return 1
 }
 
 has_drain_after_kill() { # <file>
   local kill_line drain_line read_line
-  kill_line=$(grep -n '\[CiJobObject\]::Kill(\$job)' "$1" | head -1 | cut -d: -f1)
-  drain_line=$(grep -n 'Wait-JobObjectDrained -Job \$job' "$1" | head -1 | cut -d: -f1)
-  read_line=$(grep -n '\$entries = @(Get-Item -LiteralPath \$stage' "$1" | head -1 | cut -d: -f1)
+  kill_line=$(grep -n -m1 '\[CiJobObject\]::Kill(\$job)' "$1" | cut -d: -f1)
+  drain_line=$(grep -n -m1 'Wait-JobObjectDrained -Job \$job' "$1" | cut -d: -f1)
+  read_line=$(grep -n -m1 '\$entries = @(Get-Item -LiteralPath \$stage' "$1" | cut -d: -f1)
   [ -n "$kill_line" ] && [ -n "$drain_line" ] && [ -n "$read_line" ] || return 1
   # terminate, THEN wait for the members to actually go, THEN read the tree.
   [ "$kill_line" -lt "$drain_line" ] || return 1
   [ "$drain_line" -lt "$read_line" ] || return 1
   # …and a job that will not drain fails the build rather than logging.
-  code "$1" | grep -q 'ActiveProcesses' || return 1
+  code "$1" | grepq 'ActiveProcesses' || return 1
 }
 
 has_suspended_start() { # <file>
@@ -187,47 +203,47 @@ has_suspended_start() { # <file>
   # the tree while it is packed. CREATE_SUSPENDED closes it by construction.
   local code create_line assign_line resume_line
   code=$(code "$1")
-  printf '%s' "$code" | grep -q 'CreateSuspended = 0x00000004' || return 1
-  printf '%s' "$code" | grep -q 'StartSuspendedInJob' || return 1
+  printf '%s' "$code" | grepq 'CreateSuspended = 0x00000004' || return 1
+  printf '%s' "$code" | grepq 'StartSuspendedInJob' || return 1
   # ...and Start-Process is gone: it has no suspended start to offer. The C#
   # block comments explain why, and code() strips only #-comments, so the //
   # ones go here.
-  ! printf '%s\n' "$code" | grep -v '^[[:space:]]*//' | grep -q 'Start-Process' || return 1
-  create_line=$(grep -n 'CreateSuspended, IntPtr.Zero, workingDirectory' "$1" | head -1 | cut -d: -f1)
-  assign_line=$(grep -n 'AssignProcessToJobObject(job, pi.Process)' "$1" | head -1 | cut -d: -f1)
-  resume_line=$(grep -n 'ResumeThread(pi.Thread)' "$1" | head -1 | cut -d: -f1)
+  ! printf '%s\n' "$code" | grep -v '^[[:space:]]*//' | grepq 'Start-Process' || return 1
+  create_line=$(grep -n -m1 'CreateSuspended, IntPtr.Zero, workingDirectory' "$1" | cut -d: -f1)
+  assign_line=$(grep -n -m1 'AssignProcessToJobObject(job, pi.Process)' "$1" | cut -d: -f1)
+  resume_line=$(grep -n -m1 'ResumeThread(pi.Thread)' "$1" | cut -d: -f1)
   [ -n "$create_line" ] && [ -n "$assign_line" ] && [ -n "$resume_line" ] || return 1
   [ "$create_line" -lt "$assign_line" ] || return 1
   [ "$assign_line" -lt "$resume_line" ] || return 1
   # a process that could not be assigned never runs at all
-  printf '%s' "$code" | grep -q 'TerminateProcess(pi.Process, 1)' || return 1
+  printf '%s' "$code" | grepq 'TerminateProcess(pi.Process, 1)' || return 1
 }
 
 has_packed_file_count() { # <file>
   # tar packs the named cache directories. Counting every file under the staging
   # root instead lets one stray marker stand in for a warm cache, and publishes
   # an archive of empty directories that every host unpacks over its master.
-  code "$1" | grep -q 'script:CacheDirs -contains $_.FullName.Substring($prefix.Length)' || return 1
+  code "$1" | grepq 'script:CacheDirs -contains $_.FullName.Substring($prefix.Length)' || return 1
 }
 
 has_local_staging_root() { # <file>
   # An empty GITHUB_EVENT_NAME is accepted as a local build, and tested as one.
   # RUNNER_TEMP exists only on Actions, so a Join-Path against it alone would
   # make that allowance a lie.
-  code "$1" | grep -q 'System.IO.Path\]::GetTempPath()' || return 1
+  code "$1" | grepq 'System.IO.Path\]::GetTempPath()' || return 1
 }
 
 has_empty_tree_refusal() { # <file>
   # An empty archive is a valid archive, and it would replace every host's warm
   # master with nothing. The failure mode that looks exactly like success.
-  code "$1" | grep -q 'if ($files.Count -eq 0)' || return 1
+  code "$1" | grepq 'if ($files.Count -eq 0)' || return 1
 }
 
 has_archive_rooted_at_the_tool_names() { # <file>
   # -C the stage, then the names. Without -C the members carry a path prefix and
   # the host — which unpacks expecting exactly these top-level names — hydrates
   # nothing while every step reports success.
-  code "$1" | grep -q '& $tar -czf $out -C $stage $script:CacheDirs' || return 1
+  code "$1" | grepq '& $tar -czf $out -C $stage $script:CacheDirs' || return 1
 }
 
 has_stage_cleanup() { # <file>
@@ -236,13 +252,13 @@ has_stage_cleanup() { # <file>
   # first proves the tree is free of reparse points. A direct Remove-Item here
   # would still clean up; it would just do it by following whatever a prepare
   # command pointed at.
-  code "$1" | grep -q 'Remove-StageSafely -Path $stage' || return 1
-  code "$1" | grep -q 'Remove-Item -LiteralPath $stage' && return 1
+  code "$1" | grepq 'Remove-StageSafely -Path $stage' || return 1
+  code "$1" | grepq 'Remove-Item -LiteralPath $stage' && return 1
   return 0
 }
 
 has_inert_dot_source() { # <file>
-  code "$1" | grep -q "if (\$MyInvocation.InvocationName -ne '.')" || return 1
+  code "$1" | grepq "if (\$MyInvocation.InvocationName -ne '.')" || return 1
   # Nothing at column 0 may change the caller's state or compile a type: the
   # Pester suite dot-sources this file on Linux, where kernel32 does not exist.
   if code "$1" | grep -Eq '^(Set-StrictMode|\$ErrorActionPreference|Add-Type)'; then
