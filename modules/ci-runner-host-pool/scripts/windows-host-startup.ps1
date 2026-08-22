@@ -2698,13 +2698,22 @@ function Invoke-BoundedNative {
         $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -NoNewWindow `
             -RedirectStandardOutput $out -RedirectStandardError $err
         if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
-            try { $proc.Kill() } catch { }
-            # A short second wait so the exit code and the handles are settled
-            # before the finally block disposes it.
-            try { [void] $proc.WaitForExit(5000) } catch { }
+            # The short second wait is so the exit code and the handles are
+            # settled before the finally block disposes it. Neither call can
+            # change the verdict -- the call is refused either way -- but a
+            # child that exited on its own between the deadline and the Kill(),
+            # and one this process is not allowed to signal, both throw here and
+            # they are not the same fact, so the log says which.
+            $fate = 'was killed'
+            try {
+                $proc.Kill()
+                [void] $proc.WaitForExit(5000)
+            } catch {
+                $fate = "could not be killed: $($_.Exception.Message)"
+            }
             return [pscustomobject] @{
                 ExitCode = -1
-                Error    = "$What did not finish within $TimeoutSeconds" + 's and was killed'
+                Error    = "$What did not finish within $TimeoutSeconds" + "s and $fate"
             }
         }
         # The no-argument wait after the bounded one is not redundant: the timed

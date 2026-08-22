@@ -1920,7 +1920,7 @@ mutate "the wait given no deadline" \
   's|WaitForExit($TimeoutSeconds \* 1000)|WaitForExit()|' \
   has_bounded_native_calls
 mutate "the timed-out child left running" \
-  's|try { $proc.Kill() } catch { }|$null = $proc|' \
+  's|^ *\$proc\.Kill()$|                $null = $proc|' \
   has_bounded_native_calls
 mutate "a spent budget read as unbounded rather than as already over" \
   's|if ($TimeoutSeconds -le 0) {|if ($false) {|' \
