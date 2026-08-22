@@ -443,6 +443,14 @@ price of warmth and it was paid deliberately. Consequence for a job author:
 the answer arrives in a pull request rather than as an "Initialize containers"
 error about docker on a host that has none.
 
+That refusal is correct and it leaves a hole: a Windows job that needs a
+database has no supported way to get one. The answer is *reachability, not a
+runtime* — the pull request's shared stack lives on its Linux host and the
+Windows job connects to it over the VPC. Designed in
+[`adr-pr-host-affinity.md`](adr-pr-host-affinity.md), specified in
+[`ci-pr-shared-infra.md`](ci-pr-shared-infra.md), **proposed and not yet
+implemented**. Until it is, a Windows job's dependencies have to be native.
+
 **`slots_per_host = 1`.** Windows has no per-slot network namespace, so two
 concurrent slots share one loopback and one port space, and two jobs binding the
 same fixed port collide with no host-side fix — reported forever as a flaky

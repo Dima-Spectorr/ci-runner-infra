@@ -719,6 +719,8 @@ scripts/ci/egress-destinations.sh
 docs/egress-baselines/           that baseline, one file per project
 docs/ci-workflow-gates.md        those gates: rules, flags, how to adopt
 docs/ci-lane-model.md            the lane contract consumers adopt
+docs/ci-pr-shared-infra.md       one host per workflow run, one infra stack
+docs/adr-pr-host-affinity.md     the decision behind that contract
 docs/ci-merge-queue-baseline.md  one CI run per PR: the queue config + gate
 docs/ci-optimization-catalog.md  the fleet audit behind that contract
 packer/warm-cache/                optional baked caches, chosen per pool
@@ -745,6 +747,50 @@ Consumers adopt it by tag, never by copying — see
 requirements and the order they must be done in. The audit that produced it,
 with per-repository measurements, is in
 [`docs/ci-optimization-catalog.md`](docs/ci-optimization-catalog.md).
+
+## One host per workflow run, and one infrastructure stack on it
+
+Status: **proposed**. The decision is
+[`docs/adr-pr-host-affinity.md`](docs/adr-pr-host-affinity.md); the contract
+consumers will adopt is
+[`docs/ci-pr-shared-infra.md`](docs/ci-pr-shared-infra.md). Nothing in this
+section is implemented yet, and no consuming repository changes until phase 7
+of the ADR's delivery table.
+
+The lane model bounds how much CI a pull request deserves. Nothing bounds
+*where* it lands, and issue #205 measured what that costs: 12 concurrent slots
+against ~25 jobs for one Apigee-Portal pull request, with three to four pull
+requests in flight — queue waits of 291 s and, worse, unrelated required checks
+displaced from 139 s to 406 s because nothing associates a job with the pull
+request that asked for it.
+
+Three rules follow from fixing that, and they are one decision:
+
+* **A workflow run's self-hosted work runs on one host.** An affinity label
+  (`host-<instance-name>`, registered at boot by both pools) plus an **anchor
+  job**: the run's first fleet job goes out unpinned, and publishes the host it
+  landed on for everything downstream to pin to. No API call, no token, no lease
+  store — and the host is demonstrably alive, because a job of yours is on it.
+  A host older than the contract is a **supported answer** that degrades to
+  today's unpinned behaviour, because a label naming a host that is not there is
+  a pull request that queues for 24 hours. The unit is a workflow *run* because
+  job outputs do not cross runs; "one host per pull request" is what a
+  repository gets once its `pull_request` CI is one workflow, which is the first
+  step of adoption.
+* **Infrastructure is brought up once per pull request**, by one job, and
+  shared. `services:` is per-job by construction and is what this replaces.
+* **A Windows job reaches that stack over the VPC.** Slots have separate network
+  namespaces, so a sibling slot's `127.0.0.1` is not the owner's; the stack is
+  published into a per-slot host port band, DNAT'd to the host address, and
+  reached at that address by siblings and by the Windows host alike. The Windows
+  pool still gets **no container runtime** — that decision
+  ([`docs/adr-windows-pool.md`](docs/adr-windows-pool.md) §4) was reconsidered
+  here and re-affirmed. Reachability, not a runtime.
+
+`RUNNER9`/`RUNNER10`/`RUNNER11` in `check-runner-policy.sh` will assert the
+three, opt-in by flag until adoption completes — a gate that fails every
+repository the day it merges is a gate disabled in every repository the day
+after.
 
 ## One CI run per pull request, or one per batch
 
