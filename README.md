@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.33.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.34.0"
   # ...
 }
 ```
@@ -367,6 +367,44 @@ that image a real answer is separate work, not a line in this one.
   first. Each slot's dockerd runs with `PrivateTmp=yes` and its runner agent
   joins that same namespace, so `docker run -v /tmp/x:/x` still mounts the file
   the step just wrote instead of an empty directory.
+* **A slot is told its share of the host, because it cannot measure it.** Slots
+  are separated by user, network namespace and container daemon — and
+  deliberately **not** by CPU. There is no `CPUQuota`, no `cpuset`, no
+  `MemoryMax` on the agent unit, so `nproc` inside a slot reports the whole
+  machine: 16 on an `n2-standard-16`, whether that slot is alone on the host or
+  one of four. That is the right default. A hard quota would stop a lone job from
+  using an otherwise idle host, and the pool exists to make jobs fast; the
+  kernel's fair scheduler already divides a *contended* host sensibly.
+
+  What it breaks is the very common workflow line `--max-workers=$(nproc)`. Every
+  slot sizes its worker pool for the whole machine, and K of them do it at once.
+  Measured on the IntegrateIT pool, 2026-08-22: 4 slots on 16 vCPU, each test job
+  budgeting 2 packages x 6 workers from a comment that still said "one CI job per
+  VM" — up to 48 workers on 16 vCPU plus four database service containers, about
+  3x oversubscribed. Nothing errors. The jobs are slow and their per-test
+  timeouts start expiring, which reads as a flaky suite and gets "fixed" by a
+  re-run that oversubscribes the host again.
+
+  So the unit carries four variables, computed at boot from the host it is
+  actually on:
+
+  | variable | value |
+  |---|---|
+  | `CI_SLOT_VCPUS` | host vCPU / `slots_per_host`, floored at 1 |
+  | `CI_SLOT_MEM_MB` | host memory / `slots_per_host` |
+  | `CI_HOST_VCPUS` | the host's own vCPU count |
+  | `CI_HOST_SLOTS` | `slots_per_host` |
+
+  A workflow sizes from `CI_SLOT_VCPUS` and falls back to `nproc` when it is
+  unset — which is exactly the over-subscription above, so the fallback is a
+  compatibility path and not a resting place. Both host totals are published too,
+  so a job that genuinely wants to reason about the machine does not have to
+  guess which of the two numbers `nproc` gave it.
+
+  This is advice, not enforcement: a job that ignores the variable still gets the
+  whole host if the host is idle, and still competes fairly if it is not. Pinning
+  it as a quota is a separate decision, and would cost the idle-host case.
+
 * **The dependency cache is shared read-only and written per slot.** The tree
   splits in two. `/opt/ci-cache` — **from image `v3-12-0` on** — is the master:
   root-owned, stripped of group and other write, shared by all slots and writable

@@ -1867,6 +1867,38 @@ provision_shared_cache() {
 # uids that read-only mode was the only thing standing between a hostile
 # co-tenant and an in-place edit of a module another slot compiles. Per-slot
 # caches make Go's own default both safe and sufficient, so the default stays.
+share_env() {
+  # What this slot's FAIR SHARE of the host is, published so a job can size
+  # itself to the machine it is actually on.
+  #
+  # `nproc` inside a slot reports the whole host — 16 on an n2-standard-16 —
+  # because slots are separated by user, network namespace and dockerd, and not
+  # by CPU. That is deliberate: a hard CPUQuota would stop a lone job from using
+  # an otherwise idle host, and this pool exists to make jobs fast. The cost is
+  # that every tool which sizes a worker pool from `nproc` believes it owns the
+  # machine, and K of them believe it at the same time.
+  #
+  # Measured on the IntegrateIT pool, 2026-08-22: 4 slots on 16 vCPU, each test
+  # job budgeting 2 packages x 6 workers because its workflow reasoned from
+  # `nproc` and a comment that still said "one CI job per VM". Up to 48 test
+  # workers on 16 vCPU, plus four Postgres service containers — 3x
+  # oversubscribed, which is the shape that produces timeouts a re-run "fixes".
+  #
+  # So the host states the share and the job obeys it. Contention between slots
+  # stays on the kernel's fair scheduler, where a slot that is alone still gets
+  # everything; what changes is that a slot which is NOT alone no longer plans
+  # as though it were.
+  local cpus mem_kb
+  cpus=$(nproc)
+  mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+  cat <<EOF
+Environment=CI_SLOT_VCPUS=$(( cpus / SLOTS > 0 ? cpus / SLOTS : 1 ))
+Environment=CI_SLOT_MEM_MB=$(( mem_kb / 1024 / SLOTS ))
+Environment=CI_HOST_VCPUS=$cpus
+Environment=CI_HOST_SLOTS=$SLOTS
+EOF
+}
+
 cache_env() {
   local idx="$1" c="$CACHE_SLOTS/$1"
   # The marker, not the directory. $c is created by the FIRST line of
@@ -2529,6 +2561,11 @@ install_slot() {
   # default under the slot's home — slower, and correct.
   local CACHE_ENV; CACHE_ENV=$(cache_env "$idx")
 
+  # Unconditional, unlike CACHE_ENV: every slot has a share whether or not it
+  # has a seeded cache, and a job that cannot read one falls back to `nproc` —
+  # which is the over-subscription this exists to end.
+  local SHARE_ENV; SHARE_ENV=$(share_env)
+
   mkdir -p "$dir"
   # Copy, not symlink: config.sh writes .runner/.credentials into the directory
   # it runs in, and K agents must not share one identity.
@@ -2624,6 +2661,7 @@ NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
 BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 $BROKER_ENV
 $CACHE_ENV
+$SHARE_ENV
 # Reset this slot before every job and after every job: the home is emptied and
 # rebuilt from $SLOT_TEMPLATE, and the previous job's workspace and tool cache go
 # with it. Set unconditionally, and NOT alongside BROKER_ENV: a pool with no job
