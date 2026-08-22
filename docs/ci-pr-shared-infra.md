@@ -72,7 +72,19 @@ host from its own environment, and every later job pins to it.
           # in every slot. The TTL is a deadline measured from NOW, not from the
           # end of the run, so it must cover the whole run -- see "Sizing the
           # TTL" below. A lapsed hold degrades to today's behaviour.
-          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL"
+          #
+          # READ THE ANSWER. The helper is an admission decision, not a request:
+          # it exits 0 either way and says `pinned=0` when another run already
+          # holds this host. Publishing the label anyway pins every consumer to
+          # a host somebody else owns, which is the contention this whole
+          # mechanism exists to prevent.
+          if [ "$(ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL" \
+                    | sed -n 's/^pinned=//p')" != 1 ]; then
+            echo 'runs-on=["self-hosted","linux","gcp","<Repo>"]' >> "$GITHUB_OUTPUT"
+            echo "host=" >> "$GITHUB_OUTPUT"
+            echo "::notice::another run holds this host — running unpinned"
+            exit 0
+          fi
 
           printf 'runs-on=["self-hosted","linux","gcp","<Repo>","%s"]\n' \
             "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
@@ -182,7 +194,16 @@ host-side" below.
           # Pin the host AND reserve this slot for the rest of the run. The
           # slot part is what keeps the stack alive after this job ends; see
           # below for why the job cannot do that by staying alive itself.
-          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL" --reserve-slot
+          #
+          # A refusal here is fatal for THIS job and not for the run: the stack
+          # is already up on a slot nothing is protecting, so the honest thing
+          # is to fail rather than publish an address that the next job to land
+          # on this slot will wipe out from under its consumers.
+          if [ "$(ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL" \
+                    --reserve-slot | sed -n 's/^pinned=//p')" != 1 ]; then
+            echo "::error::could not reserve this slot — another run holds this host"
+            exit 1
+          fi
 
           printf 'runs-on=["self-hosted","linux","gcp","<Repo>","%s"]\n' \
             "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
@@ -212,25 +233,32 @@ first run.
 one mechanism either — it is a fast half and an exclusive half, because neither
 alone is buildable.
 
-`ci-pin-hold --reserve-slot` writes an unprivileged record into the slot's own
-state directory saying this slot belongs to this run. It needs no root: job code
-here runs fenced behind a sudoers allowlist of exactly two command lines, and
-widening that for PR-authored code to stop a systemd unit is not a trade this
-contract is willing to make.
+`ci-pin-hold --reserve-slot` records that this slot belongs to this run. The
+record is written by a root helper into a root-owned directory that jobs can
+read and none can write, reached through a sudoers allowlist of exactly three
+command lines (`--run *`, `renew`, `status`) — and the helper takes no slot
+argument at all: it derives the index from `SUDO_UID`, the way `slot-reset.sh`
+already does, so a slot cannot name a neighbour's. What PR-authored code can ask
+for is bounded rather than trusted: the run id is shape-checked, the TTL is
+clamped to a ceiling the host owns, and no verb shortens or removes a hold —
+expiry is the only end.
 
 Two things then read that record. **`slot-reset.sh`**, which already runs as
 root before and after every job, keeps wiping the workspace, home and
 credentials exactly as it does today but leaves this slot's containers standing.
-**The controller**, on the per-host probe it already makes, stops the slot's
-agent so nothing further is scheduled onto that uid or that daemon.
+**The sweeper**, a 30-second host timer, stops the slot's agent so nothing
+further is scheduled onto that uid or that daemon.
 
-The stop is the controller's and not the hook's for a mechanical reason: the
-hook executes inside `ci-runner@<idx>.service`, so a hook that stopped its own
-unit would have systemd SIGTERM the agent that is still reporting the job's
-result — the reservation would work and the job would be lost. Between the
-owner's exit and the controller's next tick a job can still land on the slot; it
-gets a clean workspace and the stack survives, which is why the reset half has
-to exist rather than being an optimisation.
+The stop is neither the hook's nor the controller's, for two different reasons.
+The hook executes inside `ci-runner@<idx>.service`, so a hook that stopped its
+own unit would have systemd SIGTERM the agent that is still reporting the job's
+result — the reservation would work and the job would be lost. The controller's
+only per-host shell runs after it has already decided to remove a host: a
+healthy, current-template, busy host is never probed, and that is every host a
+live hold is on. So the timer does it. Between the owner's exit and the next
+sweep a job can still land on the slot; it gets a clean workspace and the stack
+survives, which is why the reset half has to exist rather than being an
+optimisation.
 
 The release is host-side too, by the sweeper described below. The cost is
 unchanged: one of `slots_per_host` is unavailable for the length of the run.
@@ -274,6 +302,7 @@ network namespace, so `127.0.0.1` is the wrong address there:
     steps:
       # Nothing to renew here: the host renews the hold before this job's first
       # step runs. See "Sizing the TTL".
+      - run: ./gradlew integrationTest
 ```
 
 ### Sizing the TTL
@@ -307,9 +336,14 @@ label naming this host and a hold for that run exists; otherwise it does
 nothing. It renews with **the TTL the anchor recorded in the hold**, not with
 `CI_PIN_TTL`: a hook runs outside the job's step environment and cannot rely on
 seeing a workflow-level `env:`, and a hold that renewed itself with a defaulted
-duration would silently stop honouring the number the workflow chose. That makes renewal automatic for every pinned consumer including the
-containerised ones, unforgettable rather than merely documented, and removes
-the gate that could not have worked.
+duration would silently stop honouring the number the workflow chose. That
+makes renewal automatic for every pinned consumer, including the containerised
+ones, unforgettable rather than merely documented, and removes the gate that
+could not have worked.
+
+Renewal never fails a job. A hold that cannot extend expires, and the sweeper
+puts the slot back — the better of the two outcomes, and the reason the hook
+swallows the helper's exit status.
 
 **The TTL must still exceed the longest single hop.** Renewal does not help
 across a hop nothing renews: a Windows consumer runs on a *different* host and
@@ -375,8 +409,8 @@ And one command, on `PATH` in every slot:
 
 | command | meaning |
 |---|---|
-| `ci-pin-hold --run <id> --ttl <duration>` | write (or renew) this host's pin hold as a guest attribute; the controller reads it before acting on a drain, cordon or retire verdict, and vetoes the removal while the hold is live. The TTL runs from now — see "Sizing the TTL". Called by the anchor, and thereafter by the host's job-started hook: a workflow never needs to call it to renew, and a job inside a `container:` could not |
-| `ci-pin-hold … --reserve-slot` | additionally reserve **this slot** for the run. Unprivileged — it writes a record. `slot-reset.sh` then spares this slot's containers while still wiping its workspace, and the host-side sweeper stops the slot's agent so nothing else lands on its uid or its daemon. **Refuses** when the host already holds a reservation for a different run — first anchor wins, and the loser continues unpinned. Released, torn down and restored host-side when the run ends or the TTL lapses |
+| `ci-pin-hold --run <id> --ttl <duration>` | write (or renew) this host's pin hold as a guest attribute; the controller reads it before acting on a drain, cordon or retire verdict, and vetoes the removal while the hold is live. The TTL runs from now — see "Sizing the TTL". Called by the anchor, and thereafter by the host's job-started hook (`renew --run <id>`, on **started** only, and refused when the id is not the one the record names): a workflow never needs to call it to renew, and a job inside a `container:` could not. **Prints `pinned=1` or `pinned=0` and exits 0 either way** — it is an admission decision, so read the answer and continue unpinned on a refusal |
+| `ci-pin-hold … --reserve-slot` | additionally reserve **this slot** for the run. Runs as root through a three-line sudoers allowlist, because the record it writes decides whether a slot is wiped and PR-authored code is what calls it. `slot-reset.sh` then spares this slot's containers while still wiping its workspace, and the host-side sweeper stops the slot's agent so nothing else lands on its uid or its daemon. **Refuses** when the host already holds a reservation for a different run — first anchor wins, and the loser continues unpinned — and on a single-slot host, where reserving the only slot would serve nobody. Released, torn down and restored host-side when the run ends or the TTL lapses. A second run is refused until that release has actually happened, not merely become due |
 
 A host that does not set them is older than this contract. The anchor degrades
 to unpinned on a missing `CI_HOST_LABEL`; the owner job fails on a missing
