@@ -139,12 +139,15 @@ else
 fi
 
 src_has "MIG_BASE has a value before any function runs" 'MIG_BASE=""'
+# shellcheck disable=SC2016  # the controller source is the literal under test
 src_has "a run already cancelled this tick is not cancelled again" 'case "$gone" in *" $run "*) continue ;; esac'
+# shellcheck disable=SC2016  # the controller source is the literal under test
 src_has "a run already tried this tick is not posted to again" 'case "$tried" in'
 # Every path out of the orphan branch that leaves the run in the queue has to
 # count it: no token, already tried this tick, and a refused cancel -- plus the
 # blind tick and the ordinary pinned/wait case. Five increments, and a missing
 # one is a wedged run that ci_demand_pinned reports as zero.
+# shellcheck disable=SC2016  # the controller source is the literal under test
 _inc=$(grep -cF 'DEMAND_PINNED=$((DEMAND_PINNED + 1))' "$CONTROLLER")
 if [ "$_inc" -ge 5 ]; then
   printf 'ok   %s
