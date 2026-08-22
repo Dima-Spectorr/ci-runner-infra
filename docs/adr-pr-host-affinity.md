@@ -702,15 +702,15 @@ added is an environment read and not a job's worth of scheduling.
 Each phase is independently landable and independently useful. Nothing before
 phase 5 changes any consuming repository's behaviour.
 
-| # | Phase | Touches | Ships without |
-|---|---|---|---|
-| 1 | This ADR and the published contract | `docs/` | — |
-| 2 | Affinity label at boot + `CI_HOST_LABEL`, both pools; **`collect_demand` recognises it (§2.5)**; **orphaned-pin detection (§2.6)** | `host-startup.sh`, `windows-host-startup.ps1`, `controller-startup.sh`, self-tests | any workflow using it |
-| 3 | Port band, per-slot DNAT, **the conntrack band allow paired with [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) in one change**, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper, publishing the hold as a guest attribute, and its `--reserve-slot` record** (refusing a one-slot host), **`slot-reset.sh` sparing a held slot's containers and releasing a hold from a previous boot as orphaned** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), sweeper teardown + reset + agent start with **fail-closed retire** when any of the three fails, TTL sweep | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** |
-| 4 | Ingress/egress band rules on the new per-pool `ci-shared-infra-<pool>` tag, **applied to both of the repository's pools**; pin-hold veto read from guest attributes and applied to the `cordon:`/`retire:`/`drain:` verdicts of **both** `recycle_decision` and `drain_decision` (§2.4) | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `controller-startup.sh`, self-tests | any workflow using it |
-| 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) |
-| 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — |
-| 7 | Per-repository adoption, workflow consolidation first | consuming repositories, one pull request each | — |
+| # | Phase | Touches | Ships without | Status |
+|---|---|---|---|---|
+| 1 | This ADR and the published contract | `docs/` | — | [#247](https://github.com/Dima-Spectorr/ci-runner-infra/pull/247) merged; the rest in [#255](https://github.com/Dima-Spectorr/ci-runner-infra/pull/255) |
+| 2 | Affinity label at boot + `CI_HOST_LABEL`, both pools; **`collect_demand` recognises it (§2.5)**; **orphaned-pin detection (§2.6)** | `host-startup.sh`, `windows-host-startup.ps1`, `controller-startup.sh`, self-tests | any workflow using it | [#253](https://github.com/Dima-Spectorr/ci-runner-infra/pull/253) for the label; [#256](https://github.com/Dima-Spectorr/ci-runner-infra/pull/256) for §2.5 + §2.6 |
+| 3 | Port band, per-slot DNAT, **the conntrack band allow paired with [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) in one change**, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper, publishing the hold as a guest attribute, and its `--reserve-slot` record** (refusing a one-slot host), **`slot-reset.sh` sparing a held slot's containers and releasing a hold from a previous boot as orphaned** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), sweeper teardown + reset + agent start with **fail-closed retire** when any of the three fails, TTL sweep | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** | not started |
+| 4 | Ingress/egress band rules on the new per-pool `ci-shared-infra-<pool>` tag, **applied to both of the repository's pools**; pin-hold veto read from guest attributes and applied to the `cordon:`/`retire:`/`drain:` verdicts of **both** `recycle_decision` and `drain_decision` (§2.4) | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `controller-startup.sh`, self-tests | any workflow using it | not started |
+| 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) | not started |
+| 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — | not started |
+| 7 | Per-repository adoption, workflow consolidation first | consuming repositories, one pull request each | — | not started |
 
 Phase 5 lands the rules behind a flag for the same reason `--forks` is a flag: a
 gate that fails every repository on the day it merges is a gate that gets
