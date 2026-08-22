@@ -33,6 +33,17 @@
 # Tenancy-agnostic: no customer, repository, region or project literal below.
 
 locals {
+  # Shared-infrastructure band tags. See var.shared_infra_id: the first is
+  # carried by BOTH pools of a pair and is the ingress source, the second is
+  # carried by the Linux pool ONLY and is the ingress target. The Windows host
+  # therefore matches no ingress rule anywhere, which is the property
+  # docs/adr-windows-pool.md is protecting. The controller carries neither: it
+  # publishes no stack and consumes none.
+  shared_infra_tags = var.shared_infra_id == "" ? [] : concat(
+    ["ci-shared-infra-${var.shared_infra_id}"],
+    var.host_os == "linux" ? ["ci-shared-infra-stack-${var.shared_infra_id}"] : [],
+  )
+
   # `pool` and `repo` label every metric this pool publishes, so a single fleet
   # dashboard can group by either without per-repo dashboard code.
   repo_full = "${var.github_owner}/${var.github_repo}"
@@ -209,7 +220,7 @@ resource "google_compute_instance_template" "host" {
 
   machine_type = var.machine_type
   labels       = local.common_labels
-  tags         = concat(["ci-runner-host", var.name], var.network_tags)
+  tags         = concat(["ci-runner-host", var.name], var.network_tags, local.shared_infra_tags)
 
   disk {
     source_image = var.image

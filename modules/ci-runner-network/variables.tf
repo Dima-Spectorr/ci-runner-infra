@@ -127,3 +127,64 @@ variable "firewall_logging" {
     error_message = "firewall_logging must be one of: all, denied, off."
   }
 }
+
+variable "shared_infra_id" {
+  description = <<-EOT
+    Identifier of the shared-infrastructure pool PAIR these rules serve — the
+    same value given to both of the repository's `ci-runner-host-pool`
+    instances, which is what puts the paired tags on their hosts.
+
+    Empty (the default) creates no band rules at all. A project whose pools set
+    no `shared_infra_id` gets exactly today's posture.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.shared_infra_id == "" || can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.shared_infra_id))
+    error_message = "shared_infra_id must be a valid GCP network-tag component: lowercase letters, digits and dashes, starting with a letter."
+  }
+}
+
+variable "shared_infra_slots_per_host" {
+  description = <<-EOT
+    `slots_per_host` of the LINUX pool in the pair. It is the only input the
+    band span needs: slot i owns 100 host ports at 35000 + i*100, and slots are
+    numbered from ONE, so the span is 35100 .. 35000 + slots*100 + 99.
+
+    It is stated here rather than read from the pool module because this module
+    is created once per project and does not depend on the pools — but it must
+    AGREE with them, and `scripts/ci/shared-infra-band.selftest.sh` asserts that
+    this arithmetic and `host-startup.sh`'s produce the same numbers. A
+    firewall span and a DNAT span that disagree do not fail loudly: the
+    connection hangs until the job's timeout.
+  EOT
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.shared_infra_slots_per_host >= 1 && var.shared_infra_slots_per_host <= 90 && floor(var.shared_infra_slots_per_host) == var.shared_infra_slots_per_host
+    error_message = "shared_infra_slots_per_host must be a whole number between 1 and 90 — above 90 the band would run past port 44099 and into the ephemeral range."
+  }
+}
+
+variable "shared_infra_destination_ranges" {
+  description = <<-EOT
+    Destination ranges for the band's EGRESS allow. GCP egress rules cannot be
+    scoped by destination TAG — only by range — so this is the one asymmetry in
+    the pair of rules: ingress names the tag that may be reached, egress can
+    only name where the sender may send.
+
+    Default is RFC1918, which is what the `egress_database` rule already
+    concedes for the same reason. Narrow it to the pool subnet's CIDR where the
+    subnet is known; the ingress rule is the half that actually bounds who may
+    answer.
+  EOT
+  type        = list(string)
+  default     = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+  validation {
+    condition     = length(var.shared_infra_destination_ranges) > 0
+    error_message = "shared_infra_destination_ranges must not be empty: an empty list is not a closed rule, it is an apply error, and the intent it looks like (no band egress) is spelled shared_infra_id = \"\"."
+  }
+}
