@@ -336,6 +336,16 @@ that image a real answer is separate work, not a line in this one.
   and tool cache with it. Installed on every pool, including pools with no job
   service account, where an inherited credential is worst. A slot that cannot be
   shown to have been left clean fails its next job rather than running it.
+
+  The one thing the reset deliberately keeps is the daemon's image store — that
+  is where the warm layer lives, and deleting it would be a cold start per job.
+  So what a job leaves there is pruned by *name* instead: at the end of every
+  job, a local tag that carries no registry digest and whose image id is not in
+  the boot-time baked manifest is untagged, with the layers left in place, so a
+  rebuild is still warm. Without that, a job can tag or build any name it likes
+  and the next job on that slot runs it while believing it fetched it — a local
+  image by that name is resolved without ever contacting a registry, both by
+  `docker run` and by a `FROM` in a later build (#233).
 * **The metadata fence stops at port 80, and that is deliberate.**
   `169.254.169.254` is two services on one address: the metadata server over
   HTTP on port 80, and the VPC resolver on port 53. A container is handed that

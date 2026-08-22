@@ -446,6 +446,58 @@ has_baked_image_load() { # <file>
   matches "$joined" 'docker info --format' || return 1
 }
 
+# A name the previous job left in the slot's image store is the one warm thing
+# the next job EXECUTES while believing it fetched it: `docker run x` contacts no
+# registry when a local `x` exists, and neither does a `FROM x` in a later build.
+# #231 moved the store out of the home so it survives a reset — that is what
+# makes the reset cheap, and it is also what leaves this open (#233).
+#
+# None of it is visible in a passing build: the poisoned job succeeds.
+has_local_tag_prune() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # 1. At the resets that END a job, never at the one that starts it — at
+  #    `started` the runner has already loaded the image the job is about to use.
+  matches "$code" 'if \[ "\\\$stage" != started \]; then' || return 1
+
+  # 2. A REGISTRY DIGEST is what buys a tag its life, and a job cannot write one:
+  #    `docker tag` and `docker build -t` produce none; only a pull or a push does.
+  matches "$code" 'RepoDigests' || return 1
+  matches "$code" '\[ "\\\$ndig" = 0 \] \|\| continue' || return 1
+
+  # 3. …or the boot manifest, matched by image ID and NEVER by name. Match the
+  #    name and a job blesses its own image by retagging it onto a baked one.
+  matches "$code" 'baked="\\\$SLOT_STATE/\\\$idx/baked-images"' || return 1
+  matches "$code" 'grep -qxF -- "\\\$id" "\\\$baked"' || return 1
+
+  # 4. The NAME goes, not the content. `--no-prune` on one reference of a
+  #    multiply-referenced image untags it and leaves the layers in the store, so
+  #    a rebuild is still warm — deleting the content instead would be the cold
+  #    start per job that the whole warm layer exists to end.
+  matches "$code" 'docker rmi --no-prune -- "\\\$t"' || return 1
+  ! matches "$code" 'docker image prune' || return 1
+
+  # 5. The manifest it reads is written by root at boot from what `docker load`
+  #    actually reported, by ID — a name there would be forgeable by the same
+  #    retag as above.
+  matches "$code" "docker image inspect --format '\{\{\.Id\}\}' -- \"\\\$ref\"" || return 1
+  matches "$code" 'chown root:root "\$manifest_tmp"' || return 1
+  # …and installed with ONE rename, so a reset that lands mid-boot reads either
+  #    the previous complete list or the new complete list. A manifest appended
+  #    to in place would have a window in which the entries not yet written look
+  #    exactly like an image nobody baked — and get untagged.
+  matches "$code" 'mv -T -- "\$manifest_tmp" "\$manifest"' || return 1
+
+  # 6. A daemon that is not there only logs: it already fails the next job at its
+  #    first docker line, and refusing the marker on top of that turns a slot with
+  #    no dockerd into a slot that also fails every job for a reason it never
+  #    names. A tag that will NOT go is the opposite — that slot is poisoned, and
+  #    the clean marker is exactly the claim it must not get.
+  matches "$code" 'no docker socket at' || return 1
+  matches "$code" 'could not drop local image tag' || return 1
+}
+
 # The helper carries the trap it was written to avoid, so it is tested first.
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -603,6 +655,12 @@ else
   bad "a job can choose the container image every OTHER slot on this host runs — the baked archives are loaded into every slot's daemon at boot, so an archive a slot can write (or a checksum line it can borrow from a neighbouring filename) is arbitrary code in every job that lands here afterwards"
 fi
 
+if has_local_tag_prune "$SCRIPT"; then
+  ok
+else
+  bad "a job can leave an image name behind for the next, unrelated job on the same slot to run as if it had fetched it — the store survives the reset by design (#231) and nothing drops the tags no registry digest and no boot manifest vouches for (#233)"
+fi
+
 # --- mutation cases: prove the checks above can actually fail -----------------
 if has_slot_share "$SCRIPT"; then
   ok
@@ -614,7 +672,12 @@ mutate() { # <description> <sed-program> <predicate> — predicate must go false
   local desc="$1" prog="$2" pred="$3" tmp
   tmp=$(mktemp)
   sed "$prog" "$SCRIPT" >"$tmp"
-  if "$pred" "$tmp"; then
+  if cmp -s "$SCRIPT" "$tmp"; then
+    # The sed program matched nothing, so the predicate was handed the REAL file
+    # and passing proves nothing. Left undetected this reads as a live mutation
+    # for as long as the anchor stays stale.
+    bad "mutation did not apply (stale anchor): $desc"
+  elif "$pred" "$tmp"; then
     bad "mutation not detected: $desc"
   else
     ok
@@ -704,6 +767,15 @@ mutate "unchecked archives loaded again"     's|"\$nmatch" -ne 1|"$nmatch" -ge 0
 mutate "digest no longer verified"           's|sha256sum -c --status|cat|'                                         has_baked_image_load
 mutate "loads left to the cgroup killer"     's|wait \${IMAGE_LOAD_PIDS}|:|'                                        has_baked_image_load
 mutate "image store no longer reported"      's|io.containerd.snapshotter.v1|containerd|g'                          has_baked_image_load
+
+mutate "prune moved onto the starting job"   's|if \[ "\\$stage" != started \]; then|if [ "\\$stage" = started ]; then|' has_local_tag_prune
+mutate "digest-bearing images untagged too"  's|\[ "\\$ndig" = 0 \] \|\| continue|[ "\\$ndig" -ge 0 ] \|\| continue|'    has_local_tag_prune
+mutate "boot manifest no longer consulted"   's|grep -qxF -- "\\$id" "\\$baked"|grep -qxF -- "zzz" "\\$baked"|'          has_local_tag_prune
+mutate "manifest keyed by name, not id"      's|--format .{{[.]Id}}. -- "$ref"|--format NAME -- "$ref"|'         has_local_tag_prune
+mutate "manifest written in place"           's|mv -T -- "\$manifest_tmp" "\$manifest"|cp -- "$manifest_tmp" "$manifest"|'  has_local_tag_prune
+mutate "manifest left slot-writable"         's|chown root:root "\$manifest_tmp"|chown "$u":"$u" "$manifest_tmp"|'          has_local_tag_prune
+mutate "layers deleted with the tag"         's|docker rmi --no-prune -- "\\$t"|docker image prune -af|'                  has_local_tag_prune
+mutate "a stuck tag no longer fails the slot" 's|could not drop local image tag|dropped nothing for|'                     has_local_tag_prune
 
 mutate "App JWT back in curl argv"        's@-K <(printf.*\$jwt")@-H "Authorization: Bearer $jwt"@'          has_secrets_out_of_argv
 mutate "registration token back in curl argv" 's@-K <(printf.*\$tok")@-H "Authorization: Bearer $tok"@'          has_secrets_out_of_argv
