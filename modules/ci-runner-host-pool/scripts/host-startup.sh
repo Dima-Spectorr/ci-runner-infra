@@ -589,6 +589,81 @@ if [ "\$took" = 1 ]; then
   fi
 fi
 
+# THE IMAGE STORE, tags only.
+#
+# #231 moved the store to $SLOT_STATE/<idx>/docker precisely so every image the
+# host warmed SURVIVES a reset -- that is what keeps the reset cheap -- and #233
+# is the surface that leaves open. A job can 'docker tag' or 'docker build -t' a
+# name the next job on this slot then resolves LOCALLY: 'docker run <name>' never
+# contacts a registry when a local image by that name exists, and neither does a
+# 'FROM' in a later build. The next job runs the previous job's content under a
+# name it believes it fetched.
+#
+# Removing the store would be a cold start per job and would defeat the warm
+# layer, so what goes is narrower. A tag is KEPT when either is true:
+#
+#   the image carries a RepoDigest   it came from a registry, by digest. A job
+#                                    cannot forge one: 'docker tag' and
+#                                    'docker build' produce none, and only a
+#                                    pull or a push writes one.
+#   its id is in the boot manifest   $SLOT_STATE/<idx>/baked-images, written by
+#                                    record_baked_images() from what 'docker
+#                                    load' reported at boot. Root-owned, in the
+#                                    same root-owned directory as the clean
+#                                    marker, so a slot cannot add to it.
+#
+# Everything else is a name this host has no record of anyone fetching. A MISSING
+# manifest reads as an empty one -- a pool that bakes no images has no
+# /opt/ci-images and gets no file -- which is correct: with nothing baked, a
+# registry digest is the only thing that vouches for a tag.
+#
+# The NAME goes, not the content: 'docker rmi --no-prune' on one reference of a
+# multiply-referenced image untags it, and the layers stay in the store. A
+# rebuild is still warm, and the digest-bearing images are untouched.
+#
+# A daemon that is not there is not a failure here. It already fails the next job
+# at its first 'docker' line, and refusing the clean marker on top of that would
+# turn a slot with no dockerd into a slot that also fails every job for a reason
+# it does not name. A tag that will not go IS a failure: that slot is poisoned,
+# and the marker is exactly the claim it must not get.
+if [ "\$stage" != started ]; then
+  sock="/run/\$u/docker.sock"
+  baked="\$SLOT_STATE/\$idx/baked-images"
+  if [ -S "\$sock" ]; then
+    ids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+            docker image ls --all --quiet --no-trunc 2>/dev/null | sort -u)
+    if [ -n "\$ids" ]; then
+      # One inspect for the whole store rather than one per image: a slot that
+      # has run a few builds holds dozens, and this runs between every pair of
+      # jobs.
+      #
+      # word-splitting \$ids is the point -- one id per argument.
+      # shellcheck disable=SC2086
+      info=\$(timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+              docker image inspect \
+              --format '{{.Id}} {{len .RepoDigests}} {{range .RepoTags}}{{.}} {{end}}' \
+              \$ids 2>/dev/null)
+      while read -r id ndig tags; do
+        [ -n "\$id" ] || continue
+        [ "\$ndig" = 0 ] || continue
+        grep -qxF -- "\$id" "\$baked" 2>/dev/null && continue
+        for t in \$tags; do
+          case "\$t" in '' | '<none>:<none>') continue ;; esac
+          if timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+               docker rmi --no-prune -- "\$t" >/dev/null 2>&1; then
+            say "slot \$idx: dropped local image tag \$t -- no registry digest and not baked at boot"
+          else
+            say "slot \$idx: could not drop local image tag \$t"
+            rc=1
+          fi
+        done
+      done <<< "\$info"
+    fi
+  else
+    say "slot \$idx: no docker socket at \$sock -- no image tag was checked"
+  fi
+fi
+
 # Written LAST and only on success, into a directory no slot can write. It is
 # the assertion "this slot is in the state the template describes", and a reset
 # that half-failed has not earned it. Not written at 'started', because the slot
@@ -2397,6 +2472,39 @@ EOF
 # It is affordable only because nothing waits on it: slots register and take
 # jobs while these run in the background, and the first UI job to land before
 # its slot finished loading just pulls the image itself.
+# The identity of what boot put in this slot's image store, for #233.
+#
+# `docker load` is the only moment the host knows an image arrived from a source
+# the host chose. Everything after it -- every tag in that store -- is a name a
+# JOB may have created, and `docker run <name>` never contacts a registry when a
+# local image by that name exists. So the ids loaded here are recorded, and the
+# reset prunes any tag that is neither in this list nor carrying a registry
+# digest of its own.
+#
+# The ids and not the names. A job can `docker tag` a baked NAME onto its own
+# image, and a manifest of names would then bless exactly the substitution this
+# is here to catch. An id is the content.
+#
+# Never fatal. A manifest that cannot be written leaves the prune trusting
+# registry digests alone, which costs a re-pull of the baked images on the next
+# job and breaks nothing.
+record_baked_images() { # <idx> <slot user> <manifest path> <docker load output>
+  local idx="$1" u="$2" f="$3" out="$4" ref id
+  # Both forms docker prints: a tagged image gives `Loaded image: repo:tag`, an
+  # untagged one gives `Loaded image ID: sha256:...`.
+  printf '%s\n' "$out" |
+    sed -n -e 's/^Loaded image ID: //p' -e 's/^Loaded image: //p' |
+    while IFS= read -r ref; do
+      [ -n "$ref" ] || continue
+      id=$(sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
+             docker image inspect --format '{{.Id}}' -- "$ref" 2>/dev/null) || continue
+      [ -n "$id" ] || continue
+      printf '%s\n' "$id" >>"$f" ||
+        log "slot $idx: could not record $ref in the baked-image manifest"
+    done
+}
+
+
 load_baked_images() {
   local idx="$1" u; u=$(slot_user "$idx")
   local dir="/opt/ci-images"
@@ -2407,7 +2515,17 @@ load_baked_images() {
   [ -n "$archives" ] || return 0
 
   (
-    local a base
+    local a base manifest manifest_tmp
+    # Built beside its destination and moved into place ONCE, at the end. A warm
+    # reboot re-runs this while agents may already be executing jobs, and a
+    # manifest that is empty for the minutes a multi-gigabyte load takes is a
+    # manifest the reset would read as "nothing here was baked". Truncating in
+    # place would open exactly that window; a rename does not.
+    manifest="$SLOT_STATE/$idx/baked-images"
+    manifest_tmp="$manifest.$$"
+    : >"$manifest_tmp"
+    chown root:root "$manifest_tmp"
+    chmod 0644 "$manifest_tmp"
     printf '%s\n' "$archives" | while IFS= read -r a; do
       [ -n "$a" ] || continue
       base=$(basename "$a")
@@ -2462,9 +2580,17 @@ load_baked_images() {
       # is root: a GCE startup script runs as root, which is also why every
       # other write to this log in this file is spelled the same way. `sudo`
       # here drops privilege for the daemon socket, it does not raise it.
-      if timeout 1800 sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
-           docker load -i "$a" >>/var/log/ci-host.log 2>&1; then
+      #
+      # The output is CAPTURED rather than redirected, because it is the only
+      # place the identity of what was just loaded appears. `docker load` names
+      # each image it wrote (`Loaded image:` / `Loaded image ID:`), and that list
+      # is what the per-slot boot manifest is built from -- see #233 and the tag
+      # prune in slot-reset.sh. It still reaches the log, one line later.
+      if out=$(timeout 1800 sudo -u "$u" DOCKER_HOST="unix:///run/$u/docker.sock" \
+                 docker load -i "$a" 2>&1); then
+        printf '%s\n' "$out" >>/var/log/ci-host.log
         log "slot $idx: loaded baked image archive $base"
+        record_baked_images "$idx" "$u" "$manifest_tmp" "$out"
         # Whether loading it SAVED anything is a separate question from whether
         # it loaded. The runner pulls the job's `container:` image
         # unconditionally, and that pull only recognises these layers under the
@@ -2486,6 +2612,12 @@ load_baked_images() {
         log "slot $idx: could not load $base — jobs will pull that image themselves"
       fi
     done
+    # Even when every archive failed. An EMPTY manifest is the honest statement
+    # "this host baked nothing into this slot", and the prune treats it that way;
+    # leaving the PREVIOUS boot's manifest in place would keep blessing image ids
+    # this boot never loaded.
+    mv -T -- "$manifest_tmp" "$manifest" ||
+      log "slot $idx: could not install the baked-image manifest — the tag prune will trust registry digests only"
   ) &
   # Remembered so main() can wait for it. A GCE startup script runs under
   # google-startup-scripts.service, a Type=oneshot unit, and systemd's default
