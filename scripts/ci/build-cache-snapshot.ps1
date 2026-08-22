@@ -261,8 +261,12 @@ public static class CiJobObject
     private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length, out uint returned);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
 
+    private const int BasicAccountingInformation = 1;
     private const int ExtendedLimitInformation = 9;
     private const int LimitKillOnJobClose = 0x2000;
 
@@ -293,6 +297,19 @@ public static class CiJobObject
         public UIntPtr Affinity;
         public uint PriorityClass;
         public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BasicAccountingInformationStruct
+    {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -347,7 +364,37 @@ public static class CiJobObject
 
     public static void Kill(IntPtr job)
     {
-        TerminateJobObject(job, 1);
+        if (!TerminateJobObject(job, 1))
+        {
+            throw new InvalidOperationException("TerminateJobObject failed: " + Marshal.GetLastWin32Error());
+        }
+    }
+
+    // TerminateJobObject only REQUESTS termination: like TerminateProcess it
+    // returns before the members have finished dying, and a child's pending I/O
+    // can still land in the staged tree after it does. The job HANDLE is
+    // signalled by a time limit, not by emptiness, so the only thing that
+    // answers "is the tree quiet now" is the live member count.
+    public static uint ActiveProcesses(IntPtr job)
+    {
+        int length = Marshal.SizeOf(typeof(BasicAccountingInformationStruct));
+        IntPtr block = Marshal.AllocHGlobal(length);
+        try
+        {
+            uint returned;
+            if (!QueryInformationJobObject(job, BasicAccountingInformation, block, (uint)length, out returned))
+            {
+                throw new InvalidOperationException("QueryInformationJobObject failed: " + Marshal.GetLastWin32Error());
+            }
+
+            BasicAccountingInformationStruct info =
+                (BasicAccountingInformationStruct)Marshal.PtrToStructure(block, typeof(BasicAccountingInformationStruct));
+            return info.ActiveProcesses;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(block);
+        }
     }
 
     public static void Close(IntPtr job)
@@ -356,6 +403,37 @@ public static class CiJobObject
     }
 }
 '@
+}
+
+function Wait-JobObjectDrained {
+    <#
+      .SYNOPSIS
+        Block until the job object holds no live process, or give up loudly.
+      .DESCRIPTION
+        Kill() asks; this is what waits for the answer. Everything the caller does
+        next -- enumerating the tree, refusing a reparse point, packing the archive
+        -- is a statement about a tree nothing is still writing, and a member that
+        is still dying invalidates every one of them. Failing to drain is fatal
+        rather than logged: the alternative is publishing a snapshot that was
+        packed while a child was mid-write, which is indistinguishable from a good
+        one until a host unpacks it.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $Job,
+        [Parameter(Mandatory = $true)][int] $TimeoutSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $live = [CiJobObject]::ActiveProcesses($Job)
+        if ($live -eq 0) { return }
+        if ((Get-Date) -ge $deadline) {
+            throw ("the prepare command's job object still holds $live process(es) ${TimeoutSeconds}s after it was " +
+                'terminated -- something is wedged in kernel or filter-driver I/O, and a tree it may still be ' +
+                'writing is not packed')
+        }
+        Start-Sleep -Milliseconds 100
+    }
 }
 
 function Invoke-PrepareInJob {
@@ -395,7 +473,22 @@ function Invoke-PrepareInJob {
         # a second P/Invoke of CreateProcess itself, which would replace this
         # whole function; the window is microseconds of process startup, and the
         # digest pin on the archive is the detector for what it cannot bound.
-        [CiJobObject]::Assign($job, $proc.Handle)
+        try {
+            [CiJobObject]::Assign($job, $proc.Handle)
+        } catch {
+            # The command is RUNNING and outside the job: kill-on-close will not
+            # reach it, the deadline below would not bound it, and it would go on
+            # writing into a tree this script is about to delete. The managed
+            # Dispose() in the finally frees a handle, it does not end a process,
+            # so the kill has to be explicit and has to happen here.
+            try {
+                $proc.Kill()
+                $null = $proc.WaitForExit(30000)
+            } catch {
+                Write-BuildLog "could not kill the unassigned prepare command: $($_.Exception.Message)"
+            }
+            throw
+        }
 
         if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
             $timedOut = $true
@@ -408,6 +501,7 @@ function Invoke-PrepareInJob {
         # only once the .NET finalizer got round to the process handle, and "the
         # tree is quiet now" has to be true at the point the next line reads it.
         [CiJobObject]::Kill($job)
+        Wait-JobObjectDrained -Job $job -TimeoutSeconds 60
         [CiJobObject]::Close($job)
         if ($proc) { $proc.Dispose() }
     }
@@ -449,7 +543,14 @@ function Invoke-Main {
         throw "tar.exe is not at $tar -- there is nothing here to pack the snapshot with"
     }
 
-    $stage = Join-Path $env:RUNNER_TEMP ('cache-stage-' + [guid]::NewGuid().ToString('N'))
+    # RUNNER_TEMP on Actions; the system temp directory otherwise. A local run is
+    # explicitly allowed -- Test-SnapshotEventAllowed accepts an empty event name,
+    # and there is a test for it -- so a Join-Path that throws on the one variable
+    # only Actions sets would make that allowance a lie.
+    $tempRoot = $env:RUNNER_TEMP
+    if (-not $tempRoot) { $tempRoot = [System.IO.Path]::GetTempPath() }
+    $stage = Join-Path $tempRoot ('cache-stage-' + [guid]::NewGuid().ToString('N'))
+    $keepStage = $false
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     foreach ($d in $script:CacheDirs) {
         New-Item -ItemType Directory -Path (Join-Path $stage $d) -Force | Out-Null
@@ -478,9 +579,24 @@ function Invoke-Main {
         # every path. Everything below is a statement about a tree nothing is still
         # writing, and that ordering is the whole reason the reap is not deferred to
         # the end.
-        $entries = @(Get-ChildItem -LiteralPath $stage -Recurse -Force -ErrorAction Stop)
+        # The ROOT is first, and it is not decoration: Get-ChildItem returns the
+        # descendants of whatever $stage resolves to and never the starting item,
+        # so a prepare command that removes $stage and puts a junction in its place
+        # produces a tree that scans clean while `tar -C $stage` packs from
+        # somewhere else entirely. The host-side scan includes its root for the
+        # same reason.
+        $entries = @(Get-Item -LiteralPath $stage -Force -ErrorAction Stop) +
+            @(Get-ChildItem -LiteralPath $stage -Recurse -Force -ErrorAction Stop)
         $hostile = Get-StagedTreeRefusal -Entries $entries
-        if ($hostile) { throw "refusing to pack: $hostile" }
+        if ($hostile) {
+            # Left on disk deliberately. Windows PowerShell 5.1's `Remove-Item
+            # -Recurse` DESCENDS a directory junction, so deleting a tree that was
+            # just proved to contain one would delete the junction's target -- the
+            # workspace, a profile, whatever it points at -- as the cleanup for
+            # refusing it. The runner's own teardown reclaims the stage.
+            $keepStage = $true
+            throw "refusing to pack: $hostile"
+        }
 
         $files = @($entries | Where-Object { -not $_.PSIsContainer })
         Write-BuildLog "staged $($files.Count) file(s) across $($script:CacheDirs.Count) tool director(ies)"
@@ -501,7 +617,7 @@ function Invoke-Main {
         # exactly the top-level names in $script:CacheDirs and drops everything else,
         # so a path prefix here is a snapshot that arrives and hydrates nothing.
         Write-BuildLog "packing $out"
-        & $tar -czf $out -C $stage @script:CacheDirs
+        & $tar -czf $out -C $stage $script:CacheDirs
         if ($LASTEXITCODE -ne 0) {
             throw "tar exited $LASTEXITCODE; no archive was produced"
         }
@@ -514,7 +630,11 @@ function Invoke-Main {
         Write-BuildLog "archive $bytes byte(s), sha256 $digest"
         Write-BuildLog 'built. The publish job scans this archive and uploads it; this job holds no credential.'
     } finally {
-        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        if ($keepStage) {
+            Write-BuildLog "left $stage on disk: it contains a reparse point, and a recursive delete would follow it"
+        } else {
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 

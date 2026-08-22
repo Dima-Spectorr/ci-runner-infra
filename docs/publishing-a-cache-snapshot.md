@@ -269,6 +269,14 @@ the same reason (a junction names a path outside the tree that the per-slot copy
 would follow). Failing here means it is refused once, in a run someone is
 watching, rather than silently on every boot of every host in the pool.
 
+The scan includes the staging directory ITSELF, not only what is under it: a
+prepare command that deletes the stage and puts a junction in its place leaves a
+tree whose descendants all look ordinary while `tar -C` packs from wherever the
+junction points. And a stage that is refused is **left on disk** for the runner's
+own teardown to reclaim — Windows PowerShell 5.1's `Remove-Item -Recurse`
+descends a junction, so deleting a tree that was just proved to contain one would
+delete the junction's target as the cleanup for refusing it.
+
 ## The five rules the script enforces so you do not have to
 
 1. **Built from the default branch into an empty tree.** Never an archive of a

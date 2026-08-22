@@ -45,6 +45,13 @@
 
 set -uo pipefail
 
+# Every predicate below is invoked through its NAME, held in a variable, by
+# assert() and mutate() -- which is the whole design: the same predicate has to
+# run against the real file and against a mutated copy, and a caller that named
+# it directly could not do both. shellcheck's reachability pass sees no direct
+# call and reports the entire file as dead code.
+# shellcheck disable=SC2317
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/build-cache-snapshot.ps1"
 HOST_SCRIPT="$HERE/../../modules/ci-runner-host-pool/scripts/windows-host-startup.ps1"
@@ -115,7 +122,7 @@ has_no_publish_surface() { # <file>
 has_reap_before_read() { # <file>
   local run_line read_line
   run_line=$(grep -n '\$run = Invoke-PrepareInJob' "$1" | head -1 | cut -d: -f1)
-  read_line=$(grep -n '\$entries = @(Get-ChildItem -LiteralPath \$stage' "$1" | head -1 | cut -d: -f1)
+  read_line=$(grep -n '\$entries = @(Get-Item -LiteralPath \$stage' "$1" | head -1 | cut -d: -f1)
   [ -n "$run_line" ] && [ -n "$read_line" ] || return 1
   [ "$run_line" -lt "$read_line" ] || return 1
 }
@@ -126,7 +133,51 @@ has_hostile_scan_before_pack() { # <file>
   pack_line=$(grep -n '& \$tar -czf' "$1" | head -1 | cut -d: -f1)
   [ -n "$scan_line" ] && [ -n "$pack_line" ] || return 1
   [ "$scan_line" -lt "$pack_line" ] || return 1
-  code "$1" | grep -q 'if ($hostile) { throw' || return 1
+  code "$1" | grep -q 'if ($hostile) {' || return 1
+  code "$1" | grep -q 'throw "refusing to pack: $hostile"' || return 1
+}
+
+has_root_in_hostile_scan() { # <file>
+  # Get-ChildItem returns the descendants of whatever $stage RESOLVES to and
+  # never the starting item, so a prepare command that replaces $stage with a
+  # junction produces a tree that scans clean while tar packs from elsewhere.
+  # The root is the one entry the scan cannot afford to omit.
+  code "$1" | grep -q '@(Get-Item -LiteralPath $stage -Force' || return 1
+}
+
+has_hostile_stage_left_alone() { # <file>
+  # Windows PowerShell 5.1's Remove-Item -Recurse DESCENDS a directory junction.
+  # Deleting a tree that was just proved to contain one deletes the junction's
+  # TARGET -- as the cleanup for refusing it.
+  code "$1" | grep -q '$keepStage = $true' || return 1
+  code "$1" | grep -q 'if ($keepStage) {' || return 1
+}
+
+has_drain_after_kill() { # <file>
+  local kill_line drain_line read_line
+  kill_line=$(grep -n '\[CiJobObject\]::Kill(\$job)' "$1" | head -1 | cut -d: -f1)
+  drain_line=$(grep -n 'Wait-JobObjectDrained -Job \$job' "$1" | head -1 | cut -d: -f1)
+  read_line=$(grep -n '\$entries = @(Get-Item -LiteralPath \$stage' "$1" | head -1 | cut -d: -f1)
+  [ -n "$kill_line" ] && [ -n "$drain_line" ] && [ -n "$read_line" ] || return 1
+  # terminate, THEN wait for the members to actually go, THEN read the tree.
+  [ "$kill_line" -lt "$drain_line" ] || return 1
+  [ "$drain_line" -lt "$read_line" ] || return 1
+  # …and a job that will not drain fails the build rather than logging.
+  code "$1" | grep -q 'ActiveProcesses' || return 1
+}
+
+has_unassigned_child_killed() { # <file>
+  # AssignProcessToJobObject can fail with the command already running. Dispose()
+  # frees a handle; it does not end a process. Without an explicit kill the
+  # prepare command outlives both the deadline and the tree it is writing into.
+  code "$1" | grep -q '$proc.Kill()' || return 1
+}
+
+has_local_staging_root() { # <file>
+  # An empty GITHUB_EVENT_NAME is accepted as a local build, and tested as one.
+  # RUNNER_TEMP exists only on Actions, so a Join-Path against it alone would
+  # make that allowance a lie.
+  code "$1" | grep -q 'System.IO.Path\]::GetTempPath()' || return 1
 }
 
 has_empty_tree_refusal() { # <file>
@@ -139,7 +190,7 @@ has_archive_rooted_at_the_tool_names() { # <file>
   # -C the stage, then the names. Without -C the members carry a path prefix and
   # the host — which unpacks expecting exactly these top-level names — hydrates
   # nothing while every step reports success.
-  code "$1" | grep -q '& $tar -czf $out -C $stage @script:CacheDirs' || return 1
+  code "$1" | grep -q '& $tar -czf $out -C $stage $script:CacheDirs' || return 1
 }
 
 has_stage_cleanup() { # <file>
@@ -187,6 +238,11 @@ assert "the archive's members are the bare tool directories"       has_archive_r
 assert "the staging tree is removed on every path"                 has_stage_cleanup
 assert "the file is dot-sourceable with no side effects"           has_inert_dot_source
 assert "the tool list matches the host's, name for name and in order" has_matching_cache_dir_lists
+assert "the staging root itself is scanned, not only its descendants" has_root_in_hostile_scan
+assert "a tree with a reparse point is left, not recursively deleted"  has_hostile_stage_left_alone
+assert "the job is drained before the tree is read"                    has_drain_after_kill
+assert "a child that could not be assigned to the job is killed"       has_unassigned_child_killed
+assert "there is a staging root off Actions too"                       has_local_staging_root
 
 # --- mutations ---------------------------------------------------------------
 #
@@ -216,7 +272,7 @@ mutate "the event guard dropped" \
   has_event_guard
 
 mutate "the process assigned to no job object" \
-  's|^        \[CiJobObject\]::Assign($job, $proc.Handle)$|        $null = $job|' \
+  's|^ *\[CiJobObject\]::Assign($job, $proc.Handle)$|        $null = $job|' \
   has_job_object_reap
 
 mutate "the job closed without being terminated first" \
@@ -240,23 +296,43 @@ mutate "an upload added to the build job" \
   has_no_publish_surface
 
 mutate "the tree read before the job is reaped" \
-  's|^        $entries = @(Get-ChildItem -LiteralPath $stage.*$|        $entries = @()\n        $run = Invoke-PrepareInJob -Command x -TimeoutSeconds 1 -WorkingDirectory .|' \
+  's|^        $entries = @(Get-Item -LiteralPath $stage.*$|        $entries = @()\n        $run = Invoke-PrepareInJob -Command x -TimeoutSeconds 1 -WorkingDirectory .|' \
   has_reap_before_read
 
 mutate "the reparse-point verdict computed and ignored" \
-  's|^        if ($hostile) { throw.*$|        $null = $hostile|' \
+  's|^        if ($hostile) {$|        if ($false) {|' \
   has_hostile_scan_before_pack
+
+mutate "only the staged tree's descendants scanned" \
+  's|@(Get-Item -LiteralPath $stage -Force -ErrorAction Stop) +|@() +|' \
+  has_root_in_hostile_scan
+
+mutate "a hostile tree recursively deleted anyway" \
+  's|^            $keepStage = $true$|            $null = $stage|' \
+  has_hostile_stage_left_alone
+
+mutate "the job terminated but never drained" \
+  's|^        Wait-JobObjectDrained -Job $job -TimeoutSeconds 60$|        $null = $job|' \
+  has_drain_after_kill
+
+mutate "an unassignable child left running" \
+  's|^                $proc.Kill()$|                $null = $proc|' \
+  has_unassigned_child_killed
+
+mutate "no staging root off Actions" \
+  's|\[System.IO.Path\]::GetTempPath()|$env:RUNNER_TEMP|' \
+  has_local_staging_root
 
 mutate "an empty tree packed and published" \
   's|^        if ($files.Count -eq 0) {$|        if ($false) {|' \
   has_empty_tree_refusal
 
 mutate "the archive rooted at the staging path instead of the tool names" \
-  's|& $tar -czf $out -C $stage @script:CacheDirs|\& $tar -czf $out $stage|' \
+  's|& $tar -czf $out -C $stage $script:CacheDirs|\& $tar -czf $out $stage|' \
   has_archive_rooted_at_the_tool_names
 
 mutate "the staging tree left on disk" \
-  's|^        Remove-Item -LiteralPath $stage -Recurse -Force.*$|        $null = $stage|' \
+  's|^ *Remove-Item -LiteralPath $stage -Recurse -Force.*$|            $null = $stage|' \
   has_stage_cleanup
 
 mutate "the entry-point guard removed, so dot-sourcing runs main" \
