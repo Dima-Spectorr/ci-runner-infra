@@ -58,6 +58,12 @@ matches() { # <text> <ere>
   [ "${n:-0}" -gt 0 ]
 }
 
+counts() { # <text> <ere> <n>
+  local n
+  n=$(printf '%s' "$1" | grep -cE -- "$2")
+  [ "${n:-0}" -eq "$3" ]
+}
+
 # --- the invariants, as pure predicates over a script's text -----------------
 
 # --disableupdate must sit in config.sh's own argument list. The list is
@@ -498,6 +504,46 @@ has_local_tag_prune() { # <file>
   matches "$code" 'could not drop local image tag' || return 1
 }
 
+# A stack the anchor brought up with `docker compose up -d` does not stop when
+# the job that started it ends -- nothing in the runner's lifecycle reaches into
+# a detached rootless container. Before the port band that was untidy; with a
+# PERSISTENT band it is a correctness bug wearing two faces, both silent. The
+# ports stay bound, so the next run assigned this slot gets address-in-use in a
+# job that changed nothing; or the stack stays up and the next run CONNECTS to a
+# finished pull request's database -- passwordless, in the example the contract
+# documents.
+has_container_reclaim() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # 1. Every container, running or not, and by boundary rather than by TTL: the
+  #    resets that END a job are exactly the points at which no job of this slot
+  #    is running. A HELD slot is spared by the same gate that spares its image
+  #    tags, because the run's later jobs land here and reuse the stack.
+  matches "$code" 'docker ps --all --quiet --no-trunc' || return 1
+  matches "$code" 'docker rm --force --volumes -- \\\$cids' || return 1
+
+  # 2. BEFORE the tags. A running container holds a reference to its image and
+  #    the untag would fail on it.
+  local before after
+  before=$(printf '%s\n' "$code" | grep -n 'docker ps --all --quiet' | head -1 | cut -d: -f1)
+  after=$(printf '%s\n' "$code" | grep -n 'docker image ls --all --quiet' | head -1 | cut -d: -f1)
+  [ -n "$before" ] && [ -n "$after" ] && [ "$before" -lt "$after" ] || return 1
+
+  # 3. The volumes go with them, named ones included -- `docker compose` names
+  #    its volumes after the project, so a survivor is the previous pull
+  #    request's database handed to the next run under the same name. The older
+  #    spelling is tried before the missing flag is called a failure, or a host
+  #    on Docker 22 would refuse the marker for every job it ever runs.
+  matches "$code" 'docker volume prune --force --all' || return 1
+  matches "$code" 'docker volume prune --force >' || return 1
+  matches "$code" 'docker network prune --force' || return 1
+
+  # 4. Fail closed. A container this reset could not remove still holds the
+  #    band's ports, and the clean marker is exactly the claim it must not get.
+  matches "$code" 'could not remove the containers left behind' || return 1
+}
+
 # The helper carries the trap it was written to avoid, so it is tested first.
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -601,6 +647,17 @@ has_shared_infra_band() { # <file>
   # pair, so it survives #249 removing the broad per-veth accepts
   matches "$code" 'ctstate DNAT --ctorigdst "\$baddr"' || return 1
   matches "$code" 'ctorigdstport "\$bspan_min:\$bspan_max"' || return 1
+  # ...and scoped to TCP, like the DNAT it mirrors. `--ctorigdstport` carries no
+  # protocol of its own, so without this the accept was wider than the rule that
+  # produces the traffic it exists for.
+  matches "$code" 'FORWARD -p tcp -m conntrack --ctstate DNAT' || return 1
+  # The band is reserved out of the ephemeral range. It sits above 32768, so
+  # without this a host socket can be handed a band port and hold it, and the
+  # slot that publishes there fails to bind -- on a different port every boot.
+  # Merged with what is already reserved, never stamped over it.
+  matches "$code" 'sysctl -qw "net.ipv4.ip_local_reserved_ports=' || return 1
+  matches "$code" '\$\{reserved:\+\$reserved,\}\$want' || return 1
+  matches "$code" '< /proc/sys/net/ipv4/ip_local_reserved_ports' || return 1
   # and the slot is told its own band, or a job cannot know where to publish
   matches "$code" '^Environment=CI_SHARED_INFRA_ADDR=' || return 1
   matches "$code" '^Environment=CI_SHARED_INFRA_PORT_MIN=' || return 1
@@ -710,6 +767,12 @@ else
   bad "a job can leave an image name behind for the next, unrelated job on the same slot to run as if it had fetched it — the store survives the reset by design (#231) and nothing drops the tags no registry digest and no boot manifest vouches for (#233)"
 fi
 
+if has_container_reclaim "$SCRIPT"; then
+  ok
+else
+  bad "a stack the last run left detached keeps this slot's band ports bound and its database reachable — the next run assigned this slot either cannot start its own services or connects to a finished pull request's, and neither says so"
+fi
+
 if has_shared_infra_band "$SCRIPT"; then
   ok
 else
@@ -782,20 +845,96 @@ has_pin_hold() { # <file>
 
   # sudoers grants the three verbs and nothing else, and is validated before it
   # is installed
-  matches "$code" 'NOPASSWD: /opt/ci/job-hooks/pin-hold\.sh --run \*, /opt/ci/job-hooks/pin-hold\.sh renew, /opt/ci/job-hooks/pin-hold\.sh status' || return 1
+  matches "$code" 'NOPASSWD: /opt/ci/job-hooks/pin-hold\.sh --run \*, /opt/ci/job-hooks/pin-hold\.sh renew --run \*, /opt/ci/job-hooks/pin-hold\.sh status' || return 1
+  # …and the BARE verb is not in it. `renew` with no id renews whatever hold is
+  # on the host, so leaving it permitted hands every job on the box the ability
+  # to feed a stranger's hold — with the ownership check right there, unreached.
+  ! matches "$code" 'pin-hold\.sh renew,' || return 1
+  matches "$code" 'refusing: renew needs --run <id>' || return 1
   matches "$code" 'visudo -cqf "\$tmp"' || return 1
 
   # THE HOST RENEWS, NOT THE WORKFLOW. A consumer job running inside a
   # `container:` cannot reach /usr/local/bin/ci-pin-hold at all, and those are
   # the runs long enough for a TTL to matter — so the renewal is in the job hook
   # every job goes through, and it is never fatal.
-  matches "$code" 'sudo -n /opt/ci/job-hooks/pin-hold\.sh renew >/dev/null 2>&1 \|\| true' || return 1
+  matches "$code" "sudo -n /opt/ci/job-hooks/pin-hold.sh renew --run .\\\$\{GITHUB_RUN_ID:-\}." || return 1
+  # …on job-STARTED only. A renewal in the completed hook pushes the expiry a
+  # full TTL past the last job of the run, over a host nothing is using.
+  matches "$code" 'if \[ "\$stage" = started \]; then' || return 1
+  matches "$code" 'renewed on job-started only' || return 1
+  # …and it names the run, so a job of some OTHER run cannot feed this hold. It
+  # was every job renewing every hold: after the owner finished or was
+  # cancelled, an unrelated job on any slot pushed the expiry forward again and
+  # the stopped slot, the surviving stack and the removal veto never ended.
+  matches "$code" 'renew_run" != "\\\$R_RUN"' || return 1
+
+  # THE SWEEPER STOPS THE AGENT BEFORE IT TEARS ANYTHING DOWN, and fails closed
+  # if it cannot. The live branch's stop can miss -- the hold can expire before
+  # the slot ever goes idle -- and reaching teardown with the agent up deletes
+  # the containers, home and workspace of a job running right now.
+  matches "$code" 'agent stopped before teardown' || return 1
+  matches "$code" 'could not stop the agent — NOT tearing down' || return 1
+
+  # A FAILED ENUMERATION IS NOT AN EMPTY ONE. `docker ps` timing out left ids
+  # empty with the failure dropped, so removal was skipped, teardown was called
+  # a success, the hold was deleted and the agent came back over a live stack.
+  matches "$code" 'could not list the run.s containers' || return 1
+
+  # THE RECORD OUTLIVES A FAILED START. Removing it and then failing to start
+  # left no state to retry from and the slot stayed down for the life of the
+  # host, with the controller keeping that host at the floor rather than
+  # replacing it.
+  matches "$code" 'the agent would not start — the hold stays in place' || return 1
+
+  # IDLE NEEDS TWO WITNESSES. The clean marker is on disk from the completed
+  # hook until the NEXT job's started hook, so a tick in either window stopped
+  # the unit under a live job -- through the mechanism added to avoid that.
+  matches "$code" 'pgrep -u "\\\$u" -f .Runner\\.Worker.' || return 1
+
+  # A PREVIOUS-BOOT HOLD IS PUBLISHED AS RELEASED, not only logged. The instance
+  # answers the same host-* label across a reboot, so nothing else can tell the
+  # controller the promised stack is gone.
+  counts "$code" '^ *publish ""$' 3 || return 1
 
   # A HELD slot keeps its local image tags. The run's later jobs land on this
   # slot and reuse what the anchor built, and a compose-built image carries no
   # RepoDigest and was not baked at boot — precisely what the prune removes.
   matches "$code" 'held by a live run' || return 1
   matches "$code" 'if \[ "\\\$stage" != started \] && \[ "\\\$prune" = 1 \]' || return 1
+
+  # ADMISSION IS SERIALISED. Check-then-write was not exclusive: two anchors on
+  # two idle slots could both read "free", both write, and both be told
+  # pinned=1, with the second rename silently discarding the first reservation.
+  # The atomic rename was never the race. The sweeper takes the same lock, so
+  # "free" and "being released right now" stop looking identical.
+  matches "$code" 'flock -w 15 9' || return 1
+  matches "$code" 'take_lock "the hold" \|\| exit 1' || return 1
+  matches "$code" 'take_lock "the renewal" \|\| exit 1' || return 1
+  matches "$code" 'flock -w 10 9 \|\| \{ say "another caller holds the admission lock' || return 1
+
+  # AN EXPIRED RESERVATION IS NOT A FREE HOST. Between the expiry and the next
+  # 30-second tick the record still describes a stopped agent over a live stack,
+  # and overwriting it there is how a slot leaks: the old stack survives, the
+  # old agent stays down, and the new run reserves a different slot.
+  matches "$code" 'the sweeper has not released it' || return 1
+
+  # A REPEATED CLAIM BY THE SAME RUN may add a reservation and may do nothing
+  # else. The record is world-readable, so matching R_RUN is an identity claim
+  # and not proof of one; keeping the reserved slot and the later expiry leaves
+  # a co-tenant nothing to move and no way to shorten a hold.
+  matches "$code" 'slot_to_write=\\\$R_SLOT' || return 1
+  matches "$code" '\[ "\\\$R_EXPIRY" -gt "\\\$expiry_to_write" \] && expiry_to_write=\\\$R_EXPIRY' || return 1
+
+  # A FLAG THAT NEEDS A VALUE GETS ONE. `shift 2 || break` accepted `--ttl` with
+  # nothing after it and fell through to the default.
+  matches "$code" 'refusing: --ttl needs a value' || return 1
+  matches "$code" 'refusing: --run needs a value' || return 1
+
+  # THE BOOT ID IS PART OF THE PRUNE DECISION. On a warm reboot the runner unit
+  # runs this reset before the sweeper can call the old record orphaned, and an
+  # unexpired record from the PREVIOUS boot spared image tags for containers
+  # that did not survive the guest.
+  matches "$code" 'h_boot" = "\\\$\(cat /proc/sys/kernel/random/boot_id' || return 1
 
   # A DURATION, because that is what the contract publishes (`CI_PIN_TTL: 90m`)
   # and what a workflow author writes beside a timeout-minutes they already own.
@@ -824,7 +963,8 @@ has_pin_hold() { # <file>
   # and not the controller, which never opens a shell on a host that is healthy
   # and busy. Gated on the clean marker, which is what makes "idle" a fact
   # rather than a guess: a slot running a job has no marker.
-  matches "$code" '\[ "\\\$reserve" = 1 \] && \[ -f "\\\$marker" \] && systemctl is-active --quiet "ci-runner@\\\$slot\.service"' || return 1
+  matches "$code" '\[ "\\\$reserve" = 1 \] && \[ -f "\\\$marker" \] &&' || return 1
+  matches "$code" 'systemctl is-active --quiet "ci-runner@\\\$slot\.service"; then' || return 1
   matches "$code" 'systemctl stop "ci-runner@\\\$slot\.service"' || return 1
 
   # …and at expiry it tears the run's stack down, resets, and only THEN clears
@@ -834,7 +974,7 @@ has_pin_hold() { # <file>
   # slot that is missing.
   matches "$code" 'docker rm --force' || return 1
   matches "$code" '/opt/ci/job-hooks/slot-reset\.sh completed "\\\$slot"' || return 1
-  matches "$code" 'if \[ "\\\$rc" = 0 \]; then' || return 1
+  matches "$code" 'if \[ "\\\$rc" != 0 \]; then' || return 1
   matches "$code" 'rm -f -- "\\\$RECORD"' || return 1
   matches "$code" 'the agent stays DOWN' || return 1
   matches "$code" 'systemctl start "ci-runner@\\\$slot\.service"' || return 1
@@ -992,6 +1132,12 @@ mutate "manifest keyed by name, not id"      's|--format .{{[.]Id}}. -- "$ref"|-
 mutate "manifest written in place"           's|mv -T -- "\$manifest_tmp" "\$manifest"|cp -- "$manifest_tmp" "$manifest"|'  has_local_tag_prune
 mutate "manifest left slot-writable"         's|chown root:root "\$manifest_tmp"|chown "$u":"$u" "$manifest_tmp"|'          has_local_tag_prune
 mutate "layers deleted with the tag"         's|docker rmi --no-prune -- "\\$t"|docker image prune -af|'                  has_local_tag_prune
+mutate "the band's forward allow drops -p tcp"  's|FORWARD -p tcp -m conntrack|FORWARD -m conntrack|g'                       has_shared_infra_band
+mutate "the band is no longer reserved"        '/ip_local_reserved_ports=/d'                                                  has_shared_infra_band
+mutate "the reservation overwrites the list"   's|ports=[$][{]reserved:+[$]reserved,[}][$]want|ports=$want|'                  has_shared_infra_band
+mutate "containers left for the next run"    's|docker ps --all --quiet --no-trunc|docker ps --quiet --filter name=zzz|'      has_container_reclaim
+mutate "named volumes survive the reset"     's|docker volume prune --force --all|docker volume prune --force|'               has_container_reclaim
+mutate "a stuck container no longer fails"   's|could not remove the containers left behind|removed nothing behind|'          has_container_reclaim
 mutate "a stuck tag no longer fails the slot" 's|could not drop local image tag|dropped nothing for|'                     has_local_tag_prune
 
 mutate "App JWT back in curl argv"        's@-K <(printf.*\$jwt")@-H "Authorization: Bearer $jwt"@'          has_secrets_out_of_argv
@@ -1030,17 +1176,33 @@ mutate "the TTL clamp removed"              's@\[ "\\\$ttl" -le "\\\$PIN_MAX_TTL
 mutate "the record left slot-writable"      's@chmod 0755 "\$PIN_DIR"@chmod 0777 "$PIN_DIR"@'                              has_pin_hold
 mutate "the record written in place"        's@mv -f -- "\\\$tmp" "\\\$RECORD"@cp -f -- "\\\$tmp" "\\\$RECORD"@'           has_pin_hold
 mutate "an unparseable record swept away"   's@the hold record does not parse@unreadable, removing@'                       has_pin_hold
-mutate "sudoers widened to any verb"        's@pin-hold.sh --run \*, /opt/ci/job-hooks/pin-hold.sh renew, /opt/ci/job-hooks/pin-hold.sh status@pin-hold.sh *@' has_pin_hold
-mutate "the host stops renewing the hold"   's@sudo -n /opt/ci/job-hooks/pin-hold.sh renew >/dev/null 2>&1 || true@:@'     has_pin_hold
+mutate "sudoers widened to any verb"        's@pin-hold.sh --run \*, /opt/ci/job-hooks/pin-hold.sh renew --run \*, /opt/ci/job-hooks/pin-hold.sh status@pin-hold.sh *@' has_pin_hold
+mutate "the bare renew verb comes back"     's@pin-hold.sh renew --run \*@pin-hold.sh renew, /opt/ci/job-hooks/pin-hold.sh renew --run *@'      has_pin_hold
+mutate "renew accepts an empty run"         's@refusing: renew needs --run <id>@carry on then@'                                 has_pin_hold
+mutate "the host stops renewing the hold"   's@sudo -n /opt/ci/job-hooks/pin-hold.sh renew --run@: renew --run@'           has_pin_hold
+mutate "any run may renew any hold"         's@renew_run" != "\\\$R_RUN"@renew_run" = "" @'                                    has_pin_hold
+mutate "the completed hook renews too"      's@if \[ "\$stage" = started \]; then@if true; then@'                              has_pin_hold
+mutate "admission is not serialised"        's@take_lock "the hold" || exit 1@:@'                                             has_pin_hold
+mutate "the sweeper ignores the lock"       's@flock -w 10 9 ||@true ||@'                                              has_pin_hold
+mutate "an expired reservation is free"     's@the sweeper has not released it@go right ahead@'                               has_pin_hold
+mutate "a repeat claim moves the slot"      's@slot_to_write=\\\$R_SLOT@slot_to_write=\\\$idx@'                                has_pin_hold
+mutate "a repeat claim may shorten a hold"  's@\[ "\\\$R_EXPIRY" -gt "\\\$expiry_to_write" \] \&\& expiry_to_write=\\\$R_EXPIRY@:@' has_pin_hold
+mutate "--ttl accepts no value again"       's@refusing: --ttl needs a value@a default will do@'                               has_pin_hold
+mutate "the prune forgets the boot"         's@\[ "\\\$h_boot" = "\\\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" \]@true@' has_pin_hold
+mutate "teardown before the agent stops"    's@agent stopped before teardown@here we go@'                                     has_pin_hold
+mutate "a failed docker ps reads as empty"  's@could not list the run.s containers@nothing to see@'                           has_pin_hold
+mutate "the record dies with a failed start" 's@the agent would not start — the hold stays in place@the agent would not start@' has_pin_hold
+mutate "the marker alone proves idle"       's@! pgrep -u "\\\$u" -f .Runner\\.Worker. >/dev/null 2>&1 \&\&@@'                has_pin_hold
+mutate "an orphaned hold is only logged"    's@^  publish ""$@  true@'                                                        has_pin_hold
 mutate "a held slot pruned between jobs"    's@if \[ "\\\$stage" != started \] && \[ "\\\$prune" = 1 \]@if [ "\\\$stage" != started ]@' has_pin_hold
 mutate "the sweeper runs once at boot"      's@^OnUnitActiveSec=30$@@'                                                     has_pin_hold
 mutate "the sweep left to systemd to time"  's@^AccuracySec=5$@@'                                                          has_pin_hold
 mutate "the timer installed but not armed"  's@systemctl enable --now ci-pin-sweep.timer@systemctl enable ci-pin-sweep.timer@' has_pin_hold
-mutate "a busy slot stopped mid-job"        's@\[ -f "\\\$marker" \] && systemctl is-active@systemctl is-active@'          has_pin_hold
+mutate "a busy slot stopped mid-job"        's@&& \[ -f "\\\$marker" \] &&@\&\&@'                       has_pin_hold
 mutate "the held slot never taken out"      's|systemctl stop "ci-runner@\\\$slot.service"|true|'                          has_pin_hold
 mutate "the stack survives expiry"          's@docker rm --force@docker ps --filter@'                                      has_pin_hold
 mutate "no reset after the hold"            's@/opt/ci/job-hooks/slot-reset.sh completed "\\\$slot"@true@'                  has_pin_hold
-mutate "the hold cleared even on failure"   's@^if \[ "\\\$rc" = 0 \]; then$@if true; then@'                                has_pin_hold
+mutate "the hold cleared even on failure"   's@^if \[ "\\\$rc" != 0 \]; then$@if false; then@'                               has_pin_hold
 mutate "a failed teardown back in service"  's@the agent stays DOWN@the agent is restarted anyway@'                        has_pin_hold
 
 mutate "the TTL suffix silently ignored"    's@is not a duration@is close enough@'                                  has_pin_hold
