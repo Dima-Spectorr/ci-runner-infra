@@ -194,6 +194,81 @@ not masked in logs, and a credential that the install writes into the cache is a
 credential published to every host in the pool. The script scans for both, and
 that scan is a floor, not a guarantee.
 
+## A Windows pool
+
+A Windows pool publishes into the **same bucket, the same way, with the same
+publish job**. Only the build half changes, and it changes because it has to:
+
+```yaml
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read           # and nothing else — this job runs the install
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          repository: Dima-Spectorr/ci-runner-infra
+          ref: <commit sha of the pinned tag>   # >= v5.34.0
+          path: .ci-runner-infra
+
+      - name: Build the snapshot
+        shell: pwsh
+        env:
+          CACHE_PREPARE: npm ci --ignore-scripts
+          CACHE_ARCHIVE_OUT: ${{ runner.temp }}\snap.tar.gz
+        run: .\.ci-runner-infra\scripts\ci\build-cache-snapshot.ps1
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cache-snapshot
+          path: ${{ runner.temp }}\snap.tar.gz
+          retention-days: 1
+```
+
+The `publish` job above is **unchanged** — same `ubuntu-latest`, same
+`publish-cache-snapshot.sh`, same `CACHE_ARCHIVE_IN`. The credential scan, the
+size bounds, the write-once name and the pointer swap are not re-derived for
+Windows; the archive crossed a job boundary, so the publish job treats it as
+input and applies all four to it exactly as it does to a Linux one. There is one
+copy of those rules and it is on the side that already had them.
+
+**The key needs nothing new.** `host_os` is a property of a *pool* and pool names
+are unique, so a Windows pool is its own `cache/<pool>/` and cannot collide with a
+Linux pool's objects by construction. Set `CACHE_POOL` to the Windows pool's name
+and there is nothing further to arrange.
+
+**Why not just run the shell script under git-bash on `windows-latest`.** Two
+reasons, both controls rather than inconveniences:
+
+* the install is bounded by a **process group** (`set -m`, `kill -- -$pgid`, read
+  back from `/proc`). Windows has neither. The build script uses a **job object**
+  with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` instead, which is the only Windows
+  primitive with the property the process-group argument needs: a kernel-held set
+  a process cannot leave, whose children join it, terminated as a whole. The
+  timeout, the refusal to publish a half-populated cache, and `0` being rejected
+  rather than read as *no limit at all* are all identical to the Linux side.
+* the staging tree would be a **msys path** (`/tmp/...`). Native npm, NuGet and
+  Maven on Windows do not read one, so a prepare command pointed at it caches
+  somewhere else entirely and publishes an empty snapshot — the failure that
+  looks exactly like success. The build script stages under `RUNNER_TEMP` and
+  exports native paths, and refuses an empty tree rather than shipping it.
+
+**Do not give the Windows build job `id-token: write`.** The split is the same
+split and it is enforced the same way: the script refuses to start the install if
+it can see `ACTIONS_ID_TOKEN_REQUEST_URL`, `CACHE_POOL` or `CACHE_BUCKET`, so a
+merged job dies before any third-party code runs.
+
+One extra refusal exists on this side. A **reparse point** anywhere in the staged
+tree fails the build, because every host would refuse the snapshot on arrival for
+the same reason (a junction names a path outside the tree that the per-slot copy
+would follow). Failing here means it is refused once, in a run someone is
+watching, rather than silently on every boot of every host in the pool.
+
 ## The five rules the script enforces so you do not have to
 
 1. **Built from the default branch into an empty tree.** Never an archive of a

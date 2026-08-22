@@ -263,7 +263,7 @@ jobs:
           $cfg.Run.PassThru = $true
           $cfg.Output.Verbosity = 'Detailed'
           $r = Invoke-Pester -Configuration $cfg
-          $floor = 189
+          $floor = 216
           Write-Output "pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.TotalCount) discovered"
           if ($r.TotalCount -lt $floor) {
             throw "Pester discovered only $($r.TotalCount) test(s), fewer than the $floor this suite is known to contain — the suite did not run, whatever the exit code says"
@@ -367,6 +367,15 @@ jobs:
       # slot users can write — which fails just as silently and much worse.
       - name: dependency cache self-test
         run: bash scripts/ci/shared-cache.selftest.sh
+
+      # The Windows half of the same layer, and the same silence: a build phase
+      # that loses its bound, its reap or its two-job split still produces an
+      # archive, and the archive is what every host in the pool unpacks as
+      # SYSTEM. The Pester suite runs this script's pure functions; nothing but
+      # this file checks that they are CALLED, or that the reap happens before
+      # the tree is read.
+      - name: Windows snapshot build-phase self-test
+        run: bash scripts/ci/build-cache-snapshot.selftest.sh
 
       # Routing bug here = job code gets the HOST identity, which reads the
       # GitHub App key. Tested on every change, not only when the broker moves.
