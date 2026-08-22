@@ -68,6 +68,12 @@ host from its own environment, and every later job pins to it.
             echo "::notice::host predates the affinity contract — running unpinned"
             exit 0
           fi
+          # Hold the host against drain and recycle. `ci-pin-hold` is on PATH
+          # in every slot. The TTL is a deadline measured from NOW, not from the
+          # end of the run, so it must cover the whole run -- see "Sizing the
+          # TTL" below. A lapsed hold degrades to today's behaviour.
+          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL"
+
           printf 'runs-on=["self-hosted","linux","gcp","<Repo>","%s"]\n' \
             "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
           printf 'host=%s\n' "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
@@ -94,6 +100,19 @@ whole array so "unpinned" is a shorter array, not a blank element.
 with shared infrastructure should make its **infra owner job the anchor** (§3)
 rather than paying for a job that only echoes a variable.
 
+**If the host disappears, your run is cancelled — deliberately.** A pin names
+one machine, and a machine that is replaced comes back under a new name, so a
+job pinned to a host that no longer exists is not slow, it is unservable:
+nothing will ever carry that label again. Left alone it holds its concurrency
+group until GitHub times it out a day later. The controller instead fails the
+run within minutes of the host going away, with the reason in its log. **Re-run
+it** — the next anchor picks a live host, and there is nothing to clean up.
+
+This should be rare, because hosts are drained rather than yanked and the pin
+hold blocks the drain for the length of your run. A run of these means hosts are
+disappearing under live work — a recycle policy that is too aggressive, or
+preemption — and the series `ci_pinned_runs_cancelled` is where that shows up.
+
 ## 2. Consuming the anchor
 
 ```yaml
@@ -117,6 +136,12 @@ but one naming the anchor job's output.
 Exactly one job in the workflow brings the stack up, and it is the anchor.
 `RUNNER10` fails a second owner.
 
+**The owner job exits as soon as the stack is up, and it must.** A job's
+outputs do not reach `needs.<job>.outputs.*` until the job *completes*, so an
+owner that lingers is an owner whose consumers can never start. The slot it
+leaves behind is reserved host-side instead — see "Why the slot is held
+host-side" below.
+
 ```yaml
   anchor:
     name: Shared infra (anchor)
@@ -124,6 +149,8 @@ Exactly one job in the workflow brings the stack up, and it is the anchor.
     if: needs.lane.outputs.lane != 'none'
     # ci: shared-infra-owner    <- the marker RUNNER10 counts
     runs-on: [self-hosted, linux, gcp, '<Repo>']
+    # The bring-up, and nothing else. This job has to END for its outputs to
+    # reach the jobs that need them.
     timeout-minutes: 15
     outputs:
       runs-on: ${{ steps.up.outputs.runs-on }}
@@ -152,24 +179,75 @@ Exactly one job in the workflow brings the stack up, and it is the anchor.
           # for: it used to run in every job that needed a database.
           ./scripts/db-migrate.sh "postgres://ci@127.0.0.1:${pg}/app"
 
+          # Pin the host AND reserve this slot for the rest of the run. The
+          # slot part is what keeps the stack alive after this job ends; see
+          # below for why the job cannot do that by staying alive itself.
+          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL" --reserve-slot
+
           printf 'runs-on=["self-hosted","linux","gcp","<Repo>","%s"]\n' \
             "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
           echo "addr=${CI_SHARED_INFRA_ADDR}" >> "$GITHUB_OUTPUT"
           echo "pg=${pg}"                     >> "$GITHUB_OUTPUT"
 ```
 
-### Teardown is the host's job, not a workflow's
+### Why the slot is held host-side
 
-**Do not write a teardown job.** A consuming job runs as a different uid on a
-different slot; the owner's rootless daemon socket lives in a mode-0700
-`/run/ci-s<i>` it cannot open. A teardown step in the last consuming job cannot
-reach the stack it is trying to remove, and an `if: always()` step that silently
-fails is worse than none.
+There is a real problem here, and one tempting fix for it that does not work.
 
-The stack is reclaimed **host-side**, by the owner slot's own between-jobs
-cleanup and by a band TTL sweep — the same slot, the same uid, the only context
-that can talk to that daemon. A stack outliving its workflow run holds its band
-until the sweep, and no longer.
+**The problem.** A slot is released the instant its job ends, and the next job
+to land on it runs as the **same uid against the same rootless daemon** — free
+to list, `exec` into, mutate or stop a stack that other jobs are still using.
+The slot's between-jobs reset would destroy it outright, on purpose. Host
+affinity does not help: it pins a *host*, and this is a *slot* problem.
+
+**The fix that does not work.** The owner cannot reserve the slot by simply not
+finishing. A job's outputs are published to `needs.<job>.outputs.*` only when
+the job **completes**, and a dependent job does not start until everything in
+its `needs:` list has completed. An owner that stays running to guard the stack
+is an owner whose consumers are still queued, waiting for the endpoints it is
+holding — while it waits for them. Every adopting workflow would deadlock on its
+first run.
+
+**What actually happens.** The reservation is not a job at all, and it is not
+one mechanism either — it is a fast half and an exclusive half, because neither
+alone is buildable.
+
+`ci-pin-hold --reserve-slot` writes an unprivileged record into the slot's own
+state directory saying this slot belongs to this run. It needs no root: job code
+here runs fenced behind a sudoers allowlist of exactly two command lines, and
+widening that for PR-authored code to stop a systemd unit is not a trade this
+contract is willing to make.
+
+Two things then read that record. **`slot-reset.sh`**, which already runs as
+root before and after every job, keeps wiping the workspace, home and
+credentials exactly as it does today but leaves this slot's containers standing.
+**The controller**, on the per-host probe it already makes, stops the slot's
+agent so nothing further is scheduled onto that uid or that daemon.
+
+The stop is the controller's and not the hook's for a mechanical reason: the
+hook executes inside `ci-runner@<idx>.service`, so a hook that stopped its own
+unit would have systemd SIGTERM the agent that is still reporting the job's
+result — the reservation would work and the job would be lost. Between the
+owner's exit and the controller's next tick a job can still land on the slot; it
+gets a clean workspace and the stack survives, which is why the reset half has
+to exist rather than being an optimisation.
+
+The release is host-side too, by the sweeper described below. The cost is
+unchanged: one of `slots_per_host` is unavailable for the length of the run.
+
+**A reboot ends your run rather than resuming it.** Rootless containers do not
+survive the guest, and the slot's boot-time reset restores the agent before
+anything could stop it. The hold records the boot it was written under, so a
+stale one is released rather than honoured, and the run is failed promptly
+instead of waiting for a stack that no longer exists. Re-run it; the next anchor
+picks a live host.
+
+**Teardown belongs to the host, not to a workflow.** A consuming job is a
+different uid and cannot open a mode-0700 `/run/ci-s<i>`; an `if: always()`
+teardown step there fails silently, which is worse than none. When the hold is
+released — the controller sees the run finished, or the TTL lapses — the host
+tears the stack down as the slot's own user, runs the reset the hook skipped,
+and starts the agent again.
 
 ### What replaces `services:`
 
@@ -193,7 +271,40 @@ network namespace, so `127.0.0.1` is the wrong address there:
     timeout-minutes: 30
     env:
       DATABASE_URL: postgres://ci@${{ needs.anchor.outputs.addr }}:${{ needs.anchor.outputs.pg }}/app
+    steps:
+      # Renew first, before any work. Re-writing the hold moves its expiry, so
+      # the deadline tracks the last job to START rather than the anchor.
+      - run: ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL"
 ```
+
+### Sizing the TTL
+
+**The hold expires on wall-clock time from when it was written, and the release
+path tears the stack down when it lapses.** A run that outlives its hold loses
+its database mid-test -- the failure this contract exists to prevent, arriving
+through the door the contract opened. Two rules keep that from happening, and
+both are needed:
+
+**Every pinned consumer renews the hold as its first step.** Re-writing a hold
+for the same run id moves the expiry forward, so the TTL only ever has to cover
+*one job plus the gap before the next*, not the whole run. It is unprivileged
+and idempotent, so there is no reason for a pinned job not to do it.
+
+**The TTL must still exceed the longest single hop.** Renewal does not help
+across a hop nothing renews: a Windows consumer runs on a *different* host and
+cannot renew the Linux host's hold at all. So set the TTL from one number the
+workflow already owns -- the largest `timeout-minutes` among the jobs that may
+run between two renewals -- plus queueing headroom, and declare it once:
+
+```yaml
+env:
+  CI_PIN_TTL: 90m    # >= the longest job between renewals, plus queue time
+```
+
+A run whose long tail is entirely Windows renews nothing on the Linux host, and
+its TTL must cover that whole tail. If that number is uncomfortably large, the
+fix is a renewal hop -- a trivial pinned job between the Windows stages -- not a
+bigger ceiling: the ceiling is also how long an abandoned hold pins a host.
 
 **From the Windows host** — identical, which is the point:
 
@@ -239,6 +350,13 @@ Set by the boot script in every Linux slot's environment:
 | `CI_SHARED_INFRA_PORT_MIN` | first host port DNAT'd into this slot |
 | `CI_SHARED_INFRA_PORT_MAX` | last one; the band is 100 ports and disjoint per slot |
 
+And one command, on `PATH` in every slot:
+
+| command | meaning |
+|---|---|
+| `ci-pin-hold --run <id> --ttl <duration>` | write (or renew) this host's pin hold as a guest attribute; the controller reads it before acting on a drain, cordon or retire verdict, and vetoes the removal while the hold is live. The TTL runs from now — see "Sizing the TTL" |
+| `ci-pin-hold … --reserve-slot` | additionally reserve **this slot** for the run. Unprivileged — it writes a record. `slot-reset.sh` then spares this slot's containers while still wiping its workspace, and the controller stops the slot's agent so nothing else lands on its uid or its daemon. Released, torn down and restored host-side when the run ends or the TTL lapses |
+
 A host that does not set them is older than this contract. The anchor degrades
 to unpinned on a missing `CI_HOST_LABEL`; the owner job fails on a missing
 `CI_SHARED_INFRA_ADDR` (`:?` above) rather than defaulting to `127.0.0.1`, which
@@ -262,6 +380,14 @@ surprise.
   label, keeps the pinned job out of scale-out demand, and still counts its host
   as busy. Genuine scale-out demand still comes from anchors, which are
   unpinned.
+- **If the host disappears anyway, your run fails instead of hanging.** The pin
+  hold covers drain and recycle; it does not cover a crash or a manual delete,
+  and a MIG replacement comes back under a different name and therefore a
+  different label. A pinned job whose host no longer exists can never be
+  served — and because it is excluded from scale-out demand, nothing will even
+  try. The controller detects that case and fails the run within a bounded
+  window rather than leaving it to GitHub's 24-hour queue timeout. Re-run the
+  workflow: the next anchor picks a live host.
 
 ## 7. Adoption order
 
@@ -288,8 +414,22 @@ disable it.
 - **Do not use a PAT to read the runner list.** The anchor makes the API
   unnecessary; a fleet-wide token in a repository that runs pull-request code is
   a worse trade than any scheduling gain.
-- **Do not write a teardown job.** See §3 — it cannot reach the daemon it
-  targets.
+- **Do not tear the stack down from a consuming job.** See §3 — it cannot reach
+  the daemon it targets. The host does it.
+- **Do not keep the owner job running to guard the stack.** Its outputs are
+  unreadable until it finishes and its consumers cannot start, so it would wait
+  for them while they wait for it. The reservation is host-side precisely
+  because the workflow layer cannot express it.
+- **Do not expect the reservation to be instant.** For a tick after the owner
+  exits, another job may land on the reserved slot. It cannot corrupt your
+  workspace — the reset still runs — but it shares your daemon while it lasts.
+  A stack must not hold anything a concurrent pull request should not see; the
+  port band already says the same thing for the network side.
+- **Do not adopt this on a one-slot pool.** The owner would reserve the only
+  agent and its consumers, all pinned to that host, would never start. The
+  reservation refuses and fails the run rather than deadlocking, but the fix is
+  `slots_per_host >= 2` on the pool. Your consumers then get `slots_per_host - 1`
+  concurrent slots, not `slots_per_host`.
 - **Do not publish outside your slot's band.** It works in the job that does it
   and in no other job, which is the worst place for a failure to appear.
 - **Do not write `localhost` in a Windows fleet job.** See `RUNNER11`.
