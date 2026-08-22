@@ -323,6 +323,21 @@ stack survives it.
 One of `slots_per_host` is unavailable for the run either way; that is the price
 of the stack existing at all, and it is inside the budget rule 1 already sets.
 
+**Which makes `slots_per_host = 1` unadoptable, and the module permits it**
+(`variables.tf`: the validation is `>= 1`, and the Windows guidance is 1 for a
+pool whose jobs bind fixed ports). On a one-slot host the owner reserves the
+only agent, every consumer is pinned to that host, and nothing can run until the
+TTL sweep releases the slot — at which point it tears down the stack those
+consumers were queued for. A deadlock resolved by destroying its own subject.
+
+A Terraform validation cannot catch it: the pool does not know whether the
+repository has adopted the contract. So the check belongs to the only actor that
+knows both facts at once — `ci-pin-hold --reserve-slot` refuses on a host with
+one slot and fails the run there, in the anchor, with the pool's name and the
+reason. Adoption therefore requires `slots_per_host >= 2`, and consumer
+concurrency is `slots_per_host - 1`, which is the number the budget in §1 should
+be read against for an adopting repository.
+
 `services:` is the shape being replaced. A `services:` block is per-job by
 definition and there is no version of it that is shared, so a repository that
 has adopted this contract declares infrastructure in exactly one place. That is
@@ -357,8 +372,33 @@ address instead admits both while still declining anything not addressed to this
 host.
 
 The `FORWARD` chain already accepts `-o cis<idx>`, so nothing in the forwarding
-policy loosens. What is new is one PREROUTING entry per slot, bounded to 100
-ports, and nothing else on the host becomes reachable.
+policy loosens today. What is new is one PREROUTING entry per slot, bounded to
+100 ports, and nothing else on the host becomes reachable.
+
+**But "already accepts" is exactly what [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249)
+removes, and this path depends on it.** A sibling slot's packet to the host
+address is DNATed in `PREROUTING` and then traverses `FORWARD` from its own
+`cis<N>` to the owner's veth — the same forward that #249 exists to reject. The
+two changes therefore cannot be sequenced independently: closing the broad
+accepts first makes every same-host Linux consumer unable to reach the stack,
+and shipping the band first leaves #249 with a path it must not simply keep
+open.
+
+The band needs its own allow, scoped to what the DNAT actually produced rather
+than to an interface pair:
+
+```
+FORWARD -m conntrack --ctstate DNAT \
+        --ctorigdst <host primary address> \
+        --ctorigdstport 35000:35000+slots_per_host*100-1  -j ACCEPT
+FORWARD -m conntrack --ctstate ESTABLISHED,RELATED        -j ACCEPT
+```
+
+Original-destination matching is the point: it admits precisely the traffic that
+entered through a band DNAT and nothing that a slot addressed to a sibling's
+`10.99.<n>.2` directly. That rule is installed **before** #249's reject, and
+#249's own acceptance criterion becomes "a sibling reaches the band, and reaches
+nothing else" — which is stronger than what either change asserts alone.
 
 The slot learns its own band, its host label and the host's address the same way
 it learns its cache paths — environment, set by the boot script:
@@ -439,6 +479,29 @@ single packaging build, so both answers are defensible and neither is imposed:
 `RUNNER9` covers Linux jobs only. A repository that runs several Windows jobs
 chooses in its own workflow.
 
+### 3.4a A reboot ends the run; it must not quietly resume it
+
+A reservation that lives only in a stopped unit does not survive a restart.
+`ci-runner@<idx>` is `systemctl enable`d, so a rebooted host starts it again,
+and its `ExecStartPre=+slot-reset.sh boot <idx>` wipes the slot before the agent
+becomes schedulable. Nothing in that sequence knows a hold existed: the slot
+comes back schedulable, another pull request's job lands on the owner's uid and
+daemon, and the run that was pinned there is still waiting for a stack that a
+reboot destroyed anyway — rootless containers do not survive the guest.
+
+So the hold is a file, not a process state, and it records the boot it was
+written under. The `boot` path of the reset — which already runs before the
+agent can take work, and is therefore the right place — compares them. A hold
+from a previous boot is not honoured and not silently dropped either: the host
+performs the full reset, releases the slot, and marks the hold **orphaned** for
+the controller to read on the probe it already makes.
+
+That last step matters because §2.6 would otherwise miss this. §2.6 fires when
+no live host answers a pinned label, and after a reboot the label is answered
+again by the same instance. The orphan mark is what turns "the stack you were
+promised no longer exists" into a failed run in a bounded window instead of a
+pinned queue that drains at GitHub's 24-hour timeout.
+
 ### 3.5 Teardown is host-side, and so is the release
 
 A downstream job cannot do it: different uid, and the owner's daemon socket is
@@ -449,7 +512,24 @@ start, so it is long gone before the last of them finishes.
 
 The host owns both ends. Releasing the slot hold *is* the teardown: the sweeper
 brings the stack down as the slot's own user, runs the container reset that the
-hold had been sparing, and starts the agent again. It fires when the controller observes
+hold had been sparing, and starts the agent again.
+
+**And it needs a terminal branch, because those three steps can fail.** A daemon
+that will not stop, a compose project that will not come down, a reset that
+returns non-zero: each leaves the slot in a state with no good local move.
+Restarting the agent would hand the next job a live stack and an unreset tree.
+Leaving it stopped strands capacity past the TTL the contract advertises, and
+expiring the *host* pin does not recover it — ordinary drain holds the fleet at
+`min_hosts`, so the host stays, broken, with one slot fewer.
+
+So release fails closed to host replacement: the host marks itself unhealthy
+with the failing step named, the controller retires it — the `retire:` branch of
+`recycle_decision`, which replaces rather than drains and is therefore not
+bounded by `min_hosts` — and the MIG brings up a clean one. Bounded: one sweep
+interval to detect, one recycle to replace. Visible: the failure is a reason
+string on the same series as the holds, not a slot that silently stopped
+existing. A host that cannot clean a slot is a host, and hosts here are
+disposable; a slot is not. It fires when the controller observes
 the run finished — it already lists that run's jobs — or when the TTL lapses,
 whichever comes first. The TTL is the backstop that keeps a controller outage
 from stranding a slot, and a band sweep catches a stack whose hold record was
@@ -512,7 +592,9 @@ named port band on the host address precisely so that the sanctioned path is the
 one workflows are written against, and so that closing the accidental one later
 breaks nothing. **Filed as
 [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249); it lands
-before or with phase 3.**
+before or with phase 3, and §3.2's conntrack allow lands with it** — the two are
+one change in two files, because the band's same-host path runs through the
+forward that #249 closes.
 
 **The reservation is not instant, so a stack can briefly have a co-tenant.**
 Between the owner's exit and the controller's next tick, another pull request's
@@ -578,7 +660,7 @@ phase 5 changes any consuming repository's behaviour.
 |---|---|---|---|
 | 1 | This ADR and the published contract | `docs/` | — |
 | 2 | Affinity label at boot + `CI_HOST_LABEL`, both pools; **`collect_demand` recognises it (§2.5)**; **orphaned-pin detection (§2.6)** | `host-startup.sh`, `windows-host-startup.ps1`, `controller-startup.sh`, self-tests | any workflow using it |
-| 3 | Port band, per-slot DNAT, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper and its `--reserve-slot` record**, **`slot-reset.sh` sparing a held slot's containers** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), sweeper teardown + reset + agent start, TTL sweep; **[#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) first** | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** |
+| 3 | Port band, per-slot DNAT, **the conntrack band allow paired with [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) in one change**, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper and its `--reserve-slot` record** (refusing a one-slot host), **`slot-reset.sh` sparing a held slot's containers and releasing a hold from a previous boot as orphaned** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), sweeper teardown + reset + agent start with **fail-closed retire** when any of the three fails, TTL sweep | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** |
 | 4 | Ingress/egress band rules on the new `ci-shared-infra` tag, **applied to both pools**; pin hold read on the existing IAP-SSH probe and honoured by **both** `recycle_decision` and `drain_decision` (§2.4) | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `recycle-decision.sh`, `drain-decision.sh`, self-tests | any workflow using it |
 | 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) |
 | 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — |
@@ -614,7 +696,13 @@ disabled in every repository on the day after.
   slot's containers, and the controller stops that slot's agent — because a
   released slot is reused by the next job under the same uid and the same
   daemon. The hold itself is unprivileged; job code gains no new sudo rule.
-  Teardown and release are the same host-side act.
+  Teardown and release are the same host-side act, and a release that cannot
+  complete retires the host rather than restarting the agent over a stack it
+  failed to remove.
+- Adoption requires `slots_per_host >= 2` — a one-slot pool would reserve its
+  only agent — and consumer concurrency is `slots_per_host - 1`. A reboot
+  releases the hold as orphaned and fails the run, because the stack did not
+  survive it either.
 - The Windows pool gets no container runtime. This was reconsidered as part of
   this decision and re-affirmed: `adr-windows-pool.md` §4's reasoning is
   unchanged, and rule 3 is satisfied by reachability, not by a runtime. Windows

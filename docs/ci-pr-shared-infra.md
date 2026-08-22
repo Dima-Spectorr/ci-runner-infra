@@ -221,6 +221,13 @@ to exist rather than being an optimisation.
 The release is host-side too, by the sweeper described below. The cost is
 unchanged: one of `slots_per_host` is unavailable for the length of the run.
 
+**A reboot ends your run rather than resuming it.** Rootless containers do not
+survive the guest, and the slot's boot-time reset restores the agent before
+anything could stop it. The hold records the boot it was written under, so a
+stale one is released rather than honoured, and the run is failed promptly
+instead of waiting for a stack that no longer exists. Re-run it; the next anchor
+picks a live host.
+
 **Teardown belongs to the host, not to a workflow.** A consuming job is a
 different uid and cannot open a mode-0700 `/run/ci-s<i>`; an `if: always()`
 teardown step there fails silently, which is worse than none. When the hold is
@@ -371,6 +378,11 @@ disable it.
   workspace — the reset still runs — but it shares your daemon while it lasts.
   A stack must not hold anything a concurrent pull request should not see; the
   port band already says the same thing for the network side.
+- **Do not adopt this on a one-slot pool.** The owner would reserve the only
+  agent and its consumers, all pinned to that host, would never start. The
+  reservation refuses and fails the run rather than deadlocking, but the fix is
+  `slots_per_host >= 2` on the pool. Your consumers then get `slots_per_host - 1`
+  concurrent slots, not `slots_per_host`.
 - **Do not publish outside your slot's band.** It works in the job that does it
   and in no other job, which is the worst place for a failure to appear.
 - **Do not write `localhost` in a Windows fleet job.** See `RUNNER11`.
