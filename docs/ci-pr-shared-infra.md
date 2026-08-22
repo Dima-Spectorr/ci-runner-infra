@@ -68,10 +68,11 @@ host from its own environment, and every later job pins to it.
             echo "::notice::host predates the affinity contract — running unpinned"
             exit 0
           fi
-          # Hold the host against drain and recycle for the rest of this run.
-          # `ci-pin-hold` is on PATH in every slot; the expiry is a ceiling, not
-          # a promise, and a lapsed hold degrades to today's behaviour.
-          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl 90m
+          # Hold the host against drain and recycle. `ci-pin-hold` is on PATH
+          # in every slot. The TTL is a deadline measured from NOW, not from the
+          # end of the run, so it must cover the whole run -- see "Sizing the
+          # TTL" below. A lapsed hold degrades to today's behaviour.
+          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL"
 
           printf 'runs-on=["self-hosted","linux","gcp","<Repo>","%s"]\n' \
             "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
@@ -181,7 +182,7 @@ host-side" below.
           # Pin the host AND reserve this slot for the rest of the run. The
           # slot part is what keeps the stack alive after this job ends; see
           # below for why the job cannot do that by staying alive itself.
-          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl 90m --reserve-slot
+          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL" --reserve-slot
 
           printf 'runs-on=["self-hosted","linux","gcp","<Repo>","%s"]\n' \
             "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
@@ -270,7 +271,40 @@ network namespace, so `127.0.0.1` is the wrong address there:
     timeout-minutes: 30
     env:
       DATABASE_URL: postgres://ci@${{ needs.anchor.outputs.addr }}:${{ needs.anchor.outputs.pg }}/app
+    steps:
+      # Renew first, before any work. Re-writing the hold moves its expiry, so
+      # the deadline tracks the last job to START rather than the anchor.
+      - run: ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL"
 ```
+
+### Sizing the TTL
+
+**The hold expires on wall-clock time from when it was written, and the release
+path tears the stack down when it lapses.** A run that outlives its hold loses
+its database mid-test -- the failure this contract exists to prevent, arriving
+through the door the contract opened. Two rules keep that from happening, and
+both are needed:
+
+**Every pinned consumer renews the hold as its first step.** Re-writing a hold
+for the same run id moves the expiry forward, so the TTL only ever has to cover
+*one job plus the gap before the next*, not the whole run. It is unprivileged
+and idempotent, so there is no reason for a pinned job not to do it.
+
+**The TTL must still exceed the longest single hop.** Renewal does not help
+across a hop nothing renews: a Windows consumer runs on a *different* host and
+cannot renew the Linux host's hold at all. So set the TTL from one number the
+workflow already owns -- the largest `timeout-minutes` among the jobs that may
+run between two renewals -- plus queueing headroom, and declare it once:
+
+```yaml
+env:
+  CI_PIN_TTL: 90m    # >= the longest job between renewals, plus queue time
+```
+
+A run whose long tail is entirely Windows renews nothing on the Linux host, and
+its TTL must cover that whole tail. If that number is uncomfortably large, the
+fix is a renewal hop -- a trivial pinned job between the Windows stages -- not a
+bigger ceiling: the ceiling is also how long an abandoned hold pins a host.
 
 **From the Windows host** — identical, which is the point:
 
@@ -320,7 +354,7 @@ And one command, on `PATH` in every slot:
 
 | command | meaning |
 |---|---|
-| `ci-pin-hold --run <id> --ttl <duration>` | write this host's pin hold; the controller reads it on the IAP-SSH probe it already makes, and refuses to drain or cordon the host until the hold lapses |
+| `ci-pin-hold --run <id> --ttl <duration>` | write (or renew) this host's pin hold as a guest attribute; the controller reads it before acting on a drain, cordon or retire verdict, and vetoes the removal while the hold is live. The TTL runs from now — see "Sizing the TTL" |
 | `ci-pin-hold … --reserve-slot` | additionally reserve **this slot** for the run. Unprivileged — it writes a record. `slot-reset.sh` then spares this slot's containers while still wiping its workspace, and the controller stops the slot's agent so nothing else lands on its uid or its daemon. Released, torn down and restored host-side when the run ends or the TTL lapses |
 
 A host that does not set them is older than this contract. The anchor degrades

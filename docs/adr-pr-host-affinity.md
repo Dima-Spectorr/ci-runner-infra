@@ -115,8 +115,10 @@ What it must not do is rely on the path that already exists by accident — see
 
 The same fence decides **who may tear a stack down**: only the owning slot's uid
 can open its own daemon socket, so teardown cannot be a downstream job's
-`if: always()` step. The owner does it, which is one of the reasons §3.1 keeps
-the owner alive for the whole run.
+`if: always()` step — and it cannot be the owner's either, because the owner is
+a job, and a job that has ended cannot run a cleanup for the jobs that follow
+it. Teardown therefore belongs to the only actor that outlives every job on the
+host and can still enter a slot's uid: the host-side sweeper of §3.5.
 
 ---
 
@@ -208,10 +210,19 @@ idle agents, and a cordoned host stops answering its own affinity label while
 the run pinned to it still has jobs to place.
 
 So: a host carries a **pin hold** — a marker naming the workflow run and an
-expiry, written by the anchor job. **Both** `recycle_decision()` and
-`drain_decision()` take it as an input, and both treat an unexpired hold as
-not-removable. They stay pure functions of their arguments, which is how every
-other decision in this module is tested.
+expiry, written by the anchor job. The hold is a **veto on the verdict**, not an
+argument to it: `recycle_decision()` and `drain_decision()` keep their current
+signatures and stay pure functions of their arguments, and the controller,
+having reached a `cordon:`, `retire:` or `drain:` verdict for a host, reads that
+host's hold and downgrades the verdict to a no-op when the hold is live. Both
+paths are covered because both funnel through the same veto.
+
+Placing it after the verdict rather than inside it is what makes the cost
+bounded. A hold passed as an argument would have to be read for **every** host on
+**every** tick, since `recycle_decision()` is consulted for every host; read as a
+veto it is fetched only for a host the controller is about to remove, which is
+rare. That is the same shape as the existing `beacon_gate()`, which vetoes a
+delete rather than feeding the decision that produced it.
 
 The expiry is what makes the hold safe to write from job context: the worst a
 forged or abandoned hold can do is keep one host warm until it lapses, which is
@@ -221,11 +232,34 @@ the same cost as a slow job, and the orphan rules are unchanged above it.
 hold is a concrete pair: `ci-pin-hold --run <id> --ttl <duration>`, a bounded
 host helper on `PATH` in every slot, which the anchor invokes before it
 publishes the label — with `--reserve-slot` when it also owns shared
-infrastructure (§3.1); and a read on the IAP-SSH probe the controller *already*
-makes per host (`pgrep -fc Runner.Worker`, `controller-startup.sh:1579`), which
-costs no new round trip. The helper ships with the host in phase 3, the two
-readers in phase 4 — the delivery table says so, because a hold whose writer is
-nobody's phase is how this arrives half-built.
+infrastructure (§3.1); and a reader in the controller.
+
+**The helper publishes the hold as a guest attribute**, and the controller reads
+it with `gcloud compute instances get-guest-attributes` — the same channel and
+the same call `beacon_gate()` already uses (`controller-startup.sh:1388`). Three
+reasons it is that and not an SSH read. Guest attributes are writable by any
+process on the VM, job code included, so the helper needs no privilege the job
+does not already have — which is the whole premise of §3.4. The controller needs
+no shell on the host to answer a question about it. And the mechanism is already
+in the module, already gated, already tested.
+
+An earlier draft claimed the read was free because the controller already
+SSHes to each host. It is not: that probe (`pgrep -fc Runner.Worker`,
+`controller-startup.sh:1579`) lives **inside** `drain_host()`, which runs *after*
+the verdict and *after* the host's agents have been deregistered. It could not
+inform a decision that had already been made, and by the time it ran the host
+had already stopped answering its affinity label. The veto owns a real round
+trip — one per host being removed, per the paragraph above.
+
+The reader inherits `beacon_gate()`'s two defences verbatim, for the same
+reason: first occurrence of a key wins, because job code can append; and the
+expiry is **clamped to a configured maximum** on read, because job code can also
+write one ten years out. Seeing a malformed hold means keeping the host, not
+dropping the hold — a broken publisher must not read as consent to delete.
+
+The helper ships with the host in phase 3, the veto in phase 4 — the delivery
+table says so, because a hold whose writer is nobody's phase is how this arrives
+half-built.
 
 ### 2.6 A host that disappears must fail the run, not hang it
 
@@ -427,11 +461,11 @@ So rule 3 needs two narrow rules, not a posture change — and they are **not
 symmetrical**, because GCP's two directions do not offer the same controls:
 
 ```
-INGRESS  source_tags        = [ci-shared-infra]
-         target_tags        = [ci-shared-infra]
+INGRESS  source_tags        = [ci-shared-infra-<pool>]
+         target_tags        = [ci-shared-infra-<pool>]
          tcp: 35000 .. 35000 + slots_per_host*100 - 1
 
-EGRESS   target_tags        = [ci-shared-infra]        # the SOURCE VMs
+EGRESS   target_tags        = [ci-shared-infra-<pool>] # the SOURCE VMs
          destination_ranges = [the pool subnet's CIDR] # ranges only
          tcp: 35000 .. 35000 + slots_per_host*100 - 1
 ```
@@ -444,7 +478,18 @@ would have left the Windows host matching neither rule, so `deny-egress` at
 65534 would take every connection to the stack and rule 3 — the whole reason
 this section exists — would fail closed on the one case it was written for.
 
-So the band gets its own tag, `ci-shared-infra`, applied to both pools' hosts.
+So the band gets its own tag, applied to both pools' hosts — and the tag is
+**scoped to the repository's pool pair, not to the fleet**:
+`ci-shared-infra-<pool>`, derived from the same name the module already uses for
+its MIG. A literal `ci-shared-infra` would have been a fleet-wide tag, and
+network tags match across every VM in the VPC that carries them: two
+repositories whose pools share a network — which is the normal deployment, since
+the module takes the network as an input — would each match the other's ingress
+rule, and one repository's job could open a socket on another repository's
+database. The tag must name *these* hosts. The Linux and Windows pools of one
+repository deliberately share it, because rule 3 is precisely the statement that
+those two may reach each other's band.
+
 It **does not** reintroduce an inbound path to Windows: the tag appears as an
 ingress *source* and as an egress *target* (which selects the sending VM). No
 ingress rule anywhere targets a Windows host, and the Windows ADR's decision
@@ -661,8 +706,8 @@ phase 5 changes any consuming repository's behaviour.
 |---|---|---|---|
 | 1 | This ADR and the published contract | `docs/` | — |
 | 2 | Affinity label at boot + `CI_HOST_LABEL`, both pools; **`collect_demand` recognises it (§2.5)**; **orphaned-pin detection (§2.6)** | `host-startup.sh`, `windows-host-startup.ps1`, `controller-startup.sh`, self-tests | any workflow using it |
-| 3 | Port band, per-slot DNAT, **the conntrack band allow paired with [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) in one change**, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper and its `--reserve-slot` record** (refusing a one-slot host), **`slot-reset.sh` sparing a held slot's containers and releasing a hold from a previous boot as orphaned** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), sweeper teardown + reset + agent start with **fail-closed retire** when any of the three fails, TTL sweep | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** |
-| 4 | Ingress/egress band rules on the new `ci-shared-infra` tag, **applied to both pools**; pin hold read on the existing IAP-SSH probe and honoured by **both** `recycle_decision` and `drain_decision` (§2.4) | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `recycle-decision.sh`, `drain-decision.sh`, self-tests | any workflow using it |
+| 3 | Port band, per-slot DNAT, **the conntrack band allow paired with [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) in one change**, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper, publishing the hold as a guest attribute, and its `--reserve-slot` record** (refusing a one-slot host), **`slot-reset.sh` sparing a held slot's containers and releasing a hold from a previous boot as orphaned** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), sweeper teardown + reset + agent start with **fail-closed retire** when any of the three fails, TTL sweep | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** |
+| 4 | Ingress/egress band rules on the new per-pool `ci-shared-infra-<pool>` tag, **applied to both of the repository's pools**; pin-hold veto read from guest attributes and applied to the `cordon:`/`retire:`/`drain:` verdicts of **both** `recycle_decision` and `drain_decision` (§2.4) | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `controller-startup.sh`, self-tests | any workflow using it |
 | 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) |
 | 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — |
 | 7 | Per-repository adoption, workflow consolidation first | consuming repositories, one pull request each | — |
@@ -685,7 +730,8 @@ disabled in every repository on the day after.
   that degrades to today's behaviour.
 - The controller will not drain **or cordon-for-recycle** a host holding an
   unexpired pin hold. The hold has a named writer (`ci-pin-hold`, invoked by the
-  anchor) and a named reader (the IAP-SSH probe the controller already makes).
+  anchor and renewed by each pinned consumer) and a named reader (a guest-
+  attribute read on the removal path, one round trip per host being removed).
 - `collect_demand` must recognise the affinity label before the label ships, and
   a pinned job whose host no longer exists fails its run within a bounded window
   instead of queueing for a day.
@@ -708,8 +754,9 @@ disabled in every repository on the day after.
   this decision and re-affirmed: `adr-windows-pool.md` §4's reasoning is
   unchanged, and rule 3 is satisfied by reachability, not by a runtime. Windows
   jobs are not pinned.
-- The firewall gains two narrow rules for the band on a **new `ci-shared-infra`
-  tag carried by both pools** — ingress scoped by tag, egress scoped by the pool
+- The firewall gains two narrow rules for the band on a **new
+  `ci-shared-infra-<pool>` tag carried by both of a repository's pools and by no
+  other repository's** — ingress scoped by tag, egress scoped by the pool
   subnet's range because GCP egress cannot scope by tag — and no widening of
   `database_egress_ports`. Windows gains no inbound path; the tag is only ever
   an ingress source or an egress target.
