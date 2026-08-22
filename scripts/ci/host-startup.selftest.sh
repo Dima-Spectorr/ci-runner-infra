@@ -500,6 +500,34 @@ has_secrets_out_of_argv() { # <file>
   matches "$code" '^  harden_proc$'
 }
 
+# A slot must be TOLD what fraction of the host it is. `nproc` inside a slot
+# reports the whole machine — slots are separated by user, network namespace and
+# dockerd, and deliberately not by CPU — so a workflow that sizes its worker
+# pool from `nproc` sizes it for a host it shares with K-1 siblings. Measured on
+# the IntegrateIT pool 2026-08-22: 4 slots on 16 vCPU, each test job budgeting
+# for 16, roughly 3x oversubscribed. Nothing errors. The job just runs slowly
+# and its per-test timeouts start expiring, which reads as a flaky suite and
+# gets "fixed" by a re-run — so the variables are pinned here.
+has_slot_share() { # <file>
+  local code
+  code=$(code_of "$1")
+  # the share is DERIVED from the host and the slot count, not a literal
+  matches "$code" 'Environment=CI_SLOT_VCPUS=\$\(\( cpus / SLOTS' || return 1
+  matches "$code" 'Environment=CI_SLOT_MEM_MB=' || return 1
+  # and the host's own totals, so a job that wants to reason about the machine
+  # can, without guessing which of the two `nproc` means
+  matches "$code" 'Environment=CI_HOST_VCPUS=' || return 1
+  matches "$code" 'Environment=CI_HOST_SLOTS=' || return 1
+  # never zero: integer division on a host with fewer vCPU than slots would
+  # otherwise hand a job a worker budget of 0
+  matches "$code" 'cpus / SLOTS > 0 \? cpus / SLOTS : 1' || return 1
+  # computed unconditionally — unlike CACHE_ENV, which is empty for an unseeded
+  # slot. A slot always has a share.
+  matches "$code" 'local SHARE_ENV; SHARE_ENV=\$\(share_env\)' || return 1
+  # and actually reaching the unit, which is the only part the job can observe
+  matches "$code" '^\$SHARE_ENV$'
+}
+
 # --- the real script must satisfy both ---------------------------------------
 if has_disableupdate "$SCRIPT"; then
   ok
@@ -576,6 +604,12 @@ else
 fi
 
 # --- mutation cases: prove the checks above can actually fail -----------------
+if has_slot_share "$SCRIPT"; then
+  ok
+else
+  bad "a slot does not publish its share of the host, so a job sizing itself from nproc sizes for the whole machine and oversubscribes it K-fold - slow jobs and expiring per-test timeouts that a re-run appears to fix"
+fi
+
 mutate() { # <description> <sed-program> <predicate> — predicate must go false
   local desc="$1" prog="$2" pred="$3" tmp
   tmp=$(mktemp)
@@ -680,6 +714,14 @@ mutate "silent env drop no longer fatal"   '/sudo will not pass an environment v
 mutate "only one slot unit hides /proc"    '0,/^ProtectProc=invisible/s@^ProtectProc=invisible@#&@'               has_secrets_out_of_argv
 mutate "hidepid weakened to 1"             's@hidepid=2@hidepid=1@'                                               has_secrets_out_of_argv
 mutate "host /proc left readable"          '/^  harden_proc$/d'                                                   has_secrets_out_of_argv
+
+mutate "share never computed"        's@^  local SHARE_ENV; SHARE_ENV=\$(share_env)$@@'          has_slot_share
+mutate "share never reaches the unit" 's@^\$SHARE_ENV$@@'                                        has_slot_share
+mutate "slot handed the whole host"   's@cpus / SLOTS > 0 ? cpus / SLOTS : 1@cpus@'               has_slot_share
+mutate "share hardcoded"              's@Environment=CI_SLOT_VCPUS=\$(( cpus / SLOTS@Environment=CI_SLOT_VCPUS=$(( 16 / SLOTS@' has_slot_share
+mutate "memory share dropped"         '/^Environment=CI_SLOT_MEM_MB=/d'                           has_slot_share
+mutate "host totals dropped"          '/^Environment=CI_HOST_VCPUS=/d'                            has_slot_share
+mutate "slot count dropped"           '/^Environment=CI_HOST_SLOTS=/d'                            has_slot_share
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
