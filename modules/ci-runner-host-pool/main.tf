@@ -233,14 +233,8 @@ resource "google_compute_instance_template" "host" {
   # made it invalid — on a Linux host, which gains two — with no plan-time
   # signal. The apply reached the API and failed there, on a change whose plan
   # said "one instance template". Deduplicated, because GCP counts the set and
-  # `concat` does not.
-  lifecycle {
-    precondition {
-      condition     = length(local.host_network_tags) <= 64
-      error_message = "pool '${var.name}' would carry ${length(local.host_network_tags)} distinct network tags and GCP allows 64. The two built-in tags plus var.network_tags${var.shared_infra_id == "" ? "" : " plus the ${var.host_os == "linux" ? "two" : "one"} shared_infra_id tag(s)"} exceed the limit; drop entries from var.network_tags. Left to the apply this fails at the API, after the plan looked clean."
-    }
-  }
-
+  # `concat` does not. The check itself lives in the resource's one `lifecycle`
+  # block further down -- Terraform allows exactly one per resource.
   disk {
     source_image = var.image
     auto_delete  = true
@@ -334,6 +328,11 @@ resource "google_compute_instance_template" "host" {
 
   lifecycle {
     create_before_destroy = true
+
+    precondition {
+      condition     = length(local.host_network_tags) <= 64
+      error_message = "pool '${var.name}' would carry ${length(local.host_network_tags)} distinct network tags and GCP allows 64. The two built-in tags plus var.network_tags${var.shared_infra_id == "" ? "" : " plus the ${var.host_os == "linux" ? "two" : "one"} shared_infra_id tag(s)"} exceed the limit; drop entries from var.network_tags. Left to the apply this fails at the API, after the plan looked clean."
+    }
 
     # The three identities must be three DIFFERENT accounts. Each variable's own
     # `validation` block can only see itself (cross-variable validation needs

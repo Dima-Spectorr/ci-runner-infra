@@ -238,6 +238,7 @@ else
   bad "the source and stack tags no longer sit in separate namespaces -- a pair key can spell the other role's tag, joining two repositories' bands with no error anywhere"
 fi
 
+# shellcheck disable=SC2016  # the Terraform interpolations are the literals under test
 if grep -qF -- '-allow-si-in-${each.key}' "$NET_TF" && grep -qF -- '-allow-si-eg-${each.key}' "$NET_TF"; then
   ok "the ingress and egress rule names cannot collide"
 else
@@ -322,9 +323,11 @@ mutate "egress left un-keyed"                net  '/shared_infra_egress/,$ s/for
 # the point.
 # shellcheck disable=SC2016
 mutate "the source tag namespace contains the stack one" net 's/ci-shared-infra-src-\${k}/ci-shared-infra-${k}/'
+# shellcheck disable=SC2016  # the Terraform interpolations are the literals under test
 mutate "the ingress rule name loses its direction"       net 's/-allow-si-in-\${each\.key}/-allow-si-${each.key}/'
 mutate "the span's lower endpoint moved a slot up" net 's/^        local\.shared_infra_band_base + local\.shared_infra_band_width,$/        local.shared_infra_band_base + 2 * local.shared_infra_band_width,/'
 mutate "the span's upper endpoint lost a port"    net 's/local\.shared_infra_band_width - 1,$/local.shared_infra_band_width - 2,/'
+# shellcheck disable=SC2016  # the Terraform interpolations are the literals under test
 mutate "source tag no longer built from key" net  's/source_tag = "ci-shared-infra-src-\${k}"/source_tag = "ci-shared-infra-src"/'
 # shellcheck disable=SC2016
 mutate "stack tag no longer built from key"  net  's/stack_tag  = "ci-shared-infra-stack-\${k}"/stack_tag  = "ci-shared-infra-stack"/'
