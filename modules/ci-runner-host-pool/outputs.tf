@@ -112,6 +112,13 @@ output "metric_names" {
       # is working and the hosts are not leaving — jobs that never end.
       "ci_recycle_verdicts",
       "ci_poller_heartbeat",
+      # Pools the controller's own table refused at boot. A rejected pool has no
+      # series of its own — it is simply never ticked — so there is nothing to
+      # go absent and nothing to alert on except this. Its autoscaler is
+      # ONLY_UP, which means it holds whatever size it last reached, forever,
+      # while every other pool on the same controller reads healthy. Alert on
+      # any non-zero value.
+      "ci_pool_table_rejected",
       # Non-zero means scale-in is SUSPENDED — the controller cannot read the
       # runner list, so no host can be proven idle. Alert on a sustained run
       # (> 3 ticks), never on a single blip: one blind tick is normal API noise.

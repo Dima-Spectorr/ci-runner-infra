@@ -64,55 +64,191 @@ REPO=$(md "instance/attributes/ci-github-repo")
 APP_ID=$(md "instance/attributes/ci-app-id")
 INSTALL_ID=$(md "instance/attributes/ci-app-installation-id")
 KEY_SECRET=$(md "instance/attributes/ci-app-key-secret")
-POOL=$(md "instance/attributes/ci-pool")
-MIG=$(md "instance/attributes/ci-mig-name")
-REGION=$(md "instance/attributes/ci-region")
-SLOTS=$(md "instance/attributes/ci-slots")
-MIN_HOSTS=$(md "instance/attributes/ci-min-hosts")
-MAX_HOSTS=$(md "instance/attributes/ci-max-hosts")
-GRACE=$(md "instance/attributes/ci-drain-grace-seconds")
 POLL=$(md "instance/attributes/ci-poll-seconds")
 METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
-RUNNER_LABELS=$(md "instance/attributes/ci-runner-labels")
-REGISTER_GRACE=$(md "instance/attributes/ci-register-grace-seconds")
-ORPHAN_CONFIRM_TICKS=$(md "instance/attributes/ci-orphan-confirm-ticks")
-RECYCLE_MAX_UNAVAILABLE=$(md "instance/attributes/ci-recycle-max-unavailable")
-MINT_REG=$(md "instance/attributes/ci-mint-registration-token")
 
-SLOTS=${SLOTS:-1}
-MIN_HOSTS=${MIN_HOSTS:-0}
-MAX_HOSTS=${MAX_HOSTS:-0}
-GRACE=${GRACE:-900}
-# How long a host may read reg=absent before it counts as a failed boot rather
-# than a booting one. A golden-image host registers in well under two minutes;
-# 600s leaves room for a slow image pull or an API retry without letting a truly
-# dead host bill all night.
-REGISTER_GRACE=${REGISTER_GRACE:-600}
-# Consecutive ticks an offline agent must have NO instance behind it before its
-# registration is deleted. 3 ticks (~1 min at the default poll) is far longer
-# than a transient gcloud failure and far shorter than the hours a dead
-# registration otherwise occupies the repo's runner list.
-ORPHAN_CONFIRM_TICKS=${ORPHAN_CONFIRM_TICKS:-3}
+# --- the pool table ----------------------------------------------------------
+#
+# ONE controller, N pools. Everything that describes A pool — its MIG, its
+# labels, its graces, whether it mints registration tokens — is per-pool state
+# from here on, and pool_select() writes it into the globals the rest of this
+# file already reads. That is deliberate and it is the whole design: every
+# function that acts on a pool is UNCHANGED, and the tick loop selects a pool
+# before calling them.
+#
+# THE LEGACY SHAPE IS SYNTHESISED, NOT SERVED BY A SECOND PATH. A controller
+# rendered before `ci-pools` existed carries the old one-key-per-field metadata
+# and no table; it becomes a one-row table here and takes the same code path.
+# So there is no second implementation to keep in step, and no consumer has to
+# move Terraform state to keep the controller it already has running.
+POOLS_JSON=$(md "instance/attributes/ci-pools")
+if [ -z "${POOLS_JSON:-}" ]; then
+  # `nz` and not jq's `//`: an ABSENT metadata attribute reads as the empty
+  # string, and in jq an empty string is truthy — `"" // 900` is `""`, not 900.
+  # Every default in pool_table_parse() would be bypassed by the very thing it
+  # exists to default, and the row would then be rejected as non-numeric.
+  #
+  # One behaviour change is deliberate and bounded: a controller so old that it
+  # has no `ci-host-os` at all used to resolve to `unknown`, which shut the
+  # drain gate's OS-inference fallback. It now defaults to `linux`. Every such
+  # controller IS Linux — the key landed in the same change as Windows support —
+  # so the inference it re-enables can only reach the answer it would have been
+  # given explicitly.
+  POOLS_JSON=$(jq -n \
+    --arg name "$(md "instance/attributes/ci-pool")" \
+    --arg mig "$(md "instance/attributes/ci-mig-name")" \
+    --arg region "$(md "instance/attributes/ci-region")" \
+    --arg slots "$(md "instance/attributes/ci-slots")" \
+    --arg minh "$(md "instance/attributes/ci-min-hosts")" \
+    --arg maxh "$(md "instance/attributes/ci-max-hosts")" \
+    --arg grace "$(md "instance/attributes/ci-drain-grace-seconds")" \
+    --arg reggrace "$(md "instance/attributes/ci-register-grace-seconds")" \
+    --arg ticks "$(md "instance/attributes/ci-orphan-confirm-ticks")" \
+    --arg recycle "$(md "instance/attributes/ci-recycle-max-unavailable")" \
+    --arg hostos "$(md "instance/attributes/ci-host-os")" \
+    --arg mint "$(md "instance/attributes/ci-mint-registration-token")" \
+    --arg beacon "$(md "instance/attributes/ci-beacon-interval")" \
+    --arg pin "$(md "instance/attributes/ci-pin-orphan-grace-seconds")" \
+    --arg labels "$(md "instance/attributes/ci-runner-labels")" \
+    'def nz: if . == "" then null else . end;
+     [ { name: $name, mig: $mig, region: $region,
+         slots: ($slots | nz), min_hosts: ($minh | nz), max_hosts: ($maxh | nz),
+         drain_grace_seconds: ($grace | nz),
+         register_grace_seconds: ($reggrace | nz),
+         orphan_confirm_ticks: ($ticks | nz),
+         recycle_max_unavailable: ($recycle | nz),
+         host_os: ($hostos | nz),
+         mints_registration_token: ($mint | nz),
+         beacon_interval: ($beacon | nz),
+         pin_orphan_grace_seconds: ($pin | nz),
+         runner_labels: $labels } ]')
+fi
 
-# How long a job pinned to a host this pool cannot see may wait before the run
-# is failed. Read from metadata like everything else, but NO pool sets the key
-# today and none has to: an absent attribute reads empty and takes the default,
-# so this adds no Terraform surface and changes no plan. The default is
-# deliberately long relative to a boot — the cost of waiting one extra tick is a
-# tick, and the cost of being wrong is a cancelled build.
-PIN_ORPHAN_GRACE=$(md "instance/attributes/ci-pin-orphan-grace-seconds")
-PIN_ORPHAN_GRACE=${PIN_ORPHAN_GRACE:-900}
-# Hosts that may be mid-recycle at once. The default is 0 — OFF — and that is
-# not timidity, it is the only correct default for a controller that may be
-# running against a template it did not expect: a controller restarted from an
-# old image, or a metadata key that failed to render, must not start deleting
-# hosts because a field was missing. Consumers opt in.
-RECYCLE_MAX_UNAVAILABLE=${RECYCLE_MAX_UNAVAILABLE:-0}
-# Whether THIS controller mints its hosts' runner registration tokens. Absent
-# metadata reads empty, which is `false`, which is every pool that exists today:
-# a Linux host mints its own from Secret Manager and this whole path is inert.
-# See ci-runner-host-pool's `controller_mints_registration_token`.
-MINT_REG=${MINT_REG:-false}
+POOLS=()
+declare -A P_MIG=() P_REGION=() P_SLOTS=() P_MIN=() P_MAX=() P_GRACE=()
+declare -A P_REGGRACE=() P_TICKS=() P_RECYCLE=() P_HOST_OS=() P_MINT=()
+declare -A P_ROLE=() P_BEACON=() P_PIN=() P_LABELS=() P_LABELS_JSON=()
+
+# Rejected rows are counted and published (ci_pool_table_rejected), not merely
+# logged: a pool that silently stopped being served looks exactly like a pool
+# with nothing to do, and its autoscaler is ONLY_UP, so it holds its last size
+# indefinitely with every other series reading healthy.
+POOL_TABLE_REJECTED=0
+{
+  pool_rejects=$(mktemp)
+  pool_rows=$(printf '%s' "$POOLS_JSON" | pool_table_parse 2>"$pool_rejects") || {
+    echo "no usable pool in ci-pools metadata — this controller has nothing to manage" >&2
+    cat "$pool_rejects" >&2
+    rm -f "$pool_rejects"
+    exit 1
+  }
+  # `grep -c` exits 1 on zero matches, so `|| echo 0` would append a SECOND
+  # line to a count that is already "0" and every later `-eq` on it would be an
+  # `integer expression expected`. wc counts without an opinion.
+  POOL_TABLE_REJECTED=$(grep -c . "$pool_rejects" 2>/dev/null | head -1)
+  case "${POOL_TABLE_REJECTED:-}" in '' | *[!0-9]*) POOL_TABLE_REJECTED=0 ;; esac
+  [ "$POOL_TABLE_REJECTED" -eq 0 ] || cat "$pool_rejects" >&2
+  rm -f "$pool_rejects"
+}
+
+# Tab-separated on the way back in, and safely so: pool_table_parse rejects any
+# row with an empty column, so there is no run of empty fields for `read` to
+# collapse. See the note in pool-table.sh.
+while IFS=$'\t' read -r p_name p_mig p_region p_slots p_min p_max p_grace \
+  p_reggrace p_ticks p_recycle p_hostos p_mint p_role p_beacon p_pin p_labels; do
+  [ -n "$p_name" ] || continue
+  POOLS+=("$p_name")
+  P_MIG["$p_name"]="$p_mig"
+  P_REGION["$p_name"]="$p_region"
+  P_SLOTS["$p_name"]="$p_slots"
+  P_MIN["$p_name"]="$p_min"
+  P_MAX["$p_name"]="$p_max"
+  P_GRACE["$p_name"]="$p_grace"
+  P_REGGRACE["$p_name"]="$p_reggrace"
+  P_TICKS["$p_name"]="$p_ticks"
+  P_RECYCLE["$p_name"]="$p_recycle"
+  P_HOST_OS["$p_name"]="$p_hostos"
+  P_MINT["$p_name"]="$p_mint"
+  P_ROLE["$p_name"]="$p_role"
+  P_BEACON["$p_name"]="$p_beacon"
+  P_PIN["$p_name"]="$p_pin"
+  P_LABELS["$p_name"]="$p_labels"
+  # The left-hand side of GitHub's superset rule, precomputed once per pool
+  # rather than per run per tick. Must stay identical to what host-startup.sh
+  # passes to config.sh, which is why both sides come from one metadata value.
+  P_LABELS_JSON["$p_name"]=$(printf '%s' "$p_labels" \
+    | jq -R -c 'split(",") | map(select(length > 0))')
+done <<<"$pool_rows"
+
+# The label sets of every pool at once, as {pool: [labels]}. The demand sweep
+# fetches a run's job list ONCE and asks jq which pools each job belongs to —
+# the entire reason a repository can have four pools without paying for four
+# controllers' worth of API calls.
+POOLS_LABELS_MAP=$(
+  {
+    for p in "${POOLS[@]}"; do
+      jq -n -c --arg p "$p" --argjson l "${P_LABELS_JSON[$p]}" '{($p): $l}'
+    done
+  } | jq -s -c 'add // {}'
+)
+
+# pool_select <name> — make <name> THE pool for every function below.
+#
+# It writes the same global names the single-pool controller always used, which
+# is why drain_host(), registration_token_step(), beacon_gate() and the rest are
+# byte-identical to what they were. The reset half matters as much as the write
+# half: MIG_TEMPLATE and the MIG facts are cleared, so a describe that fails for
+# the second pool cannot leave the first pool's template in place and read every
+# one of the second pool's hosts as stale — which is a whole-pool cordon.
+pool_select() {
+  POOL="$1"
+  MIG="${P_MIG[$POOL]}"
+  REGION="${P_REGION[$POOL]}"
+  SLOTS="${P_SLOTS[$POOL]}"
+  MIN_HOSTS="${P_MIN[$POOL]}"
+  MAX_HOSTS="${P_MAX[$POOL]}"
+  GRACE="${P_GRACE[$POOL]}"
+  REGISTER_GRACE="${P_REGGRACE[$POOL]}"
+  ORPHAN_CONFIRM_TICKS="${P_TICKS[$POOL]}"
+  RECYCLE_MAX_UNAVAILABLE="${P_RECYCLE[$POOL]}"
+  CONTROLLER_HOST_OS="${P_HOST_OS[$POOL]}"
+  MINT_REG="${P_MINT[$POOL]}"
+  POOL_ROLE="${P_ROLE[$POOL]}"
+  BEACON_INTERVAL="${P_BEACON[$POOL]}"
+  PIN_ORPHAN_GRACE="${P_PIN[$POOL]}"
+  RUNNER_LABELS="${P_LABELS[$POOL]}"
+  POOL_LABELS_JSON="${P_LABELS_JSON[$POOL]}"
+
+  MIG_BASE=""
+  MIG_TARGET=0
+  MIG_TEMPLATE=""
+
+  DEMAND_TOTAL="${D_TOTAL[$POOL]:-0}"
+  DEMAND_QUEUED="${D_QUEUED[$POOL]:-0}"
+  QUEUE_WAIT_MAX="${D_WAIT[$POOL]:-0}"
+  RUNNING_MAX="${D_RUNNING[$POOL]:-0}"
+}
+
+# The per-pool globals pool_select writes, declared at file scope so that a read
+# before the first select cannot kill the tick under `set -u`.
+POOL=""
+MIG=""
+REGION=""
+SLOTS=1
+MIN_HOSTS=0
+MAX_HOSTS=0
+GRACE=900
+REGISTER_GRACE=600
+ORPHAN_CONFIRM_TICKS=3
+RECYCLE_MAX_UNAVAILABLE=0
+CONTROLLER_HOST_OS="unknown"
+MINT_REG=false
+POOL_ROLE="ci"
+BEACON_INTERVAL=30
+PIN_ORPHAN_GRACE=900
+RUNNER_LABELS=""
+POOL_LABELS_JSON="[]"
+
 # The per-instance metadata key a minted token is written to, and DELETED from.
 # Hard-coded rather than an input: it is a contract between this file and the
 # host boot script in the same module, and a configurable name is one more way
@@ -122,22 +258,6 @@ REG_TOKEN_KEY="ci-registration-token"
 # into, and the keys inside it. Hard-coded for the same reason REG_TOKEN_KEY is:
 # it is a contract between this file and the beacon publisher in this module.
 BEACON_NS="ci"
-# This CONTROLLER's own `ci-host-os`. It is NOT how the gate decides what a host
-# is — that is read per host, see instance_host_os() — it is used for exactly one
-# thing: resolving a host that predates the key at all. A pool is single-OS by
-# construction (one instance template, one `var.host_os`), so the controller's
-# value is what every host in it was built as. Anything but a value we recognise
-# leaves the fallback shut.
-CONTROLLER_HOST_OS=$(md "instance/attributes/ci-host-os")
-case "${CONTROLLER_HOST_OS:-}" in linux | windows) ;; *) CONTROLLER_HOST_OS="unknown" ;; esac
-# Seconds between the host publisher's writes. beacon_decision() derives its
-# staleness ceiling from this (3x), so a controller that guessed high would keep
-# reading a dead publisher as fresh. Read from metadata so a pool that tunes the
-# publisher can tune the reader with it; absent — which is every pool today —
-# reads empty and falls back to the publisher's own default of 30.
-BEACON_INTERVAL=$(md "instance/attributes/ci-beacon-interval")
-case "${BEACON_INTERVAL:-}" in '' | *[!0-9]*) BEACON_INTERVAL=30 ;; esac
-[ "$BEACON_INTERVAL" -gt 0 ] || BEACON_INTERVAL=30
 POLL=${POLL:-20}
 # Seconds the demand sweep may spend walking per-run job lists. It must stay far
 # below the watchdog threshold (10 polls, min 300s): a tick that outruns the
@@ -147,23 +267,17 @@ POLL=${POLL:-20}
 DEMAND_BUDGET=$(md "instance/attributes/ci-demand-budget-seconds")
 DEMAND_BUDGET=${DEMAND_BUDGET:-90}
 DEMAND_RUNS_SKIPPED=0
+# The demand sweep's per-pool results. One sweep fills all four; pool_select()
+# hands the selected pool's values to the tick as the globals it always used.
+declare -A D_TOTAL=() D_QUEUED=() D_WAIT=() D_RUNNING=()
 METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/github}
 REPO_FULL="$OWNER/$REPO"
 
-# The exact label set this pool's agents register with, as a JSON array — the
-# left-hand side of GitHub's superset rule. Must stay identical to what
-# host-startup.sh passes to config.sh, which is why both read the same
-# metadata key rather than each building their own list.
-POOL_LABELS_JSON=$(printf '%s' "$RUNNER_LABELS" | jq -R -c 'split(",") | map(select(length > 0))')
-
 # An empty label set silently matches NOTHING: every queued job is discarded as
 # "not mine", demand reads 0 on every tick, and the pool sits at zero hosts
-# while jobs queue. Fail loudly instead — a controller that cannot count demand
-# has no job to do.
-if [ "$POOL_LABELS_JSON" = "[]" ]; then
-  echo "ci-runner-labels metadata is missing or empty — cannot count demand" >&2
-  exit 1
-fi
+# while jobs queue. That check now lives in pool_table_parse(), one row at a
+# time — a controller serving four pools must not be taken down by the one that
+# is misconfigured — and a table in which EVERY row fails it still exits above.
 
 # --- GitHub ------------------------------------------------------------------
 
@@ -289,10 +403,17 @@ budget_allows_call() {
 
 collect_demand() {
   local runs jobs
-  DEMAND_TOTAL=0
-  DEMAND_QUEUED=0
-  QUEUE_WAIT_MAX=0
-  RUNNING_MAX=0
+  # Per pool now, not per controller. The sweep itself is still ONE pass over
+  # the repository's runs: a job list is fetched once and scored against every
+  # pool's label set inside the same jq invocation, which is what lets four
+  # pools cost what one used to.
+  local p
+  for p in "${POOLS[@]}"; do
+    D_TOTAL["$p"]=0
+    D_QUEUED["$p"]=0
+    D_WAIT["$p"]=0
+    D_RUNNING["$p"]=0
+  done
   # Reset HERE, with the other counters, not after the loop: every early return
   # below would otherwise leave the previous tick's value in place and the
   # controller would keep republishing "demand is truncated" forever.
@@ -352,29 +473,45 @@ collect_demand() {
     examined=$((examined + 1))
     jobs=$(gh_api "repos/$REPO_FULL/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || continue
 
+    # One line per POOL, from one pass over one job list. The candidate set —
+    # unfinished, labelled, not pinned — is computed once and then intersected
+    # with each pool's labels, so adding a pool costs jq an intersection rather
+    # than the controller an API call.
+    #
+    # A job counts for every pool whose label set is a superset of its own, and
+    # that is GitHub's own rule, not a simplification: any such runner really
+    # can pick the job up. It also means two pools with overlapping label sets
+    # both scale out for the same job. That is why the merge-queue pools are
+    # given a label the CI pools do not carry AND deliberately omit the generic
+    # labels the CI pools do — the sets are disjoint by construction, and this
+    # is the code that would double-scale if they ever stopped being.
     local counted
-    counted=$(printf '%s' "$jobs" | jq -r --argjson mine_labels "$POOL_LABELS_JSON" '
+    counted=$(printf '%s' "$jobs" | jq -r --argjson pools "$POOLS_LABELS_MAP" '
       [ .jobs[]?
         | select(.status == "queued" or .status == "in_progress")
         | select( ((.labels // []) | length) > 0 )
         | select( ((.labels // []) | map(select(startswith("host-"))) | length) == 0 )
-        | select( ((.labels // []) - $mine_labels) | length == 0 )
-      ] as $mine
-      | [ ($mine | length),
+      ] as $candidates
+      | $pools | to_entries[]
+      | .key as $pool
+      | .value as $mine_labels
+      | [ $candidates[] | select( ((.labels // []) - $mine_labels) | length == 0 ) ] as $mine
+      | [ $pool,
+          ($mine | length),
           ([ $mine[] | select(.status == "queued") ] | length),
-          ([ $mine[] | select(.status == "queued") | .started_at // .created_at ] | join(" ")),
-          ([ $mine[] | select(.status == "in_progress") | .started_at // empty ] | join(" "))
+          # `-` and not "" when a pool matched nothing in this run. An empty
+          # field between tabs is a field `read` COLLAPSES — tab is IFS
+          # whitespace — so a run with in-flight jobs and no queued ones would
+          # hand the in-flight stamps to the queued column and report a job
+          # that started ten minutes ago as having waited ten minutes.
+          # `date -d -` fails and the stamp is skipped, which is the intent.
+          ([ $mine[] | select(.status == "queued") | .started_at // .created_at ]
+             | join(" ") | if . == "" then "-" else . end),
+          ([ $mine[] | select(.status == "in_progress") | .started_at // empty ]
+             | join(" ") | if . == "" then "-" else . end)
         ] | @tsv' 2>/dev/null)
 
     [ -n "$counted" ] || continue
-    local n q stamps running
-    n=$(printf '%s' "$counted" | cut -f1)
-    q=$(printf '%s' "$counted" | cut -f2)
-    stamps=$(printf '%s' "$counted" | cut -f3)
-    running=$(printf '%s' "$counted" | cut -f4)
-
-    DEMAND_TOTAL=$((DEMAND_TOTAL + n))
-    DEMAND_QUEUED=$((DEMAND_QUEUED + q))
 
     # The pinned half of the same payload, kept rather than counted.
     #
@@ -415,29 +552,44 @@ collect_demand() {
     # pool under the most load, which is the pool being looked at.
     now=$(date +%s)
 
-    local s wait epoch
-    for s in $stamps; do
-      epoch=$(date -d "$s" +%s 2>/dev/null) || continue
-      wait=$((now - epoch))
-      [ "$wait" -gt "$QUEUE_WAIT_MAX" ] && QUEUE_WAIT_MAX=$wait
-    done
+    # One line per pool, in the order jq emitted them. A pool with no matching
+    # job in this run still emits a line of zeros and an empty stamp list, which
+    # is what keeps the accumulators honest without a second membership test.
+    local c_pool n q stamps running s wait epoch
+    while IFS=$'\t' read -r c_pool n q stamps running; do
+      [ -n "${c_pool:-}" ] || continue
+      # A pool jq knows about but this shell does not cannot happen — the map
+      # was built from POOLS — but the guard costs nothing and an unguarded
+      # write would create a phantom entry that every later loop iterates.
+      [ -n "${D_TOTAL[$c_pool]+set}" ] || continue
 
-    # Same arithmetic, different question: how long has the OLDEST job that is
-    # already executing been executing for. Free — these jobs are in the payload
-    # the demand sweep just paid for, and their start times were discarded.
-    #
-    # A job that started after this run's clock reading yields a negative age
-    # and loses the comparison. That is the right answer, not a swallowed one:
-    # the question is which job is OLDEST, and the job that just started is
-    # never it. The only value this can distort is a pool whose sole in-flight
-    # job began within the same second, reported as 0 rather than as 1 — on a
-    # gauge whose threshold is measured in minutes, and which is about to be
-    # correct on the next tick anyway.
-    for s in $running; do
-      epoch=$(date -d "$s" +%s 2>/dev/null) || continue
-      wait=$((now - epoch))
-      [ "$wait" -gt "$RUNNING_MAX" ] && RUNNING_MAX=$wait
-    done
+      D_TOTAL["$c_pool"]=$(( D_TOTAL["$c_pool"] + ${n:-0} ))
+      D_QUEUED["$c_pool"]=$(( D_QUEUED["$c_pool"] + ${q:-0} ))
+
+      for s in $stamps; do
+        epoch=$(date -d "$s" +%s 2>/dev/null) || continue
+        wait=$((now - epoch))
+        [ "$wait" -gt "${D_WAIT[$c_pool]}" ] && D_WAIT["$c_pool"]=$wait
+      done
+
+      # Same arithmetic, different question: how long has the OLDEST job that is
+      # already executing been executing for. Free — these jobs are in the
+      # payload the demand sweep just paid for, and their start times were
+      # discarded.
+      #
+      # A job that started after this run's clock reading yields a negative age
+      # and loses the comparison. That is the right answer, not a swallowed one:
+      # the question is which job is OLDEST, and the job that just started is
+      # never it. The only value this can distort is a pool whose sole in-flight
+      # job began within the same second, reported as 0 rather than as 1 — on a
+      # gauge whose threshold is measured in minutes, and which is about to be
+      # correct on the next tick anyway.
+      for s in $running; do
+        epoch=$(date -d "$s" +%s 2>/dev/null) || continue
+        wait=$((now - epoch))
+        [ "$wait" -gt "${D_RUNNING[$c_pool]}" ] && D_RUNNING["$c_pool"]=$wait
+      done
+    done <<<"$counted"
   done
 
   # NEVER silently. A truncated sweep under-reports demand, and under-reported
@@ -567,12 +719,18 @@ collect_outcomes() {
     # One line per job: workflow, conclusion, seconds. `completed_at` and
     # `started_at` are both present on a completed job; a job that reports
     # neither contributes 0 seconds rather than a negative number.
-    rows=$(printf '%s' "$jobs" | jq -r --argjson mine_labels "$POOL_LABELS_JSON" '
-      .jobs[]?
-      | select(.status == "completed")
-      | select( ((.labels // []) | length) > 0 )
+    rows=$(printf '%s' "$jobs" | jq -r --argjson pools "$POOLS_LABELS_MAP" '
+      [ .jobs[]?
+        | select(.status == "completed")
+        | select( ((.labels // []) | length) > 0 )
+      ] as $candidates
+      | $pools | to_entries[]
+      | .key as $pool
+      | .value as $mine_labels
+      | $candidates[]
       | select( ((.labels // []) - $mine_labels) | length == 0 )
-      | [ (.workflow_name // "unknown"),
+      | [ $pool,
+          (.workflow_name // "unknown"),
           (.conclusion // "unknown"),
           ( ( ((.completed_at // "") | if . == "" then 0 else fromdateiso8601 end)
             - ((.started_at   // "") | if . == "" then 0 else fromdateiso8601 end) ) as $d
@@ -585,8 +743,9 @@ collect_outcomes() {
     printf '%s %s\n' "$sweep_start" "$id" >>"$OUTCOME_STATE"
     [ -n "$rows" ] || continue
 
-    local wf outcome secs
-    while IFS=$'\t' read -r wf outcome secs; do
+    local o_pool wf outcome secs
+    while IFS=$'\t' read -r o_pool wf outcome secs; do
+      [ -n "$o_pool" ] || continue
       [ -n "$outcome" ] || continue
       wf=$(ts_label_value "$wf")
       outcome=$(ts_label_value "$outcome")
@@ -605,8 +764,11 @@ collect_outcomes() {
       # row would abort the tick — the outcome sweep must never be able to take
       # the scaling loop down with it.
       secs="${secs:-0}"
-      OUTCOME_JOBS["$wf|$outcome"]=$(( ${OUTCOME_JOBS["$wf|$outcome"]:-0} + 1 ))
-      OUTCOME_SECONDS["$wf"]=$(( ${OUTCOME_SECONDS["$wf"]:-0} + ${secs%%.*} ))
+      # Keyed by POOL first. Cost attribution is per pool or it is not
+      # attribution: the whole point of a merge-queue pool is to be able to say
+      # what the queue's second CI pass costs, separately from the first.
+      OUTCOME_JOBS["$o_pool|$wf|$outcome"]=$(( ${OUTCOME_JOBS["$o_pool|$wf|$outcome"]:-0} + 1 ))
+      OUTCOME_SECONDS["$o_pool|$wf"]=$(( ${OUTCOME_SECONDS["$o_pool|$wf"]:-0} + ${secs%%.*} ))
     done <<<"$rows"
   done
 
@@ -624,16 +786,24 @@ collect_outcomes() {
 #
 # Each point is the DELTA for this tick, on a GAUGE, exactly as
 # ci_drain_verdicts already is — sum it over a window to read a rate.
+# Emits the points belonging to the CURRENTLY SELECTED pool, and is therefore
+# called once per pool from inside the per-pool tick — queue_series labels every
+# point with $POOL, so a key from another pool published here would be filed
+# under this one.
 queue_outcome_series() {
-  local key wf outcome
+  local key rest wf outcome
   for key in "${!OUTCOME_JOBS[@]}"; do
-    wf="${key%%|*}"
-    outcome="${key##*|}"
+    case "$key" in "$POOL|"*) ;; *) continue ;; esac
+    rest="${key#"$POOL|"}"
+    wf="${rest%|*}"
+    outcome="${rest##*|}"
     queue_series "ci_jobs_completed" "${OUTCOME_JOBS[$key]}" \
       "\"workflow\":\"$wf\",\"outcome\":\"$outcome\""
   done
-  for wf in "${!OUTCOME_SECONDS[@]}"; do
-    queue_series "ci_job_seconds" "${OUTCOME_SECONDS[$wf]}" "\"workflow\":\"$wf\""
+  for key in "${!OUTCOME_SECONDS[@]}"; do
+    case "$key" in "$POOL|"*) ;; *) continue ;; esac
+    wf="${key#"$POOL|"}"
+    queue_series "ci_job_seconds" "${OUTCOME_SECONDS[$key]}" "\"workflow\":\"$wf\""
   done
 }
 
@@ -1809,7 +1979,67 @@ cordon_host() {
 
 # --- tick --------------------------------------------------------------------
 
+# tick — one pass over the whole REPOSITORY, then one pass per pool.
+#
+# The split is the point of this file. Everything GitHub can answer once for the
+# repository — the runner list, the demand sweep, the outcome sweep — is done
+# once here, and each pool's own work runs against the results. Four pools cost
+# one repository's worth of API calls, which is what makes four pools possible
+# at all: the alternative, four controllers, is four times the polling against
+# an installation rate limit that all of them share.
 tick() {
+  local tick_start
+  tick_start=$(date +%s)
+
+  # A blind tick is not an error, it is a SUSPENSION: every host reads
+  # reg=unknown, so nothing drains, in EVERY pool. One is unremarkable; a run of
+  # them is a fleet pinned at its current size, billing for hosts nobody is
+  # using, while the heartbeat keeps publishing 1 and every dashboard stays
+  # green. The counter is what makes the difference visible — it is published on
+  # every tick, and an alert on it fires on the run, not on the single blip.
+  if collect_runners; then
+    BLIND_TICKS=0
+  else
+    BLIND_TICKS=$((BLIND_TICKS + 1))
+    log "GitHub runner list unavailable this tick (status=$RUNNER_LIST_STATUS, consecutive=$BLIND_TICKS) — every host reads reg=unknown and nothing will be drained (fail-safe)"
+  fi
+
+  collect_demand
+
+  # Deliberately BEFORE the pool loop, unlike the single-pool controller that
+  # ran it last. It is still the work nothing waits on — no host is drained and
+  # no MIG resized on what it finds — but with N pools the flush is now shared,
+  # so running it last would delay the flush for every pool rather than for the
+  # one it belongs to. It carries its own budget and its own interval; on most
+  # ticks it returns immediately.
+  collect_outcomes
+
+  local p
+  for p in "${POOLS[@]}"; do
+    pool_select "$p"
+    tick_pool
+  done
+
+  # The controller-wide facts, published under EVERY pool's label. A pool whose
+  # series simply stop is indistinguishable from a pool that went idle, so each
+  # one carries its own copy of the heartbeat and of the two counters that say
+  # whether this tick could see GitHub at all.
+  local tick_seconds
+  tick_seconds=$(( $(date +%s) - tick_start ))
+  for p in "${POOLS[@]}"; do
+    pool_select "$p"
+    queue_controller_series "$tick_seconds"
+    queue_outcome_series
+  done
+
+  # One request per tick, every pool's series together.
+  flush_series
+}
+
+# tick_pool — everything that is true of ONE pool. Unchanged from the
+# single-pool controller except that it no longer sweeps GitHub or flushes:
+# pool_select() has already written the globals it reads.
+tick_pool() {
   DRAINED=0
   DRAIN_ABORTED=0
   REAPED=0
@@ -1820,22 +2050,6 @@ tick() {
   WORKER_GATE_UNDETERMINED=0
   WORKER_GATE_OS_FALLBACK=0
 
-  local tick_start
-  tick_start=$(date +%s)
-
-  collect_demand
-  # A blind tick is not an error, it is a SUSPENSION: every host reads
-  # reg=unknown, so nothing drains. One is unremarkable; a run of them is a pool
-  # pinned at its current size, billing for hosts nobody is using, while the
-  # heartbeat keeps publishing 1 and every dashboard stays green. The counter is
-  # what makes the difference visible — it is published on every tick, and an
-  # alert on it fires on the run, not on the single blip.
-  if collect_runners; then
-    BLIND_TICKS=0
-  else
-    BLIND_TICKS=$((BLIND_TICKS + 1))
-    log "GitHub runner list unavailable this tick (status=$RUNNER_LIST_STATUS, consecutive=$BLIND_TICKS) — every host reads reg=unknown and nothing will be drained (fail-safe)"
-  fi
   collect_hosts
   # AFTER collect_hosts, and that ordering is the whole reason this is not part
   # of collect_demand: classify_pinned decides whether a pinned run is servable,
@@ -1874,9 +2088,18 @@ tick() {
   # credential. An actually-empty pool is swept on the next tick that reads one.
   local f mname live_hosts
   live_hosts=$(printf '%s\n' "$HOSTS" | awk -F, '{ if ($1 != "") print $1 }')
+  #
+  # AND THE STATE DIRECTORY IS NOW SHARED BY EVERY POOL. `live_hosts` is this
+  # pool's host list, so an unscoped sweep would read every OTHER pool's markers
+  # as belonging to hosts that no longer exist and delete them — handing back
+  # recycle budget across the whole controller and, worse, forgetting that a
+  # live registration token is sitting in another pool's instance metadata. Only
+  # markers whose host name this pool's MIG could have created are considered,
+  # and if the MIG's base name could not be read, nothing is swept at all.
   for f in "$STATE_DIR"/cordon-* "$STATE_DIR"/regtoken-* "$STATE_DIR"/regkey-* \
     "$STATE_DIR"/regfail-* "$STATE_DIR"/beaconmiss-*; do
     [ -n "$live_hosts" ] || break
+    [ -n "$MIG_BASE" ] || break
     [ -e "$f" ] || continue
     mname=$(basename "$f")
     mname=${mname#cordon-}
@@ -1884,12 +2107,22 @@ tick() {
     mname=${mname#regkey-}
     mname=${mname#regfail-}
     mname=${mname#beaconmiss-}
+    case "$mname" in "$MIG_BASE"-*) ;; *) continue ;; esac
     case $'\n'"$live_hosts"$'\n' in
       *$'\n'"$mname"$'\n'*) ;;
       *) rm -f "$f" ;;
     esac
   done
-  recycling=$(find "$STATE_DIR" -maxdepth 1 -name 'cordon-*' 2>/dev/null | wc -l)
+  # Scoped to this pool's own hosts, for the same reason the sweep above is: the
+  # recycle budget is per pool, and counting the whole controller's cordons
+  # would let one pool's rollout stop every other pool from rolling out at all.
+  # With no base name to scope by, the budget reads as fully spent — a pool that
+  # cannot count its own cordons must not start new ones.
+  if [ -n "$MIG_BASE" ]; then
+    recycling=$(find "$STATE_DIR" -maxdepth 1 -name "cordon-$MIG_BASE-*" 2>/dev/null | wc -l)
+  else
+    recycling="$RECYCLE_MAX_UNAVAILABLE"
+  fi
 
   # `IFS=,` on both walks, and it is not cosmetic — see collect_hosts.
   while IFS=, read -r host status host_tpl host_uri; do
@@ -1989,14 +2222,6 @@ tick() {
 
   local target="$MIG_TARGET"
 
-  # Deliberately LAST, after every scaling decision this tick makes. It is the
-  # only work in the tick that nothing waits on — no host is drained and no MIG
-  # is resized on what it finds — so running it earlier would spend up to
-  # OUTCOME_BUDGET seconds delaying the flush that the autoscaler reads
-  # ci_demand from, in order to publish a number nobody is paged on.
-  collect_outcomes
-
-  # One request per tick, all series together.
   queue_series "ci_demand" "$DEMAND_TOTAL"
   # Deliberately a SEPARATE series and not part of ci_demand: the autoscaler
   # consumes ci_demand, and a pinned job cannot be served by the host it would
@@ -2070,10 +2295,22 @@ tick() {
   # are disappearing without going through drain_host() — worth an alert, not
   # just a log line.
   queue_series "ci_orphan_registrations_reaped" "$REAPED"
+}
+
+# queue_controller_series <tick_seconds> — the facts that belong to the
+# CONTROLLER rather than to a pool, published once per pool so that every pool
+# carries its own heartbeat and its own "could this tick see GitHub" counters.
+# Duplicated on purpose: a pool whose series merely stop reads as an idle pool.
+queue_controller_series() {
+  local tick_seconds="${1:-0}"
   # Heartbeat is published on EVERY tick including a bad one, so "no data" on
   # this series means the controller is down — a distinct alert from "the pool
   # is idle", which the other series cannot distinguish on their own.
   queue_series "ci_poller_heartbeat" "1"
+  # Pools the table refused. Non-zero means this controller is serving fewer
+  # pools than it was configured with, and the pool that is missing has no
+  # series of its own to go absent — this is the only place it is visible.
+  queue_series "ci_pool_table_rejected" "$POOL_TABLE_REJECTED"
   # Published on EVERY tick, 0 included — a series that only appears when broken
   # is indistinguishable from a controller that stopped publishing, which is the
   # confusion this whole fleet keeps paying for. 0 means "the last tick could see
@@ -2082,18 +2319,21 @@ tick() {
   # How long this tick took, end to end. The fleet had no series for it and paid
   # for that: a tick growing past the watchdog threshold is a controller about to
   # be restarted mid-tick forever, and the only visible symptom was every OTHER
-  # series going absent at once. Published last so it also covers the work done
-  # after the drain loop.
-  queue_series "ci_tick_seconds" "$(( $(date +%s) - tick_start ))"
+  # series going absent at once.
+  #
+  # It is the WHOLE controller's tick, not this pool's share of it, and every
+  # pool reports the same number — because the number the watchdog threshold is
+  # compared against is the whole loop. A per-pool split would be four values
+  # none of which can be alerted on.
+  queue_series "ci_tick_seconds" "$tick_seconds"
   # >0 means ci_demand is a lower bound this tick, so a pool that looks
-  # under-scaled may simply not have been counted.
+  # under-scaled may simply not have been counted. Controller-wide: the sweep is
+  # shared, so a run skipped for budget is skipped for every pool.
   queue_series "ci_demand_runs_skipped" "$DEMAND_RUNS_SKIPPED"
   # Published on every tick, 0 included — it is what makes an ABSENT
   # ci_jobs_completed readable as "no jobs finished" rather than "the outcome
   # sweep never got to them".
   queue_series "ci_outcome_runs_skipped" "$OUTCOME_RUNS_SKIPPED"
-  queue_outcome_series
-  flush_series
 }
 
 # --- install / run -----------------------------------------------------------
