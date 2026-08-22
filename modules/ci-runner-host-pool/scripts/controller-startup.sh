@@ -243,10 +243,17 @@ ORPHAN_CONFIRM_TICKS=3
 RECYCLE_MAX_UNAVAILABLE=0
 CONTROLLER_HOST_OS="unknown"
 MINT_REG=false
+# POOL_ROLE and POOL_LABELS_JSON are written by pool_select and read by
+# nothing in THIS file — the routing rule that consumes the role, and the
+# label set the demand sweep hands to jq, both live in the pool table and
+# arrive at their readers by other routes. Dropping them here would mean
+# re-deriving them per tick from the table instead.
+# shellcheck disable=SC2034
 POOL_ROLE="ci"
 BEACON_INTERVAL=30
 PIN_ORPHAN_GRACE=900
 RUNNER_LABELS=""
+# shellcheck disable=SC2034
 POOL_LABELS_JSON="[]"
 
 # The per-instance metadata key a minted token is written to, and DELETED from.

@@ -56,18 +56,18 @@ bad() { # <desc> <want> <got>
 }
 
 want_rc() { # <desc> <expected>
-  [ "$RC" -eq "$2" ] && ok || bad "$1" "rc $2" "rc $RC"
+  if [ "$RC" -eq "$2" ]; then ok; else bad "$1" "rc $2" "rc $RC"; fi
 }
 want_rows() { # <desc> <expected count>
   local n
   n=$(printf '%s' "$OUT" | grep -c . || true)
-  [ "$n" -eq "$2" ] && ok || bad "$1" "$2 row(s)" "$n row(s): $OUT"
+  if [ "$n" -eq "$2" ]; then ok; else bad "$1" "$2 row(s)" "$n row(s): $OUT"; fi
 }
 want_names() { # <desc> <space separated names in order>
   local got
   got=$(printf '%s\n' "$OUT" | grep . | cut -f1 | tr '\n' ' ')
   got="${got% }"
-  [ "$got" = "$2" ] && ok || bad "$1" "$2" "$got"
+  if [ "$got" = "$2" ]; then ok; else bad "$1" "$2" "$got"; fi
 }
 want_reject() { # <desc> <substring the rejection must contain>
   case "$ERR" in
@@ -78,7 +78,11 @@ want_reject() { # <desc> <substring the rejection must contain>
 want_field() { # <desc> <1-based column> <expected>
   local got
   got=$(printf '%s\n' "$OUT" | grep . | head -1 | cut -f"$2")
-  [ "$got" = "$3" ] && ok || bad "$1" "column $2 = '$3'" "column $2 = '$got'"
+  if [ "$got" = "$3" ]; then
+    ok
+  else
+    bad "$1" "column $2 = '$3'" "column $2 = '$got'"
+  fi
 }
 
 # A fully specified pool: nothing defaulted, so the column-order assertions
@@ -211,7 +215,11 @@ reject_case "zero slots is arithmetically valid and operationally dead" \
 # nothing to name in the message, and the count it would inflate is per-pool.
 run '[{"mig":"m","region":"r","runner_labels":"a"}]'
 want_rows "an unnamed pool is not a pool" 0
-[ -z "$ERR" ] && ok || bad "an unnamed pool is skipped quietly" "" "$ERR"
+if [ -z "$ERR" ]; then
+  ok
+else
+  bad "an unnamed pool is skipped quietly" "" "$ERR"
+fi
 
 # --- one bad row must not take the others down --------------------------------
 # The reason rejection is per-row rather than fatal. A typo in the newest pool
@@ -249,8 +257,11 @@ want_field "the tab stays escaped" 16 'a\tb'
 # The controller pipes the metadata value in rather than embedding it in an
 # argument, so this is the path that actually runs in production.
 OUT=$(printf '%s' "$FULL" | pool_table_parse 2>/dev/null)
-[ "$(printf '%s\n' "$OUT" | cut -f1)" = "linux-ci" ] && ok \
-  || bad "the table can be read from stdin" "linux-ci" "$OUT"
+if [ "$(printf '%s\n' "$OUT" | cut -f1)" = "linux-ci" ]; then
+  ok
+else
+  bad "the table can be read from stdin" "linux-ci" "$OUT"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

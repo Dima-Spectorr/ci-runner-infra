@@ -48,6 +48,8 @@ check() { # <name> <expected> <actual>
 # The function is extracted and run for real, with only the globals it is
 # entitled to read. A field added to pool_select and not to its reset half fails
 # here rather than in the fleet.
+# shellcheck disable=SC2034  # every P_*/D_* below is read by the eval'd
+# pool_select, which no static reader of this file can see.
 select_out=$(
   set -uo pipefail
   # shellcheck disable=SC1090
@@ -149,7 +151,7 @@ sweep_out=$(
       *) rm -f "$f" ;;
     esac
   done
-  (cd "$STATE_DIR" && ls | sort | paste -sd, -)
+  (cd "$STATE_DIR" && printf '%s\n' * | sort | paste -sd, -)
   rm -rf "$STATE_DIR"
 )
 check "sweep: a dead host's marker in the ticked pool is still collected" \
@@ -173,7 +175,7 @@ sweep_blind=$(
     [ -e "$f" ] || continue
     rm -f "$f"
   done
-  (cd "$STATE_DIR" && ls | paste -sd, -)
+  (cd "$STATE_DIR" && printf '%s\n' * | sort | paste -sd, -)
   rm -rf "$STATE_DIR"
 )
 check "sweep: a controller that cannot name its MIG sweeps nothing" \
@@ -181,6 +183,7 @@ check "sweep: a controller that cannot name its MIG sweeps nothing" \
 
 # The source is checked too, because the two loops above are a copy: a scoping
 # guard that is dropped from the controller must not leave this file green.
+# shellcheck disable=SC2016
 grep -qF 'case "$mname" in "$MIG_BASE"-*) ;; *) continue ;; esac' "$CTRL" &&
   r=yes || r=no
 check "sweep: the controller really carries the scoping guard" yes "$r"
@@ -196,6 +199,7 @@ check "recycle: the cordon count is scoped to this pool's MIG" yes "$r"
 # No base name means the budget reads FULLY SPENT. A pool that cannot count its
 # own cordons must not start new ones — the failure mode of the opposite choice
 # is recycling the whole pool while blind.
+# shellcheck disable=SC2016
 r=$(sed -n '/recycling=$(find/,/^  fi$/p' "$CTRL" | grep -c 'recycling="\$RECYCLE_MAX_UNAVAILABLE"')
 check "recycle: an unreadable MIG spends the budget rather than ignoring it" 1 "$r"
 
@@ -213,6 +217,7 @@ legacy=$(
   # oldest of them, which is the case that matters: an absent attribute reads as
   # the empty string, and in jq an empty string is TRUTHY, so `// 900` would
   # hand the row a "" it then rejects as non-numeric.
+  # shellcheck disable=SC2317  # every arm is reached via the eval'd code.
   md() {
     case "$1" in
       *ci-pools) echo "" ;;
@@ -230,6 +235,7 @@ legacy=$(
       *) echo "" ;;
     esac
   }
+  # shellcheck disable=SC2016
   eval "$(sed -n '/POOLS_JSON=$(jq -n /,/runner_labels: /p' "$CTRL")"
   printf '%s' "$POOLS_JSON" | pool_table_parse 2>/dev/null | tr '\t' '|'
 )
