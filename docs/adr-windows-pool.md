@@ -1306,6 +1306,14 @@ that a job whose `runs-on` names a Windows pool label and which declares
 `container:` or `services:` fails in the consuming repository's own CI, where the
 author can see it.
 
+*Amended 2026-08-22:* that leaves a Windows job needing a database with nowhere
+to get one, and [`adr-pr-host-affinity.md`](adr-pr-host-affinity.md) answers it
+without touching this decision — the pull request's shared stack runs on its
+Linux host, is published into a per-slot host port band, and the Windows job
+connects to it over the VPC. A container runtime for this pool was reconsidered
+as part of that decision and **re-affirmed as refused**: the paragraph above is
+unchanged, and reachability is what was missing, not a runtime.
+
 **The isolation the container boundary provided.** On Linux the sentence "job
 isolation is provided by running each job in a container instead of by destroying
 the machine" is load-bearing: a job gets a clean root filesystem. On Windows a job

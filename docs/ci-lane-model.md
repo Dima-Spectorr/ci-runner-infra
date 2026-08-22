@@ -5,6 +5,11 @@ This is the contract consuming repositories adopt. The rule itself is
 in this repository's CI. The evidence behind it is in
 [`ci-optimization-catalog.md`](ci-optimization-catalog.md).
 
+It decides **how much** CI a diff deserves. It does not decide **where** that CI
+runs or what it shares — that is [`ci-pr-shared-infra.md`](ci-pr-shared-infra.md)
+(one host per pull request, one infrastructure stack on it), which is adopted
+*after* this document because it pins the set of jobs this one selects.
+
 Same argument as the Terraform module this repository already publishes: the
 lane rule was re-derived independently in four repositories with four different
 path lists, and two of them evaluate it in a place that defeats its purpose.
