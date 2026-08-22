@@ -1,0 +1,501 @@
+# One workflow run, one host — and one shared infrastructure stack on it
+
+Status: **proposed** (design only; nothing here is implemented).
+Scope: every repository on the fleet, both pools.
+Related: [`ci-lane-model.md`](ci-lane-model.md) decides *how much* CI a diff
+deserves; this decides *where* that CI runs and *what it shares*.
+[`adr-windows-pool.md`](adr-windows-pool.md) §3A and §4 are the constraint this
+document's third rule has to live inside.
+
+## The three rules being adopted
+
+1. **One pull request's self-hosted work runs on one host** — except a pull
+   request that also needs the Windows pool, which uses two: one Linux host and
+   one Windows host.
+2. **Infrastructure a suite needs — a database, a broker, a cache — is brought
+   up ONCE per pull request** and shared by every test and every container that
+   pull request runs.
+3. **A job on the Windows host can reach that shared infrastructure**, which
+   lives on the Linux host.
+
+They are one decision, not three. Rule 2 is only meaningful if rule 1 holds —
+"once per pull request" has no referent while a pull request's jobs are
+scattered across whichever hosts the pool happened to have idle. And rule 3 is
+the price of rule 1's exception: the moment a pull request legitimately occupies
+two hosts, the shared stack is on one of them and the other has to cross a
+network boundary this fleet currently denies in both directions.
+
+**The enforceable unit is a workflow run, not a pull request.** `needs:` and job
+outputs do not cross workflow runs, so two `pull_request` workflows cannot agree
+on a host without a lease store — and §2.2 rejects lease stores. Rule 1 is
+therefore delivered as "one workflow run, one host", and a repository gets "one
+pull request, one host" by consolidating its `pull_request` CI into one
+workflow. That consolidation is step 2 of adoption, before anything else here
+takes effect. The title of this document says what is actually true.
+
+---
+
+## Why this is being written
+
+Three separate observations, one cause.
+
+**The pool is the binding constraint and the arithmetic is not close.** Issue
+[#205](https://github.com/Dima-Spectorr/ci-runner-infra/issues/205) measured it:
+`max_hosts 3` × `slots_per_host 4` = 12 concurrent slots, against ~25 jobs for a
+single Apigee-Portal pull request with three to four pull requests routinely in
+flight. Measured queue waits of 50 s, 98 s, 180 s and 291 s, and — the part that
+matters here — *displacement*: `TypeScript type-check` finished at 139 s on one
+head and at 310 s and 406 s on two others, because unrelated pull requests were
+eating the slots. A pull request's cost today is unbounded in the one dimension
+the pool cannot grow.
+
+**Every job that needs a database builds its own.** GitHub's `services:` are
+per-job by construction: the agent creates them at "Initialize containers" and
+destroys them when the job ends. A pull request with six jobs that each need
+Postgres starts Postgres six times, migrates it six times, and seeds it six
+times — on six slots that may be on three different hosts. Nothing about that is
+a bug in any one workflow. It is what the primitive does.
+
+**And the Windows pool cannot use that primitive at all.** `container:` and
+`services:` fail at "Initialize containers" on a Windows host, which has no
+container runtime by design — the pool exists for a WiX/`signtool` packaging
+build that needs the host's real Win32 surface, and a Windows container is
+precisely what breaks it (`adr-windows-pool.md` §4). `check-runner-policy.sh`
+`RUNNER8` refuses the declaration so it fails in the consuming repository's own
+CI rather than on the pool. That is the right refusal and it leaves a hole: a
+Windows job that needs a database has, today, no supported way to get one.
+
+---
+
+## 1. What "one host" has to mean, given the isolation model
+
+This is the part that cannot be decided by preference, because the host is not a
+flat machine. `host-startup.sh` gives every slot its own uid, its own network
+namespace, and its own rootless Docker daemon on a socket in a 0700
+`/run/ci-s<i>`. The namespaces are `10.99.<idx>.2/30` on a veth to a
+`10.99.<idx>.1` host end, NAT'd out of the primary interface.
+
+So "one host" admits two readings, and they cost differently:
+
+| reading | a pull request gets | shared infra reachable by |
+|---|---|---|
+| one **slot** | 1 concurrent job | that job only |
+| one **host** | up to `slots_per_host` concurrent jobs | every slot on the host, *if* a path exists |
+
+**One slot is rejected.** It makes rule 2 trivial — one daemon, one Docker
+network, `localhost` everywhere — and it collapses a 25-job Apigee-Portal pull
+request into a single serialized job. Measured against #205's own numbers that
+trades a 291 s queue wait for a wall-clock several times worse, and it destroys
+the per-check granularity the merge queue reads. The cure would be worse than
+the disease it is prescribed for.
+
+**One host is adopted.** A pull request occupies at most `slots_per_host` slots,
+which is a *bound* where today there is none — that is the whole win against
+#205 — and it keeps intra-pull-request parallelism at four-wide.
+
+It also fixes the thing #205 describes and does not name: displacement is
+unbounded because nothing associates a job with its pull request. Pinning makes
+the association explicit, and the pool's contention moves from "every job
+against every other job" to "at most three pull requests against each other",
+which is a queue an operator can reason about.
+
+### The consequence rule 2 has to absorb
+
+Two slots on one host do **not** share a Docker daemon, a network namespace, or
+a `localhost`. A stack brought up in slot 1 is invisible to slot 2 at
+`127.0.0.1`, and that is deliberate: the slot fence exists because a shared
+daemon socket let one job enumerate a sibling's containers, `exec` into them,
+and read its `GITHUB_TOKEN` (README, "Each slot is its own Linux user with its
+own rootless Docker daemon").
+
+So sharing across slots needs a *sanctioned* path, and §3 builds exactly one.
+What it must not do is rely on the path that already exists by accident — see
+"Residual risk" below.
+
+The same fence decides **who may tear a stack down**: only the owning slot's uid
+can open its own daemon socket, so teardown cannot be a downstream job's
+`if: always()` step. It is host-side, and §3.5 says so.
+
+---
+
+## 2. Pinning a workflow run to a host
+
+### 2.1 Hosts get an affinity label
+
+Today every agent on a pool registers the same label set, read from
+`instance/attributes/ci-runner-labels` — a template attribute, identical across
+the MIG. There is nothing in a `runs-on` that can name one host.
+
+Each agent additionally registers `host-<instance-name>`, composed at boot from
+`instance/name` rather than from Terraform, because a MIG generates the name and
+Terraform does not know it. Both boot scripts do it — `host-startup.sh` before
+`--labels "$LABELS"`, `windows-host-startup.ps1` before its `--labels` argument.
+The same value is exported into every slot's job environment as
+`CI_HOST_LABEL`, which is what §2.2 reads.
+
+This is additive. A `runs-on` that names only the pool labels keeps matching
+every host, because GitHub routes to any runner whose label set is a superset of
+what the job asks for. Nothing that exists today changes behaviour.
+
+### 2.2 An anchor job resolves the label — no API, no lease
+
+The first fleet job of a workflow run is the **anchor**. It runs deliberately
+**unpinned**, and whichever host answers it becomes this run's host: the anchor
+reads `CI_HOST_LABEL` from its own environment and publishes the complete
+`runs-on` array as a job output. Every later fleet Linux job consumes it.
+
+**Why not a runner-list lookup.** The rejected design had a lease job list
+`repos/{owner}/{repo}/actions/runners` and pick `pr_number % count`. Reading the
+runner list is repository administration, `administration` is not a valid
+job-level `permissions:` key, and `GITHUB_TOKEN` cannot be granted repo-admin
+read at all. The mechanism was not adoptable; it was only plausible. The
+fallback — a PAT — is worse than the problem, in a repository that runs
+pull-request code.
+
+**Why not a lease store.** A registry, a lock, and a lock's failure modes, to
+solve a problem the anchor solves with an environment variable.
+
+**What the anchor buys beyond removing the API call:**
+
+- The host it names is **demonstrably alive and busy**, because a job of yours
+  is on it. An out-of-band pick can name a host that drains before the first
+  pinned job arrives.
+- The **pin hold (§2.4) is written by the anchor itself**, so it exists before
+  any job that depends on it. There is no window between selection and
+  protection.
+- A pinned job never has to be scheduled onto a host that might not exist, so
+  the empty-pool case is not a special path — it is just the anchor queueing
+  like any unpinned job does today, and the autoscaler scaling out for it.
+
+**A host that predates this contract is a supported answer, and it is `""`.**
+`CI_HOST_LABEL` unset means an older boot script. The anchor emits the unpinned
+label array, downstream `runs-on` degrades to exactly today's behaviour, and the
+pull request runs — unpinned, and therefore with per-job infrastructure. **The
+contract degrades; it does not deadlock.** This is the single most important
+property in this document, because it is the one whose absence is unrecoverable
+without an operator.
+
+### 2.3 Downstream jobs consume it
+
+```yaml
+  test:
+    needs: [lane, anchor]
+    if: needs.lane.outputs.lane != 'none'
+    runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+```
+
+`fromJSON` of a whole array, not a label appended to a literal list: an empty
+affinity label appended to a list produces `[self-hosted, linux, gcp, Repo, ""]`,
+and an empty-string label matches no runner at all. The anchor emits the
+complete array — pinned or unpinned — so the degraded case is expressed by the
+array being shorter rather than by a label being blank.
+
+### 2.4 The controller must not remove a pinned host — by either path
+
+A pull request between its fast tier and its heavy tier is a host that is idle
+and must not be taken away: the run's remaining jobs name that host by label,
+and a host that is gone is a label nothing answers.
+
+There are **two** paths that remove a host, and the hold has to block both. The
+controller's tick calls `recycle_decision()` first and `continue`s on a
+`cordon:` or `retire:` verdict, so `drain_decision()` is never consulted for
+that host on that tick. A hold wired only into `drain_decision()` would be
+bypassed entirely by a stale-template recycle — which cordons by deregistering
+idle agents, and a cordoned host stops answering its own affinity label while
+the run pinned to it still has jobs to place.
+
+So: a host carries a **pin hold** — a marker naming the workflow run and an
+expiry, written by the anchor job. **Both** `recycle_decision()` and
+`drain_decision()` take it as an input, and both treat an unexpired hold as
+not-removable. They stay pure functions of their arguments, which is how every
+other decision in this module is tested.
+
+The expiry is what makes the hold safe to write from job context: the worst a
+forged or abandoned hold can do is keep one host warm until it lapses, which is
+the same cost as a slow job, and the orphan rules are unchanged above it.
+
+### 2.5 The controller must not go blind to pinned work
+
+`collect_demand()` classifies a queued job as this pool's by subtracting the
+pool's template label set from the job's labels and requiring the remainder to
+be empty. `host-<instance-name>` is by construction **not** in the template set,
+so an affinity-pinned job leaves a non-empty remainder and is dropped from both
+`DEMAND_TOTAL` and `DEMAND_QUEUED`. The pool would go invisible to its own
+autoscaler exactly when it is busiest.
+
+The matcher must therefore recognise the affinity label — strip a `host-*` label
+before the subset test — and then classify rather than simply count:
+
+- **Pinned queued work is not scale-out demand.** A new host cannot serve it;
+  only the named host can. Counting it would drive an `ONLY_UP` autoscaler to
+  `max_hosts` for jobs no new host can take.
+- **Pinned work does mark its host busy**, which is what keeps drain, recycle
+  and the published series honest.
+
+Genuine scale-out demand still exists, and it comes from the anchors — which are
+unpinned by design. This is a phase-2 obligation, listed in §6, and it is not
+optional: shipping the label without it degrades the autoscaler.
+
+---
+
+## 3. One shared stack per workflow run, reachable from both hosts
+
+### 3.1 The owner job brings it up; nobody else does
+
+Exactly one job owns the stack, and it is the anchor — the anchor occupies a
+slot either way, so a repository with shared infrastructure should not pay for a
+second job that only echoes a variable. It brings the stack up on its own slot's
+rootless daemon with a compose project name derived from the pull-request
+number, migrates and seeds it once, publishes the endpoints as job outputs, and
+every other job — Linux or Windows — consumes those outputs.
+
+`services:` is the shape being replaced. A `services:` block is per-job by
+definition and there is no version of it that is shared, so a repository that
+has adopted this contract declares infrastructure in exactly one place. That is
+what `RUNNER10` (§4) asserts.
+
+### 3.2 The port band, and the DNAT that makes it reachable
+
+A slot's published port lands in the slot's network namespace. From outside the
+host — and from a sibling slot — it does not exist. Two things are added:
+
+**A per-slot port band.** Slot `idx` owns host ports `35000 + idx*100` through
+`35000 + idx*100 + 99`. Disjoint by construction, so two slots publishing the
+"same" service never collide — the collision that
+[`setup_slot_netns`](../modules/ci-runner-host-pool/scripts/host-startup.sh)
+was written for in the first place. The number of bands follows
+`slots_per_host`; no part of this design may hardcode four slots, and the
+firewall range in §3.3 is computed from the same variable.
+
+**A 1:1 DNAT per band**, installed at boot beside the existing MASQUERADE:
+
+```
+-t nat -A PREROUTING -d <host primary address> -p tcp --dport <band> \
+       -j DNAT --to 10.99.<idx>.2
+```
+
+**Matched on destination address, not on `-i <primary_if>`.** The main consumer
+of this path is a *sibling slot on the same host*, whose packets arrive on
+`cis<N>`, not on the primary interface; an input-interface match would silently
+exclude the traffic the rule exists for — handing the Windows case a working
+path and the same-host case a connection refused. Matching the host's own
+address instead admits both while still declining anything not addressed to this
+host.
+
+The `FORWARD` chain already accepts `-o cis<idx>`, so nothing in the forwarding
+policy loosens. What is new is one PREROUTING entry per slot, bounded to 100
+ports, and nothing else on the host becomes reachable.
+
+The slot learns its own band, its host label and the host's address the same way
+it learns its cache paths — environment, set by the boot script:
+
+```
+CI_HOST_LABEL              host-<instance-name>
+CI_SHARED_INFRA_ADDR       the host's primary VPC address
+CI_SHARED_INFRA_PORT_MIN   35000 + idx*100
+CI_SHARED_INFRA_PORT_MAX   35000 + idx*100 + 99
+```
+
+A job that publishes outside its band gets a port that resolves on the slot's
+own `localhost` and nowhere else — which fails as "the Windows job cannot
+connect" rather than as anything readable, so the owner job asserts the range
+before it publishes.
+
+### 3.3 The firewall, which is currently closed in both directions
+
+`ci-runner-network` today grants ingress for IAP SSH (22) and health checks, and
+egress for 443, 53, and `database_egress_ports` to RFC1918. There is **no**
+ingress rule permitting one pool host to reach another, and the explicit
+`deny-egress` at priority 65534 takes everything the allows do not name.
+
+So rule 3 needs two narrow rules, not a posture change — and they are **not
+symmetrical**, because GCP's two directions do not offer the same controls:
+
+```
+INGRESS  source_tags        = [runner_network_tag]
+         target_tags        = [runner_network_tag]
+         tcp: 35000 .. 35000 + slots_per_host*100 - 1
+
+EGRESS   target_tags        = [runner_network_tag]     # the SOURCE VMs
+         destination_ranges = [the pool subnet's CIDR] # ranges only
+         tcp: 35000 .. 35000 + slots_per_host*100 - 1
+```
+
+**An egress rule cannot scope its destination by network tag.** GCP egress
+destinations are IP ranges, full stop; `target_tags` on an egress rule selects
+the VMs the rule applies *from*. An earlier draft of this document specified
+"tag-to-tag" in both directions and was simply not expressible. The egress side
+is therefore scoped to the pool's own subnet range, which the module already
+knows, and the ingress side keeps `source_tags` — the narrowest statement of "a
+host in this pool" that is available where it is available.
+
+The Windows side's egress is already permitted **if** the band falls inside
+`database_egress_ports`, and it does not — that list is real database ports.
+Rather than widen a variable whose meaning is "a database somewhere in the
+estate", the band gets its own rule. Two narrow rules that state what they are
+beat one wide rule that has to be explained.
+
+### 3.4 The Windows job reads an address, never `localhost`
+
+There is no container runtime and no shared stack on the Windows host. A Windows
+job connects to `${{ needs.anchor.outputs.addr }}:${{ needs.anchor.outputs.pg }}`.
+
+`localhost` on a Windows fleet job is the copy-paste failure this contract
+manufactures — the Linux snippet is correct on Linux and silently wrong here —
+so `RUNNER11` (§4) refuses it rather than leaving it to a reviewer.
+
+Windows jobs are **not** pinned by this contract. `slots_per_host` is 1 on that
+pool, so pinning would serialize them onto one machine, while leaving them
+unpinned spends one host per concurrent Windows job. The pool exists for a
+single packaging build, so both answers are defensible and neither is imposed:
+`RUNNER9` covers Linux jobs only. A repository that runs several Windows jobs
+chooses in its own workflow.
+
+### 3.5 Teardown is host-side
+
+A downstream job cannot tear the stack down: it runs as a different uid and the
+owner's daemon socket is in a mode-0700 `/run/ci-s<i>`. An `if: always()`
+teardown step in the last consuming job fails silently, which is worse than no
+teardown at all.
+
+The stack is reclaimed by the owning slot — its between-jobs cleanup, plus a TTL
+sweep over the band so a stack whose workflow run ended does not hold ports
+until the host is recycled. Same slot, same uid, the only context that can
+address that daemon.
+
+---
+
+## 4. The gate
+
+Three rules join `check-runner-policy.sh`, which every consuming repository
+already runs, so adoption needs no new wiring.
+
+| id | Rule |
+|---|---|
+| `RUNNER9` | a fleet-reachable **Linux** job in a `pull_request` workflow resolves its `runs-on` from the anchor job's output, or is the anchor, or carries a declared exemption |
+| `RUNNER10` | at most **one** job across a repository's `pull_request` workflows is an infrastructure owner — counting `services:` blocks *and* `# ci: shared-infra-owner` markers together |
+| `RUNNER11` | a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
+
+`RUNNER10` counts the marker as well as `services:` for a reason that only shows
+up after adoption: a repository that has moved its database into
+`ci/compose.yaml` has **zero** `services:` blocks, so a rule counting only those
+passes vacuously while nothing at all enforces "brought up once". The marker is
+what the rule can still see once the primitive it replaced is gone.
+
+`RUNNER9` has to tolerate `RUNNER5`. Resolving `runs-on` from a job output *is*
+dynamic runner selection, which `RUNNER5` reports as UNDECIDED unless
+`--allow-dynamic-runner` is passed. A repository that has adopted this contract
+passes it, and `RUNNER9` then supplies the specificity `RUNNER5` gave up: not
+merely "an expression", but an expression naming the anchor job's output.
+
+Exemptions are **declared, not inferred**, in the workflow where a reviewer sees
+them — the same posture as `--forks=blocked` and `remote-reusable-allowed`. A
+release job that must not share a host with a pull request's test stack is a
+legitimate exemption; "this one was awkward" is not, and the marker carries the
+reason so the difference is legible.
+
+---
+
+## 5. Residual risk, honestly
+
+**Two workflows on one pull request get two hosts and two stacks.** Job outputs
+do not cross runs, so each workflow anchors independently. The mitigation is
+organisational, not technical — consolidate `pull_request` CI into one workflow,
+which the lane model already wants — and the failure mode is the status quo
+rather than a regression: two stacks with distinct compose project names, which
+is exactly what happens today.
+
+**A re-run, or a second workflow, brings the stack up twice.** The compose
+project name is derived from the pull-request number, so the second stack is a
+second complete stack rather than a half-initialised shared one. It costs a band
+until the TTL sweep (§3.5) reclaims it.
+
+**Slots on one host can already reach each other, and this document must not be
+read as granting that.** `setup_slot_netns` appends `FORWARD -i cis<idx> ACCEPT`
+and `FORWARD -o cis<idx> ACCEPT`, so a packet from `10.99.2.2` to `10.99.1.2` is
+forwarded today. The daemon sockets are 0700 and unaffected, so this is
+network-level reach and not container control — but it is reach that nothing
+decided to grant, and it is not the mechanism §3.2 uses. §3.2 goes through a
+named port band on the host address precisely so that the sanctioned path is the
+one workflows are written against, and so that closing the accidental one later
+breaks nothing. **Filed as
+[#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249); it lands
+before or with phase 3.**
+
+**A shared stack is a shared mutable object.** Six jobs against one Postgres can
+race in ways six private Postgres instances cannot, and the failure looks like
+flake. The contract is that suites sharing a stack are schema- or
+database-per-suite inside it; that is a per-repository obligation this document
+states and no gate can check.
+
+**The port band is reachable by every host in the pool, not only by the pull
+request's Windows host.** Tag scoping on the ingress side is the narrowest
+control the firewall offers, and the egress side cannot even do that (§3.3) —
+distinguishing "this pull request's Windows host" from "another pull request's
+Linux host" is not expressible there. The pool already serves one repository
+(README, "Isolation rules"), so the exposure is bounded by that rule and not by
+this one — which is another way of saying the one-repository-per-pool rule is
+load-bearing here in the same way `adr-windows-pool.md` §3A says it is
+load-bearing there.
+
+**A pull request is now bounded to `slots_per_host` concurrent slots.** For a
+pull request that today briefly gets eight slots because the fleet was quiet,
+this is slower. That is the trade being made deliberately: #205's evidence is
+that the unbounded case is what produces the 291 s waits and the displaced
+required checks, and a predictable four is worth more than an occasional eight.
+
+**The anchor serializes the start of a run.** Nothing pinned can begin until the
+anchor has landed on a host, so a cold pool pays one boot before any pinned job
+starts, where today several jobs would queue in parallel for the same boot. The
+anchor is also the owner job, whose work has to happen first anyway, so what is
+added is an environment read and not a job's worth of scheduling.
+
+---
+
+## 6. Delivery
+
+Each phase is independently landable and independently useful. Nothing before
+phase 5 changes any consuming repository's behaviour.
+
+| # | Phase | Touches | Ships without |
+|---|---|---|---|
+| 1 | This ADR and the published contract | `docs/` | — |
+| 2 | Affinity label at boot + `CI_HOST_LABEL`, both pools; **`collect_demand` recognises it (§2.5)** | `host-startup.sh`, `windows-host-startup.ps1`, `controller-startup.sh`, self-tests | any workflow using it |
+| 3 | Port band, per-slot DNAT, `CI_SHARED_INFRA_*`, TTL sweep; **[#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) first** | `host-startup.sh`, self-tests | any firewall change |
+| 4 | Ingress/egress band rules; pin hold in **both** `recycle_decision` and `drain_decision` (§2.4) | `ci-runner-network`, `recycle-decision.sh`, `drain-decision.sh`, self-tests | any workflow using it |
+| 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) |
+| 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — |
+| 7 | Per-repository adoption, workflow consolidation first | consuming repositories, one pull request each | — |
+
+Phase 5 lands the rules behind a flag for the same reason `--forks` is a flag: a
+gate that fails every repository on the day it merges is a gate that gets
+disabled in every repository on the day after.
+
+---
+
+## 7. Decided
+
+- One **workflow run** occupies one Linux host, and one Windows host only if it
+  needs one. Not one slot. "One pull request, one host" follows from
+  consolidating a repository's `pull_request` CI into one workflow, which is
+  step 2 of adoption.
+- Pinning is an affinity label plus an **anchor job**: the run's first fleet job
+  is unpinned and publishes the host it landed on. No runner-list API, no token,
+  no lease store. A host that predates the contract is a **supported answer**
+  that degrades to today's behaviour.
+- The controller will not drain **or cordon-for-recycle** a host holding an
+  unexpired pin hold, and `collect_demand` must recognise the affinity label
+  before the label ships.
+- Shared infrastructure is owned by exactly one job — the anchor — published
+  into a per-slot port band, DNAT'd on the host address, and reached by everyone
+  else at that address. Teardown is host-side; a downstream job cannot reach the
+  owner's daemon socket.
+- The Windows pool gets no container runtime. This was reconsidered as part of
+  this decision and re-affirmed: `adr-windows-pool.md` §4's reasoning is
+  unchanged, and rule 3 is satisfied by reachability, not by a runtime. Windows
+  jobs are not pinned.
+- The firewall gains two narrow rules for the band — ingress scoped by tag,
+  egress scoped by the pool subnet's range because GCP egress cannot scope by
+  tag — and no widening of `database_egress_ports`.
+- The gate rules are opt-in by flag until phase 7 completes.
