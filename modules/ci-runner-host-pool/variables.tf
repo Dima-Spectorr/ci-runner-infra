@@ -545,9 +545,19 @@ variable "runner_labels" {
   description = <<-EOT
     Extra labels each agent registers with, on top of the always-applied
     `self-hosted` and the pool name. Workflows select the pool through these.
+
+    `host-` is a RESERVED prefix: every agent already registers
+    `host-<instance-name>`, and the controller reads a `host-*` entry in a job's
+    `runs-on` as an affinity pin to one machine. A pool label sharing that
+    prefix would be read as a pin to a host that does not exist.
   EOT
   type        = list(string)
   default     = []
+
+  validation {
+    condition     = alltrue([for l in var.runner_labels : !startswith(l, "host-")])
+    error_message = "runner_labels may not start with `host-`: that prefix is reserved for the per-instance affinity label, and a pool label using it would be read as a pin to a host that does not exist."
+  }
 }
 
 variable "runner_group" {

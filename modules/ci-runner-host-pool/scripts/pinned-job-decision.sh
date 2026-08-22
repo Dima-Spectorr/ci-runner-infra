@@ -81,8 +81,16 @@ pinned_job_decision() {
   #     its own job's verdict) but both make the classifier lie, so anything
   #     carrying pattern syntax is not classified at all. A real label cannot
   #     contain these: GitHub restricts runner labels to plain text.
+  #
+  #     The backslash is built with printf rather than written literally in
+  #     the pattern list: shellcheck reads *'\'* as a botched attempt to
+  #     escape a single quote (SC1003) and fails the build over it. A quoted
+  #     expansion in a `case` pattern is matched literally, which is what is
+  #     wanted here in any event.
+  local _bs
+  _bs=$(printf '\\')
   case "$job_labels" in
-    *'*'* | *'?'* | *'['* | *']'* | *'\'*)
+    *'*'* | *'?'* | *'['* | *']'* | *"$_bs"*)
       echo "ignore:labels contain pattern syntax"; return 0 ;;
   esac
 
@@ -95,8 +103,23 @@ pinned_job_decision() {
   #    correctly and is a trap: `unset` on a local unshadows the caller's value
   #    rather than restoring the default, and this function is called from a
   #    loop inside the controller's tick.
+  #    A `host-*` label that this pool ALREADY REGISTERS is not an affinity pin
+  #    — it is an ordinary pool label that happens to share the prefix, and
+  #    `runner_labels` accepted such a label long before affinity existed. Read
+  #    as a pin it is catastrophic in a quiet way: `host-large` would parse as a
+  #    pin to an instance named `large`, no live host would answer it, and the
+  #    controller would cancel a perfectly schedulable run — while also dropping
+  #    it from scale-out demand, so nothing would even be built for it. The
+  #    pool's own list is the authority on which of its labels are its own.
+  #
+  #    `variables.tf` now also refuses a `host-`-prefixed `runner_labels` entry
+  #    outright, so a NEW pool cannot create this collision at all. This arm is
+  #    what keeps an EXISTING one from being cancelled on the way to fixing it.
   local pins="" rest="" l
   for l in ${job_labels//,/ }; do
+    case ",$pool_labels," in
+      *",$l,"*) rest="${rest:+$rest,}$l"; continue ;;
+    esac
     case "$l" in
       host-*) pins="${pins:+$pins,}$l" ;;
       *)      rest="${rest:+$rest,}$l" ;;

@@ -33,6 +33,18 @@ expect ignore: "another pool's job (a label we do not carry)" \
 expect ignore: "a subset of our labels is still not ours if one label is foreign" \
   queued "self-hosted,linux,arm64" "$POOL" "$BASE" "$LIVE" 0 300
 
+# --- a pool label that merely shares the prefix -------------------------------
+# A pool configured with `host-large` predates affinity, and `runner_labels`
+# accepted it. Read as a pin it would name an instance called `large`, no live
+# host would answer, and the controller would cancel a schedulable run while
+# also dropping it from demand -- wrong twice, and silently. The pool's own
+# list is the authority on which of its labels are its own.
+POOL_HL="self-hosted,linux,gcp,Repo,host-large"
+expect demand: "a pool label that starts with host- is a label, not a pin"   queued "self-hosted,linux,host-large" "$POOL_HL" "$BASE" "$LIVE" 99999 300
+expect pinned: "a real pin still reads as a pin on a pool that has such a label"   in_progress "self-hosted,linux,host-large,host-ci-lin-a1b2" "$POOL_HL" "$BASE" "$LIVE" 0 300
+expect orphan: "and a dead pin on that pool is still orphaned"   queued "self-hosted,linux,host-large,host-ci-lin-dead" "$POOL_HL" "$BASE" "$LIVE" 99999 300
+expect ignore: "a host- label this pool does NOT carry is a pin, not a label"   queued "self-hosted,linux,host-large" "$POOL" "$BASE" "$LIVE" 99999 300
+
 # --- ordinary demand ----------------------------------------------------------
 expect demand: "an unpinned job asking for a strict subset is demand" \
   queued "self-hosted,linux" "$POOL" "$BASE" "$LIVE" 0 300
