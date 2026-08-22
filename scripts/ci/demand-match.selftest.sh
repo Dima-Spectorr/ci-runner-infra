@@ -24,7 +24,7 @@ FILTER='
   [ .jobs[]?
     | select(.status == "queued" or .status == "in_progress")
     | select( ((.labels // []) | length) > 0 )
-    | select( ((.labels // []) | map(select(startswith("host-"))) | length) == 0 )
+    | select( (((.labels // []) | map(select(startswith("host-")))) - $mine_labels | length) == 0 )
     | select( ((.labels // []) - $mine_labels) | length == 0 )
   ] | length'
 
@@ -178,8 +178,24 @@ expect 1 "and the unpinned job beside it still counts — the filter excludes, i
 expect 1 "an in-progress pinned job is excluded too, so the pair of series stays consistent" \
   '{"jobs":[{"status":"in_progress","labels":["self-hosted","linux","host-ci-lin-a1b2"]},{"status":"in_progress","labels":["self-hosted","linux"]}]}'
 
+# --- a reserved prefix is not an owned one ------------------------------------
+#
+# `host-` is reserved for affinity FROM THIS ADR ONWARD; a pool configured
+# before it may already carry a label like `host-large`, and a job asking for it
+# is an ordinary job this pool can serve. Excluding it here while the pin filter
+# reads it as unpinned is how a job leaves ci_demand and ci_demand_pinned at the
+# same time -- counted nowhere, scaling nothing, and invisible on both charts.
+POOL_LABELS=$(printf '%s' "self-hosted,ci-runner-host-telnet,linux,gcp,Telnet-Emulation,host-large" \
+  | jq -R -c 'split(",") | map(select(length > 0))')
+expect 1 "a host- label that is one of THIS pool's own labels is ordinary demand" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","linux","host-large"]}]}'
+expect 0 "a host- label this pool does not carry is still a pin, and still excluded" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","linux","host-large","host-ci-lin-a1b2"]}]}'
+POOL_LABELS=$(printf '%s' "self-hosted,ci-runner-host-telnet,linux,gcp,Telnet-Emulation" \
+  | jq -R -c 'split(",") | map(select(length > 0))')
+
 # shellcheck disable=SC2016  # matching jq source text literally, on purpose.
-if grep -qF 'select( ((.labels // []) | map(select(startswith("host-"))) | length) == 0 )' "$CONTROLLER"; then
+if grep -qF 'select( (((.labels // []) | map(select(startswith("host-")))) - $mine_labels | length) == 0 )' "$CONTROLLER"; then
   PASS=$((PASS + 1))
 else
   FAIL=$((FAIL + 1))

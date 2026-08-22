@@ -357,7 +357,7 @@ collect_demand() {
       [ .jobs[]?
         | select(.status == "queued" or .status == "in_progress")
         | select( ((.labels // []) | length) > 0 )
-        | select( ((.labels // []) | map(select(startswith("host-"))) | length) == 0 )
+        | select( (((.labels // []) | map(select(startswith("host-")))) - $mine_labels | length) == 0 )
         | select( ((.labels // []) - $mine_labels) | length == 0 )
       ] as $mine
       | [ ($mine | length),
@@ -394,11 +394,17 @@ collect_demand() {
     # every $name in a function against every other function's locals, and
     # classify_pinned owns a local called `run`. A jq variable is invisible to
     # that check as anything other than a collision.
-    pinned_recs=$(printf '%s' "$jobs" | jq -r --arg rid "$id" '
+    # THE `host-` PREFIX IS RESERVED, NOT OWNED. A pool configured long before
+    # this ADR may legitimately carry a label like `host-large`, and a job naming
+    # it is an ordinary job for this pool -- not a pin at a named machine. So the
+    # test is "a host- label that is NOT one of ours", and it has to be the same
+    # test on both sides: a job excluded from ci_demand as pinned, and then read
+    # as unpinned here, would vanish from both series and never scale anything.
+    pinned_recs=$(printf '%s' "$jobs" | jq -r --arg rid "$id" --argjson mine_labels "$POOL_LABELS_JSON" '
       .jobs[]?
       | select(.status == "queued" or .status == "in_progress")
-      | select( ((.labels // []) | map(select(startswith("host-"))) | length) > 0 )
-      | [ $rid, .status, ((.labels // []) | join(",")), (.created_at // "") ]
+      | select( (((.labels // []) | map(select(startswith("host-")))) - $mine_labels | length) > 0 )
+      | [ $rid, .status, ((.labels // []) | join(",")), (.created_at // .started_at // "") ]
       | @tsv' 2>/dev/null)
     if [ -n "$pinned_recs" ]; then
       PINNED_JOBS="${PINNED_JOBS}${pinned_recs}
@@ -693,6 +699,10 @@ collect_hosts() {
 # One describe per tick for both facts we need from the MIG: the target size we
 # publish, and the baseInstanceName that bounds the orphan reaper to instances
 # THIS pool can create. Kept together so the reaper never costs an extra call.
+MIG_BASE=""
+MIG_TARGET=0
+MIG_TEMPLATE=""
+
 collect_mig() {
   local line
   line=$(gcloud compute instance-groups managed describe "$MIG" \
@@ -769,6 +779,13 @@ classify_pinned() {
   local blind=0
   [ -n "$live" ] || blind=1
 
+  # PINNED_JOBS holds one record per JOB; cancellation is per RUN. A matrix of
+  # eight pinned jobs is one wedged run, and posting eight cancels to it would
+  # publish eight units of ci_pinned_runs_cancelled for the one run that left.
+  # Two lists rather than one: `tried` stops the second POST, `gone` stops the
+  # second COUNT, and the gap between them is a run whose cancel was refused --
+  # which is still pinned demand, because the job is still sitting there.
+  local tried=" " gone=" "
   local now run status labels created age epoch verdict token code
   now=$(date +%s)
 
@@ -806,7 +823,24 @@ classify_pinned() {
           log "pinned run $run: $verdict — NOT cancelled, this tick has no host list (fail-safe)"
           continue
         fi
-        token=$(gh_token) || { log "pinned run $run: $verdict — no token, not cancelled"; continue; }
+        case "$gone" in *" $run "*) continue ;; esac
+        case "$tried" in
+          *" $run "*)
+            # Already posted for this run this tick and it did not take. The job
+            # is still queued, so it is still demand nothing can serve.
+            DEMAND_PINNED=$((DEMAND_PINNED + 1))
+            continue
+            ;;
+        esac
+        # A run nothing can cancel is a run still sitting in the queue: counted,
+        # so ci_demand_pinned shows the wedge instead of reporting zero of it.
+        token=$(gh_token) || {
+          DEMAND_PINNED=$((DEMAND_PINNED + 1))
+          tried="$tried$run "
+          log "pinned run $run: $verdict — no token, not cancelled"
+          continue
+        }
+        tried="$tried$run "
         code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X POST \
           -H "Authorization: Bearer $token" \
           -H "Accept: application/vnd.github+json" \
@@ -815,6 +849,7 @@ classify_pinned() {
           202 | 409)
             # 409 = already finishing. The run is leaving either way, and
             # counting it as handled is what stops the log repeating per tick.
+            gone="$gone$run "
             PIN_ORPHANED=$((PIN_ORPHANED + 1))
             log "pinned run $run: $verdict — cancelled (HTTP $code)"
             ;;
@@ -822,6 +857,7 @@ classify_pinned() {
             # Most likely the app lacks Actions: write. Say so once per tick
             # rather than retrying: the job still cannot run, and a wedge nobody
             # can see is exactly what this function exists to prevent.
+            DEMAND_PINNED=$((DEMAND_PINNED + 1))
             log "pinned run $run: $verdict — cancel REFUSED (HTTP $code); the run will wait for GitHub's own timeout"
             ;;
         esac
@@ -1840,8 +1876,12 @@ tick() {
   # AFTER collect_hosts, and that ordering is the whole reason this is not part
   # of collect_demand: classify_pinned decides whether a pinned run is servable,
   # which is a question about which hosts are alive.
-  classify_pinned
+  # BEFORE classify_pinned, which reads MIG_BASE to tell a host this pool owns
+  # from a host it never had. Under `set -u` reading it first does not misjudge
+  # anything -- it kills the controller, and systemd restarts it into the same
+  # tick for as long as the pinned job stays queued.
   collect_mig
+  classify_pinned
 
   local pool_size=0 slots_busy=0 idle_max=0 draining=0 stale_hosts=0
   local host status host_tpl host_uri busy idle age verdict tpl cordoned recycling
