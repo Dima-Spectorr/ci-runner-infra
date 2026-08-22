@@ -158,6 +158,12 @@ locals {
     file("${path.module}/scripts/beacon-decision.sh"),
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/watchdog-decision.sh"),
+    # Ahead of the controller itself, and not merely by convention: the
+    # controller calls pool_table_parse at FILE SCOPE, before its first tick,
+    # to learn which pools it serves. Concatenated after, the call would run
+    # against an undefined function and the controller would exit on boot
+    # having served nothing.
+    file("${path.module}/scripts/pool-table.sh"),
     file("${path.module}/scripts/controller-startup.sh"),
   ])
 
