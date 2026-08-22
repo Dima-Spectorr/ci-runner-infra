@@ -87,6 +87,14 @@ code_of() { grep -vE '^[[:space:]]*#' "$1"; }
 # a race with how much the writer had already buffered, which is why this passed
 # on a laptop and failed on a runner against a byte-identical script. Every
 # predicate below therefore matches against a string, not through a pipe.
+# And never `[^\n]*` for "anything on this line". These are POSIX EREs, not
+# PCRE: a bracket expression has no escape sequences, so `[^\n]` reads as "not a
+# backslash and not the letter n" -- it stops at the first n. Six assertions here
+# were written that way (#234): the five negative ones could not fire on any
+# realistic spelling of what they refuse, and the one positive one passed only
+# because the text it anchors on happens to carry neither character. `.` already
+# cannot cross a newline, because grep matches a line at a time, so `.*` is both
+# correct and simpler.
 matches() { # <text> <ere>
   local n
   n=$(printf '%s\n' "$1" | grep -cE -- "$2")
@@ -110,7 +118,7 @@ has_no_firewall_fence() { # <file>
   ! matches "$code" 'netsh[[:space:]]+(-[a-z]+[[:space:]]+)*advfirewall' || return 1
   # The block rule's own address+port, in any spelling that would fence the
   # metadata server off this host.
-  ! matches "$code" '(Block|Deny)[^\n]*169\.254\.169\.254|169\.254\.169\.254[^\n]*(Block|Deny)' || return 1
+  ! matches "$code" '(Block|Deny).*169\.254\.169\.254|169\.254\.169\.254.*(Block|Deny)' || return 1
 }
 
 # --- invariant 2: no credential reaches metadata or guest attributes ---------
@@ -124,7 +132,7 @@ has_no_credential_channel() { # <file>
   #    controller-startup.sh; a host that could write instance metadata could
   #    also re-create the key the controller just deleted.
   ! matches "$code" 'add-metadata|setMetadata' || return 1
-  ! matches "$code" 'instance/attributes[^\n]*-Method[[:space:]]+(Put|Post)' || return 1
+  ! matches "$code" 'instance/attributes.*-Method[[:space:]]+(Put|Post)' || return 1
 
   # 2. Every guest-attribute write names a key from the allow-list. `boot` is the
   #    only one this script writes; `workers` and `ts` belong to the beacon and
@@ -143,7 +151,7 @@ has_no_credential_channel() { # <file>
   # 3. And nothing credential-shaped reaches either channel, whatever the key is
   #    called. This is the check that survives somebody adding an allow-listed
   #    key and putting the wrong thing in it.
-  ! matches "$code" '(Write-GuestAttribute|add-metadata|guest-attributes)[^\n]*([Pp]assword|[Ss]ecret|[Tt]oken|[Cc]redential)' || return 1
+  ! matches "$code" '(Write-GuestAttribute|add-metadata|guest-attributes).*([Pp]assword|[Ss]ecret|[Tt]oken|[Cc]redential)' || return 1
 
   # 4. The slot password never leaves the SecureString it is born in. Phase 1
   #    builds a PSCredential and hands it to phase 5; a plaintext conversion is
@@ -406,7 +414,7 @@ has_agent_registration() { # <file>
   # The plaintext-password spellings this design exists to avoid. Every one of
   # them puts the slot credential in the process table of a host whose local
   # accounts run pull-request code.
-  ! matches "$code" 'windowslogonpassword|password=[^\n]*\$|StartPassword' || return 1
+  ! matches "$code" 'windowslogonpassword|password=.*\$|StartPassword' || return 1
 }
 
 has_cleared_recovery_actions() { # <file>
@@ -418,7 +426,7 @@ has_cleared_recovery_actions() { # <file>
   # drains a host by deregistering its agents; an agent the SCM restarts after a
   # job-time failure re-registers, takes more work, and keeps a host the
   # controller believes is draining alive forever.
-  matches "$code" 'sc\.exe failure[^\n]*reset= 0 actions=' || return 1
+  matches "$code" 'sc\.exe failure.*reset= 0 actions=' || return 1
   matches "$code" 'Clear-ServiceRecoveryAction -ServiceName \$serviceName -AgentName \$name' || return 1
 
   # OWNERSHIP travels with the name, at every call site. -AgentName is mandatory
@@ -437,7 +445,7 @@ has_cleared_recovery_actions() { # <file>
   # deliberately — those must come back — but writing one here is the exact
   # regression, and `actions= restart/60000` is what a reader who thinks
   # "services should be resilient" types.
-  ! matches "$code" 'actions=[^\n]*restart' || return 1
+  ! matches "$code" 'actions=.*restart' || return 1
 }
 
 has_worthless_host_identity_probe() { # <file>
@@ -1179,6 +1187,14 @@ mutate "the profile-wide default-block form" \
 mutate "the same fence spelled through netsh" \
   's|^\$script:BrokerServiceName.*|\& netsh advfirewall firewall add rule name=ci dir=out action=block remoteip=169.254.169.254|' \
   has_no_firewall_fence
+# …and the address+action pair with no tool name in it at all. Every mutation
+# above is caught by an EARLIER assertion in this predicate, so none of them was
+# ever evidence that the address check works -- and until #234 it did not, because
+# `[^\n]*` reads as "not a backslash and not the letter n" and `-Action Block` has
+# an n in it. `Outbound` below puts an n between the two anchors on purpose.
+mutate "the metadata fence spelled without a cmdlet name" \
+  's|^\$script:BrokerServiceName.*|$null = Deny-Outbound -Address 169.254.169.254|' \
+  has_no_firewall_fence
 
 # 2. A credential reaches a channel job code can read.
 mutate "a credential written to guest attributes" \
@@ -1192,6 +1208,17 @@ mutate "an allow-listed key carrying the wrong thing" \
   has_no_credential_channel
 mutate "the slot password converted out of its SecureString" \
   's|^\$script:BrokerServiceName.*|$plain = ConvertFrom-SecureString $secure -AsPlainText|' \
+  has_no_credential_channel
+# The host writing instance metadata over the API rather than through gcloud --
+# the second spelling of item 1, which had no mutation behind it at all. `runner`
+# carries the n that #234's `[^\n]*` choked on.
+mutate "instance metadata written by the host over the API" \
+  's|^\$script:BrokerServiceName.*|$null = Invoke-RestMethod -Uri "$md/instance/attributes/runner" -Method Put -Body $t|' \
+  has_no_credential_channel
+# …and item 3 with an n between the channel and the credential, which is the
+# case the old pattern let through.
+mutate "an allow-listed key carrying a registration token" \
+  "s|Write-GuestAttribute -Key 'boot' -Value (Get-BeaconTimestamp)|Write-GuestAttribute -Key 'boot' -Value \\\$registrationToken|" \
   has_no_credential_channel
 
 # 3. The hooks become conditional — the exact edit the invariant exists for.
@@ -1324,6 +1351,13 @@ mutate "the service left running as the SCM default identity" \
 mutate "the slot password handed to config.cmd as plaintext" \
   's|^\$script:RunnerTemplate.*|$p = --windowslogonpassword|' \
   has_agent_registration
+# The mutation above trips the `windowslogonpassword` alternative; the
+# `password=.*\$` one had nothing behind it, and `[^\n]*` meant it only ever fired
+# when no n stood between the two halves. This is the leak in its likeliest
+# shape -- the plaintext concatenated into a log line -- with `run` in the gap.
+mutate "the slot password concatenated into a log line" \
+  's|^\$script:RunnerTemplate.*|Write-BootLog ("password= for this run " + $plain)|' \
+  has_agent_registration
 
 # 8b. The identity change applied to a service that never stopped, or to one that
 #     was never this slot's. Every one of these leaves a boot whose every log
@@ -1362,6 +1396,14 @@ mutate "the guard re-validating shape but no longer ownership" \
   has_cleared_recovery_actions
 mutate "a restart action written instead of an empty one" \
   's|reset= 0 actions= |reset= 86400 actions= restart/60000|' \
+  has_cleared_recovery_actions
+# The mutation above is caught by the POSITIVE `reset= 0 actions=` assertion,
+# which fires first, so the empty-list assertion had nothing behind it. This one
+# leaves `reset= 0 actions=` intact so only the empty-list assertion can catch
+# it, and puts an n (`run`, the action that runs a command) in front of the
+# restart -- the gap `[^\n]*` could not cross.
+mutate "a restart action reintroduced behind a run action" \
+  's|reset= 0 actions= |reset= 0 actions= run/1000/restart/60000|' \
   has_cleared_recovery_actions
 mutate "a failed clear downgraded to a warning" \
   's|Deny-Boot ("could not clear the recovery actions on \$ServiceName|Write-BootLog ("recovery actions not cleared on $ServiceName|' \
