@@ -268,31 +268,45 @@ locals {
   # scripts/ci/shared-infra-band.selftest.sh.
   shared_infra_band_base  = 35000
   shared_infra_band_width = 100
-  shared_infra_band_span = format(
-    "%d-%d",
-    local.shared_infra_band_base + local.shared_infra_band_width,
-    local.shared_infra_band_base + var.shared_infra_slots_per_host * local.shared_infra_band_width + local.shared_infra_band_width - 1,
-  )
 
-  shared_infra_enabled    = var.shared_infra_id != ""
-  shared_infra_source_tag = "ci-shared-infra-${var.shared_infra_id}"
-  shared_infra_stack_tag  = "ci-shared-infra-stack-${var.shared_infra_id}"
+  # ONE ENTRY PER PAIR, and every derived value computed here rather than inline
+  # in each resource. This module is created once per PROJECT while a pair
+  # belongs to a REPOSITORY, so a project hosting two repositories' pools has
+  # two pairs; the two rules below are the only resources in this module that
+  # are per-pair, which is why they are the only ones keyed. Deriving the span
+  # and the tags twice, once in each resource, is how an ingress rule and an
+  # egress rule come to disagree — and that failure does not surface as a red
+  # apply, it surfaces as a job that hangs until its timeout.
+  shared_infra = {
+    for k, v in var.shared_infra_pairs : k => {
+      source_tag = "ci-shared-infra-${k}"
+      stack_tag  = "ci-shared-infra-stack-${k}"
+      band_span = format(
+        "%d-%d",
+        local.shared_infra_band_base + local.shared_infra_band_width,
+        local.shared_infra_band_base + v.slots_per_host * local.shared_infra_band_width + local.shared_infra_band_width - 1,
+      )
+      destination_ranges = coalesce(v.destination_ranges, var.shared_infra_destination_ranges)
+    }
+  }
 }
 
 resource "google_compute_firewall" "shared_infra_ingress" {
-  count = local.shared_infra_enabled ? 1 : 0
+  # An empty map — the default — creates nothing, which is the gate: a project
+  # that declared no pair gets exactly today's posture and no new rules.
+  for_each = local.shared_infra
 
   project = var.project_id
-  name    = "${var.name_prefix}-allow-shared-infra"
+  name    = "${var.name_prefix}-allow-si-${each.key}"
   network = var.network
 
   direction   = "INGRESS"
-  source_tags = [local.shared_infra_source_tag]
-  target_tags = [local.shared_infra_stack_tag]
+  source_tags = [each.value.source_tag]
+  target_tags = [each.value.stack_tag]
 
   allow {
     protocol = "tcp"
-    ports    = [local.shared_infra_band_span]
+    ports    = [each.value.band_span]
   }
 
   # Which host reached which stack, on which port. This is a rule that opens a
@@ -307,19 +321,19 @@ resource "google_compute_firewall" "shared_infra_ingress" {
 }
 
 resource "google_compute_firewall" "shared_infra_egress" {
-  count = local.shared_infra_enabled ? 1 : 0
+  for_each = local.shared_infra
 
   project = var.project_id
-  name    = "${var.name_prefix}-allow-egress-shared-infra"
+  name    = "${var.name_prefix}-allow-si-eg-${each.key}"
   network = var.network
 
   direction          = "EGRESS"
-  destination_ranges = var.shared_infra_destination_ranges
-  target_tags        = [local.shared_infra_source_tag] # the SENDING VMs
+  destination_ranges = each.value.destination_ranges
+  target_tags        = [each.value.source_tag] # the SENDING VMs
 
   allow {
     protocol = "tcp"
-    ports    = [local.shared_infra_band_span]
+    ports    = [each.value.band_span]
   }
 
   dynamic "log_config" {

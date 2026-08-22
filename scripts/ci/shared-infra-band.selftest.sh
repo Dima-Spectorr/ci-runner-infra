@@ -27,6 +27,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HOST_SH="${BAND_HOST_SH:-$ROOT/modules/ci-runner-host-pool/scripts/host-startup.sh}"
 NET_TF="${BAND_NET_TF:-$ROOT/modules/ci-runner-network/main.tf}"
 POOL_TF="${BAND_POOL_TF:-$ROOT/modules/ci-runner-host-pool/main.tf}"
+NET_VARS="${BAND_NET_VARS:-$ROOT/modules/ci-runner-network/variables.tf}"
 
 fail=0
 ok()  { echo "  ok    $1"; }
@@ -34,7 +35,7 @@ bad() { echo "  FAIL  $1"; fail=1; }
 
 echo "shared-infra-band self-test:"
 
-for f in "$HOST_SH" "$NET_TF" "$POOL_TF"; do
+for f in "$HOST_SH" "$NET_TF" "$POOL_TF" "$NET_VARS"; do
   if [ ! -r "$f" ]; then
     echo "  FAIL  missing $f — every check below would be vacuous"
     exit 1
@@ -110,16 +111,17 @@ done
 
 # --- the span is built from the constants, not written out as a literal -------
 
-if grep -qE 'shared_infra_band_base \+ var\.shared_infra_slots_per_host \* local\.shared_infra_band_width' "$NET_TF"; then
+if grep -qE 'shared_infra_band_base \+ v\.slots_per_host \* local\.shared_infra_band_width' "$NET_TF"; then
   ok "the span's upper end follows slots_per_host"
 else
   bad "the span's upper end no longer follows slots_per_host — a fixed span silently drops the slots above it"
 fi
 
-if grep -qE 'ports +?= +?\[local\.shared_infra_band_span\]' "$NET_TF"; then
+got_ports=$(grep -cE 'ports +?= +?\[each\.value\.band_span\]' "$NET_TF")
+if [ "$got_ports" -eq 2 ]; then
   ok "both rules take their ports from the computed span"
 else
-  bad "a band rule names its ports literally instead of using local.shared_infra_band_span"
+  bad "$got_ports of the 2 band rules take their ports from each.value.band_span — one that names its ports literally drifts from the other, and the pair then permits different ranges in each direction"
 fi
 
 # --- the tags: source on both pools, stack tag on Linux only ------------------
@@ -143,13 +145,13 @@ else
   bad "the stack tag is not gated on host_os — a Windows host carrying it becomes an ingress TARGET"
 fi
 
-if grep -qE 'target_tags +?= +?\[local\.shared_infra_stack_tag\]' "$NET_TF"; then
+if grep -qE 'target_tags +?= +?\[each\.value\.stack_tag\]' "$NET_TF"; then
   ok "the ingress rule targets the stack tag, not the source tag"
 else
   bad "the ingress rule does not target the stack tag — with the source tag as target it admits traffic TO every host of the pair, Windows included"
 fi
 
-if grep -qE 'source_tags +?= +?\[local\.shared_infra_source_tag\]' "$NET_TF"; then
+if grep -qE 'source_tags +?= +?\[each\.value\.source_tag\]' "$NET_TF"; then
   ok "the ingress rule's source is the pair-wide tag"
 else
   bad "the ingress rule's source is not the pair-wide tag — the Windows host would match no source and rule 3 would fail closed"
@@ -162,10 +164,38 @@ fi
 # moment a longer name is added beside it — and it breaks as a red gate on an
 # unrelated change, which is how a gate gets deleted rather than fixed.
 
-if grep -qE 'shared_infra_enabled +?= +?var\.shared_infra_id != ""' "$NET_TF"; then
-  ok "the rules are gated on shared_infra_id"
+# shellcheck disable=SC2016  # the ${...} here is Terraform interpolation in the file being searched, not a shell expansion
+if grep -qF 'source_tag = "ci-shared-infra-${k}"' "$NET_TF"; then
+  ok "the network's source tag is built from the pair key"
 else
-  bad "the band rules are not gated — a project that asked for no pair gets new firewall rules"
+  bad "the network's source tag is not built from the pair key — it would no longer name the tag the pool module puts on the hosts, and the rule would match nothing"
+fi
+
+# shellcheck disable=SC2016  # the ${...} here is Terraform interpolation in the file being searched, not a shell expansion
+if grep -qF 'stack_tag  = "ci-shared-infra-stack-${k}"' "$NET_TF"; then
+  ok "the network's stack tag is built from the pair key"
+else
+  bad "the network's stack tag is not built from the pair key — the ingress rule would target a tag no Linux host carries"
+fi
+
+# --- one rule per PAIR, and none at all by default ----------------------------
+#
+# The module is created once per project; a pair belongs to a repository. A
+# scalar input could describe only the first repository's pair, and pointing it
+# at the second silently retargets the first one's rules away from its own
+# hosts — a rule that still exists, still applies clean, and admits nothing.
+
+got_each=$(grep -cE 'for_each +?= +?local\.shared_infra$' "$NET_TF")
+if [ "$got_each" -eq 2 ]; then
+  ok "both band rules are keyed per pair"
+else
+  bad "$got_each of the 2 band rules iterate local.shared_infra — a rule left on a scalar serves one pair while its partner serves all of them, and the two halves of the path stop agreeing"
+fi
+
+if grep -qE '^  default += +\{\}' "$NET_VARS"; then
+  ok "the pair map is empty by default"
+else
+  bad "shared_infra_pairs is not empty by default — a project that asked for no pair gets new firewall rules"
 fi
 
 # --- mutations ----------------------------------------------------------------
@@ -187,12 +217,14 @@ mutate() {
   # mutate <label> <file-key> <sed-expression>
   local label="$1" key="$2" expr="$3" out
   cp "$HOST_SH" "$tmp/host.sh"; cp "$NET_TF" "$tmp/net.tf"; cp "$POOL_TF" "$tmp/pool.tf"
+  cp "$NET_VARS" "$tmp/net-vars.tf"
   case "$key" in
     host) sed -i "$expr" "$tmp/host.sh" ;;
     net)  sed -i "$expr" "$tmp/net.tf"  ;;
     pool) sed -i "$expr" "$tmp/pool.tf" ;;
+    vars) sed -i "$expr" "$tmp/net-vars.tf" ;;
   esac
-  out=$(BAND_SELFTEST_CHILD=1 BAND_HOST_SH="$tmp/host.sh" BAND_NET_TF="$tmp/net.tf" BAND_POOL_TF="$tmp/pool.tf"         bash "${BASH_SOURCE[0]}" 2>&1)
+  out=$(BAND_SELFTEST_CHILD=1 BAND_HOST_SH="$tmp/host.sh" BAND_NET_TF="$tmp/net.tf" BAND_POOL_TF="$tmp/pool.tf" BAND_NET_VARS="$tmp/net-vars.tf"         bash "${BASH_SOURCE[0]}" 2>&1)
   if [ -n "$out" ] && printf '%s' "$out" | grep -q FAIL; then
     ok "mutation caught: $label"
   else
@@ -204,11 +236,14 @@ echo "  -- mutations"
 mutate "host base moved to 40000"            host 's/^CI_BAND_BASE=35000/CI_BAND_BASE=40000/'
 mutate "host width narrowed to 10"           host 's/^CI_BAND_WIDTH=100/CI_BAND_WIDTH=10/'
 mutate "firewall base moved to 35001"        net  's/shared_infra_band_base *= *35000/shared_infra_band_base = 35001/'
-mutate "span drops the last slot"            net  's/var.shared_infra_slots_per_host \* local.shared_infra_band_width/(var.shared_infra_slots_per_host - 1) * local.shared_infra_band_width/'
-mutate "ingress targets the source tag"      net  's/target_tags *= *\[local.shared_infra_stack_tag\]/target_tags = [local.shared_infra_source_tag]/'
-mutate "ingress sources the stack tag"       net  's/source_tags *= *\[local.shared_infra_source_tag\]/source_tags = [local.shared_infra_stack_tag]/'
-mutate "rules no longer gated on the id"     net  's/shared_infra_enabled *= *var.shared_infra_id != ""/shared_infra_enabled = true/'
-mutate "ports written as a literal span"     net  's/ports *= *\[local.shared_infra_band_span\]/ports = ["35100-35499"]/'
+mutate "span drops the last slot"            net  's/v.slots_per_host \* local.shared_infra_band_width/(v.slots_per_host - 1) * local.shared_infra_band_width/'
+mutate "ingress targets the source tag"      net  's/target_tags *= *\[each.value.stack_tag\]/target_tags = [each.value.source_tag]/'
+mutate "ingress sources the stack tag"       net  's/source_tags *= *\[each.value.source_tag\]/source_tags = [each.value.stack_tag]/'
+mutate "ports written as a literal span"     net  's/ports *= *\[each.value.band_span\]/ports = ["35100-35499"]/'
+mutate "egress left un-keyed"                net  '/shared_infra_egress/,$ s/for_each = local.shared_infra$/count = 1/'
+mutate "source tag no longer built from key" net  's/source_tag = "ci-shared-infra-\${k}"/source_tag = "ci-shared-infra"/'
+mutate "stack tag no longer built from key"  net  's/stack_tag  = "ci-shared-infra-stack-\${k}"/stack_tag  = "ci-shared-infra-stack"/'
+mutate "pairs default to a populated map"    vars 's/^  default = {}$/  default = { demo = { slots_per_host = 4 } }/'
 mutate "stack tag no longer gated on linux"  pool 's/var.host_os == "linux" ? /true ? /'
 
 if [ "$fail" -eq 0 ]; then

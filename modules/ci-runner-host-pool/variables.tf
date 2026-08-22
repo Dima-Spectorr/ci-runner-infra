@@ -767,12 +767,28 @@ variable "shared_infra_id" {
     Empty (the default) means this pool takes part in no shared-infrastructure
     pair and carries neither tag. The matching rules live in
     `ci-runner-network`; a tag with no rule does nothing.
+
+    SETTING THIS ON A POOL THAT IS ALREADY RUNNING DOES NOT TAG ITS HOSTS. The
+    tags live on the instance template, the MIG's update policy is
+    OPPORTUNISTIC, and OPPORTUNISTIC means "next time the instance is replaced
+    anyway" — so the apply goes green, the new template is correct, and every
+    host currently up keeps the old one. The rules then match nothing, and the
+    symptom is not an error: it is a connection that hangs until the job's
+    timeout, on a pair the operator has every reason to believe is configured.
+
+    So adopting a pair on a live pool is a two-step change: apply, then recycle.
+    Either scale the pool to zero and let it come back (cheapest on a pool that
+    scales to zero already, which these do), or let the controller's ordinary
+    age-based recycle roll the fleet over and accept that the pair does not work
+    until the last pre-change host is gone. There is no third option that leaves
+    a running host correct, because a network tag cannot be changed on a VM the
+    MIG owns without the MIG replacing it.
   EOT
   type        = string
   default     = ""
 
   validation {
-    condition     = var.shared_infra_id == "" || can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.shared_infra_id))
-    error_message = "shared_infra_id must be a valid GCP network-tag component: lowercase letters, digits and dashes, starting with a letter. It is concatenated into a tag name, and an invalid one fails the apply at the API rather than at the plan."
+    condition     = var.shared_infra_id == "" || can(regex("^[a-z]([-a-z0-9]{0,39}[a-z0-9])?$", var.shared_infra_id))
+    error_message = "shared_infra_id must be a valid GCP network-tag component: lowercase letters, digits and dashes, starting with a letter, at most 41 characters. 41 and not 63 because it is concatenated into `ci-shared-infra-stack-<id>`, whose 22-character prefix has to fit inside the 63-character tag limit alongside it. An invalid or over-long one fails the apply at the API rather than at the plan."
   }
 }
