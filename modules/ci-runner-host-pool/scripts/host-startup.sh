@@ -23,6 +23,22 @@ RUNNER_HOME="/opt/actions-runner"
 SLOT_ROOT="/opt/ci/slots"
 LOG_TAG="ci-host"
 
+# A slot's HOME is disposable. It is emptied and rebuilt from $SLOT_TEMPLATE
+# before every job, after every job and at every agent start, so nothing a job
+# leaves there is ever seen by the next one (#110). These two directories are
+# what makes that possible.
+#
+# The template is the ONLY description of what a slot starts with: root-owned,
+# never writable by a slot, and used both when a slot is first provisioned and
+# on every reset, so "fresh" and "reset" cannot drift apart.
+SLOT_TEMPLATE="/opt/ci/slot-template"
+# Per-slot state that must SURVIVE the home being replaced: the rootless
+# daemon's data root, which is moved out of the home for exactly that reason
+# (see install_dockerd_unit), and the marker recording that the slot was left
+# clean. Root-owned all the way down except the daemon's own subdirectory, so a
+# slot cannot forge its own clean bill of health.
+SLOT_STATE="/var/lib/ci-slot"
+
 # Each slot runs as its OWN Linux user, `ci-s<idx>`, with its OWN rootless
 # Docker daemon. Slots used to share the `runner` account and the one system
 # daemon, which meant a job could reach /var/run/docker.sock and from there
@@ -80,7 +96,7 @@ JOB_SA=$(md "instance/attributes/ci-job-service-account")
 BROKER_PORT=$(md "instance/attributes/ci-job-broker-port")
 HOSTNAME_SHORT=$(md "instance/name")
 # Registry hosts the job identity authenticates to. Comma-separated, set by the
-# module; see write_slot_docker_config for why the list is explicit.
+# module; see write_docker_cred_helpers for why the list is explicit.
 REGISTRY_HOSTS=$(md "instance/attributes/ci-registry-hosts")
 # The regional Artifact Registry of the host's OWN region is always included:
 # the overwhelmingly common case is a repository pulling a builder image it
@@ -340,43 +356,214 @@ EOF
 # agent is killed mid-job — exactly the case that leaves the most behind.
 # JOB_STARTED alone leaves the idle window open. Together, a job neither inherits
 # nor bequeaths one.
+#
+# --- and why it is now the whole slot, not two credential stores (#110) -------
+#
+# The first version of this removed ~/.config/gcloud and ~/.gsutil. That is a
+# DENYLIST: it removes what it was told about and leaves everything else, and
+# what it left is EXECUTED by the next job on the same slot — ~/.gitconfig's
+# `core.hooksPath` fires on the next actions/checkout, ~/.bashrc and ~/.profile
+# fire on the next `run:` step, ~/.local/bin shadows a real binary, and
+# `.git/hooks/*` in a leftover workspace survives a `git clean -ffdx`. Naming those
+# four would only make the denylist longer; the fifth is whatever nobody has
+# thought of yet.
+#
+# So the home is REPLACED, not cleaned: every entry is deleted and $SLOT_TEMPLATE
+# is copied back. What a job starts with becomes a property of a tree this
+# script writes and no slot can reach, instead of a property of the list of
+# paths someone remembered. The same argument retires _work's leftovers — the
+# previous workspace and `_tool`, which is on PATH.
+#
+# That is only affordable because nothing a slot must KEEP lives in the home any
+# more. The dependency caches are under $CACHE_SLOTS, the daemon's socket is in
+# $XDG_RUNTIME_DIR, and the daemon's data root was moved to $SLOT_STATE/<idx>
+# for precisely this reason (see install_dockerd_unit) — so a reset costs a copy
+# of a few dotfiles, not a re-pull of every image the host has warmed.
 install_job_hooks() {
   mkdir -p /opt/ci/job-hooks || return 1
   chown root:root /opt/ci/job-hooks || return 1
-  # Root-owned and not slot-writable: this one file is executed by every slot on
-  # the host, so a slot that could rewrite it would be running code in every
-  # OTHER slot's uid. The hook itself runs as the slot user and removes only that
-  # user's own files.
+  # Root-owned and not slot-writable: these files are executed by every slot on
+  # the host, so a slot that could rewrite one would be running code in every
+  # OTHER slot's uid — and one of them now runs as root.
   chmod 0755 /opt/ci/job-hooks || return 1
 
-  cat >/opt/ci/job-hooks/reset-credentials.sh <<EOF
+  # Two shims, because the runner tells a hook nothing about which stage it is
+  # in: ACTIONS_RUNNER_HOOK_JOB_STARTED and ..._COMPLETED are two variables
+  # naming two paths, and neither script is passed an argument saying which one
+  # it is. Two one-line files is the whole of the difference.
+  local stage
+  for stage in started completed; do
+    cat >"/opt/ci/job-hooks/job-$stage.sh" <<EOF
 #!/usr/bin/env bash
-# Installed by host-startup.sh. Runs as the slot user, before every job starts
-# and after every job ends. See install_job_hooks() for why.
+# Installed by host-startup.sh. Runs as the slot user. See install_job_hooks().
+set -uo pipefail
+# -n: never prompt. There is no tty and nobody to answer it, so a sudoers file
+# that stopped granting this must fail the job at once rather than hang it until
+# the job's own timeout.
+exec sudo -n /opt/ci/job-hooks/slot-reset.sh $stage
+EOF
+    chown root:root "/opt/ci/job-hooks/job-$stage.sh" || return 1
+    chmod 0755 "/opt/ci/job-hooks/job-$stage.sh" || return 1
+  done
+
+  # The reset itself, and it runs as ROOT. Not a preference: a job's containers
+  # write into the slot's tree through a user namespace, so the files they leave
+  # behind are owned by SUBORDINATE uids and the directories among them are not
+  # writable by the slot user. `rm -rf` run as the slot user returns EACCES on
+  # exactly the leftovers that matter most — and, under `set -uo pipefail` with
+  # no `-e`, would have reported a partial wipe as a completed one.
+  cat >/opt/ci/job-hooks/slot-reset.sh <<EOF
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as root. See install_job_hooks() for why.
 set -uo pipefail
 
-# The passwd entry, not \$HOME: this runs inside the agent's environment, and the
-# directory being deleted should be decided by the host's account database rather
-# than by a variable a job could have changed.
-home=\$(getent passwd "\$(id -un)" | cut -d: -f6)
-case "\$home" in
-  /home/$SLOT_USER_PREFIX*) ;;
-  *) echo "credential reset: refusing to clean '\$home' — not a slot home" >&2; exit 1 ;;
+SLOT_ROOT="$SLOT_ROOT"
+SLOT_STATE="$SLOT_STATE"
+SLOT_TEMPLATE="$SLOT_TEMPLATE"
+SLOT_USER_PREFIX="$SLOT_USER_PREFIX"
+
+say() { logger -t ci-slot-reset -- "\$*" 2>/dev/null || true; echo "slot reset: \$*" >&2; }
+
+stage="\${1:-}"
+idx=""
+
+# WHICH slot is being reset is decided here, and never by the caller when the
+# caller is a slot. sudo sets SUDO_UID itself from the real invoking user and
+# env_reset drops the caller's own copy, so a slot cannot name a DIFFERENT
+# slot's index — it does not get to name one at all. The sudoers rule matches
+# the two permitted argument forms literally, for the same reason.
+if [ -n "\${SUDO_UID:-}" ]; then
+  u=\$(getent passwd "\$SUDO_UID" | cut -d: -f1)
+  case "\$u" in
+    "\$SLOT_USER_PREFIX"[0-9]*) idx=\${u#"\$SLOT_USER_PREFIX"} ;;
+    *) say "refusing: uid \$SUDO_UID (\$u) is not a slot user"; exit 1 ;;
+  esac
+else
+  # No sudo in the picture: this is systemd's ExecStartPre, which has to supply
+  # the index because there is no invoking user to read it from.
+  idx="\${2:-}"
+fi
+
+case "\$stage:\$idx" in
+  started:[0-9]*|completed:[0-9]*|boot:[0-9]*) ;;
+  *) say "refusing: bad stage or index '\$stage'/'\$idx'"; exit 1 ;;
 esac
 
-# Only credential stores that NOTHING on this host owns. ~/.docker/config.json is
-# deliberately absent: write_slot_docker_config puts the registry helper there,
-# and removing it would fail every container job at "Initialize containers"
-# instead of fixing anything.
-rc=0
-for d in "\$home/.config/gcloud" "\$home/.gsutil"; do
-  rm -rf -- "\$d" || { echo "credential reset: could not remove \$d" >&2; rc=1; }
-done
-exit \$rc
-EOF
+u="\$SLOT_USER_PREFIX\$idx"
+# The passwd entry, and then a shape check on what it returned. This deletes a
+# directory tree as root, so the single input that decides WHICH tree comes from
+# the account database rather than from a variable, and still has to look like a
+# slot home when it gets here.
+home=\$(getent passwd "\$u" | cut -d: -f6)
+case "\$home" in
+  /home/"\$SLOT_USER_PREFIX"[0-9]*) ;;
+  *) say "refusing: home of \$u is '\$home', not a slot home"; exit 1 ;;
+esac
+[ -d "\$SLOT_TEMPLATE" ] || { say "refusing: \$SLOT_TEMPLATE is missing"; exit 1; }
 
-  chown root:root /opt/ci/job-hooks/reset-credentials.sh || return 1
-  chmod 0755 /opt/ci/job-hooks/reset-credentials.sh || return 1
+marker="\$SLOT_STATE/\$idx/clean"
+
+# How much of _work goes. _actions and _temp are filled by the runner BEFORE the
+# job-started hook is called — actions are downloaded in JobExtension and _temp
+# carries the hook's own invocation — so removing them at that point breaks the
+# job that is starting. Everything else under _work belongs to the last job: the
+# checked-out workspace with its .git/hooks, and _tool, which is on PATH.
+#
+# At `completed` and `boot` nothing under _work belongs to a live job, so the
+# exception is dropped and _actions goes with the rest.
+keep_actions=0
+[ "\$stage" = started ] && keep_actions=1
+
+# A job-started that cannot find the marker is a job about to run on a slot
+# whose previous job never reached its completed hook — cancelled hard, agent
+# killed, host lost power mid-job. That is the state that leaves the most
+# behind, and it is also the one state in which _actions cannot be trusted. So
+# the exception is dropped and the job is FAILED rather than run: one lost job
+# that says why beats a job that silently executed a previous job's action code.
+fail_after=0
+if [ "\$stage" = started ] && [ ! -f "\$marker" ]; then
+  say "slot \$idx was not left clean — its previous job never completed; wiping everything and failing this job"
+  keep_actions=0
+  fail_after=1
+fi
+# Cleared FIRST. Everything below can fail, and a marker left in place by a
+# reset that did not finish is a lie the next job would believe.
+rm -f -- "\$marker"
+
+rc=0
+
+# THE HOME, wholesale. -mindepth 1 so the home itself keeps its inode, its
+# ownership and its mode: the shell dotfiles, the caches a tool decided to put
+# there and anything a job planted are all just entries inside it.
+find "\$home" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || { say "slot \$idx: could not empty \$home"; rc=1; }
+cp -a "\$SLOT_TEMPLATE/." "\$home/" || { say "slot \$idx: could not restore \$home from \$SLOT_TEMPLATE"; rc=1; }
+chown -R "\$u:\$u" "\$home" || { say "slot \$idx: could not chown \$home"; rc=1; }
+chmod 0750 "\$home" || { say "slot \$idx: could not chmod \$home"; rc=1; }
+
+# THE WORK FOLDER. Absent until the slot's first job, which is not a failure.
+work="\$SLOT_ROOT/\$idx/_work"
+if [ -d "\$work" ]; then
+  for e in "\$work"/* "\$work"/.[!.]*; do
+    [ -e "\$e" ] || continue
+    case "\${e##*/}" in
+      _temp) continue ;;
+      _actions) [ "\$keep_actions" = 1 ] && continue ;;
+    esac
+    rm -rf -- "\$e" || { say "slot \$idx: could not remove \$e"; rc=1; }
+  done
+fi
+
+# Written LAST and only on success, into a directory no slot can write. It is
+# the assertion "this slot is in the state the template describes", and a reset
+# that half-failed has not earned it. Not written at `started`, because the slot
+# is about to be dirtied by the job that is starting.
+if [ "\$rc" = 0 ] && [ "\$stage" != started ]; then
+  : >"\$marker" || rc=1
+fi
+
+[ "\$fail_after" = 1 ] && exit 1
+exit "\$rc"
+EOF
+  chown root:root /opt/ci/job-hooks/slot-reset.sh || return 1
+  chmod 0755 /opt/ci/job-hooks/slot-reset.sh || return 1
+
+  # The credential-only hook this supersedes. Removed rather than left behind: a
+  # warm host reboots into a newer copy of this script with the old file still
+  # on its boot disk, and a stale reset that removes two directories is worse
+  # than none at all — it looks like the reset is happening.
+  rm -f /opt/ci/job-hooks/reset-credentials.sh
+
+  install_slot_reset_sudoers || return 1
+}
+
+# What a slot may run as root, spelled out to the argument. sudoers matches a
+# command line literally, so listing the two stages IS the allowlist: there is
+# no permitted form that names another slot's index, and none that reaches the
+# `boot` path systemd uses.
+install_slot_reset_sudoers() {
+  local f=/etc/sudoers.d/ci-slot-reset tmp i u
+  tmp=$(mktemp) || return 1
+  {
+    echo "# Written by host-startup.sh. Lets each slot ask root to reset ITSELF"
+    echo "# between jobs. The index comes from SUDO_UID, never from an argument."
+    for i in $(seq 1 "$SLOTS"); do
+      u=$(slot_user "$i")
+      printf '%s ALL=(root) NOPASSWD: /opt/ci/job-hooks/slot-reset.sh started, /opt/ci/job-hooks/slot-reset.sh completed\n' "$u"
+    done
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0440 "$tmp" || { rm -f "$tmp"; return 1; }
+
+  # Validated BEFORE it is installed. A file in /etc/sudoers.d that does not
+  # parse does not fail open on the one rule it was meant to add: sudo refuses
+  # the whole ruleset, and every sudo on the host stops working — including the
+  # one install_slot needs to register an agent at all.
+  if ! visudo -cqf "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    log "refusing to install $f: it does not pass visudo"
+    return 1
+  fi
+  install -o root -g root -m 0440 "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
 }
 
 # --- registry credentials for job containers ----------------------------------
@@ -435,8 +622,12 @@ HELPER
   chmod 0755 /usr/local/bin/docker-credential-cijob
 }
 
-# Per slot, because ~/.docker/config.json is read from the HOME of whoever runs
-# the docker client, and every slot is its own user.
+# The registry credential-helper map, written to stdout so the one caller can
+# put it wherever it needs it. It goes into $SLOT_TEMPLATE/.docker/config.json
+# and from there into every slot's home, because docker reads ~/.docker from the
+# HOME of whoever runs the client and every slot is its own user — but the
+# CONTENT is identical for every slot on the host, so there is one copy to be
+# right rather than K.
 #
 # EVERY KEY IS AN EXACT HOST. The first version of this wrote `"*.pkg.dev"`, on
 # the assumption that docker matches credHelpers by pattern. It does not: the
@@ -452,28 +643,22 @@ HELPER
 # given. Only Google registries appear, so docker.io and ghcr.io keep pulling
 # anonymously — which a `credsStore` (which DOES apply to every registry) would
 # have broken by offering them a Google access token.
-write_slot_docker_config() {
-  local idx="$1" u hosts h first
-  u=$(slot_user "$idx")
+write_docker_cred_helpers() {
+  local hosts h first
 
   hosts="gcr.io us.gcr.io eu.gcr.io asia.gcr.io"
   [ -n "$HOST_REGION" ] && hosts="$hosts ${HOST_REGION}-docker.pkg.dev"
   [ -n "$REGISTRY_HOSTS" ] && hosts="$hosts $(printf '%s' "$REGISTRY_HOSTS" | tr ',' ' ')"
 
-  install -d -o "$u" -g "$u" -m 0700 "/home/$u/.docker"
-  {
-    printf '{\n  "credHelpers": {\n'
-    first=1
-    for h in $hosts; do
-      [ -n "$h" ] || continue
-      [ "$first" = 1 ] || printf ',\n'
-      printf '    "%s": "cijob"' "$h"
-      first=0
-    done
-    printf '\n  }\n}\n'
-  } >"/home/$u/.docker/config.json"
-  chown "$u:$u" "/home/$u/.docker/config.json"
-  chmod 0600 "/home/$u/.docker/config.json"
+  printf '{\n  "credHelpers": {\n'
+  first=1
+  for h in $hosts; do
+    [ -n "$h" ] || continue
+    [ "$first" = 1 ] || printf ',\n'
+    printf '    "%s": "cijob"' "$h"
+    first=0
+  done
+  printf '\n  }\n}\n'
 }
 
 # --- container MTU ------------------------------------------------------------
@@ -509,18 +694,39 @@ write_slot_docker_config() {
 # Read from the primary interface, not written as 1460: an image or estate with
 # jumbo frames or a tunnel would be given the wrong number by a literal, and the
 # wrong number here fails exactly as invisibly as the default did.
-write_slot_daemon_config() {
-  local idx="$1" u mtu
-  u=$(slot_user "$idx")
+# ...and both of those files now live in the TEMPLATE rather than being written
+# into each home directly, because the home is emptied between jobs (#110). The
+# template is what a slot is built from at boot and rebuilt from on every reset,
+# so anything a slot must have is here or it does not survive the first job.
+seed_slot_template() {
+  local mtu
   mtu=$(primary_mtu)
   [ -n "$mtu" ] || return 1
 
-  install -d -o "$u" -g "$u" -m 0700 "/home/$u/.config"
-  install -d -o "$u" -g "$u" -m 0700 "/home/$u/.config/docker"
+  # Rebuilt from scratch on every boot rather than updated in place. This tree
+  # is on the boot disk of a host that reboots warm, so an entry left behind by
+  # an OLDER version of this script would otherwise be copied into every slot's
+  # home, on every reset, for the life of the host.
+  rm -rf "$SLOT_TEMPLATE" || return 1
+  install -d -o root -g root -m 0755 "$SLOT_TEMPLATE" || return 1
+
+  # What `useradd -m` would have copied, so a slot's shell behaves the way the
+  # image says it should. Taken from the image rather than written here — the
+  # distro owns these files and a second inline copy is a second thing to keep
+  # in step. ~/.bashrc and ~/.profile are two of the four plant sites #110
+  # names, which is exactly why their content now comes from a root-owned tree
+  # instead of from whatever the last job left.
+  [ ! -d /etc/skel ] || cp -a /etc/skel/. "$SLOT_TEMPLATE/" || return 1
+
+  install -d -o root -g root -m 0700 "$SLOT_TEMPLATE/.docker" || return 1
+  write_docker_cred_helpers >"$SLOT_TEMPLATE/.docker/config.json" || return 1
+  chmod 0600 "$SLOT_TEMPLATE/.docker/config.json" || return 1
+
+  install -d -o root -g root -m 0700 "$SLOT_TEMPLATE/.config" || return 1
+  install -d -o root -g root -m 0700 "$SLOT_TEMPLATE/.config/docker" || return 1
   printf '{\n  "mtu": %s,\n  "default-network-opts": {\n    "bridge": { "com.docker.network.driver.mtu": "%s" }\n  }\n}\n' \
-    "$mtu" "$mtu" >"/home/$u/.config/docker/daemon.json"
-  chown "$u:$u" "/home/$u/.config/docker/daemon.json"
-  chmod 0600 "/home/$u/.config/docker/daemon.json"
+    "$mtu" "$mtu" >"$SLOT_TEMPLATE/.config/docker/daemon.json" || return 1
+  chmod 0600 "$SLOT_TEMPLATE/.config/docker/daemon.json" || return 1
 }
 
 # --- the dependency cache -----------------------------------------------------
@@ -1682,16 +1888,26 @@ provision_slot_user() {
   # this survived a boot probe that only asked the daemon whether it was up.
   loginctl enable-linger "$u" || return 1
 
-  # Credentials for the slot's own rootless daemon. Written here rather than in
-  # install_slot because it belongs to the USER, and a slot user that exists
-  # without it pulls anonymously — which fails at "Initialize containers",
-  # before any step of the job runs.
-  write_slot_docker_config "$idx" || return 1
+  # Root-owned per-slot state, and the single leaf inside it the slot may write:
+  # its daemon's data root. Root owns the directory ABOVE that leaf, so a slot
+  # cannot create, rename or replace a name there — the same namespace-ownership
+  # rule the cache tree follows, and here it is what stops a slot from forging
+  # the `clean` marker that decides whether its next job is allowed to run.
+  install -d -o root -g root -m 0755 "$SLOT_STATE" || return 1
+  install -d -o root -g root -m 0755 "$SLOT_STATE/$idx" || return 1
+  install -d -o "$u" -g "$u" -m 0700 "$SLOT_STATE/$idx/docker" || return 1
 
-  # …and the daemon's own config, which must exist before ci-dockerd@$idx starts:
-  # `mtu` is read at daemon start, so writing it later leaves the running daemon
-  # — and every network it has already created — on the wrong one.
-  write_slot_daemon_config "$idx" || return 1
+  # The home's CONTENT — the registry credential helpers and the daemon's mtu
+  # config among it — comes from $SLOT_TEMPLATE, laid down by the same code that
+  # will lay it down again between every pair of jobs. Writing it here a second
+  # way is exactly how "a fresh slot" and "a reset slot" drift apart, and a drift
+  # in this direction is silent: the first job on a host would see a file no
+  # later job on that host ever sees again.
+  #
+  # Fails the slot: a home that is not in the state the template describes is a
+  # home nobody can describe, and the next thing to happen to it is an agent
+  # being registered against it.
+  /opt/ci/job-hooks/slot-reset.sh boot "$idx" || return 1
 }
 
 # --- per-slot network namespace ----------------------------------------------
@@ -1863,7 +2079,15 @@ PrivateTmp=yes
 # argument for anything — it is the belt over the tokens already being out of
 # argv, not a substitute for it.
 ProtectProc=invisible
-ExecStart=/usr/bin/dockerd-rootless.sh
+# The data root is OUTSIDE the slot's home, which is what lets the home be
+# emptied between jobs (#110) — and also what keeps a reset cheap: every image
+# this host has warmed lives here and survives one.
+#
+# Passed explicitly rather than left to $XDG_DATA_HOME. dockerd-rootless.sh
+# forwards its arguments to the daemon and sets no data root of its own, so
+# without this dockerd falls back to $HOME/.local/share/docker — inside the tree
+# the reset deletes, while the daemon still holds it open.
+ExecStart=/usr/bin/dockerd-rootless.sh --data-root=/var/lib/ci-slot/%i/docker
 # Rootless dockerd needs its own cgroup subtree to set any resource limit;
 # without delegation it still runs, but every limit a job asks for is ignored.
 Delegate=yes
@@ -2305,18 +2529,24 @@ NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
 BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 $BROKER_ENV
 $CACHE_ENV
-# Wipe this slot's leftover cloud credential store before every job and after
-# every job. Set unconditionally, and NOT alongside BROKER_ENV: a pool with no
-# job service account is where an inherited credential is most dangerous, since
+# Reset this slot before every job and after every job: the home is emptied and
+# rebuilt from $SLOT_TEMPLATE, and the previous job's workspace and tool cache go
+# with it. Set unconditionally, and NOT alongside BROKER_ENV: a pool with no job
+# service account is where an inherited credential is most dangerous, since
 # nothing there is supposed to have Google credentials at all. A failing hook
 # fails the job, which is the intended trade — a job that could not be given a
-# clean credential state must not run with a previous job's identity.
-Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci/job-hooks/reset-credentials.sh
-Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/reset-credentials.sh
+# clean slot must not run in a previous job's leftovers.
+Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci/job-hooks/job-started.sh
+Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/job-completed.sh
 # The one that matters: this is the unit job code runs under, and everything a
 # job spawns inherits this mount namespace, so a step cannot read root's argv --
 # nor a sibling slot's — out of /proc. See the daemon unit for why both carry it.
 ProtectProc=invisible
+# The third reset, and the one the two hooks cannot cover: an agent KILLED
+# mid-job never runs its completed hook, and a host that reboots warm starts its
+# agents over a disk the previous boot's jobs wrote. `+` runs this as root in
+# spite of User= above, which is the entire point — see install_job_hooks.
+ExecStartPre=+/opt/ci/job-hooks/slot-reset.sh boot $idx
 ExecStart=$dir/run.sh
 # The controller drains a host by DEREGISTERING its agents through the GitHub
 # API, which GitHub refuses while an agent is executing a job. Restart=no here
@@ -2394,6 +2624,16 @@ main() {
   install_registry_credential_helper \
     || die 'could not install the registry credential helper — every job running in a container from a private registry would fail its pull'
 
+  # Before the slot users, because provisioning one now BUILDS its home from the
+  # template — the very same way a reset rebuilds it between jobs.
+  seed_slot_template || die "could not build the pristine slot home template — refusing to register agents"
+  # Before the slot users for that same reason, and before the units that name
+  # it. Fails CLOSED twice over: provision_slot_user calls slot-reset.sh, and an
+  # agent whose ACTIONS_RUNNER_HOOK_JOB_STARTED points at a file that is not
+  # there refuses to run any job at all — so a host that registered without this
+  # would take work and fail every bit of it.
+  install_job_hooks || die "could not install the per-job slot reset — refusing to register agents"
+
   local i
   for i in $(seq 1 "$SLOTS"); do
     provision_slot_user "$i" || die "could not provision the user for slot $i"
@@ -2430,12 +2670,6 @@ main() {
   else
     log "no ci-job-service-account set — jobs on this host get no Google credentials"
   fi
-
-  # Before the units that reference it exist, and fails CLOSED: an agent whose
-  # ACTIONS_RUNNER_HOOK_JOB_STARTED points at a missing file refuses to run any
-  # job, so a host that registered without the hook installed would take work and
-  # fail all of it.
-  install_job_hooks || die "could not install the per-job credential reset hook — refusing to register agents"
 
   local token
   token=$(registration_token) || die "could not obtain a registration token"
