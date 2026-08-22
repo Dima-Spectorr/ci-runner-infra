@@ -763,7 +763,7 @@ variable "shared_infra_id" {
 
     Set, this pool's hosts carry:
 
-      ci-shared-infra-<id>        both pools — the ingress SOURCE and the
+      ci-shared-infra-src-<id>    both pools — the ingress SOURCE and the
                                   egress target (which selects the SENDING VM)
       ci-shared-infra-stack-<id>  linux only — the ingress TARGET
 
@@ -799,6 +799,6 @@ variable "shared_infra_id" {
 
   validation {
     condition     = var.shared_infra_id == "" || can(regex("^[a-z]([-a-z0-9]{0,39}[a-z0-9])?$", var.shared_infra_id))
-    error_message = "shared_infra_id must be a valid GCP network-tag component: lowercase letters, digits and dashes, starting with a letter, at most 41 characters. 41 and not 63 because it is concatenated into `ci-shared-infra-stack-<id>`, whose 22-character prefix has to fit inside the 63-character tag limit alongside it. An invalid or over-long one fails the apply at the API rather than at the plan."
+    error_message = "shared_infra_id must be a valid GCP network-tag component: lowercase letters, digits and dashes, starting with a letter, at most 41 characters. 41 and not 63 because it is concatenated into `ci-shared-infra-stack-<id>`, whose 22-character prefix has to fit inside the 63-character tag limit alongside it — 22 + 41 = 63 exactly, and the shorter `ci-shared-infra-src-` prefix has room to spare. An invalid or over-long one fails the apply at the API rather than at the plan."
   }
 }

@@ -177,7 +177,7 @@ variable "shared_infra_pairs" {
       for k in keys(var.shared_infra_pairs) :
       can(regex("^[a-z]([-a-z0-9]{0,39}[a-z0-9])?$", k))
     ])
-    error_message = "every shared_infra_pairs key must be a valid GCP network-tag component of at most 41 characters: lowercase letters, digits and dashes, starting with a letter. 41 and not 63 because the key is concatenated into `ci-shared-infra-stack-<key>`, and a tag over 63 characters is refused by the API at apply time rather than at plan."
+    error_message = "every shared_infra_pairs key must be a valid GCP network-tag component of at most 41 characters: lowercase letters, digits and dashes, starting with a letter. 41 and not 63 because the key is concatenated into `ci-shared-infra-stack-<key>`, and a tag over 63 characters is refused by the API at apply time rather than at plan: 22 + 41 = 63 exactly. The key also has to be one whose generated names cannot collide with another key's, which is why the tags and the rule names each carry a fixed role token (`-src-`/`-stack-`, `-in-`/`-eg-`) between the prefix and the key."
   }
 
   validation {

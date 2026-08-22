@@ -249,9 +249,21 @@ resource "google_compute_firewall" "egress_deny" {
 # outside the estate's own networks.
 #
 # The tags are the whole safety argument and they are described in the host
-# pool's var.shared_infra_id. In short: `ci-shared-infra-<id>` is carried by
-# both pools and is the SOURCE; `ci-shared-infra-stack-<id>` is carried by the
-# Linux pool only and is the ingress TARGET. A Windows host matches no ingress
+# pool's var.shared_infra_id. In short: `ci-shared-infra-src-<id>` is carried
+# by both pools and is the SOURCE; `ci-shared-infra-stack-<id>` is carried by
+# the Linux pool only and is the ingress TARGET.
+#
+# `-src-` is in that name to keep the two namespaces DISJOINT, and it is not
+# cosmetic. Spelled `ci-shared-infra-<id>`, the source namespace CONTAINED the
+# stack namespace: the pair keyed `stack-foo` got the source tag
+# `ci-shared-infra-stack-foo`, which is character-for-character the stack tag of
+# the pair keyed `foo`. Both keys pass validation, and the result is a rule for
+# `foo` that targets `stack-foo`'s hosts -- the Windows one included, which
+# `docs/adr-windows-pool.md` says can match no ingress rule -- and a rule for
+# `stack-foo` that accepts `foo`'s Linux hosts as sources. Two repositories'
+# bands joined, silently, by a naming choice. With a fixed role token after a
+# fixed prefix the collision is not possible to spell: every source tag begins
+# `ci-shared-infra-src-` and every stack tag `ci-shared-infra-stack-`. A Windows host matches no ingress
 # rule anywhere, which is what keeps docs/adr-windows-pool.md's "no inbound
 # path" true through a change that is entirely about inbound paths.
 #
@@ -307,7 +319,7 @@ locals {
   # apply, it surfaces as a job that hangs until its timeout.
   shared_infra = {
     for k, v in var.shared_infra_pairs : k => {
-      source_tag = "ci-shared-infra-${k}"
+      source_tag = "ci-shared-infra-src-${k}"
       stack_tag  = "ci-shared-infra-stack-${k}"
       band_span = format(
         "%d-%d",
@@ -325,12 +337,26 @@ resource "google_compute_firewall" "shared_infra_ingress" {
   for_each = local.shared_infra
 
   project = var.project_id
-  name    = "${var.name_prefix}-allow-si-${each.key}"
+  # `-in-`, for the reason `-src-` is in the tag above: `-allow-si-<key>` and
+  # `-allow-si-eg-<key>` were nested namespaces, so the pair keyed `eg-foo`
+  # claimed the same firewall name as `foo`'s egress rule. Firewall names are
+  # unique per project, so a valid two-pair configuration failed at apply.
+  name    = "${var.name_prefix}-allow-si-in-${each.key}"
   network = var.network
 
   direction   = "INGRESS"
   source_tags = [each.value.source_tag]
   target_tags = [each.value.stack_tag]
+
+  # Same check as the egress rule's, and here rather than only there because
+  # "the other name is the longer one" is a fact about two string literals that
+  # a later edit can change without either resource noticing.
+  lifecycle {
+    precondition {
+      condition     = length("${var.name_prefix}-allow-si-in-${each.key}") <= 63
+      error_message = "name_prefix and the shared_infra_pairs key '${each.key}' together exceed GCP's 63-character resource-name limit for `${var.name_prefix}-allow-si-in-${each.key}`. Shorten one of them: otherwise the apply reaches the API and fails there, after the plan looked clean."
+    }
+  }
 
   allow {
     protocol = "tcp"
@@ -379,8 +405,6 @@ resource "google_compute_firewall" "shared_infra_egress" {
   # would refuse to load, and every plan in every 1.5-1.8 consumer would fail on
   # a feature they never turned on.
   #
-  # The egress name is the longer of the two the pair generates, so checking it
-  # covers the ingress name as well.
   lifecycle {
     precondition {
       condition     = length("${var.name_prefix}-allow-si-eg-${each.key}") <= 63

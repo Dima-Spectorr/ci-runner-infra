@@ -84,14 +84,52 @@ fi
 # from either side alone: each file is self-consistent while the last slot's
 # band sits outside the firewall's range.
 
+# The two endpoint expressions are READ OUT OF the Terraform, not restated here.
+# Restated, this loop compared one hand-written formula against another and
+# agreed with itself: change the Terraform's lower endpoint to `base + 2 *
+# width`, or its upper endpoint's trailing `- 1` to `- 2`, and the test that
+# exists to catch exactly that mismatch stayed green. The formulas below are
+# whatever `band_span` currently says; the shell evaluates them with the same
+# three inputs Terraform would.
+#
+# `format("%d-%d", <min expr>, <max expr>)` — the two argument lines, in order.
+span_args=$(sed -n '/band_span = format(/,/^      )$/p' "$NET_TF" |
+  sed -n 's/^ *\(local\.shared_infra_band_base[^,]*\),$/\1/p')
+span_min_expr=$(printf '%s
+' "$span_args" | sed -n 1p)
+span_max_expr=$(printf '%s
+' "$span_args" | sed -n 2p)
+
+if [ -n "$span_min_expr" ] && [ -n "$span_max_expr" ]; then
+  ok "both band_span endpoint expressions were read from the Terraform"
+else
+  bad "band_span's endpoint expressions could not be read from $NET_TF — the span is built some other way now, and every endpoint comparison below would silently compare nothing"
+fi
+[ "$fail" -eq 0 ] || { echo "shared-infra-band: FAILED"; exit 1; }
+
+# Terraform arithmetic that survives translation to `$(( ))` is the subset these
+# expressions use: the three names, integers, and `+ - * ( )`. Anything else —
+# a `min()`, a conditional, a new variable — is not silently evaluated to
+# something plausible; it fails the gate and asks for a human.
+tf_expr_value() { # <expr> <slots>
+  local e
+  e=$(printf '%s' "$1" |
+    sed -e "s/local\.shared_infra_band_base/$tf_base/g"         -e "s/local\.shared_infra_band_width/$tf_width/g"         -e "s/v\.slots_per_host/$2/g")
+  if [ -n "$(printf '%s' "$e" | tr -d '0-9 +*()-')" ]; then
+    printf 'UNEVALUATABLE'
+    return 0
+  fi
+  printf '%s' "$(( e ))"
+}
+
 for slots in 1 2 4 8 16; do
   want_min=$(( host_base + host_width ))
   want_max=$(( host_base + slots * host_width + host_width - 1 ))
 
   # The Terraform expression, evaluated rather than pattern-matched: a textual
   # check cannot tell `slots * width` from `(slots - 1) * width`.
-  got_min=$(( tf_base + tf_width ))
-  got_max=$(( tf_base + slots * tf_width + tf_width - 1 ))
+  got_min=$(tf_expr_value "$span_min_expr" "$slots")
+  got_max=$(tf_expr_value "$span_max_expr" "$slots")
 
   if [ "$want_min" = "$got_min" ] && [ "$want_max" = "$got_max" ]; then
     ok "slots=$slots span $got_min-$got_max"
@@ -132,7 +170,7 @@ fi
 # file that says nothing about Windows.
 
 # shellcheck disable=SC2016  # the ${...} here is Terraform interpolation in the file being searched, not a shell expansion
-if grep -q 'ci-shared-infra-\${var.shared_infra_id}' "$POOL_TF"; then
+if grep -q 'ci-shared-infra-src-\${var.shared_infra_id}' "$POOL_TF"; then
   ok "the source tag is built from shared_infra_id"
 else
   bad "the source tag is not built from shared_infra_id — a tag derived per module differs between the two pools of a pair"
@@ -165,7 +203,7 @@ fi
 # unrelated change, which is how a gate gets deleted rather than fixed.
 
 # shellcheck disable=SC2016  # the ${...} here is Terraform interpolation in the file being searched, not a shell expansion
-if grep -qF 'source_tag = "ci-shared-infra-${k}"' "$NET_TF"; then
+if grep -qF 'source_tag = "ci-shared-infra-src-${k}"' "$NET_TF"; then
   ok "the network's source tag is built from the pair key"
 else
   bad "the network's source tag is not built from the pair key — it would no longer name the tag the pool module puts on the hosts, and the rule would match nothing"
@@ -176,6 +214,34 @@ if grep -qF 'stack_tag  = "ci-shared-infra-stack-${k}"' "$NET_TF"; then
   ok "the network's stack tag is built from the pair key"
 else
   bad "the network's stack tag is not built from the pair key — the ingress rule would target a tag no Linux host carries"
+fi
+
+# --- the two namespaces are disjoint ------------------------------------------
+#
+# Nested, they were not two namespaces at all. `ci-shared-infra-<key>` for the
+# source and `ci-shared-infra-stack-<key>` for the stack meant the pair keyed
+# `stack-foo` had `foo`'s STACK tag as its own SOURCE tag -- both keys valid,
+# both applies green, and `foo`'s ingress rule now targets `stack-foo`'s hosts,
+# Windows included. Same shape one layer up in the rule names: `-allow-si-<key>`
+# contained `-allow-si-eg-<key>`, so a pair keyed `eg-foo` collided with `foo`'s
+# egress rule on a name that must be unique per project.
+#
+# What makes them disjoint is a FIXED role token between the fixed prefix and
+# the key, so no key can spell its way from one namespace into the other. These
+# assertions check the token is still there; that is the whole property.
+
+# shellcheck disable=SC2016  # the ${...} here is Terraform interpolation in the file being searched, not a shell expansion
+if grep -qF 'source_tag = "ci-shared-infra-src-${k}"' "$NET_TF" &&
+   grep -qF 'stack_tag  = "ci-shared-infra-stack-${k}"' "$NET_TF"; then
+  ok "the source and stack tag namespaces cannot collide"
+else
+  bad "the source and stack tags no longer sit in separate namespaces -- a pair key can spell the other role's tag, joining two repositories' bands with no error anywhere"
+fi
+
+if grep -qF -- '-allow-si-in-${each.key}' "$NET_TF" && grep -qF -- '-allow-si-eg-${each.key}' "$NET_TF"; then
+  ok "the ingress and egress rule names cannot collide"
+else
+  bad "the band rule names no longer carry distinct direction tokens -- a pair key can claim the other direction's firewall name, and firewall names are unique per project"
 fi
 
 # --- one rule per PAIR, and none at all by default ----------------------------
@@ -255,7 +321,11 @@ mutate "egress left un-keyed"                net  '/shared_infra_egress/,$ s/for
 # `${k}` is sed pattern text, not a shell expansion -- the single quotes are
 # the point.
 # shellcheck disable=SC2016
-mutate "source tag no longer built from key" net  's/source_tag = "ci-shared-infra-\${k}"/source_tag = "ci-shared-infra"/'
+mutate "the source tag namespace contains the stack one" net 's/ci-shared-infra-src-\${k}/ci-shared-infra-${k}/'
+mutate "the ingress rule name loses its direction"       net 's/-allow-si-in-\${each\.key}/-allow-si-${each.key}/'
+mutate "the span's lower endpoint moved a slot up" net 's/^        local\.shared_infra_band_base + local\.shared_infra_band_width,$/        local.shared_infra_band_base + 2 * local.shared_infra_band_width,/'
+mutate "the span's upper endpoint lost a port"    net 's/local\.shared_infra_band_width - 1,$/local.shared_infra_band_width - 2,/'
+mutate "source tag no longer built from key" net  's/source_tag = "ci-shared-infra-src-\${k}"/source_tag = "ci-shared-infra-src"/'
 # shellcheck disable=SC2016
 mutate "stack tag no longer built from key"  net  's/stack_tag  = "ci-shared-infra-stack-\${k}"/stack_tag  = "ci-shared-infra-stack"/'
 mutate "pairs default to a populated map"    vars 's/^  default = {}$/  default = { demo = { slots_per_host = 4 } }/'
