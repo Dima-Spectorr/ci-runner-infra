@@ -525,7 +525,7 @@ chmod 0750 "\$home" || { say "slot \$idx: could not chmod \$home"; rc=1; }
 # with it, so the runner keeps the workspace it already prepared; what it does
 # not carry is the slot's ability to swap a name mid-loop. Without this the
 # remove-then-recreate below is a root-owned TOCTOU: a second process of the
-# same slot can plant a symlink at $e between the rm and the install.
+# same slot can plant a symlink at \$work between the rm and the install.
 work="\$SLOT_ROOT/\$idx/_work"
 held="\$SLOT_ROOT/.reset/\$idx/_work"
 took=0
