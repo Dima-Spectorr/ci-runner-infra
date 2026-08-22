@@ -281,16 +281,20 @@ variable "warm_cache_script" {
     machine-wide to have any effect, because the slot accounts a job runs as do
     not exist yet at image-build time.
 
-    IT IS NOT A CACHE LAYER, DESPITE THE NAME IT SHARES WITH THE LINUX ONE.
-    There is no host-wide warm cache on a Windows host and nothing here can
-    create one: windows-host-startup.ps1 states outright that "CacheRoot is the
-    slot's OWN workspace root. There is no host-wide warm cache directory on
-    this image", and it has no counterpart to the Linux boot script's
-    CACHE_MASTER=/opt/ci-cache -> CACHE_SLOTS=/var/lib/ci-cache per-slot copy.
-    A tree baked here would be read by nothing, copied per slot by nothing, and
-    put on a job's PATH or into an npm/NuGet config by nothing. The name is kept
-    so the two templates take the same variable; the gap is tracked in issue
-    #150 and this description changes when that closes, not before.
+    IT IS ALSO THE CACHE LAYER. Anything this script leaves under C:\ci-cache
+    is sealed by the provisioner below and copied per slot at boot, exactly as
+    the Linux template's /opt/ci-cache is: windows-host-startup.ps1's phase 7
+    scans that tree, seals it read-and-execute to the slot accounts, copies it to
+    C:\ci\cache\<idx> per slot and points npm_config_cache, NUGET_PACKAGES,
+    PIP_CACHE_DIR and seven others at the copy. The tool subdirectory names are
+    the same nine the Linux side uses -- npm, yarn, pnpm-store, go-mod, pip, uv,
+    m2, nuget, composer -- and a directory outside that list is baked into the
+    image and never copied to a slot.
+
+    WHATEVER IT WRITES THERE IS UNTRUSTED BUILD INPUT. The tree reaches every
+    slot as a WRITABLE copy, so the seal below refuses a reparse point outright:
+    a junction under this tree would aim both the ACL grant and the per-slot copy
+    at whatever it names.
 
     There is no container half of this contract either: section 4 of the ADR
     states that a Windows pool runs no job containers, so the Linux template's
@@ -553,10 +557,21 @@ build {
   #    installing layer: everything above is identical for every consumer, so a
   #    change here does not invalidate the expensive layers.
   #
-  #    Machine-wide or nothing — see the `warm_cache_script` description. This
-  #    image bakes no cache tree, because a Windows host has nothing that would
-  #    read one (issue #150); baking one anyway would be dead weight that reads
-  #    like a working feature, which is the more expensive of the two mistakes.
+  #    Machine-wide toolchain, or cache content under C:\ci-cache, or both — see
+  #    the `warm_cache_script` description. The cache root is created HERE rather
+  #    than by the warm script, so that "the script wrote nothing" and "the script
+  #    was not supplied" produce the same shape of image: an empty, sealed master
+  #    that phase 7 copies nine empty directories from, rather than a missing tree
+  #    that phase 7 has to special-case.
+  provisioner "powershell" {
+    elevated_user     = build.User
+    elevated_password = build.Password
+    inline = [
+      "$ErrorActionPreference = 'Stop'",
+      "New-Item -ItemType Directory -Force -Path 'C:\\ci-cache' | Out-Null",
+    ]
+  }
+
   provisioner "powershell" {
     # Never an empty list: Packer validates this at PREPARE time and rejects a
     # provisioner with no script, so "warm nothing" is a script that does
@@ -564,6 +579,61 @@ build {
     scripts           = [local.warm_script]
     elevated_user     = build.User
     elevated_password = build.Password
+  }
+
+  # 7b. Seal the master cache AFTER warming.
+  #
+  #     A consumer's warm script is arbitrary repo-supplied code running elevated,
+  #     so what it leaves behind is not assumed. This is the Windows counterpart of
+  #     the Linux template's step 6b, and it answers the same two questions in the
+  #     same order: is there anything in here that the ACL walk and the per-slot
+  #     copy must not propagate, and if not, what ACL does the tree ship with.
+  #
+  #     WHAT IS REFUSED, AND WHY IT IS THE ONE PREDICATE
+  #
+  #     The Linux scan refuses five things — symlinks, device nodes, setuid bits,
+  #     out-of-tree hardlinks, file capabilities. Four of those have no Windows
+  #     spelling at all. The one that does is the REPARSE POINT, and it matters for
+  #     both operations that follow a warm script:
+  #
+  #       * `icacls /grant` with (OI)(CI) follows a junction, so a junction aimed
+  #         at C:\Windows is a read-and-execute grant applied THERE. An ACL applied
+  #         to the wrong tree is not undone by the next boot.
+  #       * the boot script's robocopy follows one too, turning a per-slot cache
+  #         seed into a per-slot copy of whatever tree it names.
+  #
+  #     `Get-ChildItem -Recurse` does not descend through a reparse point unless
+  #     -FollowSymlink is given, so the junction is seen and not walked into. The
+  #     boot script repeats this scan in Get-CacheHostileReason, because an image
+  #     is not the only way content reaches this tree.
+  #
+  #     WHY THE GRANTS ARE SIDS
+  #
+  #     `icacls C:\ci-cache /grant Administrators:(OI)(CI)F` is a NAME LOOKUP, and
+  #     the name is localised: on a German image the group is `Administratoren`
+  #     and the line fails. icacls reports that as a non-zero exit and a message
+  #     nobody reads, and without the check below the build would carry on and ship
+  #     an image whose cache root is whatever C:\ handed down. Well-known SIDs do
+  #     not move: S-1-5-18 LocalSystem, S-1-5-32-544 Administrators, S-1-5-32-545
+  #     Users. The last one is what makes the tree readable to the slot accounts,
+  #     which do not exist yet at build time — the boot script narrows it to the
+  #     accounts that do exist once they do.
+  provisioner "powershell" {
+    elevated_user     = build.User
+    elevated_password = build.Password
+    inline = [
+      "$ErrorActionPreference = 'Stop'",
+      "$root = Get-Item -LiteralPath 'C:\\ci-cache' -Force",
+      # The root itself first: a master that IS a junction is the case where every
+      # entry below it already belongs to another tree.
+      "$bad = @(@($root) + @(Get-ChildItem -LiteralPath 'C:\\ci-cache' -Recurse -Force) | Where-Object { \"$($_.Attributes)\" -match 'ReparsePoint' })",
+      # The name is repo-supplied text, so it is stripped of control characters and
+      # bounded before it reaches the build log — the same reason the Linux
+      # template pipes its refusal through `tr`.
+      "if ($bad.Count -gt 0) { $n = ($bad[0].FullName -replace '[\\x00-\\x1f]', ' '); throw \"the warm cache holds a reparse point: $($n.Substring(0, [Math]::Min(300, $n.Length)))\" }",
+      "& icacls.exe 'C:\\ci-cache' /inheritance:r /grant '*S-1-5-18:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-5-32-545:(OI)(CI)RX' /Q | Out-Null",
+      "if ($LASTEXITCODE -ne 0) { throw \"icacls could not seal C:\\ci-cache (exit $LASTEXITCODE)\" }",
+    ]
   }
 
   # 8. The image version marker.

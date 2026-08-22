@@ -1616,5 +1616,208 @@ mutate "the pattern validation removed, so a wildcard can take the beacon with i
   's|^        \[ValidatePattern.*$||' \
   has_registration_token_containment
 
+# --- invariant 9: the dependency cache does not become a cross-slot channel ---
+#
+# Phase 7 gives every slot a copy of a tree that arrived in the image from
+# repo-supplied code (`warm_cache_script`). Three things make that safe, and each
+# of them can be undone by an edit that looks like a simplification and produces
+# no error at boot:
+#
+#   the master goes writable   `-ReadOnlyUser` becoming `-SlotUser` on C:\ci-cache
+#                              reads as one word and hands every slot Modify on
+#                              the tree every OTHER slot copies from. `npx`
+#                              executes out of the npm cache and NuGet does not
+#                              re-verify a package it already has, so that is one
+#                              job handing the next one code to run — on a host
+#                              whose slots are the whole boundary.
+#
+#   the scan moves            Sealing follows a junction, so a scan that ran
+#                              after the seal would be reporting on a tree whose
+#                              read-and-execute grant had already been applied
+#                              somewhere else. An ACL applied to the wrong tree
+#                              outlives the boot that applied it.
+#
+#   the marker moves          `.ready` says "every directory below is present and
+#                              reachable by this slot". It lives in a directory
+#                              only SYSTEM can create names in. One level down, a
+#                              slot forges it and phase 5 points ten variables at
+#                              directories the slot itself laid out.
+
+has_cache_master_sealed_readonly() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # READ-and-execute, never Modify. This is the whole isolation: one shared tree,
+  # K readers, no writer but SYSTEM.
+  matches "$code" 'Protect-CiDirectory -Path \$Master -ReadOnlyUser \$SlotUsers' || return 1
+  ! matches "$code" 'Protect-CiDirectory -Path \$Master.*-SlotUser' || return 1
+
+  # The scan is called, and it is called BEFORE icacls touches anything. Line
+  # order is what makes this decidable from the text: the reason line must appear
+  # earlier in the file than the reset.
+  local scan_at seal_at
+  scan_at=$(printf '%s\n' "$code" | grep -nE 'Get-CacheHostileReason -Entries \$entries' | head -1 | cut -d: -f1)
+  seal_at=$(printf '%s\n' "$code" | grep -nE 'icacls\.exe \$Master' | head -1 | cut -d: -f1)
+  [ -n "$scan_at" ] && [ -n "$seal_at" ] || return 1
+  [ "$scan_at" -lt "$seal_at" ] || return 1
+
+  # The refusal is acted on, not merely computed. ANCHORED ON ITS INDENTATION:
+  # there are two `if ($reason)` sites now -- this one and the retired-slot sweep
+  # in Invoke-Phase7DependencyCache -- and an unanchored match is satisfied by
+  # either, so neutering this one would leave the assertion green.
+  matches "$code" '^    if \(\$reason\) \{$' || return 1
+
+  # `/C` makes icacls continue past per-file errors AND still exit 0, which turns
+  # "half the tree kept its inherited ACE" into a silent success.
+  ! matches "$code" "icacls\.exe \\\$Master.*'/C'" || return 1
+  # And the exit code is checked at all.
+  matches "$code" 'if \(\$exit -ne 0\)' || return 1
+
+  # The root itself is scanned, not only its children: a master that IS a junction
+  # is the case where everything below it already belongs to another tree.
+  matches "$code" '\$entries = @\(\$root\) \+' || return 1
+}
+
+has_slot_cache_isolation() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # The slot's own directory is SYSTEM-and-Administrators only. It is root's work
+  # area: the staging name is created in it and the marker is written in it, and a
+  # slot that could create a name there could substitute either.
+  matches "$code" 'Protect-CiDirectory -Path \$dst$' || return 1
+  ! matches "$code" 'Protect-CiDirectory -Path \$dst.*-SlotUser' || return 1
+  matches "$code" 'Protect-CiDirectory -Path \$script:CacheSlots$' || return 1
+
+  # The marker is cleared before the loop and written after it. Written first, it
+  # would mean "seeding was attempted"; and phase 5 reads it to decide whether to
+  # emit ten variables that name paths inside it.
+  local clear_at write_at
+  clear_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$marker' | head -1 | cut -d: -f1)
+  write_at=$(printf '%s\n' "$code" | grep -nE 'Set-Content -LiteralPath \$marker' | head -1 | cut -d: -f1)
+  [ -n "$clear_at" ] && [ -n "$write_at" ] || return 1
+  [ "$clear_at" -lt "$write_at" ] || return 1
+
+  # The copy does NOT carry the master's security descriptor, or the slot gets a
+  # cache it cannot write; and it does not descend into a junction.
+  matches "$code" "'/COPY:DAT'" || return 1
+  ! matches "$code" '/COPYALL|/COPY:DATS' || return 1
+  matches "$code" "'/XJ'" || return 1
+
+  # Robocopy's exit code is a BITMAP and 1 means "files were copied". A `-ne 0`
+  # check here would report every successful seed as a failure; a bare `-lt 8`
+  # would accept the NEGATIVE code a killed robocopy exits with and publish a
+  # partial tree as a complete cache.
+  matches "$code" 'Test-RobocopySuccess -ExitCode \$exit' || return 1
+  matches "$code" 'ExitCode -ge 0 -and \$ExitCode -lt 8' || return 1
+
+  # Published by rename, so the directory the variables name either is absent (a
+  # cache miss, which is correct) or is complete.
+  matches "$code" 'Move-Item -LiteralPath \$stage -Destination \$final' || return 1
+
+  # Room is checked per slot, inside the loop, so the slots that fit are seeded
+  # and the rest run cold instead of the volume filling under the jobs.
+  matches "$code" 'Test-CacheSeedAffordable -MasterBytes \$masterBytes' || return 1
+
+  # This phase FAILS OPEN. Every other phase ends in Deny-Boot; a host that
+  # refuses to register over a cache problem is a missing host, and the pool
+  # answers missing hosts by queueing jobs.
+  #
+  # `.*` and not `[^\n]*`, for the reason recorded above on ConvertFrom-Json:
+  # grep is line-based, so `[^\n]` reads as "not the letter n and not a
+  # backslash" -- and the line this has to catch is `Deny-Boot "phase 7: the
+  # dependency cache ..."`, whose `n` in `dependency` sits between the two
+  # anchors. Written that way the assertion could not fail, which its own
+  # mutation caught.
+  ! matches "$code" 'Deny-Boot.*cache' || return 1
+
+  # The retired-index sweep is the ONE recursive delete on this host that reaches
+  # a tree job code could write: `<idx>` is SYSTEM's, but `<idx>\<tool>` carries
+  # the slot's Modify grant. Windows PowerShell 5.1 -- which is what runs the boot
+  # script -- follows a junction on `Remove-Item -Recurse` and deletes what it
+  # points at (PowerShell/PowerShell#621, fixed in 6.0, never backported), so the
+  # tree is scanned first and a hostile one is left on disk rather than deleted.
+  local scan_at del_at
+  scan_at=$(printf '%s\n' "$code" | grep -nE '\$reason = Get-CacheHostileReason -Entries \(@\(\$dir\)' | head -1 | cut -d: -f1)
+  del_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$dir\.FullName -Recurse' | head -1 | cut -d: -f1)
+  [ -n "$scan_at" ] && [ -n "$del_at" ] || return 1
+  [ "$scan_at" -lt "$del_at" ] || return 1
+  # And the refusal is acted on. Anchored the same way, and for the same reason.
+  matches "$code" '^            if \(\$reason\) \{$' || return 1
+
+  # The cache variables are emitted only for a slot that actually got a cache.
+  # Unconditional, they would name directories phase 7 never built — and a tool
+  # that cannot open the cache it was told to use fails the job rather than
+  # missing it.
+  matches "$code" 'if \(-not \[string\]::IsNullOrWhiteSpace\(\$CachePath\)\)' || return 1
+}
+
+if has_cache_master_sealed_readonly "$SCRIPT"; then
+  ok
+else
+  bad "the master dependency cache is not sealed read-only before it is scanned, or a slot can write it — C:\\ci-cache is copied into every slot, so a slot that can write it hands the next job on every other slot code to run, and a seal applied before the reparse-point scan applies that grant to whatever a junction names"
+fi
+
+if has_slot_cache_isolation "$SCRIPT"; then
+  ok
+else
+  bad "a slot's cache copy is not isolated, not published atomically, or its readiness marker is forgeable — phase 5 reads that marker to decide whether to point npm, NuGet, pip and seven others at the tree, and a half-built or slot-laid-out tree is a hard per-job failure rather than the cache miss this layer promises"
+fi
+
+# --- group 24: the master cache stops being read-only ------------------------
+mutate "the master handed to every slot as Modify" \
+  's|Protect-CiDirectory -Path \$Master -ReadOnlyUser \$SlotUsers|Protect-CiDirectory -Path $Master -SlotUser $SlotUsers[0]|' \
+  has_cache_master_sealed_readonly
+mutate "the hostile-content scan computed and never acted on" \
+  's|^    if (\$reason) {$|    if ($false) {|' \
+  has_cache_master_sealed_readonly
+mutate "icacls given /C, so a half-applied reset still exits 0" \
+  "s|& icacls.exe \\\$Master '/reset'|\& icacls.exe \$Master '/C' '/reset'|" \
+  has_cache_master_sealed_readonly
+mutate "the icacls exit code dropped" \
+  's|^    if (\$exit -ne 0) {$|    if ($false) {|' \
+  has_cache_master_sealed_readonly
+mutate "the root left out of the scan, so a junction as the master is walked into" \
+  's|\$entries = @(\$root) + @(Get-ChildItem|$entries = @(Get-ChildItem|' \
+  has_cache_master_sealed_readonly
+
+# --- group 25: a slot's copy stops being its own -----------------------------
+mutate "the slot given write on its own cache directory, where the marker lives" \
+  's|^    Protect-CiDirectory -Path \$dst$|    Protect-CiDirectory -Path $dst -SlotUser $User|' \
+  has_slot_cache_isolation
+mutate "the readiness marker written before the tools are copied" \
+  's|^    Remove-Item -LiteralPath \$marker -Force -ErrorAction SilentlyContinue$|    Set-Content -LiteralPath $marker -Value "" -Encoding Ascii|' \
+  has_slot_cache_isolation
+mutate "the copy told to carry the master ACL, so no slot can write its own cache" \
+  "s|'/COPY:DAT'|'/COPYALL'|" \
+  has_slot_cache_isolation
+mutate "junction exclusion dropped from the copy" \
+  "s| '/XJ'||" \
+  has_slot_cache_isolation
+mutate "robocopy's bitmap read as a plain exit code" \
+  's|Test-RobocopySuccess -ExitCode \$exit|$exit -eq 0|' \
+  has_slot_cache_isolation
+mutate "a killed robocopy's negative exit accepted as success" \
+  's|(\$ExitCode -ge 0 -and \$ExitCode -lt 8)|($ExitCode -lt 8)|' \
+  has_slot_cache_isolation
+mutate "the half-copied tree published in place instead of renamed" \
+  's|Move-Item -LiteralPath \$stage -Destination \$final|Copy-Item -LiteralPath $stage -Destination $final -Recurse|' \
+  has_slot_cache_isolation
+mutate "the free-space floor dropped, so the last copy fills the volume" \
+  's|Test-CacheSeedAffordable -MasterBytes \$masterBytes -FreeBytes \$free `|$true; $null = $free; $null = @( `|' \
+  has_slot_cache_isolation
+mutate "a cache failure promoted to a boot refusal, which strands the host" \
+  's|Write-BootLog "phase 7: the dependency cache could not be prepared|Deny-Boot "phase 7: the dependency cache could not be prepared|' \
+  has_slot_cache_isolation
+mutate "a retired tree scanned, found hostile, and deleted anyway" \
+  's|^            if (\$reason) {$|            if ($false) {|' \
+  has_slot_cache_isolation
+mutate "a retired slot's cache tree deleted recursively without being scanned" \
+  's|$reason = Get-CacheHostileReason -Entries (@($dir)|$reason = $null; $null = (@($dir)|' \
+  has_slot_cache_isolation
+mutate "the cache variables emitted for a slot that never got a cache" \
+  's|if (-not \[string\]::IsNullOrWhiteSpace(\$CachePath)) {|if ($true) {|' \
+  has_slot_cache_isolation
+
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

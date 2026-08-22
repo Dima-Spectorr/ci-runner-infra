@@ -21,6 +21,7 @@
 #   phase 2  the metadata fence                                (DELETED, see below)
 #   phase 3  the job credential broker
 #   phase 4  the per-job credential reset hooks
+#   phase 7  the per-slot dependency cache                    (fails OPEN)
 #   phase 6  the boot probe, run as a slot account
 #   phase 5  agent registration as a service
 #
@@ -128,6 +129,70 @@ $script:BrokerScript = 'C:\ci\bin\job-metadata-broker.py'
 # their own ACL: SYSTEM and Administrators full, every slot read-and-execute.
 $script:JobHookRoot = 'C:\ci\job-hooks'
 $script:JobHookPath = 'C:\ci\job-hooks\reset-credentials.ps1'
+
+# --- the dependency cache -----------------------------------------------------
+#
+# The Windows counterpart of host-startup.sh's CACHE_MASTER -> CACHE_SLOTS split,
+# and the two trees mean exactly what they mean there:
+#
+#   $script:CacheMaster (C:\ci-cache) is baked by the image, owned by SYSTEM and
+#     Administrators, and READ-AND-EXECUTE to every slot account. No slot can
+#     write anywhere in it.
+#   $script:CacheSlots\<idx> is one writable cache per slot, COPIED from the
+#     master at boot and reachable only by that slot.
+#
+# A tree several slot accounts can write is a channel by which one job hands the
+# next one code to run -- `npx` executes out of the npm cache, NuGet does not
+# re-verify a package already in the global-packages folder, pip does not re-hash
+# a cached wheel. That is why the master is read-only and the copy is per slot.
+#
+# WHY A FULL COPY, AND NOT A JUNCTION OR A HARDLINK OR A CLONE
+#
+# This is the choice issue #150 calls the substance of the work, so all three
+# rejected options are recorded rather than left to be re-derived:
+#
+#   * A JUNCTION (or a symlink) from each slot to the master is one tree wearing
+#     K names. Either the master stays read-only, in which case every package
+#     manager fails on its first write into what it believes is its own cache, or
+#     it is made writable and every slot is writing the tree every other slot
+#     reads -- the cross-slot channel above, with extra steps.
+#   * NTFS HARDLINKS are the Windows shape of the `cp -al` idea Linux rejected,
+#     and they fail here for a harder reason. A file's security descriptor lives
+#     on its MFT record, not on the directory entry, so every hardlink to a file
+#     SHARES ONE ACL. A slot's "own" copy would carry the master's ACL: it cannot
+#     be granted write for that slot alone, and granting it at all grants it to
+#     every slot at once. On Linux the equivalent failure was a sysctl
+#     (fs.protected_hardlinks) that could in principle be turned off; here there
+#     is no per-link ACL to fix, so there is nothing to trade away.
+#   * BLOCK CLONING (the copy-on-write answer) is a ReFS feature. This module
+#     provisions one 200 GB NTFS boot disk and no second volume, and NTFS has no
+#     block cloning at any version. Reaching for it would mean provisioning and
+#     formatting a second disk per host, which is a larger change than the saving
+#     it buys on a tree measured in single-digit gigabytes.
+#
+# So each slot gets its own bytes, and every tool then sees what it sees on an
+# ordinary single-user machine: its own cache, owned by the account running it,
+# with no permission special case anywhere. The price is disk, K copies of it,
+# which is why Test-CacheSeedAffordable exists and why a slot that would not fit
+# runs cold instead of filling the volume out from under the jobs.
+$script:CacheMaster = 'C:\ci-cache'
+$script:CacheSlots = 'C:\ci\cache'
+
+# One subdirectory per tool, named for the tool rather than for the language, and
+# deliberately the SAME list as CACHE_DIRS in host-startup.sh -- a tree lifted off
+# a Linux host and a tree lifted off a Windows one describe themselves the same
+# way, and the two boot scripts can be diffed.
+$script:CacheDirs = @('npm', 'yarn', 'pnpm-store', 'go-mod', 'pip', 'uv', 'm2', 'nuget', 'composer')
+
+# How much of the volume must still be free AFTER a slot's copy for that copy to
+# happen at all. The host disk is 200 GB and the Windows image is the large part
+# of it; what is left carries K job workspaces, K per-slot TEMPs and now K cache
+# copies. Filling the volume does not slow a job down, it fails it -- and it fails
+# every OTHER slot's job on the host at the same time, which a cold cache never
+# does. So the floor is checked before EACH slot's copy rather than once for the
+# host: the slots that fit are seeded and the rest run cold, instead of the whole
+# pool running cold because the last one would not have fitted.
+$script:CacheFreeFloorBytes = 25GB
 
 # The loopback port the broker answers on when metadata does not name one. The
 # same default as the Linux broker, because it is the same broker.
@@ -812,6 +877,185 @@ exit $rc
 '@
 }
 
+function Get-SlotCachePath {
+    <#
+      .SYNOPSIS
+        Where slot $Index's own writable dependency cache lives. Pure.
+      .DESCRIPTION
+        -Root is injectable for the reason Get-SlotTempPath's is: the Pester suite
+        runs on ubuntu-latest, where `Join-Path 'C:\ci\cache' 1` does not build a
+        string, it throws DriveNotFoundException.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [string] $Root = $script:CacheSlots
+    )
+    return (Join-Path $Root ([string] $Index))
+}
+
+function Get-CacheHostileReason {
+    <#
+      .SYNOPSIS
+        Why the master cache must not be sealed or copied, or '' if it may be. Pure.
+      .DESCRIPTION
+        The Windows half of host-startup.sh's cache_master_is_hostile(). The Linux
+        scan refuses symlinks, device nodes, setuid bits, out-of-tree hardlinks
+        and file capabilities; none of those five spellings exists here, and the
+        one thing that does is the REPARSE POINT.
+
+        It is refused because of what the two operations after this scan would do
+        with it, which is the same test the Linux list is built from:
+
+          * SEALING walks the tree and applies an ACL. `icacls /reset /T` and an
+            inheritable ACE both follow a junction, so a junction aimed at
+            C:\Windows or at another slot's workspace is a grant applied THERE --
+            read-and-execute for every slot account, on a tree nobody chose to
+            share. An ACL applied to the wrong tree is not undone by the next
+            boot; it is the durable half of this failure.
+          * COPYING follows it too. robocopy without /SJ and /SL descends into a
+            junction and copies what it points at, so the same junction turns a
+            per-slot cache seed into a per-slot copy of whatever tree it names --
+            silently, and K times.
+
+        The master is repo-supplied content: `warm_cache_script` is arbitrary code
+        the consuming repository supplies, running elevated in the build VM. That
+        makes this a gate over untrusted build input, not decoration -- exactly as
+        README.md puts it for Linux, "a warm cache is untrusted build input".
+
+        Takes already-enumerated entries rather than doing the enumeration, so the
+        rule is asserted by a test that never touches an NTFS volume. The caller
+        passes the ROOT ITSELF as the first entry: a master that is a junction is
+        the case where every entry below it is already the wrong tree, and a scan
+        that only looked at children would walk into it to find out.
+
+        Returns the FIRST reason, not all of them, and names the entry. Six
+        predicates sharing one message is the thing the Linux side had to go back
+        and fix -- a live host shipped a setgid /opt/ci-cache and the refusal named
+        the path twice and the cause not at all -- so this one says which attribute
+        on which path from the start.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][array] $Entries)
+
+    foreach ($entry in $Entries) {
+        if ($null -eq $entry) { continue }
+        $attrs = [string] $entry.Attributes
+        if ($attrs -match 'ReparsePoint') {
+            # The name is untrusted text, for the same reason the Linux packer
+            # gate runs its refusal through `tr`: a path may hold a newline, and a
+            # refusal that splits into two lines can be shaped to read like any
+            # other line this boot log emits. Control characters out, one line,
+            # bounded length.
+            $safe = ([string] $entry.FullName) -replace '[\x00-\x1f]', ' '
+            if ($safe.Length -gt 300) { $safe = $safe.Substring(0, 300) }
+            return "reparse point: $safe"
+        }
+    }
+    return ''
+}
+
+function Test-RobocopySuccess {
+    <#
+      .SYNOPSIS
+        Whether a robocopy exit code means the copy happened. Pure.
+      .DESCRIPTION
+        ROBOCOPY DOES NOT RETURN 0 ON SUCCESS, AND THAT IS THE WHOLE OF THIS
+        FUNCTION
+
+        Its exit code is a BITMAP: 1 = files copied, 2 = extra files in the
+        destination, 4 = mismatched files, 8 = some files could not be copied,
+        16 = a serious error, no files copied. So the ordinary successful seed of
+        a non-empty tree exits 1, and `if ($LASTEXITCODE -ne 0)` -- the check every
+        other native call in this file makes, correctly -- would treat every
+        successful copy as a failure and every slot would run cold while the log
+        said the copy failed.
+
+        Below 8 is success, 8 and above is failure. Written as a comparison rather
+        than a bit test because 16 is not a flag combined with the others: robocopy
+        reports it alone, and `-band 8` would pass a 16.
+
+        A NEGATIVE code is a failure too, and it is not hypothetical -- a killed or
+        crashed robocopy exits with the NTSTATUS as a negative integer, and `-lt 8`
+        is true for every one of them. That is the check this function exists to
+        stop somebody writing inline in one line.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int] $ExitCode)
+    return ($ExitCode -ge 0 -and $ExitCode -lt 8)
+}
+
+function Test-CacheSeedAffordable {
+    <#
+      .SYNOPSIS
+        Whether one more copy of the master still leaves the volume room. Pure.
+      .DESCRIPTION
+        Checked before EACH slot's copy, not once for the host, because the answer
+        changes as the copies land: on a host where two of four copies fit, seeding
+        two slots and leaving two cold is strictly better than either filling the
+        volume or refusing all four.
+
+        A cache is not a workspace: running out of disk mid-copy leaves a partial
+        tree that reads as a cache and misses on every entry that did not arrive,
+        and it fails the OTHER slots' jobs -- which a cold cache never does. Hence
+        a floor rather than "copy while anything is left".
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][long] $MasterBytes,
+        [Parameter(Mandatory = $true)][long] $FreeBytes,
+        [Parameter(Mandatory = $true)][long] $FloorBytes
+    )
+    return (($FreeBytes - $MasterBytes) -ge $FloorBytes)
+}
+
+function Get-SlotCacheEnvironment {
+    <#
+      .SYNOPSIS
+        The variables that point one slot's build tools at its own cache. Pure.
+      .DESCRIPTION
+        Every entry is the variable the tool's own documentation names, and the
+        list is deliberately the same one host-startup.sh's cache_env() emits, with
+        the same two EXCLUSIONS -- each a bug avoided rather than an oversight:
+
+          * GOCACHE (Go's BUILD cache) -- golang/go#43645: concurrent builds
+            sharing one GOCACHE is not safe. GOMODCACHE is a different directory
+            and is the one worth keeping warm, so only that is set.
+          * RUNNER_TOOL_CACHE / AGENT_TOOLSDIRECTORY -- the tool-cache library has
+            no locking (actions/toolkit#804), and the setup-* actions treat that
+            directory as one they own and prune. It stays per-slot and untouched.
+
+        Returns an ordered dictionary for the reason Get-SlotServiceEnvironment
+        returns one: the service key phase 5 writes has to be comparable across two
+        boots of one host.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $CachePath)
+
+    $root = $CachePath.TrimEnd('\')
+    return [ordered] @{
+        # npm reads any config key from a matching npm_config_* variable.
+        npm_config_cache      = "$root\npm"
+        YARN_CACHE_FOLDER     = "$root\yarn"
+        # BOTH spellings, because the supported one changed: pnpm 11 reads
+        # pnpm_config_store_dir and silently IGNORES the npm_config_ form it
+        # honoured before. Repositories pin their own pnpm, so this host cannot
+        # assume which side of that change it is serving.
+        pnpm_config_store_dir = "$root\pnpm-store"
+        npm_config_store_dir  = "$root\pnpm-store"
+        GOMODCACHE            = "$root\go-mod"
+        PIP_CACHE_DIR         = "$root\pip"
+        UV_CACHE_DIR          = "$root\uv"
+        # Maven has no environment variable for the local repository; the system
+        # property is the supported route and MAVEN_ARGS is how you deliver one
+        # from the environment (Maven 3.9.0 and later). A repository that sets its
+        # own MAVEN_ARGS overrides this, which is the correct precedence.
+        MAVEN_ARGS            = "-Dmaven.repo.local=$root\m2"
+        NUGET_PACKAGES        = "$root\nuget"
+        COMPOSER_CACHE_DIR    = "$root\composer"
+    }
+}
+
 function Get-SlotServiceEnvironment {
     <#
       .SYNOPSIS
@@ -846,6 +1090,10 @@ function Get-SlotServiceEnvironment {
         [Parameter(Mandatory = $true)][int] $Index,
         [string] $HookPath = $script:JobHookPath,
         [AllowEmptyString()][string] $BrokerEndpoint = '',
+        # The slot's own dependency cache, or '' when phase 7 could not give it
+        # one. See the block at the end of this function for why this is the one
+        # value here that is allowed to be conditional.
+        [AllowEmptyString()][string] $CachePath = '',
         # Injectable for the same reason Get-SlotTempPath's is: the Pester suite
         # runs on ubuntu-latest, where `Join-Path 'C:\ci\slots' 1` does not build
         # a string, it throws DriveNotFoundException. A pure function that cannot
@@ -871,6 +1119,26 @@ function Get-SlotServiceEnvironment {
 
     $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] = $HookPath
     $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] = $HookPath
+
+    # THE ONE CONDITIONAL BLOCK, AND THE CONTRAST WITH THE FIVE ABOVE IS THE POINT
+    #
+    # The five above are set whatever the host looks like, because an unset
+    # GCE_METADATA_HOST does not withhold a credential -- it hands ADC back to the
+    # real metadata server and the HOST service account. Omission there is a
+    # weaker boundary, so omission is not allowed.
+    #
+    # These ten are the opposite. An unset npm_config_cache means npm uses its
+    # own default under the slot's profile: a cache that is cold and entirely
+    # correct. Pointing them at a directory phase 7 did not finish building would
+    # be the harmful move -- a tool that cannot open the cache it was told to use
+    # fails the job rather than missing. So the absence of a cache is expressed by
+    # saying nothing, and phase 7 hands '' for exactly the slots it could not
+    # serve.
+    if (-not [string]::IsNullOrWhiteSpace($CachePath)) {
+        foreach ($entry in (Get-SlotCacheEnvironment -CachePath $CachePath).GetEnumerator()) {
+            $block[$entry.Key] = $entry.Value
+        }
+    }
     return $block
 }
 
@@ -2270,6 +2538,344 @@ function Invoke-Phase1SlotSetup {
     return $provisioned
 }
 
+# --- phase 7: the dependency cache --------------------------------------------
+#
+# THIS PHASE FAILS OPEN, AND IT IS THE ONLY ONE THAT DOES
+#
+# Every other phase in this file ends in Deny-Boot: a host that cannot prove its
+# slot boundary must not take a job. This one is the opposite, for the reason
+# host-startup.sh gives for provision_shared_cache(). A host with no usable cache
+# is a SLOW host; a host that refuses to register over a cache problem is a
+# MISSING host, and the pool responds to missing hosts by queueing jobs. Speed is
+# worth less than capacity, so every failure below is logged and survived, and the
+# phase returns the slots it managed to seed rather than throwing.
+#
+# The whole body is therefore inside one try/catch. The entry point runs under
+# $ErrorActionPreference = 'Stop', so an unexpected throw anywhere in here would
+# take the boot down -- which is exactly the trade this phase exists not to make.
+
+function Protect-CacheMaster {
+    <#
+      .SYNOPSIS
+        Scan and seal C:\ci-cache; $true if a slot may be seeded from it.
+      .DESCRIPTION
+        THE SCAN RUNS BEFORE THE SEAL, AND THAT ORDER IS THE SAFETY PROPERTY
+
+        Sealing is `icacls /reset /T` followed by an inheritable ACE, and both
+        follow a junction. So a scan that ran second would be reporting on a tree
+        whose ACL had already been applied somewhere else -- and an ACL applied to
+        the wrong tree outlives the boot that applied it. Get-CacheHostileReason
+        carries the long form of what is refused and why.
+
+        Get-ChildItem -Recurse does NOT descend through a reparse point unless
+        -FollowSymlink is given, so the junction is seen as an entry and not
+        walked into. That is the behaviour this scan wants and it is relied upon
+        rather than assumed: descending would mean enumerating whatever the
+        junction names before deciding whether to refuse it.
+
+        The seal is /reset first and Protect-CiDirectory second. /reset drops every
+        explicit ACE below the root and puts those entries back on inheritance;
+        protecting the root then defines what they inherit. Reversing the two would
+        have /reset strip the protection that was just applied.
+
+        `/C` is deliberately NOT passed to icacls. It continues past per-file
+        errors AND still exits 0, so it would turn "half the tree kept an ACE
+        granting Everyone write" into a silent success -- the shape of failure this
+        function exists to prevent. Without it a file icacls cannot touch is a
+        non-zero exit and a refusal to seed, which is the fail-open direction.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string[]] $SlotUsers,
+        [string] $Master = $script:CacheMaster
+    )
+
+    if (-not (Test-Path -LiteralPath $Master)) {
+        Write-BootLog ("phase 7: no $Master on this image -- jobs will run with a cold cache " +
+            '(needs a Windows image built after issue #150)')
+        return $false
+    }
+
+    $root = Get-Item -LiteralPath $Master -Force
+    if (-not $root.PSIsContainer) {
+        Write-BootLog "phase 7: $Master is not a directory -- jobs will run with a cold cache"
+        return $false
+    }
+
+    # The root is the FIRST entry on purpose: a master that is itself a junction
+    # is the case where everything below it is already somebody else's tree.
+    $entries = @($root) + @(Get-ChildItem -LiteralPath $Master -Recurse -Force -ErrorAction SilentlyContinue)
+    $reason = Get-CacheHostileReason -Entries $entries
+    if ($reason) {
+        Write-BootLog ("phase 7: refusing to seed from $Master -- $reason; " +
+            'jobs will run with a cold cache')
+        return $false
+    }
+
+    # The preference is dropped around the native call for the reason given in
+    # Install-BeaconService: under Stop, `2>&1` on a native command turns each
+    # stderr line into a terminating NativeCommandError, and icacls writes a
+    # per-file progress line there on a tree of any size.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & icacls.exe $Master '/reset' '/T' '/Q' 2>&1 | Out-Null
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    if ($exit -ne 0) {
+        Write-BootLog ("phase 7: icacls could not reset the ACLs under $Master (exit $exit) -- " +
+            'refusing to seed from a tree whose permissions are not proven; cold cache')
+        return $false
+    }
+
+    # SYSTEM and Administrators full, every slot READ-AND-EXECUTE and nothing
+    # more. Protect-CiDirectory grants by well-known SID rather than by group
+    # name, which is what keeps this working on a localised image -- 'BUILTIN\
+    # Administrators' is 'BUILTIN\Administratoren' on a German one, and an icacls
+    # line that fails to resolve a name is an ACL that was never applied while the
+    # boot carries on.
+    Protect-CiDirectory -Path $Master -ReadOnlyUser $SlotUsers
+    Write-BootLog "phase 7: $Master sealed read-and-execute to $($SlotUsers -join ', ')"
+    return $true
+}
+
+function Get-CacheMasterSize {
+    <#
+      .SYNOPSIS
+        Bytes held by the master cache. 0 when it is empty or unreadable.
+    #>
+    [CmdletBinding()]
+    param([string] $Master = $script:CacheMaster)
+    $sum = (Get-ChildItem -LiteralPath $Master -Recurse -Force -File -ErrorAction SilentlyContinue |
+            Measure-Object -Property Length -Sum).Sum
+    if ($null -eq $sum) { return [long] 0 }
+    return [long] $sum
+}
+
+function Get-CacheVolumeFreeByte {
+    <#
+      .SYNOPSIS
+        Free bytes on the volume the per-slot copies land on.
+      .DESCRIPTION
+        [System.IO.DriveInfo] rather than Get-Volume or Get-PSDrive: it is the one
+        that reports the free space available TO THE CALLER, and it needs no
+        storage module on the image.
+    #>
+    [CmdletBinding()]
+    param([string] $Path = $script:CacheSlots)
+    $qualifier = Split-Path -Qualifier $Path
+    return [long] ([System.IO.DriveInfo]::new($qualifier + '\')).AvailableFreeSpace
+}
+
+function Initialize-SlotCache {
+    <#
+      .SYNOPSIS
+        Give slot $Index its own writable cache, seeded from the master.
+      .DESCRIPTION
+        THE NAMESPACE, NOT THE FLAGS, IS WHAT MAKES THIS SAFE
+
+        host-startup.sh states the rule this follows: root never operates on a
+        path inside a directory an untrusted account controls. The Windows layout
+        is the same shape as the Linux one --
+
+          C:\ci-cache               SYSTEM + Administrators, slots read-only
+          C:\ci\cache               SYSTEM + Administrators -- traversal only
+          C:\ci\cache\<idx>         SYSTEM + Administrators -- this function's work area
+          C:\ci\cache\<idx>\<tool>  + the slot, Modify -- the writable cache
+
+        -- and it works on Windows for a reason worth writing down, because it
+        looks broken at first glance: the slot has NO ACE on C:\ci\cache or on its
+        own <idx> directory, yet it opens <idx>\npm perfectly well. Traversal is
+        governed by SeChangeNotifyPrivilege ("bypass traverse checking"), which is
+        granted to Everyone by default, so a path is reachable when its LAST
+        component grants access regardless of the directories above it. That is
+        already what makes C:\ci\slots\<idx> work for the workspace, so this is the
+        established pattern here rather than a new bet.
+
+        What the layout buys is that a slot cannot create, rename or delete a name
+        in <idx>. So it cannot swap the staging directory for a junction between
+        the ACL being applied and robocopy writing into it, and it cannot forge
+        the .ready marker -- which is why the marker lives in <idx> and not one
+        level down where the slot could write it.
+
+        THE MARKER IS CLEARED FIRST AND WRITTEN LAST
+
+        It means "every directory below is present and reachable by this slot",
+        not "seeding was attempted". Phase 5 reads it and not the directory,
+        because a half-finished seed would otherwise point ten variables at paths
+        that are absent or unwritable -- a hard per-job failure rather than the
+        cache miss this layer promises.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [Parameter(Mandatory = $true)][string] $User,
+        [Parameter(Mandatory = $true)][bool] $Seed,
+        [string] $Master = $script:CacheMaster
+    )
+
+    $dst = Get-SlotCachePath -Index $Index
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Protect-CiDirectory -Path $dst
+
+    $marker = Join-Path $dst '.ready'
+    Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+
+    foreach ($tool in $script:CacheDirs) {
+        $final = Join-Path $dst $tool
+        # Already seeded on an earlier boot: leave it exactly as the slot left it.
+        # Re-seeding would delete a warm cache to replace it with a colder one, and
+        # the entry cannot have been substituted -- only SYSTEM can create a name
+        # in $dst.
+        if (Test-Path -LiteralPath $final) { continue }
+
+        $stage = Join-Path $dst ".seed-$tool"
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        $src = Join-Path $Master $tool
+        if ($Seed -and (Test-Path -LiteralPath $src)) {
+            New-Item -ItemType Directory -Force -Path $stage | Out-Null
+            # The ACL goes on BEFORE the copy so every file robocopy writes
+            # inherits it. Applying it afterwards would mean walking a tree of
+            # hundreds of thousands of small files a second time for no gain.
+            Protect-CiDirectory -Path $stage -SlotUser $User
+
+            # /COPY:DAT and NOT /COPYALL: data, attributes and timestamps, but not
+            # the SECURITY descriptor. This is the Windows spelling of the Linux
+            # `cp -a --no-preserve=ownership` -- the master's ACL is
+            # SYSTEM-and-Administrators plus read-only slots, and copying it would
+            # hand the slot a cache it cannot write. Omitting S is what lets the
+            # inherited ACE from $stage apply instead.
+            #
+            # /XJ excludes junction points from the copy. The scan in
+            # Protect-CacheMaster already refuses the whole master over one, so
+            # this is the second line of the same defence, and it is cheap: without
+            # it robocopy descends into a junction and copies what it names.
+            $previous = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            & robocopy.exe $src $stage '/E' '/COPY:DAT' '/XJ' '/R:1' '/W:1' `
+                '/NFL' '/NDL' '/NJH' '/NJS' '/NP' 2>&1 | Out-Null
+            $exit = $LASTEXITCODE
+            $ErrorActionPreference = $previous
+
+            if (Test-RobocopySuccess -ExitCode $exit) {
+                # Renamed into place rather than copied into place, because the
+                # variables phase 5 writes name the FINAL path: a tool that started
+                # while a half-copied tree sat there would read a truncated entry
+                # as a real one. Move-Item within one directory on one volume is a
+                # rename, so the directory either is not there (a cache miss, which
+                # is correct) or is complete.
+                Move-Item -LiteralPath $stage -Destination $final
+            } else {
+                Write-BootLog "phase 7: slot $Index -- robocopy $tool exited $exit, that cache stays cold"
+                Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        # Either the master had nothing to give, or the copy failed, or this slot
+        # did not fit. All three are a cold cache, which is slow and correct -- but
+        # the directory still has to exist and be writable, or the tool pointed at
+        # it fails instead of missing.
+        if (-not (Test-Path -LiteralPath $final)) {
+            New-Item -ItemType Directory -Force -Path $final | Out-Null
+            Protect-CiDirectory -Path $final -SlotUser $User
+        }
+    }
+
+    Set-Content -LiteralPath $marker -Value '' -Encoding Ascii
+    return $dst
+}
+
+function Invoke-Phase7DependencyCache {
+    <#
+      .SYNOPSIS
+        Seed every slot's dependency cache. Returns index -> cache path.
+      .DESCRIPTION
+        Fails open in every direction -- see the section header. A slot missing
+        from the returned map is a slot phase 5 leaves without cache variables,
+        which is the cold-cache behaviour every Windows host has had until now.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][array] $Provisioned)
+
+    $paths = @{}
+    try {
+        $slotUsers = @($Provisioned | ForEach-Object { $_.User })
+        if (-not (Protect-CacheMaster -SlotUsers $slotUsers)) { return $paths }
+
+        New-Item -ItemType Directory -Force -Path $script:CacheSlots | Out-Null
+        Protect-CiDirectory -Path $script:CacheSlots
+
+        # Retired indices go before the live ones are seeded. `ci-slots` can be
+        # reduced, and a directory for an index above the new count keeps its tree
+        # AND its .ready marker -- which says "every tool directory below is
+        # present and reachable by this slot". Nothing reads it while the index is
+        # retired, so this is hygiene rather than a live bug; it stops being true
+        # the moment the count goes back up and the seeding loop finds a directory
+        # that already claims to be ready. It is also a full duplicate cache tree
+        # per retired slot, on the volume the live ones are sized against.
+        #
+        # Bounded by what is THERE, not by a guess at the old count: the previous
+        # value is recorded nowhere on this host. Only all-digit names are
+        # considered, and only ones above the live count are removed -- anything
+        # else under C:\ci\cache was not put there by this function.
+        foreach ($dir in @(Get-ChildItem -LiteralPath $script:CacheSlots -Directory -Force -ErrorAction SilentlyContinue)) {
+            if ($dir.Name -notmatch '^[0-9]+$') { continue }
+            if ([int] $dir.Name -le $Provisioned.Count) { continue }
+            # SCANNED BEFORE IT IS DELETED, AND THIS IS THE ONE RECURSIVE DELETE
+            # ON THIS HOST THAT REACHES A TREE JOB CODE COULD WRITE.
+            #
+            # `<idx>` is SYSTEM's, but `<idx>\<tool>` carries the slot's Modify
+            # grant -- that is the entire point of the layout -- so a job that ran
+            # on this host before the count came down could have left a junction
+            # in its own cache directory. Windows PowerShell 5.1, which is what
+            # runs this file, follows one on `Remove-Item -Recurse` and deletes
+            # what it POINTS AT rather than the link (PowerShell/PowerShell#621,
+            # fixed in 6.0 and never backported). Aimed at C:\Windows\System32
+            # that is a host this pool cannot recover, executed by SYSTEM, from a
+            # cleanup path whose whole job is hygiene.
+            #
+            # So the refusal is to delete at all. A stale cache tree left on disk
+            # costs disk and is logged; the other branch costs the machine, and
+            # the seeding loop below will not touch a retired index either way.
+            $held = @(Get-ChildItem -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue)
+            $reason = Get-CacheHostileReason -Entries (@($dir) + $held)
+            if ($reason) {
+                Write-BootLog ("phase 7: slot $($dir.Name) retired, but its cache copy is NOT " +
+                    "being removed -- $reason")
+                continue
+            }
+            try {
+                Remove-Item -LiteralPath $dir.FullName -Recurse -Force
+                Write-BootLog ("phase 7: slot $($dir.Name) retired (this host now has " +
+                    "$($Provisioned.Count)), its cache copy removed")
+            } catch {
+                Write-BootLog "phase 7: slot $($dir.Name) retired, but its cache copy could not be removed"
+            }
+        }
+
+        $masterBytes = Get-CacheMasterSize
+        foreach ($slot in $Provisioned) {
+            $free = Get-CacheVolumeFreeByte
+            $seed = Test-CacheSeedAffordable -MasterBytes $masterBytes -FreeBytes $free `
+                -FloorBytes $script:CacheFreeFloorBytes
+            if (-not $seed) {
+                Write-BootLog ("phase 7: slot $($slot.Index) -- a $([int] ($masterBytes / 1GB)) GB copy " +
+                    "would leave under $([int] ($script:CacheFreeFloorBytes / 1GB)) GB free; it gets empty " +
+                    "cache directories and warms from its own jobs instead")
+            }
+            try {
+                $paths[$slot.Index] = Initialize-SlotCache -Index $slot.Index -User $slot.User -Seed $seed
+            } catch {
+                Write-BootLog "phase 7: slot $($slot.Index) -- could not build its cache: $($_.Exception.Message)"
+            }
+        }
+        Write-BootLog ("phase 7: dependency cache seeded for $($paths.Count) slot(s) from " +
+            "$script:CacheMaster ($($script:CacheDirs.Count) tool caches, read-only master)")
+    } catch {
+        Write-BootLog "phase 7: the dependency cache could not be prepared: $($_.Exception.Message)"
+    }
+    return $paths
+}
+
 # --- phase 3: the job credential broker --------------------------------------
 #
 # WHAT THE BROKER IS FOR, NOW THAT THERE IS NO FENCE
@@ -3154,13 +3760,19 @@ function Invoke-Phase5Registration {
         [Parameter(Mandatory = $true)][array] $Provisioned,
         [Parameter(Mandatory = $true)][System.Collections.IDictionary] $Config,
         [Parameter(Mandatory = $true)][string] $HookPath,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $BrokerEndpoint
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $BrokerEndpoint,
+        # Index -> cache path, from phase 7. A slot that is absent from it gets no
+        # cache variables at all, which is the cold-cache behaviour every Windows
+        # host had before issue #150 closed.
+        [System.Collections.IDictionary] $CachePath = @{}
     )
 
     $regToken = Wait-RegistrationToken
     foreach ($slot in $Provisioned) {
+        $cache = ''
+        if ($CachePath.Contains($slot.Index)) { $cache = [string] $CachePath[$slot.Index] }
         $block = Get-SlotServiceEnvironment -Index $slot.Index `
-            -HookPath $HookPath -BrokerEndpoint $BrokerEndpoint
+            -HookPath $HookPath -BrokerEndpoint $BrokerEndpoint -CachePath $cache
         Register-SlotAgent -Slot $slot -RegistrationToken $regToken `
             -Owner $Config.Owner -Repo $Config.Repo -InstanceName $Config.InstanceName `
             -Labels $Config.Labels -RunnerGroup $Config.RunnerGroup -Environment $block
@@ -3584,6 +4196,15 @@ function Invoke-Main {
         -JobServiceAccount $cfg.JobSa -BrokerSource $cfg.BrokerSource -BrokerPort $cfg.BrokerPort
     $hookPath = Invoke-Phase4JobHook -SlotUsers $slotUsers
 
+    # AFTER phase 1 because it needs the slot accounts to seal the master against,
+    # and BEFORE phase 5 because phase 5 is what writes the variables that point a
+    # job at the result. Its position relative to phases 3, 4 and 6 does not
+    # matter: it touches no credential and proves no boundary. It is placed here
+    # rather than last because it is the only phase that can take minutes, and a
+    # slot registered before its cache exists would take a job that runs cold
+    # while the copy it was meant to use is still landing.
+    $cachePath = Invoke-Phase7DependencyCache -Provisioned $provisioned
+
     # BEFORE PHASE 5, and the ordering is the safety property. The probe spends a
     # slot credential to prove the boundary; phase 5 spends it on agents GitHub
     # can hand a job to immediately. Proving second proves nothing.
@@ -3592,7 +4213,7 @@ function Invoke-Main {
     # LAST, and the only phase that makes this host reachable by a job. Everything
     # above it is a boundary; this is what is let inside one.
     Invoke-Phase5Registration -Provisioned $provisioned -Config $cfg `
-        -HookPath $hookPath -BrokerEndpoint $brokerEndpoint
+        -HookPath $hookPath -BrokerEndpoint $brokerEndpoint -CachePath $cachePath
 }
 
 # Dot-sourceable without side effects, so Pester can import the pure functions
