@@ -527,6 +527,29 @@ Describe 'slot service environment' {
         $block['GCE_METADATA_ROOT'] | Should -Be '127.0.0.1:8081'
     }
 
+    # The affinity label is what a workflow run pins its later jobs to. Every
+    # slot on one host gets the SAME value -- it names the host, not the slot --
+    # which is the property the anchor job depends on: any slot that answers can
+    # publish it, and every consumer that lands anywhere on this host is served.
+    It 'hands every slot on a host the same affinity label' {
+        $one = Get-SlotServiceEnvironment -Index 1 -SlotRoot '/ci/slots' -HostLabel 'host-ci-win-abcd'
+        $two = Get-SlotServiceEnvironment -Index 2 -SlotRoot '/ci/slots' -HostLabel 'host-ci-win-abcd'
+        $one['CI_HOST_LABEL'] | Should -Be 'host-ci-win-abcd'
+        $two['CI_HOST_LABEL'] | Should -Be 'host-ci-win-abcd'
+    }
+
+    # Absent, not empty. An empty CI_HOST_LABEL would be a string the anchor's
+    # `-z` test still catches, but a host that publishes the variable at all is
+    # claiming to support the contract -- and one that publishes it EMPTY would
+    # pin a run to the label `host-`, which nothing answers. Saying nothing is
+    # the only reading that degrades to unpinned scheduling.
+    It 'omits the affinity label rather than publishing an empty one' {
+        $block = Get-SlotServiceEnvironment -Index 1 -SlotRoot '/ci/slots'
+        $block.Contains('CI_HOST_LABEL') | Should -BeFalse
+        $blank = Get-SlotServiceEnvironment -Index 1 -SlotRoot '/ci/slots' -HostLabel '   '
+        $blank.Contains('CI_HOST_LABEL') | Should -BeFalse
+    }
+
     # Per service, never machine-wide: a machine-wide TMP hands every slot the
     # same one, which is the collision the per-slot directory removes.
     It 'gives each slot its own temp' {

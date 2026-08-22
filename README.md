@@ -780,12 +780,12 @@ with per-repository measurements, is in
 
 ## One host per workflow run, and one infrastructure stack on it
 
-Status: **proposed**. The decision is
+Status: **accepted, landing phase by phase**. The decision is
 [`docs/adr-pr-host-affinity.md`](docs/adr-pr-host-affinity.md); the contract
-consumers will adopt is
-[`docs/ci-pr-shared-infra.md`](docs/ci-pr-shared-infra.md). Nothing in this
-section is implemented yet, and no consuming repository changes until phase 7
-of the ADR's delivery table.
+consumers adopt is
+[`docs/ci-pr-shared-infra.md`](docs/ci-pr-shared-infra.md), whose delivery table
+is the record of what is live. No consuming repository changes until phase 7,
+and a repository adopting the shared stack needs `slots_per_host >= 2`.
 
 The lane model bounds how much CI a pull request deserves. Nothing bounds
 *where* it lands, and issue #205 measured what that costs: 12 concurrent slots
