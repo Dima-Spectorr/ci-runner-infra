@@ -841,6 +841,36 @@ reading an unreadable file as clean"). Note which way that fails -- it fails the
 exactly as every other phase-7 refusal does; fail-closed on the gate is not
 fail-closed on the host.
 
+**Sealing the DACL is not sealing the tree, because a DACL does not bind the
+owner.** Neither `icacls /reset` nor the grant that follows it changes who
+**owns** an entry, and Windows gives an object's owner `READ_CONTROL` and
+`WRITE_DAC` with no ACE saying so. The owner check is satisfied by a **group**
+SID in the token as well as by the account's own, so a `warm_cache_script` that
+leaves the master owned by `BUILTIN\Users` -- which every slot account is a
+member of -- hands each slot the ability to re-grant itself write on the tree
+that is copied into every other slot. Ownership is therefore taken first, to
+`BUILTIN\Administrators`, in the image (step 7b) and again at boot; a failure
+to take it refuses the seed, because an entry a slot still owns is an entry that
+slot can re-open. It runs after the reparse-point scan for the same reason the
+reset does: `/T` follows a junction.
+
+**Phase 7 is budgeted, because it runs before anything registers.** The scan,
+the two `icacls` tree walks and one `robocopy` per tool per slot all cost time
+set by the **image**, not by this code, and all of it is spent before phase 5
+brings an agent up. Past the registration grace `drain_decision.sh` reads an
+agent-less host as never registered and the replacement is built from the same
+image, so a cache that is merely large turns into a pool that rebuilds hosts
+forever. The seeding therefore carries a wall-clock budget re-read **between
+copies**; when it is gone the remaining tools and slots get empty directories
+and the boot moves on. The free-space floor is re-read at the same points and
+for a related reason: it was measured against a sum of file *lengths*, which
+counts neither allocated size nor the alternate data streams `/COPY:DAT`
+copies, so a master built to understate itself passes the check once and then
+overruns it. Asking the volume again between copies bounds that overrun to a
+single tool directory. What a budget of this shape does **not** bound is one
+native call that hangs rather than runs long; that needs a process-level
+deadline and is tracked separately.
+
 **Reducing `ci-slots` is the one recursive delete that reaches job-written
 files.** A retired index's tree is swept before the live ones are seeded, and
 `<idx>\<tool>` is precisely where the retired slot had `Modify` — so a job that

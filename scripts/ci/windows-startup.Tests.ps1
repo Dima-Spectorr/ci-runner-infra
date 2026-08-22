@@ -1745,6 +1745,32 @@ Describe 'cache seed affordability' {
     }
 }
 
+Describe 'cache seeding budget' {
+    It 'has budget left before the deadline' {
+        Test-CacheSeedBudgetExpired -ElapsedSeconds 12 -BudgetSeconds 420 | Should -BeFalse
+    }
+
+    It 'is expired exactly at the deadline' {
+        Test-CacheSeedBudgetExpired -ElapsedSeconds 420 -BudgetSeconds 420 | Should -BeTrue
+    }
+
+    It 'is expired past the deadline' {
+        Test-CacheSeedBudgetExpired -ElapsedSeconds 421 -BudgetSeconds 420 | Should -BeTrue
+    }
+
+    It 'reads a zero budget as expired, not as unlimited' {
+        # The dangerous reading of "0" is "no limit", and it is the one a reader
+        # expects from every other timeout. Here it means seed nothing, because a
+        # bound that can silently mean unbounded is what this function exists to
+        # rule out; the cost of being wrong this way is a cold cache.
+        Test-CacheSeedBudgetExpired -ElapsedSeconds 0 -BudgetSeconds 0 | Should -BeTrue
+    }
+
+    It 'reads a negative budget as expired too' {
+        Test-CacheSeedBudgetExpired -ElapsedSeconds 0 -BudgetSeconds -1 | Should -BeTrue
+    }
+}
+
 Describe 'slot cache environment' {
     BeforeAll {
         $script:CacheBlock = Get-SlotCacheEnvironment -CachePath 'C:\ci\cache\2'
