@@ -295,14 +295,33 @@ This is the same failure shape as the runner-list lease in §2.2 — a mechanism
 whose description reads fine and which cannot exist — and it is worth stating
 plainly rather than quietly replacing.
 
-So the reservation is host-side, where slots are actually a concept. The owner
-calls `ci-pin-hold --reserve-slot`; the slot's `job-completed` hook reads the
-record, skips its reset, and stops the slot's own agent. Nothing else is
-scheduled onto that uid or that daemon because nothing is listening for it —
-a stronger guarantee than an occupied job, and it consumes no GitHub
-concurrency. One of `slots_per_host` is unavailable for the run either way;
-that is the price of the stack existing at all, and it is inside the budget
-rule 1 already sets.
+So the reservation is host-side, where slots are actually a concept. It is two
+mechanisms, and the split is forced rather than chosen.
+
+The owner calls `ci-pin-hold --reserve-slot`, which writes a record into the
+slot's own state directory. **Unprivileged, deliberately.** A slot's sudoers
+grant is an allowlist of two literal command lines (`slot-reset.sh started`,
+`slot-reset.sh completed`), and the index is taken from `SUDO_UID` so a slot
+cannot even name another. Adding a rule that lets PR-authored code stop a
+systemd unit would undo the most carefully argued fence on the host to save
+writing a file.
+
+`slot-reset.sh` — already root, already invoked before and after every job —
+reads that record and spares this slot's containers while performing its wipe of
+the workspace, home and credentials unchanged. The **controller** stops the
+slot's agent, on the per-host probe it already makes, so no further work is
+scheduled onto that uid or that daemon.
+
+The stop cannot be the hook's. `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` executes
+inside `ci-runner@<idx>.service`; a hook that stopped its own unit would have
+systemd SIGTERM the agent mid-report, so the slot would be reserved and the job
+would be lost. That leaves a window of one controller tick in which a job can
+still land on the reserved slot — which is exactly why the reset half is
+load-bearing and not an optimisation: the newcomer gets a clean tree, and the
+stack survives it.
+
+One of `slots_per_host` is unavailable for the run either way; that is the price
+of the stack existing at all, and it is inside the budget rule 1 already sets.
 
 `services:` is the shape being replaced. A `services:` block is per-job by
 definition and there is no version of it that is shared, so a repository that
@@ -429,8 +448,8 @@ the owner do it, for the reason §3.1 gives: it has to exit for its consumers to
 start, so it is long gone before the last of them finishes.
 
 The host owns both ends. Releasing the slot hold *is* the teardown: the sweeper
-brings the stack down as the slot's own user, runs the reset the `job-completed`
-hook skipped, and starts the agent again. It fires when the controller observes
+brings the stack down as the slot's own user, runs the container reset that the
+hold had been sparing, and starts the agent again. It fires when the controller observes
 the run finished — it already lists that run's jobs — or when the TTL lapses,
 whichever comes first. The TTL is the backstop that keeps a controller outage
 from stranding a slot, and a band sweep catches a stack whose hold record was
@@ -495,6 +514,17 @@ breaks nothing. **Filed as
 [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249); it lands
 before or with phase 3.**
 
+**The reservation is not instant, so a stack can briefly have a co-tenant.**
+Between the owner's exit and the controller's next tick, another pull request's
+job can be scheduled onto the reserved slot and will share that slot's daemon
+for its duration. The reset protects the newcomer's workspace and the hold
+protects the stack from the reset, but nothing stops that job from reaching the
+daemon socket it legitimately owns. The exposure is bounded by the same rule
+that bounds the port band — one repository per pool — and it is the reason a
+shared stack must never hold a secret. Shrinking the window means the controller
+learning about a hold sooner than its tick, which is a cost this design declines
+to pay for a risk this rule already contains.
+
 **A shared stack is a shared mutable object.** Six jobs against one Postgres can
 race in ways six private Postgres instances cannot, and the failure looks like
 flake. The contract is that suites sharing a stack are schema- or
@@ -525,7 +555,7 @@ not adopt the owner pattern at all — a plain `services:` block on that job is
 cheaper and this contract is not for it.
 
 **A reserved slot depends on the release path running.** The agent is stopped by
-the hook and started by the sweeper, so a bug or an outage between the two
+the controller and started by the sweeper, so a bug or an outage between the two
 subtracts a slot from the pool until the TTL fires. The TTL is what bounds it,
 and the reserved-slot count belongs on the same demand series as the pin holds
 so a leak is visible rather than inferred from capacity that quietly went
@@ -548,7 +578,7 @@ phase 5 changes any consuming repository's behaviour.
 |---|---|---|---|
 | 1 | This ADR and the published contract | `docs/` | — |
 | 2 | Affinity label at boot + `CI_HOST_LABEL`, both pools; **`collect_demand` recognises it (§2.5)**; **orphaned-pin detection (§2.6)** | `host-startup.sh`, `windows-host-startup.ps1`, `controller-startup.sh`, self-tests | any workflow using it |
-| 3 | Port band, per-slot DNAT, `CI_SHARED_INFRA_*`, **the `ci-pin-hold` helper and its `--reserve-slot` path** (`job-completed` hook skip + agent stop, sweeper teardown + reset + agent start), TTL sweep; **[#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) first** | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change |
+| 3 | Port band, per-slot DNAT, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper and its `--reserve-slot` record**, **`slot-reset.sh` sparing a held slot's containers** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), sweeper teardown + reset + agent start, TTL sweep; **[#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) first** | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** |
 | 4 | Ingress/egress band rules on the new `ci-shared-infra` tag, **applied to both pools**; pin hold read on the existing IAP-SSH probe and honoured by **both** `recycle_decision` and `drain_decision` (§2.4) | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `recycle-decision.sh`, `drain-decision.sh`, self-tests | any workflow using it |
 | 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) |
 | 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — |
@@ -580,9 +610,11 @@ disabled in every repository on the day after.
   into a per-slot port band, DNAT'd on the host address, and reached by everyone
   else at that address. **The owner exits immediately** (its outputs are
   unreadable until it does, so a lingering owner deadlocks its consumers) and
-  **the host reserves its slot for the run** by stopping that slot's agent,
-  because a released slot is reused by the next job under the same uid and the
-  same daemon. Teardown and release are the same host-side act.
+  **the host reserves its slot for the run** — root's reset spares the held
+  slot's containers, and the controller stops that slot's agent — because a
+  released slot is reused by the next job under the same uid and the same
+  daemon. The hold itself is unprivileged; job code gains no new sudo rule.
+  Teardown and release are the same host-side act.
 - The Windows pool gets no container runtime. This was reconsidered as part of
   this decision and re-affirmed: `adr-windows-pool.md` §4's reasoning is
   unchanged, and rule 3 is satisfied by reachability, not by a runtime. Windows

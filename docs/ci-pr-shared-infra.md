@@ -194,13 +194,29 @@ is an owner whose consumers are still queued, waiting for the endpoints it is
 holding — while it waits for them. Every adopting workflow would deadlock on its
 first run.
 
-**What actually happens.** The reservation is not a job at all. `ci-pin-hold
---reserve-slot` records, on the host, that this slot belongs to this run. The
-slot's `job-completed` hook reads that record and does two things instead of its
-usual reset: it leaves the stack standing, and it stops the slot's own runner
-agent. Nothing else can be scheduled onto that uid or that daemon, because the
-agent that would accept the work is no longer listening — a stronger guarantee
-than an idle job, and it costs no GitHub concurrency.
+**What actually happens.** The reservation is not a job at all, and it is not
+one mechanism either — it is a fast half and an exclusive half, because neither
+alone is buildable.
+
+`ci-pin-hold --reserve-slot` writes an unprivileged record into the slot's own
+state directory saying this slot belongs to this run. It needs no root: job code
+here runs fenced behind a sudoers allowlist of exactly two command lines, and
+widening that for PR-authored code to stop a systemd unit is not a trade this
+contract is willing to make.
+
+Two things then read that record. **`slot-reset.sh`**, which already runs as
+root before and after every job, keeps wiping the workspace, home and
+credentials exactly as it does today but leaves this slot's containers standing.
+**The controller**, on the per-host probe it already makes, stops the slot's
+agent so nothing further is scheduled onto that uid or that daemon.
+
+The stop is the controller's and not the hook's for a mechanical reason: the
+hook executes inside `ci-runner@<idx>.service`, so a hook that stopped its own
+unit would have systemd SIGTERM the agent that is still reporting the job's
+result — the reservation would work and the job would be lost. Between the
+owner's exit and the controller's next tick a job can still land on the slot; it
+gets a clean workspace and the stack survives, which is why the reset half has
+to exist rather than being an optimisation.
 
 The release is host-side too, by the sweeper described below. The cost is
 unchanged: one of `slots_per_host` is unavailable for the length of the run.
@@ -285,7 +301,7 @@ And one command, on `PATH` in every slot:
 | command | meaning |
 |---|---|
 | `ci-pin-hold --run <id> --ttl <duration>` | write this host's pin hold; the controller reads it on the IAP-SSH probe it already makes, and refuses to drain or cordon the host until the hold lapses |
-| `ci-pin-hold … --reserve-slot` | additionally reserve **this slot** for the run: the `job-completed` hook skips its reset and stops the slot's agent, so the stack survives and nothing else lands on its uid or its daemon. Released, torn down and restored host-side when the run ends or the TTL lapses |
+| `ci-pin-hold … --reserve-slot` | additionally reserve **this slot** for the run. Unprivileged — it writes a record. `slot-reset.sh` then spares this slot's containers while still wiping its workspace, and the controller stops the slot's agent so nothing else lands on its uid or its daemon. Released, torn down and restored host-side when the run ends or the TTL lapses |
 
 A host that does not set them is older than this contract. The anchor degrades
 to unpinned on a missing `CI_HOST_LABEL`; the owner job fails on a missing
@@ -350,6 +366,11 @@ disable it.
   unreadable until it finishes and its consumers cannot start, so it would wait
   for them while they wait for it. The reservation is host-side precisely
   because the workflow layer cannot express it.
+- **Do not expect the reservation to be instant.** For a tick after the owner
+  exits, another job may land on the reserved slot. It cannot corrupt your
+  workspace — the reset still runs — but it shares your daemon while it lasts.
+  A stack must not hold anything a concurrent pull request should not see; the
+  port band already says the same thing for the network side.
 - **Do not publish outside your slot's band.** It works in the job that does it
   and in no other job, which is the worst place for a failure to appear.
 - **Do not write `localhost` in a Windows fleet job.** See `RUNNER11`.
