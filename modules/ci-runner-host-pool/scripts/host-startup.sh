@@ -469,7 +469,7 @@ marker="\$SLOT_STATE/\$idx/clean"
 # job that is starting. Everything else under _work belongs to the last job: the
 # checked-out workspace with its .git/hooks, and _tool, which is on PATH.
 #
-# At `completed` and `boot` nothing under _work belongs to a live job, so the
+# At 'completed' and 'boot' nothing under _work belongs to a live job, so the
 # exception is dropped and _actions goes with the rest.
 keep_actions=0
 [ "\$stage" = started ] && keep_actions=1
@@ -509,10 +509,10 @@ if [ -d "\$work" ]; then
       _temp) continue ;;
       _actions) [ "\$keep_actions" = 1 ] && continue ;;
     esac
-    # A directory is recreated EMPTY rather than left absent. At `started` the
+    # A directory is recreated EMPTY rather than left absent. At 'started' the
     # runner has ALREADY prepared the pipeline workspace — JobExtension creates
     # it while initializing the job, well before it appends this hook to the
-    # pre-job steps — so a job whose first step is a plain `run:` would chdir
+    # pre-job steps — so a job whose first step is a plain 'run:' would chdir
     # into a path that had stopped existing. The CONTENT is what belongs to the
     # previous job; the directory itself belongs to this one, and _tool is on
     # PATH the same way.
@@ -527,7 +527,7 @@ fi
 
 # Written LAST and only on success, into a directory no slot can write. It is
 # the assertion "this slot is in the state the template describes", and a reset
-# that half-failed has not earned it. Not written at `started`, because the slot
+# that half-failed has not earned it. Not written at 'started', because the slot
 # is about to be dirtied by the job that is starting.
 if [ "\$rc" = 0 ] && [ "\$stage" != started ]; then
   : >"\$marker" || rc=1
@@ -2556,7 +2556,7 @@ Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/job-completed.sh
 ProtectProc=invisible
 # The third reset, and the one the two hooks cannot cover: an agent KILLED
 # mid-job never runs its completed hook, and a host that reboots warm starts its
-# agents over a disk the previous boot's jobs wrote. `+` runs this as root in
+# agents over a disk the previous boot's jobs wrote. '+' runs this as root in
 # spite of User= above, which is the entire point — see install_job_hooks.
 ExecStartPre=+/opt/ci/job-hooks/slot-reset.sh boot $idx
 ExecStart=$dir/run.sh
