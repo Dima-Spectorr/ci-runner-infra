@@ -2851,7 +2851,12 @@ function Get-CacheHydrateBound {
         # arrive here as the same thing -- text from a metadata attribute -- and
         # [int] would happily parse the first two into a bound nobody chose.
         if ($Text -notmatch '^[0-9]+$') { return $Default }
-        $n = [decimal] $Text
+        # TryParse, NOT a cast. `[decimal] '9' * 40` overflows and THROWS, and
+        # this value came from instance metadata -- so the cast turns a junk
+        # attribute into an exception on the boot path of a phase whose entire
+        # contract is to fail open. Unparseable is out of range is the default.
+        $n = [decimal] 0
+        if (-not [decimal]::TryParse($Text, [ref] $n)) { return $Default }
         if ($n -lt $Low) { return $Low }
         if ($n -gt $High) { return $High }
         return [long] $n
@@ -2933,7 +2938,12 @@ function Get-CacheSnapshotRefusal {
 
     if ($AgeHours -ge $MaxAgeHours) { return "too-old" }
     if ($Bytes -gt $MaxBytes) { return "too-big" }
-    if ($FreeBytes -lt (Get-CacheExpandBound -CompressedBytes $Bytes)) { return "no-space" }
+    # BOTH AT ONCE. The compressed archive stays in C:\ci-cache.download for the
+    # whole of the unpack -- it is what tar is reading -- so the disk has to hold
+    # the archive AND everything it expands to. Reserving only the expansion
+    # passed a 4 GB snapshot with 32 GB free and then needed 36 GB, which fills
+    # the boot volume of a host that was about to run jobs.
+    if ($FreeBytes -lt ((Get-CacheExpandBound -CompressedBytes $Bytes) + $Bytes)) { return "no-space" }
     return ''
 }
 
@@ -2961,11 +2971,19 @@ function Get-CacheMetadataResult {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string] $Path)
     try {
-        $value = [string](Invoke-RestMethod `
-                -Uri "$script:MetadataRoot/$Path" `
-                -Headers @{ 'Metadata-Flavor' = 'Google' } `
-                -TimeoutSec $script:HttpTimeoutSeconds)
-        return [pscustomobject] @{ Value = $value; Unreachable = $false }
+        # BOTH SHAPES, because this reader serves two kinds of attribute.
+        # Invoke-RestMethod deserializes by content type, so the plain-text
+        # attributes (`ci-cache-bucket` and friends) come back as strings and the
+        # service-account token comes back as an OBJECT. Casting that object to
+        # a string yields `@{access_token=...; expires_in=...}` -- which is not
+        # JSON, and a caller matching a JSON regex against it finds nothing and
+        # reports "no token" on a host whose token arrived perfectly. `Object` is
+        # the undamaged response; `Value` stays what every text caller expects.
+        $raw = Invoke-RestMethod `
+            -Uri "$script:MetadataRoot/$Path" `
+            -Headers @{ 'Metadata-Flavor' = 'Google' } `
+            -TimeoutSec $script:HttpTimeoutSeconds
+        return [pscustomobject] @{ Value = [string] $raw; Object = $raw; Unreachable = $false }
     } catch {
         $status = $null
         if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
@@ -2977,6 +2995,7 @@ function Get-CacheMetadataResult {
         # be spelled identically.
         return [pscustomobject] @{
             Value       = ''
+            Object      = $null
             Unreachable = (-not (Test-MetadataAbsence -StatusCode $status))
         }
     }
@@ -3034,6 +3053,14 @@ function Invoke-CacheFetch {
     $enc = ($Prefix + $Object) -replace '/', '%2F'
     $uri = "https://storage.googleapis.com/storage/v1/b/$Bucket/o/$enc$Query"
 
+    # THE TOTAL, NOT EACH READ. `Timeout` bounds the connect and `ReadWriteTimeout`
+    # bounds one Read call, so a response that trickles a byte in just under the
+    # per-read limit is unbounded in aggregate -- and phase 7 runs BEFORE agent
+    # registration, so that is a host recycled for never registering rather than
+    # a slow download. Measure-CacheArchiveExpansion checks its deadline inside
+    # its loop for the same reason; this is that check, on the copy.
+    $copyDeadline = ([datetime]::UtcNow).AddSeconds($TimeoutSeconds)
+
     $response = $null
     $stream = $null
     $file = $null
@@ -3053,6 +3080,9 @@ function Invoke-CacheFetch {
             $read = $stream.Read($buffer, 0, $buffer.Length)
             if ($read -le 0) { break }
             $total += $read
+            if ([datetime]::UtcNow -gt $copyDeadline) {
+                throw "response did not finish inside $TimeoutSeconds seconds"
+            }
             if ($total -gt $MaxBytes) {
                 # Not truncated and kept: a prefix of an archive is the shape of a
                 # partial hydrate, which is the one outcome worse than no hydrate.
@@ -3133,6 +3163,12 @@ function Measure-CacheArchiveExpansion {
     }
 }
 
+# Set only by Expand-CacheSnapshot, when a killed tar could not be confirmed
+# dead; read only by Remove-CacheTreeSafely. Script scope because the cleanup
+# runs in a `finally` several frames above, which the failing path has no way to
+# pass anything to.
+$script:CacheStageNotQuiesced = $false
+
 function Remove-CacheTreeSafely {
     <#
       .SYNOPSIS
@@ -3171,6 +3207,16 @@ function Remove-CacheTreeSafely {
     param([Parameter(Mandatory = $true)][string] $Path)
 
     if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    # THE SCAN BELOW IS EVIDENCE ABOUT A TREE NOTHING IS WRITING. If a killed
+    # unpacker could not be confirmed dead, it can still create a junction
+    # between that scan and the delete, and no ordering closes that window --
+    # so the delete is given up rather than re-ordered.
+    if ($script:CacheStageNotQuiesced) {
+        Write-BootLog ("phase 7: leaving $Path in place -- an unpacker in it could not be confirmed " +
+            'stopped, and a recursive delete could follow a reparse point created after the scan')
+        return
+    }
 
     $rootErrors = @()
     $treeErrors = @()
@@ -3421,7 +3467,22 @@ function Expand-CacheSnapshot {
             -ArgumentList @('-x', '-z', '-f', $Archive, '-C', $Stage) `
             -NoNewWindow -PassThru
         if (-not $proc.WaitForExit($seconds * 1000)) {
+            # KILL IS A REQUEST, NOT AN EVENT. It returns as soon as the
+            # termination is queued, and returning here hands control to the
+            # caller's `finally`, which scans the staging tree and then
+            # recursively deletes what scanned clean -- while tar may still be
+            # writing into it. An archive member that is a reparse point, created
+            # in that window, is followed by 5.1's Remove-Item and deletes what it
+            # points at, as SYSTEM. So the exit is waited for; and if it cannot be
+            # confirmed, the tree is declared un-quiesced and left alone. A stale
+            # staging tree costs disk on an ephemeral host. The other branch costs
+            # the host.
             try { $proc.Kill() } catch { $null = $_ }
+            if (-not $proc.WaitForExit(10000)) {
+                $script:CacheStageNotQuiesced = $true
+                Write-BootLog ('phase 7: the unpacker did not exit after being killed -- leaving the ' +
+                    'staging tree in place rather than deleting a tree something may still be writing')
+            }
             return $false
         }
         return ($proc.ExitCode -eq 0)
@@ -3430,6 +3491,68 @@ function Expand-CacheSnapshot {
     } finally {
         if ($proc) { try { $proc.Dispose() } catch { $null = $_ } }
     }
+}
+
+function Get-CacheStagedEntry {
+    <#
+      .SYNOPSIS
+        Every entry under a staged tree, with a deadline. Reports what it could
+        not read and whether it ran out of time.
+      .DESCRIPTION
+        WHY NOT `Get-ChildItem -Recurse`. One call, however long it takes: an
+        archive inside the size bound can still hold a very large number of very
+        small entries, and a filter driver can slow enumeration by an order of
+        magnitude. Phase 7 runs BEFORE agent registration, so an unbounded scan is
+        the advertised budget quietly not applying to the last step of the
+        sequence -- the same gap the download copy and the expansion measurement
+        each had to close inside their own loops.
+
+        So the walk is explicit and the deadline is checked once per directory.
+        `TimedOut` returns NO entries at all, deliberately: a partial listing is
+        the one shape a hostility scan must never be handed, because it is a proof
+        of absence and half a tree proves nothing about the other half.
+
+        A REPARSE POINT IS JUDGED, NEVER ENTERED. Get-ChildItem -Recurse does not
+        descend one unless asked, and the queue here does not either -- the entry
+        is returned so Get-CacheHostileReason can refuse the whole tree over it.
+
+        `Failed` counts what could not be read. An enumeration error is not an
+        empty directory, and reporting them identically is how a scan starts
+        saying "clean" about a tree nobody managed to look at.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][datetime] $DeadlineUtc
+    )
+
+    $entries = New-Object System.Collections.ArrayList
+    $failed = 0
+
+    $rootErrors = @()
+    foreach ($r in @(Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue -ErrorVariable rootErrors)) {
+        [void] $entries.Add($r)
+    }
+    $failed += $rootErrors.Count
+
+    $queue = New-Object System.Collections.Queue
+    [void] $queue.Enqueue($Path)
+    while ($queue.Count -gt 0) {
+        if ([datetime]::UtcNow -gt $DeadlineUtc) {
+            return [pscustomobject] @{ Entries = @(); Failed = $failed; TimedOut = $true }
+        }
+        $dir = $queue.Dequeue()
+        $dirErrors = @()
+        $kids = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue -ErrorVariable dirErrors)
+        $failed += $dirErrors.Count
+        foreach ($k in $kids) {
+            [void] $entries.Add($k)
+            if ($k.PSIsContainer -and -not ($k.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                [void] $queue.Enqueue($k.FullName)
+            }
+        }
+    }
+    return [pscustomobject] @{ Entries = $entries.ToArray(); Failed = $failed; TimedOut = $false }
 }
 
 function Update-CacheMasterFromStage {
@@ -3484,6 +3607,16 @@ function Update-CacheMasterFromStage {
     foreach ($dir in $script:CacheDirs) {
         $source = Join-Path $Stage $dir
         if (-not (Test-Path -LiteralPath $source)) { continue }
+        # AN EMPTY DIRECTORY IS NOT A CACHE. The host pre-creates all of
+        # $script:CacheDirs at startup, so a snapshot built from a CACHE_PREPARE
+        # that only warmed npm still SHIPS an empty maven, nuget and go. Moving
+        # those over the baked ones costs this pool the cache its image built,
+        # and the verdict still says 'hydrated'. Replacement is only ever an
+        # improvement when there is something in the replacement.
+        if (-not (Get-ChildItem -LiteralPath $source -Force -ErrorAction SilentlyContinue |
+                    Select-Object -First 1)) {
+            continue
+        }
         if (-not $PSCmdlet.ShouldProcess($dir, 'publish into the cache master')) { continue }
         $target = Join-Path $Master $dir
         $aside = Join-Path $Master ".$dir.previous"
@@ -3525,6 +3658,13 @@ function Invoke-CacheHydrateBounded {
     [CmdletBinding()]
     param([string] $Master = $script:CacheMaster)
 
+    # BEFORE THE FIRST READ, not after the last one. Five metadata attributes are
+    # read below, each with its own 10-second timeout, so a metadata server that
+    # answers slowly but inside those timeouts could spend most of a minute here
+    # -- and the budget then started from zero afterwards, which made a documented
+    # 60-second phase take nearly two minutes ahead of agent registration.
+    $started = [datetime]::UtcNow
+
     $bucketRead = Get-CacheMetadataResult -Path 'instance/attributes/ci-cache-bucket'
     if ([string]::IsNullOrEmpty($bucketRead.Value)) {
         if ($bucketRead.Unreachable) {
@@ -3552,7 +3692,6 @@ function Invoke-CacheHydrateBounded {
         -MaxAgeHours (Get-CacheMetadataResult -Path 'instance/attributes/ci-cache-max-age-hours').Value `
         -MaxBytes (Get-CacheMetadataResult -Path 'instance/attributes/ci-cache-max-bytes').Value
 
-    $started = [datetime]::UtcNow
     $deadline = $started.AddSeconds($bounds.BudgetSeconds)
     $left = { [int] ([datetime]::UtcNow).Subtract($deadline).Negate().TotalSeconds }
 
@@ -3574,10 +3713,18 @@ function Invoke-CacheHydrateBounded {
         return 'master-hostile'
     }
 
-    $token = (Get-CacheMetadataResult -Path 'instance/service-accounts/default/token').Value
-    if ($token -match '"access_token"\s*:\s*"([^"]+)"') {
-        $token = $Matches[1]
-    } else {
+    # THE PROPERTY, NOT A REGEX OVER THE STRINGIFIED OBJECT. Invoke-RestMethod
+    # has already parsed this response; `[string]` on the result gives
+    # `@{access_token=...}`, which no JSON pattern matches, so the regex form
+    # returned 'no-token' on every host and the whole pool quietly stayed on the
+    # baked cache. The broker readiness code a few hundred lines below reads the
+    # same endpoint the same way.
+    $tokenResult = Get-CacheMetadataResult -Path 'instance/service-accounts/default/token'
+    $token = ''
+    if ($tokenResult.Object -and $tokenResult.Object.access_token) {
+        $token = [string] $tokenResult.Object.access_token
+    }
+    if (-not $token) {
         Write-BootLog 'phase 7: no instance token -- skipping the cache hydrate'
         return 'no-token'
     }
@@ -3658,7 +3805,10 @@ function Invoke-CacheHydrateBounded {
             return 'no-metadata'
         }
 
-        $age = [int] $started.Subtract($created).TotalHours
+        # FLOOR, not [int]'s banker's rounding: 167.6 hours became 168 and a
+        # snapshot inside a 168-hour bound was refused for being at it. The Linux
+        # half computes this with integer division and means the same thing.
+        $age = [int] [math]::Floor($started.Subtract($created).TotalHours)
         $refusal = Get-CacheSnapshotRefusal -AgeHours $age -Bytes $size `
             -MaxAgeHours $bounds.MaxAgeHours -MaxBytes $bounds.MaxBytes `
             -FreeBytes (Get-CacheVolumeFreeByte -Path $Master)
@@ -3706,23 +3856,34 @@ function Invoke-CacheHydrateBounded {
         # image build. A snapshot is the one way into this tree that no reviewed
         # build step stands in front of, and this is where it is stopped -- in the
         # staging tree, before a single directory reaches the master.
-        $rootErrors = @()
-        $treeErrors = @()
-        $entries = @(Get-Item -LiteralPath $script:CacheStage -Force -ErrorAction SilentlyContinue -ErrorVariable rootErrors) +
-            @(Get-ChildItem -LiteralPath $script:CacheStage -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable treeErrors)
-        if ($rootErrors.Count -gt 0 -or $treeErrors.Count -gt 0) {
+        $scan = Get-CacheStagedEntry -Path $script:CacheStage -DeadlineUtc $deadline
+        if ($scan.TimedOut) {
+            Write-BootLog ("phase 7: the staged snapshot could not be scanned inside the " +
+                "$($bounds.BudgetSeconds)s budget -- starting cold rather than publishing a tree " +
+                'this host never finished reading')
+            return 'scan-timeout'
+        }
+        if ($scan.Failed -gt 0) {
             Write-BootLog ("phase 7: could not read all of the staged snapshot " +
-                "($($rootErrors.Count + $treeErrors.Count) error(s)) -- it cannot be shown to be free of " +
+                "($($scan.Failed) error(s)) -- it cannot be shown to be free of " +
                 'reparse points, so nothing from it reaches the master')
             return 'scan-refused'
         }
-        $reason = Get-CacheHostileReason -Entries $entries
+        $reason = Get-CacheHostileReason -Entries $scan.Entries
         if ($reason) {
             Write-BootLog ("phase 7: cache snapshot $snapshot rejected by the same scan the image build " +
                 "runs -- $reason; starting cold instead")
             return 'scan-refused'
         }
 
+        # The scan finished in time; the moves are what is left, and they are
+        # renames within one volume. Starting them past the deadline would be the
+        # budget expiring between the last two statements of the phase.
+        if ([datetime]::UtcNow -gt $deadline) {
+            Write-BootLog ("phase 7: the $($bounds.BudgetSeconds)s budget ran out before the staged " +
+                'snapshot could be published -- starting cold instead')
+            return 'scan-timeout'
+        }
         $moved = Update-CacheMasterFromStage -Stage $script:CacheStage -Master $Master
         $took = [int] ([datetime]::UtcNow).Subtract($started).TotalSeconds
         Write-BootLog ("phase 7: cache hydrated from $snapshot -- $moved tool cache(s), $size bytes, " +

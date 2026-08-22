@@ -8,8 +8,8 @@ gap it leaves — a Windows job needing a database — is answered by
 [`adr-pr-host-affinity.md`](adr-pr-host-affinity.md) with reachability rather
 than a runtime. Nothing in this document changes.
 Amended 2026-08-22: phase 7, the per-slot dependency cache *and its snapshot hydrate*, is added to
-§3 and closes issue #150; it supersedes the "warm cache" half of what §4 says
-Windows does not get.
+§3; the per-slot cache closed issue #150 and the snapshot hydrate closes #236. It
+supersedes the "warm cache" half of what §4 says Windows does not get.
 Amended 2026-08-16: **§3A supersedes phase 2 of §3 in full** and rewrites parts of
 §2, §4, §5, §6 and §7. Phase 2 as originally written cannot work — the mechanism
 is refuted by Microsoft's documented firewall rule precedence. Read §3A before

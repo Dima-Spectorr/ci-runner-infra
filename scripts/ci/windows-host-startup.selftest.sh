@@ -1993,6 +1993,70 @@ mutate "the cache variables emitted for a slot that never got a cache" \
 # reason it is allowed to exist at all, and none of them fails loudly when it is
 # edited away. A hydrate that has quietly stopped scanning still hydrates.
 
+has_hydrate_bounds_honoured() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # THE TOKEN IS A PROPERTY, NOT A REGEX OVER A STRINGIFIED OBJECT.
+  # Invoke-RestMethod deserialises by content type, so `[string]` on the token
+  # response yields `@{access_token=...; expires_in=...}` -- which is not JSON.
+  # A pattern looking for `"access_token":` finds nothing in it, so the hydrate
+  # said 'no-token' on a host whose token arrived perfectly, and the whole pool
+  # quietly stayed on its baked cache with a tidy verdict in the log.
+  matches "$code" '\$tokenResult\.Object\.access_token' || return 1
+  ! matches "$code" '"access_token"\\s\*:' || return 1
+
+  # A metadata attribute is text someone else supplies. `[decimal] $Text` on
+  # forty digits OVERFLOWS AND THROWS -- an exception on the boot path of the one
+  # phase whose entire contract is to fail open.
+  matches "$code" '\[decimal\]::TryParse\(\$Text, \[ref\] \$n\)' || return 1
+
+  # THE WHOLE DOWNLOAD IS BOUNDED, NOT EACH READ. ReadWriteTimeout bounds one
+  # Read call, so a response trickling a byte just inside it is unbounded in
+  # aggregate -- and phase 7 runs BEFORE agent registration, so that is a host
+  # recycled for never registering, not a slow download.
+  matches "$code" '\$copyDeadline = \(\[datetime\]::UtcNow\)\.AddSeconds\(\$TimeoutSeconds\)' || return 1
+  matches "$code" '^ *if \(\[datetime\]::UtcNow -gt \$copyDeadline\) \{$' || return 1
+
+  # BOTH AT ONCE. The compressed archive is what tar reads, so it stays on disk
+  # for the whole unpack: the reservation covers the archive AND its expansion.
+  # Reserving only the expansion passed a snapshot that then filled the boot
+  # volume of a host about to run jobs.
+  matches "$code" 'Get-CacheExpandBound -CompressedBytes \$Bytes\) \+ \$Bytes' || return 1
+
+  # The age bound is a FLOOR. [int] rounds, so 167.6 hours became 168 and a
+  # snapshot inside a 168-hour bound was refused for being at it.
+  matches "$code" '\[math\]::Floor\(\$started\.Subtract\(\$created\)\.TotalHours\)' || return 1
+
+  # AN EMPTY DIRECTORY IS NOT A CACHE. The host pre-creates every tool directory,
+  # so a snapshot built from a prepare that only warmed npm still ships an empty
+  # maven and nuget -- and moving those over the baked ones costs this pool the
+  # cache its own image built, with the verdict still reading 'hydrated'.
+  matches "$code" 'Select-Object -First 1\)\) \{' || return 1
+
+  # KILL IS A REQUEST, NOT AN EVENT: it returns as soon as termination is queued.
+  # Without a confirmed exit the caller's cleanup scans and then recursively
+  # deletes a tree tar may still be writing into, and 5.1's Remove-Item follows a
+  # reparse point planted in that window -- as SYSTEM. No ordering closes it, so
+  # an unconfirmed stop gives the delete up entirely.
+  matches "$code" '\$proc\.WaitForExit\(10000\)' || return 1
+  matches "$code" '\$script:CacheStageNotQuiesced = \$true' || return 1
+  local flag_at del_at
+  flag_at=$(printf '%s\n' "$code" | grep -n 'if (\$script:CacheStageNotQuiesced) {' | head -1 | cut -d: -f1)
+  del_at=$(printf '%s\n' "$code" | grep -n 'Remove-Item -LiteralPath \$Path -Recurse' | head -1 | cut -d: -f1)
+  [ -n "$flag_at" ] && [ -n "$del_at" ] || return 1
+  [ "$flag_at" -lt "$del_at" ] || return 1
+
+  # THE SCAN IS INSIDE THE BUDGET TOO. An archive within the size bound can still
+  # hold a very large number of entries, and `Get-ChildItem -Recurse` is one call
+  # that cannot be interrupted -- the budget quietly not applying to the last
+  # step of the sequence. And a timed-out walk hands back NO entries: a hostility
+  # scan is a proof of ABSENCE, and half a tree proves nothing about the rest.
+  matches "$code" 'Get-CacheStagedEntry -Path \$script:CacheStage -DeadlineUtc \$deadline' || return 1
+  matches "$code" "return 'scan-timeout'" || return 1
+  matches "$code" 'Entries = @\(\); Failed = \$failed; TimedOut = \$true' || return 1
+}
+
 has_bounded_cache_hydrate() { # <file>
   local code
   code=$(code_of "$1")
@@ -2037,7 +2101,7 @@ has_bounded_cache_hydrate() { # <file>
   # is already published. Anchored to the hydrate's indent: Protect-CacheMaster
   # has a scan of its own at four spaces, and it was standing in for this one.
   local scan_at move_at
-  scan_at=$(printf '%s\n' "$code" | grep -n '^        \$reason = Get-CacheHostileReason -Entries \$entries$' | head -1 | cut -d: -f1)
+  scan_at=$(printf '%s\n' "$code" | grep -n '^        \$reason = Get-CacheHostileReason -Entries \$scan\.Entries$' | head -1 | cut -d: -f1)
   move_at=$(printf '%s\n' "$code" | grep -n 'Update-CacheMasterFromStage -Stage' | head -1 | cut -d: -f1)
   [ -n "$scan_at" ] && [ -n "$move_at" ] || return 1
   [ "$scan_at" -lt "$move_at" ] || return 1
@@ -2098,7 +2162,7 @@ mutate "the expansion bound computed and never acted on" \
   's|^        if (\$expanded -gt \$bound) {$|        if ($false) {|' \
   has_bounded_cache_hydrate
 mutate "the staged tree moved into the master before it is scanned" \
-  's|^        \$reason = Get-CacheHostileReason -Entries \$entries$|        $reason = $null; $null = @($entries)|' \
+  's|^        \$reason = Get-CacheHostileReason -Entries \$scan\.Entries$|        $reason = $null; $null = @($scan)|' \
   has_bounded_cache_hydrate
 mutate "the master root moved onto without being looked at" \
   's|\$rootReason = Get-CacheHostileReason|$rootReason = $null; $null = @(|' \
@@ -2115,6 +2179,44 @@ mutate "the download tree deleted recursively without a reparse-point scan" \
 mutate "the transcoding header traded for handler-side decompression, which arrives unbounded" \
   "s|\$request.Headers.Add('Accept-Encoding', 'gzip')|\$request.AutomaticDecompression = 'GZip'|" \
   has_bounded_cache_hydrate
+
+if has_hydrate_bounds_honoured "$SCRIPT"; then
+  ok
+else
+  bad "the snapshot hydrate misses a bound review found it missing — the instance token, an oversized metadata number, the total download time, the archive's own disk footprint, the age floor, an empty staged directory, a killed unpacker's exit, or the staged scan's share of the budget; every one of these leaves a hydrate that still LOOKS like it works"
+fi
+
+# --- group 27: the bounds the hydrate was missing ----------------------------
+mutate "the instance token read back out of a stringified object" \
+  's|\$tokenResult\.Object\.access_token|$tokenResult.Value|' \
+  has_hydrate_bounds_honoured
+mutate "an oversized metadata number cast straight to decimal" \
+  's|if (-not \[decimal\]::TryParse(\$Text, \[ref\] \$n)) { return \$Default }|$n = [decimal] $Text|' \
+  has_hydrate_bounds_honoured
+mutate "the download bounded per read again, and never in total" \
+  's|if (\[datetime\]::UtcNow -gt \$copyDeadline) {|if ($false) {|' \
+  has_hydrate_bounds_honoured
+mutate "the archive left out of the free-space reservation" \
+  's|(Get-CacheExpandBound -CompressedBytes \$Bytes) + \$Bytes|(Get-CacheExpandBound -CompressedBytes $Bytes)|' \
+  has_hydrate_bounds_honoured
+mutate "the snapshot age rounded to the nearest hour instead of floored" \
+  's|\[int\] \[math\]::Floor(\$started\.Subtract(\$created)\.TotalHours)|[int] $started.Subtract($created).TotalHours|' \
+  has_hydrate_bounds_honoured
+mutate "the staged-directory emptiness test off by one, so every directory looks empty" \
+  's|Select-Object -First 1)) {|Select-Object -First 0)) {|' \
+  has_hydrate_bounds_honoured
+mutate "the killed unpacker never waited for" \
+  's|if (-not \$proc\.WaitForExit(10000)) {|if ($false) {|' \
+  has_hydrate_bounds_honoured
+mutate "the un-quiesced staging tree deleted anyway" \
+  's|if (\$script:CacheStageNotQuiesced) {|if ($false) {|' \
+  has_hydrate_bounds_honoured
+mutate "the staged scan run without a deadline again" \
+  's|Get-CacheStagedEntry -Path \$script:CacheStage -DeadlineUtc \$deadline|Get-CacheStagedEntry -Path $script:CacheStage|' \
+  has_hydrate_bounds_honoured
+mutate "a timed-out walk handing back the entries it did manage to read" \
+  's|Entries = @(); Failed = \$failed; TimedOut = \$true|Entries = $entries.ToArray(); Failed = $failed; TimedOut = $true|' \
+  has_hydrate_bounds_honoured
 
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
