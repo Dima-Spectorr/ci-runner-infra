@@ -44,6 +44,17 @@ output "metric_names" {
     for m in [
       "ci_demand",
       "ci_demand_queued",
+      # Jobs this pool must run that are PINNED to one named host, kept out of
+      # ci_demand on purpose: the autoscaler reads ci_demand, and buying a host
+      # cannot help a job only one existing host can serve. Read the two
+      # together — ci_demand near zero while this is high is a pool that looks
+      # idle and is not, and it is the shape a stuck pinned run makes.
+      "ci_demand_pinned",
+      # Runs failed because the host they were pinned to no longer exists. Rare
+      # by construction and never routine: a sustained non-zero rate means hosts
+      # are being replaced underneath live runs — recycling too aggressively, or
+      # preemption — not that the cancel logic is working hard.
+      "ci_pinned_runs_cancelled",
       "ci_hosts_running",
       "ci_hosts_max",
       "ci_hosts_draining",

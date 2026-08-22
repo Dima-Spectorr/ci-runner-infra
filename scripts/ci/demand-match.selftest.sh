@@ -24,6 +24,7 @@ FILTER='
   [ .jobs[]?
     | select(.status == "queued" or .status == "in_progress")
     | select( ((.labels // []) | length) > 0 )
+    | select( ((.labels // []) | map(select(startswith("host-"))) | length) == 0 )
     | select( ((.labels // []) - $mine_labels) | length == 0 )
   ] | length'
 
@@ -161,6 +162,29 @@ do
     printf 'FAIL: `%s` no longer appears in controller-startup.sh\n' "$needle"
   fi
 done
+# --- host affinity: a pinned job is OURS, and is still not scale-out demand ---
+#
+# ci_demand is the autoscaler's input, and its one move is to add a host. A job
+# pinned to `host-<instance>` can be served by exactly one existing machine, so
+# counting it here buys a host per tick that the job cannot use. It is counted
+# instead as ci_demand_pinned, by classify_pinned(), which runs after the host
+# list exists.
+expect 0 "a job pinned to one of our own hosts is excluded from ci_demand" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","linux","gcp","Telnet-Emulation","host-ci-lin-a1b2"]}]}'
+expect 0 "label order does not smuggle a pinned job back in" \
+  '{"jobs":[{"status":"queued","labels":["host-ci-lin-a1b2","self-hosted","linux"]}]}'
+expect 1 "and the unpinned job beside it still counts — the filter excludes, it does not drop the run" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","linux","host-ci-lin-a1b2"]},{"status":"queued","labels":["self-hosted","linux"]}]}'
+expect 1 "an in-progress pinned job is excluded too, so the pair of series stays consistent" \
+  '{"jobs":[{"status":"in_progress","labels":["self-hosted","linux","host-ci-lin-a1b2"]},{"status":"in_progress","labels":["self-hosted","linux"]}]}'
+
+# shellcheck disable=SC2016  # matching jq source text literally, on purpose.
+if grep -qF 'select( ((.labels // []) | map(select(startswith("host-"))) | length) == 0 )' "$CONTROLLER"; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: the pin-exclusion line tested here no longer appears in controller-startup.sh"
+fi
 # shellcheck disable=SC2016  # matching jq source text literally, on purpose.
 if grep -qF 'select( ((.labels // []) - $mine_labels) | length == 0 )' "$CONTROLLER"; then
   PASS=$((PASS + 1))
