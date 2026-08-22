@@ -805,6 +805,10 @@ describing nothing.
    survives a reset — without it dockerd defaults to `$HOME/.local/share/docker`,
    inside the tree being deleted. And `_actions`/`_temp` are kept at
    `started` only, because the runner fills them *before* it calls that hook.
+   `started` only is the whole of it: `_temp` is `RUNNER_TEMP`, which is where
+   `google-github-actions/auth` writes its credential file, so a `_temp` kept at
+   `completed` would leave that file for the next job on the slot — the same leak
+   one directory over from the home the reset rebuilds.
 
    The reset runs as root through a `sudoers.d` rule that names the two permitted
    argument forms literally; which slot is reset comes from `SUDO_UID`, never from
