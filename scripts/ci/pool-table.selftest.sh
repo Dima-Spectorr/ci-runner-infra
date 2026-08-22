@@ -164,6 +164,17 @@ reject_case() { # <desc> <json> <reason substring>
   want_rows "$1 — the row is dropped" 0
   want_reject "$1 — and reported" "$3"
 }
+# The name reaches two places that treat it as syntax rather than as text: the
+# JSON of every metric point, and a `case` pattern. Both failures are silent and
+# both are cross-pool — one bad name takes down the whole controller's telemetry
+# or quietly steals another pool's completed jobs.
+reject_case "a quote in a name would break every pool's metric flush" \
+  '[{"name":"a\"b","mig":"m","region":"r","runner_labels":"a"}]' "name may use only"
+reject_case "a glob in a name would claim another pool's outcomes" \
+  '[{"name":"lin-*","mig":"m","region":"r","runner_labels":"a"}]' "name may use only"
+reject_case "and a space, which is not a metric label value either" \
+  '[{"name":"lin ci","mig":"m","region":"r","runner_labels":"a"}]' "name may use only"
+
 reject_case "a pool with no mig names no machines" \
   '[{"name":"p","region":"r","runner_labels":"a"}]' "no mig"
 reject_case "a pool with no region cannot be addressed" \

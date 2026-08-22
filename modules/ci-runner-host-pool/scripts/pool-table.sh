@@ -123,6 +123,17 @@ pool_table_parse() {
     # operator reading a boot log should get one line per broken pool.
     why=""
 
+    # The name is not just an identifier. It is interpolated RAW into the JSON
+    # of every metric point the pool publishes (`"pool":"$POOL"`), and it is
+    # used as a shell GLOB PATTERN when the outcome accumulators are filtered
+    # back apart per pool (`case "$key" in "$POOL|"*)`). A quote in it breaks
+    # the flush for EVERY pool on the controller, not just this one; a `*` or a
+    # `?` in it silently claims another pool's completed jobs as its own. Both
+    # are one hand-edited table away, and neither is visible anywhere.
+    case "$name" in
+      *[!A-Za-z0-9._-]*) why="name may use only letters, digits, dot, dash and underscore" ;;
+    esac
+
     # The two that address real infrastructure. A row missing either names no
     # machines, and every later call would be made against an empty string —
     # which for `gcloud compute instance-groups managed list-instances` is not
