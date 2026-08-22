@@ -310,7 +310,18 @@ has_slot_reset() { # <file>
   # reaches ..name as well as .name — either one left behind is an entry that
   # survives every reset while the slot is still recorded clean
   matches "$code" '\[ -e "\\\$e" \] \|\| \[ -L "\\\$e" \] \|\| continue' || return 1
-  matches "$code" '"\\\$work"/\.\[!\.\]\* "\\\$work"/\.\.\?\*' || return 1
+  matches "$code" '"\\\$held"/\.\[!\.\]\* "\\\$held"/\.\.\?\*' || return 1
+  # root never walks a name the slot can swap. _work is renamed into a root-owned
+  # 0700 holding directory for the duration and renamed back at the end, and a
+  # _work that is already a symlink is refused rather than followed.
+  matches "$code" 'held="\\\$SLOT_ROOT/\.reset/\\\$idx/_work"' || return 1
+  matches "$code" 'if \[ -L "\\\$work" \]' || return 1
+  matches "$code" 'mv -T -- "\\\$work" "\\\$held"' || return 1
+  matches "$code" 'mv -T -- "\\\$held" "\\\$work"' || return 1
+  matches "$code" 'install -d -o root -g root -m 0700 "\$SLOT_ROOT/\.reset/\$idx"' || return 1
+  # and the boot reset in provision_slot_user does not run under an agent that a
+  # warm reboot already brought up — that unit ran its own boot reset
+  matches "$code" 'systemctl is-active --quiet "ci-runner@\$idx\.service"' || return 1
   # and the workspace the runner already prepared for the STARTING job is
   # emptied, not unlinked — a plain `run:` step chdirs into it
   matches "$code" 'install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"' || return 1
@@ -435,6 +446,58 @@ has_baked_image_load() { # <file>
   matches "$joined" 'docker info --format' || return 1
 }
 
+# A name the previous job left in the slot's image store is the one warm thing
+# the next job EXECUTES while believing it fetched it: `docker run x` contacts no
+# registry when a local `x` exists, and neither does a `FROM x` in a later build.
+# #231 moved the store out of the home so it survives a reset — that is what
+# makes the reset cheap, and it is also what leaves this open (#233).
+#
+# None of it is visible in a passing build: the poisoned job succeeds.
+has_local_tag_prune() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # 1. At the resets that END a job, never at the one that starts it — at
+  #    `started` the runner has already loaded the image the job is about to use.
+  matches "$code" 'if \[ "\\\$stage" != started \]; then' || return 1
+
+  # 2. A REGISTRY DIGEST is what buys a tag its life, and a job cannot write one:
+  #    `docker tag` and `docker build -t` produce none; only a pull or a push does.
+  matches "$code" 'RepoDigests' || return 1
+  matches "$code" '\[ "\\\$ndig" = 0 \] \|\| continue' || return 1
+
+  # 3. …or the boot manifest, matched by image ID and NEVER by name. Match the
+  #    name and a job blesses its own image by retagging it onto a baked one.
+  matches "$code" 'baked="\\\$SLOT_STATE/\\\$idx/baked-images"' || return 1
+  matches "$code" 'grep -qxF -- "\\\$id" "\\\$baked"' || return 1
+
+  # 4. The NAME goes, not the content. `--no-prune` on one reference of a
+  #    multiply-referenced image untags it and leaves the layers in the store, so
+  #    a rebuild is still warm — deleting the content instead would be the cold
+  #    start per job that the whole warm layer exists to end.
+  matches "$code" 'docker rmi --no-prune -- "\\\$t"' || return 1
+  ! matches "$code" 'docker image prune' || return 1
+
+  # 5. The manifest it reads is written by root at boot from what `docker load`
+  #    actually reported, by ID — a name there would be forgeable by the same
+  #    retag as above.
+  matches "$code" "docker image inspect --format '\{\{\.Id\}\}' -- \"\\\$ref\"" || return 1
+  matches "$code" 'chown root:root "\$manifest_tmp"' || return 1
+  # …and installed with ONE rename, so a reset that lands mid-boot reads either
+  #    the previous complete list or the new complete list. A manifest appended
+  #    to in place would have a window in which the entries not yet written look
+  #    exactly like an image nobody baked — and get untagged.
+  matches "$code" 'mv -T -- "\$manifest_tmp" "\$manifest"' || return 1
+
+  # 6. A daemon that is not there only logs: it already fails the next job at its
+  #    first docker line, and refusing the marker on top of that turns a slot with
+  #    no dockerd into a slot that also fails every job for a reason it never
+  #    names. A tag that will NOT go is the opposite — that slot is poisoned, and
+  #    the clean marker is exactly the claim it must not get.
+  matches "$code" 'no docker socket at' || return 1
+  matches "$code" 'could not drop local image tag' || return 1
+}
+
 # The helper carries the trap it was written to avoid, so it is tested first.
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -487,6 +550,34 @@ has_secrets_out_of_argv() { # <file>
   [ "$(printf '%s\n' "$code" | grep -cE '^ProtectProc=invisible')" -eq 2 ] || return 1
   matches "$code" 'remount,nosuid,nodev,noexec,hidepid=2 /proc' || return 1
   matches "$code" '^  harden_proc$'
+}
+
+# A slot must be TOLD what fraction of the host it is. `nproc` inside a slot
+# reports the whole machine — slots are separated by user, network namespace and
+# dockerd, and deliberately not by CPU — so a workflow that sizes its worker
+# pool from `nproc` sizes it for a host it shares with K-1 siblings. Measured on
+# the IntegrateIT pool 2026-08-22: 4 slots on 16 vCPU, each test job budgeting
+# for 16, roughly 3x oversubscribed. Nothing errors. The job just runs slowly
+# and its per-test timeouts start expiring, which reads as a flaky suite and
+# gets "fixed" by a re-run — so the variables are pinned here.
+has_slot_share() { # <file>
+  local code
+  code=$(code_of "$1")
+  # the share is DERIVED from the host and the slot count, not a literal
+  matches "$code" 'Environment=CI_SLOT_VCPUS=\$\(\( cpus / SLOTS' || return 1
+  matches "$code" 'Environment=CI_SLOT_MEM_MB=' || return 1
+  # and the host's own totals, so a job that wants to reason about the machine
+  # can, without guessing which of the two `nproc` means
+  matches "$code" 'Environment=CI_HOST_VCPUS=' || return 1
+  matches "$code" 'Environment=CI_HOST_SLOTS=' || return 1
+  # never zero: integer division on a host with fewer vCPU than slots would
+  # otherwise hand a job a worker budget of 0
+  matches "$code" 'cpus / SLOTS > 0 \? cpus / SLOTS : 1' || return 1
+  # computed unconditionally — unlike CACHE_ENV, which is empty for an unseeded
+  # slot. A slot always has a share.
+  matches "$code" 'local SHARE_ENV; SHARE_ENV=\$\(share_env\)' || return 1
+  # and actually reaching the unit, which is the only part the job can observe
+  matches "$code" '^\$SHARE_ENV$'
 }
 
 # --- the real script must satisfy both ---------------------------------------
@@ -564,12 +655,29 @@ else
   bad "a job can choose the container image every OTHER slot on this host runs — the baked archives are loaded into every slot's daemon at boot, so an archive a slot can write (or a checksum line it can borrow from a neighbouring filename) is arbitrary code in every job that lands here afterwards"
 fi
 
+if has_local_tag_prune "$SCRIPT"; then
+  ok
+else
+  bad "a job can leave an image name behind for the next, unrelated job on the same slot to run as if it had fetched it — the store survives the reset by design (#231) and nothing drops the tags no registry digest and no boot manifest vouches for (#233)"
+fi
+
 # --- mutation cases: prove the checks above can actually fail -----------------
+if has_slot_share "$SCRIPT"; then
+  ok
+else
+  bad "a slot does not publish its share of the host, so a job sizing itself from nproc sizes for the whole machine and oversubscribes it K-fold - slow jobs and expiring per-test timeouts that a re-run appears to fix"
+fi
+
 mutate() { # <description> <sed-program> <predicate> — predicate must go false
   local desc="$1" prog="$2" pred="$3" tmp
   tmp=$(mktemp)
   sed "$prog" "$SCRIPT" >"$tmp"
-  if "$pred" "$tmp"; then
+  if cmp -s "$SCRIPT" "$tmp"; then
+    # The sed program matched nothing, so the predicate was handed the REAL file
+    # and passing proves nothing. Left undetected this reads as a live mutation
+    # for as long as the anchor stays stale.
+    bad "mutation did not apply (stale anchor): $desc"
+  elif "$pred" "$tmp"; then
     bad "mutation not detected: $desc"
   else
     ok
@@ -637,7 +745,12 @@ mutate "prepared workspace unlinked"      's@install -d -o "\\\$u" -g "\\\$u" -m
 mutate "credentials kept across the boundary" 's@_temp) \[ "\\\$keep_temp" = 1 \] && continue ;;@_temp) continue ;;@'  has_slot_reset
 mutate "_temp wiped under the starting job" 's@\[ "\\\$stage" = started \] && keep_temp=1@keep_temp=0@'                    has_slot_reset
 mutate "dangling symlink survives the reset" 's@\[ -e "\\\$e" \] || \[ -L "\\\$e" \] || continue@[ -e "\\\$e" ] || continue@' has_slot_reset
-mutate "double-dot names never enumerated" 's@ "\\\$work"/\.\.?\*@@'                                                has_slot_reset
+mutate "double-dot names never enumerated" 's@ "\\\$held"/\.\.?\*@@'                                                has_slot_reset
+mutate "root walks a name the slot can swap" 's@mv -T -- "\\\$work" "\\\$held"@true@'                              has_slot_reset
+mutate "a symlinked work folder followed" 's@if \[ -L "\\\$work" \]@if false@'                                            has_slot_reset
+mutate "the workspace never handed back" 's@mv -T -- "\\\$held" "\\\$work"@true@'                                    has_slot_reset
+mutate "holding directory left slot-writable" 's@install -d -o root -g root -m 0700 "\$SLOT_ROOT/.reset/\$idx"@install -d -o "\$u" -g "\$u" -m 0700 "\$SLOT_ROOT/.reset/\$idx"@' has_slot_reset
+mutate "boot reset runs under a live agent" 's|systemctl is-active --quiet "ci-runner@\$idx.service"|false|'                                  has_slot_reset
 mutate "data root back inside the home"   's@ --data-root=/var/lib/ci-slot/%i/docker@@'                            has_slot_reset
 
 mutate "daemon MTU config removed"        's|daemon\.json|daemon.txt|g'                                          has_container_mtu
@@ -655,6 +768,15 @@ mutate "digest no longer verified"           's|sha256sum -c --status|cat|'     
 mutate "loads left to the cgroup killer"     's|wait \${IMAGE_LOAD_PIDS}|:|'                                        has_baked_image_load
 mutate "image store no longer reported"      's|io.containerd.snapshotter.v1|containerd|g'                          has_baked_image_load
 
+mutate "prune moved onto the starting job"   's|if \[ "\\$stage" != started \]; then|if [ "\\$stage" = started ]; then|' has_local_tag_prune
+mutate "digest-bearing images untagged too"  's|\[ "\\$ndig" = 0 \] \|\| continue|[ "\\$ndig" -ge 0 ] \|\| continue|'    has_local_tag_prune
+mutate "boot manifest no longer consulted"   's|grep -qxF -- "\\$id" "\\$baked"|grep -qxF -- "zzz" "\\$baked"|'          has_local_tag_prune
+mutate "manifest keyed by name, not id"      's|--format .{{[.]Id}}. -- "$ref"|--format NAME -- "$ref"|'         has_local_tag_prune
+mutate "manifest written in place"           's|mv -T -- "\$manifest_tmp" "\$manifest"|cp -- "$manifest_tmp" "$manifest"|'  has_local_tag_prune
+mutate "manifest left slot-writable"         's|chown root:root "\$manifest_tmp"|chown "$u":"$u" "$manifest_tmp"|'          has_local_tag_prune
+mutate "layers deleted with the tag"         's|docker rmi --no-prune -- "\\$t"|docker image prune -af|'                  has_local_tag_prune
+mutate "a stuck tag no longer fails the slot" 's|could not drop local image tag|dropped nothing for|'                     has_local_tag_prune
+
 mutate "App JWT back in curl argv"        's@-K <(printf.*\$jwt")@-H "Authorization: Bearer $jwt"@'          has_secrets_out_of_argv
 mutate "registration token back in curl argv" 's@-K <(printf.*\$tok")@-H "Authorization: Bearer $tok"@'          has_secrets_out_of_argv
 mutate "env prefix dropped from config.sh" '/^  ACTIONS_RUNNER_INPUT_TOKEN=/d'                                    has_secrets_out_of_argv
@@ -664,6 +786,14 @@ mutate "silent env drop no longer fatal"   '/sudo will not pass an environment v
 mutate "only one slot unit hides /proc"    '0,/^ProtectProc=invisible/s@^ProtectProc=invisible@#&@'               has_secrets_out_of_argv
 mutate "hidepid weakened to 1"             's@hidepid=2@hidepid=1@'                                               has_secrets_out_of_argv
 mutate "host /proc left readable"          '/^  harden_proc$/d'                                                   has_secrets_out_of_argv
+
+mutate "share never computed"        's@^  local SHARE_ENV; SHARE_ENV=\$(share_env)$@@'          has_slot_share
+mutate "share never reaches the unit" 's@^\$SHARE_ENV$@@'                                        has_slot_share
+mutate "slot handed the whole host"   's@cpus / SLOTS > 0 ? cpus / SLOTS : 1@cpus@'               has_slot_share
+mutate "share hardcoded"              's@Environment=CI_SLOT_VCPUS=\$(( cpus / SLOTS@Environment=CI_SLOT_VCPUS=$(( 16 / SLOTS@' has_slot_share
+mutate "memory share dropped"         '/^Environment=CI_SLOT_MEM_MB=/d'                           has_slot_share
+mutate "host totals dropped"          '/^Environment=CI_HOST_VCPUS=/d'                            has_slot_share
+mutate "slot count dropped"           '/^Environment=CI_HOST_SLOTS=/d'                            has_slot_share
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
