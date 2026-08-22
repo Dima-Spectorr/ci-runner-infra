@@ -1872,3 +1872,125 @@ Describe 'cache variables on the service environment' {
         $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookPath
     }
 }
+
+Describe 'snapshot hydrate bounds' {
+    # The clamps are not the same check Terraform already ran. Metadata is not
+    # only written by Terraform: anyone who can set an instance's metadata can
+    # set ci-cache-budget-seconds to a number that holds registration open for as
+    # long as they like, and a shape check alone accepts that number.
+    It 'takes the metadata values when they are inside the ranges' {
+        $b = Get-CacheHydrateBound -Budget '90' -MaxAgeHours '24' -MaxBytes '1073741824'
+        $b.BudgetSeconds | Should -Be 90
+        $b.MaxAgeHours | Should -Be 24
+        $b.MaxBytes | Should -Be 1073741824
+    }
+
+    It 'falls back to the defaults for a host booting from an older template' {
+        $b = Get-CacheHydrateBound -Budget '' -MaxAgeHours $null -MaxBytes ''
+        $b.BudgetSeconds | Should -Be $script:CacheHydrateBudgetSeconds
+        $b.MaxAgeHours | Should -Be $script:CacheSnapshotMaxAgeHours
+        $b.MaxBytes | Should -Be $script:CacheSnapshotMaxBytes
+    }
+
+    It 'clamps a budget that would hold registration open' {
+        (Get-CacheHydrateBound -Budget '86400' -MaxAgeHours '1' -MaxBytes '1048576').BudgetSeconds |
+            Should -Be 300
+    }
+
+    It 'clamps a budget too small to fetch anything' {
+        (Get-CacheHydrateBound -Budget '1' -MaxAgeHours '1' -MaxBytes '1048576').BudgetSeconds |
+            Should -Be 10
+    }
+
+    It 'clamps an age bound past the bucket lifecycle' {
+        (Get-CacheHydrateBound -Budget '60' -MaxAgeHours '9999' -MaxBytes '1048576').MaxAgeHours |
+            Should -Be 720
+    }
+
+    It 'clamps a size bound that would fill the boot disk' {
+        (Get-CacheHydrateBound -Budget '60' -MaxAgeHours '24' -MaxBytes '999999999999').MaxBytes |
+            Should -Be 34359738368
+    }
+
+    # A negative number and a decimal are both text at this point, and [int]
+    # would parse them into a bound nobody chose.
+    It 'refuses anything that is not a run of digits' {
+        foreach ($bad in @('-1', '6.5', '60s', 'sixty', ' 60')) {
+            (Get-CacheHydrateBound -Budget $bad -MaxAgeHours '24' -MaxBytes '1048576').BudgetSeconds |
+                Should -Be $script:CacheHydrateBudgetSeconds
+        }
+    }
+}
+
+Describe 'snapshot pointer whitelist' {
+    It 'accepts a name a publisher writes' {
+        Test-CacheSnapshotPointer -Name 'snapshot-2026-08-22T03-00-11Z.tar.gz' | Should -BeTrue
+    }
+
+    # The pointer is the one input in the hydrate that names a path, so the
+    # refusals are the property: no traversal, no other pool's prefix, and
+    # nothing needing URL encoding -- which is why the fetch carries no
+    # percent-encoder.
+    It 'refuses a name that could leave this pool prefix' {
+        foreach ($bad in @('../other-pool/snap.tgz', 'sub/snap.tgz', '..', '.hidden', '',
+                'snap$(whoami).tgz', "snap`nsecond", 'snap%2F..%2Fx', 'snap file.tgz')) {
+            Test-CacheSnapshotPointer -Name $bad | Should -BeFalse
+        }
+    }
+
+    It 'refuses a null pointer' {
+        Test-CacheSnapshotPointer -Name $null | Should -BeFalse
+    }
+}
+
+Describe 'snapshot expansion bound' {
+    # gzip expands by more than a thousandfold on the right input, so the bound
+    # on the compressed archive bounds nothing about what it writes.
+    It 'allows eight times the compressed size' {
+        Get-CacheExpandBound -CompressedBytes 100MB | Should -Be (800MB)
+    }
+
+    It 'gives a tiny archive a workable floor' {
+        Get-CacheExpandBound -CompressedBytes 16 | Should -Be $script:CacheExpandFloorBytes
+    }
+}
+
+Describe 'snapshot refusal' {
+    # Built per-case rather than splatted from one hashtable with overrides:
+    # splatting a name and then passing it again is a parameter-bound error, not
+    # an override, and the test would fail for a reason that is not the rule.
+    BeforeAll {
+        $script:Refuse = {
+            param($AgeHours = 1, $Bytes = 1MB, $MaxAgeHours = 168, $MaxBytes = 4GB, $FreeBytes = 100GB)
+            Get-CacheSnapshotRefusal -AgeHours $AgeHours -Bytes $Bytes `
+                -MaxAgeHours $MaxAgeHours -MaxBytes $MaxBytes -FreeBytes $FreeBytes
+        }
+    }
+
+    It 'accepts a fresh snapshot that fits' {
+        & $script:Refuse | Should -Be ''
+    }
+
+    # The bucket's lifecycle rule and this bound fail differently: the bucket's
+    # holds if this script is broken, this one holds if the rule is edited away
+    # in the console.
+    It 'refuses one past the age bound' {
+        & $script:Refuse -AgeHours 168 | Should -Be 'too-old'
+    }
+
+    It 'refuses one past the size bound' {
+        & $script:Refuse -Bytes (4GB + 1) | Should -Be 'too-big'
+    }
+
+    # Reserved against the EXPANDED bound, not the compressed size: unpacking
+    # past what was reserved is the failure the reservation exists to prevent.
+    It 'refuses one that would not fit expanded, even though it fits compressed' {
+        & $script:Refuse -Bytes 1GB -FreeBytes 2GB | Should -Be 'no-space'
+    }
+
+    # The refusal NAMES which bound it was. Six predicates sharing one message is
+    # what cost the Linux side hours on a cold pool.
+    It 'reports the age bound first when more than one is broken' {
+        & $script:Refuse -AgeHours 999 -Bytes 8GB -FreeBytes 0 | Should -Be 'too-old'
+    }
+}

@@ -1914,5 +1914,136 @@ mutate "the cache variables emitted for a slot that never got a cache" \
   's|if (-not \[string\]::IsNullOrWhiteSpace(\$CachePath)) {|if ($true) {|' \
   has_slot_cache_isolation
 
+# --- invariant 12: the snapshot hydrate stays bounded and untrusted ----------
+#
+# Phase 7 now unpacks a tarball this pool did not build over the tree every slot
+# reads from. That is a NEW way into C:\ci-cache, and it is the only one no
+# reviewed image-build step stands in front of -- so every property below is the
+# reason it is allowed to exist at all, and none of them fails loudly when it is
+# edited away. A hydrate that has quietly stopped scanning still hydrates.
+
+has_bounded_cache_hydrate() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # ORDERING, AND IT IS THE DESIGN. The hydrate writes untrusted content into the
+  # master; Protect-CacheMaster is the gate that scans and seals it. Moving the
+  # hydrate after the seal would leave the pool reading a tree that was sealed
+  # before its contents arrived.
+  local hyd_at seal_at
+  hyd_at=$(printf '%s\n' "$code" | grep -n '\$null = Invoke-CacheHydrate' | head -1 | cut -d: -f1)
+  seal_at=$(printf '%s\n' "$code" | grep -n 'Protect-CacheMaster -SlotUsers \$slotUsers' | head -1 | cut -d: -f1)
+  [ -n "$hyd_at" ] && [ -n "$seal_at" ] || return 1
+  [ "$hyd_at" -lt "$seal_at" ] || return 1
+
+  # The pointer is the one input here that names a path. Whitelisted, and the
+  # rejected name is never echoed: it is fully attacker-controlled, it has not
+  # been validated at the point the log line runs, and boot logs are read in a
+  # terminal.
+  matches "$code" 'if \(-not \(Test-CacheSnapshotPointer -Name \$snapshot\)\) \{' || return 1
+  matches "$code" '\$\(\$snapshot\.Length\) bytes' || return 1
+
+  # THE GENERATION IS PINNED. Age, size and free space are asserted against the
+  # metadata and the bytes arrive afterwards; unpinned, every one of those bounds
+  # was checked against a generation that no longer exists.
+  matches "$code" 'generation=\$generation' || return 1
+
+  # A COUNTING PASS DECIDES THE BOUND, BEFORE anything is unpacked. tar exits 0
+  # on a stream cut at a member boundary -- the zero padding reads as an
+  # end-of-archive marker -- so a bound enforced only by stopping the unpacker
+  # yields a PARTIAL cache believed whole.
+  local count_at unpack_at
+  count_at=$(printf '%s\n' "$code" | grep -n 'Measure-CacheArchiveExpansion -Path \$archive' | head -1 | cut -d: -f1)
+  unpack_at=$(printf '%s\n' "$code" | grep -n 'Expand-CacheSnapshot -Archive \$archive' | head -1 | cut -d: -f1)
+  [ -n "$count_at" ] && [ -n "$unpack_at" ] || return 1
+  [ "$count_at" -lt "$unpack_at" ] || return 1
+  # ...and the count is ACTED ON. gzip expands by more than a thousandfold on the
+  # right input, so the bound on the compressed archive bounds nothing.
+  matches "$code" '^        if \(\$expanded -gt \$bound\) \{$' || return 1
+
+  # THE SAME SCAN Protect-CacheMaster RUNS, and it runs BEFORE the staged tree is
+  # moved into the master -- not after, where the refusal would name content that
+  # is already published. Anchored to the hydrate's indent: Protect-CacheMaster
+  # has a scan of its own at four spaces, and it was standing in for this one.
+  local scan_at move_at
+  scan_at=$(printf '%s\n' "$code" | grep -n '^        \$reason = Get-CacheHostileReason -Entries \$entries$' | head -1 | cut -d: -f1)
+  move_at=$(printf '%s\n' "$code" | grep -n 'Update-CacheMasterFromStage -Stage' | head -1 | cut -d: -f1)
+  [ -n "$scan_at" ] && [ -n "$move_at" ] || return 1
+  [ "$scan_at" -lt "$move_at" ] || return 1
+  matches "$code" "return 'scan-refused'" || return 1
+
+  # The master's own ROOT is checked before anything is moved onto it. The
+  # recursive scan is Protect-CacheMaster's, and it runs after this -- so a
+  # junction AS the master would be moved into before anything looked at it.
+  matches "$code" '\$rootReason = Get-CacheHostileReason' || return 1
+
+  # THIS LAYER FAILS OPEN. Get-MetadataValue denies the boot when the metadata
+  # server does not answer, which is right for identity and wrong for a cache: a
+  # host that refuses to register over a cold cache is a missing host, and the
+  # pool answers a missing host by queueing jobs.
+  matches "$code" 'Get-CacheMetadataResult -Path' || return 1
+
+  # Remove-CacheTreeSafely is the ONLY recursive delete on the scratch trees.
+  # Windows PowerShell 5.1 -- which runs this script -- follows a directory
+  # junction on `Remove-Item -Recurse` and deletes what it points at
+  # (PowerShell/PowerShell#621, fixed in 6.0, never backported), and the staging
+  # tree holds a tarball a publisher wrote.
+  ! matches "$code" 'Remove-Item -LiteralPath \$script:CacheStage' || return 1
+  ! matches "$code" 'Remove-Item -LiteralPath \$script:CacheDownload' || return 1
+  matches "$code" 'Remove-CacheTreeSafely -Path \$script:CacheStage' || return 1
+  matches "$code" 'Remove-CacheTreeSafely -Path \$script:CacheDownload' || return 1
+
+  # `Accept-Encoding: gzip` is not an optimisation. Without it the storage
+  # service decompressively transcodes a gzip-stored object: it arrives with no
+  # Content-Length and expanded past the size that was just bounded. So the
+  # header is sent by hand and the handler's own decompression stays OFF.
+  matches "$code" "Headers.Add\('Accept-Encoding', 'gzip'\)" || return 1
+  ! matches "$code" 'AutomaticDecompression *=' || return 1
+}
+
+if has_bounded_cache_hydrate "$SCRIPT"; then
+  ok
+else
+  bad "the snapshot hydrate is unbounded, unpinned, or reaches the master unscanned — it unpacks an archive this pool did not build over the tree every slot reads from, and it is the one way into C:\\ci-cache that no image-build step stands in front of"
+fi
+
+# --- group 26: the hydrate stops being the untrusted path it is --------------
+mutate "the hydrate moved after the seal, where the master is sealed before its contents arrive" \
+  's|^        \$null = Invoke-CacheHydrate$|        $null = $Provisioned|' \
+  has_bounded_cache_hydrate
+mutate "the pointer whitelist dropped, so a name can leave this pool prefix" \
+  's|if (-not (Test-CacheSnapshotPointer -Name \$snapshot)) {|if ($false) {|' \
+  has_bounded_cache_hydrate
+mutate "the rejected pointer echoed into a boot log read in a terminal" \
+  's|(\$(\$snapshot.Length) bytes)|($snapshot)|' \
+  has_bounded_cache_hydrate
+mutate "the generation unpinned, so what was measured is not what is downloaded" \
+  's|?alt=media&generation=\$generation|?alt=media|' \
+  has_bounded_cache_hydrate
+mutate "the counting pass dropped, leaving the bound to the unpacker that exits 0 on a cut stream" \
+  's|\$expanded = Measure-CacheArchiveExpansion -Path \$archive|$expanded = 0; $null = @( -Path $archive|' \
+  has_bounded_cache_hydrate
+mutate "the expansion bound computed and never acted on" \
+  's|^        if (\$expanded -gt \$bound) {$|        if ($false) {|' \
+  has_bounded_cache_hydrate
+mutate "the staged tree moved into the master before it is scanned" \
+  's|^        \$reason = Get-CacheHostileReason -Entries \$entries$|        $reason = $null; $null = @($entries)|' \
+  has_bounded_cache_hydrate
+mutate "the master root moved onto without being looked at" \
+  's|\$rootReason = Get-CacheHostileReason|$rootReason = $null; $null = @(|' \
+  has_bounded_cache_hydrate
+mutate "the cache metadata read through the fence that denies the boot" \
+  's|Get-CacheMetadataResult -Path|Get-MetadataValue -Path|' \
+  has_bounded_cache_hydrate
+mutate "the staging tree deleted recursively without a reparse-point scan" \
+  's|Remove-CacheTreeSafely -Path \$script:CacheStage|Remove-Item -LiteralPath $script:CacheStage -Recurse -Force|' \
+  has_bounded_cache_hydrate
+mutate "the download tree deleted recursively without a reparse-point scan" \
+  's|Remove-CacheTreeSafely -Path \$script:CacheDownload|Remove-Item -LiteralPath $script:CacheDownload -Recurse -Force|' \
+  has_bounded_cache_hydrate
+mutate "the transcoding header traded for handler-side decompression, which arrives unbounded" \
+  "s|\$request.Headers.Add('Accept-Encoding', 'gzip')|\$request.AutomaticDecompression = 'GZip'|" \
+  has_bounded_cache_hydrate
+
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
