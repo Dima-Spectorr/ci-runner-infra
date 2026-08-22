@@ -157,10 +157,10 @@ else
 fi
 
 got_ports=$(grep -cE 'ports +?= +?\[each\.value\.band_span\]' "$NET_TF")
-if [ "$got_ports" -eq 2 ]; then
-  ok "both rules take their ports from the computed span"
+if [ "$got_ports" -eq 3 ]; then
+  ok "all three rules take their ports from the computed span"
 else
-  bad "$got_ports of the 2 band rules take their ports from each.value.band_span — one that names its ports literally drifts from the other, and the pair then permits different ranges in each direction"
+  bad "$got_ports of the 3 band rules take their ports from each.value.band_span — the ingress allow, the egress allow and the egress deny must name one range, and one that spells its ports literally drifts from the other two: the deny then carves a hole the allow does not fill, or leaves one it does"
 fi
 
 # --- the tags: source on both pools, stack tag on Linux only ------------------
@@ -254,10 +254,10 @@ fi
 # hosts — a rule that still exists, still applies clean, and admits nothing.
 
 got_each=$(grep -cE 'for_each +?= +?local\.shared_infra$' "$NET_TF")
-if [ "$got_each" -eq 2 ]; then
-  ok "both band rules are keyed per pair"
+if [ "$got_each" -eq 3 ]; then
+  ok "all three band rules are keyed per pair"
 else
-  bad "$got_each of the 2 band rules iterate local.shared_infra — a rule left on a scalar serves one pair while its partner serves all of them, and the two halves of the path stop agreeing"
+  bad "$got_each of the 3 band rules iterate local.shared_infra — a rule left on a scalar serves one pair while its partners serve all of them, and the halves of the path stop agreeing"
 fi
 
 if grep -qE '^  default += +\{\}' "$NET_VARS"; then
@@ -275,6 +275,57 @@ if grep -qE 'condition += +length\("\$\{var\.name_prefix\}-allow-si-eg-\$\{each\
   ok "the rule name's 63-character limit is checked at plan time"
 else
   bad "the generated egress rule's name is not length-checked in the resource — either the check is gone, or it moved back into a variable validation where a 1.5 consumer cannot load it"
+fi
+
+# ---------------------------------------------------------------------------
+# The egress ALLOW has a floor to be an exception to.
+#
+# An allow rule permits nothing on its own; it carves a hole in a deny. The
+# module-wide `egress_deny` is that deny — and it targets var.runner_network_tag,
+# which a WINDOWS pool does not carry, because the documented Windows
+# configuration passes no network_tags at all. Such a host matches no deny,
+# falls through to GCP's implied allow-egress, and reaches a band port at any
+# address at all. Not through this module's allow: through the absence of a
+# refusal. destination_ranges and the per-pair override were advisory on
+# precisely the host the feature was built for.
+if grep -qE 'resource "google_compute_firewall" "shared_infra_egress_deny"' "$NET_TF"; then
+  ok "band egress outside the permitted ranges is refused, not merely un-allowed"
+else
+  bad "there is no band egress deny — on a pool that carries no runner_network_tag the allow is decorative and destination_ranges constrains nothing"
+fi
+
+# It targets the SOURCE tag, which is the one tag such a host is guaranteed to
+# have; targeting runner_network_tag again would reproduce the hole exactly.
+if grep -qE '^  target_tags += +\[each\.value\.source_tag\]' "$NET_TF" &&
+  [ "$(grep -cE '^  target_tags += +\[each\.value\.source_tag\]' "$NET_TF")" -eq 2 ]; then
+  ok "the band deny follows the sending hosts by their source tag"
+else
+  bad "the band deny does not target each.value.source_tag — a deny on any other tag misses the Windows host it exists for"
+fi
+
+# And it LOSES to the allow. The allow runs at Terraform's default priority of
+# 1000; a deny that outranked it would close the band outright, and a consumer
+# hanging until the job's timeout looks the same either way.
+if grep -qE '^  priority += +65533$' "$NET_TF"; then
+  ok "the band deny sits below the allow, so the permitted ranges still pass"
+else
+  bad "the band deny's priority is not 65533 — above the allow's default 1000 it closes the band it is supposed to bound"
+fi
+
+# ---------------------------------------------------------------------------
+# A one-slot pair is a deadlock, and the pair map is where it can be refused.
+#
+# The owner job reserves its slot for the length of the run. On a one-slot host
+# it therefore takes the only agent, every consumer is pinned to that host, and
+# nothing runs until the sweep releases the slot -- by tearing down the stack
+# the consumers were queued for. adr-pr-host-affinity.md §3.4 called this
+# uncatchable at plan time because a POOL cannot know whether the repository
+# adopted the contract. The pair map can: entering it IS the adoption, and it
+# carries the Linux pool's slots_per_host as its own input.
+if grep -qE 'v\.slots_per_host >= 2 && v\.slots_per_host <= 90' "$NET_VARS"; then
+  ok "a shared-infra pair must leave at least one slot for a consumer"
+else
+  bad "shared_infra_pairs still accepts slots_per_host = 1 — a pair that cannot run a single consumer applies clean and deadlocks the first run that uses it"
 fi
 
 # ---------------------------------------------------------------------------
@@ -363,6 +414,10 @@ mutate "stack tag no longer built from key"  net  's/stack_tag  = "ci-shared-inf
 mutate "pairs default to a populated map"    vars 's/^  default = {}$/  default = { demo = { slots_per_host = 4 } }/'
 mutate "the name-length precondition removed"  net  '/precondition {/,/^    }$/d'
 mutate "stack tag no longer gated on linux"  pool 's/var.host_os == "linux" ? /true ? /'
+mutate "the band egress deny removed"        net  '/resource "google_compute_firewall" "shared_infra_egress_deny"/,/^}$/d'
+mutate "the band deny outranks the allow"    net  's/^  priority *= 65533$/  priority           = 999/'
+mutate "the band deny follows the wrong tag" net  '/shared_infra_egress_deny/,$ s/target_tags        = \[each.value.source_tag\]/target_tags        = [var.runner_network_tag]/'
+mutate "a one-slot pair is accepted again"   vars 's/v.slots_per_host >= 2/v.slots_per_host >= 1/'
 mutate "the pool name may enter the namespace" poolvars 's/!startswith(var.name, "ci-shared-infra-")/true/'
 mutate "network_tags may enter the namespace"  poolvars 's/!startswith(t, "ci-shared-infra-")/true/'
 

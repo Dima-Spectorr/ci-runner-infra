@@ -183,9 +183,9 @@ variable "shared_infra_pairs" {
   validation {
     condition = alltrue([
       for v in values(var.shared_infra_pairs) :
-      v.slots_per_host >= 1 && v.slots_per_host <= 90 && floor(v.slots_per_host) == v.slots_per_host
+      v.slots_per_host >= 2 && v.slots_per_host <= 90 && floor(v.slots_per_host) == v.slots_per_host
     ])
-    error_message = "every slots_per_host must be a whole number between 1 and 90 — above 90 the band would run past port 44099 and into the ephemeral range."
+    error_message = "every slots_per_host must be a whole number between 2 and 90. Above 90 the band would run past port 44099 and into the ephemeral range. Below 2 the pair cannot work at all: the owner job RESERVES its slot for the length of the run, so on a one-slot host it takes the only agent and every consumer it brought the stack up for waits for a slot that will not come free until the run it belongs to has ended."
   }
 
   validation {

@@ -440,20 +440,31 @@ to one winner rather than two half-reservations.
 One of `slots_per_host` is unavailable for the run either way; that is the price
 of the stack existing at all, and it is inside the budget rule 1 already sets.
 
-**Which makes `slots_per_host = 1` unadoptable, and the module permits it**
-(`variables.tf`: the validation is `>= 1`, and the Windows guidance is 1 for a
-pool whose jobs bind fixed ports). On a one-slot host the owner reserves the
-only agent, every consumer is pinned to that host, and nothing can run until the
-TTL sweep releases the slot — at which point it tears down the stack those
-consumers were queued for. A deadlock resolved by destroying its own subject.
+**Which makes `slots_per_host = 1` unadoptable.** On a one-slot host the owner
+reserves the only agent, every consumer is pinned to that host, and nothing can
+run until the TTL sweep releases the slot — at which point it tears down the
+stack those consumers were queued for. A deadlock resolved by destroying its own
+subject.
 
-A Terraform validation cannot catch it: the pool does not know whether the
-repository has adopted the contract. So the check belongs to the only actor that
-knows both facts at once — `ci-pin-hold --reserve-slot` refuses on a host with
-one slot and fails the run there, in the anchor, with the pool's name and the
-reason. Adoption therefore requires `slots_per_host >= 2`, and consumer
-concurrency is `slots_per_host - 1`, which is the number the budget in §1 should
-be read against for an adopting repository.
+It is refused twice, because two different actors can be the first to know.
+
+`ci-runner-network`'s `shared_infra_pairs` validation refuses it at PLAN time.
+That map is the adoption declaration: a repository that has entered a pair has
+said it intends to run the contract, and the pair carries the Linux pool's
+`slots_per_host` as its own input. So the two facts a refusal needs are in one
+place, and the answer arrives before anything is built. (The bound is `>= 2`
+there and only there. The Windows guidance of one slot per host is about a
+different variable on a different module — a Windows pool's jobs bind fixed
+ports — and a Windows pool is never the pair's `slots_per_host`.)
+
+`ci-pin-hold --reserve-slot` refuses it at RUN time, for the case the plan-time
+check structurally cannot see: a pool that never declared a pair, reached by a
+workflow that adopted the contract anyway. It fails the run in the anchor, with
+the pool's name and the reason, rather than letting the deadlock above play out.
+
+Adoption therefore requires `slots_per_host >= 2`, and consumer concurrency is
+`slots_per_host - 1`, which is the number the budget in §1 should be read
+against for an adopting repository.
 
 `services:` is the shape being replaced. A `services:` block is per-job by
 definition and there is no version of it that is shared, so a repository that

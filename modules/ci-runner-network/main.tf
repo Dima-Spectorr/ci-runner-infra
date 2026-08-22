@@ -412,3 +412,58 @@ resource "google_compute_firewall" "shared_infra_egress" {
     }
   }
 }
+
+# The floor the allow above is an exception TO, and without it the allow was
+# decorative on the side that needs it most.
+#
+# `egress_deny` is what normally makes an egress allow mean something: it denies
+# everything at 65534 and the allows carve holes in it. But it targets
+# `var.runner_network_tag`, and a WINDOWS pool does not carry that tag — the
+# documented Windows configuration passes no network_tags at all, because its
+# liveness gate is outbound and it needs no inbound path. So a Windows host
+# carries the source tag and nothing else, matches no deny, and falls through
+# to GCP's implied allow-egress. Band traffic to an address OUTSIDE
+# destination_ranges was therefore permitted: not by this module's allow, but
+# by the absence of anything refusing it. Both the per-pair override and
+# shared_infra_destination_ranges were advisory on exactly the host the feature
+# exists for.
+#
+# Scoped to the band and to the source tag, because that is the reach this PR
+# grants and the reach it should be able to withdraw. It does NOT give a
+# Windows pool the general egress floor a Linux pool has; that gap is real and
+# older than this rule, and closing it means deciding what a Windows host is
+# allowed to reach, which is not a decision to make inside a firewall rule for
+# a database band.
+#
+# 65533 and not 1000: the allow above runs at the default 1000 and has to win
+# for the ranges it names. A deny that outranked it would close the band
+# outright, and the symptom -- a consumer hanging until the job's timeout --
+# looks identical to the misconfiguration this rule is here to surface.
+resource "google_compute_firewall" "shared_infra_egress_deny" {
+  for_each = local.shared_infra
+
+  project = var.project_id
+  name    = "${var.name_prefix}-deny-si-eg-${each.key}"
+  network = var.network
+
+  direction          = "EGRESS"
+  priority           = 65533
+  destination_ranges = ["0.0.0.0/0"]
+  target_tags        = [each.value.source_tag]
+
+  deny {
+    protocol = "tcp"
+    ports    = [each.value.band_span]
+  }
+
+  # No name-length precondition of its own: `-deny-si-eg-` is a character
+  # shorter than `-allow-si-eg-`, so the allow's check above is the binding one
+  # and this name cannot be the first to overflow.
+
+  dynamic "log_config" {
+    for_each = local.log_denied ? [1] : []
+    content {
+      metadata = local.firewall_log_metadata
+    }
+  }
+}
