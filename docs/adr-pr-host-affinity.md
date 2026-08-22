@@ -219,7 +219,8 @@ the same cost as a slow job, and the orphan rules are unchanged above it.
 **Something has to write it.** A guarantee with no writer is a sentence, so the
 hold is a concrete pair: `ci-pin-hold --run <id> --ttl <duration>`, a bounded
 host helper on `PATH` in every slot, which the anchor invokes before it
-publishes the label; and a read on the IAP-SSH probe the controller *already*
+publishes the label — with `--reserve-slot` when it also owns shared
+infrastructure (§3.1); and a read on the IAP-SSH probe the controller *already*
 makes per host (`pgrep -fc Runner.Worker`, `controller-startup.sh:1579`), which
 costs no new round trip. The helper ships with the host in phase 3, the two
 readers in phase 4 — the delivery table says so, because a hold whose writer is
@@ -276,16 +277,32 @@ rootless daemon with a compose project name derived from the pull-request
 number, migrates and seeds it once, publishes the endpoints as job outputs, and
 every other job — Linux or Windows — consumes those outputs.
 
-**And then it stays running.** A slot is released the instant its job ends, and
-the next job to land there runs as the *same uid against the same rootless
-daemon* — free to list, `exec` into, mutate or stop a stack that other jobs are
-still using. The slot's between-jobs reset would destroy it outright. Host
-affinity does not help: it pins a host, and this is a *slot* problem. The only
-reservation GitHub offers is a job that has not finished, so the owner watches
-its own run (`actions: read` — a permission that, unlike `administration`,
-exists) and exits when the consumers do. One slot is occupied for the run; that
-is the price of the stack existing at all, and it is inside the budget rule 1
-already sets.
+**And then it exits — while its slot stays reserved.** Those are two separate
+requirements, and the obvious way to satisfy the second breaks the first.
+
+A slot is released the instant its job ends, and the next job to land there runs
+as the *same uid against the same rootless daemon* — free to list, `exec` into,
+mutate or stop a stack that other jobs are still using; the slot's between-jobs
+reset would destroy it outright. Host affinity does not help: it pins a host,
+and this is a *slot* problem.
+
+The tempting reservation — keep the owner job running — is unbuildable. Job
+outputs reach `needs.<job>.outputs.*` only on completion, and a dependent job
+waits for its whole `needs:` list to complete. An owner that lingers to guard
+the stack is holding the endpoints its consumers are queued for, while waiting
+for those same consumers: every adopting workflow deadlocks on its first run.
+This is the same failure shape as the runner-list lease in §2.2 — a mechanism
+whose description reads fine and which cannot exist — and it is worth stating
+plainly rather than quietly replacing.
+
+So the reservation is host-side, where slots are actually a concept. The owner
+calls `ci-pin-hold --reserve-slot`; the slot's `job-completed` hook reads the
+record, skips its reset, and stops the slot's own agent. Nothing else is
+scheduled onto that uid or that daemon because nothing is listening for it —
+a stronger guarantee than an occupied job, and it consumes no GitHub
+concurrency. One of `slots_per_host` is unavailable for the run either way;
+that is the price of the stack existing at all, and it is inside the budget
+rule 1 already sets.
 
 `services:` is the shape being replaced. A `services:` block is per-job by
 definition and there is no version of it that is shared, so a repository that
@@ -403,16 +420,21 @@ single packaging build, so both answers are defensible and neither is imposed:
 `RUNNER9` covers Linux jobs only. A repository that runs several Windows jobs
 chooses in its own workflow.
 
-### 3.5 The owner tears its own stack down
+### 3.5 Teardown is host-side, and so is the release
 
 A downstream job cannot do it: different uid, and the owner's daemon socket is
 in a mode-0700 `/run/ci-s<i>`. An `if: always()` teardown step in the last
-consuming job fails silently, which is worse than no teardown at all.
+consuming job fails silently, which is worse than no teardown at all. Nor can
+the owner do it, for the reason §3.1 gives: it has to exit for its consumers to
+start, so it is long gone before the last of them finishes.
 
-Since §3.1 keeps the owner alive until its consumers finish, the owner is both
-the only context that *can* reclaim the stack and the one that knows when to —
-so teardown is its last step. A host-side TTL sweep over the band stays as the
-backstop for an owner that was cancelled or killed before that step ran.
+The host owns both ends. Releasing the slot hold *is* the teardown: the sweeper
+brings the stack down as the slot's own user, runs the reset the `job-completed`
+hook skipped, and starts the agent again. It fires when the controller observes
+the run finished — it already lists that run's jobs — or when the TTL lapses,
+whichever comes first. The TTL is the backstop that keeps a controller outage
+from stranding a slot, and a band sweep catches a stack whose hold record was
+lost.
 
 ---
 
@@ -495,12 +517,19 @@ this is slower. That is the trade being made deliberately: #205's evidence is
 that the unbounded case is what produces the 291 s waits and the displaced
 required checks, and a predictable four is worth more than an occasional eight.
 
-**The owner's slot is occupied and mostly idle.** For the length of the run, one
-of `slots_per_host` is a job waiting on its siblings. The alternatives are a
-stack that dies when its owner exits, or one a stranger's job can reach on the
-recycled slot; both are worse. It also means a repository whose stack is needed
-by one job should not adopt the owner pattern at all — a plain `services:` block
-on that job is cheaper and this contract is not for it.
+**The owner's slot is reserved and idle.** For the length of the run, one of
+`slots_per_host` accepts no work. The alternatives are a stack that dies when
+its owner exits, or one a stranger's job can reach on the recycled slot; both
+are worse. It also means a repository whose stack is needed by one job should
+not adopt the owner pattern at all — a plain `services:` block on that job is
+cheaper and this contract is not for it.
+
+**A reserved slot depends on the release path running.** The agent is stopped by
+the hook and started by the sweeper, so a bug or an outage between the two
+subtracts a slot from the pool until the TTL fires. The TTL is what bounds it,
+and the reserved-slot count belongs on the same demand series as the pin holds
+so a leak is visible rather than inferred from capacity that quietly went
+missing.
 
 **The anchor serializes the start of a run.** Nothing pinned can begin until the
 anchor has landed on a host, so a cold pool pays one boot before any pinned job
@@ -519,7 +548,7 @@ phase 5 changes any consuming repository's behaviour.
 |---|---|---|---|
 | 1 | This ADR and the published contract | `docs/` | — |
 | 2 | Affinity label at boot + `CI_HOST_LABEL`, both pools; **`collect_demand` recognises it (§2.5)**; **orphaned-pin detection (§2.6)** | `host-startup.sh`, `windows-host-startup.ps1`, `controller-startup.sh`, self-tests | any workflow using it |
-| 3 | Port band, per-slot DNAT, `CI_SHARED_INFRA_*`, **the `ci-pin-hold` helper**, TTL sweep; **[#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) first** | `host-startup.sh`, self-tests | any firewall change |
+| 3 | Port band, per-slot DNAT, `CI_SHARED_INFRA_*`, **the `ci-pin-hold` helper and its `--reserve-slot` path** (`job-completed` hook skip + agent stop, sweeper teardown + reset + agent start), TTL sweep; **[#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) first** | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change |
 | 4 | Ingress/egress band rules on the new `ci-shared-infra` tag, **applied to both pools**; pin hold read on the existing IAP-SSH probe and honoured by **both** `recycle_decision` and `drain_decision` (§2.4) | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `recycle-decision.sh`, `drain-decision.sh`, self-tests | any workflow using it |
 | 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) |
 | 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — |
@@ -549,9 +578,11 @@ disabled in every repository on the day after.
   instead of queueing for a day.
 - Shared infrastructure is owned by exactly one job — the anchor — published
   into a per-slot port band, DNAT'd on the host address, and reached by everyone
-  else at that address. **The owner holds its slot for the run** and tears the
-  stack down itself, because a released slot is reused by the next job under the
-  same uid and the same daemon.
+  else at that address. **The owner exits immediately** (its outputs are
+  unreadable until it does, so a lingering owner deadlocks its consumers) and
+  **the host reserves its slot for the run** by stopping that slot's agent,
+  because a released slot is reused by the next job under the same uid and the
+  same daemon. Teardown and release are the same host-side act.
 - The Windows pool gets no container runtime. This was reconsidered as part of
   this decision and re-affirmed: `adr-windows-pool.md` §4's reasoning is
   unchanged, and rule 3 is satisfied by reachability, not by a runtime. Windows

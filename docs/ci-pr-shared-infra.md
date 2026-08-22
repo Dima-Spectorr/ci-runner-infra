@@ -122,10 +122,11 @@ but one naming the anchor job's output.
 Exactly one job in the workflow brings the stack up, and it is the anchor.
 `RUNNER10` fails a second owner.
 
-**The owner job does not exit when the stack is up.** It stays running until its
-consumers are done, and that is deliberate — see "Why the owner holds its slot"
-below. Its `timeout-minutes` therefore has to cover the whole run, not just the
-bring-up.
+**The owner job exits as soon as the stack is up, and it must.** A job's
+outputs do not reach `needs.<job>.outputs.*` until the job *completes*, so an
+owner that lingers is an owner whose consumers can never start. The slot it
+leaves behind is reserved host-side instead — see "Why the slot is held
+host-side" below.
 
 ```yaml
   anchor:
@@ -134,13 +135,9 @@ bring-up.
     if: needs.lane.outputs.lane != 'none'
     # ci: shared-infra-owner    <- the marker RUNNER10 counts
     runs-on: [self-hosted, linux, gcp, '<Repo>']
-    timeout-minutes: 90          # covers the whole run, not the bring-up
-    permissions:
-      # Declaring the block drops every scope not named here to none, so the
-      # checkout needs saying too.
-      contents: read
-      # To watch its own run's jobs. Unlike `administration`, this one exists.
-      actions: read
+    # The bring-up, and nothing else. This job has to END for its outputs to
+    # reach the jobs that need them.
+    timeout-minutes: 15
     outputs:
       runs-on: ${{ steps.up.outputs.runs-on }}
       addr: ${{ steps.up.outputs.addr }}
@@ -168,57 +165,52 @@ bring-up.
           # for: it used to run in every job that needed a database.
           ./scripts/db-migrate.sh "postgres://ci@127.0.0.1:${pg}/app"
 
-          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl 90m
+          # Pin the host AND reserve this slot for the rest of the run. The
+          # slot part is what keeps the stack alive after this job ends; see
+          # below for why the job cannot do that by staying alive itself.
+          ci-pin-hold --run "$GITHUB_RUN_ID" --ttl 90m --reserve-slot
 
           printf 'runs-on=["self-hosted","linux","gcp","<Repo>","%s"]\n' \
             "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
           echo "addr=${CI_SHARED_INFRA_ADDR}" >> "$GITHUB_OUTPUT"
           echo "pg=${pg}"                     >> "$GITHUB_OUTPUT"
-
-      # Outputs are published when the STEP ends, so consumers start now while
-      # this step keeps the job — and therefore the slot and the stack — alive.
-      - id: hold
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Wait for every other job in this run to reach a terminal state.
-          while :; do
-            pending=$(gh api --paginate \
-              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs" \
-              --jq '[.jobs[] | select(.name != "Shared infra (anchor)")
-                             | select(.status != "completed")] | length')
-            [ "$pending" -eq 0 ] && break
-            sleep 15
-          done
-          # Same uid, same daemon: the only context that can do this.
-          docker compose -f ci/compose.yaml down -v || true
 ```
 
-### Why the owner holds its slot
+### Why the slot is held host-side
 
-A job's slot is released the instant the job ends, and the next job to land on
-it runs as the **same uid against the same rootless daemon**. If the owner
-exited once the stack was up, that next job — another pull request's, on a
-single-repository pool — could list, `exec` into, mutate or stop a stack its
-consumers were still using. And the slot's between-jobs reset would do the same
-thing on purpose. Either way the stack dies, or is exposed, while jobs depend on
-it.
+There is a real problem here, and one tempting fix for it that does not work.
 
-Host affinity does not help here: it pins a *host*, and the owner's problem is
-its *slot*. So the owner reserves the slot the only way GitHub offers — by not
-finishing. It watches its own run's jobs (`actions: read`, a permission that
-actually exists), and exits when they are done.
+**The problem.** A slot is released the instant its job ends, and the next job
+to land on it runs as the **same uid against the same rootless daemon** — free
+to list, `exec` into, mutate or stop a stack that other jobs are still using.
+The slot's between-jobs reset would destroy it outright, on purpose. Host
+affinity does not help: it pins a *host*, and this is a *slot* problem.
 
-The cost is one slot occupied for the run, mostly idle. That is the price of the
-stack existing at all, and it is inside the budget rule 1 already sets: the pull
-request holds one host either way.
+**The fix that does not work.** The owner cannot reserve the slot by simply not
+finishing. A job's outputs are published to `needs.<job>.outputs.*` only when
+the job **completes**, and a dependent job does not start until everything in
+its `needs:` list has completed. An owner that stays running to guard the stack
+is an owner whose consumers are still queued, waiting for the endpoints it is
+holding — while it waits for them. Every adopting workflow would deadlock on its
+first run.
 
-**Teardown is the owner's last step**, for the same reason nobody else can do
-it: a consuming job is a different uid and cannot open a mode-0700
-`/run/ci-s<i>`. A host-side TTL sweep over the band remains as the backstop for
-an owner that was cancelled or killed before its final step ran.
+**What actually happens.** The reservation is not a job at all. `ci-pin-hold
+--reserve-slot` records, on the host, that this slot belongs to this run. The
+slot's `job-completed` hook reads that record and does two things instead of its
+usual reset: it leaves the stack standing, and it stops the slot's own runner
+agent. Nothing else can be scheduled onto that uid or that daemon, because the
+agent that would accept the work is no longer listening — a stronger guarantee
+than an idle job, and it costs no GitHub concurrency.
+
+The release is host-side too, by the sweeper described below. The cost is
+unchanged: one of `slots_per_host` is unavailable for the length of the run.
+
+**Teardown belongs to the host, not to a workflow.** A consuming job is a
+different uid and cannot open a mode-0700 `/run/ci-s<i>`; an `if: always()`
+teardown step there fails silently, which is worse than none. When the hold is
+released — the controller sees the run finished, or the TTL lapses — the host
+tears the stack down as the slot's own user, runs the reset the hook skipped,
+and starts the agent again.
 
 ### What replaces `services:`
 
@@ -293,6 +285,7 @@ And one command, on `PATH` in every slot:
 | command | meaning |
 |---|---|
 | `ci-pin-hold --run <id> --ttl <duration>` | write this host's pin hold; the controller reads it on the IAP-SSH probe it already makes, and refuses to drain or cordon the host until the hold lapses |
+| `ci-pin-hold … --reserve-slot` | additionally reserve **this slot** for the run: the `job-completed` hook skips its reset and stops the slot's agent, so the stack survives and nothing else lands on its uid or its daemon. Released, torn down and restored host-side when the run ends or the TTL lapses |
 
 A host that does not set them is older than this contract. The anchor degrades
 to unpinned on a missing `CI_HOST_LABEL`; the owner job fails on a missing
@@ -352,9 +345,11 @@ disable it.
   unnecessary; a fleet-wide token in a repository that runs pull-request code is
   a worse trade than any scheduling gain.
 - **Do not tear the stack down from a consuming job.** See §3 — it cannot reach
-  the daemon it targets. The owner does it.
-- **Do not make the owner job exit early to "free the slot".** The slot is the
-  stack's lifetime.
+  the daemon it targets. The host does it.
+- **Do not keep the owner job running to guard the stack.** Its outputs are
+  unreadable until it finishes and its consumers cannot start, so it would wait
+  for them while they wait for it. The reservation is host-side precisely
+  because the workflow layer cannot express it.
 - **Do not publish outside your slot's band.** It works in the job that does it
   and in no other job, which is the worst place for a failure to appear.
 - **Do not write `localhost` in a Windows fleet job.** See `RUNNER11`.
