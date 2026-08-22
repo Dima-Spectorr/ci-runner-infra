@@ -514,6 +514,8 @@ data "google_compute_zones" "available" {
 }
 
 resource "google_compute_instance" "controller" {
+  count = var.manage_controller ? 1 : 0
+
   project      = var.project_id
   name         = "${var.name}-controller"
   zone         = length(var.zones) > 0 ? var.zones[0] : data.google_compute_zones.available.names[0]
@@ -558,6 +560,12 @@ resource "google_compute_instance" "controller" {
     on_host_maintenance = "MIGRATE"
   }
 
+  # STILL ONE KEY PER FIELD, deliberately, even though the controller now reads
+  # a `ci-pools` table. This controller serves exactly one pool — its own — and
+  # the controller synthesises a one-row table from these keys when `ci-pools`
+  # is absent. Rendering the table here instead would rewrite the metadata of
+  # every controller in the fleet to say what it already says, for no behaviour
+  # change, on the same apply that is trying to change something else.
   metadata = merge(local.controller_registration_metadata, {
     startup-script = local.controller_startup
 
