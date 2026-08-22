@@ -143,6 +143,7 @@ locals {
     "#!/usr/bin/env bash",
     file("${path.module}/scripts/drain-decision.sh"),
     file("${path.module}/scripts/orphan-decision.sh"),
+    file("${path.module}/scripts/pinned-job-decision.sh"),
     file("${path.module}/scripts/recycle-decision.sh"),
     # The Windows half of the second delete gate. Concatenated on EVERY pool,
     # Linux included, and inert on one: nothing calls beacon_decision() unless a

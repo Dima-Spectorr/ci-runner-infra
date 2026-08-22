@@ -188,8 +188,13 @@ grep -q 'format="csv\[no-heading\](instance.basename(),instanceStatus,' "$CTRL" 
 check "host row: collect_hosts asks gcloud for CSV" yes "$r"
 r=$(grep -c 'while IFS=, read -r host status host_tpl host_uri' "$CTRL")
 check "host row: both host walks split on the comma" 2 "$r"
+# Three since classify_pinned() landed: the drain walk, the orphan reaper, and
+# the pinned-job classifier all derive the live-host list from $HOSTS the same
+# way. This number is the count of readers, so a new one added with the wrong
+# separator lands as a FALLING count, not a passing test — which is the reason
+# it is asserted as an exact figure rather than a floor.
 r=$(grep -c "awk -F, '{ *\(if (\$1 != \"\") \)\?print \$1" "$CTRL")
-check "host row: both awk readers split on the comma" 2 "$r"
+check "host row: every awk reader splits on the comma" 3 "$r"
 
 # ── the registration token, and the delete that is the whole point ───────────
 #
