@@ -299,10 +299,18 @@ has_slot_reset() { # <file>
   matches "$code" 'cp -a "\\\$SLOT_TEMPLATE/\." "\\\$home/"' || return 1
   # …and the previous job's workspace and tool cache go with it
   matches "$code" 'work="\\\$SLOT_ROOT/\\\$idx/_work"' || return 1
-  # …while _temp and, at job start only, _actions stay: the runner fills both
-  # BEFORE the started hook runs, so wiping them there breaks the starting job
-  matches "$code" '_temp\) continue ;;' || return 1
+  # …while _temp and _actions stay at job start ONLY: the runner fills both
+  # BEFORE the started hook runs, so wiping them there breaks the starting job.
+  # At completed and boot they go with the rest, because _temp is where
+  # RUNNER_TEMP lands and a credential written there must not outlive its job.
+  matches "$code" '_temp\) \[ "\\\$keep_temp" = 1 \] && continue ;;' || return 1
   matches "$code" '\[ "\\\$stage" = started \] && keep_actions=1' || return 1
+  matches "$code" '\[ "\\\$stage" = started \] && keep_temp=1' || return 1
+  # a dangling symlink is invisible to -e, so -L is asked too, and the glob set
+  # reaches ..name as well as .name — either one left behind is an entry that
+  # survives every reset while the slot is still recorded clean
+  matches "$code" '\[ -e "\\\$e" \] \|\| \[ -L "\\\$e" \] \|\| continue' || return 1
+  matches "$code" '"\\\$work"/\.\[!\.\]\* "\\\$work"/\.\.\?\*' || return 1
   # and the workspace the runner already prepared for the STARTING job is
   # emptied, not unlinked — a plain `run:` step chdirs into it
   matches "$code" 'install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"' || return 1
@@ -626,6 +634,10 @@ mutate "dirty slot allowed to run anyway" 's@^  fail_after=1$@  fail_after=0@'  
 mutate "work folder left alone"           's@work="\\\$SLOT_ROOT/\\\$idx/_work"@work="\$SLOT_ROOT/\$idx/_none"@'  has_slot_reset
 mutate "starting job loses its actions"   's@keep_actions=1@keep_actions=0@'                                     has_slot_reset
 mutate "prepared workspace unlinked"      's@install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"@true@'                     has_slot_reset
+mutate "credentials kept across the boundary" 's@_temp) \[ "\\\$keep_temp" = 1 \] && continue ;;@_temp) continue ;;@'  has_slot_reset
+mutate "_temp wiped under the starting job" 's@\[ "\\\$stage" = started \] && keep_temp=1@keep_temp=0@'                    has_slot_reset
+mutate "dangling symlink survives the reset" 's@\[ -e "\\\$e" \] || \[ -L "\\\$e" \] || continue@[ -e "\\\$e" ] || continue@' has_slot_reset
+mutate "double-dot names never enumerated" 's@ "\\\$work"/\.\.?\*@@'                                                has_slot_reset
 mutate "data root back inside the home"   's@ --data-root=/var/lib/ci-slot/%i/docker@@'                            has_slot_reset
 
 mutate "daemon MTU config removed"        's|daemon\.json|daemon.txt|g'                                          has_container_mtu

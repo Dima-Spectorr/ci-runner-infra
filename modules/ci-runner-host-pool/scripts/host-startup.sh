@@ -469,10 +469,16 @@ marker="\$SLOT_STATE/\$idx/clean"
 # job that is starting. Everything else under _work belongs to the last job: the
 # checked-out workspace with its .git/hooks, and _tool, which is on PATH.
 #
-# At 'completed' and 'boot' nothing under _work belongs to a live job, so the
-# exception is dropped and _actions goes with the rest.
+# At 'completed' and 'boot' nothing under _work belongs to a live job, so both
+# exceptions are dropped and _actions and _temp go with the rest. Leaving _temp
+# behind is not a tidiness question: google-github-actions/auth writes its
+# credential file under RUNNER_TEMP, which IS _temp, so a _temp that outlives the
+# job boundary is the exact leak #110 was opened for, one directory over from the
+# home this hook already rebuilds.
 keep_actions=0
+keep_temp=0
 [ "\$stage" = started ] && keep_actions=1
+[ "\$stage" = started ] && keep_temp=1
 
 # A job-started that cannot find the marker is a job about to run on a slot
 # whose previous job never reached its completed hook — cancelled hard, agent
@@ -484,6 +490,10 @@ fail_after=0
 if [ "\$stage" = started ] && [ ! -f "\$marker" ]; then
   say "slot \$idx was not left clean — its previous job never completed; wiping everything and failing this job"
   keep_actions=0
+  # keep_temp is deliberately NOT cleared here. The runner writes this hook's own
+  # invocation under _temp, so emptying it now would break the very job we are
+  # about to fail deliberately. Its content goes at the completed reset that
+  # follows, which is the reset that has to be trusted anyway.
   fail_after=1
 fi
 # Cleared FIRST. Everything below can fail, and a marker left in place by a
@@ -503,10 +513,15 @@ chmod 0750 "\$home" || { say "slot \$idx: could not chmod \$home"; rc=1; }
 # THE WORK FOLDER. Absent until the slot's first job, which is not a failure.
 work="\$SLOT_ROOT/\$idx/_work"
 if [ -d "\$work" ]; then
-  for e in "\$work"/* "\$work"/.[!.]*; do
-    [ -e "\$e" ] || continue
+  for e in "\$work"/* "\$work"/.[!.]* "\$work"/..?*; do
+    # -e is FALSE for a dangling symlink, so -L is asked too: a link left pointing
+    # at a path that no longer exists would otherwise survive every reset, still be
+    # recorded clean, and break the next job when the runner prepares or enters that
+    # name. The three globs together cover every entry -- plain, .name and ..name --
+    # and an unmatched glob stays literal and is dropped by the same test.
+    [ -e "\$e" ] || [ -L "\$e" ] || continue
     case "\${e##*/}" in
-      _temp) continue ;;
+      _temp) [ "\$keep_temp" = 1 ] && continue ;;
       _actions) [ "\$keep_actions" = 1 ] && continue ;;
     esac
     # A directory is recreated EMPTY rather than left absent. At 'started' the
