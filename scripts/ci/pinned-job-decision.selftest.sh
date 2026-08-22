@@ -153,6 +153,7 @@ else
   printf 'FAIL %s
 ' "only $_inc paths count pinned demand -- a refused or un-retried cancel reports zero"; fail=1
 fi
+# shellcheck disable=SC2016  # a jq fragment: `$mine_labels` is jq's variable, not the shell's
 src_has "the pin filter and the demand filter agree on what a pin is" '- $mine_labels | length) > 0 )'
 src_has "a pinned record falls back to started_at when created_at is absent" '(.created_at // .started_at // "")'
 
