@@ -1698,8 +1698,8 @@ has_cache_master_sealed_readonly() { # <file>
   # order is what makes this decidable from the text: the reason line must appear
   # earlier in the file than the reset.
   local scan_at seal_at
-  scan_at=$(printf '%s\n' "$code" | grep -nE 'Get-CacheHostileReason -Entries \$entries' | head -1 | cut -d: -f1)
-  seal_at=$(printf '%s\n' "$code" | grep -nE "FilePath 'icacls\\.exe'" | head -1 | cut -d: -f1)
+  scan_at=$(printf '%s\n' "$code" | grep -nE 'Get-CacheHostileReason -Entries \$entries' | cut -d: -f1 | sed -n 1p)
+  seal_at=$(printf '%s\n' "$code" | grep -nE "FilePath 'icacls\\.exe'" | cut -d: -f1 | sed -n 1p)
   [ -n "$scan_at" ] && [ -n "$seal_at" ] || return 1
   [ "$scan_at" -lt "$seal_at" ] || return 1
 
@@ -1796,8 +1796,8 @@ has_slot_cache_isolation() { # <file>
   # would mean "seeding was attempted"; and phase 5 reads it to decide whether to
   # emit ten variables that name paths inside it.
   local clear_at write_at
-  clear_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$marker' | head -1 | cut -d: -f1)
-  write_at=$(printf '%s\n' "$code" | grep -nE 'Set-Content -LiteralPath \$marker' | head -1 | cut -d: -f1)
+  clear_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$marker' | cut -d: -f1 | sed -n 1p)
+  write_at=$(printf '%s\n' "$code" | grep -nE 'Set-Content -LiteralPath \$marker' | cut -d: -f1 | sed -n 1p)
   [ -n "$clear_at" ] && [ -n "$write_at" ] || return 1
   [ "$clear_at" -lt "$write_at" ] || return 1
 
@@ -1841,8 +1841,8 @@ has_slot_cache_isolation() { # <file>
   # points at (PowerShell/PowerShell#621, fixed in 6.0, never backported), so the
   # tree is scanned first and a hostile one is left on disk rather than deleted.
   local scan_at del_at
-  scan_at=$(printf '%s\n' "$code" | grep -nE '\$reason = Get-CacheHostileReason -Entries \(@\(\$dir\)' | head -1 | cut -d: -f1)
-  del_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$dir\.FullName -Recurse' | head -1 | cut -d: -f1)
+  scan_at=$(printf '%s\n' "$code" | grep -nE '\$reason = Get-CacheHostileReason -Entries \(@\(\$dir\)' | cut -d: -f1 | sed -n 1p)
+  del_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$dir\.FullName -Recurse' | cut -d: -f1 | sed -n 1p)
   [ -n "$scan_at" ] && [ -n "$del_at" ] || return 1
   [ "$scan_at" -lt "$del_at" ] || return 1
   # And the refusal is acted on. Anchored the same way, and for the same reason.
@@ -1861,8 +1861,8 @@ has_slot_cache_isolation() { # <file>
   # slot's Modify grant, so a job could have planted a junction inside a stage a
   # previous boot left behind -- and 5.1's Remove-Item follows it.
   local stale_scan_at stale_del_at
-  stale_scan_at=$(printf '%s\n' "$code" | grep -nE '\$staleReason = Get-CacheHostileReason' | head -1 | cut -d: -f1)
-  stale_del_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$stale\.FullName -Recurse' | head -1 | cut -d: -f1)
+  stale_scan_at=$(printf '%s\n' "$code" | grep -nE '\$staleReason = Get-CacheHostileReason' | cut -d: -f1 | sed -n 1p)
+  stale_del_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$stale\.FullName -Recurse' | cut -d: -f1 | sed -n 1p)
   [ -n "$stale_scan_at" ] && [ -n "$stale_del_at" ] || return 1
   [ "$stale_scan_at" -lt "$stale_del_at" ] || return 1
 
@@ -2042,8 +2042,8 @@ has_hydrate_bounds_honoured() { # <file>
   matches "$code" '\$proc\.WaitForExit\(10000\)' || return 1
   matches "$code" '\$script:CacheStageNotQuiesced = \$true' || return 1
   local flag_at del_at
-  flag_at=$(printf '%s\n' "$code" | grep -n 'if (\$script:CacheStageNotQuiesced) {' | head -1 | cut -d: -f1)
-  del_at=$(printf '%s\n' "$code" | grep -n 'Remove-Item -LiteralPath \$Path -Recurse' | head -1 | cut -d: -f1)
+  flag_at=$(printf '%s\n' "$code" | grep -n 'if (\$script:CacheStageNotQuiesced) {' | cut -d: -f1 | sed -n 1p)
+  del_at=$(printf '%s\n' "$code" | grep -n 'Remove-Item -LiteralPath \$Path -Recurse' | cut -d: -f1 | sed -n 1p)
   [ -n "$flag_at" ] && [ -n "$del_at" ] || return 1
   [ "$flag_at" -lt "$del_at" ] || return 1
 
@@ -2052,6 +2052,31 @@ has_hydrate_bounds_honoured() { # <file>
   # that cannot be interrupted -- the budget quietly not applying to the last
   # step of the sequence. And a timed-out walk hands back NO entries: a hostility
   # scan is a proof of ABSENCE, and half a tree proves nothing about the rest.
+  # A STAGED ENTRY IS A DIRECTORY OR IT IS NOTHING. Test-Path is true for a file
+  # of the same name, and a file moved over the baked tree is worse than a cold
+  # host: Initialize-SlotCache cannot copy from it and skips the writable
+  # fallback because the path already exists, so every job is handed cache
+  # variables pointing at a file.
+  matches "$code" 'if \(-not \$staged\.PSIsContainer\) \{' || return 1
+
+  # The five metadata attributes and the token are ten seconds each in front of a
+  # sixty-second phase. `& $left` bounds every fetch AFTER this point; nothing
+  # bounded the token read itself.
+  matches "$code" 'if \(\(& \$left\) -le 0\) \{' || return 1
+
+  # A SURVIVING `.previous` IS A REFUSAL. Remove-CacheTreeSafely deliberately
+  # leaves a stale aside it cannot show to be safe, and Move-Item -Force onto an
+  # existing directory name moves the source INSIDE it -- inside a junction is
+  # wherever the junction points, so the baked master gets written to an
+  # arbitrary path as SYSTEM, which the scan after it can refuse but not undo.
+  matches "$code" 'if \(Test-Path -LiteralPath \$aside\) \{' || return 1
+  local aside_at move_at
+  aside_at=$(printf '%s\n' "$code" | grep -n 'if (Test-Path -LiteralPath \$aside) {' | cut -d: -f1 | sed -n 1p)
+  move_at=$(printf '%s\n' "$code" | grep -n 'Move-Item -LiteralPath \$target -Destination \$aside' | cut -d: -f1 | sed -n 1p)
+  [ -n "$aside_at" ] && [ -n "$move_at" ] || return 1
+  [ "$aside_at" -lt "$move_at" ] || return 1
+  matches "$code" "return 'budget-spent'" || return 1
+
   matches "$code" 'Get-CacheStagedEntry -Path \$script:CacheStage -DeadlineUtc \$deadline' || return 1
   matches "$code" "return 'scan-timeout'" || return 1
   matches "$code" 'Entries = @\(\); Failed = \$failed; TimedOut = \$true' || return 1
@@ -2066,8 +2091,8 @@ has_bounded_cache_hydrate() { # <file>
   # hydrate after the seal would leave the pool reading a tree that was sealed
   # before its contents arrived.
   local hyd_at seal_at
-  hyd_at=$(printf '%s\n' "$code" | grep -n '\$null = Invoke-CacheHydrate' | head -1 | cut -d: -f1)
-  seal_at=$(printf '%s\n' "$code" | grep -n 'Protect-CacheMaster -SlotUsers \$slotUsers' | head -1 | cut -d: -f1)
+  hyd_at=$(printf '%s\n' "$code" | grep -n '\$null = Invoke-CacheHydrate' | cut -d: -f1 | sed -n 1p)
+  seal_at=$(printf '%s\n' "$code" | grep -n 'Protect-CacheMaster -SlotUsers \$slotUsers' | cut -d: -f1 | sed -n 1p)
   [ -n "$hyd_at" ] && [ -n "$seal_at" ] || return 1
   [ "$hyd_at" -lt "$seal_at" ] || return 1
 
@@ -2088,8 +2113,8 @@ has_bounded_cache_hydrate() { # <file>
   # end-of-archive marker -- so a bound enforced only by stopping the unpacker
   # yields a PARTIAL cache believed whole.
   local count_at unpack_at
-  count_at=$(printf '%s\n' "$code" | grep -n 'Measure-CacheArchiveExpansion -Path \$archive' | head -1 | cut -d: -f1)
-  unpack_at=$(printf '%s\n' "$code" | grep -n 'Expand-CacheSnapshot -Archive \$archive' | head -1 | cut -d: -f1)
+  count_at=$(printf '%s\n' "$code" | grep -n 'Measure-CacheArchiveExpansion -Path \$archive' | cut -d: -f1 | sed -n 1p)
+  unpack_at=$(printf '%s\n' "$code" | grep -n 'Expand-CacheSnapshot -Archive \$archive' | cut -d: -f1 | sed -n 1p)
   [ -n "$count_at" ] && [ -n "$unpack_at" ] || return 1
   [ "$count_at" -lt "$unpack_at" ] || return 1
   # ...and the count is ACTED ON. gzip expands by more than a thousandfold on the
@@ -2101,8 +2126,8 @@ has_bounded_cache_hydrate() { # <file>
   # is already published. Anchored to the hydrate's indent: Protect-CacheMaster
   # has a scan of its own at four spaces, and it was standing in for this one.
   local scan_at move_at
-  scan_at=$(printf '%s\n' "$code" | grep -n '^        \$reason = Get-CacheHostileReason -Entries \$scan\.Entries$' | head -1 | cut -d: -f1)
-  move_at=$(printf '%s\n' "$code" | grep -n 'Update-CacheMasterFromStage -Stage' | head -1 | cut -d: -f1)
+  scan_at=$(printf '%s\n' "$code" | grep -n '^        \$reason = Get-CacheHostileReason -Entries \$scan\.Entries$' | cut -d: -f1 | sed -n 1p)
+  move_at=$(printf '%s\n' "$code" | grep -n 'Update-CacheMasterFromStage -Stage' | cut -d: -f1 | sed -n 1p)
   [ -n "$scan_at" ] && [ -n "$move_at" ] || return 1
   [ "$scan_at" -lt "$move_at" ] || return 1
   matches "$code" "return 'scan-refused'" || return 1
@@ -2213,6 +2238,15 @@ mutate "the un-quiesced staging tree deleted anyway" \
   has_hydrate_bounds_honoured
 mutate "the staged scan run without a deadline again" \
   's|Get-CacheStagedEntry -Path \$script:CacheStage -DeadlineUtc \$deadline|Get-CacheStagedEntry -Path $script:CacheStage|' \
+  has_hydrate_bounds_honoured
+mutate "a staged file allowed to replace the baked directory it is named after" \
+  's|if (-not \$staged\.PSIsContainer) {|if ($false) {|' \
+  has_hydrate_bounds_honoured
+mutate "the baked master moved aside onto a stale name the sweep could not clear" \
+  's|if (Test-Path -LiteralPath $aside) {|if ($false) {|' \
+  has_hydrate_bounds_honoured
+mutate "the token read reached with the budget already spent on metadata" \
+  's|if ((& \$left) -le 0) {|if ($false) {|' \
   has_hydrate_bounds_honoured
 mutate "a timed-out walk handing back the entries it did manage to read" \
   's|Entries = @(); Failed = \$failed; TimedOut = \$true|Entries = $entries.ToArray(); Failed = $failed; TimedOut = $true|' \

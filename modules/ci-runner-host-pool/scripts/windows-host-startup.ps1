@@ -3606,7 +3606,21 @@ function Update-CacheMasterFromStage {
     $moved = 0
     foreach ($dir in $script:CacheDirs) {
         $source = Join-Path $Stage $dir
-        if (-not (Test-Path -LiteralPath $source)) { continue }
+        $staged = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
+        if (-not $staged) { continue }
+        # A DIRECTORY, OR NOTHING. Test-Path is true for a FILE of the same name,
+        # and a CACHE_PREPARE that deletes a pre-created tool directory and writes
+        # an ordinary file in its place gets that file moved over the baked tree.
+        # The damage is downstream: Initialize-SlotCache cannot copy from a file,
+        # and because the cache path now EXISTS it does not create the writable
+        # fallback either -- so every job on this host is handed cache environment
+        # variables pointing at a file and fails, where the whole contract of this
+        # phase is that the worst case is running cold.
+        if (-not $staged.PSIsContainer) {
+            Write-BootLog ("phase 7: the staged snapshot has $dir as a file rather than a directory -- " +
+                'leaving the baked one in place')
+            continue
+        }
         # AN EMPTY DIRECTORY IS NOT A CACHE. The host pre-creates all of
         # $script:CacheDirs at startup, so a snapshot built from a CACHE_PREPARE
         # that only warmed npm still SHIPS an empty maven, nuget and go. Moving
@@ -3620,6 +3634,20 @@ function Update-CacheMasterFromStage {
         if (-not $PSCmdlet.ShouldProcess($dir, 'publish into the cache master')) { continue }
         $target = Join-Path $Master $dir
         $aside = Join-Path $Master ".$dir.previous"
+        # A SURVIVING ASIDE IS A REFUSAL, NOT A LEFTOVER. The sweep above drops
+        # stale `.previous` trees through Remove-CacheTreeSafely, which
+        # DELIBERATELY leaves one it cannot show to be safe -- a junction, or a
+        # tree it could not read to the end. `Move-Item -Force` onto an existing
+        # directory name does not replace that name, it moves the source INSIDE
+        # it, and inside a junction is wherever the junction points: the baked
+        # cache written to an arbitrary path as SYSTEM. Protect-CacheMaster a few
+        # lines later can refuse the result; it cannot take that write back. So a
+        # tool whose aside is still there keeps its baked cache instead.
+        if (Test-Path -LiteralPath $aside) {
+            Write-BootLog ("phase 7: $dir keeps its baked cache -- $aside survived the sweep, and " +
+                'moving the master onto a name this host could not clear is how a junction gets written through')
+            continue
+        }
         if (Test-Path -LiteralPath $target) {
             try {
                 Move-Item -LiteralPath $target -Destination $aside -Force -ErrorAction Stop
@@ -3711,6 +3739,18 @@ function Invoke-CacheHydrateBounded {
     if ($rootReason) {
         Write-BootLog "phase 7: not hydrating $Master -- $rootReason"
         return 'master-hostile'
+    }
+
+    # THE READS ABOVE ARE INSIDE THE BUDGET, AND THEY CAN SPEND IT. Five metadata
+    # attributes at ten seconds each, plus the token below, is a minute of fixed
+    # timeouts in front of a sixty-second phase; `& $left` bounds every FETCH
+    # after this point, but nothing bounded the token read itself. If the budget
+    # is already gone there is no snapshot this host can finish, so it says so
+    # rather than spending another ten seconds proving it.
+    if ((& $left) -le 0) {
+        Write-BootLog ("phase 7: the $($bounds.BudgetSeconds)s budget was spent reading cache " +
+            'metadata -- starting cold instead')
+        return 'budget-spent'
     }
 
     # THE PROPERTY, NOT A REGEX OVER THE STRINGIFIED OBJECT. Invoke-RestMethod

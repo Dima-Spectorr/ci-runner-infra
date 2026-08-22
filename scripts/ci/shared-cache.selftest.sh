@@ -1519,12 +1519,31 @@ has_agreeing_cache_dirs() { # <publish-script>
 # The split is the whole control: `CACHE_PREPARE` runs third-party code, and a
 # job with `id-token: write` hands that code the credential through
 # ACTIONS_ID_TOKEN_REQUEST_TOKEN no matter what the script does afterwards.
+# Every block for one job key in the doc, each ending where the job ends: the
+# next key at the same indent, or the closing fence.
+#
+# The doc carries more than one `build:` -- the reference workflow's and the
+# Windows pool's -- and the claim below is about ALL of them, so the range
+# cannot simply run from `build:` to `publish:`: a `,` range in sed restarts,
+# so a `build:` with no `publish:` after it printed to END OF FILE, and the
+# predicate read every `id-token` in the document as being inside a build job.
+# Closing on the fence alone is not enough either -- both jobs of the reference
+# workflow live in ONE fenced block, so `build:` would swallow `publish:` and
+# with it the credential the whole split exists to keep out of the build job.
+yaml_job_block() { # <file> <key>
+  awk -v key="  $2:" '
+    $0 == key { inb = 1; print; next }
+    inb && ($0 == "```" || $0 ~ /^  [A-Za-z_][A-Za-z0-9_-]*:[ 	]*$/) { inb = 0; next }
+    inb { print }
+  ' "$1"
+}
+
 has_split_publishing_workflow() { # <doc>
   local build publish doc
   doc=$(cat "$1")
-  # The two job blocks, by their own boundaries rather than by line count.
-  build=$(sed -n '/^  build:$/,/^  publish:$/p' "$1")
-  publish=$(sed -n '/^  publish:$/,/^```$/p' "$1")
+  # The job blocks, by their own boundaries rather than by line count.
+  build=$(yaml_job_block "$1" build)
+  publish=$(yaml_job_block "$1" publish)
   [ -n "$build" ] && [ -n "$publish" ] || return 1
 
   matches "$build" 'CACHE_PREPARE'      || return 1
@@ -2311,6 +2330,14 @@ mutate_file "$PUBDOC" 'the two jobs are merged back into one' has_split_publishi
   's@^      id-token: write.*$@@'
 mutate_file "$PUBDOC" 'the install job gains the credential' has_split_publishing_workflow \
   's@^      contents: read  .*$@      contents: read\n      id-token: write@'
+# The SECOND build job, on its own. The first version of this predicate ran its
+# range from `build:` to `publish:`, so the Windows block -- which has no
+# `publish:` after it -- was never inside the text being judged at all: a
+# credential could be granted to a documented install job and the split's own
+# test would pass. The two blocks are the same claim, so both are mutated.
+mutate_file "$PUBDOC" 'the Windows install job gains the credential' has_split_publishing_workflow   's@^    runs-on: windows-latest$@    runs-on: windows-latest
+    permissions:
+      id-token: write@'
 mutate_file "$PUBDOC" 'the token is granted workflow-wide instead' has_split_publishing_workflow \
   's@^permissions: \{\}$@permissions:\n  id-token: write@'
 mutate_file "$PUBDOC" 'the publishing job stops waiting for the build' has_split_publishing_workflow \
