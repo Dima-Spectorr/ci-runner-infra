@@ -1676,6 +1676,14 @@ has_cache_master_sealed_readonly() { # <file>
   # The root itself is scanned, not only its children: a master that IS a junction
   # is the case where everything below it already belongs to another tree.
   matches "$code" '\$entries = @\(\$root\) \+' || return 1
+
+  # An enumeration that partly failed is not a tree that came back clean. The
+  # scan proves ABSENCE of reparse points, and the only evidence for that is
+  # having read every entry, so the errors are captured and a scan that hit any
+  # of them refuses. Without this, an unreadable subdirectory produces the same
+  # empty $reason a genuinely clean tree does.
+  matches "$code" '-ErrorVariable scanErrors' || return 1
+  matches "$code" 'if \(\$scanErrors\.Count -gt 0\)' || return 1
 }
 
 has_slot_cache_isolation() { # <file>
@@ -1744,6 +1752,13 @@ has_slot_cache_isolation() { # <file>
   [ "$scan_at" -lt "$del_at" ] || return 1
   # And the refusal is acted on. Anchored the same way, and for the same reason.
   matches "$code" '^            if \(\$reason\) \{$' || return 1
+
+  # Each seed attempt stages under a name that cannot collide. With the fixed
+  # name this started as, a stage the cleanup failed to remove would be copied
+  # INTO -- robocopy reports 2 or 3 for the extra files, which is success -- and
+  # the rename would publish the previous attempt mixed into this one.
+  matches "$code" '\$stage = Join-Path \$dst \(' || return 1
+  matches "$code" '-f \$tool, \[guid\]::NewGuid' || return 1
 
   # The cache variables are emitted only for a slot that actually got a cache.
   # Unconditional, they would name directories phase 7 never built — and a tool
@@ -1815,6 +1830,9 @@ mutate "a retired tree scanned, found hostile, and deleted anyway" \
 mutate "a retired slot's cache tree deleted recursively without being scanned" \
   's|$reason = Get-CacheHostileReason -Entries (@($dir)|$reason = $null; $null = (@($dir)|' \
   has_slot_cache_isolation
+mutate "a partly-unreadable master scanned and sealed as though it were clean"   's|if (\$scanErrors.Count -gt 0) {|if ($false) {|'   has_cache_master_sealed_readonly
+mutate "the scan errors discarded, so an unreadable tree reads as an empty one"   's|-ErrorAction SilentlyContinue -ErrorVariable scanErrors)|-ErrorAction SilentlyContinue)|'   has_cache_master_sealed_readonly
+mutate "the staging directory back to a fixed name a failed cleanup can leave behind"   "s|('\.seed-{0}-{1}' -f \$tool, \[guid\]::NewGuid().ToString('N'))|\".seed-\$tool\"|"   has_slot_cache_isolation
 mutate "the cache variables emitted for a slot that never got a cache" \
   's|if (-not \[string\]::IsNullOrWhiteSpace(\$CachePath)) {|if ($true) {|' \
   has_slot_cache_isolation

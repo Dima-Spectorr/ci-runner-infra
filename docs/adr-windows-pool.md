@@ -828,6 +828,15 @@ scan therefore runs **before** the seal, and it includes the root itself, since
 a master that *is* a junction is the case where everything below it already
 belongs to another tree.
 
+The scan asserts an **absence**, so it only means anything if the enumeration
+succeeded: a directory that could not be listed is not an entry that came back
+clean. The enumeration errors are captured and any of them refuses the seed,
+which is the same correction the Linux publisher scan needed (`de69516`, "stop
+reading an unreadable file as clean"). Note which way that fails -- it fails the
+**cache**, not the **boot**. The host still registers and its jobs run cold,
+exactly as every other phase-7 refusal does; fail-closed on the gate is not
+fail-closed on the host.
+
 **Reducing `ci-slots` is the one recursive delete that reaches job-written
 files.** A retired index's tree is swept before the live ones are seeded, and
 `<idx>\<tool>` is precisely where the retired slot had `Modify` — so a job that

@@ -1707,7 +1707,20 @@ Describe 'hostile cache content' {
     }
 
     It 'skips a null entry rather than throwing on one' {
+        # A one-element array holding $null binds as $null, not as an array of
+        # one -- which is why AllowNull is on the parameter and not just the
+        # $null check inside the loop.
         Get-CacheHostileReason -Entries @($null) | Should -Be ''
+    }
+
+    It 'still finds a hostile entry sitting behind a null one' {
+        # Two elements, so this really does arrive as an array and the skip
+        # inside the loop is the thing under test rather than the binder.
+        $entries = @($null, [pscustomobject] @{
+                FullName   = 'C:\ci-cache\npm'
+                Attributes = 'Directory, ReparsePoint'
+            })
+        Get-CacheHostileReason -Entries $entries | Should -Be 'reparse point: C:\ci-cache\npm'
     }
 }
 
@@ -1737,7 +1750,7 @@ Describe 'slot cache environment' {
         $script:CacheBlock = Get-SlotCacheEnvironment -CachePath 'C:\ci\cache\2'
     }
 
-    It 'points every tool at the slot own copy' {
+    It 'points every tool at the slot''s own copy' {
         $script:CacheBlock['npm_config_cache'] | Should -Be 'C:\ci\cache\2\npm'
         $script:CacheBlock['YARN_CACHE_FOLDER'] | Should -Be 'C:\ci\cache\2\yarn'
         $script:CacheBlock['GOMODCACHE'] | Should -Be 'C:\ci\cache\2\go-mod'

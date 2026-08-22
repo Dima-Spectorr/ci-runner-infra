@@ -936,7 +936,7 @@ function Get-CacheHostileReason {
         on which path from the start.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][array] $Entries)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowNull()][array] $Entries)
 
     foreach ($entry in $Entries) {
         if ($null -eq $entry) { continue }
@@ -2604,7 +2604,32 @@ function Protect-CacheMaster {
 
     # The root is the FIRST entry on purpose: a master that is itself a junction
     # is the case where everything below it is already somebody else's tree.
-    $entries = @($root) + @(Get-ChildItem -LiteralPath $Master -Recurse -Force -ErrorAction SilentlyContinue)
+    #
+    # AND THE ENUMERATION HAS TO SUCCEED BEFORE ITS RESULT MEANS ANYTHING. This
+    # scan is a proof of ABSENCE -- "there is no reparse point under here" -- and
+    # the only evidence for it is having looked at every entry. A directory that
+    # could not be listed is not an entry that came back clean; it is an entry
+    # nobody read, and `-ErrorAction SilentlyContinue` alone turns the difference
+    # into an empty `$reason`, which is the same value a genuinely clean tree
+    # produces. The two must not be spelled identically, for the reason the
+    # publisher scan had to be fixed for on the Linux side (de69516, "stop
+    # reading an unreadable file as clean").
+    #
+    # So the errors are captured and a scan that hit any of them refuses. Note
+    # which way this fails: it fails the CACHE, not the BOOT -- the host still
+    # registers and its jobs run cold, exactly as every other phase-7 refusal
+    # does. Fail-closed on the gate is not fail-closed on the host.
+    $scanErrors = @()
+    $entries = @($root) + @(Get-ChildItem -LiteralPath $Master -Recurse -Force `
+            -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
+    if ($scanErrors.Count -gt 0) {
+        $first = ([string] $scanErrors[0]) -replace '[\x00-\x1f]', ' '
+        if ($first.Length -gt 300) { $first = $first.Substring(0, 300) }
+        Write-BootLog ("phase 7: could not read all of $Master ($($scanErrors.Count) error(s), " +
+            "first: $first) -- the tree cannot be shown to be free of reparse points, so it " +
+            'is not sealed or copied; jobs will run with a cold cache')
+        return $false
+    }
     $reason = Get-CacheHostileReason -Entries $entries
     if ($reason) {
         Write-BootLog ("phase 7: refusing to seed from $Master -- $reason; " +
@@ -2720,6 +2745,15 @@ function Initialize-SlotCache {
     $marker = Join-Path $dst '.ready'
     Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
 
+    # Staging trees from a boot that died mid-copy. Swept here, once, rather than
+    # per tool: a stage is only ever published by rename, so anything still
+    # wearing the prefix is by definition a copy that never completed. Only
+    # SYSTEM can create a name in $dst, so these are our own leftovers and not
+    # something a slot planted. Best effort -- a stage that will not delete costs
+    # disk, and the unique names below mean it cannot be mistaken for a new one.
+    Get-ChildItem -LiteralPath $dst -Filter '.seed-*' -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+
     foreach ($tool in $script:CacheDirs) {
         $final = Join-Path $dst $tool
         # Already seeded on an earlier boot: leave it exactly as the slot left it.
@@ -2728,11 +2762,24 @@ function Initialize-SlotCache {
         # in $dst.
         if (Test-Path -LiteralPath $final) { continue }
 
-        $stage = Join-Path $dst ".seed-$tool"
-        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        # UNIQUE PER ATTEMPT, not the fixed ".seed-$tool" this started as. With a
+        # fixed name the delete above it was the only thing standing between a
+        # leftover tree and the cache: if it failed -- a transient lock is enough
+        # -- robocopy would run against a NON-EMPTY stage, report 2 or 3 (extra
+        # files present) which Test-RobocopySuccess correctly reads as success,
+        # and the rename would publish the previous attempt's files mixed into
+        # this one as a complete cache. A name that cannot collide removes the
+        # dependency on that delete succeeding: a stage this loop did not just
+        # create is a stage this loop will never publish.
+        $stage = Join-Path $dst ('.seed-{0}-{1}' -f $tool, [guid]::NewGuid().ToString('N'))
         $src = Join-Path $Master $tool
-        if ($Seed -and (Test-Path -LiteralPath $src)) {
-            New-Item -ItemType Directory -Force -Path $stage | Out-Null
+        # Not `continue` on a collision: the tail of this loop is what guarantees
+        # $final exists at all, and a tool directory that is missing rather than
+        # empty fails the job instead of missing the cache.
+        if (Test-Path -LiteralPath $stage) {
+            Write-BootLog "phase 7: slot $Index -- $stage already exists, $tool stays cold"
+        } elseif ($Seed -and (Test-Path -LiteralPath $src)) {
+            New-Item -ItemType Directory -Path $stage | Out-Null
             # The ACL goes on BEFORE the copy so every file robocopy writes
             # inherits it. Applying it afterwards would mean walking a tree of
             # hundreds of thousands of small files a second time for no gain.
@@ -3764,13 +3811,13 @@ function Invoke-Phase5Registration {
         # Index -> cache path, from phase 7. A slot that is absent from it gets no
         # cache variables at all, which is the cold-cache behaviour every Windows
         # host had before issue #150 closed.
-        [System.Collections.IDictionary] $CachePath = @{}
+        [System.Collections.IDictionary] $CachePaths = @{}
     )
 
     $regToken = Wait-RegistrationToken
     foreach ($slot in $Provisioned) {
         $cache = ''
-        if ($CachePath.Contains($slot.Index)) { $cache = [string] $CachePath[$slot.Index] }
+        if ($CachePaths.Contains($slot.Index)) { $cache = [string] $CachePaths[$slot.Index] }
         $block = Get-SlotServiceEnvironment -Index $slot.Index `
             -HookPath $HookPath -BrokerEndpoint $BrokerEndpoint -CachePath $cache
         Register-SlotAgent -Slot $slot -RegistrationToken $regToken `
@@ -4203,7 +4250,7 @@ function Invoke-Main {
     # rather than last because it is the only phase that can take minutes, and a
     # slot registered before its cache exists would take a job that runs cold
     # while the copy it was meant to use is still landing.
-    $cachePath = Invoke-Phase7DependencyCache -Provisioned $provisioned
+    $cachePaths = Invoke-Phase7DependencyCache -Provisioned $provisioned
 
     # BEFORE PHASE 5, and the ordering is the safety property. The probe spends a
     # slot credential to prove the boundary; phase 5 spends it on agents GitHub
@@ -4213,7 +4260,7 @@ function Invoke-Main {
     # LAST, and the only phase that makes this host reachable by a job. Everything
     # above it is a boundary; this is what is let inside one.
     Invoke-Phase5Registration -Provisioned $provisioned -Config $cfg `
-        -HookPath $hookPath -BrokerEndpoint $brokerEndpoint -CachePath $cachePath
+        -HookPath $hookPath -BrokerEndpoint $brokerEndpoint -CachePaths $cachePaths
 }
 
 # Dot-sourceable without side effects, so Pester can import the pure functions
