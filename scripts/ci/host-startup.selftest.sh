@@ -601,11 +601,20 @@ has_secrets_out_of_argv() { # <file>
   # host that cannot carry it must not register rather than fall back to argv.
   matches "$joined" 'sudo_passes_env "\$u".*return 1' || return 1
 
-  # Belt, so the next call site cannot reintroduce the class: both slot units
-  # (they share a mount namespace, so one-sided is a coin toss) plus the host
-  # /proc, which is what stops a `--pid=host` container from seeing around them.
-  [ "$(printf '%s\n' "$code" | grep -cE '^ProtectProc=invisible')" -eq 2 ] || return 1
-  matches "$code" 'remount,nosuid,nodev,noexec,hidepid=2 /proc' || return 1
+  # There WAS a belt on top of this — /proc hidden from the slot users, so that
+  # a future call site could not reintroduce the class even if it tried. It is
+  # gone, and its absence is asserted rather than merely allowed: hiding /proc/1
+  # hides it from the runner, which reads /proc/1/cgroup before it will start a
+  # job's service containers, so every test shard on this repository died in
+  # 'Initialize containers'. Re-adding it silently would take CI down again, and
+  # the two settings must move together — a unit that hides /proc while the host
+  # mount does not, or the reverse, is the same outage.
+  ! matches "$code" '^ProtectProc=invisible' || return 1
+  ! matches "$code" 'hidepid=[1-9]' || return 1
+  [ "$(printf '%s\n' "$code" | grep -cE '^ProtectProc=default')" -eq 2 ] || return 1
+  # Explicit, not absent: a warm host may already carry hidepid from a previous
+  # boot of this script, and only a remount takes it off.
+  matches "$code" 'remount,nosuid,nodev,noexec,hidepid=0 /proc' || return 1
   matches "$code" '^  harden_proc$'
 }
 
@@ -1354,9 +1363,9 @@ mutate "env prefix dropped from config.sh" '/^  ACTIONS_RUNNER_INPUT_TOKEN=/d'  
 mutate "sudo stops preserving the variable" 's@--preserve-env=ACTIONS_RUNNER_INPUT_TOKEN @@'                      has_secrets_out_of_argv
 mutate "--token added back alongside it"   's@--url "https://github.com/$OWNER@--token "$token" --url "https://github.com/$OWNER@' has_secrets_out_of_argv
 mutate "silent env drop no longer fatal"   '/sudo will not pass an environment variable/s@; return 1; }@; }@'     has_secrets_out_of_argv
-mutate "only one slot unit hides /proc"    '0,/^ProtectProc=invisible/s@^ProtectProc=invisible@#&@'               has_secrets_out_of_argv
-mutate "hidepid weakened to 1"             's@hidepid=2@hidepid=1@'                                               has_secrets_out_of_argv
-mutate "host /proc left readable"          '/^  harden_proc$/d'                                                   has_secrets_out_of_argv
+mutate "one slot unit hides /proc again"   '0,/^ProtectProc=default/s@^ProtectProc=default@ProtectProc=invisible@' has_secrets_out_of_argv
+mutate "host /proc hidden again"           's@hidepid=0@hidepid=2@'                                               has_secrets_out_of_argv
+mutate "hidepid left to a warm host"       '/^  harden_proc$/d'                                                   has_secrets_out_of_argv
 
 mutate "share never computed"        's@^  local SHARE_ENV; SHARE_ENV=\$(share_env)$@@'          has_slot_share
 mutate "share never reaches the unit" 's@^\$SHARE_ENV$@@'                                        has_slot_share
