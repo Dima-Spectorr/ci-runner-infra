@@ -319,6 +319,7 @@ chmod 0700 "$STAGE" "$ARCHIVE_DIR"
 # and, in particular, to the prepare command, which is handed $STAGE and not
 # this. Set after the directory exists rather than before the source, because
 # the library resolves it at scan time.
+# shellcheck disable=SC2034  # read by scan-cache-credentials.sh, sourced above.
 SCAN_TMPDIR="$ARCHIVE_DIR"
 
 # --- the scan --------------------------------------------------------------------
