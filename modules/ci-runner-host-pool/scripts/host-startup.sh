@@ -778,11 +778,57 @@ if [ "\$took" = 1 ]; then
     # into a path that had stopped existing. The CONTENT is what belongs to the
     # previous job; the directory itself belongs to this one, and _tool is on
     # PATH the same way.
+    #
+    # TWO levels deep, not one, and the missing level is what drained the fleet.
+    # The directory the runner hands a step is \$RUNNER_WORKSPACE/<repo> --
+    # \`_work/<repo>/<repo>\` -- so recreating only the depth-1 entry leaves that
+    # chdir target absent. An ordinary job never notices: \`actions/checkout\`
+    # recreates it in the first step, long before anything else needs it. The
+    # FAILED job is the one that pays, and it pays with the slot rather than with
+    # itself:
+    #
+    #   fail_after ends the job before any step runs  nothing recreates the
+    #                                                 workspace
+    #   the job-completed hook is launched IN it      it cannot start at all
+    #   only that hook writes the clean marker        the marker is never written
+    #   the next job finds no marker                  and fails itself, the same
+    #                                                 way, forever
+    #
+    # So a hook written to cost one job costs the slot permanently, and the fleet
+    # drains a slot at a time. Measured 2026-08-23: nine slots across three hosts,
+    # every open pull request blocked, and reruns landing on a different poisoned
+    # slot each time -- which reads as flake and is the opposite of it.
+    #
+    # Depth 2 is the contract rather than a guess: \`_temp\`, \`_actions\` and
+    # \`_tool\` sit at depth 1 and the workspace at depth 2, and nothing the runner
+    # enters is deeper. Bounded there deliberately -- recreating the skeleton of a
+    # \`node_modules\` would be thousands of mkdirs for a tree no runner chdirs into.
+    #
+    # Note what is NOT done here: writing the marker on the fail_after path. The
+    # wipe has just made the slot clean, so it is tempting, and it is wrong --
+    # keep_temp deliberately spares \`_temp\` at 'started', and \`_temp\` is where
+    # google-github-actions/auth leaves its credential file. Claiming clean over
+    # that trades this liveness bug for the credential leak #110 exists to close.
+    # The completed reset empties \`_temp\` and earns the marker honestly; the fix
+    # is to let that reset RUN.
     d=0
-    [ -d "\$e" ] && d=1
+    subdirs=""
+    if [ -d "\$e" ]; then
+      d=1
+      # Listed from the root-owned holding directory, which the slot cannot reach
+      # or rename into -- the same namespace-ownership rule the mv above exists
+      # for. These names are ones root itself just read.
+      [ "\$stage" = started ] &&
+        subdirs=\$(find "\$e" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null)
+    fi
     rm -rf -- "\$e" || { say "slot \$idx: could not remove \$e"; rc=1; }
     if [ "\$d" = 1 ] && [ "\$stage" = started ]; then
       install -d -o "\$u" -g "\$u" -m 0755 "\$e" || { say "slot \$idx: could not recreate \$e"; rc=1; }
+      while IFS= read -r sub; do
+        [ -n "\$sub" ] || continue
+        install -d -o "\$u" -g "\$u" -m 0755 "\$e/\$sub" ||
+          { say "slot \$idx: could not recreate \$e/\$sub"; rc=1; }
+      done <<< "\$subdirs"
     fi
   done
   # Handed back. The slot still owns the parent, so it could have created a NEW

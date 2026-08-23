@@ -222,5 +222,49 @@ mutate "every quoted string counts as a runner fallback" \
 mutate "a commented block-scalar header no longer opens a block" \
   's@(#\.\*)?@@g'
 
+# --- RUNNER12/13 ---------------------------------------------------------------
+# The merge-queue route. RUNNER12 is a security rule whose failure is silent in
+# both directions -- the workflow is green either way -- so "the detector has
+# been seen to fire" is worth more here than anywhere else in this file.
+#
+# The SC2016 waivers below sit on each `mutate` that needs one rather than here:
+# a directive applies to the next command, not to a block, and one written at the
+# top of a section reads as covering the section while covering one call.
+
+# 19. The reader stops reporting the route at all. Every rule below is untouched
+#     and reviews as correct; none of them is ever handed the fact it branches
+#     on, and a repository routing on the branch name alone reads as clean.
+mutate "the reader no longer reports the queue route" \
+  's@    out("#QUEUEREF", vid, origin)@    return@'
+
+# 20-21. One required conjunct stops being required. Each half has its own
+#        fixture because each half is a different vulnerability: without the
+#        same-repo test a FORK takes the reserved pool, without the author test
+#        any member of the repository does.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the same-repo conjunct no longer required" \
+  's@  \[ "$same_repo" -eq 0 \] && missing=@  [ 1 -eq 0 ] \&\& missing=@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the Mergify-author conjunct no longer required" \
+  's@  \[ "$author" -eq 0 \] && missing=@  [ 1 -eq 0 ] \&\& missing=@'
+
+# 22. The RUNNER12 finding is computed and never reported -- the state a
+#     refactor reaches by deleting one line.
+mutate "the RUNNER12 diagnostic never emitted" \
+  's@        err RUNNER12 @        : RUNNER12 @'
+
+# 23. The disjointness test always answers yes. Both pools keep their names,
+#     the route keeps working, and the queue pool quietly serves ordinary pull
+#     requests again -- which is the rationing the split exists to remove,
+#     restored without a single label changing.
+mutate "the disjointness test always answers yes" \
+  's@^disjoint_scopes() {$@disjoint_scopes() { return 0;@'
+
+# 24. Scope labels compared case-sensitively. GitHub does not distinguish
+#     `Linux` from `linux`, so two spellings of ONE pool would read as two
+#     pools and the superset that merges them would go unreported.
+mutate "scope labels compared case-sensitively" \
+  "s@    tr '\\[:upper:\\]' '\\[:lower:\\]' | grep -vxE@    cat | grep -vxE@"
+
 printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
