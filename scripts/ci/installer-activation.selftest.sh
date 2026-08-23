@@ -106,7 +106,7 @@ while IFS= read -r unit; do
   # service carries no stale process to replace.
   case "$unit" in
     *.service)
-      if printf '%s\n' "$all_units" | grep -qx "${unit%.service}.timer"; then
+      if printf '%s\n' "$all_units" | grep -cx "${unit%.service}.timer" >/dev/null; then
         ok "$unit is timer-activated (${unit%.service}.timer) — no resident process to replace"
         continue
       fi

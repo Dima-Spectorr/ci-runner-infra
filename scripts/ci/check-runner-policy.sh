@@ -793,13 +793,13 @@ check_file() {
       # GitHub does not distinguish `Windows` from `windows`, and a gate that
       # did would read the capitalised spelling every consumer actually writes
       # as some other pool entirely and say nothing about it.
-      if printf '%s' "$label" | grep -qiE "^(${WINDOWS_LABEL})$"; then
+      if printf '%s' "$label" | grep -ciE "^(${WINDOWS_LABEL})$" >/dev/null; then
         windows_pool=1
       fi
-      if printf '%s' "$label" | grep -qiE "^self-hosted$"; then
+      if printf '%s' "$label" | grep -ciE "^self-hosted$" >/dev/null; then
         self_hosted=1
       else
-        printf '%s' "$label" | grep -qiE "^(${GENERIC})$" || scoped=1
+        printf '%s' "$label" | grep -ciE "^(${GENERIC})$" >/dev/null || scoped=1
       fi
     done <<EOF
 $labels
@@ -854,7 +854,7 @@ EOF
     # and can resolve to 360, and this gate cannot read the variable. Reported
     # rather than passed, on the same rule RUNNER5 follows for `runs-on`.
     if [ "$has_timeout" -eq 1 ]; then
-      if printf '%s' "$timeout" | grep -qE '^[0-9]+$'; then
+      if printf '%s' "$timeout" | grep -cE '^[0-9]+$' >/dev/null; then
         if [ "$timeout" -ge "$MAX_TIMEOUT" ]; then
           err RUNNER6 "$rel: job '$job' declares timeout-minutes: $timeout, which is not below the $MAX_TIMEOUT-minute ceiling — it bounds nothing GitHub was not already bounding"
         fi
@@ -1066,8 +1066,8 @@ EOF
     changed=0
     while IFS=$'\t' read -r caller target; do
       [ -n "${target:-}" ] || continue
-      printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$caller" || continue
-      printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$target" && continue
+      printf '%s\n' "$REACHABLE_PR" | grep -cxF -- "$caller" >/dev/null || continue
+      printf '%s\n' "$REACHABLE_PR" | grep -cxF -- "$target" >/dev/null && continue
       REACHABLE_PR="$REACHABLE_PR$target"$'\n'
       changed=1
     done <<EOF
@@ -2106,7 +2106,7 @@ main() {
     *) echo "::error::[RUNNER0] --forks must be 'allowed' or 'blocked', got '$forks'"; return 1 ;;
   esac
 
-  if ! printf '%s' "$MAX_TIMEOUT" | grep -qE '^[1-9][0-9]*$'; then
+  if ! printf '%s' "$MAX_TIMEOUT" | grep -cE '^[1-9][0-9]*$' >/dev/null; then
     echo "::error::[RUNNER0] --max-timeout must be a positive integer, got '$MAX_TIMEOUT'"
     return 1
   fi

@@ -1098,15 +1098,15 @@ scan_file() {
     return
   fi
 
-  if printf '%s\n' "$doc" | grep -q '^#ERR	'; then
+  if printf '%s\n' "$doc" | grep -c '^#ERR	' >/dev/null; then
     err CHECK0 "\`$f\` is not loadable YAML, so nothing below it is worth asserting: Mergify refuses the whole file and NO pull request queues. Parser said: $(printf '%s\n' "$doc" | awk -F'\t' '$1 == "#ERR" { print $2; exit }')"
     return
   fi
-  if printf '%s\n' "$doc" | grep -qx '#BUDGET'; then
+  if printf '%s\n' "$doc" | grep -cx '#BUDGET' >/dev/null; then
     err CHECK0 "\`$f\` expands past this gate's traversal budget. A cycle is not required for that: aliases that reference each other acyclically double the traversal each level, so a sub-kilobyte file can expand to millions of nodes — the gate then runs until the job times out, which reads as infrastructure flakiness rather than as a configuration finding. No valid Mergify configuration is that shape."
     return
   fi
-  if printf '%s\n' "$doc" | grep -qx '#DEPTH'; then
+  if printf '%s\n' "$doc" | grep -cx '#DEPTH' >/dev/null; then
     err CHECK0 "a condition list in \`$f\` nests deeper than this gate reads (64 levels). Everything below that point was NOT inspected, and reporting PASS on a tree it stopped reading is the vacuous pass this gate exists to prevent — a \`check-success\` under 65 nested \`and:\` nodes is restated whether or not the reader reached it. Flatten the conditions."
     return
   fi
@@ -1447,10 +1447,10 @@ EOF
   if has '#AMCBASEDISJOINT'; then
     err CHECK8 "\`auto_merge_conditions\` and the queue rules admit DISJOINT sets of branches: no pull request can satisfy both, so nothing is ever queued. Same failure as an unserved base, in a spelling that names no base to point at — an admission list written as an exclusion (\`base != x\`), or a queue rule whose own \`base\` conditions are ANDed together and therefore admit nothing at all."
   fi
-  if printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DRAFTCLASH" && $2 == "draft"' | grep -q .; then
+  if printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DRAFTCLASH" && $2 == "draft"' | grep -c . >/dev/null; then
     err CHECK8 "\`auto_merge_conditions\` admits \`draft\` while every queue rule that can take those pull requests requires \`-draft\`. Only drafts are then auto-queued, and no rule accepts them: nothing merges, and nothing goes red."
   fi
-  if printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DRAFTCLASH" && $2 == "-draft"' | grep -q .; then
+  if printf '%s\n' "$doc" | awk -F'\t' '$1 == "#DRAFTCLASH" && $2 == "-draft"' | grep -c . >/dev/null; then
     err CHECK8 "\`auto_merge_conditions\` requires \`-draft\` while every queue rule that can take those pull requests requires \`draft\`. The two admit disjoint sets of pull requests, so the queue takes nothing at all — the mirror image of the case above, and just as silent."
   fi
 }

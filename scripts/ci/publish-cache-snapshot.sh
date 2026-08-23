@@ -776,7 +776,7 @@ explain_credential_hit() { # <tree> <file>
       if [ "$label" = url-embedded-basic-auth ]; then
         scheme=$(LC_ALL=C grep -oEa -m1 -e "$pat" "$file" 2>/dev/null | head -n1 \
           | sed -E 's@^[^A-Za-z]*@@; s@://.*@@') || true
-        if printf '%s' "$scheme" | grep -qE "^($URL_SCHEME_ALT)$"; then
+        if printf '%s' "$scheme" | grep -cE "^($URL_SCHEME_ALT)$" >/dev/null; then
           printf '    scheme: %s\n' "$scheme"
         else
           printf '    scheme: not a recognised URL scheme — inspect that line locally\n'
