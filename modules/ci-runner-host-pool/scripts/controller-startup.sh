@@ -1342,7 +1342,7 @@ stall_attempts_bump() {
 # state is the never-entered-the-queue one from case 3.
 stall_dequeue_kind() {
   local num="$1" runs="$2" deadline="$3"
-  local run_id conclusion jobs sig
+  local run_id jobs sig
 
   run_id=$(printf '%s' "$runs" | jq -r --arg pat "#$num " '
     [ .workflow_runs[]?
@@ -1351,7 +1351,10 @@ stall_dequeue_kind() {
       | select(.status == "completed")
       | select((.conclusion // "") != "success") ]
     | sort_by(.updated_at) | last | (.id // "") | tostring' 2>/dev/null)
-  [ -n "$run_id" ] && [ "$run_id" != "null" ] || { printf 'infra'; return 0; }
+  if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+    printf 'infra'
+    return 0
+  fi
 
   budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME" || {
     # Out of budget is NOT a verdict. Say "real" — the conservative answer,
@@ -1375,7 +1378,17 @@ stall_dequeue_kind() {
           e: (if (.started_at // "") != "" and (.completed_at // "") != ""
               then ((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601))
               else "" end),
-          s: ([ .steps[]? | select(.status == "completed") ] | length) } ]
+          # `infra_dequeue` reads an empty steps field as "the caller could not
+          # tell" and a "0" as "it ran nothing", and the two must not be
+          # conflated: the second earns a requeue and the first must not. The
+          # jobs API omits `.steps` entirely when it has no step data for a job,
+          # and `.steps[]?` would quietly turn that absence into a length of 0 —
+          # manufacturing exactly the signature this rule retries on. An empty
+          # ARRAY is different and is a real zero: the job existed, recorded
+          # steps, and completed none of them.
+          s: (if (.steps == null) then ""
+              else ([ .steps[] | select(.status == "completed") ] | length)
+              end) } ]
     | .[] | [ .c, (.e | tostring), (.s | tostring) ] | @tsv' 2>/dev/null)
   [ -n "$sig" ] || { printf 'real'; return 0; }
 

@@ -169,6 +169,10 @@ stall_verdict() {
   local stall_after="${9:-}"
   local attempts="${10:-}"
   local max_attempts="${11:-}"
+  # shellcheck disable=SC2034  # accepted and deliberately unread; see the
+  # header. Bound rather than dropped so the signature keeps a place for the
+  # question, and so a caller that passes it gets the documented no-op instead
+  # of silently shifting an argument onto some other parameter.
   local behind="${12:-}"
 
   local n

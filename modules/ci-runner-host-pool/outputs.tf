@@ -329,15 +329,18 @@ output "metric_names" {
       # fleet working, it is the queue needing a chaperone — read it as a defect
       # rate, and read it beside the failure rate of the merge-queue draft runs.
       "ci_queue_nudges",
-      # Pull requests that met every stall condition and were NOT nudged,
-      # because the head sha had already spent its attempts. This is the series
-      # that says a human is needed: the automation has given up and the pull
-      # request is still sitting there. Alert on it.
+      # Pull requests that met every stall condition and were NOT nudged, for
+      # any reason OTHER than the attempt ceiling: the comment was refused, or
+      # the queue run failed the way a build fails and so earned no requeue.
+      # This is the series that says a human is needed — the automation looked,
+      # declined, and the pull request is still sitting there. Alert on it.
       "ci_queue_stalls_unresolved",
-      # How many heads hit that ceiling. Separate from the count above because
-      # this one is cumulative evidence that the infra/diff line is drawn wrong
-      # — a healthy fleet exhausts nobody — while the count above is one
-      # pull request needing help right now.
+      # The ceiling case, counted separately rather than folded into the series
+      # above, because the two carry different advice. This one is cumulative
+      # evidence that the infra/diff line is drawn wrong — a healthy fleet
+      # exhausts nobody, and a rising count means the rule is spending retries
+      # on pull requests that were genuinely broken — while the series above is
+      # one pull request needing a human right now.
       "ci_queue_stall_attempts_exhausted",
       # > 0 means the stall sweep did not examine every candidate this tick, so
       # every count above is a lower bound rather than a fact. Published every
