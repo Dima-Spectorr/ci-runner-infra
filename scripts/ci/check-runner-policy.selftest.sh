@@ -195,5 +195,44 @@ mutate "a declared exemption is no longer honoured" \
 mutate "the marker no longer has to name the job it excuses" \
   's@${esc}${tail}@[^)]*@'
 
+# --- RUNNER12/13 ---------------------------------------------------------------
+# The merge-queue route. RUNNER12 is a security rule whose failure is silent in
+# both directions -- the workflow is green either way -- so "the detector has
+# been seen to fire" is worth more here than anywhere else in this file.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+
+# 17. The reader stops reporting the route at all. Every rule below is untouched
+#     and reviews as correct; none of them is ever handed the fact it branches
+#     on, and a repository routing on the branch name alone reads as clean.
+mutate "the reader no longer reports the queue route" \
+  's@    out("#QUEUEREF", vid, origin)@    return@'
+
+# 18-19. One required conjunct stops being required. Each half has its own
+#        fixture because each half is a different vulnerability: without the
+#        same-repo test a FORK takes the reserved pool, without the author test
+#        any member of the repository does.
+mutate "the same-repo conjunct no longer required" \
+  's@  \[ "$same_repo" -eq 0 \] && missing=@  [ 1 -eq 0 ] \&\& missing=@'
+mutate "the Mergify-author conjunct no longer required" \
+  's@  \[ "$author" -eq 0 \] && missing=@  [ 1 -eq 0 ] \&\& missing=@'
+
+# 20. The RUNNER12 finding is computed and never reported -- the state a
+#     refactor reaches by deleting one line.
+mutate "the RUNNER12 diagnostic never emitted" \
+  's@        err RUNNER12 @        : RUNNER12 @'
+
+# 21. The disjointness test always answers yes. Both pools keep their names,
+#     the route keeps working, and the queue pool quietly serves ordinary pull
+#     requests again -- which is the rationing the split exists to remove,
+#     restored without a single label changing.
+mutate "the disjointness test always answers yes" \
+  's@^disjoint_scopes() {$@disjoint_scopes() { return 0;@'
+
+# 22. Scope labels compared case-sensitively. GitHub does not distinguish
+#     `Linux` from `linux`, so two spellings of ONE pool would read as two
+#     pools and the superset that merges them would go unreported.
+mutate "scope labels compared case-sensitively" \
+  "s@    tr '\\[:upper:\\]' '\\[:lower:\\]' | grep -vxE@    cat | grep -vxE@"
+
 printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

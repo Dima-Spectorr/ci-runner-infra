@@ -60,6 +60,13 @@ output "pool_descriptor" {
     host_os                  = var.host_os
     mints_registration_token = var.controller_mints_registration_token
     runner_labels            = local.runner_labels
+
+    # Carried even though the parser defaults it, unlike every other defaulted
+    # column: `ci` is the safe default for a pool that says nothing, and it is
+    # the WRONG answer for the pool this delivery exists to add. A merge-queue
+    # pool that arrives labelled `ci` is sized from pull-request demand, which
+    # is precisely the rationing the split removes.
+    role = var.role
   }
 }
 

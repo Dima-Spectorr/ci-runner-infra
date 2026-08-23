@@ -62,6 +62,8 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER9` | with `--shared-infra`, a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the anchor job's output, or is the anchor, or carries a declared exemption |
 | `RUNNER10` | with `--shared-infra`, at most **one** job across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# shared-infra-owner(<job>)` markers counted together, because a repository that has adopted the contract has no `services:` left to count |
 | `RUNNER11` | with `--shared-infra`, a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
+| `RUNNER12` | a route onto the **merge-queue** pool also requires the head branch to live in this repository and the author to be `mergify[bot]` — not the branch name alone |
+| `RUNNER13` | and the label sets it routes between are mutually non-superset, so neither pool can be scheduled onto the other's hosts |
 
 `RUNNER9`–`RUNNER11` are designed in
 [`adr-pr-host-affinity.md`](adr-pr-host-affinity.md) and specified for consumers
@@ -149,6 +151,49 @@ The port band is what makes this decidable — `localhost` on 8080 is a service
 the job started itself and is left alone; `localhost` in 35100–44099 is the
 mistake. It is read from the whole job rather than from `run:` blocks alone,
 because the shape it actually takes is a connection string in `env:`.
+
+### `RUNNER12`/`RUNNER13` — the merge-queue route
+
+A repository served by both a pull-request pool and a merge-queue pool routes
+between them in one expression, published as an output of the lane job. Both
+rules read that expression, and both are opted into by the route **existing** —
+no flag, because a repository that never writes `mergify/merge-queue/` into a
+`runs-on` or a job output is not making either mistake.
+
+`RUNNER12` is a security check, on the same footing as `RUNNER1`.
+`github.head_ref` is whatever the requester typed, so a route keyed on the
+branch prefix alone offers the reserved pool to any pull request willing to be
+named after the queue — a fork included. Two facts nobody outside the
+repository can forge have to be required with it: `head.repo.full_name ==
+github.repository`, and `user.login == 'mergify[bot]'`. Nothing goes red when
+they are missing; the route works, and it also works for everyone else.
+
+What it asserts is that both conjuncts are **present**, not that they are used
+the right way round: a route that tested `!(head.repo.full_name ==
+github.repository)` would satisfy it and mean the opposite. That is the limit of
+reading an expression without evaluating it, and it is the same limit `RUNNER4`
+lives with — write the route the way [`ci-lane-model.md`](ci-lane-model.md)
+spells it and the question does not arise.
+
+`RUNNER13` is the scheduling half. GitHub matches a runner by superset, so if
+the queue arm's labels cover the pull-request arm's, every ordinary job is
+eligible for the queue's hosts and the split buys nothing; covered the other way
+round, the queue cannot be addressed at all and its jobs wait against a label no
+runner carries. Each arm must therefore carry a scope label the other does not —
+mutual non-superset, not merely "different" — and an arm carrying no scope label
+at all is `RUNNER1`'s finding reached through an expression `RUNNER1` cannot
+read. Case is not a difference: GitHub does not distinguish `Linux` from
+`linux`, so neither does the comparison.
+
+The **hosted** arm of the fork idiom (`'["ubuntu-latest"]'`) is not a pool and
+is excluded, decided against the same `HOSTED_IMAGE` expression the fork guard
+uses rather than re-derived — otherwise the one shape that already got this
+right would be the one reported.
+
+`modules/ci-runner-controller` asserts the same disjointness across its `pools`
+table at plan time. Both ends, because either end alone is a rule the other end
+drifts away from: Terraform sees the pools and not the workflow, this gate sees
+the workflow and not the pools.
 
 ### `self-hosted` is a label, not a requirement
 
