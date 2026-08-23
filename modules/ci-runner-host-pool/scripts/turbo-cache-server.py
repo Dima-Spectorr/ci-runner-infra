@@ -357,20 +357,36 @@ class Handler(BaseHTTPRequestHandler):
         unread bytes at the head of the next request on that connection, and
         turbo then reports a protocol error for an artifact it never uploaded.
         """
-        length = int(self.headers.get("Content-Length") or 0)
-        remaining = length
+        self._drain()
+        self._json(202, {"urls": []})
+
+    def _drain(self):
+        """Consume the request body, or give up on the connection instead.
+
+        A framed body is read and dropped. A CHUNKED one is not decoded here —
+        this server never wants a byte of it, and half-implementing chunked
+        decoding to throw the result away is how a keep-alive connection ends up
+        one frame out of step, which surfaces as a protocol error on the NEXT
+        request and gets blamed on whatever artifact that was. Closing the
+        connection costs one handshake and leaves nothing mis-framed.
+        """
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            self.close_connection = True
+            return
+        try:
+            remaining = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.close_connection = True
+            return
         while remaining > 0:
             chunk = self.rfile.read(min(remaining, 1024 * 1024))
             if not chunk:
                 break
             remaining -= len(chunk)
-        self._json(202, {"urls": []})
 
     def do_POST(self):  # noqa: N802 - stdlib signature
         path = urllib.parse.urlsplit(self.path).path
-        length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        self._drain()
         # Turbo posts cache hit/miss telemetry here and treats a non-2xx as a
         # cache error. There is no telemetry sink in this fleet — the host's own
         # metrics carry what an operator needs — so it is answered and dropped.

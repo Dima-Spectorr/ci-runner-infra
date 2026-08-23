@@ -190,6 +190,24 @@ h = FakeHandler("/v8/artifacts/cafebabe", body=b"x" * 4096)
 h.do_PUT()
 check("the discarded upload's body is consumed", h.rfile.read() == b"")
 
+# 5b. A CHUNKED upload carries no Content-Length, so there is no framed body to
+#     drain and the only safe answer is to stop reusing the connection. Reading
+#     the raw chunk framing as if it were the body is what would leave the
+#     connection one frame out of step — a protocol error reported against
+#     whatever request came next.
+h = FakeHandler(
+    "/v8/artifacts/cafebabe",
+    headers={"Authorization": "Bearer host-token", "Transfer-Encoding": "chunked"},
+    body=b"1000\r\n" + b"x" * 4096 + b"\r\n0\r\n\r\n",
+)
+h.close_connection = False
+h.do_PUT()
+check(
+    "a chunked upload is answered and the connection is not reused",
+    h.status == 202 and h.close_connection,
+    "status=%s close=%r" % (h.status, h.close_connection),
+)
+
 # 6. Hash shapes. The hash is the only thing that reaches an object name and a
 #    file path, so a traversal must be refused before either.
 for name, path in [

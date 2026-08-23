@@ -57,6 +57,22 @@ variable "name" {
 variable "github_owner" {
   description = "GitHub organisation or user that owns the repository this pool serves."
   type        = string
+
+  # Both of these now end up in two places where an unexpected character is not
+  # cosmetic: the build cache's object prefix, and the IAM condition scoping the
+  # host's read grant to that prefix. The condition is a CEL expression built by
+  # interpolating them into a quoted string literal, so an owner or repo
+  # carrying a double quote could close the literal and rewrite the expression
+  # into one that is unconditionally true — a grant meant to reach one
+  # repository's build artifacts, reaching every repository's. A slash is the
+  # quieter half of the same problem: it would move the prefix, so the grant and
+  # the server would confine reads to a tree nobody meant to name.
+  #
+  # The charsets below are GitHub's own, so no real value is refused.
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$", var.github_owner))
+    error_message = "github_owner must be a GitHub login: 1-39 characters, letters, digits and hyphens, not starting with a hyphen."
+  }
 }
 
 variable "github_repo" {
@@ -67,6 +83,13 @@ variable "github_repo" {
     credentials and workspace remnants.
   EOT
   type        = string
+
+  # See github_owner: this value is interpolated into an IAM condition's CEL
+  # string literal and into the build cache's object prefix.
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_.-]{1,100}$", var.github_repo))
+    error_message = "github_repo must be a repository NAME without the owner: 1-100 characters, letters, digits, dots, hyphens and underscores."
+  }
 }
 
 # --- the host -----------------------------------------------------------------
