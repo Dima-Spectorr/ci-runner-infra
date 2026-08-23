@@ -580,30 +580,41 @@ Describe 'quiesce victim selection' {
 }
 
 Describe 'slot state paths' {
+    # A POSIX root, and expectations built with Join-Path rather than written as
+    # literals -- the same convention Get-SlotCachePath's cases use, and for the
+    # reason those builders document: this suite runs on ubuntu-latest, where
+    # `Join-Path 'C:\ci\state' 1` does not build a string, it throws
+    # DriveNotFoundException. The real roots are asserted where they are defined.
+    BeforeAll {
+        $script:StateFixture = '/tmp/ci-state'
+        $script:TemplateFixture = '/tmp/ci-profile-template'
+    }
+
     It 'keeps every slot''s state under its own index' {
-        Get-SlotStatePath -Index 1 -StateRoot 'C:\ci\state' | Should -Be 'C:\ci\state\1'
-        Get-SlotRequestPath -Index 1 -StateRoot 'C:\ci\state' | Should -Be 'C:\ci\state\1\request'
-        Get-SlotMarkerPath -Index 1 -StateRoot 'C:\ci\state' | Should -Be 'C:\ci\state\1\clean'
-        Get-SlotVerdictPath -Index 1 -StateRoot 'C:\ci\state' | Should -Be 'C:\ci\state\1\verdict'
-        Get-SlotRunnerServicePath -Index 1 -StateRoot 'C:\ci\state' | Should -Be 'C:\ci\state\1\service'
+        $one = Join-Path $script:StateFixture '1'
+        Get-SlotStatePath -Index 1 -StateRoot $script:StateFixture | Should -Be $one
+        Get-SlotRequestPath -Index 1 -StateRoot $script:StateFixture | Should -Be (Join-Path $one 'request')
+        Get-SlotMarkerPath -Index 1 -StateRoot $script:StateFixture | Should -Be (Join-Path $one 'clean')
+        Get-SlotVerdictPath -Index 1 -StateRoot $script:StateFixture | Should -Be (Join-Path $one 'verdict')
+        Get-SlotRunnerServicePath -Index 1 -StateRoot $script:StateFixture | Should -Be (Join-Path $one 'service')
     }
 
     # The request directory is the ONLY path a slot may write, and it is one
     # level below the state directory rather than beside it, so granting write on
     # it cannot reach the marker or the verdict that gate the same slot.
     It 'puts the writable directory below the state the slot must not touch' {
-        $state = Get-SlotStatePath -Index 4 -StateRoot 'C:\ci\state'
-        $request = Get-SlotRequestPath -Index 4 -StateRoot 'C:\ci\state'
-        $request.StartsWith("$state\") | Should -BeTrue
-        (Get-SlotMarkerPath -Index 4 -StateRoot 'C:\ci\state').StartsWith("$request\") | Should -BeFalse
-        (Get-SlotVerdictPath -Index 4 -StateRoot 'C:\ci\state').StartsWith("$request\") | Should -BeFalse
+        $state = Get-SlotStatePath -Index 4 -StateRoot $script:StateFixture
+        $request = Get-SlotRequestPath -Index 4 -StateRoot $script:StateFixture
+        $request | Should -Be (Join-Path $state 'request')
+        (Get-SlotMarkerPath -Index 4 -StateRoot $script:StateFixture).StartsWith($request) | Should -BeFalse
+        (Get-SlotVerdictPath -Index 4 -StateRoot $script:StateFixture).StartsWith($request) | Should -BeFalse
     }
 
     It 'gives each slot its own profile template' {
-        Get-SlotProfileTemplatePath -Index 0 -Root 'C:\ci\profile-template' |
-            Should -Be 'C:\ci\profile-template\ci-s0'
-        Get-SlotProfileTemplatePath -Index 3 -Root 'C:\ci\profile-template' |
-            Should -Be 'C:\ci\profile-template\ci-s3'
+        Get-SlotProfileTemplatePath -Index 0 -Root $script:TemplateFixture |
+            Should -Be (Join-Path $script:TemplateFixture 'ci-s0')
+        Get-SlotProfileTemplatePath -Index 3 -Root $script:TemplateFixture |
+            Should -Be (Join-Path $script:TemplateFixture 'ci-s3')
     }
 }
 
