@@ -197,6 +197,12 @@ locals {
     # be the branch that was tested, and a pool that ships it conditionally is a
     # per-deployment variant of the controller.
     file("${path.module}/scripts/pin-hold-decision.sh"),
+    # The merge-queue parking rule. Concatenated on EVERY pool for the third
+    # time the same reason applies: the controller is ONE binary, and a decision
+    # rule shipped selectively is a per-deployment variant of it. It happens to
+    # be repository-wide rather than pool-wide, which changes where it is CALLED
+    # from and not what is delivered.
+    file("${path.module}/scripts/parked-decision.sh"),
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/watchdog-decision.sh"),
     # The merge-queue pool's ceiling rule. On EVERY pool, like the two above:
@@ -732,6 +738,9 @@ resource "google_compute_instance" "controller" {
     "ci-poll-seconds"            = tostring(var.poll_interval_seconds)
     "ci-demand-budget-seconds"   = tostring(var.demand_budget_seconds)
     "ci-metric-prefix"           = var.metric_prefix
+    # The queue's branch, so the parking sweep can tell a pull request that will
+    # never be admitted from one that is simply waiting its turn.
+    "ci-queue-base" = var.queue_base_branch
 
     "block-project-ssh-keys" = "true"
   })

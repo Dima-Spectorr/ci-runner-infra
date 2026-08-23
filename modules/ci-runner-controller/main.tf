@@ -56,6 +56,10 @@ locals {
     # deleted must be the branch that was tested. A shared controller that shipped
     # it selectively would delete a held host for one pool and not another.
     file("${local.pool_scripts}/pin-hold-decision.sh"),
+    # The merge-queue parking rule — repository-wide, and the only rule here
+    # that is. A shared controller serving four pools sweeps one repository, so
+    # it asks this question once and publishes the answer under every pool.
+    file("${local.pool_scripts}/parked-decision.sh"),
     file("${local.pool_scripts}/telemetry.sh"),
     file("${local.pool_scripts}/watchdog-decision.sh"),
     # Same list, same order, same reason as the pool module's copy: the ceiling
@@ -143,6 +147,9 @@ resource "google_compute_instance" "controller" {
     "ci-poll-seconds"          = tostring(var.poll_interval_seconds)
     "ci-demand-budget-seconds" = tostring(var.demand_budget_seconds)
     "ci-metric-prefix"         = var.metric_prefix
+    # The queue's branch, so the parking sweep can tell a pull request that will
+    # never be admitted from one that is simply waiting its turn.
+    "ci-queue-base" = var.queue_base_branch
 
     # The table. Present, so the controller does NOT fall back to synthesising a
     # one-row table from the single-pool keys — which is exactly what it would

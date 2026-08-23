@@ -269,6 +269,24 @@ output "metric_names" {
       # deferred, not lost. Sustained non-zero means OUTCOME_BUDGET is too small
       # for this repository's throughput and the other two are lagging.
       "ci_outcome_runs_skipped",
+      # --- the merge queue, as opposed to the pool ----------------------------
+      # Open pull requests that are GREEN and can never enter the merge queue,
+      # grouped by the entry condition they fail (`draft`, `base`,
+      # `draft-and-base`). It is a REPOSITORY fact published under every pool's
+      # label, so read it with max() across pools and never sum() — four pools
+      # on one controller each publish the same count.
+      #
+      # It is here, in a capacity contract, because the two "CI is making no
+      # progress" reports this fleet received in one week were both this and
+      # neither was a pool: Mergify reports an unmet entry condition as NEUTRAL,
+      # which renders as a grey dot beside forty green ticks. Nothing else in
+      # this list can go non-zero for it.
+      "ci_prs_green_and_unqueued",
+      # > 0 means the parking sweep did not examine every candidate, so the
+      # count above is a lower bound. Published every tick, 0 included: it is
+      # what makes a zero above readable as "nothing is parked" rather than "the
+      # sweep never got there".
+      "ci_parked_prs_skipped",
       # --- the cache hydrate --------------------------------------------------
       # Published by the HOST, not the controller, and once per boot rather than
       # per tick: the hydrate finishes before the runner agent registers, so the

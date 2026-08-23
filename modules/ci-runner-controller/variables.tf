@@ -174,6 +174,12 @@ variable "demand_budget_seconds" {
   default     = 45
 }
 
+variable "queue_base_branch" {
+  description = "The branch the merge queue admits. The controller compares every open pull request's base against it and reports one that is green and can never be queued (ci_prs_green_and_unqueued). Never a literal in the controller: a repository whose queue targets something else would otherwise read as entirely parked."
+  type        = string
+  default     = "main"
+}
+
 variable "metric_prefix" {
   description = "Custom-metric prefix. Series are labelled with `pool`, so all four pools publish under one prefix."
   type        = string

@@ -643,6 +643,12 @@ variable "runner_group" {
 
 # --- telemetry ----------------------------------------------------------------
 
+variable "queue_base_branch" {
+  description = "The branch the merge queue admits. The controller compares every open pull request's base against it and reports one that is green and can never be queued (ci_prs_green_and_unqueued). Never a literal in the controller: a repository whose queue targets something else would otherwise read as entirely parked."
+  type        = string
+  default     = "main"
+}
+
 variable "metric_prefix" {
   description = <<-EOT
     Custom-metric prefix. Every series this pool publishes is
