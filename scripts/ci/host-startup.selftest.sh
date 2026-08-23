@@ -354,6 +354,17 @@ has_slot_reset() { # <file>
   # one: that is the single state in which _actions cannot be trusted either
   matches "$code" 'fail_after=1' || return 1
 
+  # ONE RESET AT A TIME PER SLOT. The hooks alone were serial — the runner does
+  # not start a job's hook while another job's is running on the same slot — so
+  # this was implicit until the idle sweep gave root a second, independent
+  # caller. Two resets interleaved on one slot is the marker written by the one
+  # that finished first over the tree the other is still emptying.
+  matches "$code" 'exec 9>>"\\\$SLOT_STATE/\\\$idx/\.reset\.lock"' || return 1
+  # WAIT, do not skip: a started hook that skipped its reset is the one outcome
+  # this script must never produce. And fail CLOSED when the wait expires.
+  matches "$code" 'flock -w 300 9 \|\|' || return 1
+  matches "$code" 'refusing to start a second one' || return 1
+
   # the daemon's data root is OUT of the home, which is what makes the home
   # disposable at all — leave it in and a reset deletes the store of a daemon
   # that is still holding it open
@@ -980,7 +991,80 @@ has_pin_hold() { # <file>
   matches "$code" 'systemctl start "ci-runner@\\\$slot\.service"' || return 1
 }
 
-# The two scripts this boot script WRITES are never run by anything here, so a
+# --- the idle slot sweep ------------------------------------------------------
+#
+# A slot with no clean marker refuses every job it is handed, and the started
+# hook is the only thing that ever writes one back. That is fine while the two
+# hooks always run in pairs, and it is a permanent outage when they do not: a
+# job cancelled by fail-fast never reaches its completed hook, so the slot is
+# left dirty and the NEXT job is failed at ~6 seconds -- faster than a healthy
+# slot can claim work, so the condemned slot preferentially wins the queue and
+# takes the rest of the run down with it. Twelve of IntegrateIT's twenty-four
+# slots on 2026-08-23, and re-running the workflow made it worse.
+#
+# The sweep is what breaks that: the recovery stops costing a job.
+has_slot_sweep() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # installed, and NOT fatal. Every slot still works without it; what is lost is
+  # the recovery, so a host that has one is worth more than a host that refuses
+  # to boot. The log line has to say which of those happened.
+  matches "$code" 'install_slot_sweep \|\|' || return 1
+  ! matches "$code" 'install_slot_sweep \|\| die' || return 1
+  matches "$code" 'stay dirty until this host is recycled' || return 1
+
+  # ON A TIMER, because "the job that would have noticed" is exactly the job
+  # this exists to stop spending. Same cadence as the pin sweep.
+  matches "$code" 'systemctl enable --now ci-slot-sweep\.timer' || return 1
+  matches "$code" '^TimeoutStartSec=900$' || return 1
+
+  # BOTH WITNESSES, and this is the whole safety argument. The marker is absent
+  # for the entire length of a live job, so "dirty" alone describes a running
+  # job exactly as well as it describes an abandoned one; the worker process is
+  # the fact that tells them apart.
+  matches "$code" 'if \[ -f "\\\$marker" \]; then' || return 1
+  matches "$code" "pgrep -u \"\\\\\\\$u\" -f 'Runner\\\\.Worker'" || return 1
+
+  # A state read as a WORD. `is-active --quiet` answers only for 'active', so it
+  # calls the boot reset -- which runs as the agent unit's own ExecStartPre --
+  # an inactive slot, and the sweep would fire a second, concurrent reset into
+  # a slot already being reset.
+  matches "$code" 'state=\\\$\(systemctl is-active "ci-runner@\\\$idx\.service"' || return 1
+  matches "$code" 'activating \| deactivating \| reloading\) continue ;;' || return 1
+
+  # TWO TICKS, not one. A pgrep that missed a process it should have seen is
+  # indistinguishable from an idle slot in a single sample; requiring the state
+  # to persist turns that from a wrong action into a skipped tick.
+  matches "$code" '^GRACE=60$' || return 1
+  matches "$code" '\[ \\\$\(\(now - seen\)\) -ge "\\\$GRACE" \] \|\| continue' || return 1
+  # …and a slot that came back clears the clock rather than carrying a
+  # measurement taken before a whole job toward its next dirty spell
+  counts "$code" 'rm -f -- "\\\$since"' 3 || return 1
+
+  # THE AGENT GOES DOWN FIRST, and the worker is asked AGAIN afterwards. The
+  # stop is what stops a job being assigned mid-reset; the second pgrep is what
+  # refuses the reset if one arrived anyway. Losing either one puts root's
+  # `rm -rf` under a live job.
+  matches "$code" 'systemctl stop "ci-runner@\\\$idx\.service"' || return 1
+  matches "$code" 'refusing to reset underneath one' || return 1
+  # a stop that failed is not a stopped agent
+  matches "$code" 'its agent would not stop' || return 1
+
+  # BACK INTO THE POOL EITHER WAY, including after a reset that did not finish.
+  # It is the marker that keeps a job off this slot, not the agent's absence, so
+  # a slot left down would be capacity lost to the bookkeeping rather than the
+  # fault — and it would stay lost for the life of the host.
+  matches "$code" 'systemctl start "ci-runner@\\\$idx\.service"' || return 1
+  matches "$code" 'it stays dirty and the next sweep retries' || return 1
+
+  # It calls the same reset the hooks call. A sweep with its own idea of what
+  # cleaning means is a second implementation of the thing that has to agree
+  # with the marker it writes.
+  matches "$code" '/opt/ci/job-hooks/slot-reset\.sh completed "\\\$idx"' || return 1
+}
+
+# The scripts this boot script WRITES are never run by anything here, so a
 # syntax error in either survives every text predicate above and first appears
 # on a live host as a slot that will not pin — or, worse, a sweeper that exits
 # before it can hand one back. So they are extracted and parsed.
@@ -989,7 +1073,7 @@ has_pin_hold() { # <file>
 # text back into the file the host actually gets.
 generated_scripts_parse() { # <file>
   local name body tmp rc=0
-  for name in pin-hold pin-sweep; do
+  for name in slot-reset slot-sweep pin-hold pin-sweep; do
     body=$(awk -v n="$name" '
       $0 == "  cat >/opt/ci/job-hooks/" n ".sh <<EOF" { on = 1; next }
       on && $0 == "EOF" { exit }
@@ -1012,10 +1096,16 @@ else
   bad "a workflow run cannot keep the host it landed on, or cannot give it back — an unpinnable host hands one pull request two of them and a database the second cannot reach, and a hold nobody ends leaves a host serving nobody until the controller retires it (adr-pr-host-affinity.md §3.1)"
 fi
 
+if has_slot_sweep "$SCRIPT"; then
+  ok
+else
+  bad "a slot left dirty by a job that never reached its completed hook is never reset — it refuses every job afterwards, fails each one in seconds, and therefore WINS the queue ahead of healthy slots, so re-running the workflow spreads the outage instead of clearing it (IntegrateIT, 12 of 24 slots, 2026-08-23)"
+fi
+
 if generated_scripts_parse "$SCRIPT"; then
   ok
 else
-  bad "one of the pin-hold scripts this boot script writes does not parse — every text check above still passes, and the failure first appears as a host that silently will not pin"
+  bad "one of the scripts this boot script writes does not parse — every text check above still passes, and the failure first appears as a host that silently will not pin, or will not sweep"
 fi
 
 # --- mutation cases: prove the checks above can actually fail -----------------
@@ -1212,6 +1302,27 @@ mutate "the hold forgets which boot"        's@boot=%s@host=%s@'                
 mutate "a hold honoured across a reboot"    's@releasing it as orphaned@keeping it@'                                 has_pin_hold
 mutate "a plain pin takes its slot away"    's@\[ "\\\$reserve" = 1 \] && \[ -f@[ -f@'                                     has_pin_hold
 
+# the reset's lock — root became a second caller the day the sweep arrived
+mutate "resets no longer serialised"        's@exec 9>>"\\\$SLOT_STATE/\\\$idx/\.reset\.lock"@exec 9>/dev/null #@'          has_slot_reset
+mutate "the lock taken but not waited for"  's@flock -w 300 9@flock -n 9@'                                                has_slot_reset
+
+# the sweep
+mutate "the sweep not installed"            's@^  install_slot_sweep ||$@  true \&\& #@'                                  has_slot_sweep
+mutate "a failed sweep install kills boot"  's@^  install_slot_sweep ||$@  install_slot_sweep || die@'                    has_slot_sweep
+mutate "the sweep never runs"               's@systemctl enable --now ci-slot-sweep\.timer@systemctl enable ci-slot-sweep.timer@' has_slot_sweep
+mutate "a wedged sweep blocks every later one" 's@^TimeoutStartSec=900$@TimeoutStartSec=infinity@'                        has_slot_sweep
+mutate "dirty alone is enough to reset"     "s@pgrep -u \"\\\\\\\$u\" -f 'Runner\\\\.Worker'@false@"                       has_slot_sweep
+mutate "the marker no longer consulted"     's@^  if \[ -f "\\\$marker" \]; then$@  if false; then@'                       has_slot_sweep
+mutate "state read as a yes/no again"       's@state=\\\$(systemctl is-active "ci-runner@state=\$(systemctl is-active --quiet "ci-runner@' has_slot_sweep
+mutate "a slot mid-transition swept anyway" 's@    activating | deactivating | reloading) continue ;;@    esac_placeholder) : ;;@' has_slot_sweep
+mutate "one sample is enough"               's@^GRACE=60$@GRACE=0@'                                                       has_slot_sweep
+mutate "the grace never checked"            's@-ge "\\\$GRACE" \] || continue@-ge 0 ] || true@'                            has_slot_sweep
+mutate "the agent left up during the reset" 's@systemctl stop "ci-runner@systemctl show "ci-runner@'                       has_slot_sweep
+mutate "no second look for a live job"      's@refusing to reset underneath one@resetting anyway@'                         has_slot_sweep
+mutate "a stop that failed treated as done" 's@its agent would not stop@its agent stopped@'                                has_slot_sweep
+mutate "a failed reset leaves the slot down" 's@it stays dirty and the next sweep retries@it stays dirty@'                  has_slot_sweep
+mutate "the sweep cleans it its own way"    's@/opt/ci/job-hooks/slot-reset\.sh completed "\\\$idx"@rm -rf "\$dir"@'        has_slot_sweep
+
 # --- no comment in an UNQUOTED heredoc may spell a live backtick --------------
 #
 # Everything this script installs is written by heredocs, and most of them are
@@ -1245,14 +1356,21 @@ _live=$(awk -v SQ="'" '
   line == delim { inhd = 0; next }
   q == 0 {
     for (i = 1; i <= length($0); i++) {
-      if (substr($0, i, 1) == BT && substr($0, i - 1, 1) != BS) { print FNR; next }
+      c = substr($0, i, 1)
+      if (substr($0, i - 1, 1) == BS) continue
+      # The backtick spelling, and the modern one. `$(` is the rarer mistake
+      # because it reads like code and gets escaped by reflex -- but it is the
+      # worse one when it happens, since a substitution that SUCCEEDS produces
+      # no output, no failure and no trace that it ran.
+      if (c == BT) { print FNR; next }
+      if (c == "$" && substr($0, i + 1, 1) == "(") { print FNR; next }
     }
   }
 ' "$SCRIPT")
 if [ -z "$_live" ]; then
   ok
 else
-  bad "a backtick inside an unquoted heredoc is a command substitution the boot would run, not prose -- line(s): ${_live//$'\n'/ }"
+  bad "an unescaped backtick or \$( inside an unquoted heredoc is a command substitution the boot would run, not prose -- line(s): ${_live//$'\n'/ }"
 fi
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

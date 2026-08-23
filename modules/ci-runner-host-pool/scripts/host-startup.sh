@@ -505,6 +505,31 @@ esac
 
 marker="\$SLOT_STATE/\$idx/clean"
 
+# ONE reset at a time per slot, and this became a requirement rather than a
+# nicety when the idle sweep arrived. Until then every caller was the slot's own
+# agent, which is single-threaded across the job boundary: started, then the job,
+# then completed. The sweep is a root timer that resets a slot NO agent is
+# currently driving, so two roots can now be inside one tree — one renaming
+# _work into the holding directory while the other is emptying it, both running
+# rm -rf against paths the other is moving. The window is small and the outcome
+# is not: a half-moved _work is a slot that fails every job until the host goes.
+#
+# The lock file is in the slot's own state directory, which is root-owned 0755
+# and holds the clean marker for the same reason — a slot that could write here
+# could forge the very claim this script exists to make.
+#
+# WAIT rather than skip, because both callers are legitimate and neither is
+# repeatable at no cost: the sweep gives up its tick, and a started hook that
+# skipped the reset would be the one outcome this script must never produce. The
+# deadline is generous because the reset it is waiting on tears down containers
+# under three \`timeout\`s of its own; a wait that expires means something is
+# genuinely wedged, and then refusing is right — the marker is withheld either
+# way, so the sweep tries again in thirty seconds.
+exec 9>>"\$SLOT_STATE/\$idx/.reset.lock" ||
+  { say "slot \$idx: could not open the reset lock"; exit 1; }
+flock -w 300 9 ||
+  { say "slot \$idx: another reset of this slot is still running — refusing to start a second one"; exit 1; }
+
 # How much of _work goes. _actions and _temp are filled by the runner BEFORE the
 # job-started hook is called — actions are downloaded in JobExtension and _temp
 # carries the hook's own invocation — so removing them at that point breaks the
@@ -1497,6 +1522,191 @@ EOF
 
   systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
   systemctl enable --now ci-pin-sweep.timer >>/var/log/ci-host.log 2>&1 || return 1
+}
+
+# --- the idle slot sweep ------------------------------------------------------
+#
+# A slot with no clean marker is a slot whose last job never reached its
+# completed hook: cancelled hard, agent killed, host lost power mid-job. The
+# started hook refuses to RUN such a slot, and that refusal is right and stays —
+# it is the one state in which _actions cannot be trusted, so a job that ran
+# there would be executing a previous job's action code.
+#
+# What was wrong is that the cleaning waited for a victim. Nothing about a
+# cancelled job's leftovers requires a job to be standing on the slot while they
+# are removed, and the price of waiting was measured: under a fail-fast matrix
+# one red shard cancels its siblings, every cancelled sibling condemns its slot,
+# and every condemned slot then bills the next job that lands on it. At
+# IntegrateIT on 2026-08-23 that reached twelve of twenty-four slots, and a
+# condemned slot burns a job in about six seconds -- faster than a healthy slot
+# can claim one, so it preferentially WINS queued work.
+#
+# So the same reset runs here instead, at the one moment that costs nothing: the
+# slot is dirty AND no job is on it. The stage is 'completed', which is the
+# existing path for exactly this state -- no live job, so both the _actions and
+# _temp exceptions are dropped and the marker is written on success.
+#
+# Three sources feed it and only the first is a defect: a job cancelled by
+# fail-fast, a job that deleted its own workspace so the runner could not launch
+# the completed hook at all, and the periodic audits that withdraw a marker on
+# purpose when a slot's prune inputs stop holding.
+install_slot_sweep() {
+  cat >/opt/ci/job-hooks/slot-sweep.sh <<EOF
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as root on a timer. See install_slot_sweep().
+set -uo pipefail
+
+SLOT_STATE="$SLOT_STATE"
+SLOT_USER_PREFIX="$SLOT_USER_PREFIX"
+SLOTS=$SLOTS
+
+# How long a slot must have been dirty AND idle before this touches it. Two
+# ticks, deliberately: one observation is a sample of two facts read a moment
+# apart, and the whole risk here is acting on a slot a job is arriving at. A
+# job in flight holds a worker process for its entire length, so the pair below
+# cannot BOTH be true under one -- but a pgrep that failed to see a process it
+# should have seen would be indistinguishable from an idle slot, and requiring
+# the state to persist turns that from a wrong action into a skipped tick.
+GRACE=60
+
+say() { logger -t ci-slot-sweep -- "\$*" 2>/dev/null || true; echo "slot sweep: \$*" >&2; }
+
+for idx in \$(seq 1 "\$SLOTS"); do
+  u="\$SLOT_USER_PREFIX\$idx"
+  dir="\$SLOT_STATE/\$idx"
+  marker="\$dir/clean"
+  since="\$dir/dirty-since"
+
+  id "\$u" >/dev/null 2>&1 || continue
+  [ -d "\$dir" ] || continue
+
+  # Clean is the ordinary case and the cheap one, and it clears the clock: a
+  # slot that went dirty, served a job and came back must not carry a
+  # measurement taken before all of that toward its next dirty spell.
+  if [ -f "\$marker" ]; then
+    rm -f -- "\$since"
+    continue
+  fi
+
+  # A live job. The marker is absent for the whole length of one -- the started
+  # hook clears it and the completed hook writes it back -- so this is the
+  # ordinary reading of a dirty slot and not an exception.
+  if pgrep -u "\$u" -f 'Runner\.Worker' >/dev/null 2>&1; then
+    rm -f -- "\$since"
+    continue
+  fi
+
+  # A slot mid-transition is somebody else's. 'activating' is the boot reset
+  # running as the agent unit's ExecStartPre, which is this same script under
+  # another name; is-active --quiet answers only for 'active', so the state is
+  # read as a word rather than as a yes/no.
+  state=\$(systemctl is-active "ci-runner@\$idx.service" 2>/dev/null)
+  case "\$state" in
+    activating | deactivating | reloading) continue ;;
+  esac
+
+  now=\$(date +%s)
+  seen=""
+  [ -f "\$since" ] && read -r seen <"\$since"
+  case "\$seen" in
+    [0-9]*) ;;
+    *) seen="\$now"; printf '%s\n' "\$now" >"\$since" || say "slot \$idx: could not record when it went dirty" ;;
+  esac
+  [ \$((now - seen)) -ge "\$GRACE" ] || continue
+
+  # THE AGENT GOES DOWN FIRST, and that is what makes the reset below safe
+  # rather than merely likely to be safe. With the unit stopped no job can be
+  # assigned to this slot at all, so the tree is not being replaced under one
+  # that arrived while the checks above were running.
+  #
+  # It does not close the window entirely, and the same limit is already
+  # recorded on the reserved-slot stop in the pin sweep: a job that arrives
+  # between the pgrep and the stop is killed by the stop. That is one job, on a
+  # slot that has been dirty and idle for a minute, against a slot that
+  # otherwise fails every job it is ever handed. What must not happen is the
+  # reset running UNDER a live job, so the worker is asked for a second time
+  # once the stop has returned.
+  was_active=0
+  [ "\$state" = active ] && was_active=1
+  if [ "\$was_active" = 1 ] &&
+    ! systemctl stop "ci-runner@\$idx.service" >/dev/null 2>&1; then
+    say "slot \$idx: is dirty and idle but its agent would not stop — leaving it for the next sweep"
+    continue
+  fi
+  if pgrep -u "\$u" -f 'Runner\.Worker' >/dev/null 2>&1; then
+    say "slot \$idx: a job is still on it after the agent was stopped — refusing to reset underneath one"
+    [ "\$was_active" = 1 ] &&
+      { systemctl start "ci-runner@\$idx.service" >/dev/null 2>&1 ||
+        say "slot \$idx: and it did not come back up — the next sweep retries"; }
+    continue
+  fi
+
+  if /opt/ci/job-hooks/slot-reset.sh completed "\$idx" >/dev/null 2>&1; then
+    rm -f -- "\$since"
+    say "slot \$idx: was left dirty by a job that never completed — reset with no job on it; the next job takes the ordinary path"
+  else
+    # The marker is withheld by the reset itself, which is the correct outcome
+    # and not a second failure to handle here: the slot stays dirty, the started
+    # hook goes on refusing it, and this sweep tries again in thirty seconds.
+    # The clock is deliberately NOT cleared, so the retry is immediate.
+    say "slot \$idx: dirty and idle, but the reset did not finish — it stays dirty and the next sweep retries"
+  fi
+
+  # Back into the pool either way. A slot left down by a failed reset would be
+  # capacity lost to the bookkeeping rather than to the fault, and the marker is
+  # what keeps a job from running on it — not the agent being absent.
+  if [ "\$was_active" = 1 ] &&
+    ! systemctl start "ci-runner@\$idx.service" >/dev/null 2>&1; then
+    say "slot \$idx: reset, but its agent would not start again — the next sweep retries"
+  fi
+done
+
+exit 0
+EOF
+  # Checked, not trusted, and for the reason install_job_hooks records: an
+  # unescaped name in the body above aborts the expansion AFTER the redirect has
+  # truncated the file, leaving a zero-byte script with the right owner and mode
+  # that systemd reports as 203/EXEC.
+  [ -s /opt/ci/job-hooks/slot-sweep.sh ] ||
+    { log "slot-sweep.sh came out empty -- a name in its here-document did not expand"; return 1; }
+  bash -n /opt/ci/job-hooks/slot-sweep.sh ||
+    { log "slot-sweep.sh is not parseable -- refusing to install it"; return 1; }
+  chown root:root /opt/ci/job-hooks/slot-sweep.sh || return 1
+  chmod 0755 /opt/ci/job-hooks/slot-sweep.sh || return 1
+
+  cat >/etc/systemd/system/ci-slot-sweep.service <<'EOF'
+[Unit]
+Description=Reset this host's dirty slots while no job is on them
+
+[Service]
+Type=oneshot
+# A oneshot with no deadline blocks its own timer forever, and this one calls a
+# reset that tears down containers under three timeouts of its own, once per
+# slot. Generous enough that a busy host finishes, bounded so a single wedged
+# docker call cannot stop every later sweep on this host -- which would leave
+# the dirty slots this exists to clear dirty for the life of the host.
+TimeoutStartSec=900
+ExecStart=/opt/ci/job-hooks/slot-sweep.sh
+EOF
+
+  # Every 30 seconds, matching the pin sweep. With GRACE at two ticks a slot
+  # left dirty is back in ordinary service inside about a minute and a half,
+  # against never.
+  cat >/etc/systemd/system/ci-slot-sweep.timer <<'EOF'
+[Unit]
+Description=Sweep this host's dirty idle slots every 30 seconds
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
+  systemctl enable --now ci-slot-sweep.timer >>/var/log/ci-host.log 2>&1 || return 1
 }
 
 # --- registry credentials for job containers ----------------------------------
@@ -3867,6 +4077,19 @@ main() {
   done
 
   systemctl daemon-reload
+
+  # After the agents, because it stops and starts their units by name, and after
+  # the daemon-reload that makes those units known.
+  #
+  # Fails OPEN, and this is the one place in main() where that is the safer
+  # reading rather than the lazier one. Everything above it fails CLOSED because
+  # without it a host would serve jobs it should not: unfenced, unreset, or with
+  # no credentials. Without the sweep a host serves jobs exactly as it did
+  # before this existed -- it loses the recovery, not the isolation -- and
+  # refusing to register over a missing timer would turn a repairable host into
+  # a fleet outage of the kind the sweep is here to end.
+  install_slot_sweep ||
+    log "the idle slot sweep did not install — a slot left dirty by a cancelled job will stay dirty until this host is recycled"
 
   if [ "$failures" -ge "$SLOTS" ]; then
     # Zero registered agents = a host GitHub will never send work to. It cannot
