@@ -469,6 +469,33 @@ say() { logger -t ci-slot-reset -- "\$*" 2>/dev/null || true; echo "slot reset: 
 stage="\${1:-}"
 idx=""
 
+# WHERE THE RUNNER IS STANDING, captured before anything is removed.
+#
+# The runner invokes both hooks with the pipeline workspace as the process
+# working directory, and sudo does not change it — so at 'started' this is the
+# directory the job is about to run in, and the reset below is about to delete
+# it. In the ordinary case that costs nothing: actions/checkout recreates the
+# workspace during the job, and the completed hook finds it there.
+#
+# In the ONE case where no step ever runs — a slot found dirty, whose job is
+# failed deliberately — nothing recreates it, and the runner cannot even START
+# the completed hook: it reports
+#
+#   An error occurred trying to start process '/usr/bin/bash' with working
+#   directory '.../_work/<repo>/<repo>'. No such file or directory
+#
+# The completed reset is what WRITES the clean marker. So the slot that was
+# dirty once stays dirty forever: every job routed to it is failed at its
+# started hook, deletes the workspace again, and again loses the hook that would
+# have cleared it. Measured 2026-08-23 on IntegrateIT: four slots in this state
+# were failing every job of every open pull request, and the loop had been
+# eating individual slots for weeks (~10% of the fleet) before it took enough of
+# them at once to be visible as an outage rather than as flake.
+#
+# The recreation below is what breaks the loop. It is only a directory, and only
+# inside the slot's own tree.
+cwd=\$(pwd -P 2>/dev/null || echo "")
+
 # WHICH slot is being reset is decided here, and never by the caller when the
 # caller is a slot. sudo sets SUDO_UID itself from the real invoking user and
 # env_reset drops the caller's own copy, so a slot cannot name a DIFFERENT
@@ -629,6 +656,35 @@ if [ "\$took" = 1 ]; then
     say "slot \$idx: could not return \$work to slot \$idx"
     rc=1
   fi
+fi
+
+# THE WORKING DIRECTORY THE RUNNER IS STANDING IN, put back empty.
+#
+# See the capture of \$cwd at the top for why: without this, a slot found dirty
+# never gets its clean marker back and fails every job it is ever handed again.
+#
+# The loop above already recreates the TOP-LEVEL entries of _work — but the
+# workspace is nested one level deeper (_work/<repo>/<repo>), so recreating
+# _work/<repo> is not enough to give the completed hook somewhere to stand.
+# This recreates the whole chain, which is also what a job whose first step
+# names a deep 'working-directory' needs.
+#
+# 'started' only. At 'completed' and 'boot' no runner is standing anywhere, and
+# recreating a path then would only put back a name the reset just removed.
+#
+# \$cwd is a path an untrusted account chose, so it is CONSTRAINED rather than
+# trusted: 'pwd -P' returns it canonical, with no '..' component to walk out
+# through, and the case below accepts it only strictly inside \$work — a tree
+# the slot owns outright, where a directory owned by the slot is not a privilege
+# it did not already have. Anything else is ignored in silence, because a runner
+# standing outside its own work folder is not a state this hook can improve.
+if [ "\$stage" = started ] && [ -n "\$cwd" ]; then
+  case "\$cwd" in
+    "\$work"/?*)
+      install -d -o "\$u" -g "\$u" -m 0755 "\$cwd" \
+        || { say "slot \$idx: could not recreate the job's working directory \$cwd"; rc=1; }
+      ;;
+  esac
 fi
 
 # THE IMAGE STORE, tags only.

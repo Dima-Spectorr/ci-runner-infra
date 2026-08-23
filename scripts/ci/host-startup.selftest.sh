@@ -353,6 +353,16 @@ has_slot_reset() { # <file>
   # …and a slot whose previous job never completed does not get to run the next
   # one: that is the single state in which _actions cannot be trusted either
   matches "$code" 'fail_after=1' || return 1
+  # …and failing it does not COST the slot. The reset deletes the directory the
+  # runner is standing in, and the runner cannot start the completed hook — the
+  # hook that writes the marker — without one, so a slot failed this way used to
+  # stay dirty for good. The workspace is nested (_work/<repo>/<repo>), so the
+  # top-level recreation in the wipe loop does not reach it; the captured cwd
+  # does, and only strictly inside the slot's own _work.
+  matches "$code" 'cwd=\\\$\(pwd -P' || return 1
+  matches "$code" 'if \[ "\\\$stage" = started \] && \[ -n "\\\$cwd" \]; then' || return 1
+  matches "$code" '"\\\$work"/\?\*)' || return 1
+  matches "$code" 'install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$cwd"' || return 1
 
   # the daemon's data root is OUT of the home, which is what makes the home
   # disposable at all — leave it in and a reset deletes the store of a daemon
@@ -1096,7 +1106,9 @@ mutate "sudoers widened to any argument"  's@ started, /opt/ci/job-hooks/slot-re
 mutate "sudoers installed unvalidated"    's@visudo -cqf "\$tmp"@true@'                                            has_slot_reset
 mutate "marker left forgeable by the slot" 's@install -d -o root -g root -m 0755 "\$SLOT_STATE/\$idx"@install -d -o "\$u" -g "\$u" -m 0755 "\$SLOT_STATE/\$idx"@' has_slot_reset
 mutate "dirty slot allowed to run anyway" 's@^  fail_after=1$@  fail_after=0@'                                     has_slot_reset
-mutate "work folder left alone"           's@work="\\\$SLOT_ROOT/\\\$idx/_work"@work="\$SLOT_ROOT/\$idx/_none"@'  has_slot_reset
+mutate "failed slot loses its cwd for good" 's@^  case "\\\$cwd" in$@  case "" in@'                                 has_slot_reset
+mutate "cwd recreated from any path"      's@"\\\$work"/\?\*)@*)@'                                                 has_slot_reset
+mutate "work folder left alone"         's@work="\\\$SLOT_ROOT/\\\$idx/_work"@work="\$SLOT_ROOT/\$idx/_none"@'  has_slot_reset
 mutate "starting job loses its actions"   's@keep_actions=1@keep_actions=0@'                                     has_slot_reset
 mutate "prepared workspace unlinked"      's@install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"@true@'                     has_slot_reset
 mutate "credentials kept across the boundary" 's@_temp) \[ "\\\$keep_temp" = 1 \] && continue ;;@_temp) continue ;;@'  has_slot_reset
