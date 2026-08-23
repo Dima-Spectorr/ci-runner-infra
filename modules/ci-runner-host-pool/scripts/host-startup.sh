@@ -94,6 +94,14 @@ SLOTS=$(md "instance/attributes/ci-slots")
 POOL=$(md "instance/attributes/ci-pool")
 JOB_SA=$(md "instance/attributes/ci-job-service-account")
 BROKER_PORT=$(md "instance/attributes/ci-job-broker-port")
+# The Turborepo remote cache this host SERVES to its slots. Empty bucket = the
+# layer is off and every slot runs exactly as it did before these keys existed,
+# which is what lets a host booted from an older template stay correct.
+TURBO_BUCKET=$(md "instance/attributes/ci-turbo-bucket")
+TURBO_PREFIX=$(md "instance/attributes/ci-turbo-prefix")
+TURBO_PORT=$(md "instance/attributes/ci-turbo-port")
+TURBO_DISK_BUDGET=$(md "instance/attributes/ci-turbo-disk-budget-bytes")
+TURBO_MAX_ARTIFACT=$(md "instance/attributes/ci-turbo-max-artifact-bytes")
 HOSTNAME_SHORT=$(md "instance/name")
 # Registry hosts the job identity authenticates to. Comma-separated, set by the
 # module; see write_docker_cred_helpers for why the list is explicit.
@@ -128,6 +136,16 @@ METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 TS_MAX_TIME=10
 
 BROKER_PORT=${BROKER_PORT:-8081}
+
+TURBO_PORT=${TURBO_PORT:-8082}
+# Set by start_turbo_cache when the layer comes up, and read by install_slot to
+# decide whether a slot is told about the cache at all. Declared here so the two
+# are not ordered by accident: a slot must never be handed TURBO_API for a
+# server that failed to start, because turbo would then spend a request per task
+# on a connection refused instead of building.
+TURBO_TOKEN=""
+TURBO_DISK_BUDGET=${TURBO_DISK_BUDGET:-8589934592}
+TURBO_MAX_ARTIFACT=${TURBO_MAX_ARTIFACT:-536870912}
 
 SLOTS=${SLOTS:-1}
 
@@ -335,6 +353,98 @@ EOF
       "http://127.0.0.1:$BROKER_PORT/computeMetadata/v1/instance/service-accounts/default/token" \
       >/dev/null 2>&1; then
       log "job credential broker serving $JOB_SA on 127.0.0.1:$BROKER_PORT"
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# --- the Turborepo remote cache this host serves ------------------------------
+#
+# The repository configures nothing. A monorepo's build cache is the largest
+# remaining win on this fleet (docs/ci-optimization-catalog.md, 4.4), and the one
+# repository that built one by hand ran it COLD for weeks without noticing,
+# because a hand-wired cache fails as a warning per artifact in a green run. So
+# the host serves it and points every slot at it, the same way it serves job
+# credentials: one thing to get right, in one place, reviewed with the module.
+#
+# READ-ONLY, and that is not a stage on the way to something else — see the
+# header of turbo-cache-server.py. A host runs pull-request code; a cache that
+# job code could write is one pull request handing the next build a tarball that
+# is unpacked into its output tree and treated as its own result.
+#
+# Fails OPEN. Every failure here costs cache hits and nothing else, and a host
+# that refused to register over a cache would turn a speed layer into an
+# outage — the exact trade the snapshot layer already declines.
+start_turbo_cache() {
+  local src
+  src=$(md "instance/attributes/ci-turbo-cache-py")
+  [ -n "$src" ] || { log "turbo cache: server source missing from metadata"; return 1; }
+
+  printf '%s' "$src" >/opt/ci/turbo-cache-server.py
+  chmod 0755 /opt/ci/turbo-cache-server.py
+
+  # A per-BOOT token, generated here and never persisted. It is not the security
+  # boundary — the port is REJECTed on the primary interface and every slot on
+  # this host may read the same artifacts anyway (see _authorized in the
+  # server) — so its whole job is to make a workflow that points TURBO_API
+  # somewhere else, or brings a token of its own, fail loudly instead of reading
+  # this cache under a team name that means nothing here.
+  # Held in a local until the server has ANSWERED, and only then published as
+  # TURBO_TOKEN: install_slot reads that variable as "the cache is up", so
+  # setting it here would point every slot at a server this function is about to
+  # give up on.
+  local tok
+  tok=$(openssl rand -hex 16 2>/dev/null) || tok=""
+  [ -n "$tok" ] || { log "turbo cache: could not generate a token"; return 1; }
+
+  cat >/etc/systemd/system/ci-turbo-cache.service <<EOF
+[Unit]
+Description=Turborepo remote cache, read-only ($POOL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root, for the same reason the job broker is: this is the only thing on the
+# host that may hold the host identity's token, which is what reads the store.
+# Job code cannot reach that token — the slot namespaces REJECT the metadata
+# server and /proc of a root process is invisible under hidepid=2.
+User=root
+Environment=CI_TURBO_BUCKET=$TURBO_BUCKET
+Environment=CI_TURBO_PREFIX=$TURBO_PREFIX
+Environment=CI_TURBO_TOKEN=$tok
+Environment=CI_TURBO_DISK_BUDGET_BYTES=$TURBO_DISK_BUDGET
+Environment=CI_TURBO_MAX_ARTIFACT_BYTES=$TURBO_MAX_ARTIFACT
+# Every slot has its own network namespace and therefore its own loopback, so a
+# server bound to 127.0.0.1 in the host namespace is reachable from none of
+# them. It binds every address — including each slot's gateway — and
+# setup_slot_networking REJECTs this port on the primary interface, exactly as
+# it does for the broker.
+Environment=CI_TURBO_HOST=0.0.0.0
+Environment=CI_TURBO_PORT=$TURBO_PORT
+ExecStart=/usr/bin/python3 /opt/ci/turbo-cache-server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now ci-turbo-cache.service >>/var/log/ci-host.log 2>&1 || return 1
+
+  # Prove it answers before a slot is told to trust it. `status` is the call
+  # turbo makes first and the one that decides whether the client uses the cache
+  # at all, so a server that listens but cannot answer it is a server that turns
+  # itself off in every build while looking up here.
+  local i
+  for i in $(seq 1 15); do
+    if curl "${CURL_TIMEOUTS[@]}" -fsS \
+      "http://127.0.0.1:$TURBO_PORT/v8/artifacts/status" >/dev/null 2>&1; then
+      TURBO_TOKEN="$tok"
+      log "turbo remote cache serving gs://$TURBO_BUCKET/$TURBO_PREFIX on 127.0.0.1:$TURBO_PORT"
       return 0
     fi
     sleep 2
@@ -1497,6 +1607,197 @@ EOF
 
   systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
   systemctl enable --now ci-pin-sweep.timer >>/var/log/ci-host.log 2>&1 || return 1
+}
+
+# --- the baked-image manifest, re-checked ------------------------------------
+#
+# #233 asked for two things and #250 shipped the per-reset half: at every reset
+# that ends a job, a local image tag survives only if it carries a registry
+# RepoDigest or its id is in $SLOT_STATE/<idx>/baked-images. What that leaves is
+# the other half. The manifest is written ONCE, by load_baked_images() at boot,
+# and nothing afterwards asks whether the facts it records are still facts. A
+# host that runs for days between reboots is trusting a claim made at boot and
+# never revisited.
+#
+# This is a DETECTOR, not a second enforcement path. The per-reset prune is what
+# protects a job; this only asks, on a timer, whether the inputs that prune
+# depends on still hold:
+#
+#   an id that no longer resolves   the image was deleted out from under the
+#                                   store, so the manifest vouches for nothing
+#                                   and the NAME it used to carry is free for a
+#                                   job to take.
+#   the manifest's own ownership    root:root 0644 in a root-owned directory is
+#                                   the only thing stopping a slot from writing
+#                                   its own ids into it, which would bless
+#                                   exactly the substitution #233 is about.
+#   the per-slot state directory    $SLOT_STATE and $SLOT_STATE/<idx> are the
+#                                   namespace a slot must not own: owning it is
+#                                   owning the `clean` marker and the manifest
+#                                   both, whatever their own modes say.
+#   the daemon's data root          $SLOT_STATE/<idx>/docker belongs to THIS
+#                                   slot's user at 0700. Another slot's user, or
+#                                   a wider mode, is one slot reading or writing
+#                                   another's image store.
+#
+# The failure policy is the per-reset one, for the same reasons. A finding that
+# means the slot can be poisoned withdraws that slot's `clean` marker, which is
+# the claim it must not hold; the next job on it is refused until a reset earns
+# the marker back. A daemon that is simply absent is LOGGED and nothing more —
+# it already fails the next job at its first `docker` line, and taking the
+# marker on top of that turns a slot with no dockerd into a slot that also fails
+# every job for a reason nothing names.
+#
+# A slot that is mid-job has no marker to withdraw, so this needs no interlock
+# with the runner: the removal is a no-op exactly when a job is running, and the
+# reset that ends that job re-runs the prune and re-earns the marker.
+install_baked_image_audit() {
+  cat >/opt/ci/job-hooks/baked-image-audit.sh <<EOF
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as root on a timer. See install_baked_image_audit().
+set -uo pipefail
+
+SLOT_STATE="$SLOT_STATE"
+SLOT_USER_PREFIX="$SLOT_USER_PREFIX"
+SLOTS=$SLOTS
+
+say() { logger -t ci-baked-audit -- "\$*" 2>/dev/null || true; echo "baked-image audit: \$*" >&2; }
+
+# Checked once, not once per slot: it is one directory, and a finding on it is
+# a finding about every slot on the host.
+state_own=\$(stat -c '%U:%G:%a' -- "\$SLOT_STATE" 2>/dev/null || echo missing)
+if [ "\$state_own" != "root:root:755" ]; then
+  say "\$SLOT_STATE is \$state_own, not root:root:755 -- every slot's clean marker and baked-image manifest is forgeable"
+fi
+
+for idx in \$(seq 1 "\$SLOTS"); do
+  u="\$SLOT_USER_PREFIX\$idx"
+  dir="\$SLOT_STATE/\$idx"
+  manifest="\$dir/baked-images"
+  marker="\$dir/clean"
+  droot="\$dir/docker"
+  sock="/run/\$u/docker.sock"
+  poisoned=0
+
+  [ -d "\$dir" ] || continue
+
+  # The state directory ITSELF, before anything inside it. A slot that owns this
+  # can create, rename and replace every name below it, so a manifest reporting
+  # root:root 0644 inside a slot-owned parent is telling the truth about a file
+  # the slot can swap out from under the check.
+  if [ "\$state_own" != "root:root:755" ]; then
+    poisoned=1
+  fi
+  dir_own=\$(stat -c '%U:%G:%a' -- "\$dir" 2>/dev/null || echo missing)
+  if [ "\$dir_own" != "root:root:755" ]; then
+    say "slot \$idx: \$dir is \$dir_own, not root:root:755 -- the slot owns the namespace holding its own clean marker"
+    poisoned=1
+  fi
+
+  # The daemon's data root is the one leaf in here the slot may write, and it
+  # may write only its OWN. \`stat\` follows a symlink, so the link test comes
+  # first or a slot-planted link to a root-owned directory reads as compliant.
+  if [ -L "\$droot" ]; then
+    say "slot \$idx: \$droot is a symlink -- the image store is not where this host thinks it is"
+    poisoned=1
+  elif [ -e "\$droot" ]; then
+    droot_own=\$(stat -c '%U:%G:%a' -- "\$droot" 2>/dev/null || echo missing)
+    if [ "\$droot_own" != "\$u:\$u:700" ]; then
+      say "slot \$idx: \$droot is \$droot_own, not \$u:\$u:700 -- another account can read or write this slot's image store"
+      poisoned=1
+    fi
+  fi
+
+  # A MISSING manifest is not a finding. Most pools bake no images at all, and
+  # the prune reads an absent file as an empty one: with nothing baked, a
+  # registry digest is the only thing that vouches for a tag, which is correct.
+  if [ -L "\$manifest" ]; then
+    say "slot \$idx: \$manifest is a symlink -- the prune is reading a file this host did not write"
+    poisoned=1
+  elif [ -f "\$manifest" ]; then
+    man_own=\$(stat -c '%U:%G:%a' -- "\$manifest" 2>/dev/null || echo missing)
+    if [ "\$man_own" != "root:root:644" ]; then
+      say "slot \$idx: \$manifest is \$man_own, not root:root:644 -- a slot can add its own ids and bless its own images"
+      poisoned=1
+    fi
+
+    if [ -S "\$sock" ]; then
+      ids=\$(grep -v '^[[:space:]]*\$' -- "\$manifest" 2>/dev/null)
+      if [ -n "\$ids" ]; then
+        # One inspect for the whole list rather than one per id: a list with a
+        # dead id still prints every live one, so the SET it returns is the
+        # answer and the non-zero exit is not.
+        #
+        # word-splitting \$ids is the point -- one id per argument.
+        # shellcheck disable=SC2086
+        live=\$(timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+                 docker image inspect --format '{{.Id}}' -- \$ids 2>/dev/null)
+        while IFS= read -r id; do
+          [ -n "\$id" ] || continue
+          # \`grep -c ... >/dev/null\`, never \`grep -q\`: -q exits on the first
+          # match, the in-process \`printf\` dies of EPIPE, and pipefail then
+          # reports a pipeline that FOUND its id as one that did not.
+          printf '%s\n' "\$live" | grep -cxF -- "\$id" >/dev/null && continue
+          say "slot \$idx: the manifest names \$id, which the store no longer has -- it vouches for nothing, and the name it carried is free for a job to take"
+          poisoned=1
+        done <<< "\$ids"
+      fi
+    else
+      say "slot \$idx: no docker socket at \$sock -- the manifest's ids were not checked"
+    fi
+  fi
+
+  # The marker, and only the marker. This detects; the reset enforces. Removing
+  # it is a no-op on a slot that is mid-job -- a running job already cleared it
+  # -- and on an idle one it is exactly the refusal the next job needs.
+  if [ "\$poisoned" = 1 ] && [ -f "\$marker" ]; then
+    if rm -f -- "\$marker"; then
+      say "slot \$idx: clean marker withdrawn -- the next job on this slot is refused until a reset earns it back"
+    else
+      say "slot \$idx: could not withdraw the clean marker -- the slot is poisoned and still claims to be clean"
+    fi
+  fi
+done
+exit 0
+EOF
+  chown root:root /opt/ci/job-hooks/baked-image-audit.sh || return 1
+  chmod 0755 /opt/ci/job-hooks/baked-image-audit.sh || return 1
+
+  cat >/etc/systemd/system/ci-baked-image-audit.service <<'EOF'
+[Unit]
+Description=Re-check each slot's baked-image manifest and the state directory holding it
+
+[Service]
+Type=oneshot
+# A oneshot with no deadline blocks its own timer forever. Every call in here is
+# already bounded -- the only unbounded one would be `docker image inspect`, and
+# it carries its own `timeout` -- so this ceiling is the backstop rather than the
+# control.
+TimeoutStartSec=180
+ExecStart=/opt/ci/job-hooks/baked-image-audit.sh
+EOF
+
+  # Every 15 minutes, not every 30 seconds. The per-reset prune already runs at
+  # every job boundary, which is where a poisoning would actually be exploited;
+  # this covers the span BETWEEN boundaries on a host that has been up for days,
+  # and wants to be cheap enough that nobody turns it off. The first run waits
+  # five minutes so it does not race the boot-time `docker load`, whose manifest
+  # is only moved into place when the load finishes.
+  cat >/etc/systemd/system/ci-baked-image-audit.timer <<'EOF'
+[Unit]
+Description=Re-check the baked-image manifests every 15 minutes
+
+[Timer]
+OnBootSec=300
+OnUnitActiveSec=900
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
+  systemctl enable --now ci-baked-image-audit.timer >>/var/log/ci-host.log 2>&1 || return 1
 }
 
 # --- registry credentials for job containers ----------------------------------
@@ -3069,6 +3370,20 @@ setup_slot_networking() {
   iptables -w -C INPUT -i "$ifc" -p tcp --dport "$BROKER_PORT" -j REJECT 2>/dev/null \
     || iptables -w -I INPUT 1 -i "$ifc" -p tcp --dport "$BROKER_PORT" -j REJECT \
     || return 1
+
+  # The turbo cache listens on every slot gateway for the same reason, and so
+  # also on the VM's own address. It vends no credential, but it does serve one
+  # repository's build artifacts out of a bucket nothing off this host is
+  # entitled to read — and it is added here, next to the broker's rule, so the
+  # question "what does this host expose?" has one answer in one place.
+  #
+  # Unconditional on the port even when the layer is off: nothing listens then,
+  # and a REJECT for a closed port costs nothing, whereas making the rule
+  # conditional makes a host that later enables the layer depend on a reboot
+  # ordering to be safe.
+  iptables -w -C INPUT -i "$ifc" -p tcp --dport "$TURBO_PORT" -j REJECT 2>/dev/null \
+    || iptables -w -I INPUT 1 -i "$ifc" -p tcp --dport "$TURBO_PORT" -j REJECT \
+    || return 1
 }
 
 # Idempotent: a re-run of this script (or a slot restart) must find the
@@ -3585,6 +3900,27 @@ install_slot() {
   # default under the slot's home — slower, and correct.
   local CACHE_ENV; CACHE_ENV=$(cache_env "$idx")
 
+  # What makes the remote build cache seamless: the repository sets nothing, and
+  # a workflow that never heard of this fleet gets cache hits because `turbo`
+  # reads these three variables out of its environment.
+  #
+  # TURBO_API is this slot's GATEWAY address, not 127.0.0.1 — the slot has its
+  # own loopback and nothing listens on it, the same wrinkle the broker has.
+  #
+  # TURBO_TEAM is required by the client even when the server ignores it: turbo
+  # refuses to use a remote cache without a team, and it must be a `team_`-
+  # prefixed slug or the CLI rejects it. The value names the pool, so a cache
+  # line in a build log says which pool served it.
+  #
+  # Empty when the server did not come up, deliberately: a slot pointed at a
+  # dead cache spends a connection refused per task, which is slower than having
+  # no cache and much harder to read in a log.
+  local TURBO_ENV=""
+  if [ -n "$TURBO_TOKEN" ]; then
+    TURBO_ENV=$(printf 'Environment=TURBO_API=http://%s:%s\nEnvironment=TURBO_TOKEN=%s\nEnvironment=TURBO_TEAM=team_%s' \
+      "$(slot_gw_ip "$idx")" "$TURBO_PORT" "$TURBO_TOKEN" "$POOL")
+  fi
+
   # Unconditional, unlike CACHE_ENV: every slot has a share whether or not it
   # has a seeded cache, and a job that cannot read one falls back to `nproc` —
   # which is the over-subscription this exists to end.
@@ -3685,6 +4021,7 @@ NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
 BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 $BROKER_ENV
 $CACHE_ENV
+$TURBO_ENV
 $SHARE_ENV
 # The label a job pins the rest of its workflow run to. Read by the anchor job,
 # which publishes it as the runs-on list for every later job in the run. A slot
@@ -3857,6 +4194,20 @@ main() {
     log "no ci-job-service-account set — jobs on this host get no Google credentials"
   fi
 
+  # After the fence and the namespaces, because the server binds the slot
+  # gateways those created and the REJECT that hides it from the network is
+  # installed there; before install_slot, because that reads TURBO_TOKEN to
+  # decide whether a slot is told the cache exists.
+  #
+  # Fails OPEN, unlike the broker: a missing credential fails a deploy job
+  # outright, whereas a missing build cache only costs the time the fleet was
+  # already spending before this layer existed.
+  if [ -n "$TURBO_BUCKET" ] && [ -n "$TURBO_PREFIX" ]; then
+    start_turbo_cache || log "turbo remote cache did not come up — slots will build without it"
+  else
+    log "no ci-turbo-bucket set — this pool serves no remote build cache"
+  fi
+
   local token
   token=$(registration_token) || die "could not obtain a registration token"
   [ -n "$token" ] || die "registration token was empty"
@@ -3881,6 +4232,14 @@ main() {
   # AFTER the host is announced ready, so a slow image load delays nothing that
   # matters: the agents are registered and already taking work by this point.
   wait_for_image_loads
+
+  # After the loads, because the manifests it re-checks are what those loads
+  # write. Fails OPEN, and deliberately: this is a detector over a control that
+  # already runs at every job boundary, so a host that could not install it is a
+  # host with the protection it always had and none of the reporting. Refusing
+  # to serve over that would cost more than it buys.
+  install_baked_image_audit ||
+    log "could not install the periodic baked-image audit — the per-reset prune still runs, but nothing re-checks the manifests between jobs"
 }
 
 main "$@"

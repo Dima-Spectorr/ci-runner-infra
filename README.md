@@ -372,6 +372,34 @@ that image a real answer is separate work, not a line in this one.
   and the next job on that slot runs it while believing it fetched it — a local
   image by that name is resolved without ever contacting a registry, both by
   `docker run` and by a `FROM` in a later build (#233).
+* **The remote BUILD cache is served by the host, so no repository wires one
+  up.** A dependency cache saves downloading; a build cache saves building, and
+  it dedupes across pull requests where a path filter only helps within one. The
+  host runs a Turborepo remote cache against the project's cache bucket, under
+  `turbo/<owner>/<repo>/`, and hands every slot `TURBO_API`, `TURBO_TOKEN` and
+  `TURBO_TEAM` — a repository adds nothing to its workflows and holds no
+  credential. That is the correction to the fault above rather than a separate
+  feature: IntegrateIT's hand-built cache is what ran cold for weeks behind five
+  warnings a run, and the fix that matters is that there is no longer anything
+  per-repository to get wrong.
+
+  **It is read-only to job code, permanently.** A turbo artifact is a tarball
+  the next build unpacks into its output tree and reports as its own result, so
+  a job that could publish one would hand every later build in that repository
+  its output — the cross-slot channel the per-slot cache copy closes, and the
+  cross-host one the snapshot bucket's read-only grant closes, re-opened with a
+  better delivery mechanism. A host's grant is `roles/storage.objectViewer`
+  conditioned on the repository's prefix; an upload from a job is accepted and
+  discarded, because `turbo` reports a refused upload as a warning per artifact
+  and a log full of those is the exact noise that hid the original fault. What
+  fills the store is the default branch, published by an identity that never
+  runs pull-request code.
+
+  The whole layer fails open — a server that will not start, an unreadable
+  bucket or an oversized artifact is a cache miss and a task that builds
+  normally — and its port is `REJECT`ed on the primary interface, like the
+  credential broker's, because it serves one repository's build output out of a
+  bucket nothing off the host may read.
 * **The metadata fence stops at port 80, and that is deliberate.**
   `169.254.169.254` is two services on one address: the metadata server over
   HTTP on port 80, and the VPC resolver on port 53. A container is handed that
@@ -587,20 +615,25 @@ that image a real answer is separate work, not a line in this one.
   become the starting cache of every later host in the pool: the cross-slot
   channel the per-slot copy closes, re-opened across hosts and across time. A
   fork pull request would need to run once. Publishing belongs to a separate
-  identity, `ci-runner-cache-publisher`: no key, attached to no VM, held only by
-  a run of one named workflow file, in one named repository, on the default ref —
-  all three in one claim, because a pool is shared across repositories and a
-  `pull_request_target` run asserts the default branch while running fork code. It
-  may create objects
+  identity, and to a separate module: `ci-runner-cache-warmer`, a Cloud Build in
+  the project that owns the bucket, fired nightly by Cloud Scheduler against the
+  default branch. It has no key and is attached to no VM. It may create objects
   under its pool's prefix and may not overwrite them — no `storage.objects.delete`
   means "snapshots are written once" is enforced by IAM rather than trusted — and
   may replace exactly one object, the pointer. What it runs is
-  `scripts/ci/publish-cache-snapshot.sh`, from a scheduled workflow in the
-  consuming repository (`docs/publishing-a-cache-snapshot.md`): dependencies
-  installed from the default branch into an empty tree, scanned with the host's
-  own rules, packed and uploaded under a name never reused. A pool whose
-  repository has not added that workflow finds nothing and runs on the baked
-  cache.
+  `scripts/ci/publish-cache-snapshot.sh`, the same script by the same rules:
+  dependencies installed from the default branch into an empty tree, scanned with
+  the host's own rules, packed and uploaded under a name never reused. **The
+  consuming repository adds nothing** — no workflow, no federation, no schedule —
+  which is the difference from `ci-runner-cache-publisher`, the workload-identity
+  path this supersedes and which remains for a build that cannot run in Cloud
+  Build. A pool whose project has not added the warmer finds nothing and runs on
+  the baked cache.
+
+  The same run publishes the **build** cache, under `turbo/<owner>/<repo>/`, so
+  the two halves of `4.4` are filled by one job. Turbo's local `<hash>.tar.zst`
+  is the remote artifact byte for byte, so that publish is an object copy — the
+  host-side cache server still has no write path in it at all.
 
   What arrives is inspected before any of it is trusted: it is unpacked into a
   staging tree outside the master, scanned by the same check the image build runs
@@ -720,6 +753,8 @@ seeding it is an act of review rather than a formality.
 modules/ci-runner-network/       the per-project firewall posture (no NAT),
                                  and the log of where the pool connects out to
 modules/ci-runner-cache-bucket/  where a pool's cache lives between hosts
+modules/ci-runner-cache-warmer/  the only identity that WRITES either cache:
+                                 a nightly build of the default branch
 modules/ci-runner-apply-trigger/ the unattended apply, as the project's OWN Cloud Build
 modules/ci-host-image-trigger/   the golden image, rebuilt by a merge instead of by hand
 modules/ci-runner-host-pool/     the module consumers reference
@@ -750,6 +785,8 @@ docs/egress-baselines/           that baseline, one file per project
 docs/ci-workflow-gates.md        those gates: rules, flags, how to adopt
 docs/ci-lane-model.md            the lane contract consumers adopt
 docs/ci-pr-shared-infra.md       one host per workflow run, one infra stack
+docs/examples/pr-shared-infra.yml  that contract as one workflow — the file a
+                                 consumer copies, gate-checked on every run here
 docs/adr-pr-host-affinity.md     the decision behind that contract
 docs/ci-merge-queue-baseline.md  one CI run per PR: the queue config + gate
 docs/ci-optimization-catalog.md  the fleet audit behind that contract
