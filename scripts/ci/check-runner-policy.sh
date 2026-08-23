@@ -1087,14 +1087,14 @@ EOF
           # A file nothing calls has no incoming edges and counts once, exactly
           # as before; so does every file when `check_file` is driven directly,
           # without a reachability pass in front of it.
-          local abs_self si_edges ctarget cfile cjob2
+          local abs_self si_edges cfile cjob2
           abs_self="$(abs_path "$file")"
           si_edges="$(awk -v self="$abs_self" -F'\t' '$1 == self' <<EOF
 $CALL_EDGES
 EOF
 )"
           if [ -n "$si_edges" ]; then
-            while IFS=$'\t' read -r ctarget cfile cjob2; do
+            while IFS=$'\t' read -r _ cfile cjob2; do
               [ -n "${cjob2:-}" ] || continue
               SHARED_INFRA_OWNERS="${SHARED_INFRA_OWNERS}${rel}: job '${job}' (called from ${cfile#"$REPO_ROOT"/} job '${cjob2}')"$'
 '
