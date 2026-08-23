@@ -66,6 +66,14 @@ INSTALL_ID=$(md "instance/attributes/ci-app-installation-id")
 KEY_SECRET=$(md "instance/attributes/ci-app-key-secret")
 POLL=$(md "instance/attributes/ci-poll-seconds")
 METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
+# The branch the merge queue admits. Read here rather than assumed, because the
+# parking sweep compares every open pull request's base against it and a wrong
+# value would report the whole repository as parked. Defaulted in the shell and
+# not only in Terraform: a controller rendered before this key existed has no
+# such attribute, and `md` returns the empty string for one that is absent —
+# which would make every base comparison unequal.
+QUEUE_BASE=$(md "instance/attributes/ci-queue-base")
+: "${QUEUE_BASE:=main}"
 
 # --- the pool table ----------------------------------------------------------
 #
@@ -935,6 +943,136 @@ queue_outcome_series() {
     wf="${key#"$POOL|"}"
     queue_series "ci_job_seconds" "${OUTCOME_SECONDS[$key]}" "\"workflow\":\"$wf\""
   done
+}
+
+# --- parked pull requests ------------------------------------------------------
+#
+# The one sweep in this file that is not about capacity. parked-decision.sh
+# carries the rule and the reasoning; this is the I/O around it.
+#
+# COST. The list call is unconditional and costs one request per interval. The
+# per-pull-request check counts are paid ONLY for pull requests that already
+# fail an entry condition, because parked_verdict's first branch is decidable
+# from the list payload alone — so a repository whose pull requests all target
+# the queue's branch and none of which are drafts pays exactly one call, and a
+# repository with a wall of stale drafts pays a bounded number.
+#
+# PERMISSION. `commits/<sha>/check-runs` needs the installation to hold
+# `checks: read`. It is the only endpoint in this file that does, so an
+# installation granted the older permission set will fail every one of these
+# calls and nothing else. That is logged by name rather than counted silently:
+# the failure mode of this whole feature is being quietly inert, which is what
+# it was built to fix.
+PARKED_BUDGET=20
+# Seconds between sweeps. Nothing scales or drains on this, and an entry
+# condition changes on the timescale of a human editing a pull request, so it
+# rides the same 300s the outcome sweep uses rather than the poll interval.
+PARKED_INTERVAL=300
+PARKED_LAST_SWEEP=0
+# A ceiling on top of the budget. The budget bounds the TIME; this bounds the
+# calls, so a repository with sixty open drafts cannot spend a whole tick's
+# worth of installation rate limit on a question nothing waits on.
+PARKED_MAX_CANDIDATES=20
+PARKED_SKIPPED=0
+# Every reason parked_verdict can return, keyed here so the series can be
+# published as a zero. A metric that only appears when something is wrong is
+# indistinguishable from a controller that stopped publishing — the same
+# argument as ci_runner_list_blind_ticks, and the reason the list is closed.
+PARKED_REASONS=(draft base draft-and-base)
+declare -A PARKED_COUNT=()
+
+collect_parked() {
+  local sweep_start
+  sweep_start=$(date +%s)
+
+  # Not this tick's turn. Counters are deliberately NOT reset here: they keep
+  # reporting what the last real sweep found, rather than flickering to 0 on
+  # every tick in between and hiding a pull request that has been parked for a
+  # week.
+  [ $((sweep_start - PARKED_LAST_SWEEP)) -ge "$PARKED_INTERVAL" ] || return 0
+  PARKED_LAST_SWEEP=$sweep_start
+
+  local r
+  for r in "${PARKED_REASONS[@]}"; do PARKED_COUNT["$r"]=0; done
+  PARKED_SKIPPED=0
+
+  local deadline=$((sweep_start + PARKED_BUDGET))
+
+  local pulls rows
+  pulls=$(gh_api "repos/$REPO_FULL/pulls?state=open&per_page=50") || {
+    log "parked sweep: cannot list open pull requests (status=$(cat "$STATE_DIR/api.status" 2>/dev/null))"
+    return 0
+  }
+
+  # The free half of the rule, applied before anything is fetched. `.draft` is
+  # present on every entry of the list payload and `.base.ref` likewise, so a
+  # pull request that satisfies both entry conditions is dropped for nothing.
+  rows=$(printf '%s' "$pulls" | jq -r --arg qb "$QUEUE_BASE" '
+    .[]?
+    | select((.draft == true) or ((.base.ref // "") != $qb))
+    | [ (.number | tostring),
+        (if .draft then "1" else "0" end),
+        (.base.ref // ""),
+        (.head.sha // "") ] | @tsv' 2>/dev/null)
+  [ -n "$rows" ] || return 0
+
+  local num draft base sha checks counts total failed pending verdict reason
+  local examined=0
+  while IFS=$'\t' read -r num draft base sha; do
+    [ -n "$num" ] || continue
+    [ -n "$sha" ] || continue
+
+    if [ "$examined" -ge "$PARKED_MAX_CANDIDATES" ] \
+      || ! budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME"; then
+      PARKED_SKIPPED=$((PARKED_SKIPPED + 1))
+      continue
+    fi
+    examined=$((examined + 1))
+
+    checks=$(gh_api "repos/$REPO_FULL/commits/$sha/check-runs?per_page=100") || {
+      PARKED_SKIPPED=$((PARKED_SKIPPED + 1))
+      log "parked sweep: cannot read check runs for #$num (status=$(cat "$STATE_DIR/api.status" 2>/dev/null)) — a 403 here means the App installation lacks 'checks: read' and this sweep can never report anything"
+      continue
+    }
+
+    # `neutral` and `skipped` are deliberately absent from the failure list.
+    # GitHub does not treat either as blocking and neither does the queue, so
+    # counting them would read a path-filtered monorepo as permanently red and
+    # this rule would never fire on the repositories that need it most.
+    counts=$(printf '%s' "$checks" | jq -r '
+      [ .check_runs[]? ] as $c
+      | [ ($c | length),
+          ($c | map(select(.status == "completed")
+                    | (.conclusion // ""))
+              | map(select(. == "failure" or . == "cancelled"
+                        or . == "timed_out" or . == "action_required"))
+              | length),
+          ($c | map(select(.status != "completed")) | length)
+        ] | @tsv' 2>/dev/null)
+    IFS=$'\t' read -r total failed pending <<<"$counts"
+
+    # The empty string is passed through rather than defaulted to a number: an
+    # unparseable count must reach parked_verdict as unparseable, which it
+    # answers with silence. Defaulting to 0 here would turn a jq failure into
+    # "green, no checks failed" and manufacture the alert.
+    verdict=$(parked_verdict "$draft" "$base" "$QUEUE_BASE" \
+      "${total:-}" "${failed:-}" "${pending:-}")
+
+    case "$verdict" in
+      parked:*)
+        reason="${verdict#parked:}"
+        reason="${reason%% *}"
+        PARKED_COUNT["$reason"]=$((${PARKED_COUNT["$reason"]:-0} + 1))
+        # Logged with the number, because the metric can only say how many. The
+        # operator reading an alert needs to know WHICH pull request, and this
+        # is the only place that says so.
+        log "pull request #$num is green and cannot enter the merge queue ($verdict) — no check reports this as a failure"
+        ;;
+    esac
+  done <<<"$rows"
+
+  [ "$PARKED_SKIPPED" -gt 0 ] && log "parked sweep: $PARKED_SKIPPED pull request(s) not examined this sweep (budget ${PARKED_BUDGET}s, ceiling $PARKED_MAX_CANDIDATES) — retried next sweep, not lost"
+  return 0
 }
 
 # --- hosts -------------------------------------------------------------------
@@ -2276,6 +2414,13 @@ tick() {
   # ticks it returns immediately.
   collect_outcomes
 
+  # Same placement, same reasoning, as the outcome sweep: repository-wide, on
+  # its own interval, and nothing in the pool loop waits on what it finds. It is
+  # the only thing this controller does that is not about capacity at all — see
+  # parked-decision.sh for why a fleet control plane is nonetheless the right
+  # place for it.
+  collect_parked
+
   local p
   for p in "${POOLS[@]}"; do
     pool_select "$p"
@@ -2675,6 +2820,26 @@ queue_controller_series() {
   # ci_jobs_completed readable as "no jobs finished" rather than "the outcome
   # sweep never got to them".
   queue_series "ci_outcome_runs_skipped" "$OUTCOME_RUNS_SKIPPED"
+
+  # Pull requests that are green and can never enter the merge queue. A
+  # REPOSITORY fact published under every pool's label, exactly like the
+  # heartbeat above and for the same reason — a pool whose series merely stop
+  # reads as an idle pool. Read it with max() across pools, never sum(): four
+  # pools publishing the same repository's count would otherwise report four
+  # times the parked pull requests.
+  #
+  # Every reason is published every tick, 0 included. A series that appears only
+  # when something is parked cannot be told apart from a sweep that never ran,
+  # and "the sweep never ran" is precisely the state this whole feature exists
+  # to stop being invisible.
+  local r
+  for r in "${PARKED_REASONS[@]}"; do
+    queue_series "ci_prs_green_and_unqueued" "${PARKED_COUNT[$r]:-0}" "\"reason\":\"$r\""
+  done
+  # What makes the zero above readable. Non-zero means the sweep ran out of
+  # budget or hit its ceiling, so the count is a lower bound rather than an
+  # answer — the same contract as ci_demand_runs_skipped.
+  queue_series "ci_parked_prs_skipped" "$PARKED_SKIPPED"
 }
 
 # --- install / run -----------------------------------------------------------
