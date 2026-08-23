@@ -1147,8 +1147,18 @@ collect_parked() {
   local pulls rows status
   pulls=$(gh_api "repos/$REPO_FULL/pulls?state=open&per_page=50") || {
     status=$(cat "$STATE_DIR/api.status" 2>/dev/null)
-    parked_denial "$status" && PARKED_DENIED=$((PARKED_DENIED + 1))
-    log "parked sweep: cannot list open pull requests (status=$status)"
+    # The word DENIED is load-bearing: the alert's runbook tells the operator to
+    # grep for it, so a path that raises ci_parked_sweep_denied without printing
+    # it sends somebody to a log that has nothing to say. This path is refused
+    # for a DIFFERENT permission than the check-runs one — listing pull requests
+    # needs `pull_requests: read` — and the message says so, because the fix
+    # differs and the counter cannot carry that distinction on its own.
+    if parked_denial "$status"; then
+      PARKED_DENIED=$((PARKED_DENIED + 1))
+      log "parked sweep: DENIED listing open pull requests (status=$status) — this call needs 'pull_requests: read', not the 'checks: read' the per-pull-request call needs"
+    else
+      log "parked sweep: cannot list open pull requests (status=$status)"
+    fi
     return 0
   }
 
