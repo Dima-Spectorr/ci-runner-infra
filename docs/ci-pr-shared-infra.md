@@ -498,7 +498,7 @@ surprise.
    alone and confirm the pull request still runs when the pool is cold.
 4. Move `services:` into `ci/compose.yaml` and make the anchor the owner.
 5. Point the Windows job at the outputs.
-6. Turn the gate on: add `--allow-dynamic-runner --pr-affinity` to the
+6. Turn the gate on: add `--allow-dynamic-runner --shared-infra` to the
    `check-runner-policy.sh` invocation.
 
 Step 6 last, deliberately. The rules are opt-in by flag so that a repository
