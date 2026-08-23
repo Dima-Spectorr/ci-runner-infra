@@ -1103,7 +1103,11 @@ hf() { # <runners-json> <slots> <host>
   (
     set -uo pipefail
     eval "$(fn host_facts)"
+    # Read by host_facts, which arrived through the eval above — no static
+    # reader can see that, so both names look dead here and neither is.
+    # shellcheck disable=SC2034
     RUNNERS_JSON="$1"
+    # shellcheck disable=SC2034
     SLOTS="$2"
     HOST_BUSY=0
     HOST_PRESENT=0
@@ -1149,8 +1153,9 @@ check "slots: a blind tick reports -1, which the sum skips entirely" \
 # a host that is not RUNNING is arriving or leaving, and a blind tick knows
 # nothing — each has to be excluded, or the gap is non-zero on every scale event
 # and the alert built on it is turned off within a week.
-# shellcheck disable=SC2016
 _guards=$(sed -n '/SLOTS THAT ANSWER/,/^    fi$/p' "$CTRL")
+# The needles are the controller's text, so they must NOT expand here.
+# shellcheck disable=SC2016
 for needle in '"$HOST_PRESENT" -ge 0' '"$status" = "RUNNING"' '"$age" -ge "$REGISTER_GRACE"'; do
   case "$_guards" in
     *"$needle"*) r=yes ;;
