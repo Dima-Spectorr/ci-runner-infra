@@ -18,12 +18,12 @@ Next to the pool, once per repository:
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=vX.Y.Z"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.35.0"
 
   project_id   = var.project_id
   region       = var.region
   pool_name    = "ci-runner-host-myrepo"      # the SAME name the pool has
-  account_id   = "ci-runner-myrepo"           # `-warm` is appended
+  account_id   = "ci-runner-myrepo"           # `-warm` and `-fire` are appended
   cache_bucket = module.ci_cache.bucket_name
   github_owner = "my-org"
   github_repo  = "myrepo"
