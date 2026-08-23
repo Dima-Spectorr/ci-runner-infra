@@ -60,6 +60,11 @@ locals {
     # that is. A shared controller serving four pools sweeps one repository, so
     # it asks this question once and publishes the answer under every pool.
     file("${local.pool_scripts}/parked-decision.sh"),
+    # Its complement, and likewise repository-wide: the parking rule reports a
+    # queue that will never admit a pull request, this one recovers a queue that
+    # admitted it and stopped. Asked once per repository, published under every
+    # pool. The only rule in this list whose verdict WRITES to GitHub.
+    file("${local.pool_scripts}/queue-stall-decision.sh"),
     file("${local.pool_scripts}/telemetry.sh"),
     file("${local.pool_scripts}/watchdog-decision.sh"),
     # Same list, same order, same reason as the pool module's copy: the ceiling
@@ -161,6 +166,15 @@ resource "google_compute_instance_template" "controller" {
     # The queue's branch, so the parking sweep can tell a pull request that will
     # never be admitted from one that is simply waiting its turn.
     "ci-queue-base" = var.queue_base_branch
+
+    # And the stall sweep's two thresholds. Metadata rather than baked into the
+    # script for the usual reason — the controller is one binary and these are
+    # the per-deployment facts — but note the second one doubles as the switch:
+    # zero attempts makes the sweep observe and publish and never comment, which
+    # is what a fleet gets before its App installation accepts `pull requests:
+    # write`.
+    "ci-queue-stall-after-seconds" = tostring(var.queue_stall_after_seconds)
+    "ci-queue-stall-max-attempts"  = tostring(var.queue_stall_max_attempts)
 
     # The table. Present, so the controller does NOT fall back to synthesising a
     # one-row table from the single-pool keys — which is exactly what it would

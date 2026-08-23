@@ -598,9 +598,24 @@ The commit that introduces the route cannot be merged *through* the queue:
 Mergify's speculative draft of that very commit runs under the new routing and
 asks for a label no runner carries yet.
 
-### One extra App permission
+### Every required workflow must route through the lane — including the small ones
 
-The controller now needs **`Contents: read`** on the GitHub App, to read
+The pool only helps if the queue's draft actually lands on it, and the way this
+goes wrong is a workflow nobody thinks of as a CI workflow. A required
+`pull_request` job that hardcodes `runs-on: [self-hosted, linux, gcp, <repo>]`
+runs on the queue draft too, on the **CI** pool, where it competes with every
+ordinary pull request in the repository.
+
+Measured on one consumer's `generic-binary-check`: created 17:04:46, started
+17:35:52 — **31 minutes queued for a 65-second job**, with the merge-queue pool
+sitting idle the whole time. Every required workflow takes
+`runs-on: ${{ fromJSON(needs.lane.outputs.runner) }}`, and every one of them
+takes a `timeout-minutes` tight enough that starvation fails loudly rather than
+waiting. Audit the whole `required` list, not just the big one.
+
+### Two extra App permissions
+
+The controller needs **`Contents: read`** on the GitHub App, to read
 `.mergify.yml`. Without it the read is a 403 and the merge-queue pool silently
 keeps its Terraform `max_hosts` instead of a derived ceiling — it fails open, so
 nothing breaks and nothing says so. The one signal is
@@ -612,6 +627,20 @@ owner adds the permission, and then **every installation owner has to accept
 it**. Both steps, who can perform each, and how to verify from the controller
 rather than from a settings page:
 [`github-app-permissions.md`](github-app-permissions.md).
+
+It also needs **`Pull requests: read & write`**. The read half has always been
+required; the write half is what lets the controller recover a queue that has
+stalled — a pull request that is open, green and going nowhere because Mergify
+dequeued it on a runner failure, or stopped evaluating it. That state is
+invisible on every surface that reports anything, it cost two pull requests 17
+and 18 hours on one repository, and the fix is a comment the fleet can now post
+itself. It buys one endpoint and cannot merge, push or edit code. The failure
+class, the three shapes it takes and the by-hand remedy:
+[`merge-queue-stall-recovery.md`](merge-queue-stall-recovery.md).
+
+Until the installation accepts the write, the sweep runs and publishes
+`ci_queue_stall_sweep_denied` instead of acting — so a fleet that never grants it
+is not broken, just back to needing a human to notice.
 
 ## 9. Wire the Mergify nudge
 
@@ -887,6 +916,9 @@ it as a broken image.
 | a Windows host boots, looks healthy, registers nothing | the image family. A Windows instance carrying the Linux boot key runs no boot script at all; the module refuses the mispairing at plan time, so check the `image` a running pool was applied with |
 | a build fails on a different download each run | container MTU. The hosts set the slot daemon's `mtu` from the primary interface, so this should not recur; a fork that dropped it black-holes large TLS responses and reports them as a truncated handshake or a "not found" dependency, never as a size error |
 | `go clean -modcache` or `uv cache clean` fails with `EACCES` | the warm cache, working as designed — see "Cleaning a warm cache" below |
+| a pull request is green, mergeable, and has not merged for hours | the merge queue stalled, not CI. Mergify dequeued it on a runner failure, or stopped evaluating it — three shapes, two remedies, one of them a comment the controller now posts itself: [`merge-queue-stall-recovery.md`](merge-queue-stall-recovery.md) |
+| the queue crawls while the merge-queue pool sits idle | a required workflow hardcoding the CI pool's labels, so the queue draft starves behind ordinary pull requests. Audit every required `pull_request` workflow for `runs-on`, not just the main one |
+| `ci_queue_nudges` flat at zero on a repository whose queue visibly stalls | `Pull requests: write` missing or pending acceptance — check `ci_queue_stall_sweep_denied`, then the installation page |
 
 ### Cleaning a warm cache
 

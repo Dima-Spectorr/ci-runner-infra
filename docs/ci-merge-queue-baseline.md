@@ -1154,6 +1154,39 @@ moves for either tells the reader neither. The alert key is `parkeddenied`, at
 30 minutes: one refused sweep during a GitHub incident is not a page, five in a
 row is.
 
+### Its complement: the queue that admitted the pull request and stopped
+
+The detector above answers "the queue will never take this". The far more
+expensive case is the opposite — the queue took it, or would, and then nothing
+moved. Two pull requests on one consumer repository took **17h11m** and
+**18h00m** to merge on 2026-08-22..23 while green the whole time, and the fleet
+now clears that state itself rather than waiting for somebody to wonder.
+
+Three shapes, all of them invisible from the pull request page: Mergify
+**dequeued** it terminally because the speculative draft's CI failed — 87 of 122
+queue-draft runs on that repository failed, almost all at `Set up runner`,
+`Initialize containers` or `Complete runner`, i.e. the fleet and not the diff;
+Mergify **held** the entry and never noticed the last check go green; or it
+**never entered** the queue at all. The first and third want `@mergifyio queue`,
+the second `@mergifyio refresh`.
+
+The rule is `modules/ci-runner-host-pool/scripts/queue-stall-decision.sh` (43
+self-test cases) and it is the only decision rule in this fleet whose verdict
+**writes**: it posts the comment. Two invariants bound it — never nudge a pull
+request that is not finished and green, and never auto-requeue a failure that
+was the diff rather than the machine (a failure inside 90 seconds, or a
+cancellation with zero steps run) — with a three-nudge-per-head-sha ceiling as
+the backstop for the second being drawn wrong. It publishes `ci_queue_nudges`
+(by kind), `ci_queue_stalls_unresolved`, `ci_queue_stall_attempts_exhausted`,
+`ci_queue_stall_prs_skipped` and `ci_queue_stall_sweep_denied`, alert keys
+`queuestuck` and `queuestalldenied`, and it needs **`pull requests: write`** —
+which buys one comment endpoint and cannot merge anything.
+
+Full account, including the by-hand runbook and the separate routing cause
+(a required workflow hardcoding the CI pool's labels, measured at 31 minutes
+queued for a 65-second job):
+[merge-queue-stall-recovery.md](merge-queue-stall-recovery.md).
+
 ---
 
 ## The other invisible wait: CI is green and Mergify has not heard about it

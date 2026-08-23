@@ -75,6 +75,18 @@ METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 QUEUE_BASE=$(md "instance/attributes/ci-queue-base")
 : "${QUEUE_BASE:=main}"
 
+# How long a pull request may sit finished, green and unmerged before the stall
+# sweep treats the queue as stuck rather than busy, and how many nudges one head
+# sha may earn. Both defaulted in the shell for the same reason QUEUE_BASE is:
+# a controller rendered before these keys existed has no such attribute, and the
+# absent value must land on the behaviour we want rather than on 0 — which for
+# the attempt ceiling would silently disable the whole feature on exactly the
+# fleet that has not been re-applied yet.
+QUEUE_STALL_AFTER=$(md "instance/attributes/ci-queue-stall-after-seconds")
+case "$QUEUE_STALL_AFTER" in '' | *[!0-9]*) QUEUE_STALL_AFTER=600 ;; esac
+QUEUE_STALL_MAX_ATTEMPTS=$(md "instance/attributes/ci-queue-stall-max-attempts")
+case "$QUEUE_STALL_MAX_ATTEMPTS" in '' | *[!0-9]*) QUEUE_STALL_MAX_ATTEMPTS=3 ;; esac
+
 # Empty unless the root turned autohealing on. NO DEFAULT, deliberately — the
 # other way round from QUEUE_BASE above. An absent attribute must mean "do not
 # listen": this is the machine holding the App installation token, and a
@@ -477,6 +489,36 @@ gh_api() {
   printf '%s' "$status" >"$STATE_DIR/api.status"
   case "$status" in
     2*) cat "$STATE_DIR/api.body"; return 0 ;;
+  esac
+  return 1
+}
+
+# The ONE call in this controller that writes anything to GitHub, and it writes
+# exactly one kind of thing: a comment on a pull request whose whole content is
+# a Mergify command. Kept as its own function rather than a flag on gh_api so
+# that "what can this control plane change in a repository" is answerable by
+# reading one name — grep for gh_api_post and the answer is this call site and
+# no other.
+#
+# It needs `pull_requests: write` on the installation, which is the one
+# permission in the set that is not read-only. What that buys and what it
+# deliberately does not (it cannot merge, cannot push, cannot approve) is in
+# docs/github-app-permissions.md; what it is FOR is in
+# docs/merge-queue-stall-recovery.md.
+gh_api_post() {
+  local path="$1" body="$2"
+  local tok status
+  tok=$(gh_token) || { printf 'no-token' >"$STATE_DIR/api.status"; return 1; }
+  status=$(curl "${CURL_TIMEOUTS[@]}" -sS -o "$STATE_DIR/api.body" -w '%{http_code}' \
+    -X POST \
+    -H "Authorization: Bearer $tok" \
+    -H "Accept: application/vnd.github+json" \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    "https://api.github.com/$path" 2>>"$LOG") || status="000"
+  printf '%s' "$status" >"$STATE_DIR/api.status"
+  case "$status" in
+    2*) return 0 ;;
   esac
   return 1
 }
@@ -1239,6 +1281,289 @@ collect_parked() {
   done <<<"$rows"
 
   [ "$PARKED_SKIPPED" -gt 0 ] && log "parked sweep: $PARKED_SKIPPED pull request(s) not examined this sweep (budget ${PARKED_BUDGET}s, ceiling $PARKED_MAX_CANDIDATES) — retried next sweep, not lost"
+  return 0
+}
+
+# --- stalled merge queue -------------------------------------------------------
+#
+# The acting half. queue-stall-decision.sh carries both rules and all of the
+# reasoning; this is the I/O, the attempt bookkeeping and the one write.
+#
+# COST. One list call per sweep, shared with nothing. Per-pull-request check
+# counts are paid only for ADMISSIBLE pull requests — the exact complement of
+# the parked sweep above, which pays for the inadmissible ones — so between them
+# the two sweeps read every open pull request's checks at most once. The
+# infrastructure classification costs one further call per pull request the rule
+# is already willing to nudge, which on a healthy repository is zero.
+QUEUE_STALL_BUDGET=25
+QUEUE_STALL_INTERVAL=300
+QUEUE_STALL_LAST_SWEEP=0
+QUEUE_STALL_MAX_CANDIDATES=20
+QUEUE_STALL_SKIPPED=0
+QUEUE_STALL_DENIED=0
+# Nudges actually posted this sweep, by kind, and the pull requests that wanted
+# one and could not have it. All four are published every tick, zero included —
+# the same closed-list argument as PARKED_REASONS.
+declare -A QUEUE_STALL_ACTED=([refresh]=0 [queue]=0)
+QUEUE_STALL_STUCK=0
+QUEUE_STALL_EXHAUSTED=0
+
+# Attempts are per HEAD SHA, on disk, one file per sha. A new commit is a new
+# sha and therefore a fresh budget, which is the behaviour you want: the author
+# changed something, so the previous three attempts say nothing about this one.
+# The directory is pruned to the shas still open on every sweep, so it cannot
+# grow without bound on a busy repository.
+stall_attempts_dir() { printf '%s/queue-stall' "$STATE_DIR"; }
+
+stall_attempts_get() {
+  local n
+  n=$(cat "$(stall_attempts_dir)/$1" 2>/dev/null)
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s' "$n"
+}
+
+stall_attempts_bump() {
+  local dir
+  dir=$(stall_attempts_dir)
+  mkdir -p "$dir"
+  printf '%s' "$(($(stall_attempts_get "$1") + 1))" >"$dir/$1"
+}
+
+# The queue draft for pull request N, and whether the way it died was the fleet.
+#
+# Mergify names its speculative draft's workflow run after the pull requests it
+# carries — "merge queue: checking main (abc1234) and #11025 together" — which
+# is the only link back from a closed throwaway branch to the pull request that
+# is still sitting there green. `runs` is fetched once per sweep and read by
+# every candidate.
+#
+# Echoes "infra" or "real". A pull request with no queue run at all is "infra":
+# it was never dequeued by a failure, so there is no diff to blame, and the
+# state is the never-entered-the-queue one from case 3.
+stall_dequeue_kind() {
+  local num="$1" runs="$2" deadline="$3"
+  local run_id conclusion jobs sig
+
+  run_id=$(printf '%s' "$runs" | jq -r --arg pat "#$num " '
+    [ .workflow_runs[]?
+      | select((.head_branch // "") | startswith("mergify/merge-queue/"))
+      | select(((.display_title // "") + " ") | contains($pat))
+      | select(.status == "completed")
+      | select((.conclusion // "") != "success") ]
+    | sort_by(.updated_at) | last | (.id // "") | tostring' 2>/dev/null)
+  [ -n "$run_id" ] && [ "$run_id" != "null" ] || { printf 'infra'; return 0; }
+
+  budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME" || {
+    # Out of budget is NOT a verdict. Say "real" — the conservative answer,
+    # which spends nothing — and let the next sweep decide with data.
+    printf 'real'
+    return 0
+  }
+
+  jobs=$(gh_api "repos/$REPO_FULL/actions/runs/$run_id/jobs?per_page=100") || {
+    printf 'real'
+    return 0
+  }
+
+  # The worst verdict wins: one job that failed the way a build fails makes the
+  # whole run real, however many slots also died around it.
+  sig=$(printf '%s' "$jobs" | jq -r '
+    [ .jobs[]?
+      | select(.status == "completed")
+      | select((.conclusion // "") != "success" and (.conclusion // "") != "skipped")
+      | { c: (.conclusion // ""),
+          e: (if (.started_at // "") != "" and (.completed_at // "") != ""
+              then ((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601))
+              else "" end),
+          s: ([ .steps[]? | select(.status == "completed") ] | length) } ]
+    | .[] | [ .c, (.e | tostring), (.s | tostring) ] | @tsv' 2>/dev/null)
+  [ -n "$sig" ] || { printf 'real'; return 0; }
+
+  # Spelled out rather than `c e s`, and not merely for readability: the scope
+  # gate in controller-scope.selftest.sh treats every `local` name in the file
+  # as owned by exactly one function, and a one-letter local makes every jq
+  # program in the file that happens to bind `$c` look like a cross-function
+  # read. A single-letter local here reddens collect_parked.
+  local concl elapsed steps
+  while IFS=$'\t' read -r concl elapsed steps; do
+    [ -n "$concl" ] || continue
+    infra_dequeue "$concl" "$elapsed" "$steps" || { printf 'real'; return 0; }
+  done <<<"$sig"
+  printf 'infra'
+  return 0
+}
+
+collect_queue_stalls() {
+  local sweep_start
+  sweep_start=$(date +%s)
+  [ $((sweep_start - QUEUE_STALL_LAST_SWEEP)) -ge "$QUEUE_STALL_INTERVAL" ] || return 0
+  QUEUE_STALL_LAST_SWEEP=$sweep_start
+
+  local k
+  for k in refresh queue; do QUEUE_STALL_ACTED["$k"]=0; done
+  QUEUE_STALL_SKIPPED=0
+  QUEUE_STALL_DENIED=0
+  QUEUE_STALL_STUCK=0
+  QUEUE_STALL_EXHAUSTED=0
+
+  local deadline=$((sweep_start + QUEUE_STALL_BUDGET))
+
+  local pulls rows status
+  pulls=$(gh_api "repos/$REPO_FULL/pulls?state=open&per_page=50") || {
+    status=$(cat "$STATE_DIR/api.status" 2>/dev/null)
+    if parked_denial "$status"; then
+      QUEUE_STALL_DENIED=$((QUEUE_STALL_DENIED + 1))
+      log "queue stall sweep: DENIED listing open pull requests (status=$status) — this call needs 'pull_requests: read'"
+    else
+      log "queue stall sweep: cannot list open pull requests (status=$status)"
+    fi
+    return 0
+  }
+
+  # The complement of the parked sweep: admissible pull requests only. Both
+  # conditions come out of the list payload, so an inadmissible one is dropped
+  # here for nothing and is reported next door instead.
+  rows=$(printf '%s' "$pulls" | jq -r --arg qb "$QUEUE_BASE" '
+    .[]?
+    | select(.draft != true)
+    | select((.base.ref // "") == $qb)
+    | [ (.number | tostring), (.base.ref // ""), (.head.sha // "") ] | @tsv' 2>/dev/null)
+
+  # Prune the attempt ledger to the shas still open BEFORE returning on an empty
+  # candidate list, or a repository that merges everything never prunes at all.
+  local dir
+  dir=$(stall_attempts_dir)
+  if [ -d "$dir" ]; then
+    local open_shas f
+    open_shas=$(printf '%s\n' "$rows" | cut -f3)
+    for f in "$dir"/*; do
+      [ -e "$f" ] || continue
+      printf '%s\n' "$open_shas" | grep -qxF "$(basename "$f")" || rm -f "$f"
+    done
+  fi
+  [ -n "$rows" ] || return 0
+
+  # Fetched once, read by every candidate that turns out to have been dequeued.
+  # Failure is not fatal to the sweep: stall_dequeue_kind reads an empty list as
+  # "no queue run", which is the never-entered case and the one that most wants
+  # a nudge.
+  local runs
+  runs=$(gh_api "repos/$REPO_FULL/actions/runs?per_page=100") || runs='{}'
+
+  local num base sha checks counts total failed pending mq_state newest now idle
+  local verdict attempts kind body cmd examined=0
+  while IFS=$'\t' read -r num base sha; do
+    [ -n "$num" ] || continue
+    [ -n "$sha" ] || continue
+
+    if [ "$examined" -ge "$QUEUE_STALL_MAX_CANDIDATES" ] \
+      || ! budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME"; then
+      QUEUE_STALL_SKIPPED=$((QUEUE_STALL_SKIPPED + 1))
+      continue
+    fi
+    examined=$((examined + 1))
+
+    checks=$(gh_api "repos/$REPO_FULL/commits/$sha/check-runs?per_page=100") || {
+      status=$(cat "$STATE_DIR/api.status" 2>/dev/null)
+      if parked_denial "$status"; then
+        QUEUE_STALL_DENIED=$((QUEUE_STALL_DENIED + 1))
+        log "queue stall sweep: DENIED reading check runs for #$num (status=$status) — the App installation lacks 'checks: read'"
+      else
+        QUEUE_STALL_SKIPPED=$((QUEUE_STALL_SKIPPED + 1))
+        log "queue stall sweep: cannot read check runs for #$num (status=$status)"
+      fi
+      continue
+    }
+
+    # Mergify's own check runs are excluded from every count and from the idle
+    # clock, and this is load-bearing rather than tidy. `Mergify Merge Queue`
+    # sits `in_progress` for as long as the entry is being checked, so counting
+    # it would make a stalled pull request permanently "pending" — the rule
+    # would go quiet in exactly the state it exists to catch. Its state is read
+    # separately, below, as the answer to "does Mergify think it holds this".
+    counts=$(printf '%s' "$checks" | jq -r '
+      [ .check_runs[]? | select((.name // "") | startswith("Mergify") | not) ] as $c
+      | [ ($c | length),
+          ($c | map(select(.status == "completed") | (.conclusion // ""))
+              | map(select(. == "failure" or . == "cancelled"
+                        or . == "timed_out" or . == "action_required"))
+              | length),
+          ($c | map(select(.status != "completed")) | length),
+          ([ $c[] | select(.status == "completed") | (.completed_at // "")
+             | select(. != "") | fromdateiso8601 ] | max // 0)
+        ] | @tsv' 2>/dev/null)
+    IFS=$'\t' read -r total failed pending newest <<<"$counts"
+
+    mq_state=$(printf '%s' "$checks" | jq -r '
+      [ .check_runs[]? | select((.name // "") == "Mergify Merge Queue") ]
+      | if length == 0 then "absent"
+        else (sort_by(.started_at) | last | .status) end' 2>/dev/null)
+    case "$mq_state" in
+      absent | in_progress | completed) : ;;
+      queued) mq_state=in_progress ;;
+      *) mq_state=unknown ;;
+    esac
+
+    now=$(date +%s)
+    if [[ "$newest" =~ ^[0-9]+$ ]] && [ "$newest" -gt 0 ]; then
+      idle=$((now - newest))
+      [ "$idle" -lt 0 ] && idle=0
+    else
+      idle=""
+    fi
+
+    attempts=$(stall_attempts_get "$sha")
+    verdict=$(stall_verdict 0 "$base" "$QUEUE_BASE" \
+      "${total:-}" "${failed:-}" "${pending:-}" \
+      "$mq_state" "${idle:-}" "$QUEUE_STALL_AFTER" \
+      "$attempts" "$QUEUE_STALL_MAX_ATTEMPTS")
+
+    case "$verdict" in
+      quiet:exhausted*)
+        QUEUE_STALL_EXHAUSTED=$((QUEUE_STALL_EXHAUSTED + 1))
+        log "pull request #$num is green and the queue is not moving it, and this controller has spent its $QUEUE_STALL_MAX_ATTEMPTS attempts on $sha — a human has to look ($verdict)"
+        continue
+        ;;
+      nudge:*) : ;;
+      *) continue ;;
+    esac
+
+    kind="${verdict#nudge:}"
+    kind="${kind%% *}"
+
+    # Invariant B. A refresh is free — it asks Mergify to re-read a state it
+    # already holds — so only a REQUEUE has to earn its attempt by having been
+    # dropped by the fleet rather than by the diff.
+    if [ "$kind" = "queue" ] \
+      && [ "$(stall_dequeue_kind "$num" "$runs" "$deadline")" = "real" ]; then
+      QUEUE_STALL_STUCK=$((QUEUE_STALL_STUCK + 1))
+      log "pull request #$num is green on its own head but its queue run failed the way a build fails, not the way a slot dies — not requeuing"
+      continue
+    fi
+
+    case "$kind" in
+      refresh) cmd="@mergifyio refresh" ;;
+      *) cmd="@mergifyio queue" ;;
+    esac
+
+    body=$(jq -n --arg b "$cmd" '{body: $b}')
+    if gh_api_post "repos/$REPO_FULL/issues/$num/comments" "$body"; then
+      stall_attempts_bump "$sha"
+      QUEUE_STALL_ACTED["$kind"]=$((${QUEUE_STALL_ACTED["$kind"]:-0} + 1))
+      log "pull request #$num: green for ${idle}s with the queue not moving ($verdict) — posted '$cmd'"
+    else
+      status=$(cat "$STATE_DIR/api.status" 2>/dev/null)
+      QUEUE_STALL_STUCK=$((QUEUE_STALL_STUCK + 1))
+      if parked_denial "$status"; then
+        QUEUE_STALL_DENIED=$((QUEUE_STALL_DENIED + 1))
+        log "queue stall sweep: DENIED commenting on #$num (status=$status) — this is the one call that needs 'pull_requests: WRITE'; until it is granted and the installation has accepted it, this controller can see every stall and fix none of them"
+      else
+        log "queue stall sweep: could not comment on #$num (status=$status)"
+      fi
+    fi
+  done <<<"$rows"
+
+  [ "$QUEUE_STALL_SKIPPED" -gt 0 ] && log "queue stall sweep: $QUEUE_STALL_SKIPPED pull request(s) not examined this sweep (budget ${QUEUE_STALL_BUDGET}s, ceiling $QUEUE_STALL_MAX_CANDIDATES) — retried next sweep, not lost"
   return 0
 }
 
@@ -2731,6 +3056,14 @@ tick() {
   # place for it.
   collect_parked
 
+  # Immediately after the parked sweep, and deliberately so: the two are
+  # complements over the same list, they share an interval, and reading them in
+  # one place is what stops a future change from making both sweeps pay for the
+  # same pull request's check runs. This is the only sweep in the file that
+  # WRITES to GitHub — see queue-stall-decision.sh for why a control plane and
+  # not a workflow.
+  collect_queue_stalls
+
   local p
   for p in "${POOLS[@]}"; do
     pool_select "$p"
@@ -3234,6 +3567,34 @@ queue_controller_series() {
   # `checks: read` publishes an unbroken zero from every other series in this
   # block — which is exactly what a repository with nothing parked publishes.
   queue_series "ci_parked_sweep_denied" "$PARKED_DENIED"
+
+  # The stall sweep. Same publication contract as the block above — a
+  # REPOSITORY fact under every pool's label, read with max() and never sum().
+  #
+  # ci_queue_nudges is the one series here that is healthy at ZERO and expected
+  # to be non-zero anyway. It is not an error count: every nudge is a merge that
+  # would otherwise have waited for somebody to notice, so the number is the
+  # size of the problem being absorbed. Watch its TREND, and if it does not fall
+  # after a fleet fix, the fleet was not fixed.
+  local k
+  for k in refresh queue; do
+    queue_series "ci_queue_nudges" "${QUEUE_STALL_ACTED[$k]:-0}" "\"kind\":\"$k\""
+  done
+  # Stalls this controller could see and could not clear: the comment was
+  # refused, or the queue run failed the way a build fails. This is the series a
+  # human is meant to act on, because everything it counts stays stuck forever.
+  queue_series "ci_queue_stalls_unresolved" "$QUEUE_STALL_STUCK"
+  # Pull requests that burned the whole attempt budget on one head sha. Non-zero
+  # means the infrastructure classification let something through that it should
+  # not have, or a repository is genuinely broken against its own base — either
+  # way the automation has stopped and is saying so rather than looping.
+  queue_series "ci_queue_stall_attempts_exhausted" "$QUEUE_STALL_EXHAUSTED"
+  queue_series "ci_queue_stall_prs_skipped" "$QUEUE_STALL_SKIPPED"
+  # And the same "the zero above is nothing at all" signal the parked sweep
+  # publishes. Here it has a second cause the other one cannot have: the sweep
+  # may hold every read permission it needs, see the stall perfectly, and be
+  # refused the single write that fixes it.
+  queue_series "ci_queue_stall_sweep_denied" "$QUEUE_STALL_DENIED"
 }
 
 # --- install / run -----------------------------------------------------------

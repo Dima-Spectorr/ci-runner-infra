@@ -315,6 +315,40 @@ output "metric_names" {
       # a permission — and because a denied sweep leaves every other series here
       # publishing the same unbroken zero a healthy repository publishes.
       "ci_parked_sweep_denied",
+      # --- the merge queue that ADMITTED the pull request and stopped ---------
+      # The complement of the four series above: those describe a pull request
+      # the queue will never take, these describe one it took and then left
+      # stationary. Same repository-fact caveat — published under every pool's
+      # label, read with max() and never sum().
+      #
+      # Nudges the controller actually posted this tick, labelled by `kind`
+      # (`refresh` = the queue holds the entry and has not looked at it since
+      # the last check went green; `queue` = there is no live entry, because it
+      # was dequeued on a fleet failure or never entered). A per-tick DELTA on a
+      # gauge: align with a sum, never a mean. Sustained non-zero is not the
+      # fleet working, it is the queue needing a chaperone — read it as a defect
+      # rate, and read it beside the failure rate of the merge-queue draft runs.
+      "ci_queue_nudges",
+      # Pull requests that met every stall condition and were NOT nudged,
+      # because the head sha had already spent its attempts. This is the series
+      # that says a human is needed: the automation has given up and the pull
+      # request is still sitting there. Alert on it.
+      "ci_queue_stalls_unresolved",
+      # How many heads hit that ceiling. Separate from the count above because
+      # this one is cumulative evidence that the infra/diff line is drawn wrong
+      # — a healthy fleet exhausts nobody — while the count above is one
+      # pull request needing help right now.
+      "ci_queue_stall_attempts_exhausted",
+      # > 0 means the stall sweep did not examine every candidate this tick, so
+      # every count above is a lower bound rather than a fact. Published every
+      # tick, 0 included, for the same reason ci_parked_prs_skipped is.
+      "ci_queue_stall_prs_skipped",
+      # > 0 means REFUSED, not delayed. Reading the state needs `checks: read`
+      # and `pull_requests: read`; POSTING the nudge needs `pull_requests:
+      # write`, which is the permission a repository is most likely to be
+      # missing, and without it this layer is silently a no-op that publishes
+      # the same zeros a healthy repository publishes.
+      "ci_queue_stall_sweep_denied",
       # --- the cache hydrate --------------------------------------------------
       # Published by the HOST, not the controller, and once per boot rather than
       # per tick: the hydrate finishes before the runner agent registers, so the
