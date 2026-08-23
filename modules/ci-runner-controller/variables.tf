@@ -174,6 +174,12 @@ variable "demand_budget_seconds" {
   default     = 45
 }
 
+variable "queue_base_branch" {
+  description = "The branch the merge queue admits. The controller compares every open pull request's base against it and reports one that is green and can never be queued (ci_prs_green_and_unqueued). Never a literal in the controller: a repository whose queue targets something else would otherwise read as entirely parked."
+  type        = string
+  default     = "main"
+}
+
 variable "metric_prefix" {
   description = "Custom-metric prefix. Series are labelled with `pool`, so all four pools publish under one prefix."
   type        = string
@@ -181,6 +187,44 @@ variable "metric_prefix" {
 }
 
 # --- the VM ------------------------------------------------------------------------
+
+variable "controller_autohealing" {
+  description = <<-EOT
+    Let the controller's managed group DELETE and rebuild the controller when a
+    health probe says it is not answering.
+
+    Off by default, deliberately. The group itself is always on and already
+    rebuilds a controller that is deleted or whose VM is gone, which is the
+    failure this exists for. This flag adds the probe-driven half, and a probe
+    that cannot reach the controller — health-check ranges not open to its tag,
+    a central firewall dropping them, the wrong port — reads a healthy machine
+    as dead and loops: delete, rebuild, cannot reach, delete. That is worse
+    than a pet, because a pet that is up stays up.
+
+    The in-guest watchdog already restarts a wedged tick loop without deleting
+    anything, so what this adds is the narrow case of a guest too broken to run
+    its own watchdog.
+
+    Turn it on only after confirming the health check reports HEALTHY against
+    the running controller. The sequence is in docs/applying-runner-infra.md.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "controller_health_port" {
+  description = <<-EOT
+    Port the controller's liveness responder listens on when
+    `controller_autohealing` is set. It answers 200 on /livez only while the
+    tick heartbeat is fresh, so the probe distinguishes a stalled controller
+    from a live one rather than merely confirming something is listening.
+
+    With autohealing off nothing listens on it at all: the port is passed to
+    the VM as an empty string and the responder is never started.
+  EOT
+  type        = number
+  default     = 8008
+}
 
 variable "controller_machine_type" {
   description = "Machine type for the controller VM."
