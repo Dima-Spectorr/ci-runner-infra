@@ -55,7 +55,7 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER2` | with `--scope=<label>`, it is THAT label |
 | `RUNNER3` | every job that runs steps declares `timeout-minutes` (see the note below) |
 | `RUNNER4` | a fork-reachable workflow keeps fleet-reachable jobs behind a fork guard |
-| `RUNNER5` | the runner is selected dynamically — reported as UNDECIDED, not passed |
+| `RUNNER5` | the runner is selected dynamically — reported as UNDECIDED, not passed; declarable per repository (`--allow-dynamic-runner`) or per job (`# dynamic-runner-allowed(<job>, #<issue>)`) |
 | `RUNNER6` | and the declared timeout is below the default it replaces |
 | `RUNNER7` | a REMOTE reusable workflow's jobs are not in this repository — UNDECIDED, declarable per callee |
 | `RUNNER8` | a job on a **Windows** pool label declares `container:` or `services:`, which that pool cannot run |
@@ -147,6 +147,26 @@ Both name their job because a YAML reader has discarded comments by the time it
 yields a job, so a bare marker cannot be attributed to one — and a bare marker
 is also un-reviewable: it would excuse whatever the file contains after the next
 change, including a job added later that nobody weighed.
+
+### `RUNNER5` can be answered per job as well as per repository
+
+```
+# dynamic-runner-allowed(<job-id>, #<issue>): <who scopes the value>
+```
+
+`--allow-dynamic-runner` is the right answer for a repository where every fleet
+job resolves its pool from one anchor: one property, one declaration. It is the
+wrong answer for a repository with **one** dynamic job, because the flag also
+excuses the next one — added by an unrelated change, from a CI invocation the
+reviewer of that job never sees.
+
+This repository is now the second kind. `shared-infra-anchor.yml` takes its pool
+label as a `workflow_call` input, so its `runs-on` is an expression by
+construction and always will be, while every other workflow here is
+GitHub-hosted and must stay checkable. The marker asserts exactly what the flag
+asserts, narrowed to one job: a human read where the value comes from and
+accepted that whoever supplies it scopes it. The issue is where that reading
+lives, which is why a marker without one does not count.
 
 ### `RUNNER10` is counted across files, and reported once
 

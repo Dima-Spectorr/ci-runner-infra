@@ -174,7 +174,9 @@
 #   the answer belonged to the other question. The guard now settles RUNNER4
 #   only. A consumer whose pool genuinely comes from a repository variable its
 #   admins scope says so with `--allow-dynamic-runner` — in its own workflow,
-#   in a diff, the same shape as `--forks=blocked`.
+#   in a diff, the same shape as `--forks=blocked` — or, for one job rather than
+#   all of them, with `# dynamic-runner-allowed(<job>, #<issue>): <who scopes
+#   the value>` beside it.
 #
 # EXIT CODES
 #   0 — clean
@@ -846,6 +848,38 @@ shared_infra_marker() {
 # It does not verify them — nothing here can, which is the whole finding. The
 # issue number is where that reading is recorded, so the acceptance has an owner
 # and a place to be revisited; a marker without one is not accepted.
+# RUNNER5's escape hatch, in the same shape and for the same reason RUNNER7's
+# exists:
+#
+#   # dynamic-runner-allowed(<job-id>, #<issue>): <who scopes the value>
+#
+# `--allow-dynamic-runner` excuses EVERY dynamic job in the repository at once,
+# including one a later, unrelated change adds, and it lives in the CI
+# invocation rather than beside the job it excuses — so the reviewer of that job
+# never sees it. That trade is fine for a repository where every fleet job
+# resolves its pool from one anchor, which is why the flag stays. It is the
+# wrong trade for a repository with ONE such job, and this one is now that
+# repository: `shared-infra-anchor.yml` takes its pool label as a
+# `workflow_call` input, so its `runs-on` is an expression by construction and
+# always will be, while every other workflow here is GitHub-hosted and must stay
+# checkable.
+#
+# What the marker asserts is exactly what the flag asserts, narrowed to one job:
+# a human has read where that value comes from and accepted that whoever
+# supplies it scopes it. The issue number is where that reading is recorded.
+dynamic_runner_declared() {
+  local file="$1" job="$2" esc
+  # `re_quote` for the same reason `shared_infra_marker` uses it: a YAML job id
+  # may legally contain `.`, `[` and `+`, and two spellings of one escaping rule
+  # drift apart on the first change to either.
+  esc="$(re_quote "$job")"
+  # An issue is required, as it is for an exemption and a remote call: this
+  # accepts a known gap rather than declaring intent, so it needs an owner and a
+  # place to be revisited. The trailing `[^[:space:]]` refuses `(...): ` with
+  # nothing after it — a waiver wearing the shape of a declaration.
+  grep -Eq "^[[:space:]]*#.*dynamic-runner-allowed\([[:space:]]*${esc}[[:space:]]*,[[:space:]]*#[0-9]+[[:space:]]*\):[[:space:]]*[^[:space:]]" <(comment_view "$file")
+}
+
 remote_call_declared() {
   local file="$1" callee="$2" esc
   # The callee is DATA, not a pattern. Unescaped, the `.` in `ci.yml` matches any
@@ -1199,8 +1233,8 @@ EOF
     # a repository variable declares that with `--allow-dynamic-runner`, in its
     # workflow, where it is reviewable — the same shape as `--forks=blocked`.
     if [ "$has_expr" -eq 1 ] || [ "$has_group" -eq 1 ]; then
-      if [ "$ALLOW_DYNAMIC" -eq 0 ]; then
-        err RUNNER5 "$rel: job '$job' selects its runner dynamically — this gate cannot decide which pool it claims (declare --allow-dynamic-runner if the label is a repository variable your admins scope)"
+      if [ "$ALLOW_DYNAMIC" -eq 0 ] && ! dynamic_runner_declared "$file" "$job_base"; then
+        err RUNNER5 "$rel: job '$job' selects its runner dynamically — this gate cannot decide which pool it claims (declare '# dynamic-runner-allowed($job_base, #<issue>): <who scopes the value>' beside the job, or --allow-dynamic-runner if every dynamic job in the repository has the same answer)"
       fi
     fi
 
@@ -1512,6 +1546,46 @@ jobs:
     runs-on: ${{ github.event.pull_request.head.repo.fork && '"'"'ubuntu-latest'"'"' || vars.CI_RUNNER_LABEL }}
     timeout-minutes: 30
     steps: [{run: "true"}]' 1
+
+  # …or declare it for ONE job instead of the whole repository. The flag excuses
+  # every dynamic job at once, including one a later change adds, from a CI
+  # invocation the reviewer of this job never sees; the marker is beside the job
+  # and names it. Note the absent trailing `1`: no flag here.
+  expect "a per-job declaration accepts an undecidable pool without the flag" "" "" allowed \
+'on:
+  pull_request:
+jobs:
+  # dynamic-runner-allowed(build, #1): the label is a repository variable our admins scope
+  build:
+    runs-on: ${{ github.event.pull_request.head.repo.fork && '"'"'ubuntu-latest'"'"' || vars.CI_RUNNER_LABEL }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # An issue is not decoration. This marker accepts a known gap rather than
+  # declaring intent, so it needs an owner and a place to be revisited — the
+  # same bar `shared-infra-exempt` and `remote-reusable-allowed` are held to.
+  expect "…but not without an issue" "RUNNER5" "" allowed \
+'on:
+  pull_request:
+jobs:
+  # dynamic-runner-allowed(build): the label is a repository variable our admins scope
+  build:
+    runs-on: ${{ github.event.pull_request.head.repo.fork && '"'"'ubuntu-latest'"'"' || vars.CI_RUNNER_LABEL }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # …and not for a job it does not name. A bare or misdirected marker would
+  # excuse whatever the file contains after the next change, including a job
+  # added later that nobody weighed.
+  expect "…and not for a job the marker does not name" "RUNNER5" "" allowed \
+'on:
+  pull_request:
+jobs:
+  # dynamic-runner-allowed(lint, #1): the label is a repository variable our admins scope
+  build:
+    runs-on: ${{ github.event.pull_request.head.repo.fork && '"'"'ubuntu-latest'"'"' || vars.CI_RUNNER_LABEL }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
 
   # Written the other way round, the SAME idiom hands forks the pool. The first
   # version of this gate read both as guarded, because it looked for the topic

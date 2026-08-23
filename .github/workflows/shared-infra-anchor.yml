@@ -20,7 +20,7 @@
 #   # shared-infra-owner(anchor): brings up ci/compose.yaml on this run's Linux host
 #   jobs:
 #     anchor:
-#       uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@v5.36.0
+#       uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@<release-tag>
 #       with:
 #         repo-label: ExampleRepo
 #         migrate: ./scripts/db-migrate.sh "$DATABASE_URL"
@@ -102,11 +102,13 @@ on:
         required: false
         default: ubuntu-latest
         type: string
-      timeout-minutes:
-        description: The bring-up and nothing else. Not the run's budget.
-        required: false
-        default: 15
-        type: number
+      # There is deliberately NO `timeout-minutes` input. `timeout-minutes:
+      # ${{ inputs.timeout-minutes }}` is an expression this repository's own
+      # RUNNER6 refuses, and it is right to: an expression that lands on 360 or
+      # more bounds nothing, and nothing in a static read can rule that out. The
+      # bound is fixed at 15 below. A repository whose bring-up genuinely needs
+      # longer should open an issue rather than fork the file — the fix belongs
+      # here, once, for everyone.
 
     outputs:
       runs-on:
@@ -138,6 +140,17 @@ jobs:
   # consumers can never start. The slot is held host-side instead, by
   # `--reserve-slot`.
   # ---------------------------------------------------------------------------
+  # RUNNER5. This job's `runs-on` is an expression BY CONSTRUCTION and always
+  # will be: the pool label is a `workflow_call` input, which is the whole point
+  # of publishing the anchor once instead of seven times. The value is scoped by
+  # the calling repository, whose own gate run checks the label it passes, and
+  # the fork branch keeps outside code on a hosted image regardless.
+  #
+  # Declared per-job rather than with `--allow-dynamic-runner`, which would
+  # excuse every dynamic job in this repository at once — including one a later,
+  # unrelated change adds — from a CI invocation the reviewer of this job never
+  # sees. Every other workflow here is GitHub-hosted and must stay checkable.
+  # dynamic-runner-allowed(anchor, #248): the pool label is a workflow_call input, scoped by the calling repository
   anchor:
     name: Shared infra (anchor)
     # RUNNER4, and NOT `if: fork == false`.
@@ -156,7 +169,8 @@ jobs:
     # build the JSON and read it back. A `repo-label` that is not a plain label
     # fails `fromJSON` here, loudly, rather than silently matching no runner.
     runs-on: ${{ github.event.pull_request.head.repo.fork && inputs.hosted-runner || fromJSON(format('["self-hosted","linux","gcp","{0}"]', inputs.repo-label)) }}
-    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # Fixed, not an input — see the note in the input block above.
+    timeout-minutes: 15
     outputs:
       runs-on: ${{ steps.up.outputs.runs-on }}
       addr: ${{ steps.up.outputs.addr }}
