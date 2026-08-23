@@ -1451,7 +1451,14 @@ collect_queue_stalls() {
     open_shas=$(printf '%s\n' "$rows" | cut -f3)
     for f in "$dir"/*; do
       [ -e "$f" ] || continue
-      printf '%s\n' "$open_shas" | grep -qxF "$(basename "$f")" || rm -f "$f"
+      # `grep -c … >/dev/null` and never `grep -q`: this pipeline's status IS
+      # the decision, and `-q` exits on its first match, so the writer dies of
+      # EPIPE and pipefail reports a pipeline that FOUND its sha as failed. The
+      # `||` would then delete the ledger of a pull request that is still open,
+      # resetting its attempt count and handing it three more nudges — the exact
+      # ceiling this file exists to hold. `-c` reads to end of input and still
+      # exits 1 when there is no match.
+      printf '%s\n' "$open_shas" | grep -cxF "$(basename "$f")" >/dev/null || rm -f "$f"
     done
   fi
   [ -n "$rows" ] || return 0
