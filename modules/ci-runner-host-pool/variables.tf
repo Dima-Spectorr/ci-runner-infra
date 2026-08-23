@@ -70,8 +70,8 @@ variable "github_owner" {
   #
   # The charsets below are GitHub's own, so no real value is refused.
   validation {
-    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$", var.github_owner))
-    error_message = "github_owner must be a GitHub login: 1-39 characters, letters, digits and hyphens, not starting with a hyphen."
+    condition     = can(regex("^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$", var.github_owner))
+    error_message = "github_owner must be a GitHub login: 1-39 characters, letters, digits and hyphens, and neither starting nor ending with a hyphen."
   }
 }
 
