@@ -616,6 +616,25 @@ variable "runner_labels" {
   }
 }
 
+variable "role" {
+  description = <<-EOT
+    What this pool serves: `ci` for ordinary pull-request runs, `merge-queue` for
+    Mergify's speculative validation of a queued pull request.
+
+    It changes nothing about the hosts. It is the pool's declared PURPOSE, and it
+    travels in the controller's table so the two workloads can be told apart
+    where the difference matters: sizing a queue pool from the queue's own width,
+    and asserting that the label sets of the two roles are disjoint.
+  EOT
+  type        = string
+  default     = "ci"
+
+  validation {
+    condition     = contains(["ci", "merge-queue"], var.role)
+    error_message = "role must be `ci` or `merge-queue`. The controller's table parser rejects any other value, and a rejected row is a pool that is never ticked: its ONLY_UP autoscaler holds its last size forever while the dashboard reads healthy."
+  }
+}
+
 variable "runner_group" {
   description = "GitHub runner group to register into. Empty = the repository default."
   type        = string

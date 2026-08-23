@@ -70,6 +70,65 @@ variable "pools" {
     condition     = alltrue([for p in var.pools : contains(["linux", "windows"], coalesce(p.host_os, "linux"))])
     error_message = "each pool's host_os must be linux or windows."
   }
+
+  validation {
+    condition     = alltrue([for p in var.pools : contains(["ci", "merge-queue"], coalesce(p.role, "ci"))])
+    error_message = "each pool's role must be `ci` or `merge-queue`. The table parser rejects any other value and a rejected row is a pool that is never ticked."
+  }
+
+  # LABEL ISOLATION, ASSERTED WHERE BOTH POOLS ARE FINALLY IN ONE PLACE.
+  #
+  # GitHub schedules a self-hosted runner by SUPERSET: a job asking for
+  # [self-hosted, linux, gcp, Repo] runs on ANY runner carrying at least those
+  # labels. So a merge-queue pool that also carried the CI pool's selector
+  # labels would be dedicated in name only — every ordinary pull-request job
+  # would be eligible for it, and the split that exists to stop the two
+  # workloads starving each other would buy nothing.
+  #
+  # The property is mutual, and both directions fail silently in opposite ways:
+  #
+  #   queue labels ⊇ ci labels   the pools merge. Queue hosts serve ordinary
+  #                              jobs, and the queue is starved by the very
+  #                              pull requests feeding it.
+  #   queue labels ⊆ ci labels   the queue cannot be addressed at all. Its jobs
+  #                              ask for a label no runner carries and queue
+  #                              against it forever rather than failing.
+  #
+  # It is a relation BETWEEN pools, which is why it could not live in the pool
+  # module: one instance there cannot see the other. Here the whole table is one
+  # variable, so the relation is checkable at plan time — before an instance
+  # moves — instead of being a paragraph in a comment that an override edits out.
+  #
+  # `self-hosted` and the pool's own name are excluded on both sides. Every pool
+  # registers its own name and every name is unique, so leaving them in would
+  # make the difference set non-empty for ANY pair and the check vacuous — it
+  # would pass on the addressing label while the selector labels were identical,
+  # which is the exact failure it is here to catch.
+  #
+  # Compared lower-cased and trimmed, the same way RUNNER13 compares them in
+  # `check-runner-policy.sh`, because that is how GitHub compares them: `Repo`
+  # and `repo` are ONE label. Left case-sensitive, two spellings of one pool
+  # would read here as two pools, this check would pass, and the pools would
+  # still merge at scheduling time — a green plan over the exact overlap the
+  # rule exists to refuse.
+  validation {
+    condition = alltrue(flatten([
+      for q in var.pools : [
+        for c in var.pools : (
+          length(setsubtract(
+            setsubtract(toset([for l in split(",", c.runner_labels) : lower(trimspace(l))]), toset(["self-hosted", lower(c.name)])),
+            setsubtract(toset([for l in split(",", q.runner_labels) : lower(trimspace(l))]), toset(["self-hosted", lower(q.name)])),
+            )) > 0 && length(setsubtract(
+            setsubtract(toset([for l in split(",", q.runner_labels) : lower(trimspace(l))]), toset(["self-hosted", lower(q.name)])),
+            setsubtract(toset([for l in split(",", c.runner_labels) : lower(trimspace(l))]), toset(["self-hosted", lower(c.name)])),
+          )) > 0
+        )
+        if coalesce(c.role, "ci") == "ci" && coalesce(c.host_os, "linux") == coalesce(q.host_os, "linux")
+      ]
+      if coalesce(q.role, "ci") == "merge-queue"
+    ]))
+    error_message = "a merge-queue pool and the CI pool on the same OS must each carry a selector label the other does not. GitHub matches a runner by superset: if the queue pool's labels cover the CI pool's, every ordinary job becomes eligible for the queue's hosts; if they are covered BY the CI pool's, queue jobs ask for a label nothing carries and wait against it forever. The queue pool carries its own label INSTEAD OF the CI pool's, never in addition to it."
+  }
 }
 
 # --- what the whole repository shares ---------------------------------------------
