@@ -15,6 +15,12 @@
 #     PFR1  a bare assignment `x="$(cmd | head -1)"` — the status of a simple
 #           assignment IS the status of its command substitution
 #     PFR2  a bare pipeline statement `cmd | head -5`
+#     PFR3  a pipeline whose status IS the verdict — an `if`/`while` condition,
+#           or one followed by `||`/`&&` — whose writer is IN-PROCESS (a
+#           `printf`/`echo` of a shell variable, or a shell function). `set -e`
+#           is suspended in a condition, so this never crashes: it silently
+#           INVERTS the answer, which in a self-test is a green check over an
+#           assertion that was never made
 #     PFR0  the gate could not read a document, had no reader to read with, or
 #           found nothing to check — reported, never passed
 #
@@ -53,11 +59,33 @@
 #   * A file or block without BOTH `-e` and `pipefail` in effect. Most gates in
 #     this repository run `set -uo pipefail` deliberately, precisely so an
 #     assignment that returns 141 does not take the gate down.
-#   * `if cmd | grep -q x; then` — the §5.2a inversion, and NOT a rule here.
-#     `set -e` is suspended in a condition, so this fails only on the buffering
-#     race, and the idiom is everywhere. A gate that lit up on every one of them
-#     across fourteen repositories is a gate somebody deletes, which costs more
-#     than the findings are worth. Tracked separately.
+#   * `if cmd | grep -q x; then` where the writer is a FILE READ or an external
+#     command — `grep -qE "$re" "$file"`, `find . -type f | grep -q x`. There is
+#     no in-process writer to kill, so there is nothing to invert. That is by
+#     far the most common form in this repository, and leaving it alone is what
+#     keeps PFR3 off the "gate somebody deletes" bar set in #216.
+#
+# WHY PFR3 DOES NOT REQUIRE `-e` (measured, 2026-08-22)
+#   `set -e` is suspended in a condition, so the 141 never crashes anything —
+#   which is why this shape is worse than PFR1/PFR2 rather than milder: the
+#   status is consumed AS THE ANSWER. `grep -q` exits on its first match and
+#   closes the pipe; the in-process writer (`printf`, or a function's own
+#   `grep -v`) dies of EPIPE; `pipefail` makes 141 the pipeline's status; and a
+#   predicate that FOUND its text returns false.
+#
+#   It fires only when the match lands early enough that the writer still holds
+#   unwritten bytes, so it turns on input size and on the pipe buffer — 64 KiB
+#   on Linux, 8 KiB on Windows. A label or a version string is safe in practice;
+#   a whole file's contents is not. `build-cache-snapshot.selftest.sh` asked 44
+#   of its questions this way and five failed in CI on a commit that had passed
+#   on a laptop. Two were mutation cases, where a predicate stuck at false reads
+#   as "mutation not caught" — the self-test accusing the code of a defect that
+#   is not there.
+#
+#   THE FIX IS `grep -c … >/dev/null`: it reads to end of input, so nothing
+#   upstream is ever cut off, and it still exits 1 when there is no match. For a
+#   line number, `grep -n -m1 pat file` (a file argument has no writer to kill)
+#   or `… | cut -d: -f1 | sed -n 1p` (`sed -n 1p` keeps reading).
 #
 # HOW A `run:` BLOCK'S OPTIONS ARE DECIDED
 #   GitHub's `shell: bash` is `bash --noprofile --norc -eo pipefail {0}` — both
@@ -172,6 +200,114 @@ def reader_name(segment):
     return None
 
 
+FUNCDEF = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*\(\)\s*", re.M)
+VERDICT_HEAD = re.compile(r"^\s*(?:if|elif|while|until)\s+")
+ENVPREFIX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+OPENER = re.compile(
+    r"^(?:(?:function\s+)?[A-Za-z_][A-Za-z0-9_.-]*\s*\(\)\s*)?\{\s*|^(?:then|do|else)\s+"
+)
+
+
+def shell_functions(script):
+    """Every function this script defines — the in-process writers of PFR3."""
+    return set(FUNCDEF.findall(script))
+
+
+def verdict_pipelines(text):
+    """Every pipeline on this line whose status is READ, in order.
+
+    The verdict is the whole point of PFR3, so it is decided structurally rather
+    than by keyword: a pipeline in an `if`/`elif`/`while`/`until` condition, or
+    one whose status is consumed by a following `||`/`&&`. Quotes and `$( )` are
+    tracked so an operator inside either is not read as the top-level one.
+
+    INSIDE A CONDITION, every element of an `&&`/`||` list is read, not just the
+    first: `if [ -n "$out" ] && printf '%s' "$out" | grep -q FAIL; then` is the
+    same inversion one segment further along, and looking only at the head of
+    the list is how it hides. Outside a condition the head is all that is
+    claimed, which is what keeps PFR3 disjoint from PFR1/PFR2.
+    """
+    s = text.strip()
+    # `f() { printf ... | grep -q x || return 1; }` on one line is a whole
+    # function, and the pipeline inside it is the same pipeline. Strip the
+    # opener, or parts[0] is `f()` and the writer is never recognised.
+    s = OPENER.sub("", s, count=1)
+    verdict = bool(VERDICT_HEAD.match(s))
+    if verdict:
+        s = VERDICT_HEAD.sub("", s, count=1)
+    while s.startswith("!"):
+        s = s[1:].lstrip()
+    segments, start = [], 0
+    quote, depth, i = None, 0, 0
+    while i < len(s):
+        c = s[i]
+        if quote:
+            if c == quote and s[i - 1] != "\\":
+                quote = None
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif depth == 0:
+            if s.startswith("||", i) or s.startswith("&&", i):
+                # An OR/AND list consumes the status, which is what makes it the
+                # answer. This is the one place PFR3 and the PFR1/PFR2 `||`
+                # exemption disagree, and deliberately so: there, `||` means the
+                # author waived the status; here, it means the author READ it.
+                segments.append(s[start:i].strip())
+                if not verdict:
+                    return segments
+                start = i + 2
+                i += 2
+                continue
+            if c == ";":
+                segments.append(s[start:i].strip())
+                return segments if verdict or len(segments) > 1 else []
+        i += 1
+    segments.append(s[start:].strip())
+    return segments if verdict or len(segments) > 1 else []
+
+
+def in_process_writer(segment, funcs):
+    """True when killing this stage's writer kills a process INSIDE this shell.
+
+    `printf`/`echo` of a shell variable, or a function defined in this script. A
+    file argument (`grep -q pat file`) or an external command (`find`, `git`) is
+    not: SIGPIPE there does not invert an answer computed in this shell, and
+    flagging those is what would make the rule unusable.
+    """
+    words = segment.strip().split()
+    i = 0
+    while i < len(words) and ENVPREFIX.match(words[i]):
+        i += 1
+    if i >= len(words):
+        return False
+    cmd = words[i]
+    if cmd in ("printf", "echo") and "$" in segment:
+        return True
+    return cmd in funcs
+
+
+def verdict_reader(text, funcs):
+    """The early-exiting reader of a PFR3 pipeline on this line, or None."""
+    for pipeline in verdict_pipelines(text):
+        if "|" not in pipeline:
+            continue
+        parts = split_pipeline(pipeline)
+        if len(parts) < 2:
+            continue
+        name = reader_name(parts[-1])
+        if not name:
+            continue
+        if in_process_writer(parts[0], funcs):
+            return name
+    return None
+
+
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(\"?)\$\((.*)\)\2\s*$")
 DECLARER = re.compile(r"^\s*(local|export|declare|typeset|readonly)\s")
@@ -223,35 +359,48 @@ def logical_lines(script):
     return out
 
 
+def crash_finding(text):
+    """(rule, reader) for the shapes whose 141 reaches `set -e`, or None."""
+    if DECLARER.match(text):
+        return None
+    m = ASSIGN.match(text)
+    if m:
+        inner = m.group(3)
+        name = reader_name(split_pipeline(inner)[-1]) if "|" in inner else None
+        return ("PFR1", name) if name else None
+    if STARTER.match(text) or "|" not in text:
+        return None
+    # An assignment this far in is `x=1 cmd | head` (an env prefix) or a
+    # form ASSIGN did not recognise; treat it as a bare pipeline.
+    name = reader_name(split_pipeline(text)[-1])
+    return ("PFR2", name) if name else None
+
+
 def findings(script, errexit, pipefail):
     """(line offset, rule, reader, text) for every offending logical line."""
-    if not (errexit and pipefail):
+    if not pipefail:
         return []
+    funcs = shell_functions(script)
     hits = []
     for lineno, raw in logical_lines(blank_heredocs(script)):
         text = raw.strip()
         if not text or text.startswith("#"):
             continue
-        if DECLARER.match(text):
-            continue
 
-        m = ASSIGN.match(text)
-        if m:
-            inner = m.group(3)
-            name = reader_name(split_pipeline(inner)[-1]) if "|" in inner else None
-            if name:
-                hits.append((lineno, "PFR1", name, text))
-            continue
+        # PFR1/PFR2 are about a 141 that CRASHES the shell, so they need -e too.
+        # PFR3 is about one that is READ as an answer, and needs only pipefail.
+        # The two sets are disjoint by construction: PFR3 requires the status to
+        # be consumed (a condition, or an OR/AND list), and PFR1/PFR2 both stop
+        # at exactly that.
+        if errexit:
+            hit = crash_finding(text)
+            if hit:
+                hits.append((lineno, hit[0], hit[1], text))
+                continue
 
-        if STARTER.match(text):
-            continue
-        if "|" not in text:
-            continue
-        # An assignment this far in is `x=1 cmd | head` (an env prefix) or a
-        # form ASSIGN did not recognise; treat it as a bare pipeline.
-        name = reader_name(split_pipeline(text)[-1])
+        name = verdict_reader(text, funcs)
         if name:
-            hits.append((lineno, "PFR2", name, text))
+            hits.append((lineno, "PFR3", name, text))
     return hits
 
 
@@ -388,6 +537,17 @@ for path, offset, script, errexit, pipefail, raw in units:
             shown = path.as_posix()
         absline = lineno if raw is None else anchor(raw, text, offset, lineno)
         where = ",line=%d" % absline if absline else ""
+        if rule == "PFR3":
+            print(
+                "::error file=%s%s::[PFR3] `%s` ends this pipeline and its status IS the "
+                "answer, while the writer is in-process: the reader exits on its first "
+                "match, the writer dies of EPIPE, and pipefail turns a pipeline that FOUND "
+                "its text into a false one. Use `grep -c ... >/dev/null` — it reads to end "
+                "of input and still exits 1 when there is no match — or, for a line number, "
+                "`... | cut -d: -f1 | sed -n 1p`. Offending line: %s"
+                % (shown, where, name, text[:160])
+            )
+            continue
         print(
             "::error file=%s%s::[%s] `%s` ends this pipeline, and the block runs with "
             "-e and pipefail: the writer takes SIGPIPE, exits 141, and that becomes the "
@@ -467,12 +627,14 @@ SH
     return 1
   fi
 
-  # An author who wrote `||` already said the status is not the verdict —
-  # including the `|| { ...; }` block form this repository's self-tests use.
+  # An author who wrote `||` said the 141 will not CRASH the script, which is
+  # all PFR1/PFR2 are about. It says nothing about the answer being right, which
+  # is why the same `||` is what makes a PFR3 pipeline a verdict — so the writer
+  # here is external, and the in-process one is asserted a few cases below.
   cat >"$tmp/bad.sh" <<'SH'
 set -euo pipefail
 grep -rn thing . | head -5 || true
-printf '%s\n' "$list" | grep -qx "$m" || { echo "missing: $m" >&2; exit 1; }
+grep -rlx "$m" . | grep -qx "$m" || { echo "missing: $m" >&2; exit 1; }
 SH
   if ! scan "$tmp" >/dev/null 2>&1; then
     echo "::error::[PFR-SELFTEST] the gate FAILED a guarded pipeline" >&2
@@ -507,14 +669,122 @@ SH
     *) echo "::error::[PFR-SELFTEST] expected PFR2, got: $out" >&2; return 1 ;;
   esac
 
-  # An `if` condition is explicitly NOT a finding — see the header. This is the
-  # exemption most likely to be "fixed" into a false-positive machine later.
+  # An `if` condition over an EXTERNAL writer stays out of scope. There is no
+  # process inside this shell to kill, so nothing inverts — and this is the form
+  # the repository is full of. It is the exemption most likely to be "fixed"
+  # into a false-positive machine later.
   cat >"$tmp/bad.sh" <<'SH'
 set -euo pipefail
 if find . -type f | grep -q needle; then echo yes; fi
 SH
   if ! scan "$tmp" >/dev/null 2>&1; then
-    echo "::error::[PFR-SELFTEST] the gate FAILED an if-condition, which is out of scope" >&2
+    echo "::error::[PFR-SELFTEST] the gate FAILED an if-condition over an external writer" >&2
+    return 1
+  fi
+
+  # PFR3, the shape that cost a CI run: an in-process writer feeding a reader
+  # whose status is the answer. No `-e` here on purpose — the whole point is
+  # that errexit is suspended in a condition and the 141 is read as `not found`.
+  cat >"$tmp/bad.sh" <<'SH'
+set -uo pipefail
+if printf '%s\n' "$code" | grep -q 'needle'; then echo yes; fi
+SH
+  if out=$(scan "$tmp" 2>&1); then
+    echo "::error::[PFR-SELFTEST] the gate PASSED an if-condition whose writer is a printf" >&2
+    return 1
+  fi
+  case "$out" in
+    *"file=bad.sh,line=2"*"[PFR3]"*) : ;;
+    *) echo "::error::[PFR-SELFTEST] expected a PFR3 annotation at bad.sh line 2, got: $out" >&2; return 1 ;;
+  esac
+
+  # …and the `||` form, which the PFR1/PFR2 rules treat as a WAIVER of the
+  # status and this one treats as a READ of it. Getting these two backwards is
+  # the single most likely way to break the gate while it still looks correct.
+  cat >"$tmp/bad.sh" <<'SH'
+set -uo pipefail
+check() { printf '%s\n' "$code" | grep -q 'needle' || return 1; }
+SH
+  if out=$(scan "$tmp" 2>&1); then
+    echo "::error::[PFR-SELFTEST] the gate PASSED a printf | grep -q whose status feeds ||" >&2
+    return 1
+  fi
+  case "$out" in
+    *"[PFR3]"*) : ;;
+    *) echo "::error::[PFR-SELFTEST] expected PFR3 for the || form, got: $out" >&2; return 1 ;;
+  esac
+
+  # A function defined in the same script is an in-process writer too — this is
+  # the `code "$1" | grep -q ...` shape the self-tests in this directory use,
+  # and the one that actually failed in CI.
+  cat >"$tmp/bad.sh" <<'SH'
+set -uo pipefail
+code() { grep -v '^#' "$1"; }
+has_thing() { code "$1" | grep -q 'thing' || return 1; }
+SH
+  if out=$(scan "$tmp" 2>&1); then
+    echo "::error::[PFR-SELFTEST] the gate PASSED a shell function feeding grep -q" >&2
+    return 1
+  fi
+  case "$out" in
+    *"file=bad.sh,line=3"*"[PFR3]"*) : ;;
+    *) echo "::error::[PFR-SELFTEST] expected PFR3 at bad.sh line 3, got: $out" >&2; return 1 ;;
+  esac
+
+  # NOT ONLY THE HEAD OF THE LIST. A condition's `&&` list reads the status of
+  # every element, and a gate that inspects only the first one leaves the same
+  # inversion sitting one segment further along — which is exactly where it was
+  # found in shared-infra-band.selftest.sh.
+  cat >"$tmp/bad.sh" <<'SH'
+set -uo pipefail
+if [ -n "$out" ] && printf '%s' "$out" | grep -q FAIL; then :; fi
+SH
+  if out=$(scan "$tmp" 2>&1); then
+    echo "::error::[PFR-SELFTEST] the gate PASSED a verdict pipeline in the SECOND element of an && list" >&2
+    return 1
+  fi
+  case "$out" in
+    *"file=bad.sh,line=2"*"[PFR3]"*) : ;;
+    *) echo "::error::[PFR-SELFTEST] expected PFR3 at bad.sh line 2 for the && list, got: $out" >&2; return 1 ;;
+  esac
+
+  # The recommended fixes must both be silent, or the gate has no landing place:
+  # `grep -c ... >/dev/null` reads to end of input, and `sed -n 1p` keeps
+  # reading where `head -1` would exit.
+  cat >"$tmp/bad.sh" <<'SH'
+set -uo pipefail
+code() { grep -v '^#' "$1"; }
+has_thing() { code "$1" | grep -c 'thing' >/dev/null || return 1; }
+line_of() { printf '%s\n' "$1" | grep -n 'thing' | cut -d: -f1 | sed -n 1p; }
+at() { grep -n -m1 'thing' "$1" | cut -d: -f1; }
+SH
+  if ! scan "$tmp" >/dev/null 2>&1; then
+    echo "::error::[PFR-SELFTEST] the gate FAILED one of the fixes it recommends" >&2
+    return 1
+  fi
+
+  # Without pipefail the pipeline's status is the READER's, which is 0 on a
+  # match — nothing to invert. Most `run:` blocks with the default shell are
+  # exactly this, so getting it wrong lights up the fleet.
+  cat >"$tmp/bad.sh" <<'SH'
+set -u
+if printf '%s\n' "$code" | grep -q 'needle'; then echo yes; fi
+SH
+  if ! scan "$tmp" >/dev/null 2>&1; then
+    echo "::error::[PFR-SELFTEST] the gate FAILED a printf | grep -q without pipefail" >&2
+    return 1
+  fi
+
+  # A FILE argument has no writer to kill, even though the reader is the same
+  # `grep -q` and the status is the same verdict. This is the exemption that
+  # keeps the rule narrow enough to be worth having.
+  cat >"$tmp/bad.sh" <<'SH'
+set -uo pipefail
+if grep -q 'needle' "$f" | cat; then echo yes; fi
+if LC_ALL=C grep -qE "$re" "$f"; then echo yes; fi
+SH
+  if ! scan "$tmp" >/dev/null 2>&1; then
+    echo "::error::[PFR-SELFTEST] the gate FAILED a grep with a file argument" >&2
     return 1
   fi
 
