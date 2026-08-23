@@ -27,9 +27,9 @@ posture you opt into knowingly. Read [Windows](#windows) before you declare one.
 1. **The GitHub App is installed on the repository.** The fleet authenticates as
    one App, not as a PAT. You need its **app id** and the **installation id**
    for the account that owns the repo — both non-secret. The private key is not
-   in any repository or state file; see step 3. The App needs **`Contents:
-   read`** if you are standing up a merge-queue pool (step 8) — without it the
-   pool keeps its Terraform ceiling and says nothing.
+   in any repository or state file; see step 3. The App needs
+   **`Contents: read`** if you are standing up a merge-queue pool (step 8) —
+   without it the pool keeps its Terraform ceiling and says nothing.
 2. **A GCP project, a VPC and a subnet** in the region the pool will run in.
    Hosts get no external IP: egress must already work from that subnet (in the
    MOT projects it is the peering to `mot-lz-vpc` through the central firewall —
@@ -516,7 +516,7 @@ module "ci_runner_pool_mq" {        # the Linux merge-queue pool
   # name only. The controller asserts this across its whole table at plan time.
   runner_labels = ["self-hosted", "linux", "gcp", "${var.github_repo}-merge-queue"]
 
-  max_hosts = var.mq_max_hosts   # a starting number only — see below
+  max_hosts = var.mq_max_hosts   # the hard stop, not the size — see below
 }
 
 module "ci_runner_controller" {

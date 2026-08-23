@@ -1,7 +1,9 @@
 # One controller, four pools — and the merge queue sized by its own configuration
 
-Status: **accepted** 2026-08-23. Delivered in five pull requests; the delivery
-table in §7 is the record of what is live.
+Status: **accepted** 2026-08-23, rollout in progress. The decision is settled;
+the capability is being delivered in five pull requests and adopted repository
+by repository after that. The delivery table in §7 is the record of what has
+actually landed — read it before assuming any part of this is live.
 Scope: every repository on the fleet.
 Related: [`ci-lane-model.md`](ci-lane-model.md) is the operational description of
 the same thing and is where the routing contract and the capacity formula are

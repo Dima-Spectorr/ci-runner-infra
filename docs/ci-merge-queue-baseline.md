@@ -278,9 +278,10 @@ declare `mode: parallel` with a covering scope map before arguing for runners.
 Two things above are now stale, and both are stale in the same direction: they
 describe a world where a width raise was somebody's homework.
 
-**1. The merge queue no longer spends the CI pool's ceiling.** Every repository
-now runs four pools — Linux CI, Windows CI, Linux merge-queue, Windows
-merge-queue — behind **one** controller
+**1. The merge queue no longer spends the CI pool's ceiling.** The fleet
+standard is now four pools per repository — Linux CI, Windows CI, Linux
+merge-queue, Windows merge-queue — behind **one** controller, and each
+repository adopts it as its own migration lands
 ([the lane model](ci-lane-model.md), [#274](https://github.com/Dima-Spectorr/ci-runner-infra/issues/274)).
 A pool carries a `role`, the merge-queue pools answer a disjoint label set, and
 speculative check runs are routed to them by a conditional `runs-on`. So the

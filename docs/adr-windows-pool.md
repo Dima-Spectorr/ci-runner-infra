@@ -94,8 +94,9 @@ existing contract.
 > Windows pool runs one controller VM between them, and its per-tick GitHub
 > sweep is shared rather than duplicated. Nothing else in this section changes:
 > a pool still has exactly one OS, the two pools still must never answer the
-> same labels, and `host_os` is still the variable that says which. A pool already serves one repository
-with one label set, and the two pools must never answer the same labels or
+> same labels, and `host_os` is still the variable that says which.
+
+A pool already serves one repository with one label set, and the two pools must never answer the same labels or
 GitHub will hand a Linux job to a Windows host. Two module blocks is how that is
 already expressed for two repositories, and an OS is a weaker distinction than a
 repository.
