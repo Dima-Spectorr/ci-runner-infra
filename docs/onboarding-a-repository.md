@@ -186,6 +186,43 @@ before giving up and registering anyway; `cache_snapshot_max_bytes` (4 GiB)
 refuses a snapshot too large to unpack safely. Every failure inside that budget
 is a log line and a cold first job, never a host that does not come up.
 
+### The remote build cache, which you configure by not configuring it
+
+A dependency cache saves downloading; a **build** cache saves building, and it
+does it *across* pull requests — where a path filter only ever helps inside one.
+On a monorepo that is the largest remaining term in a run (see
+`ci-optimization-catalog.md` 4.4).
+
+If your pool has `cache_snapshot_bucket`, you already have it. The host runs a
+Turborepo remote cache server and sets `TURBO_API`, `TURBO_TOKEN` and
+`TURBO_TEAM` for every slot, so `turbo` finds it with **no workflow change, no
+bucket of your own, no token to rotate and no `gcloud` call in your build**.
+Artifacts live under `turbo/<owner>/<repo>/` in the same bucket, so two pools
+serving one repository share hits and two repositories share nothing.
+
+That default is deliberate and it is the point of the layer. The one repository
+in this fleet that wired a build cache into its own workflows ran it **stone cold
+for weeks** while every run stayed green: a hand-wired cache fails as one warning
+per artifact, and nobody reads two hundred of those. A capability every
+repository has to assemble by hand is a capability most of them will have
+subtly, invisibly wrong.
+
+Three things worth knowing before you look for a knob:
+
+* **Your jobs cannot write to it, and the misses you see on a new branch are
+  correct.** A host runs pull-request code, and a turbo artifact is a tarball
+  the next build unpacks into its output tree and reports as its own result — so
+  a job that could publish one would hand every later build in the repository
+  its output. Uploads are accepted and discarded, which is why your build log
+  says it uploaded and a later run still misses. The store is filled from your
+  **default branch**, by an identity that never runs pull-request code.
+* **Nothing about it can fail your job.** A server that does not start, a bucket
+  that cannot be read, an artifact over the size bound: every one of them is a
+  cache miss and a task that builds normally. The host logs the verdict.
+* **`turbo_cache_bucket` exists, and you should not need it.** Unset follows
+  `cache_snapshot_bucket`; `""` turns the layer off for a pool that must hydrate
+  dependencies but serve no build artifacts; a name points it somewhere else.
+
 ### If your jobs run in a container from a private registry
 
 `jobs.<id>.container` and `services:` images are pulled by the slot's own
