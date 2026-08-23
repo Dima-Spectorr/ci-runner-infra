@@ -329,6 +329,16 @@ jobs:
       - name: beacon-decision self-test
         run: bash scripts/ci/beacon-decision.selftest.sh
 
+      # The veto that stops the controller taking away a host a pull request is
+      # still using. Both directions are asserted, and they are not symmetric: a
+      # wrong `free:` deletes a host a run named by label -- taking the shared
+      # database on it with it -- while a wrong `hold:` keeps one machine warm
+      # until the hold lapses. The monotonic cases are the security ones; guest
+      # attributes are writable by any process on the VM, so a co-tenant job can
+      # publish a valid-but-expired hold over a live one.
+      - name: pin-hold-decision self-test
+        run: bash scripts/ci/pin-hold-decision.selftest.sh
+
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a
       # mis-restarted controller publishes nothing at all while systemd reports

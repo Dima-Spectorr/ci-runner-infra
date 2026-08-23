@@ -55,6 +55,14 @@ output "metric_names" {
       # are being replaced underneath live runs — recycling too aggressively, or
       # preemption — not that the cancel logic is working hard.
       "ci_pinned_runs_cancelled",
+      # Removals this pool decided on and then declined to carry out because the
+      # host held a live pin hold. Scale-in deliberately deferred, not an error:
+      # read alongside ci_demand_pinned, the two together are "the pool is
+      # holding hosts for runs in flight". Sustained non-zero with no pinned
+      # demand is the opposite — a hold that is not lapsing, which is the shape
+      # an abandoned or forged one makes, and the reason the controller clamps
+      # every hold to PIN_HOLD_MAX.
+      "ci_pin_holds_honoured",
       "ci_hosts_running",
       "ci_hosts_max",
       "ci_hosts_draining",

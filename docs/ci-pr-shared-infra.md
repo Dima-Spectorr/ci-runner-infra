@@ -307,6 +307,22 @@ network namespace, so `127.0.0.1` is the wrong address there:
 
 ### Sizing the TTL
 
+**Nothing you can write shortens a hold, including your own release.** The
+controller remembers the greatest expiry it has ever seen for a host and judges
+against that, so the value in front of it can only ever push the deadline
+further out. That is not tidiness: guest attributes are writable by every
+process on the VM, so without it the cheapest attack on this design would be to
+publish a valid-but-expired hold over a neighbour's live one and have the
+controller delete the host, and the shared stack on it, for you. The practical
+consequence for a normal run is small and worth knowing: after your teardown the
+host may stay up until the hold would have lapsed anyway. Size the TTL for the
+gap between your jobs, not for the length of the run.
+
+Two bounds sit on top of that. The controller **clamps** any hold to the same
+ceiling the host helper clamps `--ttl` to, so a hold written ten years out buys
+nothing; and a **malformed** hold keeps the host rather than freeing it, because
+a broken publisher must not read as consent to delete.
+
 **The hold expires on wall-clock time from when it was written, and the release
 path tears the stack down when it lapses.** A run that outlives its hold loses
 its database mid-test -- the failure this contract exists to prevent, arriving

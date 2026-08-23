@@ -272,11 +272,24 @@ means keeping the host rather than dropping it — a broken publisher must not
 read as consent to delete.
 
 The same cache is what makes §2.6 work after the last Linux job has finished;
-it records the run the hold names, not only the deadline.
+it records the run the hold names, not only the deadline. **That second reader
+is not built yet** — the veto writes the record, and nothing reads it back. It
+is deliberately a separate change, because it is not a veto: it decides whether
+to CANCEL a run whose Linux host went away underneath a Windows tail, which is
+cross-pool, irreversible, and answerable only for a hold that has already
+lapsed. Tracked as its own issue rather than left as an implied half of this
+one.
 
 The helper ships with the host in phase 3, the veto in phase 4 — the delivery
 table says so, because a hold whose writer is nobody's phase is how this arrives
 half-built.
+
+**What the veto costs when nothing goes wrong: one guest-attribute read, for a
+host the controller was about to remove.** It is not asked for every host on
+every tick — that is the difference between a veto on the verdict and an
+argument to the rule, and at fleet scale it is also the difference between
+staying inside the per-instance rate limit and manufacturing the failure that
+reads as "keep everything".
 
 ### 2.6 A host that disappears must fail the run, not hang it
 
