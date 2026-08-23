@@ -1036,6 +1036,12 @@ from a judgement call into a reading of a cliff.
   1 is a fleet-level change; recompute the runner budget in the same pull
   request.
 
+- **Do not read a queue that is slow to start as a queue that is busy.** Between
+  nine and twenty minutes of a green pull request sitting on "under evaluation"
+  is a missed webhook, not throughput, and no amount of `batch_size` or `mode`
+  fixes it. See
+  [CI is green and Mergify has not heard about it](#the-other-invisible-wait-ci-is-green-and-mergify-has-not-heard-about-it).
+
 Added 2026-08-19, all four about `mode`:
 
 - **Do not use `mode: isolated`.** Ever. It removes the dependency between
@@ -1147,6 +1153,194 @@ two carry opposite advice — wait, versus grant a permission — and a counter 
 moves for either tells the reader neither. The alert key is `parkeddenied`, at
 30 minutes: one refused sweep during a GitHub incident is not a page, five in a
 row is.
+
+---
+
+## The other invisible wait: CI is green and Mergify has not heard about it
+
+The section above is about a pull request that never enters the queue. This one
+is about a pull request that will enter it, is entitled to enter it right now,
+and does not — for between nine and twenty minutes, with nothing anywhere going
+red.
+
+**Mergify is event-driven, not polling.** It advances a pull request when GitHub
+delivers it a webhook, and for "CI finished" that webhook is
+`check_run.completed`. When the delivery is missed or late, the pull request
+sits with every required check green and `Mergify Merge Protections` showing
+*"Your merge queue conditions are under evaluation. Be patient, this will be
+updated soon"* — with an empty queue ahead of it. That message is indefinite. It
+is the same message a pull request shows three seconds before it embarks.
+
+Measured in `ci-runner-infra` on 2026-08-23, from the last required check
+reporting success to Mergify acting:
+
+| pull request | idle |
+|---|---|
+| #332 | 8m55s |
+| #328 | 11m06s |
+| #326 | 17m24s |
+| #333 | 20m01s |
+
+**And the control that says this is the webhook, not Mergify being slow.**
+Mergify reacts to *its own merges* in **13–14 seconds**, three times out of
+three: the next queue entry's CI run was created 13 seconds after the previous
+pull request merged. It knows about that internally and needs no webhook. The
+two orders of magnitude between the two numbers is the whole finding.
+
+Reproduced deliberately on #339: three required checks green at 19:34:28, still
+"under evaluation" at 19:43:52, one `@mergifyio refresh` posted at 19:45:27, and
+"In merge queue" inside sixty seconds. **The stall is real, it is not the CI, and
+a single comment clears it.**
+
+### The fix, and why it is a comment
+
+`@mergifyio refresh` re-evaluates a pull request's conditions. There is no API
+alternative to automate instead: Mergify's API is `https://api.mergify.com/v1/`,
+its pull-request surface is two `…/pulls/{n}/scopes` endpoints, and refresh
+exists only as the comment command. An API route would also make every consuming
+repository provision a Mergify application key as a secret — a real adoption cost
+for a mechanism whose whole value is being free.
+
+So the fleet publishes a reusable workflow, `mergify-nudge.yml`, and a consumer
+copies in the trigger and nothing else.
+
+### What a consuming repository adds
+
+**Two things, and both are required.** Either one alone is inert.
+
+**1. The trigger.** `workflow_run` cannot live in a reusable workflow —
+`workflow_call` is the only trigger a callee may declare — so this file is the
+consumer's, and it is the entire consumer-side cost:
+
+```yaml
+# .github/workflows/mergify-nudge.yml
+name: Mergify nudge
+
+on:
+  workflow_run:
+    # The `name:` key of the workflow that runs your required checks. By NAME:
+    # `workflow_run` offers no path handle, so renaming that workflow detaches
+    # this one silently.
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mergify-nudge-${{ github.event.workflow_run.head_branch || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  nudge:
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/mergify-nudge.yml@v5
+    permissions:
+      contents: read
+      pull-requests: write
+```
+
+A repository whose required checks come from **more than one workflow** lists
+them all under `workflows:`; the nudge is idempotent and self-suppressing, so the
+extra dispatches cost API calls and post nothing.
+
+**2. The sender permission.** The nudge posts as `github-actions[bot]`, which is
+not a repository collaborator. Mergify checks the permission of whoever posted a
+command, the default restriction on `refresh` is `sender-permission >= write`,
+and GitHub answers that question about the bot with less than write. Mergify
+then discards the command **in silence** — no reply, no reaction, nothing in the
+thread that distinguishes "ignored" from "the stall was going to end anyway".
+This block in `.mergify.yml` is what admits it:
+
+```yaml
+commands_restrictions:
+  refresh:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = github-actions[bot]
+```
+
+Declaring the key **replaces** the default rather than adding to it, which is why
+the write clause is restated. Widening `refresh` to a bot widens very little:
+refresh re-evaluates conditions that are already written down, and cannot
+approve, bypass, queue or merge.
+
+### Why it usually posts nothing
+
+A nudge fired unconditionally would be a comment per CI run per pull request —
+on the majority of runs where the webhook arrived perfectly well. Comment noise
+is how an automation gets muted, and a muted automation is worse than none
+because it still looks installed.
+
+So the workflow waits out a grace period (60s by default, roughly four times
+Mergify's own measured reaction time), then asks GitHub a question with a factual
+answer: **has any check-run belonging to the Mergify app been touched at or after
+the moment CI finished?** If yes, Mergify has already seen this world. Only a
+Mergify that is demonstrably behind gets a comment. It re-asks every 30s, four
+times, so a merely-late webhook still costs nothing but API calls.
+
+The two ways that question can be wrong are deliberately asymmetric. A false
+"behind" costs one redundant comment and a no-op refresh. A false "caught up"
+costs nothing new — it leaves the pull request exactly where it is today. Neither
+can merge anything that was not already going to merge.
+
+**Success and failure both.** A red check is a queue event as much as a green
+one: a queued pull request whose failure Mergify has not seen holds the front of
+a serial queue until `checks_timeout` (30 minutes in the reference config) while
+everything behind it waits out a decision that was already made. `cancelled`,
+`skipped`, `stale` and `action_required` are deliberately **not** nudged — a
+cancelled run means `cancel-in-progress` superseded it and a newer run is already
+in flight to nudge in its place.
+
+### It does not run on the pull request that adds it
+
+GitHub dispatches `workflow_run` from the **default branch only**. The pull
+request that adds or changes the nudge cannot exercise it, whatever CI says, and
+no arrangement of jobs fixes that — it is a property of the trigger.
+
+Two consequences, and both are the consumer's to accept:
+
+- **The first evidence is the first CI completion after the merge.** Watch it.
+  The workflow log says which branch it took: *"Mergify re-evaluated … on its own
+  … no nudge needed"* is the healthy path, *"nudged pull request #N"* is the
+  stall being cleared.
+- **`scripts/ci/mergify-nudge.selftest.sh` stands in for the run that cannot
+  happen.** It asserts the structure of both workflow files and of the
+  `commands_restrictions` block, each property with a mutation that must make it
+  fail, and it runs as an ordinary pull-request check. A property asserted
+  without a mutation beside it is asserted by hope.
+
+### How to tell it is not working
+
+The failure mode is silence, so check for the specific silence:
+
+1. The nudge workflow ran and logged `nudged pull request #N`.
+2. A comment starting `@mergifyio refresh` is on the pull request.
+3. **Mergify did not react to it** — no reply, no reaction, no state change
+   within a minute.
+
+That combination means the sender is being filtered: the
+`commands_restrictions` block is missing, misspelled, or under the wrong command
+name. It is the only failure that looks exactly like the problem it was added to
+solve.
+
+### What a consuming repository must not do
+
+- **Do not add the trigger without the `commands_restrictions` block.** Every
+  nudge is then discarded in silence and the repository believes it is fixed.
+- **Do not fork the callee.** The nudge's logic lives once, here, for the same
+  reason `shared-infra-anchor.yml` does: fourteen copies is fourteen copies of
+  every future fix.
+- **Do not remove the grace period to "react faster".** It is what keeps the
+  automation quiet enough to stay installed, and it costs at most 60 seconds on
+  a stall that is measured in tens of minutes.
+- **Do not let `grace-seconds + (attempts - 1) × interval-seconds` approach the
+  queue's `checks_timeout`.** A nudge that arrives after the entry has been
+  dequeued for a timeout is telling Mergify about a pull request it stopped
+  tracking.
+- **Do not point `workflows:` at a workflow name you are about to change.** The
+  detachment is silent; nothing goes red, the nudge simply stops being
+  dispatched.
 
 ---
 

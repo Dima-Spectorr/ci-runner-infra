@@ -613,6 +613,35 @@ it**. Both steps, who can perform each, and how to verify from the controller
 rather than from a settings page:
 [`github-app-permissions.md`](github-app-permissions.md).
 
+## 9. Wire the Mergify nudge
+
+Everything above makes CI fast. This is about the gap **after** CI, which no
+amount of pool tuning touches: Mergify is event-driven, and when GitHub's
+`check_run.completed` webhook is missed or late, a fully green pull request sits
+on *"your merge queue conditions are under evaluation"* with an empty queue ahead
+of it. Measured in `ci-runner-infra` on 2026-08-23: **8m55s, 11m06s, 17m24s and
+20m01s**, against 13–14 seconds when Mergify reacts to an event it generated
+itself. It is invisible from every pool metric, because no runner is involved.
+
+Two files, both required, neither optional:
+
+- a `workflow_run` workflow in the consuming repository that calls
+  `ci-runner-infra`'s published `mergify-nudge.yml`, and
+- a `commands_restrictions.refresh` block in `.mergify.yml` that admits
+  `github-actions[bot]` as a sender — without it Mergify discards every nudge in
+  silence.
+
+**This applies whatever runs your CI.** The nudge keys off a *completed workflow
+run*, so it fits any repository whose required checks are GitHub Actions jobs —
+on the fleet pools or on GitHub-hosted runners, one workflow or several. The
+copy-in snippets, the defaults, why it posts nothing on a healthy run, and how to
+tell it is being silently filtered:
+[`ci-merge-queue-baseline.md`](ci-merge-queue-baseline.md#the-other-invisible-wait-ci-is-green-and-mergify-has-not-heard-about-it).
+
+One property to accept before you wire it: **`workflow_run` is dispatched from
+the default branch only**, so the pull request that adds the nudge cannot run it.
+The first evidence is the first CI completion after the merge — watch that one.
+
 ## Windows
 
 Windows is a **first-class pool of the same module**. There is no separate

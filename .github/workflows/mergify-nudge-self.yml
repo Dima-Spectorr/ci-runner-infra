@@ -1,0 +1,58 @@
+name: Mergify nudge (this repository)
+
+# This repository publishes the nudge, so it is the first place the nudge has to
+# hold — the same argument `support-windows-self.yml` and `ci.yml` already make
+# for every other rule shipped from here.
+#
+# And it is not a formality. The four measurements in `mergify-nudge.yml` (8m55s
+# to 20m01s of idle time between the last green check and Mergify acting) were
+# all taken HERE, on this repository's own pull requests, which is what makes it
+# the repository with the most standing to say the mechanism works.
+#
+# THE TRIGGER CANNOT LIVE IN THE REUSABLE WORKFLOW.
+#
+# `workflow_call` is the only trigger a callee may declare, so the `workflow_run`
+# half is necessarily the consumer's. That is the entire content of this file,
+# and the entire content of the equivalent file in every consuming repository —
+# which is the point: the ninety lines that decide anything live once, in the
+# callee, and moving them there costs each consumer this much and no more.
+#
+# THIS FILE DOES NOT RUN ON THE PULL REQUEST THAT CHANGES IT.
+#
+# GitHub dispatches `workflow_run` from the DEFAULT BRANCH only. A change here
+# is unexercised until it merges, whatever CI says, and the first evidence it
+# works is the first CI completion on main afterwards. Watch that one.
+# `scripts/ci/mergify-nudge.selftest.sh` is what stands in for the run that
+# cannot happen: it asserts the structure of both files, with mutations, so a
+# property that is silently removed fails a check that CAN run on a pull
+# request.
+
+on:
+  workflow_run:
+    # By NAME, which is the only handle `workflow_run` offers — not a path. So
+    # renaming `ci.yml`'s `name:` key detaches this workflow silently, and the
+    # self-test asserts the two agree for exactly that reason.
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the branch, so a newer CI completion cancels a nudge that is still
+  # sitting in its grace period for an older run of the same branch. The older
+  # nudge would be asking about a superseded commit, and the newer run's own
+  # nudge is the one that carries current information.
+  #
+  # `head_branch` can be empty on a run this workflow does not act on anyway, so
+  # `run_id` keeps the group distinct rather than collapsing every such run into
+  # one that cancels itself.
+  group: mergify-nudge-${{ github.event.workflow_run.head_branch || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  nudge:
+    uses: ./.github/workflows/mergify-nudge.yml
+    permissions:
+      contents: read
+      pull-requests: write
