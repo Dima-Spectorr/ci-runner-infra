@@ -513,6 +513,18 @@ data "google_compute_zones" "available" {
   status  = "UP"
 }
 
+# ADDING `count` RENAMES THE RESOURCE. `google_compute_instance.controller`
+# becomes `…controller[0]`, and an address a state file does not recognise is a
+# create — of a VM whose name is already taken — next to a destroy of the
+# controller that is currently running the fleet. Terraform does reconcile the
+# no-key/index-zero pair on its own in current versions, but "does, today,
+# quietly" is not the compatibility story this variable promises; the `moved`
+# block says it out loud, and says it in the plan.
+moved {
+  from = google_compute_instance.controller
+  to   = google_compute_instance.controller[0]
+}
+
 resource "google_compute_instance" "controller" {
   count = var.manage_controller ? 1 : 0
 
