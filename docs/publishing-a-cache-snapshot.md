@@ -3,6 +3,14 @@
 A pool's hosts **read** a snapshot on boot and never write one. This is the other
 half: the scheduled run that builds it.
 
+> **Read `modules/ci-runner-cache-warmer` first — this document is the fallback
+> now.** That module does everything below from Cloud Build, in the project that
+> owns the bucket: no workflow file, no workload-identity federation, no OIDC
+> attribute mapping, no schedule in your repository, and it fills the *build*
+> cache in the same run. Follow this document only when your build genuinely
+> cannot run in Cloud Build — or when the project has no Cloud Build GitHub
+> connection yet.
+
 Read `modules/ci-runner-cache-publisher/README.md` first for *who* may publish
 and why it cannot be a host. This document is *what* to run.
 

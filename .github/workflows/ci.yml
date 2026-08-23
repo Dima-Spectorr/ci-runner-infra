@@ -574,6 +574,16 @@ jobs:
       - name: runner policy
         run: bash scripts/ci/check-runner-policy.sh --forks=allowed
 
+      # …and the worked example seven repositories are about to copy. The
+      # rules above cannot be turned on over THIS repository's workflows yet
+      # (see the comment on the step before), so the example is where they are
+      # exercised against a real file rather than an inline fixture. Clean is
+      # only half of it: the check also mutates the example three ways and
+      # asserts each is reported, because an example that trips nothing can
+      # drift arbitrarily far from the contract while still reading green.
+      - name: shared-infra worked example
+        run: bash scripts/ci/check-shared-infra-example.sh
+
       # Whether a version is still supported. The rule is asserted here rather
       # than discovered on a fleet, because its wrong direction is a REPORT that
       # says nothing: `eol: false` in the upstream feed means "no end-of-life
@@ -651,6 +661,14 @@ jobs:
       # make one" and "Saved plan is stale, just -auto-approve it".
       - name: apply-trigger self-test
         run: bash scripts/ci/apply-trigger.selftest.sh
+
+      # The cache warmer is the one job in this fleet whose every failure is
+      # silent: it runs at 4am, nobody watches it, and a warmer that publishes
+      # to the wrong prefix, publishes nothing, or is never fired all present as
+      # "the cache is cold" — the same observable as a fleet that never had one.
+      # These checks are structural for that reason: there is no run to inspect.
+      - name: cache-warmer self-test
+        run: bash scripts/ci/cache-warmer.selftest.sh
 
       # The browser image a pool BAKES and the one a consumer is told to RUN are
       # two different lines that must name one release. When they drift nothing

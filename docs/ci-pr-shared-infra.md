@@ -6,6 +6,18 @@ the measurements and the rejected alternatives, is
 `RUNNER9`/`RUNNER10`/`RUNNER11` in `scripts/ci/check-runner-policy.sh`
 ([`ci-workflow-gates.md`](ci-workflow-gates.md)).
 
+**Copy the file, not the snippets.**
+[`examples/pr-shared-infra.yml`](examples/pr-shared-infra.yml) is the whole
+contract as one workflow — anchor/owner, a Linux consumer, a Windows consumer
+and a declared exemption. The fragments below are quoted from it to explain one
+decision at a time; the file is the one that is *checked*.
+`scripts/ci/check-shared-infra-example.sh` runs on every pull request to this
+repository and asserts both that the gate reports it clean and that three
+mutations of it are each reported — so an example that has drifted away from
+the rules fails here rather than in the repository that copied it. A snippet in
+prose has no such guard, and this document has already shipped an owner marker
+in a spelling the gate does not read.
+
 Adopt it **after** [`ci-lane-model.md`](ci-lane-model.md). The lane rule decides
 how much CI a diff deserves; this decides where that CI runs. A repository that
 pins jobs to a host before it has an aggregate required check has pinned the
@@ -143,6 +155,34 @@ gate is run with `--allow-dynamic-runner` once this contract is adopted.
 `RUNNER9` supplies the specificity that flag gives up: not merely an expression,
 but one naming the anchor job's output.
 
+### Do not put the fork guard in the anchor's `if:`
+
+`if: github.event.pull_request.head.repo.fork == false` on the anchor looks
+equivalent to routing and is not. A job that `needs:` a **skipped** job is
+itself skipped, so guarding the anchor skips every consumer with it, and a fork
+pull request gets no CI at all — the routing expression on `test` is never even
+evaluated, because `test` never starts. Nothing goes red: a skipped required
+check is not a failed one.
+
+So the anchor **routes** rather than skipping, exactly as its consumers do, and
+publishes a hosted array on a fork so the whole run degrades together:
+
+```yaml
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","gcp","<Repo>"]') }}
+```
+
+That still keeps fork code off a credentialed warm host, which is all `RUNNER4`
+asks. A fork run then has no pin and no shared stack, so the anchor publishes
+`addr` and `pg` **empty** — a blank value a consumer can test, rather than the
+literal `null` a missing output produces — and a suite that needs the stack
+either brings up its own throwaway service on that leg or does not run on
+forks.
+
+An `if:` guard is still right for a job **nothing needs**, such as the Windows
+leg: there is no hosted substitute for what it tests, so skipping it is the
+answer. A repository whose lane model makes that check required has to let a
+skip satisfy it.
+
 ## 3. The infrastructure owner job
 
 Exactly one job in the workflow brings the stack up, and it is the anchor.
@@ -159,7 +199,10 @@ host-side" below.
     name: Shared infra (anchor)
     needs: lane
     if: needs.lane.outputs.lane != 'none'
-    # ci: shared-infra-owner    <- the marker RUNNER10 counts
+    # shared-infra-owner(anchor): brings up the compose stack in a run step
+    #   ^ the marker RUNNER10 counts. The spelling is load-bearing and it names
+    #     the job: a marker that named nothing would excuse whatever the file
+    #     happened to contain, including a job added later.
     runs-on: [self-hosted, linux, gcp, '<Repo>']
     # The bring-up, and nothing else. This job has to END for its outputs to
     # reach the jobs that need them.

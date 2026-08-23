@@ -242,9 +242,27 @@ The rule therefore reads the **label**. `container:` on the Linux pool is how
 that pool is meant to be used, and a hosted `windows-2022` image is not this
 fleet and does run containers; only a fleet-reachable job naming the `windows`
 platform label is refused, case-insensitively, and a matrix is judged per leg.
-`scripts/ci/check-runner-policy.selftest.sh` mutates the gate seven ways and
+`scripts/ci/check-runner-policy.selftest.sh` mutates the gate nineteen ways and
 asserts its fixture suite FAILS for each — a detector that has not been seen to
 fire is not a detector.
+
+### The worked example is checked, so the thing you copy cannot rot
+
+[`docs/examples/pr-shared-infra.yml`](examples/pr-shared-infra.yml) is the whole
+contract as one workflow, and it is what an adopting repository copies.
+`scripts/ci/check-shared-infra-example.sh` runs on every pull request here and
+makes the argument in both directions: the gate reports the example CLEAN, and
+three mutations of it — the consumer naming its pool directly, a second owner
+marker, the Windows job dialling `localhost` on a band port — are each
+REPORTED, with the rule id.
+
+Clean on its own would prove almost nothing, because almost anything is clean
+under `--shared-infra`; a file with one hosted job is clean. The mutations are
+what say the example sits ON the edge of each rule rather than somewhere
+comfortably inside it, which is the same argument the gate's own mutation suite
+makes about the gate. Without it a snippet ships its defects to seven
+repositories at once and surfaces them one pool at a time — this document set
+had already published the owner marker in a spelling the gate does not read.
 
 ### `--forks` is declared, not guessed
 
