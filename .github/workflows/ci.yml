@@ -420,6 +420,15 @@ jobs:
       - name: job credential broker self-test
         run: python3 scripts/ci/job-broker.selftest.py
 
+      # The build cache is served TO job code, so its bug is the mirror of the
+      # broker's: an upload that reached the store would let one pull request
+      # hand every later build in that repository a tarball the build unpacks
+      # into its own output tree. The rest of the suite covers the other half —
+      # a server that is subtly wrong here presents as "cache enabled, build
+      # slow", which is precisely the failure that went unnoticed for weeks.
+      - name: turbo remote cache self-test
+        run: python3 scripts/ci/turbo-cache.selftest.py
+
       # This rule decides whether a consuming repository runs CI at all, so a
       # wrong verdict is the one that merges untested code while reporting
       # green. Asserted here, in the repository that publishes it, rather than

@@ -772,6 +772,95 @@ variable "cache_snapshot_max_bytes" {
   }
 }
 
+variable "turbo_cache_bucket" {
+  description = <<-EOT
+    Bucket holding the REMOTE BUILD CACHE this pool's hosts serve to their slots
+    (Turborepo artifacts), under `turbo/<owner>/<repo>/`.
+
+    Leave it unset — the default — and it follows `cache_snapshot_bucket`. A
+    project that already runs `ci-runner-cache-bucket` therefore serves its
+    repositories a build cache without adding anything, and a repository's
+    workflows need no `TURBO_API`, no token, and no bucket of their own: the
+    host sets those for every slot. That default is the feature. The one
+    repository in this fleet that wired a build cache into its own workflows ran
+    it permanently cold for weeks while every run stayed green, because a
+    hand-wired cache fails as a warning per artifact.
+
+    `""` turns the layer off for this pool while leaving the dependency snapshot
+    on. A name points it at a different bucket than the snapshots come from.
+
+    Whatever it resolves to, the grant it creates is `roles/storage.objectViewer`
+    conditioned on this repository's prefix. READ ONLY, and not a default to be
+    relaxed: a host executes pull-request code, and a build artifact is a tarball
+    the next build unpacks into its output tree and reports as its own result, so
+    a host that could write here would let one pull request hand every later
+    build its output. Writing belongs to the warmer, which builds the default
+    branch and never runs pull-request code.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    # The same door `cache_snapshot_bucket` closes, for the same reason: this
+    # value is interpolated into a CEL condition inside a quoted literal, and a
+    # name carrying a double quote could rewrite that expression into one that is
+    # unconditionally true — turning a grant scoped to one repository's prefix
+    # into bucket-wide read over every repository's build artifacts.
+    condition     = var.turbo_cache_bucket == null || var.turbo_cache_bucket == "" || can(regex("^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$", var.turbo_cache_bucket))
+    error_message = "turbo_cache_bucket must be a bucket NAME (3-63 characters, lowercase letters, digits, dots, hyphens and underscores), \"\" to turn the build cache off for this pool, or unset to follow cache_snapshot_bucket."
+  }
+}
+
+variable "turbo_cache_port" {
+  description = <<-EOT
+    Port the host's build-cache server listens on, reachable from this host's
+    slots and REJECTed on the primary interface.
+
+    It must differ from `job_broker_port`, which the template asserts: two
+    services on one port means one of them does not start, and the one that
+    loses is decided by boot ordering rather than by anything written down.
+  EOT
+  type        = number
+  default     = 8082
+}
+
+variable "turbo_cache_disk_budget_bytes" {
+  description = <<-EOT
+    How much of the boot disk the host may keep build artifacts on.
+
+    The server caches what it read from the bucket so a second slot needing the
+    same artifact does not fetch it again; this bounds that copy. It shares the
+    disk with every slot's workspace and every image layer, and a full disk does
+    not slow a build down — it fails every job on the host at once, which is a
+    worse outcome than the re-reads this directory exists to avoid.
+  EOT
+  type        = number
+  default     = 8589934592
+
+  validation {
+    condition     = var.turbo_cache_disk_budget_bytes >= 1073741824 && var.turbo_cache_disk_budget_bytes <= 68719476736
+    error_message = "turbo_cache_disk_budget_bytes must be between 1 GiB and 64 GiB; below that the local copy holds too little of a monorepo's artifacts to be worth its scan, above it no boot disk in this fleet has the room."
+  }
+}
+
+variable "turbo_cache_max_artifact_bytes" {
+  description = <<-EOT
+    Refuse a single artifact larger than this.
+
+    The bound is on what one request may pull into the server's memory, so it is
+    a property of the host rather than of any repository's build. An artifact
+    over the bound is served as a miss and the task is rebuilt, which costs time
+    and nothing else.
+  EOT
+  type        = number
+  default     = 536870912
+
+  validation {
+    condition     = var.turbo_cache_max_artifact_bytes >= 1048576 && var.turbo_cache_max_artifact_bytes <= 4294967296
+    error_message = "turbo_cache_max_artifact_bytes must be between 1 MiB and 4 GiB; below that ordinary build outputs are refused, above it one request can take the host's memory."
+  }
+}
+
 variable "shared_infra_id" {
   description = <<-EOT
     Identifier of the shared-infrastructure PAIR this pool belongs to — one

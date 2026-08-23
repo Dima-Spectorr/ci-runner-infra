@@ -94,6 +94,14 @@ SLOTS=$(md "instance/attributes/ci-slots")
 POOL=$(md "instance/attributes/ci-pool")
 JOB_SA=$(md "instance/attributes/ci-job-service-account")
 BROKER_PORT=$(md "instance/attributes/ci-job-broker-port")
+# The Turborepo remote cache this host SERVES to its slots. Empty bucket = the
+# layer is off and every slot runs exactly as it did before these keys existed,
+# which is what lets a host booted from an older template stay correct.
+TURBO_BUCKET=$(md "instance/attributes/ci-turbo-bucket")
+TURBO_PREFIX=$(md "instance/attributes/ci-turbo-prefix")
+TURBO_PORT=$(md "instance/attributes/ci-turbo-port")
+TURBO_DISK_BUDGET=$(md "instance/attributes/ci-turbo-disk-budget-bytes")
+TURBO_MAX_ARTIFACT=$(md "instance/attributes/ci-turbo-max-artifact-bytes")
 HOSTNAME_SHORT=$(md "instance/name")
 # Registry hosts the job identity authenticates to. Comma-separated, set by the
 # module; see write_docker_cred_helpers for why the list is explicit.
@@ -128,6 +136,16 @@ METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 TS_MAX_TIME=10
 
 BROKER_PORT=${BROKER_PORT:-8081}
+
+TURBO_PORT=${TURBO_PORT:-8082}
+# Set by start_turbo_cache when the layer comes up, and read by install_slot to
+# decide whether a slot is told about the cache at all. Declared here so the two
+# are not ordered by accident: a slot must never be handed TURBO_API for a
+# server that failed to start, because turbo would then spend a request per task
+# on a connection refused instead of building.
+TURBO_TOKEN=""
+TURBO_DISK_BUDGET=${TURBO_DISK_BUDGET:-8589934592}
+TURBO_MAX_ARTIFACT=${TURBO_MAX_ARTIFACT:-536870912}
 
 SLOTS=${SLOTS:-1}
 
@@ -335,6 +353,98 @@ EOF
       "http://127.0.0.1:$BROKER_PORT/computeMetadata/v1/instance/service-accounts/default/token" \
       >/dev/null 2>&1; then
       log "job credential broker serving $JOB_SA on 127.0.0.1:$BROKER_PORT"
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# --- the Turborepo remote cache this host serves ------------------------------
+#
+# The repository configures nothing. A monorepo's build cache is the largest
+# remaining win on this fleet (docs/ci-optimization-catalog.md, 4.4), and the one
+# repository that built one by hand ran it COLD for weeks without noticing,
+# because a hand-wired cache fails as a warning per artifact in a green run. So
+# the host serves it and points every slot at it, the same way it serves job
+# credentials: one thing to get right, in one place, reviewed with the module.
+#
+# READ-ONLY, and that is not a stage on the way to something else — see the
+# header of turbo-cache-server.py. A host runs pull-request code; a cache that
+# job code could write is one pull request handing the next build a tarball that
+# is unpacked into its output tree and treated as its own result.
+#
+# Fails OPEN. Every failure here costs cache hits and nothing else, and a host
+# that refused to register over a cache would turn a speed layer into an
+# outage — the exact trade the snapshot layer already declines.
+start_turbo_cache() {
+  local src
+  src=$(md "instance/attributes/ci-turbo-cache-py")
+  [ -n "$src" ] || { log "turbo cache: server source missing from metadata"; return 1; }
+
+  printf '%s' "$src" >/opt/ci/turbo-cache-server.py
+  chmod 0755 /opt/ci/turbo-cache-server.py
+
+  # A per-BOOT token, generated here and never persisted. It is not the security
+  # boundary — the port is REJECTed on the primary interface and every slot on
+  # this host may read the same artifacts anyway (see _authorized in the
+  # server) — so its whole job is to make a workflow that points TURBO_API
+  # somewhere else, or brings a token of its own, fail loudly instead of reading
+  # this cache under a team name that means nothing here.
+  # Held in a local until the server has ANSWERED, and only then published as
+  # TURBO_TOKEN: install_slot reads that variable as "the cache is up", so
+  # setting it here would point every slot at a server this function is about to
+  # give up on.
+  local tok
+  tok=$(openssl rand -hex 16 2>/dev/null) || tok=""
+  [ -n "$tok" ] || { log "turbo cache: could not generate a token"; return 1; }
+
+  cat >/etc/systemd/system/ci-turbo-cache.service <<EOF
+[Unit]
+Description=Turborepo remote cache, read-only ($POOL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root, for the same reason the job broker is: this is the only thing on the
+# host that may hold the host identity's token, which is what reads the store.
+# Job code cannot reach that token — the slot namespaces REJECT the metadata
+# server and /proc of a root process is invisible under hidepid=2.
+User=root
+Environment=CI_TURBO_BUCKET=$TURBO_BUCKET
+Environment=CI_TURBO_PREFIX=$TURBO_PREFIX
+Environment=CI_TURBO_TOKEN=$tok
+Environment=CI_TURBO_DISK_BUDGET_BYTES=$TURBO_DISK_BUDGET
+Environment=CI_TURBO_MAX_ARTIFACT_BYTES=$TURBO_MAX_ARTIFACT
+# Every slot has its own network namespace and therefore its own loopback, so a
+# server bound to 127.0.0.1 in the host namespace is reachable from none of
+# them. It binds every address — including each slot's gateway — and
+# setup_slot_networking REJECTs this port on the primary interface, exactly as
+# it does for the broker.
+Environment=CI_TURBO_HOST=0.0.0.0
+Environment=CI_TURBO_PORT=$TURBO_PORT
+ExecStart=/usr/bin/python3 /opt/ci/turbo-cache-server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now ci-turbo-cache.service >>/var/log/ci-host.log 2>&1 || return 1
+
+  # Prove it answers before a slot is told to trust it. `status` is the call
+  # turbo makes first and the one that decides whether the client uses the cache
+  # at all, so a server that listens but cannot answer it is a server that turns
+  # itself off in every build while looking up here.
+  local i
+  for i in $(seq 1 15); do
+    if curl "${CURL_TIMEOUTS[@]}" -fsS \
+      "http://127.0.0.1:$TURBO_PORT/v8/artifacts/status" >/dev/null 2>&1; then
+      TURBO_TOKEN="$tok"
+      log "turbo remote cache serving gs://$TURBO_BUCKET/$TURBO_PREFIX on 127.0.0.1:$TURBO_PORT"
       return 0
     fi
     sleep 2
@@ -3057,6 +3167,20 @@ setup_slot_networking() {
   iptables -w -C INPUT -i "$ifc" -p tcp --dport "$BROKER_PORT" -j REJECT 2>/dev/null \
     || iptables -w -I INPUT 1 -i "$ifc" -p tcp --dport "$BROKER_PORT" -j REJECT \
     || return 1
+
+  # The turbo cache listens on every slot gateway for the same reason, and so
+  # also on the VM's own address. It vends no credential, but it does serve one
+  # repository's build artifacts out of a bucket nothing off this host is
+  # entitled to read — and it is added here, next to the broker's rule, so the
+  # question "what does this host expose?" has one answer in one place.
+  #
+  # Unconditional on the port even when the layer is off: nothing listens then,
+  # and a REJECT for a closed port costs nothing, whereas making the rule
+  # conditional makes a host that later enables the layer depend on a reboot
+  # ordering to be safe.
+  iptables -w -C INPUT -i "$ifc" -p tcp --dport "$TURBO_PORT" -j REJECT 2>/dev/null \
+    || iptables -w -I INPUT 1 -i "$ifc" -p tcp --dport "$TURBO_PORT" -j REJECT \
+    || return 1
 }
 
 # Idempotent: a re-run of this script (or a slot restart) must find the
@@ -3573,6 +3697,27 @@ install_slot() {
   # default under the slot's home — slower, and correct.
   local CACHE_ENV; CACHE_ENV=$(cache_env "$idx")
 
+  # What makes the remote build cache seamless: the repository sets nothing, and
+  # a workflow that never heard of this fleet gets cache hits because `turbo`
+  # reads these three variables out of its environment.
+  #
+  # TURBO_API is this slot's GATEWAY address, not 127.0.0.1 — the slot has its
+  # own loopback and nothing listens on it, the same wrinkle the broker has.
+  #
+  # TURBO_TEAM is required by the client even when the server ignores it: turbo
+  # refuses to use a remote cache without a team, and it must be a `team_`-
+  # prefixed slug or the CLI rejects it. The value names the pool, so a cache
+  # line in a build log says which pool served it.
+  #
+  # Empty when the server did not come up, deliberately: a slot pointed at a
+  # dead cache spends a connection refused per task, which is slower than having
+  # no cache and much harder to read in a log.
+  local TURBO_ENV=""
+  if [ -n "$TURBO_TOKEN" ]; then
+    TURBO_ENV=$(printf 'Environment=TURBO_API=http://%s:%s\nEnvironment=TURBO_TOKEN=%s\nEnvironment=TURBO_TEAM=team_%s' \
+      "$(slot_gw_ip "$idx")" "$TURBO_PORT" "$TURBO_TOKEN" "$POOL")
+  fi
+
   # Unconditional, unlike CACHE_ENV: every slot has a share whether or not it
   # has a seeded cache, and a job that cannot read one falls back to `nproc` —
   # which is the over-subscription this exists to end.
@@ -3673,6 +3818,7 @@ NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
 BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 $BROKER_ENV
 $CACHE_ENV
+$TURBO_ENV
 $SHARE_ENV
 # The label a job pins the rest of its workflow run to. Read by the anchor job,
 # which publishes it as the runs-on list for every later job in the run. A slot
@@ -3835,6 +3981,20 @@ main() {
     start_job_broker || die "job service account $JOB_SA is configured but its credential broker did not come up"
   else
     log "no ci-job-service-account set — jobs on this host get no Google credentials"
+  fi
+
+  # After the fence and the namespaces, because the server binds the slot
+  # gateways those created and the REJECT that hides it from the network is
+  # installed there; before install_slot, because that reads TURBO_TOKEN to
+  # decide whether a slot is told the cache exists.
+  #
+  # Fails OPEN, unlike the broker: a missing credential fails a deploy job
+  # outright, whereas a missing build cache only costs the time the fleet was
+  # already spending before this layer existed.
+  if [ -n "$TURBO_BUCKET" ] && [ -n "$TURBO_PREFIX" ]; then
+    start_turbo_cache || log "turbo remote cache did not come up — slots will build without it"
+  else
+    log "no ci-turbo-bucket set — this pool serves no remote build cache"
   fi
 
   local token
