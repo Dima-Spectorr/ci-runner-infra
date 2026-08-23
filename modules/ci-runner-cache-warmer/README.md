@@ -33,12 +33,37 @@ module "ci_cache_warmer" {
 }
 ```
 
-Everything else has a default: nightly at 04:00 UTC, `npm ci --ignore-scripts`,
-`npx --no-install turbo run build`, `node:22`, `E2_HIGHCPU_8`, a one-hour
-timeout. `prepare_command` is the one input a non-npm repository is likely to
-have to state; `build_command = "true"` gives you the dependency snapshot and no
-build artifacts, which is the right setting for a repository with no turbo
+Those six values plus a bucket are the whole configuration, and every one of
+them is a fact the root already knows. **Nothing here describes the repository's
+build**, and that is deliberate: the warm reads the repository.
+
+| what | how it is decided |
+|---|---|
+| package manager | the lockfile — `pnpm-lock.yaml`, `yarn.lock`, `package-lock.json`, else a bare `package.json`. `corepack` is enabled for the first two, so the version the repository pins is the version that installs. |
+| the install | that manager's frozen-lockfile install, **without lifecycle scripts** for the snapshot, **with** them for the build step (see below) |
+| where turbo writes | the module passes `--cache-dir` itself, from `turbo_cache_dir`, so it cannot drift from where the publishing step looks — a repository whose own CI builds with `--cache-dir=.turbo` still overrides nothing |
+
+The rest of the defaults: nightly at 04:00 UTC, `node:22`, `E2_HIGHCPU_8`, a
+one-hour timeout. `build_command = "true"` gives you the dependency snapshot and
+no build artifacts, which is the right setting for a repository with no turbo
 pipeline.
+
+`prepare_command` and `build_command` are still there, and the honest advice is
+not to use them. A command written here is a claim in a Terraform root about a
+repository that can change package managers without telling it, and a stale
+claim does not fail the apply — it fails inside a nightly build, or succeeds
+having installed nothing. Both read from the outside as a cache that is merely
+cold. Override only for a repository whose build genuinely is not
+`turbo run build`, and expect to revisit it.
+
+**The build step installs twice, on purpose.** The publishing script stages the
+package stores under `mktemp -d`, and only `/workspace` survives between Cloud
+Build steps. With npm that is invisible; pnpm's `node_modules` is a tree of links
+into that store, so the build step would otherwise open a workspace whose every
+dependency dangles, fail, and leave the turbo prefix empty without saying so. The
+second install is also the one allowed to run lifecycle scripts — it exists to
+run the repository's build, which is that repository's code by definition,
+whereas the snapshot it does not touch is unpacked as root on every host.
 
 Run the first warm by hand rather than waiting for 04:00 — until one completes,
 both caches are empty, which is a supported state and looks exactly like a warm
@@ -97,9 +122,12 @@ The residual is that a compromised dependency in your default branch could
 publish cache content — which is a dependency that is already installed on every
 host in the pool, and would already be running there.
 
-`prepare_command` defaults to `npm ci --ignore-scripts` for the same reason.
-A repository that genuinely needs its install scripts overrides it in its own
-tfvars, where the decision is visible in a plan.
+The detected install for the **snapshot** runs no lifecycle scripts, for the same
+reason. The build step's install does — it is there to run the repository's build
+and cannot avoid running its code — but nothing that step installs goes into the
+archive a host unpacks as root. A repository that needs lifecycle scripts inside
+the snapshot itself overrides `prepare_command`, where the decision is visible in
+a plan.
 
 ### Two phases
 
