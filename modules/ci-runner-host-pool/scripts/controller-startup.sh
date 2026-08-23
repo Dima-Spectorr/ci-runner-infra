@@ -66,6 +66,24 @@ INSTALL_ID=$(md "instance/attributes/ci-app-installation-id")
 KEY_SECRET=$(md "instance/attributes/ci-app-key-secret")
 POLL=$(md "instance/attributes/ci-poll-seconds")
 METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
+# The branch the merge queue admits. Read here rather than assumed, because the
+# parking sweep compares every open pull request's base against it and a wrong
+# value would report the whole repository as parked. Defaulted in the shell and
+# not only in Terraform: a controller rendered before this key existed has no
+# such attribute, and `md` returns the empty string for one that is absent —
+# which would make every base comparison unequal.
+QUEUE_BASE=$(md "instance/attributes/ci-queue-base")
+: "${QUEUE_BASE:=main}"
+
+# Empty unless the root turned autohealing on. NO DEFAULT, deliberately — the
+# other way round from QUEUE_BASE above. An absent attribute must mean "do not
+# listen": this is the machine holding the App installation token, and a
+# defaulted port would open a socket on every controller in the fleet to answer
+# a probe nobody configured.
+HEALTH_PORT=$(md "instance/attributes/ci-health-port")
+case "$HEALTH_PORT" in
+  '' | *[!0-9]*) HEALTH_PORT="" ;;
+esac
 
 # --- the pool table ----------------------------------------------------------
 #
@@ -262,6 +280,7 @@ pool_select() {
   QUEUE_WAIT_MAX="${D_WAIT[$POOL]:-0}"
   RUNNING_MAX="${D_RUNNING[$POOL]:-0}"
   DEMAND_EXPIRED="${D_EXPIRED[$POOL]:-0}"
+  POOL_JOBS_PER_CHECK="${Q_JPC[$POOL]:-1}"
 }
 
 # The per-pool globals pool_select writes, declared at file scope so that a read
@@ -279,13 +298,15 @@ ORPHAN_CONFIRM_TICKS=3
 RECYCLE_MAX_UNAVAILABLE=0
 CONTROLLER_HOST_OS="unknown"
 MINT_REG=false
-# POOL_ROLE and POOL_LABELS_JSON are written by pool_select and read by
-# nothing in THIS file — the routing rule that consumes the role, and the
-# label set the demand sweep hands to jq, both live in the pool table and
-# arrive at their readers by other routes. Dropping them here would mean
-# re-deriving them per tick from the table instead.
-# shellcheck disable=SC2034
+# Read in tick_pool by the capacity clamp: the role is what decides whether a
+# pool's ceiling comes from the repository's Mergify configuration or from
+# Terraform alone. It arrived with PR3 unread by this file; it is read now.
 POOL_ROLE="ci"
+# The high-water jobs-per-check for the selected pool. 1 until the demand sweep
+# has seen a run, which makes the derived ceiling its narrowest — and narrowest
+# is correct before anything has been observed, because the ceiling caps demand
+# and demand at that point is zero.
+POOL_JOBS_PER_CHECK=1
 BEACON_INTERVAL=30
 PIN_ORPHAN_GRACE=900
 # The configured list, verbatim — kept for parity with `config.sh --labels` and
@@ -691,6 +712,17 @@ collect_demand() {
       # write would create a phantom entry that every later loop iterates.
       [ -n "${D_TOTAL[$c_pool]+set}" ] || continue
 
+      # HOW BIG ONE RUN IS, for this pool, kept as a high-water mark across
+      # ticks. `n` is already exactly that: the jobs of ONE workflow run that
+      # this pool can serve. For a merge-queue pool a workflow run IS a
+      # speculative check, so this is the "jobs per check" the capacity rule
+      # needs, measured instead of guessed — see Q_JPC. Tracked for every pool
+      # because the accumulator is shared and one comparison is cheaper than a
+      # role test; only a merge-queue pool ever reads it.
+      if [ "${n:-0}" -gt "${Q_JPC[$c_pool]:-1}" ]; then
+        Q_JPC["$c_pool"]="$n"
+      fi
+
       D_TOTAL["$c_pool"]=$(( D_TOTAL["$c_pool"] + ${n:-0} ))
       D_QUEUED["$c_pool"]=$(( D_QUEUED["$c_pool"] + ${q:-0} ))
       D_EXPIRED["$c_pool"]=$(( D_EXPIRED["$c_pool"] + ${expired_n:-0} ))
@@ -727,6 +759,119 @@ collect_demand() {
   # budget being too small for a repo is visible without reading a controller log.
   DEMAND_RUNS_SKIPPED=$skipped
   [ "$skipped" -gt 0 ] && log "demand budget ${DEMAND_BUDGET}s exhausted after $examined run(s): $skipped run(s) not examined this tick — demand is a LOWER BOUND, and a skipped in_progress run may still hold queued jobs"
+  return 0
+}
+
+# --- the merge-queue's own ceiling ---------------------------------------------
+#
+# A merge-queue pool exists to serve one producer, and that producer publishes
+# how much it will ask for: Mergify runs at most `max_parallel_checks`
+# speculative check runs per queue, and nothing outside `.mergify.yml` decides
+# that number. Until this sweep the pool's ceiling was a Terraform variable
+# somebody typed, in another repository, at some earlier time — so the fleet had
+# eight independently-wrong numbers, and the wrong direction that matters is
+# silent: a queue throttled by runner capacity has PENDING checks, not failed
+# ones, and pending forever looks exactly like a slow build.
+#
+# So the ceiling is derived from the configuration itself, live, on every
+# controller, the same way. `mergify_capacity` is the rule; this is its I/O.
+#
+# READ LIVE, NOT AT APPLY TIME, and that is a decision rather than a
+# convenience. The Terraform that creates a pool lives in THIS repository and
+# the `.mergify.yml` that sizes it lives in the repository being served, so an
+# apply-time read would need a cross-repository fetch at plan time and would
+# still be stale the moment somebody raised `max_parallel_checks` in a pull
+# request of their own. Reading it here means a queue that widens is served by a
+# pool that widens with it, with no apply anywhere.
+QUEUE_CONFIG_INTERVAL=300
+QUEUE_CONFIG_LAST=0
+# When the facts on hand were last read SUCCESSFULLY. Published as an age, which
+# is the only way a reader can tell "derived from the current configuration"
+# from "derived from what the configuration said before the App lost access".
+QUEUE_CONFIG_AT=0
+# The reader's records, or the literal `unreadable`. Starts unreadable so that
+# the very first tick — before any sweep has run — fails open to the configured
+# ceiling rather than deriving one from an empty document.
+QUEUE_FACTS="unreadable"
+# In Mergify's own order of precedence. The first one that exists wins, and a
+# repository with none of them is a repository with no queue configuration,
+# which is NOT the same as an unreachable one.
+QUEUE_CONFIG_PATHS=".mergify.yml .mergify/config.yml .github/mergify.yml"
+QUEUE_CONFIG_FILE=""
+# Jobs one speculative check run produces, per pool, OBSERVED rather than
+# configured — a high-water mark that only ever rises while this process lives.
+#
+# Configuring it would mean asking an operator for a number they cannot know:
+# it is however many jobs the repository's pull-request workflows happen to
+# contain today, and it changes with every workflow edit. Observing it costs
+# nothing — collect_demand already counts, per run and per pool, exactly this —
+# and the direction it can be wrong in is the safe one. Too LOW throttles a
+# healthy queue; too HIGH only authorises hosts that real demand never asks for,
+# because the ceiling caps demand and does not create it. A high-water mark is
+# never too low for a run shape that has already been seen.
+declare -A Q_JPC=()
+
+collect_queue_config() {
+  local now
+  now=$(date +%s)
+
+  # Not this tick's turn. A merge queue's concurrency changes when somebody
+  # edits a file, so polling it at the 20s tick rate would spend 180 contents
+  # calls an hour of a shared installation budget to re-learn the same number.
+  [ $((now - QUEUE_CONFIG_LAST)) -ge "$QUEUE_CONFIG_INTERVAL" ] || return 0
+  QUEUE_CONFIG_LAST=$now
+
+  local path resp body facts status
+  for path in $QUEUE_CONFIG_PATHS; do
+    if ! resp=$(gh_api "repos/$REPO_FULL/contents/$path" 2>/dev/null); then
+      # gh_api returns 1 for EVERY non-2xx, so its failure alone cannot tell a
+      # file that is not there from a repository that is not reachable — a
+      # revoked token would walk all three candidate paths and then record "this
+      # repository has no queue", which is the one lie this sweep must not tell.
+      # Only a 404 is an absence; the status it just wrote is what says so.
+      status=$(cat "$STATE_DIR/api.status" 2>/dev/null || echo "")
+      if [ "$status" = "404" ]; then continue; fi
+      log "mergify config could not be fetched (api status ${status:-unknown}) — keeping the previous queue facts"
+      return 0
+    fi
+    # A 404 is a `continue` above. Everything from here is a file that EXISTS,
+    # so a failure to make sense of it is a real fault and must not fall through
+    # to the next candidate path — that would report the absence of a file the
+    # repository does not use as the reason the one it does use is unreadable.
+    body=$(printf '%s' "$resp" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null)
+    if [ -z "$body" ]; then
+      log "mergify config $path could not be decoded — keeping the previous queue facts"
+      return 0
+    fi
+    # The status of the READER, tested directly rather than through `$?` after
+    # an assignment: with `pipefail` the pipeline's status is the reader's, and
+    # an assignment's own status would be the last thing that ran either way.
+    if ! facts=$(printf '%s' "$body" | mergify_queue_facts); then
+      log "mergify config $path could not be parsed (invalid YAML, or python3-yaml missing) — keeping the previous queue facts"
+      return 0
+    fi
+    # Logged on CHANGE, not every read: the ceiling every merge-queue pool on
+    # this controller is about to enforce, and the file it came from. At the
+    # five-minute read interval an unconditional log would be 288 identical
+    # lines a day; on change it is the audit trail of every time the queue's
+    # concurrency moved, which is the only entry anyone ever goes looking for.
+    if [ "$facts" != "$QUEUE_FACTS" ] || [ "$path" != "$QUEUE_CONFIG_FILE" ]; then
+      log "mergify config read from $path — queues: $(printf '%s' "$facts" | tr '\n' ' ')"
+    fi
+    QUEUE_FACTS="$facts"
+    QUEUE_CONFIG_FILE="$path"
+    QUEUE_CONFIG_AT=$now
+    return 0
+  done
+
+  # None of the candidate paths exists. THIS IS A FACT, not a failure, and it is
+  # recorded as one: a repository with no Mergify configuration has no queue,
+  # and the rule fails open to the configured ceiling with a reason that says
+  # so. Leaving it `unreadable` would be a lie that reads identically to a
+  # revoked installation token.
+  QUEUE_FACTS=""
+  QUEUE_CONFIG_FILE=""
+  QUEUE_CONFIG_AT=$now
   return 0
 }
 
@@ -935,6 +1080,166 @@ queue_outcome_series() {
     wf="${key#"$POOL|"}"
     queue_series "ci_job_seconds" "${OUTCOME_SECONDS[$key]}" "\"workflow\":\"$wf\""
   done
+}
+
+# --- parked pull requests ------------------------------------------------------
+#
+# The one sweep in this file that is not about capacity. parked-decision.sh
+# carries the rule and the reasoning; this is the I/O around it.
+#
+# COST. The list call is unconditional and costs one request per interval. The
+# per-pull-request check counts are paid ONLY for pull requests that already
+# fail an entry condition, because parked_verdict's first branch is decidable
+# from the list payload alone — so a repository whose pull requests all target
+# the queue's branch and none of which are drafts pays exactly one call, and a
+# repository with a wall of stale drafts pays a bounded number.
+#
+# PERMISSION. `commits/<sha>/check-runs` needs the installation to hold
+# `checks: read`. It is the only endpoint in this file that does, so an
+# installation granted the older permission set will fail every one of these
+# calls and nothing else. That is logged by name rather than counted silently:
+# the failure mode of this whole feature is being quietly inert, which is what
+# it was built to fix.
+PARKED_BUDGET=20
+# Seconds between sweeps. Nothing scales or drains on this, and an entry
+# condition changes on the timescale of a human editing a pull request, so it
+# rides the same 300s the outcome sweep uses rather than the poll interval.
+PARKED_INTERVAL=300
+PARKED_LAST_SWEEP=0
+# A ceiling on top of the budget. The budget bounds the TIME; this bounds the
+# calls, so a repository with sixty open drafts cannot spend a whole tick's
+# worth of installation rate limit on a question nothing waits on.
+PARKED_MAX_CANDIDATES=20
+PARKED_SKIPPED=0
+# DENIED IS NOT SKIPPED, and conflating them is what made the permission note
+# above a comment rather than a signal. A skipped pull request is retried on the
+# next sweep and the count is merely a lower bound; a denied one is retried
+# forever and the count is a lie. Both would have moved the same counter, so an
+# installation without `checks: read` published "the sweep is slightly behind"
+# every five minutes, indefinitely, while reporting zero parked pull requests —
+# a feature built to end a silent zero, failing by producing one.
+PARKED_DENIED=0
+# Every reason parked_verdict can return, keyed here so the series can be
+# published as a zero. A metric that only appears when something is wrong is
+# indistinguishable from a controller that stopped publishing — the same
+# argument as ci_runner_list_blind_ticks, and the reason the list is closed.
+PARKED_REASONS=(draft base draft-and-base)
+declare -A PARKED_COUNT=()
+
+collect_parked() {
+  local sweep_start
+  sweep_start=$(date +%s)
+
+  # Not this tick's turn. Counters are deliberately NOT reset here: they keep
+  # reporting what the last real sweep found, rather than flickering to 0 on
+  # every tick in between and hiding a pull request that has been parked for a
+  # week.
+  [ $((sweep_start - PARKED_LAST_SWEEP)) -ge "$PARKED_INTERVAL" ] || return 0
+  PARKED_LAST_SWEEP=$sweep_start
+
+  local r
+  for r in "${PARKED_REASONS[@]}"; do PARKED_COUNT["$r"]=0; done
+  PARKED_SKIPPED=0
+  PARKED_DENIED=0
+
+  local deadline=$((sweep_start + PARKED_BUDGET))
+
+  local pulls rows status
+  pulls=$(gh_api "repos/$REPO_FULL/pulls?state=open&per_page=50") || {
+    status=$(cat "$STATE_DIR/api.status" 2>/dev/null)
+    # The word DENIED is load-bearing: the alert's runbook tells the operator to
+    # grep for it, so a path that raises ci_parked_sweep_denied without printing
+    # it sends somebody to a log that has nothing to say. This path is refused
+    # for a DIFFERENT permission than the check-runs one — listing pull requests
+    # needs `pull_requests: read` — and the message says so, because the fix
+    # differs and the counter cannot carry that distinction on its own.
+    if parked_denial "$status"; then
+      PARKED_DENIED=$((PARKED_DENIED + 1))
+      log "parked sweep: DENIED listing open pull requests (status=$status) — this call needs 'pull_requests: read', not the 'checks: read' the per-pull-request call needs"
+    else
+      log "parked sweep: cannot list open pull requests (status=$status)"
+    fi
+    return 0
+  }
+
+  # The free half of the rule, applied before anything is fetched. `.draft` is
+  # present on every entry of the list payload and `.base.ref` likewise, so a
+  # pull request that satisfies both entry conditions is dropped for nothing.
+  rows=$(printf '%s' "$pulls" | jq -r --arg qb "$QUEUE_BASE" '
+    .[]?
+    | select((.draft == true) or ((.base.ref // "") != $qb))
+    | [ (.number | tostring),
+        (if .draft then "1" else "0" end),
+        (.base.ref // ""),
+        (.head.sha // "") ] | @tsv' 2>/dev/null)
+  [ -n "$rows" ] || return 0
+
+  local num draft base sha checks counts total failed pending verdict reason
+  local examined=0
+  while IFS=$'\t' read -r num draft base sha; do
+    [ -n "$num" ] || continue
+    [ -n "$sha" ] || continue
+
+    if [ "$examined" -ge "$PARKED_MAX_CANDIDATES" ] \
+      || ! budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME"; then
+      PARKED_SKIPPED=$((PARKED_SKIPPED + 1))
+      continue
+    fi
+    examined=$((examined + 1))
+
+    checks=$(gh_api "repos/$REPO_FULL/commits/$sha/check-runs?per_page=100") || {
+      status=$(cat "$STATE_DIR/api.status" 2>/dev/null)
+      # A denial is counted as a denial and NOT also as a skip: the two carry
+      # opposite advice — wait, versus grant a permission — and a counter that
+      # moves for both tells the reader neither.
+      if parked_denial "$status"; then
+        PARKED_DENIED=$((PARKED_DENIED + 1))
+        log "parked sweep: DENIED reading check runs for #$num (status=$status) — the App installation lacks 'checks: read', so this sweep can never report anything until that is granted"
+      else
+        PARKED_SKIPPED=$((PARKED_SKIPPED + 1))
+        log "parked sweep: cannot read check runs for #$num (status=$status)"
+      fi
+      continue
+    }
+
+    # `neutral` and `skipped` are deliberately absent from the failure list.
+    # GitHub does not treat either as blocking and neither does the queue, so
+    # counting them would read a path-filtered monorepo as permanently red and
+    # this rule would never fire on the repositories that need it most.
+    counts=$(printf '%s' "$checks" | jq -r '
+      [ .check_runs[]? ] as $c
+      | [ ($c | length),
+          ($c | map(select(.status == "completed")
+                    | (.conclusion // ""))
+              | map(select(. == "failure" or . == "cancelled"
+                        or . == "timed_out" or . == "action_required"))
+              | length),
+          ($c | map(select(.status != "completed")) | length)
+        ] | @tsv' 2>/dev/null)
+    IFS=$'\t' read -r total failed pending <<<"$counts"
+
+    # The empty string is passed through rather than defaulted to a number: an
+    # unparseable count must reach parked_verdict as unparseable, which it
+    # answers with silence. Defaulting to 0 here would turn a jq failure into
+    # "green, no checks failed" and manufacture the alert.
+    verdict=$(parked_verdict "$draft" "$base" "$QUEUE_BASE" \
+      "${total:-}" "${failed:-}" "${pending:-}")
+
+    case "$verdict" in
+      parked:*)
+        reason="${verdict#parked:}"
+        reason="${reason%% *}"
+        PARKED_COUNT["$reason"]=$((${PARKED_COUNT["$reason"]:-0} + 1))
+        # Logged with the number, because the metric can only say how many. The
+        # operator reading an alert needs to know WHICH pull request, and this
+        # is the only place that says so.
+        log "pull request #$num is green and cannot enter the merge queue ($verdict) — no check reports this as a failure"
+        ;;
+    esac
+  done <<<"$rows"
+
+  [ "$PARKED_SKIPPED" -gt 0 ] && log "parked sweep: $PARKED_SKIPPED pull request(s) not examined this sweep (budget ${PARKED_BUDGET}s, ceiling $PARKED_MAX_CANDIDATES) — retried next sweep, not lost"
+  return 0
 }
 
 # --- hosts -------------------------------------------------------------------
@@ -2268,6 +2573,12 @@ tick() {
 
   collect_demand
 
+  # AFTER the demand sweep, because the sweep is what measures how many jobs one
+  # check run produces, and BEFORE the pool loop, because the ceiling it derives
+  # is applied per pool inside it. Interval-gated like the outcome sweep: on
+  # most ticks it returns without a call.
+  collect_queue_config
+
   # Deliberately BEFORE the pool loop, unlike the single-pool controller that
   # ran it last. It is still the work nothing waits on — no host is drained and
   # no MIG resized on what it finds — but with N pools the flush is now shared,
@@ -2275,6 +2586,13 @@ tick() {
   # one it belongs to. It carries its own budget and its own interval; on most
   # ticks it returns immediately.
   collect_outcomes
+
+  # Same placement, same reasoning, as the outcome sweep: repository-wide, on
+  # its own interval, and nothing in the pool loop waits on what it finds. It is
+  # the only thing this controller does that is not about capacity at all — see
+  # parked-decision.sh for why a fleet control plane is nonetheless the right
+  # place for it.
+  collect_parked
 
   local p
   for p in "${POOLS[@]}"; do
@@ -2539,7 +2857,83 @@ tick_pool() {
 
   local target="$MIG_TARGET"
 
-  queue_series "ci_demand" "$DEMAND_TOTAL"
+  # --- the merge-queue ceiling, applied ----------------------------------------
+  #
+  # Published demand is what the ONLY_UP autoscaler acts on, so this is the one
+  # place a derived ceiling can actually bound a pool: the controller does not
+  # scale out, it says how much work there is, and the platform buys hosts for
+  # it. Terraform's `max_hosts` remains the hard stop underneath — the MIG will
+  # not exceed it whatever is published — and the derived ceiling is the SOFT one
+  # that tracks the queue.
+  #
+  # A CI pool is untouched. Its work comes from people pushing commits, which no
+  # configuration file bounds, and clamping it to anything would be inventing a
+  # limit.
+  #
+  # The clamp is expected to be quiet. Real demand is measured from jobs Mergify
+  # has already launched, and Mergify launches at most what its own config
+  # allows, so `ci_queue_demand_clamped` should sit at zero — it is a bound
+  # against a fault (a mislabelled workflow flooding the queue pool, a queue
+  # config narrowed while runs are in flight), not a routine throttle. It is
+  # published rather than logged because a bound that never reports is a bound
+  # nobody can tell is working.
+  local demand_published="$DEMAND_TOTAL" queue_clamped=0
+  local q_hosts q_want q_checks q_batch q_reason
+  if [ "$POOL_ROLE" = "merge-queue" ]; then
+    read -r q_hosts q_want q_checks q_batch q_reason \
+      <<<"$(mergify_capacity "$QUEUE_FACTS" "$SLOTS" "$MAX_HOSTS" "$POOL_JOBS_PER_CHECK")"
+
+    # A ceiling of zero is NOT a ceiling of zero. Both fail-open branches echo
+    # `max_hosts` back, so a pool whose table row carries 0 — "no configured
+    # ceiling" — would arrive here asking for demand to be clamped to nothing,
+    # and clamping demand to nothing is precisely the silent throttle this whole
+    # file exists to prevent. Zero means unbounded here, as it does everywhere
+    # else the pool table uses it, and unbounded publishes demand untouched.
+    local ceiling=$((q_hosts * SLOTS))
+    if [ "$ceiling" -gt 0 ] && [ "$demand_published" -gt "$ceiling" ]; then
+      queue_clamped=$((demand_published - ceiling))
+      demand_published=$ceiling
+    fi
+
+    # The sentence "your Terraform ceiling is now the bottleneck", said once per
+    # tick that it is true and with both numbers in it. This is the reported
+    # problem in its diagnosable form: the queue is configured to run more
+    # checks than the pool is allowed to grow for, and every check beyond the
+    # ceiling waits — pending, not failed, on a green-looking pull request.
+    if [ "$q_reason" = "capped-by-max-hosts" ]; then
+      log "merge-queue pool $POOL is capped: ${q_checks} parallel check(s) x ${POOL_JOBS_PER_CHECK} job(s) needs ${q_want} host(s), max_hosts is ${MAX_HOSTS} — raise max_hosts or lower max_parallel_checks"
+    fi
+
+    queue_series "ci_queue_capacity_hosts" "$q_hosts"
+    # Both numbers, always, because the gap between them IS the finding.
+    # `wanted > capacity` sustained is a pool to widen; they are equal on a
+    # healthy pool, which is what makes the alert a comparison rather than a
+    # threshold somebody has to pick per repository.
+    queue_series "ci_queue_capacity_wanted_hosts" "$q_want"
+    queue_series "ci_queue_parallel_checks" "$q_checks"
+    # Read, published, and deliberately not multiplied into the ceiling — a
+    # batch is validated as ONE speculative pull request. On the chart beside
+    # the two above it is what stops the next person deriving the ceiling from
+    # the depth of the queue instead. See mergify-capacity.sh.
+    queue_series "ci_queue_batch_size" "$q_batch"
+    queue_series "ci_queue_jobs_per_check" "$POOL_JOBS_PER_CHECK"
+    queue_series "ci_queue_demand_clamped" "$queue_clamped"
+    # An AGE, not a timestamp, and published even when the last read failed —
+    # that is the point of it. The rule fails open, so a controller that has
+    # lost access to the repository's configuration goes on enforcing the last
+    # ceiling it derived and looks entirely healthy; this is the only series
+    # that says how old that ceiling is. A value climbing past
+    # QUEUE_CONFIG_INTERVAL means the sweep is failing. `-1` is the distinct
+    # "never read at all", which a 0 would have hidden as the freshest possible
+    # answer — the worst place for an absence to imitate a success.
+    local config_age=-1
+    if [ "$QUEUE_CONFIG_AT" -gt 0 ]; then
+      config_age=$(( $(date +%s) - QUEUE_CONFIG_AT ))
+    fi
+    queue_series "ci_queue_config_age_seconds" "$config_age"
+  fi
+
+  queue_series "ci_demand" "$demand_published"
   # Deliberately a SEPARATE series and not part of ci_demand: the autoscaler
   # consumes ci_demand, and a pinned job cannot be served by the host it would
   # buy. Published so that "the pool looks idle" and "the pool is full of work
@@ -2675,6 +3069,33 @@ queue_controller_series() {
   # ci_jobs_completed readable as "no jobs finished" rather than "the outcome
   # sweep never got to them".
   queue_series "ci_outcome_runs_skipped" "$OUTCOME_RUNS_SKIPPED"
+
+  # Pull requests that are green and can never enter the merge queue. A
+  # REPOSITORY fact published under every pool's label, exactly like the
+  # heartbeat above and for the same reason — a pool whose series merely stop
+  # reads as an idle pool. Read it with max() across pools, never sum(): four
+  # pools publishing the same repository's count would otherwise report four
+  # times the parked pull requests.
+  #
+  # Every reason is published every tick, 0 included. A series that appears only
+  # when something is parked cannot be told apart from a sweep that never ran,
+  # and "the sweep never ran" is precisely the state this whole feature exists
+  # to stop being invisible.
+  local r
+  for r in "${PARKED_REASONS[@]}"; do
+    queue_series "ci_prs_green_and_unqueued" "${PARKED_COUNT[$r]:-0}" "\"reason\":\"$r\""
+  done
+  # What makes the zero above readable. Non-zero means the sweep ran out of
+  # budget or hit its ceiling, so the count is a lower bound rather than an
+  # answer — the same contract as ci_demand_runs_skipped.
+  queue_series "ci_parked_prs_skipped" "$PARKED_SKIPPED"
+  # And what makes the zero UNREADABLE if it is missing. Non-zero here means the
+  # sweep was refused rather than delayed: the count above is not a lower bound,
+  # it is nothing at all, and no number of further sweeps will improve it. This
+  # is the series to alert on, because a repository whose installation lacks
+  # `checks: read` publishes an unbroken zero from every other series in this
+  # block — which is exactly what a repository with nothing parked publishes.
+  queue_series "ci_parked_sweep_denied" "$PARKED_DENIED"
 }
 
 # --- install / run -----------------------------------------------------------
@@ -2683,12 +3104,27 @@ install_self() {
   mkdir -p "$STATE_DIR" /opt/ci-controller
   install -m 0755 "$0" "$SELF_INSTALL"
 
-  # jq is the only runtime dependency not in the base image. Installed here,
-  # once, on a 2-vCPU always-on VM — not in any build path.
-  command -v jq >/dev/null 2>&1 || {
+  # jq and a YAML reader are the runtime dependencies not in the base image.
+  # Installed here, once, on a 2-vCPU always-on VM — not in any build path.
+  #
+  # python3-yaml is for the Mergify configuration, and its absence is NOT fatal:
+  # the reader exits non-zero, the capacity rule fails open, and the merge-queue
+  # pool keeps the ceiling Terraform gave it. That is why one `apt-get install`
+  # names both — a failure to fetch the YAML package must not take jq with it,
+  # and a jq that is already present must not skip the YAML package. The `||
+  # true` keeps a controller booting on a box with no package mirror.
+  local want_pkgs=""
+  command -v jq >/dev/null 2>&1 || want_pkgs="$want_pkgs jq"
+  python3 -c 'import yaml' >/dev/null 2>&1 || want_pkgs="$want_pkgs python3-yaml"
+  if [ -n "$want_pkgs" ]; then
     apt-get update -qq >>"$LOG" 2>&1
-    apt-get install -y -qq jq >>"$LOG" 2>&1
-  }
+    # shellcheck disable=SC2086  # a deliberate word split: it is a package list
+    apt-get install -y -qq $want_pkgs >>"$LOG" 2>&1 || true
+    command -v jq >/dev/null 2>&1 \
+      || log "jq is still missing after install — the controller cannot parse any GitHub response and every tick will be blind"
+    python3 -c 'import yaml' >/dev/null 2>&1 \
+      || log "python3-yaml is still missing after install — merge-queue pools will keep their configured max_hosts instead of a ceiling derived from .mergify.yml"
+  fi
 
   cat >/etc/systemd/system/ci-controller.service <<EOF
 [Unit]
@@ -2803,6 +3239,129 @@ AccuracySec=10s
 WantedBy=timers.target
 WDTIMEOF
 
+  # --- liveness responder (#308) ---------------------------------------------
+  #
+  # Installed ONLY when the root asked for autohealing. Without it no port is
+  # opened, which is the default and the state every controller in the fleet is
+  # in until an operator changes it.
+  #
+  # What it answers matters more than that it answers. The managed group's
+  # health check is the one thing in this design authorised to DELETE the
+  # control plane, so a responder that returns 200 merely because a process is
+  # listening would license a rebuild loop against a controller that is fine,
+  # and license nothing against one that is wedged — the wedge keeps the socket
+  # open. So the verdict is the heartbeat's age, the same file the watchdog
+  # reads, against a threshold deliberately WIDER than the watchdog's: the
+  # watchdog restarts a unit, this deletes a machine, and the cheaper remedy
+  # must get first refusal.
+  if [ -n "$HEALTH_PORT" ]; then
+    # The heartbeat file must EXIST before the responder starts, because the
+    # unit below bind-mounts that one path into an otherwise empty view of
+    # /var/lib. A bind source that is absent at unit start is absent for the
+    # life of the process — `Restart=always` never fires, since a responder
+    # answering 503 has not exited — so a controller installed a moment before
+    # its first tick would answer 503 forever and the group would delete it on a
+    # loop. Touching it here is not a lie about liveness: the controller service
+    # is restarted a few lines below and overwrites it within one tick, and if
+    # that never happens the file ages out and the verdict flips to 503 exactly
+    # as it should.
+    touch "$STATE_DIR/heartbeat" 2>/dev/null || true
+
+    cat >/opt/ci-controller/livez.py <<LIVEZEOF
+import http.server, os, time
+
+HB = "$STATE_DIR/heartbeat"
+THRESHOLD = $((wd_threshold * 3))
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?")[0] != "/livez":
+            self.send_response(404); self.end_headers(); return
+        try:
+            age = int(time.time() - os.stat(HB).st_mtime)
+        except OSError:
+            # No heartbeat file yet. The group's initial_delay_sec covers a
+            # controller that has not reached its first tick; past that, an
+            # absent heartbeat is the same as an ancient one.
+            age = THRESHOLD + 1
+        ok = age < THRESHOLD
+        self.send_response(200 if ok else 503)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(("age=%d threshold=%d\n" % (age, THRESHOLD)).encode())
+
+    def log_message(self, *a):
+        # A probe every 30s, forever. Logging it buries the controller's own log.
+        pass
+
+http.server.HTTPServer(("0.0.0.0", $HEALTH_PORT), H).serve_forever()
+LIVEZEOF
+    chmod 0644 /opt/ci-controller/livez.py
+
+    cat >/etc/systemd/system/ci-controller-livez.service <<'LIVEZSVCEOF'
+[Unit]
+Description=CI controller liveness responder — 200 while the tick heartbeat is fresh
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/ci-controller/livez.py
+Restart=always
+RestartSec=10
+# It reads one file's mtime and writes a fixed string. Nothing it does needs
+# the controller's identity, and it is the only thing on this VM listening on a
+# port, so it runs as nobody.
+#
+# AND IT IS THE ONLY UNPRIVILEGED PROCESS ON THIS MACHINE. Before #308 the
+# controller ran nothing but root's own loop; adding a socket listener changed
+# what a bug in that listener would be worth. `$STATE_DIR` is created 0755 by
+# root and holds `api.body` — the last GitHub response, which on a private
+# repository is repository data — so "runs as nobody" alone would leave a
+# network-facing process able to read it.
+#
+# TemporaryFileSystem + BindReadOnlyPaths is the narrow answer: an empty tmpfs
+# is mounted over /var/lib inside this unit's namespace and exactly one path is
+# bound back in, read-only. The responder therefore sees the heartbeat and
+# NOTHING else under /var/lib — not api.body, not the drain counters. Everything
+# below it removes a capability the responder demonstrably does not use.
+User=nobody
+Group=nogroup
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+TemporaryFileSystem=/var/lib:ro
+BindReadOnlyPaths=/var/lib/ci-controller/heartbeat
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# MemoryDenyWriteExecute is deliberately NOT set. It is the one hardening on
+# this list that breaks interpreters rather than merely constraining them, and
+# a responder that fails to start is a probe that never answers, which is a
+# group deleting a healthy controller every few minutes. The blast radius of
+# each setting here is judged against that, not against a static checklist.
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
+LIVEZSVCEOF
+  else
+    # Autohealing was turned OFF on a controller that previously had it on. The
+    # unit file survives the reboot on the boot disk, so leaving it alone would
+    # keep the port open after the operator asked for it to close.
+    if [ -f /etc/systemd/system/ci-controller-livez.service ]; then
+      systemctl disable --now ci-controller-livez.service >>"$LOG" 2>&1 || true
+      rm -f /etc/systemd/system/ci-controller-livez.service /opt/ci-controller/livez.py
+      log "liveness responder removed — autohealing is off"
+    fi
+  fi
+
   systemctl daemon-reload
   systemctl enable ci-controller.service
   systemctl enable ci-controller-watchdog.timer
@@ -2823,7 +3382,14 @@ WDTIMEOF
   # a tick started over loses nothing.
   systemctl restart ci-controller.service
   systemctl restart ci-controller-watchdog.timer
-  log "controller installed for $REPO_FULL pool=$POOL mig=$MIG poll=${POLL}s grace=${GRACE}s slots=$SLOTS watchdog=${wd_threshold}s"
+  if [ -n "$HEALTH_PORT" ]; then
+    systemctl enable ci-controller-livez.service >>"$LOG" 2>&1 || true
+    # RESTART for the same reason as the controller above: the previous
+    # version's livez.py is already on disk and its unit already running, so
+    # `enable --now` would leave the old responder serving the new threshold.
+    systemctl restart ci-controller-livez.service >>"$LOG" 2>&1 || true
+  fi
+  log "controller installed for $REPO_FULL pool=$POOL mig=$MIG poll=${POLL}s grace=${GRACE}s slots=$SLOTS watchdog=${wd_threshold}s livez=${HEALTH_PORT:-off}"
 }
 
 run_loop() {

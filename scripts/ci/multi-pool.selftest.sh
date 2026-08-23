@@ -61,7 +61,11 @@ select_out=$(
   # associative subscript on a variable bash has never seen is parsed as
   # ARITHMETIC, so `${D_EXPIRED[$POOL]:-0}` with POOL=a dies under `set -u` as
   # "a: unbound variable" — the default never gets a chance to apply.
-  declare -A P_LABELS_JSON P_MATCH_CSV D_TOTAL D_QUEUED D_WAIT D_RUNNING D_EXPIRED
+  # Q_JPC is here for the same reason D_EXPIRED is, and it is the sweep's
+  # measurement rather than a configured column: pool_select copies it out per
+  # pool so the merge-queue ceiling is derived from THIS pool's run shape and
+  # not from whichever pool was selected last.
+  declare -A P_LABELS_JSON P_MATCH_CSV D_TOTAL D_QUEUED D_WAIT D_RUNNING D_EXPIRED Q_JPC
 
   # Two pools that agree on NOTHING, so a field carried over from the first is
   # visible in the second rather than coincidentally equal.
@@ -99,6 +103,8 @@ select_out=$(
   D_WAIT[b]=12
   D_RUNNING[a]=300
   D_RUNNING[b]=9
+  Q_JPC[a]=11
+  Q_JPC[b]=3
 
   pool_select a
   # Exactly what collect_mig() would have written for pool a, and exactly what
@@ -108,10 +114,10 @@ select_out=$(
   MIG_TEMPLATE="ci-lin-tpl-v5"
 
   pool_select b
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$POOL" "$MIG" "$CONTROLLER_HOST_OS" "$MINT_REG" "$RUNNER_MATCH_LABELS" \
     "$MIG_BASE" "$MIG_TARGET" "$MIG_TEMPLATE" \
-    "$DEMAND_TOTAL" "$DEMAND_QUEUED" "$RUNNING_MAX"
+    "$DEMAND_TOTAL" "$DEMAND_QUEUED" "$RUNNING_MAX" "$POOL_JOBS_PER_CHECK"
 )
 check "pool_select: the second pool's own fields are all in place" \
   "b|mig-b|windows|true|b,self-hosted,x64" \
@@ -127,6 +133,15 @@ check "pool_select: the previous pool's MIG facts are cleared, not inherited" \
 check "pool_select: demand comes from the sweep's per-pool result" \
   "2|1|9" \
   "$(printf '%s' "$select_out" | cut -d'|' -f9-11)"
+
+# The merge-queue ceiling is derived from jobs-per-check, and a value carried
+# over from the previous pool would size THIS pool from a run shape it has never
+# had — 11 rather than 3 here, which on a queue pool is nearly four times the
+# hosts. Same class of bug as the MIG facts above, on a number nothing else
+# would contradict.
+check "pool_select: jobs-per-check is this pool's, not the previous pool's" \
+  "3" \
+  "$(printf '%s' "$select_out" | cut -d'|' -f12)"
 
 # --- 2. the marker sweep cannot reach another pool's markers ------------------
 #

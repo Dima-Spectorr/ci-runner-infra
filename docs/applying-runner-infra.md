@@ -56,7 +56,7 @@ ref-scoped `principalSet` is how it is bounded. Read the section below.
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.38.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.39.0"
 
   project_id     = var.project_id
   region         = "<region>"
@@ -262,7 +262,7 @@ repository's README anyway. Anything that *is* a secret stays where it is.
 
 ```hcl
 module "ci_runner_apply_identity" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.38.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.39.0"
 
   project_id             = var.project_id
   name                   = var.pool_name
@@ -340,7 +340,7 @@ provisioner has already run.
 
 ```hcl
 module "ci_host_image_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.38.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.39.0"
 
   project_id   = var.project_id
   region       = "<region>"
@@ -491,3 +491,155 @@ pool can therefore stay on the old template for as long as it stays busy.
 
 So an apply moves the *definition*. Getting it onto machines is a separate
 concern, and it belongs to the controller.
+
+---
+
+## The controller is a managed group of size 1 (#308)
+
+Until v5.39 the controller was the one pet in a design made of managed groups.
+It carried `desired_status = "RUNNING"`, which repairs a controller somebody
+**stopped** — on the next apply, whenever that is — and does nothing at all for
+one somebody **deleted**.
+
+That failure is quiet in the worst possible way. Every fact the fleet publishes
+about its own capacity comes out of the controller tick: `ci_demand`,
+`ci_slots_registered`, `ci_slots_missing`, `ci_poller_heartbeat`. A controller
+that is gone does not produce an outage signal — it produces the **absence of
+every signal** — and the autoscaler is `ONLY_UP` on a metric nobody is writing,
+so the pool freezes at whatever size it happened to be and every job queues.
+
+Both modules now build the controller from an instance template held by a
+`google_compute_instance_group_manager` of `target_size = 1`. A deleted
+controller, or one whose VM is gone, is rebuilt without a human.
+
+### The first apply replaces your controller. Read the plan.
+
+There is no in-place path from a standalone instance to a managed one, so the
+plan shows a **destroy and a create**:
+
+```
+- google_compute_instance.controller
++ google_compute_instance_template.controller
++ google_compute_instance_group_manager.controller
+```
+
+`tf-apply-guard.sh` will **refuse** that apply and print a
+`TF_GUARD_CONFIRM_DESTROY=<digest>` token, which is correct and is the point:
+the destroy of a control plane should be something an operator retyped, not
+something that scrolled past. Re-run with the token.
+
+What the gap costs: a couple of minutes with nothing polling. Hosts keep running
+the jobs they already hold — the controller executes none of them — and every
+tick recomputes from live GitHub and MIG state, so there is no controller-side
+state to carry across. Queued jobs wait; they are not lost.
+
+**The instance name changes.** It gains the group's suffix — `<name>-controller`
+becomes `<name>-controller-a1b2`, and it changes again every time the group
+rebuilds it. The `controller_instance` output now names the **group**, which is
+stable. Anything that SSHes to the controller by a hardcoded name needs:
+
+```bash
+gcloud compute instance-groups managed list-instances <name>-controller \
+  --project=<project> --zone=<zone> --format="value(instance.basename())"
+```
+
+### Two controllers at once is the thing to never allow
+
+`max_surge_fixed = 0` on the group's `update_policy` is an invariant, not a
+tuning choice. Two controllers serving one repository both count demand, both
+resize the MIG and both drain hosts, each against a GitHub view the other is
+already acting on. The group replaces one-at-a-time with a gap, deliberately.
+
+Unlike the hosts' group, the update policy is `PROACTIVE`: an `OPPORTUNISTIC`
+controller would sit on the old startup script until something else happened to
+replace it, which is the rollout shape that once put a new version on disk and
+left the old one running the pool.
+
+### Autohealing is off by default — and turning it on has a prerequisite
+
+`controller_autohealing = false` is the considered answer, not an unfinished
+one. Autohealing on a group of size 1 is not "recover faster"; it is "grant a
+health probe the authority to delete the fleet's control plane, repeatedly, on
+no other evidence". If the probe cannot reach the controller — health-check
+ranges not open to its tag, a central firewall dropping them, the wrong port —
+the group reads a healthy controller as dead and loops: delete, rebuild, cannot
+reach, delete. **That is strictly worse than a pet, because a pet that is up
+stays up.**
+
+The wedge case it is usually bought for is already covered in-guest:
+`ci-controller-watchdog.timer` compares the tick heartbeat's age against ten
+poll intervals and restarts the unit — the exact 2h55m stall of 2026-08-14,
+caught with no network path and without deleting anything. What autohealing adds
+is the narrow case of a guest too broken to run its own watchdog.
+
+If you want it, turn it on in this order — never in one apply:
+
+1. **Open the path first.** The `ci-runner-network` module now targets the
+   `ci-runner-controller` tag with its health-check rule alongside the runner
+   tag. If your VPC's ingress is governed elsewhere (in the MOT projects, the
+   central firewall), confirm `130.211.0.0/22` and `35.191.0.0/16` reach the
+   controller on the port before anything else.
+2. **Apply the firewall change with autohealing still off.** Note that this does
+   not yet give you anything to probe: the responder starts only when
+   `controller_autohealing` is true, because the port reaches the VM as an empty
+   string otherwise — no listening socket on the one machine in the fleet
+   holding the App installation token until somebody asks for one.
+3. **Set `controller_autohealing = true` and apply.** The controller is replaced
+   (new metadata → new template), boots, and starts
+   `ci-controller-livez.service`.
+4. **Confirm the probe is actually green before trusting it:**
+
+   ```bash
+   gcloud compute instance-groups managed describe <name>-controller \
+     --project=<project> --zone=<zone> \
+     --format="value(status.isStable)"
+
+   gcloud compute instance-groups managed list-instances <name>-controller \
+     --project=<project> --zone=<zone> \
+     --format="csv[no-heading](name,instanceHealth[0].detailedHealthState)"
+   ```
+
+   `HEALTHY` is the answer you need. `UNHEALTHY` or `UNKNOWN` past the
+   ten-minute `initial_delay_sec` means the probe is not landing — set
+   `controller_autohealing = false` and apply again **now**, before the group
+   starts rebuilding a controller that is fine.
+
+### What the probe actually answers
+
+`/livez` on port `controller_health_port` (default 8008) returns 200 only while
+the tick heartbeat file is fresh, and 503 otherwise. A TCP check would pass for
+a controller whose tick loop has stopped — the wedge keeps the socket open —
+which is exactly the state worth catching.
+
+Its threshold is **three times** the watchdog's, deliberately. The watchdog
+restarts a unit; this deletes a machine. The cheaper remedy gets first refusal.
+
+### The responder is the only unprivileged process on the controller
+
+Before autohealing existed, the controller ran nothing but root's own loop and
+listened on no port. The responder is the first process on that machine that is
+both network-facing and not root, and it is on the one VM in the fleet that can
+mint a GitHub App installation token — so it is confined rather than merely
+demoted:
+
+- it runs as `nobody`, with an empty `CapabilityBoundingSet` and
+  `NoNewPrivileges`;
+- `TemporaryFileSystem=/var/lib:ro` plus a single `BindReadOnlyPaths` entry mean
+  it sees the heartbeat file and **nothing else** under `/var/lib` — not
+  `api.body`, which holds the last GitHub response and on a private repository
+  is repository data;
+- `RestrictAddressFamilies` leaves it IP only, and `SystemCallFilter` leaves it
+  `@system-service`.
+
+`MemoryDenyWriteExecute` is deliberately absent: it is the one setting on that
+list that breaks interpreters rather than constraining them, and a responder
+that will not start is a probe that never answers, which is a group deleting a
+healthy controller every few minutes. The same reasoning explains why the
+startup script `touch`es the heartbeat before writing the unit — a bind source
+that is missing at unit start is missing for the life of the process, and the
+process never exits, so `Restart=always` would never recover it.
+
+`controller-module.selftest.sh` asserts the three couplings this path holds by
+literal rather than by variable: the firewall tag matches the tag on both
+controller templates, the bind path matches `STATE_DIR`, and the `touch`
+precedes the unit.

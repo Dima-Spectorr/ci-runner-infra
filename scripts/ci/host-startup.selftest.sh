@@ -1160,7 +1160,13 @@ has_baked_image_audit() { # <file>
   matches "$code" 'say "slot \\\$idx: the manifest names \\\$id, which the store no longer has' || return 1
   matches "$code" 'not root:root:644' || return 1
   matches "$code" 'not root:root:755' || return 1
-  matches "$code" 'not \\\$u:\\\$u:700' || return 1
+  # Owner and mode are checked SEPARATELY, and the mode is checked by bit rather
+  # than by literal: dockerd chmods its own data root to 0710 on every start, so
+  # an equality test against the mode install_slot wrote flags a healthy slot and
+  # withdraws its clean marker. What must hold is that group and other carry
+  # neither read nor write.
+  matches "$code" 'not \\\$u:\\\$u -- another account owns' || return 1
+  matches "$code" '0\\\$droot_mode & 066' || return 1
 
   # `stat` follows a symlink, so the link test comes FIRST or a slot-planted
   # link to a root-owned path reads as compliant.
@@ -1494,7 +1500,8 @@ mutate "audit failure made fatal"            's@^  install_baked_image_audit ||$
 mutate "dead manifest id no longer reported" 's@say "slot \\\$idx: the manifest names@: "slot \$idx: the manifest names@' has_baked_image_audit
 mutate "manifest mode no longer checked"     's@not root:root:644@is fine@'                                           has_baked_image_audit
 mutate "state directory no longer checked"   's@not root:root:755@is fine@g'                                          has_baked_image_audit
-mutate "image store owner no longer checked" 's@not \\\$u:\\\$u:700@is fine@'                                         has_baked_image_audit
+mutate "image store owner no longer checked" 's@not \\\$u:\\\$u -- another account owns@is fine@'                     has_baked_image_audit
+mutate "image store mode no longer checked"  's@0\\\$droot_mode & 066@0@'                                             has_baked_image_audit
 mutate "symlinked manifest reads as a file"  's@if \[ -L "\\\$manifest" \]@if false@'                                 has_baked_image_audit
 mutate "symlinked image store accepted"      's@if \[ -L "\\\$droot" \]@if false@'                                    has_baked_image_audit
 mutate "poisoned slot keeps its marker"      's@^    if rm -f -- "\\\$marker"; then$@    if true; then@'              has_baked_image_audit

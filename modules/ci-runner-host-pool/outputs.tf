@@ -22,14 +22,20 @@ output "autoscaler_name" {
 # and an index into an empty list fails the PLAN with an error about the output
 # rather than about the pool. Null is the honest answer — this pool's controller
 # is somewhere else.
+#
+# And the GROUP, not the instance. Since #308 the controller is a managed group of
+# size 1, and the VM inside it is named `<group>-<suffix>` — a name that changes
+# every time the group rebuilds it, which is the entire point. An output that
+# named the instance would be a value every consumer had to re-read after each
+# recovery, so the stable handle is the group.
 output "controller_instance" {
-  description = "Name of the always-on controller VM, or null when a shared controller serves this pool."
-  value       = one(google_compute_instance.controller[*].name)
+  description = "Name of the managed group holding the always-on controller VM, or null when a shared controller serves this pool. The VM itself is <this>-<suffix>; list it with `gcloud compute instance-groups managed list-instances`."
+  value       = one(google_compute_instance_group_manager.controller[*].name)
 }
 
 output "controller_zone" {
-  description = "Zone of the controller VM, or null when a shared controller serves this pool."
-  value       = one(google_compute_instance.controller[*].zone)
+  description = "Zone of the controller's managed group, or null when a shared controller serves this pool."
+  value       = one(google_compute_instance_group_manager.controller[*].zone)
 }
 
 # THE POOL, AS THE CONTROLLER'S TABLE WANTS IT.
@@ -210,6 +216,48 @@ output "metric_names" {
       # lower bound, so an apparently under-scaled pool may simply not have been
       # counted.
       "ci_demand_runs_skipped",
+      # --- the merge queue's own ceiling --------------------------------------
+      # Published ONLY by a pool whose role is `merge-queue`, and absent on every
+      # CI pool — a CI pool's work comes from people pushing commits, which no
+      # configuration file bounds. Absence here is therefore normal and carries
+      # meaning; do not alert on it.
+      #
+      # The pair to read together is ci_queue_capacity_wanted_hosts against
+      # ci_queue_capacity_hosts. Equal is healthy. `wanted` above `capacity` is
+      # the reported bottleneck in its diagnosable form: Mergify is configured
+      # to run more speculative checks at once than this pool is allowed to grow
+      # for, so the surplus checks WAIT — pending, never failed, on a pull
+      # request whose own CI is already green. Alert on the comparison, which
+      # needs no per-repository threshold, rather than on either number.
+      "ci_queue_capacity_hosts",
+      "ci_queue_capacity_wanted_hosts",
+      # The inputs the ceiling was derived from, published so the derivation can
+      # be checked from a dashboard instead of by reading a controller log.
+      # ci_queue_parallel_checks is the summed `max_parallel_checks` of the
+      # repository's queues; ci_queue_jobs_per_check is the observed high-water
+      # number of this pool's jobs in one run. Their product over the pool's
+      # slots is ci_queue_capacity_wanted_hosts.
+      "ci_queue_parallel_checks",
+      "ci_queue_jobs_per_check",
+      # Read from the configuration, reported, and deliberately NOT multiplied
+      # into the ceiling: in `parallel` mode Mergify validates a batch as ONE
+      # speculative pull request, so a wider batch clears more of the backlog
+      # per check run rather than needing more runners. It is published because
+      # the opposite intuition is the natural one.
+      "ci_queue_batch_size",
+      # Jobs the ceiling removed from the published demand this tick. Expected
+      # to be flat zero: real demand is measured from jobs Mergify has already
+      # launched, and Mergify launches at most what its own config allows. A
+      # non-zero value is a fault to go and read — a mislabelled workflow
+      # reaching the queue pool, or a queue narrowed while runs were in flight.
+      "ci_queue_demand_clamped",
+      # How stale the configuration behind the ceiling is. The capacity rule
+      # FAILS OPEN, so a controller that has lost access to the repository's
+      # `.mergify.yml` keeps enforcing the last ceiling it derived and looks
+      # entirely healthy — this is the only series that would say otherwise.
+      # `-1` means it has never been read at all. Alert above a small multiple
+      # of the sweep interval.
+      "ci_queue_config_age_seconds",
       # --- work, as opposed to pool ------------------------------------------
       # Every series above describes the POOL. These two describe what it RAN,
       # labelled by workflow, which is the only way the fleet-wide questions
@@ -227,6 +275,30 @@ output "metric_names" {
       # deferred, not lost. Sustained non-zero means OUTCOME_BUDGET is too small
       # for this repository's throughput and the other two are lagging.
       "ci_outcome_runs_skipped",
+      # --- the merge queue, as opposed to the pool ----------------------------
+      # Open pull requests that are GREEN and can never enter the merge queue,
+      # grouped by the entry condition they fail (`draft`, `base`,
+      # `draft-and-base`). It is a REPOSITORY fact published under every pool's
+      # label, so read it with max() across pools and never sum() — four pools
+      # on one controller each publish the same count.
+      #
+      # It is here, in a capacity contract, because the two "CI is making no
+      # progress" reports this fleet received in one week were both this and
+      # neither was a pool: Mergify reports an unmet entry condition as NEUTRAL,
+      # which renders as a grey dot beside forty green ticks. Nothing else in
+      # this list can go non-zero for it.
+      "ci_prs_green_and_unqueued",
+      # > 0 means the parking sweep did not examine every candidate, so the
+      # count above is a lower bound. Published every tick, 0 included: it is
+      # what makes a zero above readable as "nothing is parked" rather than "the
+      # sweep never got there".
+      "ci_parked_prs_skipped",
+      # > 0 means the sweep was REFUSED, not delayed: the installation lacks
+      # `checks: read` and no later sweep will do better. Separate from the
+      # counter above because the two carry opposite advice — wait, versus grant
+      # a permission — and because a denied sweep leaves every other series here
+      # publishing the same unbroken zero a healthy repository publishes.
+      "ci_parked_sweep_denied",
       # --- the cache hydrate --------------------------------------------------
       # Published by the HOST, not the controller, and once per boot rather than
       # per tick: the hydrate finishes before the runner agent registers, so the

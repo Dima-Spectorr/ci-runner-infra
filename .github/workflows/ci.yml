@@ -346,6 +346,16 @@ jobs:
       - name: pin-hold-decision self-test
         run: bash scripts/ci/pin-hold-decision.selftest.sh
 
+      # The one rule in this directory that judges a pull request rather than a
+      # machine, and the only one whose failure mode is a muted alert rather
+      # than a lost job. It fires on a state every other surface reports as
+      # healthy -- green, finished, and permanently outside the merge queue --
+      # so a single false positive on somebody's work in progress is enough for
+      # the signal to be filtered away and the next parked pull request to sit
+      # for another three days. Hence a case list weighted towards silence.
+      - name: parked-decision self-test
+        run: bash scripts/ci/parked-decision.selftest.sh
+
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a
       # mis-restarted controller publishes nothing at all while systemd reports
@@ -370,6 +380,22 @@ jobs:
 
       - name: demand-match self-test
         run: bash scripts/ci/demand-match.selftest.sh
+
+      # The merge-queue pool's ceiling, derived from the repository's own
+      # Mergify configuration. Every way this rule can be wrong is silent: too
+      # low throttles the queue into checks that are PENDING rather than failed,
+      # too high buys hosts nothing keeps busy, and a fail-CLOSED bug takes a
+      # healthy queue to zero capacity on a transient API error.
+      - name: mergify-capacity self-test
+        run: |
+          # The reader needs PyYAML, and the self-test REFUSES to run without it
+          # rather than comparing two empty strings and passing. Guarded so the
+          # gate does not depend on what a hosted image happens to preinstall.
+          python3 -c 'import yaml' 2>/dev/null || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-yaml
+          }
+          bash scripts/ci/mergify-capacity.selftest.sh
 
       - name: host-startup self-test
         run: bash scripts/ci/host-startup.selftest.sh

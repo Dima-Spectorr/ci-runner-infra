@@ -237,7 +237,7 @@ policy_json() {  # <key> -> a full alertPolicy body on stdout
 { "displayName": "CI runners / controller dead (no heartbeat 10m)",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "The CI warm-host controller stopped reporting. Jobs will queue and the pool will not scale. Check the controller VM (ci-runner-*-controller) and its ci-controller.service." },
+    "The CI warm-host controller stopped reporting. Jobs will queue and the pool will not scale. Since #308 the controller is a managed group of size 1, so a DELETED one is rebuilt on its own and this alert should clear within a few minutes -- one that does not clear is a controller that boots and cannot tick, not a missing machine. Find the VM with 'gcloud compute instance-groups managed list-instances <name>-controller' (the instance name carries a suffix and changes on every rebuild) and read its ci-controller.service." },
   "conditions": [ { "displayName": "ci_poller_heartbeat absent for 10m",
     "conditionAbsent": { "duration": "600s",
       "filter": "metric.type=\"custom.googleapis.com/github/ci_poller_heartbeat\" AND resource.type=\"generic_node\"",
@@ -341,6 +341,30 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    parked) cat <<EOF
+{ "displayName": "CI runners / a green pull request cannot enter the merge queue",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "An open pull request has every check green and can NEVER be merged, because it fails one of the queue's entry conditions. Read the metric's \`reason\` label for which one: \`draft\` (nobody promoted it out of draft), \`base\` (it targets a branch the queue does not admit — usually a sibling feature branch an agent session stacked it on), or both.\n\nThis is the only alert here that fires on a state every other surface reports as healthy. Mergify does not fail an unmet entry condition, it reports NEUTRAL, which renders as a grey dot beside forty green ticks: no red check, no comment, no timer. Two repositories in this fleet reported 'CI is making no progress' in one week and neither had a failing job: two green DRAFTS nobody promoted in one, and a pull request BASED on a sibling feature branch in the other. Both were found days later by a human wondering why something had not landed.\n\nThe controller's log names the pull request number: grep 'cannot enter the merge queue' in the controller's syslog. Fix it in the repository — promote the draft, or retarget the base — not here. Read with max() across pools: the count is a REPOSITORY fact and every pool on the controller publishes the same one.\n\nA long window on purpose. A draft opened and promoted within the hour is somebody working, not an incident; only a pull request that stays finished-and-parked is worth a page. If ci_parked_prs_skipped is non-zero the count is a lower bound — the sweep hit its budget or its candidate ceiling." },
+  "conditions": [ { "displayName": "ci_prs_green_and_unqueued > 0 for 60m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "3600s",
+      "filter": "metric.type=\"custom.googleapis.com/github/ci_prs_green_and_unqueued\" AND resource.type=\"generic_node\"",
+      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
+    parkeddenied) cat <<EOF
+{ "displayName": "CI runners / the parking sweep is being refused",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "The controller cannot read check runs, so the alert above it can never fire. This is the watcher's watcher, and it exists because the feature it guards fails by looking healthy: an installation without \`checks: read\` publishes an unbroken ci_prs_green_and_unqueued of ZERO, which is precisely what a repository with nothing parked publishes.\n\nOne cause, almost always: the GitHub App installation for this repository holds the older permission set. \`commits/<sha>/check-runs\` is the ONLY endpoint the controller calls that needs \`checks: read\`, so nothing else about the controller degrades - demand, draining and recycling all keep working, which is why nobody notices. Grant the permission on the App, then ACCEPT it on the installation: a permission added to an App stays pending until the installation approves it, and a pending permission behaves exactly like one that was never granted.\n\nDistinct from ci_parked_prs_skipped on purpose. Skipped means the sweep ran out of budget and will retry; this means it was refused and will be refused again in five minutes, forever. Grep 'parked sweep: DENIED' in the controller's syslog for the status GitHub actually returned - 401 is a bad App key or installation id rather than a missing permission, and 404 on a sha the same token just listed is a permission answer wearing another number.\n\nRead with max() across pools, like everything else the controller publishes per repository. Fires after 30m: a single refused sweep during a GitHub incident is not worth a page, five in a row is." },
+  "conditions": [ { "displayName": "ci_parked_sweep_denied > 0 for 30m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
+      "filter": "metric.type=\"custom.googleapis.com/github/ci_parked_sweep_denied\" AND resource.type=\"generic_node\"",
+      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
     egressdenied) cat <<EOF
 { "displayName": "CI runners / egress refused",
   "combiner": "OR",
@@ -438,6 +462,9 @@ ensure_descriptor ci_tick_seconds            "Controller tick duration. Approach
 # during the incident.
 ensure_descriptor ci_slots_registered        "Slots whose runner agent answers, over RUNNING hosts past their registration grace. Compare with ci_slots_total, which is arithmetic and cannot fall."
 ensure_descriptor ci_slots_missing           "Slots the pool was built with that no agent answers for. Non-zero is capacity that exists on paper only: a host that registered nothing, a host whose slot units died before the agent started, or a slot the host condemned for failing every job it claimed."
+ensure_descriptor ci_prs_green_and_unqueued "Open pull requests that are green and can never enter the merge queue, labelled by the entry condition they fail. A repository fact published under every pool label -- read with max(), never sum()."
+ensure_descriptor ci_parked_prs_skipped     "Pull requests the parking sweep did not examine. Non-zero makes ci_prs_green_and_unqueued a lower bound."
+ensure_descriptor ci_parked_sweep_denied    "Parking sweeps GitHub refused (401/403/404). Non-zero means ci_prs_green_and_unqueued is inert rather than zero; the usual cause is a missing checks:read, but a bad App key or installation id reads the same."
 # Published by the HOST once per boot, not by the controller per tick. Declared
 # here for the same reason as the rest — a pool that has never booted a host
 # still needs its alerting provisioned — and it matters more here: these series
@@ -458,7 +485,7 @@ pl_status="$(mon GET 'alertPolicies?pageSize=1000')"
   sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
 existing="$(json_pairs alertPolicies displayName)"
 
-for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing egressdenied; do
+for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied egressdenied; do
   policy_json "$key" >"$tmp/p.json"
   # Neither of these ends in `| head -1`, and that is deliberate. This script
   # runs `set -euo pipefail`; under both options a reader that stops early sends

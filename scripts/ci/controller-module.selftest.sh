@@ -139,6 +139,113 @@ check "manage_controller really removes the pool's own controller" yes "$r"
 grep -q '"ci-pools"' "$POOL_TF/main.tf" && r=yes || r=no
 check "the pool module still renders one key per field, not a table" no "$r"
 
+# --- 6. the controller is a managed group, and never two of them (#308) -------
+#
+# Both modules build the controller from a template held by a group of size 1,
+# so a DELETED controller is rebuilt instead of staying deleted. Two properties
+# of that arrangement are load-bearing and would fail silently if edited away,
+# because both produce a plan that applies cleanly.
+for m in "$POOL_TF" "$CTRL_TF"; do
+  n=$(basename "$m")
+
+  grep -q 'resource "google_compute_instance_group_manager" "controller"' "$m/main.tf" &&
+    r=yes || r=no
+  check "$n: the controller is a managed group, not a pet" yes "$r"
+
+  # The pet is GONE, not merely joined by a group. Leaving the old resource in
+  # place next to the new one is a plan that creates a second control plane and
+  # reports success: two controllers, one repository, both counting demand and
+  # both draining hosts.
+  grep -q 'resource "google_compute_instance" "controller"' "$m/main.tf" &&
+    r=yes || r=no
+  check "$n: the standalone controller instance is gone, not duplicated" no "$r"
+
+  # THE INVARIANT. A surge to two during a rolling replace is two controllers
+  # serving one repository, each acting on a GitHub view the other is already
+  # changing — briefly, on every apply that touches the startup script, which
+  # is most of them.
+  grep -A8 'resource "google_compute_instance_group_manager" "controller"' "$m/main.tf" |
+    grep -q 'max_surge_fixed *= *0' && r=yes || r=no
+  if [ "$r" = no ]; then
+    # The block is longer than 8 lines in one module; widen rather than assume.
+    sed -n '/resource "google_compute_instance_group_manager" "controller"/,/^}/p' "$m/main.tf" |
+      grep -q 'max_surge_fixed *= *0' && r=yes || r=no
+  fi
+  check "$n: the group never surges to two controllers" yes "$r"
+
+  # Autohealing grants a health probe the authority to DELETE the control
+  # plane. A probe that cannot land — ranges not open to the tag, a central
+  # firewall, the wrong port — then loops delete/rebuild/delete, which is worse
+  # than the pet this replaced. Opt-in, and this asserts the default rather
+  # than trusting a reviewer to notice a flipped bool.
+  d=$(sed -n '/^variable "controller_autohealing"/,/^}/p' "$m/variables.tf" |
+    grep -oE 'default *= *(true|false)' | grep -oE '(true|false)')
+  check "$n: autohealing is off by default" false "$d"
+done
+
+# The port reaches the VM as an EMPTY STRING when autohealing is off, and the
+# startup script has no default for it. A default there would open a listening
+# socket on every controller in the fleet — the one machine holding the App
+# installation token — to answer a probe nobody configured.
+grep -q 'ci-health-port" = var.controller_autohealing ? tostring(var.controller_health_port) : ""' \
+  "$POOL_TF/main.tf" && r=yes || r=no
+check "the health port is empty unless autohealing asked for it" yes "$r"
+
+sed -n '/^HEALTH_PORT=/,/^esac$/p' "$POOL_TF/scripts/controller-startup.sh" |
+  grep -q 'HEALTH_PORT:=' && r=yes || r=no
+check "the startup script never defaults the health port" no "$r"
+
+# --- 7. the three couplings the probe path holds by literal, not by variable ---
+#
+# Enabling autohealing joins four files that never reference each other, and
+# every one of these mismatches produces the SAME symptom: the probe does not
+# answer, the group calls a healthy controller dead, and deletes it on a loop.
+# None of them fails an apply and none of them is visible in a plan.
+
+STARTUP="$POOL_TF/scripts/controller-startup.sh"
+NET_TF="$ROOT/modules/ci-runner-network/main.tf"
+
+# (a) The firewall opens a tag; the templates must carry that tag. The network
+# module cannot reference either controller module — it is applied once per
+# project, they are applied per pool — so the tag is a literal on both sides.
+net_tag=$(sed -n '/resource "google_compute_firewall" "health_check"/,/^}/p' "$NET_TF" |
+  grep -o '"ci-runner-[a-z-]*"' | tr -d '"' | grep -v '^ci-runner-host$' | head -1)
+check "the health-check firewall opens the controller tag" "ci-runner-controller" "$net_tag"
+
+for m in "$POOL_TF" "$CTRL_TF"; do
+  n=$(basename "$m")
+  sed -n '/resource "google_compute_instance_template" "controller"/,/^}/p' "$m/main.tf" |
+    grep -q "\"$net_tag\"" && r=yes || r=no
+  check "$n: the controller template carries the tag that firewall opens" yes "$r"
+done
+
+# (b) The responder's unit bind-mounts the heartbeat by ABSOLUTE path, inside a
+# single-quoted heredoc that expands nothing. A change to STATE_DIR would move
+# the file and leave the mount pointing at a path that no longer exists — and
+# an absent bind source makes systemd refuse to start the unit, so this one at
+# least fails loudly rather than answering 503.
+state_dir=$(grep -m1 '^STATE_DIR=' "$STARTUP" | cut -d'"' -f2)
+grep -q "^BindReadOnlyPaths=$state_dir/heartbeat\$" "$STARTUP" && r=yes || r=no
+check "the responder binds the heartbeat from STATE_DIR, not from a stale path" yes "$r"
+
+# And the tmpfs it is bound back into must be an ANCESTOR of that path, or the
+# mount does nothing and the responder still sees the whole state directory —
+# including api.body, which is the reason the tmpfs is there.
+tmpfs=$(grep -m1 '^TemporaryFileSystem=' "$STARTUP" | cut -d= -f2 | cut -d: -f1)
+case "$state_dir/" in
+  "$tmpfs"/*) r=yes ;;
+  *) r=no ;;
+esac
+check "the tmpfs covers the state directory it is meant to hide" yes "$r"
+
+# (c) The bind source must EXIST when the unit starts. Absent, systemd refuses
+# the unit; present-but-created-later never appears inside the namespace,
+# because the responder does not exit and so is never restarted into a new one.
+r=$(awk '/touch "\$STATE_DIR\/heartbeat"/ { t = NR }
+         /^BindReadOnlyPaths=/ { b = NR }
+         END { print (t > 0 && b > 0 && t < b) ? "yes" : "no" }' "$STARTUP")
+check "the heartbeat is created before the unit that bind-mounts it" yes "$r"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

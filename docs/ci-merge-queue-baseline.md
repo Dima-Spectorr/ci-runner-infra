@@ -194,7 +194,9 @@ Thirteen repositories at width 1 are a small, roughly constant claim, and one
 change and needs the sum recomputed, in the pull request that makes it.** This
 is also the reason Tier 1 preferred batch size: raising `batch_size` does not
 appear in that sum at all. Since 2026-08-18 that escape is closed by policy
-rather than by arithmetic — `batch_size` is 1 everywhere.
+rather than by arithmetic — `batch_size` is 1 everywhere. *(Both sentences are
+amended below, 2026-08-23: the queue has its own pool now, and `batch_size` is
+neither 1 everywhere nor an escape.)*
 
 **Corrected 2026-08-19 — "shared" is one pool short of the truth, and it changes
 who may raise what.** Runners are registered **per repository**, not into one
@@ -270,6 +272,52 @@ The rule that survives: **state which ceiling you are spending, and show the
 width.** What no longer holds is the blanket claim that a repository under queue
 pressure has no local move — since 2026-08-19 it has one, and it is free:
 declare `mode: parallel` with a covering scope map before arguing for runners.
+
+#### Amended 2026-08-23 — the queue has its own pool, and nobody does the arithmetic any more
+
+Two things above are now stale, and both are stale in the same direction: they
+describe a world where a width raise was somebody's homework.
+
+**1. The merge queue no longer spends the CI pool's ceiling.** The fleet
+standard is now four pools per repository — Linux CI, Windows CI, Linux
+merge-queue, Windows merge-queue — behind **one** controller, and each
+repository adopts it as its own migration lands
+([the lane model](ci-lane-model.md), [#274](https://github.com/Dima-Spectorr/ci-runner-infra/issues/274)).
+A pool carries a `role`, the merge-queue pools answer a disjoint label set, and
+speculative check runs are routed to them by a conditional `runs-on`. So the
+sum a width raise has to fit inside is the **merge-queue** pool's
+`slots_per_host × max_hosts`, not the CI pool's — which is what removes the
+original bottleneck: a pull request that has gone green and entered the queue is
+no longer competing with ordinary PR CI for the same hosts.
+
+**2. The width raise is no longer a Terraform change at all.** The controller
+reads `max_parallel_checks` out of the repository's own `.mergify.yml`, live,
+and derives the merge-queue pool's ceiling from it:
+
+```
+hosts = ceil( Σ max_parallel_checks × jobs per check ÷ slots per host )
+```
+
+Raising the width in `.mergify.yml` is now sufficient; within five minutes the
+pool is sized for it. `max_hosts` remains the hard stop underneath, and when the
+derivation wants more than it allows the controller says so — the comparison
+`ci_queue_capacity_wanted_hosts > ci_queue_capacity_hosts` is the whole
+diagnosis, and it needs no per-repository threshold. **That comparison replaces
+"show the arithmetic in the pull request"**: the arithmetic is now done
+continuously, by the thing that can actually see both numbers.
+
+**3. `batch_size` is not 1 everywhere, and it does not need to be.** The
+2026-08-18 policy above closed an escape that no longer exists. A batch is
+validated as ONE speculative pull request, so `batch_size` does not enter the
+capacity sum in either the old form or the new one — it says how much backlog
+each check run clears, not how many runners it needs. Per-repository batch sizes
+therefore stay as they are (IntegrateIT is at 2), and the controller reads and
+publishes the value as `ci_queue_batch_size` rather than acting on it, precisely
+so that the opposite intuition is settled by a chart instead of by this
+paragraph.
+
+What is unchanged: the GCP quota the managed instance groups draw from is still
+shared, and it is still the coarse bound that actually bit on 2026-08-13.
 
 ---
 
@@ -1021,6 +1069,83 @@ Added 2026-08-19, all four about `mode`:
 > genuinely does cost a full run per step. IntegrateIT sat at width 5 with
 > `batch_size: 1` for exactly this reason. Kept visible rather than deleted,
 > because the deleted version of a rule is the one that gets re-derived.
+
+---
+
+## The failure this baseline cannot see: a green pull request that is never admitted
+
+Everything above tunes what happens **after** a pull request enters the queue.
+The costliest CI failures of the past week happened before that, and none of
+them produced a red check.
+
+Mergify's entry conditions — `base = <the queue's branch>`, `-draft`,
+`-conflict` — are not reported as failures when they do not hold. They are
+reported as **neutral**: a grey dot beside forty green ticks, with no comment
+and no timer. A pull request that is complete, fully green and permanently
+parked therefore looks identical to one that is about to merge. Twice in one
+week a repository reported "CI is making no progress" and CI was fine: one
+consumer repository had two pull requests sitting as green **drafts**, the older
+for three days, and this repository's own #299 was green with its **base**
+pointing at a sibling feature branch. No failing job anywhere.
+
+**The controller reports it, so the repository cannot switch it off.** A
+scheduled workflow in the consumer repository would be simpler and would report
+where the author is already looking — and it would live in the file the
+misconfigured repository is allowed to edit, which defeats the purpose. The
+contract this fleet offers is minimum configuration in the consumer repository
+and no way for that repository to break the mechanism. The controller already
+holds an installation token and already sweeps the repository every tick.
+
+**What it publishes.**
+
+| Metric | Meaning |
+|---|---|
+| `ci_prs_green_and_unqueued` | Open pull requests that are finished, green, and fail an entry condition. Labelled `reason` = `draft`, `base` or `draft-and-base`. |
+| `ci_parked_prs_skipped` | Pull requests the sweep did not examine this pass. Non-zero makes the metric above a **lower bound**. |
+| `ci_parked_sweep_denied` | Sweeps GitHub **refused**. Non-zero means the metric above is not a lower bound, it is nothing at all. |
+
+Both are **repository** facts published under **every** pool label, so that a
+pool whose series merely stop is not read as an idle pool. Read them with
+`max()`, never `sum()` — summing multiplies one parked pull request by the
+number of pools. An alert (`ci_prs_green_and_unqueued > 0` for 60 minutes) ships
+in `scripts/ci/ensure-alert-policies.sh` under the key `parked`.
+
+**The queue's branch is configuration, not a literal.** `queue_base_branch`
+defaults to `main` on both modules. A repository whose queue admits something
+else must set it, or every open pull request reads as parked.
+
+**What it deliberately stays quiet about.** The rule
+(`modules/ci-runner-host-pool/scripts/parked-decision.sh`, 24 self-test cases)
+reports only a pull request that is **finished and stuck**. Anything still
+running, anything already red, and anything with no checks at all is somebody's
+work in progress. `-conflict` is not detected: answering it costs a GET per pull
+request, a conflicted branch runs no CI at all so it lands in the "no checks"
+arm anyway, and GitHub's own merge box already says so in red. The invariant is
+that a single false positive on work in progress is enough for the signal to be
+filtered away — which returns the fleet to the grey dot it replaced.
+
+**Cost.** The entry-condition half is decidable from the pull-request list
+payload alone, so a healthy repository pays exactly one API call per five
+minutes. Only an already-inadmissible pull request costs a `check-runs` call,
+capped at 20 candidates and a 20-second budget per sweep; anything beyond that
+increments `ci_parked_prs_skipped` and is retried next sweep, never lost.
+
+**It needs `checks: read`** on the App installation — the only endpoint in the
+controller that does. See
+[onboarding-a-repository.md](onboarding-a-repository.md).
+
+**And the detector has its own detector, because it can fail the same way it
+was built to catch.** An installation without that permission fails every
+`check-runs` call and nothing else: the pool scales, registers and runs jobs
+normally, while `ci_prs_green_and_unqueued` publishes an unbroken zero — which
+is exactly what a repository with nothing parked publishes. `parked_denial` in
+the same rule file classifies the HTTP status (`401`, `403`, `404` are refusals;
+`5xx`, `000` and a failed secret read are merely late) and a refusal increments
+`ci_parked_sweep_denied` **instead of** `ci_parked_prs_skipped`, never both. The
+two carry opposite advice — wait, versus grant a permission — and a counter that
+moves for either tells the reader neither. The alert key is `parkeddenied`, at
+30 minutes: one refused sweep during a GitHub incident is not a page, five in a
+row is.
 
 ---
 
