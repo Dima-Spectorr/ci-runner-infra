@@ -978,8 +978,11 @@ function Get-CacheHostileReason {
       .DESCRIPTION
         The Windows half of host-startup.sh's cache_master_is_hostile(). The Linux
         scan refuses symlinks, device nodes, setuid bits, out-of-tree hardlinks
-        and file capabilities; none of those five spellings exists here, and the
-        one thing that does is the REPARSE POINT.
+        and file capabilities; three of those five spellings do not exist here.
+        This function is the REPARSE POINT half. The out-of-tree hardlink is the
+        other half and lives in Get-CacheHardlinkReason, because it cannot be
+        decided from a DirectoryInfo: it takes a link count, and reading one
+        takes a handle.
 
         It is refused because of what the two operations after this scan would do
         with it, which is the same test the Linux list is built from:
@@ -1028,6 +1031,217 @@ function Get-CacheHostileReason {
             if ($safe.Length -gt 300) { $safe = $safe.Substring(0, 300) }
             return "reparse point: $safe"
         }
+    }
+    return ''
+}
+
+# The hardlink probe's P/Invoke source.
+#
+# WHY THERE HAS TO BE ONE. A file's security descriptor lives on its MFT record,
+# not on the directory entry, so every NAME for a file shares ONE ACL. The seal
+# that runs after the scan above is `icacls /reset /T` followed by an
+# inheritable grant, and `/T` walks names -- each name it touches rewrites the
+# descriptor of the underlying file. A hardlink dropped at C:\ci-cache\npm\x
+# pointing at a file under C:\Windows is therefore a grant applied THERE, at the
+# real path, and an ACL applied to the wrong tree is not undone by the next boot.
+# robocopy then copies the content into every slot, which is the smaller half.
+#
+# It is the same failure as the reparse point and it was not covered, because
+# detecting it needs a LINK COUNT and nothing in the managed API surface
+# available to Windows PowerShell 5.1 exposes one. `Get-ChildItem` does not,
+# FileInfo.LinkTarget is .NET 6, and `fsutil hardlink list` is one process per
+# file over a tree of tens of thousands. GetFileInformationByHandle is one call.
+#
+# FILE_READ_ATTRIBUTES (0x80) and nothing more: the probe never needs the
+# contents, and an attributes-only open is the cheapest handle Windows will give.
+# FILE_FLAG_OPEN_REPARSE_POINT (0x00200000) so the probe judges the name in the
+# tree rather than whatever it points at -- the scan above refuses reparse points
+# outright, and this must not disagree with it about which file it is looking at.
+# Full sharing (7), because a file another process holds open is not evidence of
+# anything and a sharing violation here would read as an unscannable tree.
+$script:CacheLinkProbeSource = @'
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct BY_HANDLE_FILE_INFORMATION {
+    public uint FileAttributes;
+    public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+    public uint VolumeSerialNumber;
+    public uint FileSizeHigh;
+    public uint FileSizeLow;
+    public uint NumberOfLinks;
+    public uint FileIndexHigh;
+    public uint FileIndexLow;
+}
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(
+    string lpFileName, uint dwDesiredAccess, uint dwShareMode, System.IntPtr lpSecurityAttributes,
+    uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetFileInformationByHandle(
+    Microsoft.Win32.SafeHandles.SafeFileHandle hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+'@
+
+# $null until the probe has been attempted; $true or $false afterwards.
+$script:CacheLinkProbeReady = $null
+
+function Initialize-CacheLinkProbe {
+    <#
+      .SYNOPSIS
+        Compile the link-count P/Invoke. $true when the probe may be used.
+      .DESCRIPTION
+        LAZY, AND THAT IS THE COST ARGUMENT. Add-Type shells out to csc.exe --
+        measured at 0.5-0.9s on Windows PowerShell 5.1 -- and a host with no
+        snapshot to hydrate must not pay it. It is called from the hydrate, after
+        a staged tree exists to scan, and never from the boot path that reads the
+        baked master: that tree was scanned once at image build, where the cost is
+        paid per image rather than per host.
+
+        Compiled ONCE. The guard is the type's existence rather than the flag
+        alone, because a second Add-Type of the same namespace throws on a name
+        that is already loaded, and the throw would arrive as a hydrate failure.
+
+        Never Deny-Boot. A probe that will not compile is a snapshot this host
+        cannot scan, which costs it a warm cache and nothing else.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($null -ne $script:CacheLinkProbeReady) { return $script:CacheLinkProbeReady }
+    $script:CacheLinkProbeReady = $false
+    try {
+        if (-not ([System.Management.Automation.PSTypeName] 'CiCache.Fs').Type) {
+            Add-Type -Namespace 'CiCache' -Name 'Fs' -MemberDefinition $script:CacheLinkProbeSource
+        }
+        $script:CacheLinkProbeReady = $true
+    } catch {
+        Write-BootLog "phase 7: the hardlink probe did not compile: $($_.Exception.Message)"
+    }
+    return $script:CacheLinkProbeReady
+}
+
+function Get-CacheLinkRecord {
+    <#
+      .SYNOPSIS
+        One record per multi-named file under a scanned tree. Bounded.
+      .DESCRIPTION
+        Takes the entries Get-CacheStagedEntry already walked rather than walking
+        again: the second enumeration would double the cost of the one step of
+        phase 7 that is measured in tens of thousands of file-system calls.
+
+        ONLY FILES WITH MORE THAN ONE NAME ARE RECORDED. A tree of a hundred
+        thousand singly-named files produces an empty list, and the predicate that
+        reads it then has nothing to do. That matters because the interesting case
+        is rare and the walk is not.
+
+        The identity is (volume serial, file index high, file index low) -- the
+        Windows spelling of (device, inode). Two names of one file agree on it and
+        no two files do, which is the whole basis of the count below.
+
+        BOUNDED LIKE EVERYTHING ELSE IN PHASE 7, and `TimedOut` returns no records
+        at all. Half a list of names is worse than none here: the predicate
+        compares how many names it SAW against how many the file has, so a walk cut
+        short reports every multi-named file as out-of-tree and refuses a snapshot
+        that was fine.
+
+        `Failed` counts handles that would not open or would not answer. As
+        LocalSystem, on a tree this host just unpacked, neither should happen --
+        and a file whose attributes cannot be read is exactly the file a scan must
+        not report as clean.
+
+        Measured 2026-08-23 on Windows PowerShell 5.1 over NTFS: 0.17ms per file
+        warm and 1.4ms cold. The staged tree is warm by construction -- this host
+        wrote it seconds earlier -- so a 60k-file snapshot costs around 10s of the
+        60s budget, and the deadline covers the case where it does not.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowNull()][array] $Entries,
+        [Parameter(Mandatory = $true)][datetime] $DeadlineUtc
+    )
+
+    $records = New-Object System.Collections.ArrayList
+    $failed = 0
+
+    foreach ($entry in $Entries) {
+        if ($null -eq $entry -or $entry.PSIsContainer) { continue }
+        if ([datetime]::UtcNow -gt $DeadlineUtc) {
+            return [pscustomobject] @{ Records = @(); Failed = $failed; TimedOut = $true }
+        }
+        # \\?\ so a path past MAX_PATH is probed rather than counted as a failure:
+        # a deep node_modules tree is the ordinary case here, not the exotic one.
+        $handle = [CiCache.Fs]::CreateFileW(('\\?\' + $entry.FullName), 0x80, 7, [System.IntPtr]::Zero, 3, 0x00200000, [System.IntPtr]::Zero)
+        if ($handle.IsInvalid) {
+            $handle.Dispose()
+            $failed++
+            continue
+        }
+        try {
+            $info = New-Object 'CiCache.Fs+BY_HANDLE_FILE_INFORMATION'
+            if (-not [CiCache.Fs]::GetFileInformationByHandle($handle, [ref] $info)) {
+                $failed++
+                continue
+            }
+            if ($info.NumberOfLinks -gt 1) {
+                [void] $records.Add([pscustomobject] @{
+                        Path  = [string] $entry.FullName
+                        Links = [int] $info.NumberOfLinks
+                        Id    = ('{0}:{1}:{2}' -f $info.VolumeSerialNumber, $info.FileIndexHigh, $info.FileIndexLow)
+                    })
+            }
+        } finally {
+            $handle.Dispose()
+        }
+    }
+    return [pscustomobject] @{ Records = $records.ToArray(); Failed = $failed; TimedOut = $false }
+}
+
+function Get-CacheHardlinkReason {
+    <#
+      .SYNOPSIS
+        Why a tree's hardlinks make it unsafe to seal or copy, or '' if they do
+        not. Pure.
+      .DESCRIPTION
+        COUNTED RATHER THAN FORBIDDEN, and that is the whole design. The Linux
+        scan spent a release refusing every tree with a link count above one, and
+        it had to be taken back out: pnpm's content-addressed store hardlinks
+        internally, `cp -al` in a warm script does too, and both are entirely
+        safe -- every name is inside the tree, so the ACL walk reaches all of
+        them. Over-blocking a security check into permanent uselessness is worse
+        than not having it, because the pool then runs cold on every boot and
+        nobody watches a cache-hit rate per job.
+
+        The exact question is answerable: count how many of a file's names live
+        inside the tree and compare with how many names it has. Equal means the
+        seal reaches all of them. Fewer means at least one name is somewhere this
+        tree does not own -- and `icacls /reset /T` rewrites the descriptor of the
+        file, not of the name, so the grant lands at that other path.
+
+        Deterministic on the offender it names: the records are re-read IN ORDER
+        rather than the count table being enumerated, because a hashtable's order
+        is unspecified and a refusal that names a different file each run is a
+        refusal nobody can act on.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowNull()][array] $Records)
+
+    $seen = @{}
+    foreach ($record in $Records) {
+        if ($null -eq $record) { continue }
+        $id = [string] $record.Id
+        if ($seen.ContainsKey($id)) { $seen[$id] = $seen[$id] + 1 } else { $seen[$id] = 1 }
+    }
+    foreach ($record in $Records) {
+        if ($null -eq $record) { continue }
+        $id = [string] $record.Id
+        $links = [int] $record.Links
+        if ($seen[$id] -ge $links) { continue }
+        # Same treatment as the reparse-point refusal: the name is untrusted text
+        # that may hold a newline, and a refusal which splits into two lines can be
+        # shaped to read like any other line this boot log emits.
+        $safe = ([string] $record.Path) -replace '[\x00-\x1f]', ' '
+        if ($safe.Length -gt 300) { $safe = $safe.Substring(0, 300) }
+        return "out-of-tree hardlink ($($seen[$id]) of $links names are in the tree): $safe"
     }
     return ''
 }
@@ -3913,6 +4127,38 @@ function Invoke-CacheHydrateBounded {
         if ($reason) {
             Write-BootLog ("phase 7: cache snapshot $snapshot rejected by the same scan the image build " +
                 "runs -- $reason; starting cold instead")
+            return 'scan-refused'
+        }
+
+        # AND THE SECOND WAY ONE FILE GETS TWO ACLS. A reparse point is one name
+        # standing for another tree; a hardlink is two names for one file, sharing
+        # one security descriptor -- so `icacls /reset /T` over this tree rewrites
+        # the ACL of whatever the other name is, wherever it lives. The scan above
+        # cannot see it: nothing in a directory entry says how many names a file
+        # has. This runs on the staged tree, before anything reaches the master,
+        # for exactly the reason the scan above does.
+        if (-not (Initialize-CacheLinkProbe)) {
+            Write-BootLog ("phase 7: cache snapshot $snapshot cannot be checked for out-of-tree " +
+                'hardlinks on this host -- starting cold rather than sealing a tree whose ACL ' +
+                'walk might land somewhere else')
+            return 'scan-refused'
+        }
+        $links = Get-CacheLinkRecord -Entries $scan.Entries -DeadlineUtc $deadline
+        if ($links.TimedOut) {
+            Write-BootLog ("phase 7: the staged snapshot could not be checked for hardlinks inside " +
+                "the $($bounds.BudgetSeconds)s budget -- starting cold instead")
+            return 'scan-timeout'
+        }
+        if ($links.Failed -gt 0) {
+            Write-BootLog ("phase 7: could not read the link count of all of the staged snapshot " +
+                "($($links.Failed) file(s)) -- it cannot be shown to be free of out-of-tree " +
+                'hardlinks, so nothing from it reaches the master')
+            return 'scan-refused'
+        }
+        $linkReason = Get-CacheHardlinkReason -Records $links.Records
+        if ($linkReason) {
+            Write-BootLog ("phase 7: cache snapshot $snapshot rejected by the same scan the image build " +
+                "runs -- $linkReason; starting cold instead")
             return 'scan-refused'
         }
 

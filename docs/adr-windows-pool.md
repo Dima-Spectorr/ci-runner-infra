@@ -822,14 +822,31 @@ established pattern here rather than a new bet.
 **The master is untrusted build input.** `warm_cache_script` is arbitrary
 repo-supplied code running elevated in the build VM (§6), and what it leaves
 behind is both ACL-walked and copied K times. The Linux scan refuses five
-things; three have no Windows spelling. Of the two that do, the **reparse
-point** is refused by the Packer template at step 7b and again by
-`Get-CacheHostileReason` at boot, because an image is not the only way content
-reaches that tree. The other, an **NTFS hardlink whose other name lies outside
-the master**, is not refused: a file's security descriptor lives on its MFT
-record, so `icacls /reset /T` rewrites it at that other name too. Detecting it
-needs a link count, which `Get-ChildItem` does not carry; #238 holds the
-options and their boot-time cost. Both operations that follow the scan would
+things; three have no Windows spelling. The two that do are refused twice each,
+by the Packer template at step 7b and again at boot, because an image is not
+the only way content reaches that tree — a hydrated snapshot is the other, and
+no reviewed build step stands in front of it.
+
+The first is the **reparse point** (`Get-CacheHostileReason`). The second is an
+**NTFS hardlink whose other name lies outside the master**: a file's security
+descriptor lives on its MFT record, so `icacls /reset /T` rewrites it at that
+other name too, and `robocopy /COPY:DAT` copies the content into every slot.
+Detecting it needs a link count, which `Get-ChildItem` does not carry and
+nothing in the managed surface of Windows PowerShell 5.1 exposes, so both
+copies P/Invoke `GetFileInformationByHandle` — `Get-CacheLinkRecord` plus
+`Get-CacheHardlinkReason` at boot, `packer/windows/scan-cache-hardlinks.ps1` at
+build time. The rule is **counted, not forbidden**: the names visible in the
+tree are compared against the link count, because a pnpm store and a `cp -al`
+hardlink legitimately and entirely inside it. Measured on NTFS under Windows
+PowerShell 5.1, the probe costs ~0.17 ms per file warm and ~1.4 ms cold, which
+is why the boot copy runs only over the **staged** tree on the hydrate path —
+warm by construction, and already inside the hydrate deadline it shares with
+the copy that follows — while the baked master is judged once, at build time.
+Compilation is lazy for the same reason: a host with no snapshot to hydrate
+never pays the ~0.5 s `Add-Type` shells out for, and a host where it fails
+starts cold rather than sealing a tree it could not check.
+
+Both operations that follow the scan would
 honour a junction: `icacls` with `(OI)(CI)` applies the grant to whatever it
 names, and an ACL applied to the wrong tree outlives the boot; `robocopy`
 descends into it. The scan therefore runs **before** the seal, and it includes

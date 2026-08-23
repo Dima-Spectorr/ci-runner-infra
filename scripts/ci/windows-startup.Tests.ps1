@@ -2068,3 +2068,145 @@ Describe 'snapshot refusal' {
         & $script:Refuse -AgeHours 999 -Bytes 8GB -FreeBytes 0 | Should -Be 'too-old'
     }
 }
+
+Describe 'out-of-tree hardlinks' {
+    # The second way one file ends up with two names, and the one Get-ChildItem
+    # cannot see: a hardlink carries no reparse attribute. The rule is COUNTED
+    # rather than forbidden, because a link count above one is ordinary inside a
+    # pnpm store or after a `cp -al` in a warm script -- the Linux side shipped
+    # the strict version once and had to take it back out.
+    It 'passes a tree with nothing in it' {
+        Get-CacheHardlinkReason -Records @() | Should -Be ''
+    }
+
+    It 'passes a file whose every name is inside the tree' {
+        $records = @(
+            [pscustomobject] @{ Path = 'C:\ci-cache\store\a'; Links = 2; Id = '1:0:7' },
+            [pscustomobject] @{ Path = 'C:\ci-cache\npm\a'; Links = 2; Id = '1:0:7' }
+        )
+        Get-CacheHardlinkReason -Records $records | Should -Be ''
+    }
+
+    It 'passes three names for one file when all three are in the tree' {
+        $records = @(
+            [pscustomobject] @{ Path = 'C:\ci-cache\1'; Links = 3; Id = '1:0:7' },
+            [pscustomobject] @{ Path = 'C:\ci-cache\2'; Links = 3; Id = '1:0:7' },
+            [pscustomobject] @{ Path = 'C:\ci-cache\3'; Links = 3; Id = '1:0:7' }
+        )
+        Get-CacheHardlinkReason -Records $records | Should -Be ''
+    }
+
+    It 'refuses a file with a name this tree cannot see' {
+        # One name here, two on disk. The other one is somewhere the ACL walk
+        # would still reach, because the descriptor lives on the file.
+        $records = @([pscustomobject] @{ Path = 'C:\ci-cache\npm\x'; Links = 2; Id = '1:0:7' })
+        Get-CacheHardlinkReason -Records $records |
+            Should -Be 'out-of-tree hardlink (1 of 2 names are in the tree): C:\ci-cache\npm\x'
+    }
+
+    It 'refuses when only some of a file''s names are in the tree' {
+        $records = @(
+            [pscustomobject] @{ Path = 'C:\ci-cache\a'; Links = 4; Id = '1:0:7' },
+            [pscustomobject] @{ Path = 'C:\ci-cache\b'; Links = 4; Id = '1:0:7' }
+        )
+        Get-CacheHardlinkReason -Records $records | Should -Match '\(2 of 4 names are in the tree\)'
+    }
+
+    It 'tells two different files apart by identity, not by link count' {
+        # Same link count, different (volume, index): counting names without
+        # keying on identity would read this as one file with two names and pass.
+        $records = @(
+            [pscustomobject] @{ Path = 'C:\ci-cache\a'; Links = 2; Id = '1:0:7' },
+            [pscustomobject] @{ Path = 'C:\ci-cache\b'; Links = 2; Id = '1:0:8' }
+        )
+        Get-CacheHardlinkReason -Records $records | Should -Match 'C:\ci-cache\a'
+    }
+
+    It 'names the first offender in tree order, every run' {
+        # The counts live in a hashtable and a hashtable has no order, so the
+        # verdict is re-read from the records. A refusal that names a different
+        # file on each boot is a refusal nobody can act on.
+        $records = @(
+            [pscustomobject] @{ Path = 'C:\ci-cache\aaa'; Links = 2; Id = '1:0:7' },
+            [pscustomobject] @{ Path = 'C:\ci-cache\bbb'; Links = 2; Id = '1:0:8' },
+            [pscustomobject] @{ Path = 'C:\ci-cache\ccc'; Links = 2; Id = '1:0:9' }
+        )
+        1..5 | ForEach-Object {
+            Get-CacheHardlinkReason -Records $records | Should -Match 'C:\ci-cache\aaa'
+        }
+    }
+
+    It 'strips control characters out of the name it logs' {
+        $records = @([pscustomobject] @{
+                Path  = "C:\ci-cache\a`nphase 7: sealed"
+                Links = 2
+                Id    = '1:0:7'
+            })
+        $reason = Get-CacheHardlinkReason -Records $records
+        $reason | Should -Not -Match "`n"
+        $reason | Should -Match 'C:\ci-cache\a phase 7: sealed$'
+    }
+
+    It 'bounds the name it logs' {
+        $records = @([pscustomobject] @{
+                Path  = 'C:\ci-cache\' + ('a' * 900)
+                Links = 2
+                Id    = '1:0:7'
+            })
+        $reason = Get-CacheHardlinkReason -Records $records
+        $reason.Length | Should -Be ('out-of-tree hardlink (1 of 2 names are in the tree): '.Length + 300)
+    }
+
+    It 'skips a null record rather than throwing on one' {
+        Get-CacheHardlinkReason -Records @($null) | Should -Be ''
+    }
+
+    It 'still finds an offender sitting behind a null record' {
+        $records = @($null, [pscustomobject] @{ Path = 'C:\ci-cache\z'; Links = 2; Id = '1:0:7' })
+        Get-CacheHardlinkReason -Records $records | Should -Match 'C:\ci-cache\z'
+    }
+}
+
+Describe 'the hardlink probe''s bound' {
+    # Get-CacheLinkRecord opens a handle per file, so the cases below are the
+    # ones that decide WITHOUT touching the filesystem -- they run on the same
+    # ubuntu-latest as the rest of this file. The probe itself is proved on the
+    # host, where a refusal costs a cold cache and not a registration.
+    It 'reports nothing for an empty tree, and does not call it a timeout' {
+        $r = Get-CacheLinkRecord -Entries @() -DeadlineUtc ([datetime]::UtcNow.AddMinutes(5))
+        $r.Records | Should -HaveCount 0
+        $r.Failed | Should -Be 0
+        $r.TimedOut | Should -Be $false
+    }
+
+    It 'skips directories without opening a handle for them' {
+        $entries = @([pscustomobject] @{ FullName = 'C:\ci-cache\npm'; PSIsContainer = $true })
+        $r = Get-CacheLinkRecord -Entries $entries -DeadlineUtc ([datetime]::UtcNow.AddMinutes(5))
+        $r.Records | Should -HaveCount 0
+        $r.TimedOut | Should -Be $false
+    }
+
+    It 'gives up on a deadline already past, before it opens anything' {
+        # The deadline is the hydrate budget, shared with the copy that follows.
+        # A scan that ran to completion past it would spend the whole budget
+        # proving the snapshot was fine and then have none left to install it.
+        $entries = @([pscustomobject] @{ FullName = 'C:\ci-cache\npm\x'; PSIsContainer = $false })
+        $r = Get-CacheLinkRecord -Entries $entries -DeadlineUtc ([datetime]::UtcNow.AddMinutes(-1))
+        $r.TimedOut | Should -Be $true
+    }
+
+    It 'reports no records at all when it times out' {
+        # NOT a partial answer. Half a scan says nothing about the half it did
+        # not read, and Get-CacheHardlinkReason would read a truncated record set
+        # as a tree that is merely small.
+        $entries = @([pscustomobject] @{ FullName = 'C:\ci-cache\npm\x'; PSIsContainer = $false })
+        $r = Get-CacheLinkRecord -Entries $entries -DeadlineUtc ([datetime]::UtcNow.AddMinutes(-1))
+        $r.Records | Should -HaveCount 0
+    }
+
+    It 'skips a null entry rather than throwing on one' {
+        $r = Get-CacheLinkRecord -Entries @($null) -DeadlineUtc ([datetime]::UtcNow.AddMinutes(5))
+        $r.Records | Should -HaveCount 0
+        $r.TimedOut | Should -Be $false
+    }
+}

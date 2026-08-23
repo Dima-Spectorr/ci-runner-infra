@@ -2252,5 +2252,204 @@ mutate "a timed-out walk handing back the entries it did manage to read" \
   's|Entries = @(); Failed = \$failed; TimedOut = \$true|Entries = $entries.ToArray(); Failed = $failed; TimedOut = $true|' \
   has_hydrate_bounds_honoured
 
+# --- invariant 13: a cached file's other name cannot be outside the tree -----
+#
+# THE SECOND WAY ONE FILE ENDS UP WITH TWO ACLS, and the one Get-ChildItem
+# cannot see. A reparse point announces itself in an attribute; a hardlink does
+# not. A file's security descriptor lives on its MFT record rather than on the
+# directory entry, so every name for the file shares ONE descriptor: `icacls
+# /setowner /T` and `/reset /T` over the cache rewrite the ACL of a file whose
+# real home is C:\Windows, and robocopy /COPY:DAT copies its CONTENT into every
+# slot.
+#
+# COUNTED, NOT FORBIDDEN. The Linux side shipped "link count above one is
+# hostile" and had to withdraw it: pnpm's content-addressed store hardlinks
+# internally and a `cp -al` in a warm script does too, and both are safe because
+# every name is inside the tree. So the question asked is the exact one — are
+# all of this file's names here? — and the checks below refuse the cheap
+# approximation of it as hard as they refuse its absence.
+#
+# There are two copies, for the same reason the reparse-point scan has two: the
+# image build refuses a hostile master before any host boots from it, and the
+# boot script refuses a hostile SNAPSHOT, which is the path no reviewed build
+# step stands in front of.
+
+WIN_PACKER="$HERE/../../packer/ci-host-image-win.pkr.hcl"
+SCAN_PS="$HERE/../../packer/windows/scan-cache-hardlinks.ps1"
+
+has_hardlink_scan() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # The probe compiles LAZILY, and a host that cannot compile it starts cold
+  # rather than sealing a tree whose ACL walk might land somewhere else. Never
+  # Deny-Boot: this is the cache layer, and it may not cost a host its
+  # registration.
+  matches "$code" 'if \(-not \(Initialize-CacheLinkProbe\)\) \{' || return 1
+  ! matches "$code" 'Initialize-CacheLinkProbe.*Deny-Boot' || return 1
+
+  # It runs on the STAGED tree — before anything reaches the master — and it
+  # shares the hydrate's deadline with the copy that follows.
+  matches "$code" '\$links = Get-CacheLinkRecord -Entries \$scan\.Entries -DeadlineUtc \$deadline' || return 1
+  matches "$code" 'if \(\$links\.TimedOut\) \{' || return 1
+  # A handle that would not open is not evidence of a clean tree.
+  matches "$code" 'if \(\$links\.Failed -gt 0\) \{' || return 1
+  matches "$code" '\$linkReason = Get-CacheHardlinkReason -Records \$links\.Records' || return 1
+
+  # A timed-out walk hands back NOTHING. Half a scan says nothing about the half
+  # it did not read, and the verdict would read a truncated record set as a tree
+  # that is merely small — the same correction group 27 pins on the entry walk.
+  matches "$code" 'Records = @\(\); Failed = \$failed; TimedOut = \$true' || return 1
+
+  # Counted, not forbidden: the verdict compares names-seen against the link
+  # count. `$seen[$id] -ge $links` going away is the pnpm regression coming back.
+  matches "$code" '\$seen\[\$id\] -ge \$links' || return 1
+
+  # The probe judges the NAME, not what it points at: without
+  # FILE_FLAG_OPEN_REPARSE_POINT a junction's own link count is never read.
+  matches "$code" '0x00200000' || return 1
+}
+
+has_image_hardlink_scan() { # <file: the Windows packer template>
+  local code upload run seal
+  [ -f "$1" ] || return 1
+  code=$(code_of "$1")
+
+  # Uploaded rather than inlined: a P/Invoke does not survive being folded into
+  # an array of one-line HCL strings.
+  matches "$code" 'source      = "windows/scan-cache-hardlinks\.ps1"' || return 1
+  matches "$code" '\-ExecutionPolicy Bypass -File .*scan-cache-hardlinks\.ps1' || return 1
+  # …and its refusal is CHECKED. -File turns a throw into an exit code, and an
+  # unchecked exit code is a scan that runs and decides nothing.
+  matches "$code" 'the warm cache did not pass the hardlink scan' || return 1
+
+  # ORDER IS THE WHOLE SAFETY PROPERTY, exactly as the step's own comment says of
+  # the reparse-point scan: /setowner /T and /reset /T walk every name, and an
+  # ACL applied to the wrong file is not undone by anything later.
+  upload=$(grep -nE 'source      = "windows/scan-cache-hardlinks\.ps1"' "$1" | head -1 | cut -d: -f1)
+  run=$(grep -nE '\-ExecutionPolicy Bypass -File .*scan-cache-hardlinks\.ps1' "$1" | head -1 | cut -d: -f1)
+  seal=$(grep -nE "icacls\.exe 'C:..ci-cache' /setowner" "$1" | head -1 | cut -d: -f1)
+  [ -n "$upload" ] && [ -n "$run" ] && [ -n "$seal" ] || return 1
+  [ "$upload" -lt "$run" ] || return 1
+  [ "$run" -lt "$seal" ] || return 1
+}
+
+has_hardlink_scan_script() { # <file: packer/windows/scan-cache-hardlinks.ps1>
+  local code
+  [ -f "$1" ] || return 1
+  code=$(code_of "$1")
+
+  # The link count nothing in the managed surface of Windows PowerShell 5.1
+  # exposes, read the only way there is to read it.
+  matches "$code" 'GetFileInformationByHandle' || return 1
+  matches "$code" 'NumberOfLinks' || return 1
+  matches "$code" '0x00200000' || return 1
+
+  # Fails closed on a file it cannot open. At build time there is no budget to
+  # protect and no boot to save, so "could not read" is a failed build.
+  matches "$code" 'attributes could not be read' || return 1
+  matches "$code" 'link count could not be read' || return 1
+
+  # Counted, not forbidden — the same predicate the boot script carries, and the
+  # reason both are written out rather than shared: they run on different hosts,
+  # in different languages of the same language, and only this gate reads both.
+  matches "$code" '\$names\[\$entry\.Id\] -ge \$links\[\$entry\.Id\]' || return 1
+  matches "$code" 'names are in the tree' || return 1
+  ! matches "$code" 'NumberOfLinks -gt 1\) \{ *throw' || return 1
+
+  # Refuses deterministically: the counts live in a hashtable, whose order is
+  # unspecified, so the verdict is re-read from the walk. A build that names a
+  # different file each run is a build nobody can unblock.
+  matches "$code" 'foreach \(\$entry in \$order\)' || return 1
+}
+
+if has_hardlink_scan "$SCRIPT"; then
+  ok
+else
+  bad "the boot script's hydrate does not refuse an out-of-tree hardlink — the probe gate, the staged walk, its deadline, its failed-handle count, the verdict, or the counting rule that keeps a pnpm store legal is missing"
+fi
+
+if has_image_hardlink_scan "$WIN_PACKER"; then
+  ok
+else
+  bad "the Windows image build does not refuse an out-of-tree hardlink in the warm cache, or runs the scan after the icacls walk that would already have applied an ACL somewhere else"
+fi
+
+if has_hardlink_scan_script "$SCAN_PS"; then
+  ok
+else
+  bad "packer/windows/scan-cache-hardlinks.ps1 is missing, does not read a link count, does not fail closed on an unreadable file, or forbids hardlinks outright instead of counting the names it can see"
+fi
+
+# --- group 28: the hardlink half of the scan --------------------------------
+#
+# The boot-script half goes through `mutate`; the two build-time files need a
+# helper that takes the file, because `mutate` only ever edits $SCRIPT.
+mutate_file() { # <file> <description> <sed-program> <predicate>
+  local f="$1" desc="$2" prog="$3" pred="$4" tmp
+  tmp=$(mktemp)
+  if ! sed "$prog" "$f" >"$tmp"; then
+    bad "mutation expression failed: $desc"
+    rm -f "$tmp"
+    return
+  fi
+  if cmp -s "$tmp" "$f"; then
+    bad "mutation changed nothing, so it asserts nothing: $desc"
+    rm -f "$tmp"
+    return
+  fi
+  if "$pred" "$tmp"; then
+    bad "mutation not detected: $desc"
+  else
+    ok
+  fi
+  rm -f "$tmp"
+}
+
+mutate "the hydrate seals a tree on a host where the probe never compiled" \
+  's|if (-not (Initialize-CacheLinkProbe)) {|if ($false) {|' \
+  has_hardlink_scan
+mutate "the staged tree walked for links without the hydrate's deadline" \
+  's|\$links = Get-CacheLinkRecord -Entries \$scan\.Entries -DeadlineUtc \$deadline|$links = Get-CacheLinkRecord -Entries $scan.Entries -DeadlineUtc ([datetime]::MaxValue)|' \
+  has_hardlink_scan
+mutate "a timed-out link walk treated as a clean one" \
+  's|if (\$links\.TimedOut) {|if ($false) {|' \
+  has_hardlink_scan
+mutate "the files whose handles would not open counted as having one name" \
+  's|if (\$links\.Failed -gt 0) {|if ($false) {|' \
+  has_hardlink_scan
+mutate "the records collected and then never judged" \
+  's|\$linkReason = Get-CacheHardlinkReason -Records \$links\.Records|$linkReason = ""; $null = @($links)|' \
+  has_hardlink_scan
+mutate "a timed-out link walk handing back the records it did manage to read" \
+  's|Records = @(); Failed = \$failed; TimedOut = \$true|Records = $records.ToArray(); Failed = $failed; TimedOut = $true|' \
+  has_hardlink_scan
+mutate "the pnpm regression restored: any second name is hostile" \
+  's|if (\$seen\[\$id\] -ge \$links) { continue }|if ($links -le 1) { continue }|' \
+  has_hardlink_scan
+mutate "the probe following a junction instead of judging the name in the tree" \
+  's|0x00200000|0x00000000|' \
+  has_hardlink_scan
+
+mutate_file "$WIN_PACKER" "the image build stops uploading the scan it runs" \
+  's|source      = "windows/scan-cache-hardlinks.ps1"|source      = "windows/ci-service-shim.cs"|' \
+  has_image_hardlink_scan
+mutate_file "$WIN_PACKER" "the scan runs and its refusal is discarded" \
+  's|if ($LASTEXITCODE -ne 0) { throw \\"the warm cache did not pass the hardlink scan (exit $LASTEXITCODE)\\" }|$null = $LASTEXITCODE|' \
+  has_image_hardlink_scan
+mutate_file "$WIN_PACKER" "the ACL walk moved ahead of the scan that decides whether it is safe" \
+  's|"& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .C:\\\\Windows\\\\Temp\\\\scan-cache-hardlinks.ps1. -Root .C:\\\\ci-cache.",||' \
+  has_image_hardlink_scan
+
+mutate_file "$SCAN_PS" "the build-time scan forbids hardlinks outright, and a pnpm store stops building" \
+  's|if ($names\[$entry.Id\] -ge $links\[$entry.Id\]) { continue }|if ($false) { continue }|' \
+  has_hardlink_scan_script
+mutate_file "$SCAN_PS" "a file the build could not open reported as clean" \
+  's|throw "the warm cache holds a file whose attributes could not be read: $($file.FullName)"|continue|' \
+  has_hardlink_scan_script
+mutate_file "$SCAN_PS" "the offender chosen out of a hashtable, so the build names a different file each run" \
+  's|foreach ($entry in $order) {|foreach ($entry in $names.Keys) {|' \
+  has_hardlink_scan_script
+
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
