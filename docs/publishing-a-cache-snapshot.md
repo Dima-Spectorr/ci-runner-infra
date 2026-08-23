@@ -289,6 +289,15 @@ the same reason (a junction names a path outside the tree that the per-slot copy
 would follow). Failing here means it is refused once, in a run someone is
 watching, rather than silently on every boot of every host in the pool.
 
+**A Windows pool consumes what this publishes, on the same terms.** Phase 7 of
+`windows-host-startup.ps1` -- which ships in the module, not in the image, so it
+arrives on the next instance-template roll rather than the next image build --
+fetches this pool's `current` pointer and unpacks the snapshot over `C:\ci-cache` before
+the master is scanned and sealed — same prefix, same read-only grant, same
+age/size/free-space bounds, same 60-second budget, same verdict strings. Nothing
+in this document changes for a Windows pool; it is listed here because the
+*verification* below differs.
+
 The scan includes the staging directory ITSELF, not only what is under it: a
 prepare command that deletes the stage and puts a junction in its place leaves a
 tree whose descendants all look ordinary while `tar -C` packs from wherever the
@@ -623,3 +632,14 @@ logs the snapshot name, how many tool caches it moved in, its size, its age, and
 how much of the budget it spent. Every failure inside that budget is one line and
 a cold first job — the layer fails open, so a broken publish costs cache hits and
 never a host that does not come up.
+
+**On a Windows pool the log is the only place to look.** That boot script has no
+metric client, so it publishes none of the series above: the verdict is one
+`phase 7: cache hydrate verdict: <verdict>` line on the startup script's stdout,
+which GCE captures to the host's serial port 1
+(`gcloud compute instances get-serial-port-output <host> --project <p> --zone <z>`).
+The consequence is worth stating plainly, because it is the failure this document
+otherwise tells you the dashboard will catch: a Windows pool whose publish
+silently stopped, or whose hosts refuse every snapshot, is invisible in
+monitoring and shows up only as jobs that got slower. Check a fresh host's log
+after the first publish, and again after any change to the workflow.

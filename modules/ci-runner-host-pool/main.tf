@@ -546,7 +546,21 @@ data "google_compute_zones" "available" {
   status  = "UP"
 }
 
+# ADDING `count` RENAMES THE RESOURCE. `google_compute_instance.controller`
+# becomes `…controller[0]`, and an address a state file does not recognise is a
+# create — of a VM whose name is already taken — next to a destroy of the
+# controller that is currently running the fleet. Terraform does reconcile the
+# no-key/index-zero pair on its own in current versions, but "does, today,
+# quietly" is not the compatibility story this variable promises; the `moved`
+# block says it out loud, and says it in the plan.
+moved {
+  from = google_compute_instance.controller
+  to   = google_compute_instance.controller[0]
+}
+
 resource "google_compute_instance" "controller" {
+  count = var.manage_controller ? 1 : 0
+
   project      = var.project_id
   name         = "${var.name}-controller"
   zone         = length(var.zones) > 0 ? var.zones[0] : data.google_compute_zones.available.names[0]
@@ -591,6 +605,12 @@ resource "google_compute_instance" "controller" {
     on_host_maintenance = "MIGRATE"
   }
 
+  # STILL ONE KEY PER FIELD, deliberately, even though the controller now reads
+  # a `ci-pools` table. This controller serves exactly one pool — its own — and
+  # the controller synthesises a one-row table from these keys when `ci-pools`
+  # is absent. Rendering the table here instead would rewrite the metadata of
+  # every controller in the fleet to say what it already says, for no behaviour
+  # change, on the same apply that is trying to change something else.
   metadata = merge(local.controller_registration_metadata, {
     startup-script = local.controller_startup
 
