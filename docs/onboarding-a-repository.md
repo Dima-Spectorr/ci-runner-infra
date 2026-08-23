@@ -35,9 +35,15 @@ posture you opt into knowingly. Read [Windows](#windows) before you declare one.
    one thing it buys is the merge-queue parking detector below: the controller
    reads each open pull request's check runs to decide whether a pull request
    the queue will never admit is nevertheless finished and green. Missing the
-   permission does not fail an apply or a job; the controller logs the 403 once
-   per sweep and `ci_prs_green_and_unqueued` stays at zero forever, which reads
-   exactly like health. If you see that log line, that is what it means.
+   permission does not fail an apply or a job, and `ci_prs_green_and_unqueued`
+   then publishes an unbroken zero — which is exactly what a repository with
+   nothing parked publishes. So the controller says so in its own right:
+   `ci_parked_sweep_denied` goes non-zero, the log line reads `parked sweep:
+   DENIED`, and the `parkeddenied` alert fires after 30 minutes. If you see
+   either, grant the permission on the App **and accept it on the installation**
+   — a permission added to an App stays pending until the installation approves
+   it, and a pending permission behaves exactly like one that was never
+   granted.
 
    It needs **`Contents: read`** as well if you are standing up a merge-queue
    pool (step 8): that is how the controller reads the repository's own

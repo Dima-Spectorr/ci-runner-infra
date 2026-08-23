@@ -1111,6 +1111,14 @@ PARKED_LAST_SWEEP=0
 # worth of installation rate limit on a question nothing waits on.
 PARKED_MAX_CANDIDATES=20
 PARKED_SKIPPED=0
+# DENIED IS NOT SKIPPED, and conflating them is what made the permission note
+# above a comment rather than a signal. A skipped pull request is retried on the
+# next sweep and the count is merely a lower bound; a denied one is retried
+# forever and the count is a lie. Both would have moved the same counter, so an
+# installation without `checks: read` published "the sweep is slightly behind"
+# every five minutes, indefinitely, while reporting zero parked pull requests —
+# a feature built to end a silent zero, failing by producing one.
+PARKED_DENIED=0
 # Every reason parked_verdict can return, keyed here so the series can be
 # published as a zero. A metric that only appears when something is wrong is
 # indistinguishable from a controller that stopped publishing — the same
@@ -1132,12 +1140,15 @@ collect_parked() {
   local r
   for r in "${PARKED_REASONS[@]}"; do PARKED_COUNT["$r"]=0; done
   PARKED_SKIPPED=0
+  PARKED_DENIED=0
 
   local deadline=$((sweep_start + PARKED_BUDGET))
 
-  local pulls rows
+  local pulls rows status
   pulls=$(gh_api "repos/$REPO_FULL/pulls?state=open&per_page=50") || {
-    log "parked sweep: cannot list open pull requests (status=$(cat "$STATE_DIR/api.status" 2>/dev/null))"
+    status=$(cat "$STATE_DIR/api.status" 2>/dev/null)
+    parked_denial "$status" && PARKED_DENIED=$((PARKED_DENIED + 1))
+    log "parked sweep: cannot list open pull requests (status=$status)"
     return 0
   }
 
@@ -1167,8 +1178,17 @@ collect_parked() {
     examined=$((examined + 1))
 
     checks=$(gh_api "repos/$REPO_FULL/commits/$sha/check-runs?per_page=100") || {
-      PARKED_SKIPPED=$((PARKED_SKIPPED + 1))
-      log "parked sweep: cannot read check runs for #$num (status=$(cat "$STATE_DIR/api.status" 2>/dev/null)) — a 403 here means the App installation lacks 'checks: read' and this sweep can never report anything"
+      status=$(cat "$STATE_DIR/api.status" 2>/dev/null)
+      # A denial is counted as a denial and NOT also as a skip: the two carry
+      # opposite advice — wait, versus grant a permission — and a counter that
+      # moves for both tells the reader neither.
+      if parked_denial "$status"; then
+        PARKED_DENIED=$((PARKED_DENIED + 1))
+        log "parked sweep: DENIED reading check runs for #$num (status=$status) — the App installation lacks 'checks: read', so this sweep can never report anything until that is granted"
+      else
+        PARKED_SKIPPED=$((PARKED_SKIPPED + 1))
+        log "parked sweep: cannot read check runs for #$num (status=$status)"
+      fi
       continue
     }
 
@@ -3059,6 +3079,13 @@ queue_controller_series() {
   # budget or hit its ceiling, so the count is a lower bound rather than an
   # answer — the same contract as ci_demand_runs_skipped.
   queue_series "ci_parked_prs_skipped" "$PARKED_SKIPPED"
+  # And what makes the zero UNREADABLE if it is missing. Non-zero here means the
+  # sweep was refused rather than delayed: the count above is not a lower bound,
+  # it is nothing at all, and no number of further sweeps will improve it. This
+  # is the series to alert on, because a repository whose installation lacks
+  # `checks: read` publishes an unbroken zero from every other series in this
+  # block — which is exactly what a repository with nothing parked publishes.
+  queue_series "ci_parked_sweep_denied" "$PARKED_DENIED"
 }
 
 # --- install / run -----------------------------------------------------------
