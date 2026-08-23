@@ -104,7 +104,7 @@ check "the descriptor was found" yes \
 unknown=""
 while read -r k; do
   [ -n "$k" ] || continue
-  printf '%s\n' "$columns" | grep -qx "$k" || unknown="$unknown $k"
+  printf '%s\n' "$columns" | grep -cx "$k" >/dev/null || unknown="$unknown $k"
 done <<EOF
 $descriptor
 EOF
@@ -116,7 +116,7 @@ check "no descriptor key is a column the parser does not read" "" "$unknown"
 # job under GitHub's superset rule, so the pool reports zero demand forever
 # while looking perfectly healthy.
 for required in name mig region runner_labels; do
-  printf '%s\n' "$descriptor" | grep -qx "$required" && r=yes || r=no
+  printf '%s\n' "$descriptor" | grep -cx "$required" >/dev/null && r=yes || r=no
   check "the descriptor carries '$required', which has no safe default" yes "$r"
 done
 
