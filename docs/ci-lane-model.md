@@ -328,6 +328,71 @@ continues still reports red, so nothing is loosened.
   Raising a gating job past `checks_timeout` without raising `checks_timeout`
   re-creates that dequeue.
 
+### Routing the queue's own runs to their own pool
+
+The lane rule decides **how much** CI a change deserves. It does not decide
+**where** that CI runs, and on a repository with a merge-queue pool those are
+two different questions arriving at the same job.
+
+Mergify validates a queued pull request by re-running the same `pull_request`
+workflows on a `mergify/merge-queue/<sha>` branch, against the same labels, at
+the moment the pull-request pool is busiest — which is the bottleneck this
+split exists to remove. So the lane job publishes a second output naming the
+label set, and every self-hosted job resolves `runs-on` from it:
+
+```yaml
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      lane: ${{ steps.decide.outputs.lane }}
+      runner: >-
+        ${{ (github.event.pull_request.head.repo.full_name == github.repository
+             && github.event.pull_request.user.login == 'mergify[bot]'
+             && startsWith(github.head_ref, 'mergify/merge-queue/'))
+            && '["self-hosted","linux","gcp","<Repo>-merge-queue"]'
+            || '["self-hosted","linux","gcp","<Repo>"]' }}
+
+  test:
+    needs: lane
+    if: needs.lane.outputs.lane != 'none'
+    runs-on: ${{ fromJSON(needs.lane.outputs.runner) }}
+```
+
+Four properties, each of which has already failed somewhere on this fleet:
+
+- **An expression, not a step.** A step can fail, and a failed step leaves every
+  downstream job with an empty `runs-on`, which GitHub queues forever against a
+  label no runner carries. There is no red check for that — the pull request
+  simply stops moving.
+- **The branch name alone decides nothing.** `github.head_ref` is chosen by
+  whoever opened the pull request, so keyed on the prefix alone the pool
+  reserved for the queue is available to anyone — a fork included — willing to
+  name a branch after it. Two facts nobody outside the repository can forge are
+  required with it: the head branch lives in **this** repository, and the pull
+  request was opened by Mergify. `check-runner-policy.sh` fails this as
+  **RUNNER12**.
+- **The two label sets must be disjoint.** GitHub schedules a self-hosted runner
+  by *superset*, so a queue arm that carries `<Repo>` *as well as*
+  `<Repo>-merge-queue` is dedicated in name only — every ordinary job is
+  eligible for the queue's hosts, and the split buys nothing. Covered the other
+  way round and the queue cannot be addressed at all. The queue pool carries its
+  own label **instead of** the pull-request pool's, never in addition to it.
+  **RUNNER13** here; the controller module asserts the same property across its
+  `pools` table at plan time, because either end alone is a rule the other end
+  drifts away from.
+- **`github.head_ref` is empty on `push`,** so a push to the default branch
+  resolves to the pull-request pool. Correct: a push is not a speculative check.
+
+**Turning the route on is order-dependent, once, per repository.** The commit
+that introduces it cannot be merged *through* the queue: Mergify's speculative
+draft of that very commit runs under the new routing and asks for a label no
+runner carries yet. Apply the Terraform that creates the queue pool first, then
+merge the workflow change.
+
+A repository with no merge-queue pool writes none of this and neither rule
+applies to it — they are opted into by the route existing, not by a flag.
+
 ---
 
 ## Where a browser suite sits in the lanes
