@@ -743,40 +743,12 @@ if [ "\$took" = 1 ]; then
     # into a path that had stopped existing. The CONTENT is what belongs to the
     # previous job; the directory itself belongs to this one, and _tool is on
     # PATH the same way.
-    #
-    # THE WHOLE TREE, not just the top entry. Recreating only \$e is what took
-    # twelve of IntegrateIT's twenty-four slots out of service on 2026-08-23:
-    # the pipeline workspace is _work/<owner>/<repo>, so <owner> came back and
-    # <repo> did not. Both hooks are launched WITH that path as their working
-    # directory, so the completed hook could not start, the clean marker was
-    # never written, and every job routed to the slot afterwards was failed for
-    # a previous job that had in fact finished — in about six seconds, which is
-    # faster than a healthy slot finishes anything, so the queue drained onto
-    # the broken slots first. Nothing in the loop was individually wrong; the
-    # depth was.
-    #
-    # Directories only, and \`find -type d\` does not follow symlinks, so a name
-    # a slot pointed elsewhere is not rebuilt as a real directory. The shape is
-    # read out of the HOLDING directory, which is root-owned 0700 — the slot
-    # cannot add a path here for root to go on to create.
     d=0
-    shape="\$SLOT_ROOT/.reset/\$idx/.shape"
-    : >"\$shape"
-    if [ -d "\$e" ] && [ ! -L "\$e" ]; then
-      d=1
-      [ "\$stage" = started ] &&
-        { (cd "\$e" && find . -mindepth 1 -type d -print0) >"\$shape" 2>/dev/null || true; }
-    fi
+    [ -d "\$e" ] && d=1
     rm -rf -- "\$e" || { say "slot \$idx: could not remove \$e"; rc=1; }
     if [ "\$d" = 1 ] && [ "\$stage" = started ]; then
       install -d -o "\$u" -g "\$u" -m 0755 "\$e" || { say "slot \$idx: could not recreate \$e"; rc=1; }
-      # find walks pre-order, so a parent is always created before its child.
-      while IFS= read -r -d '' sub; do
-        install -d -o "\$u" -g "\$u" -m 0755 "\$e/\${sub#./}" ||
-          { say "slot \$idx: could not recreate \$e/\${sub#./}"; rc=1; }
-      done <"\$shape"
     fi
-    rm -f -- "\$shape"
   done
   # Handed back. The slot still owns the parent, so it could have created a NEW
   # _work at the vacated name while root worked in the holding directory; that
