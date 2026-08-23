@@ -155,6 +155,34 @@ gate is run with `--allow-dynamic-runner` once this contract is adopted.
 `RUNNER9` supplies the specificity that flag gives up: not merely an expression,
 but one naming the anchor job's output.
 
+### Do not put the fork guard in the anchor's `if:`
+
+`if: github.event.pull_request.head.repo.fork == false` on the anchor looks
+equivalent to routing and is not. A job that `needs:` a **skipped** job is
+itself skipped, so guarding the anchor skips every consumer with it, and a fork
+pull request gets no CI at all — the routing expression on `test` is never even
+evaluated, because `test` never starts. Nothing goes red: a skipped required
+check is not a failed one.
+
+So the anchor **routes** rather than skipping, exactly as its consumers do, and
+publishes a hosted array on a fork so the whole run degrades together:
+
+```yaml
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","gcp","<Repo>"]') }}
+```
+
+That still keeps fork code off a credentialed warm host, which is all `RUNNER4`
+asks. A fork run then has no pin and no shared stack, so the anchor publishes
+`addr` and `pg` **empty** — a blank value a consumer can test, rather than the
+literal `null` a missing output produces — and a suite that needs the stack
+either brings up its own throwaway service on that leg or does not run on
+forks.
+
+An `if:` guard is still right for a job **nothing needs**, such as the Windows
+leg: there is no hosted substitute for what it tests, so skipping it is the
+answer. A repository whose lane model makes that check required has to let a
+skip satisfy it.
+
 ## 3. The infrastructure owner job
 
 Exactly one job in the workflow brings the stack up, and it is the anchor.
