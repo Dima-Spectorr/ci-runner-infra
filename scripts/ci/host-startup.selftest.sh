@@ -900,7 +900,14 @@ has_pin_hold() { # <file>
   # IDLE NEEDS TWO WITNESSES. The clean marker is on disk from the completed
   # hook until the NEXT job's started hook, so a tick in either window stopped
   # the unit under a live job -- through the mechanism added to avoid that.
-  matches "$code" 'pgrep -u "\\\$u" -f .Runner\\.Worker.' || return 1
+  #
+  # Anchored on the NEGATED form, not on the bare pgrep. The bare spelling
+  # stopped identifying this site the moment the idle slot sweep grew a worker
+  # probe of its own: the needle went on matching the sweep's copy while the pin
+  # sweep's own had been deleted, which is a gate reading green about a line
+  # that is gone. The negation is what makes this site this site — the sweep's
+  # two probes are both positive.
+  matches "$code" '! pgrep -u .*Runner.*Worker.* &&' || return 1
 
   # A PREVIOUS-BOOT HOLD IS PUBLISHED AS RELEASED, not only logged. The instance
   # answers the same host-* label across a reboot, so nothing else can tell the
@@ -1332,7 +1339,7 @@ mutate "the prune forgets the boot"         's@\[ "\\\$h_boot" = "\\\$(cat /proc
 mutate "teardown before the agent stops"    's@agent stopped before teardown@here we go@'                                     has_pin_hold
 mutate "a failed docker ps reads as empty"  's@could not list the run.s containers@nothing to see@'                           has_pin_hold
 mutate "the record dies with a failed start" 's@the agent would not start — the hold stays in place@the agent would not start@' has_pin_hold
-mutate "the marker alone proves idle"       's@! pgrep -u "\\\$u" -f .Runner\\.Worker. >/dev/null 2>&1 \&\&@@'                has_pin_hold
+mutate "the marker alone proves idle"       's@! pgrep -u "@pgrep -u "@'                                                      has_pin_hold
 mutate "an orphaned hold is only logged"    's@^  publish ""$@  true@'                                                        has_pin_hold
 mutate "a held slot pruned between jobs"    's@if \[ "\\\$stage" != started \] && \[ "\\\$prune" = 1 \]@if [ "\\\$stage" != started ]@' has_pin_hold
 mutate "the sweeper runs once at boot"      's@^OnUnitActiveSec=30$@@'                                                     has_pin_hold
@@ -1413,15 +1420,23 @@ _live=$(awk -v SQ="'" '
   { line = $0; sub(/^[ 	]+/, "", line); sub(/[ 	]+$/, "", line) }
   line == delim { inhd = 0; next }
   q == 0 {
+    # `$(` is the rarer mistake because it reads like code and gets escaped by
+    # reflex -- and it is the worse one when it happens, since a substitution
+    # that SUCCEEDS produces no output, no failure and no trace that it ran. But
+    # it is ALSO the idiom that renders a computed value into a unit file
+    # (`Environment=CI_SLOT_VCPUS=$(( ... ))`, `NetworkNamespacePath=/run/netns/
+    # $(slot_netns "$idx")`), which is deliberate and load-bearing. Flagging
+    # those would make the gate cost more than it catches, and a gate that has
+    # to be waived per line stops being read. So `$(` is judged in COMMENTS
+    # only, which is where the mistake lives: #272 was a sentence, not a
+    # command. Backticks stay strict everywhere -- no line in this tree wants
+    # one at render time, so any is a mistake wherever it sits.
+    iscomment = (substr(line, 1, 1) == "#")
     for (i = 1; i <= length($0); i++) {
       c = substr($0, i, 1)
       if (substr($0, i - 1, 1) == BS) continue
-      # The backtick spelling, and the modern one. `$(` is the rarer mistake
-      # because it reads like code and gets escaped by reflex -- but it is the
-      # worse one when it happens, since a substitution that SUCCEEDS produces
-      # no output, no failure and no trace that it ran.
       if (c == BT) { print FNR; next }
-      if (c == "$" && substr($0, i + 1, 1) == "(") { print FNR; next }
+      if (iscomment && c == "$" && substr($0, i + 1, 1) == "(") { print FNR; next }
     }
   }
 ' "$SCRIPT")
