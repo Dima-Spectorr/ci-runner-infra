@@ -84,24 +84,46 @@ expect 0 "missing jobs key does not crash the tick" '{}'
 # long the pool has been running them). Crossing the two wires would be silent —
 # both are plausible ISO timestamps and both produce a plausible number of
 # seconds — so the split is pinned here rather than read back off the graph.
-# shellcheck disable=SC2016  # $mine_labels is a jq variable, not a shell one.
+# The expression emits ONE LINE PER POOL now, because one controller serves the
+# whole repository and sweeps its runs once. Field 1 is the pool the line
+# belongs to; the four that follow are the same four as before, and the lines
+# are joined with `;` below so a multi-pool expectation is still one string.
+#
+# An empty stamp list is written as `-`, not as "". Tab is IFS whitespace, so
+# `read` COLLAPSES a run of empty fields: a pool with running jobs and nothing
+# queued would hand its in-progress stamps to the queued column and report a job
+# that started ten minutes ago as having waited ten minutes for a runner. That
+# is the same wire-crossing this block exists to pin, arriving by another route.
+# `date -d -` fails, so the sentinel is skipped by the reader.
+# shellcheck disable=SC2016  # $pools is a jq variable, not a shell one.
 STAMPS='
   [ .jobs[]?
     | select(.status == "queued" or .status == "in_progress")
     | select( ((.labels // []) | length) > 0 )
-    | select( ((.labels // []) - $mine_labels) | length == 0 )
-  ] as $mine
-  | [ ($mine | length),
+    | select( ((.labels // []) | map(select(startswith("host-"))) | length) == 0 )
+  ] as $candidates
+  | $pools | to_entries[]
+  | .key as $pool
+  | .value as $mine_labels
+  | [ $candidates[] | select( ((.labels // []) - $mine_labels) | length == 0 ) ] as $mine
+  | [ $pool,
+      ($mine | length),
       ([ $mine[] | select(.status == "queued") ] | length),
-      ([ $mine[] | select(.status == "queued") | .started_at // .created_at ] | join(" ")),
-      ([ $mine[] | select(.status == "in_progress") | .started_at // empty ] | join(" "))
+      ([ $mine[] | select(.status == "queued") | .started_at // .created_at ]
+         | join(" ") | if . == "" then "-" else . end),
+      ([ $mine[] | select(.status == "in_progress") | .started_at // empty ]
+         | join(" ") | if . == "" then "-" else . end)
     ] | @tsv'
+
+# One pool for the stamp cases, so their expectations stay readable. The
+# multi-pool cases at the end of the file build their own map.
+POOLS_MAP=$(jq -n --argjson l "$POOL_LABELS" '{telnet: $l}')
 
 # fields <want-pipe-joined> <description> <jobs-json>
 fields() {
   local want="$1" desc="$2" jobs="$3" got
-  got=$(printf '%s' "$jobs" | jq -r --argjson mine_labels "$POOL_LABELS" "$STAMPS" \
-    | tr -d '\r' | tr '\t' '|')
+  got=$(printf '%s' "$jobs" | jq -r --argjson pools "$POOLS_MAP" "$STAMPS" \
+    | tr -d '\r' | tr '\t' '|' | paste -sd';' -)
   if [ "$got" = "$want" ]; then
     PASS=$((PASS + 1))
   else
@@ -110,13 +132,13 @@ fields() {
   fi
 }
 
-fields '2|1|2026-08-15T16:15:00Z|2026-08-15T16:18:09Z' \
+fields 'telnet|2|1|2026-08-15T16:15:00Z|2026-08-15T16:18:09Z' \
   "a queued and a running job land in different fields, never the same one" \
   '{"jobs":[
      {"status":"queued","labels":["self-hosted"],"created_at":"2026-08-15T16:15:00Z"},
      {"status":"in_progress","labels":["self-hosted"],"started_at":"2026-08-15T16:18:09Z"}]}'
 
-fields '1|0||2026-08-15T16:18:09Z' \
+fields 'telnet|1|0|-|2026-08-15T16:18:09Z' \
   "a pool with nothing queued still reports how long its running job has been running" \
   '{"jobs":[{"status":"in_progress","labels":["self-hosted"],"started_at":"2026-08-15T16:18:09Z"}]}'
 
@@ -124,24 +146,92 @@ fields '1|0||2026-08-15T16:18:09Z' \
 # told us started has not been running for the time since it was created, and
 # reporting that difference as run time would raise a wedged-slot alert for
 # every job still sitting in the queue.
-fields '1|0||' \
+fields 'telnet|1|0|-|-' \
   "a running job with no start time contributes nothing rather than its queue age" \
   '{"jobs":[{"status":"in_progress","labels":["self-hosted"],"created_at":"2026-08-15T16:15:00Z"}]}'
 
 # The incident this field exists for: one slot wedged, every sibling finished.
 # The completed jobs must not dilute it — they are not in flight.
-fields '1|0||2026-08-15T16:18:09Z' \
+fields 'telnet|1|0|-|2026-08-15T16:18:09Z' \
   "finished siblings do not enter the in-flight age at all" \
   '{"jobs":[
      {"status":"completed","labels":["self-hosted"],"started_at":"2026-08-15T16:17:48Z"},
      {"status":"completed","labels":["self-hosted"],"started_at":"2026-08-15T16:18:02Z"},
      {"status":"in_progress","labels":["self-hosted"],"started_at":"2026-08-15T16:18:09Z"}]}'
 
-fields '1|0||' \
+fields 'telnet|1|0|-|-' \
   "a job wedged on ANOTHER pool's runner is not this pool's stuck job" \
   '{"jobs":[
      {"status":"in_progress","labels":["self-hosted","windows"],"started_at":"2026-08-15T16:18:09Z"},
      {"status":"in_progress","labels":["self-hosted"]}]}'
+
+# --- four pools, one sweep ------------------------------------------------------
+#
+# The reason this expression grew a pool column at all: a repository needs a
+# Linux CI pool, a Windows CI pool and a merge-queue pool for each, and four
+# controllers polling one repository's run list would spend 720 list calls an
+# hour against an installation budget all four share. So one sweep scores every
+# pool, and the cases below are the ones that go wrong when it does not.
+
+MULTI=$(jq -n '{
+  "lin-ci":    ["self-hosted","linux","gcp","Telnet-Emulation"],
+  "win-ci":    ["self-hosted","windows","gcp","Telnet-Emulation"],
+  "lin-queue": ["self-hosted","merge-queue","linux-mq","Telnet-Emulation"]
+}')
+
+# multi <want> <description> <jobs-json> — same reader, an explicit pool map.
+multi() {
+  local want="$1" desc="$2" jobs="$3" got
+  got=$(printf '%s' "$jobs" | jq -r --argjson pools "$MULTI" "$STAMPS" \
+    | tr -d '\r' | cut -f1,2 | tr '\t' '|' | paste -sd';' -)
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  want: %s\n  got:  %s\n' "$desc" "$want" "$got"
+  fi
+}
+
+# EVERY pool gets a line, including the ones that matched nothing. A pool that
+# emitted no line at all would keep the previous tick's demand — the sweep
+# accumulates into one array per pool across every run it examines — and a pool
+# whose work has finished would go on asking for the hosts it no longer needs.
+multi 'lin-ci|0;win-ci|0;lin-queue|0' \
+  "a pool that matched nothing still reports itself, at zero" \
+  '{"jobs":[{"status":"queued","labels":["ubuntu-latest"]}]}'
+
+# The routing the whole four-pool design rests on. The merge-queue pool does not
+# carry the generic `linux`/`gcp` labels, and the CI pools do not carry
+# `merge-queue`, so the label sets are DISJOINT and a job is demand for exactly
+# one of them. If that ever stops being true this line is what fails.
+multi 'lin-ci|1;win-ci|0;lin-queue|0' \
+  "an ordinary Linux CI job is demand for the Linux CI pool alone" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","linux","gcp"]}]}'
+
+multi 'lin-ci|0;win-ci|0;lin-queue|1' \
+  "a merge-queue job is demand for the merge-queue pool alone" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","merge-queue","linux-mq"]}]}'
+
+multi 'lin-ci|0;win-ci|1;lin-queue|0' \
+  "a Windows job does not scale out the Linux pools" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","windows"]}]}'
+
+# The one case where a job counts twice, asserted rather than avoided: under
+# GitHub's superset rule BOTH pools really can pick up a job whose labels every
+# pool satisfies, so both scaling out is correct, not a bug. It is also why a
+# pool must never be given a label set that is a superset of another's by
+# accident — the cost of that mistake is double the machines, and it is visible
+# here and nowhere else.
+multi 'lin-ci|1;win-ci|1;lin-queue|1' \
+  "a job asking only for self-hosted is genuinely demand for every pool" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted"]}]}'
+
+# A pinned job is not scale-out demand for ANY pool — buying a host cannot help
+# a job only one existing machine can run. Excluded once, in the candidate set,
+# rather than once per pool.
+multi 'lin-ci|0;win-ci|0;lin-queue|0' \
+  "a pinned job is excluded before the pools are scored, not after" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","linux","host-ci-lin-a1b2"]}]}'
 
 # --- the copy is really a copy -------------------------------------------------
 # A test of a copied expression tests nothing once the original moves on, so
@@ -151,8 +241,8 @@ CONTROLLER="$HERE/../../modules/ci-runner-host-pool/scripts/controller-startup.s
 # shellcheck disable=SC2016  # matching jq source text literally, on purpose.
 for needle in \
   'select(.status == "in_progress") | .started_at // empty' \
-  'running=$(printf '"'"'%s'"'"' "$counted" | cut -f4)' \
-  'RUNNING_MAX=$wait' \
+  'while IFS=$'"'"'\t'"'"' read -r c_pool n q stamps running; do' \
+  'D_RUNNING["$c_pool"]=$wait' \
   'queue_series "ci_job_running_seconds_max" "$RUNNING_MAX"'
 do
   if grep -qF "$needle" "$CONTROLLER"; then

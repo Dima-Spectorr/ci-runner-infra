@@ -421,6 +421,35 @@ Ports outside the band are **not** DNAT'd and are not a bug — the band is what
 the pool's firewall rule permits between hosts, and a wider one would be a wider
 rule.
 
+### What the firewall rule does not separate
+
+The rule is scoped to the **repository**, not to the run, and the difference is
+worth stating because the band otherwise reads as private to your pull request.
+
+A network tag is static metadata on a VM. Every host in your repository's pool
+carries the same source tag and every stack host the same target tag, for as
+long as the pool exists — there is no run id in a tag. So two pull requests of
+the *same repository* running at the same time on different hosts each match the
+other's rule, and either could open a socket on the other's band. In the example
+this document uses, that is a passwordless PostgreSQL.
+
+What this is not: an opening for fork-authored code. Forks do not run on this
+fleet — the pools refuse fork workflows and `check-runner-policy.sh` fails a
+`pull_request` job that reaches a warm host without a fork guard. Both sides of
+this boundary are code that already has write access to the repository.
+
+What it still is: a job with a hardcoded port, a stale connection string, or a
+test that scans the band can reach a *concurrent run's* database and corrupt a
+result, and nothing in the failure will point at this rule. Two habits avoid it
+entirely, and they are the same two the rest of this document asks for anyway —
+take your addresses from `CI_SHARED_INFRA_ADDR` and the band variables rather
+than hardcoding a port, and name your compose project after the run so a stray
+connection fails loudly instead of landing somewhere plausible.
+
+Closing it properly needs authorization the network layer cannot express, and is
+tracked in issue #265 as host-side filtering keyed on the run the pin hold
+already records.
+
 ## 6. What the pool does for you
 
 You do not configure any of this; it is stated so the behaviour is not a
