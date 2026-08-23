@@ -387,6 +387,19 @@ around it:
 * **The pool bound and the two-pin rule still come first**, unchanged. A
   controller never cancels over a host it does not own.
 
+The ledger also moves an instance name across a boundary it had never crossed
+before: the absence clock is a **file named after the host**, so for the first
+time a string taken from `runs-on` — text authored in a pull request — decides a
+path. §2.6's rule 1b already refuses labels carrying `case`-pattern syntax, but
+it lives inside the decision function, and a caller needs the host name *before*
+there is a verdict, so rule 1b is not the thing standing there. `pin_host_of`
+therefore enforces GCE's own instance-name charset at the point it hands the
+name out, and the controller re-checks before building a path — the two live in
+different files joined only at apply time, and a future caller arriving with a
+name from somewhere else is exactly the change that would not look wrong. A name
+that fails is simply no pin, which every caller already reads as "no absence
+clock", and it could not have named a live host in any event.
+
 The verdict is separate from §2.6's (`vanished` rather than `orphan`) and so is
 its series, `ci_pinned_jobs_host_vanished` — counted per **job** and before the
 per-run de-duplication, because a matrix of eight jobs on one dead host really

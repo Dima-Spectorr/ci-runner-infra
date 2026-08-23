@@ -1675,6 +1675,18 @@ refresh_host_liveness() {
   fi
 
   for host in ${live//,/ }; do
+    # Same charset check as the reader, and here it guards a WRITE. This list
+    # comes from the instance-group listing rather than from a pull request, so
+    # nothing malformed is expected — which is the reason to check rather than
+    # not: an unexpected value in a trusted list is precisely the one that goes
+    # unnoticed, and the failure it would cause is a file written outside the
+    # state directory by the one process on the fleet holding the App token.
+    case "$host" in
+      "" | *[!a-z0-9-]*)
+        log "host liveness: refusing to stamp a clock for an implausible instance name [$host] — the pool listing returned something that is not a GCE instance name"
+        continue
+        ;;
+    esac
     printf '%s' "$now" >"$STATE_DIR/absent-$host"
   done
 
@@ -1701,6 +1713,17 @@ refresh_host_liveness() {
 # pinned_job_decision treats the two completely differently.
 host_missing_seconds() {
   local host="$1" now="$2"
+
+  # The name becomes a path, so it is checked here as well as at pin_host_of,
+  # which is where it was cleaned. Not redundancy for its own sake: the name
+  # originates in `runs-on`, the two functions live in different files joined
+  # only at Terraform apply time, and a future caller reaching this one with a
+  # name from somewhere else is exactly the change that would not look wrong.
+  # A path is never built from a string this function has not itself vetted.
+  case "$host" in
+    "" | *[!a-z0-9-]*) return 0 ;;
+  esac
+
   local f="$STATE_DIR/absent-$host"
   local stamp
   [ -f "$f" ] || return 0

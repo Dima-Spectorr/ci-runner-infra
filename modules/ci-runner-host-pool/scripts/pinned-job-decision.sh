@@ -87,13 +87,32 @@ pin_split() {
 # than one — two pins are unsatisfiable by construction (rule 6) and there is no
 # single host to ask about. Says nothing about whether the job is this pool's;
 # that is rule 3's and rule 5's, and both still run.
+#
+# And empty for a name that is not a GCE instance name. This is the one helper
+# whose output a caller turns into a FILESYSTEM PATH before any verdict exists,
+# and its input is `runs-on` — text authored in the pull request. Rule 1b
+# already refuses `case`-pattern syntax, but it lives inside the decision
+# function, which by definition has not run yet when a caller asks this
+# question, and it has no reason to care about `/` or `..` because it never
+# builds a path. So the charset is enforced HERE, at the boundary that hands the
+# name out, rather than trusted at each place that consumes it: a label of
+# `host-../../something` yields no pin at all, which every caller already
+# handles as "no absence clock" and reads as unknown.
+#
+# The rule is GCE's, not ours — an instance name is lowercase alphanumerics and
+# hyphens — so a legitimate pin cannot fail it, and a name that fails it could
+# not have named a live host in any event.
 pin_host_of() {
   local pins
   pins=$(pin_split pins "${1:-}" "${2:-}")
   case "$pins" in
     "" | *,*) return 0 ;;
   esac
-  printf '%s' "${pins#host-}"
+  local host="${pins#host-}"
+  case "$host" in
+    "" | *[!a-z0-9-]*) return 0 ;;
+  esac
+  printf '%s' "$host"
 }
 
 # pinned_job_decision <job_status> <job_labels_csv> <pool_labels_csv> \

@@ -254,5 +254,46 @@ expect ignore: "a Windows job is not a Linux pool's, in any case" \
 src_has "the controller passes the set its agents answer to, not the configured one" \
   'pinned_job_decision "$status" "$labels" "$RUNNER_MATCH_LABELS"'
 
+# --- the name that becomes a path ---------------------------------------------
+#
+# pin_host_of is the one helper here whose answer a caller turns into a file
+# path, and it does so BEFORE any verdict exists — so rule 1b, which lives
+# inside the decision function, has not run and cannot be the thing relied on.
+# The input is `runs-on`, authored in the pull request. These assert the name
+# handed out is always one GCE could have issued.
+pin_is() { # <desc> <expected> <job_labels>
+  local got; got="$(pin_host_of "$3" "$POOL")"
+  if [ "$got" = "$2" ]; then printf 'ok   %s\n' "$1"
+  else printf 'FAIL %s\n       want [%s]\n       got  [%s]\n' "$1" "$2" "$got"; fail=1; fi
+}
+
+pin_is "an ordinary pin is handed back as the instance name" \
+  "ci-lin-a1b2" "self-hosted,linux,host-ci-lin-a1b2"
+pin_is "a traversal in the label yields NO pin, so no path is built from it" \
+  "" "self-hosted,linux,host-../../../etc/passwd"
+pin_is "a bare parent reference yields no pin either" "" "self-hosted,linux,host-.."
+pin_is "a separator anywhere in the name is refused" "" "self-hosted,linux,host-a/b"
+pin_is "so is an empty pin, which would name the state directory itself" \
+  "" "self-hosted,linux,host-"
+# Whitespace never reaches the charset check: pin_split iterates an UNQUOTED
+# expansion, so `host-a b` is already two labels by the time anything looks at
+# it, and the pin is the first of them. Asserted because the safety here is a
+# property of that splitting rather than of the check — quoting the expansion
+# would be a reasonable-looking tidy-up that reintroduced a name with a space
+# in it, and this case is what would object.
+pin_is "whitespace splits into two labels rather than surviving inside a name" \
+  "a" "self-hosted,linux,host-a b"
+# pin_split folds case itself, for the same reason the decision function does:
+# GitHub dispatches case-insensitively and GCE instance names are lowercase. So
+# an upper-case pin is a legitimate pin, and the charset check must see the
+# folded form or it would reject every workflow that shouts.
+pin_is "an upper-case pin is folded, not refused" \
+  "ci-lin-a1b2" "self-hosted,linux,host-CI-LIN-A1B2"
+# And the refusal must not become a verdict of its own: a job whose pin is
+# unusable is still classified by every rule that follows, on the labels
+# themselves rather than on the cleaned name.
+expect ignore: "a label carrying pattern syntax is still refused by rule 1b" \
+  queued "self-hosted,linux,host-ci-lin-*" "$POOL" "$BASE" "$LIVE" 99999 300
+
 [ "$fail" = 0 ] && printf '\npinned-job-decision: all cases pass\n'
 exit "$fail"
