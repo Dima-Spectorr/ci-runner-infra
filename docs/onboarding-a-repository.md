@@ -29,15 +29,36 @@ posture you opt into knowingly. Read [Windows](#windows) before you declare one.
    for the account that owns the repo — both non-secret. The private key is not
    in any repository or state file; see step 3.
 
+   **Its permissions, who can grant each one, and how to tell whether a grant
+   actually landed are all in
+   [`github-app-permissions.md`](github-app-permissions.md)** — read it before
+   the first apply, not after the first silent failure. Every permission on
+   that list fails quietly, and a permission added to the App but not yet
+   accepted by the installation behaves exactly like one that was never
+   granted. Two entries are called out here because they are the ones an
+   onboarding reader is most likely to be missing:
+
    Its installation needs **`checks: read`** in addition to the permissions the
    runners themselves use. Nothing about job execution depends on it — without
    it the pool scales, registers and runs jobs exactly as it does with it. The
    one thing it buys is the merge-queue parking detector below: the controller
    reads each open pull request's check runs to decide whether a pull request
    the queue will never admit is nevertheless finished and green. Missing the
-   permission does not fail an apply or a job; the controller logs the 403 once
-   per sweep and `ci_prs_green_and_unqueued` stays at zero forever, which reads
-   exactly like health. If you see that log line, that is what it means.
+   permission does not fail an apply or a job, and `ci_prs_green_and_unqueued`
+   then publishes an unbroken zero — which is exactly what a repository with
+   nothing parked publishes. So the controller says so in its own right:
+   `ci_parked_sweep_denied` goes non-zero, the log line reads `parked sweep:
+   DENIED`, and the `parkeddenied` alert fires after 30 minutes. If you see
+   either, grant the permission on the App **and accept it on the installation**
+   — a permission added to an App stays pending until the installation approves
+   it, and a pending permission behaves exactly like one that was never
+   granted.
+
+   It needs **`Contents: read`** as well if you are standing up a merge-queue
+   pool (step 8): that is how the controller reads the repository's own
+   `.mergify.yml` to size the pool. This one fails the same quiet way — without
+   it the pool keeps the Terraform ceiling you typed and says nothing, and
+   `ci_queue_config_age_seconds` climbing is the only sign.
 2. **A GCP project, a VPC and a subnet** in the region the pool will run in.
    Hosts get no external IP: egress must already work from that subnet (in the
    MOT projects it is the peering to `mot-lz-vpc` through the central firewall —
@@ -58,7 +79,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.41.0"
 
   project_id         = var.project_id
   network            = var.network
@@ -67,7 +88,7 @@ module "ci_runner_network" {
 }
 
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.41.0"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -76,7 +97,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.41.0"
 
   project_id = var.project_id
   region     = var.region
@@ -155,7 +176,7 @@ nightly, from your default branch.
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.41.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -166,9 +187,17 @@ module "ci_cache_warmer" {
   github_repo  = "<repo>"
 
   github_connection = var.cloudbuild_github_connection # gen2 projects only
-  prepare_command   = "npm ci --ignore-scripts"        # the default
 }
 ```
+
+**Nothing there describes your build, and nothing should.** The warm reads your
+lockfile — pnpm, yarn, npm, in that order — installs the way that manager
+installs, and runs `turbo run build` with a `--cache-dir` it passes itself. A
+repository that builds with pnpm and `--cache-dir=.turbo` sets none of it. The
+`prepare_command` / `build_command` inputs exist for a build that genuinely is
+not that, and a command written into a Terraform root is a claim about a
+repository that can change package managers without telling the root — stale, it
+does not fail the apply, it fails at 04:00 into a log nobody reads.
 
 That is a Cloud Build in *this project*, so there is no federation, no OIDC
 provider to map, no credential in your repository and no workflow file to keep.
@@ -392,7 +421,7 @@ later apply:
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.39.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.41.0"
 
   project_id     = var.project_id
   region         = var.region
@@ -477,6 +506,112 @@ Run the suite in the baked Playwright container rather than installing browsers
 on the pool — [`ui-testing-on-the-fleet.md`](ui-testing-on-the-fleet.md) is the
 consumer guide for that half — and tier it: `@smoke` on every pull request, the
 full suite on the merge queue.
+
+## 8. The four pools — the fleet standard
+
+Everything above stands up **one** pool, and one pool is the shape a repository
+starts in, not the shape it stays in. The fleet standard is **four pools behind
+one controller**: Linux CI, Windows CI, Linux merge-queue, Windows merge-queue.
+The decision is [`adr-four-pool-controller.md`](adr-four-pool-controller.md);
+the operational detail — the routing contract and the capacity formula — is in
+[`ci-lane-model.md`](ci-lane-model.md).
+
+**Why the merge queue gets its own pool.** Mergify validates a queued pull
+request by re-running the same `pull_request` workflows, against the same
+labels, at exactly the moment the CI pool is busiest with the *next* pull
+requests. Sharing one pool between the two means a pull request that has already
+gone green sits in the queue waiting for a runner — and it does not fail, it
+sits *pending*, which no red check anywhere reports.
+
+**Why the Windows pair is declared even at zero.** `max_hosts = 0` costs a table
+row and nothing else. What it buys is that the shape is identical in every
+repository, so turning Windows on later is a number change rather than a
+retrofit into a routing contract that has already shipped.
+
+### The Terraform delta
+
+Each pool keeps its own `ci-runner-host-pool` block with **its controller turned
+off**, and hands its descriptor to one `ci-runner-controller`:
+
+```hcl
+module "ci_runner_pool" {           # the Linux CI pool from step 1, unchanged
+  # …
+  manage_controller = false
+  role              = "ci"          # the default; written out for symmetry
+  runner_labels     = var.runner_labels
+}
+
+module "ci_runner_pool_mq" {        # the Linux merge-queue pool
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.41.0"
+  # …every argument of the CI pool, with three differences:
+  name              = "${var.pool_name}-mq"
+  manage_controller = false
+  role              = "merge-queue"
+
+  # DISJOINT, never a superset. GitHub schedules a self-hosted runner by label
+  # superset, so a queue pool that also carries the CI label is dedicated in
+  # name only. The controller asserts this across its whole table at plan time.
+  runner_labels = ["self-hosted", "linux", "gcp", "${var.github_repo}-merge-queue"]
+
+  max_hosts = var.mq_max_hosts   # the hard stop, not the size — see below
+}
+
+module "ci_runner_controller" {
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.41.0"
+
+  name  = "${var.pool_name}-controller"
+  pools = [
+    module.ci_runner_pool.pool_descriptor,
+    module.ci_runner_pool_mq.pool_descriptor,
+    module.ci_runner_pool_win.pool_descriptor,      # max_hosts = 0
+    module.ci_runner_pool_win_mq.pool_descriptor,   # max_hosts = 0
+  ]
+  # …the same github app, network and controller service account the pool used
+}
+```
+
+Never write the controller's table by hand: `mig` is a *generated* name, and a
+wrong one gives you a controller that lists an empty instance group forever and
+reports a perfectly healthy, permanently empty pool. Pass `pool_descriptor`.
+
+### `mq_max_hosts` is a hard stop, not the size
+
+The merge-queue pool sizes itself. The controller reads `max_parallel_checks`
+out of the repository's own `.mergify.yml`, live, and derives the ceiling:
+
+```
+hosts = ceil( Σ max_parallel_checks × jobs per check ÷ slots per host )
+```
+
+`max_hosts` remains the MIG's maximum underneath that, so set it to something
+the derivation will not routinely hit — and then watch, rather than calculate:
+`ci_queue_capacity_wanted_hosts` above `ci_queue_capacity_hosts` is the
+controller telling you your Terraform ceiling has become the bottleneck. It is a
+comparison, so it needs no threshold of your own.
+
+### The order, which is not optional
+
+1. **Apply the Terraform** that creates the merge-queue pool.
+2. **Then** merge the workflow change that routes to it.
+
+The commit that introduces the route cannot be merged *through* the queue:
+Mergify's speculative draft of that very commit runs under the new routing and
+asks for a label no runner carries yet.
+
+### One extra App permission
+
+The controller now needs **`Contents: read`** on the GitHub App, to read
+`.mergify.yml`. Without it the read is a 403 and the merge-queue pool silently
+keeps its Terraform `max_hosts` instead of a derived ceiling — it fails open, so
+nothing breaks and nothing says so. The one signal is
+`ci_queue_config_age_seconds` climbing past 300; on a healthy controller it
+stays under it, and `-1` means the configuration has never been read at all.
+
+Granting it is two steps and the second is the one that gets missed: the App
+owner adds the permission, and then **every installation owner has to accept
+it**. Both steps, who can perform each, and how to verify from the controller
+rather than from a settings page:
+[`github-app-permissions.md`](github-app-permissions.md).
 
 ## Windows
 
@@ -618,7 +753,7 @@ instantiations with their own names, MIGs, controllers and labels.
 
 ```hcl
 module "ci_runner_identity_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.41.0"
 
   project_id        = var.project_id
   name              = var.win_pool_name
@@ -631,7 +766,7 @@ module "ci_runner_identity_win" {
 }
 
 module "ci_runner_pool_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.41.0"
 
   # ... project_id, region, github_*, network, subnetwork and the three
   # identities exactly as the Linux pool above, from the _win modules ...

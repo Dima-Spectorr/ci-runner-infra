@@ -103,8 +103,23 @@ local job. Three things about this call are not decoration:
   owner and report two stacks clean.
 
 `pin-ttl` sizing is §4; the remaining inputs (`compose-file`,
-`compose-project`, `hosted-runner`, `timeout-minutes`) are documented on the
-workflow itself and default to what the example uses.
+`compose-project`, `hosted-runner`) are documented on the workflow itself and
+default to what the example uses.
+
+**Rule 1 without rule 2.** An empty `compose-file` is pin-only: the host is
+pinned and the run's jobs land together, and nothing is brought up. Two cases
+need it. A repository with no shared infrastructure would otherwise have to
+invent a compose file to get host affinity at all. And a repository whose lane
+model has a docs-only lane wants the pin for the jobs that still run and no
+database for the shards that do not, which it selects with an expression:
+
+```yaml
+        compose-file: ${{ needs.lane.outputs.lane == 'none' && '' || 'ci/compose.yaml' }}
+```
+
+`pg` is then published empty — the same statement a degrade makes, and
+deliberately indistinguishable from it, because a consumer only ever has to act
+on "there is no shared stack".
 
 ### What it does
 
@@ -237,6 +252,66 @@ An `if:` guard is still right for a job **nothing needs**, such as the Windows
 leg: there is no hosted substitute for what it tests, so skipping it is the
 answer. A repository whose lane model makes that check required has to let a
 skip satisfy it.
+
+### An empty `pg` is a normal Tuesday, not a fork corner case
+
+The fork branch is the *rarest* of the three the anchor degrades on. The other
+two are a host older than the contract, and — the common one — **a host another
+run already holds**. The anchor is deliberately unpinned, so it lands on any
+free slot, including a free slot on a host somebody else's run has pinned;
+`ci-pin-hold` then answers `pinned=0` and the run continues unpinned, with no
+shared stack and `pg` empty. On a private repository, where the fork branch
+never fires at all, that third branch is the only one that ever does, and it
+fires whenever two pull requests are in flight.
+
+So a job that reads `needs.anchor.outputs.pg` straight into a URL does not have
+a fork-only bug. It has `postgres://ci@127.0.0.1:/app` on an ordinary busy
+afternoon, and a red required check on a run where nothing was wrong.
+
+**Every consumer of `pg` needs a fallback, and it is published rather than
+copied:**
+
+```yaml
+      - id: db
+        uses: Dima-Spectorr/ci-runner-infra/.github/actions/shared-infra-db@v5
+        with:
+          pg: ${{ needs.anchor.outputs.pg }}
+          addr: ${{ needs.anchor.outputs.addr }}
+          image: public.ecr.aws/docker/library/postgres@sha256:<digest>
+      - run: ./scripts/test.sh
+        env:
+          DATABASE_URL: ${{ steps.db.outputs.url }}
+```
+
+It hands back the shared stack's band port when there is one and starts a
+throwaway Postgres on this job's own runtime when there is not, so the suite
+cannot tell the difference. It also publishes `shared`, which is worth logging:
+a run where *every* job reports `0` is a run whose anchor never pinned
+anything — a fleet problem currently wearing a green tick.
+
+Nothing tears the throwaway down, on purpose. `slot-reset.sh completed` removes
+every container on the slot's daemon at the end of every job and fails closed if
+it cannot, sparing only a held slot; a teardown step would duplicate a host-side
+guarantee that has to be right anyway, since a job that dies does not run its
+own cleanup either.
+
+**The Windows leg has no fallback available** — there is no container runtime on
+a Windows host. A Windows job that needs the stack and finds `addr` empty has to
+skip. That is rule 3's asymmetry, and it is why the Windows leg is the one job
+in the example carrying an `if:` guard. Forget the guard and the action says so:
+the fallback checks `RUNNER_OS` and `docker` on PATH before it starts anything,
+so the leg fails on a sentence naming the missing `if:` rather than on
+`docker: command not found` from inside a command substitution.
+
+Two smaller inputs behave the way their names suggest, which is worth stating
+because one of them did not always. `password` is enforced on the fallback and
+not merely embedded in the URL — empty runs the throwaway container under
+`POSTGRES_HOST_AUTH_METHOD=trust`, which is the normal case for a fixture
+database and what the anchor's compose does, and a non-empty one drops `trust`
+so the image's scram-sha-256 default applies and the credential in the URL is
+the credential the server checks. `health-timeout` is a whole number of
+seconds, validated: `90m` is rejected with a message instead of reaching the
+arithmetic and dying as a bash syntax error.
 
 ## 3. The infrastructure owner job
 

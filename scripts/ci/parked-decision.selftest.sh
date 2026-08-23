@@ -125,6 +125,42 @@ expect "parked:base" "…and does not suppress one the base condition earned" \
 # argument gets no alert, not a spurious one.
 expect "quiet:" "no arguments at all is silence" # (no args)
 
+# --- parked_denial: is a failed sweep refused, or merely late? -----------------
+#
+# The counter this feeds is the one an operator is paged on, and it separates
+# two states that used to share a number: "retry in five minutes" and "no
+# retry will ever work". A rule that says DENIED too eagerly pages somebody
+# during a GitHub incident; one that says it too rarely restores the silent
+# zero this whole file exists to end.
+deny() { # <expected: yes|no> <name> <status>
+  local want="$1" name="$2" status="${3-}"
+  local got=no
+  parked_denial "$status" && got=yes
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL $name: parked_denial '$status' -> $got, expected $want"
+  fi
+}
+
+deny yes "403 is a missing 'checks: read' or 'pull_requests: read', the whole reason for this" 403
+deny yes "401 is a rejected installation token, equally permanent" 401
+deny yes "404 on a sha the same token just listed is a permission answer" 404
+
+# Everything below is LATE, and counting it as denied would page a human for
+# something that fixes itself.
+deny no  "500 is GitHub having a bad day" 500
+deny no  "502 likewise" 502
+deny no  "503 likewise" 503
+deny no  "000 is curl never getting a response — a network fact, not a grant" 000
+deny no  "no-token is the secret read failing, reported by its own path" no-token
+deny no  "200 never reaches here, and must not be read as a denial anyway" 200
+deny no  "an empty status is unknown, and unknown is not a page" ""
+deny no  "no argument at all is silence, like every other rule in this file"
+deny no  "a status that merely CONTAINS 403 is not a 403" "x403"
+deny no  "nor one that is prefixed by it" "4030"
+
 if [ "$FAIL" -gt 0 ]; then
   echo "parked-decision: $FAIL failed, $PASS passed"
   exit 1

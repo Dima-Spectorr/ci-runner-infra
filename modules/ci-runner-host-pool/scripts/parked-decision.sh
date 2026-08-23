@@ -148,3 +148,42 @@ parked_verdict() {
   echo "parked:$reason base=$base queue_base=$queue_base checks=$total"
   return 0
 }
+
+# parked_denial <http_status> -> 0 = this sweep is DENIED, not merely late
+#
+# The second rule in this file, and the one that decides whether a failed sweep
+# is worth waking somebody for. The sweep's only privileged call is
+# `commits/<sha>/check-runs`, which needs the installation to hold
+# `checks: read` — the sole endpoint in the controller that does. An
+# installation granted the older permission set fails that call, and only that
+# call, on every sweep forever.
+#
+# Counting such a failure as "skipped" — which is what happened before — is the
+# exact failure this whole feature was built to end: the controller published
+# "the sweep is slightly behind" every five minutes and zero parked pull
+# requests, indefinitely, and zero is what a healthy repository publishes too.
+#
+# WHAT COUNTS AS DENIED, and why the list is short:
+#
+#   401  the installation token was rejected. Not transient — the App's key or
+#        installation id is wrong, and the next sweep gets the same answer.
+#   403  the endpoint exists and this installation may not read it. GitHub also
+#        answers 403 for a secondary rate limit, which IS transient; that is
+#        accepted noise, because a rate limit severe enough to spend a sweep is
+#        itself worth seeing and the alert on this counter is a sustained one,
+#        not a single sample.
+#   404  GitHub's deliberate answer for a resource a token may not see. On a
+#        `commits/<sha>/check-runs` path built from a sha the same token just
+#        listed, "not found" is a permission answer wearing another number.
+#
+# Everything else is late, not denied: 5xx is GitHub, `000` is curl never
+# getting a response, `no-token` is a secret read that failed and is already
+# reported by its own path, and 2xx never reaches here.
+#
+# Pure: one argument in, an exit status out, no state, no output.
+parked_denial() {
+  case "${1:-}" in
+    401 | 403 | 404) return 0 ;;
+    *) return 1 ;;
+  esac
+}

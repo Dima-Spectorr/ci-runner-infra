@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.41.0"
   # ...
 }
 ```
@@ -777,6 +777,8 @@ docs/image-vuln-ignores.txt      the dated exceptions to that
 scripts/ci/lane-decision.sh      pure CI-lane rule (unit-tested)
 scripts/ci/                      self-tests
 docs/onboarding-a-repository.md  how to put a NEW repo on the fleet
+docs/github-app-permissions.md   the App's permissions: who grants each, how,
+                                 and how each one fails without saying so
 scripts/ci/check-merge-queue-single-step.sh
                                  the merge-queue rule consumers copy in
 scripts/ci/check-runner-policy.sh
@@ -795,6 +797,8 @@ docs/ci-pr-shared-infra.md       one host per workflow run, one infra stack
 .github/workflows/shared-infra-anchor.yml
                                  the anchor itself, published once — consumers
                                  call it rather than copying its body
+.github/actions/shared-infra-db/ the shared stack's URL, or a throwaway when the
+                                 anchor degraded and published none
 docs/examples/pr-shared-infra.yml  the consumer side as one workflow — the file
                                  a consumer copies, gate-checked on every run here
 docs/adr-pr-host-affinity.md     the decision behind that contract

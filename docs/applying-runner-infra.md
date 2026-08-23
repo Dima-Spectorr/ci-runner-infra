@@ -56,7 +56,7 @@ ref-scoped `principalSet` is how it is bounded. Read the section below.
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.39.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.41.0"
 
   project_id     = var.project_id
   region         = "<region>"
@@ -262,7 +262,7 @@ repository's README anyway. Anything that *is* a secret stays where it is.
 
 ```hcl
 module "ci_runner_apply_identity" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.39.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.41.0"
 
   project_id             = var.project_id
   name                   = var.pool_name
@@ -340,7 +340,7 @@ provisioner has already run.
 
 ```hcl
 module "ci_host_image_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.39.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.41.0"
 
   project_id   = var.project_id
   region       = "<region>"
@@ -613,3 +613,33 @@ which is exactly the state worth catching.
 
 Its threshold is **three times** the watchdog's, deliberately. The watchdog
 restarts a unit; this deletes a machine. The cheaper remedy gets first refusal.
+
+### The responder is the only unprivileged process on the controller
+
+Before autohealing existed, the controller ran nothing but root's own loop and
+listened on no port. The responder is the first process on that machine that is
+both network-facing and not root, and it is on the one VM in the fleet that can
+mint a GitHub App installation token — so it is confined rather than merely
+demoted:
+
+- it runs as `nobody`, with an empty `CapabilityBoundingSet` and
+  `NoNewPrivileges`;
+- `TemporaryFileSystem=/var/lib:ro` plus a single `BindReadOnlyPaths` entry mean
+  it sees the heartbeat file and **nothing else** under `/var/lib` — not
+  `api.body`, which holds the last GitHub response and on a private repository
+  is repository data;
+- `RestrictAddressFamilies` leaves it IP only, and `SystemCallFilter` leaves it
+  `@system-service`.
+
+`MemoryDenyWriteExecute` is deliberately absent: it is the one setting on that
+list that breaks interpreters rather than constraining them, and a responder
+that will not start is a probe that never answers, which is a group deleting a
+healthy controller every few minutes. The same reasoning explains why the
+startup script `touch`es the heartbeat before writing the unit — a bind source
+that is missing at unit start is missing for the life of the process, and the
+process never exits, so `Restart=always` would never recover it.
+
+`controller-module.selftest.sh` asserts the three couplings this path holds by
+literal rather than by variable: the firewall tag matches the tag on both
+controller templates, the bind path matches `STATE_DIR`, and the `touch`
+precedes the unit.
