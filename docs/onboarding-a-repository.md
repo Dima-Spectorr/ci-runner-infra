@@ -38,6 +38,12 @@ posture you opt into knowingly. Read [Windows](#windows) before you declare one.
    permission does not fail an apply or a job; the controller logs the 403 once
    per sweep and `ci_prs_green_and_unqueued` stays at zero forever, which reads
    exactly like health. If you see that log line, that is what it means.
+
+   It needs **`Contents: read`** as well if you are standing up a merge-queue
+   pool (step 8): that is how the controller reads the repository's own
+   `.mergify.yml` to size the pool. This one fails the same quiet way — without
+   it the pool keeps the Terraform ceiling you typed and says nothing, and
+   `ci_queue_config_age_seconds` climbing is the only sign.
 2. **A GCP project, a VPC and a subnet** in the region the pool will run in.
    Hosts get no external IP: egress must already work from that subnet (in the
    MOT projects it is the peering to `mot-lz-vpc` through the central firewall —
@@ -477,6 +483,106 @@ Run the suite in the baked Playwright container rather than installing browsers
 on the pool — [`ui-testing-on-the-fleet.md`](ui-testing-on-the-fleet.md) is the
 consumer guide for that half — and tier it: `@smoke` on every pull request, the
 full suite on the merge queue.
+
+## 8. The four pools — the fleet standard
+
+Everything above stands up **one** pool, and one pool is the shape a repository
+starts in, not the shape it stays in. The fleet standard is **four pools behind
+one controller**: Linux CI, Windows CI, Linux merge-queue, Windows merge-queue.
+The decision is [`adr-four-pool-controller.md`](adr-four-pool-controller.md);
+the operational detail — the routing contract and the capacity formula — is in
+[`ci-lane-model.md`](ci-lane-model.md).
+
+**Why the merge queue gets its own pool.** Mergify validates a queued pull
+request by re-running the same `pull_request` workflows, against the same
+labels, at exactly the moment the CI pool is busiest with the *next* pull
+requests. Sharing one pool between the two means a pull request that has already
+gone green sits in the queue waiting for a runner — and it does not fail, it
+sits *pending*, which no red check anywhere reports.
+
+**Why the Windows pair is declared even at zero.** `max_hosts = 0` costs a table
+row and nothing else. What it buys is that the shape is identical in every
+repository, so turning Windows on later is a number change rather than a
+retrofit into a routing contract that has already shipped.
+
+### The Terraform delta
+
+Each pool keeps its own `ci-runner-host-pool` block with **its controller turned
+off**, and hands its descriptor to one `ci-runner-controller`:
+
+```hcl
+module "ci_runner_pool" {           # the Linux CI pool from step 1, unchanged
+  # …
+  manage_controller = false
+  role              = "ci"          # the default; written out for symmetry
+  runner_labels     = var.runner_labels
+}
+
+module "ci_runner_pool_mq" {        # the Linux merge-queue pool
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
+  # …every argument of the CI pool, with three differences:
+  name              = "${var.pool_name}-mq"
+  manage_controller = false
+  role              = "merge-queue"
+
+  # DISJOINT, never a superset. GitHub schedules a self-hosted runner by label
+  # superset, so a queue pool that also carries the CI label is dedicated in
+  # name only. The controller asserts this across its whole table at plan time.
+  runner_labels = ["self-hosted", "linux", "gcp", "${var.github_repo}-merge-queue"]
+
+  max_hosts = var.mq_max_hosts   # the hard stop, not the size — see below
+}
+
+module "ci_runner_controller" {
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.39.0"
+
+  name  = "${var.pool_name}-controller"
+  pools = [
+    module.ci_runner_pool.pool_descriptor,
+    module.ci_runner_pool_mq.pool_descriptor,
+    module.ci_runner_pool_win.pool_descriptor,      # max_hosts = 0
+    module.ci_runner_pool_win_mq.pool_descriptor,   # max_hosts = 0
+  ]
+  # …the same github app, network and controller service account the pool used
+}
+```
+
+Never write the controller's table by hand: `mig` is a *generated* name, and a
+wrong one gives you a controller that lists an empty instance group forever and
+reports a perfectly healthy, permanently empty pool. Pass `pool_descriptor`.
+
+### `mq_max_hosts` is a hard stop, not the size
+
+The merge-queue pool sizes itself. The controller reads `max_parallel_checks`
+out of the repository's own `.mergify.yml`, live, and derives the ceiling:
+
+```
+hosts = ceil( Σ max_parallel_checks × jobs per check ÷ slots per host )
+```
+
+`max_hosts` remains the MIG's maximum underneath that, so set it to something
+the derivation will not routinely hit — and then watch, rather than calculate:
+`ci_queue_capacity_wanted_hosts` above `ci_queue_capacity_hosts` is the
+controller telling you your Terraform ceiling has become the bottleneck. It is a
+comparison, so it needs no threshold of your own.
+
+### The order, which is not optional
+
+1. **Apply the Terraform** that creates the merge-queue pool.
+2. **Then** merge the workflow change that routes to it.
+
+The commit that introduces the route cannot be merged *through* the queue:
+Mergify's speculative draft of that very commit runs under the new routing and
+asks for a label no runner carries yet.
+
+### One extra App permission
+
+The controller now needs **`Contents: read`** on the GitHub App, to read
+`.mergify.yml`. Without it the read is a 403 and the merge-queue pool silently
+keeps its Terraform `max_hosts` instead of a derived ceiling — it fails open, so
+nothing breaks and nothing says so. The one signal is
+`ci_queue_config_age_seconds` climbing past 300; on a healthy controller it
+stays under it, and `-1` means the configuration has never been read at all.
 
 ## Windows
 
