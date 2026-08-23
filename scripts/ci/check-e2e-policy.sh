@@ -129,9 +129,9 @@ check_config() { # <config file> <job-timeout-minutes|"">
   txt=$(decomment "$f")
 
   # --- E2E1 -----------------------------------------------------------------
-  if ! printf '%s\n' "$txt" | grep -qE 'forbidOnly[[:space:]]*:'; then
+  if ! printf '%s\n' "$txt" | grep -cE 'forbidOnly[[:space:]]*:' >/dev/null; then
     report "E2E1" "$f" "no 'forbidOnly' — a committed test.only silently shrinks the suite to that one test and still reports green"
-  elif printf '%s\n' "$txt" | grep -qE 'forbidOnly[[:space:]]*:[[:space:]]*false'; then
+  elif printf '%s\n' "$txt" | grep -cE 'forbidOnly[[:space:]]*:[[:space:]]*false' >/dev/null; then
     report "E2E1" "$f" "'forbidOnly: false' — under CI this must be true (or !!process.env.CI)"
   fi
 
@@ -145,9 +145,9 @@ check_config() { # <config file> <job-timeout-minutes|"">
   # explicit and resolves to undefined, which IS the default — the core count —
   # behind a line that looks like it was thought about. So the value has to be a
   # literal: a count, or a percentage of the host ('50%').
-  if ! printf '%s\n' "$txt" | grep -qE '(^|[^A-Za-z])workers[[:space:]]*:'; then
+  if ! printf '%s\n' "$txt" | grep -cE '(^|[^A-Za-z])workers[[:space:]]*:' >/dev/null; then
     report "E2E2" "$f" "no explicit 'workers' — the default is the host's core count, which starves the other agent slots on a shared runner"
-  elif ! printf '%s\n' "$txt" | grep -qE "(^|[^A-Za-z])workers[[:space:]]*:[[:space:]]*([0-9]+|['\"][0-9]+%['\"])"; then
+  elif ! printf '%s\n' "$txt" | grep -cE "(^|[^A-Za-z])workers[[:space:]]*:[[:space:]]*([0-9]+|['\"][0-9]+%['\"])" >/dev/null; then
     report "E2E2" "$f" "'workers' is not a literal this gate can read — an unresolved value falls back to the host's core count, which is the unbounded case this check exists to prevent; write a number or a percentage ('50%')"
   fi
 
@@ -157,7 +157,7 @@ check_config() { # <config file> <job-timeout-minutes|"">
   t_test=$(numval "$(without_expect_block "$txt")" 'timeout')
   t_global=$(numval "$txt" 'globalTimeout')
 
-  if ! printf '%s\n' "$txt" | grep -qE 'globalTimeout[[:space:]]*:'; then
+  if ! printf '%s\n' "$txt" | grep -cE 'globalTimeout[[:space:]]*:' >/dev/null; then
     report "E2E3" "$f" "no 'globalTimeout' — a hung suite then burns the job's entire budget, and the merge queue DEQUEUES the pull request silently instead of failing it"
   elif [ -z "$t_global" ]; then
     report "E2E3" "$f" "'globalTimeout' is not a literal this gate can read — write it as a number or a product (15 * 60_000)"
@@ -180,28 +180,28 @@ check_config() { # <config file> <job-timeout-minutes|"">
   # --- E2E4 -----------------------------------------------------------------
   local k
   for k in trace video screenshot; do
-    if printf '%s\n' "$txt" | grep -qE "${k}[[:space:]]*:[[:space:]]*['\"]on['\"]"; then
+    if printf '%s\n' "$txt" | grep -cE "${k}[[:space:]]*:[[:space:]]*['\"]on['\"]" >/dev/null; then
       report "E2E4" "$f" "'${k}: on' captures every PASSING test — roughly doubles runtime and floods artifact storage; use on-first-retry / retain-on-failure / only-on-failure"
     fi
   done
-  if ! printf '%s\n' "$txt" | grep -qE 'trace[[:space:]]*:'; then
+  if ! printf '%s\n' "$txt" | grep -cE 'trace[[:space:]]*:' >/dev/null; then
     report "E2E4" "$f" "no 'trace' setting — a CI failure then has nothing to open, and every diagnosis costs a re-run"
   fi
 
   # --- E2E5 -----------------------------------------------------------------
-  if ! printf '%s\n' "$txt" | grep -qE 'reporter[[:space:]]*:'; then
+  if ! printf '%s\n' "$txt" | grep -cE 'reporter[[:space:]]*:' >/dev/null; then
     report "E2E5" "$f" "no 'reporter' — the default output is not machine-readable, so nothing downstream can read the result"
-  elif ! printf '%s\n' "$txt" | grep -qE "['\"](blob|json|junit|github)['\"]"; then
+  elif ! printf '%s\n' "$txt" | grep -cE "['\"](blob|json|junit|github)['\"]" >/dev/null; then
     report "E2E5" "$f" "reporter has no machine-readable entry (blob/json/junit/github) — an html-only report cannot be read by a gate or merged across shards"
   fi
 
   # --- E2E6 -----------------------------------------------------------------
   # A warm host is the point of this fleet, and it is exactly why a "reusable"
   # server is a server the PREVIOUS job left running.
-  if printf '%s\n' "$txt" | grep -qE 'webServer'; then
-    if ! printf '%s\n' "$txt" | grep -qE 'reuseExistingServer[[:space:]]*:'; then
+  if printf '%s\n' "$txt" | grep -cE 'webServer' >/dev/null; then
+    if ! printf '%s\n' "$txt" | grep -cE 'reuseExistingServer[[:space:]]*:' >/dev/null; then
       report "E2E6" "$f" "webServer without 'reuseExistingServer' — on a warm host CI can silently test a server left behind by a previous job"
-    elif printf '%s\n' "$txt" | grep -qE 'reuseExistingServer[[:space:]]*:[[:space:]]*true'; then
+    elif printf '%s\n' "$txt" | grep -cE 'reuseExistingServer[[:space:]]*:[[:space:]]*true' >/dev/null; then
       report "E2E6" "$f" "'reuseExistingServer: true' unconditionally — must be false under CI (!process.env.CI)"
     fi
   fi

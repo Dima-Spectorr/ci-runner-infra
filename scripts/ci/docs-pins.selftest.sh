@@ -39,7 +39,7 @@ want=$(tr -d '[:space:]' < "$VERSION_FILE")
 # shape and is not: in a glob `*` matches anything, and `.` is a literal with no
 # quantifier attached to the digit class, so `v4x.2y.0junk` and `v4.2.0.1` both
 # pass it. The pins are then asserted against a value that is not a tag.
-if printf '%s' "$want" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+if printf '%s' "$want" | grep -cE '^v[0-9]+\.[0-9]+\.[0-9]+$' >/dev/null; then
   ok "VERSION is a tag-shaped version ($want)"
 else
   bad "VERSION is not tag-shaped: '$want' (expected vMAJOR.MINOR.PATCH)"
