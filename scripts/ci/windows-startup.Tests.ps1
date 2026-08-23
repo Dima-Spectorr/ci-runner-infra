@@ -2068,3 +2068,120 @@ Describe 'snapshot refusal' {
         & $script:Refuse -AgeHours 999 -Bytes 8GB -FreeBytes 0 | Should -Be 'too-old'
     }
 }
+
+Describe 'metric label values' {
+    # The allowlist is telemetry.sh's, character for character, and that is the
+    # whole point of testing it here: a Linux pool and a Windows pool that
+    # sanitise a verdict differently land in two buckets on a chart grouped by
+    # `verdict`, and the fleet-wide view silently splits without either half
+    # looking broken.
+    It 'passes through what the allowlist allows' {
+        ConvertTo-MetricLabelValue -Value 'too-old' | Should -Be 'too-old'
+        ConvertTo-MetricLabelValue -Value 'a.b_c/d 1-2' | Should -Be 'a.b_c/d 1-2'
+    }
+
+    # A quote is the character that motivated the allowlist on the shell side.
+    # Here the serializer would escape it, so this is defence in depth -- but the
+    # two implementations still have to agree on the RESULT, not just on being
+    # safe.
+    It 'substitutes everything else, one underscore per character' {
+        ConvertTo-MetricLabelValue -Value 'a"b' | Should -Be 'a_b'
+        ConvertTo-MetricLabelValue -Value "a`nb" | Should -Be 'a_b'
+        ConvertTo-MetricLabelValue -Value 'a\b:c' | Should -Be 'a_b_c'
+    }
+
+    # Truncation, not rejection: the tail of a long name is where the per-run
+    # junk lives, and a label that reads slightly short beats a cardinality
+    # explosion.
+    It 'caps at 64 characters' {
+        $long = 'x' * 100
+        (ConvertTo-MetricLabelValue -Value $long).Length | Should -Be 64
+    }
+
+    # `unknown` and not '': an empty label value is a series that groups under
+    # nothing, which reads on a chart as the pool not reporting at all.
+    It 'answers unknown for an empty or null value' {
+        ConvertTo-MetricLabelValue -Value '' | Should -Be 'unknown'
+        ConvertTo-MetricLabelValue -Value $null | Should -Be 'unknown'
+    }
+}
+
+Describe 'metric region' {
+    It 'takes the region out of a full metadata zone path' {
+        ConvertTo-MetricRegion -Zone 'projects/123456789/zones/us-central1-a' |
+            Should -Be 'us-central1'
+    }
+
+    # Only the LAST dash-separated part is dropped: the region itself contains
+    # dashes, so a split-on-first would answer `us` and put every zone in the
+    # world in one location.
+    It 'keeps the dashes inside the region' {
+        ConvertTo-MetricRegion -Zone 'europe-west4-b' | Should -Be 'europe-west4'
+    }
+
+    # Empty, never a guess. The caller skips the whole flush on an empty region,
+    # which is the correct outcome: a zone spelled into `location` publishes and
+    # then does not join the Linux pools' series, and nothing anywhere says so.
+    It 'answers empty on anything without the shape' {
+        ConvertTo-MetricRegion -Zone 'nodashes' | Should -Be ''
+        ConvertTo-MetricRegion -Zone 'projects/1/zones/' | Should -Be ''
+        ConvertTo-MetricRegion -Zone '' | Should -Be ''
+        ConvertTo-MetricRegion -Zone $null | Should -Be ''
+    }
+}
+
+Describe 'metric point' {
+    BeforeAll {
+        $script:Point = {
+            param($Name = 'ci_cache_hydrate_seconds', $Value = 12, $ExtraLabels = $null)
+            ConvertTo-MetricPoint -Name $Name -Value $Value `
+                -MetricPrefix 'custom.googleapis.com/ci' -Project 'p' -Region 'r' `
+                -Repo 'o/r' -Pool 'pool-a' -ExtraLabels $ExtraLabels
+        }
+    }
+
+    # GAUGE DOUBLE for every series, and `generic_node` for every resource, is
+    # what lets ONE alert policy cover the fleet. A second metric kind cannot be
+    # expressed in the same policy, so drift here is not a formatting change --
+    # it is a series no existing alert can see.
+    It 'is a GAUGE double on a generic_node resource' {
+        $p = & $script:Point
+        $p.metricKind | Should -Be 'GAUGE'
+        $p.valueType | Should -Be 'DOUBLE'
+        $p.resource.type | Should -Be 'generic_node'
+    }
+
+    It 'carries the prefix, the repo and the pool exactly as host-startup.sh does' {
+        $p = & $script:Point
+        $p.metric.type | Should -Be 'custom.googleapis.com/ci/ci_cache_hydrate_seconds'
+        $p.metric.labels.repo | Should -Be 'o/r'
+        $p.metric.labels.pool | Should -Be 'pool-a'
+        $p.resource.labels.project_id | Should -Be 'p'
+        $p.resource.labels.location | Should -Be 'r'
+        $p.resource.labels.namespace | Should -Be 'pool-a'
+        $p.resource.labels.node_id | Should -Be 'o/r'
+    }
+
+    It 'writes the value as a double point with an RFC3339 end time' {
+        $p = & $script:Point -Value 7
+        $p.points[0].value.doubleValue | Should -Be 7
+        $p.points[0].interval.endTime | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+    }
+
+    # The extra label is the only one that carries text this script did not
+    # write, so it is the only one that has to go through the allowlist. A
+    # verdict reaching the JSON unsanitised is the failure mode the allowlist
+    # exists for.
+    It 'passes an extra label through the allowlist' {
+        $p = & $script:Point -ExtraLabels @{ verdict = 'too-old' }
+        $p.metric.labels.verdict | Should -Be 'too-old'
+        (& $script:Point -ExtraLabels @{ verdict = 'a"b' }).metric.labels.verdict |
+            Should -Be 'a_b'
+    }
+
+    It 'leaves repo and pool in place when an extra label is added' {
+        $p = & $script:Point -ExtraLabels @{ verdict = 'ok' }
+        $p.metric.labels.repo | Should -Be 'o/r'
+        $p.metric.labels.pool | Should -Be 'pool-a'
+    }
+}

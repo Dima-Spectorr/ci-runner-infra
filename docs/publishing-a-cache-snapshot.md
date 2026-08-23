@@ -641,13 +641,11 @@ how much of the budget it spent. Every failure inside that budget is one line an
 a cold first job — the layer fails open, so a broken publish costs cache hits and
 never a host that does not come up.
 
-**On a Windows pool the log is the only place to look.** That boot script has no
-metric client, so it publishes none of the series above: the verdict is one
-`phase 7: cache hydrate verdict: <verdict>` line on the startup script's stdout,
-which GCE captures to the host's serial port 1
-(`gcloud compute instances get-serial-port-output <host> --project <p> --zone <z>`).
-The consequence is worth stating plainly, because it is the failure this document
-otherwise tells you the dashboard will catch: a Windows pool whose publish
-silently stopped, or whose hosts refuse every snapshot, is invisible in
-monitoring and shows up only as jobs that got slower. Check a fresh host's log
-after the first publish, and again after any change to the workflow.
+**On a Windows pool the series are the same and the log lives elsewhere.** That
+boot script publishes every series above, under the same names and on the same
+`generic_node` resource, so the dashboard and the alert policy cover a Windows
+pool without a second copy of either. What differs is where the line lands: the
+verdict is one `phase 7: cache hydrate verdict: <verdict>` line on the startup
+script's stdout, which GCE captures to the host's serial port 1
+(`gcloud compute instances get-serial-port-output <host> --project <p> --zone <z>`)
+rather than to `/var/log/ci-runner-startup.log`.

@@ -247,13 +247,25 @@ $script:CacheSeedBudgetSeconds = 420
 #    Protect-CacheMaster runs, on content no reviewed build step stands in front
 #    of.
 #
-# What it does NOT have is the Linux side's telemetry. host-startup.sh publishes
-# a verdict, an age, a size and a count to Cloud Monitoring; this file has no
-# metric client at all, so the verdict is logged and nothing else. That is a real
-# gap -- a Windows pool that stops hydrating looks exactly like one that never
-# had a bucket -- and it is tracked rather than papered over.
+# 5. REPORTED. The four failure modes above are all silent by design -- the layer
+#    fails open, so a pool that stopped hydrating and a pool hydrating perfectly
+#    both look like "jobs are a bit slow". Publish-CacheTelemetry sends the same
+#    five series host-startup.sh does, under the same names, on the same
+#    `generic_node` resource, so one alert policy and one dashboard cover both
+#    kinds of pool. See the telemetry section below Write-BootLog.
 $script:CacheStage = 'C:\ci-cache.staging'
 $script:CacheDownload = 'C:\ci-cache.download'
+
+# What the hydrate measured, for the telemetry to publish after it returns.
+#
+# NOT return values. The hydrate has a dozen early returns and each one would
+# have to carry them, which is the rule the verdict itself already proved will be
+# missed at the next return added. $null rather than 0 is the whole point: a zero
+# age on a pool with no bucket configured would sit in the same series as a zero
+# age on a pool whose snapshot is fresh, and no alert can tell those apart.
+$script:CacheSnapAgeHours = $null
+$script:CacheSnapBytes = $null
+$script:CacheDirsHydrated = $null
 
 # Defaults for a host booting from a template cut before these metadata keys
 # existed. The live values come from Terraform, which validates them.
@@ -469,6 +481,115 @@ function Test-ImageVersion {
     $trimmed = $Marker.Trim()
     if ($trimmed -notmatch '^[0-9]+$') { return $false }
     return ([int] $trimmed) -ge $Floor
+}
+
+function ConvertTo-MetricLabelValue {
+    <#
+      .SYNOPSIS
+        A string safe to paste into the metric's JSON label fragment. Pure.
+      .DESCRIPTION
+        telemetry.sh's ts_label_value(), same allowlist, same cap, same fallback,
+        because the two must produce the same label for the same verdict -- a
+        Linux pool and a Windows pool grouped by `verdict` have to land in the
+        same bucket or the fleet-wide chart silently splits in two.
+
+        Allowlist rather than escape, for the reason telemetry.sh gives: escaping
+        has to be right about quotes, backslashes, newlines and truncated UTF-8;
+        an allowlist has to be right about one thing. A label slightly wrong beats
+        a request the API rejects whole, which would drop every series in the
+        flush -- including the verdict that says why.
+
+        64 characters because a label value is also a cardinality decision.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Value)
+
+    $safe = [regex]::Replace([string] $Value, '[^A-Za-z0-9._/ -]', '_')
+    if ($safe.Length -gt 64) { $safe = $safe.Substring(0, 64) }
+    if ([string]::IsNullOrEmpty($safe)) { return 'unknown' }
+    return $safe
+}
+
+function ConvertTo-MetricRegion {
+    <#
+      .SYNOPSIS
+        The region out of a metadata zone path. Pure. Empty when undecidable.
+      .DESCRIPTION
+        `instance/zone` answers `projects/<number>/zones/<region>-<letter>`, and
+        the `generic_node` resource wants `<region>` in its `location` label --
+        the same derivation host-startup.sh does with two parameter expansions.
+
+        Empty rather than a guess on anything that does not have the shape: an
+        undecidable location is a resource label the API rejects, and the caller
+        skips the whole flush on an empty one. A zone spelled into `location`
+        would publish, and would silently not join the Linux pools' series.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Zone)
+
+    $leaf = ([string] $Zone).Split('/')[-1]
+    # `<region>-<letter>`: at least two dash-separated parts, and the region
+    # itself contains dashes (`us-central1`), so only the LAST one is dropped.
+    if ($leaf -notmatch '^[a-z0-9]+(-[a-z0-9]+)+$') { return '' }
+    return $leaf.Substring(0, $leaf.LastIndexOf('-'))
+}
+
+function ConvertTo-MetricPoint {
+    <#
+      .SYNOPSIS
+        One timeSeries element, as a hashtable. Pure.
+      .DESCRIPTION
+        The same document telemetry.sh's _ts_point() writes: a GAUGE DOUBLE on a
+        `generic_node` resource labelled with repo and pool. Uniform metric kind
+        across the fleet on purpose -- a mixed kind makes a single alert policy
+        impossible to express.
+
+        A hashtable rather than a string, and ConvertTo-Json at the flush: the
+        shell side builds JSON by concatenation because it has nothing else, and
+        pays for it with ts_label_value. Here the serializer escapes, so the
+        allowlist above is defence in depth rather than the only defence.
+
+        Returned wrapped in a single-element array by the caller's `,` operator
+        where needed; PowerShell unrolls a returned hashtable safely, so this
+        returns it plainly.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Name,
+        [Parameter(Mandatory = $true)][double] $Value,
+        [Parameter(Mandatory = $true)][string] $MetricPrefix,
+        [Parameter(Mandatory = $true)][string] $Project,
+        [Parameter(Mandatory = $true)][string] $Region,
+        [Parameter(Mandatory = $true)][string] $Repo,
+        [Parameter(Mandatory = $true)][string] $Pool,
+        [hashtable] $ExtraLabels
+    )
+
+    $labels = @{ repo = $Repo; pool = $Pool }
+    if ($ExtraLabels) {
+        foreach ($k in $ExtraLabels.Keys) { $labels[$k] = ConvertTo-MetricLabelValue -Value $ExtraLabels[$k] }
+    }
+
+    return @{
+        metric     = @{ type = "$MetricPrefix/$Name"; labels = $labels }
+        resource   = @{
+            type   = 'generic_node'
+            labels = @{
+                project_id = $Project
+                location   = $Region
+                namespace  = $Pool
+                node_id    = $Repo
+            }
+        }
+        metricKind = 'GAUGE'
+        valueType  = 'DOUBLE'
+        points     = @(
+            @{
+                interval = @{ endTime = ([datetime]::UtcNow).ToString('yyyy-MM-ddTHH:mm:ssZ') }
+                value    = @{ doubleValue = $Value }
+            }
+        )
+    }
 }
 
 function Get-SlotUserName {
@@ -2277,6 +2398,16 @@ function Invoke-Phase0Preflight {
         # name -- and it is read here with everything else static rather than
         # from inside the phase, for the reason Get-MetadataValue gives.
         AppKeySecret   = Get-MetadataValue 'instance/attributes/ci-app-key-secret'
+        # Phase 7's telemetry, read here with everything else static. Absent on a
+        # host booted from a template cut before the key existed, which the
+        # publisher treats as "this pool does not publish" rather than as an
+        # error -- the same fallback every cache key gets.
+        MetricPrefix   = Get-MetadataValue 'instance/attributes/ci-metric-prefix'
+        # The project and the zone are read from the machine rather than passed
+        # in metadata that already knows them: a second copy of the project id is
+        # a second thing that can disagree with the host it is running on.
+        ProjectId      = Get-MetadataValue 'project/project-id'
+        Zone           = Get-MetadataValue 'instance/zone'
     }
 
     if ([string]::IsNullOrWhiteSpace($cfg.Owner) -or [string]::IsNullOrWhiteSpace($cfg.Repo)) {
@@ -2309,6 +2440,11 @@ function Invoke-Phase0Preflight {
     # the instance name at creation.
     $cfg.HostLabel = "host-$($cfg.InstanceName)"
     $cfg.Labels = "$($cfg.Labels),$($cfg.HostLabel)"
+
+    # Here rather than in phase 7, because these are the attributes phase 0 has
+    # just read and phase 7 must not read again. No network: it only records who
+    # this host is for the hydrate's flush.
+    Initialize-CacheTelemetry -Config $cfg
 
     # The OS marker is asserted, not assumed. Terraform decides which metadata
     # key carries which boot script; a mis-wired pool would otherwise deliver
@@ -3849,6 +3985,15 @@ function Invoke-CacheHydrateBounded {
         # snapshot inside a 168-hour bound was refused for being at it. The Linux
         # half computes this with integer division and means the same thing.
         $age = [int] [math]::Floor($started.Subtract($created).TotalHours)
+
+        # RECORDED BEFORE THE BOUNDS THAT MAY REJECT IT, exactly as on Linux. A
+        # `too-old` verdict is only actionable next to the age that produced it:
+        # published only on the paths that accepted the snapshot, the age series
+        # would be empty for every pool whose snapshot expired -- which is the one
+        # case an operator opens the chart for.
+        $script:CacheSnapAgeHours = $age
+        $script:CacheSnapBytes = $size
+
         $refusal = Get-CacheSnapshotRefusal -AgeHours $age -Bytes $size `
             -MaxAgeHours $bounds.MaxAgeHours -MaxBytes $bounds.MaxBytes `
             -FreeBytes (Get-CacheVolumeFreeByte -Path $Master)
@@ -3925,6 +4070,7 @@ function Invoke-CacheHydrateBounded {
             return 'scan-timeout'
         }
         $moved = Update-CacheMasterFromStage -Stage $script:CacheStage -Master $Master
+        $script:CacheDirsHydrated = $moved
         $took = [int] ([datetime]::UtcNow).Subtract($started).TotalSeconds
         Write-BootLog ("phase 7: cache hydrated from $snapshot -- $moved tool cache(s), $size bytes, " +
             "${age}h old, ${took}s of a $($bounds.BudgetSeconds)s budget")
@@ -3937,6 +4083,180 @@ function Invoke-CacheHydrateBounded {
         Remove-CacheTreeSafely -Path $script:CacheDownload
         Remove-CacheTreeSafely -Path $script:CacheStage
     }
+}
+
+# --- the telemetry the hydrate is judged by ----------------------------------
+#
+# ONE publisher, mirroring modules/ci-runner-host-pool/scripts/telemetry.sh --
+# the shape to mirror, not to reuse: the shell file is concatenated ahead of the
+# two bash startup scripts and cannot be dot-sourced here.
+#
+# The five series, their names, their resource type and their labels are the
+# Linux ones exactly. That is the whole point: `ci_cache_hydrate_verdict` grouped
+# by `verdict` has to answer for every pool in the fleet, and the alert policy
+# ensure-alert-policies.sh installs is written once against one filter.
+#
+# The host account already holds roles/monitoring.metricWriter -- the same grant
+# that lets the Linux host in this same module publish -- so this costs no new
+# permission on a machine that runs pull-request code. It is the SAME instance
+# template: modules/ci-runner-host-pool/main.tf gives every host `ci-metric-
+# prefix`, and the service account is bound in one place for both host kinds.
+#
+# It never fails a boot. A host that cannot publish still registers: the metric
+# exists to explain a slow pool, and refusing to serve jobs because the
+# explanation did not send would be the monitoring deciding the availability.
+
+$script:MetricBuffer = @()
+
+function Initialize-CacheTelemetry {
+    <#
+      .SYNOPSIS
+        Record who this host is, for the publisher. No network.
+      .DESCRIPTION
+        Phase 0 reads every static attribute exactly once, and these are static
+        attributes. Reading them from inside phase 7 instead would put a metadata
+        call on the hydrate's own budget and give this file a second read site.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary] $Config)
+
+    $script:MetricPrefix = [string] $Config.MetricPrefix
+    $script:MetricProject = [string] $Config.ProjectId
+    $script:MetricRegion = ConvertTo-MetricRegion -Zone ([string] $Config.Zone)
+    $script:MetricPool = [string] $Config.Pool
+    # Empty when either half is, rather than the "/" that concatenating two empty
+    # reads would produce: the flush skips on an empty repo, and "/" is not empty
+    # -- it is a resource label that publishes and cannot be grouped by.
+    $script:MetricRepo = ''
+    if (-not [string]::IsNullOrWhiteSpace($Config.Owner) -and
+        -not [string]::IsNullOrWhiteSpace($Config.Repo)) {
+        $script:MetricRepo = "$($Config.Owner)/$($Config.Repo)"
+    }
+}
+
+function Add-MetricSeries {
+    <#
+      .SYNOPSIS
+        Buffer one point. Cloud Monitoring rejects two points for one series.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Name,
+        [Parameter(Mandatory = $true)][double] $Value,
+        [hashtable] $ExtraLabels
+    )
+    $script:MetricBuffer += , (ConvertTo-MetricPoint -Name $Name -Value $Value `
+            -MetricPrefix $script:MetricPrefix -Project $script:MetricProject `
+            -Region $script:MetricRegion -Repo $script:MetricRepo -Pool $script:MetricPool `
+            -ExtraLabels $ExtraLabels)
+}
+
+function Send-MetricSeries {
+    <#
+      .SYNOPSIS
+        One API call for everything buffered. $true when it landed.
+      .DESCRIPTION
+        The token is read through Get-CacheMetadataResult, which hands its failure
+        back instead of taking the host down with it -- Get-MetadataValue would
+        Deny-Boot, and a boot lost to an unpublished metric is the monitoring
+        deciding the availability.
+
+        The token never reaches a command line. host-startup.sh has to work to
+        achieve that -- it pipes a curl config over a file descriptor, because
+        `-H "Authorization: Bearer $token"` would put the instance's token in a
+        world-readable /proc/<pid>/cmdline while job code runs on the same host.
+        Here the header is a hashtable passed in-process to Invoke-RestMethod and
+        nothing is exec'd, so there is no argv to leak into. Worth stating,
+        because the obvious "port" of that code would be to shell out to curl.
+
+        Bounded by $script:HttpTimeoutSeconds, like every call this host makes:
+        this flush sits on the boot path, in front of the agent registering.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($script:MetricBuffer.Count -eq 0) { return $true }
+    $body = @{ timeSeries = $script:MetricBuffer } | ConvertTo-Json -Depth 12 -Compress
+    $script:MetricBuffer = @()
+
+    $tokenResult = Get-CacheMetadataResult -Path 'instance/service-accounts/default/token'
+    $token = ''
+    if ($tokenResult.Object -and $tokenResult.Object.access_token) {
+        $token = [string] $tokenResult.Object.access_token
+    }
+    if (-not $token) {
+        Write-BootLog 'phase 7: no instance token -- cache telemetry not published'
+        return $false
+    }
+
+    try {
+        $null = Invoke-RestMethod -Method Post `
+            -Uri "https://monitoring.googleapis.com/v3/projects/$script:MetricProject/timeSeries" `
+            -Headers @{ Authorization = "Bearer $token" } `
+            -ContentType 'application/json' `
+            -Body $body `
+            -TimeoutSec $script:HttpTimeoutSeconds
+        return $true
+    } catch {
+        # Loud, for the reason telemetry.sh gives: a silent telemetry failure is
+        # worse than no telemetry, because the chart that would have shown the
+        # gap is the chart that stops moving.
+        Write-BootLog "phase 7: cache telemetry did not publish: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Publish-CacheTelemetry {
+    <#
+      .SYNOPSIS
+        The five hydrate series, once per boot.
+      .DESCRIPTION
+        Called from Invoke-CacheHydrate rather than from the returns that decided
+        the verdict, for the same reason the verdict itself is logged there: a
+        rule that has to be repeated at every return is a rule that will be missed
+        at the next one.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $Verdict,
+        [Parameter(Mandatory = $true)][int] $Seconds
+    )
+
+    # All four, not just the two the URL needs: project and region are resource
+    # labels and so are pool and repo, and an empty one produces a request the API
+    # rejects whole -- one missing metadata read would drop every series in this
+    # flush and log a 400 nobody reads, rather than skipping cleanly.
+    if ([string]::IsNullOrWhiteSpace($script:MetricPrefix) -or
+        [string]::IsNullOrWhiteSpace($script:MetricProject) -or
+        [string]::IsNullOrWhiteSpace($script:MetricRegion) -or
+        [string]::IsNullOrWhiteSpace($script:MetricPool) -or
+        [string]::IsNullOrWhiteSpace($script:MetricRepo)) {
+        return $false
+    }
+
+    # An empty verdict means the hydrate returned through a path that states
+    # none, which is a bug in this file rather than a state of the cache. Named
+    # rather than dropped, because a verdict that silently stops being published
+    # looks exactly like a pool that stopped hydrating.
+    $stated = $Verdict
+    if ([string]::IsNullOrWhiteSpace($stated)) { $stated = 'unset' }
+    Add-MetricSeries -Name 'ci_cache_hydrate_verdict' -Value 1 -ExtraLabels @{ verdict = $stated }
+    Add-MetricSeries -Name 'ci_cache_hydrate_seconds' -Value $Seconds
+
+    # Age, size and count only when a snapshot was actually read -- a zero on a
+    # pool with no bucket configured would sit in the same series as a zero on a
+    # pool whose snapshot is fresh, and an alert cannot tell those apart.
+    if ($null -ne $script:CacheSnapAgeHours) {
+        Add-MetricSeries -Name 'ci_cache_snapshot_age_hours' -Value $script:CacheSnapAgeHours
+    }
+    if ($null -ne $script:CacheSnapBytes) {
+        Add-MetricSeries -Name 'ci_cache_snapshot_bytes' -Value $script:CacheSnapBytes
+    }
+    if ($null -ne $script:CacheDirsHydrated) {
+        Add-MetricSeries -Name 'ci_cache_dirs_hydrated' -Value $script:CacheDirsHydrated
+    }
+
+    return (Send-MetricSeries)
 }
 
 function Invoke-CacheHydrate {
@@ -3962,12 +4282,22 @@ function Invoke-CacheHydrate {
     [CmdletBinding()]
     param([string] $Master = $script:CacheMaster)
     $verdict = 'error'
+    # Started here and not inside the bounded half, so the seconds series covers
+    # the same span the Linux one does -- including the throw path, which is the
+    # one whose duration nobody can otherwise account for.
+    $started = [datetime]::UtcNow
     try {
         $verdict = Invoke-CacheHydrateBounded -Master $Master
     } catch {
         Write-BootLog "phase 7: the cache hydrate failed: $($_.Exception.Message)"
     }
     Write-BootLog "phase 7: cache hydrate verdict: $verdict"
+    # After the log line, never instead of it: the log is what an operator reads
+    # on a host they are already looking at, and it must not depend on a metric
+    # write. Telemetry never throws -- Publish-CacheTelemetry returns $false --
+    # but the ordering is the guarantee, not the current implementation.
+    $null = Publish-CacheTelemetry -Verdict $verdict `
+        -Seconds ([int] ([datetime]::UtcNow).Subtract($started).TotalSeconds)
     return $verdict
 }
 

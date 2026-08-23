@@ -305,10 +305,15 @@ that image a real answer is separate work, not a line in this one.
   anything is moved onto it, since the recursive scan that covers the rest of
   the tree runs afterwards, inside the seal.
 
-  **What the Windows side does not yet have is the telemetry.** The boot script
-  has no metric client at all, so the hydrate verdict is written to the boot log
-  and nowhere else: a Windows pool that has silently stopped hydrating looks
-  exactly like one that was never given a bucket. Tracked, not papered over.
+  **And the Windows side reports it.** The boot script publishes the same five
+  series a Linux host does, under the same names, on the same `generic_node`
+  resource labelled `repo` and `pool`, so one alert policy and one dashboard
+  cover both kinds of pool. Age and size are recorded *before* the bounds that
+  may reject the snapshot, so a `too-old` verdict arrives with the number that
+  produced it. The publish never denies a boot: it reads the instance token
+  through the failing-open metadata helper, is bounded by the same HTTP timeout
+  as everything else in phase 7, and skips cleanly rather than sending a request
+  the API would reject whole.
 
   **The parent directories are SYSTEM's, not the slot's**, for the reason the
   Linux side states about `/var/lib/ci-cache/<idx>`: root never creates,
@@ -673,10 +678,11 @@ because both are absent (not zero) when nothing finished.
 `ci_cache_hydrate_seconds`, `ci_cache_snapshot_age_hours`,
 `ci_cache_snapshot_bytes`, `ci_cache_dirs_hydrated`. These are the one group the
 **host** publishes rather than the controller, and once per boot rather than
-once per tick — and, today, only a **Linux** host: the Windows boot script
-hydrates on the same terms but has no metric client, so its verdict reaches the
-boot log and no series. Read these as covering the Linux pools only, and do not
-alert on their absence for a Windows one.
+once per tick — from a **Linux and a Windows** host alike, under the same names
+and on the same resource, so one policy covers both. The two publishers are
+different code (the Windows boot script cannot dot-source `telemetry.sh`) and
+`scripts/ci/metric-contract.selftest.sh` fails if either stops sending a series
+the other still does.
 The reason they are host-published: the hydrate finishes before the runner agent registers, so the
 controller never sees the machine it would be reporting on. Both accounts
 already hold `roles/monitoring.metricWriter`, so this costs no new grant on a
