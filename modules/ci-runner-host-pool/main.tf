@@ -156,6 +156,11 @@ locals {
     # whether a machine is deleted would then differ from the branch that was
     # tested.
     file("${path.module}/scripts/beacon-decision.sh"),
+    # The pin-hold veto's rule. Concatenated on EVERY pool for the same reason
+    # the beacon's is: the branch that decides whether a machine is deleted must
+    # be the branch that was tested, and a pool that ships it conditionally is a
+    # per-deployment variant of the controller.
+    file("${path.module}/scripts/pin-hold-decision.sh"),
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/watchdog-decision.sh"),
     # Ahead of the controller itself, and not merely by convention: the
