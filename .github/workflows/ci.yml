@@ -574,6 +574,16 @@ jobs:
       - name: runner policy
         run: bash scripts/ci/check-runner-policy.sh --forks=allowed
 
+      # …and the worked example seven repositories are about to copy. The
+      # rules above cannot be turned on over THIS repository's workflows yet
+      # (see the comment on the step before), so the example is where they are
+      # exercised against a real file rather than an inline fixture. Clean is
+      # only half of it: the check also mutates the example three ways and
+      # asserts each is reported, because an example that trips nothing can
+      # drift arbitrarily far from the contract while still reading green.
+      - name: shared-infra worked example
+        run: bash scripts/ci/check-shared-infra-example.sh
+
       # Whether a version is still supported. The rule is asserted here rather
       # than discovered on a fleet, because its wrong direction is a REPORT that
       # says nothing: `eol: false` in the upstream feed means "no end-of-life

@@ -785,6 +785,8 @@ docs/egress-baselines/           that baseline, one file per project
 docs/ci-workflow-gates.md        those gates: rules, flags, how to adopt
 docs/ci-lane-model.md            the lane contract consumers adopt
 docs/ci-pr-shared-infra.md       one host per workflow run, one infra stack
+docs/examples/pr-shared-infra.yml  that contract as one workflow — the file a
+                                 consumer copies, gate-checked on every run here
 docs/adr-pr-host-affinity.md     the decision behind that contract
 docs/ci-merge-queue-baseline.md  one CI run per PR: the queue config + gate
 docs/ci-optimization-catalog.md  the fleet audit behind that contract
