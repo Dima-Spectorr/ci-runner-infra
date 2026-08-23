@@ -110,5 +110,65 @@ else
   printf 'FAIL %s\n' "the caller's IFS was clobbered"; fail=1
 fi
 
+# --- the caller, which is not a pure function and so is read rather than run ---
+#
+# Every case above is about the DECISION. These are about the loop around it,
+# and each one is a bug that shipped: none can be reached by calling
+# pinned_job_decision, and all of them cost either a live controller or a metric.
+
+CONTROLLER="$(dirname "$0")/../../modules/ci-runner-host-pool/scripts/controller-startup.sh"
+
+src_has() {
+  if grep -qF -- "$2" "$CONTROLLER"; then
+    printf 'ok   %s\n' "$1"
+  else
+    printf 'FAIL %s\n' "$1"; fail=1
+  fi
+}
+
+# THE ORDER IS LOAD-BEARING, not stylistic. classify_pinned reads MIG_BASE, the
+# controller runs under `set -u`, and collect_mig is the only thing that assigns
+# it -- so `classify_pinned` first is not a misjudged pin, it is a dead process
+# that systemd restarts straight back into the same tick.
+_mig_at=$(grep -n '^  collect_mig$' "$CONTROLLER" | tail -1 | cut -d: -f1)
+_cls_at=$(grep -n '^  classify_pinned$' "$CONTROLLER" | tail -1 | cut -d: -f1)
+if [ -n "$_mig_at" ] && [ -n "$_cls_at" ] && [ "$_mig_at" -lt "$_cls_at" ]; then
+  printf 'ok   %s\n' "the MIG is described before anything classifies a pin"
+else
+  printf 'FAIL %s\n' "classify_pinned runs before collect_mig (mig=$_mig_at cls=$_cls_at) -- under set -u the first pinned job kills the controller"; fail=1
+fi
+
+src_has "MIG_BASE has a value before any function runs" 'MIG_BASE=""'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "a run already cancelled this tick is not cancelled again" 'case "$gone" in *" $run "*) continue ;; esac'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "a run already tried this tick is not posted to again" 'case "$tried" in'
+# Every path out of the orphan branch that leaves the run in the queue has to
+# count it: no token, already tried this tick, and a refused cancel -- plus the
+# blind tick and the ordinary pinned/wait case. Five increments, and a missing
+# one is a wedged run that ci_demand_pinned reports as zero.
+# shellcheck disable=SC2016  # the controller source is the literal under test
+_inc=$(grep -cF 'DEMAND_PINNED=$((DEMAND_PINNED + 1))' "$CONTROLLER")
+if [ "$_inc" -ge 5 ]; then
+  printf 'ok   %s
+' "every path that leaves a pinned run queued counts it ($_inc)"
+else
+  printf 'FAIL %s
+' "only $_inc paths count pinned demand -- a refused or un-retried cancel reports zero"; fail=1
+fi
+# BOTH SIDES SUBTRACT A LABEL SET before calling a job pinned, and neither reads
+# a bare `host-` prefix as one. They subtract different sets on purpose: demand
+# is computed per pool and asks about THIS pool's labels, while the pin sweep
+# runs once for every pool in the table and so asks about their union. A pool
+# that carries `host-large` therefore keeps its jobs on ci_demand, and the sweep
+# does not report them as pins on nobody's behalf.
+# shellcheck disable=SC2016  # a jq fragment: `$mine_labels` is jq's variable, not the shell's
+src_has "the demand filter subtracts this pool's own labels" '- $mine_labels | length) == 0 )'
+# shellcheck disable=SC2016  # a jq fragment: `$known_labels` is jq's variable, not the shell's
+src_has "the pin filter subtracts every label the pool table knows" '- $known_labels | length) > 0 )'
+# shellcheck disable=SC2016  # a jq fragment: `$pools` is jq's variable, not the shell's
+src_has "and that set is the union over the pool table" '([ $pools | to_entries[] | .value[] ] | unique) as $known_labels'
+src_has "a pinned record falls back to started_at when created_at is absent" '(.created_at // .started_at // "")'
+
 [ "$fail" = 0 ] && printf '\npinned-job-decision: all cases pass\n'
 exit "$fail"
