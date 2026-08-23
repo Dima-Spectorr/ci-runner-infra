@@ -55,6 +55,18 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# AND THEN SUDO GETS OUT OF THE WAY. sudo sets SUDO_UID itself, and that is not
+# an incidental variable to slot-reset.sh: it is the signal "a slot invoked me,
+# so read the index out of the account database and ignore anything the caller
+# named". It is the whole reason the sudoers rule can be safe. Here it is a lie
+# — the invoking account is the CI runner, not a slot — so every reset below is
+# refused with "uid N is not a slot user", and the suite would then be testing
+# the refusal path twenty times over while reporting the reset as broken.
+#
+# Both callers this file models are root with no sudo in the picture: systemd's
+# ExecStartPre on the agent unit, and the sweep's own timer. Neither has these.
+unset SUDO_UID SUDO_GID SUDO_USER SUDO_COMMAND
+
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  PASS %s\n' "$1"; }
@@ -122,6 +134,12 @@ expand_into() { # <destination> <body>
   # -u` is the point as much as the expansion is: an unbound name aborts here
   # rather than writing a truncated script, which is how #268 reached a fleet.
   #
+  # The newline after the closing EOF is load-bearing. A here-document
+  # terminator that is the last line of the string with nothing after it is not
+  # a line, and bash accepts it with `warning: here-document ... delimited by
+  # end-of-file` on stderr — which this function collects, so the harness would
+  # report its own construction as something the expansion executed.
+  #
   # Anything the expansion prints to stderr is collected rather than discarded.
   # An unquoted here-document expands its COMMENTS too, so a stray backtick pair
   # in a sentence runs whatever it encloses at boot; the command usually
@@ -130,7 +148,8 @@ expand_into() { # <destination> <body>
     set -u
     eval "cat >\"\$1\" <<EOF
 $2
-EOF" _ "$1"
+EOF
+" _ "$1"
   ) 2>>"$NOISE"
 }
 
