@@ -84,6 +84,14 @@ failed=0
 # "argument list too long" that aborts the publish after an arbitrary prefix of
 # it. -maxdepth 1 because only the top level holds artifacts; turbo keeps its
 # own bookkeeping in subdirectories.
+#
+# STREAMED through process substitution, not a here-document. A here-doc fed by
+# `$(find ...)` collects every path into one shell string first, which is the
+# same "hold the whole list in memory at once" the glob was rejected for, only
+# without the hard limit that would announce it. Process substitution also keeps
+# the loop in THIS shell — a pipe would run it in a subshell and every counter
+# below would be discarded at the end, reporting `published=0` on a run that
+# published everything.
 while IFS= read -r artifact; do
   [ -n "$artifact" ] || continue
   base=$(basename "$artifact")
@@ -135,9 +143,7 @@ while IFS= read -r artifact; do
     log "could not publish $hash"
     failed=$((failed + 1))
   fi
-done <<EOF
-$(find "$WARM_TURBO_DIR" -maxdepth 1 -type f -name '*.tar.zst' 2>/dev/null)
-EOF
+done < <(find "$WARM_TURBO_DIR" -maxdepth 1 -type f -name '*.tar.zst' 2>/dev/null)
 
 log "published=$published already-present=$skipped refused=$refused failed=$failed"
 

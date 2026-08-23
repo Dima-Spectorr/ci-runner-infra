@@ -75,13 +75,25 @@ fi
 # 2. TWO PHASES. The archive is packed in one step and uploaded in another, and
 #    the uploading step is not the one that ran the install.
 has_two_phases() { # <file>
-  local code
+  local code deps
   code=$(code_of "$1")
   matches "$code" 'CACHE_ARCHIVE_OUT=' || return 1
   matches "$code" 'CACHE_ARCHIVE_IN=' || return 1
   # The install phase must NOT be handed the bucket: a phase that can upload is
   # a phase that is publishing, whatever the step is called.
-  ! matches "$code" 'CACHE_ARCHIVE_OUT=[^\"]*\"[,]?[[:space:]]*$(:?)CACHE_BUCKET'
+  #
+  # SLICED, not matched with one regex. The first draft asked grep for a pattern
+  # spanning the `CACHE_ARCHIVE_OUT=` line and a `CACHE_BUCKET=` line below it,
+  # which grep cannot do — it reads a line at a time, so the assertion could
+  # never fail and the mutation beside it passed for the wrong reason. awk
+  # extracts the dependencies step and the question is asked of that text alone.
+  deps=$(printf '%s\n' "$code" | awk '
+    /id[[:space:]]*=[[:space:]]*"dependencies"/ { inside = 1 }
+    inside && /id[[:space:]]*=[[:space:]]*"build"/ { inside = 0 }
+    inside { print }
+  ')
+  [ -n "$deps" ] || return 1
+  ! matches "$deps" 'CACHE_BUCKET'
 }
 
 if has_two_phases "$MAIN"; then ok; else
@@ -201,6 +213,14 @@ mutate "the publisher copied into the module" "$MAIN" \
 
 mutate "install and upload in one phase" "$MAIN" \
   's@"CACHE_ARCHIVE_OUT=/workspace/ci-cache-snapshot.tar.gz",@@' \
+  has_two_phases
+
+# The mutation above removes the split; this one keeps it and hands the install
+# step the credential anyway, which is the shape a later "just publish it here,
+# it is one less step" edit actually takes. It is the only mutation that
+# exercises the slice, and the reason the check was rewritten to use one.
+mutate "the install step is handed the bucket" "$MAIN" \
+  's@"CACHE_ARCHIVE_OUT=/workspace/ci-cache-snapshot.tar.gz",@&\n        "CACHE_BUCKET=${var.cache_bucket}",@' \
   has_two_phases
 
 mutate "the pointer grant widened to a prefix" "$MAIN" \
