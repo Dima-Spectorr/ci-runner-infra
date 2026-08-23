@@ -1449,6 +1449,15 @@ Description=Expire this host's pin hold and return the held slot to service
 
 [Service]
 Type=oneshot
+# A oneshot with no deadline blocks its own timer forever: systemd will not
+# start the next activation while this one is still running, so a single sweep
+# wedged in `docker compose down` or `systemctl start` stops every later sweep
+# on this host -- and the held slot it was about to return never comes back.
+# Generous rather than tight, because the sweep tears a stack down and starts an
+# agent, and killing that halfway is only safe BECAUSE it is: the hold record
+# outlives a failed teardown, so the next sweep retries from where this one
+# stopped.
+TimeoutStartSec=300
 ExecStart=/opt/ci/job-hooks/pin-sweep.sh
 EOF
 
