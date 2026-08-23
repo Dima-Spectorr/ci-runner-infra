@@ -357,6 +357,14 @@ jobs:
       - name: host-startup self-test
         run: bash scripts/ci/host-startup.selftest.sh
 
+      # The band's two constants live in two files in two languages, because
+      # the network module is created once per project and deliberately does
+      # not depend on the pools. A firewall span narrower than the DNAT range
+      # fails as a hang, not as an error: the SYN is dropped and the client
+      # waits out the job's timeout. This is what notices.
+      - name: shared-infra-band self-test
+        run: bash scripts/ci/shared-infra-band.selftest.sh
+
       # The Windows startup script is guarded twice, because the two harnesses
       # answer different questions. Pester (in the Windows job) executes the
       # functions and checks what they RETURN. This one reads the file as text

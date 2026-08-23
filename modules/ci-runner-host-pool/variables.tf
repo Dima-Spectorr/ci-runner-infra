@@ -39,6 +39,19 @@ variable "name" {
     condition     = can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.name))
     error_message = "name must be 1-63 characters, lowercase letters, digits and hyphens, starting with a letter and not ending in a hyphen."
   }
+
+  validation {
+    # The pool name is applied to the hosts as a network tag, and
+    # `ci-shared-infra-` is the namespace the shared-infra firewall rules are
+    # keyed on. A pool named `ci-shared-infra-src-checkout` is therefore an
+    # authorized source for pair `checkout` -- and `ci-shared-infra-stack-...`
+    # an ingress target -- in a pull request that never asked for it and a
+    # repository it may not belong to. Nothing else in the module notices,
+    # because the tag is perfectly well-formed; the boundary is the tag string
+    # and only reserving the prefix keeps ordinary naming from spelling it.
+    condition     = !startswith(var.name, "ci-shared-infra-")
+    error_message = "name must not start with \"ci-shared-infra-\" — that prefix is reserved for the tags shared_infra_id mints, and a pool wearing one joins that pair's firewall rules as a source or a target."
+  }
 }
 
 variable "github_owner" {
@@ -604,7 +617,18 @@ variable "network_tags" {
     inbound path from the controller at all: no IAP-SSH rule, no tag, no
     listener. A reader of a Windows pool should not go hunting for a firewall
     rule that must not exist.
+
+    Reserved: no tag here may start with `ci-shared-infra-`. That namespace
+    belongs to `shared_infra_id`, and a tag passed in by hand is the other way
+    a pool can be enrolled in a pair it does not belong to.
   EOT
+
+  validation {
+    # Same boundary as var.name, reached through the other door. A caller
+    # naming the tag directly does not even need a plausible pool name.
+    condition     = alltrue([for t in var.network_tags : !startswith(t, "ci-shared-infra-")])
+    error_message = "network_tags must not contain a tag starting with \"ci-shared-infra-\" — that prefix is minted from shared_infra_id, and passing one by hand puts this pool inside another pair's firewall rules."
+  }
 }
 
 variable "recycle_max_unavailable" {
@@ -745,5 +769,60 @@ variable "cache_snapshot_max_bytes" {
     # boot disk.
     condition     = var.cache_snapshot_max_bytes >= 1048576 && var.cache_snapshot_max_bytes <= 34359738368
     error_message = "cache_snapshot_max_bytes must be between 1 MiB and 32 GiB; below that no real dependency cache fits, above it no boot disk does."
+  }
+}
+
+variable "shared_infra_id" {
+  description = <<-EOT
+    Identifier of the shared-infrastructure PAIR this pool belongs to — one
+    value per consuming repository, passed IDENTICALLY to that repository's
+    Linux and Windows pool instances.
+
+    It exists because the two pools are separate module instances with separate
+    `name` values, so anything derived from a pool's own name gives the paired
+    hosts DIFFERENT tags — and the ingress rule below would then reject exactly
+    the Windows-to-Linux traffic the shared-infrastructure contract is about
+    (docs/adr-pr-host-affinity.md §3.3). The pair has to be named by whoever
+    declares the pair, because only they know it is a pair.
+
+    Set, this pool's hosts carry:
+
+      ci-shared-infra-src-<id>    both pools — the ingress SOURCE and the
+                                  egress target (which selects the SENDING VM)
+      ci-shared-infra-stack-<id>  linux only — the ingress TARGET
+
+    Two tags rather than one, because with a single tag on both pools the
+    ingress rule's target_tags would name the Windows hosts too, permitting
+    inbound connections to them: the path docs/adr-windows-pool.md exists to
+    deny, reintroduced by the rule meant to preserve it. A Windows host carries
+    the first tag and not the second, so it may reach a Linux stack and nothing
+    may reach it.
+
+    Empty (the default) means this pool takes part in no shared-infrastructure
+    pair and carries neither tag. The matching rules live in
+    `ci-runner-network`; a tag with no rule does nothing.
+
+    SETTING THIS ON A POOL THAT IS ALREADY RUNNING DOES NOT TAG ITS HOSTS. The
+    tags live on the instance template, the MIG's update policy is
+    OPPORTUNISTIC, and OPPORTUNISTIC means "next time the instance is replaced
+    anyway" — so the apply goes green, the new template is correct, and every
+    host currently up keeps the old one. The rules then match nothing, and the
+    symptom is not an error: it is a connection that hangs until the job's
+    timeout, on a pair the operator has every reason to believe is configured.
+
+    So adopting a pair on a live pool is a two-step change: apply, then recycle.
+    Either scale the pool to zero and let it come back (cheapest on a pool that
+    scales to zero already, which these do), or let the controller's ordinary
+    age-based recycle roll the fleet over and accept that the pair does not work
+    until the last pre-change host is gone. There is no third option that leaves
+    a running host correct, because a network tag cannot be changed on a VM the
+    MIG owns without the MIG replacing it.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.shared_infra_id == "" || can(regex("^[a-z]([-a-z0-9]{0,39}[a-z0-9])?$", var.shared_infra_id))
+    error_message = "shared_infra_id must be a valid GCP network-tag component: lowercase letters, digits and dashes, starting with a letter, at most 41 characters. 41 and not 63 because it is concatenated into `ci-shared-infra-stack-<id>`, whose 22-character prefix has to fit inside the 63-character tag limit alongside it — 22 + 41 = 63 exactly, and the shorter `ci-shared-infra-src-` prefix has room to spare. An invalid or over-long one fails the apply at the API rather than at the plan."
   }
 }
