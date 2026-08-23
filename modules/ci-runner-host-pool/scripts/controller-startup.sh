@@ -265,6 +265,14 @@ REG_TOKEN_KEY="ci-registration-token"
 # into, and the keys inside it. Hard-coded for the same reason REG_TOKEN_KEY is:
 # it is a contract between this file and the beacon publisher in this module.
 BEACON_NS="ci"
+# The key inside that namespace the pin hold is published to, and the ceiling
+# the controller will honour on any single hold. Both are contracts with the
+# host helper rather than inputs: PIN_HOLD_KEY is the name `ci-pin-hold` writes,
+# and PIN_HOLD_MAX is the same 7200 that helper's own PIN_MAX_TTL clamps --ttl
+# to. A controller ceiling BELOW the host's clamp would silently cut holds
+# short; a configurable one would be one more way for the two to drift apart.
+PIN_HOLD_KEY="pin-hold"
+PIN_HOLD_MAX=7200
 POLL=${POLL:-20}
 # Seconds the demand sweep may spend walking per-run job lists. It must stay far
 # below the watchdog threshold (10 polls, min 300s): a tick that outruns the
@@ -497,12 +505,19 @@ collect_demand() {
       [ .jobs[]?
         | select(.status == "queued" or .status == "in_progress")
         | select( ((.labels // []) | length) > 0 )
-        | select( ((.labels // []) | map(select(startswith("host-"))) | length) == 0 )
       ] as $candidates
       | $pools | to_entries[]
       | .key as $pool
       | .value as $mine_labels
-      | [ $candidates[] | select( ((.labels // []) - $mine_labels) | length == 0 ) ] as $mine
+      # THE `host-` PREFIX IS RESERVED, NOT OWNED, so the pin test is per POOL and
+      # cannot live in the pool-independent candidate set above: a pool that
+      # legitimately carries `host-large` serves a job asking for it, and dropping
+      # that job as "pinned" here while the pinned classifier -- which subtracts
+      # the same labels -- reads it as unpinned leaves it counted on neither
+      # series, scaling nothing and invisible on both charts.
+      | [ $candidates[]
+          | select( (((.labels // []) | map(select(startswith("host-")))) - $mine_labels | length) == 0 )
+          | select( ((.labels // []) - $mine_labels) | length == 0 ) ] as $mine
       | [ $pool,
           ($mine | length),
           ([ $mine[] | select(.status == "queued") ] | length),
@@ -538,11 +553,23 @@ collect_demand() {
     # every $name in a function against every other function's locals, and
     # classify_pinned owns a local called `run`. A jq variable is invisible to
     # that check as anything other than a collision.
-    pinned_recs=$(printf '%s' "$jobs" | jq -r --arg rid "$id" '
-      .jobs[]?
+    # THE `host-` PREFIX IS RESERVED, NOT OWNED. A pool configured long before
+    # this ADR may legitimately carry a label like `host-large`, and a job naming
+    # it is an ordinary job for that pool -- not a pin at a named machine. So the
+    # test is "a host- label no configured pool carries", and it has to agree
+    # with the demand filter above: a job excluded from ci_demand as pinned and
+    # then read as unpinned here would vanish from both series and scale nothing.
+    #
+    # The UNION over the pool table, and not this pool's labels: one controller
+    # now serves every pool in one sweep, so there is no "this pool" here to ask
+    # -- POOL_LABELS_JSON is whichever pool was selected last, which before the
+    # first select is the empty list and would read every host- label as a pin.
+    pinned_recs=$(printf '%s' "$jobs" | jq -r --arg rid "$id" --argjson pools "$POOLS_LABELS_MAP" '
+      ([ $pools | to_entries[] | .value[] ] | unique) as $known_labels
+      | .jobs[]?
       | select(.status == "queued" or .status == "in_progress")
-      | select( ((.labels // []) | map(select(startswith("host-"))) | length) > 0 )
-      | [ $rid, .status, ((.labels // []) | join(",")), (.created_at // "") ]
+      | select( (((.labels // []) | map(select(startswith("host-")))) - $known_labels | length) > 0 )
+      | [ $rid, .status, ((.labels // []) | join(",")), (.created_at // .started_at // "") ]
       | @tsv' 2>/dev/null)
     if [ -n "$pinned_recs" ]; then
       PINNED_JOBS="${PINNED_JOBS}${pinned_recs}
@@ -870,6 +897,10 @@ collect_hosts() {
 # One describe per tick for both facts we need from the MIG: the target size we
 # publish, and the baseInstanceName that bounds the orphan reaper to instances
 # THIS pool can create. Kept together so the reaper never costs an extra call.
+MIG_BASE=""
+MIG_TARGET=0
+MIG_TEMPLATE=""
+
 collect_mig() {
   local line
   line=$(gcloud compute instance-groups managed describe "$MIG" \
@@ -946,6 +977,13 @@ classify_pinned() {
   local blind=0
   [ -n "$live" ] || blind=1
 
+  # PINNED_JOBS holds one record per JOB; cancellation is per RUN. A matrix of
+  # eight pinned jobs is one wedged run, and posting eight cancels to it would
+  # publish eight units of ci_pinned_runs_cancelled for the one run that left.
+  # Two lists rather than one: `tried` stops the second POST, `gone` stops the
+  # second COUNT, and the gap between them is a run whose cancel was refused --
+  # which is still pinned demand, because the job is still sitting there.
+  local tried=" " gone=" "
   local now run status labels created age epoch verdict token code
   now=$(date +%s)
 
@@ -983,7 +1021,24 @@ classify_pinned() {
           log "pinned run $run: $verdict — NOT cancelled, this tick has no host list (fail-safe)"
           continue
         fi
-        token=$(gh_token) || { log "pinned run $run: $verdict — no token, not cancelled"; continue; }
+        case "$gone" in *" $run "*) continue ;; esac
+        case "$tried" in
+          *" $run "*)
+            # Already posted for this run this tick and it did not take. The job
+            # is still queued, so it is still demand nothing can serve.
+            DEMAND_PINNED=$((DEMAND_PINNED + 1))
+            continue
+            ;;
+        esac
+        # A run nothing can cancel is a run still sitting in the queue: counted,
+        # so ci_demand_pinned shows the wedge instead of reporting zero of it.
+        token=$(gh_token) || {
+          DEMAND_PINNED=$((DEMAND_PINNED + 1))
+          tried="$tried$run "
+          log "pinned run $run: $verdict — no token, not cancelled"
+          continue
+        }
+        tried="$tried$run "
         code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X POST \
           -H "Authorization: Bearer $token" \
           -H "Accept: application/vnd.github+json" \
@@ -992,6 +1047,7 @@ classify_pinned() {
           202 | 409)
             # 409 = already finishing. The run is leaving either way, and
             # counting it as handled is what stops the log repeating per tick.
+            gone="$gone$run "
             PIN_ORPHANED=$((PIN_ORPHANED + 1))
             log "pinned run $run: $verdict — cancelled (HTTP $code)"
             ;;
@@ -999,6 +1055,7 @@ classify_pinned() {
             # Most likely the app lacks Actions: write. Say so once per tick
             # rather than retrying: the job still cannot run, and a wedge nobody
             # can see is exactly what this function exists to prevent.
+            DEMAND_PINNED=$((DEMAND_PINNED + 1))
             log "pinned run $run: $verdict — cancel REFUSED (HTTP $code); the run will wait for GitHub's own timeout"
             ;;
         esac
@@ -1764,6 +1821,95 @@ EOF
   return 0
 }
 
+# pin_hold_gate <host> <host_uri> -> the pin_hold_decision() verdict
+#
+# The veto's I/O, and the monotonic cache it is taken against. The rule is
+# pin_hold_decision(); everything here is the round trip and the file.
+#
+# Called ONLY for a host the controller has already decided to remove. That is
+# the whole reason the hold is a veto on the verdict rather than an argument to
+# it: recycle_decision() is consulted for every host on every tick, and a hold
+# passed as an argument would cost a guest-attribute read per host per tick --
+# straight into the 10-queries-per-minute-per-instance limit, on the busy pool,
+# where manufacturing that limit presents as read-failed and read-failed keeps.
+#
+# THE CACHE IS THE SECURITY PROPERTY. `$STATE_DIR/pinhold-<host>` holds the
+# greatest expiry this controller has ever seen for the host, and the verdict is
+# taken against that -- so a co-tenant job on another slot can only ever extend
+# a hold, never shorten one. See pin-hold-decision.sh for what shortening one
+# would otherwise buy an attacker.
+pin_hold_gate() {
+  local host="$1" uri="$2"
+  local zone raw rc line key val present=0 hold_raw=""
+  local cf="$STATE_DIR/pinhold-$host"
+  local cached c_run="" c_exp=0 now verdict m_run m_exp
+
+  # No self-link, no zone, and a guessed zone addresses some other machine. The
+  # read cannot happen, so this reads exactly as the read failing: keep.
+  zone=${uri%/instances/*}
+  zone=${zone##*/}
+  if [ -z "$uri" ] || [ -z "$zone" ]; then
+    printf '%s' "hold:run= expiry=0 no-zone"
+    return 0
+  fi
+
+  # The WHOLE namespace in one call, like beacon_gate, and not
+  # `--query-path=ci/pin-hold`: a query path naming a key that is not there
+  # exits NON-ZERO, which this rule reads as "we did not get an answer" and
+  # answers by keeping the host. Every unheld host in the fleet would then be
+  # undeletable. Asked for the namespace, an absent key is a successful read
+  # that returns no row -- a fact, and the fact the free path needs.
+  raw=$(timeout 60 gcloud compute instances get-guest-attributes "$host" \
+    --project="$PROJECT" --zone="$zone" --query-path="$BEACON_NS/" \
+    --format="csv[no-heading](key,value)" 2>/dev/null)
+  rc=$?
+
+  # FIRST occurrence wins, for the same reason beacon_gate does it: guest
+  # attributes are writable by any process on the VM, job code included, and a
+  # later row must not overwrite an earlier one within a single read.
+  while IFS= read -r line; do
+    key=${line%%,*}
+    val=${line#*,}
+    case "$key" in
+      "$PIN_HOLD_KEY") [ "$present" = "1" ] || { present=1; hold_raw="$val"; } ;;
+    esac
+  done <<PIN_ATTR_EOF
+$raw
+PIN_ATTR_EOF
+
+  cached=$(cat "$cf" 2>/dev/null)
+  c_run=${cached%% *}
+  c_exp=${cached##* }
+
+  now=$(date -u +%s)
+  verdict=$(pin_hold_decision "$rc" "$present" "$hold_raw" "$c_run" "$c_exp" \
+    "$now" "$PIN_HOLD_MAX")
+
+  # The cache is written only from a read that SUCCEEDED. A failed read is not
+  # evidence about a hold in either direction, and letting it rewrite the file
+  # would let one API blip either forget a live hold or freeze a dead one.
+  if [ "$rc" = "0" ]; then
+    case "$verdict" in
+      hold:*)
+        m_run=${verdict#*run=}
+        m_run=${m_run%% *}
+        m_exp=${verdict#*expiry=}
+        m_exp=${m_exp%% *}
+        # A malformed publish with nothing cached yields expiry=0: it holds this
+        # host for this tick, and it deliberately leaves no record behind.
+        case "$m_exp" in
+          '' | 0 | *[!0-9]*) ;;
+          *) printf '%s %s' "$m_run" "$m_exp" >"$cf" ;;
+        esac
+        ;;
+      *) rm -f "$cf" ;;
+    esac
+  fi
+
+  printf '%s' "$verdict"
+  return 0
+}
+
 # --- drain -------------------------------------------------------------------
 #
 # The verdict from drain_decision() authorises this sequence and nothing less.
@@ -1919,7 +2065,12 @@ drain_host() {
       return 1
     }
 
-  rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/seen-$host" "$STATE_DIR/beaconmiss-$host"
+  # pinhold- goes with them. The host reached this line only because its hold
+  # was absent or lapsed -- a live one vetoes the verdict that calls drain_host
+  # -- so nothing is being forgotten, and a leftover file would be a veto with
+  # no host to apply to.
+  rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/seen-$host" "$STATE_DIR/beaconmiss-$host" \
+    "$STATE_DIR/pinhold-$host"
   log "drain $host: deregistered and deleted"
   DRAINED=$((DRAINED + 1))
   return 0
@@ -2056,16 +2207,21 @@ tick_pool() {
   WORKER_GATE_HELD=0
   WORKER_GATE_UNDETERMINED=0
   WORKER_GATE_OS_FALLBACK=0
+  PIN_HELD=0
 
   collect_hosts
   # AFTER collect_hosts, and that ordering is the whole reason this is not part
   # of collect_demand: classify_pinned decides whether a pinned run is servable,
   # which is a question about which hosts are alive.
-  classify_pinned
+  # BEFORE classify_pinned, which reads MIG_BASE to tell a host this pool owns
+  # from a host it never had. Under `set -u` reading it first does not misjudge
+  # anything -- it kills the controller, and systemd restarts it into the same
+  # tick for as long as the pinned job stays queued.
   collect_mig
+  classify_pinned
 
   local pool_size=0 slots_busy=0 idle_max=0 draining=0 stale_hosts=0
-  local host status host_tpl host_uri busy idle age verdict tpl cordoned recycling
+  local host status host_tpl host_uri busy idle age verdict hold tpl cordoned recycling
 
   # Hosts already mid-recycle, counted BEFORE any decision this tick, so every
   # host is judged against the same budget rather than against however many
@@ -2104,7 +2260,7 @@ tick_pool() {
   # markers whose host name this pool's MIG could have created are considered,
   # and if the MIG's base name could not be read, nothing is swept at all.
   for f in "$STATE_DIR"/cordon-* "$STATE_DIR"/regtoken-* "$STATE_DIR"/regkey-* \
-    "$STATE_DIR"/regfail-* "$STATE_DIR"/beaconmiss-*; do
+    "$STATE_DIR"/regfail-* "$STATE_DIR"/beaconmiss-* "$STATE_DIR"/pinhold-*; do
     [ -n "$live_hosts" ] || break
     [ -n "$MIG_BASE" ] || break
     [ -e "$f" ] || continue
@@ -2114,6 +2270,7 @@ tick_pool() {
     mname=${mname#regkey-}
     mname=${mname#regfail-}
     mname=${mname#beaconmiss-}
+    mname=${mname#pinhold-}
     case "$mname" in "$MIG_BASE"-*) ;; *) continue ;; esac
     case $'\n'"$live_hosts"$'\n' in
       *$'\n'"$mname"$'\n'*) ;;
@@ -2177,6 +2334,24 @@ tick_pool() {
     verdict=$(recycle_decision "$status" "$tpl" "$busy" "$HOST_REG" \
       "$age" "$REGISTER_GRACE" "$recycling" "$RECYCLE_MAX_UNAVAILABLE" "$cordoned")
 
+    # THE PIN HOLD VETO, first half. A cordon is not "less than" a delete here:
+    # it deregisters the host's idle agents, and a cordoned host stops answering
+    # its own affinity label while the run pinned to it still has jobs to place.
+    # A hold wired only into the drain path would be bypassed entirely by a
+    # stale-template recycle.
+    case "$verdict" in
+      cordon:* | retire:*)
+        hold=$(pin_hold_gate "$host" "$host_uri")
+        case "$hold" in
+          hold:*)
+            log "$host: $verdict -- VETOED by pin hold ($hold)"
+            PIN_HELD=$((PIN_HELD + 1))
+            continue
+            ;;
+        esac
+        ;;
+    esac
+
     case "$verdict" in
       cordon:*)
         log "$host: $verdict"
@@ -2210,6 +2385,20 @@ tick_pool() {
 
     verdict=$(drain_decision "$status" "$busy" "$idle" "$GRACE" "$pool_size" "$MIN_HOSTS" "$HOST_REG" \
       "$age" "$REGISTER_GRACE")
+
+    # THE PIN HOLD VETO, second half. Same gate, same cache, the other path.
+    case "$verdict" in
+      drain:*)
+        hold=$(pin_hold_gate "$host" "$host_uri")
+        case "$hold" in
+          hold:*)
+            log "$host: $verdict -- VETOED by pin hold ($hold)"
+            PIN_HELD=$((PIN_HELD + 1))
+            continue
+            ;;
+        esac
+        ;;
+    esac
 
     case "$verdict" in
       drain:*)
@@ -2279,6 +2468,13 @@ tick_pool() {
   queue_series "ci_worker_gate_verdicts" "$WORKER_GATE_CLEAR" '"outcome":"clear"'
   queue_series "ci_worker_gate_verdicts" "$WORKER_GATE_HELD" '"outcome":"held"'
   queue_series "ci_worker_gate_verdicts" "$WORKER_GATE_UNDETERMINED" '"outcome":"undetermined"'
+  # Removals this pool decided on and then did not carry out because the host
+  # was pinned. Not an error and not a drain: it is scale-in deliberately
+  # deferred, and the series exists so "the pool will not shrink" and "the pool
+  # is holding hosts for runs in flight" stop reading identically. Sustained
+  # non-zero with no pinned demand is a hold that is not lapsing -- the shape a
+  # forged or abandoned hold would have, bounded by PIN_HOLD_MAX either way.
+  queue_series "ci_pin_holds_honoured" "${PIN_HELD:-0}"
   # Not a fourth `outcome`: a fallback host goes on to reach `clear` or `held`
   # like any other, so folding it into that label set would double-count. It is
   # the countdown on a transitional arm — see drain_host(). Zero across every
