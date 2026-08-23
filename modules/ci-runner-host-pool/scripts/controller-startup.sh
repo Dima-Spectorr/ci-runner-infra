@@ -128,6 +128,7 @@ POOLS=()
 declare -A P_MIG=() P_REGION=() P_SLOTS=() P_MIN=() P_MAX=() P_GRACE=()
 declare -A P_REGGRACE=() P_TICKS=() P_RECYCLE=() P_HOST_OS=() P_MINT=()
 declare -A P_ROLE=() P_BEACON=() P_PIN=() P_LABELS=() P_LABELS_JSON=()
+declare -A P_MATCH_JSON=() P_MATCH_CSV=()
 
 # Rejected rows are counted and published (ci_pool_table_rejected), not merely
 # logged: a pool that silently stopped being served looks exactly like a pool
@@ -178,16 +179,48 @@ while IFS=$'\t' read -r p_name p_mig p_region p_slots p_min p_max p_grace \
   # passes to config.sh, which is why both sides come from one metadata value.
   P_LABELS_JSON["$p_name"]=$(printf '%s' "$p_labels" \
     | jq -R -c 'split(",") | map(select(length > 0))')
+  # THE SET WE CONFIGURE IS NOT THE SET THE AGENT ANSWERS TO, and the difference
+  # is why this fleet's `ci_demand` was structurally 0 on every pool. The runner
+  # registers three labels of its own that no `--labels` argument produces and
+  # none of ours can remove -- GitHub calls them `read-only`: `self-hosted`, the
+  # OS (`Linux`/`Windows`), and the architecture (`X64`). Every workflow in the
+  # fleet asks for `[self-hosted, linux, gcp, <Repo>]`; the configured list has
+  # no `linux` in it at all, so the subset test left `["linux"]` over, counted
+  # nothing, and the autoscaler was handed a flat zero while jobs queued for
+  # hours in front of idle slots. Only `min_hosts` and the warm schedules ever
+  # moved a pool.
+  #
+  # Case is the second half of the same bug: GitHub dispatches
+  # case-insensitively, so `linux` and `Linux` are one label to it and two to a
+  # jq `-`. Adding the read-only labels WITHOUT folding fixes nothing. Both
+  # sides are folded here and at every comparison downstream.
+  #
+  # `X64` is derived and not read back off a registered runner on purpose: a
+  # pool with no live runner would report an empty match set, count no demand,
+  # and never buy the host that would have registered one -- a deadlock that
+  # only an operator could break. It is correct for every machine type this
+  # module can create; an arm64 pool would need this to follow the machine type.
+  P_MATCH_JSON["$p_name"]=$(printf '%s' "$p_labels" | jq -R -c --arg os "$p_hostos" '
+    (if ($os | ascii_downcase) == "windows" then "Windows" else "Linux" end) as $osl
+    | split(",") + ["self-hosted", $osl, "X64"]
+    | map(select(length > 0) | ascii_downcase) | unique')
+  P_MATCH_CSV["$p_name"]=$(printf '%s' "${P_MATCH_JSON[$p_name]}" | jq -r 'join(",")')
 done <<<"$pool_rows"
 
-# The label sets of every pool at once, as {pool: [labels]}. The demand sweep
-# fetches a run's job list ONCE and asks jq which pools each job belongs to —
-# the entire reason a repository can have four pools without paying for four
-# controllers' worth of API calls.
-POOLS_LABELS_MAP=$(
+# The MATCH sets of every pool at once, as {pool: [folded labels]}. The demand
+# sweep fetches a run's job list ONCE and asks jq which pools each job belongs
+# to — the entire reason a repository can have four pools without paying for
+# four controllers' worth of API calls.
+#
+# P_MATCH_JSON and not P_LABELS_JSON: what a job can be routed to is decided by
+# what the AGENT registers, which is the configured list plus the runner's own
+# read-only labels, compared case-insensitively. P_LABELS_JSON stays exactly
+# what `config.sh --labels` was given, because that parity is what keeps the
+# host and the controller talking about the same pool.
+POOLS_MATCH_MAP=$(
   {
     for p in "${POOLS[@]}"; do
-      jq -n -c --arg p "$p" --argjson l "${P_LABELS_JSON[$p]}" '{($p): $l}'
+      jq -n -c --arg p "$p" --argjson l "${P_MATCH_JSON[$p]}" '{($p): $l}'
     done
   } | jq -s -c 'add // {}'
 )
@@ -217,6 +250,7 @@ pool_select() {
   BEACON_INTERVAL="${P_BEACON[$POOL]}"
   PIN_ORPHAN_GRACE="${P_PIN[$POOL]}"
   RUNNER_LABELS="${P_LABELS[$POOL]}"
+  RUNNER_MATCH_LABELS="${P_MATCH_CSV[$POOL]}"
   POOL_LABELS_JSON="${P_LABELS_JSON[$POOL]}"
 
   MIG_BASE=""
@@ -227,11 +261,13 @@ pool_select() {
   DEMAND_QUEUED="${D_QUEUED[$POOL]:-0}"
   QUEUE_WAIT_MAX="${D_WAIT[$POOL]:-0}"
   RUNNING_MAX="${D_RUNNING[$POOL]:-0}"
+  DEMAND_EXPIRED="${D_EXPIRED[$POOL]:-0}"
 }
 
 # The per-pool globals pool_select writes, declared at file scope so that a read
 # before the first select cannot kill the tick under `set -u`.
 POOL=""
+DEMAND_EXPIRED=0
 MIG=""
 REGION=""
 SLOTS=1
@@ -252,7 +288,15 @@ MINT_REG=false
 POOL_ROLE="ci"
 BEACON_INTERVAL=30
 PIN_ORPHAN_GRACE=900
+# The configured list, verbatim — kept for parity with `config.sh --labels` and
+# read by the multi-pool test, not by any routing decision in this file.
+# shellcheck disable=SC2034
 RUNNER_LABELS=""
+# What the pool's agents actually ANSWER to: that list plus the runner's own
+# read-only labels, folded. Every routing question — is this job ours, is this
+# pin one of our labels, is this host- label known to the fleet — is asked of
+# this one and never of RUNNER_LABELS. See P_MATCH_JSON for why.
+RUNNER_MATCH_LABELS=""
 # shellcheck disable=SC2034
 POOL_LABELS_JSON="[]"
 
@@ -284,7 +328,32 @@ DEMAND_BUDGET=${DEMAND_BUDGET:-90}
 DEMAND_RUNS_SKIPPED=0
 # The demand sweep's per-pool results. One sweep fills all four; pool_select()
 # hands the selected pool's values to the tick as the globals it always used.
-declare -A D_TOTAL=() D_QUEUED=() D_WAIT=() D_RUNNING=()
+declare -A D_TOTAL=() D_QUEUED=() D_WAIT=() D_RUNNING=() D_EXPIRED=()
+
+# HOW LONG A QUEUED JOB IS ALLOWED TO BE DEMAND.
+#
+# GitHub keeps a run `queued` for as long as its jobs are undispatched, and
+# nothing ever takes it out of that list on its own: a run held by an
+# unapproved deployment environment, blocked behind a `concurrency` group, or
+# simply abandoned on a dead branch stays queued and keeps asking this pool for
+# a host. Apigee-Portal had three of them from 2026-08-19 still queued on
+# 2026-08-23, one holding a job this pool's labels matched — twelve slots idle,
+# every one of them online, and a demand floor of 1 that could not fall.
+#
+# The application repository does not have to do anything wrong to cause it,
+# which is exactly why the controller has to bound it rather than trust it.
+#
+# Two harms, and the second is the one that hides the first: a pool that can
+# never return to zero holds a host warm for work that will never arrive, and
+# ci_demand_wait_seconds pegs at the corpse's age — so the gauge that says "this
+# pool is behind" is saturated and a real queue underneath it is invisible.
+#
+# Six hours is far past any legitimate wait: the longest genuine one measured on
+# this fleet is 72 minutes, behind a full merge queue. And where a legitimate
+# job COULD exceed it, the pool is by definition already at max_hosts, so
+# dropping it changes no decision — under-reporting is only possible in the one
+# state where the number is not being acted on.
+DEMAND_MAX_AGE=21600
 METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/github}
 REPO_FULL="$OWNER/$REPO"
 
@@ -428,6 +497,7 @@ collect_demand() {
     D_QUEUED["$p"]=0
     D_WAIT["$p"]=0
     D_RUNNING["$p"]=0
+    D_EXPIRED["$p"]=0
   done
   # Reset HERE, with the other counters, not after the loop: every early return
   # below would otherwise leave the previous tick's value in place and the
@@ -501,7 +571,20 @@ collect_demand() {
     # labels the CI pools do — the sets are disjoint by construction, and this
     # is the code that would double-scale if they ever stopped being.
     local counted
-    counted=$(printf '%s' "$jobs" | jq -r --argjson pools "$POOLS_LABELS_MAP" '
+    counted=$(printf '%s' "$jobs" | jq -r --argjson pools "$POOLS_MATCH_MAP" \
+      --argjson now "$sweep_start" --argjson maxage "$DEMAND_MAX_AGE" '
+      # A QUEUED JOB HAS A SHELF LIFE, and past it this pool stops answering for
+      # it. See DEMAND_MAX_AGE. An unparseable timestamp reads as "just now" and
+      # is therefore never aged out -- the fail-safe direction, since the cost of
+      # keeping a corpse is a warm host and the cost of dropping a live job is a
+      # pool that will not scale out for real work.
+      # GITHUB ROUTES CASE-INSENSITIVELY and jq subtracts case-sensitively, so
+      # every comparison below is between folded sets. $pools arrives folded.
+      def jlabels: ((.labels // []) | map(ascii_downcase));
+      def expired:
+        .status == "queued"
+        and (((((.started_at // .created_at) // "") | fromdateiso8601?) // $now)
+              < ($now - $maxage));
       [ .jobs[]?
         | select(.status == "queued" or .status == "in_progress")
         | select( ((.labels // []) | length) > 0 )
@@ -516,8 +599,14 @@ collect_demand() {
       # the same labels -- reads it as unpinned leaves it counted on neither
       # series, scaling nothing and invisible on both charts.
       | [ $candidates[]
-          | select( (((.labels // []) | map(select(startswith("host-")))) - $mine_labels | length) == 0 )
-          | select( ((.labels // []) - $mine_labels) | length == 0 ) ] as $mine
+          | select( ((jlabels | map(select(startswith("host-")))) - $mine_labels | length) == 0 )
+          | select( (jlabels - $mine_labels) | length == 0 ) ] as $matched
+      # Dropped from the COUNT and from the STAMPS both. Leaving an expired job
+      # in the stamps would peg ci_demand_wait_seconds at its age forever, which
+      # is worse than the phantom host: a saturated gauge cannot report the real
+      # queue underneath it, and that gauge is how a starved pool is noticed.
+      | [ $matched[] | select(expired | not) ] as $mine
+      | ([ $matched[] | select(expired) ] | length) as $expired_n
       | [ $pool,
           ($mine | length),
           ([ $mine[] | select(.status == "queued") ] | length),
@@ -530,7 +619,11 @@ collect_demand() {
           ([ $mine[] | select(.status == "queued") | .started_at // .created_at ]
              | join(" ") | if . == "" then "-" else . end),
           ([ $mine[] | select(.status == "in_progress") | .started_at // empty ]
-             | join(" ") | if . == "" then "-" else . end)
+             | join(" ") | if . == "" then "-" else . end),
+          # Appended, never inserted: the two fields above are space-joined
+          # lists, and a reader that shifted its columns would hand a stamp list
+          # to a counter. Always a number, so it cannot collapse under IFS.
+          $expired_n
         ] | @tsv' 2>/dev/null)
 
     [ -n "$counted" ] || continue
@@ -564,11 +657,12 @@ collect_demand() {
     # now serves every pool in one sweep, so there is no "this pool" here to ask
     # -- POOL_LABELS_JSON is whichever pool was selected last, which before the
     # first select is the empty list and would read every host- label as a pin.
-    pinned_recs=$(printf '%s' "$jobs" | jq -r --arg rid "$id" --argjson pools "$POOLS_LABELS_MAP" '
+    pinned_recs=$(printf '%s' "$jobs" | jq -r --arg rid "$id" --argjson pools "$POOLS_MATCH_MAP" '
+      def jlabels: ((.labels // []) | map(ascii_downcase));
       ([ $pools | to_entries[] | .value[] ] | unique) as $known_labels
       | .jobs[]?
       | select(.status == "queued" or .status == "in_progress")
-      | select( (((.labels // []) | map(select(startswith("host-")))) - $known_labels | length) > 0 )
+      | select( ((jlabels | map(select(startswith("host-")))) - $known_labels | length) > 0 )
       | [ $rid, .status, ((.labels // []) | join(",")), (.created_at // .started_at // "") ]
       | @tsv' 2>/dev/null)
     if [ -n "$pinned_recs" ]; then
@@ -589,8 +683,8 @@ collect_demand() {
     # One line per pool, in the order jq emitted them. A pool with no matching
     # job in this run still emits a line of zeros and an empty stamp list, which
     # is what keeps the accumulators honest without a second membership test.
-    local c_pool n q stamps running s wait epoch
-    while IFS=$'\t' read -r c_pool n q stamps running; do
+    local c_pool n q stamps running expired_n s wait epoch
+    while IFS=$'\t' read -r c_pool n q stamps running expired_n; do
       [ -n "${c_pool:-}" ] || continue
       # A pool jq knows about but this shell does not cannot happen — the map
       # was built from POOLS — but the guard costs nothing and an unguarded
@@ -599,6 +693,7 @@ collect_demand() {
 
       D_TOTAL["$c_pool"]=$(( D_TOTAL["$c_pool"] + ${n:-0} ))
       D_QUEUED["$c_pool"]=$(( D_QUEUED["$c_pool"] + ${q:-0} ))
+      D_EXPIRED["$c_pool"]=$(( D_EXPIRED["$c_pool"] + ${expired_n:-0} ))
 
       for s in $stamps; do
         epoch=$(date -d "$s" +%s 2>/dev/null) || continue
@@ -753,7 +848,8 @@ collect_outcomes() {
     # One line per job: workflow, conclusion, seconds. `completed_at` and
     # `started_at` are both present on a completed job; a job that reports
     # neither contributes 0 seconds rather than a negative number.
-    rows=$(printf '%s' "$jobs" | jq -r --argjson pools "$POOLS_LABELS_MAP" '
+    rows=$(printf '%s' "$jobs" | jq -r --argjson pools "$POOLS_MATCH_MAP" '
+      def jlabels: ((.labels // []) | map(ascii_downcase));
       [ .jobs[]?
         | select(.status == "completed")
         | select( ((.labels // []) | length) > 0 )
@@ -762,7 +858,7 @@ collect_outcomes() {
       | .key as $pool
       | .value as $mine_labels
       | $candidates[]
-      | select( ((.labels // []) - $mine_labels) | length == 0 )
+      | select( (jlabels - $mine_labels) | length == 0 )
       | [ $pool,
           (.workflow_name // "unknown"),
           (.conclusion // "unknown"),
@@ -998,7 +1094,7 @@ classify_pinned() {
       [ "$age" -lt 0 ] && age=0
     fi
 
-    verdict=$(pinned_job_decision "$status" "$labels" "$RUNNER_LABELS" "$MIG_BASE" \
+    verdict=$(pinned_job_decision "$status" "$labels" "$RUNNER_MATCH_LABELS" "$MIG_BASE" \
       "$live" "$age" "$PIN_ORPHAN_GRACE")
 
     case "$verdict" in
@@ -2426,6 +2522,14 @@ tick_pool() {
   queue_series "ci_demand_pinned" "${DEMAND_PINNED:-0}"
   queue_series "ci_pinned_runs_cancelled" "${PIN_ORPHANED:-0}"
   queue_series "ci_demand_queued" "$DEMAND_QUEUED"
+  # Queued jobs this pool has STOPPED answering for: older than DEMAND_MAX_AGE,
+  # so they are not in ci_demand and not in ci_demand_wait_seconds either. This
+  # is the series that keeps that subtraction honest -- without it a pool whose
+  # repository is holding a run at an unapproved environment simply reports less
+  # demand than the repository can see queued, and the two numbers disagreeing
+  # with no third one to explain them is how a correct autoscaler gets blamed.
+  # Sustained >0 is a repository problem to go and close, not a fleet problem.
+  queue_series "ci_demand_expired" "$DEMAND_EXPIRED"
   queue_series "ci_hosts_running" "$pool_size"
   # Published so saturation is expressible as a ratio in one alert policy that
   # works for every pool, rather than a per-pool threshold copied by hand.

@@ -27,6 +27,10 @@
 #              naming the callee (see `remote_call_declared`).
 #     RUNNER8  a job on a WINDOWS pool label declares `container:` or
 #              `services:`, neither of which that pool can run.
+#     RUNNER12 a route onto the merge-queue pool is decided by facts the
+#              requester cannot forge, not by the branch name alone.
+#     RUNNER13 and the two pools it routes between carry disjoint scope labels,
+#              so neither can be scheduled onto the other's hosts.
 #
 #   And, behind `--shared-infra`, the three that make a pull request use ONE
 #   host and ONE copy of its infrastructure (docs/adr-pr-host-affinity.md):
@@ -249,6 +253,15 @@ ensure_yaml() {
 #   #FORKGUARD\t<id>                 `head.repo.fork` decides this job
 #   #CONTAINER\t<id>                 the job declares `container:`
 #   #SERVICES\t<id>                  the job declares `services:`
+#   #QUEUEREF\t<id>\t<origin>        an expression routes on the merge-queue
+#                                    branch prefix; `origin` is `runs-on` or
+#                                    `output:<name>`
+#   #QUEUESAMEREPO\t<id>\t<origin>   ...and also requires the head branch to
+#                                    live in this repository
+#   #QUEUEAUTHOR\t<id>\t<origin>     ...and also requires the author to be
+#                                    Mergify
+#   #ROUTEARM\t<id>\t<origin>\t<hosted|pool>\t<labels>  one comma-joined JSON
+#                                    label set that expression can resolve to
 read_workflow() {
   "${PY_BIN:-python3}" - "$1" <<'PY'
 import json
@@ -488,6 +501,57 @@ def fork_guarded(job):
     return False
 
 
+# --- the merge-queue route (RUNNER12/RUNNER13) --------------------------------
+# A repository served by BOTH a pull-request pool and a merge-queue pool routes
+# between them in one expression, and that expression is where both of this
+# fleet's queue-routing failures get written.
+#
+# `github.head_ref` is chosen by whoever opened the pull request. A branch named
+# `mergify/merge-queue/anything` therefore hands ordinary -- or forked -- work
+# the pool that exists to be RESERVED for the queue, and does it by spelling a
+# string. Two facts nobody outside the repository can forge have to be required
+# with it: the head branch lives in this repository, and the pull request was
+# opened by Mergify. A human cannot author a pull request as `mergify[bot]`.
+QUEUE_BRANCH = re.compile(r"mergify/merge-queue/")
+QUEUE_SAME_REPO = re.compile(r"head\.repo\.full_name\s*==\s*github\.repository")
+QUEUE_AUTHOR = re.compile(r"""user\.login\s*==\s*(['"])mergify\[bot\]\1""")
+
+# A single-quoted JSON array inside an expression -- the label set one arm of
+# the route resolves to. `runs-on` needs a list and an expression yields a
+# string, so each arm is JSON and `fromJSON` unwraps whichever one won.
+EXPR_JSON_ARRAY = re.compile(r"'(\[[^']*\])'")
+
+
+def emit_expr_facts(vid, origin, text):
+    """Facts about ONE expression: whether it routes on the queue branch, on
+    what else, and which label sets its arms are. Facts only -- whether a
+    missing conjunct is a finding is decided once, in the shell, like every
+    other rule in this file."""
+    if "${{" not in text or not QUEUE_BRANCH.search(text):
+        return
+    out("#QUEUEREF", vid, origin)
+    if QUEUE_SAME_REPO.search(text):
+        out("#QUEUESAMEREPO", vid, origin)
+    if QUEUE_AUTHOR.search(text):
+        out("#QUEUEAUTHOR", vid, origin)
+    for m in EXPR_JSON_ARRAY.finditer(text):
+        try:
+            arm = json.loads(m.group(1))
+        except ValueError:
+            continue
+        if not (isinstance(arm, list) and all(isinstance(x, str) for x in arm)):
+            continue
+        # Whether an arm is a GitHub-hosted image is decided HERE, against the
+        # same `HOSTED_IMAGE` every other hosted/self-hosted judgement in this
+        # file uses. The fork idiom's safe arm carries no scope label at all,
+        # and a shell that only counted scope labels would read it as an
+        # unscoped pool and report a correct workflow.
+        kind = "hosted" if arm and all(HOSTED_IMAGE.match(x.strip()) for x in arm) else "pool"
+        # Comma-joined: a runner label may not contain a comma, so the shell can
+        # split it without a second parser.
+        out("#ROUTEARM", vid, origin, kind, ",".join(arm))
+
+
 def resolve_matrix_legs(job):
     """Label lists for each leg of a matrix-selected `runs-on`, or None.
 
@@ -614,6 +678,13 @@ for job_id, job in jobs.items():
         # on itself.
         if isinstance(job.get("outputs"), dict) and job["outputs"]:
             out("#OUTPUTS", vid)
+            # ...and WHAT they publish, for RUNNER12/13. The merge-queue
+            # route is published as a job output rather than written into
+            # every `runs-on`, so an expression scanner reading only `runs-on`
+            # sees `fromJSON(needs.lane.outputs.runner)` in each downstream job
+            # and never reaches the one expression that decides.
+            for oname, ovalue in job["outputs"].items():
+                emit_expr_facts(vid, "output:%s" % oname, str(ovalue))
 
         # RUNNER11 reads the job's steps as TEXT. Every place a port can be
         # written — `run:`, `env:`, `with:`, a service's options — is one
@@ -680,6 +751,10 @@ for job_id, job in jobs.items():
                 text = str(label)
                 if "${{" in text:
                     out("#EXPR", vid)
+                    # A repository small enough to route inline rather than
+                    # through a lane job writes the same decision here, and it
+                    # is the same decision.
+                    emit_expr_facts(vid, "runs-on", text)
                 else:
                     literal.append(text.strip())
                     out("#LABEL", vid, text.strip())
@@ -706,6 +781,27 @@ re_quote() { printf '%s' "$1" | sed 's/[][\.^$*+?(){}|\\\/]/\\&/g'; }
 # One spelling for a file, so that a path used as a set KEY and a path used as a
 # set MEMBER compare equal. Falls back to the argument unchanged when the
 # directory cannot be entered, which is the reading a missing file deserves.
+# The labels of ONE comma-joined arm that scope it to a repository: every label
+# that is not one of the platform labels every pool in the fleet carries.
+# Lower-cased, because GitHub does not distinguish `Linux` from `linux`, and a
+# comparison that did would read two spellings of one pool as two pools.
+scope_labels() {
+  printf '%s' "$1" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' |
+    tr '[:upper:]' '[:lower:]' | grep -vxE "(${GENERIC})" | grep -v '^$' | sort -u
+}
+
+# Two arms are two pools when EACH carries a scope label the other does not.
+# Not "they differ" -- mutual non-superset is the property GitHub's scheduler
+# reads, and a set that merely differs can still contain the other whole.
+disjoint_scopes() {
+  local a b
+  a="$(scope_labels "$1")"
+  b="$(scope_labels "$2")"
+  [ -n "$(comm -23 <(printf '%s\n' "$a") <(printf '%s\n' "$b"))" ] &&
+    [ -n "$(comm -13 <(printf '%s\n' "$a") <(printf '%s\n' "$b"))" ]
+}
+
+
 abs_path() {
   local d b
   d="$(dirname -- "$1")"
@@ -1069,6 +1165,72 @@ EOF
         err RUNNER8 "$rel: job '$job' targets a Windows pool label and declares $rule8_keys — a Windows pool has NO container runtime (job isolation there is one local Windows account per slot, not a container), so this job fails at 'Initialize containers' before any step runs, with an error about docker on a host that has none"
       fi
     fi
+
+    # --- RUNNER12/13: the merge-queue route ----------------------------------
+    #
+    # OUTSIDE the self-hosted block on purpose. The job that DECIDES the route
+    # is the lane job, and the lane job runs on `ubuntu-latest` -- it is a
+    # five-second expression, not pool work. Gating this on `self_hosted` would
+    # skip the one job in the repository that publishes the decision and report
+    # clean on every downstream job that merely obeys it.
+    local origin
+    while IFS= read -r origin; do
+      [ -n "$origin" ] || continue
+      local origin_re
+      origin_re="$(re_quote "$origin")"
+
+      # RUNNER12 -- the branch name is not a fact. `github.head_ref` is whatever
+      # the requester typed, so a route keyed on the prefix alone offers the
+      # reserved pool to any pull request willing to be named after the queue,
+      # forks included. Its absence is silent: the workflow is green, the route
+      # works, and it also works for everybody else.
+      local same_repo=0 author=0 missing=""
+      [ "$(printf '%s\n' "$records" | grep -c "^#QUEUESAMEREPO	${job_re}	${origin_re}$")" -gt 0 ] && same_repo=1
+      [ "$(printf '%s\n' "$records" | grep -c "^#QUEUEAUTHOR	${job_re}	${origin_re}$")" -gt 0 ] && author=1
+      [ "$same_repo" -eq 0 ] && missing="the head branch living in this repository (head.repo.full_name == github.repository)"
+      [ "$author" -eq 0 ] && missing="${missing:+$missing and }the author being Mergify (user.login == 'mergify[bot]')"
+      if [ -n "$missing" ]; then
+        err RUNNER12 "$rel: job '$job' routes on the merge-queue branch prefix in $origin but does not also require $missing -- github.head_ref is chosen by whoever opened the pull request, so as written ANY pull request named 'mergify/merge-queue/...' claims the pool reserved for the queue"
+      fi
+
+      # RUNNER13 -- and the two pools have to be two pools. GitHub schedules a
+      # self-hosted runner by SUPERSET, so if one arm's labels cover the
+      # other's the route is decorative: every ordinary job is eligible for the
+      # queue's hosts and the split buys nothing. Covered the other way round
+      # and the queue cannot be addressed at all -- its jobs ask for a label no
+      # runner carries and queue against it forever rather than failing.
+      #
+      # The same property the controller module asserts across its `pools`
+      # table at plan time, asserted here across the workflow that ADDRESSES
+      # them. Both ends, because either one alone is a rule the other drifts
+      # away from.
+      local arms=() arm
+      while IFS= read -r arm; do
+        [ -n "$arm" ] || continue
+        arms+=("$arm")
+      done <<EOF
+$(printf '%s\n' "$records" | sed -n "s/^#ROUTEARM\t${job_re}\t${origin_re}\tpool\t//p")
+EOF
+
+      local i j
+      for ((i = 0; i < ${#arms[@]}; i++)); do
+        # An arm naming no scope label at all is offered to the entire fleet --
+        # RUNNER1's finding, reached through an expression RUNNER1 cannot read.
+        if [ -z "$(scope_labels "${arms[$i]}")" ]; then
+          err RUNNER13 "$rel: job '$job' routes $origin to [${arms[$i]}], which names no repository-scoped label -- that is not a pool, it is every pool in the fleet"
+          continue
+        fi
+        for ((j = i + 1; j < ${#arms[@]}; j++)); do
+          [ -n "$(scope_labels "${arms[$j]}")" ] || continue
+          if ! disjoint_scopes "${arms[$i]}" "${arms[$j]}"; then
+            err RUNNER13 "$rel: job '$job' routes $origin between [${arms[$i]}] and [${arms[$j]}], and one label set covers the other -- GitHub matches a runner by superset, so these are not two pools. The queue pool carries its own scope label INSTEAD OF the pull-request pool's, never in addition to it"
+          fi
+        done
+      done
+    done <<EOF
+$(printf '%s\n' "$records" | sed -n "s/^#QUEUEREF\t${job_re}\t//p" | sort -u)
+EOF
+
 
       # --- RUNNER9/10/11: one host, one stack, per pull request ---------------
       #
@@ -2655,6 +2817,180 @@ jobs:
     timeout-minutes: 30
     steps:
       - run: psql postgres://ci@localhost:35100/app'
+
+  # --- RUNNER12/13 fixtures: the merge-queue route ----------------------------
+  #
+  # The lane job runs on `ubuntu-latest`, so no other rule in this gate looks at
+  # it. That is exactly why these two live here: it is the one job in the
+  # repository that decides which pool every OTHER job claims.
+  #
+  # Written with DOUBLE-quoted shell strings, unlike every fixture above. A
+  # GitHub expression quotes its own string literals with single quotes, and a
+  # fixture that spelled them any other way would be testing this gate against a
+  # syntax no real workflow can contain.
+
+  local QGUARD="github.event.pull_request.head.repo.full_name == github.repository
+             && github.event.pull_request.user.login == 'mergify[bot]'
+             && startsWith(github.head_ref, 'mergify/merge-queue/')"
+
+  expect "the routed lane job, written correctly" "" "" allowed \
+"on: [pull_request]
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: >-
+        \${{ ($QGUARD)
+            && '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo-merge-queue\"]'
+            || '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]' }}
+    steps: [{run: \"true\"}]"
+
+  # The whole of the vulnerability, and it is shorter than the correct version.
+  # Green, working, and available to anybody willing to name a branch after the
+  # queue -- a fork included.
+  expect "routing on the branch prefix alone" "RUNNER12" "" allowed \
+"on: [pull_request]
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: >-
+        \${{ startsWith(github.head_ref, 'mergify/merge-queue/')
+            && '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo-merge-queue\"]'
+            || '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]' }}
+    steps: [{run: \"true\"}]"
+
+  # Half a guard. The head branch is proven to live in this repository, so no
+  # fork reaches the pool -- but any member of the repository still takes it by
+  # naming a branch, which is most of what the rule is for.
+  expect "same-repo without the Mergify author" "RUNNER12" "" allowed \
+"on: [pull_request]
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: >-
+        \${{ (github.event.pull_request.head.repo.full_name == github.repository
+             && startsWith(github.head_ref, 'mergify/merge-queue/'))
+            && '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo-merge-queue\"]'
+            || '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]' }}
+    steps: [{run: \"true\"}]"
+
+  # The mirror of the case above, and the one a reviewer waves through: the
+  # author is proven, so the pull request really is Mergify's -- but nothing
+  # says the head branch is not a fork's, and a fork can name a branch too.
+  expect "the Mergify author without same-repo" "RUNNER12" "" allowed \
+"on: [pull_request]
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: >-
+        \${{ (github.event.pull_request.user.login == 'mergify[bot]'
+             && startsWith(github.head_ref, 'mergify/merge-queue/'))
+            && '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo-merge-queue\"]'
+            || '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]' }}
+    steps: [{run: \"true\"}]"
+
+  # The queue arm carries the pull-request pool's label AS WELL AS its own. It
+  # reads like belt and braces and it undoes the split: a job asking for
+  # `ExampleRepo` matches these runners too, so ordinary pull requests are
+  # scheduled onto the hosts reserved for the queue.
+  expect "the queue arm is a superset of the CI arm" "RUNNER13" "" allowed \
+"on: [pull_request]
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: >-
+        \${{ ($QGUARD)
+            && '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\",\"ExampleRepo-merge-queue\"]'
+            || '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]' }}
+    steps: [{run: \"true\"}]"
+
+  # The other direction, and the quieter one: an arm naming no scope label is
+  # not a pool, it is every pool in the fleet.
+  expect "an arm with no scope label is the whole fleet" "RUNNER13" "" allowed \
+"on: [pull_request]
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: >-
+        \${{ ($QGUARD)
+            && '[\"self-hosted\",\"linux\",\"gcp\"]'
+            || '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]' }}
+    steps: [{run: \"true\"}]"
+
+  # The fork idiom wraps the route, and its safe arm is a hosted image carrying
+  # no scope label at all. Counted as a pool it would be the unscoped-fleet
+  # finding above, so this fixture fails if `#ROUTEARM`s hosted/pool judgement
+  # is ever dropped or re-derived in the shell.
+  expect "a hosted fork arm is not a pool" "" "" allowed \
+"on: [pull_request]
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: >-
+        \${{ github.event.pull_request.head.repo.fork
+            && '[\"ubuntu-latest\"]'
+            || (($QGUARD)
+                && '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo-merge-queue\"]'
+                || '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]') }}
+    steps: [{run: \"true\"}]"
+
+  # Case is not a difference. GitHub does not distinguish `Linux` from `linux`,
+  # and neither may this -- otherwise the two arms below read as two pools and
+  # the superset that merges them goes unreported.
+  expect "case does not make two pools" "RUNNER13" "" allowed \
+"on: [pull_request]
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: >-
+        \${{ ($QGUARD)
+            && '[\"self-hosted\",\"Linux\",\"gcp\",\"ExampleRepo\"]'
+            || '[\"self-hosted\",\"linux\",\"gcp\",\"examplerepo\"]' }}
+    steps: [{run: \"true\"}]"
+
+  # A repository with no merge-queue pool never mentions the prefix, and none of
+  # this applies to it. These two rules are opted into by the route EXISTING,
+  # not by a flag -- a gate every consumer must configure is a gate several
+  # consumers configure wrongly, which is the same reasoning as `--scope`.
+  expect "no queue route, no queue rules" "" "" allowed \
+"on: [pull_request]
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]'
+    steps: [{run: \"true\"}]"
+
+  # The same decision written inline in `runs-on`, by a repository small enough
+  # not to have a lane job. RUNNER5 comes with it -- the runner IS dynamic -- and
+  # RUNNER12 has to be reached past it rather than instead of it. `--forks=
+  # blocked` only to keep RUNNER4 out of the assertion; it is not the subject.
+  expect "the route written inline in runs-on" "RUNNER12 RUNNER5" "" blocked \
+"on: [pull_request]
+jobs:
+  build:
+    runs-on: >-
+      \${{ fromJSON(startsWith(github.head_ref, 'mergify/merge-queue/')
+          && '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo-merge-queue\"]'
+          || '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]') }}
+    timeout-minutes: 30
+    steps: [{run: \"true\"}]"
 
   rm -rf "$tmp"
   return "$status"
