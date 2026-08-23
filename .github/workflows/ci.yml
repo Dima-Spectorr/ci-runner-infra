@@ -374,6 +374,15 @@ jobs:
       - name: host-startup self-test
         run: bash scripts/ci/host-startup.selftest.sh
 
+      # host-startup.selftest.sh is structural, and the slot-reset bug of
+      # 2026-08-23 walked straight past it: the code said "recreate the
+      # directory" and did, one level above the directory the runner chdirs
+      # into. Every job the reset deliberately failed then failed the SLOT, and
+      # nine of them across three hosts took the fleet down. This one extracts
+      # the generated hook and runs it.
+      - name: slot-reset workspace self-test
+        run: bash scripts/ci/slot-reset-workspace.selftest.sh
+
       # The band's two constants live in two files in two languages, because
       # the network module is created once per project and deliberately does
       # not depend on the pools. A firewall span narrower than the DNAT range
