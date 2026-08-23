@@ -65,7 +65,14 @@ for f in "$GATE" "$EXAMPLE"; do
   fi
 done
 
-WORK="$(mktemp -d)"
+# Hard-fail rather than degrade. An empty `WORK` writes every mutant to
+# `./mutant.yml` in whatever directory this was invoked from — a file left in
+# the working tree, and, worse, a `rm -rf ""` in the trap that silently removes
+# nothing while the caller believes it cleaned up.
+if ! WORK="$(mktemp -d)" || [ -z "$WORK" ] || [ ! -d "$WORK" ]; then
+  echo "FAIL: could not create a temporary directory — every mutation below would write into the working tree"
+  exit 1
+fi
 trap 'rm -rf "$WORK"' EXIT
 
 # --- 1. the example is clean --------------------------------------------------
@@ -86,7 +93,13 @@ fi
 mutate() { # <rule-id> <description> <sed-program>
   local id="$1" desc="$2" prog="$3" tmp got
   tmp="$WORK/mutant.yml"
-  sed "$prog" "$EXAMPLE" >"$tmp"
+  # A `sed` that refuses its program writes an empty file, which the gate then
+  # reports as a workflow with no jobs — clean, and scored as "the rule did not
+  # fire" when in truth nothing was ever checked.
+  if ! sed "$prog" "$EXAMPLE" >"$tmp"; then
+    bad "the mutation program was refused by sed, so it asserts nothing: $desc"
+    return
+  fi
   # A sed program that matches nothing leaves the example intact, the gate
   # reports it clean, and the case reads as "the rule did not fire" — when in
   # truth the assertion was never made. This is how the gate's own mutation
@@ -111,7 +124,7 @@ $got"
 # different host, where this run's stack does not exist.
 # shellcheck disable=SC2016  # a sed program over the example's own text
 mutate RUNNER9 "the test job names its pool directly instead of the anchor's output" \
-  's@^    runs-on: \${{ github.event.pull_request.head.repo.fork.*fromJSON.*$@    runs-on: [self-hosted, linux, gcp, ExampleRepo]@'
+  's@^    runs-on: .*fromJSON(needs\.anchor\.outputs\.runs-on).*$@    runs-on: [self-hosted, linux, gcp, ExampleRepo]@'
 
 # Rule 2, one stack per run. A second job declares itself an owner — the shape
 # this takes in real life is a second workflow, or a job that "just needs its
