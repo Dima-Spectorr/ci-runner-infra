@@ -1071,16 +1071,71 @@ has_slot_sweep() { # <file>
   matches "$code" '/opt/ci/job-hooks/slot-reset\.sh completed "\\\$idx"' || return 1
 }
 
+# #250 shipped the PER-RESET half of #233: a tag survives a reset only with a
+# registry digest or an id in the boot manifest. This is the periodic half. The
+# manifest is written once, at boot, and a host that runs for days between
+# reboots is otherwise trusting a fact established then and never revisited.
+has_baked_image_audit() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # Installed, armed, and NOT fatal. It is a detector over a control that already
+  # runs at every job boundary, so a host that could not install it still has the
+  # protection — refusing to serve over that would cost more than it buys.
+  matches "$code" 'install_baked_image_audit \|\|$' || return 1
+  ! matches "$code" 'install_baked_image_audit \|\| die' || return 1
+  matches "$code" 'systemctl enable --now ci-baked-image-audit\.timer' || return 1
+  matches "$code" '^OnUnitActiveSec=900$' || return 1
+
+  # PERIODIC, and that is the whole point: nothing delivers "the store changed
+  # under the manifest" as an event. The first run waits, because the boot-time
+  # `docker load` only moves a manifest into place when it finishes.
+  matches "$code" '^OnBootSec=300$' || return 1
+  # A oneshot with no deadline blocks its own timer forever.
+  matches "$code" '^TimeoutStartSec=180$' || return 1
+
+  # THE FOUR FINDINGS. An id the store no longer has; the manifest's own
+  # ownership; the root-owned namespace above it; and the daemon's data root.
+  # `say`, not just the sentence: a finding computed and never emitted reads
+  # exactly like a clean host, and it is one deleted word away at all times.
+  matches "$code" 'say "slot \\\$idx: the manifest names \\\$id, which the store no longer has' || return 1
+  matches "$code" 'not root:root:644' || return 1
+  matches "$code" 'not root:root:755' || return 1
+  matches "$code" 'not \\\$u:\\\$u:700' || return 1
+
+  # `stat` follows a symlink, so the link test comes FIRST or a slot-planted
+  # link to a root-owned path reads as compliant.
+  matches "$code" '\[ -L "\\\$manifest" \]' || return 1
+  matches "$code" '\[ -L "\\\$droot" \]' || return 1
+
+  # The failure policy is the reset's. A poisoning withdraws the marker; a
+  # daemon that is merely absent logs and takes nothing.
+  # Spelled with the `if`: the reset hook removes a marker too, so the bare
+  # `rm` matches whether or not the audit still withdraws anything.
+  matches "$code" 'if rm -f -- "\\\$marker"; then' || return 1
+  matches "$code" 'clean marker withdrawn' || return 1
+  matches "$code" 'no docker socket at \\\$sock -- the manifest.s ids were not checked' || return 1
+
+  # Never `grep -q` on a pipeline whose status is the answer: -q exits on the
+  # first match, the in-process writer dies of EPIPE, and pipefail reports a
+  # pipeline that FOUND its id as one that did not.
+  matches "$code" 'grep -cxF -- "\\\$id" >/dev/null' || return 1
+
+  # A MISSING manifest is not a finding — most pools bake nothing, and the prune
+  # reads an absent file as an empty one.
+  matches "$code" 'elif \[ -f "\\\$manifest" \]' || return 1
+}
+
 # The scripts this boot script WRITES are never run by anything here, so a
-# syntax error in either survives every text predicate above and first appears
-# on a live host as a slot that will not pin — or, worse, a sweeper that exits
-# before it can hand one back. So they are extracted and parsed.
+# syntax error in any of them survives every text predicate above and first
+# appears on a live host as a slot that will not pin — or, worse, a sweeper that
+# exits before it can hand one back. So they are extracted and parsed.
 #
 # `\$` in the heredoc is a runtime `$`; unescaping it is what turns the emitted
 # text back into the file the host actually gets.
 generated_scripts_parse() { # <file>
   local name body tmp rc=0
-  for name in slot-reset slot-sweep pin-hold pin-sweep; do
+  for name in slot-reset slot-sweep pin-hold pin-sweep baked-image-audit; do
     body=$(awk -v n="$name" '
       $0 == "  cat >/opt/ci/job-hooks/" n ".sh <<EOF" { on = 1; next }
       on && $0 == "EOF" { exit }
@@ -1107,6 +1162,12 @@ if has_slot_sweep "$SCRIPT"; then
   ok
 else
   bad "a slot left dirty by a job that never reached its completed hook is never reset — it refuses every job afterwards, fails each one in seconds, and therefore WINS the queue ahead of healthy slots, so re-running the workflow spreads the outage instead of clearing it (IntegrateIT, 12 of 24 slots, 2026-08-23)"
+fi
+
+if has_baked_image_audit "$SCRIPT"; then
+  ok
+else
+  bad "nothing re-checks the baked-image manifest after boot — on a host that runs for days the prune in #250 is deciding which image tags may survive a reset from a claim made once, at boot, over a store that has changed since (issue #251)"
 fi
 
 if generated_scripts_parse "$SCRIPT"; then
@@ -1349,6 +1410,22 @@ mutate "a busy slot stopped mid-job"        's@&& \[ -f "\\\$marker" \] &&@\&\&@
 mutate "the held slot never taken out"      's|systemctl stop "ci-runner@\\\$slot.service"|true|'                          has_pin_hold
 mutate "the stack survives expiry"          's@docker rm --force@docker ps --filter@'                                      has_pin_hold
 mutate "no reset after the hold"            's@/opt/ci/job-hooks/slot-reset.sh completed "\\\$slot"@true@'                  has_pin_hold
+
+mutate "audit installed but not armed"       's@systemctl enable --now ci-baked-image-audit.timer@systemctl enable ci-baked-image-audit.timer@' has_baked_image_audit
+mutate "audit runs once and never again"     's@^OnUnitActiveSec=900$@@'                                              has_baked_image_audit
+mutate "audit races the boot image load"     's@^OnBootSec=300$@OnBootSec=1@'                                         has_baked_image_audit
+mutate "audit oneshot without a deadline"    's@^TimeoutStartSec=180$@@'                                              has_baked_image_audit
+mutate "audit failure made fatal"            's@^  install_baked_image_audit ||$@  install_baked_image_audit || die@' has_baked_image_audit
+mutate "dead manifest id no longer reported" 's@say "slot \\\$idx: the manifest names@: "slot \$idx: the manifest names@' has_baked_image_audit
+mutate "manifest mode no longer checked"     's@not root:root:644@is fine@'                                           has_baked_image_audit
+mutate "state directory no longer checked"   's@not root:root:755@is fine@g'                                          has_baked_image_audit
+mutate "image store owner no longer checked" 's@not \\\$u:\\\$u:700@is fine@'                                         has_baked_image_audit
+mutate "symlinked manifest reads as a file"  's@if \[ -L "\\\$manifest" \]@if false@'                                 has_baked_image_audit
+mutate "symlinked image store accepted"      's@if \[ -L "\\\$droot" \]@if false@'                                    has_baked_image_audit
+mutate "poisoned slot keeps its marker"      's@^    if rm -f -- "\\\$marker"; then$@    if true; then@'              has_baked_image_audit
+mutate "absent daemon stops being logged"    's@no docker socket at \\\$sock -- the manifest.s ids@no docker socket at \$sock -- nothing@' has_baked_image_audit
+mutate "id lookup back to grep -q"           's@grep -cxF -- "\\\$id" >/dev/null@grep -qxF -- "\$id"@'                has_baked_image_audit
+mutate "a missing manifest made a finding"   's@elif \[ -f "\\\$manifest" \]@elif true@'                              has_baked_image_audit
 mutate "the hold cleared even on failure"   's@^if \[ "\\\$rc" != 0 \]; then$@if false; then@'                               has_pin_hold
 mutate "a failed teardown back in service"  's@the agent stays DOWN@the agent is restarted anyway@'                        has_pin_hold
 

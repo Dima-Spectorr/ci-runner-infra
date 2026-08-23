@@ -78,7 +78,7 @@ jobs:
           # Same shape assertion as docs-pins: an unshaped VERSION would create
           # a ref named after whatever the file happened to contain, and a bad
           # tag cannot be moved once a consumer has pinned it.
-          if ! printf '%s' "$want" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+          if ! printf '%s' "$want" | grep -cE '^v[0-9]+\.[0-9]+\.[0-9]+$' >/dev/null; then
             echo "::error::VERSION is '$want', which is not vMAJOR.MINOR.PATCH — refusing to create a tag from it."
             exit 1
           fi

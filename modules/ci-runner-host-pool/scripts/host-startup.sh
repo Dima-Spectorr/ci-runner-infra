@@ -1819,6 +1819,197 @@ EOF
   systemctl enable --now ci-slot-sweep.timer >>/var/log/ci-host.log 2>&1 || return 1
 }
 
+# --- the baked-image manifest, re-checked ------------------------------------
+#
+# #233 asked for two things and #250 shipped the per-reset half: at every reset
+# that ends a job, a local image tag survives only if it carries a registry
+# RepoDigest or its id is in $SLOT_STATE/<idx>/baked-images. What that leaves is
+# the other half. The manifest is written ONCE, by load_baked_images() at boot,
+# and nothing afterwards asks whether the facts it records are still facts. A
+# host that runs for days between reboots is trusting a claim made at boot and
+# never revisited.
+#
+# This is a DETECTOR, not a second enforcement path. The per-reset prune is what
+# protects a job; this only asks, on a timer, whether the inputs that prune
+# depends on still hold:
+#
+#   an id that no longer resolves   the image was deleted out from under the
+#                                   store, so the manifest vouches for nothing
+#                                   and the NAME it used to carry is free for a
+#                                   job to take.
+#   the manifest's own ownership    root:root 0644 in a root-owned directory is
+#                                   the only thing stopping a slot from writing
+#                                   its own ids into it, which would bless
+#                                   exactly the substitution #233 is about.
+#   the per-slot state directory    $SLOT_STATE and $SLOT_STATE/<idx> are the
+#                                   namespace a slot must not own: owning it is
+#                                   owning the `clean` marker and the manifest
+#                                   both, whatever their own modes say.
+#   the daemon's data root          $SLOT_STATE/<idx>/docker belongs to THIS
+#                                   slot's user at 0700. Another slot's user, or
+#                                   a wider mode, is one slot reading or writing
+#                                   another's image store.
+#
+# The failure policy is the per-reset one, for the same reasons. A finding that
+# means the slot can be poisoned withdraws that slot's `clean` marker, which is
+# the claim it must not hold; the next job on it is refused until a reset earns
+# the marker back. A daemon that is simply absent is LOGGED and nothing more —
+# it already fails the next job at its first `docker` line, and taking the
+# marker on top of that turns a slot with no dockerd into a slot that also fails
+# every job for a reason nothing names.
+#
+# A slot that is mid-job has no marker to withdraw, so this needs no interlock
+# with the runner: the removal is a no-op exactly when a job is running, and the
+# reset that ends that job re-runs the prune and re-earns the marker.
+install_baked_image_audit() {
+  cat >/opt/ci/job-hooks/baked-image-audit.sh <<EOF
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as root on a timer. See install_baked_image_audit().
+set -uo pipefail
+
+SLOT_STATE="$SLOT_STATE"
+SLOT_USER_PREFIX="$SLOT_USER_PREFIX"
+SLOTS=$SLOTS
+
+say() { logger -t ci-baked-audit -- "\$*" 2>/dev/null || true; echo "baked-image audit: \$*" >&2; }
+
+# Checked once, not once per slot: it is one directory, and a finding on it is
+# a finding about every slot on the host.
+state_own=\$(stat -c '%U:%G:%a' -- "\$SLOT_STATE" 2>/dev/null || echo missing)
+if [ "\$state_own" != "root:root:755" ]; then
+  say "\$SLOT_STATE is \$state_own, not root:root:755 -- every slot's clean marker and baked-image manifest is forgeable"
+fi
+
+for idx in \$(seq 1 "\$SLOTS"); do
+  u="\$SLOT_USER_PREFIX\$idx"
+  dir="\$SLOT_STATE/\$idx"
+  manifest="\$dir/baked-images"
+  marker="\$dir/clean"
+  droot="\$dir/docker"
+  sock="/run/\$u/docker.sock"
+  poisoned=0
+
+  [ -d "\$dir" ] || continue
+
+  # The state directory ITSELF, before anything inside it. A slot that owns this
+  # can create, rename and replace every name below it, so a manifest reporting
+  # root:root 0644 inside a slot-owned parent is telling the truth about a file
+  # the slot can swap out from under the check.
+  if [ "\$state_own" != "root:root:755" ]; then
+    poisoned=1
+  fi
+  dir_own=\$(stat -c '%U:%G:%a' -- "\$dir" 2>/dev/null || echo missing)
+  if [ "\$dir_own" != "root:root:755" ]; then
+    say "slot \$idx: \$dir is \$dir_own, not root:root:755 -- the slot owns the namespace holding its own clean marker"
+    poisoned=1
+  fi
+
+  # The daemon's data root is the one leaf in here the slot may write, and it
+  # may write only its OWN. \`stat\` follows a symlink, so the link test comes
+  # first or a slot-planted link to a root-owned directory reads as compliant.
+  if [ -L "\$droot" ]; then
+    say "slot \$idx: \$droot is a symlink -- the image store is not where this host thinks it is"
+    poisoned=1
+  elif [ -e "\$droot" ]; then
+    droot_own=\$(stat -c '%U:%G:%a' -- "\$droot" 2>/dev/null || echo missing)
+    if [ "\$droot_own" != "\$u:\$u:700" ]; then
+      say "slot \$idx: \$droot is \$droot_own, not \$u:\$u:700 -- another account can read or write this slot's image store"
+      poisoned=1
+    fi
+  fi
+
+  # A MISSING manifest is not a finding. Most pools bake no images at all, and
+  # the prune reads an absent file as an empty one: with nothing baked, a
+  # registry digest is the only thing that vouches for a tag, which is correct.
+  if [ -L "\$manifest" ]; then
+    say "slot \$idx: \$manifest is a symlink -- the prune is reading a file this host did not write"
+    poisoned=1
+  elif [ -f "\$manifest" ]; then
+    man_own=\$(stat -c '%U:%G:%a' -- "\$manifest" 2>/dev/null || echo missing)
+    if [ "\$man_own" != "root:root:644" ]; then
+      say "slot \$idx: \$manifest is \$man_own, not root:root:644 -- a slot can add its own ids and bless its own images"
+      poisoned=1
+    fi
+
+    if [ -S "\$sock" ]; then
+      ids=\$(grep -v '^[[:space:]]*\$' -- "\$manifest" 2>/dev/null)
+      if [ -n "\$ids" ]; then
+        # One inspect for the whole list rather than one per id: a list with a
+        # dead id still prints every live one, so the SET it returns is the
+        # answer and the non-zero exit is not.
+        #
+        # word-splitting \$ids is the point -- one id per argument.
+        # shellcheck disable=SC2086
+        live=\$(timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+                 docker image inspect --format '{{.Id}}' -- \$ids 2>/dev/null)
+        while IFS= read -r id; do
+          [ -n "\$id" ] || continue
+          # \`grep -c ... >/dev/null\`, never \`grep -q\`: -q exits on the first
+          # match, the in-process \`printf\` dies of EPIPE, and pipefail then
+          # reports a pipeline that FOUND its id as one that did not.
+          printf '%s\n' "\$live" | grep -cxF -- "\$id" >/dev/null && continue
+          say "slot \$idx: the manifest names \$id, which the store no longer has -- it vouches for nothing, and the name it carried is free for a job to take"
+          poisoned=1
+        done <<< "\$ids"
+      fi
+    else
+      say "slot \$idx: no docker socket at \$sock -- the manifest's ids were not checked"
+    fi
+  fi
+
+  # The marker, and only the marker. This detects; the reset enforces. Removing
+  # it is a no-op on a slot that is mid-job -- a running job already cleared it
+  # -- and on an idle one it is exactly the refusal the next job needs.
+  if [ "\$poisoned" = 1 ] && [ -f "\$marker" ]; then
+    if rm -f -- "\$marker"; then
+      say "slot \$idx: clean marker withdrawn -- the next job on this slot is refused until a reset earns it back"
+    else
+      say "slot \$idx: could not withdraw the clean marker -- the slot is poisoned and still claims to be clean"
+    fi
+  fi
+done
+exit 0
+EOF
+  chown root:root /opt/ci/job-hooks/baked-image-audit.sh || return 1
+  chmod 0755 /opt/ci/job-hooks/baked-image-audit.sh || return 1
+
+  cat >/etc/systemd/system/ci-baked-image-audit.service <<'EOF'
+[Unit]
+Description=Re-check each slot's baked-image manifest and the state directory holding it
+
+[Service]
+Type=oneshot
+# A oneshot with no deadline blocks its own timer forever. Every call in here is
+# already bounded -- the only unbounded one would be `docker image inspect`, and
+# it carries its own `timeout` -- so this ceiling is the backstop rather than the
+# control.
+TimeoutStartSec=180
+ExecStart=/opt/ci/job-hooks/baked-image-audit.sh
+EOF
+
+  # Every 15 minutes, not every 30 seconds. The per-reset prune already runs at
+  # every job boundary, which is where a poisoning would actually be exploited;
+  # this covers the span BETWEEN boundaries on a host that has been up for days,
+  # and wants to be cheap enough that nobody turns it off. The first run waits
+  # five minutes so it does not race the boot-time `docker load`, whose manifest
+  # is only moved into place when the load finishes.
+  cat >/etc/systemd/system/ci-baked-image-audit.timer <<'EOF'
+[Unit]
+Description=Re-check the baked-image manifests every 15 minutes
+
+[Timer]
+OnBootSec=300
+OnUnitActiveSec=900
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
+  systemctl enable --now ci-baked-image-audit.timer >>/var/log/ci-host.log 2>&1 || return 1
+}
+
 # --- registry credentials for job containers ----------------------------------
 #
 # THE FAULT (Borsh-Tablet-App, first pool run): every job declaring
@@ -4264,6 +4455,14 @@ main() {
   # AFTER the host is announced ready, so a slow image load delays nothing that
   # matters: the agents are registered and already taking work by this point.
   wait_for_image_loads
+
+  # After the loads, because the manifests it re-checks are what those loads
+  # write. Fails OPEN, and deliberately: this is a detector over a control that
+  # already runs at every job boundary, so a host that could not install it is a
+  # host with the protection it always had and none of the reporting. Refusing
+  # to serve over that would cost more than it buys.
+  install_baked_image_audit ||
+    log "could not install the periodic baked-image audit — the per-reset prune still runs, but nothing re-checks the manifests between jobs"
 }
 
 main "$@"

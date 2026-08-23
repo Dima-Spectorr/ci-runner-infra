@@ -894,14 +894,14 @@ check_file() {
   # …or reached from one. A callee declares only `workflow_call` and runs with
   # the caller's pull-request context, so judging it on its own triggers reads a
   # self-hosted job with no guard as unreachable by forks.
-  if [ "$has_pr" -eq 0 ] && printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$(abs_path "$file")"; then
+  if [ "$has_pr" -eq 0 ] && printf '%s\n' "$REACHABLE_PR" | grep -cxF -- "$(abs_path "$file")" >/dev/null; then
     has_pr=1
   fi
   # The guard-blind answer, for the rules that are not RUNNER4. See
   # REACHABLE_PR_ANY: a callee behind `fork == false` still runs, for every
   # pull request from the repository itself.
   local has_pr_any="$has_pr"
-  if [ "$has_pr_any" -eq 0 ] && printf '%s\n' "$REACHABLE_PR_ANY" | grep -qxF -- "$(abs_path "$file")"; then
+  if [ "$has_pr_any" -eq 0 ] && printf '%s\n' "$REACHABLE_PR_ANY" | grep -cxF -- "$(abs_path "$file")" >/dev/null; then
     has_pr_any=1
   fi
 
@@ -929,13 +929,13 @@ check_file() {
       # GitHub does not distinguish `Windows` from `windows`, and a gate that
       # did would read the capitalised spelling every consumer actually writes
       # as some other pool entirely and say nothing about it.
-      if printf '%s' "$label" | grep -qiE "^(${WINDOWS_LABEL})$"; then
+      if printf '%s' "$label" | grep -ciE "^(${WINDOWS_LABEL})$" >/dev/null; then
         windows_pool=1
       fi
-      if printf '%s' "$label" | grep -qiE "^self-hosted$"; then
+      if printf '%s' "$label" | grep -ciE "^self-hosted$" >/dev/null; then
         self_hosted=1
       else
-        printf '%s' "$label" | grep -qiE "^(${GENERIC})$" || scoped=1
+        printf '%s' "$label" | grep -ciE "^(${GENERIC})$" >/dev/null || scoped=1
       fi
     done <<EOF
 $labels
@@ -990,7 +990,7 @@ EOF
     # and can resolve to 360, and this gate cannot read the variable. Reported
     # rather than passed, on the same rule RUNNER5 follows for `runs-on`.
     if [ "$has_timeout" -eq 1 ]; then
-      if printf '%s' "$timeout" | grep -qE '^[0-9]+$'; then
+      if printf '%s' "$timeout" | grep -cE '^[0-9]+$' >/dev/null; then
         if [ "$timeout" -ge "$MAX_TIMEOUT" ]; then
           err RUNNER6 "$rel: job '$job' declares timeout-minutes: $timeout, which is not below the $MAX_TIMEOUT-minute ceiling — it bounds nothing GitHub was not already bounding"
         fi
@@ -1230,7 +1230,7 @@ compute_reachable() {
     # spelled differently: the caller was whatever the invocation passed —
     # `.github/workflows/ci.yml` in the documented `<file>...` mode — while a
     # `./…` call target was resolved to an absolute path here. The seeds were
-    # then relative, the targets absolute, and `grep -qxF` matched neither
+    # then relative, the targets absolute, and the membership test matched neither
     # against the other, so reachability silently computed to nothing on the
     # exact invocation the usage line documents. `check_file` canonicalises the
     # same way before asking whether its file is in the set.
@@ -1273,8 +1273,8 @@ EOF
     changed=0
     while IFS=$'\t' read -r caller target; do
       [ -n "${target:-}" ] || continue
-      printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$caller" || continue
-      printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$target" && continue
+      printf '%s\n' "$REACHABLE_PR" | grep -cxF -- "$caller" >/dev/null || continue
+      printf '%s\n' "$REACHABLE_PR" | grep -cxF -- "$target" >/dev/null && continue
       REACHABLE_PR="$REACHABLE_PR$target"$'\n'
       changed=1
     done <<EOF
@@ -1290,8 +1290,8 @@ EOF
     changed=0
     while IFS=$'\t' read -r target caller _cjob; do
       [ -n "${caller:-}" ] || continue
-      printf '%s\n' "$REACHABLE_PR_ANY" | grep -qxF -- "$caller" || continue
-      printf '%s\n' "$REACHABLE_PR_ANY" | grep -qxF -- "$target" && continue
+      printf '%s\n' "$REACHABLE_PR_ANY" | grep -cxF -- "$caller" >/dev/null || continue
+      printf '%s\n' "$REACHABLE_PR_ANY" | grep -cxF -- "$target" >/dev/null && continue
       REACHABLE_PR_ANY="$REACHABLE_PR_ANY$target"$'\n'
       changed=1
     done <<EOF
@@ -2614,7 +2614,7 @@ main() {
     *) echo "::error::[RUNNER0] --forks must be 'allowed' or 'blocked', got '$forks'"; return 1 ;;
   esac
 
-  if ! printf '%s' "$MAX_TIMEOUT" | grep -qE '^[1-9][0-9]*$'; then
+  if ! printf '%s' "$MAX_TIMEOUT" | grep -cE '^[1-9][0-9]*$' >/dev/null; then
     echo "::error::[RUNNER0] --max-timeout must be a positive integer, got '$MAX_TIMEOUT'"
     return 1
   fi
