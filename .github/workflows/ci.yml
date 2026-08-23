@@ -299,6 +299,13 @@ jobs:
       - name: multi-pool self-test
         run: bash scripts/ci/multi-pool.selftest.sh
 
+      # The seam between a pool and the controller that serves it: a
+      # `pool_descriptor` output on one side, a jq parser on the other, and
+      # Terraform checking neither. A key the parser never reads is not an
+      # error anywhere — the column it was meant to fill just takes its default.
+      - name: controller module self-test
+        run: bash scripts/ci/controller-module.selftest.sh
+
       - name: drain-decision self-test
         run: bash scripts/ci/drain-decision.selftest.sh
 
