@@ -63,11 +63,19 @@ jobs:
   # ---------------------------------------------------------------------------
   anchor:
     name: Shared infra (anchor)
-    # RUNNER4. The anchor names its pool directly, so it cannot use the
-    # fork-routing idiom the consumers below use, and needs the guard in its own
-    # `if:`. Fork code never reaches a credentialed warm host.
-    if: github.event.pull_request.head.repo.fork == false
-    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    # RUNNER4, and NOT `if: fork == false`.
+    #
+    # A guard in the anchor's `if:` looks equivalent and is not: a job that
+    # `needs:` a SKIPPED job is itself skipped, so guarding the anchor skips
+    # every consumer with it and a fork pull request gets no CI at all — the
+    # routing expression on `test` below would never even be evaluated. The
+    # failure is silent, because a skipped required check is not a red one.
+    #
+    # So the anchor routes instead of skipping. On a fork it runs on a
+    # GitHub-hosted image, which is what keeps fork code off a credentialed
+    # warm host, and it publishes a hosted array so the whole run degrades
+    # together.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","gcp","ExampleRepo"]') }}
     # The bring-up and nothing else.
     timeout-minutes: 15
     env:
@@ -76,6 +84,11 @@ jobs:
       # host does not publish it, the workflow owns it, and it belongs next to
       # the timeouts it has to cover.
       CI_PIN_TTL: 90m
+      # Read in the step below, because the fork answer decides what this job
+      # publishes and `${{ }}` in a `run:` is interpolated before the shell
+      # sees it — an untrusted value belongs in an env var, never spliced into
+      # a command line.
+      IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
     outputs:
       # A JSON ARRAY consumed with fromJSON. Appending an empty label to a
       # literal list yields a label that matches no runner, which queues until
@@ -92,11 +105,31 @@ jobs:
         run: |
           set -euo pipefail
 
+          # A fork pull request runs entirely on GitHub-hosted runners: no warm
+          # host, no pin, and no shared stack. `addr` and `pg` are published
+          # EMPTY rather than omitted, so a consumer that reads them gets an
+          # obviously-blank value instead of the literal string `null` from a
+          # missing output. A suite that needs the stack has to bring up its own
+          # throwaway service on this leg, or not run on forks.
+          if [ "${IS_FORK:-false}" = "true" ]; then
+            {
+              echo 'runs-on=["ubuntu-latest"]'
+              echo "addr="
+              echo "pg="
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice::fork pull request — the whole run stays on hosted runners"
+            exit 0
+          fi
+
           # Set by the host at boot. Absent means this host predates the
           # contract: degrade to unpinned scheduling, do not fail. A gate that
           # bricks every run on an old host is a gate that gets reverted.
           if [ -z "${CI_HOST_LABEL:-}" ]; then
-            echo 'runs-on=["self-hosted","linux","gcp","ExampleRepo"]' >> "$GITHUB_OUTPUT"
+            {
+              echo 'runs-on=["self-hosted","linux","gcp","ExampleRepo"]'
+              echo "addr="
+              echo "pg="
+            } >> "$GITHUB_OUTPUT"
             echo "::notice::host predates the affinity contract — running unpinned"
             exit 0
           fi
@@ -117,7 +150,11 @@ jobs:
           # `--reserve-slot` is what keeps the stack alive after this job ends.
           if [ "$(ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL" --reserve-slot \
                     | sed -n 's/^pinned=//p')" != 1 ]; then
-            echo 'runs-on=["self-hosted","linux","gcp","ExampleRepo"]' >> "$GITHUB_OUTPUT"
+            {
+              echo 'runs-on=["self-hosted","linux","gcp","ExampleRepo"]'
+              echo "addr="
+              echo "pg="
+            } >> "$GITHUB_OUTPUT"
             echo "::notice::another run holds this host — running unpinned"
             exit 0
           fi
@@ -167,6 +204,12 @@ jobs:
   windows:
     name: Test (Windows)
     needs: [anchor]
+    # Here the guard IS a skip, and that is the right answer: there is no
+    # hosted substitute for what this leg tests, and fork code must not reach a
+    # warm host. Nothing cascades from it — the anchor above routes rather than
+    # skipping, so a fork run loses this job and keeps the rest. A repository
+    # whose lane model makes this check REQUIRED has to let a skip satisfy it,
+    # or forks will sit blocked on a job that was never going to run.
     if: github.event.pull_request.head.repo.fork == false
     runs-on: [self-hosted, Windows, gcp, ExampleRepo]
     timeout-minutes: 30
