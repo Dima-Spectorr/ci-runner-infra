@@ -64,9 +64,12 @@ inputs:
     required: true
   addr:
     description: >-
-      The anchor's `addr` output. Empty, or equal to this host, means the stack
-      is on this machine and the URL uses loopback. Present and different means
-      the caller is reaching it across the VPC.
+      The anchor's `addr` output — the host's VPC address, which is what a
+      consumer dials even when it landed on the same machine. `127.0.0.1` is
+      wrong from a sibling slot: each slot has its own network namespace, so
+      loopback there is the slot, not the host. The anchor publishes `addr` and
+      `pg` together, so an empty `addr` beside a non-empty `pg` should not
+      happen; the loopback branch below is a guard, not a mode.
     required: false
     default: ''
   image:
@@ -151,9 +154,12 @@ runs:
         [ -z "$DB_PASSWORD" ] || auth="${DB_USER}:${DB_PASSWORD}"
 
         if [ -n "$PG" ]; then
-          # The shared stack. Loopback when the anchor's host is this host —
-          # `addr` empty means the anchor published none — and the VPC address
-          # otherwise, which is the same address rule 3 has the Windows leg use.
+          # The shared stack, at the host's VPC address — the same address rule
+          # 3 has the Windows leg use, and the right one even for a job that
+          # landed on the anchor's own machine: a sibling slot has its own
+          # network namespace, so `127.0.0.1` there is the slot and not the
+          # host. The loopback line is a guard against an `addr` the anchor
+          # should never have published empty beside a port.
           host="127.0.0.1"
           [ -z "$ADDR" ] || host="$ADDR"
           publish "postgres://${auth}@${host}:${PG}/${DB_NAME}" "$PG" 1
