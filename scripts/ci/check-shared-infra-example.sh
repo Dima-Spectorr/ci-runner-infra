@@ -110,7 +110,7 @@ mutate() { # <rule-id> <description> <sed-program>
     return
   fi
   got="$(bash "$GATE" "${FLAGS[@]}" "$tmp" 2>&1)"
-  if printf '%s' "$got" | grep -q "\[$id\]"; then
+  if printf '%s' "$got" | grep -c "\[$id\]" >/dev/null; then
     ok
   else
     bad "the example no longer exercises $id — $desc, and the gate still reports it clean:

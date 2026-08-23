@@ -901,7 +901,7 @@ check_file() {
   # REACHABLE_PR_ANY: a callee behind `fork == false` still runs, for every
   # pull request from the repository itself.
   local has_pr_any="$has_pr"
-  if [ "$has_pr_any" -eq 0 ] && printf '%s\n' "$REACHABLE_PR_ANY" | grep -qxF -- "$(abs_path "$file")"; then
+  if [ "$has_pr_any" -eq 0 ] && printf '%s\n' "$REACHABLE_PR_ANY" | grep -cxF -- "$(abs_path "$file")" >/dev/null; then
     has_pr_any=1
   fi
 
@@ -1230,7 +1230,7 @@ compute_reachable() {
     # spelled differently: the caller was whatever the invocation passed —
     # `.github/workflows/ci.yml` in the documented `<file>...` mode — while a
     # `./…` call target was resolved to an absolute path here. The seeds were
-    # then relative, the targets absolute, and `grep -qxF` matched neither
+    # then relative, the targets absolute, and the membership test matched neither
     # against the other, so reachability silently computed to nothing on the
     # exact invocation the usage line documents. `check_file` canonicalises the
     # same way before asking whether its file is in the set.
@@ -1290,8 +1290,8 @@ EOF
     changed=0
     while IFS=$'\t' read -r target caller _cjob; do
       [ -n "${caller:-}" ] || continue
-      printf '%s\n' "$REACHABLE_PR_ANY" | grep -qxF -- "$caller" || continue
-      printf '%s\n' "$REACHABLE_PR_ANY" | grep -qxF -- "$target" && continue
+      printf '%s\n' "$REACHABLE_PR_ANY" | grep -cxF -- "$caller" >/dev/null || continue
+      printf '%s\n' "$REACHABLE_PR_ANY" | grep -cxF -- "$target" >/dev/null && continue
       REACHABLE_PR_ANY="$REACHABLE_PR_ANY$target"$'\n'
       changed=1
     done <<EOF
