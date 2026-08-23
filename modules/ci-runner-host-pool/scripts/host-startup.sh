@@ -664,12 +664,12 @@ chmod 0750 "\$home" || { say "slot \$idx: could not chmod \$home"; rc=1; }
 
 # THE WORK FOLDER. Absent until the slot's first job, which is not a failure.
 #
-# The slot OWNS $SLOT_ROOT/$idx -- install_slot chowns the whole runner copy to
+# The slot OWNS \$SLOT_ROOT/\$idx -- install_slot chowns the whole runner copy to
 # it, because config.sh writes .runner and .credentials there -- so the slot can
 # create, rename and replace names inside it, including _work itself. That makes
 # every path below a name an untrusted account controls, and root is the one
 # walking them. Two things follow, and this is the same namespace-ownership rule
-# provision_slot_user states on $SLOT_STATE/$idx: root operates on a leaf inside
+# provision_slot_user states on \$SLOT_STATE/\$idx: root operates on a leaf inside
 # a directory root owns, never inside one the slot owns.
 #
 # So _work is RENAMED into a root-owned holding directory for the duration and
@@ -926,6 +926,18 @@ fi
 [ "\$fail_after" = 1 ] && exit 1
 exit "\$rc"
 EOF
+  # A here-document is expanded BEFORE cat ever runs, and this script runs under
+  # `set -u`. One unescaped name in the body above -- in a comment line as
+  # readily as in code -- aborts that expansion, and because the `>` redirect
+  # has already truncated the target the failure leaves a ZERO-BYTE file with
+  # the right owner and the right mode. Every slot unit then dies on
+  # `ExecStartPre` with `Exec format error` (203/EXEC), on a host that went on
+  # to announce itself ready. Measured 2026-08-23: eight of eleven hosts served
+  # nothing for hours this way. So the write is not trusted, it is checked.
+  [ -s /opt/ci/job-hooks/slot-reset.sh ] ||
+    { log "slot-reset.sh came out empty -- a name in its here-document did not expand"; return 1; }
+  bash -n /opt/ci/job-hooks/slot-reset.sh ||
+    { log "slot-reset.sh is not parseable -- refusing to install it"; return 1; }
   chown root:root /opt/ci/job-hooks/slot-reset.sh || return 1
   chmod 0755 /opt/ci/job-hooks/slot-reset.sh || return 1
 
@@ -3867,7 +3879,15 @@ TimeoutStopSec=3600
 WantedBy=multi-user.target
 EOF
 
-  systemctl enable --now "ci-runner@$idx.service" >>/var/log/ci-host.log 2>&1
+  # Checked, because the caller counts a failure here and the host's readiness
+  # line is computed from that count. An unchecked `enable --now` reports four
+  # slots serving on a host whose four units all failed to start.
+  if ! systemctl enable --now "ci-runner@$idx.service" >>/var/log/ci-host.log 2>&1 ||
+     ! systemctl is-active --quiet "ci-runner@$idx.service"; then
+    log "slot $idx: ci-runner@$idx.service did not start; slot will not serve"
+    systemctl status "ci-runner@$idx.service" --no-pager -l >>/var/log/ci-host.log 2>&1 || true
+    return 1
+  fi
   log "slot $idx registered as $name"
 }
 

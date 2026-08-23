@@ -390,6 +390,26 @@ variable "cooldown_period_sec" {
 
 # --- controller ---------------------------------------------------------------
 
+variable "manage_controller" {
+  description = "Whether this module creates the pool's controller VM. Set false for every pool served by a shared modules/ci-runner-controller."
+  type        = bool
+  default     = true
+
+  # DEFAULT TRUE, AND THE DEFAULT IS THE WHOLE COMPATIBILITY STORY. A pool that
+  # says nothing keeps the controller it has, keeps its name, keeps its metadata
+  # key set, and plans no change — no state move, no VM replaced, nothing to
+  # coordinate across fourteen repositories on one afternoon.
+  #
+  # Set false and this module builds a pool with NO control plane of its own. It
+  # is then inert until some controller is told about it: an ONLY_UP autoscaler
+  # holds whatever size it last had and nothing ever drains a host, which from
+  # every dashboard looks like a quiet pool rather than an abandoned one. The
+  # only safe way to set it is together with a modules/ci-runner-controller that
+  # carries this pool's descriptor in its `pools` list — which is why the
+  # descriptor is an output of this module rather than something a consumer
+  # retypes.
+}
+
 variable "controller_machine_type" {
   description = <<-EOT
     Always-on controller VM. It polls GitHub outbound (no inbound webhook is
