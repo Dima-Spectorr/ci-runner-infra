@@ -390,6 +390,31 @@ jobs:
       - name: host-startup self-test
         run: bash scripts/ci/host-startup.selftest.sh
 
+      # host-startup.selftest.sh is structural, and the slot-reset bug of
+      # 2026-08-23 walked straight past it: the code said "recreate the
+      # directory" and did, one level above the directory the runner chdirs
+      # into. Every job the reset deliberately failed then failed the SLOT, and
+      # nine of them across three hosts took the fleet down. This one extracts
+      # the generated hook and runs it.
+      - name: slot-reset workspace self-test
+        run: bash scripts/ci/slot-reset-workspace.selftest.sh
+
+      # And the same script's slot lifecycle, RUN rather than read. The gate
+      # above is text: it asks whether a control is present and proves the
+      # question can fail by deleting the control. That cannot see a property
+      # that lives between three individually correct lines, which is what
+      # condemned twelve of IntegrateIT's twenty-four slots on 2026-08-23 --
+      # every structural assertion passed throughout the outage. This one
+      # extracts slot-reset.sh and slot-sweep.sh exactly as a host writes them
+      # and drives boot/started/completed against a real slot tree.
+      #
+      # It needs root, which is why it lives in the ubuntu-latest job and not
+      # on the pool: the reset chowns a home and empties directories owned by
+      # another uid, and as anyone else it would report a partial wipe as a
+      # completed one. It FAILS rather than skips if it cannot get root.
+      - name: slot lifecycle behaviour
+        run: sudo -n bash scripts/ci/slot-lifecycle.behaviour.sh
+
       # The band's two constants live in two files in two languages, because
       # the network module is created once per project and deliberately does
       # not depend on the pools. A firewall span narrower than the DNAT range

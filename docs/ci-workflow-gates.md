@@ -55,12 +55,12 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER2` | with `--scope=<label>`, it is THAT label |
 | `RUNNER3` | every job that runs steps declares `timeout-minutes` (see the note below) |
 | `RUNNER4` | a fork-reachable workflow keeps fleet-reachable jobs behind a fork guard |
-| `RUNNER5` | the runner is selected dynamically — reported as UNDECIDED, not passed |
+| `RUNNER5` | the runner is selected dynamically — reported as UNDECIDED, not passed; declarable per repository (`--allow-dynamic-runner`) or per job (`# dynamic-runner-allowed(<job>, #<issue>)`) |
 | `RUNNER6` | and the declared timeout is below the default it replaces |
 | `RUNNER7` | a REMOTE reusable workflow's jobs are not in this repository — UNDECIDED, declarable per callee |
 | `RUNNER8` | a job on a **Windows** pool label declares `container:` or `services:`, which that pool cannot run |
 | `RUNNER9` | with `--shared-infra`, a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the anchor job's output, or is the anchor, or carries a declared exemption |
-| `RUNNER10` | with `--shared-infra`, at most **one** job invocation across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# shared-infra-owner(<job>)` markers counted together, because a repository that has adopted the contract has no `services:` left to count |
+| `RUNNER10` | with `--shared-infra`, at most **one** job invocation across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# shared-infra-owner(<job>)` markers counted together, including on a `uses:` job, because a repository that has adopted the contract has no `services:` left to count and its anchor is a call |
 | `RUNNER11` | with `--shared-infra`, a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
 | `RUNNER12` | a route onto the **merge-queue** pool also requires the head branch to live in this repository and the author to be `mergify[bot]` — not the branch name alone |
 | `RUNNER13` | and the label sets it routes between are mutually non-superset, so neither pool can be scheduled onto the other's hosts |
@@ -130,6 +130,16 @@ what an anchor becomes once it outgrows `services:`. Declaring it makes the job
 an anchor for `RUNNER9` and an owner for `RUNNER10` — the same fact, used by
 both rules.
 
+It is also the **only** evidence available once the anchor moves behind a
+`uses:`, which is where this contract's own adoption path puts it: the body is
+published once as
+[`shared-infra-anchor.yml`](../.github/workflows/shared-infra-anchor.yml) and
+each repository calls it. Such a caller has no `runs-on`, no `services:` and
+nothing else to read, so it is counted as an owner **when, and only when, it
+declares itself one**. Without that, a repository could call the anchor *and*
+keep a second job with its own `services:` block, and `RUNNER10` would count one
+owner and report two stacks clean.
+
 An **exemption** is `RUNNER7`'s shape reused: beside the job, naming the job,
 with an issue. It answers both rules the job can be the subject of, because a
 marker that silenced one while leaving the other red would be read as the gate
@@ -139,6 +149,26 @@ Both name their job because a YAML reader has discarded comments by the time it
 yields a job, so a bare marker cannot be attributed to one — and a bare marker
 is also un-reviewable: it would excuse whatever the file contains after the next
 change, including a job added later that nobody weighed.
+
+### `RUNNER5` can be answered per job as well as per repository
+
+```
+# dynamic-runner-allowed(<job-id>, #<issue>): <who scopes the value>
+```
+
+`--allow-dynamic-runner` is the right answer for a repository where every fleet
+job resolves its pool from one anchor: one property, one declaration. It is the
+wrong answer for a repository with **one** dynamic job, because the flag also
+excuses the next one — added by an unrelated change, from a CI invocation the
+reviewer of that job never sees.
+
+This repository is now the second kind. `shared-infra-anchor.yml` takes its pool
+label as a `workflow_call` input, so its `runs-on` is an expression by
+construction and always will be, while every other workflow here is
+GitHub-hosted and must stay checkable. The marker asserts exactly what the flag
+asserts, narrowed to one job: a human read where the value comes from and
+accepted that whoever supplies it scopes it. The issue is where that reading
+lives, which is why a marker without one does not count.
 
 ### `RUNNER10` is counted across files, and reported once
 

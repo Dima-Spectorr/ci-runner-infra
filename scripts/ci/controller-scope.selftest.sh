@@ -1084,3 +1084,85 @@ check "gate/mutation: not capturing the worker count makes the gate inert" \
 
 echo "controller-scope selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
+
+# --- #278: capacity that ANSWERS, and the gap ---------------------------------
+#
+# ci_slots_total is arithmetic — hosts × slots — so it reads exactly the same
+# whether every agent registered or none did. Three separate outages hid in that
+# gap: a host that registered nothing (#130), a host whose slot units died at
+# ExecStartPre (#268), and a slot the host's own sweep condemned and stopped
+# after it failed to reach a clean state CONDEMN_MAX times (#278). All three
+# subtract from the count of slots that answer, and none of them was published.
+#
+# host_facts() has always computed that count and thrown it away. It is run for
+# real here, because the one thing that must not happen is a BLIND tick reading
+# as an outage: an unreadable runner list knows nothing about any host, and a
+# host summed as having zero slots is indistinguishable from a host that lost
+# them — which would page on exactly the ticks where nothing is known.
+hf() { # <runners-json> <slots> <host>
+  (
+    set -uo pipefail
+    eval "$(fn host_facts)"
+    # Read by host_facts, which arrived through the eval above — no static
+    # reader can see that, so both names look dead here and neither is.
+    # shellcheck disable=SC2034
+    RUNNERS_JSON="$1"
+    # shellcheck disable=SC2034
+    SLOTS="$2"
+    HOST_BUSY=0
+    HOST_PRESENT=0
+    HOST_REG=""
+    host_facts "$3"
+    printf '%s|%s|%s' "$HOST_PRESENT" "$HOST_BUSY" "$HOST_REG"
+  ) 2>&1
+}
+
+FULL='{"runners":[
+  {"name":"ci-lin-a1b2-s1","busy":true},
+  {"name":"ci-lin-a1b2-s2","busy":false},
+  {"name":"ci-lin-a1b2-s3","busy":false},
+  {"name":"ci-lin-a1b2-s4","busy":false},
+  {"name":"ci-lin-zzzz-s1","busy":true}
+]}'
+
+check "slots: a fully registered host reports every slot, and only its own" \
+  "4|1|present" "$(hf "$FULL" 4 ci-lin-a1b2)"
+
+# The #278 shape: one slot condemned and its agent stopped, so it is simply not
+# in the list any more. The host is still RUNNING, still serving on the other
+# three, and every existing series reads healthy.
+CONDEMNED='{"runners":[
+  {"name":"ci-lin-a1b2-s1","busy":true},
+  {"name":"ci-lin-a1b2-s2","busy":false},
+  {"name":"ci-lin-a1b2-s3","busy":false}
+]}'
+check "slots: a condemned slot is missing from the count, not from the pool" \
+  "3|1|partial" "$(hf "$CONDEMNED" 4 ci-lin-a1b2)"
+
+# The #268 shape: the host booted, announced itself, and registered nothing.
+check "slots: a host that registered nothing reads as zero, not as unknown" \
+  "0|0|absent" "$(hf '{"runners":[]}' 4 ci-lin-a1b2)"
+
+# THE ONE THAT MUST NOT BE ZERO. A tick that could not read the list is not
+# evidence about any host in either direction.
+check "slots: a blind tick reports -1, which the sum skips entirely" \
+  "-1|0|unknown" "$(hf '' 4 ci-lin-a1b2)"
+
+# And the sum itself: the three guards that keep ordinary scale-out from moving
+# the series. A host still inside its registration grace has not registered YET,
+# a host that is not RUNNING is arriving or leaving, and a blind tick knows
+# nothing — each has to be excluded, or the gap is non-zero on every scale event
+# and the alert built on it is turned off within a week.
+_guards=$(sed -n '/SLOTS THAT ANSWER/,/^    fi$/p' "$CTRL")
+# The needles are the controller's text, so they must NOT expand here.
+# shellcheck disable=SC2016
+for needle in '"$HOST_PRESENT" -ge 0' '"$status" = "RUNNING"' '"$age" -ge "$REGISTER_GRACE"'; do
+  case "$_guards" in
+    *"$needle"*) r=yes ;;
+    *) r=no ;;
+  esac
+  check "slots: the sum excludes on [$needle]" yes "$r"
+done
+
+check "slots: both series are published" "2" \
+  "$(grep -cE 'queue_series "ci_slots_(registered|missing)"' "$CTRL")"
