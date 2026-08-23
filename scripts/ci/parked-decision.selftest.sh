@@ -144,7 +144,7 @@ deny() { # <expected: yes|no> <name> <status>
   fi
 }
 
-deny yes "403 is the missing checks:read permission, the whole reason for this" 403
+deny yes "403 is a missing 'checks: read' or 'pull_requests: read', the whole reason for this" 403
 deny yes "401 is a rejected installation token, equally permanent" 401
 deny yes "404 on a sha the same token just listed is a permission answer" 404
 
