@@ -75,6 +75,16 @@ METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 QUEUE_BASE=$(md "instance/attributes/ci-queue-base")
 : "${QUEUE_BASE:=main}"
 
+# Empty unless the root turned autohealing on. NO DEFAULT, deliberately — the
+# other way round from QUEUE_BASE above. An absent attribute must mean "do not
+# listen": this is the machine holding the App installation token, and a
+# defaulted port would open a socket on every controller in the fleet to answer
+# a probe nobody configured.
+HEALTH_PORT=$(md "instance/attributes/ci-health-port")
+case "$HEALTH_PORT" in
+  '' | *[!0-9]*) HEALTH_PORT="" ;;
+esac
+
 # --- the pool table ----------------------------------------------------------
 #
 # ONE controller, N pools. Everything that describes A pool — its MIG, its
@@ -3192,6 +3202,86 @@ AccuracySec=10s
 WantedBy=timers.target
 WDTIMEOF
 
+  # --- liveness responder (#308) ---------------------------------------------
+  #
+  # Installed ONLY when the root asked for autohealing. Without it no port is
+  # opened, which is the default and the state every controller in the fleet is
+  # in until an operator changes it.
+  #
+  # What it answers matters more than that it answers. The managed group's
+  # health check is the one thing in this design authorised to DELETE the
+  # control plane, so a responder that returns 200 merely because a process is
+  # listening would license a rebuild loop against a controller that is fine,
+  # and license nothing against one that is wedged — the wedge keeps the socket
+  # open. So the verdict is the heartbeat's age, the same file the watchdog
+  # reads, against a threshold deliberately WIDER than the watchdog's: the
+  # watchdog restarts a unit, this deletes a machine, and the cheaper remedy
+  # must get first refusal.
+  if [ -n "$HEALTH_PORT" ]; then
+    cat >/opt/ci-controller/livez.py <<LIVEZEOF
+import http.server, os, time
+
+HB = "$STATE_DIR/heartbeat"
+THRESHOLD = $((wd_threshold * 3))
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?")[0] != "/livez":
+            self.send_response(404); self.end_headers(); return
+        try:
+            age = int(time.time() - os.stat(HB).st_mtime)
+        except OSError:
+            # No heartbeat file yet. The group's initial_delay_sec covers a
+            # controller that has not reached its first tick; past that, an
+            # absent heartbeat is the same as an ancient one.
+            age = THRESHOLD + 1
+        ok = age < THRESHOLD
+        self.send_response(200 if ok else 503)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(("age=%d threshold=%d\n" % (age, THRESHOLD)).encode())
+
+    def log_message(self, *a):
+        # A probe every 30s, forever. Logging it buries the controller's own log.
+        pass
+
+http.server.HTTPServer(("0.0.0.0", $HEALTH_PORT), H).serve_forever()
+LIVEZEOF
+    chmod 0644 /opt/ci-controller/livez.py
+
+    cat >/etc/systemd/system/ci-controller-livez.service <<'LIVEZSVCEOF'
+[Unit]
+Description=CI controller liveness responder — 200 while the tick heartbeat is fresh
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/ci-controller/livez.py
+Restart=always
+RestartSec=10
+# It reads one file's mtime and writes a fixed string. Nothing it does needs
+# the controller's identity, and it is the only thing on this VM listening on a
+# port, so it runs as nobody.
+User=nobody
+Group=nogroup
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+LIVEZSVCEOF
+  else
+    # Autohealing was turned OFF on a controller that previously had it on. The
+    # unit file survives the reboot on the boot disk, so leaving it alone would
+    # keep the port open after the operator asked for it to close.
+    if [ -f /etc/systemd/system/ci-controller-livez.service ]; then
+      systemctl disable --now ci-controller-livez.service >>"$LOG" 2>&1 || true
+      rm -f /etc/systemd/system/ci-controller-livez.service /opt/ci-controller/livez.py
+      log "liveness responder removed — autohealing is off"
+    fi
+  fi
+
   systemctl daemon-reload
   systemctl enable ci-controller.service
   systemctl enable ci-controller-watchdog.timer
@@ -3212,7 +3302,14 @@ WDTIMEOF
   # a tick started over loses nothing.
   systemctl restart ci-controller.service
   systemctl restart ci-controller-watchdog.timer
-  log "controller installed for $REPO_FULL pool=$POOL mig=$MIG poll=${POLL}s grace=${GRACE}s slots=$SLOTS watchdog=${wd_threshold}s"
+  if [ -n "$HEALTH_PORT" ]; then
+    systemctl enable ci-controller-livez.service >>"$LOG" 2>&1 || true
+    # RESTART for the same reason as the controller above: the previous
+    # version's livez.py is already on disk and its unit already running, so
+    # `enable --now` would leave the old responder serving the new threshold.
+    systemctl restart ci-controller-livez.service >>"$LOG" 2>&1 || true
+  fi
+  log "controller installed for $REPO_FULL pool=$POOL mig=$MIG poll=${POLL}s grace=${GRACE}s slots=$SLOTS watchdog=${wd_threshold}s livez=${HEALTH_PORT:-off}"
 }
 
 run_loop() {
