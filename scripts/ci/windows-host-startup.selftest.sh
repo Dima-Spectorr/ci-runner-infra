@@ -52,7 +52,7 @@
 # evidence.
 
 # Every predicate and mutation below matches the TEXT of windows-host-startup.ps1,
-# in which `$block`, `$HookPath` and `$script:JobHookPath` are the literal
+# in which `$block`, `$HookPath` and `$script:JobHookStartedPath` are the literal
 # characters that must be there. Expanding them here would compare against this
 # test's own environment and pass on any script at all — so the single quotes are
 # the point.
