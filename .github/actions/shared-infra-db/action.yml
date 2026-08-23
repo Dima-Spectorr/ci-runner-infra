@@ -34,9 +34,13 @@
 # host-side guarantee that already exists and is already the one that has to be
 # right, since a job that dies does not run its own cleanup either.
 #
-# LINUX ONLY. The fallback needs a container runtime, and a Windows fleet host
-# has none. A Windows job reaches the shared stack across the band (rule 3) and
-# has no fallback available; if the anchor degraded, that leg has to skip.
+# THE FALLBACK IS LINUX ONLY; the action is not. The shared branch is string
+# concatenation and runs anywhere, which is how a Windows job reaches the stack
+# across the band under rule 3. Only the fallback needs a container runtime, and
+# a Windows fleet host has none — so a Windows leg has no fallback available and
+# has to skip when the anchor degrades. The fallback checks `RUNNER_OS` and
+# `docker` on PATH and fails with that sentence, rather than letting the leg die
+# on `docker: command not found` several lines later.
 #
 # USAGE — in the consuming repository:
 #
@@ -91,6 +95,14 @@ inputs:
       holding fixtures is not a secret, and putting one here would only put it
       in the workflow file; a stack that needs a real credential should pass it
       from `secrets` at the call site.
+
+      It is enforced on the FALLBACK, not merely embedded in the URL: empty
+      means the throwaway container runs with
+      `POSTGRES_HOST_AUTH_METHOD=trust`, and non-empty means it does not, so the
+      image's scram-sha-256 default applies and the credential in the URL is the
+      credential the server checks. On the SHARED branch this action starts
+      nothing, so what is accepted there is the anchor's compose file's business
+      and this value only has to match it.
     required: false
     default: ''
   database:
@@ -99,8 +111,10 @@ inputs:
     default: app
   health-timeout:
     description: >-
-      Seconds to wait for the FALLBACK to accept connections. Not applied to the
-      shared stack, which the anchor already brought up with `--wait`.
+      Seconds to wait for the FALLBACK to accept connections. A whole number of
+      seconds, validated — `90m` is rejected with a message rather than reaching
+      the arithmetic and dying as a bash syntax error. Not applied to the shared
+      stack, which the anchor already brought up with `--wait`.
     required: false
     default: '60'
 
@@ -170,6 +184,35 @@ runs:
         # No shared stack. Everything below is the degraded leg.
         echo "::notice::the anchor published no shared stack — starting a throwaway Postgres for this job alone"
 
+        # FAIL FAST, AND ONLY HERE. The two preconditions below belong to the
+        # fallback, not to the action: the shared branch above is a string
+        # concatenation and works on any runner, which is exactly how a Windows
+        # job reaches the stack across the band under rule 3. Guarding at the
+        # top of the script instead would break that.
+        #
+        # Without these the leg still fails, just later and wearing a worse
+        # error: `docker: command not found` from inside a `$(...)`, or a
+        # Windows shell's rendition of the same.
+        if [ "${RUNNER_OS:-Linux}" != "Linux" ]; then
+          echo "::error::this action's fallback is Linux-only (RUNNER_OS=${RUNNER_OS:-unset}) and the anchor published no shared stack, so there is nothing for this job to connect to. A Windows leg must skip when the anchor degrades — guard the job on the anchor's \`addr\` output being non-empty."
+          exit 1
+        fi
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "::error::the fallback needs a container runtime and \`docker\` is not on PATH. On a fleet host this means the slot's rootless daemon did not come up; on any other runner it means this job cannot use the fallback at all."
+          exit 1
+        fi
+
+        # `health-timeout` reaches the arithmetic below, where a non-integer is
+        # a bash syntax error under `set -e` rather than a message anyone can
+        # act on. `90m` is the plausible mistake: the input is seconds, and
+        # every neighbouring GitHub knob (`timeout-minutes`) is not.
+        case "$HEALTH_TIMEOUT" in
+          '' | *[!0-9]*)
+            echo "::error::health-timeout must be a whole number of seconds; got '${HEALTH_TIMEOUT}'"
+            exit 1
+            ;;
+        esac
+
         # `127.0.0.1::5432`, three fields on purpose: bind to loopback, let the
         # kernel pick the host port. A fixed port collides with the sibling
         # slots that share this host's loopback, and a band port collides with
@@ -179,12 +222,28 @@ runs:
         # No `--rm`: the host reaps the slot's containers at job end, and `--rm`
         # would delete the container the moment it exited, taking its logs with
         # it in exactly the case worth reading them.
+        # AUTH FOLLOWS THE `password` INPUT, because it used to not. This ran
+        # with `POSTGRES_HOST_AUTH_METHOD=trust` unconditionally while also
+        # setting a password, so a caller who passed one got it embedded in the
+        # returned URL and a container that accepted every other credential
+        # too. That is the worst shape available: the input reads as enforced,
+        # the suite passes, and nothing reports that the fallback was open to
+        # anything on the slot's loopback.
+        #
+        # Empty password keeps `trust`, which is the documented normal case for
+        # a CI fixture database and matches what the anchor's compose does.
+        # A non-empty one drops `trust` entirely and lets the image default to
+        # scram-sha-256, so the URL's credential is the credential.
+        auth_env=(--env "POSTGRES_PASSWORD=${DB_PASSWORD}")
+        if [ -z "$DB_PASSWORD" ]; then
+          auth_env=(--env POSTGRES_HOST_AUTH_METHOD=trust)
+        fi
+
         cid="$(docker run --detach \
                  --publish '127.0.0.1::5432' \
                  --env "POSTGRES_USER=${DB_USER}" \
-                 --env "POSTGRES_PASSWORD=${DB_PASSWORD:-postgres}" \
+                 "${auth_env[@]}" \
                  --env "POSTGRES_DB=${DB_NAME}" \
-                 --env POSTGRES_HOST_AUTH_METHOD=trust \
                  -- "$IMAGE")"
 
         # `docker port` and not a hard-coded guess: the kernel chose it.

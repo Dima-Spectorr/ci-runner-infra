@@ -317,9 +317,12 @@ The rule therefore reads the **label**. `container:` on the Linux pool is how
 that pool is meant to be used, and a hosted `windows-2022` image is not this
 fleet and does run containers; only a fleet-reachable job naming the `windows`
 platform label is refused, case-insensitively, and a matrix is judged per leg.
-`scripts/ci/check-runner-policy.selftest.sh` mutates the gate nineteen ways and
-asserts its fixture suite FAILS for each — a detector that has not been seen to
-fire is not a detector.
+`scripts/ci/check-runner-policy.selftest.sh` mutates the gate and asserts its
+fixture suite FAILS for each mutation — a detector that has not been seen to
+fire is not a detector. The count lives in that file and nowhere else: it prints
+what it ran and asserts a floor on it, so a number written here would be a
+second source of truth, and this sentence said "nineteen" while the file held
+twenty-five.
 
 ### The worked example is checked, so the thing you copy cannot rot
 
