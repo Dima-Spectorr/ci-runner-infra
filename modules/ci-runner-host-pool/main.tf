@@ -59,6 +59,19 @@ locals {
 
   # `self-hosted` is what workflows match on today across the fleet; the pool
   # name is what lets a repository address THIS pool specifically.
+  #
+  # THIS IS NOT THE SET A JOB IS ROUTED AGAINST, and the difference cost this
+  # fleet every scale-out it never performed. The agent registers three labels
+  # of its own that no `--labels` argument produces and none of these can
+  # remove — GitHub calls them `read-only`: `self-hosted`, the OS (`Linux` /
+  # `Windows`) and the architecture (`X64`). No pool here is configured with an
+  # OS label because of that, and every workflow in the fleet asks for one, so
+  # the controller — which subtracted this list and only this list — had a
+  # label left over on every job and counted none of them. The controller now
+  # derives its own match set from this plus `ci-host-os`; see P_MATCH_JSON in
+  # controller-startup.sh. Adding an OS label HERE would be the wrong fix: it
+  # would be passed to `config.sh --labels` as a custom label and duplicate the
+  # read-only one.
   runner_labels = join(",", concat(["self-hosted", var.name], var.runner_labels))
 
   # ONE expression for this pool's slice of the shared cache bucket, read by both
@@ -696,9 +709,11 @@ resource "google_compute_instance" "controller" {
     "ci-app-installation-id" = var.github_app_installation_id
     "ci-app-key-secret"      = var.github_app_private_key_secret
     "ci-pool"                = var.name
-    # The same key the hosts read. Demand is counted by GitHub's superset rule
-    # against THIS list, so a controller without it matches no job at all,
-    # reports zero demand forever, and the pool never leaves zero hosts.
+    # The same key the hosts read, and the base of the set demand is counted
+    # against — the controller adds the agent's read-only labels to it and folds
+    # the case before it applies GitHub's superset rule. A controller without
+    # this key matches no job at all, reports zero demand forever, and the pool
+    # never leaves zero hosts.
     "ci-runner-labels"           = local.runner_labels
     "ci-host-os"                 = var.host_os
     "ci-mig-name"                = google_compute_region_instance_group_manager.hosts.name
