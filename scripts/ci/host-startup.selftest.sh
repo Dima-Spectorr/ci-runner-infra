@@ -1071,6 +1071,56 @@ has_slot_sweep() { # <file>
   matches "$code" '/opt/ci/job-hooks/slot-reset\.sh completed "\\\$idx"' || return 1
 }
 
+# #278 — A SLOT THAT FAILS EVERY JOB IS STILL CAPACITY.
+#
+# The sweep above removes the largest source of condemned slots; it cannot
+# remove the class. A reset that genuinely cannot finish — a container that will
+# not die, a tag that will not drop, a `_work` the slot recreated under us —
+# withholds the marker ON PURPOSE, and that slot then refuses every job it is
+# handed, in about six seconds each. Six seconds is faster than a healthy slot
+# can claim work, so the broken one preferentially WINS the queue.
+#
+# Three properties, and each is a separate way the fleet stayed blind: it has to
+# be counted, it has to be taken out of service, and the gap it leaves has to
+# reach a series someone can alert on.
+has_slot_condemn() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # COUNTED, in the root-owned directory that already holds the marker. A slot
+  # that could write this could forge the claim that it is healthy, which is the
+  # claim this exists to withdraw.
+  matches "$code" 'burns="\\\$SLOT_STATE/\\\$idx/burns"' || return 1
+  matches "$code" '^burn_add\(\) \{' || return 1
+  # a non-numeric or absent file reads as zero rather than aborting the reset
+  matches "$code" "'' \| \\*\\[!0-9\\]\\*\\) printf '0'" || return 1
+
+  # CONSECUTIVE, not lifetime. A reset that earned the marker is the only
+  # evidence that this slot can still be returned to the template state, so it
+  # is the only thing that clears the count.
+  matches "$code" 'rm -f -- "\\\$burns"' || return 1
+  # both failure shapes are counted: a job failed on arrival, and a reset that
+  # could not earn the marker
+  counts "$code" '^ *burn_add$' 2 || return 1
+  # …and 'started' clears nothing, or every job would erase the history at its
+  # own start
+  matches "$code" 'if \[ "\\\$stage" != started \]; then' || return 1
+
+  # TAKEN OUT OF SERVICE. Not disabled and not deleted — the next tick tries the
+  # reset again, so a slot whose obstruction clears recovers on its own.
+  matches "$code" '^CONDEMN_MAX=3$' || return 1
+  matches "$code" '\[ "\\\$reset_ok" = 0 \] && \[ "\\\$burns" -ge "\\\$CONDEMN_MAX" \]' || return 1
+  matches "$code" 'taking it out of service' || return 1
+  matches "$code" 'putting it back into service' || return 1
+
+  # The third property — saying so — is the controller's, because the fact is
+  # already there: a stopped agent leaves the repository's runner list, and
+  # host_facts() has always counted how many of a host's slots answer. It is
+  # published as ci_slots_missing, and it is asserted in
+  # controller-scope.selftest.sh, where the controller's own code is the subject
+  # and the mutation harness can reach it.
+}
+
 # The scripts this boot script WRITES are never run by anything here, so a
 # syntax error in either survives every text predicate above and first appears
 # on a live host as a slot that will not pin — or, worse, a sweeper that exits
@@ -1107,6 +1157,12 @@ if has_slot_sweep "$SCRIPT"; then
   ok
 else
   bad "a slot left dirty by a job that never reached its completed hook is never reset — it refuses every job afterwards, fails each one in seconds, and therefore WINS the queue ahead of healthy slots, so re-running the workflow spreads the outage instead of clearing it (IntegrateIT, 12 of 24 slots, 2026-08-23)"
+fi
+
+if has_slot_condemn "$SCRIPT"; then
+  ok
+else
+  bad "a slot that can never be returned to a clean state is left in the fleet — it fails every job it is handed in about six seconds, which is faster than a healthy slot can claim one, so it preferentially WINS queued work and nothing in the fleet says so (IntegrateIT#11107, four consecutive jobs on one slot)"
 fi
 
 if generated_scripts_parse "$SCRIPT"; then
@@ -1340,6 +1396,16 @@ mutate "teardown before the agent stops"    's@agent stopped before teardown@her
 mutate "a failed docker ps reads as empty"  's@could not list the run.s containers@nothing to see@'                           has_pin_hold
 mutate "the record dies with a failed start" 's@the agent would not start — the hold stays in place@the agent would not start@' has_pin_hold
 mutate "the marker alone proves idle"       's@! pgrep -u "@pgrep -u "@'                                                      has_pin_hold
+
+# #278. Each of these is a way the count stops meaning "in a row, right now",
+# which is the only shape the take-out-of-service rule can read.
+mutate "burns become a lifetime total"      's@^    rm -f -- "\\\$burns"$@    :@'                                             has_slot_condemn
+mutate "a burned job is not counted"        's@^  burn_add$@  :@'                                                             has_slot_condemn
+mutate "a failed reset is not counted"      's@^    burn_add$@    :@'                                                         has_slot_condemn
+mutate "the count is slot-writable"         's@burns="\\\$SLOT_STATE/\\\$idx/burns"@burns="\$home/burns"@'                    has_slot_condemn
+mutate "nothing is ever condemned"          's@^CONDEMN_MAX=3$@CONDEMN_MAX=999999@'                                           has_slot_condemn
+mutate "a condemned slot is put back"       's@\[ "\\\$reset_ok" = 0 \] \&\& \[ "\\\$burns" -ge "\\\$CONDEMN_MAX" \]@false@'  has_slot_condemn
+mutate "a recovered slot stays down"        's@putting it back into service@still down, sorry@'                               has_slot_condemn
 mutate "an orphaned hold is only logged"    's@^  publish ""$@  true@'                                                        has_pin_hold
 mutate "a held slot pruned between jobs"    's@if \[ "\\\$stage" != started \] && \[ "\\\$prune" = 1 \]@if [ "\\\$stage" != started ]@' has_pin_hold
 mutate "the sweeper runs once at boot"      's@^OnUnitActiveSec=30$@@'                                                     has_pin_hold
