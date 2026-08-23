@@ -178,9 +178,17 @@ module "ci_cache_warmer" {
   github_repo  = "<repo>"
 
   github_connection = var.cloudbuild_github_connection # gen2 projects only
-  prepare_command   = "npm ci --ignore-scripts"        # the default
 }
 ```
+
+**Nothing there describes your build, and nothing should.** The warm reads your
+lockfile — pnpm, yarn, npm, in that order — installs the way that manager
+installs, and runs `turbo run build` with a `--cache-dir` it passes itself. A
+repository that builds with pnpm and `--cache-dir=.turbo` sets none of it. The
+`prepare_command` / `build_command` inputs exist for a build that genuinely is
+not that, and a command written into a Terraform root is a claim about a
+repository that can change package managers without telling the root — stale, it
+does not fail the apply, it fails at 04:00 into a log nobody reads.
 
 That is a Cloud Build in *this project*, so there is no federation, no OIDC
 provider to map, no credential in your repository and no workflow file to keep.
