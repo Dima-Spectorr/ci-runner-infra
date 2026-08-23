@@ -134,11 +134,13 @@ expand_into() { # <destination> <body>
   # -u` is the point as much as the expansion is: an unbound name aborts here
   # rather than writing a truncated script, which is how #268 reached a fleet.
   #
-  # The newline after the closing EOF is load-bearing. A here-document
-  # terminator that is the last line of the string with nothing after it is not
-  # a line, and bash accepts it with `warning: here-document ... delimited by
-  # end-of-file` on stderr — which this function collects, so the harness would
-  # report its own construction as something the expansion executed.
+  # `eval` JOINS its arguments and evaluates the result; it does not take
+  # positional parameters. So a trailing `_ "$1"` does not bind $1 — it lands on
+  # the closing EOF, which then terminates nothing, and bash reads to the end of
+  # the string with `warning: here-document delimited by end-of-file` on the
+  # stderr this function collects. $1 is already the destination: it is this
+  # function's own first argument, which the subshell inherits. Hence the
+  # newline after EOF, and nothing after that.
   #
   # Anything the expansion prints to stderr is collected rather than discarded.
   # An unquoted here-document expands its COMMENTS too, so a stray backtick pair
@@ -149,7 +151,7 @@ expand_into() { # <destination> <body>
     eval "cat >\"\$1\" <<EOF
 $2
 EOF
-" _ "$1"
+"
   ) 2>>"$NOISE"
 }
 
