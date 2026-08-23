@@ -226,8 +226,8 @@ And at boot, each of these makes the host register **nothing**:
   host identity not proved harmless from a slot user's own context — a host whose
   service account can still read the App key secret registers nothing;
 * the job credential broker configured and not answering;
-* the per-job slot reset not installed — its service, its hooks or the profile
-  template any one of them replaces from (§3 phase 4, revised by #232);
+* the per-job slot reset not installed — any one of its service, its hooks, or
+  the profile template the reset restores from (§3 phase 4, revised by #232);
 * the liveness beacon not published at least once (§2).
 
 ---
@@ -648,7 +648,8 @@ host identity.
 
 > **REVISED 2026-08-23 (#232).** This section used to specify a *credential*
 > reset: a hook that deleted `%APPDATA%\gcloud` and `%APPDATA%\gsutil`. Linux
-> retired the equivalent hook in #110 and replaced it in #231 and #237, for a
+> retired the equivalent hook in #110 and replaced it in #231 — #237 is the
+> follow-up findings against that replacement, not the replacement — for a
 > reason that applies here word for word, and the text below is the Windows
 > design rather than a note appended to the old one. The hook's two surviving
 > properties — the profile resolved from the account database, and the hook file
@@ -686,9 +687,13 @@ by the cache work, and this section depends on it staying true.
 **Three things had to be decided rather than translated.**
 
 *1. The privilege split — there is no `sudo`, and no `SUDO_UID`.* On Linux the
-hook runs `sudo slot-reset.sh <idx>` and the script trusts the *caller's* identity
-for nothing: `sudo` proves who is asking, and the slot index is checked against
-it. Windows has neither half. The decision:
+hook runs `sudo -n /opt/ci/job-hooks/slot-reset.sh <stage>` and passes **no
+index at all**: `sudo` sets `SUDO_UID` itself from the real invoking user, and
+the script reads the slot out of that rather than out of its argv, so a slot
+cannot ask for a reset of a slot that is not itself. (The one caller that does
+supply an index is systemd's `ExecStartPre`, which runs as root with no `sudo`
+in the picture.) Windows has neither half — no `sudo` to prove who is asking,
+and so no `SUDO_UID` to read the index from. The decision:
 
 > The reset runs as **SYSTEM**, in a host-level service installed by this phase
 > and supervised by the same shim the beacon and the broker use. A slot asks for
