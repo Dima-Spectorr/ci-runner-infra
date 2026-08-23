@@ -139,44 +139,44 @@ That is the whole change. The module then grants this pool's HOST account
 `roles/storage.objectViewer` **conditioned on `cache/<pool>/`** — read only, this
 pool only. Nothing on a host ever writes there.
 
-Publishing is a **different identity**, `ci-runner-cache-publisher`, added next to
-the pool:
+Publishing is a **different identity**, and it is not yours: add
+`ci-runner-cache-warmer` next to the pool and it produces the snapshot for you,
+nightly, from your default branch.
 
 ```hcl
-module "ci_cache_publisher" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-publisher?ref=v5.35.0"
+module "ci_cache_warmer" {
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.35.0"
 
-  project_id             = var.project_id
-  name                   = "ci-runner-host-myrepo"   # the SAME pool name
-  account_id             = "ci-runner-myrepo"
-  cache_snapshot_bucket  = module.ci_cache.bucket_name
-  workload_identity_pool = var.github_workload_identity_pool
-  repository             = "<org>/<repo>"
+  project_id   = var.project_id
+  region       = var.region
+  pool_name    = "ci-runner-host-myrepo"   # the SAME pool name
+  account_id   = "ci-runner-myrepo"
+  cache_bucket = module.ci_cache.bucket_name
+  github_owner = "<org>"
+  github_repo  = "<repo>"
+
+  github_connection = var.cloudbuild_github_connection # gen2 projects only
+  prepare_command   = "npm ci --ignore-scripts"        # the default
 }
 ```
 
-It has no key and is attached to no VM: the only way to hold it is a run of the
-**one workflow file** named by `publish_workflow_path`, in that repository, on the
-default ref. All three, because neither of the obvious two is enough on its own —
-a workload identity pool is normally shared by every repository in the org, and a
-`pull_request_target` or `workflow_run` run gets an OIDC token asserting the
-default branch while executing fork-authored code. The pool's OIDC provider must
-map `attribute.job_workflow_ref` and must pin the org by numeric id; the module
-cannot check either.
+That is a Cloud Build in *this project*, so there is no federation, no OIDC
+provider to map, no credential in your repository and no workflow file to keep.
+The account it runs as is attached to no VM, may create objects under this pool's
+prefix and may not overwrite them — `storage.objects.delete` is absent, which is
+what keeps the bucket's age bound real — and may replace exactly one object, the
+`current` pointer.
 
-It may create objects under this pool's prefix and may not overwrite them —
-`storage.objects.delete` is absent, which is what keeps the bucket's age bound
-real — and it may replace exactly one object, the `current` pointer.
+Run one by hand rather than waiting for 04:00:
+`gcloud builds triggers run <name> --branch=main --region=<region>`. Until a warm
+completes, a pool configured this way finds no snapshot and runs on the baked
+cache — a supported state, not a misconfiguration.
 
-The run that builds and uploads a snapshot is a scheduled workflow in *your*
-repository, at the path you gave `publish_workflow_path`.
-`docs/publishing-a-cache-snapshot.md` is the whole of it: copy the workflow — it
-is deliberately **two jobs**, and the one that installs your dependencies must
-never be the one holding the publishing credential — set
-`CACHE_PREPARE` to whatever installs your dependencies, and run it once by hand
-with `CACHE_DRY_RUN=1` to see the size. Until you add it, a pool configured this
-way finds no snapshot and runs on the baked cache — a supported state, not a
-misconfiguration.
+`modules/ci-runner-cache-warmer/README.md` has the rest, including what to do if
+you already publish snapshots from a workflow of your own: that path
+(`ci-runner-cache-publisher` plus `docs/publishing-a-cache-snapshot.md`) still
+works and is now the fallback, for a repository whose build genuinely cannot run
+in Cloud Build.
 
 Three bounds have defaults worth leaving alone unless you have a measurement:
 `cache_snapshot_max_age_hours` (168) is a security control and must stay at or
@@ -215,7 +215,9 @@ Three things worth knowing before you look for a knob:
   a job that could publish one would hand every later build in the repository
   its output. Uploads are accepted and discarded, which is why your build log
   says it uploaded and a later run still misses. The store is filled from your
-  **default branch**, by an identity that never runs pull-request code.
+  **default branch**, by an identity that never runs pull-request code — the
+  same `ci-runner-cache-warmer` that publishes your dependency snapshot. One
+  module fills both caches; if you added it above, this one is already warm.
 * **Nothing about it can fail your job.** A server that does not start, a bucket
   that cannot be read, an artifact over the size bound: every one of them is a
   cache miss and a task that builds normally. The host logs the verdict.

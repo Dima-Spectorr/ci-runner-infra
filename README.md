@@ -615,20 +615,25 @@ that image a real answer is separate work, not a line in this one.
   become the starting cache of every later host in the pool: the cross-slot
   channel the per-slot copy closes, re-opened across hosts and across time. A
   fork pull request would need to run once. Publishing belongs to a separate
-  identity, `ci-runner-cache-publisher`: no key, attached to no VM, held only by
-  a run of one named workflow file, in one named repository, on the default ref —
-  all three in one claim, because a pool is shared across repositories and a
-  `pull_request_target` run asserts the default branch while running fork code. It
-  may create objects
+  identity, and to a separate module: `ci-runner-cache-warmer`, a Cloud Build in
+  the project that owns the bucket, fired nightly by Cloud Scheduler against the
+  default branch. It has no key and is attached to no VM. It may create objects
   under its pool's prefix and may not overwrite them — no `storage.objects.delete`
   means "snapshots are written once" is enforced by IAM rather than trusted — and
   may replace exactly one object, the pointer. What it runs is
-  `scripts/ci/publish-cache-snapshot.sh`, from a scheduled workflow in the
-  consuming repository (`docs/publishing-a-cache-snapshot.md`): dependencies
-  installed from the default branch into an empty tree, scanned with the host's
-  own rules, packed and uploaded under a name never reused. A pool whose
-  repository has not added that workflow finds nothing and runs on the baked
-  cache.
+  `scripts/ci/publish-cache-snapshot.sh`, the same script by the same rules:
+  dependencies installed from the default branch into an empty tree, scanned with
+  the host's own rules, packed and uploaded under a name never reused. **The
+  consuming repository adds nothing** — no workflow, no federation, no schedule —
+  which is the difference from `ci-runner-cache-publisher`, the workload-identity
+  path this supersedes and which remains for a build that cannot run in Cloud
+  Build. A pool whose project has not added the warmer finds nothing and runs on
+  the baked cache.
+
+  The same run publishes the **build** cache, under `turbo/<owner>/<repo>/`, so
+  the two halves of `4.4` are filled by one job. Turbo's local `<hash>.tar.zst`
+  is the remote artifact byte for byte, so that publish is an object copy — the
+  host-side cache server still has no write path in it at all.
 
   What arrives is inspected before any of it is trusted: it is unpacked into a
   staging tree outside the master, scanned by the same check the image build runs
@@ -748,6 +753,8 @@ seeding it is an act of review rather than a formality.
 modules/ci-runner-network/       the per-project firewall posture (no NAT),
                                  and the log of where the pool connects out to
 modules/ci-runner-cache-bucket/  where a pool's cache lives between hosts
+modules/ci-runner-cache-warmer/  the only identity that WRITES either cache:
+                                 a nightly build of the default branch
 modules/ci-runner-apply-trigger/ the unattended apply, as the project's OWN Cloud Build
 modules/ci-host-image-trigger/   the golden image, rebuilt by a merge instead of by hand
 modules/ci-runner-host-pool/     the module consumers reference
