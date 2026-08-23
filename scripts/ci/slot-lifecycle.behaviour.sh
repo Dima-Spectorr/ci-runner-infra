@@ -134,6 +134,11 @@ EOF" _ "$1"
   ) 2>>"$NOISE"
 }
 
+# Read by the here-document bodies below, not by this file: host-startup.sh
+# renders `SLOT_USER_PREFIX="$SLOT_USER_PREFIX"` into each hook, so the name has
+# to be bound HERE for the expansion under `set -u` to succeed. No static reader
+# — shellcheck included — can see through the eval that does it.
+# shellcheck disable=SC2034
 SLOT_USER_PREFIX=$PREFIX
 
 RESET="$SB/slot-reset.sh"
