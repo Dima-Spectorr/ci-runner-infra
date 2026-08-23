@@ -652,6 +652,14 @@ jobs:
       - name: apply-trigger self-test
         run: bash scripts/ci/apply-trigger.selftest.sh
 
+      # The cache warmer is the one job in this fleet whose every failure is
+      # silent: it runs at 4am, nobody watches it, and a warmer that publishes
+      # to the wrong prefix, publishes nothing, or is never fired all present as
+      # "the cache is cold" — the same observable as a fleet that never had one.
+      # These checks are structural for that reason: there is no run to inspect.
+      - name: cache-warmer self-test
+        run: bash scripts/ci/cache-warmer.selftest.sh
+
       # The browser image a pool BAKES and the one a consumer is told to RUN are
       # two different lines that must name one release. When they drift nothing
       # fails — every UI job just quietly downloads two gigabytes it was meant
