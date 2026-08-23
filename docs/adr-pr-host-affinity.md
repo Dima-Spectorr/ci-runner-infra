@@ -277,8 +277,8 @@ is not built yet** — the veto writes the record, and nothing reads it back. It
 is deliberately a separate change, because it is not a veto: it decides whether
 to CANCEL a run whose Linux host went away underneath a Windows tail, which is
 cross-pool, irreversible, and answerable only for a hold that has already
-lapsed. Tracked as its own issue rather than left as an implied half of this
-one.
+lapsed. Tracked as [#270](https://github.com/Dima-Spectorr/ci-runner-infra/issues/270)
+rather than left as an implied half of this one.
 
 The helper ships with the host in phase 3, the veto in phase 4 — the delivery
 table says so, because a hold whose writer is nobody's phase is how this arrives
