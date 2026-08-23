@@ -29,21 +29,29 @@ posture you opt into knowingly. Read [Windows](#windows) before you declare one.
    for the account that owns the repo — both non-secret. The private key is not
    in any repository or state file; see step 3.
 
-   Its installation needs **`checks: read`** in addition to the permissions the
-   runners themselves use. Nothing about job execution depends on it — without
-   it the pool scales, registers and runs jobs exactly as it does with it. The
-   one thing it buys is the merge-queue parking detector below: the controller
-   reads each open pull request's check runs to decide whether a pull request
-   the queue will never admit is nevertheless finished and green. Missing the
-   permission does not fail an apply or a job, and `ci_prs_green_and_unqueued`
-   then publishes an unbroken zero — which is exactly what a repository with
-   nothing parked publishes. So the controller says so in its own right:
-   `ci_parked_sweep_denied` goes non-zero, the log line reads `parked sweep:
-   DENIED`, and the `parkeddenied` alert fires after 30 minutes. If you see
-   either, grant the permission on the App **and accept it on the installation**
-   — a permission added to an App stays pending until the installation approves
-   it, and a pending permission behaves exactly like one that was never
-   granted.
+   Its installation needs **`pull_requests: read`** and **`checks: read`** in
+   addition to the permissions the runners themselves use. Nothing about job
+   execution depends on either — without them the pool scales, registers and
+   runs jobs exactly as it does with them. The one thing they buy is the
+   merge-queue parking detector below, which takes two calls: it lists the open
+   pull requests (`pull_requests: read`), then reads each one's check runs
+   (`checks: read`) to decide whether a pull request the queue will never admit
+   is nevertheless finished and green. Missing either does not fail an apply or
+   a job, and `ci_prs_green_and_unqueued` then publishes an unbroken zero —
+   which is exactly what a repository with nothing parked publishes. So the
+   controller says so in its own right: `ci_parked_sweep_denied` goes non-zero,
+   a log line reads `parked sweep: DENIED …` and **names which of the two
+   permissions that call wanted**, and the `parkeddenied` alert fires after 30
+   minutes. Read the log line before you grant anything — one counter covers
+   both calls, so the metric alone cannot tell you which. Then grant the
+   permission on the App **and accept it on the installation** — a permission
+   added to an App stays pending until the installation approves it, and a
+   pending permission behaves exactly like one that was never granted.
+
+   Where: the App's owning account → **Settings → Developer settings → GitHub
+   Apps → *your App* → Permissions & events → Repository permissions**; the
+   acceptance is on the installation, at **org → Settings → GitHub Apps → *your
+   App* → Configure**.
 
    It needs **`Contents: read`** as well if you are standing up a merge-queue
    pool (step 8): that is how the controller reads the repository's own
