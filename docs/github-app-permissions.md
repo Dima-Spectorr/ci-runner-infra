@@ -28,11 +28,15 @@ Two facts shape everything below:
 | Permission | Level | The call that needs it | Without it |
 |---|---|---|---|
 | **Metadata** | Read | mandatory for every App | nothing works |
-| **Administration** | Read & write | `POST repos/{repo}/actions/runners/registration-token`, `GET repos/{repo}/actions/runners` | **hosts cannot register.** The one permission here that fails loudly — a host boots, cannot get a token, and the pool serves nothing |
-| **Actions** | Read | `GET repos/{repo}/actions/runs`, `.../runs/{id}/jobs` | the controller sees no demand, publishes none, and the pool never scales out. Reads on every chart as a quiet repository |
-| **Checks** | Read | `GET repos/{repo}/commits/{sha}/check-runs` | the merge-queue **parking detector** can never report. Signalled: `ci_parked_sweep_denied` non-zero, log `parked sweep: DENIED`, `parkeddenied` alert after 30 min |
-| **Pull requests** | Read | `GET repos/{repo}/pulls?state=open` | same detector, one step earlier — log `parked sweep: cannot list open pull requests` |
-| **Contents** | Read | `GET repos/{repo}/contents/{path}` | the merge-queue pool **cannot read `.mergify.yml`** and cannot derive its own size. Fails open: it keeps the Terraform `max_hosts` you typed, forever, and says so only in a log line |
+| **Administration** | Read & write | `POST /repos/{owner}/{repo}/actions/runners/registration-token`, `GET /repos/{owner}/{repo}/actions/runners` | **hosts cannot register.** The one permission here that fails loudly — a host boots, cannot get a token, and the pool serves nothing |
+| **Actions** | Read | `GET /repos/{owner}/{repo}/actions/runs`, `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs` | the controller sees no demand, publishes none, and the pool never scales out. Reads on every chart as a quiet repository |
+| **Checks** | Read | `GET /repos/{owner}/{repo}/commits/{ref}/check-runs` | the merge-queue **parking detector** can never report. Signalled: `ci_parked_sweep_denied` non-zero, log `parked sweep: DENIED`, `parkeddenied` alert after 30 min |
+| **Pull requests** | Read | `GET /repos/{owner}/{repo}/pulls?state=open` | same detector, one step earlier — log `parked sweep: cannot list open pull requests` |
+| **Contents** | Read | `GET /repos/{owner}/{repo}/contents/{path}` | the merge-queue pool **cannot read `.mergify.yml`** and cannot derive its own size. Fails open: it keeps the Terraform `max_hosts` you typed, forever, and says so only in a log line |
+
+Paths are written as GitHub documents them, so each one is directly usable —
+`gh api repos/<owner>/<repo>/actions/runners` drops the leading `/` and `gh`
+supplies the host, which is the shape the verification commands below use.
 
 `Administration: read & write` is the level that makes some reviewers stop. It
 is what GitHub requires to mint a self-hosted-runner registration token; there
