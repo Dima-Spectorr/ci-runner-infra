@@ -144,7 +144,7 @@ mutate "the diagnostic never emitted" \
 #    every correctly pinned consumer in the fleet is reported as unpinned — and
 #    RUNNER9 firing everywhere is how RUNNER9 gets turned off everywhere.
 mutate "the reader no longer reports the anchor resolution" \
-  's@out("#RUNSONNEEDS", vid, m.group(1))@pass@'
+  's@out("#RUNSONNEEDS", vid, anchor)@pass@'
 
 # 9. The resolution is read only up to the first `||`. A plain consumer still
 #    passes, so most fixtures stay green — but the fleet's fork-routing idiom
@@ -157,15 +157,26 @@ mutate "the anchor resolution read only before the fork branch" \
 #     like any other, and the Windows job that cannot possibly work is reported
 #     clean — RUNNER11's whole subject restored by one character class.
 mutate "the loopback band regex no longer covers the band" \
-  's@(3\[5-9\]\[0-9\]{3}@(9[5-9][0-9]{3}@'
+  's@(35\[1-9\]\[0-9\]{2}@(95[1-9][0-9]{2}@'
+
+# 10b. The band regex stops being case-insensitive. `LOCALHOST:35100` is the
+#      same mistake in the same job, and a gate that reads one spelling and not
+#      the other reports the file clean.
+mutate "the loopback band match is case-sensitive again"   's@^    re.IGNORECASE,$@@'
+
+# Indentation is deliberately not part of the two `err` patterns below, and the
+# exemption pattern is not anchored to its leading spaces either. All three
+# broke at once when the rules moved a nesting level, and a mutation that no
+# longer applies asserts nothing while still reporting green -- the exact
+# failure `mutate` exists to make loud.
 
 # 11-12. Each finding computed and never reported. A gate that decides
 #        correctly and says nothing is indistinguishable from a clean
 #        repository, and it is the state a refactor reaches by deleting a line.
 mutate "the RUNNER9 diagnostic never emitted" \
-  's@            err RUNNER9 @            : RUNNER9 @'
+  's@ err RUNNER9 @ : RUNNER9 @'
 mutate "the RUNNER11 diagnostic never emitted" \
-  's@            err RUNNER11 @            : RUNNER11 @'
+  's@ err RUNNER11 @ : RUNNER11 @'
 
 # 13. The owner threshold nudged by one. Two stacks in one run — the precise
 #     thing rule 2 forbids — becomes the passing case, and nothing else changes.
@@ -185,7 +196,7 @@ mutate "Windows no longer exempt from the pinning rule" \
 #     by refusing an answer the repository already argued for in writing.
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "a declared exemption is no longer honoured" \
-  's@          if ! shared_infra_marker "$file" exempt "$job"; then@          if true; then@'
+  's@if ! shared_infra_marker "$file" exempt "$job_base"; then@if true; then@'
 
 # 16. The marker stops being bound to its job, so a marker naming ANY job in the
 #     file excuses every job in it — including one added later that nobody
@@ -194,6 +205,22 @@ mutate "a declared exemption is no longer honoured" \
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "the marker no longer has to name the job it excuses" \
   's@${esc}${tail}@[^)]*@'
+
+# 17. The literal rule widened back to every quoted string. This is the
+#     over-correction, and it fails a CORRECT workflow rather than passing a
+#     wrong one — which is the more expensive direction: a gate that reports
+#     the `'main'` in a `contains()` guard teaches the repository to pass
+#     `--allow-dynamic-runner`, and the rule is gone for everything.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "every quoted string counts as a runner fallback" \
+  's@(?:&&|\\|\\|)\\s\*@@'
+
+# 18. A block-scalar indicator is only recognised at end of line, so `run: |`
+#     opens a block and `run: | # note` does not. The body goes back into the
+#     comment view and a marker echoed there declares an exemption again —
+#     the same bypass, reachable by adding a comment to the line above it.
+mutate "a commented block-scalar header no longer opens a block" \
+  's@(#\.\*)?@@g'
 
 printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

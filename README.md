@@ -372,6 +372,34 @@ that image a real answer is separate work, not a line in this one.
   and the next job on that slot runs it while believing it fetched it — a local
   image by that name is resolved without ever contacting a registry, both by
   `docker run` and by a `FROM` in a later build (#233).
+* **The remote BUILD cache is served by the host, so no repository wires one
+  up.** A dependency cache saves downloading; a build cache saves building, and
+  it dedupes across pull requests where a path filter only helps within one. The
+  host runs a Turborepo remote cache against the project's cache bucket, under
+  `turbo/<owner>/<repo>/`, and hands every slot `TURBO_API`, `TURBO_TOKEN` and
+  `TURBO_TEAM` — a repository adds nothing to its workflows and holds no
+  credential. That is the correction to the fault above rather than a separate
+  feature: IntegrateIT's hand-built cache is what ran cold for weeks behind five
+  warnings a run, and the fix that matters is that there is no longer anything
+  per-repository to get wrong.
+
+  **It is read-only to job code, permanently.** A turbo artifact is a tarball
+  the next build unpacks into its output tree and reports as its own result, so
+  a job that could publish one would hand every later build in that repository
+  its output — the cross-slot channel the per-slot cache copy closes, and the
+  cross-host one the snapshot bucket's read-only grant closes, re-opened with a
+  better delivery mechanism. A host's grant is `roles/storage.objectViewer`
+  conditioned on the repository's prefix; an upload from a job is accepted and
+  discarded, because `turbo` reports a refused upload as a warning per artifact
+  and a log full of those is the exact noise that hid the original fault. What
+  fills the store is the default branch, published by an identity that never
+  runs pull-request code.
+
+  The whole layer fails open — a server that will not start, an unreadable
+  bucket or an oversized artifact is a cache miss and a task that builds
+  normally — and its port is `REJECT`ed on the primary interface, like the
+  credential broker's, because it serves one repository's build output out of a
+  bucket nothing off the host may read.
 * **The metadata fence stops at port 80, and that is deliberate.**
   `169.254.169.254` is two services on one address: the metadata server over
   HTTP on port 80, and the VPC resolver on port 53. A container is handed that

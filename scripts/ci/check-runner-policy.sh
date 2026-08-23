@@ -307,6 +307,21 @@ MATRIX_RUNS_ON = re.compile(
 # job that MAY name a pool literally from the ones that may not.
 NEEDS_OUTPUT = re.compile(r"needs\.([A-Za-z0-9_-]+)\.outputs\.")
 
+# The literals in a `runs-on` expression that can actually BECOME the runner:
+# the operands of a short-circuit. GitHub Actions quotes strings with single
+# quotes only, but not every quoted string is a candidate label — in
+# `contains(github.ref, 'main') && 'PoolA' || …` the first literal is an
+# argument to a condition and can never be the answer. Reporting it would fail
+# the guard a careful author wrote, which is the worst kind of false positive.
+LITERAL_ALT = re.compile(r"(?:&&|\|\|)\s*'([^']*)'")
+
+# The same question for a literal that OPENS the expression, which no operator
+# precedes: `${{ 'PoolA' || needs.anchor.outputs.runs-on }}` is that pool on
+# every run, because a non-empty string short-circuits before the reference is
+# ever read. Deliberately not the mirror rule "a literal FOLLOWED by an
+# operator" — that one also matches the `'main'` in `x == 'main' && …`.
+LITERAL_FIRST = re.compile(r"\$\{\{\s*'([^']*)'")
+
 # A loopback address with a port in the shared-infrastructure band, anywhere in
 # a job's steps. On a Windows host there is nothing listening there: the stack
 # runs on the LINUX host of the same pull request, and is reached at that host's
@@ -314,11 +329,20 @@ NEEDS_OUTPUT = re.compile(r"needs\.([A-Za-z0-9_-]+)\.outputs\.")
 # refused connection at whatever point the test first queries — late, and
 # nowhere near the line that is wrong.
 #
-# The band is 35100-44099: 90 slots of 100 ports above 35000, which is the
-# widest `shared_infra_slots_per_host` the network module accepts. Ports outside
-# it are somebody else's business and not reported.
+# The band is 35100-44099 and it starts at 35100, not at 35000: slot indices
+# begin at ONE, so the first slot's hundred ports sit one width above the base.
+# 90 slots of 100 ports is the widest `shared_infra_slots_per_host` the network
+# module accepts. Ports outside the band are somebody else's business and are
+# not reported — 35000-35099 belongs to nobody, and reporting it would send a
+# reader looking for a slot that does not exist.
+#
+# `(?![0-9])` because without it `localhost:351000` matches on its first five
+# digits: a five-digit prefix of a six-digit port, reported as a band port the
+# job never named.
 LOOPBACK_BAND = re.compile(
-    r"(?:localhost|127\.0\.0\.1)[:/](3[5-9][0-9]{3}|4[0-3][0-9]{3}|440[0-9]{2})"
+    r"(?:localhost|127\.0\.0\.1)[:/]"
+    r"(35[1-9][0-9]{2}|3[6-9][0-9]{3}|4[0-3][0-9]{3}|440[0-9]{2})(?![0-9])",
+    re.IGNORECASE,
 )
 
 # --- fork guards, by DIRECTION and not by mention -----------------------------
@@ -607,10 +631,38 @@ for job_id, job in jobs.items():
         # because the fleet's fork idiom wraps it:
         # `${{ fork && 'ubuntu-latest' || fromJSON(needs.anchor.outputs.runs-on) }}`
         # is a correct consumer and an anchored match would call it unpinned.
+        #
+        # A substring match is also what makes the literal check below
+        # necessary. `${{ needs.anchor.outputs.label || 'ExampleRepo' }}`
+        # contains the reference and resolves to the POOL whenever the output is
+        # empty — which is every run where the anchor was skipped, and every run
+        # where it failed before publishing. That is the second host RUNNER9
+        # exists to stop, wearing the shape of the fix.
+        #
+        # So each literal alternative in the expression is checked, and only a
+        # GitHub-HOSTED image is accepted beside the reference: that is the fork
+        # idiom's `'ubuntu-latest'` and nothing else. The record is still
+        # emitted either way, because it is also how the ANCHOR is discovered —
+        # a consumer with a bad fallback still names its anchor, and dropping
+        # the record would report the anchor for failing to pin to itself. What
+        # the literal costs is the CONSUMER's credit, which is the job that is
+        # actually wrong.
         for label in (runs_on if isinstance(runs_on, list) else [runs_on]):
             text = str(label) if label is not None else ""
-            for m in NEEDS_OUTPUT.finditer(text):
-                out("#RUNSONNEEDS", vid, m.group(1))
+            anchors = [m.group(1) for m in NEEDS_OUTPUT.finditer(text)]
+            for anchor in anchors:
+                out("#RUNSONNEEDS", vid, anchor)
+            # Hoisted out of the loop above. The literals belong to the
+            # EXPRESSION, not to each reference inside it, and scanning per
+            # reference emitted the same literal once per
+            # `needs.<job>.outputs.*` the expression happened to name.
+            if anchors:
+                seen = dict.fromkeys(
+                    LITERAL_ALT.findall(text) + LITERAL_FIRST.findall(text)
+                )
+                for lit in seen:
+                    if lit.strip() and not HOSTED_IMAGE.match(lit.strip()):
+                        out("#RUNSONLITERAL", vid, lit.strip())
 
         if isinstance(runs_on, dict):
             # `{group: …}` names a runner GROUP, whose membership lives in
@@ -662,6 +714,17 @@ abs_path() {
 # Files a `pull_request` workflow can reach through a local `uses:` call — see
 # `compute_reachable`. Newline-separated absolute paths.
 REACHABLE_PR=""
+
+# The same set computed WITHOUT the fork guard.
+#
+# Two different questions were reading one answer. RUNNER4 asks "can FORK code
+# reach a warm host", and a `fork == false` edge is correctly not a path for it.
+# Everything else asks "does this file take part in a pull request at all", and
+# a guarded edge is precisely the path that DOES run — for an in-repo pull
+# request, which is every pull request the fleet actually serves. Read off
+# REACHABLE_PR, a guarded callee was invisible: two `services:` owners inside it
+# were two stacks in one run, and the gate said nothing.
+REACHABLE_PR_ANY=""
 # A `timeout-minutes` at or above this bounds nothing GitHub was not already
 # bounding. Overridable downwards by a consumer whose queue expires sooner.
 MAX_TIMEOUT=360
@@ -678,6 +741,18 @@ SHARED_INFRA=0
 # this rule exists to catch, and the shape a per-file count reads as clean.
 SHARED_INFRA_OWNERS=""
 
+# Every LOCAL `uses:` edge the file set contains, as
+# `<callee abs path>	<caller abs path>	<caller job id>`. Filled by
+# `compute_reachable`, which already walks these edges for fork reachability.
+#
+# RUNNER10 needs them because "one stack per run" is counted per INVOCATION and
+# not per job definition. A reusable workflow whose job brings up a stack,
+# called from three jobs, is three stacks in one run — and read as a file it is
+# one job and looks clean. That is not a hypothetical shape; it is what a
+# repository reaches by factoring its one owner job out into a reusable
+# workflow, which is the refactor this contract otherwise encourages.
+CALL_EDGES=""
+
 # RUNNER9's escape hatch and RUNNER10's declaration, in the shape RUNNER7's
 # marker already established: beside the job, naming the job, with an issue.
 #
@@ -688,6 +763,50 @@ SHARED_INFRA_OWNERS=""
 # it yields a job, so a bare marker cannot be attributed to one — and a bare
 # marker is also un-reviewable: it excuses whatever the file happens to contain
 # after the next change, including a job added later that nobody weighed.
+# YAML comment lines only — block-scalar bodies removed.
+#
+# `# shared-infra-exempt(job, #1): x` written inside a `run: |` block is not a
+# comment. It is shell, in the middle of a step, and it declares nothing; it
+# reads as a declaration only to a grep that treats the file as text. A
+# repository could exempt a job by echoing the marker, and would not have to
+# mean to: a `run:` block that greps its own logs for the string is enough.
+#
+# Tracked by INDENT, which is what a block scalar is: the body of `run: |` is
+# every following line indented past the line that opened it, blank lines
+# included, and the block ends at the first line that is not. Written in awk
+# rather than parsed, because PyYAML has discarded comments by the time it
+# yields anything — the reader that could parse this is the one that cannot see
+# it.
+comment_view() {
+  awk '
+    {
+      match($0, /^[ \t]*/); ind = RLENGTH
+      if (inblock) {
+        if ($0 ~ /^[ \t]*$/) next
+        if (ind > blockind) next
+        inblock = 0
+      }
+      print
+      # A block-scalar indicator ends its line -- EXCEPT that YAML allows a
+      # comment after it, so `run: | # note` opens a block just as `run: |`
+      # does. Missing that shape put the whole body back into the comment view,
+      # which is the bypass this function exists to close, reachable by adding
+      # a comment.
+      #
+      # Anchored on the `:` (or a sequence dash) that a block scalar always
+      # follows, and never fired on a line that is itself a comment: without
+      # that, a comment ending in `|` would swallow everything indented under
+      # it. `[-+0-9]*` because the chomping and indentation indicators may be
+      # written in either order (`|2-` as well as `|-2`).
+      if ($0 !~ /^[ \t]*#/ &&
+          ($0 ~ /:[ \t]*[|>][-+0-9]*[ \t]*(#.*)?$/ ||
+           $0 ~ /^[ \t]*-[ \t]*[|>][-+0-9]*[ \t]*(#.*)?$/)) {
+        inblock = 1; blockind = ind
+      }
+    }
+  ' "$1"
+}
+
 shared_infra_marker() {
   local file="$1" kind="$2" job="$3" esc tail
   # `re_quote`, not a second escaping expression written here. A YAML job id may
@@ -700,7 +819,10 @@ shared_infra_marker() {
     exempt) tail=",[[:space:]]*#[0-9]+[[:space:]]*" ;;
     *)      tail="[[:space:]]*" ;;
   esac
-  grep -Eq "^[[:space:]]*#.*shared-infra-${kind}\([[:space:]]*${esc}${tail}\):[[:space:]]*[^[:space:]]" "$file"
+  # Process substitution and not a pipe: `-q` exits at the first match, and in a
+  # pipeline that SIGPIPEs the writer and `pipefail` turns a successful match
+  # into a failed command. Here the reader is not in grep's pipeline at all.
+  grep -Eq "^[[:space:]]*#.*shared-infra-${kind}\([[:space:]]*${esc}${tail}\):[[:space:]]*[^[:space:]]" <(comment_view "$file")
 }
 
 # RUNNER7's escape hatch, and deliberately NOT RUNNER5's `--allow-dynamic-runner`.
@@ -730,7 +852,7 @@ remote_call_declared() {
   # A file, not a pipe, so `-q`'s early exit cannot turn into a pipefail false
   # negative. The trailing `[^[:space:]]` is the reason: `(...): ` with nothing
   # after it is a waiver wearing the shape of a declaration.
-  grep -Eq "^[[:space:]]*#.*remote-reusable-allowed\([[:space:]]*${esc}[[:space:]]*,[[:space:]]*#[0-9]+[[:space:]]*\):[[:space:]]*[^[:space:]]" "$file"
+  grep -Eq "^[[:space:]]*#.*remote-reusable-allowed\([[:space:]]*${esc}[[:space:]]*,[[:space:]]*#[0-9]+[[:space:]]*\):[[:space:]]*[^[:space:]]" <(comment_view "$file")
 }
 
 # `scope` empty means RUNNER2 is not asserted; `forks` is the declared posture.
@@ -775,11 +897,25 @@ check_file() {
   if [ "$has_pr" -eq 0 ] && printf '%s\n' "$REACHABLE_PR" | grep -cxF -- "$(abs_path "$file")" >/dev/null; then
     has_pr=1
   fi
+  # The guard-blind answer, for the rules that are not RUNNER4. See
+  # REACHABLE_PR_ANY: a callee behind `fork == false` still runs, for every
+  # pull request from the repository itself.
+  local has_pr_any="$has_pr"
+  if [ "$has_pr_any" -eq 0 ] && printf '%s\n' "$REACHABLE_PR_ANY" | grep -qxF -- "$(abs_path "$file")"; then
+    has_pr_any=1
+  fi
 
   local job job_re
   while IFS= read -r job; do
     [ -n "$job" ] || continue
     job_re="$(re_quote "$job")"
+    # A matrix leg is judged separately — a scoped leg cannot vouch for an
+    # unscoped one — so `$job` here may be the synthetic `lint~leg1`. That id
+    # exists nowhere in the workflow. Anything a workflow AUTHOR has to write or
+    # read uses the YAML job id instead: the exemption marker names it, and a
+    # diagnostic that recommended `shared-infra-exempt(lint~leg1, …)` was
+    # recommending a declaration that could never match.
+    local job_base="${job%%~leg*}"
 
     local labels self_hosted=0 scoped=0 hosted_only=0 windows_pool=0 label
     labels="$(printf '%s\n' "$records" | sed -n "s/^#LABEL\t${job_re}\t//p")"
@@ -904,23 +1040,45 @@ EOF
       # A job with no `runs-on` at all is a `uses:` job — it runs the callee's
       # jobs, which this gate judges in the callee's own file, and asking it to
       # pin a pool it never names would be a finding nobody could act on.
-      if [ "$SHARED_INFRA" -eq 1 ] && [ "$has_pr" -eq 1 ] && [ "$hosted_only" -eq 0 ] &&
-         { [ -n "$labels" ] || [ "$has_expr" -eq 1 ]; }; then
+      #
+      # A runner GROUP is included, and it was not. `runs-on: {group: X}` names
+      # neither a label nor an expression, so the job fell out of these rules
+      # entirely: two group-selected jobs could each declare `services:` and the
+      # gate reported clean. A group is a pool named directly — which is the
+      # subject of RUNNER9, not an exception to it.
+      if [ "$SHARED_INFRA" -eq 1 ] && [ "$has_pr_any" -eq 1 ] && [ "$hosted_only" -eq 0 ] &&
+         { [ -n "$labels" ] || [ "$has_expr" -eq 1 ] || [ "$has_group" -eq 1 ]; }; then
         local pins_to_anchor=0 is_owner=0 is_anchor=0
         [ "$(printf '%s
 ' "$records" | grep -c "^#RUNSONNEEDS	${job_re}	")" -gt 0 ] && pins_to_anchor=1
+        # ...unless the same expression can also resolve to a pool literal. A
+        # `||` fallback is not a safety net here, it is the failure: the run
+        # whose anchor did not publish is exactly the run that lands the job on
+        # a second host.
+        [ "$(printf '%s
+' "$records" | grep -c "^#RUNSONLITERAL	${job_re}	")" -gt 0 ] && pins_to_anchor=0
         # An owner is a job that brings the stack up: it declares `services:`,
         # or it says so. Both, rather than services alone, because a stack
         # started by a `docker compose up` step in a `run:` block is invisible
         # to YAML and is the shape a real anchor takes once it outgrows
         # `services:`.
-        { [ "$has_services" -eq 1 ] || shared_infra_marker "$file" owner "$job"; } && is_owner=1
+        { [ "$has_services" -eq 1 ] || shared_infra_marker "$file" owner "$job_base"; } && is_owner=1
         # The anchor is whatever another job resolves its pool FROM. Read off
         # the graph, not asserted: a job that calls itself the anchor and that
         # nobody pins to is not holding a host for anyone.
         [ "$(printf '%s
 ' "$records" | grep -c "^#RUNSONNEEDS	[^	]*	${job_re}$")" -gt 0 ] && is_anchor=1
         [ "$is_owner" -eq 1 ] && is_anchor=1
+        # …and a job that PUBLISHES outputs in a file where nothing resolves a
+        # pool from anything. That is a repository with one fleet job: it IS
+        # the anchor, it holds the host the run will use, and there is no other
+        # job for it to pin to. Reported without this, the only fix on offer
+        # was to make the job depend on itself — which is why the reader emits
+        # `#OUTPUTS` at all.
+        if [ "$(printf '%s\n' "$records" | grep -c "^#RUNSONNEEDS	")" -eq 0 ] &&
+           [ "$(printf '%s\n' "$records" | grep -c "^#OUTPUTS	${job_re}$")" -gt 0 ]; then
+          is_anchor=1
+        fi
 
         # RUNNER9 — a second host per run is the whole failure this addresses.
         # A Linux fleet job that names its pool literally is scheduled by
@@ -934,8 +1092,8 @@ EOF
         # A Windows job reaches the stack across the band (RUNNER11 checks it
         # reaches it correctly), so it is a second host on purpose.
         if [ "$windows_pool" -eq 0 ] && [ "$pins_to_anchor" -eq 0 ] && [ "$is_anchor" -eq 0 ]; then
-          if ! shared_infra_marker "$file" exempt "$job"; then
-            err RUNNER9 "$rel: job '$job' is self-hosted on a pull_request workflow and names its pool directly instead of resolving it from the anchor job's output — GitHub may place it on a different host than the rest of this run, where the run's shared stack does not exist (use runs-on: \${{ fromJSON(needs.<anchor>.outputs.runs-on) }}, or declare '# shared-infra-exempt($job, #<issue>): <reason>')"
+          if ! shared_infra_marker "$file" exempt "$job_base"; then
+            err RUNNER9 "$rel: job '$job' is self-hosted on a pull_request workflow and names its pool directly instead of resolving it from the anchor job's output — GitHub may place it on a different host than the rest of this run, where the run's shared stack does not exist (use runs-on: \${{ fromJSON(needs.<anchor>.outputs.runs-on) }}, or declare '# shared-infra-exempt($job_base, #<issue>): <reason>')"
           fi
         fi
 
@@ -950,9 +1108,35 @@ EOF
         # issue, that this job needs its own stack has answered RUNNER10 as
         # well — and a marker that silenced one rule while leaving the other
         # red would just be read as the gate being broken.
-        if [ "$is_owner" -eq 1 ] && ! shared_infra_marker "$file" exempt "$job"; then
-          SHARED_INFRA_OWNERS="${SHARED_INFRA_OWNERS}${rel}: job '${job}'"$'
+        if [ "$is_owner" -eq 1 ] && ! shared_infra_marker "$file" exempt "$job_base"; then
+          # Once per INVOCATION, not once per definition. A reusable workflow
+          # whose job brings up a stack, called from three caller jobs, starts
+          # three stacks in one run; counted per file it is one owner and reads
+          # clean. That is not a hypothetical shape — it is the one a repository
+          # lands on by factoring its single owner job out into a reusable
+          # workflow, which is the refactor this contract otherwise encourages.
+          #
+          # A file nothing calls has no incoming edges and counts once, exactly
+          # as before; so does every file when `check_file` is driven directly,
+          # without a reachability pass in front of it.
+          local abs_self si_edges cfile cjob2
+          abs_self="$(abs_path "$file")"
+          si_edges="$(awk -v self="$abs_self" -F'\t' '$1 == self' <<EOF
+$CALL_EDGES
+EOF
+)"
+          if [ -n "$si_edges" ]; then
+            while IFS=$'\t' read -r _ cfile cjob2; do
+              [ -n "${cjob2:-}" ] || continue
+              SHARED_INFRA_OWNERS="${SHARED_INFRA_OWNERS}${rel}: job '${job}' (called from ${cfile#"$REPO_ROOT"/} job '${cjob2}')"$'
 '
+            done <<EOF
+$si_edges
+EOF
+          else
+            SHARED_INFRA_OWNERS="${SHARED_INFRA_OWNERS}${rel}: job '${job}'"$'
+'
+          fi
         fi
 
         # RUNNER11 — the Windows half of rule 3, and the mistake it is going to
@@ -961,13 +1145,25 @@ EOF
         # the Windows machine, where nothing is listening. It fails as a
         # refusal or a hang, in a job whose code is correct everywhere else,
         # which is why it is worth a gate rather than a paragraph.
-        if [ "$windows_pool" -eq 1 ]; then
-          local lb
-          lb="$(printf '%s
+        local lb
+        lb="$(printf '%s
 ' "$records" | sed -n "s/^#LOOPBACKBAND	${job_re}	//p" | head -1)"
-          if [ -n "$lb" ]; then
-            err RUNNER11 "$rel: job '$job' runs on a Windows pool and names localhost:$lb — a shared-infrastructure port, which on a Windows host has nothing listening on it (the stack runs on the run's LINUX host; use the address the host exports as CI_SHARED_INFRA_ADDR)"
-          fi
+        if [ -n "$lb" ] && [ "$windows_pool" -eq 1 ]; then
+          err RUNNER11 "$rel: job '$job' runs on a Windows pool and names localhost:$lb — a shared-infrastructure port, which on a Windows host has nothing listening on it (the stack runs on the run's LINUX host; use the address the host exports as CI_SHARED_INFRA_ADDR)"
+        elif [ -n "$lb" ] && { [ "$has_expr" -eq 1 ] || [ "$has_group" -eq 1 ]; } &&
+             shared_infra_marker "$file" exempt "$job_base"; then
+          # The OS is not decidable here, and this is the one shape in which
+          # that matters. A job selecting its pool dynamically names no
+          # `windows` label, so `windows_pool` is 0 and the check above was
+          # skipped — for a job that has ALSO declared, with the exemption, that
+          # it is deliberately a second host. That is the Windows job of rule
+          # 3, spelled the way the fleet's routing idiom spells it, and reading
+          # it as non-Windows reports the one job this rule exists for as clean.
+          #
+          # An ordinary consumer is untouched: it resolves its pool from the
+          # anchor and carries no exemption, and `localhost` on the run's Linux
+          # host is exactly right for it.
+          err RUNNER11 "$rel: job '$job' names localhost:$lb — a shared-infrastructure port — while selecting its runner dynamically AND declaring a shared-infra exemption, so it is a second host of unknown OS: if that host is Windows nothing is listening on that port (use the address the host exports as CI_SHARED_INFRA_ADDR, which is correct on either OS)"
         fi
       fi
 
@@ -1024,7 +1220,11 @@ EOF
 # which this gate does not have; that limitation is named in RUNNER7 rather than
 # assumed away.
 compute_reachable() {
-  local f records seed="" edges="" caller target changed=1 line
+  local f records seed="" edges="" caller target changed=1 line _cjob
+  # Reset, because RUNNER10 reads it and the self-test drives the pass more than
+  # once in a single process: edges left over from the previous fixture would be
+  # counted against the next one's owners.
+  CALL_EDGES=""
   for f in "$@"; do
     # Both sides of every edge are canonicalised, because the two sides were
     # spelled differently: the caller was whatever the invocation passed —
@@ -1051,8 +1251,14 @@ compute_reachable() {
     while IFS=$'\t' read -r cjob line; do
       [ -n "${line:-}" ] || continue
       cjob_re="$(re_quote "$cjob")"
-      [ "$(printf '%s\n' "$records" | grep -c "^#FORKGUARD	${cjob_re}$")" -gt 0 ] && continue
       target="$(cd "$(dirname "$f")/../.." 2>/dev/null && pwd)/${line#./}"
+      # Recorded BEFORE the fork guard, and deliberately. A guarded edge is
+      # still an invocation: `fork == false` is exactly the condition under
+      # which the job runs on THIS fleet, so it brings the callee's stack up on
+      # every in-repo pull request. The guard scopes REACHABILITY, which is a
+      # question about forks; it does not scope how many stacks a run starts.
+      CALL_EDGES="$CALL_EDGES$target	$f	$cjob"$'\n'
+      [ "$(printf '%s\n' "$records" | grep -c "^#FORKGUARD	${cjob_re}$")" -gt 0 ] && continue
       edges="$edges$f	$target"$'\n'
     done <<EOF
 $(printf '%s\n' "$records" | sed -n 's/^#CALLS\t//p')
@@ -1060,6 +1266,7 @@ EOF
   done
 
   REACHABLE_PR="$seed"
+  REACHABLE_PR_ANY="$seed"
   # Fixpoint rather than one hop: a caller may reach a callee that itself calls
   # another, and the pool at the end of that chain is as reachable as the first.
   while [ "$changed" -eq 1 ]; do
@@ -1072,6 +1279,23 @@ EOF
       changed=1
     done <<EOF
 $edges
+EOF
+  done
+
+  # …and again over CALL_EDGES, which carries the guarded edges too. Same
+  # fixpoint, different edge set: `<callee>	<caller>	<caller job>`, so the
+  # two fields are read in the other order.
+  changed=1
+  while [ "$changed" -eq 1 ]; do
+    changed=0
+    while IFS=$'\t' read -r target caller _cjob; do
+      [ -n "${caller:-}" ] || continue
+      printf '%s\n' "$REACHABLE_PR_ANY" | grep -qxF -- "$caller" || continue
+      printf '%s\n' "$REACHABLE_PR_ANY" | grep -qxF -- "$target" && continue
+      REACHABLE_PR_ANY="$REACHABLE_PR_ANY$target"$'\n'
+      changed=1
+    done <<EOF
+$CALL_EDGES
 EOF
   done
 }
@@ -2054,6 +2278,290 @@ jobs:
     runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
     timeout-minutes: 30
     steps: [{run: "true"}]'
+
+  # Uppercase is the same mistake. A gate that reads `localhost` and not
+  # `LOCALHOST` reports the job clean, and the job still cannot reach the stack.
+  expect_si "an uppercase band host is the same Windows mistake" "RUNNER11" \
+'on: [pull_request]
+jobs:
+  win:
+    runs-on: [self-hosted, Windows, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps:
+      - run: psql postgres://ci@LOCALHOST:35100/app'
+
+  # A six-digit port is not a band port. Without the trailing guard the first
+  # five digits match, and the job is reported for a mistake it did not make.
+  expect_si "a longer port that starts with a band port is not one" "" \
+'on: [pull_request]
+jobs:
+  win:
+    runs-on: [self-hosted, Windows, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "curl http://localhost:351000/health"}]'
+
+  # The anchor reference beside a literal pool. This resolves to the POOL on
+  # every run where the anchor was skipped or failed before publishing — the
+  # second host RUNNER9 exists to stop, wearing the shape of the fix. Only a
+  # GitHub-hosted image is allowed beside the reference, because that is the
+  # fleet's fork-routing idiom.
+  expect_si "a pool literal beside the anchor reference is not a pin" "RUNNER9" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: ${{ needs.anchor.outputs.runs-on || '"'"'ExampleRepo'"'"' }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect_si "the fork-routing fallback to a hosted image still pins" "" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: ${{ github.event.pull_request.head.repo.fork && '"'"'ubuntu-latest'"'"' || fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # A quoted string is not automatically a candidate label. Here it is an
+  # argument to a condition and can never be what `runs-on` resolves to, so
+  # reporting it would fail the guard a careful author wrote — which is the
+  # false positive that teaches a repository to pass `--allow-dynamic-runner`
+  # and lose the rule entirely.
+  expect_si "a literal inside a condition is not a fallback" "" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: ${{ contains(github.ref, '"'"'main'"'"') && fromJSON(needs.anchor.outputs.runs-on) || fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The literal that opens the expression, which no operator precedes. A
+  # non-empty string short-circuits before the reference is read, so this is
+  # the pool on every run, not just on the runs where the anchor went missing.
+  expect_si "a pool literal ahead of the anchor reference is not a pin" "RUNNER9" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: ${{ '"'"'ExampleRepo'"'"' || fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # A marker inside a `run: |` block is shell, not a declaration. A repository
+  # could exempt a job by echoing the string, and would not have to mean to.
+  expect_si "an exemption echoed inside a run block exempts nothing" "RUNNER9" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps:
+      - run: |
+          # shared-infra-exempt(test, #1): echoed, not declared
+          echo hi'
+
+  # The same bypass, reachable by adding a comment. `run: | # note` is a block
+  # scalar too, and a reader that only recognises an indicator at end of line
+  # puts the whole body back in the comment view.
+  expect_si "an exemption echoed inside a commented block scalar exempts nothing" "RUNNER9" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps:
+      - run: | # a trailing comment is legal after the indicator
+          # shared-infra-exempt(test, #1): echoed, not declared
+          echo hi'
+
+  # RUNNER10 counts INVOCATIONS, not definitions. A reusable workflow with one
+  # owner job, called from two caller jobs, brings two stacks up in one run;
+  # read as a file it is one owner and reads clean. Both files have to live
+  # under a `.github/workflows` directory, because that is what a `./…` call
+  # target is resolved against.
+  expect_si_calls() {
+    local name="$1" want="$2" caller_body="$3"
+    local got out_text wf="$tmp/.github/workflows"
+    mkdir -p "$wf"
+    printf '%s\n' "$caller_body" > "$wf/caller.yml"
+    cat > "$wf/reusable.yml" <<'YAML'
+on: [workflow_call]
+jobs:
+  up:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    services:
+      db: {image: "postgres:16"}
+    steps: [{run: "true"}]
+YAML
+    out_text="$(fail=0; ALLOW_DYNAMIC=1; SHARED_INFRA=1; SHARED_INFRA_OWNERS=""
+      compute_reachable "$wf/caller.yml" "$wf/reusable.yml" >/dev/null
+      check_file "$wf/caller.yml" "" blocked
+      check_file "$wf/reusable.yml" "" blocked
+      shared_infra_owner_verdict 2>&1)"
+    got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr '\n' ' ')"
+    got="$(printf '%s' "$got" | sed 's/ *$//')"
+    rm -rf "$wf"
+    if [ "$got" != "$want" ]; then
+      echo "FAIL $name: want ids [$want], got [$got]"
+      printf '%s\n' "$out_text" | sed 's/^/      /'
+      status=1
+    else
+      echo "ok   $name [$want]"
+    fi
+  }
+
+  expect_si_calls "one owner called from two jobs is two stacks" "RUNNER10" \
+'on: [pull_request]
+jobs:
+  a:
+    uses: ./.github/workflows/reusable.yml
+  b:
+    uses: ./.github/workflows/reusable.yml'
+
+  expect_si_calls "the same owner called once is one stack" "" \
+'on: [pull_request]
+jobs:
+  a:
+    uses: ./.github/workflows/reusable.yml'
+
+  # A fork guard scopes RUNNER4 and nothing else. `fork == false` is precisely
+  # the condition under which these calls DO run -- for every pull request the
+  # repository opens against itself -- so a guarded callee takes part in the
+  # run, and two invocations of it are two stacks. Read off the guard-aware
+  # reachable set, the callee was not in a pull request at all and the whole
+  # rule was skipped.
+  expect_si_calls "a fork-guarded owner called twice is still two stacks" "RUNNER10" \
+'on: [pull_request]
+jobs:
+  a:
+    if: github.event.pull_request.head.repo.fork == false
+    uses: ./.github/workflows/reusable.yml
+  b:
+    if: github.event.pull_request.head.repo.fork == false
+    uses: ./.github/workflows/reusable.yml'
+
+
+  # A runner GROUP names the pool as directly as a label does, and read as
+  # neither a label nor an expression both of these fell out of the rules
+  # entirely -- two stacks in one run, reported clean.
+  expect_si "two group-selected owners are still two stacks" "RUNNER10" \
+'on: [pull_request]
+jobs:
+  a:
+    runs-on:
+      group: fleet
+    timeout-minutes: 30
+    services:
+      db: {image: "postgres:16"}
+    steps: [{run: "true"}]
+  b:
+    runs-on:
+      group: fleet
+    timeout-minutes: 30
+    services:
+      db: {image: "postgres:16"}
+    steps: [{run: "true"}]'
+
+  # A repository with ONE fleet job. It publishes the host it landed on, and
+  # there is no other job for it to pin to: it IS the anchor. The finding it
+  # used to get could only be answered by making the job depend on itself.
+  expect_si "the only fleet job in the file is the anchor" "" \
+'on: [pull_request]
+jobs:
+  only:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      runs-on: ${{ steps.pin.outputs.runs-on }}
+    steps: [{id: pin, run: "true"}]'
+
+  # ...and publishing outputs is not a licence to name the pool. A file where
+  # something DOES resolve a pool from a `needs` output has an anchor already,
+  # and a second job that publishes anything is just a second host.
+  expect_si "a second publisher beside a real anchor is still a second host" "RUNNER9" \
+'on: [pull_request]
+jobs:
+  anchor:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      runs-on: ${{ steps.pin.outputs.runs-on }}
+    services:
+      db: {image: "postgres:16"}
+    steps: [{id: pin, run: "true"}]
+  test:
+    needs: [anchor]
+    runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  lint:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      whatever: ${{ steps.x.outputs.whatever }}
+    steps: [{id: x, run: "true"}]'
+
+  # The exemption names the YAML job id, which is the only id a workflow author
+  # can write. A matrix leg is judged as the synthetic `suite~leg1`, and a
+  # marker matched against THAT could never be written at all -- so every
+  # matrix-selected pool was unexemptable.
+  expect_si "an exemption covers the matrix legs of the job it names" "" \
+'# shared-infra-exempt(suite, #248): each leg is its own pool, by design
+on: [pull_request]
+jobs:
+  suite:
+    runs-on: ${{ fromJSON(matrix.suite.runs_on) }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        suite:
+          - {name: api, runs_on: '"'"'["self-hosted", "linux", "gcp", "ExampleRepo"]'"'"'}
+          - {name: web, runs_on: '"'"'["self-hosted", "linux", "gcp", "OtherRepo"]'"'"'}
+    steps: [{run: "true"}]'
+
+  # RUNNER11 on a job whose OS is not decidable. Selecting the pool dynamically
+  # names no `windows` label, so the Windows check was skipped -- on a job that
+  # has ALSO declared, with the exemption, that it is deliberately a second
+  # host. That is rule 3's Windows job, spelled the way this fleet spells
+  # routing, and it was the one job the rule exists for.
+  expect_si "a deliberate second host of unknown OS may not name localhost" "RUNNER11" \
+'# shared-infra-exempt(win, #248): the Windows leg of this suite
+on: [pull_request]
+jobs:
+  anchor:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      runs-on: ${{ steps.pin.outputs.runs-on }}
+    services:
+      db: {image: "postgres:16"}
+    steps: [{id: pin, run: "true"}]
+  win:
+    needs: [anchor]
+    runs-on: ${{ fromJSON(needs.anchor.outputs.win-runs-on) }}
+    timeout-minutes: 30
+    steps:
+      - run: psql postgres://ci@localhost:35100/app'
+
+  # ...and the ordinary consumer, which is the same shape minus the exemption,
+  # is untouched: it lands on the run's own Linux host and `localhost` there is
+  # exactly right.
+  expect_si "an ordinary consumer may name localhost" "" \
+'on: [pull_request]
+jobs:
+  anchor:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      runs-on: ${{ steps.pin.outputs.runs-on }}
+    services:
+      db: {image: "postgres:16"}
+    steps: [{id: pin, run: "true"}]
+  test:
+    needs: [anchor]
+    runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+    steps:
+      - run: psql postgres://ci@localhost:35100/app'
 
   rm -rf "$tmp"
   return "$status"

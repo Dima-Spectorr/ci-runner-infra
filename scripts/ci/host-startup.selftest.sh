@@ -1018,6 +1018,56 @@ else
   bad "one of the pin-hold scripts this boot script writes does not parse — every text check above still passes, and the failure first appears as a host that silently will not pin"
 fi
 
+# --- the remote build cache, whose every failure is silent --------------------
+#
+# This layer has no loud failure mode at all. A slot pointed at a dead server, a
+# slot pointed at its own loopback where nothing listens, a server reachable
+# from off the host, a token published before the server answered — each of them
+# produces builds that run, pass, and are slower than they should be, which is
+# how the one hand-wired build cache in this fleet stayed cold for weeks under
+# green runs.
+#
+# Four properties, and one of them is a security property rather than a speed
+# one: the port must be REJECTed on the primary interface, because the server
+# reads one repository's build artifacts out of a bucket nothing off this host
+# is entitled to read.
+has_turbo_cache() { # <file>
+  local code joined
+  code=$(code_of "$1")
+  joined=$(joined_code_of "$1")
+
+  # 1. The slot is told about the cache only when the server ANSWERED. The
+  #    token is published inside the readiness loop for exactly this reason, and
+  #    install_slot's guard is what turns "the server did not come up" into "no
+  #    cache" rather than a connection refused per task.
+  matches "$code" 'TURBO_TOKEN="\$tok"' || return 1
+  matches "$code" 'if \[ -n "\$TURBO_TOKEN" \]; then' || return 1
+  matches "$code" '/v8/artifacts/status' || return 1
+
+  # 2. The slot's own loopback is not where the server is. Every slot has its
+  #    own network namespace, so TURBO_API must name the slot's GATEWAY — the
+  #    same wrinkle that makes the credential broker unreachable on 127.0.0.1.
+  matches "$joined" 'Environment=TURBO_API=http://%s:%s' || return 1
+  matches "$joined" 'TURBO_API=.*slot_gw_ip' || return 1
+
+  # 3. The variables reach the unit. Computed and never interpolated is a whole
+  #    layer that silently does nothing.
+  matches "$code" '^\$TURBO_ENV$' || return 1
+
+  # 4. Nothing off this host reaches it.
+  matches "$joined" 'INPUT 1 -i "\$ifc" -p tcp --dport "\$TURBO_PORT" -j REJECT' || return 1
+
+  # 5. It never takes the host down. A build cache that refuses to register
+  #    agents has turned a speed layer into an outage.
+  ! matches "$joined" 'start_turbo_cache \|\| die'
+}
+
+if has_turbo_cache "$SCRIPT"; then
+  ok
+else
+  bad "the remote build cache is mis-wired — a slot pointed at a dead or unreachable server, a cache the network can reach, or a boot that dies over it; every one of those presents as builds that pass and are slow, which is the failure this layer exists to end"
+fi
+
 # --- mutation cases: prove the checks above can actually fail -----------------
 if has_slot_share "$SCRIPT"; then
   ok
@@ -1204,6 +1254,14 @@ mutate "the stack survives expiry"          's@docker rm --force@docker ps --fil
 mutate "no reset after the hold"            's@/opt/ci/job-hooks/slot-reset.sh completed "\\\$slot"@true@'                  has_pin_hold
 mutate "the hold cleared even on failure"   's@^if \[ "\\\$rc" != 0 \]; then$@if false; then@'                               has_pin_hold
 mutate "a failed teardown back in service"  's@the agent stays DOWN@the agent is restarted anyway@'                        has_pin_hold
+
+mutate "cache token published before it answered" 's@^  local tok$@  local tok; TURBO_TOKEN=x@; s@^      TURBO_TOKEN="\$tok"$@@'  has_turbo_cache
+mutate "slot told about a dead cache"     's@if \[ -n "\$TURBO_TOKEN" \]; then@if true; then@'                          has_turbo_cache
+mutate "cache addressed on the slot loopback" 's@Environment=TURBO_API=http://%s:%s@Environment=TURBO_API=http://127.0.0.1:%s@' has_turbo_cache
+mutate "cache variables never reach the unit" 's@^\$TURBO_ENV$@@'                                                       has_turbo_cache
+mutate "cache exposed to the network"     '/--dport "\$TURBO_PORT" -j REJECT/,+1d'                                      has_turbo_cache
+mutate "readiness probe dropped"          's@/v8/artifacts/status@/@'                                                   has_turbo_cache
+mutate "a cold cache takes the host down" 's@start_turbo_cache || log@start_turbo_cache || die@'                        has_turbo_cache
 
 mutate "the TTL suffix silently ignored"    's@is not a duration@is close enough@'                                  has_pin_hold
 mutate "minutes read as seconds"            's@unit=60 ;;@unit=1 ;;@'                                              has_pin_hold
