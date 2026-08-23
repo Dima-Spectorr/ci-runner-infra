@@ -30,6 +30,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/../.."
 MAIN="$ROOT/modules/ci-runner-cache-warmer/main.tf"
+VARS="$ROOT/modules/ci-runner-cache-warmer/variables.tf"
 TURBO="$ROOT/modules/ci-runner-cache-warmer/scripts/warm-turbo.sh"
 SHARED="$ROOT/scripts/ci/publish-cache-snapshot.sh"
 
@@ -38,7 +39,7 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); }
 bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
 
-for f in "$MAIN" "$TURBO"; do
+for f in "$MAIN" "$VARS" "$TURBO"; do
   [ -f "$f" ] || { echo "FAIL: missing $f"; exit 1; }
 done
 
@@ -155,7 +156,9 @@ has_uploader_bounds() { # <file>
   code=$(code_of "$1")
   matches "$code" '\*\[!A-Za-z0-9_-\]\*' || return 1
   matches "$code" 'WARM_MAX_BYTES' || return 1
-  matches "$code" -- '--no-clobber' || return 1
+  # Same trap as in has_cache_dir_bound: an intervening `--` here would make the
+  # pattern `--`, and this assertion would hold over any file at all.
+  matches "$code" '\-\-no-clobber' || return 1
   # A prefix that does not end in a slash writes next to the tree, not into it.
   matches "$code" 'does not end in'
 }
@@ -183,6 +186,81 @@ has_separate_firer() { # <file>
 
 if has_separate_firer "$MAIN"; then ok; else
   bad "the account that fires the warm is the account that runs it — firing a trigger cannot be scoped to one trigger, so a dependency in the default branch could start any build in the project, including the terraform apply"
+fi
+
+# 8. THE WARM CONFIGURES ITSELF FROM THE REPOSITORY. Every input a consumer has
+#    to fill in is an input a consumer can get wrong in a root nobody revisits,
+#    about a repository that changes without telling Terraform — and wrong here
+#    does not fail an apply, it fails inside a nightly build or, worse, succeeds
+#    having installed nothing. The install must be decided from the lockfile the
+#    repository already commits, and both commands must remain OPTIONAL.
+has_self_configuring() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'pnpm-lock\.yaml' || return 1
+  matches "$code" 'yarn\.lock' || return 1
+  matches "$code" 'package-lock\.json' || return 1
+  matches "$code" 'prepare_command = coalesce\(var\.prepare_command, local\.install_scriptfree\)' || return 1
+  matches "$code" 'build_command = coalesce\(var\.build_command,'
+}
+
+if has_self_configuring "$MAIN"; then ok; else
+  bad "the warm no longer works its install out from the repository's lockfile — every consuming root is back to stating a package manager that only has to be wrong once, in the one place where being wrong reports as a cache that is merely cold"
+fi
+
+# And the inputs stay optional. A default restored in variables.tf re-imposes a
+# package manager on every consumer that leaves them unset, which is all of them.
+block_of() { # <file> <variable-name>
+  awk -v v="$2" 'index($0, "variable \"" v "\" {") == 1 { inside = 1 } inside { print } inside && $0 == "}" { exit }' "$1"
+}
+
+has_optional_commands() { # <file>
+  local v blk
+  for v in prepare_command build_command; do
+    blk=$(block_of "$1" "$v")
+    [ -n "$blk" ] || return 1
+    matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*null[[:space:]]*$' || return 1
+  done
+}
+
+if has_optional_commands "$VARS"; then ok; else
+  bad "prepare_command or build_command has a default again — a consumer that states nothing now gets a package manager chosen by this module instead of one read from its own lockfile"
+fi
+
+# 9. THE BUILD IS TOLD WHERE TO WRITE, FROM THE SAME INPUT THE COLLECTOR READS.
+#    Two knobs that must be kept equal is one knob that is eventually unequal,
+#    and unequal here means turbo wrote its artifacts somewhere the publishing
+#    step does not look: a green warm that publishes nothing at all.
+has_cache_dir_bound() { # <file>
+  local code
+  code=$(code_of "$1")
+  # NOT `matches "$code" -- '--cache-dir…'`: `matches` passes its second argument
+  # to grep, so an intervening `--` makes the PATTERN `--`, which every file
+  # matches. That is how the mutation below first passed. Escape the dashes into
+  # the pattern instead.
+  matches "$code" '\-\-cache-dir=\\"\$WARM_TURBO_DIR\\"' || return 1
+  # The install ladder ends in `fi`, and the two halves are joined with a space:
+  # without the `;` the step is `fi npx …`, a syntax error that kills the build
+  # step before anything runs. Caught once by hand; asserted here so it is caught
+  # the next time too.
+  matches "$code" '"\$\{local\.install_full\};"' || return 1
+  [ "$(printf '%s\n' "$code" | grep -cE 'WARM_TURBO_DIR=\$\{var\.turbo_cache_dir\}')" -eq 2 ]
+}
+
+if has_cache_dir_bound "$MAIN"; then ok; else
+  bad "the build step and the publishing step no longer take the turbo cache directory from one input — turbo writes where the collector does not look, and the warm reports success having published nothing"
+fi
+
+# 10. THE SNAPSHOT'S INSTALL RUNS NO LIFECYCLE SCRIPTS. It is unpacked as root on
+#     every host in the pool; the build step's install is a separate ladder and
+#     is deliberately allowed to run them, which is exactly how this one loses
+#     `--ignore-scripts` in a later edit that "makes them consistent".
+has_scriptfree_snapshot() { # <file>
+  matches "$(code_of "$1")" 'install_scriptfree = replace\(replace\(local\.install_ladder, "@FLAGS@", "--ignore-scripts"\)'
+}
+
+if has_scriptfree_snapshot "$MAIN"; then ok; else
+  bad "the snapshot's install runs lifecycle scripts again — install-time scripts are the cheapest place to put code in someone else's build, and this archive is unpacked as root on every host in the pool"
 fi
 
 # --- mutations -----------------------------------------------------------------
@@ -258,6 +336,34 @@ mutate "the uploader stops checking the hash shape" "$TURBO" \
 mutate "the uploader overwrites what is already published" "$TURBO" \
   's@ --no-clobber@@' \
   has_uploader_bounds
+
+mutate "a package manager assumed instead of detected" "$MAIN" \
+  's@if \[ -f pnpm-lock\.yaml \]@if [ -f package-lock.json ]@' \
+  has_self_configuring
+
+mutate "the prepare command made a required input again" "$MAIN" \
+  's@prepare_command = coalesce(var\.prepare_command, local\.install_scriptfree)@prepare_command = var.prepare_command@' \
+  has_self_configuring
+
+mutate "a default put back on the command inputs" "$VARS" \
+  's@^  default     = null$@  default     = "npm ci --ignore-scripts"@' \
+  has_optional_commands
+
+mutate "the build no longer told where to write" "$MAIN" \
+  's@ --cache-dir=\\"\$WARM_TURBO_DIR\\"@@' \
+  has_cache_dir_bound
+
+mutate "the two halves of the build command run together" "$MAIN" \
+  's@"\${local\.install_full};",@local.install_full,@' \
+  has_cache_dir_bound
+
+mutate "the collector reads a directory of its own" "$MAIN" \
+  's@"WARM_TURBO_DIR=\${var\.turbo_cache_dir}",@"WARM_TURBO_DIR=node_modules/.cache/turbo",@' \
+  has_cache_dir_bound
+
+mutate "the two installs made consistent, in the wrong direction" "$MAIN" \
+  's|"@FLAGS@", "--ignore-scripts"|"@FLAGS@", ""|' \
+  has_scriptfree_snapshot
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
