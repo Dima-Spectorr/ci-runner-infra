@@ -62,6 +62,10 @@ locals {
     file("${local.pool_scripts}/parked-decision.sh"),
     file("${local.pool_scripts}/telemetry.sh"),
     file("${local.pool_scripts}/watchdog-decision.sh"),
+    # Same list, same order, same reason as the pool module's copy: the ceiling
+    # rule ships on every controller and is inert unless a pool declares the
+    # merge-queue role.
+    file("${local.pool_scripts}/mergify-capacity.sh"),
     # Before the controller, always: pool_table_parse is called at FILE SCOPE,
     # before the first tick. Concatenated after, the call runs against an
     # undefined function and the controller exits on boot having served nothing.

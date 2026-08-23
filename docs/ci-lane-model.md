@@ -393,6 +393,64 @@ merge the workflow change.
 A repository with no merge-queue pool writes none of this and neither rule
 applies to it — they are opted into by the route existing, not by a flag.
 
+### How big that pool is allowed to get — nobody types the number
+
+The route decides *where* the queue's runs go. It says nothing about *how many*
+hosts may be there, and that number has exactly one correct source: the
+repository's own Mergify configuration. Mergify runs at most
+`max_parallel_checks` speculative check runs per queue and no more, whatever the
+queue's depth.
+
+So the controller reads it, live, and derives the pool's ceiling:
+
+```
+hosts = ceil( Σ max_parallel_checks × jobs per check ÷ slots per host )
+```
+
+- **Σ over the repository's queues.** A queue that declares no
+  `max_parallel_checks` runs Mergify's default of one; `speculative_checks` is
+  the old spelling of the same knob.
+- **Jobs per check is observed, not configured.** It is however many of this
+  pool's jobs one workflow run contains, which is a property of the workflow
+  file and changes whenever somebody edits it. The controller already counts it
+  during the demand sweep and keeps the high-water mark.
+- **`batch_size` is read, published, and does not multiply.** In `parallel` mode
+  a batch is validated as **one** speculative pull request, so a wider batch
+  clears more of the backlog per check run rather than needing more runners. It
+  is published as `ci_queue_batch_size` precisely because the opposite intuition
+  is the natural one.
+- **Terraform's `max_hosts` is still the hard stop.** It owns the MIG's maximum
+  and the autoscaler's, so the derived number is a *soft* ceiling underneath it.
+  When the derivation wants more than `max_hosts` allows, the controller logs it
+  and publishes both numbers — `ci_queue_capacity_wanted_hosts` above
+  `ci_queue_capacity_hosts` is the reported bottleneck in its diagnosable form,
+  and needs no per-repository alert threshold because it is a comparison.
+- **It fails open.** A contents call that fails, a file that is not valid YAML,
+  a controller without `python3-yaml` — all keep the ceiling Terraform gave the
+  pool. A rule that failed closed would take a healthy queue to zero capacity on
+  a transient HTTP error, and a throttled queue reports nothing: its checks are
+  *pending*, never failed. `ci_queue_config_age_seconds` is how a stale ceiling
+  is told apart from a fresh one; `-1` means it has never been read.
+- **It needs `Contents: read` on the GitHub App**, which is the one new
+  permission this adds and the one thing that can make it fail open
+  *permanently* rather than transiently. Without it the contents call is a 403,
+  the merge-queue pool keeps its Terraform ceiling, and the only sign is
+  `ci_queue_config_age_seconds` climbing past the five-minute read interval —
+  which is why the controller logs the API status rather than treating every
+  non-2xx as "this repository has no queue".
+
+Read live rather than fixed at apply time because the two files live in
+different repositories: the pool is created here and sized by a
+`.mergify.yml` over there, which somebody may widen in a pull request of their
+own. A queue that widens is served by a pool that widens with it, with no apply
+anywhere. Nothing here is per-repository configuration — every controller in the
+fleet runs the same rule against whatever its own repository declares, which is
+what makes it a standard rather than eight numbers to keep in step.
+
+The rule is `modules/ci-runner-host-pool/scripts/mergify-capacity.sh`, and it is
+pure: `scripts/ci/mergify-capacity.selftest.sh` exercises it over the fleet's
+real queue configurations.
+
 ---
 
 ## Where a browser suite sits in the lanes
