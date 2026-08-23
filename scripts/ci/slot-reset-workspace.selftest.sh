@@ -30,6 +30,14 @@
 # Case 2 re-breaks the hook the way it was broken before and asserts this test
 # goes red. A test that only passes on correct input is not evidence.
 
+# The mutation patterns below match the TEXT of a heredoc template in which `\$u`,
+# `\$e` and `\$sub` are the literal characters that must be there — they are
+# runtime variables of the GENERATED hook, not of this script. Expanding them here
+# would match this test's own empty environment and mutate nothing, which is the
+# one failure a mutation guard cannot survive. Same disable, and the same reason,
+# as host-startup.selftest.sh.
+# shellcheck disable=SC2016
+
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
