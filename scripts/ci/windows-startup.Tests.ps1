@@ -2119,7 +2119,10 @@ Describe 'out-of-tree hardlinks' {
             [pscustomobject] @{ Path = 'C:\ci-cache\a'; Links = 2; Id = '1:0:7' },
             [pscustomobject] @{ Path = 'C:\ci-cache\b'; Links = 2; Id = '1:0:8' }
         )
-        Get-CacheHardlinkReason -Records $records | Should -Match 'C:\ci-cache\a'
+        # DOUBLED backslashes: -Match takes a regex, so `\a` is BEL and `\c` is a
+        # control escape -- the assertion would look for a string the reason can
+        # never contain, and pass only by never matching anything.
+        Get-CacheHardlinkReason -Records $records | Should -Match 'C:\\ci-cache\\a'
     }
 
     It 'names the first offender in tree order, every run' {
@@ -2132,7 +2135,7 @@ Describe 'out-of-tree hardlinks' {
             [pscustomobject] @{ Path = 'C:\ci-cache\ccc'; Links = 2; Id = '1:0:9' }
         )
         1..5 | ForEach-Object {
-            Get-CacheHardlinkReason -Records $records | Should -Match 'C:\ci-cache\aaa'
+            Get-CacheHardlinkReason -Records $records | Should -Match 'C:\\ci-cache\\aaa'
         }
     }
 
@@ -2144,7 +2147,7 @@ Describe 'out-of-tree hardlinks' {
             })
         $reason = Get-CacheHardlinkReason -Records $records
         $reason | Should -Not -Match "`n"
-        $reason | Should -Match 'C:\ci-cache\a phase 7: sealed$'
+        $reason | Should -Match 'C:\\ci-cache\\a phase 7: sealed$'
     }
 
     It 'bounds the name it logs' {
@@ -2163,7 +2166,7 @@ Describe 'out-of-tree hardlinks' {
 
     It 'still finds an offender sitting behind a null record' {
         $records = @($null, [pscustomobject] @{ Path = 'C:\ci-cache\z'; Links = 2; Id = '1:0:7' })
-        Get-CacheHardlinkReason -Records $records | Should -Match 'C:\ci-cache\z'
+        Get-CacheHardlinkReason -Records $records | Should -Match 'C:\\ci-cache\\z'
     }
 }
 
