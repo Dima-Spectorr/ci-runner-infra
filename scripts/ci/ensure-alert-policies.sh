@@ -103,7 +103,7 @@ g() {
 # transport for channels and policies removes the surprise install dependency
 # and makes every call in this script fail the same way when auth is wrong.
 # Minted once, not per call. There are now upwards of twenty API calls in a full
-# run (nine policies, five descriptors, two listings), and `gcloud auth
+# run (ten policies, fourteen descriptors, two listings), and `gcloud auth
 # print-access-token` is a Python process launch each time — on a machine behind
 # the corporate proxy that was the dominant cost of the run and, worse, twenty
 # more chances to fail on a network blip in the middle of provisioning. An
@@ -329,6 +329,18 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    slotsmissing) cat <<EOF
+{ "displayName": "CI runners / capacity on paper only (slots registered short of slots built)",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "Hosts are RUNNING and past their registration grace, and fewer runner agents answer than the pool was built with. This is the one alert that separates 'the pool is fine and jobs are queuing' from 'the pool is not there': ci_slots_total is arithmetic — hosts x slots — so it reads identically whether every agent registered or none did, and every other series stays green through all three of the failures below.\n\nRead ci_slots_registered next to ci_slots_total to size the gap, then the host serial log. Three causes, in rough order of likelihood: a host that registered NOTHING (its config.sh never completed — check the registration token and egress to github.com); a host whose slot units died before the agent started (a truncated generated hook is 203/EXEC, and the host still reports healthy); or a slot the host's own sweep CONDEMNED after CONDEMN_MAX consecutive failures to reach a clean state, which is the sweep working — the slot was failing every job it claimed — and grep 'taking it out of service' in the host's syslog will say so.\n\nA controller that cannot read the runner list contributes to neither side of this, by construction, so an unreadable API cannot raise it. Sustained non-zero only: a host replaced mid-window is excluded by the grace, but a rolling recycle can still tick it briefly." },
+  "conditions": [ { "displayName": "ci_slots_missing > 0 for 15m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "900s",
+      "filter": "metric.type=\"custom.googleapis.com/github/ci_slots_missing\" AND resource.type=\"generic_node\"",
+      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MIN" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
     egressdenied) cat <<EOF
 { "displayName": "CI runners / egress refused",
   "combiner": "OR",
@@ -420,6 +432,12 @@ ensure_descriptor ci_host_idle_seconds_max   "Longest idle time across warm host
 ensure_descriptor ci_queue_wait_seconds_max  "Longest time a queued job has waited for a slot."
 ensure_descriptor ci_drain_verdicts          "Drain-loop outcomes, labelled by outcome."
 ensure_descriptor ci_tick_seconds            "Controller tick duration. Approaching the watchdog threshold means an imminent restart loop in which nothing is published at all."
+# Declared even though the policy reads only ci_slots_missing: the gap is not
+# actionable without the numerator, and a descriptor a dashboard cannot find
+# is how "how many slots ARE answering" becomes a question nobody can ask
+# during the incident.
+ensure_descriptor ci_slots_registered        "Slots whose runner agent answers, over RUNNING hosts past their registration grace. Compare with ci_slots_total, which is arithmetic and cannot fall."
+ensure_descriptor ci_slots_missing           "Slots the pool was built with that no agent answers for. Non-zero is capacity that exists on paper only: a host that registered nothing, a host whose slot units died before the agent started, or a slot the host condemned for failing every job it claimed."
 # Published by the HOST once per boot, not by the controller per tick. Declared
 # here for the same reason as the rest — a pool that has never booted a host
 # still needs its alerting provisioned — and it matters more here: these series
@@ -433,14 +451,14 @@ ensure_descriptor ci_cache_dirs_hydrated     "Tool caches moved in. Zero alongsi
 
 # Same fail-closed rule as the channel listing: a LIST that errored reads as an
 # empty inventory, and an empty inventory makes every policy below look absent —
-# so the script would create a SECOND copy of all nine and double every page.
+# so the script would create a SECOND copy of all ten and double every page.
 pl_status="$(mon GET 'alertPolicies?pageSize=1000')"
 [ "$pl_status" = "200" ] || {
   echo "$PROJECT: cannot list alert policies (HTTP $pl_status)" >&2
   sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
 existing="$(json_pairs alertPolicies displayName)"
 
-for key in heartbeat blind idle queue drain slowtick cachestale cachefail egressdenied; do
+for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing egressdenied; do
   policy_json "$key" >"$tmp/p.json"
   # Neither of these ends in `| head -1`, and that is deliberate. This script
   # runs `set -euo pipefail`; under both options a reader that stops early sends
