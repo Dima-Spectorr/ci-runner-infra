@@ -3245,6 +3245,18 @@ WDTIMEOF
   # watchdog restarts a unit, this deletes a machine, and the cheaper remedy
   # must get first refusal.
   if [ -n "$HEALTH_PORT" ]; then
+    # The heartbeat file must EXIST before the responder starts, because the
+    # unit below bind-mounts that one path into an otherwise empty view of
+    # /var/lib. A bind source that is absent at unit start is absent for the
+    # life of the process — `Restart=always` never fires, since a responder
+    # answering 503 has not exited — so a controller installed a moment before
+    # its first tick would answer 503 forever and the group would delete it on a
+    # loop. Touching it here is not a lie about liveness: the controller service
+    # is restarted a few lines below and overwrites it within one tick, and if
+    # that never happens the file ages out and the verdict flips to 503 exactly
+    # as it should.
+    touch "$STATE_DIR/heartbeat" 2>/dev/null || true
+
     cat >/opt/ci-controller/livez.py <<LIVEZEOF
 import http.server, os, time
 
@@ -3288,12 +3300,43 @@ RestartSec=10
 # It reads one file's mtime and writes a fixed string. Nothing it does needs
 # the controller's identity, and it is the only thing on this VM listening on a
 # port, so it runs as nobody.
+#
+# AND IT IS THE ONLY UNPRIVILEGED PROCESS ON THIS MACHINE. Before #308 the
+# controller ran nothing but root's own loop; adding a socket listener changed
+# what a bug in that listener would be worth. `$STATE_DIR` is created 0755 by
+# root and holds `api.body` — the last GitHub response, which on a private
+# repository is repository data — so "runs as nobody" alone would leave a
+# network-facing process able to read it.
+#
+# TemporaryFileSystem + BindReadOnlyPaths is the narrow answer: an empty tmpfs
+# is mounted over /var/lib inside this unit's namespace and exactly one path is
+# bound back in, read-only. The responder therefore sees the heartbeat and
+# NOTHING else under /var/lib — not api.body, not the drain counters. Everything
+# below it removes a capability the responder demonstrably does not use.
 User=nobody
 Group=nogroup
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+TemporaryFileSystem=/var/lib:ro
+BindReadOnlyPaths=/var/lib/ci-controller/heartbeat
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# MemoryDenyWriteExecute is deliberately NOT set. It is the one hardening on
+# this list that breaks interpreters rather than merely constraining them, and
+# a responder that fails to start is a probe that never answers, which is a
+# group deleting a healthy controller every few minutes. The blast radius of
+# each setting here is judged against that, not against a static checklist.
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
