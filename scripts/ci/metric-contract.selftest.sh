@@ -69,7 +69,11 @@ floor "host-startup.sh" "$host_published" 3
 # countdown on a transitional arm that resolves a pre-`ci-host-os` host by
 # inference. Lose the series and the arm has no removal criterion and becomes
 # permanent.
-for m in ci_worker_gate_verdicts ci_worker_gate_os_fallback; do
+# ci_pin_holds_honoured is named for a third reason: it is the ONLY evidence
+# that the pin-hold veto ran at all. Every other symptom of losing it is a
+# success -- hosts drain, the pool shrinks, the graphs look healthy -- right up
+# until a pull request's second job finds the host it named is gone.
+for m in ci_worker_gate_verdicts ci_worker_gate_os_fallback ci_pin_holds_honoured; do
   printf '%s\n' "$published" | grep -qx "$m" || {
     printf 'FAIL %s is not published by either script — the second delete gate has no telemetry\n' "$m"
     fails=$((fails + 1)); }

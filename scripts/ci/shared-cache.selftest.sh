@@ -1519,25 +1519,37 @@ has_agreeing_cache_dirs() { # <publish-script>
 # The split is the whole control: `CACHE_PREPARE` runs third-party code, and a
 # job with `id-token: write` hands that code the credential through
 # ACTIONS_ID_TOKEN_REQUEST_TOKEN no matter what the script does afterwards.
+# Every block for one job key in the doc, each ending where the job ends: the
+# next key at the same indent, or the closing fence.
+#
+# The doc carries more than one `build:` -- the reference workflow's and the
+# Windows pool's -- and the claim below is about ALL of them, so the range
+# cannot simply run from `build:` to `publish:`: a `,` range in sed restarts,
+# so a `build:` with no `publish:` after it printed to END OF FILE, and the
+# predicate read every `id-token` in the document as being inside a build job.
+# Closing on the fence alone is not enough either -- both jobs of the reference
+# workflow live in ONE fenced block, so `build:` would swallow `publish:` and
+# with it the credential the whole split exists to keep out of the build job.
+yaml_job_block() { # <file> <key> [occurrence, default 1]
+  awk -v key="  $2:" -v want="${3:-1}" '
+    $0 == key { n++; if (n == want) { inb = 1; print } next }
+    inb && ($0 == "```" || $0 ~ /^  [A-Za-z_][A-Za-z0-9_-]*:[ 	]*$/) { inb = 0; next }
+    inb { print }
+  ' "$1"
+}
+
 has_split_publishing_workflow() { # <doc>
   local build publish winbuild doc
   doc=$(cat "$1")
   # The job blocks, by their own boundaries rather than by line count.
-  #
-  # THE FIRST `build:` ONLY, and awk rather than a sed range, because the
-  # document now carries a SECOND one: the Windows variant further down. A sed
-  # range re-triggers on every match of its opening address, so `/build:/,/publish:/`
-  # opened again at the Windows block and, finding no later `publish:`, ran to
-  # end of file -- handing the refusals below several hundred lines of prose to
-  # read as job YAML. The predicate did not become wrong when the Windows block
-  # was added; it had always been one heading away from it.
-  build=$(awk '/^  build:$/ { f = 1 } f { print } /^  publish:$/ { exit }' "$1")
-  publish=$(sed -n '/^  publish:$/,/^```$/p' "$1")
-  # And the Windows build job gets the SAME reading rather than being skipped.
-  # It runs CACHE_PREPARE, so every reason the Linux build job may hold no
-  # credential applies to it unchanged; a split that holds on one platform and
-  # not the other is not a split.
-  winbuild=$(awk '/^  build:$/ { n++ } n == 2 { print } n == 2 && /^```$/ { exit }' "$1")
+  # The FIRST `build:` and the SECOND are both build jobs -- the reference
+  # workflow's and the Windows pool's -- and the claim below is about BOTH. The
+  # Windows one runs CACHE_PREPARE too, so every reason the Linux build job may
+  # hold no credential applies to it unchanged; a split that holds on one
+  # platform and not the other is not a split.
+  build=$(yaml_job_block "$1" build 1)
+  winbuild=$(yaml_job_block "$1" build 2)
+  publish=$(yaml_job_block "$1" publish)
   [ -n "$build" ] && [ -n "$publish" ] && [ -n "$winbuild" ] || return 1
 
   matches "$build" 'CACHE_PREPARE'      || return 1
@@ -2334,6 +2346,13 @@ mutate_file "$PUBDOC" 'the two jobs are merged back into one' has_split_publishi
   's@^      id-token: write.*$@@'
 mutate_file "$PUBDOC" 'the install job gains the credential' has_split_publishing_workflow \
   's@^      contents: read  .*$@      contents: read\n      id-token: write@'
+# The SECOND build job, on its own. The first version of this predicate ran its
+# range from `build:` to `publish:`, so the Windows block -- which has no
+# `publish:` after it -- was never inside the text being judged at all: a
+# credential could be granted to a documented install job and the split's own
+# test would pass. The two blocks are the same claim, so both are mutated.
+mutate_file "$PUBDOC" 'the Windows install job gains the credential' has_split_publishing_workflow \
+  's@^    runs-on: windows-latest$@    runs-on: windows-latest\n    permissions:\n      id-token: write@'
 mutate_file "$PUBDOC" 'the token is granted workflow-wide instead' has_split_publishing_workflow \
   's@^permissions: \{\}$@permissions:\n  id-token: write@'
 mutate_file "$PUBDOC" 'the publishing job stops waiting for the build' has_split_publishing_workflow \

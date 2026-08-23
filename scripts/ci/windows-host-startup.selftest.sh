@@ -1698,8 +1698,8 @@ has_cache_master_sealed_readonly() { # <file>
   # order is what makes this decidable from the text: the reason line must appear
   # earlier in the file than the reset.
   local scan_at seal_at
-  scan_at=$(printf '%s\n' "$code" | grep -nE 'Get-CacheHostileReason -Entries \$entries' | head -1 | cut -d: -f1)
-  seal_at=$(printf '%s\n' "$code" | grep -nE "FilePath 'icacls\\.exe'" | head -1 | cut -d: -f1)
+  scan_at=$(printf '%s\n' "$code" | grep -nE 'Get-CacheHostileReason -Entries \$entries' | cut -d: -f1 | sed -n 1p)
+  seal_at=$(printf '%s\n' "$code" | grep -nE "FilePath 'icacls\\.exe'" | cut -d: -f1 | sed -n 1p)
   [ -n "$scan_at" ] && [ -n "$seal_at" ] || return 1
   [ "$scan_at" -lt "$seal_at" ] || return 1
 
@@ -1762,7 +1762,13 @@ has_bounded_native_calls() { # <file>
   # The wait has a deadline and the deadline is acted on. Without the kill the
   # wrapper is an ordinary blocking call with extra words.
   matches "$code" 'WaitForExit\(\$TimeoutSeconds \* 1000\)' || return 1
-  matches "$code" '\$proc\.Kill\(\)' || return 1
+  # ANCHORED ON ITS OWN LINE, because phase 7's snapshot fetch now has a
+  # $proc.Kill() of its own -- spelled `try { $proc.Kill() } catch { ... }`, all
+  # on one line. Unanchored, that second site kept this assertion green while
+  # Invoke-BoundedNative's deadline did nothing but log, which is the exact
+  # failure the wrapper exists to prevent. The mutation below targets the
+  # standalone-line form; the match has to be the same shape or it tests nothing.
+  matches "$code" '^ *\$proc\.Kill\(\)$' || return 1
 
   # A bound of zero reads as ALREADY OVER, never as unbounded -- the reading
   # Test-CacheSeedBudgetExpired takes, for the reason it gives.
@@ -1790,8 +1796,8 @@ has_slot_cache_isolation() { # <file>
   # would mean "seeding was attempted"; and phase 5 reads it to decide whether to
   # emit ten variables that name paths inside it.
   local clear_at write_at
-  clear_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$marker' | head -1 | cut -d: -f1)
-  write_at=$(printf '%s\n' "$code" | grep -nE 'Set-Content -LiteralPath \$marker' | head -1 | cut -d: -f1)
+  clear_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$marker' | cut -d: -f1 | sed -n 1p)
+  write_at=$(printf '%s\n' "$code" | grep -nE 'Set-Content -LiteralPath \$marker' | cut -d: -f1 | sed -n 1p)
   [ -n "$clear_at" ] && [ -n "$write_at" ] || return 1
   [ "$clear_at" -lt "$write_at" ] || return 1
 
@@ -1835,8 +1841,8 @@ has_slot_cache_isolation() { # <file>
   # points at (PowerShell/PowerShell#621, fixed in 6.0, never backported), so the
   # tree is scanned first and a hostile one is left on disk rather than deleted.
   local scan_at del_at
-  scan_at=$(printf '%s\n' "$code" | grep -nE '\$reason = Get-CacheHostileReason -Entries \(@\(\$dir\)' | head -1 | cut -d: -f1)
-  del_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$dir\.FullName -Recurse' | head -1 | cut -d: -f1)
+  scan_at=$(printf '%s\n' "$code" | grep -nE '\$reason = Get-CacheHostileReason -Entries \(@\(\$dir\)' | cut -d: -f1 | sed -n 1p)
+  del_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$dir\.FullName -Recurse' | cut -d: -f1 | sed -n 1p)
   [ -n "$scan_at" ] && [ -n "$del_at" ] || return 1
   [ "$scan_at" -lt "$del_at" ] || return 1
   # And the refusal is acted on. Anchored the same way, and for the same reason.
@@ -1855,8 +1861,8 @@ has_slot_cache_isolation() { # <file>
   # slot's Modify grant, so a job could have planted a junction inside a stage a
   # previous boot left behind -- and 5.1's Remove-Item follows it.
   local stale_scan_at stale_del_at
-  stale_scan_at=$(printf '%s\n' "$code" | grep -nE '\$staleReason = Get-CacheHostileReason' | head -1 | cut -d: -f1)
-  stale_del_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$stale\.FullName -Recurse' | head -1 | cut -d: -f1)
+  stale_scan_at=$(printf '%s\n' "$code" | grep -nE '\$staleReason = Get-CacheHostileReason' | cut -d: -f1 | sed -n 1p)
+  stale_del_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$stale\.FullName -Recurse' | cut -d: -f1 | sed -n 1p)
   [ -n "$stale_scan_at" ] && [ -n "$stale_del_at" ] || return 1
   [ "$stale_scan_at" -lt "$stale_del_at" ] || return 1
 
@@ -1978,6 +1984,273 @@ mutate "the volume measured once for the host instead of between copies"   's|} 
 mutate "the cache variables emitted for a slot that never got a cache" \
   's|if (-not \[string\]::IsNullOrWhiteSpace(\$CachePath)) {|if ($true) {|' \
   has_slot_cache_isolation
+
+# --- invariant 12: the snapshot hydrate stays bounded and untrusted ----------
+#
+# Phase 7 now unpacks a tarball this pool did not build over the tree every slot
+# reads from. That is a NEW way into C:\ci-cache, and it is the only one no
+# reviewed image-build step stands in front of -- so every property below is the
+# reason it is allowed to exist at all, and none of them fails loudly when it is
+# edited away. A hydrate that has quietly stopped scanning still hydrates.
+
+has_hydrate_bounds_honoured() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # THE TOKEN IS A PROPERTY, NOT A REGEX OVER A STRINGIFIED OBJECT.
+  # Invoke-RestMethod deserialises by content type, so `[string]` on the token
+  # response yields `@{access_token=...; expires_in=...}` -- which is not JSON.
+  # A pattern looking for `"access_token":` finds nothing in it, so the hydrate
+  # said 'no-token' on a host whose token arrived perfectly, and the whole pool
+  # quietly stayed on its baked cache with a tidy verdict in the log.
+  matches "$code" '\$tokenResult\.Object\.access_token' || return 1
+  ! matches "$code" '"access_token"\\s\*:' || return 1
+
+  # A metadata attribute is text someone else supplies. `[decimal] $Text` on
+  # forty digits OVERFLOWS AND THROWS -- an exception on the boot path of the one
+  # phase whose entire contract is to fail open.
+  matches "$code" '\[decimal\]::TryParse\(\$Text, \[ref\] \$n\)' || return 1
+
+  # THE WHOLE DOWNLOAD IS BOUNDED, NOT EACH READ. ReadWriteTimeout bounds one
+  # Read call, so a response trickling a byte just inside it is unbounded in
+  # aggregate -- and phase 7 runs BEFORE agent registration, so that is a host
+  # recycled for never registering, not a slow download.
+  matches "$code" '\$copyDeadline = \(\[datetime\]::UtcNow\)\.AddSeconds\(\$TimeoutSeconds\)' || return 1
+  matches "$code" '^ *if \(\[datetime\]::UtcNow -gt \$copyDeadline\) \{$' || return 1
+
+  # BOTH AT ONCE. The compressed archive is what tar reads, so it stays on disk
+  # for the whole unpack: the reservation covers the archive AND its expansion.
+  # Reserving only the expansion passed a snapshot that then filled the boot
+  # volume of a host about to run jobs.
+  matches "$code" 'Get-CacheExpandBound -CompressedBytes \$Bytes\) \+ \$Bytes' || return 1
+
+  # The age bound is a FLOOR. [int] rounds, so 167.6 hours became 168 and a
+  # snapshot inside a 168-hour bound was refused for being at it.
+  matches "$code" '\[math\]::Floor\(\$started\.Subtract\(\$created\)\.TotalHours\)' || return 1
+
+  # AN EMPTY DIRECTORY IS NOT A CACHE. The host pre-creates every tool directory,
+  # so a snapshot built from a prepare that only warmed npm still ships an empty
+  # maven and nuget -- and moving those over the baked ones costs this pool the
+  # cache its own image built, with the verdict still reading 'hydrated'.
+  matches "$code" 'Select-Object -First 1\)\) \{' || return 1
+
+  # KILL IS A REQUEST, NOT AN EVENT: it returns as soon as termination is queued.
+  # Without a confirmed exit the caller's cleanup scans and then recursively
+  # deletes a tree tar may still be writing into, and 5.1's Remove-Item follows a
+  # reparse point planted in that window -- as SYSTEM. No ordering closes it, so
+  # an unconfirmed stop gives the delete up entirely.
+  matches "$code" '\$proc\.WaitForExit\(10000\)' || return 1
+  matches "$code" '\$script:CacheStageNotQuiesced = \$true' || return 1
+  local flag_at del_at
+  flag_at=$(printf '%s\n' "$code" | grep -n 'if (\$script:CacheStageNotQuiesced) {' | cut -d: -f1 | sed -n 1p)
+  del_at=$(printf '%s\n' "$code" | grep -n 'Remove-Item -LiteralPath \$Path -Recurse' | cut -d: -f1 | sed -n 1p)
+  [ -n "$flag_at" ] && [ -n "$del_at" ] || return 1
+  [ "$flag_at" -lt "$del_at" ] || return 1
+
+  # THE SCAN IS INSIDE THE BUDGET TOO. An archive within the size bound can still
+  # hold a very large number of entries, and `Get-ChildItem -Recurse` is one call
+  # that cannot be interrupted -- the budget quietly not applying to the last
+  # step of the sequence. And a timed-out walk hands back NO entries: a hostility
+  # scan is a proof of ABSENCE, and half a tree proves nothing about the rest.
+  # A STAGED ENTRY IS A DIRECTORY OR IT IS NOTHING. Test-Path is true for a file
+  # of the same name, and a file moved over the baked tree is worse than a cold
+  # host: Initialize-SlotCache cannot copy from it and skips the writable
+  # fallback because the path already exists, so every job is handed cache
+  # variables pointing at a file.
+  matches "$code" 'if \(-not \$staged\.PSIsContainer\) \{' || return 1
+
+  # The five metadata attributes and the token are ten seconds each in front of a
+  # sixty-second phase. `& $left` bounds every fetch AFTER this point; nothing
+  # bounded the token read itself.
+  matches "$code" 'if \(\(& \$left\) -le 0\) \{' || return 1
+
+  # A SURVIVING `.previous` IS A REFUSAL. Remove-CacheTreeSafely deliberately
+  # leaves a stale aside it cannot show to be safe, and Move-Item -Force onto an
+  # existing directory name moves the source INSIDE it -- inside a junction is
+  # wherever the junction points, so the baked master gets written to an
+  # arbitrary path as SYSTEM, which the scan after it can refuse but not undo.
+  matches "$code" 'if \(Test-Path -LiteralPath \$aside\) \{' || return 1
+  local aside_at move_at
+  aside_at=$(printf '%s\n' "$code" | grep -n 'if (Test-Path -LiteralPath \$aside) {' | cut -d: -f1 | sed -n 1p)
+  move_at=$(printf '%s\n' "$code" | grep -n 'Move-Item -LiteralPath \$target -Destination \$aside' | cut -d: -f1 | sed -n 1p)
+  [ -n "$aside_at" ] && [ -n "$move_at" ] || return 1
+  [ "$aside_at" -lt "$move_at" ] || return 1
+  matches "$code" "return 'budget-spent'" || return 1
+
+  matches "$code" 'Get-CacheStagedEntry -Path \$script:CacheStage -DeadlineUtc \$deadline' || return 1
+  matches "$code" "return 'scan-timeout'" || return 1
+  matches "$code" 'Entries = @\(\); Failed = \$failed; TimedOut = \$true' || return 1
+}
+
+has_bounded_cache_hydrate() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # ORDERING, AND IT IS THE DESIGN. The hydrate writes untrusted content into the
+  # master; Protect-CacheMaster is the gate that scans and seals it. Moving the
+  # hydrate after the seal would leave the pool reading a tree that was sealed
+  # before its contents arrived.
+  local hyd_at seal_at
+  hyd_at=$(printf '%s\n' "$code" | grep -n '\$null = Invoke-CacheHydrate' | cut -d: -f1 | sed -n 1p)
+  seal_at=$(printf '%s\n' "$code" | grep -n 'Protect-CacheMaster -SlotUsers \$slotUsers' | cut -d: -f1 | sed -n 1p)
+  [ -n "$hyd_at" ] && [ -n "$seal_at" ] || return 1
+  [ "$hyd_at" -lt "$seal_at" ] || return 1
+
+  # The pointer is the one input here that names a path. Whitelisted, and the
+  # rejected name is never echoed: it is fully attacker-controlled, it has not
+  # been validated at the point the log line runs, and boot logs are read in a
+  # terminal.
+  matches "$code" 'if \(-not \(Test-CacheSnapshotPointer -Name \$snapshot\)\) \{' || return 1
+  matches "$code" '\$\(\$snapshot\.Length\) bytes' || return 1
+
+  # THE GENERATION IS PINNED. Age, size and free space are asserted against the
+  # metadata and the bytes arrive afterwards; unpinned, every one of those bounds
+  # was checked against a generation that no longer exists.
+  matches "$code" 'generation=\$generation' || return 1
+
+  # A COUNTING PASS DECIDES THE BOUND, BEFORE anything is unpacked. tar exits 0
+  # on a stream cut at a member boundary -- the zero padding reads as an
+  # end-of-archive marker -- so a bound enforced only by stopping the unpacker
+  # yields a PARTIAL cache believed whole.
+  local count_at unpack_at
+  count_at=$(printf '%s\n' "$code" | grep -n 'Measure-CacheArchiveExpansion -Path \$archive' | cut -d: -f1 | sed -n 1p)
+  unpack_at=$(printf '%s\n' "$code" | grep -n 'Expand-CacheSnapshot -Archive \$archive' | cut -d: -f1 | sed -n 1p)
+  [ -n "$count_at" ] && [ -n "$unpack_at" ] || return 1
+  [ "$count_at" -lt "$unpack_at" ] || return 1
+  # ...and the count is ACTED ON. gzip expands by more than a thousandfold on the
+  # right input, so the bound on the compressed archive bounds nothing.
+  matches "$code" '^        if \(\$expanded -gt \$bound\) \{$' || return 1
+
+  # THE SAME SCAN Protect-CacheMaster RUNS, and it runs BEFORE the staged tree is
+  # moved into the master -- not after, where the refusal would name content that
+  # is already published. Anchored to the hydrate's indent: Protect-CacheMaster
+  # has a scan of its own at four spaces, and it was standing in for this one.
+  local scan_at move_at
+  scan_at=$(printf '%s\n' "$code" | grep -n '^        \$reason = Get-CacheHostileReason -Entries \$scan\.Entries$' | cut -d: -f1 | sed -n 1p)
+  move_at=$(printf '%s\n' "$code" | grep -n 'Update-CacheMasterFromStage -Stage' | cut -d: -f1 | sed -n 1p)
+  [ -n "$scan_at" ] && [ -n "$move_at" ] || return 1
+  [ "$scan_at" -lt "$move_at" ] || return 1
+  matches "$code" "return 'scan-refused'" || return 1
+
+  # The master's own ROOT is checked before anything is moved onto it. The
+  # recursive scan is Protect-CacheMaster's, and it runs after this -- so a
+  # junction AS the master would be moved into before anything looked at it.
+  matches "$code" '\$rootReason = Get-CacheHostileReason' || return 1
+
+  # THIS LAYER FAILS OPEN. Get-MetadataValue denies the boot when the metadata
+  # server does not answer, which is right for identity and wrong for a cache: a
+  # host that refuses to register over a cold cache is a missing host, and the
+  # pool answers a missing host by queueing jobs.
+  matches "$code" 'Get-CacheMetadataResult -Path' || return 1
+
+  # Remove-CacheTreeSafely is the ONLY recursive delete on the scratch trees.
+  # Windows PowerShell 5.1 -- which runs this script -- follows a directory
+  # junction on `Remove-Item -Recurse` and deletes what it points at
+  # (PowerShell/PowerShell#621, fixed in 6.0, never backported), and the staging
+  # tree holds a tarball a publisher wrote.
+  ! matches "$code" 'Remove-Item -LiteralPath \$script:CacheStage' || return 1
+  ! matches "$code" 'Remove-Item -LiteralPath \$script:CacheDownload' || return 1
+  matches "$code" 'Remove-CacheTreeSafely -Path \$script:CacheStage' || return 1
+  matches "$code" 'Remove-CacheTreeSafely -Path \$script:CacheDownload' || return 1
+
+  # `Accept-Encoding: gzip` is not an optimisation. Without it the storage
+  # service decompressively transcodes a gzip-stored object: it arrives with no
+  # Content-Length and expanded past the size that was just bounded. So the
+  # header is sent by hand and the handler's own decompression stays OFF.
+  matches "$code" "Headers.Add\('Accept-Encoding', 'gzip'\)" || return 1
+  ! matches "$code" 'AutomaticDecompression *=' || return 1
+}
+
+if has_bounded_cache_hydrate "$SCRIPT"; then
+  ok
+else
+  bad "the snapshot hydrate is unbounded, unpinned, or reaches the master unscanned — it unpacks an archive this pool did not build over the tree every slot reads from, and it is the one way into C:\\ci-cache that no image-build step stands in front of"
+fi
+
+# --- group 26: the hydrate stops being the untrusted path it is --------------
+mutate "the hydrate moved after the seal, where the master is sealed before its contents arrive" \
+  's|^        \$null = Invoke-CacheHydrate$|        $null = $Provisioned|' \
+  has_bounded_cache_hydrate
+mutate "the pointer whitelist dropped, so a name can leave this pool prefix" \
+  's|if (-not (Test-CacheSnapshotPointer -Name \$snapshot)) {|if ($false) {|' \
+  has_bounded_cache_hydrate
+mutate "the rejected pointer echoed into a boot log read in a terminal" \
+  's|(\$(\$snapshot.Length) bytes)|($snapshot)|' \
+  has_bounded_cache_hydrate
+mutate "the generation unpinned, so what was measured is not what is downloaded" \
+  's|?alt=media&generation=\$generation|?alt=media|' \
+  has_bounded_cache_hydrate
+mutate "the counting pass dropped, leaving the bound to the unpacker that exits 0 on a cut stream" \
+  's|\$expanded = Measure-CacheArchiveExpansion -Path \$archive|$expanded = 0; $null = @( -Path $archive|' \
+  has_bounded_cache_hydrate
+mutate "the expansion bound computed and never acted on" \
+  's|^        if (\$expanded -gt \$bound) {$|        if ($false) {|' \
+  has_bounded_cache_hydrate
+mutate "the staged tree moved into the master before it is scanned" \
+  's|^        \$reason = Get-CacheHostileReason -Entries \$scan\.Entries$|        $reason = $null; $null = @($scan)|' \
+  has_bounded_cache_hydrate
+mutate "the master root moved onto without being looked at" \
+  's|\$rootReason = Get-CacheHostileReason|$rootReason = $null; $null = @(|' \
+  has_bounded_cache_hydrate
+mutate "the cache metadata read through the fence that denies the boot" \
+  's|Get-CacheMetadataResult -Path|Get-MetadataValue -Path|' \
+  has_bounded_cache_hydrate
+mutate "the staging tree deleted recursively without a reparse-point scan" \
+  's|Remove-CacheTreeSafely -Path \$script:CacheStage|Remove-Item -LiteralPath $script:CacheStage -Recurse -Force|' \
+  has_bounded_cache_hydrate
+mutate "the download tree deleted recursively without a reparse-point scan" \
+  's|Remove-CacheTreeSafely -Path \$script:CacheDownload|Remove-Item -LiteralPath $script:CacheDownload -Recurse -Force|' \
+  has_bounded_cache_hydrate
+mutate "the transcoding header traded for handler-side decompression, which arrives unbounded" \
+  "s|\$request.Headers.Add('Accept-Encoding', 'gzip')|\$request.AutomaticDecompression = 'GZip'|" \
+  has_bounded_cache_hydrate
+
+if has_hydrate_bounds_honoured "$SCRIPT"; then
+  ok
+else
+  bad "the snapshot hydrate misses a bound review found it missing — the instance token, an oversized metadata number, the total download time, the archive's own disk footprint, the age floor, an empty staged directory, a killed unpacker's exit, or the staged scan's share of the budget; every one of these leaves a hydrate that still LOOKS like it works"
+fi
+
+# --- group 27: the bounds the hydrate was missing ----------------------------
+mutate "the instance token read back out of a stringified object" \
+  's|\$tokenResult\.Object\.access_token|$tokenResult.Value|' \
+  has_hydrate_bounds_honoured
+mutate "an oversized metadata number cast straight to decimal" \
+  's|if (-not \[decimal\]::TryParse(\$Text, \[ref\] \$n)) { return \$Default }|$n = [decimal] $Text|' \
+  has_hydrate_bounds_honoured
+mutate "the download bounded per read again, and never in total" \
+  's|if (\[datetime\]::UtcNow -gt \$copyDeadline) {|if ($false) {|' \
+  has_hydrate_bounds_honoured
+mutate "the archive left out of the free-space reservation" \
+  's|(Get-CacheExpandBound -CompressedBytes \$Bytes) + \$Bytes|(Get-CacheExpandBound -CompressedBytes $Bytes)|' \
+  has_hydrate_bounds_honoured
+mutate "the snapshot age rounded to the nearest hour instead of floored" \
+  's|\[int\] \[math\]::Floor(\$started\.Subtract(\$created)\.TotalHours)|[int] $started.Subtract($created).TotalHours|' \
+  has_hydrate_bounds_honoured
+mutate "the staged-directory emptiness test off by one, so every directory looks empty" \
+  's|Select-Object -First 1)) {|Select-Object -First 0)) {|' \
+  has_hydrate_bounds_honoured
+mutate "the killed unpacker never waited for" \
+  's|if (-not \$proc\.WaitForExit(10000)) {|if ($false) {|' \
+  has_hydrate_bounds_honoured
+mutate "the un-quiesced staging tree deleted anyway" \
+  's|if (\$script:CacheStageNotQuiesced) {|if ($false) {|' \
+  has_hydrate_bounds_honoured
+mutate "the staged scan run without a deadline again" \
+  's|Get-CacheStagedEntry -Path \$script:CacheStage -DeadlineUtc \$deadline|Get-CacheStagedEntry -Path $script:CacheStage|' \
+  has_hydrate_bounds_honoured
+mutate "a staged file allowed to replace the baked directory it is named after" \
+  's|if (-not \$staged\.PSIsContainer) {|if ($false) {|' \
+  has_hydrate_bounds_honoured
+mutate "the baked master moved aside onto a stale name the sweep could not clear" \
+  's|if (Test-Path -LiteralPath $aside) {|if ($false) {|' \
+  has_hydrate_bounds_honoured
+mutate "the token read reached with the budget already spent on metadata" \
+  's|if ((& \$left) -le 0) {|if ($false) {|' \
+  has_hydrate_bounds_honoured
+mutate "a timed-out walk handing back the entries it did manage to read" \
+  's|Entries = @(); Failed = \$failed; TimedOut = \$true|Entries = $entries.ToArray(); Failed = $failed; TimedOut = $true|' \
+  has_hydrate_bounds_honoured
 
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

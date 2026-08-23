@@ -299,6 +299,13 @@ jobs:
       - name: multi-pool self-test
         run: bash scripts/ci/multi-pool.selftest.sh
 
+      # The seam between a pool and the controller that serves it: a
+      # `pool_descriptor` output on one side, a jq parser on the other, and
+      # Terraform checking neither. A key the parser never reads is not an
+      # error anywhere — the column it was meant to fill just takes its default.
+      - name: controller module self-test
+        run: bash scripts/ci/controller-module.selftest.sh
+
       - name: drain-decision self-test
         run: bash scripts/ci/drain-decision.selftest.sh
 
@@ -328,6 +335,16 @@ jobs:
       # implementation, and each deletes a machine that may be running a job.
       - name: beacon-decision self-test
         run: bash scripts/ci/beacon-decision.selftest.sh
+
+      # The veto that stops the controller taking away a host a pull request is
+      # still using. Both directions are asserted, and they are not symmetric: a
+      # wrong `free:` deletes a host a run named by label -- taking the shared
+      # database on it with it -- while a wrong `hold:` keeps one machine warm
+      # until the hold lapses. The monotonic cases are the security ones; guest
+      # attributes are writable by any process on the VM, so a co-tenant job can
+      # publish a valid-but-expired hold over a live one.
+      - name: pin-hold-decision self-test
+        run: bash scripts/ci/pin-hold-decision.selftest.sh
 
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a
@@ -409,6 +426,15 @@ jobs:
       # GitHub App key. Tested on every change, not only when the broker moves.
       - name: job credential broker self-test
         run: python3 scripts/ci/job-broker.selftest.py
+
+      # The build cache is served TO job code, so its bug is the mirror of the
+      # broker's: an upload that reached the store would let one pull request
+      # hand every later build in that repository a tarball the build unpacks
+      # into its own output tree. The rest of the suite covers the other half —
+      # a server that is subtly wrong here presents as "cache enabled, build
+      # slow", which is precisely the failure that went unnoticed for weeks.
+      - name: turbo remote cache self-test
+        run: python3 scripts/ci/turbo-cache.selftest.py
 
       # This rule decides whether a consuming repository runs CI at all, so a
       # wrong verdict is the one that merges untested code while reporting

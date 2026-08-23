@@ -338,11 +338,34 @@ Image-building jobs (`image-smoke` at 138 s average, `docker-build` in
 Specaria-Platform) rebuild layers from scratch. Registry-backed
 `--cache-from`/`--cache-to` against Artifact Registry is the fix.
 
-### 4.4 Remote build cache for the monorepos
+### 4.4 Remote build cache for the monorepos — the read side is shipped
 
 IntegrateIT (~277 packages) and Apigee-Portal would benefit more from a shared
 Turborepo/Nx remote cache than from finer path filters: a remote cache dedupes
 work *across PRs*, whereas a path filter only ever helps within one PR.
+
+It is now part of the pool rather than something a repository assembles. A host
+serves `turbo-cache-server.py` against the project's cache bucket, under
+`turbo/<owner>/<repo>/`, and hands every slot `TURBO_API`, `TURBO_TOKEN` and
+`TURBO_TEAM` — so a workflow that never heard of this fleet gets hits, holds no
+credential and has nothing to renew. `cache_snapshot_bucket` alone turns it on;
+`turbo_cache_bucket` exists only to point it elsewhere or switch it off.
+
+Being *inside* the pool is the fix, not a packaging choice. The hand-wired cache
+4b is about ran cold for weeks and reported the fault as five warnings inside
+green runs. A per-repository cache is a per-repository way to be silently slow.
+
+Two things are deliberately absent. Job code cannot write: an artifact is a
+tarball the next build unpacks into its output tree and reports as its own
+result, so a writable cache is one pull request handing every later build its
+output — uploads are accepted and discarded rather than refused, because a
+refusal is one warning per artifact and that noise is what hid the original
+fault. And nothing fills the store yet: **the warmer, which builds the default
+branch on a schedule and publishes what it produces, is the other half and is
+not shipped.** Until it lands the layer is configured, correct and empty, which
+is the state the read side is built to sit in safely.
+
+Nx is not covered: its remote-cache protocol is not the one this server speaks.
 
 ### 4.5 Checkout cost
 

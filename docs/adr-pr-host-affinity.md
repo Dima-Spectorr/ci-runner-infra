@@ -272,11 +272,24 @@ means keeping the host rather than dropping it — a broken publisher must not
 read as consent to delete.
 
 The same cache is what makes §2.6 work after the last Linux job has finished;
-it records the run the hold names, not only the deadline.
+it records the run the hold names, not only the deadline. **That second reader
+is not built yet** — the veto writes the record, and nothing reads it back. It
+is deliberately a separate change, because it is not a veto: it decides whether
+to CANCEL a run whose Linux host went away underneath a Windows tail, which is
+cross-pool, irreversible, and answerable only for a hold that has already
+lapsed. Tracked as [#270](https://github.com/Dima-Spectorr/ci-runner-infra/issues/270)
+rather than left as an implied half of this one.
 
 The helper ships with the host in phase 3, the veto in phase 4 — the delivery
 table says so, because a hold whose writer is nobody's phase is how this arrives
 half-built.
+
+**What the veto costs when nothing goes wrong: one guest-attribute read, for a
+host the controller was about to remove.** It is not asked for every host on
+every tick — that is the difference between a veto on the verdict and an
+argument to the rule, and at fleet scale it is also the difference between
+staying inside the per-instance rate limit and manufacturing the failure that
+reads as "keep everything".
 
 ### 2.6 A host that disappears must fail the run, not hang it
 
@@ -826,9 +839,9 @@ phase 5 changes any consuming repository's behaviour.
 |---|---|---|---|---|
 | 1 | This ADR and the published contract | `docs/` | — | [#247](https://github.com/Dima-Spectorr/ci-runner-infra/pull/247) merged; the rest in [#255](https://github.com/Dima-Spectorr/ci-runner-infra/pull/255) |
 | 2 | Affinity label at boot + `CI_HOST_LABEL`, both pools; **`collect_demand` recognises it (§2.5)**; **orphaned-pin detection (§2.6)** | `host-startup.sh`, `windows-host-startup.ps1`, `controller-startup.sh`, self-tests | any workflow using it | [#253](https://github.com/Dima-Spectorr/ci-runner-infra/pull/253) for the label; [#256](https://github.com/Dima-Spectorr/ci-runner-infra/pull/256) for §2.5 + §2.6 |
-| 3 | Port band, per-slot DNAT, **the conntrack band allow paired with [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) in one change**, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper, publishing the hold as a guest attribute, and its `--reserve-slot` record** (refusing a one-slot host), **`slot-reset.sh` sparing a held slot's containers and releasing a hold from a previous boot as orphaned** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), **the job-started hook that renews the hold (§4 of the contract) — the host renews, never the workflow, because a consumer inside a `container:` cannot reach the binary**, sweeper teardown + reset + **stopping a reserved slot's agent (§3.1)** + agent start with **fail-closed retire** when any of the three fails, TTL sweep | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** | not started |
-| 4 | Ingress/egress band rules on the new `shared_infra_id`-scoped tag pair — `ci-shared-infra-src-<id>` **on both pools** as the source, `ci-shared-infra-stack-<id>` **on Linux only** as the ingress target (§3.3); pin-hold veto read from guest attributes, **monotonic in the controller's `$STATE_DIR`** so a co-tenant can only extend a hold (§2.4), applied to the `cordon:`/`retire:`/`drain:` verdicts of **both** `recycle_decision` and `drain_decision`, and the same cache read by the §2.6 detector so a Windows-only tail is still covered | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `controller-startup.sh`, self-tests | any workflow using it | not started |
-| 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) | not started |
+| 3 | Port band, per-slot DNAT, **the conntrack band allow paired with [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) in one change**, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper, publishing the hold as a guest attribute, and its `--reserve-slot` record** (refusing a one-slot host), **`slot-reset.sh` sparing a held slot's containers and releasing a hold from a previous boot as orphaned** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), **the job-started hook that renews the hold (§4 of the contract) — the host renews, never the workflow, because a consumer inside a `container:` cannot reach the binary**, sweeper teardown + reset + **stopping a reserved slot's agent (§3.1)** + agent start with **fail-closed retire** when any of the three fails, TTL sweep | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** | [#258](https://github.com/Dima-Spectorr/ci-runner-infra/pull/258) for the port band, DNAT and `CI_SHARED_INFRA_*`; [#264](https://github.com/Dima-Spectorr/ci-runner-infra/pull/264) for the pin hold, the reservation and the sweeper |
+| 4 | Ingress/egress band rules on the new `shared_infra_id`-scoped tag pair — `ci-shared-infra-src-<id>` **on both pools** as the source, `ci-shared-infra-stack-<id>` **on Linux only** as the ingress target (§3.3); pin-hold veto read from guest attributes, **monotonic in the controller's `$STATE_DIR`** so a co-tenant can only extend a hold (§2.4), applied to the `cordon:`/`retire:`/`drain:` verdicts of **both** `recycle_decision` and `drain_decision`, and the same cache read by the §2.6 detector so a Windows-only tail is still covered | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `controller-startup.sh`, self-tests | any workflow using it | [#260](https://github.com/Dima-Spectorr/ci-runner-infra/pull/260) merged for the band rules; [#269](https://github.com/Dima-Spectorr/ci-runner-infra/pull/269) for the veto |
+| 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) | [#261](https://github.com/Dima-Spectorr/ci-runner-infra/pull/261) merged |
 | 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — | not started |
 | 7 | Per-repository adoption, workflow consolidation first | consuming repositories, one pull request each | — | not started |
 

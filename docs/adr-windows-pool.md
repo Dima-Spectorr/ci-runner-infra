@@ -7,9 +7,9 @@ Amended 2026-08-22: §4's refusal of a container runtime is re-affirmed, and the
 gap it leaves — a Windows job needing a database — is answered by
 [`adr-pr-host-affinity.md`](adr-pr-host-affinity.md) with reachability rather
 than a runtime. Nothing in this document changes.
-Amended 2026-08-22: phase 7, the per-slot dependency cache, is added to
-§3 and closes issue #150; it supersedes the "warm cache" half of what §4 says
-Windows does not get.
+Amended 2026-08-22: phase 7, the per-slot dependency cache *and its snapshot hydrate*, is added to
+§3; the per-slot cache closed issue #150 and the snapshot hydrate closes #236. It
+supersedes the "warm cache" half of what §4 says Windows does not get.
 Amended 2026-08-16: **§3A supersedes phase 2 of §3 in full** and rewrites parts of
 §2, §4, §5, §6 and §7. Phase 2 as originally written cannot work — the mechanism
 is refuted by Microsoft's documented firewall rule precedence. Read §3A before
@@ -928,6 +928,76 @@ The copy is `/COPY:DAT` and never `/COPYALL` — data, attributes, timestamps, b
 staging directory's inherited slot ACE survive; `/COPYALL` would hand every slot
 a copy of its own cache that it cannot write, which is the Windows form of the
 `EACCES`-on-first-install trap the Linux `go-w`/`a-w` note describes.
+
+### Phase 7's hydrate — the master the image did not bake
+
+Added 2026-08-22, closing issue #236. Everything above describes a master whose
+contents are as old as the image, and a pool only ever scales out **under load**
+— so every new host is handed the coldest cache in the fleet at exactly the
+moment the queue that caused the scale-out needs it warmest. The hydrate closes
+that gap the same way `host-startup.sh` does: a regularly published tarball of
+this same tree, fetched from `cache/<pool>/` and unpacked over the baked master
+before anything is sealed or copied.
+
+It is a **strict mirror** of the Linux implementation — the same four properties
+(read-only always; bounded then abandoned; aged out here too; inspected before it
+is trusted), the same bounds, and the same verdict strings, so the two boot
+scripts stay diffable. What follows is only what Windows forced to differ.
+
+**The hydrate runs before `Protect-CacheMaster`, and that ordering is the
+design.** What arrives is untrusted build input that passed through no
+image-build gate. The scan-and-seal is the gate that has to judge it, so it must
+run *after* the content lands, not before. Sealing first and hydrating second
+would publish read-and-execute over a tree whose contents had not yet been
+looked at. The verdict is deliberately not consulted by the caller: every exit,
+including the ones meaning the master was left exactly as the image baked it,
+continues into the same scan and the same seal.
+
+**Every recursive delete on the hydrate's scratch trees goes through
+`Remove-CacheTreeSafely`.** This is the junction hazard the retired-slot sweep
+already documents, arriving by a second route: the staging tree holds whatever a
+publisher packed, and Windows PowerShell 5.1 follows a directory junction on
+`Remove-Item -Recurse` and deletes what it points at. The cleanup runs in a
+`finally`, which is the half a success-path-only version would miss — the
+failure paths are exactly the ones that leave a half-unpacked tree behind. A tree
+that cannot be fully *read* is refused rather than deleted: a scan is a proof of
+absence, and `-ErrorAction SilentlyContinue` alone spells "came back clean" and
+"could not be looked at" identically.
+
+**The master's own root is checked before anything is moved onto it**, because
+the recursive scan that covers the rest of the tree is `Protect-CacheMaster`'s
+and runs afterwards. Without this, a junction *as* `C:\ci-cache` would be moved
+into before anything had looked at it.
+
+**A counting pass decides the size bound, before `tar` is started.** `tar` exits
+0 on a stream cut at a member boundary — the zero padding reads as an
+end-of-archive marker — so a bound enforced only by stopping the unpacker yields
+a partial cache believed whole. And the bound is on the *expanded* size
+(`8 x compressed`, floor 64 KiB, matching `cache_expand_bound`), because gzip
+expands by more than a thousandfold on the right input; the free-space check
+reserves that same number.
+
+**The generation is pinned.** Age, size and free space are asserted against the
+object's metadata and the bytes arrive afterwards. Unpinned, the object could be
+replaced in between and every one of those bounds would have been checked against
+a generation that no longer exists. "Snapshots are written once" is the
+publisher's convention enforced by IAM on the publisher — it is not a control
+this host can enforce, so this host does not rely on it.
+
+**The metadata read fails open.** `Get-MetadataValue` denies the boot when the
+metadata server does not answer, which is right for identity and wrong here, so
+the cache layer reads through `Get-CacheMetadataResult`, which distinguishes a
+404 from a transport failure and denies nothing. This is the same rule as
+"phase 7 is the one phase that does not end in `Deny-Boot`", applied to a call
+that would otherwise have imported the opposite one.
+
+**The gap this leaves.** `host-startup.sh` publishes `ci_cache_hydrate_verdict`,
+`ci_cache_hydrate_seconds`, `ci_cache_snapshot_age_hours`,
+`ci_cache_snapshot_bytes` and `ci_cache_dirs_hydrated`. This file has no metric
+client at all, so the Windows verdict is one boot-log line and nothing else: a
+Windows pool that has silently stopped hydrating is indistinguishable, in
+monitoring, from one that was never given a bucket. That is a real gap, it is
+named here rather than papered over, and it is tracked as its own issue.
 
 ---
 

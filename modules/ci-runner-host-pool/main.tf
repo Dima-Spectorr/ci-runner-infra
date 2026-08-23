@@ -68,6 +68,29 @@ locals {
   # host logs as a snapshot that has not been published yet.
   cache_prefix = "cache/${var.name}/"
 
+  # WHERE THE BUILD CACHE LIVES, AND WHY NOT SAYING IS THE COMMON CASE.
+  #
+  # `null` — the default — means "the bucket this pool already hydrates from".
+  # A project that runs `ci-runner-cache-bucket` therefore gets the remote build
+  # cache by adding nothing at all, which is the entire point of the layer: the
+  # one repository in this fleet that wired a build cache by hand ran it stone
+  # cold for weeks and every run stayed green. A capability every consumer has
+  # to opt into by hand is a capability most of them will have wrong.
+  #
+  # An explicit "" turns it off for a pool that hydrates dependencies but must
+  # not serve build artifacts, and an explicit name points it at a different
+  # bucket. Both are unusual and both are stated.
+  turbo_bucket = var.turbo_cache_bucket == null ? var.cache_snapshot_bucket : var.turbo_cache_bucket
+
+  # The remote BUILD cache's slice, and it is keyed by REPOSITORY where the
+  # dependency snapshot is keyed by pool. The difference is the point of the
+  # layer: a turbo artifact is named by the hash of its inputs, so two pools
+  # serving the same repository — a Linux pool and a shard pool, say — compute
+  # the same names and should hit each other's entries. Two pools serving
+  # DIFFERENT repositories must never share, which is what the owner and repo in
+  # the path guarantee and what the IAM condition below enforces.
+  turbo_prefix = "turbo/${var.github_owner}/${var.github_repo}/"
+
   # Controller and hosts are different identities: the controller may delete
   # instances, a host executes build input. There is no fallback — the fallback
   # that used to be here silently chose the weak side of that split for every
@@ -156,6 +179,11 @@ locals {
     # whether a machine is deleted would then differ from the branch that was
     # tested.
     file("${path.module}/scripts/beacon-decision.sh"),
+    # The pin-hold veto's rule. Concatenated on EVERY pool for the same reason
+    # the beacon's is: the branch that decides whether a machine is deleted must
+    # be the branch that was tested, and a pool that ships it conditionally is a
+    # per-deployment variant of the controller.
+    file("${path.module}/scripts/pin-hold-decision.sh"),
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/watchdog-decision.sh"),
     # Ahead of the controller itself, and not merely by convention: the
@@ -219,6 +247,37 @@ resource "google_storage_bucket_iam_member" "host_reads_cache" {
     title       = "only-this-pools-cache-prefix"
     description = "Reads are confined to ${local.cache_prefix}, so one pool's hosts cannot read another pool's cache snapshots out of the shared bucket."
     expression  = "resource.name.startsWith(\"projects/_/buckets/${var.cache_snapshot_bucket}/objects/${local.cache_prefix}\")"
+  }
+}
+
+# --- the remote build cache this pool may read -----------------------------------
+
+# The same grant, the same shape, and the same refusal to widen it: READ, inside
+# this REPOSITORY's prefix, and nothing else.
+#
+# It is a second binding rather than a widened condition on the one above,
+# because the two prefixes answer to different keys — `cache/<pool>/` is per
+# pool, `turbo/<owner>/<repo>/` is per repository — and a single condition
+# spelling both would be a condition nobody can read at 2am. The cost of the
+# split is one more binding on the same bucket; the benefit is that revoking
+# either layer is deleting one resource.
+#
+# `objectViewer`, never `objectUser`: no `storage.objects.create`, no
+# `storage.objects.delete`. What writes here is the warmer, from the default
+# branch, on a schedule — never a host, because a host runs pull-request code
+# and a build artifact is a tarball the next build unpacks into its output tree
+# and reports as its own result.
+resource "google_storage_bucket_iam_member" "host_reads_turbo_cache" {
+  count = local.turbo_bucket == "" ? 0 : 1
+
+  bucket = local.turbo_bucket
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${var.service_account_email}"
+
+  condition {
+    title       = "only-this-repositorys-build-cache"
+    description = "Reads are confined to ${local.turbo_prefix}, so a pool serving one repository cannot read another repository's build artifacts out of the shared bucket."
+    expression  = "resource.name.startsWith(\"projects/_/buckets/${local.turbo_bucket}/objects/${local.turbo_prefix}\")"
   }
 }
 
@@ -321,6 +380,19 @@ resource "google_compute_instance_template" "host" {
     "ci-cache-budget-seconds" = tostring(var.cache_hydrate_budget_seconds)
     "ci-cache-max-bytes"      = tostring(var.cache_snapshot_max_bytes)
 
+    # The remote BUILD cache the host serves to its slots. Empty bucket = the
+    # layer is off, hosts start no server and set no TURBO_* variables, and a
+    # repository's builds behave exactly as they did before these keys existed.
+    # The server source travels as metadata for the same reason the broker's
+    # does: one image, every pool, and the code stays reviewable and versioned
+    # with the module rather than baked into an image nobody re-reads.
+    "ci-turbo-bucket"             = local.turbo_bucket
+    "ci-turbo-prefix"             = local.turbo_bucket == "" ? "" : local.turbo_prefix
+    "ci-turbo-port"               = tostring(var.turbo_cache_port)
+    "ci-turbo-disk-budget-bytes"  = tostring(var.turbo_cache_disk_budget_bytes)
+    "ci-turbo-max-artifact-bytes" = tostring(var.turbo_cache_max_artifact_bytes)
+    "ci-turbo-cache-py"           = local.turbo_bucket == "" ? "" : file("${path.module}/scripts/turbo-cache-server.py")
+
     # Registry hosts a job container may be pulled from as the JOB identity, on
     # TOP of this host's own region and the Container Registry hosts, which the
     # host always configures. Needed only when a repository pulls its builder
@@ -334,6 +406,15 @@ resource "google_compute_instance_template" "host" {
 
   lifecycle {
     create_before_destroy = true
+
+    # Two host services, one port, and the loser is chosen by boot ordering. The
+    # broker is the one that must never lose — a host whose credential broker did
+    # not start refuses to register at all — so this is refused at plan time
+    # rather than discovered as a pool that stops taking work.
+    precondition {
+      condition     = local.turbo_bucket == "" || var.turbo_cache_port != var.job_broker_port
+      error_message = "pool '${var.name}' would run the build-cache server and the job credential broker on the same port (${var.job_broker_port}). One of the two would fail to bind, and which one depends on boot ordering; give turbo_cache_port a port of its own."
+    }
 
     precondition {
       condition     = length(local.host_network_tags) <= 64
@@ -541,7 +622,21 @@ data "google_compute_zones" "available" {
   status  = "UP"
 }
 
+# ADDING `count` RENAMES THE RESOURCE. `google_compute_instance.controller`
+# becomes `…controller[0]`, and an address a state file does not recognise is a
+# create — of a VM whose name is already taken — next to a destroy of the
+# controller that is currently running the fleet. Terraform does reconcile the
+# no-key/index-zero pair on its own in current versions, but "does, today,
+# quietly" is not the compatibility story this variable promises; the `moved`
+# block says it out loud, and says it in the plan.
+moved {
+  from = google_compute_instance.controller
+  to   = google_compute_instance.controller[0]
+}
+
 resource "google_compute_instance" "controller" {
+  count = var.manage_controller ? 1 : 0
+
   project      = var.project_id
   name         = "${var.name}-controller"
   zone         = length(var.zones) > 0 ? var.zones[0] : data.google_compute_zones.available.names[0]
@@ -586,6 +681,12 @@ resource "google_compute_instance" "controller" {
     on_host_maintenance = "MIGRATE"
   }
 
+  # STILL ONE KEY PER FIELD, deliberately, even though the controller now reads
+  # a `ci-pools` table. This controller serves exactly one pool — its own — and
+  # the controller synthesises a one-row table from these keys when `ci-pools`
+  # is absent. Rendering the table here instead would rewrite the metadata of
+  # every controller in the fleet to say what it already says, for no behaviour
+  # change, on the same apply that is trying to change something else.
   metadata = merge(local.controller_registration_metadata, {
     startup-script = local.controller_startup
 
