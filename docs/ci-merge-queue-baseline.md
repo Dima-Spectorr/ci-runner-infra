@@ -1102,6 +1102,7 @@ holds an installation token and already sweeps the repository every tick.
 |---|---|
 | `ci_prs_green_and_unqueued` | Open pull requests that are finished, green, and fail an entry condition. Labelled `reason` = `draft`, `base` or `draft-and-base`. |
 | `ci_parked_prs_skipped` | Pull requests the sweep did not examine this pass. Non-zero makes the metric above a **lower bound**. |
+| `ci_parked_sweep_denied` | Sweeps GitHub **refused**. Non-zero means the metric above is not a lower bound, it is nothing at all. |
 
 Both are **repository** facts published under **every** pool label, so that a
 pool whose series merely stop is not read as an idle pool. Read them with
@@ -1130,9 +1131,21 @@ capped at 20 candidates and a 20-second budget per sweep; anything beyond that
 increments `ci_parked_prs_skipped` and is retried next sweep, never lost.
 
 **It needs `checks: read`** on the App installation — the only endpoint in the
-controller that does. Without it the sweep logs the 403 and the metric stays at
-zero, which is indistinguishable from health. See
+controller that does. See
 [onboarding-a-repository.md](onboarding-a-repository.md).
+
+**And the detector has its own detector, because it can fail the same way it
+was built to catch.** An installation without that permission fails every
+`check-runs` call and nothing else: the pool scales, registers and runs jobs
+normally, while `ci_prs_green_and_unqueued` publishes an unbroken zero — which
+is exactly what a repository with nothing parked publishes. `parked_denial` in
+the same rule file classifies the HTTP status (`401`, `403`, `404` are refusals;
+`5xx`, `000` and a failed secret read are merely late) and a refusal increments
+`ci_parked_sweep_denied` **instead of** `ci_parked_prs_skipped`, never both. The
+two carry opposite advice — wait, versus grant a permission — and a counter that
+moves for either tells the reader neither. The alert key is `parkeddenied`, at
+30 minutes: one refused sweep during a GitHub incident is not a page, five in a
+row is.
 
 ---
 

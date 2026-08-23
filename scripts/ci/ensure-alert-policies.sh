@@ -353,6 +353,18 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    parkeddenied) cat <<EOF
+{ "displayName": "CI runners / the parking sweep is being refused",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "The controller cannot read check runs, so the alert above it can never fire. This is the watcher's watcher, and it exists because the feature it guards fails by looking healthy: an installation without \`checks: read\` publishes an unbroken ci_prs_green_and_unqueued of ZERO, which is precisely what a repository with nothing parked publishes.\n\nOne cause, almost always: the GitHub App installation for this repository holds the older permission set. \`commits/<sha>/check-runs\` is the ONLY endpoint the controller calls that needs \`checks: read\`, so nothing else about the controller degrades - demand, draining and recycling all keep working, which is why nobody notices. Grant the permission on the App, then ACCEPT it on the installation: a permission added to an App stays pending until the installation approves it, and a pending permission behaves exactly like one that was never granted.\n\nDistinct from ci_parked_prs_skipped on purpose. Skipped means the sweep ran out of budget and will retry; this means it was refused and will be refused again in five minutes, forever. Grep 'parked sweep: DENIED' in the controller's syslog for the status GitHub actually returned - 401 is a bad App key or installation id rather than a missing permission, and 404 on a sha the same token just listed is a permission answer wearing another number.\n\nRead with max() across pools, like everything else the controller publishes per repository. Fires after 30m: a single refused sweep during a GitHub incident is not worth a page, five in a row is." },
+  "conditions": [ { "displayName": "ci_parked_sweep_denied > 0 for 30m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
+      "filter": "metric.type=\"custom.googleapis.com/github/ci_parked_sweep_denied\" AND resource.type=\"generic_node\"",
+      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
     egressdenied) cat <<EOF
 { "displayName": "CI runners / egress refused",
   "combiner": "OR",
@@ -452,6 +464,7 @@ ensure_descriptor ci_slots_registered        "Slots whose runner agent answers, 
 ensure_descriptor ci_slots_missing           "Slots the pool was built with that no agent answers for. Non-zero is capacity that exists on paper only: a host that registered nothing, a host whose slot units died before the agent started, or a slot the host condemned for failing every job it claimed."
 ensure_descriptor ci_prs_green_and_unqueued "Open pull requests that are green and can never enter the merge queue, labelled by the entry condition they fail. A repository fact published under every pool label -- read with max(), never sum()."
 ensure_descriptor ci_parked_prs_skipped     "Pull requests the parking sweep did not examine. Non-zero makes ci_prs_green_and_unqueued a lower bound."
+ensure_descriptor ci_parked_sweep_denied    "Parking sweeps refused by GitHub. Non-zero means the installation lacks checks:read and ci_prs_green_and_unqueued is inert, not zero."
 # Published by the HOST once per boot, not by the controller per tick. Declared
 # here for the same reason as the rest — a pool that has never booted a host
 # still needs its alerting provisioned — and it matters more here: these series
@@ -472,7 +485,7 @@ pl_status="$(mon GET 'alertPolicies?pageSize=1000')"
   sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
 existing="$(json_pairs alertPolicies displayName)"
 
-for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing parked egressdenied; do
+for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied egressdenied; do
   policy_json "$key" >"$tmp/p.json"
   # Neither of these ends in `| head -1`, and that is deliberate. This script
   # runs `set -euo pipefail`; under both options a reader that stops early sends
