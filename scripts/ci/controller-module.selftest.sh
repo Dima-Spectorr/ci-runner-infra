@@ -139,6 +139,62 @@ check "manage_controller really removes the pool's own controller" yes "$r"
 grep -q '"ci-pools"' "$POOL_TF/main.tf" && r=yes || r=no
 check "the pool module still renders one key per field, not a table" no "$r"
 
+# --- 6. the controller is a managed group, and never two of them (#308) -------
+#
+# Both modules build the controller from a template held by a group of size 1,
+# so a DELETED controller is rebuilt instead of staying deleted. Two properties
+# of that arrangement are load-bearing and would fail silently if edited away,
+# because both produce a plan that applies cleanly.
+for m in "$POOL_TF" "$CTRL_TF"; do
+  n=$(basename "$m")
+
+  grep -q 'resource "google_compute_instance_group_manager" "controller"' "$m/main.tf" &&
+    r=yes || r=no
+  check "$n: the controller is a managed group, not a pet" yes "$r"
+
+  # The pet is GONE, not merely joined by a group. Leaving the old resource in
+  # place next to the new one is a plan that creates a second control plane and
+  # reports success: two controllers, one repository, both counting demand and
+  # both draining hosts.
+  grep -q 'resource "google_compute_instance" "controller"' "$m/main.tf" &&
+    r=yes || r=no
+  check "$n: the standalone controller instance is gone, not duplicated" no "$r"
+
+  # THE INVARIANT. A surge to two during a rolling replace is two controllers
+  # serving one repository, each acting on a GitHub view the other is already
+  # changing — briefly, on every apply that touches the startup script, which
+  # is most of them.
+  grep -A8 'resource "google_compute_instance_group_manager" "controller"' "$m/main.tf" |
+    grep -q 'max_surge_fixed *= *0' && r=yes || r=no
+  if [ "$r" = no ]; then
+    # The block is longer than 8 lines in one module; widen rather than assume.
+    sed -n '/resource "google_compute_instance_group_manager" "controller"/,/^}/p' "$m/main.tf" |
+      grep -q 'max_surge_fixed *= *0' && r=yes || r=no
+  fi
+  check "$n: the group never surges to two controllers" yes "$r"
+
+  # Autohealing grants a health probe the authority to DELETE the control
+  # plane. A probe that cannot land — ranges not open to the tag, a central
+  # firewall, the wrong port — then loops delete/rebuild/delete, which is worse
+  # than the pet this replaced. Opt-in, and this asserts the default rather
+  # than trusting a reviewer to notice a flipped bool.
+  d=$(sed -n '/^variable "controller_autohealing"/,/^}/p' "$m/variables.tf" |
+    grep -oE 'default *= *(true|false)' | grep -oE '(true|false)')
+  check "$n: autohealing is off by default" false "$d"
+done
+
+# The port reaches the VM as an EMPTY STRING when autohealing is off, and the
+# startup script has no default for it. A default there would open a listening
+# socket on every controller in the fleet — the one machine holding the App
+# installation token — to answer a probe nobody configured.
+grep -q 'ci-health-port" = var.controller_autohealing ? tostring(var.controller_health_port) : ""' \
+  "$POOL_TF/main.tf" && r=yes || r=no
+check "the health port is empty unless autohealing asked for it" yes "$r"
+
+sed -n '/^HEALTH_PORT=/,/^esac$/p' "$POOL_TF/scripts/controller-startup.sh" |
+  grep -q 'HEALTH_PORT:=' && r=yes || r=no
+check "the startup script never defaults the health port" no "$r"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

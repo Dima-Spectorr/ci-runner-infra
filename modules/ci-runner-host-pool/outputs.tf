@@ -22,14 +22,20 @@ output "autoscaler_name" {
 # and an index into an empty list fails the PLAN with an error about the output
 # rather than about the pool. Null is the honest answer — this pool's controller
 # is somewhere else.
+#
+# And the GROUP, not the instance. Since #308 the controller is a managed group of
+# size 1, and the VM inside it is named `<group>-<suffix>` — a name that changes
+# every time the group rebuilds it, which is the entire point. An output that
+# named the instance would be a value every consumer had to re-read after each
+# recovery, so the stable handle is the group.
 output "controller_instance" {
-  description = "Name of the always-on controller VM, or null when a shared controller serves this pool."
-  value       = one(google_compute_instance.controller[*].name)
+  description = "Name of the managed group holding the always-on controller VM, or null when a shared controller serves this pool. The VM itself is <this>-<suffix>; list it with `gcloud compute instance-groups managed list-instances`."
+  value       = one(google_compute_instance_group_manager.controller[*].name)
 }
 
 output "controller_zone" {
-  description = "Zone of the controller VM, or null when a shared controller serves this pool."
-  value       = one(google_compute_instance.controller[*].zone)
+  description = "Zone of the controller's managed group, or null when a shared controller serves this pool."
+  value       = one(google_compute_instance_group_manager.controller[*].zone)
 }
 
 # THE POOL, AS THE CONTROLLER'S TABLE WANTS IT.

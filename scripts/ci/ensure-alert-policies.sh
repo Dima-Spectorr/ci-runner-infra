@@ -237,7 +237,7 @@ policy_json() {  # <key> -> a full alertPolicy body on stdout
 { "displayName": "CI runners / controller dead (no heartbeat 10m)",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "The CI warm-host controller stopped reporting. Jobs will queue and the pool will not scale. Check the controller VM (ci-runner-*-controller) and its ci-controller.service." },
+    "The CI warm-host controller stopped reporting. Jobs will queue and the pool will not scale. Since #308 the controller is a managed group of size 1, so a DELETED one is rebuilt on its own and this alert should clear within a few minutes -- one that does not clear is a controller that boots and cannot tick, not a missing machine. Find the VM with 'gcloud compute instance-groups managed list-instances <name>-controller' (the instance name carries a suffix and changes on every rebuild) and read its ci-controller.service." },
   "conditions": [ { "displayName": "ci_poller_heartbeat absent for 10m",
     "conditionAbsent": { "duration": "600s",
       "filter": "metric.type=\"custom.googleapis.com/github/ci_poller_heartbeat\" AND resource.type=\"generic_node\"",

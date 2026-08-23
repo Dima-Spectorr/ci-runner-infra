@@ -93,26 +93,37 @@ data "google_compute_zones" "available" {
   status  = "UP"
 }
 
-resource "google_compute_instance" "controller" {
+# THE CONTROLLER IS NO LONGER A PET (#308). Same change as the pool module's,
+# and it matters more here: this one serves FOUR pools, so a controller that is
+# deleted and stays deleted freezes four autoscalers at once. It used to be a
+# bare instance with `desired_status = "RUNNING"`, which repairs one somebody
+# STOPPED, on the next apply, and does nothing at all for one somebody DELETED.
+#
+# A missing controller does not produce an outage signal; it produces the
+# absence of every signal, because every capacity fact the fleet has comes out
+# of its tick.
+#
+# THE FIRST APPLY REPLACES THE CONTROLLER — there is no in-place path from a
+# standalone instance to a managed one. Expect a destroy and a create, and a
+# couple of minutes with no control plane. Nothing is lost: hosts keep running
+# their jobs, and every tick recomputes from live GitHub and MIG state. The
+# instance name gains the group's suffix: `<name>-a1b2`.
+#
+# Autohealing is a separate, off-by-default flag; the reasoning is in the pool
+# module beside the health check, and it is the same reasoning here.
+resource "google_compute_instance_template" "controller" {
   project      = var.project_id
-  name         = var.name
-  zone         = length(var.zones) > 0 ? var.zones[0] : data.google_compute_zones.available.names[0]
+  name_prefix  = "${var.name}-"
+  region       = var.region
   machine_type = var.controller_machine_type
   labels       = var.labels
   tags         = concat(["ci-runner-controller"], var.network_tags)
 
-  # A controller stopped by hand, by a maintenance action, or by anything
-  # outside Terraform does NOT come back on its own — automatic_restart covers
-  # host failures only. Declaring the state means the next apply repairs a
-  # stopped control plane instead of reporting no changes while FOUR pools go
-  # unpolled and undrained.
-  desired_status = "RUNNING"
-
-  boot_disk {
-    initialize_params {
-      image = var.controller_image
-      size  = 20
-    }
+  disk {
+    source_image = var.controller_image
+    auto_delete  = true
+    boot         = true
+    disk_size_gb = 20
   }
 
   network_interface {
@@ -156,8 +167,72 @@ resource "google_compute_instance" "controller" {
     # do here, and it would find none of them and serve nothing.
     "ci-pools" = local.pools_json
 
+    # Empty unless autohealing is on, so the default path opens no port on the
+    # one machine in the fleet that holds the App installation token.
+    "ci-health-port" = var.controller_autohealing ? tostring(var.controller_health_port) : ""
+
     "block-project-ssh-keys" = "true"
   }
 
-  allow_stopping_for_update = true
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Off by default. The full argument lives once, in ci-runner-host-pool/main.tf
+# beside its copy of this resource: a probe that cannot reach the controller
+# reads a healthy machine as dead and loops delete/rebuild/delete, which is
+# worse than a pet, and the in-guest watchdog already restarts a wedged tick
+# loop without deleting anything.
+resource "google_compute_health_check" "controller" {
+  count = var.controller_autohealing ? 1 : 0
+
+  project = var.project_id
+  name    = "${var.name}-live"
+
+  check_interval_sec  = 30
+  timeout_sec         = 10
+  healthy_threshold   = 2
+  unhealthy_threshold = 3
+
+  # HTTP, not TCP: a TCP check passes for a controller whose tick loop has
+  # stopped, which is the state worth catching.
+  http_health_check {
+    port         = var.controller_health_port
+    request_path = "/livez"
+  }
+}
+
+resource "google_compute_instance_group_manager" "controller" {
+  project = var.project_id
+  name    = var.name
+  zone    = length(var.zones) > 0 ? var.zones[0] : data.google_compute_zones.available.names[0]
+
+  base_instance_name = var.name
+  target_size        = 1
+
+  version {
+    instance_template = google_compute_instance_template.controller.id
+  }
+
+  # `max_surge_fixed = 0` is the invariant: two controllers serving one
+  # repository both count demand, both resize four MIGs and both drain hosts,
+  # each against a GitHub view the other is already acting on. One at a time,
+  # with a gap, is correct. PROACTIVE because an OPPORTUNISTIC controller would
+  # sit on the old startup script indefinitely.
+  update_policy {
+    type                  = "PROACTIVE"
+    minimal_action        = "REPLACE"
+    replacement_method    = "SUBSTITUTE"
+    max_surge_fixed       = 0
+    max_unavailable_fixed = 1
+  }
+
+  dynamic "auto_healing_policies" {
+    for_each = var.controller_autohealing ? [1] : []
+    content {
+      health_check      = google_compute_health_check.controller[0].id
+      initial_delay_sec = 600
+    }
+  }
 }

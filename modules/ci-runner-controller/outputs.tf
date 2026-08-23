@@ -1,11 +1,15 @@
+# The GROUP, not the instance. Since #308 the controller is a managed group of
+# size 1 and the VM inside it is `<group>-<suffix>`, a name that changes every
+# time the group rebuilds it — which is the point. The group is the stable
+# handle.
 output "controller_instance" {
-  description = "Name of the always-on controller VM serving every pool in the table."
-  value       = google_compute_instance.controller.name
+  description = "Name of the managed group holding the controller VM that serves every pool in the table. The VM itself is <this>-<suffix>; list it with `gcloud compute instance-groups managed list-instances`."
+  value       = google_compute_instance_group_manager.controller.name
 }
 
 output "controller_zone" {
-  description = "Zone of the controller VM."
-  value       = google_compute_instance.controller.zone
+  description = "Zone of the controller's managed group."
+  value       = google_compute_instance_group_manager.controller.zone
 }
 
 output "pools_served" {

@@ -645,41 +645,52 @@ data "google_compute_zones" "available" {
   status  = "UP"
 }
 
-# ADDING `count` RENAMES THE RESOURCE. `google_compute_instance.controller`
-# becomes `…controller[0]`, and an address a state file does not recognise is a
-# create — of a VM whose name is already taken — next to a destroy of the
-# controller that is currently running the fleet. Terraform does reconcile the
-# no-key/index-zero pair on its own in current versions, but "does, today,
-# quietly" is not the compatibility story this variable promises; the `moved`
-# block says it out loud, and says it in the plan.
-moved {
-  from = google_compute_instance.controller
-  to   = google_compute_instance.controller[0]
-}
-
-resource "google_compute_instance" "controller" {
+# THE CONTROLLER IS NO LONGER A PET (#308).
+#
+# It used to be a bare `google_compute_instance` with `desired_status =
+# "RUNNING"`, which repairs a controller somebody STOPPED — on the next apply,
+# whenever that is — and does nothing at all for one somebody DELETED. The
+# hosts it drives have been in a MIG behind an autoscaler since the beginning;
+# the thing driving them was the one machine in the design that could vanish
+# and stay vanished.
+#
+# The failure is quiet in the worst way. Every fact the fleet publishes about
+# its own capacity comes out of the controller tick, so a missing controller
+# does not produce an outage signal — it produces the ABSENCE of every signal,
+# and the autoscaler is `ONLY_UP` on a metric nobody is writing, so the pool
+# freezes at whatever size it happened to be and every job queues.
+#
+# WHAT THIS BUYS AND WHAT IT DOES NOT
+#
+# A managed group of size 1 recreates an instance that is deleted or whose VM
+# is gone. That is the whole default. It is deliberately NOT autohealing: see
+# `controller_autohealing` below for why the health-check-driven half is opt-in
+# rather than the default it looks like it should be.
+#
+# THE FIRST APPLY REPLACES THE CONTROLLER. There is no in-place path from a
+# standalone instance to a managed one, so the plan will show a destroy and a
+# create, and the fleet runs without a control plane for the couple of minutes
+# the new one takes to boot and install. Nothing is lost: hosts keep running
+# the jobs they hold — the controller executes none of them — and every tick
+# recomputes from live GitHub and MIG state, so there is no controller-side
+# state to carry across (`controller-markers-are-not-durable-state`: the boot
+# path already assumes its own markers do not survive). What DOES change is the
+# instance name, which gains the group's suffix: `<name>-controller-a1b2`.
+resource "google_compute_instance_template" "controller" {
   count = var.manage_controller ? 1 : 0
 
   project      = var.project_id
-  name         = "${var.name}-controller"
-  zone         = length(var.zones) > 0 ? var.zones[0] : data.google_compute_zones.available.names[0]
+  name_prefix  = "${var.name}-controller-"
+  region       = var.region
   machine_type = var.controller_machine_type
   labels       = local.common_labels
   tags         = concat(["ci-runner-controller", var.name], var.network_tags)
 
-  # A controller stopped by hand, by a maintenance action or by anything outside
-  # Terraform does NOT come back on its own — automatic_restart only covers host
-  # failures. Declaring the desired lifecycle state means the next apply repairs
-  # a stopped control plane instead of reporting no changes while nothing polls
-  # demand and nothing ever drains a host (SOAP-To-REST #1994, carried up from
-  # the copy that fix landed in).
-  desired_status = "RUNNING"
-
-  boot_disk {
-    initialize_params {
-      image = var.controller_image
-      size  = 20
-    }
+  disk {
+    source_image = var.controller_image
+    auto_delete  = true
+    boot         = true
+    disk_size_gb = 20
   }
 
   network_interface {
@@ -742,8 +753,110 @@ resource "google_compute_instance" "controller" {
     # never be admitted from one that is simply waiting its turn.
     "ci-queue-base" = var.queue_base_branch
 
+    # Empty unless autohealing is on. The startup script starts the liveness
+    # responder only when this key has a value, so the default path opens no
+    # port at all — the responder is a listening socket on the one machine that
+    # holds the App installation token, and it exists to answer a probe nobody
+    # is sending unless an operator asked for one.
+    "ci-health-port" = var.controller_autohealing ? tostring(var.controller_health_port) : ""
+
     "block-project-ssh-keys" = "true"
   })
 
-  allow_stopping_for_update = true
+  # The group below refers to this template by id, so the new one must exist
+  # before the old one can go.
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# AUTOHEALING IS OFF BY DEFAULT, AND THAT IS THE CONSIDERED ANSWER, NOT A TODO.
+#
+# Autohealing on a group of size 1 is not "recover faster". It is "grant a
+# health probe the authority to delete the fleet's control plane, repeatedly,
+# on no other evidence". If the probe cannot reach the controller — the
+# health-check ranges are not open to its tag, a central firewall drops them, a
+# port is wrong — the group concludes the controller is dead, deletes it,
+# builds another, cannot reach that one either, and loops. That state is
+# strictly worse than the pet: a pet that is up stays up.
+#
+# And the wedge case autohealing is usually bought for is already covered
+# in-guest. `ci-controller-watchdog.timer` compares the tick heartbeat's age
+# against ten poll intervals and restarts the unit — the exact 2h55m stall of
+# 2026-08-14, caught without a network path and without deleting anything. What
+# autohealing adds on top is narrow: a guest whose OS is dead enough that
+# systemd cannot run the watchdog. Real, but not worth a recreate loop by
+# default.
+#
+# So: the group is the default (it recovers a DELETED controller, which is what
+# #308 is about, and it can do that with no health check at all), and the
+# probe-driven half is a flag an operator turns on after confirming the probe
+# actually reports HEALTHY. `docs/applying-runner-infra.md` has the sequence.
+resource "google_compute_health_check" "controller" {
+  count = var.manage_controller && var.controller_autohealing ? 1 : 0
+
+  project = var.project_id
+  name    = "${var.name}-controller-live"
+
+  # 3 × 30s to condemn. Below that a slow tick starts looking like a dead
+  # machine, and the cost of being wrong here is a rebuilt control plane.
+  check_interval_sec  = 30
+  timeout_sec         = 10
+  healthy_threshold   = 2
+  unhealthy_threshold = 3
+
+  # HTTP, not TCP. A TCP check passes as long as something is listening, which
+  # is true of a controller whose tick loop has stopped — the responder answers
+  # 200 only while the heartbeat is fresh, and that distinction is the entire
+  # reason for having a check rather than relying on "the VM exists".
+  http_health_check {
+    port         = var.controller_health_port
+    request_path = "/livez"
+  }
+}
+
+resource "google_compute_instance_group_manager" "controller" {
+  count = var.manage_controller ? 1 : 0
+
+  project = var.project_id
+  name    = "${var.name}-controller"
+  zone    = length(var.zones) > 0 ? var.zones[0] : data.google_compute_zones.available.names[0]
+
+  base_instance_name = "${var.name}-controller"
+  target_size        = 1
+
+  version {
+    instance_template = google_compute_instance_template.controller[0].id
+  }
+
+  # `max_surge_fixed = 0` IS THE INVARIANT, NOT A TUNING CHOICE. Two
+  # controllers serving one repository at the same time both count demand,
+  # both resize the MIG and both drain hosts, against a GitHub view neither
+  # knows the other is acting on. Surging to two for a template change would
+  # do exactly that, briefly, on every apply that touches the startup script —
+  # which is most of them. One at a time, with a gap, is correct.
+  #
+  # PROACTIVE, unlike the hosts' group: an OPPORTUNISTIC controller would sit
+  # on the old startup script until something else replaced it, which is the
+  # rollout shape that put v5.1.0 on disk and left v5.0 running the pool.
+  update_policy {
+    type                  = "PROACTIVE"
+    minimal_action        = "REPLACE"
+    replacement_method    = "SUBSTITUTE"
+    max_surge_fixed       = 0
+    max_unavailable_fixed = 1
+  }
+
+  dynamic "auto_healing_policies" {
+    for_each = var.controller_autohealing ? [1] : []
+    content {
+      health_check = google_compute_health_check.controller[0].id
+
+      # Ten minutes. The controller installs packages, mints a token and walks
+      # the whole repository before its first heartbeat; a delay shorter than
+      # the slowest legitimate boot turns autohealing into a boot loop that
+      # never reaches a first tick.
+      initial_delay_sec = 600
+    }
+  }
 }
