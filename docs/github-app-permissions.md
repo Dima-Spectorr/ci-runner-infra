@@ -9,10 +9,14 @@ silently**. Not one of them fails an apply, fails a job, or turns a check red.
 
 Two facts shape everything below:
 
-* **A permission grant is fleet-wide, not per-repository.** One App, installed
-  once per account, serving every repository selected in that installation. So
-  the grant is done once and it lands everywhere — and so a permission nobody
-  noticed was missing was missing everywhere.
+* **A permission grant covers an installation, not a repository.** One App
+  serves every repository selected in a given installation, so the grant is
+  done once and lands on all of them — and a permission nobody noticed was
+  missing was missing on all of them too. **The fleet is not one App.** There
+  is more than one, so "we granted it" is only ever true of the installation it
+  was granted on: check each root's own `github_app_id` /
+  `github_installation_id` in its `terraform.tfvars` before assuming a repo is
+  covered by a grant made elsewhere.
 * **A permission added to an App is not granted until the installation accepts
   it.** GitHub treats the edit as a *request*. Until an owner approves it, the
   App behaves in every respect as though the permission had never been added.
