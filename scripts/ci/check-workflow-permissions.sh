@@ -251,13 +251,13 @@ check_file() {
     return
   fi
 
-  if printf '%s\n' "$records" | grep -q '^#ERR	'; then
+  if printf '%s\n' "$records" | grep -c '^#ERR	' >/dev/null; then
     err PERM0 "$rel: $(printf '%s\n' "$records" | sed -n 's/^#ERR\t//p' | head -1)"
     return
   fi
 
   # A file the parser read but emitted no `#TOP` for never reached the emitter.
-  if ! printf '%s\n' "$records" | grep -q '^#TOP	'; then
+  if ! printf '%s\n' "$records" | grep -c '^#TOP	' >/dev/null; then
     err PERM0 "$rel: the YAML reader produced no verdict for the workflow itself"
     return
   fi

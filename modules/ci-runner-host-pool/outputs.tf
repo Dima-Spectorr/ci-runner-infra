@@ -86,6 +86,17 @@ output "metric_names" {
     for m in [
       "ci_demand",
       "ci_demand_queued",
+      # Queued jobs this pool STOPPED answering for because they had been queued
+      # past DEMAND_MAX_AGE. GitHub never takes a run out of `queued` on its own,
+      # so a run held by an unapproved environment, blocked on a `concurrency`
+      # group, or abandoned on a dead branch would otherwise hold a host warm
+      # forever and peg ci_demand_wait_seconds at its own age — saturating the
+      # one gauge that would have shown the real queue underneath it. Published
+      # rather than silently subtracted: a demand figure that dropped with no
+      # visible reason is the same invisibility arriving from the other side. A
+      # steady non-zero count is a repository leaving runs stuck, not a fleet
+      # fault; a sudden one alongside a rising ci_demand is worth reading twice.
+      "ci_demand_expired",
       # Jobs this pool must run that are PINNED to one named host, kept out of
       # ci_demand on purpose: the autoscaler reads ci_demand, and buying a host
       # cannot help a job only one existing host can serve. Read the two

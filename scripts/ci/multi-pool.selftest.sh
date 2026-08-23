@@ -57,7 +57,11 @@ select_out=$(
 
   declare -A P_MIG P_REGION P_SLOTS P_MIN P_MAX P_GRACE P_REGGRACE P_TICKS
   declare -A P_RECYCLE P_HOST_OS P_MINT P_ROLE P_BEACON P_PIN P_LABELS
-  declare -A P_LABELS_JSON D_TOTAL D_QUEUED D_WAIT D_RUNNING
+  # D_EXPIRED is declared even though pool_select reads it as `${...:-0}`: an
+  # associative subscript on a variable bash has never seen is parsed as
+  # ARITHMETIC, so `${D_EXPIRED[$POOL]:-0}` with POOL=a dies under `set -u` as
+  # "a: unbound variable" — the default never gets a chance to apply.
+  declare -A P_LABELS_JSON P_MATCH_CSV D_TOTAL D_QUEUED D_WAIT D_RUNNING D_EXPIRED
 
   # Two pools that agree on NOTHING, so a field carried over from the first is
   # visible in the second rather than coincidentally equal.
@@ -75,6 +79,11 @@ select_out=$(
     P_PIN[$p]=900
     P_LABELS[$p]="self-hosted,$p"
     P_LABELS_JSON[$p]="[\"self-hosted\",\"$p\"]"
+    # The MATCH set, which is what every routing question is asked of. It
+    # differs from P_LABELS on purpose: a pool_select that carried the
+    # configured list into RUNNER_MATCH_LABELS would pass a test in which the
+    # two were equal, and then read every real workflow as another pool's.
+    P_MATCH_CSV[$p]="$p,self-hosted,x64"
   done
   P_MIG[a]=mig-a
   P_MIG[b]=mig-b
@@ -100,12 +109,12 @@ select_out=$(
 
   pool_select b
   printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-    "$POOL" "$MIG" "$CONTROLLER_HOST_OS" "$MINT_REG" "$RUNNER_LABELS" \
+    "$POOL" "$MIG" "$CONTROLLER_HOST_OS" "$MINT_REG" "$RUNNER_MATCH_LABELS" \
     "$MIG_BASE" "$MIG_TARGET" "$MIG_TEMPLATE" \
     "$DEMAND_TOTAL" "$DEMAND_QUEUED" "$RUNNING_MAX"
 )
 check "pool_select: the second pool's own fields are all in place" \
-  "b|mig-b|windows|true|self-hosted,b" \
+  "b|mig-b|windows|true|b,self-hosted,x64" \
   "$(printf '%s' "$select_out" | cut -d'|' -f1-5)"
 
 # The one that cordons a pool. MIG_TEMPLATE from pool a, compared against pool

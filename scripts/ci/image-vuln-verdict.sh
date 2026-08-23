@@ -363,7 +363,7 @@ selftest() {
   # It is NOT rendered as an ordinary report. `reported` means "nothing to do
   # here"; this one is fixable and above the floor and deliberately let through,
   # which is a different sentence and has to read as one.
-  if run --report "$tmp/gomod.json" --today 2026-01-01 2>&1 | grep -q "reported critical GHSA-x"; then
+  if run --report "$tmp/gomod.json" --today 2026-01-01 2>&1 | grep -c "reported critical GHSA-x" >/dev/null; then
     echo "FAIL an off-distro finding renders as off-distro, not as reported"
     status=1
   else

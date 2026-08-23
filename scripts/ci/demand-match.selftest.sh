@@ -21,15 +21,35 @@ FAIL=0
 # one, this test fails until you change the other — which is the point.
 # shellcheck disable=SC2016  # $mine_labels is a jq variable, not a shell one.
 FILTER='
+  def jlabels: ((.labels // []) | map(ascii_downcase));
   [ .jobs[]?
     | select(.status == "queued" or .status == "in_progress")
     | select( ((.labels // []) | length) > 0 )
-    | select( (((.labels // []) | map(select(startswith("host-")))) - $mine_labels | length) == 0 )
-    | select( ((.labels // []) - $mine_labels) | length == 0 )
+    | select( ((jlabels | map(select(startswith("host-")))) - $mine_labels | length) == 0 )
+    | select( (jlabels - $mine_labels) | length == 0 )
   ] | length'
 
-POOL_LABELS=$(printf '%s' "self-hosted,ci-runner-host-telnet,linux,gcp,Telnet-Emulation" \
-  | jq -R -c 'split(",") | map(select(length > 0))')
+# WHAT THE POOL IS CONFIGURED WITH, exactly as `ci-runner-labels` carries it and
+# exactly as `config.sh --labels` receives it. Note what is NOT in it: `linux`.
+# No pool in this fleet is configured with an OS label, because the agent
+# registers one itself -- and the fixture that used to sit here invented one.
+# That is why this file was green for months while `ci_demand` was structurally
+# 0 on every pool in the fleet: every real workflow asks for `linux`, no pool
+# was configured with it, the subset test had `["linux"]` left over, and nothing
+# was ever counted. A fixture that is not what production sends is not a test.
+POOL_CONFIGURED="self-hosted,ci-runner-host-telnet,gcp,Telnet-Emulation"
+
+# WHAT THE AGENT ANSWERS TO. Derived here the way controller-startup.sh derives
+# P_MATCH_JSON: the configured list plus the three labels the runner registers
+# on its own (`self-hosted`, the OS, the architecture), folded, because GitHub
+# routes case-insensitively and a jq `-` does not.
+match_set() { # <configured-csv> <host_os>
+  printf '%s' "$1" | jq -R -c --arg os "$2" '
+    (if ($os | ascii_downcase) == "windows" then "Windows" else "Linux" end) as $osl
+    | split(",") + ["self-hosted", $osl, "X64"]
+    | map(select(length > 0) | ascii_downcase) | unique'
+}
+POOL_LABELS=$(match_set "$POOL_CONFIGURED" linux)
 
 # expect <count> <description> <jobs-json>
 expect() {
@@ -97,23 +117,37 @@ expect 0 "missing jobs key does not crash the tick" '{}'
 # `date -d -` fails, so the sentinel is skipped by the reader.
 # shellcheck disable=SC2016  # $pools is a jq variable, not a shell one.
 STAMPS='
+  def jlabels: ((.labels // []) | map(ascii_downcase));
+  def expired:
+    .status == "queued"
+    and (((((.started_at // .created_at) // "") | fromdateiso8601?) // $now)
+          < ($now - $maxage));
   [ .jobs[]?
     | select(.status == "queued" or .status == "in_progress")
     | select( ((.labels // []) | length) > 0 )
-    | select( ((.labels // []) | map(select(startswith("host-"))) | length) == 0 )
+    | select( (jlabels | map(select(startswith("host-"))) | length) == 0 )
   ] as $candidates
   | $pools | to_entries[]
   | .key as $pool
   | .value as $mine_labels
-  | [ $candidates[] | select( ((.labels // []) - $mine_labels) | length == 0 ) ] as $mine
+  | [ $candidates[] | select( (jlabels - $mine_labels) | length == 0 ) ] as $matched
+  | [ $matched[] | select(expired | not) ] as $mine
+  | ([ $matched[] | select(expired) ] | length) as $expired_n
   | [ $pool,
       ($mine | length),
       ([ $mine[] | select(.status == "queued") ] | length),
       ([ $mine[] | select(.status == "queued") | .started_at // .created_at ]
          | join(" ") | if . == "" then "-" else . end),
       ([ $mine[] | select(.status == "in_progress") | .started_at // empty ]
-         | join(" ") | if . == "" then "-" else . end)
+         | join(" ") | if . == "" then "-" else . end),
+      $expired_n
     ] | @tsv'
+
+# The sweep clock, fixed so the age cases read the same on every run, and the
+# shelf life the controller applies to a queued job. Every stamp in this file is
+# minutes before NOW, so no case written before the shelf life existed ages out.
+NOW=$(jq -n '"2026-08-15T17:00:00Z" | fromdateiso8601')
+MAXAGE=21600
 
 # One pool for the stamp cases, so their expectations stay readable. The
 # multi-pool cases at the end of the file build their own map.
@@ -122,7 +156,8 @@ POOLS_MAP=$(jq -n --argjson l "$POOL_LABELS" '{telnet: $l}')
 # fields <want-pipe-joined> <description> <jobs-json>
 fields() {
   local want="$1" desc="$2" jobs="$3" got
-  got=$(printf '%s' "$jobs" | jq -r --argjson pools "$POOLS_MAP" "$STAMPS" \
+  got=$(printf '%s' "$jobs" | jq -r --argjson pools "$POOLS_MAP" \
+    --argjson now "$NOW" --argjson maxage "$MAXAGE" "$STAMPS" \
     | tr -d '\r' | tr '\t' '|' | paste -sd';' -)
   if [ "$got" = "$want" ]; then
     PASS=$((PASS + 1))
@@ -132,13 +167,13 @@ fields() {
   fi
 }
 
-fields 'telnet|2|1|2026-08-15T16:15:00Z|2026-08-15T16:18:09Z' \
+fields 'telnet|2|1|2026-08-15T16:15:00Z|2026-08-15T16:18:09Z|0' \
   "a queued and a running job land in different fields, never the same one" \
   '{"jobs":[
      {"status":"queued","labels":["self-hosted"],"created_at":"2026-08-15T16:15:00Z"},
      {"status":"in_progress","labels":["self-hosted"],"started_at":"2026-08-15T16:18:09Z"}]}'
 
-fields 'telnet|1|0|-|2026-08-15T16:18:09Z' \
+fields 'telnet|1|0|-|2026-08-15T16:18:09Z|0' \
   "a pool with nothing queued still reports how long its running job has been running" \
   '{"jobs":[{"status":"in_progress","labels":["self-hosted"],"started_at":"2026-08-15T16:18:09Z"}]}'
 
@@ -146,20 +181,20 @@ fields 'telnet|1|0|-|2026-08-15T16:18:09Z' \
 # told us started has not been running for the time since it was created, and
 # reporting that difference as run time would raise a wedged-slot alert for
 # every job still sitting in the queue.
-fields 'telnet|1|0|-|-' \
+fields 'telnet|1|0|-|-|0' \
   "a running job with no start time contributes nothing rather than its queue age" \
   '{"jobs":[{"status":"in_progress","labels":["self-hosted"],"created_at":"2026-08-15T16:15:00Z"}]}'
 
 # The incident this field exists for: one slot wedged, every sibling finished.
 # The completed jobs must not dilute it — they are not in flight.
-fields 'telnet|1|0|-|2026-08-15T16:18:09Z' \
+fields 'telnet|1|0|-|2026-08-15T16:18:09Z|0' \
   "finished siblings do not enter the in-flight age at all" \
   '{"jobs":[
      {"status":"completed","labels":["self-hosted"],"started_at":"2026-08-15T16:17:48Z"},
      {"status":"completed","labels":["self-hosted"],"started_at":"2026-08-15T16:18:02Z"},
      {"status":"in_progress","labels":["self-hosted"],"started_at":"2026-08-15T16:18:09Z"}]}'
 
-fields 'telnet|1|0|-|-' \
+fields 'telnet|1|0|-|-|0' \
   "a job wedged on ANOTHER pool's runner is not this pool's stuck job" \
   '{"jobs":[
      {"status":"in_progress","labels":["self-hosted","windows"],"started_at":"2026-08-15T16:18:09Z"},
@@ -182,7 +217,8 @@ MULTI=$(jq -n '{
 # multi <want> <description> <jobs-json> — same reader, an explicit pool map.
 multi() {
   local want="$1" desc="$2" jobs="$3" got
-  got=$(printf '%s' "$jobs" | jq -r --argjson pools "$MULTI" "$STAMPS" \
+  got=$(printf '%s' "$jobs" | jq -r --argjson pools "$MULTI" \
+    --argjson now "$NOW" --argjson maxage "$MAXAGE" "$STAMPS" \
     | tr -d '\r' | cut -f1,2 | tr '\t' '|' | paste -sd';' -)
   if [ "$got" = "$want" ]; then
     PASS=$((PASS + 1))
@@ -241,7 +277,7 @@ CONTROLLER="$HERE/../../modules/ci-runner-host-pool/scripts/controller-startup.s
 # shellcheck disable=SC2016  # matching jq source text literally, on purpose.
 for needle in \
   'select(.status == "in_progress") | .started_at // empty' \
-  'while IFS=$'"'"'\t'"'"' read -r c_pool n q stamps running; do' \
+  'while IFS=$'"'"'\t'"'"' read -r c_pool n q stamps running expired_n; do' \
   'D_RUNNING["$c_pool"]=$wait' \
   'queue_series "ci_job_running_seconds_max" "$RUNNING_MAX"'
 do
@@ -275,29 +311,150 @@ expect 1 "an in-progress pinned job is excluded too, so the pair of series stays
 # is an ordinary job this pool can serve. Excluding it here while the pin filter
 # reads it as unpinned is how a job leaves ci_demand and ci_demand_pinned at the
 # same time -- counted nowhere, scaling nothing, and invisible on both charts.
-POOL_LABELS=$(printf '%s' "self-hosted,ci-runner-host-telnet,linux,gcp,Telnet-Emulation,host-large" \
-  | jq -R -c 'split(",") | map(select(length > 0))')
+POOL_LABELS=$(match_set "$POOL_CONFIGURED,host-large" linux)
 expect 1 "a host- label that is one of THIS pool's own labels is ordinary demand" \
   '{"jobs":[{"status":"queued","labels":["self-hosted","linux","host-large"]}]}'
 expect 0 "a host- label this pool does not carry is still a pin, and still excluded" \
   '{"jobs":[{"status":"queued","labels":["self-hosted","linux","host-large","host-ci-lin-a1b2"]}]}'
-POOL_LABELS=$(printf '%s' "self-hosted,ci-runner-host-telnet,linux,gcp,Telnet-Emulation" \
-  | jq -R -c 'split(",") | map(select(length > 0))')
+POOL_LABELS=$(match_set "$POOL_CONFIGURED" linux)
 
 # shellcheck disable=SC2016  # matching jq source text literally, on purpose.
-if grep -qF 'select( (((.labels // []) | map(select(startswith("host-")))) - $mine_labels | length) == 0 )' "$CONTROLLER"; then
+if grep -qF 'select( ((jlabels | map(select(startswith("host-")))) - $mine_labels | length) == 0 )' "$CONTROLLER"; then
   PASS=$((PASS + 1))
 else
   FAIL=$((FAIL + 1))
   echo "FAIL: the pin-exclusion line tested here no longer appears in controller-startup.sh"
 fi
 # shellcheck disable=SC2016  # matching jq source text literally, on purpose.
-if grep -qF 'select( ((.labels // []) - $mine_labels) | length == 0 )' "$CONTROLLER"; then
+if grep -qF 'select( (jlabels - $mine_labels) | length == 0 )' "$CONTROLLER"; then
   PASS=$((PASS + 1))
 else
   FAIL=$((FAIL + 1))
   echo "FAIL: the filter tested here no longer appears in controller-startup.sh"
 fi
+
+# --- the labels the runner registers, and the case nobody controls ------------
+#
+# THE OUTAGE THIS SECTION EXISTS FOR. Every pool in the fleet reported
+# `ci_demand` 0 while jobs queued for hours in front of idle slots, and the
+# autoscaler — whose input that gauge IS — did exactly what a zero asks for.
+# Two independent reasons, and fixing either alone still counts nothing:
+#
+#   * The agent registers `self-hosted`, the OS and the architecture ITSELF.
+#     GitHub calls them read-only; no `--labels` produces them and none of ours
+#     removes them. The configured list has no OS label in it, so a `runs-on`
+#     naming one had a label left over and fell out of the subset test.
+#   * GitHub matches case-insensitively. The agent registers `Linux`; every
+#     workflow in the fleet writes `linux`. To a jq `-` those are two labels.
+#
+# So both sides are folded and the read-only three are added, and each half is
+# pinned separately below — a fix that quietly loses one half is the outage
+# again, and it looks exactly as healthy on the way in as it did the first time.
+expect 1 "the OS label a workflow always writes and no pool is ever configured with" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","linux","gcp","Telnet-Emulation"]}]}'
+expect 1 "the same label as the agent spells it" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","Linux"]}]}'
+expect 1 "SHOUTED, because GitHub does not care and neither may we" \
+  '{"jobs":[{"status":"queued","labels":["SELF-HOSTED","LINUX","GCP"]}]}'
+expect 1 "the architecture is registered too, in either case" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","x64"]}]}'
+expect 1 "a configured label in the wrong case is still ours" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","TELNET-EMULATION"]}]}'
+# Folding must not make everything match everything: the read-only labels are
+# the runner's THREE, not a licence to answer for any OS or architecture.
+expect 0 "arm64 is not this pool's architecture, folded or not" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","linux","ARM64"]}]}'
+expect 0 "macOS belongs to nobody here" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","macos"]}]}'
+
+# The OS half is per-pool and comes from `host_os`, so a Windows pool must not
+# answer for `linux` — which, with the read-only labels added but the derivation
+# wrong, is precisely how one pool ends up buying hosts for another's work.
+WIN_LABELS=$(match_set "self-hosted,ci-runner-host-win,gcp,Telnet-Emulation" windows)
+win() { # <want> <description> <jobs-json>
+  local want="$1" desc="$2" jobs="$3" got
+  got=$(printf '%s' "$jobs" | jq -r --argjson mine_labels "$WIN_LABELS" "$FILTER")
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  want: %s\n  got:  %s\n' "$desc" "$want" "$got"
+  fi
+}
+win 1 "a Windows pool answers for a Windows job" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","windows","gcp"]}]}'
+win 0 "a Windows pool does not answer for a Linux job" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted","linux","gcp"]}]}'
+
+# A fixture that derives the match set the way the controller does proves
+# nothing once the controller stops doing it, so the derivation is pinned too.
+# shellcheck disable=SC2016  # matching jq source text literally, on purpose.
+for needle in \
+  'split(",") + ["self-hosted", $osl, "X64"]' \
+  'map(select(length > 0) | ascii_downcase) | unique' \
+  'def jlabels: ((.labels // []) | map(ascii_downcase));'
+do
+  if grep -qF "$needle" "$CONTROLLER"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: `%s` no longer appears in controller-startup.sh\n' "$needle"
+  fi
+done
+
+# --- a queued job has a shelf life --------------------------------------------
+#
+# GitHub never takes a run out of `queued` on its own. A run held by an
+# unapproved environment, blocked on a `concurrency` group, or abandoned on a
+# dead branch keeps asking this pool for a host forever. Apigee-Portal had three
+# from 2026-08-19 still queued on 2026-08-23. The cost is not academic: one
+# corpse times `single_instance_assignment` pins a host warm for good, and the
+# wait gauge pegs at the corpse's age, so the one series that would show a real
+# queue underneath it is saturated. Both halves are asserted — dropped from the
+# count AND from the stamps — and what was dropped is published as its own
+# series rather than silently subtracted out of the one the operator watches.
+STALE='2026-08-15T09:00:00Z'   # 8h before NOW, past the 6h shelf life
+FRESH='2026-08-15T16:30:00Z'   # 30m before NOW
+
+fields "telnet|0|0|-|-|1" \
+  "a queued job older than the shelf life is not demand" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted"],"created_at":"'"$STALE"'"}]}'
+fields "telnet|1|1|$FRESH|-|1" \
+  "the fresh job beside it still counts, and the corpse is reported separately" \
+  '{"jobs":[
+     {"status":"queued","labels":["self-hosted"],"created_at":"'"$STALE"'"},
+     {"status":"queued","labels":["self-hosted"],"created_at":"'"$FRESH"'"}]}'
+# The stamps matter as much as the count: leaving the corpse's timestamp in the
+# queued list would peg ci_demand_wait_seconds at eight hours and hold it there.
+fields "telnet|1|1|$FRESH|-|1" \
+  "the expired job's timestamp is not in the wait series either" \
+  '{"jobs":[
+     {"status":"queued","labels":["self-hosted"],"created_at":"'"$FRESH"'"},
+     {"status":"queued","labels":["self-hosted"],"created_at":"'"$STALE"'"}]}'
+# In-flight, not queued. A job that has been RUNNING for eight hours is a wedged
+# slot, and dropping it would hide the incident the running series exists to
+# report — it is the QUEUE that has a shelf life, not the work.
+fields "telnet|1|0|-|$STALE|0" \
+  "an old RUNNING job is not expired — that is a wedged slot, not a corpse" \
+  '{"jobs":[{"status":"in_progress","labels":["self-hosted"],"started_at":"'"$STALE"'"}]}'
+# An unreadable timestamp reads as "just now" and is never aged out. The costs
+# are asymmetric: keeping a corpse buys a warm host, while dropping a live job
+# stops the pool scaling out for work that is really waiting.
+fields "telnet|1|1|not-a-date|-|0" \
+  "an unparseable timestamp is kept, not aged out" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted"],"created_at":"not-a-date"}]}'
+# shellcheck disable=SC2016  # matching shell source text literally, on purpose.
+for needle in \
+  'DEMAND_MAX_AGE=21600' \
+  'queue_series "ci_demand_expired" "$DEMAND_EXPIRED"'
+do
+  if grep -qF "$needle" "$CONTROLLER"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: `%s` no longer appears in controller-startup.sh\n' "$needle"
+  fi
+done
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

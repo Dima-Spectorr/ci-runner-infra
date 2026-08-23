@@ -74,17 +74,17 @@ floor "host-startup.sh" "$host_published" 3
 # success -- hosts drain, the pool shrinks, the graphs look healthy -- right up
 # until a pull request's second job finds the host it named is gone.
 for m in ci_worker_gate_verdicts ci_worker_gate_os_fallback ci_pin_holds_honoured; do
-  printf '%s\n' "$published" | grep -qx "$m" || {
+  printf '%s\n' "$published" | grep -cx "$m" >/dev/null || {
     printf 'FAIL %s is not published by either script — the second delete gate has no telemetry\n' "$m"
     fails=$((fails + 1)); }
-  printf '%s\n' "$declared" | grep -qx "$m" || {
+  printf '%s\n' "$declared" | grep -cx "$m" >/dev/null || {
     printf 'FAIL %s is not declared in metric_names — no dashboard or alert can find the delete gate\n' "$m"
     fails=$((fails + 1)); }
 done
 
 while read -r m; do
   [ -n "$m" ] || continue
-  if printf '%s\n' "$declared" | grep -qx "$m"; then
+  if printf '%s\n' "$declared" | grep -cx "$m" >/dev/null; then
     printf 'ok   %s is published and declared\n' "$m"
   else
     printf 'FAIL %s is published by the controller but missing from metric_names — no dashboard can find it\n' "$m"
@@ -94,7 +94,7 @@ done <<<"$published"
 
 while read -r m; do
   [ -n "$m" ] || continue
-  if ! printf '%s\n' "$published" | grep -qx "$m"; then
+  if ! printf '%s\n' "$published" | grep -cx "$m" >/dev/null; then
     printf 'FAIL %s is declared in metric_names but nothing publishes it — an alert on it can never fire\n' "$m"
     fails=$((fails + 1))
   fi
