@@ -74,8 +74,25 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
 
 check() { # <description> <condition-as-command...>
   local d="$1"; shift
+  # `!` is a shell KEYWORD and a keyword does not survive "$@" expansion -- it
+  # arrives here as a command named `!`, which does not exist, so the assertion
+  # reports the missing command instead of the condition. Refuse it outright:
+  # a negated condition has its own helper below.
+  if [ "$1" = '!' ]; then
+    bad "$d [harness: negate with check_not, not a leading !]"
+    return
+  fi
   if "$@"; then ok "$d"; else bad "$d"; fi
 }
+
+check_not() { # <description> <condition-as-command...>
+  local d="$1"; shift
+  if "$@"; then bad "$d"; else ok "$d"; fi
+}
+
+# Wrapped rather than redirected at the call site, so the quieting lands on
+# pgrep and not on the assertion's own verdict.
+pgrep_slot() { pgrep -u "$U" >/dev/null 2>&1; }
 
 # --- the sandbox --------------------------------------------------------------
 #
@@ -306,10 +323,21 @@ rc=$?
 # it, so a survivor recreates the file and this assertion is not a race.
 sleep 1
 check "the reset succeeds with a writer to stop"  test "$rc" = 0
-check "no process of the slot outlives the reset" ! pgrep -u "$U" >/dev/null 2>&1
+# NOT `check ... ! pgrep ... >/dev/null 2>&1`: those redirections attach to
+# `check`, not to pgrep, so the verdict this assertion prints goes to /dev/null
+# and a failure is counted with nothing on screen naming it. Silence the
+# condition, never the harness.
+check_not "no process of the slot outlives the reset" pgrep_slot
 check "nothing rewrote the home after the wipe"   test ! -e "$HOME_DIR/.pwned"
 check "the home is the template's again"          test -f "$HOME_DIR/.bashrc"
 check "and the marker means it"                   test -f "$MARKER"
+
+# The suite goes on after a failed assertion, so a writer that DID survive would
+# keep rewriting the home under every case below and the report would blame
+# them. Kill anything of this slot's here, whatever the verdict was.
+sudo pkill -KILL -u "$U" >/dev/null 2>&1 || :
+sleep 0.2
+rm -f -- "$HOME_DIR/.pwned"
 
 echo
 echo "started, on a slot whose last job never completed"
