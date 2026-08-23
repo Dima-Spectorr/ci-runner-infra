@@ -138,5 +138,39 @@ mutate RUNNER10 "a second job declares itself an infrastructure owner" \
 mutate RUNNER11 "the Windows job dials localhost on the band port" \
   's|postgres://ci@${{ needs.anchor.outputs.addr }}:${{ needs.anchor.outputs.pg }}|postgres://ci@localhost:35100|'
 
+# The anchor is now a call to this repository's own published workflow rather
+# than seventy-five lines the adopter copies, and RUNNER7 is what makes that
+# call reviewable: the gate cannot read a remote callee, so the acceptance is
+# declared beside the call, against an issue. Drop the declaration and the check
+# has to re-arm — otherwise the example teaches an unreviewed remote call.
+mutate RUNNER7 "the remote-reusable declaration beside the anchor call is dropped" \
+  '/^# remote-reusable-allowed(/d'
+
+# --- 3. and the ref it teaches is still a placeholder -------------------------
+#
+# `@REPLACE-WITH-A-RELEASE-TAG` is not an oversight. Seven repositories copy
+# this file, and a real tag written here ages: it would be copied, months later,
+# as the pin for an anchor that has since moved against host-side contracts it
+# talks to — `ci-pin-hold`, `CI_SHARED_INFRA_ADDR`, the port band — which are
+# versioned with the pool image. A placeholder fails loudly in the adopter's own
+# first run; a stale pin fails quietly, much later, on their pool.
+#
+# This is also why it is asserted here rather than left to review: the natural
+# tidy-up is to "fix" the placeholder, and nothing else in the tree would notice.
+if grep -q 'shared-infra-anchor\.yml@REPLACE-WITH-A-RELEASE-TAG' "$EXAMPLE"; then
+  ok
+else
+  bad "the example's anchor ref is no longer a placeholder — an adopter would copy whatever tag was current when it was written (keep '@REPLACE-WITH-A-RELEASE-TAG'; the pin belongs in the adopter's repository, not in the reference)"
+fi
+
+# And the workflow it names has to exist here, under that exact path, or the
+# example teaches a call to nothing. The gate cannot check a remote callee by
+# design — but this callee is not remote from here.
+if [ -r "$REPO_ROOT/.github/workflows/shared-infra-anchor.yml" ]; then
+  ok
+else
+  bad "the example calls .github/workflows/shared-infra-anchor.yml and this repository does not have it — every adopter's anchor job would fail to resolve"
+fi
+
 printf 'shared-infra example: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

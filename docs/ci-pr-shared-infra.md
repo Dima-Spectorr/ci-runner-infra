@@ -6,10 +6,21 @@ the measurements and the rejected alternatives, is
 `RUNNER9`/`RUNNER10`/`RUNNER11` in `scripts/ci/check-runner-policy.sh`
 ([`ci-workflow-gates.md`](ci-workflow-gates.md)).
 
-**Copy the file, not the snippets.**
+**Call the anchor, do not copy it.** Its body — pin admission, band arithmetic,
+three degrade branches, the bring-up — is published once, here, as
+[`.github/workflows/shared-infra-anchor.yml`](../.github/workflows/shared-infra-anchor.yml),
+and a consuming repository reaches it with a `uses:` and four lines of `with:`.
+Seven copies of that body is seven copies of every future fix to it, and the
+anchor talks to host-side contracts (`ci-pin-hold`, `CI_SHARED_INFRA_ADDR`, the
+port band) that move with the pool image. §1 shows the call; the fragments after
+it are the *callee's* body, quoted so the mechanism is readable and so a
+repository that genuinely cannot make the remote call knows what it is
+reproducing.
+
+**Copy the example file, not the snippets.**
 [`examples/pr-shared-infra.yml`](examples/pr-shared-infra.yml) is the whole
-contract as one workflow — anchor/owner, a Linux consumer, a Windows consumer
-and a declared exemption. The fragments below are quoted from it to explain one
+consumer side as one workflow — the anchor call, a Linux consumer, a Windows
+consumer and a declared exemption. The fragments below are quoted to explain one
 decision at a time; the file is the one that is *checked*.
 `scripts/ci/check-shared-infra-example.sh` runs on every pull request to this
 repository and asserts both that the gate reports it clean and that three
@@ -56,6 +67,47 @@ three stacks, and the contract will have made nothing better.
 There is no API call and no lease. The first fleet job runs **unpinned**, and
 whichever host it lands on becomes this workflow run's host. It reports that
 host from its own environment, and every later job pins to it.
+
+### What you write
+
+```yaml
+# remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml, #<issue>): the fleet's own published anchor
+# shared-infra-owner(anchor): brings up ci/compose.yaml on this run's Linux host
+jobs:
+  anchor:
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@<release-tag>
+    with:
+      repo-label: <Repo>
+      pin-ttl: 90m
+      migrate: ./scripts/db-migrate.sh "$DATABASE_URL"
+```
+
+Outputs are `runs-on`, `addr` and `pg`, read exactly as they would be from a
+local job. Three things about this call are not decoration:
+
+- **Pin the ref to a release tag**, not `main`. The anchor talks to host-side
+  contracts that are versioned with the pool image, so a floating ref lets it
+  move ahead of the hosts it is talking to.
+- **`remote-reusable-allowed`** is `RUNNER7`. The gate cannot read another
+  repository's file, so it cannot decide the callee's runner scope or timeouts;
+  the marker records that a human did, against an issue, instead of handing the
+  property to a document nobody checked.
+- **`shared-infra-owner`** is `RUNNER10`. Behind a `uses:` there is no
+  `services:` block and no `runs-on` for a YAML reader to see, so the marker is
+  the only evidence this run has an owner — and "one stack per run" is only
+  countable if each owner says so. Without it a repository could call the anchor
+  *and* keep a second job with its own `services:`, and the gate would count one
+  owner and report two stacks clean.
+
+`pin-ttl` sizing is §4; the remaining inputs (`compose-file`,
+`compose-project`, `hosted-runner`, `timeout-minutes`) are documented on the
+workflow itself and default to what the example uses.
+
+### What it does
+
+The rest of this section is the callee's body. Read it to understand the
+mechanism, to size the TTL, or to reproduce it in a repository that cannot make
+the remote call — not to paste it into one that can.
 
 ```yaml
   anchor:
@@ -537,9 +589,13 @@ surprise.
 1. The aggregate required check and the lane model — [`ci-lane-model.md`](ci-lane-model.md).
 2. **Consolidate `pull_request` CI into one workflow.** Without this, everything
    below is per-workflow and the pull request still holds several hosts.
-3. The anchor job, with every other fleet Linux job consuming it. Merge this
-   alone and confirm the pull request still runs when the pool is cold.
-4. Move `services:` into `ci/compose.yaml` and make the anchor the owner.
+3. **Call the published anchor** (§1) and point every other fleet Linux job at
+   its output. Merge this alone and confirm the pull request still runs when the
+   pool is cold. A private repository must first allow this one as a reusable-
+   workflow source — *Settings → Actions → Access* — or the call fails to
+   resolve before any job starts.
+4. Move `services:` into `ci/compose.yaml` and pass it to the anchor as
+   `compose-file`, with the `shared-infra-owner` marker beside the call.
 5. Point the Windows job at the outputs.
 6. Turn the gate on: add `--allow-dynamic-runner --shared-infra` to the
    `check-runner-policy.sh` invocation.
@@ -550,8 +606,14 @@ disable it.
 
 ## 8. What a consuming repository must not do
 
-- **Do not vendor the anchor job's logic and then edit it.** Nine divergent
-  copies of the pool module is the mistake this repository exists to undo.
+- **Do not vendor the anchor job's logic.** Call
+  [`shared-infra-anchor.yml`](../.github/workflows/shared-infra-anchor.yml).
+  Nine divergent copies of the pool module is the mistake this repository exists
+  to undo, and a pasted anchor is the same mistake in YAML: it ages against the
+  host-side contracts it talks to, silently, until a job on your pool fails for
+  a reason that reads like your mistake. If you must reproduce it, open an issue
+  saying why — the reason is a gap in the reusable workflow's inputs, and that
+  is fixable here, once, for everyone.
 - **Do not pin the anchor.** It is the job that discovers the host; pinning it
   to a host that may not exist is the deadlock this design removes.
 - **Do not use a PAT to read the runner list.** The anchor makes the API

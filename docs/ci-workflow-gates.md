@@ -60,7 +60,7 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER7` | a REMOTE reusable workflow's jobs are not in this repository — UNDECIDED, declarable per callee |
 | `RUNNER8` | a job on a **Windows** pool label declares `container:` or `services:`, which that pool cannot run |
 | `RUNNER9` | with `--shared-infra`, a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the anchor job's output, or is the anchor, or carries a declared exemption |
-| `RUNNER10` | with `--shared-infra`, at most **one** job invocation across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# shared-infra-owner(<job>)` markers counted together, because a repository that has adopted the contract has no `services:` left to count |
+| `RUNNER10` | with `--shared-infra`, at most **one** job invocation across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# shared-infra-owner(<job>)` markers counted together, including on a `uses:` job, because a repository that has adopted the contract has no `services:` left to count and its anchor is a call |
 | `RUNNER11` | with `--shared-infra`, a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
 
 `RUNNER9`–`RUNNER11` are designed in
@@ -127,6 +127,16 @@ is visible, `docker compose up -d` in a `run:` step is not, and the second is
 what an anchor becomes once it outgrows `services:`. Declaring it makes the job
 an anchor for `RUNNER9` and an owner for `RUNNER10` — the same fact, used by
 both rules.
+
+It is also the **only** evidence available once the anchor moves behind a
+`uses:`, which is where this contract's own adoption path puts it: the body is
+published once as
+[`shared-infra-anchor.yml`](../.github/workflows/shared-infra-anchor.yml) and
+each repository calls it. Such a caller has no `runs-on`, no `services:` and
+nothing else to read, so it is counted as an owner **when, and only when, it
+declares itself one**. Without that, a repository could call the anchor *and*
+keep a second job with its own `services:` block, and `RUNNER10` would count one
+owner and report two stacks clean.
 
 An **exemption** is `RUNNER7`'s shape reused: beside the job, naming the job,
 with an issue. It answers both rules the job can be the subject of, because a

@@ -35,7 +35,9 @@
 #              its `runs-on` from the anchor job's output, or IS the anchor, or
 #              carries a declared exemption.
 #     RUNNER10 at most ONE job across the repository's pull-request workflows
-#              owns the shared infrastructure.
+#              owns the shared infrastructure — counting a `uses:` job that
+#              declares itself an owner, which is what calling the fleet's
+#              published anchor looks like from the caller's side.
 #     RUNNER11 a WINDOWS fleet job does not name `localhost` on a
 #              shared-infrastructure port — there is nothing listening there.
 #
@@ -1046,8 +1048,25 @@ EOF
       # entirely: two group-selected jobs could each declare `services:` and the
       # gate reported clean. A group is a pool named directly — which is the
       # subject of RUNNER9, not an exception to it.
+      #
+      # A `uses:` job is included too, but ONLY when it declares itself an
+      # owner. That is not a loophole being widened, it is the one this
+      # contract's own recommended refactor opened: the anchor's body belongs in
+      # ONE reusable workflow that every repository calls, and the moment it
+      # moves there the caller's anchor job has no `runs-on`, no `services:` and
+      # nothing else a YAML reader can see. Counted as before, such a caller
+      # declares no owner at all — so a repository could call the fleet anchor
+      # AND keep a second job with its own `services:` block, and RUNNER10 would
+      # count one owner and report two stacks clean. The marker is the only
+      # evidence there is, which is exactly why the marker exists.
+      #
+      # RUNNER9 cannot fire on this job (an owner is an anchor, and an anchor
+      # names its own pool by definition) and neither can RUNNER11 (a `uses:`
+      # job has no steps to dial anything from). The widening reaches RUNNER10
+      # and nothing else.
       if [ "$SHARED_INFRA" -eq 1 ] && [ "$has_pr_any" -eq 1 ] && [ "$hosted_only" -eq 0 ] &&
-         { [ -n "$labels" ] || [ "$has_expr" -eq 1 ] || [ "$has_group" -eq 1 ]; }; then
+         { [ -n "$labels" ] || [ "$has_expr" -eq 1 ] || [ "$has_group" -eq 1 ] ||
+           { [ "$reusable" -eq 1 ] && shared_infra_marker "$file" owner "$job_base"; }; }; then
         local pins_to_anchor=0 is_owner=0 is_anchor=0
         [ "$(printf '%s
 ' "$records" | grep -c "^#RUNSONNEEDS	${job_re}	")" -gt 0 ] && pins_to_anchor=1
