@@ -272,11 +272,24 @@ means keeping the host rather than dropping it — a broken publisher must not
 read as consent to delete.
 
 The same cache is what makes §2.6 work after the last Linux job has finished;
-it records the run the hold names, not only the deadline.
+it records the run the hold names, not only the deadline. **That second reader
+is not built yet** — the veto writes the record, and nothing reads it back. It
+is deliberately a separate change, because it is not a veto: it decides whether
+to CANCEL a run whose Linux host went away underneath a Windows tail, which is
+cross-pool, irreversible, and answerable only for a hold that has already
+lapsed. Tracked as [#270](https://github.com/Dima-Spectorr/ci-runner-infra/issues/270)
+rather than left as an implied half of this one.
 
 The helper ships with the host in phase 3, the veto in phase 4 — the delivery
 table says so, because a hold whose writer is nobody's phase is how this arrives
 half-built.
+
+**What the veto costs when nothing goes wrong: one guest-attribute read, for a
+host the controller was about to remove.** It is not asked for every host on
+every tick — that is the difference between a veto on the verdict and an
+argument to the rule, and at fleet scale it is also the difference between
+staying inside the per-instance rate limit and manufacturing the failure that
+reads as "keep everything".
 
 ### 2.6 A host that disappears must fail the run, not hang it
 
@@ -440,20 +453,31 @@ to one winner rather than two half-reservations.
 One of `slots_per_host` is unavailable for the run either way; that is the price
 of the stack existing at all, and it is inside the budget rule 1 already sets.
 
-**Which makes `slots_per_host = 1` unadoptable, and the module permits it**
-(`variables.tf`: the validation is `>= 1`, and the Windows guidance is 1 for a
-pool whose jobs bind fixed ports). On a one-slot host the owner reserves the
-only agent, every consumer is pinned to that host, and nothing can run until the
-TTL sweep releases the slot — at which point it tears down the stack those
-consumers were queued for. A deadlock resolved by destroying its own subject.
+**Which makes `slots_per_host = 1` unadoptable.** On a one-slot host the owner
+reserves the only agent, every consumer is pinned to that host, and nothing can
+run until the TTL sweep releases the slot — at which point it tears down the
+stack those consumers were queued for. A deadlock resolved by destroying its own
+subject.
 
-A Terraform validation cannot catch it: the pool does not know whether the
-repository has adopted the contract. So the check belongs to the only actor that
-knows both facts at once — `ci-pin-hold --reserve-slot` refuses on a host with
-one slot and fails the run there, in the anchor, with the pool's name and the
-reason. Adoption therefore requires `slots_per_host >= 2`, and consumer
-concurrency is `slots_per_host - 1`, which is the number the budget in §1 should
-be read against for an adopting repository.
+It is refused twice, because two different actors can be the first to know.
+
+`ci-runner-network`'s `shared_infra_pairs` validation refuses it at PLAN time.
+That map is the adoption declaration: a repository that has entered a pair has
+said it intends to run the contract, and the pair carries the Linux pool's
+`slots_per_host` as its own input. So the two facts a refusal needs are in one
+place, and the answer arrives before anything is built. (The bound is `>= 2`
+there and only there. The Windows guidance of one slot per host is about a
+different variable on a different module — a Windows pool's jobs bind fixed
+ports — and a Windows pool is never the pair's `slots_per_host`.)
+
+`ci-pin-hold --reserve-slot` refuses it at RUN time, for the case the plan-time
+check structurally cannot see: a pool that never declared a pair, reached by a
+workflow that adopted the contract anyway. It fails the run in the anchor, with
+the pool's name and the reason, rather than letting the deadlock above play out.
+
+Adoption therefore requires `slots_per_host >= 2`, and consumer concurrency is
+`slots_per_host - 1`, which is the number the budget in §1 should be read
+against for an adopting repository.
 
 `services:` is the shape being replaced. A `services:` block is per-job by
 definition and there is no version of it that is shared, so a repository that
@@ -549,11 +573,11 @@ So rule 3 needs two narrow rules, not a posture change — and they are **not
 symmetrical**, because GCP's two directions do not offer the same controls:
 
 ```
-INGRESS  source_tags        = [ci-shared-infra-<id>]        # both pools
+INGRESS  source_tags        = [ci-shared-infra-src-<id>]        # both pools
          target_tags        = [ci-shared-infra-stack-<id>]  # Linux pool only
          tcp: <band span>
 
-EGRESS   target_tags        = [ci-shared-infra-<id>]  # the SOURCE VMs
+EGRESS   target_tags        = [ci-shared-infra-src-<id>]  # the SOURCE VMs
          destination_ranges = [the pool subnet's CIDR] # ranges only
          tcp: <band span>
 ```
@@ -584,7 +608,7 @@ and the rule would permit every tagged host in the pool pair to open TCP
 connections *to* the Windows band — the inbound path `adr-windows-pool.md`
 exists to deny, reintroduced by the rule that was supposed to preserve it. So:
 
-* `ci-shared-infra-<id>` — the **source** tag, carried by both pools. It says
+* `ci-shared-infra-src-<id>` — the **source** tag, carried by both pools. It says
   "a host of this repository's pair may originate band traffic".
 * `ci-shared-infra-stack-<id>` — the **destination** tag, carried by the Linux
   pool only. It says "a stack may be reached here".
@@ -815,9 +839,9 @@ phase 5 changes any consuming repository's behaviour.
 |---|---|---|---|---|
 | 1 | This ADR and the published contract | `docs/` | — | [#247](https://github.com/Dima-Spectorr/ci-runner-infra/pull/247) merged; the rest in [#255](https://github.com/Dima-Spectorr/ci-runner-infra/pull/255) |
 | 2 | Affinity label at boot + `CI_HOST_LABEL`, both pools; **`collect_demand` recognises it (§2.5)**; **orphaned-pin detection (§2.6)** | `host-startup.sh`, `windows-host-startup.ps1`, `controller-startup.sh`, self-tests | any workflow using it | [#253](https://github.com/Dima-Spectorr/ci-runner-infra/pull/253) for the label; [#256](https://github.com/Dima-Spectorr/ci-runner-infra/pull/256) for §2.5 + §2.6 |
-| 3 | Port band, per-slot DNAT, **the conntrack band allow paired with [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) in one change**, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper, publishing the hold as a guest attribute, and its `--reserve-slot` record** (refusing a one-slot host), **`slot-reset.sh` sparing a held slot's containers and releasing a hold from a previous boot as orphaned** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), **the job-started hook that renews the hold (§4 of the contract) — the host renews, never the workflow, because a consumer inside a `container:` cannot reach the binary**, sweeper teardown + reset + **stopping a reserved slot's agent (§3.1)** + agent start with **fail-closed retire** when any of the three fails, TTL sweep | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** | not started |
-| 4 | Ingress/egress band rules on the new `shared_infra_id`-scoped tag pair — `ci-shared-infra-<id>` **on both pools** as the source, `ci-shared-infra-stack-<id>` **on Linux only** as the ingress target (§3.3); pin-hold veto read from guest attributes, **monotonic in the controller's `$STATE_DIR`** so a co-tenant can only extend a hold (§2.4), applied to the `cordon:`/`retire:`/`drain:` verdicts of **both** `recycle_decision` and `drain_decision`, and the same cache read by the §2.6 detector so a Windows-only tail is still covered | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `controller-startup.sh`, self-tests | any workflow using it | not started |
-| 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) | not started |
+| 3 | Port band, per-slot DNAT, **the conntrack band allow paired with [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) in one change**, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper, publishing the hold as a guest attribute, and its `--reserve-slot` record** (refusing a one-slot host), **`slot-reset.sh` sparing a held slot's containers and releasing a hold from a previous boot as orphaned** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), **the job-started hook that renews the hold (§4 of the contract) — the host renews, never the workflow, because a consumer inside a `container:` cannot reach the binary**, sweeper teardown + reset + **stopping a reserved slot's agent (§3.1)** + agent start with **fail-closed retire** when any of the three fails, TTL sweep | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** | [#258](https://github.com/Dima-Spectorr/ci-runner-infra/pull/258) for the port band, DNAT and `CI_SHARED_INFRA_*`; [#264](https://github.com/Dima-Spectorr/ci-runner-infra/pull/264) for the pin hold, the reservation and the sweeper |
+| 4 | Ingress/egress band rules on the new `shared_infra_id`-scoped tag pair — `ci-shared-infra-src-<id>` **on both pools** as the source, `ci-shared-infra-stack-<id>` **on Linux only** as the ingress target (§3.3); pin-hold veto read from guest attributes, **monotonic in the controller's `$STATE_DIR`** so a co-tenant can only extend a hold (§2.4), applied to the `cordon:`/`retire:`/`drain:` verdicts of **both** `recycle_decision` and `drain_decision`, and the same cache read by the §2.6 detector so a Windows-only tail is still covered | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `controller-startup.sh`, self-tests | any workflow using it | [#260](https://github.com/Dima-Spectorr/ci-runner-infra/pull/260) merged for the band rules; [#269](https://github.com/Dima-Spectorr/ci-runner-infra/pull/269) for the veto |
+| 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) | [#261](https://github.com/Dima-Spectorr/ci-runner-infra/pull/261) merged |
 | 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — | not started |
 | 7 | Per-repository adoption, workflow consolidation first | consuming repositories, one pull request each | — | not started |
 
@@ -876,7 +900,7 @@ disabled in every repository on the day after.
 - The firewall gains two narrow rules for the band on a **new pair of tags
   scoped by an explicit `shared_infra_id` — one value per repository, passed to
   both module instances, never derived from a module's own name, which differs
-  between the two pools**. `ci-shared-infra-<id>` on both pools is the ingress
+  between the two pools**. `ci-shared-infra-src-<id>` on both pools is the ingress
   source and the egress target; `ci-shared-infra-stack-<id>` on Linux only is
   the ingress target. Egress is scoped by the pool subnet's range because GCP
   egress cannot scope by tag, and `database_egress_ports` is not widened.

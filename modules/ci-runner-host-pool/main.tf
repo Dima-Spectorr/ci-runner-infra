@@ -33,6 +33,21 @@
 # Tenancy-agnostic: no customer, repository, region or project literal below.
 
 locals {
+  # Shared-infrastructure band tags. See var.shared_infra_id: the first is
+  # carried by BOTH pools of a pair and is the ingress source, the second is
+  # carried by the Linux pool ONLY and is the ingress target. The Windows host
+  # therefore matches no ingress rule anywhere, which is the property
+  # docs/adr-windows-pool.md is protecting. The controller carries neither: it
+  # publishes no stack and consumes none.
+  shared_infra_tags = var.shared_infra_id == "" ? [] : concat(
+    ["ci-shared-infra-src-${var.shared_infra_id}"],
+    var.host_os == "linux" ? ["ci-shared-infra-stack-${var.shared_infra_id}"] : [],
+  )
+
+  # The complete set the template carries, named once so the count can be
+  # checked against GCP's 64-tag limit rather than discovered at the API.
+  host_network_tags = distinct(concat(["ci-runner-host", var.name], var.network_tags, local.shared_infra_tags))
+
   # `pool` and `repo` label every metric this pool publishes, so a single fleet
   # dashboard can group by either without per-repo dashboard code.
   repo_full = "${var.github_owner}/${var.github_repo}"
@@ -141,8 +156,19 @@ locals {
     # whether a machine is deleted would then differ from the branch that was
     # tested.
     file("${path.module}/scripts/beacon-decision.sh"),
+    # The pin-hold veto's rule. Concatenated on EVERY pool for the same reason
+    # the beacon's is: the branch that decides whether a machine is deleted must
+    # be the branch that was tested, and a pool that ships it conditionally is a
+    # per-deployment variant of the controller.
+    file("${path.module}/scripts/pin-hold-decision.sh"),
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/watchdog-decision.sh"),
+    # Ahead of the controller itself, and not merely by convention: the
+    # controller calls pool_table_parse at FILE SCOPE, before its first tick,
+    # to learn which pools it serves. Concatenated after, the call would run
+    # against an undefined function and the controller would exit on boot
+    # having served nothing.
+    file("${path.module}/scripts/pool-table.sh"),
     file("${path.module}/scripts/controller-startup.sh"),
   ])
 
@@ -210,8 +236,16 @@ resource "google_compute_instance_template" "host" {
 
   machine_type = var.machine_type
   labels       = local.common_labels
-  tags         = concat(["ci-runner-host", var.name], var.network_tags)
+  tags         = local.host_network_tags
 
+  # GCP caps an instance at 64 network tags. Nothing here approached it until
+  # `shared_infra_id` started ADDING tags to a set the caller already controls:
+  # a pool passing 62 of its own network_tags was valid, and turning the pair on
+  # made it invalid — on a Linux host, which gains two — with no plan-time
+  # signal. The apply reached the API and failed there, on a change whose plan
+  # said "one instance template". Deduplicated, because GCP counts the set and
+  # `concat` does not. The check itself lives in the resource's one `lifecycle`
+  # block further down -- Terraform allows exactly one per resource.
   disk {
     source_image = var.image
     auto_delete  = true
@@ -305,6 +339,11 @@ resource "google_compute_instance_template" "host" {
 
   lifecycle {
     create_before_destroy = true
+
+    precondition {
+      condition     = length(local.host_network_tags) <= 64
+      error_message = "pool '${var.name}' would carry ${length(local.host_network_tags)} distinct network tags and GCP allows 64. The two built-in tags plus var.network_tags${var.shared_infra_id == "" ? "" : " plus the ${var.host_os == "linux" ? "two" : "one"} shared_infra_id tag(s)"} exceed the limit; drop entries from var.network_tags. Left to the apply this fails at the API, after the plan looked clean."
+    }
 
     # The three identities must be three DIFFERENT accounts. Each variable's own
     # `validation` block can only see itself (cross-variable validation needs

@@ -55,6 +55,14 @@ output "metric_names" {
       # are being replaced underneath live runs — recycling too aggressively, or
       # preemption — not that the cancel logic is working hard.
       "ci_pinned_runs_cancelled",
+      # Removals this pool decided on and then declined to carry out because the
+      # host held a live pin hold. Scale-in deliberately deferred, not an error:
+      # read alongside ci_demand_pinned, the two together are "the pool is
+      # holding hosts for runs in flight". Sustained non-zero with no pinned
+      # demand is the opposite — a hold that is not lapsing, which is the shape
+      # an abandoned or forged one makes, and the reason the controller clamps
+      # every hold to PIN_HOLD_MAX.
+      "ci_pin_holds_honoured",
       "ci_hosts_running",
       "ci_hosts_max",
       "ci_hosts_draining",
@@ -112,6 +120,13 @@ output "metric_names" {
       # is working and the hosts are not leaving — jobs that never end.
       "ci_recycle_verdicts",
       "ci_poller_heartbeat",
+      # Pools the controller's own table refused at boot. A rejected pool has no
+      # series of its own — it is simply never ticked — so there is nothing to
+      # go absent and nothing to alert on except this. Its autoscaler is
+      # ONLY_UP, which means it holds whatever size it last reached, forever,
+      # while every other pool on the same controller reads healthy. Alert on
+      # any non-zero value.
+      "ci_pool_table_rejected",
       # Non-zero means scale-in is SUSPENDED — the controller cannot read the
       # runner list, so no host can be proven idle. Alert on a sustained run
       # (> 3 ticks), never on a single blip: one blind tick is normal API noise.

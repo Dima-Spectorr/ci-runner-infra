@@ -285,6 +285,20 @@ jobs:
           }
           if ($r.FailedCount -gt 0) { throw "$($r.FailedCount) Pester test(s) failed" }
 
+      # Ahead of every decision rule below, because all of them run against a
+      # row this parser produced. A dropped row is not a failure the fleet
+      # reports: that pool simply stops being ticked, and its ONLY_UP autoscaler
+      # holds its last size forever while every dashboard stays green.
+      - name: pool-table self-test
+        run: bash scripts/ci/pool-table.selftest.sh
+
+      # The three ways one controller serving four pools can corrupt a pool it
+      # is not currently ticking — a stale MIG template, another pool's state
+      # markers, another pool's recycle budget — plus the pre-table controller
+      # still booting. None of them is visible in a boot log.
+      - name: multi-pool self-test
+        run: bash scripts/ci/multi-pool.selftest.sh
+
       - name: drain-decision self-test
         run: bash scripts/ci/drain-decision.selftest.sh
 
@@ -315,6 +329,16 @@ jobs:
       - name: beacon-decision self-test
         run: bash scripts/ci/beacon-decision.selftest.sh
 
+      # The veto that stops the controller taking away a host a pull request is
+      # still using. Both directions are asserted, and they are not symmetric: a
+      # wrong `free:` deletes a host a run named by label -- taking the shared
+      # database on it with it -- while a wrong `hold:` keeps one machine warm
+      # until the hold lapses. The monotonic cases are the security ones; guest
+      # attributes are writable by any process on the VM, so a co-tenant job can
+      # publish a valid-but-expired hold over a live one.
+      - name: pin-hold-decision self-test
+        run: bash scripts/ci/pin-hold-decision.selftest.sh
+
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a
       # mis-restarted controller publishes nothing at all while systemd reports
@@ -342,6 +366,14 @@ jobs:
 
       - name: host-startup self-test
         run: bash scripts/ci/host-startup.selftest.sh
+
+      # The band's two constants live in two files in two languages, because
+      # the network module is created once per project and deliberately does
+      # not depend on the pools. A firewall span narrower than the DNAT range
+      # fails as a hang, not as an error: the SYN is dropped and the client
+      # waits out the job's timeout. This is what notices.
+      - name: shared-infra-band self-test
+        run: bash scripts/ci/shared-infra-band.selftest.sh
 
       # The Windows startup script is guarded twice, because the two harnesses
       # answer different questions. Pester (in the Windows job) executes the
@@ -506,7 +538,7 @@ jobs:
 
       # …and the fixtures' own proof. A fixture asserting "this workflow
       # produces RUNNER8" keeps passing while the detector behind it is
-      # weakened, so this mutates the gate seven ways and asserts the suite
+      # weakened, so this mutates the gate sixteen ways and asserts the suite
       # above FAILS for each. Runs after it, because a mutation "detected" by a
       # suite that was already red asserts nothing either.
       - name: runner policy mutation self-test
@@ -515,6 +547,14 @@ jobs:
       # …and then this repository's own workflows. It publishes the rule, so it
       # is the first place the rule must hold. `--forks=allowed` is the strict
       # posture and this repository is PUBLIC, so it is also the true one.
+      #
+      # `--shared-infra` is deliberately NOT passed yet. This repository's own
+      # workflows have not been consolidated onto an anchor, so turning the
+      # rules on here would fail this pipeline on the commit that adds them —
+      # and a gate whose first act is to redden its own repository is a gate
+      # nobody adopts. It goes on in the pull request that does the
+      # consolidation (phase 7 of docs/adr-pr-host-affinity.md); until then the
+      # fixtures above are what prove the rules work.
       - name: runner policy
         run: bash scripts/ci/check-runner-policy.sh --forks=allowed
 
