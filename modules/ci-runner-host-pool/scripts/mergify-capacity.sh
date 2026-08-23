@@ -58,6 +58,9 @@
 #
 # Exit 2 when the document cannot be parsed or is not a mapping. A caller must
 # treat that as "unreadable" and NOT as "no queues" — see the rule.
+# The quotes are single ON PURPOSE: this is a Python program, and every `$` in it
+# belongs to Python.
+# shellcheck disable=SC2016
 MERGIFY_QUEUE_FACTS_PY='
 import sys
 

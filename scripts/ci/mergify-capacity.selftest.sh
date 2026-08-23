@@ -134,9 +134,9 @@ check "a config with only pull_request_rules declares no queue" \
 # empty facts mean "no queue configured" and fail open with a different reason.
 for bad in 'queue_rules: [' 'just a string' '- a
 - list'; do
-  facts_of "$bad" >/dev/null 2>&1
+  if facts_of "$bad" >/dev/null 2>&1; then verdict=zero; else verdict=nonzero; fi
   check "unparseable input exits non-zero, never 'no queues': ${bad%%$'\n'*}" \
-    "nonzero" "$([ $? -ne 0 ] && echo nonzero || echo zero)"
+    "nonzero" "$verdict"
 done
 
 # --- the rule ------------------------------------------------------------------
@@ -261,15 +261,25 @@ sweep() { # <description> <expected: facts|file|aged> <status:body pairs, one pe
     eval "$(sed -n '/^collect_queue_config() {/,/^}/p' "$CTRL")"
 
     STATE_DIR=$(mktemp -d)
-    REPO_FULL="owner/repo"
-    QUEUE_CONFIG_INTERVAL=300
-    QUEUE_CONFIG_LAST=0
+    # The controller's own globals. Their only reader is collect_queue_config,
+    # which arrives through the `eval` above — invisible to shellcheck, hence the
+    # block directive rather than a reader it can see.
+    # shellcheck disable=SC2034
+    {
+      REPO_FULL="owner/repo"
+      QUEUE_CONFIG_INTERVAL=300
+      QUEUE_CONFIG_LAST=0
+      QUEUE_CONFIG_PATHS=".mergify.yml .mergify/config.yml .github/mergify.yml"
+    }
     QUEUE_CONFIG_AT=0
-    QUEUE_CONFIG_PATHS=".mergify.yml .mergify/config.yml .github/mergify.yml"
     QUEUE_CONFIG_FILE=""
     # The previous sweep's answer, so that "kept" is distinguishable from
     # "overwritten with the same thing".
     QUEUE_FACTS="previous"
+    # Both stubs are called only from the eval'd function, so shellcheck reads
+    # their bodies as dead code (SC2317). They are the opposite: they are the
+    # whole experiment.
+    # shellcheck disable=SC2317
     log() { :; }
 
     # One `<status>:<body>` per candidate path, in order. gh_api's contract is
@@ -281,6 +291,7 @@ sweep() { # <description> <expected: facts|file|aged> <status:body pairs, one pe
     # discarded and every candidate path would be answered with the first
     # response — a stub that silently ignores its own script.
     echo 0 >"$STATE_DIR/calls"
+    # shellcheck disable=SC2317
     gh_api() {
       local call pair
       call=$(cat "$STATE_DIR/calls")
