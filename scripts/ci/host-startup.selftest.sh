@@ -324,6 +324,14 @@ has_slot_reset() { # <file>
   matches "$code" 'if \[ -L "\\\$work" \]' || return 1
   matches "$code" 'mv -T -- "\\\$work" "\\\$held"' || return 1
   matches "$code" 'mv -T -- "\\\$held" "\\\$work"' || return 1
+  # …and the tree that comes back is the tree that was there. Recreating only the
+  # top-level entry is #278: the pipeline workspace is _work/<owner>/<repo>, both
+  # hooks are launched with it as their working directory, and an <owner> that
+  # came back empty meant the completed hook could not start and the slot never
+  # went clean again. Both halves are pinned — the shape is captured before the
+  # rm, and it is replayed after it.
+  matches "$code" 'find \. -mindepth 1 -type d -print0' || return 1
+  matches "$code" 'done <"\\\$shape"' || return 1
   matches "$code" 'install -d -o root -g root -m 0700 "\$SLOT_ROOT/\.reset/\$idx"' || return 1
   # and the boot reset in provision_slot_user does not run under an agent that a
   # warm reboot already brought up — that unit ran its own boot reset
@@ -1355,6 +1363,10 @@ mutate "reset script left slot-writable"  's@chmod 0755 /opt/ci/job-hooks/slot-r
 mutate "home cleaned, never replaced"     's@^cp -a "\\\$SLOT_TEMPLATE/\." "\\\$home/".*@:@'                       has_slot_reset
 mutate "home never emptied"               's@^find "\\\$home" -mindepth 1.*@:@'                                    has_slot_reset
 mutate "home taken from the environment"  's@^home=\\\$(getent passwd.*@home="\$HOME"@'                           has_slot_reset
+# #278, in the two places it can be undone: the shape is never read, or it is
+# read and never replayed. Either way the workspace comes back one level deep.
+mutate "the tree shape is never captured" 's@.*find \. -mindepth 1 -type d -print0.*@        :@'                     has_slot_reset
+mutate "the tree shape is never replayed" 's@^      done <"\\\$shape"$@      done </dev/null@'                       has_slot_reset
 mutate "slot names its own index"         's@if \[ -n "\\\${SUDO_UID:-}" \]@if [ -n "\${CI_SLOT:-}" ]@'           has_slot_reset
 mutate "sudoers widened to any argument"  's@ started, /opt/ci/job-hooks/slot-reset.sh completed@@'                has_slot_reset
 mutate "sudoers installed unvalidated"    's@visudo -cqf "\$tmp"@true@'                                            has_slot_reset
