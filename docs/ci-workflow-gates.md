@@ -60,7 +60,7 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER7` | a REMOTE reusable workflow's jobs are not in this repository — UNDECIDED, declarable per callee |
 | `RUNNER8` | a job on a **Windows** pool label declares `container:` or `services:`, which that pool cannot run |
 | `RUNNER9` | with `--shared-infra`, a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the anchor job's output, or is the anchor, or carries a declared exemption |
-| `RUNNER10` | with `--shared-infra`, at most **one** job across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# shared-infra-owner(<job>)` markers counted together, because a repository that has adopted the contract has no `services:` left to count |
+| `RUNNER10` | with `--shared-infra`, at most **one** job invocation across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# shared-infra-owner(<job>)` markers counted together, because a repository that has adopted the contract has no `services:` left to count |
 | `RUNNER11` | with `--shared-infra`, a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
 
 `RUNNER9`–`RUNNER11` are designed in
@@ -101,6 +101,16 @@ runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || from
 — and an anchored match would report the one shape that had already got this
 right.
 
+The substring is not a blank cheque, though. An expression that mentions the
+anchor **and** names a pool through another branch is rejected: the fallback
+runs on a second host while reading as considered, which is the hardest version
+of this mistake to see in review. Fork routing stays legal because the branch it
+falls back to is a GitHub-hosted label, not a pool.
+
+The exemption marker is read from the workflow's comments, never from inside a
+`run:` block. A step that echoes the marker text is a step, not a declaration —
+otherwise any job could grant itself the exemption in a shell line.
+
 **Windows is exempt, by design rather than by omission.** A Windows job is a
 second host on purpose; it reaches the run's stack across the port band
 (`adr-pr-host-affinity.md` §3.3) instead of sharing a machine with it.
@@ -137,6 +147,11 @@ So owners accumulate across the whole file set and the verdict is reported after
 the last file, naming every owner rather than only the surplus one — which of
 two is the mistake is a question the repository answers, not the gate.
 
+For the same reason it counts **invocations**, not definitions. One local
+reusable workflow holding one owner, called from two `pull_request` jobs, brings
+up two stacks — the definition is written once, which is exactly why the
+duplicate is easy to miss.
+
 ### `RUNNER11` is the Windows half of rule 3
 
 A Windows job reaches the stack at the **Linux** host's address, on the slot's
@@ -148,7 +163,16 @@ whose code is correct on every other runner it has ever run on.
 The port band is what makes this decidable — `localhost` on 8080 is a service
 the job started itself and is left alone; `localhost` in 35100–44099 is the
 mistake. It is read from the whole job rather than from `run:` blocks alone,
-because the shape it actually takes is a connection string in `env:`.
+because the shape it actually takes is a connection string in `env:`, and
+case-insensitively, because `LOCALHOST:35100` resolves to loopback exactly as
+the lowercase spelling does.
+
+The rule follows the job to whichever Windows host it lands on: a pool named by
+a literal label, selected through an expression, or reached through a runner
+group. A job that carries a `RUNNER9` exemption is the one that needs this
+check most — the exemption is granted **for** a deliberate second host, so
+skipping `RUNNER11` there would switch off the rule that makes the second host
+work.
 
 ### `self-hosted` is a label, not a requirement
 
@@ -218,9 +242,27 @@ The rule therefore reads the **label**. `container:` on the Linux pool is how
 that pool is meant to be used, and a hosted `windows-2022` image is not this
 fleet and does run containers; only a fleet-reachable job naming the `windows`
 platform label is refused, case-insensitively, and a matrix is judged per leg.
-`scripts/ci/check-runner-policy.selftest.sh` mutates the gate seven ways and
+`scripts/ci/check-runner-policy.selftest.sh` mutates the gate nineteen ways and
 asserts its fixture suite FAILS for each — a detector that has not been seen to
 fire is not a detector.
+
+### The worked example is checked, so the thing you copy cannot rot
+
+[`docs/examples/pr-shared-infra.yml`](examples/pr-shared-infra.yml) is the whole
+contract as one workflow, and it is what an adopting repository copies.
+`scripts/ci/check-shared-infra-example.sh` runs on every pull request here and
+makes the argument in both directions: the gate reports the example CLEAN, and
+three mutations of it — the consumer naming its pool directly, a second owner
+marker, the Windows job dialling `localhost` on a band port — are each
+REPORTED, with the rule id.
+
+Clean on its own would prove almost nothing, because almost anything is clean
+under `--shared-infra`; a file with one hosted job is clean. The mutations are
+what say the example sits ON the edge of each rule rather than somewhere
+comfortably inside it, which is the same argument the gate's own mutation suite
+makes about the gate. Without it a snippet ships its defects to seven
+repositories at once and surfaces them one pool at a time — this document set
+had already published the owner marker in a spelling the gate does not read.
 
 ### `--forks` is declared, not guessed
 
