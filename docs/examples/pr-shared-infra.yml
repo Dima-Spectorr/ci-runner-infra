@@ -1,0 +1,198 @@
+# The worked example behind docs/ci-pr-shared-infra.md: one host per pull
+# request, one shared infrastructure stack per run, and a Windows job that
+# reaches that stack across the port band.
+#
+# WHY THIS IS A FILE AND NOT A CODE BLOCK IN THE DOCUMENT
+#
+# Seven repositories are going to copy this. A snippet in prose is copied with
+# whatever is wrong with it, and nothing tells the author it was wrong until a
+# job on their pool fails — the document already shipped one such defect, an
+# owner marker in a spelling the gate does not read, which would have declared
+# nothing in every repository that copied it.
+#
+# This file is checked on every CI run of this repository by
+# `scripts/ci/check-shared-infra-example.sh`, which asserts the gate reports it
+# CLEAN and then asserts that three mutations of it are each REPORTED. So it is
+# not merely conformant, it is conformant at the edge: remove the anchor
+# reference, add a second owner, or dial `localhost` on a band port, and the
+# check goes red here before it can go red in a consumer.
+#
+# WHAT IT IS NOT
+#
+# It is not in `.github/workflows/`, so GitHub never runs it. It cannot be:
+# this repository defines the self-hosted fleet and must not need the fleet to
+# be healthy in order to fix the fleet (see `.github/workflows/ci.yml`). What
+# runs on every pull request here is the CHECK over this file, not the jobs in
+# it. The jobs run, for real, in the repositories that adopt it — phase 7 of
+# docs/adr-pr-host-affinity.md.
+#
+# `ExampleRepo` is the repository-scoping label RUNNER1 requires. Replace it
+# with yours, everywhere, and change nothing else about the shape.
+
+# The marker RUNNER10 counts, and the only way to declare an owner whose
+# bring-up happens inside a `run:` step, where no YAML reader can see it.
+# Spelling is load-bearing: `shared-infra-owner(<job-id>): <what it brings up>`.
+# shared-infra-owner(anchor): brings up ci/compose.yaml on this run's Linux host
+
+name: PR
+
+on: [pull_request]
+
+permissions:
+  contents: read
+
+# A superseded push must release the host rather than run to completion beside
+# its replacement — under this contract a stale run is holding a machine, not
+# just a queue slot.
+concurrency:
+  group: pr-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The anchor, which is also the infrastructure owner.
+  #
+  # Deliberately UNPINNED: whichever host it lands on becomes this run's host.
+  # It is the owner as well because the anchor occupies a slot either way, and a
+  # job that only echoes a variable is a slot spent on nothing.
+  #
+  # It must END. Outputs do not reach `needs.<job>.outputs.*` until the job
+  # completes, so an owner that lingers to "keep the stack up" is an owner whose
+  # consumers can never start. The slot is held host-side instead, by
+  # `--reserve-slot` below.
+  # ---------------------------------------------------------------------------
+  anchor:
+    name: Shared infra (anchor)
+    # RUNNER4. The anchor names its pool directly, so it cannot use the
+    # fork-routing idiom the consumers below use, and needs the guard in its own
+    # `if:`. Fork code never reaches a credentialed warm host.
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    # The bring-up and nothing else.
+    timeout-minutes: 15
+    env:
+      # How long the host holds itself against drain and recycle. A DEADLINE
+      # measured from now, so it must outlive the whole run, not this job — the
+      # host does not publish it, the workflow owns it, and it belongs next to
+      # the timeouts it has to cover.
+      CI_PIN_TTL: 90m
+    outputs:
+      # A JSON ARRAY consumed with fromJSON. Appending an empty label to a
+      # literal list yields a label that matches no runner, which queues until
+      # cancelled; emitting the whole array makes "unpinned" a SHORTER array.
+      runs-on: ${{ steps.up.outputs.runs-on }}
+      # The address a sibling slot or a Windows host reaches the stack at. Never
+      # localhost — see the windows job.
+      addr: ${{ steps.up.outputs.addr }}
+      pg: ${{ steps.up.outputs.pg }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - id: up
+        run: |
+          set -euo pipefail
+
+          # Set by the host at boot. Absent means this host predates the
+          # contract: degrade to unpinned scheduling, do not fail. A gate that
+          # bricks every run on an old host is a gate that gets reverted.
+          if [ -z "${CI_HOST_LABEL:-}" ]; then
+            echo 'runs-on=["self-hosted","linux","gcp","ExampleRepo"]' >> "$GITHUB_OUTPUT"
+            echo "::notice::host predates the affinity contract — running unpinned"
+            exit 0
+          fi
+
+          # A port outside the band resolves on this slot's own loopback and
+          # NOWHERE else, which fails later, in the Windows job, as "connection
+          # refused" with nothing nearby to read. Assert it here instead.
+          : "${CI_SHARED_INFRA_ADDR:?host is too old for this contract — needs the port-band boot}"
+          pg=$(( CI_SHARED_INFRA_PORT_MIN + 0 ))
+          [ "$pg" -le "$CI_SHARED_INFRA_PORT_MAX" ] || { echo "band exhausted"; exit 1; }
+
+          # READ THE ANSWER. `ci-pin-hold` is an admission decision, not a
+          # request: it exits 0 either way and says `pinned=0` when another run
+          # already holds this host. Publishing the label anyway pins every
+          # consumer to a host somebody else owns — the exact contention this
+          # mechanism exists to prevent.
+          #
+          # `--reserve-slot` is what keeps the stack alive after this job ends.
+          if [ "$(ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL" --reserve-slot \
+                    | sed -n 's/^pinned=//p')" != 1 ]; then
+            echo 'runs-on=["self-hosted","linux","gcp","ExampleRepo"]' >> "$GITHUB_OUTPUT"
+            echo "::notice::another run holds this host — running unpinned"
+            exit 0
+          fi
+
+          # Per pull request, so two stacks for one pull request (two workflows,
+          # or a re-run) are two COMPLETE stacks rather than one half-migrated
+          # shared one.
+          export COMPOSE_PROJECT_NAME="pr-${{ github.event.pull_request.number }}"
+          PG_PORT="$pg" docker compose -f ci/compose.yaml up -d --wait
+
+          # Migrate and seed ONCE. This line is what the contract is for: it
+          # used to run in every job that needed a database.
+          ./scripts/db-migrate.sh "postgres://ci@127.0.0.1:${pg}/app"
+
+          printf 'runs-on=["self-hosted","linux","gcp","ExampleRepo","%s"]\n' \
+            "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
+          printf 'addr=%s\n' "$CI_SHARED_INFRA_ADDR" >> "$GITHUB_OUTPUT"
+          printf 'pg=%s\n' "$pg" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Every other fleet Linux job. One line differs from what it was before this
+  # contract: `runs-on`.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    needs: [anchor]
+    # RUNNER9 and RUNNER4 in one expression. The fork-true branch names a
+    # GitHub-hosted image, which is what makes it a guard; written the other way
+    # round it hands forks the pool. This is dynamic runner selection, so the
+    # gate runs with `--allow-dynamic-runner`; RUNNER9 supplies the specificity
+    # that flag gives up, by requiring the anchor's output by name.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+    env:
+      # 127.0.0.1 because this job is on the anchor's host — same machine, and
+      # the band port is published there.
+      DATABASE_URL: postgres://ci@127.0.0.1:${{ needs.anchor.outputs.pg }}/app
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: ./scripts/test.sh
+
+  # ---------------------------------------------------------------------------
+  # Windows is a SECOND host, on purpose, and is never asked to pin — rule 1's
+  # only exception. It reaches the stack across the band, at the Linux host's
+  # address.
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Test (Windows)
+    needs: [anchor]
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, Windows, gcp, ExampleRepo]
+    timeout-minutes: 30
+    env:
+      # RUNNER11. `localhost` here is the WINDOWS machine, where nothing is
+      # listening: a refusal or a hang, in a job whose code is right everywhere
+      # else. The address comes from the anchor, which read it from the Linux
+      # host's CI_SHARED_INFRA_ADDR.
+      DATABASE_URL: postgres://ci@${{ needs.anchor.outputs.addr }}:${{ needs.anchor.outputs.pg }}/app
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: ./scripts/test.ps1
+        shell: pwsh
+
+  # ---------------------------------------------------------------------------
+  # The escape hatch, in RUNNER7's shape: beside the job, naming the job, with
+  # an issue. A job that genuinely must not share the anchor's host says so
+  # here, once, where a reviewer sees the reason.
+  # ---------------------------------------------------------------------------
+  # shared-infra-exempt(lint, #248): a linter touches no database, and pinning
+  # it would serialise it behind the anchor for no benefit
+  lint:
+    name: Lint
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: ./scripts/lint.sh
