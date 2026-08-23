@@ -51,6 +51,11 @@ locals {
     file("${local.pool_scripts}/pinned-job-decision.sh"),
     file("${local.pool_scripts}/recycle-decision.sh"),
     file("${local.pool_scripts}/beacon-decision.sh"),
+    # The pin-hold veto, on every controller for the same reason the pool module
+    # concatenates it on every pool: the branch that decides whether a machine is
+    # deleted must be the branch that was tested. A shared controller that shipped
+    # it selectively would delete a held host for one pool and not another.
+    file("${local.pool_scripts}/pin-hold-decision.sh"),
     file("${local.pool_scripts}/telemetry.sh"),
     file("${local.pool_scripts}/watchdog-decision.sh"),
     # Before the controller, always: pool_table_parse is called at FILE SCOPE,
