@@ -109,13 +109,33 @@ jobs:
     # that flag gives up, by requiring the anchor's output by name.
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON(needs.anchor.outputs.runs-on) }}
     timeout-minutes: 30
-    env:
-      # 127.0.0.1 because this job is on the anchor's host — same machine, and
-      # the band port is published there.
-      DATABASE_URL: postgres://ci@127.0.0.1:${{ needs.anchor.outputs.pg }}/app
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # NOT `postgres://ci@127.0.0.1:${{ needs.anchor.outputs.pg }}/app` in a
+      # job-level `env:`. The anchor publishes `pg` EMPTY on all three of its
+      # degrade branches, and the common one is not the fork — it is a host
+      # another run already holds, which happens whenever two pull requests are
+      # in flight. That URL becomes `postgres://ci@127.0.0.1:/app` and the job
+      # goes red on a run where nothing was wrong.
+      #
+      # The action resolves the shared stack when there is one and starts a
+      # throwaway on this leg when there is not, so the suite cannot tell.
+      # Nothing tears the throwaway down: the host reaps the slot's containers
+      # at job end and fails closed if it cannot.
+      - id: db
+        uses: Dima-Spectorr/ci-runner-infra/.github/actions/shared-infra-db@v5
+        with:
+          pg: ${{ needs.anchor.outputs.pg }}
+          addr: ${{ needs.anchor.outputs.addr }}
+          # Digest-pinned, and from a pull-through mirror rather than Docker Hub
+          # directly: the fleet's hosts share one egress IP and hit the
+          # unauthenticated pull-rate limit.
+          image: public.ecr.aws/docker/library/postgres@sha256:11a9d238fbb48bab14599c57e41123254452b1a2d93c6c8595bce96f346bd082
+
       - run: ./scripts/test.sh
+        env:
+          DATABASE_URL: ${{ steps.db.outputs.url }}
 
   # ---------------------------------------------------------------------------
   # Windows is a SECOND host, on purpose, and is never asked to pin — rule 1's
@@ -132,7 +152,15 @@ jobs:
     # keeps the rest. A repository whose lane model makes this check REQUIRED
     # has to let a skip satisfy it, or forks will sit blocked on a job that was
     # never going to run.
-    if: github.event.pull_request.head.repo.fork == false
+    #
+    # The second clause is the degrade, and Windows is the one leg that cannot
+    # absorb it: there is no container runtime on a Windows host, so the
+    # fallback the Linux job uses does not exist here. An empty `addr` means no
+    # shared stack, and the honest answer is to skip rather than to dial a URL
+    # with a hole in it.
+    if: >-
+      github.event.pull_request.head.repo.fork == false
+      && needs.anchor.outputs.addr != ''
     runs-on: [self-hosted, Windows, gcp, ExampleRepo]
     timeout-minutes: 30
     env:
