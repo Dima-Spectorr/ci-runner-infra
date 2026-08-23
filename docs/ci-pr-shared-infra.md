@@ -6,6 +6,18 @@ the measurements and the rejected alternatives, is
 `RUNNER9`/`RUNNER10`/`RUNNER11` in `scripts/ci/check-runner-policy.sh`
 ([`ci-workflow-gates.md`](ci-workflow-gates.md)).
 
+**Copy the file, not the snippets.**
+[`examples/pr-shared-infra.yml`](examples/pr-shared-infra.yml) is the whole
+contract as one workflow — anchor/owner, a Linux consumer, a Windows consumer
+and a declared exemption. The fragments below are quoted from it to explain one
+decision at a time; the file is the one that is *checked*.
+`scripts/ci/check-shared-infra-example.sh` runs on every pull request to this
+repository and asserts both that the gate reports it clean and that three
+mutations of it are each reported — so an example that has drifted away from
+the rules fails here rather than in the repository that copied it. A snippet in
+prose has no such guard, and this document has already shipped an owner marker
+in a spelling the gate does not read.
+
 Adopt it **after** [`ci-lane-model.md`](ci-lane-model.md). The lane rule decides
 how much CI a diff deserves; this decides where that CI runs. A repository that
 pins jobs to a host before it has an aggregate required check has pinned the
@@ -159,7 +171,10 @@ host-side" below.
     name: Shared infra (anchor)
     needs: lane
     if: needs.lane.outputs.lane != 'none'
-    # ci: shared-infra-owner    <- the marker RUNNER10 counts
+    # shared-infra-owner(anchor): brings up the compose stack in a run step
+    #   ^ the marker RUNNER10 counts. The spelling is load-bearing and it names
+    #     the job: a marker that named nothing would excuse whatever the file
+    #     happened to contain, including a job added later.
     runs-on: [self-hosted, linux, gcp, '<Repo>']
     # The bring-up, and nothing else. This job has to END for its outputs to
     # reach the jobs that need them.
@@ -498,7 +513,7 @@ surprise.
    alone and confirm the pull request still runs when the pool is cold.
 4. Move `services:` into `ci/compose.yaml` and make the anchor the owner.
 5. Point the Windows job at the outputs.
-6. Turn the gate on: add `--allow-dynamic-runner --pr-affinity` to the
+6. Turn the gate on: add `--allow-dynamic-runner --shared-infra` to the
    `check-runner-policy.sh` invocation.
 
 Step 6 last, deliberately. The rules are opt-in by flag so that a repository

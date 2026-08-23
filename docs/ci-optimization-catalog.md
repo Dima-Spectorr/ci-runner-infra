@@ -338,11 +338,45 @@ Image-building jobs (`image-smoke` at 138 s average, `docker-build` in
 Specaria-Platform) rebuild layers from scratch. Registry-backed
 `--cache-from`/`--cache-to` against Artifact Registry is the fix.
 
-### 4.4 Remote build cache for the monorepos
+### 4.4 Remote build cache for the monorepos — shipped, both halves
 
 IntegrateIT (~277 packages) and Apigee-Portal would benefit more from a shared
 Turborepo/Nx remote cache than from finer path filters: a remote cache dedupes
 work *across PRs*, whereas a path filter only ever helps within one PR.
+
+It is now part of the pool rather than something a repository assembles. A host
+serves `turbo-cache-server.py` against the project's cache bucket, under
+`turbo/<owner>/<repo>/`, and hands every slot `TURBO_API`, `TURBO_TOKEN` and
+`TURBO_TEAM` — so a workflow that never heard of this fleet gets hits, holds no
+credential and has nothing to renew. `cache_snapshot_bucket` alone turns it on;
+`turbo_cache_bucket` exists only to point it elsewhere or switch it off.
+
+Being *inside* the pool is the fix, not a packaging choice. The hand-wired cache
+§4.1 is about ran cold for weeks and reported the fault as five warnings inside
+green runs. A per-repository cache is a per-repository way to be silently slow.
+
+Job code cannot write, and that is permanent. An artifact is a tarball the next
+build unpacks into its output tree and reports as its own result, so a writable
+cache is one pull request handing every later build its output — uploads are
+accepted and discarded rather than refused, because a refusal is one warning per
+artifact and that noise is what hid the original fault.
+
+What fills the store is `modules/ci-runner-cache-warmer`: one Cloud Build
+trigger, fired nightly by Cloud Scheduler, that installs the default branch's
+dependencies and runs its build, then publishes both results — the turbo
+artifacts under `turbo/<owner>/<repo>/` and the dependency snapshot under
+`cache/<pool>/`. It is the fleet's only identity allowed to write cache content,
+it is attached to no VM, and its grants carry create without delete, so a
+published object cannot be replaced in place. Because turbo's local
+`<hash>.tar.zst` **is** the remote artifact byte for byte, publishing is a plain
+object copy and the host-side server still has no write path at all.
+
+That also retires the per-repository snapshot workflow: a repository that used
+`ci-runner-cache-publisher` was wiring federation, a workflow file and a
+schedule of its own to produce the same object this now produces for it. See
+`modules/ci-runner-cache-warmer/README.md` for the migration.
+
+Nx is not covered: its remote-cache protocol is not the one this server speaks.
 
 ### 4.5 Checkout cost
 
