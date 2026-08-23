@@ -121,7 +121,29 @@ locals {
   # still resolves, because a module vendored without its repository root would
   # otherwise fail at plan time with a message about a missing file and nothing
   # about why this module wants one two directories up.
-  publish_script = file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh")
+  #
+  # EVERY `$` GOES IN DOUBLED, and that is not cosmetic. Cloud Build reads `$X`
+  # and `${X}` in every string of a build config — args, env, anywhere — as a
+  # SUBSTITUTION, before the container ever sees them. A shell script pasted in
+  # whole is dense with both, and the trigger accepts it happily: the refusal
+  # comes at FIRE time, from the API, as
+  #
+  #   invalid value for 'build.substitutions': key in the template
+  #   "CACHE_EXPAND_FLOOR_BYTES" is not a valid built-in substitution
+  #
+  # …in a nightly build nobody is watching, on a warmer that applied cleanly
+  # months earlier. `$$` is Cloud Build's escape for a literal `$`, so doubling
+  # every one hands the container the script it was written as.
+  #
+  # NOT `substitution_option = "ALLOW_LOOSE"`, which is the fix this error's
+  # first search result suggests: that makes the unmatched keys resolve to the
+  # EMPTY STRING instead of failing, so the build starts and runs a script whose
+  # every variable reference has been erased. This is one of the few places
+  # where the loud failure is the good outcome.
+  escape_dollars = "$$"
+
+  publish_script = replace(file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh"), "$", local.escape_dollars)
+  turbo_script   = replace(file("${path.module}/scripts/warm-turbo.sh"), "$", local.escape_dollars)
 
   # HOW THE REPOSITORY IS INSTALLED AND BUILT — WORKED OUT AT WARM TIME, FROM THE
   # REPOSITORY, RATHER THAN STATED BY WHOEVER WIRES THE WARMER UP.
@@ -171,7 +193,11 @@ locals {
   # empty — silently. One extra install a night is the cheaper side of that.
   install_full = replace(replace(local.install_ladder, "@FLAGS@", ""), "@YARN@", "")
 
-  prepare_command = coalesce(var.prepare_command, local.install_scriptfree)
+  # Escaped for the same reason the scripts are, and a repository's OWN override
+  # is escaped too: a `build_command` holding `$(git rev-parse HEAD)` or a plain
+  # `$HOME` is not an unreasonable thing to write, and unescaped it takes the
+  # whole warmer down at fire time rather than in the plan that accepted it.
+  prepare_command = replace(coalesce(var.prepare_command, local.install_scriptfree), "$", local.escape_dollars)
 
   # `--cache-dir` is passed from the same variable the publishing step reads, so
   # the two cannot drift. The old default relied on turbo's own default matching
@@ -181,10 +207,10 @@ locals {
   # The `;` is load-bearing and is asserted by the self-test: the ladder ends in
   # `fi`, and `fi npx …` is a syntax error the whole build step dies on before
   # anything runs — a green apply, a red nightly build, an empty cache.
-  build_command = coalesce(var.build_command, join(" ", [
+  build_command = replace(coalesce(var.build_command, join(" ", [
     "${local.install_full};",
     "npx --no-install turbo run build --cache-dir=\"$WARM_TURBO_DIR\"",
-  ]))
+  ])), "$", local.escape_dollars)
 
   # WHO FIRES THE TRIGGER IS A DIFFERENT IDENTITY FROM WHO RUNS THE BUILD, and
   # this is not symmetry for its own sake. `cloudbuild.builds.create` — the
@@ -426,7 +452,7 @@ resource "google_cloudbuild_trigger" "warm" {
       id         = "publish-turbo"
       name       = var.gcloud_image
       entrypoint = "bash"
-      args       = ["-c", file("${path.module}/scripts/warm-turbo.sh")]
+      args       = ["-c", local.turbo_script]
       env = [
         "WARM_BUCKET=${var.cache_bucket}",
         "WARM_TURBO_PREFIX=${local.turbo_prefix}",

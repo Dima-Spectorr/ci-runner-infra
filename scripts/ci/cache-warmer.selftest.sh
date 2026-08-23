@@ -200,8 +200,8 @@ has_self_configuring() { # <file>
   matches "$code" 'pnpm-lock\.yaml' || return 1
   matches "$code" 'yarn\.lock' || return 1
   matches "$code" 'package-lock\.json' || return 1
-  matches "$code" 'prepare_command = coalesce\(var\.prepare_command, local\.install_scriptfree\)' || return 1
-  matches "$code" 'build_command = coalesce\(var\.build_command,'
+  matches "$code" 'coalesce\(var\.prepare_command, local\.install_scriptfree\)' || return 1
+  matches "$code" 'coalesce\(var\.build_command,'
 }
 
 if has_self_configuring "$MAIN"; then ok; else
@@ -261,6 +261,29 @@ has_scriptfree_snapshot() { # <file>
 
 if has_scriptfree_snapshot "$MAIN"; then ok; else
   bad "the snapshot's install runs lifecycle scripts again — install-time scripts are the cheapest place to put code in someone else's build, and this archive is unpacked as root on every host in the pool"
+fi
+
+# 11. EVERY `$` THAT REACHES THE BUILD CONFIG IS DOUBLED. Cloud Build reads `$X`
+#     and `${X}` in args and env as a SUBSTITUTION, so a shell script pasted in
+#     whole is a config full of keys it does not know. The trigger applies
+#     cleanly and the API refuses at FIRE time — "key in the template ... is not
+#     a valid built-in substitution" — which is a warmer that has never once run
+#     and a cache that has always been cold. Observed on the first live fire.
+has_dollars_escaped() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'escape_dollars = "\$\$"' || return 1
+  matches "$code" 'publish_script = replace\(file\(.*publish-cache-snapshot\.sh"\), "\$", local\.escape_dollars\)' || return 1
+  matches "$code" 'turbo_script   = replace\(file\(.*warm-turbo\.sh"\), "\$", local\.escape_dollars\)' || return 1
+  matches "$code" 'prepare_command = replace\(coalesce\(var\.prepare_command' || return 1
+  matches "$code" 'build_command = replace\(coalesce\(var\.build_command' || return 1
+  # And nothing reaches a step's args as a raw file() read, which is how the
+  # escaping gets bypassed for one step while the local next to it keeps it.
+  ! matches "$code" 'args[[:space:]]*=[[:space:]]*\["-c", file\('
+}
+
+if has_dollars_escaped "$MAIN"; then ok; else
+  bad "a script or command reaches the build config with its dollars unescaped — Cloud Build parses those as substitutions and refuses the build at fire time, so the trigger applies green and the warm has never run"
 fi
 
 # --- mutations -----------------------------------------------------------------
@@ -342,7 +365,7 @@ mutate "a package manager assumed instead of detected" "$MAIN" \
   has_self_configuring
 
 mutate "the prepare command made a required input again" "$MAIN" \
-  's@prepare_command = coalesce(var\.prepare_command, local\.install_scriptfree)@prepare_command = var.prepare_command@' \
+  's@coalesce(var\.prepare_command, local\.install_scriptfree)@var.prepare_command@' \
   has_self_configuring
 
 mutate "a default put back on the command inputs" "$VARS" \
@@ -364,6 +387,18 @@ mutate "the collector reads a directory of its own" "$MAIN" \
 mutate "the two installs made consistent, in the wrong direction" "$MAIN" \
   's|"@FLAGS@", "--ignore-scripts"|"@FLAGS@", ""|' \
   has_scriptfree_snapshot
+
+mutate "the publishing script pasted in unescaped" "$MAIN" \
+  's@publish_script = replace(file("\${path\.module}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"), "\$", local\.escape_dollars)@publish_script = file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh")@' \
+  has_dollars_escaped
+
+mutate "one step given the raw file() again" "$MAIN" \
+  's@args       = \["-c", local\.turbo_script\]@args       = ["-c", file("${path.module}/scripts/warm-turbo.sh")]@' \
+  has_dollars_escaped
+
+mutate "the escape reduced to a single dollar" "$MAIN" \
+  's@escape_dollars = "\$\$"@escape_dollars = "$"@' \
+  has_dollars_escaped
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
