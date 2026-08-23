@@ -2,13 +2,26 @@
 # request, one shared infrastructure stack per run, and a Windows job that
 # reaches that stack across the port band.
 #
+# WHAT AN ADOPTER ACTUALLY WRITES
+#
+# Four jobs, and only one of them is new. The anchor's body — pin admission,
+# band arithmetic, three degrade branches, the bring-up — is NOT here: it lives
+# once, in this repository, at `.github/workflows/shared-infra-anchor.yml`, and
+# this example CALLS it. Seven repositories copying seventy-five lines of pin
+# logic is seven copies of every future fix to it, and the gate's own RUNNER7
+# comment already says the fleet's premise is one reusable workflow rather than
+# nine drifting copies.
+#
+# So what is demonstrated below is the CONSUMER side of the contract, which is
+# the part that is irreducibly per-repository: which jobs pin to the anchor,
+# which one is Windows, and which one is exempt.
+#
 # WHY THIS IS A FILE AND NOT A CODE BLOCK IN THE DOCUMENT
 #
-# Seven repositories are going to copy this. A snippet in prose is copied with
-# whatever is wrong with it, and nothing tells the author it was wrong until a
-# job on their pool fails — the document already shipped one such defect, an
-# owner marker in a spelling the gate does not read, which would have declared
-# nothing in every repository that copied it.
+# A snippet in prose is copied with whatever is wrong with it, and nothing tells
+# the author it was wrong until a job on their pool fails — the document already
+# shipped one such defect, an owner marker in a spelling the gate does not read,
+# which would have declared nothing in every repository that copied it.
 #
 # This file is checked on every CI run of this repository by
 # `scripts/ci/check-shared-infra-example.sh`, which asserts the gate reports it
@@ -29,9 +42,17 @@
 # `ExampleRepo` is the repository-scoping label RUNNER1 requires. Replace it
 # with yours, everywhere, and change nothing else about the shape.
 
+# RUNNER7. This gate cannot read another repository's file, so it cannot decide
+# the callee's runner scope or its timeouts; the marker records that a human
+# did, against an issue, rather than letting the exemption hand that property to
+# a document nobody checked. The ref is deliberately not part of the marker — a
+# pin bump does not change what this gate can read.
+# remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml, #248): the fleet's own published anchor, reviewed in ci-runner-infra
+
 # The marker RUNNER10 counts, and the only way to declare an owner whose
-# bring-up happens inside a `run:` step, where no YAML reader can see it.
-# Spelling is load-bearing: `shared-infra-owner(<job-id>): <what it brings up>`.
+# bring-up happens behind a `uses:` — where no YAML reader can see a `services:`
+# block, a `runs-on`, or anything else. Spelling is load-bearing:
+# `shared-infra-owner(<job-id>): <what it brings up>`.
 # shared-infra-owner(anchor): brings up ci/compose.yaml on this run's Linux host
 
 name: PR
@@ -50,129 +71,29 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # The anchor, which is also the infrastructure owner.
+  # The anchor, which is also the infrastructure owner. Whichever host it lands
+  # on becomes this run's host, and it publishes where that was.
   #
-  # Deliberately UNPINNED: whichever host it lands on becomes this run's host.
-  # It is the owner as well because the anchor occupies a slot either way, and a
-  # job that only echoes a variable is a slot spent on nothing.
-  #
-  # It must END. Outputs do not reach `needs.<job>.outputs.*` until the job
-  # completes, so an owner that lingers to "keep the stack up" is an owner whose
-  # consumers can never start. The slot is held host-side instead, by
-  # `--reserve-slot` below.
+  # THE REF IS `@v5`, THE FLOATING MAJOR THIS REPOSITORY PUBLISHES — not `@main`
+  # and not an exact tag. The anchor talks to host-side contracts —
+  # `ci-pin-hold`, `CI_SHARED_INFRA_ADDR`, the port band — which are versioned
+  # with the pool image: `@main` lets it move ahead of the hosts it talks to,
+  # while a major moves only when one of those contracts breaks. An exact tag
+  # would age instead, in seven repositories at once, since this is the file
+  # they copy. `check-shared-infra-example.sh` asserts the `@v5` here, because
+  # `docs-pins.selftest.sh` reads tracked `*.md` only and cannot see this file.
   # ---------------------------------------------------------------------------
   anchor:
-    name: Shared infra (anchor)
-    # RUNNER4, and NOT `if: fork == false`.
-    #
-    # A guard in the anchor's `if:` looks equivalent and is not: a job that
-    # `needs:` a SKIPPED job is itself skipped, so guarding the anchor skips
-    # every consumer with it and a fork pull request gets no CI at all — the
-    # routing expression on `test` below would never even be evaluated. The
-    # failure is silent, because a skipped required check is not a red one.
-    #
-    # So the anchor routes instead of skipping. On a fork it runs on a
-    # GitHub-hosted image, which is what keeps fork code off a credentialed
-    # warm host, and it publishes a hosted array so the whole run degrades
-    # together.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","gcp","ExampleRepo"]') }}
-    # The bring-up and nothing else.
-    timeout-minutes: 15
-    env:
-      # How long the host holds itself against drain and recycle. A DEADLINE
-      # measured from now, so it must outlive the whole run, not this job — the
-      # host does not publish it, the workflow owns it, and it belongs next to
-      # the timeouts it has to cover.
-      CI_PIN_TTL: 90m
-      # Read in the step below, because the fork answer decides what this job
-      # publishes and `${{ }}` in a `run:` is interpolated before the shell
-      # sees it — an untrusted value belongs in an env var, never spliced into
-      # a command line.
-      IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
-    outputs:
-      # A JSON ARRAY consumed with fromJSON. Appending an empty label to a
-      # literal list yields a label that matches no runner, which queues until
-      # cancelled; emitting the whole array makes "unpinned" a SHORTER array.
-      runs-on: ${{ steps.up.outputs.runs-on }}
-      # The address a sibling slot or a Windows host reaches the stack at. Never
-      # localhost — see the windows job.
-      addr: ${{ steps.up.outputs.addr }}
-      pg: ${{ steps.up.outputs.pg }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - id: up
-        run: |
-          set -euo pipefail
-
-          # A fork pull request runs entirely on GitHub-hosted runners: no warm
-          # host, no pin, and no shared stack. `addr` and `pg` are published
-          # EMPTY rather than omitted, so a consumer that reads them gets an
-          # obviously-blank value instead of the literal string `null` from a
-          # missing output. A suite that needs the stack has to bring up its own
-          # throwaway service on this leg, or not run on forks.
-          if [ "${IS_FORK:-false}" = "true" ]; then
-            {
-              echo 'runs-on=["ubuntu-latest"]'
-              echo "addr="
-              echo "pg="
-            } >> "$GITHUB_OUTPUT"
-            echo "::notice::fork pull request — the whole run stays on hosted runners"
-            exit 0
-          fi
-
-          # Set by the host at boot. Absent means this host predates the
-          # contract: degrade to unpinned scheduling, do not fail. A gate that
-          # bricks every run on an old host is a gate that gets reverted.
-          if [ -z "${CI_HOST_LABEL:-}" ]; then
-            {
-              echo 'runs-on=["self-hosted","linux","gcp","ExampleRepo"]'
-              echo "addr="
-              echo "pg="
-            } >> "$GITHUB_OUTPUT"
-            echo "::notice::host predates the affinity contract — running unpinned"
-            exit 0
-          fi
-
-          # A port outside the band resolves on this slot's own loopback and
-          # NOWHERE else, which fails later, in the Windows job, as "connection
-          # refused" with nothing nearby to read. Assert it here instead.
-          : "${CI_SHARED_INFRA_ADDR:?host is too old for this contract — needs the port-band boot}"
-          pg=$(( CI_SHARED_INFRA_PORT_MIN + 0 ))
-          [ "$pg" -le "$CI_SHARED_INFRA_PORT_MAX" ] || { echo "band exhausted"; exit 1; }
-
-          # READ THE ANSWER. `ci-pin-hold` is an admission decision, not a
-          # request: it exits 0 either way and says `pinned=0` when another run
-          # already holds this host. Publishing the label anyway pins every
-          # consumer to a host somebody else owns — the exact contention this
-          # mechanism exists to prevent.
-          #
-          # `--reserve-slot` is what keeps the stack alive after this job ends.
-          if [ "$(ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL" --reserve-slot \
-                    | sed -n 's/^pinned=//p')" != 1 ]; then
-            {
-              echo 'runs-on=["self-hosted","linux","gcp","ExampleRepo"]'
-              echo "addr="
-              echo "pg="
-            } >> "$GITHUB_OUTPUT"
-            echo "::notice::another run holds this host — running unpinned"
-            exit 0
-          fi
-
-          # Per pull request, so two stacks for one pull request (two workflows,
-          # or a re-run) are two COMPLETE stacks rather than one half-migrated
-          # shared one.
-          export COMPOSE_PROJECT_NAME="pr-${{ github.event.pull_request.number }}"
-          PG_PORT="$pg" docker compose -f ci/compose.yaml up -d --wait
-
-          # Migrate and seed ONCE. This line is what the contract is for: it
-          # used to run in every job that needed a database.
-          ./scripts/db-migrate.sh "postgres://ci@127.0.0.1:${pg}/app"
-
-          printf 'runs-on=["self-hosted","linux","gcp","ExampleRepo","%s"]\n' \
-            "$CI_HOST_LABEL" >> "$GITHUB_OUTPUT"
-          printf 'addr=%s\n' "$CI_SHARED_INFRA_ADDR" >> "$GITHUB_OUTPUT"
-          printf 'pg=%s\n' "$pg" >> "$GITHUB_OUTPUT"
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@v5
+    with:
+      repo-label: ExampleRepo
+      # A DEADLINE measured from the anchor, so it must outlive the whole run —
+      # here, the 30-minute `test` and `windows` legs plus queueing, not the
+      # anchor's own 15.
+      pin-ttl: 90m
+      # The line the contract is for: it used to run in every job that needed a
+      # database. `DATABASE_URL` is in the environment the callee runs this in.
+      migrate: ./scripts/db-migrate.sh "$DATABASE_URL"
 
   # ---------------------------------------------------------------------------
   # Every other fleet Linux job. One line differs from what it was before this
@@ -206,10 +127,11 @@ jobs:
     needs: [anchor]
     # Here the guard IS a skip, and that is the right answer: there is no
     # hosted substitute for what this leg tests, and fork code must not reach a
-    # warm host. Nothing cascades from it — the anchor above routes rather than
-    # skipping, so a fork run loses this job and keeps the rest. A repository
-    # whose lane model makes this check REQUIRED has to let a skip satisfy it,
-    # or forks will sit blocked on a job that was never going to run.
+    # warm host. Nothing cascades from it — the anchor routes rather than
+    # skipping, inside the reusable workflow, so a fork run loses this job and
+    # keeps the rest. A repository whose lane model makes this check REQUIRED
+    # has to let a skip satisfy it, or forks will sit blocked on a job that was
+    # never going to run.
     if: github.event.pull_request.head.repo.fork == false
     runs-on: [self-hosted, Windows, gcp, ExampleRepo]
     timeout-minutes: 30
