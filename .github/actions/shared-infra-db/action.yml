@@ -1,0 +1,201 @@
+# Resolve a Postgres URL for a job under the three-rule contract: the run's
+# SHARED stack when there is one, a throwaway container on this leg when there
+# is not.
+#
+# WHY THIS EXISTS
+#
+# `shared-infra-anchor.yml` has three branches on which it publishes `pg` EMPTY
+# and brings up no stack at all: a fork pull request, a host older than the
+# contract, and — the common one — a host another run already holds. On a
+# private repository the fork branch never fires and the third fires whenever
+# two pull requests are in flight, so "no shared stack" is not a corner case,
+# it is a Tuesday.
+#
+# A consumer that reads `needs.anchor.outputs.pg` straight into a URL gets
+# `postgres://ci@127.0.0.1:/app` on those branches and a red required check on a
+# run where nothing was wrong. The contract's answer, stated in
+# docs/ci-pr-shared-infra.md for the fork branch, is that a suite needing the
+# stack brings up its own throwaway service on that leg. This is that fallback,
+# published once rather than reproduced in every adopter — the same argument
+# that made the anchor a reusable workflow.
+#
+# A composite ACTION and not a reusable workflow, for the reason
+# `.github/actions/playwright-ui/action.yml` gives at length: shipping steps
+# instead of a job keeps `runs-on` and `timeout-minutes` in the consumer's own
+# workflow, as literals its own `check-runner-policy.sh` can read.
+#
+# NOTHING IS TORN DOWN HERE, AND THAT IS NOT AN OVERSIGHT
+#
+# The fallback container is removed by the host, not by the job:
+# `slot-reset.sh completed` does `docker rm --force --volumes` over every
+# container on the slot's rootless daemon at the end of every job, and fails
+# closed if it cannot. A held slot — the one carrying a shared stack — is
+# spared by the same gate. So a teardown step here would duplicate a
+# host-side guarantee that already exists and is already the one that has to be
+# right, since a job that dies does not run its own cleanup either.
+#
+# LINUX ONLY. The fallback needs a container runtime, and a Windows fleet host
+# has none. A Windows job reaches the shared stack across the band (rule 3) and
+# has no fallback available; if the anchor degraded, that leg has to skip.
+#
+# USAGE — in the consuming repository:
+#
+#   - id: db
+#     uses: <org>/ci-runner-infra/.github/actions/shared-infra-db@v5
+#     with:
+#       pg: ${{ needs.anchor.outputs.pg }}
+#       addr: ${{ needs.anchor.outputs.addr }}
+#       image: public.ecr.aws/docker/library/postgres@sha256:<digest>
+#   - run: ./scripts/test.sh
+#     env:
+#       DATABASE_URL: ${{ steps.db.outputs.url }}
+name: Shared infra database URL
+description: >-
+  Resolve a Postgres URL from the shared-infra anchor's outputs, starting a
+  throwaway Postgres on this job's own runtime when the anchor degraded and
+  published no stack.
+
+inputs:
+  pg:
+    description: >-
+      The anchor's `pg` output — the band port the shared stack's Postgres is
+      published on. EMPTY means the anchor degraded and there is no shared
+      stack, which is the whole reason this action exists.
+    required: true
+  addr:
+    description: >-
+      The anchor's `addr` output. Empty, or equal to this host, means the stack
+      is on this machine and the URL uses loopback. Present and different means
+      the caller is reaching it across the VPC.
+    required: false
+    default: ''
+  image:
+    description: >-
+      The Postgres image the FALLBACK starts. Digest-pinned, and from a
+      pull-through mirror rather than Docker Hub directly — the fleet's hosts
+      share an egress IP and hit Docker Hub's unauthenticated pull-rate limit.
+      Unused when there is a shared stack.
+    required: true
+  user:
+    description: >-
+      Database user. Must match what the anchor's compose file creates, because
+      one URL is built for both branches and only the adopter knows the compose.
+    required: false
+    default: ci
+  password:
+    description: >-
+      Database password, empty for a trust-authenticated stack. A CI database
+      holding fixtures is not a secret, and putting one here would only put it
+      in the workflow file; a stack that needs a real credential should pass it
+      from `secrets` at the call site.
+    required: false
+    default: ''
+  database:
+    description: Database name. Must match the anchor's compose file.
+    required: false
+    default: app
+  health-timeout:
+    description: >-
+      Seconds to wait for the FALLBACK to accept connections. Not applied to the
+      shared stack, which the anchor already brought up with `--wait`.
+    required: false
+    default: '60'
+
+outputs:
+  url:
+    description: The Postgres URL to hand the suite.
+    value: ${{ steps.resolve.outputs.url }}
+  port:
+    description: >-
+      The host port Postgres is on — the band port when shared, the ephemeral
+      port Docker allocated when not.
+    value: ${{ steps.resolve.outputs.port }}
+  shared:
+    description: >-
+      `1` when this job is talking to the run's shared stack, `0` when it is
+      talking to a throwaway it started. Worth logging: a run where every job
+      reports 0 is a run whose anchor never pinned anything, and that is a fleet
+      problem wearing a green tick.
+    value: ${{ steps.resolve.outputs.shared }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        # Every input through the environment, never spliced into the script.
+        # `image` in particular is a value the caller controls and a
+        # `$(...)` in it would otherwise be command substitution in this shell.
+        PG: ${{ inputs.pg }}
+        ADDR: ${{ inputs.addr }}
+        IMAGE: ${{ inputs.image }}
+        DB_USER: ${{ inputs.user }}
+        DB_PASSWORD: ${{ inputs.password }}
+        DB_NAME: ${{ inputs.database }}
+        HEALTH_TIMEOUT: ${{ inputs.health-timeout }}
+      run: |
+        set -euo pipefail
+
+        publish() { # <url> <port> <shared>
+          {
+            printf 'url=%s\n' "$1"
+            printf 'port=%s\n' "$2"
+            printf 'shared=%s\n' "$3"
+          } >> "$GITHUB_OUTPUT"
+        }
+
+        # The credential half of the URL, built once for both branches so the
+        # shared stack and the fallback are indistinguishable to the suite.
+        auth="$DB_USER"
+        [ -z "$DB_PASSWORD" ] || auth="${DB_USER}:${DB_PASSWORD}"
+
+        if [ -n "$PG" ]; then
+          # The shared stack. Loopback when the anchor's host is this host —
+          # `addr` empty means the anchor published none — and the VPC address
+          # otherwise, which is the same address rule 3 has the Windows leg use.
+          host="127.0.0.1"
+          [ -z "$ADDR" ] || host="$ADDR"
+          publish "postgres://${auth}@${host}:${PG}/${DB_NAME}" "$PG" 1
+          echo "::notice::using the run's shared stack at ${host}:${PG}"
+          exit 0
+        fi
+
+        # No shared stack. Everything below is the degraded leg.
+        echo "::notice::the anchor published no shared stack — starting a throwaway Postgres for this job alone"
+
+        # `127.0.0.1::5432`, three fields on purpose: bind to loopback, let the
+        # kernel pick the host port. A fixed port collides with the sibling
+        # slots that share this host's loopback, and a band port collides with
+        # a shared stack belonging to somebody else's run — which is the
+        # failure this fallback exists downstream of, reintroduced.
+        #
+        # No `--rm`: the host reaps the slot's containers at job end, and `--rm`
+        # would delete the container the moment it exited, taking its logs with
+        # it in exactly the case worth reading them.
+        cid="$(docker run --detach \
+                 --publish '127.0.0.1::5432' \
+                 --env "POSTGRES_USER=${DB_USER}" \
+                 --env "POSTGRES_PASSWORD=${DB_PASSWORD:-postgres}" \
+                 --env "POSTGRES_DB=${DB_NAME}" \
+                 --env POSTGRES_HOST_AUTH_METHOD=trust \
+                 -- "$IMAGE")"
+
+        # `docker port` and not a hard-coded guess: the kernel chose it.
+        hostport="$(docker port "$cid" 5432/tcp | head -n 1 | sed 's/.*://')"
+        [ -n "$hostport" ] || { echo "::error::the fallback Postgres published no host port"; exit 1; }
+
+        # Ready means "accepts connections", which is later than "container is
+        # running" — a suite that connects in between reads "the database
+        # system is starting up" and reports itself broken.
+        deadline=$(( SECONDS + HEALTH_TIMEOUT ))
+        until docker exec "$cid" pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1; do
+          if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "::error::the fallback Postgres did not accept connections within ${HEALTH_TIMEOUT}s"
+            docker logs --tail 50 "$cid" || true
+            exit 1
+          fi
+          sleep 1
+        done
+
+        publish "postgres://${auth}@127.0.0.1:${hostport}/${DB_NAME}" "$hostport" 0

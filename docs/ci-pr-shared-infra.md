@@ -238,6 +238,53 @@ leg: there is no hosted substitute for what it tests, so skipping it is the
 answer. A repository whose lane model makes that check required has to let a
 skip satisfy it.
 
+### An empty `pg` is a normal Tuesday, not a fork corner case
+
+The fork branch is the *rarest* of the three the anchor degrades on. The other
+two are a host older than the contract, and — the common one — **a host another
+run already holds**. The anchor is deliberately unpinned, so it lands on any
+free slot, including a free slot on a host somebody else's run has pinned;
+`ci-pin-hold` then answers `pinned=0` and the run continues unpinned, with no
+shared stack and `pg` empty. On a private repository, where the fork branch
+never fires at all, that third branch is the only one that ever does, and it
+fires whenever two pull requests are in flight.
+
+So a job that reads `needs.anchor.outputs.pg` straight into a URL does not have
+a fork-only bug. It has `postgres://ci@127.0.0.1:/app` on an ordinary busy
+afternoon, and a red required check on a run where nothing was wrong.
+
+**Every consumer of `pg` needs a fallback, and it is published rather than
+copied:**
+
+```yaml
+      - id: db
+        uses: Dima-Spectorr/ci-runner-infra/.github/actions/shared-infra-db@v5
+        with:
+          pg: ${{ needs.anchor.outputs.pg }}
+          addr: ${{ needs.anchor.outputs.addr }}
+          image: public.ecr.aws/docker/library/postgres@sha256:<digest>
+      - run: ./scripts/test.sh
+        env:
+          DATABASE_URL: ${{ steps.db.outputs.url }}
+```
+
+It hands back the shared stack's band port when there is one and starts a
+throwaway Postgres on this job's own runtime when there is not, so the suite
+cannot tell the difference. It also publishes `shared`, which is worth logging:
+a run where *every* job reports `0` is a run whose anchor never pinned
+anything — a fleet problem currently wearing a green tick.
+
+Nothing tears the throwaway down, on purpose. `slot-reset.sh completed` removes
+every container on the slot's daemon at the end of every job and fails closed if
+it cannot, sparing only a held slot; a teardown step would duplicate a host-side
+guarantee that has to be right anyway, since a job that dies does not run its
+own cleanup either.
+
+**The Windows leg has no fallback available** — there is no container runtime on
+a Windows host. A Windows job that needs the stack and finds `addr` empty has to
+skip. That is rule 3's asymmetry, and it is why the Windows leg is the one job
+in the example carrying an `if:` guard.
+
 ## 3. The infrastructure owner job
 
 Exactly one job in the workflow brings the stack up, and it is the anchor.
