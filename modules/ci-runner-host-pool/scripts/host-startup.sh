@@ -2057,9 +2057,28 @@ for idx in \$(seq 1 "\$SLOTS"); do
     say "slot \$idx: \$droot is a symlink -- the image store is not where this host thinks it is"
     poisoned=1
   elif [ -e "\$droot" ]; then
-    droot_own=\$(stat -c '%U:%G:%a' -- "\$droot" 2>/dev/null || echo missing)
-    if [ "\$droot_own" != "\$u:\$u:700" ]; then
-      say "slot \$idx: \$droot is \$droot_own, not \$u:\$u:700 -- another account can read or write this slot's image store"
+    # OWNER and MODE are two findings, not one, because only one of them is ours
+    # to choose. install_slot creates this directory 0700 — and then dockerd
+    # chmods its own data root to 0710 every time it starts (Docker 29). So an
+    # assertion of the mode we installed fails on every slot of every host the
+    # moment the daemon comes up, and the cost is not cosmetic: a finding
+    # withdraws the clean marker, so the next job to arrive on the slot is
+    # refused. Measured 2026-08-23 in IntegrateIT — all four slots on every
+    # pull-request host flagged continuously, jobs failing on arrival with
+    # "was not left clean" long after the reset defect they blamed was fixed.
+    # A check that fires on a healthy fleet does not protect it; it drains it.
+    #
+    # What has to hold is the property the message actually claims: nobody but
+    # the owner may read or write. The slot's group is its own and has no other
+    # member, so the daemon's group-execute bit grants nobody anything. Assert
+    # that, and let the daemon own the bits it insists on owning.
+    droot_own=\$(stat -c '%U:%G' -- "\$droot" 2>/dev/null || echo missing)
+    droot_mode=\$(stat -c '%a' -- "\$droot" 2>/dev/null || echo missing)
+    if [ "\$droot_own" != "\$u:\$u" ]; then
+      say "slot \$idx: \$droot is owned by \$droot_own, not \$u:\$u -- another account owns this slot's image store"
+      poisoned=1
+    elif [ "\$droot_mode" = missing ] || [ \$((0\$droot_mode & 066)) -ne 0 ]; then
+      say "slot \$idx: \$droot is mode \$droot_mode -- another account can read or write this slot's image store"
       poisoned=1
     fi
   fi
