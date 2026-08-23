@@ -66,6 +66,24 @@ INSTALL_ID=$(md "instance/attributes/ci-app-installation-id")
 KEY_SECRET=$(md "instance/attributes/ci-app-key-secret")
 POLL=$(md "instance/attributes/ci-poll-seconds")
 METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
+# The branch the merge queue admits. Read here rather than assumed, because the
+# parking sweep compares every open pull request's base against it and a wrong
+# value would report the whole repository as parked. Defaulted in the shell and
+# not only in Terraform: a controller rendered before this key existed has no
+# such attribute, and `md` returns the empty string for one that is absent —
+# which would make every base comparison unequal.
+QUEUE_BASE=$(md "instance/attributes/ci-queue-base")
+: "${QUEUE_BASE:=main}"
+
+# Empty unless the root turned autohealing on. NO DEFAULT, deliberately — the
+# other way round from QUEUE_BASE above. An absent attribute must mean "do not
+# listen": this is the machine holding the App installation token, and a
+# defaulted port would open a socket on every controller in the fleet to answer
+# a probe nobody configured.
+HEALTH_PORT=$(md "instance/attributes/ci-health-port")
+case "$HEALTH_PORT" in
+  '' | *[!0-9]*) HEALTH_PORT="" ;;
+esac
 
 # --- the pool table ----------------------------------------------------------
 #
@@ -1064,6 +1082,136 @@ queue_outcome_series() {
   done
 }
 
+# --- parked pull requests ------------------------------------------------------
+#
+# The one sweep in this file that is not about capacity. parked-decision.sh
+# carries the rule and the reasoning; this is the I/O around it.
+#
+# COST. The list call is unconditional and costs one request per interval. The
+# per-pull-request check counts are paid ONLY for pull requests that already
+# fail an entry condition, because parked_verdict's first branch is decidable
+# from the list payload alone — so a repository whose pull requests all target
+# the queue's branch and none of which are drafts pays exactly one call, and a
+# repository with a wall of stale drafts pays a bounded number.
+#
+# PERMISSION. `commits/<sha>/check-runs` needs the installation to hold
+# `checks: read`. It is the only endpoint in this file that does, so an
+# installation granted the older permission set will fail every one of these
+# calls and nothing else. That is logged by name rather than counted silently:
+# the failure mode of this whole feature is being quietly inert, which is what
+# it was built to fix.
+PARKED_BUDGET=20
+# Seconds between sweeps. Nothing scales or drains on this, and an entry
+# condition changes on the timescale of a human editing a pull request, so it
+# rides the same 300s the outcome sweep uses rather than the poll interval.
+PARKED_INTERVAL=300
+PARKED_LAST_SWEEP=0
+# A ceiling on top of the budget. The budget bounds the TIME; this bounds the
+# calls, so a repository with sixty open drafts cannot spend a whole tick's
+# worth of installation rate limit on a question nothing waits on.
+PARKED_MAX_CANDIDATES=20
+PARKED_SKIPPED=0
+# Every reason parked_verdict can return, keyed here so the series can be
+# published as a zero. A metric that only appears when something is wrong is
+# indistinguishable from a controller that stopped publishing — the same
+# argument as ci_runner_list_blind_ticks, and the reason the list is closed.
+PARKED_REASONS=(draft base draft-and-base)
+declare -A PARKED_COUNT=()
+
+collect_parked() {
+  local sweep_start
+  sweep_start=$(date +%s)
+
+  # Not this tick's turn. Counters are deliberately NOT reset here: they keep
+  # reporting what the last real sweep found, rather than flickering to 0 on
+  # every tick in between and hiding a pull request that has been parked for a
+  # week.
+  [ $((sweep_start - PARKED_LAST_SWEEP)) -ge "$PARKED_INTERVAL" ] || return 0
+  PARKED_LAST_SWEEP=$sweep_start
+
+  local r
+  for r in "${PARKED_REASONS[@]}"; do PARKED_COUNT["$r"]=0; done
+  PARKED_SKIPPED=0
+
+  local deadline=$((sweep_start + PARKED_BUDGET))
+
+  local pulls rows
+  pulls=$(gh_api "repos/$REPO_FULL/pulls?state=open&per_page=50") || {
+    log "parked sweep: cannot list open pull requests (status=$(cat "$STATE_DIR/api.status" 2>/dev/null))"
+    return 0
+  }
+
+  # The free half of the rule, applied before anything is fetched. `.draft` is
+  # present on every entry of the list payload and `.base.ref` likewise, so a
+  # pull request that satisfies both entry conditions is dropped for nothing.
+  rows=$(printf '%s' "$pulls" | jq -r --arg qb "$QUEUE_BASE" '
+    .[]?
+    | select((.draft == true) or ((.base.ref // "") != $qb))
+    | [ (.number | tostring),
+        (if .draft then "1" else "0" end),
+        (.base.ref // ""),
+        (.head.sha // "") ] | @tsv' 2>/dev/null)
+  [ -n "$rows" ] || return 0
+
+  local num draft base sha checks counts total failed pending verdict reason
+  local examined=0
+  while IFS=$'\t' read -r num draft base sha; do
+    [ -n "$num" ] || continue
+    [ -n "$sha" ] || continue
+
+    if [ "$examined" -ge "$PARKED_MAX_CANDIDATES" ] \
+      || ! budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME"; then
+      PARKED_SKIPPED=$((PARKED_SKIPPED + 1))
+      continue
+    fi
+    examined=$((examined + 1))
+
+    checks=$(gh_api "repos/$REPO_FULL/commits/$sha/check-runs?per_page=100") || {
+      PARKED_SKIPPED=$((PARKED_SKIPPED + 1))
+      log "parked sweep: cannot read check runs for #$num (status=$(cat "$STATE_DIR/api.status" 2>/dev/null)) — a 403 here means the App installation lacks 'checks: read' and this sweep can never report anything"
+      continue
+    }
+
+    # `neutral` and `skipped` are deliberately absent from the failure list.
+    # GitHub does not treat either as blocking and neither does the queue, so
+    # counting them would read a path-filtered monorepo as permanently red and
+    # this rule would never fire on the repositories that need it most.
+    counts=$(printf '%s' "$checks" | jq -r '
+      [ .check_runs[]? ] as $c
+      | [ ($c | length),
+          ($c | map(select(.status == "completed")
+                    | (.conclusion // ""))
+              | map(select(. == "failure" or . == "cancelled"
+                        or . == "timed_out" or . == "action_required"))
+              | length),
+          ($c | map(select(.status != "completed")) | length)
+        ] | @tsv' 2>/dev/null)
+    IFS=$'\t' read -r total failed pending <<<"$counts"
+
+    # The empty string is passed through rather than defaulted to a number: an
+    # unparseable count must reach parked_verdict as unparseable, which it
+    # answers with silence. Defaulting to 0 here would turn a jq failure into
+    # "green, no checks failed" and manufacture the alert.
+    verdict=$(parked_verdict "$draft" "$base" "$QUEUE_BASE" \
+      "${total:-}" "${failed:-}" "${pending:-}")
+
+    case "$verdict" in
+      parked:*)
+        reason="${verdict#parked:}"
+        reason="${reason%% *}"
+        PARKED_COUNT["$reason"]=$((${PARKED_COUNT["$reason"]:-0} + 1))
+        # Logged with the number, because the metric can only say how many. The
+        # operator reading an alert needs to know WHICH pull request, and this
+        # is the only place that says so.
+        log "pull request #$num is green and cannot enter the merge queue ($verdict) — no check reports this as a failure"
+        ;;
+    esac
+  done <<<"$rows"
+
+  [ "$PARKED_SKIPPED" -gt 0 ] && log "parked sweep: $PARKED_SKIPPED pull request(s) not examined this sweep (budget ${PARKED_BUDGET}s, ceiling $PARKED_MAX_CANDIDATES) — retried next sweep, not lost"
+  return 0
+}
+
 # --- hosts -------------------------------------------------------------------
 
 collect_runners() {
@@ -1358,13 +1506,14 @@ reap_orphan_registrations() {
   done
 }
 
-# host_facts <host> -> sets HOST_BUSY, HOST_REG
+# host_facts <host> -> sets HOST_BUSY, HOST_PRESENT, HOST_REG
 # Slot agents are named "<host>-s<N>" by host-startup.sh; that naming IS the
 # join key between GCE instances and GitHub registrations.
 host_facts() {
   local host="$1"
   if [ -z "$RUNNERS_JSON" ]; then
     HOST_BUSY=0
+    HOST_PRESENT=-1
     HOST_REG="unknown"
     return 0
   fi
@@ -1382,6 +1531,13 @@ host_facts() {
   busy=${busy:-0}
 
   HOST_BUSY=$busy
+  # How many of this host's slots ANSWER, as opposed to how many it was built
+  # with. The two have never been compared: a slot is counted as capacity on the
+  # strength of its agent being up, and the fleet had no series that said
+  # otherwise. -1 above, never 0, because a tick that could not read the runner
+  # list knows nothing about this host and must not be summed as a host with no
+  # slots — that reads identically to the outage it is supposed to detect.
+  HOST_PRESENT=$present
   if [ "$present" -eq 0 ]; then
     HOST_REG="absent"
   elif [ "$present" -lt "$SLOTS" ]; then
@@ -2401,6 +2557,13 @@ tick() {
   # ticks it returns immediately.
   collect_outcomes
 
+  # Same placement, same reasoning, as the outcome sweep: repository-wide, on
+  # its own interval, and nothing in the pool loop waits on what it finds. It is
+  # the only thing this controller does that is not about capacity at all — see
+  # parked-decision.sh for why a fleet control plane is nonetheless the right
+  # place for it.
+  collect_parked
+
   local p
   for p in "${POOLS[@]}"; do
     pool_select "$p"
@@ -2450,6 +2613,10 @@ tick_pool() {
   classify_pinned
 
   local pool_size=0 slots_busy=0 idle_max=0 draining=0 stale_hosts=0
+  # Slots that answered, summed only over hosts the runner list could speak
+  # about. slots_known is the denominator that goes with it: without it a blind
+  # tick and a fleet-wide outage produce the same pair of numbers.
+  local slots_registered=0 slots_known=0
   local host status host_tpl host_uri busy idle age verdict hold tpl cordoned recycling
 
   # Hosts already mid-recycle, counted BEFORE any decision this tick, so every
@@ -2534,6 +2701,19 @@ tick_pool() {
     idle=$(idle_seconds "$host" "$busy")
     [ "$idle" -gt "$idle_max" ] && idle_max=$idle
     age=$(host_age_seconds "$host")
+
+    # SLOTS THAT ANSWER, over hosts old enough to have answered. A host still
+    # inside its registration grace has not registered YET, and a host that is
+    # not RUNNING is booting or on its way out; counting either as short of
+    # slots would make ci_slots_missing non-zero through every ordinary scale
+    # event, which is how a series stops being alerted on. A tick that could not
+    # read the runner list contributes nothing to either side — HOST_PRESENT is
+    # -1 there, and a blind tick must not read as an outage.
+    if [ "$HOST_PRESENT" -ge 0 ] && [ "$status" = "RUNNING" ] &&
+      [ "$age" -ge "$REGISTER_GRACE" ]; then
+      slots_known=$((slots_known + SLOTS))
+      slots_registered=$((slots_registered + HOST_PRESENT))
+    fi
 
     # Before any deletion verdict: a host that is still booting needs its
     # registration token now, and a host that has registered — or is running a
@@ -2746,6 +2926,15 @@ tick_pool() {
   queue_series "ci_hosts_draining" "$draining"
   queue_series "ci_slots_total" "$((pool_size * SLOTS))"
   queue_series "ci_slots_busy" "$slots_busy"
+  # CAPACITY THAT ANSWERS, and the gap. ci_slots_total is arithmetic —
+  # hosts × slots — so it says what the pool was BUILT with and cannot say
+  # whether any of it is reachable. Every failure in the #130 / #268 / #278
+  # family is invisible in it: a host that registered nothing, a host whose slot
+  # units died at ExecStartPre, a slot the sweep condemned and stopped. All
+  # three subtract from ci_slots_registered, and the difference is the series to
+  # alert on.
+  queue_series "ci_slots_registered" "$slots_registered"
+  queue_series "ci_slots_missing" "$((slots_known - slots_registered))"
   queue_series "ci_host_idle_seconds_max" "$idle_max"
   queue_series "ci_queue_wait_seconds_max" "$QUEUE_WAIT_MAX"
   # The other half of the wait. ci_queue_wait_seconds_max says how long a job
@@ -2850,6 +3039,26 @@ queue_controller_series() {
   # ci_jobs_completed readable as "no jobs finished" rather than "the outcome
   # sweep never got to them".
   queue_series "ci_outcome_runs_skipped" "$OUTCOME_RUNS_SKIPPED"
+
+  # Pull requests that are green and can never enter the merge queue. A
+  # REPOSITORY fact published under every pool's label, exactly like the
+  # heartbeat above and for the same reason — a pool whose series merely stop
+  # reads as an idle pool. Read it with max() across pools, never sum(): four
+  # pools publishing the same repository's count would otherwise report four
+  # times the parked pull requests.
+  #
+  # Every reason is published every tick, 0 included. A series that appears only
+  # when something is parked cannot be told apart from a sweep that never ran,
+  # and "the sweep never ran" is precisely the state this whole feature exists
+  # to stop being invisible.
+  local r
+  for r in "${PARKED_REASONS[@]}"; do
+    queue_series "ci_prs_green_and_unqueued" "${PARKED_COUNT[$r]:-0}" "\"reason\":\"$r\""
+  done
+  # What makes the zero above readable. Non-zero means the sweep ran out of
+  # budget or hit its ceiling, so the count is a lower bound rather than an
+  # answer — the same contract as ci_demand_runs_skipped.
+  queue_series "ci_parked_prs_skipped" "$PARKED_SKIPPED"
 }
 
 # --- install / run -----------------------------------------------------------
@@ -2993,6 +3202,86 @@ AccuracySec=10s
 WantedBy=timers.target
 WDTIMEOF
 
+  # --- liveness responder (#308) ---------------------------------------------
+  #
+  # Installed ONLY when the root asked for autohealing. Without it no port is
+  # opened, which is the default and the state every controller in the fleet is
+  # in until an operator changes it.
+  #
+  # What it answers matters more than that it answers. The managed group's
+  # health check is the one thing in this design authorised to DELETE the
+  # control plane, so a responder that returns 200 merely because a process is
+  # listening would license a rebuild loop against a controller that is fine,
+  # and license nothing against one that is wedged — the wedge keeps the socket
+  # open. So the verdict is the heartbeat's age, the same file the watchdog
+  # reads, against a threshold deliberately WIDER than the watchdog's: the
+  # watchdog restarts a unit, this deletes a machine, and the cheaper remedy
+  # must get first refusal.
+  if [ -n "$HEALTH_PORT" ]; then
+    cat >/opt/ci-controller/livez.py <<LIVEZEOF
+import http.server, os, time
+
+HB = "$STATE_DIR/heartbeat"
+THRESHOLD = $((wd_threshold * 3))
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?")[0] != "/livez":
+            self.send_response(404); self.end_headers(); return
+        try:
+            age = int(time.time() - os.stat(HB).st_mtime)
+        except OSError:
+            # No heartbeat file yet. The group's initial_delay_sec covers a
+            # controller that has not reached its first tick; past that, an
+            # absent heartbeat is the same as an ancient one.
+            age = THRESHOLD + 1
+        ok = age < THRESHOLD
+        self.send_response(200 if ok else 503)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(("age=%d threshold=%d\n" % (age, THRESHOLD)).encode())
+
+    def log_message(self, *a):
+        # A probe every 30s, forever. Logging it buries the controller's own log.
+        pass
+
+http.server.HTTPServer(("0.0.0.0", $HEALTH_PORT), H).serve_forever()
+LIVEZEOF
+    chmod 0644 /opt/ci-controller/livez.py
+
+    cat >/etc/systemd/system/ci-controller-livez.service <<'LIVEZSVCEOF'
+[Unit]
+Description=CI controller liveness responder — 200 while the tick heartbeat is fresh
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/ci-controller/livez.py
+Restart=always
+RestartSec=10
+# It reads one file's mtime and writes a fixed string. Nothing it does needs
+# the controller's identity, and it is the only thing on this VM listening on a
+# port, so it runs as nobody.
+User=nobody
+Group=nogroup
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+LIVEZSVCEOF
+  else
+    # Autohealing was turned OFF on a controller that previously had it on. The
+    # unit file survives the reboot on the boot disk, so leaving it alone would
+    # keep the port open after the operator asked for it to close.
+    if [ -f /etc/systemd/system/ci-controller-livez.service ]; then
+      systemctl disable --now ci-controller-livez.service >>"$LOG" 2>&1 || true
+      rm -f /etc/systemd/system/ci-controller-livez.service /opt/ci-controller/livez.py
+      log "liveness responder removed — autohealing is off"
+    fi
+  fi
+
   systemctl daemon-reload
   systemctl enable ci-controller.service
   systemctl enable ci-controller-watchdog.timer
@@ -3013,7 +3302,14 @@ WDTIMEOF
   # a tick started over loses nothing.
   systemctl restart ci-controller.service
   systemctl restart ci-controller-watchdog.timer
-  log "controller installed for $REPO_FULL pool=$POOL mig=$MIG poll=${POLL}s grace=${GRACE}s slots=$SLOTS watchdog=${wd_threshold}s"
+  if [ -n "$HEALTH_PORT" ]; then
+    systemctl enable ci-controller-livez.service >>"$LOG" 2>&1 || true
+    # RESTART for the same reason as the controller above: the previous
+    # version's livez.py is already on disk and its unit already running, so
+    # `enable --now` would leave the old responder serving the new threshold.
+    systemctl restart ci-controller-livez.service >>"$LOG" 2>&1 || true
+  fi
+  log "controller installed for $REPO_FULL pool=$POOL mig=$MIG poll=${POLL}s grace=${GRACE}s slots=$SLOTS watchdog=${wd_threshold}s livez=${HEALTH_PORT:-off}"
 }
 
 run_loop() {

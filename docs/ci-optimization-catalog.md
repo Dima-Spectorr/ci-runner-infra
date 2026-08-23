@@ -874,6 +874,51 @@ describing nothing.
    so a slot whose agent is up has already been reset by the path that owns
    that decision.
 
+   **A dirty slot is recovered by a timer, not by the next job.** The marker is
+   the right gate and it had the wrong exit: the `started` hook was the only
+   thing that ever wrote one back, so a slot whose job never reached its
+   completed hook stayed condemned. Every job routed there afterwards was failed
+   in about six seconds — *faster than a healthy slot can claim work*, so the
+   broken slot preferentially won the queue and re-running the workflow spread
+   the outage rather than clearing it. IntegrateIT lost twelve of twenty-four
+   slots to it on 2026-08-23, from an ordinary `fail-fast` cancellation.
+   `install_slot_sweep()` therefore runs `slot-sweep.sh` on a 30-second timer:
+   any slot with no marker, no `Runner.Worker`, and a settled systemd state for
+   two consecutive ticks has its agent stopped, is re-checked for a worker,
+   is reset through the same `slot-reset.sh` the hooks call, and comes back.
+   Recovery stops costing a job. Two witnesses and two ticks are both load-
+   bearing — the marker is absent for the whole length of a *live* job, so
+   "dirty" alone describes a running job exactly as well as an abandoned one —
+   and the reset now takes a per-slot `flock`, because the sweep made root a
+   second concurrent caller of a script that had only ever been called serially
+   by the runner.
+
+   **And a slot the timer cannot recover leaves the pool rather than eating
+   it.** Retrying forever is right for a transient obstruction and wrong for a
+   permanent one: while the sweep retries, the slot is still registered, still
+   offered work, and still failing it in six seconds — which is precisely how
+   twelve broken slots out-competed twelve healthy ones for the same queue.
+   `slot-reset.sh` therefore counts consecutive failures to reach a clean state
+   into `$SLOT_STATE/<idx>/burns` — root-owned, beside the marker, because the
+   subject of the measurement is the slot — and clears it the moment the slot
+   comes back clean. Past `CONDEMN_MAX=3` the sweep stops starting that slot's
+   agent. Not disabled and not deleted: the reset is still attempted every tick,
+   and a slot whose obstruction clears is put straight back into service.
+
+   The fleet can already see this without a new API call or a new guest
+   attribute. A stopped agent leaves the repository's runner list, and
+   `host_facts()` has always counted how many of a host's slots answer; that
+   count is now published as `ci_slots_registered`, and the gap against the
+   slots the pool was built with as **`ci_slots_missing`** — the series to alert
+   on. `ci_slots_total` is arithmetic, hosts × slots, so it reads identically
+   whether every agent registered or none did, which is why three separate
+   outages all presented as "the pool looks fine and jobs queue": a host that
+   registered nothing (#130), a host whose slot units died before the agent
+   started (#268), and a condemned slot (#278). The sum counts only RUNNING
+   hosts past their registration grace, so ordinary scale-out does not move it,
+   and a tick that could not read the runner list contributes to neither side —
+   an unreadable API cannot fake an outage.
+
    The symmetric caution: a workflow that *relied* on a previous job's login now
    fails. Nothing in this fleet does — every workflow that needs GCP either runs
    `google-github-actions/auth` itself or uses the broker's ADC — but a repo

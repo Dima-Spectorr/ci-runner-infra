@@ -1072,6 +1072,70 @@ Added 2026-08-19, all four about `mode`:
 
 ---
 
+## The failure this baseline cannot see: a green pull request that is never admitted
+
+Everything above tunes what happens **after** a pull request enters the queue.
+The costliest CI failures of the past week happened before that, and none of
+them produced a red check.
+
+Mergify's entry conditions — `base = <the queue's branch>`, `-draft`,
+`-conflict` — are not reported as failures when they do not hold. They are
+reported as **neutral**: a grey dot beside forty green ticks, with no comment
+and no timer. A pull request that is complete, fully green and permanently
+parked therefore looks identical to one that is about to merge. Twice in one
+week a repository reported "CI is making no progress" and CI was fine: one
+consumer repository had two pull requests sitting as green **drafts**, the older
+for three days, and this repository's own #299 was green with its **base**
+pointing at a sibling feature branch. No failing job anywhere.
+
+**The controller reports it, so the repository cannot switch it off.** A
+scheduled workflow in the consumer repository would be simpler and would report
+where the author is already looking — and it would live in the file the
+misconfigured repository is allowed to edit, which defeats the purpose. The
+contract this fleet offers is minimum configuration in the consumer repository
+and no way for that repository to break the mechanism. The controller already
+holds an installation token and already sweeps the repository every tick.
+
+**What it publishes.**
+
+| Metric | Meaning |
+|---|---|
+| `ci_prs_green_and_unqueued` | Open pull requests that are finished, green, and fail an entry condition. Labelled `reason` = `draft`, `base` or `draft-and-base`. |
+| `ci_parked_prs_skipped` | Pull requests the sweep did not examine this pass. Non-zero makes the metric above a **lower bound**. |
+
+Both are **repository** facts published under **every** pool label, so that a
+pool whose series merely stop is not read as an idle pool. Read them with
+`max()`, never `sum()` — summing multiplies one parked pull request by the
+number of pools. An alert (`ci_prs_green_and_unqueued > 0` for 60 minutes) ships
+in `scripts/ci/ensure-alert-policies.sh` under the key `parked`.
+
+**The queue's branch is configuration, not a literal.** `queue_base_branch`
+defaults to `main` on both modules. A repository whose queue admits something
+else must set it, or every open pull request reads as parked.
+
+**What it deliberately stays quiet about.** The rule
+(`modules/ci-runner-host-pool/scripts/parked-decision.sh`, 24 self-test cases)
+reports only a pull request that is **finished and stuck**. Anything still
+running, anything already red, and anything with no checks at all is somebody's
+work in progress. `-conflict` is not detected: answering it costs a GET per pull
+request, a conflicted branch runs no CI at all so it lands in the "no checks"
+arm anyway, and GitHub's own merge box already says so in red. The invariant is
+that a single false positive on work in progress is enough for the signal to be
+filtered away — which returns the fleet to the grey dot it replaced.
+
+**Cost.** The entry-condition half is decidable from the pull-request list
+payload alone, so a healthy repository pays exactly one API call per five
+minutes. Only an already-inadmissible pull request costs a `check-runs` call,
+capped at 20 candidates and a 20-second budget per sweep; anything beyond that
+increments `ci_parked_prs_skipped` and is retried next sweep, never lost.
+
+**It needs `checks: read`** on the App installation — the only endpoint in the
+controller that does. Without it the sweep logs the 403 and the metric stays at
+zero, which is indistinguishable from health. See
+[onboarding-a-repository.md](onboarding-a-repository.md).
+
+---
+
 ## Fleet status (2026-08-21) — the scopes pass, completed
 
 Every repository that has a Mergify queue now **declares** `merge_queue.mode`,

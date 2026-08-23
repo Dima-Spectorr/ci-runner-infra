@@ -27,9 +27,23 @@ posture you opt into knowingly. Read [Windows](#windows) before you declare one.
 1. **The GitHub App is installed on the repository.** The fleet authenticates as
    one App, not as a PAT. You need its **app id** and the **installation id**
    for the account that owns the repo — both non-secret. The private key is not
-   in any repository or state file; see step 3. The App needs
-   **`Contents: read`** if you are standing up a merge-queue pool (step 8) —
-   without it the pool keeps its Terraform ceiling and says nothing.
+   in any repository or state file; see step 3.
+
+   Its installation needs **`checks: read`** in addition to the permissions the
+   runners themselves use. Nothing about job execution depends on it — without
+   it the pool scales, registers and runs jobs exactly as it does with it. The
+   one thing it buys is the merge-queue parking detector below: the controller
+   reads each open pull request's check runs to decide whether a pull request
+   the queue will never admit is nevertheless finished and green. Missing the
+   permission does not fail an apply or a job; the controller logs the 403 once
+   per sweep and `ci_prs_green_and_unqueued` stays at zero forever, which reads
+   exactly like health. If you see that log line, that is what it means.
+
+   It needs **`Contents: read`** as well if you are standing up a merge-queue
+   pool (step 8): that is how the controller reads the repository's own
+   `.mergify.yml` to size the pool. This one fails the same quiet way — without
+   it the pool keeps the Terraform ceiling you typed and says nothing, and
+   `ci_queue_config_age_seconds` climbing is the only sign.
 2. **A GCP project, a VPC and a subnet** in the region the pool will run in.
    Hosts get no external IP: egress must already work from that subnet (in the
    MOT projects it is the peering to `mot-lz-vpc` through the central firewall —
@@ -50,7 +64,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.35.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.39.0"
 
   project_id         = var.project_id
   network            = var.network
@@ -59,7 +73,7 @@ module "ci_runner_network" {
 }
 
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.35.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.39.0"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -68,7 +82,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.35.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
 
   project_id = var.project_id
   region     = var.region
@@ -147,7 +161,7 @@ nightly, from your default branch.
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.35.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.39.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -384,7 +398,7 @@ later apply:
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.35.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.39.0"
 
   project_id     = var.project_id
   region         = var.region
@@ -505,7 +519,7 @@ module "ci_runner_pool" {           # the Linux CI pool from step 1, unchanged
 }
 
 module "ci_runner_pool_mq" {        # the Linux merge-queue pool
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.35.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
   # …every argument of the CI pool, with three differences:
   name              = "${var.pool_name}-mq"
   manage_controller = false
@@ -520,7 +534,7 @@ module "ci_runner_pool_mq" {        # the Linux merge-queue pool
 }
 
 module "ci_runner_controller" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.35.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.39.0"
 
   name  = "${var.pool_name}-controller"
   pools = [
@@ -710,7 +724,7 @@ instantiations with their own names, MIGs, controllers and labels.
 
 ```hcl
 module "ci_runner_identity_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.35.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.39.0"
 
   project_id        = var.project_id
   name              = var.win_pool_name
@@ -723,7 +737,7 @@ module "ci_runner_identity_win" {
 }
 
 module "ci_runner_pool_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.35.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
 
   # ... project_id, region, github_*, network, subnetwork and the three
   # identities exactly as the Linux pool above, from the _win modules ...

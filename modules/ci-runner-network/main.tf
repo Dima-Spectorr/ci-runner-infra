@@ -82,7 +82,15 @@ resource "google_compute_firewall" "health_check" {
 
   direction     = "INGRESS"
   source_ranges = var.health_check_source_ranges
-  target_tags   = [var.runner_network_tag]
+
+  # `ci-runner-controller` as well as the runner tag, since #308. The controller
+  # is now a managed group of size 1, and a root that turns
+  # `controller_autohealing` on gets a health check whose probes must reach it —
+  # from these ranges, to a tag this rule opens. Without the tag here, the probe
+  # never lands, the group reads a healthy controller as dead, and rebuilds it
+  # on a loop. The rule is a no-op for the default (autohealing off, nothing
+  # listening): an allow rule to a port with no listener admits nothing.
+  target_tags = distinct([var.runner_network_tag, "ci-runner-controller"])
 
   allow {
     protocol = "tcp"

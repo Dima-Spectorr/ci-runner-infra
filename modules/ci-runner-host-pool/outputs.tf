@@ -22,14 +22,20 @@ output "autoscaler_name" {
 # and an index into an empty list fails the PLAN with an error about the output
 # rather than about the pool. Null is the honest answer — this pool's controller
 # is somewhere else.
+#
+# And the GROUP, not the instance. Since #308 the controller is a managed group of
+# size 1, and the VM inside it is named `<group>-<suffix>` — a name that changes
+# every time the group rebuilds it, which is the entire point. An output that
+# named the instance would be a value every consumer had to re-read after each
+# recovery, so the stable handle is the group.
 output "controller_instance" {
-  description = "Name of the always-on controller VM, or null when a shared controller serves this pool."
-  value       = one(google_compute_instance.controller[*].name)
+  description = "Name of the managed group holding the always-on controller VM, or null when a shared controller serves this pool. The VM itself is <this>-<suffix>; list it with `gcloud compute instance-groups managed list-instances`."
+  value       = one(google_compute_instance_group_manager.controller[*].name)
 }
 
 output "controller_zone" {
-  description = "Zone of the controller VM, or null when a shared controller serves this pool."
-  value       = one(google_compute_instance.controller[*].zone)
+  description = "Zone of the controller's managed group, or null when a shared controller serves this pool."
+  value       = one(google_compute_instance_group_manager.controller[*].zone)
 }
 
 # THE POOL, AS THE CONTROLLER'S TABLE WANTS IT.
@@ -121,6 +127,22 @@ output "metric_names" {
       "ci_hosts_draining",
       "ci_slots_total",
       "ci_slots_busy",
+      # Slots that ANSWER, and the gap between that and the slots the pool was
+      # built with. ci_slots_total is arithmetic — hosts × slots — so it reads
+      # identically whether every agent is registered or none is. These two are
+      # the only series that distinguish the two, and they are counted only over
+      # RUNNING hosts past their registration grace, so ordinary scale-out does
+      # not move them.
+      #
+      # Alert on sustained non-zero ci_slots_missing. It is one number for three
+      # failures that all present as "the pool looks fine and jobs queue": a
+      # host that registered nothing at all, a host whose slot units died before
+      # the agent started, and a slot the host's own sweep condemned and took
+      # out of service after it failed to reach a clean state CONDEMN_MAX times.
+      # A blind tick contributes to neither, so this cannot be moved by the API
+      # being unreadable.
+      "ci_slots_registered",
+      "ci_slots_missing",
       "ci_host_idle_seconds_max",
       "ci_queue_wait_seconds_max",
       # How long the oldest job already EXECUTING has been executing. Pairs with
@@ -253,6 +275,24 @@ output "metric_names" {
       # deferred, not lost. Sustained non-zero means OUTCOME_BUDGET is too small
       # for this repository's throughput and the other two are lagging.
       "ci_outcome_runs_skipped",
+      # --- the merge queue, as opposed to the pool ----------------------------
+      # Open pull requests that are GREEN and can never enter the merge queue,
+      # grouped by the entry condition they fail (`draft`, `base`,
+      # `draft-and-base`). It is a REPOSITORY fact published under every pool's
+      # label, so read it with max() across pools and never sum() — four pools
+      # on one controller each publish the same count.
+      #
+      # It is here, in a capacity contract, because the two "CI is making no
+      # progress" reports this fleet received in one week were both this and
+      # neither was a pool: Mergify reports an unmet entry condition as NEUTRAL,
+      # which renders as a grey dot beside forty green ticks. Nothing else in
+      # this list can go non-zero for it.
+      "ci_prs_green_and_unqueued",
+      # > 0 means the parking sweep did not examine every candidate, so the
+      # count above is a lower bound. Published every tick, 0 included: it is
+      # what makes a zero above readable as "nothing is parked" rather than "the
+      # sweep never got there".
+      "ci_parked_prs_skipped",
       # --- the cache hydrate --------------------------------------------------
       # Published by the HOST, not the controller, and once per boot rather than
       # per tick: the hydrate finishes before the runner agent registers, so the
