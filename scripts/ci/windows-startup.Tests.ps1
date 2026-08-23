@@ -782,7 +782,7 @@ Describe 'slot reset service body' {
         $script:Reset | Should -Not -Match '& robocopy'
     }
 
-    # …and substituted with the RESTORE budget, not the capture's. One serial
+    # ...and substituted with the RESTORE budget, not the capture's. One serial
     # loop serves every slot, so this bound is how long another slot's gate waits
     # behind this one -- at the capture's 600 s it would outlast the hook's own
     # wait and fail a job on a slot that is perfectly clean.
