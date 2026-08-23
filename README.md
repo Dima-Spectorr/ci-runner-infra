@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.40.0"
   # ...
 }
 ```
@@ -770,6 +770,8 @@ docs/image-vuln-ignores.txt      the dated exceptions to that
 scripts/ci/lane-decision.sh      pure CI-lane rule (unit-tested)
 scripts/ci/                      self-tests
 docs/onboarding-a-repository.md  how to put a NEW repo on the fleet
+docs/github-app-permissions.md   the App's permissions: who grants each, how,
+                                 and how each one fails without saying so
 scripts/ci/check-merge-queue-single-step.sh
                                  the merge-queue rule consumers copy in
 scripts/ci/check-runner-policy.sh
