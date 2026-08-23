@@ -264,6 +264,8 @@ check "the heartbeat is created before the unit that bind-mounts it" yes "$r"
 # So the program is extracted from the script rather than restated here — a
 # second copy would pass while the real one drifted — and run against the two
 # payloads that differ only in the field.
+# shellcheck disable=SC2016  # a sed address matching shell source text, on
+# purpose: the `$(` is the script's own characters, not an expansion of ours.
 sig_jq=$(sed -n '/sig=$(printf .* | jq -r ./,/@tsv/p' "$STARTUP" |
   sed '1s/.*jq -r .//; $s/.*/  | .[] | [ .c, (.e | tostring), (.s | tostring) ] | @tsv/')
 [ -n "$sig_jq" ] && r=yes || r=no
