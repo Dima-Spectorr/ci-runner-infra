@@ -64,6 +64,7 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER11` | with `--shared-infra`, a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
 | `RUNNER12` | a route onto the **merge-queue** pool also requires the head branch to live in this repository and the author to be `mergify[bot]` — not the branch name alone |
 | `RUNNER13` | and the label sets it routes between are mutually non-superset, so neither pool can be scheduled onto the other's hosts |
+| `RUNNER14` | and in a repository that HAS such a route, no fleet-reachable `pull_request` job names its pool literally — a job that does sits out the route and queues against the pull-request pool even on a merge-queue draft |
 
 `RUNNER9`–`RUNNER11` are designed in
 [`adr-pr-host-affinity.md`](adr-pr-host-affinity.md) and specified for consumers
@@ -248,6 +249,61 @@ right would be the one reported.
 table at plan time. Both ends, because either end alone is a rule the other end
 drifts away from: Terraform sees the pools and not the workflow, this gate sees
 the workflow and not the pools.
+
+### `RUNNER14` — the half of the route nobody remembers to finish
+
+`RUNNER12` and `RUNNER13` both read the route and ask whether it is written
+correctly. Neither asks the question that actually costs merges: **which jobs
+take it.**
+
+Adopting the split is not one edit. The pools are Terraform, the route is an
+expression in one workflow, and every self-hosted job in the repository has to
+be repointed at it — including the ones in the other workflow files, which is
+where this stops being remembered. A job left naming `<scope>` literally is not
+broken and reports nothing: the labels resolve, a runner exists, the job runs.
+It just runs on the **pull-request** pool, on every speculative queue draft,
+competing with the ordinary pull-request traffic that the queue pool was built
+to insulate the queue from. The busier the repository, the worse it gets —
+precisely when the queue matters.
+
+Measured on IntegrateIT, 2026-08-23: `generic-binary-check.yml` kept
+`runs-on: [self-hosted, linux, gcp, IntegrateIT]` after `pr-check.yml` adopted
+the route, and on pull request #11307 its **65-second** job waited **31m06s**
+for a runner. Because `generic-binary` is a required check, Mergify reported the
+queue entry as "waiting for generic-binary" for the whole half hour — which
+reads as a check that is running slowly, not as one that cannot start. That
+reading is why the repository spent weeks blaming the queue.
+
+Like `RUNNER12`/`RUNNER13`, this is opted into by the route **existing**, and by
+nothing else. The rule is off in a repository with one pool, and it switches
+itself on for every workflow file the moment any job anywhere resolves its pool
+from a route — which is also why the verdict is **deferred to the end** and
+reported per offending job rather than per file: whether a repository has a
+route is not knowable while reading the file that lacks one. `RUNNER10` is
+deferred for the same reason and reports once; this one reports each job,
+because each is a separate edit to make.
+
+Three answers are accepted, the same three shapes `RUNNER9` takes:
+
+- resolve the pool from the routing job's output —
+  `runs-on: ${{ fromJSON(needs.<lane>.outputs.runner) }}`;
+- be a job the queue drafts cannot reach, proven by an `if:` that excludes
+  `mergify/merge-queue/` heads — a job that never runs during queue validation
+  never competes for a pool during it;
+- declare `# merge-queue-route-exempt(<job>, #<issue>): <reason>` beside it.
+
+The exemption exists because one case is real and cannot be fixed by editing the
+workflow: a job on a pool that has **no merge-queue twin**. A Windows build in a
+repository whose queue pool is Linux-only has no second label to name. That is a
+sizing decision, so it belongs in an issue rather than in a silent pass — and
+the marker is read through `comment_view()` like every other declaration here,
+so a marker echoed inside a `run:` block declares nothing.
+
+An inline `runs-on:` expression is not one of the three. It is a single line and
+needs no second job, and `RUNNER5` rejects it before this rule is reached, on the
+grounds that a pool gate which cannot resolve the pool must say so rather than
+pass. The cost of the extra job is one hosted-runner start; the cost of the
+alternative is a gate that stops gating.
 
 ### `self-hosted` is a label, not a requirement
 
