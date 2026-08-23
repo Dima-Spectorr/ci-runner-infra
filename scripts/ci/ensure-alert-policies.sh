@@ -464,7 +464,7 @@ ensure_descriptor ci_slots_registered        "Slots whose runner agent answers, 
 ensure_descriptor ci_slots_missing           "Slots the pool was built with that no agent answers for. Non-zero is capacity that exists on paper only: a host that registered nothing, a host whose slot units died before the agent started, or a slot the host condemned for failing every job it claimed."
 ensure_descriptor ci_prs_green_and_unqueued "Open pull requests that are green and can never enter the merge queue, labelled by the entry condition they fail. A repository fact published under every pool label -- read with max(), never sum()."
 ensure_descriptor ci_parked_prs_skipped     "Pull requests the parking sweep did not examine. Non-zero makes ci_prs_green_and_unqueued a lower bound."
-ensure_descriptor ci_parked_sweep_denied    "Parking sweeps refused by GitHub. Non-zero means the installation lacks checks:read and ci_prs_green_and_unqueued is inert, not zero."
+ensure_descriptor ci_parked_sweep_denied    "Parking sweeps GitHub refused (401/403/404). Non-zero means ci_prs_green_and_unqueued is inert rather than zero; the usual cause is a missing checks:read, but a bad App key or installation id reads the same."
 # Published by the HOST once per boot, not by the controller per tick. Declared
 # here for the same reason as the rest — a pool that has never booted a host
 # still needs its alerting provisioned — and it matters more here: these series
