@@ -104,16 +104,23 @@ variable "pools" {
   # make the difference set non-empty for ANY pair and the check vacuous — it
   # would pass on the addressing label while the selector labels were identical,
   # which is the exact failure it is here to catch.
+  #
+  # Compared lower-cased and trimmed, the same way RUNNER13 compares them in
+  # `check-runner-policy.sh`, because that is how GitHub compares them: `Repo`
+  # and `repo` are ONE label. Left case-sensitive, two spellings of one pool
+  # would read here as two pools, this check would pass, and the pools would
+  # still merge at scheduling time — a green plan over the exact overlap the
+  # rule exists to refuse.
   validation {
     condition = alltrue(flatten([
       for q in var.pools : [
         for c in var.pools : (
           length(setsubtract(
-            setsubtract(toset(split(",", c.runner_labels)), toset(["self-hosted", c.name])),
-            setsubtract(toset(split(",", q.runner_labels)), toset(["self-hosted", q.name])),
+            setsubtract(toset([for l in split(",", c.runner_labels) : lower(trimspace(l))]), toset(["self-hosted", lower(c.name)])),
+            setsubtract(toset([for l in split(",", q.runner_labels) : lower(trimspace(l))]), toset(["self-hosted", lower(q.name)])),
             )) > 0 && length(setsubtract(
-            setsubtract(toset(split(",", q.runner_labels)), toset(["self-hosted", q.name])),
-            setsubtract(toset(split(",", c.runner_labels)), toset(["self-hosted", c.name])),
+            setsubtract(toset([for l in split(",", q.runner_labels) : lower(trimspace(l))]), toset(["self-hosted", lower(q.name)])),
+            setsubtract(toset([for l in split(",", c.runner_labels) : lower(trimspace(l))]), toset(["self-hosted", lower(c.name)])),
           )) > 0
         )
         if coalesce(c.role, "ci") == "ci" && coalesce(c.host_os, "linux") == coalesce(q.host_os, "linux")
