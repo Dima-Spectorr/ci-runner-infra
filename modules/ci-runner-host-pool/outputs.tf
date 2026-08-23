@@ -293,6 +293,12 @@ output "metric_names" {
       # what makes a zero above readable as "nothing is parked" rather than "the
       # sweep never got there".
       "ci_parked_prs_skipped",
+      # > 0 means the sweep was REFUSED, not delayed: the installation lacks
+      # `checks: read` and no later sweep will do better. Separate from the
+      # counter above because the two carry opposite advice — wait, versus grant
+      # a permission — and because a denied sweep leaves every other series here
+      # publishing the same unbroken zero a healthy repository publishes.
+      "ci_parked_sweep_denied",
       # --- the cache hydrate --------------------------------------------------
       # Published by the HOST, not the controller, and once per boot rather than
       # per tick: the hydrate finishes before the runner agent registers, so the
