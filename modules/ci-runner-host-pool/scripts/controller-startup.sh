@@ -262,6 +262,7 @@ pool_select() {
   QUEUE_WAIT_MAX="${D_WAIT[$POOL]:-0}"
   RUNNING_MAX="${D_RUNNING[$POOL]:-0}"
   DEMAND_EXPIRED="${D_EXPIRED[$POOL]:-0}"
+  POOL_JOBS_PER_CHECK="${Q_JPC[$POOL]:-1}"
 }
 
 # The per-pool globals pool_select writes, declared at file scope so that a read
@@ -279,13 +280,15 @@ ORPHAN_CONFIRM_TICKS=3
 RECYCLE_MAX_UNAVAILABLE=0
 CONTROLLER_HOST_OS="unknown"
 MINT_REG=false
-# POOL_ROLE and POOL_LABELS_JSON are written by pool_select and read by
-# nothing in THIS file — the routing rule that consumes the role, and the
-# label set the demand sweep hands to jq, both live in the pool table and
-# arrive at their readers by other routes. Dropping them here would mean
-# re-deriving them per tick from the table instead.
-# shellcheck disable=SC2034
+# Read in tick_pool by the capacity clamp: the role is what decides whether a
+# pool's ceiling comes from the repository's Mergify configuration or from
+# Terraform alone. It arrived with PR3 unread by this file; it is read now.
 POOL_ROLE="ci"
+# The high-water jobs-per-check for the selected pool. 1 until the demand sweep
+# has seen a run, which makes the derived ceiling its narrowest — and narrowest
+# is correct before anything has been observed, because the ceiling caps demand
+# and demand at that point is zero.
+POOL_JOBS_PER_CHECK=1
 BEACON_INTERVAL=30
 PIN_ORPHAN_GRACE=900
 # The configured list, verbatim — kept for parity with `config.sh --labels` and
@@ -691,6 +694,17 @@ collect_demand() {
       # write would create a phantom entry that every later loop iterates.
       [ -n "${D_TOTAL[$c_pool]+set}" ] || continue
 
+      # HOW BIG ONE RUN IS, for this pool, kept as a high-water mark across
+      # ticks. `n` is already exactly that: the jobs of ONE workflow run that
+      # this pool can serve. For a merge-queue pool a workflow run IS a
+      # speculative check, so this is the "jobs per check" the capacity rule
+      # needs, measured instead of guessed — see Q_JPC. Tracked for every pool
+      # because the accumulator is shared and one comparison is cheaper than a
+      # role test; only a merge-queue pool ever reads it.
+      if [ "${n:-0}" -gt "${Q_JPC[$c_pool]:-1}" ]; then
+        Q_JPC["$c_pool"]="$n"
+      fi
+
       D_TOTAL["$c_pool"]=$(( D_TOTAL["$c_pool"] + ${n:-0} ))
       D_QUEUED["$c_pool"]=$(( D_QUEUED["$c_pool"] + ${q:-0} ))
       D_EXPIRED["$c_pool"]=$(( D_EXPIRED["$c_pool"] + ${expired_n:-0} ))
@@ -727,6 +741,119 @@ collect_demand() {
   # budget being too small for a repo is visible without reading a controller log.
   DEMAND_RUNS_SKIPPED=$skipped
   [ "$skipped" -gt 0 ] && log "demand budget ${DEMAND_BUDGET}s exhausted after $examined run(s): $skipped run(s) not examined this tick — demand is a LOWER BOUND, and a skipped in_progress run may still hold queued jobs"
+  return 0
+}
+
+# --- the merge-queue's own ceiling ---------------------------------------------
+#
+# A merge-queue pool exists to serve one producer, and that producer publishes
+# how much it will ask for: Mergify runs at most `max_parallel_checks`
+# speculative check runs per queue, and nothing outside `.mergify.yml` decides
+# that number. Until this sweep the pool's ceiling was a Terraform variable
+# somebody typed, in another repository, at some earlier time — so the fleet had
+# eight independently-wrong numbers, and the wrong direction that matters is
+# silent: a queue throttled by runner capacity has PENDING checks, not failed
+# ones, and pending forever looks exactly like a slow build.
+#
+# So the ceiling is derived from the configuration itself, live, on every
+# controller, the same way. `mergify_capacity` is the rule; this is its I/O.
+#
+# READ LIVE, NOT AT APPLY TIME, and that is a decision rather than a
+# convenience. The Terraform that creates a pool lives in THIS repository and
+# the `.mergify.yml` that sizes it lives in the repository being served, so an
+# apply-time read would need a cross-repository fetch at plan time and would
+# still be stale the moment somebody raised `max_parallel_checks` in a pull
+# request of their own. Reading it here means a queue that widens is served by a
+# pool that widens with it, with no apply anywhere.
+QUEUE_CONFIG_INTERVAL=300
+QUEUE_CONFIG_LAST=0
+# When the facts on hand were last read SUCCESSFULLY. Published as an age, which
+# is the only way a reader can tell "derived from the current configuration"
+# from "derived from what the configuration said before the App lost access".
+QUEUE_CONFIG_AT=0
+# The reader's records, or the literal `unreadable`. Starts unreadable so that
+# the very first tick — before any sweep has run — fails open to the configured
+# ceiling rather than deriving one from an empty document.
+QUEUE_FACTS="unreadable"
+# In Mergify's own order of precedence. The first one that exists wins, and a
+# repository with none of them is a repository with no queue configuration,
+# which is NOT the same as an unreachable one.
+QUEUE_CONFIG_PATHS=".mergify.yml .mergify/config.yml .github/mergify.yml"
+QUEUE_CONFIG_FILE=""
+# Jobs one speculative check run produces, per pool, OBSERVED rather than
+# configured — a high-water mark that only ever rises while this process lives.
+#
+# Configuring it would mean asking an operator for a number they cannot know:
+# it is however many jobs the repository's pull-request workflows happen to
+# contain today, and it changes with every workflow edit. Observing it costs
+# nothing — collect_demand already counts, per run and per pool, exactly this —
+# and the direction it can be wrong in is the safe one. Too LOW throttles a
+# healthy queue; too HIGH only authorises hosts that real demand never asks for,
+# because the ceiling caps demand and does not create it. A high-water mark is
+# never too low for a run shape that has already been seen.
+declare -A Q_JPC=()
+
+collect_queue_config() {
+  local now
+  now=$(date +%s)
+
+  # Not this tick's turn. A merge queue's concurrency changes when somebody
+  # edits a file, so polling it at the 20s tick rate would spend 180 contents
+  # calls an hour of a shared installation budget to re-learn the same number.
+  [ $((now - QUEUE_CONFIG_LAST)) -ge "$QUEUE_CONFIG_INTERVAL" ] || return 0
+  QUEUE_CONFIG_LAST=$now
+
+  local path resp body facts status
+  for path in $QUEUE_CONFIG_PATHS; do
+    if ! resp=$(gh_api "repos/$REPO_FULL/contents/$path" 2>/dev/null); then
+      # gh_api returns 1 for EVERY non-2xx, so its failure alone cannot tell a
+      # file that is not there from a repository that is not reachable — a
+      # revoked token would walk all three candidate paths and then record "this
+      # repository has no queue", which is the one lie this sweep must not tell.
+      # Only a 404 is an absence; the status it just wrote is what says so.
+      status=$(cat "$STATE_DIR/api.status" 2>/dev/null || echo "")
+      if [ "$status" = "404" ]; then continue; fi
+      log "mergify config could not be fetched (api status ${status:-unknown}) — keeping the previous queue facts"
+      return 0
+    fi
+    # A 404 is a `continue` above. Everything from here is a file that EXISTS,
+    # so a failure to make sense of it is a real fault and must not fall through
+    # to the next candidate path — that would report the absence of a file the
+    # repository does not use as the reason the one it does use is unreadable.
+    body=$(printf '%s' "$resp" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null)
+    if [ -z "$body" ]; then
+      log "mergify config $path could not be decoded — keeping the previous queue facts"
+      return 0
+    fi
+    # The status of the READER, tested directly rather than through `$?` after
+    # an assignment: with `pipefail` the pipeline's status is the reader's, and
+    # an assignment's own status would be the last thing that ran either way.
+    if ! facts=$(printf '%s' "$body" | mergify_queue_facts); then
+      log "mergify config $path could not be parsed (invalid YAML, or python3-yaml missing) — keeping the previous queue facts"
+      return 0
+    fi
+    # Logged on CHANGE, not every read: the ceiling every merge-queue pool on
+    # this controller is about to enforce, and the file it came from. At the
+    # five-minute read interval an unconditional log would be 288 identical
+    # lines a day; on change it is the audit trail of every time the queue's
+    # concurrency moved, which is the only entry anyone ever goes looking for.
+    if [ "$facts" != "$QUEUE_FACTS" ] || [ "$path" != "$QUEUE_CONFIG_FILE" ]; then
+      log "mergify config read from $path — queues: $(printf '%s' "$facts" | tr '\n' ' ')"
+    fi
+    QUEUE_FACTS="$facts"
+    QUEUE_CONFIG_FILE="$path"
+    QUEUE_CONFIG_AT=$now
+    return 0
+  done
+
+  # None of the candidate paths exists. THIS IS A FACT, not a failure, and it is
+  # recorded as one: a repository with no Mergify configuration has no queue,
+  # and the rule fails open to the configured ceiling with a reason that says
+  # so. Leaving it `unreadable` would be a lie that reads identically to a
+  # revoked installation token.
+  QUEUE_FACTS=""
+  QUEUE_CONFIG_FILE=""
+  QUEUE_CONFIG_AT=$now
   return 0
 }
 
@@ -2260,6 +2387,12 @@ tick() {
 
   collect_demand
 
+  # AFTER the demand sweep, because the sweep is what measures how many jobs one
+  # check run produces, and BEFORE the pool loop, because the ceiling it derives
+  # is applied per pool inside it. Interval-gated like the outcome sweep: on
+  # most ticks it returns without a call.
+  collect_queue_config
+
   # Deliberately BEFORE the pool loop, unlike the single-pool controller that
   # ran it last. It is still the work nothing waits on — no host is drained and
   # no MIG resized on what it finds — but with N pools the flush is now shared,
@@ -2514,7 +2647,83 @@ tick_pool() {
 
   local target="$MIG_TARGET"
 
-  queue_series "ci_demand" "$DEMAND_TOTAL"
+  # --- the merge-queue ceiling, applied ----------------------------------------
+  #
+  # Published demand is what the ONLY_UP autoscaler acts on, so this is the one
+  # place a derived ceiling can actually bound a pool: the controller does not
+  # scale out, it says how much work there is, and the platform buys hosts for
+  # it. Terraform's `max_hosts` remains the hard stop underneath — the MIG will
+  # not exceed it whatever is published — and the derived ceiling is the SOFT one
+  # that tracks the queue.
+  #
+  # A CI pool is untouched. Its work comes from people pushing commits, which no
+  # configuration file bounds, and clamping it to anything would be inventing a
+  # limit.
+  #
+  # The clamp is expected to be quiet. Real demand is measured from jobs Mergify
+  # has already launched, and Mergify launches at most what its own config
+  # allows, so `ci_queue_demand_clamped` should sit at zero — it is a bound
+  # against a fault (a mislabelled workflow flooding the queue pool, a queue
+  # config narrowed while runs are in flight), not a routine throttle. It is
+  # published rather than logged because a bound that never reports is a bound
+  # nobody can tell is working.
+  local demand_published="$DEMAND_TOTAL" queue_clamped=0
+  local q_hosts q_want q_checks q_batch q_reason
+  if [ "$POOL_ROLE" = "merge-queue" ]; then
+    read -r q_hosts q_want q_checks q_batch q_reason \
+      <<<"$(mergify_capacity "$QUEUE_FACTS" "$SLOTS" "$MAX_HOSTS" "$POOL_JOBS_PER_CHECK")"
+
+    # A ceiling of zero is NOT a ceiling of zero. Both fail-open branches echo
+    # `max_hosts` back, so a pool whose table row carries 0 — "no configured
+    # ceiling" — would arrive here asking for demand to be clamped to nothing,
+    # and clamping demand to nothing is precisely the silent throttle this whole
+    # file exists to prevent. Zero means unbounded here, as it does everywhere
+    # else the pool table uses it, and unbounded publishes demand untouched.
+    local ceiling=$((q_hosts * SLOTS))
+    if [ "$ceiling" -gt 0 ] && [ "$demand_published" -gt "$ceiling" ]; then
+      queue_clamped=$((demand_published - ceiling))
+      demand_published=$ceiling
+    fi
+
+    # The sentence "your Terraform ceiling is now the bottleneck", said once per
+    # tick that it is true and with both numbers in it. This is the reported
+    # problem in its diagnosable form: the queue is configured to run more
+    # checks than the pool is allowed to grow for, and every check beyond the
+    # ceiling waits — pending, not failed, on a green-looking pull request.
+    if [ "$q_reason" = "capped-by-max-hosts" ]; then
+      log "merge-queue pool $POOL is capped: ${q_checks} parallel check(s) x ${POOL_JOBS_PER_CHECK} job(s) needs ${q_want} host(s), max_hosts is ${MAX_HOSTS} — raise max_hosts or lower max_parallel_checks"
+    fi
+
+    queue_series "ci_queue_capacity_hosts" "$q_hosts"
+    # Both numbers, always, because the gap between them IS the finding.
+    # `wanted > capacity` sustained is a pool to widen; they are equal on a
+    # healthy pool, which is what makes the alert a comparison rather than a
+    # threshold somebody has to pick per repository.
+    queue_series "ci_queue_capacity_wanted_hosts" "$q_want"
+    queue_series "ci_queue_parallel_checks" "$q_checks"
+    # Read, published, and deliberately not multiplied into the ceiling — a
+    # batch is validated as ONE speculative pull request. On the chart beside
+    # the two above it is what stops the next person deriving the ceiling from
+    # the depth of the queue instead. See mergify-capacity.sh.
+    queue_series "ci_queue_batch_size" "$q_batch"
+    queue_series "ci_queue_jobs_per_check" "$POOL_JOBS_PER_CHECK"
+    queue_series "ci_queue_demand_clamped" "$queue_clamped"
+    # An AGE, not a timestamp, and published even when the last read failed —
+    # that is the point of it. The rule fails open, so a controller that has
+    # lost access to the repository's configuration goes on enforcing the last
+    # ceiling it derived and looks entirely healthy; this is the only series
+    # that says how old that ceiling is. A value climbing past
+    # QUEUE_CONFIG_INTERVAL means the sweep is failing. `-1` is the distinct
+    # "never read at all", which a 0 would have hidden as the freshest possible
+    # answer — the worst place for an absence to imitate a success.
+    local config_age=-1
+    if [ "$QUEUE_CONFIG_AT" -gt 0 ]; then
+      config_age=$(( $(date +%s) - QUEUE_CONFIG_AT ))
+    fi
+    queue_series "ci_queue_config_age_seconds" "$config_age"
+  fi
+
+  queue_series "ci_demand" "$demand_published"
   # Deliberately a SEPARATE series and not part of ci_demand: the autoscaler
   # consumes ci_demand, and a pinned job cannot be served by the host it would
   # buy. Published so that "the pool looks idle" and "the pool is full of work
@@ -2649,12 +2858,27 @@ install_self() {
   mkdir -p "$STATE_DIR" /opt/ci-controller
   install -m 0755 "$0" "$SELF_INSTALL"
 
-  # jq is the only runtime dependency not in the base image. Installed here,
-  # once, on a 2-vCPU always-on VM — not in any build path.
-  command -v jq >/dev/null 2>&1 || {
+  # jq and a YAML reader are the runtime dependencies not in the base image.
+  # Installed here, once, on a 2-vCPU always-on VM — not in any build path.
+  #
+  # python3-yaml is for the Mergify configuration, and its absence is NOT fatal:
+  # the reader exits non-zero, the capacity rule fails open, and the merge-queue
+  # pool keeps the ceiling Terraform gave it. That is why one `apt-get install`
+  # names both — a failure to fetch the YAML package must not take jq with it,
+  # and a jq that is already present must not skip the YAML package. The `||
+  # true` keeps a controller booting on a box with no package mirror.
+  local want_pkgs=""
+  command -v jq >/dev/null 2>&1 || want_pkgs="$want_pkgs jq"
+  python3 -c 'import yaml' >/dev/null 2>&1 || want_pkgs="$want_pkgs python3-yaml"
+  if [ -n "$want_pkgs" ]; then
     apt-get update -qq >>"$LOG" 2>&1
-    apt-get install -y -qq jq >>"$LOG" 2>&1
-  }
+    # shellcheck disable=SC2086  # a deliberate word split: it is a package list
+    apt-get install -y -qq $want_pkgs >>"$LOG" 2>&1 || true
+    command -v jq >/dev/null 2>&1 \
+      || log "jq is still missing after install — the controller cannot parse any GitHub response and every tick will be blind"
+    python3 -c 'import yaml' >/dev/null 2>&1 \
+      || log "python3-yaml is still missing after install — merge-queue pools will keep their configured max_hosts instead of a ceiling derived from .mergify.yml"
+  fi
 
   cat >/etc/systemd/system/ci-controller.service <<EOF
 [Unit]
