@@ -383,7 +383,7 @@ mutate() {
     poolvars) sed -i "$expr" "$tmp/pool-vars.tf" ;;
   esac
   out=$(BAND_SELFTEST_CHILD=1 BAND_HOST_SH="$tmp/host.sh" BAND_NET_TF="$tmp/net.tf" BAND_POOL_TF="$tmp/pool.tf" BAND_NET_VARS="$tmp/net-vars.tf" BAND_POOL_VARS="$tmp/pool-vars.tf" bash "${BASH_SOURCE[0]}" 2>&1)
-  if [ -n "$out" ] && printf '%s' "$out" | grep -q FAIL; then
+  if [ -n "$out" ] && printf '%s' "$out" | grep -c FAIL >/dev/null; then
     ok "mutation caught: $label"
   else
     bad "mutation NOT caught: $label — the assertion for it passes on a file that breaks it"

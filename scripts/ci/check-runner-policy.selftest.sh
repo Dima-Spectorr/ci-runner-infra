@@ -112,7 +112,7 @@ mutate "the Windows label set widened to a second OS" \
 #    for exactly half the fleet and nothing would say which half.
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "the Windows label matched case-sensitively" \
-  's@grep -qiE "^(${WINDOWS_LABEL})$"@grep -qE "^(${WINDOWS_LABEL})$"@'
+  's@grep -ciE "^(${WINDOWS_LABEL})$"@grep -cE "^(${WINDOWS_LABEL})$"@'
 
 # 5-6. One half of the disjunction dropped. Distinct from cases 1-2: there the
 #      fact never arrives, here it arrives and is not read. Both halves matter

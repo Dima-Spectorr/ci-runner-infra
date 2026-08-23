@@ -213,13 +213,19 @@ def shell_functions(script):
     return set(FUNCDEF.findall(script))
 
 
-def leading_pipeline(text):
-    """(the leading pipeline, is its status the verdict?).
+def verdict_pipelines(text):
+    """Every pipeline on this line whose status is READ, in order.
 
     The verdict is the whole point of PFR3, so it is decided structurally rather
     than by keyword: a pipeline in an `if`/`elif`/`while`/`until` condition, or
     one whose status is consumed by a following `||`/`&&`. Quotes and `$( )` are
     tracked so an operator inside either is not read as the top-level one.
+
+    INSIDE A CONDITION, every element of an `&&`/`||` list is read, not just the
+    first: `if [ -n "$out" ] && printf '%s' "$out" | grep -q FAIL; then` is the
+    same inversion one segment further along, and looking only at the head of
+    the list is how it hides. Outside a condition the head is all that is
+    claimed, which is what keeps PFR3 disjoint from PFR1/PFR2.
     """
     s = text.strip()
     # `f() { printf ... | grep -q x || return 1; }` on one line is a whole
@@ -231,6 +237,7 @@ def leading_pipeline(text):
         s = VERDICT_HEAD.sub("", s, count=1)
     while s.startswith("!"):
         s = s[1:].lstrip()
+    segments, start = [], 0
     quote, depth, i = None, 0, 0
     while i < len(s):
         c = s[i]
@@ -251,11 +258,18 @@ def leading_pipeline(text):
                 # answer. This is the one place PFR3 and the PFR1/PFR2 `||`
                 # exemption disagree, and deliberately so: there, `||` means the
                 # author waived the status; here, it means the author READ it.
-                return s[:i].strip(), True
+                segments.append(s[start:i].strip())
+                if not verdict:
+                    return segments
+                start = i + 2
+                i += 2
+                continue
             if c == ";":
-                return s[:i].strip(), verdict
+                segments.append(s[start:i].strip())
+                return segments if verdict or len(segments) > 1 else []
         i += 1
-    return s.strip(), verdict
+    segments.append(s[start:].strip())
+    return segments if verdict or len(segments) > 1 else []
 
 
 def in_process_writer(segment, funcs):
@@ -279,17 +293,19 @@ def in_process_writer(segment, funcs):
 
 
 def verdict_reader(text, funcs):
-    """The early-exiting reader of a PFR3 pipeline, or None."""
-    pipeline, verdict = leading_pipeline(text)
-    if not verdict or "|" not in pipeline:
-        return None
-    parts = split_pipeline(pipeline)
-    if len(parts) < 2:
-        return None
-    name = reader_name(parts[-1])
-    if not name:
-        return None
-    return name if in_process_writer(parts[0], funcs) else None
+    """The early-exiting reader of a PFR3 pipeline on this line, or None."""
+    for pipeline in verdict_pipelines(text):
+        if "|" not in pipeline:
+            continue
+        parts = split_pipeline(pipeline)
+        if len(parts) < 2:
+            continue
+        name = reader_name(parts[-1])
+        if not name:
+            continue
+        if in_process_writer(parts[0], funcs):
+            return name
+    return None
 
 
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
@@ -713,6 +729,23 @@ SH
   case "$out" in
     *"file=bad.sh,line=3"*"[PFR3]"*) : ;;
     *) echo "::error::[PFR-SELFTEST] expected PFR3 at bad.sh line 3, got: $out" >&2; return 1 ;;
+  esac
+
+  # NOT ONLY THE HEAD OF THE LIST. A condition's `&&` list reads the status of
+  # every element, and a gate that inspects only the first one leaves the same
+  # inversion sitting one segment further along — which is exactly where it was
+  # found in shared-infra-band.selftest.sh.
+  cat >"$tmp/bad.sh" <<'SH'
+set -uo pipefail
+if [ -n "$out" ] && printf '%s' "$out" | grep -q FAIL; then :; fi
+SH
+  if out=$(scan "$tmp" 2>&1); then
+    echo "::error::[PFR-SELFTEST] the gate PASSED a verdict pipeline in the SECOND element of an && list" >&2
+    return 1
+  fi
+  case "$out" in
+    *"file=bad.sh,line=2"*"[PFR3]"*) : ;;
+    *) echo "::error::[PFR-SELFTEST] expected PFR3 at bad.sh line 2 for the && list, got: $out" >&2; return 1 ;;
   esac
 
   # The recommended fixes must both be silent, or the gate has no landing place:

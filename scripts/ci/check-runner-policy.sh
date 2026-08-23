@@ -772,7 +772,7 @@ check_file() {
   # …or reached from one. A callee declares only `workflow_call` and runs with
   # the caller's pull-request context, so judging it on its own triggers reads a
   # self-hosted job with no guard as unreachable by forks.
-  if [ "$has_pr" -eq 0 ] && printf '%s\n' "$REACHABLE_PR" | grep -qxF -- "$(abs_path "$file")"; then
+  if [ "$has_pr" -eq 0 ] && printf '%s\n' "$REACHABLE_PR" | grep -cxF -- "$(abs_path "$file")" >/dev/null; then
     has_pr=1
   fi
 
