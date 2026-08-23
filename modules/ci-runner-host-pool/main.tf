@@ -199,6 +199,10 @@ locals {
     file("${path.module}/scripts/pin-hold-decision.sh"),
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/watchdog-decision.sh"),
+    # The merge-queue pool's ceiling rule. On EVERY pool, like the two above:
+    # nothing calls it unless a pool's role is `merge-queue`, and shipping it
+    # selectively would make the controller a per-deployment variant.
+    file("${path.module}/scripts/mergify-capacity.sh"),
     # Ahead of the controller itself, and not merely by convention: the
     # controller calls pool_table_parse at FILE SCOPE, before its first tick,
     # to learn which pools it serves. Concatenated after, the call would run
