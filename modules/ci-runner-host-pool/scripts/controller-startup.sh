@@ -1362,6 +1362,7 @@ template_state() {
 classify_pinned() {
   DEMAND_PINNED=0
   PIN_ORPHANED=0
+  PIN_VANISHED=0
 
   [ -n "${PINNED_JOBS:-}" ] || return 0
 
@@ -1386,7 +1387,12 @@ classify_pinned() {
   # which is still pinned demand, because the job is still sitting there.
   local tried=" " gone=" "
   local now run status labels created age epoch verdict token code
+  local pin_host missing
   now=$(date +%s)
+
+  # The absence clock is refreshed BEFORE any verdict is asked for, so every job
+  # in this loop is judged against the same reading of the same tick.
+  refresh_host_liveness "$live" "$now" "$blind"
 
   while IFS=$(printf '\t') read -r run status labels created; do
     [ -n "$run" ] || continue
@@ -1399,8 +1405,18 @@ classify_pinned() {
       [ "$age" -lt 0 ] && age=0
     fi
 
+    # How long the pinned host has been missing, asked of the SAME rule that
+    # decides what a pin is — pin_host_of is rule 2, not a second reading of it.
+    # Empty for an unpinned job, for a job carrying two pins, and for a host
+    # this controller has never listed; all three mean "no absence clock", and
+    # the decision function is explicit about treating that as unknown rather
+    # than as zero.
+    pin_host=$(pin_host_of "$labels" "$RUNNER_MATCH_LABELS")
+    missing=""
+    [ -n "$pin_host" ] && missing=$(host_missing_seconds "$pin_host" "$now")
+
     verdict=$(pinned_job_decision "$status" "$labels" "$RUNNER_MATCH_LABELS" "$MIG_BASE" \
-      "$live" "$age" "$PIN_ORPHAN_GRACE")
+      "$live" "$age" "$PIN_ORPHAN_GRACE" "$missing")
 
     case "$verdict" in
       pinned:* | wait:*)
@@ -1409,7 +1425,29 @@ classify_pinned() {
         # "add a host" would buy a machine per tick that the job cannot use.
         DEMAND_PINNED=$((DEMAND_PINNED + 1))
         ;;
-      orphan:*)
+      orphan:* | vanished:*)
+        # `vanished` is `orphan` for a job that was RUNNING when its host went
+        # away, and the handling below is deliberately identical: the same
+        # cancel, the same per-run de-duplication, the same fail-safes. It is a
+        # separate verdict because it is a separate FAULT — a queued job
+        # outliving a scale-in can be nobody's mistake, while live work losing
+        # its host is the fleet's every time — and because it is the one that
+        # unblocks everything downstream. A cancelled run has a conclusion; a
+        # run whose host evaporated has none and never will, so whatever is
+        # waiting on that status waits out its own timeout instead. That is the
+        # 150 minutes a merge queue spends before dequeuing a green pull request
+        # for a reason that names nothing.
+        #
+        # Counted here, per JOB, and before every guard below — including the
+        # de-duplication that makes ci_pinned_runs_cancelled per-RUN. The two
+        # series answer different questions on purpose: that one counts the
+        # action taken, this one counts the fault observed, and a matrix of
+        # eight jobs on one dead host really is eight jobs that lost their host.
+        # It is also the only one of the two that survives a refused cancel,
+        # which is exactly the case where an operator needs to see the number.
+        case "$verdict" in
+          vanished:*) PIN_VANISHED=$((PIN_VANISHED + 1)) ;;
+        esac
         # The run id is interpolated into an API path, and everything else on
         # this line is derived from a payload a pull request can influence. It
         # is an integer from GitHub or it is not used — a value carrying a slash
@@ -1597,6 +1635,82 @@ host_age_seconds() {
   first=$(cat "$f" 2>/dev/null)
   [ -n "$first" ] || { echo "$now" >"$f"; echo 0; return 0; }
   echo $((now - first))
+}
+
+# --- the absence ledger -------------------------------------------------------
+#
+# host_age_seconds above answers "how long have we known this host". This
+# answers the opposite and, for a pinned job, the only question that matters:
+# how long has the host been CONTINUOUSLY MISSING from the MIG's list.
+#
+# It exists because `age` — seconds since the job was created — is not evidence
+# about a host. A job that queued for twenty minutes and then lost its host has
+# already spent its whole grace allowance before the host went anywhere, so one
+# blipped listing was enough to cancel it. That was tolerable while only queued
+# jobs could be cancelled; it is not tolerable now that a RUNNING one can be,
+# which is why pinned_job_decision refuses the `vanished` verdict outright
+# unless this ledger can answer.
+#
+# Keyed by HOST and not by job, so it is independent of which pins exist this
+# tick and survives a job being recreated. One file per host, the same shape as
+# seen-/idle-/orphan-, and it is refreshed for every live host every tick — so
+# "the file is old" and "the host is missing" are the same statement.
+refresh_host_liveness() {
+  local live="$1" now="$2" blind="$3"
+  local f host
+
+  # A BLIND TICK RESETS EVERY CLOCK RATHER THAN ADVANCING THEM. An empty host
+  # list means the list call failed or the pool is genuinely at zero, and those
+  # are indistinguishable here — the same ambiguity classify_pinned refuses to
+  # act on. Letting the absence clocks run through it would mean a listing
+  # outage of one grace window handed every pinned host a cancellation the
+  # moment sight returned, which is the outage causing the damage rather than
+  # merely hiding it.
+  if [ "$blind" = 1 ]; then
+    for f in "$STATE_DIR"/absent-*; do
+      [ -e "$f" ] || continue
+      printf '%s' "$now" >"$f"
+    done
+    return 0
+  fi
+
+  for host in ${live//,/ }; do
+    printf '%s' "$now" >"$STATE_DIR/absent-$host"
+  done
+
+  # A host absent for a full day is not coming back and no job pinned to it has
+  # survived either — GitHub's own timeout is 24 hours. Pruning here rather than
+  # on a timer keeps a controller that runs for months from accumulating a file
+  # per host it has ever seen.
+  local stamp
+  for f in "$STATE_DIR"/absent-*; do
+    [ -e "$f" ] || continue
+    stamp=$(cat "$f" 2>/dev/null)
+    case "$stamp" in
+      "" | *[!0-9]*) rm -f "$f"; continue ;;
+    esac
+    [ $((now - stamp)) -gt 86400 ] && rm -f "$f"
+  done
+  return 0
+}
+
+# host_missing_seconds <host> <now>
+# Echoes the seconds since the host was last listed, or NOTHING when this
+# controller has never listed it. Empty is not zero and must not be read as
+# one: a host we have never seen is a host we can say nothing about, and
+# pinned_job_decision treats the two completely differently.
+host_missing_seconds() {
+  local host="$1" now="$2"
+  local f="$STATE_DIR/absent-$host"
+  local stamp
+  [ -f "$f" ] || return 0
+  stamp=$(cat "$f" 2>/dev/null)
+  case "$stamp" in
+    "" | *[!0-9]*) return 0 ;;
+  esac
+  local gap=$((now - stamp))
+  [ "$gap" -lt 0 ] && gap=0
+  printf '%s' "$gap"
 }
 
 # idle_seconds <host> <busy>
@@ -2940,6 +3054,7 @@ tick_pool() {
   # nothing can scale for" stop reading identically on a dashboard.
   queue_series "ci_demand_pinned" "${DEMAND_PINNED:-0}"
   queue_series "ci_pinned_runs_cancelled" "${PIN_ORPHANED:-0}"
+  queue_series "ci_pinned_jobs_host_vanished" "${PIN_VANISHED:-0}"
   queue_series "ci_demand_queued" "$DEMAND_QUEUED"
   # Queued jobs this pool has STOPPED answering for: older than DEMAND_MAX_AGE,
   # so they are not in ci_demand and not in ci_demand_wait_seconds either. This

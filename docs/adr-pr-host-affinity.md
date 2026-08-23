@@ -307,6 +307,10 @@ as a bounded, reportable fault: surfaced on the existing demand series, and the
 run failed within a small multiple of a tick rather than a day. Failing fast is
 the whole point; a re-run anchors somewhere alive.
 
+*(The word `queued` in that sentence was load-bearing and is no longer the whole
+rule — a job that was already RUNNING when its host went away is covered by
+§2.6b, under stricter conditions.)*
+
 **A queued pinned job is not the only way a run depends on a host.** A supported
 workflow finishes every Linux consumer and then spends a long tail in the
 unpinned Windows job, still talking to the Linux stack across the band. If the
@@ -324,6 +328,73 @@ run is still in progress and whose hold has not lapsed, is the same bounded
 fault as above and takes the same exit. The cache entry is dropped when the run
 ends or the hold lapses, so it is bounded by the ceiling like everything else
 here.
+
+### 2.6b The same host, but the job was already running — and then nothing is red at all
+
+§2.6 as originally shipped looked only at **queued** pinned jobs, and the
+controller's rule said so in as many words: anything not `queued` returned "in
+flight" and was never examined again, on the reasoning that a running job *has*
+a host and a MIG listing that lags a boot is not evidence to cancel on.
+
+The first half of that is only true while the host exists. When a slot dies
+holding a job — a host deleted under it, an agent that stops answering, a slot
+poisoned mid-run — GitHub leaves the job `in_progress` with nothing behind it,
+and the check run reaches **no conclusion at all**: not success, not failure,
+not cancelled, until GitHub's own 24-hour timeout.
+
+That is a strictly worse failure than the queued one §2.6 was written for, and
+it is worse in a way that is easy to miss. A queued pinned job at least sits
+visibly in a queue. A job in this state produces *no signal*: nothing is red,
+nothing is queued, the pool reports healthy, and the run simply never finishes.
+Everything downstream then waits out **its own** timeout instead of reacting to
+a result — and a merge queue is the expensive case, because it does not read a
+missing status as a failure. It reads it as "still checking" and holds the entry
+for its full window before dequeuing on a timeout that names no cause. Measured
+on a consumer repository on 2026-08-23, that is 150 minutes spent on a pull
+request whose own CI had been green for hours, and the dequeue message blames
+nothing an author can act on.
+
+So the detector now asks the liveness question of a running job too, and a job
+whose host is gone is cancelled — which is the point. **A cancelled run has a
+conclusion; a run whose host evaporated has none and never will.** The fix for
+"the queue never got a status" is to make the job report.
+
+**Cancelling live work is the most expensive mistake this detector can make, so
+it is fenced harder than the queued case, by two clocks that must both run out.**
+
+The clock §2.6 already had is the job's age, measured from its creation. That is
+not evidence about a *host*: a job that queued for twenty minutes and then lost
+its host has already spent its whole grace allowance before the host went
+anywhere, so a single blipped MIG listing was enough to cancel it. Tolerable
+when the cost was a re-run of something that had not started; not tolerable for
+work in progress.
+
+The second clock is an **absence ledger** in the controller's state — one file
+per host, refreshed every tick for every live host, so "the file is old" and
+"the host is missing" are the same statement. The effective clock is the smaller
+of the two, which is exactly "both have run out", and three fail-safes sit
+around it:
+
+* **The absence clock is required for a running job.** Without a ledger there is
+  no `vanished` verdict at all, only the old count-it-and-say-nothing. A caller
+  that cannot answer "how long has that host been gone" does not get to cancel
+  live work.
+* **A tick with no host list resets every clock rather than advancing them.** An
+  empty list means the list call failed or the pool is genuinely at zero, and
+  those are indistinguishable — the same ambiguity §2.6 already refuses to act
+  on. Letting the clocks run through a listing outage would mean the outage
+  *caused* the damage rather than merely hiding it.
+* **The pool bound and the two-pin rule still come first**, unchanged. A
+  controller never cancels over a host it does not own.
+
+The verdict is separate from §2.6's (`vanished` rather than `orphan`) and so is
+its series, `ci_pinned_jobs_host_vanished` — counted per **job** and before the
+per-run de-duplication, because a matrix of eight jobs on one dead host really
+is eight jobs that lost their host, and because it survives a refused cancel,
+which is the case where an operator most needs the number. It is the only series
+the controller publishes that reports a job producing no signal whatsoever, so a
+non-zero reading is never routine tidying: it is live work that lost its
+machine, and sustained non-zero is a slot-health problem.
 
 ### 2.4b `host-` is a reserved label prefix
 

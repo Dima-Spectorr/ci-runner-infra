@@ -114,6 +114,22 @@ output "metric_names" {
       # are being replaced underneath live runs — recycling too aggressively, or
       # preemption — not that the cancel logic is working hard.
       "ci_pinned_runs_cancelled",
+      # Jobs found RUNNING on a host that had gone. Per JOB and before any
+      # de-duplication, unlike the per-RUN series above, and it survives a
+      # refused cancel — which is the case where the number matters most.
+      #
+      # It is the only series in this list that reports a job which was
+      # producing NO SIGNAL AT ALL. A slot that dies holding a job leaves the
+      # check run `in_progress` at GitHub with nothing behind it: no success, no
+      # failure, no cancellation, until GitHub's own 24-hour timeout. Everything
+      # downstream then waits out ITS timeout instead — a merge queue reads a
+      # missing status as "still checking" and holds the entry for its full
+      # window before dequeuing on a timeout that names no cause.
+      #
+      # So a non-zero here is never "the controller is tidying up". It is live
+      # work that lost its machine, and sustained non-zero is a slot-health
+      # problem being reported by the only layer positioned to notice.
+      "ci_pinned_jobs_host_vanished",
       # Removals this pool decided on and then declined to carry out because the
       # host held a live pin hold. Scale-in deliberately deferred, not an error:
       # read alongside ci_demand_pinned, the two together are "the pool is

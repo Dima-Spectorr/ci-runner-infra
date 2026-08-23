@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Self-test for pinned_job_decision (modules/ci-runner-host-pool/scripts/pinned-job-decision.sh).
 #
-# Two of the five verdicts act on somebody's workflow run — `orphan` cancels it
-# — and the function is the only thing standing between a MIG listing that
-# blipped and a cancelled build. The cases below are written around that: most
-# of them assert what must NOT happen.
+# Two of the six verdicts act on somebody's workflow run — `orphan` cancels a
+# queued one and `vanished` cancels a RUNNING one — and the function is the only
+# thing standing between a MIG listing that blipped and a cancelled build. The
+# cases below are written around that: most of them assert what must NOT happen.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,7 +76,7 @@ expect orphan: "a pin that is a PREFIX of a live host is not that host" \
   queued "self-hosted,linux,host-ci-lin-a1" "$POOL" "$BASE" "$LIVE" 301 300
 
 # --- the guards that stop a wrong cancellation --------------------------------
-expect pinned: "an in-flight job is never orphaned, even against an empty host list" \
+expect pinned: "an in-flight job is never cancelled on age alone, whatever the host list says" \
   in_progress "self-hosted,linux,host-ci-lin-a1b2" "$POOL" "$BASE" "" 99999 300
 expect ignore: "a pin naming another pool's host is not ours to judge" \
   queued "self-hosted,linux,host-ci-win-9z8y" "$POOL" "$BASE" "$LIVE" 99999 300
@@ -98,6 +98,56 @@ expect orphan: "two host labels can never be a superset of any runner's — a wo
   queued "self-hosted,linux,host-ci-lin-a1b2,host-ci-lin-c3d4" "$POOL" "$BASE" "$LIVE" 0 300
 expect orphan: "and two pins are called immediately, not after a pointless grace wait" \
   queued "self-hosted,linux,host-ci-lin-a1b2,host-ci-lin-c3d4" "$POOL" "$BASE" "$LIVE" 0 99999
+
+# --- a host that went away UNDER a running job --------------------------------
+#
+# The state this rule was extended for. A slot that dies holding a job leaves
+# the job `in_progress` at GitHub with nothing behind it, and it reports no
+# conclusion at all — not success, not failure, not cancelled — until GitHub's
+# own 24-hour timeout. A merge queue does not read a missing status as a
+# problem; it reads it as "still checking" and holds the entry until ITS
+# timeout, which is how a green pull request waits two and a half hours to be
+# dequeued for a reason that names nothing.
+#
+# Cancelling live work is the most expensive mistake this function can make, so
+# it is fenced harder than the queued case: the absence clock is REQUIRED, and
+# both clocks have to run out.
+
+expect vanished: "past both clocks, a host gone from under a running job is cancelled" \
+  in_progress "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 99999 300 301
+
+expect pinned: "but never on age alone — no ledger, no vanished verdict, ever" \
+  in_progress "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 99999 300
+
+expect wait: "a host absent for one tick is a blip, not a dead slot" \
+  in_progress "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 99999 300 30
+
+expect wait: "and at exactly the grace it still resolves in favour of the run" \
+  in_progress "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 99999 300 300
+
+expect wait: "an unreadable absence clock waits, it does not error the tick" \
+  in_progress "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 99999 300 abc
+
+expect pinned: "a live host is live however long the ledger claims — liveness comes first" \
+  in_progress "self-hosted,linux,host-ci-lin-a1b2" "$POOL" "$BASE" "$LIVE" 99999 300 99999
+
+expect ignore: "and the pool bound still comes first: another pool's host is not ours to cancel" \
+  in_progress "self-hosted,linux,host-ci-win-9z8y" "$POOL" "$BASE" "$LIVE" 99999 300 99999
+
+# BOTH clocks, which is the whole point of there being two. A job created two
+# minutes ago whose host has somehow been absent for an hour has not yet earned
+# a cancellation on its own age — the smaller clock governs.
+expect wait: "a young job is not cancelled because its host has a long absence record" \
+  in_progress "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 120 300 99999
+
+# The queued path keeps its second clock too, and gains the tolerance it never
+# had: a job that spent twenty minutes in a queue used to be cancellable by a
+# single blipped listing, because `age` had already run out before the host went
+# anywhere.
+expect wait: "a long-queued job survives one blipped listing" \
+  queued "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 99999 300 30
+expect orphan: "and is still orphaned once the host has really been gone" \
+  queued "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 99999 300 301
 
 # --- the trap the implementation must not fall into ---------------------------
 # `local IFS=,` + `unset IFS` unshadows the caller's IFS instead of restoring the

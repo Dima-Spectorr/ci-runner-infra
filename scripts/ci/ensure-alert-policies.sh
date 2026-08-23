@@ -103,7 +103,7 @@ g() {
 # transport for channels and policies removes the surprise install dependency
 # and makes every call in this script fail the same way when auth is wrong.
 # Minted once, not per call. There are now upwards of twenty API calls in a full
-# run (ten policies, fourteen descriptors, two listings), and `gcloud auth
+# run (thirteen policies, eighteen descriptors, two listings), and `gcloud auth
 # print-access-token` is a Python process launch each time — on a machine behind
 # the corporate proxy that was the dominant cost of the run and, worse, twenty
 # more chances to fail on a network blip in the middle of provisioning. An
@@ -155,7 +155,7 @@ mon() {
 # The two listings below need `displayName<TAB>name` pairs out of a JSON page.
 # Named rather than inlined twice, and fail-closed: a missing python3 must stop
 # the script, not read as "no channels and no policies exist" — which would
-# create a duplicate channel and a second copy of all nine policies.
+# create a duplicate channel and a second copy of all thirteen policies.
 json_pairs() {  # <collection key> <name field> — reads $tmp/api.out
   command -v python3 >/dev/null 2>&1 || {
     echo "python3 is required to read the Monitoring API response" >&2; return 1; }
@@ -219,7 +219,7 @@ else
   echo "channel exists: $channel"
 fi
 
-# ── the nine policies ────────────────────────────────────────────────────────
+# ── the thirteen policies ────────────────────────────────────────────────────────
 # `duration` is what stops each of these paging on a blip, and every controller
 # threshold below is deliberately longer than one controller tick.
 #
@@ -365,6 +365,18 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    hostvanished) cat <<EOF
+{ "displayName": "CI runners / a host went away under a running job",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "A job was found RUNNING on a host that no longer exists. The controller cancels the run so it reports something, and this counts the jobs it found.\n\nWhy it is worth a page rather than a line in a log: a slot that dies holding a job produces NO SIGNAL. GitHub leaves the check run \`in_progress\` with nothing behind it — not success, not failure, not cancelled — until its own 24-hour timeout. Nothing is red, nothing is queued, the pool reports healthy, and the job simply never finishes. Everything waiting on that status then waits out ITS timeout instead: a merge queue does not read a missing status as a failure, it reads it as 'still checking' and holds the entry for its full window before dequeuing on a timeout that names no cause. Measured on one repository, that is 150 minutes spent on a pull request whose own CI had been green for hours.\n\nSo the cancellation is the REMEDY, not the incident. The incident is upstream, and it is one of: a slot poisoned mid-run, an agent that stopped answering, host maintenance or an operator delete-instances against a busy host, or a MIG recreate. Grep 'went away under a running job' in the controller's syslog for the instance name, then look at that slot's history — a host that appears here repeatedly is a host to recycle, not a job to re-run.\n\nTwo clocks have to run out before anything is cancelled, and the absence clock is required: the controller refuses this verdict entirely unless it can say how long the host has been continuously missing from the MIG list, and a tick with no host list at all resets every clock rather than advancing it. A false positive here is live work thrown away, so the rule is deliberately slower than the queued-job equivalent.\n\nRead with max() across pools. Fires on any occurrence within the window — this is not a rate to tolerate." },
+  "conditions": [ { "displayName": "ci_pinned_jobs_host_vanished > 0 for 15m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "900s",
+      "filter": "metric.type=\"custom.googleapis.com/github/ci_pinned_jobs_host_vanished\" AND resource.type=\"generic_node\"",
+      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
     egressdenied) cat <<EOF
 { "displayName": "CI runners / egress refused",
   "combiner": "OR",
@@ -464,6 +476,7 @@ ensure_descriptor ci_slots_registered        "Slots whose runner agent answers, 
 ensure_descriptor ci_slots_missing           "Slots the pool was built with that no agent answers for. Non-zero is capacity that exists on paper only: a host that registered nothing, a host whose slot units died before the agent started, or a slot the host condemned for failing every job it claimed."
 ensure_descriptor ci_prs_green_and_unqueued "Open pull requests that are green and can never enter the merge queue, labelled by the entry condition they fail. A repository fact published under every pool label -- read with max(), never sum()."
 ensure_descriptor ci_parked_prs_skipped     "Pull requests the parking sweep did not examine. Non-zero makes ci_prs_green_and_unqueued a lower bound."
+ensure_descriptor ci_pinned_jobs_host_vanished "Jobs found RUNNING on a host that no longer exists, counted per job and before any per-run de-duplication. Such a job reports no conclusion at all until GitHub's 24-hour timeout, so everything waiting on its status - a merge queue above all - waits out its own timeout instead. Non-zero is live work that lost its machine; grep 'went away under a running job' for the instance."
 ensure_descriptor ci_parked_sweep_denied    "Parking sweeps GitHub refused (401/403/404). Non-zero means ci_prs_green_and_unqueued is inert rather than zero. Either call can be the refused one and they need different permissions - listing pull requests needs 'pull_requests: read', reading check runs needs 'checks: read' - and a bad App key or installation id reads the same, so grep 'parked sweep: DENIED' for which."
 # Published by the HOST once per boot, not by the controller per tick. Declared
 # here for the same reason as the rest — a pool that has never booted a host
@@ -485,7 +498,7 @@ pl_status="$(mon GET 'alertPolicies?pageSize=1000')"
   sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
 existing="$(json_pairs alertPolicies displayName)"
 
-for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied egressdenied; do
+for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied hostvanished egressdenied; do
   policy_json "$key" >"$tmp/p.json"
   # Neither of these ends in `| head -1`, and that is deliberate. This script
   # runs `set -euo pipefail`; under both options a reader that stops early sends
