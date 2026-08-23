@@ -274,7 +274,20 @@ here does not produce an error you can read; it produces a pull request that
 appears to hang. Register the labels the workflows already use and no workflow
 edit is needed at all.
 
-The controller counts demand for those same labels. Labels that no workflow asks
+**Three of those labels are not yours to register.** The agent adds
+`self-hosted`, the OS (`Linux` or `Windows`) and the architecture (`X64`) by
+itself; GitHub marks them `read-only` and no `--labels` argument creates or
+removes them. So `runner_labels` in the example above is `gcp, <Repo>` — the
+module prepends `self-hosted` and the pool name, and the OS comes from
+`host_os`. Listing `linux` yourself is not an error, only a duplicate.
+
+Case is not yours either: GitHub routes case-insensitively, so a workflow saying
+`linux` reaches an agent registering `Linux`. The controller folds both sides
+before it counts, which it did not always do: every pool in the fleet reported
+0 demand and never scaled out until #284, because the configured list had no OS
+label in it and every workflow asked for one.
+
+The controller counts demand against that same set. Labels that no workflow asks
 for produce a pool that never scales out; labels asked for but never registered
 produce jobs that never start.
 
@@ -689,7 +702,7 @@ it as a broken image.
 | jobs queue forever, no error | `runner_labels` vs `runs-on` (§2) |
 | hosts run, zero slots registered | `/var/log/ci-host.log` — the fail-closed guards (§5) |
 | pool never scales in | the IAP firewall tag: the drain proves a host idle over IAP-SSH, and a host outside the rule fails that probe |
-| pool never scales out | the controller's demand labels, and `max_hosts` |
+| pool never scales out | `ci_demand` on the pool. A flat 0 with jobs queued is a label-set mismatch, not a quiet fleet — the controller matches the configured labels PLUS the agent's read-only three (§2), folded. `ci_demand` non-zero and hosts flat is `max_hosts`, or an expired queue: check `ci_demand_expired` |
 | first host never registers | the App key secret version (§3) |
 | a Windows job fails at "Initialize containers" | `container:`/`services:` on a Windows pool — there is no container runtime. `check-runner-policy.sh` (`RUNNER8`) catches this in your own CI |
 | a Windows host registers, reboots, and never comes back | expected after the registration token expires — the MIG replaces it at `register_grace_seconds` (see "A rebooted Windows host comes back dead") |

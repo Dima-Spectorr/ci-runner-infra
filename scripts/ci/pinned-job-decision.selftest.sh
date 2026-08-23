@@ -170,5 +170,39 @@ src_has "the pin filter subtracts every label the pool table knows" '- $known_la
 src_has "and that set is the union over the pool table" '([ $pools | to_entries[] | .value[] ] | unique) as $known_labels'
 src_has "a pinned record falls back to started_at when created_at is absent" '(.created_at // .started_at // "")'
 
+# --- case, which nobody in the pipeline controls ------------------------------
+#
+# GitHub dispatches a job case-insensitively; every membership test in this
+# function is a comma-fenced `case`, which is exact. Unfolded, a workflow saying
+# `linux` against agents registering `Linux` falls out at rule 3 as another
+# pool's job — and then a job pinned to a host THIS pool owns is neither counted
+# as work in flight nor ever orphaned when its host dies: it waits out GitHub's
+# 24 hours in silence, on a controller reporting perfect health. That is not a
+# hypothetical spelling; it is what every workflow in this fleet writes, against
+# a label the agent supplies itself and always capitalises.
+#
+# The pool side is folded here too, so the caller may hand this function the
+# agent's own spelling without the verdict depending on which one it picked.
+POOL_CASED="self-hosted,Linux,gcp,Repo,X64"
+expect demand: "the workflow's lowercase OS label against the agent's capital one" \
+  queued "self-hosted,linux,gcp,Repo" "$POOL_CASED" "$BASE" "$LIVE" 0 300
+expect demand: "and shouted, because GitHub does not care and neither may we" \
+  queued "SELF-HOSTED,LINUX,X64" "$POOL_CASED" "$BASE" "$LIVE" 0 300
+expect pinned: "a pin is found on a folded label too, so a live host is seen as live" \
+  queued "self-hosted,LINUX,HOST-CI-LIN-A1B2" "$POOL_CASED" "$BASE" "$LIVE" 0 300
+expect orphan: "and a dead pin is still cancelled rather than left to time out" \
+  queued "self-hosted,LINUX,HOST-CI-LIN-DEAD" "$POOL_CASED" "$BASE" "$LIVE" 99999 300
+# Folding must not turn the subset test into a wildcard: a foreign label is
+# still foreign whatever case it arrives in.
+expect ignore: "a Windows job is not a Linux pool's, in any case" \
+  queued "self-hosted,WINDOWS" "$POOL_CASED" "$BASE" "$LIVE" 0 300
+
+# The cases above prove the function folds. This proves the CONTROLLER hands it
+# the right set to fold: the configured list alone is missing the three labels
+# the agent registers itself, and every real workflow names one of them.
+# shellcheck disable=SC2016  # matching shell source text literally, on purpose.
+src_has "the controller passes the set its agents answer to, not the configured one" \
+  'pinned_job_decision "$status" "$labels" "$RUNNER_MATCH_LABELS"'
+
 [ "$fail" = 0 ] && printf '\npinned-job-decision: all cases pass\n'
 exit "$fail"

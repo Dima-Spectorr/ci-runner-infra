@@ -39,8 +39,13 @@
 #
 #   job_status      : "queued" | "in_progress" per the GitHub API.
 #   job_labels_csv  : the job's `runs-on`, comma-separated.
-#   pool_labels_csv : ci-runner-labels — what this pool's agents register
-#                     BEFORE the per-host affinity label is appended at boot.
+#   pool_labels_csv : everything this pool's agents register BEFORE the per-host
+#                     affinity label is appended at boot — ci-runner-labels PLUS
+#                     the runner's own read-only labels (`self-hosted`, the OS,
+#                     the architecture), which no `--labels` argument produces
+#                     and no workflow can tell apart from ours. Passing the
+#                     configured list alone reads every real workflow in this
+#                     fleet as another pool's. Case is irrelevant; see rule 0.
 #   base_instance_name : the MIG's baseInstanceName. Bounds every verdict that
 #                     acts to hosts THIS pool can create; see rule 5.
 #   live_hosts_csv  : instance names the MIG reports NOW (not labels — the
@@ -68,6 +73,20 @@ pinned_job_decision() {
   local live="${5:-}"
   local age="${6:-0}"
   local grace="${7:-300}"
+
+  # 0. BOTH SIDES ARE FOLDED BEFORE ANYTHING IS COMPARED. GitHub dispatches a
+  #    job case-insensitively — `linux`, `Linux` and `LINUX` are one label to
+  #    it — while every membership test below is a `case` on a comma-fenced
+  #    string, which is exact. Unfolded, a workflow saying `linux` against a
+  #    pool whose agents register `Linux` falls out at rule 3 as "not this
+  #    pool's", and a job pinned to a host this pool owns is then neither
+  #    counted nor ever orphaned: it waits out GitHub's 24 hours in silence.
+  #    That is not hypothetical — it is what every workflow in this fleet says.
+  #    Folded here rather than at the caller so the function cannot be handed a
+  #    set it will silently misread. Labels are ASCII by GitHub's own rule, so
+  #    `tr` is the whole of it; instance names are lowercase by GCE's.
+  job_labels=$(printf '%s' "$job_labels" | tr '[:upper:]' '[:lower:]')
+  pool_labels=$(printf '%s' "$pool_labels" | tr '[:upper:]' '[:lower:]')
 
   # 1. A job with no labels is a GitHub-hosted job. Not ours, and not a fault.
   [ -n "$job_labels" ] || { echo "ignore:job has no labels"; return 0; }
