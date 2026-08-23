@@ -29,6 +29,15 @@ posture you opt into knowingly. Read [Windows](#windows) before you declare one.
    for the account that owns the repo — both non-secret. The private key is not
    in any repository or state file; see step 3.
 
+   **Its permissions, who can grant each one, and how to tell whether a grant
+   actually landed are all in
+   [`github-app-permissions.md`](github-app-permissions.md)** — read it before
+   the first apply, not after the first silent failure. Every permission on
+   that list fails quietly, and a permission added to the App but not yet
+   accepted by the installation behaves exactly like one that was never
+   granted. Two entries are called out here because they are the ones an
+   onboarding reader is most likely to be missing:
+
    Its installation needs **`checks: read`** in addition to the permissions the
    runners themselves use. Nothing about job execution depends on it — without
    it the pool scales, registers and runs jobs exactly as it does with it. The
@@ -597,6 +606,12 @@ keeps its Terraform `max_hosts` instead of a derived ceiling — it fails open, 
 nothing breaks and nothing says so. The one signal is
 `ci_queue_config_age_seconds` climbing past 300; on a healthy controller it
 stays under it, and `-1` means the configuration has never been read at all.
+
+Granting it is two steps and the second is the one that gets missed: the App
+owner adds the permission, and then **every installation owner has to accept
+it**. Both steps, who can perform each, and how to verify from the controller
+rather than from a settings page:
+[`github-app-permissions.md`](github-app-permissions.md).
 
 ## Windows
 

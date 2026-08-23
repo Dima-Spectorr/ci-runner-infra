@@ -1130,13 +1130,14 @@ minutes. Only an already-inadmissible pull request costs a `check-runs` call,
 capped at 20 candidates and a 20-second budget per sweep; anything beyond that
 increments `ci_parked_prs_skipped` and is retried next sweep, never lost.
 
-**It needs `checks: read`** on the App installation — the only endpoint in the
-controller that does. See
+**It needs `pull_requests: read` for the list call and `checks: read` for the
+`check-runs` call** on the App installation — the latter is the only endpoint in
+the controller that needs it. See
 [onboarding-a-repository.md](onboarding-a-repository.md).
 
 **And the detector has its own detector, because it can fail the same way it
-was built to catch.** An installation without that permission fails every
-`check-runs` call and nothing else: the pool scales, registers and runs jobs
+was built to catch.** An installation missing either permission fails those
+calls and nothing else: the pool scales, registers and runs jobs
 normally, while `ci_prs_green_and_unqueued` publishes an unbroken zero — which
 is exactly what a repository with nothing parked publishes. `parked_denial` in
 the same rule file classifies the HTTP status (`401`, `403`, `404` are refusals;
