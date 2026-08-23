@@ -221,7 +221,7 @@ publish job**. Only the build half changes, and it changes because it has to:
         with:
           persist-credentials: false
           repository: Dima-Spectorr/ci-runner-infra
-          ref: <commit sha of the pinned tag>   # >= v5.35.0
+          ref: <commit sha of the pinned tag>   # >= v5.36.0
           path: .ci-runner-infra
 
       - name: Build the snapshot
