@@ -284,6 +284,32 @@ that image a real answer is separate work, not a line in this one.
   missing, and the pool answers a missing host by queueing jobs. An image with
   no `C:\ci-cache` is therefore a supported image and needs no contract bump.
 
+  **A Windows host hydrates from the snapshot, on the same terms as a Linux
+  one.** Before the master is scanned and sealed, phase 7 fetches this pool's
+  current snapshot and unpacks it over `C:\ci-cache` — same bucket, same
+  `cache/<pool>/` prefix, same read-only grant, same age/size/free-space bounds,
+  same one-budget-and-abandon rule, and the same verdict strings. Publishing is
+  the same separate identity; a Windows pool publishes with a `windows-latest`
+  job running `scripts/ci/build-cache-snapshot.ps1`
+  (`docs/publishing-a-cache-snapshot.md`). Ordering is the design: the hydrate
+  runs *before* `Protect-CacheMaster`, because what it writes is untrusted build
+  input and the scan-and-seal is the gate that has to judge it, not something it
+  arrives behind.
+
+  Two Windows-specific pieces have no Linux counterpart. The staging and
+  download trees are dropped through a reparse-point scan rather than
+  `Remove-Item -Recurse`, because Windows PowerShell 5.1 — which is what runs
+  the boot script — *follows a directory junction* on a recursive delete and
+  removes what it points at (PowerShell/PowerShell#621, fixed in 6.0, never
+  backported). And the master's own root is checked for hostility before
+  anything is moved onto it, since the recursive scan that covers the rest of
+  the tree runs afterwards, inside the seal.
+
+  **What the Windows side does not yet have is the telemetry.** The boot script
+  has no metric client at all, so the hydrate verdict is written to the boot log
+  and nowhere else: a Windows pool that has silently stopped hydrating looks
+  exactly like one that was never given a bucket. Tracked, not papered over.
+
   **The parent directories are SYSTEM's, not the slot's**, for the reason the
   Linux side states about `/var/lib/ci-cache/<idx>`: root never creates,
   renames or re-ACLs a name inside a directory an untrusted account controls.
@@ -614,7 +640,11 @@ because both are absent (not zero) when nothing finished.
 `ci_cache_hydrate_seconds`, `ci_cache_snapshot_age_hours`,
 `ci_cache_snapshot_bytes`, `ci_cache_dirs_hydrated`. These are the one group the
 **host** publishes rather than the controller, and once per boot rather than
-once per tick: the hydrate finishes before the runner agent registers, so the
+once per tick — and, today, only a **Linux** host: the Windows boot script
+hydrates on the same terms but has no metric client, so its verdict reaches the
+boot log and no series. Read these as covering the Linux pools only, and do not
+alert on their absence for a Windows one.
+The reason they are host-published: the hydrate finishes before the runner agent registers, so the
 controller never sees the machine it would be reporting on. Both accounts
 already hold `roles/monitoring.metricWriter`, so this costs no new grant on a
 machine that runs pull-request code.

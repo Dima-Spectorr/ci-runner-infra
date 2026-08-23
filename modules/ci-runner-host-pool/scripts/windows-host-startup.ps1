@@ -211,6 +211,66 @@ $script:CacheFreeFloorBytes = 25GB
 # happen.
 $script:CacheSeedBudgetSeconds = 420
 
+# --- the snapshot the image did not bake -------------------------------------
+#
+# The Windows half of host-startup.sh's hydrate_shared_cache(). The baked master
+# is as old as the image, and a pool only ever scales out under load -- so every
+# new host is handed the coldest cache in the fleet at exactly the moment the
+# queue that caused the scale-out needs it warmest. The snapshot closes that gap:
+# a regularly published tarball of this same tree, unpacked over the baked one at
+# boot, before anything is sealed or copied.
+#
+# THE SAME FOUR PROPERTIES THE LINUX SIDE IS BUILT ON, AND EACH IS LOAD-BEARING.
+#
+# 1. READ ONLY, ALWAYS. This host never writes to the bucket. Its service account
+#    holds `roles/storage.objectViewer` conditioned on this pool's own prefix --
+#    no create, no delete, no other pool -- and that is the whole reason a host
+#    may consume a snapshot at all. A host executes job code; a host that could
+#    publish would let whatever one job left in a cache become the starting cache
+#    of every later host in the pool, which is the cross-slot channel the
+#    per-slot copy closes, re-opened across hosts and across time.
+#
+# 2. BOUNDED, THEN ABANDONED. Everything here runs against one deadline. A slow
+#    or missing snapshot costs the FIRST job on this host a cold cache; a host
+#    that waits on it costs the pool a host, and the pool answers a missing host
+#    by queueing jobs. Every failure below is logged and survived.
+#
+# 3. AGED OUT HERE TOO. The bucket deletes snapshots at its own age bound and
+#    this refuses one older than its own limit. Two bounds because they fail
+#    differently: the bucket's holds if this script is broken, this one holds if
+#    the lifecycle rule is edited away in the console -- and lifecycle deletion is
+#    asynchronous, so the bucket's bound alone is soft by up to a day.
+#
+# 4. INSPECTED BEFORE IT IS TRUSTED. What arrives is untrusted build input that
+#    passed through no image-build gate, so it goes through Get-CacheHostileReason
+#    in a staging tree before anything reaches C:\ci-cache -- the same scan
+#    Protect-CacheMaster runs, on content no reviewed build step stands in front
+#    of.
+#
+# What it does NOT have is the Linux side's telemetry. host-startup.sh publishes
+# a verdict, an age, a size and a count to Cloud Monitoring; this file has no
+# metric client at all, so the verdict is logged and nothing else. That is a real
+# gap -- a Windows pool that stops hydrating looks exactly like one that never
+# had a bucket -- and it is tracked rather than papered over.
+$script:CacheStage = 'C:\ci-cache.staging'
+$script:CacheDownload = 'C:\ci-cache.download'
+
+# Defaults for a host booting from a template cut before these metadata keys
+# existed. The live values come from Terraform, which validates them.
+$script:CacheHydrateBudgetSeconds = 60
+$script:CacheSnapshotMaxAgeHours = 168
+$script:CacheSnapshotMaxBytes = 4GB
+
+# The pointer object is tiny by construction -- one snapshot name -- and this is
+# what stops a bucket that answers with something else from landing on the disk.
+$script:CachePointerMaxBytes = 65536
+
+# gzip expands by more than a thousandfold on the right input, so the bound on
+# the COMPRESSED archive bounds nothing about what it writes. Same shape as
+# host-startup.sh's cache_expand_bound: eight times the compressed size, with a
+# floor so a tiny archive still gets a workable allowance.
+$script:CacheExpandFloorBytes = 65536
+
 # The loopback port the broker answers on when metadata does not name one. The
 # same default as the Linux broker, because it is the same broker.
 $script:DefaultBrokerPort = 8081
@@ -2760,6 +2820,422 @@ function Invoke-BoundedNative {
     }
 }
 
+function Get-CacheHydrateBound {
+    <#
+      .SYNOPSIS
+        The hydrate's budget, age bound and size bound, clamped. Pure.
+      .DESCRIPTION
+        Defaults exist for the host that boots from an older instance template,
+        where the key is simply absent -- Terraform validates the live values.
+
+        THE CLAMPS ARE NOT THE SAME CHECK REPEATED. Metadata is not only written
+        by Terraform: anyone who can set an instance's metadata can set
+        `ci-cache-budget-seconds` to a number that holds registration open for as
+        long as they like, and a shape check alone accepts that number. So the
+        same ranges Terraform validates are applied again here, on the host, to
+        the value the host actually read.
+
+        Mirrors the clamps in host-startup.sh's hydrate_shared_cache_bounded(),
+        value for value; the two are meant to be diffable.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string] $Budget,
+        [AllowNull()][string] $MaxAgeHours,
+        [AllowNull()][string] $MaxBytes
+    )
+
+    $clamp = {
+        param($Text, $Default, $Low, $High)
+        # All-digits or the default. A negative number, a decimal and a word all
+        # arrive here as the same thing -- text from a metadata attribute -- and
+        # [int] would happily parse the first two into a bound nobody chose.
+        if ($Text -notmatch '^[0-9]+$') { return $Default }
+        # TryParse, NOT a cast. `[decimal] '9' * 40` overflows and THROWS, and
+        # this value came from instance metadata -- so the cast turns a junk
+        # attribute into an exception on the boot path of a phase whose entire
+        # contract is to fail open. Unparseable is out of range is the default.
+        $n = [decimal] 0
+        if (-not [decimal]::TryParse($Text, [ref] $n)) { return $Default }
+        if ($n -lt $Low) { return $Low }
+        if ($n -gt $High) { return $High }
+        return [long] $n
+    }
+
+    return [pscustomobject] @{
+        BudgetSeconds = [int] (& $clamp $Budget $script:CacheHydrateBudgetSeconds 10 300)
+        MaxAgeHours   = [int] (& $clamp $MaxAgeHours $script:CacheSnapshotMaxAgeHours 1 720)
+        MaxBytes      = [long] (& $clamp $MaxBytes $script:CacheSnapshotMaxBytes 1MB 32GB)
+    }
+}
+
+function Test-CacheSnapshotPointer {
+    <#
+      .SYNOPSIS
+        May this pointer value name an object in this pool's prefix? Pure.
+      .DESCRIPTION
+        A WHITELIST, NOT A SANITISER. The pointer is written by the trusted
+        publisher, but it is still the one input in the whole hydrate that names a
+        path, and this is what keeps it from naming anything but a snapshot in
+        this pool's own prefix: no `/`, so no traversal and no other pool; no
+        `..`; no leading dot; nothing outside a character set that needs no
+        URL encoding, which is also why Invoke-CacheFetch does not carry a general
+        percent-encoder and why its absence is not a gap.
+
+        The same predicate as the `*[!A-Za-z0-9._-]* | '' | .*` case in
+        host-startup.sh.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][string] $Name)
+    if ([string]::IsNullOrEmpty($Name)) { return $false }
+    if ($Name.StartsWith('.')) { return $false }
+    return ($Name -match '^[A-Za-z0-9._-]+$')
+}
+
+function Get-CacheExpandBound {
+    <#
+      .SYNOPSIS
+        How many decompressed bytes a snapshot of this compressed size may write. Pure.
+      .DESCRIPTION
+        The size bound and the free-space check both speak about the COMPRESSED
+        archive, and gzip expands by more than a thousandfold on the right input:
+        a 4 MiB tarball can fill the boot disk. This is the number the unpack is
+        allowed to write and the number the free-space check reserves -- the same
+        one, deliberately, because unpacking past what was reserved is the failure
+        the reservation exists to prevent.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][long] $CompressedBytes)
+    $bound = $CompressedBytes * 8
+    if ($bound -lt $script:CacheExpandFloorBytes) { return [long] $script:CacheExpandFloorBytes }
+    return [long] $bound
+}
+
+function Get-CacheSnapshotRefusal {
+    <#
+      .SYNOPSIS
+        Why this snapshot must not be unpacked, or '' if it may be. Pure.
+      .DESCRIPTION
+        Age, size and free space, decided together and before a single byte of the
+        archive is downloaded. Pure so that the three bounds the whole layer rests
+        on are asserted by a test rather than by a host that has already
+        registered agents -- and so the refusal NAMES which bound it was, which is
+        the lesson the Linux scan had to be taught the expensive way.
+
+        Free space is reserved against Get-CacheExpandBound rather than against
+        the compressed size: filling the boot disk to warm a cache costs this host
+        every job it was about to run, which is a far worse trade than starting
+        cold.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $AgeHours,
+        [Parameter(Mandatory = $true)][long] $Bytes,
+        [Parameter(Mandatory = $true)][int] $MaxAgeHours,
+        [Parameter(Mandatory = $true)][long] $MaxBytes,
+        [Parameter(Mandatory = $true)][long] $FreeBytes
+    )
+
+    if ($AgeHours -ge $MaxAgeHours) { return "too-old" }
+    if ($Bytes -gt $MaxBytes) { return "too-big" }
+    # BOTH AT ONCE. The compressed archive stays in C:\ci-cache.download for the
+    # whole of the unpack -- it is what tar is reading -- so the disk has to hold
+    # the archive AND everything it expands to. Reserving only the expansion
+    # passed a 4 GB snapshot with 32 GB free and then needed 36 GB, which fills
+    # the boot volume of a host that was about to run jobs.
+    if ($FreeBytes -lt ((Get-CacheExpandBound -CompressedBytes $Bytes) + $Bytes)) { return "no-space" }
+    return ''
+}
+
+function Get-CacheMetadataResult {
+    <#
+      .SYNOPSIS
+        Read one metadata attribute WITHOUT failing the boot. Value plus reachability.
+      .DESCRIPTION
+        Get-MetadataValue calls Deny-Boot on anything that is not a 404, and that
+        is right for every attribute it reads: an unread ci-job-service-account
+        silently converts a broker pool into a no-broker pool. None of that
+        applies here. The cache layer fails OPEN by design -- a host with no
+        usable cache is a slow host, a host that refuses to register over a cache
+        problem is a missing host, and the pool answers a missing host by queueing
+        jobs. So this reader hands the failure back instead of taking the host
+        down with it.
+
+        `Unreachable` is not cosmetic. An unset `ci-cache-bucket` is the correct
+        steady state of a pool that never wanted this layer, and the alert on
+        hydrate failures excludes exactly that verdict. Reported the same way, a
+        metadata read that failed at boot would file itself into the silenced
+        bucket: a pool with a bucket configured, hydrating nothing, reporting the
+        verdict that means "nothing to do".
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $Path)
+    try {
+        # BOTH SHAPES, because this reader serves two kinds of attribute.
+        # Invoke-RestMethod deserializes by content type, so the plain-text
+        # attributes (`ci-cache-bucket` and friends) come back as strings and the
+        # service-account token comes back as an OBJECT. Casting that object to
+        # a string yields `@{access_token=...; expires_in=...}` -- which is not
+        # JSON, and a caller matching a JSON regex against it finds nothing and
+        # reports "no token" on a host whose token arrived perfectly. `Object` is
+        # the undamaged response; `Value` stays what every text caller expects.
+        $raw = Invoke-RestMethod `
+            -Uri "$script:MetadataRoot/$Path" `
+            -Headers @{ 'Metadata-Flavor' = 'Google' } `
+            -TimeoutSec $script:HttpTimeoutSeconds
+        return [pscustomobject] @{ Value = [string] $raw; Object = $raw; Unreachable = $false }
+    } catch {
+        $status = $null
+        if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+            $status = $_.Exception.Response.StatusCode
+        }
+        # A 404 is the attribute genuinely not being set. Everything else -- a DNS
+        # failure, a refused connection, a read timeout, all of which arrive with
+        # no response at all -- is the server not answering, and the two must not
+        # be spelled identically.
+        return [pscustomobject] @{
+            Value       = ''
+            Object      = $null
+            Unreachable = (-not (Test-MetadataAbsence -StatusCode $status))
+        }
+    }
+}
+
+function Invoke-CacheFetch {
+    <#
+      .SYNOPSIS
+        Download one object from this pool's prefix to a file. $true on success.
+      .DESCRIPTION
+        The Storage JSON API against a documented URL with the instance's own
+        token, for the reason host-startup.sh gives: no dependency on which gcloud
+        is on the image and no config directory left behind.
+
+        THE TOKEN NEVER REACHES A COMMAND LINE. On Linux this needed a `-K` file
+        descriptor, because `-H "Authorization: Bearer ..."` would put the host
+        identity in argv and /proc/<pid>/cmdline is world-readable. Here the
+        request is made in-process by this script, which is running as SYSTEM, so
+        no child process exists to carry it -- and that is a property to keep
+        rather than a coincidence to rely on: nothing in this function may become
+        a call to curl.exe or gsutil with the token in its arguments.
+
+        `MaxBytes` bounds the response BEFORE it is all on disk. Without it the
+        only bound on a response is the deadline, and C:\ is what fills. It is
+        enforced while copying rather than from Content-Length, which the server
+        supplies and this host does not control.
+
+        `Accept-Encoding: gzip` is not an optimisation. An object stored with
+        `Content-Encoding: gzip` is decompressively transcoded by the service
+        unless the client says it accepts gzip, and a transcoded response arrives
+        with no Content-Length and expanded past the size its metadata reported.
+        Asking for gzip means the bytes arrive exactly as stored. The header is
+        set by hand and AutomaticDecompression is deliberately NOT enabled, so
+        .NET does not undo it one layer lower.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Bucket,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $Prefix,
+        [Parameter(Mandatory = $true)][string] $Object,
+        [Parameter(Mandatory = $true)][string] $Destination,
+        [Parameter(Mandatory = $true)][int] $TimeoutSeconds,
+        [Parameter(Mandatory = $true)][string] $Token,
+        [string] $Query = '?alt=media',
+        [long] $MaxBytes = 65536
+    )
+
+    # A budget already spent is not a one-second budget. Every caller subtracts
+    # the elapsed time from the deadline, so this is where "the hydrate is out of
+    # time" turns into a refusal rather than into one more request.
+    if ($TimeoutSeconds -le 0) { return $false }
+
+    # Only `/` needs encoding -- see Test-CacheSnapshotPointer for why nothing
+    # else can be here.
+    $enc = ($Prefix + $Object) -replace '/', '%2F'
+    $uri = "https://storage.googleapis.com/storage/v1/b/$Bucket/o/$enc$Query"
+
+    # THE TOTAL, NOT EACH READ. `Timeout` bounds the connect and `ReadWriteTimeout`
+    # bounds one Read call, so a response that trickles a byte in just under the
+    # per-read limit is unbounded in aggregate -- and phase 7 runs BEFORE agent
+    # registration, so that is a host recycled for never registering rather than
+    # a slow download. Measure-CacheArchiveExpansion checks its deadline inside
+    # its loop for the same reason; this is that check, on the copy.
+    $copyDeadline = ([datetime]::UtcNow).AddSeconds($TimeoutSeconds)
+
+    $response = $null
+    $stream = $null
+    $file = $null
+    try {
+        $request = [System.Net.HttpWebRequest]::Create($uri)
+        $request.Method = 'GET'
+        $request.Timeout = $TimeoutSeconds * 1000
+        $request.ReadWriteTimeout = $TimeoutSeconds * 1000
+        $request.Headers.Add('Authorization', "Bearer $Token")
+        $request.Headers.Add('Accept-Encoding', 'gzip')
+        $response = $request.GetResponse()
+        $stream = $response.GetResponseStream()
+        $file = [System.IO.File]::Create($Destination)
+        $buffer = New-Object byte[] 65536
+        $total = [long] 0
+        while ($true) {
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { break }
+            $total += $read
+            if ([datetime]::UtcNow -gt $copyDeadline) {
+                throw "response did not finish inside $TimeoutSeconds seconds"
+            }
+            if ($total -gt $MaxBytes) {
+                # Not truncated and kept: a prefix of an archive is the shape of a
+                # partial hydrate, which is the one outcome worse than no hydrate.
+                throw "response exceeded $MaxBytes bytes"
+            }
+            $file.Write($buffer, 0, $read)
+        }
+        $file.Close(); $file = $null
+        return $true
+    } catch {
+        # The eight discards below are deliberate and the analyzer is right to
+        # make them say so. A Dispose that throws during cleanup would REPLACE
+        # the real failure with a cleanup failure, and on this function's paths
+        # it must not be logged at all: the exception carries the request URI,
+        # and the only Authorization header this host ever builds is on the
+        # request that produced it.
+        if ($file) { try { $file.Close() } catch { $null = $_ } }
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        return $false
+    } finally {
+        if ($file) { try { $file.Dispose() } catch { $null = $_ } }
+        if ($stream) { try { $stream.Dispose() } catch { $null = $_ } }
+        if ($response) { try { $response.Close() } catch { $null = $_ } }
+    }
+}
+
+function Measure-CacheArchiveExpansion {
+    <#
+      .SYNOPSIS
+        Decompressed size of a .tar.gz, stopped at Bound+1. -1 if it could not be read.
+      .DESCRIPTION
+        THE BOUND IS DECIDED BY COUNTING, AND THE UNPACKER'S STATUS IS ONLY THE
+        SECOND OPINION. tar exits 0 on a stream cut at a member boundary -- the
+        record's zero padding reads as an end-of-archive marker -- so a bound
+        enforced only by stopping the unpacker can leave this host with a PARTIAL
+        cache it believes is whole, after which the hostility scan passes on a
+        subset of what the snapshot carries. host-startup.sh had to learn this and
+        added the counting pass for it; this is the same pass.
+
+        Counting stops at Bound+1 rather than at the end, so an archive designed
+        to expand forever costs one comparison rather than a disk.
+
+        A read that could not finish returns -1 rather than a number, because a
+        number here is a claim that the archive was measured. The deadline is
+        checked inside the loop for the same reason the copy in Invoke-CacheFetch
+        is bounded inside its loop: a decompression bomb does not answer to a
+        connect timeout.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][long] $Bound,
+        [Parameter(Mandatory = $true)][datetime] $DeadlineUtc
+    )
+
+    # NOT $input: that is an automatic variable, and assigning to it inside a
+    # function replaces the pipeline enumerator PowerShell put there.
+    $raw = $null
+    $gzip = $null
+    try {
+        $raw = [System.IO.File]::OpenRead($Path)
+        $gzip = New-Object System.IO.Compression.GZipStream($raw, [System.IO.Compression.CompressionMode]::Decompress)
+        $buffer = New-Object byte[] 65536
+        $total = [long] 0
+        while ($true) {
+            $read = $gzip.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { break }
+            $total += $read
+            if ($total -gt $Bound) { return [long] ($Bound + 1) }
+            if ([datetime]::UtcNow -gt $DeadlineUtc) { return [long] (-1) }
+        }
+        return $total
+    } catch {
+        return [long] (-1)
+    } finally {
+        if ($gzip) { try { $gzip.Dispose() } catch { $null = $_ } }
+        if ($raw) { try { $raw.Dispose() } catch { $null = $_ } }
+    }
+}
+
+# Set only by Expand-CacheSnapshot, when a killed tar could not be confirmed
+# dead; read only by Remove-CacheTreeSafely. Script scope because the cleanup
+# runs in a `finally` several frames above, which the failing path has no way to
+# pass anything to.
+$script:CacheStageNotQuiesced = $false
+
+function Remove-CacheTreeSafely {
+    <#
+      .SYNOPSIS
+        Delete a cache tree, unless it cannot be shown to be safe to delete.
+      .DESCRIPTION
+        Windows PowerShell 5.1 -- which is what runs this file -- FOLLOWS a
+        directory junction on `Remove-Item -Recurse` and deletes what it POINTS AT
+        rather than the link (PowerShell/PowerShell#621, fixed in 6.0 and never
+        backported). Every tree this function is pointed at is either a staging
+        tree unpacked from a snapshot or a baked master directory moved aside, and
+        both are untrusted build input: `warm_cache_script` is arbitrary code the
+        consuming repository supplies, and the snapshot passed through no gate at
+        all. Aimed at C:\Windows\System32 that is a host this pool cannot recover,
+        executed by SYSTEM, from a cleanup path whose whole job is hygiene.
+
+        So the refusal is to delete at all. A stale tree left on disk costs disk
+        and is logged; the other branch costs the machine. The refusal is the same
+        one Invoke-Phase7DependencyCache already makes for a retired slot's cache
+        copy -- this is that rule, given a name, on the paths the hydrate adds.
+
+        A SCAN THAT COULD NOT FINISH IS NOT A CLEAN SCAN. The enumeration errors
+        are captured and any of them refuses: this is a proof of ABSENCE, and
+        `-ErrorAction SilentlyContinue` alone spells "there is nothing hostile
+        here" and "nobody read it" identically.
+
+        Get-ChildItem -Recurse does not descend a reparse point unless
+        -FollowSymlink is given, so the scan itself is safe on the tree it judges;
+        and it never returns the starting item, which is why the root is added by
+        hand -- a tree whose ROOT is a junction is exactly the case that matters.
+    #>
+    # ConfirmImpact stays Low deliberately. This runs unattended at boot, where
+    # $ConfirmPreference is High and nothing prompts -- the declaration is what
+    # lets -WhatIf report the delete instead of doing it. Raising the impact
+    # would turn a cleanup into a host that never registers.
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    # THE SCAN BELOW IS EVIDENCE ABOUT A TREE NOTHING IS WRITING. If a killed
+    # unpacker could not be confirmed dead, it can still create a junction
+    # between that scan and the delete, and no ordering closes that window --
+    # so the delete is given up rather than re-ordered.
+    if ($script:CacheStageNotQuiesced) {
+        Write-BootLog ("phase 7: leaving $Path in place -- an unpacker in it could not be confirmed " +
+            'stopped, and a recursive delete could follow a reparse point created after the scan')
+        return
+    }
+
+    $rootErrors = @()
+    $treeErrors = @()
+    $entries = @(Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue -ErrorVariable rootErrors) +
+        @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable treeErrors)
+    if ($rootErrors.Count -gt 0 -or $treeErrors.Count -gt 0) {
+        Write-BootLog ("phase 7: $Path is left on disk -- $($rootErrors.Count + $treeErrors.Count) entr(ies) " +
+            'could not be read, so it cannot be shown to be free of reparse points')
+        return
+    }
+    $reason = Get-CacheHostileReason -Entries $entries
+    if ($reason) {
+        Write-BootLog "phase 7: $Path is left on disk -- $reason, and a recursive delete would follow it"
+        return
+    }
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Remove-Item -Recurse')) { return }
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 function Protect-CacheMaster {
     <#
       .SYNOPSIS
@@ -2940,6 +3416,559 @@ function Get-CacheVolumeFreeByte {
     param([string] $Path = $script:CacheSlots)
     $qualifier = Split-Path -Qualifier $Path
     return [long] ([System.IO.DriveInfo]::new($qualifier + '\')).AvailableFreeSpace
+}
+
+function Expand-CacheSnapshot {
+    <#
+      .SYNOPSIS
+        Unpack a measured snapshot into the staging tree. $true on success.
+      .DESCRIPTION
+        `tar.exe` is bsdtar, in System32 on every Windows Server image this pool
+        builds from. It is called AFTER Measure-CacheArchiveExpansion has already
+        decided the archive is within its bound, so this step is not what enforces
+        the bound -- tar exits 0 on a stream cut at a member boundary, which is
+        exactly why the counting pass exists.
+
+        WHAT MUST NEVER BE ADDED TO THIS COMMAND LINE: `-P` / `--absolute-paths`.
+        The staging tree is what confines an adversarial archive, and it is tar's
+        DEFAULTS that confine it -- a leading `/` and a leading `../` are stripped,
+        and a member landing outside the extraction root is refused. `-P` turns
+        that off, and the scan afterwards only ever sees what stayed inside the
+        tree.
+
+        The deadline binds tar because a large archive is where the budget
+        actually goes. tar spawns nothing, which is what makes a plain wait-then-
+        kill sufficient here and is not true of the snapshot BUILD's install step
+        -- that one runs arbitrary repository code and needs a job object.
+
+        The process HANDLE is what is waited on and killed, never a pid looked up
+        again afterwards: holding the object is what stops Windows recycling the
+        number under this function.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Archive,
+        [Parameter(Mandatory = $true)][string] $Stage,
+        [Parameter(Mandatory = $true)][datetime] $DeadlineUtc
+    )
+
+    $seconds = [int] ([datetime]::UtcNow).Subtract($DeadlineUtc).Negate().TotalSeconds
+    if ($seconds -le 0) { return $false }
+
+    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+    if (-not (Test-Path -LiteralPath $tar)) {
+        Write-BootLog "phase 7: no $tar on this image -- a snapshot cannot be unpacked"
+        return $false
+    }
+
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath $tar `
+            -ArgumentList @('-x', '-z', '-f', $Archive, '-C', $Stage) `
+            -NoNewWindow -PassThru
+        if (-not $proc.WaitForExit($seconds * 1000)) {
+            # KILL IS A REQUEST, NOT AN EVENT. It returns as soon as the
+            # termination is queued, and returning here hands control to the
+            # caller's `finally`, which scans the staging tree and then
+            # recursively deletes what scanned clean -- while tar may still be
+            # writing into it. An archive member that is a reparse point, created
+            # in that window, is followed by 5.1's Remove-Item and deletes what it
+            # points at, as SYSTEM. So the exit is waited for; and if it cannot be
+            # confirmed, the tree is declared un-quiesced and left alone. A stale
+            # staging tree costs disk on an ephemeral host. The other branch costs
+            # the host.
+            try { $proc.Kill() } catch { $null = $_ }
+            if (-not $proc.WaitForExit(10000)) {
+                $script:CacheStageNotQuiesced = $true
+                Write-BootLog ('phase 7: the unpacker did not exit after being killed -- leaving the ' +
+                    'staging tree in place rather than deleting a tree something may still be writing')
+            }
+            return $false
+        }
+        return ($proc.ExitCode -eq 0)
+    } catch {
+        return $false
+    } finally {
+        if ($proc) { try { $proc.Dispose() } catch { $null = $_ } }
+    }
+}
+
+function Get-CacheStagedEntry {
+    <#
+      .SYNOPSIS
+        Every entry under a staged tree, with a deadline. Reports what it could
+        not read and whether it ran out of time.
+      .DESCRIPTION
+        WHY NOT `Get-ChildItem -Recurse`. One call, however long it takes: an
+        archive inside the size bound can still hold a very large number of very
+        small entries, and a filter driver can slow enumeration by an order of
+        magnitude. Phase 7 runs BEFORE agent registration, so an unbounded scan is
+        the advertised budget quietly not applying to the last step of the
+        sequence -- the same gap the download copy and the expansion measurement
+        each had to close inside their own loops.
+
+        So the walk is explicit and the deadline is checked once per directory.
+        `TimedOut` returns NO entries at all, deliberately: a partial listing is
+        the one shape a hostility scan must never be handed, because it is a proof
+        of absence and half a tree proves nothing about the other half.
+
+        A REPARSE POINT IS JUDGED, NEVER ENTERED. Get-ChildItem -Recurse does not
+        descend one unless asked, and the queue here does not either -- the entry
+        is returned so Get-CacheHostileReason can refuse the whole tree over it.
+
+        `Failed` counts what could not be read. An enumeration error is not an
+        empty directory, and reporting them identically is how a scan starts
+        saying "clean" about a tree nobody managed to look at.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][datetime] $DeadlineUtc
+    )
+
+    $entries = New-Object System.Collections.ArrayList
+    $failed = 0
+
+    $rootErrors = @()
+    foreach ($r in @(Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue -ErrorVariable rootErrors)) {
+        [void] $entries.Add($r)
+    }
+    $failed += $rootErrors.Count
+
+    $queue = New-Object System.Collections.Queue
+    [void] $queue.Enqueue($Path)
+    while ($queue.Count -gt 0) {
+        if ([datetime]::UtcNow -gt $DeadlineUtc) {
+            return [pscustomobject] @{ Entries = @(); Failed = $failed; TimedOut = $true }
+        }
+        $dir = $queue.Dequeue()
+        $dirErrors = @()
+        $kids = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue -ErrorVariable dirErrors)
+        $failed += $dirErrors.Count
+        foreach ($k in $kids) {
+            [void] $entries.Add($k)
+            if ($k.PSIsContainer -and -not ($k.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                [void] $queue.Enqueue($k.FullName)
+            }
+        }
+    }
+    return [pscustomobject] @{ Entries = $entries.ToArray(); Failed = $failed; TimedOut = $false }
+}
+
+function Update-CacheMasterFromStage {
+    <#
+      .SYNOPSIS
+        Move the staged tool directories into the master. Returns how many moved.
+      .DESCRIPTION
+        ONLY THE TOOL DIRECTORIES THIS HOST KNOWS ABOUT, BY NAME. A snapshot
+        cannot introduce a new top-level entry into the master: anything the
+        archive holds that is not in $script:CacheDirs is dropped with the staging
+        tree, so a name added to the publisher has to be added here -- and
+        reviewed -- before it can arrive.
+
+        A directory is REPLACED rather than merged. The snapshot is produced from
+        this same image, so it is a superset of what was baked; a merge would be
+        slower, would not be atomic, and would leave entries from an expired
+        snapshot alive in the master indefinitely, which is the age bound quietly
+        failing.
+
+        THE BAKED DIRECTORY IS MOVED ASIDE, NOT DELETED, and only dropped once its
+        replacement is in place. Deleting first is one failed rename away from a
+        host with neither copy: the snapshot path is allowed to leave the cache as
+        cold as it found it, never colder. A rename rather than a copy, because
+        both paths are on the same volume, so it costs nothing and cannot half
+        finish -- and nothing reads the master until Protect-CacheMaster runs a
+        few lines later in this same phase, so there is no reader to tear.
+
+        The aside copy is dropped through Remove-CacheTreeSafely: it is the BAKED
+        master, which `warm_cache_script` wrote, and Protect-CacheMaster has not
+        scanned it yet at this point in the phase.
+
+        A stale `.previous` is swept before the loop rather than inside it. A boot
+        that died between the aside-move and the replacement leaves one behind,
+        and a sweep that only ran for directories the NEXT snapshot happens to
+        ship would leave it there indefinitely -- a full duplicate cache tree that
+        Protect-CacheMaster then publishes read-and-execute to every slot.
+    #>
+    # Same reasoning as Remove-CacheTreeSafely: declared so -WhatIf is honest,
+    # Low so an unattended boot never stops to ask.
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
+    param(
+        [Parameter(Mandatory = $true)][string] $Stage,
+        [string] $Master = $script:CacheMaster
+    )
+
+    foreach ($stale in @(Get-ChildItem -LiteralPath $Master -Force -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\.[A-Za-z0-9._-]+\.previous$' })) {
+        Remove-CacheTreeSafely -Path $stale.FullName
+    }
+
+    $moved = 0
+    foreach ($dir in $script:CacheDirs) {
+        $source = Join-Path $Stage $dir
+        $staged = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
+        if (-not $staged) { continue }
+        # A DIRECTORY, OR NOTHING. Test-Path is true for a FILE of the same name,
+        # and a CACHE_PREPARE that deletes a pre-created tool directory and writes
+        # an ordinary file in its place gets that file moved over the baked tree.
+        # The damage is downstream: Initialize-SlotCache cannot copy from a file,
+        # and because the cache path now EXISTS it does not create the writable
+        # fallback either -- so every job on this host is handed cache environment
+        # variables pointing at a file and fails, where the whole contract of this
+        # phase is that the worst case is running cold.
+        if (-not $staged.PSIsContainer) {
+            Write-BootLog ("phase 7: the staged snapshot has $dir as a file rather than a directory -- " +
+                'leaving the baked one in place')
+            continue
+        }
+        # AN EMPTY DIRECTORY IS NOT A CACHE. The host pre-creates all of
+        # $script:CacheDirs at startup, so a snapshot built from a CACHE_PREPARE
+        # that only warmed npm still SHIPS an empty maven, nuget and go. Moving
+        # those over the baked ones costs this pool the cache its image built,
+        # and the verdict still says 'hydrated'. Replacement is only ever an
+        # improvement when there is something in the replacement.
+        if (-not (Get-ChildItem -LiteralPath $source -Force -ErrorAction SilentlyContinue |
+                    Select-Object -First 1)) {
+            continue
+        }
+        if (-not $PSCmdlet.ShouldProcess($dir, 'publish into the cache master')) { continue }
+        $target = Join-Path $Master $dir
+        $aside = Join-Path $Master ".$dir.previous"
+        # A SURVIVING ASIDE IS A REFUSAL, NOT A LEFTOVER. The sweep above drops
+        # stale `.previous` trees through Remove-CacheTreeSafely, which
+        # DELIBERATELY leaves one it cannot show to be safe -- a junction, or a
+        # tree it could not read to the end. `Move-Item -Force` onto an existing
+        # directory name does not replace that name, it moves the source INSIDE
+        # it, and inside a junction is wherever the junction points: the baked
+        # cache written to an arbitrary path as SYSTEM. Protect-CacheMaster a few
+        # lines later can refuse the result; it cannot take that write back. So a
+        # tool whose aside is still there keeps its baked cache instead.
+        if (Test-Path -LiteralPath $aside) {
+            Write-BootLog ("phase 7: $dir keeps its baked cache -- $aside survived the sweep, and " +
+                'moving the master onto a name this host could not clear is how a junction gets written through')
+            continue
+        }
+        if (Test-Path -LiteralPath $target) {
+            try {
+                Move-Item -LiteralPath $target -Destination $aside -Force -ErrorAction Stop
+            } catch {
+                # The baked copy is still in place and still usable. Leaving it is
+                # the whole point of moving aside rather than deleting.
+                continue
+            }
+        }
+        try {
+            Move-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
+            $moved++
+        } catch {
+            if (Test-Path -LiteralPath $aside) {
+                Move-Item -LiteralPath $aside -Destination $target -Force -ErrorAction SilentlyContinue
+            }
+            continue
+        }
+        Remove-CacheTreeSafely -Path $aside
+    }
+    return $moved
+}
+
+function Invoke-CacheHydrateBounded {
+    <#
+      .SYNOPSIS
+        Replace the baked master with the published snapshot. Returns a verdict.
+      .DESCRIPTION
+        Every return states a VERDICT and none of them throws. See the section
+        header above $script:CacheStage for the four properties this is built on.
+
+        The verdict strings are the same ones host-startup.sh publishes, so a
+        Linux pool and a Windows pool describe the same outcome the same way even
+        though only one of them has a metric to publish it to.
+    #>
+    [CmdletBinding()]
+    param([string] $Master = $script:CacheMaster)
+
+    # BEFORE THE FIRST READ, not after the last one. Five metadata attributes are
+    # read below, each with its own 10-second timeout, so a metadata server that
+    # answers slowly but inside those timeouts could spend most of a minute here
+    # -- and the budget then started from zero afterwards, which made a documented
+    # 60-second phase take nearly two minutes ahead of agent registration.
+    $started = [datetime]::UtcNow
+
+    $bucketRead = Get-CacheMetadataResult -Path 'instance/attributes/ci-cache-bucket'
+    if ([string]::IsNullOrEmpty($bucketRead.Value)) {
+        if ($bucketRead.Unreachable) {
+            Write-BootLog ('phase 7: metadata server unreachable -- cannot tell whether a snapshot ' +
+                'bucket is configured; this host runs on the cache its image baked')
+            return 'no-metadata-server'
+        }
+        Write-BootLog 'phase 7: no snapshot bucket configured -- this host runs on the cache its image baked'
+        return 'not-configured'
+    }
+    $bucket = $bucketRead.Value
+
+    # The prefix is what the read grant is CONDITIONED on, so an empty one is not
+    # a harmless default: it would send every request outside the condition, and
+    # the 403s would read in this log as "the snapshot is missing" rather than as
+    # a misconfigured pool.
+    $prefix = (Get-CacheMetadataResult -Path 'instance/attributes/ci-cache-prefix').Value
+    if (-not $prefix.EndsWith('/')) {
+        Write-BootLog "phase 7: the cache prefix is not a directory prefix -- skipping the hydrate"
+        return 'bad-prefix'
+    }
+
+    $bounds = Get-CacheHydrateBound `
+        -Budget (Get-CacheMetadataResult -Path 'instance/attributes/ci-cache-budget-seconds').Value `
+        -MaxAgeHours (Get-CacheMetadataResult -Path 'instance/attributes/ci-cache-max-age-hours').Value `
+        -MaxBytes (Get-CacheMetadataResult -Path 'instance/attributes/ci-cache-max-bytes').Value
+
+    $deadline = $started.AddSeconds($bounds.BudgetSeconds)
+    $left = { [int] ([datetime]::UtcNow).Subtract($deadline).Negate().TotalSeconds }
+
+    # The master has to be there to be replaced. Creating one here would hand this
+    # pool a cache tree the image never built and Protect-CacheMaster's own
+    # message about the image requirement would stop being true; the host runs
+    # cold instead, exactly as it does today.
+    if (-not (Test-Path -LiteralPath $Master)) {
+        Write-BootLog "phase 7: no $Master on this image -- there is nothing for a snapshot to replace"
+        return 'no-master'
+    }
+    # The ROOT only, and before anything is moved INTO it. A master that is itself
+    # a junction turns every move below into a write somewhere nobody chose. The
+    # recursive scan is Protect-CacheMaster's, a few lines later; this is the one
+    # question that has to be answered BEFORE the moves rather than after them.
+    $rootReason = Get-CacheHostileReason -Entries @(Get-Item -LiteralPath $Master -Force -ErrorAction SilentlyContinue)
+    if ($rootReason) {
+        Write-BootLog "phase 7: not hydrating $Master -- $rootReason"
+        return 'master-hostile'
+    }
+
+    # THE READS ABOVE ARE INSIDE THE BUDGET, AND THEY CAN SPEND IT. Five metadata
+    # attributes at ten seconds each, plus the token below, is a minute of fixed
+    # timeouts in front of a sixty-second phase; `& $left` bounds every FETCH
+    # after this point, but nothing bounded the token read itself. If the budget
+    # is already gone there is no snapshot this host can finish, so it says so
+    # rather than spending another ten seconds proving it.
+    if ((& $left) -le 0) {
+        Write-BootLog ("phase 7: the $($bounds.BudgetSeconds)s budget was spent reading cache " +
+            'metadata -- starting cold instead')
+        return 'budget-spent'
+    }
+
+    # THE PROPERTY, NOT A REGEX OVER THE STRINGIFIED OBJECT. Invoke-RestMethod
+    # has already parsed this response; `[string]` on the result gives
+    # `@{access_token=...}`, which no JSON pattern matches, so the regex form
+    # returned 'no-token' on every host and the whole pool quietly stayed on the
+    # baked cache. The broker readiness code a few hundred lines below reads the
+    # same endpoint the same way.
+    $tokenResult = Get-CacheMetadataResult -Path 'instance/service-accounts/default/token'
+    $token = ''
+    if ($tokenResult.Object -and $tokenResult.Object.access_token) {
+        $token = [string] $tokenResult.Object.access_token
+    }
+    if (-not $token) {
+        Write-BootLog 'phase 7: no instance token -- skipping the cache hydrate'
+        return 'no-token'
+    }
+
+    # Root-owned from creation, under a name no slot account can reach: SYSTEM is
+    # about to unpack an archive into it, and nothing else on this host may read,
+    # still less substitute, a name inside it. Both trees are removed through
+    # Remove-CacheTreeSafely on every path out of this function.
+    Remove-CacheTreeSafely -Path $script:CacheDownload
+    Remove-CacheTreeSafely -Path $script:CacheStage
+    if ((Test-Path -LiteralPath $script:CacheDownload) -or (Test-Path -LiteralPath $script:CacheStage)) {
+        Write-BootLog 'phase 7: a previous hydrate left a tree that cannot safely be removed -- skipping'
+        return 'no-scratch'
+    }
+    try {
+        New-Item -ItemType Directory -Force -Path $script:CacheDownload -ErrorAction Stop | Out-Null
+        New-Item -ItemType Directory -Force -Path $script:CacheStage -ErrorAction Stop | Out-Null
+        Protect-CiDirectory -Path $script:CacheDownload
+        Protect-CiDirectory -Path $script:CacheStage
+    } catch {
+        Write-BootLog "phase 7: could not create the hydrate scratch directories: $($_.Exception.Message)"
+        return 'no-scratch'
+    }
+
+    try {
+        $fetch = @{ Bucket = $bucket; Prefix = $prefix; Token = $token }
+
+        # The pointer names the current snapshot. It is a separate, tiny object
+        # because the snapshots themselves must never be overwritten: the bucket
+        # measures age per generation and an overwrite starts a new one at zero, so
+        # a snapshot key rewritten in place would never reach the age bound and
+        # never expire.
+        $pointerFile = Join-Path $script:CacheDownload 'current'
+        if (-not (Invoke-CacheFetch @fetch -Object 'current' -Destination $pointerFile `
+                    -TimeoutSeconds (& $left) -MaxBytes $script:CachePointerMaxBytes)) {
+            Write-BootLog 'phase 7: no cache snapshot published for this pool yet -- running on the baked cache'
+            return 'no-snapshot'
+        }
+        $snapshot = ''
+        $firstLine = @(Get-Content -LiteralPath $pointerFile -TotalCount 1 -ErrorAction SilentlyContinue)
+        if ($firstLine.Count -gt 0) { $snapshot = ([string] $firstLine[0]).Trim() }
+        if (-not (Test-CacheSnapshotPointer -Name $snapshot)) {
+            # The rejected name is NOT echoed. It is the one fully attacker-
+            # controlled string in this function, it has not been validated at the
+            # point this line runs, and this log is read in a terminal.
+            Write-BootLog ("phase 7: the cache pointer does not name a snapshot in this pool's prefix " +
+                "($($snapshot.Length) bytes) -- ignoring it")
+            return 'bad-pointer'
+        }
+
+        # Size and creation time from the SERVICE, not from the name: a timestamp
+        # encoded in an object name is written by whoever wrote the object, and the
+        # age bound is worth having only if it reads the one that cannot be
+        # backdated.
+        $metaFile = Join-Path $script:CacheDownload 'meta.json'
+        if (-not (Invoke-CacheFetch @fetch -Object $snapshot -Destination $metaFile `
+                    -TimeoutSeconds (& $left) -Query '?fields=timeCreated,size,generation' `
+                    -MaxBytes $script:CachePointerMaxBytes)) {
+            Write-BootLog ("phase 7: cache snapshot $snapshot is named by the pointer but could not be " +
+                'read -- running on the baked cache')
+            return 'unreadable'
+        }
+        $meta = $null
+        try { $meta = Get-Content -LiteralPath $metaFile -Raw | ConvertFrom-Json } catch { $meta = $null }
+        $created = [datetime]::MinValue
+        $size = [long] 0
+        $generation = ''
+        if ($meta) {
+            $generation = [string] $meta.generation
+            [void][long]::TryParse([string] $meta.size, [ref] $size)
+            [void][datetime]::TryParse([string] $meta.timeCreated, [cultureinfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor
+                [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref] $created)
+        }
+        if ($created -eq [datetime]::MinValue -or $size -le 0 -or $generation -notmatch '^[0-9]+$') {
+            Write-BootLog ("phase 7: cache snapshot $snapshot has no readable size, generation or " +
+                'creation time -- refusing it')
+            return 'no-metadata'
+        }
+
+        # FLOOR, not [int]'s banker's rounding: 167.6 hours became 168 and a
+        # snapshot inside a 168-hour bound was refused for being at it. The Linux
+        # half computes this with integer division and means the same thing.
+        $age = [int] [math]::Floor($started.Subtract($created).TotalHours)
+        $refusal = Get-CacheSnapshotRefusal -AgeHours $age -Bytes $size `
+            -MaxAgeHours $bounds.MaxAgeHours -MaxBytes $bounds.MaxBytes `
+            -FreeBytes (Get-CacheVolumeFreeByte -Path $Master)
+        if ($refusal) {
+            Write-BootLog ("phase 7: refusing cache snapshot $snapshot -- $refusal (${age}h old, $size bytes, " +
+                "bounds $($bounds.MaxAgeHours)h / $($bounds.MaxBytes) bytes); starting cold instead")
+            return $refusal
+        }
+
+        # THE GENERATION IS PINNED, so that what was measured is what is
+        # downloaded. Age, size and free space were all asserted against the
+        # metadata above; without pinning, the object could be replaced in between
+        # and every one of those bounds would have been checked against a
+        # generation that no longer exists. "Snapshots are written once" is the
+        # publisher's convention -- it is not a control this host can enforce, so
+        # this host does not rely on it.
+        $archive = Join-Path $script:CacheDownload 'snapshot.tar.gz'
+        if (-not (Invoke-CacheFetch @fetch -Object $snapshot -Destination $archive `
+                    -TimeoutSeconds (& $left) -Query "?alt=media&generation=$generation" -MaxBytes $size)) {
+            Write-BootLog ("phase 7: cache snapshot $snapshot did not download inside the " +
+                "$($bounds.BudgetSeconds)s budget -- starting cold instead")
+            return 'download-timeout'
+        }
+
+        $bound = Get-CacheExpandBound -CompressedBytes $size
+        $expanded = Measure-CacheArchiveExpansion -Path $archive -Bound $bound -DeadlineUtc $deadline
+        if ($expanded -lt 0) {
+            Write-BootLog ("phase 7: cache snapshot $snapshot could not be measured inside the " +
+                "$($bounds.BudgetSeconds)s budget -- starting cold rather than unpacking an archive " +
+                'nothing bounded')
+            return 'unpack-timeout'
+        }
+        if ($expanded -gt $bound) {
+            Write-BootLog ("phase 7: cache snapshot $snapshot expands past the $bound byte bound -- " +
+                'refusing it rather than unpacking part of it')
+            return 'too-big-expanded'
+        }
+        if (-not (Expand-CacheSnapshot -Archive $archive -Stage $script:CacheStage -DeadlineUtc $deadline)) {
+            Write-BootLog ("phase 7: cache snapshot $snapshot did not unpack inside the " +
+                "$($bounds.BudgetSeconds)s budget -- starting cold instead")
+            return 'unpack-timeout'
+        }
+
+        # THE SAME SCAN Protect-CacheMaster RUNS, on content that passed through no
+        # image build. A snapshot is the one way into this tree that no reviewed
+        # build step stands in front of, and this is where it is stopped -- in the
+        # staging tree, before a single directory reaches the master.
+        $scan = Get-CacheStagedEntry -Path $script:CacheStage -DeadlineUtc $deadline
+        if ($scan.TimedOut) {
+            Write-BootLog ("phase 7: the staged snapshot could not be scanned inside the " +
+                "$($bounds.BudgetSeconds)s budget -- starting cold rather than publishing a tree " +
+                'this host never finished reading')
+            return 'scan-timeout'
+        }
+        if ($scan.Failed -gt 0) {
+            Write-BootLog ("phase 7: could not read all of the staged snapshot " +
+                "($($scan.Failed) error(s)) -- it cannot be shown to be free of " +
+                'reparse points, so nothing from it reaches the master')
+            return 'scan-refused'
+        }
+        $reason = Get-CacheHostileReason -Entries $scan.Entries
+        if ($reason) {
+            Write-BootLog ("phase 7: cache snapshot $snapshot rejected by the same scan the image build " +
+                "runs -- $reason; starting cold instead")
+            return 'scan-refused'
+        }
+
+        # The scan finished in time; the moves are what is left, and they are
+        # renames within one volume. Starting them past the deadline would be the
+        # budget expiring between the last two statements of the phase.
+        if ([datetime]::UtcNow -gt $deadline) {
+            Write-BootLog ("phase 7: the $($bounds.BudgetSeconds)s budget ran out before the staged " +
+                'snapshot could be published -- starting cold instead')
+            return 'scan-timeout'
+        }
+        $moved = Update-CacheMasterFromStage -Stage $script:CacheStage -Master $Master
+        $took = [int] ([datetime]::UtcNow).Subtract($started).TotalSeconds
+        Write-BootLog ("phase 7: cache hydrated from $snapshot -- $moved tool cache(s), $size bytes, " +
+            "${age}h old, ${took}s of a $($bounds.BudgetSeconds)s budget")
+        if ($moved -eq 0) { return 'hydrated-nothing' }
+        return 'hydrated'
+    } finally {
+        # On EVERY path out, including the ones a later edit adds -- and through
+        # the scanning delete, because the staging tree holds an archive this host
+        # did not build.
+        Remove-CacheTreeSafely -Path $script:CacheDownload
+        Remove-CacheTreeSafely -Path $script:CacheStage
+    }
+}
+
+function Invoke-CacheHydrate {
+    <#
+      .SYNOPSIS
+        Run the hydrate and state its verdict, once, on every path out.
+      .DESCRIPTION
+        WHY THE VERDICT IS PUBLISHED HERE AND NOT AT THE RETURN THAT DECIDED IT.
+
+        The body has a dozen early returns and the layer fails open, so all but one
+        of them log a line and carry on. That is the diagnostic problem this
+        wrapper exists for: from outside, a pool whose snapshot expired, a pool
+        whose bucket was never configured and a pool whose every host times out on
+        the download are the same observable -- jobs that are slower than they
+        were, and nothing red anywhere. Each return states its verdict and this
+        publishes it, including for the returns a later edit adds.
+
+        It also catches. Invoke-Phase7DependencyCache runs under
+        $ErrorActionPreference = 'Stop' inside its own try/catch, and this is
+        deliberately a second one: an unexpected throw in the hydrate must cost
+        this host its cache, never its registration.
+    #>
+    [CmdletBinding()]
+    param([string] $Master = $script:CacheMaster)
+    $verdict = 'error'
+    try {
+        $verdict = Invoke-CacheHydrateBounded -Master $Master
+    } catch {
+        Write-BootLog "phase 7: the cache hydrate failed: $($_.Exception.Message)"
+    }
+    Write-BootLog "phase 7: cache hydrate verdict: $verdict"
+    return $verdict
 }
 
 function Initialize-SlotCache {
@@ -3155,6 +4184,17 @@ function Invoke-Phase7DependencyCache {
     $paths = @{}
     $startedUtc = [datetime]::UtcNow
     try {
+        # BEFORE THE SCAN AND THE SEAL, AND THAT ORDER IS THE WHOLE DESIGN. The
+        # snapshot is untrusted build input; Protect-CacheMaster is the gate that
+        # judges the master's contents and then applies an ACL to them. Hydrating
+        # afterwards would put content into a tree that had already been judged,
+        # already been sealed, and is about to be copied into every slot.
+        #
+        # Its verdict is not consulted: every one of them, including the ones that
+        # mean the master was left exactly as the image baked it, continues into
+        # the same scan and the same seal.
+        $null = Invoke-CacheHydrate
+
         $slotUsers = @($Provisioned | ForEach-Object { $_.User })
         if (-not (Protect-CacheMaster -SlotUsers $slotUsers -StartedUtc $startedUtc)) { return $paths }
 
