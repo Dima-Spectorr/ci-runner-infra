@@ -411,6 +411,16 @@ has_fail_closed_slot_reset() { # <file>
   matches "$reset" 'if \(-not \$proc\.WaitForExit\(\$TimeoutSeconds \* 1000\)\)' || return 1
   matches "$reset" '\$proc\.Kill\(\)' || return 1
 
+  # …and the RESTORE's bound fits inside the hook's wait, with the quiesce and
+  # the hive wait ahead of it. The loop is serial, so this number is not "how
+  # long this slot's reset may take", it is how long ANOTHER slot's gate sits
+  # behind it -- and a gate that gives up fails a job on a slot that is clean.
+  local copy_bound wait_bound
+  copy_bound=$(printf '%s\n' "$code" | sed -n 's|^\$script:SlotResetCopySeconds = \([0-9][0-9]*\)$|\1|p' | head -1)
+  wait_bound=$(printf '%s\n' "$code" | sed -n 's|^\$script:SlotResetWaitSeconds = \([0-9][0-9]*\)$|\1|p' | head -1)
+  [ -n "$copy_bound" ] && [ -n "$wait_bound" ] || return 1
+  [ "$((copy_bound + 60))" -lt "$wait_bound" ] || return 1
+
   # /MIR, because "nothing of the last job survives" is not a claim a copy that
   # only adds can support; /XJ so a junction a job planted is replaced rather
   # than followed out of the profile and mirrored over whatever it pointed at.
@@ -428,6 +438,13 @@ has_fail_closed_slot_reset() { # <file>
   # a SIBLING's directory would have it wipe a slot that is mid-job.
   matches "$reset" 'return \(\$parts\[-1\] -ceq "ci-s\$Index"\)' || return 1
   matches "$code" 'return \(\$parts\[-1\] -ceq \(Get-SlotUserName -Index \$Index\)\)' || return 1
+
+  # …and the poll looks only where a request can legitimately appear: depth 2,
+  # with the PARENT's name checked. A slot may create entries in its own request
+  # directory and nowhere else, and a directory it creates in there puts the
+  # contents at depth 3, out of the loop's reach.
+  matches "$reset" '\-Recurse -Depth 2' || return 1
+  matches "$reset" "Directory.Name -ceq 'request'" || return 1
 
   # The slot is the DIRECTORY the request appeared in. Nothing reads a request.
   matches "$code" 'if \(\$parts\[-2\] -cne .request.\) \{ return .. \}' || return 1
@@ -1475,6 +1492,9 @@ mutate "the mirror downgraded to a copy that only adds" \
 mutate "the mirror's deadline observed and not acted on" \
   's|if (-not \$proc.WaitForExit(\$TimeoutSeconds \* 1000)) {|if ($false) {|' \
   has_fail_closed_slot_reset
+mutate "the restore given the boot capture's budget, which outlasts the hook's wait" \
+  's|^\$script:SlotResetCopySeconds = 120$|$script:SlotResetCopySeconds = 600|' \
+  has_fail_closed_slot_reset
 mutate "the bounded mirror handed back to the call operator" \
   's|\$proc = Start-Process -FilePath .robocopy.exe. -PassThru -NoNewWindow|$null = \& robocopy.exe $Source $Destination|' \
   has_fail_closed_slot_reset
@@ -1582,6 +1602,9 @@ mutate "the not-a-slot-profile refusal removed" \
   has_fail_closed_slot_reset
 mutate "the refusal widened from this slot to any slot" \
   's|\$parts\[-1\] -ceq "ci-s\$Index"|$parts[-1] -cmatch "^ci-s[0-9]+$"|' \
+  has_fail_closed_slot_reset
+mutate "the request poll widened past the request directories" \
+  's|-File -Recurse -Depth 2 `|-File -Recurse `|' \
   has_fail_closed_slot_reset
 
 # 6. OBLIGATION (a): the one read becomes a per-slot read, in both spellings.

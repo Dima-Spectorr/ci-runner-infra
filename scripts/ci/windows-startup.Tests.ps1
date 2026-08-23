@@ -782,8 +782,13 @@ Describe 'slot reset service body' {
         $script:Reset | Should -Not -Match '& robocopy'
     }
 
-    It 'leaves the copy timeout substituted, not a placeholder' {
-        $script:Reset | Should -Match '\$TimeoutSeconds = 600'
+    # …and substituted with the RESTORE budget, not the capture's. One serial
+    # loop serves every slot, so this bound is how long another slot's gate waits
+    # behind this one -- at the capture's 600 s it would outlast the hook's own
+    # wait and fail a job on a slot that is perfectly clean.
+    It 'leaves the copy timeout substituted with the restore budget' {
+        $script:Reset | Should -Match '\$TimeoutSeconds = 120'
+        $script:Reset | Should -Not -Match '\$TimeoutSeconds = 600'
     }
 
     # The gate consumes the marker. A marker that survived its own gate would
@@ -818,6 +823,14 @@ Describe 'slot reset service body' {
     # gate, and the shim would restart it into the request it just deleted.
     It 'never lets one slot''s failure stop the loop' {
         $script:Reset | Should -Match 'Write-ResetLog "slot \$index ''\$name'' failed'
+    }
+
+    # A slot may create entries in its own request directory and nowhere else.
+    # Depth 2 plus a check on the PARENT's name means a directory it creates in
+    # there puts the contents at depth 3, where this loop cannot see them.
+    It 'looks only where a request can legitimately appear' {
+        $script:Reset | Should -Match '-Recurse -Depth 2'
+        $script:Reset | Should -Match "\`$_\.Directory\.Name -ceq 'request'"
     }
 
     It 'reads nothing out of the request file' {

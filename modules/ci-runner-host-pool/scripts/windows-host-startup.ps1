@@ -169,14 +169,21 @@ $script:SlotResetServiceName = 'ci-slot-reset'
 $script:SlotResetWaitSeconds = 300
 $script:SlotResetPollSeconds = 2
 
-# The wall-clock bound on the two robocopy calls this phase makes -- the capture
-# at boot, and every restore afterwards. Both are bounded for the reason phase
-# 7's copies are: the call operator cannot be asked to give up once the child is
-# running, so a wedged mirror is a boot that never registers, or a reset service
-# that never serves another request. A pristine profile is small; this is
-# generous rather than tight, because the bound is there to end a hang and not to
-# police a duration.
+# The wall-clock bound on the CAPTURE at boot. Bounded for the reason phase 7's
+# copies are: the call operator cannot be asked to give up once the child is
+# running, so a wedged mirror is a host that never registers. Nothing is waiting
+# on this one, so it is generous rather than tight -- the bound is there to end a
+# hang, not to police a duration.
 $script:ProfileTemplateSeconds = 600
+
+# The bound on every RESTORE afterwards, and it is deliberately much shorter than
+# the capture's. THE RESET SERVICE SERVES EVERY SLOT FROM ONE SERIAL LOOP, so
+# this bound is not just how long one slot's own reset may take -- it is how long
+# a DIFFERENT slot's gate sits behind it. At the capture's 600 s a single slow
+# mirror would outlast $SlotResetWaitSeconds and fail a job on a healthy slot,
+# which is the one failure this whole layer is supposed to make impossible.
+# Quiesce (30) + hive (30) + this must leave room inside the hook's wait.
+$script:SlotResetCopySeconds = 120
 
 # --- the dependency cache -----------------------------------------------------
 #
@@ -1264,7 +1271,7 @@ function Get-SlotResetScript {
         [string] $TemplateRoot = $script:ProfileTemplateRoot,
         [string] $LogPath = $script:LogPath,
         [int] $QuiesceWaitSeconds = 30,
-        [int] $CopySeconds = $script:ProfileTemplateSeconds
+        [int] $CopySeconds = $script:SlotResetCopySeconds
     )
     $body = @'
 # Installed by windows-host-startup.ps1 (phase 4) and supervised by the service
@@ -1554,6 +1561,12 @@ function Invoke-SlotGate {
 
 Write-ResetLog "started, polling $StateRoot every $PollSeconds s"
 while ($true) {
+    # -Depth 2 and a check on the PARENT's name, so the only files this loop can
+    # ever see are `<state>\<index>\request\<name>`. A slot may create entries in
+    # its own request directory and nowhere else, and a directory it creates in
+    # there puts its contents at depth 3, out of reach. The walk does not follow a
+    # junction either: Get-ChildItem -Recurse does not descend a reparse point
+    # without -FollowSymlink, the same property Test-CacheTreeHostile relies on.
     $requests = @()
     try {
         $requests = @(Get-ChildItem -Path $StateRoot -Filter '*' -File -Recurse -Depth 2 `
