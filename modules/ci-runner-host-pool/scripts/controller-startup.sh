@@ -1231,13 +1231,14 @@ reap_orphan_registrations() {
   done
 }
 
-# host_facts <host> -> sets HOST_BUSY, HOST_REG
+# host_facts <host> -> sets HOST_BUSY, HOST_PRESENT, HOST_REG
 # Slot agents are named "<host>-s<N>" by host-startup.sh; that naming IS the
 # join key between GCE instances and GitHub registrations.
 host_facts() {
   local host="$1"
   if [ -z "$RUNNERS_JSON" ]; then
     HOST_BUSY=0
+    HOST_PRESENT=-1
     HOST_REG="unknown"
     return 0
   fi
@@ -1255,6 +1256,13 @@ host_facts() {
   busy=${busy:-0}
 
   HOST_BUSY=$busy
+  # How many of this host's slots ANSWER, as opposed to how many it was built
+  # with. The two have never been compared: a slot is counted as capacity on the
+  # strength of its agent being up, and the fleet had no series that said
+  # otherwise. -1 above, never 0, because a tick that could not read the runner
+  # list knows nothing about this host and must not be summed as a host with no
+  # slots — that reads identically to the outage it is supposed to detect.
+  HOST_PRESENT=$present
   if [ "$present" -eq 0 ]; then
     HOST_REG="absent"
   elif [ "$present" -lt "$SLOTS" ]; then
@@ -2317,6 +2325,10 @@ tick_pool() {
   classify_pinned
 
   local pool_size=0 slots_busy=0 idle_max=0 draining=0 stale_hosts=0
+  # Slots that answered, summed only over hosts the runner list could speak
+  # about. slots_known is the denominator that goes with it: without it a blind
+  # tick and a fleet-wide outage produce the same pair of numbers.
+  local slots_registered=0 slots_known=0
   local host status host_tpl host_uri busy idle age verdict hold tpl cordoned recycling
 
   # Hosts already mid-recycle, counted BEFORE any decision this tick, so every
@@ -2401,6 +2413,19 @@ tick_pool() {
     idle=$(idle_seconds "$host" "$busy")
     [ "$idle" -gt "$idle_max" ] && idle_max=$idle
     age=$(host_age_seconds "$host")
+
+    # SLOTS THAT ANSWER, over hosts old enough to have answered. A host still
+    # inside its registration grace has not registered YET, and a host that is
+    # not RUNNING is booting or on its way out; counting either as short of
+    # slots would make ci_slots_missing non-zero through every ordinary scale
+    # event, which is how a series stops being alerted on. A tick that could not
+    # read the runner list contributes nothing to either side — HOST_PRESENT is
+    # -1 there, and a blind tick must not read as an outage.
+    if [ "$HOST_PRESENT" -ge 0 ] && [ "$status" = "RUNNING" ] &&
+      [ "$age" -ge "$REGISTER_GRACE" ]; then
+      slots_known=$((slots_known + SLOTS))
+      slots_registered=$((slots_registered + HOST_PRESENT))
+    fi
 
     # Before any deletion verdict: a host that is still booting needs its
     # registration token now, and a host that has registered — or is running a
@@ -2537,6 +2562,15 @@ tick_pool() {
   queue_series "ci_hosts_draining" "$draining"
   queue_series "ci_slots_total" "$((pool_size * SLOTS))"
   queue_series "ci_slots_busy" "$slots_busy"
+  # CAPACITY THAT ANSWERS, and the gap. ci_slots_total is arithmetic —
+  # hosts × slots — so it says what the pool was BUILT with and cannot say
+  # whether any of it is reachable. Every failure in the #130 / #268 / #278
+  # family is invisible in it: a host that registered nothing, a host whose slot
+  # units died at ExecStartPre, a slot the sweep condemned and stopped. All
+  # three subtract from ci_slots_registered, and the difference is the series to
+  # alert on.
+  queue_series "ci_slots_registered" "$slots_registered"
+  queue_series "ci_slots_missing" "$((slots_known - slots_registered))"
   queue_series "ci_host_idle_seconds_max" "$idle_max"
   queue_series "ci_queue_wait_seconds_max" "$QUEUE_WAIT_MAX"
   # The other half of the wait. ci_queue_wait_seconds_max says how long a job

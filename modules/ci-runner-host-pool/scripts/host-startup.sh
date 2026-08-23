@@ -615,6 +615,35 @@ esac
 
 marker="\$SLOT_STATE/\$idx/clean"
 
+# THE BURN COUNT. Beside the marker, in the same root-owned directory and for
+# the same reason: it is a claim about a slot that the slot must not be able to
+# make about itself.
+#
+# What it counts is consecutive failures to reach a clean state — a job failed
+# on arrival because the slot was not left clean, or a reset that could not earn
+# the marker. Any reset that DOES earn the marker clears it, so the number is
+# always "how many in a row, right now", never a lifetime total. That is the
+# only shape the take-out-of-service rule can read: a slot that fails one job in
+# fifty is a repository's problem, and a slot that has failed the last four is
+# the fleet's.
+burns="\$SLOT_STATE/\$idx/burns"
+
+burn_count() {
+  local n=""
+  [ -f "\$burns" ] && read -r n <"\$burns" 2>/dev/null
+  case "\$n" in
+    '' | *[!0-9]*) printf '0' ;;
+    *) printf '%s' "\$n" ;;
+  esac
+}
+
+burn_add() {
+  local n
+  n=\$(burn_count)
+  printf '%s\n' "\$((n + 1))" >"\$burns" 2>/dev/null ||
+    say "slot \$idx: could not record that it burned a job"
+}
+
 # ONE reset at a time per slot, and this became a requirement rather than a
 # nicety when the idle sweep arrived. Until then every caller was the slot's own
 # agent, which is single-threaded across the job boundary: started, then the job,
@@ -672,6 +701,12 @@ if [ "\$stage" = started ] && [ ! -f "\$marker" ]; then
   # about to fail deliberately. Its content goes at the completed reset that
   # follows, which is the reset that has to be trusted anyway.
   fail_after=1
+  # A job is about to be failed on this slot. That is the event #278 exists to
+  # count: it is invisible in every fleet series — the host goes on reporting
+  # the slot as serving — and it is also the event that makes a broken slot
+  # WIN work, because failing in six seconds returns it to the queue faster
+  # than a healthy slot can claim one.
+  burn_add
 fi
 # Cleared FIRST. Everything below can fail, and a marker left in place by a
 # reset that did not finish is a lie the next job would believe.
@@ -992,6 +1027,22 @@ fi
 # is about to be dirtied by the job that is starting.
 if [ "\$rc" = 0 ] && [ "\$stage" != started ]; then
   : >"\$marker" || rc=1
+fi
+
+# THE COUNT, decided by the same rc the marker was. A reset that reached the
+# template state is the only evidence that this slot can still be returned to
+# it, so it is the only thing that clears the count — and a reset that could
+# not is exactly the condemned-by-design case #277 leaves behind: a container
+# that will not die, a tag that will not drop, a _work the slot recreated under
+# us. 'started' is skipped in both directions: it never earns the marker, so
+# clearing on it would erase the history at the start of every job, and the
+# burn it may have just recorded above is already counted.
+if [ "\$stage" != started ]; then
+  if [ "\$rc" = 0 ]; then
+    rm -f -- "\$burns"
+  else
+    burn_add
+  fi
 fi
 
 [ "\$fail_after" = 1 ] && exit 1
@@ -1725,6 +1776,18 @@ SLOTS=$SLOTS
 # the state to persist turns that from a wrong action into a skipped tick.
 GRACE=60
 
+# How many consecutive failures to reach a clean state condemn a slot. Counted
+# by slot-reset.sh into \$SLOT_STATE/<idx>/burns; see the burn count there for
+# what does and does not clear it.
+#
+# Small on purpose. The cost of being wrong in one direction is a slot idle for
+# a few minutes on a host that has other slots; in the other it is a slot that
+# burns every job it is handed at six seconds a job, winning the race for
+# queued work against its healthy neighbours because losing is faster than
+# working. Three is two more chances than the evidence in #278 suggests any of
+# them ever used.
+CONDEMN_MAX=3
+
 say() { logger -t ci-slot-sweep -- "\$*" 2>/dev/null || true; echo "slot sweep: \$*" >&2; }
 
 for idx in \$(seq 1 "\$SLOTS"); do
@@ -1797,7 +1860,9 @@ for idx in \$(seq 1 "\$SLOTS"); do
     continue
   fi
 
+  reset_ok=0
   if /opt/ci/job-hooks/slot-reset.sh completed "\$idx" >/dev/null 2>&1; then
+    reset_ok=1
     rm -f -- "\$since"
     say "slot \$idx: was left dirty by a job that never completed — reset with no job on it; the next job takes the ordinary path"
   else
@@ -1806,6 +1871,41 @@ for idx in \$(seq 1 "\$SLOTS"); do
     # hook goes on refusing it, and this sweep tries again in thirty seconds.
     # The clock is deliberately NOT cleared, so the retry is immediate.
     say "slot \$idx: dirty and idle, but the reset did not finish — it stays dirty and the next sweep retries"
+  fi
+
+  # CONDEMNATION. Everything above retries forever, and forever is the bug: a
+  # slot whose reset can never finish stays dirty, so the started hook goes on
+  # failing every job it is handed, and it is handed a lot of them because
+  # failing takes six seconds. Past CONDEMN_MAX the slot stops being offered
+  # work at all — its agent is simply not started again below.
+  #
+  # A slot serving nothing is strictly better than a slot serving six-second
+  # failures, and it is also the state the rest of the fleet can already SEE: a
+  # stopped agent leaves the repository's runner list, the controller's
+  # host_facts() reads the host as short of slots, and that gap is published as
+  # ci_slots_missing. No new call, no new attribute, and it covers the two
+  # neighbouring shapes as well — a host that registered nothing (#130) and a
+  # host whose slot units never started (#268).
+  #
+  # Not disabled, not deleted: the next tick tries the reset again, so a slot
+  # whose obstruction clears — a wedged container finally reaped, a disk that
+  # came back — recovers on its own.
+  burns=""
+  [ -f "\$dir/burns" ] && read -r burns <"\$dir/burns" 2>/dev/null
+  case "\$burns" in '' | *[!0-9]*) burns=0 ;; esac
+
+  if [ "\$reset_ok" = 0 ] && [ "\$burns" -ge "\$CONDEMN_MAX" ]; then
+    if [ ! -f "\$dir/condemned" ]; then
+      : >"\$dir/condemned" 2>/dev/null || say "slot \$idx: could not record that it is condemned"
+      say "slot \$idx: \$burns consecutive failures to reach a clean state — taking it out of service rather than letting it keep winning jobs it will burn"
+    fi
+    continue
+  fi
+
+  if [ "\$reset_ok" = 1 ] && [ -f "\$dir/condemned" ]; then
+    rm -f -- "\$dir/condemned"
+    say "slot \$idx: clean again after being condemned — putting it back into service"
+    was_active=1
   fi
 
   # Back into the pool either way. A slot left down by a failed reset would be

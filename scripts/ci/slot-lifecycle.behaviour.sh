@@ -381,6 +381,95 @@ check "and its clock is reset, not advanced"      test ! -f "$SINCE"
 kill "$worker" >/dev/null 2>&1
 wait "$worker" >/dev/null 2>&1
 
+# --- the burn count, and condemnation -----------------------------------------
+#
+# Everything above is about a slot that comes back. #278 is the slot that does
+# not: on 2026-08-23 twelve of IntegrateIT's twenty-four could not reach a clean
+# state, so the started hook refused every job routed to them -- in about six
+# seconds each, which is faster than a healthy slot finishes anything. Failing
+# quickly is how they kept WINNING the race for queued work, and the repository
+# saw a pool of twenty-four runners burn its queue down without running it.
+#
+# The count is the whole mechanism, so it is asserted as arithmetic rather than
+# as a log line: what increments it, what clears it, and who is allowed to write
+# it. It lives beside the clean marker under root-owned state precisely because
+# the subject of the measurement is the slot.
+BURNS="$SLOT_STATE/$IDX/burns"
+CONDEMNED="$SLOT_STATE/$IDX/condemned"
+
+echo
+echo "burns: what a slot has cost"
+seed_work
+rm -f -- "$MARKER" "$BURNS"
+in_workspace started
+check "a job refused on a dirty slot is counted"  grep -qx 1 "$BURNS"
+in_workspace completed
+check "and reaching a clean state clears the debt" test ! -e "$BURNS"
+check "which is the point of clearing it"          test -f "$MARKER"
+
+# A count that is a lifetime total condemns every slot on a long-lived host
+# eventually, whatever its health, so the two directions are asserted together.
+seed_work
+rm -f -- "$MARKER"
+in_workspace started
+in_workspace completed
+seed_work
+rm -f -- "$MARKER"
+in_workspace started
+check "the count is consecutive, not cumulative"   grep -qx 1 "$BURNS"
+
+echo
+echo "burns: who may write the count"
+#
+# The slot user owns its home and the parent of _work, and is the account a job
+# runs as. If it could reach this file it could zero its own record between
+# failures and never be condemned at all.
+if sudo -u "$U" sh -c ": >'$BURNS'" 2>/dev/null; then
+  bad "a slot cannot rewrite its own count"
+else
+  ok "a slot cannot rewrite its own count"
+fi
+check "and the count survived the attempt"         grep -qx 1 "$BURNS"
+
+echo
+echo "condemnation: a slot whose reset can never finish"
+#
+# An obstruction the reset genuinely cannot clear. The symlinked _work above is
+# the one the refusal path already covers, so it is reused here for a different
+# purpose: it makes `completed` fail deterministically, tick after tick, which
+# is the shape of every fault this counts.
+in_workspace completed >/dev/null 2>&1
+rm -rf -- "$WORK"
+sudo -u "$U" ln -s /tmp "$WORK"
+rm -f -- "$MARKER" "$BURNS" "$CONDEMNED"
+printf '%s\n' 1 >"$SINCE"
+
+"$SWEEP" >>"$HOOKLOG" 2>&1
+check "one failed sweep condemns nothing"          test ! -e "$CONDEMNED"
+check "and the sweep's own failure is counted"     grep -qx 1 "$BURNS"
+check "and the clock is left alone, so it retries" test -f "$SINCE"
+
+"$SWEEP" >>"$HOOKLOG" 2>&1
+check "two is still within the allowance"          test ! -e "$CONDEMNED"
+
+"$SWEEP" >>"$HOOKLOG" 2>&1
+check "three takes the slot out of service"        test -f "$CONDEMNED"
+check "and the symlink target is still untouched"  test -d /tmp
+
+echo
+echo "condemnation: and the way back"
+#
+# Condemned is not disabled and not deleted. The sweep goes on trying the reset,
+# so a slot whose obstruction clears -- a wedged container finally reaped, a
+# disk that came back -- returns without anyone being paged.
+rm -f -- "$WORK"
+seed_work
+"$SWEEP" >>"$HOOKLOG" 2>&1
+check "a slot that reaches a clean state is clean" test -f "$MARKER"
+check "and it is put back into service"            test ! -e "$CONDEMNED"
+check "and it owes nothing"                        test ! -e "$BURNS"
+check "and its clock is cleared"                   test ! -f "$SINCE"
+
 if [ "$FAIL" -gt 0 ] && [ -s "$HOOKLOG" ]; then
   echo
   echo "what the hooks said:"

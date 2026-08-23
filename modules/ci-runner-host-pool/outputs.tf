@@ -121,6 +121,22 @@ output "metric_names" {
       "ci_hosts_draining",
       "ci_slots_total",
       "ci_slots_busy",
+      # Slots that ANSWER, and the gap between that and the slots the pool was
+      # built with. ci_slots_total is arithmetic — hosts × slots — so it reads
+      # identically whether every agent is registered or none is. These two are
+      # the only series that distinguish the two, and they are counted only over
+      # RUNNING hosts past their registration grace, so ordinary scale-out does
+      # not move them.
+      #
+      # Alert on sustained non-zero ci_slots_missing. It is one number for three
+      # failures that all present as "the pool looks fine and jobs queue": a
+      # host that registered nothing at all, a host whose slot units died before
+      # the agent started, and a slot the host's own sweep condemned and took
+      # out of service after it failed to reach a clean state CONDEMN_MAX times.
+      # A blind tick contributes to neither, so this cannot be moved by the API
+      # being unreadable.
+      "ci_slots_registered",
+      "ci_slots_missing",
       "ci_host_idle_seconds_max",
       "ci_queue_wait_seconds_max",
       # How long the oldest job already EXECUTING has been executing. Pairs with
