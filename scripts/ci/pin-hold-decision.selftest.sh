@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
+
+# shellcheck disable=SC2016
+#   The single quotes in the wiring half are load-bearing. Every pattern there
+#   is an extended regular expression matched against the controller's TEXT, so
+#   `$host`, `$rc` and `$BEACON_NS` are literal dollar signs the file has to
+#   contain -- not variables this suite holds. Expanded, each pattern would
+#   collapse toward the empty string and match anything, which is precisely the
+#   failure the wiring assertions exist to catch: they would all pass against a
+#   controller with the veto ripped out.
+#   File scope rather than per call site because a directive on a comment binds
+#   to the next command only, and there are ten of them.
 # Self-test for the controller's PIN HOLD rule, and for the wiring that applies
 # it.
 #
