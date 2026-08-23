@@ -75,6 +75,12 @@ PUBVARS="$HERE/../../modules/ci-runner-cache-publisher/variables.tf"
 BUCKETTF="$HERE/../../modules/ci-runner-cache-bucket/main.tf"
 TELEM="$HERE/../../modules/ci-runner-host-pool/scripts/telemetry.sh"
 PUBSH="$HERE/publish-cache-snapshot.sh"
+# The embedded-credential CONTENT pass, extracted so the Windows builder can run
+# the same patterns. It is asserted as ONE body of code with the publisher below:
+# a rule that moved from one file to the other must not be able to look like a
+# rule that was deleted, and a rule deleted from both must not be able to look
+# like a rule that moved.
+SCANSH="$HERE/scan-cache-credentials.sh"
 PUBDOC="$HERE/../../docs/publishing-a-cache-snapshot.md"
 
 PASS=0
@@ -97,6 +103,7 @@ skip() { SKIP=$((SKIP + 1)); printf 'SKIP: %s\n' "$1"; }
 [ -f "$BUCKETTF" ] || { echo "FAIL: missing $BUCKETTF"; exit 1; }
 [ -f "$TELEM" ] || { echo "FAIL: missing $TELEM"; exit 1; }
 [ -f "$PUBSH" ] || { echo "FAIL: missing $PUBSH"; exit 1; }
+[ -f "$SCANSH" ] || { echo "FAIL: missing $SCANSH"; exit 1; }
 [ -f "$PUBDOC" ] || { echo "FAIL: missing $PUBDOC"; exit 1; }
 
 # Code only: full-line comments stripped, so the prose explaining an invariant
@@ -105,7 +112,11 @@ skip() { SKIP=$((SKIP + 1)); printf 'SKIP: %s\n' "$1"; }
 # every variable and every mechanism that must not be present — `GOCACHE`,
 # `RUNNER_TOOL_CACHE`, `cp -al`, `2775` and `UMask` all appear as documented
 # rejections, so a check reading raw text would see them and pass.
-code_of() { grep -vE '^[[:space:]]*#' "$1"; }
+#
+# Takes one file or several. Several is what lets a predicate assert over a pair
+# of files that were once one file: `-h` so no `==>` header can ever satisfy a
+# pattern, and the concatenation order is the caller's, never glob order.
+code_of() { grep -hvE '^[[:space:]]*#' "$@"; }
 
 # Never `... | grep -q` under `set -o pipefail`: grep exits on the match, the
 # writer takes SIGPIPE and exits 141, and pipefail reports a SUCCESSFUL match as
@@ -900,9 +911,17 @@ has_no_write_grant_on_the_bucket() { # <file>
 
 # The publishing script is the only writer into the trusted path, so what it
 # refuses matters as much as what it does.
+#
+# It reads TWO files as one body of code: the file under test, and whichever of
+# the pair it is not. $PAIR_OTHER is what supplies the second — set by
+# `mutate_pubsh` and `mutate_scansh`, so a mutation of either half is judged
+# against the whole. Without it every assertion that names a rule now living in
+# the other file would fail on every mutation of this one, and the suite would
+# report ~90 failures that say nothing about the mutation.
+PAIR_OTHER=""
 has_trusted_snapshot_build() { # <file>
   local code reporter labeller confirmer line rest form arg label
-  code=$(code_of "$1")
+  code=$(code_of "$1" ${PAIR_OTHER:+"$PAIR_OTHER"})
   # Built into a fresh staging tree, never from a host's cache. /opt/ci-cache is
   # the master's path and must not appear at all: an archive of it would put a
   # previous snapshot's content — or a slot's — back through the front door.
@@ -1010,10 +1029,32 @@ has_trusted_snapshot_build() { # <file>
   # is writable by the install it is about to run, so an allowlist parsed after
   # third-party code executed is one that code could have extended — it would
   # excuse its own planted file and the run would look like a clean publish.
-  local allow_at prep_at
-  allow_at=$(printf '%s\n' "$code" | grep -n 'CACHE_SCAN_ALLOW_FILE:-' | head -1 | cut -d: -f1)
+  #
+  # Since the extraction it takes two assertions instead of one, because the
+  # allowlist now lives in the other file and runs when that file is SOURCED.
+  # Both halves are checked, and each is checked WITHIN one file's own lines: the
+  # two are concatenated in whichever order puts the mutated one first, so a line
+  # number compared across the seam would mean nothing.
+  #
+  # Half one: the source happens before the prepare command is launched.
+  local src_at prep_at
+  src_at=$(printf '%s\n' "$code" | grep -n '^  \. "\$HERE/scan-cache-credentials\.sh"$' | head -1 | cut -d: -f1)
   prep_at=$(printf '%s\n' "$code" | grep -n 'timeout -k 30 "\$CACHE_PREPARE_TIMEOUT"' | head -1 | cut -d: -f1)
-  [ -n "$allow_at" ] && [ -n "$prep_at" ] && [ "$allow_at" -lt "$prep_at" ] || return 1
+  [ -n "$src_at" ] && [ -n "$prep_at" ] && [ "$src_at" -lt "$prep_at" ] || return 1
+  # Half two: sourcing is what parses it. Both parses sit at TOP LEVEL — column
+  # zero, not inside a function — so they run at source time. Moved into
+  # `scan_credentials_or_die` they would instead run after the prepare command,
+  # which is the ordering this pair of checks exists to refuse.
+  matches "$code" '^if \[ -n "\$\{CACHE_SCAN_ALLOW_FILE:-\}" \]; then$'    || return 1
+  matches "$code" '^if \[ -n "\$\{CACHE_SCAN_ALLOW_DIGESTS:-\}" \]; then$' || return 1
+  # Half three: a library that did not load is a hard refusal, not a publish with
+  # one pass missing. The source is CONDITIONAL — the cache-warmer inlines the
+  # library instead, because its Cloud Build step runs `bash -c "<text>"` and has
+  # no scripts/ci to source from — so "the function is defined" is the thing that
+  # has to be asserted, separately from "the source ran".
+  matches "$code" 'declare -F scan_credentials_or_die >/dev/null 2>&1 \\$' || return 1
+  matches "$code" 'the embedded-credential content scan is not loaded' || return 1
+  matches "$code" 'scan_credentials_or_die "\$root"' || return 1
   matches "$code" '\[ "\$d" = "\$1" \]' || return 1
   matches "$code" 'sha256sum is not on PATH' || return 1
   matches "$code" 'log "the content scan excused \$\(safe_path' || return 1
@@ -1196,8 +1237,13 @@ has_trusted_snapshot_build() { # <file>
   matches "$labeller" '\[ "\$rc" -le 1 \]' || return 1
   # The hit list is created with mktemp, so the prepare command — which runs as
   # this uid, before the scan, knowing the temp root — cannot pre-create it as a
-  # symlink to /dev/null or as a directory and take the whole pass green.
-  matches "$code" 'hits=\$\(mktemp "\$ARCHIVE_DIR/hits\.XXXXXX"\)' || return 1
+  # symlink to /dev/null or as a directory and take the whole pass green. The
+  # directory it is created IN is $SCAN_TMPDIR, which the publisher points at its
+  # own 0700 archive directory — the second assertion, because a library default
+  # of `.` would put the list inside whatever tree the caller happened to be in.
+  matches "$code" 'hits=\$\(mktemp "\$SCAN_TMPDIR/hits\.XXXXXX"\)' || return 1
+  matches "$code" '^SCAN_TMPDIR="\$ARCHIVE_DIR"$' || return 1
+  matches "$code" 'SCAN_TMPDIR="\$\(mktemp -d\)"' || return 1
   matches "$code" 'die "the content scan found matches it could not then read' || return 1
   matches "$code" 'done <"\$hits"' || return 1
   # NUL-separated, both ends. A newline is a legal filename byte, so a
@@ -1626,7 +1672,9 @@ run 'the pool name cannot rewrite the IAM condition'     has_constrained_pool_na
 run 'the publisher may create but never overwrite a snapshot' has_write_once_publisher "$PUBTF"
 run 'only the default ref may become the publisher'      has_ref_bound_publisher   "$PUBVARS"
 run 'the bucket module grants no write of its own'       has_no_write_grant_on_the_bucket "$BUCKETTF"
+PAIR_OTHER="$SCANSH"
 run 'a snapshot is built clean, scanned and written once' has_trusted_snapshot_build "$PUBSH"
+PAIR_OTHER=""
 run 'both sides agree on which tool caches travel'       has_agreeing_cache_dirs   "$PUBSH"
 run 'the install never runs beside the publishing credential' has_split_publishing_workflow "$PUBDOC"
 run 'every hydrate exit says which one it was'           has_observable_hydrate    "$SCRIPT"
@@ -1661,6 +1709,17 @@ mutate_file() { # <source> <name> <fn> <sed-expr>
 
 mutate() { # <name> <fn> <sed-expr>
   mutate_file "$SCRIPT" "$1" "$2" "$3"
+}
+
+# The publisher/credential-scan pair. Each wrapper mutates ONE file and names the
+# other as the predicate's second input, so the pair reads as the single body of
+# code it was before the extraction. Reset afterwards rather than left set: a
+# stale $PAIR_OTHER would silently hand an unrelated predicate a second file.
+mutate_pubsh() { # <name> <fn> <sed-expr>
+  PAIR_OTHER="$SCANSH"; mutate_file "$PUBSH" "$1" "$2" "$3"; PAIR_OTHER=""
+}
+mutate_scansh() { # <name> <fn> <sed-expr>
+  PAIR_OTHER="$PUBSH"; mutate_file "$SCANSH" "$1" "$2" "$3"; PAIR_OTHER=""
 }
 
 mutate 'pnpm store loses the v11 spelling' has_cache_env \
@@ -1961,23 +2020,23 @@ mutate_file "$BUCKETTF" 'ACLs come back and route around the prefix conditions' 
 # The publishing script. Each of these is an edit that leaves a working script —
 # it still builds something and still uploads it — and changes what "trusted"
 # means. None of them would fail a run.
-mutate_file "$PUBSH" 'the publisher refusal names the path but not the reason' has_trusted_snapshot_build \
+mutate_pubsh 'the publisher refusal names the path but not the reason' has_trusted_snapshot_build \
   "s@-printf '%y %M %p.n' -quit@-print -quit@"
-mutate_file "$PUBSH" 'the snapshot is packed from a host cache instead' has_trusted_snapshot_build \
+mutate_pubsh 'the snapshot is packed from a host cache instead' has_trusted_snapshot_build \
   's@^STAGE=\$\(mktemp -d\)$@STAGE=/opt/ci-cache@'
-mutate_file "$PUBSH" 'pnpm loses the v11 spelling on the publishing side' has_trusted_snapshot_build \
+mutate_pubsh 'pnpm loses the v11 spelling on the publishing side' has_trusted_snapshot_build \
   's@^ *export pnpm_config_store_dir=.*$@@'
-mutate_file "$PUBSH" 'the event guard opens to every event' has_trusted_snapshot_build \
+mutate_pubsh 'the event guard opens to every event' has_trusted_snapshot_build \
   "s@^  '' \| schedule \| workflow_dispatch \| push \) : ;;\$@  * ) : ;;@"
-mutate_file "$PUBSH" 'a missing getcap becomes a skipped scan' has_trusted_snapshot_build \
+mutate_pubsh 'a missing getcap becomes a skipped scan' has_trusted_snapshot_build \
   's@^command -v getcap.*$@if command -v getcap >/dev/null 2>\&1; then :; fi@'
-mutate_file "$PUBSH" 'setuid entries stop being scanned for' has_trusted_snapshot_build \
+mutate_pubsh 'setuid entries stop being scanned for' has_trusted_snapshot_build \
   's@-o -perm /6000 @@'
-mutate_file "$PUBSH" 'a hardlink may be packed as a link member' has_trusted_snapshot_build \
+mutate_pubsh 'a hardlink may be packed as a link member' has_trusted_snapshot_build \
   's@ --hard-dereference@@'
-mutate_file "$PUBSH" 'the shipped bytes stop being inspected' has_trusted_snapshot_build \
+mutate_pubsh 'the shipped bytes stop being inspected' has_trusted_snapshot_build \
   's@^archive_is_flat "\$ARCHIVE"$@@'
-mutate_file "$PUBSH" 'the embedded-credential pass is dropped' has_trusted_snapshot_build \
+mutate_scansh 'the embedded-credential pass is dropped' has_trusted_snapshot_build \
   's@^  "registry-auth-token\|.*_authToken.*$@@'
 # Widening it back is not the same failure as dropping it, and it is the quieter
 # one: the scan still fires, the suite still passes its own token cases, and what
@@ -1987,355 +2046,355 @@ mutate_file "$PUBSH" 'the embedded-credential pass is dropped' has_trusted_snaps
 # left class that lets `._authToken =` through. Each of the last two is a real
 # package — googleapis and neo4j-driver — and each would take the publish job
 # permanently red with no allowlist entry able to clear it.
-mutate_file "$PUBSH" 'the token rule matches the tail of a longer word again' has_trusted_snapshot_build \
+mutate_scansh 'the token rule matches the tail of a longer word again' has_trusted_snapshot_build \
   's@^  "registry-auth-token\|.*_authToken.*$@  "registry-auth-token|_authToken"@'
-mutate_file "$PUBSH" 'the token rule stops requiring an assignment' has_trusted_snapshot_build \
+mutate_scansh 'the token rule stops requiring an assignment' has_trusted_snapshot_build \
   's@_authToken\(\[\[:space:\].*\)"$@_authToken"@'
-mutate_file "$PUBSH" 'the token rule matches a property access again' has_trusted_snapshot_build \
+mutate_scansh 'the token rule matches a property access again' has_trusted_snapshot_build \
   's@\[\^A-Za-z0-9\.\\\$\]@[^A-Za-z0-9]@'
 # Dropping either locale pin re-opens the boundary as a hole rather than closing
 # it. Two mutations, not one: the two greps answer different questions — which
 # labels a file trips, and which files are looked at at all — and a suite that
 # only pins one of them accepts a script where they disagree.
-mutate_file "$PUBSH" 'the per-file credential grep loses its byte locale' has_trusted_snapshot_build \
+mutate_scansh 'the per-file credential grep loses its byte locale' has_trusted_snapshot_build \
   's@^    LC_ALL=C grep -qa -E -e @    grep -qa -E -e @'
-mutate_file "$PUBSH" 'the tree-wide credential grep loses its byte locale' has_trusted_snapshot_build \
+mutate_scansh 'the tree-wide credential grep loses its byte locale' has_trusted_snapshot_build \
   's@^  LC_ALL=C grep -rlaZ -E @  grep -rlaZ -E @'
 # The reporter's greps decide nothing, so dropping their pin is not a bypass —
 # it is a file the gate refuses and then cannot name a rule for, which reads as
 # a false positive and gets the rule deleted. Caught by the closed allow-list of
 # forms allowed to touch "$file", which now carries the prefix.
-mutate_file "$PUBSH" 'the credential reporter loses its byte locale' has_trusted_snapshot_build \
+mutate_scansh 'the credential reporter loses its byte locale' has_trusted_snapshot_build \
   's@^      n=\$\(LC_ALL=C grep -ca @      n=$(grep -ca @'
 # A refusal that names only a content-addressed hash file cannot be told from a
 # false positive without reproducing the whole install, and the predictable
 # response to a gate nobody can read is deleting it.
-mutate_file "$PUBSH" 'the credential refusal stops saying what it caught' has_trusted_snapshot_build \
+mutate_scansh 'the credential refusal stops saying what it caught' has_trusted_snapshot_build \
   's@^    explain_credential_hit "\$root" "\$bad"$@@'
 # The allowlist is the one place this script excuses a scan hit, so each of its
 # bounds gets a mutation. Every one of these leaves a script that still builds,
 # still scans and still publishes.
-mutate_file "$PUBSH" 'an allowlist entry may be a digest PREFIX' has_trusted_snapshot_build \
+mutate_scansh 'an allowlist entry may be a digest PREFIX' has_trusted_snapshot_build \
   's@^  \[ "\$\{#d\}" = 64 \] \\$@  true \\@'
 # The file's rules. Each mutation leaves a script that still parses a list and
 # still publishes — the loss is only that nobody can tell what was excused.
-mutate_file "$PUBSH" 'a digest in the file needs no package name beside it' has_trusted_snapshot_build \
+mutate_scansh 'a digest in the file needs no package name beside it' has_trusted_snapshot_build \
   's@^    \[ "\$scan_allow_digest" != "\$scan_allow_line" \] \\$@    true \\@'
-mutate_file "$PUBSH" 'a bare `#` counts as naming the package' has_trusted_snapshot_build \
+mutate_scansh 'a bare `#` counts as naming the package' has_trusted_snapshot_build \
   's@^    \[ -n "\$scan_allow_name" \] \\$@    true \\@'
-mutate_file "$PUBSH" 'an allowlist file that is not there excuses nothing, quietly' has_trusted_snapshot_build \
+mutate_scansh 'an allowlist file that is not there excuses nothing, quietly' has_trusted_snapshot_build \
   's@^  \[ -f "\$CACHE_SCAN_ALLOW_FILE" \] \\$@  true \\@'
-mutate_file "$PUBSH" 'a file of nothing but comments passes for an allowlist' has_trusted_snapshot_build \
+mutate_scansh 'a file of nothing but comments passes for an allowlist' has_trusted_snapshot_build \
   's@^  \[ "\$scan_allow_count" -gt 0 \] \\$@  true \\@'
-mutate_file "$PUBSH" 'an indented entry is eaten as a comment' has_trusted_snapshot_build \
+mutate_scansh 'an indented entry is eaten as a comment' has_trusted_snapshot_build \
   's@^      .. \| .#.\* \) continue ;;$@      "" | *"#"* ) continue ;;@'
-mutate_file "$PUBSH" 'the excusal no longer says where the exception came from' has_trusted_snapshot_build \
+mutate_scansh 'the excusal no longer says where the exception came from' has_trusted_snapshot_build \
   's@, excused by \$SCAN_ALLOW_MATCHED_WHERE"@ is on CACHE_SCAN_ALLOW_DIGESTS"@'
-mutate_file "$PUBSH" 'the file skips its own validator' has_trusted_snapshot_build \
+mutate_scansh 'the file skips its own validator' has_trusted_snapshot_build \
   's@^    scan_allow_add "\$scan_allow_digest" "\$scan_allow_where"$@    SCAN_ALLOW_DIGESTS+=("$scan_allow_digest"); SCAN_ALLOW_WHERE+=("$scan_allow_where")@'
-mutate_file "$PUBSH" 'an excused file is excused silently' has_trusted_snapshot_build \
+mutate_scansh 'an excused file is excused silently' has_trusted_snapshot_build \
   's@^          log "the content scan excused @          : "@'
-mutate_file "$PUBSH" 'the content pass stops at the first hit again' has_trusted_snapshot_build \
+mutate_scansh 'the content pass stops at the first hit again' has_trusted_snapshot_build \
   's@^  done <"\$hits"$@  done < <(head -n1 "$hits")@'
 # The prepare command runs first, as this uid, and is told where the temp root
 # is. A fixed name for the hit list is a symlink to /dev/null away from turning
 # the only pass that sees an embedded credential into a no-op.
-mutate_file "$PUBSH" 'the hit list gets a name the install can guess' has_trusted_snapshot_build \
-  's@^  hits=\$\(mktemp "\$ARCHIVE_DIR/hits\.XXXXXX"\).*$@  hits="$ARCHIVE_DIR/content-hits"@'
-mutate_file "$PUBSH" 'a hit list that vanished reads as a clean tree' has_trusted_snapshot_build \
+mutate_scansh 'the hit list gets a name the install can guess' has_trusted_snapshot_build \
+  's@^  hits=\$\(mktemp "\$SCAN_TMPDIR/hits\.XXXXXX"\).*$@  hits="$SCAN_TMPDIR/content-hits"@'
+mutate_scansh 'a hit list that vanished reads as a clean tree' has_trusted_snapshot_build \
   's@^    || die "the content scan found matches it could not then read.*$@    || true@'
 # A newline is a legal filename byte. Either half of the NUL pair reverted puts
 # the parser back where a planted name can split one record into two.
-mutate_file "$PUBSH" 'the hit list goes back to newline-separated' has_trusted_snapshot_build \
+mutate_scansh 'the hit list goes back to newline-separated' has_trusted_snapshot_build \
   's@grep -rlaZ -E@grep -rla -E@'
 # One NUL byte is all `-I` needs to classify a file as binary and skip it, which
 # turns the only pass that reads file CONTENT into a no-op for that file.
-mutate_file "$PUBSH" 'a leading NUL byte opts a file out of the content pass' has_trusted_snapshot_build \
+mutate_scansh 'a leading NUL byte opts a file out of the content pass' has_trusted_snapshot_build \
   's@grep -rlaZ -E@grep -rlIZ -E@'
-mutate_file "$PUBSH" 'the hit-list reader goes back to reading lines' has_trusted_snapshot_build \
+mutate_scansh 'the hit-list reader goes back to reading lines' has_trusted_snapshot_build \
   "s@while IFS= read -r -d '' bad; do@while IFS= read -r bad; do@"
 # The same guessable-name argument, for the three other files this script writes
 # into the directory the prepare command can find.
-mutate_file "$PUBSH" 'the archive listing gets a name the install can guess' has_trusted_snapshot_build \
+mutate_pubsh 'the archive listing gets a name the install can guess' has_trusted_snapshot_build \
   's@^  list=\$\(mktemp "\$ARCHIVE_DIR/listing\.XXXXXX"\).*$@  list="$ARCHIVE_DIR/listing"@'
 # Back to creating the archive before the install runs: the file is then there,
 # listable, and writable by anything the prepare command left behind.
-mutate_file "$PUBSH" 'the archive exists before the install does' has_trusted_snapshot_build \
+mutate_pubsh 'the archive exists before the install does' has_trusted_snapshot_build \
   's@^ARCHIVE=""$@ARCHIVE=$(mktemp "$ARCHIVE_DIR/snap.XXXXXX.tar.gz")@'
-mutate_file "$PUBSH" 'the pointer body gets a name the install can guess' has_trusted_snapshot_build \
+mutate_pubsh 'the pointer body gets a name the install can guess' has_trusted_snapshot_build \
   's@^pointer_body=\$\(mktemp "\$ARCHIVE_DIR/current\.XXXXXX"\).*$@pointer_body="$ARCHIVE_DIR/current"@'
 # A shorter label list is what makes a file equal `private-key-header`, so an
 # early exit from the labeller is an excusal for a file holding a real token.
-mutate_file "$PUBSH" 'the labeller stops at the first rule it matches' has_trusted_snapshot_build \
+mutate_scansh 'the labeller stops at the first rule it matches' has_trusted_snapshot_build \
   's@out="\$out \$\{entry%%\|\*\}"; fi@out="$out ${entry%%|*}"; break; fi@'
-mutate_file "$PUBSH" 'a grep error in the labeller reads as no match' has_trusted_snapshot_build \
+mutate_scansh 'a grep error in the labeller reads as no match' has_trusted_snapshot_build \
   's@^    \[ "\$rc" -le 1 \] \\$@    true \\@'
 # The digest is an oracle for anything whose preimage is small, and one of these
 # rules matches a HEADER while another matches a 40-byte connection string — the
 # size floor is what keeps both out of the log and off the allowlist.
-mutate_file "$PUBSH" 'a tiny credential file becomes excusable and gets its digest printed' has_trusted_snapshot_build \
+mutate_scansh 'a tiny credential file becomes excusable and gets its digest printed' has_trusted_snapshot_build \
   's@^SCAN_EXCUSABLE_MIN_BYTES=1024$@SCAN_EXCUSABLE_MIN_BYTES=0@'
-mutate_file "$PUBSH" 'the allowlist drops everything after the first newline' has_trusted_snapshot_build \
+mutate_scansh 'the allowlist drops everything after the first newline' has_trusted_snapshot_build \
   "s@read -rd '' -a SCAN_ALLOW_RAW@read -ra SCAN_ALLOW_RAW@"
 # The off switch. One legitimate entry would excuse every content hit there is,
 # and the run would still look exactly like a successful publish.
-mutate_file "$PUBSH" 'the allowlist matches every digest' has_trusted_snapshot_build \
+mutate_scansh 'the allowlist matches every digest' has_trusted_snapshot_build \
   's@^    if \[ "\$d" = "\$1" \]; then$@    if true; then@'
-mutate_file "$PUBSH" 'a digest matches as a prefix at compare time' has_trusted_snapshot_build \
+mutate_scansh 'a digest matches as a prefix at compare time' has_trusted_snapshot_build \
   's@^    if \[ "\$d" = "\$1" \]; then$@    if case "$1" in "$d"*) true ;; *) false ;; esac; then@'
-mutate_file "$PUBSH" 'an allowlist entry need not be hex' has_trusted_snapshot_build \
+mutate_scansh 'an allowlist entry need not be hex' has_trusted_snapshot_build \
   's@\*\[!0-9a-fA-F\]\*@*[!-~]*@'
-mutate_file "$PUBSH" 'an allowlist that cannot be evaluated is ignored' has_trusted_snapshot_build \
+mutate_scansh 'an allowlist that cannot be evaluated is ignored' has_trusted_snapshot_build \
   's@^    || die "CACHE_SCAN_ALLOW_DIGESTS is set but sha256sum.*$@    || true@'
 # The rule that keeps a registry token unexcusable. Without it a digest excuses
 # an `_authToken` line, and the refusal prints the sha256 of a nearly-known
 # plaintext into a public log while it is at it.
-mutate_file "$PUBSH" 'every credential shape becomes excusable by digest' has_trusted_snapshot_build \
+mutate_scansh 'every credential shape becomes excusable by digest' has_trusted_snapshot_build \
   's@^      if scan_hit_is_excusable "\$bad"; then$@      if true; then@'
-mutate_file "$PUBSH" 'the refusal prints a digest for every rule' has_trusted_snapshot_build \
+mutate_scansh 'the refusal prints a digest for every rule' has_trusted_snapshot_build \
   's@^    elif scan_hit_digest_is_printable "\$file"; then$@    elif true; then@'
 # The two questions fused back into one. This is the shape the first attempt at
 # this change had, and it prints a sha256 for a file that is a published README
 # with one credential substituted into it.
-mutate_file "$PUBSH" 'the log prints a digest for anything a list could excuse' has_trusted_snapshot_build \
+mutate_scansh 'the log prints a digest for anything a list could excuse' has_trusted_snapshot_build \
   's@^    elif scan_hit_digest_is_printable "\$file"; then$@    elif scan_hit_is_excusable "$file"; then@'
-mutate_file "$PUBSH" 'the URL class becomes printable too' has_trusted_snapshot_build \
+mutate_scansh 'the URL class becomes printable too' has_trusted_snapshot_build \
   "s@^SCAN_PRINTABLE_LABELS='private-key-header'\$@SCAN_PRINTABLE_LABELS='private-key-header url-embedded-basic-auth'@"
 # The whitelist walk in the printable set. Inverted, the ONE rule that must never
 # be printed is the only one that is.
-mutate_file "$PUBSH" 'the printable set is read as a blocklist' has_trusted_snapshot_build \
+mutate_scansh 'the printable set is read as a blocklist' has_trusted_snapshot_build \
   's@^      \*" \$label "\* \) ;;$@      *" $label "* ) return 1 ;;@'
-mutate_file "$PUBSH" 'a label nobody listed is printable by default' has_trusted_snapshot_build \
+mutate_scansh 'a label nobody listed is printable by default' has_trusted_snapshot_build \
   's@^      \* \) return 1 ;;$@      * ) ;;@'
 # The floor table. A label with no number must be unexcusable, not free.
-mutate_file "$PUBSH" 'a label nobody gave a floor is excusable by default' has_trusted_snapshot_build \
+mutate_scansh 'a label nobody gave a floor is excusable by default' has_trusted_snapshot_build \
   's@^    \* \) return 1 ;;$@    * ) printf 0 ;;@'
-mutate_file "$PUBSH" 'the URL class loses its floor' has_trusted_snapshot_build \
+mutate_scansh 'the URL class loses its floor' has_trusted_snapshot_build \
   "s@^    url-embedded-basic-auth \\) printf '%s' \"\\\$SCAN_EXCUSABLE_MIN_BYTES\" ;;\$@    url-embedded-basic-auth ) printf '0' ;;@"
 # Where a digest was written. The variable enforces nothing but hex, so dropping
 # the source check hands the class most likely to be a live credential back to a
 # route no reviewer can read.
-mutate_file "$PUBSH" 'any route may excuse a URL credential again' has_trusted_snapshot_build \
+mutate_scansh 'any route may excuse a URL credential again' has_trusted_snapshot_build \
   's@ && scan_excusal_source_is_allowed "\$labels"@@'
-mutate_file "$PUBSH" 'the file-only table is emptied' has_trusted_snapshot_build \
+mutate_scansh 'the file-only table is emptied' has_trusted_snapshot_build \
   "s@^SCAN_FILE_ONLY_LABELS='url-embedded-basic-auth'\$@SCAN_FILE_ONLY_LABELS=''@"
-mutate_file "$PUBSH" 'the variable counts as the file' has_trusted_snapshot_build \
+mutate_scansh 'the variable counts as the file' has_trusted_snapshot_build \
   's@^      "CACHE_SCAN_ALLOW_FILE"\* \) ;;$@      "CACHE_SCAN_ALLOW"* ) ;;@'
 # The confirmation stage. Each of these is a way the 22 churning source files
 # come back, or a way a real key stops being confirmed and walks out.
-mutate_file "$PUBSH" 'the key header is refused unconfirmed again' has_trusted_snapshot_build \
+mutate_scansh 'the key header is refused unconfirmed again' has_trusted_snapshot_build \
   's@^    if \[ "\$labels" = private-key-header \] && ! scan_file_holds_pem_block "\$bad"; then$@    if false; then@'
-mutate_file "$PUBSH" 'a header with no body counts as a key' has_trusted_snapshot_build \
+mutate_scansh 'a header with no body counts as a key' has_trusted_snapshot_build \
   's@^      if \(body > 0\) found = 1$@      found = 1@'
-mutate_file "$PUBSH" 'an encrypted key loses its header lines' has_trusted_snapshot_build \
+mutate_scansh 'an encrypted key loses its header lines' has_trusted_snapshot_build \
   's@^    inblock && /\^\[\[:space:\]\]\*\[A-Za-z\]\[A-Za-z0-9-\]\*:/ \{ next \}$@    inblock \&\& /^ZZZNEVER:/ { next }@'
-mutate_file "$PUBSH" 'an encrypted key loses its blank line' has_trusted_snapshot_build \
+mutate_scansh 'an encrypted key loses its blank line' has_trusted_snapshot_build \
   's@^    inblock && /\^\[\[:space:\]\]\*\$/ \{ next \}$@    inblock \&\& /^ZZZNEVER$/ { next }@'
 # The indented shapes. An anchored body expression is what shipped, so both the
 # header rule and the body rule get a mutation that puts the anchor back.
-mutate_file "$PUBSH" 'the body must start in column zero again' has_trusted_snapshot_build \
+mutate_scansh 'the body must start in column zero again' has_trusted_snapshot_build \
   's@^    inblock && /\^\[\[:space:\]\]\*\[A-Za-z0-9\+\\/=\]\+\[\[:space:\]\]\*\$/ \{ body\+\+; next \}$@    inblock \&\& /^[A-Za-z0-9+\\/=]+[[:space:]]*$/ { body++; next }@'
-mutate_file "$PUBSH" 'an indented header line stops being a header line' has_trusted_snapshot_build \
+mutate_scansh 'an indented header line stops being a header line' has_trusted_snapshot_build \
   's@^    inblock && /\^\[\[:space:\]\]\*\[A-Za-z\]\[A-Za-z0-9-\]\*:/ \{ next \}$@    inblock \&\& /^[A-Za-z][A-Za-z0-9-]*:/ { next }@'
-mutate_file "$PUBSH" 'the confirmation reads bytes as text' has_trusted_snapshot_build \
+mutate_scansh 'the confirmation reads bytes as text' has_trusted_snapshot_build \
   's@\| LC_ALL=C awk@\| awk@'
 # The reader and the parser share an exit status again — the shape where an
 # unopenable file reads as a file with no key in it.
-mutate_file "$PUBSH" 'a broken confirmation reads as no key' has_trusted_snapshot_build \
+mutate_scansh 'a broken confirmation reads as no key' has_trusted_snapshot_build \
   's@^  \[ "\$parser" -le 1 \] \\$@  [ "$parser" -le 99 ] \\@'
-mutate_file "$PUBSH" 'an unreadable file reads as a file without a key' has_trusted_snapshot_build \
+mutate_scansh 'an unreadable file reads as a file without a key' has_trusted_snapshot_build \
   's@^  \[ "\$reader" = 0 \] \\$@  [ "$reader" -le 99 ] \\@'
-mutate_file "$PUBSH" 'the reader and the parser collapse into one status' has_trusted_snapshot_build \
+mutate_scansh 'the reader and the parser collapse into one status' has_trusted_snapshot_build \
   's@^  reader=\$\{pipes%% \*\}$@  reader=${pipes##* }@'
 # PIPESTATUS survives exactly one command. Read it anywhere but in the branch
 # body — an assignment counts — and the array is the assignment's, not the
 # pipeline's, so `reader` becomes 0 for every file including the unreadable one.
-mutate_file "$PUBSH" 'the statuses are read after the pipeline is gone' has_trusted_snapshot_build \
+mutate_scansh 'the statuses are read after the pipeline is gone' has_trusted_snapshot_build \
   's@^    pipes="\$\{PIPESTATUS\[\*\]\}"$@    pipes="0 0"@'
-mutate_file "$PUBSH" 'the size test drops out of the excusability walk' has_trusted_snapshot_build \
+mutate_scansh 'the size test drops out of the excusability walk' has_trusted_snapshot_build \
   's@^    \[ "\$size" -ge "\$floor" \] \|\| return 1$@    true@'
-mutate_file "$PUBSH" 'an unrecognised label stops refusing the whole file' has_trusted_snapshot_build \
+mutate_scansh 'an unrecognised label stops refusing the whole file' has_trusted_snapshot_build \
   's@^    floor=\$\(scan_label_min_bytes "\$label"\) \|\| return 1$@    floor=$(scan_label_min_bytes "$label") || floor=0@'
 # A labeller that came back empty means its grep died in a subshell, on a file
 # the scan has already matched. Reading that as "no rule tripped" walks straight
 # into the whitelist loop with nothing to reject.
-mutate_file "$PUBSH" 'a labeller that failed reads as a file with nothing to excuse' has_trusted_snapshot_build \
+mutate_scansh 'a labeller that failed reads as a file with nothing to excuse' has_trusted_snapshot_build \
   's@^  \[ -n "\$labels" \] \|\| return 1$@  [ -n "$labels" ] || return 0@'
-mutate_file "$PUBSH" 'a broken content grep reads as a clean pass' has_trusted_snapshot_build \
+mutate_scansh 'a broken content grep reads as a clean pass' has_trusted_snapshot_build \
   's@^  \[ "\$rc" -le 1 \] \|\| die .*$@@'
 # The rule the whole reporter exists for: report ABOUT the file, never hand over
 # what is in it.
-mutate_file "$PUBSH" 'the refusal prints the head of what it caught' has_trusted_snapshot_build \
+mutate_scansh 'the refusal prints the head of what it caught' has_trusted_snapshot_build \
   's@^    printf .  the matched text is deliberately not printed.*$@&\n    printf "  head: %s\\n" "$(head -c 200 "$file")"@'
-mutate_file "$PUBSH" 'the refusal echoes whatever sat in front of the ://' has_trusted_snapshot_build \
+mutate_scansh 'the refusal echoes whatever sat in front of the ://' has_trusted_snapshot_build \
   's@^          printf .    scheme: not a recognised URL scheme.*$@          printf "    scheme: %s\\n" "$scheme"@'
-mutate_file "$PUBSH" 'a filename from the staged tree is printed raw' has_trusted_snapshot_build \
+mutate_pubsh 'a filename from the staged tree is printed raw' has_trusted_snapshot_build \
   's@\$\(safe_path "\$bad"\)@$bad@g'
-mutate_file "$PUBSH" 'a half-populated install publishes with a zero exit' has_trusted_snapshot_build \
+mutate_pubsh 'a half-populated install publishes with a zero exit' has_trusted_snapshot_build \
   's@exec sh -euc "\$cmd"@exec sh -c "$cmd"@'
 # Both respellings of the -I mistake. Each one publishes a NUL-prefixed token,
 # and each one used to walk past the guard that claimed to forbid it.
-mutate_file "$PUBSH" 'the binary skip comes back spelled -rIlZ' has_trusted_snapshot_build \
+mutate_scansh 'the binary skip comes back spelled -rIlZ' has_trusted_snapshot_build \
   's@grep -rlaZ -E@grep -rIlZ -E@'
-mutate_file "$PUBSH" 'the binary skip comes back as --binary-files' has_trusted_snapshot_build \
+mutate_scansh 'the binary skip comes back as --binary-files' has_trusted_snapshot_build \
   's@grep -rlaZ -E@grep -rlZ --binary-files=without-match -E@'
-mutate_file "$PUBSH" 'the URL rule loses its scheme anchor' has_trusted_snapshot_build \
+mutate_scansh 'the URL rule loses its scheme anchor' has_trusted_snapshot_build \
   's@\(\^\|\[\^A-Za-z0-9\+\.-\]\)\(\$URL_SCHEME_ALT\)://@://@'
-mutate_file "$PUBSH" 'one process may both run the install and hold the credential' has_trusted_snapshot_build \
+mutate_pubsh 'one process may both run the install and hold the credential' has_trusted_snapshot_build \
   '/^\[ "\$BUILDING" = 0 \] \|\| \[ "\$PUBLISHING" = 0 \]/,+1d'
-mutate_file "$PUBSH" 'the size and layout verdicts precede the digest pin' has_trusted_snapshot_build \
+mutate_pubsh 'the size and layout verdicts precede the digest pin' has_trusted_snapshot_build \
   '/^ARCHIVE_SHA=/,+1d; s@^archive_is_flat "\$ARCHIVE"$@archive_is_flat "$ARCHIVE"\nARCHIVE_SHA=$(sha256sum <"$ARCHIVE" | cut -d" " -f1) \\\n  || die "the archive could not be digested"@'
-mutate_file "$PUBSH" 'the VCS schemes go back to a hand-picked few' has_trusted_snapshot_build \
+mutate_scansh 'the VCS schemes go back to a hand-picked few' has_trusted_snapshot_build \
   's@[(]git[|]hg[|]bzr[|]svn[)][(][\][+][(]ssh[|]https[?][|]file[)][)][?]@git@'
-mutate_file "$PUBSH" 'the group the reap is aimed at goes unchecked' has_trusted_snapshot_build \
+mutate_pubsh 'the group the reap is aimed at goes unchecked' has_trusted_snapshot_build \
   '/^  prep_seen=\$\(tr -dc 0-9/,+4d'
 # The shape this replaced. `[ -z "$prep_seen" ] ||` had to be there while the
 # value came from `ps`, because a finished child reports nothing — and that is
 # exactly why the check never fired on the case it was written for.
-mutate_file "$PUBSH" 'an unrecorded process group passes again' has_trusted_snapshot_build \
+mutate_pubsh 'an unrecorded process group passes again' has_trusted_snapshot_build \
   's@^  \[ -n "\$prep_seen" \] \\$@  [ -z "$prep_seen" ] || \\@'
-mutate_file "$PUBSH" 'the group comes back from ps instead of from the child' has_trusted_snapshot_build \
+mutate_pubsh 'the group comes back from ps instead of from the child' has_trusted_snapshot_build \
   's@^  prep_seen=\$\(tr -dc 0-9 <"\$prep_pgid_file"\) \|\| prep_seen=""$@  prep_seen=$(pgid_of "$prep_pgid" || true)@'
-mutate_file "$PUBSH" 'the child stops recording the group it ran in' has_trusted_snapshot_build \
+mutate_pubsh 'the child stops recording the group it ran in' has_trusted_snapshot_build \
   's@^        \| tr -dc 0-9 >"\$CACHE_PREPARE_PGID_FILE" \|\| true$@        | cat >/dev/null || true@'
-mutate_file "$PUBSH" 'the /proc fallback goes away, so a host without ps refuses every run' has_trusted_snapshot_build \
+mutate_pubsh 'the /proc fallback goes away, so a host without ps refuses every run' has_trusted_snapshot_build \
   's@ \|\| cut -d" " -f5 /proc/self/stat@@'
 # Read before the wait and "empty" means "not yet" again — the file is there but
 # the child has not reached its first line, and the run dies on a scheduling
 # accident, which is the fault the ps version had.
-mutate_file "$PUBSH" 'the recorded group is read before the install finishes' has_trusted_snapshot_build \
+mutate_pubsh 'the recorded group is read before the install finishes' has_trusted_snapshot_build \
   '/^  prep_seen=\$\(tr -dc 0-9/d; s@^  prep_rc=0$@  prep_seen=$(tr -dc 0-9 <"$prep_pgid_file") || prep_seen=""\n  prep_rc=0@'
-mutate_file "$PUBSH" 'the pgid file path is left in the prepare command environment' has_trusted_snapshot_build \
+mutate_pubsh 'the pgid file path is left in the prepare command environment' has_trusted_snapshot_build \
   's@^      unset CACHE_PREPARE_PGID_FILE CACHE_PREPARE_CMD$@      :@'
-mutate_file "$PUBSH" 'the install keeps the run process group' has_trusted_snapshot_build \
+mutate_pubsh 'the install keeps the run process group' has_trusted_snapshot_build \
   's@^  set -m$@  :@'
-mutate_file "$PUBSH" 'nothing is reaped once the install returns' has_trusted_snapshot_build \
+mutate_pubsh 'nothing is reaped once the install returns' has_trusted_snapshot_build \
   's@^  kill -TERM -- "-\$prep_pgid" 2>/dev/null \|\| true$@  :@'
-mutate_file "$PUBSH" 'the group is reaped only after the tree is scanned' has_trusted_snapshot_build \
+mutate_pubsh 'the group is reaped only after the tree is scanned' has_trusted_snapshot_build \
   '/^  kill -(TERM|KILL) -- "-\$prep_pgid"/d; s@^  scan_or_die "\$STAGE"$@  scan_or_die "$STAGE"\n  kill -KILL -- "-$prep_pgid" 2>/dev/null || true@'
-mutate_file "$PUBSH" 'the uploaded bytes are never re-checked' has_trusted_snapshot_build \
+mutate_pubsh 'the uploaded bytes are never re-checked' has_trusted_snapshot_build \
   's@^assert_archive_unchanged "the upload"$@true@'
-mutate_file "$PUBSH" 'the CACHE_ARCHIVE_IN refusal echoes the path unfiltered' has_trusted_snapshot_build \
+mutate_pubsh 'the CACHE_ARCHIVE_IN refusal echoes the path unfiltered' has_trusted_snapshot_build \
   's@\$\(safe_path "\$CACHE_ARCHIVE_IN"\)@$CACHE_ARCHIVE_IN@'
-mutate_file "$PUBSH" 'the recreated stage keeps the ambient umask' has_trusted_snapshot_build \
+mutate_pubsh 'the recreated stage keeps the ambient umask' has_trusted_snapshot_build \
   's@mkdir -p "\$STAGE"; chmod 0700 "\$STAGE"@mkdir -p "$STAGE"@'
-mutate_file "$PUBSH" 'the written artifact is never re-checked' has_trusted_snapshot_build \
+mutate_pubsh 'the written artifact is never re-checked' has_trusted_snapshot_build \
   's@^  assert_archive_unchanged "the artifact was written"$@  :@'
-mutate_file "$PUBSH" 'the snapshot is named after a fresh read of the file' has_trusted_snapshot_build \
+mutate_pubsh 'the snapshot is named after a fresh read of the file' has_trusted_snapshot_build \
   's@^digest=\$\{ARCHIVE_SHA:0:16\}$@digest=$(sha256sum "$ARCHIVE" | cut -c1-16)@'
-mutate_file "$PUBSH" 'the packed bytes are never scanned again' has_trusted_snapshot_build \
+mutate_pubsh 'the packed bytes are never scanned again' has_trusted_snapshot_build \
   's@^scan_or_die "\$VERIFY"$@true@'
 # Gated on the phase again: the two-job flow still re-scans, and a single-phase
 # run goes back to one scan with a writable window behind it.
-mutate_file "$PUBSH" 'the re-scan happens only in the publishing phase' has_trusted_snapshot_build \
+mutate_pubsh 'the re-scan happens only in the publishing phase' has_trusted_snapshot_build \
   's@^scan_or_die "\$VERIFY"$@[ "$BUILDING" = 0 ] \&\& scan_or_die "$VERIFY"@'
-mutate_file "$PUBSH" 'the decompression stops being bounded' has_trusted_snapshot_build \
+mutate_pubsh 'the decompression stops being bounded' has_trusted_snapshot_build \
   's@ \| head -c "\$verify_bound" \\@ \\@'
 # The count, which is the only part of the bound tar cannot fool. Without it a cut
 # stream that happens to end on a member boundary extracts a PREFIX and exits 0 --
 # the scan then passes on a subset of the bytes about to be published.
-mutate_file "$PUBSH" 'the expansion bound goes back to trusting tar' has_trusted_snapshot_build \
+mutate_pubsh 'the expansion bound goes back to trusting tar' has_trusted_snapshot_build \
   's@^assert_expands_within_bound "\$verify_bound"$@:@'
-mutate_file "$PUBSH" 'the count is compared the wrong way round' has_trusted_snapshot_build \
+mutate_pubsh 'the count is compared the wrong way round' has_trusted_snapshot_build \
   's@^  \[ "\$expanded" -le "\$1" \] \\@  [ "$expanded" -gt "$1" ] \\@'
-mutate_file "$PUBSH" 'the expansion count is taken after the unpack' has_trusted_snapshot_build \
+mutate_pubsh 'the expansion count is taken after the unpack' has_trusted_snapshot_build \
   's@^assert_expands_within_bound "\$verify_bound"$@:@; s@^scan_or_die "\$VERIFY"$@assert_expands_within_bound "$verify_bound"\nscan_or_die "$VERIFY"@'
-mutate_file "$PUBSH" 'the expansion count itself becomes unbounded' has_trusted_snapshot_build \
+mutate_pubsh 'the expansion count itself becomes unbounded' has_trusted_snapshot_build \
   's@ \| head -c "\$\(\(\$1 \+ 1\)\)" \| wc -c \)@ | wc -c )@'
 # The publisher's copy of the floor. Drifting from the fleet's is the same defect
 # in the other direction: the gate exists to refuse here what a host would refuse
 # on arrival, and two different bounds refuse two different sets.
-mutate_file "$PUBSH" 'the expansion bound loses its floor in the publisher' has_trusted_snapshot_build \
+mutate_pubsh 'the expansion bound loses its floor in the publisher' has_trusted_snapshot_build \
   's@^  \[ "\$bound" -ge "\$CACHE_EXPAND_FLOOR_BYTES" \] \|\| bound=\$CACHE_EXPAND_FLOOR_BYTES$@  :@'
-mutate_file "$PUBSH" 'the publisher floors the bound at nothing' has_trusted_snapshot_build \
+mutate_pubsh 'the publisher floors the bound at nothing' has_trusted_snapshot_build \
   's@^CACHE_EXPAND_FLOOR_BYTES=65536$@CACHE_EXPAND_FLOOR_BYTES=0@'
-mutate_file "$PUBSH" 'the two bounds are computed by hand again' has_trusted_snapshot_build \
+mutate_pubsh 'the two bounds are computed by hand again' has_trusted_snapshot_build \
   's@^verify_bound=\$\(cache_expand_bound "\$size"\)$@verify_bound=$((size * 8))@'
 # The listing. Unbounded it is a self-DoS; bounded but TRIMMED it is worse than
 # unbounded, because the member it was written to catch can be in the part that
 # was cut and the check passes.
-mutate_file "$PUBSH" 'the archive listing goes back to unbounded' has_trusted_snapshot_build \
+mutate_pubsh 'the archive listing goes back to unbounded' has_trusted_snapshot_build \
   's@^  if tar -tvzf "\$1" \| head -c "\$\(\(cap \+ 1\)\)" >"\$list"; then$@  if tar -tvzf "$1" >"$list"; then@'
-mutate_file "$PUBSH" 'a truncated listing is inspected instead of refused' has_trusted_snapshot_build \
+mutate_pubsh 'a truncated listing is inspected instead of refused' has_trusted_snapshot_build \
   's@^  \[ "\$written" -le "\$cap" \] \\$@  [ "$written" -ge 0 ] \\@'
 # Order: tar's status read first reports every over-long listing as a corrupt
 # archive, because `head` closing the pipe kills tar with SIGPIPE.
-mutate_file "$PUBSH" 'tar exit status decides before the byte count does' has_trusted_snapshot_build \
+mutate_pubsh 'tar exit status decides before the byte count does' has_trusted_snapshot_build \
   '/^  \[ "\$tar_rc" = 0 \]/d; s@^  written=\$\(wc -c <"\$list"\).*$@  [ "$tar_rc" = 0 ] || die "the archive could not be listed"\n&@'
 # The limiter is the last stage, so its only failures are failures to WRITE the
 # listing. Dropped, an ENOSPC truncation measures under the cap and the flatness
 # scan passes on a prefix.
-mutate_file "$PUBSH" 'the listing limiter goes back to having no status' has_trusted_snapshot_build \
+mutate_pubsh 'the listing limiter goes back to having no status' has_trusted_snapshot_build \
   '/list_pipes##\* \}" = 0 \]/,+1d'
-mutate_file "$PUBSH" 'only the producer of the listing is checked' has_trusted_snapshot_build \
+mutate_pubsh 'only the producer of the listing is checked' has_trusted_snapshot_build \
   's@^  tar_rc=\$\{list_pipes%% \*\}$@  tar_rc=${PIPESTATUS[0]}@'
-mutate_file "$PUBSH" 'the two listing statuses collapse into one' has_trusted_snapshot_build \
+mutate_pubsh 'the two listing statuses collapse into one' has_trusted_snapshot_build \
   's@^  tar_rc=\$\{list_pipes%% \*\}$@  tar_rc=${list_pipes##* }@'
 # The reap must precede the REFUSALS, not just the scan. An unrecorded group is
 # the shape most likely to have left a daemon behind, and it was the one shape
 # that died before the kill.
-mutate_file "$PUBSH" 'the run gives up on an unrecorded group before reaping it' has_trusted_snapshot_build \
+mutate_pubsh 'the run gives up on an unrecorded group before reaping it' has_trusted_snapshot_build \
   '/^  kill -(TERM|KILL) -- "-\$prep_pgid"/d; /^  sleep 1$/d; s@^  case "\$prep_rc" in$@  kill -TERM -- "-$prep_pgid" 2>/dev/null || true\n  sleep 1\n  kill -KILL -- "-$prep_pgid" 2>/dev/null || true\n  case "$prep_rc" in@'
 # The names the publish run is aimed at, checked before the tree is packed. Each
 # of these is a value that cannot name anything the modules can create, so the
 # only question is whether the operator learns that here or from a 403 that
 # four different faults share.
-mutate_file "$PUBSH" 'a pool name may open with a digit' has_trusted_snapshot_build \
+mutate_pubsh 'a pool name may open with a digit' has_trusted_snapshot_build \
   '/^    \[!a-z\]\* \) die "CACHE_POOL must start/d'
-mutate_file "$PUBSH" 'the pool name loses its length bound' has_trusted_snapshot_build \
+mutate_pubsh 'the pool name loses its length bound' has_trusted_snapshot_build \
   '/^  \[ "\$\{#CACHE_POOL\}" -le 63 \]/,+1d'
-mutate_file "$PUBSH" 'the bucket name loses its length bound' has_trusted_snapshot_build \
+mutate_pubsh 'the bucket name loses its length bound' has_trusted_snapshot_build \
   '/^  \[ "\$\{#CACHE_BUCKET\}" -ge 3 \]/,+1d'
-mutate_file "$PUBSH" 'the bucket name may be longer than a bucket name' has_trusted_snapshot_build \
+mutate_pubsh 'the bucket name may be longer than a bucket name' has_trusted_snapshot_build \
   '/^  \[ "\$\{#CACHE_BUCKET\}" -le 63 \]/,+1d'
-mutate_file "$PUBSH" 'the pool name stops being validated at all' has_trusted_snapshot_build \
+mutate_pubsh 'the pool name stops being validated at all' has_trusted_snapshot_build \
   '/^  case "\$CACHE_POOL" in$/,+3d'
-mutate_file "$PUBSH" 'the bucket name stops being validated at all' has_trusted_snapshot_build \
+mutate_pubsh 'the bucket name stops being validated at all' has_trusted_snapshot_build \
   '/^  case "\$CACHE_BUCKET" in$/,+3d'
 # The verification unpack is the publisher reading back what it is about to ship,
 # and it reads it back under the same refusals a host would apply.
-mutate_file "$PUBSH" 'the verification unpack lets the archive pick its owner' has_trusted_snapshot_build \
+mutate_pubsh 'the verification unpack lets the archive pick its owner' has_trusted_snapshot_build \
   's@-C "\$VERIFY" --no-same-owner @-C "$VERIFY" @'
-mutate_file "$PUBSH" 'credential files stop being scanned for' has_trusted_snapshot_build \
+mutate_pubsh 'credential files stop being scanned for' has_trusted_snapshot_build \
   "s@-o -name '\.git-credentials' @@"
-mutate_file "$PUBSH" 'the snapshot name becomes reusable' has_trusted_snapshot_build \
+mutate_pubsh 'the snapshot name becomes reusable' has_trusted_snapshot_build \
   's@^SNAP="\$\(date -u \+%Y%m%dT%H%M%SZ\)-\$\{digest\}\.tar\.gz"$@SNAP="latest.tar.gz"@'
-mutate_file "$PUBSH" 'the upload may overwrite an existing snapshot' has_trusted_snapshot_build \
+mutate_pubsh 'the upload may overwrite an existing snapshot' has_trusted_snapshot_build \
   's@&ifGenerationMatch=0"@"@'
-mutate_file "$PUBSH" 'the pointer swap loses its precondition' has_trusted_snapshot_build \
+mutate_pubsh 'the pointer swap loses its precondition' has_trusted_snapshot_build \
   's@&ifGenerationMatch=\$\{gen\}"@"@'
-mutate_file "$PUBSH" 'the upload goes back to a tool that lists the bucket' has_trusted_snapshot_build \
+mutate_pubsh 'the upload goes back to a tool that lists the bucket' has_trusted_snapshot_build \
   's@^log "uploading @gcloud storage cp "$ARCHIVE" "$dest" || true\nlog "uploading @'
-mutate_file "$PUBSH" 'the access token moves into argv' has_trusted_snapshot_build \
+mutate_pubsh 'the access token moves into argv' has_trusted_snapshot_build \
   's@-K <\(printf .header = "Authorization: Bearer %s.\\n. "\$GCS_TOKEN"\)@-H "Authorization: Bearer $GCS_TOKEN"@'
 # The session URI arrives in a response header and is then handed the credential.
-mutate_file "$PUBSH" 'the session URI is trusted because it arrived over TLS' has_trusted_snapshot_build \
+mutate_pubsh 'the session URI is trusted because it arrived over TLS' has_trusted_snapshot_build \
   's@^  \* \) die "the upload session URI is not.*$@  * ) : ;;@'
-mutate_file "$PUBSH" 'curl stops pinning the scheme' has_trusted_snapshot_build \
+mutate_pubsh 'curl stops pinning the scheme' has_trusted_snapshot_build \
   "s@curl -sS --proto '=https' @curl -sS @"
 # A 308 is not a finalised object, and curl's exit status cannot tell them apart.
-mutate_file "$PUBSH" 'a resume-incomplete counts as a finished upload' has_trusted_snapshot_build \
+mutate_pubsh 'a resume-incomplete counts as a finished upload' has_trusted_snapshot_build \
   's@200 \| 201 \) uploaded=1@200 | 201 | 308 ) uploaded=1@g'
-mutate_file "$PUBSH" 'the resume probe sends no Content-Length' has_trusted_snapshot_build \
+mutate_pubsh 'the resume probe sends no Content-Length' has_trusted_snapshot_build \
   "s@-H 'Content-Length: 0' @@"
-mutate_file "$PUBSH" 'a session holding every byte is called finalised' has_trusted_snapshot_build \
+mutate_pubsh 'a session holding every byte is called finalised' has_trusted_snapshot_build \
   's@^      \|\| die "the upload session holds all.*$@      || { uploaded=1; break; }@'
 # Integrity across the wire, and the pin re-asserted on the read a retry makes.
-mutate_file "$PUBSH" 'the upload declares no digest' has_trusted_snapshot_build \
+mutate_pubsh 'the upload declares no digest' has_trusted_snapshot_build \
   's@--data "\{.*md5Hash.*\}"@--data "{}"@'
-mutate_file "$PUBSH" 'a retry re-reads the archive without re-checking it' has_trusted_snapshot_build \
+mutate_pubsh 'a retry re-reads the archive without re-checking it' has_trusted_snapshot_build \
   's@^    assert_archive_unchanged "the upload retry"$@    :@'
 # The generation read, and the two things that keep it from killing the shell or
 # reaching a URL as something other than digits.
-mutate_file "$PUBSH" 'a missing pointer kills the shell instead of reading as 0' has_trusted_snapshot_build \
+mutate_pubsh 'a missing pointer kills the shell instead of reading as 0' has_trusted_snapshot_build \
   's@ \| head -n 1\) \|\| true$@ | head -n 1)@'
-mutate_file "$PUBSH" 'the generation parse matches metageneration too' has_trusted_snapshot_build \
+mutate_pubsh 'the generation parse matches metageneration too' has_trusted_snapshot_build \
   "s@s/\\^generation:@s/.*generation:@"
-mutate_file "$PUBSH" 'whatever came back reaches the URL unvalidated' has_trusted_snapshot_build \
+mutate_pubsh 'whatever came back reaches the URL unvalidated' has_trusted_snapshot_build \
   's@^  .. \| .\[!0-9\]. \) gen=0 ;;$@  zzz ) gen=0 ;;@'
-mutate_file "$PUBSH" 'the size bound is dropped' has_trusted_snapshot_build \
+mutate_pubsh 'the size bound is dropped' has_trusted_snapshot_build \
   's@CACHE_MAX_BYTES@CACHE_SIZE_HINT@g'
-mutate_file "$PUBSH" 'the build phase falls through into the upload' has_trusted_snapshot_build \
+mutate_pubsh 'the build phase falls through into the upload' has_trusted_snapshot_build \
   's@^if \[ "\$PUBLISHING" = 0 \]; then$@if false; then@'
 mutate_file "$PUBSH" 'a directory is published that no host accepts' has_agreeing_cache_dirs \
   's@^CACHE_DIRS=\(npm @CACHE_DIRS=(npm cargo @'

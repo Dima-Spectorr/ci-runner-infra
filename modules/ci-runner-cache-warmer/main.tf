@@ -121,7 +121,23 @@ locals {
   # still resolves, because a module vendored without its repository root would
   # otherwise fail at plan time with a message about a missing file and nothing
   # about why this module wants one two directories up.
-  publish_script = file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh")
+  #
+  # TWO files, concatenated, because the step runs `bash -c "<text>"` and there
+  # is no scripts/ci on that disk to source from. The publisher sources
+  # `scan-cache-credentials.sh` when it can find it and uses what is already
+  # defined when it cannot, so prepending the library's text is the same program
+  # by a different route — and the publisher refuses outright if the scan
+  # function is missing, which is what stops a broken concatenation from
+  # publishing an unscanned snapshot.
+  #
+  # SCAN_INLINE_LIBRARY suppresses the library's standalone entry point. Without
+  # it the library's own `usage:` check runs against the step's argv and kills
+  # the build before the publisher's first line.
+  publish_script = join("\n", [
+    "SCAN_INLINE_LIBRARY=1",
+    file("${path.module}/../../scripts/ci/scan-cache-credentials.sh"),
+    file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh"),
+  ])
 
   # WHO FIRES THE TRIGGER IS A DIFFERENT IDENTITY FROM WHO RUNS THE BUILD, and
   # this is not symmetry for its own sake. `cloudbuild.builds.create` — the

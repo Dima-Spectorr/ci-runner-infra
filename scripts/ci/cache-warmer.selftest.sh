@@ -32,6 +32,7 @@ ROOT="$HERE/../.."
 MAIN="$ROOT/modules/ci-runner-cache-warmer/main.tf"
 TURBO="$ROOT/modules/ci-runner-cache-warmer/scripts/warm-turbo.sh"
 SHARED="$ROOT/scripts/ci/publish-cache-snapshot.sh"
+SHAREDSCAN="$ROOT/scripts/ci/scan-cache-credentials.sh"
 
 PASS=0
 FAIL=0
@@ -60,8 +61,21 @@ code_of() { grep -vE '^[[:space:]]*#' "$1"; }
 #    replaced by a copy inside the module (drift), or the root file could be
 #    moved (a plan that fails with a message about a missing file and nothing
 #    about why a module wants one two directories up).
+#
+#    The credential-scan library is the same reference and the same argument. The
+#    step runs `bash -c "<text>"`, so there is nothing on that disk to source: the
+#    library's text is prepended, and if it stopped being prepended the publisher
+#    would find no `scan_credentials_or_die` and refuse — loudly, but only at
+#    trigger time, on a schedule nobody is watching. Asserted here instead.
+#    SCAN_INLINE_LIBRARY goes with it: without the marker the library's standalone
+#    entry point runs `usage:` against the step's argv and the build dies before
+#    the publisher's first line.
 has_shared_publisher() { # <file>
-  matches "$(code_of "$1")" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"\)'
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"\)' || return 1
+  matches "$code" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/scan-cache-credentials\.sh"\)'  || return 1
+  matches "$code" '"SCAN_INLINE_LIBRARY=1"'                                                       || return 1
 }
 
 if has_shared_publisher "$MAIN"; then ok; else
@@ -70,6 +84,10 @@ fi
 
 if [ -f "$SHARED" ]; then ok; else
   bad "scripts/ci/publish-cache-snapshot.sh has moved; the warmer module reads it by relative path and terraform will fail at plan time with a message that says nothing about this"
+fi
+
+if [ -f "$SHAREDSCAN" ]; then ok; else
+  bad "scripts/ci/scan-cache-credentials.sh has moved; the warmer module reads it by relative path too, and terraform will fail at plan time with a message that says nothing about this"
 fi
 
 # 2. TWO PHASES. The archive is packed in one step and uploaded in another, and
@@ -209,6 +227,14 @@ mutate() { # <description> <file> <sed-program> <predicate>
 
 mutate "the publisher copied into the module" "$MAIN" \
   's@file("\${path\.module}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh")@file("${path.module}/scripts/publish-cache-snapshot.sh")@' \
+  has_shared_publisher
+
+mutate "the credential-scan library stops being inlined" "$MAIN" \
+  's@^    file("\${path\.module}/\.\./\.\./scripts/ci/scan-cache-credentials\.sh"),$@@' \
+  has_shared_publisher
+
+mutate "the inline marker is dropped, so the library runs its usage check" "$MAIN" \
+  's@^    "SCAN_INLINE_LIBRARY=1",$@@' \
   has_shared_publisher
 
 mutate "install and upload in one phase" "$MAIN" \
