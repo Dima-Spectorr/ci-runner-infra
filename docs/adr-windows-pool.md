@@ -84,8 +84,17 @@ named and either replaced or explicitly refused.
 `host_os` is a variable on `ci-runner-host-pool`, defaulting to `"linux"`, with
 `validation` restricting it to `linux` or `windows`. A consumer that wants both
 instantiates the module twice — one Linux pool, one Windows pool, each with its
-own name, its own MIG, its own controller, its own labels. That is not a
-workaround; it is the existing contract. A pool already serves one repository
+own name, its own MIG, its own labels. That is not a workaround; it is the
+existing contract.
+
+> **Amended by the four-pool controller (#274).** When this was written each
+> pool also got **its own controller**, and that sentence is no longer true. One
+> controller now serves a *table* of pools — see
+> [the lane model](ci-lane-model.md) — so a repository with a Linux pool and a
+> Windows pool runs one controller VM between them, and its per-tick GitHub
+> sweep is shared rather than duplicated. Nothing else in this section changes:
+> a pool still has exactly one OS, the two pools still must never answer the
+> same labels, and `host_os` is still the variable that says which. A pool already serves one repository
 with one label set, and the two pools must never answer the same labels or
 GitHub will hand a Linux job to a Windows host. Two module blocks is how that is
 already expressed for two repositories, and an OS is a weaker distinction than a
