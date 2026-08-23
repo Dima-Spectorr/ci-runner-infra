@@ -345,7 +345,7 @@ check_file() {
     return
   fi
 
-  if printf '%s\n' "$records" | grep -q '^#ERR	'; then
+  if printf '%s\n' "$records" | grep -c '^#ERR	' >/dev/null; then
     err WFS0 "$rel: $(printf '%s\n' "$records" | sed -n 's/^#ERR\t//p' | head -1)"
     return
   fi
@@ -504,7 +504,7 @@ jobs:
           done' > "$tmp/wf.yml"
   local mapped
   mapped="$(fail=0; check_file "$tmp/wf.yml" 2>&1)"
-  if printf '%s' "$mapped" | grep -q 'wf\.yml: line 9'; then
+  if printf '%s' "$mapped" | grep -c 'wf\.yml: line 9' >/dev/null; then
     echo "ok   a finding names its real line"
   else
     echo "FAIL a finding names its real line: expected 'wf.yml: line 9' in:"

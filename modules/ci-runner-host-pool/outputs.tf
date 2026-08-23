@@ -60,6 +60,13 @@ output "pool_descriptor" {
     host_os                  = var.host_os
     mints_registration_token = var.controller_mints_registration_token
     runner_labels            = local.runner_labels
+
+    # Carried even though the parser defaults it, unlike every other defaulted
+    # column: `ci` is the safe default for a pool that says nothing, and it is
+    # the WRONG answer for the pool this delivery exists to add. A merge-queue
+    # pool that arrives labelled `ci` is sized from pull-request demand, which
+    # is precisely the rationing the split removes.
+    role = var.role
   }
 }
 
@@ -79,6 +86,17 @@ output "metric_names" {
     for m in [
       "ci_demand",
       "ci_demand_queued",
+      # Queued jobs this pool STOPPED answering for because they had been queued
+      # past DEMAND_MAX_AGE. GitHub never takes a run out of `queued` on its own,
+      # so a run held by an unapproved environment, blocked on a `concurrency`
+      # group, or abandoned on a dead branch would otherwise hold a host warm
+      # forever and peg ci_demand_wait_seconds at its own age — saturating the
+      # one gauge that would have shown the real queue underneath it. Published
+      # rather than silently subtracted: a demand figure that dropped with no
+      # visible reason is the same invisibility arriving from the other side. A
+      # steady non-zero count is a repository leaving runs stuck, not a fleet
+      # fault; a sudden one alongside a rising ci_demand is worth reading twice.
+      "ci_demand_expired",
       # Jobs this pool must run that are PINNED to one named host, kept out of
       # ci_demand on purpose: the autoscaler reads ci_demand, and buying a host
       # cannot help a job only one existing host can serve. Read the two
@@ -103,6 +121,22 @@ output "metric_names" {
       "ci_hosts_draining",
       "ci_slots_total",
       "ci_slots_busy",
+      # Slots that ANSWER, and the gap between that and the slots the pool was
+      # built with. ci_slots_total is arithmetic — hosts × slots — so it reads
+      # identically whether every agent is registered or none is. These two are
+      # the only series that distinguish the two, and they are counted only over
+      # RUNNING hosts past their registration grace, so ordinary scale-out does
+      # not move them.
+      #
+      # Alert on sustained non-zero ci_slots_missing. It is one number for three
+      # failures that all present as "the pool looks fine and jobs queue": a
+      # host that registered nothing at all, a host whose slot units died before
+      # the agent started, and a slot the host's own sweep condemned and took
+      # out of service after it failed to reach a clean state CONDEMN_MAX times.
+      # A blind tick contributes to neither, so this cannot be moved by the API
+      # being unreadable.
+      "ci_slots_registered",
+      "ci_slots_missing",
       "ci_host_idle_seconds_max",
       "ci_queue_wait_seconds_max",
       # How long the oldest job already EXECUTING has been executing. Pairs with

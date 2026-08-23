@@ -351,7 +351,7 @@ check_file() {
       continue
     fi
 
-    if ! printf '%s' "$version" | grep -qE "$SHA_RE"; then
+    if ! printf '%s' "$version" | grep -cE "$SHA_RE" >/dev/null; then
       err PIN1 "$rel: job '$job' $loc uses '$path@$version' — a tag or branch, not a commit; pin to a 40-character SHA"
       continue
     fi

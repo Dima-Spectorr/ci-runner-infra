@@ -1340,7 +1340,13 @@ has_trusted_snapshot_build() { # <file>
   # `git+http` reads like policy and is an oversight.
   matches "$code" '\(git\|hg\|bzr\|svn\)\(\\\+\(ssh\|https\?\|file\)\)\?' || return 1
   matches "$code" 'url-embedded-basic-auth\|\(\^\|\[\^A-Za-z0-9\+\.-\]\)\(\$URL_SCHEME_ALT\)://' || return 1
-  matches "$code" 'grep -qE "\^\(\$URL_SCHEME_ALT\)\$"' || return 1
+  # `grep -c … >/dev/null` and never `grep -qE`: the writer is an in-process
+  # `printf` of a shell variable, and the status of this pipeline IS whether the
+  # scheme is recognised. `-q` exits on the first match, the `printf` dies of
+  # EPIPE, and pipefail then reports a scheme that WAS recognised as one that was
+  # not — printing the raw hit the allow-list exists to keep out of the log. See
+  # PFR3 in check-pipefail-readers.sh.
+  matches "$code" 'grep -cE "\^\(\$URL_SCHEME_ALT\)\$" >/dev/null' || return 1
 
   matches "$code" '^VERIFY=\$\(mktemp -d\)' || return 1
   matches "$code" '^scan_or_die "\$VERIFY"$' || return 1

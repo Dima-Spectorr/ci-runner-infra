@@ -559,7 +559,13 @@ explain_credential_hit() { # <tree> <file>
       if [ "$label" = url-embedded-basic-auth ]; then
         scheme=$(LC_ALL=C grep -oEa -m1 -e "$pat" "$file" 2>/dev/null | head -n1 \
           | sed -E 's@^[^A-Za-z]*@@; s@://.*@@') || true
-        if printf '%s' "$scheme" | grep -qE "^($URL_SCHEME_ALT)$"; then
+        # `grep -c … >/dev/null` and never `grep -qE`: the writer is an in-process
+        # `printf` of a shell variable, and the status of this pipeline IS whether
+        # the scheme is recognised. `-q` exits on the first match, the `printf`
+        # dies of EPIPE, and pipefail then reports a scheme that WAS recognised as
+        # one that was not — printing the raw hit the allow-list exists to keep out
+        # of the log. See PFR3 in check-pipefail-readers.sh.
+        if printf '%s' "$scheme" | grep -cE "^($URL_SCHEME_ALT)$" >/dev/null; then
           printf '    scheme: %s\n' "$scheme"
         else
           printf '    scheme: not a recognised URL scheme — inspect that line locally\n'

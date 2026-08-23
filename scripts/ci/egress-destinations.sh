@@ -367,8 +367,8 @@ selftest() {
   local out
   out="$(main --from-file "$tmp/diff.ndjson" --baseline "$tmp/baseline.txt" --fail-on-new 2>&1)"
   local rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'as:64512|RU|443' \
-     && ! printf '%s' "$out" | grep -q '::warning.*as:36459'; then
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -c 'as:64512|RU|443' >/dev/null \
+     && ! printf '%s' "$out" | grep -c '::warning.*as:36459' >/dev/null; then
     echo "ok   the diff reports only the destination not in the baseline"
   else
     echo "FAIL the diff reports only the destination not in the baseline (rc=$rc)"
@@ -381,7 +381,7 @@ selftest() {
   { entry ALLOWED EGRESS 140.82.121.4 443 36459 US; } > "$tmp/one.ndjson"
   out="$(main --from-file "$tmp/one.ndjson" --baseline "$tmp/stale.txt" --fail-on-new 2>&1)"
   rc=$?
-  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'as:99999|NL|443'; then
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -c 'as:99999|NL|443' >/dev/null; then
     echo "ok   a destination that disappeared is reported, not failed"
   else
     echo "FAIL a destination that disappeared is reported, not failed (rc=$rc)"
@@ -393,7 +393,7 @@ selftest() {
   # is a deliberate act rather than the default.
   out="$(main --from-file "$tmp/one.ndjson" --baseline "$tmp/nope.txt" --fail-on-new 2>&1)"
   rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'as:36459|US|443'; then
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -c 'as:36459|US|443' >/dev/null; then
     echo "ok   an absent baseline makes every destination new"
   else
     echo "FAIL an absent baseline makes every destination new (rc=$rc)"
@@ -405,7 +405,7 @@ selftest() {
   main --from-file "$tmp/diff.ndjson" --baseline "$tmp/seeded.txt" --update-baseline >/dev/null 2>&1
   out="$(main --from-file "$tmp/diff.ndjson" --baseline "$tmp/seeded.txt" --fail-on-new 2>&1)"
   rc=$?
-  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'no new egress destinations'; then
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -c 'no new egress destinations' >/dev/null; then
     echo "ok   a seeded baseline matches the window it was seeded from"
   else
     echo "FAIL a seeded baseline matches the window it was seeded from (rc=$rc)"

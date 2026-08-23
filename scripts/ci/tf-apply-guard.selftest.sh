@@ -95,13 +95,13 @@ fi
 # account, so routine IAM churn would have been refused as identity destruction.
 type_fails=0
 for t in google_secret_manager_secret google_service_account; do
-  if ! echo "$t" | grep -qE "$PROTECTED_TYPES"; then
+  if ! echo "$t" | grep -cE "$PROTECTED_TYPES" >/dev/null; then
     printf 'FAIL %s is not matched as protected\n' "$t"; type_fails=$((type_fails + 1))
   fi
 done
 for t in google_service_account_iam_member google_secret_manager_secret_iam_member \
          google_secret_manager_secret_version google_service_account_key; do
-  if echo "$t" | grep -qE "$PROTECTED_TYPES"; then
+  if echo "$t" | grep -cE "$PROTECTED_TYPES" >/dev/null; then
     printf 'FAIL %s is matched as protected — IAM churn would be refused\n' "$t"; type_fails=$((type_fails + 1))
   fi
 done

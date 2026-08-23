@@ -615,6 +615,60 @@ esac
 
 marker="\$SLOT_STATE/\$idx/clean"
 
+# THE BURN COUNT. Beside the marker, in the same root-owned directory and for
+# the same reason: it is a claim about a slot that the slot must not be able to
+# make about itself.
+#
+# What it counts is consecutive failures to reach a clean state — a job failed
+# on arrival because the slot was not left clean, or a reset that could not earn
+# the marker. Any reset that DOES earn the marker clears it, so the number is
+# always "how many in a row, right now", never a lifetime total. That is the
+# only shape the take-out-of-service rule can read: a slot that fails one job in
+# fifty is a repository's problem, and a slot that has failed the last four is
+# the fleet's.
+burns="\$SLOT_STATE/\$idx/burns"
+
+burn_count() {
+  local n=""
+  [ -f "\$burns" ] && read -r n <"\$burns" 2>/dev/null
+  case "\$n" in
+    '' | *[!0-9]*) printf '0' ;;
+    *) printf '%s' "\$n" ;;
+  esac
+}
+
+burn_add() {
+  local n
+  n=\$(burn_count)
+  printf '%s\n' "\$((n + 1))" >"\$burns" 2>/dev/null ||
+    say "slot \$idx: could not record that it burned a job"
+}
+
+# ONE reset at a time per slot, and this became a requirement rather than a
+# nicety when the idle sweep arrived. Until then every caller was the slot's own
+# agent, which is single-threaded across the job boundary: started, then the job,
+# then completed. The sweep is a root timer that resets a slot NO agent is
+# currently driving, so two roots can now be inside one tree — one renaming
+# _work into the holding directory while the other is emptying it, both running
+# rm -rf against paths the other is moving. The window is small and the outcome
+# is not: a half-moved _work is a slot that fails every job until the host goes.
+#
+# The lock file is in the slot's own state directory, which is root-owned 0755
+# and holds the clean marker for the same reason — a slot that could write here
+# could forge the very claim this script exists to make.
+#
+# WAIT rather than skip, because both callers are legitimate and neither is
+# repeatable at no cost: the sweep gives up its tick, and a started hook that
+# skipped the reset would be the one outcome this script must never produce. The
+# deadline is generous because the reset it is waiting on tears down containers
+# under three \`timeout\`s of its own; a wait that expires means something is
+# genuinely wedged, and then refusing is right — the marker is withheld either
+# way, so the sweep tries again in thirty seconds.
+exec 9>>"\$SLOT_STATE/\$idx/.reset.lock" ||
+  { say "slot \$idx: could not open the reset lock"; exit 1; }
+flock -w 300 9 ||
+  { say "slot \$idx: another reset of this slot is still running — refusing to start a second one"; exit 1; }
+
 # How much of _work goes. _actions and _temp are filled by the runner BEFORE the
 # job-started hook is called — actions are downloaded in JobExtension and _temp
 # carries the hook's own invocation — so removing them at that point breaks the
@@ -647,6 +701,12 @@ if [ "\$stage" = started ] && [ ! -f "\$marker" ]; then
   # about to fail deliberately. Its content goes at the completed reset that
   # follows, which is the reset that has to be trusted anyway.
   fail_after=1
+  # A job is about to be failed on this slot. That is the event #278 exists to
+  # count: it is invisible in every fleet series — the host goes on reporting
+  # the slot as serving — and it is also the event that makes a broken slot
+  # WIN work, because failing in six seconds returns it to the queue faster
+  # than a healthy slot can claim one.
+  burn_add
 fi
 # Cleared FIRST. Everything below can fail, and a marker left in place by a
 # reset that did not finish is a lie the next job would believe.
@@ -718,11 +778,57 @@ if [ "\$took" = 1 ]; then
     # into a path that had stopped existing. The CONTENT is what belongs to the
     # previous job; the directory itself belongs to this one, and _tool is on
     # PATH the same way.
+    #
+    # TWO levels deep, not one, and the missing level is what drained the fleet.
+    # The directory the runner hands a step is \$RUNNER_WORKSPACE/<repo> --
+    # \`_work/<repo>/<repo>\` -- so recreating only the depth-1 entry leaves that
+    # chdir target absent. An ordinary job never notices: \`actions/checkout\`
+    # recreates it in the first step, long before anything else needs it. The
+    # FAILED job is the one that pays, and it pays with the slot rather than with
+    # itself:
+    #
+    #   fail_after ends the job before any step runs  nothing recreates the
+    #                                                 workspace
+    #   the job-completed hook is launched IN it      it cannot start at all
+    #   only that hook writes the clean marker        the marker is never written
+    #   the next job finds no marker                  and fails itself, the same
+    #                                                 way, forever
+    #
+    # So a hook written to cost one job costs the slot permanently, and the fleet
+    # drains a slot at a time. Measured 2026-08-23: nine slots across three hosts,
+    # every open pull request blocked, and reruns landing on a different poisoned
+    # slot each time -- which reads as flake and is the opposite of it.
+    #
+    # Depth 2 is the contract rather than a guess: \`_temp\`, \`_actions\` and
+    # \`_tool\` sit at depth 1 and the workspace at depth 2, and nothing the runner
+    # enters is deeper. Bounded there deliberately -- recreating the skeleton of a
+    # \`node_modules\` would be thousands of mkdirs for a tree no runner chdirs into.
+    #
+    # Note what is NOT done here: writing the marker on the fail_after path. The
+    # wipe has just made the slot clean, so it is tempting, and it is wrong --
+    # keep_temp deliberately spares \`_temp\` at 'started', and \`_temp\` is where
+    # google-github-actions/auth leaves its credential file. Claiming clean over
+    # that trades this liveness bug for the credential leak #110 exists to close.
+    # The completed reset empties \`_temp\` and earns the marker honestly; the fix
+    # is to let that reset RUN.
     d=0
-    [ -d "\$e" ] && d=1
+    subdirs=""
+    if [ -d "\$e" ]; then
+      d=1
+      # Listed from the root-owned holding directory, which the slot cannot reach
+      # or rename into -- the same namespace-ownership rule the mv above exists
+      # for. These names are ones root itself just read.
+      [ "\$stage" = started ] &&
+        subdirs=\$(find "\$e" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null)
+    fi
     rm -rf -- "\$e" || { say "slot \$idx: could not remove \$e"; rc=1; }
     if [ "\$d" = 1 ] && [ "\$stage" = started ]; then
       install -d -o "\$u" -g "\$u" -m 0755 "\$e" || { say "slot \$idx: could not recreate \$e"; rc=1; }
+      while IFS= read -r sub; do
+        [ -n "\$sub" ] || continue
+        install -d -o "\$u" -g "\$u" -m 0755 "\$e/\$sub" ||
+          { say "slot \$idx: could not recreate \$e/\$sub"; rc=1; }
+      done <<< "\$subdirs"
     fi
   done
   # Handed back. The slot still owns the parent, so it could have created a NEW
@@ -921,6 +1027,22 @@ fi
 # is about to be dirtied by the job that is starting.
 if [ "\$rc" = 0 ] && [ "\$stage" != started ]; then
   : >"\$marker" || rc=1
+fi
+
+# THE COUNT, decided by the same rc the marker was. A reset that reached the
+# template state is the only evidence that this slot can still be returned to
+# it, so it is the only thing that clears the count — and a reset that could
+# not is exactly the condemned-by-design case #277 leaves behind: a container
+# that will not die, a tag that will not drop, a _work the slot recreated under
+# us. 'started' is skipped in both directions: it never earns the marker, so
+# clearing on it would erase the history at the start of every job, and the
+# burn it may have just recorded above is already counted.
+if [ "\$stage" != started ]; then
+  if [ "\$rc" = 0 ]; then
+    rm -f -- "\$burns"
+  else
+    burn_add
+  fi
 fi
 
 [ "\$fail_after" = 1 ] && exit 1
@@ -1607,6 +1729,431 @@ EOF
 
   systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
   systemctl enable --now ci-pin-sweep.timer >>/var/log/ci-host.log 2>&1 || return 1
+}
+
+# --- the idle slot sweep ------------------------------------------------------
+#
+# A slot with no clean marker is a slot whose last job never reached its
+# completed hook: cancelled hard, agent killed, host lost power mid-job. The
+# started hook refuses to RUN such a slot, and that refusal is right and stays —
+# it is the one state in which _actions cannot be trusted, so a job that ran
+# there would be executing a previous job's action code.
+#
+# What was wrong is that the cleaning waited for a victim. Nothing about a
+# cancelled job's leftovers requires a job to be standing on the slot while they
+# are removed, and the price of waiting was measured: under a fail-fast matrix
+# one red shard cancels its siblings, every cancelled sibling condemns its slot,
+# and every condemned slot then bills the next job that lands on it. At
+# IntegrateIT on 2026-08-23 that reached twelve of twenty-four slots, and a
+# condemned slot burns a job in about six seconds -- faster than a healthy slot
+# can claim one, so it preferentially WINS queued work.
+#
+# So the same reset runs here instead, at the one moment that costs nothing: the
+# slot is dirty AND no job is on it. The stage is 'completed', which is the
+# existing path for exactly this state -- no live job, so both the _actions and
+# _temp exceptions are dropped and the marker is written on success.
+#
+# Three sources feed it and only the first is a defect: a job cancelled by
+# fail-fast, a job that deleted its own workspace so the runner could not launch
+# the completed hook at all, and the periodic audits that withdraw a marker on
+# purpose when a slot's prune inputs stop holding.
+install_slot_sweep() {
+  cat >/opt/ci/job-hooks/slot-sweep.sh <<EOF
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as root on a timer. See install_slot_sweep().
+set -uo pipefail
+
+SLOT_STATE="$SLOT_STATE"
+SLOT_USER_PREFIX="$SLOT_USER_PREFIX"
+SLOTS=$SLOTS
+
+# How long a slot must have been dirty AND idle before this touches it. Two
+# ticks, deliberately: one observation is a sample of two facts read a moment
+# apart, and the whole risk here is acting on a slot a job is arriving at. A
+# job in flight holds a worker process for its entire length, so the pair below
+# cannot BOTH be true under one -- but a pgrep that failed to see a process it
+# should have seen would be indistinguishable from an idle slot, and requiring
+# the state to persist turns that from a wrong action into a skipped tick.
+GRACE=60
+
+# How many consecutive failures to reach a clean state condemn a slot. Counted
+# by slot-reset.sh into \$SLOT_STATE/<idx>/burns; see the burn count there for
+# what does and does not clear it.
+#
+# Small on purpose. The cost of being wrong in one direction is a slot idle for
+# a few minutes on a host that has other slots; in the other it is a slot that
+# burns every job it is handed at six seconds a job, winning the race for
+# queued work against its healthy neighbours because losing is faster than
+# working. Three is two more chances than the evidence in #278 suggests any of
+# them ever used.
+CONDEMN_MAX=3
+
+say() { logger -t ci-slot-sweep -- "\$*" 2>/dev/null || true; echo "slot sweep: \$*" >&2; }
+
+for idx in \$(seq 1 "\$SLOTS"); do
+  u="\$SLOT_USER_PREFIX\$idx"
+  dir="\$SLOT_STATE/\$idx"
+  marker="\$dir/clean"
+  since="\$dir/dirty-since"
+
+  id "\$u" >/dev/null 2>&1 || continue
+  [ -d "\$dir" ] || continue
+
+  # Clean is the ordinary case and the cheap one, and it clears the clock: a
+  # slot that went dirty, served a job and came back must not carry a
+  # measurement taken before all of that toward its next dirty spell.
+  if [ -f "\$marker" ]; then
+    rm -f -- "\$since"
+    continue
+  fi
+
+  # A live job. The marker is absent for the whole length of one -- the started
+  # hook clears it and the completed hook writes it back -- so this is the
+  # ordinary reading of a dirty slot and not an exception.
+  if pgrep -u "\$u" -f 'Runner\.Worker' >/dev/null 2>&1; then
+    rm -f -- "\$since"
+    continue
+  fi
+
+  # A slot mid-transition is somebody else's. 'activating' is the boot reset
+  # running as the agent unit's ExecStartPre, which is this same script under
+  # another name; is-active --quiet answers only for 'active', so the state is
+  # read as a word rather than as a yes/no.
+  state=\$(systemctl is-active "ci-runner@\$idx.service" 2>/dev/null)
+  case "\$state" in
+    activating | deactivating | reloading) continue ;;
+  esac
+
+  now=\$(date +%s)
+  seen=""
+  [ -f "\$since" ] && read -r seen <"\$since"
+  case "\$seen" in
+    [0-9]*) ;;
+    *) seen="\$now"; printf '%s\n' "\$now" >"\$since" || say "slot \$idx: could not record when it went dirty" ;;
+  esac
+  [ \$((now - seen)) -ge "\$GRACE" ] || continue
+
+  # THE AGENT GOES DOWN FIRST, and that is what makes the reset below safe
+  # rather than merely likely to be safe. With the unit stopped no job can be
+  # assigned to this slot at all, so the tree is not being replaced under one
+  # that arrived while the checks above were running.
+  #
+  # It does not close the window entirely, and the same limit is already
+  # recorded on the reserved-slot stop in the pin sweep: a job that arrives
+  # between the pgrep and the stop is killed by the stop. That is one job, on a
+  # slot that has been dirty and idle for a minute, against a slot that
+  # otherwise fails every job it is ever handed. What must not happen is the
+  # reset running UNDER a live job, so the worker is asked for a second time
+  # once the stop has returned.
+  was_active=0
+  [ "\$state" = active ] && was_active=1
+  if [ "\$was_active" = 1 ] &&
+    ! systemctl stop "ci-runner@\$idx.service" >/dev/null 2>&1; then
+    say "slot \$idx: is dirty and idle but its agent would not stop — leaving it for the next sweep"
+    continue
+  fi
+  if pgrep -u "\$u" -f 'Runner\.Worker' >/dev/null 2>&1; then
+    say "slot \$idx: a job is still on it after the agent was stopped — refusing to reset underneath one"
+    [ "\$was_active" = 1 ] &&
+      { systemctl start "ci-runner@\$idx.service" >/dev/null 2>&1 ||
+        say "slot \$idx: and it did not come back up — the next sweep retries"; }
+    continue
+  fi
+
+  reset_ok=0
+  if /opt/ci/job-hooks/slot-reset.sh completed "\$idx" >/dev/null 2>&1; then
+    reset_ok=1
+    rm -f -- "\$since"
+    say "slot \$idx: was left dirty by a job that never completed — reset with no job on it; the next job takes the ordinary path"
+  else
+    # The marker is withheld by the reset itself, which is the correct outcome
+    # and not a second failure to handle here: the slot stays dirty, the started
+    # hook goes on refusing it, and this sweep tries again in thirty seconds.
+    # The clock is deliberately NOT cleared, so the retry is immediate.
+    say "slot \$idx: dirty and idle, but the reset did not finish — it stays dirty and the next sweep retries"
+  fi
+
+  # CONDEMNATION. Everything above retries forever, and forever is the bug: a
+  # slot whose reset can never finish stays dirty, so the started hook goes on
+  # failing every job it is handed, and it is handed a lot of them because
+  # failing takes six seconds. Past CONDEMN_MAX the slot stops being offered
+  # work at all — its agent is simply not started again below.
+  #
+  # A slot serving nothing is strictly better than a slot serving six-second
+  # failures, and it is also the state the rest of the fleet can already SEE: a
+  # stopped agent leaves the repository's runner list, the controller's
+  # host_facts() reads the host as short of slots, and that gap is published as
+  # ci_slots_missing. No new call, no new attribute, and it covers the two
+  # neighbouring shapes as well — a host that registered nothing (#130) and a
+  # host whose slot units never started (#268).
+  #
+  # Not disabled, not deleted: the next tick tries the reset again, so a slot
+  # whose obstruction clears — a wedged container finally reaped, a disk that
+  # came back — recovers on its own.
+  burns=""
+  [ -f "\$dir/burns" ] && read -r burns <"\$dir/burns" 2>/dev/null
+  case "\$burns" in '' | *[!0-9]*) burns=0 ;; esac
+
+  if [ "\$reset_ok" = 0 ] && [ "\$burns" -ge "\$CONDEMN_MAX" ]; then
+    if [ ! -f "\$dir/condemned" ]; then
+      : >"\$dir/condemned" 2>/dev/null || say "slot \$idx: could not record that it is condemned"
+      say "slot \$idx: \$burns consecutive failures to reach a clean state — taking it out of service rather than letting it keep winning jobs it will burn"
+    fi
+    continue
+  fi
+
+  if [ "\$reset_ok" = 1 ] && [ -f "\$dir/condemned" ]; then
+    rm -f -- "\$dir/condemned"
+    say "slot \$idx: clean again after being condemned — putting it back into service"
+    was_active=1
+  fi
+
+  # Back into the pool either way. A slot left down by a failed reset would be
+  # capacity lost to the bookkeeping rather than to the fault, and the marker is
+  # what keeps a job from running on it — not the agent being absent.
+  if [ "\$was_active" = 1 ] &&
+    ! systemctl start "ci-runner@\$idx.service" >/dev/null 2>&1; then
+    say "slot \$idx: reset, but its agent would not start again — the next sweep retries"
+  fi
+done
+
+exit 0
+EOF
+  # Checked, not trusted, and for the reason install_job_hooks records: an
+  # unescaped name in the body above aborts the expansion AFTER the redirect has
+  # truncated the file, leaving a zero-byte script with the right owner and mode
+  # that systemd reports as 203/EXEC.
+  [ -s /opt/ci/job-hooks/slot-sweep.sh ] ||
+    { log "slot-sweep.sh came out empty -- a name in its here-document did not expand"; return 1; }
+  bash -n /opt/ci/job-hooks/slot-sweep.sh ||
+    { log "slot-sweep.sh is not parseable -- refusing to install it"; return 1; }
+  chown root:root /opt/ci/job-hooks/slot-sweep.sh || return 1
+  chmod 0755 /opt/ci/job-hooks/slot-sweep.sh || return 1
+
+  cat >/etc/systemd/system/ci-slot-sweep.service <<'EOF'
+[Unit]
+Description=Reset this host's dirty slots while no job is on them
+
+[Service]
+Type=oneshot
+# A oneshot with no deadline blocks its own timer forever, and this one calls a
+# reset that tears down containers under three timeouts of its own, once per
+# slot. Generous enough that a busy host finishes, bounded so a single wedged
+# docker call cannot stop every later sweep on this host -- which would leave
+# the dirty slots this exists to clear dirty for the life of the host.
+TimeoutStartSec=900
+ExecStart=/opt/ci/job-hooks/slot-sweep.sh
+EOF
+
+  # Every 30 seconds, matching the pin sweep. With GRACE at two ticks a slot
+  # left dirty is back in ordinary service inside about a minute and a half,
+  # against never.
+  cat >/etc/systemd/system/ci-slot-sweep.timer <<'EOF'
+[Unit]
+Description=Sweep this host's dirty idle slots every 30 seconds
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
+  systemctl enable --now ci-slot-sweep.timer >>/var/log/ci-host.log 2>&1 || return 1
+}
+
+# --- the baked-image manifest, re-checked ------------------------------------
+#
+# #233 asked for two things and #250 shipped the per-reset half: at every reset
+# that ends a job, a local image tag survives only if it carries a registry
+# RepoDigest or its id is in $SLOT_STATE/<idx>/baked-images. What that leaves is
+# the other half. The manifest is written ONCE, by load_baked_images() at boot,
+# and nothing afterwards asks whether the facts it records are still facts. A
+# host that runs for days between reboots is trusting a claim made at boot and
+# never revisited.
+#
+# This is a DETECTOR, not a second enforcement path. The per-reset prune is what
+# protects a job; this only asks, on a timer, whether the inputs that prune
+# depends on still hold:
+#
+#   an id that no longer resolves   the image was deleted out from under the
+#                                   store, so the manifest vouches for nothing
+#                                   and the NAME it used to carry is free for a
+#                                   job to take.
+#   the manifest's own ownership    root:root 0644 in a root-owned directory is
+#                                   the only thing stopping a slot from writing
+#                                   its own ids into it, which would bless
+#                                   exactly the substitution #233 is about.
+#   the per-slot state directory    $SLOT_STATE and $SLOT_STATE/<idx> are the
+#                                   namespace a slot must not own: owning it is
+#                                   owning the `clean` marker and the manifest
+#                                   both, whatever their own modes say.
+#   the daemon's data root          $SLOT_STATE/<idx>/docker belongs to THIS
+#                                   slot's user at 0700. Another slot's user, or
+#                                   a wider mode, is one slot reading or writing
+#                                   another's image store.
+#
+# The failure policy is the per-reset one, for the same reasons. A finding that
+# means the slot can be poisoned withdraws that slot's `clean` marker, which is
+# the claim it must not hold; the next job on it is refused until a reset earns
+# the marker back. A daemon that is simply absent is LOGGED and nothing more —
+# it already fails the next job at its first `docker` line, and taking the
+# marker on top of that turns a slot with no dockerd into a slot that also fails
+# every job for a reason nothing names.
+#
+# A slot that is mid-job has no marker to withdraw, so this needs no interlock
+# with the runner: the removal is a no-op exactly when a job is running, and the
+# reset that ends that job re-runs the prune and re-earns the marker.
+install_baked_image_audit() {
+  cat >/opt/ci/job-hooks/baked-image-audit.sh <<EOF
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as root on a timer. See install_baked_image_audit().
+set -uo pipefail
+
+SLOT_STATE="$SLOT_STATE"
+SLOT_USER_PREFIX="$SLOT_USER_PREFIX"
+SLOTS=$SLOTS
+
+say() { logger -t ci-baked-audit -- "\$*" 2>/dev/null || true; echo "baked-image audit: \$*" >&2; }
+
+# Checked once, not once per slot: it is one directory, and a finding on it is
+# a finding about every slot on the host.
+state_own=\$(stat -c '%U:%G:%a' -- "\$SLOT_STATE" 2>/dev/null || echo missing)
+if [ "\$state_own" != "root:root:755" ]; then
+  say "\$SLOT_STATE is \$state_own, not root:root:755 -- every slot's clean marker and baked-image manifest is forgeable"
+fi
+
+for idx in \$(seq 1 "\$SLOTS"); do
+  u="\$SLOT_USER_PREFIX\$idx"
+  dir="\$SLOT_STATE/\$idx"
+  manifest="\$dir/baked-images"
+  marker="\$dir/clean"
+  droot="\$dir/docker"
+  sock="/run/\$u/docker.sock"
+  poisoned=0
+
+  [ -d "\$dir" ] || continue
+
+  # The state directory ITSELF, before anything inside it. A slot that owns this
+  # can create, rename and replace every name below it, so a manifest reporting
+  # root:root 0644 inside a slot-owned parent is telling the truth about a file
+  # the slot can swap out from under the check.
+  if [ "\$state_own" != "root:root:755" ]; then
+    poisoned=1
+  fi
+  dir_own=\$(stat -c '%U:%G:%a' -- "\$dir" 2>/dev/null || echo missing)
+  if [ "\$dir_own" != "root:root:755" ]; then
+    say "slot \$idx: \$dir is \$dir_own, not root:root:755 -- the slot owns the namespace holding its own clean marker"
+    poisoned=1
+  fi
+
+  # The daemon's data root is the one leaf in here the slot may write, and it
+  # may write only its OWN. \`stat\` follows a symlink, so the link test comes
+  # first or a slot-planted link to a root-owned directory reads as compliant.
+  if [ -L "\$droot" ]; then
+    say "slot \$idx: \$droot is a symlink -- the image store is not where this host thinks it is"
+    poisoned=1
+  elif [ -e "\$droot" ]; then
+    droot_own=\$(stat -c '%U:%G:%a' -- "\$droot" 2>/dev/null || echo missing)
+    if [ "\$droot_own" != "\$u:\$u:700" ]; then
+      say "slot \$idx: \$droot is \$droot_own, not \$u:\$u:700 -- another account can read or write this slot's image store"
+      poisoned=1
+    fi
+  fi
+
+  # A MISSING manifest is not a finding. Most pools bake no images at all, and
+  # the prune reads an absent file as an empty one: with nothing baked, a
+  # registry digest is the only thing that vouches for a tag, which is correct.
+  if [ -L "\$manifest" ]; then
+    say "slot \$idx: \$manifest is a symlink -- the prune is reading a file this host did not write"
+    poisoned=1
+  elif [ -f "\$manifest" ]; then
+    man_own=\$(stat -c '%U:%G:%a' -- "\$manifest" 2>/dev/null || echo missing)
+    if [ "\$man_own" != "root:root:644" ]; then
+      say "slot \$idx: \$manifest is \$man_own, not root:root:644 -- a slot can add its own ids and bless its own images"
+      poisoned=1
+    fi
+
+    if [ -S "\$sock" ]; then
+      ids=\$(grep -v '^[[:space:]]*\$' -- "\$manifest" 2>/dev/null)
+      if [ -n "\$ids" ]; then
+        # One inspect for the whole list rather than one per id: a list with a
+        # dead id still prints every live one, so the SET it returns is the
+        # answer and the non-zero exit is not.
+        #
+        # word-splitting \$ids is the point -- one id per argument.
+        # shellcheck disable=SC2086
+        live=\$(timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+                 docker image inspect --format '{{.Id}}' -- \$ids 2>/dev/null)
+        while IFS= read -r id; do
+          [ -n "\$id" ] || continue
+          # \`grep -c ... >/dev/null\`, never \`grep -q\`: -q exits on the first
+          # match, the in-process \`printf\` dies of EPIPE, and pipefail then
+          # reports a pipeline that FOUND its id as one that did not.
+          printf '%s\n' "\$live" | grep -cxF -- "\$id" >/dev/null && continue
+          say "slot \$idx: the manifest names \$id, which the store no longer has -- it vouches for nothing, and the name it carried is free for a job to take"
+          poisoned=1
+        done <<< "\$ids"
+      fi
+    else
+      say "slot \$idx: no docker socket at \$sock -- the manifest's ids were not checked"
+    fi
+  fi
+
+  # The marker, and only the marker. This detects; the reset enforces. Removing
+  # it is a no-op on a slot that is mid-job -- a running job already cleared it
+  # -- and on an idle one it is exactly the refusal the next job needs.
+  if [ "\$poisoned" = 1 ] && [ -f "\$marker" ]; then
+    if rm -f -- "\$marker"; then
+      say "slot \$idx: clean marker withdrawn -- the next job on this slot is refused until a reset earns it back"
+    else
+      say "slot \$idx: could not withdraw the clean marker -- the slot is poisoned and still claims to be clean"
+    fi
+  fi
+done
+exit 0
+EOF
+  chown root:root /opt/ci/job-hooks/baked-image-audit.sh || return 1
+  chmod 0755 /opt/ci/job-hooks/baked-image-audit.sh || return 1
+
+  cat >/etc/systemd/system/ci-baked-image-audit.service <<'EOF'
+[Unit]
+Description=Re-check each slot's baked-image manifest and the state directory holding it
+
+[Service]
+Type=oneshot
+# A oneshot with no deadline blocks its own timer forever. Every call in here is
+# already bounded -- the only unbounded one would be `docker image inspect`, and
+# it carries its own `timeout` -- so this ceiling is the backstop rather than the
+# control.
+TimeoutStartSec=180
+ExecStart=/opt/ci/job-hooks/baked-image-audit.sh
+EOF
+
+  # Every 15 minutes, not every 30 seconds. The per-reset prune already runs at
+  # every job boundary, which is where a poisoning would actually be exploited;
+  # this covers the span BETWEEN boundaries on a host that has been up for days,
+  # and wants to be cheap enough that nobody turns it off. The first run waits
+  # five minutes so it does not race the boot-time `docker load`, whose manifest
+  # is only moved into place when the load finishes.
+  cat >/etc/systemd/system/ci-baked-image-audit.timer <<'EOF'
+[Unit]
+Description=Re-check the baked-image manifests every 15 minutes
+
+[Timer]
+OnBootSec=300
+OnUnitActiveSec=900
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
+  systemctl enable --now ci-baked-image-audit.timer >>/var/log/ci-host.log 2>&1 || return 1
 }
 
 # --- registry credentials for job containers ----------------------------------
@@ -3296,7 +3843,29 @@ PrivateTmp=yes
 # Ignored with a warning by systemd older than 247, which is why it is not the
 # argument for anything — it is the belt over the tokens already being out of
 # argv, not a substitute for it.
-ProtectProc=invisible
+#
+# And the belt is OFF, because it cost more than it held. Hiding /proc/1 hides
+# it from the runner too, and actions/runner reads /proc/1/cgroup to decide
+# whether it is itself inside a container before it starts a job's service
+# containers. It cannot, so it does not: every job with `services:` or
+# `container:` died in 'Initialize containers' with
+#
+#   Could not find a part of the path '/proc/1/cgroup'.
+#   Value cannot be null. (Parameter 'network')
+#
+# which on this repository is every test shard, because they all bring up
+# Postgres that way. Measured 2026-08-23: hosts on the image carrying this
+# setting failed those jobs outright while the previous generation passed them,
+# so which host a job landed on decided whether CI could run at all.
+#
+# There is no narrower setting. hidepid=1 and ProtectProc=noaccess leave the pid
+# listed and refuse the read ('Operation not permitted'), which fails the same
+# way; gid= would hand the whole view back to the very accounts it is hiding
+# things from. The security property this was doubling — the App JWT and the
+# registration token are not in argv at ALL — is unaffected and is what the
+# self-test asserts. Do not re-add this without first showing a container job
+# still initializes.
+ProtectProc=default
 # The data root is OUTSIDE the slot's home, which is what lets the home be
 # emptied between jobs (#110) — and also what keeps a reset cheap: every image
 # this host has warmed lives here and survives one.
@@ -3856,10 +4425,11 @@ Environment=CI_SHARED_INFRA_PORT_MAX=$(slot_band_max "$idx")
 # clean slot must not run in a previous job's leftovers.
 Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci/job-hooks/job-started.sh
 Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/job-completed.sh
-# The one that matters: this is the unit job code runs under, and everything a
-# job spawns inherits this mount namespace, so a step cannot read root's argv --
-# nor a sibling slot's — out of /proc. See the daemon unit for why both carry it.
-ProtectProc=invisible
+# This is the unit job code runs under, and everything a job spawns inherits
+# this mount namespace — which is exactly why it cannot hide /proc/1: the runner
+# is in here, and it reads /proc/1/cgroup before starting any job container. See
+# the daemon unit for the measurement and for why there is no narrower setting.
+ProtectProc=default
 # The third reset, and the one the two hooks cannot cover: an agent KILLED
 # mid-job never runs its completed hook, and a host that reboots warm starts its
 # agents over a disk the previous boot's jobs wrote. '+' runs this as root in
@@ -3891,28 +4461,25 @@ EOF
   log "slot $idx registered as $name"
 }
 
-# ProtectProc= covers the slot units, and a container is the hole it leaves: a
-# job can ask its own daemon for `--pid=host`, and a fresh procfs mount inside
-# that namespace would show the whole host again. The kernel refuses such a mount
-# unless it is at least as restrictive as the one already visible, so setting
-# hidepid on the host /proc is what makes the unit-level setting hold everywhere
-# below it.
+# The host /proc, and the OTHER half of a setting that had to come off. hidepid is
+# what makes the unit-level hiding hold below a `--pid=host` container, so
+# leaving it while the units say ProtectProc=default would hide /proc/1 from the
+# runner anyway and keep every container job broken — the two only make sense
+# together, in either direction.
 #
-# hidepid=2, not 1: 1 hides the contents of another uid's /proc/<pid> but still
-# lists the pid, and the argv of a boot-time process is exactly what must not be
-# enumerable. No gid= escape hatch — a group that can see everything is the
-# thing being removed.
-#
-# Fails OPEN, deliberately, and it is the only hardening here that does. The
-# security property is that the tokens are not in argv at all; this makes the
-# whole CLASS unreadable so a future call site cannot reintroduce it. A kernel
-# or a mount policy that will not take the option is a reason to log loudly, not
-# a reason to take a pool offline over a defence in depth.
+# What remains is the property that always did the work: the JWT and the
+# registration token are never in any argv, enforced at the call sites and
+# asserted there. This function said so itself — "the security property is that
+# the tokens are not in argv at all" — and said it fails open rather than take a
+# pool offline over a defence in depth. It was taking the pool offline.
 harden_proc() {
-  if mount -o remount,nosuid,nodev,noexec,hidepid=2 /proc 2>/dev/null; then
-    log "/proc remounted hidepid=2 — one uid cannot read another's argv"
+  # Explicit, not merely absent: an image can be relaunched onto a host whose
+  # /proc a previous boot of THIS script hardened, and a remount is the only
+  # thing that puts it back. hidepid=0 is the kernel default.
+  if mount -o remount,nosuid,nodev,noexec,hidepid=0 /proc 2>/dev/null; then
+    log "/proc left readable — the runner needs /proc/1/cgroup to start job containers"
   else
-    log "WARNING: could not remount /proc with hidepid=2; argv stays world-readable on this host, so every future call site must keep its own secrets out of it"
+    log "WARNING: could not remount /proc; if a previous boot set hidepid, jobs using service containers will fail in 'Initialize containers'"
   fi
 }
 
@@ -4028,6 +4595,19 @@ main() {
 
   systemctl daemon-reload
 
+  # After the agents, because it stops and starts their units by name, and after
+  # the daemon-reload that makes those units known.
+  #
+  # Fails OPEN, and this is the one place in main() where that is the safer
+  # reading rather than the lazier one. Everything above it fails CLOSED because
+  # without it a host would serve jobs it should not: unfenced, unreset, or with
+  # no credentials. Without the sweep a host serves jobs exactly as it did
+  # before this existed -- it loses the recovery, not the isolation -- and
+  # refusing to register over a missing timer would turn a repairable host into
+  # a fleet outage of the kind the sweep is here to end.
+  install_slot_sweep ||
+    log "the idle slot sweep did not install — a slot left dirty by a cancelled job will stay dirty until this host is recycled"
+
   if [ "$failures" -ge "$SLOTS" ]; then
     # Zero registered agents = a host GitHub will never send work to. It cannot
     # fix itself, so it announces the fact and lets the controller drain it
@@ -4041,6 +4621,14 @@ main() {
   # AFTER the host is announced ready, so a slow image load delays nothing that
   # matters: the agents are registered and already taking work by this point.
   wait_for_image_loads
+
+  # After the loads, because the manifests it re-checks are what those loads
+  # write. Fails OPEN, and deliberately: this is a detector over a control that
+  # already runs at every job boundary, so a host that could not install it is a
+  # host with the protection it always had and none of the reporting. Refusing
+  # to serve over that would cost more than it buys.
+  install_baked_image_audit ||
+    log "could not install the periodic baked-image audit — the per-reset prune still runs, but nothing re-checks the manifests between jobs"
 }
 
 main "$@"
