@@ -226,7 +226,10 @@ mutate "a commented block-scalar header no longer opens a block" \
 # The merge-queue route. RUNNER12 is a security rule whose failure is silent in
 # both directions -- the workflow is green either way -- so "the detector has
 # been seen to fire" is worth more here than anywhere else in this file.
-# shellcheck disable=SC2016  # the gate's own source text, matched literally
+#
+# The SC2016 waivers below sit on each `mutate` that needs one rather than here:
+# a directive applies to the next command, not to a block, and one written at the
+# top of a section reads as covering the section while covering one call.
 
 # 19. The reader stops reporting the route at all. Every rule below is untouched
 #     and reviews as correct; none of them is ever handed the fact it branches
@@ -238,8 +241,10 @@ mutate "the reader no longer reports the queue route" \
 #        fixture because each half is a different vulnerability: without the
 #        same-repo test a FORK takes the reserved pool, without the author test
 #        any member of the repository does.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "the same-repo conjunct no longer required" \
   's@  \[ "$same_repo" -eq 0 \] && missing=@  [ 1 -eq 0 ] \&\& missing=@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "the Mergify-author conjunct no longer required" \
   's@  \[ "$author" -eq 0 \] && missing=@  [ 1 -eq 0 ] \&\& missing=@'
 
