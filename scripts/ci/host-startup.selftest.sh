@@ -1252,7 +1252,7 @@ _live=$(awk -v SQ="'" '
 if [ -z "$_live" ]; then
   ok
 else
-  bad "a backtick inside an unquoted heredoc is a command substitution the boot would run, not prose -- line(s): $(echo $_live)"
+  bad "a backtick inside an unquoted heredoc is a command substitution the boot would run, not prose -- line(s): ${_live//$'\n'/ }"
 fi
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

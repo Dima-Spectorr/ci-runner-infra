@@ -236,7 +236,7 @@ alone is buildable.
 `ci-pin-hold --reserve-slot` records that this slot belongs to this run. The
 record is written by a root helper into a root-owned directory that jobs can
 read and none can write, reached through a sudoers allowlist of exactly three
-command lines (`--run *`, `renew`, `status`) — and the helper takes no slot
+command lines (`--run *`, `renew --run *`, `status`) — and the helper takes no slot
 argument at all: it derives the index from `SUDO_UID`, the way `slot-reset.sh`
 already does, so a slot cannot name a neighbour's. What PR-authored code can ask
 for is bounded rather than trusted: the run id is shape-checked, the TTL is
