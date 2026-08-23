@@ -129,6 +129,13 @@ body_of() { # <opening-line> — the here-document body, up to its own EOF
 NOISE="$SB/expansion-noise"
 : >"$NOISE"
 
+# Everything the two hooks say, kept rather than discarded. Both are chatty on
+# the way out — every refusal in them is a `say` — while a failing assertion
+# here is a one-line "boot succeeds FAIL" naming an exit status and no reason.
+# The log is printed only when something failed, so a green run stays quiet.
+HOOKLOG="$SB/hook-output"
+: >"$HOOKLOG"
+
 expand_into() { # <destination> <body>
   # The same unquoted here-document the host uses, so the same expansion. `set
   # -u` is the point as much as the expansion is: an unbound name aborts here
@@ -197,8 +204,20 @@ sed -i "s#/opt/ci/job-hooks/slot-reset\.sh#$RESET#" "$SWEEP"
 
 # --- the fixture --------------------------------------------------------------
 
+# mktemp gives the sandbox 0700 root, and every path below it inherits that as
+# an execute barrier: a `sudo -u ci-s1` step cannot TRAVERSE into its own slot
+# directory, let alone write there. On a host the slot tree lives under a 0755
+# /var/lib path. Without this the tests that act as the slot fail on the fixture
+# rather than on the thing they are testing.
+chmod 0755 "$SB"
+
 install -d -o root -g root -m 0755 "$SLOT_STATE" "$SLOT_STATE/$IDX" "$PIN_DIR"
-install -d -o root -g root -m 0700 "$SLOT_ROOT/.reset"
+# Both levels, the way provision_slot_user creates them. The reset renames _work
+# into $SLOT_ROOT/.reset/$idx/ for the duration; with the per-slot level missing
+# that rename fails, the reset gives up before it purges anything, and the
+# result reads as "the reset does not empty _work" — a fixture gap wearing the
+# costume of the bug this suite exists to catch.
+install -d -o root -g root -m 0700 "$SLOT_ROOT/.reset" "$SLOT_ROOT/.reset/$IDX"
 install -d -m 0755 "$SLOT_TEMPLATE"
 printf 'from the template\n' >"$SLOT_TEMPLATE/.bashrc"
 install -d -o "$U" -g "$U" -m 0755 "$SLOT_ROOT/$IDX"
@@ -218,7 +237,7 @@ seed_work() {
 # directory. Reproducing that is the whole point of this fixture: it is the
 # thing the reset can delete out from under the hook that comes after it.
 in_workspace() { # <stage>
-  ( cd "$WORKSPACE" 2>/dev/null || exit 127; "$RESET" "$1" "$IDX" >/dev/null 2>&1 )
+  ( cd "$WORKSPACE" 2>/dev/null || exit 127; "$RESET" "$1" "$IDX" >>"$HOOKLOG" 2>&1 )
 }
 
 # --- the stages ---------------------------------------------------------------
@@ -227,7 +246,7 @@ echo
 echo "boot"
 seed_work
 printf 'a stale dotfile\n' >"$HOME_DIR/.leftover"
-"$RESET" boot "$IDX" >/dev/null 2>&1
+"$RESET" boot "$IDX" >>"$HOOKLOG" 2>&1
 rc=$?
 check "boot succeeds"                        test "$rc" = 0
 check "boot writes the clean marker"         test -f "$MARKER"
@@ -293,17 +312,17 @@ in_workspace completed >/dev/null 2>&1
 echo
 echo "refusals"
 seed_work
-"$RESET" started nonsense >/dev/null 2>&1
+"$RESET" started nonsense >>"$HOOKLOG" 2>&1
 check "a non-numeric index is refused"  test "$?" != 0
-"$RESET" wipe "$IDX" >/dev/null 2>&1
+"$RESET" wipe "$IDX" >>"$HOOKLOG" 2>&1
 check "an unknown stage is refused"     test "$?" != 0
 
 # A slot owns the parent of _work, so the name is one an untrusted account can
 # replace. Following it would have root empty whatever it points at.
-"$RESET" completed "$IDX" >/dev/null 2>&1
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
 rm -rf -- "$WORK"
 sudo -u "$U" ln -s /tmp "$WORK"
-"$RESET" completed "$IDX" >/dev/null 2>&1
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
 rc=$?
 check "a _work replaced by a symlink is refused" test "$rc" != 0
 check "and the slot is not marked clean"         test ! -f "$MARKER"
@@ -319,9 +338,9 @@ rm -f -- "$WORK"
 echo
 echo "sweep: a clean slot"
 seed_work
-"$RESET" completed "$IDX" >/dev/null 2>&1
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
 printf '%s\n' 1 >"$SINCE"
-"$SWEEP" >/dev/null 2>&1
+"$SWEEP" >>"$HOOKLOG" 2>&1
 check "a clean slot is left alone"                test -f "$MARKER"
 check "and its dirty clock is cleared"            test ! -f "$SINCE"
 
@@ -329,7 +348,7 @@ echo
 echo "sweep: a dirty slot, first sight"
 seed_work
 rm -f -- "$MARKER"
-"$SWEEP" >/dev/null 2>&1
+"$SWEEP" >>"$HOOKLOG" 2>&1
 check "the first tick does not act"               test ! -f "$MARKER"
 check "the first tick starts the clock"           test -f "$SINCE"
 check "the slot is left as it was"                test -f "$WORK/_actions/action.yml"
@@ -337,7 +356,7 @@ check "the slot is left as it was"                test -f "$WORK/_actions/action
 echo
 echo "sweep: a dirty slot, still dirty a grace later"
 printf '%s\n' 1 >"$SINCE"
-"$SWEEP" >/dev/null 2>&1
+"$SWEEP" >>"$HOOKLOG" 2>&1
 check "the slot is reset"                         test -f "$MARKER"
 check "and the leftovers are gone"                test ! -e "$WORK/_actions/action.yml"
 check "and the clock is cleared"                  test ! -f "$SINCE"
@@ -355,12 +374,18 @@ printf '%s\n' 1 >"$SINCE"
 sudo -u "$U" bash -c 'exec -a Runner.Worker sleep 20' &
 worker=$!
 sleep 1
-"$SWEEP" >/dev/null 2>&1
+"$SWEEP" >>"$HOOKLOG" 2>&1
 check "a slot with a worker on it is not reset"   test -f "$WORK/_actions/action.yml"
 check "and it is not marked clean underneath one" test ! -f "$MARKER"
 check "and its clock is reset, not advanced"      test ! -f "$SINCE"
 kill "$worker" >/dev/null 2>&1
 wait "$worker" >/dev/null 2>&1
+
+if [ "$FAIL" -gt 0 ] && [ -s "$HOOKLOG" ]; then
+  echo
+  echo "what the hooks said:"
+  sed 's/^/  /' "$HOOKLOG"
+fi
 
 echo
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
