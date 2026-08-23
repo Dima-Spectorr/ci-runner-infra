@@ -361,8 +361,14 @@ has_slot_reset() { # <file>
   # does, and only strictly inside the slot's own _work.
   matches "$code" 'cwd=\\\$\(pwd -P' || return 1
   matches "$code" 'if \[ "\\\$stage" = started \] && \[ -n "\\\$cwd" \]; then' || return 1
+  matches "$code" 'case "\\\$cwd" in' || return 1
   matches "$code" '"\\\$work"/\?\*)' || return 1
   matches "$code" 'install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$cwd"' || return 1
+  # …and it may not fail the job when it does not land. At 'started' the hook's
+  # exit status is the job's, so folding this into \$rc would turn a missing
+  # convenience directory into a lost job — the same outage one layer over.
+  matches "$code" 'm 0755 "\\\$cwd" \\$' || return 1
+  matches "$code" '^ *\|\| say "slot \\\$idx: could not recreate the job.s working directory' || return 1
 
   # the daemon's data root is OUT of the home, which is what makes the home
   # disposable at all — leave it in and a reset deletes the store of a daemon
@@ -600,11 +606,20 @@ has_secrets_out_of_argv() { # <file>
   # host that cannot carry it must not register rather than fall back to argv.
   matches "$joined" 'sudo_passes_env "\$u".*return 1' || return 1
 
-  # Belt, so the next call site cannot reintroduce the class: both slot units
-  # (they share a mount namespace, so one-sided is a coin toss) plus the host
-  # /proc, which is what stops a `--pid=host` container from seeing around them.
-  [ "$(printf '%s\n' "$code" | grep -cE '^ProtectProc=invisible')" -eq 2 ] || return 1
-  matches "$code" 'remount,nosuid,nodev,noexec,hidepid=2 /proc' || return 1
+  # There WAS a belt on top of this — /proc hidden from the slot users, so that
+  # a future call site could not reintroduce the class even if it tried. It is
+  # gone, and its absence is asserted rather than merely allowed: hiding /proc/1
+  # hides it from the runner, which reads /proc/1/cgroup before it will start a
+  # job's service containers, so every test shard on this repository died in
+  # 'Initialize containers'. Re-adding it silently would take CI down again, and
+  # the two settings must move together — a unit that hides /proc while the host
+  # mount does not, or the reverse, is the same outage.
+  ! matches "$code" '^ProtectProc=invisible' || return 1
+  ! matches "$code" 'hidepid=[1-9]' || return 1
+  [ "$(printf '%s\n' "$code" | grep -cE '^ProtectProc=default')" -eq 2 ] || return 1
+  # Explicit, not absent: a warm host may already carry hidepid from a previous
+  # boot of this script, and only a remount takes it off.
+  matches "$code" 'remount,nosuid,nodev,noexec,hidepid=0 /proc' || return 1
   matches "$code" '^  harden_proc$'
 }
 
@@ -1107,7 +1122,8 @@ mutate "sudoers installed unvalidated"    's@visudo -cqf "\$tmp"@true@'         
 mutate "marker left forgeable by the slot" 's@install -d -o root -g root -m 0755 "\$SLOT_STATE/\$idx"@install -d -o "\$u" -g "\$u" -m 0755 "\$SLOT_STATE/\$idx"@' has_slot_reset
 mutate "dirty slot allowed to run anyway" 's@^  fail_after=1$@  fail_after=0@'                                     has_slot_reset
 mutate "failed slot loses its cwd for good" 's@^  case "\\\$cwd" in$@  case "" in@'                                 has_slot_reset
-mutate "cwd recreated from any path"      's@"\\\$work"/\?\*)@*)@'                                                 has_slot_reset
+mutate "cwd recreated from any path"      's@"\\\$work"/[?]\*)@    *)@'                                            has_slot_reset
+mutate "recreation failure fails the job" 's@|| say "slot \\\$idx: could not recreate the job@|| rc=1; say "slot \\\$idx: could not recreate the job@' has_slot_reset
 mutate "work folder left alone"         's@work="\\\$SLOT_ROOT/\\\$idx/_work"@work="\$SLOT_ROOT/\$idx/_none"@'  has_slot_reset
 mutate "starting job loses its actions"   's@keep_actions=1@keep_actions=0@'                                     has_slot_reset
 mutate "prepared workspace unlinked"      's@install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"@true@'                     has_slot_reset
@@ -1158,9 +1174,9 @@ mutate "env prefix dropped from config.sh" '/^  ACTIONS_RUNNER_INPUT_TOKEN=/d'  
 mutate "sudo stops preserving the variable" 's@--preserve-env=ACTIONS_RUNNER_INPUT_TOKEN @@'                      has_secrets_out_of_argv
 mutate "--token added back alongside it"   's@--url "https://github.com/$OWNER@--token "$token" --url "https://github.com/$OWNER@' has_secrets_out_of_argv
 mutate "silent env drop no longer fatal"   '/sudo will not pass an environment variable/s@; return 1; }@; }@'     has_secrets_out_of_argv
-mutate "only one slot unit hides /proc"    '0,/^ProtectProc=invisible/s@^ProtectProc=invisible@#&@'               has_secrets_out_of_argv
-mutate "hidepid weakened to 1"             's@hidepid=2@hidepid=1@'                                               has_secrets_out_of_argv
-mutate "host /proc left readable"          '/^  harden_proc$/d'                                                   has_secrets_out_of_argv
+mutate "one slot unit hides /proc again"   '0,/^ProtectProc=default/s@^ProtectProc=default@ProtectProc=invisible@' has_secrets_out_of_argv
+mutate "host /proc hidden again"           's@hidepid=0@hidepid=2@'                                               has_secrets_out_of_argv
+mutate "hidepid left to a warm host"       '/^  harden_proc$/d'                                                   has_secrets_out_of_argv
 
 mutate "share never computed"        's@^  local SHARE_ENV; SHARE_ENV=\$(share_env)$@@'          has_slot_share
 mutate "share never reaches the unit" 's@^\$SHARE_ENV$@@'                                        has_slot_share

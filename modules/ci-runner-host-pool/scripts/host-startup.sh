@@ -681,8 +681,14 @@ fi
 if [ "\$stage" = started ] && [ -n "\$cwd" ]; then
   case "\$cwd" in
     "\$work"/?*)
+      # NOT fatal, and not folded into \$rc. At 'started' the script's exit
+      # status IS the job's, so a non-zero here fails the job — and this
+      # directory is a convenience for the hook that comes after, not a
+      # property the job depends on. Failing a job because a mkdir did not
+      # land would trade the loop this fixes for a fresh way to lose jobs,
+      # which is the same shape of outage one layer over. It says so instead.
       install -d -o "\$u" -g "\$u" -m 0755 "\$cwd" \
-        || { say "slot \$idx: could not recreate the job's working directory \$cwd"; rc=1; }
+        || say "slot \$idx: could not recreate the job's working directory \$cwd"
       ;;
   esac
 fi
@@ -3228,7 +3234,29 @@ PrivateTmp=yes
 # Ignored with a warning by systemd older than 247, which is why it is not the
 # argument for anything — it is the belt over the tokens already being out of
 # argv, not a substitute for it.
-ProtectProc=invisible
+#
+# And the belt is OFF, because it cost more than it held. Hiding /proc/1 hides
+# it from the runner too, and actions/runner reads /proc/1/cgroup to decide
+# whether it is itself inside a container before it starts a job's service
+# containers. It cannot, so it does not: every job with `services:` or
+# `container:` died in 'Initialize containers' with
+#
+#   Could not find a part of the path '/proc/1/cgroup'.
+#   Value cannot be null. (Parameter 'network')
+#
+# which on this repository is every test shard, because they all bring up
+# Postgres that way. Measured 2026-08-23: hosts on the image carrying this
+# setting failed those jobs outright while the previous generation passed them,
+# so which host a job landed on decided whether CI could run at all.
+#
+# There is no narrower setting. hidepid=1 and ProtectProc=noaccess leave the pid
+# listed and refuse the read ('Operation not permitted'), which fails the same
+# way; gid= would hand the whole view back to the very accounts it is hiding
+# things from. The security property this was doubling — the App JWT and the
+# registration token are not in argv at ALL — is unaffected and is what the
+# self-test asserts. Do not re-add this without first showing a container job
+# still initializes.
+ProtectProc=default
 # The data root is OUTSIDE the slot's home, which is what lets the home be
 # emptied between jobs (#110) — and also what keeps a reset cheap: every image
 # this host has warmed lives here and survives one.
@@ -3766,10 +3794,11 @@ Environment=CI_SHARED_INFRA_PORT_MAX=$(slot_band_max "$idx")
 # clean slot must not run in a previous job's leftovers.
 Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci/job-hooks/job-started.sh
 Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/job-completed.sh
-# The one that matters: this is the unit job code runs under, and everything a
-# job spawns inherits this mount namespace, so a step cannot read root's argv --
-# nor a sibling slot's — out of /proc. See the daemon unit for why both carry it.
-ProtectProc=invisible
+# This is the unit job code runs under, and everything a job spawns inherits
+# this mount namespace — which is exactly why it cannot hide /proc/1: the runner
+# is in here, and it reads /proc/1/cgroup before starting any job container. See
+# the daemon unit for the measurement and for why there is no narrower setting.
+ProtectProc=default
 # The third reset, and the one the two hooks cannot cover: an agent KILLED
 # mid-job never runs its completed hook, and a host that reboots warm starts its
 # agents over a disk the previous boot's jobs wrote. '+' runs this as root in
@@ -3801,28 +3830,25 @@ EOF
   log "slot $idx registered as $name"
 }
 
-# ProtectProc= covers the slot units, and a container is the hole it leaves: a
-# job can ask its own daemon for `--pid=host`, and a fresh procfs mount inside
-# that namespace would show the whole host again. The kernel refuses such a mount
-# unless it is at least as restrictive as the one already visible, so setting
-# hidepid on the host /proc is what makes the unit-level setting hold everywhere
-# below it.
+# The host /proc, and the OTHER half of a setting that had to come off. hidepid is
+# what makes the unit-level hiding hold below a `--pid=host` container, so
+# leaving it while the units say ProtectProc=default would hide /proc/1 from the
+# runner anyway and keep every container job broken — the two only make sense
+# together, in either direction.
 #
-# hidepid=2, not 1: 1 hides the contents of another uid's /proc/<pid> but still
-# lists the pid, and the argv of a boot-time process is exactly what must not be
-# enumerable. No gid= escape hatch — a group that can see everything is the
-# thing being removed.
-#
-# Fails OPEN, deliberately, and it is the only hardening here that does. The
-# security property is that the tokens are not in argv at all; this makes the
-# whole CLASS unreadable so a future call site cannot reintroduce it. A kernel
-# or a mount policy that will not take the option is a reason to log loudly, not
-# a reason to take a pool offline over a defence in depth.
+# What remains is the property that always did the work: the JWT and the
+# registration token are never in any argv, enforced at the call sites and
+# asserted there. This function said so itself — "the security property is that
+# the tokens are not in argv at all" — and said it fails open rather than take a
+# pool offline over a defence in depth. It was taking the pool offline.
 harden_proc() {
-  if mount -o remount,nosuid,nodev,noexec,hidepid=2 /proc 2>/dev/null; then
-    log "/proc remounted hidepid=2 — one uid cannot read another's argv"
+  # Explicit, not merely absent: an image can be relaunched onto a host whose
+  # /proc a previous boot of THIS script hardened, and a remount is the only
+  # thing that puts it back. hidepid=0 is the kernel default.
+  if mount -o remount,nosuid,nodev,noexec,hidepid=0 /proc 2>/dev/null; then
+    log "/proc left readable — the runner needs /proc/1/cgroup to start job containers"
   else
-    log "WARNING: could not remount /proc with hidepid=2; argv stays world-readable on this host, so every future call site must keep its own secrets out of it"
+    log "WARNING: could not remount /proc; if a previous boot set hidepid, jobs using service containers will fail in 'Initialize containers'"
   fi
 }
 
