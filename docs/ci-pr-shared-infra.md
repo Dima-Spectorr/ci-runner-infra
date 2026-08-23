@@ -103,8 +103,23 @@ local job. Three things about this call are not decoration:
   owner and report two stacks clean.
 
 `pin-ttl` sizing is §4; the remaining inputs (`compose-file`,
-`compose-project`, `hosted-runner`, `timeout-minutes`) are documented on the
-workflow itself and default to what the example uses.
+`compose-project`, `hosted-runner`) are documented on the workflow itself and
+default to what the example uses.
+
+**Rule 1 without rule 2.** An empty `compose-file` is pin-only: the host is
+pinned and the run's jobs land together, and nothing is brought up. Two cases
+need it. A repository with no shared infrastructure would otherwise have to
+invent a compose file to get host affinity at all. And a repository whose lane
+model has a docs-only lane wants the pin for the jobs that still run and no
+database for the shards that do not, which it selects with an expression:
+
+```yaml
+        compose-file: ${{ needs.lane.outputs.lane == 'none' && '' || 'ci/compose.yaml' }}
+```
+
+`pg` is then published empty — the same statement a degrade makes, and
+deliberately indistinguishable from it, because a consumer only ever has to act
+on "there is no shared stack".
 
 ### What it does
 
