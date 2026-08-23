@@ -75,7 +75,7 @@ host from its own environment, and every later job pins to it.
 # shared-infra-owner(anchor): brings up ci/compose.yaml on this run's Linux host
 jobs:
   anchor:
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@<release-tag>
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@v5
     with:
       repo-label: <Repo>
       pin-ttl: 90m
@@ -85,9 +85,12 @@ jobs:
 Outputs are `runs-on`, `addr` and `pg`, read exactly as they would be from a
 local job. Three things about this call are not decoration:
 
-- **Pin the ref to a release tag**, not `main`. The anchor talks to host-side
-  contracts that are versioned with the pool image, so a floating ref lets it
-  move ahead of the hosts it is talking to.
+- **The ref is `@v5`**, the floating major this repository publishes — not
+  `main`, and not an exact tag. The anchor talks to host-side contracts that are
+  versioned with the pool image: `@main` lets it move ahead of the hosts it is
+  talking to, while the major moves only when one of those contracts breaks. An
+  exact tag goes stale on the next release, which is what `docs-pins.selftest.sh`
+  exists to catch.
 - **`remote-reusable-allowed`** is `RUNNER7`. The gate cannot read another
   repository's file, so it cannot decide the callee's runner scope or timeouts;
   the marker records that a human did, against an issue, instead of handing the

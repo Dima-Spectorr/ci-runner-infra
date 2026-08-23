@@ -146,21 +146,24 @@ mutate RUNNER11 "the Windows job dials localhost on the band port" \
 mutate RUNNER7 "the remote-reusable declaration beside the anchor call is dropped" \
   '/^# remote-reusable-allowed(/d'
 
-# --- 3. and the ref it teaches is still a placeholder -------------------------
+# --- 3. and the ref it teaches is the floating major --------------------------
 #
-# `@REPLACE-WITH-A-RELEASE-TAG` is not an oversight. Seven repositories copy
-# this file, and a real tag written here ages: it would be copied, months later,
-# as the pin for an anchor that has since moved against host-side contracts it
+# `@v5` is this repository's published convention for a workflow reference, and
+# `docs-pins.selftest.sh` enforces it across every tracked `*.md`. It cannot see
+# this file — its scope is `git ls-files -- '*.md'` — so the convention holds
+# here only because this check holds it.
+#
+# The convention answers the aging problem directly: seven repositories copy
+# this file, and an exact tag written into it would be copied months later as
+# the pin for an anchor that has since moved against host-side contracts it
 # talks to — `ci-pin-hold`, `CI_SHARED_INFRA_ADDR`, the port band — which are
-# versioned with the pool image. A placeholder fails loudly in the adopter's own
-# first run; a stale pin fails quietly, much later, on their pool.
-#
-# This is also why it is asserted here rather than left to review: the natural
-# tidy-up is to "fix" the placeholder, and nothing else in the tree would notice.
-if grep -q 'shared-infra-anchor\.yml@REPLACE-WITH-A-RELEASE-TAG' "$EXAMPLE"; then
+# versioned with the pool image. A floating major moves WITH those releases; a
+# breaking change to the host-side contracts is a major bump, which is exactly
+# the change that should not arrive silently.
+if grep -q 'shared-infra-anchor\.yml@v5' "$EXAMPLE"; then
   ok
 else
-  bad "the example's anchor ref is no longer a placeholder — an adopter would copy whatever tag was current when it was written (keep '@REPLACE-WITH-A-RELEASE-TAG'; the pin belongs in the adopter's repository, not in the reference)"
+  bad "the example's anchor ref is not the floating major this repository publishes (use '@v5'; an exact tag written here is stale on the next release, in seven repositories at once)"
 fi
 
 # And the workflow it names has to exist here, under that exact path, or the

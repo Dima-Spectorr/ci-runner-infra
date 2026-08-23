@@ -74,15 +74,17 @@ jobs:
   # The anchor, which is also the infrastructure owner. Whichever host it lands
   # on becomes this run's host, and it publishes where that was.
   #
-  # PIN THE REF TO A RELEASE TAG. The placeholder below is a placeholder on
-  # purpose: `check-shared-infra-example.sh` asserts it is still one, so this
-  # reference cannot quietly freeze a stale tag into the file seven
-  # repositories copy. The anchor talks to host-side contracts — `ci-pin-hold`,
-  # `CI_SHARED_INFRA_ADDR`, the port band — which are versioned with the pool
-  # image, so `@main` lets the anchor move ahead of the hosts it talks to.
+  # THE REF IS `@v5`, THE FLOATING MAJOR THIS REPOSITORY PUBLISHES — not `@main`
+  # and not an exact tag. The anchor talks to host-side contracts —
+  # `ci-pin-hold`, `CI_SHARED_INFRA_ADDR`, the port band — which are versioned
+  # with the pool image: `@main` lets it move ahead of the hosts it talks to,
+  # while a major moves only when one of those contracts breaks. An exact tag
+  # would age instead, in seven repositories at once, since this is the file
+  # they copy. `check-shared-infra-example.sh` asserts the `@v5` here, because
+  # `docs-pins.selftest.sh` reads tracked `*.md` only and cannot see this file.
   # ---------------------------------------------------------------------------
   anchor:
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@REPLACE-WITH-A-RELEASE-TAG
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@v5
     with:
       repo-label: ExampleRepo
       # A DEADLINE measured from the anchor, so it must outlive the whole run —
