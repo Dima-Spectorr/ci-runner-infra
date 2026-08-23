@@ -415,6 +415,11 @@ install_job_hooks() {
   for stage in started completed; do
     renew=': the hold is renewed on job-started only, never here'
     if [ "$stage" = started ]; then
+      # shellcheck disable=SC2016  # ${GITHUB_RUN_ID} must survive into the hook
+      # file verbatim. Expansion is not recursive, so $renew going into the
+      # unquoted heredoc below inserts this text without re-expanding it, and
+      # the hook then reads the runner's own environment at job time. Expanding
+      # it here would bake in the empty value this boot has.
       renew='sudo -n /opt/ci/job-hooks/pin-hold.sh renew --run "${GITHUB_RUN_ID:-}" >/dev/null 2>&1 || true'
     fi
     cat >"/opt/ci/job-hooks/job-$stage.sh" <<EOF
