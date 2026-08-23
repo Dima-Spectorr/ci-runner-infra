@@ -20,9 +20,10 @@
 #   phase 1  slot accounts, logon rights, ACLs, per-slot TEMP
 #   phase 2  the metadata fence                                (DELETED, see below)
 #   phase 3  the job credential broker
-#   phase 4  the per-job credential reset hooks
+#   phase 4  the per-job slot reset: hooks, state, and the SYSTEM service
 #   phase 7  the per-slot dependency cache                    (fails OPEN)
 #   phase 6  the boot probe, run as a slot account
+#   phase 4b the profile templates, captured once the probe has made the profiles
 #   phase 5  agent registration as a service
 #
 # Phase 6 RUNS BEFORE PHASE 5, and the numbers are the order they were written
@@ -77,8 +78,8 @@
 #
 # Every phase either succeeds or the host registers nothing. There is no partial
 # host: one that came up without its broker turns every deploy step into a
-# confusing auth failure, and one that came up without its hooks hands the next
-# pull request the last job's credentials.
+# confusing auth failure, and one that came up without its reset hands the next
+# pull request everything the last one left in the profile.
 #
 # WHY THE BEACON IS PHASE 0 AND NOT PHASE 5
 #
@@ -127,8 +128,55 @@ $script:BrokerScript = 'C:\ci\bin\job-metadata-broker.py'
 # Administrators with no slot ACE at all (phase 1), and a hook a slot cannot read
 # is a hook that fails every job on the host. They get their own directory with
 # their own ACL: SYSTEM and Administrators full, every slot read-and-execute.
+#
+# TWO files, because the runner does not tell a hook which end of the job it is
+# running at: the same path in both variables would be one script guessing from
+# an environment a job can set. The two ends do different things -- see
+# Get-JobHookScript -- and the difference is a gate versus a reset, so guessing
+# is not an option.
 $script:JobHookRoot = 'C:\ci\job-hooks'
-$script:JobHookPath = 'C:\ci\job-hooks\reset-credentials.ps1'
+$script:JobHookStartedPath = 'C:\ci\job-hooks\slot-reset-started.ps1'
+$script:JobHookCompletedPath = 'C:\ci\job-hooks\slot-reset-completed.ps1'
+
+# --- the per-job slot reset (phase 4) -----------------------------------------
+#
+# The Windows spelling of Linux's slot reset, and the ADR section it implements
+# (docs/adr-windows-pool.md, phase 4, revised by #232) carries the reasoning. The
+# three constants that ARE the security boundary:
+#
+#   $script:StateRoot\<i>           SYSTEM and Administrators full, the slot
+#                                   READ. The `clean` marker lives here, so a
+#                                   slot cannot write itself a clean verdict.
+#   $script:StateRoot\<i>\request   the same, plus WRITE for ci-s<i> alone. This
+#                                   is the whole request channel: which slot is
+#                                   being reset is decided by the directory the
+#                                   request appeared in, never by anything
+#                                   inside it.
+#   $script:ProfileTemplateRoot\<i> SYSTEM and Administrators only, no slot ACE.
+#                                   A slot that could write its own template
+#                                   would be handing every later job on that
+#                                   slot whatever it left there.
+$script:StateRoot = 'C:\ci\state'
+$script:ProfileTemplateRoot = 'C:\ci\profile-template'
+$script:SlotResetRoot = 'C:\ci\slot-reset'
+$script:SlotResetScriptPath = 'C:\ci\slot-reset\ci-slot-reset.ps1'
+$script:SlotResetConfigPath = 'C:\ci\slot-reset\ci-slot-reset.xml'
+$script:SlotResetServiceName = 'ci-slot-reset'
+
+# How long the STARTED hook waits for a verdict before failing the job, and how
+# often it looks. Bounded like every other wait in this file: a reset service
+# that has died must fail the job it cannot vouch for, not hang the agent on it.
+$script:SlotResetWaitSeconds = 300
+$script:SlotResetPollSeconds = 2
+
+# The wall-clock bound on the two robocopy calls this phase makes -- the capture
+# at boot, and every restore afterwards. Both are bounded for the reason phase
+# 7's copies are: the call operator cannot be asked to give up once the child is
+# running, so a wedged mirror is a boot that never registers, or a reset service
+# that never serves another request. A pristine profile is small; this is
+# generous rather than tight, because the bound is there to end a hang and not to
+# police a duration.
+$script:ProfileTemplateSeconds = 600
 
 # --- the dependency cache -----------------------------------------------------
 #
@@ -877,81 +925,796 @@ function Test-BrokerListenerSid {
     return ($Sid.Trim() -eq 'S-1-5-18')
 }
 
-function Get-JobHookScript {
+function Get-SlotStatePath {
     <#
       .SYNOPSIS
-        The body of the per-job credential reset hook.
+        One slot's state directory. SYSTEM writes it, the slot reads it.
       .DESCRIPTION
-        THE FAULT THIS EXISTS FOR IS NOT gcloud-SPECIFIC AND WAS PAID FOR ON LINUX
+        The marker, the verdict and the recorded runner service name live here,
+        and none of the three may be writable by the slot they describe: a slot
+        that could write its own `clean` marker could vouch for itself, which is
+        the whole of what the gate refuses to let it do.
 
-        A slot account's profile outlives every job the slot serves. An action
-        that persists a credential -- setup-gcloud writes the external account in
-        as the ACTIVE account -- leaves it for whatever pull request lands on that
-        slot next. On IntegrateIT that surfaced as a permanently cold remote cache
-        because the leftover subject token had expired; the security half does not
-        depend on the expiry at all.
-
-        Both ends of the job, for the reason the Linux comment gives: COMPLETED
-        alone leaves a live credential on disk for the whole idle window and does
-        not run at all if the agent is killed mid-job, which is the case that
-        leaves the most behind. STARTED alone leaves the idle window open.
-
-        TWO DETAILS ARE THE SECURITY HALF AND MUST NOT BE SIMPLIFIED AWAY
-
-        1. The profile directory is resolved from the ACCOUNT DATABASE -- the
-           SID's ProfileImagePath under the ProfileList key -- and never from
-           %USERPROFILE% or %APPDATA%. This runs inside the agent's environment,
-           and the directory being deleted must be decided by the host rather than
-           by a variable a job could have changed. The Linux hook reads
-           `getent passwd` for exactly this reason.
-        2. It refuses anything that is not a `ci-s<n>` profile. A resolution that
-           somehow yields C:\Users\Administrator must abort, not recurse.
-
-        A failing hook fails the job, and that is the intended trade: a job that
-        could not be given a clean credential state must not run with the previous
-        job's identity.
-
-        Returned as text rather than shipped as a file of its own because the
-        thing being installed is one file per host, ACL'd by the installer that
-        writes it; a second tracked `.ps1` would have to be fetched from somewhere
-        and the somewhere is the problem this avoids.
+        -StateRoot is injectable for the reason Get-SlotServiceEnvironment's
+        -SlotRoot is: the suite runs on ubuntu-latest, where a path builder that
+        insists on `C:\` is a pure function nothing can call.
     #>
     [CmdletBinding()]
-    param()
-    # A single-quoted here-string: nothing in the body is interpolated by THIS
-    # script, so the hook reads on disk exactly as it reads here.
-    return @'
-# Installed by windows-host-startup.ps1 (phase 4). Runs as the slot user, before
-# every job starts and after every job ends. See Get-JobHookScript for why both.
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [string] $StateRoot = $script:StateRoot
+    )
+    return (Join-Path $StateRoot ([string] $Index))
+}
+
+function Get-SlotRequestPath {
+    <#
+      .SYNOPSIS
+        The one directory a slot may write in order to ask for a reset.
+      .DESCRIPTION
+        This directory IS the privilege split. There is no `sudo` on Windows and
+        no SUDO_UID, so nothing about a request can be authenticated from its
+        contents; what can be authenticated is WHERE it appeared, because phase 4
+        grants write on `<state>\<i>\request` to `ci-s<i>` and to no other slot.
+        A job that writes a file naming slot 0 has written a file in its own
+        directory saying something the service never reads.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [string] $StateRoot = $script:StateRoot
+    )
+    return (Join-Path (Get-SlotStatePath -Index $Index -StateRoot $StateRoot) 'request')
+}
+
+function Get-SlotMarkerPath {
+    <#
+      .SYNOPSIS
+        The `clean` marker: written by the reset, deleted by the gate.
+      .DESCRIPTION
+        Deleted at the START of a job rather than written at the end of one, and
+        that asymmetry is the fail-closed half. A slot whose predecessor was
+        killed mid-reset has no marker, so the next job on it is failed rather
+        than run -- the same property host-startup.sh's marker carries, spelled in
+        NTFS.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [string] $StateRoot = $script:StateRoot
+    )
+    return (Join-Path (Get-SlotStatePath -Index $Index -StateRoot $StateRoot) 'clean')
+}
+
+function Get-SlotVerdictPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [string] $StateRoot = $script:StateRoot
+    )
+    return (Join-Path (Get-SlotStatePath -Index $Index -StateRoot $StateRoot) 'verdict')
+}
+
+function Get-SlotRunnerServicePath {
+    <#
+      .SYNOPSIS
+        Where phase 5 records the runner service name the reset is allowed to stop.
+      .DESCRIPTION
+        NOT the agent's own `.service` marker, which is the file
+        Get-RunnerServiceName reads. That file lives inside the slot's runner
+        directory, which the slot account can write, and the name inside it
+        reaches Stop-Service running as SYSTEM. Phase 5 has already validated it
+        twice -- shape, and ownership by this slot's agent name -- so what is
+        recorded here is the validated result, in a directory no slot can write.
+
+        Missing means no reset: the service has nothing it will vouch for
+        stopping, so it writes no marker and the next job is failed. Closed.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [string] $StateRoot = $script:StateRoot
+    )
+    return (Join-Path (Get-SlotStatePath -Index $Index -StateRoot $StateRoot) 'service')
+}
+
+function Get-SlotProfileTemplatePath {
+    <#
+      .SYNOPSIS
+        The pristine copy of one slot's profile, captured once at boot.
+      .DESCRIPTION
+        SYSTEM and Administrators only, with no slot ACE at all -- unlike the hook
+        directory, which every slot must be able to execute out of. A slot able to
+        write its own template would be handing every later job on that slot
+        whatever it left there, which is the persistence the wholesale replacement
+        exists to end.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $Index,
+        [string] $Root = $script:ProfileTemplateRoot
+    )
+    return (Join-Path $Root (Get-SlotUserName -Index $Index))
+}
+
+function Get-RequestSlotIndex {
+    <#
+      .SYNOPSIS
+        Which slot a request file names, decided by its PATH. Pure. '' when none.
+      .DESCRIPTION
+        The one function that decides whose profile gets replaced, so it is
+        separated out and tested rather than written inline in a service payload
+        nothing off Windows can execute.
+
+        The rule is the ADR's: the slot is the directory, never the content. A
+        request is `<state>\<index>\request\<name>`, and this returns the index
+        only when all three of the parent, the grandparent and the index itself
+        are what they must be. Anything else returns '' and the caller ignores the
+        file -- including, deliberately, a path with `..` in it, which is refused
+        by the index pattern rather than resolved.
+
+        Returns a STRING, because '' is the no-answer and 0 is a real slot.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Path
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    # Split on both separators. The service builds these paths itself, but this
+    # function's whole job is to be the thing that does not assume that.
+    $parts = @($Path -split '[\\/]+' | Where-Object { $_ -ne '' })
+    if ($parts.Count -lt 3) { return '' }
+    if ($parts[-2] -cne 'request') { return '' }
+    $index = $parts[-3]
+    # Leading zeros excluded: `01` and `1` would be two names for one slot, and
+    # two names for one slot is how a marker gets written beside the one being
+    # read rather than over it.
+    if ($index -notmatch '^(0|[1-9][0-9]*)$') { return '' }
+    return $index
+}
+
+function Test-ResetRequestName {
+    <#
+      .SYNOPSIS
+        Is this a request name the service acts on? Pure.
+      .DESCRIPTION
+        Exactly two names, matched case-sensitively and in full. The service
+        deletes the file before acting on it, so an unrecognised name that were
+        accepted here would be a slot choosing which of the two very different
+        code paths -- a gate, or a service stop and a profile replacement -- runs
+        against it.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Name)
+    if ($null -eq $Name) { return $false }
+    return ($Name -cin @('started', 'completed'))
+}
+
+function Test-ResetVerdictClean {
+    <#
+      .SYNOPSIS
+        Does this verdict text let a job run? Pure, and false for everything odd.
+      .DESCRIPTION
+        `clean`, case-sensitively, after trimming, and nothing else. Written as a
+        function rather than an inline comparison because every interesting way to
+        get this wrong is a way to say yes: a `-like 'clean*'` accepts
+        `clean-failed`, a case-insensitive match accepts a file somebody edited by
+        hand, and a null-tolerant one accepts a verdict that was never written.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    return ($Text.Trim() -ceq 'clean')
+}
+
+function Test-SlotProfileDirectory {
+    <#
+      .SYNOPSIS
+        May this directory be replaced as slot <Index>'s profile? Pure.
+      .DESCRIPTION
+        Carried over verbatim from the credential hook this replaces, because it
+        was the security half of it and it is the security half of this -- with
+        one clause added. The old hook checked the leaf was SOME `ci-s<n>`; this
+        checks it is THIS slot's, because the caller is now SYSTEM resetting a slot
+        it was told about, not a slot cleaning its own profile. A ProfileList entry
+        that resolved to a sibling's directory would otherwise have SYSTEM wipe the
+        profile of a slot that is mid-job.
+
+        The path being tested is read from the account database -- the SID's
+        ProfileImagePath -- and never from %USERPROFILE%, for the reason the Linux
+        script reads `getent passwd`: the directory being emptied is the host's
+        decision, not a variable's.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Path,
+        [Parameter(Mandatory = $true)][int] $Index
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $parts = @($Path -split '[\\/]+' | Where-Object { $_ -ne '' })
+    if ($parts.Count -lt 2) { return $false }
+    return ($parts[-1] -ceq (Get-SlotUserName -Index $Index))
+}
+
+function Test-SlotProcessKillable {
+    <#
+      .SYNOPSIS
+        May the quiesce terminate this process? Pure, and false unless certain.
+      .DESCRIPTION
+        The Windows spelling of host-startup.sh's sweep, and it exists for the
+        identical reason (#237): a background process the job left running holds a
+        writable profile and can put a dotfile back AFTER the replacement, at which
+        point the marker certifies a slot that is not clean.
+
+        What Windows does not have is the cgroup Linux uses to spare the agent and
+        its rootless daemon, so the sparing is done by identity and by ancestry:
+
+          * OWNERSHIP is the whole filter, and it is an exact SID match. A name
+            match would be wrong twice -- `ci-s1` is a prefix of nothing here but
+            would be of `ci-s10`, and a display name is resolved through a
+            locale-dependent account database this module has no say in.
+          * The RESET'S OWN process tree is spared. It runs as SYSTEM, so it does
+            not match the SID filter at all today; the parameter exists because the
+            first thing anybody adding "and also kill orphans" will reach for is a
+            wider filter, and this is where that gets stopped.
+          * PIDs 0 and 4 are refused outright. Neither can be owned by a slot, and
+            a lookup that returned one of them means the enumeration is answering
+            about something other than what was asked.
+
+        An UNKNOWN owner is false, not true. GetOwnerSid fails on a process that
+        exited between the enumeration and the query, and it fails the same way on
+        one running as an identity this code could not read -- so the safe answer
+        is to leave it and let the marker be withheld if it is still there.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $OwnerSid,
+        [Parameter(Mandatory = $true)][string] $SlotSid,
+        [Parameter(Mandatory = $true)][int] $ProcessId,
+        [int[]] $SpareProcessId = @()
+    )
+    if ([string]::IsNullOrWhiteSpace($OwnerSid)) { return $false }
+    if ($ProcessId -le 4) { return $false }
+    if (@($SpareProcessId) -contains $ProcessId) { return $false }
+    return ($OwnerSid.Trim() -ceq $SlotSid)
+}
+
+function Get-SlotResetServiceConfig {
+    <#
+      .SYNOPSIS
+        The shim's service definition for the reset service, as XML text.
+      .DESCRIPTION
+        Pure, like the beacon's and the broker's, and the three values that decide
+        whether the fleet is safe are the same three:
+
+        `<onfailure action="restart">` -- a reset service that has died is a host
+        on which every COMPLETED request piles up unserved and every later job
+        fails at its gate. That is fail-closed, and it is also every slot on the
+        host out of service until somebody looks, so it restarts.
+
+        `<startmode>Automatic</startmode>` -- the host must come back able to reset
+        after any restart, including one it did not choose.
+
+        LocalSystem, the shim's default and the entire point: the thing being
+        stopped is a service, the thing being replaced is another account's
+        profile, and neither is reachable from the slot asking for it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $ScriptPath,
+        [string] $ServiceName = $script:SlotResetServiceName,
+        [int] $PollSeconds = $script:SlotResetPollSeconds
+    )
+    $esc = { param($v) [System.Security.SecurityElement]::Escape([string] $v) }
+    $svc = & $esc $ServiceName
+    $shimArgs = & $esc ("-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`" " +
+        "-PollSeconds $PollSeconds")
+    return @"
+<service>
+  <id>$svc</id>
+  <name>$svc</name>
+  <description>Resets a CI slot's profile between jobs, and vouches for the result.</description>
+  <executable>powershell.exe</executable>
+  <arguments>$shimArgs</arguments>
+  <startmode>Automatic</startmode>
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="10 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>2</keepFiles>
+  </log>
+</service>
+"@
+}
+
+function Get-SlotResetScript {
+    <#
+      .SYNOPSIS
+        The body of the SYSTEM-side reset service. Text, with paths substituted.
+      .DESCRIPTION
+        Emitted as text for the reason the boot probe's payload is: this script
+        arrives as instance metadata and is never a file on the disk, so a payload
+        that wanted to dot-source it would have nothing to source. What can be
+        tested off Windows is therefore the DECISIONS, which live in the pure
+        functions above and are called by name from in here, plus the STRUCTURE of
+        this text, which the shell gate asserts the way host-startup.selftest.sh
+        asserts the Linux here-doc.
+
+        A single-quoted here-string with @TOKEN@ placeholders, not an interpolated
+        one: the payload must read on disk exactly as it reads here, and the five
+        substitutions are made explicitly at the end so a reader can see the entire
+        set of things this script gets to inject.
+
+        THE ORDER OF THE LAST TWO STEPS DIFFERS FROM THE ADR, DELIBERATELY
+
+        The ADR (phase 4, decision 2) says restart the service, then write the
+        marker. That has a window: the agent is back and dispatchable while the
+        marker it will be gated on does not exist yet, so a job that arrives inside
+        it is failed for a reset that in fact succeeded. The marker is therefore
+        written FIRST and the service started after it. Nothing weakens: the marker
+        still says only "the reset finished", and a crash between the two leaves a
+        marker with a stopped agent, which is a slot that takes no jobs rather than
+        one that takes them unproved.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $StateRoot = $script:StateRoot,
+        [string] $TemplateRoot = $script:ProfileTemplateRoot,
+        [string] $LogPath = $script:LogPath,
+        [int] $QuiesceWaitSeconds = 30,
+        [int] $CopySeconds = $script:ProfileTemplateSeconds
+    )
+    $body = @'
+# Installed by windows-host-startup.ps1 (phase 4) and supervised by the service
+# shim as LocalSystem. Serves reset requests dropped by the job hooks; see
+# Get-SlotResetScript, and docs/adr-windows-pool.md phase 4, for why it is a
+# service and not a scheduled task.
+[CmdletBinding()]
+param([int] $PollSeconds = 2)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# The account database, not $env:USERPROFILE and not $env:APPDATA: this runs in
-# the agent's environment, and the directory being deleted is the host's decision.
-$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
-$raw = (Get-ItemProperty -LiteralPath $key -Name 'ProfileImagePath').ProfileImagePath
-# ProfileImagePath is REG_EXPAND_SZ; on a stock image it reads %SystemDrive%\Users\...
-$profileDir = [System.Environment]::ExpandEnvironmentVariables([string] $raw)
+$StateRoot = '@STATE_ROOT@'
+$TemplateRoot = '@TEMPLATE_ROOT@'
+$LogPath = '@LOG_PATH@'
+$QuiesceWaitSeconds = @QUIESCE_SECONDS@
 
-if ((Split-Path -Leaf $profileDir) -notmatch '^ci-s[0-9]+$') {
-    [Console]::Error.WriteLine("credential reset: refusing to clean '$profileDir' -- not a slot profile")
-    exit 1
+function Write-ResetLog {
+    param([Parameter(Mandatory = $true)][string] $Message)
+    $line = ('{0} slot-reset: {1}' -f (Get-Date).ToUniversalTime().ToString('o'), $Message)
+    try { Add-Content -LiteralPath $LogPath -Value $line -ErrorAction Stop } catch { $null = $_ }
 }
 
-$rc = 0
-foreach ($leaf in @('AppData\Roaming\gcloud', 'AppData\Roaming\gsutil')) {
-    $target = Join-Path $profileDir $leaf
-    if (-not (Test-Path -LiteralPath $target)) { continue }
-    try {
-        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
-    } catch {
-        [Console]::Error.WriteLine("credential reset: could not remove $target -- $($_.Exception.Message)")
-        $rc = 1
+# Written through a temporary file and moved into place. A reader polling this
+# path is another process, and a partial read of `clean` is `cle` -- which
+# Test-ResetVerdictClean correctly rejects, failing a job whose slot was fine.
+function Write-Atomic {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Text
+    )
+    $tmp = "$Path.tmp"
+    [System.IO.File]::WriteAllText($tmp, $Text, (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tmp -Destination $Path -Force
+}
+
+# The slot is the DIRECTORY the request appeared in, never anything inside the
+# file. Nothing below reads a request's contents at all.
+function Get-RequestSlotIndex {
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    $parts = @($Path -split '[\\/]+' | Where-Object { $_ -ne '' })
+    if ($parts.Count -lt 3) { return '' }
+    if ($parts[-2] -cne 'request') { return '' }
+    $index = $parts[-3]
+    if ($index -notmatch '^(0|[1-9][0-9]*)$') { return '' }
+    return $index
+}
+
+function Test-ResetRequestName {
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Name)
+    if ($null -eq $Name) { return $false }
+    return ($Name -cin @('started', 'completed'))
+}
+
+function Test-SlotProfileDirectory {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Path,
+        [Parameter(Mandatory = $true)][int] $Index
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $parts = @($Path -split '[\\/]+' | Where-Object { $_ -ne '' })
+    if ($parts.Count -lt 2) { return $false }
+    return ($parts[-1] -ceq "ci-s$Index")
+}
+
+function Test-SlotProcessKillable {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $OwnerSid,
+        [Parameter(Mandatory = $true)][string] $SlotSid,
+        [Parameter(Mandatory = $true)][int] $ProcessId,
+        [int[]] $SpareProcessId = @()
+    )
+    if ([string]::IsNullOrWhiteSpace($OwnerSid)) { return $false }
+    if ($ProcessId -le 4) { return $false }
+    if (@($SpareProcessId) -contains $ProcessId) { return $false }
+    return ($OwnerSid.Trim() -ceq $SlotSid)
+}
+
+function Get-SlotSid {
+    param([Parameter(Mandatory = $true)][int] $Index)
+    $account = New-Object System.Security.Principal.NTAccount("ci-s$Index")
+    return $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+}
+
+# The account database, for the reason the Linux script reads getent passwd: the
+# directory about to be emptied is the host's decision and not a variable's.
+function Get-SlotProfileDirectory {
+    param([Parameter(Mandatory = $true)][string] $Sid)
+    $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$Sid"
+    $raw = (Get-ItemProperty -LiteralPath $key -Name 'ProfileImagePath').ProfileImagePath
+    return [System.Environment]::ExpandEnvironmentVariables([string] $raw)
+}
+
+# Terminate every process whose token names this slot, then say whether any
+# survived. The caller withholds the marker when one does: a writer that will not
+# die is exactly the case where "the files were removed" stops being a claim
+# about the slot.
+function Invoke-SlotQuiesce {
+    param(
+        [Parameter(Mandatory = $true)][string] $Sid,
+        [Parameter(Mandatory = $true)][int] $TimeoutSeconds
+    )
+    $spare = @($PID)
+    foreach ($pass in @('stop', 'kill')) {
+        $victims = @()
+        foreach ($p in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
+            $owner = ''
+            try {
+                $owner = [string] (Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid `
+                        -ErrorAction Stop).Sid
+            } catch { $null = $_ }
+            if (Test-SlotProcessKillable -OwnerSid $owner -SlotSid $Sid `
+                    -ProcessId ([int] $p.ProcessId) -SpareProcessId $spare) {
+                $victims += [int] $p.ProcessId
+            }
+        }
+        if ($victims.Count -eq 0) { return $true }
+        Write-ResetLog "$pass pass: $($victims.Count) process(es) still owned by $Sid"
+        foreach ($victim in $victims) {
+            try { Stop-Process -Id $victim -Force -ErrorAction Stop } catch { $null = $_ }
+        }
+        Start-Sleep -Seconds ([Math]::Max(1, [int] ($TimeoutSeconds / 6)))
+    }
+    foreach ($p in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
+        $owner = ''
+        try {
+            $owner = [string] (Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid `
+                    -ErrorAction Stop).Sid
+        } catch { $null = $_ }
+        if (Test-SlotProcessKillable -OwnerSid $owner -SlotSid $Sid `
+                -ProcessId ([int] $p.ProcessId) -SpareProcessId $spare) {
+            return $false
+        }
+    }
+    return $true
+}
+
+# NTUSER.DAT is held open for as long as anything runs as the account, and there
+# is no supported way to replace a loaded hive underneath a live session. HKU
+# losing the SID is how the host says the session is gone.
+function Wait-HiveUnloaded {
+    param(
+        [Parameter(Mandatory = $true)][string] $Sid,
+        [Parameter(Mandatory = $true)][int] $TimeoutSeconds
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$Sid")) { return $true }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Seconds 1
     }
 }
-exit $rc
+
+# /MIR, because the claim is "nothing of the last job survives" and a copy that
+# only adds is a copy that keeps whatever was added. /COPY:DAT and not :DATS: the
+# destination is the live profile and its ACL is the host's, not the template's.
+# /XJ so a junction a job planted is replaced rather than followed out of the
+# profile and mirrored over whatever it pointed at.
+#
+# BOUNDED, and Start-Process rather than the call operator is the whole reason
+# why: the operator blocks until the child exits and offers nothing to ask once
+# it is running, so one wedged mirror -- a filter driver, an AV scanner, a handle
+# nobody releases -- is a poll loop that never serves another slot. Killed
+# reports -1, which the caller reads as a failure and withholds the marker for.
+function Copy-ProfileTree {
+    param(
+        [Parameter(Mandatory = $true)][string] $Source,
+        [Parameter(Mandatory = $true)][string] $Destination,
+        [int] $TimeoutSeconds = @COPY_SECONDS@
+    )
+    $out = [System.IO.Path]::GetTempFileName()
+    $err = [System.IO.Path]::GetTempFileName()
+    $proc = $null
+    $code = -1
+    try {
+        $proc = Start-Process -FilePath 'robocopy.exe' -PassThru -NoNewWindow `
+            -RedirectStandardOutput $out -RedirectStandardError $err `
+            -ArgumentList @($Source, $Destination, '/MIR', '/XJ', '/COPY:DAT', '/R:1', '/W:1',
+            '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+        if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $proc.Kill(); [void] $proc.WaitForExit(5000) } catch { $null = $_ }
+            Write-ResetLog "robocopy did not finish within $TimeoutSeconds s and was killed"
+            return $false
+        }
+        $proc.WaitForExit()
+        $code = $proc.ExitCode
+    } catch {
+        Write-ResetLog "robocopy could not be started -- $($_.Exception.Message)"
+        return $false
+    } finally {
+        if ($proc) { $proc.Dispose() }
+        Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $err -Force -ErrorAction SilentlyContinue
+    }
+    # Robocopy's exit code is a bit field: 0-7 is success and 8 or more is not.
+    # NEGATIVE is a failure too -- a killed robocopy exits with the NTSTATUS as a
+    # negative integer, and a bare `-lt 8` reads every one of those as success.
+    return ($code -ge 0 -and $code -lt 8)
+}
+
+function Invoke-SlotReset {
+    param([Parameter(Mandatory = $true)][int] $Index)
+
+    $state = Join-Path $StateRoot ([string] $Index)
+    $marker = Join-Path $state 'clean'
+    $template = Join-Path $TemplateRoot "ci-s$Index"
+    $servicePath = Join-Path $state 'service'
+
+    # Gone before anything else happens, so a reset that dies halfway through
+    # leaves a slot that fails its next gate rather than one still vouched for.
+    if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force }
+
+    if (-not (Test-Path -LiteralPath $template)) {
+        Write-ResetLog "slot $Index has no profile template at $template -- no reset, no marker"
+        return
+    }
+    if (-not (Test-Path -LiteralPath $servicePath)) {
+        Write-ResetLog "slot $Index has no recorded runner service -- no reset, no marker"
+        return
+    }
+    # Phase 5 wrote this after Get-RunnerServiceName validated it twice, into a
+    # directory no slot can write. Re-checked here anyway, because the value
+    # reaches Stop-Service running as SYSTEM and one validation in another phase
+    # is not a property of this one.
+    $serviceName = ([string] (Get-Content -Raw -LiteralPath $servicePath)).Trim()
+    if ($serviceName -notmatch '^actions\.runner\.[A-Za-z0-9._-]+$') {
+        Write-ResetLog "slot $Index recorded an unusable runner service name -- no reset, no marker"
+        return
+    }
+
+    $sid = Get-SlotSid -Index $Index
+    $profileDir = Get-SlotProfileDirectory -Sid $sid
+    if (-not (Test-SlotProfileDirectory -Path $profileDir -Index $Index)) {
+        Write-ResetLog "slot $Index resolved to '$profileDir', which is not its profile -- refusing"
+        return
+    }
+
+    try {
+        Stop-Service -Name $serviceName -Force -ErrorAction Stop
+    } catch {
+        Write-ResetLog "slot $Index -- could not stop $serviceName ($($_.Exception.Message))"
+        return
+    }
+
+    if (-not (Invoke-SlotQuiesce -Sid $sid -TimeoutSeconds $QuiesceWaitSeconds)) {
+        Write-ResetLog "slot $Index still has a process running as $sid -- no marker"
+        return
+    }
+    if (-not (Wait-HiveUnloaded -Sid $sid -TimeoutSeconds $QuiesceWaitSeconds)) {
+        Write-ResetLog "slot $Index -- the profile hive did not unload, so nothing was replaced"
+        return
+    }
+    if (-not (Copy-ProfileTree -Source $template -Destination $profileDir)) {
+        Write-ResetLog "slot $Index -- robocopy could not restore $profileDir from $template"
+        return
+    }
+
+    # BEFORE the service starts, not after. See Get-SlotResetScript: an agent that
+    # is dispatchable while its marker does not yet exist fails a job over a reset
+    # that worked.
+    Write-Atomic -Path $marker -Text 'clean'
+    try {
+        Start-Service -Name $serviceName -ErrorAction Stop
+    } catch {
+        Write-ResetLog "slot $Index -- reset done but $serviceName would not start ($($_.Exception.Message))"
+        return
+    }
+    Write-ResetLog "slot $Index reset from $template"
+}
+
+# The gate. It does not reset anything -- the job asking is running under the
+# service a reset would stop -- it reads the marker the last reset left, consumes
+# it, and says what it found.
+function Invoke-SlotGate {
+    param([Parameter(Mandatory = $true)][int] $Index)
+    $state = Join-Path $StateRoot ([string] $Index)
+    $marker = Join-Path $state 'clean'
+    $verdict = Join-Path $state 'verdict'
+    $answer = 'dirty'
+    if (Test-Path -LiteralPath $marker) {
+        Remove-Item -LiteralPath $marker -Force
+        $answer = 'clean'
+    }
+    Write-Atomic -Path $verdict -Text $answer
+    Write-ResetLog "slot $Index gate: $answer"
+}
+
+Write-ResetLog "started, polling $StateRoot every $PollSeconds s"
+while ($true) {
+    $requests = @()
+    try {
+        $requests = @(Get-ChildItem -Path $StateRoot -Filter '*' -File -Recurse -Depth 2 `
+                -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -ceq 'request' })
+    } catch { $null = $_ }
+
+    foreach ($request in ($requests | Sort-Object -Property LastWriteTimeUtc)) {
+        $index = Get-RequestSlotIndex -Path $request.FullName
+        $name = $request.Name
+        # Deleted BEFORE it is acted on. A request that keeps failing must not be
+        # a request that keeps being served: the slot's next gate fails, which is
+        # the outcome a stuck reset is supposed to have.
+        try { Remove-Item -LiteralPath $request.FullName -Force -ErrorAction Stop } catch { $null = $_ }
+        if ($index -eq '') { continue }
+        if (-not (Test-ResetRequestName -Name $name)) {
+            Write-ResetLog "slot $index asked for '$name', which is not a request -- ignored"
+            continue
+        }
+        try {
+            if ($name -ceq 'started') {
+                Invoke-SlotGate -Index ([int] $index)
+            } else {
+                Invoke-SlotReset -Index ([int] $index)
+            }
+        } catch {
+            # Never fatal. A service that exits here is a host on which every
+            # later job fails its gate, and the shim would restart it into the
+            # same request it just deleted.
+            Write-ResetLog "slot $index '$name' failed -- $($_.Exception.Message)"
+        }
+    }
+    Start-Sleep -Seconds $PollSeconds
+}
 '@
+    $body = $body.Replace('@STATE_ROOT@', $StateRoot)
+    $body = $body.Replace('@TEMPLATE_ROOT@', $TemplateRoot)
+    $body = $body.Replace('@LOG_PATH@', $LogPath)
+    $body = $body.Replace('@QUIESCE_SECONDS@', [string] $QuiesceWaitSeconds)
+    return $body.Replace('@COPY_SECONDS@', [string] $CopySeconds)
+}
+
+function Get-JobHookScript {
+    <#
+      .SYNOPSIS
+        The body of one end of the per-job slot reset hook.
+      .DESCRIPTION
+        THE FAULT THIS EXISTS FOR IS NOT gcloud-SPECIFIC AND WAS PAID FOR ON LINUX
+
+        This used to delete `%APPDATA%\gcloud` and `%APPDATA%\gsutil`. A denylist
+        of two directories cannot support the claim the reset is read to make --
+        that the next job inherits nothing -- because a Windows profile carries the
+        same executable surfaces Linux does under other names: a `.gitconfig` that
+        names a core.hooksPath, both PowerShell profiles, any writable directory on
+        PATH, the previous checkout's own `.git\hooks`, and whatever the next tool
+        decides a credential store is. Linux retired the equivalent hook in #110
+        and replaced it in #231 and #237; docs/adr-windows-pool.md phase 4 is the
+        Windows version of that decision and #232 is the issue.
+
+        So the hooks stopped deleting. What they do now is ASK, and the deleting is
+        done by a service running as SYSTEM outside the job -- which is what buys
+        the property the old hook could never have, since a profile cannot be
+        replaced while a process is running as the account that owns it.
+
+        TWO ENDS, TWO FILES, TWO DIFFERENT JOBS
+
+          * STARTED writes a `started` request and WAITS for a verdict, failing the
+            job unless it is `clean`. A slot whose predecessor never finished has
+            no marker, so its next job is failed rather than run.
+          * COMPLETED writes a `completed` request and returns immediately. It must
+            not wait: the work it is asking for stops the service it is running
+            under, and waiting for that is waiting to be killed. Serialisation is
+            free rather than engineered -- while the reset holds the runner service
+            stopped, the agent cannot be dispatched a job.
+
+        The account database, again and for the same reason: which slot to ask for
+        is taken from the identity this hook is RUNNING AS, not from an environment
+        variable a job can set. A request written into another slot's directory is
+        an Access is denied, because phase 4 grants write on `<state>\<i>\request`
+        to `ci-s<i>` alone -- but a hook that asked on the wrong slot's behalf would
+        be a job resetting a neighbour that is mid-work, so it is refused here too.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('Started', 'Completed')][string] $Phase,
+        [string] $StateRoot = $script:StateRoot,
+        [int] $WaitSeconds = $script:SlotResetWaitSeconds,
+        [int] $PollSeconds = $script:SlotResetPollSeconds
+    )
+
+    # Single-quoted here-strings with @TOKEN@ placeholders, so the hook reads on
+    # disk exactly as it reads here and the substitutions are all in one place.
+    $preamble = @'
+# Installed by windows-host-startup.ps1 (phase 4). Runs as the slot user at one
+# end of every job. See Get-JobHookScript for why the two ends differ.
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# The identity, not $env:USERNAME and not $env:USERPROFILE: this runs inside the
+# job's environment and which slot is being reset is the host's decision.
+$who = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$leaf = ($who -split '\\')[-1]
+# Matched POSITIVELY, so the capture is read from a comparison that succeeded.
+# `-notmatch` also fills $Matches when the regex matched, which is exactly the
+# kind of thing that keeps working until somebody reorders the branches.
+if ($leaf -match '^ci-s([0-9]+)$') {
+    $index = $Matches[1]
+} else {
+    [Console]::Error.WriteLine("slot reset: refusing to act as '$who' -- not a slot account")
+    exit 1
+}
+$state = Join-Path '@STATE_ROOT@' $index
+$request = Join-Path (Join-Path $state 'request') '@REQUEST@'
+'@
+
+    if ($Phase -eq 'Completed') {
+        $tail = @'
+
+# No wait, by design: the reset this asks for stops the service this hook is
+# running under. A failure to ask is still fatal -- an unasked reset is a slot
+# that keeps the last job's profile, and its next gate is what will say so.
+New-Item -ItemType File -Path $request -Force | Out-Null
+exit 0
+'@
+    } else {
+        $tail = @'
+
+$verdict = Join-Path $state 'verdict'
+
+# The timestamp is taken from the request FILE, not from the clock: the verdict
+# and the request are written to the same volume, and a verdict older than the
+# request is the last job's, sitting there since before this one asked.
+New-Item -ItemType File -Path $request -Force | Out-Null
+$asked = (Get-Item -LiteralPath $request).LastWriteTimeUtc
+
+$deadline = (Get-Date).AddSeconds(@WAIT@)
+while ($true) {
+    $item = $null
+    try { $item = Get-Item -LiteralPath $verdict -ErrorAction Stop } catch { $null = $_ }
+    if ($item -and $item.LastWriteTimeUtc -ge $asked) {
+        $text = ''
+        try { $text = [string] (Get-Content -Raw -LiteralPath $verdict -ErrorAction Stop) } catch { $null = $_ }
+        # `clean`, case-sensitively and in full. Every loose spelling of this
+        # comparison is a way of saying yes to something that did not happen.
+        if ($text.Trim() -ceq 'clean') { exit 0 }
+        [Console]::Error.WriteLine("slot reset: this slot is not clean (verdict '$($text.Trim())')")
+        exit 1
+    }
+    if ((Get-Date) -ge $deadline) { break }
+    Start-Sleep -Seconds @POLL@
+}
+# A job that could not be given a clean slot must not run on a dirty one. This is
+# the same trade the credential hook made, now over the whole profile.
+[Console]::Error.WriteLine('slot reset: no verdict in @WAIT@ s -- refusing to run on an unproved slot')
+exit 1
+'@
+    }
+
+    $text = ($preamble + $tail).Replace('@STATE_ROOT@', $StateRoot)
+    $text = $text.Replace('@REQUEST@', $Phase.ToLowerInvariant())
+    $text = $text.Replace('@WAIT@', [string] $WaitSeconds)
+    return $text.Replace('@POLL@', [string] $PollSeconds)
 }
 
 function Get-SlotCachePath {
@@ -1218,7 +1981,8 @@ function Get-SlotServiceEnvironment {
         competes with whatever the last workflow left behind, so the leftover is
         simply what the next job authenticates as.
 
-        The hooks clear the leftover. The GCE_METADATA_* values close the other
+        The hooks get the leftover replaced, wholesale, by the reset service that
+        runs outside the job (phase 4). The GCE_METADATA_* values close the other
         door -- unset, they do not withhold credentials, they hand ADC back to
         169.254.169.254 and the HOST service account, because section 3A deleted
         the fence that gives Linux that property for free. Phase 3 hands this
@@ -1230,7 +1994,12 @@ function Get-SlotServiceEnvironment {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][int] $Index,
-        [string] $HookPath = $script:JobHookPath,
+        # TWO paths, and they must not be collapsed back into one. The runner does
+        # not tell a hook which end of the job it is at, so one file serving both
+        # would have to guess -- and the two ends are a gate that waits and a reset
+        # request that must not.
+        [string] $StartedHookPath = $script:JobHookStartedPath,
+        [string] $CompletedHookPath = $script:JobHookCompletedPath,
         [AllowEmptyString()][string] $BrokerEndpoint = '',
         # The slot's own dependency cache, or '' when phase 7 could not give it
         # one. See the block at the end of this function for why this is the one
@@ -1263,8 +2032,8 @@ function Get-SlotServiceEnvironment {
     $block['GCE_METADATA_IP'] = $endpoint
     $block['GCE_METADATA_ROOT'] = $endpoint
 
-    $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] = $HookPath
-    $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] = $HookPath
+    $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] = $StartedHookPath
+    $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] = $CompletedHookPath
 
     # The label the rest of a workflow run pins itself to, read by the anchor
     # job (docs/adr-pr-host-affinity.md). Absent, the anchor runs the workflow
@@ -4538,18 +5307,18 @@ function Invoke-Phase3JobBroker {
     return "127.0.0.1:$port"
 }
 
-# --- phase 4: the per-job credential reset hooks ------------------------------
+# --- phase 4: the per-job slot reset ------------------------------------------
 
 function Install-JobHook {
     <#
       .SYNOPSIS
-        Write the reset hook and lock it: every slot may run it, none may edit it.
+        Write both hooks and lock them: every slot may run them, none may edit them.
       .DESCRIPTION
-        The ACL is the security half and it is not optional. ONE file is executed
-        by every slot on the host, so a slot that could rewrite it would be
-        running code in every other slot's identity -- and, the host being warm,
-        in every later job's too. This is the Windows spelling of `chown
-        root:root` plus `0755`.
+        The ACL is the security half and it is not optional. TWO files are executed
+        by every slot on the host, so a slot that could rewrite one would be
+        running code in every other slot's identity -- and, the host being warm, in
+        every later job's too. This is the Windows spelling of `chown root:root`
+        plus `0755`.
 
         Installed BEFORE any agent registers (phase 5), and fatal if it fails: an
         agent whose JOB_STARTED hook points at a missing file takes work and fails
@@ -4558,34 +5327,250 @@ function Install-JobHook {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string[]] $SlotUsers)
 
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
     New-Item -ItemType Directory -Force -Path $script:JobHookRoot | Out-Null
-    [System.IO.File]::WriteAllText($script:JobHookPath, (Get-JobHookScript),
-        (New-Object System.Text.UTF8Encoding($true)))
+    [System.IO.File]::WriteAllText($script:JobHookStartedPath,
+        (Get-JobHookScript -Phase 'Started'), $utf8Bom)
+    [System.IO.File]::WriteAllText($script:JobHookCompletedPath,
+        (Get-JobHookScript -Phase 'Completed'), $utf8Bom)
 
-    # The directory and the file both. Locking only the file leaves a directory a
-    # slot could rename the hook out of, which fails every job rather than
+    # The directory and the files both. Locking only the files leaves a directory a
+    # slot could rename a hook out of, which fails every job rather than
     # subverting one -- but it is the same missing-hook fault by a longer path.
     Protect-CiDirectory -Path $script:JobHookRoot -ReadOnlyUser $SlotUsers
-    Protect-CiDirectory -Path $script:JobHookPath -ReadOnlyUser $SlotUsers
-    Write-BootLog ("phase 4: reset hook at $script:JobHookPath, runnable by " +
+    Protect-CiDirectory -Path $script:JobHookStartedPath -ReadOnlyUser $SlotUsers
+    Protect-CiDirectory -Path $script:JobHookCompletedPath -ReadOnlyUser $SlotUsers
+    Write-BootLog ("phase 4: reset hooks under $script:JobHookRoot, runnable by " +
         "$($SlotUsers -join ', ') and writable by none of them")
 }
 
-function Invoke-Phase4JobHook {
+function Install-SlotStateDirectory {
     <#
       .SYNOPSIS
-        Install the reset hook. Returns the path phase 5 points both hooks at.
+        One slot's state directory and its request channel, with the ACLs that ARE
+        the privilege split.
+      .DESCRIPTION
+        Two directories, two different ACLs, and the difference between them is the
+        whole boundary this phase rests on:
+
+          <state>\<i>          SYSTEM and Administrators full, the slot READ. The
+                               `clean` marker and the verdict live here, so a slot
+                               cannot vouch for itself.
+          <state>\<i>\request  the same, plus Modify for ci-s<i> alone. This is the
+                               only thing a slot may write, and which slot a
+                               request names is decided by which of these
+                               directories it appeared in.
+
+        Modify rather than a hand-built write-only ACE: a slot must be able to
+        create the file and, having created it, it may as well be able to delete
+        it -- the service deletes requests anyway, and an ACL nobody can read is an
+        ACL nobody maintains. What matters is that the grant does not reach the
+        parent, and Protect-CiDirectory disables inheritance on both.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int] $Index)
+
+    $state = Get-SlotStatePath -Index $Index
+    $request = Get-SlotRequestPath -Index $Index
+    $user = Get-SlotUserName -Index $Index
+
+    New-Item -ItemType Directory -Force -Path $state | Out-Null
+    New-Item -ItemType Directory -Force -Path $request | Out-Null
+    Protect-CiDirectory -Path $state -ReadOnlyUser @($user)
+    Protect-CiDirectory -Path $request -SlotUser $user
+    Write-BootLog "phase 4: slot $Index may write $request and read $state, and nothing else"
+}
+
+function Install-SlotResetService {
+    <#
+      .SYNOPSIS
+        Install the SYSTEM-side reset service under the shim, and start it.
+      .DESCRIPTION
+        Fatal when it will not install or start. The alternative is a host whose
+        COMPLETED requests pile up unserved: every slot on it fails its next gate,
+        which is fail-closed and is also the whole host out of service with the
+        reason three log lines away from where anyone would look.
+
+        NOT a per-slot scheduled task, and the ADR records why at length: a task's
+        security descriptor is only reachable through
+        ITaskFolder.RegisterTaskDefinition, Register-ScheduledTask does not expose
+        it, and a mis-set one fails OPEN -- every slot able to run every slot's
+        reset, with nothing in the boot log saying so. A directory ACL is the
+        boundary phase 1 already establishes and phase 6 already proves, and
+        getting it wrong is an Access is denied at the moment of the mistake.
+
+        The payload and its config are written to a directory with NO slot ACE at
+        all, unlike the boot probe's: this service runs as LocalSystem, so the
+        shim's own log append happens as SYSTEM and there is no slot that needs to
+        write beside it.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (-not (Test-Path -LiteralPath $script:ServiceShim)) {
+        Deny-Boot ("the service shim $script:ServiceShim is missing -- this image cannot reset a " +
+            'slot between jobs, and a host that cannot reset a slot must not serve one')
+    }
+
+    # UTF-8 WITH a BOM, for the reason Install-BeaconService gives: `-Encoding
+    # UTF8` means with-BOM on 5.1 and without-BOM on 7, and a BOM-less file is
+    # decoded as ANSI by the 5.1 that runs it.
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+    New-Item -ItemType Directory -Force -Path $script:SlotResetRoot | Out-Null
+    [System.IO.File]::WriteAllText($script:SlotResetScriptPath, (Get-SlotResetScript), $utf8Bom)
+    [System.IO.File]::WriteAllText($script:SlotResetConfigPath,
+        (Get-SlotResetServiceConfig -ScriptPath $script:SlotResetScriptPath), $utf8Bom)
+    Protect-CiDirectory -Path $script:SlotResetRoot
+    Protect-CiDirectory -Path $script:SlotResetScriptPath
+    Protect-CiDirectory -Path $script:SlotResetConfigPath
+
+    # The preference is dropped around the native call for the reason given in
+    # Install-BeaconService: under Stop, `2>&1` on a native command turns each
+    # stderr line into a terminating NativeCommandError before the exit code is read.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $shimOutput = & $script:ServiceShim 'install' $script:SlotResetConfigPath 2>&1
+    $shimExit = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    foreach ($line in @($shimOutput)) { Write-BootLog "shim: $line" }
+    if ($shimExit -ne 0) {
+        Deny-Boot "the service shim refused to install the slot reset service (exit $shimExit)"
+    }
+
+    try {
+        Start-Service -Name $script:SlotResetServiceName -ErrorAction Stop
+    } catch {
+        Deny-Boot ("the slot reset service would not start ($($_.Exception.Message)) -- no slot on " +
+            'this host could be proved clean between jobs')
+    }
+    Write-BootLog "phase 4: $script:SlotResetServiceName started as LocalSystem"
+}
+
+function Save-SlotProfileTemplate {
+    <#
+      .SYNOPSIS
+        Capture one slot's pristine profile, and write the first `clean` marker.
+      .DESCRIPTION
+        RUNS AFTER PHASE 6 AND BEFORE PHASE 5, AND BOTH HALVES OF THAT ARE LOAD-BEARING
+
+        A Windows profile does not exist until the account logs on, and slot
+        accounts are DENIED interactive and network logon by phase 1 -- service
+        logon is the only kind they have. So there is nothing to capture until some
+        service has run as the slot, and the first one that does is phase 6's boot
+        probe. Capturing after it, and before phase 5 hands the account to an agent
+        GitHub can dispatch to, is the one window in which the profile exists and
+        no job has ever touched it.
+
+        The hive matters, which is why the window matters. HKCU is a persistence
+        surface in its own right -- Run keys, HKCU\Environment, an ExecutionPolicy
+        -- and NTUSER.DAT is only copyable while the account has no session. The
+        probe's service is stopped and removed by the time this runs, so it is.
+
+        Fatal on failure. A slot with no template is a slot the reset service will
+        refuse to reset, which is a slot every one of whose jobs fails at the gate.
+        Better to deny the boot and say so.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int] $Index)
+
+    $template = Get-SlotProfileTemplatePath -Index $Index
+    $profileDir = ''
+    $sid = ''
+    try {
+        # The SID, resolved from the account name phase 1 created, and then the
+        # profile resolved from the SID. Two lookups rather than one because
+        # ProfileList is keyed by SID and nothing else, and because a name that no
+        # longer resolves is a different fault from a profile that was never made.
+        $account = New-Object System.Security.Principal.NTAccount((Get-SlotUserName -Index $Index))
+        $sid = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
+        $raw = (Get-ItemProperty -LiteralPath $key -Name 'ProfileImagePath').ProfileImagePath
+        $profileDir = [System.Environment]::ExpandEnvironmentVariables([string] $raw)
+    } catch {
+        Deny-Boot ("slot $Index has no profile in the account database " +
+            "($($_.Exception.Message)) -- nothing to capture, so nothing could be restored")
+    }
+    # The account database's answer, checked against the slot it is supposed to
+    # describe. A ProfileList entry pointing anywhere else would have this capture
+    # -- and every later restore -- reach a directory that is not this slot's.
+    if (-not (Test-SlotProfileDirectory -Path $profileDir -Index $Index)) {
+        Deny-Boot ("slot $Index resolved to '$profileDir', which is not its profile -- refusing to " +
+            'capture a template from it')
+    }
+
+    New-Item -ItemType Directory -Force -Path $script:ProfileTemplateRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $template | Out-Null
+    # NO slot ACE at all, unlike the hooks: nothing on this host reads a template
+    # except SYSTEM, and a slot that could write its own would be handing every
+    # later job on that slot whatever it left there.
+    Protect-CiDirectory -Path $script:ProfileTemplateRoot
+    Protect-CiDirectory -Path $template
+
+    # Bounded, like phase 7's copies and for the identical reason: this runs
+    # before phase 5 registers anything, the call operator cannot be asked to give
+    # up once the child is running, and a robocopy that wedges here is a host that
+    # never registers -- which past the registration grace reads to
+    # drain_decision.sh as never-registered, so the pool rebuilds it from the same
+    # image forever. A pristine profile is small, so the bound is generous.
+    $copy = Invoke-BoundedNative -FilePath 'robocopy.exe' -TimeoutSeconds $script:ProfileTemplateSeconds `
+        -What "capturing slot $Index's profile template" -ArgumentList @(
+        $profileDir, $template, '/MIR', '/XJ', '/COPY:DAT', '/R:1', '/W:1',
+        '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+    if (-not (Test-RobocopySuccess -ExitCode $copy.ExitCode)) {
+        if ($copy.Error) { Write-BootLog "robocopy: $($copy.Error)" }
+        Deny-Boot ("could not capture slot $Index's profile template (robocopy exit " +
+            "$($copy.ExitCode)) -- every job on this slot would fail at its gate")
+    }
+
+    # The first marker, written by the same hand that captured the template. A
+    # freshly booted slot IS clean -- nothing has run on it -- and without this its
+    # very first job would be failed for a reset that had no predecessor to undo.
+    [System.IO.File]::WriteAllText((Get-SlotMarkerPath -Index $Index), 'clean',
+        (New-Object System.Text.UTF8Encoding($false)))
+    Write-BootLog "phase 4: slot $Index template captured from $profileDir, marked clean"
+}
+
+function Invoke-Phase4SlotReset {
+    <#
+      .SYNOPSIS
+        Install the hooks, the state directories and the reset service. Returns
+        the two paths phase 5 points the two hook variables at.
       .DESCRIPTION
         UNCONDITIONAL, and that is the whole design decision in this phase. There
         is no `if a job service account is configured` around it: a pool with no
         broker is where an inherited credential is MOST dangerous, because nothing
         on the host competes with whatever a workflow left behind and the leftover
-        is simply what the next job authenticates as.
+        is simply what the next job authenticates as. The same is true of every
+        other thing a job leaves in a profile.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string[]] $SlotUsers)
-    Install-JobHook -SlotUsers $SlotUsers
-    return $script:JobHookPath
+    param([Parameter(Mandatory = $true)][object[]] $Provisioned)
+
+    $slotUsers = @($Provisioned | ForEach-Object { $_.User })
+    Install-JobHook -SlotUsers $slotUsers
+    New-Item -ItemType Directory -Force -Path $script:StateRoot | Out-Null
+    Protect-CiDirectory -Path $script:StateRoot -ReadOnlyUser $slotUsers
+    foreach ($slot in $Provisioned) { Install-SlotStateDirectory -Index $slot.Index }
+    Install-SlotResetService
+    return @{
+        Started   = $script:JobHookStartedPath
+        Completed = $script:JobHookCompletedPath
+    }
+}
+
+function Invoke-Phase4ProfileTemplate {
+    <#
+      .SYNOPSIS
+        Capture every slot's profile template and mark every slot clean.
+      .DESCRIPTION
+        Separated from Invoke-Phase4SlotReset because the two halves of this phase
+        cannot run at the same point in the boot: the hooks and the service must
+        exist before any agent registers, and the templates cannot exist until a
+        service has logged the slot accounts on. See Save-SlotProfileTemplate.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][object[]] $Provisioned)
+    foreach ($slot in $Provisioned) { Save-SlotProfileTemplate -Index $slot.Index }
 }
 
 # --- phase 5: agent registration as a per-slot service ------------------------
@@ -4933,6 +5918,17 @@ function Register-SlotAgent {
             'does starts with none of them')
     }
 
+    # RECORDED WHERE THE SLOT CANNOT REACH IT, for phase 4's reset service.
+    #
+    # `.service` above lives inside the slot's own runner directory, which the slot
+    # account can write, and the name inside it reaches Stop-Service running as
+    # SYSTEM. Get-RunnerServiceName has just validated it twice -- shape, and
+    # ownership by this slot's agent name -- so what is copied here is the
+    # validated result into a directory phase 4 locked to SYSTEM and
+    # Administrators. The reset service reads this and never the agent's copy.
+    [System.IO.File]::WriteAllText((Get-SlotRunnerServicePath -Index $Slot.Index), $serviceName,
+        (New-Object System.Text.UTF8Encoding($false)))
+
     # THE STEP WITHOUT WHICH EVERY STEP BELOW IT IS DECORATION
     #
     # `config.cmd --runasservice` does not just install the service, it STARTS
@@ -5161,7 +6157,10 @@ function Invoke-Phase5Registration {
     param(
         [Parameter(Mandatory = $true)][array] $Provisioned,
         [Parameter(Mandatory = $true)][System.Collections.IDictionary] $Config,
-        [Parameter(Mandatory = $true)][string] $HookPath,
+        # The two hook paths phase 4 installed, as a dictionary rather than one
+        # string: the two ends of a job do different work, and a single path here
+        # would be a signature that cannot express the difference.
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary] $HookPath,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string] $BrokerEndpoint,
         # Index -> cache path, from phase 7. A slot that is absent from it gets no
         # cache variables at all, which is the cold-cache behaviour every Windows
@@ -5174,7 +6173,9 @@ function Invoke-Phase5Registration {
         $cache = ''
         if ($CachePaths.Contains($slot.Index)) { $cache = [string] $CachePaths[$slot.Index] }
         $block = Get-SlotServiceEnvironment -Index $slot.Index `
-            -HookPath $HookPath -BrokerEndpoint $BrokerEndpoint -CachePath $cache `
+            -StartedHookPath ([string] $HookPath.Started) `
+            -CompletedHookPath ([string] $HookPath.Completed) `
+            -BrokerEndpoint $BrokerEndpoint -CachePath $cache `
             -HostLabel $Config.HostLabel
         Register-SlotAgent -Slot $slot -RegistrationToken $regToken `
             -Owner $Config.Owner -Repo $Config.Repo -InstanceName $Config.InstanceName `
@@ -5597,7 +6598,7 @@ function Invoke-Main {
     # takes work whose JOB_STARTED points at a file that is not there.
     $brokerEndpoint = Invoke-Phase3JobBroker `
         -JobServiceAccount $cfg.JobSa -BrokerSource $cfg.BrokerSource -BrokerPort $cfg.BrokerPort
-    $hookPath = Invoke-Phase4JobHook -SlotUsers $slotUsers
+    $hookPath = Invoke-Phase4SlotReset -Provisioned $provisioned
 
     # AFTER phase 1 because it needs the slot accounts to seal the master against,
     # and BEFORE phase 5 because phase 5 is what writes the variables that point a
@@ -5612,6 +6613,15 @@ function Invoke-Main {
     # slot credential to prove the boundary; phase 5 spends it on agents GitHub
     # can hand a job to immediately. Proving second proves nothing.
     Invoke-Phase6BootProbe -Provisioned $provisioned -Config $cfg -BrokerEndpoint $brokerEndpoint
+
+    # THE SECOND HALF OF PHASE 4, AND IT CAN ONLY RUN HERE.
+    #
+    # A Windows profile does not exist until the account logs on, and phase 1
+    # denies these accounts every logon type except service -- so the first
+    # profile on this host is the one phase 6's probe service just created. This
+    # is the single window in which every slot has a profile and no job has ever
+    # run in one: after the probe, before the agents. See Save-SlotProfileTemplate.
+    Invoke-Phase4ProfileTemplate -Provisioned $provisioned
 
     # LAST, and the only phase that makes this host reachable by a job. Everything
     # above it is a boundary; this is what is let inside one.
