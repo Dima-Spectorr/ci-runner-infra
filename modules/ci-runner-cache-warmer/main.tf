@@ -140,6 +140,19 @@ locals {
   # EMPTY STRING instead of failing, so the build starts and runs a script whose
   # every variable reference has been erased. This is one of the few places
   # where the loud failure is the good outcome.
+  # AND EVERY STEP CARRIES ITS SCRIPT IN `script`, NEVER IN `args`. A build step
+  # argument is capped at 10,000 characters and the API refuses the whole build
+  # at FIRE time — again, not at apply time — with
+  #
+  #   invalid build: invalid .steps field: build step 0 arg 1 too long
+  #   (max: 10000)
+  #
+  # The publishing script alone is an order of magnitude past that, so
+  # `entrypoint = "bash"` + `args = ["-c", script]` cannot carry it and no amount
+  # of escaping changes that. `script` has no such cap (verified live: a 165 KB
+  # step was accepted), and it honours the file's own `#!/usr/bin/env bash`, so
+  # both scripts run under the interpreter they were written for. Setting
+  # `entrypoint` beside `script` is an error — that is why these steps have none.
   escape_dollars = "$$"
 
   # TWO files, concatenated, because the step runs `bash -c "<text>"` and there
@@ -429,10 +442,9 @@ resource "google_cloudbuild_trigger" "warm" {
     #    metadata server, but the ordering costs nothing and the day Cloud Build
     #    can scope a step's identity this is already the right shape.
     step {
-      id         = "dependencies"
-      name       = var.build_image
-      entrypoint = "bash"
-      args       = ["-c", local.publish_script]
+      id     = "dependencies"
+      name   = var.build_image
+      script = local.publish_script
       env = [
         "CACHE_PREPARE=${local.prepare_command}",
         "CACHE_ARCHIVE_OUT=/workspace/ci-cache-snapshot.tar.gz",
@@ -454,10 +466,9 @@ resource "google_cloudbuild_trigger" "warm" {
     #    carries the same value to a build_command a repository overrode, which
     #    turbo honours without a flag.
     step {
-      id         = "build"
-      name       = var.build_image
-      entrypoint = "bash"
-      args       = ["-c", "${local.build_command} || echo '[warm] build failed; publishing what it produced'"]
+      id     = "build"
+      name   = var.build_image
+      script = "#!/usr/bin/env bash\n${local.build_command} || echo '[warm] build failed; publishing what it produced'\n"
       env = [
         "TURBO_TELEMETRY_DISABLED=1",
         "CI=true",
@@ -468,10 +479,9 @@ resource "google_cloudbuild_trigger" "warm" {
 
     # 3. THE TURBO ARTIFACTS.
     step {
-      id         = "publish-turbo"
-      name       = var.gcloud_image
-      entrypoint = "bash"
-      args       = ["-c", local.turbo_script]
+      id     = "publish-turbo"
+      name   = var.gcloud_image
+      script = local.turbo_script
       env = [
         "WARM_BUCKET=${var.cache_bucket}",
         "WARM_TURBO_PREFIX=${local.turbo_prefix}",
@@ -485,10 +495,9 @@ resource "google_cloudbuild_trigger" "warm" {
     #    trusting the phase that produced it. An artifact that crossed a step
     #    boundary is input.
     step {
-      id         = "publish-snapshot"
-      name       = var.gcloud_image
-      entrypoint = "bash"
-      args       = ["-c", local.publish_script]
+      id     = "publish-snapshot"
+      name   = var.gcloud_image
+      script = local.publish_script
       env = [
         "CACHE_ARCHIVE_IN=/workspace/ci-cache-snapshot.tar.gz",
         "CACHE_POOL=${var.pool_name}",

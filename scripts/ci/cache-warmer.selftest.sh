@@ -299,13 +299,33 @@ has_dollars_escaped() { # <file>
   matches "$code" 'turbo_script = replace\(file\(.*warm-turbo\.sh"\), "\$", local\.escape_dollars\)' || return 1
   matches "$code" 'prepare_command = replace\(coalesce\(var\.prepare_command' || return 1
   matches "$code" 'build_command = replace\(coalesce\(var\.build_command' || return 1
-  # And nothing reaches a step's args as a raw file() read, which is how the
-  # escaping gets bypassed for one step while the local next to it keeps it.
+  # And nothing reaches a step as a raw file() read, which is how the escaping
+  # gets bypassed for one step while the local next to it keeps it.
+  ! matches "$code" 'script[[:space:]]*=[[:space:]]*file\(' || return 1
   ! matches "$code" 'args[[:space:]]*=[[:space:]]*\["-c", file\('
 }
 
 if has_dollars_escaped "$MAIN"; then ok; else
   bad "a script or command reaches the build config with its dollars unescaped — Cloud Build parses those as substitutions and refuses the build at fire time, so the trigger applies green and the warm has never run"
+fi
+
+# 12. EVERY STEP CARRIES ITS SCRIPT IN `script`, NEVER IN `args`. A step argument
+#     is capped at 10,000 characters and the publishing script is an order of
+#     magnitude past it, so `entrypoint = "bash"` + `args = ["-c", …]` is refused
+#     — at FIRE time again, "build step 0 arg 1 too long (max: 10000)", on a
+#     trigger that applied green. `script` has no such cap and honours the file's
+#     own shebang; setting `entrypoint` beside it is an error in its own right.
+carries_scripts_in_script_field() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'script = local\.publish_script' || return 1
+  matches "$code" 'script = local\.turbo_script' || return 1
+  ! matches "$code" 'args[[:space:]]*=[[:space:]]*\["-c"' || return 1
+  ! matches "$code" 'entrypoint'
+}
+
+if carries_scripts_in_script_field "$MAIN"; then ok; else
+  bad "a step passes its script through args or sets an entrypoint beside script — args are capped at 10,000 characters, the publishing script is far past that, and the API refuses the build at fire time on a trigger that applied cleanly"
 fi
 
 # --- mutations -----------------------------------------------------------------
@@ -423,8 +443,16 @@ mutate "the publishing script pasted in unescaped" "$MAIN" \
   has_dollars_escaped
 
 mutate "one step given the raw file() again" "$MAIN" \
-  's@args       = \["-c", local\.turbo_script\]@args       = ["-c", file("${path.module}/scripts/warm-turbo.sh")]@' \
+  's@script = local\.turbo_script@script = file("${path.module}/scripts/warm-turbo.sh")@' \
   has_dollars_escaped
+
+mutate "a script handed back to bash -c" "$MAIN" \
+  's@script = local\.publish_script@entrypoint = "bash"\n      args       = ["-c", local.publish_script]@' \
+  carries_scripts_in_script_field
+
+mutate "an entrypoint set beside a script" "$MAIN" \
+  's@script = local\.turbo_script@entrypoint = "bash"\n      script     = local.turbo_script@' \
+  carries_scripts_in_script_field
 
 mutate "the escape reduced to a single dollar" "$MAIN" \
   's@escape_dollars = "\$\$"@escape_dollars = "$"@' \

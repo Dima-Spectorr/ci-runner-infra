@@ -402,18 +402,24 @@ RUNS_ON_ROUTES = re.compile(
 # "Finite family" has to mean the versions GitHub actually ships, not any
 # number: `\d+(?:\.\d+)?` accepted `ubuntu-1`, `ubuntu-2204`, `windows-11` and
 # `macos-14.0`, none of which is a hosted image and every one of which is an
-# ordinary self-hosted naming convention. So each OS carries its own version
-# shape — Ubuntu ships LTS only (`24.04`), Windows a year (`2022`) or the ARM
-# preview, macOS a bare major (`15`).
+# ordinary self-hosted naming convention.
+#
+# A per-OS version SHAPE was the first tightening and it was not enough. A shape
+# still says "any number of the right form", so `ubuntu-99.04`, `windows-2099`
+# and `macos-99` were hosted images to this gate — and a fleet that wanted a
+# private label of exactly that form would silently get every isolation check
+# skipped on the job carrying it. So the versions are ENUMERATED. There are
+# eleven of them; there is no shape to guess at.
 #
 # The list goes stale in the SAFE direction, on purpose: an image GitHub adds
 # later reads as self-hosted until this line is updated, which costs one
-# reported job. The other direction costs the boundary.
+# reported job and a one-line pull request. The other direction costs the
+# boundary. Last checked against GitHub's runner-images inventory 2026-08-23.
 HOSTED_IMAGE = re.compile(
     r"^(?:"
-    r"ubuntu-(?:latest|\d{2}\.04)"
-    r"|windows-(?:latest|20\d{2}|11-arm)"
-    r"|macos-(?:latest|\d{2})"
+    r"ubuntu-(?:latest|24\.04|22\.04)"
+    r"|windows-(?:latest|2025|2022|11-arm)"
+    r"|macos-(?:latest|15|14|13)"
     r")(?:-(?:arm|arm64|large|xlarge))?$",
     re.IGNORECASE,
 )
@@ -1632,6 +1638,65 @@ jobs:
     steps: [{run: "true"}]
   mac:
     runs-on: macos-latest-xlarge
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # A version of the right SHAPE is still not a version GitHub ships. These
+  # three passed the per-OS shapes (`\d{2}\.04`, `20\d{2}`, `\d{2}`) and are
+  # exactly the private labels a fleet would pick if it wanted one that looked
+  # official — so the versions are enumerated rather than shaped, and each of
+  # these reads as the custom label it is.
+  expect "an unshipped Ubuntu LTS number is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-99.04
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "an unshipped Windows year is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: windows-2099
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "an unshipped macOS major is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: macos-99
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # …and every version that IS shipped stays hosted, so enumerating did not
+  # quietly drop one. `windows-2022-large` is a real larger-runner label.
+  expect "the enumerated images stay hosted" "" "" allowed \
+'on: [pull_request]
+jobs:
+  u22:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  w25:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  wlarge:
+    runs-on: windows-2022-large
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  m13:
+    runs-on: macos-13
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  m14:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  m15:
+    runs-on: macos-15
     timeout-minutes: 30
     steps: [{run: "true"}]'
 

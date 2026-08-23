@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.41.0"
   # ...
 }
 ```
@@ -328,11 +328,18 @@ that image a real answer is separate work, not a line in this one.
   **A warm cache is untrusted build input on Windows too.** `warm_cache_script`
   is arbitrary repo-supplied code running elevated in the build VM, and the tree
   it leaves behind is both ACL-walked and copied K times. The Linux scan refuses
-  five things; three of them have no Windows spelling. Of the two that do, the
-  **reparse point** is refused at build time and again at boot; the out-of-tree
-  **NTFS hardlink** is not refused at all, and the seal rewrites the shared
-  security descriptor at the file's other name -- a known gap, tracked as #238,
-  because a link count needs a per-file `fsutil` call or a P/Invoke. `icacls`
+  five things; three of them have no Windows spelling. Both of the two that do —
+  the **reparse point** and the out-of-tree **NTFS hardlink** — are refused at
+  build time and again at boot. They are one hazard in two shapes: a name in
+  this tree standing for a file that is not. A hardlink needs no attribute to
+  do it, so the second scan reads a link count through
+  `GetFileInformationByHandle` and **counts** the names it can see against it,
+  rather than forbidding a link count above one — a pnpm store and a `cp -al`
+  both hardlink legitimately, entirely inside the tree, and the Linux side
+  shipped the strict version once and had to withdraw it. At boot the probe is
+  compiled lazily and only on the hydrate path, so a host with nothing to
+  hydrate pays nothing; a host that cannot compile it starts cold rather than
+  sealing a tree it could not check. `icacls`
   with `(OI)(CI)` follows a junction, so a junction aimed at `C:\Windows` is a
   read-and-execute grant applied *there* — and an ACL applied to the wrong tree
   is not undone by the next boot. `robocopy` follows one too, turning a cache
@@ -770,6 +777,8 @@ docs/image-vuln-ignores.txt      the dated exceptions to that
 scripts/ci/lane-decision.sh      pure CI-lane rule (unit-tested)
 scripts/ci/                      self-tests
 docs/onboarding-a-repository.md  how to put a NEW repo on the fleet
+docs/github-app-permissions.md   the App's permissions: who grants each, how,
+                                 and how each one fails without saying so
 scripts/ci/check-merge-queue-single-step.sh
                                  the merge-queue rule consumers copy in
 scripts/ci/check-runner-policy.sh
