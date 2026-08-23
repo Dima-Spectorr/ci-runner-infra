@@ -307,10 +307,20 @@ MATRIX_RUNS_ON = re.compile(
 # job that MAY name a pool literally from the ones that may not.
 NEEDS_OUTPUT = re.compile(r"needs\.([A-Za-z0-9_-]+)\.outputs\.")
 
-# Every single-quoted literal in a `runs-on` expression. GitHub Actions
-# expressions quote strings with single quotes only, so this is the whole of the
-# literal surface.
-LITERAL_ALT = re.compile(r"'([^']*)'")
+# The literals in a `runs-on` expression that can actually BECOME the runner:
+# the operands of a short-circuit. GitHub Actions quotes strings with single
+# quotes only, but not every quoted string is a candidate label — in
+# `contains(github.ref, 'main') && 'PoolA' || …` the first literal is an
+# argument to a condition and can never be the answer. Reporting it would fail
+# the guard a careful author wrote, which is the worst kind of false positive.
+LITERAL_ALT = re.compile(r"(?:&&|\|\|)\s*'([^']*)'")
+
+# The same question for a literal that OPENS the expression, which no operator
+# precedes: `${{ 'PoolA' || needs.anchor.outputs.runs-on }}` is that pool on
+# every run, because a non-empty string short-circuits before the reference is
+# ever read. Deliberately not the mirror rule "a literal FOLLOWED by an
+# operator" — that one also matches the `'main'` in `x == 'main' && …`.
+LITERAL_FIRST = re.compile(r"\$\{\{\s*'([^']*)'")
 
 # A loopback address with a port in the shared-infrastructure band, anywhere in
 # a job's steps. On a Windows host there is nothing listening there: the stack
@@ -639,9 +649,18 @@ for job_id, job in jobs.items():
         # actually wrong.
         for label in (runs_on if isinstance(runs_on, list) else [runs_on]):
             text = str(label) if label is not None else ""
-            for m in NEEDS_OUTPUT.finditer(text):
-                out("#RUNSONNEEDS", vid, m.group(1))
-                for lit in LITERAL_ALT.findall(text):
+            anchors = [m.group(1) for m in NEEDS_OUTPUT.finditer(text)]
+            for anchor in anchors:
+                out("#RUNSONNEEDS", vid, anchor)
+            # Hoisted out of the loop above. The literals belong to the
+            # EXPRESSION, not to each reference inside it, and scanning per
+            # reference emitted the same literal once per
+            # `needs.<job>.outputs.*` the expression happened to name.
+            if anchors:
+                seen = dict.fromkeys(
+                    LITERAL_ALT.findall(text) + LITERAL_FIRST.findall(text)
+                )
+                for lit in seen:
                     if lit.strip() and not HOSTED_IMAGE.match(lit.strip()):
                         out("#RUNSONLITERAL", vid, lit.strip())
 
@@ -768,9 +787,22 @@ comment_view() {
         inblock = 0
       }
       print
-      # A block-scalar indicator ends its line: YAML allows a comment after
-      # `|`, so `[^#]` keeps `key: | # note` out of the way of the anchor.
-      if ($0 ~ /(^|[^#])[|>][-+]?[0-9]*[ \t]*$/) { inblock = 1; blockind = ind }
+      # A block-scalar indicator ends its line -- EXCEPT that YAML allows a
+      # comment after it, so `run: | # note` opens a block just as `run: |`
+      # does. Missing that shape put the whole body back into the comment view,
+      # which is the bypass this function exists to close, reachable by adding
+      # a comment.
+      #
+      # Anchored on the `:` (or a sequence dash) that a block scalar always
+      # follows, and never fired on a line that is itself a comment: without
+      # that, a comment ending in `|` would swallow everything indented under
+      # it. `[-+0-9]*` because the chomping and indentation indicators may be
+      # written in either order (`|2-` as well as `|-2`).
+      if ($0 !~ /^[ \t]*#/ &&
+          ($0 ~ /:[ \t]*[|>][-+0-9]*[ \t]*(#.*)?$/ ||
+           $0 ~ /^[ \t]*-[ \t]*[|>][-+0-9]*[ \t]*(#.*)?$/)) {
+        inblock = 1; blockind = ind
+      }
     }
   ' "$1"
 }
@@ -2289,6 +2321,30 @@ jobs:
     timeout-minutes: 30
     steps: [{run: "true"}]'
 
+  # A quoted string is not automatically a candidate label. Here it is an
+  # argument to a condition and can never be what `runs-on` resolves to, so
+  # reporting it would fail the guard a careful author wrote — which is the
+  # false positive that teaches a repository to pass `--allow-dynamic-runner`
+  # and lose the rule entirely.
+  expect_si "a literal inside a condition is not a fallback" "" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: ${{ contains(github.ref, '"'"'main'"'"') && fromJSON(needs.anchor.outputs.runs-on) || fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The literal that opens the expression, which no operator precedes. A
+  # non-empty string short-circuits before the reference is read, so this is
+  # the pool on every run, not just on the runs where the anchor went missing.
+  expect_si "a pool literal ahead of the anchor reference is not a pin" "RUNNER9" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: ${{ '"'"'ExampleRepo'"'"' || fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
   # A marker inside a `run: |` block is shell, not a declaration. A repository
   # could exempt a job by echoing the string, and would not have to mean to.
   expect_si "an exemption echoed inside a run block exempts nothing" "RUNNER9" \
@@ -2299,6 +2355,20 @@ jobs:
     timeout-minutes: 30
     steps:
       - run: |
+          # shared-infra-exempt(test, #1): echoed, not declared
+          echo hi'
+
+  # The same bypass, reachable by adding a comment. `run: | # note` is a block
+  # scalar too, and a reader that only recognises an indicator at end of line
+  # puts the whole body back in the comment view.
+  expect_si "an exemption echoed inside a commented block scalar exempts nothing" "RUNNER9" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps:
+      - run: | # a trailing comment is legal after the indicator
           # shared-infra-exempt(test, #1): echoed, not declared
           echo hi'
 

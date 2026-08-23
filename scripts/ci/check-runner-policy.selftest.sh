@@ -144,7 +144,7 @@ mutate "the diagnostic never emitted" \
 #    every correctly pinned consumer in the fleet is reported as unpinned — and
 #    RUNNER9 firing everywhere is how RUNNER9 gets turned off everywhere.
 mutate "the reader no longer reports the anchor resolution" \
-  's@out("#RUNSONNEEDS", vid, m.group(1))@pass@'
+  's@out("#RUNSONNEEDS", vid, anchor)@pass@'
 
 # 9. The resolution is read only up to the first `||`. A plain consumer still
 #    passes, so most fixtures stay green — but the fleet's fork-routing idiom
@@ -205,6 +205,22 @@ mutate "a declared exemption is no longer honoured" \
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "the marker no longer has to name the job it excuses" \
   's@${esc}${tail}@[^)]*@'
+
+# 17. The literal rule widened back to every quoted string. This is the
+#     over-correction, and it fails a CORRECT workflow rather than passing a
+#     wrong one — which is the more expensive direction: a gate that reports
+#     the `'main'` in a `contains()` guard teaches the repository to pass
+#     `--allow-dynamic-runner`, and the rule is gone for everything.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "every quoted string counts as a runner fallback" \
+  's@(?:&&|\\|\\|)\\s\*@@'
+
+# 18. A block-scalar indicator is only recognised at end of line, so `run: |`
+#     opens a block and `run: | # note` does not. The body goes back into the
+#     comment view and a marker echoed there declares an exemption again —
+#     the same bypass, reachable by adding a comment to the line above it.
+mutate "a commented block-scalar header no longer opens a block" \
+  's@(#\.\*)?@@g'
 
 printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
