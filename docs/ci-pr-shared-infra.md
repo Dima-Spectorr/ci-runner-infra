@@ -298,7 +298,20 @@ own cleanup either.
 **The Windows leg has no fallback available** — there is no container runtime on
 a Windows host. A Windows job that needs the stack and finds `addr` empty has to
 skip. That is rule 3's asymmetry, and it is why the Windows leg is the one job
-in the example carrying an `if:` guard.
+in the example carrying an `if:` guard. Forget the guard and the action says so:
+the fallback checks `RUNNER_OS` and `docker` on PATH before it starts anything,
+so the leg fails on a sentence naming the missing `if:` rather than on
+`docker: command not found` from inside a command substitution.
+
+Two smaller inputs behave the way their names suggest, which is worth stating
+because one of them did not always. `password` is enforced on the fallback and
+not merely embedded in the URL — empty runs the throwaway container under
+`POSTGRES_HOST_AUTH_METHOD=trust`, which is the normal case for a fixture
+database and what the anchor's compose does, and a non-empty one drops `trust`
+so the image's scram-sha-256 default applies and the credential in the URL is
+the credential the server checks. `health-timeout` is a whole number of
+seconds, validated: `90m` is rejected with a message instead of reaching the
+arithmetic and dying as a bash syntax error.
 
 ## 3. The infrastructure owner job
 
