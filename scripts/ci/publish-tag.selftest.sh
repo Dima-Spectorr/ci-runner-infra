@@ -83,7 +83,7 @@ is_idempotent() {
 # must never reach `git/refs` — the mistake is permanent.
 refuses_an_unshaped_version() {
   local code; code=$(code_of "$1")
-  matches "$code" 'grep -qE .\^v\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\$' || return 1
+  matches "$code" 'grep -cE .\^v\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\$' || return 1
   matches "$code" 'refusing to create a tag' || return 1
   matches "$code" 'exit 1' || return 1
 }
@@ -270,8 +270,8 @@ mutate "token downgraded to read" \
   's|contents: write|contents: read|'                                    can_write_tags
 mutate "existence check dropped" \
   's|git/ref/tags/\$want|git/ref/tags/nothing|'                          is_idempotent
-mutate "shape guard dropped" \
-  's|grep -qE|grep -cE|'                                                 refuses_an_unshaped_version
+mutate "shape guard unanchored" \
+  's|\^v\[0-9\]|v[0-9]|'                                                 refuses_an_unshaped_version
 mutate "refusal downgraded to a warning" \
   's|refusing to create a tag|creating a tag|'                           refuses_an_unshaped_version
 mutate "lightweight tag instead of annotated" \
