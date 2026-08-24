@@ -138,6 +138,72 @@ while read -r m; do
   fi
 done <<<"$declared"
 
+# --- and the contract that a declared metric actually ARRIVES ----------------
+#
+# Agreeing on names is worth nothing if the request carrying them is rejected.
+# Cloud Monitoring caps projects.timeSeries.create at 200 TimeSeries objects and
+# rejects the WHOLE request past it, so on a four-pool controller — ~55 series
+# per pool — one flush would drop every series in the tick, `ci_demand` included,
+# and the pool would stop scaling while every dashboard held its last value.
+#
+# Run for real, against a stubbed transport, because the arithmetic is the thing
+# under test: the buffer is a comma-joined string of JSON objects and the cap is
+# enforced by COUNTING on the way in, which is exactly the kind of off-by-one a
+# static read of the diff cannot settle.
+batching_holds() {
+  local dir reqs
+  dir=$(mktemp -d) || return 1
+  reqs="$dir/requests"
+  : >"$reqs"
+
+  (
+    set -uo pipefail
+    PROJECT=test-project REGION=test-region
+    REPO_FULL=test-owner/test-repo POOL=test-pool
+    METRIC_PREFIX=custom.googleapis.com/ci
+    log() { :; }
+
+    # Shadows the binary for the whole subshell. The token call and the POST are
+    # told apart by their URL, and the POST records how many series it was handed
+    # rather than sending them anywhere.
+    curl() {
+      local a prev="" body=""
+      case "$*" in
+        *service-accounts/default/token*)
+          printf '{"access_token":"stub"}'
+          return 0
+          ;;
+      esac
+      for a in "$@"; do
+        [ "$prev" = "-d" ] && body="$a"
+        prev="$a"
+      done
+      printf '%s' "$body" | grep -o '"metric"' | wc -l | tr -d ' ' >>"$reqs"
+      printf '200'
+    }
+
+    # shellcheck source=/dev/null
+    . "$scripts/telemetry.sh"
+
+    # No `local` here: this is a subshell, not a function (shellcheck SC2168).
+    for i in $(seq 1 450); do
+      queue_series "ci_probe_$i" 1
+    done
+    flush_series
+  ) >/dev/null 2>&1
+
+  local got
+  got=$(tr '\n' ' ' <"$reqs" | sed 's/ *$//')
+  rm -rf "$dir"
+  [ "$got" = "200 200 50" ] || {
+    printf 'FAIL telemetry batching: 450 queued series produced requests of [%s], expected [200 200 50] — a request over 200 is rejected whole, so this drops every series in the tick including ci_demand\n' "$got"
+    return 1
+  }
+  printf 'ok   telemetry: 450 series are split into requests of 200, 200, 50\n'
+}
+
+batching_holds || fails=$((fails + 1))
+
 if [ "$fails" -eq 0 ]; then
   printf '\nPASS — the published metrics and the module contract agree.\n'
 else

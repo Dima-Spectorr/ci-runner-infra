@@ -58,7 +58,22 @@
 #
 # An org policy that disables guest-attribute ACCESS disables the WRITE as well
 # as the read, so `ci-pin-hold` on a host cannot publish a hold, no hold can
-# exist, and there is nothing behind the failure to protect. Left as a keep it
+# exist, and there is nothing behind the failure to protect.
+#
+# THAT IS MEASURED, NOT INFERRED, and it is worth the space because the published
+# description of the constraint does not say it. "Disables Compute Engine API
+# access to the Guest Attributes" reads as though only the API side is closed and
+# the guest keeps its metadata-server channel — which is exactly the channel
+# `publish()` in host-startup.sh uses. Probed from inside a live pool host on
+# 2026-08-24, with `enable-guest-attributes = TRUE` set on the instance:
+#
+#   PUT  .../instance/guest-attributes/probe/write-test  -> HTTP 403
+#   GET  .../instance/guest-attributes/probe/write-test  ->
+#     "Guest attributes endpoint access is disabled."
+#   GET  .../instance/guest-attributes/ci/pin-hold       -> HTTP 403, same body
+#
+# The guest endpoint is closed in both directions too. A host under this policy
+# cannot write a hold, cannot read one back, and has none to lose. Left as a keep it
 # is not a conservative default — it is a permanent, silent veto on every
 # removal the controller will ever decide, for every host, on every tick.
 #
@@ -132,8 +147,13 @@ pin_hold_decision() {
   #    412 on its own is not the fact — the constraint name is. See the header
   #    for why this is the one failure that does not mean "we did not get an
   #    answer": the write is disabled by the same policy as the read, so there
-  #    is no hold to be wrong about. Nothing is cached and nothing is consulted;
-  #    a stale cache entry from before the policy landed must not outlive it.
+  #    is no hold to be wrong about.
+  #
+  #    THE RULE IGNORES THE CACHE HERE -- it does not read c_run/c_exp, and it
+  #    does not decide from them. Clearing it is the CALLER's job and the caller
+  #    does it: pin_hold_gate treats this verdict like a successful read, so a
+  #    hold cached from before the policy landed is dropped rather than left to
+  #    lapse on its own TTL.
   if [ "$reads_disabled" = "1" ]; then
     echo "free:guest-attributes-unavailable"
     return 0
