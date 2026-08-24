@@ -138,6 +138,14 @@ output "metric_names" {
       # an abandoned or forged one makes, and the reason the controller clamps
       # every hold to PIN_HOLD_MAX.
       "ci_pin_holds_honoured",
+      # Guest-attribute reads refused by
+      # constraints/compute.disableGuestAttributesAccess this tick, across both
+      # gates that make one. This is the series that separates "the pool is
+      # holding hosts for runs in flight" from "the pool can no longer ask, so
+      # it holds everything forever", and until it existed the two were the same
+      # number on the same chart. Alert on ANY non-zero: unlike a hold, an org
+      # policy does not lapse, and no amount of waiting clears it.
+      "ci_guest_attributes_denied",
       "ci_hosts_running",
       "ci_hosts_max",
       "ci_hosts_draining",
