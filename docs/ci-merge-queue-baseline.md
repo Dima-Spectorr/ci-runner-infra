@@ -1532,10 +1532,22 @@ The step log shows the `gh api` 403 above the notice.
   configuration the workflow otherwise accepts. The callee clamps its own
   sleeps to that budget and emits a `::warning::` naming it, so overrunning
   degrades to a shorter last wait rather than a cancellation; treat that
-  warning as a configuration error, not as the mechanism working. The timeout
-  is a literal rather than an input because RUNNER6 refuses a
-  `timeout-minutes` it cannot resolve to a number, and 20 is set against the
-  queue's 30-minute `checks_timeout`, which caps the useful ladder anyway.
+  warning as a configuration error, not as the mechanism working. Once the
+  budget is gone the ladder **stops** rather than firing its remaining nudges
+  back-to-back: a comment nobody is given time to answer is not a retry, it is
+  noise on the pull request, and the run says so — `stopped after N of M
+  refresh commands` instead of the warning that sends you to audit webhook
+  deliveries that are working. The timeout is a literal rather than an input
+  because RUNNER6 refuses a `timeout-minutes` it cannot resolve to a number,
+  and 20 is set against the queue's 30-minute `checks_timeout`, which caps the
+  useful ladder anyway.
+- **The wait inputs are `type: number`, and the callee rounds them up to whole
+  seconds.** `number` is not `integer`: `grace-seconds: 0.5` arrives as the
+  literal `0.5`, and the clamp compares it arithmetically, so an unnormalised
+  fraction fails the comparison *false* and the job sleeps its entire remaining
+  budget — half a second becoming nineteen minutes. Rounding is up because each
+  of these is a minimum. A value that is not a number fails the job with an
+  `::error::` naming the input, rather than being read as zero.
 - **Do not restore `grace-seconds` as a safety margin.** It reads like one and
   is not: it has been measured over eleven runs catching Mergify self-reacting
   zero times, and it delays every run to save a comment on none of them. The

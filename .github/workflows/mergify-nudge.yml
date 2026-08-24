@@ -253,6 +253,49 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Every wait below is a `type: number` input, and `number` in Actions
+          # is not `integer`: `grace-seconds: 0.5` reaches this script as the
+          # literal `0.5`. `sleep` accepts that, but `[ 0.5 -le 1155 ]` does
+          # not — it is an ARITHMETIC test, so it prints "integer expression
+          # expected" and returns false, and the clamp below reads a false
+          # there as "this wait is too long" and sleeps the ENTIRE remaining
+          # budget. Half a second would have become nineteen minutes: not a
+          # cryptic failure, a silent inversion of the thing the clamp exists
+          # to guarantee.
+          #
+          # So normalise once, here, before any arithmetic sees them. Rounding
+          # is UP because every one of these is a minimum — "give Mergify at
+          # least this long" — and rounding up is the only direction that
+          # cannot make the ladder more aggressive than the caller asked for.
+          # A value that is not a number at all is a misconfiguration, and it
+          # fails loudly rather than being silently treated as zero.
+          to_seconds() { # <input name> <value>
+            local name="$1" v="$2" int frac
+            case "$v" in
+              ''|.|*[!0-9.]*|*.*.*)
+                echo "::error::$name must be a non-negative number; got '$v'" >&2
+                return 1
+                ;;
+            esac
+            int="${v%%.*}"
+            int="$(( 10#${int:-0} ))"
+            if [ "$v" = "${v%%.*}" ]; then
+              printf '%s\n' "$int"
+              return 0
+            fi
+            frac="${v#*.}"
+            case "$frac" in
+              *[!0]*) int=$(( int + 1 )) ;;
+            esac
+            printf '%s\n' "$int"
+          }
+
+          GRACE="$(to_seconds grace-seconds "$GRACE")"
+          ATTEMPTS="$(to_seconds attempts "$ATTEMPTS")"
+          INTERVAL="$(to_seconds interval-seconds "$INTERVAL")"
+          NUDGE_ATTEMPTS="$(to_seconds nudge-attempts "$NUDGE_ATTEMPTS")"
+          CONFIRM="$(to_seconds confirm-seconds "$CONFIRM")"
+
           # Everything below waits, and GitHub cancels the job at
           # `timeout-minutes` without running the final probe or the warning —
           # so a widened `confirm-seconds` would turn a supported configuration
@@ -261,15 +304,27 @@ jobs:
           # a worse answer than the operator asked for but still an answer.
           # The 45s reserve covers job setup before this line plus the `gh`
           # calls after the last sleep.
+          #
+          # A wait that could not be taken IN FULL means the budget is spent,
+          # and that has to be reported rather than swallowed. Returning 0
+          # there degrades the ladder into a comment burst: every later wait
+          # returns instantly, so the remaining nudges post back-to-back with
+          # none of the confirmation window they exist to provide, and the run
+          # ends by telling the operator to audit their webhook deliveries when
+          # the real fault is a configuration that does not fit in the job.
+          # `out_of_time` below carries that verdict, and the ladder stops.
           deadline=$(( $(date -u +%s) + JOB_TIMEOUT_MINUTES * 60 - 45 ))
-          bounded_sleep() { # <seconds>
+          out_of_time=0
+          bounded_sleep() { # <seconds>; returns 1 when the budget is spent
             local left=$(( deadline - $(date -u +%s) ))
-            [ "$left" -gt 0 ] || return 0
-            [ "$1" -le "$left" ] || {
+            if [ "$left" -le 0 ]; then
+              return 1
+            fi
+            if [ "$1" -gt "$left" ]; then
               echo "::warning::waiting ${left}s instead of $1s — the configured ladder does not fit in the job's ${JOB_TIMEOUT_MINUTES}-minute timeout; narrow the waits, and note the queue's checks_timeout caps this anyway"
               sleep "$left"
-              return 0
-            }
+              return 1
+            fi
             sleep "$1"
           }
 
@@ -328,7 +383,7 @@ jobs:
             [ "$(date -u -d "$newest" +%s)" -ge "$ci_ended" ]
           }
 
-          bounded_sleep "$GRACE"
+          bounded_sleep "$GRACE" || out_of_time=1
 
           attempt=1
           while true; do
@@ -336,9 +391,9 @@ jobs:
               echo "::notice::Mergify re-evaluated $HEAD_SHA on its own after attempt $attempt — no nudge needed"
               exit 0
             fi
-            [ "$attempt" -lt "$ATTEMPTS" ] || break
+            [ "$attempt" -lt "$ATTEMPTS" ] && [ "$out_of_time" -eq 0 ] || break
             attempt=$((attempt + 1))
-            bounded_sleep "$INTERVAL"
+            bounded_sleep "$INTERVAL" || out_of_time=1
           done
 
           # Mergify is behind. The command has to START the comment, with a
@@ -393,11 +448,15 @@ jobs:
           while true; do
             post_nudge "$nudge"
             [ "$nudge" -lt "$NUDGE_ATTEMPTS" ] || break
-            bounded_sleep "$CONFIRM"
+            bounded_sleep "$CONFIRM" || out_of_time=1
             if mergify_seen_it; then
               echo "::notice::Mergify answered nudge $nudge — re-evaluated $HEAD_SHA"
               exit 0
             fi
+            # After the probe, never before it: a spent budget still deserves
+            # the answer to the nudge already posted. It is the NEXT post that
+            # must not happen, because there is no window left to answer it in.
+            [ "$out_of_time" -eq 0 ] || break
             nudge=$((nudge + 1))
           done
 
@@ -407,10 +466,17 @@ jobs:
           # on #372 Mergify's reply landed in the same second as this line and
           # the job still told the operator to go audit their webhook deliveries.
           # The warning below is only true if it survives one more wait.
-          bounded_sleep "$CONFIRM"
-          if mergify_seen_it; then
-            echo "::notice::Mergify answered nudge $NUDGE_ATTEMPTS — re-evaluated $HEAD_SHA"
-            exit 0
+          #
+          # Guarded, because the loop above breaks for two different reasons:
+          # having posted every nudge, or having run out of budget — and in the
+          # second case it has ALREADY waited and probed, so repeating it here
+          # would report a wait that never happened.
+          if [ "$out_of_time" -eq 0 ]; then
+            bounded_sleep "$CONFIRM" || out_of_time=1
+            if mergify_seen_it; then
+              echo "::notice::Mergify answered nudge $nudge — re-evaluated $HEAD_SHA"
+              exit 0
+            fi
           fi
 
           # Every comment we are willing to send has been sent and Mergify has
@@ -418,4 +484,12 @@ jobs:
           # and reconciliation will reach it: but say so loudly, because a
           # repository that reaches this line regularly has something wrong with
           # its Mergify installation that no amount of nudging will fix.
-          echo "::warning::posted $NUDGE_ATTEMPTS refresh commands and Mergify re-evaluated none of them — check the Mergify installation's webhook deliveries"
+          #
+          # Unless the ladder never finished, in which case blaming the webhook
+          # deliveries sends the operator to audit a subsystem that is working.
+          # The fault is theirs and it is fixable, so name it.
+          if [ "$out_of_time" -ne 0 ]; then
+            echo "::warning::stopped after $nudge of $NUDGE_ATTEMPTS refresh commands — the ladder does not fit in the job's ${JOB_TIMEOUT_MINUTES}-minute budget, and posting the rest back-to-back would give Mergify no window to answer any of them; narrow the waits"
+          else
+            echo "::warning::posted $NUDGE_ATTEMPTS refresh commands and Mergify re-evaluated none of them — check the Mergify installation's webhook deliveries"
+          fi
