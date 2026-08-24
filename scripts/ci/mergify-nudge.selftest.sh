@@ -279,7 +279,7 @@ is_bounded() {
 normalises_the_waits() {
   local code; code=$(code_of "$1")
   matches "$code" '^          to_seconds\(\) \{' || return 1
-  matches "$code" '::error::\$name must be a non-negative number' || return 1
+  matches "$code" '::error::\$name must be a plain non-negative number' || return 1
   local v
   for v in GRACE ATTEMPTS INTERVAL NUDGE_ATTEMPTS CONFIRM; do
     matches "$code" "^          $v=\"\\\$\(to_seconds " || return 1
@@ -309,8 +309,18 @@ stops_when_the_budget_is_spent() {
   matches "$code" '^ +bounded_sleep "\$GRACE" \|\| out_of_time=1$'    || return 1
   matches "$code" '^ +bounded_sleep "\$INTERVAL" \|\| out_of_time=1$' || return 1
   matches "$code" '^ +bounded_sleep "\$CONFIRM" \|\| out_of_time=1$'  || return 1
+  # An EXACT fit is exhaustion too. `-gt` there says "the sleep fitted", which
+  # is true and is not the question: a wait equal to the whole remaining budget
+  # leaves nothing behind it, and reporting success hands the caller a budget of
+  # zero dressed up as a budget.
+  matches "$body" '^ +if \[ "\$1" -ge "\$left" \]; then$'             || return 1
   # The retry loop leaves rather than posting into a window that does not exist.
   matches "$code" '^ +\[ "\$out_of_time" -eq 0 \] \|\| break$'        || return 1
+  # …and asks the CLOCK as well as the flag. The flag is set by the last sleep,
+  # but the probe between that sleep and the guard spends real time — two
+  # paginated `gh api` calls — so a wait that fitted can still leave the
+  # deadline behind us by the time the guard runs.
+  matches "$code" '^ +\[ "\$\(\( deadline - \$\(date -u \+%s\) \)\)" -gt 0 \] \|\| break$' || return 1
   # And the closing warning names the real fault.
   matches "$code" '^          if \[ "\$out_of_time" -ne 0 \]; then$'  || return 1
   matches "$code" 'stopped after \$nudge of \$NUDGE_ATTEMPTS'         || return 1
@@ -515,6 +525,10 @@ mutate "the ladder keeps posting after the budget is spent" "$CALLEE" \
   's@^            \[ "\$out_of_time" -eq 0 \] || break$@            true@' stops_when_the_budget_is_spent
 mutate "an overrun is blamed on the webhook deliveries" "$CALLEE" \
   's|^          if \[ "\$out_of_time" -ne 0 \]; then$|          if false; then|' stops_when_the_budget_is_spent
+mutate "a wait that consumes the budget EXACTLY reports success" "$CALLEE" \
+  's|^            if \[ "\$1" -ge "\$left" \]; then$|            if [ "$1" -gt "$left" ]; then|' stops_when_the_budget_is_spent
+mutate "the post guard trusts the flag and never re-reads the clock" "$CALLEE" \
+  's@^            \[ "\$(( deadline - \$(date -u +%s) ))" -gt 0 \] || break$@            true@' stops_when_the_budget_is_spent
 
 mutate "the caller no longer fires on completion" "$CALLER" \
   's|^    types: \[completed\]$|    types: [requested]|'              triggers_on_ci_completion

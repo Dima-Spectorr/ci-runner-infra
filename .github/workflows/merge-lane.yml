@@ -1,0 +1,243 @@
+# =============================================================================
+# merge-lane — the merge queue, inside the repository
+#
+# WHAT THIS REPLACES, AND WHY
+#
+# Mergify. The full argument, with the measurements, is in
+# `scripts/ci/merge-lane-decision.sh` and `docs/merge-lane.md`; the short form
+# is that a third-party queue learns that CI went green over a webhook, and a
+# webhook that is missed leaves a green pull request sitting on "under
+# evaluation" for 9 to 25 minutes. That was never solved. `mergify-nudge` capped
+# it at about three and a half minutes by paying a runner to SLEEP and then
+# posting `@mergifyio refresh`, which is a workaround whose own cost was a
+# billed idle runner on every CI completion in every private repository.
+#
+# GitHub does not need to be told that CI finished. It finished it. A
+# `workflow_run` trigger in the same repository is dispatched by GitHub itself,
+# and the merge decision happens in the run that observes the green — seconds,
+# not minutes, with no third party in the path.
+#
+# The second thing this removes is the speculative draft. Mergify validates a
+# queued pull request on a throwaway branch at `mergify/merge-queue/<sha>`,
+# which is a second full CI run per merge, and on one consumer repository 87 of
+# 122 of those runs failed — almost all at `Set up runner` / `Initialize
+# containers` / `Complete runner`, i.e. the fleet rather than the diff. Each
+# failure was a terminal dequeue of a good pull request. This lane validates IN
+# PLACE, on the pull request's own branch: a branch already current with the
+# base merges with no second run at all, and one whose base moved gets exactly
+# one re-run, on its own branch, where a failure is the author's to read.
+#
+# WHY A REUSABLE WORKFLOW
+#
+# The same argument `shared-infra-anchor.yml` and the retired `mergify-nudge`
+# made: fourteen repositories needing the same logic is fourteen copies of every
+# future fix. The consumer writes a caller with the `workflow_run` trigger —
+# which cannot live here, since `workflow_call` is the only trigger a callee may
+# declare — and passes its own required-check names.
+#
+# WHY IT RUNS THE DEFAULT BRANCH'S CODE, ALWAYS
+#
+# `workflow_run` checks out the default branch, not the pull request, and that
+# is a security property this workflow depends on rather than an accident. This
+# job holds a token that can merge to the default branch. If it ever executed a
+# script authored in the pull request under evaluation, any contributor could
+# merge anything by editing that script. Nothing below reads a single byte from
+# the head ref: the decision script is the one checked out here, the check names
+# come from the caller's inputs, and every fact about the pull request is read
+# from the API.
+#
+# WHAT THE CONSUMER MUST PROVIDE
+#
+# A GitHub App with `Contents: write`, `Pull requests: write`, `Checks: read`,
+# `Actions: read`, `Metadata: read`, installed on the repository. This is
+# DELIBERATELY NOT the fleet's runner App: `docs/github-app-permissions.md`
+# argues that that App must never hold `Contents: write`, and that argument is
+# still correct. Merge authority gets its own identity and its own blast radius.
+#
+# The App token is not a convenience. A merge or a branch update performed with
+# the built-in `GITHUB_TOKEN` triggers NO further workflow — so the re-run this
+# lane depends on would never start, and the release and deploy workflows that
+# fire on a push to the default branch would silently stop firing. Wiring this
+# with `GITHUB_TOKEN` does not fail; it quietly does half the job.
+# =============================================================================
+
+name: Merge lane
+
+on:
+  workflow_call:
+    inputs:
+      base:
+        description: The branch this lane merges into. One lane per base.
+        required: false
+        default: main
+        type: string
+      required-checks:
+        description: >-
+          Newline-separated check names that must be green on the head sha
+          before anything merges. These are the repository's own required
+          checks, named exactly as they appear on the pull request. A name that
+          matches nothing is counted as MISSING and blocks the merge — renaming
+          a job without updating this list stops the lane rather than silently
+          ungating it.
+        required: true
+        type: string
+      runs-on:
+        description: >-
+          Where the lane runs. Defaults to `ubuntu-latest`, which is free and
+          unmetered on a PUBLIC repository. A private repository should pass a
+          self-hosted label instead: GitHub-hosted minutes are billed there, and
+          self-hosted minutes are not. The job is a handful of API calls with no
+          sleeps, so it holds a slot for seconds. The label must resolve to a
+          LINUX runner: the lane is bash and reads `date -u -d` and `mapfile`,
+          neither of which the fleet's Windows pool provides.
+        required: false
+        default: ubuntu-latest
+        type: string
+      inflight-budget-seconds:
+        description: >-
+          How long the lane waits on a pull request whose checks are still
+          running or missing before releasing it and saying so. This is
+          Mergify's `checks_timeout`, kept, and for the same reason: without it
+          a re-run that never reports holds a serial lane forever.
+        required: false
+        default: 1800
+        type: number
+      max-actions:
+        description: >-
+          How many pull requests one acquisition of the lane may act on. A burst
+          of ready pull requests drains in one run rather than one per CI
+          completion. Bounded because each iteration re-reads the world, and an
+          unbounded loop against a repository that keeps producing candidates is
+          a job that never ends.
+        required: false
+        default: 4
+        type: number
+      require-label:
+        description: >-
+          If set, only pull requests carrying this label are candidates. Empty
+          means every open, non-draft, unconflicted pull request on the base is
+          a candidate, which is the behaviour Mergify's `auto_merge_conditions`
+          had here and the default this fleet migrates onto.
+        required: false
+        default: ''
+        type: string
+      priority-label-prefix:
+        description: >-
+          Labels beginning with this prefix carry a number that orders the lane,
+          lowest first, default 50. A docs-only fix does not have to queue
+          behind an infrastructure change — an ordering Mergify's serial queue
+          could not express and GitHub's native queue cannot either.
+        required: false
+        default: 'merge-lane/priority-'
+        type: string
+      implementation-repository:
+        description: >-
+          Where `scripts/ci/merge-lane.sh` lives. A reusable workflow's
+          `actions/checkout` clones the CALLER, not the callee, so the lane has
+          to name its own repository to find its own driver.
+        required: false
+        default: Dima-Spectorr/ci-runner-infra
+        type: string
+      implementation-ref:
+        description: >-
+          The ref of `implementation-repository` to run. Set it to the SAME
+          40-hex sha your `uses:` line is pinned to. Left at the default the
+          lane runs the tip of the default branch under a pinned workflow,
+          which is the version skew the fleet's pin gate exists to stop.
+        required: false
+        default: main
+        type: string
+      dry-run:
+        description: >-
+          Compute and log every verdict, act on none. The honest way to land
+          this workflow: a `workflow_run` workflow cannot run on the pull
+          request that adds it, so the first live run is the first CI completion
+          after the merge. Merge it in dry-run, read a few real verdicts, then
+          flip it.
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      app-id:
+        description: App ID of the merge App.
+        required: true
+      app-private-key:
+        description: Private key of the merge App.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  lane:
+    name: Merge lane
+    # dynamic-runner-allowed(lane, #402): the label is a workflow_call input, scoped by the calling repository
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+
+    # THE LOCK, AND THE REASON IT IS NOT A QUEUE.
+    #
+    # GitHub's `concurrency` holds ONE running run and ONE pending run; a third
+    # arrival cancels the pending one. That is mutual exclusion, not a FIFO, and
+    # trying to use it as a queue would silently drop entries.
+    #
+    # It does not have to be a queue. The lane keeps no list — it recomputes the
+    # candidate set from the API every time it acquires the lock. So the run
+    # that gets cancelled while pending loses nothing: whatever it would have
+    # seen, the run that replaced it sees too, and more recently.
+    #
+    # `cancel-in-progress: false` is load-bearing. Cancelling a lane mid-merge
+    # is how a branch gets updated and then abandoned, or worse, killed between
+    # the merge call and the log line that records it.
+    concurrency:
+      group: merge-lane-${{ inputs.base }}
+      cancel-in-progress: false
+
+    permissions:
+      # Deliberately minimal, and NOT how the merge is authorised. Everything
+      # that writes uses the App token below; `GITHUB_TOKEN` here only checks
+      # out the default branch. Merging with it would trigger no downstream
+      # workflow, which is the failure this whole design turns on.
+      contents: read
+
+    steps:
+      # THE IMPLEMENTATION REPOSITORY, NOT THE CALLER'S.
+      #
+      # In a `workflow_call` the `github` context belongs to the CALLER, so a
+      # bare `actions/checkout` here would clone the consumer's tree — which
+      # does not contain `scripts/ci/merge-lane.sh`, and the run would die at
+      # the last step. `shared-infra-anchor.yml` relies on exactly that
+      # behaviour, because its steps run the CALLER's compose file; this
+      # workflow needs the opposite, and has to say so.
+      #
+      # There is no context in a reusable workflow that names the callee's own
+      # repository and ref, so they are inputs. Pin `implementation-ref` to the
+      # SAME ref your `uses:` line is pinned to: a lane running one version of
+      # the driver under another version of the workflow is exactly the drift
+      # this repository's pin gate exists to prevent.
+      - name: Check out the lane's implementation
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ inputs.implementation-repository }}
+          ref: ${{ inputs.implementation-ref }}
+          persist-credentials: false
+
+      - name: Mint the merge App token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
+      - name: Run the lane
+        env:
+          # The App token, not `github.token`. See the header.
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          LANE_BASE: ${{ inputs.base }}
+          REQUIRED_CHECKS: ${{ inputs.required-checks }}
+          BUDGET: ${{ inputs.inflight-budget-seconds }}
+          MAX_ACTIONS: ${{ inputs.max-actions }}
+          REQUIRE_LABEL: ${{ inputs.require-label }}
+          PRIORITY_PREFIX: ${{ inputs.priority-label-prefix }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: bash scripts/ci/merge-lane.sh

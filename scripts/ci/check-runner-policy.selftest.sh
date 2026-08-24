@@ -347,7 +347,7 @@ fi
 #
 # Every case re-runs the gate's WHOLE fixture suite, and that suite spawns one
 # `python3` per fixture — seventy-six interpreter startups, each importing
-# PyYAML, about seventeen seconds. Twenty-four mutations plus the control paid
+# PyYAML, about seventeen seconds. Twenty-five mutations plus the control paid
 # that price at four-way parallelism and the step took three minutes ten, which
 # was 37% of the entire CI run for this repository.
 #
@@ -360,12 +360,15 @@ fi
 # removing a shard cannot leave a stale total behind — the failure mode that
 # would otherwise silently stop running the last shard's mutations while every
 # job still reported green.
-SHARD_I=1
-SHARD_N=1
-if [ "${1:-}" = "--shard" ]; then
-  spec="${2:-}"
-  SHARD_I="${spec%%/*}"
-  SHARD_N="${spec##*/}"
+# `parse_shard <spec>` prints `I N` and returns 0, or explains itself and returns
+# 1. It is a FUNCTION rather than the inline code it replaced so that the guards
+# can be asserted below: testing them by re-invoking this script would, on any
+# spec the guard wrongly ACCEPTS, run the whole mutation suite — and a wrongly
+# accepted spec is the only case worth testing for.
+parse_shard() { # <spec>
+  local spec="$1" i n
+  i="${spec%%/*}"
+  n="${spec##*/}"
   # A malformed spec must not fall back to "run everything" — that reads as a
   # pass while N-1 shards duplicate each other and nothing says so.
   # Both numbers are required, spelled out. `--shard 4` without a slash would
@@ -374,19 +377,79 @@ if [ "${1:-}" = "--shard" ]; then
   case "$spec" in
     "" | *[!0-9/]* | */*/* | /* | */)
       printf 'FAIL: --shard wants I/N with both whole numbers, got: %s\n' "$spec" >&2
-      exit 1
+      return 1
       ;;
     */*) ;; # one slash, digits either side
     *)
       printf 'FAIL: --shard wants I/N, got a lone number: %s\n' "$spec" >&2
-      exit 1
+      return 1
       ;;
   esac
-  if [ "$SHARD_N" -lt 1 ] || [ "$SHARD_I" -lt 1 ] || [ "$SHARD_I" -gt "$SHARD_N" ]; then
-    printf 'FAIL: --shard %s is not a shard of a set of %s\n' "$SHARD_I" "$SHARD_N" >&2
+  # DEMAND A POSITIVE ANSWER AND READ AN ERROR AS "NO".
+  #
+  # `[` compares in base ten, so digit-only halves need no normalising: `08` is
+  # eight here, where `$(( 08 ))` is a bad-octal error. What `[` does NOT survive
+  # is a number too large for a C long — `[ 99999999999999999999 -lt 1 ]` exits 2
+  # with "integer expected" rather than answering.
+  #
+  # This file is `set -u` without `-e`, and the previous spelling was three
+  # rejections OR-ed together (`-lt 1 || -lt 1 || -gt`). All three arms erroring
+  # therefore read as "no rejection matched", and the spec was ACCEPTED:
+  # `--shard 1/99999999999999999999` reached awk, whose `NR % n` selected case 1
+  # alone, skipped the other twenty-four, and exited green. Asking instead for
+  # proof that the spec IS in range puts the error on the refusing side.
+  if ! { [ "$n" -ge 1 ] && [ "$i" -ge 1 ] && [ "$i" -le "$n" ]; } 2>/dev/null; then
+    printf 'FAIL: --shard %s is not a shard of a set of %s\n' "$i" "$n" >&2
+    return 1
+  fi
+  # NORMALISE, now that both halves are known to be real integers in range.
+  # `[` was the forgiving one: everything downstream reads a leading zero as
+  # octal. `printf '%d' 08` is "invalid octal number" and prints 0, so an
+  # accepted `08/24` would otherwise announce itself as "shard 0 of 24" in the
+  # summary line — a report that contradicts the run it describes. `10#` forces
+  # base ten, and cannot overflow here because the check above has already
+  # refused anything `[` was unable to compare.
+  printf '%s %s\n' "$((10#$i))" "$((10#$n))"
+}
+
+SHARD_I=1
+SHARD_N=1
+if [ "${1:-}" = "--shard" ]; then
+  if ! shard_parsed="$(parse_shard "${2:-}")"; then
     exit 1
   fi
+  SHARD_I="${shard_parsed%% *}"
+  SHARD_N="${shard_parsed##* }"
 fi
+
+# The guard is the only thing between a typo in `ci.yml` and a run that asserts a
+# fraction of the suite and reports green, so it is exercised rather than
+# trusted. These cost nothing: every one of them is decided before the first
+# mutation is written.
+for spec in "" "4" "/4" "4/" "1/0" "0/4" "5/4" "1//4" "4/x" "1/99999999999999999999"; do
+  if parse_shard "$spec" >/dev/null 2>&1; then
+    bad "--shard '$spec' was accepted — a spec that does not name one shard of a real set has to be refused, or the run skips mutations and says nothing"
+  else
+    ok
+  fi
+done
+for spec in "1/1" "1/6" "6/6" "08/24"; do
+  if parse_shard "$spec" >/dev/null 2>&1; then
+    ok
+  else
+    bad "--shard '$spec' was refused, and it names a real shard"
+  fi
+done
+# The pair it returns is what every later line believes, so read it rather than
+# only checking that it said yes.
+for probe in "1/6=1 6" "08/24=8 24" "6/6=6 6"; do
+  got="$(parse_shard "${probe%%=*}" 2>/dev/null)"
+  if [ "$got" = "${probe#*=}" ]; then
+    ok
+  else
+    bad "--shard '${probe%%=*}' parsed as '$got', not '${probe#*=}' — the run would be reported as a shard it is not"
+  fi
+done
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -415,8 +478,17 @@ fi
 # refactor that leaves `case_list` emitting nothing — a stray `return`, a
 # renamed helper — makes `xargs` run zero workers and this file print "N passed,
 # 0 failed" over a mutation suite that asserted nothing at all.
+#
+# IT IS A RATCHET, SET AT THE CURRENT COUNT, not a round number below it. It sat
+# at 24 against a list of 25 and so had a row of slack — enough that deleting one
+# mutation passed the guard whose whole purpose is to notice mutations going
+# missing. A floor is only worth the assertion if it equals what the file is
+# known to contain, which also means ADDING a mutation should raise it: leave it
+# behind and the slack comes straight back. Removing one has to lower it by hand,
+# and that is the point — a shrinking mutation suite should cost somebody a
+# deliberate edit rather than a silent digit.
 CASES="$(case_list | wc -l)"
-FLOOR=24
+FLOOR=25
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
@@ -472,8 +544,8 @@ PASS=$((PASS + CASE_OK))
 # with no failing case named is itself a finding rather than a curiosity.
 #
 # Reconciled against THIS SHARD'S slice rather than the full list — a shard that
-# drew seven cases and heard seven verdicts is complete, and comparing it to
-# twenty-four would redden every sharded run.
+# drew seven cases and heard seven verdicts is complete, and comparing it to the
+# full list would redden every sharded run.
 REPORTED=$((CASE_OK + CASE_FAIL))
 if [ "$REPORTED" -ne "$SHARD_CASES" ]; then
   bad "the dispatcher started $SHARD_CASES case(s) and $REPORTED returned a verdict — the rest ended without one, so their mutations were never asserted, whatever the exit codes say"

@@ -486,7 +486,25 @@ a harder reason: the pool has no container runtime at all.
 ## 4. Consuming the stack
 
 **From another Linux slot on the same host** — the sibling slot has its own
-network namespace, so `127.0.0.1` is the wrong address there:
+network namespace, so `127.0.0.1` is the wrong address there.
+
+> **This hand-rolled form is wrong in one case, and the `shared-infra-db` action
+> is not.** On a host that has not yet rolled onto the hairpin SNAT
+> ([ADR §3.2](adr-pr-host-affinity.md)), a consumer job that lands on the
+> anchor's *own* slot cannot reach `addr:pg`: the band DNAT rewrites the
+> destination to the address the packet came from, the reply never returns
+> through the host's conntrack, and the dial hangs until the client gives up —
+> which knex and friends report thirty seconds later as a pool timeout. Roughly
+> one consumer job in four lands there, so the symptom is intermittent. Use the
+> action: it resolves to loopback when `pg` falls inside the consuming slot's
+> own band. The block below is kept because it shows what the action produces,
+> not as a pattern to copy.
+>
+> The action cannot do this for a `container:` job — its steps run in the
+> container and do not inherit the runner service's environment, so the band is
+> not visible there. A containerized consumer needs a host carrying the hairpin
+> SNAT; on an un-rolled host, keep it off the anchor's slot or run it
+> uncontainerized.
 
 ```yaml
   integration:
