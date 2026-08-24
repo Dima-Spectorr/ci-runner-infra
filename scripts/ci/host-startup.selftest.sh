@@ -555,6 +555,82 @@ has_container_reclaim() { # <file>
   matches "$code" 'could not remove the containers left behind' || return 1
 }
 
+# THE MARKER IS A CLAIM ABOUT WRITERS, NOT ABOUT FILES (#237 finding 3).
+#
+# Every step of the old reset was correct and the ORDER was not: the home was
+# emptied and restored, _work was rebuilt, and only then were the containers
+# torn down -- so a detached container bind-mounting the home had a window in
+# which to put `.bashrc`, `.gitconfig` or a credential back into a home that had
+# just been made clean, and the marker was written afterwards over exactly that.
+# A process the job backgrounded outside a container was never stopped at all.
+#
+# Removing files cannot certify isolation while a writer survives. So this
+# predicate is mostly about SEQUENCE, which no single-line assertion can see.
+has_slot_quiesce() { # <file>
+  local code containers quiesce home_wipe marker_write term kill_
+  code=$(code_of "$1")
+
+  containers=$(printf '%s\n' "$code" | grep -n 'docker rm --force --volumes' | head -1 | cut -d: -f1)
+  quiesce=$(printf '%s\n' "$code" | grep -n 'quiesce_slot || rc=1' | head -1 | cut -d: -f1)
+  home_wipe=$(printf '%s\n' "$code" | grep -n 'find "\\\$home" -mindepth 1' | head -1 | cut -d: -f1)
+  marker_write=$(printf '%s\n' "$code" | grep -n ': >"\\\$marker"' | head -1 | cut -d: -f1)
+  [ -n "$containers" ] && [ -n "$quiesce" ] && [ -n "$home_wipe" ] && [ -n "$marker_write" ] || return 1
+
+  # 1. Both kinds of writer are stopped before the first thing is removed, and
+  #    the marker is the last thing that happens.
+  [ "$containers" -lt "$home_wipe" ] || return 1
+  [ "$quiesce" -lt "$home_wipe" ] || return 1
+  [ "$home_wipe" -lt "$marker_write" ] || return 1
+
+  # 2. TERM, then KILL. A job's server gets the signal it can shut down on
+  #    before the one it cannot handle.
+  term=$(printf '%s\n' "$code" | grep -n 'kill -TERM' | head -1 | cut -d: -f1)
+  kill_=$(printf '%s\n' "$code" | grep -n 'kill -KILL' | head -1 | cut -d: -f1)
+  [ -n "$term" ] && [ -n "$kill_" ] && [ "$term" -lt "$kill_" ] || return 1
+
+  # 3. Fail closed, exactly as the container half does: something still alive
+  #    after SIGKILL means this slot is not in the state the template describes.
+  matches "$code" 'would not die -- refusing to call this slot clean' || return 1
+  matches "$code" 'quiesce_slot \|\| rc=1' || return 1
+
+  # 4. WHAT IS SPARED, and each of these is a way to turn a cleanup into an
+  #    outage rather than a missed leftover:
+  #    our own chain -- the hook is a child of Runner.Worker, which is a child of
+  #    the agent, so a sweep without it aborts the job whose completed hook is
+  #    running and takes the agent with it;
+  matches "$code" 'keep="\\\$keep\\\$p "' || return 1
+  #    the slot's service manager -- rootless dockerd, its containerd and the
+  #    container processes under them. The daemon has to outlive the reset: the
+  #    image-tag audit still talks to it and the next job needs its socket;
+  matches "$code" 'user@\\\$1\\\.service' || return 1
+  #    and the agent's own tree when the caller is NOT the agent. The idle sweep
+  #    and the sweeper's teardown are root timers: without this they would kill
+  #    the listener of every slot they touched.
+  matches "$code" 'if \[ -z "\\\$\{SUDO_UID:-\}" \]; then' || return 1
+  matches "$code" 'ci-runner@\\\$idx\.service' || return 1
+  matches "$code" 'sparing everything in its unit rather than guessing' || return 1
+
+  # 5. A zombie is not a survivor. Runner.Worker leaves them for moments at a
+  #    time at exactly the boundary this runs on, they cannot be killed because
+  #    they are already dead, and counting one would refuse the marker on a slot
+  #    that is clean -- intermittently, which is the worst way to be wrong.
+  matches "$code" '\[ "\\\$state" = Z \] && continue' || return 1
+
+  # 6. And the state that decides 5 is read out of a line the JOB can shape:
+  #    /proc/<pid>/stat carries the executable name verbatim, so a program named
+  #    `x) Z` puts a second `) ` inside the comm field. Split on the FIRST one
+  #    and the state test reads a string the job chose -- which is how a live
+  #    writer gets itself skipped as a corpse. Everything after the real comm is
+  #    numeric, so the last `) ` on the line is always the closing one.
+  local greedy shortest
+  greedy=$(printf '%s\n' "$code" | grep -cF "rest=\\\${line##*') '}")
+  shortest=$(printf '%s\n' "$code" | grep -cF "rest=\\\${line#*') '}")
+  [ "${greedy:-0}" = 3 ] || return 1
+  [ "${shortest:-0}" = 0 ] || return 1
+
+  return 0
+}
+
 # The helper carries the trap it was written to avoid, so it is tested first.
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -791,6 +867,12 @@ if has_container_reclaim "$SCRIPT"; then
   ok
 else
   bad "a stack the last run left detached keeps this slot's band ports bound and its database reachable — the next run assigned this slot either cannot start its own services or connects to a finished pull request's, and neither says so"
+fi
+
+if has_slot_quiesce "$SCRIPT"; then
+  ok
+else
+  bad "the clean marker claims more than the reset can support — a container or a background process the last job left running can put a dotfile, a credential or a checkout back after the wipe and before the marker, so the next job starts on a slot certified clean by a reset a writer outlived (#237)"
 fi
 
 if has_shared_infra_band "$SCRIPT"; then
@@ -1418,6 +1500,17 @@ mutate "containers left for the next run"    's|docker ps --all --quiet --no-tru
 mutate "named volumes survive the reset"     's|docker volume prune --force --all|docker volume prune --force|'               has_container_reclaim
 mutate "a stuck container no longer fails"   's|could not remove the containers left behind|removed nothing behind|'          has_container_reclaim
 mutate "a stuck tag no longer fails the slot" 's|could not drop local image tag|dropped nothing for|'                     has_local_tag_prune
+
+mutate "nothing sweeps the last job's processes" '/quiesce_slot || rc=1/d'                                                has_slot_quiesce
+mutate "a sweep that fails no longer withdraws the marker" 's@quiesce_slot || rc=1@quiesce_slot@'                         has_slot_quiesce
+mutate "a process that ignores TERM survives"  's|kill -KILL|kill -TERM|'                                                 has_slot_quiesce
+mutate "an unkillable process is called clean" 's|would not die -- refusing to call this slot clean|would not die|'       has_slot_quiesce
+mutate "the sweep kills the agent that called it" 's|keep="\\$keep\\$p "|keep="\\$keep"|'                                 has_slot_quiesce
+mutate "the slot's own dockerd is swept away"  '/user@\\$1/d'                                                             has_slot_quiesce
+mutate "a root sweep no longer spares the agent" 's|ci-runner@\\$idx.service|ci-runner@0.service|'                        has_slot_quiesce
+mutate "a zombie is counted as a survivor"     '/= Z ] \&\& continue/d'                                                   has_slot_quiesce
+mutate "the home wipe stops being the anchor"  '/find "\\$home" -mindepth 1/d'                                            has_slot_quiesce
+mutate "a job can name itself out of the sweep" 's|{line##|{line#|g'                                                      has_slot_quiesce
 
 mutate "App JWT back in curl argv"        's@-K <(printf.*\$jwt")@-H "Authorization: Bearer $jwt"@'          has_secrets_out_of_argv
 mutate "registration token back in curl argv" 's@-K <(printf.*\$tok")@-H "Authorization: Bearer $tok"@'          has_secrets_out_of_argv

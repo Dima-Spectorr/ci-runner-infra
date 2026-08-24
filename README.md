@@ -370,6 +370,20 @@ that image a real answer is separate work, not a line in this one.
   service account, where an inherited credential is worst. A slot that cannot be
   shown to have been left clean fails its next job rather than running it.
 
+  Removing files cannot certify isolation while a writer survives, so the reset
+  **stops the last job's writers before it removes anything**: the containers it
+  left detached, and then every process of the slot that is not the agent, the
+  slot's own dockerd or this hook's own ancestry — `SIGTERM`, then `SIGKILL`.
+  Only then is the home replaced, and only then is the slot marked clean. In the
+  other order each step is correct and the sequence is not: a container
+  bind-mounting the home, or a server a step backgrounded, can put a dotfile or
+  a credential back *after* the wipe and *before* the marker. A writer that will
+  not die withholds the marker, exactly as an unremovable container does. The
+  one documented exception is a slot **held** by a live run: the run's own later
+  jobs land back on it and are meant to find the stack the anchor brought up, so
+  containers, tags and processes are spared until the hold expires — and the
+  sweeper's teardown then runs the same reset with the hold gone.
+
   The one thing the reset deliberately keeps is the daemon's image store — that
   is where the warm layer lives, and deleting it would be a cold start per job.
   So what a job leaves there is pruned by *name* instead: at the end of every
