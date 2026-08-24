@@ -33,10 +33,34 @@ variable "workload_identity_pool" {
   }
 }
 
+variable "repository" {
+  type        = string
+  description = "The repository whose apply workflow may assume this identity, as `<owner>/<repo>`. Required, and no default: a pool is normally shared by every repository in the org, so a binding that names only a ref matches a run on ANY of their default branches, and guessing somebody else's repository here would be worse than failing."
+
+  # Interpolated into the principalSet, whose parts are separated by `/` and `@`.
+  # GitHub's own charset is narrower than this; what matters here is that neither
+  # part may carry a separator and change what the principalSet names.
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$", var.repository))
+    error_message = "repository must be <owner>/<repo> — exactly one slash, and no @ or other separator in either part."
+  }
+}
+
+variable "apply_workflow_path" {
+  type        = string
+  default     = ".github/workflows/apply-runner-pool.yml"
+  description = "Path of the ONE workflow file whose runs may assume this identity, relative to the repository root. Pinning the file is what keeps a `pull_request_target` workflow — whose token also asserts the default ref — from reaching project-wide compute.admin."
+
+  validation {
+    condition     = can(regex("^\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml$", var.apply_workflow_path))
+    error_message = "apply_workflow_path must be a workflow file under .github/workflows/, e.g. .github/workflows/apply-runner-pool.yml. GitHub reports no other location in job_workflow_ref."
+  }
+}
+
 variable "allowed_ref" {
   type        = string
   default     = "refs/heads/main"
-  description = "The single git ref permitted to assume this identity. Requires the provider to map attribute.ref (assertion.ref); adding that mapping is additive and does not disturb existing bindings."
+  description = "The one git ref whose runs may assume this identity. Note this is the WEAKEST of the three parts of the binding — a ref alone is reachable from pull_request_target and workflow_run — so it is the repository and the workflow file beside it that carry the boundary. Requires the provider to map attribute.job_workflow_ref (assertion.job_workflow_ref); adding that mapping is additive and does not disturb existing bindings."
 
   validation {
     # A bare "main" is the plausible mistake, and it is the DANGEROUS kind: it
@@ -48,7 +72,7 @@ variable "allowed_ref" {
   }
 
   validation {
-    # attribute.ref carries one ref. A wildcard is not expanded by IAM — it is
+    # The claim carries one ref. A wildcard is not expanded by IAM — it is
     # matched literally — so "refs/heads/*" authorises a branch named "*".
     condition     = !can(regex("[*?]", var.allowed_ref))
     error_message = "allowed_ref takes ONE ref; IAM matches it literally and does not expand wildcards, so refs/heads/* authorises a branch literally named '*' and nothing else."
