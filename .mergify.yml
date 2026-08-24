@@ -121,15 +121,25 @@ merge_protections_settings:
 # merge, so the worst a hostile refresh achieves is making Mergify re-read the
 # truth sooner.
 #
-# Declaring the key REPLACES the default rather than adding to it, so the write
-# clause is restated here. The default's other arm — a pull request's author may
-# refresh their own fork pull request — is deliberately not restated: nothing in
-# this repository depends on it, and reconstructing a clause by guessing at its
+# Declaring the key REPLACES the default rather than adding to it, so EVERY arm
+# of the default has to be restated here or it is silently taken away. That is
+# two arms, not one. The second — a pull request's author may refresh their own
+# fork pull request — was left out when this block was first written, on the
+# reasoning that nothing here depends on it and that guessing at a clause's
 # spelling is how a `.mergify.yml` becomes invalid, which fails the queue CLOSED
-# for every open pull request at once.
+# for every open pull request at once. Both halves of that were wrong. The
+# spelling is published (`sender = {{author}}` and the boolean `from-fork`
+# attribute), so it is not a guess; and the people who depend on the arm are
+# precisely the ones the automation cannot help. `workflow_run.pull_requests` is
+# empty for a fork run, so the nudge never fires on a fork pull request — its
+# author refreshing by hand IS the recovery path there, and dropping the arm
+# removed the automatic and the manual route in the same change.
 commands_restrictions:
   refresh:
     conditions:
       - or:
           - sender-permission >= write
+          - and:
+              - sender = {{author}}
+              - from-fork
           - sender = github-actions[bot]
