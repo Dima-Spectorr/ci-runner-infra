@@ -221,7 +221,11 @@ Every fleet-reachable Linux job in a `pull_request` workflow does this, except
 the anchor itself. `RUNNER9` checks it.
 
 This is dynamic runner selection, which `RUNNER5` reports as UNDECIDED, so the
-gate is run with `--allow-dynamic-runner` once this contract is adopted.
+gate is run with `--allow-dynamic-runner` **in the same pull request that makes
+the first job dynamic** — step 4 of §7, not later. `RUNNER5` has no grace
+period: it fires on the expression itself, so the commit that introduces the
+idiom is the commit that turns the gate red.
+
 `RUNNER9` supplies the specificity that flag gives up: not merely an expression,
 but one naming the anchor job's output.
 
@@ -667,20 +671,65 @@ surprise.
 1. The aggregate required check and the lane model — [`ci-lane-model.md`](ci-lane-model.md).
 2. **Consolidate `pull_request` CI into one workflow.** Without this, everything
    below is per-workflow and the pull request still holds several hosts.
-3. **Call the published anchor** (§1) and point every other fleet Linux job at
-   its output. Merge this alone and confirm the pull request still runs when the
-   pool is cold. A private repository must first allow this one as a reusable-
-   workflow source — *Settings → Actions → Access* — or the call fails to
-   resolve before any job starts.
-4. Move `services:` into `ci/compose.yaml` and pass it to the anchor as
+3. **Refresh your copy of `check-runner-policy.sh` from this repository**, on its
+   own, and confirm it is still green with no flags added. The gate is published
+   here and *copied* into each consumer, so a copy predating this contract has
+   neither the rules nor — the blocking part — the **markers that excuse step 4**.
+   The new rules are opt-in, so a refresh by itself changes no verdict.
+4. **Call the published anchor** (§1) with `compose-file: ''`, point every other
+   fleet Linux job at its output, and in the same pull request add
+   `--allow-dynamic-runner` to the `check-runner-policy.sh` invocation and the
+   `remote-reusable-allowed` marker beside the call. Merge this alone and
+   confirm the pull request still runs when the pool is cold. A private
+   repository must first allow this one as a reusable-workflow source —
+   *Settings → Actions → Access* — or the call fails to resolve before any job
+   starts.
+5. Move `services:` into `ci/compose.yaml` and pass it to the anchor as
    `compose-file`, with the `shared-infra-owner` marker beside the call.
-5. Point the Windows job at the outputs.
-6. Turn the gate on: add `--allow-dynamic-runner --shared-infra` to the
-   `check-runner-policy.sh` invocation.
+6. Point the Windows job at the outputs.
+7. Turn the rest of the gate on: add `--shared-infra` to the same invocation.
 
-Step 6 last, deliberately. The rules are opt-in by flag so that a repository
-mid-adoption is not a repository with a red gate teaching its readers to
-disable it.
+### Everything gate-related used to be the last step. Two thirds of it cannot be
+
+Until 2026-08-24 the refresh, `--allow-dynamic-runner` and `--shared-infra` were
+one final step, on the reasoning that the rules are opt-in so that a repository
+mid-adoption is not a repository with a red gate teaching its readers to disable
+it. That is right about the flag it was written for and wrong about the other
+two, because it treats "gate change" as one kind of thing when there are three:
+
+- **`--shared-infra` enables new rules.** `RUNNER9`/`RUNNER10`/`RUNNER11` are
+  off by default, so a half-adopted repository is silent. Deferring is free, and
+  it stays last.
+- **`--allow-dynamic-runner` suppresses an existing rule.** `RUNNER5` is on by
+  default and fires on any expression in `runs-on`. Step 4's whole content is
+  putting an expression in `runs-on` — in every fleet Linux job at once. Deferred,
+  it makes step 4 land red once per job.
+- **The refresh unlocks an escape hatch that does not exist yet, and this is the
+  one that blocks outright.** `RUNNER7` reports a *remote* reusable-workflow call
+  as UNDECIDED, and calling the published anchor is exactly that. In this
+  repository's current gate a `remote-reusable-allowed` marker declares it. In a
+  copy predating the contract there is no marker, no flag and no way to pass —
+  so step 4 could not be made green at all until the copy moved.
+
+So the adopter following the old order met a gate they could not satisfy on the
+pull request the order told them to *merge alone*, with two thirds of the fix
+three steps away. That is the exact "red gate teaching its readers to disable
+it" the deferral existed to prevent, produced by the deferral.
+
+The refresh is its own step rather than a line inside step 4 because a copy can
+be years of gate development behind — the first repository measured was 1,480
+lines against this repository's 3,166 — and rules unrelated to this contract may
+have tightened in between. Those findings are worth seeing on a pull request
+that changes nothing else.
+
+### Step 4 needs no `ci/compose.yaml`
+
+`compose-file: ''` is the anchor's pin-only mode (§1): the host is pinned and
+`runs-on` is published, `pg` comes back empty, and nothing is brought up. It
+exists so that rule 1 can be adopted without rule 2 — which is exactly what
+step 4 is. Passing no `compose-file` at all takes the input's `ci/compose.yaml`
+default instead and the bring-up runs, so step 4 must spell the empty string
+out. Step 5 is where the real value replaces it.
 
 ## 8. What a consuming repository must not do
 
