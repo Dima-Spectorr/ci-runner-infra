@@ -106,29 +106,58 @@ on:
         description: >-
           How long to wait before asking whether Mergify is behind. This is the
           budget for the webhook arriving NORMALLY — Mergify's own measured
-          reaction time to an event it does receive is 13-14 seconds, so 60 is
-          roughly four times the healthy case. Too short and every run nudges;
-          too long and a genuine stall is prolonged by exactly this much.
+          reaction time to an event it does receive is 13-14 seconds. It used
+          to be 60, four times the healthy case; measured over the first ten
+          nudged pull requests in this repository, Mergify re-evaluated on its
+          own within the grace window ZERO times, so the whole window was dead
+          time on every run. 20 is one grace period plus one retry still inside
+          half a minute. Too short and a healthy run nudges needlessly; too long
+          and every stall is prolonged by exactly this much.
         required: false
-        default: 60
+        default: 20
         type: number
       attempts:
         description: >-
-          How many times to ask, including the first. Every attempt after the
-          first is a second chance for a merely-late webhook to land, which
-          costs an API call and buys a comment not posted.
+          How many times to ask BEFORE nudging, including the first. Every
+          attempt after the first is a second chance for a merely-late webhook
+          to land, which costs an API call and buys a comment not posted.
         required: false
-        default: 4
+        default: 2
         type: number
       interval-seconds:
         description: >-
           The gap between attempts. `grace-seconds + (attempts - 1) *
-          interval-seconds` is the longest this waits before nudging, and it
-          must stay well under the queue's `checks_timeout` — a nudge that
-          arrives after the entry has already been dequeued for a timeout is
-          telling Mergify about a pull request it has stopped tracking.
+          interval-seconds` is the longest this waits before the FIRST nudge,
+          and the whole ladder — that plus `(nudge-attempts - 1) *
+          confirm-seconds` — must stay well under the queue's `checks_timeout`:
+          a nudge that arrives after the entry has already been dequeued for a
+          timeout is telling Mergify about a pull request it has stopped
+          tracking.
         required: false
-        default: 30
+        default: 15
+        type: number
+      nudge-attempts:
+        description: >-
+          How many times to POST the command, including the first. This is the
+          input that exists because one comment is not reliable. Measured across
+          ten nudges: when Mergify received the comment it answered in 12-30s,
+          but three of the ten sat for 9-11 minutes — a flat ~10 minutes, which
+          is not a slow reply, it is the periodic reconciliation that picks up
+          what a lost webhook never delivered. The comment webhook is losable in
+          exactly the way the `check_run` webhook is; the difference is that we
+          can send another one. Losing three in a row is the case this gives up
+          on, and reconciliation still catches that.
+        required: false
+        default: 3
+        type: number
+      confirm-seconds:
+        description: >-
+          How long to give Mergify to answer a posted command before posting
+          another. Must comfortably exceed the 12-30s healthy reaction, or the
+          retry races a refresh that was already on its way and every stall
+          costs a duplicate comment.
+        required: false
+        default: 45
         type: number
 
 permissions:
@@ -185,6 +214,8 @@ jobs:
           GRACE: ${{ inputs.grace-seconds }}
           ATTEMPTS: ${{ inputs.attempts }}
           INTERVAL: ${{ inputs.interval-seconds }}
+          NUDGE_ATTEMPTS: ${{ inputs.nudge-attempts }}
+          CONFIRM: ${{ inputs.confirm-seconds }}
         run: |
           set -euo pipefail
 
@@ -254,24 +285,65 @@ jobs:
           # single space after `@mergifyio`, or Mergify does not read it at all
           # — so the explanation goes underneath, where it is for the human
           # reading the thread and wondering what posted this.
-          body="$(printf '%s\n\n%s\n\n%s\n' \
-            '@mergifyio refresh' \
-            "CI finished ($CONCLUSION) at \`$RUN_ENDED_AT\` and no Mergify check-run has been updated since." \
-            "Automated by \`mergify-nudge\`; see the [CI run]($RUN_URL) and \`docs/ci-merge-queue-baseline.md\`.")"
+          post_nudge() { # <attempt>
+            local body again=""
+            # Never `cmd && printf …` inside the substitution below: on the
+            # first attempt the test is false, the substitution's exit status
+            # is 1, and `set -e` kills the job at the moment everything is
+            # working normally.
+            if [ "$1" -gt 1 ]; then
+              again=" Nudge $1 of $NUDGE_ATTEMPTS: the previous command went unanswered for ${CONFIRM}s, which is what a lost webhook looks like."
+            fi
+            body="$(printf '%s\n\n%s\n\n%s\n' \
+              '@mergifyio refresh' \
+              "CI finished ($CONCLUSION) at \`$RUN_ENDED_AT\` and no Mergify check-run has been updated since.$again" \
+              "Automated by \`mergify-nudge\`; see the [CI run]($RUN_URL) and \`docs/ci-merge-queue-baseline.md\`.")"
 
-          # One comment per pull request, and the loop is not defensive
-          # paranoia: a commit can be the head of more than one open pull
-          # request, and refreshing only the first would leave the others in the
-          # exact state this exists to clear.
-          #
-          # Fed by a heredoc rather than `for pr in $prs`, which is unquoted
-          # word splitting on purpose and reads to every linter as the bug it
-          # usually is, and rather than a pipe, which would run the body in a
-          # subshell whose failures `set -e` cannot see.
-          while read -r pr; do
-            [ -n "$pr" ] || continue
-            gh api "repos/$GITHUB_REPOSITORY/issues/$pr/comments" -f body="$body" --silent
-            echo "::notice::nudged pull request #$pr — Mergify had not re-evaluated $HEAD_SHA since CI finished"
-          done <<EOF
+            # One comment per pull request, and the loop is not defensive
+            # paranoia: a commit can be the head of more than one open pull
+            # request, and refreshing only the first would leave the others in
+            # the exact state this exists to clear.
+            #
+            # Fed by a heredoc rather than `for pr in $prs`, which is unquoted
+            # word splitting on purpose and reads to every linter as the bug it
+            # usually is, and rather than a pipe, which would run the body in a
+            # subshell whose failures `set -e` cannot see.
+            while read -r pr; do
+              [ -n "$pr" ] || continue
+              gh api "repos/$GITHUB_REPOSITORY/issues/$pr/comments" -f body="$body" --silent
+              echo "::notice::nudged pull request #$pr (attempt $1) — Mergify had not re-evaluated $HEAD_SHA since CI finished"
+            done <<EOF
           $prs
           EOF
+          }
+
+          # Posting the command once is where this workflow used to stop, and
+          # it is not enough. A comment is delivered to Mergify by the same
+          # webhook channel that dropped the `check_run` event in the first
+          # place; when that delivery is the one that goes missing, the PR waits
+          # for reconciliation and the observed cost is a flat ~10 minutes —
+          # measured on three of ten nudges here, the exact symptom this
+          # workflow exists to remove, reappearing one layer up.
+          #
+          # So: post, confirm, post again. Each comment is an independent
+          # delivery, so the odds of a stall surviving the ladder fall off a
+          # cliff, and a Mergify that answered the FIRST one never sees a
+          # second.
+          nudge=1
+          while true; do
+            post_nudge "$nudge"
+            [ "$nudge" -lt "$NUDGE_ATTEMPTS" ] || break
+            sleep "$CONFIRM"
+            if mergify_seen_it; then
+              echo "::notice::Mergify answered nudge $nudge — re-evaluated $HEAD_SHA"
+              exit 0
+            fi
+            nudge=$((nudge + 1))
+          done
+
+          # Every comment we are willing to send has been sent and Mergify has
+          # still not moved. Do not fail the job: the pull request is not broken
+          # and reconciliation will reach it: but say so loudly, because a
+          # repository that reaches this line regularly has something wrong with
+          # its Mergify installation that no amount of nudging will fix.
+          echo "::warning::posted $NUDGE_ATTEMPTS refresh commands and Mergify re-evaluated none of them — check the Mergify installation's webhook deliveries"
