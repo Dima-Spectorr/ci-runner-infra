@@ -716,6 +716,15 @@ jobs:
       # The README quickstart pinned v3.0.0 while the fleet ran v4.1.0 — the one
       # copy-pasteable line in the repo, three minor versions stale, because
       # nothing connected Markdown to a git tag. VERSION is that connection.
+      # The documented `uses:` pins are now SHAs with a version comment (#351),
+      # and the check proves the comment by resolving the tag it names. A
+      # default checkout is depth 1 with no tags, so without this the check
+      # would fail closed on every run — which is the right direction to fail,
+      # but not a useful gate. Only the tag refs, and still shallow: the point
+      # is to read what a tag POINTS AT, not to clone the history behind it.
+      - name: fetch tags (the docs-pin check resolves them)
+        run: git fetch --depth=1 origin '+refs/tags/*:refs/tags/*'
+
       - name: docs pins self-test
         run: bash scripts/ci/docs-pins.selftest.sh
 

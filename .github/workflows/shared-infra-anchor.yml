@@ -20,7 +20,7 @@
 #   # shared-infra-owner(anchor): brings up ci/compose.yaml on this run's Linux host
 #   jobs:
 #     anchor:
-#       uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@v5
+#       uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
 #       with:
 #         repo-label: ExampleRepo
 #         migrate: ./scripts/db-migrate.sh "$DATABASE_URL"
@@ -38,14 +38,27 @@
 #
 # WHERE THE VERSION COMES FROM
 #
-# `@v5` — the floating major this repository publishes, which is the convention
-# `scripts/ci/docs-pins.selftest.sh` enforces across every tracked document.
-# Not `@main`: the anchor talks to host-side contracts — `ci-pin-hold`,
+# A 40-character SHA with a version comment beside it — the shape
+# `check-action-pins.sh` PIN1 demands, because that gate is published by this
+# repository and copied into every consumer.
+#
+# This block used to say `@v5`, the floating major, and that advice could not be
+# followed: PIN1 rejects a tag outright, so the call as documented failed the
+# gate in the first three repositories that adopted it (#351). The rule is
+# right and the example was wrong. A tag is a pointer its owner may move, this
+# workflow executes on hosts holding a GCP identity, and a floating major is the
+# most movable pointer there is — it moves on every release.
+#
+# Nor `@main`: the anchor talks to host-side contracts — `ci-pin-hold`,
 # `CI_SHARED_INFRA_ADDR`, the port band — which are versioned with the pool
-# image, and `@main` lets it move ahead of the hosts it is talking to. Not an
-# exact tag either: that ages the moment the next release ships, in every
-# repository that copied it, whereas a major moves only when one of those
-# host-side contracts breaks — the one change that must not arrive silently.
+# image, and `@main` lets it move ahead of the hosts it is talking to.
+#
+# The comment is not decoration. PIN1 requires it precisely so Dependabot can
+# rewrite the pin, which answers the objection the old text raised against an
+# exact version: a SHA does NOT age silently in a consumer, because a pull
+# request arrives when it moves. `docs-pins.selftest.sh` holds up this end —
+# every documented pin must be a SHA whose comment names a real tag of this
+# repository, in the major it currently publishes.
 #
 # WHY IT RUNS NOWHERE IN THIS REPOSITORY
 #

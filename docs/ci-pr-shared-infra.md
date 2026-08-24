@@ -75,7 +75,7 @@ host from its own environment, and every later job pins to it.
 # shared-infra-owner(anchor): brings up ci/compose.yaml on this run's Linux host
 jobs:
   anchor:
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@v5
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
     with:
       repo-label: <Repo>
       pin-ttl: 90m
@@ -85,12 +85,16 @@ jobs:
 Outputs are `runs-on`, `addr` and `pg`, read exactly as they would be from a
 local job. Three things about this call are not decoration:
 
-- **The ref is `@v5`**, the floating major this repository publishes — not
-  `main`, and not an exact tag. The anchor talks to host-side contracts that are
-  versioned with the pool image: `@main` lets it move ahead of the hosts it is
-  talking to, while the major moves only when one of those contracts breaks. An
-  exact tag goes stale on the next release, which is what `docs-pins.selftest.sh`
-  exists to catch.
+- **The ref is a SHA with a version comment**, not `@v5` and not `@main`. This
+  document said `@v5` until #351, and that call could not be green anywhere:
+  `check-action-pins.sh` is published by this repository, copied into every
+  consumer, and its `PIN1` rejects a tag outright — the anchor executes on hosts
+  holding a GCP identity, and a floating major is the most movable pointer we
+  publish. `@main` is worse still: the anchor talks to host-side contracts
+  versioned with the pool image, and `main` lets it move ahead of the hosts it
+  is talking to. The comment is the half that keeps the pin fresh — PIN1
+  requires it so Dependabot can rewrite it, so a SHA arrives as a reviewable
+  pull request when the anchor moves rather than ageing in silence.
 - **`remote-reusable-allowed`** is `RUNNER7`. The gate cannot read another
   repository's file, so it cannot decide the callee's runner scope or timeouts;
   the marker records that a human did, against an issue, instead of handing the
@@ -277,7 +281,7 @@ copied:**
 
 ```yaml
       - id: db
-        uses: Dima-Spectorr/ci-runner-infra/.github/actions/shared-infra-db@v5
+        uses: Dima-Spectorr/ci-runner-infra/.github/actions/shared-infra-db@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
         with:
           pg: ${{ needs.anchor.outputs.pg }}
           addr: ${{ needs.anchor.outputs.addr }}
