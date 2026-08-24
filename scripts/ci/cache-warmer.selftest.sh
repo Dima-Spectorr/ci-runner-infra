@@ -30,15 +30,17 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/../.."
 MAIN="$ROOT/modules/ci-runner-cache-warmer/main.tf"
+VARS="$ROOT/modules/ci-runner-cache-warmer/variables.tf"
 TURBO="$ROOT/modules/ci-runner-cache-warmer/scripts/warm-turbo.sh"
 SHARED="$ROOT/scripts/ci/publish-cache-snapshot.sh"
+SHAREDSCAN="$ROOT/scripts/ci/scan-cache-credentials.sh"
 
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); }
 bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
 
-for f in "$MAIN" "$TURBO"; do
+for f in "$MAIN" "$VARS" "$TURBO"; do
   [ -f "$f" ] || { echo "FAIL: missing $f"; exit 1; }
 done
 
@@ -60,8 +62,21 @@ code_of() { grep -vE '^[[:space:]]*#' "$1"; }
 #    replaced by a copy inside the module (drift), or the root file could be
 #    moved (a plan that fails with a message about a missing file and nothing
 #    about why a module wants one two directories up).
+#
+#    The credential-scan library is the same reference and the same argument. The
+#    step runs `bash -c "<text>"`, so there is nothing on that disk to source: the
+#    library's text is prepended, and if it stopped being prepended the publisher
+#    would find no `scan_credentials_or_die` and refuse — loudly, but only at
+#    trigger time, on a schedule nobody is watching. Asserted here instead.
+#    SCAN_INLINE_LIBRARY goes with it: without the marker the library's standalone
+#    entry point runs `usage:` against the step's argv and the build dies before
+#    the publisher's first line.
 has_shared_publisher() { # <file>
-  matches "$(code_of "$1")" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"\)'
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"\)' || return 1
+  matches "$code" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/scan-cache-credentials\.sh"\)'  || return 1
+  matches "$code" '"SCAN_INLINE_LIBRARY=1"'                                                       || return 1
 }
 
 if has_shared_publisher "$MAIN"; then ok; else
@@ -70,6 +85,10 @@ fi
 
 if [ -f "$SHARED" ]; then ok; else
   bad "scripts/ci/publish-cache-snapshot.sh has moved; the warmer module reads it by relative path and terraform will fail at plan time with a message that says nothing about this"
+fi
+
+if [ -f "$SHAREDSCAN" ]; then ok; else
+  bad "scripts/ci/scan-cache-credentials.sh has moved; the warmer module reads it by relative path too, and terraform will fail at plan time with a message that says nothing about this"
 fi
 
 # 2. TWO PHASES. The archive is packed in one step and uploaded in another, and
@@ -155,7 +174,9 @@ has_uploader_bounds() { # <file>
   code=$(code_of "$1")
   matches "$code" '\*\[!A-Za-z0-9_-\]\*' || return 1
   matches "$code" 'WARM_MAX_BYTES' || return 1
-  matches "$code" -- '--no-clobber' || return 1
+  # Same trap as in has_cache_dir_bound: an intervening `--` here would make the
+  # pattern `--`, and this assertion would hold over any file at all.
+  matches "$code" '\-\-no-clobber' || return 1
   # A prefix that does not end in a slash writes next to the tree, not into it.
   matches "$code" 'does not end in'
 }
@@ -185,6 +206,128 @@ if has_separate_firer "$MAIN"; then ok; else
   bad "the account that fires the warm is the account that runs it — firing a trigger cannot be scoped to one trigger, so a dependency in the default branch could start any build in the project, including the terraform apply"
 fi
 
+# 8. THE WARM CONFIGURES ITSELF FROM THE REPOSITORY. Every input a consumer has
+#    to fill in is an input a consumer can get wrong in a root nobody revisits,
+#    about a repository that changes without telling Terraform — and wrong here
+#    does not fail an apply, it fails inside a nightly build or, worse, succeeds
+#    having installed nothing. The install must be decided from the lockfile the
+#    repository already commits, and both commands must remain OPTIONAL.
+has_self_configuring() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'pnpm-lock\.yaml' || return 1
+  matches "$code" 'yarn\.lock' || return 1
+  matches "$code" 'package-lock\.json' || return 1
+  matches "$code" 'coalesce\(var\.prepare_command, local\.install_scriptfree\)' || return 1
+  matches "$code" 'coalesce\(var\.build_command,'
+}
+
+if has_self_configuring "$MAIN"; then ok; else
+  bad "the warm no longer works its install out from the repository's lockfile — every consuming root is back to stating a package manager that only has to be wrong once, in the one place where being wrong reports as a cache that is merely cold"
+fi
+
+# And the inputs stay optional. A default restored in variables.tf re-imposes a
+# package manager on every consumer that leaves them unset, which is all of them.
+block_of() { # <file> <variable-name>
+  awk -v v="$2" 'index($0, "variable \"" v "\" {") == 1 { inside = 1 } inside { print } inside && $0 == "}" { exit }' "$1"
+}
+
+has_optional_commands() { # <file>
+  local v blk
+  for v in prepare_command build_command; do
+    blk=$(block_of "$1" "$v")
+    [ -n "$blk" ] || return 1
+    matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*null[[:space:]]*$' || return 1
+  done
+}
+
+if has_optional_commands "$VARS"; then ok; else
+  bad "prepare_command or build_command has a default again — a consumer that states nothing now gets a package manager chosen by this module instead of one read from its own lockfile"
+fi
+
+# 9. THE BUILD IS TOLD WHERE TO WRITE, FROM THE SAME INPUT THE COLLECTOR READS.
+#    Two knobs that must be kept equal is one knob that is eventually unequal,
+#    and unequal here means turbo wrote its artifacts somewhere the publishing
+#    step does not look: a green warm that publishes nothing at all.
+has_cache_dir_bound() { # <file>
+  local code
+  code=$(code_of "$1")
+  # NOT `matches "$code" -- '--cache-dir…'`: `matches` passes its second argument
+  # to grep, so an intervening `--` makes the PATTERN `--`, which every file
+  # matches. That is how the mutation below first passed. Escape the dashes into
+  # the pattern instead.
+  matches "$code" '\-\-cache-dir=\\"\$WARM_TURBO_DIR\\"' || return 1
+  # The install ladder ends in `fi`, and the two halves are joined with a space:
+  # without the `;` the step is `fi npx …`, a syntax error that kills the build
+  # step before anything runs. Caught once by hand; asserted here so it is caught
+  # the next time too.
+  matches "$code" '"\$\{local\.install_full\};"' || return 1
+  [ "$(printf '%s\n' "$code" | grep -cE 'WARM_TURBO_DIR=\$\{var\.turbo_cache_dir\}')" -eq 2 ]
+}
+
+if has_cache_dir_bound "$MAIN"; then ok; else
+  bad "the build step and the publishing step no longer take the turbo cache directory from one input — turbo writes where the collector does not look, and the warm reports success having published nothing"
+fi
+
+# 10. THE SNAPSHOT'S INSTALL RUNS NO LIFECYCLE SCRIPTS. It is unpacked as root on
+#     every host in the pool; the build step's install is a separate ladder and
+#     is deliberately allowed to run them, which is exactly how this one loses
+#     `--ignore-scripts` in a later edit that "makes them consistent".
+has_scriptfree_snapshot() { # <file>
+  matches "$(code_of "$1")" 'install_scriptfree = replace\(replace\(local\.install_ladder, "@FLAGS@", "--ignore-scripts"\)'
+}
+
+if has_scriptfree_snapshot "$MAIN"; then ok; else
+  bad "the snapshot's install runs lifecycle scripts again — install-time scripts are the cheapest place to put code in someone else's build, and this archive is unpacked as root on every host in the pool"
+fi
+
+# 11. EVERY `$` THAT REACHES THE BUILD CONFIG IS DOUBLED. Cloud Build reads `$X`
+#     and `${X}` in args and env as a SUBSTITUTION, so a shell script pasted in
+#     whole is a config full of keys it does not know. The trigger applies
+#     cleanly and the API refuses at FIRE time — "key in the template ... is not
+#     a valid built-in substitution" — which is a warmer that has never once run
+#     and a cache that has always been cold. Observed on the first live fire.
+has_dollars_escaped() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'escape_dollars = "\$\$"' || return 1
+  # The publishing script is TWO files joined, so the escape wraps the join and
+  # not each file: escaping part by part is the same result today by a route
+  # where the part added tomorrow arrives raw.
+  matches "$code" 'publish_script = replace\(join\("\\n", \[' || return 1
+  matches "$code" '\]\), "\$", local\.escape_dollars\)' || return 1
+  matches "$code" 'turbo_script = replace\(file\(.*warm-turbo\.sh"\), "\$", local\.escape_dollars\)' || return 1
+  matches "$code" 'prepare_command = replace\(coalesce\(var\.prepare_command' || return 1
+  matches "$code" 'build_command = replace\(coalesce\(var\.build_command' || return 1
+  # And nothing reaches a step as a raw file() read, which is how the escaping
+  # gets bypassed for one step while the local next to it keeps it.
+  ! matches "$code" 'script[[:space:]]*=[[:space:]]*file\(' || return 1
+  ! matches "$code" 'args[[:space:]]*=[[:space:]]*\["-c", file\('
+}
+
+if has_dollars_escaped "$MAIN"; then ok; else
+  bad "a script or command reaches the build config with its dollars unescaped — Cloud Build parses those as substitutions and refuses the build at fire time, so the trigger applies green and the warm has never run"
+fi
+
+# 12. EVERY STEP CARRIES ITS SCRIPT IN `script`, NEVER IN `args`. A step argument
+#     is capped at 10,000 characters and the publishing script is an order of
+#     magnitude past it, so `entrypoint = "bash"` + `args = ["-c", …]` is refused
+#     — at FIRE time again, "build step 0 arg 1 too long (max: 10000)", on a
+#     trigger that applied green. `script` has no such cap and honours the file's
+#     own shebang; setting `entrypoint` beside it is an error in its own right.
+carries_scripts_in_script_field() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'script = local\.publish_script' || return 1
+  matches "$code" 'script = local\.turbo_script' || return 1
+  ! matches "$code" 'args[[:space:]]*=[[:space:]]*\["-c"' || return 1
+  ! matches "$code" 'entrypoint'
+}
+
+if carries_scripts_in_script_field "$MAIN"; then ok; else
+  bad "a step passes its script through args or sets an entrypoint beside script — args are capped at 10,000 characters, the publishing script is far past that, and the API refuses the build at fire time on a trigger that applied cleanly"
+fi
+
 # --- mutations -----------------------------------------------------------------
 
 mutate() { # <description> <file> <sed-program> <predicate>
@@ -209,6 +352,14 @@ mutate() { # <description> <file> <sed-program> <predicate>
 
 mutate "the publisher copied into the module" "$MAIN" \
   's@file("\${path\.module}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh")@file("${path.module}/scripts/publish-cache-snapshot.sh")@' \
+  has_shared_publisher
+
+mutate "the credential-scan library stops being inlined" "$MAIN" \
+  's@^    file("\${path\.module}/\.\./\.\./scripts/ci/scan-cache-credentials\.sh"),$@@' \
+  has_shared_publisher
+
+mutate "the inline marker is dropped, so the library runs its usage check" "$MAIN" \
+  's@^    "SCAN_INLINE_LIBRARY=1",$@@' \
   has_shared_publisher
 
 mutate "install and upload in one phase" "$MAIN" \
@@ -258,6 +409,54 @@ mutate "the uploader stops checking the hash shape" "$TURBO" \
 mutate "the uploader overwrites what is already published" "$TURBO" \
   's@ --no-clobber@@' \
   has_uploader_bounds
+
+mutate "a package manager assumed instead of detected" "$MAIN" \
+  's@if \[ -f pnpm-lock\.yaml \]@if [ -f package-lock.json ]@' \
+  has_self_configuring
+
+mutate "the prepare command made a required input again" "$MAIN" \
+  's@coalesce(var\.prepare_command, local\.install_scriptfree)@var.prepare_command@' \
+  has_self_configuring
+
+mutate "a default put back on the command inputs" "$VARS" \
+  's@^  default     = null$@  default     = "npm ci --ignore-scripts"@' \
+  has_optional_commands
+
+mutate "the build no longer told where to write" "$MAIN" \
+  's@ --cache-dir=\\"\$WARM_TURBO_DIR\\"@@' \
+  has_cache_dir_bound
+
+mutate "the two halves of the build command run together" "$MAIN" \
+  's@"\${local\.install_full};",@local.install_full,@' \
+  has_cache_dir_bound
+
+mutate "the collector reads a directory of its own" "$MAIN" \
+  's@"WARM_TURBO_DIR=\${var\.turbo_cache_dir}",@"WARM_TURBO_DIR=node_modules/.cache/turbo",@' \
+  has_cache_dir_bound
+
+mutate "the two installs made consistent, in the wrong direction" "$MAIN" \
+  's|"@FLAGS@", "--ignore-scripts"|"@FLAGS@", ""|' \
+  has_scriptfree_snapshot
+
+mutate "the publishing script pasted in unescaped" "$MAIN" \
+  's@publish_script = replace(join(@publish_script = join(@; s@^  \]), "\$", local\.escape_dollars)$@  ])@' \
+  has_dollars_escaped
+
+mutate "one step given the raw file() again" "$MAIN" \
+  's@script = local\.turbo_script@script = file("${path.module}/scripts/warm-turbo.sh")@' \
+  has_dollars_escaped
+
+mutate "a script handed back to bash -c" "$MAIN" \
+  's@script = local\.publish_script@entrypoint = "bash"\n      args       = ["-c", local.publish_script]@' \
+  carries_scripts_in_script_field
+
+mutate "an entrypoint set beside a script" "$MAIN" \
+  's@script = local\.turbo_script@entrypoint = "bash"\n      script     = local.turbo_script@' \
+  carries_scripts_in_script_field
+
+mutate "the escape reduced to a single dollar" "$MAIN" \
+  's@escape_dollars = "\$\$"@escape_dollars = "$"@' \
+  has_dollars_escaped
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

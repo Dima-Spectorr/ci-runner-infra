@@ -78,7 +78,12 @@ on:
         default: 90m
         type: string
       compose-file:
-        description: Compose file brought up on the pinned host.
+        description: >-
+          Compose file brought up on the pinned host. EMPTY means pin-only:
+          rule 1 without rule 2, for a repository that has no shared
+          infrastructure, or for a lane of one that needs none. `pg` is then
+          published empty, which is the same statement a degrade makes, so a
+          consumer does not have to tell the two apart.
         required: false
         default: ci/compose.yaml
         type: string
@@ -127,7 +132,10 @@ on:
           Never localhost — see RUNNER11. Empty on any degrade branch.
         value: ${{ jobs.anchor.outputs.addr }}
       pg:
-        description: The band port Postgres is published on. Empty on a degrade.
+        description: >-
+          The band port Postgres is published on. Empty on a degrade, and empty
+          in pin-only mode — both say "there is no shared stack", which is the
+          only thing a consumer has to act on.
         value: ${{ jobs.anchor.outputs.pg }}
 
 permissions:
@@ -262,6 +270,30 @@ jobs:
             exit 0
           fi
 
+          pinned="$(jq -cn --arg l "$REPO_LABEL" --arg h "$CI_HOST_LABEL" \
+                      '["self-hosted","linux","gcp",$l,$h]')"
+
+          # PIN-ONLY. An empty `compose-file` means this run wants rule 1 and
+          # not rule 2: the host is pinned and every job lands together, but
+          # nothing is brought up.
+          #
+          # Two real cases, and without this neither could adopt the contract at
+          # all. A repository with no shared infrastructure would have to invent
+          # a compose file to get host affinity. And a repository whose lane
+          # model has a docs-only lane wants the pin for the jobs that still run
+          # and no database for the shards that do not — which it selects with
+          # an expression on this input.
+          #
+          # `pg` is published EMPTY, exactly as on a degrade, because the
+          # statement both make is the same one: there is no shared stack here.
+          # A consumer using `shared-infra-db` therefore falls back on its own
+          # leg without needing to know which of the two happened.
+          if [ -z "$COMPOSE_FILE_IN" ]; then
+            publish "$pinned" "$CI_SHARED_INFRA_ADDR" ""
+            echo "::notice::pinned ${CI_HOST_LABEL} with no shared stack — compose-file is empty"
+            exit 0
+          fi
+
           COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_IN:-}"
           [ -n "$COMPOSE_PROJECT_NAME" ] || COMPOSE_PROJECT_NAME="pr-${PR_NUMBER}"
           export COMPOSE_PROJECT_NAME
@@ -274,6 +306,4 @@ jobs:
               bash -c "$MIGRATE"
           fi
 
-          publish "$(jq -cn --arg l "$REPO_LABEL" --arg h "$CI_HOST_LABEL" \
-                       '["self-hosted","linux","gcp",$l,$h]')" \
-                  "$CI_SHARED_INFRA_ADDR" "$pg"
+          publish "$pinned" "$CI_SHARED_INFRA_ADDR" "$pg"

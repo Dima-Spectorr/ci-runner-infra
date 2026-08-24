@@ -121,7 +121,128 @@ locals {
   # still resolves, because a module vendored without its repository root would
   # otherwise fail at plan time with a message about a missing file and nothing
   # about why this module wants one two directories up.
-  publish_script = file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh")
+  #
+  # EVERY `$` GOES IN DOUBLED, and that is not cosmetic. Cloud Build reads `$X`
+  # and `${X}` in every string of a build config — args, env, anywhere — as a
+  # SUBSTITUTION, before the container ever sees them. A shell script pasted in
+  # whole is dense with both, and the trigger accepts it happily: the refusal
+  # comes at FIRE time, from the API, as
+  #
+  #   invalid value for 'build.substitutions': key in the template
+  #   "CACHE_EXPAND_FLOOR_BYTES" is not a valid built-in substitution
+  #
+  # …in a nightly build nobody is watching, on a warmer that applied cleanly
+  # months earlier. `$$` is Cloud Build's escape for a literal `$`, so doubling
+  # every one hands the container the script it was written as.
+  #
+  # NOT `substitution_option = "ALLOW_LOOSE"`, which is the fix this error's
+  # first search result suggests: that makes the unmatched keys resolve to the
+  # EMPTY STRING instead of failing, so the build starts and runs a script whose
+  # every variable reference has been erased. This is one of the few places
+  # where the loud failure is the good outcome.
+  # AND EVERY STEP CARRIES ITS SCRIPT IN `script`, NEVER IN `args`. A build step
+  # argument is capped at 10,000 characters and the API refuses the whole build
+  # at FIRE time — again, not at apply time — with
+  #
+  #   invalid build: invalid .steps field: build step 0 arg 1 too long
+  #   (max: 10000)
+  #
+  # The publishing script alone is an order of magnitude past that, so
+  # `entrypoint = "bash"` + `args = ["-c", script]` cannot carry it and no amount
+  # of escaping changes that. `script` has no such cap (verified live: a 165 KB
+  # step was accepted), and it honours the file's own `#!/usr/bin/env bash`, so
+  # both scripts run under the interpreter they were written for. Setting
+  # `entrypoint` beside `script` is an error — that is why these steps have none.
+  escape_dollars = "$$"
+
+  # TWO files, concatenated, because the step runs `bash -c "<text>"` and there
+  # is no scripts/ci on that disk to source from. The publisher sources
+  # `scan-cache-credentials.sh` when it can find it and uses what is already
+  # defined when it cannot, so prepending the library's text is the same program
+  # by a different route — and the publisher refuses outright if the scan
+  # function is missing, which is what stops a broken concatenation from
+  # publishing an unscanned snapshot.
+  #
+  # SCAN_INLINE_LIBRARY suppresses the library's standalone entry point. Without
+  # it the library's own `usage:` check runs against the step's argv and kills
+  # the build before the publisher's first line.
+  #
+  # Escaped as ONE string after the join, not file by file: the escape is a
+  # property of what Cloud Build receives, and escaping the parts separately is
+  # the same result by a route where a later part can be added unescaped.
+  publish_script = replace(join("\n", [
+    "SCAN_INLINE_LIBRARY=1",
+    file("${path.module}/../../scripts/ci/scan-cache-credentials.sh"),
+    file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh"),
+  ]), "$", local.escape_dollars)
+  turbo_script = replace(file("${path.module}/scripts/warm-turbo.sh"), "$", local.escape_dollars)
+
+  # HOW THE REPOSITORY IS INSTALLED AND BUILT — WORKED OUT AT WARM TIME, FROM THE
+  # REPOSITORY, RATHER THAN STATED BY WHOEVER WIRES THE WARMER UP.
+  #
+  # These defaults are the difference between a capability every consumer opts
+  # into by hand and one that is simply on. An input like `prepare_command` looks
+  # harmless — it is one line of tfvars — but it is one line that must be RIGHT,
+  # in a root nobody revisits, about a repository whose package manager changes
+  # without telling Terraform. Wrong, it does not fail the apply: the install
+  # fails inside a nightly build, or worse succeeds and builds nothing, and both
+  # read from the outside as a cache that is merely cold.
+  #
+  # So the ladder below asks the repository. A lockfile is the one statement
+  # about package managers every repository already makes, keeps current, and
+  # commits — the same fact the repository's own CI reads.
+  #
+  # ONE LINE, deliberately: the prepare half crosses into the build as a Cloud
+  # Build environment entry (`CACHE_PREPARE=…`), and an entry carrying newlines is
+  # a thing to find out about in a nightly log. `join(" ", …)` is what keeps the
+  # ladder readable here and a single line there.
+  install_ladder = join(" ", [
+    "if [ -f pnpm-lock.yaml ]; then corepack enable >/dev/null 2>&1 || true; pnpm install --frozen-lockfile @FLAGS@;",
+    # Berry and classic disagree on both flags, and which one a repository is on
+    # is not knowable from the lockfile name. Berry first, classic as the fallback.
+    "elif [ -f yarn.lock ]; then corepack enable >/dev/null 2>&1 || true; yarn install --immutable @YARN@ || yarn install --frozen-lockfile @FLAGS@;",
+    "elif [ -f package-lock.json ]; then npm ci @FLAGS@;",
+    "elif [ -f package.json ]; then npm install --no-audit --no-fund @FLAGS@;",
+    "else echo '[warm] no lockfile and no package.json at the repository root; nothing to install'; fi",
+  ])
+
+  # THE SNAPSHOT'S INSTALL RUNS NO LIFECYCLE SCRIPTS. It is unpacked as root on
+  # every host in the pool, and install-time scripts are the cheapest place to
+  # put code in someone else's build.
+  install_scriptfree = replace(replace(local.install_ladder, "@FLAGS@", "--ignore-scripts"), "@YARN@", "--mode=skip-build")
+
+  # THE BUILD'S INSTALL DOES run them, and that is not an inconsistency. This step
+  # exists to run the repository's build — arbitrary code from the default branch,
+  # by definition — so refusing its lifecycle scripts buys nothing and stops most
+  # workspaces from building at all, which was the single most common reason a
+  # consumer had to override anything here.
+  #
+  # It re-installs rather than inheriting the step above because the publishing
+  # script stages the package stores under `mktemp -d`, and only `/workspace`
+  # survives between Cloud Build steps. With npm that is invisible; pnpm's
+  # `node_modules` is a tree of links INTO that store, so the build would open a
+  # workspace whose every dependency dangles, fail, and leave the turbo prefix
+  # empty — silently. One extra install a night is the cheaper side of that.
+  install_full = replace(replace(local.install_ladder, "@FLAGS@", ""), "@YARN@", "")
+
+  # Escaped for the same reason the scripts are, and a repository's OWN override
+  # is escaped too: a `build_command` holding `$(git rev-parse HEAD)` or a plain
+  # `$HOME` is not an unreasonable thing to write, and unescaped it takes the
+  # whole warmer down at fire time rather than in the plan that accepted it.
+  prepare_command = replace(coalesce(var.prepare_command, local.install_scriptfree), "$", local.escape_dollars)
+
+  # `--cache-dir` is passed from the same variable the publishing step reads, so
+  # the two cannot drift. The old default relied on turbo's own default matching
+  # whatever `--cache-dir` the repository's CI happened to pass; when it did not,
+  # the warm published an empty directory and reported success.
+  #
+  # The `;` is load-bearing and is asserted by the self-test: the ladder ends in
+  # `fi`, and `fi npx …` is a syntax error the whole build step dies on before
+  # anything runs — a green apply, a red nightly build, an empty cache.
+  build_command = replace(coalesce(var.build_command, join(" ", [
+    "${local.install_full};",
+    "npx --no-install turbo run build --cache-dir=\"$WARM_TURBO_DIR\"",
+  ])), "$", local.escape_dollars)
 
   # WHO FIRES THE TRIGGER IS A DIFFERENT IDENTITY FROM WHO RUNS THE BUILD, and
   # this is not symmetry for its own sake. `cloudbuild.builds.create` — the
@@ -321,12 +442,11 @@ resource "google_cloudbuild_trigger" "warm" {
     #    metadata server, but the ordering costs nothing and the day Cloud Build
     #    can scope a step's identity this is already the right shape.
     step {
-      id         = "dependencies"
-      name       = var.build_image
-      entrypoint = "bash"
-      args       = ["-c", local.publish_script]
+      id     = "dependencies"
+      name   = var.build_image
+      script = local.publish_script
       env = [
-        "CACHE_PREPARE=${var.prepare_command}",
+        "CACHE_PREPARE=${local.prepare_command}",
         "CACHE_ARCHIVE_OUT=/workspace/ci-cache-snapshot.tar.gz",
         "CACHE_MAX_BYTES=${var.snapshot_max_bytes}",
       ]
@@ -338,20 +458,30 @@ resource "google_cloudbuild_trigger" "warm" {
     #    turbo step below simply finds fewer artifacts. The exit code is logged
     #    by Cloud Build either way, so a permanently broken default branch is
     #    still visible.
+    #
+    #    WARM_TURBO_DIR is the same value the publishing step reads, and the
+    #    default build command passes it to turbo as `--cache-dir`: where the
+    #    artifacts are written and where they are looked for are one input, not
+    #    two that have to be kept equal by whoever wires this up. TURBO_CACHE_DIR
+    #    carries the same value to a build_command a repository overrode, which
+    #    turbo honours without a flag.
     step {
-      id         = "build"
-      name       = var.build_image
-      entrypoint = "bash"
-      args       = ["-c", "${var.build_command} || echo '[warm] build failed; publishing what it produced'"]
-      env        = ["TURBO_TELEMETRY_DISABLED=1", "CI=true"]
+      id     = "build"
+      name   = var.build_image
+      script = "#!/usr/bin/env bash\n${local.build_command} || echo '[warm] build failed; publishing what it produced'\n"
+      env = [
+        "TURBO_TELEMETRY_DISABLED=1",
+        "CI=true",
+        "WARM_TURBO_DIR=${var.turbo_cache_dir}",
+        "TURBO_CACHE_DIR=${var.turbo_cache_dir}",
+      ]
     }
 
     # 3. THE TURBO ARTIFACTS.
     step {
-      id         = "publish-turbo"
-      name       = var.gcloud_image
-      entrypoint = "bash"
-      args       = ["-c", file("${path.module}/scripts/warm-turbo.sh")]
+      id     = "publish-turbo"
+      name   = var.gcloud_image
+      script = local.turbo_script
       env = [
         "WARM_BUCKET=${var.cache_bucket}",
         "WARM_TURBO_PREFIX=${local.turbo_prefix}",
@@ -365,10 +495,9 @@ resource "google_cloudbuild_trigger" "warm" {
     #    trusting the phase that produced it. An artifact that crossed a step
     #    boundary is input.
     step {
-      id         = "publish-snapshot"
-      name       = var.gcloud_image
-      entrypoint = "bash"
-      args       = ["-c", local.publish_script]
+      id     = "publish-snapshot"
+      name   = var.gcloud_image
+      script = local.publish_script
       env = [
         "CACHE_ARCHIVE_IN=/workspace/ci-cache-snapshot.tar.gz",
         "CACHE_POOL=${var.pool_name}",

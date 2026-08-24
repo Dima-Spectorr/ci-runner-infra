@@ -29,15 +29,30 @@ posture you opt into knowingly. Read [Windows](#windows) before you declare one.
    for the account that owns the repo — both non-secret. The private key is not
    in any repository or state file; see step 3.
 
+   **Its permissions, who can grant each one, and how to tell whether a grant
+   actually landed are all in
+   [`github-app-permissions.md`](github-app-permissions.md)** — read it before
+   the first apply, not after the first silent failure. Every permission on
+   that list fails quietly, and a permission added to the App but not yet
+   accepted by the installation behaves exactly like one that was never
+   granted. Two entries are called out here because they are the ones an
+   onboarding reader is most likely to be missing:
+
    Its installation needs **`checks: read`** in addition to the permissions the
    runners themselves use. Nothing about job execution depends on it — without
    it the pool scales, registers and runs jobs exactly as it does with it. The
    one thing it buys is the merge-queue parking detector below: the controller
    reads each open pull request's check runs to decide whether a pull request
    the queue will never admit is nevertheless finished and green. Missing the
-   permission does not fail an apply or a job; the controller logs the 403 once
-   per sweep and `ci_prs_green_and_unqueued` stays at zero forever, which reads
-   exactly like health. If you see that log line, that is what it means.
+   permission does not fail an apply or a job, and `ci_prs_green_and_unqueued`
+   then publishes an unbroken zero — which is exactly what a repository with
+   nothing parked publishes. So the controller says so in its own right:
+   `ci_parked_sweep_denied` goes non-zero, the log line reads `parked sweep:
+   DENIED`, and the `parkeddenied` alert fires after 30 minutes. If you see
+   either, grant the permission on the App **and accept it on the installation**
+   — a permission added to an App stays pending until the installation approves
+   it, and a pending permission behaves exactly like one that was never
+   granted.
 
    It needs **`Contents: read`** as well if you are standing up a merge-queue
    pool (step 8): that is how the controller reads the repository's own
@@ -64,7 +79,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.41.0"
 
   project_id         = var.project_id
   network            = var.network
@@ -73,7 +88,7 @@ module "ci_runner_network" {
 }
 
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.41.0"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -82,7 +97,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.41.0"
 
   project_id = var.project_id
   region     = var.region
@@ -161,7 +176,7 @@ nightly, from your default branch.
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.41.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -172,9 +187,17 @@ module "ci_cache_warmer" {
   github_repo  = "<repo>"
 
   github_connection = var.cloudbuild_github_connection # gen2 projects only
-  prepare_command   = "npm ci --ignore-scripts"        # the default
 }
 ```
+
+**Nothing there describes your build, and nothing should.** The warm reads your
+lockfile — pnpm, yarn, npm, in that order — installs the way that manager
+installs, and runs `turbo run build` with a `--cache-dir` it passes itself. A
+repository that builds with pnpm and `--cache-dir=.turbo` sets none of it. The
+`prepare_command` / `build_command` inputs exist for a build that genuinely is
+not that, and a command written into a Terraform root is a claim about a
+repository that can change package managers without telling the root — stale, it
+does not fail the apply, it fails at 04:00 into a log nobody reads.
 
 That is a Cloud Build in *this project*, so there is no federation, no OIDC
 provider to map, no credential in your repository and no workflow file to keep.
@@ -398,7 +421,7 @@ later apply:
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.39.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.41.0"
 
   project_id     = var.project_id
   region         = var.region
@@ -519,7 +542,7 @@ module "ci_runner_pool" {           # the Linux CI pool from step 1, unchanged
 }
 
 module "ci_runner_pool_mq" {        # the Linux merge-queue pool
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.41.0"
   # …every argument of the CI pool, with three differences:
   name              = "${var.pool_name}-mq"
   manage_controller = false
@@ -534,7 +557,7 @@ module "ci_runner_pool_mq" {        # the Linux merge-queue pool
 }
 
 module "ci_runner_controller" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.41.0"
 
   name  = "${var.pool_name}-controller"
   pools = [
@@ -583,6 +606,12 @@ keeps its Terraform `max_hosts` instead of a derived ceiling — it fails open, 
 nothing breaks and nothing says so. The one signal is
 `ci_queue_config_age_seconds` climbing past 300; on a healthy controller it
 stays under it, and `-1` means the configuration has never been read at all.
+
+Granting it is two steps and the second is the one that gets missed: the App
+owner adds the permission, and then **every installation owner has to accept
+it**. Both steps, who can perform each, and how to verify from the controller
+rather than from a settings page:
+[`github-app-permissions.md`](github-app-permissions.md).
 
 ## Windows
 
@@ -724,7 +753,7 @@ instantiations with their own names, MIGs, controllers and labels.
 
 ```hcl
 module "ci_runner_identity_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.41.0"
 
   project_id        = var.project_id
   name              = var.win_pool_name
@@ -737,7 +766,7 @@ module "ci_runner_identity_win" {
 }
 
 module "ci_runner_pool_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.39.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.41.0"
 
   # ... project_id, region, github_*, network, subnetwork and the three
   # identities exactly as the Linux pool above, from the _win modules ...

@@ -24,6 +24,29 @@
 # is not writable. Then every mutation reads as detected and this file is a row
 # of green ticks over nothing. The control proves the opposite direction first:
 # an UNMUTATED copy, in the same temporary directory, run the same way, PASSES.
+#
+# WHY THE CASES ARE A LIST AND NOT A SEQUENCE OF CALLS
+#
+# Each case is one full run of the gate's seventy-fixture suite — about fifteen
+# seconds — over a file nothing else touches. Run one after another that is six
+# and a quarter minutes, and it was 53% of this repository's entire CI critical
+# path: longer than every other gate in `ci.yml` added together. Nothing about
+# the cases makes them ordered; they were sequential only because a shell
+# function called once per case, in a row, is the obvious way to write them.
+#
+# So the cases are DATA now — `mutate` prints one tab-separated row instead of
+# running one — and the parent dispatches them across the runner's cores by
+# re-entering this same file with `--case N`. The case list stays the single
+# source of truth for both halves, so a case cannot be added to the listing and
+# missed by the runner.
+#
+# The count is asserted at the end for the reason every other floor in this
+# repository is asserted: a dispatch loop that silently ran nothing reports the
+# same zero failures as one that ran everything. And because a worker can also
+# die without a word — OOM, a `bash` that will not start, a full disk — every
+# case prints a verdict even when it passes, and the parent reconciles the
+# verdicts it received against the cases it started. Counting only failures
+# would score a batch of dead workers as a clean suite.
 
 set -uo pipefail
 
@@ -51,27 +74,25 @@ gate_suite_passes() { # <path-to-a-copy-of-the-gate>
   bash "$1" --selftest >/dev/null 2>&1
 }
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-
-# --- the control -------------------------------------------------------------
-
-cp "$GATE" "$WORK/control.sh"
-if gate_suite_passes "$WORK/control.sh"; then
-  ok
-else
-  bad "an UNMUTATED copy of the gate fails its own fixture suite — either the gate is broken, or it cannot run from a temporary directory, and in the second case every mutation below would score as detected without asserting anything"
-  # Continuing would print green ticks over a harness that cannot tell the two
-  # answers apart, which is worse than reporting nothing.
-  printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
-  exit 1
-fi
-
-# --- the mutations -----------------------------------------------------------
-
-mutate() { # <description> <sed-program> — the gate's fixture suite must FAIL
-  local desc="$1" prog="$2" tmp
-  tmp="$WORK/mutant.sh"
+# --- one case, as run by a worker ---------------------------------------------
+#
+# EVERY CASE PRINTS EXACTLY ONE VERDICT LINE — `ok   [n]` or `FAIL: [n]` — and
+# that is the contract the parent audits, not merely the one it counts.
+#
+# Success used to print nothing, which made two states identical: a case that
+# ran and passed, and a case whose worker never ran at all. `xargs` reports a
+# child killed by the OOM killer, a `bash` that could not start, or a `mktemp`
+# on a full disk the same way it reports a detected mutation — one exit status
+# for the whole batch — so a batch in which half the workers died silently
+# scored as a clean suite. One line per case makes the parent able to say "I
+# started twenty-five and twenty-five answered", which is the only form of that
+# assertion that survives workers dying.
+run_case() { # <index> <description> <sed-program>
+  local idx="$1" desc="$2" prog="$3" work tmp
+  work="$(mktemp -d)"
+  # shellcheck disable=SC2064  # expand $work now: the trap outlives the local
+  trap "rm -rf '$work'" EXIT
+  tmp="$work/mutant.sh"
   sed "$prog" "$GATE" >"$tmp"
   # A sed program that matches nothing leaves the gate intact, the suite passes,
   # and the case would read as "mutation not detected" — or, worse, a program
@@ -79,17 +100,48 @@ mutate() { # <description> <sed-program> — the gate's fixture suite must FAIL
   # while nothing changed. Either way the assertion was never made, so refuse to
   # score a case whose file is byte-identical to the gate.
   if cmp -s "$tmp" "$GATE"; then
-    bad "mutation changed nothing, so it asserts nothing: $desc"
-    rm -f "$tmp"
-    return
+    printf 'FAIL: [%s] mutation changed nothing, so it asserts nothing: %s\n' "$idx" "$desc"
+    return 1
   fi
   if gate_suite_passes "$tmp"; then
-    bad "mutation not detected: $desc"
-  else
-    ok
+    printf 'FAIL: [%s] mutation not detected: %s\n' "$idx" "$desc"
+    return 1
   fi
-  rm -f "$tmp"
+  printf 'ok   [%s] %s\n' "$idx" "$desc"
+  return 0
 }
+
+# --- the mutations -----------------------------------------------------------
+#
+# One row per case: a description and the sed program that reverts one element
+# of the rule, tab-separated.
+#
+# NEITHER FIELD MAY CONTAIN A TAB OR A NEWLINE, and both are refused rather than
+# merely documented. A tab makes the row split into the wrong two halves, so the
+# case runs with a truncated description and a sed program nobody wrote. A
+# newline is worse and quieter: the row becomes TWO rows, every index after it
+# shifts by one, and the count the floor and the reported-verdict audit both
+# rest on stops meaning "cases". Neither is hypothetical enough to leave to a
+# comment — these sed programs are edited by hand and several already span two
+# source lines.
+TAB=$'\t'
+NL=$'\n'
+
+mutate() { # <description> <sed-program>
+  case "$1$2" in
+    *"$TAB"*)
+      printf 'FAIL: case field contains a tab, which would split the row wrongly: %s\n' "$1" >&2
+      exit 1
+      ;;
+    *"$NL"*)
+      printf 'FAIL: case field contains a newline, which would split it into two rows: %s\n' "$1" >&2
+      exit 1
+      ;;
+  esac
+  printf '%s%s%s\n' "$1" "$TAB" "$2"
+}
+
+case_list() {
 
 # 1-2. The reader stops reporting the key. This is the failure that reads
 #      cleanest of all: the bash rule below is untouched and reviews as correct,
@@ -266,5 +318,106 @@ mutate "the disjointness test always answers yes" \
 mutate "scope labels compared case-sensitively" \
   "s@    tr '\\[:upper:\\]' '\\[:lower:\\]' | grep -vxE@    cat | grep -vxE@"
 
-printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
+}
+
+# --- the worker entry point ---------------------------------------------------
+#
+# Reached only by the dispatcher below, re-entering this file. It reads its case
+# out of the same list the parent counted, so the two cannot disagree about what
+# case N is.
+if [ "${1:-}" = "--case" ]; then
+  row="$(case_list | sed -n "${2}p")"
+  # An out-of-range index yields an empty row, whose two empty fields make a
+  # `sed` program that changes nothing — which `run_case` reports, correctly, as
+  # a case that asserts nothing. Named here anyway, because "case 26 changed
+  # nothing" is a much worse clue than "there is no case 26".
+  if [ -z "$row" ]; then
+    printf 'FAIL: no case at index %s — the dispatcher and the list disagree\n' "$2"
+    exit 1
+  fi
+  # `$TAB` rather than a literal tab in the source: an editor or a formatter
+  # that expands one turns both expansions into no-ops, and the case then runs
+  # with the whole row as its description and an empty sed program — which
+  # `run_case` would report as "changed nothing", for a reason nowhere near it.
+  run_case "$2" "${row%%"$TAB"*}" "${row#*"$TAB"}"
+  exit
+fi
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# --- the control -------------------------------------------------------------
+
+cp "$GATE" "$WORK/control.sh"
+if gate_suite_passes "$WORK/control.sh"; then
+  ok
+else
+  bad "an UNMUTATED copy of the gate fails its own fixture suite — either the gate is broken, or it cannot run from a temporary directory, and in the second case every mutation below would score as detected without asserting anything"
+  # Continuing would print green ticks over a harness that cannot tell the two
+  # answers apart, which is worse than reporting nothing.
+  printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
+  exit 1
+fi
+
+# --- the dispatcher -----------------------------------------------------------
+#
+# The control has just proved the harness works, so from here the cases are
+# independent runs over files nothing shares. `nproc` rather than a literal: a
+# hosted runner has four cores and a fleet host has more, and hard-coding either
+# number makes the file wrong on the other.
+#
+# A FLOOR ON THE CASE COUNT, for the same reason Pester has one in `ci.yml`. A
+# refactor that leaves `case_list` emitting nothing — a stray `return`, a
+# renamed helper — makes `xargs` run zero workers and this file print "N passed,
+# 0 failed" over a mutation suite that asserted nothing at all.
+CASES="$(case_list | wc -l)"
+FLOOR=24
+if [ "$CASES" -lt "$FLOOR" ]; then
+  bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
+  printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
+  exit 1
+fi
+
+JOBS="$(nproc 2>/dev/null || echo 4)"
+# `-I{}` already implies one argument per command; passing `-n1` beside it makes
+# xargs warn that the two are mutually exclusive, on every run, forever.
+OUT="$(seq 1 "$CASES" | xargs -P "$JOBS" -I{} bash "${BASH_SOURCE[0]}" --case {} 2>&1)"
+DISPATCH_RC=$?
+
+# The workers' interleaved verdicts, printed in full. Unlike the sequential
+# version this is the ONLY record of what ran: an `ok` line names a case that
+# answered, and its absence is the finding audited below.
+if [ -n "$OUT" ]; then
+  printf '%s\n' "$OUT"
+fi
+
+# Counted out of the verdict lines rather than out of an exit status, because
+# `xargs` collapses any number of failed children into one 123 and the summary
+# has to say how many.
+CASE_OK="$(printf '%s\n' "$OUT" | grep -c '^ok   \[')"
+CASE_FAIL="$(printf '%s\n' "$OUT" | grep -c '^FAIL: ')"
+FAIL=$((FAIL + CASE_FAIL))
+PASS=$((PASS + CASE_OK))
+
+# THE AUDIT, and the reason every case prints even when it passes.
+#
+# A worker can end without a verdict: the OOM killer takes it, `bash` cannot
+# start, `mktemp` finds a full disk, the runner reclaims the job's cgroup. Every
+# one of those leaves `$CASE_FAIL` at zero, and counting only failures would
+# then report a clean mutation suite over cases that never ran — the exact
+# vacuous pass this whole file exists to make impossible one level down.
+#
+# So the dispatch is reconciled twice, on two independent facts. The count of
+# verdicts must equal the count of cases started, and a non-zero `xargs` status
+# with no failing case named is itself a finding rather than a curiosity.
+REPORTED=$((CASE_OK + CASE_FAIL))
+if [ "$REPORTED" -ne "$CASES" ]; then
+  bad "the dispatcher started $CASES case(s) and $REPORTED returned a verdict — the rest ended without one, so their mutations were never asserted, whatever the exit codes say"
+fi
+if [ "$DISPATCH_RC" -ne 0 ] && [ "$CASE_FAIL" -eq 0 ]; then
+  bad "xargs exited $DISPATCH_RC while every case that answered was green — a worker failed for a reason it never got to print, and this run proves nothing"
+fi
+
+printf 'check-runner-policy self-test: %d passed, %d failed (%d of %d case(s) answered, %d at a time)\n' \
+  "$PASS" "$FAIL" "$REPORTED" "$CASES" "$JOBS"
 [ "$FAIL" -eq 0 ]
