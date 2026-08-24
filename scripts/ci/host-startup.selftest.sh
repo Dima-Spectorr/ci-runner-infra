@@ -1789,7 +1789,7 @@ mutate "band DNAT dropped"            '/PREROUTING -d "\$addr" -p tcp --dport/,+
 mutate "DNAT matched on the interface" 's@PREROUTING -d "\$addr" -p tcp@PREROUTING -i "$ifc" -p tcp@g' has_shared_infra_band
 mutate "hairpin SNAT dropped"          '/POSTROUTING -s "\$nsip" -d "\$nsip" -p tcp/,+3d'    has_shared_infra_band
 mutate "hairpin SNAT unscoped"         's@POSTROUTING -s "\$nsip" -d "\$nsip" -p tcp@POSTROUTING -s 10.99.0.0/16 -p tcp@g' has_shared_infra_band
-mutate "forward allow scoped to a veth"'s@ctstate DNAT --ctorigdst "\$baddr"@ctstate NEW -i "$veth"@g' has_shared_infra_band
+mutate "forward allow scoped to a veth" 's@ctstate DNAT --ctorigdst "\$baddr"@ctstate NEW -i "$veth"@g' has_shared_infra_band
 mutate "span hardcoded to four slots"  's@slot_band_max "\$SLOTS"@slot_band_max 4@'               has_shared_infra_band
 mutate "slot never told its band"      '/^Environment=CI_SHARED_INFRA_PORT_MIN=/d'                 has_shared_infra_band
 mutate "bands overlap"                 's@CI_BAND_WIDTH=100@CI_BAND_WIDTH=10@'                     band_arithmetic_disjoint
