@@ -122,11 +122,16 @@ has_os_selected_boot_key() { # <main.tf>
   # `windows-startup-script-ps1` and nothing else: the guest agent matches the
   # key name exactly and silently ignores every other.
   matches "$code" '^  boot_script_metadata = var\.host_os == "windows" \? \{' || return 1
-  matches "$code" '^    "windows-startup-script-ps1" = local\.windows_host_startup$' || return 1
-  matches "$code" '^    "startup-script" = local\.host_startup$' || return 1
+  matches "$code" '^    "windows-startup-script-ps1" += local\.windows_boot_loader$' || return 1
+  matches "$code" '^    "startup-script" += local\.boot_loader$' || return 1
 
-  # …carrying the real script, not a placeholder.
+  # …carrying the real script, not a placeholder. The value under the OS key is
+  # now a LOADER and the script travels compressed beside it (see invariant 5),
+  # so both halves are named here: a loader wired to nothing boots a host that
+  # fetches a key nobody wrote.
   matches "$code" 'windows_host_startup = file\("\$\{path\.module\}/scripts/windows-host-startup\.ps1"\)' || return 1
+  matches "$code" 'boot_loader += file\("\$\{path\.module\}/scripts/boot-loader\.sh"\)' || return 1
+  matches "$code" 'windows_boot_loader += file\("\$\{path\.module\}/scripts/boot-loader\.ps1"\)' || return 1
 
   # …and actually rendered. A local nothing merges into the template is a
   # rename away from being deleted as unused, and the template would keep
@@ -136,8 +141,46 @@ has_os_selected_boot_key() { # <main.tf>
   # Exactly one Linux boot key in the file, and it is the conditional's. The
   # hardcoded `startup-script = local.host_startup` this change replaced would
   # otherwise sit in the merged map and win on a Windows pool.
-  [ "$(count_of "$code" '"startup-script" = local\.host_startup')" -eq 1 ] || return 1
-  ! matches "$code" '^    startup-script = local\.host_startup$' || return 1
+  [ "$(count_of "$code" '"startup-script" += local\.boot_loader')" -eq 1 ] || return 1
+  ! matches "$code" '^    startup-script += local\.boot_loader$' || return 1
+}
+
+# --- invariant 5: the boot script FITS, and is proved to at plan time --------
+#
+# GCE caps one metadata value at 262,144 characters. On 2026-08-24 both boot
+# scripts were over it — Linux 278,405, Windows 366,591 — and nothing in the
+# module said so: the plan read clean and the APPLY died against the API with
+# `Error 413 ... is too large`. Every pool in the fleet was unable to build an
+# instance template, and three repositories sat at zero CI capacity for a day
+# and a half (#378).
+#
+# Two things have to stay true, and the second is the one that rots: the value
+# must be compressed, AND the compressed length must still be checked. Dropping
+# the precondition costs nothing today and buys back the identical outage the
+# next time the script grows.
+
+boot_script_fits_and_is_checked() { # <main.tf>
+  local code
+  code=$(code_of "$1")
+
+  # Compressed with the built-in, not with a hand-rolled split across keys: one
+  # reviewed, unit-tested file is the whole point.
+  matches "$code" '^  host_startup_gz += base64gzip\(local\.host_startup\)$'                 || return 1
+  matches "$code" '^  windows_host_startup_gz += base64gzip\(local\.windows_host_startup\)$' || return 1
+
+  # The RAW script must not be a metadata value on either arm. This is the
+  # regression that reads as a harmless revert — the pairing gate above would
+  # still pass with `"startup-script" = local.host_startup`, and the apply would
+  # 413 again.
+  ! matches "$code" '^    "startup-script" += local\.host_startup$'                 || return 1
+  ! matches "$code" '^    "windows-startup-script-ps1" += local\.windows_host_startup$' || return 1
+
+  # The compressed value is what ships, so the compressed value is what the
+  # precondition measures. A check against the uncompressed length would fail a
+  # plan that would have applied fine.
+  matches "$code" 'precondition \{'                                        || return 1
+  matches "$code" 'length\(var\.host_os == "windows" \? local\.windows_host_startup_gz : local\.host_startup_gz\) <= local\.metadata_value_max' || return 1
+  matches "$code" '^  metadata_value_max += 262144$'                       || return 1
 }
 
 # --- invariant 3: the host and the controller are TOLD their OS --------------
@@ -297,6 +340,12 @@ else
   bad "the boot-script metadata key is not selected by host_os — a Windows instance carrying startup-script runs NO boot script at all, comes up healthy, registers nothing, is drained at the register grace and rebuilt from the same template forever while every metric reads 'hosts running'"
 fi
 
+if boot_script_fits_and_is_checked "$MAIN"; then
+  ok
+else
+  bad "the boot script is not carried compressed, or its compressed size is no longer checked at plan time — GCE caps a metadata value at 262,144 characters and both boot scripts are past that uncompressed, so this reverts to an apply that dies at the API with a 413 while the plan reads clean, and no pool in the fleet can build an instance template"
+fi
+
 if has_host_os_metadata "$MAIN"; then
   ok
 else
@@ -373,7 +422,7 @@ mutate "the Windows image floor variable removed" "$VARS" \
 
 # 2. The boot-script key: the silent-churn mistake, in each shape it takes.
 mutate "the Windows pool given the Linux boot key" "$MAIN" \
-  's|"windows-startup-script-ps1" = local.windows_host_startup|"startup-script" = local.windows_host_startup|' \
+  's|"windows-startup-script-ps1" = local.windows_boot_loader|"startup-script" = local.windows_boot_loader|' \
   has_os_selected_boot_key
 mutate "the selection reverted to a hardcoded key" "$MAIN" \
   's|^  boot_script_metadata = var.host_os == "windows" ? {|  boot_script_metadata = {|' \
@@ -382,7 +431,25 @@ mutate "the selected key never merged into the template" "$MAIN" \
   's|^  metadata = merge(local.boot_script_metadata, local.windows_host_metadata, {|  metadata = merge(local.windows_host_metadata, {|' \
   has_os_selected_boot_key
 mutate "the hardcoded Linux key left in the merged map as well" "$MAIN" \
-  's|^    "ci-host-os" = var.host_os$|    startup-script = local.host_startup|' \
+  's|^    "ci-host-os" = var.host_os$|    startup-script = local.boot_loader|' \
+  has_os_selected_boot_key
+
+# 2b. The size fix, in each shape a revert takes. Every one of these applies
+#     cleanly, plans clean, and dies at the API with a 413.
+mutate "'the loader is indirection, put the script back' — Linux uncompressed" "$MAIN" \
+  's|^    "startup-script"    = local.boot_loader$|    "startup-script" = local.host_startup|' \
+  boot_script_fits_and_is_checked
+mutate "…and the same on Windows" "$MAIN" \
+  's|^    "windows-startup-script-ps1" = local.windows_boot_loader$|    "windows-startup-script-ps1" = local.windows_host_startup|' \
+  boot_script_fits_and_is_checked
+mutate "'it fits now, the check is noise' — the size precondition removed" "$MAIN" \
+  's|length(var.host_os == "windows" ? local.windows_host_startup_gz : local.host_startup_gz) <= local.metadata_value_max|true|' \
+  boot_script_fits_and_is_checked
+mutate "the cap measured against the script instead of what ships" "$MAIN" \
+  's|length(var.host_os == "windows" ? local.windows_host_startup_gz : local.host_startup_gz) <= local.metadata_value_max|length(local.host_startup) <= local.metadata_value_max|' \
+  boot_script_fits_and_is_checked
+mutate "the loader wired to a file that is not the loader" "$MAIN" \
+  's|boot_loader         = file("${path.module}/scripts/boot-loader.sh")|boot_loader         = file("${path.module}/scripts/telemetry.sh")|' \
   has_os_selected_boot_key
 
 # 3. The OS stops being stated.

@@ -127,11 +127,27 @@ In `main.tf`, exactly one thing: which metadata key carries the boot script.
 ```
 metadata = merge(
   var.host_os == "windows"
-    ? { "windows-startup-script-ps1" = local.windows_host_startup }
-    : { "startup-script"             = local.host_startup },
+    ? { "windows-startup-script-ps1" = local.windows_boot_loader
+        "ci-boot-script-gz"          = local.windows_host_startup_gz }
+    : { "startup-script"    = local.boot_loader
+        "ci-boot-script-gz" = local.host_startup_gz },
   { "ci-host-os" = var.host_os, ... }
 )
 ```
+
+The OS key carries a **loader**, not the script. GCE caps one metadata value at
+262,144 characters and both boot scripts passed it — Linux 278,405, Windows
+366,591 (measured 2026-08-24) — so the apply died against the API with
+`Error 413 ... is too large` and no pool in the fleet could build an instance
+template; three repositories sat at zero CI capacity for a day and a half
+(#378). `scripts/boot-loader.sh` and `scripts/boot-loader.ps1` read
+`ci-boot-script-gz`, which is the same script through `base64gzip` (128,344 and
+148,860 characters respectively), and `exec` it. One key name for both operating
+systems: the pairing that matters, and the one this module refuses at plan time,
+is `startup-script` versus `windows-startup-script-ps1`, and a second
+OS-specific name would be a second chance to get that wrong for no gain. The
+template also carries a precondition on the **compressed** length, so the next
+script to outgrow the cap is a plan that says so rather than an apply that 413s.
 
 `ci-host-os` is set as its own metadata key and the boot script asserts it
 against the OS it is actually running on. This exists because the failure mode

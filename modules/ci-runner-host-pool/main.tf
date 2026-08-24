@@ -139,11 +139,39 @@ locals {
   # metric reads "hosts running". A script that never started cannot assert
   # anything about the mistake, which is why the image pairing is refused at
   # plan time instead.
+  #
+  # NEITHER key carries the boot script itself any more; both carry a LOADER,
+  # and the script travels beside it in `ci-boot-script-gz`. GCE caps one
+  # metadata value at 262,144 characters and both boot scripts had passed it --
+  # Linux at 278,405 (106%), Windows at 366,591 (140%) -- so the apply died at
+  # the API with `Error 413 ... is too large` and no pool in the fleet could
+  # build an instance template. Three repositories lost all CI capacity for a
+  # day and a half before anybody read that error (#378). The pairing this block
+  # exists to get right is unchanged: the loader is still the ONE key the
+  # guest agent for that platform looks for, and still the only thing host_os
+  # switches on the template.
   boot_script_metadata = var.host_os == "windows" ? {
-    "windows-startup-script-ps1" = local.windows_host_startup
+    "windows-startup-script-ps1" = local.windows_boot_loader
+    "ci-boot-script-gz"          = local.windows_host_startup_gz
     } : {
-    "startup-script" = local.host_startup
+    "startup-script"    = local.boot_loader
+    "ci-boot-script-gz" = local.host_startup_gz
   }
+
+  # base64gzip, not a hand-rolled split across several keys: the boot script
+  # stays ONE reviewed, unit-tested file, and the seam is a decompressor rather
+  # than a reassembly order that has to be right at 04:00 in the dark. Linux
+  # 278,405 -> 128,344 characters, 49% of the cap; Windows 366,591 -> 148,860, 57%.
+  host_startup_gz         = base64gzip(local.host_startup)
+  windows_host_startup_gz = base64gzip(local.windows_host_startup)
+
+  boot_loader         = file("${path.module}/scripts/boot-loader.sh")
+  windows_boot_loader = file("${path.module}/scripts/boot-loader.ps1")
+
+  # The cap, named once. Asserted as a plan-time precondition on the template
+  # below, because the whole point of this change is that running out of room
+  # must never again be something an apply discovers against the API.
+  metadata_value_max = 262144
 
   # Windows-only keys, MERGED IN rather than written with an empty value, so a
   # Linux pool renders the same key set it renders today.
@@ -444,6 +472,22 @@ resource "google_compute_instance_template" "host" {
     precondition {
       condition     = local.turbo_bucket == "" || var.turbo_cache_port != var.job_broker_port
       error_message = "pool '${var.name}' would run the build-cache server and the job credential broker on the same port (${var.job_broker_port}). One of the two would fail to bind, and which one depends on boot ordering; give turbo_cache_port a port of its own."
+    }
+
+    # The boot script has to FIT. GCE caps one metadata value at 262,144
+    # characters, and on 2026-08-24 both boot scripts were over it: Linux at
+    # 278,405 and Windows at 366,591. Nothing said so until the apply reached
+    # the API — `Error 413 ... resource.properties.metadata.items[27].value is
+    # too large` — by which point the plan had already read clean, every pool in
+    # the fleet was unable to build a template, and three repositories had spent
+    # a day and a half with zero CI capacity (#378).
+    #
+    # The compressed value is what is measured, because the compressed value is
+    # what ships. Compression buys room; it does not remove the ceiling, and the
+    # next script that outgrows it must find out here.
+    precondition {
+      condition     = length(var.host_os == "windows" ? local.windows_host_startup_gz : local.host_startup_gz) <= local.metadata_value_max
+      error_message = "pool '${var.name}': the ${var.host_os} boot script is ${length(var.host_os == "windows" ? local.windows_host_startup_gz : local.host_startup_gz)} characters once gzipped and base64'd, and GCE allows ${local.metadata_value_max} in one metadata value. It is already compressed, so there is no cheap fix left: move a self-contained part of the boot script into the golden image, or split it across a second metadata key and teach scripts/boot-loader.${var.host_os == "windows" ? "ps1" : "sh"} to join them. Left to the apply this fails at the API with a 413, after the plan looked clean."
     }
 
     precondition {
