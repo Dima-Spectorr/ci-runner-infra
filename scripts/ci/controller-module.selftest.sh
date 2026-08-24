@@ -246,6 +246,52 @@ r=$(awk '/touch "\$STATE_DIR\/heartbeat"/ { t = NR }
          END { print (t > 0 && b > 0 && t < b) ? "yes" : "no" }' "$STARTUP")
 check "the heartbeat is created before the unit that bind-mounts it" yes "$r"
 
+# --- 8. the stall rule's caller must preserve "unknown", not flatten it -------
+#
+# infra_dequeue draws its second line at a CANCELLED job that completed zero
+# steps, and it distinguishes "" (the caller could not tell) from "0" (it ran
+# nothing) because only the second earns a requeue. That distinction is made in
+# the rule, which the decision self-test covers — but it is DESTROYED or kept in
+# the jq that feeds it, which lives in the startup script and no pure-function
+# test can reach.
+#
+# The failure it guards is quiet in the worst way: the jobs API omits `.steps`
+# entirely when it holds no step data, `.steps[]?` turns that absence into a
+# length of 0, and the rule then reads a job it knows nothing about as the exact
+# signature it retries on. Nothing errors; a cancelled-by-a-newer-commit job
+# gets requeued and burns a queue CI run.
+#
+# So the program is extracted from the script rather than restated here — a
+# second copy would pass while the real one drifted — and run against the two
+# payloads that differ only in the field.
+# shellcheck disable=SC2016  # a sed address matching shell source text, on
+# purpose: the `$(` is the script's own characters, not an expansion of ours.
+sig_jq=$(sed -n '/sig=$(printf .* | jq -r ./,/@tsv/p' "$STARTUP" |
+  sed '1s/.*jq -r .//; $s/.*/  | .[] | [ .c, (.e | tostring), (.s | tostring) ] | @tsv/')
+[ -n "$sig_jq" ] && r=yes || r=no
+check "the stall signature program was found in the startup script" yes "$r"
+
+sig_of() { # <steps-field-json>
+  printf '{"jobs":[{"status":"completed","conclusion":"cancelled","started_at":"2026-08-23T10:00:00Z","completed_at":"2026-08-23T10:15:00Z"%s}]}' "$1" |
+    jq -r "$sig_jq" 2>/dev/null | cut -f3
+}
+
+# Absent — GitHub told us nothing about the steps. Must stay empty.
+check "a job with no steps field reports an UNKNOWN step count" "" "$(sig_of '')"
+
+# Present and null. Same thing, and jq treats the two identically only if the
+# guard tests for null rather than for the key.
+check "a job with a null steps field reports an UNKNOWN step count" "" "$(sig_of ',"steps":null')"
+
+# Present and empty — the job recorded steps and completed none. A real zero,
+# and the case the whole rule exists for: a slot that took the job and died.
+check "a job with an empty steps array reports ZERO" "0" "$(sig_of ',"steps":[]')"
+
+# And a job that got somewhere still counts what it got through, so the arm
+# above cannot fire on it.
+check "a job that completed a step reports that count" "1" \
+  "$(sig_of ',"steps":[{"status":"completed"},{"status":"in_progress"}]')"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

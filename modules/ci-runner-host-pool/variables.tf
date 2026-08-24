@@ -687,6 +687,48 @@ variable "queue_base_branch" {
   default     = "main"
 }
 
+variable "queue_stall_after_seconds" {
+  description = <<-EOT
+    How long an open, admissible, fully-green pull request may sit with the
+    merge queue not moving before the controller treats it as STALLED and posts
+    a Mergify nudge. The clock starts when the LAST check on the head commit
+    completed, not when the pull request opened.
+
+    This is not a tuning knob so much as the width of the gap between the
+    control plane and Mergify itself. Mergify reacts to a completed check in
+    seconds, so anything above a couple of minutes cannot race it; the default
+    of 600 is generous on purpose, because the failure it recovers from lasted
+    hours and being late by ten minutes costs nothing while being early costs a
+    duplicated comment on every healthy merge.
+
+    Lower it only with evidence that the queue reliably reacts faster than this
+    on the repository in question.
+  EOT
+  type        = number
+  default     = 600
+}
+
+variable "queue_stall_max_attempts" {
+  description = <<-EOT
+    How many nudges the controller may spend on ONE head commit before it gives
+    up and leaves the pull request for a human. Refreshes and requeues share
+    this budget: three of each would be six comments on a pull request nobody is
+    helping.
+
+    The ceiling is the backstop for the infrastructure-versus-diff
+    classification being drawn wrong. An automatic requeue is defensible only
+    because the draft failed the way a machine fails; if that judgement is ever
+    mistaken the pull request burns three queue runs and then stops, rather than
+    looping.
+
+    Set to 0 to make the sweep observe and publish without ever commenting —
+    which is also the correct setting for a fleet whose GitHub App installation
+    holds only `pull requests: read`.
+  EOT
+  type        = number
+  default     = 3
+}
+
 variable "metric_prefix" {
   description = <<-EOT
     Custom-metric prefix. Every series this pool publishes is

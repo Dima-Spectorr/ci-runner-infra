@@ -180,6 +180,18 @@ variable "queue_base_branch" {
   default     = "main"
 }
 
+variable "queue_stall_after_seconds" {
+  description = "How long an open, admissible, fully-green pull request may sit with the merge queue not moving before the controller posts a Mergify nudge. The clock starts when the LAST check on the head commit completed. Mergify reacts to a completed check in seconds, so the default of 600 cannot race it — being late costs nothing, being early duplicates a comment on every healthy merge."
+  type        = number
+  default     = 600
+}
+
+variable "queue_stall_max_attempts" {
+  description = "Nudges the controller may spend on ONE head commit before leaving the pull request for a human; refreshes and requeues share the budget. This is the backstop for the infrastructure-versus-diff classification being wrong: a misjudged pull request burns three queue runs and then stops rather than looping. Set to 0 to observe and publish without ever commenting — also the correct setting when the App installation holds only `pull requests: read`."
+  type        = number
+  default     = 3
+}
+
 variable "metric_prefix" {
   description = "Custom-metric prefix. Series are labelled with `pool`, so all four pools publish under one prefix."
   type        = string
