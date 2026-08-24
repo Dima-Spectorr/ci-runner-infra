@@ -50,7 +50,11 @@ function Write-LoaderLine([string] $Message) {
 # is about to run. Same reasoning, and the same builtin SIDs, as Set-CiAcl in
 # the boot script itself: S-1-5-18 is SYSTEM and S-1-5-32-544 Administrators,
 # named by SID because their display names are localised.
-function New-LockedFile([string] $Path) {
+function New-LockedFile {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    if (-not $PSCmdlet.ShouldProcess($Path, 'create, restricted to SYSTEM and Administrators')) { return }
     if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
     New-Item -ItemType File -Path $Path -Force | Out-Null
 
@@ -70,19 +74,21 @@ function New-LockedFile([string] $Path) {
 
 function Expand-GzipBase64([string] $Text) {
     $bytes = [Convert]::FromBase64String($Text)
-    $input = New-Object System.IO.MemoryStream(, $bytes)
-    $gzip = New-Object System.IO.Compression.GZipStream($input, [System.IO.Compression.CompressionMode]::Decompress)
-    $output = New-Object System.IO.MemoryStream
+    # Not $input: that is one of PowerShell's automatic variables, and assigning
+    # to it inside a function is how a pipeline enumerator gets quietly replaced.
+    $compressed = New-Object System.IO.MemoryStream(, $bytes)
+    $gzip = New-Object System.IO.Compression.GZipStream($compressed, [System.IO.Compression.CompressionMode]::Decompress)
+    $plain = New-Object System.IO.MemoryStream
     try {
-        $gzip.CopyTo($output)
+        $gzip.CopyTo($plain)
     }
     finally {
-        $gzip.Dispose(); $input.Dispose()
+        $gzip.Dispose(); $compressed.Dispose()
     }
     # UTF8 without a BOM, and written back as such below: PowerShell reads a
     # BOM-less UTF8 file correctly, and a BOM prepended to a `<#` would be part
     # of the first token.
-    [System.Text.Encoding]::UTF8.GetString($output.ToArray())
+    [System.Text.Encoding]::UTF8.GetString($plain.ToArray())
 }
 
 # Retried, because this is the one fetch with nothing behind it: the metadata
