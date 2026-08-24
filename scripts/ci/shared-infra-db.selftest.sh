@@ -130,7 +130,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
 
 # An empty `addr` beside a port is an anchor bug; the URL falls back to loopback
 # rather than emitting `postgres://ci@:35100/app`.
-( PG=35100 ADDR= run_resolve sharednoaddr
+( PG=35100 ADDR='' run_resolve sharednoaddr
   ok "shared without addr: falls back to loopback" \
      "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:35100/app' ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharednoaddr" ) || true
@@ -138,7 +138,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
 # ---------------------------------------------------------------------------
 # The fallback draws its own port.
 # ---------------------------------------------------------------------------
-( PG= PG_PORT_CANDIDATES="24001" run_resolve draw
+( PG='' PG_PORT_CANDIDATES="24001" run_resolve draw
   ok "fallback: exits 0" "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
   ok "fallback: publishes the drawn port explicitly, never '127.0.0.1::5432'" \
      "$(grep -q -- '127\.0\.0\.1:24001:5432' "$CALLS" && ! grep -q -- '127\.0\.0\.1::5432' "$CALLS" && echo 1 || echo 0)"
@@ -149,14 +149,14 @@ got() { sed -n "s/^$2=//p" "$1"; }
 
 # A port already listening on the host is skipped. 32768 is the case that
 # matters: it is where Docker's own allocator would have started.
-( PG= SS_BUSY="32768 24001" PG_PORT_CANDIDATES="24001 24002" run_resolve busy
+( PG='' SS_BUSY="32768 24001" PG_PORT_CANDIDATES="24001 24002" run_resolve busy
   ok "busy port: skips the listener and takes the next candidate" \
      "$(grep -q -- '127\.0\.0\.1:24002:5432' "$CALLS" && ! grep -q -- '127\.0\.0\.1:24001:5432' "$CALLS" && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.busy" ) || true
 
 # A bind that fails anyway — the window the listener scan cannot close — is
 # retried on a DIFFERENT port, and the refused one is never drawn again.
-( PG= DOCKER_REFUSE="24001" PG_PORT_CANDIDATES="24001 24001 24002" run_resolve refuse
+( PG='' DOCKER_REFUSE="24001" PG_PORT_CANDIDATES="24001 24001 24002" run_resolve refuse
   ok "refused bind: still succeeds" "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
   ok "refused bind: the refused port is blacklisted, not redrawn" \
      "$([ "$(grep -c -- '127\.0\.0\.1:24001:5432' "$CALLS")" -eq 1 ] && echo 1 || echo 0)"
@@ -167,7 +167,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.refuse" ) || true
 
 # Five refusals is a real failure, not a silent success on a port nothing bound.
-( PG= DOCKER_REFUSE="24001 24002 24003 24004 24005" \
+( PG='' DOCKER_REFUSE="24001 24002 24003 24004 24005" \
   PG_PORT_CANDIDATES="24001 24002 24003 24004 24005" run_resolve exhausted
   ok "five refusals: fails" "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
   ok "five refusals: says so" \
@@ -179,7 +179,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
 # ---------------------------------------------------------------------------
 # The guards that were already there, kept honest.
 # ---------------------------------------------------------------------------
-( PG= HEALTH_TIMEOUT=90m PG_PORT_CANDIDATES="24001" run_resolve badtimeout
+( PG='' HEALTH_TIMEOUT=90m PG_PORT_CANDIDATES="24001" run_resolve badtimeout
   ok "health-timeout '90m': rejected with a message, not a bash syntax error" \
      "$([ "$RC" -ne 0 ] && grep -q 'whole number of seconds' "$TMP/stdout.badtimeout" && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.badtimeout" ) || true
@@ -187,22 +187,22 @@ got() { sed -n "s/^$2=//p" "$1"; }
 # A non-empty password drops `trust` and reaches the URL; an empty one keeps
 # `trust` and leaves the URL bare. This used to be wrong in both directions at
 # once — `trust` unconditionally, password embedded anyway.
-( PG= DB_PASSWORD=s3cret PG_PORT_CANDIDATES="24001" run_resolve pw
+( PG='' DB_PASSWORD=s3cret PG_PORT_CANDIDATES="24001" run_resolve pw
   ok "password: not run under trust" \
      "$(! grep -q 'POSTGRES_HOST_AUTH_METHOD=trust' "$CALLS" && echo 1 || echo 0)"
   ok "password: reaches the url" \
      "$(grep -q '^url=postgres://ci:s3cret@' "$OUT" && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.pw" ) || true
 
-( PG= PG_PORT_CANDIDATES="24001" run_resolve trust
+( PG='' PG_PORT_CANDIDATES="24001" run_resolve trust
   ok "no password: trust, and no credential in the url" \
      "$(grep -q 'POSTGRES_HOST_AUTH_METHOD=trust' "$CALLS" && grep -q '^url=postgres://ci@' "$OUT" && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.trust" ) || true
 
 # A Windows leg has no container runtime, so the fallback is not available to
 # it — it must fail on that sentence rather than on `docker: command not found`.
-( PATH="$BIN:$PATH" GITHUB_OUTPUT="$TMP/out.win" RUNNER_OS=Windows PG= ADDR= \
-    IMAGE=x DB_USER=ci DB_PASSWORD= DB_NAME=app HEALTH_TIMEOUT=30 \
+( PATH="$BIN:$PATH" GITHUB_OUTPUT="$TMP/out.win" RUNNER_OS=Windows PG='' ADDR='' \
+    IMAGE=x DB_USER=ci DB_PASSWORD='' DB_NAME=app HEALTH_TIMEOUT=30 \
     DOCKER_CALLS="$TMP/calls.win" DOCKER_LAST_PORT_FILE="$TMP/lp.win" \
     bash "$RESOLVE" >"$TMP/stdout.win" 2>&1
   rc=$?
