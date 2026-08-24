@@ -1955,5 +1955,35 @@ else
   bad "an unescaped backtick or \$( inside an unquoted heredoc is a command substitution the boot would run, not prose -- line(s): ${_live//$'\n'/ }"
 fi
 
+
+# THE BOOT SCRIPT HAS TO FIT IN A METADATA VALUE.
+#
+# GCE caps one metadata value at 256 KiB. This script plus telemetry.sh crossed
+# that on 2026-08-24 at about 271 KiB, and the way it presented is why the check
+# is here rather than left to the apply: `terraform plan` was clean, the apply
+# died with `Error 413 ... actual size 277764` inside an unattended nightly
+# build, the pool kept its previous template, and three repositories ran a
+# known-broken boot script for a day while every merged fix looked shipped.
+#
+# The module now ships the script gzipped inside a small wrapper, which is what
+# this measures — the wrapper's own text is a rounding error next to the blob.
+# A plan-time precondition in the module asserts the same thing for real; this
+# is the copy that fails in CI, on the pull request that grows the script,
+# instead of on a machine at 04:00.
+#
+# The threshold is under the cap on purpose. Terraform's `base64gzip` is Go's
+# gzip at its DEFAULT level and this is whatever the runner's gzip defaults to,
+# so the two numbers are close but not guaranteed equal; the margin is there so
+# a compression-level difference can never be what decides whether the fleet
+# boots.
+_cap=262144
+_margin=245760
+_gz=$(cat "$HERE/../../modules/ci-runner-host-pool/scripts/telemetry.sh" "$SCRIPT" | gzip | base64 -w0 | wc -c)
+if [ "$_gz" -lt "$_margin" ]; then
+  ok
+else
+  bad "the gzipped boot script is ${_gz} characters as metadata; the budget is ${_margin} and GCE refuses anything over ${_cap}. Shorten host-startup.sh or move part of it onto the golden image -- past the cap this is an Error 413 at create time, on a plan that read clean."
+fi
+
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

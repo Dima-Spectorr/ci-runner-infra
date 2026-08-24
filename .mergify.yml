@@ -61,10 +61,19 @@ queue_rules:
       - base = main
       - -draft
       - -conflict
-      # The three CI jobs, named individually because this repository has no
-      # aggregate job to name instead. All three run on every pull request with
-      # no path filter and no draft gate, so none of them can skip and leave the
-      # queue waiting for a conclusion that never comes.
+      # The three CI checks. All three run on every pull request with no path
+      # filter and no draft gate, so none of them can skip and leave the queue
+      # waiting for a conclusion that never comes.
+      #
+      # `Shell (syntax + drain rule)` is no longer one job: the shell gate is ten
+      # parallel jobs behind an AGGREGATE of that name, which is why the name did
+      # not change when the work behind it was split. Name the aggregate here,
+      # never the jobs it waits for — this list and the branch ruleset's required
+      # checks are two copies of the same three strings, and a list that grows a
+      # row per job has to be edited in two places outside this repository every
+      # time the split changes. The aggregate reports `success` only when all ten
+      # do, and it runs `if: always()` so a failed dependency reddens it rather
+      # than skipping it.
       - check-success = "Shell (syntax + drain rule)"
       - check-success = "Terraform (fmt + validate)"
       - check-success = "Genericity (no customer or repo literals)"
