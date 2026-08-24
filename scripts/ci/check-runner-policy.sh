@@ -609,7 +609,7 @@ QUEUE_AUTHOR = re.compile(r"""user\.login\s*==\s*(['"])mergify\[bot\]\1""")
 # RUNNER14's one legitimate way out without a marker: a job that does not RUN
 # on a merge-queue draft has no route to take, and asking it to resolve a pool
 # it will never claim would be a finding nobody can act on. Deliberately narrow
-# -- the two readable spellings of "not a queue draft" and nothing inferred --
+# -- the readable spellings of "not a queue draft" and nothing inferred --
 # because the two error directions are not symmetric here either: an
 # unrecognised-but-correct skip costs one declared exemption, where an
 # over-eager reading silently excuses the job the whole rule is about.
@@ -619,12 +619,44 @@ QUEUE_SKIP = re.compile(
     r"\s*==\s*false"
 )
 
+# THE SAME STATEMENT WRITTEN FROM THE OTHER SIDE, and the same certainty rather
+# than a widening. A Mergify queue draft is a real pull request in this
+# repository, so GitHub delivers it as `pull_request` -- or, on the target
+# trigger, `pull_request_target` -- and as no other event. A job pinned to any
+# other event therefore cannot be reached by one. `if: github.event_name ==
+# 'push'` is not a guess about what the author meant; it excludes the draft as
+# conclusively as negating the branch prefix does.
+#
+# IntegrateIT's `publish-msi` is the case that found this: push-only, reported
+# by RUNNER14, and with no action available to it. Routing a job that never
+# runs on a draft would have been dead code, and the declared exemption the
+# rule offered instead would have recorded a fact about the gate rather than
+# about the repository.
+#
+# EQUALITY AGAINST A LITERAL ONLY, deliberately. `!=` says which event this is
+# not, which leaves `pull_request` in play unless the rest of the condition is
+# read with it; `contains(fromJSON(...), github.event_name)` hides the answer
+# in a list. Both are shapes where an over-eager reading excuses the job the
+# whole rule is about, which is the asymmetry stated above.
+QUEUE_SKIP_EVENT = re.compile(r"github\.event_name\s*==\s*(['\"])([A-Za-z_]+)\1")
+
+# The two events a queue draft actually arrives as. Anything else is a skip.
+QUEUE_DRAFT_EVENTS = ("pull_request", "pull_request_target")
+
+
+def queue_skip_leaf(expr):
+    """One leaf of the Boolean walk: does this term alone rule out a draft?"""
+    if QUEUE_SKIP.search(expr):
+        return True
+    hit = QUEUE_SKIP_EVENT.search(expr)
+    return bool(hit and hit.group(2) not in QUEUE_DRAFT_EVENTS)
+
 
 def queue_skipped(job):
     """True when this job cannot run on a `mergify/merge-queue/<sha>` draft."""
     condition = job.get("if")
     return isinstance(condition, str) and condition_excludes(
-        condition, QUEUE_SKIP.search
+        condition, queue_skip_leaf
     )
 
 
@@ -3501,6 +3533,57 @@ jobs:
 jobs:
   policy:
     if: \"always() || !startsWith(github.head_ref, 'mergify/merge-queue/')\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # The same skip written from the other side. A queue draft arrives as
+  # `pull_request`, so a job pinned to `push` is not on one — the spelling
+  # IntegrateIT's push-only `publish-msi` uses, and the one this rule used to
+  # report with nothing the repository could do about it.
+  expect_mq_pair "a push-only job is not on a queue draft" "" \
+"$MQ_LANE" \
+"on: [pull_request, push]
+jobs:
+  policy:
+    if: \"github.event_name == 'push'\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # …and it is still the tree that decides, not the substring. One arm of an
+  # `||` restricted to `push` says nothing about the other arm, which runs on
+  # the draft on the pull-request pool.
+  expect_mq_pair "an event test in one arm of an OR skips nothing" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request, push]
+jobs:
+  policy:
+    if: \"github.event_name == 'push' || github.event.pull_request.draft == false\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # The direction that must NOT be read as a skip: a queue draft IS a pull
+  # request, so pinning the job to that event confirms it is on the draft
+  # rather than excusing it. `pull_request_target` is the same answer — Mergify
+  # opens a real pull request, and the target trigger fires on it too.
+  expect_mq_pair "pinning to pull_request is not a skip" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request]
+jobs:
+  policy:
+    if: \"github.event_name == 'pull_request'\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  expect_mq_pair "…nor is pinning to pull_request_target" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request, pull_request_target]
+jobs:
+  policy:
+    if: \"github.event_name == 'pull_request_target'\"
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 10
     steps: [{run: \"true\"}]"
