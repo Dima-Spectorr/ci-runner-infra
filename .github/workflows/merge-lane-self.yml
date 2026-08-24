@@ -1,0 +1,94 @@
+name: Merge lane (this repository)
+
+# This repository publishes the lane, so it is the first place the lane has to
+# hold — the same argument `support-windows-self.yml` and `ci.yml` already make
+# for every other rule shipped from here, and the same one the retired
+# `mergify-nudge-self.yml` made before it.
+#
+# It also has the most standing to run it. Every measurement that justifies
+# replacing Mergify (8m55s to 20m01s of idle time between the last green check
+# and Mergify acting) was taken on this repository's own pull requests.
+#
+# THE TRIGGER CANNOT LIVE IN THE REUSABLE WORKFLOW.
+#
+# `workflow_call` is the only trigger a callee may declare, so the `workflow_run`
+# half is necessarily the consumer's. That is the entire content of this file,
+# and of the equivalent file in every consuming repository.
+#
+# THIS FILE DOES NOT RUN ON THE PULL REQUEST THAT CHANGES IT.
+#
+# GitHub dispatches `workflow_run` from the DEFAULT BRANCH only. A change here
+# is unexercised until it merges, whatever CI says.
+# `scripts/ci/merge-lane-decision.selftest.sh` is what stands in for the run
+# that cannot happen — it holds every decision this lane makes — and
+# `scripts/ci/merge-lane.selftest.sh` asserts the structural properties of these
+# two files, with mutations, so a property silently removed fails a check that
+# CAN run on a pull request.
+
+on:
+  # The fast path, and the whole point: GitHub dispatches this itself the
+  # instant CI finishes, with no webhook to a third party anywhere in it.
+  workflow_run:
+    # By NAME, which is the only handle `workflow_run` offers — so renaming
+    # `ci.yml`'s `name:` key detaches this silently, and the self-test asserts
+    # the two agree for exactly that reason.
+    workflows: [CI]
+    types: [completed]
+
+  # The backstop, not the mechanism. A merge moves the base, and every other
+  # open pull request becomes one commit behind — but nothing about that is a CI
+  # completion, so without a sweep a pull request could sit needing only an
+  # update that nothing triggers. Fifteen minutes is chosen to be irrelevant on
+  # the happy path and finite on the unhappy one.
+  #
+  # Free here: this repository is PUBLIC, so GitHub-hosted minutes are unmetered.
+  # A private consumer should point `runs-on` at the fleet instead of dropping
+  # the schedule — it is the only thing that recovers a missed dispatch.
+  schedule:
+    - cron: '*/15 * * * *'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lane:
+    uses: ./.github/workflows/merge-lane.yml
+    permissions:
+      contents: read
+    with:
+      base: main
+      # The three CI jobs, named exactly as they appear on a pull request, and
+      # exactly the three that `.mergify.yml` named in its anchored condition
+      # list before it was deleted. All three run on every pull request with no
+      # path filter and no draft gate, so none can skip and leave the lane
+      # waiting on a conclusion that never comes.
+      #
+      # A rename here is a MISSING check, not a passing one — the lane stops
+      # rather than ungates. That is the failure mode worth having.
+      required-checks: |
+        Shell (syntax + drain rule)
+        Terraform (fmt + validate)
+        Genericity (no customer or repo literals)
+      # GitHub-hosted on purpose, and it is the same choice `ci.yml` makes: the
+      # repository that DEFINES the self-hosted fleet must not need the fleet to
+      # be healthy in order to merge a fix to the fleet. Free, because public.
+      runs-on: ubuntu-latest
+      # `.mergify.yml`'s `checks_timeout` was 30 min. Kept, unchanged.
+      inflight-budget-seconds: 1800
+      # ARMED BY A VARIABLE, NOT BY A COMMIT.
+      #
+      # A `workflow_run` workflow cannot run on the pull request that adds it,
+      # so the first live execution is the first CI completion after this
+      # merges. Reading real verdicts before granting merge authority is the
+      # only honest order to do this in — and making the switch a repository
+      # variable means arming it does not require another pull request through
+      # the very queue being replaced.
+      #
+      # Unset or anything but the exact string `false` means DRY RUN. Fail-safe
+      # in the direction that does not merge.
+      dry-run: ${{ vars.MERGE_LANE_ARMED != 'true' }}
+    secrets:
+      app-id: ${{ secrets.MERGE_APP_ID }}
+      app-private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}

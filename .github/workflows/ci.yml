@@ -674,6 +674,13 @@ jobs:
       # `.mergify.yml`'s `commands_restrictions`, with a mutation per property.
       - name: mergify nudge self-test
         run: bash scripts/ci/mergify-nudge.selftest.sh
+      # The merge lane replaces Mergify. Both are wired while the lane runs in
+      # dry run; see docs/merge-lane.md for the cutover order and why it is not
+      # one step.
+      - name: merge-lane decision self-test
+        run: bash scripts/ci/merge-lane-decision.selftest.sh
+      - name: merge-lane structural self-test
+        run: bash scripts/ci/merge-lane.selftest.sh
 
       # `ci_orphan_registrations_reaped` was published from the day the reaper
       # landed and never declared in the module output that dashboards and alert
