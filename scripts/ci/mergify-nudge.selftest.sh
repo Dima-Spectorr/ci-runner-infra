@@ -299,7 +299,11 @@ stops_when_the_budget_is_spent() {
   local body
   body=$(printf '%s\n' "$code" | awk '/^          bounded_sleep\(\) \{/,/^          \}$/')
   [ -n "$body" ] || return 1
-  ! printf '%s\n' "$body" | grep -qE '^ +return 0$' || return 1
+  # `grep -c … >/dev/null`, not `grep -q`: under `pipefail` a `-q` reader exits
+  # on its first match, the in-process writer dies of EPIPE, and the pipeline
+  # that FOUND the text reports failure. PFR3 rejects it. `-c` reads to the end
+  # and still exits 1 on no match, which is the answer this line wants.
+  [ "$(printf '%s\n' "$body" | grep -cE '^ +return 0$')" -eq 0 ] || return 1
   [ "$(printf '%s\n' "$body" | grep -cE '^ +return 1$')" -eq 2 ] || return 1
   # No wait may discard the verdict.
   matches "$code" '^ +bounded_sleep "\$GRACE" \|\| out_of_time=1$'    || return 1
