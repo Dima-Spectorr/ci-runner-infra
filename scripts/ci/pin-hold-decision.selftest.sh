@@ -157,6 +157,40 @@ expect "hold:run=77 expiry=$LIVE" "a corrupt cache still yields to a good publis
 
 # 4. Defaults. A future caller that forgets an argument gets the safe verdict.
 expect hold "no arguments at all is a hold" # (no args)
+# Including the new one: a caller that does not pass `reads_disabled` gets the
+# behaviour it had before the argument existed.
+expect hold "an omitted reads_disabled is the old, conservative behaviour" \
+  1 0 "" "" 0 "$NOW" "$MAX"
+
+# --- the mechanism is administratively OFF ------------------------------------
+#
+# The one failed read that is not a failure. `disableGuestAttributesAccess`
+# disables the WRITE as well, so nothing can have published a hold and the veto
+# has nothing to protect. Held anyway, it is a permanent silent stop on every
+# drain and every recycle in the fleet -- which is exactly what it was, live, on
+# 2026-08-24, with every series reading healthy.
+#
+# Note what each of these does NOT do: none of them consults the cache. A hold
+# remembered from before the policy landed must not outlive the mechanism that
+# could renew it, or the "temporary" veto becomes permanent by another route.
+expect free "an administratively disabled mechanism cannot be hiding a hold" \
+  1 0 "" "" 0 "$NOW" "$MAX" 1
+expect "free:guest-attributes-unavailable" "the reason is in the verdict, not just the outcome" \
+  1 0 "" "" 0 "$NOW" "$MAX" 1
+expect free "a cached live hold does not survive the mechanism being switched off" \
+  1 0 "" 88 "$LIVE" "$NOW" "$MAX" 1
+# And the flag is checked BEFORE the read-failed rule, not instead of it: an
+# ordinary failure with the flag clear must still keep, or this change would
+# have quietly deleted the rule it was narrowing.
+expect hold "an ordinary failed read still keeps when the mechanism is available" \
+  1 0 "" 88 "$LIVE" "$NOW" "$MAX" 0
+# Only the exact flag. Anything else a future caller might pass -- an error
+# string, a status code, an empty variable -- must not read as "switched off",
+# because the wrong answer here deletes a pinned host.
+for notflag in "" 0 2 "true" "yes" "412" "-1"; do
+  expect hold "reads_disabled='$notflag' is not the off switch" \
+    1 0 "" 88 "$LIVE" "$NOW" "$MAX" "$notflag"
+done
 
 # --- the wiring ---------------------------------------------------------------
 #
@@ -218,7 +252,8 @@ counted "nothing reads the hold key by path" '\-\-query-path="\$BEACON_NS/\$PIN_
 
 # The cache is the monotonic store, and only a read that SUCCEEDED may write it.
 wired "the cache lives beside the beacon's own markers" 'pinhold-\$host'
-wired "only a successful read updates the cache" 'if \[ "\$rc" = "0" \]; then'
+wired "only a successful read -- or a proven-off mechanism -- touches the cache" \
+  'if \[ "\$rc" = "0" \] \|\| \[ "\$disabled" = "1" \]; then'
 wired "the cache goes when the host does" 'STATE_DIR/pinhold-\$host"$'
 
 # The ceiling is a contract with the host helper's own clamp, not an input. A
@@ -240,6 +275,112 @@ fi
 wired "held removals are counted" 'PIN_HELD=\$\(\(PIN_HELD \+ 1\)\)'
 wired "the counter resets per pool" '^ +PIN_HELD=0$'
 wired "the count is published" 'queue_series "ci_pin_holds_honoured"'
+
+# --- the classifier, run rather than matched ----------------------------------
+#
+# `guest_attributes_denied` is the only thing standing between "the org switched
+# guest attributes off" and "the API had a bad minute", and the two answers are
+# opposite: one deletes the host, the other keeps it. Extracted and EXECUTED
+# here -- a predicate that is only grepped for is a predicate nobody has run.
+#
+# Extraction refuses an empty or renamed body, so a rename that silently stops
+# testing anything fails instead of passing vacuously.
+gad_body=$(awk '
+  /^guest_attributes_denied\(\) \{/ { on = 1 }
+  on { print }
+  on && $0 == "}" { exit }
+' "$CTL")
+case "$gad_body" in
+  *disableGuestAttributesAccess*)
+    eval "$gad_body"
+    denied() { # <description> <expected 0|1> <text>
+      local want="$2"
+      local got=0
+      guest_attributes_denied "$3" || got=1
+      if [ "$got" = "$want" ]; then
+        PASS=$((PASS + 1))
+      else
+        FAIL=$((FAIL + 1))
+        printf 'FAIL: %s\n  text: %s\n  want: %s got: %s\n' "$1" "$3" "$want" "$got"
+      fi
+    }
+
+    # The real message, verbatim from `gcloud compute instances
+    # get-guest-attributes` against a project where the constraint is enforced.
+    denied "the live org-policy refusal is recognised" 0 \
+      "ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 412: Constraint constraints/compute.disableGuestAttributesAccess violated for project 000000000000."
+    # gcloud wraps long messages, and a match that needs the whole sentence on
+    # one line is a match that stops working on a narrower terminal.
+    denied "a line-wrapped refusal is still recognised" 0 \
+      "$(printf 'ERROR: HTTPError 412: Constraint\nconstraints/compute.disableGuestAttributesAccess violated for project 1.')"
+    denied "a CRLF refusal is still recognised" 0 \
+      "$(printf 'Constraint constraints/compute.disableGuestAttributesAccess violated\r\n')"
+
+    # And every neighbouring failure is NOT this one. Each of these leaves a
+    # hold perfectly possible, so answering "switched off" would delete a pinned
+    # host over a transient error -- the exact bug this change is narrowing, in
+    # the opposite direction.
+    denied "an empty error is not the policy" 1 ""
+    denied "a timeout is not the policy" 1 "ERROR: gcloud timed out"
+    denied "a rate limit is not the policy" 1 \
+      "ERROR: HTTPError 429: Quota exceeded for quota metric 'Guest attribute queries'"
+    denied "a missing IAM grant is not the policy" 1 \
+      "ERROR: HTTPError 403: Required 'compute.instances.getGuestAttributes' permission for 'projects/p/zones/z/instances/i'"
+    denied "an instance that is gone is not the policy" 1 \
+      "ERROR: HTTPError 404: The resource 'projects/p/zones/z/instances/i' was not found"
+    # A DIFFERENT constraint is not this constraint. The org enforces dozens,
+    # and a substring match on "Constraint ... violated" would read a serial-port
+    # or shielded-VM policy as permission to delete pinned hosts.
+    denied "another org constraint is not this one" 1 \
+      "ERROR: HTTPError 412: Constraint constraints/compute.disableSerialPortAccess violated for project 1."
+    ;;
+  *)
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: guest_attributes_denied() could not be extracted from controller-startup.sh -- renamed, or it no longer names the constraint\n'
+    ;;
+esac
+
+# --- the wiring of the off switch ---------------------------------------------
+#
+# Both gates classify, because both read the same namespace through the same
+# API and the policy refuses both. They then diverge on PURPOSE, and that
+# divergence is the point of the change: a pin hold that cannot exist is no
+# reason to keep a host, but a beacon that cannot be read is still the loss of
+# the only evidence a Windows host is idle. So the pin-hold gate frees and the
+# beacon gate keeps -- and BOTH count, so the fleet can see it.
+counted "both gates classify the refusal" 'guest_attributes_denied "\$\(cat "\$errf"\)"' 2
+counted "neither gate throws the error away any more" '\-\-format="csv\[no-heading\]\(key,value\)" 2>/dev/null' 0
+wired "the classification reaches the rule" \
+  'pin_hold_decision "\$rc" "\$present" "\$hold_raw" "\$c_run" "\$c_exp" \\$'
+wired "the rule is given the flag" '"\$now" "\$PIN_HOLD_MAX" "\$disabled"'
+# The beacon gate must NOT have gained a free path. Its keep is still correct.
+counted "the beacon rule is unchanged" \
+  'beacon_decision "\$rc" "\$present" "\$workers" "\$ts" "\$now" \\$' 1
+
+# A FILE, not a variable, and the assertion says so. Both gates are called as
+# `x=$(gate ...)` -- a subshell -- so a counter variable incremented inside
+# either of them is discarded when the substitution closes, and the series
+# publishes a confident zero on exactly the fleet it exists to report.
+counted "both gates record a refusal" '^ +note_guest_attributes_denied$' 2
+wired "the record outlives the subshell" 'printf .x.n. >>"\$GA_DENIED_FILE"'
+wired "nothing counts refusals in a variable the subshell owns" \
+  'GA_DENIED_FILE="\$STATE_DIR/ga-denied-\$POOL"'
+counted "no subshell-local counter survives" 'GA_DENIED=\$\(\(GA_DENIED \+ 1\)\)' 0
+wired "the file is truncated per pool per tick" '^ +: >"\$GA_DENIED_FILE"'
+wired "the count is published" 'queue_series "ci_guest_attributes_denied" "\$ga_denied"'
+
+# --- a skip is telemetry, not silence -----------------------------------------
+#
+# Only `cordoned` and `retired` were ever published, so a recycle that skipped
+# every host on every tick was indistinguishable from one with nothing to do --
+# which is how nine hosts sat on a stale template for a day underneath a
+# `ci_hosts_stale_template` of 9 that was already saying so.
+wired "skip verdicts are counted" 'RECYCLE_SKIPS\["\$skip_reason"\]='
+wired "skips are counted only while the template is not current" '\[ "\$tpl" != "current" \]'
+wired "the reasons are a closed set" \
+  'disabled \| not-running \| template \| registration-unknown \| booting \| at-capacity\)'
+wired "the zeroes are published too" 'for reason in disabled not-running template'
+wired "skips share the recycle series" 'outcome\\":\\"skip-\$reason'
 
 if [ "$FAIL" -gt 0 ]; then
   echo "pin-hold-decision: $FAIL failed, $PASS passed"
