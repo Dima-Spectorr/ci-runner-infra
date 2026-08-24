@@ -306,6 +306,13 @@ windows_boot_script_is_compressed() { # <main.tf>
   wrapper=$(cat "$HERE/../../modules/ci-runner-host-pool/scripts/windows-boot-wrapper.ps1")
   matches "$wrapper" 'IsNullOrWhiteSpace\(\$plain\)' || return 1
   matches "$wrapper" '^\$root = .C:\\ci.$' || return 1
+
+  # …and restricted on EVERY boot, not only the one where this wrapper created
+  # it. The golden image ships C:\ci, so an ACL applied inside the create branch
+  # is an ACL that never runs on a real host, and what protects the boot path is
+  # then whatever C:\ hands down by inheritance. Column zero: indented, the call
+  # is back inside the `if`.
+  matches "$wrapper" '^Protect-Path \$root$' || return 1
   ! matches "$wrapper" '\$env:TEMP' || return 1
   matches "$wrapper" 'S-1-5-18' || return 1
   matches "$wrapper" 'S-1-5-32-544' || return 1

@@ -35,8 +35,9 @@
   created there with inherited permissions and locked down a moment later is a
   window in which a slot could replace it. The boot script itself refuses
   C:\Windows\Temp for the same reason when it writes the security-policy
-  export. C:\ci is created here with an explicit ACL when it is absent, and is
-  already SYSTEM-and-Administrators-only on every reboot after the first.
+  export. C:\ci is restricted to SYSTEM and Administrators here on every boot,
+  and created first if it is absent -- the golden image ships it, so in practice
+  only the restriction runs.
 
   Nothing deletes C:\ci between boots, so unlike a path the boot script
   recreates there is no way for this file to be removed out from under the
@@ -110,10 +111,16 @@ if ([string]::IsNullOrWhiteSpace($plain)) {
     exit 1
 }
 
+# Unconditionally, not only when this wrapper created the directory. The golden
+# image already ships C:\ci, so on a real host the create never runs -- and an
+# ACL applied only on the path that never executes is an ACL that does not
+# exist. Whether the boot path is writable would then rest on whatever C:\ hands
+# down by inheritance, which is the thing applying it before the write exists to
+# avoid. Set-Acl on an already-correct directory is a no-op.
 if (-not (Test-Path -LiteralPath $root)) {
     New-Item -ItemType Directory -Path $root -Force | Out-Null
-    Protect-Path $root
 }
+Protect-Path $root
 
 if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force }
 New-Item -ItemType File -Path $dest -Force | Out-Null
