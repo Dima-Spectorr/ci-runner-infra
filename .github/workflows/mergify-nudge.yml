@@ -105,12 +105,12 @@ on:
       grace-seconds:
         description: >-
           How long to wait before asking whether Mergify is behind. This was
-          sized as a budget for the webhook arriving NORMALLY, and that budget
-          has now been paid eleven times and collected on none: across ten
-          nudged pull requests Mergify re-evaluated inside the grace window
-          ZERO times, and on #372 the window plus one retry cost 43 of the 184
-          seconds between CI going green and the merge — the single largest
-          span anyone here controls. It is not a free safety margin, it is a
+          sized as a budget for the webhook arriving NORMALLY, and across the
+          eleven nudged pull requests measured in this repository it has been
+          paid every time and collected on none: Mergify re-evaluated inside
+          the grace window ZERO times. On #372 the window plus one retry cost
+          43 of the 184 seconds between CI going green and the merge — the
+          single largest span anyone here controls. It is not a safety margin, it is a
           delay applied to every run to avoid a comment on some of them, and
           that comment is cheap: Mergify answers a redundant refresh with
           "already running from a previous command" and does no extra work.
@@ -125,7 +125,7 @@ on:
           attempt is a second chance for a merely-late webhook to land, priced
           at `interval-seconds` of delay on EVERY run and paying out only on
           the runs that were never stuck. At the measured hit rate of zero in
-          ten that trade is not worth making twice, so this is 1: probe once,
+          eleven that trade is not worth making twice, so this is 1: probe once,
           and if Mergify is behind, say so immediately. The retry that matters
           is `nudge-attempts`, which retries the thing that can actually be
           lost.
@@ -137,8 +137,9 @@ on:
           The gap between attempts, and therefore dead weight unless `attempts`
           is raised above its default of 1. `grace-seconds + (attempts - 1) *
           interval-seconds` is the longest this waits before the FIRST nudge,
-          and the whole ladder — that plus `(nudge-attempts - 1) *
-          confirm-seconds` — must stay well under the queue's `checks_timeout`:
+          and the whole ladder — that plus `nudge-attempts * confirm-seconds`,
+          the last post getting a confirmation window like every other — must
+          fit inside `timeout-minutes` and stay well under `checks_timeout`:
           a nudge that arrives after the entry has already been dequeued for a
           timeout is telling Mergify about a pull request it has stopped
           tracking.
@@ -174,6 +175,20 @@ on:
         required: false
         default: 60
         type: number
+      timeout-minutes:
+        description: >-
+          The job timeout, which must cover the whole ladder —
+          `grace-seconds + (attempts - 1) * interval-seconds +
+          nudge-attempts * confirm-seconds` — plus setup. Raise this whenever
+          you widen the waits: a job cancelled by its timeout loses the final
+          probe and the warning, and reds a run over a configuration this
+          workflow accepts. The shell also clamps its own sleeps to this
+          budget, so overrunning degrades to a shorter last wait rather than a
+          cancellation, but that clamp is a backstop and not a licence to skip
+          raising it. 10 is roughly three times the default ladder's 185s.
+        required: false
+        default: 10
+        type: number
 
 permissions:
   contents: read
@@ -188,10 +203,15 @@ jobs:
     # spending a warm pool slot on it would take a slot from a real job for
     # minutes at a time while it waits.
     runs-on: ubuntu-latest
-    # The wait is bounded by the inputs and the defaults sum to 2m30s. Ten
-    # minutes leaves room for a consumer that widened them without leaving a
-    # hung `gh` call able to sit here indefinitely.
-    timeout-minutes: 10
+    # The wait is bounded by the inputs, so the timeout must be too — a fixed
+    # ceiling is a second, invisible bound that a consumer widening the inputs
+    # has no way to see. At `confirm-seconds: 240` the ladder needs ~12 minutes
+    # and a hard 10 would have GitHub cancel the job mid-wait, losing the final
+    # probe and the warning: the run goes red on a configuration this workflow
+    # accepts and documents. It stays an input rather than an expression over
+    # the others so it is an integer the runner can take verbatim, and the
+    # shell bounds its own sleeps against it.
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
       # `GET /repos/{o}/{r}/commits/{sha}/check-runs` is governed by the Checks
@@ -231,8 +251,29 @@ jobs:
           INTERVAL: ${{ inputs.interval-seconds }}
           NUDGE_ATTEMPTS: ${{ inputs.nudge-attempts }}
           CONFIRM: ${{ inputs.confirm-seconds }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
         run: |
           set -euo pipefail
+
+          # Everything below waits, and GitHub cancels the job at
+          # `timeout-minutes` without running the final probe or the warning —
+          # so a widened `confirm-seconds` would turn a supported configuration
+          # into a red run, with no output saying why. Sleep against a deadline
+          # instead: the ladder then degrades to a shorter last wait, which is
+          # a worse answer than the operator asked for but still an answer.
+          # The 45s reserve covers job setup before this line plus the `gh`
+          # calls after the last sleep.
+          deadline=$(( $(date -u +%s) + TIMEOUT_MINUTES * 60 - 45 ))
+          bounded_sleep() { # <seconds>
+            local left=$(( deadline - $(date -u +%s) ))
+            [ "$left" -gt 0 ] || return 0
+            [ "$1" -le "$left" ] || {
+              echo "::warning::waiting ${left}s instead of $1s — the configured ladder does not fit in timeout-minutes=$TIMEOUT_MINUTES; raise it"
+              sleep "$left"
+              return 0
+            }
+            sleep "$1"
+          }
 
           # A caller wired to something other than a pull-request CI run. There
           # is no queue entry to be behind on, so there is nothing to refresh.
@@ -289,7 +330,7 @@ jobs:
             [ "$(date -u -d "$newest" +%s)" -ge "$ci_ended" ]
           }
 
-          sleep "$GRACE"
+          bounded_sleep "$GRACE"
 
           attempt=1
           while true; do
@@ -299,7 +340,7 @@ jobs:
             fi
             [ "$attempt" -lt "$ATTEMPTS" ] || break
             attempt=$((attempt + 1))
-            sleep "$INTERVAL"
+            bounded_sleep "$INTERVAL"
           done
 
           # Mergify is behind. The command has to START the comment, with a
@@ -354,7 +395,7 @@ jobs:
           while true; do
             post_nudge "$nudge"
             [ "$nudge" -lt "$NUDGE_ATTEMPTS" ] || break
-            sleep "$CONFIRM"
+            bounded_sleep "$CONFIRM"
             if mergify_seen_it; then
               echo "::notice::Mergify answered nudge $nudge — re-evaluated $HEAD_SHA"
               exit 0
@@ -368,7 +409,7 @@ jobs:
           # on #372 Mergify's reply landed in the same second as this line and
           # the job still told the operator to go audit their webhook deliveries.
           # The warning below is only true if it survives one more wait.
-          sleep "$CONFIRM"
+          bounded_sleep "$CONFIRM"
           if mergify_seen_it; then
             echo "::notice::Mergify answered nudge $NUDGE_ATTEMPTS — re-evaluated $HEAD_SHA"
             exit 0
