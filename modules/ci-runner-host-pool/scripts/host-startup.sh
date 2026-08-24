@@ -4748,7 +4748,7 @@ install_slot() {
   # not root's to remove. The slot is left without a clean marker, and a slot
   # with no marker fails every job that follows, forever. `mkdir -p` here is
   # exactly the appearance that triggers it, and the window is open on every warm
-  # reboot: the agent that runs the reset is already up (see slot_unit_is_active).
+  # reboot: the agent that runs the reset is already up (see slot_unit_preexists).
   #
   # Nor is there anything to heal in that case. The agent was configured with
   # this `--work` and has been using it; `_work` MISSING on a warm host means the
