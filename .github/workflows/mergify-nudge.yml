@@ -175,20 +175,6 @@ on:
         required: false
         default: 60
         type: number
-      timeout-minutes:
-        description: >-
-          The job timeout, which must cover the whole ladder —
-          `grace-seconds + (attempts - 1) * interval-seconds +
-          nudge-attempts * confirm-seconds` — plus setup. Raise this whenever
-          you widen the waits: a job cancelled by its timeout loses the final
-          probe and the warning, and reds a run over a configuration this
-          workflow accepts. The shell also clamps its own sleeps to this
-          budget, so overrunning degrades to a shorter last wait rather than a
-          cancellation, but that clamp is a backstop and not a licence to skip
-          raising it. 10 is roughly three times the default ladder's 185s.
-        required: false
-        default: 10
-        type: number
 
 permissions:
   contents: read
@@ -203,15 +189,24 @@ jobs:
     # spending a warm pool slot on it would take a slot from a real job for
     # minutes at a time while it waits.
     runs-on: ubuntu-latest
-    # The wait is bounded by the inputs, so the timeout must be too — a fixed
-    # ceiling is a second, invisible bound that a consumer widening the inputs
-    # has no way to see. At `confirm-seconds: 240` the ladder needs ~12 minutes
-    # and a hard 10 would have GitHub cancel the job mid-wait, losing the final
-    # probe and the warning: the run goes red on a configuration this workflow
-    # accepts and documents. It stays an input rather than an expression over
-    # the others so it is an integer the runner can take verbatim, and the
-    # shell bounds its own sleeps against it.
-    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # 10 was too tight to be a backstop: every wait below is an input, and at
+    # `confirm-seconds: 240` the ladder needs ~12 minutes, so GitHub would
+    # cancel the job mid-wait and lose the final probe AND the warning — a red
+    # run on a configuration this workflow accepts and documents.
+    #
+    # Deriving it from the inputs was the first attempt and RUNNER6 rejected
+    # it, correctly: `${{ inputs.timeout-minutes }}` is a number the gate
+    # cannot resolve, so it cannot rule out an expression landing on 360, and a
+    # bound nobody can evaluate is not a bound. So it is a literal, chosen
+    # against the thing that actually caps the ladder — the queue's 30-minute
+    # `checks_timeout`, past which a nudge describes a pull request Mergify has
+    # stopped tracking. Anything needing more than 20 minutes here is
+    # misconfigured, not merely slow.
+    #
+    # `JOB_TIMEOUT_MINUTES` below MUST equal this, and the self-test asserts it
+    # does: the shell clamps its own sleeps to this budget, so the two drifting
+    # apart means either the clamp fires early or it never fires at all.
+    timeout-minutes: 20
     permissions:
       contents: read
       # `GET /repos/{o}/{r}/commits/{sha}/check-runs` is governed by the Checks
@@ -251,7 +246,10 @@ jobs:
           INTERVAL: ${{ inputs.interval-seconds }}
           NUDGE_ATTEMPTS: ${{ inputs.nudge-attempts }}
           CONFIRM: ${{ inputs.confirm-seconds }}
-          TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+          # Must equal the job's `timeout-minutes:` above; the self-test
+          # asserts it, because the clamp below is derived from this value and
+          # the cancellation it exists to prevent is driven by that one.
+          JOB_TIMEOUT_MINUTES: 20
         run: |
           set -euo pipefail
 
@@ -263,12 +261,12 @@ jobs:
           # a worse answer than the operator asked for but still an answer.
           # The 45s reserve covers job setup before this line plus the `gh`
           # calls after the last sleep.
-          deadline=$(( $(date -u +%s) + TIMEOUT_MINUTES * 60 - 45 ))
+          deadline=$(( $(date -u +%s) + JOB_TIMEOUT_MINUTES * 60 - 45 ))
           bounded_sleep() { # <seconds>
             local left=$(( deadline - $(date -u +%s) ))
             [ "$left" -gt 0 ] || return 0
             [ "$1" -le "$left" ] || {
-              echo "::warning::waiting ${left}s instead of $1s — the configured ladder does not fit in timeout-minutes=$TIMEOUT_MINUTES; raise it"
+              echo "::warning::waiting ${left}s instead of $1s — the configured ladder does not fit in the job's ${JOB_TIMEOUT_MINUTES}-minute timeout; narrow the waits, and note the queue's checks_timeout caps this anyway"
               sleep "$left"
               return 0
             }

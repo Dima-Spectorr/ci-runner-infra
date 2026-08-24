@@ -246,17 +246,24 @@ keeps_expressions_out_of_the_shell() {
 }
 
 # The job sleeps by design, so an unbounded one is a job that can sleep for six
-# hours against the account's concurrency. But a LITERAL bound is its own bug:
-# the waits are inputs, and a fixed ceiling is a second limit the consumer who
-# widens them cannot see. At `confirm-seconds: 240` the ladder needs ~12
-# minutes, and a hard 10 has GitHub cancel the job mid-wait — no final probe,
-# no warning, a red run on a configuration this workflow documents as
-# supported. So the bound must come from an input, and the shell must clamp its
-# own sleeps to it.
+# hours against the account's concurrency. But the bound has to be big enough
+# to cover the waits it sits over: every one of them is an input, and at
+# `confirm-seconds: 240` the ladder needs ~12 minutes, so a hard 10 had GitHub
+# cancel the job mid-wait — no final probe, no warning, a red run on a
+# configuration this workflow documents as supported.
+#
+# Deriving it from the inputs is not available: RUNNER6 refuses a
+# `timeout-minutes` it cannot resolve to a number, on the grounds that a bound
+# nobody can evaluate is not a bound. So it is a literal, and the safety comes
+# from the shell clamping its own sleeps to the SAME number — which is only
+# true while the two stay equal, and they are in different halves of the file.
 is_bounded() {
   local code; code=$(code_of "$1")
-  matches "$code" '^    timeout-minutes: \$\{\{ inputs\.timeout-minutes \}\}$' || return 1
-  matches "$code" 'deadline=\$\(\( \$\(date -u \+%s\) \+ TIMEOUT_MINUTES \* 60' || return 1
+  local job env
+  job=$(printf '%s\n' "$code" | sed -n 's|^    timeout-minutes: \([0-9]\+\)$|\1|p')
+  env=$(printf '%s\n' "$code" | sed -n 's|^          JOB_TIMEOUT_MINUTES: \([0-9]\+\)$|\1|p')
+  [ -n "$job" ] && [ "$job" = "$env" ] || return 1
+  matches "$code" 'deadline=\$\(\( \$\(date -u \+%s\) \+ JOB_TIMEOUT_MINUTES \* 60' || return 1
   matches "$code" '^          bounded_sleep\(\) \{' || return 1
   # Every wait goes through the clamp, or the one that does not is the one that
   # runs past the timeout.
@@ -444,7 +451,7 @@ mutate "an expression is spliced into the shell" "$CALLEE" \
   's|\$RUN_URL|${{ github.event.workflow_run.html_url }}|'            keeps_expressions_out_of_the_shell
 mutate "the timeout is removed" "$CALLEE" \
   's|^    timeout-minutes: .*$|    # unbounded|'                      is_bounded
-mutate "the timeout goes back to a literal the inputs can outgrow" "$CALLEE" \
+mutate "the job timeout and the clamp drift apart" "$CALLEE" \
   's|^    timeout-minutes: .*$|    timeout-minutes: 10|'              is_bounded
 mutate "a wait escapes the clamp and can outlast the timeout" "$CALLEE" \
   's|^          bounded_sleep "\$GRACE"$|          sleep "\$GRACE"|'   is_bounded

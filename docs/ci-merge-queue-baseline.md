@@ -1527,13 +1527,15 @@ The step log shows the `gh api` 403 above the notice.
   defaults that total is 185s against a 30-minute timeout. Note the term is
   `nudge-attempts`, not `nudge-attempts - 1`: the last post gets a confirmation
   window too, so that it can be answered rather than warned about.
-- **Raise `timeout-minutes` whenever you widen the waits.** It is an input for
-  exactly this reason: a fixed ceiling is a second bound that the consumer
-  tuning the ladder cannot see, and a job cancelled by its timeout loses the
-  final probe and the warning — a red run on a configuration the workflow
-  accepts. The shell clamps its own sleeps to the budget and says so in a
-  `::warning::`, so overrunning degrades to a shorter last wait instead of a
-  cancellation; that is a backstop, not permission to leave it at 10.
+- **Do not widen the waits past the job's 20-minute timeout.** A job cancelled
+  by its timeout loses the final probe *and* the warning — a red run on a
+  configuration the workflow otherwise accepts. The callee clamps its own
+  sleeps to that budget and emits a `::warning::` naming it, so overrunning
+  degrades to a shorter last wait rather than a cancellation; treat that
+  warning as a configuration error, not as the mechanism working. The timeout
+  is a literal rather than an input because RUNNER6 refuses a
+  `timeout-minutes` it cannot resolve to a number, and 20 is set against the
+  queue's 30-minute `checks_timeout`, which caps the useful ladder anyway.
 - **Do not restore `grace-seconds` as a safety margin.** It reads like one and
   is not: it has been measured over eleven runs catching Mergify self-reacting
   zero times, and it delays every run to save a comment on none of them. The
