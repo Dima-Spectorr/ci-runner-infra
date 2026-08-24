@@ -291,9 +291,17 @@ Three answers are accepted, the same three shapes `RUNNER9` takes:
 
 - resolve the pool from the routing job's output —
   `runs-on: ${{ fromJSON(needs.<lane>.outputs.runner) }}`;
-- be a job the queue drafts cannot reach, proven by an `if:` that excludes
-  `mergify/merge-queue/` heads — a job that never runs during queue validation
-  never competes for a pool during it;
+- be a job the queue drafts cannot reach — a job that never runs during queue
+  validation never competes for a pool during it. Two spellings prove it, and
+  they are the same statement from opposite sides: an `if:` that excludes
+  `mergify/merge-queue/` heads, or an `if:` pinning the job to an event a draft
+  never arrives as. A queue draft is a real pull request Mergify opened in the
+  repository, so GitHub delivers it as `pull_request` — or `pull_request_target`
+  — and as nothing else; `if: github.event_name == 'push'` therefore rules it
+  out as conclusively as negating the branch prefix does. Equality against a
+  literal event name only: `!=` and `contains(...)` leave the answer depending
+  on the rest of the condition, and an over-eager reading here excuses the job
+  the rule is about;
 - declare `# merge-queue-route-exempt(<job>, #<issue>): <reason>` beside it.
 
 The exemption exists because one case is real and cannot be fixed by editing the
