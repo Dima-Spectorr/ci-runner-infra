@@ -455,40 +455,429 @@ Describe 'broker service definition' {
     }
 }
 
-# --- phase 4, the per-job credential reset hooks -------------------------------
+# --- phase 4, the per-job slot reset -------------------------------------------
 
-Describe 'credential reset hook body' {
-    BeforeAll { $script:Hook = Get-JobHookScript }
+# The request's slot is the DIRECTORY it appeared in. Nothing reads a request's
+# contents, because on Windows there is no SUDO_UID to authenticate them with:
+# `<state>\<i>\request` is writable by ci-s<i> alone, and that ACL is the whole
+# authentication. A path parser that can be talked into the wrong index gives it
+# away, so the parser is where the tests are.
+Describe 'reset request path parsing' {
+    It 'takes the index from the directory two levels up' {
+        Get-RequestSlotIndex -Path 'C:\ci\state\3\request\started' | Should -Be '3'
+        Get-RequestSlotIndex -Path 'C:\ci\state\0\request\completed' | Should -Be '0'
+        Get-RequestSlotIndex -Path 'C:/ci/state/11/request/started' | Should -Be '11'
+    }
 
-    # The hook runs inside the agent's environment. %USERPROFILE% and %APPDATA%
-    # are values a job could have changed, so what gets deleted would be the
-    # job's decision rather than the host's. The account database is not.
-    It 'resolves the profile from the account database, not the environment' {
-        $script:Hook | Should -Match 'ProfileList'
-        $script:Hook | Should -Match 'ProfileImagePath'
-        $code = ($script:Hook -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
-        $code | Should -Not -Match '\$env:USERPROFILE'
-        $code | Should -Not -Match '\$env:APPDATA'
+    # Two spellings of one slot is two slots as far as anything keyed on the
+    # string is concerned, and only one of them has an ACL.
+    It 'refuses a leading zero rather than accepting a second name for a slot' {
+        Get-RequestSlotIndex -Path 'C:\ci\state\01\request\started' | Should -Be ''
+    }
+
+    It 'refuses anything that is not directly under a request directory' {
+        Get-RequestSlotIndex -Path 'C:\ci\state\1\other\started' | Should -Be ''
+        Get-RequestSlotIndex -Path 'C:\ci\state\1\request\sub\started' | Should -Be ''
+        Get-RequestSlotIndex -Path 'C:\ci\state\1\Request\started' | Should -Be ''
+        Get-RequestSlotIndex -Path 'started' | Should -Be ''
+        Get-RequestSlotIndex -Path '' | Should -Be ''
+    }
+
+    # `..` never becomes an index, so a traversal cannot arrive as a slot number.
+    It 'refuses a traversal' {
+        Get-RequestSlotIndex -Path 'C:\ci\state\..\request\started' | Should -Be ''
+        Get-RequestSlotIndex -Path 'C:\ci\state\-1\request\started' | Should -Be ''
+    }
+
+    It 'names the two requests there are, case-sensitively' {
+        Test-ResetRequestName -Name 'started' | Should -BeTrue
+        Test-ResetRequestName -Name 'completed' | Should -BeTrue
+        Test-ResetRequestName -Name 'Started' | Should -BeFalse
+        Test-ResetRequestName -Name 'reset' | Should -BeFalse
+        Test-ResetRequestName -Name '' | Should -BeFalse
+    }
+}
+
+# Every loose spelling of this comparison is a way of saying yes to a reset that
+# did not happen: the job runs on the last job's profile and nothing reports it.
+Describe 'reset verdict reading' {
+    It 'accepts exactly clean, surrounding whitespace aside' {
+        Test-ResetVerdictClean -Text 'clean' | Should -BeTrue
+        Test-ResetVerdictClean -Text "  clean `r`n" | Should -BeTrue
+    }
+
+    It 'rejects every near miss' {
+        Test-ResetVerdictClean -Text 'Clean' | Should -BeFalse
+        Test-ResetVerdictClean -Text 'clean-failed' | Should -BeFalse
+        Test-ResetVerdictClean -Text 'dirty' | Should -BeFalse
+        Test-ResetVerdictClean -Text '' | Should -BeFalse
+        Test-ResetVerdictClean -Text "   " | Should -BeFalse
+        Test-ResetVerdictClean -Text $null | Should -BeFalse
+    }
+}
+
+# The old hook checked `^ci-s[0-9]+$`, which was as much as it could: it ran as
+# the slot, so the only profile it could reach was its own. The reset service
+# runs as SYSTEM and can reach all of them, so the check is now to THIS slot.
+Describe 'slot profile directory guard' {
+    It 'accepts the profile of the slot being reset' {
+        Test-SlotProfileDirectory -Path 'C:\Users\ci-s2' -Index 2 | Should -BeTrue
+    }
+
+    It 'refuses a neighbour that merely starts the same way' {
+        Test-SlotProfileDirectory -Path 'C:\Users\ci-s20' -Index 2 | Should -BeFalse
+        Test-SlotProfileDirectory -Path 'C:\Users\ci-s2.DOMAIN' -Index 2 | Should -BeFalse
+        Test-SlotProfileDirectory -Path 'C:\Users\ci-s1' -Index 2 | Should -BeFalse
     }
 
     # A resolution that somehow yields C:\Users\Administrator must abort, not
-    # recurse. This is the difference between a cleanup and an incident.
-    It 'refuses a profile that is not a slot profile' {
-        $script:Hook | Should -Match "notmatch '\^ci-s\[0-9\]\+\`$'"
-        $script:Hook | Should -Match 'exit 1'
+    # mirror over it. This is the difference between a reset and an incident.
+    It 'refuses a profile that is nobody''s slot' {
+        Test-SlotProfileDirectory -Path 'C:\Users\Administrator' -Index 2 | Should -BeFalse
+        Test-SlotProfileDirectory -Path 'C:\Users' -Index 2 | Should -BeFalse
+        Test-SlotProfileDirectory -Path '' -Index 2 | Should -BeFalse
+    }
+}
+
+# Over-killing is an outage and under-killing certifies a slot a writer is still
+# holding, so both directions are asserted.
+Describe 'quiesce victim selection' {
+    It 'kills a process whose token is exactly this slot' {
+        Test-SlotProcessKillable -OwnerSid 'S-1-5-21-1-2-3-1001' `
+            -SlotSid 'S-1-5-21-1-2-3-1001' -ProcessId 900 | Should -BeTrue
     }
 
-    It 'removes the credential state a previous job could have left' {
-        $script:Hook | Should -Match 'AppData\\Roaming\\gcloud'
-        $script:Hook | Should -Match 'AppData\\Roaming\\gsutil'
-        $script:Hook | Should -Match 'Remove-Item -LiteralPath \$target -Recurse -Force'
+    It 'spares everything the slot does not own' {
+        Test-SlotProcessKillable -OwnerSid 'S-1-5-18' `
+            -SlotSid 'S-1-5-21-1-2-3-1001' -ProcessId 900 | Should -BeFalse
+        Test-SlotProcessKillable -OwnerSid 'S-1-5-21-1-2-3-10011' `
+            -SlotSid 'S-1-5-21-1-2-3-1001' -ProcessId 900 | Should -BeFalse
+    }
+
+    # An owner the CIM call could not answer for is not evidence of ownership,
+    # and a reset that guesses here kills a process it cannot name.
+    It 'spares a process whose owner could not be read' {
+        Test-SlotProcessKillable -OwnerSid '' `
+            -SlotSid 'S-1-5-21-1-2-3-1001' -ProcessId 900 | Should -BeFalse
+        Test-SlotProcessKillable -OwnerSid $null `
+            -SlotSid 'S-1-5-21-1-2-3-1001' -ProcessId 900 | Should -BeFalse
+    }
+
+    # 0 and 4 are Idle and System. Neither can be owned by a slot, and a Stop
+    # aimed at either is a bug worth refusing before it is attempted.
+    It 'never aims at the system pseudo-processes' {
+        Test-SlotProcessKillable -OwnerSid 'S-1-5-21-1-2-3-1001' `
+            -SlotSid 'S-1-5-21-1-2-3-1001' -ProcessId 4 | Should -BeFalse
+        Test-SlotProcessKillable -OwnerSid 'S-1-5-21-1-2-3-1001' `
+            -SlotSid 'S-1-5-21-1-2-3-1001' -ProcessId 0 | Should -BeFalse
+    }
+
+    It 'spares the caller itself' {
+        Test-SlotProcessKillable -OwnerSid 'S-1-5-21-1-2-3-1001' `
+            -SlotSid 'S-1-5-21-1-2-3-1001' -ProcessId 900 `
+            -SpareProcessId @(900, 901) | Should -BeFalse
+    }
+}
+
+Describe 'slot state paths' {
+    # A POSIX root, and expectations built with Join-Path rather than written as
+    # literals -- the same convention Get-SlotCachePath's cases use, and for the
+    # reason those builders document: this suite runs on ubuntu-latest, where
+    # `Join-Path 'C:\ci\state' 1` does not build a string, it throws
+    # DriveNotFoundException. The real roots are asserted where they are defined.
+    BeforeAll {
+        $script:StateFixture = '/tmp/ci-state'
+        $script:TemplateFixture = '/tmp/ci-profile-template'
+    }
+
+    It 'keeps every slot''s state under its own index' {
+        $one = Join-Path $script:StateFixture '1'
+        Get-SlotStatePath -Index 1 -StateRoot $script:StateFixture | Should -Be $one
+        Get-SlotRequestPath -Index 1 -StateRoot $script:StateFixture | Should -Be (Join-Path $one 'request')
+        Get-SlotMarkerPath -Index 1 -StateRoot $script:StateFixture | Should -Be (Join-Path $one 'clean')
+        Get-SlotVerdictPath -Index 1 -StateRoot $script:StateFixture | Should -Be (Join-Path $one 'verdict')
+        Get-SlotRunnerServicePath -Index 1 -StateRoot $script:StateFixture | Should -Be (Join-Path $one 'service')
+    }
+
+    # The request directory is the ONLY path a slot may write, and it is one
+    # level below the state directory rather than beside it, so granting write on
+    # it cannot reach the marker or the verdict that gate the same slot.
+    It 'puts the writable directory below the state the slot must not touch' {
+        $state = Get-SlotStatePath -Index 4 -StateRoot $script:StateFixture
+        $request = Get-SlotRequestPath -Index 4 -StateRoot $script:StateFixture
+        $request | Should -Be (Join-Path $state 'request')
+        (Get-SlotMarkerPath -Index 4 -StateRoot $script:StateFixture).StartsWith($request) | Should -BeFalse
+        (Get-SlotVerdictPath -Index 4 -StateRoot $script:StateFixture).StartsWith($request) | Should -BeFalse
+    }
+
+    It 'gives each slot its own profile template' {
+        Get-SlotProfileTemplatePath -Index 0 -Root $script:TemplateFixture |
+            Should -Be (Join-Path $script:TemplateFixture 'ci-s0')
+        Get-SlotProfileTemplatePath -Index 3 -Root $script:TemplateFixture |
+            Should -Be (Join-Path $script:TemplateFixture 'ci-s3')
+    }
+}
+
+Describe 'job hook bodies' {
+    BeforeAll {
+        $script:Started = Get-JobHookScript -Phase Started
+        $script:Completed = Get-JobHookScript -Phase Completed
+    }
+
+    # The hook runs inside the agent's environment. %USERPROFILE% and %USERNAME%
+    # are values a job could have changed, so which slot got reset would be the
+    # job's decision rather than the host's. The identity token is not.
+    It 'takes the slot from the identity, not the environment' {
+        foreach ($hook in @($script:Started, $script:Completed)) {
+            $hook | Should -Match 'WindowsIdentity\]::GetCurrent\(\)'
+            $code = ($hook -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+            $code | Should -Not -Match '\$env:USERPROFILE'
+            $code | Should -Not -Match '\$env:USERNAME'
+        }
+    }
+
+    # `-notmatch` fills $Matches whenever the regex matched, so a capture read
+    # from the failing branch of one keeps working right up until somebody
+    # reorders the branches. The match that feeds $index is positive.
+    It 'reads the slot index from a match that succeeded' {
+        $script:Started | Should -Match "if \(\`$leaf -match '\^ci-s\(\[0-9\]\+\)\`$'\) \{"
+        $script:Started | Should -Match '\$index = \$Matches\[1\]'
+    }
+
+    It 'refuses to act as anything that is not a slot account' {
+        foreach ($hook in @($script:Started, $script:Completed)) {
+            $hook | Should -Match 'not a slot account'
+            $hook | Should -Match 'exit 1'
+        }
+    }
+
+    # The hooks ASK. A hook that deleted anything would be doing it as the slot,
+    # inside the job, against a profile whose hive is loaded -- which is the
+    # thing the old hook could not do and why #232 moved the work to SYSTEM.
+    It 'deletes nothing itself' {
+        foreach ($hook in @($script:Started, $script:Completed)) {
+            $hook | Should -Not -Match 'Remove-Item'
+            $hook | Should -Not -Match 'robocopy'
+        }
+    }
+
+    It 'writes each end''s request into its own slot''s request directory' {
+        $script:Started | Should -Match "Join-Path \(Join-Path \`$state 'request'\) 'started'"
+        $script:Completed | Should -Match "Join-Path \(Join-Path \`$state 'request'\) 'completed'"
+    }
+
+    # THE ASSERTION THE STARTED HOOK EXISTS FOR. No verdict, or any verdict other
+    # than clean, and the job does not run. A slot whose predecessor died left no
+    # marker, so this is also what stops the NEXT job inheriting that profile.
+    It 'fails the job unless the verdict is clean' {
+        $script:Started | Should -Match "if \(\`$text\.Trim\(\) -ceq 'clean'\) \{ exit 0 \}"
+        $script:Started | Should -Match 'refusing to run on an unproved slot'
+        $script:Started | Should -Match 'exit 1'
+    }
+
+    # A verdict older than the request is the previous job's, sitting on disk
+    # since before this one asked. Accepting it is accepting a stale yes.
+    It 'accepts only a verdict newer than its own request' {
+        $script:Started | Should -Match '\$asked = \(Get-Item -LiteralPath \$request\)\.LastWriteTimeUtc'
+        $script:Started | Should -Match '\$item\.LastWriteTimeUtc -ge \$asked'
+    }
+
+    It 'gives up rather than waiting forever' {
+        $hook = Get-JobHookScript -Phase Started -WaitSeconds 300 -PollSeconds 2
+        $hook | Should -Match '\$deadline = \(Get-Date\)\.AddSeconds\(300\)'
+        $hook | Should -Match 'Start-Sleep -Seconds 2'
+    }
+
+    # It must NOT wait: the reset it asks for stops the service it is running
+    # under, so waiting for the answer is waiting to be killed.
+    It 'returns immediately at the completed end' {
+        $script:Completed | Should -Not -Match 'while \(\$true\)'
+        $script:Completed | Should -Not -Match 'verdict'
+        $script:Completed | Should -Match 'exit 0'
     }
 
     # A hook whose meaning a job's own preference variables could change is not a
     # control. It sets its own.
     It 'sets its own error handling rather than inheriting the agent''s' {
-        $script:Hook | Should -Match 'Set-StrictMode -Version Latest'
-        $script:Hook | Should -Match "\`$ErrorActionPreference = 'Stop'"
+        foreach ($hook in @($script:Started, $script:Completed)) {
+            $hook | Should -Match 'Set-StrictMode -Version Latest'
+            $hook | Should -Match "\`$ErrorActionPreference = 'Stop'"
+        }
+    }
+
+    It 'leaves no placeholder unsubstituted' {
+        foreach ($hook in @($script:Started, $script:Completed)) {
+            $hook | Should -Not -Match '@[A-Z_]+@'
+        }
+    }
+}
+
+Describe 'slot reset service body' {
+    BeforeAll { $script:Reset = Get-SlotResetScript -StateRoot 'C:\ci\state' -TemplateRoot 'C:\ci\profile-template' }
+
+    # The marker is deleted at the START of the reset rather than written at the
+    # end of it, so a reset that dies halfway leaves a slot that fails its next
+    # gate instead of one still vouched for by the marker its last reset wrote.
+    It 'drops the marker before it touches anything' {
+        $body = ($script:Reset -split 'function Invoke-SlotReset')[1]
+        $drop = $body.IndexOf('Remove-Item -LiteralPath $marker')
+        $copy = $body.IndexOf('Copy-ProfileTree')
+        $drop | Should -BeGreaterThan -1
+        $copy | Should -BeGreaterThan $drop
+    }
+
+    # Deliberately not the ADR's order. Starting the agent first opens a window in
+    # which it is dispatchable and its marker does not exist yet, failing a job
+    # over a reset that in fact worked.
+    It 'writes the marker before it starts the agent back up' {
+        $body = ($script:Reset -split 'function Invoke-SlotReset')[1]
+        $mark = $body.IndexOf("Write-Atomic -Path `$marker -Text 'clean'")
+        $start = $body.IndexOf('Start-Service')
+        $mark | Should -BeGreaterThan -1
+        $start | Should -BeGreaterThan $mark
+    }
+
+    # Every one of these withholds the marker. There is no path that resets
+    # nothing and says clean anyway.
+    It 'returns without a marker on every failure it can name' {
+        $script:Reset | Should -Match 'has no profile template'
+        $script:Reset | Should -Match 'has no recorded runner service'
+        $script:Reset | Should -Match 'recorded an unusable runner service name'
+        $script:Reset | Should -Match 'which is not its profile -- refusing'
+        $script:Reset | Should -Match 'still has a process running as'
+        $script:Reset | Should -Match 'the profile hive did not unload'
+        $script:Reset | Should -Match 'could not restore'
+    }
+
+    # Phase 5 validated this name into a directory no slot can write, and it is
+    # re-validated here anyway: it reaches Stop-Service as SYSTEM, and one check
+    # in another phase is not a property of this one.
+    It 'revalidates the runner service name it is about to stop' {
+        $script:Reset | Should -Match "\^actions\\\.runner\\\.\[A-Za-z0-9\._-\]\+\`$"
+    }
+
+    # A live profile cannot be replaced: NTUSER.DAT is held for as long as any
+    # process runs as the account, so all three come before the copy.
+    It 'stops, quiesces and waits for the hive before it copies' {
+        $body = ($script:Reset -split 'function Invoke-SlotReset')[1]
+        $stop = $body.IndexOf('Stop-Service')
+        $quiesce = $body.IndexOf('Invoke-SlotQuiesce')
+        $hive = $body.IndexOf('Wait-HiveUnloaded')
+        $copy = $body.IndexOf('Copy-ProfileTree')
+        $quiesce | Should -BeGreaterThan $stop
+        $hive | Should -BeGreaterThan $quiesce
+        $copy | Should -BeGreaterThan $hive
+    }
+
+    # /MIR because the claim is that nothing of the last job survives and a copy
+    # that only adds keeps whatever was added; /XJ so a junction a job planted is
+    # replaced rather than followed out of the profile.
+    It 'mirrors the template rather than merging into the profile' {
+        $script:Reset | Should -Match "\`$Source, \`$Destination, '/MIR', '/XJ'"
+    }
+
+    # A killed robocopy exits with an NTSTATUS as a NEGATIVE integer, and a bare
+    # `-lt 8` reads every one of those as a successful mirror.
+    It 'treats a negative robocopy exit as a failure' {
+        $script:Reset | Should -Match '\$code -ge 0 -and \$code -lt 8'
+    }
+
+    # The payload serves every slot from ONE poll loop, so a mirror that never
+    # returns is not one slow reset -- it is every later slot failing its gate on
+    # a verdict the loop never gets to write. The call operator has nothing to ask
+    # once the child is running, which is why this is Start-Process and a kill.
+    It 'bounds the mirror and acts on the deadline' {
+        $script:Reset | Should -Match "Start-Process -FilePath 'robocopy\.exe' -PassThru"
+        $script:Reset | Should -Match '\$proc\.WaitForExit\(\$TimeoutSeconds \* 1000\)'
+        $script:Reset | Should -Match '\$proc\.Kill\(\)'
+        $script:Reset | Should -Not -Match '& robocopy'
+    }
+
+    # ...and substituted with the RESTORE budget, not the capture's. One serial
+    # loop serves every slot, so this bound is how long another slot's gate waits
+    # behind this one -- at the capture's 600 s it would outlast the hook's own
+    # wait and fail a job on a slot that is perfectly clean.
+    It 'leaves the copy timeout substituted with the restore budget' {
+        $script:Reset | Should -Match '\$TimeoutSeconds = 120'
+        $script:Reset | Should -Not -Match '\$TimeoutSeconds = 600'
+    }
+
+    # The gate consumes the marker. A marker that survived its own gate would
+    # certify the job after this one as well, on a slot nothing reset in between.
+    It 'consumes the marker it reports on' {
+        $gate = ($script:Reset -split 'function Invoke-SlotGate')[1]
+        $gate | Should -Match 'Remove-Item -LiteralPath \$marker -Force'
+        $gate | Should -Match "\`$answer = 'dirty'"
+    }
+
+    # Verdicts are read by another process while they are being written, and a
+    # partial read of `clean` is `cle` -- which reads as dirty and fails a job
+    # whose slot was fine.
+    It 'publishes the verdict atomically' {
+        $script:Reset | Should -Match 'Move-Item -LiteralPath \$tmp -Destination \$Path -Force'
+        $gate = ($script:Reset -split 'function Invoke-SlotGate')[1]
+        $gate | Should -Match 'Write-Atomic -Path \$verdict'
+    }
+
+    # A request deleted only after it succeeded is a request that is served again
+    # every poll while it keeps failing. Deleting first makes a stuck reset fail
+    # the slot's next gate, which is the outcome it is supposed to have.
+    It 'deletes a request before it acts on it' {
+        $loop = ($script:Reset -split 'while \(\$true\) \{')[-1]
+        $del = $loop.IndexOf('Remove-Item -LiteralPath $request.FullName')
+        $act = $loop.IndexOf('Invoke-SlotGate -Index')
+        $del | Should -BeGreaterThan -1
+        $act | Should -BeGreaterThan $del
+    }
+
+    # A service that exits here is a host on which every later job fails its
+    # gate, and the shim would restart it into the request it just deleted.
+    It 'never lets one slot''s failure stop the loop' {
+        $script:Reset | Should -Match 'Write-ResetLog "slot \$index ''\$name'' failed'
+    }
+
+    # A slot may create entries in its own request directory and nowhere else.
+    # Depth 2 plus a check on the PARENT's name means a directory it creates in
+    # there puts the contents at depth 3, where this loop cannot see them.
+    It 'looks only where a request can legitimately appear' {
+        $script:Reset | Should -Match '-Recurse -Depth 2'
+        $script:Reset | Should -Match "\`$_\.Directory\.Name -ceq 'request'"
+    }
+
+    It 'reads nothing out of the request file' {
+        $script:Reset | Should -Not -Match 'Get-Content[^\n]*\$request'
+    }
+
+    It 'leaves no placeholder unsubstituted' {
+        $script:Reset | Should -Not -Match '@[A-Z_]+@'
+        $script:Reset | Should -Match '\$StateRoot = ''C:\\ci\\state'''
+    }
+}
+
+Describe 'slot reset service config' {
+    BeforeAll { $script:ResetXml = Get-SlotResetServiceConfig -ScriptPath 'C:\ci\slot-reset\ci-slot-reset.ps1' }
+
+    # It must be running before the first job asks, and it must come back if it
+    # dies: a host whose reset service is dead fails every gate on it.
+    It 'starts itself at boot and restarts itself when it dies' {
+        $script:ResetXml | Should -Match '<startmode>Automatic</startmode>'
+        ([regex]::Matches($script:ResetXml, '<onfailure action="restart"')).Count | Should -Be 3
+    }
+
+    # LocalSystem is the whole point: replacing a profile requires a principal the
+    # slot cannot be, and a reset running as a slot could not stop the service it
+    # runs under either. LocalSystem is the shim's default, so what this asserts
+    # is that no <serviceaccount> element was added to move it off one -- and, in
+    # particular, that no slot is named anywhere in the document.
+    It 'runs as LocalSystem rather than as any slot' {
+        $script:ResetXml | Should -Not -Match '<serviceaccount>'
+        $script:ResetXml | Should -Not -Match 'ci-s[0-9]'
+    }
+
+    It 'names the script it supervises' {
+        $script:ResetXml | Should -Match 'ci-slot-reset\.ps1'
+        $script:ResetXml | Should -Match '<id>ci-slot-reset</id>'
+        $script:ResetXml | Should -Match '<name>ci-slot-reset</name>'
     }
 }
 
@@ -504,8 +893,8 @@ Describe 'slot service environment' {
     # fence that gives Linux that property for free.
     It 'sets both hooks when there is no broker at all' {
         $block = Get-SlotServiceEnvironment -Index 1 -BrokerEndpoint '' -SlotRoot '/ci/slots'
-        $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookPath
-        $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookPath
+        $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookStartedPath
+        $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookCompletedPath
         $block['GCE_METADATA_HOST'] | Should -Be $script:ClosedMetadataEndpoint
         $block['GCE_METADATA_IP'] | Should -Be $script:ClosedMetadataEndpoint
         $block['GCE_METADATA_ROOT'] | Should -Be $script:ClosedMetadataEndpoint
@@ -513,8 +902,8 @@ Describe 'slot service environment' {
 
     It 'sets both hooks when there is one' {
         $block = Get-SlotServiceEnvironment -Index 1 -BrokerEndpoint '127.0.0.1:8081' -SlotRoot '/ci/slots'
-        $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookPath
-        $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookPath
+        $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookStartedPath
+        $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookCompletedPath
     }
 
     # All three, or the client libraries disagree about where the metadata server
@@ -1937,13 +2326,13 @@ Describe 'cache variables on the service environment' {
         # ADC back to the real metadata server and the HOST service account.
         $block = Get-SlotServiceEnvironment -Index 1 -SlotRoot '/ci/slots'
         $block['GCE_METADATA_HOST'] | Should -Be $script:ClosedMetadataEndpoint
-        $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookPath
+        $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] | Should -Be $script:JobHookStartedPath
     }
 
     It 'does not let a cache variable shadow the credential plumbing' {
         $block = Get-SlotServiceEnvironment -Index 1 -SlotRoot '/ci/slots' -CachePath 'C:\ci\cache\1'
         $block['GCE_METADATA_HOST'] | Should -Be $script:ClosedMetadataEndpoint
-        $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookPath
+        $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] | Should -Be $script:JobHookCompletedPath
     }
 }
 

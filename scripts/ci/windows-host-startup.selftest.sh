@@ -52,7 +52,7 @@
 # evidence.
 
 # Every predicate and mutation below matches the TEXT of windows-host-startup.ps1,
-# in which `$block`, `$HookPath` and `$script:JobHookPath` are the literal
+# in which `$block`, `$HookPath` and `$script:JobHookStartedPath` are the literal
 # characters that must be there. Expanding them here would compare against this
 # test's own environment and pass on any script at all — so the single quotes are
 # the point.
@@ -169,8 +169,8 @@ has_unconditional_job_hooks() { # <file>
   # the whole idle window and does not run at all if the agent is killed mid-job,
   # which is the case that leaves the most behind; STARTED alone leaves the idle
   # window open.
-  matches "$code" "ACTIONS_RUNNER_HOOK_JOB_STARTED'\] = \\\$HookPath" || return 1
-  matches "$code" "ACTIONS_RUNNER_HOOK_JOB_COMPLETED'\] = \\\$HookPath" || return 1
+  matches "$code" "ACTIONS_RUNNER_HOOK_JOB_STARTED'\] = \\\$StartedHookPath" || return 1
+  matches "$code" "ACTIONS_RUNNER_HOOK_JOB_COMPLETED'\] = \\\$CompletedHookPath" || return 1
 
   # …at the FUNCTION's indentation, not the broker branch's. This is the whole
   # invariant, and indentation is what makes it decidable from the text: the
@@ -182,8 +182,17 @@ has_unconditional_job_hooks() { # <file>
 
   # …and the install itself is unconditional too. A hook path in the environment
   # of an agent whose hook file was never written takes work and fails all of it.
-  matches "$code" '^    \$hookPath = Invoke-Phase4JobHook -SlotUsers \$slotUsers$' || return 1
-  ! matches "$code" '^        \$hookPath = Invoke-Phase4JobHook' || return 1
+  matches "$code" '^    \$hookPath = Invoke-Phase4SlotReset -Provisioned \$provisioned$' || return 1
+  ! matches "$code" '^        \$hookPath = Invoke-Phase4SlotReset' || return 1
+
+  # TWO files, not one. The runner does not tell a hook which end of the job it
+  # is at, so one file would have to guess -- and the two ends do opposite
+  # things: STARTED gates and waits, COMPLETED asks and must NOT wait, because
+  # the reset it asks for stops the service it is running under.
+  matches "$code" "^    \\\$block\['ACTIONS_RUNNER_HOOK_JOB_STARTED'\] = \\\$StartedHookPath\$" || return 1
+  matches "$code" "^    \\\$block\['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'\] = \\\$CompletedHookPath\$" || return 1
+  ! matches "$code" 'JOB_COMPLETED.\] = \$StartedHookPath' || return 1
+  ! matches "$code" 'JOB_STARTED.\] = \$CompletedHookPath' || return 1
 }
 
 # --- phase 3's own invariants ------------------------------------------------
@@ -285,25 +294,202 @@ has_owned_broker_socket() { # <file>
 has_job_hook_acl() { # <file>
   local code
   code=$(code_of "$1")
-  # One file executed by every slot on the host: read-and-execute for the slots,
-  # writable by none of them. A slot that could rewrite it would be running code
+  # Two files executed by every slot on the host: read-and-execute for the slots,
+  # writable by none of them. A slot that could rewrite one would be running code
   # in every OTHER slot's identity, and on a warm host in every later job's too.
-  matches "$code" 'Protect-CiDirectory -Path \$script:JobHookPath -ReadOnlyUser \$SlotUsers' || return 1
+  # The DIRECTORY too -- locking only the files leaves one a slot could rename a
+  # hook out of, which is the same missing-hook fault by a longer path.
+  matches "$code" 'Protect-CiDirectory -Path \$script:JobHookRoot -ReadOnlyUser \$SlotUsers' || return 1
+  matches "$code" 'Protect-CiDirectory -Path \$script:JobHookStartedPath -ReadOnlyUser \$SlotUsers' || return 1
+  matches "$code" 'Protect-CiDirectory -Path \$script:JobHookCompletedPath -ReadOnlyUser \$SlotUsers' || return 1
   matches "$code" "Rights = 'ReadAndExecute'" || return 1
-  ! matches "$code" 'Protect-CiDirectory -Path \$script:JobHookPath -SlotUser' || return 1
-  # The profile is resolved from the ACCOUNT DATABASE, never from a variable the
-  # job could have rewritten — the hook runs inside the agent's environment.
-  # Anchored to the CODE, because code_of keeps `<# ... #>` bodies and the
-  # docstring above the hook says ProfileImagePath too -- so the bare token
-  # was true whatever the hook actually read.
-  matches "$code" 'Get-ItemProperty -LiteralPath \$key -Name .ProfileImagePath.' || return 1
-  matches "$code" 'GetCurrent\(\)\.User\.Value' || return 1
-  ! matches "$code" '\$env:USERPROFILE|\$env:APPDATA' || return 1
-  # …and it refuses anything that is not a slot profile rather than recursing.
-  matches "$code" "notmatch '\^ci-s\[0-9\]\+\\\$'" || return 1
-  matches "$code" 'refusing to clean' || return 1
-  # The credential stores it removes, on Windows paths.
-  matches "$code" 'AppData.Roaming.gcloud' || return 1
+  ! matches "$code" 'Protect-CiDirectory -Path \$script:JobHook[A-Za-z]* -SlotUser' || return 1
+
+  # WHICH SLOT is taken from the identity the hook is running as, never from the
+  # environment: the hook runs inside the job's own environment, so %USERNAME%
+  # and %USERPROFILE% are values the job could have set. Anchored to the CODE,
+  # because code_of keeps `<# ... #>` bodies and the docstrings say these words
+  # too -- a bare token stays true whatever the payload actually reads.
+  matches "$code" 'WindowsIdentity\]::GetCurrent\(\)\.Name' || return 1
+  ! matches "$code" '\$env:USERPROFILE|\$env:APPDATA|\$env:USERNAME' || return 1
+  # Matched POSITIVELY. `-notmatch` also fills $Matches when the regex matched,
+  # so a capture read from the failing branch of one keeps working until
+  # somebody reorders the branches -- and then names the wrong slot.
+  matches "$code" "if \(\\\$leaf -match '\^ci-s\(\[0-9\]\+\)\\\$'\) \{" || return 1
+  matches "$code" 'not a slot account' || return 1
+
+  # …and the hooks DELETE NOTHING. That is the whole of #232: a hook doing the
+  # cleanup runs as the slot, inside the job, against a profile whose hive is
+  # loaded, so it can only ever manage a denylist of paths it thought of.
+  local hooks
+  hooks=$(sed -n '/^function Get-JobHookScript/,/^function Get-SlotCachePath/p' "$1")
+  ! matches "$hooks" 'Remove-Item|robocopy|Remove-ItemProperty' || return 1
+}
+
+# --- the privilege split, which on Windows IS a pair of directory ACLs -------
+#
+# There is no `sudo` here and no SUDO_UID, so nothing about a reset request can
+# be authenticated from its CONTENTS. What can be authenticated is WHERE it
+# appeared: `<state>\<i>\request` is writable by ci-s<i> and by no other slot.
+# Those two ACLs are the boundary, so they are what this asserts.
+
+has_slot_state_acl() { # <file>
+  local code
+  code=$(code_of "$1")
+  # The state directory holds the `clean` marker and the verdict. A slot that
+  # could write either could vouch for itself, which is the one thing the gate
+  # exists to stop it doing -- so it is READ there, and Modify only one level
+  # down, in the request channel.
+  matches "$code" 'Protect-CiDirectory -Path \$state -ReadOnlyUser @\(\$user\)' || return 1
+  matches "$code" 'Protect-CiDirectory -Path \$request -SlotUser \$user' || return 1
+  ! matches "$code" 'Protect-CiDirectory -Path \$state -SlotUser' || return 1
+  matches "$code" 'Protect-CiDirectory -Path \$script:StateRoot -ReadOnlyUser \$slotUsers' || return 1
+
+  # The template and the reset payload get NO slot ACE at all -- not even read.
+  # A slot that could write its own template would be handing every later job on
+  # that slot whatever it left there, which is the persistence the wholesale
+  # replacement exists to end; a slot that could write the payload would be
+  # writing code that runs as LocalSystem.
+  matches "$code" 'Protect-CiDirectory -Path \$script:ProfileTemplateRoot$' || return 1
+  matches "$code" 'Protect-CiDirectory -Path \$template$' || return 1
+  matches "$code" 'Protect-CiDirectory -Path \$script:SlotResetRoot$' || return 1
+  matches "$code" 'Protect-CiDirectory -Path \$script:SlotResetScriptPath$' || return 1
+  matches "$code" 'Protect-CiDirectory -Path \$script:SlotResetConfigPath$' || return 1
+  ! matches "$code" 'Protect-CiDirectory -Path \$script:(ProfileTemplateRoot|SlotReset[A-Za-z]*) -(SlotUser|ReadOnlyUser)' || return 1
+
+  # The runner service name the reset will stop is recorded where no slot can
+  # write it. The agent's own `.service` marker lives inside the slot's runner
+  # directory, which the slot CAN write, and that name reaches Stop-Service in a
+  # LocalSystem process.
+  matches "$code" 'Get-SlotRunnerServicePath -Index \$Slot\.Index' || return 1
+}
+
+has_fail_closed_slot_reset() { # <file>
+  local code reset
+  code=$(code_of "$1")
+  reset=$(sed -n '/^function Get-SlotResetScript/,/^function Get-JobHookScript/p' "$1")
+
+  # THE ASSERTION THIS PREDICATE EXISTS FOR. The marker is deleted at the START
+  # of the reset rather than written at the end of it, so a reset that dies
+  # halfway leaves a slot that fails its next gate instead of one still vouched
+  # for by the marker its previous reset wrote.
+  matches "$reset" 'Remove-Item -LiteralPath \$marker -Force' || return 1
+  local drop copy mark start
+  drop=$(printf '%s\n' "$reset" | grep -n 'Remove-Item -LiteralPath \$marker' | head -1 | cut -d: -f1)
+  copy=$(printf '%s\n' "$reset" | grep -n 'if (-not (Copy-ProfileTree' | head -1 | cut -d: -f1)
+  mark=$(printf '%s\n' "$reset" | grep -n "Write-Atomic -Path \$marker -Text 'clean'" | head -1 | cut -d: -f1)
+  start=$(printf '%s\n' "$reset" | grep -n 'Start-Service -Name \$serviceName' | head -1 | cut -d: -f1)
+  [ -n "$drop" ] && [ -n "$copy" ] && [ -n "$mark" ] && [ -n "$start" ] || return 1
+  [ "$drop" -lt "$copy" ] || return 1
+  # …and the marker is written BEFORE the agent comes back, deliberately unlike
+  # the ADR: an agent that is dispatchable while its marker does not yet exist
+  # fails a job over a reset that in fact worked.
+  [ "$mark" -lt "$start" ] || return 1
+
+  # Every failure returns WITHOUT a marker. There is no path that resets nothing
+  # and lets the next job run anyway.
+  matches "$reset" 'has no profile template' || return 1
+  matches "$reset" 'has no recorded runner service' || return 1
+  matches "$reset" 'recorded an unusable runner service name' || return 1
+  matches "$reset" 'still has a process running as' || return 1
+  matches "$reset" 'the profile hive did not unload' || return 1
+
+  # A killed robocopy exits with an NTSTATUS as a NEGATIVE integer, and a bare
+  # `-lt 8` reads every one of those as a mirror that succeeded. Both sides say
+  # so: the payload inline, because it cannot call into this script, and
+  # Test-RobocopySuccess for every caller that can.
+  matches "$reset" '\$code -ge 0 -and \$code -lt 8' || return 1
+  matches "$code" 'return \(\$ExitCode -ge 0 -and \$ExitCode -lt 8\)' || return 1
+
+  # …and the mirror is BOUNDED. The payload runs under the service shim and
+  # serves every slot from one poll loop, so a robocopy that never returns is
+  # not one slow reset, it is a host on which no later slot is ever served --
+  # every one of them failing its gate on a marker the loop never gets to. The
+  # call operator has nothing to ask once the child is running, hence
+  # Start-Process, a deadline, and a kill that is acted on.
+  matches "$reset" 'Start-Process -FilePath .robocopy\.exe. -PassThru' || return 1
+  matches "$reset" 'if \(-not \$proc\.WaitForExit\(\$TimeoutSeconds \* 1000\)\)' || return 1
+  matches "$reset" '\$proc\.Kill\(\)' || return 1
+
+  # …and the RESTORE's bound fits inside the hook's wait, with the quiesce and
+  # the hive wait ahead of it. The loop is serial, so this number is not "how
+  # long this slot's reset may take", it is how long ANOTHER slot's gate sits
+  # behind it -- and a gate that gives up fails a job on a slot that is clean.
+  local copy_bound wait_bound
+  copy_bound=$(printf '%s\n' "$code" | sed -n 's|^\$script:SlotResetCopySeconds = \([0-9][0-9]*\)$|\1|p' | head -1)
+  wait_bound=$(printf '%s\n' "$code" | sed -n 's|^\$script:SlotResetWaitSeconds = \([0-9][0-9]*\)$|\1|p' | head -1)
+  [ -n "$copy_bound" ] && [ -n "$wait_bound" ] || return 1
+  [ "$((copy_bound + 60))" -lt "$wait_bound" ] || return 1
+
+  # /MIR, because "nothing of the last job survives" is not a claim a copy that
+  # only adds can support; /XJ so a junction a job planted is replaced rather
+  # than followed out of the profile and mirrored over whatever it pointed at.
+  matches "$reset" '\$Source, \$Destination, ./MIR., ./XJ.' || return 1
+
+  # THE DIRECTORY ABOUT TO BE EMPTIED IS THE HOST'S ANSWER, NOT A VARIABLE'S.
+  # ProfileList keyed by the SID the account database resolved -- never
+  # %USERPROFILE%, which the job it is cleaning up after got to set. And the
+  # answer is refused unless its leaf really is this slot's account: /MIR into
+  # the wrong directory mirrors a pristine profile over whatever was there.
+  matches "$reset" 'Get-ItemProperty -LiteralPath \$key -Name .ProfileImagePath.' || return 1
+  matches "$reset" 'if \(-not \(Test-SlotProfileDirectory -Path \$profileDir -Index \$Index\)\)' || return 1
+  # THIS slot's account, case-sensitively -- not "some ci-s<n>". The caller is
+  # SYSTEM acting on a slot it was told about, so a ProfileList entry pointing at
+  # a SIBLING's directory would have it wipe a slot that is mid-job.
+  matches "$reset" 'return \(\$parts\[-1\] -ceq "ci-s\$Index"\)' || return 1
+  matches "$code" 'return \(\$parts\[-1\] -ceq \(Get-SlotUserName -Index \$Index\)\)' || return 1
+
+  # …and the poll looks only where a request can legitimately appear: depth 2,
+  # with the PARENT's name checked. A slot may create entries in its own request
+  # directory and nowhere else, and a directory it creates in there puts the
+  # contents at depth 3, out of the loop's reach.
+  matches "$reset" '\-Recurse -Depth 2' || return 1
+  matches "$reset" "Directory.Name -ceq 'request'" || return 1
+
+  # The slot is the DIRECTORY the request appeared in. Nothing reads a request.
+  matches "$code" 'if \(\$parts\[-2\] -cne .request.\) \{ return .. \}' || return 1
+  ! matches "$reset" 'Get-Content.*\$request' || return 1
+  # A request deleted only after it succeeded is one that is served again every
+  # poll while it keeps failing.
+  matches "$reset" 'Remove-Item -LiteralPath \$request\.FullName -Force' || return 1
+  # The service is LocalSystem and it restarts. A dead reset service is a host
+  # on which every later job fails its gate, which is closed and is also the
+  # whole host out of service with nobody looking.
+  matches "$code" '<onfailure action="restart"' || return 1
+  ! matches "$code" 'Get-SlotResetServiceConfig.*ServiceAccount' || return 1
+}
+
+has_profile_template_before_registration() { # <file>
+  local code first probe template register
+  code=$(code_of "$1")
+  first=$(printf '%s\n' "$code" | grep -n '^function Invoke-Main' | head -1 | cut -d: -f1)
+  [ -n "$first" ] || return 1
+
+  # A Windows profile does not exist until the account logs on, and phase 1
+  # denies these accounts every logon type except SERVICE -- so the first
+  # profile on the host is the one phase 6's probe service made. Capturing after
+  # the probe and BEFORE phase 5 is the single window in which every slot has a
+  # profile and no job has ever run in one. Either half wrong and the template
+  # is missing (every job fails its gate) or dirty (the reset restores a profile
+  # a pull request already wrote to).
+  probe=$(printf '%s\n' "$code" | grep -n '^    Invoke-Phase6BootProbe' | head -1 | cut -d: -f1)
+  template=$(printf '%s\n' "$code" | grep -n '^    Invoke-Phase4ProfileTemplate' | head -1 | cut -d: -f1)
+  register=$(printf '%s\n' "$code" | grep -n '^    Invoke-Phase5Registration' | head -1 | cut -d: -f1)
+  [ -n "$probe" ] && [ -n "$template" ] && [ -n "$register" ] || return 1
+  [ "$probe" -lt "$template" ] || return 1
+  [ "$template" -lt "$register" ] || return 1
+
+  # Fatal when it fails, both times. A slot with no template is a slot the reset
+  # service refuses to reset, which is a slot every one of whose jobs fails.
+  matches "$code" 'Deny-Boot \("slot \$Index has no profile in the account database' || return 1
+  matches "$code" "Deny-Boot \(\"could not capture slot \\\$Index's profile template" || return 1
+  # …and the capture is checked against the slot it claims to describe, so a
+  # ProfileList entry pointing elsewhere cannot make this mirror a neighbour.
+  matches "$code" 'Test-SlotProfileDirectory -Path \$profileDir -Index \$Index' || return 1
+  # The first marker. A freshly booted slot IS clean -- nothing has run on it --
+  # and without this its very first job is failed for a reset with no
+  # predecessor to undo.
+  matches "$code" 'WriteAllText\(\(Get-SlotMarkerPath -Index \$Index\), .clean.' || return 1
 }
 
 # --- phase 5: the two obligations the controller cannot check ----------------
@@ -959,8 +1145,8 @@ has_5_1_compatible_apis() { # <file>
   # ForEach-Object -Parallel: PowerShell 7.0. Boot time is the thing every
   # optimisation aims at, and the slot loops are the obvious target.
   ! matches "$code" 'ForEach-Object[[:space:]]+-Parallel' || return 1
-  # Split-Path -LeafBase: PowerShell 6.0. This script already calls
-  # `Split-Path -Leaf` on a profile directory.
+  # Split-Path -LeafBase: PowerShell 6.0. This script already calls Split-Path,
+  # and -LeafBase is one switch away from every use of it.
   ! matches "$code" '\-LeafBase' || return 1
   # ConvertFrom-Json -Depth: PowerShell 6.2. Phase 6 parses the probe's verdict
   # with ConvertFrom-Json, and -Depth is the first thing anybody reaches for the
@@ -1120,7 +1306,25 @@ fi
 if has_job_hook_acl "$SCRIPT"; then
   ok
 else
-  bad "the reset hook is slot-writable, or resolves the profile from the job's own environment — one file is executed by every slot on the host, so a slot that can rewrite it runs code in every other slot's identity"
+  bad "a reset hook is slot-writable, takes its slot from the job's own environment, or deletes something itself — two files are executed by every slot on the host, so a slot that can rewrite one runs code in every other slot's identity, and a hook that does the cleanup can only ever manage the denylist of paths it thought of"
+fi
+
+if has_slot_state_acl "$SCRIPT"; then
+  ok
+else
+  bad "the reset's privilege split is gone — Windows has no SUDO_UID, so which slot a request names is decided ONLY by which directory it appeared in; a slot that can write its own state directory can write its own clean marker and vouch for itself, and a slot that can write a profile template or the reset payload owns every later job on the host, the payload as LocalSystem"
+fi
+
+if has_fail_closed_slot_reset "$SCRIPT"; then
+  ok
+else
+  bad "the slot reset no longer fails closed — the marker must be dropped before anything is touched and written before the agent comes back, every named failure must return without one, and a negative robocopy exit (a killed mirror, reported as an NTSTATUS) must not read as a profile that was successfully replaced"
+fi
+
+if has_profile_template_before_registration "$SCRIPT"; then
+  ok
+else
+  bad "the profile templates are captured outside the one window in which they are pristine — slot accounts have only SERVICE logon, so no profile exists before phase 6's probe and every profile is a job's after phase 5; captured too early there is nothing to copy and every job fails at its gate, captured too late the reset restores a profile a pull request already wrote to"
 fi
 
 if has_single_registration_token_read "$SCRIPT"; then
@@ -1232,8 +1436,91 @@ mutate "JOB_COMPLETED dropped, leaving only the start hook" \
   "s|^    \\\$block\\['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'\\].*||" \
   has_unconditional_job_hooks
 mutate "hook install made conditional in Invoke-Main" \
-  's|^    \$hookPath = Invoke-Phase4JobHook -SlotUsers \$slotUsers$|        $hookPath = Invoke-Phase4JobHook -SlotUsers $slotUsers|' \
+  's|^    \$hookPath = Invoke-Phase4SlotReset -Provisioned \$provisioned$|        $hookPath = Invoke-Phase4SlotReset -Provisioned $provisioned|' \
   has_unconditional_job_hooks
+# Both ends pointed at the same file -- the shape the one-hook design had, and
+# the one a reader "simplifying" two near-identical paths reaches for first. The
+# STARTED body waits for a verdict, so a COMPLETED that ran it would block until
+# the reset it asked for stopped the service it was waiting in.
+mutate "both ends pointed at the starting hook" \
+  "s|\\\$block\\['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'\\] = \\\$CompletedHookPath|\\\$block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] = \\\$StartedHookPath|" \
+  has_unconditional_job_hooks
+
+# 3b. The reset's privilege split, which is a pair of directory ACLs and nothing
+#     else -- there is no SUDO_UID here to authenticate a request's contents.
+mutate "the slot handed write on its own state directory" \
+  's|Protect-CiDirectory -Path \$state -ReadOnlyUser @(\$user)|Protect-CiDirectory -Path $state -SlotUser $user|' \
+  has_slot_state_acl
+mutate "the request channel demoted to read-only" \
+  's|Protect-CiDirectory -Path \$request -SlotUser \$user|Protect-CiDirectory -Path $request -ReadOnlyUser @($user)|' \
+  has_slot_state_acl
+mutate "the profile template made readable by its slot" \
+  's|Protect-CiDirectory -Path \$template$|Protect-CiDirectory -Path $template -ReadOnlyUser @($user)|' \
+  has_slot_state_acl
+mutate "the reset payload made slot-writable" \
+  's|Protect-CiDirectory -Path \$script:SlotResetScriptPath$|Protect-CiDirectory -Path $script:SlotResetScriptPath -SlotUser $user|' \
+  has_slot_state_acl
+mutate "a hook file left inheriting its directory's ACL" \
+  's|Protect-CiDirectory -Path \$script:JobHookStartedPath -ReadOnlyUser \$SlotUsers||' \
+  has_job_hook_acl
+mutate "a hook made slot-writable" \
+  's|Protect-CiDirectory -Path \$script:JobHookCompletedPath -ReadOnlyUser \$SlotUsers|Protect-CiDirectory -Path $script:JobHookCompletedPath -SlotUser $SlotUsers[0]|' \
+  has_job_hook_acl
+mutate "the hook taking its slot from the environment" \
+  's|\$who = \[System.Security.Principal.WindowsIdentity\]::GetCurrent().Name|$who = $env:USERNAME|' \
+  has_job_hook_acl
+mutate "the slot index read from a match that failed" \
+  "s|if (\\\$leaf -match '^ci-s(\\[0-9\\]+)\$') {|if (\\\$leaf -notmatch '^ci-s(\\[0-9\\]+)\$') {|" \
+  has_job_hook_acl
+mutate "the hook deleting things again" \
+  "s|New-Item -ItemType File -Path \\\$request -Force \\| Out-Null|Remove-Item -LiteralPath \\\$state -Recurse -Force|" \
+  has_job_hook_acl
+
+# 3c. The reset stops failing closed.
+mutate "the marker written at the end instead of dropped at the start" \
+  's|if (Test-Path -LiteralPath \$marker) { Remove-Item -LiteralPath \$marker -Force }||' \
+  has_fail_closed_slot_reset
+mutate "the agent started before its marker exists" \
+  "s|    Write-Atomic -Path \\\$marker -Text 'clean'||" \
+  has_fail_closed_slot_reset
+mutate "a robocopy killed mid-mirror read as a success" \
+  's|return (\$code -ge 0 -and \$code -lt 8)|return ($code -lt 8)|' \
+  has_fail_closed_slot_reset
+mutate "the mirror downgraded to a copy that only adds" \
+  "s|\$Source, \$Destination, '/MIR', '/XJ'|\$Source, \$Destination, '/E', '/XJ'|" \
+  has_fail_closed_slot_reset
+mutate "the mirror's deadline observed and not acted on" \
+  's|if (-not \$proc.WaitForExit(\$TimeoutSeconds \* 1000)) {|if ($false) {|' \
+  has_fail_closed_slot_reset
+mutate "the restore given the boot capture's budget, which outlasts the hook's wait" \
+  's|^\$script:SlotResetCopySeconds = 120$|$script:SlotResetCopySeconds = 600|' \
+  has_fail_closed_slot_reset
+mutate "the bounded mirror handed back to the call operator" \
+  's|\$proc = Start-Process -FilePath .robocopy.exe. -PassThru -NoNewWindow|$null = \& robocopy.exe $Source $Destination|' \
+  has_fail_closed_slot_reset
+mutate "an unquiesced slot still marked clean" \
+  's|Write-ResetLog "slot \$Index still has a process running as \$sid -- no marker"||' \
+  has_fail_closed_slot_reset
+mutate "the request's own contents trusted for the slot" \
+  "s|    if (\\\$parts\\[-2\\] -cne 'request') { return '' }||" \
+  has_fail_closed_slot_reset
+mutate "a failing request served again every poll" \
+  's|try { Remove-Item -LiteralPath \$request.FullName -Force -ErrorAction Stop } catch { $null = \$_ }||' \
+  has_fail_closed_slot_reset
+
+# 3d. The templates captured outside the one window in which they are pristine.
+mutate "templates captured after the agents are registered" \
+  's|^    Invoke-Phase4ProfileTemplate -Provisioned \$provisioned$||' \
+  has_profile_template_before_registration
+mutate "a slot with no capturable profile allowed to boot" \
+  's|Deny-Boot ("slot \$Index has no profile in the account database |Write-BootLog ("slot $Index has no profile in the account database |' \
+  has_profile_template_before_registration
+mutate "the captured directory no longer checked against its slot" \
+  's|if (-not (Test-SlotProfileDirectory -Path \$profileDir -Index \$Index)) {|if ($false) {|' \
+  has_profile_template_before_registration
+mutate "the first marker dropped, failing every slot's first job" \
+  's|\[System.IO.File\]::WriteAllText((Get-SlotMarkerPath -Index \$Index), .clean.,||' \
+  has_profile_template_before_registration
 
 # 4. The broker regresses to the Linux shape, or to checking the daemon.
 mutate "broker bound on the VM's address" \
@@ -1293,10 +1580,14 @@ mutate "the owner matched by localisable name instead of SID" \
   's|S-1-5-18|NT AUTHORITY\\SYSTEM|g' \
   has_owned_broker_socket
 
-# 5. The hook loses its ACL or its account-database resolution.
-mutate "hook made slot-writable" \
-  's|Protect-CiDirectory -Path \$script:JobHookPath -ReadOnlyUser \$SlotUsers|Protect-CiDirectory -Path $script:JobHookPath -SlotUser $SlotUsers[0]|' \
-  has_job_hook_acl
+# 5. The hook loses its ACL, or the RESET loses its account-database resolution.
+#
+# The profile work moved out of the hook and into the SYSTEM-side reset payload
+# (#232): the hook now only drops a request and waits for a verdict, so what used
+# to be asserted about it is asserted about the payload, against
+# has_fail_closed_slot_reset. The gcloud/gsutil denylist is gone on purpose --
+# the profile is MIRRORED from a pristine template now, so there is no list of
+# credential stores to keep current and nothing to leave off it.
 mutate "read-and-execute widened to modify" \
   "s|Rights = 'ReadAndExecute'|Rights = 'Modify'|" \
   has_job_hook_acl
@@ -1305,13 +1596,16 @@ mutate "profile taken from the job's environment" \
   has_job_hook_acl
 mutate "the profile resolved without touching the account database" \
   '/Get-ItemProperty -LiteralPath \$key -Name .ProfileImagePath./d' \
-  has_job_hook_acl
+  has_fail_closed_slot_reset
 mutate "the not-a-slot-profile refusal removed" \
-  "s|notmatch '\\^ci-s\\[0-9\\]+\\\$'|match '.'|" \
-  has_job_hook_acl
-mutate "the gcloud credential store no longer cleaned" \
-  's|AppData\\Roaming\\gcloud|AppData\\Local\\Temp\\turbo|' \
-  has_job_hook_acl
+  's|if (-not (Test-SlotProfileDirectory -Path \$profileDir -Index \$Index)) {|if ($false) {|' \
+  has_fail_closed_slot_reset
+mutate "the refusal widened from this slot to any slot" \
+  's|\$parts\[-1\] -ceq "ci-s\$Index"|$parts[-1] -cmatch "^ci-s[0-9]+$"|' \
+  has_fail_closed_slot_reset
+mutate "the request poll widened past the request directories" \
+  's|-File -Recurse -Depth 2 `|-File -Recurse `|' \
+  has_fail_closed_slot_reset
 
 # 6. OBLIGATION (a): the one read becomes a per-slot read, in both spellings.
 mutate "the token read moved inside the slot loop" \
@@ -1463,8 +1757,8 @@ mutate "the WebException handling simplified into an error-check switch" \
 mutate "the slot loop parallelised to shorten boot" \
   's|ForEach-Object {|ForEach-Object -Parallel {|' \
   has_5_1_compatible_apis
-mutate "the profile name taken with the base-name switch" \
-  's|Split-Path -Leaf |Split-Path -LeafBase |' \
+mutate "a path split with the 6.0-only base-name switch" \
+  's|Split-Path -Qualifier |Split-Path -LeafBase |' \
   has_5_1_compatible_apis
 mutate "the generator leaked instead of disposed" \
   's|\$rng\.Dispose()||' \
@@ -1754,10 +2048,15 @@ has_bounded_native_calls() { # <file>
   ! matches "$code" '& (icacls|robocopy)\.exe' || return 1
   matches "$code" "Invoke-BoundedNative -FilePath 'icacls\\.exe' -TimeoutSeconds \\\$left" || return 1
   matches "$code" "Invoke-BoundedNative -FilePath 'robocopy\\.exe' -TimeoutSeconds \\\$left" || return 1
-  # …and all three of them, not two: a call site left behind is the one that
-  # hangs.
+  # …and all FOUR of them, not three: a call site left behind is the one that
+  # hangs. The fourth is phase 4b's Save-SlotProfileTemplate, which mirrors each
+  # slot's pristine profile before phase 5 registers anything and so spends its
+  # time in exactly the same pre-registration window as phase 7's copies. (The
+  # reset payload mirrors too, but it is emitted as text and cannot call a
+  # function of this script, so it carries its own bounded Start-Process — see
+  # has_fail_closed_slot_reset, which asserts that one.)
   count=$(printf '%s\n' "$code" | grep -cE 'Invoke-BoundedNative -FilePath')
-  [ "${count:-0}" -eq 3 ] || return 1
+  [ "${count:-0}" -eq 4 ] || return 1
 
   # The wait has a deadline and the deadline is acted on. Without the kill the
   # wrapper is an ordinary blocking call with extra words.
@@ -1795,8 +2094,12 @@ has_slot_cache_isolation() { # <file>
   # The marker is cleared before the loop and written after it. Written first, it
   # would mean "seeding was attempted"; and phase 5 reads it to decide whether to
   # emit ten variables that name paths inside it.
+  # ANCHORED ON PHASE 7'S OWN LINE, not on the first `$marker` removal anywhere.
+  # The slot-reset payload clears a marker of its own and is emitted far earlier
+  # in the file, so a loose match picks THAT line up, and the ordering below then
+  # compares two unrelated markers -- true no matter what phase 7 does with its.
   local clear_at write_at
-  clear_at=$(printf '%s\n' "$code" | grep -nE 'Remove-Item -LiteralPath \$marker' | cut -d: -f1 | sed -n 1p)
+  clear_at=$(printf '%s\n' "$code" | grep -nE '^    Remove-Item -LiteralPath \$marker -Force -ErrorAction SilentlyContinue$' | cut -d: -f1 | sed -n 1p)
   write_at=$(printf '%s\n' "$code" | grep -nE 'Set-Content -LiteralPath \$marker' | cut -d: -f1 | sed -n 1p)
   [ -n "$clear_at" ] && [ -n "$write_at" ] || return 1
   [ "$clear_at" -lt "$write_at" ] || return 1
