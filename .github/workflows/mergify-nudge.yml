@@ -148,17 +148,29 @@ on:
         type: number
       nudge-attempts:
         description: >-
-          How many times to POST the command, including the first. This is the
-          input that exists because one comment is not reliable. Measured across
-          ten nudges: when Mergify received the comment it answered in 12-30s,
-          but three of the ten sat for 9-11 minutes — a flat ~10 minutes, which
-          is not a slow reply, it is the periodic reconciliation that picks up
-          what a lost webhook never delivered. The comment webhook is losable in
-          exactly the way the `check_run` webhook is; the difference is that we
-          can send another one. Losing three in a row is the case this gives up
-          on, and reconciliation still catches that.
+          How many times to POST the command, including the first. This was 3,
+          on the theory that a comment webhook is losable exactly the way the
+          `check_run` webhook is, so the answer to one going missing is to send
+          another. Thirty-six commands later that theory is dead, and the
+          evidence against it is Mergify's own reply: every retry came back
+          `Command refresh ignored because it is already running from a previous
+          command`. Not lost — RECEIVED, and deduplicated. Across a full
+          afternoon of nudges there is not one case where a second or third
+          comment did anything the first had not already done.
+
+          What the retries did do is add load. Every comment is a webhook the
+          same Mergify installation has to process, and that installation is
+          the thing being waited on: it answered a nudge in 11 seconds at 17:16,
+          and 12 minutes 13 seconds by 18:16, over an afternoon in which this
+          repository posted three commands per CI run on every run. That
+          correlation is not proof of causation, but a retry with no measured
+          benefit and a plausible cost is not a trade worth keeping.
+
+          So: 1. Say it once. If Mergify is behind by minutes, it is behind on
+          the comment channel too, and a second comment arrives in the same
+          backlog as the first.
         required: false
-        default: 3
+        default: 1
         type: number
       confirm-seconds:
         description: >-
@@ -253,6 +265,49 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Every wait below is a `type: number` input, and `number` in Actions
+          # is not `integer`: `grace-seconds: 0.5` reaches this script as the
+          # literal `0.5`. `sleep` accepts that, but `[ 0.5 -le 1155 ]` does
+          # not — it is an ARITHMETIC test, so it prints "integer expression
+          # expected" and returns false, and the clamp below reads a false
+          # there as "this wait is too long" and sleeps the ENTIRE remaining
+          # budget. Half a second would have become nineteen minutes: not a
+          # cryptic failure, a silent inversion of the thing the clamp exists
+          # to guarantee.
+          #
+          # So normalise once, here, before any arithmetic sees them. Rounding
+          # is UP because every one of these is a minimum — "give Mergify at
+          # least this long" — and rounding up is the only direction that
+          # cannot make the ladder more aggressive than the caller asked for.
+          # A value that is not a number at all is a misconfiguration, and it
+          # fails loudly rather than being silently treated as zero.
+          to_seconds() { # <input name> <value>
+            local name="$1" v="$2" int frac
+            case "$v" in
+              ''|.|*[!0-9.]*|*.*.*)
+                echo "::error::$name must be a non-negative number; got '$v'" >&2
+                return 1
+                ;;
+            esac
+            int="${v%%.*}"
+            int="$(( 10#${int:-0} ))"
+            if [ "$v" = "${v%%.*}" ]; then
+              printf '%s\n' "$int"
+              return 0
+            fi
+            frac="${v#*.}"
+            case "$frac" in
+              *[!0]*) int=$(( int + 1 )) ;;
+            esac
+            printf '%s\n' "$int"
+          }
+
+          GRACE="$(to_seconds grace-seconds "$GRACE")"
+          ATTEMPTS="$(to_seconds attempts "$ATTEMPTS")"
+          INTERVAL="$(to_seconds interval-seconds "$INTERVAL")"
+          NUDGE_ATTEMPTS="$(to_seconds nudge-attempts "$NUDGE_ATTEMPTS")"
+          CONFIRM="$(to_seconds confirm-seconds "$CONFIRM")"
+
           # Everything below waits, and GitHub cancels the job at
           # `timeout-minutes` without running the final probe or the warning —
           # so a widened `confirm-seconds` would turn a supported configuration
@@ -261,15 +316,27 @@ jobs:
           # a worse answer than the operator asked for but still an answer.
           # The 45s reserve covers job setup before this line plus the `gh`
           # calls after the last sleep.
+          #
+          # A wait that could not be taken IN FULL means the budget is spent,
+          # and that has to be reported rather than swallowed. Returning 0
+          # there degrades the ladder into a comment burst: every later wait
+          # returns instantly, so the remaining nudges post back-to-back with
+          # none of the confirmation window they exist to provide, and the run
+          # ends by telling the operator to audit their webhook deliveries when
+          # the real fault is a configuration that does not fit in the job.
+          # `out_of_time` below carries that verdict, and the ladder stops.
           deadline=$(( $(date -u +%s) + JOB_TIMEOUT_MINUTES * 60 - 45 ))
-          bounded_sleep() { # <seconds>
+          out_of_time=0
+          bounded_sleep() { # <seconds>; returns 1 when the budget is spent
             local left=$(( deadline - $(date -u +%s) ))
-            [ "$left" -gt 0 ] || return 0
-            [ "$1" -le "$left" ] || {
+            if [ "$left" -le 0 ]; then
+              return 1
+            fi
+            if [ "$1" -gt "$left" ]; then
               echo "::warning::waiting ${left}s instead of $1s — the configured ladder does not fit in the job's ${JOB_TIMEOUT_MINUTES}-minute timeout; narrow the waits, and note the queue's checks_timeout caps this anyway"
               sleep "$left"
-              return 0
-            }
+              return 1
+            fi
             sleep "$1"
           }
 
@@ -328,7 +395,7 @@ jobs:
             [ "$(date -u -d "$newest" +%s)" -ge "$ci_ended" ]
           }
 
-          bounded_sleep "$GRACE"
+          bounded_sleep "$GRACE" || out_of_time=1
 
           attempt=1
           while true; do
@@ -336,9 +403,17 @@ jobs:
               echo "::notice::Mergify re-evaluated $HEAD_SHA on its own after attempt $attempt — no nudge needed"
               exit 0
             fi
-            [ "$attempt" -lt "$ATTEMPTS" ] || break
+            # Two statements, not `A && B || C`: that chain runs `break` when
+            # A is true and B is false, which is what we want here and is
+            # still the wrong shape to write — SC2015 rejects it because the
+            # next person to add a third clause gets if-then-else semantics
+            # they did not ask for. Split, and the intent survives the edit.
+            if [ "$attempt" -ge "$ATTEMPTS" ]; then
+              break
+            fi
+            [ "$out_of_time" -eq 0 ] || break
             attempt=$((attempt + 1))
-            bounded_sleep "$INTERVAL"
+            bounded_sleep "$INTERVAL" || out_of_time=1
           done
 
           # Mergify is behind. The command has to START the comment, with a
@@ -377,27 +452,39 @@ jobs:
           EOF
           }
 
-          # Posting the command once is where this workflow used to stop, and
-          # it is not enough. A comment is delivered to Mergify by the same
-          # webhook channel that dropped the `check_run` event in the first
-          # place; when that delivery is the one that goes missing, the PR waits
-          # for reconciliation and the observed cost is a flat ~10 minutes —
-          # measured on three of ten nudges here, the exact symptom this
-          # workflow exists to remove, reappearing one layer up.
+          # A loop that, at the default `nudge-attempts: 1`, posts once and
+          # falls straight through to the confirmation below. It is written as
+          # a loop because the input exists, and the input exists because the
+          # ORIGINAL reasoning — a comment rides the same webhook channel that
+          # dropped the `check_run` event, so a redelivery is cheap insurance —
+          # is sound in shape and was simply wrong about this installation.
           #
-          # So: post, confirm, post again. Each comment is an independent
-          # delivery, so the odds of a stall surviving the ladder fall off a
-          # cliff, and a Mergify that answered the FIRST one never sees a
-          # second.
+          # What the retries actually did, every time: came back `Command
+          # refresh ignored because it is already running from a previous
+          # command`. That is Mergify saying RECEIVED AND DEDUPLICATED, not
+          # lost. No second or third comment was ever seen doing something the
+          # first had not. And on 2026-08-24 a HUMAN refresh on the same pull
+          # request was answered in the same delayed batch as the bot's — one
+          # processing queue, minutes behind, dropping nothing. A second
+          # comment into a backlog lands in the same backlog.
+          #
+          # So the default is 1. Raising it costs a real comment into the
+          # worker being waited on; only a measurement showing a genuinely
+          # LOST command — an Nth answered where the first was never
+          # acknowledged at all — justifies paying that.
           nudge=1
           while true; do
             post_nudge "$nudge"
             [ "$nudge" -lt "$NUDGE_ATTEMPTS" ] || break
-            bounded_sleep "$CONFIRM"
+            bounded_sleep "$CONFIRM" || out_of_time=1
             if mergify_seen_it; then
               echo "::notice::Mergify answered nudge $nudge — re-evaluated $HEAD_SHA"
               exit 0
             fi
+            # After the probe, never before it: a spent budget still deserves
+            # the answer to the nudge already posted. It is the NEXT post that
+            # must not happen, because there is no window left to answer it in.
+            [ "$out_of_time" -eq 0 ] || break
             nudge=$((nudge + 1))
           done
 
@@ -407,15 +494,34 @@ jobs:
           # on #372 Mergify's reply landed in the same second as this line and
           # the job still told the operator to go audit their webhook deliveries.
           # The warning below is only true if it survives one more wait.
-          bounded_sleep "$CONFIRM"
-          if mergify_seen_it; then
-            echo "::notice::Mergify answered nudge $NUDGE_ATTEMPTS — re-evaluated $HEAD_SHA"
-            exit 0
+          #
+          # Guarded, because the loop above breaks for two different reasons:
+          # having posted every nudge, or having run out of budget — and in the
+          # second case it has ALREADY waited and probed, so repeating it here
+          # would report a wait that never happened.
+          if [ "$out_of_time" -eq 0 ]; then
+            bounded_sleep "$CONFIRM" || out_of_time=1
+            if mergify_seen_it; then
+              echo "::notice::Mergify answered nudge $nudge — re-evaluated $HEAD_SHA"
+              exit 0
+            fi
           fi
 
           # Every comment we are willing to send has been sent and Mergify has
           # still not moved. Do not fail the job: the pull request is not broken
-          # and reconciliation will reach it: but say so loudly, because a
-          # repository that reaches this line regularly has something wrong with
-          # its Mergify installation that no amount of nudging will fix.
-          echo "::warning::posted $NUDGE_ATTEMPTS refresh commands and Mergify re-evaluated none of them — check the Mergify installation's webhook deliveries"
+          # and Mergify will reach it. But say so, and say the right thing —
+          # this used to send the reader to audit webhook DELIVERIES, which is
+          # the wrong subsystem. Measured 2026-08-24: Mergify answered a nudge
+          # in 11s at 17:16 and in 12m13s at 18:16, and it answered a HUMAN
+          # refresh on the same pull request with the same delay, in the same
+          # batch. Nothing was dropped; the installation's processing is simply
+          # minutes behind, and no comment this workflow posts can shorten that.
+          #
+          # Unless the ladder never finished, which IS a local fault and IS
+          # fixable — a configured ladder too long for the job's budget — so
+          # that arm names the configuration instead.
+          if [ "$out_of_time" -ne 0 ]; then
+            echo "::warning::stopped after $nudge of $NUDGE_ATTEMPTS refresh commands — the ladder does not fit in the job's ${JOB_TIMEOUT_MINUTES}-minute budget, and posting the rest back-to-back would give Mergify no window to answer any of them; narrow the waits"
+          else
+            echo "::warning::posted $NUDGE_ATTEMPTS refresh command(s); Mergify had not re-evaluated $HEAD_SHA ${CONFIRM}s later. The command was accepted, not lost — this is the Mergify installation running behind, and no further comment shortens it. Expect the merge once it catches up."
+          fi
