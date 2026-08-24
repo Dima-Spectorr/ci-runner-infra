@@ -69,6 +69,12 @@ matches() { # <text> <ere>
 # must NOT carry would otherwise read as carrying it.
 blocks() { awk "/^resource \"$1\"/,/^}/" "$2" | grep -vE '^[[:space:]]*#'; }  # <resource-type> <file>
 
+# Same idea for a variable, which `blocks` cannot reach — its range anchors on
+# `resource`. Needed because "this input has no default" is a statement about one
+# block: `default` appears in half the file, so a whole-file match for its absence
+# is vacuous, and a whole-file match for its presence indicts the wrong variable.
+var_block() { awk "/^variable \"$1\" \\{/,/^}/" "$2" | grep -vE '^[[:space:]]*#'; }  # <name> <file>
+
 # 1. THE prohibition. Not a list of bad role names — a list of every role that
 #    can write an IAM policy or mint an identity, which is the capability being
 #    denied. Named individually so a failure says which one arrived.
@@ -122,15 +128,49 @@ scopes_state_to_one_bucket() {
   ! matches "$(blocks 'google_project_iam_member' "$1")" 'roles/storage\.' || return 1
 }
 
-# 5. The security boundary itself. A principalSet on attribute.repository binds
-#    the whole repository — every branch, including one pushed by anyone who can
-#    push, running a workflow file they wrote. Branch protection is no defence:
-#    that workflow never goes near main.
-binds_to_one_ref_not_the_repository() {
+# 5. The security boundary itself, and it takes all THREE facts (#111).
+#
+#    A principalSet on attribute.repository binds the whole repository — every
+#    branch, including one pushed by anyone who can push, running a workflow file
+#    they wrote. Branch protection is no defence: that workflow never goes near
+#    main.
+#
+#    attribute.ref is not the narrower alternative, which is what this gate used
+#    to assert. It is a DIFFERENT axis and is open twice over: a pool is normally
+#    shared by every repository in the org, so a ref-only binding matches a run on
+#    any of their default branches; and `refs/heads/main` is itself reachable from
+#    a pull request, because `pull_request_target`, `workflow_run`, `issue_comment`
+#    and `schedule` all report the DEFAULT BRANCH in the `ref` claim.
+#
+#    So: job_workflow_ref, carrying repository, workflow file and ref in one claim.
+binds_to_one_workflow_file_on_one_ref() {
   local code; code=$(code_of "$1")
-  matches "$code" 'attribute\.ref/\$\{var\.allowed_ref\}' || return 1
-  ! matches "$code" 'attribute\.repository/'              || return 1
-  ! matches "$code" 'principalSet://[^"]*\*'              || return 1
+  matches "$code" 'attribute\.job_workflow_ref/\$\{var\.repository\}/\$\{var\.apply_workflow_path\}@\$\{var\.allowed_ref\}' || return 1
+  # Each weaker axis on its own, rejected by name. `attribute.ref/` is written
+  # without the `job_workflow_` that also ends in `ref` — the pattern anchors on
+  # the `.` before it, so the good binding does not match it.
+  ! matches "$code" 'attribute\.repository/'  || return 1
+  ! matches "$code" 'attribute\.ref/'         || return 1
+  ! matches "$code" 'principalSet://[^"]*\*'  || return 1
+}
+
+# 5b. And the repository must be the CONSUMER'S, supplied deliberately. A default
+#     here would be a guess at somebody else's repository, and a wrong guess is a
+#     binding that authorises a repository the operator never looked at.
+requires_the_repository_and_the_workflow_file() {
+  local code; code=$(code_of "$1")
+  local repo wf
+  repo=$(var_block repository "$1")
+  wf=$(var_block apply_workflow_path "$1")
+  # Non-empty first: `matches` on an absent block is false, which would land the
+  # prohibition below in the passing branch and assert nothing at all.
+  [ -n "$repo" ] && [ -n "$wf" ]                    || return 1
+  ! matches "$repo" '^[[:space:]]*default[[:space:]]*=' || return 1
+  # Neither part may carry a principalSet separator, or it renames what the
+  # binding points at rather than failing. One slash, no `@`.
+  matches "$repo" 'regex\('                         || return 1
+  matches "$repo" '\[A-Za-z0-9\._-\]\*/'            || return 1
+  matches "$wf" '\.github/workflows/'               || return 1
 }
 
 # 6. `allowed_ref = "main"` is the plausible typo and the dangerous one: it
@@ -167,7 +207,8 @@ check grants_no_iam_authority              "$MAIN" "the apply identity can write
 check scopes_act_as_to_named_accounts      "$MAIN" "actAs is not scoped to named accounts — compute.admin becomes act-as-anything"
 check reads_secrets_without_reading_values "$MAIN" "the apply identity can read secret VALUES"
 check scopes_state_to_one_bucket           "$MAIN" "storage is granted wider than the state bucket"
-check binds_to_one_ref_not_the_repository  "$MAIN" "any branch in the repository can assume the apply identity"
+check binds_to_one_workflow_file_on_one_ref "$MAIN" "the binding does not name repository, workflow file and ref together — see #111"
+check requires_the_repository_and_the_workflow_file "$VARS" "repository is defaulted or unvalidated — the binding could name a repository nobody chose"
 check refuses_a_ref_that_is_not_a_ref      "$VARS" "a ref that matches nothing is accepted"
 
 mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
@@ -204,10 +245,17 @@ mutate "'the apply cannot read the artifact bucket' — storage granted project-
 # happen, and the mutation proof would "pass" having tested nothing.
 # shellcheck disable=SC2016
 mutate "'it fails from the release branch too' — bound to the repository" "$MAIN" \
-  's|attribute.ref/\${var.allowed_ref}|attribute.repository/${var.repository}|' binds_to_one_ref_not_the_repository
+  's|attribute.job_workflow_ref/\${var.repository}/\${var.apply_workflow_path}@\${var.allowed_ref}|attribute.repository/${var.repository}|' binds_to_one_workflow_file_on_one_ref
+# The regression this gate was written the wrong way round for until #111: the
+# binding reduced to a ref, which LOOKS like the narrow option and is not.
+# shellcheck disable=SC2016  # terraform interpolation matched literally, as above
+mutate "'the workflow file moved, drop it from the binding' — back to the ref alone" "$MAIN" \
+  's|attribute.job_workflow_ref/\${var.repository}/\${var.apply_workflow_path}@\${var.allowed_ref}|attribute.ref/${var.allowed_ref}|' binds_to_one_workflow_file_on_one_ref
 # shellcheck disable=SC2016  # terraform interpolation matched literally, as above
 mutate "'let any branch apply' — wildcard principalSet" "$MAIN" \
-  's|attribute.ref/\${var.allowed_ref}|attribute.ref/*|'            binds_to_one_ref_not_the_repository
+  's|@\${var.allowed_ref}|@*|'                                      binds_to_one_workflow_file_on_one_ref
+mutate "'every consumer is this repo anyway' — repository defaulted" "$VARS" \
+  's|description = "The repository whose apply workflow|default     = "some-owner/some-repo"\n  description = "The repository whose apply workflow|' requires_the_repository_and_the_workflow_file
 mutate "'refs/ prefix is fiddly' — bare branch names allowed" "$VARS" \
   's|startswith(var.allowed_ref, "refs/")|true|'                    refuses_a_ref_that_is_not_a_ref
 mutate "'we want a wildcard ref' — wildcard guard dropped" "$VARS" \
