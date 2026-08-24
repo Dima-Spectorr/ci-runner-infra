@@ -300,6 +300,18 @@ cannot tell the difference. It also publishes `shared`, which is worth logging:
 a run where *every* job reports `0` is a run whose anchor never pinned
 anything — a fleet problem currently wearing a green tick.
 
+**The throwaway's host port is drawn, not left to Docker**, and that is not a
+detail. Docker's allocator starts scanning at 32768 every time; a fleet host
+carries several slots under separate uids whose rootless published ports are all
+bound by RootlessKit in the *host* namespace, so two slots publishing seconds
+apart both take 32768 and the second one dies on `bind: address already in use`
+(measured in DataRetrival run 31790204079, #366). The fallback therefore draws a
+random port from 20000-29999, skips anything already listening, and retries on a
+fresh draw if the bind fails anyway — a retry against Docker's own allocator
+would pick 32768 again. This matters most on exactly the runs that reach the
+fallback: the anchor degrades when another run already holds the host, which is
+when sibling slots are starting containers seconds apart.
+
 Nothing tears the throwaway down, on purpose. `slot-reset.sh completed` removes
 every container on the slot's daemon at the end of every job and fails closed if
 it cannot, sparing only a held slot; a teardown step would duplicate a host-side

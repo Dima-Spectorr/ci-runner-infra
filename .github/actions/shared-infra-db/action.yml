@@ -34,6 +34,27 @@
 # host-side guarantee that already exists and is already the one that has to be
 # right, since a job that dies does not run its own cleanup either.
 #
+# THE FALLBACK DRAWS ITS OWN HOST PORT, and must
+#
+# `--publish '127.0.0.1::5432'` reads as "let the kernel pick" and does not mean
+# that here: DOCKER picks, and its allocator starts scanning at 32768 every
+# time. A fleet host carries several slots, each a separate uid running rootless
+# Docker, and a rootless published port is bound by RootlessKit in the HOST
+# network namespace — so the slots share one port space while sharing no
+# allocator state, and two jobs publishing seconds apart both take 32768:
+#
+#   error while calling RootlessKit PortManager.AddPort():
+#   listen tcp4 0.0.0.0:32768: bind: address already in use
+#
+# Measured in DataRetrival run 31790204079 (#366). Re-running does not help. And
+# this is the busy-afternoon leg by construction — the fallback runs when the
+# anchor found the host already held, which is when sibling slots are starting
+# containers seconds apart. `resolve.sh` therefore draws a random port from
+# 20000-29999 (below Docker's scan start, clear of the 35100-44099 band), skips
+# anything already listening, and RETRIES on a fresh draw if the bind fails
+# anyway. The random draw is what makes each attempt independent; a retry
+# against Docker's allocator would pick 32768 again.
+#
 # THE FALLBACK IS LINUX ONLY; the action is not. The shared branch is string
 # concatenation and runs anywhere, which is how a Windows job reaches the stack
 # across the band under rule 3. Only the fallback needs a container runtime, and
@@ -151,116 +172,8 @@ runs:
         DB_PASSWORD: ${{ inputs.password }}
         DB_NAME: ${{ inputs.database }}
         HEALTH_TIMEOUT: ${{ inputs.health-timeout }}
-      run: |
-        set -euo pipefail
-
-        publish() { # <url> <port> <shared>
-          {
-            printf 'url=%s\n' "$1"
-            printf 'port=%s\n' "$2"
-            printf 'shared=%s\n' "$3"
-          } >> "$GITHUB_OUTPUT"
-        }
-
-        # The credential half of the URL, built once for both branches so the
-        # shared stack and the fallback are indistinguishable to the suite.
-        auth="$DB_USER"
-        [ -z "$DB_PASSWORD" ] || auth="${DB_USER}:${DB_PASSWORD}"
-
-        if [ -n "$PG" ]; then
-          # The shared stack, at the host's VPC address — the same address rule
-          # 3 has the Windows leg use, and the right one even for a job that
-          # landed on the anchor's own machine: a sibling slot has its own
-          # network namespace, so `127.0.0.1` there is the slot and not the
-          # host. The loopback line is a guard against an `addr` the anchor
-          # should never have published empty beside a port.
-          host="127.0.0.1"
-          [ -z "$ADDR" ] || host="$ADDR"
-          publish "postgres://${auth}@${host}:${PG}/${DB_NAME}" "$PG" 1
-          echo "::notice::using the run's shared stack at ${host}:${PG}"
-          exit 0
-        fi
-
-        # No shared stack. Everything below is the degraded leg.
-        echo "::notice::the anchor published no shared stack — starting a throwaway Postgres for this job alone"
-
-        # FAIL FAST, AND ONLY HERE. The two preconditions below belong to the
-        # fallback, not to the action: the shared branch above is a string
-        # concatenation and works on any runner, which is exactly how a Windows
-        # job reaches the stack across the band under rule 3. Guarding at the
-        # top of the script instead would break that.
-        #
-        # Without these the leg still fails, just later and wearing a worse
-        # error: `docker: command not found` from inside a `$(...)`, or a
-        # Windows shell's rendition of the same.
-        if [ "${RUNNER_OS:-Linux}" != "Linux" ]; then
-          echo "::error::this action's fallback is Linux-only (RUNNER_OS=${RUNNER_OS:-unset}) and the anchor published no shared stack, so there is nothing for this job to connect to. A Windows leg must skip when the anchor degrades — guard the job on the anchor's \`addr\` output being non-empty."
-          exit 1
-        fi
-        if ! command -v docker >/dev/null 2>&1; then
-          echo "::error::the fallback needs a container runtime and \`docker\` is not on PATH. On a fleet host this means the slot's rootless daemon did not come up; on any other runner it means this job cannot use the fallback at all."
-          exit 1
-        fi
-
-        # `health-timeout` reaches the arithmetic below, where a non-integer is
-        # a bash syntax error under `set -e` rather than a message anyone can
-        # act on. `90m` is the plausible mistake: the input is seconds, and
-        # every neighbouring GitHub knob (`timeout-minutes`) is not.
-        case "$HEALTH_TIMEOUT" in
-          '' | *[!0-9]*)
-            echo "::error::health-timeout must be a whole number of seconds; got '${HEALTH_TIMEOUT}'"
-            exit 1
-            ;;
-        esac
-
-        # `127.0.0.1::5432`, three fields on purpose: bind to loopback, let the
-        # kernel pick the host port. A fixed port collides with the sibling
-        # slots that share this host's loopback, and a band port collides with
-        # a shared stack belonging to somebody else's run — which is the
-        # failure this fallback exists downstream of, reintroduced.
-        #
-        # No `--rm`: the host reaps the slot's containers at job end, and `--rm`
-        # would delete the container the moment it exited, taking its logs with
-        # it in exactly the case worth reading them.
-        # AUTH FOLLOWS THE `password` INPUT, because it used to not. This ran
-        # with `POSTGRES_HOST_AUTH_METHOD=trust` unconditionally while also
-        # setting a password, so a caller who passed one got it embedded in the
-        # returned URL and a container that accepted every other credential
-        # too. That is the worst shape available: the input reads as enforced,
-        # the suite passes, and nothing reports that the fallback was open to
-        # anything on the slot's loopback.
-        #
-        # Empty password keeps `trust`, which is the documented normal case for
-        # a CI fixture database and matches what the anchor's compose does.
-        # A non-empty one drops `trust` entirely and lets the image default to
-        # scram-sha-256, so the URL's credential is the credential.
-        auth_env=(--env "POSTGRES_PASSWORD=${DB_PASSWORD}")
-        if [ -z "$DB_PASSWORD" ]; then
-          auth_env=(--env POSTGRES_HOST_AUTH_METHOD=trust)
-        fi
-
-        cid="$(docker run --detach \
-                 --publish '127.0.0.1::5432' \
-                 --env "POSTGRES_USER=${DB_USER}" \
-                 "${auth_env[@]}" \
-                 --env "POSTGRES_DB=${DB_NAME}" \
-                 -- "$IMAGE")"
-
-        # `docker port` and not a hard-coded guess: the kernel chose it.
-        hostport="$(docker port "$cid" 5432/tcp | head -n 1 | sed 's/.*://')"
-        [ -n "$hostport" ] || { echo "::error::the fallback Postgres published no host port"; exit 1; }
-
-        # Ready means "accepts connections", which is later than "container is
-        # running" — a suite that connects in between reads "the database
-        # system is starting up" and reports itself broken.
-        deadline=$(( SECONDS + HEALTH_TIMEOUT ))
-        until docker exec "$cid" pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1; do
-          if [ "$SECONDS" -ge "$deadline" ]; then
-            echo "::error::the fallback Postgres did not accept connections within ${HEALTH_TIMEOUT}s"
-            docker logs --tail 50 "$cid" || true
-            exit 1
-          fi
-          sleep 1
-        done
-
-        publish "postgres://${auth}@127.0.0.1:${hostport}/${DB_NAME}" "$hostport" 0
+      # The body lives in resolve.sh so it can be run against a stubbed `docker`
+      # and `ss` by scripts/ci/shared-infra-db.selftest.sh (#366). Inline YAML is
+      # only reachable by running a whole workflow on a real fleet host — the
+      # expensive place to find out that the retry loop retries on the same port.
+      run: bash "$GITHUB_ACTION_PATH/resolve.sh"

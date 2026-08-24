@@ -127,13 +127,17 @@ merge_protections_settings:
 # fork pull request — was left out when this block was first written, on the
 # reasoning that nothing here depends on it and that guessing at a clause's
 # spelling is how a `.mergify.yml` becomes invalid, which fails the queue CLOSED
-# for every open pull request at once. Both halves of that were wrong. The
-# spelling is published (`sender = {{author}}` and the boolean `from-fork`
-# attribute), so it is not a guess; and the people who depend on the arm are
-# precisely the ones the automation cannot help. `workflow_run.pull_requests` is
-# empty for a fork run, so the nudge never fires on a fork pull request — its
-# author refreshing by hand IS the recovery path there, and dropping the arm
-# removed the automatic and the manual route in the same change.
+# for every open pull request at once. The caution was sound; the conclusion was
+# not. The spelling is published (`sender = {{author}}` and the boolean
+# `from-fork` attribute), so restating it is not a guess — and "nothing here
+# depends on it" was a judgement about this repository made on behalf of an
+# outside contributor, which is not ours to make. Dropping an arm of an upstream
+# default is a permission taken away in silence.
+#
+# It is a backstop, not the only route: the nudge DOES reach fork pull requests,
+# because the callee resolves them from `commits/<sha>/pulls` rather than from
+# the run payload (whose `pull_requests` is empty for a fork). The arm is what
+# the author is left with when the nudge itself is the thing that is broken.
 commands_restrictions:
   refresh:
     conditions:

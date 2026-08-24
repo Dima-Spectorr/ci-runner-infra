@@ -119,6 +119,36 @@ waits_out_the_healthy_case() {
   matches "$code" 'sleep "\$INTERVAL"' || return 1
 }
 
+# Posting the command ONCE is not a nudge, it is a coin flip. The comment
+# reaches Mergify over the same webhook channel that dropped the `check_run`
+# event this workflow exists to compensate for; when that delivery is the one
+# lost, the pull request waits for Mergify's periodic reconciliation and the
+# measured cost is a flat ~10 minutes — three of the first ten nudges in this
+# repository did exactly that, which is the original stall reappearing one
+# layer up. Re-sending is the entire fix, and it is the kind of loop a later
+# reader deletes as redundant because the happy path never enters it.
+retries_an_unanswered_nudge() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'post_nudge "\$nudge"' || return 1
+  matches "$code" '\[ "\$nudge" -lt "\$NUDGE_ATTEMPTS" \]' || return 1
+  matches "$code" 'sleep "\$CONFIRM"' || return 1
+  # And the retry must be driven by a real re-read of Mergify's check-runs, not
+  # by the timer alone: a ladder that posts N comments regardless answers a
+  # Mergify that already replied with two more comments.
+  matches "$code" 'if mergify_seen_it; then' || return 1
+}
+
+# `/check-runs` truncates silently. Read one page and a commit busy enough to
+# push Mergify's own check past the boundary looks permanently behind — which
+# used to cost one redundant comment and now costs the whole ladder.
+reads_every_check_run_page() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'gh api --paginate "repos/\$GITHUB_REPOSITORY/commits/\$HEAD_SHA/check-runs' || return 1
+  # Pages arrive as separate JSON documents; without `-s` the query runs once
+  # per page and the shell gets several answers where it expects one.
+  matches "$code" 'jq -rs' || return 1
+}
+
 # And the wait is only worth anything if the answer can stop it. A run that
 # waits and then posts regardless is the unconditional version with extra
 # latency.
@@ -151,7 +181,7 @@ compares_against_the_ci_end_time() {
 # on, while the workflow log still says it nudged.
 the_command_starts_the_comment() {
   local code; code=$(code_of "$1")
-  matches "$code" "^            '@mergifyio refresh' \\\\$" || return 1
+  matches "$code" "^              '@mergifyio refresh' \\\\$" || return 1
 }
 
 # `workflow_run.pull_requests` is EMPTY for a fork pull request. Reading it
@@ -174,7 +204,10 @@ skips_what_is_not_waiting() {
 # stopping leaves the others in the exact state this exists to clear.
 nudges_every_matching_pull_request() {
   local code; code=$(code_of "$1")
-  matches "$code" '^          while read -r pr; do$' || return 1
+  matches "$code" '^            while read -r pr; do$' || return 1
+  # `$prs` and its `EOF` stay at ten spaces however deeply the loop is nested:
+  # YAML strips exactly that much from the block scalar, which puts the heredoc
+  # delimiter at column zero where the shell requires it.
   matches "$code" '^          \$prs$' || return 1
 }
 
@@ -253,6 +286,8 @@ check can_read_check_runs               "$CALLEE" "the job cannot read check-run
 check acts_on_failure_too               "$CALLEE" "a failed CI run is not nudged, so a dead queue entry waits out checks_timeout"
 check ignores_a_non_verdict             "$CALLEE" "a cancelled or skipped run is nudged, so every force-push posts a comment"
 check waits_out_the_healthy_case        "$CALLEE" "the grace period is gone, so the healthy majority of runs post a comment"
+check retries_an_unanswered_nudge       "$CALLEE" "an unanswered refresh command is never re-sent, so a lost comment webhook still costs the ~10 minutes this workflow exists to remove"
+check reads_every_check_run_page        "$CALLEE" "the check-run probe reads one page, so a busy commit can hide Mergify's own check and draw the entire ladder"
 check posts_only_when_mergify_is_behind "$CALLEE" "the wait cannot end early, so the check on Mergify's state buys nothing"
 check identifies_mergify_by_app         "$CALLEE" "Mergify's checks are matched by name rather than by app, which goes stale silently"
 check compares_against_the_ci_end_time  "$CALLEE" "'behind' is not compared against anything, so it can never be true"
@@ -287,13 +322,24 @@ admits_the_bot_sender() {
   # lock every human out of a command they can run today.
   matches "$code" 'sender-permission >= write' || return 1
   # The default's OTHER arm, and the one this block shipped without: a fork
-  # pull request's author may refresh their own. It is not decoration. A run
-  # triggered by a fork pull request carries an empty `pull_requests`, so the
-  # nudge above never fires there and the author's own comment is the ONLY way
-  # out of a stall. Dropping the arm removes the automatic and the manual route
-  # together, for the one contributor who has neither.
-  matches "$code" 'sender = \{\{author\}\}' || return 1
-  matches "$code" '^              - from-fork$' || return 1
+  # pull request's author may refresh their own. Not the only route out of a
+  # stall — `resolves_pull_requests_from_the_api` above is what makes the nudge
+  # reach forks at all — but the one the author still has when the nudge itself
+  # is what is broken, and an upstream default is not ours to drop in silence.
+  #
+  # Asserted as a GROUP, not as two independent line matches: split into two
+  # separate arms that each also demand write permission, both lines are still
+  # present, the external author is still refused, and a pair of `matches` calls
+  # would report green. Raised by Codex against the commit that added them.
+  local grouped
+  grouped=$(printf '%s\n' "$code" | awk '
+    /^[[:space:]]*- and:$/                          { open = 1; n = 0; next }
+    open && /^[[:space:]]*- sender = \{\{author\}\}$/ { n++; next }
+    open && /^[[:space:]]*- from-fork$/               { n++; next }
+                                                    { if (n == 2) hit = 1; open = 0; n = 0 }
+    END { if (n == 2) hit = 1; print hit + 0 }
+  ')
+  [ "$grouped" = "1" ] || return 1
 }
 check admits_the_bot_sender "$MERGIFY" ".mergify.yml does not admit github-actions[bot] as a refresh sender, so every nudge is discarded in silence"
 
@@ -325,6 +371,16 @@ mutate "the grace period is removed" "$CALLEE" \
   's|^          sleep "\$GRACE"$|          :|'                        waits_out_the_healthy_case
 mutate "the retry interval is removed" "$CALLEE" \
   's|^            sleep "\$INTERVAL"$|            :|'                 waits_out_the_healthy_case
+mutate "the check-run probe stops paginating" "$CALLEE" \
+  's|gh api --paginate "repos/\$GITHUB_REPOSITORY/commits|gh api "repos/$GITHUB_REPOSITORY/commits|' reads_every_check_run_page
+mutate "the pages are queried one at a time instead of slurped" "$CALLEE" \
+  's|jq -rs|jq -r|'                                                   reads_every_check_run_page
+mutate "the nudge is posted once and never re-sent" "$CALLEE" \
+  's|\[ "\$nudge" -lt "\$NUDGE_ATTEMPTS" \]|false|'                    retries_an_unanswered_nudge
+mutate "the retry stops waiting for an answer before re-posting" "$CALLEE" \
+  's|sleep "\$CONFIRM"|:|'                                            retries_an_unanswered_nudge
+mutate "the ladder posts on a timer instead of checking Mergify" "$CALLEE" \
+  's|if mergify_seen_it; then|if false; then|g'                       retries_an_unanswered_nudge
 mutate "the early exit is removed, so it always posts" "$CALLEE" \
   's|^              exit 0$|              true|'                      posts_only_when_mergify_is_behind
 mutate "Mergify is matched by check name instead of by app" "$CALLEE" \
@@ -334,7 +390,7 @@ mutate "the comparison against the CI end time is dropped" "$CALLEE" \
 mutate "the CI end time is no longer read from the event" "$CALLEE" \
   's|ci_ended="\$(date -u -d "\$RUN_ENDED_AT" +%s)"|ci_ended=0|'      compares_against_the_ci_end_time
 mutate "the command is no longer the first line of the comment" "$CALLEE" \
-  "s|^            '@mergifyio refresh' \\\\\$|            '#### CI finished' \\\\|" the_command_starts_the_comment
+  "s|^              '@mergifyio refresh' \\\\\$|              '#### CI finished' \\\\|" the_command_starts_the_comment
 mutate "the pull request is read from the event payload" "$CALLEE" \
   's|commits/\$HEAD_SHA/pulls|../workflow_run.pull_requests|'         resolves_pull_requests_from_the_api
 mutate "closed pull requests are no longer filtered out" "$CALLEE" \
@@ -342,7 +398,7 @@ mutate "closed pull requests are no longer filtered out" "$CALLEE" \
 mutate "drafts are no longer filtered out" "$CALLEE" \
   's|select(\.draft == false)|.|'                                     skips_what_is_not_waiting
 mutate "the loop is replaced by a single-shot read of the first pull request" "$CALLEE" \
-  's|^          while read -r pr; do$|          pr=${prs%%\\n*}; {|'   nudges_every_matching_pull_request
+  's|^            while read -r pr; do$|            pr=${prs%%\\n*}; {|' nudges_every_matching_pull_request
 mutate "the loop is fed nothing, so it nudges no pull request at all" "$CALLEE" \
   's|^          \$prs$|          |'                                   nudges_every_matching_pull_request
 mutate "an expression is spliced into the shell" "$CALLEE" \
@@ -373,10 +429,15 @@ mutate "the write clause is dropped, locking humans out" "$MERGIFY" \
   's|          - sender-permission >= write||'                        admits_the_bot_sender
 mutate "the restriction is renamed to a command that is not the one posted" "$MERGIFY" \
   's|^  refresh:$|  rebase:|'                                         admits_the_bot_sender
-mutate "the fork author loses the only recovery they have" "$MERGIFY" \
+mutate "the fork author loses the backstop the nudge cannot give them" "$MERGIFY" \
   's|^              - sender = {{author}}$||'                         admits_the_bot_sender
 mutate "the author clause stops being scoped to forks" "$MERGIFY" \
   's|^              - from-fork$||'                                   admits_the_bot_sender
+# The mutation the two above cannot catch on their own: both lines survive, so
+# a presence check stays green, but they no longer share an `and` — the author
+# is admitted only when some OTHER arm already admits them, which is never.
+mutate "the two fork clauses stop sharing one and-arm" "$MERGIFY" \
+  's|^          - and:$|          - or:|'                             admits_the_bot_sender
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
