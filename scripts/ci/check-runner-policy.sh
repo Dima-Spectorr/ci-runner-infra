@@ -652,7 +652,13 @@ EXPR_WRAP = re.compile(r"^\$\{\{(.*)\}\}$", re.DOTALL)
 
 def queue_skip_leaf(expr):
     """One leaf of the Boolean walk: does this term alone rule out a draft?"""
-    if QUEUE_SKIP.search(expr):
+    expr = expr.strip()
+    # BOTH arms anchored, for one reason. `!(!startsWith(github.head_ref,
+    # 'mergify/merge-queue/'))` CONTAINS the first alternative and means its
+    # opposite, and `!startsWith(...) == false` contains the second and means
+    # its opposite too -- the identical mistake as the event arm below, just
+    # spelled on the arm whose correct form already carries the `!`.
+    if QUEUE_SKIP.fullmatch(expr):
         return True
     # THE WHOLE LEAF, not a substring of it. `condition_excludes` walks `&&`
     # and `||` and has no notion of `!` -- deliberately, because the head-ref
@@ -669,7 +675,7 @@ def queue_skip_leaf(expr):
     # An anchored match cannot make that mistake: any operator wrapped around
     # the equality leaves something outside the match, and the leaf is not the
     # bare positive statement any more.
-    hit = QUEUE_SKIP_EVENT.fullmatch(expr.strip())
+    hit = QUEUE_SKIP_EVENT.fullmatch(expr)
     return bool(hit and hit.group(2) not in QUEUE_DRAFT_EVENTS)
 
 
@@ -3587,6 +3593,32 @@ jobs:
 jobs:
   policy:
     if: \"github.event_name == 'push' || github.event.pull_request.draft == false\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # The head-ref arm's own version of the same mistake. Its CORRECT form
+  # carries the `!`, so anchoring is the only way to tell it from a second `!`
+  # wrapped around it — and `!(!startsWith(...))` is true for exactly the
+  # drafts the arm claims to exclude.
+  expect_mq_pair "a doubly negated head-ref test is not a skip" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request]
+jobs:
+  policy:
+    if: \"!(!startsWith(github.head_ref, 'mergify/merge-queue/'))\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # …and the `== false` spelling inverted the same way. `!` binds tighter than
+  # `==`, so this reads "startsWith is TRUE" — which is the draft.
+  expect_mq_pair "an inverted == false head-ref test is not a skip" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request]
+jobs:
+  policy:
+    if: \"!startsWith(github.head_ref, 'mergify/merge-queue/') == false\"
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 10
     steps: [{run: \"true\"}]"
