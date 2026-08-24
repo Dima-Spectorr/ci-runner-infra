@@ -57,17 +57,24 @@ now="$(date -u +%s)"
 # — is resolved to its NEWEST occurrence, because that is the one the pull
 # request displays and the one a human means by "it is green now".
 # ---------------------------------------------------------------------------
+# `--paginate` on both, and it is not defensive padding. A commit in this
+# repository already carries more than twenty check-runs and the shard count
+# only grows; past a hundred, an unpaginated read silently returns the first
+# page, a required check that fell off the end is counted ABSENT, and the lane
+# stops merging a pull request that is in fact green. The retiring
+# `mergify-nudge` documents the same truncation for the same endpoint.
 check_counts() {
   local sha="$1"
   local runs statuses all
-  runs="$(gh api "repos/$R/commits/$sha/check-runs?per_page=100" \
-    --jq '[.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // "")}]' 2>/dev/null || echo '[]')"
-  statuses="$(gh api "repos/$R/commits/$sha/status?per_page=100" \
-    --jq '[.statuses[] | {name: .context, state: (if .state == "pending" then "pending" else .state end), at: (.updated_at // "")}]' 2>/dev/null || echo '[]')"
+  runs="$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" \
+    --jq '.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // "")}' 2>/dev/null || true)"
+  statuses="$(gh api --paginate "repos/$R/commits/$sha/status?per_page=100" \
+    --jq '.statuses[] | {name: .context, state: (if .state == "pending" then "pending" else .state end), at: (.updated_at // "")}' 2>/dev/null || true)"
 
-  # Newest wins per name.
+  # Newest wins per name. `--paginate` emits one document per page, so these are
+  # streams of objects rather than one array; `-s` collects the stream.
   all="$(printf '%s\n%s\n' "$runs" "$statuses" \
-    | jq -s 'add | sort_by(.at) | group_by(.name) | map(.[-1]) | map({(.name): .state}) | add // {}')"
+    | jq -s 'sort_by(.at) | group_by(.name) | map(.[-1]) | map({(.name): .state}) | add // {}')"
 
   local green=0 missing=0 failed=0 pending=0 name state
   for name in "${REQUIRED[@]}"; do
@@ -86,12 +93,49 @@ check_counts() {
 }
 
 # ---------------------------------------------------------------------------
+# already_released <pr> <sha> — has the lane already said this out loud?
+#
+# The lane keeps no state of its own, deliberately, so the record of a release
+# is the release notice: a hidden marker naming the exact head sha. Only read
+# when a verdict is `drop`, which is rare.
+# ---------------------------------------------------------------------------
+released_marker() { printf '<!-- merge-lane:released:%s -->' "$1"; }
+
+already_released() {
+  local num="$1" sha="$2" bodies
+  bodies="$(gh api --paginate "repos/$R/issues/$num/comments?per_page=100" --jq '.[].body' 2>/dev/null || true)"
+  # `grep -c ... >/dev/null` rather than `-q`: under `pipefail` a `-q` that
+  # exits on its first match closes the pipe and the writer dies on SIGPIPE,
+  # which this repository has been bitten by often enough to have a gate for.
+  printf '%s\n' "$bodies" | grep -cF -- "$(released_marker "$sha")" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
 # One pass: read every candidate, rank them, act on the best one.
 # Returns 0 if it acted, 1 if there was nothing to do.
 # ---------------------------------------------------------------------------
 one_pass() {
-  local prs
-  prs="$(gh api "repos/$R/pulls?state=open&base=$LANE_BASE&per_page=100" \
+  local prs base_sha
+
+  # THE BASE AS IT STOOD WHEN THIS PASS READ THE WORLD.
+  #
+  # Everything below — `behind_by` above all — is a statement about this
+  # commit. The `concurrency` group serialises merge-lane runs against each
+  # other, but it says nothing about a human pushing to the base, or an admin
+  # merge, or a release workflow committing. Any of those between the
+  # comparison and the merge call would land a head that was verified against
+  # a base that no longer exists, and `sha=` would not notice: it pins the
+  # head. So the tip is captured here and re-read immediately before acting.
+  if ! base_sha="$(gh api "repos/$R/commits/$LANE_BASE" --jq '.sha' 2>/dev/null)" || [ -z "$base_sha" ]; then
+    echo "lane: cannot read the tip of $LANE_BASE — doing nothing this pass"
+    return 1
+  fi
+
+  # Paginated: past a hundred open pull requests on one base, an unpaginated
+  # read would make every candidate after the first page permanently invisible
+  # — and drafts and red ones, which the lane can never clear, are exactly what
+  # would sit on that page holding a green one out of sight forever.
+  prs="$(gh api --paginate "repos/$R/pulls?state=open&base=$LANE_BASE&per_page=100" \
     --jq '.[] | [.number, .head.sha, (.draft|tostring), (.mergeable_state // "")] | @tsv')"
   if [ -z "$prs" ]; then
     echo "lane: no open pull requests on $LANE_BASE"
@@ -137,8 +181,18 @@ one_pass() {
     # the whole of invariant C: it is what makes this a queue rather than plain
     # auto-merge, and what catches two sessions that pass alone and break
     # together.
-    behind="$(gh api "repos/$R/compare/$LANE_BASE...$sha" --jq '.behind_by' 2>/dev/null || echo '')"
-    [[ "$behind" =~ ^[0-9]+$ ]] || behind=0
+    #
+    # And it FAILS CLOSED. A transient 5xx, a rate limit or an expired token
+    # all make this call fail, and a fallback of 0 would read as "current with
+    # the base" — the one answer that lets a merge through. `sha=` on the merge
+    # call does not save us here: it pins the head, and being behind is a fact
+    # about the BASE. An unreadable comparison means the lane does not know, so
+    # it does nothing this pass and looks again on the next one.
+    if ! behind="$(gh api "repos/$R/compare/$LANE_BASE...$sha" --jq '.behind_by' 2>/dev/null)" \
+      || [[ ! "$behind" =~ ^[0-9]+$ ]]; then
+      echo "lane: #$num wait:base-comparison-unreadable — not assuming it is current"
+      continue
+    fi
 
     # The in-flight clock, and the only one available without storing state:
     # when this head commit was written. `lane_verdict` only allows it to expire
@@ -165,6 +219,19 @@ one_pass() {
 
     echo "lane: #$num $verdict (sha=${sha:0:8} priority=$priority behind=$behind)"
 
+    # A release is a one-shot, not a state the lane keeps re-announcing. The
+    # dropped pull request stays open, stays a candidate, and its verdict stays
+    # `drop` until something changes — so without this it would be ranked first
+    # again on the very next iteration, comment again, and go on doing that
+    # every fifteen minutes for as long as the check never reports. Once per
+    # head sha is once: the marker lives in the comment itself, which survives
+    # a run, a restart and a re-installation, and a push produces a new sha and
+    # therefore a new, warranted release notice.
+    if [ "${verdict%%:*}" = "drop" ] && already_released "$num" "$sha"; then
+      echo "lane: #$num drop already announced for ${sha:0:8} — leaving it alone"
+      continue
+    fi
+
     if lane_admits "$verdict"; then
       local key
       key="$(lane_rank "$verdict" "$priority" "${age:-0}")"
@@ -185,6 +252,17 @@ one_pass() {
 
   if [ "$DRY_RUN" = "true" ]; then
     echo "::notice::dry-run — would take '$action_verdict' on #$action_num"
+    return 1
+  fi
+
+  # THE OTHER HALF OF THE RACE. `sha=` below rejects a moved HEAD; nothing in
+  # the merge API rejects a moved BASE, so it is checked here. If the tip is no
+  # longer what `behind_by` was computed against, every verdict in this pass
+  # describes a world that has gone — so none of them is acted on, and the next
+  # pass reads the new one.
+  local base_now
+  if ! base_now="$(gh api "repos/$R/commits/$LANE_BASE" --jq '.sha' 2>/dev/null)" || [ "$base_now" != "$base_sha" ]; then
+    echo "::warning::$LANE_BASE moved while this pass was reading (${base_sha:0:8} → ${base_now:0:8}) — nothing acted on, re-reading."
     return 1
   fi
 
@@ -216,9 +294,10 @@ one_pass() {
       fi
       ;;
     drop)
-      gh api "repos/$R/issues/$action_num/comments" -f body="$(printf '%s\n\n%s\n' \
+      gh api "repos/$R/issues/$action_num/comments" -f body="$(printf '%s\n\n%s\n\n%s\n' \
         "The merge lane released this pull request: \`$action_verdict\`." \
-        "Its required checks did not all reach a conclusion within the lane's budget, so it was let go rather than left holding the lane. Nothing is wrong with the diff as far as the lane knows — push, or re-run the checks, and it will be picked up again automatically.")" --silent
+        "Its required checks did not all reach a conclusion within the lane's budget, so it was let go rather than left holding the lane. Nothing is wrong with the diff as far as the lane knows — push, or re-run the checks, and it will be picked up again automatically." \
+        "$(released_marker "$action_sha")")" --silent
       echo "::notice::released #$action_num ($action_verdict)"
       ;;
   esac

@@ -179,7 +179,15 @@ jobs:
       required-checks: |
         Your required check
         Your other required check
-      runs-on: self-hosted          # see "minutes", below
+      # A LINUX label. `self-hosted` alone matches the fleet's Windows pool too,
+      # and the lane is bash: `mapfile`, `date -u -d`, `jq`. Use the same
+      # Linux-scoped label your CI jobs use. See "minutes", below.
+      runs-on: [self-hosted, linux]
+      # The SAME sha as the `uses:` pin above. The reusable workflow's own
+      # `actions/checkout` clones the CALLER, so the lane has to be told where
+      # its driver script lives; left unset it runs the tip of the default
+      # branch under a pinned workflow, which is version skew.
+      implementation-ref: 00d3aec8adc67275fe2189c635bdf25cf66bc696
       inflight-budget-seconds: 1800
       dry-run: ${{ vars.MERGE_LANE_ARMED != 'true' }}
     secrets:
@@ -187,9 +195,13 @@ jobs:
       app-private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
 ```
 
-Pin to the release that first ships the lane. The pin above tracks this
-repository's currently documented version, which `docs-pins.selftest.sh`
-asserts; a consumer bumps it the same way it bumps every other fleet pin.
+> **The pin above is not yet resolvable.** It is this repository's currently
+> documented fleet version, which is what `docs-pins.selftest.sh` asserts — and
+> it predates the lane, so `merge-lane.yml` does not exist in that tree. **Do
+> not copy this into a consumer until the lane has been released.** The cutover
+> below is written in that order for this reason: the lane ships here first, a
+> release tag is cut, and both the `uses:` pin and `implementation-ref` are
+> repointed at that tag before any consumer wires it up.
 
 **The schedule is a backstop, not the mechanism.** A merge moves the base, which
 makes every other open pull request one commit behind — and that is not a CI

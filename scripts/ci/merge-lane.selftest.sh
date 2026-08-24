@@ -18,6 +18,12 @@
 # that lands code on the default branch, so the properties asserted hardest are
 # the ones whose loss would let it merge something unverified, merge as the
 # wrong identity, or merge two things at once.
+#
+# Every pattern below matches the TEXT of a workflow or a script, in which
+# `${{ ... }}` and `$sha` are the literal characters that have to be there.
+# Single quotes are the point, not an oversight.
+# shellcheck disable=SC2016
+
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -213,6 +219,63 @@ reads_both_check_surfaces() {
   matches "$code" 'commits/\$sha/status'
 }
 
+# A reusable workflow's `actions/checkout` clones the CALLER. Without an
+# explicit repository the lane would look for its own driver in the consumer's
+# tree, where it does not exist — a failure every consumer hits and this
+# repository never does, because here caller and callee are the same repo.
+checks_out_its_own_implementation() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'repository: \$\{\{ inputs.implementation-repository \}\}' || return 1
+  matches "$code" 'ref: \$\{\{ inputs.implementation-ref \}\}'
+}
+
+# Every list endpoint the lane reads is paginated. Unpaginated, a required check
+# past the first page reads as ABSENT and the lane declines a green pull
+# request; an open pull request past the first page is invisible forever.
+reads_every_page() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'gh api --paginate "repos/\$R/commits/\$sha/check-runs' || return 1
+  matches "$code" 'gh api --paginate "repos/\$R/commits/\$sha/status' || return 1
+  matches "$code" 'gh api --paginate "repos/\$R/pulls\?state=open'
+}
+
+# `behind_by` is the only fact that makes this a queue. A failed comparison must
+# not read as zero: zero means "current with the base", which is precisely the
+# answer that lets a merge through on evidence the lane never gathered.
+fails_closed_on_an_unreadable_comparison() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'if ! behind=' || return 1
+  matches "$code" 'wait:base-comparison-unreadable' || return 1
+  # And the old shape must be gone: a fallback assignment of 0 anywhere near
+  # `behind` re-opens it silently.
+  ! matches "$code" '\|\| behind=0'
+}
+
+# `sha=` pins the head; nothing in the merge API pins the base. A push to the
+# base between the comparison and the merge lands a head verified against a
+# base that no longer exists, and the concurrency group does not help — it
+# serialises merge-lane runs, not humans.
+refuses_a_base_that_moved() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'base_sha=' || return 1
+  matches "$code" 'base_now=' || return 1
+  matches "$code" '\[ "\$base_now" != "\$base_sha" \]'
+}
+
+# A dropped pull request stays open and keeps its verdict, so without a
+# per-sha record the lane re-announces the same release on every pass and every
+# scheduled sweep, forever.
+announces_a_release_once() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'merge-lane:released:' || return 1
+  matches "$code" 'already_released "\$num" "\$sha"'
+}
+
 # Empty configuration must stop the lane, not open it.
 fails_closed_on_empty_configuration() {
   local code
@@ -255,6 +318,7 @@ check is_bounded "$CALLEE" "the lane is unbounded, so one run can hold the lock 
 check keeps_expressions_out_of_the_shell "$CALLEE" "an expression is interpolated into the shell of a job that can merge"
 check demands_its_gate "$CALLEE" "required-checks is optional, so a consumer can wire a lane that merges on no evidence"
 check delegates_the_decision "$CALLEE" "the callee decides something itself, in YAML, where no pull request can test it"
+check checks_out_its_own_implementation "$CALLEE" "the checkout takes the caller's tree, so every consumer's lane dies looking for a driver that is not there"
 
 check triggers_on_ci_completion "$CALLER" "the caller does not fire on a completed CI run, which is the entire fast path"
 check has_a_backstop_sweep "$CALLER" "there is no sweep, so a pull request needing only an update waits for an event that never comes"
@@ -265,6 +329,10 @@ check merges_only_the_sha_it_verified "$DRIVER" "the merge is not conditional on
 check treats_a_non_verdict_as_a_failure "$DRIVER" "a skipped or neutral required check counts as success, so the lane merges what nothing checked"
 check reads_both_check_surfaces "$DRIVER" "only one check surface is read, so a required commit status can never be satisfied"
 check fails_closed_on_empty_configuration "$DRIVER" "empty configuration does not stop the lane"
+check reads_every_page "$DRIVER" "a list endpoint is read unpaginated, so a required check or a whole pull request can be invisible"
+check fails_closed_on_an_unreadable_comparison "$DRIVER" "a failed base comparison reads as up-to-date, which is the one answer that lets a merge through"
+check refuses_a_base_that_moved "$DRIVER" "the base tip is not re-checked before acting, so a push to the base merges a head verified against a base that is gone"
+check announces_a_release_once "$DRIVER" "a release is not recorded per sha, so the lane re-comments on every pass and every sweep"
 
 if required_checks_all_exist_in_ci; then ok; else
   bad "a check named in the caller's required-checks does not match any job name in ci.yml — the lane would count it missing and decline every pull request"
@@ -307,6 +375,10 @@ mutate "required-checks becomes optional" "$CALLEE" \
   's|^        required: true$|        required: false|' demands_its_gate
 mutate "the callee inlines a decision instead of delegating" "$CALLEE" \
   's|^        run: bash scripts/ci/merge-lane\.sh$|        run: gh pr merge --squash|' delegates_the_decision
+mutate "the checkout reverts to the caller's tree" "$CALLEE" \
+  's@^          repository: .*@          fetch-depth: 0@' checks_out_its_own_implementation
+mutate "the implementation ref stops being pinnable" "$CALLEE" \
+  's@^          ref: .*inputs.implementation-ref.*@          ref: main@' checks_out_its_own_implementation
 
 mutate "the caller stops listening to CI" "$CALLER" \
   's|^    workflows: \[CI\]|    workflows: [Something Else]|' triggers_on_ci_completion
@@ -327,6 +399,16 @@ mutate "the commit-status surface is dropped" "$DRIVER" \
   's|commits/\$sha/status|commits/$sha/nothing|' reads_both_check_surfaces
 mutate "the empty-configuration guard is removed" "$DRIVER" \
   's%^if \[ "..#REQUIRED\[@\]." -eq 0 \]; then%if false; then%' fails_closed_on_empty_configuration
+mutate "the check-run read stops paginating" "$DRIVER" \
+  's@gh api --paginate "repos/\$R/commits/\$sha/check-runs@gh api "repos/$R/commits/$sha/check-runs@' reads_every_page
+mutate "the pull request list stops paginating" "$DRIVER" \
+  's@gh api --paginate "repos/\$R/pulls?state=open@gh api "repos/$R/pulls?state=open@' reads_every_page
+mutate "an unreadable comparison falls back to up-to-date" "$DRIVER" \
+  's@^    if ! behind=@    behind=0; if false; behind=@' fails_closed_on_an_unreadable_comparison
+mutate "the moved-base guard is removed" "$DRIVER" \
+  's@\[ "\$base_now" != "\$base_sha" \]@false@' refuses_a_base_that_moved
+mutate "the release stops being recorded per sha" "$DRIVER" \
+  's@merge-lane:released:@merge-lane-released@' announces_a_release_once
 
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane: $FAIL failed, $PASS passed"

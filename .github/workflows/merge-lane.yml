@@ -130,6 +130,23 @@ on:
         required: false
         default: 'merge-lane/priority-'
         type: string
+      implementation-repository:
+        description: >-
+          Where `scripts/ci/merge-lane.sh` lives. A reusable workflow's
+          `actions/checkout` clones the CALLER, not the callee, so the lane has
+          to name its own repository to find its own driver.
+        required: false
+        default: Dima-Spectorr/ci-runner-infra
+        type: string
+      implementation-ref:
+        description: >-
+          The ref of `implementation-repository` to run. Set it to the SAME
+          40-hex sha your `uses:` line is pinned to. Left at the default the
+          lane runs the tip of the default branch under a pinned workflow,
+          which is the version skew the fleet's pin gate exists to stop.
+        required: false
+        default: main
+        type: string
       dry-run:
         description: >-
           Compute and log every verdict, act on none. The honest way to land
@@ -154,6 +171,7 @@ permissions:
 jobs:
   lane:
     name: Merge lane
+    # dynamic-runner-allowed(lane, #402): the label is a workflow_call input, scoped by the calling repository
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 15
 
@@ -183,9 +201,25 @@ jobs:
       contents: read
 
     steps:
-      - name: Check out the default branch's copy of the decision script
+      # THE IMPLEMENTATION REPOSITORY, NOT THE CALLER'S.
+      #
+      # In a `workflow_call` the `github` context belongs to the CALLER, so a
+      # bare `actions/checkout` here would clone the consumer's tree — which
+      # does not contain `scripts/ci/merge-lane.sh`, and the run would die at
+      # the last step. `shared-infra-anchor.yml` relies on exactly that
+      # behaviour, because its steps run the CALLER's compose file; this
+      # workflow needs the opposite, and has to say so.
+      #
+      # There is no context in a reusable workflow that names the callee's own
+      # repository and ref, so they are inputs. Pin `implementation-ref` to the
+      # SAME ref your `uses:` line is pinned to: a lane running one version of
+      # the driver under another version of the workflow is exactly the drift
+      # this repository's pin gate exists to prevent.
+      - name: Check out the lane's implementation
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          repository: ${{ inputs.implementation-repository }}
+          ref: ${{ inputs.implementation-ref }}
           persist-credentials: false
 
       - name: Mint the merge App token
