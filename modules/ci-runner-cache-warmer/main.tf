@@ -266,7 +266,52 @@ locals {
   # it needs no substitution escaping; adding one means escaping it.
   ensure_getcap = "if ! command -v getcap >/dev/null 2>&1; then\n  if command -v apt-get >/dev/null 2>&1; then\n    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends libcap2-bin >/dev/null 2>&1 || true\n  elif command -v apk >/dev/null 2>&1; then\n    apk add --no-cache libcap-getcap >/dev/null 2>&1 || apk add --no-cache libcap >/dev/null 2>&1 || true\n  fi\nfi\n"
 
-  run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\n${local.ensure_getcap}exec ${local.staged_dir}/publish-cache-snapshot.sh\n"
+  # AND THE CREDENTIAL SCAN NEEDS THE REPOSITORY'S ALLOWLIST, FOR THE SAME REASON
+  # THE getcap INSTALL DOES: the workflow this module replaces passed
+  # CACHE_SCAN_ALLOW_FILE in BOTH of its jobs, and nothing was carrying it over.
+  #
+  # The scan refuses a staged tree holding what looks like an embedded
+  # credential, and dependency trees legitimately contain such files — a test
+  # fixture that is a PEM, a package README quoting `https://user:pass@host`.
+  # Refusing them is right; the way past is a named, commented digest, never a
+  # widened rule. `url-embedded-basic-auth` in particular is excusable ONLY from
+  # the allowlist FILE, where a comment says which package ships it, and never
+  # from the bare-hex CACHE_SCAN_ALLOW_DIGESTS. So the file is the only route,
+  # and a warmer that cannot pass one cannot warm such a repository at all.
+  #
+  # Resolved at warm time against the checkout rather than asserted in a plan.
+  # The path is a convention with a default, so the ordinary repository
+  # configures nothing; a repository with no such file exports nothing and the
+  # scan excuses nothing, which is the correct starting state. But an operator
+  # who NAMED a path and mistyped it must not get that same silence — an
+  # allowlist that is not there reads exactly like one that worked — so a
+  # non-default path that is missing fails the step.
+  #
+  # `null` means the convention and is the default; a named path is a claim the
+  # operator made and is therefore required to exist; `""` turns the lookup off.
+  # No `$` anywhere in here — this goes into `run_publish`, which is NOT put
+  # through the `escape_dollars` pass (only the staging script is), so a `$`
+  # added here reaches Cloud Build as a substitution key and refuses the build.
+  # The path itself is validated to hold neither, along with the quote that
+  # would otherwise end the single-quoted string it is pasted into.
+  scan_allow_default  = ".github/cache-scan-allow.txt"
+  scan_allow_rel      = var.cache_scan_allow_file == null ? local.scan_allow_default : var.cache_scan_allow_file
+  scan_allow_path     = local.scan_allow_rel == "" ? "" : "/workspace/${local.scan_allow_rel}"
+  scan_allow_required = var.cache_scan_allow_file != null && var.cache_scan_allow_file != ""
+
+  ensure_scan_allow = local.scan_allow_path == "" ? "" : join("", [
+    "if [ -f '${local.scan_allow_path}' ]; then\n",
+    "  CACHE_SCAN_ALLOW_FILE='${local.scan_allow_path}'\n",
+    "  export CACHE_SCAN_ALLOW_FILE\n",
+    "  echo '[warm] credential-scan allowlist: ${local.scan_allow_rel}'\n",
+    "else\n",
+    local.scan_allow_required
+    ? "  echo '[warm] cache_scan_allow_file names ${local.scan_allow_rel}, which is not in the checkout - refusing, because an allowlist that is not there excuses nothing and reads exactly like one that worked' >&2\n  exit 1\n"
+    : "  echo '[warm] no credential-scan allowlist at ${local.scan_allow_rel}; the scan will excuse nothing'\n",
+    "fi\n",
+  ])
+
+  run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\n${local.ensure_getcap}${local.ensure_scan_allow}exec ${local.staged_dir}/publish-cache-snapshot.sh\n"
   run_turbo   = "#!/bin/sh\nset -eu\necho '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\nexec ${local.staged_dir}/warm-turbo.sh\n"
 
   # HOW THE REPOSITORY IS INSTALLED AND BUILT — WORKED OUT AT WARM TIME, FROM THE

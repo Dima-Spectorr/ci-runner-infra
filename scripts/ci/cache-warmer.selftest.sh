@@ -380,11 +380,56 @@ ensures_getcap_before_publishing() { # <file>
   matches "$code" 'apk add --no-cache libcap-getcap' || return 1
   # In the wrapper that runs the publisher, and therefore in BOTH steps that run
   # it — not bolted onto one of them.
-  matches "$code" '\$\{local\.ensure_getcap\}exec \$\{local\.staged_dir\}/publish-cache-snapshot\.sh'
+  matches "$code" '\$\{local\.ensure_getcap\}.*exec \$\{local\.staged_dir\}/publish-cache-snapshot\.sh'
 }
 
 if ensures_getcap_before_publishing "$MAIN"; then ok; else
   bad "the publishing wrapper no longer ensures getcap is installed — node:22 has no libcap2-bin, so the warm installs the whole dependency tree and then refuses to build the snapshot it was fired to build"
+fi
+
+# 15. AND IT PASSES THE REPOSITORY'S CREDENTIAL-SCAN ALLOWLIST, the other thing
+#     the replaced workflow did in BOTH of its jobs and the module did not carry
+#     over. Dependency trees legitimately hold files the scan refuses — a
+#     package's PEM test fixture, a README quoting `https://user:pass@host` — and
+#     `url-embedded-basic-auth` is excusable ONLY from the allowlist file, never
+#     from the bare-hex env variable. Without a way to pass one, such a
+#     repository cannot be warmed at all.
+passes_scan_allowlist() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'CACHE_SCAN_ALLOW_FILE' || return 1
+  # Resolved against the checkout, so the ordinary repository configures
+  # nothing — and the default is a convention, not a required input.
+  matches "$code" 'scan_allow_default *= *"\.github/cache-scan-allow\.txt"' || return 1
+  matches "$code" 'if \[ -f' || return 1
+  # A path the operator NAMED and mistyped must fail the step, not go quiet:
+  # an allowlist that is not there excuses nothing and reads exactly like one
+  # that worked.
+  matches "$code" 'scan_allow_required' || return 1
+  matches "$code" 'exit 1' || return 1
+  # In the wrapper, and therefore in BOTH steps that run the publisher.
+  matches "$code" '\$\{local\.ensure_scan_allow\}.*exec \$\{local\.staged_dir\}/publish-cache-snapshot\.sh'
+}
+
+if passes_scan_allowlist "$MAIN"; then ok; else
+  bad "the publishing wrapper no longer passes the repository's credential-scan allowlist — a repository whose dependency tree holds a PEM fixture or a URL with basic auth cannot be warmed, and the only route past that class is the allowlist FILE"
+fi
+
+# 16. AND THAT PATH IS CHECKED AT PLAN TIME, because it is pasted into a shell
+#     string in a step that can reach the metadata server and mint the warmer's
+#     write token. A quote ends that string; a `$` is read by Cloud Build as a
+#     substitution key and refuses the build outright.
+validates_scan_allow_path() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'variable "cache_scan_allow_file"' || return 1
+  matches "$code" 'validation' || return 1
+  matches "$code" "regexall" || return 1
+  matches "$code" 'startswith'
+}
+
+if validates_scan_allow_path "$VARS"; then ok; else
+  bad "cache_scan_allow_file is no longer validated — it is pasted into a single-quoted shell string in the step that holds the warmer's write credential"
 fi
 
 # --- mutations -----------------------------------------------------------------
@@ -410,7 +455,7 @@ mutate() { # <description> <file> <sed-program> <predicate>
 }
 
 mutate "the getcap install dropped from the publishing wrapper" "$MAIN" \
-  's@\${local\.ensure_getcap}exec@exec@' \
+  's@\${local\.ensure_getcap}\${local\.ensure_scan_allow}@${local.ensure_scan_allow}@' \
   ensures_getcap_before_publishing
 
 mutate "only the Debian package manager handled" "$MAIN" \
@@ -420,6 +465,22 @@ mutate "only the Debian package manager handled" "$MAIN" \
 mutate "Alpine given the library instead of the scanner" "$MAIN" \
   's@apk add --no-cache libcap-getcap >/dev/null 2>&1 || @@' \
   ensures_getcap_before_publishing
+
+mutate "the allowlist dropped from the publishing wrapper" "$MAIN" \
+  's@\${local\.ensure_scan_allow}exec@exec@' \
+  passes_scan_allowlist
+
+mutate "a missing named allowlist made silent instead of fatal" "$MAIN" \
+  's@exit 1@true@' \
+  passes_scan_allowlist
+
+mutate "the allowlist path taken on trust" "$VARS" \
+  's@^ *validation {@  lifecycle_stub {@' \
+  validates_scan_allow_path
+
+mutate "the conventional allowlist path renamed out from under the repositories" "$MAIN" \
+  's@\.github/cache-scan-allow\.txt@.github/scan-allow.txt@' \
+  passes_scan_allowlist
 
 mutate "the publisher copied into the module" "$MAIN" \
   's@file("\${path\.module}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh")@file("${path.module}/scripts/publish-cache-snapshot.sh")@' \
