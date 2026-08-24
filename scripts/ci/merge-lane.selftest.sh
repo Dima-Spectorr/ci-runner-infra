@@ -219,6 +219,17 @@ reads_both_check_surfaces() {
   matches "$code" 'commits/\$sha/status'
 }
 
+# A dry run still mints the App token, so a caller wired before the App exists
+# fails on every CI completion on the default branch. That red is
+# indistinguishable from a broken lane, which is the one signal that has to stay
+# meaningful — so the caller stays switched off until an operator says the App
+# is there.
+waits_for_the_app_to_exist() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" "^ *if: vars.MERGE_LANE_ENABLED == 'true'$"
+}
+
 # A reusable workflow's `actions/checkout` clones the CALLER. Without an
 # explicit repository the lane would look for its own driver in the consumer's
 # tree, where it does not exist — a failure every consumer hits and this
@@ -324,6 +335,7 @@ check triggers_on_ci_completion "$CALLER" "the caller does not fire on a complet
 check has_a_backstop_sweep "$CALLER" "there is no sweep, so a pull request needing only an update waits for an event that never comes"
 check arms_deliberately "$CALLER" "the lane is not armed by an explicit variable, so it cannot be landed in dry run"
 check passes_the_app_credentials "$CALLER" "the caller does not pass App credentials, so the lane cannot authenticate"
+check waits_for_the_app_to_exist "$CALLER" "the caller runs before an operator confirms the App exists, so it goes red on every CI completion and that red stops meaning anything"
 
 check merges_only_the_sha_it_verified "$DRIVER" "the merge is not conditional on the verified sha, so a push mid-pass merges unverified code"
 check treats_a_non_verdict_as_a_failure "$DRIVER" "a skipped or neutral required check counts as success, so the lane merges what nothing checked"
@@ -386,6 +398,8 @@ mutate "the backstop sweep is removed" "$CALLER" \
   's|^  schedule:|  x-schedule:|' has_a_backstop_sweep
 mutate "the lane is armed unconditionally" "$CALLER" \
   's@dry-run: .*MERGE_LANE_ARMED.*@dry-run: false@' arms_deliberately
+mutate "the caller runs before the App is provisioned" "$CALLER" \
+  "s@^    if: vars.MERGE_LANE_ENABLED == 'true'\$@    name: lane@" waits_for_the_app_to_exist
 mutate "the private key stops being passed" "$CALLER" \
   's@^      app-private-key: .*@      app-private-key: literal-key@' passes_the_app_credentials
 
