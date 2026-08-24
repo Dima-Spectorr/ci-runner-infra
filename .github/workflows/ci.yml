@@ -491,6 +491,13 @@ jobs:
       - name: slot lifecycle behaviour
         run: sudo -n bash scripts/ci/slot-lifecycle.behaviour.sh
 
+  shell-infra:
+    name: Shell — shared infra and Windows host boot
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
       # The band's two constants live in two files in two languages, because
       # the network module is created once per project and deliberately does
       # not depend on the pools. A firewall span narrower than the DNAT range
@@ -749,7 +756,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -918,6 +925,7 @@ jobs:
       - shell-powershell
       - shell-decisions
       - shell-host
+      - shell-infra
       - shell-cache
       - shell-contracts
       - shell-runner-policy
