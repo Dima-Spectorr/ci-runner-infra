@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# Self-test for the workflow that tells Mergify its webhook did not arrive.
+#
+# WHY THIS FILE HAS TO EXIST, RATHER THAN A TEST RUN
+#
+# `mergify-nudge-self.yml` is triggered by `workflow_run`, and GitHub dispatches
+# `workflow_run` from the DEFAULT BRANCH only. The pull request that changes the
+# nudge cannot run the nudge. There is no arrangement of jobs that fixes this —
+# it is a property of the trigger — so the only evidence available at
+# pull-request time is evidence about the TEXT.
+#
+# That makes this file the whole safety net, and makes the mutations the
+# important half of it. A predicate that only passes on correct input is not
+# evidence; each mutation below breaks one property the way a later edit
+# plausibly would, and asserts that this test goes red for it. Anything that is
+# asserted here and not mutated here is asserted by hope.
+#
+# WHAT IS DELIBERATELY NOT ASSERTED
+#
+# That the mechanism WORKS — that Mergify reads the comment, honours the
+# `commands_restrictions` entry that admits `github-actions[bot]`, and advances
+# the pull request. That is a fact about Mergify's servers, it is not decidable
+# from this repository, and the first observation of it is the first CI
+# completion on main after the merge. `docs/ci-merge-queue-baseline.md` says
+# what to look at and what a silent failure looks like.
+
+# The predicates match the TEXT of the workflows, in which `$GRACE`, `$prs` and
+# `${{ … }}` are the literal characters that must be there. Expanding them in
+# this shell would make every match fail against a file that is perfectly
+# correct.
+# shellcheck disable=SC2016
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+CALLEE="$ROOT/.github/workflows/mergify-nudge.yml"
+CALLER="$ROOT/.github/workflows/mergify-nudge-self.yml"
+CI="$ROOT/.github/workflows/ci.yml"
+MERGIFY="$ROOT/.mergify.yml"
+
+PASS=0
+FAIL=0
+ok()  { PASS=$((PASS + 1)); }
+bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
+
+for f in "$CALLEE" "$CALLER" "$CI" "$MERGIFY"; do
+  [ -f "$f" ] || { printf 'FAIL: missing %s — every check below would be vacuous\n' "$f"; exit 1; }
+done
+
+# Code only: full-line comments stripped, so the long rationale above each
+# property can never be what satisfies the check for that property. Both files
+# argue for the properties at length in prose, which is exactly the material
+# that would make a naive grep pass over a workflow that lost them.
+code_of() { grep -vE '^[[:space:]]*#' "$1"; }
+
+# Never `… | grep -q` under `set -o pipefail`: grep exits on the first match,
+# the writer takes SIGPIPE, and a successful match is then reported as a
+# failure. Count instead, and compare.
+matches() { # <text> <ere>
+  local n
+  n=$(printf '%s\n' "$1" | grep -cE -- "$2")
+  [ "${n:-0}" -gt 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# The callee: what the nudge does
+# ---------------------------------------------------------------------------
+
+# A callee with a second trigger would run on its own account, from a context
+# where `github.event.workflow_run` is empty — so every field it reads would be
+# blank and the guards would be answering questions about nothing.
+is_reusable_only() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^  workflow_call:' || return 1
+  ! matches "$code" '^  (push|pull_request|pull_request_target|schedule|workflow_run|workflow_dispatch|issue_comment):' || return 1
+}
+
+# Without this the job cannot post, and a nudge that cannot be posted fails
+# exactly like a nudge that was not needed: quietly, with the pull request
+# waiting.
+can_comment() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^      pull-requests: write$' || return 1
+}
+
+# The scope that governs `/commits/{sha}/check-runs`. Declaring a `permissions:`
+# block sets everything unlisted to `none`, so omitting this does not fall back
+# to a default read — the probe 403s, `mergify_seen_it` fails closed, and every
+# run nudges. Asserted on BOTH files because a callee cannot exceed its caller:
+# either half missing produces the same 403.
+can_read_check_runs() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^      checks: read$' || return 1
+}
+
+# A red CI run is a queue event too. Dropping `failure` leaves a dead entry
+# holding the front of a serial queue until `checks_timeout`.
+acts_on_failure_too() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'success\|failure\|timed_out\)' || return 1
+}
+
+# `cancelled` means `cancel-in-progress` superseded the run and a newer one is
+# already in flight. Nudging for it posts a comment about a commit nobody is
+# waiting on, on every force-push.
+ignores_a_non_verdict() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'is not a verdict Mergify can act on' || return 1
+  matches "$code" '^            \*\)$' || return 1
+}
+
+# The grace period is what keeps this silent on the healthy majority of runs.
+# Removing it turns the nudge into a comment on every CI completion, which is
+# how the automation gets muted.
+waits_out_the_healthy_case() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'sleep "\$GRACE"' || return 1
+  matches "$code" 'sleep "\$INTERVAL"' || return 1
+}
+
+# And the wait is only worth anything if the answer can stop it. A run that
+# waits and then posts regardless is the unconditional version with extra
+# latency.
+posts_only_when_mergify_is_behind() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'if mergify_seen_it; then' || return 1
+  matches "$code" 'no nudge needed' || return 1
+  matches "$code" '^              exit 0$' || return 1
+}
+
+# By app, not by check name. `Mergify Merge Protections` is Mergify's name to
+# change, and a name that stops matching makes this report "behind" forever —
+# a comment on every run, for a reason nobody would look for in a grep pattern.
+identifies_mergify_by_app() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'select\(\.app\.slug == "mergify"\)' || return 1
+}
+
+# "Behind" is a comparison, not a state. Without the CI end time this asks
+# "has Mergify ever run", which is true on every pull request that has ever
+# been evaluated, so it would never nudge at all.
+compares_against_the_ci_end_time() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'ci_ended="\$\(date -u -d "\$RUN_ENDED_AT" \+%s\)"' || return 1
+  matches "$code" '\-ge "\$ci_ended"' || return 1
+}
+
+# Mergify reads a command only when it STARTS the comment. Any prefix — a
+# heading, a quote, an HTML marker — and the comment is prose that nothing acts
+# on, while the workflow log still says it nudged.
+the_command_starts_the_comment() {
+  local code; code=$(code_of "$1")
+  matches "$code" "^            '@mergifyio refresh' \\\\$" || return 1
+}
+
+# `workflow_run.pull_requests` is EMPTY for a fork pull request. Reading it
+# instead would make forks the one case that silently never gets nudged.
+resolves_pull_requests_from_the_api() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'commits/\$HEAD_SHA/pulls' || return 1
+  ! matches "$code" 'workflow_run\.pull_requests' || return 1
+}
+
+# A draft or closed pull request is not waiting on Mergify, and commenting on
+# one is pure noise on somebody's unfinished work.
+skips_what_is_not_waiting() {
+  local code; code=$(code_of "$1")
+  matches "$code" 'select\(\.state == "open"\)' || return 1
+  matches "$code" 'select\(\.draft == false\)' || return 1
+}
+
+# One commit can head more than one open pull request. Refreshing the first and
+# stopping leaves the others in the exact state this exists to clear.
+nudges_every_matching_pull_request() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^          while read -r pr; do$' || return 1
+  matches "$code" '^          \$prs$' || return 1
+}
+
+# `${{ }}` is substituted before the shell parses the line, so a value carrying
+# a quote or a newline becomes shell SYNTAX. `head_branch` and `display_title`
+# are attacker-chosen on a fork pull request, and this job holds a write token.
+# The whole run body must therefore read from the environment and nothing else.
+keeps_expressions_out_of_the_shell() {
+  local body
+  body=$(sed -n '/run: |/,$p' "$1")
+  [ -n "$body" ] || return 1
+  ! matches "$body" '\$\{\{' || return 1
+}
+
+# The job sleeps by design, so an unbounded one is a job that can sleep for six
+# hours against the account's concurrency.
+is_bounded() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^    timeout-minutes: [0-9]+$' || return 1
+}
+
+# ---------------------------------------------------------------------------
+# The caller: whether the nudge is ever reached
+# ---------------------------------------------------------------------------
+
+triggers_on_ci_completion() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^  workflow_run:' || return 1
+  matches "$code" '^    types: \[completed\]$' || return 1
+}
+
+# A newer CI completion must cancel a nudge still sitting in its grace period
+# for the previous commit on the same branch: that older nudge would be asking
+# a question about a superseded sha.
+supersedes_an_older_nudge() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^  cancel-in-progress: true$' || return 1
+  matches "$code" '^  group: mergify-nudge-' || return 1
+}
+
+# The callee declares the write, but a reusable workflow cannot grant itself
+# more than the caller gave it. Omit it here and the callee's declaration is a
+# statement about a permission it does not have.
+grants_the_write_at_the_call() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^      pull-requests: write$' || return 1
+  matches "$code" 'uses: \./\.github/workflows/mergify-nudge\.yml' || return 1
+}
+
+check() { # <predicate> <file> <description>
+  if "$1" "$2"; then ok; else bad "$3"; fi
+}
+
+echo "mergify-nudge self-test:"
+check is_reusable_only                  "$CALLEE" "the callee has a trigger other than workflow_call, so it can run with no workflow_run context"
+check can_comment                       "$CALLEE" "the job cannot post a comment, so every nudge is a silent no-op"
+check can_read_check_runs               "$CALLEE" "the job cannot read check-runs, so the probe 403s and every run nudges"
+check acts_on_failure_too               "$CALLEE" "a failed CI run is not nudged, so a dead queue entry waits out checks_timeout"
+check ignores_a_non_verdict             "$CALLEE" "a cancelled or skipped run is nudged, so every force-push posts a comment"
+check waits_out_the_healthy_case        "$CALLEE" "the grace period is gone, so the healthy majority of runs post a comment"
+check posts_only_when_mergify_is_behind "$CALLEE" "the wait cannot end early, so the check on Mergify's state buys nothing"
+check identifies_mergify_by_app         "$CALLEE" "Mergify's checks are matched by name rather than by app, which goes stale silently"
+check compares_against_the_ci_end_time  "$CALLEE" "'behind' is not compared against anything, so it can never be true"
+check the_command_starts_the_comment    "$CALLEE" "the command does not start the comment, so Mergify does not read it"
+check resolves_pull_requests_from_the_api "$CALLEE" "the pull request is read from the event payload, which is empty for a fork"
+check skips_what_is_not_waiting         "$CALLEE" "draft and closed pull requests are commented on"
+check nudges_every_matching_pull_request "$CALLEE" "only the first pull request at this head is nudged"
+check keeps_expressions_out_of_the_shell "$CALLEE" "an expression is interpolated into the shell of a job holding a write token"
+check is_bounded                        "$CALLEE" "the job that sleeps by design has no timeout"
+check triggers_on_ci_completion         "$CALLER" "the caller does not fire on a completed CI run"
+check supersedes_an_older_nudge         "$CALLER" "a superseded nudge is not cancelled and will ask about an old sha"
+check grants_the_write_at_the_call      "$CALLER" "the caller does not pass the write the callee needs"
+check can_read_check_runs               "$CALLER" "the caller does not pass checks: read, so the callee's own declaration buys nothing"
+
+# The trigger names the CI workflow by its `name:` key, which is the only handle
+# `workflow_run` offers. Renaming `ci.yml`'s name detaches the nudge with
+# nothing going red anywhere — the workflow simply stops being dispatched. This
+# is the one check that reads a file the nudge does not own.
+ci_name=$(grep -m1 -E '^name: ' "$CI" | sed 's/^name: //')
+if [ -n "$ci_name" ] && matches "$(code_of "$CALLER")" "^    workflows: \[$ci_name\]$"; then ok
+else bad "the caller's workflow_run trigger does not name ci.yml's '$ci_name' — the nudge is detached and nothing reports it"; fi
+
+# The other half. Without this entry Mergify discards the comment for want of
+# sender permission, in silence, and the only symptom is that nothing improves.
+admits_the_bot_sender() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^commands_restrictions:$' || return 1
+  matches "$code" '^  refresh:$' || return 1
+  matches "$code" 'sender = github-actions\[bot\]' || return 1
+  # Declaring the key replaces the default, so dropping the write clause would
+  # lock every human out of a command they can run today.
+  matches "$code" 'sender-permission >= write' || return 1
+}
+check admits_the_bot_sender "$MERGIFY" ".mergify.yml does not admit github-actions[bot] as a refresh sender, so every nudge is discarded in silence"
+
+mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
+  local desc="$1" f="$2" prog="$3" pred="$4" tmp
+  tmp=$(mktemp)
+  sed "$prog" "$f" >"$tmp"
+  if cmp -s "$tmp" "$f"; then
+    bad "mutation changed nothing, so it asserts nothing: $desc"
+  elif "$pred" "$tmp"; then
+    bad "mutation not detected: $desc"
+  else
+    ok
+  fi
+  rm -f "$tmp"
+}
+
+mutate "the callee grows a pull_request trigger" "$CALLEE" \
+  's|^  workflow_call:|  pull_request:\n  workflow_call:|'            is_reusable_only
+mutate "the comment permission is downgraded to read" "$CALLEE" \
+  's|^      pull-requests: write$|      pull-requests: read|'         can_comment
+mutate "the callee stops granting itself checks: read" "$CALLEE" \
+  's|^      checks: read$|      contents: read|'                      can_read_check_runs
+mutate "failure is dropped from the verdicts" "$CALLEE" \
+  's|success\|failure\|timed_out)|success)|'                          acts_on_failure_too
+mutate "the catch-all arm is removed, so every conclusion nudges" "$CALLEE" \
+  's|^            \*)$|            never_matches)|'                   ignores_a_non_verdict
+mutate "the grace period is removed" "$CALLEE" \
+  's|^          sleep "\$GRACE"$|          :|'                        waits_out_the_healthy_case
+mutate "the retry interval is removed" "$CALLEE" \
+  's|^            sleep "\$INTERVAL"$|            :|'                 waits_out_the_healthy_case
+mutate "the early exit is removed, so it always posts" "$CALLEE" \
+  's|^              exit 0$|              true|'                      posts_only_when_mergify_is_behind
+mutate "Mergify is matched by check name instead of by app" "$CALLEE" \
+  's|select(\.app\.slug == "mergify")|select(.name == "Mergify Merge Protections")|' identifies_mergify_by_app
+mutate "the comparison against the CI end time is dropped" "$CALLEE" \
+  's|-ge "\$ci_ended"|-ge 0|'                                         compares_against_the_ci_end_time
+mutate "the CI end time is no longer read from the event" "$CALLEE" \
+  's|ci_ended="\$(date -u -d "\$RUN_ENDED_AT" +%s)"|ci_ended=0|'      compares_against_the_ci_end_time
+mutate "the command is no longer the first line of the comment" "$CALLEE" \
+  "s|^            '@mergifyio refresh' \\\\\$|            '#### CI finished' \\\\|" the_command_starts_the_comment
+mutate "the pull request is read from the event payload" "$CALLEE" \
+  's|commits/\$HEAD_SHA/pulls|../workflow_run.pull_requests|'         resolves_pull_requests_from_the_api
+mutate "closed pull requests are no longer filtered out" "$CALLEE" \
+  's|select(\.state == "open")|.|'                                    skips_what_is_not_waiting
+mutate "drafts are no longer filtered out" "$CALLEE" \
+  's|select(\.draft == false)|.|'                                     skips_what_is_not_waiting
+mutate "the loop is replaced by a single-shot read of the first pull request" "$CALLEE" \
+  's|^          while read -r pr; do$|          pr=${prs%%\\n*}; {|'   nudges_every_matching_pull_request
+mutate "the loop is fed nothing, so it nudges no pull request at all" "$CALLEE" \
+  's|^          \$prs$|          |'                                   nudges_every_matching_pull_request
+mutate "an expression is spliced into the shell" "$CALLEE" \
+  's|\$RUN_URL|${{ github.event.workflow_run.html_url }}|'            keeps_expressions_out_of_the_shell
+mutate "the timeout is removed" "$CALLEE" \
+  's|^    timeout-minutes: [0-9]*$|    # unbounded|'                  is_bounded
+
+mutate "the caller no longer fires on completion" "$CALLER" \
+  's|^    types: \[completed\]$|    types: [requested]|'              triggers_on_ci_completion
+mutate "the workflow_run trigger is replaced by a push trigger" "$CALLER" \
+  's|^  workflow_run:|  push:|'                                       triggers_on_ci_completion
+mutate "a superseded nudge is left running" "$CALLER" \
+  's|^  cancel-in-progress: true$|  cancel-in-progress: false|'       supersedes_an_older_nudge
+mutate "the caller stops passing the write" "$CALLER" \
+  's|^      pull-requests: write$|      pull-requests: read|'         grants_the_write_at_the_call
+mutate "the caller stops passing checks: read" "$CALLER" \
+  's|^      checks: read$|      contents: read|'                      can_read_check_runs
+mutate "the caller points at a different callee" "$CALLER" \
+  's|uses: \./\.github/workflows/mergify-nudge\.yml|uses: ./.github/workflows/ci.yml|' grants_the_write_at_the_call
+
+mutate "the bot sender is dropped from the refresh restriction" "$MERGIFY" \
+  's|          - sender = github-actions\[bot\]||'                    admits_the_bot_sender
+mutate "the write clause is dropped, locking humans out" "$MERGIFY" \
+  's|          - sender-permission >= write||'                        admits_the_bot_sender
+mutate "the restriction is renamed to a command that is not the one posted" "$MERGIFY" \
+  's|^  refresh:$|  rebase:|'                                         admits_the_bot_sender
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ] || exit 1
