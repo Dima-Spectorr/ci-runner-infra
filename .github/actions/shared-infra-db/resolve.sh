@@ -44,13 +44,47 @@ auth="$DB_USER"
 
 if [ -n "$PG" ]; then
   # The shared stack, at the host's VPC address — the same address rule 3 has
-  # the Windows leg use, and the right one even for a job that landed on the
-  # anchor's own machine: a sibling slot has its own network namespace, so
-  # `127.0.0.1` there is the slot and not the host. The loopback line is a
-  # guard against an `addr` the anchor should never have published empty
-  # beside a port.
+  # the Windows leg use, and the right one for a job in any OTHER slot: a
+  # sibling has its own network namespace, so `127.0.0.1` there is the slot and
+  # not the host. The loopback line is a guard against an `addr` the anchor
+  # should never have published empty beside a port.
   host="127.0.0.1"
   [ -z "$ADDR" ] || host="$ADDR"
+
+  # EXCEPT IN THE SLOT THAT OWNS THE STACK, where the host address is the one
+  # address that does NOT work. The band port is DNAT'd host→slot in
+  # PREROUTING, and PREROUTING is not on the path of a locally generated
+  # packet: a connection opened from inside the owning slot to
+  # `<host-vpc-ip>:<band-port>` takes OUTPUT, is never translated, finds
+  # nothing listening on the host itself, and is refused. Every sibling slot
+  # connects to the same string fine, so this reads as flaky rather than
+  # broken — it bites only the roughly one consumer job in four that lands on
+  # the anchor's own slot.
+  #
+  # Measured in DataRetrival run 32755968066: anchor on slot 3,
+  # `migration-harness-run` on slot 4 connected at 17:22:41,
+  # `integration-tests` on slot 3 timed out against the identical URL. Knex
+  # reports the refusal as `KnexTimeoutError: Timeout acquiring a connection`
+  # 30 seconds later, which is why it was first read as TLS.
+  #
+  # A listener on the band port INSIDE this namespace means the stack is ours —
+  # rootless Docker publishes into the slot's own netns, so a sibling sees
+  # nothing here. `-l`, not the fallback's bare `-tan`: an established outbound
+  # connection whose local port happens to be $PG would otherwise look like a
+  # listener. Guarded on Linux and on `ss` existing so the Windows leg of rule
+  # 3, which is a string concatenation and nothing else, is untouched — and a
+  # Windows job is never the owning slot anyway, the anchor's compose being
+  # Linux.
+  if [ "$host" != "127.0.0.1" ] && [ "${RUNNER_OS:-Linux}" = "Linux" ] && command -v ss >/dev/null 2>&1; then
+    listening="$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -u || true)"
+    case $'\n'"$listening"$'\n' in
+      *$'\n'"$PG"$'\n'*)
+        host="127.0.0.1"
+        echo "::notice::the shared stack is published in THIS slot — using loopback, because ${ADDR}:${PG} is DNAT'd in PREROUTING and a packet from inside the slot never reaches it"
+        ;;
+    esac
+  fi
+
   publish "postgres://${auth}@${host}:${PG}/${DB_NAME}" "$PG" 1
   echo "::notice::using the run's shared stack at ${host}:${PG}"
   exit 0

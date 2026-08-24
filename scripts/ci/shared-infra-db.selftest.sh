@@ -135,6 +135,25 @@ got() { sed -n "s/^$2=//p" "$1"; }
      "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:35100/app' ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharednoaddr" ) || true
 
+# The slot that OWNS the stack must use loopback: `addr` is DNAT'd in
+# PREROUTING, which a locally generated packet never traverses. A listener on
+# the band port inside this namespace is what identifies the owning slot —
+# rootless Docker publishes into the slot's own netns, so a sibling sees none.
+( PG=35100 ADDR=10.0.0.7 SS_BUSY="35100" run_resolve sharedown
+  ok "shared on the anchor's own slot: uses loopback, not addr" \
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:35100/app' ] && echo 1 || echo 0)"
+  ok "shared on the anchor's own slot: still reports shared=1" \
+     "$([ "$(got "$OUT" shared)" = 1 ] && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharedown" ) || true
+
+# A listener on some OTHER port is not the stack. Only $PG decides, or every
+# sibling slot with a busy port would be pushed onto a loopback with nothing on
+# it — turning an intermittent failure into a total one.
+( PG=35100 ADDR=10.0.0.7 SS_BUSY="35101 22" run_resolve sharedsibling
+  ok "shared beside an unrelated listener: keeps addr" \
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app' ] && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharedsibling" ) || true
+
 # ---------------------------------------------------------------------------
 # The fallback draws its own port.
 # ---------------------------------------------------------------------------

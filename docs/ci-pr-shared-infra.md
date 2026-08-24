@@ -486,7 +486,17 @@ a harder reason: the pool has no container runtime at all.
 ## 4. Consuming the stack
 
 **From another Linux slot on the same host** — the sibling slot has its own
-network namespace, so `127.0.0.1` is the wrong address there:
+network namespace, so `127.0.0.1` is the wrong address there.
+
+> **This hand-rolled form is wrong in one case, and the `shared-infra-db` action
+> is not.** A consumer job that lands on the anchor's *own* slot cannot reach
+> `addr:pg`: the band port is DNAT'd in `PREROUTING`, and a packet originating
+> inside the owning slot takes `OUTPUT` and is never translated. It is refused,
+> which knex and friends report thirty seconds later as a pool timeout. Roughly
+> one consumer job in four lands there, so the symptom is intermittent. Use the
+> action — it probes for the listener in the local namespace and swaps to
+> loopback when the stack is this slot's. The block below is kept because it
+> shows what the action produces, not as a pattern to copy.
 
 ```yaml
   integration:

@@ -90,11 +90,15 @@ inputs:
   addr:
     description: >-
       The anchor's `addr` output — the host's VPC address, which is what a
-      consumer dials even when it landed on the same machine. `127.0.0.1` is
-      wrong from a sibling slot: each slot has its own network namespace, so
-      loopback there is the slot, not the host. The anchor publishes `addr` and
-      `pg` together, so an empty `addr` beside a non-empty `pg` should not
-      happen; the loopback branch below is a guard, not a mode.
+      consumer on any OTHER slot dials, and what the Windows leg dials.
+      `127.0.0.1` is wrong from a sibling slot: each slot has its own network
+      namespace, so loopback there is the slot, not the host. In the slot that
+      OWNS the stack the reverse holds — the band port is DNAT'd in
+      `PREROUTING`, which a locally generated packet never traverses — and
+      `resolve.sh` detects that case and swaps back to loopback on its own. The
+      anchor publishes `addr` and `pg` together, so an empty `addr` beside a
+      non-empty `pg` should not happen; the loopback branch below is a guard,
+      not a mode.
     required: false
     default: ''
   image:

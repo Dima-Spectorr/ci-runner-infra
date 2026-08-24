@@ -602,6 +602,24 @@ path and the same-host case a connection refused. Matching the host's own
 address instead admits both while still declining anything not addressed to this
 host.
 
+**`PREROUTING` is not on the path of a locally generated packet, so the owning
+slot cannot dial its own band port through the host address.** A connection
+opened from inside slot `idx` to `<host address>:<its own band port>` takes
+`OUTPUT`, is never translated, finds nothing listening on the host itself, and
+is refused. Every *other* slot reaches that same string fine, which is what
+makes this read as flakiness: it bites only the consumer jobs that happen to
+land on the anchor's own slot — roughly one in `slots_per_host`. Measured in
+DataRetrival run 32755968066, where the anchor held slot 3, a consumer on slot 4
+connected and a consumer on slot 3 timed out against the identical URL.
+
+An `OUTPUT` DNAT rule per band would close it in the kernel, and is deliberately
+not what this design does: the address is only ever wrong for the slot that owns
+the stack, and that slot can see the listener in its own namespace. So the fix
+lives in [`shared-infra-db`](../.github/actions/shared-infra-db/resolve.sh),
+which prefers loopback when the band port is listening locally. Consumers that
+hand-roll the URL from the anchor's outputs do not get it — one more reason for
+the action to be the only supported way to reach the stack.
+
 The `FORWARD` chain already accepts `-o cis<idx>`, so nothing in the forwarding
 policy loosens today. What is new is one PREROUTING entry per slot, bounded to
 100 ports, and nothing else on the host becomes reachable.
