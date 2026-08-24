@@ -243,7 +243,30 @@ locals {
   scan_sha    = filesha256("${path.module}/../../scripts/ci/scan-cache-credentials.sh")
   turbo_sha   = filesha256("${path.module}/scripts/warm-turbo.sh")
 
-  run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\nexec ${local.staged_dir}/publish-cache-snapshot.sh\n"
+  # AND getcap HAS TO BE IN THE IMAGE, WHICH IN A NODE IMAGE IT IS NOT.
+  #
+  # The publisher refuses to build a snapshot it cannot scan for file
+  # capabilities, because a host refuses to unpack one: `getcap` missing is a
+  # refusal on both sides, deliberately, and not a skip. `node:22` — the default
+  # build image, and the image the snapshot phase runs in — ships without
+  # libcap2-bin, so the warm died on that check having installed the whole
+  # dependency tree first. The workflow this module replaces installed it in a
+  # `run:` line (docs/publishing-a-cache-snapshot.md); nothing was carrying that
+  # over here.
+  #
+  # Best-effort, and the failure mode is what makes it safe to be: if the install
+  # does not work the publisher's own check fires one line later with the message
+  # that named the package. Both package managers are tried because the images
+  # are inputs — a repository may set `build_image` to an Alpine variant, where
+  # the manager is `apk`. There the binary is in `libcap-getcap`, NOT in
+  # `libcap`: current Alpine ships /usr/sbin/getcap from that subpackage alone
+  # (pkgs.alpinelinux.org, checked 2026-08-24), and `libcap` on its own installs
+  # the shared library and no scanner. Older Alpine did carry it in `libcap`, so
+  # that is the fallback rather than the first try. No `$` anywhere in here, so
+  # it needs no substitution escaping; adding one means escaping it.
+  ensure_getcap = "if ! command -v getcap >/dev/null 2>&1; then\n  if command -v apt-get >/dev/null 2>&1; then\n    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends libcap2-bin >/dev/null 2>&1 || true\n  elif command -v apk >/dev/null 2>&1; then\n    apk add --no-cache libcap-getcap >/dev/null 2>&1 || apk add --no-cache libcap >/dev/null 2>&1 || true\n  fi\nfi\n"
+
+  run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\n${local.ensure_getcap}exec ${local.staged_dir}/publish-cache-snapshot.sh\n"
   run_turbo   = "#!/bin/sh\nset -eu\necho '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\nexec ${local.staged_dir}/warm-turbo.sh\n"
 
   # HOW THE REPOSITORY IS INSTALLED AND BUILT — WORKED OUT AT WARM TIME, FROM THE
