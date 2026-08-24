@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Self-test for the merge lane's per-pull-request rule.
+#
+# This rule MERGES. It is the only decision in this repository whose wrong
+# answer lands code on the default branch, and the workflow that calls it runs
+# only from the default branch — so the pull request that changes it cannot
+# exercise it even once. These cases are the entire test.
+#
+# The weighting follows the blast radius rather than the code paths. Every arm
+# that returns `merge` is tested against the ONE-OFF of each count it compares,
+# because the interesting bug here is not "does a green pull request merge" but
+# "does a pull request that is one check short of green merge anyway". The
+# `skip` and `wait` arms are cheap to get wrong and cheap to fix; `merge` is
+# neither.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$HERE/merge-lane-decision.sh"
+
+PASS=0
+FAIL=0
+
+# expect <expected-prefix> <description> <args...>
+expect() {
+  local want="$1" desc="$2"
+  shift 2
+  local got
+  got=$(lane_verdict "$@")
+  if [[ "$got" == "$want"* ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  args: %s\n  want: %s*\n  got:  %s\n' "$desc" "$*" "$want" "$got"
+  fi
+}
+
+# args: draft base lane_base conflict total green missing failed pending behind
+#       inflight_age inflight_budget
+LB=main
+
+# --- the one verdict that lands code ------------------------------------------
+expect "merge:ready" "three required checks green, current with the base, nothing pending" \
+  0 "$LB" "$LB" 0 3 3 0 0 0 0 "" 1800
+expect "merge:ready" "a single required check is a legitimate configuration" \
+  0 "$LB" "$LB" 0 1 1 0 0 0 0 "" 1800
+expect "merge:ready" "in flight, within budget, and now green — the second half of an update" \
+  0 "$LB" "$LB" 0 3 3 0 0 0 0 60 1800
+
+# --- one off each count, where a wrong comparison would merge -----------------
+# Invariant A. Each of these differs from the merge case above by exactly one.
+expect "skip:not-all-green" "two of three green is not green, and > would merge it" \
+  0 "$LB" "$LB" 0 3 2 0 0 0 0 "" 1800
+expect "skip:missing-required" "a renamed required check reports nothing and must not pass" \
+  0 "$LB" "$LB" 0 3 2 1 0 0 0 "" 1800
+expect "skip:red" "one failure among greens" \
+  0 "$LB" "$LB" 0 3 2 0 1 0 0 "" 1800
+expect "wait:pending" "one still running" \
+  0 "$LB" "$LB" 0 3 2 0 0 1 0 "" 1800
+expect "update:behind" "one commit behind is behind — >0, not some tolerance" \
+  0 "$LB" "$LB" 0 3 3 0 0 0 1 "" 1800
+
+# Invariant B, stated on its own. This is the shape that makes a gate stop
+# gating in silence: nothing is failing, nothing is running, and the checks the
+# lane was told to require simply are not there.
+expect "skip:missing-required" "every check missing, none red — the silent ungating" \
+  0 "$LB" "$LB" 0 3 0 3 0 0 0 "" 1800
+
+# --- fail closed --------------------------------------------------------------
+# A lane that requires nothing merges on no evidence. Configuration that failed
+# to load looks exactly like this, and it must stop the lane rather than open it.
+expect "skip:no-required-checks-configured" "zero required checks is broken config, not consent" \
+  0 "$LB" "$LB" 0 0 0 0 0 0 0 "" 1800
+
+for bad in "" x -1 3.5 " " 1e2; do
+  expect "skip:unparseable-counts" "a non-integer green count ('$bad') declines, never crashes" \
+    0 "$LB" "$LB" 0 3 "$bad" 0 0 0 0 "" 1800
+  expect "skip:unparseable-counts" "a non-integer behind count ('$bad') declines too" \
+    0 "$LB" "$LB" 0 3 3 0 0 0 "$bad" "" 1800
+done
+
+# --- ordering of the guards ---------------------------------------------------
+# Each of these is green-and-current on every axis except one, so the verdict
+# names which guard fired. Getting the ORDER wrong is how a draft gets reported
+# as a timeout, or a conflicted pull request gets updated pointlessly.
+expect "skip:base" "a pull request onto a sibling branch is not this lane's" \
+  0 release/9 "$LB" 0 3 3 0 0 0 0 "" 1800
+expect "skip:draft" "a green draft is the author saying not yet" \
+  1 "$LB" "$LB" 0 3 3 0 0 0 0 "" 1800
+expect "skip:draft" "drafting a pull request the lane holds releases it quietly, not as a drop" \
+  1 "$LB" "$LB" 0 3 3 0 0 0 9999 1800
+expect "drop:budget-exceeded" "an in-flight entry past budget is released before anything else" \
+  0 "$LB" "$LB" 0 3 0 3 0 1 1 9999 1800
+# Exactly at budget is within it. Tested with a check still pending, because
+# that is the only state in which the budget arm is reachable at all.
+expect "wait:pending" "exactly at budget is within it — > not >=, so a boundary tick does not drop" \
+  0 "$LB" "$LB" 0 3 2 0 0 1 0 1800 1800
+expect "drop:budget-exceeded" "one second past it does drop" \
+  0 "$LB" "$LB" 0 3 2 0 0 1 0 1801 1800
+
+# The budget bounds WAITING, and the caller's only in-flight clock is the head
+# commit's timestamp — so a pull request pushed long ago and green today is
+# ancient by that clock. If the budget could fire without something outstanding,
+# the lane would drop precisely the entries it exists to merge, and the longer a
+# pull request had waited the more certainly it would be dropped.
+expect "merge:ready" "an old but finished-and-green pull request merges; age alone is not a drop" \
+  0 "$LB" "$LB" 0 3 3 0 0 0 0 987654 1800
+expect "drop:budget-exceeded" "the same age with one check still pending IS a drop" \
+  0 "$LB" "$LB" 0 3 2 0 0 1 0 987654 1800
+expect "drop:budget-exceeded" "and with a required check that never reported" \
+  0 "$LB" "$LB" 0 3 2 1 0 0 0 987654 1800
+expect "skip:red" "a red pull request is skipped on its own terms, not dropped for age" \
+  0 "$LB" "$LB" 0 3 2 0 1 0 0 987654 1800
+expect "skip:red" "red outranks pending: the outcome cannot change, so do not hold the lane" \
+  0 "$LB" "$LB" 0 3 1 0 1 1 0 "" 1800
+expect "skip:conflict" "a conflict is skipped before its checks are consulted" \
+  0 "$LB" "$LB" 1 3 3 0 0 0 0 "" 1800
+
+# --- mergeability is a tri-state, and the middle value is the dangerous one ---
+# GitHub computes this asynchronously and answers null until it has. Reading
+# null as "mergeable" merges into a conflict; reading it as "conflict" skips a
+# good pull request forever. It is a wait.
+expect "wait:mergeability-unknown" "null mergeability is not a green light" \
+  0 "$LB" "$LB" "" 3 3 0 0 0 0 "" 1800
+expect "wait:mergeability-unknown" "and not a red one either, even with everything else ready" \
+  0 "$LB" "$LB" "" 3 3 0 0 0 5 "" 1800
+
+# --- an absent in-flight budget must not become a drop ------------------------
+expect "merge:ready" "no in-flight age means not in flight, not infinitely old" \
+  0 "$LB" "$LB" 0 3 3 0 0 0 0 "" 1800
+expect "merge:ready" "an unparseable age is ignored rather than treated as expired" \
+  0 "$LB" "$LB" 0 3 3 0 0 0 0 abc 1800
+expect "merge:ready" "no budget configured means no budget enforced" \
+  0 "$LB" "$LB" 0 3 3 0 0 0 0 99999 ""
+
+# --- lane_admits --------------------------------------------------------------
+admits() {
+  local want="$1" desc="$2" verdict="$3"
+  local got=no
+  lane_admits "$verdict" && got=yes
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  verdict: %s\n  want: %s\n  got: %s\n' "$desc" "$verdict" "$want" "$got"
+  fi
+}
+
+admits yes "merge is an action" "merge:ready green=3 total=3"
+admits yes "update is an action — it starts a CI run" "update:behind behind=2"
+admits yes "drop is an action — releasing a stuck entry is progress" "drop:budget-exceeded age=2 budget=1"
+admits no  "wait is explicitly not an action" "wait:pending pending=1"
+admits no  "nor is an unknown mergeability" "wait:mergeability-unknown"
+admits no  "skip is not an action" "skip:draft"
+admits no  "and neither is an empty verdict" ""
+admits no  "a verdict that merely CONTAINS merge is not a merge" "skip:premerge-hook"
+
+# --- lane_rank ----------------------------------------------------------------
+# Asserted as ORDERINGS rather than as literal keys, so the format can change
+# without rewriting the test and the property under test stays the property.
+lt() {
+  local desc="$1" a="$2" b="$3"
+  if [[ "$a" < "$b" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  expected %s to sort before %s\n' "$desc" "$a" "$b"
+  fi
+}
+
+lt "a stuck entry is resolved before a fresh merge" \
+  "$(lane_rank "drop:budget-exceeded" 50 10)" "$(lane_rank "merge:ready" 50 10)"
+lt "a ready merge goes before an update — seconds of work before a whole CI run" \
+  "$(lane_rank "merge:ready" 50 10)" "$(lane_rank "update:behind" 50 10)"
+lt "priority beats age within one class" \
+  "$(lane_rank "merge:ready" 10 1)" "$(lane_rank "merge:ready" 90 99999)"
+lt "at equal priority the oldest goes first, so nothing starves" \
+  "$(lane_rank "merge:ready" 50 9000)" "$(lane_rank "merge:ready" 50 10)"
+lt "class outranks priority: an urgent update still yields to a ready merge" \
+  "$(lane_rank "merge:ready" 99 0)" "$(lane_rank "update:behind" 0 99999)"
+lt "an unactionable verdict sorts last whatever its priority" \
+  "$(lane_rank "update:behind" 99 0)" "$(lane_rank "wait:pending" 0 99999)"
+
+# Bad inputs must not reorder the lane. A garbage priority that sorted to the
+# front would let a malformed label jump the queue.
+lt "a non-numeric priority falls back to the default, not to the front" \
+  "$(lane_rank "merge:ready" 10 5)" "$(lane_rank "merge:ready" abc 5)"
+lt "an absurd age clamps instead of wrapping past zero" \
+  "$(lane_rank "merge:ready" 50 999999999)" "$(lane_rank "merge:ready" 50 1)"
+
+if [ "$FAIL" -gt 0 ]; then
+  echo "merge-lane-decision: $FAIL failed, $PASS passed"
+  exit 1
+fi
+echo "merge-lane-decision: $PASS cases pass"
