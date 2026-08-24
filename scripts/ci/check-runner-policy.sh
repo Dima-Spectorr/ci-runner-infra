@@ -472,29 +472,40 @@ RUNS_ON_ROUTES = re.compile(
 # reported job and a one-line pull request. The other direction costs the
 # boundary. Last checked against GitHub's runner-images inventory 2026-08-23.
 #
-# THE SUFFIX HAS TO BE PER-OS FOR THE SAME REASON THE VERSION DOES, and both
-# ways it was shared it was wrong. Found in Apigee-Portal, whose vendored copy
-# had already fixed it locally — a consumer can be ahead of the fleet, and this
-# came back only because the refresh diffed the two rather than overwriting.
+# THE SUFFIX HAS TO BE PER-OS FOR THE SAME REASON THE VERSION DOES. Splitting
+# `windows-11-arm` out was half the fix; the OTHER three OS families still
+# shared one alternation, and a shared list is wrong in both directions at once
+# because every suffix it carries for one OS it also grants to the others:
 #
-#   * `windows-11-arm` already spends the ARM marker in its version, so the
-#     shared alternation applied it a SECOND time and `windows-11-arm-arm` read
-#     as a hosted image. Any pool labelled that way skipped RUNNER1, RUNNER2 and
-#     RUNNER4 entirely — the boundary-opening direction this expression exists
-#     to close. It is now spelled out separately, with no suffix of its own.
-#   * The shared list carried no `intel`, so `macos-15-intel` — an image GitHub
-#     actually ships — was read as a self-hosted pool, and a conforming
-#     workflow was failed on a required check. That is the over-reporting
-#     direction, which is safe for the boundary and still costs a repository a
-#     red gate it cannot act on.
+#   * `-arm64`, `-large` and `-xlarge` were still reachable from
+#     `windows-11-arm`'s siblings and from each other, so `windows-11-arm-arm64`
+#     — a perfectly ordinary private pool label — read as a hosted image and
+#     skipped RUNNER1, RUNNER2 and RUNNER4. That is the boundary-opening
+#     direction, and it is the reason this is per-OS now.
+#   * `-large`/`-xlarge` exist on macOS ONLY. Larger runners on Ubuntu and
+#     Windows take ORGANISATION-CHOSEN names, which by this rule's own logic are
+#     self-hosted-shaped and must not be pattern-matched. A fixture here used to
+#     assert `windows-2022-large` was "a real larger-runner label"; it is not
+#     one, and it now asserts the opposite.
+#   * `-intel` is macOS only, `-arm` is Ubuntu only. Granted to every OS they
+#     buy nothing and cost the labels above.
+#
+# So: each OS carries its own versions AND its own suffixes, and the two bare
+# families GitHub ships with no version component — `ubuntu-slim` and `xcode-27`
+# — are exact literals. Literals carry none of the shape risk the enumeration
+# exists to close: an organisation would have to name a pool exactly that to be
+# mistaken for hosted, which is the exposure `ubuntu-24.04` already has.
+#
+# `macos-13` is gone: GitHub's inventory no longer lists it, and a label that is
+# not shipped is a private one. Last checked against `actions/runner-images`
+# `README.md` (raw, `main`) on 2026-08-24.
 HOSTED_IMAGE = re.compile(
     r"^(?:"
-    r"(?:"
-    r"ubuntu-(?:latest|24\.04|22\.04)"
-    r"|windows-(?:latest|2025|2022)"
-    r"|macos-(?:latest|15|14|13)"
-    r")(?:-(?:arm|arm64|intel|large|xlarge))?"
-    r"|windows-11-arm"
+    r"ubuntu-(?:latest|26\.04|24\.04|22\.04)(?:-arm)?"
+    r"|ubuntu-slim"
+    r"|windows-(?:latest|2025-vs2026|2025|2022|11-vs2026-arm|11-arm)"
+    r"|macos-(?:latest|26|15|14)(?:-(?:intel|large|xlarge))?"
+    r"|xcode-27(?:-xlarge)?"
     r")$",
     re.IGNORECASE,
 )
@@ -1980,7 +1991,7 @@ jobs:
     steps: [{run: "true"}]'
 
   # …and every version that IS shipped stays hosted, so enumerating did not
-  # quietly drop one. `windows-2022-large` is a real larger-runner label.
+  # quietly drop one.
   expect "the enumerated images stay hosted" "" "" allowed \
 'on: [pull_request]
 jobs:
@@ -1988,16 +1999,24 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps: [{run: "true"}]
+  u26:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  u26arm:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 30
+    steps: [{run: "true"}]
   w25:
     runs-on: windows-2025
     timeout-minutes: 30
     steps: [{run: "true"}]
-  wlarge:
-    runs-on: windows-2022-large
+  wvs:
+    runs-on: windows-2025-vs2026
     timeout-minutes: 30
     steps: [{run: "true"}]
-  m13:
-    runs-on: macos-13
+  wvsarm:
+    runs-on: windows-11-vs2026-arm
     timeout-minutes: 30
     steps: [{run: "true"}]
   m14:
@@ -2006,6 +2025,74 @@ jobs:
     steps: [{run: "true"}]
   m15:
     runs-on: macos-15
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  m26:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  m26intel:
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The two families GitHub ships with no version component. They are exact
+  # literals rather than a widened shape, so accepting them costs nothing the
+  # enumeration was protecting: a pool would have to be named EXACTLY this.
+  expect "the versionless hosted families are hosted" "" "" allowed \
+'on: [pull_request]
+jobs:
+  slim:
+    runs-on: ubuntu-slim
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  xc:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  xcbig:
+    runs-on: xcode-27-xlarge
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The suffix that made the list per-OS. `-arm64` was never a hosted suffix on
+  # ANY OS, and reachable from `windows-11-arm` it produced a hosted reading for
+  # a label that is a private pool by every convention — the direction that
+  # skips RUNNER1, RUNNER2 and RUNNER4 on the job carrying it.
+  expect "an ARM64 suffix on the ARM image is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: windows-11-arm-arm64
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # `-large` and `-xlarge` are macOS-only. Larger runners on Ubuntu and Windows
+  # take organisation-chosen names, so a Windows label ending in `-large` is a
+  # private one and must be read as self-hosted. A fixture here asserted the
+  # opposite and was itself the bug.
+  expect "a larger-runner suffix off macOS is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  wlarge:
+    runs-on: windows-2022-large
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "an Ubuntu xlarge suffix is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  ularge:
+    runs-on: ubuntu-24.04-xlarge
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # An image GitHub has RETIRED is a private label like any other unshipped one.
+  expect "a retired macOS image is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  m13:
+    runs-on: macos-13
     timeout-minutes: 30
     steps: [{run: "true"}]'
 
