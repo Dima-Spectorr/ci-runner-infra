@@ -478,8 +478,17 @@ fi
 # refactor that leaves `case_list` emitting nothing — a stray `return`, a
 # renamed helper — makes `xargs` run zero workers and this file print "N passed,
 # 0 failed" over a mutation suite that asserted nothing at all.
+#
+# IT IS A RATCHET, SET AT THE CURRENT COUNT, not a round number below it. It sat
+# at 24 against a list of 25 and so had a row of slack — enough that deleting one
+# mutation passed the guard whose whole purpose is to notice mutations going
+# missing. A floor is only worth the assertion if it equals what the file is
+# known to contain, which also means ADDING a mutation should raise it: leave it
+# behind and the slack comes straight back. Removing one has to lower it by hand,
+# and that is the point — a shrinking mutation suite should cost somebody a
+# deliberate edit rather than a silent digit.
 CASES="$(case_list | wc -l)"
-FLOOR=24
+FLOOR=25
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
