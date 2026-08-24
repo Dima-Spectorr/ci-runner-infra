@@ -85,7 +85,10 @@ excuse that class. `cache_scan_allow_file` defaults to `null`, which uses
 `.github/cache-scan-allow.txt` if the checkout has one — so a repository that
 keeps its allowlist where everyone else does configures nothing. Name a path
 and it must exist: an allowlist that is not there excuses nothing and reads
-exactly like one that worked.
+exactly like one that worked. Set `""` to turn the lookup off — which is a
+different statement from the default, and the one to use for a repository that
+must never excuse anything, so that a file appearing at the conventional path
+later does not quietly start being honoured.
 
 Run the first warm by hand rather than waiting for 04:00 — until one completes,
 both caches are empty, which is a supported state and looks exactly like a warm
