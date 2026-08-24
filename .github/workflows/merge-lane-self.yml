@@ -54,6 +54,24 @@ permissions:
 
 jobs:
   lane:
+    # DRY RUN IS NOT THE SAME AS NOT WIRED YET.
+    #
+    # Even a dry run mints the App token and reads the API, so until
+    # `MERGE_APP_ID` and `MERGE_APP_PRIVATE_KEY` exist this job fails at its
+    # second step — on every CI completion, on the default branch, forever. A
+    # red run that means "the operator has not finished the setup" is
+    # indistinguishable from a red run that means "the lane is broken", and the
+    # second one is the only one anyone should ever have to look at.
+    #
+    # So this is the operator's switch and it is deliberately separate from
+    # `MERGE_LANE_ARMED`. They answer different questions: this one is "does
+    # the App exist", that one is "may it act". Setting them together is fine;
+    # conflating them into one variable would mean the only way to see a
+    # verdict is to grant merge authority first.
+    #
+    # `secrets.*` cannot be read in an `if:`, which is why this is a variable
+    # rather than a test for the secret itself.
+    if: vars.MERGE_LANE_ENABLED == 'true'
     uses: ./.github/workflows/merge-lane.yml
     permissions:
       contents: read
