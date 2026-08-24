@@ -1338,7 +1338,8 @@ repository with them needs no pool capacity for this.
 
 **2. The sender permission.** The nudge posts as `github-actions[bot]`, which is
 not a repository collaborator. Mergify checks the permission of whoever posted a
-command, the default restriction on `refresh` is `sender-permission >= write`,
+command, the default restriction on `refresh` admits `sender-permission >= write`
+(and, separately, a fork pull request's own author),
 and GitHub answers that question about the bot with less than write. Mergify
 then discards the command **in silence** — no reply, no reaction, nothing in the
 thread that distinguishes "ignored" from "the stall was going to end anyway".
@@ -1350,13 +1351,25 @@ commands_restrictions:
     conditions:
       - or:
           - sender-permission >= write
+          - and:
+              - sender = {{author}}
+              - from-fork
           - sender = github-actions[bot]
 ```
 
-Declaring the key **replaces** the default rather than adding to it, which is why
-the write clause is restated. Widening `refresh` to a bot widens very little:
-refresh re-evaluates conditions that are already written down, and cannot
-approve, bypass, queue or merge.
+Declaring the key **replaces** the default rather than adding to it, so both arms
+of the default are restated above and only the third arm is new. Copy all three.
+Widening `refresh` to a bot widens very little: refresh re-evaluates conditions
+that are already written down, and cannot approve, bypass, queue or merge.
+
+**The fork-author arm is not boilerplate, and this block shipped without it.**
+`workflow_run.pull_requests` is empty for a run triggered by a fork pull request,
+so the nudge never fires on one — a fork contributor's only route out of a stall
+is to post `@mergifyio refresh` themselves. Omitting the arm takes that away at
+the same moment the automated path is unavailable to them, leaving the one class
+of contributor with no recovery at all waiting on a maintainer. Both bot
+reviewers caught it independently; the fleet had already merged the two-arm
+version into five repositories before it was fixed.
 
 ### Why it usually posts nothing
 

@@ -286,6 +286,14 @@ admits_the_bot_sender() {
   # Declaring the key replaces the default, so dropping the write clause would
   # lock every human out of a command they can run today.
   matches "$code" 'sender-permission >= write' || return 1
+  # The default's OTHER arm, and the one this block shipped without: a fork
+  # pull request's author may refresh their own. It is not decoration. A run
+  # triggered by a fork pull request carries an empty `pull_requests`, so the
+  # nudge above never fires there and the author's own comment is the ONLY way
+  # out of a stall. Dropping the arm removes the automatic and the manual route
+  # together, for the one contributor who has neither.
+  matches "$code" 'sender = \{\{author\}\}' || return 1
+  matches "$code" '^              - from-fork$' || return 1
 }
 check admits_the_bot_sender "$MERGIFY" ".mergify.yml does not admit github-actions[bot] as a refresh sender, so every nudge is discarded in silence"
 
@@ -365,6 +373,10 @@ mutate "the write clause is dropped, locking humans out" "$MERGIFY" \
   's|          - sender-permission >= write||'                        admits_the_bot_sender
 mutate "the restriction is renamed to a command that is not the one posted" "$MERGIFY" \
   's|^  refresh:$|  rebase:|'                                         admits_the_bot_sender
+mutate "the fork author loses the only recovery they have" "$MERGIFY" \
+  's|^              - sender = {{author}}$||'                         admits_the_bot_sender
+mutate "the author clause stops being scoped to forks" "$MERGIFY" \
+  's|^              - from-fork$||'                                   admits_the_bot_sender
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
