@@ -56,7 +56,7 @@ ref-scoped `principalSet` is how it is bounded. Read the section below.
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.47.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.48.0"
 
   project_id     = var.project_id
   region         = "<region>"
@@ -262,13 +262,17 @@ repository's README anyway. Anything that *is* a secret stays where it is.
 
 ```hcl
 module "ci_runner_apply_identity" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.47.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.48.0"
 
   project_id             = var.project_id
   name                   = var.pool_name
   account_id             = "${var.pool_name}-apply"
   state_bucket           = "<the bucket holding this root's tfstate>"
   workload_identity_pool = "projects/<num>/locations/global/workloadIdentityPools/<pool>"
+
+  # who may assume it: this repository's apply workflow, on the default ref.
+  # Required, and there is no default — see below for why a ref alone is not it.
+  repository = "<owner>/<repo>"
 
   # the accounts the apply attaches to instances — the pool's own, and no others
   impersonable_service_accounts = [
@@ -302,20 +306,55 @@ release changes, and it is compute.
 stops red, naming the resource, and a human runs that one apply. An account that
 never needs a human is an account that can grant itself anything.
 
-Access is bound to a single ref, not to the repository:
+Access is bound to **one repository, one workflow file, one ref** — a single
+`job_workflow_ref` claim carrying all three:
 
 ```
-principalSet://iam.googleapis.com/<pool>/attribute.ref/refs/heads/main
+principalSet://iam.googleapis.com/<pool>/attribute.job_workflow_ref/<owner>/<repo>/.github/workflows/apply-runner-pool.yml@refs/heads/main
 ```
 
-`attribute.repository` binds *every* branch — including one pushed by anyone
-with write access, running a workflow file they wrote, which never goes near
-`main` and so never meets branch protection. If the shared provider does not map
-`attribute.ref` yet, add it: the mapping is additive, existing principalSets keep
-resolving, and it is a one-command fix rather than a reason to widen this.
+Neither half of that is optional, and it is worth saying why, because both of
+the obvious simpler bindings are open:
+
+- `attribute.repository` binds *every* branch — including one pushed by anyone
+  with write access, running a workflow file they wrote, which never goes near
+  `main` and so never meets branch protection.
+- `attribute.ref` is **not** the narrower one. It is a different axis, and this
+  module bound it alone until #111. A pool is normally shared by every
+  repository in the org — this doc calls it "the shared provider" — so
+  `attribute.ref/refs/heads/main` matches a run on *any* of their default
+  branches, and with no attribute condition on the provider, any repository on
+  GitHub. And `refs/heads/main` is reachable from a pull request: for
+  `pull_request_target`, `workflow_run`, `issue_comment` and `schedule`,
+  `GITHUB_REF` — which the `ref` claim mirrors — is the default branch, so the
+  ordinary `pull_request_target` + checkout-the-head-sha pattern runs
+  fork-authored code in a run whose token asserts `refs/heads/main`.
+
+For this identity the payoff is project-wide `compute.admin` plus `actAs` on the
+pool's accounts, so neither is a theoretical concern.
+
+Two prerequisites on the provider, both one-off. Adding a mapping is additive —
+existing principalSets keep resolving — so a provider that does not map the
+claim yet is a one-command fix rather than a reason to widen the binding:
 
 ```bash
-gcloud iam workload-identity-pools providers update-oidc <provider> --project=<project> --location=global --workload-identity-pool=<pool> --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref"
+gcloud iam workload-identity-pools providers update-oidc <provider> --project=<project> --location=global --workload-identity-pool=<pool> --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref,attribute.job_workflow_ref=assertion.job_workflow_ref"
+```
+
+And an attribute condition pinning the org by **numeric** id — an org *name* is
+renameable, and a freed name is re-registrable by whoever gets there first, so
+the numeric id is the only durable pin:
+
+```bash
+gcloud iam workload-identity-pools providers update-oidc <provider> --project=<project> --location=global --workload-identity-pool=<pool> --attribute-condition="assertion.repository_owner_id == '<numeric-owner-id>'"
+```
+
+Read the current mapping and condition before sending either — `update-oidc`
+replaces them wholesale, so a mapping sent without the entries already there
+breaks every principalSet that depends on them:
+
+```bash
+gcloud iam workload-identity-pools providers describe <provider> --project=<project> --location=global --workload-identity-pool=<pool> --format="value(attributeMapping,attributeCondition)"
 ```
 
 The module itself is created by the **one** apply a human still runs — the
@@ -340,7 +379,7 @@ provisioner has already run.
 
 ```hcl
 module "ci_host_image_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.47.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.48.0"
 
   project_id   = var.project_id
   region       = "<region>"

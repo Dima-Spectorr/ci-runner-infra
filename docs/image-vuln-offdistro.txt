@@ -1,0 +1,44 @@
+# The off-distro findings this image is known to carry.  (#196)
+#
+# One line per DISTINCT pair:
+#
+#     <cve-or-ghsa-id> <package> [free-text note]
+#
+# `#` starts a comment. The note is optional — this file records what the image
+# CONTAINS, not a decision to tolerate it, and 273 seeded lines each carrying a
+# sentence of invented prose would be 273 lines of nothing. Where somebody has
+# actually looked at one, write down what they concluded.
+#
+# WHAT IT IS FOR
+#
+# `image-vuln-verdict.sh` blocks only on findings grype matched through a
+# distro's own security feed, because for a version read out of a binary it
+# compares upstream numbers and a backported fix is invisible to that
+# comparison — a gate that blocked on those would be red on every image forever
+# (the first real run: 273 such findings, none of them fixable here).
+#
+# The gap that leaves is a genuinely vulnerable module vendored into an
+# image-installed binary. So what is enforced is the population's GROWTH: a pair
+# in the scan and not in this file fails the build as VULN3. Adding it is a pull
+# request, which is the review.
+#
+# By pair and not by count, deliberately. A count moves whenever the
+# vulnerability database does; a new (id, package) pair is a new statement about
+# this image.
+#
+# UNSEEDED, AND WHY IT SHIPS THAT WAY
+#
+# This file has no entries yet, and while it has none the gate runs in OBSERVE
+# mode: it prints the population as a paste-ready block and does not fail the
+# build. That is the honest state — the baseline can only come from a real scan,
+# which happens inside a Packer build and not in this repository's CI, so
+# nothing here could have produced it.
+#
+# TO START ENFORCING: run an image build, take the indented block printed under
+# `off-distro tracking: OBSERVE` in its verdict output, paste it below, and open
+# a pull request. The gate switches to ENFORCE the moment this file has one
+# entry. Until then #196 is not closed, whatever the code says.
+#
+# Pruning a line that no longer appears is optional and never fails the build —
+# the gate prints it as "no longer seen". Emptying the file is not pruning: it
+# turns enforcement back off.

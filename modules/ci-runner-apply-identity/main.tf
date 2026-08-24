@@ -152,19 +152,45 @@ resource "google_storage_bucket_iam_member" "state" {
 # THE principalSet IS THE SECURITY BOUNDARY, and it is the line most likely to
 # be widened by someone in a hurry.
 #
-# A provider that maps only `attribute.repository` binds to the repository as a
-# whole — every branch, every workflow file, including one pushed to a branch by
-# anyone who can push. Branch protection does not help: the workflow that
-# assumes this identity is the attacker's own file, running on their own branch,
-# and it never goes near main.
+# It binds `attribute.job_workflow_ref`, and neither `attribute.repository` nor
+# `attribute.ref`, because each of those ALONE is open in a direction that is
+# easy to miss — and on this account the payoff is project-wide compute.admin
+# plus actAs on the pool's identities.
 #
-# So the default binds `attribute.ref` to a single ref, and the module REFUSES a
-# repository-wide binding rather than accepting it as a default. Adding
-# `attribute.ref: assertion.ref` to a provider's mapping is additive — existing
-# principalSets keep resolving — so "the provider does not map ref" is a
-# one-command fix, not a reason to widen this.
+#   attribute.repository admits every branch and every workflow file in the
+#   repository, including one pushed to a branch by anyone who can push. Branch
+#   protection does not help: the workflow that assumes this identity is the
+#   attacker's own file, running on their own branch, and it never goes near
+#   main.
+#
+#   attribute.ref is not "narrower than repository" — it is a DIFFERENT axis, and
+#   this module bound it alone until #111. That is open twice over. GitHub uses
+#   one OIDC issuer for all of github.com and a pool is normally shared by every
+#   repository in the org — `docs/applying-runner-infra.md` calls it "the shared
+#   provider" — so `attribute.ref/refs/heads/main` matches a run on ANY of their
+#   default branches, and if the provider carries no attribute condition, any
+#   repository on GitHub. Worse, `refs/heads/main` is reachable from
+#   attacker-triggered events: for `pull_request_target`, `workflow_run`,
+#   `issue_comment` and `schedule`, GITHUB_REF — which the `ref` claim mirrors —
+#   is the DEFAULT BRANCH. The ordinary `pull_request_target` +
+#   checkout-the-head-sha pattern therefore runs fork-authored code inside a run
+#   whose token asserts refs/heads/main.
+#
+# `job_workflow_ref` closes both, because one claim carries all three facts:
+# `<owner>/<repo>/.github/workflows/<file>@<ref>`. A fork cannot change that file
+# on the default ref, another repository cannot produce this repository's value,
+# and another workflow in this repository — including a `pull_request_target`
+# one — produces a different filename.
+#
+# TWO PREREQUISITES ON THE PROVIDER, which this module cannot express and does
+# not silently assume (see `docs/applying-runner-infra.md`):
+#   1. the provider maps `attribute.job_workflow_ref = assertion.job_workflow_ref`.
+#      Adding a mapping is additive; existing principalSets keep resolving.
+#   2. the provider carries an attribute condition pinning the org, by NUMERIC id
+#      (`assertion.repository_owner_id == '<id>'`). Without it the pool federates
+#      all of GitHub, and the pin below is the only thing standing in the way.
 resource "google_service_account_iam_member" "workload_identity" {
   service_account_id = google_service_account.apply.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${var.workload_identity_pool}/attribute.ref/${var.allowed_ref}"
+  member             = "principalSet://iam.googleapis.com/${var.workload_identity_pool}/attribute.job_workflow_ref/${var.repository}/${var.apply_workflow_path}@${var.allowed_ref}"
 }
