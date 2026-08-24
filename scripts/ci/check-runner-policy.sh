@@ -444,12 +444,31 @@ RUNS_ON_ROUTES = re.compile(
 # later reads as self-hosted until this line is updated, which costs one
 # reported job and a one-line pull request. The other direction costs the
 # boundary. Last checked against GitHub's runner-images inventory 2026-08-23.
+#
+# THE SUFFIX HAS TO BE PER-OS FOR THE SAME REASON THE VERSION DOES, and both
+# ways it was shared it was wrong. Found in Apigee-Portal, whose vendored copy
+# had already fixed it locally — a consumer can be ahead of the fleet, and this
+# came back only because the refresh diffed the two rather than overwriting.
+#
+#   * `windows-11-arm` already spends the ARM marker in its version, so the
+#     shared alternation applied it a SECOND time and `windows-11-arm-arm` read
+#     as a hosted image. Any pool labelled that way skipped RUNNER1, RUNNER2 and
+#     RUNNER4 entirely — the boundary-opening direction this expression exists
+#     to close. It is now spelled out separately, with no suffix of its own.
+#   * The shared list carried no `intel`, so `macos-15-intel` — an image GitHub
+#     actually ships — was read as a self-hosted pool, and a conforming
+#     workflow was failed on a required check. That is the over-reporting
+#     direction, which is safe for the boundary and still costs a repository a
+#     red gate it cannot act on.
 HOSTED_IMAGE = re.compile(
     r"^(?:"
+    r"(?:"
     r"ubuntu-(?:latest|24\.04|22\.04)"
-    r"|windows-(?:latest|2025|2022|11-arm)"
+    r"|windows-(?:latest|2025|2022)"
     r"|macos-(?:latest|15|14|13)"
-    r")(?:-(?:arm|arm64|large|xlarge))?$",
+    r")(?:-(?:arm|arm64|intel|large|xlarge))?"
+    r"|windows-11-arm"
+    r")$",
     re.IGNORECASE,
 )
 
@@ -1790,6 +1809,32 @@ jobs:
 jobs:
   build:
     runs-on: macos-99
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The two directions of a SHARED suffix list, one test each.
+  #
+  # `windows-11-arm` carries its ARM marker in the version, so a suffix
+  # alternation reachable from it matched the marker twice. This is the
+  # expensive direction: a self-hosted pool labelled `windows-11-arm-arm` was
+  # read as a GitHub image, so every isolation check was skipped on the job
+  # carrying it and a fork could have reached the pool with this gate green.
+  expect "a doubled ARM suffix is a custom label, not a hosted image" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: windows-11-arm-arm
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The other direction, and the one that costs a conforming repository a red
+  # required check it cannot act on: `macos-15-intel` is an image GitHub ships,
+  # and a suffix list without `intel` read it as a self-hosted pool.
+  expect "the hosted Intel macOS image is a hosted image" "" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: macos-15-intel
     timeout-minutes: 30
     steps: [{run: "true"}]'
 
