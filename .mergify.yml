@@ -97,3 +97,39 @@ merge_protections_settings:
     - base = main
     - -draft
     - -conflict
+
+# WHO MAY SAY `@mergifyio refresh` — the other half of
+# `.github/workflows/mergify-nudge.yml`, and useless without it.
+#
+# Mergify is event-driven, and a missed `check_run.completed` webhook leaves a
+# fully green pull request sitting on "your merge queue conditions are under
+# evaluation" until a periodic re-evaluation minutes later. Measured here on
+# 2026-08-23: 8m55s, 11m06s, 17m24s and 20m01s of idle time between the last
+# green check and Mergify acting, against 13-14 seconds when Mergify reacts to
+# an event it generated itself. `mergify-nudge` posts the refresh that clears
+# it.
+#
+# It posts as `github-actions[bot]`, which is NOT a repository collaborator. The
+# default restriction on `refresh` is `sender-permission >= write`, GitHub
+# answers that question about the bot with something less than write, and
+# Mergify then discards the command in SILENCE — no reply, no reaction, nothing
+# in the thread to distinguish "ignored" from "the stall was going to end
+# anyway". This block is what admits it.
+#
+# Widening it to a bot is not widening much: `refresh` re-evaluates the
+# conditions that are already written down. It cannot approve, bypass, queue or
+# merge, so the worst a hostile refresh achieves is making Mergify re-read the
+# truth sooner.
+#
+# Declaring the key REPLACES the default rather than adding to it, so the write
+# clause is restated here. The default's other arm — a pull request's author may
+# refresh their own fork pull request — is deliberately not restated: nothing in
+# this repository depends on it, and reconstructing a clause by guessing at its
+# spelling is how a `.mergify.yml` becomes invalid, which fails the queue CLOSED
+# for every open pull request at once.
+commands_restrictions:
+  refresh:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = github-actions[bot]
