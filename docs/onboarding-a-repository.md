@@ -675,6 +675,22 @@ One property to accept before you wire it: **`workflow_run` is dispatched from
 the default branch only**, so the pull request that adds the nudge cannot run it.
 The first evidence is the first CI completion after the merge — watch that one.
 
+Three things the fleet rollout got wrong on the first pass, all of them cheap to
+get right the first time:
+
+- **List every workflow that produces a required check**, resolved from
+  `.mergify.yml` rather than from memory. The one that gets missed is a fast
+  hosted gate — `CI module drift`, `generic-binary-check` — not the long build,
+  and when it finishes last the nudge is a coin-flip.
+- **Key the concurrency group on the pull request, not on `head_branch`.** Two
+  pull requests from different forks may share a source-branch name, and keyed
+  on it they cancel each other's nudge.
+- **If this repository runs `check-runner-policy.sh`, add the RUNNER7
+  declaration.** The gate cannot read a callee in another repository, so it
+  refuses the call until a `remote-reusable-allowed(…, #issue)` comment records
+  that a human read it. Snippet in
+  [`ci-merge-queue-baseline.md`](ci-merge-queue-baseline.md#what-a-consuming-repository-adds).
+
 ## Windows
 
 Windows is a **first-class pool of the same module**. There is no separate
