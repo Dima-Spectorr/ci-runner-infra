@@ -683,9 +683,14 @@ has_publisher_token_out_of_argv() { # <telemetry.sh>
 has_host_telemetry_wiring() { # <main.tf>
   local code
   code=$(code_of "$1")
-  matches "$code" 'host_startup = join' || return 1
+  # `host_startup_source`, not `host_startup`: the value that reaches metadata is
+  # now a wrapper that gunzips this one, so the join is what the concatenation
+  # has to be asserted against. Matching `host_startup` loosely would also match
+  # the wrapper and pass on a build where the two scripts were no longer joined
+  # at all.
+  matches "$code" 'host_startup_source = join' || return 1
   local block
-  block=$(awk '/host_startup = join/, /\]\)/' <<<"$code")
+  block=$(awk '/host_startup_source = join/, /\]\)/' <<<"$code")
   matches "$block" 'scripts/telemetry\.sh'     || return 1
   matches "$block" 'scripts/host-startup\.sh'  || return 1
   # Order matters: the host script calls queue_series at the top level of a
@@ -2497,7 +2502,7 @@ mutate_file "$TELEM" 'the failure exit leaves the response body on disk' has_pub
 mutate_file "$POOLTF" 'the host loses the telemetry publisher' has_host_telemetry_wiring \
   's@^    file\("\$\{path\.module\}/scripts/telemetry\.sh"\),$@@'
 mutate_file "$POOLTF" 'the host script goes back to standing alone' has_host_telemetry_wiring \
-  's@^  host_startup = join\(".{2}", \[$@  host_startup = file("${path.module}/scripts/host-startup.sh") # [@'
+  's@^  host_startup_source = join\(".{2}", \[$@  host_startup_source = file("${path.module}/scripts/host-startup.sh") # [@'
 
 # --- the behavioural tests ------------------------------------------------------
 #
