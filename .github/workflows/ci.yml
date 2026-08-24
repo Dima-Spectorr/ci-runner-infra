@@ -25,8 +25,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  shell:
-    name: Shell (syntax + drain rule)
+  # THE SHELL GATE IS EIGHT JOBS AND AN AGGREGATE, not one job of eighty steps.
+  #
+  # It was one job, and it ran for 8m38s while the other two finished in 8s and
+  # 32s — eighty steps in a single line, on one four-core runner, with two of
+  # them (`shell-runner-policy-mutation` and `shell-cache`) accounting for over
+  # half the wall clock. Nothing about the work required that order: these are
+  # independent gates over a checked-out tree.
+  #
+  # The split is by TOOL and by COST, so a job installs what it needs and
+  # nothing else — `shellcheck`, PSScriptAnalyzer and Pester, packer, PyYAML —
+  # instead of every job paying for every install.
+  #
+  # `Shell (syntax + drain rule)` still exists, as the aggregate at the bottom.
+  # That name is a required status check here and is named in `.mergify.yml`, so
+  # it is a CONTRACT, not a label: splitting the work behind it must not change
+  # what the branch ruleset and the merge queue have to wait for.
+  #
+  # A job left out of that aggregate's `needs:` would run, fail, and be waited
+  # for by nobody — green queue, red job. So the aggregate does not trust its own
+  # list: it reads every `shell-*` job back out of this file and asserts the list
+  # names all of them.
+  shell-lint:
+    name: Shell — lint (bash -n + shellcheck + workflow shell)
     runs-on: ubuntu-latest
     # Without this a hung job inherits GitHub's 360-minute default. On a
     # self-hosted pool that holds a host for six hours; here it merely wastes
@@ -65,6 +86,12 @@ jobs:
           find . -name '*.sh' -print0 \
             | timeout 300 xargs -0 -n1 shellcheck -e SC1090,SC1091
 
+      # THE TWO STEPS ABOVE, AND THESE TWO, SHARE A JOB BECAUSE THEY SHARE A
+      # TOOL. `check-workflow-shell.sh` runs shellcheck and refuses to run
+      # without it (WFS0), so it belongs wherever shellcheck is installed —
+      # splitting it into the config-gate job below would cost a second apt
+      # install to avoid a fail-closed gate, which is the worse trade.
+      #
       # The two steps above read every `*.sh` in the tree and nothing else — and
       # a composite action's `run:` blocks are shell that lives in a `.yml`. The
       # pull request that added `.github/actions/playwright-ui/action.yml` had
@@ -82,6 +109,13 @@ jobs:
 
       - name: workflow shell gate
         run: bash scripts/ci/check-workflow-shell.sh
+
+  shell-config-gates:
+    name: Shell — config gates (packer, pipefail)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # And those sweeps read the shell as shell, which leaves one interpreter
       # question they cannot ask: a packer `inline` block is a script whose
@@ -188,8 +222,15 @@ jobs:
       - name: image vulnerability verdict self-test
         run: bash scripts/ci/image-vuln-verdict.sh --selftest
 
-      # Those three sweeps read `*.sh` and `run:` blocks, and are blind to a
-      # `.ps1`. Windows hosts are driven by PowerShell, so the fleet is about to
+  shell-powershell:
+    name: Shell — PowerShell (analyzer + Pester)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The shell and workflow sweeps read `*.sh` and `run:` blocks, and are
+      # blind to a `.ps1`. Windows hosts are driven by PowerShell, so the fleet is about to
       # grow code that no gate in this file can read. These three steps land one
       # pull request BEFORE the first `.ps1` does, so no window exists in which
       # unparsed, unlinted Windows code sits on main looking gated.
@@ -284,6 +325,13 @@ jobs:
             }
           }
           if ($r.FailedCount -gt 0) { throw "$($r.FailedCount) Pester test(s) failed" }
+
+  shell-decisions:
+    name: Shell — controller decision rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Ahead of every decision rule below, because all of them run against a
       # row this parser produced. A dropped row is not a failure the fleet
@@ -408,6 +456,13 @@ jobs:
           }
           bash scripts/ci/mergify-capacity.selftest.sh
 
+  shell-host:
+    name: Shell — host boot and slot lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
       - name: host-startup self-test
         run: bash scripts/ci/host-startup.selftest.sh
 
@@ -435,6 +490,13 @@ jobs:
       # completed one. It FAILS rather than skips if it cannot get root.
       - name: slot lifecycle behaviour
         run: sudo -n bash scripts/ci/slot-lifecycle.behaviour.sh
+
+  shell-infra:
+    name: Shell — shared infra and Windows host boot
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # The band's two constants live in two files in two languages, because
       # the network module is created once per project and deliberately does
@@ -474,6 +536,20 @@ jobs:
       - name: host-os guard self-test
         run: bash scripts/ci/host-os-guard.selftest.sh
 
+  shell-cache:
+    name: Shell — dependency cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # ALONE IN ITS OWN JOB, and the longest of them — which makes it the thing
+      # that decides how long this pipeline takes. It runs 274 mutations
+      # sequentially, about a hundred seconds. Every other job here finishes well
+      # inside that, so shortening the pipeline further means splitting THIS
+      # file's cases the way `check-runner-policy.selftest.sh` splits its own,
+      # not rearranging anything around it.
+      #
       # The dependency cache is the only layer here whose breakage produces no
       # error at all: a job with a misconfigured cache still passes, it just
       # re-downloads everything. That is how the image described itself as
@@ -484,7 +560,15 @@ jobs:
       - name: dependency cache self-test
         run: bash scripts/ci/shared-cache.selftest.sh
 
-      # The Windows half of the same layer, and the same silence: a build phase
+  shell-contracts:
+    name: Shell — snapshots, brokers and identity contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The Windows half of the dependency-cache layer, and the same silence: a
+      # build phase
       # that loses its bound, its reap or its two-job split still produces an
       # archive, and the archive is what every host in the pool unpacks as
       # SYSTEM. The Pester suite runs this script's pure functions; nothing but
@@ -626,30 +710,66 @@ jobs:
       - name: tf-apply-guard self-test
         run: bash scripts/ci/tf-apply-guard.selftest.sh
 
+  shell-runner-policy:
+    name: Shell — runner policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
       # Which pool a job may claim. The fixtures first, same reason as above —
       # a workflow gate that reads no workflow reports clean.
       - name: runner policy self-test
         run: bash scripts/ci/check-runner-policy.sh --selftest
 
-      # …and the fixtures' own proof. A fixture asserting "this workflow
-      # produces RUNNER8" keeps passing while the detector behind it is
-      # weakened, so this mutates the gate and asserts the suite above FAILS for
-      # each mutation. Runs after it, because a mutation "detected" by a suite
-      # that was already red asserts nothing either.
-      #
-      # The case count is deliberately not written here: the script prints its
-      # own and asserts a floor on it, and a number in prose beside a test that
-      # counts itself is a second source of truth that goes stale — this comment
-      # said "sixteen ways" while the file held twenty-five.
-      #
-      # It is also the longest step in this pipeline by a wide margin, because
-      # each case is a full run of the gate's own fixture suite. The cases are
-      # independent, so the script fans them across the runner's cores; nothing
-      # here has to know that, but a future reader wondering why this step is
-      # minutes rather than seconds should look at the fan-out before adding
-      # cases.
+  shell-runner-policy-mutation:
+    name: Shell — runner policy mutation ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # …and the fixtures' own proof. A fixture asserting "this workflow produces
+    # RUNNER8" keeps passing while the detector behind it is weakened, so this
+    # mutates the gate and asserts its fixture suite FAILS for each mutation.
+    #
+    # It used to run as a step AFTER `runner policy self-test`, on the reasoning
+    # that a mutation "detected" by a suite that was already red asserts nothing.
+    # That ordering is now inside the script instead of beside it: every shard
+    # first runs an UNMUTATED copy of the gate and refuses to score a single case
+    # unless that copy passes. The guarantee is the same one, made where it
+    # cannot be reordered away — so this job no longer needs to follow anything.
+    #
+    # The case count is deliberately not written here: the script prints its own
+    # and asserts a floor on it, and a number in prose beside a test that counts
+    # itself is a second source of truth that goes stale — this comment said
+    # "sixteen ways" while the file held twenty-five.
+    #
+    # WHY THIS IS A MATRIX. Each case is a full run of the gate's fixture suite,
+    # and that suite spawns one `python3` per fixture — about seventeen seconds
+    # of interpreter startup. Fanned across one runner's four cores the whole set
+    # took three minutes ten, which was 37% of this pipeline. Sharded four ways
+    # it is four runners' worth of cores instead of one.
+    #
+    # `strategy.job-total` is the LENGTH OF THE LIST BELOW, so the shard count is
+    # written down exactly once. Add or remove a shard and the total follows; the
+    # alternative — a literal `4` beside the list — goes stale by dropping the
+    # last shard's mutations while every job still reports green.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
       - name: runner policy mutation self-test
-        run: bash scripts/ci/check-runner-policy.selftest.sh
+        run: bash scripts/ci/check-runner-policy.selftest.sh --shard ${{ matrix.shard }}/${{ strategy.job-total }}
+
+  shell-repo-gates:
+    name: Shell — this repository's own gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # …and then this repository's own workflows. It publishes the rule, so it
       # is the first place the rule must hold. `--forks=allowed` is the strict
@@ -661,7 +781,8 @@ jobs:
       # and a gate whose first act is to redden its own repository is a gate
       # nobody adopts. It goes on in the pull request that does the
       # consolidation (phase 7 of docs/adr-pr-host-affinity.md); until then the
-      # fixtures above are what prove the rules work.
+      # fixtures in `shell-runner-policy` and the mutations in
+      # `shell-runner-policy-mutation` are what prove the rules work.
       - name: runner policy
         run: bash scripts/ci/check-runner-policy.sh --forks=allowed
 
@@ -780,6 +901,95 @@ jobs:
 
       - name: playwright pin
         run: bash scripts/ci/check-playwright-pin.sh
+
+  # THE NAME THE REST OF THE WORLD WAITS FOR.
+  #
+  # `.mergify.yml` names this string, and so does the branch ruleset's required
+  # check list. Both are outside this file and neither is updated by editing it,
+  # so the name is pinned here and the work moved behind it.
+  #
+  # `if: always()` is what makes it a gate rather than a formality. Without it
+  # this job is SKIPPED when a dependency fails, and a skipped required check is
+  # not a failed one — GitHub reports no conclusion, the queue waits forever, and
+  # `.mergify.yml`'s own comment about jobs that "skip and leave the queue
+  # waiting for a conclusion that never comes" describes exactly what it would
+  # have become.
+  shell:
+    name: Shell (syntax + drain rule)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - shell-lint
+      - shell-config-gates
+      - shell-powershell
+      - shell-decisions
+      - shell-host
+      - shell-infra
+      - shell-cache
+      - shell-contracts
+      - shell-runner-policy
+      - shell-runner-policy-mutation
+      - shell-repo-gates
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Every dependency, by name and result. `success` is the ONLY acceptable
+      # one: `failure` and `cancelled` are obvious, and `skipped` is the quiet
+      # one — a dependency that never ran asserted nothing, and treating it as
+      # green is how a gate reports on work it did not do.
+      - name: every shell job concluded green
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+
+          results = json.loads(os.environ["RESULTS"])
+          bad = {j: r["result"] for j, r in sorted(results.items()) if r["result"] != "success"}
+          for job, outcome in sorted(results.items()):
+              print("%9s  %s" % (outcome["result"], job))
+          if bad:
+              print()
+              for job, result in bad.items():
+                  print(f"::error::{job} concluded '{result}', not success")
+              sys.exit(1)
+          print(f"\nall {len(results)} shell job(s) green")
+          PY
+
+      # THE LIST AUDITS ITSELF.
+      #
+      # A new `shell-*` job that nobody adds to `needs:` above runs, fails, and
+      # blocks nothing: this aggregate goes green without it and the merge queue
+      # merges over a red check. That is a silent hole, and it is one `grep`
+      # away from being impossible, so it is asserted rather than left to review.
+      - name: the aggregate waits for every shell job in this file
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          watched = set(json.loads(os.environ["RESULTS"]))
+          declared = set(
+              re.findall(
+                  r"^  (shell-[a-z0-9-]+):$",
+                  open(".github/workflows/ci.yml", encoding="utf-8").read(),
+                  re.MULTILINE,
+              )
+          )
+          missing = declared - watched
+          stale = watched - declared
+          for job in sorted(missing):
+              print(f"::error::job '{job}' is not in this aggregate's needs: — it would fail without blocking anything")
+          for job in sorted(stale):
+              print(f"::error::this aggregate needs '{job}', which no longer exists in this file")
+          if missing or stale:
+              sys.exit(1)
+          print(f"the aggregate covers all {len(declared)} shell-* job(s)")
+          PY
 
   terraform:
     name: Terraform (fmt + validate)

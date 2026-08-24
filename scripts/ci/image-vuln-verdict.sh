@@ -6,6 +6,7 @@
 #   scripts/ci/image-vuln-verdict.sh --report <grype.json>
 #                                    [--fail-on critical|high|medium|low]
 #                                    [--ignores <file>] [--today YYYY-MM-DD]
+#                                    [--offdistro-baseline <file>]
 #                                    [--selftest]
 #
 # PURPOSE
@@ -17,6 +18,9 @@
 #     VULN1  a finding at or above the floor WITH AN AVAILABLE FIX — blocking
 #     VULN2  an ignore entry whose expiry has passed — blocking, and the
 #            finding it was hiding is reported alongside it
+#     VULN3  an off-distro finding this image has not seen before — blocking,
+#            once the baseline is seeded (see WHY THE OFF-DISTRO POPULATION IS
+#            TRACKED)
 #     VULN0  the report could not be read, or matched nothing at all —
 #            reported as a failure, never as a clean image
 #
@@ -48,6 +52,28 @@
 #   perfect result, and that vacuous pass is worse than no gate, because it is
 #   believed.
 #
+# WHY THE OFF-DISTRO POPULATION IS TRACKED (#196)
+#   Narrowing the gate to distro-matched findings was necessary — the first real
+#   run produced 273 blocking findings, every one of them a binary match no
+#   change to this repository could clear — and it left a real gap: a genuinely
+#   vulnerable module vendored into an image-installed binary no longer fails the
+#   build. Re-enabling the block wholesale would restore a permanently red gate,
+#   because for a version read out of a binary grype compares upstream numbers
+#   and a backported fix is invisible to that comparison.
+#
+#   So what is enforced is not the population but its GROWTH, and by identity
+#   rather than by count. A count moves whenever the vulnerability database does;
+#   a new `(CVE, package)` pair is a new statement about this image. The known
+#   pairs live in `docs/image-vuln-offdistro.txt`, so adding one is a pull
+#   request, which is the review — the same mechanism as the ignore file, for the
+#   same reason.
+#
+#   The baseline can only be seeded from a real scan, which happens in a Packer
+#   build and not here. An UNSEEDED file therefore puts the gate in OBSERVE mode:
+#   it prints the population as a paste-ready block and does not block, and it
+#   says on the summary line that it is not enforcing. That is the one state
+#   somebody could leave it in forever, so it is the loudest thing the gate says.
+#
 # WHAT THIS DOES NOT DECIDE
 #   Whether a CVE is exploitable on a CI host. That is the review, and the
 #   ignore file with its dated reason is where the review is recorded.
@@ -61,7 +87,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-REPORT=""; FAIL_ON="critical"; IGNORES=""; TODAY=""; SELFTEST=0
+REPORT=""; FAIL_ON="critical"; IGNORES=""; TODAY=""; BASELINE=""; SELFTEST=0
 
 usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" >&2; exit 2; }
 
@@ -71,6 +97,7 @@ usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" >&2; exit 2; }
 #
 #   #FINDING<TAB>id<TAB>severity<TAB>package<TAB>version<TAB>fix<TAB>state
 #   #EXPIRED<TAB>id<TAB>expiry<TAB>reason
+#   #OFFDISTRO<TAB>id<TAB>package    — one per DISTINCT pair, for the baseline
 #   #COUNT<TAB>total<TAB>blocking<TAB>ignored<TAB>expired<TAB>offdistro
 #
 # `state` is blocking | ignored | offdistro | reported. No field may be empty: `read` with
@@ -164,6 +191,9 @@ def out(*fields):
 
 total = blocking = ignored = expired = offdistro = 0
 seen_expired = set()
+# Insertion-ordered so the seed block a human pastes is stable between builds and
+# a diff of it reads as the change it is. A set would reorder on every run.
+offdistro_pairs = {}
 
 for m in matches:
     vuln = m.get("vulnerability") or {}
@@ -193,6 +223,11 @@ for m in matches:
         # speak to what it found" never render as the same line.
         state = "offdistro"
         offdistro += 1
+        # By (id, package), not by count and not by location: grype reports the
+        # same vendored module once per binary that carries it, so a count moves
+        # when a distro repackages something and says nothing about this image's
+        # exposure. The pair is the statement the baseline records.
+        offdistro_pairs.setdefault((vid, art.get("name") or "-"), None)
 
     if at_or_above and fixable and provenance_blocks:
         if vid in ignores:
@@ -215,12 +250,15 @@ for m in matches:
 
     out("#FINDING", vid, sev, art.get("name") or "-", art.get("version") or "-", fixed_in, state)
 
+for vid, pkg in offdistro_pairs:
+    out("#OFFDISTRO", vid, pkg)
+
 out("#COUNT", total, blocking, ignored, expired, offdistro)
 PY
 }
 
 run() {
-  REPORT=""; FAIL_ON="critical"; IGNORES=""; TODAY=""; SELFTEST=0
+  REPORT=""; FAIL_ON="critical"; IGNORES=""; TODAY=""; BASELINE=""; SELFTEST=0
 
   while [ $# -gt 0 ]; do
     # `$2` is read under `set -u`, so a value-taking flag given last would die
@@ -229,7 +267,7 @@ run() {
     # the invocation being wrong. Checked before the case, once, rather than in
     # four places that could each be forgotten.
     case "$1" in
-      --report|--fail-on|--ignores|--today)
+      --report|--fail-on|--ignores|--today|--offdistro-baseline)
         [ $# -ge 2 ] || { echo "$1 needs a value" >&2; usage; }
         ;;
     esac
@@ -238,6 +276,7 @@ run() {
       --fail-on) FAIL_ON="$2"; shift 2 ;;
       --ignores) IGNORES="$2"; shift 2 ;;
       --today)   TODAY="$2";   shift 2 ;;
+      --offdistro-baseline) BASELINE="$2"; shift 2 ;;
       --selftest) SELFTEST=1;  shift ;;
       *) echo "unknown argument: $1" >&2; usage ;;
     esac
@@ -252,6 +291,9 @@ run() {
   # repository's CI read the same file without either having to name it.
   if [ -z "$IGNORES" ] && [ -f "$REPO_ROOT/docs/image-vuln-ignores.txt" ]; then
     IGNORES="$REPO_ROOT/docs/image-vuln-ignores.txt"
+  fi
+  if [ -z "$BASELINE" ] && [ -f "$REPO_ROOT/docs/image-vuln-offdistro.txt" ]; then
+    BASELINE="$REPO_ROOT/docs/image-vuln-offdistro.txt"
   fi
 
   local records
@@ -275,7 +317,74 @@ run() {
   # is the count of things at or above the floor, with a fix, that this gate
   # deliberately does not block on — the number whose growth means the gate is
   # covering less than the reader assumes.
-  echo "image scan: $total finding(s), floor=$FAIL_ON, $blocking blocking, $ignored ignored, $expired expired ignore(s), $offdistro fixable off-distro (not blocking)"
+  # --- the off-distro population, tracked build over build (#196) --------------
+  #
+  # Computed BEFORE the summary line, because a new pair adds to `blocking` and a
+  # summary that disagreed with the errors printed under it would read as those
+  # errors being spurious.
+  local seen known new_pairs stale_pairs baseline_state
+  seen="$(printf '%s\n' "$records" | grep '^#OFFDISTRO' | cut -f2,3 | tr '\t' ' ' | sort -u)"
+
+  known=""
+  baseline_state="absent"
+  if [ -n "$BASELINE" ] && [ -f "$BASELINE" ]; then
+    # A line the reader half-understands is worse than no baseline: it would
+    # silently accept a pair nobody recorded. One field is the shape a truncated
+    # copy-paste takes, so it is rejected rather than read as an id with no
+    # package. The reason column is OPTIONAL here, unlike the ignore file — this
+    # records what the image contains, not a decision to tolerate it, and forcing
+    # 273 seeded lines to each carry prose would produce 273 lines of nothing.
+    local lineno=0 line f1 f2
+    while IFS= read -r line || [ -n "$line" ]; do
+      lineno=$((lineno + 1))
+      case "$line" in ''|'#'*) continue ;; esac
+      read -r f1 f2 _ <<< "$line"
+      if [ -z "$f2" ]; then
+        echo "::error::[VULN0] $BASELINE line $lineno is not '<id> <package> [reason]': $line" >&2
+        return 2
+      fi
+      known="$known$f1 $f2
+"
+    done < "$BASELINE"
+    known="$(printf '%s' "$known" | sort -u)"
+    [ -n "$known" ] && baseline_state="seeded" || baseline_state="unseeded"
+  fi
+
+  # `comm` and not a loop with grep: an id is a substring of nothing here, but a
+  # package name legitimately contains another package name, and a substring
+  # match would quietly accept a pair the baseline does not carry.
+  new_pairs="$(comm -23 <(printf '%s\n' "$seen") <(printf '%s\n' "$known") | grep -v '^$' || true)"
+  stale_pairs="$(comm -13 <(printf '%s\n' "$seen") <(printf '%s\n' "$known") | grep -v '^$' || true)"
+
+  local n_new n_stale
+  n_new=$(printf '%s\n' "$new_pairs" | grep -c . || true)
+  n_stale=$(printf '%s\n' "$stale_pairs" | grep -c . || true)
+  [ "$baseline_state" = "seeded" ] && blocking=$((blocking + n_new))
+
+  echo "image scan: $total finding(s), floor=$FAIL_ON, $blocking blocking, $ignored ignored, $expired expired ignore(s), $offdistro fixable off-distro ($n_new not in the baseline)"
+
+  if [ "$baseline_state" != "seeded" ]; then
+    # The state somebody could leave forever, so it is said plainly and the seed
+    # is printed ready to paste. Not blocking: the baseline can only come from a
+    # real scan, and a gate that fails until it has been given data it is the
+    # only source of is a gate that gets deleted.
+    echo "off-distro tracking: OBSERVE — $BASELINE is ${baseline_state}, so a new off-distro finding will NOT fail this build."
+    echo "off-distro tracking: commit the block below to that file to start enforcing; after that, a pair not in it is a red build and a pull request is the review."
+    printf '%s\n' "$seen" | grep -v '^$' | sed 's/^/    /' || true
+  else
+    echo "off-distro tracking: ENFORCE — ${n_new} new pair(s), ${n_stale} baseline entry(ies) no longer seen"
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      echo "::error::[VULN3] off-distro finding not in the baseline: $line — a module vendored into an image binary that this image has not carried before. Review it, then add it to $BASELINE in a pull request, or remove whatever brought it in."
+    done <<< "$new_pairs"
+    # Reported, never blocking: a pair that stopped appearing is good news, and
+    # failing the build over an unpruned line would teach people to empty the
+    # file — which turns enforcement back off without anybody deciding to.
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      echo "  baseline entry no longer seen (prune it when convenient): $line"
+    done <<< "$stale_pairs"
+  fi
 
   local _ id sev pkg ver fix state expiry reason
   while IFS=$'\t' read -r _ id expiry reason; do
@@ -382,6 +491,82 @@ selftest() {
   check "an rpm is a distro package too" 1 "VULN1" --report "$tmp/rpm.json" --today 2026-01-01
   report "$(match CVE-14 critical fixed 1.2.3 libfoo 1.2.2 apk)" > "$tmp/apk.json"
   check "an apk is a distro package too" 1 "VULN1" --report "$tmp/apk.json" --today 2026-01-01
+
+  # ── the off-distro population, tracked build over build (#196) ─────────────
+  #
+  # Every check below passes `--offdistro-baseline` explicitly. The default
+  # resolves to the repository's own file, which is UNSEEDED today — so a fixture
+  # that relied on the default would exercise OBSERVE mode and keep doing so
+  # after somebody seeds the real file, at which point it would start failing for
+  # a reason that has nothing to do with the code.
+
+  # Unseeded: the population is printed for pasting, and nothing blocks. The
+  # bootstrap state, and the one somebody could leave forever, so it is asserted
+  # rather than assumed.
+  : > "$tmp/base-empty.txt"
+  check "an unseeded baseline observes and does not block" 0 "OBSERVE" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-empty.txt" --today 2026-01-01
+  check "…and prints the pair ready to paste" 0 "GHSA-x golang.org/x/crypto" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-empty.txt" --today 2026-01-01
+
+  # A file that is not there at all is the same decision, and says which state it
+  # is in — "absent" and "unseeded" are different mistakes to fix.
+  check "an absent baseline observes too, and says it is absent" 0 "is absent" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/nope.txt" --today 2026-01-01
+
+  # Seeded and the pair is known: enforcing, and still green. This is the steady
+  # state, and if it ever blocked the file would be emptied within a week.
+  printf 'GHSA-x golang.org/x/crypto vendored in dockerd, Ubuntu ships the backport\n' > "$tmp/base-known.txt"
+  check "a known pair does not block a seeded baseline" 0 "ENFORCE" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-known.txt" --today 2026-01-01
+
+  # THE POINT OF THE WHOLE MECHANISM: a pair this image has not carried before.
+  printf 'CVE-OTHER some-other-package seen before\n' > "$tmp/base-other.txt"
+  check "a pair not in a seeded baseline blocks" 1 "VULN3" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-other.txt" --today 2026-01-01
+  check "…and the build's blocking count includes it" 1 "1 blocking" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-other.txt" --today 2026-01-01
+
+  # Matched as a whole pair. The same CVE against a DIFFERENT package is a
+  # different statement about the image, and a baseline that accepted it would
+  # let a new binary in under an id already on file.
+  printf 'GHSA-x some-other-package same id, different package\n' > "$tmp/base-sameid.txt"
+  check "the same id against another package is still new" 1 "VULN3" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-sameid.txt" --today 2026-01-01
+
+  # And not by substring: `crypto` is a prefix of `golang.org/x/crypto` only
+  # after the slashes, but package names do contain each other, and a substring
+  # match here would silently accept a pair nobody recorded.
+  printf 'GHSA-x crypto a shorter name that is a substring of the real one\n' > "$tmp/base-substr.txt"
+  check "a baseline entry that is a substring of the pair does not cover it" 1 "VULN3" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-substr.txt" --today 2026-01-01
+
+  # A baseline line that no longer matches anything is reported and NOT blocking.
+  # Failing on it would teach people to empty the file, which turns enforcement
+  # off without anybody deciding to.
+  printf 'GHSA-x golang.org/x/crypto still here\nCVE-GONE gone-package no longer in the image\n' > "$tmp/base-stale.txt"
+  check "a stale baseline entry is reported, not blocking" 0 "no longer seen" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-stale.txt" --today 2026-01-01
+
+  # Comments and blank lines are not entries — a file of nothing but the header
+  # this repository ships is UNSEEDED, not seeded-with-zero-entries. Seeded with
+  # zero entries would mean "this image carries no off-distro findings", and
+  # would block on the first one that appeared, which is the red-forever gate.
+  printf '# just a header\n\n# and another comment\n' > "$tmp/base-comments.txt"
+  check "a baseline of comments alone is unseeded, not seeded-empty" 0 "OBSERVE" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-comments.txt" --today 2026-01-01
+
+  # A truncated line fails the gate rather than being read as an id with no
+  # package — the same rule as the ignore file, for the same reason.
+  printf 'GHSA-x\n' > "$tmp/base-short.txt"
+  check "a baseline line with no package fails the gate" 2 "VULN0" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-short.txt" --today 2026-01-01
+
+  # A distro finding is not in this population at all: the baseline is about
+  # what the gate CANNOT judge, and a blocking deb must not be silenced by a
+  # line in it.
+  check "a blocking distro finding is unaffected by the baseline" 1 "VULN1" \
+    --report "$tmp/deb.json" --offdistro-baseline "$tmp/base-known.txt" --today 2026-01-01
 
   # An ignore is about a CVE; whether a finding blocks is about provenance, and
   # provenance is decided first. So an ignore for an off-distro finding is dead

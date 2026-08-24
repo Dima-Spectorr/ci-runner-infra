@@ -237,6 +237,26 @@ variable "build_image" {
   default     = "node:22"
 }
 
+variable "cache_scan_allow_file" {
+  description = "Repository-relative path to the credential-scan allowlist, whose commented digests name the dependency files the scan may excuse (a package's PEM test fixture, a README quoting a URL with basic auth). `null`, the default, uses `.github/cache-scan-allow.txt` if the checkout has one and no allowlist otherwise — so an ordinary repository sets nothing. A path named here must exist, because an allowlist that is not there excuses nothing and reads exactly like one that worked. `\"\"` disables the lookup."
+  type        = string
+  default     = null
+
+  # The value is pasted into a single-quoted shell string inside a step that can
+  # reach the metadata server and mint the warmer's write token, so it is checked
+  # here rather than trusted: a quote ends that string, a `$` is read by Cloud
+  # Build as a substitution key and refuses the whole build, and an absolute or
+  # `..` path resolves outside the checkout the allowlist is supposed to come
+  # from.
+  validation {
+    condition = var.cache_scan_allow_file == null || (
+      length(regexall("['\"$`\\\\]|\\.\\.", coalesce(var.cache_scan_allow_file, "x"))) == 0
+      && !startswith(coalesce(var.cache_scan_allow_file, "x"), "/")
+    )
+    error_message = "cache_scan_allow_file must be a repository-relative path with no quote, dollar, backtick, backslash or `..` — it is pasted into a shell string in a step that holds the warmer's write credential."
+  }
+}
+
 variable "gcloud_image" {
   description = "Image the two publishing steps run in. Needs `gcloud storage` and the shell utilities the publishing script uses."
   type        = string

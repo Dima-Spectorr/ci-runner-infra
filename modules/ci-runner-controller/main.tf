@@ -44,7 +44,7 @@ locals {
   # than a controller that boots into an empty startup script.
   pool_scripts = "${path.module}/../ci-runner-host-pool/scripts"
 
-  controller_startup = join("\n", [
+  controller_startup_source = join("\n", [
     "#!/usr/bin/env bash",
     file("${local.pool_scripts}/drain-decision.sh"),
     file("${local.pool_scripts}/orphan-decision.sh"),
@@ -77,6 +77,29 @@ locals {
     file("${local.pool_scripts}/pool-table.sh"),
     file("${local.pool_scripts}/controller-startup.sh"),
   ])
+
+  # AND IT TRAVELS COMPRESSED, exactly as the pool module's copy does and for
+  # the identical reason: fourteen files concatenated render past the 256 KiB
+  # cap on a GCE metadata value, `terraform plan` does not check the length, and
+  # the apply then dies with an Error 413 at create time. This module is not yet
+  # in service anywhere, so it has never hit it — which is precisely why it gets
+  # the wrapper now rather than after its first deployment discovers it.
+  #
+  # The unpack path is outside anything the controller manages, because bash
+  # reads a script incrementally as it runs; `set -euo pipefail` makes a
+  # truncated blob a loud boot failure rather than a controller running a prefix
+  # of its own decision rules.
+  controller_startup_gz = base64gzip(local.controller_startup_source)
+
+  controller_startup = <<-EOT
+    #!/usr/bin/env bash
+    set -euo pipefail
+    base64 -d <<'CI_CONTROLLER_STARTUP_GZ_EOF' | gzip -d > /var/lib/ci-controller-startup.sh
+    ${local.controller_startup_gz}
+    CI_CONTROLLER_STARTUP_GZ_EOF
+    chmod 0700 /var/lib/ci-controller-startup.sh
+    exec /var/lib/ci-controller-startup.sh
+  EOT
 
   # `jsonencode` writes an unset optional attribute as JSON `null`, and null is
   # exactly what the parser's `//` defaults are for — `null // 900` is 900,
@@ -190,6 +213,14 @@ resource "google_compute_instance_template" "controller" {
 
   lifecycle {
     create_before_destroy = true
+
+    # The same gate the pool module's controller carries. Stated here too rather
+    # than inherited, because this module renders its own metadata and a shared
+    # controller that cannot be created is FOUR pools that never leave zero.
+    precondition {
+      condition     = length(local.controller_startup) < 262144
+      error_message = "controller '${var.name}' renders a ${length(local.controller_startup)}-character boot script and a GCE metadata value is capped at 262144. The script is already gzipped into its wrapper, so the SOURCE has outgrown even the compressed form: shorten the decision-rule scripts under modules/ci-runner-host-pool/scripts/, or move part of the controller onto the golden image. Left to the apply this is an Error 413 at create time, on a plan that read clean."
+    }
   }
 }
 

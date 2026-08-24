@@ -739,6 +739,13 @@ has_shared_infra_band() { # <file>
   # exclude a sibling slot, whose packets arrive on cis<N> -- the main consumer.
   matches "$code" 'PREROUTING -d "\$addr" -p tcp --dport "\$bmin:\$bmax"' || return 1
   matches "$code" 'DNAT --to-destination "\$nsip"' || return 1
+  # ...and the hairpin SNAT, without which that DNAT is broken for exactly one
+  # slot: the one that owns the band. Post-DNAT source and destination are both
+  # 10.99.<idx>.2, the reply never comes back through conntrack, and the
+  # consumer times out. Scoped to the slot's own /30 so a sibling keeps its
+  # real address.
+  matches "$code" 'POSTROUTING -s "\$nsip" -d "\$nsip" -p tcp' || return 1
+  matches "$code" '--dport "\$bmin:\$bmax" -j MASQUERADE' || return 1
   # the forward allow is scoped to what the DNAT produced, not to an interface
   # pair, so it survives #249 removing the broad per-veth accepts
   matches "$code" 'ctstate DNAT --ctorigdst "\$baddr"' || return 1
@@ -1780,6 +1787,8 @@ mutate "slot count dropped"           '/^Environment=CI_HOST_SLOTS=/d'          
 
 mutate "band DNAT dropped"            '/PREROUTING -d "\$addr" -p tcp --dport/,+3d'          has_shared_infra_band
 mutate "DNAT matched on the interface" 's@PREROUTING -d "\$addr" -p tcp@PREROUTING -i "$ifc" -p tcp@g' has_shared_infra_band
+mutate "hairpin SNAT dropped"          '/POSTROUTING -s "\$nsip" -d "\$nsip" -p tcp/,+3d'    has_shared_infra_band
+mutate "hairpin SNAT unscoped"         's@POSTROUTING -s "\$nsip" -d "\$nsip" -p tcp@POSTROUTING -s 10.99.0.0/16 -p tcp@g' has_shared_infra_band
 mutate "forward allow scoped to a veth" 's@ctstate DNAT --ctorigdst "\$baddr"@ctstate NEW -i "$veth"@g' has_shared_infra_band
 mutate "span hardcoded to four slots"  's@slot_band_max "\$SLOTS"@slot_band_max 4@'               has_shared_infra_band
 mutate "slot never told its band"      '/^Environment=CI_SHARED_INFRA_PORT_MIN=/d'                 has_shared_infra_band
@@ -1944,6 +1953,36 @@ if [ -z "$_live" ]; then
   ok
 else
   bad "an unescaped backtick or \$( inside an unquoted heredoc is a command substitution the boot would run, not prose -- line(s): ${_live//$'\n'/ }"
+fi
+
+
+# THE BOOT SCRIPT HAS TO FIT IN A METADATA VALUE.
+#
+# GCE caps one metadata value at 256 KiB. This script plus telemetry.sh crossed
+# that on 2026-08-24 at about 271 KiB, and the way it presented is why the check
+# is here rather than left to the apply: `terraform plan` was clean, the apply
+# died with `Error 413 ... actual size 277764` inside an unattended nightly
+# build, the pool kept its previous template, and three repositories ran a
+# known-broken boot script for a day while every merged fix looked shipped.
+#
+# The module now ships the script gzipped inside a small wrapper, which is what
+# this measures — the wrapper's own text is a rounding error next to the blob.
+# A plan-time precondition in the module asserts the same thing for real; this
+# is the copy that fails in CI, on the pull request that grows the script,
+# instead of on a machine at 04:00.
+#
+# The threshold is under the cap on purpose. Terraform's `base64gzip` is Go's
+# gzip at its DEFAULT level and this is whatever the runner's gzip defaults to,
+# so the two numbers are close but not guaranteed equal; the margin is there so
+# a compression-level difference can never be what decides whether the fleet
+# boots.
+_cap=262144
+_margin=245760
+_gz=$(cat "$HERE/../../modules/ci-runner-host-pool/scripts/telemetry.sh" "$SCRIPT" | gzip | base64 -w0 | wc -c)
+if [ "$_gz" -lt "$_margin" ]; then
+  ok
+else
+  bad "the gzipped boot script is ${_gz} characters as metadata; the budget is ${_margin} and GCE refuses anything over ${_cap}. Shorten host-startup.sh or move part of it onto the golden image -- past the cap this is an Error 413 at create time, on a plan that read clean."
 fi
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
