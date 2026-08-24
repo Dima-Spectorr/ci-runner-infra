@@ -33,6 +33,7 @@ MAIN="$ROOT/modules/ci-runner-cache-warmer/main.tf"
 VARS="$ROOT/modules/ci-runner-cache-warmer/variables.tf"
 TURBO="$ROOT/modules/ci-runner-cache-warmer/scripts/warm-turbo.sh"
 SHARED="$ROOT/scripts/ci/publish-cache-snapshot.sh"
+SHAREDSCAN="$ROOT/scripts/ci/scan-cache-credentials.sh"
 
 PASS=0
 FAIL=0
@@ -61,8 +62,19 @@ code_of() { grep -vE '^[[:space:]]*#' "$1"; }
 #    replaced by a copy inside the module (drift), or the root file could be
 #    moved (a plan that fails with a message about a missing file and nothing
 #    about why a module wants one two directories up).
+#
+#    The credential-scan library is the same reference and the same argument. The
+#    publisher sources it from its own directory and refuses to run at all when
+#    `scan_credentials_or_die` is undefined, so a library that stops being staged
+#    beside it is a warm that publishes nothing — loudly, but only at trigger
+#    time, on a schedule nobody is watching. Asserted here instead: read from the
+#    repository root, written into the staged directory next to the publisher.
 has_shared_publisher() { # <file>
-  matches "$(code_of "$1")" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"\)'
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"\)' || return 1
+  matches "$code" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/scan-cache-credentials\.sh"\)'  || return 1
+  matches "$code" 'gzip -d > \$\{local\.staged_dir\}/scan-cache-credentials\.sh'                  || return 1
 }
 
 if has_shared_publisher "$MAIN"; then ok; else
@@ -71,6 +83,10 @@ fi
 
 if [ -f "$SHARED" ]; then ok; else
   bad "scripts/ci/publish-cache-snapshot.sh has moved; the warmer module reads it by relative path and terraform will fail at plan time with a message that says nothing about this"
+fi
+
+if [ -f "$SHAREDSCAN" ]; then ok; else
+  bad "scripts/ci/scan-cache-credentials.sh has moved; the warmer module reads it by relative path too, and terraform will fail at plan time with a message that says nothing about this"
 fi
 
 # 2. TWO PHASES. The archive is packed in one step and uploaded in another, and
@@ -273,8 +289,7 @@ has_dollars_escaped() { # <file>
   local code
   code=$(code_of "$1")
   matches "$code" 'escape_dollars = "\$\$"' || return 1
-  matches "$code" 'publish_script = replace\(file\(.*publish-cache-snapshot\.sh"\), "\$", local\.escape_dollars\)' || return 1
-  matches "$code" 'turbo_script   = replace\(file\(.*warm-turbo\.sh"\), "\$", local\.escape_dollars\)' || return 1
+  matches "$code" 'stage_script = replace\(local\.stage_script_raw, "\$", local\.escape_dollars\)' || return 1
   matches "$code" 'prepare_command = replace\(coalesce\(var\.prepare_command' || return 1
   matches "$code" 'build_command = replace\(coalesce\(var\.build_command' || return 1
   # And nothing reaches a step as a raw file() read, which is how the escaping
@@ -296,14 +311,54 @@ fi
 carries_scripts_in_script_field() { # <file>
   local code
   code=$(code_of "$1")
-  matches "$code" 'script = local\.publish_script' || return 1
-  matches "$code" 'script = local\.turbo_script' || return 1
+  matches "$code" 'script = local\.stage_script' || return 1
+  matches "$code" 'script = local\.run_publish' || return 1
+  matches "$code" 'script = local\.run_turbo' || return 1
   ! matches "$code" 'args[[:space:]]*=[[:space:]]*\["-c"' || return 1
   ! matches "$code" 'entrypoint'
 }
 
 if carries_scripts_in_script_field "$MAIN"; then ok; else
   bad "a step passes its script through args or sets an entrypoint beside script — args are capped at 10,000 characters, the publishing script is far past that, and the API refuses the build at fire time on a trigger that applied cleanly"
+fi
+
+# 13. THE SCRIPTS ARE HANDED OVER ONCE, GZIPPED, AND THE APPLY REFUSES A CONFIG
+#     THAT HAS GROWN BACK TOWARD 128 KiB. Past roughly that, Cloud Build accepts
+#     the build, gives it an id, and then never schedules it — source fetched,
+#     SETUPBUILD finished, every step QUEUED, no BUILD phase and no error, until
+#     the queue TTL expires an hour later. Measured by bisection in one region: a
+#     125 KB config reached BUILD in two seconds, a 140 KB config never reached
+#     it at all. The first version of this module inlined the 91 KB publishing
+#     script into TWO steps and shipped a 199 KB config, so every warm it fired
+#     sat in that hole for as long as the module existed, reported nowhere.
+#     Inlining a script into a step is how it comes back, which is why the read
+#     is `base64gzip` and the guard is a precondition rather than a comment.
+has_config_under_the_cliff() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'publish_gz = base64gzip\(file\(' || return 1
+  matches "$code" 'turbo_gz   = base64gzip\(file\(' || return 1
+  matches "$code" 'build_config_bytes = sum\(\[' || return 1
+  # And a step that runs a STAGED script checks its digest first. /workspace is
+  # also where the repository's install and build run, so a step that executes
+  # what it finds there is a step the untrusted one in the middle could have
+  # rewritten — the exact ordering the two-phase split exists to keep.
+  matches "$code" 'publish_sha = filesha256\(' || return 1
+  matches "$code" 'scan_sha    = filesha256\(' || return 1
+  matches "$code" 'turbo_sha   = filesha256\(' || return 1
+  # The library the publisher sources is checked in the same step as the
+  # publisher: a snapshot scanned by a rewritten scanner is a snapshot nobody
+  # scanned, and it is published either way.
+  matches "$code" '\$\{local\.scan_sha\}  \$\{local\.staged_dir\}/scan-cache-credentials\.sh' || return 1
+  [ "$(printf '%s\n' "$code" | grep -c 'sha256sum -c -')" -eq 2 ] || return 1
+  matches "$code" 'condition     = local\.build_config_bytes < [0-9]+' || return 1
+  # And the big script reaches the config exactly once. Twice is the 199 KB
+  # config that never ran.
+  [ "$(printf '%s\n' "$code" | grep -cF 'base64gzip(file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh"))')" -eq 1 ]
+}
+
+if has_config_under_the_cliff "$MAIN"; then ok; else
+  bad "a script is inlined into the build config again, or the size guard is gone — past ~128 KiB Cloud Build never schedules the build at all, and says nothing about it anywhere"
 fi
 
 # --- mutations -----------------------------------------------------------------
@@ -330,6 +385,14 @@ mutate() { # <description> <file> <sed-program> <predicate>
 
 mutate "the publisher copied into the module" "$MAIN" \
   's@file("\${path\.module}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh")@file("${path.module}/scripts/publish-cache-snapshot.sh")@' \
+  has_shared_publisher
+
+mutate "the credential-scan library stops being staged" "$MAIN" \
+  's@^  scan_gz    = base64gzip(file("\${path\.module}/\.\./\.\./scripts/ci/scan-cache-credentials\.sh"))$@@' \
+  has_shared_publisher
+
+mutate "the library is read but never written beside the publisher" "$MAIN" \
+  's@gzip -d > \${local\.staged_dir}/scan-cache-credentials\.sh@gzip -d > /tmp/scan-cache-credentials.sh@' \
   has_shared_publisher
 
 mutate "install and upload in one phase" "$MAIN" \
@@ -408,21 +471,40 @@ mutate "the two installs made consistent, in the wrong direction" "$MAIN" \
   's|"@FLAGS@", "--ignore-scripts"|"@FLAGS@", ""|' \
   has_scriptfree_snapshot
 
-mutate "the publishing script pasted in unescaped" "$MAIN" \
-  's@publish_script = replace(file("\${path\.module}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"), "\$", local\.escape_dollars)@publish_script = file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh")@' \
+mutate "the staging script pasted in unescaped" "$MAIN" \
+  's@stage_script = replace(local\.stage_script_raw, "\$", local\.escape_dollars)@stage_script = local.stage_script_raw@' \
   has_dollars_escaped
 
 mutate "one step given the raw file() again" "$MAIN" \
-  's@script = local\.turbo_script@script = file("${path.module}/scripts/warm-turbo.sh")@' \
+  's@script = local\.run_turbo@script = file("${path.module}/scripts/warm-turbo.sh")@' \
   has_dollars_escaped
 
 mutate "a script handed back to bash -c" "$MAIN" \
-  's@script = local\.publish_script@entrypoint = "bash"\n      args       = ["-c", local.publish_script]@' \
+  's@script = local\.run_publish@entrypoint = "bash"\n      args       = ["-c", local.run_publish]@' \
   carries_scripts_in_script_field
 
 mutate "an entrypoint set beside a script" "$MAIN" \
-  's@script = local\.turbo_script@entrypoint = "bash"\n      script     = local.turbo_script@' \
+  's@script = local\.run_turbo@entrypoint = "bash"\n      script     = local.run_turbo@' \
   carries_scripts_in_script_field
+
+# The 199 KB config, put back one step at a time — which is exactly how it was
+# written the first time, by someone reasoning that a step should carry the
+# script it runs.
+mutate "the publishing script inlined into its step again" "$MAIN" \
+  's@script = local\.run_publish@script = base64gzip(file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh"))@' \
+  has_config_under_the_cliff
+
+mutate "a staged script run without checking its digest" "$MAIN" \
+  's@\\nexec \${local\.staged_dir}/warm-turbo\.sh@\\nexec ${local.staged_dir}/warm-turbo.sh@;s@sha256sum -c -\\nexec \${local\.staged_dir}/warm-turbo\.sh@exec ${local.staged_dir}/warm-turbo.sh@' \
+  has_config_under_the_cliff
+
+mutate "the scanner staged but left unchecked" "$MAIN" \
+  's@\\n\${local\.scan_sha}  \${local\.staged_dir}/scan-cache-credentials\.sh@@' \
+  has_config_under_the_cliff
+
+mutate "the size guard removed" "$MAIN" \
+  's@condition     = local\.build_config_bytes < 110000@condition     = true@' \
+  has_config_under_the_cliff
 
 mutate "the escape reduced to a single dollar" "$MAIN" \
   's@escape_dollars = "\$\$"@escape_dollars = "$"@' \

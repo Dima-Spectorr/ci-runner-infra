@@ -27,6 +27,13 @@
 #     is the unrecoverable-without-an-operator shape the ADR exists to avoid,
 #     arriving through the door the ADR opened.
 #
+#   * And the same thing happens to a job that was already RUNNING when its
+#     host went away, except quieter: GitHub leaves the job `in_progress` with
+#     nothing behind it, so the check run never reaches a conclusion at all.
+#     Everything waiting on that status waits out somebody's timeout — a merge
+#     queue reads "no status" as "still checking" and holds the entry for its
+#     full window before dequeuing on a timeout that names no cause. See rule 7.
+#
 # So the rule is separated from the I/O for the same reason drain-decision.sh
 # and orphan-decision.sh are. Two of its verdicts are irreversible in one
 # direction — `orphan` cancels somebody's workflow run — and a predicate that
@@ -34,8 +41,83 @@
 #
 # Tenancy-agnostic — no customer literals, no project/repo knowledge.
 
+# pin_split <pins|rest> <job_labels_csv> <pool_labels_csv>
+#
+# Rule 2 of pinned_job_decision, lifted out so there is exactly ONE piece of
+# code in this fleet that decides which of a job's labels is an affinity pin.
+# The controller needs that answer separately — to look up how long the pinned
+# host has been missing before it asks for a verdict — and the alternative was a
+# second copy of the rule in the caller, which is precisely the drift the demand
+# sweep's comment warns about.
+#
+# Echoes the comma-joined subset asked for: `pins` (the `host-*` labels this
+# pool does NOT itself register) or `rest` (everything else, including a
+# `host-`-prefixed label the pool DOES register, which is an ordinary label and
+# not a pin — see the caller's note on `host-large`).
+#
+# Folds both sides itself so it is safe to call before or after
+# pinned_job_decision has folded them; folding is idempotent.
+pin_split() {
+  local want="${1:-}"
+  local job_labels pool_labels
+  job_labels=$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')
+  pool_labels=$(printf '%s' "${3:-}" | tr '[:upper:]' '[:lower:]')
+
+  local pins="" rest="" l
+  for l in ${job_labels//,/ }; do
+    case ",$pool_labels," in
+      *",$l,"*) rest="${rest:+$rest,}$l"; continue ;;
+    esac
+    case "$l" in
+      host-*) pins="${pins:+$pins,}$l" ;;
+      *)      rest="${rest:+$rest,}$l" ;;
+    esac
+  done
+
+  case "$want" in
+    pins) printf '%s' "$pins" ;;
+    *)    printf '%s' "$rest" ;;
+  esac
+}
+
+# pin_host_of <job_labels_csv> <pool_labels_csv>
+#
+# The instance name a job is pinned to, for a caller that needs it BEFORE it has
+# a verdict. Empty when the job carries no pin, and empty when it carries more
+# than one — two pins are unsatisfiable by construction (rule 6) and there is no
+# single host to ask about. Says nothing about whether the job is this pool's;
+# that is rule 3's and rule 5's, and both still run.
+#
+# And empty for a name that is not a GCE instance name. This is the one helper
+# whose output a caller turns into a FILESYSTEM PATH before any verdict exists,
+# and its input is `runs-on` — text authored in the pull request. Rule 1b
+# already refuses `case`-pattern syntax, but it lives inside the decision
+# function, which by definition has not run yet when a caller asks this
+# question, and it has no reason to care about `/` or `..` because it never
+# builds a path. So the charset is enforced HERE, at the boundary that hands the
+# name out, rather than trusted at each place that consumes it: a label of
+# `host-../../something` yields no pin at all, which every caller already
+# handles as "no absence clock" and reads as unknown.
+#
+# The rule is GCE's, not ours — an instance name is lowercase alphanumerics and
+# hyphens — so a legitimate pin cannot fail it, and a name that fails it could
+# not have named a live host in any event.
+pin_host_of() {
+  local pins
+  pins=$(pin_split pins "${1:-}" "${2:-}")
+  case "$pins" in
+    "" | *,*) return 0 ;;
+  esac
+  local host="${pins#host-}"
+  case "$host" in
+    "" | *[!a-z0-9-]*) return 0 ;;
+  esac
+  printf '%s' "$host"
+}
+
 # pinned_job_decision <job_status> <job_labels_csv> <pool_labels_csv> \
-#                     <base_instance_name> <live_hosts_csv> <age> <grace>
+#                     <base_instance_name> <live_hosts_csv> <age> <grace> \
+#                     [missing_for]
 #
 #   job_status      : "queued" | "in_progress" per the GitHub API.
 #   job_labels_csv  : the job's `runs-on`, comma-separated.
@@ -54,12 +136,18 @@
 #   age             : seconds this job has been queued.
 #   grace           : seconds a pinned job may wait for a host the MIG has not
 #                     reported yet before it is called orphaned.
+#   missing_for     : seconds the pinned host has been CONTINUOUSLY absent from
+#                     the MIG's list, or empty when the caller cannot say. This
+#                     is a second, independent clock and both must run out
+#                     before anything is cancelled; see rule 9.
 #
 # Echoes one of:
 #   ignore:<reason>  not this pool's job; do not count it, do not act on it
 #   demand:<reason>  unpinned and ours — count it, and let it ask for a host
 #   pinned:<reason>  ours and pinned to a live host — count it as work in
 #                    flight, but NOT as a reason to scale out
+#   vanished:<reason> ours, RUNNING, and the host underneath it is gone — the
+#                    job will never report a conclusion on its own; fail the run
 #   wait:<reason>    ours, pinned, host not in the MIG's list yet — inside the
 #                    grace window, so say nothing and look again next tick
 #   orphan:<reason>  ours, pinned, and unservable — fail the run
@@ -73,6 +161,7 @@ pinned_job_decision() {
   local live="${5:-}"
   local age="${6:-0}"
   local grace="${7:-300}"
+  local missing="${8:-}"
 
   # 0. BOTH SIDES ARE FOLDED BEFORE ANYTHING IS COMPARED. GitHub dispatches a
   #    job case-insensitively — `linux`, `Linux` and `LINUX` are one label to
@@ -136,16 +225,9 @@ pinned_job_decision() {
   #    `variables.tf` now also refuses a `host-`-prefixed `runner_labels` entry
   #    outright, so a NEW pool cannot create this collision at all. This arm is
   #    what keeps an EXISTING one from being cancelled on the way to fixing it.
-  local pins="" rest="" l
-  for l in ${job_labels//,/ }; do
-    case ",$pool_labels," in
-      *",$l,"*) rest="${rest:+$rest,}$l"; continue ;;
-    esac
-    case "$l" in
-      host-*) pins="${pins:+$pins,}$l" ;;
-      *)      rest="${rest:+$rest,}$l" ;;
-    esac
-  done
+  local pins rest
+  pins=$(pin_split pins "$job_labels" "$pool_labels")
+  rest=$(pin_split rest "$job_labels" "$pool_labels")
 
   # 3. The superset rule, minus the affinity label. GitHub sends a job to any
   #    runner whose labels are a SUPERSET of `runs-on`, and this pool's agents
@@ -192,43 +274,116 @@ pinned_job_decision() {
     *,*) echo "orphan:pinned to more than one host ($pins)"; return 0 ;;
   esac
 
-  # 7. In flight. Whatever the MIG currently reports, a running job HAS a host —
-  #    a list that lags a boot or misses a tick is not evidence to cancel on.
-  if [ "$status" != "queued" ]; then
-    echo "pinned:in flight on $pin_host"
-    return 0
-  fi
-
-  # 8. Pinned to a host that is up. Real work, and it counts as busy — but it is
-  #    not scale-out demand, because a new host cannot serve it.
+  # 7. Pinned to a host that is up. Real work — queued behind that host's other
+  #    jobs, or running on it — and it counts as busy, but it is not scale-out
+  #    demand, because a new host cannot serve it.
+  #
+  #    THE LIVENESS TEST IS ASKED OF A RUNNING JOB TOO, and it did not use to
+  #    be: this function used to answer "in flight" for anything non-queued and
+  #    return, on the reasoning that a running job HAS a host and a lagging MIG
+  #    list is not evidence to cancel on. The first half of that is only true
+  #    while the host exists. When a slot dies holding a job — a host deleted
+  #    under it, an agent that stopped answering, a slot poisoned mid-run — the
+  #    job stays `in_progress` at GitHub with no runner behind it and reports
+  #    NOTHING: not success, not failure, not cancelled. Measured on a consumer
+  #    repository 2026-08-23, that is a check run stuck for GitHub's own 24-hour
+  #    timeout, and everything downstream waits it out. A merge queue is the
+  #    expensive case, because it does not read a missing status as a problem —
+  #    it reads it as "still checking" and holds the entry until its own
+  #    timeout, 150 minutes on that repository, before dequeuing on a timeout
+  #    that names nothing.
+  #
+  #    So the fix for "the queue never got a status" is to make the JOB report.
+  #    A run that is cancelled has a conclusion; a run whose host evaporated has
+  #    none and never will. The second half of the old reasoning is still
+  #    honoured, and honoured harder — see rule 9's two clocks.
   case ",$live," in
-    *",$pin_host,"*) echo "pinned:$pin_host is live"; return 0 ;;
+    *",$pin_host,"*)
+      if [ "$status" = "queued" ]; then
+        echo "pinned:$pin_host is live"
+      else
+        echo "pinned:in flight on $pin_host"
+      fi
+      return 0
+      ;;
   esac
 
-  # 9. Not in the list, but not for long.
+  # 8. Not in the list, but possibly not for long.
   #
-  #    Non-numeric age or grace is treated as "wait", not as an arithmetic error
-  #    — a malformed timestamp from the API is not grounds to cancel a run, and
-  #    the alternative is a `[: integer expression expected` that takes the
-  #    controller's tick down with it.
+  #    Non-numeric age, grace or missing_for is treated as "wait", not as an
+  #    arithmetic error — a malformed timestamp from the API is not grounds to
+  #    cancel a run, and the alternative is a `[: integer expression expected`
+  #    that takes the controller's tick down with it. An EMPTY missing_for is
+  #    different from a malformed one: it means the caller keeps no absence
+  #    ledger, which is allowed, and rule 9 falls back to one clock.
   case "$age$grace" in
     *[!0-9]*) echo "wait:$pin_host not listed yet (unreadable age/grace)"; return 0 ;;
   esac
+  if [ -n "$missing" ]; then
+    case "$missing" in
+      *[!0-9]*) echo "wait:$pin_host not listed yet (unreadable absence)"; return 0 ;;
+    esac
+  fi
 
-  #    A host mid-boot, a MIG listing that
-  #    blipped, a controller on its first tick with an empty host list: all
-  #    three look exactly like a dead host for a moment. The grace window is
-  #    what stops a transient from cancelling a healthy run.
-  #    `-le`, not `-lt`: a tick that lands exactly on the deadline resolves in
-  #    favour of the run. One more tick of waiting costs a tick; one wrongly
-  #    cancelled run costs somebody a re-run and the fleet its credibility.
-  if [ "$age" -le "$grace" ]; then
-    echo "wait:$pin_host not listed yet (${age}s of ${grace}s)"
+  # 8b. A RUNNING JOB IS ONLY EVER CANCELLED ON THE ABSENCE CLOCK. Without a
+  #     ledger there is exactly one clock, `age`, and for a running job it is
+  #     the wrong one twice over: it is measured from creation rather than from
+  #     anything about the host, and every long job trips it. Cancelling a
+  #     queued job on that evidence costs a wait; cancelling a running one
+  #     throws away work that is happening. So a caller that keeps no ledger
+  #     gets the OLD behaviour for in-flight jobs — count it, say nothing — and
+  #     the new verdict is available only to a caller that can answer "how long
+  #     has that host been gone".
+  if [ "$status" != "queued" ] && [ -z "$missing" ]; then
+    echo "pinned:in flight on $pin_host (not listed, and no absence clock)"
     return 0
   fi
 
-  # 10. Long enough. The host is not coming back under this name — a MIG
-  #     replacement returns with a new one — so nothing will ever serve this
-  #     job. Fail it now; a re-run anchors somewhere alive.
-  echo "orphan:$pin_host is gone (${age}s)"
+  # 9. TWO CLOCKS, AND BOTH MUST RUN OUT. A host mid-boot, a MIG listing that
+  #    blipped, a controller on its first tick with an empty host list: all
+  #    three look exactly like a dead host for a moment, and the grace window is
+  #    what stops a transient from cancelling a healthy run.
+  #
+  #    `age` alone is not that window. It is measured from the job's creation,
+  #    so a job that sat in a queue for twenty minutes and then lost its host
+  #    has already spent the whole allowance before the host went anywhere: one
+  #    blipped listing cancels it on the first tick, with no tolerance at all.
+  #    That was survivable while only QUEUED jobs could be cancelled here —
+  #    the cost is a re-run of something that had not started. It is not
+  #    survivable now that a running job can be, so the caller may supply a
+  #    second clock measuring the thing actually being claimed: how long the
+  #    host has been continuously absent.
+  #
+  #    The effective clock is the SMALLER of the two, which is exactly "both
+  #    have run out". A caller with no ledger passes nothing and gets today's
+  #    behaviour unchanged — and, per rule 8b, gets no `vanished` verdict at
+  #    all, because for a running job the ledger IS the evidence.
+  #
+  #    `-le`, not `-lt`: a tick that lands exactly on the deadline resolves in
+  #    favour of the run. One more tick of waiting costs a tick; one wrongly
+  #    cancelled run costs somebody a re-run and the fleet its credibility.
+  local clock="$age"
+  if [ -n "$missing" ] && [ "$missing" -lt "$clock" ]; then
+    clock="$missing"
+  fi
+  if [ "$clock" -le "$grace" ]; then
+    echo "wait:$pin_host not listed yet (${clock}s of ${grace}s)"
+    return 0
+  fi
+
+  # 10. Long enough, on both clocks. The host is not coming back under this name
+  #     — a MIG replacement returns with a new one — so nothing will ever serve
+  #     this job, and nothing will ever conclude it either. Fail it now; a
+  #     re-run anchors somewhere alive.
+  #
+  #     The two verdicts differ only in what they tell the operator, and the
+  #     distinction is worth keeping: a QUEUED job that is cancelled cost the
+  #     fleet nothing but a wait, while a RUNNING one that is cancelled had a
+  #     host taken out from under live work. The second is a fleet fault every
+  #     time. The first can be a job that simply outlived a legitimate scale-in.
+  if [ "$status" = "queued" ]; then
+    echo "orphan:$pin_host is gone (${clock}s)"
+  else
+    echo "vanished:$pin_host went away under a running job (${clock}s)"
+  fi
 }

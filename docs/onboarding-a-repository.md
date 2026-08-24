@@ -79,7 +79,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.41.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.43.0"
 
   project_id         = var.project_id
   network            = var.network
@@ -88,7 +88,7 @@ module "ci_runner_network" {
 }
 
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.41.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.43.0"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -97,7 +97,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.41.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.43.0"
 
   project_id = var.project_id
   region     = var.region
@@ -176,7 +176,7 @@ nightly, from your default branch.
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.41.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.43.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -421,7 +421,7 @@ later apply:
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.41.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.43.0"
 
   project_id     = var.project_id
   region         = var.region
@@ -542,7 +542,7 @@ module "ci_runner_pool" {           # the Linux CI pool from step 1, unchanged
 }
 
 module "ci_runner_pool_mq" {        # the Linux merge-queue pool
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.41.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.43.0"
   # …every argument of the CI pool, with three differences:
   name              = "${var.pool_name}-mq"
   manage_controller = false
@@ -557,7 +557,7 @@ module "ci_runner_pool_mq" {        # the Linux merge-queue pool
 }
 
 module "ci_runner_controller" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.41.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.43.0"
 
   name  = "${var.pool_name}-controller"
   pools = [
@@ -612,6 +612,39 @@ owner adds the permission, and then **every installation owner has to accept
 it**. Both steps, who can perform each, and how to verify from the controller
 rather than from a settings page:
 [`github-app-permissions.md`](github-app-permissions.md).
+
+## 9. Wire the Mergify nudge
+
+Everything above makes CI fast. This is about the gap **after** CI, which no
+amount of pool tuning touches: Mergify is event-driven, and when GitHub's
+`check_run.completed` webhook is missed or late, a fully green pull request sits
+on *"your merge queue conditions are under evaluation"* with an empty queue ahead
+of it. Measured in `ci-runner-infra` on 2026-08-23: **8m55s, 11m06s, 17m24s and
+20m01s**, against 13–14 seconds when Mergify reacts to an event it generated
+itself. It is invisible from every pool metric, because no runner is involved.
+
+Two files, both required, neither optional:
+
+- a `workflow_run` workflow in the consuming repository that calls
+  `ci-runner-infra`'s published `mergify-nudge.yml`, and
+- a `commands_restrictions.refresh` block in `.mergify.yml` that admits
+  `github-actions[bot]` as a sender — without it Mergify discards every nudge in
+  silence.
+
+**This applies whatever runs your CI, and it is not optional for any repository
+in the fleet.** The nudge keys off a *completed workflow run*, so it fits any
+repository whose required checks are GitHub Actions jobs — on the fleet pools, on
+GitHub-hosted minutes, or a mix; one workflow or several. A repository that has
+not adopted the pools yet still gets the whole benefit, and needs no pool
+capacity for it: the nudge job runs on `ubuntu-latest` by design, so it never
+takes a warm slot from a real job. The
+copy-in snippets, the defaults, why it posts nothing on a healthy run, and how to
+tell it is being silently filtered:
+[`ci-merge-queue-baseline.md`](ci-merge-queue-baseline.md#the-other-invisible-wait-ci-is-green-and-mergify-has-not-heard-about-it).
+
+One property to accept before you wire it: **`workflow_run` is dispatched from
+the default branch only**, so the pull request that adds the nudge cannot run it.
+The first evidence is the first CI completion after the merge — watch that one.
 
 ## Windows
 
@@ -753,7 +786,7 @@ instantiations with their own names, MIGs, controllers and labels.
 
 ```hcl
 module "ci_runner_identity_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.41.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.43.0"
 
   project_id        = var.project_id
   name              = var.win_pool_name
@@ -766,7 +799,7 @@ module "ci_runner_identity_win" {
 }
 
 module "ci_runner_pool_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.41.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.43.0"
 
   # ... project_id, region, github_*, network, subnetwork and the three
   # identities exactly as the Linux pool above, from the _win modules ...

@@ -714,6 +714,310 @@ rm -f -- "\$marker"
 
 rc=0
 
+# --- QUIESCE, AND IT COMES BEFORE ANYTHING IS REMOVED -------------------------
+#
+# The order used to be the other way round: empty the home, restore the
+# template, rebuild _work, THEN tear the containers down, then write the marker.
+# Every one of those steps was right and the composition was not (#237). A
+# detached container bind-mounting the home outlives the job by design -- that
+# is the whole finding #258 acted on -- so between the template restore and its
+# removal it had a window in which to write \`.bashrc\`, \`.gitconfig\` or a
+# credential back into a home that had just been made clean, and the marker went
+# on afterwards over exactly that.
+#
+# Removing files cannot certify isolation while a writer survives. So the
+# writers go FIRST -- the containers here, the processes that are not in one
+# right after -- the removal is what comes last, and the marker is written over
+# a slot nothing has been able to touch since.
+slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, or empty>
+  local d owner pid line rest state ppid p hops spared
+  # ONE stat for the whole of /proc rather than one per pid, and the difference
+  # is not cosmetic: this runs between every pair of jobs on a host with several
+  # hundred processes, and a fork each was a fifth of a second of the job
+  # boundary spent asking who owns pid 4 -- again on every tick of the wait
+  # below. The directory's owner IS the process's uid, so no other file has to
+  # be opened to decide that a pid is somebody else's.
+  while read -r d owner; do
+    [ "\$owner" = "\$1" ] || continue
+    pid=\${d#/proc/}
+    case "\$2" in *" \$pid "*) continue ;; esac
+    # A ZOMBIE IS NOT A WRITER. It holds no memory, no file and no port; it is
+    # an exit status its parent has not collected yet, and it cannot be killed
+    # because it is already dead. Runner.Worker leaves them for moments at a
+    # time at the end of a job -- which is precisely when this runs -- and
+    # counting one as a survivor would refuse the marker on a slot that is
+    # clean, fail the next job on it, and do so intermittently.
+    #
+    # The comm field is the reason for the \`*) \` split rather than a field
+    # number: it is the executable name, in parentheses, and a job is free to
+    # run a program whose name contains a space or a bracket. The split is
+    # GREEDY for that same reason -- a program named \`x) Z\` puts a second
+    # \`) \` inside the field, and a shortest match would hand the state test a
+    # string the job chose. Everything after the real comm is numeric, so the
+    # LAST \`) \` on the line is always the one that closes it.
+    read -r line <"\$d/stat" 2>/dev/null || continue
+    rest=\${line##*') '}
+    read -r state _ <<< "\$rest"
+    [ "\$state" = Z ] && continue
+    # EVERYTHING THE SLOT'S OWN SERVICE MANAGER SUPERVISES IS SPARED, matched on
+    # the cgroup rather than on a list of program names: \`user@<uid>.service\` is
+    # rootless dockerd, its containerd, and the container processes underneath
+    # them. The daemon has to survive -- the image-tag audit further down still
+    # talks to it and the next job needs its socket -- and the containers under
+    # it are already gone by the time this runs, removed through docker, which
+    # is where that job belongs and where \`-v\` takes their volumes with them.
+    grep -q "user@\$1\.service" "\$d/cgroup" 2>/dev/null && continue
+    # AND THE AGENT'S OWN TREE, when the agent is not already on the chain above.
+    # See quiesce_slot for which caller is which; here it is one parent walk per
+    # candidate, stopped at pid 1 and bounded so that a /proc read racing with an
+    # exiting process cannot spin.
+    #
+    # NOT the agent's cgroup, and that distinction is the whole of it: a process
+    # a job backgrounded stays in the agent unit's cgroup after the worker exits
+    # and it is reparented -- cgroup membership does not follow reparenting -- so
+    # a cgroup test spares precisely the leftovers this exists to remove. Descent
+    # from the agent's main pid does not: a straggler's chain reaches pid 1.
+    if [ -n "\$3" ]; then
+      p=\$pid; hops=0; spared=0
+      while [ -n "\$p" ] && [ "\$p" != 0 ] && [ "\$p" != 1 ] && [ "\$hops" -lt 64 ]; do
+        if [ "\$p" = "\$3" ]; then spared=1; break; fi
+        line=\$(cat "/proc/\$p/stat" 2>/dev/null) || break
+        rest=\${line##*') '}
+        read -r state ppid _ <<< "\$rest"
+        p=\$ppid
+        hops=\$((hops + 1))
+      done
+      [ "\$spared" = 1 ] && continue
+    fi
+    if [ -n "\$4" ]; then
+      grep -qF -- "\$4" "\$d/cgroup" 2>/dev/null && continue
+    fi
+    printf '%s\n' "\$pid"
+  done <<< "\$(stat -c '%n %u' /proc/[0-9]* 2>/dev/null)"
+}
+
+# WHAT A JOB LEFT RUNNING OUTSIDE A CONTAINER.
+#
+# \`docker rm --force\` covers what a job left inside one. It does not cover
+# \`nohup ./server &\`, a language server some tool started, or a \`setsid\` wrapper
+# deliberately detached from the worker. Those are reparented to pid 1 when the
+# job's worker exits and go on running as the slot user, with a writable home,
+# for as long as the host does.
+#
+# OUR OWN ANCESTRY IS SPARED, and that is the second exclusion. This hook is a
+# child of Runner.Worker, which is a child of Runner.Listener, which is the
+# slot's agent service: killing the chain we are standing on would abort the job
+# whose completed hook is running and take the agent down with it. The chain is
+# walked once from \$\$ -- it cannot change while we are inside it.
+#
+# THE CALLER DECIDES WHETHER THE AGENT NEEDS A THIRD EXCLUSION, and getting this
+# wrong is how a cleanup becomes an outage. Two callers reach this code:
+#
+#   the job-completed hook   runs INSIDE the agent, so the agent is already on
+#                            the chain above. Everything else of this slot's is
+#                            the job's, including a step's backgrounded child --
+#                            which is still a child of the worker at this
+#                            instant and is exactly what has to go.
+#   a root caller            systemd's ExecStartPre at boot, the idle sweep, the
+#                            pin sweeper's teardown. The agent is NOT on the
+#                            chain, no job of this slot is running, and sweeping
+#                            without sparing its tree would kill the listener of
+#                            every idle slot the sweep touched.
+#
+# So the agent's main pid is looked up and spared WITH ITS DESCENDANTS when it
+# is not already on our chain. An indeterminate answer -- systemctl itself
+# failing -- refuses rather than guesses: a stopped unit answers 0, which is an
+# answer, and anything else means we cannot tell an agent from a straggler.
+#
+# TERM, then KILL. A survivor gets five seconds to exit on its own before the
+# signal it cannot handle, and the scan is repeated on every tick so a process
+# that forks a replacement is caught by the next pass instead of outliving the
+# sweep.
+#
+# FAILS CLOSED. Something still alive after SIGKILL is unkillable -- stuck in
+# uninterruptible I/O -- the slot is not in the state the template describes,
+# and the marker is exactly the claim it must not get.
+quiesce_slot() {
+  local uid keep p line rest state ppid agent unit targets tick left
+  uid=\$(id -u "\$u" 2>/dev/null) ||
+    { say "slot \$idx: could not resolve the uid of \$u -- refusing to call this slot clean"; return 1; }
+
+  keep=" "
+  p=\$\$
+  while [ -n "\$p" ] && [ "\$p" != 0 ] && [ "\$p" != 1 ]; do
+    keep="\$keep\$p "
+    line=\$(cat "/proc/\$p/stat" 2>/dev/null) || break
+    rest=\${line##*') '}
+    read -r state ppid _ <<< "\$rest"
+    p=\$ppid
+  done
+
+  # WHICH CALLER THIS IS, read from the same variable the top of the script
+  # reads to decide whose slot this is. sudo sets it and env_reset drops the
+  # caller's own copy, so a set SUDO_UID means the agent is above us on the
+  # chain that was just walked and needs nothing further. Empty means a root
+  # caller -- boot, the idle sweep, the pin sweeper's teardown -- and there the
+  # agent has to be found and spared with its descendants.
+  agent=""
+  unit=""
+  if [ -z "\${SUDO_UID:-}" ]; then
+    if agent=\$(systemctl show -p MainPID --value "ci-runner@\$idx.service" 2>/dev/null); then
+      case "\$agent" in '' | 0 | *[!0-9]*) agent="" ;; esac
+    else
+      # No answer is not permission to sweep. Falling back to the unit's cgroup
+      # spares more than it should -- a straggler stays in that cgroup after it
+      # is reparented -- and that is the right way to be wrong here: the cost is
+      # a process this reset did not remove, against an idle sweep that killed
+      # the listener of every slot it touched.
+      agent=""
+      unit="ci-runner@\$idx.service"
+      say "slot \$idx: systemd would not name the agent's pid -- sparing everything in its unit rather than guessing"
+    fi
+  fi
+
+  targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit")
+  [ -n "\$targets" ] || return 0
+  say "slot \$idx: \$(printf '%s\n' "\$targets" | grep -c .) process(es) outlived the last job -- terminating them"
+
+  tick=0
+  while [ "\$tick" -lt 10 ]; do
+    # word-splitting is the point -- one pid per argument.
+    # shellcheck disable=SC2086
+    kill -TERM \$targets 2>/dev/null
+    sleep 0.5
+    targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit")
+    [ -n "\$targets" ] || return 0
+    tick=\$((tick + 1))
+  done
+
+  tick=0
+  while [ "\$tick" -lt 10 ]; do
+    # shellcheck disable=SC2086
+    kill -KILL \$targets 2>/dev/null
+    sleep 0.5
+    targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit")
+    [ -n "\$targets" ] || return 0
+    tick=\$((tick + 1))
+  done
+
+  left=\$(printf '%s\n' "\$targets" | grep -c .)
+  say "slot \$idx: \$left process(es) of the last job would not die -- refusing to call this slot clean"
+  return 1
+}
+
+sock="/run/\$u/docker.sock"
+baked="\$SLOT_STATE/\$idx/baked-images"
+
+# A HELD slot is spared, and that is rule 2 of the shared-infra contract meeting
+# rule 1. Under one host per pull request the run's later jobs land on THIS
+# slot and reuse what the anchor built — and a stack built by \`docker compose
+# build\` carries no RepoDigest and was not baked at boot, which is exactly the
+# shape below removes. Pruning between two jobs of one run would delete the
+# run's own images out from under it.
+#
+# Deferred, never waived: the sweeper's teardown at expiry runs this same reset
+# with the hold already past its expiry, so the tags go then. Nothing a run
+# built outlives the run.
+prune=1
+# The BOOT ID is part of the question, and leaving it out made the warm-reboot
+# case silently wrong. The runner unit is already enabled, so on a reboot it
+# runs this reset before the sweeper has had a chance to declare the old record
+# orphaned. Judged on slot and wall clock alone, an unexpired record from the
+# PREVIOUS boot spared the tags -- for containers that did not survive the
+# guest. The next job then resolved locally tagged images the last run built,
+# which is exactly the cross-job leak this reset exists to close.
+if [ -f "\$PIN_DIR/host" ]; then
+  h_slot=""; h_expiry=""; h_boot=""
+  while IFS='=' read -r hk hv; do
+    case "\$hk" in slot) h_slot="\$hv" ;; expiry) h_expiry="\$hv" ;; boot) h_boot="\$hv" ;; esac
+  done <"\$PIN_DIR/host"
+  case "\$h_slot:\$h_expiry" in
+    [0-9]*:[0-9]*)
+      if [ "\$h_slot" = "\$idx" ] && [ "\$h_expiry" -gt "\$(date +%s)" ] &&
+        [ "\$h_boot" = "\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]; then
+        prune=0
+        say "slot \$idx is held by a live run -- keeping its containers, its processes and its local image tags until the hold expires"
+      fi
+      ;;
+  esac
+fi
+if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
+  if [ -S "\$sock" ]; then
+    # THE CONTAINERS, and they go BEFORE the tags -- a running container holds a
+    # reference to its image and the untag below would fail on it.
+    #
+    # A stack brought up the documented way, \`docker compose up -d\` in the
+    # anchor job, does not stop when the job that started it ends: nothing in
+    # the runner's lifecycle reaches into a detached rootless container. Before
+    # #258 that was untidy. With a PERSISTENT port band it is a correctness bug
+    # with two faces, and both are silent:
+    #
+    #   the ports stay bound   the next run assigned this slot brings up its own
+    #                          stack on the same band ports and gets
+    #                          address-in-use, in a job that changed nothing.
+    #   the stack stays up     or -- worse -- the next run's jobs CONNECT, to a
+    #                          database belonging to a pull request that ended,
+    #                          and read or corrupt its data. A passwordless
+    #                          Postgres is the example this contract documents.
+    #
+    # So the reclamation is host-side and boundary-driven, not a TTL: it happens
+    # at 'completed' and at 'boot', which is every point at which no job of this
+    # slot is running. A HELD slot is spared by the same \`prune\` gate that
+    # spares its image tags -- the run's later jobs land here and reuse the
+    # stack, which is rule 2 of the contract -- and the sweeper's teardown runs
+    # this same reset once the hold has expired, so nothing a run brought up
+    # outlives the run.
+    #
+    # \`docker rm -f -v\`, not \`compose down\`: root has no compose project name
+    # here, and a job is free to have started containers without compose at all.
+    # \`-v\` takes the anonymous volumes with them, which is where a database that
+    # was never meant to persist put its data.
+    cids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+             docker ps --all --quiet --no-trunc 2>/dev/null | sort -u)
+    if [ -n "\$cids" ]; then
+      # word-splitting is the point -- one id per argument.
+      # shellcheck disable=SC2086
+      if timeout 180 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+           docker rm --force --volumes -- \$cids >/dev/null 2>&1; then
+        say "slot \$idx: removed \$(printf '%s\n' "\$cids" | grep -c .) container(s) left behind by the last job"
+      else
+        # Fail closed. A container this reset could not remove is still holding
+        # its band ports, and the marker is exactly the claim it must not get:
+        # the next job on this slot is failed rather than run into a port
+        # collision, or into somebody else's database.
+        say "slot \$idx: could not remove the containers left behind by the last job"
+        rc=1
+      fi
+    fi
+    # The networks and named volumes compose created alongside them. Unreferenced
+    # by now, because the containers are gone; a named volume that survived would
+    # carry the previous pull request's database into the next run's stack under
+    # the same compose project name.
+    timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+      docker network prune --force >/dev/null 2>&1 ||
+      { say "slot \$idx: could not prune the last job's networks"; rc=1; }
+    # \`--all\` covers NAMED volumes and not merely anonymous ones, which is the
+    # half that matters: \`docker compose\` names its volumes after the project,
+    # so the next run under the same project name would inherit the last pull
+    # request's database. The flag arrived in Docker 23 and this fleet's hosts
+    # are newer -- but a host that is not would fail the flag, fail this reset,
+    # and refuse the marker for every job it ever runs. So the older spelling
+    # is tried before that is called a failure.
+    timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+      docker volume prune --force --all >/dev/null 2>&1 ||
+      timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+        docker volume prune --force >/dev/null 2>&1 ||
+      { say "slot \$idx: could not prune the last job's volumes"; rc=1; }
+  else
+    say "slot \$idx: no docker socket at \$sock -- no container was reclaimed and no image tag was checked"
+  fi
+
+  # AND THE PROCESSES THAT WERE NEVER IN A CONTAINER, which is why this sits
+  # outside the socket test rather than inside it: a slot whose daemon is gone
+  # can still have been handed a job that backgrounded something.
+  quiesce_slot || rc=1
+fi
+
 # THE HOME, wholesale. -mindepth 1 so the home itself keeps its inode, its
 # ownership and its mode: the shell dotfiles, the caches a tool decided to put
 # there and anything a job planted are all just entries inside it.
@@ -884,108 +1188,8 @@ fi
 # turn a slot with no dockerd into a slot that also fails every job for a reason
 # it does not name. A tag that will not go IS a failure: that slot is poisoned,
 # and the marker is exactly the claim it must not get.
-# A HELD slot is spared, and that is rule 2 of the shared-infra contract meeting
-# rule 1. Under one host per pull request the run's later jobs land on THIS
-# slot and reuse what the anchor built — and a stack built by \`docker compose
-# build\` carries no RepoDigest and was not baked at boot, which is exactly the
-# shape below removes. Pruning between two jobs of one run would delete the
-# run's own images out from under it.
-#
-# Deferred, never waived: the sweeper's teardown at expiry runs this same reset
-# with the hold already past its expiry, so the tags go then. Nothing a run
-# built outlives the run.
-prune=1
-# The BOOT ID is part of the question, and leaving it out made the warm-reboot
-# case silently wrong. The runner unit is already enabled, so on a reboot it
-# runs this reset before the sweeper has had a chance to declare the old record
-# orphaned. Judged on slot and wall clock alone, an unexpired record from the
-# PREVIOUS boot spared the tags -- for containers that did not survive the
-# guest. The next job then resolved locally tagged images the last run built,
-# which is exactly the cross-job leak this reset exists to close.
-if [ -f "\$PIN_DIR/host" ]; then
-  h_slot=""; h_expiry=""; h_boot=""
-  while IFS='=' read -r hk hv; do
-    case "\$hk" in slot) h_slot="\$hv" ;; expiry) h_expiry="\$hv" ;; boot) h_boot="\$hv" ;; esac
-  done <"\$PIN_DIR/host"
-  case "\$h_slot:\$h_expiry" in
-    [0-9]*:[0-9]*)
-      if [ "\$h_slot" = "\$idx" ] && [ "\$h_expiry" -gt "\$(date +%s)" ] &&
-        [ "\$h_boot" = "\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]; then
-        prune=0
-        say "slot \$idx is held by a live run -- keeping its local image tags until the hold expires"
-      fi
-      ;;
-  esac
-fi
 if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
-  sock="/run/\$u/docker.sock"
-  baked="\$SLOT_STATE/\$idx/baked-images"
   if [ -S "\$sock" ]; then
-    # THE CONTAINERS, and they go BEFORE the tags -- a running container holds a
-    # reference to its image and the untag below would fail on it.
-    #
-    # A stack brought up the documented way, \`docker compose up -d\` in the
-    # anchor job, does not stop when the job that started it ends: nothing in
-    # the runner's lifecycle reaches into a detached rootless container. Before
-    # #258 that was untidy. With a PERSISTENT port band it is a correctness bug
-    # with two faces, and both are silent:
-    #
-    #   the ports stay bound   the next run assigned this slot brings up its own
-    #                          stack on the same band ports and gets
-    #                          address-in-use, in a job that changed nothing.
-    #   the stack stays up     or -- worse -- the next run's jobs CONNECT, to a
-    #                          database belonging to a pull request that ended,
-    #                          and read or corrupt its data. A passwordless
-    #                          Postgres is the example this contract documents.
-    #
-    # So the reclamation is host-side and boundary-driven, not a TTL: it happens
-    # at 'completed' and at 'boot', which is every point at which no job of this
-    # slot is running. A HELD slot is spared by the same \`prune\` gate that
-    # spares its image tags -- the run's later jobs land here and reuse the
-    # stack, which is rule 2 of the contract -- and the sweeper's teardown runs
-    # this same reset once the hold has expired, so nothing a run brought up
-    # outlives the run.
-    #
-    # \`docker rm -f -v\`, not \`compose down\`: root has no compose project name
-    # here, and a job is free to have started containers without compose at all.
-    # \`-v\` takes the anonymous volumes with them, which is where a database that
-    # was never meant to persist put its data.
-    cids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-             docker ps --all --quiet --no-trunc 2>/dev/null | sort -u)
-    if [ -n "\$cids" ]; then
-      # word-splitting is the point -- one id per argument.
-      # shellcheck disable=SC2086
-      if timeout 180 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-           docker rm --force --volumes -- \$cids >/dev/null 2>&1; then
-        say "slot \$idx: removed \$(printf '%s\n' "\$cids" | grep -c .) container(s) left behind by the last job"
-      else
-        # Fail closed. A container this reset could not remove is still holding
-        # its band ports, and the marker is exactly the claim it must not get:
-        # the next job on this slot is failed rather than run into a port
-        # collision, or into somebody else's database.
-        say "slot \$idx: could not remove the containers left behind by the last job"
-        rc=1
-      fi
-    fi
-    # The networks and named volumes compose created alongside them. Unreferenced
-    # by now, because the containers are gone; a named volume that survived would
-    # carry the previous pull request's database into the next run's stack under
-    # the same compose project name.
-    timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-      docker network prune --force >/dev/null 2>&1 ||
-      { say "slot \$idx: could not prune the last job's networks"; rc=1; }
-    # \`--all\` covers NAMED volumes and not merely anonymous ones, which is the
-    # half that matters: \`docker compose\` names its volumes after the project,
-    # so the next run under the same project name would inherit the last pull
-    # request's database. The flag arrived in Docker 23 and this fleet's hosts
-    # are newer -- but a host that is not would fail the flag, fail this reset,
-    # and refuse the marker for every job it ever runs. So the older spelling
-    # is tried before that is called a failure.
-    timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-      docker volume prune --force --all >/dev/null 2>&1 ||
-      timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-        docker volume prune --force >/dev/null 2>&1 ||
-      { say "slot \$idx: could not prune the last job's volumes"; rc=1; }
 
     ids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
             docker image ls --all --quiet --no-trunc 2>/dev/null | sort -u)
@@ -1016,8 +1220,6 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
         done
       done <<< "\$info"
     fi
-  else
-    say "slot \$idx: no docker socket at \$sock -- no container was reclaimed and no image tag was checked"
   fi
 fi
 
@@ -1025,6 +1227,18 @@ fi
 # the assertion "this slot is in the state the template describes", and a reset
 # that half-failed has not earned it. Not written at 'started', because the slot
 # is about to be dirtied by the job that is starting.
+#
+# WHAT THE CLAIM COVERS, exactly. Until #237 it was read as "nothing of the last
+# job survives here", and file removal alone could not support that: a container
+# or a background process that outlived the job could put a dotfile or a
+# credential back after the removal and before this line. Both are now stopped
+# BEFORE anything is removed, so the marker means what it is read to mean -- with
+# one stated exception, which is the slot HELD by a live run. There the run's
+# own later jobs land back on this slot and are meant to find the stack the
+# anchor brought up, so containers, tags and processes are all spared and the
+# marker asserts only the template state of the home and the workspace. The
+# sweeper's teardown at expiry runs this same reset with the hold gone, and
+# nothing a run left behind outlives the run.
 if [ "\$rc" = 0 ] && [ "\$stage" != started ]; then
   : >"\$marker" || rc=1
 fi
