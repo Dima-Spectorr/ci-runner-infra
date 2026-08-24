@@ -138,6 +138,27 @@ retries_an_unanswered_nudge() {
   matches "$code" 'if mergify_seen_it; then' || return 1
 }
 
+# The loop breaks immediately after the last post, so without a trailing wait
+# the final comment is the only one never given a chance to be answered — and
+# the job does not merely miss a clean exit, it warns that Mergify ignored
+# everything. That happened on #372 with Mergify's reply in the same second.
+# An alarm that fires on the success path is worse than no alarm.
+confirms_the_last_nudge_before_warning() {
+  local code; code=$(code_of "$1")
+  # The tail after the loop: a wait, a re-read, and a clean exit — all three, or
+  # the warning below them is not evidence of anything.
+  # Reset on EVERY `done`, so only the run of lines after the LAST one counts.
+  # Anchoring on the first `done` instead lets the ladder's own in-loop wait and
+  # probe satisfy this, and the assertion passes with the tail deleted.
+  printf '%s\n' "$code" | awk '
+    /^[[:space:]]*done$/                  { waited = probed = hit = 0; next }
+    /sleep "\$CONFIRM"/                   { waited = 1 }
+    waited && /if mergify_seen_it; then/  { probed = 1 }
+    probed && /^[[:space:]]*exit 0$/      { hit = 1 }
+    END { exit !hit }
+  '
+}
+
 # `/check-runs` truncates silently. Read one page and a commit busy enough to
 # push Mergify's own check past the boundary looks permanently behind — which
 # used to cost one redundant comment and now costs the whole ladder.
@@ -287,6 +308,7 @@ check acts_on_failure_too               "$CALLEE" "a failed CI run is not nudged
 check ignores_a_non_verdict             "$CALLEE" "a cancelled or skipped run is nudged, so every force-push posts a comment"
 check waits_out_the_healthy_case        "$CALLEE" "the grace period is gone, so the healthy majority of runs post a comment"
 check retries_an_unanswered_nudge       "$CALLEE" "an unanswered refresh command is never re-sent, so a lost comment webhook still costs the ~10 minutes this workflow exists to remove"
+check confirms_the_last_nudge_before_warning "$CALLEE" "the final nudge is never given the confirmation window the others got, so a Mergify that answered it is still reported as having ignored everything"
 check reads_every_check_run_page        "$CALLEE" "the check-run probe reads one page, so a busy commit can hide Mergify's own check and draw the entire ladder"
 check posts_only_when_mergify_is_behind "$CALLEE" "the wait cannot end early, so the check on Mergify's state buys nothing"
 check identifies_mergify_by_app         "$CALLEE" "Mergify's checks are matched by name rather than by app, which goes stale silently"
@@ -381,6 +403,10 @@ mutate "the retry stops waiting for an answer before re-posting" "$CALLEE" \
   's|sleep "\$CONFIRM"|:|'                                            retries_an_unanswered_nudge
 mutate "the ladder posts on a timer instead of checking Mergify" "$CALLEE" \
   's|if mergify_seen_it; then|if false; then|g'                       retries_an_unanswered_nudge
+# Ten spaces, not twelve: the identical `sleep "$CONFIRM"` inside the loop is
+# one indent deeper, so this deletes the trailing confirmation and nothing else.
+mutate "the last nudge loses the confirmation window and warns over a success" "$CALLEE" \
+  's|^          sleep "\$CONFIRM"$||'                                 confirms_the_last_nudge_before_warning
 mutate "the early exit is removed, so it always posts" "$CALLEE" \
   's|^              exit 0$|              true|'                      posts_only_when_mergify_is_behind
 mutate "Mergify is matched by check name instead of by app" "$CALLEE" \

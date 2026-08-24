@@ -104,29 +104,38 @@ on:
     inputs:
       grace-seconds:
         description: >-
-          How long to wait before asking whether Mergify is behind. This is the
-          budget for the webhook arriving NORMALLY — Mergify's own measured
-          reaction time to an event it does receive is 13-14 seconds. It used
-          to be 60, four times the healthy case; measured over the first ten
-          nudged pull requests in this repository, Mergify re-evaluated on its
-          own within the grace window ZERO times, so the whole window was dead
-          time on every run. 20 is one grace period plus one retry still inside
-          half a minute. Too short and a healthy run nudges needlessly; too long
-          and every stall is prolonged by exactly this much.
+          How long to wait before asking whether Mergify is behind. This was
+          sized as a budget for the webhook arriving NORMALLY, and that budget
+          has now been paid eleven times and collected on none: across ten
+          nudged pull requests Mergify re-evaluated inside the grace window
+          ZERO times, and on #372 the window plus one retry cost 43 of the 184
+          seconds between CI going green and the merge — the single largest
+          span anyone here controls. It is not a free safety margin, it is a
+          delay applied to every run to avoid a comment on some of them, and
+          that comment is cheap: Mergify answers a redundant refresh with
+          "already running from a previous command" and does no extra work.
+          5 leaves the probe below meaningful (a check-run that lands between
+          CI ending and here still short-circuits) without paying for it.
         required: false
-        default: 20
+        default: 5
         type: number
       attempts:
         description: >-
-          How many times to ask BEFORE nudging, including the first. Every
-          attempt after the first is a second chance for a merely-late webhook
-          to land, which costs an API call and buys a comment not posted.
+          How many times to ask BEFORE nudging, including the first. Each extra
+          attempt is a second chance for a merely-late webhook to land, priced
+          at `interval-seconds` of delay on EVERY run and paying out only on
+          the runs that were never stuck. At the measured hit rate of zero in
+          ten that trade is not worth making twice, so this is 1: probe once,
+          and if Mergify is behind, say so immediately. The retry that matters
+          is `nudge-attempts`, which retries the thing that can actually be
+          lost.
         required: false
-        default: 2
+        default: 1
         type: number
       interval-seconds:
         description: >-
-          The gap between attempts. `grace-seconds + (attempts - 1) *
+          The gap between attempts, and therefore dead weight unless `attempts`
+          is raised above its default of 1. `grace-seconds + (attempts - 1) *
           interval-seconds` is the longest this waits before the FIRST nudge,
           and the whole ladder — that plus `(nudge-attempts - 1) *
           confirm-seconds` — must stay well under the queue's `checks_timeout`:
@@ -153,11 +162,17 @@ on:
       confirm-seconds:
         description: >-
           How long to give Mergify to answer a posted command before posting
-          another. Must comfortably exceed the 12-30s healthy reaction, or the
-          retry races a refresh that was already on its way and every stall
-          costs a duplicate comment.
+          another. Must comfortably exceed the healthy reaction, or the retry
+          races a refresh that was already on its way. 45 did not: on #372
+          Mergify took 90 seconds to answer nudge 1 and replied to the retries
+          with "already running from a previous command" — proof they were
+          received and deduplicated rather than lost, which is the one case a
+          retry cannot help. 60 straddles the 12-30s healthy reaction and that
+          90s outlier: a genuinely lost comment is still re-sent within the
+          minute, and a slow-but-received one costs at most one duplicate
+          instead of two.
         required: false
-        default: 45
+        default: 60
         type: number
 
 permissions:
@@ -346,6 +361,18 @@ jobs:
             fi
             nudge=$((nudge + 1))
           done
+
+          # The loop breaks straight after the LAST post, having never given that
+          # post the confirmation window every earlier one got. Skipping it does
+          # not just lose a chance to exit clean, it manufactures a false alarm:
+          # on #372 Mergify's reply landed in the same second as this line and
+          # the job still told the operator to go audit their webhook deliveries.
+          # The warning below is only true if it survives one more wait.
+          sleep "$CONFIRM"
+          if mergify_seen_it; then
+            echo "::notice::Mergify answered nudge $NUDGE_ATTEMPTS — re-evaluated $HEAD_SHA"
+            exit 0
+          fi
 
           # Every comment we are willing to send has been sent and Mergify has
           # still not moved. Do not fail the job: the pull request is not broken
