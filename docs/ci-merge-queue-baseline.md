@@ -1363,13 +1363,17 @@ Widening `refresh` to a bot widens very little: refresh re-evaluates conditions
 that are already written down, and cannot approve, bypass, queue or merge.
 
 **The fork-author arm is not boilerplate, and this block shipped without it.**
-`workflow_run.pull_requests` is empty for a run triggered by a fork pull request,
-so the nudge never fires on one — a fork contributor's only route out of a stall
-is to post `@mergifyio refresh` themselves. Omitting the arm takes that away at
-the same moment the automated path is unavailable to them, leaving the one class
-of contributor with no recovery at all waiting on a maintainer. Both bot
-reviewers caught it independently; the fleet had already merged the two-arm
-version into five repositories before it was fixed.
+It was left out on the reasoning that nothing in the repository depended on it.
+That is a judgement about a repository's own maintainers, made on behalf of an
+outside contributor who is not in the room — and dropping an arm of an upstream
+default is a permission taken away in silence, which is the same failure mode
+this whole section is about. It is a backstop rather than the only route: the
+nudge *does* reach fork pull requests, because the callee resolves them from
+`commits/<sha>/pulls` rather than from `workflow_run.pull_requests` (which
+GitHub leaves empty for a fork). The arm is what the author is left with when
+the nudge itself is what is broken. Both bot reviewers caught the omission
+independently; the fleet had already merged the two-arm version into five
+repositories before it was fixed.
 
 ### Why it usually posts nothing
 
@@ -1378,17 +1382,46 @@ on the majority of runs where the webhook arrived perfectly well. Comment noise
 is how an automation gets muted, and a muted automation is worse than none
 because it still looks installed.
 
-So the workflow waits out a grace period (60s by default, roughly four times
-Mergify's own measured reaction time), then asks GitHub a question with a factual
-answer: **has any check-run belonging to the Mergify app been touched at or after
-the moment CI finished?** If yes, Mergify has already seen this world. Only a
-Mergify that is demonstrably behind gets a comment. It re-asks every 30s, four
-times, so a merely-late webhook still costs nothing but API calls.
+So the workflow waits out a grace period (20s by default), then asks GitHub a
+question with a factual answer: **has any check-run belonging to the Mergify app
+been touched at or after the moment CI finished?** If yes, Mergify has already
+seen this world. Only a Mergify that is demonstrably behind gets a comment. It
+re-asks once more after 15s, so a merely-late webhook still costs nothing but
+API calls.
+
+The grace period was 60s — four times Mergify's 13-14s reaction to an event it
+receives — on the assumption that most runs would be caught by it. Measured over
+the first ten nudged pull requests in `ci-runner-infra`, Mergify re-evaluated
+inside the window **zero** times. When the webhook lands Mergify is fast; when it
+does not land, waiting longer does not help. The window is now sized to catch a
+merely-late delivery, not to hope for a lost one.
 
 The two ways that question can be wrong are deliberately asymmetric. A false
 "behind" costs one redundant comment and a no-op refresh. A false "caught up"
 costs nothing new — it leaves the pull request exactly where it is today. Neither
 can merge anything that was not already going to merge.
+
+### One comment is not enough: the nudge is a ladder
+
+The measurement that forced this: across those same ten nudges, Mergify answered
+the comment in **12-30s seven times, and took 9-11 minutes three times**. Not a
+spread — a flat ~10 minutes, which is not a slow reply but Mergify's periodic
+reconciliation picking up what was never delivered.
+
+**The command comment travels the same webhook channel that dropped the
+`check_run` event.** When *that* delivery is the one lost, posting once and
+walking away reproduces the exact stall this workflow exists to remove, one
+layer up, and there is no API to fall back on: Mergify exposes `refresh` only as
+a comment command.
+
+So the workflow posts, waits `confirm-seconds` (45s), re-reads Mergify's
+check-runs, and posts again if nothing moved — up to `nudge-attempts` (3). Each
+comment is an independent delivery, so a stall surviving the whole ladder is
+unlikely, and a Mergify that answered the first comment never sees a second.
+Worst case end-to-end is under three minutes; the common case is well under one.
+A repository that regularly exhausts the ladder gets a `::warning::` — that is
+not a nudge problem, it is a Mergify installation whose webhook deliveries need
+looking at.
 
 **Success and failure both.** A red check is a queue event as much as a green
 one: a queued pull request whose failure Mergify has not seen holds the front of
@@ -1444,12 +1477,17 @@ The step log shows the `gh api` 403 above the notice.
   reason `shared-infra-anchor.yml` does: fourteen copies is fourteen copies of
   every future fix.
 - **Do not remove the grace period to "react faster".** It is what keeps the
-  automation quiet enough to stay installed, and it costs at most 60 seconds on
-  a stall that is measured in tens of minutes.
-- **Do not let `grace-seconds + (attempts - 1) × interval-seconds` approach the
+  automation quiet enough to stay installed, and at 20s it costs almost nothing
+  on a stall that is measured in tens of minutes.
+- **Do not collapse the nudge ladder back to a single comment.** It reads as
+  redundant because the happy path never enters it. It is the difference between
+  a stall costing 30 seconds and costing the ten minutes Mergify's
+  reconciliation takes to notice a comment it never received.
+- **Do not let the full ladder — `grace-seconds + (attempts - 1) ×
+  interval-seconds + (nudge-attempts - 1) × confirm-seconds` — approach the
   queue's `checks_timeout`.** A nudge that arrives after the entry has been
   dequeued for a timeout is telling Mergify about a pull request it stopped
-  tracking.
+  tracking. At the defaults that total is 125s against a 30-minute timeout.
 - **Do not point `workflows:` at a workflow name you are about to change.** The
   detachment is silent; nothing goes red, the nudge simply stops being
   dispatched.
