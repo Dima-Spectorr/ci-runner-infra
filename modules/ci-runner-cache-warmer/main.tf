@@ -155,8 +155,27 @@ locals {
   # `entrypoint` beside `script` is an error — that is why these steps have none.
   escape_dollars = "$$"
 
-  publish_script = replace(file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh"), "$", local.escape_dollars)
-  turbo_script   = replace(file("${path.module}/scripts/warm-turbo.sh"), "$", local.escape_dollars)
+  # TWO files, concatenated, because the step runs `bash -c "<text>"` and there
+  # is no scripts/ci on that disk to source from. The publisher sources
+  # `scan-cache-credentials.sh` when it can find it and uses what is already
+  # defined when it cannot, so prepending the library's text is the same program
+  # by a different route — and the publisher refuses outright if the scan
+  # function is missing, which is what stops a broken concatenation from
+  # publishing an unscanned snapshot.
+  #
+  # SCAN_INLINE_LIBRARY suppresses the library's standalone entry point. Without
+  # it the library's own `usage:` check runs against the step's argv and kills
+  # the build before the publisher's first line.
+  #
+  # Escaped as ONE string after the join, not file by file: the escape is a
+  # property of what Cloud Build receives, and escaping the parts separately is
+  # the same result by a route where a later part can be added unescaped.
+  publish_script = replace(join("\n", [
+    "SCAN_INLINE_LIBRARY=1",
+    file("${path.module}/../../scripts/ci/scan-cache-credentials.sh"),
+    file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh"),
+  ]), "$", local.escape_dollars)
+  turbo_script = replace(file("${path.module}/scripts/warm-turbo.sh"), "$", local.escape_dollars)
 
   # HOW THE REPOSITORY IS INSTALLED AND BUILT — WORKED OUT AT WARM TIME, FROM THE
   # REPOSITORY, RATHER THAN STATED BY WHOEVER WIRES THE WARMER UP.

@@ -74,8 +74,25 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
 
 check() { # <description> <condition-as-command...>
   local d="$1"; shift
+  # `!` is a shell KEYWORD and a keyword does not survive "$@" expansion -- it
+  # arrives here as a command named `!`, which does not exist, so the assertion
+  # reports the missing command instead of the condition. Refuse it outright:
+  # a negated condition has its own helper below.
+  if [ "$1" = '!' ]; then
+    bad "$d [harness: negate with check_not, not a leading !]"
+    return
+  fi
   if "$@"; then ok "$d"; else bad "$d"; fi
 }
+
+check_not() { # <description> <condition-as-command...>
+  local d="$1"; shift
+  if "$@"; then bad "$d"; else ok "$d"; fi
+}
+
+# Wrapped rather than redirected at the call site, so the quieting lands on
+# pgrep and not on the assertion's own verdict.
+pgrep_slot() { pgrep -u "$U" >/dev/null 2>&1; }
 
 # --- the sandbox --------------------------------------------------------------
 #
@@ -276,6 +293,51 @@ check "completed succeeds"                    test "$rc" = 0
 check "completed writes the clean marker"     test -f "$MARKER"
 check "completed takes _actions"              test ! -e "$WORK/_actions/action.yml"
 check "completed takes the credential in _temp" test ! -e "$WORK/_temp/creds.json"
+
+echo
+echo "quiesce: a writer the last job left running"
+#
+# #237 finding 3, and the reason this suite exists rather than another static
+# assertion. Every step of the old reset was right: it emptied the home, it
+# restored the template, it tore the containers down, it wrote the marker. The
+# ORDER was wrong -- the teardown came after the wipe -- so anything the last
+# job left running had a window in which to put a dotfile, a credential or a
+# checkout back into a home that had just been made clean, and the marker went
+# on over it. Nothing in the text of any one line is incorrect, and the slot the
+# next job lands on is certified clean by a reset a writer outlived.
+#
+# A detached container is the case the issue names; a process the job simply
+# backgrounded is the same bug with less machinery, needs no daemon in the
+# sandbox, and is what runs here.
+seed_work
+sudo -u "$U" nohup bash -c "while :; do printf 'the last job is still here\n' >'$HOME_DIR/.pwned'; sleep 0.1; done" \
+  >/dev/null 2>&1 &
+# Long enough for the loop to have written once, so a pass cannot be a writer
+# that never got started.
+sleep 1
+check "the writer is actually running before the reset" test -e "$HOME_DIR/.pwned"
+
+in_workspace completed
+rc=$?
+# A full second AFTER the reset returned. The writer's loop turns ten times in
+# it, so a survivor recreates the file and this assertion is not a race.
+sleep 1
+check "the reset succeeds with a writer to stop"  test "$rc" = 0
+# NOT `check ... ! pgrep ... >/dev/null 2>&1`: those redirections attach to
+# `check`, not to pgrep, so the verdict this assertion prints goes to /dev/null
+# and a failure is counted with nothing on screen naming it. Silence the
+# condition, never the harness.
+check_not "no process of the slot outlives the reset" pgrep_slot
+check "nothing rewrote the home after the wipe"   test ! -e "$HOME_DIR/.pwned"
+check "the home is the template's again"          test -f "$HOME_DIR/.bashrc"
+check "and the marker means it"                   test -f "$MARKER"
+
+# The suite goes on after a failed assertion, so a writer that DID survive would
+# keep rewriting the home under every case below and the report would blame
+# them. Kill anything of this slot's here, whatever the verdict was.
+sudo pkill -KILL -u "$U" >/dev/null 2>&1 || :
+sleep 0.2
+rm -f -- "$HOME_DIR/.pwned"
 
 echo
 echo "started, on a slot whose last job never completed"

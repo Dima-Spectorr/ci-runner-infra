@@ -67,6 +67,12 @@ $script:CacheDirs = @('npm', 'yarn', 'pnpm-store', 'go-mod', 'pip', 'uv', 'm2', 
 # raises it in one place for both.
 $script:DefaultPrepareTimeoutSeconds = 3600
 
+# This script's own directory, resolved at load and used only to reach
+# `scan-cache-credentials.sh` next to it. $PSScriptRoot rather than the current
+# directory, because Invoke-Main changes into the checkout and the prepare
+# command is free to change it again.
+$script:ScriptDir = $PSScriptRoot
+
 function Write-BuildLog {
     param([Parameter(Mandatory = $true)][string] $Message)
     # NOT Write-Host, which fails PSAvoidUsingWriteHost -- powershell-gate.sh
@@ -208,13 +214,14 @@ function Get-CacheToolEnvironment {
 # cheap half of the credential scan runs on the side that produced the tree,
 # before the archive exists.
 #
-# It is the cheap half only, and that is stated rather than glossed: this catches
+# It is the name half only, and that is stated rather than glossed: this catches
 # a credential a tool wrote to its OWN CONFIG, which is the common case (an
 # `.npmrc` left behind by `npm login`, a `.netrc`, a service-account JSON). It
 # does not see one embedded in cache CONTENT under a hash-named file, which is
-# what `CREDENTIAL_PATTERNS` is for and which needs the shell script's regex
-# engine. That pass still runs only in the publish job, and closing it on this
-# side is tracked as its own issue.
+# what `CREDENTIAL_PATTERNS` is for and which needs a regex engine this script
+# does not have. Invoke-ContentCredentialScan below closes that half by running
+# `scan-cache-credentials.sh` -- the ONE copy of those patterns -- through the
+# git-bash that IS on every Windows runner, rather than porting them here.
 $script:CredentialFileNames = @(
     '.npmrc', '.yarnrc', '.yarnrc.yml', '.netrc', '.pypirc', '.git-credentials',
     'auth.json', 'settings.xml', 'nuget.config', 'credentials',
@@ -251,6 +258,119 @@ function Get-CredentialFileRefusal {
         }
     }
     return $null
+}
+
+function Get-BashPath {
+    <#
+      .SYNOPSIS
+        The git-bash to run the content scan with, or $null. Pure enough to test:
+        it only looks, it never runs anything.
+      .DESCRIPTION
+        `bash.exe` is on PATH on every GitHub-hosted `windows-latest` image and on
+        the self-hosted Windows image, which installs Git for Windows. Both known
+        install roots are checked as well, because PATH is the one part of this a
+        prepare command can edit: it runs in this process's environment, and a
+        `bash.exe` it drops earlier on PATH would be the thing that gets to decide
+        whether the tree is clean. The fixed roots are tried FIRST for that reason.
+    #>
+    [CmdletBinding()]
+    param()
+    $roots = @(
+        (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Git\bin\bash.exe')
+    )
+    foreach ($r in $roots) {
+        if ($r -and (Test-Path -LiteralPath $r -PathType Leaf)) { return $r }
+    }
+    $cmd = Get-Command -Name 'bash.exe' -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
+function ConvertTo-BashPath {
+    <#
+      .SYNOPSIS
+        A Windows path as git-bash's find and grep will accept it. Pure.
+      .DESCRIPTION
+        Forward slashes, drive letter kept. MSYS resolves `C:/x/y` natively; a
+        BACKSLASH path is what breaks, because the scan passes the root through
+        `find` and a `\` there is a shell-level escape in some positions and a
+        literal in others. Trailing separators are dropped so `find` prints paths
+        with one separator rather than two, which only matters because those paths
+        end up in a refusal message an operator has to read.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Path)
+    return ($Path -replace '\\', '/').TrimEnd('/')
+}
+
+function Invoke-ContentCredentialScan {
+    <#
+      .SYNOPSIS
+        Runs the EMBEDDED-CREDENTIAL CONTENT pass over a staged tree. Throws if the
+        tree holds one, and throws if the pass could not be run at all.
+      .DESCRIPTION
+        Not a port. `scripts/ci/scan-cache-credentials.sh` holds one copy of
+        CREDENTIAL_PATTERNS, the PEM confirmation stage, the byte floor and the
+        digest allowlist, and this runs THAT -- so the Windows and Linux snapshots
+        are refused by the same rules rather than by two sets that have to be kept
+        equal. A PowerShell translation would be a third copy of security-critical
+        regexes, and .NET's regex engine does not agree with POSIX ERE on the
+        bracket expressions those patterns turn on.
+
+        FAILS CLOSED, including on "there is no bash here". A missing interpreter
+        is indistinguishable, from the artifact's point of view, from a tree that
+        was never scanned -- and the artifact is downloadable by anyone who can
+        read the repository the moment it is stored, so there is no later refusal
+        that can take it back.
+
+        CACHE_SCAN_ALLOW_DIGESTS and CACHE_SCAN_ALLOW_FILE are inherited from this
+        process, which is what makes the two jobs' allowlists the same allowlist.
+        The file's path is converted, because an operator naturally writes it as a
+        Windows path.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Root,
+        [Parameter(Mandatory)][string] $ScriptPath,
+        [Parameter(Mandatory)][string] $TempRoot
+    )
+    $bash = Get-BashPath
+    if (-not $bash) {
+        throw ('no bash.exe was found, so the embedded-credential content scan cannot run -- refusing to ' +
+            'pack. Install Git for Windows on this runner; an unscanned archive is uploaded before the ' +
+            'publish job ever sees it')
+    }
+    if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
+        throw ("the content scan script is not at $(Get-SafeText $ScriptPath) -- refusing to pack an " +
+            'archive nothing scanned for embedded credentials')
+    }
+
+    # Its own directory, not the stage: the hit list must not be somewhere the
+    # prepare command wrote, and must not become a member of the archive.
+    $scanTmp = Join-Path $TempRoot ('cache-scan-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $scanTmp -Force | Out-Null
+    try {
+        $prev = $env:SCAN_TMPDIR
+        $prevAllowFile = $env:CACHE_SCAN_ALLOW_FILE
+        $env:SCAN_TMPDIR = ConvertTo-BashPath $scanTmp
+        if ($env:CACHE_SCAN_ALLOW_FILE) {
+            $env:CACHE_SCAN_ALLOW_FILE = ConvertTo-BashPath $env:CACHE_SCAN_ALLOW_FILE
+        }
+        Write-BuildLog 'scanning the staged tree for embedded credentials'
+        & $bash (ConvertTo-BashPath $ScriptPath) (ConvertTo-BashPath $Root)
+        $rc = $LASTEXITCODE
+    } finally {
+        $env:SCAN_TMPDIR = $prev
+        $env:CACHE_SCAN_ALLOW_FILE = $prevAllowFile
+        Remove-Item -LiteralPath $scanTmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($rc -ne 0) {
+        # The scan already printed WHICH rule caught WHICH file and what would
+        # excuse it. Repeating a guess here would be a second, worse explanation.
+        throw "refusing to pack: the embedded-credential content scan exited $rc"
+    }
 }
 
 function Get-StagedTreeRefusal {
@@ -1058,6 +1178,12 @@ function Invoke-Main {
             # Remove-StageSafely decides what may be recursively removed.
             throw "refusing to pack: $credential"
         }
+
+        # And the content half, in the same place and for the same reason: what
+        # this refuses must never become the artifact. It runs the shell script's
+        # patterns rather than a copy of them -- see Invoke-ContentCredentialScan.
+        Invoke-ContentCredentialScan -Root $stage -TempRoot $tempRoot `
+            -ScriptPath (Join-Path $script:ScriptDir 'scan-cache-credentials.sh')
 
         # ONLY WHAT TAR WILL PACK COUNTS. The tar line names the cache
         # directories, so a file the prepare command drops anywhere else under the
