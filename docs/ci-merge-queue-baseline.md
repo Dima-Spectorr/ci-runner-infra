@@ -1414,14 +1414,46 @@ walking away reproduces the exact stall this workflow exists to remove, one
 layer up, and there is no API to fall back on: Mergify exposes `refresh` only as
 a comment command.
 
-So the workflow posts, waits `confirm-seconds` (45s), re-reads Mergify's
-check-runs, and posts again if nothing moved — up to `nudge-attempts` (3). Each
-comment is an independent delivery, so a stall surviving the whole ladder is
-unlikely, and a Mergify that answered the first comment never sees a second.
-Worst case end-to-end is under three minutes; the common case is well under one.
-A repository that regularly exhausts the ladder gets a `::warning::` — that is
-not a nudge problem, it is a Mergify installation whose webhook deliveries need
-looking at.
+So the workflow posts, waits `confirm-seconds` (60s), re-reads Mergify's
+check-runs, and posts again if nothing moved — up to `nudge-attempts` (3),
+**including one final wait and re-read after the last post**. That trailing
+check is not symmetry for its own sake: without it the last comment is the only
+one never given a chance to be answered, and the job warns over a Mergify that
+had in fact replied. Each comment is an independent delivery, so a stall
+surviving the whole ladder is unlikely, and a Mergify that answered the first
+comment never sees a second. A repository that regularly exhausts the ladder
+gets a `::warning::` — that is not a nudge problem, it is a Mergify
+installation whose webhook deliveries need looking at.
+
+### What the first live run measured, and what it changed
+
+PR #372, the first pull request merged with the ladder running:
+
+| | |
+|---|---|
+| CI ended | `16:29:59` |
+| nudge workflow started | `16:30:02` — the `workflow_run` webhook is not the slow part |
+| first nudge posted | `16:30:42` |
+| Mergify acted | `16:32:12` |
+| merged | `16:33:03` |
+
+Three minutes against the nine to thirteen this replaced, and two findings that
+changed the defaults:
+
+- **43 of those 184 seconds were spent before the first comment was posted** —
+  `grace-seconds` plus one retry — and that window has now been observed
+  catching Mergify self-reacting zero times out of eleven. It is not a safety
+  margin, it is a delay charged to every run to avoid a comment on some of
+  them. `grace-seconds` is 5 and `attempts` is 1. The retry worth having is the
+  one on the thing that can actually be lost.
+- **Mergify replied to the retries with "already running from a previous
+  command"** — so they were received and deduplicated, not lost. Retrying is
+  therefore cheap but not free, and 45s was short enough to spend two duplicate
+  comments on a Mergify that simply took 90 seconds. `confirm-seconds` is 60.
+
+Expected now: CI green → first comment in **under 10 seconds**, which is the
+whole of the span this side controls. What remains after that is Mergify's own
+reaction time.
 
 **Success and failure both.** A red check is a queue event as much as a green
 one: a queued pull request whose failure Mergify has not seen holds the front of
@@ -1484,10 +1516,17 @@ The step log shows the `gh api` 403 above the notice.
   a stall costing 30 seconds and costing the ten minutes Mergify's
   reconciliation takes to notice a comment it never received.
 - **Do not let the full ladder — `grace-seconds + (attempts - 1) ×
-  interval-seconds + (nudge-attempts - 1) × confirm-seconds` — approach the
-  queue's `checks_timeout`.** A nudge that arrives after the entry has been
-  dequeued for a timeout is telling Mergify about a pull request it stopped
-  tracking. At the defaults that total is 125s against a 30-minute timeout.
+  interval-seconds + nudge-attempts × confirm-seconds` — approach the queue's
+  `checks_timeout`.** A nudge that arrives after the entry has been dequeued for
+  a timeout is telling Mergify about a pull request it stopped tracking. At the
+  defaults that total is 185s against a 30-minute timeout. Note the term is
+  `nudge-attempts`, not `nudge-attempts - 1`: the last post gets a confirmation
+  window too, so that it can be answered rather than warned about.
+- **Do not restore `grace-seconds` as a safety margin.** It reads like one and
+  is not: it has been measured over eleven runs catching Mergify self-reacting
+  zero times, and it delays every run to save a comment on none of them. The
+  redundant comment it was buying is answered by Mergify with "already running
+  from a previous command" and costs no work at either end.
 - **Do not point `workflows:` at a workflow name you are about to change.** The
   detachment is silent; nothing goes red, the nudge simply stops being
   dispatched.
