@@ -602,6 +602,46 @@ path and the same-host case a connection refused. Matching the host's own
 address instead admits both while still declining anything not addressed to this
 host.
 
+**And a hairpin SNAT, because the DNAT alone is broken for exactly one slot: the
+one that owns the band.**
+
+```
+-t nat -A POSTROUTING -s 10.99.<idx>.2 -d 10.99.<idx>.2 -p tcp --dport <band> \
+       -j MASQUERADE
+```
+
+A consumer in slot `idx` dialling `<host address>:<its own band port>` is not a
+special case on the way *in*. Its packet is not locally generated as far as the
+host namespace is concerned: it leaves over `cis<idx>`, arrives as forwarded
+traffic, and `PREROUTING` rewrites it like anybody else's. It is a special case
+on the way *back*. The address it is rewritten to is `10.99.<idx>.2` — the
+address the packet came from — so post-DNAT source and destination are equal and
+the packet is routed straight back out `cis<idx>`. The slot discards it as a
+martian, its own address arriving on an external interface; and even accepted,
+the reply would be namespace-local, never re-enter this host's conntrack, and
+never be un-DNATed into something the client's socket recognises. The general
+egress MASQUERADE does not cover this: that rule is `-o <primary_if>`, and a
+hairpin leaves by the veth. Scoping the SNAT to one slot's own /30 and its own
+band keeps a *sibling* — which needs no help and whose real address the band's
+`FORWARD` accept is written against — untouched.
+
+Without it the connection never completes and the consumer sits until its own
+timeout, which is why this presented as slow, intermittent flakiness rather than
+a connection refused: it bites only the consumer jobs that happen to land on the
+anchor's own slot, roughly one in `slots_per_host`. Measured in DataRetrival run
+32755968066, where the anchor held slot 3, a consumer on slot 4 connected and a
+consumer on slot 3 timed out against the identical URL.
+
+**A host only gets that rule when it is rolled onto the new boot script**, so
+[`shared-infra-db`](../.github/actions/shared-infra-db/resolve.sh) also resolves
+the stack to loopback when `pg` falls inside the *consuming slot's own* band —
+disjoint per slot, and published to the slot as `CI_SHARED_INFRA_PORT_MIN`/`MAX`,
+which is the same band the anchor drew the port from. That covers the fleet
+before it rolls; it cannot cover a `container:` consumer, whose steps do not
+inherit the runner service's environment, nor a consumer that hand-rolls the URL
+from the anchor's outputs. Those two need the kernel rule, which is the reason
+it exists rather than leaving the whole fix in the action.
+
 The `FORWARD` chain already accepts `-o cis<idx>`, so nothing in the forwarding
 policy loosens today. What is new is one PREROUTING entry per slot, bounded to
 100 ports, and nothing else on the host becomes reachable.

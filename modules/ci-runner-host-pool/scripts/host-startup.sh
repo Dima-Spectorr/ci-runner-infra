@@ -4042,6 +4042,36 @@ setup_slot_netns() { # <idx>
       -j DNAT --to-destination "$nsip" 2>/dev/null \
       || iptables -w -t nat -A PREROUTING -d "$addr" -p tcp --dport "$bmin:$bmax" \
         -j DNAT --to-destination "$nsip" || return 1
+
+    # ...AND THE HAIRPIN SNAT, which is what makes that DNAT usable from the
+    # slot that owns the band -- the one slot for which it is otherwise broken.
+    #
+    # A consumer job in slot <idx> dialling the host address is not a special
+    # case on the way IN: the packet leaves over cis<idx>, enters this namespace
+    # as forwarded traffic, and the DNAT above rewrites it. It is a special case
+    # on the way BACK. The destination it is rewritten to is 10.99.<idx>.2 --
+    # the address the packet came FROM -- so it is routed straight back out
+    # cis<idx> with source and destination equal. The slot drops it as a martian
+    # (its own address arriving on an external interface), and had it not, the
+    # reply would be namespace-local, never return through this host's
+    # conntrack, and never be un-DNATed into something the client's socket
+    # recognises. Either way the connection never completes: the consumer sits
+    # until ITS OWN timeout, which is why this surfaces as a slow, intermittent
+    # client-side timeout rather than a connection refused.
+    #
+    # The general egress MASQUERADE below does not cover it -- that one is
+    # `-o $ifc`, and a hairpin leaves via the veth. This rule replaces the
+    # source with the host end of the /30, so the service replies to the host,
+    # the reply is un-SNATed and un-DNATed on the way back, and the socket sees
+    # the address it dialled.
+    #
+    # Scoped to one slot's own /30 and its own band, so it can never touch a
+    # sibling's traffic: a sibling reaching this band is `-s 10.99.<other>.2`
+    # and keeps its real address.
+    iptables -w -t nat -C POSTROUTING -s "$nsip" -d "$nsip" -p tcp \
+      --dport "$bmin:$bmax" -j MASQUERADE 2>/dev/null \
+      || iptables -w -t nat -A POSTROUTING -s "$nsip" -d "$nsip" -p tcp \
+        --dport "$bmin:$bmax" -j MASQUERADE || return 1
   else
     log "slot $idx: no primary address -- shared-infrastructure band not published"
   fi
