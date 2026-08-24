@@ -194,7 +194,7 @@ down because each one, seen live, looks like a cold cache rather than a bug.
 | **nothing at all** — a build id, `FETCHSOURCE` and `SETUPBUILD` done, every step `QUEUED`, no `BUILD` phase, no log, no error, until the queue TTL expires an hour later | A build message past roughly **128 KiB** is accepted and then never scheduled. Measured by bisection in one region of this fleet: 125 KB reached `BUILD` in two seconds, 140 KB never reached it; machine type, service account, step images and regional capacity make no difference. The module used to inline the 91 KB publishing script into two steps — a 199 KB config, so **no warm ever ran**. | v5.42.0 |
 
 The last one is why the scripts are handed to the build **once**, gzipped, by a
-`stage-scripts` step that unpacks them into `/workspace` — about 48 KB instead of
+`stage-scripts` step that unpacks them into `/workspace` — about 55 KB instead of
 199 KB — and why the trigger carries a precondition that fails the *apply* if
 that total climbs back toward the cliff. Add a script to this module by putting
 it through the staging step, never by inlining it into the step that runs it.

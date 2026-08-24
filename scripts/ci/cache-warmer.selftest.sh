@@ -33,6 +33,7 @@ MAIN="$ROOT/modules/ci-runner-cache-warmer/main.tf"
 VARS="$ROOT/modules/ci-runner-cache-warmer/variables.tf"
 TURBO="$ROOT/modules/ci-runner-cache-warmer/scripts/warm-turbo.sh"
 SHARED="$ROOT/scripts/ci/publish-cache-snapshot.sh"
+SHAREDSCAN="$ROOT/scripts/ci/scan-cache-credentials.sh"
 
 PASS=0
 FAIL=0
@@ -61,8 +62,19 @@ code_of() { grep -vE '^[[:space:]]*#' "$1"; }
 #    replaced by a copy inside the module (drift), or the root file could be
 #    moved (a plan that fails with a message about a missing file and nothing
 #    about why a module wants one two directories up).
+#
+#    The credential-scan library is the same reference and the same argument. The
+#    publisher sources it from its own directory and refuses to run at all when
+#    `scan_credentials_or_die` is undefined, so a library that stops being staged
+#    beside it is a warm that publishes nothing — loudly, but only at trigger
+#    time, on a schedule nobody is watching. Asserted here instead: read from the
+#    repository root, written into the staged directory next to the publisher.
 has_shared_publisher() { # <file>
-  matches "$(code_of "$1")" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"\)'
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"\)' || return 1
+  matches "$code" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/scan-cache-credentials\.sh"\)'  || return 1
+  matches "$code" 'gzip -d > \$\{local\.staged_dir\}/scan-cache-credentials\.sh'                  || return 1
 }
 
 if has_shared_publisher "$MAIN"; then ok; else
@@ -71,6 +83,10 @@ fi
 
 if [ -f "$SHARED" ]; then ok; else
   bad "scripts/ci/publish-cache-snapshot.sh has moved; the warmer module reads it by relative path and terraform will fail at plan time with a message that says nothing about this"
+fi
+
+if [ -f "$SHAREDSCAN" ]; then ok; else
+  bad "scripts/ci/scan-cache-credentials.sh has moved; the warmer module reads it by relative path too, and terraform will fail at plan time with a message that says nothing about this"
 fi
 
 # 2. TWO PHASES. The archive is packed in one step and uploaded in another, and
@@ -328,7 +344,12 @@ has_config_under_the_cliff() { # <file>
   # what it finds there is a step the untrusted one in the middle could have
   # rewritten — the exact ordering the two-phase split exists to keep.
   matches "$code" 'publish_sha = filesha256\(' || return 1
+  matches "$code" 'scan_sha    = filesha256\(' || return 1
   matches "$code" 'turbo_sha   = filesha256\(' || return 1
+  # The library the publisher sources is checked in the same step as the
+  # publisher: a snapshot scanned by a rewritten scanner is a snapshot nobody
+  # scanned, and it is published either way.
+  matches "$code" '\$\{local\.scan_sha\}  \$\{local\.staged_dir\}/scan-cache-credentials\.sh' || return 1
   [ "$(printf '%s\n' "$code" | grep -c 'sha256sum -c -')" -eq 2 ] || return 1
   matches "$code" 'condition     = local\.build_config_bytes < [0-9]+' || return 1
   # And the big script reaches the config exactly once. Twice is the 199 KB
@@ -364,6 +385,14 @@ mutate() { # <description> <file> <sed-program> <predicate>
 
 mutate "the publisher copied into the module" "$MAIN" \
   's@file("\${path\.module}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh")@file("${path.module}/scripts/publish-cache-snapshot.sh")@' \
+  has_shared_publisher
+
+mutate "the credential-scan library stops being staged" "$MAIN" \
+  's@^  scan_gz    = base64gzip(file("\${path\.module}/\.\./\.\./scripts/ci/scan-cache-credentials\.sh"))$@@' \
+  has_shared_publisher
+
+mutate "the library is read but never written beside the publisher" "$MAIN" \
+  's@gzip -d > \${local\.staged_dir}/scan-cache-credentials\.sh@gzip -d > /tmp/scan-cache-credentials.sh@' \
   has_shared_publisher
 
 mutate "install and upload in one phase" "$MAIN" \
@@ -467,6 +496,10 @@ mutate "the publishing script inlined into its step again" "$MAIN" \
 
 mutate "a staged script run without checking its digest" "$MAIN" \
   's@\\nexec \${local\.staged_dir}/warm-turbo\.sh@\\nexec ${local.staged_dir}/warm-turbo.sh@;s@sha256sum -c -\\nexec \${local\.staged_dir}/warm-turbo\.sh@exec ${local.staged_dir}/warm-turbo.sh@' \
+  has_config_under_the_cliff
+
+mutate "the scanner staged but left unchecked" "$MAIN" \
+  's@\\n\${local\.scan_sha}  \${local\.staged_dir}/scan-cache-credentials\.sh@@' \
   has_config_under_the_cliff
 
 mutate "the size guard removed" "$MAIN" \

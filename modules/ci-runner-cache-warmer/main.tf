@@ -170,7 +170,7 @@ locals {
   #
   # So the scripts are handed over ONCE, gzipped, and unpacked into /workspace —
   # the one directory Cloud Build carries between steps. That takes the config from
-  # 199 KB to about 50 KB and it removes the escaping problem above for the two
+  # 199 KB to about 55 KB and it removes the escaping problem above for the three
   # scripts as a side effect: base64 has no `$` in its alphabet, so there is
   # nothing left in them for Cloud Build to read as a substitution. The four steps
   # that follow are three lines each.
@@ -182,8 +182,20 @@ locals {
   staged_dir = "/workspace/.ci-warmer"
 
   publish_gz = base64gzip(file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh"))
+  scan_gz    = base64gzip(file("${path.module}/../../scripts/ci/scan-cache-credentials.sh"))
   turbo_gz   = base64gzip(file("${path.module}/scripts/warm-turbo.sh"))
 
+  # THE CREDENTIAL-SCAN LIBRARY IS STAGED AS A SIBLING, NOT CONCATENATED.
+  #
+  # `publish-cache-snapshot.sh` sources `$HERE/scan-cache-credentials.sh` unless
+  # `scan_credentials_or_die` is already defined, and refuses to publish at all if
+  # the function is missing by the time anything scans. When the publisher was
+  # pasted into a step as text there was no disk to source from and the library's
+  # text had to be prepended, with `SCAN_INLINE_LIBRARY=1` to suppress its
+  # standalone `usage:` check. Staged as a real file it needs neither: `$HERE`
+  # resolves to the directory below and the warm loads the library by exactly the
+  # route the workflow does, which is one fewer way for the two to diverge.
+  #
   # Quoted heredoc delimiters, so the shell expands nothing in a blob it is only
   # decoding, and `chmod +x` so each script is executed through its OWN shebang
   # rather than whatever interpreter the step image happens to call it with.
@@ -194,10 +206,13 @@ locals {
     base64 -d <<'PUBLISH_GZ_EOF' | gzip -d > ${local.staged_dir}/publish-cache-snapshot.sh
     ${local.publish_gz}
     PUBLISH_GZ_EOF
+    base64 -d <<'SCAN_GZ_EOF' | gzip -d > ${local.staged_dir}/scan-cache-credentials.sh
+    ${local.scan_gz}
+    SCAN_GZ_EOF
     base64 -d <<'TURBO_GZ_EOF' | gzip -d > ${local.staged_dir}/warm-turbo.sh
     ${local.turbo_gz}
     TURBO_GZ_EOF
-    chmod +x ${local.staged_dir}/publish-cache-snapshot.sh ${local.staged_dir}/warm-turbo.sh
+    chmod +x ${local.staged_dir}/publish-cache-snapshot.sh ${local.staged_dir}/scan-cache-credentials.sh ${local.staged_dir}/warm-turbo.sh
   EOT
 
   # A no-op today — there is no `$` in base64 — and kept because the day someone
@@ -219,10 +234,16 @@ locals {
   # This does not widen or narrow what a compromised dependency can ultimately
   # do — it can mint this account's token from its own step either way, as the
   # header says. It keeps the step boundary meaning what it says it means.
+  # The scan library is checked with the publisher and not on its own, because
+  # the publisher is the only thing that loads it: a step that verified it and
+  # then ran nothing would prove nothing, and one that ran the publisher without
+  # verifying it would publish a tree scanned by whatever the build step left in
+  # that file.
   publish_sha = filesha256("${path.module}/../../scripts/ci/publish-cache-snapshot.sh")
+  scan_sha    = filesha256("${path.module}/../../scripts/ci/scan-cache-credentials.sh")
   turbo_sha   = filesha256("${path.module}/scripts/warm-turbo.sh")
 
-  run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh' | sha256sum -c -\nexec ${local.staged_dir}/publish-cache-snapshot.sh\n"
+  run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\nexec ${local.staged_dir}/publish-cache-snapshot.sh\n"
   run_turbo   = "#!/bin/sh\nset -eu\necho '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\nexec ${local.staged_dir}/warm-turbo.sh\n"
 
   # HOW THE REPOSITORY IS INSTALLED AND BUILT — WORKED OUT AT WARM TIME, FROM THE
