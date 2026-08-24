@@ -1145,6 +1145,15 @@ if [ "\$took" = 1 ]; then
     rc=1
   elif mv -T -- "\$held" "\$work"; then
     chown "\$u:\$u" "\$work" || { say "slot \$idx: could not chown \$work"; rc=1; }
+    # AND THE MODE, not only the owner. The mode is whatever the last job left,
+    # and a job owns this directory: one that ran \`chmod 000\` on its own
+    # workspace -- or a tool that did it on the way out -- hands back a directory
+    # its own user cannot enter, and every job after it fails before its first
+    # step while the agent stays ONLINE. Restored HERE, from inside the holding
+    # directory root owns, because this is the one place the name cannot be
+    # swapped between the check and the write; install_slot deliberately refuses
+    # rather than repairing, for exactly that reason.
+    chmod 0755 "\$work" || { say "slot \$idx: could not restore the mode of \$work"; rc=1; }
   else
     say "slot \$idx: could not return \$work to slot \$idx"
     rc=1
@@ -4522,16 +4531,29 @@ sudo_passes_env() { # <user>
 # substitute a different major it happens to have. So a half-unpacked tree that
 # kept node20 and lost node24 satisfies "any one node" and still burns every job
 # that uses `actions/checkout`, which is the 2026-08-23 failure with one
-# directory restored. The version-agnostic property that is actually checkable is
-# "every runtime this copy claims to ship can start", and that is what is asked:
-# the set is read off the tree rather than pinned here, so a major bump needs no
-# edit and a missing member of the set is still caught.
-slot_can_execute() { # <dir>
-  local dir="$1" ext found=0
+# directory restored.
+#
+# THE EXPECTED SET COMES FROM THE TEMPLATE, not from the copy. Deriving it from
+# the destination answers a weaker question than it looks: a tree where node24
+# was never written AT ALL ships one runtime, node20, and "every runtime this
+# copy ships works" is true of it. The pristine tree this copy was made from is
+# right here -- it is what `cp -a` read -- so the set is read off THAT and each
+# member is required in the copy. Still nothing pinned in this file, so a major
+# bump needs no edit; what changes is that a missing directory is now a missing
+# member rather than an absence nobody expected.
+#
+# The copy's own runtimes are checked too, for the directory the template does
+# not have: an image that grew one is a tree this slot would launch from.
+slot_can_execute() { # <dir> <template>
+  local dir="$1" tpl="${2:-}" ext found=0
 
-  [ -x "$dir/run.sh" ] ||
+  # `-f` as well as `-x`: a directory carries the execute bit as a matter of
+  # course, so `-x` alone passes a corrupted unpack that left `run.sh` as a
+  # directory -- which then fails at exec time, in the unreadable way this whole
+  # gate exists to move earlier.
+  { [ -f "$dir/run.sh" ] && [ -x "$dir/run.sh" ]; } ||
     { log "slot workspace $dir has no executable run.sh"; return 1; }
-  [ -x "$dir/config.sh" ] ||
+  { [ -f "$dir/config.sh" ] && [ -x "$dir/config.sh" ]; } ||
     { log "slot workspace $dir has no executable config.sh"; return 1; }
 
   # Iterated over the DIRECTORIES, not over `node*/bin/node`: a runtime whose
@@ -4541,22 +4563,47 @@ slot_can_execute() { # <dir>
   for ext in "$dir"/externals/node*; do
     [ -d "$ext" ] || continue
     found=$((found + 1))
-    [ -x "$ext/bin/node" ] ||
+    { [ -f "$ext/bin/node" ] && [ -x "$ext/bin/node" ]; } ||
       { log "slot workspace $dir ships ${ext##*/} with no usable bin/node -- an action that names that runtime would fail at its first step"; return 1; }
   done
   [ "$found" -gt 0 ] ||
     { log "slot workspace $dir has no externals/node* runtime at all -- the agent would fail every job at its first step"; return 1; }
+
+  # And every runtime the ORIGINAL has. Skipped when no template is given, so the
+  # function stays a pure predicate over one directory for anything that has only
+  # that to offer.
+  [ -n "$tpl" ] || return 0
+  for ext in "$tpl"/externals/node*; do
+    [ -d "$ext" ] || continue
+    { [ -f "$dir/externals/${ext##*/}/bin/node" ] && [ -x "$dir/externals/${ext##*/}/bin/node" ]; } ||
+      { log "slot workspace $dir is missing ${ext##*/}, which $tpl ships -- an action that names that runtime would fail at its first step"; return 1; }
+  done
 }
 
-# slot_unit_is_active <idx> — true when this slot's agent is ALREADY running.
+# slot_unit_preexists <idx> — true when this slot was registered BEFORE this boot.
 #
-# On a WARM reboot it is: the ci-runner@ units are enabled, so systemd brings
-# them up while this script is still working, which is the same window
-# provision_slot_user refuses to reset in. install_slot has to know, because two
-# of its steps are only safe on a cold boot -- see the `_work` block and
-# refuse_slot below.
-slot_unit_is_active() { # <idx>
-  systemctl is-active --quiet "ci-runner@$1.service"
+# NOT `is-active` alone, and the difference is the bug it would leave. On a warm
+# reboot systemd brings the enabled ci-runner@ units up while this script is
+# still working, so the unit is very often `activating` rather than `active` when
+# the snapshot is taken -- it has an ExecStartPre that runs the boot reset, and
+# it waits on the slot's dockerd. `is-active` is false for `activating`, so the
+# question "is this a warm boot" would answer NO on exactly the hosts where it
+# matters most, and install_slot would take the cold path: recreate `_work` at
+# the name the reset is holding, and later refuse without stopping an agent that
+# finishes activating a moment afterwards.
+#
+# `is-enabled` is the durable half of the answer and the one that cannot race:
+# the unit FILE is written by install_slot, so its presence on disk is precisely
+# "a previous boot got this far". A genuinely cold boot has no such file.
+slot_unit_preexists() { # <idx>
+  systemctl is-enabled --quiet "ci-runner@$1.service" 2>/dev/null && return 0
+  # And the transient half, for the window where the file is being replaced.
+  # Anything that is not settled-off counts as warm, because the cold path is the
+  # destructive one and an uncertain answer must not choose it.
+  case "$(systemctl is-active "ci-runner@$1.service" 2>/dev/null)" in
+    active | activating | reloading | deactivating) return 0 ;;
+  esac
+  return 1
 }
 
 # refuse_slot <idx> <warm> <message> — log why this slot will not serve, take the
@@ -4600,7 +4647,7 @@ install_slot() {
   # this function behaves differently on a warm reboot, and they must all agree
   # about which kind of boot this is.
   local warm=0
-  slot_unit_is_active "$idx" && warm=1
+  slot_unit_preexists "$idx" && warm=1
 
   start_slot_dockerd "$idx" || return 1
 
@@ -4661,7 +4708,7 @@ install_slot() {
   chmod 0750 "$dir"
 
   # Before the token is spent and before GitHub is told this slot is capacity.
-  slot_can_execute "$dir" ||
+  slot_can_execute "$dir" "$RUNNER_HOME" ||
     refuse_slot "$idx" "$warm" "workspace cannot execute; not registering it" ||
     return 1
 
@@ -4707,6 +4754,22 @@ install_slot() {
   # this `--work` and has been using it; `_work` MISSING on a warm host means the
   # reset is holding it, not that it is gone.
   if [ "$warm" = 1 ]; then
+    # Looked at, but never touched. `slot_can_enter` is a read-only `test` run as
+    # the slot user, so it cannot create the name the reset is holding and cannot
+    # be the thing that poisons the slot -- and it still catches the case this
+    # arm would otherwise wave through: a workspace the previous job left at mode
+    # 000, handed back by a reset that restores ownership, with an agent ONLINE
+    # over a directory its own user cannot enter.
+    #
+    # ABSENT is not a failure here. On a warm host `_work` missing means the
+    # reset has renamed it into its holding directory for the moment, which is
+    # the healthy path, not a broken slot -- so only a `_work` that is actually
+    # present is judged.
+    if [ -e "$dir/_work" ] && [ ! -L "$dir/_work" ] &&
+       ! slot_can_enter "$u" "$dir/_work"; then
+      refuse_slot "$idx" "$warm" "$dir/_work exists but $u cannot read, write and enter it, and an agent is already online over it -- every job it claims would fail before its first step"
+      return 1
+    fi
     log "slot $idx: agent already running (warm reboot) -- leaving _work to it and to slot-reset.sh, which may be holding it right now"
   elif [ -L "$dir/_work" ]; then
     refuse_slot "$idx" "$warm" "$dir/_work is a symlink, not a workspace -- not registering it"
@@ -4721,12 +4784,22 @@ install_slot() {
     # mode is whatever the last job left -- a job that ran `chmod 000` on its own
     # workspace, or a tool that did it on the way out, leaves a directory that
     # `mkdir -p` reports success for and root's `-d` accepts, and that the slot
-    # user cannot enter. Healed first, because the mode is ours to set and the
-    # directory is ours to own, and only then refused.
-    if ! slot_can_enter "$u" "$dir/_work"; then
-      chown "$u:$u" "$dir/_work" 2>>/var/log/ci-host.log || true
-      chmod 0755 "$dir/_work" 2>>/var/log/ci-host.log || true
-    fi
+    # user cannot enter.
+    #
+    # REFUSED, NOT HEALED, and that is a deliberate reversal. `$dir` is chowned
+    # to the slot user above -- config.sh writes .runner and .credentials there
+    # -- so every name under it is one an untrusted account controls, and a root
+    # `chown`/`chmod` on such a name follows whatever it points at by the time
+    # the syscall runs. The `-L` test above cannot close that: it is a separate
+    # syscall, and the slot may swap the name between the two. That is the same
+    # namespace-ownership rule slot-reset.sh states -- root operates on a leaf
+    # inside a directory ROOT owns, never inside one the slot owns -- and the
+    # only way to keep it here is not to write at all.
+    #
+    # Nothing is lost by refusing. The mode the heal was for is restored at its
+    # source: slot-reset.sh sets it when it hands `_work` back, from inside its
+    # own root-owned holding directory, where there is no name for a slot to
+    # swap. A read-only `test` is all this needs to be.
     if ! slot_can_enter "$u" "$dir/_work"; then
       refuse_slot "$idx" "$warm" "$dir/_work exists but $u cannot read, write and enter it -- every job would fail before its first step"
       return 1
