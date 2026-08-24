@@ -125,7 +125,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
 ( PG=35100 ADDR=10.0.0.7 run_resolve shared
   ok "shared: exits 0" "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
   ok "shared: url names addr and the band port" \
-     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app' ] && echo 1 || echo 0)"
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app?sslmode=disable' ] && echo 1 || echo 0)"
   ok "shared: reports shared=1" "$([ "$(got "$OUT" shared)" = 1 ] && echo 1 || echo 0)"
   ok "shared: starts no container" "$([ ! -s "$CALLS" ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.shared" ) || true
@@ -134,7 +134,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
 # rather than emitting `postgres://ci@:35100/app`.
 ( PG=35100 ADDR='' run_resolve sharednoaddr
   ok "shared without addr: falls back to loopback" \
-     "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:35100/app' ] && echo 1 || echo 0)"
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:35100/app?sslmode=disable' ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharednoaddr" ) || true
 
 # The slot that OWNS the stack must use loopback on a host that has not yet been
@@ -145,7 +145,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
 ( PG=35100 ADDR=10.0.0.7 CI_SHARED_INFRA_PORT_MIN=35100 CI_SHARED_INFRA_PORT_MAX=35199 \
     run_resolve sharedown
   ok "shared on the anchor's own slot: uses loopback, not addr" \
-     "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:35100/app' ] && echo 1 || echo 0)"
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:35100/app?sslmode=disable' ] && echo 1 || echo 0)"
   ok "shared on the anchor's own slot: still reports shared=1" \
      "$([ "$(got "$OUT" shared)" = 1 ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharedown" ) || true
@@ -156,7 +156,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
 ( PG=35100 ADDR=10.0.0.7 CI_SHARED_INFRA_PORT_MIN=35200 CI_SHARED_INFRA_PORT_MAX=35299 \
     SS_BUSY="35100 22" run_resolve sharedsibling
   ok "shared from a sibling slot: keeps addr even with the same port listening" \
-     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app' ] && echo 1 || echo 0)"
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app?sslmode=disable' ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharedsibling" ) || true
 
 # No band in the environment is the GitHub-hosted runner and the `container:`
@@ -166,7 +166,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
 # container itself.
 ( PG=35100 ADDR=10.0.0.7 run_resolve sharednoband
   ok "shared with no band in the environment: keeps addr" \
-     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app' ] && echo 1 || echo 0)"
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app?sslmode=disable' ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharednoband" ) || true
 
 # A malformed band must not crash the action or silently mean "ours".
@@ -174,7 +174,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
     run_resolve sharedbadband
   ok "shared with a non-numeric band: exits 0" "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
   ok "shared with a non-numeric band: keeps addr" \
-     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app' ] && echo 1 || echo 0)"
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app?sslmode=disable' ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharedbadband" ) || true
 
 # ---------------------------------------------------------------------------
@@ -185,7 +185,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
   ok "fallback: publishes the drawn port explicitly, never '127.0.0.1::5432'" \
      "$(grep -q -- '127\.0\.0\.1:24001:5432' "$CALLS" && ! grep -q -- '127\.0\.0\.1::5432' "$CALLS" && echo 1 || echo 0)"
   ok "fallback: url carries the drawn port" \
-     "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:24001/app' ] && echo 1 || echo 0)"
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:24001/app?sslmode=disable' ] && echo 1 || echo 0)"
   ok "fallback: reports shared=0" "$([ "$(got "$OUT" shared)" = 0 ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.draw" ) || true
 
@@ -203,7 +203,7 @@ got() { sed -n "s/^$2=//p" "$1"; }
   ok "refused bind: the refused port is blacklisted, not redrawn" \
      "$([ "$(grep -c -- '127\.0\.0\.1:24001:5432' "$CALLS")" -eq 1 ] && echo 1 || echo 0)"
   ok "refused bind: the url names the port that bound" \
-     "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:24002/app' ] && echo 1 || echo 0)"
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:24002/app?sslmode=disable' ] && echo 1 || echo 0)"
   ok "refused bind: the leftover container is removed before the next attempt" \
      "$(grep -q '^rm --force ' "$CALLS" && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.refuse" ) || true
@@ -240,6 +240,29 @@ got() { sed -n "s/^$2=//p" "$1"; }
   ok "no password: trust, and no credential in the url" \
      "$(grep -q 'POSTGRES_HOST_AUTH_METHOD=trust' "$CALLS" && grep -q '^url=postgres://ci@' "$OUT" && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.trust" ) || true
+
+# ---------------------------------------------------------------------------
+# The URL says the server has no TLS, because nothing else can.
+#
+# Asserted on BOTH branches and asserted ONCE: an adopter that also appends the
+# parameter would get `…/app?sslmode=disable?sslmode=disable`, which is not a
+# parseable query, so "appears at all" is not the property that matters. The
+# count check is what would catch a later edit that adds it at a call site as
+# well as in `publish` (#386).
+# ---------------------------------------------------------------------------
+( PG=35100 ADDR=10.0.0.7 run_resolve sslshared
+  ok "shared: the url declares sslmode=disable" \
+     "$(case "$(got "$OUT" url)" in *'?sslmode=disable') echo 1 ;; *) echo 0 ;; esac)"
+  ok "shared: it appears exactly once" \
+     "$([ "$(got "$OUT" url | grep -o 'sslmode=disable' | wc -l)" -eq 1 ] && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sslshared" ) || true
+
+( PG='' PG_PORT_CANDIDATES="24001" run_resolve sslfallback
+  ok "fallback: the url declares sslmode=disable too" \
+     "$(case "$(got "$OUT" url)" in *'?sslmode=disable') echo 1 ;; *) echo 0 ;; esac)"
+  ok "fallback: it appears exactly once" \
+     "$([ "$(got "$OUT" url | grep -o 'sslmode=disable' | wc -l)" -eq 1 ] && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sslfallback" ) || true
 
 # A Windows leg has no container runtime, so the fallback is not available to
 # it — it must fail on that sentence rather than on `docker: command not found`.

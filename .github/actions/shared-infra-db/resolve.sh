@@ -29,9 +29,30 @@ retry_sleep="${PG_RETRY_SLEEP:-3}"
 poll_sleep="${PG_POLL_SLEEP:-1}"
 candidates="${PG_PORT_CANDIDATES:-}"
 
-publish() { # <url> <port> <shared>
+# `?sslmode=disable`, on BOTH branches, appended here rather than at either call
+# site so the two cannot drift apart.
+#
+# The server runs with no TLS on either branch — the anchor's compose is the
+# stock `postgres` image, and so is the fallback's `docker run` — and the URL is
+# the only thing a consumer receives. Nothing in
+# `postgres://ci@10.0.0.7:35100/app` says the handshake will be refused, so
+# every adopter rediscovers it, and the rediscovery is expensive because the
+# symptom is rarely a message about TLS. DataRetrival hit it twice on one pull
+# request chain: once as "The server does not support SSL connections"
+# (DataRetrival#2487) and once, from the same handshake at a second consumer,
+# as `KnexTimeoutError: Timeout acquiring a connection` after 30 seconds
+# (DataRetrival#2491) — which reads as pool exhaustion and was investigated as
+# one.
+#
+# libpq's own spelling, understood by `pg-connection-string` and therefore by
+# node-postgres, so this is the action stating a fact only the action holds
+# rather than a private convention. An adopter that already appends the
+# parameter itself must stop when it re-pins: two of them concatenate into
+# `…/app?sslmode=disable?sslmode=disable`, which is not a parseable query
+# (#386).
+publish() { # <base-url> <port> <shared>
   {
-    printf 'url=%s\n' "$1"
+    printf 'url=%s?sslmode=disable\n' "$1"
     printf 'port=%s\n' "$2"
     printf 'shared=%s\n' "$3"
   } >> "$GITHUB_OUTPUT"
