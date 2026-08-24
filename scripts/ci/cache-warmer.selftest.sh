@@ -407,6 +407,14 @@ passes_scan_allowlist() { # <file>
   # that worked.
   matches "$code" 'scan_allow_required' || return 1
   matches "$code" 'exit 1' || return 1
+  # Captured in the staging step, which runs before the install — and the
+  # publisher reads the CAPTURE, never the live checkout. The build step runs the
+  # repository's lifecycle scripts and can write to /workspace, so an allowlist
+  # re-read there could be rewritten alongside the archive it excuses, and the
+  # credentialed phase would re-scan forged content against a forged allowlist.
+  matches "$code" '\$\{local\.stage_scan_allow\}' || return 1
+  matches "$code" "cp '\\\$\{local\.scan_allow_path\}' '\\\$\{local\.scan_allow_staged\}'" || return 1
+  matches "$code" "CACHE_SCAN_ALLOW_FILE='\\\$\{local\.scan_allow_staged\}'" || return 1
   # In the wrapper, and therefore in BOTH steps that run the publisher.
   matches "$code" '\$\{local\.ensure_scan_allow\}.*exec \$\{local\.staged_dir\}/publish-cache-snapshot\.sh'
 }
@@ -468,6 +476,14 @@ mutate "Alpine given the library instead of the scanner" "$MAIN" \
 
 mutate "the allowlist dropped from the publishing wrapper" "$MAIN" \
   's@\${local\.ensure_scan_allow}exec@exec@' \
+  passes_scan_allowlist
+
+mutate "the allowlist read back from the live checkout" "$MAIN" \
+  "s@CACHE_SCAN_ALLOW_FILE='\\\${local\.scan_allow_staged}'@CACHE_SCAN_ALLOW_FILE='\${local.scan_allow_path}'@" \
+  passes_scan_allowlist
+
+mutate "the allowlist no longer captured before the install" "$MAIN" \
+  's@^ *\${local\.stage_scan_allow}$@@' \
   passes_scan_allowlist
 
 mutate "a missing named allowlist made silent instead of fatal" "$MAIN" \
