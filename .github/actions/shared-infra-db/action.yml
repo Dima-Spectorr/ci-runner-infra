@@ -93,9 +93,11 @@ inputs:
       consumer on any OTHER slot dials, and what the Windows leg dials.
       `127.0.0.1` is wrong from a sibling slot: each slot has its own network
       namespace, so loopback there is the slot, not the host. In the slot that
-      OWNS the stack the reverse holds — the band port is DNAT'd in
-      `PREROUTING`, which a locally generated packet never traverses — and
-      `resolve.sh` detects that case and swaps back to loopback on its own. The
+      OWNS the stack the reverse holds on a host that predates the hairpin SNAT:
+      the band DNAT rewrites the destination to the address the packet came
+      from, so the reply never returns through the host's conntrack and the dial
+      hangs. `resolve.sh` swaps back to loopback when `pg` is inside this slot's
+      own band, which is how it recognises that case without a probe. The
       anchor publishes `addr` and `pg` together, so an empty `addr` beside a
       non-empty `pg` should not happen; the loopback branch below is a guard,
       not a mode.

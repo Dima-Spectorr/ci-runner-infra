@@ -51,38 +51,59 @@ if [ -n "$PG" ]; then
   host="127.0.0.1"
   [ -z "$ADDR" ] || host="$ADDR"
 
-  # EXCEPT IN THE SLOT THAT OWNS THE STACK, where the host address is the one
-  # address that does NOT work. The band port is DNAT'd host→slot in
-  # PREROUTING, and PREROUTING is not on the path of a locally generated
-  # packet: a connection opened from inside the owning slot to
-  # `<host-vpc-ip>:<band-port>` takes OUTPUT, is never translated, finds
-  # nothing listening on the host itself, and is refused. Every sibling slot
-  # connects to the same string fine, so this reads as flaky rather than
-  # broken — it bites only the roughly one consumer job in four that lands on
-  # the anchor's own slot.
+  # EXCEPT IN THE SLOT THAT OWNS THE STACK, on a host that has not yet been
+  # rolled onto the hairpin SNAT.
+  #
+  # The band port is DNAT'd host→slot in PREROUTING, and a packet from inside a
+  # slot does reach PREROUTING: it leaves over the veth and is forwarded, not
+  # locally generated. The owning slot is special on the way BACK — the DNAT
+  # rewrites the destination to the address the packet came from, so source and
+  # destination are equal, the reply never returns through the host's conntrack
+  # to be un-DNAT'd, and the connection hangs until the client's own timeout.
+  # Every sibling slot connects to the same string fine, so this reads as flaky
+  # rather than broken: it bites only the roughly one consumer job in four that
+  # lands on the anchor's own slot.
   #
   # Measured in DataRetrival run 32755968066: anchor on slot 3,
   # `migration-harness-run` on slot 4 connected at 17:22:41,
   # `integration-tests` on slot 3 timed out against the identical URL. Knex
-  # reports the refusal as `KnexTimeoutError: Timeout acquiring a connection`
-  # 30 seconds later, which is why it was first read as TLS.
+  # reports it as `KnexTimeoutError: Timeout acquiring a connection` 30 seconds
+  # later, which is why it was first read as TLS.
   #
-  # A listener on the band port INSIDE this namespace means the stack is ours —
-  # rootless Docker publishes into the slot's own netns, so a sibling sees
-  # nothing here. `-l`, not the fallback's bare `-tan`: an established outbound
-  # connection whose local port happens to be $PG would otherwise look like a
-  # listener. Guarded on Linux and on `ss` existing so the Windows leg of rule
-  # 3, which is a string concatenation and nothing else, is untouched — and a
+  # `host-startup.sh` now SNATs that hairpin, which fixes it for every consumer
+  # — including the ones this action cannot help, a `container:` job among them
+  # (see below). This branch is what covers the hosts still running the old
+  # boot script, and it stays after they roll because it costs a string
+  # comparison.
+  #
+  # THE TEST IS THE BAND, not a listener. Each slot is told its own band at boot
+  # (`CI_SHARED_INFRA_PORT_MIN`/`MAX`, disjoint per slot) and the anchor draws
+  # the stack's port from the band of the slot it ran on, so `$PG` falling in
+  # THIS slot's band means this slot is the anchor's. A listener probe was the
+  # first attempt and is not sound: identical fixed ports are explicitly
+  # allowed across the slot namespaces, so a sibling that happens to publish a
+  # service on the same number would be sent to loopback and reach its own
+  # service instead of the stack.
+  #
+  # Absent variables mean "not a fleet slot, or not visible from here" and are
+  # not an error — a GitHub-hosted runner, and a `container:` job, whose steps
+  # do not inherit the runner service's environment. Those keep `$ADDR`, which
+  # is correct everywhere except the un-rolled owning-slot case. The Windows leg
+  # of rule 3 is untouched: it is a string concatenation and nothing else, and a
   # Windows job is never the owning slot anyway, the anchor's compose being
   # Linux.
-  if [ "$host" != "127.0.0.1" ] && [ "${RUNNER_OS:-Linux}" = "Linux" ] && command -v ss >/dev/null 2>&1; then
-    listening="$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -u || true)"
-    case $'\n'"$listening"$'\n' in
-      *$'\n'"$PG"$'\n'*)
-        host="127.0.0.1"
-        echo "::notice::the shared stack is published in THIS slot — using loopback, because ${ADDR}:${PG} is DNAT'd in PREROUTING and a packet from inside the slot never reaches it"
-        ;;
-    esac
+  own_band=0
+  case "${PG}:${CI_SHARED_INFRA_PORT_MIN:-}:${CI_SHARED_INFRA_PORT_MAX:-}" in
+    *[!0-9:]* | *::* | :* | *:) : ;;
+    *)
+      if [ "$PG" -ge "$CI_SHARED_INFRA_PORT_MIN" ] && [ "$PG" -le "$CI_SHARED_INFRA_PORT_MAX" ]; then
+        own_band=1
+      fi
+      ;;
+  esac
+  if [ "$host" != "127.0.0.1" ] && [ "$own_band" = 1 ]; then
+    host="127.0.0.1"
+    echo "::notice::the shared stack is published in THIS slot (${PG} is in this slot's band ${CI_SHARED_INFRA_PORT_MIN}-${CI_SHARED_INFRA_PORT_MAX}) — using loopback, because ${ADDR}:${PG} hairpins back to this namespace and only works from a sibling"
   fi
 
   publish "postgres://${auth}@${host}:${PG}/${DB_NAME}" "$PG" 1
