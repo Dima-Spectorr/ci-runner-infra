@@ -792,7 +792,7 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <ssh-out>
   # runs the unreadable case against `command not found` rather than against the
   # classifier -- the answer comes out the same way for the wrong reason, and the
   # one branch this gate exists to hold would be unfalsifiable.
-  code=$(printf '%s\n%s\n%s\n%s\n%s\n' \
+  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$(fn host_age_seconds)" "$(fn instance_host_os)" \
     "$(fn guest_attributes_denied)" "$(fn note_guest_attributes_denied)" \
     "$(fn beacon_gate)" "$(fn drain_host)")

@@ -166,6 +166,8 @@ batching_holds() {
     REPO_FULL=test-owner/test-repo POOL=test-pool
     # shellcheck disable=SC2034
     METRIC_PREFIX=custom.googleapis.com/ci
+    # Called only from the sourced file, so SC2317 again.
+    # shellcheck disable=SC2317
     log() { :; }
 
     # Shadows the binary for the whole subshell. The token call and the POST are
