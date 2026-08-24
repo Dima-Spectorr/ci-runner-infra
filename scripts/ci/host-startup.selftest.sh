@@ -1329,6 +1329,149 @@ else
   bad "one of the scripts this boot script writes does not parse — every text check above still passes, and the failure first appears as a host that silently will not pin, or will not sweep"
 fi
 
+# --- a slot may not be advertised as capacity it cannot execute ---------------
+#
+# Registration is the claim "this slot can run a job", and for a long time the
+# only thing behind it was that config.sh exited 0. On 2026-08-23 the Apigee
+# pool came back from a recovery apply with eight agents ONLINE and every
+# self-hosted job failing at actions/checkout with
+# `'/opt/ci/slots/1/externals/node24/bin/node' ... No such file or directory`,
+# across three hosts and every slot on them. Each of those jobs was CLAIMED and
+# burned, so the pool turned every required check red faster than a healthy pool
+# could have turned them green.
+#
+# The predicate is not a text match, because a text match cannot tell a check
+# that works from one that always says yes. `slot_can_execute` is a pure
+# function of a directory, so it is extracted and RUN against planted trees.
+extract_fn() { # <file> <name>
+  awk -v n="$2" '
+    $0 ~ "^" n "\\(\\) \\{" { on = 1 }
+    on { print }
+    on && $0 == "}" { exit }
+  ' "$1"
+}
+
+slot_can_execute_behaves() { # <file>
+  local body root rc=0
+  body=$(extract_fn "$1" slot_can_execute)
+  # An empty extraction is a renamed or deleted function, and an empty body
+  # would define nothing and fail every case — which reads as a passing gate for
+  # the wrong reason. Refuse it explicitly.
+  case "$body" in
+    *'externals/node'*) : ;;
+    *) return 1 ;;
+  esac
+
+  root=$(mktemp -d)
+
+  # THE WHOLE RULE IS `-x`, SO A FILESYSTEM WITH NO EXECUTE BIT CANNOT TEST IT.
+  # Every case below is built by `chmod +x` on a file, and on a Windows working
+  # copy that chmod succeeds and changes nothing: the complete tree then fails
+  # alongside the broken ones and the suite reports a defect in a check that is
+  # fine. Rather than assert less, prove the fixture is buildable first and say
+  # so plainly when it is not. CI runs this on Linux, which is where the
+  # assertion has to hold.
+  : >"$root/.probe"
+  chmod +x "$root/.probe" 2>/dev/null
+  if [ ! -x "$root/.probe" ]; then
+    echo "SKIP: slot_can_execute behaviour — this filesystem does not carry an execute bit, so the fixtures cannot be built (runs in CI)" >&2
+    rm -rf "$root"
+    return 0
+  fi
+
+  # Under `bash -c` so a `return 1` inside the extracted function cannot end
+  # this harness, and with `log` stubbed to nothing: the real one writes to
+  # /var/log and is not what is under test.
+  probe() { # <dir> -> exit status of slot_can_execute
+    bash -c 'log() { :; }
+'"$body"'
+slot_can_execute "$1"' _ "$1" >/dev/null 2>&1
+  }
+
+  # A complete tree, exactly as the golden image unpacks it.
+  mkdir -p "$root/good/externals/node24/bin"
+  : >"$root/good/run.sh";    chmod +x "$root/good/run.sh"
+  : >"$root/good/config.sh"; chmod +x "$root/good/config.sh"
+  : >"$root/good/externals/node24/bin/node"
+  chmod +x "$root/good/externals/node24/bin/node"
+  probe "$root/good" || rc=1
+
+  # The same tree with the runtime's major version bumped. This must still
+  # pass: the bundled node moves with the agent version the image pins, and a
+  # check that named node24 would go quiet — passing on the absence it exists to
+  # catch — the first time that happens.
+  cp -a "$root/good" "$root/next"
+  mv "$root/next/externals/node24" "$root/next/externals/node26"
+  probe "$root/next" || rc=1
+
+  # The 2026-08-23 tree: externals never unpacked.
+  cp -a "$root/good" "$root/nonode"
+  rm -rf "$root/nonode/externals"
+  probe "$root/nonode" && rc=1
+
+  # Present but not executable — a copy that lost the mode bits looks complete
+  # to `-e` and cannot start a process.
+  cp -a "$root/good" "$root/noexec"
+  chmod -x "$root/noexec/externals/node24/bin/node"
+  probe "$root/noexec" && rc=1
+
+  # A half-finished copy of the agent itself.
+  cp -a "$root/good" "$root/norun"
+  rm -f "$root/norun/run.sh"
+  probe "$root/norun" && rc=1
+
+  cp -a "$root/good" "$root/noconf"
+  rm -f "$root/noconf/config.sh"
+  probe "$root/noconf" && rc=1
+
+  # Nothing there at all.
+  probe "$root/absent" && rc=1
+
+  rm -rf "$root"
+  [ "$rc" = 0 ]
+}
+
+# Running correctly is worth nothing if nobody calls it, or if it is called
+# after the token has been spent and GitHub already told this slot is capacity.
+# Both halves are structural, and both name the order.
+registration_is_gated() { # <file>
+  local code
+  code=$(joined_code_of "$1")
+  matches "$code" 'slot_can_execute "\$dir"[[:space:]]*\|\|' || return 1
+  # The copy that fills that directory is checked too: a `cp -a` that runs out
+  # of disk half way leaves a workspace that looks present and cannot run.
+  matches "$code" 'cp -a "\$RUNNER_HOME/\." "\$dir/"[[:space:]]*\|\|' || return 1
+  # And the workspace the agent launches every job in. A `_work` replaced by a
+  # symlink is refused rather than healed; anything else is created, so this
+  # gate does not depend on whether the pinned agent version materialises
+  # `--work` at configure time.
+  matches "$code" '\[ -L "\$dir/_work" \]' || return 1
+  matches "$code" 'mkdir -p "\$dir/_work"' || return 1
+  # EVERY gate must sit BEFORE config.sh, or the token is spent and the runner is
+  # registered before anyone asks whether it can run. `_work` is checked here by
+  # name and not only as part of the group: it is the one that was written after
+  # the call first, and a gate that fires after a successful `configure` leaves a
+  # runner registered with GitHub and no service to run it.
+  local n_gate n_work n_config
+  n_gate=$(grep -n 'slot_can_execute "\$dir"' "$1" | head -1 | cut -d: -f1)
+  n_work=$(grep -n '\[ -L "\$dir/_work" \]' "$1" | head -1 | cut -d: -f1)
+  n_config=$(grep -n '\$dir/config\.sh" \\' "$1" | head -1 | cut -d: -f1)
+  [ -n "$n_gate" ] && [ -n "$n_work" ] && [ -n "$n_config" ] &&
+    [ "$n_gate" -lt "$n_config" ] && [ "$n_work" -lt "$n_config" ]
+}
+
+if slot_can_execute_behaves "$SCRIPT"; then
+  ok
+else
+  bad "the slot-executability check does not actually judge a workspace — it passes a tree with no externals, or fails a complete one, so registration goes on advertising slots that fail every job at their first step (issue #282)"
+fi
+
+if registration_is_gated "$SCRIPT"; then
+  ok
+else
+  bad "a slot registers with GitHub without anything asserting it can start a process — the Apigee pool showed eight agents online while every job failed at actions/checkout, which is worse than the outage it replaced because queued runs are honest and red required checks are not (issue #282)"
+fi
+
 # --- the remote build cache, whose every failure is silent --------------------
 #
 # This layer has no loud failure mode at all. A slot pointed at a dead server, a
