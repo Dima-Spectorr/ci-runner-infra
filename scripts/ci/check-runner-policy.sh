@@ -31,6 +31,8 @@
 #              requester cannot forge, not by the branch name alone.
 #     RUNNER13 and the two pools it routes between carry disjoint scope labels,
 #              so neither can be scheduled onto the other's hosts.
+#     RUNNER14 and, in a repository that HAS such a route, no pull-request job
+#              names its pool literally and so sits out the route entirely.
 #
 #   And, behind `--shared-infra`, the three that make a pull request use ONE
 #   host and ONE copy of its infrastructure (docs/adr-pr-host-affinity.md):
@@ -131,6 +133,31 @@
 #   the fleet's own consumers must disable. A `windows-2022` hosted image is not
 #   this fleet either, and it does run containers. Only a fleet-reachable job
 #   naming the `windows` platform label is refused.
+#
+# WHY RUNNER14 IS THE HALF RUNNER12/13 DO NOT COVER
+#   Those two judge the route a job WRITES. Neither of them can see the job that
+#   writes no route at all, and that is the job the whole two-pool split is
+#   defeated by: a repository stands up a merge-queue pool, moves its main
+#   pull-request workflow onto the route, and leaves one small required workflow
+#   naming the pull-request pool the way it always did. Nothing is red. The
+#   route works. The one workflow that stayed behind is then, on every
+#   speculative `mergify/merge-queue/<sha>` draft, queueing against the pool
+#   that is full of the pull requests waiting for that very queue to drain —
+#   while the merge-queue pool it was supposed to use sits with free slots.
+#
+#   Measured on IntegrateIT, 2026-08-23: `generic-binary-check.yml` kept
+#   `runs-on: [self-hosted, linux, gcp, IntegrateIT]` after `pr-check.yml`
+#   adopted the lane route, and on pull request #11307 its 65-SECOND job waited
+#   31m06s for a runner. Mergify reports that as "waiting for generic-binary",
+#   which reads as a check that is still running rather than a check that cannot
+#   start, so the pull request looks busy for as long as it takes.
+#
+#   The rule is therefore cross-file and self-configuring, in the shape RUNNER10
+#   already established: if ANY job in the file set routes on the merge-queue
+#   branch prefix, the repository HAS two pools, and from that point a
+#   fleet-reachable job in a pull-request workflow that names its pool literally
+#   is a job that will run on the wrong one. No flag turns this on — a
+#   repository with no route never mentions the prefix and is never asked.
 #
 # WHY REACHABILITY CROSSES A LOCAL `uses:` CALL
 #   A `pull_request` workflow that calls `./.github/workflows/build.yml` runs
@@ -260,6 +287,8 @@ ensure_yaml() {
 #                                    live in this repository
 #   #QUEUEAUTHOR\t<id>\t<origin>     ...and also requires the author to be
 #                                    Mergify
+#   #QUEUESKIP\t<id>                 the job's `if:` cannot be true on a
+#                                    merge-queue draft, so it takes no route
 #   #ROUTEARM\t<id>\t<origin>\t<hosted|pool>\t<labels>  one comma-joined JSON
 #                                    label set that expression can resolve to
 read_workflow() {
@@ -457,15 +486,24 @@ def split_top_level(expr, operator):
     return parts
 
 
-def condition_excludes(expr):
-    """True when `expr` cannot be true for a fork, read as a Boolean tree.
+def condition_excludes(expr, leaf=None):
+    """True when `expr` cannot be true for whatever `leaf` excludes, read as a
+    Boolean tree. `leaf` decides WHAT is excluded and defaults to the fork test,
+    which is the caller this was written for; the walk itself knows nothing
+    about forks.
 
     A substring search is not enough. `always() || …fork == false` contains the
     exclusion and runs for forks anyway, because the OTHER disjunct does not
     care — so for `||` EVERY alternative has to exclude, while for `&&` ONE
-    conjunct excluding is enough to make the whole condition false for a fork.
-    Anything left after that is a leaf, and a leaf counts only if it matches a
+    conjunct excluding is enough to make the whole condition false. Anything
+    left after that is a leaf, and a leaf counts only if it matches a
     recognised exclusion shape outright.
+
+    The TREE is the part
+    that is hard to get right and it is identical for any "this condition
+    cannot be true for X" question, so RUNNER14 asks its own question — does
+    this job sit out the merge-queue drafts — through this same walk rather
+    than through a second copy of it that drifts.
     """
     expr = expr.strip()
     while expr.startswith("(") and expr.endswith(")"):
@@ -487,11 +525,11 @@ def condition_excludes(expr):
 
     ors = split_top_level(expr, "||")
     if len(ors) > 1:
-        return all(condition_excludes(part) for part in ors)
+        return all(condition_excludes(part, leaf) for part in ors)
     ands = split_top_level(expr, "&&")
     if len(ands) > 1:
-        return any(condition_excludes(part) for part in ands)
-    return bool(IF_EXCLUDES.search(expr))
+        return any(condition_excludes(part, leaf) for part in ands)
+    return bool((leaf or IF_EXCLUDES.search)(expr))
 
 
 def fork_guarded(job):
@@ -521,6 +559,28 @@ def fork_guarded(job):
 QUEUE_BRANCH = re.compile(r"mergify/merge-queue/")
 QUEUE_SAME_REPO = re.compile(r"head\.repo\.full_name\s*==\s*github\.repository")
 QUEUE_AUTHOR = re.compile(r"""user\.login\s*==\s*(['"])mergify\[bot\]\1""")
+
+# RUNNER14's one legitimate way out without a marker: a job that does not RUN
+# on a merge-queue draft has no route to take, and asking it to resolve a pool
+# it will never claim would be a finding nobody can act on. Deliberately narrow
+# -- the two readable spellings of "not a queue draft" and nothing inferred --
+# because the two error directions are not symmetric here either: an
+# unrecognised-but-correct skip costs one declared exemption, where an
+# over-eager reading silently excuses the job the whole rule is about.
+QUEUE_SKIP = re.compile(
+    r"!\s*startsWith\(\s*github\.head_ref\s*,\s*(['\"])mergify/merge-queue/\1\s*\)"
+    r"|startsWith\(\s*github\.head_ref\s*,\s*(['\"])mergify/merge-queue/\2\s*\)"
+    r"\s*==\s*false"
+)
+
+
+def queue_skipped(job):
+    """True when this job cannot run on a `mergify/merge-queue/<sha>` draft."""
+    condition = job.get("if")
+    return isinstance(condition, str) and condition_excludes(
+        condition, QUEUE_SKIP.search
+    )
+
 
 # A single-quoted JSON array inside an expression -- the label set one arm of
 # the route resolves to. `runs-on` needs a list and an expression yields a
@@ -675,6 +735,13 @@ for job_id, job in jobs.items():
             out("#CONTAINER", vid)
         if "services" in job:
             out("#SERVICES", vid)
+
+        # A job that cannot be true on a `mergify/merge-queue/<sha>` draft never
+        # competes for a pool during queue validation, so RUNNER14 has nothing to
+        # ask of it. Emitted per leg like the rest: the `if:` is the JOB's, and a
+        # matrix does not change whether the queue drafts reach it.
+        if queue_skipped(job):
+            out("#QUEUESKIP", vid)
 
         # A job that publishes outputs is a CANDIDATE anchor — not an anchor.
         # What makes it one is another job resolving its pool from those
@@ -847,6 +914,20 @@ SHARED_INFRA=0
 # this rule exists to catch, and the shape a per-file count reads as clean.
 SHARED_INFRA_OWNERS=""
 
+# RUNNER14, and cross-file for a reason RUNNER10's is not: the two halves of
+# this finding are usually in DIFFERENT files. The route lives in the workflow
+# that was migrated and the literal pool lives in the one that was not, so a
+# per-file reading of either half is clean. Whether the repository has a route
+# at all also cannot be known until every file has been read, and the file that
+# has it may be read last — so the candidates are collected here and judged
+# once, at the end, rather than reported as they are found.
+QUEUE_ROUTED=0
+# `<abs file>\t<job id>\t<labels>` per line, one per fleet job that named its
+# pool literally in a pull-request workflow. The absolute path is carried
+# because the exemption marker is read back out of the file at verdict time,
+# long after `check_file` has returned.
+QUEUE_UNROUTED=""
+
 # Every LOCAL `uses:` edge the file set contains, as
 # `<callee abs path>	<caller abs path>	<caller job id>`. Filled by
 # `compute_reachable`, which already walks these edges for fork reachability.
@@ -980,6 +1061,22 @@ dynamic_runner_declared() {
   # place to be revisited. The trailing `[^[:space:]]` refuses `(...): ` with
   # nothing after it — a waiver wearing the shape of a declaration.
   grep -Eq "^[[:space:]]*#.*dynamic-runner-allowed\([[:space:]]*${esc}[[:space:]]*,[[:space:]]*#[0-9]+[[:space:]]*\):[[:space:]]*[^[:space:]]" <(comment_view "$file")
+}
+
+# RUNNER14's escape hatch, in the same shape as every other marker here:
+#
+#   # merge-queue-route-exempt(<job-id>, #<issue>): <why this job stays behind>
+#
+# There are real reasons for one. A job whose whole purpose is to observe the
+# pull-request pool belongs on the pull-request pool; so does one the queue pool
+# is deliberately not sized for. What there is no reason for is the job that
+# stayed behind because nobody noticed it, and that job and this one are
+# indistinguishable in the YAML — which is what the marker is for. It records
+# WHICH of the two this is, beside the job, with an issue to revisit it.
+merge_queue_route_declared() {
+  local file="$1" job="$2" esc
+  esc="$(re_quote "$job")"
+  grep -Eq "^[[:space:]]*#.*merge-queue-route-exempt\([[:space:]]*${esc}[[:space:]]*,[[:space:]]*#[0-9]+[[:space:]]*\):[[:space:]]*[^[:space:]]" <(comment_view "$file")
 }
 
 remote_call_declared() {
@@ -1237,6 +1334,32 @@ EOF
 $(printf '%s\n' "$records" | sed -n "s/^#QUEUEREF\t${job_re}\t//p" | sort -u)
 EOF
 
+    # --- RUNNER14: the job that takes no route -------------------------------
+    #
+    # Two facts, both collected here and neither judged here: does this
+    # repository route at all, and which of its pull-request jobs named a pool
+    # instead. The verdict needs both and cannot have them until the last file
+    # has been read -- see `QUEUE_ROUTED`.
+    local job_routes=0
+    [ "$(printf '%s\n' "$records" | grep -c "^#QUEUEREF	${job_re}	")" -gt 0 ] && job_routes=1
+    [ "$job_routes" -eq 1 ] && QUEUE_ROUTED=1
+
+    if [ "$self_hosted" -eq 1 ] && [ "$has_pr_any" -eq 1 ] &&
+      [ "$has_expr" -eq 0 ] && [ "$has_group" -eq 0 ] && [ "$reusable" -eq 0 ] &&
+      [ "$job_routes" -eq 0 ] &&
+      [ "$(printf '%s\n' "$records" | grep -c "^#QUEUESKIP	${job_re}$")" -eq 0 ]; then
+      # A `uses:` job is excluded because it names no pool -- its callee does,
+      # and the callee is judged in its own file, carrying this file's
+      # pull-request reachability with it. An EXPRESSION is excluded for the
+      # opposite reason: it may well be the route, and where it is not, RUNNER5
+      # already reports it as a pool this gate cannot read. Adding a second
+      # verdict on the same undecidable value would be this rule guessing.
+      #
+      # The job that publishes the route is excluded too, and has to be: it runs
+      # BEFORE the route it computes exists, so a pool is the only thing it can
+      # name. Nothing is lost -- RUNNER12/13 judge that job in full.
+      QUEUE_UNROUTED="${QUEUE_UNROUTED}$(abs_path "$file")	${job_base}	$(printf '%s' "$labels" | tr '\n' ' ')"$'\n'
+    fi
 
       # --- RUNNER9/10/11: one host, one stack, per pull request ---------------
       #
@@ -3057,6 +3180,188 @@ jobs:
     timeout-minutes: 30
     steps: [{run: \"true\"}]"
 
+  # --- RUNNER14 fixtures: the job that took no route --------------------------
+  #
+  # A PAIR, always, because that is the shape the rule exists for: the route is
+  # in the workflow somebody migrated and the literal pool is in the one they
+  # did not, and each file read alone is clean. The pair is also what proves the
+  # verdict does not depend on the order -- `expect_mq_pair` is called with the
+  # route second as often as first.
+  expect_mq_pair() {
+    local name="$1" want="$2" a_body="$3" b_body="$4"
+    local got out_text
+    printf '%s\n' "$a_body" > "$tmp/mq_a.yml"
+    printf '%s\n' "$b_body" > "$tmp/mq_b.yml"
+    out_text="$(fail=0; ALLOW_DYNAMIC=1; QUEUE_ROUTED=0; QUEUE_UNROUTED=""
+      check_file "$tmp/mq_a.yml" "" blocked
+      check_file "$tmp/mq_b.yml" "" blocked
+      merge_queue_route_verdict 2>&1)"
+    got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr '\n' ' ')"
+    got="$(printf '%s' "$got" | sed 's/ *$//')"
+    if [ "$got" != "$want" ]; then
+      echo "FAIL $name: want ids [$want], got [$got]"
+      printf '%s\n' "$out_text" | sed 's/^/      /'
+      status=1
+    else
+      echo "ok   $name [$want]"
+    fi
+  }
+
+  local MQ_LANE="on: [pull_request]
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: >-
+        \${{ ($QGUARD)
+            && '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo-merge-queue\"]'
+            || '[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]' }}
+    steps: [{run: \"true\"}]"
+
+  expect_mq_pair "a second workflow that named the pool sits out the route" "RUNNER14" \
+"$MQ_LANE" \
+'on: [pull_request]
+jobs:
+  policy:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: "true"}]'
+
+  # Order is not evidence. The same two files, read the other way round, are the
+  # same repository -- and this is the ordering a `find | sort` actually
+  # produces for a policy check named before its lane.
+  expect_mq_pair "…and the same pair with the route read last" "RUNNER14" \
+'on: [pull_request]
+jobs:
+  policy:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: "true"}]' \
+"$MQ_LANE"
+
+  # The fix the diagnostic recommends, asserted as clean: resolving the pool
+  # from the routing job's output is what taking the route looks like.
+  expect_mq_pair "a job that resolves its pool from the lane is clean" "" \
+"$MQ_LANE" \
+'on: [pull_request]
+jobs:
+  policy:
+    needs: lane
+    runs-on: ${{ fromJSON(needs.lane.outputs.runner) }}
+    timeout-minutes: 10
+    steps: [{run: "true"}]'
+
+  # No route in the repository, no rule. A repository with one pool names it
+  # literally in every workflow and is not being asked to change.
+  expect_mq_pair "a repository with no route is never asked" "" \
+'on: [pull_request]
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps: [{run: "true"}]' \
+'on: [pull_request]
+jobs:
+  policy:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: "true"}]'
+
+  # A job that cannot run on a queue draft has no route to take.
+  expect_mq_pair "a job the queue drafts never reach needs no route" "" \
+"$MQ_LANE" \
+"on: [pull_request]
+jobs:
+  policy:
+    if: \"!startsWith(github.head_ref, 'mergify/merge-queue/')\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # …and the guard is read as a Boolean tree, not as a substring: the same test
+  # as one arm of an `||` does NOT keep the job off a draft, because the other
+  # arm runs it there.
+  expect_mq_pair "the skip has to actually skip" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request]
+jobs:
+  policy:
+    if: \"always() || !startsWith(github.head_ref, 'mergify/merge-queue/')\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # The declared exemption, and then the two ways of writing one that is not a
+  # declaration at all.
+  expect_mq_pair "a declared exemption is accepted" "" \
+"$MQ_LANE" \
+'on: [pull_request]
+jobs:
+  # merge-queue-route-exempt(policy, #4242): watches the pull-request pool
+  policy:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: "true"}]'
+
+  expect_mq_pair "an exemption with no issue is not one" "RUNNER14" \
+"$MQ_LANE" \
+'on: [pull_request]
+jobs:
+  # merge-queue-route-exempt(policy): because
+  policy:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: "true"}]'
+
+  expect_mq_pair "an exemption naming another job does not cover this one" "RUNNER14" \
+"$MQ_LANE" \
+'on: [pull_request]
+jobs:
+  # merge-queue-route-exempt(other, #4242): a different job entirely
+  policy:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: "true"}]'
+
+  # A marker echoed by a step is shell, not a declaration -- the same bypass
+  # `comment_view` closes for every other marker in this file.
+  expect_mq_pair "a marker inside a run: block declares nothing" "RUNNER14" \
+"$MQ_LANE" \
+'on: [pull_request]
+jobs:
+  policy:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps:
+      - run: |
+          # merge-queue-route-exempt(policy, #4242): not a comment, a script
+          true'
+
+  # A GitHub-hosted job never claims a pool, so the rule has nothing to say
+  # about it -- and a repository routing between two pools still runs plenty of
+  # hosted jobs.
+  expect_mq_pair "a hosted job is not a pool job" "" \
+"$MQ_LANE" \
+'on: [pull_request]
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps: [{run: "true"}]'
+
+  # A workflow with no pull-request trigger is not part of a queue draft at all.
+  expect_mq_pair "a push-only workflow is out of scope" "" \
+"$MQ_LANE" \
+'on:
+  push:
+    branches: [main]
+jobs:
+  publish:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: "true"}]'
+
   rm -rf "$tmp"
   return "$status"
 }
@@ -3082,6 +3387,27 @@ shared_infra_owner_verdict() {
   # Every owner is named, not only the surplus one: which of two is the mistake
   # is a question the repository answers, not this gate.
   err RUNNER10 "$owners jobs bring up shared infrastructure in this repository's pull-request workflows, and a pull request gets ONE stack: $(printf '%s' "$SHARED_INFRA_OWNERS" | paste -sd';' -) — the surplus owners should consume the anchor's stack instead (or declare '# shared-infra-exempt(<job>, #<issue>): <reason>' beside the one that genuinely needs its own)"
+}
+
+# The RUNNER14 verdict, deferred for the same reason and read the same way. The
+# order the files happened to be given must not decide anything: a repository
+# whose route lives in the LAST file read is the same repository as one whose
+# route is in the first.
+# shellcheck disable=SC2031
+merge_queue_route_verdict() {
+  [ "$QUEUE_ROUTED" -eq 1 ] || return 0
+  local file job labels rel
+  while IFS=$'\t' read -r file job labels; do
+    [ -n "$file" ] || continue
+    # Read now rather than at collection time: the marker is a property of the
+    # file, and nothing about it changes between the two moments -- but the
+    # grep is only paid for a repository that actually has a route.
+    merge_queue_route_declared "$file" "$job" && continue
+    rel="${file#"$REPO_ROOT"/}"
+    err RUNNER14 "$rel: job '$job' runs-on [$labels] literally, in a repository whose workflows route between a pull-request pool and a merge-queue pool — so on every 'mergify/merge-queue/<sha>' draft this job queues against the pull-request pool, which is exactly the pool the queued pull requests are filling, while the merge-queue pool it should be using sits idle. Resolve the pool from the routing job's output (runs-on: \${{ fromJSON(needs.<lane>.outputs.runner) }}), or declare '# merge-queue-route-exempt($job, #<issue>): <reason>' beside it"
+  done <<EOF
+$(printf '%s' "$QUEUE_UNROUTED" | grep -v '^$')
+EOF
 }
 
 # shellcheck disable=SC2031
@@ -3156,6 +3482,11 @@ EOF
   # owner rather than only the surplus one — which of two owners is the mistake
   # is a question the repository answers, not this gate.
   shared_infra_owner_verdict
+
+  # RUNNER14 is the other one, and for a related reason: whether the repository
+  # routes at all is a fact about the SET, and the file that proves it may be
+  # the last one read.
+  merge_queue_route_verdict
 
   if [ "$fail" -eq 0 ]; then
     echo "runner policy clean: ${#files[@]} workflow file(s)"

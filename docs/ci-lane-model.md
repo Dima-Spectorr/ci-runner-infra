@@ -359,7 +359,7 @@ label set, and every self-hosted job resolves `runs-on` from it:
     runs-on: ${{ fromJSON(needs.lane.outputs.runner) }}
 ```
 
-Four properties, each of which has already failed somewhere on this fleet:
+Five properties, each of which has already failed somewhere on this fleet:
 
 - **An expression, not a step.** A step can fail, and a failed step leaves every
   downstream job with an empty `runs-on`, which GitHub queues forever against a
@@ -383,6 +383,16 @@ Four properties, each of which has already failed somewhere on this fleet:
   drifts away from.
 - **`github.head_ref` is empty on `push`,** so a push to the default branch
   resolves to the pull-request pool. Correct: a push is not a speculative check.
+- **EVERY self-hosted job takes the route, in every workflow file.** This is the
+  property that gets half-done, because half-done reports nothing: a job left
+  naming `<Repo>` literally still finds a runner and still passes. It just finds
+  it in the **pull-request** pool, on every queue draft, competing with exactly
+  the traffic the split was built to keep away from the queue. On IntegrateIT a
+  65-second `generic-binary` job — a *required* check, in the one workflow that
+  was not repointed — waited 31m06s on a queue draft, while Mergify displayed
+  "waiting for generic-binary", which reads as slow rather than as stuck.
+  **RUNNER14** here, and it is opted into by the route existing anywhere in the
+  repository, so the second workflow cannot quietly stay behind.
 
 **Turning the route on is order-dependent, once, per repository.** The commit
 that introduces it cannot be merged *through* the queue: Mergify's speculative
