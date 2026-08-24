@@ -787,8 +787,14 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <ssh-out>
   # All four functions the gate is made of, mutated as ONE body: the branch
   # lives in drain_host, the I/O in beacon_gate, and a mutation that could only
   # reach one of them would leave half the gate unfalsifiable.
-  code=$(printf '%s\n%s\n%s\n%s\n' \
+  # guest_attributes_denied is extracted too, and it is not optional decoration:
+  # beacon_gate calls it on every failed read, and a harness that leaves it out
+  # runs the unreadable case against `command not found` rather than against the
+  # classifier -- the answer comes out the same way for the wrong reason, and the
+  # one branch this gate exists to hold would be unfalsifiable.
+  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$(fn host_age_seconds)" "$(fn instance_host_os)" \
+    "$(fn guest_attributes_denied)" "$(fn note_guest_attributes_denied)" \
     "$(fn beacon_gate)" "$(fn drain_host)")
   [ -n "$mut" ] && code=$(printf '%s\n' "$code" | sed "$mut")
 
@@ -805,6 +811,11 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <ssh-out>
       MIG=test-mig
       REGION=test-region
       BEACON_NS=ci
+      # note_guest_attributes_denied reads this, and under \`set -u\` an unbound
+      # name would abort the whole subshell rather than fail one check. Empty is
+      # the real controller's own 'nowhere to record it' value, so the counter
+      # returns early and the gate is judged on its verdict, not on its bookkeeping.
+      GA_DENIED_FILE=''
       BEACON_INTERVAL=30
       REGISTER_GRACE=600
       ORPHAN_CONFIRM_TICKS=3
@@ -1082,8 +1093,12 @@ check "gate/mutation: not capturing the worker count makes the gate inert" \
   "$(gate_seq windows "$(printf 'workers,0\nts,%s' "$NOW_TS")" 0 0 1 0 0 0 \
     's/{ present=1; workers="\$val"; }/present=1/')"
 
-echo "controller-scope selftest: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
+# The summary and the verdict used to sit HERE, with eighty more checks below
+# them. `[ "$fail" -eq 0 ]` in the middle of a script is not a gate: its status
+# is discarded, the script runs on, and the exit status is whatever the LAST
+# command happened to return -- a `check`, which returns 0 whether it passed or
+# failed. So this file reported "N passed, 1 failed" and exited 0, and CI has
+# been treating an inert gate as a green one. Both moved to the end of the file.
 
 # --- #278: capacity that ANSWERS, and the gap ---------------------------------
 #
@@ -1166,3 +1181,9 @@ done
 
 check "slots: both series are published" "2" \
   "$(grep -cE 'queue_series "ci_slots_(registered|missing)"' "$CTRL")"
+
+# THE LAST LINES IN THE FILE, and `exit` rather than a bare test, so that a check
+# appended below them cannot silently become the script's exit status again.
+echo "controller-scope selftest: $pass passed, $fail failed"
+[ "$fail" -eq 0 ] || exit 1
+exit 0

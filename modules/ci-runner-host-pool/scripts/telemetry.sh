@@ -23,6 +23,22 @@
 # because its flush sits on the boot path, in front of the agent registering.
 
 TELEMETRY_BUFFER=""
+TELEMETRY_COUNT=0
+
+# Cloud Monitoring rejects a projects.timeSeries.create carrying more than 200
+# TimeSeries objects, and it rejects the WHOLE request -- so one series past the
+# line does not lose one series, it loses the tick. Including `ci_demand`, which
+# is the only thing the autoscaler reads: the pool would stop scaling in both
+# directions while every dashboard kept showing the last value it did receive,
+# which is the failure mode that looks healthiest.
+#
+# That is not a distant ceiling. The controller queues ~55 series per pool and
+# serves up to four of them, so the fixed cost alone is ~220 before a single
+# per-host or per-outcome point is added. The count is a function of pools ×
+# hosts × outcomes and every feature that adds a series moves it, so a review
+# that checks the arithmetic once is a review that has to be repeated forever.
+# Batching removes the cliff instead of measuring the distance to it.
+TELEMETRY_MAX_PER_REQUEST=200
 
 # ts_label_value <string> — echoes a string that is safe to paste into the JSON
 # label fragment below.
@@ -89,15 +105,32 @@ queue_series() {
   else
     TELEMETRY_BUFFER="$point"
   fi
+  TELEMETRY_COUNT=$((TELEMETRY_COUNT + 1))
+
+  # THE CAP IS ENFORCED HERE, NOT IN flush_series, and that is the whole reason
+  # it is safe. The buffer is a comma-joined string of JSON objects, and those
+  # objects contain commas of their own, so a flush that tried to split a full
+  # buffer into batches would have to parse JSON in bash to find the boundaries.
+  # Counting on the way IN needs no parsing at all: the buffer simply never grows
+  # past the limit, and the existing "send the whole buffer" flush stays correct
+  # by construction.
+  #
+  # An intermediate flush that fails is logged by flush_series and does not stop
+  # the tick: losing one batch is the same class of loss the old single call
+  # already had, and refusing to queue the rest would turn it into all of them.
+  if [ "$TELEMETRY_COUNT" -ge "${TELEMETRY_MAX_PER_REQUEST:-200}" ]; then
+    flush_series || true
+  fi
 }
 
-# flush_series — one API call per tick, whatever the number of metrics.
+# flush_series — one API call per batch of at most TELEMETRY_MAX_PER_REQUEST.
 flush_series() {
   [ -n "$TELEMETRY_BUFFER" ] || return 0
 
   local body token http out
   body="{\"timeSeries\":[$TELEMETRY_BUFFER]}"
   TELEMETRY_BUFFER=""
+  TELEMETRY_COUNT=0
 
   # Bounded, and spelled out rather than reusing the controller's CURL_TIMEOUTS:
   # this file is concatenated BEFORE controller-startup.sh, so depending on a
