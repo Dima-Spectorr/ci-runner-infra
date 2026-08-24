@@ -172,11 +172,14 @@ example_refs=0
 example_bad=0
 while IFS= read -r line; do
   example_refs=$((example_refs + 1))
+  # `grep -c … >/dev/null` rather than `grep -q`, per PFR3: the reader ends the
+  # pipeline and its status is the answer, and `-q` exits on the first match,
+  # killing the in-process writer with EPIPE under pipefail.
   printf '%s\n' "$line" \
-    | grep -qE 'ci-runner-infra/\.github/(actions|workflows)/[A-Za-z0-9._/-]+@[0-9a-f]{40}([[:space:]]|$)' \
+    | grep -cE 'ci-runner-infra/\.github/(actions|workflows)/[A-Za-z0-9._/-]+@[0-9a-f]{40}([[:space:]]|$)' >/dev/null \
     || { example_bad=$((example_bad + 1)); continue; }
   printf '%s\n' "$line" \
-    | grep -qE '@[0-9a-f]{40}.*#[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+' \
+    | grep -cE '@[0-9a-f]{40}.*#[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+' >/dev/null \
     || example_bad=$((example_bad + 1))
 done < <(grep -E 'ci-runner-infra/\.github/(actions|workflows)/[A-Za-z0-9._/-]+@' "$EXAMPLE" | grep -v '^[[:space:]]*#')
 

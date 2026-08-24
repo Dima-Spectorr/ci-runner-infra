@@ -146,7 +146,10 @@ for f in "${docs[@]}"; do
             | head -1 | sed 's/.*@//')
     tag=$(printf '%s\n' "$line" | sed -n 's/.*#[[:space:]]*\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
 
-    if ! printf '%s' "$ref" | grep -qE '^[0-9a-f]{40}$'; then
+    # `grep -c … >/dev/null`, not `grep -q`: the reader's status IS the answer
+    # here, and `-q` exits on first match, killing the in-process writer with
+    # EPIPE under pipefail (PFR3).
+    if ! printf '%s' "$ref" | grep -cE '^[0-9a-f]{40}$' >/dev/null; then
       bad "$where: pins @$ref — a tag or branch, which PIN1 in check-action-pins.sh rejects. This is a copy-pasteable line, and every consumer runs that gate, so it must be a 40-character SHA."
       continue
     fi
