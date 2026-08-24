@@ -207,12 +207,30 @@ triggers_on_ci_completion() {
 }
 
 # A newer CI completion must cancel a nudge still sitting in its grace period
-# for the previous commit on the same branch: that older nudge would be asking
-# a question about a superseded sha.
+# for the previous commit on the same pull request: that older nudge would be
+# asking a question about a superseded sha.
 supersedes_an_older_nudge() {
   local code; code=$(code_of "$1")
   matches "$code" '^  cancel-in-progress: true$' || return 1
   matches "$code" '^  group: mergify-nudge-' || return 1
+}
+
+# …and it must cancel ONLY that pull request's nudge. `head_branch` is the
+# SOURCE branch's name, which two pull requests from two forks may share; keyed
+# on it they cancel each other, and a nudge cancelled right after the OTHER
+# pull request's last required check leaves exactly the stall this workflow
+# exists to clear. A separate predicate from the one above because the failure
+# is the opposite one: that check asks whether superseding happens at all, this
+# asks whether it is confined to one pull request.
+cancels_only_its_own_pull_request() {
+  local code; code=$(code_of "$1")
+  # The group must be derived from the pull request…
+  matches "$code" '^  group: mergify-nudge-\$\{\{ github\.event\.workflow_run\.pull_requests\[0\]\.number ' || return 1
+  # …and must not be derived from the branch name at all. Asserting the good
+  # spelling is not enough on its own: a group naming BOTH would pass that and
+  # still collide, because two same-named branches differ only in the half a
+  # `||` never reaches.
+  ! matches "$code" '^  group: .*head_branch' || return 1
 }
 
 # The callee declares the write, but a reusable workflow cannot grant itself
@@ -246,6 +264,7 @@ check keeps_expressions_out_of_the_shell "$CALLEE" "an expression is interpolate
 check is_bounded                        "$CALLEE" "the job that sleeps by design has no timeout"
 check triggers_on_ci_completion         "$CALLER" "the caller does not fire on a completed CI run"
 check supersedes_an_older_nudge         "$CALLER" "a superseded nudge is not cancelled and will ask about an old sha"
+check cancels_only_its_own_pull_request "$CALLER" "the concurrency group is keyed on the branch name, so two forks sharing one cancel each other's nudge"
 check grants_the_write_at_the_call      "$CALLER" "the caller does not pass the write the callee needs"
 check can_read_check_runs               "$CALLER" "the caller does not pass checks: read, so the callee's own declaration buys nothing"
 
@@ -329,6 +348,10 @@ mutate "the workflow_run trigger is replaced by a push trigger" "$CALLER" \
   's|^  workflow_run:|  push:|'                                       triggers_on_ci_completion
 mutate "a superseded nudge is left running" "$CALLER" \
   's|^  cancel-in-progress: true$|  cancel-in-progress: false|'       supersedes_an_older_nudge
+mutate "the group goes back to the branch name" "$CALLER" \
+  's|workflow_run\.pull_requests\[0\]\.number|workflow_run.head_branch|' cancels_only_its_own_pull_request
+mutate "the group names the branch as well as the pull request" "$CALLER" \
+  's|^  group: mergify-nudge-|  group: mergify-nudge-${{ github.event.workflow_run.head_branch }}-|' cancels_only_its_own_pull_request
 mutate "the caller stops passing the write" "$CALLER" \
   's|^      pull-requests: write$|      pull-requests: read|'         grants_the_write_at_the_call
 mutate "the caller stops passing checks: read" "$CALLER" \
