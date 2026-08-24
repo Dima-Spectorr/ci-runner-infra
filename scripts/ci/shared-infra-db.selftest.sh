@@ -103,6 +103,8 @@ run_resolve() {
   HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-30}" \
   PG_RETRY_SLEEP=0 PG_POLL_SLEEP=0 \
   PG_PORT_CANDIDATES="${PG_PORT_CANDIDATES:-}" \
+  CI_SHARED_INFRA_PORT_MIN="${CI_SHARED_INFRA_PORT_MIN:-}" \
+  CI_SHARED_INFRA_PORT_MAX="${CI_SHARED_INFRA_PORT_MAX:-}" \
   SS_BUSY="${SS_BUSY:-}" DOCKER_REFUSE="${DOCKER_REFUSE:-}" \
   DOCKER_ISREADY_RC="${DOCKER_ISREADY_RC:-0}" \
   bash "$RESOLVE" >"$TMP/stdout.$1" 2>&1
@@ -134,6 +136,46 @@ got() { sed -n "s/^$2=//p" "$1"; }
   ok "shared without addr: falls back to loopback" \
      "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:35100/app' ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharednoaddr" ) || true
+
+# The slot that OWNS the stack must use loopback on a host that has not yet been
+# rolled onto the hairpin SNAT: `addr` DNATs back into this same namespace, so
+# source and destination are equal and the reply never returns through the
+# host's conntrack. The slot's own band identifies it — the anchor draws the
+# stack's port from the band of the slot it ran on, and bands are disjoint.
+( PG=35100 ADDR=10.0.0.7 CI_SHARED_INFRA_PORT_MIN=35100 CI_SHARED_INFRA_PORT_MAX=35199 \
+    run_resolve sharedown
+  ok "shared on the anchor's own slot: uses loopback, not addr" \
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:35100/app' ] && echo 1 || echo 0)"
+  ok "shared on the anchor's own slot: still reports shared=1" \
+     "$([ "$(got "$OUT" shared)" = 1 ] && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharedown" ) || true
+
+# A sibling slot keeps `addr`: the port is outside ITS band, whatever it happens
+# to have listening. Sending a sibling to loopback would reach its own unrelated
+# service, or nothing — turning an intermittent failure into a total one.
+( PG=35100 ADDR=10.0.0.7 CI_SHARED_INFRA_PORT_MIN=35200 CI_SHARED_INFRA_PORT_MAX=35299 \
+    SS_BUSY="35100 22" run_resolve sharedsibling
+  ok "shared from a sibling slot: keeps addr even with the same port listening" \
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app' ] && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharedsibling" ) || true
+
+# No band in the environment is the GitHub-hosted runner and the `container:`
+# job: not a fleet slot, or a slot whose steps do not inherit the runner
+# service's environment. Keep `addr` — it is right everywhere except the
+# un-rolled owning slot, and guessing loopback there would address the
+# container itself.
+( PG=35100 ADDR=10.0.0.7 run_resolve sharednoband
+  ok "shared with no band in the environment: keeps addr" \
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app' ] && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharednoband" ) || true
+
+# A malformed band must not crash the action or silently mean "ours".
+( PG=35100 ADDR=10.0.0.7 CI_SHARED_INFRA_PORT_MIN=abc CI_SHARED_INFRA_PORT_MAX=35199 \
+    run_resolve sharedbadband
+  ok "shared with a non-numeric band: exits 0" "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+  ok "shared with a non-numeric band: keeps addr" \
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app' ] && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharedbadband" ) || true
 
 # ---------------------------------------------------------------------------
 # The fallback draws its own port.

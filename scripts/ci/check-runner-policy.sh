@@ -472,29 +472,40 @@ RUNS_ON_ROUTES = re.compile(
 # reported job and a one-line pull request. The other direction costs the
 # boundary. Last checked against GitHub's runner-images inventory 2026-08-23.
 #
-# THE SUFFIX HAS TO BE PER-OS FOR THE SAME REASON THE VERSION DOES, and both
-# ways it was shared it was wrong. Found in Apigee-Portal, whose vendored copy
-# had already fixed it locally — a consumer can be ahead of the fleet, and this
-# came back only because the refresh diffed the two rather than overwriting.
+# THE SUFFIX HAS TO BE PER-OS FOR THE SAME REASON THE VERSION DOES. Splitting
+# `windows-11-arm` out was half the fix; the OTHER three OS families still
+# shared one alternation, and a shared list is wrong in both directions at once
+# because every suffix it carries for one OS it also grants to the others:
 #
-#   * `windows-11-arm` already spends the ARM marker in its version, so the
-#     shared alternation applied it a SECOND time and `windows-11-arm-arm` read
-#     as a hosted image. Any pool labelled that way skipped RUNNER1, RUNNER2 and
-#     RUNNER4 entirely — the boundary-opening direction this expression exists
-#     to close. It is now spelled out separately, with no suffix of its own.
-#   * The shared list carried no `intel`, so `macos-15-intel` — an image GitHub
-#     actually ships — was read as a self-hosted pool, and a conforming
-#     workflow was failed on a required check. That is the over-reporting
-#     direction, which is safe for the boundary and still costs a repository a
-#     red gate it cannot act on.
+#   * `-arm64`, `-large` and `-xlarge` were still reachable from
+#     `windows-11-arm`'s siblings and from each other, so `windows-11-arm-arm64`
+#     — a perfectly ordinary private pool label — read as a hosted image and
+#     skipped RUNNER1, RUNNER2 and RUNNER4. That is the boundary-opening
+#     direction, and it is the reason this is per-OS now.
+#   * `-large`/`-xlarge` exist on macOS ONLY. Larger runners on Ubuntu and
+#     Windows take ORGANISATION-CHOSEN names, which by this rule's own logic are
+#     self-hosted-shaped and must not be pattern-matched. A fixture here used to
+#     assert `windows-2022-large` was "a real larger-runner label"; it is not
+#     one, and it now asserts the opposite.
+#   * `-intel` is macOS only, `-arm` is Ubuntu only. Granted to every OS they
+#     buy nothing and cost the labels above.
+#
+# So: each OS carries its own versions AND its own suffixes, and the two bare
+# families GitHub ships with no version component — `ubuntu-slim` and `xcode-27`
+# — are exact literals. Literals carry none of the shape risk the enumeration
+# exists to close: an organisation would have to name a pool exactly that to be
+# mistaken for hosted, which is the exposure `ubuntu-24.04` already has.
+#
+# `macos-13` is gone: GitHub's inventory no longer lists it, and a label that is
+# not shipped is a private one. Last checked against `actions/runner-images`
+# `README.md` (raw, `main`) on 2026-08-24.
 HOSTED_IMAGE = re.compile(
     r"^(?:"
-    r"(?:"
-    r"ubuntu-(?:latest|24\.04|22\.04)"
-    r"|windows-(?:latest|2025|2022)"
-    r"|macos-(?:latest|15|14|13)"
-    r")(?:-(?:arm|arm64|intel|large|xlarge))?"
-    r"|windows-11-arm"
+    r"ubuntu-(?:latest|26\.04|24\.04|22\.04)(?:-arm)?"
+    r"|ubuntu-slim"
+    r"|windows-(?:latest|2025-vs2026|2025|2022|11-vs2026-arm|11-arm)"
+    r"|macos-(?:latest|26|15|14)(?:-(?:intel|large|xlarge))?"
+    r"|xcode-27(?:-xlarge)?"
     r")$",
     re.IGNORECASE,
 )
@@ -643,21 +654,54 @@ QUEUE_SKIP_EVENT = re.compile(r"github\.event_name\s*==\s*(['\"])([A-Za-z_]+)\1"
 # The two events a queue draft actually arrives as. Anything else is a skip.
 QUEUE_DRAFT_EVENTS = ("pull_request", "pull_request_target")
 
+# `${{ … }}` around a whole `if:`, which is optional in Actions and written
+# both ways across the fleet. The Boolean walk peels parentheses but knows
+# nothing about this wrapper, so it has to come off before the walk starts --
+# see `queue_skip_leaf` for why that suddenly matters.
+EXPR_WRAP = re.compile(r"^\$\{\{(.*)\}\}$", re.DOTALL)
+
 
 def queue_skip_leaf(expr):
     """One leaf of the Boolean walk: does this term alone rule out a draft?"""
-    if QUEUE_SKIP.search(expr):
+    expr = expr.strip()
+    # BOTH arms anchored, for one reason. `!(!startsWith(github.head_ref,
+    # 'mergify/merge-queue/'))` CONTAINS the first alternative and means its
+    # opposite, and `!startsWith(...) == false` contains the second and means
+    # its opposite too -- the identical mistake as the event arm below, just
+    # spelled on the arm whose correct form already carries the `!`.
+    if QUEUE_SKIP.fullmatch(expr):
         return True
-    hit = QUEUE_SKIP_EVENT.search(expr)
+    # THE WHOLE LEAF, not a substring of it. `condition_excludes` walks `&&`
+    # and `||` and has no notion of `!` -- deliberately, because the head-ref
+    # arm above is CORRECT only in its negated form and a blanket refusal of a
+    # leading `!` would reject the original spelling of this exemption (and
+    # disturb the fork guard, which shares the walk). So the negation is
+    # handled where it can be handled precisely: here, on the one arm whose
+    # positive form is the readable one.
+    #
+    # `!(github.event_name == 'push')` CONTAINS the equality and means its
+    # opposite -- it is true for exactly the two events a queue draft arrives
+    # as. Read as a skip, it excused a literal pull-request pool from RUNNER14
+    # entirely, which is the over-eager direction the comment above swears off.
+    # An anchored match cannot make that mistake: any operator wrapped around
+    # the equality leaves something outside the match, and the leaf is not the
+    # bare positive statement any more.
+    hit = QUEUE_SKIP_EVENT.fullmatch(expr)
     return bool(hit and hit.group(2) not in QUEUE_DRAFT_EVENTS)
 
 
 def queue_skipped(job):
     """True when this job cannot run on a `mergify/merge-queue/<sha>` draft."""
     condition = job.get("if")
-    return isinstance(condition, str) and condition_excludes(
-        condition, queue_skip_leaf
-    )
+    if not isinstance(condition, str):
+        return False
+    # Off with the `${{ }}` before the walk. It is invisible to a substring
+    # search and fatal to an anchored one, and stripping it here rather than
+    # inside `condition_excludes` keeps the fork guard's behaviour untouched.
+    wrapped = EXPR_WRAP.match(condition.strip())
+    if wrapped:
+        condition = wrapped.group(1)
+    return condition_excludes(condition, queue_skip_leaf)
 
 
 # A single-quoted JSON array inside an expression -- the label set one arm of
@@ -1947,7 +1991,7 @@ jobs:
     steps: [{run: "true"}]'
 
   # …and every version that IS shipped stays hosted, so enumerating did not
-  # quietly drop one. `windows-2022-large` is a real larger-runner label.
+  # quietly drop one.
   expect "the enumerated images stay hosted" "" "" allowed \
 'on: [pull_request]
 jobs:
@@ -1955,16 +1999,24 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps: [{run: "true"}]
+  u26:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  u26arm:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 30
+    steps: [{run: "true"}]
   w25:
     runs-on: windows-2025
     timeout-minutes: 30
     steps: [{run: "true"}]
-  wlarge:
-    runs-on: windows-2022-large
+  wvs:
+    runs-on: windows-2025-vs2026
     timeout-minutes: 30
     steps: [{run: "true"}]
-  m13:
-    runs-on: macos-13
+  wvsarm:
+    runs-on: windows-11-vs2026-arm
     timeout-minutes: 30
     steps: [{run: "true"}]
   m14:
@@ -1973,6 +2025,74 @@ jobs:
     steps: [{run: "true"}]
   m15:
     runs-on: macos-15
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  m26:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  m26intel:
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The two families GitHub ships with no version component. They are exact
+  # literals rather than a widened shape, so accepting them costs nothing the
+  # enumeration was protecting: a pool would have to be named EXACTLY this.
+  expect "the versionless hosted families are hosted" "" "" allowed \
+'on: [pull_request]
+jobs:
+  slim:
+    runs-on: ubuntu-slim
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  xc:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  xcbig:
+    runs-on: xcode-27-xlarge
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The suffix that made the list per-OS. `-arm64` was never a hosted suffix on
+  # ANY OS, and reachable from `windows-11-arm` it produced a hosted reading for
+  # a label that is a private pool by every convention — the direction that
+  # skips RUNNER1, RUNNER2 and RUNNER4 on the job carrying it.
+  expect "an ARM64 suffix on the ARM image is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  build:
+    runs-on: windows-11-arm-arm64
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # `-large` and `-xlarge` are macOS-only. Larger runners on Ubuntu and Windows
+  # take organisation-chosen names, so a Windows label ending in `-large` is a
+  # private one and must be read as self-hosted. A fixture here asserted the
+  # opposite and was itself the bug.
+  expect "a larger-runner suffix off macOS is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  wlarge:
+    runs-on: windows-2022-large
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "an Ubuntu xlarge suffix is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  ularge:
+    runs-on: ubuntu-24.04-xlarge
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # An image GitHub has RETIRED is a private label like any other unshipped one.
+  expect "a retired macOS image is a custom label" "RUNNER4" "" allowed \
+'on: [pull_request]
+jobs:
+  m13:
+    runs-on: macos-13
     timeout-minutes: 30
     steps: [{run: "true"}]'
 
@@ -3560,6 +3680,61 @@ jobs:
 jobs:
   policy:
     if: \"github.event_name == 'push' || github.event.pull_request.draft == false\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # The head-ref arm's own version of the same mistake. Its CORRECT form
+  # carries the `!`, so anchoring is the only way to tell it from a second `!`
+  # wrapped around it — and `!(!startsWith(...))` is true for exactly the
+  # drafts the arm claims to exclude.
+  expect_mq_pair "a doubly negated head-ref test is not a skip" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request]
+jobs:
+  policy:
+    if: \"!(!startsWith(github.head_ref, 'mergify/merge-queue/'))\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # …and the `== false` spelling inverted the same way. `!` binds tighter than
+  # `==`, so this reads "startsWith is TRUE" — which is the draft.
+  expect_mq_pair "an inverted == false head-ref test is not a skip" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request]
+jobs:
+  policy:
+    if: \"!startsWith(github.head_ref, 'mergify/merge-queue/') == false\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # NEGATED, which means the opposite and used to be read as the same thing.
+  # The walk knows `&&` and `||` and nothing about `!`, so a substring search
+  # for the equality found it inside its own negation and called the job
+  # push-only — while `!(github.event_name == 'push')` is true for exactly the
+  # two events a queue draft arrives as. A literal pull-request pool behind it
+  # escaped RUNNER14 completely.
+  expect_mq_pair "a negated event test is not a skip" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request, push]
+jobs:
+  policy:
+    if: \"!(github.event_name == 'push')\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # The positive form still passes with the expression wrapper on, which is the
+  # spelling that had to keep working: the anchored read is done after the
+  # wrapper comes off, not instead of it.
+  expect_mq_pair "a wrapped push-only job is still not on a draft" "" \
+"$MQ_LANE" \
+"on: [pull_request, push]
+jobs:
+  policy:
+    if: \"\${{ github.event_name == 'push' }}\"
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 10
     steps: [{run: \"true\"}]"

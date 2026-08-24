@@ -241,7 +241,7 @@ locals {
   # so a running controller never depends on fetching code at runtime. They are
   # separate files in the repo precisely so they can be unit-tested; embedding
   # them here is what puts the TESTED text on the box.
-  controller_startup = join("\n", [
+  controller_startup_source = join("\n", [
     "#!/usr/bin/env bash",
     file("${path.module}/scripts/drain-decision.sh"),
     file("${path.module}/scripts/orphan-decision.sh"),
@@ -286,6 +286,38 @@ locals {
     file("${path.module}/scripts/pool-table.sh"),
     file("${path.module}/scripts/controller-startup.sh"),
   ])
+
+  # AND IT TRAVELS COMPRESSED, FOR THE REASON THE HOST'S DOES.
+  #
+  # Fourteen files concatenated render to about 305 KiB, past the 256 KiB cap on
+  # a GCE metadata value. This is the SECOND half of the same outage: gzipping
+  # only the host's script got the host template created and moved the identical
+  # Error 413 one resource down, onto `google_compute_instance_template.controller`
+  #
+  #   Error 413: Value for field 'resource.properties.metadata.items[25].value'
+  #   is too large: maximum size 262144 character(s); actual size 311914
+  #
+  # and a controller that cannot be created is a pool that never scales off zero
+  # no matter how healthy its hosts are. Both halves now carry the wrapper, and
+  # the precondition below covers this one so the next script added to the list
+  # above is a red plan rather than a failed nightly apply.
+  #
+  # Same shape as the host's, and the same two deliberate choices: it unpacks to
+  # /var/lib, outside anything the controller manages, because bash reads a
+  # script incrementally as it runs; and `set -euo pipefail` makes a truncated
+  # blob a loud boot failure rather than a controller running a prefix of its
+  # own decision rules — half of which decide whether a machine is deleted.
+  controller_startup_gz = base64gzip(local.controller_startup_source)
+
+  controller_startup = <<-EOT
+    #!/usr/bin/env bash
+    set -euo pipefail
+    base64 -d <<'CI_CONTROLLER_STARTUP_GZ_EOF' | gzip -d > /var/lib/ci-controller-startup.sh
+    ${local.controller_startup_gz}
+    CI_CONTROLLER_STARTUP_GZ_EOF
+    chmod 0700 /var/lib/ci-controller-startup.sh
+    exec /var/lib/ci-controller-startup.sh
+  EOT
 
   # Merged into the controller's metadata rather than written as a `"false"`
   # key, so a pool that has not opted in renders the SAME key set it renders
@@ -853,6 +885,16 @@ resource "google_compute_instance_template" "controller" {
   # before the old one can go.
   lifecycle {
     create_before_destroy = true
+
+    # The controller's half of the metadata-size gate. Same cap, same silence:
+    # the length is checked by the API and not by the plan, so without this the
+    # first sign is a 413 on an unattended apply, and the pool it belongs to
+    # keeps whatever controller it already had while every merged fix reads as
+    # shipped.
+    precondition {
+      condition     = length(local.controller_startup) < 262144
+      error_message = "pool '${var.name}' renders a ${length(local.controller_startup)}-character controller boot script and a GCE metadata value is capped at 262144. The script is already gzipped into its wrapper, so the SOURCE has outgrown even the compressed form: shorten the decision-rule scripts under modules/ci-runner-host-pool/scripts/, or move part of the controller onto the golden image. Left to the apply this is an Error 413 at create time, on a plan that read clean — and a controller that cannot be created is a pool that never leaves zero hosts."
+    }
   }
 }
 
