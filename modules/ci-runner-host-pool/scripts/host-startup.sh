@@ -4514,23 +4514,80 @@ sudo_passes_env() { # <user>
 # `externals/` is checked by GLOB rather than by pinning node24: the bundled
 # runtime's major version moves with the agent version the image pins, and a
 # check naming today's directory would go quiet -- passing on the absence it
-# exists to catch -- the first time that bumps. Any one usable node is enough;
-# the point is that the tree was unpacked at all.
+# exists to catch -- the first time that bumps.
+#
+# EVERY runtime the tree ships must be usable, not merely one of them, and the
+# difference is not pedantry. An action names the runtime it wants -- `using:
+# node24` in its own action.yml -- and the agent launches THAT path; it cannot
+# substitute a different major it happens to have. So a half-unpacked tree that
+# kept node20 and lost node24 satisfies "any one node" and still burns every job
+# that uses `actions/checkout`, which is the 2026-08-23 failure with one
+# directory restored. The version-agnostic property that is actually checkable is
+# "every runtime this copy claims to ship can start", and that is what is asked:
+# the set is read off the tree rather than pinned here, so a major bump needs no
+# edit and a missing member of the set is still caught.
 slot_can_execute() { # <dir>
-  local dir="$1" node found=0
+  local dir="$1" ext found=0
 
   [ -x "$dir/run.sh" ] ||
     { log "slot workspace $dir has no executable run.sh"; return 1; }
   [ -x "$dir/config.sh" ] ||
     { log "slot workspace $dir has no executable config.sh"; return 1; }
 
-  for node in "$dir"/externals/node*/bin/node; do
-    [ -x "$node" ] || continue
-    found=1
-    break
+  # Iterated over the DIRECTORIES, not over `node*/bin/node`: a runtime whose
+  # `bin/node` was never written matches nothing under the deeper glob, so a
+  # loop over the deeper one cannot see the very case it is here for -- it would
+  # simply count one runtime fewer and pass on the rest.
+  for ext in "$dir"/externals/node*; do
+    [ -d "$ext" ] || continue
+    found=$((found + 1))
+    [ -x "$ext/bin/node" ] ||
+      { log "slot workspace $dir ships ${ext##*/} with no usable bin/node -- an action that names that runtime would fail at its first step"; return 1; }
   done
-  [ "$found" -eq 1 ] ||
-    { log "slot workspace $dir has no usable externals/node*/bin/node -- the agent would fail every job at its first step"; return 1; }
+  [ "$found" -gt 0 ] ||
+    { log "slot workspace $dir has no externals/node* runtime at all -- the agent would fail every job at its first step"; return 1; }
+}
+
+# slot_unit_is_active <idx> — true when this slot's agent is ALREADY running.
+#
+# On a WARM reboot it is: the ci-runner@ units are enabled, so systemd brings
+# them up while this script is still working, which is the same window
+# provision_slot_user refuses to reset in. install_slot has to know, because two
+# of its steps are only safe on a cold boot -- see the `_work` block and
+# refuse_slot below.
+slot_unit_is_active() { # <idx>
+  systemctl is-active --quiet "ci-runner@$1.service"
+}
+
+# refuse_slot <idx> <warm> <message> — log why this slot will not serve, take the
+# already-running agent down when there is one, and return 1.
+#
+# THE STOP IS THE POINT. Every gate in install_slot returns 1 and the caller
+# counts it, which is right on a cold boot: nothing registered, so nothing is
+# advertised. On a warm reboot the slot is already registered and its agent is
+# already ONLINE, and returning 1 there only makes the readiness line say the
+# slot was withdrawn -- GitHub goes on dispatching jobs into the workspace this
+# host just declared unusable, and each one is claimed and burned. `ci_slots_missing`
+# then alerts on a gap that the fleet is, from GitHub's side, still filling.
+refuse_slot() { # <idx> <warm> <message>
+  local idx="$1" warm="$2" msg="$3"
+  log "slot $idx: $msg"
+  if [ "$warm" = 1 ]; then
+    log "slot $idx: its agent was already running from before this boot -- stopping and disabling it, because an ONLINE runner over a workspace this host has refused claims jobs and burns them"
+    systemctl disable --now "ci-runner@$idx.service" >>/var/log/ci-host.log 2>&1 || true
+  fi
+  return 1
+}
+
+# slot_can_enter <user> <path> — true when <user> can actually use <path> as a
+# working directory: read it, write into it, and enter it.
+#
+# Asked as the SLOT USER because that is who runs the job. Root's own `-d` is
+# true through a mode 000 directory, and `mkdir -p` returns 0 for a directory
+# that is already there whatever its mode, so between them they cannot tell
+# "created" from "present and unusable".
+slot_can_enter() { # <user> <path>
+  sudo -u "$1" sh -c 'test -r "$1" && test -w "$1" && test -x "$1"' sh "$2" 2>/dev/null
 }
 
 install_slot() {
@@ -4538,6 +4595,12 @@ install_slot() {
   local dir="$SLOT_ROOT/$idx"
   local name="$HOSTNAME_SHORT-s$idx"
   local u; u=$(slot_user "$idx")
+
+  # Read ONCE, at the top, before anything below can change it. Every gate in
+  # this function behaves differently on a warm reboot, and they must all agree
+  # about which kind of boot this is.
+  local warm=0
+  slot_unit_is_active "$idx" && warm=1
 
   start_slot_dockerd "$idx" || return 1
 
@@ -4592,13 +4655,15 @@ install_slot() {
   # workspace that looks present and cannot run anything, and the slot went on
   # to register over it.
   cp -a "$RUNNER_HOME/." "$dir/" ||
-    { log "slot $idx: could not copy the runner tree from $RUNNER_HOME"; return 1; }
+    refuse_slot "$idx" "$warm" "could not copy the runner tree from $RUNNER_HOME" ||
+    return 1
   chown -R "$u:$u" "$dir"
   chmod 0750 "$dir"
 
   # Before the token is spent and before GitHub is told this slot is capacity.
   slot_can_execute "$dir" ||
-    { log "slot $idx: workspace cannot execute; not registering it"; return 1; }
+    refuse_slot "$idx" "$warm" "workspace cannot execute; not registering it" ||
+    return 1
 
   # The other half of the 2026-08-23 failure, and the one the error message
   # blamed on the wrong thing: `/usr/bin/bash ... No such file or directory`
@@ -4627,14 +4692,45 @@ install_slot() {
   # the reset path already refuses, and `mkdir -p` over it would follow the link
   # and report success. `-d` alone would follow it too, so the link test comes
   # first and is its own refusal.
-  if [ -L "$dir/_work" ]; then
-    log "slot $idx: $dir/_work is a symlink, not a workspace -- not registering it"
+  #
+  # AND ONLY ON A COLD BOOT. On a warm one the name is not ours to create, and
+  # creating it is not a cosmetic race: slot-reset.sh RENAMES `_work` into a
+  # root-owned holding directory for the duration of a reset -- so that root
+  # never walks a path an untrusted account can swap -- and then refuses to hand
+  # it back if anything has appeared at the vacated name, because that name is
+  # not root's to remove. The slot is left without a clean marker, and a slot
+  # with no marker fails every job that follows, forever. `mkdir -p` here is
+  # exactly the appearance that triggers it, and the window is open on every warm
+  # reboot: the agent that runs the reset is already up (see slot_unit_is_active).
+  #
+  # Nor is there anything to heal in that case. The agent was configured with
+  # this `--work` and has been using it; `_work` MISSING on a warm host means the
+  # reset is holding it, not that it is gone.
+  if [ "$warm" = 1 ]; then
+    log "slot $idx: agent already running (warm reboot) -- leaving _work to it and to slot-reset.sh, which may be holding it right now"
+  elif [ -L "$dir/_work" ]; then
+    refuse_slot "$idx" "$warm" "$dir/_work is a symlink, not a workspace -- not registering it"
     return 1
-  fi
-  sudo -u "$u" mkdir -p "$dir/_work" 2>>/var/log/ci-host.log || true
-  if [ ! -d "$dir/_work" ]; then
-    log "slot $idx: $dir/_work is not a directory and could not be created -- every job would fail before its first step"
-    return 1
+  else
+    sudo -u "$u" mkdir -p "$dir/_work" 2>>/var/log/ci-host.log || true
+    if [ ! -d "$dir/_work" ]; then
+      refuse_slot "$idx" "$warm" "$dir/_work is not a directory and could not be created -- every job would fail before its first step"
+      return 1
+    fi
+    # Existing is not the same as usable. `_work` is owned by the slot and its
+    # mode is whatever the last job left -- a job that ran `chmod 000` on its own
+    # workspace, or a tool that did it on the way out, leaves a directory that
+    # `mkdir -p` reports success for and root's `-d` accepts, and that the slot
+    # user cannot enter. Healed first, because the mode is ours to set and the
+    # directory is ours to own, and only then refused.
+    if ! slot_can_enter "$u" "$dir/_work"; then
+      chown "$u:$u" "$dir/_work" 2>>/var/log/ci-host.log || true
+      chmod 0755 "$dir/_work" 2>>/var/log/ci-host.log || true
+    fi
+    if ! slot_can_enter "$u" "$dir/_work"; then
+      refuse_slot "$idx" "$warm" "$dir/_work exists but $u cannot read, write and enter it -- every job would fail before its first step"
+      return 1
+    fi
   fi
 
   local group_arg=()
@@ -4644,7 +4740,7 @@ install_slot() {
   # where sudo will not carry the token through the environment has no way left
   # to hand it to config.sh that does not publish it in argv. See the call below.
   sudo_passes_env "$u" \
-    || { log "slot $idx: sudo will not pass an environment variable through, and the only other way to hand config.sh its registration token is world-readable argv"; return 1; }
+    || { refuse_slot "$idx" "$warm" "sudo will not pass an environment variable through, and the only other way to hand config.sh its registration token is world-readable argv"; return 1; }
 
   # SC2024: the redirect is opened by THIS shell, which is root (startup-script
   # runs as root); sudo only drops privilege for config.sh itself. Writing the
@@ -4682,7 +4778,11 @@ install_slot() {
     --labels "$LABELS" \
     --work "$dir/_work" \
     "${group_arg[@]}" >>/var/log/ci-host.log 2>&1 || {
-      log "slot $idx: config.sh failed"
+      # Through refuse_slot like the gates above it, and for a reason of its own:
+      # on a warm reboot a FAILED re-configure leaves the agent from before the
+      # boot still running against credentials that may no longer match what
+      # GitHub holds, so it stays ONLINE and fails whatever it claims.
+      refuse_slot "$idx" "$warm" "config.sh failed"
       return 1
     }
 

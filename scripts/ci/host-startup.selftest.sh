@@ -1362,7 +1362,19 @@ slot_can_execute_behaves() { # <file>
     *) return 1 ;;
   esac
 
+  # Checked, because this script does not run under `set -e`: an unchecked
+  # `mktemp -d` that fails leaves `root` EMPTY, and every fixture below then
+  # builds itself at an absolute path -- `/good/externals/...`, `/next/...` --
+  # on the real filesystem, and `rm -rf "$root"` at the end is `rm -rf ""`.
+  # An `if`, not `A && B || C`: shellcheck SC2015 is right that the chain is not
+  # if-then-else, and here the distinction would matter — `[ -d "$root" ]` is the
+  # last condition, so a false one falls into the same branch as a failed mktemp
+  # by accident rather than by design.
   root=$(mktemp -d)
+  if [ -z "$root" ] || [ ! -d "$root" ]; then
+    echo "FAIL slot_can_execute behaviour: could not create a temporary directory for the fixtures" >&2
+    return 1
+  fi
 
   # THE WHOLE RULE IS `-x`, SO A FILESYSTEM WITH NO EXECUTE BIT CANNOT TEST IT.
   # Every case below is built by `chmod +x` on a file, and on a Windows working
@@ -1415,6 +1427,30 @@ slot_can_execute "$1"' _ "$1" >/dev/null 2>&1
   chmod -x "$root/noexec/externals/node24/bin/node"
   probe "$root/noexec" && rc=1
 
+  # TWO runtimes, both usable. The agent ships more than one major at a time and
+  # a tree carrying all of them is the ordinary case, not an anomaly.
+  cp -a "$root/good" "$root/two"
+  cp -a "$root/two/externals/node24" "$root/two/externals/node20"
+  probe "$root/two" || rc=1
+
+  # Two runtimes, ONE of them half-unpacked — and this is the case an "any one
+  # node will do" rule passes. An action names the runtime it wants in its own
+  # action.yml and the agent launches that exact path; it cannot fall back to a
+  # different major because one happens to be present. So this tree burns every
+  # job that uses `actions/checkout` while looking complete to the older check.
+  cp -a "$root/two" "$root/partial"
+  rm -rf "$root/partial/externals/node24/bin"
+  probe "$root/partial" && rc=1
+
+  # The same shape one level down: the directory and its bin/ are there, the
+  # binary is not. Separate from the case above because the deeper glob
+  # `externals/node*/bin/node` does not match this path either, so a loop written
+  # over that glob sees one runtime fewer and passes — which is exactly the
+  # reading the rule iterates over the DIRECTORIES to avoid.
+  cp -a "$root/two" "$root/partial2"
+  rm -f "$root/partial2/externals/node24/bin/node"
+  probe "$root/partial2" && rc=1
+
   # A half-finished copy of the agent itself.
   cp -a "$root/good" "$root/norun"
   rm -f "$root/norun/run.sh"
@@ -1447,6 +1483,23 @@ registration_is_gated() { # <file>
   # `--work` at configure time.
   matches "$code" '\[ -L "\$dir/_work" \]' || return 1
   matches "$code" 'mkdir -p "\$dir/_work"' || return 1
+  # ...and the mode of it, asked as the SLOT USER. `mkdir -p` returns 0 for a
+  # directory that is already there whatever its mode and root's `-d` is true
+  # through a mode 000 one, so without this the pair reports a workspace the job
+  # user cannot enter as created and healthy.
+  matches "$code" 'slot_can_enter "\$u" "\$dir/_work"' || return 1
+  # THE CREATION IS COLD-BOOT ONLY. slot-reset.sh renames `_work` away while it
+  # empties it and refuses to hand it back if anything appeared at the vacated
+  # name -- so a `mkdir -p` racing a live agent's reset poisons the slot
+  # permanently. The `warm` arm must therefore exist and must be read from the
+  # unit's own state, not guessed.
+  matches "$code" 'slot_unit_is_active "\$idx" && warm=1' || return 1
+  matches "$code" 'if \[ "\$warm" = 1 \]; then' || return 1
+  # And a refusal must take an already-running agent DOWN. Returning 1 alone only
+  # tells this host the slot was withdrawn; GitHub goes on dispatching into a
+  # workspace the host just refused, and every job it claims is burned.
+  matches "$code" 'systemctl disable --now "ci-runner@\$idx.service"' || return 1
+  matches "$code" 'refuse_slot "\$idx" "\$warm"' || return 1
   # EVERY gate must sit BEFORE config.sh, or the token is spent and the runner is
   # registered before anyone asks whether it can run. `_work` is checked here by
   # name and not only as part of the group: it is the one that was written after
