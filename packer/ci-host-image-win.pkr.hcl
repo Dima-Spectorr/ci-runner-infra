@@ -581,6 +581,14 @@ build {
     elevated_password = build.Password
   }
 
+  # The hardlink half of the seal's scan, uploaded before the block that runs it
+  # for the same reason ci-service-shim.cs is: a P/Invoke does not survive being
+  # folded into an array of one-line HCL strings.
+  provisioner "file" {
+    source      = "windows/scan-cache-hardlinks.ps1"
+    destination = "C:/Windows/Temp/scan-cache-hardlinks.ps1"
+  }
+
   # 7b. Seal the master cache AFTER warming.
   #
   #     A consumer's warm script is arbitrary repo-supplied code running elevated,
@@ -589,23 +597,40 @@ build {
   #     same order: is there anything in here that the ACL walk and the per-slot
   #     copy must not propagate, and if not, what ACL does the tree ship with.
   #
-  #     WHAT IS REFUSED, AND WHY IT IS THE ONE PREDICATE
+  #     WHAT IS REFUSED, AND WHY IT IS THESE TWO PREDICATES
   #
   #     The Linux scan refuses five things — symlinks, device nodes, setuid bits,
-  #     out-of-tree hardlinks, file capabilities. Four of those have no Windows
-  #     spelling at all. The one that does is the REPARSE POINT, and it matters for
-  #     both operations that follow a warm script:
+  #     out-of-tree hardlinks, file capabilities. Three of those have no Windows
+  #     spelling at all. The two that do are the REPARSE POINT and the OUT-OF-TREE
+  #     HARDLINK, and they are one hazard wearing two shapes: a name in this tree
+  #     standing for a file that is not.
   #
   #       * `icacls /grant` with (OI)(CI) follows a junction, so a junction aimed
   #         at C:\Windows is a read-and-execute grant applied THERE. An ACL applied
   #         to the wrong tree is not undone by the next boot.
   #       * the boot script's robocopy follows one too, turning a per-slot cache
   #         seed into a per-slot copy of whatever tree it names.
+  #       * a hardlink needs no reparse point to do the first of those. A file's
+  #         security descriptor lives on its MFT record, not on the directory
+  #         entry, so all of a file's names share ONE ACL and `/setowner /T` and
+  #         `/reset /T` rewrite it wherever else that file is named. robocopy
+  #         /COPY:DAT then copies the CONTENT into every slot.
   #
   #     `Get-ChildItem -Recurse` does not descend through a reparse point unless
-  #     -FollowSymlink is given, so the junction is seen and not walked into. The
-  #     boot script repeats this scan in Get-CacheHostileReason, because an image
-  #     is not the only way content reaches this tree.
+  #     -FollowSymlink is given, so the junction is seen and not walked into. It
+  #     cannot see a link count at all, though — nothing in the managed API
+  #     surface of Windows PowerShell 5.1 can — so the second predicate lives in
+  #     packer/windows/scan-cache-hardlinks.ps1, which P/Invokes
+  #     GetFileInformationByHandle. Its header carries the reasoning; the short
+  #     version is that it COUNTS the names it can see against the link count
+  #     rather than forbidding a link count above one, because pnpm's store and a
+  #     `cp -al` in a warm script both hardlink legitimately, entirely inside the
+  #     tree.
+  #
+  #     The boot script repeats both scans, in Get-CacheHostileReason and
+  #     Get-CacheHardlinkReason, because an image is not the only way content
+  #     reaches this tree — a hydrated snapshot is the other, and no reviewed
+  #     build step stands in front of it.
   #
   #     WHY THE GRANTS ARE SIDS
   #
@@ -631,6 +656,16 @@ build {
       # bounded before it reaches the build log — the same reason the Linux
       # template pipes its refusal through `tr`.
       "if ($bad.Count -gt 0) { $n = ($bad[0].FullName -replace '[\\x00-\\x1f]', ' '); throw \"the warm cache holds a reparse point: $($n.Substring(0, [Math]::Min(300, $n.Length)))\" }",
+      # THEN THE HARDLINK HALF, and before anything that walks the tree by name.
+      # -File rather than `&` so the scan runs under an execution policy this
+      # block states rather than one the image happens to have, and so its
+      # refusal arrives as an exit code that is checked on the next line instead
+      # of an exception crossing a script boundary. The uploaded copy is removed
+      # afterwards: C:\Windows\Temp is not slot-readable, but a scanner left in
+      # the image is a scanner someone will one day believe still runs.
+      "& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File 'C:\\Windows\\Temp\\scan-cache-hardlinks.ps1' -Root 'C:\\ci-cache'",
+      "if ($LASTEXITCODE -ne 0) { throw \"the warm cache did not pass the hardlink scan (exit $LASTEXITCODE)\" }",
+      "Remove-Item -LiteralPath 'C:\\Windows\\Temp\\scan-cache-hardlinks.ps1' -Force",
       # OWNERSHIP BEFORE ACLS, because a DACL does not bind the owner. Windows
       # gives an object's owner READ_CONTROL and WRITE_DAC with no ace saying so,
       # and the owner check accepts a GROUP sid in the token, so a tree
