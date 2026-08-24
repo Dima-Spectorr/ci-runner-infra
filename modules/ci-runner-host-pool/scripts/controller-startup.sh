@@ -1111,6 +1111,14 @@ PARKED_LAST_SWEEP=0
 # worth of installation rate limit on a question nothing waits on.
 PARKED_MAX_CANDIDATES=20
 PARKED_SKIPPED=0
+# DENIED IS NOT SKIPPED, and conflating them is what made the permission note
+# above a comment rather than a signal. A skipped pull request is retried on the
+# next sweep and the count is merely a lower bound; a denied one is retried
+# forever and the count is a lie. Both would have moved the same counter, so an
+# installation without `checks: read` published "the sweep is slightly behind"
+# every five minutes, indefinitely, while reporting zero parked pull requests —
+# a feature built to end a silent zero, failing by producing one.
+PARKED_DENIED=0
 # Every reason parked_verdict can return, keyed here so the series can be
 # published as a zero. A metric that only appears when something is wrong is
 # indistinguishable from a controller that stopped publishing — the same
@@ -1132,12 +1140,25 @@ collect_parked() {
   local r
   for r in "${PARKED_REASONS[@]}"; do PARKED_COUNT["$r"]=0; done
   PARKED_SKIPPED=0
+  PARKED_DENIED=0
 
   local deadline=$((sweep_start + PARKED_BUDGET))
 
-  local pulls rows
+  local pulls rows status
   pulls=$(gh_api "repos/$REPO_FULL/pulls?state=open&per_page=50") || {
-    log "parked sweep: cannot list open pull requests (status=$(cat "$STATE_DIR/api.status" 2>/dev/null))"
+    status=$(cat "$STATE_DIR/api.status" 2>/dev/null)
+    # The word DENIED is load-bearing: the alert's runbook tells the operator to
+    # grep for it, so a path that raises ci_parked_sweep_denied without printing
+    # it sends somebody to a log that has nothing to say. This path is refused
+    # for a DIFFERENT permission than the check-runs one — listing pull requests
+    # needs `pull_requests: read` — and the message says so, because the fix
+    # differs and the counter cannot carry that distinction on its own.
+    if parked_denial "$status"; then
+      PARKED_DENIED=$((PARKED_DENIED + 1))
+      log "parked sweep: DENIED listing open pull requests (status=$status) — this call needs 'pull_requests: read', not the 'checks: read' the per-pull-request call needs"
+    else
+      log "parked sweep: cannot list open pull requests (status=$status)"
+    fi
     return 0
   }
 
@@ -1167,8 +1188,17 @@ collect_parked() {
     examined=$((examined + 1))
 
     checks=$(gh_api "repos/$REPO_FULL/commits/$sha/check-runs?per_page=100") || {
-      PARKED_SKIPPED=$((PARKED_SKIPPED + 1))
-      log "parked sweep: cannot read check runs for #$num (status=$(cat "$STATE_DIR/api.status" 2>/dev/null)) — a 403 here means the App installation lacks 'checks: read' and this sweep can never report anything"
+      status=$(cat "$STATE_DIR/api.status" 2>/dev/null)
+      # A denial is counted as a denial and NOT also as a skip: the two carry
+      # opposite advice — wait, versus grant a permission — and a counter that
+      # moves for both tells the reader neither.
+      if parked_denial "$status"; then
+        PARKED_DENIED=$((PARKED_DENIED + 1))
+        log "parked sweep: DENIED reading check runs for #$num (status=$status) — the App installation lacks 'checks: read', so this sweep can never report anything until that is granted"
+      else
+        PARKED_SKIPPED=$((PARKED_SKIPPED + 1))
+        log "parked sweep: cannot read check runs for #$num (status=$status)"
+      fi
       continue
     }
 
@@ -3059,6 +3089,13 @@ queue_controller_series() {
   # budget or hit its ceiling, so the count is a lower bound rather than an
   # answer — the same contract as ci_demand_runs_skipped.
   queue_series "ci_parked_prs_skipped" "$PARKED_SKIPPED"
+  # And what makes the zero UNREADABLE if it is missing. Non-zero here means the
+  # sweep was refused rather than delayed: the count above is not a lower bound,
+  # it is nothing at all, and no number of further sweeps will improve it. This
+  # is the series to alert on, because a repository whose installation lacks
+  # `checks: read` publishes an unbroken zero from every other series in this
+  # block — which is exactly what a repository with nothing parked publishes.
+  queue_series "ci_parked_sweep_denied" "$PARKED_DENIED"
 }
 
 # --- install / run -----------------------------------------------------------
@@ -3218,6 +3255,18 @@ WDTIMEOF
   # watchdog restarts a unit, this deletes a machine, and the cheaper remedy
   # must get first refusal.
   if [ -n "$HEALTH_PORT" ]; then
+    # The heartbeat file must EXIST before the responder starts, because the
+    # unit below bind-mounts that one path into an otherwise empty view of
+    # /var/lib. A bind source that is absent at unit start is absent for the
+    # life of the process — `Restart=always` never fires, since a responder
+    # answering 503 has not exited — so a controller installed a moment before
+    # its first tick would answer 503 forever and the group would delete it on a
+    # loop. Touching it here is not a lie about liveness: the controller service
+    # is restarted a few lines below and overwrites it within one tick, and if
+    # that never happens the file ages out and the verdict flips to 503 exactly
+    # as it should.
+    touch "$STATE_DIR/heartbeat" 2>/dev/null || true
+
     cat >/opt/ci-controller/livez.py <<LIVEZEOF
 import http.server, os, time
 
@@ -3261,12 +3310,43 @@ RestartSec=10
 # It reads one file's mtime and writes a fixed string. Nothing it does needs
 # the controller's identity, and it is the only thing on this VM listening on a
 # port, so it runs as nobody.
+#
+# AND IT IS THE ONLY UNPRIVILEGED PROCESS ON THIS MACHINE. Before #308 the
+# controller ran nothing but root's own loop; adding a socket listener changed
+# what a bug in that listener would be worth. `$STATE_DIR` is created 0755 by
+# root and holds `api.body` — the last GitHub response, which on a private
+# repository is repository data — so "runs as nobody" alone would leave a
+# network-facing process able to read it.
+#
+# TemporaryFileSystem + BindReadOnlyPaths is the narrow answer: an empty tmpfs
+# is mounted over /var/lib inside this unit's namespace and exactly one path is
+# bound back in, read-only. The responder therefore sees the heartbeat and
+# NOTHING else under /var/lib — not api.body, not the drain counters. Everything
+# below it removes a capability the responder demonstrably does not use.
 User=nobody
 Group=nogroup
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+TemporaryFileSystem=/var/lib:ro
+BindReadOnlyPaths=/var/lib/ci-controller/heartbeat
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# MemoryDenyWriteExecute is deliberately NOT set. It is the one hardening on
+# this list that breaks interpreters rather than merely constraining them, and
+# a responder that fails to start is a probe that never answers, which is a
+# group deleting a healthy controller every few minutes. The blast radius of
+# each setting here is judged against that, not against a static checklist.
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

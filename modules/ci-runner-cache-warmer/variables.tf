@@ -151,38 +151,54 @@ variable "scheduler_service_account" {
 
 variable "prepare_command" {
   description = <<-EOT
-    How this repository installs its dependencies. This is the ONE thing a
-    repository is likely to have to state, and the default covers the npm
-    monorepos this fleet was built for.
+    How this repository installs its dependencies. LEAVE THIS UNSET.
 
-    `--ignore-scripts` is not decoration. Install-time lifecycle scripts are the
-    cheapest place to run code inside someone else's build, and the snapshot
-    this produces is unpacked as ROOT on every host in the pool. A repository
-    that genuinely needs its install scripts overrides this and accepts that in
-    its own tfvars, where the decision is visible.
+    Unset, the warm works it out from the repository's own lockfile —
+    pnpm-lock.yaml, yarn.lock, package-lock.json, or a bare package.json — which
+    is the one statement about package managers a repository already makes,
+    keeps current, and commits. Set, it is a claim in a Terraform root that has
+    to stay true about a repository that can switch package managers without
+    telling it, and a stale claim here does not fail an apply: it fails inside a
+    nightly build, or succeeds and installs nothing, and both look from the
+    outside like a cache that is merely cold.
+
+    The detected install runs NO lifecycle scripts. That is not decoration:
+    install-time scripts are the cheapest place to run code inside someone
+    else's build, and this snapshot is unpacked as ROOT on every host in the
+    pool. An override is where a repository accepts that trade in writing.
   EOT
   type        = string
-  default     = "npm ci --ignore-scripts"
+  default     = null
 }
 
 variable "build_command" {
   description = <<-EOT
-    The build whose artifacts are published. Its output is not kept and its exit
-    code does not fail the warm — only the files it leaves in
-    `turbo_cache_dir` matter here.
+    The build whose artifacts are published. LEAVE THIS UNSET.
 
-    The default runs every `build` task in the workspace through turbo, which is
-    what fills that directory. A repository with no turbo pipeline can set this
-    to `true` and still get the dependency snapshot.
+    Its output is not kept and its exit code does not fail the warm — only the
+    files it leaves in `turbo_cache_dir` matter. Unset, the warm re-installs
+    (detected the same way, and with lifecycle scripts, because this step exists
+    to run the repository's own build) and then runs every `build` task through
+    turbo with `--cache-dir` pointed at `turbo_cache_dir`, so where artifacts are
+    written and where they are collected cannot drift apart.
+
+    A repository with no turbo pipeline can set this to `true` and still get the
+    dependency snapshot. An override is handed `WARM_TURBO_DIR` and
+    `TURBO_CACHE_DIR` and must honour one of them.
   EOT
   type        = string
-  default     = "npx --no-install turbo run build"
+  default     = null
 }
 
 variable "turbo_cache_dir" {
   description = <<-EOT
     Where turbo leaves its finished task artifacts. The default is turbo's own
-    default inside a workspace.
+    default inside a workspace, and the default `build_command` PASSES this
+    value to turbo as `--cache-dir` — so this does not have to match anything
+    the repository's own CI does, and a repository that builds with
+    `--cache-dir=.turbo` still needs no override here. It only matters when
+    `build_command` is overridden with something that ignores both
+    `WARM_TURBO_DIR` and `TURBO_CACHE_DIR`.
 
     Each file there is `<hash>.tar.zst`, and the artifact a remote cache serves
     for `<hash>` is that same file byte for byte — which is why publishing is a
