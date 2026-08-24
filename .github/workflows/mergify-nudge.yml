@@ -265,27 +265,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Every wait below is a `type: number` input, and `number` in Actions
-          # is not `integer`: `grace-seconds: 0.5` reaches this script as the
-          # literal `0.5`. `sleep` accepts that, but `[ 0.5 -le 1155 ]` does
-          # not — it is an ARITHMETIC test, so it prints "integer expression
-          # expected" and returns false, and the clamp below reads a false
-          # there as "this wait is too long" and sleeps the ENTIRE remaining
-          # budget. Half a second would have become nineteen minutes: not a
-          # cryptic failure, a silent inversion of the thing the clamp exists
-          # to guarantee.
+          # Five `type: number` inputs reach this script — three waits in
+          # seconds and two counts — and `number` in Actions is not `integer`:
+          # `grace-seconds: 0.5` arrives as the literal `0.5`. `sleep` accepts
+          # that, but `[ 0.5 -le 1155 ]` does not — it is an ARITHMETIC test,
+          # so it prints "integer expression expected" and returns false, and
+          # the clamp below reads a false there as "this wait is too long" and
+          # sleeps the ENTIRE remaining budget. Half a second would have become
+          # nineteen minutes: not a cryptic failure, a silent inversion of the
+          # thing the clamp exists to guarantee.
           #
           # So normalise once, here, before any arithmetic sees them. Rounding
           # is UP because every one of these is a minimum — "give Mergify at
-          # least this long" — and rounding up is the only direction that
-          # cannot make the ladder more aggressive than the caller asked for.
-          # A value that is not a number at all is a misconfiguration, and it
-          # fails loudly rather than being silently treated as zero.
+          # least this long", "post at least this many" — and rounding up is
+          # the only direction that cannot make the ladder more aggressive than
+          # the caller asked for. A value that is not a plain non-negative
+          # decimal is a misconfiguration and fails loudly rather than being
+          # silently treated as zero. That deliberately includes exponent
+          # notation: `1e-7` is not a wait anyone means, and a script that
+          # quietly reinterprets an unreadable number is worse than one that
+          # stops and names the input.
           to_seconds() { # <input name> <value>
             local name="$1" v="$2" int frac
             case "$v" in
               ''|.|*[!0-9.]*|*.*.*)
-                echo "::error::$name must be a non-negative number; got '$v'" >&2
+                echo "::error::$name must be a plain non-negative number — digits and at most one '.', no sign and no exponent; got '$v'" >&2
                 return 1
                 ;;
             esac
@@ -334,6 +338,13 @@ jobs:
             fi
             if [ "$1" -gt "$left" ]; then
               echo "::warning::waiting ${left}s instead of $1s — the configured ladder does not fit in the job's ${JOB_TIMEOUT_MINUTES}-minute timeout; narrow the waits, and note the queue's checks_timeout caps this anyway"
+            fi
+            # `-ge`, not `-gt`. A wait that exactly equals the remaining budget
+            # fits, so it does not warn — but it leaves nothing behind it, and
+            # reporting success there hands the caller a budget of zero dressed
+            # up as a budget. The verdict this function returns is not "did the
+            # sleep fit", it is "is there still time after it".
+            if [ "$1" -ge "$left" ]; then
               sleep "$left"
               return 1
             fi
@@ -485,6 +496,14 @@ jobs:
             # the answer to the nudge already posted. It is the NEXT post that
             # must not happen, because there is no window left to answer it in.
             [ "$out_of_time" -eq 0 ] || break
+            # And ask the clock, not just the flag. The flag is set by the last
+            # sleep, but the PROBE between that sleep and this line spends real
+            # time too — a couple of paginated `gh api` calls — so a wait that
+            # fitted can still leave the deadline behind us by the time we get
+            # here. The question before posting again is not "did the last wait
+            # fit" but "is there any window at all left to answer the next post
+            # in", and only the clock answers that one.
+            [ "$(( deadline - $(date -u +%s) ))" -gt 0 ] || break
             nudge=$((nudge + 1))
           done
 

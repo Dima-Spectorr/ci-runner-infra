@@ -645,6 +645,14 @@ build {
     destination = "/tmp/image-vuln-ignores.txt"
   }
 
+  # The off-distro population this image is known to carry (#196). Uploaded
+  # explicitly rather than left to the script's default, which resolves against a
+  # repository root that does not exist on the build VM.
+  provisioner "file" {
+    source      = "../docs/image-vuln-offdistro.txt"
+    destination = "/tmp/image-vuln-offdistro.txt"
+  }
+
   # 11. SBOM, scan, verdict — recorded, not enforced. The enforcement is step 14,
   #     after the artifacts are safely off the VM and the scanners are gone.
   provisioner "shell" {
@@ -701,7 +709,7 @@ build {
       "grype sbom:$D/sbom.syft.json -o json --file $D/grype.json",
 
       "rc=0",
-      "bash /tmp/image-vuln-verdict.sh --report $D/grype.json --fail-on ${var.vuln_fail_on} --ignores /tmp/image-vuln-ignores.txt > $D/verdict.txt 2>&1 || rc=$?",
+      "bash /tmp/image-vuln-verdict.sh --report $D/grype.json --fail-on ${var.vuln_fail_on} --ignores /tmp/image-vuln-ignores.txt --offdistro-baseline /tmp/image-vuln-offdistro.txt > $D/verdict.txt 2>&1 || rc=$?",
       "echo $rc > $D/verdict.rc",
       "cat $D/verdict.txt",
       "rm -rf $D/db",
@@ -737,7 +745,7 @@ build {
     inline = [
       "set -eux",
       "rm -f /usr/local/bin/syft /usr/local/bin/grype",
-      "rm -rf /tmp/ci-image-scan /tmp/image-vuln-verdict.sh /tmp/image-vuln-ignores.txt",
+      "rm -rf /tmp/ci-image-scan /tmp/image-vuln-verdict.sh /tmp/image-vuln-ignores.txt /tmp/image-vuln-offdistro.txt",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
@@ -755,7 +763,7 @@ build {
       # /tmp, and the verdict is worth printing again next to the failure rather
       # than making somebody scroll a forty-minute log.
       "rc=$(cat /opt/ci-image-sbom/verdict.rc 2>/dev/null || echo 9)",
-      "if [ \"$rc\" != 0 ]; then echo '=== image vulnerability verdict: BLOCKING ==='; cat /opt/ci-image-sbom/verdict.txt; echo \"No image will be created. Fix the finding, or add a dated line to docs/image-vuln-ignores.txt.\"; exit 1; fi",
+      "if [ \"$rc\" != 0 ]; then echo '=== image vulnerability verdict: BLOCKING ==='; cat /opt/ci-image-sbom/verdict.txt; echo \"No image will be created. Fix the finding, or add a dated line to docs/image-vuln-ignores.txt. A VULN3 line is an off-distro finding this image has not carried before: review it, then add the pair to docs/image-vuln-offdistro.txt.\"; exit 1; fi",
       "echo 'image vulnerability verdict: clear'",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"

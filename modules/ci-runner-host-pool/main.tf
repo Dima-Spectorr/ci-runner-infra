@@ -115,11 +115,54 @@ locals {
   # thing it cannot delegate: the cache hydrate happens once, before the agent
   # registers, and the controller never sees it. A controller that reported on a
   # hydrate would be reporting on something it did not watch.
-  host_startup = join("\n", [
+  host_startup_source = join("\n", [
     "#!/usr/bin/env bash",
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/host-startup.sh"),
   ])
+
+  # AND IT TRAVELS COMPRESSED, BECAUSE THE PLAIN TEXT NO LONGER FITS.
+  #
+  # A GCE metadata VALUE is capped at 256 KiB. The two scripts above render to
+  # about 271 KiB, so `startup-script` stopped being a valid metadata value —
+  # and the way that presents is the reason this is worth the wrapper. Nothing
+  # warns: `terraform plan` is clean, and the APPLY fails at create time with
+  #
+  #   Error 413: Value for field 'resource.properties.metadata.items[N].value'
+  #   is too large: maximum size 262144 character(s); actual size 277764
+  #
+  # on a nightly unattended apply nobody reads. The pool keeps its previous
+  # template, the group keeps serving whatever it already booted, and the fleet
+  # silently stops taking new module code — which is exactly what happened:
+  # three pools sat on a template with a known-broken boot script for a day
+  # while every merged fix looked shipped.
+  #
+  # gzip, then base64, inlined in a quoted heredoc — the same shape the cache
+  # warmer already uses for its three staged scripts, for the same reason. It
+  # takes the value from ~271 KiB to ~125 KiB, which is not merely under the cap
+  # but leaves the script room to roughly double before it matters again. Doing
+  # it as a SECOND metadata key and fetching that key at boot would have been the
+  # other option; it is worse, because it adds a metadata round trip to the boot
+  # path and a new way to boot with no script at all.
+  #
+  # It unpacks OUTSIDE anything host-startup.sh manages. bash reads a script
+  # incrementally as it executes, so a boot script living under a directory its
+  # own code recreates could be truncated mid-run by its own housekeeping.
+  #
+  # `set -euo pipefail` is deliberate for the four lines it covers: a truncated
+  # blob must fail the boot loudly and let the register grace drain the host,
+  # never leave a host up running half a script.
+  host_startup_gz = base64gzip(local.host_startup_source)
+
+  host_startup = <<-EOT
+    #!/usr/bin/env bash
+    set -euo pipefail
+    base64 -d <<'CI_HOST_STARTUP_GZ_EOF' | gzip -d > /var/lib/ci-host-startup.sh
+    ${local.host_startup_gz}
+    CI_HOST_STARTUP_GZ_EOF
+    chmod 0700 /var/lib/ci-host-startup.sh
+    exec /var/lib/ci-host-startup.sh
+  EOT
 
   # The Windows boot script. Terraform evaluates both arms of a conditional, so
   # this is read whatever the pool's OS is; one name for the text is worth the
@@ -179,7 +222,7 @@ locals {
   # so a running controller never depends on fetching code at runtime. They are
   # separate files in the repo precisely so they can be unit-tested; embedding
   # them here is what puts the TESTED text on the box.
-  controller_startup = join("\n", [
+  controller_startup_source = join("\n", [
     "#!/usr/bin/env bash",
     file("${path.module}/scripts/drain-decision.sh"),
     file("${path.module}/scripts/orphan-decision.sh"),
@@ -224,6 +267,38 @@ locals {
     file("${path.module}/scripts/pool-table.sh"),
     file("${path.module}/scripts/controller-startup.sh"),
   ])
+
+  # AND IT TRAVELS COMPRESSED, FOR THE REASON THE HOST'S DOES.
+  #
+  # Fourteen files concatenated render to about 305 KiB, past the 256 KiB cap on
+  # a GCE metadata value. This is the SECOND half of the same outage: gzipping
+  # only the host's script got the host template created and moved the identical
+  # Error 413 one resource down, onto `google_compute_instance_template.controller`
+  #
+  #   Error 413: Value for field 'resource.properties.metadata.items[25].value'
+  #   is too large: maximum size 262144 character(s); actual size 311914
+  #
+  # and a controller that cannot be created is a pool that never scales off zero
+  # no matter how healthy its hosts are. Both halves now carry the wrapper, and
+  # the precondition below covers this one so the next script added to the list
+  # above is a red plan rather than a failed nightly apply.
+  #
+  # Same shape as the host's, and the same two deliberate choices: it unpacks to
+  # /var/lib, outside anything the controller manages, because bash reads a
+  # script incrementally as it runs; and `set -euo pipefail` makes a truncated
+  # blob a loud boot failure rather than a controller running a prefix of its
+  # own decision rules — half of which decide whether a machine is deleted.
+  controller_startup_gz = base64gzip(local.controller_startup_source)
+
+  controller_startup = <<-EOT
+    #!/usr/bin/env bash
+    set -euo pipefail
+    base64 -d <<'CI_CONTROLLER_STARTUP_GZ_EOF' | gzip -d > /var/lib/ci-controller-startup.sh
+    ${local.controller_startup_gz}
+    CI_CONTROLLER_STARTUP_GZ_EOF
+    chmod 0700 /var/lib/ci-controller-startup.sh
+    exec /var/lib/ci-controller-startup.sh
+  EOT
 
   # Merged into the controller's metadata rather than written as a `"false"`
   # key, so a pool that has not opted in renders the SAME key set it renders
@@ -444,6 +519,16 @@ resource "google_compute_instance_template" "host" {
     precondition {
       condition     = local.turbo_bucket == "" || var.turbo_cache_port != var.job_broker_port
       error_message = "pool '${var.name}' would run the build-cache server and the job credential broker on the same port (${var.job_broker_port}). One of the two would fail to bind, and which one depends on boot ordering; give turbo_cache_port a port of its own."
+    }
+
+    # Same class of failure as the tag limit below, and the one that actually
+    # bit: a metadata value over 256 KiB is refused by the API at CREATE time,
+    # so it costs a plan that reads clean and an apply that dies after the run
+    # has already started. Asserted here, the boot script's growth is a red plan
+    # with a number in it instead of a 413 in a nightly build log.
+    precondition {
+      condition     = length(local.boot_script_metadata[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"]) < 262144
+      error_message = "pool '${var.name}' renders a ${length(local.boot_script_metadata[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"])}-character boot script and a GCE metadata value is capped at 262144. The Linux script is already gzipped into its wrapper, so this means the SOURCE has outgrown even the compressed form: shorten modules/ci-runner-host-pool/scripts/host-startup.sh, or move a part of it onto the golden image. Left to the apply this is an Error 413 at create time, on a plan that read clean."
     }
 
     precondition {
@@ -781,6 +866,16 @@ resource "google_compute_instance_template" "controller" {
   # before the old one can go.
   lifecycle {
     create_before_destroy = true
+
+    # The controller's half of the metadata-size gate. Same cap, same silence:
+    # the length is checked by the API and not by the plan, so without this the
+    # first sign is a 413 on an unattended apply, and the pool it belongs to
+    # keeps whatever controller it already had while every merged fix reads as
+    # shipped.
+    precondition {
+      condition     = length(local.controller_startup) < 262144
+      error_message = "pool '${var.name}' renders a ${length(local.controller_startup)}-character controller boot script and a GCE metadata value is capped at 262144. The script is already gzipped into its wrapper, so the SOURCE has outgrown even the compressed form: shorten the decision-rule scripts under modules/ci-runner-host-pool/scripts/, or move part of the controller onto the golden image. Left to the apply this is an Error 413 at create time, on a plan that read clean — and a controller that cannot be created is a pool that never leaves zero hosts."
+    }
   }
 }
 

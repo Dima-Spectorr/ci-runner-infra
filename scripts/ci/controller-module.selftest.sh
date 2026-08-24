@@ -51,9 +51,13 @@ check() { # <name> <expected> <actual>
 # names them `${local.pool_scripts}/x.sh`. Reduced to bare filenames, the two
 # lists must be identical — including ORDER, because pool-table.sh has to be
 # concatenated before the controller that calls pool_table_parse at file scope.
-pool_list=$(sed -n '/controller_startup = join(/,/^  ])$/p' "$POOL_TF/main.tf" |
+# `controller_startup_source`, not `controller_startup`: the value that reaches
+# metadata is now a wrapper that gunzips this one, so the join is what the two
+# lists have to be read out of. Matching the shorter name would also match the
+# wrapper.
+pool_list=$(sed -n '/controller_startup_source = join(/,/^  ])$/p' "$POOL_TF/main.tf" |
   grep -o 'scripts/[a-z-]*\.sh' | sed 's|scripts/||')
-ctrl_list=$(sed -n '/controller_startup = join(/,/^  ])$/p' "$CTRL_TF/main.tf" |
+ctrl_list=$(sed -n '/controller_startup_source = join(/,/^  ])$/p' "$CTRL_TF/main.tf" |
   grep -o 'pool_scripts}/[a-z-]*\.sh' | sed 's|pool_scripts}/||')
 
 check "the controller module builds its startup from the same scripts, in order" \
@@ -291,6 +295,36 @@ check "a job with an empty steps array reports ZERO" "0" "$(sig_of ',"steps":[]'
 # above cannot fire on it.
 check "a job that completed a step reports that count" "1" \
   "$(sig_of ',"steps":[{"status":"completed"},{"status":"in_progress"}]')"
+
+# --- the controller boot script still fits in a metadata value ----------------
+#
+# 2026-08-24: the HOST script outgrew the 256 KiB cap on a GCE metadata value.
+# `terraform plan` reads clean — the length is only checked by the API — so the
+# first sign was an Error 413 at create time inside an unattended nightly apply,
+# and three pools sat for a day on a template whose boot script was already
+# known broken and already fixed. Gzipping the host's script moved the identical
+# error one resource down onto the CONTROLLER's template, which is this one:
+# fourteen files concatenated, about 305 KiB.
+#
+# Both are wrapped now, and both are asserted at plan time. This gate is the
+# cheaper half — it fails on the pull request that adds the fourteenth script,
+# not on a machine at 04:00. Budget 240 KiB against the 256 KiB cap, because
+# Terraform's base64gzip is Go's gzip at its default level while this measures
+# the runner's gzip: a compression-level difference must not be what decides
+# whether a fleet's control plane can be created.
+_cap=262144
+_margin=245760
+_files=""
+while read -r f; do
+  [ -n "$f" ] || continue
+  _files="$_files $POOL_TF/scripts/$f"
+done <<EOF
+$pool_list
+EOF
+# shellcheck disable=SC2086
+_gz=$(cat $_files | gzip | base64 -w0 | wc -c)
+check "the gzipped controller boot script fits in a metadata value (${_gz} < ${_margin}, cap ${_cap})" \
+  yes "$([ "$_gz" -lt "$_margin" ] && echo yes || echo no)"
 
 echo
 echo "$pass passed, $fail failed"
