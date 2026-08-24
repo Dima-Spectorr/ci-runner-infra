@@ -1131,13 +1131,24 @@ the cache layer reads through `Get-CacheMetadataResult`, which distinguishes a
 "phase 7 is the one phase that does not end in `Deny-Boot`", applied to a call
 that would otherwise have imported the opposite one.
 
-**The gap this leaves.** `host-startup.sh` publishes `ci_cache_hydrate_verdict`,
+**And it is reported.** `host-startup.sh` publishes `ci_cache_hydrate_verdict`,
 `ci_cache_hydrate_seconds`, `ci_cache_snapshot_age_hours`,
-`ci_cache_snapshot_bytes` and `ci_cache_dirs_hydrated`. This file has no metric
-client at all, so the Windows verdict is one boot-log line and nothing else: a
-Windows pool that has silently stopped hydrating is indistinguishable, in
-monitoring, from one that was never given a bucket. That is a real gap, it is
-named here rather than papered over, and it is tracked as its own issue.
+`ci_cache_snapshot_bytes` and `ci_cache_dirs_hydrated`; this file publishes the
+same five, under the same names, on the same `generic_node` resource labelled
+`repo` and `pool` (#252). It cannot dot-source `telemetry.sh`, so the publisher
+is a second implementation of the same contract, and
+`scripts/ci/metric-contract.selftest.sh` fails if either host stops sending a
+series the other still does — the union alone would not notice, which is exactly
+how a Windows pool came to answer a chart with "no data yet" for a release.
+
+Three properties make a metric write safe on this boot path. The token is read
+through `Get-CacheMetadataResult`, so a monitoring outage cannot cost a host its
+registration. The POST is bounded by the same HTTP timeout as the rest of phase
+7, because phase 7 runs in front of the agent registering. And the flush skips
+cleanly when any resource label is empty, rather than sending a request the API
+rejects whole — which would drop every series in it, including the verdict that
+says why. Age and size are recorded before the bounds that may reject the
+snapshot, so a `too-old` verdict arrives with the number that produced it.
 
 ---
 

@@ -2555,7 +2555,147 @@ mutate "a timed-out walk handing back the entries it did manage to read" \
   's|Entries = @(); Failed = \$failed; TimedOut = \$true|Entries = $entries.ToArray(); Failed = $failed; TimedOut = $true|' \
   has_hydrate_bounds_honoured
 
-# --- invariant 13: a cached file's other name cannot be outside the tree -----
+# --- invariant 13: the hydrate is REPORTED, not just performed ---------------
+#
+# Every failure mode invariant 12 bounds is silent by design: the layer fails
+# open, so a pool that stopped hydrating and a pool hydrating perfectly both
+# look like "jobs are a bit slow". The five series below are the only difference
+# between those two, and they are the half of the contract that is invisible
+# from this host -- nothing on the box goes red when they stop being sent.
+#
+# THE NAMES ARE SHARED WITH host-startup.sh. metric-contract.selftest.sh proves
+# the two hosts publish the same set; this file proves THIS host publishes them
+# from the right places, with the values recorded at the moments that make them
+# mean anything.
+
+has_hydrate_reported() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # THE FIVE SERIES. A Windows pool answering one of these with an empty chart
+  # reads as "no data yet", not as "this pool never reports" -- which is why the
+  # gap #252 closed survived a release.
+  matches "$code" "Add-MetricSeries -Name 'ci_cache_hydrate_verdict'" || return 1
+  matches "$code" "Add-MetricSeries -Name 'ci_cache_hydrate_seconds'" || return 1
+  matches "$code" "Add-MetricSeries -Name 'ci_cache_snapshot_age_hours'" || return 1
+  matches "$code" "Add-MetricSeries -Name 'ci_cache_snapshot_bytes'" || return 1
+  matches "$code" "Add-MetricSeries -Name 'ci_cache_dirs_hydrated'" || return 1
+
+  # THE CLOCK STARTS OUTSIDE THE TRY. The throw path is the one whose duration
+  # nobody can otherwise account for, and it is the path a seconds series is
+  # most wanted on: started inside the bounded half, a hydrate that threw
+  # publishes a duration of zero and looks like the fastest boot in the fleet.
+  local clock_at bounded_at
+  clock_at=$(printf '%s\n' "$code" | grep -n '^    \$started = \[datetime\]::UtcNow$' | cut -d: -f1 | sed -n '$p')
+  bounded_at=$(printf '%s\n' "$code" | grep -n '\$verdict = Invoke-CacheHydrateBounded -Master \$Master' | cut -d: -f1 | sed -n 1p)
+  [ -n "$clock_at" ] && [ -n "$bounded_at" ] || return 1
+  [ "$clock_at" -lt "$bounded_at" ] || return 1
+
+  # AFTER THE LOG LINE, NEVER INSTEAD OF IT. The log is what an operator reads on
+  # a host they are already looking at; the metric is for the fleet nobody is
+  # looking at. Publishing in place of the log trades the diagnosis you have for
+  # the one you might.
+  local log_at pub_at
+  log_at=$(printf '%s\n' "$code" | grep -n 'Write-BootLog "phase 7: cache hydrate verdict' | cut -d: -f1 | sed -n 1p)
+  pub_at=$(printf '%s\n' "$code" | grep -n '\$null = Publish-CacheTelemetry -Verdict \$verdict' | cut -d: -f1 | sed -n 1p)
+  [ -n "$log_at" ] && [ -n "$pub_at" ] || return 1
+  [ "$log_at" -lt "$pub_at" ] || return 1
+
+  # AGE AND SIZE ARE RECORDED BEFORE THE BOUNDS THAT MAY REJECT THEM, exactly as
+  # on Linux. A `too-old` verdict is only actionable next to the age that
+  # produced it: recorded after the refusal, the one snapshot whose age anybody
+  # wants is the one snapshot whose age is never published.
+  local age_at refusal_at
+  age_at=$(printf '%s\n' "$code" | grep -n '\$script:CacheSnapAgeHours = \$age' | cut -d: -f1 | sed -n 1p)
+  refusal_at=$(printf '%s\n' "$code" | grep -n '\$refusal = Get-CacheSnapshotRefusal' | cut -d: -f1 | sed -n 1p)
+  [ -n "$age_at" ] && [ -n "$refusal_at" ] || return 1
+  [ "$age_at" -lt "$refusal_at" ] || return 1
+  matches "$code" '\$script:CacheSnapBytes = \$size' || return 1
+
+  # The count comes from the move's OWN return, not from a directory listing
+  # taken afterwards: a listing counts what is there, and what is there includes
+  # everything the image baked.
+  matches "$code" '\$script:CacheDirsHydrated = \$moved' || return 1
+
+  # TELEMETRY MUST NOT COST A HOST ITS REGISTRATION. Get-MetadataValue denies the
+  # boot when the metadata server does not answer -- correct for identity, and
+  # catastrophic here: a host refusing to register because it could not publish a
+  # chart is a missing host, and the pool answers a missing host by queueing jobs.
+  matches "$code" "Get-CacheMetadataResult -Path 'instance/service-accounts/default/token'" || return 1
+
+  # And bounded, for the same reason the hydrate is: phase 7 runs in front of
+  # agent registration, so an unbounded POST is a host recycled for never
+  # registering.
+  matches "$code" '-TimeoutSec \$script:HttpTimeoutSeconds' || return 1
+
+  # SKIP CLEANLY RATHER THAN PUBLISH A REQUEST THE API REJECTS WHOLE. One missing
+  # metadata read would otherwise drop every series in the flush -- including the
+  # verdict that says why -- and log a 400 nobody reads.
+  matches "$code" '\[string\]::IsNullOrWhiteSpace\(\$script:MetricRegion\)' || return 1
+  matches "$code" '\[string\]::IsNullOrWhiteSpace\(\$script:MetricRepo\)' || return 1
+
+  # An empty verdict is named, not dropped. A verdict series that silently stops
+  # being published looks exactly like a pool that stopped hydrating.
+  matches "$code" "\\\$stated = 'unset'" || return 1
+
+  # INITIALISED IN PHASE 0, from the attributes phase 0 has just read. Phase 7
+  # must not read them again: it runs on a boot budget, and a second metadata
+  # round trip for a label is a round trip spent not hydrating.
+  local init_at hyd_at
+  init_at=$(printf '%s\n' "$code" | grep -n 'Initialize-CacheTelemetry -Config \$cfg' | cut -d: -f1 | sed -n 1p)
+  hyd_at=$(printf '%s\n' "$code" | grep -n '\$null = Invoke-CacheHydrate$' | cut -d: -f1 | sed -n 1p)
+  [ -n "$init_at" ] && [ -n "$hyd_at" ] || return 1
+  [ "$init_at" -lt "$hyd_at" ] || return 1
+}
+
+if has_hydrate_reported "$SCRIPT"; then
+  ok
+else
+  bad "the cache hydrate is performed but not reported — a series is missing, the clock or the age is taken at a moment that makes it meaningless, the publish stands in for the boot log, or the metric write can deny the boot; every one of these leaves a Windows pool whose cache layer is invisible to the fleet dashboard while the host itself looks healthy"
+fi
+
+# --- group 28: the reporting half goes quiet ---------------------------------
+mutate "the verdict series dropped, so a pool that stopped hydrating still charts nothing" \
+  "s|Add-MetricSeries -Name 'ci_cache_hydrate_verdict'|Add-MetricSeries -Name 'ci_cache_verdict'|" \
+  has_hydrate_reported
+mutate "the age series renamed, so it stops joining the Linux pools' chart" \
+  "s|Add-MetricSeries -Name 'ci_cache_snapshot_age_hours'|Add-MetricSeries -Name 'ci_cache_age_hours'|" \
+  has_hydrate_reported
+mutate "the hydrated-directory count no longer published" \
+  "s|Add-MetricSeries -Name 'ci_cache_dirs_hydrated'|Add-MetricSeries -Name 'ci_cache_dirs'|" \
+  has_hydrate_reported
+mutate "the seconds clock started after the guard, so a hydrate that threw reports zero" \
+  's|^    \$started = \[datetime\]::UtcNow$|    $null = 0|' \
+  has_hydrate_reported
+mutate "the boot log traded for the metric write" \
+  's|^    Write-BootLog "phase 7: cache hydrate verdict: \$verdict"$|    $null = $verdict|' \
+  has_hydrate_reported
+mutate "the age recorded after the bound that may reject it" \
+  's|^        \$script:CacheSnapAgeHours = \$age$|        $null = $age|' \
+  has_hydrate_reported
+mutate "the snapshot size never recorded" \
+  's|\$script:CacheSnapBytes = \$size|$null = $size|' \
+  has_hydrate_reported
+mutate "the hydrated count taken from anything but the move's own return" \
+  's|\$script:CacheDirsHydrated = \$moved|$null = $moved|' \
+  has_hydrate_reported
+mutate "the telemetry token read through the fence that denies the boot" \
+  "s|Get-CacheMetadataResult -Path 'instance/service-accounts/default/token'|Get-MetadataValue 'instance/service-accounts/default/token'|" \
+  has_hydrate_reported
+mutate "the metric POST left unbounded in front of agent registration" \
+  's|-TimeoutSec \$script:HttpTimeoutSeconds|-TimeoutSec 0|' \
+  has_hydrate_reported
+mutate "the empty-label guard dropped, so one missing read drops every series" \
+  's|\[string\]::IsNullOrWhiteSpace(\$script:MetricRegion)|$false|' \
+  has_hydrate_reported
+mutate "an empty verdict published as an empty label instead of being named" \
+  "s|if (\[string\]::IsNullOrWhiteSpace(\$stated)) { \$stated = 'unset' }|\$null = \$stated|" \
+  has_hydrate_reported
+mutate "the telemetry never initialised, so phase 7 publishes with no labels" \
+  's|Initialize-CacheTelemetry -Config \$cfg|$null = $cfg|' \
+  has_hydrate_reported
+
+# --- invariant 14: a cached file's other name cannot be outside the tree -----
 #
 # THE SECOND WAY ONE FILE ENDS UP WITH TWO ACLS, and the one Get-ChildItem
 # cannot see. A reparse point announces itself in an attribute; a hardlink does
@@ -2684,7 +2824,7 @@ else
   bad "packer/windows/scan-cache-hardlinks.ps1 is missing, does not read a link count, does not fail closed on an unreadable file, or forbids hardlinks outright instead of counting the names it can see"
 fi
 
-# --- group 28: the hardlink half of the scan --------------------------------
+# --- group 29: the hardlink half of the scan --------------------------------
 #
 # The boot-script half goes through `mutate`; the two build-time files need a
 # helper that takes the file, because `mutate` only ever edits $SCRIPT.
