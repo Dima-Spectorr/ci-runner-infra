@@ -729,7 +729,7 @@ rc=0
 # writers go FIRST -- the containers here, the processes that are not in one
 # right after -- the removal is what comes last, and the marker is written over
 # a slot nothing has been able to touch since.
-slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, or empty>
+slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, or empty> <slot idx>
   local d owner pid line rest state ppid p hops spared
   # ONE stat for the whole of /proc rather than one per pid, and the difference
   # is not cosmetic: this runs between every pair of jobs on a host with several
@@ -766,7 +766,28 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     # talks to it and the next job needs its socket -- and the containers under
     # it are already gone by the time this runs, removed through docker, which
     # is where that job belongs and where \`-v\` takes their volumes with them.
-    grep -q "user@\$1\.service" "\$d/cgroup" 2>/dev/null && continue
+    #
+    # AND \`ci-dockerd@<idx>.service\` BY NAME, because on this host the rootless
+    # daemon is NOT under \`user@<uid>.service\`. It is a SYSTEM unit with
+    # \`User=ci-s%i\` (see the unit written further down), so its processes are
+    # owned by the slot uid -- which is what selects them here -- while its
+    # cgroup is \`ci-dockerd@<idx>.service\`. The \`user@\` test above therefore
+    # matched nothing, and dockerd, its containerd, rootlesskit and the network
+    # helper were reaped as "processes that outlived the last job".
+    #
+    # That is how a whole fleet lost its runners on 2026-08-24. The agent unit
+    # declares \`BindsTo=ci-dockerd@<idx>.service\`, so killing the daemon stopped
+    # \`ci-runner@<idx>.service\` -- and this function runs as that very unit's
+    # \`ExecStartPre=+\`, so the reset killed the service it was the first step of:
+    #
+    #   slot 1: 5 process(es) outlived the last job -- terminating them
+    #   ci-runner@1.service: Control process exited, code=killed, status=15/TERM
+    #   slot 1: ci-runner@1.service did not start; slot will not serve
+    #   no slot registered - host is useless and will be drained by the controller
+    #
+    # every slot, every host, every boot. The pool then drained the host as a
+    # failed registration and rebuilt it from the same template, forever.
+    grep -qE "user@\$1\.service|ci-dockerd@\${5:-%}\.service" "\$d/cgroup" 2>/dev/null && continue
     # AND THE AGENT'S OWN TREE, when the agent is not already on the chain above.
     # See quiesce_slot for which caller is which; here it is one parent walk per
     # candidate, stopped at pid 1 and bounded so that a /proc read racing with an
@@ -875,7 +896,7 @@ quiesce_slot() {
     fi
   fi
 
-  targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit")
+  targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
   [ -n "\$targets" ] || return 0
   say "slot \$idx: \$(printf '%s\n' "\$targets" | grep -c .) process(es) outlived the last job -- terminating them"
 
@@ -885,7 +906,7 @@ quiesce_slot() {
     # shellcheck disable=SC2086
     kill -TERM \$targets 2>/dev/null
     sleep 0.5
-    targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit")
+    targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
     [ -n "\$targets" ] || return 0
     tick=\$((tick + 1))
   done
@@ -895,7 +916,7 @@ quiesce_slot() {
     # shellcheck disable=SC2086
     kill -KILL \$targets 2>/dev/null
     sleep 0.5
-    targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit")
+    targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
     [ -n "\$targets" ] || return 0
     tick=\$((tick + 1))
   done
