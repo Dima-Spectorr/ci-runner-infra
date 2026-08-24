@@ -47,7 +47,7 @@ jobs:
   # list: it reads every `shell-*` job back out of this file and asserts the list
   # names all of them.
   shell-lint:
-    name: Shell — lint (bash -n + shellcheck)
+    name: Shell — lint (bash -n + shellcheck + workflow shell)
     runs-on: ubuntu-latest
     # Without this a hung job inherits GitHub's 360-minute default. On a
     # self-hosted pool that holds a host for six hours; here it merely wastes
@@ -86,14 +86,13 @@ jobs:
           find . -name '*.sh' -print0 \
             | timeout 300 xargs -0 -n1 shellcheck -e SC1090,SC1091
 
-  shell-config-gates:
-    name: Shell — config gates (workflow, packer, pipefail)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      # `shell-lint` reads every `*.sh` in the tree and nothing else — and
+      # THE TWO STEPS ABOVE, AND THESE TWO, SHARE A JOB BECAUSE THEY SHARE A
+      # TOOL. `check-workflow-shell.sh` runs shellcheck and refuses to run
+      # without it (WFS0), so it belongs wherever shellcheck is installed —
+      # splitting it into the config-gate job below would cost a second apt
+      # install to avoid a fail-closed gate, which is the worse trade.
+      #
+      # The two steps above read every `*.sh` in the tree and nothing else — and
       # a composite action's `run:` blocks are shell that lives in a `.yml`. The
       # pull request that added `.github/actions/playwright-ui/action.yml` had
       # two real shellcheck findings in its `.sh` files and several unread
@@ -110,6 +109,13 @@ jobs:
 
       - name: workflow shell gate
         run: bash scripts/ci/check-workflow-shell.sh
+
+  shell-config-gates:
+    name: Shell — config gates (packer, pipefail)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # And those sweeps read the shell as shell, which leaves one interpreter
       # question they cannot ask: a packer `inline` block is a script whose
