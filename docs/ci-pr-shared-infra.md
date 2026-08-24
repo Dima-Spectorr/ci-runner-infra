@@ -222,7 +222,9 @@ preemption — and the series `ci_pinned_runs_cancelled` is where that shows up.
 ```
 
 Every fleet-reachable Linux job in a `pull_request` workflow does this, except
-the anchor itself. `RUNNER9` checks it.
+the anchor itself and jobs in **called** workflows, which cannot see `needs.`
+across the `uses:` boundary and take the array as a required input instead (see
+below). `RUNNER9` checks it.
 
 This is dynamic runner selection, which `RUNNER5` reports as UNDECIDED, so the
 gate is run with `--allow-dynamic-runner` **in the same pull request that makes
@@ -231,7 +233,8 @@ period: it fires on the expression itself, so the commit that introduces the
 idiom is the commit that turns the gate red.
 
 `RUNNER9` supplies the specificity that flag gives up: not merely an expression,
-but one naming the anchor job's output.
+but one naming the anchor job's output — or, in a called workflow, a required
+input the caller can only fill from it.
 
 ### Do not put the fork guard in the anchor's `if:`
 
@@ -734,6 +737,66 @@ exists so that rule 1 can be adopted without rule 2 — which is exactly what
 step 4 is. Passing no `compose-file` at all takes the input's `ci/compose.yaml`
 default instead and the bring-up runs, so step 4 must spell the empty string
 out. Step 5 is where the real value replaces it.
+
+### A job in a CALLED workflow takes the pool as a required input
+
+"Point every other fleet Linux job at its output" is written for jobs that sit
+beside the anchor. A `needs.` reference does not cross a `uses:` boundary, so a
+job in a called workflow — a `codeql.yml`, a `gitleaks.yml`, a `genericity.yml`
+— cannot read the anchor at all. The array has to arrive as a `workflow_call`
+input:
+
+```yaml
+# callee: codeql.yml
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: The JSON pool array published by the caller's anchor.
+        required: true          # ← load-bearing; see below
+        type: string
+  push:
+    branches: [main]
+jobs:
+  analyze:
+    runs-on: ${{ inputs.runner != '' && fromJSON(inputs.runner) || fromJSON('["self-hosted","linux","gcp","ExampleRepo"]') }}
+```
+
+```yaml
+# caller: ci.yml
+  codeql:
+    needs: [anchor]
+    uses: ./.github/workflows/codeql.yml
+    with:
+      runner: ${{ needs.anchor.outputs.runs-on }}
+```
+
+Two parts of that are easy to get wrong.
+
+**The fallback has to live in the job expression, not in a `default:`.** The
+`inputs` context is not populated for `push` or `schedule` at all, so an input
+default never applies on those legs — `inputs.runner` is empty there whatever
+the callee declares, and a `runs-on` of `${{ fromJSON(inputs.runner) }}` alone
+fails to parse rather than falling back. The pool literal in the expression is
+the *non-pull-request* legs' pool, and it is correct.
+
+**`required: true` is what makes this a pin.** RUNNER9 accepts a job whose
+`runs-on` resolves from a required `workflow_call` input in a file that declares
+no pull-request trigger of its own, and it accepts nothing weaker:
+
+- Declared `required: false`, a caller that omits the `with:` line starts
+  perfectly well and the callee takes the pool literal — a second host, in the
+  one arrangement where neither file shows it happening. Required, GitHub
+  refuses to start the call, which is a stronger guarantee than a gate reading
+  the caller's `with:` block could give.
+- Give the callee its own `pull_request:` trigger and the exemption is gone,
+  correctly: the file then opens a *second run* for the same pull request, and
+  in that run `inputs` is empty and the literal is the pool the job lands on.
+  A callee that participates in pull-request CI does so through its caller.
+
+The gate reported this shape as a bare pool literal until 2026-08-24 (#363) —
+eleven correct jobs across two repositories — for the same reason as the `@v5`
+contradiction in #351: the published idiom had no fixture.
 
 ## 8. What a consuming repository must not do
 
