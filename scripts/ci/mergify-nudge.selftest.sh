@@ -115,8 +115,8 @@ ignores_a_non_verdict() {
 # how the automation gets muted.
 waits_out_the_healthy_case() {
   local code; code=$(code_of "$1")
-  matches "$code" 'sleep "\$GRACE"' || return 1
-  matches "$code" 'sleep "\$INTERVAL"' || return 1
+  matches "$code" 'bounded_sleep "\$GRACE"' || return 1
+  matches "$code" 'bounded_sleep "\$INTERVAL"' || return 1
 }
 
 # Posting the command ONCE is not a nudge, it is a coin flip. The comment
@@ -131,7 +131,7 @@ retries_an_unanswered_nudge() {
   local code; code=$(code_of "$1")
   matches "$code" 'post_nudge "\$nudge"' || return 1
   matches "$code" '\[ "\$nudge" -lt "\$NUDGE_ATTEMPTS" \]' || return 1
-  matches "$code" 'sleep "\$CONFIRM"' || return 1
+  matches "$code" 'bounded_sleep "\$CONFIRM"' || return 1
   # And the retry must be driven by a real re-read of Mergify's check-runs, not
   # by the timer alone: a ladder that posts N comments regardless answers a
   # Mergify that already replied with two more comments.
@@ -149,12 +149,14 @@ confirms_the_last_nudge_before_warning() {
   # the warning below them is not evidence of anything.
   # Reset on EVERY `done`, so only the run of lines after the LAST one counts.
   # Anchoring on the first `done` instead lets the ladder's own in-loop wait and
-  # probe satisfy this, and the assertion passes with the tail deleted.
+  # probe satisfy this, and the assertion passes with the tail deleted. The
+  # trailing `[[:space:]]*$` matters: `done <<EOF` closes the loop inside
+  # `post_nudge` and a bare `done$` walks straight past it.
   printf '%s\n' "$code" | awk '
-    /^[[:space:]]*done$/                  { waited = probed = hit = 0; next }
-    /sleep "\$CONFIRM"/                   { waited = 1 }
-    waited && /if mergify_seen_it; then/  { probed = 1 }
-    probed && /^[[:space:]]*exit 0$/      { hit = 1 }
+    /^[[:space:]]*done([[:space:]].*)?$/    { waited = probed = hit = 0; next }
+    /bounded_sleep "\$CONFIRM"/             { waited = 1 }
+    waited && /if mergify_seen_it; then/    { probed = 1 }
+    probed && /^[[:space:]]*exit 0$/        { hit = 1 }
     END { exit !hit }
   '
 }
@@ -244,10 +246,28 @@ keeps_expressions_out_of_the_shell() {
 }
 
 # The job sleeps by design, so an unbounded one is a job that can sleep for six
-# hours against the account's concurrency.
+# hours against the account's concurrency. But the bound has to be big enough
+# to cover the waits it sits over: every one of them is an input, and at
+# `confirm-seconds: 240` the ladder needs ~12 minutes, so a hard 10 had GitHub
+# cancel the job mid-wait — no final probe, no warning, a red run on a
+# configuration this workflow documents as supported.
+#
+# Deriving it from the inputs is not available: RUNNER6 refuses a
+# `timeout-minutes` it cannot resolve to a number, on the grounds that a bound
+# nobody can evaluate is not a bound. So it is a literal, and the safety comes
+# from the shell clamping its own sleeps to the SAME number — which is only
+# true while the two stay equal, and they are in different halves of the file.
 is_bounded() {
   local code; code=$(code_of "$1")
-  matches "$code" '^    timeout-minutes: [0-9]+$' || return 1
+  local job env
+  job=$(printf '%s\n' "$code" | sed -n 's|^    timeout-minutes: \([0-9]\+\)$|\1|p')
+  env=$(printf '%s\n' "$code" | sed -n 's|^          JOB_TIMEOUT_MINUTES: \([0-9]\+\)$|\1|p')
+  [ -n "$job" ] && [ "$job" = "$env" ] || return 1
+  matches "$code" 'deadline=\$\(\( \$\(date -u \+%s\) \+ JOB_TIMEOUT_MINUTES \* 60' || return 1
+  matches "$code" '^          bounded_sleep\(\) \{' || return 1
+  # Every wait goes through the clamp, or the one that does not is the one that
+  # runs past the timeout.
+  ! matches "$code" '^ +sleep "\$(GRACE|INTERVAL|CONFIRM)"$' || return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -390,9 +410,9 @@ mutate "failure is dropped from the verdicts" "$CALLEE" \
 mutate "the catch-all arm is removed, so every conclusion nudges" "$CALLEE" \
   's|^            \*)$|            never_matches)|'                   ignores_a_non_verdict
 mutate "the grace period is removed" "$CALLEE" \
-  's|^          sleep "\$GRACE"$|          :|'                        waits_out_the_healthy_case
+  's|^          bounded_sleep "\$GRACE"$|          :|'                waits_out_the_healthy_case
 mutate "the retry interval is removed" "$CALLEE" \
-  's|^            sleep "\$INTERVAL"$|            :|'                 waits_out_the_healthy_case
+  's|^            bounded_sleep "\$INTERVAL"$|            :|'          waits_out_the_healthy_case
 mutate "the check-run probe stops paginating" "$CALLEE" \
   's|gh api --paginate "repos/\$GITHUB_REPOSITORY/commits|gh api "repos/$GITHUB_REPOSITORY/commits|' reads_every_check_run_page
 mutate "the pages are queried one at a time instead of slurped" "$CALLEE" \
@@ -400,13 +420,13 @@ mutate "the pages are queried one at a time instead of slurped" "$CALLEE" \
 mutate "the nudge is posted once and never re-sent" "$CALLEE" \
   's|\[ "\$nudge" -lt "\$NUDGE_ATTEMPTS" \]|false|'                    retries_an_unanswered_nudge
 mutate "the retry stops waiting for an answer before re-posting" "$CALLEE" \
-  's|sleep "\$CONFIRM"|:|'                                            retries_an_unanswered_nudge
+  's|bounded_sleep "\$CONFIRM"|:|'                                    retries_an_unanswered_nudge
 mutate "the ladder posts on a timer instead of checking Mergify" "$CALLEE" \
   's|if mergify_seen_it; then|if false; then|g'                       retries_an_unanswered_nudge
-# Ten spaces, not twelve: the identical `sleep "$CONFIRM"` inside the loop is
+# Ten spaces, not twelve: the identical `bounded_sleep "$CONFIRM"` in the loop is
 # one indent deeper, so this deletes the trailing confirmation and nothing else.
 mutate "the last nudge loses the confirmation window and warns over a success" "$CALLEE" \
-  's|^          sleep "\$CONFIRM"$||'                                 confirms_the_last_nudge_before_warning
+  's|^          bounded_sleep "\$CONFIRM"$||'                          confirms_the_last_nudge_before_warning
 mutate "the early exit is removed, so it always posts" "$CALLEE" \
   's|^              exit 0$|              true|'                      posts_only_when_mergify_is_behind
 mutate "Mergify is matched by check name instead of by app" "$CALLEE" \
@@ -430,7 +450,11 @@ mutate "the loop is fed nothing, so it nudges no pull request at all" "$CALLEE" 
 mutate "an expression is spliced into the shell" "$CALLEE" \
   's|\$RUN_URL|${{ github.event.workflow_run.html_url }}|'            keeps_expressions_out_of_the_shell
 mutate "the timeout is removed" "$CALLEE" \
-  's|^    timeout-minutes: [0-9]*$|    # unbounded|'                  is_bounded
+  's|^    timeout-minutes: .*$|    # unbounded|'                      is_bounded
+mutate "the job timeout and the clamp drift apart" "$CALLEE" \
+  's|^    timeout-minutes: .*$|    timeout-minutes: 10|'              is_bounded
+mutate "a wait escapes the clamp and can outlast the timeout" "$CALLEE" \
+  's|^          bounded_sleep "\$GRACE"$|          sleep "\$GRACE"|'   is_bounded
 
 mutate "the caller no longer fires on completion" "$CALLER" \
   's|^    types: \[completed\]$|    types: [requested]|'              triggers_on_ci_completion
