@@ -74,6 +74,22 @@ entire dependency tree and then died on that check. The install is best effort:
 if it fails, the publisher's own check fires one line later and names the
 package.
 
+**It also passes the repository's credential-scan allowlist**, the other thing
+the replaced workflow did in both of its jobs. The publisher refuses a staged
+tree holding what looks like an embedded credential, and dependency trees
+legitimately hold such files — a package's PEM test fixture, a README quoting
+`https://user:pass@host`. The way past is a named, commented digest in an
+allowlist file, never a widened rule, and for a `url-embedded-basic-auth` hit
+the *file* is the only route: the bare-hex `CACHE_SCAN_ALLOW_DIGESTS` will not
+excuse that class. `cache_scan_allow_file` defaults to `null`, which uses
+`.github/cache-scan-allow.txt` if the checkout has one — so a repository that
+keeps its allowlist where everyone else does configures nothing. Name a path
+and it must exist: an allowlist that is not there excuses nothing and reads
+exactly like one that worked. Set `""` to turn the lookup off — which is a
+different statement from the default, and the one to use for a repository that
+must never excuse anything, so that a file appearing at the conventional path
+later does not quietly start being honoured.
+
 Run the first warm by hand rather than waiting for 04:00 — until one completes,
 both caches are empty, which is a supported state and looks exactly like a warm
 that is failing:

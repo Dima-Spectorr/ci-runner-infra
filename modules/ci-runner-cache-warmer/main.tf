@@ -213,6 +213,7 @@ locals {
     ${local.turbo_gz}
     TURBO_GZ_EOF
     chmod +x ${local.staged_dir}/publish-cache-snapshot.sh ${local.staged_dir}/scan-cache-credentials.sh ${local.staged_dir}/warm-turbo.sh
+    ${local.stage_scan_allow}
   EOT
 
   # A no-op today — there is no `$` in base64 — and kept because the day someone
@@ -266,7 +267,80 @@ locals {
   # it needs no substitution escaping; adding one means escaping it.
   ensure_getcap = "if ! command -v getcap >/dev/null 2>&1; then\n  if command -v apt-get >/dev/null 2>&1; then\n    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends libcap2-bin >/dev/null 2>&1 || true\n  elif command -v apk >/dev/null 2>&1; then\n    apk add --no-cache libcap-getcap >/dev/null 2>&1 || apk add --no-cache libcap >/dev/null 2>&1 || true\n  fi\nfi\n"
 
-  run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\n${local.ensure_getcap}exec ${local.staged_dir}/publish-cache-snapshot.sh\n"
+  # AND THE CREDENTIAL SCAN NEEDS THE REPOSITORY'S ALLOWLIST, FOR THE SAME REASON
+  # THE getcap INSTALL DOES: the workflow this module replaces passed
+  # CACHE_SCAN_ALLOW_FILE in BOTH of its jobs, and nothing was carrying it over.
+  #
+  # The scan refuses a staged tree holding what looks like an embedded
+  # credential, and dependency trees legitimately contain such files — a test
+  # fixture that is a PEM, a package README quoting `https://user:pass@host`.
+  # Refusing them is right; the way past is a named, commented digest, never a
+  # widened rule. `url-embedded-basic-auth` in particular is excusable ONLY from
+  # the allowlist FILE, where a comment says which package ships it, and never
+  # from the bare-hex CACHE_SCAN_ALLOW_DIGESTS. So the file is the only route,
+  # and a warmer that cannot pass one cannot warm such a repository at all.
+  #
+  # Resolved at warm time against the checkout rather than asserted in a plan.
+  # The path is a convention with a default, so the ordinary repository
+  # configures nothing; a repository with no such file excuses nothing, which is
+  # the correct starting state. But an operator who NAMED a path and mistyped it
+  # must not get that same silence — an allowlist that is not there reads exactly
+  # like one that worked — so a non-default path that is missing fails, and it
+  # fails in the STAGING step, before the install rather than after it.
+  #
+  # `null` means the convention and is the default; a named path is a claim the
+  # operator made and is therefore required to exist; `""` turns the lookup off.
+  #
+  # CAPTURED BEFORE ANY REPOSITORY CODE RUNS, AND READ FROM THE CAPTURE AFTERWARDS.
+  # The publish phase re-scans the archive it is handed rather than trusting the
+  # phase that produced it — an artifact that crossed a step boundary is input —
+  # and an allowlist re-read from the live checkout would walk straight through
+  # that: the build step runs the repository's lifecycle scripts and can write to
+  # /workspace, so it could rewrite BOTH the archive and the file saying which
+  # digests are excusable, and have the credentialed phase accept the result.
+  # Copying it in `stage-scripts`, which runs before the install, closes that
+  # ordering: the file both phases read is the reviewed one.
+  #
+  # It is a shape, not a boundary, and the module is honest about which: the
+  # copy still lives in /workspace, and Cloud Build cannot scope a step's
+  # identity, so a build step that wanted to publish forged content can already
+  # mint the token and do it directly (see the README). What this removes is the
+  # ordering gap and the whole accidental class — a build that rewrites
+  # `.github/` for its own reasons and silently widens the scan.
+  scan_allow_default  = ".github/cache-scan-allow.txt"
+  scan_allow_rel      = var.cache_scan_allow_file == null ? local.scan_allow_default : var.cache_scan_allow_file
+  scan_allow_path     = local.scan_allow_rel == "" ? "" : "/workspace/${local.scan_allow_rel}"
+  scan_allow_staged   = "${local.staged_dir}/cache-scan-allow.txt"
+  scan_allow_required = var.cache_scan_allow_file != null && var.cache_scan_allow_file != ""
+
+  # Goes into the staging script, which IS put through `escape_dollars`, so a `$`
+  # here survives; there is none, and `sha256sum` is printed as its own command
+  # rather than substituted for exactly that reason.
+  stage_scan_allow = local.scan_allow_path == "" ? "" : join("", [
+    "if [ -f '${local.scan_allow_path}' ]; then\n",
+    "  cp '${local.scan_allow_path}' '${local.scan_allow_staged}'\n",
+    "  echo '[warm] credential-scan allowlist captured before any repository code ran: ${local.scan_allow_rel}'\n",
+    "  sha256sum '${local.scan_allow_staged}'\n",
+    "else\n",
+    local.scan_allow_required
+    ? "  echo '[warm] cache_scan_allow_file names ${local.scan_allow_rel}, which is not in the checkout - refusing, because an allowlist that is not there excuses nothing and reads exactly like one that worked' >&2\n  exit 1\n"
+    : "  echo '[warm] no credential-scan allowlist at ${local.scan_allow_rel}; the scan will excuse nothing'\n",
+    "fi",
+  ])
+
+  # And the publisher reads the CAPTURE, never the checkout. No `$` anywhere in
+  # here — this goes into `run_publish`, which is NOT put through the
+  # `escape_dollars` pass, so a `$` added here reaches Cloud Build as a
+  # substitution key and refuses the build. The path is validated to hold
+  # neither, along with the quote that would end the string it is pasted into.
+  ensure_scan_allow = local.scan_allow_path == "" ? "" : join("", [
+    "if [ -f '${local.scan_allow_staged}' ]; then\n",
+    "  CACHE_SCAN_ALLOW_FILE='${local.scan_allow_staged}'\n",
+    "  export CACHE_SCAN_ALLOW_FILE\n",
+    "fi\n",
+  ])
+
+  run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\n${local.ensure_getcap}${local.ensure_scan_allow}exec ${local.staged_dir}/publish-cache-snapshot.sh\n"
   run_turbo   = "#!/bin/sh\nset -eu\necho '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\nexec ${local.staged_dir}/warm-turbo.sh\n"
 
   # HOW THE REPOSITORY IS INSTALLED AND BUILT — WORKED OUT AT WARM TIME, FROM THE
