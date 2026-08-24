@@ -1394,10 +1394,10 @@ slot_can_execute_behaves() { # <file>
   # Under `bash -c` so a `return 1` inside the extracted function cannot end
   # this harness, and with `log` stubbed to nothing: the real one writes to
   # /var/log and is not what is under test.
-  probe() { # <dir> -> exit status of slot_can_execute
+  probe() { # <dir> [<template>] -> exit status of slot_can_execute
     bash -c 'log() { :; }
 '"$body"'
-slot_can_execute "$1"' _ "$1" >/dev/null 2>&1
+slot_can_execute "$1" "$2"' _ "$1" "${2:-}" >/dev/null 2>&1
   }
 
   # A complete tree, exactly as the golden image unpacks it.
@@ -1451,6 +1451,33 @@ slot_can_execute "$1"' _ "$1" >/dev/null 2>&1
   rm -f "$root/partial2/externals/node24/bin/node"
   probe "$root/partial2" && rc=1
 
+  # A runtime that was never written AT ALL. This is the case the copy alone
+  # cannot answer: `$root/onlynode20` ships one runtime and that runtime works,
+  # so "every runtime this tree ships is usable" is TRUE of it — and every action
+  # that names node24 still fails. Judged against the pristine tree it was copied
+  # from, which is what `cp -a` read, so the missing directory is a missing
+  # member rather than an absence nobody expected.
+  cp -a "$root/two" "$root/onlynode20"
+  rm -rf "$root/onlynode20/externals/node24"
+  probe "$root/onlynode20" || rc=1              # no template: nothing says node24 was due
+  probe "$root/onlynode20" "$root/two" && rc=1  # against the template: caught
+  # And the copy is not required to be a subset — a tree that grew a runtime the
+  # template lacks is still fine, as long as the one it grew works.
+  probe "$root/two" "$root/onlynode20" || rc=1
+
+  # `-x` is true of a DIRECTORY, so a corrupted unpack that left run.sh as one
+  # would pass a check written with `-x` alone and fail at exec time — in the
+  # unreadable way this whole gate exists to move earlier.
+  cp -a "$root/good" "$root/rundir"
+  rm -f "$root/rundir/run.sh"
+  mkdir -p "$root/rundir/run.sh"
+  probe "$root/rundir" && rc=1
+
+  cp -a "$root/good" "$root/nodedir"
+  rm -f "$root/nodedir/externals/node24/bin/node"
+  mkdir -p "$root/nodedir/externals/node24/bin/node"
+  probe "$root/nodedir" && rc=1
+
   # A half-finished copy of the agent itself.
   cp -a "$root/good" "$root/norun"
   rm -f "$root/norun/run.sh"
@@ -1473,7 +1500,9 @@ slot_can_execute "$1"' _ "$1" >/dev/null 2>&1
 registration_is_gated() { # <file>
   local code
   code=$(joined_code_of "$1")
-  matches "$code" 'slot_can_execute "\$dir"[[:space:]]*\|\|' || return 1
+  # Called with the PRISTINE tree as well as the copy: the copy alone cannot say
+  # that a runtime is missing, only that the ones present work.
+  matches "$code" 'slot_can_execute "\$dir" "\$RUNNER_HOME"[[:space:]]*\|\|' || return 1
   # The copy that fills that directory is checked too: a `cp -a` that runs out
   # of disk half way leaves a workspace that looks present and cannot run.
   matches "$code" 'cp -a "\$RUNNER_HOME/\." "\$dir/"[[:space:]]*\|\|' || return 1
@@ -1493,8 +1522,26 @@ registration_is_gated() { # <file>
   # name -- so a `mkdir -p` racing a live agent's reset poisons the slot
   # permanently. The `warm` arm must therefore exist and must be read from the
   # unit's own state, not guessed.
-  matches "$code" 'slot_unit_is_active "\$idx" && warm=1' || return 1
+  matches "$code" 'slot_unit_preexists "\$idx" && warm=1' || return 1
   matches "$code" 'if \[ "\$warm" = 1 \]; then' || return 1
+  # ...and that answer must not rest on `is-active` alone. On a warm reboot the
+  # unit is very often `activating` when this snapshot is taken — it runs the
+  # boot reset in an ExecStartPre and waits on the slot's dockerd — and
+  # `is-active` is FALSE for that, so the question would answer "cold" on exactly
+  # the hosts where the cold path is destructive. The unit FILE on disk is the
+  # part that cannot race.
+  matches "$code" 'is-enabled --quiet "ci-runner@\$1.service"' || return 1
+  matches "$code" 'activating' || return 1
+  # The mode is restored where the name cannot be swapped — inside slot-reset.sh,
+  # which holds `_work` in a root-owned directory — and NOT by a root chmod on a
+  # path the slot owns. Both halves are asserted, because dropping the repair
+  # without adding the restore would leave the mode 000 workspace unfixed.
+  # (Matched without the `\$work` argument: the reset lives in a heredoc, so the
+  # literal text carries a backslash, and `\\` inside a single-quoted pattern
+  # trips shellcheck SC1003. The message below is unique to that one call and
+  # pins it just as well.)
+  matches "$code" 'chmod 0755' || return 1
+  matches "$code" 'could not restore the mode of' || return 1
   # And a refusal must take an already-running agent DOWN. Returning 1 alone only
   # tells this host the slot was withdrawn; GitHub goes on dispatching into a
   # workspace the host just refused, and every job it claims is burned.
