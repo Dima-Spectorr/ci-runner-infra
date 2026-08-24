@@ -169,6 +169,34 @@ locals {
   # read.
   windows_host_startup = file("${path.module}/scripts/windows-host-startup.ps1")
 
+  # AND IT TRAVELS COMPRESSED TOO — by MORE than the Linux one does, and it has
+  # never once said so. `windows-host-startup.ps1` renders to 366,591
+  # characters, 140% of the cap, against Linux's 106%. The reason nothing ever
+  # reported it is that no Windows pool has ever been applied: the arm was
+  # written, reviewed and merged, and the first operator to set
+  # `host_os = "windows"` would have met #378's Error 413 on the other operating
+  # system, months later, with "the boot-script size problem was fixed" in the
+  # history to mislead them (#395).
+  #
+  # The loader is a FILE rather than a heredoc here, unlike the four Linux
+  # lines above: unpacking on Windows is not four lines. It has to restrict the
+  # file's ACL before writing it — C:\Windows\Temp is writable by the slot users
+  # on a warm host's reboot — decode gzip through .NET streams, and hand off to
+  # a child powershell.exe with a stated execution policy. That belongs in a
+  # file the PowerShell analyzer and Pester can both read, not in a Terraform
+  # string.
+  #
+  # `replace`, not `templatefile`: PowerShell's `${name}` is Terraform template
+  # syntax, so a `templatefile` loader would be one ordinary PowerShell edit
+  # away from failing the plan — or worse, interpolating.
+  windows_host_startup_gz = base64gzip(local.windows_host_startup)
+
+  windows_boot_loader = replace(
+    file("${path.module}/scripts/windows-boot-loader.ps1"),
+    "__CI_BOOT_SCRIPT_GZ__",
+    local.windows_host_startup_gz,
+  )
+
   # EXACTLY ONE boot-script key, chosen by OS. This is the only thing `host_os`
   # switches on the template itself; everything else it does is a refusal below.
   #
@@ -183,7 +211,7 @@ locals {
   # anything about the mistake, which is why the image pairing is refused at
   # plan time instead.
   boot_script_metadata = var.host_os == "windows" ? {
-    "windows-startup-script-ps1" = local.windows_host_startup
+    "windows-startup-script-ps1" = local.windows_boot_loader
     } : {
     "startup-script" = local.host_startup
   }
@@ -528,7 +556,7 @@ resource "google_compute_instance_template" "host" {
     # with a number in it instead of a 413 in a nightly build log.
     precondition {
       condition     = length(local.boot_script_metadata[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"]) < 262144
-      error_message = "pool '${var.name}' renders a ${length(local.boot_script_metadata[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"])}-character boot script and a GCE metadata value is capped at 262144. The Linux script is already gzipped into its wrapper, so this means the SOURCE has outgrown even the compressed form: shorten modules/ci-runner-host-pool/scripts/host-startup.sh, or move a part of it onto the golden image. Left to the apply this is an Error 413 at create time, on a plan that read clean."
+      error_message = "pool '${var.name}' renders a ${length(local.boot_script_metadata[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"])}-character boot script and a GCE metadata value is capped at 262144. Both arms are already gzipped into their loaders, so this means the SOURCE has outgrown even the compressed form: shorten modules/ci-runner-host-pool/scripts/${var.host_os == "windows" ? "windows-host-startup.ps1" : "host-startup.sh"}, or move a part of it onto the golden image. Left to the apply this is an Error 413 at create time, on a plan that read clean."
     }
 
     precondition {

@@ -127,11 +127,31 @@ In `main.tf`, exactly one thing: which metadata key carries the boot script.
 ```
 metadata = merge(
   var.host_os == "windows"
-    ? { "windows-startup-script-ps1" = local.windows_host_startup }
+    ? { "windows-startup-script-ps1" = local.windows_boot_loader }
     : { "startup-script"             = local.host_startup },
   { "ci-host-os" = var.host_os, ... }
 )
 ```
+
+Neither value is the boot script itself. A GCE metadata value is capped at
+262,144 characters and `windows-host-startup.ps1` measured 366,591 on
+2026-08-24 — 140% of the cap, and the Linux pair was already at 106%. That is
+not a plan-time error: the plan reads clean and the **apply** dies against the
+API with `Error 413 ... is too large` on the instance template, which is how
+three repositories lost a day and a half of CI capacity (#378). Windows was over
+by more and had never been applied anywhere, so it had never said so (#395).
+
+So each arm carries a *loader* — `scripts/windows-boot-loader.ps1`, rendered by
+`replace()` with `base64gzip(...)` of the script substituted for a sentinel. The
+blob is **inline in the same value**, not a second metadata key read at boot: a
+key fetched at boot adds a round trip to the boot path and a new way to come up
+having found no script. The loader decodes it, writes it to a file whose ACL is
+restricted to SYSTEM and Administrators *before* the write, and runs it as a
+child `powershell.exe` so `$LASTEXITCODE` is the boot script's own. Gzipped, the
+Windows arm renders at ~156k. `main.tf` asserts the rendered length against the
+cap as a plan-time precondition, and `host-startup.selftest.sh` asserts it on
+the pull request, so the next time the source outgrows even its compressed form
+it is a named failure rather than a 413 in a nightly log.
 
 `ci-host-os` is set as its own metadata key and the boot script asserts it
 against the OS it is actually running on. This exists because the failure mode

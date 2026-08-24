@@ -1985,5 +1985,19 @@ else
   bad "the gzipped boot script is ${_gz} characters as metadata; the budget is ${_margin} and GCE refuses anything over ${_cap}. Shorten host-startup.sh or move part of it onto the golden image -- past the cap this is an Error 413 at create time, on a plan that read clean."
 fi
 
+# AND SO DOES THE WINDOWS ONE, which is the arm that has never been applied and
+# so has never reported anything about itself. Uncompressed it is 366,591
+# characters -- 140% of the cap, worse than the Linux pair that took three
+# repositories' CI down -- and the only reason that was not an outage too is
+# that nobody has turned a Windows pool on yet (#395). Measuring it HERE is the
+# point: a check that first runs when an operator sets host_os = "windows" is a
+# check that greets them with someone else's regression.
+_win_gz=$(gzip < "$HERE/../../modules/ci-runner-host-pool/scripts/windows-host-startup.ps1" | base64 -w0 | wc -c)
+if [ "$_win_gz" -lt "$_margin" ]; then
+  ok
+else
+  bad "the gzipped Windows boot script is ${_win_gz} characters as metadata; the budget is ${_margin} and GCE refuses anything over ${_cap}. Shorten windows-host-startup.ps1 or move part of it onto the golden image -- past the cap no Windows pool can build an instance template at all."
+fi
+
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
