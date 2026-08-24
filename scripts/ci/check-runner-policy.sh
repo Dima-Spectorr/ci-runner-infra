@@ -38,8 +38,9 @@
 #   host and ONE copy of its infrastructure (docs/adr-pr-host-affinity.md):
 #
 #     RUNNER9  a fleet-reachable LINUX job in a pull-request workflow resolves
-#              its `runs-on` from the anchor job's output, or IS the anchor, or
-#              carries a declared exemption.
+#              its `runs-on` from the anchor job's output, or from a REQUIRED
+#              `workflow_call` input in a file that opens no pull-request run of
+#              its own, or IS the anchor, or carries a declared exemption.
 #     RUNNER10 at most ONE job across the repository's pull-request workflows
 #              owns the shared infrastructure — counting a `uses:` job that
 #              declares itself an owner, which is what calling the fleet's
@@ -270,6 +271,8 @@ ensure_yaml() {
 #   #ERR\t<message>                  the document does not load
 #   #PR                              a `pull_request` trigger is present
 #   #PRTARGET                        a `pull_request_target` trigger is present
+#   #CALLINPUTREQ\t<name>            a `workflow_call` input declared REQUIRED
+#   #RUNSONINPUT\t<id>\t<name>       runs-on reads `inputs.<name>`
 #   #JOB\t<id>                       a job exists (or one resolved matrix leg,
 #                                    as `<job>~leg<n>` — see the matrix note above)
 #   #REUSABLE\t<id>                  the job is a `uses:` call (takes no timeout)
@@ -340,6 +343,22 @@ if "pull_request" in names:
 if "pull_request_target" in names:
     out("#PRTARGET")
 
+# The `workflow_call` inputs this file declares REQUIRED. RUNNER9 reads them:
+# a callee whose `runs-on` resolves from an input is pinned by its CALLER, and
+# `required: true` is what makes that a guarantee rather than a hope — GitHub
+# refuses to start a call that omits a required input, so there is no run in
+# which the expression's pool-literal fallback is reached on a pull request.
+# Optional is not the same statement and is not accepted: a caller that simply
+# forgets the `with:` line gets the literal, silently, on a second host.
+if isinstance(triggers, dict):
+    _call = triggers.get("workflow_call")
+    if isinstance(_call, dict):
+        _call_inputs = _call.get("inputs")
+        if isinstance(_call_inputs, dict):
+            for _in_name, _in_spec in _call_inputs.items():
+                if isinstance(_in_spec, dict) and _in_spec.get("required") is True:
+                    out("#CALLINPUTREQ", str(_in_name))
+
 # `runs-on: ${{ fromJSON(matrix.<key>[.<field>]) }}` and nothing else. The
 # anchors matter: a expression that merely CONTAINS a `fromJSON(matrix…)` is
 # doing something further with it, and this resolver would be guessing.
@@ -352,6 +371,14 @@ MATRIX_RUNS_ON = re.compile(
 # id is what matters: it names the anchor, which is how RUNNER9 tells the one
 # job that MAY name a pool literally from the ones that may not.
 NEEDS_OUTPUT = re.compile(r"needs\.([A-Za-z0-9_-]+)\.outputs\.")
+
+# `inputs.<name>` anywhere inside a `runs-on` expression. This is the OTHER way
+# a job can be pinned to the run's host, and `needs.` cannot express it:
+# `needs.` does not reach across a `uses:` boundary, so a called workflow can
+# only be handed the anchor's pool array as an input. Whether that counts as a
+# pin is decided in RUNNER9 — it takes a required input and a file that is not
+# a pull-request workflow in its own right.
+INPUTS_REF = re.compile(r"inputs\.([A-Za-z0-9_-]+)")
 
 # The literals in a `runs-on` expression that can actually BECOME the runner:
 # the operands of a short-circuit. GitHub Actions quotes strings with single
@@ -819,6 +846,8 @@ for job_id, job in jobs.items():
             anchors = [m.group(1) for m in NEEDS_OUTPUT.finditer(text)]
             for anchor in anchors:
                 out("#RUNSONNEEDS", vid, anchor)
+            for in_name in dict.fromkeys(m.group(1) for m in INPUTS_REF.finditer(text)):
+                out("#RUNSONINPUT", vid, in_name)
             # Hoisted out of the loop above. The literals belong to the
             # EXPRESSION, not to each reference inside it, and scanning per
             # reference emitted the same literal once per
@@ -1145,6 +1174,12 @@ check_file() {
      [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
     has_pr=1
   fi
+  # Kept before reachability widens `has_pr` below. RUNNER9 needs the narrow
+  # answer — "does this file open a pull-request run of its own?" — because a
+  # callee that runs on a pull request ONLY as a callee has its pool chosen by
+  # the caller, and a file that also carries its own `pull_request:` trigger
+  # does not.
+  local has_own_pr="$has_pr"
   # …or reached from one. A callee declares only `workflow_call` and runs with
   # the caller's pull-request context, so judging it on its own triggers reads a
   # self-hosted job with no guard as unreachable by forks.
@@ -1443,6 +1478,46 @@ EOF
           is_anchor=1
         fi
 
+        # …and the other way a job can be pinned: the CALLER pinned it.
+        #
+        # `needs.` does not cross a `uses:` boundary, so a called workflow
+        # cannot read the anchor's output at all — the pool array has to arrive
+        # as a `workflow_call` input, and `runs-on: ${{ inputs.runner … }}` is
+        # the only shape that consumes it. Read as a pool literal, that
+        # expression made RUNNER9 fire on every correct callee in the fleet:
+        # nine jobs in one repository, two in another, each of which lands on
+        # the run's host precisely BECAUSE the caller passed the array.
+        #
+        # The literal in that expression is real, and it is not the pull
+        # request's. `inputs` is not populated for `push` or `schedule`, so a
+        # `default:` on the input never applies on those legs and the fallback
+        # has to live in the job expression; those legs are not pull-request
+        # runs and rule 1 does not govern them.
+        #
+        # Two conditions, and neither is decoration:
+        #
+        #   - the file declares no pull-request trigger of its OWN. With one,
+        #     the same job also opens a second run for the same pull request,
+        #     `inputs` is empty there, and the literal IS the pull request's
+        #     pool — the second host, arriving by the door this exemption opens.
+        #   - the input is `required: true`. That is what makes "the caller
+        #     passes it" a fact instead of a hope: GitHub refuses to start a
+        #     call that omits a required input, which is a stronger guarantee
+        #     than this gate could give by reading the caller's `with:` block.
+        #     Optional, a caller that forgets one line gets the literal and a
+        #     second host, silently, and the callee still reads clean here.
+        local pins_to_caller=0 in_name
+        if [ "$has_own_pr" -eq 0 ]; then
+          while IFS= read -r in_name; do
+            [ -n "$in_name" ] || continue
+            if [ "$(printf '%s\n' "$records" | grep -c "^#CALLINPUTREQ	$(re_quote "$in_name")$")" -gt 0 ]; then
+              pins_to_caller=1
+            fi
+          done <<EOF
+$(printf '%s\n' "$records" | sed -n "s/^#RUNSONINPUT\t${job_re}\t//p")
+EOF
+        fi
+
         # RUNNER9 — a second host per run is the whole failure this addresses.
         # A Linux fleet job that names its pool literally is scheduled by
         # GitHub onto ANY free agent of that pool, so a run with two such jobs
@@ -1454,9 +1529,10 @@ EOF
         # Windows is exempt by design, not by omission — rule 1's exception.
         # A Windows job reaches the stack across the band (RUNNER11 checks it
         # reaches it correctly), so it is a second host on purpose.
-        if [ "$windows_pool" -eq 0 ] && [ "$pins_to_anchor" -eq 0 ] && [ "$is_anchor" -eq 0 ]; then
+        if [ "$windows_pool" -eq 0 ] && [ "$pins_to_anchor" -eq 0 ] && [ "$is_anchor" -eq 0 ] &&
+           [ "$pins_to_caller" -eq 0 ]; then
           if ! shared_infra_marker "$file" exempt "$job_base"; then
-            err RUNNER9 "$rel: job '$job' is self-hosted on a pull_request workflow and names its pool directly instead of resolving it from the anchor job's output — GitHub may place it on a different host than the rest of this run, where the run's shared stack does not exist (use runs-on: \${{ fromJSON(needs.<anchor>.outputs.runs-on) }}, or declare '# shared-infra-exempt($job_base, #<issue>): <reason>')"
+            err RUNNER9 "$rel: job '$job' is self-hosted on a pull_request workflow and names its pool directly instead of resolving it from the anchor job's output — GitHub may place it on a different host than the rest of this run, where the run's shared stack does not exist (use runs-on: \${{ fromJSON(needs.<anchor>.outputs.runs-on) }}; in a called workflow, take the array as a REQUIRED workflow_call input and resolve runs-on from it; or declare '# shared-infra-exempt($job_base, #<issue>): <reason>')"
           fi
         fi
 
@@ -2910,6 +2986,98 @@ jobs:
 jobs:
   a:
     uses: ./.github/workflows/reusable.yml'
+
+  # --- the callee that the CALLER pins ---------------------------------------
+  #
+  # The shape every consumer of the published anchor ends up with, and the one
+  # RUNNER9 used to report. `needs.` cannot cross a `uses:` boundary, so the
+  # anchor's pool array arrives as an input and `runs-on` reads it. Judged as a
+  # single file the callee looks like a job naming its pool; judged as a pair it
+  # is a job whose pool the caller chose. The caller body is fixed, because what
+  # varies between these three cases is the CALLEE.
+  expect_si_callee() {
+    local name="$1" want="$2" callee_body="$3"
+    local got out_text wf="$tmp/.github/workflows"
+    mkdir -p "$wf"
+    cat > "$wf/caller.yml" <<'YAML'
+on: [pull_request]
+jobs:
+  anchor:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      runs-on: ${{ steps.pin.outputs.runs-on }}
+    services:
+      db: {image: "postgres:16"}
+    steps: [{id: pin, run: "true"}]
+  scan:
+    needs: [anchor]
+    uses: ./.github/workflows/callee.yml
+    with:
+      runner: ${{ needs.anchor.outputs.runs-on }}
+YAML
+    printf '%s\n' "$callee_body" > "$wf/callee.yml"
+    out_text="$(fail=0; ALLOW_DYNAMIC=1; SHARED_INFRA=1; SHARED_INFRA_OWNERS=""
+      compute_reachable "$wf/caller.yml" "$wf/callee.yml" >/dev/null
+      check_file "$wf/caller.yml" "" blocked
+      check_file "$wf/callee.yml" "" blocked
+      shared_infra_owner_verdict 2>&1)"
+    got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr '\n' ' ')"
+    got="$(printf '%s' "$got" | sed 's/ *$//')"
+    rm -rf "$wf"
+    if [ "$got" != "$want" ]; then
+      echo "FAIL $name: want ids [$want], got [$got]"
+      printf '%s\n' "$out_text" | sed 's/^/      /'
+      status=1
+    else
+      echo "ok   $name [$want]"
+    fi
+  }
+
+  expect_si_callee "a callee pinned by a REQUIRED input is pinned" "" \
+'on:
+  workflow_call:
+    inputs:
+      runner: {required: true, type: string}
+  push:
+    branches: [main]
+jobs:
+  scan:
+    runs-on: ${{ inputs.runner != '"'"''"'"' && fromJSON(inputs.runner) || fromJSON('"'"'["self-hosted","linux","gcp","ExampleRepo"]'"'"') }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # Optional is a different statement. A caller that omits the `with:` line
+  # starts perfectly well and the callee takes the literal — a second host, in
+  # the one arrangement where no reader of either file can see it happen.
+  expect_si_callee "an OPTIONAL input is not a pin" "RUNNER9" \
+'on:
+  workflow_call:
+    inputs:
+      runner: {required: false, default: "", type: string}
+  push:
+    branches: [main]
+jobs:
+  scan:
+    runs-on: ${{ inputs.runner != '"'"''"'"' && fromJSON(inputs.runner) || fromJSON('"'"'["self-hosted","linux","gcp","ExampleRepo"]'"'"') }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # And the exemption is only sound while the callee runs on a pull request as a
+  # CALLEE. Give the same file its own `pull_request:` trigger and it opens a
+  # second run for the same pull request, where `inputs` is empty and the
+  # literal is the pool it actually lands on.
+  expect_si_callee "a callee with its own pull_request trigger is not pinned" "RUNNER9" \
+'on:
+  workflow_call:
+    inputs:
+      runner: {required: true, type: string}
+  pull_request:
+jobs:
+  scan:
+    runs-on: ${{ inputs.runner != '"'"''"'"' && fromJSON(inputs.runner) || fromJSON('"'"'["self-hosted","linux","gcp","ExampleRepo"]'"'"') }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
 
   # A fork guard scopes RUNNER4 and nothing else. `fork == false` is precisely
   # the condition under which these calls DO run -- for every pull request the

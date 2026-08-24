@@ -59,7 +59,7 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER6` | and the declared timeout is below the default it replaces |
 | `RUNNER7` | a REMOTE reusable workflow's jobs are not in this repository — UNDECIDED, declarable per callee |
 | `RUNNER8` | a job on a **Windows** pool label declares `container:` or `services:`, which that pool cannot run |
-| `RUNNER9` | with `--shared-infra`, a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the anchor job's output, or is the anchor, or carries a declared exemption |
+| `RUNNER9` | with `--shared-infra`, a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the anchor job's output, or — in a called workflow that opens no pull-request run of its own — from a **required** `workflow_call` input, or is the anchor, or carries a declared exemption |
 | `RUNNER10` | with `--shared-infra`, at most **one** job invocation across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# shared-infra-owner(<job>)` markers counted together, including on a `uses:` job, because a repository that has adopted the contract has no `services:` left to count and its anchor is a call |
 | `RUNNER11` | with `--shared-infra`, a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
 | `RUNNER12` | a route onto the **merge-queue** pool also requires the head branch to live in this repository and the author to be `mergify[bot]` — not the branch name alone |
@@ -92,10 +92,14 @@ the host it landed on, and every later job resolves its pool from that output:
 runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
 ```
 
-`RUNNER9` asks for exactly that, and accepts three answers: the job resolves
-`runs-on` from another job's `outputs`, or it **is** an anchor, or it carries a
-declared exemption. The match on the resolution is a substring, not an anchored
-pattern, because the fleet's fork-routing idiom wraps it —
+`RUNNER9` asks for exactly that, and accepts four answers: the job resolves
+`runs-on` from another job's `outputs`; or the file declares **no**
+pull-request trigger of its own and the job resolves `runs-on` from a
+`workflow_call` input declared `required: true` — the caller passes the anchor's
+array in, and GitHub refuses to start a call that omits a required input, so the
+pin is machine-enforced rather than hoped for; or it **is** an anchor; or it
+carries a declared exemption. The match on the resolution is a substring, not an
+anchored pattern, because the fleet's fork-routing idiom wraps it —
 
 ```yaml
 runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON(needs.anchor.outputs.runs-on) }}

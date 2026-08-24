@@ -2671,7 +2671,7 @@ guest_attributes_denied() {
 # note_guest_attributes_denied — record one refusal for this tick.
 #
 # A FILE, AND NOT A VARIABLE, AND THAT IS THE WHOLE POINT. Both gates are called
-# as `x=$(beacon_gate ...)` / `x=$(pin_hold_gate ...)`, which is a SUBSHELL: a
+# as `x=$(beacon_gate ...)` / `x=$(pin_hold_gate ...)`, which is a SUBSHELL:
 # an ordinary shell increment inside either of them touches a copy that is
 # discarded the moment the substitution closes, and the series would publish a
 # confident zero on exactly the fleet it exists to report. The counter has to

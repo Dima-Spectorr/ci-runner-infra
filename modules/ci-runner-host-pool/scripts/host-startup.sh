@@ -4485,6 +4485,54 @@ sudo_passes_env() { # <user>
   [ "$SUDO_ENV_PROBE" -eq 1 ]
 }
 
+# Can this slot actually START A PROCESS? Registration is what tells GitHub the
+# slot is capacity, and until now the only thing standing behind that claim was
+# that `config.sh` exited 0 -- which it does over a copy that is missing the
+# very interpreter every step is launched with.
+#
+# That is not hypothetical. On 2026-08-23 the Apigee pool came back from a
+# recovery apply with eight agents ONLINE and every self-hosted job failing at
+# `actions/checkout`, before a single workflow step:
+#
+#   An error occurred trying to start process
+#   '/opt/ci/slots/1/externals/node24/bin/node'
+#   with working directory '/opt/ci/slots/1/_work/Apigee-Portal/Apigee-Portal'.
+#   No such file or directory
+#
+# on three hosts and every slot on them. That is strictly worse than the outage
+# it replaced: a pool with no capacity leaves runs QUEUED, which is invisible but
+# honest, while a pool advertising capacity it does not have turns every required
+# check RED for reasons that have nothing to do with the code under test. Jobs
+# were also BURNED -- each one claimed, failed and counted against the run.
+#
+# So the two things a slot cannot run without are asserted by name, on the copy
+# this slot will actually use, and the failure is returned to the caller, which
+# already counts it and already reports it: the readiness line prints
+# "N/K slots serving", and `ci_slots_missing` alerts on the gap. A slot that
+# fails here does not register, so it is never handed a job to burn.
+#
+# `externals/` is checked by GLOB rather than by pinning node24: the bundled
+# runtime's major version moves with the agent version the image pins, and a
+# check naming today's directory would go quiet -- passing on the absence it
+# exists to catch -- the first time that bumps. Any one usable node is enough;
+# the point is that the tree was unpacked at all.
+slot_can_execute() { # <dir>
+  local dir="$1" node found=0
+
+  [ -x "$dir/run.sh" ] ||
+    { log "slot workspace $dir has no executable run.sh"; return 1; }
+  [ -x "$dir/config.sh" ] ||
+    { log "slot workspace $dir has no executable config.sh"; return 1; }
+
+  for node in "$dir"/externals/node*/bin/node; do
+    [ -x "$node" ] || continue
+    found=1
+    break
+  done
+  [ "$found" -eq 1 ] ||
+    { log "slot workspace $dir has no usable externals/node*/bin/node -- the agent would fail every job at its first step"; return 1; }
+}
+
 install_slot() {
   local idx="$1" token="$2"
   local dir="$SLOT_ROOT/$idx"
@@ -4540,9 +4588,54 @@ install_slot() {
   mkdir -p "$dir"
   # Copy, not symlink: config.sh writes .runner/.credentials into the directory
   # it runs in, and K agents must not share one identity.
-  cp -a "$RUNNER_HOME/." "$dir/"
+  # Checked, unlike before: a copy that runs out of disk half way leaves a
+  # workspace that looks present and cannot run anything, and the slot went on
+  # to register over it.
+  cp -a "$RUNNER_HOME/." "$dir/" ||
+    { log "slot $idx: could not copy the runner tree from $RUNNER_HOME"; return 1; }
   chown -R "$u:$u" "$dir"
   chmod 0750 "$dir"
+
+  # Before the token is spent and before GitHub is told this slot is capacity.
+  slot_can_execute "$dir" ||
+    { log "slot $idx: workspace cannot execute; not registering it"; return 1; }
+
+  # The other half of the 2026-08-23 failure, and the one the error message
+  # blamed on the wrong thing: `/usr/bin/bash ... No such file or directory`
+  # names a binary that certainly exists, so what was missing was the WORKING
+  # DIRECTORY. `--work` below is a path the agent creates, and a slot registered
+  # without it fails every job in the same unreadable way.
+  #
+  # It is CREATED rather than only asserted, and that is deliberate. Whether
+  # `config.sh` materialises `--work` at configure time or leaves it to the first
+  # job is a property of the agent version the image pins, so asserting alone
+  # would make this gate's correctness depend on a version this file does not
+  # control -- and a gate that fails closed on a false premise takes the whole
+  # pool down. Creating it makes the postcondition true under either behaviour,
+  # and costs an empty directory the agent would have made anyway. config.sh is
+  # given the same path and is content to be handed one that already exists --
+  # which is the ordinary case on every re-registration.
+  #
+  # BEFORE config.sh, and not after, for the same reason slot_can_execute is:
+  # every refusal in install_slot has to land before the token is spent. A gate
+  # that fires after a successful `configure` leaves a runner registered with
+  # GitHub and no service to run it -- litter that only clears the next time
+  # `--replace` reuses the name.
+  #
+  # A symlink is the one case that is NOT healed: `_work` replaced by a link is
+  # a slot pointing its next job's workspace somewhere else, which is the shape
+  # the reset path already refuses, and `mkdir -p` over it would follow the link
+  # and report success. `-d` alone would follow it too, so the link test comes
+  # first and is its own refusal.
+  if [ -L "$dir/_work" ]; then
+    log "slot $idx: $dir/_work is a symlink, not a workspace -- not registering it"
+    return 1
+  fi
+  sudo -u "$u" mkdir -p "$dir/_work" 2>>/var/log/ci-host.log || true
+  if [ ! -d "$dir/_work" ]; then
+    log "slot $idx: $dir/_work is not a directory and could not be created -- every job would fail before its first step"
+    return 1
+  fi
 
   local group_arg=()
   [ -n "$RUNNER_GROUP" ] && group_arg=(--runnergroup "$RUNNER_GROUP")

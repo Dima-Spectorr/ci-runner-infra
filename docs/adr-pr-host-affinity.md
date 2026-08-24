@@ -807,7 +807,7 @@ already runs, so adoption needs no new wiring.
 
 | id | Rule |
 |---|---|
-| `RUNNER9` | a fleet-reachable **Linux** job in a `pull_request` workflow resolves its `runs-on` from the anchor job's output, or is the anchor, or carries a declared exemption |
+| `RUNNER9` | a fleet-reachable **Linux** job in a `pull_request` workflow resolves its `runs-on` from the anchor job's output, or — in a called workflow that opens no pull-request run of its own — from a **required** `workflow_call` input, or is the anchor, or carries a declared exemption |
 | `RUNNER10` | at most **one** job across a repository's `pull_request` workflows is an infrastructure owner — counting `services:` blocks *and* `# shared-infra-owner(<job>): …` markers together |
 | `RUNNER11` | a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
 
