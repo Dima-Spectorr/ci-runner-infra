@@ -643,21 +643,54 @@ QUEUE_SKIP_EVENT = re.compile(r"github\.event_name\s*==\s*(['\"])([A-Za-z_]+)\1"
 # The two events a queue draft actually arrives as. Anything else is a skip.
 QUEUE_DRAFT_EVENTS = ("pull_request", "pull_request_target")
 
+# `${{ … }}` around a whole `if:`, which is optional in Actions and written
+# both ways across the fleet. The Boolean walk peels parentheses but knows
+# nothing about this wrapper, so it has to come off before the walk starts --
+# see `queue_skip_leaf` for why that suddenly matters.
+EXPR_WRAP = re.compile(r"^\$\{\{(.*)\}\}$", re.DOTALL)
+
 
 def queue_skip_leaf(expr):
     """One leaf of the Boolean walk: does this term alone rule out a draft?"""
-    if QUEUE_SKIP.search(expr):
+    expr = expr.strip()
+    # BOTH arms anchored, for one reason. `!(!startsWith(github.head_ref,
+    # 'mergify/merge-queue/'))` CONTAINS the first alternative and means its
+    # opposite, and `!startsWith(...) == false` contains the second and means
+    # its opposite too -- the identical mistake as the event arm below, just
+    # spelled on the arm whose correct form already carries the `!`.
+    if QUEUE_SKIP.fullmatch(expr):
         return True
-    hit = QUEUE_SKIP_EVENT.search(expr)
+    # THE WHOLE LEAF, not a substring of it. `condition_excludes` walks `&&`
+    # and `||` and has no notion of `!` -- deliberately, because the head-ref
+    # arm above is CORRECT only in its negated form and a blanket refusal of a
+    # leading `!` would reject the original spelling of this exemption (and
+    # disturb the fork guard, which shares the walk). So the negation is
+    # handled where it can be handled precisely: here, on the one arm whose
+    # positive form is the readable one.
+    #
+    # `!(github.event_name == 'push')` CONTAINS the equality and means its
+    # opposite -- it is true for exactly the two events a queue draft arrives
+    # as. Read as a skip, it excused a literal pull-request pool from RUNNER14
+    # entirely, which is the over-eager direction the comment above swears off.
+    # An anchored match cannot make that mistake: any operator wrapped around
+    # the equality leaves something outside the match, and the leaf is not the
+    # bare positive statement any more.
+    hit = QUEUE_SKIP_EVENT.fullmatch(expr)
     return bool(hit and hit.group(2) not in QUEUE_DRAFT_EVENTS)
 
 
 def queue_skipped(job):
     """True when this job cannot run on a `mergify/merge-queue/<sha>` draft."""
     condition = job.get("if")
-    return isinstance(condition, str) and condition_excludes(
-        condition, queue_skip_leaf
-    )
+    if not isinstance(condition, str):
+        return False
+    # Off with the `${{ }}` before the walk. It is invisible to a substring
+    # search and fatal to an anchored one, and stripping it here rather than
+    # inside `condition_excludes` keeps the fork guard's behaviour untouched.
+    wrapped = EXPR_WRAP.match(condition.strip())
+    if wrapped:
+        condition = wrapped.group(1)
+    return condition_excludes(condition, queue_skip_leaf)
 
 
 # A single-quoted JSON array inside an expression -- the label set one arm of
@@ -3560,6 +3593,61 @@ jobs:
 jobs:
   policy:
     if: \"github.event_name == 'push' || github.event.pull_request.draft == false\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # The head-ref arm's own version of the same mistake. Its CORRECT form
+  # carries the `!`, so anchoring is the only way to tell it from a second `!`
+  # wrapped around it — and `!(!startsWith(...))` is true for exactly the
+  # drafts the arm claims to exclude.
+  expect_mq_pair "a doubly negated head-ref test is not a skip" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request]
+jobs:
+  policy:
+    if: \"!(!startsWith(github.head_ref, 'mergify/merge-queue/'))\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # …and the `== false` spelling inverted the same way. `!` binds tighter than
+  # `==`, so this reads "startsWith is TRUE" — which is the draft.
+  expect_mq_pair "an inverted == false head-ref test is not a skip" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request]
+jobs:
+  policy:
+    if: \"!startsWith(github.head_ref, 'mergify/merge-queue/') == false\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # NEGATED, which means the opposite and used to be read as the same thing.
+  # The walk knows `&&` and `||` and nothing about `!`, so a substring search
+  # for the equality found it inside its own negation and called the job
+  # push-only — while `!(github.event_name == 'push')` is true for exactly the
+  # two events a queue draft arrives as. A literal pull-request pool behind it
+  # escaped RUNNER14 completely.
+  expect_mq_pair "a negated event test is not a skip" "RUNNER14" \
+"$MQ_LANE" \
+"on: [pull_request, push]
+jobs:
+  policy:
+    if: \"!(github.event_name == 'push')\"
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 10
+    steps: [{run: \"true\"}]"
+
+  # The positive form still passes with the expression wrapper on, which is the
+  # spelling that had to keep working: the anchored read is done after the
+  # wrapper comes off, not instead of it.
+  expect_mq_pair "a wrapped push-only job is still not on a draft" "" \
+"$MQ_LANE" \
+"on: [pull_request, push]
+jobs:
+  policy:
+    if: \"\${{ github.event_name == 'push' }}\"
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 10
     steps: [{run: \"true\"}]"
