@@ -1273,7 +1273,12 @@ concurrency:
 
 jobs:
   nudge:
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/mergify-nudge.yml@v5
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/mergify-nudge.yml@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
+    # A commit, not `@v5`. A tag is a mutable pointer, so pinning to one trusts
+    # whoever can move it — `check-action-pins.sh` (PIN1) refuses it outright.
+    # The trailing comment is which release that commit was, so a reader can see
+    # how stale the pin is without resolving a sha.
+    #
     # A repository that runs `check-runner-policy.sh` needs the RUNNER7
     # declaration too — see below.
     #

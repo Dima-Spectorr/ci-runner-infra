@@ -675,8 +675,12 @@ One property to accept before you wire it: **`workflow_run` is dispatched from
 the default branch only**, so the pull request that adds the nudge cannot run it.
 The first evidence is the first CI completion after the merge — watch that one.
 
-Three things the fleet rollout got wrong on the first pass, all of them cheap to
+Four things the fleet rollout got wrong on the first pass, all of them cheap to
 get right the first time:
+
+- **Pin the callee to a commit, not to `@v5`.** A tag is a mutable pointer;
+  `check-action-pins.sh` (PIN1) refuses one. Use the commit the floating tag
+  currently names, with the release in a trailing comment.
 
 - **List every workflow that produces a required check**, resolved from
   `.mergify.yml` rather than from memory. The one that gets missed is a fast

@@ -115,18 +115,45 @@ fi
 # floating major tag that moves forward on every release, and that is what the
 # other guides already tell a consumer to use — an exact `@vX.Y.Z` in a document
 # is stale the next time anything ships, which is the drift rather than the fix.
+# WITH ONE EXCEPTION, AND IT IS NOT A LOOPHOLE: a 40-character commit sha.
+#
+# The rule above is right for a document that says "here is how to reach the
+# fleet". It is wrong for the one snippet a consumer PASTES INTO ITS OWN
+# REPOSITORY, because that repository runs `check-action-pins.sh`, and PIN1
+# refuses a remote `uses:` on a tag outright — a tag is a mutable pointer, so
+# pinning to one trusts whoever can move it. Documenting `@v5` there would be
+# documenting a snippet that cannot pass the fleet's own gate; eight of the
+# thirteen rollout pull requests went red on exactly that.
+#
+# So a sha is accepted, and only with a trailing `# vX.Y.Z` naming the release
+# it was. Without that comment a reader cannot tell a current pin from a
+# two-year-old one without resolving it, and the anti-staleness purpose of this
+# whole check is lost to a hex string nobody can read. The named release must
+# share the floating major, so a pin left behind by a major bump still goes red;
+# it is deliberately NOT compared against VERSION, because that would fail every
+# release pull request — the failure mode this file's header warns about.
 major=${want%%.*}
 uses_found=0
 for f in "${docs[@]}"; do
-  while IFS= read -r ref; do
+  while IFS= read -r line; do
     uses_found=$((uses_found + 1))
+    ref=${line##*@}
+    ref=${ref%% *}
     if [ "$ref" = "$major" ]; then
       ok "${f#"$ROOT/"}: uses @$ref"
+    elif printf '%s' "$ref" | grep -qE '^[0-9a-f]{40}$'; then
+      named=$(printf '%s' "$line" | grep -oE '#[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+      if [ -z "$named" ]; then
+        bad "${f#"$ROOT/"}: a workflow/action reference pins the commit ${ref:0:8} with no '# vX.Y.Z' comment — a reader cannot tell how stale it is"
+      elif [ "${named%%.*}" != "$major" ]; then
+        bad "${f#"$ROOT/"}: a workflow/action reference pins the commit ${ref:0:8}, documented as $named, but this repo publishes $major"
+      else
+        ok "${f#"$ROOT/"}: uses @${ref:0:8} ($named)"
+      fi
     else
       bad "${f#"$ROOT/"}: a workflow/action reference pins @$ref, but this repo publishes the floating major $major — an exact version here is stale on the next release"
     fi
-  done < <(grep -oE 'ci-runner-infra/\.github/(actions|workflows)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*@[^"[:space:])]+' -- "$f" \
-             | sed 's/.*@//')
+  done < <(grep -oE 'ci-runner-infra/\.github/(actions|workflows)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*@[^"[:space:])]+([[:space:]]+#[^"]*)?' -- "$f")
 done
 
 # Same rule as above: a scan that matches nothing is not a pass. If the shape of
