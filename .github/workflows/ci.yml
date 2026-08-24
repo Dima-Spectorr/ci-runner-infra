@@ -444,6 +444,15 @@ jobs:
       - name: shared-infra-band self-test
         run: bash scripts/ci/shared-infra-band.selftest.sh
 
+      # The fallback a consuming job takes when the anchor published no shared
+      # stack — the common leg, not the rare one, since the anchor degrades
+      # whenever another run already holds the host. Its interesting behaviour
+      # is a retry loop around `docker run`, and the only other way to reach
+      # that loop is to run a real workflow on a real host with a sibling slot
+      # holding the port, which nobody can arrange on purpose.
+      - name: shared-infra-db fallback self-test
+        run: bash scripts/ci/shared-infra-db.selftest.sh
+
       # The Windows startup script is guarded twice, because the two harnesses
       # answer different questions. Pester (in the Windows job) executes the
       # functions and checks what they RETURN. This one reads the file as text
