@@ -263,7 +263,7 @@ jobs:
           $cfg.Run.PassThru = $true
           $cfg.Output.Verbosity = 'Detailed'
           $r = Invoke-Pester -Configuration $cfg
-          $floor = 253
+          $floor = 297
           Write-Output "pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.TotalCount) discovered"
           if ($r.TotalCount -lt $floor) {
             throw "Pester discovered only $($r.TotalCount) test(s), fewer than the $floor this suite is known to contain — the suite did not run, whatever the exit code says"
@@ -562,6 +562,14 @@ jobs:
 
       - name: mergify scope-coverage gate
         run: bash scripts/ci/check-mergify-scopes.sh
+
+      # The nudge that tells Mergify a webhook did not arrive. It is triggered
+      # by `workflow_run`, GitHub dispatches that from the default branch only,
+      # and so the pull request changing it can never run it — this is the only
+      # thing that can. Structural, on the text of both workflow files and of
+      # `.mergify.yml`'s `commands_restrictions`, with a mutation per property.
+      - name: mergify nudge self-test
+        run: bash scripts/ci/mergify-nudge.selftest.sh
 
       # `ci_orphan_registrations_reaped` was published from the day the reaper
       # landed and never declared in the module output that dashboards and alert

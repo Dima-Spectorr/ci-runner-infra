@@ -1,0 +1,277 @@
+# =============================================================================
+# mergify-nudge — CI going green is an event Mergify sometimes never receives
+#
+# THE FAILURE
+#
+# Mergify is event-driven, not polling. It advances a pull request when GitHub
+# delivers it a webhook — `check_run.completed` being the one that matters here.
+# When that delivery is missed or late, nothing goes red and nothing says so:
+# the three required checks sit green, `Mergify Merge Protections` sits on "Your
+# merge queue conditions are under evaluation / Be patient, this will be updated
+# soon", the queue ahead is empty, and the pull request simply waits.
+#
+# Measured in this repository on 2026-08-23, from the moment the LAST required
+# check reported success to the moment Mergify acted:
+#
+#   #328  11m06s      #332   8m55s
+#   #326  17m24s      #333  20m01s
+#
+# And the control that says it is the webhook and not Mergify being slow:
+# Mergify reacts to its OWN merges in 13-14 seconds, measured three times out of
+# three — the next queue entry's CI run was created 13 seconds after the
+# previous pull request merged. It knows about that internally. It needs a
+# webhook for the other, and when the webhook does not arrive it only moves on a
+# periodic re-evaluation minutes later.
+#
+# The same stall was reproduced deliberately on #339: three required checks
+# green at 19:34:28, still "under evaluation" at 19:43:52, and a single
+# `@mergifyio refresh` posted at 19:45:27 moved it to "In merge queue" inside
+# sixty seconds. That comment is the whole mechanism this workflow automates.
+#
+# WHY A COMMENT AND NOT AN API CALL
+#
+# There is no refresh endpoint. Mergify's API is `https://api.mergify.com/v1/`
+# and its pull-request surface is two `…/pulls/{n}/scopes` endpoints; refresh
+# exists only as the documented `@mergifyio refresh` comment command. An API
+# call would also need every consuming repository to provision a Mergify
+# application key as a secret, which is a real adoption cost for a mechanism
+# whose entire job is to be free.
+#
+# WHY IT WAITS FIRST, AND USUALLY POSTS NOTHING
+#
+# A nudge fired unconditionally on every CI completion would be a comment per
+# run per pull request — plus whatever Mergify replies with — on the majority of
+# runs where the webhook arrived perfectly well and Mergify was already three
+# seconds ahead of us. Comment noise is how an automation gets muted, and a
+# muted automation is worse than none because it still looks installed.
+#
+# So this waits out the grace period, then asks GitHub a question with a factual
+# answer: has ANY check-run belonging to the Mergify app been touched at or
+# after the moment CI finished? If yes, Mergify has already seen this world and
+# there is nothing to tell it. Only a Mergify that is demonstrably behind gets a
+# comment. On a healthy repository this workflow runs to completion and posts
+# nothing, every time.
+#
+# The asymmetry of the two ways that question can be wrong is deliberate. A
+# false "behind" costs one redundant comment and a no-op refresh. A false
+# "caught up" costs nothing new at all — it leaves the pull request exactly
+# where it is today, waiting for the periodic re-evaluation. Neither can merge
+# anything that was not going to merge anyway: `refresh` re-evaluates, it does
+# not approve, bypass or queue.
+#
+# WHY ON FAILURE TOO, AND NOT ONLY ON SUCCESS
+#
+# A red check is a queue event as much as a green one. A queued pull request
+# whose CI failed and whose failure Mergify has not seen holds the front of a
+# serial queue until `checks_timeout` — 30 minutes in this repository's
+# `.mergify.yml` — and everything behind it waits out a decision that was
+# already made. Refreshing on failure is what turns that into a prompt dequeue.
+#
+# `cancelled`, `skipped`, `stale` and `action_required` are deliberately not
+# nudged. A cancelled run is one `cancel-in-progress` superseded, so a newer run
+# of the same workflow is already in flight and will nudge in its place; the
+# others never produced a conclusion for Mergify to be behind on.
+#
+# WHY IT IS A REUSABLE WORKFLOW
+#
+# The same argument `shared-infra-anchor.yml` makes: fourteen repositories
+# needing the same ninety lines is fourteen copies of every future fix. The
+# consumer writes a caller with the `workflow_run` trigger — which cannot live
+# in a reusable workflow, since `workflow_call` is the only trigger a callee may
+# have — and nothing else. See `docs/ci-merge-queue-baseline.md`.
+#
+# WHAT THE CONSUMER MUST KNOW
+#
+# A `workflow_run` workflow only runs from the DEFAULT BRANCH. The pull request
+# that adds it therefore proves nothing about it, and cannot: the first run is
+# the first CI completion after the merge. That is not a gap in the testing, it
+# is a property of the trigger, and `scripts/ci/mergify-nudge.selftest.sh`
+# exists because of it — the structural properties are asserted on the text,
+# with mutations, since no pull-request run can assert them on behaviour.
+#
+# And the sender matters. Mergify checks the permission of whoever posted a
+# command, and `github-actions[bot]` is not a repository collaborator, so the
+# default `sender-permission >= write` restriction does not admit it. The
+# `commands_restrictions.refresh` block in `.mergify.yml` is the other half of
+# this workflow, not an optional extra: without it every nudge is silently
+# discarded and the only symptom is that nothing improves.
+# =============================================================================
+
+name: Mergify nudge
+
+on:
+  workflow_call:
+    inputs:
+      grace-seconds:
+        description: >-
+          How long to wait before asking whether Mergify is behind. This is the
+          budget for the webhook arriving NORMALLY — Mergify's own measured
+          reaction time to an event it does receive is 13-14 seconds, so 60 is
+          roughly four times the healthy case. Too short and every run nudges;
+          too long and a genuine stall is prolonged by exactly this much.
+        required: false
+        default: 60
+        type: number
+      attempts:
+        description: >-
+          How many times to ask, including the first. Every attempt after the
+          first is a second chance for a merely-late webhook to land, which
+          costs an API call and buys a comment not posted.
+        required: false
+        default: 4
+        type: number
+      interval-seconds:
+        description: >-
+          The gap between attempts. `grace-seconds + (attempts - 1) *
+          interval-seconds` is the longest this waits before nudging, and it
+          must stay well under the queue's `checks_timeout` — a nudge that
+          arrives after the entry has already been dequeued for a timeout is
+          telling Mergify about a pull request it has stopped tracking.
+        required: false
+        default: 30
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  nudge:
+    name: Tell Mergify that CI finished
+    # GitHub-hosted, like the rest of this repository's CI: the repository that
+    # defines the self-hosted fleet must not need the fleet to be healthy in
+    # order to merge a fix to the fleet. A consumer inherits the same choice,
+    # and should keep it — this job is three API calls and two sleeps, and
+    # spending a warm pool slot on it would take a slot from a real job for
+    # minutes at a time while it waits.
+    runs-on: ubuntu-latest
+    # The wait is bounded by the inputs and the defaults sum to 2m30s. Ten
+    # minutes leaves room for a consumer that widened them without leaving a
+    # hung `gh` call able to sit here indefinitely.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # `GET /repos/{o}/{r}/commits/{sha}/check-runs` is governed by the Checks
+      # permission, not by Contents — and declaring a `permissions:` block at
+      # all sets every scope not listed here to `none`. Without this line the
+      # "has Mergify re-evaluated yet?" probe 403s, `mergify_seen_it` fails
+      # closed, and every single CI run nudges. That is the noise failure the
+      # grace period exists to prevent, and it would arrive as a comment storm
+      # rather than as a red job.
+      checks: read
+      # The one write, and the smallest one that can post a comment. Nothing
+      # here approves, merges, labels or pushes.
+      #
+      # It is deliberately NOT `issues: write`. GitHub's permissions table
+      # lists `POST /repos/{o}/{r}/issues/{n}/comments` under BOTH Issues and
+      # Pull requests, and the target here is always a pull request — resolved
+      # from `/commits/{sha}/pulls`, which cannot return an issue. Adding
+      # `issues: write` would hand this job the ability to write to every issue
+      # in the repository in exchange for nothing, on a `workflow_run` trigger,
+      # which is the one place extra write scope is worth refusing.
+      pull-requests: write
+    steps:
+      - name: Nudge Mergify if it has not seen this CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Every value the shell reads arrives as an environment variable and
+          # never as `${{ }}` spliced into the script. `head_branch` and
+          # `display_title` are attacker-influenced on a fork pull request, and
+          # interpolation happens before the shell parses the line.
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_ENDED_AT: ${{ github.event.workflow_run.updated_at }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          GRACE: ${{ inputs.grace-seconds }}
+          ATTEMPTS: ${{ inputs.attempts }}
+          INTERVAL: ${{ inputs.interval-seconds }}
+        run: |
+          set -euo pipefail
+
+          # A caller wired to something other than a pull-request CI run. There
+          # is no queue entry to be behind on, so there is nothing to refresh.
+          if [ "$RUN_EVENT" != "pull_request" ]; then
+            echo "::notice::the run was triggered by '$RUN_EVENT', not a pull request — nothing to refresh"
+            exit 0
+          fi
+
+          case "$CONCLUSION" in
+            success|failure|timed_out) ;;
+            *)
+              echo "::notice::conclusion '$CONCLUSION' is not a verdict Mergify can act on — not nudging"
+              exit 0
+              ;;
+          esac
+
+          # Which pull requests this commit is the head of. Read from the API
+          # rather than from `workflow_run.pull_requests`, which GitHub leaves
+          # EMPTY for a fork pull request — the one case where a silent nudge
+          # failure would be hardest to notice, because forks are rare enough
+          # that nobody would connect it to this workflow.
+          prs="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls" \
+                   --jq '.[] | select(.state == "open") | select(.draft == false) | .number')"
+          if [ -z "$prs" ]; then
+            echo "::notice::no open, non-draft pull request has $HEAD_SHA at its head — nothing to refresh"
+            exit 0
+          fi
+
+          # The instant CI finished, as a comparable number. Everything below
+          # asks one question against it: did Mergify touch anything AFTER this?
+          ci_ended="$(date -u -d "$RUN_ENDED_AT" +%s)"
+
+          # The newest timestamp on any check-run belonging to the Mergify app.
+          # Matched on `app.slug`, not on a check name: `Mergify Merge
+          # Protections` and the queue's own check are both Mergify's, the names
+          # are Mergify's to change, and a name that stops matching would make
+          # this report "behind" forever — a nudge on every single run.
+          #
+          # `completed_at // started_at` because a check still in progress has
+          # no completion time, and a Mergify check that STARTED after CI
+          # finished is already evidence that it has seen this world.
+          mergify_seen_it() {
+            local newest
+            newest="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?per_page=100" \
+                        --jq '[.check_runs[] | select(.app.slug == "mergify") | .completed_at // .started_at]
+                              | map(select(. != null)) | max // ""')"
+            [ -n "$newest" ] || return 1
+            [ "$(date -u -d "$newest" +%s)" -ge "$ci_ended" ]
+          }
+
+          sleep "$GRACE"
+
+          attempt=1
+          while true; do
+            if mergify_seen_it; then
+              echo "::notice::Mergify re-evaluated $HEAD_SHA on its own after attempt $attempt — no nudge needed"
+              exit 0
+            fi
+            [ "$attempt" -lt "$ATTEMPTS" ] || break
+            attempt=$((attempt + 1))
+            sleep "$INTERVAL"
+          done
+
+          # Mergify is behind. The command has to START the comment, with a
+          # single space after `@mergifyio`, or Mergify does not read it at all
+          # — so the explanation goes underneath, where it is for the human
+          # reading the thread and wondering what posted this.
+          body="$(printf '%s\n\n%s\n\n%s\n' \
+            '@mergifyio refresh' \
+            "CI finished ($CONCLUSION) at \`$RUN_ENDED_AT\` and no Mergify check-run has been updated since." \
+            "Automated by \`mergify-nudge\`; see the [CI run]($RUN_URL) and \`docs/ci-merge-queue-baseline.md\`.")"
+
+          # One comment per pull request, and the loop is not defensive
+          # paranoia: a commit can be the head of more than one open pull
+          # request, and refreshing only the first would leave the others in the
+          # exact state this exists to clear.
+          #
+          # Fed by a heredoc rather than `for pr in $prs`, which is unquoted
+          # word splitting on purpose and reads to every linter as the bug it
+          # usually is, and rather than a pipe, which would run the body in a
+          # subshell whose failures `set -e` cannot see.
+          while read -r pr; do
+            [ -n "$pr" ] || continue
+            gh api "repos/$GITHUB_REPOSITORY/issues/$pr/comments" -f body="$body" --silent
+            echo "::notice::nudged pull request #$pr — Mergify had not re-evaluated $HEAD_SHA since CI finished"
+          done <<EOF
+          $prs
+          EOF
