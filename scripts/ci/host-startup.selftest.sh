@@ -1455,7 +1455,12 @@ registration_is_gated() { # <file>
   local n_gate n_work n_config
   n_gate=$(grep -n 'slot_can_execute "\$dir"' "$1" | head -1 | cut -d: -f1)
   n_work=$(grep -n '\[ -L "\$dir/_work" \]' "$1" | head -1 | cut -d: -f1)
-  n_config=$(grep -n '\$dir/config\.sh" \\' "$1" | head -1 | cut -d: -f1)
+  # Matched by the sudo line that INVOKES config.sh, not by the bare path: the
+  # path also appears in slot_can_execute's own `-x` test, earlier in the file,
+  # and anchoring on that would compare the gate against itself and pass however
+  # the real call were ordered. (Matching the line-continuation backslash instead
+  # would work too, but `\\` inside single quotes trips shellcheck SC1003.)
+  n_config=$(grep -n 'preserve-env=ACTIONS_RUNNER_INPUT_TOKEN "\$dir/config\.sh"' "$1" | head -1 | cut -d: -f1)
   [ -n "$n_gate" ] && [ -n "$n_work" ] && [ -n "$n_config" ] &&
     [ "$n_gate" -lt "$n_config" ] && [ "$n_work" -lt "$n_config" ]
 }
