@@ -74,11 +74,28 @@ is_bounded() { # <command text>
   return 0
 }
 
+# A `#` at the start of the line is not the only comment PowerShell has: a
+# `<# ... #>` block carries prose on lines that begin with a letter, and the
+# `grep -v '^\s*#'` below cannot see it. A doc comment that EXPLAINS the bound
+# -- "the header is a hashtable passed in-process to Invoke-RestMethod" -- then
+# reads as an unbounded call, and the only way to get the gate green is to stop
+# documenting the call. That is a detector training people to write worse code.
+strip_ps_block_comments() { # <file>
+  awk '
+    { line = $0 }
+    # A block that opens and closes on the same line leaves the code around it.
+    { while (match(line, /<#([^#]|#[^>])*#>/)) { line = substr(line, 1, RSTART - 1) substr(line, RSTART + RLENGTH) } }
+    inblock { if (line ~ /#>/) { sub(/^.*#>/, "", line); inblock = 0 } else { next } }
+    line ~ /<#/ { sub(/<#.*$/, "", line); inblock = 1 }
+    { print line }
+  ' "$1"
+}
+
 # PowerShell continues a line with a trailing BACKTICK, not a backslash, so the
 # folder above would judge a wrapped `Invoke-RestMethod` as several commands and
 # miss the `-TimeoutSec` on its last line.
 # shellcheck disable=SC2016  # `$ is sed's end-of-line anchor, not a shell expansion.
-fold_ps_lines() { sed -e :a -e '/`$/{N;s/`\n//;ta' -e '}' "$1"; }
+fold_ps_lines() { strip_ps_block_comments "$1" | sed -e :a -e '/`$/{N;s/`\n//;ta' -e '}'; }
 
 ps_web_cmds() { fold_ps_lines "$1" | grep -vE '^[[:space:]]*#' | grep -Ei '(^|[^[:alnum:]_-])Invoke-(RestMethod|WebRequest)([^[:alnum:]_-]|$)'; }
 ps_httpclients() { fold_ps_lines "$1" | grep -vE '^[[:space:]]*#' | grep -cEi 'Net\.Http\.HttpClient'; }
@@ -216,6 +233,20 @@ cat >"$FIX/client.ps1" <<'PSCLIENTEOF'
 $c = [System.Net.Http.HttpClient]::new()
 PSCLIENTEOF
 
+# Prose inside a `<# #>` block, plus the one thing that block must not hide: a
+# genuinely unbounded call sitting after it. Both directions, in one fixture,
+# because a stripper that eats the rest of the file also reports zero.
+cat >"$FIX/blockcomment.ps1" <<'PSBLOCKEOF'
+<#
+    .SYNOPSIS
+    The header is a hashtable passed in-process to Invoke-RestMethod and
+    nothing is exec'd, so there is no argv to leak into.
+    [System.Net.Http.HttpClient] is named here and constructed nowhere.
+#>
+$one = Invoke-RestMethod -Uri 'https://api.github.com/x' -TimeoutSec 10
+<# a block that opens and closes on one line #> $two = Invoke-RestMethod -Uri 'https://api.github.com/y'
+PSBLOCKEOF
+
 probe_unbounded_ps() { # <file> -> count of unbounded PowerShell web calls
   local n=0 c
   while IFS= read -r c; do
@@ -244,6 +275,14 @@ expect_eq "$(ps_httpclients "$FIX/client.ps1")" 1 \
 expect_eq "$(ps_httpclients "$FIX/good.ps1")" 0 \
   "detector leaves cmdlet-only PowerShell alone" \
   "detector flags a file with no HttpClient in it"
+
+expect_eq "$(probe_unbounded_ps "$FIX/blockcomment.ps1")" 1 \
+  "detector reads past a doc comment without judging its prose" \
+  "detector judged prose inside a <# #> block, or lost the real call after it"
+
+expect_eq "$(ps_httpclients "$FIX/blockcomment.ps1")" 0 \
+  "detector does not see an HttpClient merely named in a doc comment" \
+  "detector flags a type mentioned in prose and constructed nowhere"
 
 [ "$fail" -eq 0 ] || { echo "  bounded calls UNVERIFIABLE (detectors are broken)."; exit 1; }
 

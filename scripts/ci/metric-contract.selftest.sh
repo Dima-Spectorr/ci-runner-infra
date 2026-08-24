@@ -2,12 +2,20 @@
 # Every metric the pool publishes must appear in the module's `metric_names`
 # output, and vice versa.
 #
-# "The pool" is two scripts, not one. The controller publishes every tick; the
-# host publishes once, for the cache hydrate, because that finishes before the
-# runner agent registers and the controller never observes it. Both share
-# telemetry.sh, so both go through `queue_series` and both belong to this diff —
-# a check that read only the controller would have called the host's series
-# "declared and nothing publishes it".
+# "The pool" is THREE scripts, not one. The controller publishes every tick; the
+# Linux host publishes once, for the cache hydrate, because that finishes before
+# the runner agent registers and the controller never observes it; and the
+# Windows host publishes the same five hydrate series for the same reason. The
+# first two share telemetry.sh and go through `queue_series`; the Windows script
+# cannot dot-source a bash file and has its own publisher, so it goes through
+# `Add-MetricSeries -Name`. All three belong to this diff — a check that read
+# only the controller would have called the hosts' series "declared and nothing
+# publishes it".
+#
+# TWO MATCHERS, ONE CONTRACT. The Windows publisher was added (#252) precisely so
+# a Windows pool stops being invisible; if this file had kept reading two scripts,
+# the new series would have been the ones it could not see, and the check written
+# to catch silent drift would have been silent about the drift it was extended for.
 #
 # WHY: `ci_orphan_registrations_reaped` was published from the day the reaper
 # landed and was never added to the output. Dashboards and alert policies are
@@ -21,16 +29,27 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 scripts="$here/../../modules/ci-runner-host-pool/scripts"
 controller="$scripts/controller-startup.sh"
 host="$scripts/host-startup.sh"
+winhost="$scripts/windows-host-startup.ps1"
 outputs="$here/../../modules/ci-runner-host-pool/outputs.tf"
 
-# What each script actually sends: every `queue_series "<name>"` call.
+# What a bash script actually sends: every `queue_series "<name>"` call.
 names_in() {
   grep -oE 'queue_series[[:space:]]+"[a-z0-9_]+"' "$1" \
     | sed 's/.*"\(.*\)"/\1/' | sort -u
 }
+# And the PowerShell equivalent. Single-quoted on that side, which is not a
+# style difference: PowerShell interpolates inside double quotes, so a metric
+# name written "…" there would be a name this matcher reads correctly and the
+# host might not send.
+ps_names_in() {
+  grep -oE "Add-MetricSeries[[:space:]]+-Name[[:space:]]+'[a-z0-9_]+'" "$1" \
+    | sed "s/.*'\(.*\)'/\1/" | sort -u
+}
 controller_published="$(names_in "$controller")"
 host_published="$(names_in "$host")"
-published="$(printf '%s\n%s\n' "$controller_published" "$host_published" | grep . | sort -u)"
+winhost_published="$(ps_names_in "$winhost")"
+published="$(printf '%s\n%s\n%s\n' "$controller_published" "$host_published" \
+  "$winhost_published" | grep . | sort -u)"
 
 # What the module promises: the string list inside the metric_names output.
 declared="$(sed -n '/output "metric_names"/,/^}/p' "$outputs" \
@@ -55,6 +74,7 @@ floor() { # <label> <list> <minimum>
 }
 floor "controller-startup.sh" "$controller_published" 5
 floor "host-startup.sh" "$host_published" 3
+floor "windows-host-startup.ps1" "$winhost_published" 3
 [ "$(printf '%s\n' "$declared" | grep -c .)" -ge 5 ] || {
   printf 'FAIL extracted %s declared metric(s) from outputs.tf — the matcher is broken\n' \
     "$(printf '%s\n' "$declared" | grep -c .)"; fails=$((fails + 1)); }
@@ -81,6 +101,24 @@ for m in ci_worker_gate_verdicts ci_worker_gate_os_fallback ci_pin_holds_honoure
     printf 'FAIL %s is not declared in metric_names — no dashboard or alert can find the delete gate\n' "$m"
     fails=$((fails + 1)); }
 done
+
+# THE TWO HOSTS MUST AGREE, and the generic diff below cannot see it: the union
+# still contains a series one host dropped, so it stays "published and declared"
+# while half the fleet stopped sending it. That is the exact shape of the gap
+# #252 closed — a Windows pool answering `ci_cache_hydrate_verdict` with an empty
+# chart, which reads as "no data yet" rather than "this pool never reports".
+while read -r m; do
+  [ -n "$m" ] || continue
+  printf '%s\n' "$winhost_published" | grep -cx "$m" >/dev/null || {
+    printf 'FAIL %s is published by host-startup.sh but not by windows-host-startup.ps1 — a Windows pool answers that series with an empty chart, which reads as "no data yet"\n' "$m"
+    fails=$((fails + 1)); }
+done <<<"$host_published"
+while read -r m; do
+  [ -n "$m" ] || continue
+  printf '%s\n' "$host_published" | grep -cx "$m" >/dev/null || {
+    printf 'FAIL %s is published by windows-host-startup.ps1 but not by host-startup.sh — the two host kinds no longer describe the same boot\n' "$m"
+    fails=$((fails + 1)); }
+done <<<"$winhost_published"
 
 while read -r m; do
   [ -n "$m" ] || continue
