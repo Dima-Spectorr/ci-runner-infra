@@ -8,12 +8,14 @@ scanner that feeds it is `scripts/ci/scan-support-windows.sh`, asserted by
 `scripts/ci/scan-support-windows.selftest.sh`. It is delivered as a reusable
 workflow, consumed by tag exactly as `modules/ci-runner-host-pool` is.
 
-The tag in the snippet below is the **floating major**, `@v5`, which is what
-this repository's guides publish and what its pin gate asserts — an exact
-`@vX.Y.Z` in a document is stale on the next release. It costs nothing here:
-the workflow resolves `github.job_workflow_sha` at run time, so a consumer
-still runs the scanner at the exact commit the tag pointed at when the job
-started, rather than whatever is on the default branch.
+The ref in the snippet below is a **commit SHA with a version comment**, which
+is what this repository's guides publish and what its pin gate asserts. It is
+not `@v5`: `check-action-pins.sh` is published here and copied into every
+consumer, and its `PIN1` rejects a tag outright — these workflows run on hosts
+holding a GCP identity, where a moved tag is arbitrary code nobody reviewed.
+The comment is what keeps it fresh rather than exact-and-ageing; Dependabot
+rewrites the pin, so a superseded SHA arrives as a pull request in the consumer
+instead of sitting silently.
 
 ---
 
@@ -174,7 +176,7 @@ concurrency:
 
 jobs:
   scan:
-    uses: <org>/ci-runner-infra/.github/workflows/support-windows.yml@v5
+    uses: <org>/ci-runner-infra/.github/workflows/support-windows.yml@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
     permissions:
       contents: read
       issues: write

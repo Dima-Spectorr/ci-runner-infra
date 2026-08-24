@@ -1,11 +1,14 @@
 name: Support windows
 
-# Published for consuming repositories to call by tag, exactly as
-# `modules/ci-runner-host-pool` is. The contract is docs/dependency-freshness.md.
+# Published for consuming repositories to call. A Terraform module is consumed
+# by tag; a workflow is not — `check-action-pins.sh` PIN1, published here and
+# run by every consumer, rejects a tag and requires a SHA with a version
+# comment for Dependabot to rewrite (#351). The contract is
+# docs/dependency-freshness.md.
 #
 #   jobs:
 #     support-windows:
-#       uses: <org>/ci-runner-infra/.github/workflows/support-windows.yml@v5
+#       uses: <org>/ci-runner-infra/.github/workflows/support-windows.yml@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
 #       permissions:
 #         contents: read
 #         issues: write
