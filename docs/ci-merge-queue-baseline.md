@@ -1382,26 +1382,29 @@ on the majority of runs where the webhook arrived perfectly well. Comment noise
 is how an automation gets muted, and a muted automation is worse than none
 because it still looks installed.
 
-So the workflow waits out a grace period (20s by default), then asks GitHub a
-question with a factual answer: **has any check-run belonging to the Mergify app
-been touched at or after the moment CI finished?** If yes, Mergify has already
-seen this world. Only a Mergify that is demonstrably behind gets a comment. It
-re-asks once more after 15s, so a merely-late webhook still costs nothing but
-API calls.
+So the workflow waits out a short grace period (5s by default), then asks GitHub
+a question with a factual answer: **has any check-run belonging to the Mergify
+app been touched at or after the moment CI finished?** If yes, Mergify has
+already seen this world. Only a Mergify that is demonstrably behind gets a
+comment.
 
-The grace period was 60s — four times Mergify's 13-14s reaction to an event it
-receives — on the assumption that most runs would be caught by it. Measured over
-the first ten nudged pull requests in `ci-runner-infra`, Mergify re-evaluated
-inside the window **zero** times. When the webhook lands Mergify is fast; when it
-does not land, waiting longer does not help. The window is now sized to catch a
-merely-late delivery, not to hope for a lost one.
+That grace period was 60s, then 20s, and is now 5s with a single probe
+(`attempts: 1`) — a retreat driven entirely by the fact that it never once paid
+out. It was sized at four times Mergify's 13-14s reaction to an event it
+receives, on the assumption that most runs would be caught inside it. Across
+eleven measured runs in `ci-runner-infra` it caught **zero**. When the webhook
+lands Mergify is fast; when it does not land, waiting longer does not help. So
+the window is no longer sized to catch anything — it exists only so the probe
+below it has something to read, and the comment it used to save is one Mergify
+answers with "already running from a previous command" at no cost to either
+side.
 
 The two ways that question can be wrong are deliberately asymmetric. A false
 "behind" costs one redundant comment and a no-op refresh. A false "caught up"
 costs nothing new — it leaves the pull request exactly where it is today. Neither
 can merge anything that was not already going to merge.
 
-### One comment is not enough: the nudge is a ladder
+### One comment, then confirm it: why the ladder collapsed back to a single nudge
 
 The measurement that forced this: across those same ten nudges, Mergify answered
 the comment in **12-30s seven times, and took 9-11 minutes three times**. Not a
@@ -1415,15 +1418,28 @@ layer up, and there is no API to fall back on: Mergify exposes `refresh` only as
 a comment command.
 
 So the workflow posts, waits `confirm-seconds` (60s), re-reads Mergify's
-check-runs, and posts again if nothing moved — up to `nudge-attempts` (3),
-**including one final wait and re-read after the last post**. That trailing
-check is not symmetry for its own sake: without it the last comment is the only
-one never given a chance to be answered, and the job warns over a Mergify that
-had in fact replied. Each comment is an independent delivery, so a stall
-surviving the whole ladder is unlikely, and a Mergify that answered the first
-comment never sees a second. A repository that regularly exhausts the ladder
-gets a `::warning::` — that is not a nudge problem, it is a Mergify
-installation whose webhook deliveries need looking at.
+check-runs, and warns if nothing moved. It posts **once** — `nudge-attempts`
+defaults to `1` — and the trailing wait-and-re-read happens even though there
+is no second post to lead into, because without it the one comment sent is the
+one comment never given a chance to be answered, and the job warns over a
+Mergify that had in fact replied.
+
+**That default used to be 3, and the retries were measured to do nothing.**
+Every one of them came back `☑️ Command refresh ignored because it is already
+running from a previous command` — which is Mergify saying the comment was
+*received and deduplicated*, not lost. No second or third comment was ever
+observed achieving something the first had not. The theory the ladder was built
+on — that the comment shares the webhook channel that dropped the `check_run`
+event, so a redelivery is worth having — was wrong about the failure mode: on
+2026-08-24 a **human** `@mergifyio refresh` on the same pull request was
+answered in the same delayed batch as the bot's, 12m13s later. Human and bot
+share one processing queue, and nothing was dropped; the installation was simply
+minutes behind. A second comment into a backlog arrives in the same backlog.
+
+Setting it above 1 is therefore paying three comments an hour per pull request
+into the very worker being waited on, for one comment's worth of effect. Raise
+it only with a measurement in hand that shows a *lost* comment — an `N`th
+command answered where the first was never acknowledged at all.
 
 ### What the first live run measured, and what it changed
 
@@ -1508,20 +1524,46 @@ The step log shows the `gh api` 403 above the notice.
 - **Do not fork the callee.** The nudge's logic lives once, here, for the same
   reason `shared-infra-anchor.yml` does: fourteen copies is fourteen copies of
   every future fix.
-- **Do not remove the grace period to "react faster".** It is what keeps the
-  automation quiet enough to stay installed, and at 20s it costs almost nothing
-  on a stall that is measured in tens of minutes.
-- **Do not collapse the nudge ladder back to a single comment.** It reads as
-  redundant because the happy path never enters it. It is the difference between
-  a stall costing 30 seconds and costing the ten minutes Mergify's
-  reconciliation takes to notice a comment it never received.
+- **Do not remove the check-run probe to "react faster".** The probe, not the
+  grace period, is what keeps the automation quiet enough to stay installed:
+  it is the difference between a comment on every CI run and a comment only on
+  the runs where Mergify is demonstrably behind. Shrinking the wait in front of
+  it is fine and has been done; deleting the question it asks is not.
+- **Do not raise `nudge-attempts` back above 1 without a measurement.** The
+  ladder was built on the theory that a comment can be lost the way a
+  `check_run` event can. It cannot be shown to have been: every retry Mergify
+  ever answered, it answered as *already running from a previous command*. See
+  the section above. A retry costs a real comment into a backlogged worker and
+  has never been observed to buy anything.
 - **Do not let the full ladder — `grace-seconds + (attempts - 1) ×
   interval-seconds + nudge-attempts × confirm-seconds` — approach the queue's
   `checks_timeout`.** A nudge that arrives after the entry has been dequeued for
   a timeout is telling Mergify about a pull request it stopped tracking. At the
-  defaults that total is 185s against a 30-minute timeout. Note the term is
+  defaults that total is 65s against a 30-minute timeout. Note the term is
   `nudge-attempts`, not `nudge-attempts - 1`: the last post gets a confirmation
-  window too, so that it can be answered rather than warned about.
+  window too, so that it can be answered rather than warned about — which at
+  the default of 1 is the *only* wait there is.
+- **Do not widen the waits past the job's 20-minute timeout.** A job cancelled
+  by its timeout loses the final probe *and* the warning — a red run on a
+  configuration the workflow otherwise accepts. The callee clamps its own
+  sleeps to that budget and emits a `::warning::` naming it, so overrunning
+  degrades to a shorter last wait rather than a cancellation; treat that
+  warning as a configuration error, not as the mechanism working. Once the
+  budget is gone the ladder **stops** rather than firing its remaining nudges
+  back-to-back: a comment nobody is given time to answer is not a retry, it is
+  noise on the pull request, and the run says so — `stopped after N of M
+  refresh commands` instead of the warning that sends you to audit webhook
+  deliveries that are working. The timeout is a literal rather than an input
+  because RUNNER6 refuses a `timeout-minutes` it cannot resolve to a number,
+  and 20 is set against the queue's 30-minute `checks_timeout`, which caps the
+  useful ladder anyway.
+- **The wait inputs are `type: number`, and the callee rounds them up to whole
+  seconds.** `number` is not `integer`: `grace-seconds: 0.5` arrives as the
+  literal `0.5`, and the clamp compares it arithmetically, so an unnormalised
+  fraction fails the comparison *false* and the job sleeps its entire remaining
+  budget — half a second becoming nineteen minutes. Rounding is up because each
+  of these is a minimum. A value that is not a number fails the job with an
+  `::error::` naming the input, rather than being read as zero.
 - **Do not restore `grace-seconds` as a safety margin.** It reads like one and
   is not: it has been measured over eleven runs catching Mergify self-reacting
   zero times, and it delays every run to save a comment on none of them. The

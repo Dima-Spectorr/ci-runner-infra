@@ -122,10 +122,24 @@ code_of() { grep -hvE '^[[:space:]]*#' "$@"; }
 # writer takes SIGPIPE and exits 141, and pipefail reports a SUCCESSFUL match as
 # a failure — as a race with how much the writer had buffered, so it passes on a
 # laptop and fails on a runner against a byte-identical file.
+#
+# A HERESTRING IS NOT THAT PIPE. `<<<` is not a pipeline: the shell writes the
+# word itself, there is no writer process to take SIGPIPE, and `pipefail` has no
+# pipeline to inspect. So `grep -q` is safe HERE and only here — the rule above
+# still holds for anything with a `|` in it.
+#
+# Which matters because this is the hottest function in the file. It ran as a
+# command substitution around a two-process pipeline — three forks per assertion
+# — and the predicates call it upwards of twenty times each, across 274
+# mutations. That fork traffic, not the matching, was essentially all of this
+# self-test's 114 seconds; one fork per assertion instead of three is the whole
+# saving.
+#
+# The `if` is not decoration: `grep -q` exits 2 on an INVALID pattern, where the
+# counting form returned a plain 1. No caller reads the number, but a helper this
+# widely used should not quietly change what it returns.
 matches() { # <text> <ere>
-  local n
-  n=$(printf '%s\n' "$1" | grep -cE -- "$2")
-  [ "${n:-0}" -gt 0 ]
+  if grep -qE -- "$2" <<<"$1"; then return 0; else return 1; fi
 }
 
 # --- the invariants -----------------------------------------------------------
