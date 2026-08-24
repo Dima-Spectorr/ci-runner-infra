@@ -487,16 +487,19 @@ def split_top_level(expr, operator):
 
 
 def condition_excludes(expr, leaf=None):
-    """True when `expr` cannot be true for a fork, read as a Boolean tree.
+    """True when `expr` cannot be true for whatever `leaf` excludes, read as a
+    Boolean tree. `leaf` decides WHAT is excluded and defaults to the fork test,
+    which is the caller this was written for; the walk itself knows nothing
+    about forks.
 
     A substring search is not enough. `always() || …fork == false` contains the
     exclusion and runs for forks anyway, because the OTHER disjunct does not
     care — so for `||` EVERY alternative has to exclude, while for `&&` ONE
-    conjunct excluding is enough to make the whole condition false for a fork.
-    Anything left after that is a leaf, and a leaf counts only if it matches a
+    conjunct excluding is enough to make the whole condition false. Anything
+    left after that is a leaf, and a leaf counts only if it matches a
     recognised exclusion shape outright.
 
-    `leaf` is the leaf test, defaulting to the fork one. The TREE is the part
+    The TREE is the part
     that is hard to get right and it is identical for any "this condition
     cannot be true for X" question, so RUNNER14 asks its own question — does
     this job sit out the merge-queue drafts — through this same walk rather
