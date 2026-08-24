@@ -832,6 +832,23 @@ describing nothing.
    account, where an inherited credential is worst because nothing there should
    hold Google credentials at all.
 
+   **The writers go before the files do.** Replacement is the second half of the
+   reset, not the first: `slot-reset.sh` removes the containers the last job left
+   detached and then terminates every remaining process of the slot — `SIGTERM`,
+   then `SIGKILL` — before it empties anything, and writes the clean marker only
+   once both have succeeded. In the other order every individual step is still
+   correct and the composition is not: a container bind-mounting the home, or a
+   server a step backgrounded, has a window between the template restore and its
+   own removal in which to write `.bashrc`, `.gitconfig` or a credential back,
+   and the marker then certifies a slot a writer outlived. Three things are
+   spared by name, because each of them would turn a cleanup into an outage: the
+   hook's own ancestry (the agent that called it), the slot's rootless dockerd
+   and everything under its user manager (the next job needs that socket), and —
+   when the caller is a root timer rather than the agent — the agent's own
+   process tree. A writer that will not die withholds the marker exactly as an
+   unremovable container does, and a slot **held** by a live run is spared
+   wholesale until the hold expires.
+
    Three things make wholesale replacement affordable, and each is why the reset
    is cheap rather than a cold start. The warm caches live under `/opt/ci-cache`,
    not in the home. The rootless daemon's data root is passed explicitly as

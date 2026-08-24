@@ -605,9 +605,21 @@ jobs:
 
       # …and the fixtures' own proof. A fixture asserting "this workflow
       # produces RUNNER8" keeps passing while the detector behind it is
-      # weakened, so this mutates the gate sixteen ways and asserts the suite
-      # above FAILS for each. Runs after it, because a mutation "detected" by a
-      # suite that was already red asserts nothing either.
+      # weakened, so this mutates the gate and asserts the suite above FAILS for
+      # each mutation. Runs after it, because a mutation "detected" by a suite
+      # that was already red asserts nothing either.
+      #
+      # The case count is deliberately not written here: the script prints its
+      # own and asserts a floor on it, and a number in prose beside a test that
+      # counts itself is a second source of truth that goes stale — this comment
+      # said "sixteen ways" while the file held twenty-five.
+      #
+      # It is also the longest step in this pipeline by a wide margin, because
+      # each case is a full run of the gate's own fixture suite. The cases are
+      # independent, so the script fans them across the runner's cores; nothing
+      # here has to know that, but a future reader wondering why this step is
+      # minutes rather than seconds should look at the fan-out before adding
+      # cases.
       - name: runner policy mutation self-test
         run: bash scripts/ci/check-runner-policy.selftest.sh
 

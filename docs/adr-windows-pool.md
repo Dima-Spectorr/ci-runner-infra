@@ -226,7 +226,8 @@ And at boot, each of these makes the host register **nothing**:
   host identity not proved harmless from a slot user's own context — a host whose
   service account can still read the App key secret registers nothing;
 * the job credential broker configured and not answering;
-* the per-job credential reset hooks not installed;
+* the per-job slot reset not installed — any one of its service, its hooks, or
+  the profile template the reset restores from (§3 phase 4, revised by #232);
 * the liveness beacon not published at least once (§2).
 
 ---
@@ -643,37 +644,149 @@ Linux, an empty `ci-job-service-account` means the broker is not started and job
 get no Google credentials at all — a valid pool, never a silent downgrade to the
 host identity.
 
-### Phase 4 — the per-job credential reset hooks
+### Phase 4 — the per-job slot reset
 
-`ACTIONS_RUNNER_HOOK_JOB_STARTED` and `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` are
-supported on Windows; the runner selects an interpreter from the hook file's
-extension, so the variables and the both-ends discipline carry over unchanged and
-only the script body is different.
+> **REVISED 2026-08-23 (#232).** This section used to specify a *credential*
+> reset: a hook that deleted `%APPDATA%\gcloud` and `%APPDATA%\gsutil`. Linux
+> retired the equivalent hook in #110 and replaced it in #231 — #237 is the
+> follow-up findings against that replacement, not the replacement — for a
+> reason that applies here word for word, and the text below is the Windows
+> design rather than a note appended to the old one. The hook's two surviving
+> properties — the profile resolved from the account database, and the hook file
+> ACL'd so no slot can rewrite what every slot executes — carry forward unchanged
+> and are restated at the end.
 
-The reason is unchanged and is not gcloud-specific: a slot account's profile
-outlives every job the slot serves, and an action that persists a credential
-leaves it for whatever pull request lands on that slot next. On Windows the
-leftover lives in `%APPDATA%\gcloud` (and `%APPDATA%\gsutil`), not
-`~/.config/gcloud`. Both hooks, for the reason the Linux comment gives: completion
-alone leaves a live credential on disk for the whole idle window and does not run
-at all if the agent is killed mid-job, which is the case that leaves the most
-behind.
+**A denylist of two directories cannot say what it is read to say.** The claim
+the reset has to support is *the next job does not inherit anything from the last
+one*, and a Windows slot profile carries the same executable surfaces Linux does,
+under different names:
 
-Two Linux details that must survive the port because they are the security half:
+* `%USERPROFILE%\.gitconfig` can name a `core.hooksPath`, so the next checkout
+  runs a script the last job chose;
+* `Documents\PowerShell\Microsoft.PowerShell_profile.ps1` and its Windows
+  PowerShell spelling are dot-sourced by every later shell;
+* any directory the slot can write that sits on `PATH` shadows a binary;
+* the previous checkout under `_work` keeps its own `.git\hooks`;
+* and a credential store is whatever the last tool decided it was — the two the
+  old hook named were the two we had seen, not the two that exist.
 
-* The hook resolves the profile directory from the **account database** (the
-  SID's `ProfileImagePath`), never from `$env:USERPROFILE`, and refuses to delete
-  anything that is not under a `ci-s*` profile root. The Linux version reads
-  `getent passwd` for exactly this reason: the directory being deleted must be
-  decided by the host, not by a variable a job could have changed.
-* The hook file is ACL'd SYSTEM/Administrators-full, slot-users-read-and-execute.
-  One file is executed by every slot on the host, so a slot that could rewrite it
-  would be running code in every other slot's identity. This is the Windows
-  spelling of `chown root:root` plus `0755`, and it is not optional.
+Enumerating those is the same losing game the Linux comment describes. The answer
+there is wholesale replacement from a template the slot cannot write, and it is
+the answer here.
 
-A failing hook fails the job. That is the intended trade, unchanged: a job that
-could not be given a clean credential state must not run with the previous job's
-identity.
+**What is already true, and is why this is affordable.** Wholesale replacement is
+only cheap if nothing expensive lives in the profile, and on this platform that
+work is already done: the dependency caches are per-slot under `C:\ci\cache\<i>`
+(#235), `TMP`/`TEMP` are `C:\ci\slots\<i>\temp`, `_work` is
+`C:\ci\slots\<i>\_work`, and the tool cache stays with it. What remains under
+`C:\Users\ci-s<i>` is dotfiles, shell profiles and per-tool configuration —
+kilobytes, and every byte of it a thing the last job could have written. So there
+is no Windows equivalent of the Linux "data-root move" left to do; it was paid for
+by the cache work, and this section depends on it staying true.
+
+**Three things had to be decided rather than translated.**
+
+*1. The privilege split — there is no `sudo`, and no `SUDO_UID`.* On Linux the
+hook runs `sudo -n /opt/ci/job-hooks/slot-reset.sh <stage>` and passes **no
+index at all**: `sudo` sets `SUDO_UID` itself from the real invoking user, and
+the script reads the slot out of that rather than out of its argv, so a slot
+cannot ask for a reset of a slot that is not itself. (The one caller that does
+supply an index is systemd's `ExecStartPre`, which runs as root with no `sudo`
+in the picture.) Windows has neither half — no `sudo` to prove who is asking,
+and so no `SUDO_UID` to read the index from. The decision:
+
+> The reset runs as **SYSTEM**, in a host-level service installed by this phase
+> and supervised by the same shim the beacon and the broker use. A slot asks for
+> one by dropping a request file into `C:\ci\state\<i>\request`, a directory ACL'd
+> SYSTEM-and-Administrators-full and **write for `ci-s<i>` alone**. Which slot is
+> being reset is decided by the directory the request appeared in — never by
+> anything inside it — so a job that writes a request naming slot 0 has written a
+> file in its own directory saying something the service does not read.
+
+Not a per-slot scheduled task, though the shape is tempting: a task can be given
+its own security descriptor so that only one slot may run it, but only through
+`ITaskFolder.RegisterTaskDefinition`'s SDDL parameter, which `Register-ScheduledTask`
+does not expose, and a mis-set SDDL fails *open* — every slot runs every slot's
+reset, and nothing in the boot log says so. A directory ACL is the boundary phase 1
+already establishes and phase 6 already proves, and the failure mode of getting it
+wrong is `Access is denied` at the moment of the mistake.
+
+A job can, of course, drop a request for its own slot mid-job and have its own
+profile replaced underneath it. That is self-harm inside one job's blast radius,
+it is the same thing a job can do by deleting its own files, and it buys nothing:
+the reset is what the next job's gate demands anyway.
+
+*2. A live profile cannot be emptied, so the agent stops first.* `NTUSER.DAT` is
+held open by the logon session for as long as a process runs as that account, and
+the runner service runs as `ci-s<i>` continuously. There is no supported way to
+replace a loaded hive underneath a live session. So the reset, running as SYSTEM
+and outside the job:
+
+1. **stops the slot's runner service**, which ends the logon session — and does it
+   *after* the completed hook has returned, never from inside it, because
+   stopping the service while the worker is reporting the job's result orphans
+   the job rather than finishing it;
+2. **quiesces the slot**, terminating every remaining process whose token names
+   the slot's SID — the Windows spelling of the Linux sweep, and for the identical
+   reason: a background process the job left running keeps a writable profile and
+   can put a dotfile back after the removal (#237). Its own service and the SCM
+   are excluded by ancestry, there being no cgroup here to name;
+3. waits for the hive to unload, **replaces the profile** from the template
+   captured at boot, and
+4. **restarts the service**, then writes the marker.
+
+The cost is one agent restart per job boundary, on the order of seconds, and it is
+stated here because it is a real per-job tax that Linux does not pay. It buys the
+one property the credential hook could never have: at step 3 nothing of the last
+job is running, so what the removal removes stays removed.
+
+*3. The gate, and what the hook is still for.* The marker is `C:\ci\state\<i>\clean`,
+written by SYSTEM, readable by the slot and writable by nobody else — the Linux
+marker's ACL, spelled in NTFS. The two hooks keep both ends of the job and lose
+all of the deleting:
+
+* **JOB_STARTED** writes a `started` request, waits (bounded) for the service to
+  read the marker, delete it, and publish a verdict, and **fails the job** if the
+  verdict is not `clean` or the wait expires. A slot whose predecessor never
+  finished has no marker, so its next job is failed rather than run — which is the
+  whole of the Linux property, and the reason the marker is deleted at the start
+  of a job rather than at the end of one.
+* **JOB_COMPLETED** writes a `completed` request and returns. It does not wait:
+  the work it asks for stops the service it is running under. Serialization is
+  free and not a mechanism — while the reset holds the service stopped, the agent
+  cannot be dispatched a job.
+
+A hook that cannot reach the service, or reaches it and is told `dirty`, fails the
+job. Unchanged trade, and now over the whole profile rather than two directories
+of it: a job that could not be given a clean slot must not run on a dirty one.
+
+**What stays weaker than Linux, stated rather than discovered.** There is no
+cgroup, so the quiesce spares processes by service ancestry and can in principle
+spare a straggler that re-parented into one; profile replacement is a directory
+copy and not an atomic swap, so an interrupted reset is caught by the missing
+marker rather than by the filesystem; and the per-job service restart is a cost
+Linux does not have. All three are the price of the platform, and the marker is
+what keeps every one of them fail-closed.
+
+**The two properties carried over verbatim from the old hook**, because they were
+the security half of it and are the security half of this:
+
+* The profile directory is resolved from the **account database** — the SID's
+  `ProfileImagePath` under `ProfileList` — never from `$env:USERPROFILE` or
+  `%APPDATA%`, and a resolution that does not end in a `ci-s<n>` leaf aborts
+  rather than recursing. The Linux script reads `getent passwd` for exactly this
+  reason: the directory being replaced is the host's decision, not a variable's.
+* Every file this phase installs is ACL'd SYSTEM-and-Administrators-full,
+  slot-users-read-and-execute. One hook file is executed by every slot on the
+  host, so a slot that could rewrite it would be running code in every other
+  slot's identity — and, the host being warm, in every later job's too.
+
+**Testability** follows §5's rule. The decisions above are pure functions — which
+slot a request directory names, whether a verdict is clean, what the template
+contains, which processes a quiesce may not touch — and they are unit-tested on
+`ubuntu-latest` with the paths injected. What cannot be tested off Windows (the
+hive unload, the ACL, the service stop) is proved on the host by phase 6, which is
+where "Windows does the right thing by default" claims already go to be checked.
 
 ### Phase 5 — agent registration as a service running as the slot user
 
@@ -832,14 +945,31 @@ established pattern here rather than a new bet.
 **The master is untrusted build input.** `warm_cache_script` is arbitrary
 repo-supplied code running elevated in the build VM (§6), and what it leaves
 behind is both ACL-walked and copied K times. The Linux scan refuses five
-things; three have no Windows spelling. Of the two that do, the **reparse
-point** is refused by the Packer template at step 7b and again by
-`Get-CacheHostileReason` at boot, because an image is not the only way content
-reaches that tree. The other, an **NTFS hardlink whose other name lies outside
-the master**, is not refused: a file's security descriptor lives on its MFT
-record, so `icacls /reset /T` rewrites it at that other name too. Detecting it
-needs a link count, which `Get-ChildItem` does not carry; #238 holds the
-options and their boot-time cost. Both operations that follow the scan would
+things; three have no Windows spelling. The two that do are refused twice each,
+by the Packer template at step 7b and again at boot, because an image is not
+the only way content reaches that tree — a hydrated snapshot is the other, and
+no reviewed build step stands in front of it.
+
+The first is the **reparse point** (`Get-CacheHostileReason`). The second is an
+**NTFS hardlink whose other name lies outside the master**: a file's security
+descriptor lives on its MFT record, so `icacls /reset /T` rewrites it at that
+other name too, and `robocopy /COPY:DAT` copies the content into every slot.
+Detecting it needs a link count, which `Get-ChildItem` does not carry and
+nothing in the managed surface of Windows PowerShell 5.1 exposes, so both
+copies P/Invoke `GetFileInformationByHandle` — `Get-CacheLinkRecord` plus
+`Get-CacheHardlinkReason` at boot, `packer/windows/scan-cache-hardlinks.ps1` at
+build time. The rule is **counted, not forbidden**: the names visible in the
+tree are compared against the link count, because a pnpm store and a `cp -al`
+hardlink legitimately and entirely inside it. Measured on NTFS under Windows
+PowerShell 5.1, the probe costs ~0.17 ms per file warm and ~1.4 ms cold, which
+is why the boot copy runs only over the **staged** tree on the hydrate path —
+warm by construction, and already inside the hydrate deadline it shares with
+the copy that follows — while the baked master is judged once, at build time.
+Compilation is lazy for the same reason: a host with no snapshot to hydrate
+never pays the ~0.5 s `Add-Type` shells out for, and a host where it fails
+starts cold rather than sealing a tree it could not check.
+
+Both operations that follow the scan would
 honour a junction: `icacls` with `(OI)(CI)` applies the grant to whatever it
 names, and an ACL applied to the wrong tree outlives the boot; `robocopy`
 descends into it. The scan therefore runs **before** the seal, and it includes

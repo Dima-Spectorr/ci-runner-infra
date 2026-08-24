@@ -33,6 +33,7 @@ MAIN="$ROOT/modules/ci-runner-cache-warmer/main.tf"
 VARS="$ROOT/modules/ci-runner-cache-warmer/variables.tf"
 TURBO="$ROOT/modules/ci-runner-cache-warmer/scripts/warm-turbo.sh"
 SHARED="$ROOT/scripts/ci/publish-cache-snapshot.sh"
+SHAREDSCAN="$ROOT/scripts/ci/scan-cache-credentials.sh"
 
 PASS=0
 FAIL=0
@@ -61,8 +62,21 @@ code_of() { grep -vE '^[[:space:]]*#' "$1"; }
 #    replaced by a copy inside the module (drift), or the root file could be
 #    moved (a plan that fails with a message about a missing file and nothing
 #    about why a module wants one two directories up).
+#
+#    The credential-scan library is the same reference and the same argument. The
+#    step runs `bash -c "<text>"`, so there is nothing on that disk to source: the
+#    library's text is prepended, and if it stopped being prepended the publisher
+#    would find no `scan_credentials_or_die` and refuse — loudly, but only at
+#    trigger time, on a schedule nobody is watching. Asserted here instead.
+#    SCAN_INLINE_LIBRARY goes with it: without the marker the library's standalone
+#    entry point runs `usage:` against the step's argv and the build dies before
+#    the publisher's first line.
 has_shared_publisher() { # <file>
-  matches "$(code_of "$1")" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"\)'
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"\)' || return 1
+  matches "$code" 'file\("\$\{path\.module\}/\.\./\.\./scripts/ci/scan-cache-credentials\.sh"\)'  || return 1
+  matches "$code" '"SCAN_INLINE_LIBRARY=1"'                                                       || return 1
 }
 
 if has_shared_publisher "$MAIN"; then ok; else
@@ -71,6 +85,10 @@ fi
 
 if [ -f "$SHARED" ]; then ok; else
   bad "scripts/ci/publish-cache-snapshot.sh has moved; the warmer module reads it by relative path and terraform will fail at plan time with a message that says nothing about this"
+fi
+
+if [ -f "$SHAREDSCAN" ]; then ok; else
+  bad "scripts/ci/scan-cache-credentials.sh has moved; the warmer module reads it by relative path too, and terraform will fail at plan time with a message that says nothing about this"
 fi
 
 # 2. TWO PHASES. The archive is packed in one step and uploaded in another, and
@@ -273,17 +291,41 @@ has_dollars_escaped() { # <file>
   local code
   code=$(code_of "$1")
   matches "$code" 'escape_dollars = "\$\$"' || return 1
-  matches "$code" 'publish_script = replace\(file\(.*publish-cache-snapshot\.sh"\), "\$", local\.escape_dollars\)' || return 1
-  matches "$code" 'turbo_script   = replace\(file\(.*warm-turbo\.sh"\), "\$", local\.escape_dollars\)' || return 1
+  # The publishing script is TWO files joined, so the escape wraps the join and
+  # not each file: escaping part by part is the same result today by a route
+  # where the part added tomorrow arrives raw.
+  matches "$code" 'publish_script = replace\(join\("\\n", \[' || return 1
+  matches "$code" '\]\), "\$", local\.escape_dollars\)' || return 1
+  matches "$code" 'turbo_script = replace\(file\(.*warm-turbo\.sh"\), "\$", local\.escape_dollars\)' || return 1
   matches "$code" 'prepare_command = replace\(coalesce\(var\.prepare_command' || return 1
   matches "$code" 'build_command = replace\(coalesce\(var\.build_command' || return 1
-  # And nothing reaches a step's args as a raw file() read, which is how the
-  # escaping gets bypassed for one step while the local next to it keeps it.
+  # And nothing reaches a step as a raw file() read, which is how the escaping
+  # gets bypassed for one step while the local next to it keeps it.
+  ! matches "$code" 'script[[:space:]]*=[[:space:]]*file\(' || return 1
   ! matches "$code" 'args[[:space:]]*=[[:space:]]*\["-c", file\('
 }
 
 if has_dollars_escaped "$MAIN"; then ok; else
   bad "a script or command reaches the build config with its dollars unescaped — Cloud Build parses those as substitutions and refuses the build at fire time, so the trigger applies green and the warm has never run"
+fi
+
+# 12. EVERY STEP CARRIES ITS SCRIPT IN `script`, NEVER IN `args`. A step argument
+#     is capped at 10,000 characters and the publishing script is an order of
+#     magnitude past it, so `entrypoint = "bash"` + `args = ["-c", …]` is refused
+#     — at FIRE time again, "build step 0 arg 1 too long (max: 10000)", on a
+#     trigger that applied green. `script` has no such cap and honours the file's
+#     own shebang; setting `entrypoint` beside it is an error in its own right.
+carries_scripts_in_script_field() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'script = local\.publish_script' || return 1
+  matches "$code" 'script = local\.turbo_script' || return 1
+  ! matches "$code" 'args[[:space:]]*=[[:space:]]*\["-c"' || return 1
+  ! matches "$code" 'entrypoint'
+}
+
+if carries_scripts_in_script_field "$MAIN"; then ok; else
+  bad "a step passes its script through args or sets an entrypoint beside script — args are capped at 10,000 characters, the publishing script is far past that, and the API refuses the build at fire time on a trigger that applied cleanly"
 fi
 
 # --- mutations -----------------------------------------------------------------
@@ -310,6 +352,14 @@ mutate() { # <description> <file> <sed-program> <predicate>
 
 mutate "the publisher copied into the module" "$MAIN" \
   's@file("\${path\.module}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh")@file("${path.module}/scripts/publish-cache-snapshot.sh")@' \
+  has_shared_publisher
+
+mutate "the credential-scan library stops being inlined" "$MAIN" \
+  's@^    file("\${path\.module}/\.\./\.\./scripts/ci/scan-cache-credentials\.sh"),$@@' \
+  has_shared_publisher
+
+mutate "the inline marker is dropped, so the library runs its usage check" "$MAIN" \
+  's@^    "SCAN_INLINE_LIBRARY=1",$@@' \
   has_shared_publisher
 
 mutate "install and upload in one phase" "$MAIN" \
@@ -389,12 +439,20 @@ mutate "the two installs made consistent, in the wrong direction" "$MAIN" \
   has_scriptfree_snapshot
 
 mutate "the publishing script pasted in unescaped" "$MAIN" \
-  's@publish_script = replace(file("\${path\.module}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh"), "\$", local\.escape_dollars)@publish_script = file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh")@' \
+  's@publish_script = replace(join(@publish_script = join(@; s@^  \]), "\$", local\.escape_dollars)$@  ])@' \
   has_dollars_escaped
 
 mutate "one step given the raw file() again" "$MAIN" \
-  's@args       = \["-c", local\.turbo_script\]@args       = ["-c", file("${path.module}/scripts/warm-turbo.sh")]@' \
+  's@script = local\.turbo_script@script = file("${path.module}/scripts/warm-turbo.sh")@' \
   has_dollars_escaped
+
+mutate "a script handed back to bash -c" "$MAIN" \
+  's@script = local\.publish_script@entrypoint = "bash"\n      args       = ["-c", local.publish_script]@' \
+  carries_scripts_in_script_field
+
+mutate "an entrypoint set beside a script" "$MAIN" \
+  's@script = local\.turbo_script@entrypoint = "bash"\n      script     = local.turbo_script@' \
+  carries_scripts_in_script_field
 
 mutate "the escape reduced to a single dollar" "$MAIN" \
   's@escape_dollars = "\$\$"@escape_dollars = "$"@' \
