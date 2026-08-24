@@ -713,6 +713,13 @@ jobs:
       - name: tf-apply-guard self-test
         run: bash scripts/ci/tf-apply-guard.selftest.sh
 
+      # A retry that never retries and a retry that never gives up both pass an
+      # exit-status check, so this drives a fake terraform and asserts the CALL
+      # COUNT as well: once when init is clean, three times for a reset, once
+      # for a version constraint no retry can satisfy.
+      - name: terraform init retry self-test
+        run: bash scripts/ci/terraform-init-retry.sh --selftest
+
   shell-runner-policy:
     name: Shell — runner policy
     runs-on: ubuntu-latest
@@ -1011,7 +1018,12 @@ jobs:
           set -euo pipefail
           for m in modules/*/; do
             echo "== $m"
-            terraform -chdir="$m" init -backend=false
+            # `init` talks to the registry once per module, so a transient reset
+            # anywhere in the loop fails a required check on a clean pull
+            # request. Retried, and only for failures a retry can fix (#271).
+            bash scripts/ci/terraform-init-retry.sh "$m"
+            # `validate` is offline. Its failures are always real, so it stays
+            # unwrapped — a retry here would only hide genuine breakage.
             terraform -chdir="$m" validate
           done
 
