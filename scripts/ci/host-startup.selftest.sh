@@ -1366,10 +1366,15 @@ slot_can_execute_behaves() { # <file>
   # `mktemp -d` that fails leaves `root` EMPTY, and every fixture below then
   # builds itself at an absolute path -- `/good/externals/...`, `/next/...` --
   # on the real filesystem, and `rm -rf "$root"` at the end is `rm -rf ""`.
-  root=$(mktemp -d) && [ -n "$root" ] && [ -d "$root" ] || {
+  # An `if`, not `A && B || C`: shellcheck SC2015 is right that the chain is not
+  # if-then-else, and here the distinction would matter — `[ -d "$root" ]` is the
+  # last condition, so a false one falls into the same branch as a failed mktemp
+  # by accident rather than by design.
+  root=$(mktemp -d)
+  if [ -z "$root" ] || [ ! -d "$root" ]; then
     echo "FAIL slot_can_execute behaviour: could not create a temporary directory for the fixtures" >&2
     return 1
-  }
+  fi
 
   # THE WHOLE RULE IS `-x`, SO A FILESYSTEM WITH NO EXECUTE BIT CANNOT TEST IT.
   # Every case below is built by `chmod +x` on a file, and on a Windows working
