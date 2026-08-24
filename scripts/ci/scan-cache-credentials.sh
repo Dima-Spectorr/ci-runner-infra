@@ -721,11 +721,12 @@ scan_credentials_or_die() { # <tree>
 # Run, not sourced: scan the tree named on the command line and say so. The
 # Windows build job's only entry point.
 #
-# $SCAN_INLINE_LIBRARY is the third way in. The cache-warmer cannot source a
-# file — it hands Cloud Build the publisher's TEXT with this file's text
-# prepended, so `return` at the top level fails and $SCAN_SOURCED says 0 even
-# though nothing is being run standalone. The marker is set by the line
-# terraform prepends, and it suppresses only this entry point: the functions
+# $SCAN_INLINE_LIBRARY is the third way in, for a caller that can only hand a
+# shell this file's TEXT: `return` at the top level fails there and $SCAN_SOURCED
+# says 0 even though nothing is being run standalone. The cache-warmer used to be
+# that caller and no longer is — its Cloud Build step stages this file next to
+# the publisher, which sources it — so nothing sets the marker today. It
+# suppresses only this entry point: the functions
 # above are defined either way, and the publisher refuses to continue if
 # `scan_credentials_or_die` is somehow not among them.
 if [ "$SCAN_SOURCED" = 0 ] && [ "${SCAN_INLINE_LIBRARY:-0}" = 0 ]; then

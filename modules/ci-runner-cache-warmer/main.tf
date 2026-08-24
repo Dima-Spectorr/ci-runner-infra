@@ -149,33 +149,102 @@ locals {
   #
   # The publishing script alone is an order of magnitude past that, so
   # `entrypoint = "bash"` + `args = ["-c", script]` cannot carry it and no amount
-  # of escaping changes that. `script` has no such cap (verified live: a 165 KB
-  # step was accepted), and it honours the file's own `#!/usr/bin/env bash`, so
-  # both scripts run under the interpreter they were written for. Setting
-  # `entrypoint` beside `script` is an error — that is why these steps have none.
+  # of escaping changes that. `script` has no such cap, and it honours the file's
+  # own `#!/usr/bin/env bash`, so both scripts run under the interpreter they were
+  # written for. Setting `entrypoint` beside `script` is an error — that is why
+  # these steps have none.
   escape_dollars = "$$"
 
-  # TWO files, concatenated, because the step runs `bash -c "<text>"` and there
-  # is no scripts/ci on that disk to source from. The publisher sources
-  # `scan-cache-credentials.sh` when it can find it and uses what is already
-  # defined when it cannot, so prepending the library's text is the same program
-  # by a different route — and the publisher refuses outright if the scan
-  # function is missing, which is what stops a broken concatenation from
-  # publishing an unscanned snapshot.
+  # AND THE WHOLE BUILD STAYS UNDER ~128 KiB, WHICH IS THE THIRD REFUSAL AND THE
+  # ONLY ONE THAT NEVER SAYS ANYTHING AT ALL.
   #
-  # SCAN_INLINE_LIBRARY suppresses the library's standalone entry point. Without
-  # it the library's own `usage:` check runs against the step's argv and kills
-  # the build before the publisher's first line.
+  # A build message past roughly 128 KiB is accepted by the API, given a build id,
+  # and then simply never scheduled. It fetches its source, finishes SETUPBUILD,
+  # and stops: no BUILD phase, every step `QUEUED`, no log line, no error, until
+  # the queue TTL expires an hour later. Measured live, by bisection, in one
+  # region of this fleet: a 125 KB config reached BUILD in two seconds, a 140 KB
+  # config never reached it at all, and neither the machine type, the custom
+  # service account, the step images nor regional capacity made any difference.
+  # The first version of this module inlined the 91 KB publishing script into TWO
+  # steps and shipped a 199 KB config, so every warm it fired sat in that hole.
   #
-  # Escaped as ONE string after the join, not file by file: the escape is a
-  # property of what Cloud Build receives, and escaping the parts separately is
-  # the same result by a route where a later part can be added unescaped.
-  publish_script = replace(join("\n", [
-    "SCAN_INLINE_LIBRARY=1",
-    file("${path.module}/../../scripts/ci/scan-cache-credentials.sh"),
-    file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh"),
-  ]), "$", local.escape_dollars)
-  turbo_script = replace(file("${path.module}/scripts/warm-turbo.sh"), "$", local.escape_dollars)
+  # So the scripts are handed over ONCE, gzipped, and unpacked into /workspace —
+  # the one directory Cloud Build carries between steps. That takes the config from
+  # 199 KB to about 55 KB and it removes the escaping problem above for the three
+  # scripts as a side effect: base64 has no `$` in its alphabet, so there is
+  # nothing left in them for Cloud Build to read as a substitution. The four steps
+  # that follow are three lines each.
+  #
+  # `length()` counts bytes, and the precondition on the trigger below fails the
+  # APPLY if the total ever climbs back toward the cliff. That is the point of it:
+  # this limit's natural failure mode is a nightly build nobody watches, and the
+  # publishing script grows.
+  staged_dir = "/workspace/.ci-warmer"
+
+  publish_gz = base64gzip(file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh"))
+  scan_gz    = base64gzip(file("${path.module}/../../scripts/ci/scan-cache-credentials.sh"))
+  turbo_gz   = base64gzip(file("${path.module}/scripts/warm-turbo.sh"))
+
+  # THE CREDENTIAL-SCAN LIBRARY IS STAGED AS A SIBLING, NOT CONCATENATED.
+  #
+  # `publish-cache-snapshot.sh` sources `$HERE/scan-cache-credentials.sh` unless
+  # `scan_credentials_or_die` is already defined, and refuses to publish at all if
+  # the function is missing by the time anything scans. When the publisher was
+  # pasted into a step as text there was no disk to source from and the library's
+  # text had to be prepended, with `SCAN_INLINE_LIBRARY=1` to suppress its
+  # standalone `usage:` check. Staged as a real file it needs neither: `$HERE`
+  # resolves to the directory below and the warm loads the library by exactly the
+  # route the workflow does, which is one fewer way for the two to diverge.
+  #
+  # Quoted heredoc delimiters, so the shell expands nothing in a blob it is only
+  # decoding, and `chmod +x` so each script is executed through its OWN shebang
+  # rather than whatever interpreter the step image happens to call it with.
+  stage_script_raw = <<-EOT
+    #!/bin/sh
+    set -eu
+    mkdir -p ${local.staged_dir}
+    base64 -d <<'PUBLISH_GZ_EOF' | gzip -d > ${local.staged_dir}/publish-cache-snapshot.sh
+    ${local.publish_gz}
+    PUBLISH_GZ_EOF
+    base64 -d <<'SCAN_GZ_EOF' | gzip -d > ${local.staged_dir}/scan-cache-credentials.sh
+    ${local.scan_gz}
+    SCAN_GZ_EOF
+    base64 -d <<'TURBO_GZ_EOF' | gzip -d > ${local.staged_dir}/warm-turbo.sh
+    ${local.turbo_gz}
+    TURBO_GZ_EOF
+    chmod +x ${local.staged_dir}/publish-cache-snapshot.sh ${local.staged_dir}/scan-cache-credentials.sh ${local.staged_dir}/warm-turbo.sh
+  EOT
+
+  # A no-op today — there is no `$` in base64 — and kept because the day someone
+  # adds a shell variable to the staging script is the day it would otherwise
+  # become a substitution key and take the warmer down at fire time.
+  stage_script = replace(local.stage_script_raw, "$", local.escape_dollars)
+
+  # AND EVERY STEP CHECKS THE DIGEST BEFORE IT RUNS WHAT IT FOUND THERE.
+  #
+  # /workspace is the only directory that survives between steps, and it is also
+  # the directory the repository's own install and build run in. Staging the
+  # scripts there and executing them by path would mean the publishing step runs
+  # a file the untrusted step in the middle was free to rewrite — which is
+  # precisely the ordering property the two-phase split above is for. It costs
+  # one line to keep: the digest comes from the module, out of the same `file()`
+  # read that produced the blob, so a tampered staged script fails the step
+  # loudly instead of being published from.
+  #
+  # This does not widen or narrow what a compromised dependency can ultimately
+  # do — it can mint this account's token from its own step either way, as the
+  # header says. It keeps the step boundary meaning what it says it means.
+  # The scan library is checked with the publisher and not on its own, because
+  # the publisher is the only thing that loads it: a step that verified it and
+  # then ran nothing would prove nothing, and one that ran the publisher without
+  # verifying it would publish a tree scanned by whatever the build step left in
+  # that file.
+  publish_sha = filesha256("${path.module}/../../scripts/ci/publish-cache-snapshot.sh")
+  scan_sha    = filesha256("${path.module}/../../scripts/ci/scan-cache-credentials.sh")
+  turbo_sha   = filesha256("${path.module}/scripts/warm-turbo.sh")
+
+  run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\nexec ${local.staged_dir}/publish-cache-snapshot.sh\n"
+  run_turbo   = "#!/bin/sh\nset -eu\necho '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\nexec ${local.staged_dir}/warm-turbo.sh\n"
 
   # HOW THE REPOSITORY IS INSTALLED AND BUILT — WORKED OUT AT WARM TIME, FROM THE
   # REPOSITORY, RATHER THAN STATED BY WHOEVER WIRES THE WARMER UP.
@@ -243,6 +312,19 @@ locals {
     "${local.install_full};",
     "npx --no-install turbo run build --cache-dir=\"$WARM_TURBO_DIR\"",
   ])), "$", local.escape_dollars)
+
+  build_step_script = "#!/usr/bin/env bash\n${local.build_command} || echo '[warm] build failed; publishing what it produced'\n"
+
+  # Every byte this module hands Cloud Build, which is what the cliff above is
+  # measured against. The env entries and the trigger's own fields add a little on
+  # top, hence a budget well under the observed 128 KiB rather than at it.
+  build_config_bytes = sum([
+    length(local.stage_script),
+    length(local.run_publish),
+    length(local.build_step_script),
+    length(local.run_turbo),
+    length(local.run_publish),
+  ])
 
   # WHO FIRES THE TRIGGER IS A DIFFERENT IDENTITY FROM WHO RUNS THE BUILD, and
   # this is not symmetry for its own sake. `cloudbuild.builds.create` — the
@@ -422,6 +504,22 @@ resource "google_cloudbuild_trigger" "warm" {
       machine_type = var.machine_type
     }
 
+    # 0. THE SCRIPTS, UNPACKED INTO /workspace.
+    #
+    #    Handed over once and gzipped rather than pasted into each step that runs
+    #    them: two inline copies of a 91 KB script is a 199 KB build message, and
+    #    a build message past ~128 KiB is accepted and then never scheduled, in
+    #    silence. See the note beside `staged_dir` for the measurement.
+    #
+    #    It runs in the gcloud image because that one is Debian and certainly has
+    #    `base64` and `gzip`; it carries no credential and touches nothing but
+    #    /workspace.
+    step {
+      id     = "stage-scripts"
+      name   = var.gcloud_image
+      script = local.stage_script
+    }
+
     # 1. DEPENDENCIES, AND THE SNAPSHOT PACKED BUT NOT PUBLISHED.
     #
     #    This is the publishing script's BUILD phase, and running it here rather
@@ -444,7 +542,7 @@ resource "google_cloudbuild_trigger" "warm" {
     step {
       id     = "dependencies"
       name   = var.build_image
-      script = local.publish_script
+      script = local.run_publish
       env = [
         "CACHE_PREPARE=${local.prepare_command}",
         "CACHE_ARCHIVE_OUT=/workspace/ci-cache-snapshot.tar.gz",
@@ -481,7 +579,7 @@ resource "google_cloudbuild_trigger" "warm" {
     step {
       id     = "publish-turbo"
       name   = var.gcloud_image
-      script = local.turbo_script
+      script = local.run_turbo
       env = [
         "WARM_BUCKET=${var.cache_bucket}",
         "WARM_TURBO_PREFIX=${local.turbo_prefix}",
@@ -497,7 +595,7 @@ resource "google_cloudbuild_trigger" "warm" {
     step {
       id     = "publish-snapshot"
       name   = var.gcloud_image
-      script = local.publish_script
+      script = local.run_publish
       env = [
         "CACHE_ARCHIVE_IN=/workspace/ci-cache-snapshot.tar.gz",
         "CACHE_POOL=${var.pool_name}",
@@ -508,6 +606,17 @@ resource "google_cloudbuild_trigger" "warm" {
   }
 
   lifecycle {
+    # THE CLIFF, TURNED INTO A PLAN FAILURE. Past roughly 128 KiB Cloud Build
+    # accepts the build, hands back an id, and never schedules it: no BUILD
+    # phase, no log, no error, for the whole queue TTL. Nothing downstream of an
+    # apply can notice that — a warmer in that state is indistinguishable from a
+    # cache that is merely cold, which is the exact failure this module exists to
+    # end. So it is caught here, where somebody is reading the output.
+    precondition {
+      condition     = local.build_config_bytes < 110000
+      error_message = "the warmer's build config is ${local.build_config_bytes} bytes of inline script, and Cloud Build silently never schedules a build past roughly 128 KiB — it fetches source, finishes SETUPBUILD, and sits with every step QUEUED until the queue TTL expires, with no error anywhere. Hand the new script over gzipped through the staging step instead of inlining it, the way publish-cache-snapshot.sh and warm-turbo.sh already are."
+    }
+
     precondition {
       # A gen2 project must resolve to a repository link, and an unresolved one
       # is an empty string rather than an error — which applies cleanly and

@@ -115,11 +115,11 @@ set -euo pipefail
 # This script's own directory, resolved before anything changes directory, and
 # used only to source the credential-scan library next to it.
 #
-# `:-$0` because the cache-warmer runs this script as `bash -c "<text>"`, where
-# there is no BASH_SOURCE at all and `set -u` would otherwise abort the build on
-# this line. That path does not use $HERE — it inlines the library ahead of this
-# text, and the guard below sees it already defined — but the variable is still
-# assigned, so it must be assignable there.
+# `:-$0` because a caller may hand this script's TEXT to a shell rather than run
+# the file, and there is no BASH_SOURCE on that path at all: `set -u` would abort
+# on this line before anything else. The cache-warmer no longer does that — it
+# stages this file and the library side by side and runs the file — but the
+# fallback stays, because the line must be assignable either way.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)" || exit 1
 
 # The tool directories a host will accept, by name. A host drops every top-level
@@ -195,11 +195,12 @@ esac
 # had a chance to rewrite, and the pass that catches an embedded credential
 # would be the pass the credential's own installer got to edit first.
 #
-# Guarded, because there are two ways this script is started and only one of them
-# has a filesystem to source from. The workflow runs it as a FILE next to the
-# library; the cache-warmer runs it as `bash -c "<text>"` in a Cloud Build step,
-# with the library's text prepended, and there is no `scripts/ci` on that disk at
-# all. The guard is `declare -F`, not a file test: what actually matters is that
+# Guarded, because the library can arrive two ways. Both callers today run this
+# as a FILE with the library beside it — the workflow out of `scripts/ci`, the
+# cache-warmer out of the directory its Cloud Build step stages both into — and a
+# caller that instead defines the function ahead of this text must not have it
+# re-sourced from a path that does not exist. The guard is `declare -F`, not a
+# file test: what actually matters is that
 # the function exists by the time anything scans, and a missing library must
 # still be a hard failure rather than a scan that quietly does not happen.
 if ! declare -F scan_credentials_or_die >/dev/null 2>&1; then
