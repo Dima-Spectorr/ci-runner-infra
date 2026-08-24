@@ -18,7 +18,7 @@ Next to the pool, once per repository:
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.43.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.44.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -191,7 +191,7 @@ down because each one, seen live, looks like a cold cache rather than a bug.
 |---|---|---|
 | `invalid value for 'build.substitutions': key in the template "…" is not a valid built-in substitution` | Cloud Build reads `$X` in any config string as a substitution, and the module pastes shell in whole. `$$` escapes it — **not** `substitution_option = "ALLOW_LOOSE"`, which resolves the unmatched keys to empty strings and runs the script with every variable erased. | v5.40.0 |
 | `invalid build: invalid .steps field: build step 0 arg 1 too long (max: 10000)` | A step *argument* caps at 10,000 characters. The `script` field has no such cap and honours the file's own shebang; `entrypoint` beside `script` is an error. | v5.41.0 |
-| **nothing at all** — a build id, `FETCHSOURCE` and `SETUPBUILD` done, every step `QUEUED`, no `BUILD` phase, no log, no error, until the queue TTL expires an hour later | A build message past roughly **128 KiB** is accepted and then never scheduled. Measured by bisection in one region of this fleet: 125 KB reached `BUILD` in two seconds, 140 KB never reached it; machine type, service account, step images and regional capacity make no difference. The module used to inline the 91 KB publishing script into two steps — a 199 KB config, so **no warm ever ran**. | v5.42.0 |
+| **nothing at all** — a build id, `FETCHSOURCE` and `SETUPBUILD` done, every step `QUEUED`, no `BUILD` phase, no log, no error, until the queue TTL expires an hour later | A build message past roughly **128 KiB** is accepted and then never scheduled. Measured by bisection in one region of this fleet: 125 KB reached `BUILD` in two seconds, 140 KB never reached it; machine type, service account, step images and regional capacity make no difference. The module used to inline the 91 KB publishing script into two steps — a 199 KB config, so **no warm ever ran**. | v5.44.0 |
 
 The last one is why the scripts are handed to the build **once**, gzipped, by a
 `stage-scripts` step that unpacks them into `/workspace` — about 55 KB instead of
