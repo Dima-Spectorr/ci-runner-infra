@@ -111,22 +111,65 @@ fi
 # `@v5.8.0` and the repo published v5.19.1, eleven minors later, with nothing
 # reporting it.
 #
-# Asserted against the MAJOR, not against VERSION. This repo publishes a
-# floating major tag that moves forward on every release, and that is what the
-# other guides already tell a consumer to use — an exact `@vX.Y.Z` in a document
-# is stale the next time anything ships, which is the drift rather than the fix.
+# A SHA PLUS A VERSION COMMENT — not the floating major this check used to
+# demand, and the reason is that the two halves of this repository's own advice
+# contradicted each other (#351).
+#
+# `check-action-pins.sh` is published BY THIS REPOSITORY and copied into every
+# consumer. Its PIN1 rejects `@v5` outright: a tag is a pointer its owner may
+# move, these workflows execute on hosts holding a GCP identity, and a moved tag
+# is arbitrary code on the pool with no pull request to review it. `@v5` is the
+# most movable pointer we publish — it moves on every release. So every
+# documented call here was a line that could not be pasted into any repository
+# that runs our own gate, which is all of them. Three adoptions hit it in a row
+# before anyone noticed the contradiction was ours.
+#
+# The staleness this check exists to catch is still caught, by the comment
+# rather than by the ref. PIN1 requires a version comment precisely so
+# Dependabot can rewrite the pin, so the comment is not decoration — it is the
+# machine-readable half — and it is asserted here three ways: it must name a
+# real tag, that tag must be the commit the SHA names, and its major must be the
+# major this repository publishes. A document may therefore lag a MINOR, which
+# is deliberate: within a major the anchor's host-side contracts (`ci-pin-hold`,
+# `CI_SHARED_INFRA_ADDR`, the port band) are unchanged, and it is exactly a
+# major that must never arrive silently.
 major=${want%%.*}
 uses_found=0
 for f in "${docs[@]}"; do
-  while IFS= read -r ref; do
+  where="${f#"$ROOT/"}"
+  # The whole LINE, not just the ref: the version comment lives beside it and
+  # is now half of what is being asserted.
+  while IFS= read -r line; do
     uses_found=$((uses_found + 1))
-    if [ "$ref" = "$major" ]; then
-      ok "${f#"$ROOT/"}: uses @$ref"
-    else
-      bad "${f#"$ROOT/"}: a workflow/action reference pins @$ref, but this repo publishes the floating major $major — an exact version here is stale on the next release"
+    ref=$(printf '%s\n' "$line" \
+            | grep -oE 'ci-runner-infra/\.github/(actions|workflows)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*@[^"[:space:])]+' \
+            | head -1 | sed 's/.*@//')
+    tag=$(printf '%s\n' "$line" | sed -n 's/.*#[[:space:]]*\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+
+    if ! printf '%s' "$ref" | grep -qE '^[0-9a-f]{40}$'; then
+      bad "$where: pins @$ref — a tag or branch, which PIN1 in check-action-pins.sh rejects. This is a copy-pasteable line, and every consumer runs that gate, so it must be a 40-character SHA."
+      continue
     fi
-  done < <(grep -oE 'ci-runner-infra/\.github/(actions|workflows)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*@[^"[:space:])]+' -- "$f" \
-             | sed 's/.*@//')
+    if [ -z "$tag" ]; then
+      bad "$where: SHA pin with no version comment. The comment is what Dependabot rewrites and what this check reads; without it the pin is frozen and nothing reports it."
+      continue
+    fi
+    if [ "${tag%%.*}" != "$major" ]; then
+      bad "$where: comment says $tag, but this repository publishes major $major. A documented call across a major boundary names a different host-side contract than the fleet is running."
+      continue
+    fi
+    # Fail closed on an unverifiable tag. A missing tag object in this clone is
+    # the shape a skip would take, and a skip is how the README drifted for
+    # three minor versions in the first place.
+    got=$(git -C "$ROOT" rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null)
+    if [ -z "$got" ]; then
+      bad "$where: names $tag, which is not a tag in this clone, so the SHA cannot be verified. Run 'git fetch --tags' and try again; if the tag genuinely does not exist, the document is pointing at a release nobody published."
+    elif [ "$got" != "$ref" ]; then
+      bad "$where: pins $ref but $tag is $got — the comment names a release this SHA is not, so Dependabot's next rewrite would move the pin somewhere unintended."
+    else
+      ok "$where: uses @${ref:0:12}… ($tag)"
+    fi
+  done < <(grep -E 'ci-runner-infra/\.github/(actions|workflows)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*@' -- "$f")
 done
 
 # Same rule as above: a scan that matches nothing is not a pass. If the shape of

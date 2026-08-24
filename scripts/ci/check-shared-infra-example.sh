@@ -146,24 +146,46 @@ mutate RUNNER11 "the Windows job dials localhost on the band port" \
 mutate RUNNER7 "the remote-reusable declaration beside the anchor call is dropped" \
   '/^# remote-reusable-allowed(/d'
 
-# --- 3. and the ref it teaches is the floating major --------------------------
+# --- 3. and the ref it teaches can be pasted into a repository that runs our
+#        own pin gate --------------------------------------------------------
 #
-# `@v5` is this repository's published convention for a workflow reference, and
-# `docs-pins.selftest.sh` enforces it across every tracked `*.md`. It cannot see
-# this file — its scope is `git ls-files -- '*.md'` — so the convention holds
-# here only because this check holds it.
+# This check used to demand `@v5`, and it was wrong (#351). `PIN1` in
+# `check-action-pins.sh` — published here, copied into every consumer — rejects
+# a tag outright, so the example was teaching a line that could not be green
+# anywhere it was meant to be pasted. Three adoptions hit it before the
+# contradiction was noticed, and it was ours, not theirs.
 #
-# The convention answers the aging problem directly: seven repositories copy
-# this file, and an exact tag written into it would be copied months later as
-# the pin for an anchor that has since moved against host-side contracts it
-# talks to — `ci-pin-hold`, `CI_SHARED_INFRA_ADDR`, the port band — which are
-# versioned with the pool image. A floating major moves WITH those releases; a
-# breaking change to the host-side contracts is a major bump, which is exactly
-# the change that should not arrive silently.
-if grep -q 'shared-infra-anchor\.yml@v5' "$EXAMPLE"; then
-  ok
+# `docs-pins.selftest.sh` now holds the same shape across every tracked `*.md`.
+# It cannot see this file — its scope is `git ls-files -- '*.md'` — so the
+# convention holds here only because this check holds it.
+#
+# The ageing objection the old text raised is answered by the comment rather
+# than by the ref. PIN1 requires a version comment precisely so Dependabot can
+# rewrite the pin: seven repositories copy this file, and in each of them a
+# superseded SHA arrives as a reviewable pull request instead of sitting
+# silently — which is more than a floating tag ever reported.
+# EVERY reference to this repository, not just the anchor's. The example also
+# teaches the `shared-infra-db` action, and a tag there fails PIN1 in exactly
+# the same way — one checked line beside one unchecked line is the shape that
+# lets the unchecked one rot.
+example_refs=0
+example_bad=0
+while IFS= read -r line; do
+  example_refs=$((example_refs + 1))
+  printf '%s\n' "$line" \
+    | grep -qE 'ci-runner-infra/\.github/(actions|workflows)/[A-Za-z0-9._/-]+@[0-9a-f]{40}([[:space:]]|$)' \
+    || { example_bad=$((example_bad + 1)); continue; }
+  printf '%s\n' "$line" \
+    | grep -qE '@[0-9a-f]{40}.*#[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+' \
+    || example_bad=$((example_bad + 1))
+done < <(grep -E 'ci-runner-infra/\.github/(actions|workflows)/[A-Za-z0-9._/-]+@' "$EXAMPLE" | grep -v '^[[:space:]]*#')
+
+if [ "$example_refs" -eq 0 ]; then
+  bad "the example references this repository nowhere — the anchor call is the point of the file, so this check just stopped asserting anything"
+elif [ "$example_bad" -ne 0 ]; then
+  bad "$example_bad of $example_refs reference(s) to this repository in the example are not a 40-character SHA with a version comment (PIN1 in check-action-pins.sh rejects a tag, and every consumer runs that gate, so the line as written cannot be pasted anywhere it is meant to go)"
 else
-  bad "the example's anchor ref is not the floating major this repository publishes (use '@v5'; an exact tag written here is stale on the next release, in seven repositories at once)"
+  ok
 fi
 
 # And the workflow it names has to exist here, under that exact path, or the

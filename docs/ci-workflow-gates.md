@@ -478,7 +478,7 @@ forbidden, so it is declarable, in a comment beside the call:
 jobs:
   apply:
     # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/apply-runner-pool.yml, #8160): the callee is reviewed in its own repository; it runs github-hosted with an explicit timeout
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/apply-runner-pool.yml@v5
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/apply-runner-pool.yml@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
 ```
 
 The marker **names its callee**, so pointing the `uses:` at a different workflow

@@ -1273,7 +1273,7 @@ concurrency:
 
 jobs:
   nudge:
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/mergify-nudge.yml@v5
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/mergify-nudge.yml@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
     # A repository that runs `check-runner-policy.sh` needs the RUNNER7
     # declaration too — see below.
     #
