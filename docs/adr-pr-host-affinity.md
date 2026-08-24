@@ -833,6 +833,25 @@ reason so the difference is legible.
 
 ## 5. Residual risk, honestly
 
+**Rule 3 is built and unexercised, and nothing in the fleet is currently able to
+exercise it.** Every piece of it has shipped — the band, the per-slot DNAT, the
+`shared_infra_id`-scoped tag pair, `CI_SHARED_INFRA_*`, and RUNNER11 to keep a
+Windows job from reading `localhost`. What has not happened is a Windows job
+opening a connection to a Linux host's stack, because **no such job exists**: no
+adopting repository has a Windows job that wants a database, which §"Why this is
+being written" gives as the reason none was ever written. RUNNER11 is therefore
+passing **vacuously** in every repository that has adopted, and a vacuous gate
+proves the absence of a subject, not the presence of a working path.
+
+Concretely, the first Windows job to try it is the integration test. Read the
+band arithmetic, the DNAT and the two firewall rules as a design that has been
+reviewed and not as one that has been observed — and expect the first adopter to
+find something, because that is what the first adopter of rules 1 and 2 did.
+
+This is recorded rather than resolved on purpose. Manufacturing a Windows job
+solely to prove the path would prove a fixture, and the fixture is the part
+least likely to resemble the real one.
+
 **Two workflows on one pull request get two hosts and two stacks.** Job outputs
 do not cross runs, so each workflow anchors independently. The mitigation is
 organisational, not technical — consolidate `pull_request` CI into one workflow,
@@ -926,8 +945,8 @@ phase 5 changes any consuming repository's behaviour.
 | 3 | Port band, per-slot DNAT, **the conntrack band allow paired with [#249](https://github.com/Dima-Spectorr/ci-runner-infra/issues/249) in one change**, `CI_SHARED_INFRA_*`, **the unprivileged `ci-pin-hold` helper, publishing the hold as a guest attribute, and its `--reserve-slot` record** (refusing a one-slot host), **`slot-reset.sh` sparing a held slot's containers and releasing a hold from a previous boot as orphaned** (root, max-TTL enforced, slot named by `SUDO_UID` and never by an argument), **the job-started hook that renews the hold (§4 of the contract) — the host renews, never the workflow, because a consumer inside a `container:` cannot reach the binary**, sweeper teardown + reset + **stopping a reserved slot's agent (§3.1)** + agent start with **fail-closed retire** when any of the three fails, TTL sweep | `host-startup.sh`, `job-hooks/`, self-tests | any firewall change; **`security-reviewer` on the reset change** | [#258](https://github.com/Dima-Spectorr/ci-runner-infra/pull/258) for the port band, DNAT and `CI_SHARED_INFRA_*`; [#264](https://github.com/Dima-Spectorr/ci-runner-infra/pull/264) for the pin hold, the reservation and the sweeper |
 | 4 | Ingress/egress band rules on the new `shared_infra_id`-scoped tag pair — `ci-shared-infra-src-<id>` **on both pools** as the source, `ci-shared-infra-stack-<id>` **on Linux only** as the ingress target (§3.3); pin-hold veto read from guest attributes, **monotonic in the controller's `$STATE_DIR`** so a co-tenant can only extend a hold (§2.4), applied to the `cordon:`/`retire:`/`drain:` verdicts of **both** `recycle_decision` and `drain_decision`, and the same cache read by the §2.6 detector so a Windows-only tail is still covered | `ci-runner-network`, `ci-runner-host-pool`, the Windows pool, `controller-startup.sh`, self-tests | any workflow using it | [#260](https://github.com/Dima-Spectorr/ci-runner-infra/pull/260) merged for the band rules; [#269](https://github.com/Dima-Spectorr/ci-runner-infra/pull/269) for the veto |
 | 5 | `RUNNER9`/`RUNNER10`/`RUNNER11` + fixtures | `check-runner-policy.sh`, `docs/ci-workflow-gates.md` | adoption (rules are opt-in by flag) | [#261](https://github.com/Dima-Spectorr/ci-runner-infra/pull/261) merged |
-| 6 | Reference anchor/owner job | `docs/ci-pr-shared-infra.md`, this repo's own workflows | — | not started |
-| 7 | Per-repository adoption, workflow consolidation first | consuming repositories, one pull request each | — | not started |
+| 6 | Reference anchor/owner job, published as `shared-infra-db` | `docs/ci-pr-shared-infra.md`, `.github/actions/shared-infra-db`, this repo's own workflows | — | [#322](https://github.com/Dima-Spectorr/ci-runner-infra/pull/322) merged; the fallback corrected in [#337](https://github.com/Dima-Spectorr/ci-runner-infra/pull/337) and [#367](https://github.com/Dima-Spectorr/ci-runner-infra/pull/367) |
+| 7 | Per-repository adoption, workflow consolidation first | consuming repositories, one pull request each | — | in flight, one pull request per repository; the ledger is [#248](https://github.com/Dima-Spectorr/ci-runner-infra/issues/248) |
 
 Phase 5 lands the rules behind a flag for the same reason `--forks` is a flag: a
 gate that fails every repository on the day it merges is a gate that gets
