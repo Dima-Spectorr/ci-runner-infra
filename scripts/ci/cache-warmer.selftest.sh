@@ -361,6 +361,29 @@ if has_config_under_the_cliff "$MAIN"; then ok; else
   bad "a script is inlined into the build config again, or the size guard is gone — past ~128 KiB Cloud Build never schedules the build at all, and says nothing about it anywhere"
 fi
 
+# 14. THE STEP THAT BUILDS THE SNAPSHOT HAS getcap. The publisher refuses to
+#     build a snapshot it cannot scan for file capabilities, and a host refuses
+#     to unpack one — on both sides a missing `getcap` is a refusal, not a skip.
+#     `node:22` is the default build image and ships without libcap2-bin, so the
+#     warm installed the entire dependency tree and then died on that check,
+#     every night. The workflow this module replaced installed the package in a
+#     `run:` line; the module has to carry that over itself, for both package
+#     managers, since the image is an input.
+ensures_getcap_before_publishing() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'command -v getcap' || return 1
+  matches "$code" 'libcap2-bin' || return 1
+  matches "$code" 'apk add --no-cache libcap' || return 1
+  # In the wrapper that runs the publisher, and therefore in BOTH steps that run
+  # it — not bolted onto one of them.
+  matches "$code" '\$\{local\.ensure_getcap\}exec \$\{local\.staged_dir\}/publish-cache-snapshot\.sh'
+}
+
+if ensures_getcap_before_publishing "$MAIN"; then ok; else
+  bad "the publishing wrapper no longer ensures getcap is installed — node:22 has no libcap2-bin, so the warm installs the whole dependency tree and then refuses to build the snapshot it was fired to build"
+fi
+
 # --- mutations -----------------------------------------------------------------
 
 mutate() { # <description> <file> <sed-program> <predicate>
@@ -382,6 +405,14 @@ mutate() { # <description> <file> <sed-program> <predicate>
   fi
   rm -f "$tmp"
 }
+
+mutate "the getcap install dropped from the publishing wrapper" "$MAIN" \
+  's@\${local\.ensure_getcap}exec@exec@' \
+  ensures_getcap_before_publishing
+
+mutate "only the Debian package manager handled" "$MAIN" \
+  's@apk add --no-cache libcap@true@' \
+  ensures_getcap_before_publishing
 
 mutate "the publisher copied into the module" "$MAIN" \
   's@file("\${path\.module}/\.\./\.\./scripts/ci/publish-cache-snapshot\.sh")@file("${path.module}/scripts/publish-cache-snapshot.sh")@' \
