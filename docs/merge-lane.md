@@ -171,6 +171,9 @@ permissions:
 
 jobs:
   lane:
+    # Off until an operator confirms the App secrets exist — a dry run still
+    # mints the token, so without this the job is red on every CI completion.
+    if: vars.MERGE_LANE_ENABLED == 'true'
     uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
     permissions:
       contents: read
@@ -231,13 +234,23 @@ GitHub dispatches it from the default branch only, so the first live execution
 is the first CI completion after it merges. That is a property of the trigger,
 not a gap in the testing, and it dictates the order.
 
-1. **Merge the lane in dry run, alongside Mergify.** `dry-run` defaults to on
-   and is armed by a repository *variable*, so no code change is needed to flip
-   it — and no pull request has to go through the very queue being replaced.
-   Every verdict is computed and logged; nothing is acted on.
-2. **Read real verdicts, then arm it.** Set `MERGE_LANE_ARMED=true`. Confirm a
-   real merge and a real `update:behind`.
-3. **Only then remove Mergify.** Not before: until the lane has merged
+There are **two** repository variables, and they are separate on purpose.
+`MERGE_LANE_ENABLED` says the App exists; `MERGE_LANE_ARMED` says it may act.
+A dry run still mints the App token and reads the API, so a caller left on
+before the secrets are in place fails on every CI completion — a red that means
+"setup unfinished" and is indistinguishable from a red that means "the lane is
+broken". Conflating the two into one switch would mean the only way to see a
+verdict is to grant merge authority first.
+
+1. **Merge the lane, switched off, alongside Mergify.** The caller is gated on
+   `MERGE_LANE_ENABLED`, so nothing runs and nothing goes red.
+2. **Provision the App and its secrets**, then set `MERGE_LANE_ENABLED=true`.
+   `dry-run` is still on: every verdict is computed and logged, nothing is
+   acted on.
+3. **Read real verdicts, then arm it.** Set `MERGE_LANE_ARMED=true`. Confirm a
+   real merge and a real `update:behind`. Neither step needs a code change, so
+   no pull request has to go through the very queue being replaced.
+4. **Only then remove Mergify.** Not before: until the lane has merged
    something, removing Mergify leaves the repository with no automation at all.
 
 ### Removing Mergify from a repository
