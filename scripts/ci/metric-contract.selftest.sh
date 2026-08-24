@@ -158,14 +158,23 @@ batching_holds() {
 
   (
     set -uo pipefail
+    # Read by telemetry.sh, which arrives through the `.` below — no static
+    # reader can see that, so all five look dead here and none of them is.
+    # shellcheck disable=SC2034
     PROJECT=test-project REGION=test-region
+    # shellcheck disable=SC2034
     REPO_FULL=test-owner/test-repo POOL=test-pool
+    # shellcheck disable=SC2034
     METRIC_PREFIX=custom.googleapis.com/ci
     log() { :; }
 
     # Shadows the binary for the whole subshell. The token call and the POST are
     # told apart by their URL, and the POST records how many series it was handed
     # rather than sending them anywhere.
+    #
+    # SC2317 for the same reason as the SC2034s above: the only caller is inside
+    # the sourced file, so every line of this body reads as unreachable.
+    # shellcheck disable=SC2317
     curl() {
       local a prev="" body=""
       case "$*" in
