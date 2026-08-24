@@ -849,6 +849,14 @@ Phase 5 lands the rules behind a flag for the same reason `--forks` is a flag: a
 gate that fails every repository on the day it merges is a gate that gets
 disabled in every repository on the day after.
 
+That is true of `--shared-infra`, which turns `RUNNER9`/`RUNNER10`/`RUNNER11`
+**on**, and it is not true of `--allow-dynamic-runner`, which turns `RUNNER5`
+**off**. `RUNNER5` is on by default and fires on any expression in `runs-on`, so
+an adopting repository must pass the flag in the same pull request that first
+resolves `runs-on` from the anchor — step 4 of the contract's adoption order,
+not the last step. Deferring it produces the very red gate the deferral is here
+to avoid.
+
 ---
 
 ## 7. Decided
@@ -906,4 +914,6 @@ disabled in every repository on the day after.
   egress cannot scope by tag, and `database_egress_ports` is not widened.
   Windows gains no inbound path: the only tag it carries is an ingress source
   and an egress target, and an egress target selects the sending VM.
-- The gate rules are opt-in by flag until phase 7 completes.
+- The **new** gate rules are opt-in by flag until phase 7 completes. The
+  pre-existing `RUNNER5` is not: adoption trips it, and `--allow-dynamic-runner`
+  goes in with the first dynamic `runs-on`.
