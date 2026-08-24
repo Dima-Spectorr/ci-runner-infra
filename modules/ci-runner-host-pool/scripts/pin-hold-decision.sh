@@ -46,8 +46,37 @@
 #
 # Tenancy-agnostic — no customer literals, no project/repo knowledge.
 
+# WHEN THE MECHANISM DOES NOT EXIST AT ALL, THE VETO PROTECTS NOTHING
+#
+# Rule 1 below reads a failed read as "we did not get an answer" and keeps the
+# host. That is right for the failures it was written for — a timeout, a quota,
+# the per-instance rate limit — because a hold may well be sitting there behind
+# the failure. It is wrong for one failure, and that one failure is total:
+#
+#   ERROR: HTTPError 412: Constraint
+#   constraints/compute.disableGuestAttributesAccess violated for project N.
+#
+# An org policy that disables guest-attribute ACCESS disables the WRITE as well
+# as the read, so `ci-pin-hold` on a host cannot publish a hold, no hold can
+# exist, and there is nothing behind the failure to protect. Left as a keep it
+# is not a conservative default — it is a permanent, silent veto on every
+# removal the controller will ever decide, for every host, on every tick.
+#
+# Measured on 2026-08-24 in a live fleet: the constraint is enforced org-wide,
+# so both IntegrateIT pools reported `ci_pin_holds_honoured` equal to their own
+# host count on all 91 points of a six-hour window, `ci_drain_verdicts` and
+# `ci_recycle_verdicts` zero on every one of them, and nine hosts sat on a stale
+# instance template for a day with `min_hosts` set to zero. Every series read
+# healthy. The pool simply never shrank and never upgraded again.
+#
+# So the caller classifies its own error and says so, and this rule answers the
+# only honest answer available: free. It is a NARROW gate on purpose — the
+# caller must have matched the constraint by name. A bare 403 is NOT this case:
+# that is the controller's own IAM, a hold can still have been written by job
+# code, and the keep is correct there.
+
 # pin_hold_decision <read_status> <key_present> <raw> <cached_run> \
-#                   <cached_expiry> <now_epoch> <max_hold>
+#                   <cached_expiry> <now_epoch> <max_hold> [<reads_disabled>]
 #
 #   read_status  : exit status of the get-guest-attributes call. NON-ZERO IS NOT
 #                  "no hold" — it is "we did not get an answer".
@@ -61,6 +90,11 @@
 #                  been seen for this host.
 #   now_epoch    : the controller's clock.
 #   max_hold     : the ceiling any single hold may reach from now, in seconds.
+#   reads_disabled : 1 only when the caller matched
+#                  `constraints/compute.disableGuestAttributesAccess` in the
+#                  error it got back — i.e. guest attributes are administratively
+#                  off for this project, so no hold can have been published.
+#                  Defaults to 0, which preserves every existing caller.
 #
 # Echoes "hold:run=<id> expiry=<epoch> <reason>" or "free:<reason>", and always
 # exits 0 — the verdict is the output, not the status, like the other rules.
@@ -77,6 +111,7 @@ pin_hold_decision() {
   local c_exp="${5:-0}"
   local now="${6:-0}"
   local max_hold="${7:-7200}"
+  local reads_disabled="${8:-0}"
 
   # A cache this process wrote can still be garbage: truncated by a reboot
   # mid-write, or left over from an older format. Sanitised here rather than at
@@ -90,6 +125,19 @@ pin_hold_decision() {
   fi
   case "$max_hold" in '' | *[!0-9]*) max_hold=7200 ;; esac
   case "$now" in '' | *[!0-9]*) now=0 ;; esac
+
+  # 0. The mechanism does not exist here. Checked BEFORE rule 1 because it is a
+  #    strictly more specific reading of the same failed read, and checked
+  #    against the CALLER'S classification rather than a status code, because
+  #    412 on its own is not the fact — the constraint name is. See the header
+  #    for why this is the one failure that does not mean "we did not get an
+  #    answer": the write is disabled by the same policy as the read, so there
+  #    is no hold to be wrong about. Nothing is cached and nothing is consulted;
+  #    a stale cache entry from before the policy landed must not outlive it.
+  if [ "$reads_disabled" = "1" ]; then
+    echo "free:guest-attributes-unavailable"
+    return 0
+  fi
 
   # 1. The mechanism failed: API error, timeout, permission, quota. Guest
   #    attributes are rate limited per instance, so a busy fleet is exactly when

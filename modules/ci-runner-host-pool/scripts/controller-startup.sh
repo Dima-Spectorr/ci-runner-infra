@@ -2636,6 +2636,55 @@ instance_host_os() {
   return 0
 }
 
+# guest_attributes_denied <stderr-text> -> 0 if the read was refused by the org
+# policy that turns guest attributes off, 1 otherwise.
+#
+# Both gates below read a host's guest attributes, and until now both threw the
+# error away (`2>/dev/null`) and judged on the exit status alone. One status
+# covers a timeout, a quota, a missing IAM grant and this:
+#
+#   HTTPError 412: Constraint constraints/compute.disableGuestAttributesAccess
+#   violated for project <n>.
+#
+# which is not a failure at all but a standing fact about the project: guest
+# attributes are off, in BOTH directions, so no host can publish a beacon and no
+# job can publish a pin hold. Read as an ordinary failure it made every pin hold
+# read as live and vetoed every drain and every recycle in the fleet, silently
+# and permanently (2026-08-24 — see pin-hold-decision.sh).
+#
+# GREPPED FROM THE ERROR, AND NARROWLY. The constraint NAME is the fact; 412 on
+# its own is not, and a bare 403 is the controller's own IAM, where a hold can
+# still exist and keeping the host is right. `LC_ALL=C` because gcloud localises
+# its message envelope but not the constraint id, and a locale-sensitive match
+# is one that stops matching on somebody else's machine.
+#
+# The text can only ever come from gcloud on the controller. Nothing a job can
+# write reaches it, which is what keeps this from being a way to talk the
+# controller out of a veto.
+guest_attributes_denied() {
+  case "$(printf '%s' "${1:-}" | LC_ALL=C tr -d '\r')" in
+    *constraints/compute.disableGuestAttributesAccess*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# note_guest_attributes_denied — record one refusal for this tick.
+#
+# A FILE, AND NOT A VARIABLE, AND THAT IS THE WHOLE POINT. Both gates are called
+# as `x=$(beacon_gate ...)` / `x=$(pin_hold_gate ...)`, which is a SUBSHELL: a
+# an ordinary shell increment inside either of them touches a copy that is
+# discarded the moment the substitution closes, and the series would publish a
+# confident zero on exactly the fleet it exists to report. The counter has to
+# outlive the subshell, so it is a file the parent counts.
+#
+# Appended to rather than incremented, so two gates racing cannot lose a count
+# to a read-modify-write, and truncated by tick_pool at the start of every tick.
+GA_DENIED_FILE=""
+note_guest_attributes_denied() {
+  [ -n "$GA_DENIED_FILE" ] || return 0
+  printf 'x\n' >>"$GA_DENIED_FILE" 2>/dev/null || true
+}
+
 # beacon_gate <host> <zone> <registrations> -> the beacon_decision() verdict
 #
 # The Windows half of the second gate: all of the I/O, none of the rule. The
@@ -2656,11 +2705,24 @@ beacon_gate() {
   local host="$1" zone="$2" regs="$3"
   local raw rc line key val present=0 workers="" ts_raw="" ts=0 now age misses
   local mf="$STATE_DIR/beaconmiss-$host"
+  local errf
 
+  # The error text is kept now, not discarded. The BEHAVIOUR here is unchanged
+  # on purpose — unlike a pin hold, a beacon that cannot be read is the loss of
+  # the only evidence this host is idle, so `keep` is still the right answer
+  # whatever the reason. What was missing was any way to tell a fleet that will
+  # never delete another Windows host from one that simply has nothing to
+  # delete, and that is what the counter below buys.
+  errf=$(mktemp 2>/dev/null) || errf=""
   raw=$(timeout 60 gcloud compute instances get-guest-attributes "$host" \
     --project="$PROJECT" --zone="$zone" --query-path="$BEACON_NS/" \
-    --format="csv[no-heading](key,value)" 2>/dev/null)
+    --format="csv[no-heading](key,value)" 2>"${errf:-/dev/null}")
   rc=$?
+  if [ "$rc" != "0" ] && [ -n "$errf" ] && guest_attributes_denied "$(cat "$errf")"; then
+    note_guest_attributes_denied
+    log "beacon: guest attributes are disabled by org policy -- $host cannot publish one, so it can never be drained on idleness"
+  fi
+  [ -z "$errf" ] || rm -f "$errf"
 
   # FIRST occurrence of each key wins. Guest attributes are writable by any
   # process on the VM, job code included — Google documents this plainly — so
@@ -2733,7 +2795,7 @@ pin_hold_gate() {
   local host="$1" uri="$2"
   local zone raw rc line key val present=0 hold_raw=""
   local cf="$STATE_DIR/pinhold-$host"
-  local cached c_run="" c_exp=0 now verdict m_run m_exp
+  local cached c_run="" c_exp=0 now verdict m_run m_exp errf disabled=0
 
   # No self-link, no zone, and a guessed zone addresses some other machine. The
   # read cannot happen, so this reads exactly as the read failing: keep.
@@ -2750,10 +2812,20 @@ pin_hold_gate() {
   # answers by keeping the host. Every unheld host in the fleet would then be
   # undeletable. Asked for the namespace, an absent key is a successful read
   # that returns no row -- a fact, and the fact the free path needs.
+  errf=$(mktemp 2>/dev/null) || errf=""
   raw=$(timeout 60 gcloud compute instances get-guest-attributes "$host" \
     --project="$PROJECT" --zone="$zone" --query-path="$BEACON_NS/" \
-    --format="csv[no-heading](key,value)" 2>/dev/null)
+    --format="csv[no-heading](key,value)" 2>"${errf:-/dev/null}")
   rc=$?
+  # The one failure that is not a failure. Classified here, in the I/O half,
+  # because the rule stays pure and because the CALLER is the only thing that
+  # ever sees gcloud's error text.
+  if [ "$rc" != "0" ] && [ -n "$errf" ] && guest_attributes_denied "$(cat "$errf")"; then
+    disabled=1
+    note_guest_attributes_denied
+    log "pin-hold: guest attributes are disabled by org policy -- no hold can be published, so the veto on $host is not honoured"
+  fi
+  [ -z "$errf" ] || rm -f "$errf"
 
   # FIRST occurrence wins, for the same reason beacon_gate does it: guest
   # attributes are writable by any process on the VM, job code included, and a
@@ -2774,12 +2846,16 @@ PIN_ATTR_EOF
 
   now=$(date -u +%s)
   verdict=$(pin_hold_decision "$rc" "$present" "$hold_raw" "$c_run" "$c_exp" \
-    "$now" "$PIN_HOLD_MAX")
+    "$now" "$PIN_HOLD_MAX" "$disabled")
 
   # The cache is written only from a read that SUCCEEDED. A failed read is not
   # evidence about a hold in either direction, and letting it rewrite the file
   # would let one API blip either forget a live hold or freeze a dead one.
-  if [ "$rc" = "0" ]; then
+  # `disabled` joins rc=0 as a state we are willing to write from, and it only
+  # ever takes the drop arm: the policy is off, no hold can exist, and an entry
+  # cached from before it landed would otherwise sit there vetoing this host
+  # until it lapsed on its own.
+  if [ "$rc" = "0" ] || [ "$disabled" = "1" ]; then
     case "$verdict" in
       hold:*)
         m_run=${verdict#*run=}
@@ -3120,6 +3196,22 @@ tick_pool() {
   WORKER_GATE_UNDETERMINED=0
   WORKER_GATE_OS_FALLBACK=0
   PIN_HELD=0
+  # Reads refused by constraints/compute.disableGuestAttributesAccess this tick,
+  # across BOTH gates. Zero on a healthy pool and equal to the number of hosts
+  # the controller tried to remove on a pool where the mechanism is off, so the
+  # series answers "is my scale-in wired to a switch somebody threw at the org?"
+  # — the question nobody could ask for the day this went unnoticed.
+  #
+  # The path is per POOL, not per controller: one controller serves up to four,
+  # and a shared file would report the Linux pool's refusals under the Windows
+  # pool's label as well. Truncated here, counted at publish.
+  GA_DENIED_FILE="$STATE_DIR/ga-denied-$POOL"
+  : >"$GA_DENIED_FILE" 2>/dev/null || GA_DENIED_FILE=""
+  # Re-declared, not merely cleared: `declare -A` on an existing name keeps its
+  # entries, so a plain assignment here would carry one pool's skips into the
+  # next pool's tick on a controller that serves four of them.
+  unset RECYCLE_SKIPS
+  declare -gA RECYCLE_SKIPS=()
 
   collect_hosts
   # AFTER collect_hosts, and that ordering is the whole reason this is not part
@@ -3138,6 +3230,7 @@ tick_pool() {
   # tick and a fleet-wide outage produce the same pair of numbers.
   local slots_registered=0 slots_known=0
   local host status host_tpl host_uri busy idle age verdict hold tpl cordoned recycling
+  local skip_reason
 
   # Hosts already mid-recycle, counted BEFORE any decision this tick, so every
   # host is judged against the same budget rather than against however many
@@ -3308,6 +3401,31 @@ tick_pool() {
           rm -f "$STATE_DIR/cordon-$host"
         fi
         continue
+        ;;
+      skip:*)
+        # WHY A SKIP IS COUNTED AT ALL. Until now only `cordoned` and `retired`
+        # were published, so a recycle mechanism that skipped every host on
+        # every tick produced exactly the same telemetry as one with nothing to
+        # do — which is how a pool sat on a stale template for a day underneath
+        # a `ci_hosts_stale_template` of 9 that was already screaming.
+        #
+        # ONLY WHILE THE TEMPLATE IS NOT CURRENT. `skip:template=current` is the
+        # answer for every healthy host on every tick; counting it would publish
+        # the pool size under a label that means nothing and bury the six that
+        # do. A skip is interesting exactly when the mechanism HAD something to
+        # do and did not do it.
+        if [ "$tpl" != "current" ]; then
+          skip_reason=${verdict#skip:}
+          skip_reason=${skip_reason%% *}
+          skip_reason=${skip_reason%%=*}
+          case "$skip_reason" in
+            # Closed set, so the label can never be widened by a verdict string
+            # somebody edits later without also editing the publisher.
+            disabled | not-running | template | registration-unknown | booting | at-capacity) ;;
+            *) skip_reason=other ;;
+          esac
+          RECYCLE_SKIPS["$skip_reason"]=$((${RECYCLE_SKIPS["$skip_reason"]:-0} + 1))
+        fi
         ;;
       *) : ;;
     esac
@@ -3498,6 +3616,20 @@ tick_pool() {
   # non-zero with no pinned demand is a hold that is not lapsing -- the shape a
   # forged or abandoned hold would have, bounded by PIN_HOLD_MAX either way.
   queue_series "ci_pin_holds_honoured" "${PIN_HELD:-0}"
+  # The series that would have named the cause in one glance. Non-zero means
+  # guest attributes are administratively off for this project: pin holds cannot
+  # be published at all, and a Windows pool cannot report idleness, so it cannot
+  # drain. Alert on ANY non-zero -- unlike a hold, this never resolves on its own
+  # and no amount of waiting makes it lapse.
+  # `wc -l`, not `grep -c .`: grep exits 1 on an empty file and would need an
+  # `|| echo 0` that appends a SECOND line to a count that is already 0. wc
+  # counts without an opinion — the same reasoning as POOL_TABLE_REJECTED.
+  local ga_denied=0
+  if [ -n "$GA_DENIED_FILE" ] && [ -f "$GA_DENIED_FILE" ]; then
+    ga_denied=$(wc -l <"$GA_DENIED_FILE" 2>/dev/null | tr -d ' ')
+    case "${ga_denied:-}" in '' | *[!0-9]*) ga_denied=0 ;; esac
+  fi
+  queue_series "ci_guest_attributes_denied" "$ga_denied"
   # Not a fourth `outcome`: a fallback host goes on to reach `clear` or `held`
   # like any other, so folding it into that label set would double-count. It is
   # the countdown on a transitional arm — see drain_host(). Zero across every
@@ -3517,6 +3649,16 @@ tick_pool() {
   # hosts are not leaving.
   queue_series "ci_recycle_verdicts" "$CORDONED" '"outcome":"cordoned"'
   queue_series "ci_recycle_verdicts" "$RETIRED" '"outcome":"retired"'
+  # And the refusals, on the SAME series, so one chart reads as an accounting:
+  # every stale host this tick either moved or is named here with the reason it
+  # did not. Published as a fixed set including the zeroes -- a reason that
+  # appears only when it fires is a reason nobody can build an alert on, because
+  # the absence of the series and the absence of the problem look identical.
+  local reason
+  for reason in disabled not-running template registration-unknown booting at-capacity other; do
+    queue_series "ci_recycle_verdicts" "${RECYCLE_SKIPS["$reason"]:-0}" \
+      "\"outcome\":\"skip-$reason\""
+  done
   # A pool at steady state reaps ~0. A series that keeps climbing means hosts
   # are disappearing without going through drain_host() — worth an alert, not
   # just a log line.

@@ -228,7 +228,7 @@ permissions:
 
 jobs:
   apply:
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/apply-runner-pool.yml@v5
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/apply-runner-pool.yml@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
     with:
       terraform_root: customer/<customer>/terraform/ci-runner-hosts
       region: <region>

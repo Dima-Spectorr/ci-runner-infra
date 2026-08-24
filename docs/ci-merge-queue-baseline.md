@@ -1251,9 +1251,9 @@ name: Mergify nudge
 
 on:
   workflow_run:
-    # The `name:` key of the workflow that runs your required checks. By NAME:
-    # `workflow_run` offers no path handle, so renaming that workflow detaches
-    # this one silently.
+    # The `name:` key of EVERY workflow that produces a required check — not
+    # just the big one. By NAME: `workflow_run` offers no path handle, so
+    # renaming one of them detaches this workflow silently.
     workflows: [CI]
     types: [completed]
 
@@ -1261,12 +1261,22 @@ permissions:
   contents: read
 
 concurrency:
-  group: mergify-nudge-${{ github.event.workflow_run.head_branch || github.run_id }}
+  # Keyed by PULL REQUEST, not by branch name. `head_branch` is the SOURCE
+  # branch's name, and two pull requests — from two forks, or a fork and this
+  # repository — may share one; grouped by that name they cancel each other,
+  # and a nudge cancelled right after the OTHER pull request's last required
+  # check leaves precisely the stall this exists to clear. `pull_requests` is
+  # empty on a fork run and on a run this does not act on, so `run_id` is then
+  # a group of one, which cancels nothing.
+  group: mergify-nudge-${{ github.event.workflow_run.pull_requests[0].number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   nudge:
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/mergify-nudge.yml@v5
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/mergify-nudge.yml@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
+    # A repository that runs `check-runner-policy.sh` needs the RUNNER7
+    # declaration too — see below.
+    #
     # All three, and they must match the callee's job block exactly: a called
     # workflow cannot exceed what its caller grants, so what the callee declares
     # for itself is a ceiling, not a request.
@@ -1287,6 +1297,34 @@ jobs:
 A repository whose required checks come from **more than one workflow** lists
 them all under `workflows:`; the nudge is idempotent and self-suppressing, so the
 extra dispatches cost API calls and post nothing.
+
+**Resolve that list from `.mergify.yml`, not from memory.** Take every
+`check-success=` context the queue requires and find the workflow whose `name:`
+key produces it. The one that gets missed is never the long build — it is a fast
+hosted gate like `CI module drift` or `generic-binary-check`, precisely because
+it is not the workflow anyone thinks of as "CI". Miss it and the nudge is a
+coin-flip: when that gate happens to finish last, every nudge already fired
+before the queue conditions were satisfiable and did nothing, and if Mergify
+then misses *its* completion webhook, no further nudge is ever dispatched and
+the green pull request stalls exactly as before. Found on the fleet rollout in
+`Apigee-Portal`, where `CI module drift` produces the required
+`No vendored CI runner module`.
+
+**A repository that runs `check-runner-policy.sh` needs one more line.** RUNNER7
+refuses a `uses:` pointing at another repository, because the callee's `runs-on`
+and `timeout-minutes` are not in this tree and the gate cannot decide what it
+cannot read. The escape hatch is a declaration beside the call, naming the callee
+and an issue that records the reading:
+
+```yaml
+    # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/mergify-nudge.yml, #123): callee read at v5 and accepted — ubuntu-latest, timeout-minutes: 10, posts one `@mergifyio refresh` comment and nothing else
+```
+
+The marker names the callee by path and not by ref, so a pin bump keeps it and
+repointing `uses:` at anything else re-arms the gate. What it asserts is narrow:
+a human read the callee and accepted its runner scope and timeouts. The issue is
+where that reading lives so the acceptance has an owner and a place to be
+revisited.
 
 **This is the same file in every repository in the fleet, whether its checks run
 on GitHub-hosted minutes or on the self-hosted pools.** The stall being fixed is

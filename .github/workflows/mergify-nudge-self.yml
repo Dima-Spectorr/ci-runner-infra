@@ -39,15 +39,22 @@ permissions:
   contents: read
 
 concurrency:
-  # Keyed on the branch, so a newer CI completion cancels a nudge that is still
-  # sitting in its grace period for an older run of the same branch. The older
-  # nudge would be asking about a superseded commit, and the newer run's own
-  # nudge is the one that carries current information.
+  # Keyed on the PULL REQUEST, so a newer CI completion cancels a nudge that is
+  # still sitting in its grace period for an older run of the same pull request.
+  # The older nudge would be asking about a superseded commit, and the newer
+  # run's own nudge is the one that carries current information.
   #
-  # `head_branch` can be empty on a run this workflow does not act on anyway, so
-  # `run_id` keeps the group distinct rather than collapsing every such run into
-  # one that cancels itself.
-  group: mergify-nudge-${{ github.event.workflow_run.head_branch || github.run_id }}
+  # NOT `head_branch`: that is the SOURCE branch's name, and two pull requests —
+  # from two forks, or a fork and this repository — may share one. Grouped by
+  # that name they cancel each other, and a nudge cancelled right after the
+  # OTHER pull request's last required check leaves precisely the stall this
+  # workflow exists to clear.
+  #
+  # `pull_requests` is empty on a run from a fork, and on a run this workflow
+  # does not act on at all; `run_id` is then a group of one, which cancels
+  # nothing. Losing cancellation costs a redundant nudge. Losing the nudge costs
+  # the stall.
+  group: mergify-nudge-${{ github.event.workflow_run.pull_requests[0].number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
