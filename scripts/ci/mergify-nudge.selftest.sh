@@ -84,6 +84,16 @@ can_comment() {
   matches "$code" '^      pull-requests: write$' || return 1
 }
 
+# The scope that governs `/commits/{sha}/check-runs`. Declaring a `permissions:`
+# block sets everything unlisted to `none`, so omitting this does not fall back
+# to a default read — the probe 403s, `mergify_seen_it` fails closed, and every
+# run nudges. Asserted on BOTH files because a callee cannot exceed its caller:
+# either half missing produces the same 403.
+can_read_check_runs() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^      checks: read$' || return 1
+}
+
 # A red CI run is a queue event too. Dropping `failure` leaves a dead entry
 # holding the front of a serial queue until `checks_timeout`.
 acts_on_failure_too() {
@@ -221,6 +231,7 @@ check() { # <predicate> <file> <description>
 echo "mergify-nudge self-test:"
 check is_reusable_only                  "$CALLEE" "the callee has a trigger other than workflow_call, so it can run with no workflow_run context"
 check can_comment                       "$CALLEE" "the job cannot post a comment, so every nudge is a silent no-op"
+check can_read_check_runs               "$CALLEE" "the job cannot read check-runs, so the probe 403s and every run nudges"
 check acts_on_failure_too               "$CALLEE" "a failed CI run is not nudged, so a dead queue entry waits out checks_timeout"
 check ignores_a_non_verdict             "$CALLEE" "a cancelled or skipped run is nudged, so every force-push posts a comment"
 check waits_out_the_healthy_case        "$CALLEE" "the grace period is gone, so the healthy majority of runs post a comment"
@@ -236,6 +247,7 @@ check is_bounded                        "$CALLEE" "the job that sleeps by design
 check triggers_on_ci_completion         "$CALLER" "the caller does not fire on a completed CI run"
 check supersedes_an_older_nudge         "$CALLER" "a superseded nudge is not cancelled and will ask about an old sha"
 check grants_the_write_at_the_call      "$CALLER" "the caller does not pass the write the callee needs"
+check can_read_check_runs               "$CALLER" "the caller does not pass checks: read, so the callee's own declaration buys nothing"
 
 # The trigger names the CI workflow by its `name:` key, which is the only handle
 # `workflow_run` offers. Renaming `ci.yml`'s name detaches the nudge with
@@ -276,6 +288,8 @@ mutate "the callee grows a pull_request trigger" "$CALLEE" \
   's|^  workflow_call:|  pull_request:\n  workflow_call:|'            is_reusable_only
 mutate "the comment permission is downgraded to read" "$CALLEE" \
   's|^      pull-requests: write$|      pull-requests: read|'         can_comment
+mutate "the callee stops granting itself checks: read" "$CALLEE" \
+  's|^      checks: read$|      contents: read|'                      can_read_check_runs
 mutate "failure is dropped from the verdicts" "$CALLEE" \
   's|success\|failure\|timed_out)|success)|'                          acts_on_failure_too
 mutate "the catch-all arm is removed, so every conclusion nudges" "$CALLEE" \
@@ -317,6 +331,8 @@ mutate "a superseded nudge is left running" "$CALLER" \
   's|^  cancel-in-progress: true$|  cancel-in-progress: false|'       supersedes_an_older_nudge
 mutate "the caller stops passing the write" "$CALLER" \
   's|^      pull-requests: write$|      pull-requests: read|'         grants_the_write_at_the_call
+mutate "the caller stops passing checks: read" "$CALLER" \
+  's|^      checks: read$|      contents: read|'                      can_read_check_runs
 mutate "the caller points at a different callee" "$CALLER" \
   's|uses: \./\.github/workflows/mergify-nudge\.yml|uses: ./.github/workflows/ci.yml|' grants_the_write_at_the_call
 

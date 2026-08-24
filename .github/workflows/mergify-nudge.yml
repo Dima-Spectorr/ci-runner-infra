@@ -150,8 +150,24 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      # `GET /repos/{o}/{r}/commits/{sha}/check-runs` is governed by the Checks
+      # permission, not by Contents — and declaring a `permissions:` block at
+      # all sets every scope not listed here to `none`. Without this line the
+      # "has Mergify re-evaluated yet?" probe 403s, `mergify_seen_it` fails
+      # closed, and every single CI run nudges. That is the noise failure the
+      # grace period exists to prevent, and it would arrive as a comment storm
+      # rather than as a red job.
+      checks: read
       # The one write, and the smallest one that can post a comment. Nothing
       # here approves, merges, labels or pushes.
+      #
+      # It is deliberately NOT `issues: write`. GitHub's permissions table
+      # lists `POST /repos/{o}/{r}/issues/{n}/comments` under BOTH Issues and
+      # Pull requests, and the target here is always a pull request — resolved
+      # from `/commits/{sha}/pulls`, which cannot return an issue. Adding
+      # `issues: write` would hand this job the ability to write to every issue
+      # in the repository in exchange for nothing, on a `workflow_run` trigger,
+      # which is the one place extra write scope is worth refusing.
       pull-requests: write
     steps:
       - name: Nudge Mergify if it has not seen this CI run

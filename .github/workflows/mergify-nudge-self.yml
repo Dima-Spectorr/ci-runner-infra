@@ -53,6 +53,11 @@ concurrency:
 jobs:
   nudge:
     uses: ./.github/workflows/mergify-nudge.yml
+    # A called workflow cannot exceed what the caller grants, and what it
+    # declares for itself is a ceiling, not a request — so this list must match
+    # the callee's job block exactly. Drop `checks: read` here and the callee's
+    # own declaration buys it nothing: the probe 403s and every run nudges.
     permissions:
       contents: read
+      checks: read
       pull-requests: write

@@ -631,9 +631,13 @@ Two files, both required, neither optional:
   `github-actions[bot]` as a sender — without it Mergify discards every nudge in
   silence.
 
-**This applies whatever runs your CI.** The nudge keys off a *completed workflow
-run*, so it fits any repository whose required checks are GitHub Actions jobs —
-on the fleet pools or on GitHub-hosted runners, one workflow or several. The
+**This applies whatever runs your CI, and it is not optional for any repository
+in the fleet.** The nudge keys off a *completed workflow run*, so it fits any
+repository whose required checks are GitHub Actions jobs — on the fleet pools, on
+GitHub-hosted minutes, or a mix; one workflow or several. A repository that has
+not adopted the pools yet still gets the whole benefit, and needs no pool
+capacity for it: the nudge job runs on `ubuntu-latest` by design, so it never
+takes a warm slot from a real job. The
 copy-in snippets, the defaults, why it posts nothing on a healthy run, and how to
 tell it is being silently filtered:
 [`ci-merge-queue-baseline.md`](ci-merge-queue-baseline.md#the-other-invisible-wait-ci-is-green-and-mergify-has-not-heard-about-it).

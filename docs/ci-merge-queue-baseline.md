@@ -1234,14 +1234,36 @@ concurrency:
 jobs:
   nudge:
     uses: Dima-Spectorr/ci-runner-infra/.github/workflows/mergify-nudge.yml@v5
+    # All three, and they must match the callee's job block exactly: a called
+    # workflow cannot exceed what its caller grants, so what the callee declares
+    # for itself is a ceiling, not a request.
+    #
+    # `checks: read` is not optional and does not default. Declaring a
+    # `permissions:` block at all sets every scope not listed to `none`, and
+    # `/commits/{sha}/check-runs` is governed by Checks — omit it and the "has
+    # Mergify caught up yet?" probe 403s, the check fails closed, and every run
+    # nudges. `issues: write` is deliberately absent: GitHub lists the issue
+    # comments endpoint under Pull requests as well, and the target here is
+    # always a pull request.
     permissions:
       contents: read
+      checks: read
       pull-requests: write
 ```
 
 A repository whose required checks come from **more than one workflow** lists
 them all under `workflows:`; the nudge is idempotent and self-suppressing, so the
 extra dispatches cost API calls and post nothing.
+
+**This is the same file in every repository in the fleet, whether its checks run
+on GitHub-hosted minutes or on the self-hosted pools.** The stall being fixed is
+in webhook delivery from GitHub to Mergify — downstream of every runner, and
+identical whichever kind reported the result. The nudge job itself deliberately
+stays on `ubuntu-latest` even in a repository that is otherwise entirely
+self-hosted: it is three API calls and two sleeps, and parking it on a warm pool
+slot would hold that slot away from a real job for minutes at a time. A
+repository with no self-hosted pools at all therefore needs nothing extra, and a
+repository with them needs no pool capacity for this.
 
 **2. The sender permission.** The nudge posts as `github-actions[bot]`, which is
 not a repository collaborator. Mergify checks the permission of whoever posted a
@@ -1323,6 +1345,12 @@ That combination means the sender is being filtered: the
 `commands_restrictions` block is missing, misspelled, or under the wrong command
 name. It is the only failure that looks exactly like the problem it was added to
 solve.
+
+The **loud** failure has a different signature: a nudge on *every* run, including
+runs Mergify picked up immediately. That is `checks: read` missing from the
+caller or the callee — `/commits/{sha}/check-runs` 403s, so "has Mergify caught
+up?" can never answer yes, and the workflow concludes it is behind every time.
+The step log shows the `gh api` 403 above the notice.
 
 ### What a consuming repository must not do
 
