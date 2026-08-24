@@ -729,7 +729,7 @@ rc=0
 # writers go FIRST -- the containers here, the processes that are not in one
 # right after -- the removal is what comes last, and the marker is written over
 # a slot nothing has been able to touch since.
-slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, or empty>
+slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, or empty> <slot idx>
   local d owner pid line rest state ppid p hops spared
   # ONE stat for the whole of /proc rather than one per pid, and the difference
   # is not cosmetic: this runs between every pair of jobs on a host with several
@@ -766,7 +766,28 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     # talks to it and the next job needs its socket -- and the containers under
     # it are already gone by the time this runs, removed through docker, which
     # is where that job belongs and where \`-v\` takes their volumes with them.
-    grep -q "user@\$1\.service" "\$d/cgroup" 2>/dev/null && continue
+    #
+    # AND \`ci-dockerd@<idx>.service\` BY NAME, because on this host the rootless
+    # daemon is NOT under \`user@<uid>.service\`. It is a SYSTEM unit with
+    # \`User=ci-s%i\` (see the unit written further down), so its processes are
+    # owned by the slot uid -- which is what selects them here -- while its
+    # cgroup is \`ci-dockerd@<idx>.service\`. The \`user@\` test above therefore
+    # matched nothing, and dockerd, its containerd, rootlesskit and the network
+    # helper were reaped as "processes that outlived the last job".
+    #
+    # That is how a whole fleet lost its runners on 2026-08-24. The agent unit
+    # declares \`BindsTo=ci-dockerd@<idx>.service\`, so killing the daemon stopped
+    # \`ci-runner@<idx>.service\` -- and this function runs as that very unit's
+    # \`ExecStartPre=+\`, so the reset killed the service it was the first step of:
+    #
+    #   slot 1: 5 process(es) outlived the last job -- terminating them
+    #   ci-runner@1.service: Control process exited, code=killed, status=15/TERM
+    #   slot 1: ci-runner@1.service did not start; slot will not serve
+    #   no slot registered - host is useless and will be drained by the controller
+    #
+    # every slot, every host, every boot. The pool then drained the host as a
+    # failed registration and rebuilt it from the same template, forever.
+    grep -qE "user@\$1\.service|ci-dockerd@\${5:-%}\.service" "\$d/cgroup" 2>/dev/null && continue
     # AND THE AGENT'S OWN TREE, when the agent is not already on the chain above.
     # See quiesce_slot for which caller is which; here it is one parent walk per
     # candidate, stopped at pid 1 and bounded so that a /proc read racing with an
@@ -875,7 +896,7 @@ quiesce_slot() {
     fi
   fi
 
-  targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit")
+  targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
   [ -n "\$targets" ] || return 0
   say "slot \$idx: \$(printf '%s\n' "\$targets" | grep -c .) process(es) outlived the last job -- terminating them"
 
@@ -885,7 +906,7 @@ quiesce_slot() {
     # shellcheck disable=SC2086
     kill -TERM \$targets 2>/dev/null
     sleep 0.5
-    targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit")
+    targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
     [ -n "\$targets" ] || return 0
     tick=\$((tick + 1))
   done
@@ -895,7 +916,7 @@ quiesce_slot() {
     # shellcheck disable=SC2086
     kill -KILL \$targets 2>/dev/null
     sleep 0.5
-    targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit")
+    targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
     [ -n "\$targets" ] || return 0
     tick=\$((tick + 1))
   done
@@ -4042,6 +4063,36 @@ setup_slot_netns() { # <idx>
       -j DNAT --to-destination "$nsip" 2>/dev/null \
       || iptables -w -t nat -A PREROUTING -d "$addr" -p tcp --dport "$bmin:$bmax" \
         -j DNAT --to-destination "$nsip" || return 1
+
+    # ...AND THE HAIRPIN SNAT, which is what makes that DNAT usable from the
+    # slot that owns the band -- the one slot for which it is otherwise broken.
+    #
+    # A consumer job in slot <idx> dialling the host address is not a special
+    # case on the way IN: the packet leaves over cis<idx>, enters this namespace
+    # as forwarded traffic, and the DNAT above rewrites it. It is a special case
+    # on the way BACK. The destination it is rewritten to is 10.99.<idx>.2 --
+    # the address the packet came FROM -- so it is routed straight back out
+    # cis<idx> with source and destination equal. The slot drops it as a martian
+    # (its own address arriving on an external interface), and had it not, the
+    # reply would be namespace-local, never return through this host's
+    # conntrack, and never be un-DNATed into something the client's socket
+    # recognises. Either way the connection never completes: the consumer sits
+    # until ITS OWN timeout, which is why this surfaces as a slow, intermittent
+    # client-side timeout rather than a connection refused.
+    #
+    # The general egress MASQUERADE below does not cover it -- that one is
+    # `-o $ifc`, and a hairpin leaves via the veth. This rule replaces the
+    # source with the host end of the /30, so the service replies to the host,
+    # the reply is un-SNATed and un-DNATed on the way back, and the socket sees
+    # the address it dialled.
+    #
+    # Scoped to one slot's own /30 and its own band, so it can never touch a
+    # sibling's traffic: a sibling reaching this band is `-s 10.99.<other>.2`
+    # and keeps its real address.
+    iptables -w -t nat -C POSTROUTING -s "$nsip" -d "$nsip" -p tcp \
+      --dport "$bmin:$bmax" -j MASQUERADE 2>/dev/null \
+      || iptables -w -t nat -A POSTROUTING -s "$nsip" -d "$nsip" -p tcp \
+        --dport "$bmin:$bmax" -j MASQUERADE || return 1
   else
     log "slot $idx: no primary address -- shared-infrastructure band not published"
   fi

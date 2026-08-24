@@ -1557,13 +1557,15 @@ The step log shows the `gh api` 403 above the notice.
   because RUNNER6 refuses a `timeout-minutes` it cannot resolve to a number,
   and 20 is set against the queue's 30-minute `checks_timeout`, which caps the
   useful ladder anyway.
-- **The wait inputs are `type: number`, and the callee rounds them up to whole
-  seconds.** `number` is not `integer`: `grace-seconds: 0.5` arrives as the
-  literal `0.5`, and the clamp compares it arithmetically, so an unnormalised
-  fraction fails the comparison *false* and the job sleeps its entire remaining
-  budget — half a second becoming nineteen minutes. Rounding is up because each
-  of these is a minimum. A value that is not a number fails the job with an
-  `::error::` naming the input, rather than being read as zero.
+- **The numeric inputs are `type: number` — three waits in seconds and two
+  counts — and the callee rounds them all up to whole numbers.** `number` is
+  not `integer`: `grace-seconds: 0.5` arrives as the literal `0.5`, and the
+  clamp compares it arithmetically, so an unnormalised fraction fails the
+  comparison *false* and the job sleeps its entire remaining budget — half a
+  second becoming nineteen minutes. Rounding is up because each of these is a
+  minimum. Anything that is not a plain non-negative decimal — a sign, an
+  exponent, a second `.` — fails the job with an `::error::` naming the input,
+  rather than being read as zero or silently reinterpreted.
 - **Do not restore `grace-seconds` as a safety margin.** It reads like one and
   is not: it has been measured over eleven runs catching Mergify self-reacting
   zero times, and it delays every run to save a comment on none of them. The

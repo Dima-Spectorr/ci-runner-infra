@@ -25,7 +25,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # THE SHELL GATE IS EIGHT JOBS AND AN AGGREGATE, not one job of eighty steps.
+  # THE SHELL GATE IS ELEVEN JOBS AND AN AGGREGATE, not one job of eighty steps.
+  # (Count the `shell-*` keys below rather than trusting this sentence — the
+  # aggregate's second step fails if its `needs:` misses one of them, but no
+  # check reconciles this number, so it is the thing here most able to go stale.)
   #
   # It was one job, and it ran for 8m38s while the other two finished in 8s and
   # 32s — eighty steps in a single line, on one four-core runner, with two of
