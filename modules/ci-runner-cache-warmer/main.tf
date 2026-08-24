@@ -258,9 +258,13 @@ locals {
   # does not work the publisher's own check fires one line later with the message
   # that named the package. Both package managers are tried because the images
   # are inputs — a repository may set `build_image` to an Alpine variant, where
-  # the package is `libcap` and the manager is `apk`. No `$` anywhere in here, so
+  # the manager is `apk`. There the binary is in `libcap-getcap`, NOT in
+  # `libcap`: current Alpine ships /usr/sbin/getcap from that subpackage alone
+  # (pkgs.alpinelinux.org, checked 2026-08-24), and `libcap` on its own installs
+  # the shared library and no scanner. Older Alpine did carry it in `libcap`, so
+  # that is the fallback rather than the first try. No `$` anywhere in here, so
   # it needs no substitution escaping; adding one means escaping it.
-  ensure_getcap = "if ! command -v getcap >/dev/null 2>&1; then\n  if command -v apt-get >/dev/null 2>&1; then\n    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends libcap2-bin >/dev/null 2>&1 || true\n  elif command -v apk >/dev/null 2>&1; then\n    apk add --no-cache libcap >/dev/null 2>&1 || true\n  fi\nfi\n"
+  ensure_getcap = "if ! command -v getcap >/dev/null 2>&1; then\n  if command -v apt-get >/dev/null 2>&1; then\n    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends libcap2-bin >/dev/null 2>&1 || true\n  elif command -v apk >/dev/null 2>&1; then\n    apk add --no-cache libcap-getcap >/dev/null 2>&1 || apk add --no-cache libcap >/dev/null 2>&1 || true\n  fi\nfi\n"
 
   run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\n${local.ensure_getcap}exec ${local.staged_dir}/publish-cache-snapshot.sh\n"
   run_turbo   = "#!/bin/sh\nset -eu\necho '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\nexec ${local.staged_dir}/warm-turbo.sh\n"

@@ -374,7 +374,10 @@ ensures_getcap_before_publishing() { # <file>
   code=$(code_of "$1")
   matches "$code" 'command -v getcap' || return 1
   matches "$code" 'libcap2-bin' || return 1
-  matches "$code" 'apk add --no-cache libcap' || return 1
+  # On Alpine the scanner is in `libcap-getcap`; `libcap` alone is the shared
+  # library and no getcap, so installing it would satisfy apk and still leave
+  # the publisher refusing. It stays as the fallback for older Alpine only.
+  matches "$code" 'apk add --no-cache libcap-getcap' || return 1
   # In the wrapper that runs the publisher, and therefore in BOTH steps that run
   # it — not bolted onto one of them.
   matches "$code" '\$\{local\.ensure_getcap\}exec \$\{local\.staged_dir\}/publish-cache-snapshot\.sh'
@@ -411,7 +414,11 @@ mutate "the getcap install dropped from the publishing wrapper" "$MAIN" \
   ensures_getcap_before_publishing
 
 mutate "only the Debian package manager handled" "$MAIN" \
-  's@apk add --no-cache libcap@true@' \
+  's@apk add --no-cache libcap-getcap@true@' \
+  ensures_getcap_before_publishing
+
+mutate "Alpine given the library instead of the scanner" "$MAIN" \
+  's@apk add --no-cache libcap-getcap >/dev/null 2>&1 || @@' \
   ensures_getcap_before_publishing
 
 mutate "the publisher copied into the module" "$MAIN" \

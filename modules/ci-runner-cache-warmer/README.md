@@ -65,8 +65,8 @@ second install is also the one allowed to run lifecycle scripts — it exists to
 run the repository's build, which is that repository's code by definition,
 whereas the snapshot it does not touch is unpacked as root on every host.
 
-**The publishing wrapper installs `libcap2-bin` (or `libcap`) if the image has no
-`getcap`.** The publisher refuses to build a snapshot it cannot scan for file
+**The publishing wrapper installs `libcap2-bin` (or, on Alpine, `libcap-getcap`)
+if the image has no `getcap`.** The publisher refuses to build a snapshot it cannot scan for file
 capabilities, and a host refuses to unpack one — on both sides a missing `getcap`
 is a refusal, not a skip. `node:22` ships without it, so before this was carried
 over from the workflow the module replaced, the warm installed the repository's
