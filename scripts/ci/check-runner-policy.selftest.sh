@@ -343,6 +343,51 @@ if [ "${1:-}" = "--case" ]; then
   exit
 fi
 
+# --- the shard ----------------------------------------------------------------
+#
+# Every case re-runs the gate's WHOLE fixture suite, and that suite spawns one
+# `python3` per fixture — seventy-six interpreter startups, each importing
+# PyYAML, about seventeen seconds. Twenty-four mutations plus the control paid
+# that price at four-way parallelism and the step took three minutes ten, which
+# was 37% of the entire CI run for this repository.
+#
+# So the cases are ALSO splittable across machines. `--shard I/N` runs the
+# strided subset `I, I+N, I+2N, …`; the caller runs N of them at once and the
+# suite finishes in the time one shard takes.
+#
+# `N` IS NOT WRITTEN DOWN TWICE. The caller in `ci.yml` passes GitHub's
+# `strategy.job-total`, which IS the length of the matrix list, so adding or
+# removing a shard cannot leave a stale total behind — the failure mode that
+# would otherwise silently stop running the last shard's mutations while every
+# job still reported green.
+SHARD_I=1
+SHARD_N=1
+if [ "${1:-}" = "--shard" ]; then
+  spec="${2:-}"
+  SHARD_I="${spec%%/*}"
+  SHARD_N="${spec##*/}"
+  # A malformed spec must not fall back to "run everything" — that reads as a
+  # pass while N-1 shards duplicate each other and nothing says so.
+  # Both numbers are required, spelled out. `--shard 4` without a slash would
+  # otherwise parse as BOTH halves — shard 4 of 4 — and quietly run a quarter of
+  # the mutations for a caller who believes they asked for all of them.
+  case "$spec" in
+    "" | *[!0-9/]* | */*/* | /* | */)
+      printf 'FAIL: --shard wants I/N with both whole numbers, got: %s\n' "$spec" >&2
+      exit 1
+      ;;
+    */*) ;; # one slash, digits either side
+    *)
+      printf 'FAIL: --shard wants I/N, got a lone number: %s\n' "$spec" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$SHARD_N" -lt 1 ] || [ "$SHARD_I" -lt 1 ] || [ "$SHARD_I" -gt "$SHARD_N" ]; then
+    printf 'FAIL: --shard %s is not a shard of a set of %s\n' "$SHARD_I" "$SHARD_N" >&2
+    exit 1
+  fi
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -378,10 +423,25 @@ if [ "$CASES" -lt "$FLOOR" ]; then
   exit 1
 fi
 
+# The floor above is asserted on the FULL list, not on this shard's slice: the
+# regression it exists to catch — `case_list` collapsing to nothing — has to be
+# visible from whichever shard happens to run.
+#
+# A shard with no cases at all means N was raised past the number of mutations,
+# and that shard would otherwise print a clean "0 of 0 answered". It is a
+# misconfiguration, so it is a failure.
+MINE="$(seq 1 "$CASES" | awk -v i="$SHARD_I" -v n="$SHARD_N" 'NR % n == i % n')"
+SHARD_CASES="$(printf '%s' "$MINE" | grep -c . || true)"
+if [ "$SHARD_CASES" -eq 0 ]; then
+  bad "shard $SHARD_I of $SHARD_N drew none of the $CASES case(s) — there are more shards than mutations, so this job asserts nothing"
+  printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
+  exit 1
+fi
+
 JOBS="$(nproc 2>/dev/null || echo 4)"
 # `-I{}` already implies one argument per command; passing `-n1` beside it makes
 # xargs warn that the two are mutually exclusive, on every run, forever.
-OUT="$(seq 1 "$CASES" | xargs -P "$JOBS" -I{} bash "${BASH_SOURCE[0]}" --case {} 2>&1)"
+OUT="$(printf '%s\n' "$MINE" | xargs -P "$JOBS" -I{} bash "${BASH_SOURCE[0]}" --case {} 2>&1)"
 DISPATCH_RC=$?
 
 # The workers' interleaved verdicts, printed in full. Unlike the sequential
@@ -410,14 +470,18 @@ PASS=$((PASS + CASE_OK))
 # So the dispatch is reconciled twice, on two independent facts. The count of
 # verdicts must equal the count of cases started, and a non-zero `xargs` status
 # with no failing case named is itself a finding rather than a curiosity.
+#
+# Reconciled against THIS SHARD'S slice rather than the full list — a shard that
+# drew seven cases and heard seven verdicts is complete, and comparing it to
+# twenty-four would redden every sharded run.
 REPORTED=$((CASE_OK + CASE_FAIL))
-if [ "$REPORTED" -ne "$CASES" ]; then
-  bad "the dispatcher started $CASES case(s) and $REPORTED returned a verdict — the rest ended without one, so their mutations were never asserted, whatever the exit codes say"
+if [ "$REPORTED" -ne "$SHARD_CASES" ]; then
+  bad "the dispatcher started $SHARD_CASES case(s) and $REPORTED returned a verdict — the rest ended without one, so their mutations were never asserted, whatever the exit codes say"
 fi
 if [ "$DISPATCH_RC" -ne 0 ] && [ "$CASE_FAIL" -eq 0 ]; then
   bad "xargs exited $DISPATCH_RC while every case that answered was green — a worker failed for a reason it never got to print, and this run proves nothing"
 fi
 
-printf 'check-runner-policy self-test: %d passed, %d failed (%d of %d case(s) answered, %d at a time)\n' \
-  "$PASS" "$FAIL" "$REPORTED" "$CASES" "$JOBS"
+printf 'check-runner-policy self-test: %d passed, %d failed (shard %d of %d: %d of %d case(s) answered, %d at a time; %d case(s) in the full list)\n' \
+  "$PASS" "$FAIL" "$SHARD_I" "$SHARD_N" "$REPORTED" "$SHARD_CASES" "$JOBS" "$CASES"
 [ "$FAIL" -eq 0 ]
