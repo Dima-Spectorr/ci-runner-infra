@@ -202,7 +202,7 @@ checks_out_its_own_implementation() {
   local code
   code=$(code_of "$1")
   matches "$code" '^          repository: \$\{\{ inputs\.implementation-repository \}\}$' || return 1
-  matches "$code" '^          ref: \$\{\{ inputs\.implementation-ref \}\}$'
+  matches "$code" '^          ref: \$\{\{ inputs\.implementation-ref \|\| github\.job_workflow_sha \}\}$'
 }
 
 # Every declared knob has to actually reach the script. An input that is
@@ -409,20 +409,20 @@ ci_runs_both_self_tests() {
   matches "$code" 'scripts/ci/branch-reaper\.selftest\.sh'
 }
 
-# THE DOCUMENTED PIN AND THE DOCUMENTED REF MUST BE THE SAME COMMIT.
+# THE DOCUMENTED EXAMPLE MUST CARRY EXACTLY ONE PIN.
 #
-# A reusable workflow's `actions/checkout` clones the caller, so the reaper is
-# additionally told where its own driver lives — and `implementation-ref` is a
-# second, otherwise unchecked sha sitting a few lines below the `uses:` pin. A
-# consumer copying an example where they disagree runs one release's driver
-# under another release's workflow.
-pins_agree_in_the_documented_example() {
-  local pin ref
-  pin=$(grep -oE 'uses: Dima-Spectorr/ci-runner-infra/\.github/workflows/branch-reaper\.yml@[0-9a-f]{40}' "$1" | head -1 | grep -oE '[0-9a-f]{40}')
-  ref=$(grep -oE '^ *implementation-ref: [0-9a-f]{40}' "$1" | head -1 | grep -oE '[0-9a-f]{40}')
-  [ -n "$pin" ] || return 1
-  [ -n "$ref" ] || return 1
-  [ "$pin" = "$ref" ]
+# This used to assert that two shas AGREED: a `uses:` pin and an
+# `implementation-ref` repeating it. Two shas that must agree is a rule someone
+# has to keep, and Dependabot cannot keep it — it rewrites a `uses:` line and
+# cannot see an input value, so an automatic update moves the workflow and
+# leaves the driver on the previous release.
+#
+# The workflow now defaults the ref to `github.job_workflow_sha`, the commit it
+# was itself called at, so a second sha in the example is not merely redundant:
+# a consumer who copies it reintroduces the skew by hand.
+documented_example_carries_one_pin() {
+  grep -qE 'uses: Dima-Spectorr/ci-runner-infra/\.github/workflows/branch-reaper\.yml@[0-9a-f]{40}' "$1" || return 1
+  ! grep -qE '^ *implementation-ref: [0-9a-f]{40}' "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -465,7 +465,7 @@ check writes_the_report_where_it_costs_nothing "$DRIVER" "the report is not writ
 check never_writes_an_empty_report_field "$DRIVER" "a report field can be empty, and tab collapsing then shifts every column after it left"
 
 check ci_runs_both_self_tests "$CI" "a branch-reaper self-test is not run by CI, so it is a file rather than a gate"
-check pins_agree_in_the_documented_example "$DOC" "the documented uses: pin and implementation-ref are different commits, so a consumer copying them runs one release's driver under another release's workflow"
+check documented_example_carries_one_pin "$DOC" "the documented example still sets implementation-ref to a sha, so a consumer copying it reintroduces a second pin Dependabot cannot keep in step with the first"
 
 # ---------------------------------------------------------------------------
 # Mutations. Every property above must be DETECTABLE, not merely present: a
