@@ -133,6 +133,22 @@ metadata = merge(
 )
 ```
 
+Neither value is the boot script itself: both are a few dozen lines that unpack
+a gzipped, base64'd copy of it and run that. A GCE metadata value is capped at
+262,144 characters, and measured 2026-08-24 the Linux pair (`telemetry.sh` plus
+`host-startup.sh`) was 278,405 and `windows-host-startup.ps1` 366,591 — 106% and
+140% of the cap. `terraform plan` does not notice; the **apply** dies at create
+time with `Error 413 ... is too large`, which on the Linux side meant three
+repositories ran a known-broken boot script for a day while every merged fix
+looked shipped. Compressed the two are 128,344 and 148,860. The Windows wrapper
+is a file of its own (`scripts/windows-boot-wrapper.ps1`, rendered with
+`templatefile`) rather than a heredoc, so the PowerShell gate parses and analyses
+it like every other script here; it unpacks into `C:\ci` and not
+`C:\Windows\Temp`, where an existing slot user could replace the file SYSTEM is
+about to run on a warm host's reboot. A plan-time precondition asserts the
+rendered length for whichever arm is selected, so the next script to outgrow the
+cap is a red plan naming the file rather than a 413 in an unattended build log.
+
 `ci-host-os` is set as its own metadata key and the boot script asserts it
 against the OS it is actually running on. This exists because the failure mode
 of getting the pair wrong is the worst-behaved one in the system: a Windows image

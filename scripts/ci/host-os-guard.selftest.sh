@@ -125,8 +125,10 @@ has_os_selected_boot_key() { # <main.tf>
   matches "$code" '^    "windows-startup-script-ps1" = local\.windows_host_startup$' || return 1
   matches "$code" '^    "startup-script" = local\.host_startup$' || return 1
 
-  # …carrying the real script, not a placeholder.
-  matches "$code" 'windows_host_startup = file\("\$\{path\.module\}/scripts/windows-host-startup\.ps1"\)' || return 1
+  # …carrying the real script, not a placeholder — and carrying it through the
+  # wrapper, because the raw text is 140% of a metadata value (see invariant 9).
+  matches "$code" 'windows_host_startup_source = file\("\$\{path\.module\}/scripts/windows-host-startup\.ps1"\)' || return 1
+  matches "$code" 'windows_host_startup = templatefile\("\$\{path\.module\}/scripts/windows-boot-wrapper\.ps1", \{' || return 1
 
   # …and actually rendered. A local nothing merges into the template is a
   # rename away from being deleted as unused, and the template would keep
@@ -273,6 +275,49 @@ has_every_windows_refusal() { # <main.tf>
   [ "$(count_of "$code" '^      error_message = ".*host_os = \\"')" -ge 6 ] || return 1
 }
 
+# --- invariant 9: the Windows boot script travels compressed -----------------
+
+windows_boot_script_is_compressed() { # <main.tf>
+  local code wrapper
+  code=$(code_of "$1")
+
+  # 366,591 characters of PowerShell against the 262,144 a metadata value holds.
+  # The Linux side crossed the same line at 106% and cost three repositories a
+  # day of CI; Windows is at 140% and has never been applied anywhere, so it has
+  # never said so. Whoever first turns a Windows pool on gets an Error 413 at
+  # CREATE time on a plan that read clean — after "the boot script metadata bug
+  # was fixed" is already in the history, which is what makes it read as new.
+  matches "$code" '^  windows_host_startup_gz += base64gzip\(local\.windows_host_startup_source\)' || return 1
+  matches "$code" 'windows_host_startup = templatefile\("\$\{path\.module\}/scripts/windows-boot-wrapper\.ps1", \{' || return 1
+  matches "$code" '^    gz = local\.windows_host_startup_gz$' || return 1
+
+  # The raw source must not be what reaches metadata. This is the revert that
+  # plans clean and 413s.
+  ! matches "$code" '^    "windows-startup-script-ps1" = local\.windows_host_startup_source$' || return 1
+
+  # The cap is asserted for BOTH arms, not just the one that has been applied.
+  matches "$code" 'length\(local\.boot_script_metadata\[var\.host_os == "windows" \? "windows-startup-script-ps1" : "startup-script"\]\) < 262144' || return 1
+
+  # And the wrapper itself has the two properties that decide whether a failed
+  # unpack is a drained host or a host serving nothing: it refuses an empty
+  # decode explicitly — a `catch` only ever sees a decode that FAILED — and it
+  # unpacks under C:\ci, never C:\Windows\Temp, where a slot user on a warm
+  # host's reboot could replace the file SYSTEM is about to run.
+  wrapper=$(cat "$HERE/../../modules/ci-runner-host-pool/scripts/windows-boot-wrapper.ps1")
+  matches "$wrapper" 'IsNullOrWhiteSpace\(\$plain\)' || return 1
+  matches "$wrapper" '^\$root = .C:\\ci.$' || return 1
+
+  # …and restricted on EVERY boot, not only the one where this wrapper created
+  # it. The golden image ships C:\ci, so an ACL applied inside the create branch
+  # is an ACL that never runs on a real host, and what protects the boot path is
+  # then whatever C:\ hands down by inheritance. Column zero: indented, the call
+  # is back inside the `if`.
+  matches "$wrapper" '^Protect-Path \$root$' || return 1
+  ! matches "$wrapper" '\$env:TEMP' || return 1
+  matches "$wrapper" 'S-1-5-18' || return 1
+  matches "$wrapper" 'S-1-5-32-544' || return 1
+}
+
 # --- the helper carries the trap it was written to avoid ---------------------
 # A match on the FIRST line of a large input is the worst case: with `grep -q`
 # the writer is still pushing bytes when grep exits on the match, takes SIGPIPE,
@@ -331,6 +376,12 @@ if has_every_windows_refusal "$MAIN"; then
   ok
 else
   bad "a plan-time refusal was removed — a Windows pool then applies clean into the failure the refusal existed to name, hours before anything else notices"
+fi
+
+if windows_boot_script_is_compressed "$MAIN"; then
+  ok
+else
+  bad "the Windows boot script no longer travels gzipped in its wrapper — at 366,591 characters it is 140% of the 262,144 a GCE metadata value holds, so the first Windows pool applies into an Error 413 at create time on a plan that read clean, which is exactly how three repositories lost a day of CI on the Linux side"
 fi
 
 # --- mutation cases: prove the checks above can actually fail -----------------
@@ -450,6 +501,20 @@ mutate "the linux-side refusal removed entirely" "$MAIN" \
 mutate "a refusal message that only restates its condition" "$MAIN" \
   's|^      error_message = "host_os|      error_message = "invalid input: host-os|' \
   has_every_windows_refusal
+
+# 9. The Windows boot script goes back to travelling raw, in each shape.
+mutate "the raw Windows script back on the metadata key" "$MAIN" \
+  's|^    "windows-startup-script-ps1" = local.windows_host_startup$|    "windows-startup-script-ps1" = local.windows_host_startup_source|' \
+  windows_boot_script_is_compressed
+mutate "the wrapper handed the uncompressed text" "$MAIN" \
+  's|^    gz = local.windows_host_startup_gz$|    gz = local.windows_host_startup_source|' \
+  windows_boot_script_is_compressed
+mutate "the compression local removed" "$MAIN" \
+  's|^  windows_host_startup_gz     = base64gzip(local.windows_host_startup_source)$||' \
+  windows_boot_script_is_compressed
+mutate "the cap asserted for the Linux arm only" "$MAIN" \
+  's|length(local.boot_script_metadata\[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"\]) < 262144|length(local.host_startup) < 262144|' \
+  windows_boot_script_is_compressed
 
 printf 'host-os-guard self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

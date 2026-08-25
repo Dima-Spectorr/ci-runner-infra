@@ -2894,5 +2894,28 @@ mutate_file "$SCAN_PS" "the offender chosen out of a hashtable, so the build nam
   's|foreach ($entry in $order) {|foreach ($entry in $names.Keys) {|' \
   has_hardlink_scan_script
 
+# THE BOOT SCRIPT HAS TO FIT IN A METADATA VALUE.
+#
+# The same check host-startup.selftest.sh makes for Linux, and the reason it is
+# worth making twice: this script is 366,591 characters raw, 140% of the
+# 262,144 a GCE metadata value holds, and it had been over the cap for as long
+# as it has existed without anything saying so — no Windows pool has ever been
+# applied, and a plan is clean right up to the Error 413 the apply gets at
+# create time. It now travels gzipped inside windows-boot-wrapper.ps1; this
+# measures what that leaves.
+#
+# The threshold is under the cap on purpose. Terraform's `base64gzip` is Go's
+# gzip at its DEFAULT level and this is whatever the runner's gzip defaults to,
+# so the two numbers are close but not guaranteed equal, and a compression-level
+# difference must never be what decides whether a pool can build a template.
+_cap=262144
+_margin=245760
+_gz=$(gzip <"$SCRIPT" | base64 -w0 | wc -c)
+if [ "$_gz" -lt "$_margin" ]; then
+  ok
+else
+  bad "the gzipped Windows boot script is ${_gz} characters as metadata; the budget is ${_margin} and GCE refuses anything over ${_cap}. Shorten windows-host-startup.ps1 or move part of it onto the golden image -- past the cap this is an Error 413 at create time, on a plan that read clean."
+fi
+
 printf 'windows-host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
