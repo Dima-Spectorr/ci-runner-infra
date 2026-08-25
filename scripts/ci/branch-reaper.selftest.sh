@@ -425,6 +425,22 @@ documented_example_carries_one_pin() {
   ! grep -qE '^ *implementation-ref: [0-9a-f]{40}' "$1"
 }
 
+# THE EXAMPLE MUST PASS THE GATES THE FLEET ALREADY RUNS.
+#
+# The cutover shipped a caller that this fleet's own vendored gates reject, and
+# nobody found out until the first ordinary pull request in a consumer — the
+# cutover itself landed by admin merge, which is the path that skips them.
+# `check-workflow-concurrency.sh` requires a top-level `concurrency:`, and a
+# constant group key on a scheduled workflow requires the serialization marker;
+# `check-runner-policy.sh` RUNNER7 requires a `remote-reusable-allowed` marker
+# naming this callee. Neither is discoverable from the callee, so the example is
+# where a consumer learns them, and this is what keeps them there.
+documented_example_survives_the_consumer_gates() {
+  grep -qE '^concurrency:' "$1" || return 1
+  grep -qE '^# concurrency-serialization: intentional[[:space:]]*[—-]' "$1" || return 1
+  grep -qE '^ *# remote-reusable-allowed\(Dima-Spectorr/ci-runner-infra/\.github/workflows/branch-reaper\.yml, #' "$1"
+}
+
 # ---------------------------------------------------------------------------
 echo "branch-reaper self-test:"
 
@@ -466,6 +482,7 @@ check never_writes_an_empty_report_field "$DRIVER" "a report field can be empty,
 
 check ci_runs_both_self_tests "$CI" "a branch-reaper self-test is not run by CI, so it is a file rather than a gate"
 check documented_example_carries_one_pin "$DOC" "the documented example still sets implementation-ref to a sha, so a consumer copying it reintroduces a second pin Dependabot cannot keep in step with the first"
+check documented_example_survives_the_consumer_gates "$DOC" "the documented example is missing the concurrency block or the RUNNER7 declaration, so a consumer who copies it verbatim gets a caller their own vendored gates reject"
 
 # ---------------------------------------------------------------------------
 # Mutations. Every property above must be DETECTABLE, not merely present: a
@@ -564,6 +581,11 @@ mutate "the structural self-test drops out of CI" "$CI" \
   's@scripts/ci/branch-reaper\.selftest\.sh@scripts/ci/nope.sh@' ci_runs_both_self_tests
 mutate "the decision self-test drops out of CI" "$CI" \
   's@branch-reaper-decision\.selftest\.sh@nope.sh@' ci_runs_both_self_tests
+
+mutate "the documented example loses its concurrency block" "$DOC" \
+  's@^concurrency:@# concurrency:@' documented_example_survives_the_consumer_gates
+mutate "the documented example loses its RUNNER7 declaration" "$DOC" \
+  's@# remote-reusable-allowed@# remote-reusable-was-allowed@' documented_example_survives_the_consumer_gates
 
 if [ "$FAIL" -gt 0 ]; then
   echo "branch-reaper: $FAIL failed, $PASS passed"

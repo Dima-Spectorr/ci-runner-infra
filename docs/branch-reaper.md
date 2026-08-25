@@ -155,11 +155,26 @@ on:
 permissions:
   contents: read
 
+# Two reapers would evaluate the same merged branches and race to delete them,
+# so the group is constant and the marker is what
+# `check-workflow-concurrency.sh` requires in exchange. An evicted pending run
+# costs nothing: the sweep is idempotent and runs again tomorrow.
+# concurrency-serialization: intentional — one sweep at a time
+concurrency:
+  group: branch-reaper
+  cancel-in-progress: false
+
 jobs:
   reap:
     # Off until the merge App secrets exist — a dry run still mints the token,
     # so without this the job is red every day.
     if: vars.MERGE_LANE_ENABLED == 'true'
+    # `check-runner-policy.sh` RUNNER7 cannot read a callee in another
+    # repository, so it refuses to decide its runner scope and timeouts. The
+    # marker records that a human read it — one job, `timeout-minutes: 15`,
+    # `contents: read`, and a `runs-on` YOUR file supplies — and names the issue
+    # where that reading lives. The gate rejects a marker without one.
+    # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/branch-reaper.yml, #<issue>): read and recorded there
     uses: Dima-Spectorr/ci-runner-infra/.github/workflows/branch-reaper.yml@22549049f59ee3c67f04221c6b1a17d72ec6d83a # v5.53.0
     permissions:
       contents: read

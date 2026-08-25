@@ -169,11 +169,28 @@ on:
 permissions:
   contents: read
 
+# Serialization is the point, not a concession: two lane runs read the same list
+# of open pull requests and could both act on it. The marker is what
+# `check-workflow-concurrency.sh` requires in exchange for a constant group key
+# — it accepts that a third request evicts the pending run, which costs nothing
+# here because the lane re-reads live state on the next CI completion or cron.
+# concurrency-serialization: intentional — one merge decision at a time
+concurrency:
+  group: merge-lane
+  cancel-in-progress: false
+
 jobs:
   lane:
     # Off until an operator confirms the App secrets exist — a dry run still
     # mints the token, so without this the job is red on every CI completion.
     if: vars.MERGE_LANE_ENABLED == 'true'
+    # `check-runner-policy.sh` RUNNER7 refuses to decide the runner scope and
+    # timeouts of a workflow it cannot read, and this one is in another
+    # repository. The marker records that a human read it — one job,
+    # `timeout-minutes: 15`, `contents: read`, and a `runs-on` YOUR file
+    # supplies — and points at the issue where that reading lives. Open one;
+    # the gate rejects a marker without an issue number, on purpose.
+    # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml, #<issue>): read and recorded there
     uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@22549049f59ee3c67f04221c6b1a17d72ec6d83a # v5.53.0
     permissions:
       contents: read
@@ -202,6 +219,16 @@ jobs:
       app-private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
 ```
 
+> **The two markers in that example are not decoration, and admin merge will
+> not tell you so.** A caller without them is rejected by gates several repos in
+> this fleet already vendor: `check-workflow-concurrency.sh` wants the top-level
+> `concurrency:` block, and `check-runner-policy.sh` RUNNER7 wants a
+> `remote-reusable-allowed` marker naming an issue, because it cannot read a
+> callee that lives here. The original cutover landed by admin merge — the one
+> path that skips those gates — so thirteen repositories reported a healthy
+> setup and then failed their next ordinary pull request. Open the issue, paste
+> its number into the marker, and the first PR after onboarding is green.
+>
 > **`v5.53.0` is the first release you may pin.** `v5.52.0` also contains
 > `merge-lane.yml` and you must not use it: the driver in it loses the head sha
 > of any pull request that carries no label, which is nearly all of them, so the
