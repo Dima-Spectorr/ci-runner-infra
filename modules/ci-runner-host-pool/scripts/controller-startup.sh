@@ -1635,9 +1635,31 @@ collect_hosts() {
   # template_state would then read a booting host as `stale` instead of the
   # `unknown` the recycle rule's fail-safe is built on, and the self-link would
   # arrive empty. A comma is not IFS whitespace, so an empty field stays empty.
+  #
+  # `name` for the first column and `.uri()` on the fourth, and BOTH spellings
+  # are load-bearing. A gcloud projection attaches a transform to the KEY, not
+  # to the column, so naming `instance` twice — once as `instance.basename()`
+  # and once bare — applies the basename to both, and the fourth column comes
+  # back as the host's short name. Measured on a live pool:
+  #
+  #   (instance.basename(),instance) -> ci-runner-host-abcd,ci-runner-host-abcd
+  #   (name,instance.uri())          -> ci-runner-host-abcd,https://.../zones/<zone>/instances/ci-runner-host-abcd
+  #
+  # A basename in the self-link column is not a visible failure. `${uri%/instances/*}`
+  # has nothing to strip, `${zone##*/}` has no slash to cut, and the "zone" the
+  # readers derive is the HOST NAME. Every per-instance compute call then fails
+  # with an invalid zone, which the pin-hold gate reads as `read-failed` — and
+  # `read-failed` vetoes. The whole pool becomes undeletable and never rolls
+  # onto a new template, while the log says nothing worse than "read-failed".
+  # Nor does the org-policy classifier get a chance: the request never reaches
+  # the policy, so a fleet with guest attributes switched off looks identical.
+  #
+  # Bare `instance` is not the answer either — in list-instances it renders as
+  # the SCOPE, the bare zone name, rather than as the link. `.uri()` is the spelling that asks for the URI
+  # and says so.
   HOSTS=$(gcloud compute instance-groups managed list-instances "$MIG" \
     --region="$REGION" --project="$PROJECT" \
-    --format="csv[no-heading](instance.basename(),instanceStatus,version.instanceTemplate.basename(),instance)" 2>/dev/null)
+    --format="csv[no-heading](name,instanceStatus,version.instanceTemplate.basename(),instance.uri())" 2>/dev/null)
 }
 
 # One describe per tick for both facts we need from the MIG: the target size we
@@ -2158,6 +2180,40 @@ idle_seconds() {
 # the two facts it needs, because the problem is not which fact is recorded — it
 # is where.
 
+# zone_of_uri <instance-self-link> -> the zone, or EMPTY
+#
+# Four call sites derive a zone from a MIG row's self-link, and all four used to
+# do it inline with `${uri%/instances/*}` followed by `${zone##*/}`. On a real
+# self-link that is correct. On anything that is NOT a self-link it is silently
+# wrong in the worst available way: neither expansion has anything to match, so
+# a bare host name comes back out as the "zone", non-empty, and sails through
+# the `[ -z "$zone" ]` guard each site already has.
+#
+# That is not hypothetical. collect_hosts asked gcloud for `instance` alongside
+# `instance.basename()`, gcloud attaches a transform to the key rather than to
+# the column, and the self-link column arrived as the host's short name for
+# every host in the fleet. Each per-instance call then addressed zone
+# `ci-runner-host-abcd`, failed, and the pin-hold gate read the failure as
+# `read-failed` — which vetoes. Every host on both IntegrateIT pools sat
+# undeletable on a stale template for two days, and the only trace was the word
+# `read-failed` in a log line that also appears for an ordinary API blip.
+#
+# The projection is fixed at the source. This exists so that the NEXT thing that
+# hands these functions something that is not a self-link fails as "no zone",
+# which every caller already handles, instead of as a plausible wrong answer.
+zone_of_uri() {
+  local uri="${1:-}" zone
+  # Both halves must be present. `*/zones/*/instances/*` is the shape of the
+  # only string this is allowed to succeed on.
+  case "$uri" in
+    */zones/*/instances/*) ;;
+    *) return 0 ;;
+  esac
+  zone=${uri%/instances/*}
+  zone=${zone##*/}
+  printf '%s' "$zone"
+}
+
 # write_registration_token <instance-self-link> <regkey-marker>
 write_registration_token() {
   local uri="$1" keylive="$2"
@@ -2168,7 +2224,7 @@ write_registration_token() {
   # a MIG row with no instance URI, a format change — would otherwise burn an
   # hour-long credential that no delete path can ever reach, because the delete
   # needs the same zone this failed to read.
-  zone=${uri%/instances/*}; zone=${zone##*/}
+  zone=$(zone_of_uri "$uri")
   host=${uri##*/}
   if [ -z "$zone" ] || [ -z "$host" ]; then
     log "regtoken: cannot read a zone from $uri"
@@ -2233,7 +2289,7 @@ write_registration_token() {
 # again on any tick whose previous delete failed.
 delete_registration_token() {
   local uri="$1" zone host
-  zone=${uri%/instances/*}; zone=${zone##*/}
+  zone=$(zone_of_uri "$uri")
   host=${uri##*/}
   [ -n "$zone" ] && [ -n "$host" ] || return 1
   timeout 60 gcloud compute instances remove-metadata "$host" \
@@ -2276,8 +2332,7 @@ instance_durable_facts() {
   # bug; it is the shape that makes the next caller's mistake unrecoverable.
   DUR_ISSUED="unknown"
 
-  zone=${uri%/instances/*}
-  zone=${zone##*/}
+  zone=$(zone_of_uri "$uri")
   host=${uri##*/}
   [ -n "$zone" ] && [ -n "$host" ] || return 1
 
@@ -2799,8 +2854,7 @@ pin_hold_gate() {
 
   # No self-link, no zone, and a guessed zone addresses some other machine. The
   # read cannot happen, so this reads exactly as the read failing: keep.
-  zone=${uri%/instances/*}
-  zone=${zone##*/}
+  zone=$(zone_of_uri "$uri")
   if [ -z "$uri" ] || [ -z "$zone" ]; then
     printf '%s' "hold:run= expiry=0 no-zone"
     return 0
