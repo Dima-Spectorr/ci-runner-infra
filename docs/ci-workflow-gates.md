@@ -62,9 +62,25 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER9` | with `--shared-infra`, a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the anchor job's output, or — in a called workflow that opens no pull-request run of its own — from a **required** `workflow_call` input, or is the anchor, or carries a declared exemption |
 | `RUNNER10` | with `--shared-infra`, at most **one** job invocation across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# shared-infra-owner(<job>)` markers counted together, including on a `uses:` job, because a repository that has adopted the contract has no `services:` left to count and its anchor is a call |
 | `RUNNER11` | with `--shared-infra`, a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
-| `RUNNER12` | a route onto the **merge-queue** pool also requires the head branch to live in this repository and the author to be `mergify[bot]` — not the branch name alone |
-| `RUNNER13` | and the label sets it routes between are mutually non-superset, so neither pool can be scheduled onto the other's hosts |
-| `RUNNER14` | and in a repository that HAS such a route, no fleet-reachable `pull_request` job names its pool literally — a job that does sits out the route and queues against the pull-request pool even on a merge-queue draft |
+
+**`RUNNER12`, `RUNNER13` and `RUNNER14` are retired and the numbers are not
+reused.** All three judged the route between a pull-request pool and a
+merge-queue pool, and the merge-queue pool existed to serve
+`mergify/merge-queue/<sha>` drafts. Mergify is gone fleet-wide
+([#434](https://github.com/Dima-Spectorr/ci-runner-infra/issues/434)), nothing
+creates those branches, and a rule that can only fire on a branch nobody creates
+is not a dormant safeguard — it is a shape the next reader has to work out
+before they can tell whether their repository is in scope.
+
+Retired rather than left inert for one further reason: `RUNNER14` turned itself
+on whenever *any* file in the set mentioned the queue prefix, so a repository
+that kept one stale comment would still have been asked to route jobs onto a
+pool with no workload. If you are reading this from a **vendored copy** of
+`check-runner-policy.sh` that still emits these ids, the copy predates the
+removal — refresh it rather than adding suppressions. The one property worth
+keeping, that two pools carry mutually non-superset label sets, is still
+enforced at plan time by the `pools` validation in
+`modules/ci-runner-controller/variables.tf`.
 
 `RUNNER9`–`RUNNER11` are designed in
 [`adr-pr-host-affinity.md`](adr-pr-host-affinity.md) and specified for consumers
@@ -210,112 +226,6 @@ group. A job that carries a `RUNNER9` exemption is the one that needs this
 check most — the exemption is granted **for** a deliberate second host, so
 skipping `RUNNER11` there would switch off the rule that makes the second host
 work.
-
-### `RUNNER12`/`RUNNER13` — the merge-queue route
-
-A repository served by both a pull-request pool and a merge-queue pool routes
-between them in one expression, published as an output of the lane job. Both
-rules read that expression, and both are opted into by the route **existing** —
-no flag, because a repository that never writes `mergify/merge-queue/` into a
-`runs-on` or a job output is not making either mistake.
-
-`RUNNER12` is a security check, on the same footing as `RUNNER1`.
-`github.head_ref` is whatever the requester typed, so a route keyed on the
-branch prefix alone offers the reserved pool to any pull request willing to be
-named after the queue — a fork included. Two facts nobody outside the
-repository can forge have to be required with it: `head.repo.full_name ==
-github.repository`, and `user.login == 'mergify[bot]'`. Nothing goes red when
-they are missing; the route works, and it also works for everyone else.
-
-What it asserts is that both conjuncts are **present**, not that they are used
-the right way round: a route that tested `!(head.repo.full_name ==
-github.repository)` would satisfy it and mean the opposite. That is the limit of
-reading an expression without evaluating it, and it is the same limit `RUNNER4`
-lives with — write the route the way [`ci-lane-model.md`](ci-lane-model.md)
-spells it and the question does not arise.
-
-`RUNNER13` is the scheduling half. GitHub matches a runner by superset, so if
-the queue arm's labels cover the pull-request arm's, every ordinary job is
-eligible for the queue's hosts and the split buys nothing; covered the other way
-round, the queue cannot be addressed at all and its jobs wait against a label no
-runner carries. Each arm must therefore carry a scope label the other does not —
-mutual non-superset, not merely "different" — and an arm carrying no scope label
-at all is `RUNNER1`'s finding reached through an expression `RUNNER1` cannot
-read. Case is not a difference: GitHub does not distinguish `Linux` from
-`linux`, so neither does the comparison.
-
-The **hosted** arm of the fork idiom (`'["ubuntu-latest"]'`) is not a pool and
-is excluded, decided against the same `HOSTED_IMAGE` expression the fork guard
-uses rather than re-derived — otherwise the one shape that already got this
-right would be the one reported.
-
-`modules/ci-runner-controller` asserts the same disjointness across its `pools`
-table at plan time. Both ends, because either end alone is a rule the other end
-drifts away from: Terraform sees the pools and not the workflow, this gate sees
-the workflow and not the pools.
-
-### `RUNNER14` — the half of the route nobody remembers to finish
-
-`RUNNER12` and `RUNNER13` both read the route and ask whether it is written
-correctly. Neither asks the question that actually costs merges: **which jobs
-take it.**
-
-Adopting the split is not one edit. The pools are Terraform, the route is an
-expression in one workflow, and every self-hosted job in the repository has to
-be repointed at it — including the ones in the other workflow files, which is
-where this stops being remembered. A job left naming `<scope>` literally is not
-broken and reports nothing: the labels resolve, a runner exists, the job runs.
-It just runs on the **pull-request** pool, on every speculative queue draft,
-competing with the ordinary pull-request traffic that the queue pool was built
-to insulate the queue from. The busier the repository, the worse it gets —
-precisely when the queue matters.
-
-Measured on IntegrateIT, 2026-08-23: `generic-binary-check.yml` kept
-`runs-on: [self-hosted, linux, gcp, IntegrateIT]` after `pr-check.yml` adopted
-the route, and on pull request #11307 its **65-second** job waited **31m06s**
-for a runner. Because `generic-binary` is a required check, Mergify reported the
-queue entry as "waiting for generic-binary" for the whole half hour — which
-reads as a check that is running slowly, not as one that cannot start. That
-reading is why the repository spent weeks blaming the queue.
-
-Like `RUNNER12`/`RUNNER13`, this is opted into by the route **existing**, and by
-nothing else. The rule is off in a repository with one pool, and it switches
-itself on for every workflow file the moment any job anywhere resolves its pool
-from a route — which is also why the verdict is **deferred to the end** and
-reported per offending job rather than per file: whether a repository has a
-route is not knowable while reading the file that lacks one. `RUNNER10` is
-deferred for the same reason and reports once; this one reports each job,
-because each is a separate edit to make.
-
-Three answers are accepted, the same three shapes `RUNNER9` takes:
-
-- resolve the pool from the routing job's output —
-  `runs-on: ${{ fromJSON(needs.<lane>.outputs.runner) }}`;
-- be a job the queue drafts cannot reach — a job that never runs during queue
-  validation never competes for a pool during it. Two spellings prove it, and
-  they are the same statement from opposite sides: an `if:` that excludes
-  `mergify/merge-queue/` heads, or an `if:` pinning the job to an event a draft
-  never arrives as. A queue draft is a real pull request Mergify opened in the
-  repository, so GitHub delivers it as `pull_request` — or `pull_request_target`
-  — and as nothing else; `if: github.event_name == 'push'` therefore rules it
-  out as conclusively as negating the branch prefix does. Equality against a
-  literal event name only: `!=` and `contains(...)` leave the answer depending
-  on the rest of the condition, and an over-eager reading here excuses the job
-  the rule is about;
-- declare `# merge-queue-route-exempt(<job>, #<issue>): <reason>` beside it.
-
-The exemption exists because one case is real and cannot be fixed by editing the
-workflow: a job on a pool that has **no merge-queue twin**. A Windows build in a
-repository whose queue pool is Linux-only has no second label to name. That is a
-sizing decision, so it belongs in an issue rather than in a silent pass — and
-the marker is read through `comment_view()` like every other declaration here,
-so a marker echoed inside a `run:` block declares nothing.
-
-An inline `runs-on:` expression is not one of the three. It is a single line and
-needs no second job, and `RUNNER5` rejects it before this rule is reached, on the
-grounds that a pool gate which cannot resolve the pool must say so rather than
-pass. The cost of the extra job is one hosted-runner start; the cost of the
-alternative is a gate that stops gating.
 
 ### `self-hosted` is a label, not a requirement
 

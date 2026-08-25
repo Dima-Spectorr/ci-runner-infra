@@ -370,17 +370,22 @@ Five properties, each of which has already failed somewhere on this fleet:
   reserved for the queue is available to anyone — a fork included — willing to
   name a branch after it. Two facts nobody outside the repository can forge are
   required with it: the head branch lives in **this** repository, and the pull
-  request was opened by Mergify. `check-runner-policy.sh` fails this as
-  **RUNNER12**.
+  request was opened by Mergify. `check-runner-policy.sh` used to fail this as
+  **RUNNER12**; that rule retired with Mergify
+  ([#434](https://github.com/Dima-Spectorr/ci-runner-infra/issues/434)), so
+  nothing checks it automatically any more — which is safe only for as long as
+  no repository has a merge-queue route at all.
 - **The two label sets must be disjoint.** GitHub schedules a self-hosted runner
   by *superset*, so a queue arm that carries `<Repo>` *as well as*
   `<Repo>-merge-queue` is dedicated in name only — every ordinary job is
   eligible for the queue's hosts, and the split buys nothing. Covered the other
   way round and the queue cannot be addressed at all. The queue pool carries its
   own label **instead of** the pull-request pool's, never in addition to it.
-  **RUNNER13** here; the controller module asserts the same property across its
-  `pools` table at plan time, because either end alone is a rule the other end
-  drifts away from.
+  **RUNNER13** enforced this over the workflow until it retired with Mergify
+  (#434). The controller module still asserts the same property across its
+  `pools` table at plan time, and is now the only end that does — the pair
+  existed because either end alone is a rule the other end drifts away from,
+  and one end is what is left.
 - **`github.head_ref` is empty on `push`,** so a push to the default branch
   resolves to the pull-request pool. Correct: a push is not a speculative check.
 - **EVERY self-hosted job takes the route, in every workflow file.** This is the
@@ -391,8 +396,12 @@ Five properties, each of which has already failed somewhere on this fleet:
   65-second `generic-binary` job — a *required* check, in the one workflow that
   was not repointed — waited 31m06s on a queue draft, while Mergify displayed
   "waiting for generic-binary", which reads as slow rather than as stuck.
-  **RUNNER14** here, and it is opted into by the route existing anywhere in the
-  repository, so the second workflow cannot quietly stay behind.
+  **RUNNER14** caught this, opted into by the route existing anywhere in the
+  repository, so the second workflow could not quietly stay behind. It retired
+  with Mergify (#434) — the failure it describes needs a merge-queue draft, and
+  nothing creates one now. Restoring a queue pool means restoring the rule with
+  it; the 31m06s above is what the repository gets otherwise, and it reads as a
+  slow check rather than a stuck one.
 
 **Turning the route on is order-dependent, once, per repository.** The commit
 that introduces it cannot be merged *through* the queue: Mergify's speculative

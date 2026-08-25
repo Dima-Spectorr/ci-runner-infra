@@ -54,11 +54,14 @@ posture you opt into knowingly. Read [Windows](#windows) before you declare one.
    it, and a pending permission behaves exactly like one that was never
    granted.
 
-   It needs **`Contents: read`** as well if you are standing up a merge-queue
-   pool (step 8): that is how the controller reads the repository's own
-   `.mergify.yml` to size the pool. This one fails the same quiet way — without
-   it the pool keeps the Terraform ceiling you typed and says nothing, and
-   `ci_queue_config_age_seconds` climbing is the only sign.
+   It needed **`Contents: read`** as well for a merge-queue pool sized from the
+   repository's own `.mergify.yml`. A new repository does not stand one up —
+   there is no Mergify and no queue to size for, so both merge-queue pools are
+   declared at `max_hosts = 0` (step 8). Grant it only if you are working on an
+   existing repository that still carries a sized merge-queue pool, and note
+   that it fails the same quiet way: without it the pool keeps the Terraform
+   ceiling you typed and says nothing, and `ci_queue_config_age_seconds`
+   climbing is the only sign.
 2. **A GCP project, a VPC and a subnet** in the region the pool will run in.
    Hosts get no external IP: egress must already work from that subnet (in the
    MOT projects it is the peering to `mot-lz-vpc` through the central firewall —
@@ -516,12 +519,28 @@ The decision is [`adr-four-pool-controller.md`](adr-four-pool-controller.md);
 the operational detail — the routing contract and the capacity formula — is in
 [`ci-lane-model.md`](ci-lane-model.md).
 
-**Why the merge queue gets its own pool.** Mergify validates a queued pull
-request by re-running the same `pull_request` workflows, against the same
-labels, at exactly the moment the CI pool is busiest with the *next* pull
-requests. Sharing one pool between the two means a pull request that has already
-gone green sits in the queue waiting for a runner — and it does not fail, it
-sits *pending*, which no red check anywhere reports.
+**Why the merge queue got its own pool, and why a new repository should declare
+it at zero.** Mergify validated a queued pull request by re-running the same
+`pull_request` workflows, against the same labels, at exactly the moment the CI
+pool was busiest with the *next* pull requests. Sharing one pool between the two
+meant a pull request that had already gone green sat waiting for a runner — and
+it did not fail, it sat *pending*, which no red check anywhere reports. That
+second run is what the pool was sized for.
+
+**There is no second run any more.** Mergify is gone from all thirteen
+repositories, nothing creates `mergify/merge-queue/<sha>` branches, and the
+merge lane validates **in place** on the pull request's own branch: a branch
+already current with the base merges with no extra run at all, and one whose
+base moved gets exactly one re-run, on its own branch. So the merge-queue pair
+has no workload.
+
+Declare both merge-queue pools with `max_hosts = 0`, for the same reason the
+Windows pair is declared at zero — the shape stays identical across the fleet
+and the row costs nothing. Do **not** size them against a queue that no longer
+exists. Retiring the `merge-queue` role from the module itself is tracked at
+[#274](https://github.com/Dima-Spectorr/ci-runner-infra/issues/274); it needs
+Terraform applies in the consumer repositories, so until it lands the role still
+exists and the sections below still describe it accurately.
 
 **Why the Windows pair is declared even at zero.** `max_hosts = 0` costs a table
 row and nothing else. What it buys is that the shape is identical in every
@@ -575,6 +594,13 @@ wrong one gives you a controller that lists an empty instance group forever and
 reports a perfectly healthy, permanently empty pool. Pass `pool_descriptor`.
 
 ### `mq_max_hosts` is a hard stop, not the size
+
+> **Applies only to a repository that still carries a sized merge-queue pool.**
+> The self-sizing below reads `.mergify.yml`, and there is no such file left in
+> the fleet — so on a current repository the read finds nothing and the pool is
+> whatever `mq_max_hosts` says, which should be `0`. Kept because the code is
+> still live and gated on `role = "merge-queue"`; removing it is
+> [#274](https://github.com/Dima-Spectorr/ci-runner-infra/issues/274).
 
 The merge-queue pool sizes itself. The controller reads `max_parallel_checks`
 out of the repository's own `.mergify.yml`, live, and derives the ceiling:
@@ -642,54 +668,53 @@ Until the installation accepts the write, the sweep runs and publishes
 `ci_queue_stall_sweep_denied` instead of acting — so a fleet that never grants it
 is not broken, just back to needing a human to notice.
 
-## 9. Wire the Mergify nudge
+## 9. Wire the merge lane
 
 Everything above makes CI fast. This is about the gap **after** CI, which no
-amount of pool tuning touches: Mergify is event-driven, and when GitHub's
-`check_run.completed` webhook is missed or late, a fully green pull request sits
-on *"your merge queue conditions are under evaluation"* with an empty queue ahead
-of it. Measured in `ci-runner-infra` on 2026-08-23: **8m55s, 11m06s, 17m24s and
-20m01s**, against 13–14 seconds when Mergify reacts to an event it generated
-itself. It is invisible from every pool metric, because no runner is involved.
+amount of pool tuning touches.
 
-Two files, both required, neither optional:
+Until 2026-08-24 this step wired a *nudge* at Mergify: a `workflow_run` workflow
+that slept and then posted `@mergifyio refresh`, because Mergify learns that CI
+finished over a webhook it sometimes never receives, and a fully green pull
+request would sit on *"your merge queue conditions are under evaluation"* with an
+empty queue ahead of it. Measured here on 2026-08-23: **8m55s, 11m06s, 17m24s and
+20m01s**. Invisible from every pool metric, because no runner is involved.
 
-- a `workflow_run` workflow in the consuming repository that calls
-  `ci-runner-infra`'s published `mergify-nudge.yml`, and
-- a `commands_restrictions.refresh` block in `.mergify.yml` that admits
-  `github-actions[bot]` as a sender — without it Mergify discards every nudge in
-  silence.
+**Do not wire that.** Mergify is gone from all thirteen repositories and the
+nudge went with it — it was a workaround whose own price was a billed runner
+asleep on every CI completion, and the latency underneath it was never fixed.
+The replacement is the **merge lane**: a workflow in the repository itself,
+dispatched by GitHub on `workflow_run` when CI finishes. GitHub does not need to
+be told that CI finished — it finished it — so the merge decision happens in the
+run that observes the green, with no third party in the path. The first pull
+request the lane merged by itself went in **14 seconds** after its last required
+check.
 
-**This applies whatever runs your CI, and it is not optional for any repository
-in the fleet.** The nudge keys off a *completed workflow run*, so it fits any
-repository whose required checks are GitHub Actions jobs — on the fleet pools, on
-GitHub-hosted minutes, or a mix; one workflow or several. A repository that has
-not adopted the pools yet still gets the whole benefit, and needs no pool
-capacity for it: the nudge job runs on `ubuntu-latest` by design, so it never
-takes a warm slot from a real job. The
-copy-in snippets, the defaults, why it posts nothing on a healthy run, and how to
-tell it is being silently filtered:
-[`ci-merge-queue-baseline.md`](ci-merge-queue-baseline.md#the-other-invisible-wait-ci-is-green-and-mergify-has-not-heard-about-it).
+The whole procedure, the copyable caller, the App it needs and the variables
+that arm it: [`merge-lane.md`](merge-lane.md). Three things from it that the
+fleet rollout got wrong on the first pass, and that cost the most:
 
-One property to accept before you wire it: **`workflow_run` is dispatched from
-the default branch only**, so the pull request that adds the nudge cannot run it.
-The first evidence is the first CI completion after the merge — watch that one.
-
-Three things the fleet rollout got wrong on the first pass, all of them cheap to
-get right the first time:
-
-- **List every workflow that produces a required check**, resolved from
-  `.mergify.yml` rather than from memory. The one that gets missed is a fast
-  hosted gate — `CI module drift`, `generic-binary-check` — not the long build,
-  and when it finishes last the nudge is a coin-flip.
-- **Key the concurrency group on the pull request, not on `head_branch`.** Two
-  pull requests from different forks may share a source-branch name, and keyed
-  on it they cancel each other's nudge.
+- **Keep `required-checks:` equal to the branch ruleset, and keep every name in
+  it producible by a workflow here.** The lane does not read the ruleset — that
+  literal list is what it waits for, so adding a required check is two edits. A
+  name in the list that no workflow reports is not a stricter gate, it is a
+  **permanent, invisible block**: GitHub reports `blocked`, the lane logs
+  `skip:missing-required`, and nothing is red, because the check is *absent*
+  rather than failing. Manar merged nothing until somebody diffed the two lists
+  by hand.
+- **If you gate on a label, add `pull_request_target: [labeled,
+  ready_for_review]`.** The label is what arms a pull request and a reviewer
+  applies it once the checks are already green — by then `workflow_run` has
+  fired and nothing else hears the label. See *"A label applied after the
+  green"* in [`merge-lane.md`](merge-lane.md#a-label-applied-after-the-green).
 - **If this repository runs `check-runner-policy.sh`, add the RUNNER7
   declaration.** The gate cannot read a callee in another repository, so it
   refuses the call until a `remote-reusable-allowed(…, #issue)` comment records
-  that a human read it. Snippet in
-  [`ci-merge-queue-baseline.md`](ci-merge-queue-baseline.md#what-a-consuming-repository-adds).
+  that a human read it.
+
+One property to accept before you wire it: **`workflow_run` is dispatched from
+the default branch only**, so the pull request that adds the lane cannot run it.
+The first evidence is the first CI completion after the merge — watch that one.
 
 ## Windows
 
@@ -932,7 +957,7 @@ it as a broken image.
 | a Windows host boots, looks healthy, registers nothing | the image family. A Windows instance carrying the Linux boot key runs no boot script at all; the module refuses the mispairing at plan time, so check the `image` a running pool was applied with |
 | a build fails on a different download each run | container MTU. The hosts set the slot daemon's `mtu` from the primary interface, so this should not recur; a fork that dropped it black-holes large TLS responses and reports them as a truncated handshake or a "not found" dependency, never as a size error |
 | `go clean -modcache` or `uv cache clean` fails with `EACCES` | the warm cache, working as designed — see "Cleaning a warm cache" below |
-| a pull request is green, mergeable, and has not merged for hours | the merge queue stalled, not CI. Mergify dequeued it on a runner failure, or stopped evaluating it — three shapes, two remedies, one of them a comment the controller now posts itself: [`merge-queue-stall-recovery.md`](merge-queue-stall-recovery.md) |
+| a pull request is green, mergeable, and has not merged for hours | the lane, not CI — and it is almost never stuck, it has not been **told**. Read the lane's status issue and the last lane run's log, which names its verdict per pull request. Three shapes account for nearly all of it: `skip:no-label` because the label was applied after CI went green and nothing dispatched the lane (see *"A label applied after the green"* in [`merge-lane.md`](merge-lane.md#a-label-applied-after-the-green)); `skip:missing-required` because a name in `required-checks:` is one no workflow produces, which is a permanent block with nothing red anywhere; or the lane never ran, because `MERGE_LANE_ENABLED` is unset or its `workflow_run` names a CI workflow that has since been renamed. `workflow_dispatch` the lane to settle which |
 | the queue crawls while the merge-queue pool sits idle | a required workflow hardcoding the CI pool's labels, so the queue draft starves behind ordinary pull requests. Audit every required `pull_request` workflow for `runs-on`, not just the main one |
 | `ci_queue_nudges` flat at zero on a repository whose queue visibly stalls | `Pull requests: write` missing or pending acceptance — check `ci_queue_stall_sweep_denied`, then the installation page |
 

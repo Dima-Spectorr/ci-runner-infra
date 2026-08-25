@@ -1,5 +1,25 @@
 # The merge-queue baseline — one CI run per pull request, one pull request per batch
 
+> **HISTORICAL — this document tunes Mergify, and Mergify is gone from all
+> thirteen repositories.**
+>
+> Every knob below (`max_parallel_checks`, `batch_size`, `merge_queue.mode`,
+> `commands_restrictions`) lives in a `.mergify.yml`, and there is no such file
+> left in the fleet. Nothing here is actionable; do not tune against it, and do
+> not add a `.mergify.yml` to get the settings it describes.
+>
+> It is kept, rather than deleted, because it is the **evidence**. The whole
+> argument for the merge lane is in these measurements — the second CI run per
+> merge that the speculative draft cost, the 87-of-122 queue-draft runs that
+> failed at fleet setup steps rather than on the diff, and the green-to-merge
+> latency that a webhook-driven queue could not get under. Deleting the page
+> would leave the decision in [`merge-lane.md`](merge-lane.md) asserting numbers
+> with nothing behind them.
+>
+> **The one thing to carry forward:** *one CI run per pull request* was the goal
+> here and it is now simply true, because the lane validates in place on the
+> pull request's own branch. There is no second run to budget for.
+
 **Revised 2026-08-19: a THIRD dimension, which this document had never named.**
 Everything below was written about two numbers — `max_parallel_checks` (how many
 speculative checks at once) and `batch_size` (how many pull requests share one).
