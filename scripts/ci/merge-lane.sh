@@ -160,8 +160,15 @@ one_pass() {
   # comparison and the merge call would land a head that was verified against
   # a base that no longer exists, and `sha=` would not notice: it pins the
   # head. So the tip is captured here and re-read immediately before acting.
+  # FATAL, NOT "NOTHING TO DO". Every other `return 1` here means the lane
+  # looked and found nothing actionable, and the run is rightly green. This one
+  # means the lane could not look at all — a token without access, a base that
+  # does not exist, a missing `gh` — and a green run saying "0 actions" is
+  # indistinguishable from a healthy quiet day. That is exactly how seven
+  # repositories reported a working lane for a morning while merging nothing.
   if ! base_sha="$(gh api "repos/$R/commits/$LANE_BASE" --jq '.sha' 2>/dev/null)" || [ -z "$base_sha" ]; then
-    echo "lane: cannot read the tip of $LANE_BASE — doing nothing this pass"
+    echo "lane: cannot read the tip of $LANE_BASE — the lane is blind, not idle"
+    LANE_FATAL=1
     return 1
   fi
 
@@ -515,6 +522,8 @@ publish_status_issue() {
 }
 
 acted=0
+# Set by `one_pass` when the lane could not read the world it is meant to judge.
+LANE_FATAL=0
 while [ "$acted" -lt "$MAX_ACTIONS" ]; do
   if one_pass; then
     acted=$((acted + 1))
@@ -534,3 +543,10 @@ publish_step_summary
 publish_status_issue
 
 echo "lane: done, $acted action(s)"
+
+# After the summary and the queue issue, so an operator looking at a red lane
+# still gets whatever the run managed to see.
+if [ "$LANE_FATAL" -ne 0 ]; then
+  echo "lane: failing the run — it could not read $LANE_BASE, so '0 actions' means nothing" >&2
+  exit 1
+fi

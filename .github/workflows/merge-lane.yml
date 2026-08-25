@@ -93,6 +93,13 @@ on:
           sleeps, so it holds a slot for seconds. The label must resolve to a
           LINUX runner: the lane is bash and reads `date -u -d` and `mapfile`,
           neither of which the fleet's Windows pool provides.
+
+
+          ONE LABEL, OR A JSON ARRAY IN A STRING — never a YAML sequence. This
+          is a `type: string` input, so `runs-on: [self-hosted, linux]` in your
+          caller is a parse error and the workflow never starts. Write
+          `runs-on: my-pool-label` for one label, or
+          `runs-on: '["self-hosted", "linux"]'` for several.
         required: false
         default: ubuntu-latest
         type: string
@@ -195,7 +202,12 @@ jobs:
   lane:
     name: Merge lane
     # dynamic-runner-allowed(lane, #402): the label is a workflow_call input, scoped by the calling repository
-    runs-on: ${{ inputs.runs-on }}
+    #
+    # A `type: string` input cannot carry a list, so several labels arrive as a
+    # JSON array inside the string and are decoded here. Without the
+    # `startsWith` guard `fromJSON` would be handed `ubuntu-latest` and fail, so
+    # the common single-label case takes the string through untouched.
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
     timeout-minutes: 15
 
     # THE LOCK, AND THE REASON IT IS NOT A QUEUE.
@@ -244,6 +256,16 @@ jobs:
           repository: ${{ inputs.implementation-repository }}
           ref: ${{ inputs.implementation-ref }}
           persist-credentials: false
+
+      # THE POOL IMAGES DO NOT SHIP `gh`, AND THE LANE IS ALL `gh api`.
+      #
+      # GitHub-hosted images have it, the fleet's self-hosted images do not, and
+      # the driver reads every fact through `gh api ... || true`. So on a pool
+      # host a missing binary read as "no facts available", the lane concluded
+      # there was nothing to merge, and the job went green — seven repositories
+      # reporting a healthy lane that could not have merged anything.
+      - name: Ensure the GitHub CLI
+        run: bash scripts/ci/ensure-gh.sh
 
       - name: Mint the merge App token
         id: token

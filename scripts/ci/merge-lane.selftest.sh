@@ -83,6 +83,24 @@ is_reusable_only() {
 # would never start, and every release and deploy workflow that fires on a push
 # to the default branch would silently stop firing. It does not fail; it quietly
 # does half the job, which is why it needs a test rather than a comment.
+# THE LANE'S ONLY TOOL HAS TO BE THERE BEFORE THE LANE RUNS.
+#
+# `merge-lane.sh` is `gh api` from top to bottom, and it reads every fact with
+# `|| true` because a failed read must never be mistaken for a passing check.
+# That is right for a rate limit and catastrophic for a missing binary: on the
+# fleet's self-hosted images, which do not ship the CLI, every read returned
+# nothing, the lane concluded there was nothing to merge, and the job went
+# green. Ordering matters as much as presence — installing the CLI after the
+# driver has already run is not a fix.
+guarantees_the_cli_it_runs_on() {
+  local code install driver
+  code=$(code_of "$1")
+  matches "$code" 'run: bash scripts/ci/ensure-gh\.sh' || return 1
+  install=$(printf '%s\n' "$code" | grep -n 'ensure-gh\.sh' | head -1 | cut -d: -f1)
+  driver=$(printf '%s\n' "$code" | grep -n 'run: bash scripts/ci/merge-lane\.sh' | head -1 | cut -d: -f1)
+  [ -n "$install" ] && [ -n "$driver" ] && [ "$install" -lt "$driver" ]
+}
+
 acts_as_the_app() {
   local code
   code=$(code_of "$1")
@@ -124,9 +142,20 @@ is_bounded() {
 
 # `${{ }}` is spliced in before the shell parses the line, and this job holds a
 # token that can merge. Everything reaches the shell as an environment variable.
+#
+# Collects every `run:` body rather than everything from the first one to the
+# end of the file. The cheaper version held only while the driver step was last
+# in the job: the moment a step was added above it the range swallowed the
+# following steps' `env:` blocks, where an expression is exactly how a value is
+# supposed to arrive, and the assertion fired on correct code.
 keeps_expressions_out_of_the_shell() {
   local body
-  body=$(sed -n '/^        run: /,$p' "$1")
+  body=$(awk '
+    /^        run:/       { inrun = 1; print; next }
+    inrun && /^ {10,}/    { print; next }
+    inrun && /^[[:space:]]*$/ { print; next }
+                          { inrun = 0 }
+  ' "$1")
   ! matches "$body" '\$\{\{'
 }
 
@@ -287,6 +316,24 @@ reads_the_detail_without_collapsing_an_empty_field() {
 # the same line as a transient 5xx, every fifteen minutes, forever. A
 # fail-closed verdict with no diagnostic is a lane that is stuck and cannot tell
 # anyone; that is how the field-collapse defect stayed hidden.
+# A LANE THAT CANNOT SEE MUST NOT REPORT A QUIET DAY.
+#
+# Every other early return in the driver means "looked, found nothing to do",
+# and green is the honest answer. Failing to read the base tip is the one that
+# is not: it means no pull request was judged at all. This was found in
+# production — `gh` was absent from the fleet's pool images, every `gh api ...
+# || true` returned nothing, and seven repositories reported a healthy lane
+# with `0 action(s)` for a morning while merging nothing. The missing binary is
+# fixed in the workflow; the indistinguishable green is fixed here, because the
+# next cause of a blind lane will not be that one.
+fails_when_it_cannot_read_the_base() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'LANE_FATAL=1' || return 1
+  matches "$code" 'LANE_FATAL.*-ne 0' || return 1
+  matches "$code" 'exit 1'
+}
+
 reports_why_the_comparison_failed() {
   local code
   code=$(code_of "$1")
@@ -476,6 +523,7 @@ check keeps_expressions_out_of_the_shell "$CALLEE" "an expression is interpolate
 check demands_its_gate "$CALLEE" "required-checks is optional, so a consumer can wire a lane that merges on no evidence"
 check delegates_the_decision "$CALLEE" "the callee decides something itself, in YAML, where no pull request can test it"
 check checks_out_its_own_implementation "$CALLEE" "the checkout takes the caller's tree, so every consumer's lane dies looking for a driver that is not there"
+check guarantees_the_cli_it_runs_on "$CALLEE" "the lane assumes gh is installed, which is true of GitHub-hosted images and false of the fleet's pool, where every API read then returns nothing and the run goes green"
 
 check triggers_on_ci_completion "$CALLER" "the caller does not fire on a completed CI run, which is the entire fast path"
 check has_a_backstop_sweep "$CALLER" "there is no sweep, so a pull request needing only an update waits for an event that never comes"
@@ -489,6 +537,7 @@ check reads_both_check_surfaces "$DRIVER" "only one check surface is read, so a 
 check fails_closed_on_empty_configuration "$DRIVER" "empty configuration does not stop the lane"
 check reads_every_page "$DRIVER" "a list endpoint is read unpaginated, so a required check or a whole pull request can be invisible"
 check fails_closed_on_an_unreadable_comparison "$DRIVER" "a failed base comparison reads as up-to-date, which is the one answer that lets a merge through"
+check fails_when_it_cannot_read_the_base "$DRIVER" "a lane that cannot read the base exits green with '0 actions', which is exactly what a healthy quiet day looks like"
 check reads_the_detail_without_collapsing_an_empty_field "$DRIVER" "an unlabelled pull request loses its head sha to field collapsing, so the lane can never act on one"
 check reports_why_the_comparison_failed "$DRIVER" "a base comparison fails closed without logging the cause, so a permanent block looks like a transient one forever"
 check refuses_a_base_that_moved "$DRIVER" "the base tip is not re-checked before acting, so a push to the base merges a head verified against a base that is gone"
@@ -547,6 +596,8 @@ mutate "the checkout reverts to the caller's tree" "$CALLEE" \
   's@^          repository: .*@          fetch-depth: 0@' checks_out_its_own_implementation
 mutate "the implementation ref stops being pinnable" "$CALLEE" \
   's@^          ref: .*inputs.implementation-ref.*@          ref: main@' checks_out_its_own_implementation
+mutate "the CLI install step is dropped" "$CALLEE" \
+  's@^        run: bash scripts/ci/ensure-gh\.sh$@        run: true@' guarantees_the_cli_it_runs_on
 
 mutate "the caller stops listening to CI" "$CALLER" \
   's|^    workflows: \[CI\]|    workflows: [Something Else]|' triggers_on_ci_completion
@@ -565,6 +616,8 @@ mutate "the branch update stops pinning the expected head" "$DRIVER" \
   's|-f expected_head_sha="\$action_sha"|--silent|' merges_only_the_sha_it_verified
 mutate "skipped is folded into success" "$DRIVER" \
   's@^      success) green=@      success | skipped) green=@' treats_a_non_verdict_as_a_failure
+mutate "a blind lane goes back to reporting a quiet day" "$DRIVER" \
+  's|^    LANE_FATAL=1$|    :|' fails_when_it_cannot_read_the_base
 mutate "the commit-status surface is dropped" "$DRIVER" \
   's|commits/\$sha/status|commits/$sha/nothing|' reads_both_check_surfaces
 mutate "the empty-configuration guard is removed" "$DRIVER" \
