@@ -29,6 +29,15 @@ STATUS_ISSUE="${STATUS_ISSUE:-}"
 
 R="$GITHUB_REPOSITORY"
 
+# Somewhere to keep once-per-run markers that survive a SUBSHELL, because the
+# things that want to say something once are all called from inside one. A
+# directory rather than `mktemp` per marker: the marker's meaning is its
+# ABSENCE, and a file that has to be created and then deleted to mean "not yet"
+# is a name another process can win in between.
+LANE_TMP="$(mktemp -d)"
+trap 'rm -rf "$LANE_TMP"' EXIT
+STATUS_WARN_ONCE="$LANE_TMP/status-surface-warned"
+
 # ---------------------------------------------------------------------------
 # THE QUEUE, AS SOMETHING YOU CAN LOOK AT.
 #
@@ -134,12 +143,20 @@ check_counts() {
   # required context that happens to be a legacy status then reads as ABSENT,
   # the lane skips on `missing-required`, and an operator who was not told
   # about the 403 has no way to tell that apart from a renamed job.
+  #
+  # ONCE means a FILE, not a variable. This function is called as
+  # `counts="$(check_counts "$sha")"`, which is a SUBSHELL — an assignment made
+  # here dies with it, so a variable guard is re-armed on every pull request and
+  # says "once" thirty times. Measured on 2026-08-25: the warning printed once
+  # per open pull request on IntegrateIT and on Apigee-Portal, which is the
+  # volume at which an operator learns to scroll past the one line that names
+  # the permission they are missing.
   if ! statuses="$(gh api --paginate "repos/$R/commits/$sha/status?per_page=100" \
     --jq '.statuses[] | {name: .context, state: (if .state == "pending" then "pending" else .state end), at: (.updated_at // "")}' 2>/dev/null)"; then
     statuses=""
-    if [ -z "${STATUS_SURFACE_WARNED:-}" ]; then
+    if [ ! -e "$STATUS_WARN_ONCE" ]; then
+      : >"$STATUS_WARN_ONCE"
       echo "lane: WARNING the commit-status surface is unreadable — grant the merge App 'Commit statuses: read'. Check-runs are still read; a required check that is a legacy commit status will count as MISSING and hold the lane." >&2
-      STATUS_SURFACE_WARNED=1
     fi
   fi
 
@@ -293,6 +310,37 @@ one_pass() {
     labels="${detail_lines[1]}"
     sha="${detail_lines[2]}"
     title="${detail_lines[3]}"
+
+    # THE FIRST READ IS THE REQUEST, NOT THE ANSWER. GitHub computes
+    # mergeability lazily: reading `/pulls/<n>` on a pull request nobody has
+    # asked about recently ENQUEUES the computation and returns `null` in the
+    # same breath. A lane that reads once therefore learns nothing about a stale
+    # pull request — and stale is the normal state of one waiting in a queue.
+    #
+    # Measured on 2026-08-25: a dispatched pass on IntegrateIT and on
+    # Apigee-Portal returned `null` for EVERY open pull request, so the pass did
+    # nothing at all. Left alone that is not merely slow, it is the Mergify
+    # failure this lane exists to end: nothing red, nothing merging, and the
+    # next answer arriving whenever the next trigger happens to fire.
+    #
+    # So ask again, briefly. Bounded on purpose — three reads, two seconds
+    # apart, is the difference between "not computed yet" and "GitHub is having
+    # a bad day", and the second one is still a wait rather than a guess.
+    local mergeable_try=0
+    while [ "$mergeable" = "null" ] && [ "$mergeable_try" -lt 2 ]; do
+      mergeable_try=$((mergeable_try + 1))
+      sleep 2
+      # The re-read is normalised rather than trusted. `gh api` writes the error
+      # BODY to stdout on a non-2xx, so a failed read hands back a JSON document
+      # here, not an empty string — and `true`/`false` are the only two values
+      # downstream is allowed to see as an answer.
+      local reread=''
+      reread="$(gh api "repos/$R/pulls/$num" --jq '.mergeable|tostring' 2>/dev/null)" || reread=''
+      case "$reread" in
+        true | false) mergeable="$reread" ;;
+        *) mergeable=null ;;
+      esac
+    done
 
     local conflict=''
     case "$mergeable" in
