@@ -319,3 +319,59 @@ lane_rank() {
 
   printf '%d:%03d:%08d\n' "$class" "$priority" "$inverted"
 }
+
+# ---------------------------------------------------------------------------
+# lane_pass_expired — has this pass spent its walking budget?
+#
+#   lane_pass_expired <started_epoch> <budget_seconds> <now_epoch>
+#
+# Returns 0 (expired) or 1 (keep going).
+#
+# WHY A PASS NEEDS A BUDGET OF ITS OWN.
+#
+# The lane reads the WHOLE open list on every pass and spends roughly five API
+# calls on each candidate it does not skip early. That cost tracks the size of
+# the repository, not the depth of the queue, and the job it runs in has a
+# `timeout-minutes` ceiling. Measured on `IntegrateIT` on 2026-08-25 with ~35
+# open pull requests: every single pass ran past fifteen minutes and was killed
+# — thirty runs in a row, not one of them reaching the merge call.
+#
+# A killed job is the worst possible way for this to end, and not because of the
+# lost work. **A `timeout-minutes` kill is reported by GitHub as `cancelled`, not
+# as `failure`** — the same conclusion an operator pressing the button produces,
+# and the same one the `concurrency` group produces when it evicts a pending
+# run. So a lane dying of its own weight looks exactly like a lane behaving
+# correctly under load, no annotation is written, no summary is published, and
+# the queue issue keeps whatever it last said. It is invisible by construction.
+#
+# The fix is for the lane to run out of time BEFORE the job does, so that it
+# ends on its own terms: it stops walking, says how much of the list it read,
+# still acts on the best candidate it found, publishes the queue and exits
+# green. A truncated pass is not an error — it is a busy repository — but it
+# must be a truncated pass that SAYS SO.
+#
+# A budget of 0 disables the deadline, for a repository that would rather the
+# job's own ceiling be the only limit. That is the old behaviour, available on
+# purpose, and it is not the default.
+#
+# Everything is validated rather than trusted: a non-numeric budget is a
+# misconfigured input, and the safe reading of one is "no deadline", never "the
+# deadline already passed" — an accidental 0-second budget that expired on the
+# first candidate would make the lane read nothing and merge nothing, silently,
+# which is the failure this function exists to end.
+# ---------------------------------------------------------------------------
+lane_pass_expired() {
+  local started="${1:-}" budget="${2:-}" now="${3:-}"
+
+  [[ "$budget" =~ ^[0-9]+$ ]] || return 1
+  [ "$budget" -gt 0 ] || return 1
+  [[ "$started" =~ ^[0-9]+$ ]] || return 1
+  [[ "$now" =~ ^[0-9]+$ ]] || return 1
+
+  local spent=$((now - started))
+  # A clock that went backwards reads as "no time has passed", never as an
+  # expiry: the runner's clock stepping is not a reason to stop reading.
+  [ "$spent" -ge 0 ] || return 1
+
+  [ "$spent" -ge "$budget" ]
+}
