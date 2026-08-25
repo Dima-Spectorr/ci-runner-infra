@@ -23,8 +23,11 @@
 set -euo pipefail
 
 GH_VERSION="${GH_VERSION:-2.98.0}"
-# `gh_<version>_linux_<arch>.tar.gz` from cli/cli's release assets.
+# `gh_<version>_linux_<arch>.tar.gz` from cli/cli's release assets. Read below
+# by indirect expansion, which shellcheck cannot follow — hence the directive.
+# shellcheck disable=SC2034
 GH_SHA256_amd64="3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de"
+# shellcheck disable=SC2034
 GH_SHA256_arm64="cf689084f3a3618f7eae4a2420d335d74626d65f5e594b9828d125d69f800d86"
 
 if command -v gh >/dev/null 2>&1; then
