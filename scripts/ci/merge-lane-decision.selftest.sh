@@ -60,6 +60,32 @@ expect "wait:pending" "one still running" \
 expect "update:behind" "one commit behind is behind — >0, not some tolerance" \
   0 "$LB" "$LB" 0 3 3 0 0 0 1 "" 1800
 
+# --- strict, and only as strict as the base -----------------------------------
+# The lane must not invent a rule the repository does not have. A base whose
+# required checks are not strict merges a branch that is behind, so updating it
+# would discard a green suite and spend a full CI run to rebuild the same
+# answer — which on a busy repository is a pull request that never converges.
+# Measured on IntegrateIT 2026-08-25: the whole action budget went on updates
+# and nothing merged.
+expect "merge:ready" "green and behind merges when the base is not strict" \
+  0 "$LB" "$LB" 0 3 3 0 0 0 60 "" 1800 0
+expect "update:behind" "green and behind updates when the base IS strict" \
+  0 "$LB" "$LB" 0 3 3 0 0 0 60 "" 1800 1
+# Fail closed, in both of the ways a caller can decline to answer.
+expect "update:behind" "an omitted strict argument is strict — the old signature" \
+  0 "$LB" "$LB" 0 3 3 0 0 0 60 "" 1800
+expect "update:behind" "an empty strict argument is strict, not permissive" \
+  0 "$LB" "$LB" 0 3 3 0 0 0 60 "" 1800 ""
+# Strictness is the LAST question, never a way past a red or a missing check.
+expect "skip:red" "a non-strict base does not merge something red" \
+  0 "$LB" "$LB" 0 3 2 0 1 0 60 "" 1800 0
+expect "skip:missing-required" "a non-strict base does not merge a missing check" \
+  0 "$LB" "$LB" 0 3 2 1 0 0 60 "" 1800 0
+expect "wait:pending" "a non-strict base still waits on a running check" \
+  0 "$LB" "$LB" 0 3 2 0 0 1 60 "" 1800 0
+expect "skip:conflict" "a non-strict base does not merge a conflict" \
+  0 "$LB" "$LB" 1 3 3 0 0 0 60 "" 1800 0
+
 # Invariant B, stated on its own. This is the shape that makes a gate stop
 # gating in silence: nothing is failing, nothing is running, and the checks the
 # lane was told to require simply are not there.

@@ -115,6 +115,24 @@ on:
         required: false
         default: 1800
         type: number
+      require-up-to-date:
+        description: >-
+          Whether a pull request must be up to date with the base before the
+          lane will merge it. `auto`, the default, asks the base branch for its
+          own effective rules and matches them, which is the only answer that
+          cannot drift out of step with the repository. `true` or `false` pin
+          it, for a base whose rules the lane's token cannot read.
+
+          The lane must never be stricter than the branch it merges into. On a
+          base that does not set GitHub's strict required-status-checks policy,
+          updating a branch that is behind throws away a green suite and spends
+          a full CI run to rebuild the same answer -- and on a busy repository
+          the base moves again before that run finishes, so the pull request
+          never converges and the lane spends its whole action budget on
+          updates instead of merges.
+        required: false
+        default: auto
+        type: string
       max-actions:
         description: >-
           How many pull requests one acquisition of the lane may act on. A burst
@@ -319,6 +337,7 @@ jobs:
           REQUIRED_CHECKS: ${{ inputs.required-checks }}
           BUDGET: ${{ inputs.inflight-budget-seconds }}
           MAX_ACTIONS: ${{ inputs.max-actions }}
+          REQUIRE_UP_TO_DATE: ${{ inputs.require-up-to-date }}
           REQUIRE_LABEL: ${{ inputs.require-label }}
           PRIORITY_PREFIX: ${{ inputs.priority-label-prefix }}
           STATUS_ISSUE: ${{ inputs.status-issue }}

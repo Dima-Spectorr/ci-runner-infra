@@ -26,6 +26,11 @@ REQUIRE_LABEL="${REQUIRE_LABEL:-}"
 PRIORITY_PREFIX="${PRIORITY_PREFIX:-merge-lane/priority-}"
 DRY_RUN="${DRY_RUN:-false}"
 STATUS_ISSUE="${STATUS_ISSUE:-}"
+# auto | true | false. `auto` asks the base branch, which is the only answer
+# that cannot drift: a per-repository input is a second copy of a fact GitHub
+# already publishes, and the lane has been bitten once already by two lists that
+# had to be kept equal by hand.
+REQUIRE_UP_TO_DATE="${REQUIRE_UP_TO_DATE:-auto}"
 
 R="$GITHUB_REPOSITORY"
 
@@ -238,6 +243,60 @@ already_released() {
 }
 
 # ---------------------------------------------------------------------------
+# Does this base require a branch to be UP TO DATE before it may merge?
+#
+# Answered once per run from the base's own effective rules, because the lane
+# must not be stricter than the branch it merges into. `update:behind` on a
+# non-strict base discards a green suite and spends a full CI run to rebuild
+# the same answer, and on a busy repository the base moves again before that
+# run lands — so the pull request never converges and the lane burns its whole
+# action budget re-updating branches it was always allowed to merge.
+#
+# FAILS CLOSED. An unreadable answer means strict, which costs a CI run; the
+# other way round asks GitHub for a merge it will refuse.
+# ---------------------------------------------------------------------------
+LANE_STRICT=''
+lane_resolve_strict() {
+  [ -z "$LANE_STRICT" ] || return 0
+
+  case "$REQUIRE_UP_TO_DATE" in
+    true)
+      LANE_STRICT=1
+      echo "lane: up-to-date required (pinned by configuration)"
+      return 0
+      ;;
+    false)
+      LANE_STRICT=0
+      echo "lane: up-to-date NOT required (pinned by configuration)"
+      return 0
+      ;;
+  esac
+
+  # `rules/branches/<branch>` is the EFFECTIVE rule set for the branch — every
+  # ruleset that matches it, already merged — so one call answers the question
+  # no matter how many rulesets the repository has. Classic branch protection
+  # surfaces here too.
+  local strict
+  if ! strict="$(gh api "repos/$R/rules/branches/$LANE_BASE" \
+    --jq '[.[] | select(.type=="required_status_checks")
+             | .parameters.strict_required_status_checks_policy] | any' 2>/dev/null)" \
+    || [ -z "$strict" ]; then
+    LANE_STRICT=1
+    echo "lane: cannot read the rules on $LANE_BASE — assuming up-to-date IS required"
+    return 0
+  fi
+
+  if [ "$strict" = "true" ]; then
+    LANE_STRICT=1
+    echo "lane: $LANE_BASE requires a branch to be up to date — behind means update"
+  else
+    LANE_STRICT=0
+    echo "lane: $LANE_BASE does not require a branch to be up to date — behind still merges"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # One pass: read every candidate, rank them, act on the best one.
 # Returns 0 if it acted, 1 if there was nothing to do.
 # ---------------------------------------------------------------------------
@@ -264,6 +323,8 @@ one_pass() {
     LANE_FATAL=1
     return 1
   fi
+
+  lane_resolve_strict
 
   # Reset here, at the top of the pass, and never once per run. Every pass
   # re-reads the world, so the LAST pass is the only one describing the world as
@@ -443,7 +504,8 @@ one_pass() {
 
     local verdict
     verdict="$(lane_verdict "$isdraft" "$LANE_BASE" "$LANE_BASE" "$conflict" \
-      "${#REQUIRED[@]}" "$green" "$missing" "$failed" "$pending" "$behind" "$age" "$BUDGET")"
+      "${#REQUIRED[@]}" "$green" "$missing" "$failed" "$pending" "$behind" "$age" "$BUDGET" \
+      "$LANE_STRICT")"
 
     echo "lane: #$num $verdict (sha=${sha:0:8} priority=$priority behind=$behind)"
 
