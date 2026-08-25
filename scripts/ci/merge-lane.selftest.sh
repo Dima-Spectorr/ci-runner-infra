@@ -603,7 +603,50 @@ documented_example_survives_the_consumer_gates() {
   grep -qE '^ *# remote-reusable-allowed\(Dima-Spectorr/ci-runner-infra/\.github/workflows/merge-lane\.yml, #' "$doc"
 }
 
+# A required check that SKIPPED is satisfied, and never silently. GitHub's own
+# branch protection counts it that way and so did Mergify, so a lane that reads
+# it as red is stricter than every gate around it — and holds a one-file docs
+# change nothing could have broken, with GitHub itself reporting mergeable. The
+# names are logged, because a job that skipped on a broken `if:` must stay
+# visible; absorbing it is the risk this arm carries.
+counts_a_skipped_requirement_as_passing() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'were_skipped\+=\("\$name"\)' || return 1
+  matches "$code" 'required and SKIPPED, counted as passing' || return 1
+  # `neutral` still is not a pass: a check that ran and declined to judge said
+  # something different from one that never had to run.
+  ! matches "$code" 'neutral \| skipped\)'
+}
+
+# The label gate is the only line in the example whose FAILURE MODE IS SILENCE.
+# `${{ vars.X }}` renders as an empty string when the variable is unset,
+# mistyped, or cleared later by someone tidying settings — and empty means "no
+# label required", so the bare form arms the lane against the whole backlog it
+# was added to hold back, with nothing red anywhere. A consumer copies this
+# example; the example must carry the fallback.
+documented_label_gate_fails_closed() {
+  local doc="$1"
+  grep -qE "require-label: \\\$\{\{ vars\.MERGE_LANE_REQUIRE_LABEL \|\| '[^']+' \}\}" "$doc" || return 1
+  ! grep -qE "require-label: \\\$\{\{ vars\.MERGE_LANE_REQUIRE_LABEL \}\}" "$doc"
+}
+
+# An Actions expression is parsed wherever it appears in the workflow file —
+# INCLUDING inside an input's `description:`, where `vars` is not in scope. The
+# result is "Unrecognized named-value", a startup failure: no jobs, no log, and
+# nothing on the run to read. Measured 2026-08-25: documenting the label gate's
+# fallback inline took every lane run in this repository down for an hour, and
+# it looked like an outage rather than a syntax error. The header carries prose;
+# the copyable line lives in `docs/merge-lane.md`, which is inert.
+declares_its_inputs_without_a_live_expression() {
+  local header
+  header=$(awk '/^jobs:/ { exit } { print }' "$1")
+  ! matches "$header" '\$\{\{'
+}
+
 echo "merge-lane self-test:"
+check declares_its_inputs_without_a_live_expression "$CALLEE" "an input description carries an Actions expression, and one naming vars fails the whole workflow at startup with no jobs and no log to read"
+check documented_label_gate_fails_closed "$DOC" "the documented label gate is wired bare to a variable, so a consumer copying it gets a lane that merges its entire backlog the moment the variable is unset, mistyped or cleared"
 check documented_example_carries_one_pin "$DOC" "the documented example still sets implementation-ref to a sha, so a consumer copying it reintroduces a second pin Dependabot cannot keep in step with the first"
 check documented_example_survives_the_consumer_gates "$DOC" "the documented example is missing the concurrency block or the RUNNER7 declaration, so a consumer who copies it verbatim gets a caller their own vendored gates reject"
 check is_reusable_only "$CALLEE" "the callee has a trigger other than workflow_call, so it can run holding merge authority with no inputs set"
@@ -633,6 +676,7 @@ check fails_closed_on_an_unreadable_check_surface "$DRIVER" "a failed check read
 check says_so_when_the_status_surface_is_unreadable "$DRIVER" "a 403 on the commit-status surface is silent, so a required legacy status reads as missing with nothing naming the cause"
 check asks_again_when_mergeability_is_not_computed_yet "$DRIVER" "the lane reads mergeability once, and the first read is the request rather than the answer, so a stale pull request waits forever"
 check says_it_once_across_subshells "$DRIVER" "the once-guard is a shell variable set inside a subshell, so the warning prints once per pull request instead of once per run"
+check counts_a_skipped_requirement_as_passing "$DRIVER" "a required check that skipped is read as a failure, so any pull request a path filter steers around its jobs is held for ever while GitHub reports it mergeable"
 check fails_when_it_cannot_read_the_base "$DRIVER" "a lane that cannot read the base exits green with '0 actions', which is exactly what a healthy quiet day looks like"
 check reads_the_detail_without_collapsing_an_empty_field "$DRIVER" "an unlabelled pull request loses its head sha to field collapsing, so the lane can never act on one"
 check reports_why_the_comparison_failed "$DRIVER" "a base comparison fails closed without logging the cause, so a permanent block looks like a transient one forever"
@@ -737,6 +781,9 @@ mutate "the status 403 goes quiet again" "$DRIVER" \
 mutate "a check-surface diagnostic goes to stdout, where it is read as the counts" "$DRIVER" \
   's@the lane is blind, not idle" >&2@the lane is blind, not idle"@' \
   fails_closed_on_an_unreadable_check_surface
+mutate "a skipped requirement goes back to counting as red" "$DRIVER" \
+  's@        were_skipped+=("\$name")@        failed=$((failed + 1))@' \
+  counts_a_skipped_requirement_as_passing
 mutate "the once-guard goes back to a variable a subshell throws away" "$DRIVER" \
   's@if \[ ! -e "\$STATUS_WARN_ONCE" \]; then@if [ -z "${STATUS_SURFACE_WARNED:-}" ]; then@' \
   says_it_once_across_subshells
@@ -768,6 +815,10 @@ mutate "the queue is accumulated across passes instead of reset" "$DRIVER" \
 mutate "a queue field goes in raw" "$DRIVER" \
   's@"\$(qf "\$3")"@"\$3"@' never_writes_an_empty_queue_field
 
+mutate "an input description gets an expression written into it again" "$CALLEE" \
+  's@`vars.MERGE_LANE_REQUIRE_LABEL || .ready-to-merge.`, in an expression.@`${{ vars.MERGE_LANE_REQUIRE_LABEL }}`.@' \
+  declares_its_inputs_without_a_live_expression
+
 mutate "status-issue stops reaching the driver" "$CALLEE" \
   's@^          STATUS_ISSUE: .*@          X_UNUSED: 0@' passes_the_status_issue_to_the_driver
 
@@ -775,6 +826,9 @@ mutate "the documented example loses its concurrency block" "$DOC" \
   's@^concurrency:@# concurrency:@' documented_example_survives_the_consumer_gates
 mutate "the documented example loses its RUNNER7 declaration" "$DOC" \
   's@# remote-reusable-allowed@# remote-reusable-was-allowed@' documented_example_survives_the_consumer_gates
+mutate "the documented label gate goes back to the bare variable, which is empty when unset" "$DOC" \
+  "s@require-label: \\\${{ vars.MERGE_LANE_REQUIRE_LABEL || 'ready-to-merge' }}@require-label: \\\${{ vars.MERGE_LANE_REQUIRE_LABEL }}@" \
+  documented_label_gate_fails_closed
 
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane: $FAIL failed, $PASS passed"

@@ -180,18 +180,42 @@ check_counts() {
   fi
 
   local green=0 missing=0 failed=0 pending=0 name state
+  local -a were_skipped=()
   for name in "${REQUIRED[@]}"; do
     state="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n] // "absent"')"
     case "$state" in
       success) green=$((green + 1)) ;;
       pending | queued | in_progress) pending=$((pending + 1)) ;;
       absent) missing=$((missing + 1)) ;;
-      # `neutral` and `skipped` are NOT successes. A required check that skipped
-      # itself — a path filter, a draft gate — produced no verdict on this diff,
-      # and counting it green is how a lane merges something nothing checked.
+      # `skipped` PASSES, because that is what the platform means by it and what
+      # every gate around this one already does. GitHub's own branch protection
+      # counts a skipped required check as satisfied, and so did Mergify — a job
+      # behind a path filter did not run because the diff did not reach it.
+      #
+      # Treating it as a failure was this lane's first position, and it was
+      # wrong in a way only the fleet could show: measured 2026-08-25, a pull
+      # request touching one Markdown file skipped `Web production build` on
+      # Apigee-Portal and BOTH required jobs on CarListPrice, so the lane held
+      # two repositories on a change nothing could have broken while GitHub
+      # itself said mergeable. Nothing red, nothing merging — the Mergify
+      # failure this lane exists to end, rebuilt from the other side.
+      #
+      # It is never silent. The names are printed with the verdict, so a job
+      # that skipped because someone broke its `if:` is visible rather than
+      # absorbed — that is the risk this arm carries, and the log is its price.
+      skipped)
+        green=$((green + 1))
+        were_skipped+=("$name")
+        ;;
+      # `neutral` is NOT a pass. A check that ran and declined to judge has said
+      # something different from one that never needed to run.
       *) failed=$((failed + 1)) ;;
     esac
   done
+  if [ "${#were_skipped[@]}" -gt 0 ]; then
+    echo "lane: $sha — required and SKIPPED, counted as passing: $(
+      IFS=', '; echo "${were_skipped[*]}")" >&2
+  fi
   echo "$green $missing $failed $pending"
 }
 
