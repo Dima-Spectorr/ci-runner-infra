@@ -282,6 +282,40 @@ reads_every_page() {
   matches "$code" 'gh api --paginate "repos/\$R/pulls\?state=open'
 }
 
+# `gh api` PRINTS THE ERROR BODY TO STDOUT, so `|| true` on a check read does
+# not yield "no checks" — it yields one nameless JSON object mixed into the
+# stream. `map({(.name): .state})` then dies on a null key, the aggregation
+# comes back EMPTY, and every required check resolves to the empty string,
+# which the classifier's `*)` arm counts as FAILED. Measured live 2026-08-25:
+# two `success` check-runs reported as `skip:red failed=2` across six
+# repositories, because the App lacked `Commit statuses: read`.
+#
+# Three properties, and the check needs all of them: the check-run read keeps
+# its exit status, the aggregation drops anything without a string name, and an
+# empty aggregation is fatal rather than fed to the classifier.
+fails_closed_on_an_unreadable_check_surface() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'if ! runs="\$\(gh api --paginate "repos/\$R/commits/\$sha/check-runs' || return 1
+  matches "$code" 'select\(type == "object" and \(\.name \| type\) == "string"\)' || return 1
+  matches "$code" 'did not aggregate — the lane is blind, not idle" >&2' || return 1
+  # And the diagnostics stay off stdout: this function's stdout is its return
+  # value, so a log line written there is read as the counts.
+  matches "$code" 'cannot read the check-runs of \$sha — the lane is blind, not idle" >&2'
+}
+
+# The other half of the same 403: the status surface being unreadable is NOT a
+# reason to stop merging on the check-runs that are readable, but it is a reason
+# to say so. Without the warning, a required context that is a legacy commit
+# status reads as ABSENT and is indistinguishable from a renamed job.
+says_so_when_the_status_surface_is_unreadable() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'if ! statuses="\$\(gh api --paginate' || return 1
+  matches "$code" "Commit statuses: read" || return 1
+  matches "$code" 'hold the lane\." >&2'
+}
+
 # `behind_by` is the only fact that makes this a queue. A failed comparison must
 # not read as zero: zero means "current with the base", which is precisely the
 # answer that lets a merge through on evidence the lane never gathered.
@@ -562,6 +596,8 @@ check reads_both_check_surfaces "$DRIVER" "only one check surface is read, so a 
 check fails_closed_on_empty_configuration "$DRIVER" "empty configuration does not stop the lane"
 check reads_every_page "$DRIVER" "a list endpoint is read unpaginated, so a required check or a whole pull request can be invisible"
 check fails_closed_on_an_unreadable_comparison "$DRIVER" "a failed base comparison reads as up-to-date, which is the one answer that lets a merge through"
+check fails_closed_on_an_unreadable_check_surface "$DRIVER" "a failed check read is swallowed into the stream as a nameless object, and every required check on a green pull request then counts as FAILED"
+check says_so_when_the_status_surface_is_unreadable "$DRIVER" "a 403 on the commit-status surface is silent, so a required legacy status reads as missing with nothing naming the cause"
 check fails_when_it_cannot_read_the_base "$DRIVER" "a lane that cannot read the base exits green with '0 actions', which is exactly what a healthy quiet day looks like"
 check reads_the_detail_without_collapsing_an_empty_field "$DRIVER" "an unlabelled pull request loses its head sha to field collapsing, so the lane can never act on one"
 check reports_why_the_comparison_failed "$DRIVER" "a base comparison fails closed without logging the cause, so a permanent block looks like a transient one forever"
@@ -653,6 +689,19 @@ mutate "the pull request list stops paginating" "$DRIVER" \
   's@gh api --paginate "repos/\$R/pulls?state=open@gh api "repos/$R/pulls?state=open@' reads_every_page
 mutate "an unreadable comparison falls back to up-to-date" "$DRIVER" \
   's@^    if ! behind=@    behind=0; if false; behind=@' fails_closed_on_an_unreadable_comparison
+
+mutate "the check-run read swallows its exit status again" "$DRIVER" \
+  's@if ! runs="\$(gh api --paginate "repos/\$R/commits/\$sha/check-runs@if false; runs="$(gh api --paginate "repos/$R/commits/$sha/check-runs@' \
+  fails_closed_on_an_unreadable_check_surface
+mutate "the aggregation stops filtering nameless objects" "$DRIVER" \
+  's@select(type == "object" and (.name | type) == "string")@select(true)@' \
+  fails_closed_on_an_unreadable_check_surface
+mutate "the status 403 goes quiet again" "$DRIVER" \
+  's@if ! statuses="\$(gh api --paginate@if false; statuses="$(gh api --paginate@' \
+  says_so_when_the_status_surface_is_unreadable
+mutate "a check-surface diagnostic goes to stdout, where it is read as the counts" "$DRIVER" \
+  's@the lane is blind, not idle" >&2@the lane is blind, not idle"@' \
+  fails_closed_on_an_unreadable_check_surface
 
 mutate "the detail read goes back to a tab split" "$DRIVER" \
   's@^    mapfile -t detail_lines@    IFS=$'"'"'\\t'"'"' read -r mergeable labels sha; mapfile -t detail_lines@' \
