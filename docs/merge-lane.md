@@ -459,6 +459,40 @@ hand (see the phantom required check, above).
 If you *want* linear history, set the policy on the branch. The lane will see
 it and go back to updating.
 
+#### What a non-strict base also buys: a pass that finishes
+
+The same answer changes how much work a pass has to do, and on a large backlog
+that is the difference between draining and stalling.
+
+The lane normally acts on **one** candidate and then reads the entire world
+again, because a merge moves the base and every `behind_by` it computed a moment
+ago is now stale. With `max-actions: 4` that is five full walks of the open pull
+request list per run. On a repository with ~86 open candidates each walk is
+minutes, the run hits `timeout-minutes: 15` part-way through, and the
+`concurrency` group cancels whatever queued behind it — a lane that looks dead
+while every individual verdict in its log is correct.
+
+On a base that does **not** require a branch to be up to date, the re-walk buys
+nothing:
+
+- a merge cannot make another pull request's required checks less green — they
+  were reported against *its* head, which the merge did not touch;
+- being behind is not a condition the repository imposes, so a moved base
+  changes no verdict;
+- the one thing a merge *can* change is whether another branch still applies
+  cleanly, and the merge API refuses that itself with a `405`.
+
+So on a non-strict base the lane spends its whole `max-actions` budget from a
+single reading of the ranking, stopping the moment GitHub refuses anything —
+that refusal is the signal the world moved, and the next pass reads the world it
+moved to. On a strict base the behaviour is unchanged: one action, then re-read.
+
+For the same reason the lane **skips the `behind_by` comparison entirely** when
+the base is non-strict — one API call per pull request per pass that no verdict
+consults. The queue table then shows `n/a` in the *behind* column rather than
+`0`, because "not asked" and "up to date" are different facts and the table is
+what an operator reads to decide whether the lane is working.
+
 ### The pool images do not ship `gh`
 
 GitHub-hosted images carry the CLI; the fleet's self-hosted images do not. That

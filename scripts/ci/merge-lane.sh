@@ -355,7 +355,7 @@ one_pass() {
     return 1
   fi
 
-  local best_key='' best_line=''
+  local candidates=()
   local num sha draft
 
   while IFS=$'\t' read -r num sha draft; do
@@ -471,17 +471,34 @@ one_pass() {
     # an hour went into suspecting App permissions that were correct all along.
     # So the error goes to the log. It is a `gh` diagnostic (status, URL,
     # message), never a body the lane authenticates with.
-    local cmp_err
-    cmp_err="$(mktemp)"
-    if ! behind="$(gh api "repos/$R/compare/$LANE_BASE...$sha" --jq '.behind_by' 2>"$cmp_err")" \
-      || [[ ! "$behind" =~ ^[0-9]+$ ]]; then
-      echo "lane: #$num wait:base-comparison-unreadable — not assuming it is current"
-      echo "lane: #$num compare said: $(tr '\n' ' ' <"$cmp_err" | cut -c1-400)"
+    #
+    # AND IT IS ONLY ASKED WHEN THE BASE MAKES IT MATTER. This is one API call
+    # per pull request per pass, and on a base that does not require a branch to
+    # be up to date the answer changes no verdict — it would survive only as a
+    # column in the queue table. On the repository this lane was built for that
+    # is ~86 calls a pass and five passes a run, which is most of the difference
+    # between a pass that finishes inside `timeout-minutes` and one that is
+    # killed at 15 minutes having merged nothing. The column says `n/a` rather
+    # than `0`, because "not asked" and "up to date" are different facts and the
+    # table is what an operator reads to decide the lane is working.
+    local behind_cell
+    if [ "$LANE_STRICT" = "0" ]; then
+      behind=0
+      behind_cell='n/a'
+    else
+      local cmp_err
+      cmp_err="$(mktemp)"
+      if ! behind="$(gh api "repos/$R/compare/$LANE_BASE...$sha" --jq '.behind_by' 2>"$cmp_err")" \
+        || [[ ! "$behind" =~ ^[0-9]+$ ]]; then
+        echo "lane: #$num wait:base-comparison-unreadable — not assuming it is current"
+        echo "lane: #$num compare said: $(tr '\n' ' ' <"$cmp_err" | cut -c1-400)"
+        rm -f "$cmp_err"
+        queue_row 8 "$num" "$title" wait:base-comparison-unreadable "$priority" '' ''
+        continue
+      fi
       rm -f "$cmp_err"
-      queue_row 8 "$num" "$title" wait:base-comparison-unreadable "$priority" '' ''
-      continue
+      behind_cell="$behind"
     fi
-    rm -f "$cmp_err"
 
     # The in-flight clock, and the only one available without storing state:
     # when this head commit was written. `lane_verdict` only allows it to expire
@@ -507,7 +524,7 @@ one_pass() {
       "${#REQUIRED[@]}" "$green" "$missing" "$failed" "$pending" "$behind" "$age" "$BUDGET" \
       "$LANE_STRICT")"
 
-    echo "lane: #$num $verdict (sha=${sha:0:8} priority=$priority behind=$behind)"
+    echo "lane: #$num $verdict (sha=${sha:0:8} priority=$priority behind=$behind_cell)"
 
     # Ranked exactly as the lane ranks it when it is actionable, and parked
     # behind everything actionable when it is not — so the top row is always the
@@ -515,10 +532,10 @@ one_pass() {
     # order rather than a list.
     if lane_admits "$verdict"; then
       queue_row "$(lane_rank "$verdict" "$priority" "${age:-0}")" \
-        "$num" "$title" "$verdict" "$priority" "$behind" "$green/${#REQUIRED[@]}"
+        "$num" "$title" "$verdict" "$priority" "$behind_cell" "$green/${#REQUIRED[@]}"
     else
       queue_row "8:$(printf '%03d' "$priority"):$(printf '%08d' "$num")" \
-        "$num" "$title" "$verdict" "$priority" "$behind" "$green/${#REQUIRED[@]}"
+        "$num" "$title" "$verdict" "$priority" "$behind_cell" "$green/${#REQUIRED[@]}"
     fi
 
     # A release is a one-shot, not a state the lane keeps re-announcing. The
@@ -537,20 +554,22 @@ one_pass() {
     if lane_admits "$verdict"; then
       local key
       key="$(lane_rank "$verdict" "$priority" "${age:-0}")"
-      if [ -z "$best_key" ] || [[ "$key" < "$best_key" ]]; then
-        best_key="$key"
-        best_line="$num	$sha	$verdict"
-      fi
+      candidates+=("$key	$num	$sha	$verdict")
     fi
   done <<<"$prs"
 
-  if [ -z "$best_line" ]; then
+  if [ "${#candidates[@]}" -eq 0 ]; then
     echo "lane: nothing actionable this pass"
     return 1
   fi
 
+  # Ranked once, and the whole ranking is kept rather than only its head — see
+  # the batch below for why the lane sometimes wants more than the first row.
+  local ranked
+  ranked="$(printf '%s\n' "${candidates[@]}" | LC_ALL=C sort)"
+
   local action_num action_sha action_verdict
-  IFS=$'\t' read -r action_num action_sha action_verdict <<<"$best_line"
+  IFS=$'\t' read -r _ action_num action_sha action_verdict <<<"$(head -n1 <<<"$ranked")"
 
   if [ "$DRY_RUN" = "true" ]; then
     echo "::notice::dry-run — would take '$action_verdict' on #$action_num"
@@ -567,6 +586,61 @@ one_pass() {
     echo "::warning::$LANE_BASE moved while this pass was reading (${base_sha:0:8} → ${base_now:0:8}) — nothing acted on, re-reading."
     return 1
   fi
+
+  # HOW MANY OF THE RANKING THIS PASS MAY ACT ON.
+  #
+  # One, normally, and then the whole world is read again — because a merge
+  # moves the base, and on a base that requires a branch to be up to date that
+  # invalidates every `behind_by` this pass computed. Re-reading is the only
+  # honest thing to do there.
+  #
+  # On a base that does NOT require it, that reasoning does not apply and the
+  # cost is severe. A merge cannot make another pull request's required checks
+  # any less green — they were reported against ITS head, which nothing here
+  # touched — and being behind is not a condition GitHub imposes. The only thing
+  # a merge can change is whether a branch still applies cleanly, and the merge
+  # API refuses that itself with a 405, which lands in the refusal path below
+  # and stops the batch. So the re-walk buys nothing and costs a full walk of
+  # the open list: on IntegrateIT that is ~5 walks of ~86 pull requests per run,
+  # 14m34s against `timeout-minutes: 15`, which is why passes were being killed
+  # mid-drain and the queue never emptied.
+  #
+  # Only merges batch. A `drop` is a comment the lane owes anyway, but an
+  # `update` starts a CI run whose result the next candidate might depend on,
+  # and a strict base is the only place updates occur — so anything that is not
+  # a merge ends the batch and the world is re-read.
+  #
+  # Spelled as an `if` rather than the terser `[ … ] && batch=…` used elsewhere
+  # in this file. Under `set -e` that form is only survivable because `one_pass`
+  # is always called as the condition of an `if`, which suppresses errexit for
+  # the whole call; a future caller that runs it as a plain statement would turn
+  # every strict-base pass into a silent exit.
+  local batch=1
+  if [ "$LANE_STRICT" = "0" ] && [ "$MAX_ACTIONS" -gt "$acted" ]; then
+    batch=$((MAX_ACTIONS - acted))
+  fi
+
+  PASS_ACTED=0
+  while IFS=$'\t' read -r _ action_num action_sha action_verdict; do
+    [ -n "$action_num" ] || continue
+    [ "$PASS_ACTED" -lt "$batch" ] || break
+    if [ "$PASS_ACTED" -gt 0 ] && [ "${action_verdict%%:*}" != "merge" ]; then
+      break
+    fi
+    lane_take_action "$action_num" "$action_sha" "$action_verdict" || break
+    PASS_ACTED=$((PASS_ACTED + 1))
+  done <<<"$ranked"
+
+  [ "$PASS_ACTED" -gt 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Take one action. 0 if it landed, 1 if GitHub refused it — a refusal is never
+# retried in place, because the reason for it is always that the world moved,
+# and the next pass is where the lane looks at the world it moved to.
+# ---------------------------------------------------------------------------
+lane_take_action() {
+  local action_num="$1" action_sha="$2" action_verdict="$3"
 
   case "${action_verdict%%:*}" in
     merge)
@@ -708,11 +782,14 @@ publish_status_issue() {
 }
 
 acted=0
+# How many actions the pass that just ran took. Normally one; more when the base
+# lets a pass drain several without having to re-read the world between them.
+PASS_ACTED=0
 # Set by `one_pass` when the lane could not read the world it is meant to judge.
 LANE_FATAL=0
 while [ "$acted" -lt "$MAX_ACTIONS" ]; do
   if one_pass; then
-    acted=$((acted + 1))
+    acted=$((acted + PASS_ACTED))
     # The world changed: a merge just moved the base, so everything else is now
     # one commit behind and has to be re-read rather than judged on the facts
     # gathered before it.
