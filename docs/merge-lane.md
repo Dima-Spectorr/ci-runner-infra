@@ -203,7 +203,7 @@ jobs:
     # supplies — and points at the issue where that reading lives. Open one;
     # the gate rejects a marker without an issue number, on purpose.
     # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml, #<issue>): read and recorded there
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@91c554b659cf5a6f3232d421769a0336cc75f662 # v5.56.0
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@f1008a77684b855f2d6af8f93e24dc64ec011938 # v5.59.0
     permissions:
       contents: read
     with:
