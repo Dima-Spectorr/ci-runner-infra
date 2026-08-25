@@ -118,6 +118,7 @@ permissions:
 jobs:
   reap:
     name: Branch reaper
+    # dynamic-runner-allowed(reap, #415): the label is a workflow_call input, scoped by the calling repository
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 15
     # Serialised for the same reason the lane is: two runs deleting from the
