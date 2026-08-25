@@ -34,6 +34,11 @@ fn() { sed -n "/^$1() {/,/^}/p" "$CTRL"; }
 # run_fn <function> <call> [pre-set globals...]
 # Runs the extracted function under set -u with stubbed side effects, and
 # reports ok / the shell's own error. An unbound variable surfaces verbatim.
+#
+# zone_of_uri comes along unconditionally. It is a leaf — no globals, no I/O —
+# and four of the functions extracted here call it, so leaving it out turns a
+# behavioural assertion into `command not found` and the harness reports the
+# helper's absence as the tested function's failure.
 run_fn() {
   local name="$1" call="$2"; shift 2
   local out
@@ -41,6 +46,7 @@ run_fn() {
     bash -c "
       set -uo pipefail
       $(printf '%s\n' "$@")
+      $(fn zone_of_uri)
       $(fn "$name")
       $call >/dev/null 2>&1 || true
     " 2>&1
@@ -184,8 +190,50 @@ check "host row: the tab-separated shape really did shift" \
   "$(row "$(printf 'h1\t\ttpl-a\thttps://x/zones/z/instances/h1')" "$(printf '\t')")"
 
 # shellcheck disable=SC2016
-grep -q 'format="csv\[no-heading\](instance.basename(),instanceStatus,' "$CTRL" && r=yes || r=no
-check "host row: collect_hosts asks gcloud for CSV" yes "$r"
+grep -q 'format="csv\[no-heading\](name,instanceStatus,version.instanceTemplate.basename(),instance.uri())"' "$CTRL" \
+  && r=yes || r=no
+check "host row: collect_hosts asks gcloud for CSV, and for the URI as a URI" yes "$r"
+
+# ── the transform that is attached to the key, not to the column ─────────────
+#
+# This projection used to read `(instance.basename(),instanceStatus,...,instance)`.
+# gcloud attaches a transform to the KEY, so naming `instance` twice applied the
+# basename to BOTH columns and the self-link arrived as the host's short name.
+# Nothing downstream noticed: `${uri%/instances/*}` had nothing to strip, so the
+# derived "zone" was the host name, every per-instance call failed on it, and the
+# pin-hold gate reported `read-failed` — which vetoes. Both IntegrateIT pools sat
+# undeletable on a stale template for two days behind that one word.
+#
+# Asserted as an ABSENCE because that is the shape of the mistake: the projection
+# is wrong only in combination, and a reader checking the fourth column alone
+# would call the old string correct. Scoped to `--format=` lines, because the
+# comment above collect_hosts quotes the broken projection on purpose and a bare
+# grep for the token would fail on the explanation of the bug.
+r=$(grep -E '^[^#]*--format=' "$CTRL" | grep -c 'instance\.basename()')
+check "host row: no basename transform shares the key with the self-link" 0 "$r"
+
+# Every zone derivation goes through zone_of_uri, which returns EMPTY for a
+# string that is not a self-link. The inline `${uri%/instances/*}` it replaced
+# returned the input unchanged instead — non-empty, so it passed the `[ -z ]`
+# guard each call site already had, and the wrong answer looked like a right one.
+# shellcheck disable=SC2016
+r=$(grep -c 'zone=$(zone_of_uri "$uri")' "$CTRL")
+check "host row: all four zone derivations go through zone_of_uri" 4 "$r"
+# ONE, and it is zone_of_uri's own body. A second is a call site that went back
+# to doing it by hand, which is the regression this whole section is about.
+# shellcheck disable=SC2016
+r=$(grep -c 'zone=${uri%/instances/\*}' "$CTRL")
+check "host row: the inline derivation survives in exactly one place" 1 "$r"
+
+# And the rule itself, run rather than grepped: a bare host name must not be
+# able to present itself as a zone.
+eval "$(fn zone_of_uri)"
+check "zone_of_uri: a real self-link yields the zone" "test-zone-a" \
+  "$(zone_of_uri 'https://www.googleapis.com/compute/v1/projects/p/zones/test-zone-a/instances/h1')"
+check "zone_of_uri: a bare host name yields nothing" "" "$(zone_of_uri 'ci-runner-host-abcd')"
+check "zone_of_uri: an empty string yields nothing" "" "$(zone_of_uri '')"
+check "zone_of_uri: a zone URI with no instance yields nothing" "" \
+  "$(zone_of_uri 'https://www.googleapis.com/compute/v1/projects/p/zones/test-zone-a')"
 r=$(grep -c 'while IFS=, read -r host status host_tpl host_uri' "$CTRL")
 check "host row: both host walks split on the comma" 2 "$r"
 # Three since classify_pinned() landed: the drain walk, the orphan reaper, and
@@ -314,6 +362,10 @@ reg_seq() { # <reg> <age> <pre> <status> [busy] [add-rc] [del-rc] [mutation-sed]
           *) return $drc ;;
         esac
       }
+      # A leaf helper with no globals and no I/O, called by all three of the
+      # functions below. Left out, every assertion in this section reports the
+      # helper's absence as the tested function's failure.
+      $(fn zone_of_uri)
       $(fn write_registration_token)
       $(fn delete_registration_token)
       $facts
