@@ -265,6 +265,34 @@ fails_closed_on_an_unreadable_comparison() {
   ! matches "$code" '\|\| behind=0'
 }
 
+# AN UNLABELLED PULL REQUEST IS THE ORDINARY CASE.
+#
+# `@tsv` piped into `IFS=$'\t' read -r a b c` looks exact and is not: tab is IFS
+# *whitespace*, so bash collapses the two adjacent tabs an empty `labels` field
+# produces, the head sha lands in `labels`, and `sha` comes out EMPTY. Every
+# later call then addresses `.../compare/main...` and the lane can act on no
+# unlabelled pull request, ever. Seen live on the first dry run, where it
+# presented as `wait:base-comparison-unreadable` and read as a transient.
+reads_the_detail_without_collapsing_an_empty_field() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'mapfile -t detail_lines' || return 1
+  matches "$code" '\$\{#detail_lines\[@\]\}" -ne 3' || return 1
+  ! matches "$code" 'read -r mergeable labels sha'
+}
+
+# ...and it must say WHY. A permanent cause — a missing App permission, or the
+# field-collapse defect above building a URL with no sha in it — emits exactly
+# the same line as a transient 5xx, every fifteen minutes, forever. A
+# fail-closed verdict with no diagnostic is a lane that is stuck and cannot tell
+# anyone; that is how the field-collapse defect stayed hidden.
+reports_why_the_comparison_failed() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '2>"\$cmp_err"' || return 1
+  matches "$code" 'compare said:'
+}
+
 # `sha=` pins the head; nothing in the merge API pins the base. A push to the
 # base between the comparison and the merge lands a head verified against a
 # base that no longer exists, and the concurrency group does not help — it
@@ -343,6 +371,8 @@ check reads_both_check_surfaces "$DRIVER" "only one check surface is read, so a 
 check fails_closed_on_empty_configuration "$DRIVER" "empty configuration does not stop the lane"
 check reads_every_page "$DRIVER" "a list endpoint is read unpaginated, so a required check or a whole pull request can be invisible"
 check fails_closed_on_an_unreadable_comparison "$DRIVER" "a failed base comparison reads as up-to-date, which is the one answer that lets a merge through"
+check reads_the_detail_without_collapsing_an_empty_field "$DRIVER" "an unlabelled pull request loses its head sha to field collapsing, so the lane can never act on one"
+check reports_why_the_comparison_failed "$DRIVER" "a base comparison fails closed without logging the cause, so a permanent block looks like a transient one forever"
 check refuses_a_base_that_moved "$DRIVER" "the base tip is not re-checked before acting, so a push to the base merges a head verified against a base that is gone"
 check announces_a_release_once "$DRIVER" "a release is not recorded per sha, so the lane re-comments on every pass and every sweep"
 
@@ -419,6 +449,13 @@ mutate "the pull request list stops paginating" "$DRIVER" \
   's@gh api --paginate "repos/\$R/pulls?state=open@gh api "repos/$R/pulls?state=open@' reads_every_page
 mutate "an unreadable comparison falls back to up-to-date" "$DRIVER" \
   's@^    if ! behind=@    behind=0; if false; behind=@' fails_closed_on_an_unreadable_comparison
+
+mutate "the detail read goes back to a tab split" "$DRIVER" \
+  's@^    mapfile -t detail_lines@    IFS=$'"'"'\\t'"'"' read -r mergeable labels sha; mapfile -t detail_lines@' \
+  reads_the_detail_without_collapsing_an_empty_field
+
+mutate "the comparison error is swallowed again" "$DRIVER" \
+  's@2>"\$cmp_err"@2>/dev/null@' reports_why_the_comparison_failed
 mutate "the moved-base guard is removed" "$DRIVER" \
   's@\[ "\$base_now" != "\$base_sha" \]@false@' refuses_a_base_that_moved
 mutate "the release stops being recorded per sha" "$DRIVER" \

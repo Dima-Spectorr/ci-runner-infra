@@ -135,26 +135,57 @@ one_pass() {
   # read would make every candidate after the first page permanently invisible
   # — and drafts and red ones, which the lane can never clear, are exactly what
   # would sit on that page holding a green one out of sight forever.
+  #
+  # THREE FIELDS, NONE OF WHICH CAN BE EMPTY, AND THAT IS THE POINT.
+  #
+  # Tab is IFS whitespace, so `read` collapses a run of them and an empty field
+  # silently shifts every field after it left. `.number` and `.head.sha` are
+  # always present and `.draft|tostring` is always `true` or `false`, so this
+  # split cannot slide. `mergeable_state` used to be read here as a fourth
+  # field and is not — it is unused, it CAN be empty, and carrying an
+  # empty-able field through a tab split is the defect this comment exists to
+  # stop coming back.
   prs="$(gh api --paginate "repos/$R/pulls?state=open&base=$LANE_BASE&per_page=100" \
-    --jq '.[] | [.number, .head.sha, (.draft|tostring), (.mergeable_state // "")] | @tsv')"
+    --jq '.[] | [.number, .head.sha, (.draft|tostring)] | @tsv')"
   if [ -z "$prs" ]; then
     echo "lane: no open pull requests on $LANE_BASE"
     return 1
   fi
 
   local best_key='' best_line=''
-  local num sha draft _state
+  local num sha draft
 
-  while IFS=$'\t' read -r num sha draft _state; do
+  while IFS=$'\t' read -r num sha draft; do
     [ -n "$num" ] || continue
 
     # `mergeable` is computed asynchronously and is null until GitHub has done
     # it, which is why the list call above is not enough — the list does not
     # carry it at all. Read per pull request, and let null stay null: the
     # decision treats it as a wait, not as a guess in either direction.
-    local detail mergeable labels behind age headdate
-    detail="$(gh api "repos/$R/pulls/$num" --jq '[(.mergeable|tostring), (.labels|map(.name)|join(",")), .head.sha] | @tsv')"
-    IFS=$'\t' read -r mergeable labels sha <<<"$detail"
+    #
+    # ONE FIELD PER LINE, NOT `@tsv` INTO `read`.
+    #
+    # `labels` is empty for an unlabelled pull request, which is the ORDINARY
+    # case, and tab is IFS *whitespace* — so `IFS=$'\t' read -r a b c` collapses
+    # the run of two tabs into one delimiter, slides the head sha into `labels`
+    # and leaves `sha` EMPTY. Every call below then addresses
+    # `repos/<repo>/compare/main...` and `.../commits/`, and the lane can never
+    # act on any pull request that has no label.
+    #
+    # This is exactly what the first live dry run did, and it presented as
+    # `wait:base-comparison-unreadable` — a verdict that reads as a transient
+    # API problem. `mapfile` splits on newlines only and keeps empty lines, so
+    # the field count is checked rather than inferred.
+    local detail_lines=() mergeable labels behind age headdate
+    mapfile -t detail_lines < <(gh api "repos/$R/pulls/$num" \
+      --jq '(.mergeable|tostring), (.labels|map(.name)|join(",")), .head.sha')
+    if [ "${#detail_lines[@]}" -ne 3 ]; then
+      echo "lane: #$num wait:detail-unreadable — the pull request read returned ${#detail_lines[@]} field(s), not 3"
+      continue
+    fi
+    mergeable="${detail_lines[0]}"
+    labels="${detail_lines[1]}"
+    sha="${detail_lines[2]}"
 
     local conflict=''
     case "$mergeable" in
@@ -188,11 +219,27 @@ one_pass() {
     # call does not save us here: it pins the head, and being behind is a fact
     # about the BASE. An unreadable comparison means the lane does not know, so
     # it does nothing this pass and looks again on the next one.
-    if ! behind="$(gh api "repos/$R/compare/$LANE_BASE...$sha" --jq '.behind_by' 2>/dev/null)" \
+    # FAILING CLOSED SILENTLY IS ITS OWN BUG.
+    #
+    # `wait:base-comparison-unreadable` is the right verdict for a transient
+    # 5xx, for a missing App permission, and for a bug in this script that
+    # builds a nonsense URL. On a schedule those are indistinguishable: the lane
+    # prints the same line every fifteen minutes forever and nothing ever says
+    # which one it is. That is not hypothetical — the field-collapse defect
+    # described above hid behind this exact line on the first live dry run, and
+    # an hour went into suspecting App permissions that were correct all along.
+    # So the error goes to the log. It is a `gh` diagnostic (status, URL,
+    # message), never a body the lane authenticates with.
+    local cmp_err
+    cmp_err="$(mktemp)"
+    if ! behind="$(gh api "repos/$R/compare/$LANE_BASE...$sha" --jq '.behind_by' 2>"$cmp_err")" \
       || [[ ! "$behind" =~ ^[0-9]+$ ]]; then
       echo "lane: #$num wait:base-comparison-unreadable — not assuming it is current"
+      echo "lane: #$num compare said: $(tr '\n' ' ' <"$cmp_err" | cut -c1-400)"
+      rm -f "$cmp_err"
       continue
     fi
+    rm -f "$cmp_err"
 
     # The in-flight clock, and the only one available without storing state:
     # when this head commit was written. `lane_verdict` only allows it to expire
