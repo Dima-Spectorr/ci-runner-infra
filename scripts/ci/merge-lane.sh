@@ -421,6 +421,11 @@ one_pass() {
 # same key, which means the table reads as an ORDER rather than as a list of
 # facts in whatever order the API returned them.
 # ---------------------------------------------------------------------------
+# SC2016: the single-quoted strings below are printf FORMATS and the backticks
+# in them are markdown code spans, not command substitution. Double-quoting them
+# to satisfy the linter is the change that would actually break this — the shell
+# would then try to run `%s` as a command.
+# shellcheck disable=SC2016
 render_queue() {
   printf '## Merge lane — `%s`\n\n' "$LANE_BASE"
   if [ "$DRY_RUN" = "true" ]; then
