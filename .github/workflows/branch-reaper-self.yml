@@ -1,0 +1,86 @@
+name: Branch reaper (this repository)
+
+# This repository publishes the reaper, so it is the first place it has to hold
+# — the same argument `merge-lane-self.yml`, `support-windows-self.yml` and
+# `ci.yml` already make for every other rule shipped from here.
+#
+# It also has by far the most standing to run it. 256 remote branches in about a
+# week, because the merge lane squash-merges and leaves the head behind and
+# every session works on its own branch.
+#
+# THIS FILE DOES NOT RUN ON THE PULL REQUEST THAT CHANGES IT.
+#
+# A `schedule` trigger is dispatched from the DEFAULT BRANCH only, so a change
+# here is unexercised until it merges, whatever CI says.
+# `scripts/ci/branch-reaper-decision.selftest.sh` is what stands in for the run
+# that cannot happen, and `scripts/ci/branch-reaper.selftest.sh` asserts the
+# structural properties of these two files with mutations.
+
+on:
+  # DAILY, NOT PER MERGE, AND NOT MORE OFTEN.
+  #
+  # Nothing here is urgent — the youngest branch it can touch is fourteen days
+  # old — so the only thing frequency buys is API calls and audit-log noise.
+  # Once a day means the worst case is a branch surviving a day longer than the
+  # threshold, which is not a cost anyone can perceive.
+  #
+  # 04:17 UTC: off the hour, because the whole world schedules on the hour and
+  # GitHub delays a busy cron slot rather than queueing it.
+  schedule:
+    - cron: '17 4 * * *'
+
+  # The only way to see a verdict before the next daily run, and how an operator
+  # reads the dry-run report during cutover.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reap:
+    # ENABLED IS NOT ARMED, AND THE TWO ARE SEPARATE FOR THE SAME REASON THE
+    # LANE'S ARE.
+    #
+    # Even a dry run mints the App token, so until `MERGE_APP_ID` and
+    # `MERGE_APP_PRIVATE_KEY` exist this job fails at its second step — daily,
+    # on the default branch, forever. A red run meaning "the operator has not
+    # finished the setup" is indistinguishable from one meaning "the reaper is
+    # broken", and only the second should ever need looking at.
+    #
+    # `MERGE_LANE_ENABLED` is reused deliberately rather than given a twin: it
+    # answers "does the merge App exist and is it installed here", which is the
+    # same question for both, and a second variable meaning the same thing is a
+    # second thing to get out of step.
+    if: vars.MERGE_LANE_ENABLED == 'true'
+    uses: ./.github/workflows/branch-reaper.yml
+    permissions:
+      contents: read
+    with:
+      min-age-days: 14
+
+      # Nothing in this repository's history needs an exception yet — the
+      # default branch and anything GitHub reports as protected are kept without
+      # being named, and `chore/release-*` branches are ordinary merged branches
+      # that should be reaped like the rest. Left empty on purpose rather than
+      # pre-populated with plausible-looking globs: a keep-list nobody needs is
+      # a keep-list nobody maintains, and the first real entry then gets added
+      # to a list already full of guesses.
+      keep-patterns: ''
+
+      # GitHub-hosted, same choice `ci.yml` and the lane make: the repository
+      # that DEFINES the self-hosted fleet must not need the fleet healthy to
+      # tidy itself. Free, because this repository is public.
+      runs-on: ubuntu-latest
+
+      # ARMED BY A VARIABLE, NOT BY A COMMIT.
+      #
+      # A scheduled workflow cannot run on the pull request that adds it, so the
+      # first live execution is the day after this merges. Reading a real report
+      # before granting delete authority is the only honest order — and a
+      # repository variable means arming it does not need another pull request.
+      #
+      # Unset or anything but the exact string `true` leaves it in dry run.
+      dry-run: ${{ vars.BRANCH_REAPER_ARMED != 'true' }}
+    secrets:
+      app-id: ${{ secrets.MERGE_APP_ID }}
+      app-private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}

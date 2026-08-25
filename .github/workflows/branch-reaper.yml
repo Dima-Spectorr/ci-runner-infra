@@ -1,0 +1,164 @@
+name: Branch reaper
+
+# Deletes branches that were merged and have not moved since, after a grace
+# period. Reusable, and wired the same way the merge lane is, because it is the
+# same problem: a schedule-triggered workflow is dispatched from the DEFAULT
+# BRANCH only, so nothing here runs on the pull request that changes it.
+#
+# WHY THIS EXISTS AT ALL
+#
+# The merge lane squash-merges and leaves the head branch behind, and every
+# session in this fleet works on its own branch in its own worktree. This
+# repository accumulated 256 remote branches in about a week. That is not
+# untidiness — `git branch -r` is how a session finds out whether another
+# session already has its task in flight, and a list nobody can read stops
+# answering that question.
+#
+# WHY IT IS A SEPARATE WORKFLOW FROM THE LANE
+#
+# Blast radius, in the opposite direction, and therefore different defaults. The
+# lane's wrong answer merges something you can revert out of the history it just
+# wrote; this one's DESTROYS commits that may exist nowhere else. So `dry-run`
+# defaults to TRUE here and FALSE there, the job is capped at a number of
+# deletions per run, and every unknown in the decision function is a keep.
+#
+# WHAT THE CONSUMER MUST PROVIDE
+#
+#   secrets.app-id / app-private-key   the merge App. `Contents: write` — the
+#                                      same grant the lane already needs, so a
+#                                      repository running the lane needs nothing
+#                                      new.
+#
+# The decision this makes lives in `scripts/ci/branch-reaper-decision.sh` with
+# 26 cases against it, and `scripts/ci/branch-reaper.selftest.sh` asserts the
+# structural properties of this file with mutations — because a property
+# silently removed here has to fail a check that CAN run on a pull request.
+
+on:
+  workflow_call:
+    inputs:
+      min-age-days:
+        description: >-
+          How many whole days must pass after a merge before that branch may be
+          deleted. Strictly less than, so `0` means "as soon as it is merged"
+          and `14` means a branch merged thirteen days ago survives. The grace
+          period is most of the value of the feature: a branch merged this
+          morning is a branch someone may still be reading, cherry-picking from,
+          or about to reopen.
+        required: false
+        default: 14
+        type: number
+      max-deletions:
+        description: >-
+          The most branches one run may delete. Not a performance knob. The
+          first armed run against a repository nobody has ever pruned is both
+          the run that would delete the most and the run most likely to be
+          acting on a keep-list somebody got wrong; the cap turns that from a
+          repository-wide event into a handful of branches and a report, with
+          everything else still there tomorrow.
+        required: false
+        default: 20
+        type: number
+      keep-patterns:
+        description: >-
+          Newline-separated globs that are never deleted, whatever their state —
+          `release/*`, `legacy-*`. Matched with the shell's pattern operator,
+          not a regular expression. The default branch and any branch GitHub
+          reports as protected are already kept without being listed; this is
+          for the long-lived branches that are neither.
+        required: false
+        default: ''
+        type: string
+      runs-on:
+        description: >-
+          Where the reaper runs. `ubuntu-latest` is free and unmetered on a
+          PUBLIC repository; a private repository should pass a self-hosted
+          label, because hosted minutes are billed there. Must resolve to a
+          LINUX runner — this is bash, and reads `date -u -d`, `mapfile` and
+          `declare -A`, none of which the fleet's Windows pool provides.
+        required: false
+        default: ubuntu-latest
+        type: string
+      implementation-repository:
+        description: >-
+          Where `scripts/ci/branch-reaper.sh` lives. A reusable workflow's
+          `actions/checkout` clones the CALLER, not the callee, so the reaper
+          has to name its own repository to find its own driver.
+        required: false
+        default: Dima-Spectorr/ci-runner-infra
+        type: string
+      implementation-ref:
+        description: >-
+          The ref of `implementation-repository` to run. Set it to the SAME
+          40-hex sha your `uses:` line is pinned to, or the pinned workflow runs
+          an unpinned driver.
+        required: false
+        default: main
+        type: string
+      dry-run:
+        description: >-
+          Compute every verdict, delete nothing. DEFAULTS TO TRUE, and the merge
+          lane's equivalent input defaults to false — that difference is
+          deliberate and is the main safety property of this workflow. Anything
+          but the exact string `false` is a dry run.
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      app-id:
+        description: App ID of the merge App.
+        required: true
+      app-private-key:
+        description: Private key of the merge App.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  reap:
+    name: Branch reaper
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    # Serialised for the same reason the lane is: two runs deleting from the
+    # same branch list would each act on a world the other is changing, and the
+    # second one's reads are stale by definition.
+    #
+    # `cancel-in-progress: false`, never true. A cancelled reaper is a reaper
+    # that deleted some branches and wrote no report.
+    concurrency:
+      group: branch-reaper
+      cancel-in-progress: false
+    permissions:
+      # `contents: read` on the JOB and `Contents: write` on the App. The two
+      # are not the same grant: this line bounds the built-in `GITHUB_TOKEN`,
+      # which must never be able to delete a ref, so that there is exactly one
+      # write path and it is the audited one.
+      contents: read
+    steps:
+      - name: Check out the reaper's implementation
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ inputs.implementation-repository }}
+          ref: ${{ inputs.implementation-ref }}
+          persist-credentials: false
+
+      - name: Mint the merge App token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
+      # Every input reaches the script as an environment variable and none is
+      # interpolated into the shell. `keep-patterns` is operator-supplied text
+      # arriving in a job that can delete refs; an expression expanded into a
+      # `run:` body is a shell injection there.
+      - name: Run the reaper
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          MIN_AGE_DAYS: ${{ inputs.min-age-days }}
+          MAX_DELETIONS: ${{ inputs.max-deletions }}
+          KEEP_PATTERNS: ${{ inputs.keep-patterns }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: bash scripts/ci/branch-reaper.sh

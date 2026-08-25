@@ -921,6 +921,14 @@ request, and each one a run this model does not perform.
 [`docs/merge-lane.md`](docs/merge-lane.md) has the design, the two-variable
 cutover, and the per-repository migration.
 
+The lane leaves the head branch behind on purpose — a branch deleted seconds
+after a squash merge is a branch nobody can cherry-pick from — so the tidying
+is a separate daily job with its own arming variable and its own dry-run
+default. This repository accumulated **256 remote branches in ten days**.
+[`docs/branch-reaper.md`](docs/branch-reaper.md) has the rule, which deletes a
+branch only when it was merged, has not moved since the merge, and the merge was
+at least fourteen days ago.
+
 
 ## Releasing a version
 
