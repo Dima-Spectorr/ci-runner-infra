@@ -8,7 +8,7 @@ the default branch at its service account.
 
 ```hcl
 module "ci_cache_publisher" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-publisher?ref=v5.53.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-publisher?ref=v5.54.0"
 
   project_id             = var.project_id
   name                   = "ci-runner-host-myrepo"      # the SAME pool name
