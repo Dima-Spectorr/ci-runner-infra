@@ -68,6 +68,18 @@ is_permanent() { printf '%s' "$1" | grep -Eqi "$PERMANENT_PATTERNS"; }
 
 init_module() { # <module-dir>
   local dir="$1" attempt=1 wait="$BACKOFF" out rc
+  # A terraform that is not installed is not a flake. If the setup step ever
+  # regresses — `hashicorp/setup-terraform` skipped, PATH not exported into
+  # this shell — every module fails identically, and without this the job
+  # spends ATTEMPTS calls and the whole backoff per module before saying so,
+  # with a "could not run terraform" buried under retry warnings that suggest
+  # a registry problem. Only the FIRST word is checked, because TF_BIN may
+  # carry an interpreter and a path (`sh /tmp/xxx/tf`) and the path is then
+  # not a thing `command -v` can resolve.
+  if ! command -v "${TF_BIN%% *}" >/dev/null 2>&1; then
+    echo "::error::[TFINIT] \`${TF_BIN%% *}\` is not on PATH — the terraform setup step did not run, which no retry can fix" >&2
+    return 127
+  fi
   if [ ! -d "$dir" ]; then
     echo "::error::[TFINIT] no such module directory: $dir" >&2
     return 1
@@ -110,6 +122,11 @@ selftest() {
   tmp="$(mktemp -d)" || return 1
   trap 'rm -rf "$tmp"' RETURN
   mkdir -p "$tmp/module"
+  # Exported once for every case rather than inside each subshell: the fake
+  # terraform is a child process and needs it in its environment, the value
+  # never varies, and shellcheck is right that exporting it per-subshell
+  # (SC2030/SC2031) sets something nothing outside that subshell can read.
+  export TMPD="$tmp"
 
   # $tmp/script decides what the fake terraform does on each call; $tmp/calls
   # counts them. Writing the count from the fake rather than inferring it from
@@ -144,7 +161,6 @@ FAKE
     printf '%s' "$mode" > "$tmp/script"
     : > "$tmp/calls"
     (
-      export TMPD="$tmp"
       TF_BIN="sh $tmp/tf" ATTEMPTS=3 BACKOFF=0 init_module "$tmp/module"
     ) >/dev/null 2>&1 || rc=$?
     calls="$(cat "$tmp/calls" 2>/dev/null || echo 0)"
@@ -168,12 +184,34 @@ FAKE
   : > "$tmp/calls"
   printf 'ok' > "$tmp/script"
   local absent_rc=0
-  ( export TMPD="$tmp"; TF_BIN="sh $tmp/tf" ATTEMPTS=3 BACKOFF=0 init_module "$tmp/absent" ) >/dev/null 2>&1 || absent_rc=$?
+  ( TF_BIN="sh $tmp/tf" ATTEMPTS=3 BACKOFF=0 init_module "$tmp/absent" ) >/dev/null 2>&1 || absent_rc=$?
   if [ "$absent_rc" -ne 0 ] && [ ! -s "$tmp/calls" ]; then
     pass=$((pass + 1))
   else
     bad=$((bad + 1))
     echo "SELFTEST FAIL: a missing module directory should fail without calling terraform"
+  fi
+
+  # A terraform that is not installed is the other caller-side mistake, and
+  # the more expensive one: it is true of every module, so without a fast
+  # fail the job pays ATTEMPTS calls and the whole backoff PER MODULE to
+  # report one setup regression, under retry warnings that read as a registry
+  # problem.
+  #
+  # Asserted on the RETRY WARNINGS, not on the call count. A missing binary
+  # never runs, so `$tmp/calls` stays empty whether the fast fail is there or
+  # not, and a check that reads the count is satisfied by both worlds — it
+  # passes with the fast fail deleted, which is the one thing it exists to
+  # notice.
+  : > "$tmp/calls"
+  local nobin_rc=0 nobin_out
+  nobin_out="$( ( TF_BIN="$tmp/not-a-terraform" ATTEMPTS=3 BACKOFF=0 init_module "$tmp/module" ) 2>&1 )" || nobin_rc=$?
+  if [ "$nobin_rc" -ne 0 ] && [ ! -s "$tmp/calls" ] &&
+     ! printf '%s' "$nobin_out" | grep -q 'retrying'; then
+    pass=$((pass + 1))
+  else
+    bad=$((bad + 1))
+    echo "SELFTEST FAIL: a terraform that is not on PATH should fail without retrying"
   fi
 
   printf 'terraform-init-retry selftest: %d passed, %d failed\n' "$pass" "$bad"
