@@ -657,6 +657,17 @@ jobs:
       - name: merge-lane structural self-test
         run: bash scripts/ci/merge-lane.selftest.sh
 
+      # The branch reaper, split the same way and for the same reason: a
+      # scheduled workflow is dispatched from the default branch only, so these
+      # two steps are the only thing that runs on the pull request that changes
+      # it. The decision self-test is weighted the opposite way to the lane's —
+      # nearly every case must NOT delete — because the failure being defended
+      # against destroys commits rather than merging them.
+      - name: branch-reaper decision self-test
+        run: bash scripts/ci/branch-reaper-decision.selftest.sh
+      - name: branch-reaper structural self-test
+        run: bash scripts/ci/branch-reaper.selftest.sh
+
       # `ci_orphan_registrations_reaped` was published from the day the reaper
       # landed and never declared in the module output that dashboards and alert
       # policies are built from, so nothing looked at it. The reverse drift is

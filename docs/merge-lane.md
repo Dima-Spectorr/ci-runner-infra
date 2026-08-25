@@ -333,6 +333,11 @@ find out about it later.
   run, plus an optional pinned issue kept current. See
   [Seeing the queue](#seeing-the-queue). What is genuinely gone is the
   cross-repository view — each repository's lane shows its own queue only.
+- **Deleting the head branch after a merge.** Mergify's `delete_head_branch`
+  ran at merge time; the lane leaves the branch. That is deliberate — a branch
+  deleted seconds after a squash merge is a branch nobody can cherry-pick from
+  — and it is picked up instead by [the branch reaper](branch-reaper.md), which
+  sweeps daily and only touches branches merged at least fourteen days ago.
 
 And one thing it adds that neither Mergify's serial queue nor GitHub's native
 queue can express: **priority**. A label like `merge-lane/priority-10` orders
