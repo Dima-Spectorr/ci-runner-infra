@@ -799,8 +799,10 @@ scripts/ci/                      self-tests
 docs/onboarding-a-repository.md  how to put a NEW repo on the fleet
 docs/github-app-permissions.md   the App's permissions: who grants each, how,
                                  and how each one fails without saying so
-scripts/ci/check-merge-queue-single-step.sh
-                                 the merge-queue rule consumers copy in
+.github/workflows/merge-lane.yml the merge queue consumers call, in place of
+                                 Mergify (docs/merge-lane.md)
+scripts/ci/merge-lane-decision.sh
+                                 what the lane may merge, and why (unit-tested)
 scripts/ci/check-runner-policy.sh
                                  which pool a job may claim, and for how long
 scripts/ci/check-action-pins.sh  every third-party action pinned to a commit
@@ -893,55 +895,32 @@ three, opt-in by flag until adoption completes — a gate that fails every
 repository the day it merges is a gate disabled in every repository the day
 after.
 
-## One CI run per pull request, or one per batch
+## One CI run per pull request
 
-> **Being replaced.** Mergify is on its way out of this fleet, and the section
-> below describes how we live with it until it is gone. The reason is one number
-> that never came down: **9 to 25 minutes** between the last required check
-> going green and Mergify merging, because it learns that CI finished over a
-> webhook it sometimes never receives. Its speculative-draft model was the
-> bigger cost — on one consumer repository **87 of 122 queue-draft runs failed**
-> at fleet setup steps rather than on the diff, each one a terminal dequeue of a
-> good pull request.
->
-> [`docs/merge-lane.md`](docs/merge-lane.md) is the replacement: the queue moves
-> into the repository, on a `workflow_run` trigger GitHub dispatches itself, and
-> the merge happens in the run that observes the green. It also deletes the
-> second CI run described below, because it validates **in place** on the pull
-> request's own branch instead of on a throwaway draft. The cutover is
-> deliberately three steps — dry run, arm, then remove Mergify — so nothing in
-> the section below is dead yet.
+Mergify is gone from this repository. It validated a queued pull request on a
+throwaway `mergify/merge-queue/<sha>` branch, which fired every `pull_request`
+workflow a **second** time on the fleet, and the whole of the section that used
+to live here was the rule that kept that second run down to one — `Tier 0`,
+`Tier 1`, `MPC_MAX`, `BATCH_MAX`, and a gate that fourteen repositories copied
+in to enforce it.
 
-The lane model decides how much CI a pull request deserves; it does not decide
-how many times that CI runs. Mergify validates a queued pull request on a
-throwaway `mergify/merge-queue/<sha>` branch — firing every `pull_request`
-workflow a **second** time, on the fleet — unless the queue is serial,
-unbatched, retry-free and single-step, and the fleet was in that state on
-2026-08-14 (one repository's config was rejected outright and its queue was
-failing closed).
+None of that has a job any more. The merge lane validates **in place**, on the
+pull request's own branch: a branch already current with the base merges with no
+second run at all, and one whose base moved gets exactly one re-run, on its own
+branch, where a failure is the author's to read. There is no speculative draft
+to bound, so there is no ceiling to configure and no gate to copy.
 
-That is **Tier 0**, and it is right for a repository whose pull requests wait
-on CI. A repository whose pull requests wait on the *queue* — merge cadence
-slower than one CI run — moves to **Tier 1**, where the second run is paid once
-per batch rather than once per pull request. The two tiers differ by two
-numbers in the gate, `MPC_MAX` and `BATCH_MAX`, and by nothing else.
+The two numbers that made the case are worth keeping. Green-to-merge latency was
+**9 to 25 minutes** and never came down, because Mergify learns that CI finished
+over a webhook it sometimes never receives; the first pull request the lane
+merged by itself went in **14 seconds** after its last required check. And on
+one consumer repository **87 of 122 queue-draft runs failed** at fleet setup
+steps rather than on the diff — each one a terminal dequeue of a good pull
+request, and each one a run this model does not perform.
 
-**They are not the same kind of number.** Queue throughput is
-`batch_size × max_parallel_checks`, but the runner bill is
-`max_parallel_checks` alone: each parallel check is another concurrent CI run
-drawn from the shared fleet, while each extra pull request in a batch rides a
-run that is already happening. Wanting more throughput is an argument for
-`batch_size`. It is never an argument for the width.
+[`docs/merge-lane.md`](docs/merge-lane.md) has the design, the two-variable
+cutover, and the per-repository migration.
 
-`scripts/ci/check-merge-queue-single-step.sh` is that rule, self-tested here —
-including the Tier 1 detectors, which the fixtures exercise by raising the
-ceilings for their own duration, so a repository that moves tiers inherits
-proven checks rather than shipping untested ones. It is copied into each
-consuming repository under the same name.
-[`docs/ci-merge-queue-baseline.md`](docs/ci-merge-queue-baseline.md) has the
-reference `.mergify.yml` for both tiers, the five properties, the measurement
-that justifies a tier move, and where the gate must sit for a
-`.mergify.yml`-only change to reach it.
 
 ## Releasing a version
 
