@@ -410,6 +410,55 @@ fork guard. The repositories that need this trigger are the ones on
 already satisfied. If you add the trigger to a lane running on a pool label,
 RUNNER4 will stop you, and it is right to.
 
+### Behind the base is only a problem if the base says so
+
+The lane used to refuse to merge anything that was behind its base, full stop,
+and update the branch instead. That is correct on a base that sets GitHub's
+**strict** required-status-checks policy — "require branches to be up to date
+before merging" — and it is a self-inflicted wound on a base that does not.
+
+On a non-strict base GitHub will merge a branch that is behind. Updating it
+anyway:
+
+* throws away a green suite and spends a **full CI run** rebuilding the same
+  answer,
+* moves the head sha, so the pull request needs a fresh label event or CI
+  completion to be looked at again, and
+* loses the race on a busy repository — the base moves again before the
+  re-run lands, so the pull request goes straight back to being behind and
+  **never converges**.
+
+Measured on IntegrateIT, 2026-08-25: about twenty of roughly seventy open pull
+requests sat in `update:behind` on every pass of a base whose ruleset reported
+`strict_required_status_checks_policy: false`. The lane spent its entire
+`max-actions` budget updating branches that had been mergeable the whole time,
+merged nothing, and — because each pass re-reads the world once per action —
+ran for fourteen and a half minutes against a `timeout-minutes: 15`. The
+symptom an operator sees is "lots of green pull requests, nothing merging", and
+every individual verdict in the log looks reasonable.
+
+So the lane now **asks the base** rather than assuming. Once per run it reads
+`repos/{owner}/{repo}/rules/branches/{base}` — the *effective* rules for that
+branch, so one call covers every ruleset that matches it, plus classic branch
+protection — and only emits `update:behind` when that base is strict. The log
+says which answer it got:
+
+```
+lane: main does not require a branch to be up to date — behind still merges
+```
+
+It **fails closed**: an unreadable answer is treated as strict, because being
+needlessly strict costs one CI run while being wrongly permissive asks GitHub
+for a merge it will refuse. The `require-up-to-date` input pins it to `true` or
+`false` for a base whose rules the lane's token cannot read; leave it at `auto`
+otherwise. Auto-detection is deliberate rather than a per-repository input: a
+copied setting is a second statement of a fact GitHub already publishes, and
+this lane has already been bitten once by two lists that had to be kept equal by
+hand (see the phantom required check, above).
+
+If you *want* linear history, set the policy on the branch. The lane will see
+it and go back to updating.
+
 ### The pool images do not ship `gh`
 
 GitHub-hosted images carry the CLI; the fleet's self-hosted images do not. That

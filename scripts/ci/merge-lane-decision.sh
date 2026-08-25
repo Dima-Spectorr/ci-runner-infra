@@ -80,7 +80,7 @@
 #
 #   lane_verdict <draft> <base> <lane_base> <conflict> <required_total> \
 #                <required_green> <missing> <failed> <pending> <behind> \
-#                <inflight_age> <inflight_budget>
+#                <inflight_age> <inflight_budget> [strict]
 #
 # draft            1 if the pull request is a draft, else 0
 # base             the pull request's base branch
@@ -96,6 +96,21 @@
 # inflight_age     seconds since this entry was last updated onto the base,
 #                  or "" if it is not in flight
 # inflight_budget  seconds an in-flight entry may take before it is dropped
+# strict           1 if this base requires a branch to be UP TO DATE before it
+#                  may merge, 0 if it does not. Defaults to 1, which is the
+#                  behaviour this rule had before the argument existed.
+#
+#                  This is not a preference. It is GitHub's own
+#                  `strict_required_status_checks_policy` on the base, and the
+#                  lane must not be stricter than the branch it merges into:
+#                  updating a branch that is allowed to merge behind throws away
+#                  a green suite, spends a full CI run to rebuild the same
+#                  answer, and moves the head sha — so on a busy repository the
+#                  base has moved again before the run finishes and the pull
+#                  request never converges. Measured on IntegrateIT 2026-08-25:
+#                  ~20 of ~70 open pull requests sat in `update:behind` on every
+#                  pass of a non-strict base, and the lane spent its whole
+#                  action budget re-updating them instead of merging any.
 #
 # Prints exactly one `verdict:reason key=value...` line and returns 0. The
 # caller never has to interpret an exit code, and an unparseable input is a
@@ -122,6 +137,12 @@ lane_verdict() {
   local behind="${10:-}"
   local inflight_age="${11:-}"
   local inflight_budget="${12:-}"
+  # Anything that is not an explicit 0 is strict, including an empty argument
+  # from a caller that predates this parameter. Fail CLOSED: being needlessly
+  # strict costs a CI run, while being wrongly permissive asks GitHub for a
+  # merge it will refuse.
+  local strict="${13:-1}"
+  [ "$strict" = "0" ] || strict=1
 
   local n
   for n in "$required_total" "$required_green" "$missing" "$failed" "$pending" "$behind"; do
@@ -228,7 +249,12 @@ lane_verdict() {
   # asks whether the base it was true AGAINST is still the base it would merge
   # into. If not, the pull request is a candidate but not yet a merge: update it
   # and let its own CI answer the question again.
-  if [ "$behind" -gt 0 ]; then
+  #
+  # ONLY when the base actually demands it. On a base whose required checks are
+  # not strict, GitHub will merge a branch that is behind, so an update here
+  # would be the lane inventing a rule the repository does not have — see the
+  # `strict` argument for what that costs.
+  if [ "$strict" = "1" ] && [ "$behind" -gt 0 ]; then
     echo "update:behind behind=$behind"
     return 0
   fi
