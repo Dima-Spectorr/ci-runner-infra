@@ -192,6 +192,9 @@ jobs:
       # branch under a pinned workflow, which is version skew.
       implementation-ref: 22549049f59ee3c67f04221c6b1a17d72ec6d83a
       inflight-budget-seconds: 1800
+      # Optional. An issue whose body the lane rewrites with the queue after
+      # every run — see "Seeing the queue". Unset means the job summary only.
+      status-issue: ${{ vars.MERGE_LANE_STATUS_ISSUE }}
       dry-run: ${{ vars.MERGE_LANE_ARMED != 'true' }}
     secrets:
       app-id: ${{ secrets.MERGE_APP_ID }}
@@ -219,6 +222,50 @@ recovers a missed dispatch. Do not drop it.
 **`required-checks` must name checks that exist.** A name matching nothing is
 counted as missing and blocks every merge. That is the safe direction, but it is
 a total stop, so keep it in step with your CI.
+
+### Seeing the queue
+
+Mergify had a dashboard, and losing it without replacing it would be a real
+regression — "what is the queue doing" is the question you ask exactly when
+something is wrong.
+
+The lane answers it differently, and the difference is worth understanding
+before you go looking for a list. **There is no stored queue.** The lane
+recomputes the candidate set from the API on every pass; that is what makes a
+cancelled pending run cost nothing, and it means there is no position-in-a-line
+to display. What it publishes instead is the **verdict it reached for every open
+pull request on the pass that just ran** — which is strictly more useful than a
+position, because it says what each one is waiting for.
+
+Two surfaces, and the first is not optional:
+
+- **The job summary on every lane run.** Free, native, no API call and no
+  permission. Open the newest `Merge lane` run in the Actions tab and the table
+  is on the run page. This is always written.
+- **A pinned issue, if you want a bookmark.** Set `MERGE_LANE_STATUS_ISSUE` to
+  the number of an issue and the lane **rewrites its body** after every run. The
+  body, never a comment: an edit notifies nobody, where a comment every fifteen
+  minutes would make the issue unreadable within a day. Create the issue, pin
+  it, set the variable — no code change. It must be a plain **issue**: issues
+  and pull requests share one number space, so the lane confirms what the
+  number points at before writing and refuses rather than overwrite a pull
+  request's description.
+
+The table is ordered by the lane's own ranking, so the **top row is the pull
+request the next action would touch**. Below the actionable rows come the ones
+the lane could not read, then the ones it deliberately skipped. Everything the
+pass saw gets a row, including the failures: a view that quietly omitted the
+pull requests the lane choked on would render "the queue is empty" over "the
+lane is broken", and that exact confusion cost an hour during the cutover.
+
+> **The pinned issue needs `Issues: write` on the merge App**, which GitHub
+> treats as a **separate** permission from `Pull requests: write` even though a
+> pull request is an issue — the lane's release comment goes through the
+> pull-request grant and will keep working without this one. A permission added
+> to an already-installed App stays **pending until the installation owner
+> accepts it** in the repository's app settings. Until then the lane logs a
+> warning once per run and keeps merging: a queue view that cannot be published
+> is not a reason to stop merging.
 
 ### Minutes
 
@@ -282,8 +329,10 @@ find out about it later.
   `requeue` existed to resynchronise a third party that had fallen behind, and
   there is no longer a third party. The manual equivalent is
   `workflow_dispatch`.
-- **A hosted UI.** Verdicts are in the workflow log, one line per pull request
-  per pass.
+- **A hosted UI.** Replaced rather than dropped: the job summary on every lane
+  run, plus an optional pinned issue kept current. See
+  [Seeing the queue](#seeing-the-queue). What is genuinely gone is the
+  cross-repository view — each repository's lane shows its own queue only.
 
 And one thing it adds that neither Mergify's serial queue nor GitHub's native
 queue can express: **priority**. A label like `merge-lane/priority-10` orders

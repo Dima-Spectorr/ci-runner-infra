@@ -49,7 +49,10 @@
 # WHAT THE CONSUMER MUST PROVIDE
 #
 # A GitHub App with `Contents: write`, `Pull requests: write`, `Checks: read`,
-# `Actions: read`, `Metadata: read`, installed on the repository. This is
+# `Actions: read`, `Metadata: read`, installed on the repository — plus
+# `Issues: write` if and only if `status-issue` is set, which GitHub treats as a
+# separate permission from `Pull requests: write` even though a pull request is
+# an issue. Without it the lane warns and keeps merging. This is
 # DELIBERATELY NOT the fleet's runner App: `docs/github-app-permissions.md`
 # argues that that App must never hold `Contents: write`, and that argument is
 # still correct. Merge authority gets its own identity and its own blast radius.
@@ -129,6 +132,26 @@ on:
           could not express and GitHub's native queue cannot either.
         required: false
         default: 'merge-lane/priority-'
+        type: string
+      status-issue:
+        description: >-
+          Number of an issue whose BODY the lane rewrites with the queue after
+          every run. Optional: the same table is always written to the run's job
+          summary, which costs nothing and needs no permission. This exists for
+          the person who wants one bookmarkable page that is always current
+          instead of having to find the newest lane run.
+
+          The body is REWRITTEN, never commented on — an edit notifies nobody,
+          where a comment every fifteen minutes would make the issue unreadable
+          within a day. Pin the issue so it stays at the top of the list.
+
+          Needs `Issues: write` on the merge App, which GitHub treats as a
+          SEPARATE permission from `Pull requests: write` even though a pull
+          request is an issue. Without it the lane warns once per run and keeps
+          merging; a queue view that cannot be published is not a reason to stop
+          merging.
+        required: false
+        default: ''
         type: string
       implementation-repository:
         description: >-
@@ -239,5 +262,6 @@ jobs:
           MAX_ACTIONS: ${{ inputs.max-actions }}
           REQUIRE_LABEL: ${{ inputs.require-label }}
           PRIORITY_PREFIX: ${{ inputs.priority-label-prefix }}
+          STATUS_ISSUE: ${{ inputs.status-issue }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: bash scripts/ci/merge-lane.sh
