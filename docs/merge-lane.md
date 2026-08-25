@@ -70,8 +70,11 @@ told that CI finished — it finished it.** The dispatch is internal, there is n
 third party in the path, and the merge happens in the run that observes the
 green.
 
-When the lane acquires its lock it recomputes the world and acts on one pull
-request:
+When the lane acquires its lock it recomputes the world and acts on the best
+candidate it finds — on a base that requires branches to be up to date, exactly
+one, because the merge invalidates everything else it just read; on one that
+does not, up to `max-actions` of them, for the reasons under
+[Behind the base is only a problem if the base says so](#behind-the-base-is-only-a-problem-if-the-base-says-so):
 
 1. List open, non-draft pull requests on the base.
 2. For each, read the facts: mergeability, labels, how far behind the base it

@@ -137,9 +137,12 @@ on:
         description: >-
           How many pull requests one acquisition of the lane may act on. A burst
           of ready pull requests drains in one run rather than one per CI
-          completion. Bounded because each iteration re-reads the world, and an
-          unbounded loop against a repository that keeps producing candidates is
-          a job that never ends.
+          completion. Bounded because an unbounded loop against a repository
+          that keeps producing candidates is a job that never ends. On a base
+          that requires branches to be up to date the lane re-reads the world
+          between every action, so this is also how many full walks of the open
+          list a run performs; on a base that does not, the budget is spent from
+          a single walk.
         required: false
         default: 4
         type: number
