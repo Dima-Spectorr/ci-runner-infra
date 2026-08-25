@@ -7,7 +7,7 @@ every pool in that project.
 
 ```hcl
 module "ci_cache" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-bucket?ref=v5.54.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-cache-bucket?ref=v5.55.0"
 
   project_id = var.project_id
   name       = "${var.project_id}-ci-cache"
