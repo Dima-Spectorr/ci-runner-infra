@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.51.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.52.0"
   # ...
 }
 ```
@@ -894,6 +894,23 @@ repository the day it merges is a gate disabled in every repository the day
 after.
 
 ## One CI run per pull request, or one per batch
+
+> **Being replaced.** Mergify is on its way out of this fleet, and the section
+> below describes how we live with it until it is gone. The reason is one number
+> that never came down: **9 to 25 minutes** between the last required check
+> going green and Mergify merging, because it learns that CI finished over a
+> webhook it sometimes never receives. Its speculative-draft model was the
+> bigger cost — on one consumer repository **87 of 122 queue-draft runs failed**
+> at fleet setup steps rather than on the diff, each one a terminal dequeue of a
+> good pull request.
+>
+> [`docs/merge-lane.md`](docs/merge-lane.md) is the replacement: the queue moves
+> into the repository, on a `workflow_run` trigger GitHub dispatches itself, and
+> the merge happens in the run that observes the green. It also deletes the
+> second CI run described below, because it validates **in place** on the pull
+> request's own branch instead of on a throwaway draft. The cutover is
+> deliberately three steps — dry run, arm, then remove Mergify — so nothing in
+> the section below is dead yet.
 
 The lane model decides how much CI a pull request deserves; it does not decide
 how many times that CI runs. Mergify validates a queued pull request on a

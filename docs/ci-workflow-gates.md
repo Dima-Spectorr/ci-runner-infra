@@ -443,18 +443,32 @@ destination for fork code.
 
 "Finite" then has to mean the versions GitHub actually ships, because `latest`
 or any number accepted `ubuntu-2204`, `windows-11` and `macos-14.0` — three
-ordinary self-hosted naming conventions, none of them a hosted image. Each OS
-carries its own version shape:
+ordinary self-hosted naming conventions, none of them a hosted image. A version
+*shape* was not enough either: `NN.04` accepts `ubuntu-99.04`, which is exactly
+the private label a fleet would pick if it wanted one that looked official. So
+the versions are **enumerated**, and so are the suffixes, **per OS**:
 
-| OS | Accepted | Optional class suffix |
+| OS | Accepted versions | Suffix |
 |---|---|---|
-| `ubuntu-` | `latest`, an LTS `NN.04` | `-arm`, `-arm64`, `-large`, `-xlarge` |
-| `windows-` | `latest`, a year `20NN`, `11-arm` | same |
-| `macos-` | `latest`, a bare major `NN` | same |
+| `ubuntu-` | `latest`, `26.04`, `24.04`, `22.04` | `-arm` only |
+| `windows-` | `latest`, `2025`, `2022`, `2025-vs2026`, `11-arm`, `11-vs2026-arm` | none |
+| `macos-` | `latest`, `26`, `15`, `14` | `-intel`, `-large`, `-xlarge` |
+
+Plus two families with no version component, matched as exact literals:
+`ubuntu-slim`, `xcode-27` and `xcode-27-xlarge`.
+
+**The suffix is per-OS because a shared one is wrong in both directions at
+once.** `-large` and `-xlarge` are macOS only — larger runners on Ubuntu and
+Windows take organisation-chosen names, so `windows-2022-large` is a private
+label, not a hosted image. And `-arm64` is not a hosted suffix anywhere;
+reachable from `windows-11-arm` it made `windows-11-arm-arm64` read as hosted,
+which skips every isolation check on the job carrying it.
 
 The list goes stale in the safe direction on purpose: an image GitHub adds
 later reads as self-hosted until the line is updated, which costs one reported
-job. The other direction costs the boundary.
+job. The other direction costs the boundary. A **retired** image is dropped for
+the same reason it was never added early — `macos-13` is no longer listed, so
+it is a private label now. Last checked 2026-08-24.
 
 Anything not recognised is unguarded — an unrecognised-but-correct guard costs
 one reported job and a reviewer's minute, where an unrecognised inversion costs

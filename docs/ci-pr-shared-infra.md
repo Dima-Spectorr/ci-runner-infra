@@ -300,6 +300,25 @@ cannot tell the difference. It also publishes `shared`, which is worth logging:
 a run where *every* job reports `0` is a run whose anchor never pinned
 anything — a fleet problem currently wearing a green tick.
 
+**The URL carries `?sslmode=disable`, and the consumer must not add it again.**
+The server runs `trust` with no TLS on both branches, and the address alone
+cannot say so: `postgres://ci@10.0.0.7:35100/app` looks exactly like a managed
+instance that would require TLS. The action is the only party that knows, so it
+says it, in libpq's own spelling — understood by `pg-connection-string` and
+therefore by node-postgres, so it is not a private convention.
+
+The cost of *not* saying it is what earned this its own issue (#386). DataRetrival
+hit the same handshake twice on one pull request chain and only recognised it
+once: `migration-harness-run` failed on "The server does not support SSL
+connections", and `integration-tests` then failed on `KnexTimeoutError: Timeout
+acquiring a connection` after 30 seconds — the same refusal, wearing a
+pool-exhaustion error, investigated as one.
+
+An adopter that already appends the parameter itself has to stop when it
+re-pins. Two of them concatenate into
+`…/app?sslmode=disable?sslmode=disable`, which is not a parseable query, so the
+removal and the pin bump belong in the same window.
+
 **The throwaway's host port is drawn, not left to Docker**, and that is not a
 detail. Docker's allocator starts scanning at 32768 every time; a fleet host
 carries several slots under separate uids whose rootless published ports are all

@@ -167,7 +167,26 @@ locals {
   # The Windows boot script. Terraform evaluates both arms of a conditional, so
   # this is read whatever the pool's OS is; one name for the text is worth the
   # read.
-  windows_host_startup = file("${path.module}/scripts/windows-host-startup.ps1")
+  #
+  # AND IT TRAVELS COMPRESSED TOO, for the same reason and by a wider margin:
+  # 366,591 characters against the 262,144 a metadata value holds, where the
+  # Linux pair was 278,405. Windows had never been applied anywhere, so it had
+  # never reported the 413 — it is fixed in the same breath as Linux rather than
+  # left for whoever first turns a Windows pool on, because by then "the boot
+  # script metadata bug was fixed" is in the history and the identical failure
+  # reads as something new. Gzipped it is about 149 KiB, 57% of the cap.
+  #
+  # templatefile, not a heredoc: the wrapper is forty lines of PowerShell rather
+  # than the Linux four, and as its own .ps1 it is parsed and analysed by the
+  # PowerShell gate like every other script here. `${gz}` is a valid PowerShell
+  # variable reference, so the file on disk parses before Terraform substitutes
+  # anything.
+  windows_host_startup_source = file("${path.module}/scripts/windows-host-startup.ps1")
+  windows_host_startup_gz     = base64gzip(local.windows_host_startup_source)
+
+  windows_host_startup = templatefile("${path.module}/scripts/windows-boot-wrapper.ps1", {
+    gz = local.windows_host_startup_gz
+  })
 
   # EXACTLY ONE boot-script key, chosen by OS. This is the only thing `host_os`
   # switches on the template itself; everything else it does is a refusal below.
@@ -528,7 +547,7 @@ resource "google_compute_instance_template" "host" {
     # with a number in it instead of a 413 in a nightly build log.
     precondition {
       condition     = length(local.boot_script_metadata[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"]) < 262144
-      error_message = "pool '${var.name}' renders a ${length(local.boot_script_metadata[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"])}-character boot script and a GCE metadata value is capped at 262144. The Linux script is already gzipped into its wrapper, so this means the SOURCE has outgrown even the compressed form: shorten modules/ci-runner-host-pool/scripts/host-startup.sh, or move a part of it onto the golden image. Left to the apply this is an Error 413 at create time, on a plan that read clean."
+      error_message = "pool '${var.name}' renders a ${length(local.boot_script_metadata[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"])}-character boot script and a GCE metadata value is capped at 262144. Both scripts are already gzipped into their wrappers, so this means the SOURCE has outgrown even the compressed form: shorten modules/ci-runner-host-pool/scripts/${var.host_os == "windows" ? "windows-host-startup.ps1" : "host-startup.sh"}, or move a part of it onto the golden image. Left to the apply this is an Error 413 at create time, on a plan that read clean."
     }
 
     precondition {
