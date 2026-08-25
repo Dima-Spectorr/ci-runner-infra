@@ -175,7 +175,7 @@ jobs:
     # `contents: read`, and a `runs-on` YOUR file supplies — and names the issue
     # where that reading lives. The gate rejects a marker without one.
     # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/branch-reaper.yml, #<issue>): read and recorded there
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/branch-reaper.yml@91c554b659cf5a6f3232d421769a0336cc75f662 # v5.56.0
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/branch-reaper.yml@f1008a77684b855f2d6af8f93e24dc64ec011938 # v5.59.0
     permissions:
       contents: read
     with:
