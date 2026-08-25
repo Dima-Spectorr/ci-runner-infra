@@ -513,8 +513,32 @@ documented_example_carries_one_pin() {
   ! grep -qE '^ *implementation-ref: [0-9a-f]{40}' "$doc"
 }
 
+# THE EXAMPLE MUST PASS THE GATES THE FLEET ALREADY RUNS.
+#
+# The cutover shipped a caller that three of this fleet's own vendored gates
+# reject, and nobody found out until the first ordinary pull request in a
+# consumer — because the cutover itself landed by admin merge, which is exactly
+# the path that skips them. Thirteen repositories then needed the same two
+# additions by hand.
+#
+# `check-workflow-concurrency.sh` requires a top-level `concurrency:`, and a
+# constant group key on a scheduled workflow requires the serialization marker.
+# `check-runner-policy.sh` RUNNER7 requires a `remote-reusable-allowed` marker
+# naming this callee, because it cannot read across the repository boundary.
+# Neither is optional and neither is discoverable from the callee, so the
+# example is where a consumer learns them — and this is the check that keeps
+# them there. It runs on a pull request, which the gates it stands in for
+# cannot do from this repository.
+documented_example_survives_the_consumer_gates() {
+  local doc="$1"
+  grep -qE '^concurrency:' "$doc" || return 1
+  grep -qE '^# concurrency-serialization: intentional[[:space:]]*[—-]' "$doc" || return 1
+  grep -qE '^ *# remote-reusable-allowed\(Dima-Spectorr/ci-runner-infra/\.github/workflows/merge-lane\.yml, #' "$doc"
+}
+
 echo "merge-lane self-test:"
 check documented_example_carries_one_pin "$DOC" "the documented example still sets implementation-ref to a sha, so a consumer copying it reintroduces a second pin Dependabot cannot keep in step with the first"
+check documented_example_survives_the_consumer_gates "$DOC" "the documented example is missing the concurrency block or the RUNNER7 declaration, so a consumer who copies it verbatim gets a caller their own vendored gates reject"
 check is_reusable_only "$CALLEE" "the callee has a trigger other than workflow_call, so it can run holding merge authority with no inputs set"
 check acts_as_the_app "$CALLEE" "the lane does not act as the merge App, so its merges and updates trigger no downstream workflow"
 check never_writes_as_itself "$CALLEE" "the built-in token can write, so there are two write paths and the wrong one can be used"
@@ -656,6 +680,11 @@ mutate "a queue field goes in raw" "$DRIVER" \
 
 mutate "status-issue stops reaching the driver" "$CALLEE" \
   's@^          STATUS_ISSUE: .*@          X_UNUSED: 0@' passes_the_status_issue_to_the_driver
+
+mutate "the documented example loses its concurrency block" "$DOC" \
+  's@^concurrency:@# concurrency:@' documented_example_survives_the_consumer_gates
+mutate "the documented example loses its RUNNER7 declaration" "$DOC" \
+  's@# remote-reusable-allowed@# remote-reusable-was-allowed@' documented_example_survives_the_consumer_gates
 
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane: $FAIL failed, $PASS passed"
