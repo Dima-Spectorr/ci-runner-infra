@@ -228,6 +228,10 @@ jobs:
       # `runs-on: '["self-hosted", "linux"]'`.
       runs-on: your-linux-pool-label
       inflight-budget-seconds: 1800
+      # How long the lane may spend WALKING, as opposed to how long a pull
+      # request may sit in flight. It must expire before the job's
+      # `timeout-minutes` does — see "What a pass costs".
+      pass-budget-seconds: 600
       # OPT-IN FOR THE FIRST ARMED WEEK. An armed lane merges every open pull
       # request that is green, and a repository migrating off Mergify is holding
       # a backlog of exactly those — arming wide open merges months of stale work
@@ -368,8 +372,53 @@ the fleet to be healthy in order to merge a fix to the fleet.*
 
 Every other repository in the fleet is **private**, where GitHub-hosted minutes
 are billed. Those should pass `runs-on: self-hosted`: fleet minutes are free and
-unmetered, and the lane is a handful of API calls with **no sleeps**, so it holds
-a slot for seconds rather than the minutes `mergify-nudge` spent asleep.
+unmetered, and the lane holds a slot for as long as the walk takes — seconds on
+a quiet base, minutes on a busy one, and never more than `pass-budget-seconds`.
+That is still not the runner-hour `mergify-nudge` spent deliberately asleep, but
+it is not free either, which is the next section.
+
+### What a pass costs, and why it has a deadline
+
+A pass reads the open list once, then spends per candidate: a detail read, a
+base comparison, a head-commit read, and two paginated check reads — five or six
+calls, plus up to four seconds of sleep when GitHub has not computed
+mergeability yet. **The label gate is applied to the list read**, before any of
+that, so a pull request that is not a candidate costs nothing at all. That
+ordering is the whole of issue #444 and it is asserted by the self-test; if it
+regresses, the cost of a pass goes back to tracking the number of open pull
+requests in the repository rather than the number the lane could act on.
+
+It matters because the job has a `timeout-minutes` ceiling, and:
+
+> **A `timeout-minutes` kill is reported by GitHub as `cancelled`, not as
+> `failure`.**
+
+which is also what an operator pressing *Cancel* produces, and what the
+`concurrency` group produces when a third arrival evicts the pending run. There
+is no annotation, no job summary, and no queue update. A lane dying of its own
+weight is therefore indistinguishable from a lane behaving correctly under load.
+
+Measured on `IntegrateIT` on 2026-08-25, with roughly thirty-five open pull
+requests: **thirty consecutive runs, none of them reaching a merge, every one
+reported `cancelled`.** #11682 was green, labelled and clean throughout and had
+to be merged by hand.
+
+So the lane carries a deadline of its own that expires first. When
+`pass-budget-seconds` runs out mid-walk the lane stops between candidates, still
+acts on the best one it read, and writes a warning naming *how many of how many*
+it got through — and every pull request it did not reach gets a
+`wait:not-read-this-pass` row in the queue snapshot, because a candidate simply
+missing from the table reads as "not in the queue", which nobody can catch. The
+run then ends **green**: a repository with more open pull requests than one pass
+can walk is busy, not broken, and the next CI completion or cron tick starts a
+fresh walk.
+
+If you see that warning regularly, the answers in order are: narrow the
+candidate set with `require-label`, close what is stale, or raise
+`pass-budget-seconds` **together with** the job's `timeout-minutes`. The
+self-test refuses a budget that does not leave the lane two minutes to publish
+its summary inside the ceiling — a run that merges and then reports nothing
+about it is worse than one that merges nothing.
 
 ### A label applied after the green
 

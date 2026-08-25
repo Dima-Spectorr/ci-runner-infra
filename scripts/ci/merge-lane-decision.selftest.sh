@@ -214,6 +214,39 @@ lt "a non-numeric priority falls back to the default, not to the front" \
 lt "an absurd age clamps instead of wrapping past zero" \
   "$(lane_rank "merge:ready" 50 999999999)" "$(lane_rank "merge:ready" 50 1)"
 
+# --- the pass deadline --------------------------------------------------------
+#
+# The asymmetry is the whole point: a wrong "keep going" costs one more
+# candidate, and a wrong "expired" costs the entire pass — the lane reads
+# nothing and merges nothing, green, forever. So every malformed input is
+# asserted to read as "keep going".
+deadline() { # <expect: expired|running> <desc> <started> <budget> <now>
+  local want="$1" desc="$2" got
+  shift 2
+  if lane_pass_expired "$@"; then got=expired; else got=running; fi
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  args: %s\n  want: %s\n  got:  %s\n' "$desc" "$*" "$want" "$got"
+  fi
+}
+
+deadline running "a fresh pass has its whole budget" 1000 600 1000
+deadline running "one second short of the budget still walks" 1000 600 1599
+deadline expired "the budget is spent at exactly the boundary, not one second after" 1000 600 1600
+deadline expired "a pass well past its budget stops" 1000 600 9999
+
+# A budget of 0 is the documented way to ask for no deadline at all. It must not
+# read as "expired immediately", which would be a lane that reads nothing.
+deadline running "a budget of 0 disables the deadline rather than expiring at once" 1000 0 9999
+deadline running "an empty budget is a missing input, not an expired pass" 1000 "" 9999
+deadline running "a non-numeric budget is a typo, not an expired pass" 1000 "ten minutes" 9999
+deadline running "a negative-looking budget is not a number and does not expire" 1000 -- -600 9999
+deadline running "an unreadable start time does not expire the pass" "" 600 9999
+deadline running "an unreadable clock does not expire the pass" 1000 600 ""
+deadline running "a clock that went backwards is not an expiry" 9999 600 1000
+
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane-decision: $FAIL failed, $PASS passed"
   exit 1
