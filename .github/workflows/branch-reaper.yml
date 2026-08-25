@@ -76,6 +76,13 @@ on:
           label, because hosted minutes are billed there. Must resolve to a
           LINUX runner — this is bash, and reads `date -u -d`, `mapfile` and
           `declare -A`, none of which the fleet's Windows pool provides.
+
+
+          ONE LABEL, OR A JSON ARRAY IN A STRING — never a YAML sequence. This
+          is a `type: string` input, so `runs-on: [self-hosted, linux]` in your
+          caller is a parse error and the workflow never starts. Write
+          `runs-on: my-pool-label` for one label, or
+          `runs-on: '["self-hosted", "linux"]'` for several.
         required: false
         default: ubuntu-latest
         type: string
@@ -119,7 +126,11 @@ jobs:
   reap:
     name: Branch reaper
     # dynamic-runner-allowed(reap, #415): the label is a workflow_call input, scoped by the calling repository
-    runs-on: ${{ inputs.runs-on }}
+    #
+    # Several labels arrive as a JSON array inside the string, because a
+    # `type: string` input cannot carry a list. The `startsWith` guard keeps the
+    # single-label case away from `fromJSON`, which would fail on a bare label.
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
     timeout-minutes: 15
     # Serialised for the same reason the lane is: two runs deleting from the
     # same branch list would each act on a world the other is changing, and the
@@ -143,6 +154,13 @@ jobs:
           repository: ${{ inputs.implementation-repository }}
           ref: ${{ inputs.implementation-ref }}
           persist-credentials: false
+
+      # The fleet's self-hosted images do not ship `gh`, and the reaper is all
+      # `gh api`. Here the consequence is milder than in the lane — a failed
+      # read is a keep — but "kept everything, reported success" is still a
+      # sweep that silently stopped sweeping. See `scripts/ci/ensure-gh.sh`.
+      - name: Ensure the GitHub CLI
+        run: bash scripts/ci/ensure-gh.sh
 
       - name: Mint the merge App token
         id: token

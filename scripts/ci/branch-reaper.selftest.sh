@@ -117,6 +117,22 @@ caps_the_deletions() {
 # Deleting a ref triggers no downstream workflow when done with the built-in
 # token, but more to the point the built-in token cannot delete a protected ref
 # and cannot be audited as a named actor. The App is the one write path.
+# THE DRIVER'S ONLY TOOL HAS TO BE THERE BEFORE THE DRIVER RUNS.
+#
+# The fleet's self-hosted images do not ship `gh`, and the reaper is `gh api`
+# throughout. A failed read is a keep, so the reaper does not delete anything
+# wrong when the CLI is missing — it simply stops sweeping, reports success,
+# and the backlog it exists to prevent grows behind a green daily run. Order is
+# part of the assertion: installing the CLI after the driver is not a fix.
+guarantees_the_cli_it_runs_on() {
+  local code install driver
+  code=$(code_of "$1")
+  matches "$code" 'run: bash scripts/ci/ensure-gh\.sh' || return 1
+  install=$(printf '%s\n' "$code" | grep -n 'ensure-gh\.sh' | head -1 | cut -d: -f1)
+  driver=$(printf '%s\n' "$code" | grep -n 'run: bash scripts/ci/branch-reaper\.sh' | head -1 | cut -d: -f1)
+  [ -n "$install" ] && [ -n "$driver" ] && [ "$install" -lt "$driver" ]
+}
+
 acts_as_the_app() {
   local code
   code=$(code_of "$1")
@@ -155,9 +171,19 @@ is_bounded() {
 # `${{ }}` is spliced in before the shell parses the line, and `keep-patterns`
 # is operator-supplied text arriving in a job that can delete refs. Everything
 # reaches the shell as an environment variable.
+#
+# Collects every `run:` body rather than everything from the first one to the
+# end of the file. The cheaper version held only while the driver step was last
+# in the job: add a step above it and the range swallows the following steps'
+# `env:` blocks, where an expression is exactly how a value is meant to arrive.
 keeps_expressions_out_of_the_shell() {
   local body
-  body=$(sed -n '/^        run: /,$p' "$1")
+  body=$(awk '
+    /^        run:/       { inrun = 1; print; next }
+    inrun && /^ {10,}/    { print; next }
+    inrun && /^[[:space:]]*$/ { print; next }
+                          { inrun = 0 }
+  ' "$1")
   ! matches "$body" '\$\{\{'
 }
 
@@ -416,6 +442,7 @@ check is_bounded "$CALLEE" "the reaper is unbounded, so one run can hold the loc
 check keeps_expressions_out_of_the_shell "$CALLEE" "an expression is interpolated into the shell of a job that can delete refs"
 check delegates_the_decision "$CALLEE" "the callee decides something itself, in YAML, where no pull request can test it"
 check checks_out_its_own_implementation "$CALLEE" "the checkout takes the caller's tree, so every consumer's reaper dies looking for a driver that is not there"
+check guarantees_the_cli_it_runs_on "$CALLEE" "the reaper assumes gh is installed, which is false on the fleet's pool, where it then keeps every branch and reports a successful sweep"
 check passes_every_input_to_the_driver "$CALLEE" "an input is declared and then dropped, so setting it silently does nothing"
 
 check runs_on_a_schedule "$CALLER" "there is no schedule, so the reaper never runs"
@@ -467,6 +494,8 @@ mutate "the deletion cap stops reaching the driver" "$CALLEE" \
   's|^          MAX_DELETIONS: .*|          X_UNUSED: 0|' caps_the_deletions
 mutate "the reaper falls back to the built-in token" "$CALLEE" \
   's@GH_TOKEN: .*steps\.token\.outputs\.token.*@GH_TOKEN: ${{ github.token }}@' acts_as_the_app
+mutate "the CLI install step is dropped" "$CALLEE" \
+  's@^        run: bash scripts/ci/ensure-gh\.sh$@        run: true@' guarantees_the_cli_it_runs_on
 mutate "the checkout starts persisting credentials" "$CALLEE" \
   's|^          persist-credentials: false$|          persist-credentials: true|' never_writes_as_itself
 mutate "the job grants itself contents: write" "$CALLEE" \

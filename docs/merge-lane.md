@@ -185,7 +185,13 @@ jobs:
       # A LINUX label. `self-hosted` alone matches the fleet's Windows pool too,
       # and the lane is bash: `mapfile`, `date -u -d`, `jq`. Use the same
       # Linux-scoped label your CI jobs use. See "minutes", below.
-      runs-on: [self-hosted, linux]
+      #
+      # NOT A YAML SEQUENCE. This is a `type: string` input, so
+      # `runs-on: [self-hosted, linux]` here is a parse error and the workflow
+      # never starts — "A sequence was not expected". One label as a bare
+      # string, or several as a JSON array inside a string:
+      # `runs-on: '["self-hosted", "linux"]'`.
+      runs-on: your-linux-pool-label
       # The SAME sha as the `uses:` pin above. The reusable workflow's own
       # `actions/checkout` clones the CALLER, so the lane has to be told where
       # its driver script lives; left unset it runs the tip of the default
@@ -213,6 +219,22 @@ jobs:
 > CALLER, so the lane cannot find its own repository without being told. Bumping
 > one and not the other runs one version's decisions under another version's
 > wiring, silently.
+>
+> **Pin the COMMIT, not the tag object.** This repository's release tags are
+> *annotated*, so `git/ref/tags/v5.54.0` gives you the sha of the tag object and
+> the commit is one dereference further in. The contents API dereferences that
+> for you, so a file read back at the tag-object sha looks perfectly correct —
+> but the Actions resolver does not, and `uses: …@<tag-object-sha>` resolves to
+> nothing. The run fails as `startup_failure` with no jobs and no annotation,
+> which points at your caller rather than at the pin. Read it as:
+>
+> ```bash
+> gh api repos/Dima-Spectorr/ci-runner-infra/git/ref/tags/v5.54.0 --jq '.object | if .type == "tag" then .url else .sha end'
+> ```
+>
+> A `"tag"` type means one more hop through `git/tags/<sha>`; `gh api
+> repos/OWNER/ci-runner-infra/commits/<sha>` returning 422 is the cheap check
+> that whatever you are about to paste is a commit at all.
 
 **The schedule is a backstop, not the mechanism.** A merge moves the base, which
 makes every other open pull request one commit behind — and that is not a CI
@@ -278,6 +300,30 @@ Every other repository in the fleet is **private**, where GitHub-hosted minutes
 are billed. Those should pass `runs-on: self-hosted`: fleet minutes are free and
 unmetered, and the lane is a handful of API calls with **no sleeps**, so it holds
 a slot for seconds rather than the minutes `mergify-nudge` spent asleep.
+
+### The pool images do not ship `gh`
+
+GitHub-hosted images carry the CLI; the fleet's self-hosted images do not. That
+matters more than a missing tool usually does, because the lane reads **every**
+fact through `gh api ... || true` — so a missing binary reads as *no facts
+available*, the lane concludes there is nothing to merge, and the job goes
+**green**. Seven repositories reported a healthy lane for a morning while
+merging nothing.
+
+Two things fix it, and both are in the workflow already:
+
+- [`scripts/ci/ensure-gh.sh`](../scripts/ci/ensure-gh.sh) runs before the token
+  step and installs the CLI when it is absent — by **digest**, not by tag, into
+  `$RUNNER_TEMP/bin` rather than `/usr/local/bin`, because the pool runs several
+  slots per host as an unprivileged user. On a host that already has `gh` it
+  exits immediately.
+- Failing to read the tip of the base is now **fatal**. Every other early return
+  in the driver means *looked, found nothing*; that one means *could not look at
+  all*, and the two must never render identically.
+
+Baking `gh` into the pool image would make the first of those a no-op. Until
+then, do not remove the step: a lane that cannot read is the one failure mode
+this design cannot tolerate quietly.
 
 ## Landing it: three steps, not one
 

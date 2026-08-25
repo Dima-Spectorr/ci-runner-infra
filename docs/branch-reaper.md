@@ -167,7 +167,12 @@ jobs:
       min-age-days: 14
       # A LINUX label. `self-hosted` alone matches the fleet's Windows pool too,
       # and the driver is bash: `mapfile`, `declare -A`, `date -u -d`, `jq`.
-      runs-on: [self-hosted, linux]
+      #
+      # NOT A YAML SEQUENCE. This is a `type: string` input, so a list here is a
+      # parse error and the workflow never starts. One label as a bare string,
+      # or several as a JSON array inside a string:
+      # `runs-on: '["self-hosted", "linux"]'`.
+      runs-on: your-linux-pool-label
       keep-patterns: |
         release/*
       # The SAME sha as the `uses:` pin above. The reusable workflow's own
