@@ -295,6 +295,20 @@ recovers a missed dispatch. Do not drop it.
 counted as missing and blocks every merge. That is the safe direction, but it is
 a total stop, so keep it in step with your CI.
 
+**A required check that SKIPPED counts as satisfied**, which is what GitHub's own
+branch protection does with one and what Mergify did. A job behind a path filter
+did not run because the diff never reached it. The lane's first position was the
+opposite, and the fleet showed why that is wrong: on 2026-08-25 a pull request
+touching one Markdown file skipped `Web production build` on Apigee-Portal and
+*both* required jobs on CarListPrice, and the lane held both repositories on a
+change nothing could have broken while GitHub reported them mergeable — nothing
+red, nothing merging, which is the Mergify failure this lane exists to end.
+
+`neutral` is still not a pass: a check that ran and declined to judge has said
+something different from one that never had to run. And a skipped requirement is
+never silent — the names are printed with the verdict, so a job that skipped
+because someone broke its `if:` stays visible instead of being absorbed.
+
 ### Seeing the queue
 
 Mergify had a dashboard, and losing it without replacing it would be a real
