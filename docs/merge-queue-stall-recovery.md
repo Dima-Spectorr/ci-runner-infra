@@ -1,5 +1,27 @@
 # When a green pull request stops merging
 
+> **HISTORICAL — every remedy below is a Mergify remedy, and Mergify is gone.**
+>
+> This page documents the failure class that got Mergify removed, and it is kept
+> because the measurements are the argument for the merge lane. But nothing here
+> is a live runbook any more: there is no queue to requeue into, no
+> `@mergifyio` command that anything answers, and no speculative draft to
+> dequeue. Following it would waste an operator's time on a system that is not
+> running.
+>
+> **For a green pull request that is not merging today**, the lane's verdict is
+> written down rather than guessed at — read its status issue and the last lane
+> run's log, which names a reason per pull request. The current shapes and their
+> remedies are in [`merge-lane.md`](merge-lane.md); the two that account for
+> nearly all of it are a label applied after CI went green (nothing dispatched
+> the lane) and a name in `required-checks:` that no workflow produces (a
+> permanent block, with nothing red anywhere).
+>
+> The one thing that carries over intact is the **detection** problem this page
+> opens with, and it is why the lane publishes a queue view at all: a pull
+> request that is green and going nowhere is reported by no metric, no check and
+> no dashboard — only by a human wondering why it has not landed.
+
 This page is about one failure class, and it is the most expensive one this
 fleet produces: a pull request that is **open, mergeable, and fully green**, and
 that does not merge, for hours, because nothing is going to notice.
