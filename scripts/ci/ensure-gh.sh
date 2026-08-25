@@ -68,7 +68,13 @@ tar -xzf "$tmp/$tarball" -C "$tmp"
 # `$RUNNER_TEMP/bin` rather than /usr/local/bin: the pool runs several slots per
 # host as an unprivileged user, and two concurrent jobs writing the same
 # system path is a race that would only ever show up under load.
-dest="${RUNNER_TEMP:-$tmp}/bin"
+#
+# The fallback must NOT be under `$tmp`, which the EXIT trap removes: the binary
+# would be deleted as this script exits, `$GITHUB_PATH` would name a directory
+# that no longer exists, and the caller would see a successful install and no
+# `gh` — the precise failure this script was written to remove. Actions always
+# sets `RUNNER_TEMP`; the fallback is for running this by hand.
+dest="${RUNNER_TEMP:-${HOME:-/tmp}/.cache/ensure-gh}/bin"
 mkdir -p "$dest"
 install -m 0755 "$tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" "$dest/gh"
 
