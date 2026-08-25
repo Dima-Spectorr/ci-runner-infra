@@ -583,7 +583,10 @@ skips_before_it_sleeps() {
 stops_walking_when_the_pass_runs_out_of_time() {
   local code
   code=$(code_of "$1")
-  matches "$code" 'lane_pass_expired "\$LANE_STARTED" "\$PASS_BUDGET"' || return 1
+  # Anchored to the WALK's own call site. Matching the bare name would let this
+  # be satisfied by one of the other two deadline checks — the action loop's and
+  # the batch's — and a walk that lost its deadline would still pass.
+  matches "$code" '^    if lane_pass_expired "\$LANE_STARTED" "\$PASS_BUDGET" ' || return 1
   # Asked at the top of the candidate loop AND around the action loop: four
   # actions are four full walks, and a run killed after its last merge but
   # before the summary reports nothing about what it merged.
@@ -751,6 +754,49 @@ declares_its_inputs_without_a_live_expression() {
   ! matches "$header" '\$\{\{'
 }
 
+# THE BATCH IS A CONSEQUENCE OF THE BASE, NOT A SPEED SETTING.
+#
+# Acting on several candidates from one reading of the world is only sound
+# where a merge cannot invalidate the other verdicts — a base that does not
+# require a branch to be up to date. On a strict base every `behind_by` in the
+# pass is stale the moment something merges, and a batch there would merge
+# against facts that no longer hold. So the widened budget has to stay welded
+# to `LANE_STRICT`; an unguarded `batch=` is the whole defect.
+batches_only_when_the_base_allows_it() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^  local batch=1$' || return 1
+  matches "$code" '^  if \[ "\$LANE_STRICT" = "0" \] \&\& \[ "\$MAX_ACTIONS" -gt "\$acted" \]; then$' || return 1
+  matches "$code" '^    batch=\$\(\(MAX_ACTIONS - acted\)\)$'
+}
+
+# The batch is optional work; the pass deadline is not. A pass that ran out of
+# time still takes its FIRST action -- that is the deadline's own design, the
+# best candidate it managed to read -- but spending the job's remaining
+# publishing headroom on a fifth merge costs the queue snapshot and the
+# annotation that explain why the pass was short.
+stops_batching_at_the_pass_deadline() {
+  matches "$(code_of "$1")" '^      if lane_pass_expired "\$LANE_STARTED" "\$PASS_BUDGET" '
+}
+
+# A refused merge means the world moved — most often that this pass's own
+# earlier merge left the next candidate conflicting. Carrying on down the
+# ranking after a refusal is how a batch turns into a sequence of guesses.
+ends_the_batch_on_a_refusal() {
+  matches "$(code_of "$1")" 'lane_take_action .* \|\| break'
+}
+
+# "Not asked" and "up to date" are different facts. The verdict does not care —
+# it never reads `behind` on a non-strict base — but the queue table is what an
+# operator reads to decide whether the lane is working, and a column of zeroes
+# it never measured is a table that lies.
+says_when_it_did_not_ask_how_far_behind() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" "^      behind_cell='n/a'$" || return 1
+  matches "$code" '^    if \[ "\$LANE_STRICT" = "0" \]; then$'
+}
+
 echo "merge-lane self-test:"
 check declares_its_inputs_without_a_live_expression "$CALLEE" "an input description carries an Actions expression, and one naming vars fails the whole workflow at startup with no jobs and no log to read"
 check documented_label_gate_fails_closed "$DOC" "the documented label gate is wired bare to a variable, so a consumer copying it gets a lane that merges its entire backlog the moment the variable is unset, mistyped or cleared"
@@ -789,6 +835,10 @@ check reads_the_detail_without_collapsing_an_empty_field "$DRIVER" "an unlabelle
 check reports_why_the_comparison_failed "$DRIVER" "a base comparison fails closed without logging the cause, so a permanent block looks like a transient one forever"
 check refuses_a_base_that_moved "$DRIVER" "the base tip is not re-checked before acting, so a push to the base merges a head verified against a base that is gone"
 check announces_a_release_once "$DRIVER" "a release is not recorded per sha, so the lane re-comments on every pass and every sweep"
+check batches_only_when_the_base_allows_it "$DRIVER" "the pass acts on more than one candidate without checking that the base is non-strict, so on a strict base it merges against behind_by values its own earlier merge invalidated"
+check stops_batching_at_the_pass_deadline "$DRIVER" "the batch keeps merging past the pass deadline, so a truncated pass spends the headroom it needs to publish the queue and the annotation explaining the truncation"
+check ends_the_batch_on_a_refusal "$DRIVER" "a refused action does not stop the batch, so the lane keeps working down a ranking the refusal just proved stale"
+check says_when_it_did_not_ask_how_far_behind "$DRIVER" "the queue reports 0 commits behind for a pull request it never compared, so the table an operator trusts is showing a number nothing measured"
 
 check publishes_the_queue_where_it_costs_nothing "$DRIVER" "the queue is not written to the job summary, so the only view of it depends on a permission that may not have been granted"
 check survives_an_unpublishable_status_issue "$DRIVER" "a status issue that cannot be written is not handled, so a missing Issues grant stops the lane merging"
@@ -889,7 +939,7 @@ mutate "the check-run read stops paginating" "$DRIVER" \
 mutate "the pull request list stops paginating" "$DRIVER" \
   's@gh api --paginate "repos/\$R/pulls?state=open@gh api "repos/$R/pulls?state=open@' reads_every_page
 mutate "an unreadable comparison falls back to up-to-date" "$DRIVER" \
-  's@^    if ! behind=@    behind=0; if false; behind=@' fails_closed_on_an_unreadable_comparison
+  's@^      if ! behind=@      behind=0; if false; behind=@' fails_closed_on_an_unreadable_comparison
 
 mutate "the check-run read swallows its exit status again" "$DRIVER" \
   's@if ! runs="\$(gh api --paginate "repos/\$R/commits/\$sha/check-runs@if false; runs="$(gh api --paginate "repos/$R/commits/$sha/check-runs@' \
@@ -917,6 +967,14 @@ mutate "the detail read goes back to a tab split" "$DRIVER" \
   's@^    mapfile -t detail_lines@    IFS=$'"'"'\\t'"'"' read -r mergeable labels sha; mapfile -t detail_lines@' \
   reads_the_detail_without_collapsing_an_empty_field
 
+mutate "the batch stops asking whether the base allows it" "$DRIVER" \
+  's@^  if \[ "\$LANE_STRICT" = "0" \] && @  if @' batches_only_when_the_base_allows_it
+mutate "the batch stops honouring the pass deadline" "$DRIVER"   's@^      if lane_pass_expired @      if false \&\& lane_pass_expired @' stops_batching_at_the_pass_deadline
+mutate "a refused action no longer ends the batch" "$DRIVER" \
+  's@\(lane_take_action .*\) || break@\1 || true@' ends_the_batch_on_a_refusal
+mutate "the unasked comparison starts reporting itself as up to date" "$DRIVER" \
+  "s@^      behind_cell='n/a'\$@      behind_cell=\"\$behind\"@" says_when_it_did_not_ask_how_far_behind
+
 mutate "the comparison error is swallowed again" "$DRIVER" \
   's@2>"\$cmp_err"@2>/dev/null@' reports_why_the_comparison_failed
 mutate "the moved-base guard is removed" "$DRIVER" \
@@ -931,7 +989,7 @@ mutate "an unwritable status issue starts failing the run" "$DRIVER" \
 mutate "the status issue is written without checking what it is" "$DRIVER" \
   's@if \[ "\$kind" != "issue" \]; then@if false; then@' refuses_to_overwrite_a_pull_request_body
 mutate "the unreadable candidates drop out of the view" "$DRIVER" \
-  's@^      queue_row 8 "\$num" "\$title" wait:base-comparison-unreadable.*@      :@' shows_the_candidates_it_could_not_judge
+  's@^        queue_row 8 "\$num" "\$title" wait:base-comparison-unreadable.*@        :@' shows_the_candidates_it_could_not_judge
 mutate "the queue is accumulated across passes instead of reset" "$DRIVER" \
   's@^  QUEUE_ROWS=()$@  :@' snapshots_the_pass_that_just_ran
 mutate "a queue field goes in raw" "$DRIVER" \
