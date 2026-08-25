@@ -34,6 +34,7 @@ CALLER="$ROOT/.github/workflows/merge-lane-self.yml"
 DRIVER="$ROOT/scripts/ci/merge-lane.sh"
 DECISION="$ROOT/scripts/ci/merge-lane-decision.sh"
 CI="$ROOT/.github/workflows/ci.yml"
+DOC="$ROOT/docs/merge-lane.md"
 
 PASS=0
 FAIL=0
@@ -43,7 +44,7 @@ bad() {
   printf 'FAIL: %s\n' "$1"
 }
 
-for f in "$CALLEE" "$CALLER" "$DRIVER" "$DECISION" "$CI"; do
+for f in "$CALLEE" "$CALLER" "$DRIVER" "$DECISION" "$CI" "$DOC"; do
   [ -f "$f" ] || {
     printf 'FAIL: missing %s — every check below would be vacuous\n' "$f"
     exit 1
@@ -348,7 +349,28 @@ check() { # <predicate> <file> <description>
   if "$1" "$2"; then ok; else bad "$3"; fi
 }
 
+# THE DOCUMENTED PIN AND THE DOCUMENTED REF MUST BE THE SAME COMMIT.
+#
+# `docs-pins.selftest.sh` checks the `uses:` line against VERSION and stops
+# there, because for every other workflow in this repository the pin is the
+# whole story. The lane is the exception: a reusable workflow's
+# `actions/checkout` clones the CALLER, so the lane is additionally told where
+# its own driver lives, and `implementation-ref` is a second, unchecked sha
+# sitting eight lines below the first.
+#
+# Bump one and not the other and a consumer runs one release's decision logic
+# under another release's wiring. Nothing fails; the lane just behaves like a
+# version nobody is looking at. The doc says the two must agree — that sentence
+# is a comment, and this is the gate.
+pins_agree_in_the_documented_example() {
+  local doc="$1" pin ref
+  pin=$(grep -oE 'merge-lane\.yml@[0-9a-f]{40}' "$doc" | head -1 | cut -d@ -f2)
+  ref=$(grep -oE 'implementation-ref: [0-9a-f]{40}' "$doc" | head -1 | awk '{print $2}')
+  [ -n "$pin" ] && [ -n "$ref" ] && [ "$pin" = "$ref" ]
+}
+
 echo "merge-lane self-test:"
+check pins_agree_in_the_documented_example "$DOC" "the documented uses: pin and implementation-ref are different commits, so a consumer copying them runs one release's driver under another release's workflow"
 check is_reusable_only "$CALLEE" "the callee has a trigger other than workflow_call, so it can run holding merge authority with no inputs set"
 check acts_as_the_app "$CALLEE" "the lane does not act as the merge App, so its merges and updates trigger no downstream workflow"
 check never_writes_as_itself "$CALLEE" "the built-in token can write, so there are two write paths and the wrong one can be used"

@@ -174,7 +174,7 @@ jobs:
     # Off until an operator confirms the App secrets exist — a dry run still
     # mints the token, so without this the job is red on every CI completion.
     if: vars.MERGE_LANE_ENABLED == 'true'
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@00d3aec8adc67275fe2189c635bdf25cf66bc696 # v5.46.0
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@22549049f59ee3c67f04221c6b1a17d72ec6d83a # v5.53.0
     permissions:
       contents: read
     with:
@@ -190,7 +190,7 @@ jobs:
       # `actions/checkout` clones the CALLER, so the lane has to be told where
       # its driver script lives; left unset it runs the tip of the default
       # branch under a pinned workflow, which is version skew.
-      implementation-ref: 00d3aec8adc67275fe2189c635bdf25cf66bc696
+      implementation-ref: 22549049f59ee3c67f04221c6b1a17d72ec6d83a
       inflight-budget-seconds: 1800
       dry-run: ${{ vars.MERGE_LANE_ARMED != 'true' }}
     secrets:
@@ -198,13 +198,18 @@ jobs:
       app-private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
 ```
 
-> **The pin above is not yet resolvable.** It is this repository's currently
-> documented fleet version, which is what `docs-pins.selftest.sh` asserts — and
-> it predates the lane, so `merge-lane.yml` does not exist in that tree. **Do
-> not copy this into a consumer until the lane has been released.** The cutover
-> below is written in that order for this reason: the lane ships here first, a
-> release tag is cut, and both the `uses:` pin and `implementation-ref` are
-> repointed at that tag before any consumer wires it up.
+> **`v5.53.0` is the first release you may pin.** `v5.52.0` also contains
+> `merge-lane.yml` and you must not use it: the driver in it loses the head sha
+> of any pull request that carries no label, which is nearly all of them, so the
+> lane merges nothing and reports it as an unreadable API comparison — the same
+> line, every fifteen minutes, forever. Fixed in #409, released in `v5.53.0`.
+>
+> **The two shas above must stay equal.** The `uses:` pin selects the workflow;
+> `implementation-ref` selects the driver script it runs, and nothing makes them
+> agree automatically — a reusable workflow's `actions/checkout` clones the
+> CALLER, so the lane cannot find its own repository without being told. Bumping
+> one and not the other runs one version's decisions under another version's
+> wiring, silently.
 
 **The schedule is a backstop, not the mechanism.** A merge moves the base, which
 makes every other open pull request one commit behind — and that is not a CI
