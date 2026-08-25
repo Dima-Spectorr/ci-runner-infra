@@ -123,6 +123,25 @@ Steps 3–5 are the whole point of the two-variable design: reading real verdict
 before granting delete authority is the only honest order, and a scheduled
 workflow cannot run on the pull request that adds it.
 
+**Arm it as part of the cutover, not "later".** A repository left in dry run
+accumulates merged branches at exactly the rate of one with no reaper at all,
+while reading as configured. `ci-runner-infra` itself has been armed since
+2026-08-25 (`dry-run=false`, 257 examined, 0 deleted — nothing in it is
+fourteen days old yet), which is the cheapest moment there is to arm: the
+first armed run against a repository is far less alarming when its would-delete
+list is empty, and the `max-deletions` cap then meters the backlog as branches
+age in rather than clearing it in one sweep.
+
+**Check `max-deletions` against the repository's merge rate.** The cap bounds a
+mistake, but a cap below the rate at which branches age past the threshold is
+not a bound — it is a permanent deficit, and it hides as a green sweep every
+morning while the backlog grows. Count merges per day
+(`gh api --paginate 'repos/OWNER/REPO/pulls?state=closed&per_page=100' --jq
+'.[] | select(.merged_at != null) | .merged_at[0:10]' | sort | uniq -c`) and set
+the cap above the peak, not the average. The default 20 suits a repository
+merging a handful a day; `ci-runner-infra` measured ~25/day with peaks of 50 and
+passes 60.
+
 ### The consumer's caller
 
 ```yaml
