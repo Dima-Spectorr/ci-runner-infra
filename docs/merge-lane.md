@@ -141,6 +141,18 @@ more than one App, so this is the established pattern.
 | Contents | Read & write | the squash merge, and the branch update |
 | Pull requests | Read & write | list, read mergeability, comment on a release |
 | Checks | Read | the required-check state on the head sha |
+| Commit statuses | Read | the OTHER surface a required context can live on |
+
+**Commit statuses is not optional padding, and leaving it out has a measured
+cost.** A required context may be a legacy commit status rather than a
+check-run, so the lane reads both surfaces. Without this grant the status read
+returns `403` — and until 2026-08-25 the driver swallowed that failure into the
+same stream it parsed the check-runs from, so the aggregation collapsed and
+**every required check on a green pull request counted as FAILED**. Six
+repositories reported `skip:red failed=2` over two check-runs that were both
+`success`. The driver now fails loudly instead, but a lane without this
+permission still cannot satisfy a required check that is a commit status, and
+will hold every such pull request forever.
 
 Everything in `github-app-permissions.md` about **how grants work** applies
 unchanged, and is the usual way this goes wrong: a permission added to an App is
@@ -437,7 +449,7 @@ that changes them. So nothing that decides anything lives in either:
 | [`merge-lane-decision.sh`](../scripts/ci/merge-lane-decision.sh) | every decision, as pure functions |
 | [`merge-lane-decision.selftest.sh`](../scripts/ci/merge-lane-decision.selftest.sh) | 55 cases, weighted towards the arms that merge |
 | [`merge-lane.sh`](../scripts/ci/merge-lane.sh) | the API calls, deliberately dull |
-| [`merge-lane.selftest.sh`](../scripts/ci/merge-lane.selftest.sh) | 36 structural assertions with mutations |
+| [`merge-lane.selftest.sh`](../scripts/ci/merge-lane.selftest.sh) | Structural assertions on the workflows and the driver, each with a paired mutation |
 | [`merge-lane.yml`](../.github/workflows/merge-lane.yml) | the reusable callee |
 | [`merge-lane-self.yml`](../.github/workflows/merge-lane-self.yml) | this repository's caller |
 

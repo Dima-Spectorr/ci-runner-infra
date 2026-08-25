@@ -100,15 +100,67 @@ now="$(date -u +%s)"
 check_counts() {
   local sha="$1"
   local runs statuses all
-  runs="$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" \
-    --jq '.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // "")}' 2>/dev/null || true)"
-  statuses="$(gh api --paginate "repos/$R/commits/$sha/status?per_page=100" \
-    --jq '.statuses[] | {name: .context, state: (if .state == "pending" then "pending" else .state end), at: (.updated_at // "")}' 2>/dev/null || true)"
+
+  # `|| true` DOES NOT MEAN "NO DATA". `gh api` writes the error BODY to
+  # STDOUT on a non-2xx, so a swallowed failure does not leave the stream
+  # empty — it leaves one more JSON object in it, with no `.name`. `group_by`
+  # then produces a null key, `map({(.name): .state})` dies on "Object keys
+  # must be strings", `all` comes back EMPTY, and every required check
+  # resolves to the empty string: not `success`, not `pending`, not `absent`,
+  # so the `*)` arm below counts all of them FAILED.
+  #
+  # Measured live on 2026-08-25 against an App token that did not hold
+  # `Commit statuses: read`: two check-runs, both `success`, reported as
+  # `skip:red failed=2` with `0/2` green, in six repositories at once. The
+  # lane was not merging anything and every surface said the pull request was
+  # red. So the exit status is kept, and a failed read never joins the stream.
+  #
+  # EVERY DIAGNOSTIC BELOW GOES TO STDERR. This function's stdout IS its return
+  # value — `counts="$(check_counts "$sha")"` — so a log line written to stdout
+  # would be read as the counts, which is the same class of mistake the rest of
+  # this comment is about.
+  if ! runs="$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" \
+    --jq '.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // "")}' 2>/dev/null)"; then
+    echo "lane: cannot read the check-runs of $sha — the lane is blind, not idle" >&2
+    LANE_FATAL=1
+    echo "0 ${#REQUIRED[@]} 0 0"
+    return
+  fi
+
+  # The status surface is treated differently on purpose. A repository may
+  # legitimately publish no commit statuses at all, and the merge App may not
+  # hold `Commit statuses: read` — neither is a reason to stop merging on the
+  # check-runs that ARE readable. What it is a reason for is saying so once: a
+  # required context that happens to be a legacy status then reads as ABSENT,
+  # the lane skips on `missing-required`, and an operator who was not told
+  # about the 403 has no way to tell that apart from a renamed job.
+  if ! statuses="$(gh api --paginate "repos/$R/commits/$sha/status?per_page=100" \
+    --jq '.statuses[] | {name: .context, state: (if .state == "pending" then "pending" else .state end), at: (.updated_at // "")}' 2>/dev/null)"; then
+    statuses=""
+    if [ -z "${STATUS_SURFACE_WARNED:-}" ]; then
+      echo "lane: WARNING the commit-status surface is unreadable — grant the merge App 'Commit statuses: read'. Check-runs are still read; a required check that is a legacy commit status will count as MISSING and hold the lane." >&2
+      STATUS_SURFACE_WARNED=1
+    fi
+  fi
 
   # Newest wins per name. `--paginate` emits one document per page, so these are
-  # streams of objects rather than one array; `-s` collects the stream.
+  # streams of objects rather than one array; `-s` collects the stream. The
+  # `select` is the second belt on the failure above: anything without a string
+  # name is not a check, and one of them must never be able to void the whole
+  # aggregation.
   all="$(printf '%s\n%s\n' "$runs" "$statuses" \
-    | jq -s 'sort_by(.at) | group_by(.name) | map(.[-1]) | map({(.name): .state}) | add // {}')"
+    | jq -s '[.[] | select(type == "object" and (.name | type) == "string")]
+             | sort_by(.at) | group_by(.name) | map(.[-1]) | map({(.name): .state}) | add // {}')"
+
+  # An empty `all` is what the poisoned stream produced, and it is not the same
+  # thing as a commit with no checks — that is `{}`. Never let it fall through
+  # to the classifier, which would read it as every check failing.
+  if [ -z "$all" ]; then
+    echo "lane: the check surfaces of $sha did not aggregate — the lane is blind, not idle" >&2
+    LANE_FATAL=1
+    echo "0 ${#REQUIRED[@]} 0 0"
+    return
+  fi
 
   local green=0 missing=0 failed=0 pending=0 name state
   for name in "${REQUIRED[@]}"; do
