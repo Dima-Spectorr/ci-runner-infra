@@ -246,7 +246,10 @@ Two surfaces, and the first is not optional:
   the number of an issue and the lane **rewrites its body** after every run. The
   body, never a comment: an edit notifies nobody, where a comment every fifteen
   minutes would make the issue unreadable within a day. Create the issue, pin
-  it, set the variable — no code change.
+  it, set the variable — no code change. It must be a plain **issue**: issues
+  and pull requests share one number space, so the lane confirms what the
+  number points at before writing and refuses rather than overwrite a pull
+  request's description.
 
 The table is ordered by the lane's own ranking, so the **top row is the pull
 request the next action would touch**. Below the actionable rows come the ones

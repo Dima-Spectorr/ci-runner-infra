@@ -486,6 +486,20 @@ publish_status_issue() {
     echo "::warning::status-issue is '$STATUS_ISSUE', which is not an issue number — the queue was written to the job summary only"
     return 0
   fi
+  # ISSUES AND PULL REQUESTS SHARE THE NUMBER SPACE, AND THIS ENDPOINT.
+  #
+  # `repos/<r>/issues/<n>` happily addresses a pull request, so a mistyped
+  # variable does not 404 — it OVERWRITES SOMEONE'S PULL REQUEST DESCRIPTION,
+  # every fifteen minutes, with a table. The lane holds `Contents: write` and
+  # merges code; the one thing it must not do is destroy the text explaining
+  # what is being merged. One GET, once per run, to make that impossible.
+  local kind
+  kind="$(gh api "repos/$R/issues/$STATUS_ISSUE" --jq 'if .pull_request then "pull-request" else "issue" end' 2>/dev/null || echo 'unreadable')"
+  if [ "$kind" != "issue" ]; then
+    echo "::warning::not publishing the queue to #$STATUS_ISSUE — it reads as '$kind', and this lane only ever rewrites the body of a plain issue. The queue is in the job summary."
+    return 0
+  fi
+
   local body
   body="$(render_queue)"
   if gh api -X PATCH "repos/$R/issues/$STATUS_ISSUE" -f body="$body" --silent 2>/dev/null; then

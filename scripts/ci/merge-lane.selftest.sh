@@ -360,6 +360,17 @@ survives_an_unpublishable_status_issue() {
   matches "$code" '::warning::could not update the queue issue'
 }
 
+# Issues and pull requests share one number space and one endpoint, so a
+# mistyped variable does not 404 — it overwrites a pull request's description
+# with a table, on every run. The lane must confirm it is writing to a plain
+# issue before it writes anything.
+refuses_to_overwrite_a_pull_request_body() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'if .pull_request then "pull-request" else "issue" end' || return 1
+  matches "$code" '\[ "\$kind" != "issue" \]'
+}
+
 # THE ROWS THE PASS GAVE UP ON ARE THE ONES WORTH SEEING.
 #
 # Every early `continue` in the candidate loop is a pull request the lane could
@@ -485,6 +496,7 @@ check announces_a_release_once "$DRIVER" "a release is not recorded per sha, so 
 
 check publishes_the_queue_where_it_costs_nothing "$DRIVER" "the queue is not written to the job summary, so the only view of it depends on a permission that may not have been granted"
 check survives_an_unpublishable_status_issue "$DRIVER" "a status issue that cannot be written is not handled, so a missing Issues grant stops the lane merging"
+check refuses_to_overwrite_a_pull_request_body "$DRIVER" "the status-issue number is not confirmed to be an issue, so a typo overwrites a pull request description on every run"
 check shows_the_candidates_it_could_not_judge "$DRIVER" "a pull request the pass gave up on is left out of the queue view, so a broken lane renders as an empty queue"
 check snapshots_the_pass_that_just_ran "$DRIVER" "the queue is not reset per pass, so the published view mixes passes and can show a merged pull request as waiting"
 check never_writes_an_empty_queue_field "$DRIVER" "a queue field can be empty, and tab collapsing then shifts every column after it left"
@@ -579,6 +591,8 @@ mutate "the job summary stops being written" "$DRIVER" \
   's@^publish_step_summary$@# publish_step_summary@' publishes_the_queue_where_it_costs_nothing
 mutate "an unwritable status issue starts failing the run" "$DRIVER" \
   's@::warning::could not update the queue issue@::error::could not update issue@' survives_an_unpublishable_status_issue
+mutate "the status issue is written without checking what it is" "$DRIVER" \
+  's@if \[ "\$kind" != "issue" \]; then@if false; then@' refuses_to_overwrite_a_pull_request_body
 mutate "the unreadable candidates drop out of the view" "$DRIVER" \
   's@^      queue_row 8 "\$num" "\$title" wait:base-comparison-unreadable.*@      :@' shows_the_candidates_it_could_not_judge
 mutate "the queue is accumulated across passes instead of reset" "$DRIVER" \
