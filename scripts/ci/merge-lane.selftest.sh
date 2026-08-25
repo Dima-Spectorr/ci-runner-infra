@@ -603,7 +603,20 @@ documented_example_survives_the_consumer_gates() {
   grep -qE '^ *# remote-reusable-allowed\(Dima-Spectorr/ci-runner-infra/\.github/workflows/merge-lane\.yml, #' "$doc"
 }
 
+# The label gate is the only line in the example whose FAILURE MODE IS SILENCE.
+# `${{ vars.X }}` renders as an empty string when the variable is unset,
+# mistyped, or cleared later by someone tidying settings — and empty means "no
+# label required", so the bare form arms the lane against the whole backlog it
+# was added to hold back, with nothing red anywhere. A consumer copies this
+# example; the example must carry the fallback.
+documented_label_gate_fails_closed() {
+  local doc="$1"
+  grep -qE "require-label: \\\$\{\{ vars\.MERGE_LANE_REQUIRE_LABEL \|\| '[^']+' \}\}" "$doc" || return 1
+  ! grep -qE "require-label: \\\$\{\{ vars\.MERGE_LANE_REQUIRE_LABEL \}\}" "$doc"
+}
+
 echo "merge-lane self-test:"
+check documented_label_gate_fails_closed "$DOC" "the documented label gate is wired bare to a variable, so a consumer copying it gets a lane that merges its entire backlog the moment the variable is unset, mistyped or cleared"
 check documented_example_carries_one_pin "$DOC" "the documented example still sets implementation-ref to a sha, so a consumer copying it reintroduces a second pin Dependabot cannot keep in step with the first"
 check documented_example_survives_the_consumer_gates "$DOC" "the documented example is missing the concurrency block or the RUNNER7 declaration, so a consumer who copies it verbatim gets a caller their own vendored gates reject"
 check is_reusable_only "$CALLEE" "the callee has a trigger other than workflow_call, so it can run holding merge authority with no inputs set"
@@ -775,6 +788,9 @@ mutate "the documented example loses its concurrency block" "$DOC" \
   's@^concurrency:@# concurrency:@' documented_example_survives_the_consumer_gates
 mutate "the documented example loses its RUNNER7 declaration" "$DOC" \
   's@# remote-reusable-allowed@# remote-reusable-was-allowed@' documented_example_survives_the_consumer_gates
+mutate "the documented label gate goes back to the bare variable, which is empty when unset" "$DOC" \
+  "s@require-label: \\\${{ vars.MERGE_LANE_REQUIRE_LABEL || 'ready-to-merge' }}@require-label: \\\${{ vars.MERGE_LANE_REQUIRE_LABEL }}@" \
+  documented_label_gate_fails_closed
 
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane: $FAIL failed, $PASS passed"
