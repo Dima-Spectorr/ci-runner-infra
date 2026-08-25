@@ -132,13 +132,22 @@ on:
           a candidate, which is the behaviour Mergify's `auto_merge_conditions`
           had here and the default this fleet migrates onto.
 
-          DO NOT WIRE THIS STRAIGHT TO A VARIABLE. `${{ vars.X }}` renders as an
-          empty string when the variable is unset, mistyped, or cleared later by
-          someone tidying settings — and empty here means "no label required".
-          A repository arming the lane against a backlog would then merge all of
-          it because of a missing setting. Supply the fallback:
-          `${{ vars.MERGE_LANE_REQUIRE_LABEL || 'ready-to-merge' }}`. Widening
-          becomes a pull request, which is the right price for that decision.
+          DO NOT WIRE THIS STRAIGHT TO A VARIABLE. A bare `vars.X` expression
+          renders as an empty string when the variable is unset, mistyped, or
+          cleared later by someone tidying settings — and empty here means "no
+          label required". A repository arming the lane against a backlog would
+          then merge all of it because of a missing setting. Supply a fallback:
+          `vars.MERGE_LANE_REQUIRE_LABEL || 'ready-to-merge'`, in an expression.
+          Widening becomes a pull request, the right price for that decision.
+
+          The expression syntax is deliberately NOT written out here. An
+          Actions expression inside an input DESCRIPTION is still parsed, and
+          `vars` is not in scope at that point — it is an "Unrecognized
+          named-value" and the workflow fails at startup with no jobs and no
+          log. Measured 2026-08-25: it took every lane run in this repository
+          down for an hour, silently, because a startup failure produces
+          nothing to read. The caller example in `docs/merge-lane.md` shows the
+          full line; a description is prose, and prose is where it belongs.
         required: false
         default: ''
         type: string

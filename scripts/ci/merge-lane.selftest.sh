@@ -631,7 +631,21 @@ documented_label_gate_fails_closed() {
   ! grep -qE "require-label: \\\$\{\{ vars\.MERGE_LANE_REQUIRE_LABEL \}\}" "$doc"
 }
 
+# An Actions expression is parsed wherever it appears in the workflow file —
+# INCLUDING inside an input's `description:`, where `vars` is not in scope. The
+# result is "Unrecognized named-value", a startup failure: no jobs, no log, and
+# nothing on the run to read. Measured 2026-08-25: documenting the label gate's
+# fallback inline took every lane run in this repository down for an hour, and
+# it looked like an outage rather than a syntax error. The header carries prose;
+# the copyable line lives in `docs/merge-lane.md`, which is inert.
+declares_its_inputs_without_a_live_expression() {
+  local header
+  header=$(awk '/^jobs:/ { exit } { print }' "$1")
+  ! matches "$header" '\$\{\{'
+}
+
 echo "merge-lane self-test:"
+check declares_its_inputs_without_a_live_expression "$CALLEE" "an input description carries an Actions expression, and one naming vars fails the whole workflow at startup with no jobs and no log to read"
 check documented_label_gate_fails_closed "$DOC" "the documented label gate is wired bare to a variable, so a consumer copying it gets a lane that merges its entire backlog the moment the variable is unset, mistyped or cleared"
 check documented_example_carries_one_pin "$DOC" "the documented example still sets implementation-ref to a sha, so a consumer copying it reintroduces a second pin Dependabot cannot keep in step with the first"
 check documented_example_survives_the_consumer_gates "$DOC" "the documented example is missing the concurrency block or the RUNNER7 declaration, so a consumer who copies it verbatim gets a caller their own vendored gates reject"
@@ -800,6 +814,10 @@ mutate "the queue is accumulated across passes instead of reset" "$DRIVER" \
   's@^  QUEUE_ROWS=()$@  :@' snapshots_the_pass_that_just_ran
 mutate "a queue field goes in raw" "$DRIVER" \
   's@"\$(qf "\$3")"@"\$3"@' never_writes_an_empty_queue_field
+
+mutate "an input description gets an expression written into it again" "$CALLEE" \
+  's@`vars.MERGE_LANE_REQUIRE_LABEL || .ready-to-merge.`, in an expression.@`${{ vars.MERGE_LANE_REQUIRE_LABEL }}`.@' \
+  declares_its_inputs_without_a_live_expression
 
 mutate "status-issue stops reaching the driver" "$CALLEE" \
   's@^          STATUS_ISSUE: .*@          X_UNUSED: 0@' passes_the_status_issue_to_the_driver
