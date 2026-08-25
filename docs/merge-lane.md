@@ -176,6 +176,12 @@ on:
     types: [completed]
   schedule:
     - cron: '*/15 * * * *'   # the backstop — see below
+  # Only if you gate on a label (`MERGE_LANE_REQUIRE_LABEL`). Labelling is the
+  # last thing to happen on a pull request whose CI is already green, and
+  # nothing else dispatches the lane for it. See "A label applied after the
+  # green", below.
+  pull_request_target:
+    types: [labeled, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -364,6 +370,45 @@ Every other repository in the fleet is **private**, where GitHub-hosted minutes
 are billed. Those should pass `runs-on: self-hosted`: fleet minutes are free and
 unmetered, and the lane is a handful of API calls with **no sleeps**, so it holds
 a slot for seconds rather than the minutes `mergify-nudge` spent asleep.
+
+### A label applied after the green
+
+The two triggers above answer *CI finished* and *time passed*. Neither answers
+**a human labelled it**, and under `MERGE_LANE_REQUIRE_LABEL` that is the event
+that arms a pull request — routinely the LAST thing to happen, because the
+reviewer labels once the checks are already green.
+
+So the ordinary sequence is: CI completes, the lane runs, logs
+`skip:no-label`, and stops. The label arrives a minute later and dispatches
+nothing. The pull request is then green, labelled, `mergeable_state: clean`,
+and waiting on the schedule — which reads as a broken lane, because every
+visible signal says it should have merged. On `*/15` that is a quarter of an
+hour and merely annoying. On the daily cron a repository on hosted runners uses
+to stay cheap, it is **up to 24 hours**, which is worse than the Mergify
+latency this lane was built to remove.
+
+`pull_request_target: [labeled, ready_for_review]` closes it, and it is the
+cheap fix rather than the thorough one on purpose: it dispatches once per label
+event instead of every fifteen minutes forever, so a repository paying for
+hosted minutes gets seconds of latency for a few seconds of billing. Tightening
+the cron instead buys the same latency at 96 runs a day.
+
+Two things make `pull_request_target` safe here, and both must stay true:
+
+- **The lane never checks out the pull request.** Its one `actions/checkout`
+  clones `implementation-repository` at `github.job_workflow_sha` — this
+  repository, at the pinned release. No code from the pull request is read,
+  let alone run, so the usual `pull_request_target` hazard (a privileged token
+  handed to a fork's tree) has nothing to act on.
+- **Labelling requires write access.** A fork author cannot dispatch this;
+  only someone who could already merge can.
+
+`check-runner-policy.sh` RUNNER4 sees `pull_request_target` and marks the
+workflow fork-reachable, which means any **fleet-reachable** job in it needs a
+fork guard. The repositories that need this trigger are the ones on
+`ubuntu-latest`, so nothing in the file is fleet-reachable and the rule is
+already satisfied. If you add the trigger to a lane running on a pool label,
+RUNNER4 will stop you, and it is right to.
 
 ### The pool images do not ship `gh`
 
