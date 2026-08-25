@@ -504,8 +504,57 @@ that says only "not found" cannot be told apart from a gate that is broken.
 
 ### 5.3 Retry granularity
 
-There is no flake-retry policy anywhere. When a flake occurs the whole workflow
-is re-run, multiplying the cost of the flakiest suites. Retry at the test level.
+There is no flake-retry policy anywhere in the fleet. When a flake occurs the
+whole workflow is re-run — every shard, every install, every gate — to re-run
+the one test that wobbled.
+
+The measurement, taken over the last thirty failed `pr-check` runs on the
+largest consumer during the #74 delivery:
+
+| Failing step | Runs |
+|---|---|
+| aggregate (reports the failure, is never the cause) | 30 |
+| `Test (this shard)` | 16 |
+| `Build + typecheck + lint (turbo)` | 9 |
+| `Install Terraform (for the infra gate)` | 4 |
+| Designer module-size | 1 |
+
+**Two rows in that table point in opposite directions, and the second one is
+why this section is not simply "turn retries on".**
+
+The sixteen `Test (this shard)` failures are the waste this section names: one
+shard wobbles and the whole workflow pays.
+
+The four `Install Terraform` failures were **not flakes**. All four exited 141 —
+the `pipefail` defect §5.2 above dissects, fixed in #206 and IntegrateIT #9888.
+It is a buffering race, so a retry would have gone green on a fair share of
+second attempts. A blanket retry policy would have hidden a real bug behind an
+intermittent green, and an intermittent defect is one nobody fixes. **The gate
+that would have concealed it is the one this section recommends** — which is the
+whole reason the shape matters more than the feature.
+
+So, four constraints, and a retry layer that drops any of them costs more than
+the re-runs it saves:
+
+- **Retry at the test level, inside the runner.** Not `retry-on-failure` on the
+  job, not a re-run of the workflow. A framework-level retry re-runs the test;
+  everything around it — checkout, install, build, the other shards — stays
+  done.
+- **Never retry a setup, install or gate step.** Those failures are
+  environmental or they are defects, and both want to be loud. Scope the retry
+  to the test-execution step and nothing else. The Terraform four are what this
+  clause is written against.
+- **A retried pass is a flake, not a green.** If attempt 2 is indistinguishable
+  from attempt 1 in the report, the flake rate stops being observable and the
+  suite rots quietly. Report it, count it, and put the count somewhere someone
+  reads.
+- **Cap it at one retry.** A test that needs two is not flaky, it is broken;
+  that is a quarantine decision, not a retry setting.
+
+**Where this lands is a consumer repository, not this one.** The runners do not
+decide retry policy — the test runner's own configuration does. What belongs
+here is the constraint above, so that a consumer copying this catalog copies the
+trap along with the recommendation.
 
 ---
 
