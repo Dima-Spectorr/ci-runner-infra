@@ -147,7 +147,12 @@ inputs:
 
 outputs:
   url:
-    description: The Postgres URL to hand the suite.
+    description: >-
+      The Postgres URL to hand the suite, carrying `?sslmode=disable`. The
+      server runs without TLS on both branches and nothing else in the string
+      says so, so the action states it rather than leaving each adopter to
+      rediscover it from a handshake error. Do NOT append the parameter again
+      at the consumer — two of them concatenate into an unparseable query.
     value: ${{ steps.resolve.outputs.url }}
   port:
     description: >-
