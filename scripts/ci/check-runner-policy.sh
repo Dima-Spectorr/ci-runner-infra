@@ -170,8 +170,8 @@
 #   transitively.
 #
 # WHY IT PARSES INSTEAD OF GREPPING
-#   The same reason `check-merge-queue-single-step.sh` gives: the properties are
-#   statements about the document GitHub loads, and a line reader gets each one
+#   The properties are statements about the document GitHub loads, and a line
+#   reader gets each one
 #   wrong in the direction that reports clean. `runs-on: self-hosted` is a
 #   string where `runs-on: [self-hosted]` is a list and `runs-on: {group: …}` is
 #   neither; `timeout-minutes` appears at both job and STEP level and only the
@@ -242,9 +242,9 @@ WINDOWS_LABEL='windows'
 
 # --- the parser is a hard dependency, not a nice-to-have ---------------------
 # Conditional, it would be worse than useless: on a runner without PyYAML the
-# gate would report PASS over files it never opened. It installs nothing — see
-# the same note in `check-merge-queue-single-step.sh` for why a required check
-# must not reach PyPI on every pull request in fourteen repositories.
+# gate would report PASS over files it never opened. It installs nothing: a
+# required check must not reach PyPI on every pull request in fourteen
+# repositories.
 export PY_BIN="${PY_BIN:-}"
 py_usable() {
   command -v "$1" >/dev/null 2>&1 &&

@@ -41,9 +41,11 @@ jobs:
   # instead of every job paying for every install.
   #
   # `Shell (syntax + drain rule)` still exists, as the aggregate at the bottom.
-  # That name is a required status check here and is named in `.mergify.yml`, so
-  # it is a CONTRACT, not a label: splitting the work behind it must not change
-  # what the branch ruleset and the merge queue have to wait for.
+  # That name is a required status check here and is named in the merge lane's
+  # `required-checks:`, so it is a CONTRACT, not a label: splitting the work
+  # behind it must not change what the branch ruleset and the lane wait for.
+  # A name the lane cannot find counts as MISSING, which stops the lane rather
+  # than ungating it — the safe direction, and still a stopped lane.
   #
   # A job left out of that aggregate's `needs:` would run, fail, and be waited
   # for by nobody — green queue, red job. So the aggregate does not trust its own
@@ -642,44 +644,14 @@ jobs:
       - name: installer-activation self-test
         run: bash scripts/ci/installer-activation.selftest.sh
 
-      # The fixtures first: a config gate's characteristic failure is a vacuous
-      # pass — it reads a file it never matches and reports clean — so the
-      # detectors are proved to fire before this repository's own config is
-      # believed. Each is asserted on the SET of check ids it plants, and the
-      # count is deliberately not repeated here: a number in prose beside a test
-      # that prints its own is a second source of truth, and it goes stale.
-      - name: merge-queue single-step gate self-test
-        run: bash scripts/ci/check-merge-queue-single-step.sh --selftest
-
-      # …and then the real config. Until this repository had a `.mergify.yml`
-      # only the fixtures ran here, which is the same vacuous pass one level up:
-      # the rule fourteen repositories copy in was asserted everywhere except
-      # where it is published from.
-      - name: merge-queue single-step gate
-        run: bash scripts/ci/check-merge-queue-single-step.sh
-
-      # The scope-coverage gate, published here on the same terms. Its coverage
-      # check is inert while this repository is `mode: serial`, and that is why
-      # it is wired in NOW: the gate has to be in place before a width raise, not
-      # arrive in the pull request that makes it matter. Its fixtures still fire,
-      # so a regression in the script is caught here even though this
-      # repository's own config cannot trip the check it guards.
-      - name: mergify scope-coverage gate self-test
-        run: bash scripts/ci/check-mergify-scopes.sh --selftest
-
-      - name: mergify scope-coverage gate
-        run: bash scripts/ci/check-mergify-scopes.sh
-
-      # The nudge that tells Mergify a webhook did not arrive. It is triggered
-      # by `workflow_run`, GitHub dispatches that from the default branch only,
-      # and so the pull request changing it can never run it — this is the only
-      # thing that can. Structural, on the text of both workflow files and of
-      # `.mergify.yml`'s `commands_restrictions`, with a mutation per property.
-      - name: mergify nudge self-test
-        run: bash scripts/ci/mergify-nudge.selftest.sh
-      # The merge lane replaces Mergify. Both are wired while the lane runs in
-      # dry run; see docs/merge-lane.md for the cutover order and why it is not
-      # one step.
+      # THE MERGE LANE IS THE ONLY MERGE AUTOMATION HERE NOW.
+      #
+      # Three Mergify gates used to run at this point — the single-step queue
+      # rule, the scope-coverage rule, and the nudge's structural test. All
+      # three guarded a `.mergify.yml` this repository no longer has. A gate
+      # that reads a file that does not exist is the vacuous pass those very
+      # gates were written to prevent, so they go out with the config rather
+      # than sit here reporting green over nothing.
       - name: merge-lane decision self-test
         run: bash scripts/ci/merge-lane-decision.selftest.sh
       - name: merge-lane structural self-test
@@ -921,16 +893,16 @@ jobs:
 
   # THE NAME THE REST OF THE WORLD WAITS FOR.
   #
-  # `.mergify.yml` names this string, and so does the branch ruleset's required
-  # check list. Both are outside this file and neither is updated by editing it,
-  # so the name is pinned here and the work moved behind it.
+  # The branch ruleset's required-check list names this string, and so does
+  # `merge-lane-self.yml`'s `required-checks:`. Both are outside this job and
+  # neither is updated by editing it, so the name is pinned here and the work
+  # moved behind it.
   #
   # `if: always()` is what makes it a gate rather than a formality. Without it
   # this job is SKIPPED when a dependency fails, and a skipped required check is
-  # not a failed one — GitHub reports no conclusion, the queue waits forever, and
-  # `.mergify.yml`'s own comment about jobs that "skip and leave the queue
-  # waiting for a conclusion that never comes" describes exactly what it would
-  # have become.
+  # not a failed one: GitHub reports no conclusion, so the lane counts it as
+  # MISSING and waits — correctly, and forever, until the in-flight budget
+  # releases the pull request and says so.
   shell:
     name: Shell (syntax + drain rule)
     runs-on: ubuntu-latest
