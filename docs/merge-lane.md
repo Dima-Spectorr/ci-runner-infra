@@ -333,7 +333,6 @@ find out about it later.
   run, plus an optional pinned issue kept current. See
   [Seeing the queue](#seeing-the-queue). What is genuinely gone is the
   cross-repository view — each repository's lane shows its own queue only.
-
 - **Deleting the head branch after a merge.** Mergify's `delete_head_branch`
   ran at merge time; the lane leaves the branch. That is deliberate — a branch
   deleted seconds after a squash merge is a branch nobody can cherry-pick from
