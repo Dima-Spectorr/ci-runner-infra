@@ -304,6 +304,15 @@ verdict is to grant merge authority first.
    no pull request has to go through the very queue being replaced.
 4. **Only then remove Mergify.** Not before: until the lane has merged
    something, removing Mergify leaves the repository with no automation at all.
+5. **Wire the branch reaper and arm it too.** Mergify's `delete_head_branch`
+   goes away with `.mergify.yml`, so a repository cut over and left there stops
+   cleaning up merged branches entirely — the one capability regression this
+   migration can cause. The reaper needs no new App permission and no new
+   secret; it reuses `MERGE_LANE_ENABLED` plus its own `BRANCH_REAPER_ARMED`.
+   Procedure in [the branch reaper](branch-reaper.md#enabling-it-on-a-repository).
+   **A cutover is not finished until the reaper is armed**, not merely landed:
+   a repository sitting in dry run accumulates branches exactly like one with
+   no reaper at all, and looks configured while doing it.
 
 ### Removing Mergify from a repository
 

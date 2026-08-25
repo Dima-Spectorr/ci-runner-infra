@@ -58,6 +58,22 @@ jobs:
     with:
       min-age-days: 14
 
+      # ABOVE THIS REPOSITORY'S MERGE RATE, WHICH THE DEFAULT OF 20 IS NOT.
+      #
+      # Measured 2026-08-25 over the repository's whole 12-day history: 301
+      # merged pull requests, ~25/day average, peak days of 46 and 50. A cap of
+      # 20 is below both. The failure that produces is quiet and permanent —
+      # branches age past fourteen days faster than a capped run can delete
+      # them, so the backlog grows monotonically and the reaper reports a
+      # successful sweep every morning while losing ground.
+      #
+      # 60 clears the observed peak with headroom. It is still a bound and not
+      # a removal of one: the point of the cap is that a mistaken keep-list
+      # costs a handful of branches and a report rather than the repository,
+      # and 60 of ~300 keeps that property. Consumers keep the default 20
+      # deliberately — no other repository in the fleet merges at this rate.
+      max-deletions: 60
+
       # Nothing in this repository's history needs an exception yet — the
       # default branch and anything GitHub reports as protected are kept without
       # being named, and `chore/release-*` branches are ordinary merged branches
