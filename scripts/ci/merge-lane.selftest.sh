@@ -316,6 +316,39 @@ says_so_when_the_status_surface_is_unreadable() {
   matches "$code" 'hold the lane\." >&2'
 }
 
+# "Once" has to survive a subshell. `check_counts` is called as
+# `counts="$(check_counts …)"`, so a shell variable set inside it is gone by the
+# next call and the warning is re-armed per pull request — measured at one copy
+# per open pull request on two repositories. The marker is therefore a file, in
+# a per-run directory that is removed on exit so it cannot silence the next run.
+says_it_once_across_subshells() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'LANE_TMP="\$\(mktemp -d\)"' || return 1
+  matches "$code" "trap 'rm -rf \"\\\$LANE_TMP\"' EXIT" || return 1
+  matches "$code" 'STATUS_WARN_ONCE="\$LANE_TMP/' || return 1
+  matches "$code" 'if \[ ! -e "\$STATUS_WARN_ONCE" \]' || return 1
+  # And nothing may go back to a variable that a subshell throws away.
+  ! matches "$code" 'STATUS_SURFACE_WARNED'
+}
+
+# Reading `/pulls/<n>` on a pull request nobody has asked about recently
+# ENQUEUES the mergeability computation and returns null in the same breath. One
+# read therefore learns nothing about a stale pull request, which is the normal
+# state of one sitting in a queue — measured as `wait:mergeability-unknown` for
+# every open pull request on two repositories at once, a pass that did nothing.
+asks_again_when_mergeability_is_not_computed_yet() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'while \[ "\$mergeable" = "null" \] && \[ "\$mergeable_try" -lt 2 \]' || return 1
+  matches "$code" 'sleep 2' || return 1
+  # Bounded, or a lane pass hangs on a pull request GitHub will never answer.
+  matches "$code" 'mergeable_try=\$\(\(mergeable_try \+ 1\)\)' || return 1
+  # And the re-read is normalised: `gh api` puts the error body on stdout, so
+  # anything that is not literally true/false has to collapse back to unknown.
+  matches "$code" 'true \| false\) mergeable="\$reread" ;;'
+}
+
 # `behind_by` is the only fact that makes this a queue. A failed comparison must
 # not read as zero: zero means "current with the base", which is precisely the
 # answer that lets a merge through on evidence the lane never gathered.
@@ -598,6 +631,8 @@ check reads_every_page "$DRIVER" "a list endpoint is read unpaginated, so a requ
 check fails_closed_on_an_unreadable_comparison "$DRIVER" "a failed base comparison reads as up-to-date, which is the one answer that lets a merge through"
 check fails_closed_on_an_unreadable_check_surface "$DRIVER" "a failed check read is swallowed into the stream as a nameless object, and every required check on a green pull request then counts as FAILED"
 check says_so_when_the_status_surface_is_unreadable "$DRIVER" "a 403 on the commit-status surface is silent, so a required legacy status reads as missing with nothing naming the cause"
+check asks_again_when_mergeability_is_not_computed_yet "$DRIVER" "the lane reads mergeability once, and the first read is the request rather than the answer, so a stale pull request waits forever"
+check says_it_once_across_subshells "$DRIVER" "the once-guard is a shell variable set inside a subshell, so the warning prints once per pull request instead of once per run"
 check fails_when_it_cannot_read_the_base "$DRIVER" "a lane that cannot read the base exits green with '0 actions', which is exactly what a healthy quiet day looks like"
 check reads_the_detail_without_collapsing_an_empty_field "$DRIVER" "an unlabelled pull request loses its head sha to field collapsing, so the lane can never act on one"
 check reports_why_the_comparison_failed "$DRIVER" "a base comparison fails closed without logging the cause, so a permanent block looks like a transient one forever"
@@ -702,6 +737,12 @@ mutate "the status 403 goes quiet again" "$DRIVER" \
 mutate "a check-surface diagnostic goes to stdout, where it is read as the counts" "$DRIVER" \
   's@the lane is blind, not idle" >&2@the lane is blind, not idle"@' \
   fails_closed_on_an_unreadable_check_surface
+mutate "the once-guard goes back to a variable a subshell throws away" "$DRIVER" \
+  's@if \[ ! -e "\$STATUS_WARN_ONCE" \]; then@if [ -z "${STATUS_SURFACE_WARNED:-}" ]; then@' \
+  says_it_once_across_subshells
+mutate "the mergeability re-read is dropped, so one null answer is the final one" "$DRIVER" \
+  's@while \[ "\$mergeable" = "null" \] \&\& @while false \&\& @' \
+  asks_again_when_mergeability_is_not_computed_yet
 
 mutate "the detail read goes back to a tab split" "$DRIVER" \
   's@^    mapfile -t detail_lines@    IFS=$'"'"'\\t'"'"' read -r mergeable labels sha; mapfile -t detail_lines@' \
