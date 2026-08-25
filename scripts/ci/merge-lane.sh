@@ -25,8 +25,42 @@ MAX_ACTIONS="${MAX_ACTIONS:-4}"
 REQUIRE_LABEL="${REQUIRE_LABEL:-}"
 PRIORITY_PREFIX="${PRIORITY_PREFIX:-merge-lane/priority-}"
 DRY_RUN="${DRY_RUN:-false}"
+STATUS_ISSUE="${STATUS_ISSUE:-}"
 
 R="$GITHUB_REPOSITORY"
+
+# ---------------------------------------------------------------------------
+# THE QUEUE, AS SOMETHING YOU CAN LOOK AT.
+#
+# Mergify had a dashboard. This lane keeps no queue — it recomputes the
+# candidate set from the API on every pass, which is what makes a cancelled
+# pending run lose nothing — so there is no stored list to render. What there
+# is, is the verdict the lane reached for every open pull request on this pass,
+# and that is strictly more informative than a position in a list: it says what
+# each one is waiting for.
+#
+# Every candidate gets a row, INCLUDING the ones the pass gives up on early.
+# A view that silently omits the pull requests the lane could not read is a view
+# that says "the queue is empty" when the truth is "the lane is broken", which
+# is the same class of defect as a gate that reads a file it never matches.
+#
+# The first field is a sort key and is never rendered. Actionable rows carry the
+# lane's own rank key, so the top row is the pull request the next action would
+# touch. Everything else is parked behind them under a leading `8` or `9`, and
+# the ordering inside that tail is deliberate: `8` for the ones the lane could
+# not READ, `9` for the ones it deliberately skipped. A candidate it failed to
+# read is the row someone needs to see first, above every ordinary wait.
+# ---------------------------------------------------------------------------
+QUEUE_ROWS=()
+
+# `-` for an unknown field, never the empty string: every row is split on tabs
+# further down, tab is IFS whitespace, and an empty field would collapse and
+# shift every column after it left. Same defect as the detail read below.
+qf() { [ -n "${1:-}" ] && printf '%s' "$1" || printf -- '-'; }
+
+queue_row() { # <sortkey> <num> <title> <verdict> <priority> <behind> <checks>
+  QUEUE_ROWS+=("$(qf "$1")"$'\t'"$(qf "$2")"$'\t'"$(qf "$3")"$'\t'"$(qf "$4")"$'\t'"$(qf "$5")"$'\t'"$(qf "$6")"$'\t'"$(qf "$7")")
+}
 
 # The required-check names, one per line, blanks dropped. An empty list is not a
 # permissive lane — `lane_verdict` refuses to merge anything when it is empty,
@@ -131,6 +165,14 @@ one_pass() {
     return 1
   fi
 
+  # Reset here, at the top of the pass, and never once per run. Every pass
+  # re-reads the world, so the LAST pass is the only one describing the world as
+  # it is now; the earlier ones describe a world that a merge has already
+  # changed. Above the early return as well as above the loop, or a pass that
+  # finds nothing open would publish the previous pass's rows as if they were
+  # still there.
+  QUEUE_ROWS=()
+
   # Paginated: past a hundred open pull requests on one base, an unpaginated
   # read would make every candidate after the first page permanently invisible
   # — and drafts and red ones, which the lane can never clear, are exactly what
@@ -176,16 +218,22 @@ one_pass() {
     # `wait:base-comparison-unreadable` — a verdict that reads as a transient
     # API problem. `mapfile` splits on newlines only and keeps empty lines, so
     # the field count is checked rather than inferred.
-    local detail_lines=() mergeable labels behind age headdate
+    #
+    # The title is read here rather than in the list call above for the same
+    # reason: it is free text, it is the one field that could itself contain a
+    # tab, and it exists only to be shown in the queue snapshot.
+    local detail_lines=() mergeable labels title behind age headdate
     mapfile -t detail_lines < <(gh api "repos/$R/pulls/$num" \
-      --jq '(.mergeable|tostring), (.labels|map(.name)|join(",")), .head.sha')
-    if [ "${#detail_lines[@]}" -ne 3 ]; then
-      echo "lane: #$num wait:detail-unreadable — the pull request read returned ${#detail_lines[@]} field(s), not 3"
+      --jq '(.mergeable|tostring), (.labels|map(.name)|join(",")), .head.sha, .title')
+    if [ "${#detail_lines[@]}" -ne 4 ]; then
+      echo "lane: #$num wait:detail-unreadable — the pull request read returned ${#detail_lines[@]} field(s), not 4"
+      queue_row 8 "$num" '' wait:detail-unreadable '' '' ''
       continue
     fi
     mergeable="${detail_lines[0]}"
     labels="${detail_lines[1]}"
     sha="${detail_lines[2]}"
+    title="${detail_lines[3]}"
 
     local conflict=''
     case "$mergeable" in
@@ -196,6 +244,7 @@ one_pass() {
 
     if [ -n "$REQUIRE_LABEL" ] && [[ ",$labels," != *",$REQUIRE_LABEL,"* ]]; then
       echo "lane: #$num skip:no-label ($REQUIRE_LABEL)"
+      queue_row 9 "$num" "$title" "skip:no-label($REQUIRE_LABEL)" '' '' ''
       continue
     fi
 
@@ -237,6 +286,7 @@ one_pass() {
       echo "lane: #$num wait:base-comparison-unreadable — not assuming it is current"
       echo "lane: #$num compare said: $(tr '\n' ' ' <"$cmp_err" | cut -c1-400)"
       rm -f "$cmp_err"
+      queue_row 8 "$num" "$title" wait:base-comparison-unreadable "$priority" '' ''
       continue
     fi
     rm -f "$cmp_err"
@@ -265,6 +315,18 @@ one_pass() {
       "${#REQUIRED[@]}" "$green" "$missing" "$failed" "$pending" "$behind" "$age" "$BUDGET")"
 
     echo "lane: #$num $verdict (sha=${sha:0:8} priority=$priority behind=$behind)"
+
+    # Ranked exactly as the lane ranks it when it is actionable, and parked
+    # behind everything actionable when it is not — so the top row is always the
+    # pull request the next action would touch, and the rows under it are an
+    # order rather than a list.
+    if lane_admits "$verdict"; then
+      queue_row "$(lane_rank "$verdict" "$priority" "${age:-0}")" \
+        "$num" "$title" "$verdict" "$priority" "$behind" "$green/${#REQUIRED[@]}"
+    else
+      queue_row "8:$(printf '%03d' "$priority"):$(printf '%08d' "$num")" \
+        "$num" "$title" "$verdict" "$priority" "$behind" "$green/${#REQUIRED[@]}"
+    fi
 
     # A release is a one-shot, not a state the lane keeps re-announcing. The
     # dropped pull request stays open, stays a candidate, and its verdict stays
@@ -351,6 +413,88 @@ one_pass() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# render_queue — the snapshot, as markdown, on stdout.
+#
+# Rows are ranked exactly as the lane ranks them, so the pull request at the top
+# is the one the next action would touch. Everything below it is ordered by the
+# same key, which means the table reads as an ORDER rather than as a list of
+# facts in whatever order the API returned them.
+# ---------------------------------------------------------------------------
+render_queue() {
+  printf '## Merge lane — `%s`\n\n' "$LANE_BASE"
+  if [ "$DRY_RUN" = "true" ]; then
+    printf '> **Dry run.** Every verdict below was computed for real; none was acted on.\n\n'
+  fi
+
+  if [ "${#QUEUE_ROWS[@]}" -eq 0 ]; then
+    printf '_No open pull requests on `%s`._\n\n' "$LANE_BASE"
+  else
+    printf '| pull request | verdict | waiting on | priority | behind | required |\n'
+    printf '|---|---|---|---|---|---|\n'
+    local k n t v p b c reason
+    # Sorted on the hidden first column, which is the lane's own rank key.
+    while IFS=$'\t' read -r k n t v p b c; do
+      : "$k"
+      # A title is free text and a `|` in it would end the cell early, taking
+      # every column after it with it.
+      t="${t//|/\\|}"
+      reason="${v#*:}"
+      [ "$reason" = "$v" ] && reason='—'
+      printf '| [#%s](https://github.com/%s/pull/%s) %s | `%s` | %s | %s | %s | %s |\n' \
+        "$n" "$R" "$n" "$t" "${v%%:*}" "$reason" "$p" "$b" "$c"
+    done < <(printf '%s\n' "${QUEUE_ROWS[@]}" | sort)
+    printf '\n'
+  fi
+
+  printf 'Requires all of:'
+  local c2
+  for c2 in "${REQUIRED[@]}"; do printf ' `%s`' "$c2"; done
+  printf '\n\n'
+
+  printf 'Read %s' "$(date -u +'%Y-%m-%d %H:%M:%SZ')"
+  if [ -n "${GITHUB_RUN_ID:-}" ]; then
+    printf ' by [this run](https://github.com/%s/actions/runs/%s)' "$R" "$GITHUB_RUN_ID"
+  fi
+  printf '. The lane re-reads everything on every pass; nothing here is stored.\n'
+}
+
+# The Actions run page. Free, native, no API call, and it is where someone
+# already is when they go looking at why the lane did what it did.
+publish_step_summary() {
+  [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+  render_queue >>"$GITHUB_STEP_SUMMARY"
+}
+
+# ...and one bookmarkable place that is always current, for someone who is not
+# in the Actions tab. The body is REWRITTEN rather than commented on: an edit
+# notifies nobody, where a comment every fifteen minutes would make the issue
+# unusable within a day.
+#
+# NEEDS `Issues: write` ON THE MERGE APP, WHICH IS NOT `Pull requests: write`.
+# GitHub treats them as separate permissions even though a pull request is an
+# issue, and the lane's existing release comment goes through the pull-request
+# permission. Without the grant this call 404s, which is why it warns and
+# returns rather than failing the run: a queue view that cannot be published is
+# not a reason to stop merging.
+publish_status_issue() {
+  # Unset is the ordinary case and means "summary only". Anything that is not a
+  # positive number is an operator typo, and it gets said out loud rather than
+  # turning into a PATCH against a nonsense path.
+  [ -n "$STATUS_ISSUE" ] || return 0
+  if [[ ! "$STATUS_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "::warning::status-issue is '$STATUS_ISSUE', which is not an issue number — the queue was written to the job summary only"
+    return 0
+  fi
+  local body
+  body="$(render_queue)"
+  if gh api -X PATCH "repos/$R/issues/$STATUS_ISSUE" -f body="$body" --silent 2>/dev/null; then
+    echo "lane: queue published to issue #$STATUS_ISSUE"
+  else
+    echo "::warning::could not update the queue issue #$STATUS_ISSUE — the merge App needs 'Issues: write', and a permission added to an installed App stays pending until the installation owner accepts it. Merging is unaffected."
+  fi
+}
+
 acted=0
 while [ "$acted" -lt "$MAX_ACTIONS" ]; do
   if one_pass; then
@@ -363,5 +507,11 @@ while [ "$acted" -lt "$MAX_ACTIONS" ]; do
     break
   fi
 done
+
+# After the loop, so the snapshot describes the world the lane is LEAVING
+# rather than the one it found — a pull request it just merged is gone from it,
+# and the one that was behind that merge no longer is.
+publish_step_summary
+publish_status_issue
 
 echo "lane: done, $acted action(s)"

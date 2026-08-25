@@ -278,7 +278,7 @@ reads_the_detail_without_collapsing_an_empty_field() {
   local code
   code=$(code_of "$1")
   matches "$code" 'mapfile -t detail_lines' || return 1
-  matches "$code" '\$\{#detail_lines\[@\]\}" -ne 3' || return 1
+  matches "$code" '\$\{#detail_lines\[@\]\}" -ne 4' || return 1
   ! matches "$code" 'read -r mergeable labels sha'
 }
 
@@ -322,6 +322,91 @@ fails_closed_on_empty_configuration() {
   code=$(code_of "$1")
   matches "$code" 'if \[ "\$\{#REQUIRED\[@\]\}" -eq 0 \]' || return 1
   matches "$code" '^  exit 1$'
+}
+
+# ---------------------------------------------------------------------------
+# The queue view: what replaces Mergify's dashboard
+# ---------------------------------------------------------------------------
+#
+# Mergify had a page you could open to see what was queued and why. This lane
+# keeps no queue at all — that is the design, and it is what makes a cancelled
+# pending run cost nothing — so the view has to be rebuilt from the verdicts of
+# the pass that just ran. The properties below are the ones that decide whether
+# that view can be TRUSTED, which is a stronger requirement than whether it
+# renders.
+
+# Free, native, and unconditional. The job summary needs no permission and no
+# API call, so it is the surface that must never be optional: the pinned issue
+# can 404 on a missing grant, and if that were the only view a repository would
+# be flying blind with nothing red to say so.
+publishes_the_queue_where_it_costs_nothing() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'render_queue >>"\$GITHUB_STEP_SUMMARY"' || return 1
+  matches "$code" '^publish_step_summary$'
+}
+
+# The pinned issue is best-effort BY DESIGN. `Issues: write` is a separate grant
+# from `Pull requests: write`, and a permission added to an installed App stays
+# pending until the installation owner accepts it — so the window where this
+# call 404s is the ordinary state of a repository mid-rollout. A lane that
+# stopped merging because it could not draw a table would be a queue view that
+# broke the queue.
+survives_an_unpublishable_status_issue() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^publish_status_issue$' || return 1
+  matches "$code" 'gh api -X PATCH "repos/\$R/issues/\$STATUS_ISSUE"' || return 1
+  matches "$code" '::warning::could not update the queue issue'
+}
+
+# THE ROWS THE PASS GAVE UP ON ARE THE ONES WORTH SEEING.
+#
+# Every early `continue` in the candidate loop is a pull request the lane could
+# not judge. Omitting those from the table renders "the queue is empty" over
+# "the lane is broken" — and that is not hypothetical: the field-collapse defect
+# this file already gates against presented for an hour as a lane that simply
+# had nothing to do.
+shows_the_candidates_it_could_not_judge() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'queue_row 8 "\$num" .. wait:detail-unreadable' || return 1
+  matches "$code" 'queue_row 8 "\$num" "\$title" wait:base-comparison-unreadable' || return 1
+  matches "$code" 'queue_row 9 "\$num" "\$title" "skip:no-label'
+}
+
+# A snapshot of the wrong pass is worse than no snapshot: it shows a pull
+# request the lane merged four seconds ago as still waiting. The reset belongs
+# inside `one_pass`, above the early return as well as above the loop.
+snapshots_the_pass_that_just_ran() {
+  local code n
+  code=$(code_of "$1")
+  # Once at the top level to declare it, once inside the pass to clear it.
+  n=$(printf '%s\n' "$code" | grep -cE '^ *QUEUE_ROWS=\(\)$')
+  [ "${n:-0}" -ge 2 ] || return 1
+  matches "$code" '^  QUEUE_ROWS=\(\)$'
+}
+
+# Same defect as the detail read, one layer up: the rows are tab-joined and then
+# tab-split to render, tab is IFS whitespace, and one empty field would shift
+# every column after it left — quietly, into a table that still looks like a
+# table.
+never_writes_an_empty_queue_field() {
+  local code n
+  code=$(code_of "$1")
+  matches "$code" '^qf\(\) ' || return 1
+  n=$(printf '%s\n' "$code" | grep -oE 'qf "\$[1-7]"' | wc -l)
+  [ "${n:-0}" -eq 7 ]
+}
+
+# The input exists on the callee and reaches the driver. Declaring it and not
+# wiring the environment variable is a silent no-op: the consumer sets a number,
+# the lane accepts it, and nothing is ever published.
+passes_the_status_issue_to_the_driver() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      status-issue:' || return 1
+  matches "$code" 'STATUS_ISSUE: \$\{\{ inputs.status-issue \}\}'
 }
 
 # ---------------------------------------------------------------------------
@@ -397,6 +482,13 @@ check reads_the_detail_without_collapsing_an_empty_field "$DRIVER" "an unlabelle
 check reports_why_the_comparison_failed "$DRIVER" "a base comparison fails closed without logging the cause, so a permanent block looks like a transient one forever"
 check refuses_a_base_that_moved "$DRIVER" "the base tip is not re-checked before acting, so a push to the base merges a head verified against a base that is gone"
 check announces_a_release_once "$DRIVER" "a release is not recorded per sha, so the lane re-comments on every pass and every sweep"
+
+check publishes_the_queue_where_it_costs_nothing "$DRIVER" "the queue is not written to the job summary, so the only view of it depends on a permission that may not have been granted"
+check survives_an_unpublishable_status_issue "$DRIVER" "a status issue that cannot be written is not handled, so a missing Issues grant stops the lane merging"
+check shows_the_candidates_it_could_not_judge "$DRIVER" "a pull request the pass gave up on is left out of the queue view, so a broken lane renders as an empty queue"
+check snapshots_the_pass_that_just_ran "$DRIVER" "the queue is not reset per pass, so the published view mixes passes and can show a merged pull request as waiting"
+check never_writes_an_empty_queue_field "$DRIVER" "a queue field can be empty, and tab collapsing then shifts every column after it left"
+check passes_the_status_issue_to_the_driver "$CALLEE" "status-issue is declared but never reaches the driver, so setting it does nothing"
 
 if required_checks_all_exist_in_ci; then ok; else
   bad "a check named in the caller's required-checks does not match any job name in ci.yml — the lane would count it missing and decline every pull request"
@@ -482,6 +574,20 @@ mutate "the moved-base guard is removed" "$DRIVER" \
   's@\[ "\$base_now" != "\$base_sha" \]@false@' refuses_a_base_that_moved
 mutate "the release stops being recorded per sha" "$DRIVER" \
   's@merge-lane:released:@merge-lane-released@' announces_a_release_once
+
+mutate "the job summary stops being written" "$DRIVER" \
+  's@^publish_step_summary$@# publish_step_summary@' publishes_the_queue_where_it_costs_nothing
+mutate "an unwritable status issue starts failing the run" "$DRIVER" \
+  's@::warning::could not update the queue issue@::error::could not update issue@' survives_an_unpublishable_status_issue
+mutate "the unreadable candidates drop out of the view" "$DRIVER" \
+  's@^      queue_row 8 "\$num" "\$title" wait:base-comparison-unreadable.*@      :@' shows_the_candidates_it_could_not_judge
+mutate "the queue is accumulated across passes instead of reset" "$DRIVER" \
+  's@^  QUEUE_ROWS=()$@  :@' snapshots_the_pass_that_just_ran
+mutate "a queue field goes in raw" "$DRIVER" \
+  's@"\$(qf "\$3")"@"\$3"@' never_writes_an_empty_queue_field
+
+mutate "status-issue stops reaching the driver" "$CALLEE" \
+  's@^          STATUS_ISSUE: .*@          X_UNUSED: 0@' passes_the_status_issue_to_the_driver
 
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane: $FAIL failed, $PASS passed"
