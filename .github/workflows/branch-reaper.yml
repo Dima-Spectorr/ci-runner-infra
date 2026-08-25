@@ -96,11 +96,19 @@ on:
         type: string
       implementation-ref:
         description: >-
-          The ref of `implementation-repository` to run. Set it to the SAME
-          40-hex sha your `uses:` line is pinned to, or the pinned workflow runs
-          an unpinned driver.
+          The ref of `implementation-repository` to run. LEAVE IT UNSET. Empty
+          means "the commit this workflow file was called at", read from
+          `github.job_workflow_sha`, so driver and workflow are the same release
+          by construction.
+
+
+          It used to default to `main`, so every caller repeated its `uses:` sha
+          here. Dependabot rewrites a `uses:` line and cannot see an input
+          value, so an automatic update moved the workflow and left the driver
+          on the previous release. Set this only to run a driver deliberately
+          different from the workflow.
         required: false
-        default: main
+        default: ''
         type: string
       dry-run:
         description: >-
@@ -148,11 +156,15 @@ jobs:
       # write path and it is the audited one.
       contents: read
     steps:
+      # `github.job_workflow_sha` is the commit of THIS reusable workflow file,
+      # i.e. the sha the caller's `uses:` line resolved to. Defaulting the ref
+      # to it makes driver and workflow the same release by construction, and
+      # removes the second unchecked pin a caller used to have to repeat.
       - name: Check out the reaper's implementation
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ inputs.implementation-repository }}
-          ref: ${{ inputs.implementation-ref }}
+          ref: ${{ inputs.implementation-ref || github.job_workflow_sha }}
           persist-credentials: false
 
       # The fleet's self-hosted images do not ship `gh`, and the reaper is all

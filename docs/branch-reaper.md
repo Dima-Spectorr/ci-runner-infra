@@ -175,11 +175,11 @@ jobs:
       runs-on: your-linux-pool-label
       keep-patterns: |
         release/*
-      # The SAME sha as the `uses:` pin above. The reusable workflow's own
-      # `actions/checkout` clones YOUR repository, so the reaper has to be told
-      # where its driver lives; left at the default it runs the tip of our
-      # default branch under a pinned workflow.
-      implementation-ref: 22549049f59ee3c67f04221c6b1a17d72ec6d83a
+      # There is deliberately no `implementation-ref` here. The reaper's own
+      # `actions/checkout` clones YOUR repository, so it must be told where its
+      # driver lives — but the ref defaults to `github.job_workflow_sha`, the
+      # commit the `uses:` line above resolved to. Repeating the sha is a second
+      # pin Dependabot cannot keep in step with the first.
       dry-run: ${{ vars.BRANCH_REAPER_ARMED != 'true' }}
     secrets:
       app-id: ${{ secrets.MERGE_APP_ID }}

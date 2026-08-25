@@ -170,12 +170,22 @@ on:
         type: string
       implementation-ref:
         description: >-
-          The ref of `implementation-repository` to run. Set it to the SAME
-          40-hex sha your `uses:` line is pinned to. Left at the default the
-          lane runs the tip of the default branch under a pinned workflow,
-          which is the version skew the fleet's pin gate exists to stop.
+          The ref of `implementation-repository` to run. LEAVE IT UNSET. Empty
+          means "the commit this workflow file was called at", read from
+          `github.job_workflow_sha`, so the driver and the workflow are the same
+          release by construction and there is nothing left to keep in sync.
+
+
+          It used to default to `main`, and every caller therefore had to repeat
+          its `uses:` sha here. That second sha is the version skew the pin gate
+          exists to stop, and it is worse than an unpinned one: Dependabot bumps
+          a `uses:` line and cannot see an input value, so an automatic update
+          moved the workflow and left the driver behind — a pinned workflow
+          quietly running an older release's decision logic. Set this only to
+          run a driver deliberately different from the workflow, which is a
+          debugging move, not a configuration.
         required: false
-        default: main
+        default: ''
         type: string
       dry-run:
         description: >-
@@ -245,16 +255,23 @@ jobs:
       # behaviour, because its steps run the CALLER's compose file; this
       # workflow needs the opposite, and has to say so.
       #
-      # There is no context in a reusable workflow that names the callee's own
-      # repository and ref, so they are inputs. Pin `implementation-ref` to the
-      # SAME ref your `uses:` line is pinned to: a lane running one version of
-      # the driver under another version of the workflow is exactly the drift
-      # this repository's pin gate exists to prevent.
+      # There is no context naming the callee's REPOSITORY, so that stays an
+      # input. There is one naming its REF: `github.job_workflow_sha` is the
+      # commit of the reusable workflow file this job is running, which is
+      # exactly the sha the caller's `uses:` line resolved to. Defaulting to it
+      # makes driver and workflow the same release by construction.
+      #
+      # The old default was `main`, so every caller repeated its `uses:` sha as
+      # an input — a second, unchecked pin eight lines below the first. That is
+      # the drift the pin gate exists to prevent, and Dependabot made it worse
+      # rather than better: it rewrites a `uses:` line and cannot see an input
+      # value, so an automatic update moved the workflow and left the driver on
+      # the previous release, silently.
       - name: Check out the lane's implementation
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ inputs.implementation-repository }}
-          ref: ${{ inputs.implementation-ref }}
+          ref: ${{ inputs.implementation-ref || github.job_workflow_sha }}
           persist-credentials: false
 
       # THE POOL IMAGES DO NOT SHIP `gh`, AND THE LANE IS ALL `gh api`.

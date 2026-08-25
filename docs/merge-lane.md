@@ -192,11 +192,6 @@ jobs:
       # string, or several as a JSON array inside a string:
       # `runs-on: '["self-hosted", "linux"]'`.
       runs-on: your-linux-pool-label
-      # The SAME sha as the `uses:` pin above. The reusable workflow's own
-      # `actions/checkout` clones the CALLER, so the lane has to be told where
-      # its driver script lives; left unset it runs the tip of the default
-      # branch under a pinned workflow, which is version skew.
-      implementation-ref: 22549049f59ee3c67f04221c6b1a17d72ec6d83a
       inflight-budget-seconds: 1800
       # Optional. An issue whose body the lane rewrites with the queue after
       # every run — see "Seeing the queue". Unset means the job summary only.
@@ -213,12 +208,18 @@ jobs:
 > lane merges nothing and reports it as an unreadable API comparison — the same
 > line, every fifteen minutes, forever. Fixed in #409, released in `v5.53.0`.
 >
-> **The two shas above must stay equal.** The `uses:` pin selects the workflow;
-> `implementation-ref` selects the driver script it runs, and nothing makes them
-> agree automatically — a reusable workflow's `actions/checkout` clones the
-> CALLER, so the lane cannot find its own repository without being told. Bumping
-> one and not the other runs one version's decisions under another version's
-> wiring, silently.
+> **There is one sha, and you do not repeat it.** A reusable workflow's
+> `actions/checkout` clones the CALLER, so the lane does have to be told where
+> its driver lives — but only the *repository*, not the ref. The ref defaults to
+> `github.job_workflow_sha`, the commit this workflow file was called at, which
+> is by definition the sha your `uses:` line resolved to.
+>
+> Callers used to repeat that sha as `implementation-ref`, and that is now
+> wrong rather than merely redundant. Two shas that must agree is a rule a
+> person has to keep, and the bot we delegated updates to cannot keep it:
+> Dependabot rewrites a `uses:` line and cannot see an input value, so an
+> automatic bump moved the workflow and left the driver a release behind. If you
+> are migrating an older caller, **delete the `implementation-ref` line**.
 >
 > **Pin the COMMIT, not the tag object.** This repository's release tags are
 > *annotated*, so `git/ref/tags/v5.54.0` gives you the sha of the tag object and

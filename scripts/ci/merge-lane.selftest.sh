@@ -268,7 +268,7 @@ checks_out_its_own_implementation() {
   local code
   code=$(code_of "$1")
   matches "$code" 'repository: \$\{\{ inputs.implementation-repository \}\}' || return 1
-  matches "$code" 'ref: \$\{\{ inputs.implementation-ref \}\}'
+  matches "$code" 'ref: \$\{\{ inputs.implementation-ref \|\| github.job_workflow_sha \}\}'
 }
 
 # Every list endpoint the lane reads is paginated. Unpaginated, a required check
@@ -492,28 +492,29 @@ check() { # <predicate> <file> <description>
   if "$1" "$2"; then ok; else bad "$3"; fi
 }
 
-# THE DOCUMENTED PIN AND THE DOCUMENTED REF MUST BE THE SAME COMMIT.
+# THE DOCUMENTED EXAMPLE MUST CARRY EXACTLY ONE PIN.
 #
-# `docs-pins.selftest.sh` checks the `uses:` line against VERSION and stops
-# there, because for every other workflow in this repository the pin is the
-# whole story. The lane is the exception: a reusable workflow's
-# `actions/checkout` clones the CALLER, so the lane is additionally told where
-# its own driver lives, and `implementation-ref` is a second, unchecked sha
-# sitting eight lines below the first.
+# This used to assert that two shas AGREED: a `uses:` pin, and an
+# `implementation-ref` input repeating it eight lines below, because a reusable
+# workflow's `actions/checkout` clones the CALLER and the lane had to be told
+# where its own driver lived. Two shas that must agree is a rule someone has to
+# keep, and Dependabot cannot keep it — it rewrites a `uses:` line and cannot
+# see an input value, so an automatic update moved the workflow and left the
+# driver on the previous release.
 #
-# Bump one and not the other and a consumer runs one release's decision logic
-# under another release's wiring. Nothing fails; the lane just behaves like a
-# version nobody is looking at. The doc says the two must agree — that sentence
-# is a comment, and this is the gate.
-pins_agree_in_the_documented_example() {
-  local doc="$1" pin ref
-  pin=$(grep -oE 'merge-lane\.yml@[0-9a-f]{40}' "$doc" | head -1 | cut -d@ -f2)
-  ref=$(grep -oE 'implementation-ref: [0-9a-f]{40}' "$doc" | head -1 | awk '{print $2}')
-  [ -n "$pin" ] && [ -n "$ref" ] && [ "$pin" = "$ref" ]
+# The workflow now defaults the ref to `github.job_workflow_sha`, the commit it
+# was itself called at, so the second sha is not merely unnecessary — a
+# consumer who copies one out of an old example reintroduces the skew by hand.
+# The gate is therefore the opposite of the old one: the example pins the
+# `uses:` line and says nothing else.
+documented_example_carries_one_pin() {
+  local doc="$1"
+  grep -qE 'merge-lane\.yml@[0-9a-f]{40}' "$doc" || return 1
+  ! grep -qE '^ *implementation-ref: [0-9a-f]{40}' "$doc"
 }
 
 echo "merge-lane self-test:"
-check pins_agree_in_the_documented_example "$DOC" "the documented uses: pin and implementation-ref are different commits, so a consumer copying them runs one release's driver under another release's workflow"
+check documented_example_carries_one_pin "$DOC" "the documented example still sets implementation-ref to a sha, so a consumer copying it reintroduces a second pin Dependabot cannot keep in step with the first"
 check is_reusable_only "$CALLEE" "the callee has a trigger other than workflow_call, so it can run holding merge authority with no inputs set"
 check acts_as_the_app "$CALLEE" "the lane does not act as the merge App, so its merges and updates trigger no downstream workflow"
 check never_writes_as_itself "$CALLEE" "the built-in token can write, so there are two write paths and the wrong one can be used"
