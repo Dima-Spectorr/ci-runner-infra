@@ -131,6 +131,14 @@ on:
           means every open, non-draft, unconflicted pull request on the base is
           a candidate, which is the behaviour Mergify's `auto_merge_conditions`
           had here and the default this fleet migrates onto.
+
+          DO NOT WIRE THIS STRAIGHT TO A VARIABLE. `${{ vars.X }}` renders as an
+          empty string when the variable is unset, mistyped, or cleared later by
+          someone tidying settings — and empty here means "no label required".
+          A repository arming the lane against a backlog would then merge all of
+          it because of a missing setting. Supply the fallback:
+          `${{ vars.MERGE_LANE_REQUIRE_LABEL || 'ready-to-merge' }}`. Widening
+          becomes a pull request, which is the right price for that decision.
         required: false
         default: ''
         type: string

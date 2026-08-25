@@ -222,6 +222,16 @@ jobs:
       # `runs-on: '["self-hosted", "linux"]'`.
       runs-on: your-linux-pool-label
       inflight-budget-seconds: 1800
+      # OPT-IN FOR THE FIRST ARMED WEEK. An armed lane merges every open pull
+      # request that is green, and a repository migrating off Mergify is holding
+      # a backlog of exactly those — arming wide open merges months of stale work
+      # in one pass.
+      #
+      # THE FALLBACK IS THE LABEL, NOT EMPTY. `${{ vars.X }}` renders as an empty
+      # string when the variable is unset, mistyped, or cleared later, and empty
+      # means "no label required" — so wiring it bare fails OPEN, and a forgotten
+      # setting releases the backlog. Widening is a pull request, deliberately.
+      require-label: ${{ vars.MERGE_LANE_REQUIRE_LABEL || 'ready-to-merge' }}
       # Optional. An issue whose body the lane rewrites with the queue after
       # every run — see "Seeing the queue". Unset means the job summary only.
       status-issue: ${{ vars.MERGE_LANE_STATUS_ISSUE }}
