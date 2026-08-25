@@ -92,10 +92,12 @@ on:
           Where the lane runs. Defaults to `ubuntu-latest`, which is free and
           unmetered on a PUBLIC repository. A private repository should pass a
           self-hosted label instead: GitHub-hosted minutes are billed there, and
-          self-hosted minutes are not. The job is a handful of API calls with no
-          sleeps, so it holds a slot for seconds. The label must resolve to a
-          LINUX runner: the lane is bash and reads `date -u -d` and `mapfile`,
-          neither of which the fleet's Windows pool provides.
+          self-hosted minutes are not. The job holds a slot for as long as the
+          walk takes -- a few seconds on a quiet base, minutes on one with
+          dozens of open pull requests, bounded by `pass-budget-seconds`. The
+          label must resolve to a LINUX runner: the lane is bash and reads
+          `date -u -d` and `mapfile`, neither of which the fleet's Windows pool
+          provides.
 
 
           ONE LABEL, OR A JSON ARRAY IN A STRING — never a YAML sequence. This
@@ -114,6 +116,28 @@ on:
           a re-run that never reports holds a serial lane forever.
         required: false
         default: 1800
+        type: number
+      pass-budget-seconds:
+        description: >-
+          How long the lane may spend WALKING the open list before it stops,
+          reports what it did not reach and exits on its own terms. A different
+          clock from `inflight-budget-seconds` above: that one is how long a
+          pull request may sit in flight, this one is how long the run may take.
+
+          It exists because the walk costs API calls per open pull request, so
+          it grows with the SIZE of the repository rather than the depth of the
+          queue. A base with dozens of open pull requests can outrun the job's
+          `timeout-minutes` -- and a job killed by that ceiling is reported by
+          GitHub as `cancelled`, exactly like an operator cancelling it, with no
+          annotation, no job summary and no queue update. The lane must run out
+          of time first so that it can SAY it ran out of time.
+
+          Raise it only alongside the job timeout; the self-test asserts the
+          budget still leaves two minutes to publish. `0` disables the deadline
+          and hands the job's ceiling back the job -- available on purpose, and
+          not recommended.
+        required: false
+        default: 600
         type: number
       require-up-to-date:
         description: >-
@@ -339,6 +363,7 @@ jobs:
           LANE_BASE: ${{ inputs.base }}
           REQUIRED_CHECKS: ${{ inputs.required-checks }}
           BUDGET: ${{ inputs.inflight-budget-seconds }}
+          PASS_BUDGET: ${{ inputs.pass-budget-seconds }}
           MAX_ACTIONS: ${{ inputs.max-actions }}
           REQUIRE_UP_TO_DATE: ${{ inputs.require-up-to-date }}
           REQUIRE_LABEL: ${{ inputs.require-label }}

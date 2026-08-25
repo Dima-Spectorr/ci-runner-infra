@@ -21,6 +21,14 @@ source "$HERE/merge-lane-decision.sh"
 LANE_BASE="${LANE_BASE:-main}"
 REQUIRED_CHECKS="${REQUIRED_CHECKS:-}"
 BUDGET="${BUDGET:-1800}"
+# How long the lane may spend WALKING, which is a different clock from `BUDGET`
+# above — that one is how long a pull request may sit in flight before it is
+# released. This one exists so the run ends on its own terms instead of being
+# killed by the job's `timeout-minutes`, because a killed job reports as
+# `cancelled` and is therefore indistinguishable from an operator cancelling it.
+# See `lane_pass_expired`. Must stay comfortably under the workflow's ceiling;
+# the selftest asserts the two numbers against each other.
+PASS_BUDGET="${PASS_BUDGET:-600}"
 MAX_ACTIONS="${MAX_ACTIONS:-4}"
 REQUIRE_LABEL="${REQUIRE_LABEL:-}"
 PRIORITY_PREFIX="${PRIORITY_PREFIX:-merge-lane/priority-}"
@@ -85,10 +93,15 @@ if [ "${#REQUIRED[@]}" -eq 0 ]; then
   exit 1
 fi
 
-echo "lane: base=$LANE_BASE required=${#REQUIRED[@]} budget=${BUDGET}s max-actions=$MAX_ACTIONS dry-run=$DRY_RUN"
+echo "lane: base=$LANE_BASE required=${#REQUIRED[@]} budget=${BUDGET}s pass-budget=${PASS_BUDGET}s max-actions=$MAX_ACTIONS dry-run=$DRY_RUN"
 for c in "${REQUIRED[@]}"; do echo "lane: requires '$c'"; done
 
 now="$(date -u +%s)"
+# The walking clock, set ONCE for the whole run and never refreshed. `now` above
+# is re-read after every action because the verdicts have to describe the world
+# as it is; this one is what the run is measured against, and a deadline that
+# reset itself after each merge would be no deadline at all.
+LANE_STARTED="$now"
 
 # ---------------------------------------------------------------------------
 # check_counts <sha> — how the required checks stand on exactly this commit.
@@ -301,7 +314,7 @@ lane_resolve_strict() {
 # Returns 0 if it acted, 1 if there was nothing to do.
 # ---------------------------------------------------------------------------
 one_pass() {
-  local prs base_sha
+  local base_sha
 
   # THE BASE AS IT STOOD WHEN THIS PASS READ THE WORLD.
   #
@@ -339,27 +352,101 @@ one_pass() {
   # — and drafts and red ones, which the lane can never clear, are exactly what
   # would sit on that page holding a green one out of sight forever.
   #
-  # THREE FIELDS, NONE OF WHICH CAN BE EMPTY, AND THAT IS THE POINT.
+  # FIVE FIELDS, ONE PER LINE, NOT `@tsv` INTO `read`.
   #
-  # Tab is IFS whitespace, so `read` collapses a run of them and an empty field
-  # silently shifts every field after it left. `.number` and `.head.sha` are
-  # always present and `.draft|tostring` is always `true` or `false`, so this
-  # split cannot slide. `mergeable_state` used to be read here as a fourth
-  # field and is not — it is unused, it CAN be empty, and carrying an
-  # empty-able field through a tab split is the defect this comment exists to
-  # stop coming back.
-  prs="$(gh api --paginate "repos/$R/pulls?state=open&base=$LANE_BASE&per_page=100" \
-    --jq '.[] | [.number, .head.sha, (.draft|tostring)] | @tsv')"
-  if [ -z "$prs" ]; then
+  # `labels` is empty for an unlabelled pull request — the ORDINARY case — and
+  # tab is IFS *whitespace*, so a tab split would collapse the run of two
+  # delimiters and shift every field after it left. `mapfile` splits on newlines
+  # only and keeps empty lines, so the field count is CHECKED rather than
+  # inferred. Titles have their newlines flattened for the same reason: a
+  # multi-line title would otherwise be read as several records.
+  #
+  # WHY THE LABEL AND THE TITLE ARE READ HERE RATHER THAN PER PULL REQUEST.
+  #
+  # They used to be read from `/pulls/<n>`, below, which meant the lane paid the
+  # full per-candidate cost — a detail read, up to two more reads two seconds
+  # apart, a base comparison, a head-commit read and two paginated check reads —
+  # for every open pull request INCLUDING the ones it was about to skip for want
+  # of a label. On `IntegrateIT`, where the label gate is on and the great
+  # majority of the ~35 open pull requests do not carry it, that was almost the
+  # entire cost of the pass, spent on candidates the lane had already decided
+  # against. The list call returns both fields for free. Reading them here is
+  # what lets the gate below run before anything else is spent.
+  #
+  # FAIL CLOSED. `gh api` writes the error BODY to stdout on a non-2xx, so the
+  # exit status is kept: a failed list read that fell through as "no open pull
+  # requests" would report a healthy, idle lane on a morning when it could not
+  # see the queue at all.
+  #
+  # And it says WHY, for the reason the base comparison says why: on a schedule,
+  # a missing App permission and a transient 5xx print the same line every
+  # fifteen minutes forever, and nothing distinguishes them.
+  local prs_raw='' list_err
+  list_err="$(mktemp)"
+  if ! prs_raw="$(gh api --paginate "repos/$R/pulls?state=open&base=$LANE_BASE&per_page=100" \
+    --jq '.[] | (.number|tostring), .head.sha, (.draft|tostring), ((.labels // []) | map(.name) | join(",")), ((.title // "") | gsub("[\r\n]"; " "))' 2>"$list_err")"; then
+    echo "lane: cannot list the open pull requests on $LANE_BASE — the lane is blind, not idle"
+    echo "lane: the list read said: $(tr '\n' ' ' <"$list_err" | cut -c1-400)"
+    rm -f "$list_err"
+    LANE_FATAL=1
+    return 1
+  fi
+  rm -f "$list_err"
+  if [ -z "$prs_raw" ]; then
     echo "lane: no open pull requests on $LANE_BASE"
     return 1
   fi
 
-  local candidates=()
-  local num sha draft
+  local pr_fields=()
+  mapfile -t pr_fields <<<"$prs_raw"
+  if [ $((${#pr_fields[@]} % 5)) -ne 0 ]; then
+    echo "lane: the open-pull-request list returned ${#pr_fields[@]} field(s), which is not a whole number of 5-field records — the lane is blind, not idle"
+    LANE_FATAL=1
+    return 1
+  fi
 
-  while IFS=$'\t' read -r num sha draft; do
+  local total=$((${#pr_fields[@]} / 5))
+  local candidates=()
+  # `-1`, not `0`, and the test below is `-ge 0`. A deadline that expired on the
+  # very FIRST candidate truncates at index 0, and a `-gt 0` test would report
+  # that pass — the worst one, the one that read nothing at all — as complete.
+  local num sha draft i idx read_count=0 truncated_at=-1
+
+  for ((i = 0; i < total; i++)); do
+    idx=$((i * 5))
+    num="${pr_fields[idx]}"
+    sha="${pr_fields[idx + 1]}"
+    draft="${pr_fields[idx + 2]}"
+    local list_labels="${pr_fields[idx + 3]}"
+    local list_title="${pr_fields[idx + 4]}"
     [ -n "$num" ] || continue
+
+    # THE DEADLINE, CHECKED BEFORE THE WORK RATHER THAN AFTER IT.
+    #
+    # Asking here means the lane never STARTS a candidate it cannot afford to
+    # finish, so the pass always ends between candidates with a consistent view
+    # rather than halfway through reading one. What is left unread is recorded
+    # as unread — see the queue rows below — because a candidate missing from
+    # the snapshot reads as "not in the queue", which is a lie the operator has
+    # no way to catch.
+    if lane_pass_expired "$LANE_STARTED" "$PASS_BUDGET" "$(date -u +%s)"; then
+      truncated_at=$i
+      break
+    fi
+    read_count=$((read_count + 1))
+
+    # THE CHEAP GATE GOES FIRST, AND COSTS NOTHING.
+    #
+    # Everything below this line is an API call. The label came out of the list
+    # read above, so a pull request that is not a candidate is dismissed for
+    # zero calls and zero sleeps. It is still given a queue row: "the lane
+    # looked at this and it is not labelled" is a different statement from "the
+    # lane has not looked", and the snapshot has to be able to say which.
+    if [ -n "$REQUIRE_LABEL" ] && [[ ",$list_labels," != *",$REQUIRE_LABEL,"* ]]; then
+      echo "lane: #$num skip:no-label ($REQUIRE_LABEL)"
+      queue_row 9 "$num" "$list_title" "skip:no-label($REQUIRE_LABEL)" '' '' ''
+      continue
+    fi
 
     # `mergeable` is computed asynchronously and is null until GitHub has done
     # it, which is why the list call above is not enough — the list does not
@@ -380,21 +467,35 @@ one_pass() {
     # API problem. `mapfile` splits on newlines only and keeps empty lines, so
     # the field count is checked rather than inferred.
     #
-    # The title is read here rather than in the list call above for the same
-    # reason: it is free text, it is the one field that could itself contain a
-    # tab, and it exists only to be shown in the queue snapshot.
+    # Labels, the head sha and the title all arrived from the list read already.
+    # They are re-read here anyway, at no extra cost, because this call is the
+    # fresher of the two and it is the one the merge is decided on: a label
+    # removed, or a commit pushed, in the seconds between the list and this
+    # point should be seen. The list copies are the CHEAP filter above; these
+    # are the authoritative ones.
     local detail_lines=() mergeable labels title behind age headdate
     mapfile -t detail_lines < <(gh api "repos/$R/pulls/$num" \
       --jq '(.mergeable|tostring), (.labels|map(.name)|join(",")), .head.sha, .title')
     if [ "${#detail_lines[@]}" -ne 4 ]; then
       echo "lane: #$num wait:detail-unreadable — the pull request read returned ${#detail_lines[@]} field(s), not 4"
-      queue_row 8 "$num" '' wait:detail-unreadable '' '' ''
+      queue_row 8 "$num" "$list_title" wait:detail-unreadable '' '' ''
       continue
     fi
     mergeable="${detail_lines[0]}"
     labels="${detail_lines[1]}"
     sha="${detail_lines[2]}"
     title="${detail_lines[3]}"
+
+    # The gate again, on the authoritative copy, and ABOVE the retry loop below.
+    # It can only fire when the label was removed in the last second or two, but
+    # where it sits matters more than how often it fires: the loop under it
+    # sleeps, and sleeping for a pull request the lane has already decided to
+    # skip is precisely the cost that made a pass outlive its job.
+    if [ -n "$REQUIRE_LABEL" ] && [[ ",$labels," != *",$REQUIRE_LABEL,"* ]]; then
+      echo "lane: #$num skip:no-label ($REQUIRE_LABEL)"
+      queue_row 9 "$num" "$title" "skip:no-label($REQUIRE_LABEL)" '' '' ''
+      continue
+    fi
 
     # THE FIRST READ IS THE REQUEST, NOT THE ANSWER. GitHub computes
     # mergeability lazily: reading `/pulls/<n>` on a pull request nobody has
@@ -433,12 +534,6 @@ one_pass() {
       false) conflict=1 ;;
       *) conflict='' ;;
     esac
-
-    if [ -n "$REQUIRE_LABEL" ] && [[ ",$labels," != *",$REQUIRE_LABEL,"* ]]; then
-      echo "lane: #$num skip:no-label ($REQUIRE_LABEL)"
-      queue_row 9 "$num" "$title" "skip:no-label($REQUIRE_LABEL)" '' '' ''
-      continue
-    fi
 
     local priority=50 l _labels
     IFS=',' read -ra _labels <<<"$labels"
@@ -556,7 +651,24 @@ one_pass() {
       key="$(lane_rank "$verdict" "$priority" "${age:-0}")"
       candidates+=("$key	$num	$sha	$verdict")
     fi
-  done <<<"$prs"
+  done
+
+  # THE PASS RAN OUT OF TIME, AND SAYS SO.
+  #
+  # A warning annotation rather than a failure: a repository with more open pull
+  # requests than the lane can walk in one pass is busy, not broken, and the
+  # lane still acts on the best candidate it did read. What must not happen is
+  # the truncation being silent — every unread candidate gets a row of its own,
+  # under the `8` band that means "the lane could not read this", so the queue
+  # snapshot can never show a short list as if it were the whole one.
+  if [ "$truncated_at" -ge 0 ]; then
+    echo "::warning::lane: pass truncated after ${PASS_BUDGET}s — read $read_count of $total open pull request(s) on $LANE_BASE. The rest are UNREAD this pass, not idle. The next pass starts from the top of the list again, so raise 'pass-budget-seconds' (keeping it under the job's timeout-minutes), narrow the candidate set with a label, or close what is stale."
+    local j jdx
+    for ((j = truncated_at; j < total; j++)); do
+      jdx=$((j * 5))
+      queue_row 8 "${pr_fields[jdx]}" "${pr_fields[jdx + 4]}" wait:not-read-this-pass '' '' ''
+    done
+  fi
 
   if [ "${#candidates[@]}" -eq 0 ]; then
     echo "lane: nothing actionable this pass"
@@ -624,8 +736,20 @@ one_pass() {
   while IFS=$'\t' read -r _ action_num action_sha action_verdict; do
     [ -n "$action_num" ] || continue
     [ "$PASS_ACTED" -lt "$batch" ] || break
-    if [ "$PASS_ACTED" -gt 0 ] && [ "${action_verdict%%:*}" != "merge" ]; then
-      break
+    if [ "$PASS_ACTED" -gt 0 ]; then
+      # Only merges batch. A `drop` is a comment the lane owes anyway, but an
+      # `update` starts a CI run the next candidate might depend on.
+      [ "${action_verdict%%:*}" = "merge" ] || break
+      # And only within the pass deadline. The FIRST action is deliberately
+      # exempt: a pass that ran out of time still acts on the best candidate it
+      # managed to read, which is the behaviour the deadline was designed
+      # around. Every action after it is optional, and spending the job's
+      # remaining two minutes of publishing headroom on one more merge costs
+      # the queue snapshot and the annotation that explain the truncation.
+      if lane_pass_expired "$LANE_STARTED" "$PASS_BUDGET" "$(date -u +%s)"; then
+        echo "lane: pass deadline reached after $PASS_ACTED action(s) — the rest wait for the next pass"
+        break
+      fi
     fi
     lane_take_action "$action_num" "$action_sha" "$action_verdict" || break
     PASS_ACTED=$((PASS_ACTED + 1))
@@ -788,6 +912,14 @@ PASS_ACTED=0
 # Set by `one_pass` when the lane could not read the world it is meant to judge.
 LANE_FATAL=0
 while [ "$acted" -lt "$MAX_ACTIONS" ]; do
+  # `MAX_ACTIONS` bounds how much the lane DOES; this bounds how long it takes
+  # to do it. Each pass re-walks the whole list, so four actions can cost four
+  # full walks — and a run killed between its last merge and
+  # `publish_step_summary` merges code and then reports nothing about it.
+  if lane_pass_expired "$LANE_STARTED" "$PASS_BUDGET" "$(date -u +%s)"; then
+    echo "::warning::lane: stopping after $acted action(s) — the ${PASS_BUDGET}s pass budget is spent. Whatever is still actionable is picked up by the next trigger or by the cron backstop; nothing is lost."
+    break
+  fi
   if one_pass; then
     acted=$((acted + PASS_ACTED))
     # The world changed: a merge just moved the base, so everything else is now

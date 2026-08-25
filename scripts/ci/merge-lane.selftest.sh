@@ -495,9 +495,13 @@ refuses_to_overwrite_a_pull_request_body() {
 shows_the_candidates_it_could_not_judge() {
   local code
   code=$(code_of "$1")
-  matches "$code" 'queue_row 8 "\$num" .. wait:detail-unreadable' || return 1
+  matches "$code" 'queue_row 8 "\$num" "\$list_title" wait:detail-unreadable' || return 1
   matches "$code" 'queue_row 8 "\$num" "\$title" wait:base-comparison-unreadable' || return 1
-  matches "$code" 'queue_row 9 "\$num" "\$title" "skip:no-label'
+  matches "$code" 'queue_row 9 "\$num" "\$list_title" "skip:no-label' || return 1
+  # A candidate the pass ran out of time to reach is the newest way to be
+  # invisible, and the one an operator is least likely to suspect: the lane is
+  # green, it merged something, and the snapshot is simply short.
+  matches "$code" 'queue_row 8 ".*" ".*" wait:not-read-this-pass'
 }
 
 # A snapshot of the wrong pass is worse than no snapshot: it shows a pull
@@ -527,6 +531,112 @@ never_writes_an_empty_queue_field() {
 # The input exists on the callee and reaches the driver. Declaring it and not
 # wiring the environment variable is a silent no-op: the consumer sets a number,
 # the lane accepts it, and nothing is ever published.
+# The line number of the first match, in the comment-stripped text. `grep -v`
+# renumbers, but it preserves ORDER, and order is the whole of what these
+# assertions are about: which of two things the lane does first.
+line_of() { # <text> <ere>
+  printf '%s\n' "$1" | grep -nE -- "$2" | head -1 | cut -d: -f1
+}
+
+before() { # <text> <ere-first> <ere-second>
+  local a b
+  a=$(line_of "$1" "$2")
+  b=$(line_of "$1" "$3")
+  [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]
+}
+
+# ---------------------------------------------------------------------------
+# The cost of a pass. #444.
+#
+# A lane pass reads the whole open list and then spends five or six API calls
+# and up to four seconds of sleeps on each candidate. When those were spent on
+# every open pull request — including the ones about to be skipped for want of
+# the label — the cost tracked the SIZE OF THE REPOSITORY rather than the depth
+# of the queue, and on IntegrateIT (~35 open) every pass ran past the job's
+# fifteen-minute ceiling and was killed. Thirty consecutive runs merged nothing.
+#
+# The reason that went unnoticed for a day is the fact worth remembering: a
+# `timeout-minutes` kill is reported as `cancelled`, which is also what an
+# operator cancelling produces and what `concurrency` eviction produces. There
+# is no annotation and no summary. So both halves are asserted here — the label
+# must be judged before anything is spent, and the lane must run out of time
+# before the job does, so that it ends by SAYING it ran out of time.
+# ---------------------------------------------------------------------------
+gates_on_the_label_before_it_spends_anything() {
+  local code
+  code=$(code_of "$1")
+  # The list read has to carry the label, or the gate below has nothing cheap
+  # to read and the per-pull-request call comes back.
+  matches "$code" '\.labels // \[\]\) \| map\(\.name\)' || return 1
+  matches "$code" 'list_labels="\$\{pr_fields' || return 1
+  before "$code" '",\$list_labels," != ' 'gh api "repos/\$R/pulls/\$num"'
+}
+
+skips_before_it_sleeps() {
+  local code
+  code=$(code_of "$1")
+  # The authoritative gate, on the detail read's copy, still sits above the
+  # mergeability retry loop — the only place in the pass that sleeps.
+  before "$code" '",\$labels," != ' '^      sleep '
+}
+
+stops_walking_when_the_pass_runs_out_of_time() {
+  local code
+  code=$(code_of "$1")
+  # Anchored to the WALK's own call site. Matching the bare name would let this
+  # be satisfied by one of the other two deadline checks — the action loop's and
+  # the batch's — and a walk that lost its deadline would still pass.
+  matches "$code" '^    if lane_pass_expired "\$LANE_STARTED" "\$PASS_BUDGET" ' || return 1
+  # Asked at the top of the candidate loop AND around the action loop: four
+  # actions are four full walks, and a run killed after its last merge but
+  # before the summary reports nothing about what it merged.
+  [ "$(printf '%s\n' "$code" | grep -cE 'lane_pass_expired')" -ge 2 ] || return 1
+  matches "$code" 'truncated_at=-1' || return 1
+  matches "$code" '"\$truncated_at" -ge 0' || return 1
+  matches "$code" '::warning::lane: pass truncated' || return 1
+  # The counts, not just the fact. "Read 4 of 35" is what tells an operator
+  # whether to raise the budget or close some pull requests.
+  matches "$code" 'read \$read_count of \$total'
+}
+
+the_lane_runs_out_of_time_before_the_job_does() {
+  local budget timeout
+  budget=$(awk '/^      pass-budget-seconds:/{f=1} f&&/^ *default:/{print;exit}' "$1" | grep -oE '[0-9]+')
+  timeout=$(grep -oE '^    timeout-minutes: [0-9]+' "$1" | grep -oE '[0-9]+' | head -1)
+  [ -n "$budget" ] && [ -n "$timeout" ] || return 1
+  # A margin, not merely "less than". The budget is checked BETWEEN candidates,
+  # so the lane can overshoot it by however long one candidate takes, and it
+  # still has to publish the summary and the queue issue afterwards. A budget
+  # that only just fits inside the ceiling would be killed doing exactly that,
+  # and a run that merges and then reports nothing is worse than one that
+  # merges nothing.
+  [ "$((budget + 120))" -le "$((timeout * 60))" ] || return 1
+  local driver_default
+  driver_default=$(grep -oE '^PASS_BUDGET="\$\{PASS_BUDGET:-[0-9]+\}"' "$DRIVER" | grep -oE '[0-9]+')
+  [ -n "$driver_default" ] || return 1
+  # The driver's own fallback is what applies when someone runs it by hand or
+  # from a caller that predates the input, so it is held to the same ceiling.
+  [ "$((driver_default + 120))" -le "$((timeout * 60))" ]
+}
+
+passes_the_pass_budget_to_the_driver() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      pass-budget-seconds:' || return 1
+  matches "$code" 'PASS_BUDGET: \$\{\{ inputs.pass-budget-seconds \}\}'
+}
+
+fails_closed_on_an_unreadable_pull_request_list() {
+  local code
+  code=$(code_of "$1")
+  # `gh api` writes the error body to stdout, so a list read that dropped its
+  # exit status would hand back a JSON document and then — because that is not
+  # five fields per record — either report a healthy quiet day or read garbage.
+  matches "$code" 'if ! prs_raw="\$\(gh api --paginate "repos/\$R/pulls\?state=open' || return 1
+  matches "$code" '\$\{#pr_fields\[@\]\} % 5\)\) -ne 0' || return 1
+  [ "$(printf '%s\n' "$code" | grep -cE 'LANE_FATAL=1')" -ge 4 ]
+}
+
 passes_the_status_issue_to_the_driver() {
   local code
   code=$(code_of "$1")
@@ -660,6 +770,15 @@ batches_only_when_the_base_allows_it() {
   matches "$code" '^    batch=\$\(\(MAX_ACTIONS - acted\)\)$'
 }
 
+# The batch is optional work; the pass deadline is not. A pass that ran out of
+# time still takes its FIRST action -- that is the deadline's own design, the
+# best candidate it managed to read -- but spending the job's remaining
+# publishing headroom on a fifth merge costs the queue snapshot and the
+# annotation that explain why the pass was short.
+stops_batching_at_the_pass_deadline() {
+  matches "$(code_of "$1")" '^      if lane_pass_expired "\$LANE_STARTED" "\$PASS_BUDGET" '
+}
+
 # A refused merge means the world moved — most often that this pass's own
 # earlier merge left the next candidate conflicting. Carrying on down the
 # ranking after a refusal is how a batch turns into a sequence of guesses.
@@ -717,6 +836,7 @@ check reports_why_the_comparison_failed "$DRIVER" "a base comparison fails close
 check refuses_a_base_that_moved "$DRIVER" "the base tip is not re-checked before acting, so a push to the base merges a head verified against a base that is gone"
 check announces_a_release_once "$DRIVER" "a release is not recorded per sha, so the lane re-comments on every pass and every sweep"
 check batches_only_when_the_base_allows_it "$DRIVER" "the pass acts on more than one candidate without checking that the base is non-strict, so on a strict base it merges against behind_by values its own earlier merge invalidated"
+check stops_batching_at_the_pass_deadline "$DRIVER" "the batch keeps merging past the pass deadline, so a truncated pass spends the headroom it needs to publish the queue and the annotation explaining the truncation"
 check ends_the_batch_on_a_refusal "$DRIVER" "a refused action does not stop the batch, so the lane keeps working down a ranking the refusal just proved stale"
 check says_when_it_did_not_ask_how_far_behind "$DRIVER" "the queue reports 0 commits behind for a pull request it never compared, so the table an operator trusts is showing a number nothing measured"
 
@@ -728,6 +848,13 @@ check snapshots_the_pass_that_just_ran "$DRIVER" "the queue is not reset per pas
 check never_writes_an_empty_queue_field "$DRIVER" "a queue field can be empty, and tab collapsing then shifts every column after it left"
 check passes_the_status_issue_to_the_driver "$CALLEE" "status-issue is declared but never reaches the driver, so setting it does nothing"
 
+check gates_on_the_label_before_it_spends_anything "$DRIVER" "the label is read per pull request, so the lane pays a detail read, two sleeps, a comparison and two check reads for every candidate it is about to skip — and the pass then costs the size of the repository rather than the depth of the queue (#444)"
+check skips_before_it_sleeps "$DRIVER" "the mergeability retry loop sleeps above the label gate, so the lane waits four seconds per pull request it has already decided to skip"
+check stops_walking_when_the_pass_runs_out_of_time "$DRIVER" "a pass has no deadline of its own, so it is killed by the job's timeout-minutes instead — and that kill reports as 'cancelled', which is indistinguishable from an operator cancelling it and leaves no annotation, no summary and no queue update (#444)"
+check fails_closed_on_an_unreadable_pull_request_list "$DRIVER" "a failed list read falls through as 'no open pull requests', so a lane that cannot see the queue reports a quiet day"
+check passes_the_pass_budget_to_the_driver "$CALLEE" "pass-budget-seconds is declared but never reaches the driver, so setting it does nothing"
+check the_lane_runs_out_of_time_before_the_job_does "$CALLEE" "the pass budget does not leave the lane two minutes to finish inside the job's timeout-minutes — raise the timeout or lower the budget, but never let the job's ceiling arrive first: that kill reports as 'cancelled' and publishes nothing"
+
 if required_checks_all_exist_in_ci; then ok; else
   bad "a check named in the caller's required-checks does not match any job name in ci.yml — the lane would count it missing and decline every pull request"
 fi
@@ -738,7 +865,15 @@ fi
 mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
   local desc="$1" f="$2" prog="$3" pred="$4" tmp
   tmp=$(mktemp)
-  sed "$prog" "$f" >"$tmp"
+  # A sed that ERRORS writes nothing, and an empty file fails every predicate —
+  # so a broken mutation program reported as a passing assertion. Caught twice
+  # while writing the #444 cases; the delimiter and the escaping are easy to get
+  # wrong and nothing said so.
+  if ! sed "$prog" "$f" >"$tmp" 2>/dev/null; then
+    bad "the mutation program is not valid sed, so it asserts nothing: $desc"
+    rm -f "$tmp"
+    return
+  fi
   if cmp -s "$tmp" "$f"; then
     bad "mutation changed nothing, so it asserts nothing: $desc"
   elif "$pred" "$tmp"; then
@@ -834,6 +969,7 @@ mutate "the detail read goes back to a tab split" "$DRIVER" \
 
 mutate "the batch stops asking whether the base allows it" "$DRIVER" \
   's@^  if \[ "\$LANE_STRICT" = "0" \] && @  if @' batches_only_when_the_base_allows_it
+mutate "the batch stops honouring the pass deadline" "$DRIVER"   's@^      if lane_pass_expired @      if false \&\& lane_pass_expired @' stops_batching_at_the_pass_deadline
 mutate "a refused action no longer ends the batch" "$DRIVER" \
   's@\(lane_take_action .*\) || break@\1 || true@' ends_the_batch_on_a_refusal
 mutate "the unasked comparison starts reporting itself as up to date" "$DRIVER" \
@@ -865,6 +1001,46 @@ mutate "an input description gets an expression written into it again" "$CALLEE"
 
 mutate "status-issue stops reaching the driver" "$CALLEE" \
   's@^          STATUS_ISSUE: .*@          X_UNUSED: 0@' passes_the_status_issue_to_the_driver
+
+mutate "the list read stops carrying the label, so the gate needs a per-pull-request call again" "$DRIVER" \
+  's@((\.labels // \[\]) | map(\.name) | join(","))@""@' \
+  gates_on_the_label_before_it_spends_anything
+mutate "the cheap gate goes back to reading the detail copy, below the calls it exists to avoid" "$DRIVER" \
+  's@",\$list_labels," != @",$labels," != @' \
+  gates_on_the_label_before_it_spends_anything
+mutate "the authoritative gate sinks back below the loop that sleeps" "$DRIVER" \
+  's@",\$labels," != @",$detail_labels," != @' \
+  skips_before_it_sleeps
+
+mutate "the pass loses its deadline and waits for the job's ceiling instead" "$DRIVER" \
+  's@^    if lane_pass_expired @    if false \&\& lane_deadline_gone @' \
+  stops_walking_when_the_pass_runs_out_of_time
+mutate "the truncation flag goes back to 0, so a pass that read NOTHING reports as complete" "$DRIVER" \
+  's@truncated_at=-1@truncated_at=0@' \
+  stops_walking_when_the_pass_runs_out_of_time
+mutate "a truncated pass downgrades to a notice, which writes no annotation" "$DRIVER" \
+  's@::warning::lane: pass truncated@::notice::lane: pass truncated@' \
+  stops_walking_when_the_pass_runs_out_of_time
+mutate "the truncation stops saying how much of the list it read" "$DRIVER" \
+  's@read \$read_count of \$total@stopped early@' \
+  stops_walking_when_the_pass_runs_out_of_time
+
+mutate "the pull request list swallows its exit status, so a blind lane reports a quiet day" "$DRIVER" \
+  's@if ! prs_raw="\$(gh api --paginate@if false; prs_raw="$(gh api --paginate@' \
+  fails_closed_on_an_unreadable_pull_request_list
+mutate "the record-shape assertion is dropped, so a short read slides every field" "$DRIVER" \
+  's|pr_fields\[@\]} % 5)) -ne 0|pr_fields[@]} % 5)) -ne 999|' \
+  fails_closed_on_an_unreadable_pull_request_list
+
+mutate "the pass budget stops reaching the driver" "$CALLEE" \
+  's@PASS_BUDGET: [$][{][{] inputs.pass-budget-seconds [}][}]@PASS_BUDGET_UNUSED: ${{ inputs.pass-budget-seconds }}@' \
+  passes_the_pass_budget_to_the_driver
+mutate "the pass budget is raised past the job's own ceiling" "$CALLEE" \
+  's@^        default: 600$@        default: 1800@' \
+  the_lane_runs_out_of_time_before_the_job_does
+mutate "the job timeout is cut below the pass budget" "$CALLEE" \
+  's@^    timeout-minutes: 15$@    timeout-minutes: 5@' \
+  the_lane_runs_out_of_time_before_the_job_does
 
 mutate "the documented example loses its concurrency block" "$DOC" \
   's@^concurrency:@# concurrency:@' documented_example_survives_the_consumer_gates
