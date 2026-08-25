@@ -105,9 +105,13 @@ variable "pools" {
   # would pass on the addressing label while the selector labels were identical,
   # which is the exact failure it is here to catch.
   #
-  # Compared lower-cased and trimmed, the same way RUNNER13 compares them in
-  # `check-runner-policy.sh`, because that is how GitHub compares them: `Repo`
-  # and `repo` are ONE label. Left case-sensitive, two spellings of one pool
+  # Compared lower-cased and trimmed, because that is how GitHub compares them:
+  # `Repo` and `repo` are ONE label. This check once had a counterpart in
+  # `check-runner-policy.sh` (RUNNER13) that asserted the same property over the
+  # workflow ADDRESSING the pools; that rule retired with Mergify (#434), so
+  # this plan-time validation is now the only place the property is enforced —
+  # do not relax it on the assumption that the gate still catches it. Left
+  # case-sensitive, two spellings of one pool
   # would read here as two pools, this check would pass, and the pools would
   # still merge at scheduling time — a green plan over the exact overlap the
   # rule exists to refuse.
