@@ -3864,6 +3864,81 @@ primary_if()  { ip -o route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\)
 primary_mtu() { cat "/sys/class/net/$(primary_if)/mtu" 2>/dev/null || echo 1460; }
 primary_addr() { ip -o -4 addr show dev "$(primary_if)" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1; }
 
+# The name every DNS probe on this host asks for, and it is deliberately NOT
+# metadata.google.internal.
+#
+# The GCE image ships `169.254.169.254 metadata.google.internal metadata` in
+# /etc/hosts, so `getent` answers that name out of the files database without
+# ever sending a packet. Both probes in slot_runtime_usable() used it, which
+# made them pass on a host where DNS was comprehensively broken — proved live
+# on ci-runner-host-specaria-f58b (#497): the unit-view probe returned success
+# while the same probe for any other name failed. A gate that cannot fail is
+# not a gate, and this one had been green for the four days the host had been
+# handing back "lookup … on 127.0.0.53:53: connection refused" to jobs.
+#
+# A public name is the point: it can only be answered by the VPC resolver, so
+# it exercises the resolv.conf, the FORWARD policy and the resolver together.
+DNS_PROBE_NAME="oauth2.googleapis.com"
+
+# Every process on this host must resolve through the VPC resolver, including
+# the ones that do NOT inherit a unit's mount namespace.
+#
+# The units that join a slot namespace bind /etc/netns/<ns>/resolv.conf over
+# /etc/resolv.conf (see start_slot_dockerd), and for the agent that is enough.
+# It is not enough for the daemon. `ci-dockerd@` execs dockerd-rootless.sh,
+# which runs under `rootlesskit --copy-up=/etc`: that replaces /etc with a
+# tmpfs copy inside its own mount namespace, and on Ubuntu /etc/resolv.conf is
+# a SYMLINK to ../run/systemd/resolve/stub-resolv.conf. The copy-up reproduces
+# the symlink, the symlink re-resolves to the stub, and the daemon is back on
+# 127.0.0.53 — an address where systemd-resolved listens in the HOST network
+# namespace and nowhere else. In the slot's namespace nothing listens there at
+# all, so the daemon's own registry client fails every lookup it makes.
+#
+# That fault is invisible until a build has to pull: an image already in the
+# slot's local cache needs no resolution, so what it looks like from GitHub is
+# one job out of a matrix failing on "failed to resolve source metadata for
+# docker.io/docker/dockerfile:1.7", on a different slot each time, retried away
+# as a flaky registry (#497 — six attempts on Specaria-Platform#3543, each
+# failing a different service).
+#
+# So the fix is not to defend the bind mount — RootlessKit is entitled to its
+# own /etc — but to remove the symlink it reproduces. With a regular file here
+# there is no indirection to survive, and no path by which any process on this
+# host arrives at 127.0.0.53. Nothing is lost: every slot already bypasses
+# systemd-resolved by design, so the stub was serving this host and nothing
+# else.
+#
+# `--dns` in the slot's daemon.json is NOT an alternative. It sets what
+# CONTAINERS are handed; the failing lookup is the daemon's own.
+normalize_host_resolver() {
+  local search
+
+  # Idempotent, and quiet on a host that is already correct: a re-run of this
+  # script must not rewrite a file every service is reading.
+  if [ ! -L /etc/resolv.conf ] \
+    && grep -q '^nameserver 169\.254\.169\.254$' /etc/resolv.conf 2>/dev/null; then
+    return 0
+  fi
+
+  # Carried over rather than reconstructed. The search list is what makes
+  # `curl http://<short-name>` work between hosts, and it is also what
+  # setup_slot_netns copies into each namespace's resolv.conf.
+  search=$(sed -n 's/^search /search /p' /etc/resolv.conf 2>/dev/null | head -1)
+
+  # Written beside and moved into place: a truncate-then-write leaves a window
+  # in which /etc/resolv.conf is empty, and anything resolving in that window
+  # fails for a reason that will never be reproducible.
+  {
+    printf 'nameserver 169.254.169.254\n'
+    [ -z "$search" ] || printf '%s\n' "$search"
+    printf 'options timeout:2 attempts:3\n'
+  } >/etc/resolv.conf.ci-new || return 1
+  chmod 0644 /etc/resolv.conf.ci-new || return 1
+  mv -f /etc/resolv.conf.ci-new /etc/resolv.conf || return 1
+
+  log "host resolver pinned to the VPC resolver (/etc/resolv.conf is now a regular file)"
+}
+
 # The shared-infrastructure port band. Slot <idx> owns 100 host ports and no
 # other slot owns any of them, so two slots publishing the "same" service never
 # collide -- the collision setup_slot_netns exists for, restated at the level a
@@ -4205,7 +4280,7 @@ slot_runtime_usable() { # <idx> <user>
   # the VPC resolver the FORWARD policy allows port 53 to. Resolving as root in
   # the host namespace proves nothing about either.
   local ns; ns=$(slot_netns "$idx")
-  if ! ip netns exec "$ns" getent ahostsv4 metadata.google.internal >/dev/null 2>&1; then
+  if ! ip netns exec "$ns" getent ahostsv4 "$DNS_PROBE_NAME" >/dev/null 2>&1; then
     log "slot $idx: cannot resolve inside $ns — the metadata policy is blocking port 53, or /etc/netns/$ns/resolv.conf is wrong"
     return 1
   fi
@@ -4215,7 +4290,7 @@ slot_runtime_usable() { # <idx> <user>
   # probe above passes on a host where every service is resolving against a
   # 127.0.0.53 stub that is unreachable in this namespace. nsenter joins the
   # namespace WITHOUT that convenience, which is exactly the units' view.
-  if ! nsenter --net="/run/netns/$ns" getent ahostsv4 metadata.google.internal >/dev/null 2>&1; then
+  if ! nsenter --net="/run/netns/$ns" getent ahostsv4 "$DNS_PROBE_NAME" >/dev/null 2>&1; then
     log "slot $idx: services in $ns cannot resolve — the resolv.conf bind is missing from the unit drop-ins"
     return 1
   fi
@@ -4295,6 +4370,18 @@ EOF
         log "slot $idx: daemon in network namespace $(slot_netns "$idx") ($dns)"
       else
         log "slot $idx: daemon is in the HOST network namespace — published ports will collide with a sibling slot"
+        return 1
+      fi
+      # …and that the daemon can RESOLVE, asked from inside its own mount
+      # namespace rather than from the unit's. Those are different namespaces:
+      # dockerd-rootless.sh runs under `rootlesskit --copy-up=/etc`, which
+      # gives the daemon a private /etc that the drop-in's BindReadOnlyPaths
+      # never reaches. Every probe above this line passes on a daemon pinned to
+      # 127.0.0.53 — the two in slot_runtime_usable ask the unit's view, and
+      # the namespace read just above asks about networking, not naming. This
+      # is the only check that looks where #497 lives.
+      if ! nsenter -t "$dpid" -m -n -- getent ahostsv4 "$DNS_PROBE_NAME" >/dev/null 2>&1; then
+        log "slot $idx: the daemon cannot resolve $DNS_PROBE_NAME from its own mount namespace — every image pull it has to make will fail; see normalize_host_resolver"
         return 1
       fi
       log "slot $idx: rootless docker ready for $u"
@@ -5042,6 +5129,15 @@ main() {
   # THIS script holds a GitHub App JWT while agents from a previous boot are
   # already serving jobs.
   harden_proc
+
+  # Before ANY slot daemon starts, because a rootless daemon copies /etc at the
+  # moment it starts and keeps that copy for its lifetime — fixing the resolver
+  # afterwards fixes nothing until the daemon restarts. Fails closed: a host
+  # whose daemons cannot resolve takes jobs and fails every one that has to
+  # pull an image, which reads as a flaky registry rather than a broken host
+  # (#497).
+  normalize_host_resolver \
+    || die "could not pin /etc/resolv.conf to the VPC resolver — refusing to register agents"
 
   # The shared rootful daemon is the thing being removed: while its socket
   # exists, any slot that can reach it is back to full control of every other

@@ -147,6 +147,41 @@ has_container_runtime() { # <file>
   matches "$code" 'ip netns exec "\$ns" getent ahostsv4'
 }
 
+# A slot whose DAEMON cannot resolve, on a host where every other probe passes.
+#
+# The units bind /etc/netns/<ns>/resolv.conf over /etc/resolv.conf, but
+# dockerd-rootless.sh runs under `rootlesskit --copy-up=/etc`, which hands the
+# daemon a private /etc that the bind never reaches. On Ubuntu the file it
+# copies is a SYMLINK to systemd-resolved's stub, so the daemon ends up on
+# 127.0.0.53 — where nothing listens inside a slot namespace. Every image pull
+# the daemon has to make fails; anything already in its local cache does not,
+# which is why it presents as one job of a matrix failing at a time (#497).
+has_host_resolver() { # <file>
+  local code
+  code=$(code_of "$1")
+  # 1. The symlink is replaced by a REAL file before any daemon starts. A
+  #    daemon copies /etc once, at start, so doing this later fixes nothing.
+  matches "$code" '^normalize_host_resolver\(\) \{' || return 1
+  matches "$code" 'mv -f /etc/resolv\.conf\.ci-new /etc/resolv\.conf' || return 1
+  matches "$code" "printf 'nameserver 169\\.254\\.169\\.254" || return 1
+  # 2. …and fatally. A host that keeps the stub takes jobs and fails the ones
+  #    that pull, which reads as a flaky registry rather than a broken host.
+  matches "$code" 'normalize_host_resolver[[:space:]]*\\?[[:space:]]*$' || return 1
+  matches "$code" 'refusing to register agents' || return 1
+  # 3. No probe may ask for a name /etc/hosts already answers. The GCE image
+  #    ships metadata.google.internal in there, so a getent for it never sends
+  #    a packet — which is how both existing probes passed on a host whose DNS
+  #    was entirely broken.
+  ! matches "$code" 'getent ahostsv4 metadata\.google\.internal' || return 1
+  matches "$code" '^DNS_PROBE_NAME=' || return 1
+  ! matches "$code" '^DNS_PROBE_NAME="?metadata\.google\.internal' || return 1
+  # 4. And one probe must ask from inside the daemon's own MOUNT namespace,
+  #    which is the only place this fault is visible. -m and -n both: the
+  #    network namespace alone reaches the resolver, the mount namespace alone
+  #    reads the right file, and it takes the pair to prove a lookup.
+  matches "$code" 'nsenter -t "\$dpid" -m -n -- getent ahostsv4'
+}
+
 # Slots share a host, so they share /tmp unless something separates them. A CI
 # step that names a fixed path there — `/tmp/lockfile-fresh.json`, and there are
 # many — creates it under whichever slot ran first, and every later slot gets
@@ -832,6 +867,12 @@ if has_container_runtime "$SCRIPT"; then
   ok
 else
   bad "a slot can run a daemon but not a container — DNS is fenced off, or the slot has no user manager for runc's scope, or the boot probe still only asks whether the daemon is up"
+fi
+
+if has_host_resolver "$SCRIPT"; then
+  ok
+else
+  bad "the host resolver is still a symlink to systemd-resolved's stub, or a DNS probe asks for a name /etc/hosts answers — either way a slot's rootless daemon resolves against 127.0.0.53, nothing listens there inside its namespace, and every image pull it has to make fails while the boot probes stay green (#497)"
 fi
 
 if has_registry_credentials "$SCRIPT"; then
@@ -1677,6 +1718,10 @@ mutate "slot no longer lingers"          's/loginctl enable-linger/# loginctl en
 mutate "daemon left on the system bus"   's|DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus|DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket|' has_container_runtime
 mutate "probe back to daemon-only"       's/slot_runtime_usable "\$idx" "\$u" || return 1/: /'         has_container_runtime
 mutate "DNS probe runs outside the netns" 's/ip netns exec "\$ns" getent ahostsv4/getent ahostsv4/'      has_container_runtime
+mutate "resolver left as the stub symlink" 's|mv -f /etc/resolv.conf.ci-new /etc/resolv.conf|rm -f /etc/resolv.conf.ci-new|'   has_host_resolver
+mutate "resolver pinning made non-fatal"   's|^  normalize_host_resolver \\$|  normalize_host_resolver \|\| true \\|'          has_host_resolver
+mutate "probe back to a name in /etc/hosts" 's|^DNS_PROBE_NAME=.*|DNS_PROBE_NAME="metadata.google.internal"|'                  has_host_resolver
+mutate "daemon mount-namespace probe removed" 's|nsenter -t "$dpid" -m -n -- getent ahostsv4|nsenter --net="/run/netns/$ns" getent ahostsv4|' has_host_resolver
 mutate "slots share /tmp again"          's/^PrivateTmp=yes$/PrivateTmp=no/'                           has_slot_tmp_isolation
 mutate "only the daemon gets a private /tmp" 's/^JoinsNamespaceOf=ci-dockerd@\$idx\.service$/#&/'      has_slot_tmp_isolation
 
