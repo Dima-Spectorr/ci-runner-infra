@@ -92,6 +92,12 @@ overlap="$(guard_overlap "$shared_total" "$ENFORCE_OVERLAP")"
 echo "pr-guard: overlap $overlap"
 
 # --- say it ------------------------------------------------------------------
+# SC2016: the single-quoted strings below are printf FORMATS and the backticks
+# in them are markdown code spans, not command substitution. Double-quoting them
+# is the change that would actually break this — the shell would then try to run
+# `%s` as a command. Same disable, same reason, as `render_queue` in
+# `merge-lane.sh`.
+# shellcheck disable=SC2016
 render() {
   printf '%s\n## Pull-request guard\n\n' "$MARKER"
 

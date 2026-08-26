@@ -132,8 +132,23 @@ permissions:
 jobs:
   guard:
     name: PR guard
-    # dynamic-runner-allowed(pr-guard, #434): the label is a workflow_call input, scoped by the calling repository
-    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    # dynamic-runner-allowed(guard, #434): the label is a workflow_call input, scoped by the calling repository
+    #
+    # A FORK NEVER REACHES THE POOL. Unlike the merge lane, this workflow runs on
+    # `pull_request`, so the head ref can be fork-authored — and the fleet's
+    # hosts are warm, credentialed and reused between jobs. The fork branch
+    # names a hosted image explicitly rather than merely excluding the job,
+    # because a fork's pull request is exactly the one whose author most needs
+    # to be told their branch is stale. Nothing here executes head-ref code in
+    # either case: the driver is checked out from the implementation repository
+    # and every fact is read from the API.
+    #
+    # Written as the fleet's routing idiom — bare `…head.repo.fork &&
+    # 'ubuntu-latest' || …` — and not as `== true &&`, because RUNNER4 reads the
+    # DIRECTION of the route rather than the mention of a fork, and it matches
+    # the hosted image immediately after the `&&`. The two spellings behave
+    # identically; only one is legible to the gate.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || (startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on) }}
     timeout-minutes: 10
 
     # One guard run per pull request, and the newest push wins. The OPPOSITE of
