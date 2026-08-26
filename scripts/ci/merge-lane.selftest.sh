@@ -572,6 +572,53 @@ gates_on_the_label_before_it_spends_anything() {
   before "$code" '",\$list_labels," != ' 'gh api "repos/\$R/pulls/\$num"'
 }
 
+# ---------------------------------------------------------------------------
+# The pin waiver: the one pull request nobody is going to label
+#
+# A label gate and "track the shared workflows automatically" are in direct
+# conflict, because the bump arrives from a bot that does not label. The waiver
+# resolves it, and every assertion here is about keeping it NARROW — the failure
+# it must never have is a bot pull request that edits a job merging unlabelled.
+# ---------------------------------------------------------------------------
+waives_the_label_only_for_a_pin_only_diff() {
+  local code
+  code=$(code_of "$1")
+  # Off unless configured, and only ever for the configured author.
+  matches "$code" '^  \[ -n "\$PIN_BUMP_ACTOR" \] \|\| return 1' || return 1
+  matches "$code" '^  \[ "\$author" = "\$PIN_BUMP_ACTOR" \] \|\| return 1' || return 1
+  # A file outside the workflow directory refuses the waiver …
+  matches "$code" '^        \.github/workflows/\*\) continue ;;' || return 1
+  # … and so does a changed line that does not name the pinned repository.
+  matches "$code" '\*"\$PIN_BUMP_REPO/\.github/workflows/"\*\) saw_pin=1 ;;' || return 1
+  # An empty diff is not a pin bump: `saw_pin` has to have been set.
+  matches "$code" '^  \[ "\$saw_pin" -eq 1 \]'
+}
+
+the_pin_waiver_is_asked_only_when_the_label_is_missing() {
+  local code
+  code=$(code_of "$1")
+  # It costs an API call, so it sits INSIDE the label-missing branch, never
+  # above it — the ordinary labelled pull request must not pay for it.
+  before "$code" '",\$list_labels," != ' 'if lane_is_pin_bump "\$num" "\$list_author"' || return 1
+  # And the authoritative gate honours a waiver already granted, or the second
+  # gate would skip everything the first one waved through.
+  matches "$code" '^    if \[ "\$pin_waiver" -eq 0 \] && \[ -n "\$REQUIRE_LABEL" \]'
+}
+
+the_pin_waiver_is_off_by_default() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^PIN_BUMP_ACTOR="\$\{PIN_BUMP_ACTOR:-\}"'
+}
+
+passes_the_pin_waiver_to_the_driver() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      pin-bump-actor:' || return 1
+  matches "$code" 'PIN_BUMP_ACTOR: \$\{\{ inputs.pin-bump-actor \}\}' || return 1
+  matches "$code" 'PIN_BUMP_REPO: \$\{\{ inputs.pin-bump-repo \}\}'
+}
+
 skips_before_it_sleeps() {
   local code
   code=$(code_of "$1")
@@ -633,7 +680,7 @@ fails_closed_on_an_unreadable_pull_request_list() {
   # exit status would hand back a JSON document and then — because that is not
   # five fields per record — either report a healthy quiet day or read garbage.
   matches "$code" 'if ! prs_raw="\$\(gh api --paginate "repos/\$R/pulls\?state=open' || return 1
-  matches "$code" '\$\{#pr_fields\[@\]\} % 5\)\) -ne 0' || return 1
+  matches "$code" '\$\{#pr_fields\[@\]\} % 6\)\) -ne 0' || return 1
   [ "$(printf '%s\n' "$code" | grep -cE 'LANE_FATAL=1')" -ge 4 ]
 }
 
@@ -1086,6 +1133,10 @@ check passes_the_status_issue_to_the_driver "$CALLEE" "status-issue is declared 
 
 check gates_on_the_label_before_it_spends_anything "$DRIVER" "the label is read per pull request, so the lane pays a detail read, two sleeps, a comparison and two check reads for every candidate it is about to skip — and the pass then costs the size of the repository rather than the depth of the queue (#444)"
 check skips_before_it_sleeps "$DRIVER" "the mergeability retry loop sleeps above the label gate, so the lane waits four seconds per pull request it has already decided to skip"
+check waives_the_label_only_for_a_pin_only_diff "$DRIVER" "the pin waiver is wider than a pin bump, so a bot pull request that edits a job merges without the label"
+check the_pin_waiver_is_asked_only_when_the_label_is_missing "$DRIVER" "the waiver's API call is paid for every candidate, or a waiver granted by the cheap gate is thrown away by the authoritative one"
+check the_pin_waiver_is_off_by_default "$DRIVER" "a repository that never asked for the waiver gets it anyway, and its label gate is no longer a gate"
+check passes_the_pin_waiver_to_the_driver "$CALLEE" "the waiver is configured on the caller and never reaches the driver, so Dependabot's bump still waits for a label nobody applies"
 check stops_walking_when_the_pass_runs_out_of_time "$DRIVER" "a pass has no deadline of its own, so it is killed by the job's timeout-minutes instead — and that kill reports as 'cancelled', which is indistinguishable from an operator cancelling it and leaves no annotation, no summary and no queue update (#444)"
 check fails_closed_on_an_unreadable_pull_request_list "$DRIVER" "a failed list read falls through as 'no open pull requests', so a lane that cannot see the queue reports a quiet day"
 check passes_the_pass_budget_to_the_driver "$CALLEE" "pass-budget-seconds is declared but never reaches the driver, so setting it does nothing"
@@ -1276,6 +1327,22 @@ mutate "the list read stops carrying the label, so the gate needs a per-pull-req
 mutate "the cheap gate goes back to reading the detail copy, below the calls it exists to avoid" "$DRIVER" \
   's@",\$list_labels," != @",$labels," != @' \
   gates_on_the_label_before_it_spends_anything
+mutate "the pin waiver stops asking who wrote the pull request, so any unlabelled one is waived" "$DRIVER" \
+  's@^  \[ "\$author" = "\$PIN_BUMP_ACTOR" \] || return 1@  :@' \
+  waives_the_label_only_for_a_pin_only_diff
+mutate "the pin waiver stops refusing a changed line that is not a pin" "$DRIVER" \
+  's@\*"\$PIN_BUMP_REPO/\.github/workflows/"\*) saw_pin=1 ;;@*) saw_pin=1 ;;@' \
+  waives_the_label_only_for_a_pin_only_diff
+mutate "the pin waiver arms itself by default" "$DRIVER" \
+  's@^PIN_BUMP_ACTOR="\${PIN_BUMP_ACTOR:-}"@PIN_BUMP_ACTOR="${PIN_BUMP_ACTOR:-dependabot[bot]}"@' \
+  the_pin_waiver_is_off_by_default
+mutate "the authoritative gate forgets the waiver the cheap one granted" "$DRIVER" \
+  's@if \[ "\$pin_waiver" -eq 0 \] && \[ -n "\$REQUIRE_LABEL" \]@if [ -n "$REQUIRE_LABEL" ]@' \
+  the_pin_waiver_is_asked_only_when_the_label_is_missing
+mutate "the pin waiver stops reaching the driver" "$CALLEE" \
+  's@^          PIN_BUMP_ACTOR: .*@          X_UNUSED_PIN: 0@' \
+  passes_the_pin_waiver_to_the_driver
+
 mutate "the authoritative gate sinks back below the loop that sleeps" "$DRIVER" \
   's@",\$labels," != @",$detail_labels," != @' \
   skips_before_it_sleeps
@@ -1297,7 +1364,7 @@ mutate "the pull request list swallows its exit status, so a blind lane reports 
   's@if ! prs_raw="\$(gh api --paginate@if false; prs_raw="$(gh api --paginate@' \
   fails_closed_on_an_unreadable_pull_request_list
 mutate "the record-shape assertion is dropped, so a short read slides every field" "$DRIVER" \
-  's|pr_fields\[@\]} % 5)) -ne 0|pr_fields[@]} % 5)) -ne 999|' \
+  's|pr_fields\[@\]} % 6)) -ne 0|pr_fields[@]} % 6)) -ne 999|' \
   fails_closed_on_an_unreadable_pull_request_list
 
 mutate "the pass budget stops reaching the driver" "$CALLEE" \
