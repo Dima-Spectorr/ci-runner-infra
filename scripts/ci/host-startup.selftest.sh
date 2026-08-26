@@ -1996,6 +1996,9 @@ fi
 # boot from the same template with the base64 body folded to 76 columns. Three
 # controller MIGs stuck at `creating: 1` for days is what it cost. See #434.
 _main="$HERE/../../modules/ci-runner-host-pool/main.tf"
+# The Terraform expression VERBATIM, so the single quotes are the point: the
+# `${...}` here is HCL interpolation that has to reach main.tf unexpanded.
+# shellcheck disable=SC2016
 _fold='join("\n", regexall(".{1,${local.b64_fold_columns}}", base64gzip(local.host_startup_source)))'
 if grep -qF "$_fold" "$_main"; then
   ok

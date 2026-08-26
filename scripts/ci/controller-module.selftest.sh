@@ -296,6 +296,9 @@ check "the gzipped controller boot script fits in a metadata value (${_gz} < ${_
 # size nor the template is what GCE chokes on. Three controller MIGs sat at
 # `creating: 1` for days over this, which is three pools stuck at zero hosts and
 # two repositories with no runners at all. See #434.
+# The Terraform expression VERBATIM, so the single quotes are the point: the
+# `${...}` here is HCL interpolation that has to reach main.tf unexpanded.
+# shellcheck disable=SC2016
 _fold='join("\n", regexall(".{1,${local.b64_fold_columns}}", base64gzip(local.controller_startup_source)))'
 check "the controller blob is folded, not one enormous line" \
   yes "$(grep -qF "$_fold" "$POOL_TF/main.tf" && echo yes || echo no)"
