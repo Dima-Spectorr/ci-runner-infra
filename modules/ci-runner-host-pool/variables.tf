@@ -734,9 +734,19 @@ variable "metric_prefix" {
     Custom-metric prefix. Every series this pool publishes is
     `<metric_prefix>/<name>` on a `generic_node` resource labelled with the repo
     and the pool, so one dashboard covers the whole fleet.
+
+    This module is on the READING side of that prefix as well as the writing
+    one: the hosts' autoscaler selects `<metric_prefix>/ci_demand`. The series
+    is WRITTEN by the controller, which takes its own prefix from
+    `modules/ci-runner-controller`. The two defaults MUST be identical — an
+    autoscaler pointed at a prefix nobody writes reports
+    `MISSING_CUSTOM_METRIC_DATA_POINTS`, stays ONLY_UP at zero hosts, and every
+    job in the repository queues forever while the pool looks healthy and
+    stable. `scripts/ci/check-metric-prefix-agreement.sh` is what keeps them
+    equal; do not change one without the other.
   EOT
   type        = string
-  default     = "custom.googleapis.com/github"
+  default     = "custom.googleapis.com/ci"
 }
 
 variable "labels" {
