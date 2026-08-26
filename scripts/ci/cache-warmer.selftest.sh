@@ -172,9 +172,16 @@ has_uploader_bounds() { # <file>
   code=$(code_of "$1")
   matches "$code" '\*\[!A-Za-z0-9_-\]\*' || return 1
   matches "$code" 'WARM_MAX_BYTES' || return 1
-  # Same trap as in has_cache_dir_bound: an intervening `--` here would make the
-  # pattern `--`, and this assertion would hold over any file at all.
-  matches "$code" '\-\-no-clobber' || return 1
+  # Write-once, stated on the request. `ifGenerationMatch=0` is what makes an
+  # already-published hash a 412 the loop counts as a skip rather than an
+  # overwrite — which the grant refuses anyway, but a refusal read as a failure
+  # is a nightly alert nobody can action.
+  matches "$code" 'ifGenerationMatch=0' || return 1
+  # And the upload must NOT go back through `gcloud storage cp`. That call lists
+  # the destination, a list is authorised against the BUCKET, and every grant
+  # this identity holds is conditioned on an object prefix — so it publishes
+  # nothing at all. Measured: 0 of 291 artifacts, for months.
+  ! matches "$code" 'gcloud storage cp' || return 1
   # A prefix that does not end in a slash writes next to the tree, not into it.
   matches "$code" 'does not end in'
 }
@@ -584,7 +591,11 @@ mutate "the uploader stops checking the hash shape" "$TURBO" \
   has_uploader_bounds
 
 mutate "the uploader overwrites what is already published" "$TURBO" \
-  's@ --no-clobber@@' \
+  's@&ifGenerationMatch=0@@' \
+  has_uploader_bounds
+
+mutate "the upload goes back through gcloud storage cp" "$TURBO" \
+  's@gcloud storage objects describe@gcloud storage cp@' \
   has_uploader_bounds
 
 mutate "a package manager assumed instead of detected" "$MAIN" \

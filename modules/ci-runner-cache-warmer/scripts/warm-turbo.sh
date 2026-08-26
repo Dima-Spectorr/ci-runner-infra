@@ -25,9 +25,10 @@
 #   produces the same names. The warmer's grant carries create and NOT delete,
 #   which means an upload over a live object fails with a 403 — and on a
 #   schedule most hashes are already there. So an object that exists is skipped
-#   before it is offered, and a 403 on the race between the check and the write
-#   is still a success: whatever is in the bucket under that name was written by
-#   this same identity from this same branch.
+#   before it is offered, and the write itself carries `ifGenerationMatch=0`, so
+#   losing the race between the check and the write is a 412 rather than a 403 —
+#   still a success: whatever is under that name was written by this same
+#   identity from this same branch, under a name that is a digest of its inputs.
 #
 #   This is the same rule the dependency snapshot follows and for the same
 #   reason: the bucket's age bound is measured per generation, so an object
@@ -65,6 +66,88 @@ case "$WARM_TURBO_PREFIX" in
   */) : ;;
   *) log "WARM_TURBO_PREFIX '$WARM_TURBO_PREFIX' does not end in '/' — refusing"; exit 2 ;;
 esac
+
+# The prefix reaches a URL below, so it is held to a charset with no `%` and no
+# `..` before anything is encoded from it. The hash half is already validated
+# per artifact; this is the half an operator supplies.
+case "$WARM_TURBO_PREFIX" in
+  *[!A-Za-z0-9._/-]* | *..*)
+    log "WARM_TURBO_PREFIX '$WARM_TURBO_PREFIX' is not an object prefix — refusing"; exit 2 ;;
+esac
+# `/` is the only character in the validated charset that needs encoding in an
+# object name, and it must be encoded: an unescaped one in the `name` parameter
+# is read as a path separator in the API's own URL rather than as part of the
+# object's name.
+ENC_PREFIX=${WARM_TURBO_PREFIX//\//%2F}
+
+# THE STORAGE JSON API RATHER THAN `gcloud storage cp`, AND THAT IS THE WHOLE
+# FIX. `cp` LISTS the destination to work out whether the name it was given is
+# an object or a directory, and a list is authorised against the BUCKET — so
+# `resource.name` is the bucket, which never starts with an object path. Every
+# grant this identity holds is conditioned on an object prefix, so the list is
+# refused and the upload never happens. Measured, not reasoned: the first warm
+# whose build actually produced artifacts published 0 of 291 and reported
+# `failed=291`, and the same call in the dependency-snapshot publisher had
+# already been rewritten this way for the same reason (`publish-cache-snapshot.sh`).
+#
+# Naming the object explicitly removes the question: the request needs
+# `storage.objects.create` and nothing else. A list grant on a bucket that holds
+# every pool's cache is not the alternative — it is a wider grant handed out to
+# work around a client-side convenience.
+GCS_TOKEN=""
+GCS_TOKEN_AT=0
+gcs_token() {
+  local now
+  now=$(date +%s)
+  # Re-minted well inside the hour an access token lives: a monorepo's cache can
+  # hold thousands of artifacts, and a publish loop that outlives its token
+  # fails every upload after the expiry with a 401 that looks like a broken
+  # grant. Cheap — this is a local metadata-server call.
+  if [ -z "$GCS_TOKEN" ] || [ "$((now - GCS_TOKEN_AT))" -ge 1800 ]; then
+    GCS_TOKEN=$(gcloud auth print-access-token 2>/dev/null) || return 1
+    GCS_TOKEN_AT=$now
+  fi
+  [ -n "$GCS_TOKEN" ]
+}
+
+BODY=$(mktemp) || { log "the response buffer could not be staged"; exit 2; }
+trap 'rm -f "$BODY"' EXIT
+
+# Sets HTTP_CODE and err_detail; never returns non-zero, because every outcome
+# including "no credential" is a per-artifact count the caller reports.
+HTTP_CODE=""
+err_detail=""
+gcs_upload() { # <file> <percent-encoded object name>
+  local file="$1" name="$2"
+  err_detail=""
+  HTTP_CODE=""
+  if ! gcs_token; then
+    err_detail="this step authenticated to nothing"
+    return 0
+  fi
+  # THE TOKEN IS NOT AN ARGUMENT. `-H "Authorization: Bearer $TOKEN"` would put a
+  # credential that may create objects in the bucket every host in the pool
+  # trusts into this process's argv, and /proc/<pid>/cmdline is world-readable.
+  # curl reads the header from a file descriptor instead, and `printf` is a
+  # builtin, so nothing is exec'd with the token in ITS argv either.
+  # `--proto '=https'` pins the scheme so a redirect cannot make curl send the
+  # bearer token in clear text.
+  HTTP_CODE=$(curl -sS --proto '=https' --connect-timeout 10 --max-time 1800 \
+    --speed-limit 1024 --speed-time 120 \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$GCS_TOKEN") \
+    -X POST -H 'Content-Type: application/octet-stream' \
+    --data-binary "@$file" -o "$BODY" -w '%{http_code}' \
+    "https://storage.googleapis.com/upload/storage/v1/b/${WARM_BUCKET}/o?uploadType=media&ifGenerationMatch=0&name=${name}" \
+    2>/dev/null)
+  case "$HTTP_CODE" in
+    200 | 201 | 412) : ;;
+    # The API's own message, trimmed to one line. It names the refused
+    # permission on a 403, which is the single most useful thing this step can
+    # say and the thing it could not say before.
+    *) err_detail=$(tr '\n' ' ' <"$BODY" | cut -c1-200) ;;
+  esac
+  return 0
+}
 
 if [ ! -d "$WARM_TURBO_DIR" ]; then
   # Not a failure. A repository that does not use turbo, or a build where every
@@ -120,6 +203,10 @@ while IFS= read -r artifact; do
 
   object="gs://${WARM_BUCKET}/${WARM_TURBO_PREFIX}${hash}"
 
+  # `objects describe` names the object, so it is authorised as
+  # `storage.objects.get` against THAT object and the prefix condition on the
+  # grant matches. This is the one gcloud storage call in the loop that a
+  # prefix-scoped identity can make; see the upload below for the one it cannot.
   if gcloud storage objects describe "$object" >/dev/null 2>&1; then
     skipped=$((skipped + 1))
     continue
@@ -131,18 +218,26 @@ while IFS= read -r artifact; do
     continue
   fi
 
-  # --no-clobber is the same write-once rule the grant enforces, stated on the
-  # call so the common case — a hash already published by yesterday's run,
-  # racing today's — is a no-op rather than an error someone has to read.
-  if gcloud storage cp --no-clobber "$artifact" "$object" >/dev/null 2>&1; then
-    published=$((published + 1))
-  elif gcloud storage objects describe "$object" >/dev/null 2>&1; then
-    # Lost the race, and the winner wrote the same bytes under a content hash.
-    skipped=$((skipped + 1))
-  else
-    log "could not publish $hash"
-    failed=$((failed + 1))
-  fi
+  gcs_upload "$artifact" "${ENC_PREFIX}${hash}"
+  case "$HTTP_CODE" in
+    200 | 201)
+      published=$((published + 1))
+      ;;
+    412)
+      # `ifGenerationMatch=0` refused it: something wrote that name between the
+      # describe above and this request. Whatever is there was written by this
+      # same identity from this same branch, under a name that is a digest of
+      # the task's inputs, so it is the same artifact. Lost the race, not failed.
+      skipped=$((skipped + 1))
+      ;;
+    *)
+      # The reason, not just the count. This step reported `failed=291` with no
+      # other output for months of nightly runs, and the cause — one refused
+      # permission, the same one for all 291 — was not recoverable from the log.
+      log "could not publish $hash: HTTP ${HTTP_CODE:-none}${err_detail:+ — $err_detail}"
+      failed=$((failed + 1))
+      ;;
+  esac
 done < <(find "$WARM_TURBO_DIR" -maxdepth 1 -type f -name '*.tar.zst' 2>/dev/null)
 
 log "published=$published already-present=$skipped refused=$refused failed=$failed"
