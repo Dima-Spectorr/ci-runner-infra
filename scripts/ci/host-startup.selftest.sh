@@ -1985,5 +1985,28 @@ else
   bad "the gzipped boot script is ${_gz} characters as metadata; the budget is ${_margin} and GCE refuses anything over ${_cap}. Shorten host-startup.sh or move part of it onto the golden image -- past the cap this is an Error 413 at create time, on a plan that read clean."
 fi
 
+# --- ...and it must arrive as many lines, not one -----------------------------
+#
+# Being under the cap is not sufficient, and the line is the worse half. A
+# metadata value holding ONE line of six figures is accepted when the instance
+# template is created and then breaks every instance built from that template,
+# about two minutes in, with `Internal error` or `The service is currently
+# unavailable` -- naming neither metadata nor a script. Measured 2026-08-26 in
+# 2026-08-26: five failures from the fleet's controller template, and a first-try
+# boot from the same template with the base64 body folded to 76 columns. Three
+# controller MIGs stuck at `creating: 1` for days is what it cost. See #434.
+_main="$HERE/../../modules/ci-runner-host-pool/main.tf"
+_fold='join("\n", regexall(".{1,${local.b64_fold_columns}}", base64gzip(local.host_startup_source)))'
+if grep -qF "$_fold" "$_main"; then
+  ok
+else
+  bad "local.host_startup_gz is not folded. base64gzip returns one line, and a metadata value carrying one enormous line creates the template and then fails every instance made from it with an unexplained Internal error. Write it as: ${_fold}"
+fi
+if grep -qF 'line if length(line) > 4096' "$_main"; then
+  ok
+else
+  bad "the module no longer refuses a boot script with a line over 4096 characters at plan time, so an unfolded blob would reach a template again -- green apply, and every instance created from it fails two minutes in."
+fi
+
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

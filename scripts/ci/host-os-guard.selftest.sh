@@ -287,7 +287,11 @@ windows_boot_script_is_compressed() { # <main.tf>
   # never said so. Whoever first turns a Windows pool on gets an Error 413 at
   # CREATE time on a plan that read clean — after "the boot script metadata bug
   # was fixed" is already in the history, which is what makes it read as new.
-  matches "$code" '^  windows_host_startup_gz += base64gzip\(local\.windows_host_startup_source\)' || return 1
+  # …and it travels FOLDED, which is the half that took the fleet down: an
+  # unfolded blob is accepted when the template is created and then fails every
+  # instance built from it, two minutes in, with an `Internal error` naming
+  # nothing. `Convert.FromBase64String` ignores the line feeds.
+  matches "$code" '^  windows_host_startup_gz += join\(".n", regexall\("\.\{1,\$\{local\.b64_fold_columns\}\}", base64gzip\(local\.windows_host_startup_source\)\)\)' || return 1
   matches "$code" 'windows_host_startup = templatefile\("\$\{path\.module\}/scripts/windows-boot-wrapper\.ps1", \{' || return 1
   matches "$code" '^    gz = local\.windows_host_startup_gz$' || return 1
 
@@ -510,7 +514,13 @@ mutate "the wrapper handed the uncompressed text" "$MAIN" \
   's|^    gz = local.windows_host_startup_gz$|    gz = local.windows_host_startup_source|' \
   windows_boot_script_is_compressed
 mutate "the compression local removed" "$MAIN" \
-  's|^  windows_host_startup_gz     = base64gzip(local.windows_host_startup_source)$||' \
+  's|^  windows_host_startup_gz     = .*$||' \
+  windows_boot_script_is_compressed
+# And the fold dropped while the compression stays — the revert that looks
+# harmless, plans clean, creates the template, and then fails every instance
+# built from it two minutes in with an `Internal error` naming nothing.
+mutate "the Windows blob unfolded back to one line" "$MAIN" \
+  's|^  windows_host_startup_gz     = .*$|  windows_host_startup_gz     = base64gzip(local.windows_host_startup_source)|' \
   windows_boot_script_is_compressed
 mutate "the cap asserted for the Linux arm only" "$MAIN" \
   's|length(local.boot_script_metadata\[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"\]) < 262144|length(local.host_startup) < 262144|' \
