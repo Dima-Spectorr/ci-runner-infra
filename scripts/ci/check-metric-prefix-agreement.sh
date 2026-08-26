@@ -91,7 +91,11 @@ check_root() {
 
   ctl="$(tf_default "$root/$CONTROLLER_VARS" metric_prefix)"
   pool="$(tf_default "$root/$POOL_VARS" metric_prefix)"
-  boot="$(sed -nE 's/^METRIC_PREFIX=\$\{METRIC_PREFIX:-([^}]*)\}.*/\1/p' "$root/$STARTUP" | head -1)"
+  # Read the whole file and take the first match in the shell. `| head -1` here
+  # would SIGPIPE the sed, and under -e with pipefail that 141 becomes the
+  # status of the assignment.
+  boot="$(sed -nE 's/^METRIC_PREFIX=\$\{METRIC_PREFIX:-([^}]*)\}.*/\1/p' "$root/$STARTUP")"
+  boot="${boot%%$'\n'*}"
 
   # Every distinct prefix the alert policies select on. `sort -u` so the report
   # names the offender rather than a count.
@@ -131,7 +135,7 @@ check_root() {
 }
 
 selftest() {
-  local tmp status
+  local tmp
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
 
@@ -156,6 +160,7 @@ variable "metric_prefix" {
   default = "custom.googleapis.com/ci"
 }
 EOF
+    # shellcheck disable=SC2016  # the unexpanded ${...} IS the fixture
     printf 'METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/ci}\n' >"$tmp/r/$STARTUP"
     printf '"filter": "metric.type=\\"custom.googleapis.com/ci/ci_poller_heartbeat\\""\n' >"$tmp/r/$ALERTS"
   }
@@ -177,6 +182,7 @@ EOF
   # MUTANT 2 — the boot fallback drifts. Only bites a controller that comes up
   # without the metadata key, which is the case no one is watching.
   seed
+  # shellcheck disable=SC2016  # the unexpanded ${...} IS the fixture
   printf 'METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/github}\n' >"$tmp/r/$STARTUP"
   run && { echo "selftest: a drifted boot fallback must fail" >&2; return 1; }
 
