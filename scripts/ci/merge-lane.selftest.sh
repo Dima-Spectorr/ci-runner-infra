@@ -797,6 +797,44 @@ says_when_it_did_not_ask_how_far_behind() {
   matches "$code" '^    if \[ "\$LANE_STRICT" = "0" \]; then$'
 }
 
+# The one risk a non-strict base carries that the merge API will not refuse on
+# the lane's behalf: two pull requests, each green alone, broken together. The
+# lane cannot prevent it without rebuilding every branch on every merge -- which
+# is what a strict base is, and what the repository declined -- so instead it
+# refuses to keep merging onto a base whose own required checks are failing.
+halts_when_the_base_itself_is_red() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^  if lane_base_is_broken "\$base_sha"; then$' || return 1
+  matches "$code" '^    LANE_HALT_REASON=' || return 1
+  # Above the walk. Below it the gate still works, but a halted pass would first
+  # spend a call per open pull request reaching a verdict it will not act on.
+  local halt_line walk_line
+  halt_line=$(grep -n '^  if lane_base_is_broken ' "$1" | head -n1 | cut -d: -f1)
+  walk_line=$(grep -n 'gh api --paginate "repos/\$R/pulls' "$1" | head -n1 | cut -d: -f1)
+  [ -n "$halt_line" ] && [ -n "$walk_line" ] && [ "$halt_line" -lt "$walk_line" ]
+}
+
+# FAILS OPEN, and that direction is the load-bearing part. Most repositories run
+# their required checks on `pull_request` only, so every one of them is ABSENT on
+# the base tip forever; a gate that halted on a missing or pending check would
+# stop the lane in every repository in the fleet the day it shipped. Only a
+# definite failure counts.
+only_a_definite_failure_halts_the_lane() {
+  matches "$(code_of "$1")" '^  \[ "\$\{failed:-0\}" -gt 0 \]$'
+}
+
+# A halted pass returns before it reads a single pull request, so it renders no
+# rows -- which is byte-for-byte what a base with nothing open renders. Without
+# the reason on the snapshot, the lane stopping and the lane having nothing to do
+# are the same picture.
+says_on_the_snapshot_that_it_halted() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^    printf .> \*\*Halted\.\*\* ' || return 1
+  matches "$code" '^      printf ._The open list was not read on this pass\._'
+}
+
 echo "merge-lane self-test:"
 check declares_its_inputs_without_a_live_expression "$CALLEE" "an input description carries an Actions expression, and one naming vars fails the whole workflow at startup with no jobs and no log to read"
 check documented_label_gate_fails_closed "$DOC" "the documented label gate is wired bare to a variable, so a consumer copying it gets a lane that merges its entire backlog the moment the variable is unset, mistyped or cleared"
@@ -838,6 +876,9 @@ check announces_a_release_once "$DRIVER" "a release is not recorded per sha, so 
 check batches_only_when_the_base_allows_it "$DRIVER" "the pass acts on more than one candidate without checking that the base is non-strict, so on a strict base it merges against behind_by values its own earlier merge invalidated"
 check stops_batching_at_the_pass_deadline "$DRIVER" "the batch keeps merging past the pass deadline, so a truncated pass spends the headroom it needs to publish the queue and the annotation explaining the truncation"
 check ends_the_batch_on_a_refusal "$DRIVER" "a refused action does not stop the batch, so the lane keeps working down a ranking the refusal just proved stale"
+check halts_when_the_base_itself_is_red "$DRIVER" "the lane keeps merging onto a base whose own required checks are failing, burying the commit that broke it under everything that follows"
+check only_a_definite_failure_halts_the_lane "$DRIVER" "the base-health gate halts on something other than a definite failure, which deadlocks every repository whose required checks run on pull_request only"
+check says_on_the_snapshot_that_it_halted "$DRIVER" "a halted lane renders exactly like a base with nothing open, so the queue view reports a quiet day while nothing can merge"
 check says_when_it_did_not_ask_how_far_behind "$DRIVER" "the queue reports 0 commits behind for a pull request it never compared, so the table an operator trusts is showing a number nothing measured"
 
 check publishes_the_queue_where_it_costs_nothing "$DRIVER" "the queue is not written to the job summary, so the only view of it depends on a permission that may not have been granted"
@@ -970,6 +1011,14 @@ mutate "the detail read goes back to a tab split" "$DRIVER" \
 mutate "the batch stops asking whether the base allows it" "$DRIVER" \
   's@^  if \[ "\$LANE_STRICT" = "0" \] && @  if @' batches_only_when_the_base_allows_it
 mutate "the batch stops honouring the pass deadline" "$DRIVER"   's@^      if lane_pass_expired @      if false \&\& lane_pass_expired @' stops_batching_at_the_pass_deadline
+mutate "the base-health gate is removed, so the lane merges onto a red base" "$DRIVER" \
+  's@^  if lane_base_is_broken "\$base_sha"; then$@  if false; then@' halts_when_the_base_itself_is_red
+mutate "the base-health gate sinks below the walk it exists to skip" "$DRIVER" \
+  's@^  if lane_base_is_broken "\$base_sha"; then$@  :  # moved\n@' halts_when_the_base_itself_is_red
+mutate "the base-health gate starts halting on a check that merely has not reported" "$DRIVER" \
+  's@^  \[ "\${failed:-0}" -gt 0 \]$@  [ $(( ${failed:-0} + ${missing:-0} )) -gt 0 ]@' only_a_definite_failure_halts_the_lane
+mutate "the halt stops being explained on the snapshot" "$DRIVER" \
+  's@^    printf .> \*\*Halted\.\*\* @    printf '"'"'> \\n@' says_on_the_snapshot_that_it_halted
 mutate "a refused action no longer ends the batch" "$DRIVER" \
   's@\(lane_take_action .*\) || break@\1 || true@' ends_the_batch_on_a_refusal
 mutate "the unasked comparison starts reporting itself as up to date" "$DRIVER" \
