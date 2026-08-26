@@ -600,6 +600,75 @@ CI run per merge, against a strict base's one run per *open pull request* per
 merge — the cheap end of the trade, and the whole reason the gate is shaped this
 way.
 
+#### And the half that runs before the lane: `pr-guard`
+
+The base-health gate is a backstop — it acts after something has already
+landed. The two things a non-strict base stops GitHub from telling an author
+*while they can still do something about it* are handled by a separate reusable
+workflow, [`pr-guard.yml`](../.github/workflows/pr-guard.yml):
+
+1. **Is this branch looking at the current base?** `compare/<base>...<head>`
+   gives `behind_by`; past `max-behind` the guard says so. A branch that is
+   twenty commits behind has green checks that were reported against a world
+   that no longer exists, and on a non-strict base nothing else will mention it.
+2. **Is anyone else rewriting these files?** The changed-file list of this pull
+   request, intersected with the changed-file list of every other open one
+   against the same base. Overlaps are reported as a table naming the other pull
+   request and the shared paths.
+
+It runs on `pull_request` — `opened`, `synchronize`, `reopened`,
+`ready_for_review` — so the answer is re-computed on every push, and it leaves
+**one** comment that it edits rather than a new one each time. Drafts are
+skipped. It needs no App: it writes nothing to a branch, so the caller's own
+`GITHUB_TOKEN` with `pull-requests: write` is enough.
+
+**Advisory by default, and both switches are separate.** A repository turning
+this on has a backlog of pull requests that were all opened before the rule
+existed, and a gate whose first act is to fail every one of them is a gate
+everyone learns to ignore. So `enforce-freshness` and `enforce-overlap` each
+default to `false`: advise while you drain, enforce once you are current.
+`enforce-overlap` is the harsher of the two and should stay off in most
+repositories — a shared lockfile, a changelog or a barrel file makes overlap
+routine, and the useful output there is the comment naming who else is in the
+file, not a red check.
+
+**`max-behind: 0` is usually the wrong number.** It is the strict reading, and
+on a base that merges every few minutes it marks nearly every open pull request
+the moment anything lands: true, and useless as a signal. A small non-zero
+tolerance asks the question people actually mean.
+
+**What it cannot see** is the semantic conflict: two pull requests that break
+each other through entirely separate files share no path, and the guard reports
+them as distinct. That is deliberate — claiming otherwise would make a green
+"no overlap" read as "safe to land". That case is what the base-health gate
+above bounds, after the fact.
+
+A minimal caller. The `uses:` line is deliberately not written out here: take the
+one from the merge-lane caller above — same tag, same sha, both workflows ship
+from the same release — and change the filename to `pr-guard.yml`. One pin to
+keep current instead of two that drift apart, which is the same reasoning as
+`implementation-ref`.
+
+```yaml
+name: PR guard
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+jobs:
+  guard:
+    # uses: …/.github/workflows/pr-guard.yml@<the sha from the lane example>
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      runs-on: my-pool-label   # a private repository: self-hosted minutes are not billed
+      max-behind: 10
+      enforce-freshness: false
+      enforce-overlap: false
+```
+
 ### The pool images do not ship `gh`
 
 GitHub-hosted images carry the CLI; the fleet's self-hosted images do not. That

@@ -1,0 +1,185 @@
+# =============================================================================
+# pr-guard — the two things a non-strict base stops GitHub from telling you
+#
+# WHY THIS EXISTS
+#
+# The fleet's bases do not set `strict_required_status_checks_policy`, and that
+# is a considered choice rather than an oversight: a strict base costs a full CI
+# run per OPEN pull request per merge, which on a repository with ninety of them
+# is thousands of Actions minutes to drain a backlog once. `docs/merge-lane.md`
+# has the argument in full.
+#
+# What that choice gives up is GitHub itself telling an author two things:
+#
+#   1. that their branch is looking at a base that has moved, so the green
+#      checks on it were reported against a world that no longer exists;
+#   2. that somebody else has an open pull request rewriting the same files.
+#
+# Neither is something the merge lane can answer. The lane's question is "may
+# this merge NOW", asked seconds before it does; these are asked when the pull
+# request is opened and on every push to it, which is when the author is still
+# in a position to act on the answer.
+#
+# ADVISORY BY DEFAULT. A repository turning this on typically has a backlog of
+# pull requests that were all opened before the rule existed, and a gate whose
+# first act is to fail every one of them teaches everyone to ignore it.
+# `enforce-freshness` and `enforce-overlap` are separate, so a repository can
+# advise while it drains and enforce once it is current.
+#
+# WHAT IT DOES NOT DO
+#
+# It cannot see a SEMANTIC conflict: two pull requests that break each other
+# through entirely separate files share no path and this reports them as
+# distinct. That case is bounded after the fact instead, by the merge lane
+# refusing to merge onto a base whose own required checks are failing. Saying
+# otherwise here would be the more dangerous error, because a green "no overlap"
+# would be read as "safe to land".
+#
+# WHAT THE CONSUMER MUST PROVIDE
+#
+# Nothing. Unlike the merge lane this needs no App: it never writes to a branch,
+# so the caller's own `GITHUB_TOKEN` with `pull-requests: write` is enough. A
+# pull request from a FORK gets a read-only token and cannot be commented on;
+# the findings still go to the job summary and the check still reports.
+# =============================================================================
+
+name: PR guard
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          Where the guard runs. Defaults to `ubuntu-latest`, which is free and
+          unmetered on a PUBLIC repository. A private repository should pass a
+          self-hosted label instead — this fires on every push to every open
+          pull request, so it is the most frequently dispatched job in the
+          fleet, and GitHub-hosted minutes are billed. It is a handful of API
+          calls and finishes in seconds.
+
+
+          ONE LABEL, OR A JSON ARRAY IN A STRING — never a YAML sequence. This
+          is a `type: string` input, so `runs-on: [self-hosted, linux]` in your
+          caller is a parse error and the workflow never starts.
+        required: false
+        default: ubuntu-latest
+        type: string
+      max-behind:
+        description: >-
+          How many commits the base may have moved before the branch counts as
+          stale. `0` is the strict reading, and on a repository that merges
+          every few minutes it marks nearly every open pull request the moment
+          anything lands — true, and useless as a signal. A small non-zero value
+          asks the question people actually mean: are you looking at roughly the
+          current base.
+        required: false
+        default: 0
+        type: number
+      enforce-freshness:
+        description: >-
+          Fail the check when the branch is behind, rather than commenting. Turn
+          this on only once the repository is current: switching it on over a
+          backlog fails every open pull request at once and forces a rebase of
+          all of them before anything can merge.
+        required: false
+        default: false
+        type: boolean
+      enforce-overlap:
+        description: >-
+          Fail the check when another open pull request touches the same files.
+          THE HARSHER OF THE TWO, and it should stay off in most repositories:
+          overlapping with an open pull request is legitimately common — a
+          shared lockfile, a changelog, a barrel file — and the useful output is
+          the comment naming who else is in there, not a red check. Turn it on
+          where two people silently rewriting the same file has actually cost
+          something.
+        required: false
+        default: false
+        type: boolean
+      max-compare:
+        description: >-
+          How many other open pull requests to compare against, most recently
+          updated first. Every one costs an API call for its file list, so on a
+          repository with ninety open this is the difference between one call
+          and ninety-one. Most recently updated first because the pull request
+          somebody is actively pushing to is the one worth colliding with; a
+          branch untouched for a month needs a rebase regardless.
+        required: false
+        default: 30
+        type: number
+      implementation-repository:
+        description: >-
+          Where `scripts/ci/pr-guard.sh` lives. A reusable workflow's
+          `actions/checkout` clones the CALLER, not the callee, so the guard has
+          to name its own repository to find its own driver.
+        required: false
+        default: Dima-Spectorr/ci-runner-infra
+        type: string
+      implementation-ref:
+        description: >-
+          The ref of `implementation-repository` to run. LEAVE IT UNSET. Empty
+          means "the commit this workflow file was called at", read from
+          `github.job_workflow_sha`, so driver and workflow are the same release
+          by construction — the same reasoning, and the same past defect, as the
+          merge lane's input of this name.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: PR guard
+    # dynamic-runner-allowed(pr-guard, #434): the label is a workflow_call input, scoped by the calling repository
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    timeout-minutes: 10
+
+    # One guard run per pull request, and the newest push wins. The OPPOSITE of
+    # the merge lane's `cancel-in-progress: false`, on purpose: the lane must
+    # never be killed between a merge call and the line that records it, whereas
+    # this only reads and comments, and a comment describing the previous push
+    # is worse than no comment at all.
+    concurrency:
+      group: pr-guard-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+
+    permissions:
+      contents: read
+      # To leave the findings on the pull request. Read-only on a fork, where
+      # the driver falls back to the job summary rather than failing.
+      pull-requests: write
+
+    steps:
+      # The IMPLEMENTATION repository. In a `workflow_call` the `github` context
+      # belongs to the caller, so a bare checkout would clone the consumer's
+      # tree, which does not contain the driver.
+      - name: Check out the guard's implementation
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ inputs.implementation-repository }}
+          ref: ${{ inputs.implementation-ref || github.job_workflow_sha }}
+          persist-credentials: false
+
+      # The pool images do not ship `gh`, and this driver is all `gh api`.
+      # Without it every read returns nothing, the guard finds no overlap and no
+      # staleness, and reports green — the same silent-success failure the merge
+      # lane hit across seven repositories.
+      - name: Ensure the GitHub CLI
+        run: bash scripts/ci/ensure-gh.sh
+
+      - name: Run the guard
+        env:
+          # The caller's own token. Unlike the merge lane this writes nothing to
+          # a branch, so it needs no App and no `Contents: write` — and a
+          # comment posted as `GITHUB_TOKEN` triggering no further workflow is
+          # exactly what is wanted here.
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MAX_BEHIND: ${{ inputs.max-behind }}
+          ENFORCE_FRESHNESS: ${{ inputs.enforce-freshness }}
+          ENFORCE_OVERLAP: ${{ inputs.enforce-overlap }}
+          MAX_COMPARE: ${{ inputs.max-compare }}
+        run: bash scripts/ci/pr-guard.sh
