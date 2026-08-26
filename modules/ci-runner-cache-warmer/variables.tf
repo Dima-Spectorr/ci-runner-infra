@@ -185,6 +185,15 @@ variable "build_command" {
     A repository with no turbo pipeline can set this to `true` and still get the
     dependency snapshot. An override is handed `WARM_TURBO_DIR` and
     `TURBO_CACHE_DIR` and must honour one of them.
+
+    IT CANNOT HONOUR THEM BY WRITING `$WARM_TURBO_DIR`, today. Every `$` in an
+    override is escaped to `$$` on its way into the step, and the `script` field
+    Cloud Build runs is not unescaped the way `args` is — so the shell sees its
+    own PID followed by a literal. A tool that reads `TURBO_CACHE_DIR` from the
+    environment itself is fine; a command line that spells the variable is not.
+    Write the path out, or leave this unset. Tracked in #459, with the measured
+    evidence; it is the same defect that made the default command publish
+    nothing.
   EOT
   type        = string
   default     = null

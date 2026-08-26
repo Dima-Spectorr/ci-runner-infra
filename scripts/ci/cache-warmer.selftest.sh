@@ -254,7 +254,19 @@ has_cache_dir_bound() { # <file>
   # to grep, so an intervening `--` makes the PATTERN `--`, which every file
   # matches. That is how the mutation below first passed. Escape the dashes into
   # the pattern instead.
-  matches "$code" '\-\-cache-dir=\\"\$WARM_TURBO_DIR\\"' || return 1
+  matches "$code" '\-\-cache-dir=\$\{local\.turbo_cache_dir_arg\}' || return 1
+  # And the argument is Terraform-rendered from the same input, quoted, rather
+  # than left for the shell.
+  matches "$code" 'turbo_cache_dir_arg = "'"'"'\$\{replace\(var\.turbo_cache_dir' || return 1
+  # THE REGRESSION THIS REPLACED, asserted as an absence. `--cache-dir="$WARM_
+  # TURBO_DIR"` reads correctly and is wrong: every `$` in a step command is put
+  # through `escape_dollars`, and the `script` field is handed to the shell
+  # verbatim — Cloud Build does not unescape `$$` there the way it does in
+  # `args`. So the build ran `--cache-dir="$$WARM_TURBO_DIR"`, turbo wrote to
+  # `<pid>WARM_TURBO_DIR`, and the publishing step found nothing and exited 0.
+  # Nothing went red; the prefix was simply always empty. Measured on the
+  # executed build resource `5ea57da5` (2026-08-26).
+  ! matches "$code" 'cache-dir=\\"\$WARM_TURBO_DIR' || return 1
   # The install ladder ends in `fi`, and the two halves are joined with a space:
   # without the `;` the step is `fi npx …`, a syntax error that kills the build
   # step before anything runs. Caught once by hand; asserted here so it is caught
@@ -571,7 +583,14 @@ mutate "a default put back on the command inputs" "$VARS" \
   has_optional_commands
 
 mutate "the build no longer told where to write" "$MAIN" \
-  's@ --cache-dir=\\"\$WARM_TURBO_DIR\\"@@' \
+  's@ --cache-dir=\${local\.turbo_cache_dir_arg}@@' \
+  has_cache_dir_bound
+
+# The exact shape that shipped broken for months. It is the natural thing to
+# write — the env variable is right there on the step — so it is mutated back in
+# rather than merely described above.
+mutate "the cache directory left to the shell to expand" "$MAIN" \
+  's@--cache-dir=\${local\.turbo_cache_dir_arg}@--cache-dir=\\"$WARM_TURBO_DIR\\"@' \
   has_cache_dir_bound
 
 mutate "the two halves of the build command run together" "$MAIN" \
