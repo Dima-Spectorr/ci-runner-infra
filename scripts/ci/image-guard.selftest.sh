@@ -202,6 +202,64 @@ else
   bad "$strays reference(s) to the _IMAGE_VERSION substitution outside the guard - read /workspace/image_version instead"
 fi
 
+# AND THE OTHER HALF OF THAT RULE, which cost a whole image build to learn: a
+# step may not USE `$IMAGE_VERSION` as a shell variable either unless it reads
+# the handoff file first. Each step is its own container, so the assignment the
+# guard makes is gone by the time the next one starts; under `set -u` the
+# reference is not a wrong name, it is a dead step. Build `8cfda54c`
+# (2026-08-26) died on `IMAGE_VERSION: unbound variable` in
+# `report`, the LAST step, after packer had already created
+# `ci-runner-host-gbcae58c` and forty minutes of provisioning had succeeded.
+#
+# The check is per-STEP rather than per-file: mentioning the name is fine, and
+# so is not mentioning it. What is never fine is one step using the variable
+# while another does the reading.
+steps_missing_version_read() { # <config> -> the offending step ids, if any
+  local cfg="$1" step block out=""
+  while IFS= read -r step; do
+    [ -n "$step" ] || continue
+    [ "$step" = "guard" ] && continue
+    block=$(awk -v want="$step" '
+      $0 ~ /^  - id: / { cur = substr($0, 9) }
+      cur == want { print }
+    ' "$cfg")
+    case "$block" in
+      *'IMAGE_VERSION'*)
+        case "$block" in
+          *'cat /workspace/image_version'*) : ;;
+          *) out="$out $step" ;;
+        esac ;;
+    esac
+  done <<EOF
+$(grep -oE '^  - id: .*' "$cfg" | sed 's/^  - id: //')
+EOF
+  printf '%s' "$out"
+}
+
+missing_read="$(steps_missing_version_read "$CONFIG")"
+if [ -z "$missing_read" ]; then
+  ok "every step that uses \$IMAGE_VERSION reads it from /workspace/image_version"
+else
+  bad "step(s)$missing_read use \$IMAGE_VERSION without reading /workspace/image_version — a shell variable does not cross a step boundary"
+fi
+
+# The mutation for it, run here rather than with the others below: those probe
+# the RENDERED guard step, and this one is a property of the file's shape.
+_mutant="$(mktemp)"
+awk '
+  /^  - id: / { step = substr($0, 9) }
+  step == "report" && /IMAGE_VERSION="\$\$\(cat \/workspace\/image_version\)"/ { next }
+  { print }
+' "$CONFIG" > "$_mutant"
+if cmp -s "$_mutant" "$CONFIG"; then
+  bad "mutation 'the report step stops reading the handoff' changed nothing — the pattern no longer matches"
+elif [ -n "$(steps_missing_version_read "$_mutant")" ]; then
+  ok "mutation caught: the report step stops reading the handoff"
+else
+  bad "mutation 'the report step stops reading the handoff' was not caught"
+fi
+rm -f "$_mutant"
+
 # -------------------------------------------------------------- the mutations
 #
 # Each removes the fix and asserts a check goes red. A gate that cannot fail is

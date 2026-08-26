@@ -277,6 +277,15 @@ steps:
       - -c
       - |
         set -euo pipefail
+        # THE SAME READ AS `packer`, AND FOR THE SAME REASON: each step is its
+        # own container, so a shell variable set in `guard` reaches neither of
+        # them. Without this line `set -u` kills the step on `IMAGE_VERSION:
+        # unbound variable` — measured on build `8cfda54c` (2026-08-26), which
+        # had by then created the image `ci-runner-host-gbcae58c` and
+        # was reporting nothing but a red build to say so. This step is the
+        # LAST one, so its failure lands after forty minutes of work that
+        # succeeded, and it names the wrong thing while doing it.
+        IMAGE_VERSION="$$(cat /workspace/image_version)"
         gcloud compute images describe "${_IMAGE_FAMILY}-$$IMAGE_VERSION" \
           --project="$PROJECT_ID" \
           --format="value(name,status,diskSizeGb)"
