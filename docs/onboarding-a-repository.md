@@ -82,7 +82,7 @@ or start from this minimum:
 
 ```hcl
 module "ci_runner_network" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.66.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-network?ref=v5.67.0"
 
   project_id         = var.project_id
   network            = var.network
@@ -91,7 +91,7 @@ module "ci_runner_network" {
 }
 
 module "ci_runner_identity" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.66.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.67.0"
 
   project_id        = var.project_id
   name              = var.pool_name
@@ -100,7 +100,7 @@ module "ci_runner_identity" {
 }
 
 module "ci_runner_pool" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.66.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.67.0"
 
   project_id = var.project_id
   region     = var.region
@@ -179,7 +179,7 @@ nightly, from your default branch.
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.66.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.67.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -424,7 +424,7 @@ later apply:
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.66.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.67.0"
 
   project_id     = var.project_id
   region         = var.region
@@ -561,7 +561,7 @@ module "ci_runner_pool" {           # the Linux CI pool from step 1, unchanged
 }
 
 module "ci_runner_pool_mq" {        # the Linux merge-queue pool
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.66.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.67.0"
   # …every argument of the CI pool, with three differences:
   name              = "${var.pool_name}-mq"
   manage_controller = false
@@ -576,7 +576,7 @@ module "ci_runner_pool_mq" {        # the Linux merge-queue pool
 }
 
 module "ci_runner_controller" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.66.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.67.0"
 
   name  = "${var.pool_name}-controller"
   pools = [
@@ -856,7 +856,7 @@ instantiations with their own names, MIGs, controllers and labels.
 
 ```hcl
 module "ci_runner_identity_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.66.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-identity?ref=v5.67.0"
 
   project_id        = var.project_id
   name              = var.win_pool_name
@@ -869,7 +869,7 @@ module "ci_runner_identity_win" {
 }
 
 module "ci_runner_pool_win" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.66.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.67.0"
 
   # ... project_id, region, github_*, network, subnetwork and the three
   # identities exactly as the Linux pool above, from the _win modules ...
