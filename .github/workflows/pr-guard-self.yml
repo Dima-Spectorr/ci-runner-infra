@@ -1,0 +1,54 @@
+name: PR guard (this repository)
+
+# This repository publishes the guard, so it is the first place the guard has to
+# hold — the same argument `merge-lane-self.yml` and `support-windows-self.yml`
+# already make for every rule shipped from here.
+#
+# Unlike the merge lane's self-caller, this one DOES run on the pull request
+# that changes it: `pull_request` is dispatched from the head ref, not the
+# default branch. The workflow file is therefore exercised for real on its own
+# pull request — but the DRIVER is not, because the reusable workflow checks the
+# implementation out at `github.job_workflow_sha`, which on a pull request is
+# the callee as it stands on the branch only when the caller uses a local
+# `./` path, as it does here. So on this repository the whole thing is live on
+# its own pull request; in a consumer, pinned by sha, it is not.
+#
+# `scripts/ci/pr-guard-decision.selftest.sh` is what stands behind that
+# everywhere else: every rule the guard applies, as a pure function with cases.
+
+on:
+  pull_request:
+    # `synchronize` is the one that matters. The answer to both questions —
+    # how far behind, who else is in these files — changes on every push, and a
+    # comment describing the previous push is worse than no comment.
+    #
+    # `ready_for_review` because the driver says nothing about a draft, so a
+    # pull request marked ready needs the run it skipped while it was one.
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    uses: ./.github/workflows/pr-guard.yml
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      # ADVISORY, ON THE REPOSITORY THAT PUBLISHES THE RULE. Deliberate, and not
+      # cowardice: this repository routinely has several release and
+      # infrastructure pull requests open at once that legitimately touch the
+      # same `VERSION`, `README.md` and module READMEs, and enforcing overlap
+      # here would block the release process the fleet depends on.
+      #
+      # Freshness is advisory for the reason the input's own description gives:
+      # `main` here moves several times an hour, so at `max-behind: 0` every
+      # open pull request is stale within minutes of being opened. The number
+      # below is what makes the signal mean something.
+      max-behind: 10
+      enforce-freshness: false
+      enforce-overlap: false
+      # Free on a public repository, and this fires on every push to every open
+      # pull request — the most frequently dispatched job here.
+      runs-on: ubuntu-latest

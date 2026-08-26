@@ -657,6 +657,15 @@ jobs:
       - name: merge-lane structural self-test
         run: bash scripts/ci/merge-lane.selftest.sh
 
+      # The guard the lane cannot be: the lane asks "may this merge now",
+      # seconds before it does; the guard asks whether the branch is looking at
+      # the current base and whether anyone else is rewriting the same files,
+      # on open and on every push, while the author can still act on it. Its
+      # driver is all `gh api` and is no more testable than the lane's, so the
+      # rules live in pure functions and this is where they are exercised.
+      - name: pr-guard decision self-test
+        run: bash scripts/ci/pr-guard-decision.selftest.sh
+
       # The branch reaper, split the same way and for the same reason: a
       # scheduled workflow is dispatched from the default branch only, so these
       # two steps are the only thing that runs on the pull request that changes
