@@ -93,6 +93,17 @@ if [ "${#REQUIRED[@]}" -eq 0 ]; then
   exit 1
 fi
 
+# The names the BASE-HEALTH gate reads on the base tip, which is a different
+# question from what gates a merge and may therefore be a different, cheaper
+# list. Empty falls back to `REQUIRED` — the strict reading, so a repository that
+# never set this gets the widest gate rather than a silently narrower one. There
+# is deliberately no emptiness check: unlike `REQUIRED`, an empty list here is
+# not a misconfiguration, it is the default.
+mapfile -t BASE_HEALTH < <(printf '%s\n' "${BASE_HEALTH_CHECKS:-}" | sed 's/[[:space:]]*$//' | grep -v '^$' || true)
+if [ "${#BASE_HEALTH[@]}" -eq 0 ]; then
+  BASE_HEALTH=("${REQUIRED[@]}")
+fi
+
 echo "lane: base=$LANE_BASE required=${#REQUIRED[@]} budget=${BUDGET}s pass-budget=${PASS_BUDGET}s max-actions=$MAX_ACTIONS dry-run=$DRY_RUN"
 for c in "${REQUIRED[@]}"; do echo "lane: requires '$c'"; done
 
@@ -338,9 +349,27 @@ lane_resolve_strict() {
 # push to the base, there is nothing on the tip to read and the gate is inert.
 # `docs/merge-lane.md` says so where an operator will meet it.
 # ---------------------------------------------------------------------------
+#
+# AND THE GATE DOES NOT HAVE TO READ THE SAME LIST THE MERGE DOES. Arming it
+# means running SOMETHING on a push to the base, and on IntegrateIT the required
+# `ci` takes about thirty minutes — at the drain rate the lane now reaches, that
+# is twenty half-hour runs an hour to power a gate that only ever asks one
+# yes/no question. `BASE_HEALTH_CHECKS` lets a repository point the gate at a
+# cheap post-merge signal (a typecheck-and-unit job, say) while `REQUIRED_CHECKS`
+# keeps gating the merges themselves. Unset means "the same list", which is the
+# right default: a repository that has not thought about it gets the strict
+# reading rather than a silently narrower one.
 LANE_HALT_REASON=''
 lane_base_is_broken() {
   local base_sha="$1" counts green missing failed pending
+  # DYNAMIC SCOPE, DELIBERATELY, AND THIS IS THE WHOLE MECHANISM. `check_counts`
+  # iterates the global `REQUIRED`; shadowing it with a `local` here means the
+  # call below — and the subshell it runs in, which inherits this frame — sees
+  # the base-health list instead, and every caller after this function returns
+  # sees the original. Rewriting `check_counts` to take the list as an argument
+  # would be more obvious and would touch the one function on the merge path
+  # whose failure modes are the most expensively learned in this file.
+  local -a REQUIRED=("${BASE_HEALTH[@]}")
   counts="$(check_counts "$base_sha")"
   read -r green missing failed pending <<<"$counts"
   : "$green" "$missing" "$pending"

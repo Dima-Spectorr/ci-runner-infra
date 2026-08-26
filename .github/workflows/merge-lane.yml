@@ -87,6 +87,29 @@ on:
           ungating it.
         required: true
         type: string
+      base-health-checks:
+        description: >-
+          Newline-separated check names the BASE-HEALTH gate reads on the tip of
+          the base, if they should differ from `required-checks`. Unset means
+          "the same list", which is the strict reading and the right default.
+
+
+          Why it exists: arming that gate at all means running something on a
+          push to the base, and on a repository whose required suite takes half
+          an hour that is one half-hour run per merge -- twenty an hour at the
+          rate this lane now drains a backlog -- to answer a single yes/no
+          question. Naming a cheap post-merge job here (a typecheck-and-unit
+          gate, say) keeps the gate armed at a fraction of the cost while
+          `required-checks` goes on gating the merges themselves.
+
+
+          A name that matches nothing counts as MISSING, and missing does NOT
+          halt this gate -- it fails open, unlike everything else in this
+          workflow. So a typo here does not deadlock the lane; it silently
+          disarms the gate. Read the queue snapshot after changing it.
+        required: false
+        default: ''
+        type: string
       runs-on:
         description: >-
           Where the lane runs. Defaults to `ubuntu-latest`, which is free and
@@ -362,6 +385,7 @@ jobs:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           LANE_BASE: ${{ inputs.base }}
           REQUIRED_CHECKS: ${{ inputs.required-checks }}
+          BASE_HEALTH_CHECKS: ${{ inputs.base-health-checks }}
           BUDGET: ${{ inputs.inflight-budget-seconds }}
           PASS_BUDGET: ${{ inputs.pass-budget-seconds }}
           MAX_ACTIONS: ${{ inputs.max-actions }}

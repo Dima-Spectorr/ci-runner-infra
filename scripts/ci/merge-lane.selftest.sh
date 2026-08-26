@@ -835,6 +835,50 @@ says_on_the_snapshot_that_it_halted() {
   matches "$code" '^      printf ._The open list was not read on this pass\._'
 }
 
+# THE BASE-HEALTH GATE READS ITS OWN LIST, AND FALLS BACK TO THE STRICT ONE.
+# `BASE_HEALTH_CHECKS` exists so a repository whose required suite takes half an
+# hour can arm the gate against a cheap post-merge job instead. Two things have
+# to hold for that not to be a quiet ungating: an unset value must fall back to
+# `REQUIRED` rather than to nothing -- an empty list would make `check_counts`
+# count zero failures and the gate would pass on a base that is on fire -- and
+# the shadowing must be LOCAL to `lane_base_is_broken`, or every merge after the
+# first pass would be gated on the cheap list too.
+reads_its_own_list_on_the_base_tip() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^mapfile -t BASE_HEALTH < ' || return 1
+  matches "$code" '^  local -a REQUIRED=\("\$\{BASE_HEALTH\[@\]\}"\)$'
+}
+
+falls_back_to_the_required_list() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^if \[ "\$\{#BASE_HEALTH\[@\]\}" -eq 0 \]; then$' || return 1
+  matches "$code" '^  BASE_HEALTH=\("\$\{REQUIRED\[@\]\}"\)$'
+}
+
+# The shadow has to sit inside the function. At file scope it would replace the
+# merge path's own list, and the lane would merge on whatever cheap subset the
+# base-health gate was pointed at -- the exact ungating invariant B exists to
+# prevent, arriving through the input added to make the gate affordable.
+scopes_the_shadow_to_the_gate() {
+  local shadow_line fn_start fn_end
+  shadow_line=$(grep -n '^  local -a REQUIRED=("${BASE_HEALTH\[@\]}")' "$1" | head -n1 | cut -d: -f1)
+  fn_start=$(grep -n '^lane_base_is_broken() {' "$1" | head -n1 | cut -d: -f1)
+  fn_end=$(grep -n '^one_pass() {' "$1" | head -n1 | cut -d: -f1)
+  [ -n "$shadow_line" ] && [ -n "$fn_start" ] && [ -n "$fn_end" ] \
+    && [ "$shadow_line" -gt "$fn_start" ] && [ "$shadow_line" -lt "$fn_end" ]
+}
+
+# The workflow has to hand the driver the value, or the input is decoration and
+# every repository that sets it silently keeps the strict list.
+passes_the_base_health_list_to_the_driver() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      base-health-checks:$' || return 1
+  matches "$code" '^          BASE_HEALTH_CHECKS: \$\{\{ inputs\.base-health-checks \}\}$'
+}
+
 echo "merge-lane self-test:"
 check declares_its_inputs_without_a_live_expression "$CALLEE" "an input description carries an Actions expression, and one naming vars fails the whole workflow at startup with no jobs and no log to read"
 check documented_label_gate_fails_closed "$DOC" "the documented label gate is wired bare to a variable, so a consumer copying it gets a lane that merges its entire backlog the moment the variable is unset, mistyped or cleared"
@@ -879,6 +923,10 @@ check ends_the_batch_on_a_refusal "$DRIVER" "a refused action does not stop the 
 check halts_when_the_base_itself_is_red "$DRIVER" "the lane keeps merging onto a base whose own required checks are failing, burying the commit that broke it under everything that follows"
 check only_a_definite_failure_halts_the_lane "$DRIVER" "the base-health gate halts on something other than a definite failure, which deadlocks every repository whose required checks run on pull_request only"
 check says_on_the_snapshot_that_it_halted "$DRIVER" "a halted lane renders exactly like a base with nothing open, so the queue view reports a quiet day while nothing can merge"
+check reads_its_own_list_on_the_base_tip "$DRIVER" "the base-health gate reads the merge list instead of its own, so arming it costs a full required suite on every push to the base"
+check falls_back_to_the_required_list "$DRIVER" "an unset base-health list resolves to nothing rather than to the required checks, and a gate reading an empty list passes on a base that is on fire"
+check scopes_the_shadow_to_the_gate "$DRIVER" "the base-health list leaks out of the gate and becomes what the MERGE is gated on, which is invariant B ungated by the input meant to make the gate affordable"
+check passes_the_base_health_list_to_the_driver "$CALLEE" "the input exists but never reaches the driver, so every repository that sets it silently keeps the expensive list"
 check says_when_it_did_not_ask_how_far_behind "$DRIVER" "the queue reports 0 commits behind for a pull request it never compared, so the table an operator trusts is showing a number nothing measured"
 
 check publishes_the_queue_where_it_costs_nothing "$DRIVER" "the queue is not written to the job summary, so the only view of it depends on a permission that may not have been granted"
@@ -1019,6 +1067,12 @@ mutate "the base-health gate starts halting on a check that merely has not repor
   's@^  \[ "\${failed:-0}" -gt 0 \]$@  [ $(( ${failed:-0} + ${missing:-0} )) -gt 0 ]@' only_a_definite_failure_halts_the_lane
 mutate "the halt stops being explained on the snapshot" "$DRIVER" \
   's@^    printf .> \*\*Halted\.\*\* @    printf '"'"'> \\n@' says_on_the_snapshot_that_it_halted
+mutate "the base-health gate reads the merge list rather than its own" "$DRIVER" \
+  's%^  local -a REQUIRED=("\${BASE_HEALTH\[@\]}")$%  :%' reads_its_own_list_on_the_base_tip
+mutate "an unset base-health list resolves to nothing instead of to the required checks" "$DRIVER" \
+  's%^  BASE_HEALTH=("\${REQUIRED\[@\]}")$%  BASE_HEALTH=()%' falls_back_to_the_required_list
+mutate "the workflow stops handing the base-health list to the driver" "$CALLEE" \
+  's@^          BASE_HEALTH_CHECKS: .*$@          BASE_HEALTH_CHECKS: x@' passes_the_base_health_list_to_the_driver
 mutate "a refused action no longer ends the batch" "$DRIVER" \
   's@\(lane_take_action .*\) || break@\1 || true@' ends_the_batch_on_a_refusal
 mutate "the unasked comparison starts reporting itself as up to date" "$DRIVER" \

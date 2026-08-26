@@ -600,6 +600,32 @@ CI run per merge, against a strict base's one run per *open pull request* per
 merge — the cheap end of the trade, and the whole reason the gate is shaped this
 way.
 
+**When one run per merge is still too much, narrow what the gate reads.** On
+IntegrateIT the required `ci` takes about thirty minutes, and at the rate the
+lane now drains a backlog that is roughly twenty half-hour runs an hour to power
+a gate that asks a single yes/no question. `base-health-checks` points the gate
+at a different, cheaper list:
+
+```yaml
+    with:
+      required-checks: |
+        ci
+        generic-binary
+      # What gates a MERGE is above. What the base-health gate reads is this: a
+      # fast post-merge job, not the full suite.
+      base-health-checks: |
+        main-health
+```
+
+`required-checks` goes on gating the merges themselves; only the base-tip read
+changes. Leave it unset and the gate reads `required-checks`, which is the strict
+reading and the right default for a repository that has not thought about it.
+
+One warning, because it points the other way from everything else in the lane: a
+name here that matches nothing counts as **missing**, and missing does not halt —
+this gate fails open. A typo will not deadlock the lane; it will quietly disarm
+the gate. Read the queue snapshot after changing it.
+
 #### And the half that runs before the lane: `pr-guard`
 
 The base-health gate is a backstop — it acts after something has already
