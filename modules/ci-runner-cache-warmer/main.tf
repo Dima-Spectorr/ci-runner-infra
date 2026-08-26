@@ -122,24 +122,43 @@ locals {
   # otherwise fail at plan time with a message about a missing file and nothing
   # about why this module wants one two directories up.
   #
-  # EVERY `$` GOES IN DOUBLED, and that is not cosmetic. Cloud Build reads `$X`
-  # and `${X}` in every string of a build config — args, env, anywhere — as a
-  # SUBSTITUTION, before the container ever sees them. A shell script pasted in
-  # whole is dense with both, and the trigger accepts it happily: the refusal
-  # comes at FIRE time, from the API, as
+  # NOTHING IS ESCAPED ON ITS WAY INTO A STEP, AND THAT IS MEASURED. Every `$`
+  # used to go in DOUBLED, which was right for the field this module no longer
+  # uses. Cloud Build reads `$X` and `${X}` in a build config as a SUBSTITUTION
+  # before the container sees them, and a shell script pasted whole into `args`
+  # is dense with both: the trigger accepted it happily and the API refused at
+  # FIRE time, in a nightly build nobody watches, with
   #
   #   invalid value for 'build.substitutions': key in the template
   #   "CACHE_EXPAND_FLOOR_BYTES" is not a valid built-in substitution
   #
-  # …in a nightly build nobody is watching, on a warmer that applied cleanly
-  # months earlier. `$$` is Cloud Build's escape for a literal `$`, so doubling
-  # every one hands the container the script it was written as.
+  # `$$` was the escape for that, and it stopped being needed one release later
+  # when every script moved into `script` (see below) — but it stayed, and it
+  # cost this module its whole turbo half: `--cache-dir="$$WARM_TURBO_DIR"`
+  # reached bash as the PID followed by a literal, for months, silently.
   #
-  # NOT `substitution_option = "ALLOW_LOOSE"`, which is the fix this error's
-  # first search result suggests: that makes the unmatched keys resolve to the
-  # EMPTY STRING instead of failing, so the build starts and runs a script whose
-  # every variable reference has been erased. This is one of the few places
-  # where the loud failure is the good outcome.
+  # THE SUBSTITUTION PASS DOES NOT TOUCH A `script` FIELD AT ALL. Measured with a
+  # one-step build against this fleet's own trigger, 2026-08-26, both halves:
+  #
+  #   `8f91196b`   loose    `$PROBE_VAR` reached the shell as `$PROBE_VAR` and
+  #                         expanded to the step's env value; `$$PROBE_VAR`
+  #                         reached it as `$$PROBE_VAR`, i.e. the PID.
+  #   `f314e153`   STRICT   identical — and `$_NO_SUCH_SUBSTITUTION_KEY` was
+  #                         accepted too, where the same text in `args` is the
+  #                         fire-time refusal quoted above. The pass never reads
+  #                         the field, so there is no key for it to reject.
+  #
+  # So a script is handed over exactly as written, an escape is a corruption
+  # rather than a protection, and a caller's `$HOME` or `$(git rev-parse HEAD)`
+  # now means what it says. Anything moved back into `args` — do not — would
+  # need the doubling again, and would hit the 10,000-character cap first.
+  #
+  # NOT `substitution_option = "ALLOW_LOOSE"` either, which is what this error's
+  # first search result suggests and what the loose probe above deliberately
+  # used: it makes unmatched keys resolve to the EMPTY STRING instead of
+  # failing, so a build starts and runs a script whose every variable reference
+  # has been erased. This is one of the few places where the loud failure is the
+  # good outcome.
   # AND EVERY STEP CARRIES ITS SCRIPT IN `script`, NEVER IN `args`. A build step
   # argument is capped at 10,000 characters and the API refuses the whole build
   # at FIRE time — again, not at apply time — with
@@ -153,7 +172,6 @@ locals {
   # own `#!/usr/bin/env bash`, so both scripts run under the interpreter they were
   # written for. Setting `entrypoint` beside `script` is an error — that is why
   # these steps have none.
-  escape_dollars = "$$"
 
   # AND THE WHOLE BUILD STAYS UNDER ~128 KiB, WHICH IS THE THIRD REFUSAL AND THE
   # ONLY ONE THAT NEVER SAYS ANYTHING AT ALL.
@@ -216,10 +234,7 @@ locals {
     ${local.stage_scan_allow}
   EOT
 
-  # A no-op today — there is no `$` in base64 — and kept because the day someone
-  # adds a shell variable to the staging script is the day it would otherwise
-  # become a substitution key and take the warmer down at fire time.
-  stage_script = replace(local.stage_script_raw, "$", local.escape_dollars)
+  stage_script = local.stage_script_raw
 
   # AND EVERY STEP CHECKS THE DIGEST BEFORE IT RUNS WHAT IT FOUND THERE.
   #
@@ -313,9 +328,10 @@ locals {
   scan_allow_staged   = "${local.staged_dir}/cache-scan-allow.txt"
   scan_allow_required = var.cache_scan_allow_file != null && var.cache_scan_allow_file != ""
 
-  # Goes into the staging script, which IS put through `escape_dollars`, so a `$`
-  # here survives; there is none, and `sha256sum` is printed as its own command
-  # rather than substituted for exactly that reason.
+  # Goes into the staging script, which reaches the shell verbatim, so a `$` here
+  # would mean what it says; there is none, and `sha256sum` is printed as its own
+  # command rather than substituted because a value read at warm time is the
+  # honest thing to print.
   stage_scan_allow = local.scan_allow_path == "" ? "" : join("", [
     "if [ -f '${local.scan_allow_path}' ]; then\n",
     "  cp '${local.scan_allow_path}' '${local.scan_allow_staged}'\n",
@@ -328,11 +344,9 @@ locals {
     "fi",
   ])
 
-  # And the publisher reads the CAPTURE, never the checkout. No `$` anywhere in
-  # here — this goes into `run_publish`, which is NOT put through the
-  # `escape_dollars` pass, so a `$` added here reaches Cloud Build as a
-  # substitution key and refuses the build. The path is validated to hold
-  # neither, along with the quote that would end the string it is pasted into.
+  # And the publisher reads the CAPTURE, never the checkout. The path is
+  # validated, along with the quote that would end the string it is pasted
+  # into — a `$` in it is now harmless, but a `'` still is not.
   ensure_scan_allow = local.scan_allow_path == "" ? "" : join("", [
     "if [ -f '${local.scan_allow_staged}' ]; then\n",
     "  CACHE_SCAN_ALLOW_FILE='${local.scan_allow_staged}'\n",
@@ -391,11 +405,11 @@ locals {
   # empty — silently. One extra install a night is the cheaper side of that.
   install_full = replace(replace(local.install_ladder, "@FLAGS@", ""), "@YARN@", "")
 
-  # Escaped for the same reason the scripts are, and a repository's OWN override
-  # is escaped too: a `build_command` holding `$(git rev-parse HEAD)` or a plain
-  # `$HOME` is not an unreasonable thing to write, and unescaped it takes the
-  # whole warmer down at fire time rather than in the plan that accepted it.
-  prepare_command = replace(coalesce(var.prepare_command, local.install_scriptfree), "$", local.escape_dollars)
+  # Handed over as written. This used to be escaped along with everything else,
+  # which meant a `prepare_command` holding `$HOME` or `$(git rev-parse HEAD)` —
+  # neither an unreasonable thing to write — silently became the PID and a
+  # literal. See the measurement above.
+  prepare_command = coalesce(var.prepare_command, local.install_scriptfree)
 
   # `--cache-dir` is passed from the same variable the publishing step reads, so
   # the two cannot drift. The old default relied on turbo's own default matching
@@ -404,8 +418,8 @@ locals {
   #
   # RENDERED BY TERRAFORM, NOT EXPANDED BY THE SHELL, and that is the whole point
   # of this line. It used to read `--cache-dir="$WARM_TURBO_DIR"`, taking the
-  # value from the env below — and every `$` in a step command goes through
-  # `escape_dollars` on its way out, so what Cloud Build actually ran was:
+  # value from the env below — and every `$` in a step command was doubled on its
+  # way out, so what Cloud Build actually ran was:
   #
   #   npx --no-install turbo run build --cache-dir="$$WARM_TURBO_DIR"
   #
@@ -429,17 +443,18 @@ locals {
   # the self-test now asserts the RENDERED command, which is the thing that was
   # never checked.
   #
-  # An override in `var.build_command` still goes through `escape_dollars` and
-  # therefore still cannot use a shell variable; the env below is what it has,
-  # and #459 tracks making that work rather than documenting it.
+  # The interpolation stays even though an override may now spell a shell
+  # variable: the DEFAULT should not depend on the env block below being wired,
+  # and a command with no `$` in it cannot be got wrong by a later change to how
+  # this module writes a step.
   #
   # The `;` is load-bearing and is asserted by the self-test: the ladder ends in
   # `fi`, and `fi npx …` is a syntax error the whole build step dies on before
   # anything runs — a green apply, a red nightly build, an empty cache.
-  build_command = replace(coalesce(var.build_command, join(" ", [
+  build_command = coalesce(var.build_command, join(" ", [
     "${local.install_full};",
     "npx --no-install turbo run build --cache-dir=${local.turbo_cache_dir_arg}",
-  ])), "$", local.escape_dollars)
+  ]))
 
   # Single-quoted so a directory with a space or a glob character in it is one
   # argument and not three. `'` itself is closed, escaped and reopened rather

@@ -186,14 +186,14 @@ variable "build_command" {
     dependency snapshot. An override is handed `WARM_TURBO_DIR` and
     `TURBO_CACHE_DIR` and must honour one of them.
 
-    IT CANNOT HONOUR THEM BY WRITING `$WARM_TURBO_DIR`, today. Every `$` in an
-    override is escaped to `$$` on its way into the step, and the `script` field
-    Cloud Build runs is not unescaped the way `args` is — so the shell sees its
-    own PID followed by a literal. A tool that reads `TURBO_CACHE_DIR` from the
-    environment itself is fine; a command line that spells the variable is not.
-    Write the path out, or leave this unset. Tracked in #459, with the measured
-    evidence; it is the same defect that made the default command publish
-    nothing.
+    `$WARM_TURBO_DIR` in an override means what it says. It did not until
+    v5.67.0: every `$` was doubled on its way into the step, which is Cloud
+    Build's escape for the `args` field and is corruption in the `script` field
+    this module uses — the shell saw its own PID followed by a literal. Measured
+    (`8f91196b`, `f314e153`, 2026-08-26): the substitution pass does not read a
+    `script` field at all, under strict substitution or loose, so nothing is
+    escaped now. It is the same defect that made the default command publish
+    nothing for months.
   EOT
   type        = string
   default     = null
