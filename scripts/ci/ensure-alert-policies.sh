@@ -529,6 +529,22 @@ pl_status="$(mon GET 'alertPolicies?pageSize=1000')"
   sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
 existing="$(json_pairs alertPolicies displayName)"
 
+# A policy that names a metric descriptor which does not exist YET is rejected
+# 404. That is not a broken policy — Monitoring creates a custom descriptor on
+# the first point written, so any series no host has published in this project
+# is legitimately absent: a fresh pool, a pool that has not hydrated a cache, a
+# prefix that just moved. Aborting the loop there leaves every policy AFTER it
+# unsynced, which is how a run that ends in one loud 404 quietly skips seven
+# alerts. Collect them, keep going, and fail at the end naming all of them.
+# A 404 alone is not enough: the API returns it for a bad policy id too, and
+# treating that as "come back later" would turn a real mistake into a warning.
+# Match the body as well.
+no_such_metric() {
+  [ "$1" = "404" ] || return 1
+  grep -q 'Cannot find metric' "$tmp/api.out"
+}
+
+deferred=""
 for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied hostvanished queuestuck queuestalldenied egressdenied; do
   policy_json "$key" >"$tmp/p.json"
   # Neither of these ends in `| head -1`, and that is deliberate. This script
@@ -559,13 +575,26 @@ for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsm
     up_status="$(mon PATCH "${id#projects/"$PROJECT"/}" "$tmp/p.json")"
     [ "$up_status" = "200" ] || {
       echo "$PROJECT: cannot update $name (HTTP $up_status)" >&2
-      sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
+      sed -n '1,20p' "$tmp/api.out" >&2
+      no_such_metric "$up_status" || exit 1
+      deferred="$deferred$name"$'\n'; continue; }
     printf '%s: updated  %s\n' "$PROJECT" "$name"
   else
     cp_status="$(mon POST alertPolicies "$tmp/p.json")"
     [ "$cp_status" = "200" ] || {
       echo "$PROJECT: cannot create $name (HTTP $cp_status)" >&2
-      sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
+      sed -n '1,20p' "$tmp/api.out" >&2
+      no_such_metric "$cp_status" || exit 1
+      deferred="$deferred$name"$'\n'; continue; }
     printf '%s: created  %s\n' "$PROJECT" "$name"
   fi
 done
+
+if [ -n "$deferred" ]; then
+  echo >&2
+  echo "$PROJECT: these policies name a metric this project has never received:" >&2
+  printf '%s' "$deferred" | sed 's/^/  /' >&2
+  echo "Every other policy WAS synced. Re-run once a host has published the" >&2
+  echo "series — a descriptor appears on its first point, then within 10 minutes." >&2
+  exit 1
+fi
