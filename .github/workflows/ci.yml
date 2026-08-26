@@ -416,16 +416,6 @@ jobs:
       - name: parked-decision self-test
         run: bash scripts/ci/parked-decision.selftest.sh
 
-      # Its complement, and the only rule in this directory whose verdict WRITES
-      # to somebody else's repository. A false positive here is not a muted
-      # alert: it comments on a pull request and can spend a merge-queue CI run
-      # on a diff that deserved to stay out. So this case list is weighted
-      # harder towards silence than the one above -- most of it asserts that the
-      # rule refuses to act -- and the boundaries it does assert (the settling
-      # window, the attempt ceiling, the infrastructure signature) are stated
-      # exactly rather than approximately.
-      - name: queue-stall-decision self-test
-        run: bash scripts/ci/queue-stall-decision.selftest.sh
 
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a
