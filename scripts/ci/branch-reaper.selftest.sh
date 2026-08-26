@@ -162,6 +162,44 @@ serialises() {
   matches "$code" '^      cancel-in-progress: false$'
 }
 
+# THE TWO GROUPS MUST NOT BE THE SAME NAME.
+#
+# Serialising is necessary and is asserted above; serialising against YOURSELF
+# is the failure this pair exists to prevent. A job cannot acquire a
+# concurrency group that its own run already holds at workflow level — GitHub
+# does not queue it and does not cancel the holder, it fails the job in about a
+# second with no runner assigned, no steps and no log. Nothing in the run, the
+# annotations or the API says "concurrency".
+#
+# Both halves were spelled `branch-reaper` from the cutover to 2026-08-26: the
+# callee's job here, and the caller template in `docs/branch-reaper.md` that
+# every consumer copied. Nine of nine consumer repositories therefore failed
+# every 04:17 sweep since rollout and deleted nothing, while this repository
+# passed — its own caller happens to declare no workflow-level group, which is
+# also why no assertion over the files in this repository alone could have
+# caught it. That is what makes this a CROSS-FILE predicate: the bug does not
+# exist in either file, only between them.
+#
+# Checked from both sides so that either file drifting back onto the other's
+# name fails, whichever one is edited.
+group_of() { # <file> <indent>
+  code_of "$1" | sed -n "s/^$2group: \(.*\)\$/\1/p" | head -1
+}
+
+callee_group_cannot_collide_with_a_caller() {
+  local callee doc
+  callee=$(group_of "$1" '      ')
+  doc=$(group_of "$DOC" '  ')
+  [ -n "$callee" ] && [ -n "$doc" ] && [ "$callee" != "$doc" ]
+}
+
+documented_caller_cannot_collide_with_the_callee() {
+  local callee doc
+  doc=$(group_of "$1" '  ')
+  callee=$(group_of "$CALLEE" '      ')
+  [ -n "$callee" ] && [ -n "$doc" ] && [ "$callee" != "$doc" ]
+}
+
 is_bounded() {
   local code
   code=$(code_of "$1")
@@ -454,6 +492,7 @@ check caps_the_deletions "$CALLEE" "the per-run deletion cap is missing or never
 check acts_as_the_app "$CALLEE" "the reaper does not act as the merge App, so deletions are unattributed and protected refs fail"
 check never_writes_as_itself "$CALLEE" "the built-in token can write, so there are two write paths into a job that deletes refs"
 check serialises "$CALLEE" "the reaper does not serialise, so two sweeps can act on a branch list the other is changing"
+check callee_group_cannot_collide_with_a_caller "$CALLEE" "the callee's concurrency group is the one the documented caller holds, so the job can never acquire it and every consumer's sweep dies in a second with no log"
 check is_bounded "$CALLEE" "the reaper is unbounded, so one run can hold the lock indefinitely"
 check keeps_expressions_out_of_the_shell "$CALLEE" "an expression is interpolated into the shell of a job that can delete refs"
 check delegates_the_decision "$CALLEE" "the callee decides something itself, in YAML, where no pull request can test it"
@@ -483,6 +522,7 @@ check never_writes_an_empty_report_field "$DRIVER" "a report field can be empty,
 check ci_runs_both_self_tests "$CI" "a branch-reaper self-test is not run by CI, so it is a file rather than a gate"
 check documented_example_carries_one_pin "$DOC" "the documented example still sets implementation-ref to a sha, so a consumer copying it reintroduces a second pin Dependabot cannot keep in step with the first"
 check documented_example_survives_the_consumer_gates "$DOC" "the documented example is missing the concurrency block or the RUNNER7 declaration, so a consumer who copies it verbatim gets a caller their own vendored gates reject"
+check documented_caller_cannot_collide_with_the_callee "$DOC" "the documented caller holds the callee job's own concurrency group, so every consumer who copies it reaps nothing and is told nothing"
 
 # ---------------------------------------------------------------------------
 # Mutations. Every property above must be DETECTABLE, not merely present: a
@@ -521,6 +561,12 @@ mutate "the reaper stops serialising" "$CALLEE" \
   's|^    concurrency:|    x-concurrency:|' serialises
 mutate "in-flight reapers become cancellable" "$CALLEE" \
   's|^      cancel-in-progress: false$|      cancel-in-progress: true|' serialises
+mutate "the callee takes back the group name the documented caller holds" "$CALLEE" \
+  's|^      group: branch-reaper-callee-.*|      group: branch-reaper-caller|' \
+  callee_group_cannot_collide_with_a_caller
+mutate "the documented caller takes the callee job's group name" "$DOC" \
+  's|^  group: branch-reaper-caller$|  group: branch-reaper-callee-${{ github.repository }}|' \
+  documented_caller_cannot_collide_with_the_callee
 mutate "the job timeout is removed" "$CALLEE" \
   's|^    timeout-minutes: 15$|    x: 15|' is_bounded
 mutate "an input is spliced into the shell" "$CALLEE" \
