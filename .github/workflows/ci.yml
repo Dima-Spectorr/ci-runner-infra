@@ -664,6 +664,26 @@ jobs:
       - name: merge-lane structural self-test
         run: bash scripts/ci/merge-lane.selftest.sh
 
+      # The base-health names are a contract that spans two files with nothing
+      # joining them. A name that matches no job counts as MISSING, and missing
+      # does not halt — so a typo, or renaming the job that answers, fails
+      # nothing and looks exactly like a working gate while the lane goes back
+      # to merging onto an unverified base. It also reads the fallback the lane
+      # reads: `base-health-checks` unset means `required-checks`, so a caller
+      # that never opted in is checked too, which is the case most likely to be
+      # naming a job that only ever runs on a pull request.
+      - name: base-health contract self-test
+        run: |
+          # Same guard as the other PyYAML reader in this pipeline: the check
+          # REFUSES to run without it rather than comparing two empty strings.
+          python3 -c 'import yaml' 2>/dev/null || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-yaml
+          }
+          bash scripts/ci/check-base-health-contract.sh --selftest
+      - name: base-health contract
+        run: bash scripts/ci/check-base-health-contract.sh
+
       # The guard the lane cannot be: the lane asks "may this merge now",
       # seconds before it does; the guard asks whether the branch is looking at
       # the current base and whether anyone else is rewriting the same files,

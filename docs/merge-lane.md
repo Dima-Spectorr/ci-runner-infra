@@ -665,6 +665,18 @@ Two consequences worth stating plainly:
   the event that unblocks the next merge, and a caller that only listens to CI
   learns the tip went green whenever the cron backstop next fires — a fifteen
   minute pause between merges on a base that answered in two.
+- **Join the names to the jobs, or the gate disarms itself in silence.** The
+  names in `base-health-checks` are matched literally against the check-runs on
+  the tip, and a name that matches nothing counts as MISSING — which does not
+  halt. So a typo, or renaming the job that answers, breaks nothing, fails
+  nothing, and leaves a repository merging onto an unverified base while the
+  configuration still says otherwise. [`check-base-health-contract.sh`](../scripts/ci/check-base-health-contract.sh)
+  is what joins the two files; run it in your own CI beside the other workflow
+  gates. It reads the fallback too — **`base-health-checks` unset means
+  `required-checks`**, so a caller that never opted in is still armed, against a
+  list written for pull requests. A required check that runs only on
+  `pull_request` publishes nothing on the tip, which is the same silent disarm
+  arrived at without anyone choosing it.
 
 #### And the half that runs before the lane: `pr-guard`
 
