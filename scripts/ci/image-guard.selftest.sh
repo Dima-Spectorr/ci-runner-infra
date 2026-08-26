@@ -323,6 +323,63 @@ mutate "the version taken back into double quotes" \
   "s@IMAGE_VERSION='\\\$\\{_IMAGE_VERSION\\}'@IMAGE_VERSION=\"\\\${_IMAGE_VERSION}\"@" \
   probe_value_is_literal
 
+# ---- what the build reads, versus what the trigger watches -------------------
+#
+# The image trigger fires on a path list, and the packer template uploads files
+# into the build with `file` provisioners. Those two sets have to agree, and
+# nothing made them: the vulnerability gate's script and its two data files live
+# outside `packer/`, were copied in from the start, and were never watched.
+#
+# The failure that produces is circular and does not look like a configuration
+# bug. The gate goes red on a finding; the fix is a line in
+# `docs/image-vuln-offdistro.txt`; merging that line rebuilds nothing, because
+# the trigger never heard of the file. The red build stays red until somebody
+# happens to touch `packer/` for an unrelated reason.
+#
+# Derived from the template rather than listed here, so a new provisioner is
+# caught the day it is added instead of the day it matters.
+PKR="$ROOT/packer/ci-host-image.pkr.hcl"
+TRIGGER_VARS="$ROOT/modules/ci-host-image-trigger/variables.tf"
+packer_upload_paths_are_watched() {
+  [ -r "$PKR" ] && [ -r "$TRIGGER_VARS" ] || {
+    bad "cannot read the packer template or the trigger's variables — this check would be vacuous"
+    return
+  }
+  # `source = "../<path>"` in a provisioner: the `..` is what makes it a file
+  # outside `packer/`, which is exactly the population at issue.
+  local unwatched="" path
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    grep -qF "\"$path\"" "$TRIGGER_VARS" || unwatched="$unwatched $path"
+  done <<EOF
+$(grep -oE 'source[[:space:]]*=[[:space:]]*"\.\./[^"]+"' "$PKR" | sed 's/.*"\.\.\///; s/"$//' | sort -u)
+EOF
+  printf '%s' "$unwatched"
+}
+
+unwatched="$(packer_upload_paths_are_watched)"
+if [ -z "$unwatched" ]; then
+  ok "every file the packer template uploads from outside packer/ is watched by the trigger"
+else
+  bad "the build reads$unwatched but the trigger does not watch it — changing one of those files cannot cause the rebuild that would apply it. Add it to included_files in $TRIGGER_VARS"
+fi
+
+# The mutation: drop one path from the watched list and the check must notice.
+_tvmut="$(mktemp)"
+grep -v '"docs/image-vuln-offdistro.txt"' "$TRIGGER_VARS" > "$_tvmut"
+if cmp -s "$_tvmut" "$TRIGGER_VARS"; then
+  bad "mutation 'a watched upload path removed' changed nothing — the path is no longer in the list"
+else
+  _tvreal="$TRIGGER_VARS"; TRIGGER_VARS="$_tvmut"
+  if [ -n "$(packer_upload_paths_are_watched)" ]; then
+    ok "mutation caught: a watched upload path removed"
+  else
+    bad "mutation 'a watched upload path removed' was not caught"
+  fi
+  TRIGGER_VARS="$_tvreal"
+fi
+rm -f "$_tvmut"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "image-guard selftest: all checks passed"
