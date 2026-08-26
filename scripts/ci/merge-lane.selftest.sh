@@ -1070,8 +1070,15 @@ a_red_ancestor_inside_the_window_halts_the_lane() {
   code=$(code_of "$1")
   matches "$code" '^      broken\)$' || return 1
   # rc 1 out of the walk, and the caller must refuse on it rather than fall
-  # through to the grace clock that would merge unvouched anyway.
-  matches "$code" '^      1\) return 1 ;;$'
+  # through to the grace clock that would merge unvouched anyway. The arm
+  # restores nothing, deliberately: `broken` has to survive out of the window
+  # or every message below it reports a red answer as a missing one.
+  matches "$code" '^      1\) return 1 ;;$' || return 1
+  # And the refusal has to SAY which of the two it is. A red ancestor does not
+  # clear on a timer, so wearing the unanswered wording -- "proceeds regardless
+  # after 900s" -- sends whoever reads the queue snapshot away to wait for a
+  # release that never comes.
+  matches "$code" 'FAILING on an ancestor of the tip'
 }
 
 # BOUNDED BY AGE AND BY HOPS, and both are load-bearing. Without the age test
@@ -1358,6 +1365,8 @@ mutate "the window stays open after the lane has merged" "$DRIVER" \
   's@^        LANE_MERGED_THIS_RUN=1$@        :@' the_staleness_window_closes_after_the_lane_merges
 mutate "a red ancestor stops halting the walk" "$DRIVER" \
   's@^      1) return 1 ;;$@      1) : ;;@' a_red_ancestor_inside_the_window_halts_the_lane
+mutate "a red ancestor is reported as a tip that merely has not answered" "$DRIVER" \
+  's@FAILING on an ancestor of the tip@waiting on an ancestor of the tip@' a_red_ancestor_inside_the_window_halts_the_lane
 mutate "the ancestor walk loses its age bound" "$DRIVER" \
   's@^    \[ "\$age" -lt "\$BASE_HEALTH_MAX_STALENESS" \] || break$@    :@' the_window_walk_is_bounded
 mutate "the workflow stops handing the staleness window to the driver" "$CALLEE" \

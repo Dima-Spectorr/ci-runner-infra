@@ -709,9 +709,11 @@ Two consequences worth stating plainly:
   than by this paragraph. The window is consulted **only** when the tip reads
   `unanswered` — a tip that answered red still halts the pass. The walk stops at
   the first ancestor that answered *either way*, so a red ancestor halts the lane
-  instead of being searched past for an older green one. It is bounded by age and
-  by five hops. And it is **closed for the rest of any run in which the lane has
-  merged**, because an ancestor's answer predates that merge by definition and
+  instead of being searched past for an older green one — and it halts **with its
+  own wording**, because a red ancestor does not clear on a timer and the
+  unanswered wording promises the grace window will release it. It is bounded by
+  age and by five hops. And it is **closed for the rest of any run in which the
+  lane has merged**, because an ancestor's answer predates that merge and
   must not speak for a tip the lane itself created — which is the whole point of
   the between-merges check above.
 

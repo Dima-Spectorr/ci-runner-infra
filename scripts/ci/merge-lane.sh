@@ -650,13 +650,20 @@ lane_base_is_vouched() {
   if [ "$BASE_HEALTH_MAX_STALENESS" -gt 0 ] && [ -z "$LANE_MERGED_THIS_RUN" ]; then
     local tip_verdict="$LANE_BASE_VERDICT" window_rc=0
     lane_base_window_answers "$sha" || window_rc=$?
-    LANE_BASE_VERDICT="$tip_verdict"
     # 0 vouched, 1 an ancestor inside the window is RED, 2 nothing inside it
     # answered — only the last falls through to the grace clock below.
     case "$window_rc" in
-      0) return 0 ;;
+      0) LANE_BASE_VERDICT="$tip_verdict"; return 0 ;;
+      # `broken` DELIBERATELY SURVIVES, where the other two outcomes restore the
+      # tip's own verdict. The window found a definite failure on a commit the
+      # tip descends from, and that is the reason the lane halted — restoring
+      # `unanswered` here would have every message below, and the row published
+      # to the queue snapshot, say the lane is waiting for an answer that has
+      # already arrived and was red. It would also promise the grace clock will
+      # release it, which is false: a red ancestor refuses on every pass.
       1) return 1 ;;
     esac
+    LANE_BASE_VERDICT="$tip_verdict"
   fi
   now="$(date -u +%s)"
   # An unparseable date resolves to epoch, so the age is enormous and the lane
@@ -746,8 +753,19 @@ one_pass() {
   # triggered seconds after another one's merge would otherwise walk straight
   # past a tip whose health nobody has reported yet.
   if ! lane_base_is_vouched "$base_sha" "$base_at"; then
-    LANE_HALT_REASON="the base-health check on the tip of $LANE_BASE ($base_sha) is '$LANE_BASE_VERDICT' — waiting for it to answer"
-    echo "::notice::lane: $LANE_HALT_REASON. Something answers for this base and has not yet answered for this commit; merging now would stack onto a tip nothing has vouched for. The lane resumes on its own, and proceeds regardless after ${BASE_HEALTH_GRACE}s."
+    # TWO REASONS WEAR THIS ONE REFUSAL, and they are opposite instructions to
+    # whoever reads the queue snapshot. `broken` here can only come from the
+    # staleness window — the halt above already owns a red TIP — and it means
+    # an answer arrived and was red, so the grace clock will not release it and
+    # saying it will sends an operator away to wait. Anything else is the
+    # ordinary wait for a tip that has not reported.
+    if [ "$LANE_BASE_VERDICT" = 'broken' ]; then
+      LANE_HALT_REASON="the base-health checks are FAILING on an ancestor of the tip of $LANE_BASE ($base_sha)"
+      echo "::warning::lane: not merging — $LANE_HALT_REASON. The tip has not answered for itself, and the most recent commit that did answered red; the tip descends from it. This does not clear on a timer — fix the base, or re-run its checks if the failure was infrastructure."
+    else
+      LANE_HALT_REASON="the base-health check on the tip of $LANE_BASE ($base_sha) is '$LANE_BASE_VERDICT' — waiting for it to answer"
+      echo "::notice::lane: $LANE_HALT_REASON. Something answers for this base and has not yet answered for this commit; merging now would stack onto a tip nothing has vouched for. The lane resumes on its own, and proceeds regardless after ${BASE_HEALTH_GRACE}s."
+    fi
     return 1
   fi
 
