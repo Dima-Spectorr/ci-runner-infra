@@ -236,6 +236,33 @@ check_counts() {
         green=$((green + 1))
         were_skipped+=("$name")
         ;;
+      # A RUN THAT WAS SUPERSEDED REACHED NO VERDICT, and on the BASE TIP that
+      # is the normal case rather than the exception. A repository that answers
+      # the base-health question with a job keyed on a constant concurrency
+      # group and `cancel-in-progress: true` — which is the right shape, since a
+      # verdict on a superseded sha is worthless — cancels the previous run
+      # every time the lane merges again. Measured on IntegrateIT 2026-08-26:
+      # five consecutive pushes to `main`, four `cancelled` and one pending.
+      #
+      # Counting that as a failure would have the base-health gate halt the
+      # whole lane on a repository whose base is perfectly healthy, and the
+      # halt would look exactly like a real one. It is the difference between
+      # "the base is broken" and "nobody has answered yet", and only the second
+      # is true. Pending is what "nobody has answered yet" already means here.
+      #
+      # ONLY ON THE BASE TIP. Gating a MERGE on a cancelled required check is a
+      # different question with a different right answer: the pull request's own
+      # run was cancelled, so it has not passed, and letting it through on the
+      # grounds that the cancellation was not a verdict is how an unchecked diff
+      # merges. `BASE_TIP_READ` is set by `lane_base_is_broken` and by nothing
+      # else, the same dynamic-scope handle the base-health list uses.
+      cancelled | stale)
+        if [ "${BASE_TIP_READ:-0}" = "1" ]; then
+          pending=$((pending + 1))
+        else
+          failed=$((failed + 1))
+        fi
+        ;;
       # `neutral` is NOT a pass. A check that ran and declined to judge has said
       # something different from one that never needed to run.
       *) failed=$((failed + 1)) ;;
@@ -370,6 +397,12 @@ lane_base_is_broken() {
   # would be more obvious and would touch the one function on the merge path
   # whose failure modes are the most expensively learned in this file.
   local -a REQUIRED=("${BASE_HEALTH[@]}")
+  # The same handle, for the other half of the question. A `cancelled` required
+  # check means "this pull request has not passed" on the merge path and "nobody
+  # has answered yet" on the base tip, because the run that would have answered
+  # is routinely superseded by the next merge. See the classifier for the five
+  # consecutive cancellations that made this necessary.
+  local BASE_TIP_READ=1
   counts="$(check_counts "$base_sha")"
   read -r green missing failed pending <<<"$counts"
   : "$green" "$missing" "$pending"

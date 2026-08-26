@@ -879,7 +879,41 @@ passes_the_base_health_list_to_the_driver() {
   matches "$code" '^          BASE_HEALTH_CHECKS: \$\{\{ inputs\.base-health-checks \}\}$'
 }
 
+# A cancelled required check has to mean two different things in the two places
+# it is read, and getting that wrong wedges the lane on a healthy base. The job
+# that answers the base-health question is keyed on a constant concurrency group
+# with cancel-in-progress -- the only shape that answers for the CURRENT tip --
+# so the next merge cancels it, and a cancelled run counted as red would halt
+# every pass on a repository with nothing wrong with it.
+reads_a_cancelled_base_check_as_unanswered() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      cancelled | stale)$' || return 1
+  matches "$code" '^        if \[ "\$\{BASE_TIP_READ:-0\}" = "1" \]; then$' || return 1
+  matches "$code" '^          pending=\$\(\(pending \+ 1\)\)$' || return 1
+  # And the OTHER arm, which is the half that must not be lost: on the merge
+  # path a cancelled required check is still a check that did not pass.
+  matches "$code" '^          failed=\$\(\(failed \+ 1\)\)$'
+}
+
+# `BASE_TIP_READ` is set in exactly one place. Set anywhere else -- at file
+# scope, or on the merge path -- and a cancelled required check stops blocking
+# the merge it should block.
+sets_the_base_tip_handle_only_in_the_gate() {
+  local set_line fn_start fn_end n
+  n=$(grep -c '^  local BASE_TIP_READ=1$' "$1")
+  [ "$n" = "1" ] || return 1
+  grep -q '^BASE_TIP_READ=' "$1" && return 1
+  set_line=$(grep -n '^  local BASE_TIP_READ=1$' "$1" | head -n1 | cut -d: -f1)
+  fn_start=$(grep -n '^lane_base_is_broken() {' "$1" | head -n1 | cut -d: -f1)
+  fn_end=$(grep -n '^one_pass() {' "$1" | head -n1 | cut -d: -f1)
+  [ -n "$set_line" ] && [ -n "$fn_start" ] && [ -n "$fn_end" ] \
+    && [ "$set_line" -gt "$fn_start" ] && [ "$set_line" -lt "$fn_end" ]
+}
+
 echo "merge-lane self-test:"
+check reads_a_cancelled_base_check_as_unanswered "$DRIVER" "a cancelled check on the base tip counts as a failure, so the base-health gate halts every pass on a repository whose base is healthy and whose answering run was merely superseded"
+check sets_the_base_tip_handle_only_in_the_gate "$DRIVER" "the base-tip reading mode is set outside the gate, so a cancelled required check stops blocking the merge it exists to block"
 check declares_its_inputs_without_a_live_expression "$CALLEE" "an input description carries an Actions expression, and one naming vars fails the whole workflow at startup with no jobs and no log to read"
 check documented_label_gate_fails_closed "$DOC" "the documented label gate is wired bare to a variable, so a consumer copying it gets a lane that merges its entire backlog the moment the variable is unset, mistyped or cleared"
 check documented_example_carries_one_pin "$DOC" "the documented example still sets implementation-ref to a sha, so a consumer copying it reintroduces a second pin Dependabot cannot keep in step with the first"
@@ -1073,6 +1107,10 @@ mutate "an unset base-health list resolves to nothing instead of to the required
   's%^  BASE_HEALTH=("\${REQUIRED\[@\]}")$%  BASE_HEALTH=()%' falls_back_to_the_required_list
 mutate "the workflow stops handing the base-health list to the driver" "$CALLEE" \
   's@^          BASE_HEALTH_CHECKS: .*$@          BASE_HEALTH_CHECKS: x@' passes_the_base_health_list_to_the_driver
+mutate "a cancelled check on the base tip goes back to counting as red" "$DRIVER" \
+  's%^      cancelled | stale)$%      cancelled-never)%' reads_a_cancelled_base_check_as_unanswered
+mutate "the base-tip reading mode is set for the merge path too" "$DRIVER" \
+  's%^  local BASE_TIP_READ=1$%BASE_TIP_READ=1%' sets_the_base_tip_handle_only_in_the_gate
 mutate "a refused action no longer ends the batch" "$DRIVER" \
   's@\(lane_take_action .*\) || break@\1 || true@' ends_the_batch_on_a_refusal
 mutate "the unasked comparison starts reporting itself as up to date" "$DRIVER" \
