@@ -687,6 +687,37 @@ Two consequences worth stating plainly:
   with a warning rather than stalling. **Raising it is almost never the fix:** a
   lane warning that it proceeded unvouched on every pass has a health job that
   never finishes, and the number is not what is wrong.
+- **That ceiling bounds one wait, not the waiting — and on a fast base the
+  difference is a livelock.** The grace is measured from the *tip's* commit
+  date, so every merge that lands restarts it from zero. Each wait expires
+  correctly and the sequence never does. Measured on IntegrateIT on 2026-08-26:
+  a 6–14 minute `main-health` against a `main` advancing every 2–16 minutes, and
+  the lane merged nothing for a working day while the backlog went in by hand —
+  which is itself what kept `main` moving. **It is silent.** The pass halts
+  before it classifies anything, so the run says `success` and `0 action(s)`
+  with no `merge:ready` line above it, which is also exactly what an idle,
+  healthy lane says. If a repository's lane has never merged anything, read the
+  `lane:` notices, not the run conclusion.
+- **The fix for that is `base-health-max-staleness-seconds` (default `0`, off).**
+  Non-zero lets a green answer on a recent *ancestor* vouch for a tip that has
+  not answered yet, which is the question the gate actually asks — is the base
+  broken right now. Set it to a small multiple of how long the health job takes.
+  It is deliberately opt-in: one repository outrunning its health job is not a
+  reason to relax the gate on the twelve that have not.
+
+  What it relaxes is narrow, and each bound is enforced by the self-test rather
+  than by this paragraph. The window is consulted **only** when the tip reads
+  `unanswered` — a tip that answered red still halts the pass. The walk stops at
+  the first ancestor that answered *either way*, so a red ancestor halts the lane
+  instead of being searched past for an older green one. It is bounded by age and
+  by five hops. And it is **closed for the rest of any run in which the lane has
+  merged**, because an ancestor's answer predates that merge by definition and
+  must not speak for a tip the lane itself created — which is the whole point of
+  the between-merges check above.
+
+  And note what it replaces. Past the grace, the unfixed behaviour is to merge
+  *unvouched*, on no answer at all. A green answer from four minutes ago is
+  strictly more information than that, not less.
 - **Wake the lane on the health job, not only on CI.** Add the health workflow's
   `name:` to your caller's `workflow_run: workflows:` list. Its completion is
   the event that unblocks the next merge, and a caller that only listens to CI
