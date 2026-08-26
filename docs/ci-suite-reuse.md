@@ -49,7 +49,13 @@ So:
 1. **Every lane's key covers the CI process**, whatever that lane declares:
    `.github/workflows/**`, `.github/actions/**`, `scripts/ci/**`, both spellings
    of the queue config (`.mergify.yml` and `.mergify.yaml`) and the
-   caller-supplied pins. A workflow or gate-script change alters what
+   caller-supplied pins. Mergify is gone fleet-wide
+   ([#434](https://github.com/Dima-Spectorr/ci-runner-infra/issues/434)) and no
+   repository has either file any more, so those two paths now match nothing —
+   they stay in the list because a path that matches nothing costs nothing,
+   while removing one is how a key silently stops covering something. The merge
+   lane itself lives in `.github/workflows/**`, which is already here. A
+   workflow or gate-script change alters what
    "green" *means*; a lane that reused across one would be asserting a result
    its own definition no longer produces. This is not an optimisation to be
    relaxed later — it is the reason the gate holds.
