@@ -175,7 +175,15 @@ name: Merge lane
 
 on:
   workflow_run:
-    workflows: [CI]          # must match your CI workflow's `name:` exactly
+    # Must match each workflow's `name:` exactly.
+    #
+    # LIST THE BASE-HEALTH WORKFLOW HERE TOO if you have armed the gate. On an
+    # armed base the lane merges only onto a tip that has answered green, so the
+    # completion of that job is precisely the event that unblocks the next
+    # merge. Leave it out and the lane still gets there — the cron backstop and
+    # the next CI completion both wake it — but a backlog drains at whichever of
+    # those happens to fire rather than as fast as the base can vouch for itself.
+    workflows: [CI, main-health]
     types: [completed]
   schedule:
     - cron: '*/15 * * * *'   # the backstop — see below
@@ -573,8 +581,10 @@ So the lane does not try to prevent it. It **bounds** it, with two things:
    base tip* — the same read it does on a head — and if one of them has
    **failed**, the pass stops there. The reason is logged as a workflow
    annotation and written across the top of the queue snapshot, and the lane
-   resumes on its own as soon as those checks pass. So a semantic conflict costs
-   one batch, not the whole backlog.
+   resumes on its own as soon as those checks pass. On an armed base the tip is
+   re-read between merges too, so a semantic conflict costs the one merge that
+   caused it rather than the batch it arrived in — see *once the gate is armed*
+   below.
 
 **The gate fails open, deliberately, and it is only as good as your post-merge
 CI.** Only a definite failure halts it. A check that is *missing* or *pending*
@@ -625,6 +635,36 @@ One warning, because it points the other way from everything else in the lane: a
 name here that matches nothing counts as **missing**, and missing does not halt —
 this gate fails open. A typo will not deadlock the lane; it will quietly disarm
 the gate. Read the queue snapshot after changing it.
+
+**Once the gate is armed, the lane merges only onto a tip that has answered.**
+This is the half that makes the gate worth arming, and it is easy to miss why it
+is needed: the halt above asks its question *once*, at the top of a pass, and a
+pass on a non-strict base then merges several pull requests. The first of them
+is exactly the merge that can turn the base red — two branches green alone and
+broken together is the case this whole gate exists for — and without a second
+look the rest of the batch lands on the break before any post-merge job has
+reported. So on an armed base the tip is re-read between merges *and* at the top
+of every pass, and nothing is merged onto it until its base-health checks report
+green. An unarmed base is untouched by this: nothing answers for it, so there is
+nothing to wait for and it drains as before.
+
+Two consequences worth stating plainly:
+
+- **An armed repository merges at the pace its health job answers.** That is the
+  cost of the guarantee, and it is why `base-health-checks` exists — point the
+  gate at a two-minute job, not a thirty-minute suite, and the pace is fine.
+- **The wait has a ceiling, `base-health-grace-seconds` (default 900).** The job
+  answering for the tip is keyed to supersede its own runs, which is the only
+  shape that can answer for the *current* commit, so on a busy base it is
+  routinely cancelled before it reports. Past the grace window the lane proceeds
+  with a warning rather than stalling. **Raising it is almost never the fix:** a
+  lane warning that it proceeded unvouched on every pass has a health job that
+  never finishes, and the number is not what is wrong.
+- **Wake the lane on the health job, not only on CI.** Add the health workflow's
+  `name:` to your caller's `workflow_run: workflows:` list. Its completion is
+  the event that unblocks the next merge, and a caller that only listens to CI
+  learns the tip went green whenever the cron backstop next fires — a fifteen
+  minute pause between merges on a base that answered in two.
 
 #### And the half that runs before the lane: `pr-guard`
 

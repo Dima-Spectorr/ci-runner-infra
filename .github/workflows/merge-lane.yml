@@ -110,6 +110,27 @@ on:
         required: false
         default: ''
         type: string
+      base-health-grace-seconds:
+        description: >-
+          How long the lane waits for the base tip to answer for itself before
+          merging onto it unvouched. Only reaches a repository whose base-health
+          checks actually publish on the tip; where nothing does, the gate is
+          inert and there is nothing to wait for.
+
+
+          Why a ceiling exists at all: the job answering for the tip is keyed to
+          supersede its own runs, which is the only shape that answers for the
+          CURRENT commit, so on a busy base it is routinely cancelled before it
+          reports. An unbounded wait would stall the lane hardest exactly where
+          it merges most. Past this the lane proceeds with a warning.
+
+
+          Raising it is almost never the fix. A lane warning that it proceeded
+          unvouched on every pass has a health job that never finishes, and the
+          number is not what is wrong.
+        required: false
+        default: 900
+        type: number
       runs-on:
         description: >-
           Where the lane runs. Defaults to `ubuntu-latest`, which is free and
@@ -392,6 +413,7 @@ jobs:
           REQUIRE_UP_TO_DATE: ${{ inputs.require-up-to-date }}
           REQUIRE_LABEL: ${{ inputs.require-label }}
           PRIORITY_PREFIX: ${{ inputs.priority-label-prefix }}
+          BASE_HEALTH_GRACE: ${{ inputs.base-health-grace-seconds }}
           STATUS_ISSUE: ${{ inputs.status-issue }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: bash scripts/ci/merge-lane.sh
