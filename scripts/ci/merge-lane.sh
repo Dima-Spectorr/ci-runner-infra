@@ -104,6 +104,27 @@ if [ "${#BASE_HEALTH[@]}" -eq 0 ]; then
   BASE_HEALTH=("${REQUIRED[@]}")
 fi
 
+# HOW LONG THE LANE WAITS FOR A TIP TO ANSWER FOR ITSELF BEFORE GIVING UP ON IT.
+#
+# On an armed base the lane merges only onto a tip whose base-health checks have
+# reported green. That wait needs a ceiling: the job answering the question is
+# keyed to supersede its own runs — the only shape that answers for the CURRENT
+# tip — so on a busy base it is routinely cancelled before it reports, and an
+# unbounded wait would stall the lane hardest exactly where it merges most.
+# Past this, the lane proceeds with a warning under the original fail-open rule.
+#
+# Fifteen minutes is comfortably longer than the post-merge jobs on the fleet
+# (two to six minutes) and comfortably shorter than a working morning. Whether
+# it is right for a repository is answerable from its own logs: a lane that
+# warns about proceeding unvouched on every pass has a health job that never
+# finishes, which is a fault to fix rather than a number to raise.
+BASE_HEALTH_GRACE="${BASE_HEALTH_GRACE:-900}"
+
+# Whether anything answers for the base tip at all, decided once per pass and
+# read by `lane_base_is_vouched`. Empty means inert, which is the whole fleet
+# minus the repositories that have been armed.
+LANE_BASE_ARMED=''
+
 echo "lane: base=$LANE_BASE required=${#REQUIRED[@]} budget=${BUDGET}s pass-budget=${PASS_BUDGET}s max-actions=$MAX_ACTIONS dry-run=$DRY_RUN"
 for c in "${REQUIRED[@]}"; do echo "lane: requires '$c'"; done
 
@@ -387,6 +408,22 @@ lane_resolve_strict() {
 # right default: a repository that has not thought about it gets the strict
 # reading rather than a silently narrower one.
 LANE_HALT_REASON=''
+# WHAT THE LAST READ OF THE BASE TIP SAW, IN FOUR WORDS RATHER THAN A BOOLEAN.
+#
+# `broken` is the only one that halts, and it is the only one the gate above
+# describes. The other three are the same "not a halt" to the gate and are three
+# very different facts to the BATCH, which is the one caller that needs to tell
+# them apart:
+#
+#   healthy     every base-health check has answered, and answered green
+#   unanswered  a run is in flight, or was superseded before it answered
+#   inert       nothing publishes these names on the tip at all
+#
+# `inert` is the fleet's ordinary state for a repository nobody has armed, and
+# it must keep meaning "carry on". `unanswered` looks identical to the gate and
+# is the opposite instruction: somebody IS watching this base and has not
+# reported yet.
+LANE_BASE_VERDICT=''
 lane_base_is_broken() {
   local base_sha="$1" counts green missing failed pending
   # DYNAMIC SCOPE, DELIBERATELY, AND THIS IS THE WHOLE MECHANISM. `check_counts`
@@ -405,8 +442,92 @@ lane_base_is_broken() {
   local BASE_TIP_READ=1
   counts="$(check_counts "$base_sha")"
   read -r green missing failed pending <<<"$counts"
-  : "$green" "$missing" "$pending"
+  # Classified from the same counts, and ordered by which fact outranks which.
+  # A failure outranks everything. A check still running outranks a green one,
+  # because the question is about the tip as a whole and one unanswered name
+  # leaves it unanswered. A name that is merely ABSENT alongside answered ones
+  # is the shape of a partially-armed list and is read as unanswered too — the
+  # cheap arm of that mistake is one more pass.
+  if [ "${failed:-0}" -gt 0 ]; then
+    LANE_BASE_VERDICT='broken'
+  elif [ "${pending:-0}" -gt 0 ]; then
+    LANE_BASE_VERDICT='unanswered'
+  elif [ "${green:-0}" -gt 0 ]; then
+    if [ "${missing:-0}" -gt 0 ]; then
+      LANE_BASE_VERDICT='unanswered'
+    else
+      LANE_BASE_VERDICT='healthy'
+    fi
+  else
+    LANE_BASE_VERDICT='inert'
+  fi
   [ "${failed:-0}" -gt 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# HAS ANYTHING VOUCHED FOR THIS TIP SINCE THE LAST THING THAT LANDED ON IT?
+#
+# The halt above asks one question — is the base RED — and it is asked once, at
+# the top of a pass, about the tip as it stood then. Neither of those is enough
+# on its own once a pass can merge several pull requests.
+#
+# A pass on a non-strict base drains a batch without re-reading the world, and
+# the argument for that (see the batch) is that a merge cannot make another pull
+# request's checks any less green — they were reported against ITS head, which
+# nothing here touched. That argument is sound and it does not reach THIS gate,
+# which is the one thing in the lane that reads a commit no pull request owns.
+# Two branches each green and broken TOGETHER produce exactly the gap: the first
+# merge turns the base red, and the rest of the batch lands on it before any
+# post-merge job has said a word. Observed on Apigee-Portal on 2026-08-26 —
+# #3568 and #3556, an hour apart, both green alone, opposite decisions about the
+# same accept-set — the failure this gate exists for, arriving through the batch
+# added to make the gate affordable to run.
+#
+# So on an ARMED base the tip must have answered GREEN before anything else is
+# merged onto it. Asked in both places, which is what closes it: between merges
+# in a batch, and at the top of every pass — because the run loop starts another
+# pass immediately, and a rule enforced only inside the batch would be undone by
+# the next iteration of the loop around it.
+#
+# ARMED-NESS IS DECIDED AT THE TOP OF THE PASS, NOT HERE, AND THAT IS THE WHOLE
+# SUBTLETY. Seconds after a merge the post-merge run usually does not exist yet,
+# so its checks read as MISSING on the new tip — byte-for-byte what an unarmed
+# repository reads like, forever. Asking "is anything watching this base?" of a
+# tip one second old always answers no. Asking it of the tip the pass STARTED on
+# answers correctly, and that is the answer carried in here.
+#
+# AND IT WAITS ON A CLOCK, NOT FOREVER. `unanswered` is not rare and it is not
+# always transient: the job answering for the tip is keyed to supersede itself,
+# so on a busy base its run is routinely cancelled before it reports, and a rule
+# that waited unconditionally for green would wedge the lane hardest exactly
+# where it merges most. Past `BASE_HEALTH_GRACE` the tip is taken as unvouchable
+# and the lane proceeds under the original fail-open rule, loudly. That bounds
+# the wait; it does not pretend the answer arrived.
+lane_base_is_vouched() {
+  local sha="$1" committed_at="$2" age now
+  # Not armed: nothing answers for this base at all, so there is nothing to wait
+  # for and #450's batch is the point. Most of the fleet, and it is unchanged.
+  [ -n "$LANE_BASE_ARMED" ] || return 0
+  lane_base_is_broken "$sha" || true
+  # Spelled as `if`, not `[ … ] && return`: that form is only survivable under
+  # `set -e` because every caller happens to invoke this as an `if` condition,
+  # and the next one that does not would turn a wait into a silent exit.
+  if [ "$LANE_BASE_VERDICT" = 'healthy' ]; then return 0; fi
+  # `broken` never rides the grace window out. The pass-level halt above owns
+  # that case and says so in its own words; reaching it here means a merge in
+  # THIS batch turned the base red, which is the whole point of stopping.
+  if [ "$LANE_BASE_VERDICT" = 'broken' ]; then return 1; fi
+  now="$(date -u +%s)"
+  # An unparseable date resolves to epoch, so the age is enormous and the lane
+  # PROCEEDS. Deliberate: a wait this cannot bound is a wait that never ends,
+  # and stalling every merge in a repository over a date format is a worse
+  # failure than falling back to the fail-open rule that governed before this.
+  age="$(( now - $(date -u -d "$committed_at" +%s 2>/dev/null || echo 0) ))"
+  if [ "$age" -ge "$BASE_HEALTH_GRACE" ]; then
+    echo "::warning::lane: nothing has answered for ${sha:0:8} in ${age}s (grace ${BASE_HEALTH_GRACE}s) — proceeding unvouched. A base-health job that never reports leaves this gate inert; check that it is not being cancelled before it finishes."
+    return 0
+  fi
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -431,11 +552,17 @@ one_pass() {
   # does not exist, a missing `gh` — and a green run saying "0 actions" is
   # indistinguishable from a healthy quiet day. That is exactly how seven
   # repositories reported a working lane for a morning while merging nothing.
-  if ! base_sha="$(gh api "repos/$R/commits/$LANE_BASE" --jq '.sha' 2>/dev/null)" || [ -z "$base_sha" ]; then
+  # The commit DATE comes back on the same call, and is what bounds the wait in
+  # `lane_base_is_vouched`. Read here rather than there so the wait is measured
+  # from when the tip was created, not from when the lane happened to look.
+  local base_read base_at
+  if ! base_read="$(gh api "repos/$R/commits/$LANE_BASE" --jq '.sha + " " + .commit.committer.date' 2>/dev/null)" \
+    || [ -z "$base_read" ]; then
     echo "lane: cannot read the tip of $LANE_BASE — the lane is blind, not idle"
     LANE_FATAL=1
     return 1
   fi
+  read -r base_sha base_at <<<"$base_read"
 
   lane_resolve_strict
 
@@ -451,9 +578,34 @@ one_pass() {
   # hundred pull requests to decide that would be a hundred calls spent on an
   # answer already known — and the snapshot still renders, carrying the reason.
   LANE_HALT_REASON=''
+  # Read once, and BOTH answers taken from it: whether to halt, and whether
+  # anything answers for this base at all. The second is what the batch consults
+  # after each merge, and it has to be decided here — on a tip old enough for a
+  # post-merge run to exist — rather than against the seconds-old tip a merge
+  # just created. `broken` counts as armed: something is plainly reporting.
   if lane_base_is_broken "$base_sha"; then
     LANE_HALT_REASON="a required check is FAILING on the tip of $LANE_BASE ($base_sha)"
     echo "::warning::lane: not merging — $LANE_HALT_REASON. Merging onto a base that is already red buries the commit that broke it. Fix the base, or re-run its checks if the failure was infrastructure; the lane resumes on its own once they pass."
+    return 1
+  fi
+
+  # Taken from the read that just happened, and taken HERE rather than against
+  # any tip a merge below creates. Seconds after a merge the post-merge run does
+  # not exist yet, so its checks read as MISSING on the new tip — byte-for-byte
+  # what an unarmed repository reads like, forever. Asked of a one-second-old
+  # tip the question always answers "nothing is watching", which turns the gate
+  # off precisely when it matters; asked of the tip this pass started on it
+  # answers correctly.
+  if [ "$LANE_BASE_VERDICT" = 'inert' ]; then LANE_BASE_ARMED=''; else LANE_BASE_ARMED=1; fi
+
+  # NOT RED IS NOT THE SAME AS VOUCHED FOR. On an armed base, wait for the tip
+  # to answer green before adding to it — here as well as inside the batch,
+  # because the run loop starts the next pass immediately and a lane run
+  # triggered seconds after another one's merge would otherwise walk straight
+  # past a tip whose health nobody has reported yet.
+  if ! lane_base_is_vouched "$base_sha" "$base_at"; then
+    LANE_HALT_REASON="the base-health check on the tip of $LANE_BASE ($base_sha) is '$LANE_BASE_VERDICT' — waiting for it to answer"
+    echo "::notice::lane: $LANE_HALT_REASON. Something answers for this base and has not yet answered for this commit; merging now would stack onto a tip nothing has vouched for. The lane resumes on its own, and proceeds regardless after ${BASE_HEALTH_GRACE}s."
     return 1
   fi
 
@@ -859,6 +1011,26 @@ one_pass() {
       if lane_pass_expired "$LANE_STARTED" "$PASS_BUDGET" "$(date -u +%s)"; then
         echo "lane: pass deadline reached after $PASS_ACTED action(s) — the rest wait for the next pass"
         break
+      fi
+      # AND ONLY ONTO A BASE THAT HAS ANSWERED FOR ITSELF SINCE THE LAST MERGE.
+      # A no-op on an unarmed base. On an armed one this is the difference
+      # between bounding a semantic conflict to the merge that caused it and
+      # pouring the rest of the batch on top of it.
+      # The armed-ness test is here rather than only inside the callee so that
+      # the unarmed majority of the fleet does not pay two API calls per merge
+      # to be told what was already known at the top of the pass.
+      if [ -n "$LANE_BASE_ARMED" ]; then
+        local tip_read tip_now tip_at
+        if ! tip_read="$(gh api "repos/$R/commits/$LANE_BASE" --jq '.sha + " " + .commit.committer.date' 2>/dev/null)" \
+          || [ -z "$tip_read" ]; then
+          echo "lane: could not re-read $LANE_BASE after merging — stopping the batch here, the next pass re-reads the world"
+          break
+        fi
+        read -r tip_now tip_at <<<"$tip_read"
+        if ! lane_base_is_vouched "$tip_now" "$tip_at"; then
+          echo "::notice::lane: merged $PASS_ACTED, stopping the batch — the base-health check on ${tip_now:0:8} is '$LANE_BASE_VERDICT'. Merging the rest now would pile them onto a tip nothing has vouched for since the last merge. The lane resumes as soon as it answers."
+          break
+        fi
       fi
     fi
     lane_take_action "$action_num" "$action_sha" "$action_verdict" || break

@@ -911,7 +911,80 @@ sets_the_base_tip_handle_only_in_the_gate() {
     && [ "$set_line" -gt "$fn_start" ] && [ "$set_line" -lt "$fn_end" ]
 }
 
+# NOT RED IS NOT VOUCHED FOR, AND THE BATCH IS WHERE THAT BITES.
+# The halt asks its question once, at the top of a pass, and a pass may then
+# merge several pull requests. The first of them can turn the base red -- two
+# branches green alone and broken together is precisely the case this gate
+# exists for -- and the rest of the batch lands on it before any post-merge job
+# has reported. So the tip is re-read between merges, and the batch stops unless
+# it has answered green.
+waits_for_the_tip_between_merges() {
+  matches "$(code_of "$1")" '^        if ! lane_base_is_vouched "\$tip_now" "\$tip_at"; then$'
+}
+
+# And at the top of every pass as well, or the rule is undone by the loop around
+# it: the run loop calls `one_pass` again immediately, and a lane run triggered
+# seconds after another one's merge would walk straight past an unanswered tip.
+waits_for_the_tip_at_the_top_of_a_pass() {
+  matches "$(code_of "$1")" '^  if ! lane_base_is_vouched "\$base_sha" "\$base_at"; then$'
+}
+
+# THE WAIT IS BOUNDED, AND THAT IS NOT A CONVENIENCE. The job answering for the
+# tip is keyed to supersede its own runs, so on a busy base it is routinely
+# cancelled before it reports -- `cancelled` is read as unanswered by design.
+# A wait with no ceiling would stall the lane hardest exactly where it merges
+# most, which is the failure mode the whole lane was built to end.
+the_wait_for_an_answer_is_bounded() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^BASE_HEALTH_GRACE="\$\{BASE_HEALTH_GRACE:-900\}"$' || return 1
+  matches "$code" '^  if \[ "\$age" -ge "\$BASE_HEALTH_GRACE" \]; then$' || return 1
+  # And says so out loud when it gives up, because a lane that proceeds
+  # unvouched every pass has a broken health job, not a small grace window.
+  matches "$code" 'proceeding unvouched'
+}
+
+# ARMED-NESS IS READ FROM THE PASS TIP, NEVER FROM THE ONE A MERGE JUST MADE.
+# Seconds after a merge the post-merge run does not exist yet, so its checks
+# read as MISSING on the new tip -- identical to an unarmed repository, forever.
+# Deciding it there would answer "nothing is watching" every single time, which
+# turns the whole gate off precisely when it is needed.
+decides_armed_ness_before_the_batch_moves_the_tip() {
+  local set_line fn_start fn_end
+  [ "$(grep -c '^  if \[ "\$LANE_BASE_VERDICT" = .inert. \]; then LANE_BASE_ARMED=..; else LANE_BASE_ARMED=1; fi$' "$1")" = "1" ] || return 1
+  set_line=$(grep -n '^  if \[ "\$LANE_BASE_VERDICT" = .inert. \]; then LANE_BASE_ARMED=' "$1" | head -n1 | cut -d: -f1)
+  fn_start=$(grep -n '^one_pass() {' "$1" | head -n1 | cut -d: -f1)
+  fn_end=$(grep -n '^lane_take_action() {' "$1" | head -n1 | cut -d: -f1)
+  [ -n "$set_line" ] && [ "$set_line" -gt "$fn_start" ] && [ "$set_line" -lt "$fn_end" ]
+}
+
+# An INERT base -- the fleet's ordinary state, and every repository nobody has
+# armed -- must keep draining a batch without paying two API calls per merge to
+# be told what the top of the pass already established.
+costs_an_unarmed_base_nothing() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      if \[ -n "\$LANE_BASE_ARMED" \]; then$' || return 1
+  matches "$code" '^  \[ -n "\$LANE_BASE_ARMED" \] \|\| return 0$'
+}
+
+# The four verdicts have to stay four. Collapsing `inert` and `unanswered` --
+# they look identical to the halt, which is why the halt could afford one
+# boolean -- is what makes an armed base look unarmed and reopens the whole gap.
+tells_an_unanswered_tip_from_an_unwatched_one() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" "^    LANE_BASE_VERDICT='unanswered'\$" || return 1
+  matches "$code" "^    LANE_BASE_VERDICT='inert'\$"
+}
+
 echo "merge-lane self-test:"
+check waits_for_the_tip_between_merges "$DRIVER" "a batch keeps merging after the first merge without re-reading the base, so two pull requests that are green alone and broken together bury the rest of the backlog on top of the break"
+check waits_for_the_tip_at_the_top_of_a_pass "$DRIVER" "only the batch waits for the tip to answer, so the run loop's next pass merges onto it anyway and the rule is undone by the loop around it"
+check the_wait_for_an_answer_is_bounded "$DRIVER" "the lane waits for a base-health answer with no ceiling, so a health job cancelled by its own successor stalls the lane hardest on the busiest base"
+check decides_armed_ness_before_the_batch_moves_the_tip "$DRIVER" "armed-ness is decided against a tip a merge just created, where the post-merge run does not exist yet, so every armed base reads as unarmed and the gate is off when it matters"
+check costs_an_unarmed_base_nothing "$DRIVER" "an inert base pays two API calls per merge to re-learn that nothing answers for it"
+check tells_an_unanswered_tip_from_an_unwatched_one "$DRIVER" "'nobody is watching' and 'nobody has answered yet' collapse into one verdict, so an armed base reads as unarmed and the batch stacks onto an unvouched tip"
 check reads_a_cancelled_base_check_as_unanswered "$DRIVER" "a cancelled check on the base tip counts as a failure, so the base-health gate halts every pass on a repository whose base is healthy and whose answering run was merely superseded"
 check sets_the_base_tip_handle_only_in_the_gate "$DRIVER" "the base-tip reading mode is set outside the gate, so a cancelled required check stops blocking the merge it exists to block"
 check declares_its_inputs_without_a_live_expression "$CALLEE" "an input description carries an Actions expression, and one naming vars fails the whole workflow at startup with no jobs and no log to read"
@@ -1111,6 +1184,16 @@ mutate "a cancelled check on the base tip goes back to counting as red" "$DRIVER
   's%^      cancelled | stale)$%      cancelled-never)%' reads_a_cancelled_base_check_as_unanswered
 mutate "the base-tip reading mode is set for the merge path too" "$DRIVER" \
   's%^  local BASE_TIP_READ=1$%BASE_TIP_READ=1%' sets_the_base_tip_handle_only_in_the_gate
+mutate "the batch stops re-reading the base between merges" "$DRIVER" \
+  's@^        if ! lane_base_is_vouched "\$tip_now" "\$tip_at"; then$@        if false; then@' waits_for_the_tip_between_merges
+mutate "only the batch waits, and the next pass merges anyway" "$DRIVER" \
+  's@^  if ! lane_base_is_vouched "\$base_sha" "\$base_at"; then$@  if false; then@' waits_for_the_tip_at_the_top_of_a_pass
+mutate "the wait for a base-health answer loses its ceiling" "$DRIVER" \
+  's@^  if \[ "\$age" -ge "\$BASE_HEALTH_GRACE" \]; then$@  if false; then@' the_wait_for_an_answer_is_bounded
+mutate "armed-ness starts being decided against the tip the merge just made" "$DRIVER" \
+  's@^  if \[ "\$LANE_BASE_VERDICT" = .inert. \]; then LANE_BASE_ARMED=..; else LANE_BASE_ARMED=1; fi$@  :@' decides_armed_ness_before_the_batch_moves_the_tip
+mutate "an unwatched base becomes indistinguishable from an unanswered one" "$DRIVER" \
+  "s@^    LANE_BASE_VERDICT='inert'\$@    LANE_BASE_VERDICT='unanswered'@" tells_an_unanswered_tip_from_an_unwatched_one
 mutate "a refused action no longer ends the batch" "$DRIVER" \
   's@\(lane_take_action .*\) || break@\1 || true@' ends_the_batch_on_a_refusal
 mutate "the unasked comparison starts reporting itself as up to date" "$DRIVER" \
