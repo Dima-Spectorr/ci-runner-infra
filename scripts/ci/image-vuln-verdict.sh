@@ -453,21 +453,30 @@ selftest() {
   check "a fixable critical in an installed package blocks" 1 "VULN1" \
     --report "$tmp/deb.json" --today 2026-01-01
 
+  # Every fixture from here on that expects an off-distro finding NOT to block
+  # passes its own baseline. The default resolves to this repository's file,
+  # which is seeded with the 117 pairs a real image carries — so a fixture
+  # relying on the default would assert "provenance decides" and actually be
+  # measuring "this synthetic pair is not in the real baseline", and would flip
+  # red the day somebody seeds a pair that happens to collide. Both fixture
+  # pairs are listed, so these tests say provenance and nothing else.
+  printf 'CVE-11 linux-kernel fixture\nGHSA-x golang.org/x/crypto fixture\n' > "$tmp/base-fixtures.txt"
+
   # The regression this whole change is about: 105 of these, every build,
   # "fixed in 5.16,6.2,6.7" against an Ubuntu ABI revision.
   report "$(match CVE-11 critical fixed 6.19.9 linux-kernel 6.17.0-1022-gcp linux-kernel)" > "$tmp/kern.json"
   check "a fixable critical off the kernel binary does not block" 0 "off-distro" \
-    --report "$tmp/kern.json" --today 2026-01-01
+    --report "$tmp/kern.json" --offdistro-baseline "$tmp/base-fixtures.txt" --today 2026-01-01
 
   # ...and the other 168: a Go module vendored inside dockerd.
   report "$(match GHSA-x critical fixed 0.31.0 golang.org/x/crypto v0.23.0 go-module)" > "$tmp/gomod.json"
   check "a fixable critical off a vendored module does not block" 0 "off-distro" \
-    --report "$tmp/gomod.json" --today 2026-01-01
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-fixtures.txt" --today 2026-01-01
 
   # Not silently: it is on the summary line, so a gate that stops covering
   # something says so in the one line an operator actually reads.
   check "the off-distro count is on the summary line" 0 "1 fixable off-distro" \
-    --report "$tmp/gomod.json" --today 2026-01-01
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-fixtures.txt" --today 2026-01-01
 
   # It is NOT rendered as an ordinary report. `reported` means "nothing to do
   # here"; this one is fixable and above the floor and deliberately let through,
@@ -562,6 +571,19 @@ selftest() {
   check "a baseline line with no package fails the gate" 2 "VULN0" \
     --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-short.txt" --today 2026-01-01
 
+  # THE SHIPPED FILE IS SEEDED. Every fixture above supplies its own baseline,
+  # which is what makes them stable — and it also means all of them would keep
+  # passing if somebody emptied the real file, which turns enforcement off
+  # without any check going red. That is the exact regression #196 says is not
+  # an acceptable way to close it, so it is asserted directly, once, here.
+  if [ -f "$REPO_ROOT/docs/image-vuln-offdistro.txt" ] &&
+     grep -qE '^[^#[:space:]]+[[:space:]]+[^#[:space:]]+' "$REPO_ROOT/docs/image-vuln-offdistro.txt"; then
+    echo "ok   the shipped baseline is seeded, so the gate ships in ENFORCE mode"
+  else
+    echo "FAIL the shipped baseline has no entries — the gate ships in OBSERVE mode and a new off-distro finding cannot fail a build. Seed it from an image build's verdict output."
+    status=1
+  fi
+
   # A distro finding is not in this population at all: the baseline is about
   # what the gate CANNOT judge, and a blocking deb must not be silenced by a
   # line in it.
@@ -579,7 +601,8 @@ selftest() {
   # precisely the unactionable red this change exists to remove.
   printf 'GHSA-x 2020-01-01 stale\n' > "$tmp/expired-offdistro.txt"
   check "an expired ignore does not resurrect an off-distro finding" 0 "off-distro" \
-    --report "$tmp/gomod.json" --ignores "$tmp/expired-offdistro.txt" --today 2026-01-01
+    --report "$tmp/gomod.json" --ignores "$tmp/expired-offdistro.txt" \
+    --offdistro-baseline "$tmp/base-fixtures.txt" --today 2026-01-01
 
   # The same critical with no fix does NOT block. Nothing the build can do
   # about it, and blocking is what turns the gate into a file of exceptions.

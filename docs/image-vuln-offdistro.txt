@@ -26,19 +26,158 @@
 # vulnerability database does; a new (id, package) pair is a new statement about
 # this image.
 #
-# UNSEEDED, AND WHY IT SHIPS THAT WAY
+# SEEDED FROM A REAL SCAN, AND NOW ENFORCING
 #
-# This file has no entries yet, and while it has none the gate runs in OBSERVE
-# mode: it prints the population as a paste-ready block and does not fail the
-# build. That is the honest state — the baseline can only come from a real scan,
-# which happens inside a Packer build and not in this repository's CI, so
-# nothing here could have produced it.
+# Seeded on 2026-08-26 from image build `1057f771` — the first build of this
+# trigger to succeed end to end — which reported 21,279 findings, 0 blocking,
+# and 273 fixable off-distro matches across the 117 distinct pairs below. The
+# gate is therefore in ENFORCE mode: a pair in a later scan and not in this file
+# is a red build (VULN3), and adding it is a pull request.
 #
-# TO START ENFORCING: run an image build, take the indented block printed under
-# `off-distro tracking: OBSERVE` in its verdict output, paste it below, and open
-# a pull request. The gate switches to ENFORCE the moment this file has one
-# entry. Until then #196 is not closed, whatever the code says.
+# What each group is, so a reader can judge a new line rather than pattern-match
+# it in:
+#
+#   linux-kernel (105)  grype read the version out of the kernel binary and
+#                       compared it against upstream. "Fixed in 6.19.9" against
+#                       an Ubuntu ABI revision is not a statement about whether
+#                       Ubuntu backported it — the `deb` entries for the SAME
+#                       kernel produce thousands of matches and zero blocking,
+#                       because there Ubuntu's own data is consulted.
+#   golang.org/x/crypto (8)  vendored inside dockerd, containerd and snapd. This
+#                       image cannot upgrade the module independently of the
+#                       distro packages that ship the binaries.
+#   stdlib (3)          the Go toolchain a vendored binary was built with.
+#   google.golang.org/grpc (1)  same shape as x/crypto.
+#
+# A NEW pair in any of these groups still deserves a look: "vendored in a distro
+# binary" is why it cannot block, not a reason it cannot matter. What has been
+# ruled out here is the version comparison, not the vulnerability.
 #
 # Pruning a line that no longer appears is optional and never fails the build —
 # the gate prints it as "no longer seen". Emptying the file is not pruning: it
 # turns enforcement back off.
+
+# ── linux-kernel — matched off the kernel binary, not the `deb` ──────────────
+CVE-2026-23112 linux-kernel
+CVE-2026-23240 linux-kernel
+CVE-2026-23450 linux-kernel
+CVE-2026-23455 linux-kernel
+CVE-2026-31405 linux-kernel
+CVE-2026-31414 linux-kernel
+CVE-2026-31436 linux-kernel
+CVE-2026-31448 linux-kernel
+CVE-2026-31478 linux-kernel
+CVE-2026-31501 linux-kernel
+CVE-2026-31533 linux-kernel
+CVE-2026-31536 linux-kernel
+CVE-2026-31589 linux-kernel
+CVE-2026-31608 linux-kernel
+CVE-2026-31609 linux-kernel
+CVE-2026-31633 linux-kernel
+CVE-2026-31636 linux-kernel
+CVE-2026-31637 linux-kernel
+CVE-2026-31649 linux-kernel
+CVE-2026-31657 linux-kernel
+CVE-2026-31659 linux-kernel
+CVE-2026-31668 linux-kernel
+CVE-2026-31669 linux-kernel
+CVE-2026-31682 linux-kernel
+CVE-2026-31685 linux-kernel
+CVE-2026-31705 linux-kernel
+CVE-2026-31718 linux-kernel
+CVE-2026-43011 linux-kernel
+CVE-2026-43071 linux-kernel
+CVE-2026-43083 linux-kernel
+CVE-2026-43117 linux-kernel
+CVE-2026-43185 linux-kernel
+CVE-2026-43186 linux-kernel
+CVE-2026-43197 linux-kernel
+CVE-2026-43304 linux-kernel
+CVE-2026-43341 linux-kernel
+CVE-2026-43376 linux-kernel
+CVE-2026-43379 linux-kernel
+CVE-2026-43383 linux-kernel
+CVE-2026-43384 linux-kernel
+CVE-2026-43402 linux-kernel
+CVE-2026-43406 linux-kernel
+CVE-2026-43407 linux-kernel
+CVE-2026-43414 linux-kernel
+CVE-2026-43493 linux-kernel
+CVE-2026-45988 linux-kernel
+CVE-2026-46039 linux-kernel
+CVE-2026-46043 linux-kernel
+CVE-2026-46115 linux-kernel
+CVE-2026-46119 linux-kernel
+CVE-2026-46135 linux-kernel
+CVE-2026-46137 linux-kernel
+CVE-2026-46155 linux-kernel
+CVE-2026-46185 linux-kernel
+CVE-2026-46266 linux-kernel
+CVE-2026-46289 linux-kernel
+CVE-2026-46325 linux-kernel
+CVE-2026-52914 linux-kernel
+CVE-2026-52931 linux-kernel
+CVE-2026-52958 linux-kernel
+CVE-2026-52982 linux-kernel
+CVE-2026-52986 linux-kernel
+CVE-2026-52999 linux-kernel
+CVE-2026-53010 linux-kernel
+CVE-2026-53043 linux-kernel
+CVE-2026-53045 linux-kernel
+CVE-2026-53046 linux-kernel
+CVE-2026-53049 linux-kernel
+CVE-2026-53086 linux-kernel
+CVE-2026-53088 linux-kernel
+CVE-2026-53131 linux-kernel
+CVE-2026-53151 linux-kernel
+CVE-2026-53186 linux-kernel
+CVE-2026-53215 linux-kernel
+CVE-2026-53216 linux-kernel
+CVE-2026-53221 linux-kernel
+CVE-2026-53224 linux-kernel
+CVE-2026-53225 linux-kernel
+CVE-2026-53228 linux-kernel
+CVE-2026-53246 linux-kernel
+CVE-2026-53247 linux-kernel
+CVE-2026-53260 linux-kernel
+CVE-2026-53309 linux-kernel
+CVE-2026-53355 linux-kernel
+CVE-2026-53363 linux-kernel
+CVE-2026-53384 linux-kernel
+CVE-2026-53398 linux-kernel
+CVE-2026-53399 linux-kernel
+CVE-2026-63795 linux-kernel
+CVE-2026-63800 linux-kernel
+CVE-2026-64089 linux-kernel
+CVE-2026-64091 linux-kernel
+CVE-2026-64102 linux-kernel
+CVE-2026-64106 linux-kernel
+CVE-2026-64113 linux-kernel
+CVE-2026-64125 linux-kernel
+CVE-2026-64132 linux-kernel
+CVE-2026-64142 linux-kernel
+CVE-2026-64150 linux-kernel
+CVE-2026-64160 linux-kernel
+CVE-2026-64162 linux-kernel
+CVE-2026-64216 linux-kernel
+CVE-2026-64232 linux-kernel
+CVE-2026-64268 linux-kernel
+CVE-2026-64269 linux-kernel
+
+# ── golang.org/x/crypto — vendored in dockerd / containerd / snapd ───────────
+GHSA-5cgq-3rg8-m6cv golang.org/x/crypto
+GHSA-89gr-r52h-f8rx golang.org/x/crypto
+GHSA-f5wc-c3c7-36mc golang.org/x/crypto
+GHSA-jppx-rxg9-jmrx golang.org/x/crypto
+GHSA-rm3j-f69w-wqmq golang.org/x/crypto
+GHSA-v778-237x-gjrc golang.org/x/crypto
+GHSA-vgwf-h737-ff37 golang.org/x/crypto
+GHSA-x527-x647-q7gg golang.org/x/crypto
+
+# ── the Go toolchain those binaries were built with ──────────────────────────
+GO-2024-2887 stdlib
+GO-2025-3563 stdlib
+GO-2026-4337 stdlib
+
+# ── other vendored modules ───────────────────────────────────────────────────
+GHSA-p77j-4mvh-x3m3 google.golang.org/grpc
