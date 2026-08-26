@@ -402,13 +402,50 @@ locals {
   # whatever `--cache-dir` the repository's CI happened to pass; when it did not,
   # the warm published an empty directory and reported success.
   #
+  # RENDERED BY TERRAFORM, NOT EXPANDED BY THE SHELL, and that is the whole point
+  # of this line. It used to read `--cache-dir="$WARM_TURBO_DIR"`, taking the
+  # value from the env below — and every `$` in a step command goes through
+  # `escape_dollars` on its way out, so what Cloud Build actually ran was:
+  #
+  #   npx --no-install turbo run build --cache-dir="$$WARM_TURBO_DIR"
+  #
+  # Read off the EXECUTED build resource, not the trigger template
+  # (`5ea57da5`, mot-integrateit, 2026-08-26), so substitution resolution had
+  # already happened and the `$$` survived it: the `$$` escape is unescaped in
+  # `args`, and the `script` field is handed to the shell verbatim. In bash
+  # `"$$WARM_TURBO_DIR"` is the PID followed by a literal, so turbo wrote its
+  # cache to `/workspace/<pid>WARM_TURBO_DIR`, the publishing step looked at
+  # `node_modules/.cache/turbo`, found no directory, and exited 0 — which it is
+  # right to do, because a repository with no turbo pipeline lands there too.
+  #
+  # So every warm since the turbo half shipped published ZERO artifacts and
+  # reported success. The symptom is an empty `turbo/<owner>/<repo>/` prefix and
+  # a host-side cache that never hits; nothing anywhere goes red.
+  #
+  # Interpolating the value here emits a command with no `$` in it at all, so
+  # the escaping cannot reach it and the fix does not depend on what Cloud Build
+  # does with `$$` in a `script`. The single-source property is unchanged — this
+  # is the same `var.turbo_cache_dir` the publishing step's env carries — and
+  # the self-test now asserts the RENDERED command, which is the thing that was
+  # never checked.
+  #
+  # An override in `var.build_command` still goes through `escape_dollars` and
+  # therefore still cannot use a shell variable; the env below is what it has,
+  # and #459 tracks making that work rather than documenting it.
+  #
   # The `;` is load-bearing and is asserted by the self-test: the ladder ends in
   # `fi`, and `fi npx …` is a syntax error the whole build step dies on before
   # anything runs — a green apply, a red nightly build, an empty cache.
   build_command = replace(coalesce(var.build_command, join(" ", [
     "${local.install_full};",
-    "npx --no-install turbo run build --cache-dir=\"$WARM_TURBO_DIR\"",
+    "npx --no-install turbo run build --cache-dir=${local.turbo_cache_dir_arg}",
   ])), "$", local.escape_dollars)
+
+  # Single-quoted so a directory with a space or a glob character in it is one
+  # argument and not three. `'` itself is closed, escaped and reopened rather
+  # than rejected: the value reaches a shell command line, and the failure of
+  # getting that wrong is a build step that dies on a syntax error at fire time.
+  turbo_cache_dir_arg = "'${replace(var.turbo_cache_dir, "'", "'\\''")}'"
 
   build_step_script = "#!/usr/bin/env bash\n${local.build_command} || echo '[warm] build failed; publishing what it produced'\n"
 
