@@ -291,27 +291,44 @@ if has_scriptfree_snapshot "$MAIN"; then ok; else
   bad "the snapshot's install runs lifecycle scripts again — install-time scripts are the cheapest place to put code in someone else's build, and this archive is unpacked as root on every host in the pool"
 fi
 
-# 11. EVERY `$` THAT REACHES THE BUILD CONFIG IS DOUBLED. Cloud Build reads `$X`
-#     and `${X}` in args and env as a SUBSTITUTION, so a shell script pasted in
-#     whole is a config full of keys it does not know. The trigger applies
-#     cleanly and the API refuses at FIRE time — "key in the template ... is not
-#     a valid built-in substitution" — which is a warmer that has never once run
-#     and a cache that has always been cold. Observed on the first live fire.
-has_dollars_escaped() { # <file>
+# 11. NOTHING IS ESCAPED ON ITS WAY INTO A STEP, AND THIS ASSERTION IS INVERTED
+#     FROM WHAT IT USED TO SAY. Doubling every `$` is Cloud Build's escape for
+#     the `args` field, and it was right while the scripts were pasted there —
+#     unescaped, the API refused at FIRE time with "key in the template ... is
+#     not a valid built-in substitution", which was a warmer that had never run
+#     and a cache that had always been cold.
+#
+#     Every script now goes in `script` (assertion 12), and the substitution
+#     pass does not read that field at all. Measured with a one-step build,
+#     2026-08-26, both halves: `8f91196b` under loose substitution and
+#     `f314e153` under STRICT saw `$PROBE_VAR` reach the shell intact and expand
+#     to the step's env value, saw `$$PROBE_VAR` reach it as the PID, and
+#     accepted `$_NO_SUCH_SUBSTITUTION_KEY` — the very text that is a fire-time
+#     refusal in `args`.
+#
+#     So an escape here is corruption rather than protection, and it cost this
+#     module its whole turbo half for months. The old form is asserted as an
+#     ABSENCE, because it is exactly what a reader who knows the `args` rule
+#     would put back.
+has_no_dollar_escaping() { # <file>
   local code
   code=$(code_of "$1")
-  matches "$code" 'escape_dollars = "\$\$"' || return 1
-  matches "$code" 'stage_script = replace\(local\.stage_script_raw, "\$", local\.escape_dollars\)' || return 1
-  matches "$code" 'prepare_command = replace\(coalesce\(var\.prepare_command' || return 1
-  matches "$code" 'build_command = replace\(coalesce\(var\.build_command' || return 1
-  # And nothing reaches a step as a raw file() read, which is how the escaping
-  # gets bypassed for one step while the local next to it keeps it.
+  ! matches "$code" 'escape_dollars' || return 1
+  ! matches "$code" 'replace\([^)]*"\$",' || return 1
+  matches "$code" 'stage_script = local\.stage_script_raw' || return 1
+  matches "$code" 'prepare_command = coalesce\(var\.prepare_command' || return 1
+  matches "$code" 'build_command = coalesce\(var\.build_command' || return 1
+  # And nothing reaches a step as a raw file() read. That used to be how one
+  # step could bypass the escaping while the local beside it kept it; with no
+  # escaping left the reason is different and no weaker — a step must run the
+  # STAGED file, whose digest it checks, not a second copy inlined by a route
+  # that checks nothing.
   ! matches "$code" 'script[[:space:]]*=[[:space:]]*file\(' || return 1
   ! matches "$code" 'args[[:space:]]*=[[:space:]]*\["-c", file\('
 }
 
-if has_dollars_escaped "$MAIN"; then ok; else
-  bad "a script or command reaches the build config with its dollars unescaped — Cloud Build parses those as substitutions and refuses the build at fire time, so the trigger applies green and the warm has never run"
+if has_no_dollar_escaping "$MAIN"; then ok; else
+  bad "a script or command is escaped on its way into a \`script\` field, or reaches a step by a route that bypasses staging — a doubled \`\$\` is not unescaped there and arrives as the build's PID, which is the defect that published nothing for months"
 fi
 
 # 12. EVERY STEP CARRIES ITS SCRIPT IN `script`, NEVER IN `args`. A step argument
@@ -605,13 +622,15 @@ mutate "the two installs made consistent, in the wrong direction" "$MAIN" \
   's|"@FLAGS@", "--ignore-scripts"|"@FLAGS@", ""|' \
   has_scriptfree_snapshot
 
-mutate "the staging script pasted in unescaped" "$MAIN" \
-  's@stage_script = replace(local\.stage_script_raw, "\$", local\.escape_dollars)@stage_script = local.stage_script_raw@' \
-  has_dollars_escaped
+# The escape put back the way a reader who knows the `args` rule would put it —
+# which is how it outlived the field it was written for in the first place.
+mutate "the build command escaped again" "$MAIN" \
+  's@build_command = coalesce(var\.build_command@build_command = replace(coalesce(var.build_command@' \
+  has_no_dollar_escaping
 
 mutate "one step given the raw file() again" "$MAIN" \
   's@script = local\.run_turbo@script = file("${path.module}/scripts/warm-turbo.sh")@' \
-  has_dollars_escaped
+  has_no_dollar_escaping
 
 mutate "a script handed back to bash -c" "$MAIN" \
   's@script = local\.run_publish@entrypoint = "bash"\n      args       = ["-c", local.run_publish]@' \
@@ -640,9 +659,9 @@ mutate "the size guard removed" "$MAIN" \
   's@condition     = local\.build_config_bytes < 110000@condition     = true@' \
   has_config_under_the_cliff
 
-mutate "the escape reduced to a single dollar" "$MAIN" \
-  's@escape_dollars = "\$\$"@escape_dollars = "$"@' \
-  has_dollars_escaped
+mutate "the staging script escaped again" "$MAIN" \
+  's@stage_script = local\.stage_script_raw@stage_script = replace(local.stage_script_raw, "$", "$$")@' \
+  has_no_dollar_escaping
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
