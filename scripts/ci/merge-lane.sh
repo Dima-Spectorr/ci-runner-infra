@@ -310,6 +310,44 @@ lane_resolve_strict() {
 }
 
 # ---------------------------------------------------------------------------
+# IS THE BASE ITSELF BROKEN?
+#
+# The one risk a non-strict base carries that the merge API cannot refuse for
+# us. Two pull requests that touch different files can each be green alone and
+# broken together; GitHub does not require either to be rebuilt against the
+# other, so both merge and the base goes red. Nothing upstream of here detects
+# that — the checks the lane reads were reported against each pull request's own
+# head, which the other merge did not touch.
+#
+# So the lane reads the required checks on the BASE TIP, the same way it reads
+# them on a head, and refuses to pile more onto a base that is already failing.
+# It does not repair anything and it is not meant to: it bounds the damage to
+# the batch that caused it instead of letting the next twenty land on top.
+#
+# FAILS OPEN, WHICH IS THE OPPOSITE OF `lane_resolve_strict`, ON PURPOSE.
+# Only a definite `failure` halts. `missing` and `pending` do not, because a
+# repository whose required checks run on `pull_request` only — which is most of
+# them — has every one of them permanently ABSENT on the base tip, and a gate
+# that halted on that would deadlock the lane in every repository in the fleet
+# on the day it shipped. An unreadable check surface lands in the same arm and
+# is likewise not a halt: `check_counts` reports it as missing, and refusing to
+# merge because we could not look is the failure mode that costs more here.
+#
+# The consequence is worth saying plainly: this gate is only as good as the
+# repository's post-merge CI. With no workflow running the required checks on a
+# push to the base, there is nothing on the tip to read and the gate is inert.
+# `docs/merge-lane.md` says so where an operator will meet it.
+# ---------------------------------------------------------------------------
+LANE_HALT_REASON=''
+lane_base_is_broken() {
+  local base_sha="$1" counts green missing failed pending
+  counts="$(check_counts "$base_sha")"
+  read -r green missing failed pending <<<"$counts"
+  : "$green" "$missing" "$pending"
+  [ "${failed:-0}" -gt 0 ]
+}
+
+# ---------------------------------------------------------------------------
 # One pass: read every candidate, rank them, act on the best one.
 # Returns 0 if it acted, 1 if there was nothing to do.
 # ---------------------------------------------------------------------------
@@ -346,6 +384,16 @@ one_pass() {
   # finds nothing open would publish the previous pass's rows as if they were
   # still there.
   QUEUE_ROWS=()
+
+  # Above the walk, not inside it. A halted lane merges nothing, so reading a
+  # hundred pull requests to decide that would be a hundred calls spent on an
+  # answer already known — and the snapshot still renders, carrying the reason.
+  LANE_HALT_REASON=''
+  if lane_base_is_broken "$base_sha"; then
+    LANE_HALT_REASON="a required check is FAILING on the tip of $LANE_BASE ($base_sha)"
+    echo "::warning::lane: not merging — $LANE_HALT_REASON. Merging onto a base that is already red buries the commit that broke it. Fix the base, or re-run its checks if the failure was infrastructure; the lane resumes on its own once they pass."
+    return 1
+  fi
 
   # Paginated: past a hundred open pull requests on one base, an unpaginated
   # read would make every candidate after the first page permanently invisible
@@ -823,8 +871,23 @@ render_queue() {
     printf '> **Dry run.** Every verdict below was computed for real; none was acted on.\n\n'
   fi
 
+  # Before the table, because it explains why the table is not moving. A halted
+  # pass renders no rows at all — it returns before the walk — so without this
+  # the snapshot would read exactly like a quiet base with nothing open.
+  if [ -n "$LANE_HALT_REASON" ]; then
+    printf '> **Halted.** %s\n>\n' "$LANE_HALT_REASON"
+    printf '> Nothing merges while the base is red: the next merge would bury the commit that broke it. The lane resumes by itself once those checks pass.\n\n'
+  fi
+
   if [ "${#QUEUE_ROWS[@]}" -eq 0 ]; then
-    printf '_No open pull requests on `%s`._\n\n' "$LANE_BASE"
+    # "Nothing open" and "the lane stopped before it looked" are different
+    # facts, and rendering them identically is the same defect the sort key's
+    # `8` tier exists to prevent.
+    if [ -n "$LANE_HALT_REASON" ]; then
+      printf '_The open list was not read on this pass._\n\n'
+    else
+      printf '_No open pull requests on `%s`._\n\n' "$LANE_BASE"
+    fi
   else
     printf '| pull request | verdict | waiting on | priority | behind | required |\n'
     printf '|---|---|---|---|---|---|\n'

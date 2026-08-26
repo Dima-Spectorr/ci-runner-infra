@@ -545,6 +545,61 @@ consults. The queue table then shows `n/a` in the *behind* column rather than
 `0`, because "not asked" and "up to date" are different facts and the table is
 what an operator reads to decide whether the lane is working.
 
+#### What a non-strict base costs, and the gate that bounds it
+
+Everything above says what a merge *cannot* break. There is one thing it can,
+and it is worth stating without hedging: **two pull requests that touch
+different files can each be green alone and broken together.** Neither one's
+checks were rebuilt against the other, so nothing in the lane, and nothing in
+GitHub, notices before both are in.
+
+This is a property of the base being non-strict, not of batching. Merging those
+same two an hour apart, without re-running either one's checks, lands exactly
+the same commit. Batching changes how *soon* it surfaces, not whether it can.
+The only thing that removes it is turning
+`strict_required_status_checks_policy` on for the base — the lane reads that and
+reverts to one-action-then-re-read by itself — and the price is a full CI run
+per open pull request per merge. On a repository with 90 open pull requests that
+is thousands of Actions minutes to drain a backlog once.
+
+So the lane does not try to prevent it. It **bounds** it, with two things:
+
+1. **`max-actions` is the blast radius.** A pass merges at most that many before
+   the world is read again, so it is also the most that can land on top of a
+   break before anything can notice. Raise it to drain a backlog; bring it back
+   down for steady state.
+2. **The lane refuses to merge onto a base that is already red.** Before it
+   reads a single pull request, every pass reads the *required checks on the
+   base tip* — the same read it does on a head — and if one of them has
+   **failed**, the pass stops there. The reason is logged as a workflow
+   annotation and written across the top of the queue snapshot, and the lane
+   resumes on its own as soon as those checks pass. So a semantic conflict costs
+   one batch, not the whole backlog.
+
+**The gate fails open, deliberately, and it is only as good as your post-merge
+CI.** Only a definite failure halts it. A check that is *missing* or *pending*
+on the base tip does not, because most repositories run their required checks on
+`pull_request` only — every required check is then permanently absent on the
+base tip, and a gate that halted on that would deadlock the lane everywhere the
+day it shipped. An unreadable check surface lands in the same arm for the same
+reason.
+
+Which means: **if nothing runs the required checks on a push to the base, there
+is nothing on the tip to read and the gate is inert.** To arm it, give the base
+a post-merge run of the same checks:
+
+```yaml
+on:
+  pull_request:
+  push:
+    branches: [main]
+```
+
+on whichever workflow emits the contexts named in `required-checks`. That is one
+CI run per merge, against a strict base's one run per *open pull request* per
+merge — the cheap end of the trade, and the whole reason the gate is shaped this
+way.
+
 ### The pool images do not ship `gh`
 
 GitHub-hosted images carry the CLI; the fleet's self-hosted images do not. That
