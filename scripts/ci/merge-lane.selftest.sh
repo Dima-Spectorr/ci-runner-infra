@@ -782,8 +782,46 @@ stops_batching_at_the_pass_deadline() {
 # A refused merge means the world moved — most often that this pass's own
 # earlier merge left the next candidate conflicting. Carrying on down the
 # ranking after a refusal is how a batch turns into a sequence of guesses.
+#
+# Exit 2 is the one refusal that does NOT mean the world moved: the App lacks a
+# permission on the files this pull request touches, which says nothing about
+# any other candidate. That one is skipped so it cannot starve the backlog —
+# but it must still be an EXCEPTION, spelled out, or the general case silently
+# becomes "carry on".
 ends_the_batch_on_a_refusal() {
-  matches "$(code_of "$1")" 'lane_take_action .* \|\| break'
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^    lane_take_action .* \|\| take_rc=\$\?$' || return 1
+  matches "$code" '^      \[ "\$take_rc" -eq 2 \] \|\| break$'
+}
+
+# A REFUSAL THE LANE CANNOT EXPLAIN COSTS HOURS. The old annotation guessed —
+# "head moved, or the branch became unmergeable" — while gh's stderr, carrying
+# the actual HTTP 403, went to the log unread. An operator who then checks the
+# pull request finds it mergeable and clean and has nowhere left to look.
+quotes_what_github_actually_said() {
+  local code
+  code=$(code_of "$1")
+  # The error is captured off the call, not discarded. Asserted in two pieces
+  # because the call is line-continued and `matches` reads a line at a time.
+  matches "$code" '^      if merge_err="\$\(gh api -X PUT ' || return 1
+  matches "$code" '^      if update_err="\$\(gh api -X PUT ' || return 1
+  [ "$(printf '%s\n' "$code" | grep -c -- '--silent 2>&1)"')" = 2 ] || return 1
+  # …and reaches the annotation.
+  matches "$code" 'GitHub said: \$err'
+}
+
+# The fleet's pull requests are overwhelmingly workflow pull requests, and a
+# GitHub App may not touch `.github/workflows/**` without the `workflows`
+# permission. Reported as the generic "head moved" this is undiagnosable; and
+# because such a pull request is refused identically on every pass, one of them
+# at the head of the ranking holds the entire repository. It is named, and it
+# does not end the batch.
+names_the_workflows_permission_refusal() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" "^    \*'workflows'\*permission\*)\$" || return 1
+  matches "$code" '^      return 2$'
 }
 
 # "Not asked" and "up to date" are different facts. The verdict does not care —
@@ -1027,6 +1065,8 @@ check announces_a_release_once "$DRIVER" "a release is not recorded per sha, so 
 check batches_only_when_the_base_allows_it "$DRIVER" "the pass acts on more than one candidate without checking that the base is non-strict, so on a strict base it merges against behind_by values its own earlier merge invalidated"
 check stops_batching_at_the_pass_deadline "$DRIVER" "the batch keeps merging past the pass deadline, so a truncated pass spends the headroom it needs to publish the queue and the annotation explaining the truncation"
 check ends_the_batch_on_a_refusal "$DRIVER" "a refused action does not stop the batch, so the lane keeps working down a ranking the refusal just proved stale"
+check quotes_what_github_actually_said "$DRIVER" "a refusal is reported as a guess while GitHub's own reason is thrown away, so a lane that logs merge:ready and then acts on nothing cannot be diagnosed at all"
+check names_the_workflows_permission_refusal "$DRIVER" "a pull request the App may never merge — it touches a workflow file — reads as a transient refusal and ends the batch on every pass, so one of them starves the whole repository"
 check halts_when_the_base_itself_is_red "$DRIVER" "the lane keeps merging onto a base whose own required checks are failing, burying the commit that broke it under everything that follows"
 check only_a_definite_failure_halts_the_lane "$DRIVER" "the base-health gate halts on something other than a definite failure, which deadlocks every repository whose required checks run on pull_request only"
 check says_on_the_snapshot_that_it_halted "$DRIVER" "a halted lane renders exactly like a base with nothing open, so the queue view reports a quiet day while nothing can merge"
@@ -1195,7 +1235,11 @@ mutate "armed-ness starts being decided against the tip the merge just made" "$D
 mutate "an unwatched base becomes indistinguishable from an unanswered one" "$DRIVER" \
   "s@^    LANE_BASE_VERDICT='inert'\$@    LANE_BASE_VERDICT='unanswered'@" tells_an_unanswered_tip_from_an_unwatched_one
 mutate "a refused action no longer ends the batch" "$DRIVER" \
-  's@\(lane_take_action .*\) || break@\1 || true@' ends_the_batch_on_a_refusal
+  's@^      \[ "\$take_rc" -eq 2 \] || break$@      :@' ends_the_batch_on_a_refusal
+mutate "gh's stderr goes back to the log instead of the annotation" "$DRIVER" \
+  's@ --silent 2>&1)"@ --silent)"@' quotes_what_github_actually_said
+mutate "the workflows-permission refusal stops being named" "$DRIVER" \
+  "s@^    \*'workflows'\*permission\*)\$@    *'workflows-never'*permission*)@" names_the_workflows_permission_refusal
 mutate "the unasked comparison starts reporting itself as up to date" "$DRIVER" \
   "s@^      behind_cell='n/a'\$@      behind_cell=\"\$behind\"@" says_when_it_did_not_ask_how_far_behind
 

@@ -1033,7 +1033,20 @@ one_pass() {
         fi
       fi
     fi
-    lane_take_action "$action_num" "$action_sha" "$action_verdict" || break
+    # A refusal ends the batch, with ONE exception. Exit 2 means the refusal was
+    # about this pull request and nothing else — a permission the App does not
+    # hold on the files it touches — and the world did not move, so the rest of
+    # the ranking is still describable. Ending the batch there would let one
+    # permanently unmergeable pull request at the head of the ranking starve
+    # every other candidate in the repository, on every pass, forever: measured
+    # on two repositories where a single workflow-touching pull request held the
+    # whole backlog. It is skipped, not merged and not counted.
+    local take_rc=0
+    lane_take_action "$action_num" "$action_sha" "$action_verdict" || take_rc=$?
+    if [ "$take_rc" -ne 0 ]; then
+      [ "$take_rc" -eq 2 ] || break
+      continue
+    fi
     PASS_ACTED=$((PASS_ACTED + 1))
   done <<<"$ranked"
 
@@ -1041,9 +1054,42 @@ one_pass() {
 }
 
 # ---------------------------------------------------------------------------
+# Say why GitHub refused, in GitHub's own words, and RETURN the code the caller
+# passes on: 2 when the refusal is about this pull request alone, so the batch
+# can go on, 1 when the world moved and the pass has to re-read it.
+#
+# THE MESSAGE USED TO GUESS, AND THE GUESS WAS WRONG. "Head moved, or the branch
+# became unmergeable" is the common case and it reads like a diagnosis, so an
+# operator looking at a lane that logs `merge:ready` and then `done, 0
+# action(s)` checks the pull request, finds it `mergeable: true` and
+# `mergeable_state: clean`, and has nowhere left to look. The actual refusal on
+# two repositories was an HTTP 403 the lane threw away: a GitHub App may not
+# create or update a file under `.github/workflows/` unless the installation
+# grants it the `workflows` permission, and the fleet's own pull requests are
+# overwhelmingly workflow pull requests. Whatever GitHub said is now quoted.
+# ---------------------------------------------------------------------------
+lane_report_refusal() {
+  local what="$1" num="$2" err="$3"
+  # One line: an annotation is one line, and a multi-line body would be
+  # truncated at the first newline with the reason usually below it.
+  err="$(printf '%s' "$err" | tr '\n' ' ')"
+
+  case "$err" in
+    *'workflows'*permission*)
+      echo "::error::$what of #$num was refused: the merge App may not write \`.github/workflows/**\` on this installation. Grant the App the \"Workflows\" repository permission (read and write) and accept the request on each installation — until then EVERY pull request that touches a workflow file is unmergeable by the lane, and only those. GitHub said: $err"
+      return 2
+      ;;
+  esac
+
+  echo "::warning::$what of #$num was refused — head moved, or the branch became unmergeable. Re-reading next pass. GitHub said: $err"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Take one action. 0 if it landed, 1 if GitHub refused it — a refusal is never
 # retried in place, because the reason for it is always that the world moved,
-# and the next pass is where the lane looks at the world it moved to.
+# and the next pass is where the lane looks at the world it moved to. 2 is the
+# exception described above: refused, but about this pull request only.
 # ---------------------------------------------------------------------------
 lane_take_action() {
   local action_num="$1" action_sha="$2" action_verdict="$3"
@@ -1055,24 +1101,36 @@ lane_take_action() {
       # landed while this pass was running fails the call instead of merging
       # code nothing verified. This is the race Mergify closed by owning the
       # queue, and it has to be closed explicitly now that we do.
-      if gh api -X PUT "repos/$R/pulls/$action_num/merge" \
-        -f merge_method=squash -f sha="$action_sha" --silent; then
+      # stderr is captured rather than left to the log: it is the only place
+      # GitHub says WHY, and a refusal the lane cannot explain costs hours.
+      local merge_err
+      if merge_err="$(gh api -X PUT "repos/$R/pulls/$action_num/merge" \
+        -f merge_method=squash -f sha="$action_sha" --silent 2>&1)"; then
         echo "::notice::merged #$action_num ($action_verdict)"
       else
-        echo "::warning::merge of #$action_num was refused — head moved, or the branch became unmergeable. Re-reading next pass."
-        return 1
+        # Captured rather than `return $?`: errexit is only suppressed here
+        # because every caller happens to be a condition, and a future one
+        # that is not would exit the run instead of reporting the refusal.
+        local rc=0
+        lane_report_refusal merge "$action_num" "$merge_err" || rc=$?
+        return "$rc"
       fi
       ;;
     update)
       # Same guard, same reason. This push is what starts the re-run whose
       # completion brings the lane back — and it starts one only because the
       # token is the App's.
-      if gh api -X PUT "repos/$R/pulls/$action_num/update-branch" \
-        -f expected_head_sha="$action_sha" --silent; then
+      local update_err
+      if update_err="$(gh api -X PUT "repos/$R/pulls/$action_num/update-branch" \
+        -f expected_head_sha="$action_sha" --silent 2>&1)"; then
         echo "::notice::updated #$action_num onto $LANE_BASE ($action_verdict) — its own CI now re-runs in place"
       else
-        echo "::warning::update of #$action_num was refused — head moved. Re-reading next pass."
-        return 1
+        # Captured rather than `return $?`: errexit is only suppressed here
+        # because every caller happens to be a condition, and a future one
+        # that is not would exit the run instead of reporting the refusal.
+        local rc=0
+        lane_report_refusal update "$action_num" "$update_err" || rc=$?
+        return "$rc"
       fi
       ;;
     drop)
