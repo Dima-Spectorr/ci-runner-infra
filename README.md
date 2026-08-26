@@ -175,7 +175,15 @@ the kernel image, a Go module compiled into `dockerd` — `grype` has no distro
 security data to consult, so it compares upstream version numbers and reports
 every backported fix as missing. The first real run of this gate produced 273
 blocking findings, and every one of the 273 was a match of exactly that kind.
-They are still counted and named, as `off-distro`. Exceptions go in
+They are still counted and named, as `off-distro`, and their **population is
+enforced by identity**: the `(id, package)` pairs the image is known to carry
+live in `docs/image-vuln-offdistro.txt`, seeded from a real scan, and a pair in
+a later scan that is not in that file is a red build. So the gap this narrowing
+leaves — a genuinely vulnerable module vendored into an image binary — is
+bounded by *growth* rather than left open, without restoring a gate that goes
+red on every backport. Pruning a line that stopped appearing never fails a
+build; emptying the file turns enforcement off, which the gate's self-test
+refuses. Exceptions go in
 `docs/image-vuln-ignores.txt` and **carry an expiry date**: the day after it, the
 gate goes red and names the entry, which forces the decision again rather than
 letting the list grow quietly. A report that cannot be read, or that matched

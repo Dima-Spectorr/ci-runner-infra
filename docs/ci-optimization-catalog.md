@@ -721,10 +721,18 @@ Four design choices, each against a specific way this kind of gate dies:
   produced thousands of matches and **zero** blocking, because there Ubuntu's
   data reports the backport. Left as it was, the gate was red on every image
   forever for findings nobody here can fix. They are still counted and printed,
-  on the summary line, as `off-distro`. The cost is named rather than hidden: a
-  genuinely vulnerable vendored module in an image-installed binary no longer
-  fails the build, and closing that needs a scanner that understands binary
-  provenance — not a gate that is unconditionally red. **A finding whose
+  on the summary line, as `off-distro`. The cost was named rather than hidden —
+  a genuinely vulnerable vendored module in an image-installed binary no longer
+  failed the build — and it is now bounded rather than open: the population is
+  **enforced by identity**, not by count. The `(id, package)` pairs the image
+  carries live in `docs/image-vuln-offdistro.txt` (seeded 2026-08-26 from build
+  `1057f771`: 117 pairs behind 273 findings), and a pair not in that file is a
+  red build with a pull request as the review. A count would have been useless
+  here — it moves whenever the vulnerability database does — whereas a new pair
+  is a new statement about this image. Attributing a vendored module to the
+  distro binary that already patched it still needs a scanner that understands
+  binary provenance; that is the remaining piece, and it is no longer the only
+  thing standing between this gate and a silent regression. **A finding whose
   `artifact.type` the report does not state blocks**, exactly as a `deb` would:
   the test is "distro package *or* provenance unknown", so the day grype renames
   that field the gate goes red rather than quietly narrowing to nothing.
