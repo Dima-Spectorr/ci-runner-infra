@@ -126,10 +126,64 @@ fi
 # finishes, which is a fault to fix rather than a number to raise.
 BASE_HEALTH_GRACE="${BASE_HEALTH_GRACE:-900}"
 
+# HOW OLD AN ANSWER MAY BE AND STILL VOUCH FOR A TIP THAT HAS NOT ANSWERED YET.
+# Zero — the default, and every repository on the fleet until one opts in —
+# means only the tip's OWN answer counts, which is the rule the gate shipped
+# with and the strictest reading of it.
+#
+# WHY THE STRICT READING IS NOT ALWAYS REACHABLE, WHICH IS THE WHOLE POINT.
+#
+# The grace above bounds the wait for ONE tip. It does not bound the wait, and
+# on a base that moves faster than its health job answers, nothing does: the
+# clock is keyed to the tip's commit date, so every merge that lands restarts
+# it from zero. Each individual wait expires correctly; the sequence never
+# does. That is a livelock rather than a slow gate, and it is silent — the pass
+# halts before it classifies anything, so the run reports `0 action(s)` with no
+# `merge:ready` line above it and looks exactly like an idle, healthy lane.
+#
+# Measured on IntegrateIT, 2026-08-26: `main-health` took 6-14 minutes against a
+# `main` advancing every 2-16, so the tip was replaced before its answer landed
+# on essentially every commit for a whole working day. The lane merged nothing;
+# the backlog was merged by hand; the hand-merging is what kept `main` moving.
+# That repository's own health workflow says in its header that the answer it
+# lands is "a sha or two behind while the drain is in flight" — the two designs
+# contradict each other, and this is the number that reconciles them.
+#
+# WHAT A NON-ZERO VALUE ACTUALLY RELAXES, said narrowly. The gate asks "is the
+# base broken right now". An answer on an ancestor from four minutes ago
+# answers that about as well as an answer on the tip, and it is strictly more
+# information than the fallback it replaces — which is to merge unvouched, on
+# no answer at all, once the grace runs out. The window is consulted ONLY when
+# the tip reads `unanswered`; a tip that has answered red still halts the pass,
+# and an ancestor inside the window that answered red halts it too rather than
+# being walked past in search of an older green one.
+#
+# WHAT IT DOES NOT RELAX. It is unusable for the rest of a run in which the
+# lane has merged anything (`LANE_MERGED_THIS_RUN`). The gate's other job is to
+# stop a batch piling onto a tip THE LANE ITSELF just created and nothing has
+# vouched for — two branches green alone and broken together, which is the
+# Apigee-Portal incident the batch gate was added for. An ancestor's answer
+# predates that merge by definition, so it is not allowed to speak for it.
+BASE_HEALTH_MAX_STALENESS="${BASE_HEALTH_MAX_STALENESS:-0}"
+
+# How far back the window will walk, whatever the clock allows. Each ancestor
+# costs two paginated check reads, so an unbounded walk on a base nothing has
+# answered for in an hour would spend a pass reading commits to conclude what
+# the age test concludes for free. Five is comfortably past the "a sha or two
+# behind" the window exists to bridge.
+BASE_HEALTH_MAX_HOPS=5
+
 # Whether anything answers for the base tip at all, decided once per pass and
 # read by `lane_base_is_vouched`. Empty means inert, which is the whole fleet
 # minus the repositories that have been armed.
 LANE_BASE_ARMED=''
+
+# Set the first time this RUN merges anything, and never cleared. It closes the
+# staleness window for the remainder of the run — see `BASE_HEALTH_MAX_STALENESS`
+# for why an answer older than the lane's own merge must not vouch for it. The
+# run loop starts the next pass immediately, so a guard held only inside the
+# batch would be undone by the iteration around it.
+LANE_MERGED_THIS_RUN=''
 
 echo "lane: base=$LANE_BASE required=${#REQUIRED[@]} budget=${BUDGET}s pass-budget=${PASS_BUDGET}s max-actions=$MAX_ACTIONS dry-run=$DRY_RUN"
 for c in "${REQUIRED[@]}"; do echo "lane: requires '$c'"; done
@@ -509,6 +563,71 @@ lane_base_is_broken() {
 # where it merges most. Past `BASE_HEALTH_GRACE` the tip is taken as unvouchable
 # and the lane proceeds under the original fail-open rule, loudly. That bounds
 # the wait; it does not pretend the answer arrived.
+# ---------------------------------------------------------------------------
+# DID ANYTHING RECENT ENOUGH ANSWER FOR THIS BASE, IF NOT FOR THIS COMMIT?
+#
+# Walks the base's history newest-first from the commit below the tip and stops
+# at the FIRST ancestor that has an answer. Three outcomes, and the middle one
+# is the reason this is a walk rather than an age test:
+#
+#   0  an ancestor inside the window answered GREEN — the base is not broken,
+#      which is the only question this gate asks
+#   1  an ancestor inside the window answered RED — halt, and do NOT keep
+#      walking for an older green one. A red answer is not noise to be searched
+#      past; it is the answer, and the tip is a descendant of the commit that
+#      carries it.
+#   2  nothing inside the window answered either way — the caller falls through
+#      to the grace clock, exactly as it did before this existed
+#
+# BOUNDED TWICE, BY AGE AND BY HOPS, because the two bound different failures.
+# The age bound is the honest one — an answer from an hour ago does not describe
+# `main` now. The hop bound is about cost: each ancestor is two paginated check
+# reads, and a base nothing has answered for would otherwise spend a pass
+# proving it. Either bound reached ends the walk at 2.
+#
+# `LANE_BASE_VERDICT` is clobbered by the reads here and RESTORED by the caller,
+# which is the one place that knows what it is supposed to describe.
+lane_base_window_answers() { # <tip-sha>
+  local tip="$1" now sha at age hops=0 commits
+  now="$(date -u +%s)"
+  # One page, deliberately unpaginated: the walk is capped at
+  # `BASE_HEALTH_MAX_HOPS` anyway, and a `--paginate` here would read the whole
+  # history of the base to throw all but the first few rows away.
+  if ! commits="$(gh api "repos/$R/commits?sha=$LANE_BASE&per_page=$((BASE_HEALTH_MAX_HOPS + 1))" \
+    --jq '.[] | .sha + " " + .commit.committer.date' 2>/dev/null)" || [ -z "$commits" ]; then
+    echo "lane: could not read the recent history of $LANE_BASE — the staleness window is unusable this pass, falling back to the grace clock"
+    return 2
+  fi
+  while read -r sha at; do
+    [ -n "$sha" ] || continue
+    # The tip is what the caller already read and found unanswered. It is in
+    # this list because the list is the base's history, not because it is a
+    # candidate.
+    [ "$sha" != "$tip" ] || continue
+    [ "$hops" -lt "$BASE_HEALTH_MAX_HOPS" ] || break
+    hops=$((hops + 1))
+    # An unparseable date resolves to epoch, so the age is enormous and the walk
+    # STOPS — the opposite direction from the grace clock's fallback, and for the
+    # opposite reason. There, an unbounded wait was the worse failure; here, the
+    # permissive reading would let a commit whose date the lane cannot read vouch
+    # for the tip, which is the thing this window has to be conservative about.
+    age=$(( now - $(date -u -d "$at" +%s 2>/dev/null || echo 0) ))
+    [ "$age" -lt "$BASE_HEALTH_MAX_STALENESS" ] || break
+    lane_base_is_broken "$sha" || true
+    case "$LANE_BASE_VERDICT" in
+      healthy)
+        echo "::notice::lane: ${tip:0:8} has not answered yet, but ${sha:0:8} — ${age}s old, ${hops} commit(s) back — answered green, so the base is not broken. Merging on that, within the ${BASE_HEALTH_MAX_STALENESS}s staleness window."
+        return 0
+        ;;
+      broken)
+        echo "::warning::lane: not merging — ${tip:0:8} has not answered, and its ancestor ${sha:0:8} (${age}s old) is FAILING its base-health checks. The tip inherits that until something says otherwise."
+        return 1
+        ;;
+    esac
+  done <<<"$commits"
+  return 2
+}
+
 lane_base_is_vouched() {
   local sha="$1" committed_at="$2" age now
   # Not armed: nothing answers for this base at all, so there is nothing to wait
@@ -523,6 +642,22 @@ lane_base_is_vouched() {
   # that case and says so in its own words; reaching it here means a merge in
   # THIS batch turned the base red, which is the whole point of stopping.
   if [ "$LANE_BASE_VERDICT" = 'broken' ]; then return 1; fi
+  # A RECENT ANCESTOR MAY ANSWER FOR A TIP THAT HAS NOT. Off unless the caller
+  # opted in, and closed for the rest of a run in which the lane has merged —
+  # both conditions are argued where the knob is declared. `lane_base_verdict`
+  # is left describing the TIP either way, because that is what every message
+  # below and around this function names.
+  if [ "$BASE_HEALTH_MAX_STALENESS" -gt 0 ] && [ -z "$LANE_MERGED_THIS_RUN" ]; then
+    local tip_verdict="$LANE_BASE_VERDICT" window_rc=0
+    lane_base_window_answers "$sha" || window_rc=$?
+    LANE_BASE_VERDICT="$tip_verdict"
+    # 0 vouched, 1 an ancestor inside the window is RED, 2 nothing inside it
+    # answered — only the last falls through to the grace clock below.
+    case "$window_rc" in
+      0) return 0 ;;
+      1) return 1 ;;
+    esac
+  fi
   now="$(date -u +%s)"
   # An unparseable date resolves to epoch, so the age is enormous and the lane
   # PROCEEDS. Deliberate: a wait this cannot bound is a wait that never ends,
@@ -1185,6 +1320,12 @@ lane_take_action() {
       if merge_err="$(gh api -X PUT "repos/$R/pulls/$action_num/merge" \
         -f merge_method=squash -f sha="$action_sha" --silent 2>&1)"; then
         echo "::notice::merged #$action_num ($action_verdict)"
+        # Closes the base-health staleness window for the rest of the run. From
+        # here the tip is partly the lane's own work, and an answer that predates
+        # it cannot speak for it — see `BASE_HEALTH_MAX_STALENESS`. Set on the
+        # merge itself rather than on the action count, because an `update` or a
+        # `drop` comment moves no base and must not cost the window.
+        LANE_MERGED_THIS_RUN=1
       else
         # Captured rather than `return $?`: errexit is only suppressed here
         # because every caller happens to be a condition, and a future one

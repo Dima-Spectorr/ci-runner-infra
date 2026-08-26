@@ -1029,6 +1029,72 @@ the_wait_for_an_answer_is_bounded() {
   matches "$code" 'proceeding unvouched'
 }
 
+# AND THE CEILING ABOVE IS NOT ITSELF A BOUND ON THE WAIT, WHICH IS WHY THE
+# WINDOW EXISTS. `age` is the TIP's age, so every merge that lands restarts the
+# clock from zero: each wait expires correctly and the sequence never does.
+# Measured on IntegrateIT, where a 6-14 minute health job answers for a `main`
+# that advances every 2-16 and the lane merged nothing for a working day.
+#
+# OFF UNLESS ASKED FOR. Thirteen armed repositories do not get a relaxed gate
+# because one of them outran its health job; the default is the rule the gate
+# shipped with, and the value is set by the repository that needs it.
+the_staleness_window_is_off_by_default() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^BASE_HEALTH_MAX_STALENESS="\$\{BASE_HEALTH_MAX_STALENESS:-0\}"$' || return 1
+  matches "$code" '\[ "\$BASE_HEALTH_MAX_STALENESS" -gt 0 \]'
+}
+
+# AND IT IS CLOSED FOR THE REST OF A RUN THAT HAS MERGED. The other half of this
+# gate's job is stopping a batch piling onto a tip THE LANE ITSELF just made and
+# nothing has vouched for -- the Apigee-Portal case, #3568 and #3556, green
+# alone and broken together. An ancestor's answer predates that merge by
+# definition, so letting it speak for the new tip would undo the batch gate
+# through the window. Held on a RUN variable, not a pass one: the run loop
+# starts the next pass immediately and a pass-scoped guard would be cleared by
+# the iteration around it.
+the_staleness_window_closes_after_the_lane_merges() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '\[ -z "\$LANE_MERGED_THIS_RUN" \]' || return 1
+  matches "$code" '^        LANE_MERGED_THIS_RUN=1$'
+}
+
+# A RED ANCESTOR IS AN ANSWER, NOT NOISE TO BE SEARCHED PAST. The walk stops at
+# the first ancestor that answered either way. Continuing past a red one to find
+# an older green one would turn the window into a licence to merge onto a base
+# that is broken and has said so -- the single thing the whole gate exists to
+# prevent, reached through the relaxation added to keep it usable.
+a_red_ancestor_inside_the_window_halts_the_lane() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      broken\)$' || return 1
+  # rc 1 out of the walk, and the caller must refuse on it rather than fall
+  # through to the grace clock that would merge unvouched anyway.
+  matches "$code" '^      1\) return 1 ;;$'
+}
+
+# BOUNDED BY AGE AND BY HOPS, and both are load-bearing. Without the age test
+# the "window" is the whole history and any green commit ever vouches for the
+# tip. Without the hop cap a base nothing has answered for spends a pass at two
+# paginated check reads per commit proving what the age test proves for free.
+the_window_walk_is_bounded() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^    \[ "\$age" -lt "\$BASE_HEALTH_MAX_STALENESS" \] \|\| break$' || return 1
+  matches "$code" '^    \[ "\$hops" -lt "\$BASE_HEALTH_MAX_HOPS" \] \|\| break$'
+}
+
+# The knob has to reach the driver, the same way the list and the grace do. A
+# workflow input nothing reads is a repository that set the value, watched the
+# lane go on halting, and has no way to tell which end is wrong.
+passes_the_staleness_window_to_the_driver() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      base-health-max-staleness-seconds:$' || return 1
+  matches "$code" '^          BASE_HEALTH_MAX_STALENESS: \$\{\{ inputs\.base-health-max-staleness-seconds \}\}$'
+}
+
 # ARMED-NESS IS READ FROM THE PASS TIP, NEVER FROM THE ONE A MERGE JUST MADE.
 # Seconds after a merge the post-merge run does not exist yet, so its checks
 # read as MISSING on the new tip -- identical to an unarmed repository, forever.
@@ -1067,6 +1133,11 @@ echo "merge-lane self-test:"
 check waits_for_the_tip_between_merges "$DRIVER" "a batch keeps merging after the first merge without re-reading the base, so two pull requests that are green alone and broken together bury the rest of the backlog on top of the break"
 check waits_for_the_tip_at_the_top_of_a_pass "$DRIVER" "only the batch waits for the tip to answer, so the run loop's next pass merges onto it anyway and the rule is undone by the loop around it"
 check the_wait_for_an_answer_is_bounded "$DRIVER" "the lane waits for a base-health answer with no ceiling, so a health job cancelled by its own successor stalls the lane hardest on the busiest base"
+check the_staleness_window_is_off_by_default "$DRIVER" "the staleness window is on for every repository by default, so thirteen armed bases get a relaxed base-health gate none of them asked for"
+check the_staleness_window_closes_after_the_lane_merges "$DRIVER" "an ancestor's answer vouches for a tip the lane itself just created, which undoes the between-merges gate through the window and lets a batch pile onto a semantic conflict"
+check a_red_ancestor_inside_the_window_halts_the_lane "$DRIVER" "the walk searches past a red ancestor for an older green one, so a base that is broken and has said so reads as vouched"
+check the_window_walk_is_bounded "$DRIVER" "the ancestor walk is unbounded in age or in hops, so any green commit in history vouches for the tip, or a pass is spent at two check reads per commit proving nothing answered"
+check passes_the_staleness_window_to_the_driver "$CALLEE" "the workflow declares the staleness window but never hands it to the driver, so a repository that sets it watches the lane go on halting with no way to tell which end is wrong"
 check decides_armed_ness_before_the_batch_moves_the_tip "$DRIVER" "armed-ness is decided against a tip a merge just created, where the post-merge run does not exist yet, so every armed base reads as unarmed and the gate is off when it matters"
 check costs_an_unarmed_base_nothing "$DRIVER" "an inert base pays two API calls per merge to re-learn that nothing answers for it"
 check tells_an_unanswered_tip_from_an_unwatched_one "$DRIVER" "'nobody is watching' and 'nobody has answered yet' collapse into one verdict, so an armed base reads as unarmed and the batch stacks onto an unvouched tip"
@@ -1281,6 +1352,16 @@ mutate "only the batch waits, and the next pass merges anyway" "$DRIVER" \
   's@^  if ! lane_base_is_vouched "\$base_sha" "\$base_at"; then$@  if false; then@' waits_for_the_tip_at_the_top_of_a_pass
 mutate "the wait for a base-health answer loses its ceiling" "$DRIVER" \
   's@^  if \[ "\$age" -ge "\$BASE_HEALTH_GRACE" \]; then$@  if false; then@' the_wait_for_an_answer_is_bounded
+mutate "the staleness window becomes on-by-default for the whole fleet" "$DRIVER" \
+  's@^BASE_HEALTH_MAX_STALENESS=.*$@BASE_HEALTH_MAX_STALENESS="600"@' the_staleness_window_is_off_by_default
+mutate "the window stays open after the lane has merged" "$DRIVER" \
+  's@^        LANE_MERGED_THIS_RUN=1$@        :@' the_staleness_window_closes_after_the_lane_merges
+mutate "a red ancestor stops halting the walk" "$DRIVER" \
+  's@^      1) return 1 ;;$@      1) : ;;@' a_red_ancestor_inside_the_window_halts_the_lane
+mutate "the ancestor walk loses its age bound" "$DRIVER" \
+  's@^    \[ "\$age" -lt "\$BASE_HEALTH_MAX_STALENESS" \] || break$@    :@' the_window_walk_is_bounded
+mutate "the workflow stops handing the staleness window to the driver" "$CALLEE" \
+  's@^          BASE_HEALTH_MAX_STALENESS: .*$@          BASE_HEALTH_MAX_STALENESS: 0@' passes_the_staleness_window_to_the_driver
 mutate "armed-ness starts being decided against the tip the merge just made" "$DRIVER" \
   's@^  if \[ "\$LANE_BASE_VERDICT" = .inert. \]; then LANE_BASE_ARMED=..; else LANE_BASE_ARMED=1; fi$@  :@' decides_armed_ness_before_the_batch_moves_the_tip
 mutate "an unwatched base becomes indistinguishable from an unanswered one" "$DRIVER" \

@@ -131,6 +131,37 @@ on:
         required: false
         default: 900
         type: number
+      base-health-max-staleness-seconds:
+        description: >-
+          How old a base-health answer may be and still vouch for a tip that has
+          not answered yet. `0`, the default, means only the tip's own answer
+          counts -- the rule the gate shipped with.
+
+
+          Set it on a base that moves faster than its health job answers. The
+          grace above bounds the wait for ONE tip and nothing bounds the
+          sequence: the clock is keyed to the tip's commit date, so every merge
+          restarts it and the lane holds forever while the base moves the whole
+          time. It is silent when it happens -- the pass halts before it
+          classifies anything, so the run reports `0 action(s)` with no
+          `merge:ready` line, which is also what an idle lane looks like.
+
+
+          What it relaxes is narrow. The window is consulted ONLY when the tip
+          reads `unanswered`; a tip that answered red still halts, an ancestor
+          inside the window that answered red halts too rather than being walked
+          past, and the window is closed for the rest of any run in which the
+          lane has already merged -- so it can never pour a batch onto a tip the
+          lane itself created. What it replaces is not a strict gate but the
+          fail-open fallback: past the grace the lane merges on NO answer at
+          all, and a green answer from four minutes ago is strictly more.
+
+
+          A sane value is a small multiple of how long the health job takes.
+          Much larger and it is a fail-open with extra steps.
+        required: false
+        default: 0
+        type: number
       runs-on:
         description: >-
           Where the lane runs. Defaults to `ubuntu-latest`, which is free and
@@ -441,6 +472,7 @@ jobs:
           PIN_BUMP_REPO: ${{ inputs.pin-bump-repo }}
           PRIORITY_PREFIX: ${{ inputs.priority-label-prefix }}
           BASE_HEALTH_GRACE: ${{ inputs.base-health-grace-seconds }}
+          BASE_HEALTH_MAX_STALENESS: ${{ inputs.base-health-max-staleness-seconds }}
           STATUS_ISSUE: ${{ inputs.status-issue }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: bash scripts/ci/merge-lane.sh
