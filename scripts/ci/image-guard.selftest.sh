@@ -341,10 +341,10 @@ mutate "the version taken back into double quotes" \
 PKR="$ROOT/packer/ci-host-image.pkr.hcl"
 TRIGGER_VARS="$ROOT/modules/ci-host-image-trigger/variables.tf"
 packer_upload_paths_are_watched() {
-  [ -r "$PKR" ] && [ -r "$TRIGGER_VARS" ] || {
+  if [ ! -r "$PKR" ] || [ ! -r "$TRIGGER_VARS" ]; then
     bad "cannot read the packer template or the trigger's variables — this check would be vacuous"
     return
-  }
+  fi
   # `source = "../<path>"` in a provisioner: the `..` is what makes it a file
   # outside `packer/`, which is exactly the population at issue.
   local unwatched="" path
