@@ -387,7 +387,7 @@ declare -A D_TOTAL=() D_QUEUED=() D_WAIT=() D_RUNNING=() D_EXPIRED=()
 # dropping it changes no decision — under-reporting is only possible in the one
 # state where the number is not being acted on.
 DEMAND_MAX_AGE=21600
-METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/github}
+METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/ci}
 REPO_FULL="$OWNER/$REPO"
 
 # An empty label set silently matches NOTHING: every queued job is discarded as

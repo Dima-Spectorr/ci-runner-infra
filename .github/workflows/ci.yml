@@ -684,6 +684,16 @@ jobs:
       - name: base-health contract
         run: bash scripts/ci/check-base-health-contract.sh
 
+      # The same shape one layer down: a contract spanning two files with
+      # nothing joining them, whose breakage is silent. The controller writes
+      # `<prefix>/ci_demand`; the hosts' autoscaler reads it. Split the prefix
+      # and the MIG reports targetSize 0, isStable true, and every job queues
+      # forever behind a pool that looks perfectly healthy.
+      - name: metric-prefix agreement self-test
+        run: bash scripts/ci/check-metric-prefix-agreement.sh --selftest
+      - name: metric-prefix agreement
+        run: bash scripts/ci/check-metric-prefix-agreement.sh
+
       # The guard the lane cannot be: the lane asks "may this merge now",
       # seconds before it does; the guard asks whether the branch is looking at
       # the current base and whether anyone else is rewriting the same files,

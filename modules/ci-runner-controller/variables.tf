@@ -197,7 +197,17 @@ variable "queue_stall_max_attempts" {
 }
 
 variable "metric_prefix" {
-  description = "Custom-metric prefix. Series are labelled with `pool`, so all four pools publish under one prefix."
+  description = <<-EOT
+    Custom-metric prefix. Series are labelled with `pool`, so all four pools
+    publish under one prefix.
+
+    This controller is the WRITER. Every reader — the hosts' autoscaler in
+    `modules/ci-runner-host-pool`, the alert policies in
+    `scripts/ci/ensure-alert-policies.sh`, the fleet dashboard — has to name the
+    same prefix, and nothing in Terraform joins them, because the two modules
+    can be instantiated independently. `scripts/ci/check-metric-prefix-agreement.sh`
+    is that join; do not change this default without it.
+  EOT
   type        = string
   default     = "custom.googleapis.com/ci"
 }

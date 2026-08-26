@@ -240,7 +240,7 @@ policy_json() {  # <key> -> a full alertPolicy body on stdout
     "The CI warm-host controller stopped reporting. Jobs will queue and the pool will not scale. Since #308 the controller is a managed group of size 1, so a DELETED one is rebuilt on its own and this alert should clear within a few minutes -- one that does not clear is a controller that boots and cannot tick, not a missing machine. Find the VM with 'gcloud compute instance-groups managed list-instances <name>-controller' (the instance name carries a suffix and changes on every rebuild) and read its ci-controller.service." },
   "conditions": [ { "displayName": "ci_poller_heartbeat absent for 10m",
     "conditionAbsent": { "duration": "600s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_poller_heartbeat\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_poller_heartbeat\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MEAN" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -252,7 +252,7 @@ EOF
     "The controller cannot read the GitHub runner list, so every host reads reg=unknown and NOTHING is drained. That is the correct fail-safe — a host that cannot be proven idle must not be deleted mid-job — but the pool now holds its hosts indefinitely and the heartbeat still reports 1, so nothing else will tell you. Check the GitHub App installation, the token, and egress from the controller. Fires only on a sustained run: a single blind tick is ordinary API noise." },
   "conditions": [ { "displayName": "ci_runner_list_blind_ticks > 3 for 10m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 3.0, "duration": "600s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_runner_list_blind_ticks\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_runner_list_blind_ticks\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -264,7 +264,7 @@ EOF
     "A warm host has been idle past the drain threshold and was not removed — scale-to-zero is broken and the pool is burning money. Check controller drain logs and the MIG autoscaler. If ci_runner_list_blind_ticks is also non-zero, THAT is the cause and this alert is a symptom." },
   "conditions": [ { "displayName": "ci_host_idle_seconds_max > 1200 for 10m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 1200.0, "duration": "600s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_host_idle_seconds_max\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_host_idle_seconds_max\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -276,7 +276,7 @@ EOF
     "A queued job has waited past the SLO without a slot. Either the pool hit max_hosts, hosts failed to boot, or the runner agent is offline. Compare ci_hosts_running with ci_mig_target_size, then read the host serial logs." },
   "conditions": [ { "displayName": "ci_queue_wait_seconds_max > 600 for 10m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 600.0, "duration": "600s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_queue_wait_seconds_max\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_queue_wait_seconds_max\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -288,7 +288,7 @@ EOF
     "The controller's drain loop is erroring. Hosts either leak (cost) or are deleted mid-job (flaky CI). Read the drain verdicts in the controller log." },
   "conditions": [ { "displayName": "ci_drain_verdicts{outcome=error} > 0 for 15m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "900s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_drain_verdicts\" AND resource.type=\"generic_node\" AND metric.labels.outcome=\"error\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_drain_verdicts\" AND resource.type=\"generic_node\" AND metric.labels.outcome=\"error\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -300,7 +300,7 @@ EOF
     "A controller tick is taking longer than ${SLOW_TICK}s — half this pool's watchdog threshold of ${WATCHDOG_THRESHOLD}s (max(300, poll_interval_seconds * 10), with poll_interval_seconds=${POLL}). This is the precursor to a total blackout, not a slowdown: once a tick outlasts the threshold the watchdog restarts the controller mid-tick, the restart prevents the heartbeat that would have stopped it, and every series — heartbeat included — goes absent while systemd still reports active (running). Two pools in this fleet ran that way for hours on 2026-08-14. Demand costs one API call per active workflow run, so the usual cause is a busier repository; lower demand_budget_seconds, or raise poll_interval_seconds AND re-run this script so the threshold follows the wider watchdog window. Check ci_demand_runs_skipped." },
   "conditions": [ { "displayName": "ci_tick_seconds > ${SLOW_TICK} for 10m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": ${SLOW_TICK}.0, "duration": "600s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_tick_seconds\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_tick_seconds\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -312,7 +312,7 @@ EOF
     "Hosts are booting on a shared-cache snapshot older than ${CACHE_STALE_HOURS}h, so the publishing run has stopped producing one. Nothing is broken yet — a stale snapshot is still hydrated, and hosts keep serving jobs — which is why this needs an alert: the failure is a scheduled workflow that quietly stopped, and it stays invisible until the age passes the pool's cache_snapshot_max_age_hours and every host starts cold. Check the publish-cache-snapshot workflow's last run and the pointer object (gcloud storage cat gs://<bucket>/cache/<pool>/current). Read next to ci_cache_snapshot_bytes: a snapshot that stopped growing is a publish that started failing before this did." },
   "conditions": [ { "displayName": "ci_cache_snapshot_age_hours > ${CACHE_STALE_HOURS}",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": ${CACHE_STALE_HOURS}.0, "duration": "0s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_cache_snapshot_age_hours\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_cache_snapshot_age_hours\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "3600s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -324,7 +324,7 @@ EOF
     "Hosts in a pool that HAS a snapshot bucket are registering without the shared cache. The layer fails open by design, so nothing is red: jobs run, they just run cold, and the only other symptom is CI getting slower over weeks. The verdict label says which of the dozen exits was taken — no-snapshot and bad-pointer mean the publish side, too-old, too-big and too-big-expanded mean a bound (the last one means the archive decompressed to more than eight times its own size, so the host refused it rather than unpack part of it), download-timeout and unpack-timeout mean cache_hydrate_budget_seconds is too small for the snapshot's size, scan-refused means the archive failed the host's own safety scan and SHOULD be investigated as a publish that produced something a host would not unpack. not-configured is excluded here: it is the correct steady state for a pool with no bucket, and paging on it would page every pool that never wanted this feature — a host that could not READ its configuration reports no-metadata-server instead, which is included. Read /var/log/ci-runner-startup.log on a recent host." },
   "conditions": [ { "displayName": "ci_cache_hydrate_verdict{verdict!=hydrated,not-configured} > 0",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "0s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_cache_hydrate_verdict\" AND resource.type=\"generic_node\" AND metric.labels.verdict!=\"hydrated\" AND metric.labels.verdict!=\"not-configured\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_cache_hydrate_verdict\" AND resource.type=\"generic_node\" AND metric.labels.verdict!=\"hydrated\" AND metric.labels.verdict!=\"not-configured\"",
       "aggregations": [ { "alignmentPeriod": "3600s", "perSeriesAligner": "ALIGN_SUM" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -336,7 +336,7 @@ EOF
     "Hosts are RUNNING and past their registration grace, and fewer runner agents answer than the pool was built with. This is the one alert that separates 'the pool is fine and jobs are queuing' from 'the pool is not there': ci_slots_total is arithmetic — hosts x slots — so it reads identically whether every agent registered or none did, and every other series stays green through all three of the failures below.\n\nRead ci_slots_registered next to ci_slots_total to size the gap, then the host serial log. Three causes, in rough order of likelihood: a host that registered NOTHING (its config.sh never completed — check the registration token and egress to github.com); a host whose slot units died before the agent started (a truncated generated hook is 203/EXEC, and the host still reports healthy); or a slot the host's own sweep CONDEMNED after CONDEMN_MAX consecutive failures to reach a clean state, which is the sweep working — the slot was failing every job it claimed — and grep 'taking it out of service' in the host's syslog will say so.\n\nA controller that cannot read the runner list contributes to neither side of this, by construction, so an unreadable API cannot raise it. Sustained non-zero only: a host replaced mid-window is excluded by the grace, but a rolling recycle can still tick it briefly." },
   "conditions": [ { "displayName": "ci_slots_missing > 0 for 15m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "900s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_slots_missing\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_slots_missing\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MIN" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -348,7 +348,7 @@ EOF
     "An open pull request has every check green and can NEVER be merged, because it fails one of the queue's entry conditions. Read the metric's \`reason\` label for which one: \`draft\` (nobody promoted it out of draft), \`base\` (it targets a branch the queue does not admit — usually a sibling feature branch an agent session stacked it on), or both.\n\nThis is the only alert here that fires on a state every other surface reports as healthy. Mergify does not fail an unmet entry condition, it reports NEUTRAL, which renders as a grey dot beside forty green ticks: no red check, no comment, no timer. Two repositories in this fleet reported 'CI is making no progress' in one week and neither had a failing job: two green DRAFTS nobody promoted in one, and a pull request BASED on a sibling feature branch in the other. Both were found days later by a human wondering why something had not landed.\n\nThe controller's log names the pull request number: grep 'cannot enter the merge queue' in the controller's syslog. Fix it in the repository — promote the draft, or retarget the base — not here. Read with max() across pools: the count is a REPOSITORY fact and every pool on the controller publishes the same one.\n\nA long window on purpose. A draft opened and promoted within the hour is somebody working, not an incident; only a pull request that stays finished-and-parked is worth a page. If ci_parked_prs_skipped is non-zero the count is a lower bound — the sweep hit its budget or its candidate ceiling." },
   "conditions": [ { "displayName": "ci_prs_green_and_unqueued > 0 for 60m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "3600s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_prs_green_and_unqueued\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_prs_green_and_unqueued\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -360,7 +360,7 @@ EOF
     "GitHub is refusing the parking sweep, so the alert above it can never fire. This is the watcher's watcher, and it exists because the feature it guards fails by looking healthy: a sweep that is refused publishes an unbroken ci_prs_green_and_unqueued of ZERO, which is precisely what a repository with nothing parked publishes.\n\nThe sweep makes two calls and either can be the refused one, so read the log line before granting anything: listing open pull requests needs \`pull_requests: read\`, and \`commits/<sha>/check-runs\` needs \`checks: read\`. Almost always the GitHub App installation for this repository holds the older permission set. Nothing else about the controller degrades - demand, draining and recycling all keep working, which is why nobody notices. Grant the permission on the App, then ACCEPT it on the installation: a permission added to an App stays pending until the installation approves it, and a pending permission behaves exactly like one that was never granted.\n\nDistinct from ci_parked_prs_skipped on purpose. Skipped means the sweep ran out of budget and will retry; this means it was refused and will be refused again in five minutes, forever. Grep 'parked sweep: DENIED' in the controller's syslog for the status GitHub actually returned - 401 is a bad App key or installation id rather than a missing permission, and 404 on a sha the same token just listed is a permission answer wearing another number.\n\nRead with max() across pools, like everything else the controller publishes per repository. Fires after 30m: a single refused sweep during a GitHub incident is not worth a page, five in a row is." },
   "conditions": [ { "displayName": "ci_parked_sweep_denied > 0 for 30m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_parked_sweep_denied\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_parked_sweep_denied\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -372,7 +372,7 @@ EOF
     "A job was found RUNNING on a host that no longer exists. The controller cancels the run so it reports something, and this counts the jobs it found.\n\nWhy it is worth a page rather than a line in a log: a slot that dies holding a job produces NO SIGNAL. GitHub leaves the check run \`in_progress\` with nothing behind it — not success, not failure, not cancelled — until its own 24-hour timeout. Nothing is red, nothing is queued, the pool reports healthy, and the job simply never finishes. Everything waiting on that status then waits out ITS timeout instead: a merge queue does not read a missing status as a failure, it reads it as 'still checking' and holds the entry for its full window before dequeuing on a timeout that names no cause. Measured on one repository, that is 150 minutes spent on a pull request whose own CI had been green for hours.\n\nSo the cancellation is the REMEDY, not the incident. The incident is upstream, and it is one of: a slot poisoned mid-run, an agent that stopped answering, host maintenance or an operator delete-instances against a busy host, or a MIG recreate. Grep 'went away under a running job' in the controller's syslog for the instance name, then look at that slot's history — a host that appears here repeatedly is a host to recycle, not a job to re-run.\n\nTwo clocks have to run out before anything is cancelled, and the absence clock is required: the controller refuses this verdict entirely unless it can say how long the host has been continuously missing from the MIG list, and a tick with no host list at all resets every clock rather than advancing it. A false positive here is live work thrown away, so the rule is deliberately slower than the queued-job equivalent.\n\nRead with max() across pools. Fires on any occurrence within the window — this is not a rate to tolerate." },
   "conditions": [ { "displayName": "ci_pinned_jobs_host_vanished > 0 for 15m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "900s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_pinned_jobs_host_vanished\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_pinned_jobs_host_vanished\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -384,7 +384,7 @@ EOF
     "A pull request is open, admissible and fully green, the merge queue is not moving it, and the controller's nudge did not fix it. Everything that reports anything reports health here: the merge box says ready, every check is a green tick, and the pool is idle. The only other surface that would ever notice is a human wondering why something has not landed - which on this fleet took 17 and 18 hours on two pull requests in one day.\n\nThis series counts ONLY the stalls the controller could see and could not clear, so it is already past the automation. Two causes, and the log tells them apart. Either the comment was refused, in which case ci_queue_stall_sweep_denied is non-zero too and the answer is \`pull_requests: write\` on the App - granted AND accepted on the installation, because a pending permission behaves exactly like an absent one. Or the queue's speculative draft failed the way a BUILD fails rather than the way a runner fails, which the fleet deliberately never auto-requeues: open the mergify/merge-queue/<sha> draft's run and read the failing step.\n\nGrep 'queue stall' in the controller's syslog for the pull request number and the verdict. Do not read this metric alongside ci_queue_nudges and conclude the feature is broken: nudges are EXPECTED to be non-zero and are the problem being absorbed, while this one is the residue. Read with max() across pools - it is a repository fact every pool republishes.\n\nFires after 60m. A queue that is merely busy clears on its own; one that has not moved a green pull request in an hour has stopped." },
   "conditions": [ { "displayName": "ci_queue_stalls_unresolved > 0 for 60m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "3600s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_queue_stalls_unresolved\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_queue_stalls_unresolved\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -396,7 +396,7 @@ EOF
     "The controller can SEE a stalled merge queue and is not allowed to fix it. The parking sweep's twin, and the same watcher's-watcher argument: a refused sweep publishes an unbroken ci_queue_nudges of ZERO, which is exactly what a repository whose queue never stalls publishes.\n\nOne call is refused, and it is the only write the controller makes anywhere: POST repos/<owner>/<repo>/issues/<number>/comments, which needs \`pull_requests: write\`. Almost always the App holds the older read-only grant, or somebody edited the App and nobody ACCEPTED the change on the installation - GitHub treats the edit as a request and a pending permission is indistinguishable from an absent one. Nothing else degrades: demand, draining, recycling and the parking sweep all keep working, which is why this goes unnoticed.\n\nIf the fleet is deliberately observe-only, this alert should NOT be firing - that configuration is queue_stall_max_attempts = 0, which makes the sweep publish without ever attempting the write. A denial means it tried and was refused.\n\nGrep 'queue stall sweep: DENIED' in the controller's syslog for the status: 401 is a bad App key or installation id rather than a missing permission, and 403 is the grant. Fires after 30m - one refusal during a GitHub incident is not a page, six in a row is." },
   "conditions": [ { "displayName": "ci_queue_stall_sweep_denied > 0 for 30m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
-      "filter": "metric.type=\"custom.googleapis.com/github/ci_queue_stall_sweep_denied\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_queue_stall_sweep_denied\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -460,7 +460,7 @@ ensure_log_metric ci_egress_denied \
 # the script silently re-POSTs on every run — the check reports "absent" whether
 # the descriptor is absent or the command does not exist.
 ensure_descriptor() {  # <short name> <description>
-  local short="$1" desc="$2" type="custom.googleapis.com/github/$1" token status
+  local short="$1" desc="$2" type="custom.googleapis.com/ci/$1" token status
   token="$(api_token)"
   [ -n "$token" ] || { echo "no access token — is the proxy bypass set?" >&2; return 1; }
   local base="https://monitoring.googleapis.com/v3/projects/$PROJECT/metricDescriptors"

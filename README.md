@@ -681,10 +681,22 @@ that image a real answer is separate work, not a line in this one.
 
 ## Telemetry
 
-Every pool publishes the same series under `custom.googleapis.com/github/`, on
+Every pool publishes the same series under `custom.googleapis.com/ci/`, on
 a `generic_node` resource labelled `repo` and `pool`, through one publisher
 (`scripts/telemetry.sh`). One fleet dashboard covers every repository with no
 per-repo dashboard code.
+
+**That prefix is load-bearing, and it is not just a dashboard.** The hosts'
+autoscaler scales on `<prefix>/ci_demand`, and the alert policies select on
+`<prefix>/...`. The controller writes it (`modules/ci-runner-controller`), the
+pool reads it (`modules/ci-runner-host-pool`), and the two modules can be
+instantiated independently — so Terraform does not make them agree. When they
+disagree nothing errors: the MIG reports `targetSize 0` and `isStable: true`,
+the autoscaler files a `MISSING_CUSTOM_METRIC_DATA_POINTS` status detail nobody
+reads, and in `ONLY_UP` mode the pool stays at zero while every job queues.
+`scripts/ci/check-metric-prefix-agreement.sh` is the join, and it covers the
+alert policies too — the same split that stops the scaling also silences
+`ci_poller_heartbeat`, the alert for a controller that went quiet.
 
 **The pool.** `ci_demand` (queued **and** in-progress — counting queued alone
 collapses to zero the moment work starts), `ci_demand_queued`,
