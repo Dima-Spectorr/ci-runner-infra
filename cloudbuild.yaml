@@ -14,9 +14,9 @@
 # rather than of whoever remembered the flags. See
 # docs/applying-runner-infra.md. The command below stays the way to build an
 # image OUT OF BAND — a warm-cache variant, a bisect, a one-off — and when it
-# is used, _IMAGE_VERSION must be passed explicitly: the trigger's
-# `g$SHORT_SHA` is expanded by Cloud Build only for a triggered build, and is
-# literal text here.
+# is used, _IMAGE_VERSION must be passed explicitly. Left empty, the `guard`
+# step derives `g<short sha>` from the commit — and a hand-typed submit has no
+# commit, so it refuses rather than stamping something ambiguous.
 #
 #   gcloud builds submit --config cloudbuild.yaml \
 #     --project=<project> \
@@ -73,6 +73,25 @@ options:
   logging: CLOUD_LOGGING_ONLY
   # Packer drives a build VM; the builder itself needs no muscle.
   machineType: E2_HIGHCPU_8
+  #
+  # NO `dynamicSubstitutions` HERE, DELIBERATELY, AND IT WAS TRIED. The version
+  # this build stamps used to come from the trigger as `g$SHORT_SHA` — one
+  # substitution referenced inside another's value, which resolves only under
+  # that option. Two measurements, both against this file's own trigger:
+  #
+  #   build `68004298`  no option    `_IMAGE_VERSION` reached step 0 as the
+  #                                  literal `g$SHORT_SHA`, contradicting the
+  #                                  documented "for a build invoked by a
+  #                                  trigger it is always set to true"
+  #   build `97eeb41d`  option on    identical. Setting it in the build config
+  #                                  does not reach a substitution the TRIGGER
+  #                                  supplies; by then the value is fixed.
+  #
+  # Those were the trigger's only two builds, so the image pipeline had never
+  # produced an image — invisible because nothing downstream goes looking for a
+  # version that should exist. The nesting is gone rather than made to work:
+  # `SHORT_SHA` is a built-in substitution, always defined, and referencing it
+  # directly inside a step (below) needs no option and no vendor promise.
 
 steps:
   - id: guard
@@ -82,15 +101,67 @@ steps:
       - -c
       - |
         set -euo pipefail
-        # An unversioned image cannot be pinned by a consumer, and an image no
-        # consumer can pin is how a fleet ends up running N different hosts.
-        [ -n "${_IMAGE_VERSION}" ] || { echo "_IMAGE_VERSION is required"; exit 1; }
-        [ -n "${_ZONE}" ] || { echo "_ZONE is required"; exit 1; }
-        [ -n "${_NETWORK_TAG}" ] || { echo "_NETWORK_TAG is required (IAP firewall target tag)"; exit 1; }
+        # SINGLE QUOTES, and they carry the whole point. Cloud Build pastes a
+        # substitution's value into this script as text, so a value that still
+        # holds a `$` is handed to bash to expand a SECOND time. That is how
+        # this step reported `SHORT_SHA: unbound variable` — a shell error
+        # about a name that is not a shell variable at all. Single-quoted, the
+        # value is inert whatever it contains, and the check below is what
+        # reports on it.
+        IMAGE_VERSION='${_IMAGE_VERSION}'
+        SHORT_SHA='${SHORT_SHA}'
+        ZONE='${_ZONE}'
+        NETWORK_TAG='${_NETWORK_TAG}'
+        IMAGE_STORAGE_LOCATION='${_IMAGE_STORAGE_LOCATION}'
+        # WHERE THE DEFAULT VERSION IS DECIDED — here, in a step, and not in the
+        # trigger. A step's text is substituted directly, so `${SHORT_SHA}` two
+        # lines up is the commit and nothing has to resolve it twice.
+        #
+        # `g` and not the bare sha: the image is `<family>-<version>`, the
+        # version is the only part a human reads to tell two images apart, and a
+        # suffix starting with a digit is indistinguishable from a truncated
+        # version string. `g` is git's own marker for an abbreviated object name
+        # (`git describe` prints `v1.2.3-4-gabc1234`) and it guarantees the
+        # suffix starts with a letter, which a GCE image name requires.
+        if [ -z "$$IMAGE_VERSION" ]; then
+          # Empty only for a build with no commit — an out-of-band
+          # `gcloud builds submit`, which must say which version it is stamping.
+          # An unversioned image cannot be pinned by a consumer, and an image no
+          # consumer can pin is how a fleet ends up running N different hosts.
+          [ -n "$$SHORT_SHA" ] || {
+            echo "_IMAGE_VERSION is required: this build has no SHORT_SHA to derive one from,"
+            echo "so it was not invoked by a trigger. Pass _IMAGE_VERSION explicitly."
+            exit 1
+          }
+          IMAGE_VERSION="g$$SHORT_SHA"
+        fi
+        # A caller-pinned version with a `$` in it never resolved. Non-empty, so
+        # every -n check passes, and what it reaches is `image_name` — the build
+        # spends forty minutes and creates an image genuinely called
+        # `ci-runner-host-g$SHORT_SHA`, which the next consumer to pin a version
+        # cannot tell from a deliberate name.
+        case "$$IMAGE_VERSION" in
+          *\$$*)
+            echo "_IMAGE_VERSION is '$$IMAGE_VERSION' — a substitution in it was never resolved."
+            echo "Nesting one substitution inside another does not work here (see options above)."
+            echo "Pass a literal _IMAGE_VERSION, or leave it empty and let this step derive one."
+            exit 1
+            ;;
+        esac
+        [ -n "$$ZONE" ] || { echo "_ZONE is required"; exit 1; }
+        [ -n "$$NETWORK_TAG" ] || { echo "_NETWORK_TAG is required (IAP firewall target tag)"; exit 1; }
         # Required, not optional: leaving it to GCE picks a multi-region that
         # gcp.resourceLocations rejects, and it rejects it at the END of the
         # build, after every provisioner has already run.
-        [ -n "${_IMAGE_STORAGE_LOCATION}" ] || { echo "_IMAGE_STORAGE_LOCATION is required (e.g. the build region)"; exit 1; }
+        [ -n "$$IMAGE_STORAGE_LOCATION" ] || { echo "_IMAGE_STORAGE_LOCATION is required (e.g. the build region)"; exit 1; }
+        # LAST, after every check: handed on as a file rather than re-derived,
+        # because three later steps name the version and three copies of the
+        # logic above are three chances for the image to be published under a
+        # name the scan report does not use. Written only once this step has
+        # decided the build may proceed, so the file's existence means the
+        # version in it is the agreed one.
+        printf '%s' "$$IMAGE_VERSION" > /workspace/image_version
+        echo "image version: $$IMAGE_VERSION"
 
   # Runs on the gcloud builder, NOT on hashicorp/packer: the build VM has no
   # external IP, so Packer connects over an IAP tunnel, and Packer shells out to
@@ -103,6 +174,8 @@ steps:
       - -c
       - |
         set -euo pipefail
+        # Decided by `guard`, not re-derived. See the note there.
+        IMAGE_VERSION="$$(cat /workspace/image_version)"
         curl -fsSL -o /tmp/packer.zip \
           "https://releases.hashicorp.com/packer/${_PACKER_VERSION}/packer_${_PACKER_VERSION}_linux_amd64.zip"
         # python3, not unzip: the gcloud builder ships no unzip, and apt-getting
@@ -129,7 +202,7 @@ steps:
           -var "network_tags=[\"${_NETWORK_TAG}\"]" \
           -var "image_family=${_IMAGE_FAMILY}" \
           -var "image_storage_locations=[\"${_IMAGE_STORAGE_LOCATION}\"]" \
-          -var "image_version=${_IMAGE_VERSION}" \
+          -var "image_version=$$IMAGE_VERSION" \
           -var "runner_version=${_RUNNER_VERSION}" \
           -var "warm_cache_script=${_WARM_CACHE_SCRIPT}" \
           -var "vuln_fail_on=${_VULN_FAIL_ON}" \
@@ -172,9 +245,9 @@ steps:
         fi
         if [ -n "${_SBOM_BUCKET}" ]; then
           gcloud storage cp -r image-scan/* \
-            "gs://${_SBOM_BUCKET}/ci-host-image/${_IMAGE_FAMILY}-${_IMAGE_VERSION}/" \
+            "gs://${_SBOM_BUCKET}/ci-host-image/${_IMAGE_FAMILY}-$$IMAGE_VERSION/" \
             --project="$PROJECT_ID" || echo "WARNING: publishing the SBOM failed; it is still in this log"
-          echo "SBOM + scan: gs://${_SBOM_BUCKET}/ci-host-image/${_IMAGE_FAMILY}-${_IMAGE_VERSION}/"
+          echo "SBOM + scan: gs://${_SBOM_BUCKET}/ci-host-image/${_IMAGE_FAMILY}-$$IMAGE_VERSION/"
         else
           echo "WARNING: _SBOM_BUCKET is unset — the SBOM and scan report exist only in this build's workspace, which is discarded."
         fi
@@ -204,7 +277,7 @@ steps:
       - -c
       - |
         set -euo pipefail
-        gcloud compute images describe "${_IMAGE_FAMILY}-${_IMAGE_VERSION}" \
+        gcloud compute images describe "${_IMAGE_FAMILY}-$$IMAGE_VERSION" \
           --project="$PROJECT_ID" \
           --format="value(name,status,diskSizeGb)"
         echo "Pin this exact name in the pool's `image` variable — not the family."
