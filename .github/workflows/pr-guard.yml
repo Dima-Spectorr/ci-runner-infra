@@ -156,8 +156,18 @@ jobs:
     # never be killed between a merge call and the line that records it, whereas
     # this only reads and comments, and a comment describing the previous push
     # is worse than no comment at all.
+    #
+    # THE `job-` PREFIX IS LOAD-BEARING, AND IT COST A DEBUGGING SESSION. This
+    # group is evaluated in the CALLER's context, and a caller that declares its
+    # own top-level `concurrency` — which several repositories' gates require —
+    # will reach for `pr-guard-<number>` as the obvious name. Two identical
+    # groups, one of them `cancel-in-progress`, and the called job cancels the
+    # run that called it. The failure is silent in the worst way: zero steps, no
+    # log, no annotation, and `completed_at` one second BEFORE `started_at`,
+    # which is indistinguishable from a lost runner. A name no caller would pick
+    # removes the collision rather than documenting it.
     concurrency:
-      group: pr-guard-${{ github.event.pull_request.number || github.ref }}
+      group: pr-guard-job-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
 
     permissions:

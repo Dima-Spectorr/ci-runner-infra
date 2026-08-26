@@ -656,6 +656,10 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
 permissions:
   contents: read
+# NOT `pr-guard-<number>`. See below — that is the callee's own group name.
+concurrency:
+  group: pr-guard-caller-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 jobs:
   guard:
     # uses: …/.github/workflows/pr-guard.yml@<the sha from the lane example>
@@ -668,6 +672,18 @@ jobs:
       enforce-freshness: false
       enforce-overlap: false
 ```
+
+**Do not give the caller the callee's concurrency group.** `pr-guard.yml`
+declares `pr-guard-job-<number>` on its own job, and that expression is evaluated
+in *your* repository's context. Several repositories require every workflow to
+declare a top-level `concurrency:` — and the obvious name to reach for there is
+`pr-guard-<number>`, which is one rename away from what the callee used to use.
+When the two groups match and one of them cancels in progress, the called job
+cancels the run that called it. What you see is a job with **zero steps, no log,
+no annotation, and `completed_at` one second before `started_at`** — which is
+byte-for-byte what a lost runner looks like, and sends you to the pool to
+investigate a workflow bug. The `job-` infix exists to make the collision
+impossible rather than merely documented; keep the caller's name distinct anyway.
 
 ### The pool images do not ship `gh`
 
