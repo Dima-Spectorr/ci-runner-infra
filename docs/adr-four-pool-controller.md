@@ -126,6 +126,18 @@ alternative:
 
 ## Consequences
 
+> **Partly superseded (#434).** The four-pool shape stands. The *derived ceiling*
+> below does not: it read `max_parallel_checks` out of the served repository's
+> `.mergify.yml`, and Mergify has been removed from every repository in the
+> fleet. The merge lane that replaced it publishes no concurrency for anything to
+> read, so a merge-queue pool's ceiling is now `max_hosts` and nothing else —
+> which is what the derivation already failed open to from the day the last
+> `.mergify.yml` was deleted. Retired with it: `Contents: read`, the
+> `python3-yaml` dependency, and six of the seven metrics. The seventh,
+> `ci_queue_jobs_per_check`, is observed rather than configured and survives as
+> the number to size `max_hosts` by. The three consequences that follow are kept
+> as written, because an ADR records what was decided.
+
 **New GitHub App permission: `Contents: read`.** This is the one that can make
 the derivation fail open *permanently* rather than transiently, so it is called
 out here and in the onboarding steps. Without it the read is a 403, the pool

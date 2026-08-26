@@ -240,48 +240,21 @@ output "metric_names" {
       # lower bound, so an apparently under-scaled pool may simply not have been
       # counted.
       "ci_demand_runs_skipped",
-      # --- the merge queue's own ceiling --------------------------------------
+      # --- the merge queue ----------------------------------------------------
       # Published ONLY by a pool whose role is `merge-queue`, and absent on every
-      # CI pool — a CI pool's work comes from people pushing commits, which no
-      # configuration file bounds. Absence here is therefore normal and carries
-      # meaning; do not alert on it.
+      # CI pool. Absence here is normal and carries meaning; do not alert on it.
       #
-      # The pair to read together is ci_queue_capacity_wanted_hosts against
-      # ci_queue_capacity_hosts. Equal is healthy. `wanted` above `capacity` is
-      # the reported bottleneck in its diagnosable form: Mergify is configured
-      # to run more speculative checks at once than this pool is allowed to grow
-      # for, so the surplus checks WAIT — pending, never failed, on a pull
-      # request whose own CI is already green. Alert on the comparison, which
-      # needs no per-repository threshold, rather than on either number.
-      "ci_queue_capacity_hosts",
-      "ci_queue_capacity_wanted_hosts",
-      # The inputs the ceiling was derived from, published so the derivation can
-      # be checked from a dashboard instead of by reading a controller log.
-      # ci_queue_parallel_checks is the summed `max_parallel_checks` of the
-      # repository's queues; ci_queue_jobs_per_check is the observed high-water
-      # number of this pool's jobs in one run. Their product over the pool's
-      # slots is ci_queue_capacity_wanted_hosts.
-      "ci_queue_parallel_checks",
+      # This used to be seven series describing a ceiling DERIVED from the
+      # repository's `.mergify.yml`. Mergify is gone fleet-wide and the merge lane
+      # publishes no concurrency to read, so the ceiling is Terraform's
+      # `max_hosts` and the six derived series went with the derivation.
+      #
+      # This one is observed rather than configured — the high-water number of
+      # this pool's jobs in one check run — so it survived its consumer. It is
+      # what a human sizes `max_hosts` by now that nothing sizes it automatically:
+      # multiply it by the parallel merges you want and divide by the slots per
+      # host.
       "ci_queue_jobs_per_check",
-      # Read from the configuration, reported, and deliberately NOT multiplied
-      # into the ceiling: in `parallel` mode Mergify validates a batch as ONE
-      # speculative pull request, so a wider batch clears more of the backlog
-      # per check run rather than needing more runners. It is published because
-      # the opposite intuition is the natural one.
-      "ci_queue_batch_size",
-      # Jobs the ceiling removed from the published demand this tick. Expected
-      # to be flat zero: real demand is measured from jobs Mergify has already
-      # launched, and Mergify launches at most what its own config allows. A
-      # non-zero value is a fault to go and read — a mislabelled workflow
-      # reaching the queue pool, or a queue narrowed while runs were in flight.
-      "ci_queue_demand_clamped",
-      # How stale the configuration behind the ceiling is. The capacity rule
-      # FAILS OPEN, so a controller that has lost access to the repository's
-      # `.mergify.yml` keeps enforcing the last ceiling it derived and looks
-      # entirely healthy — this is the only series that would say otherwise.
-      # `-1` means it has never been read at all. Alert above a small multiple
-      # of the sweep interval.
-      "ci_queue_config_age_seconds",
       # --- work, as opposed to pool ------------------------------------------
       # Every series above describes the POOL. These two describe what it RAN,
       # labelled by workflow, which is the only way the fleet-wide questions

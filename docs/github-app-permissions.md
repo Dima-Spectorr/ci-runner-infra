@@ -32,7 +32,14 @@ Two facts shape everything below:
 | **Actions** | Read | `GET /repos/{owner}/{repo}/actions/runs`, `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs` | the controller sees no demand, publishes none, and the pool never scales out. Reads on every chart as a quiet repository |
 | **Checks** | Read | `GET /repos/{owner}/{repo}/commits/{ref}/check-runs` | the merge-queue **parking detector** can never report. Signalled: `ci_parked_sweep_denied` non-zero, log `parked sweep: DENIED`, `parkeddenied` alert after 30 min |
 | **Pull requests** | Read | `GET /repos/{owner}/{repo}/pulls?state=open` | same detector, one step earlier — log `parked sweep: cannot list open pull requests` |
-| **Contents** | Read | `GET /repos/{owner}/{repo}/contents/{path}` | the merge-queue pool **cannot read `.mergify.yml`** and cannot derive its own size. Fails open: it keeps the Terraform `max_hosts` you typed, forever, and says so only in a log line |
+
+**`Contents` is no longer on this list**, and if your App still has it, revoke it.
+It bought exactly one call — `GET /repos/{owner}/{repo}/contents/.mergify.yml`,
+so a merge-queue pool could derive its own ceiling from the repository's Mergify
+configuration. Mergify is gone from every repository in the fleet, the merge lane
+publishes no concurrency for anything to read, and the derivation was deleted
+along with it. That was the only path in the entire control plane that read a
+repository's FILES.
 
 Paths are written as GitHub documents them, so each one is directly usable —
 `gh api repos/<owner>/<repo>/actions/runners` drops the leading `/` and `gh`
@@ -104,8 +111,8 @@ Profile picture → **Settings** (or, for an org-owned App, the org's Settings) 
 events** → Repository permissions → set the dropdown → **Save changes**.
 
 Use the "Add a note to users" box. The note is what the approver reads in the
-notification email, and "the merge-queue pool needs to read `.mergify.yml` to
-size itself" is a far better prompt to act on than a bare permission name.
+notification email, and "the pool cannot register a runner without this" is a far
+better prompt to act on than a bare permission name.
 
 **Step 2 — every installation owner accepts it.** GitHub emails each org owner
 or user with the request; the request also appears on the installation's own
@@ -116,8 +123,7 @@ is installed on more than one account, each one accepts separately.
 
 **Step 3 — nothing.** No apply, no restart, no redeploy. The controller mints a
 fresh installation token routinely and the next one carries the new permission;
-`Contents: read` starts working within one read interval (300 s), the parked
-sweep within one sweep.
+the demand sweep picks it up on its next tick, the parked sweep within one sweep.
 
 ## How to verify it actually landed
 
@@ -136,23 +142,14 @@ gcloud compute ssh <controller-instance> --zone=<zone> --project=<project> \
   --tunnel-through-iap --command 'journalctl -u ci-controller -n 300 --no-pager'
 ```
 
-Look for `parked sweep: DENIED`, or `mergify config could not be fetched (api
-status 403)`. Both name the status, so a 403 is distinguishable from a
-transient 5xx by reading the line. Silence on both is the pass.
+Look for `parked sweep: DENIED`, which names the status it got back — so a 403 is
+distinguishable from a transient 5xx by reading the line. Silence is the pass.
 
 **2. Read the metrics.** Every one of these is a fleet dashboard series:
 
-* `ci_queue_config_age_seconds` — **the `Contents: read` indicator.** Healthy is
-  under 300. Climbing without bound means the read is failing and the ceiling
-  in force is that old. `-1` means it has never succeeded once, which is what a
-  pool that has never had the permission publishes from its first tick.
 * `ci_parked_sweep_denied` — non-zero is `checks: read` missing.
 * `ci_demand` flat at zero on a repository that is plainly busy — `Actions:
   read`.
-
-There is **no alert policy on `ci_queue_config_age_seconds`** today; the
-`parkeddenied` alert has no counterpart here. Until there is, a missing
-`Contents: read` is found by looking, not by being told.
 
 **3. Ask GitHub, if you hold the private key.** The permissions an installation
 actually has come back on `GET /app/installations/{installation_id}`, which
@@ -169,7 +166,6 @@ holding the key for another reason, and never write it to disk.
 | Hosts boot and no runner appears in the repository's runner list | `Administration` missing or read-only |
 | Pool never scales out; `ci_demand` is flat zero while jobs queue | `Actions: read` |
 | `ci_parked_sweep_denied` non-zero, `parkeddenied` alert | `Checks: read` |
-| Merge-queue pool stuck at exactly `merge_queue_max_hosts`, or at whatever it derived days ago; `ci_queue_config_age_seconds` climbing | `Contents: read` |
 | Any of the above, immediately after somebody "granted the permission" | the installation never accepted it — step 2 |
 
 The last row is worth its own sentence, because it is the one that costs an
