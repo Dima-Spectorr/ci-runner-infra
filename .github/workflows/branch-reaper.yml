@@ -146,8 +146,32 @@ jobs:
     #
     # `cancel-in-progress: false`, never true. A cancelled reaper is a reaper
     # that deleted some branches and wrote no report.
+    #
+    # THE SUFFIX IS LEAD, NOT DECORATION, AND `branch-reaper` ON ITS OWN IS THE
+    # ONE NAME THIS GROUP MAY NOT HAVE.
+    #
+    # A job cannot acquire a concurrency group that its OWN RUN already holds at
+    # workflow level. It does not queue behind it and it does not cancel it —
+    # GitHub fails the job at once, with no runner assigned, no steps and no
+    # log, in about a second. Nothing anywhere names concurrency as the cause.
+    #
+    # The caller template published in `docs/branch-reaper.md` declared exactly
+    # `concurrency: group: branch-reaper` at workflow level, because serialising
+    # a destructive daily sweep is obviously right and the group has to be a
+    # constant to do it. Every consumer copied it, so every consumer's run held
+    # `branch-reaper` before this job asked for it. Measured 2026-08-26: nine of
+    # nine consumer repositories failed the 04:17 sweep in one second, and this
+    # repository — whose own caller happens to declare no workflow-level group —
+    # succeeded eight seconds later on the same cron. Branch cleanup had never
+    # run anywhere but here.
+    #
+    # `github.repository` is the CALLING repository, so this also keeps two
+    # consumers from serialising against each other over a name they share by
+    # coincidence rather than because they touch the same branches. The
+    # `-callee` suffix is what a caller cannot collide with by copying the
+    # obvious name.
     concurrency:
-      group: branch-reaper
+      group: branch-reaper-callee-${{ github.repository }}
       cancel-in-progress: false
     permissions:
       # `contents: read` on the JOB and `Contents: write` on the App. The two

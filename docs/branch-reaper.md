@@ -100,6 +100,28 @@ structural keeps at the bottom.
 There is no pinned-issue equivalent of the lane's queue view. The lane's queue
 is a *live* thing worth bookmarking; a daily sweep's report is a log entry.
 
+### A run that failed in a second with no log
+
+The signature is unmistakable once you have seen it and says nothing at all
+until then: **`conclusion: failure`, zero steps, `runner_id: null`, about one
+second**, `gh run view --log-failed` answering "log not found", and no
+annotation. There is no summary either, so the section above is empty for the
+worst outcome it has.
+
+That is a **concurrency-group collision**, and on this workflow it has exactly
+one cause: your caller's workflow-level `concurrency.group` is the same string
+as the callee job's. A job cannot acquire a group its own run already holds, and
+GitHub fails it instead of queueing it. Compare the two names — the caller's is
+`branch-reaper-caller`, the callee's is `branch-reaper-callee-<owner/repo>` —
+and make them differ. Nothing else in this workflow produces a stepless run.
+
+Its look-alikes are worth knowing apart, because all three read as "the job
+never started": a **lost runner** takes exactly ten minutes rather than one and
+does name a runner; an **Actions expression inside an input description** is a
+startup failure that produces no *jobs* at all rather than one failed job; a
+**cancelled** sweep says cancelled. If steps ran and then it went red, this
+section is the wrong one — read the summary table.
+
 ## Enabling it on a repository
 
 Prerequisite: the repository already runs the merge lane, so the merge App is
@@ -159,9 +181,20 @@ permissions:
 # so the group is constant and the marker is what
 # `check-workflow-concurrency.sh` requires in exchange. An evicted pending run
 # costs nothing: the sweep is idempotent and runs again tomorrow.
+#
+# `-caller`, AND NOT THE BARE `branch-reaper`. The callee declares a group of
+# its own on its job, and a job cannot acquire a group its own run already
+# holds: GitHub fails it instantly with no runner, no steps and no log, naming
+# nothing. This template said `branch-reaper` from the cutover until
+# 2026-08-26, the callee's job said `branch-reaper` too, and every one of the
+# nine repositories that copied it reaped nothing, ever, while its workflow
+# went red each morning for no stated reason. Both halves are fixed — the
+# callee's group is now suffixed `-callee-<repo>` — and either one alone is
+# enough; they are both here because a consumer pinned to an older callee is
+# only fixed by this half.
 # concurrency-serialization: intentional — one sweep at a time
 concurrency:
-  group: branch-reaper
+  group: branch-reaper-caller
   cancel-in-progress: false
 
 jobs:
