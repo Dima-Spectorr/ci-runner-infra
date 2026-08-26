@@ -265,13 +265,6 @@ locals {
     # be repository-wide rather than pool-wide, which changes where it is CALLED
     # from and not what is delivered.
     file("${path.module}/scripts/parked-decision.sh"),
-    # The merge-queue STALL rule, the parking rule's complement and the only one
-    # in this list whose verdict causes a WRITE. Concatenated on every pool for
-    # the same one-binary reason — and note that shipping it here does not by
-    # itself let it act: the write needs `pull requests: write` on the App, so a
-    # fleet whose installation was never upgraded runs this exact code and
-    # reports its own denial instead of acting.
-    file("${path.module}/scripts/queue-stall-decision.sh"),
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/watchdog-decision.sh"),
     # The merge-queue pool's ceiling rule. On EVERY pool, like the two above:
@@ -863,13 +856,6 @@ resource "google_compute_instance_template" "controller" {
     # The queue's branch, so the parking sweep can tell a pull request that will
     # never be admitted from one that is simply waiting its turn.
     "ci-queue-base" = var.queue_base_branch
-
-    # The stall sweep's two thresholds, alongside the branch it compares against.
-    # `max-attempts` doubles as the switch: zero makes the sweep observe and
-    # publish and never comment, which is the shape a fleet runs in until its
-    # App installation accepts `pull requests: write`.
-    "ci-queue-stall-after-seconds" = tostring(var.queue_stall_after_seconds)
-    "ci-queue-stall-max-attempts"  = tostring(var.queue_stall_max_attempts)
 
     # Empty unless autohealing is on. The startup script starts the liveness
     # responder only when this key has a value, so the default path opens no

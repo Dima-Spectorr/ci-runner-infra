@@ -377,30 +377,6 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
-    queuestuck) cat <<EOF
-{ "displayName": "CI runners / the merge queue is stalled and the fleet cannot clear it",
-  "combiner": "OR",
-  "documentation": { "mimeType": "text/markdown", "content":
-    "A pull request is open, admissible and fully green, the merge queue is not moving it, and the controller's nudge did not fix it. Everything that reports anything reports health here: the merge box says ready, every check is a green tick, and the pool is idle. The only other surface that would ever notice is a human wondering why something has not landed - which on this fleet took 17 and 18 hours on two pull requests in one day.\n\nThis series counts ONLY the stalls the controller could see and could not clear, so it is already past the automation. Two causes, and the log tells them apart. Either the comment was refused, in which case ci_queue_stall_sweep_denied is non-zero too and the answer is \`pull_requests: write\` on the App - granted AND accepted on the installation, because a pending permission behaves exactly like an absent one. Or the queue's speculative draft failed the way a BUILD fails rather than the way a runner fails, which the fleet deliberately never auto-requeues: open the mergify/merge-queue/<sha> draft's run and read the failing step.\n\nGrep 'queue stall' in the controller's syslog for the pull request number and the verdict. Do not read this metric alongside ci_queue_nudges and conclude the feature is broken: nudges are EXPECTED to be non-zero and are the problem being absorbed, while this one is the residue. Read with max() across pools - it is a repository fact every pool republishes.\n\nFires after 60m. A queue that is merely busy clears on its own; one that has not moved a green pull request in an hour has stopped." },
-  "conditions": [ { "displayName": "ci_queue_stalls_unresolved > 0 for 60m",
-    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "3600s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_queue_stalls_unresolved\" AND resource.type=\"generic_node\"",
-      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
-  "notificationChannels": [ "$channel" ] }
-EOF
-    ;;
-    queuestalldenied) cat <<EOF
-{ "displayName": "CI runners / the stall sweep is being refused",
-  "combiner": "OR",
-  "documentation": { "mimeType": "text/markdown", "content":
-    "The controller can SEE a stalled merge queue and is not allowed to fix it. The parking sweep's twin, and the same watcher's-watcher argument: a refused sweep publishes an unbroken ci_queue_nudges of ZERO, which is exactly what a repository whose queue never stalls publishes.\n\nOne call is refused, and it is the only write the controller makes anywhere: POST repos/<owner>/<repo>/issues/<number>/comments, which needs \`pull_requests: write\`. Almost always the App holds the older read-only grant, or somebody edited the App and nobody ACCEPTED the change on the installation - GitHub treats the edit as a request and a pending permission is indistinguishable from an absent one. Nothing else degrades: demand, draining, recycling and the parking sweep all keep working, which is why this goes unnoticed.\n\nIf the fleet is deliberately observe-only, this alert should NOT be firing - that configuration is queue_stall_max_attempts = 0, which makes the sweep publish without ever attempting the write. A denial means it tried and was refused.\n\nGrep 'queue stall sweep: DENIED' in the controller's syslog for the status: 401 is a bad App key or installation id rather than a missing permission, and 403 is the grant. Fires after 30m - one refusal during a GitHub incident is not a page, six in a row is." },
-  "conditions": [ { "displayName": "ci_queue_stall_sweep_denied > 0 for 30m",
-    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_queue_stall_sweep_denied\" AND resource.type=\"generic_node\"",
-      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
-  "notificationChannels": [ "$channel" ] }
-EOF
-    ;;
     egressdenied) cat <<EOF
 { "displayName": "CI runners / egress refused",
   "combiner": "OR",
@@ -502,13 +478,6 @@ ensure_descriptor ci_prs_green_and_unqueued "Open pull requests that are green a
 ensure_descriptor ci_parked_prs_skipped     "Pull requests the parking sweep did not examine. Non-zero makes ci_prs_green_and_unqueued a lower bound."
 ensure_descriptor ci_pinned_jobs_host_vanished "Jobs found RUNNING on a host that no longer exists, counted per job and before any per-run de-duplication. Such a job reports no conclusion at all until GitHub's 24-hour timeout, so everything waiting on its status - a merge queue above all - waits out its own timeout instead. Non-zero is live work that lost its machine; grep 'went away under a running job' for the instance."
 ensure_descriptor ci_parked_sweep_denied    "Parking sweeps GitHub refused (401/403/404). Non-zero means ci_prs_green_and_unqueued is inert rather than zero. Either call can be the refused one and they need different permissions - listing pull requests needs 'pull_requests: read', reading check runs needs 'checks: read' - and a bad App key or installation id reads the same, so grep 'parked sweep: DENIED' for which."
-# The stall sweep, the parking sweep's complement. Same publication contract:
-# repository facts republished under every pool label, read with max().
-ensure_descriptor ci_queue_nudges                 "Mergify nudges the controller posted, labelled 'refresh' or 'queue'. NOT an error count and healthy above zero: each one is a merge that would otherwise have waited for a human to notice. Watch the trend - if it does not fall after a fleet fix, the fleet was not fixed."
-ensure_descriptor ci_queue_stalls_unresolved      "Stalled pull requests the controller saw and could NOT clear: the comment was refused, or the queue's draft failed the way a build fails rather than the way a runner fails. This is the residue past the automation and the one a human acts on - everything it counts stays stuck."
-ensure_descriptor ci_queue_stall_attempts_exhausted "Pull requests that spent the whole nudge budget on one head sha. Non-zero means the infrastructure-versus-diff classification let something through, or a repository is broken against its own base. Either way the automation has stopped rather than looping, and says so here."
-ensure_descriptor ci_queue_stall_prs_skipped      "Pull requests the stall sweep did not examine. Non-zero makes every stall series a lower bound."
-ensure_descriptor ci_queue_stall_sweep_denied     "The controller can see a stalled queue and may not fix it. One call is refused - POST issues/<n>/comments - and it needs 'pull_requests: write' on the App, GRANTED and then ACCEPTED on the installation. Zero here with queue_stall_max_attempts = 0 is the deliberate observe-only shape, not a denial."
 # Published by the HOST once per boot, not by the controller per tick. Declared
 # here for the same reason as the rest — a pool that has never booted a host
 # still needs its alerting provisioned — and it matters more here: these series
@@ -545,7 +514,7 @@ no_such_metric() {
 }
 
 deferred=""
-for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied hostvanished queuestuck queuestalldenied egressdenied; do
+for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied hostvanished egressdenied; do
   policy_json "$key" >"$tmp/p.json"
   # Neither of these ends in `| head -1`, and that is deliberate. This script
   # runs `set -euo pipefail`; under both options a reader that stops early sends

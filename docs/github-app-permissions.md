@@ -31,7 +31,7 @@ Two facts shape everything below:
 | **Administration** | Read & write | `POST /repos/{owner}/{repo}/actions/runners/registration-token`, `GET /repos/{owner}/{repo}/actions/runners` | **hosts cannot register.** The one permission here that fails loudly — a host boots, cannot get a token, and the pool serves nothing |
 | **Actions** | Read | `GET /repos/{owner}/{repo}/actions/runs`, `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs` | the controller sees no demand, publishes none, and the pool never scales out. Reads on every chart as a quiet repository |
 | **Checks** | Read | `GET /repos/{owner}/{repo}/commits/{ref}/check-runs` | the merge-queue **parking detector** can never report. Signalled: `ci_parked_sweep_denied` non-zero, log `parked sweep: DENIED`, `parkeddenied` alert after 30 min |
-| **Pull requests** | Read & write | read: `GET /repos/{owner}/{repo}/pulls?state=open`; write: `POST /repos/{owner}/{repo}/issues/{number}/comments` | read: same detector, one step earlier — log `parked sweep: cannot list open pull requests`. write: the **stall recovery** cannot nudge Mergify — `ci_queue_stall_sweep_denied` non-zero, log `queue stall sweep: DENIED`, and every stalled pull request waits for a human |
+| **Pull requests** | Read | `GET /repos/{owner}/{repo}/pulls?state=open` | same detector, one step earlier — log `parked sweep: cannot list open pull requests` |
 | **Contents** | Read | `GET /repos/{owner}/{repo}/contents/{path}` | the merge-queue pool **cannot read `.mergify.yml`** and cannot derive its own size. Fails open: it keeps the Terraform `max_hosts` you typed, forever, and says so only in a log line |
 
 Paths are written as GitHub documents them, so each one is directly usable —
@@ -46,28 +46,28 @@ by the account job code runs as — the identity split in
 [`modules/ci-runner-identity`](../modules/ci-runner-identity/main.tf), enforced
 in every consumer's CI by `scripts/ci/check-ci-runner-identity-split.sh`.
 
-`Pull requests: read & write` is the second one worth stopping on, because it is
-the only permission on this list that lets the fleet **change** anything in a
-consumer repository, and it was added deliberately rather than inherited. It
-exists for [merge-queue stall recovery](merge-queue-stall-recovery.md): the
-controller posts `@mergifyio refresh` or `@mergifyio queue` on a pull request
-that is open, green and going nowhere. What matters is the shape of the blast
-radius, so state it plainly:
+`Pull requests: READ`, and read only, is the second one worth stopping on —
+because it used to be `read & write`, and the removal is the point.
 
-* **It can post a comment on a pull request.** That is the entire write surface
-  the controller uses — one endpoint, one body shape, built in `gh_api_post`.
-* **It cannot merge anything.** Merging is `Contents: write`, which this App
-  does not hold and must not be given. The nudge asks Mergify to re-evaluate;
-  Mergify then applies the repository's own rules, which are unchanged. A wrong
-  nudge cannot land a pull request that the repository would not have landed.
-* **It cannot push, edit code, change a branch, or alter a review.** Every one
-  of those needs a permission that is not on this list.
-* **It cannot approve.** `Pull requests: write` does permit submitting a review
-  via the API, but the controller never calls that endpoint, and no consumer
-  repository should count an App approval as a human one.
+The write existed for merge-queue stall recovery: the controller posted
+`@mergifyio refresh` or `@mergifyio queue` on a pull request that was open,
+green and going nowhere. Mergify has been removed from every repository in the
+fleet and [the merge lane](merge-lane.md) replaced it, so the sweep, its
+`gh_api_post` call site and the two alerts that watched it are all deleted.
 
-So the worst outcome of a bug in the stall rule is a comment nobody wanted, and
-the ceiling in `queue-stall-decision.sh` bounds even that at three per head sha.
+**The only write this App still holds is `Administration`, and it buys exactly
+one thing: a runner registration token.** Nothing on this list can change the
+CONTENT of a consumer repository — it cannot comment, merge, push, edit a
+branch, alter a review, or approve. That is worth more than the recovery it
+replaced, and it is the state to keep the App in: every future request for a
+content write on this identity should be answered with a separate App, the way
+merge authority was.
+
+Merge authority deliberately lives elsewhere. The merge lane's App is a
+different identity with its own installation and its own blast radius,
+precisely so that `Contents: write` never lands on the identity that self-hosted
+job code runs beside. That argument is unchanged and is the reason this list
+must stay read-only.
 
 ## Who grants it
 
@@ -147,10 +147,6 @@ transient 5xx by reading the line. Silence on both is the pass.
   in force is that old. `-1` means it has never succeeded once, which is what a
   pool that has never had the permission publishes from its first tick.
 * `ci_parked_sweep_denied` — non-zero is `checks: read` missing.
-* `ci_queue_stall_sweep_denied` — non-zero is `pull requests: write` missing (or
-  still pending acceptance). Its companion `ci_queue_nudges` sitting at a flat
-  zero on a repository whose queue visibly stalls says the same thing more
-  slowly.
 * `ci_demand` flat at zero on a repository that is plainly busy — `Actions:
   read`.
 
@@ -173,7 +169,6 @@ holding the key for another reason, and never write it to disk.
 | Hosts boot and no runner appears in the repository's runner list | `Administration` missing or read-only |
 | Pool never scales out; `ci_demand` is flat zero while jobs queue | `Actions: read` |
 | `ci_parked_sweep_denied` non-zero, `parkeddenied` alert | `Checks: read` |
-| Green pull requests sit unmerged for hours and no nudge comment ever appears; `ci_queue_stall_sweep_denied` non-zero | `Pull requests` still at `read`, or the write upgrade is pending acceptance |
 | Merge-queue pool stuck at exactly `merge_queue_max_hosts`, or at whatever it derived days ago; `ci_queue_config_age_seconds` climbing | `Contents: read` |
 | Any of the above, immediately after somebody "granted the permission" | the installation never accepted it — step 2 |
 
