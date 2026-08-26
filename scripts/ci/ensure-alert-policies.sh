@@ -430,30 +430,68 @@ ensure_log_metric ci_egress_denied \
 # not a cosmetic difference: the write is rejected and the series stays empty
 # while every dashboard shows a metric that simply has no data.
 #
+# THE LABELS MATTER TOO, and only for some filters, which is why this took a
+# while to see. A policy that selects a label by EQUALITY is accepted against a
+# descriptor that declares no labels at all — `ci_drain_verdicts` with
+# `metric.labels.outcome="error"` syncs happily. A policy that NEGATES one is
+# not: `metric.labels.verdict!="hydrated"` is answered
+# `Cannot find metric(s) that match type = ... label = "verdict"`, a 404 naming
+# the label. So a descriptor declared here without its labels blocks its own
+# alert permanently, and does it wearing the costume of the deferred-404 case
+# below — "come back once a host has published" — which will never come true,
+# because the descriptor already exists and it is the label that is missing.
+# Declare the labels for every metric that carries one.
+#
+# POSTing a type that already exists UPDATES it rather than conflicting (200,
+# not 409), so adding a label to this list is enough: there is no delete step and
+# the existing points survive.
+#
+# Observed and deliberately relied on: a label declared with no data behind it
+# does NOT come back on a later GET — the descriptor reads as label-less again.
+# The declaration still counts where it matters, because policy validation
+# happens at write time and the policy, once created, persists. The consequence
+# for the code below is that the "already complete" check never matches for a
+# label with no points yet, so a labelled descriptor is simply re-POSTed on every
+# run. That is the safe direction to fail in, and it is why the check is written
+# as "skip only if every label is already visible" rather than "skip if present".
+#
 # Done over REST, not gcloud: there is no `gcloud monitoring metrics-descriptors`
 # group at all. An existence check written as `gcloud ... describe >/dev/null
 # 2>&1` therefore fails for EVERY metric, including the ones already there, and
 # the script silently re-POSTs on every run — the check reports "absent" whether
 # the descriptor is absent or the command does not exist.
-ensure_descriptor() {  # <short name> <description>
+ensure_descriptor() {  # <short name> <description> [label ...]
   local short="$1" desc="$2" type="custom.googleapis.com/ci/$1" token status
+  shift 2
+  local labels=("$@")
   token="$(api_token)"
   [ -n "$token" ] || { echo "no access token — is the proxy bypass set?" >&2; return 1; }
   local base="https://monitoring.googleapis.com/v3/projects/$PROJECT/metricDescriptors"
 
-  status="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' \
+  status="$(curl -sS --max-time 30 -o "$tmp/desc.get" -w '%{http_code}' \
     -H "Authorization: Bearer $token" "$base/$type")"
   case "$status" in
-    200) return 0 ;;
+    200) # Present is not necessarily complete: a descriptor declared before this
+         # function knew about labels has none, and re-POSTing is what adds them.
+         local missing=0 l
+         for l in ${labels[@]+"${labels[@]}"}; do
+           grep -q "\"key\": \"$l\"" "$tmp/desc.get" || missing=1
+         done
+         [ "$missing" = "0" ] && return 0 ;;
     404) ;;
     *) echo "$PROJECT: cannot read descriptor $type (HTTP $status)" >&2; return 1 ;;
   esac
 
   if [ "$DRY" = "1" ]; then echo "$PROJECT: would declare metric descriptor $type"; return 0; fi
+  local labels_json="" l
+  for l in ${labels[@]+"${labels[@]}"}; do
+    labels_json="$labels_json,{\"key\":\"$l\",\"valueType\":\"STRING\"}"
+  done
+  [ -n "$labels_json" ] && labels_json=",\"labels\":[${labels_json#,}]"
   status="$(curl -sS --max-time 30 -o "$tmp/desc.out" -w '%{http_code}' \
     -X POST "$base" -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
     -d "{\"type\":\"$type\",\"metricKind\":\"GAUGE\",\"valueType\":\"DOUBLE\",
-         \"description\":\"$desc\",\"displayName\":\"$short\"}")"
+         \"description\":\"$desc\",\"displayName\":\"$short\"$labels_json}")"
   case "$status" in
     2*) echo "$PROJECT: declared metric descriptor $type" ;;
     409) echo "$PROJECT: descriptor $type already present" ;;
@@ -466,7 +504,7 @@ ensure_descriptor ci_poller_heartbeat        "1 on every controller tick. Absenc
 ensure_descriptor ci_runner_list_blind_ticks "Consecutive ticks the controller could not read the GitHub runner list. Non-zero means scale-in is suspended."
 ensure_descriptor ci_host_idle_seconds_max   "Longest idle time across warm hosts."
 ensure_descriptor ci_queue_wait_seconds_max  "Longest time a queued job has waited for a slot."
-ensure_descriptor ci_drain_verdicts          "Drain-loop outcomes, labelled by outcome."
+ensure_descriptor ci_drain_verdicts          "Drain-loop outcomes, labelled by outcome." outcome
 ensure_descriptor ci_tick_seconds            "Controller tick duration. Approaching the watchdog threshold means an imminent restart loop in which nothing is published at all."
 # Declared even though the policy reads only ci_slots_missing: the gap is not
 # actionable without the numerator, and a descriptor a dashboard cannot find
@@ -474,7 +512,7 @@ ensure_descriptor ci_tick_seconds            "Controller tick duration. Approach
 # during the incident.
 ensure_descriptor ci_slots_registered        "Slots whose runner agent answers, over RUNNING hosts past their registration grace. Compare with ci_slots_total, which is arithmetic and cannot fall."
 ensure_descriptor ci_slots_missing           "Slots the pool was built with that no agent answers for. Non-zero is capacity that exists on paper only: a host that registered nothing, a host whose slot units died before the agent started, or a slot the host condemned for failing every job it claimed."
-ensure_descriptor ci_prs_green_and_unqueued "Open pull requests that are green and can never enter the merge queue, labelled by the entry condition they fail. A repository fact published under every pool label -- read with max(), never sum()."
+ensure_descriptor ci_prs_green_and_unqueued "Open pull requests that are green and can never enter the merge queue, labelled by the entry condition they fail. A repository fact published under every pool label -- read with max(), never sum()." reason
 ensure_descriptor ci_parked_prs_skipped     "Pull requests the parking sweep did not examine. Non-zero makes ci_prs_green_and_unqueued a lower bound."
 ensure_descriptor ci_pinned_jobs_host_vanished "Jobs found RUNNING on a host that no longer exists, counted per job and before any per-run de-duplication. Such a job reports no conclusion at all until GitHub's 24-hour timeout, so everything waiting on its status - a merge queue above all - waits out its own timeout instead. Non-zero is live work that lost its machine; grep 'went away under a running job' for the instance."
 ensure_descriptor ci_parked_sweep_denied    "Parking sweeps GitHub refused (401/403/404). Non-zero means ci_prs_green_and_unqueued is inert rather than zero. Either call can be the refused one and they need different permissions - listing pull requests needs 'pull_requests: read', reading check runs needs 'checks: read' - and a bad App key or installation id reads the same, so grep 'parked sweep: DENIED' for which."
@@ -483,7 +521,7 @@ ensure_descriptor ci_parked_sweep_denied    "Parking sweeps GitHub refused (401/
 # still needs its alerting provisioned — and it matters more here: these series
 # are absent for long stretches by nature, so waiting for one to appear before
 # the policy can be created means the policy is created after the incident.
-ensure_descriptor ci_cache_hydrate_verdict   "1 per host boot, labelled by verdict. Every value but hydrated means the host registered without the shared cache."
+ensure_descriptor ci_cache_hydrate_verdict   "1 per host boot, labelled by verdict. Every value but hydrated means the host registered without the shared cache." verdict
 ensure_descriptor ci_cache_hydrate_seconds   "Seconds the shared-cache hydrate spent, whatever it decided. Approaching cache_hydrate_budget_seconds means hosts pay the full budget and start cold anyway."
 ensure_descriptor ci_cache_snapshot_age_hours "Age of the snapshot the host read about, recorded before the bounds that may reject it."
 ensure_descriptor ci_cache_snapshot_bytes    "Compressed size of that snapshot. A size that stops changing is a publish that stopped."
@@ -529,6 +567,18 @@ for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsm
   name="${name_all%%$'\n'*}"
   id_all="$(printf '%s\n' "$existing" | awk -F'\t' -v n="$name" '$1==n {print $2}')"
   id="${id_all%%$'\n'*}"
+
+  # Taking the first match keeps the script running, but two policies with one
+  # displayName is a state it must not pass over in silence: this run updates one
+  # of them and the other keeps whatever thresholds it was created with, so the
+  # project pages twice and only one of the pages reflects the file. Found live
+  # as a byte-identical pair — the shape the POST-is-never-retried rule in mon()
+  # predicts, a create that timed out after the server had already accepted it.
+  # Report it and name the survivor; deleting the extra is an
+  # operator decision, not something a sync script should do unprompted.
+  dupes="$(printf '%s\n' "$id_all" | grep -c . || true)"
+  [ "${dupes:-0}" -le 1 ] || {
+    echo "$PROJECT: $dupes policies share the name '$name' — updating ${id##*/} and leaving the rest stale. Delete the extras." >&2; }
 
   if [ "$DRY" = "1" ]; then
     printf '%s: would %s — %s\n' "$PROJECT" "$([ -n "$id" ] && echo update || echo create)" "$name"
