@@ -31,6 +31,12 @@ BUDGET="${BUDGET:-1800}"
 PASS_BUDGET="${PASS_BUDGET:-600}"
 MAX_ACTIONS="${MAX_ACTIONS:-4}"
 REQUIRE_LABEL="${REQUIRE_LABEL:-}"
+# The author whose pin-only updates may merge without the label, and the
+# repository whose pins those are. Empty disables the waiver entirely, which is
+# the default: a repository that has not asked for it keeps a pure label gate.
+# See `lane_is_pin_bump`.
+PIN_BUMP_ACTOR="${PIN_BUMP_ACTOR:-}"
+PIN_BUMP_REPO="${PIN_BUMP_REPO:-ci-runner-infra}"
 PRIORITY_PREFIX="${PRIORITY_PREFIX:-merge-lane/priority-}"
 DRY_RUN="${DRY_RUN:-false}"
 STATUS_ISSUE="${STATUS_ISSUE:-}"
@@ -530,6 +536,7 @@ lane_base_is_vouched() {
   return 1
 }
 
+
 # ---------------------------------------------------------------------------
 # One pass: read every candidate, rank them, act on the best one.
 # Returns 0 if it acted, 1 if there was nothing to do.
@@ -646,7 +653,7 @@ one_pass() {
   local prs_raw='' list_err
   list_err="$(mktemp)"
   if ! prs_raw="$(gh api --paginate "repos/$R/pulls?state=open&base=$LANE_BASE&per_page=100" \
-    --jq '.[] | (.number|tostring), .head.sha, (.draft|tostring), ((.labels // []) | map(.name) | join(",")), ((.title // "") | gsub("[\r\n]"; " "))' 2>"$list_err")"; then
+    --jq '.[] | (.number|tostring), .head.sha, (.draft|tostring), ((.labels // []) | map(.name) | join(",")), ((.title // "") | gsub("[\r\n]"; " ")), (.user.login // "")' 2>"$list_err")"; then
     echo "lane: cannot list the open pull requests on $LANE_BASE — the lane is blind, not idle"
     echo "lane: the list read said: $(tr '\n' ' ' <"$list_err" | cut -c1-400)"
     rm -f "$list_err"
@@ -661,13 +668,13 @@ one_pass() {
 
   local pr_fields=()
   mapfile -t pr_fields <<<"$prs_raw"
-  if [ $((${#pr_fields[@]} % 5)) -ne 0 ]; then
-    echo "lane: the open-pull-request list returned ${#pr_fields[@]} field(s), which is not a whole number of 5-field records — the lane is blind, not idle"
+  if [ $((${#pr_fields[@]} % 6)) -ne 0 ]; then
+    echo "lane: the open-pull-request list returned ${#pr_fields[@]} field(s), which is not a whole number of 6-field records — the lane is blind, not idle"
     LANE_FATAL=1
     return 1
   fi
 
-  local total=$((${#pr_fields[@]} / 5))
+  local total=$((${#pr_fields[@]} / 6))
   local candidates=()
   # `-1`, not `0`, and the test below is `-ge 0`. A deadline that expired on the
   # very FIRST candidate truncates at index 0, and a `-gt 0` test would report
@@ -675,12 +682,16 @@ one_pass() {
   local num sha draft i idx read_count=0 truncated_at=-1
 
   for ((i = 0; i < total; i++)); do
-    idx=$((i * 5))
+    idx=$((i * 6))
     num="${pr_fields[idx]}"
     sha="${pr_fields[idx + 1]}"
     draft="${pr_fields[idx + 2]}"
     local list_labels="${pr_fields[idx + 3]}"
     local list_title="${pr_fields[idx + 4]}"
+    local list_author="${pr_fields[idx + 5]}"
+    # Reset explicitly: a `local` inside a loop body is scoped to the FUNCTION,
+    # so last candidate's waiver would still be set on this one.
+    local pin_waiver=0
     [ -n "$num" ] || continue
 
     # THE DEADLINE, CHECKED BEFORE THE WORK RATHER THAN AFTER IT.
@@ -705,9 +716,14 @@ one_pass() {
     # looked at this and it is not labelled" is a different statement from "the
     # lane has not looked", and the snapshot has to be able to say which.
     if [ -n "$REQUIRE_LABEL" ] && [[ ",$list_labels," != *",$REQUIRE_LABEL,"* ]]; then
-      echo "lane: #$num skip:no-label ($REQUIRE_LABEL)"
-      queue_row 9 "$num" "$list_title" "skip:no-label($REQUIRE_LABEL)" '' '' ''
-      continue
+      if lane_is_pin_bump "$num" "$list_author"; then
+        pin_waiver=1
+        echo "lane: #$num label waived — $list_author, and the diff moves nothing but $PIN_BUMP_REPO pins"
+      else
+        echo "lane: #$num skip:no-label ($REQUIRE_LABEL)"
+        queue_row 9 "$num" "$list_title" "skip:no-label($REQUIRE_LABEL)" '' '' ''
+        continue
+      fi
     fi
 
     # `mergeable` is computed asynchronously and is null until GitHub has done
@@ -753,7 +769,7 @@ one_pass() {
     # where it sits matters more than how often it fires: the loop under it
     # sleeps, and sleeping for a pull request the lane has already decided to
     # skip is precisely the cost that made a pass outlive its job.
-    if [ -n "$REQUIRE_LABEL" ] && [[ ",$labels," != *",$REQUIRE_LABEL,"* ]]; then
+    if [ "$pin_waiver" -eq 0 ] && [ -n "$REQUIRE_LABEL" ] && [[ ",$labels," != *",$REQUIRE_LABEL,"* ]]; then
       echo "lane: #$num skip:no-label ($REQUIRE_LABEL)"
       queue_row 9 "$num" "$title" "skip:no-label($REQUIRE_LABEL)" '' '' ''
       continue
@@ -1051,6 +1067,68 @@ one_pass() {
   done <<<"$ranked"
 
   [ "$PASS_ACTED" -gt 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# THE ONE PULL REQUEST NOBODY IS EVER GOING TO LABEL.
+#
+# Consumers pin this repository's reusable workflows by exact sha and let
+# Dependabot move the pin. Under a label gate that update can never merge: the
+# bot does not label, and a human labelling fourteen repositories every week is
+# the manual step the lane exists to remove. So the fleet either runs an
+# unattended label gate OR it tracks this repository automatically — not both.
+#
+# This is the narrowest waiver that resolves that: ONE configured author, whose
+# diff touches nothing but `.github/workflows/**`, and whose every changed line
+# names this repository's reusable workflows. Anything else — a bot PR that also
+# edits a job, a human PR that only moves a pin — falls back to the label. The
+# waiver decides whether the label is required; it decides NOTHING about
+# green-ness, so a pin bump still merges only when the required checks pass.
+#
+# Costs one API call, and only for an unlabelled pull request by the configured
+# author, so the cheap gate above stays cheap for every ordinary one.
+# ---------------------------------------------------------------------------
+lane_is_pin_bump() {
+  local num="$1" author="$2"
+  [ -n "$PIN_BUMP_ACTOR" ] || return 1
+  [ "$author" = "$PIN_BUMP_ACTOR" ] || return 1
+
+  local files
+  files="$(gh api --paginate "repos/$R/pulls/$num/files?per_page=100" \
+    --jq '.[] | .filename, "@@patch@@", (.patch // ""), "@@end@@"' 2>/dev/null)" || return 1
+  [ -n "$files" ] || return 1
+
+  # A file outside the workflow directory, or a changed line that is not a pin
+  # line, and the waiver is off. Judged on the PATCH rather than on the file
+  # list, because "only workflow files changed" is not the claim being made —
+  # "only the pin moved" is.
+  local line in_patch=0 saw_pin=0
+  while IFS= read -r line; do
+    case "$line" in
+      '@@patch@@') in_patch=1; continue ;;
+      '@@end@@') in_patch=0; continue ;;
+    esac
+    if [ "$in_patch" -eq 0 ]; then
+      case "$line" in
+        .github/workflows/*) continue ;;
+        *) return 1 ;;
+      esac
+    fi
+    case "$line" in
+      '+++'*|'---'*) continue ;;
+      '+'*|'-'*)
+        # `uses:` as well as the repository name: a substring match alone would
+        # accept a line that merely MENTIONS the path — a comment, a doc string
+        # — alongside whatever else that line does.
+        case "$line" in
+          *uses:*"$PIN_BUMP_REPO/.github/workflows/"*) saw_pin=1 ;;
+          *) return 1 ;;
+        esac
+        ;;
+    esac
+  done <<<"$files"
+
+  [ "$saw_pin" -eq 1 ]
 }
 
 # ---------------------------------------------------------------------------

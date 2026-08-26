@@ -240,6 +240,31 @@ on:
         required: false
         default: ''
         type: string
+      pin-bump-actor:
+        description: >-
+          The one author whose pin-only updates may merge WITHOUT the label —
+          in practice `dependabot[bot]`, which is what keeps a repository
+          tracking the shared workflows automatically instead of waiting for
+          someone to label the same bump in every repository every week.
+
+          Narrow on purpose. The waiver applies only when the pull request is
+          by this author AND every changed line names a `pin-bump-repo`
+          reusable workflow; a bot pull request that also edits a job falls
+          back to the label. It waives the LABEL only — required checks and
+          base health still decide whether it merges.
+
+          Empty (the default) disables it, so a repository that has not asked
+          for the waiver keeps a pure label gate.
+        required: false
+        default: ''
+        type: string
+      pin-bump-repo:
+        description: >-
+          The repository whose pins `pin-bump-actor` is trusted to move. A pin
+          line naming anything else is not a pin bump, and the label applies.
+        required: false
+        default: 'ci-runner-infra'
+        type: string
       priority-label-prefix:
         description: >-
           Labels beginning with this prefix carry a number that orders the lane,
@@ -412,6 +437,8 @@ jobs:
           MAX_ACTIONS: ${{ inputs.max-actions }}
           REQUIRE_UP_TO_DATE: ${{ inputs.require-up-to-date }}
           REQUIRE_LABEL: ${{ inputs.require-label }}
+          PIN_BUMP_ACTOR: ${{ inputs.pin-bump-actor }}
+          PIN_BUMP_REPO: ${{ inputs.pin-bump-repo }}
           PRIORITY_PREFIX: ${{ inputs.priority-label-prefix }}
           BASE_HEALTH_GRACE: ${{ inputs.base-health-grace-seconds }}
           STATUS_ISSUE: ${{ inputs.status-issue }}

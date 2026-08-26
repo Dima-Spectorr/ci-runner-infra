@@ -253,6 +253,12 @@ jobs:
       # means "no label required" — so wiring it bare fails OPEN, and a forgotten
       # setting releases the backlog. Widening is a pull request, deliberately.
       require-label: ${{ vars.MERGE_LANE_REQUIRE_LABEL || 'ready-to-merge' }}
+      # Optional, and the one exception to that label. Dependabot's weekly bump
+      # of the pins above is the update nobody is ever going to label by hand in
+      # fourteen repositories — see "Tracking this repository automatically".
+      # Waives the LABEL only, and only for a diff in which every changed line
+      # names a ci-runner-infra reusable workflow.
+      pin-bump-actor: ${{ vars.MERGE_LANE_PIN_BUMP_ACTOR }}
       # Optional. An issue whose body the lane rewrites with the queue after
       # every run — see "Seeing the queue". Unset means the job summary only.
       status-issue: ${{ vars.MERGE_LANE_STATUS_ISSUE }}
@@ -290,6 +296,27 @@ jobs:
 > Dependabot rewrites a `uses:` line and cannot see an input value, so an
 > automatic bump moved the workflow and left the driver a release behind. If you
 > are migrating an older caller, **delete the `implementation-ref` line**.
+>
+> ### Tracking this repository automatically
+>
+> A label gate and "every repository picks up the shared workflows on its own"
+> are in direct conflict, and the conflict is silent. Dependabot opens the pin
+> bump, Dependabot does not label, so under `require-label` that pull request
+> sits open forever — and the repository quietly stops tracking this one while
+> reporting a perfectly healthy lane. The alternative, a human labelling the
+> same bump in fourteen repositories every Monday, is the manual step the lane
+> exists to remove.
+>
+> `pin-bump-actor` resolves it, as narrowly as it can be resolved. Set it to
+> `dependabot[bot]` and an unlabelled pull request **by that author** whose
+> every changed line names a `ci-runner-infra` reusable workflow no longer needs
+> the label. Everything else still does: a bot pull request that also edits a
+> job, a bump of some other action, a human pull request that only moves a pin.
+> And it waives the label ONLY — required checks and base health are unchanged,
+> so a pin bump that turns the repository red still does not merge.
+>
+> Empty is the default, so a repository that has not asked for the waiver keeps
+> a pure label gate.
 >
 > **Pin the COMMIT, not the tag object.** This repository's release tags are
 > *annotated*, so `git/ref/tags/v5.54.0` gives you the sha of the tag object and
