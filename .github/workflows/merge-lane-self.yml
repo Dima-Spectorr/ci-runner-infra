@@ -101,6 +101,10 @@ jobs:
       # operator action, not a commit. Unset means summary only — a repository
       # that never sets it loses nothing but the bookmark.
       status-issue: ${{ vars.MERGE_LANE_STATUS_ISSUE }}
+      # This repository has no label gate, so the waiver changes nothing here
+      # today — it is wired anyway, because the fleet's callers are copied from
+      # this one and a line nobody copies is a line nobody gets.
+      pin-bump-actor: ${{ vars.MERGE_LANE_PIN_BUMP_ACTOR }}
       # ARMED BY A VARIABLE, NOT BY A COMMIT.
       #
       # A `workflow_run` workflow cannot run on the pull request that adds it,
