@@ -657,12 +657,24 @@ variable "runner_labels" {
 variable "role" {
   description = <<-EOT
     What this pool serves: `ci` for ordinary pull-request runs, `merge-queue` for
-    Mergify's speculative validation of a queued pull request.
+    a queue's re-validation of an already-green pull request.
+
+    The merge lane produces none of those — it merges what is already green and
+    re-runs nothing — so on a current repository this pool exists at
+    `max_hosts = 0`. The role is kept because the routing contract and the
+    disjoint label sets are the same shape everywhere; collapsing it away is
+    #274.
 
     It changes nothing about the hosts. It is the pool's declared PURPOSE, and it
     travels in the controller's table so the two workloads can be told apart
-    where the difference matters: sizing a queue pool from the queue's own width,
-    and asserting that the label sets of the two roles are disjoint.
+    where the difference matters: publishing the merge-queue series, and
+    asserting that the label sets of the two roles are disjoint.
+
+    A queue pool's size used to be DERIVED from `max_parallel_checks` in the
+    repository's `.mergify.yml`. That is gone with Mergify (#434) — the merge
+    lane publishes no concurrency for anything to read — so `max_hosts` is the
+    ceiling, full stop. Size it by hand from `ci_queue_jobs_per_check`, which is
+    still published and is observed rather than configured.
   EOT
   type        = string
   default     = "ci"

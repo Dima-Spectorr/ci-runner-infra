@@ -54,14 +54,11 @@ posture you opt into knowingly. Read [Windows](#windows) before you declare one.
    it, and a pending permission behaves exactly like one that was never
    granted.
 
-   It needed **`Contents: read`** as well for a merge-queue pool sized from the
-   repository's own `.mergify.yml`. A new repository does not stand one up —
-   there is no Mergify and no queue to size for, so both merge-queue pools are
-   declared at `max_hosts = 0` (step 8). Grant it only if you are working on an
-   existing repository that still carries a sized merge-queue pool, and note
-   that it fails the same quiet way: without it the pool keeps the Terraform
-   ceiling you typed and says nothing, and `ci_queue_config_age_seconds`
-   climbing is the only sign.
+   It once needed **`Contents: read`** as well, for a merge-queue pool sized
+   from the repository's own `.mergify.yml`. **Do not grant it.** Mergify is
+   gone fleet-wide (#434), the derivation was deleted with it, and that call was
+   the only thing in the control plane that read a repository's files. If an
+   existing App still holds it, revoke it.
 2. **A GCP project, a VPC and a subnet** in the region the pool will run in.
    Hosts get no external IP: egress must already work from that subnet (in the
    MOT projects it is the peering to `mot-lz-vpc` through the central firewall —
@@ -593,36 +590,43 @@ Never write the controller's table by hand: `mig` is a *generated* name, and a
 wrong one gives you a controller that lists an empty instance group forever and
 reports a perfectly healthy, permanently empty pool. Pass `pool_descriptor`.
 
-### `mq_max_hosts` is a hard stop, not the size
+### `mq_max_hosts` is the size
 
 > **Applies only to a repository that still carries a sized merge-queue pool.**
-> The self-sizing below reads `.mergify.yml`, and there is no such file left in
-> the fleet — so on a current repository the read finds nothing and the pool is
-> whatever `mq_max_hosts` says, which should be `0`. Kept because the code is
-> still live and gated on `role = "merge-queue"`; removing it is
+> On a current repository this should be `0`: the merge lane needs no
+> speculative validation, so the pool has nothing to serve. Collapsing the pool
+> away entirely is
 > [#274](https://github.com/Dima-Spectorr/ci-runner-infra/issues/274).
 
-The merge-queue pool sizes itself. The controller reads `max_parallel_checks`
-out of the repository's own `.mergify.yml`, live, and derives the ceiling:
+The merge-queue pool used to size itself, from `max_parallel_checks` in the
+served repository's own `.mergify.yml`. Mergify is gone fleet-wide and the merge
+lane that replaced it publishes no concurrency for anything to read, so the
+derivation was deleted — since then the ceiling is `mq_max_hosts` and nothing
+else, which is exactly what the derivation had been failing open to.
+
+Sizing it by hand needs one number, and the controller still publishes it,
+because it is observed from real runs rather than read from a file:
+`ci_queue_jobs_per_check` is the high-water count of this pool's jobs in one
+check run.
 
 ```
-hosts = ceil( Σ max_parallel_checks × jobs per check ÷ slots per host )
+mq_max_hosts = ceil( ci_queue_jobs_per_check × parallel merges ÷ slots per host )
 ```
 
-`max_hosts` remains the MIG's maximum underneath that, so set it to something
-the derivation will not routinely hit — and then watch, rather than calculate:
-`ci_queue_capacity_wanted_hosts` above `ci_queue_capacity_hosts` is the
-controller telling you your Terraform ceiling has become the bottleneck. It is a
-comparison, so it needs no threshold of your own.
+Too low is the direction that hides — a throttled queue shows checks that are
+**pending**, never failed, on a pull request whose own CI is green — so revisit
+the number when the repository's workflows grow.
 
 ### The order, which is not optional
 
 1. **Apply the Terraform** that creates the merge-queue pool.
 2. **Then** merge the workflow change that routes to it.
 
-The commit that introduces the route cannot be merged *through* the queue:
-Mergify's speculative draft of that very commit runs under the new routing and
-asks for a label no runner carries yet.
+The commit that introduces the route cannot be merged by anything that re-runs
+CI on a draft of itself: that run happens under the new routing and asks for a
+label no runner carries yet. The merge lane does not re-run CI, so it is not
+affected — but a repository still on a speculative queue is, and so is a
+required check re-triggered on the merge commit.
 
 ### Every required workflow must route through the lane — including the small ones
 
@@ -639,34 +643,29 @@ sitting idle the whole time. Every required workflow takes
 takes a `timeout-minutes` tight enough that starvation fails loudly rather than
 waiting. Audit the whole `required` list, not just the big one.
 
-### Two extra App permissions
+### Two App permissions this step used to add — and no longer does
 
-The controller needs **`Contents: read`** on the GitHub App, to read
-`.mergify.yml`. Without it the read is a 403 and the merge-queue pool silently
-keeps its Terraform `max_hosts` instead of a derived ceiling — it fails open, so
-nothing breaks and nothing says so. The one signal is
-`ci_queue_config_age_seconds` climbing past 300; on a healthy controller it
-stays under it, and `-1` means the configuration has never been read at all.
+Both existed to serve Mergify, and both retired with it
+([#434](https://github.com/Dima-Spectorr/ci-runner-infra/issues/434)). They are
+recorded here because an App onboarded before 2026-08-26 still holds them, and
+the shortest path to a smaller blast radius is revoking what nothing calls.
 
-Granting it is two steps and the second is the one that gets missed: the App
-owner adds the permission, and then **every installation owner has to accept
-it**. Both steps, who can perform each, and how to verify from the controller
-rather than from a settings page:
-[`github-app-permissions.md`](github-app-permissions.md).
+**`Contents: read`** let the controller fetch the served repository's
+`.mergify.yml` and derive the merge-queue pool's ceiling from
+`max_parallel_checks`. The merge lane publishes no concurrency anywhere, so
+there is no file to read and the derivation is gone. That fetch was the only
+call in the entire control plane that read a repository's files — **revoke the
+permission.**
 
-It also needs **`Pull requests: read & write`**. The read half has always been
-required; the write half is what lets the controller recover a queue that has
-stalled — a pull request that is open, green and going nowhere because Mergify
-dequeued it on a runner failure, or stopped evaluating it. That state is
-invisible on every surface that reports anything, it cost two pull requests 17
-and 18 hours on one repository, and the fix is a comment the fleet can now post
-itself. It buys one endpoint and cannot merge, push or edit code. The failure
-class, the three shapes it takes and the by-hand remedy:
-[`merge-queue-stall-recovery.md`](merge-queue-stall-recovery.md).
+**`Pull requests: write`** let the controller comment its way out of a queue that
+Mergify had dequeued or stopped evaluating. There is no such state to recover:
+the lane merges what is ready and records why it did not. `Pull requests: read`
+is still required. **Revoke the write half.**
 
-Until the installation accepts the write, the sweep runs and publishes
-`ci_queue_stall_sweep_denied` instead of acting — so a fleet that never grants it
-is not broken, just back to needing a human to notice.
+What that leaves is one write on the whole App — `Administration`, for the runner
+registration token. Which permissions are current, how an installation owner
+accepts a change, and how to verify from the controller rather than from a
+settings page: [`github-app-permissions.md`](github-app-permissions.md).
 
 ## 9. Wire the merge lane
 

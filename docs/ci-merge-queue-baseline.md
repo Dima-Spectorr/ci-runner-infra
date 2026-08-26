@@ -310,31 +310,40 @@ sum a width raise has to fit inside is the **merge-queue** pool's
 original bottleneck: a pull request that has gone green and entered the queue is
 no longer competing with ordinary PR CI for the same hosts.
 
-**2. The width raise is no longer a Terraform change at all.** The controller
-reads `max_parallel_checks` out of the repository's own `.mergify.yml`, live,
-and derives the merge-queue pool's ceiling from it:
+**2. The width raise is a Terraform change again, and there is no width to
+read.** For a while it was not: the controller read `max_parallel_checks` out of
+the repository's own `.mergify.yml`, live, and derived the merge-queue pool's
+ceiling as `ceil( Σ max_parallel_checks × jobs per check ÷ slots per host )`.
+
+Mergify is gone from every repository in the fleet
+([#434](https://github.com/Dima-Spectorr/ci-runner-infra/issues/434)) and
+[the merge lane](merge-lane.md) replaced it. The lane merges what is ready, one
+candidate at a time, and publishes no concurrency anywhere — so there is no file
+to read and the derivation was deleted. `max_hosts` is the ceiling, which is
+what the rule had been failing open to since the last `.mergify.yml` was
+deleted.
+
+The one input survives, because it was observed rather than configured:
+`ci_queue_jobs_per_check` is the high-water number of this pool's jobs in one
+check run, counted during the demand sweep. Size the pool with it:
 
 ```
-hosts = ceil( Σ max_parallel_checks × jobs per check ÷ slots per host )
+max_hosts = ceil( ci_queue_jobs_per_check x parallel merges / slots per host )
 ```
 
-Raising the width in `.mergify.yml` is now sufficient; within five minutes the
-pool is sized for it. `max_hosts` remains the hard stop underneath, and when the
-derivation wants more than it allows the controller says so — the comparison
-`ci_queue_capacity_wanted_hosts > ci_queue_capacity_hosts` is the whole
-diagnosis, and it needs no per-repository threshold. **That comparison replaces
-"show the arithmetic in the pull request"**: the arithmetic is now done
-continuously, by the thing that can actually see both numbers.
+Too low is still the direction that hides — a queue throttled by runner capacity
+has checks that are **pending**, never failed, on a pull request whose own CI is
+green — so this is a number to revisit when a repository's workflows grow, not
+one to set once.
 
-**3. `batch_size` is not 1 everywhere, and it does not need to be.** The
-2026-08-18 policy above closed an escape that no longer exists. A batch is
-validated as ONE speculative pull request, so `batch_size` does not enter the
-capacity sum in either the old form or the new one — it says how much backlog
-each check run clears, not how many runners it needs. Per-repository batch sizes
-therefore stay as they are (IntegrateIT is at 2), and the controller reads and
-publishes the value as `ci_queue_batch_size` rather than acting on it, precisely
-so that the opposite intuition is settled by a chart instead of by this
-paragraph.
+**3. `batch_size` was never part of the sum, and there is no batch now.** The
+2026-08-18 policy above closed an escape that no longer exists. Under Mergify a
+batch was validated as ONE speculative pull request, so `batch_size` did not
+enter the capacity sum in either the old form or the new one — it said how much
+backlog each check run cleared, not how many runners it needed. With Mergify
+gone the knob itself is gone; the merge lane's throughput control is its
+`max-actions` input, which bounds how many pull requests one lane run may act
+on.
 
 What is unchanged: the GCP quota the managed instance groups draw from is still
 shared, and it is still the coarse bound that actually bit on 2026-08-13.

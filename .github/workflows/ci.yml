@@ -442,22 +442,6 @@ jobs:
       - name: demand-match self-test
         run: bash scripts/ci/demand-match.selftest.sh
 
-      # The merge-queue pool's ceiling, derived from the repository's own
-      # Mergify configuration. Every way this rule can be wrong is silent: too
-      # low throttles the queue into checks that are PENDING rather than failed,
-      # too high buys hosts nothing keeps busy, and a fail-CLOSED bug takes a
-      # healthy queue to zero capacity on a transient API error.
-      - name: mergify-capacity self-test
-        run: |
-          # The reader needs PyYAML, and the self-test REFUSES to run without it
-          # rather than comparing two empty strings and passing. Guarded so the
-          # gate does not depend on what a hosted image happens to preinstall.
-          python3 -c 'import yaml' 2>/dev/null || {
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq python3-yaml
-          }
-          bash scripts/ci/mergify-capacity.selftest.sh
-
   shell-host:
     name: Shell — host boot and slot lifecycle
     runs-on: ubuntu-latest
