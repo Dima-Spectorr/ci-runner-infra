@@ -589,7 +589,7 @@ waives_the_label_only_for_a_pin_only_diff() {
   # A file outside the workflow directory refuses the waiver …
   matches "$code" '^        \.github/workflows/\*\) continue ;;' || return 1
   # … and so does a changed line that does not name the pinned repository.
-  matches "$code" '\*"\$PIN_BUMP_REPO/\.github/workflows/"\*\) saw_pin=1 ;;' || return 1
+  matches "$code" '\*uses:\*"\$PIN_BUMP_REPO/\.github/workflows/"\*\) saw_pin=1 ;;' || return 1
   # An empty diff is not a pin bump: `saw_pin` has to have been set.
   matches "$code" '^  \[ "\$saw_pin" -eq 1 \]'
 }
@@ -1331,7 +1331,7 @@ mutate "the pin waiver stops asking who wrote the pull request, so any unlabelle
   's@^  \[ "\$author" = "\$PIN_BUMP_ACTOR" \] || return 1@  :@' \
   waives_the_label_only_for_a_pin_only_diff
 mutate "the pin waiver stops refusing a changed line that is not a pin" "$DRIVER" \
-  's@\*"\$PIN_BUMP_REPO/\.github/workflows/"\*) saw_pin=1 ;;@*) saw_pin=1 ;;@' \
+  's@\*uses:\*"\$PIN_BUMP_REPO/\.github/workflows/"\*) saw_pin=1 ;;@*) saw_pin=1 ;;@' \
   waives_the_label_only_for_a_pin_only_diff
 mutate "the pin waiver arms itself by default" "$DRIVER" \
   's@^PIN_BUMP_ACTOR="\${PIN_BUMP_ACTOR:-}"@PIN_BUMP_ACTOR="${PIN_BUMP_ACTOR:-dependabot[bot]}"@' \

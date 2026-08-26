@@ -1117,8 +1117,11 @@ lane_is_pin_bump() {
     case "$line" in
       '+++'*|'---'*) continue ;;
       '+'*|'-'*)
+        # `uses:` as well as the repository name: a substring match alone would
+        # accept a line that merely MENTIONS the path — a comment, a doc string
+        # — alongside whatever else that line does.
         case "$line" in
-          *"$PIN_BUMP_REPO/.github/workflows/"*) saw_pin=1 ;;
+          *uses:*"$PIN_BUMP_REPO/.github/workflows/"*) saw_pin=1 ;;
           *) return 1 ;;
         esac
         ;;
