@@ -65,28 +65,22 @@ locals {
 
   repository_id = local.gen2 ? coalesce(var.github_repository, try(google_cloudbuildv2_repository.repo[0].id, "")) : null
 
-  # `g$SHORT_SHA`, not `$SHORT_SHA`. The image is named
-  # `<image_family>-<image_version>` by the packer template, so the version
-  # suffix could in principle be anything — but the version is also the only
-  # part a human reads to tell two images apart, and a bare short sha starting
-  # with a digit is indistinguishable from a truncated version string. The `g`
-  # is git's own convention for "the following is an abbreviated object name"
-  # (`git describe` prints `v1.2.3-4-gabc1234`), and it guarantees the suffix
-  # begins with a letter — which matters if the family is ever overridden with
-  # something that does not, since a GCE image name must start with a lowercase
-  # letter. `packer/ci-host-image.pkr.hcl` puts no format constraint on
-  # `image_version`, so nothing downstream would reject a bad one until the
-  # image is created, at the end of the build.
+  # THE VERSION IS NOT DECIDED HERE, and it used to try to be: this module sent
+  # `_IMAGE_VERSION = "g$SHORT_SHA"`, one substitution referenced inside
+  # another's value. That resolves only under `dynamicSubstitutions`, which the
+  # documentation says is "always set to true" for a trigger-invoked build, and
+  # which is not what the API did. Build `68004298` (2026-08-26) came from this
+  # module's trigger, carried `SHORT_SHA=3133b15` in its own substitution map,
+  # and ran step 0 with `_IMAGE_VERSION` as the eleven characters `g$SHORT_SHA`.
+  # Build `97eeb41d` repeated it with the option turned on in the build config
+  # and got the same result — setting it there does not reach a value the
+  # TRIGGER supplied. Those were the trigger's only two builds, so no image had
+  # ever been produced.
   #
-  # THE EXPANSION IS REAL, NOT LITERAL TEXT. Cloud Build resolves a substitution
-  # referenced inside another substitution's value only when
-  # `dynamicSubstitutions` is on — and for a build invoked by a trigger it "is
-  # always set to true and does not need to be specified in your build config
-  # file". This module only ever produces trigger-invoked builds, so the
-  # condition holds by construction. It would NOT hold for the same value typed
-  # into a manual `gcloud builds submit`, which is the version of this that
-  # would silently create an image literally named `ci-runner-host-g$SHORT_SHA`.
-  image_version = coalesce(var.image_version, "g$SHORT_SHA")
+  # So `_IMAGE_VERSION` is now sent ONLY when a caller pins one, and the root
+  # `cloudbuild.yaml`'s `guard` step derives `g<short sha>` otherwise. A step's
+  # own text is substituted directly, so `SHORT_SHA` there needs no option and
+  # no vendor promise. The reasoning for the `g` prefix moved with it.
 
   # Always set: every one of these is either required by the root
   # cloudbuild.yaml's `guard` step or has a default in this module.
@@ -97,7 +91,6 @@ locals {
     _NETWORK_TAG            = var.network_tag
     _IMAGE_FAMILY           = var.image_family
     _IMAGE_STORAGE_LOCATION = var.image_storage_location
-    _IMAGE_VERSION          = local.image_version
     _WARM_CACHE_SCRIPT      = var.warm_cache_script
   }
 
@@ -107,6 +100,7 @@ locals {
   # value that breaks the build — a runner agent download of version `` and a
   # packer download of version ``, both 404, both an hour into nothing.
   optional_substitutions = merge(
+    var.image_version == null ? {} : { _IMAGE_VERSION = var.image_version },
     var.runner_version == null ? {} : { _RUNNER_VERSION = var.runner_version },
     var.packer_version == null ? {} : { _PACKER_VERSION = var.packer_version },
   )
