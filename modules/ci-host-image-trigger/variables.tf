@@ -174,9 +174,18 @@ variable "cloudbuild_config" {
 }
 
 variable "included_files" {
-  type        = list(string)
-  default     = ["packer/**", "cloudbuild.yaml"]
-  description = "Globs whose change rebuilds the image. Scoped tightly on purpose: this build takes about an hour, and firing it on every merge to a repository that is mostly documentation and shell would spend the day rebuilding an identical image. `scripts/**` is NOT included — nothing under it is copied into the image; the only reference to it in `packer/` is a comment. Widen it if that stops being true."
+  type = list(string)
+  default = [
+    "packer/**",
+    "cloudbuild.yaml",
+    # Not under `packer/`, but uploaded INTO the build by a `file` provisioner
+    # and therefore part of it. The description below says to widen this list
+    # when that becomes true of something; it became true of these three.
+    "scripts/ci/image-vuln-verdict.sh",
+    "docs/image-vuln-ignores.txt",
+    "docs/image-vuln-offdistro.txt",
+  ]
+  description = "Globs whose change rebuilds the image. Scoped tightly on purpose: this build takes about an hour, and firing it on every merge to a repository that is mostly documentation and shell would spend the day rebuilding an identical image. Broad `scripts/**` is still NOT included — only the individual files a `file` provisioner uploads into the build, which is what `packer_upload_paths_are_watched` in `scripts/ci/image-guard.selftest.sh` keeps this list honest about. Widen it when that set grows: a file the build reads but the trigger does not watch means the fix for a red build cannot cause the rebuild that clears it."
 }
 
 variable "ignored_files" {
