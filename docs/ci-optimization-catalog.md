@@ -5,6 +5,17 @@ self-hosted runner pools this repository provisions. Every item below is a
 *measured* gap, not a generic best practice: the evidence column names the repo
 and the number it came from.
 
+> **Mergify is gone fleet-wide
+> ([#434](https://github.com/Dima-Spectorr/ci-runner-infra/issues/434)).** Every
+> item below that names `.mergify.yml`, `mergify/merge-queue/` branches,
+> `@mergifyio refresh` or `checks_timeout` is a **measurement of what was there
+> when the audit ran**, kept as the record it is rather than rewritten. The merge
+> lane replaced it: it re-runs no checks, so it creates no speculative branch and
+> needs no `mergify/merge-queue/` escape hatch, and it reads the base tip's own
+> check runs rather than a queued draft's. Read those items for the failure
+> *class* they describe — a required check that reports `skipped`, a hung job
+> holding a host — which the lane still meets. Do not act on their remedies.
+
 Scope of the audit: `.github/workflows/*.yml` and `.mergify.yml` in
 `Apigee-Portal`, `Atlas`, `Borsh-Tablet-App`, `CarListPrice`, `DataRetrival`,
 `IntegrateIT`, `Manar`, `Print-Server`, `SOAP-To-REST`, `Specaria-Platform`,
