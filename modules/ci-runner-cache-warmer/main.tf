@@ -410,7 +410,7 @@ locals {
   #   npx --no-install turbo run build --cache-dir="$$WARM_TURBO_DIR"
   #
   # Read off the EXECUTED build resource, not the trigger template
-  # (`5ea57da5`, mot-integrateit, 2026-08-26), so substitution resolution had
+  # (`5ea57da5`, 2026-08-26), so substitution resolution had
   # already happened and the `$$` survived it: the `$$` escape is unescaped in
   # `args`, and the `script` field is handed to the shell verbatim. In bash
   # `"$$WARM_TURBO_DIR"` is the PID followed by a literal, so turbo wrote its

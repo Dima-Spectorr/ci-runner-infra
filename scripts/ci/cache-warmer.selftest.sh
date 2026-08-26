@@ -265,7 +265,7 @@ has_cache_dir_bound() { # <file>
   # `args`. So the build ran `--cache-dir="$$WARM_TURBO_DIR"`, turbo wrote to
   # `<pid>WARM_TURBO_DIR`, and the publishing step found nothing and exited 0.
   # Nothing went red; the prefix was simply always empty. Measured on the
-  # executed build resource `5ea57da5` (mot-integrateit, 2026-08-26).
+  # executed build resource `5ea57da5` (2026-08-26).
   ! matches "$code" 'cache-dir=\\"\$WARM_TURBO_DIR' || return 1
   # The install ladder ends in `fi`, and the two halves are joined with a space:
   # without the `;` the step is `fi npx …`, a syntax error that kills the build
