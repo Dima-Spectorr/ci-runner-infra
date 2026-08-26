@@ -280,6 +280,31 @@ _gz=$(cat $_files | gzip | base64 -w0 | wc -c)
 check "the gzipped controller boot script fits in a metadata value (${_gz} < ${_margin}, cap ${_cap})" \
   yes "$([ "$_gz" -lt "$_margin" ] && echo yes || echo no)"
 
+# --- and it travels as many lines, not one ------------------------------------
+#
+# Fitting is not sufficient, and this is the failure that cost more than the 413
+# did. A metadata value carrying ONE line of six figures is accepted when the
+# instance template is created — plan green, apply green — and then every
+# `instances.insert` from that template fails after hanging about two minutes,
+# with `Internal error` or `The service is currently unavailable` and no mention
+# of metadata, a script, or a line.
+#
+# Measured 2026-08-26 against a live controller template in the fleet's region:
+# five creates, five failures; the same template cloned with the base64 body
+# folded to 76 columns booted first try and reached the controller's own code. A
+# 174 KiB PLAIN-TEXT startup-script in a template creates fine, so neither the
+# size nor the template is what GCE chokes on. Three controller MIGs sat at
+# `creating: 1` for days over this, which is three pools stuck at zero hosts and
+# two repositories with no runners at all. See #434.
+# The Terraform expression VERBATIM, so the single quotes are the point: the
+# `${...}` here is HCL interpolation that has to reach main.tf unexpanded.
+# shellcheck disable=SC2016
+_fold='join("\n", regexall(".{1,${local.b64_fold_columns}}", base64gzip(local.controller_startup_source)))'
+check "the controller blob is folded, not one enormous line" \
+  yes "$(grep -qF "$_fold" "$POOL_TF/main.tf" && echo yes || echo no)"
+check "the plan refuses a controller boot script with a long line" \
+  yes "$(grep -qF 'for line in split("\n", local.controller_startup) : line if length(line) > 4096' "$POOL_TF/main.tf" && echo yes || echo no)"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

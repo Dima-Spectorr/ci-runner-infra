@@ -25,7 +25,18 @@
 
   Gzipped and base64'd this is about 149 KiB -- 57% of the cap, with room for
   the script to grow by three quarters again. `terraform fmt` never reflows the
-  blob because it is a single line inside a single-quoted here-string.
+  blob because it lives inside a single-quoted here-string.
+
+  AND IT ARRIVES FOLDED TO 76 COLUMNS.
+
+  Being under the cap is not sufficient. A metadata value carrying one line of
+  six figures is accepted when the instance TEMPLATE is created and then breaks
+  every instance created from that template, two minutes in, with an
+  `Internal error` that names nothing (measured 2026-08-26: five
+  failures from the fleet's controller template, and a first-try boot from the
+  same template with the blob folded). main.tf folds all three boot blobs, and
+  a plan-time precondition refuses a long line. `Convert.FromBase64String`
+  ignores the line feeds, so nothing below changes.
 
   IT UNPACKS INTO C:\ci, NOT C:\Windows\Temp.
 
@@ -48,7 +59,9 @@ $ErrorActionPreference = 'Stop'
 
 # A single-quoted here-string: no PowerShell expansion, no escape processing,
 # and base64's alphabet cannot terminate it. The terminator has to sit at the
-# start of a line, which is why it is not indented with the rest.
+# start of a line, which is why it is not indented with the rest -- and the
+# blob's own folded lines are flush left for the same reason, so none of them
+# can be mistaken for it.
 $b64 = @'
 ${gz}
 '@

@@ -152,7 +152,42 @@ locals {
   # `set -euo pipefail` is deliberate for the four lines it covers: a truncated
   # blob must fail the boot loudly and let the register grace drain the host,
   # never leave a host up running half a script.
-  host_startup_gz = base64gzip(local.host_startup_source)
+  # AND THE BLOB IS FOLDED, WHICH IS NOT COSMETIC.
+  #
+  # `base64gzip` returns ONE line. A metadata value whose longest line runs to
+  # six figures is accepted by `instanceTemplates.insert` — the template is
+  # created, the plan and the apply are both green — and then every
+  # `instances.insert` FROM that template fails, after hanging for about two
+  # minutes, with `Internal error ... (Code: ...)` or `The service is currently
+  # unavailable`. Neither names metadata, a script, or a line.
+  #
+  # Measured 2026-08-26 against a live controller template in the fleet's own
+  # region: five creates from the template as rendered, five failures; the SAME template
+  # cloned with the base64 body folded to 76 columns booted first try and ran the
+  # controller. A 174 KiB PLAIN-TEXT startup-script in a template creates fine, so
+  # it is neither the size of the value nor the template that GCE chokes on — it
+  # is the single enormous line.
+  #
+  # The limit is undocumented and looks like 128 KiB, because the two live
+  # templates bracket it: the controller's line was 142,189 characters and every
+  # create failed, while the host pool's — 130,244 on the same day, in the same
+  # project — creates fine. That is 99.4% of 131,072, which is the other half of
+  # why this is folded rather than trimmed: the host pool was one edit from the
+  # identical outage and nothing would have said so.
+  #
+  # What it cost: three of the fleet's controller MIGs, in three separate
+  # projects, each sat at `creating: 1` for days, so their pools never scaled
+  # off zero, so two repositories had ZERO registered runners and every check
+  # queued forever. A fourth looked healthy only because its controller instance
+  # predates its current template — every pool in the fleet was one recreate
+  # away from the same outage. See #434.
+  #
+  # 76 columns is `base64 -d`'s own canonical width. GNU base64 and .NET's
+  # `Convert.FromBase64String` both ignore the newlines, so neither wrapper
+  # changes; the value grows by about 1.3% for the line feeds.
+  b64_fold_columns = 76
+
+  host_startup_gz = join("\n", regexall(".{1,${local.b64_fold_columns}}", base64gzip(local.host_startup_source)))
 
   host_startup = <<-EOT
     #!/usr/bin/env bash
@@ -182,7 +217,7 @@ locals {
   # variable reference, so the file on disk parses before Terraform substitutes
   # anything.
   windows_host_startup_source = file("${path.module}/scripts/windows-host-startup.ps1")
-  windows_host_startup_gz     = base64gzip(local.windows_host_startup_source)
+  windows_host_startup_gz     = join("\n", regexall(".{1,${local.b64_fold_columns}}", base64gzip(local.windows_host_startup_source)))
 
   windows_host_startup = templatefile("${path.module}/scripts/windows-boot-wrapper.ps1", {
     gz = local.windows_host_startup_gz
@@ -296,7 +331,10 @@ locals {
   # script incrementally as it runs; and `set -euo pipefail` makes a truncated
   # blob a loud boot failure rather than a controller running a prefix of its
   # own decision rules — half of which decide whether a machine is deleted.
-  controller_startup_gz = base64gzip(local.controller_startup_source)
+  # Folded for the reason `host_startup_gz` is folded, and this is the blob that
+  # was measured failing: the controller template is the one that left three
+  # pools stuck at `creating: 1`.
+  controller_startup_gz = join("\n", regexall(".{1,${local.b64_fold_columns}}", base64gzip(local.controller_startup_source)))
 
   controller_startup = <<-EOT
     #!/usr/bin/env bash
@@ -537,6 +575,20 @@ resource "google_compute_instance_template" "host" {
     precondition {
       condition     = length(local.boot_script_metadata[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"]) < 262144
       error_message = "pool '${var.name}' renders a ${length(local.boot_script_metadata[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"])}-character boot script and a GCE metadata value is capped at 262144. Both scripts are already gzipped into their wrappers, so this means the SOURCE has outgrown even the compressed form: shorten modules/ci-runner-host-pool/scripts/${var.host_os == "windows" ? "windows-host-startup.ps1" : "host-startup.sh"}, or move a part of it onto the golden image. Left to the apply this is an Error 413 at create time, on a plan that read clean."
+    }
+
+    # The SAME class again, one step further in: a value that is small enough is
+    # still refused if any single LINE of it is enormous — not by
+    # `instanceTemplates.insert`, which accepts it, but by every
+    # `instances.insert` from the resulting template, two minutes later, as an
+    # `Internal error` that names nothing. That is strictly worse than the 413
+    # above, because the apply is green and the pool only dies the next time it
+    # has to build a machine. Every boot blob is folded to 76 columns; this
+    # refuses at plan time anything that reintroduces a long line, which is what
+    # a future `base64gzip(...)` written without the fold would do.
+    precondition {
+      condition     = length([for line in split("\n", local.boot_script_metadata[var.host_os == "windows" ? "windows-startup-script-ps1" : "startup-script"]) : line if length(line) > 4096]) == 0
+      error_message = "pool '${var.name}' renders a boot script containing a line of more than 4096 characters. The template would be created and every instance created FROM it would fail with an unexplained `Internal error` about two minutes in (measured 2026-08-26). Fold the base64 blob: join(\"\\n\", regexall(\".{1,${local.b64_fold_columns}}\", base64gzip(...)))."
     }
 
     precondition {
@@ -876,6 +928,17 @@ resource "google_compute_instance_template" "controller" {
     precondition {
       condition     = length(local.controller_startup) < 262144
       error_message = "pool '${var.name}' renders a ${length(local.controller_startup)}-character controller boot script and a GCE metadata value is capped at 262144. The script is already gzipped into its wrapper, so the SOURCE has outgrown even the compressed form: shorten the decision-rule scripts under modules/ci-runner-host-pool/scripts/, or move part of the controller onto the golden image. Left to the apply this is an Error 413 at create time, on a plan that read clean — and a controller that cannot be created is a pool that never leaves zero hosts."
+    }
+
+    # And the controller's half of the LINE-length gate, which is the one that
+    # actually took the fleet down. This template is the resource that was
+    # measured: created without complaint, and then five of five instance
+    # creates from it failed after a two-minute hang, so three controller MIGs
+    # sat at `creating: 1` for days and their pools never left zero hosts. A
+    # length check cannot see it — the value was 142 KiB, well under the cap.
+    precondition {
+      condition     = length([for line in split("\n", local.controller_startup) : line if length(line) > 4096]) == 0
+      error_message = "pool '${var.name}' renders a controller boot script containing a line of more than 4096 characters. The template is created and the apply is green; every instance built FROM it then fails about two minutes in with an unexplained `Internal error` (measured 2026-08-26), which is a controller MIG stuck at `creating` and a pool that never leaves zero hosts. Fold the base64 blob: join(\"\\n\", regexall(\".{1,76}\", base64gzip(...)))."
     }
   }
 }
