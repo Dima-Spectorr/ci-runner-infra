@@ -234,8 +234,17 @@ facts_for() {
   if [ "$tier" = "pool" ]; then
     local runners
     runners=$(api "repos/$OWNER/$repo/actions/runners?per_page=100")
-    facts="$facts;runners=$(printf '%s' "$runners" | jq -r '.runners|length' 2>/dev/null)"
-    facts="$facts;online=$(printf '%s' "$runners" | jq -r '[.runners[]?|select(.status=="online")]|length' 2>/dev/null)"
+    # THE SAME 403-READS-AS-ZERO TRAP AS THE VARIABLES ENDPOINT, and it bit in
+    # the quiet direction first: `.runners` is null on a refusal body, `null |
+    # length` is 0, and the 2026-08-27 run reported three repositories with a
+    # combined 37 registered runners as having none under demand. The type
+    # check is what turns that into `warn:runner-count-unknown`. Reading
+    # runners needs `Administration: read` on the App.
+    local runner_count='if (.runners|type)=="array" then'
+    facts="$facts;runners=$(printf '%s' "$runners" \
+      | jq -r "$runner_count (.runners|length) else empty end" 2>/dev/null)"
+    facts="$facts;online=$(printf '%s' "$runners" \
+      | jq -r "$runner_count ([.runners[]|select(.status==\"online\")]|length) else empty end" 2>/dev/null)"
     local q corpses="" demand=""
     q=$(queue_facts "$repo")
     [ -n "$q" ] && { corpses="${q%% *}"; demand="${q##* }"; }
