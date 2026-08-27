@@ -146,9 +146,24 @@ want_field "min_hosts defaults to 0" 5 0
 want_field "drain grace defaults to 900" 7 900
 want_field "register grace defaults to 600" 8 600
 want_field "orphan confirm defaults to 3" 9 3
+# Must equal the Terraform variable's default. A pool that omits the field and
+# lands on 0 here cannot upgrade itself at all, and nothing goes red about it.
+want_field "recycle_max_unavailable defaults to 1" 10 1
 want_field "host_os defaults to linux" 11 linux
 want_field "a pool does not mint tokens unless it says so" 12 false
 want_field "role defaults to ci" 13 ci
+
+# The two default sites must agree, and only a gate keeps them agreeing: the
+# module renders an explicit value into metadata, so the jq fallback fires only
+# for a pool entry that omits the field — a path no single-pool consumer walks
+# and therefore nobody notices is wrong.
+TFVARS="$(dirname "$0")/../../modules/ci-runner-host-pool/variables.tf"
+POOLTABLE="$(dirname "$0")/../../modules/ci-runner-host-pool/scripts/pool-table.sh"
+tf_default=$(awk '/^variable "recycle_max_unavailable"/{f=1} f && /^  default/{print $3; exit}' "$TFVARS")
+jq_default=$(grep -o 'recycle_max_unavailable // [0-9][0-9]*' "$POOLTABLE" | grep -o '[0-9][0-9]*$')
+if [ -n "$tf_default" ] && [ "$tf_default" = "$jq_default" ]; then ok; else
+  bad "the Terraform default and the pool-table fallback agree" "$tf_default" "$jq_default"
+fi
 
 # The string "false" is TRUE in jq. A table that reached this parser through a
 # loosely typed template would otherwise arm a pool to mint GitHub registration

@@ -95,7 +95,16 @@ pool_table_parse() {
       (.drain_grace_seconds // 900),
       (.register_grace_seconds // 600),
       (.orphan_confirm_ticks // 3),
-      (.recycle_max_unavailable // 0),
+      # 1, matching the default on the Terraform variable. No apostrophes in
+      # this block: the whole jq program is a single-quoted bash string, so one
+      # ends it and the next line is read as shell.
+      #
+      # These are two separate default sites. The module always renders an
+      # explicit value into metadata, so this fallback fires only for a pool
+      # entry that omits the field — and if the two disagree, a multi-pool
+      # controller silently stops upgrading every pool that said nothing, which
+      # is the state eleven of thirteen declarations were in before 2026-08-27.
+      (.recycle_max_unavailable // 1),
       (.host_os // "linux"),
       # Compared, not tested for truthiness: in jq the STRING "false" is true,
       # and a hand-written or loosely templated table is exactly where that

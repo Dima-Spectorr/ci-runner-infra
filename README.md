@@ -131,10 +131,20 @@ It is two-phase, and the phases are ticks apart:
 Bounded by `recycle_max_unavailable`, which is how many hosts may be mid-recycle
 at once. A cordoned host's idle slots leave the pool immediately, so cordoning
 every stale host at once would remove the fleet's whole spare capacity in one
-tick and leave every queued job waiting on a boot. **The default is `0`, which
-disables the mechanism entirely** — every existing consumer of this module
-predates the feature, and a rule that deletes machines on nobody's trigger needs
-a switch that stops it without a rollback. Start at `1`.
+tick and leave every queued job waiting on a boot. **The default is `1`: a pool
+upgrades itself, one host at a time, and never interrupts a job.**
+
+It defaulted to `0` — off — until 2026-08-27, so that a rule which deletes
+machines on nobody's trigger had a switch that stopped it without a rollback.
+The switch is still there (set it to `0`), but it is no longer what you get by
+saying nothing, because saying nothing is what everybody did: eleven of thirteen
+pool declarations in this fleet never set the variable, so eleven pools could
+not upgrade themselves at all. Every host in them had to be recreated by hand to
+pick up a host-level fix — including #497, where the stale hosts were failing
+live builds while `terraform apply` reported success. The bad-read risk that
+argued for `0` is handled where it belongs: `recycle_decision()` skips on
+`template=unknown` and on `registration=unknown`, so only a template positively
+determined to be stale is ever acted on.
 
 Two series make it observable. `ci_hosts_stale_template` climbs when a template
 lands and falls back to zero as hosts are replaced; **stuck** above zero is the
