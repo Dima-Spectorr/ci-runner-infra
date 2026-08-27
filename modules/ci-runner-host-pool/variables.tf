@@ -807,23 +807,36 @@ variable "recycle_max_unavailable" {
     deregister an agent that is executing one keeps the working slot alive — and
     it is deleted on a later tick, once that job lands.
 
-    Why the default is 0 (OFF): this is the only rule in the module that deletes
-    a host for a reason that is not about the host. A controller running against
+    The default is 1: a pool upgrades itself, one host at a time.
+
+    It was 0 (OFF) until 2026-08-27, on the argument that a controller reading
     an unexpected template — restarted from an old image, or handed a metadata
     key that failed to render — must not start deleting hosts because a field
-    was missing. Opt in per pool.
+    was missing. That risk is real and it is not what the default was protecting
+    against: `recycle_decision()` skips on `template=unknown` and again on
+    `registration=unknown`, precisely so a bad read cordons nothing. Only a
+    template positively determined to be `stale` is ever acted on.
 
-    1 is the value to start with: cordoning removes a host's idle slots from the
+    What the default actually bought was a fleet that could not upgrade itself.
+    Measured 2026-08-27: eleven of thirteen pool declarations never set this, so
+    eleven pools were pinned OFF, and every host in them had to be recreated by
+    hand to pick up a host-level fix — including ci-runner-infra#497, where the
+    stale hosts were failing live builds. A safety switch nobody ever turns on
+    is not a safety switch; it is the reason the fix does not arrive.
+
+    1 rather than more because cordoning removes a host's idle slots from the
     pool immediately, so recycling every stale host at once takes out the
     fleet's whole spare capacity in a single tick and every queued job waits for
-    a boot. Raise it only on a pool with headroom.
+    a boot. Raise it only on a pool with headroom. Set it to 0 to switch the
+    mechanism off — the kill switch is unchanged, it is just no longer the
+    thing you get by saying nothing.
 
     Watch `ci_hosts_stale_template`: it climbs to the pool size when a release
     lands and falls back to zero as hosts are replaced. Stuck above zero means a
     pool that keeps being told to upgrade and never does.
   EOT
   type        = number
-  default     = 0
+  default     = 1
 
   validation {
     condition     = var.recycle_max_unavailable >= 0
