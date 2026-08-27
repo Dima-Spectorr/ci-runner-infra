@@ -93,6 +93,7 @@ fi
 # truncation. Measured 2026-08-27: IntegrateIT 31 queued, 26 of them corpses.
 
 qline=$(sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -F 'actions/runs?status=queued')
+# shellcheck disable=SC2016  # the $ is the text being matched, not an expansion
 check "the queued run list is filtered by creation date" yes \
   "$(case "$qline" in *'$demand_since_q'*) echo yes ;; *) echo no ;; esac)"
 
