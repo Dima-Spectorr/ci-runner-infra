@@ -85,5 +85,34 @@ else
   check "the skipped counter resets before every early return" yes no
 fi
 
+# ── corpses are aged out server-side, not just uncounted ─────────────────────
+#
+# A wedged run stays `queued` forever and no API call clears it. The jq filter
+# stops them being counted; it cannot stop them filling the 50-run page and
+# pushing real queued work off it, which reads as demand 0 rather than as
+# truncation. Measured 2026-08-27: IntegrateIT 31 queued, 26 of them corpses.
+
+qline=$(sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -F 'actions/runs?status=queued')
+check "the queued run list is filtered by creation date" yes \
+  "$(case "$qline" in *'$demand_since_q'*) echo yes ;; *) echo no ;; esac)"
+
+# An in-progress run is legitimately older than the window — a long build can
+# still have a job that started a minute ago — so this list must NOT be filtered.
+ipline=$(sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -F 'actions/runs?status=in_progress')
+check "the in-progress run list is NOT filtered by creation date" yes \
+  "$(case "$ipline" in *created=*) echo no ;; *) echo yes ;; esac)"
+
+# The cutoff is the same constant the jq filter uses, or the two disagree about
+# which runs are corpses and the fetch drops one the counter still expects.
+# shellcheck disable=SC2016
+check "the cutoff is derived from DEMAND_MAX_AGE" yes \
+  "$(found "$CTRL" 'date -u -d "@$((sweep_start - DEMAND_MAX_AGE))"')"
+
+# gh_api hands the path to curl verbatim, so `>=` and the timestamp's colons
+# have to be encoded here or the query is silently malformed.
+ds=$(date -u -d "@0" +%Y-%m-%dT%H:%M:%SZ)
+check "the cutoff is URL-encoded" "&created=%3E%3D1970-01-01T00%3A00%3A00Z" \
+  "&created=%3E%3D${ds//:/%3A}"
+
 echo "demand-budget selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

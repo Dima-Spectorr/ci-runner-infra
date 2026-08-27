@@ -536,7 +536,44 @@ collect_demand() {
   sweep_start=$(date +%s)
   deadline=$((sweep_start + DEMAND_BUDGET))
 
-  runs=$(gh_api "repos/$REPO_FULL/actions/runs?status=queued&per_page=50" 2>/dev/null)
+  # AGE OUT THE CORPSES SERVER-SIDE, not just in the jq below.
+  #
+  # A wedged run stays `queued` forever and no API call will clear it: cancel
+  # and force-cancel both 409 "Cannot cancel a workflow run that has not been
+  # queued yet", DELETE 403s, rerun 403s. Apigee-Portal accumulated 24 of them
+  # from a single 2026-08-26 incident window and they are still there.
+  #
+  # The DEMAND_MAX_AGE filter in the jq below already stops them being COUNTED,
+  # so the metric is honest. It does not stop them being FETCHED, and that is
+  # the part that bites, in two escalating ways:
+  #
+  #   1. Each corpse costs a full job-list call before it can be discarded, out
+  #      of a budget sized for real work. 24 of them is 24 calls a tick spent
+  #      to learn nothing, and every one of them raises the chance a live run
+  #      sorts past the deadline and lands in ci_demand_runs_skipped.
+  #   2. Worse, and unbounded: this page holds 50. Corpses are permanent and
+  #      accumulate, so a repo that collects 50 of them pushes every REAL
+  #      queued run off the page entirely. That truncation happens at the API,
+  #      before the budget, so it does not even register as skipped — demand
+  #      reads a clean 0, the pool sits at zero, and every signal is green.
+  #
+  # `created` is GitHub's own filter and costs nothing. Encoded by hand: gh_api
+  # passes the path through to curl verbatim.
+  #
+  # QUEUED ONLY. An in-progress run is legitimately older than the window — a
+  # long build created eight hours ago can still have a job that started a
+  # minute ago — so filtering that list on run creation would drop live work.
+  # A queued run has no such gap: its jobs were created with it and none has
+  # started, so the run's own age bounds theirs.
+  local demand_since demand_since_q=""
+  demand_since=$(date -u -d "@$((sweep_start - DEMAND_MAX_AGE))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  # Appended rather than folded into a variable holding the whole query: the
+  # budget selftest asserts the deadline is set before the queued-run call by
+  # matching the literal `actions/runs?status=queued`, and a URL assembled out
+  # of sight of that line silently stops being checked.
+  [ -n "$demand_since" ] && demand_since_q="&created=%3E%3D${demand_since//:/%3A}"
+
+  runs=$(gh_api "repos/$REPO_FULL/actions/runs?status=queued&per_page=50$demand_since_q" 2>/dev/null)
   local runs_ip
   runs_ip=$(gh_api "repos/$REPO_FULL/actions/runs?status=in_progress&per_page=50" 2>/dev/null)
 
