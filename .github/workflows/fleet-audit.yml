@@ -131,9 +131,16 @@ jobs:
       # with a colon-space in it is a mapping, and this file would fail to
       # start with zero jobs and no log, which is the same invisible failure
       # the audit below it exists to report on.
+      #
+      # The status arrives through `env` rather than inlined into the script:
+      # a `${{ }}` substituted straight into a `[ ... ]` test is a constant by
+      # the time any linter sees it (SC2050), and the same substitution is how
+      # a value containing a quote would become executable text.
       - name: "Fail on any fail: finding"
+        env:
+          STATUS: ${{ steps.audit.outputs.status }}
         run: |
-          [ "${{ steps.audit.outputs.status }}" = "0" ] || {
+          [ "$STATUS" = "0" ] || {
             echo "fleet-audit reported failures; see the report above" >&2
             exit 1
           }
