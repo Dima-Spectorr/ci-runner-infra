@@ -146,6 +146,30 @@ has "fail:missing-app-key-secret" "an enabled lane without the app key fails" "$
 hasnt "missing-app-id-secret" "a disabled lane does not also report its missing secrets" \
   "tier=lane;has_lane=1;has_guard=1;has_reaper=1;want_pin=$WANT;lane_pin=$WANT;guard_pin=$WANT;reaper_pin=$WANT;enabled=;app_id=0;app_key=0"
 
+# UNREADABLE IS NOT UNSET. The variables and secrets APIs answer a token
+# without the scope with a 403, whose body is as empty as a repository that
+# genuinely has none. On 2026-08-27 the first live run under the App token
+# reported all seventeen armed and unarmed repositories alike as
+# `lane-not-enabled`, because the App had no `Variables: read` — the audit
+# stating the opposite of the truth, in the one place it exists to be trusted.
+UNREADABLE_VARS="$(swap enabled '');vars_readable=0"
+has "warn:lane-arming-unreadable" "a token that cannot read variables says so" \
+  "$UNREADABLE_VARS"
+hasnt "fail:lane-not-enabled" "an unreadable variable is never called unset" \
+  "$UNREADABLE_VARS"
+hasnt "warn:lane-dry-run" "an unreadable variable is not called a dry run either" \
+  "$HEALTHY_POOL;vars_readable=0"
+UNREADABLE_SECRETS="$(swap app_id 0);secrets_readable=0"
+has "warn:lane-secrets-unreadable" "a token that cannot read secrets says so" \
+  "$UNREADABLE_SECRETS"
+hasnt "fail:missing-app-id-secret" "an unreadable secret list is not a missing secret" \
+  "$UNREADABLE_SECRETS"
+# The common case must stay quiet: a readable token supplies `1`, and a caller
+# that supplies neither fact is read as readable rather than warning on every
+# repository in the fleet.
+hasnt "unreadable" "a readable token produces no readability finding" \
+  "$HEALTHY_POOL;vars_readable=1;secrets_readable=1"
+
 # --- the phantom required check -----------------------------------------------
 has "fail:required-checks-disagree" "the lane list and the ruleset must agree" \
   "$(swap checks_match 0)"
