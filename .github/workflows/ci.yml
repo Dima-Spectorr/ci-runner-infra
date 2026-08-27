@@ -730,6 +730,18 @@ jobs:
       - name: terraform init retry self-test
         run: bash scripts/ci/terraform-init-retry.sh --selftest
 
+      # EVERY OTHER GATE IN THIS PIPELINE CHECKS THIS REPOSITORY. The four
+      # outages that cost the most were all on the other side of the repository
+      # boundary — pools pinned off, a lane never armed, a required check no
+      # workflow emits, wedged queued runs hiding real demand — and each one is
+      # invisible from inside the repository it affects, because a broken
+      # repository looks exactly like an idle one. The fleet audit asks that
+      # question, and it runs from a schedule on the default branch, so this
+      # step is the only thing that exercises its rule on the pull request that
+      # changes it.
+      - name: fleet-audit decision self-test
+        run: bash scripts/ci/fleet-audit-decision.selftest.sh
+
   shell-runner-policy:
     name: Shell — runner policy
     runs-on: ubuntu-latest

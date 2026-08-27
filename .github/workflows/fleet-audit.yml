@@ -1,0 +1,139 @@
+name: Fleet audit
+
+# IS THE FLEET IN THE STATE THE FLEET INTENDS?
+#
+# Nothing asked that before this file. Every one of the ~60 gates in `ci.yml`
+# checks THIS repository, and the four outages that cost the most were all on
+# the other side of the repository boundary:
+#
+#   * eleven of thirteen pools pinned off, so no host could upgrade itself
+#   * a merge lane configured but never armed, whose job skips in silence
+#   * a required check no workflow emits, blocking every merge with nothing red
+#   * wedged queued runs filling the page, so demand read a clean zero
+#
+# What those share is not a bug in any one repository. It is that a repository
+# in the broken state looks EXACTLY like a repository that is simply idle, and
+# nobody outside it was looking. This is the thing that looks.
+#
+# THIS FILE DOES NOT RUN ON THE PULL REQUEST THAT CHANGES IT.
+#
+# A `schedule` trigger is dispatched from the DEFAULT BRANCH only — the same
+# property that makes the branch reaper's rule live in a pure function, for the
+# same reason. `scripts/ci/fleet-audit-decision.selftest.sh` runs in `ci.yml`
+# and is what stands in for the run that cannot happen here.
+
+on:
+  # Daily. Every fact it reads changes on the timescale of a release or an
+  # operator action, not a merge, so running it per push would buy nothing but
+  # API calls against the same rate limit the pools depend on.
+  #
+  # 05:41 UTC: after the 04:17 reaper, and off the hour because GitHub delays a
+  # busy cron slot rather than queueing it.
+  schedule:
+    - cron: '41 5 * * *'
+
+  # How an operator reads the report without waiting for tomorrow.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Two audits reading the fleet at once would race only on the issue comment,
+  # but the second one's reads are stale by definition.
+  #
+  # `cancel-in-progress: false`: a cancelled audit is a partial picture that
+  # would be posted as if it were the whole one.
+  group: fleet-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Audit the fleet
+    # GitHub-hosted, same choice `ci.yml` and the lane make: the workflow that
+    # reports on the self-hosted fleet must not need the fleet healthy to run.
+    # Free, because this repository is public.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # ENABLED IS NOT ARMED, AND THE GATE IS THE APP, NOT THE AUDIT.
+    #
+    # Reading another repository needs the App token. Until `MERGE_APP_ID` and
+    # `MERGE_APP_PRIVATE_KEY` exist this job fails at its second step, daily,
+    # on the default branch, forever — and "the operator has not finished the
+    # setup" would be indistinguishable from "the audit is broken".
+    if: vars.MERGE_LANE_ENABLED == 'true'
+
+    permissions:
+      contents: read
+      # The report is an issue comment. This bounds the BUILT-IN token, which
+      # is the one that writes it; the App token is read-only here by intent
+      # and is never used for anything but GETs.
+      issues: write
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # OWNER-WIDE, NOT THIS REPOSITORY. The default installation token is
+      # scoped to the repository the workflow runs in, which is the one
+      # repository the audit does not need to read.
+      - name: Mint the App token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.MERGE_APP_ID }}
+          private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Run the audit
+        id: audit
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          FLEET_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -uo pipefail
+          # `tee`, so the findings are in the job log even when the report step
+          # is skipped — a report that only exists as a comment disappears the
+          # first time the comment step is the thing that breaks.
+          bash scripts/ci/fleet-audit.sh 2>&1 | tee report.txt
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # A REPORT IN A JOB LOG IS A REPORT NOBODY READS.
+      #
+      # Posted to one long-lived issue rather than opening a new one per run:
+      # a daily audit that files an issue a day trains people to close them
+      # unread, which is the same failure as not running it. `always()` because
+      # the report matters MOST on the run that found failures.
+      - name: Post the report
+        if: always() && vars.FLEET_AUDIT_ISSUE != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ vars.FLEET_AUDIT_ISSUE }}
+        run: |
+          set -uo pipefail
+          {
+            echo "### Fleet audit — $(date -u +%Y-%m-%d\ %H:%M) UTC"
+            echo
+            echo '```'
+            cat report.txt
+            echo '```'
+            echo
+            echo "[run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          } > comment.md
+          gh issue comment "$ISSUE" --repo "${{ github.repository }}" --body-file comment.md
+
+      # The job's own verdict, last, so the report is posted either way. Only
+      # `fail:` findings go red: a dry-run lane is a legitimate place to sit,
+      # and an audit that goes red for it is an audit people stop reading.
+      # The name is quoted because it contains `: ` — an unquoted YAML scalar
+      # with a colon-space in it is a mapping, and this file would fail to
+      # start with zero jobs and no log, which is the same invisible failure
+      # the audit below it exists to report on.
+      - name: "Fail on any fail: finding"
+        run: |
+          [ "${{ steps.audit.outputs.status }}" = "0" ] || {
+            echo "fleet-audit reported failures; see the report above" >&2
+            exit 1
+          }

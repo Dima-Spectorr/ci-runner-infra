@@ -1,0 +1,59 @@
+# THE FLEET, DECLARED. One row per repository in the account.
+#
+# WHY A MANIFEST AND NOT "WHATEVER `gh repo list` RETURNS"
+#
+# Every gate in this repository checks THIS repository. Nothing checked that the
+# fleet as a whole was in the intended state, and the failures that cost the most
+# here were all of that shape: a pool pinned off, a lane never armed, a required
+# check no workflow emits. Each is invisible from inside the repository it
+# affects, because the repository looks exactly like one that is simply idle.
+#
+# Discovering the fleet instead of declaring it reproduces that blindness. A new
+# repository with no lane and no CI is indistinguishable from a deliberate
+# exemption, so a discovery-only audit has to treat it as fine — and the one
+# thing worth catching is precisely the repository nobody onboarded. So the
+# manifest is the source of truth and `fleet-audit.sh` reports in BOTH
+# directions: a row with no repository, and a repository with no row.
+#
+# TIERS
+#
+#   pool     self-hosted runners in a GCP project, plus the full lane.
+#            Audited for pins, arming, required-check agreement AND pool health.
+#   lane     the merge lane and its guards, on GitHub-hosted runners.
+#            Audited for everything except pool health.
+#   dormant  no CI at all. Audited to confirm it STILL has no CI: the day
+#            somebody adds a workflow, the repository has become a `lane`
+#            repository whose merges nothing serves, and that is the finding.
+#   empty    no default branch. Nothing to audit until it has one.
+#   source   this repository. It calls its own workflows through the `-self`
+#            variants rather than pinning a release of itself.
+#
+# The reason column is not decoration. An exemption whose reason has gone stale
+# is the same defect as a missing gate, and a reason is what makes that
+# reviewable a year later.
+#
+# repo	tier	reason
+Apigee-Portal	pool	Specaria org, europe-west1
+Atlas	lane	moved to GitHub-hosted runners after its pool went dark
+Borsh-Tablet-App	pool	me-west1
+CarListPrice	lane	small Python repo, GitHub-hosted is cheaper than a pool
+CloudObservability	lane	has ci.yml, GitHub-hosted
+DataRetrival	pool	me-west1, default branch is master
+General-IT	lane	default branch is master
+IntegrateIT	pool	me-west1, highest priority repository in the fleet
+Manar	lane	GitHub-hosted
+Print-Server	pool	me-west1
+SOAP-To-REST	pool	Specaria org, default branch is master
+Specaria-Platform	pool	Specaria org
+Telnet-Emulation	pool	me-west1
+entity-platform	pool	me-west1
+mot-claude	pool	me-west1
+mot-face-blur	lane	GitHub-hosted
+ci-runner-infra	source	the fleet's own source
+AIAgentBigQuery	empty	created, never pushed to
+ASP	dormant	no workflows
+Borsh	dormant	no workflows, superseded by Borsh-Tablet-App
+SafetyOfficer-Legacy	dormant	no workflows, read-only reference of the legacy system
+Study-App	dormant	no workflows
+claude-config	dormant	no workflows, distributed by clone rather than CI
+modern-fileserver	dormant	no workflows
