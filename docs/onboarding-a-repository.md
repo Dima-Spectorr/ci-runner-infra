@@ -715,6 +715,16 @@ One property to accept before you wire it: **`workflow_run` is dispatched from
 the default branch only**, so the pull request that adds the lane cannot run it.
 The first evidence is the first CI completion after the merge — watch that one.
 
+## 10. Add the repository to the fleet manifest
+
+One row in [`fleet/repos.tsv`](../fleet/repos.tsv): the name, the tier (`pool`
+for what you just built), and the reason. This is the last step and it is not
+bookkeeping — the daily [fleet audit](fleet-audit.md) reads that file as the
+source of truth, and a repository with no row is reported as
+`fail:not-in-manifest` rather than quietly assumed to be somebody's deliberate
+exemption. Skip it and everything above stays unwatched: the audit cannot tell
+a pool nobody onboarded from a pool that is meant to be there.
+
 ## Windows
 
 Windows is a **first-class pool of the same module**. There is no separate

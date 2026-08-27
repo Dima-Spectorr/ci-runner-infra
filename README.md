@@ -974,6 +974,23 @@ branch only when it was merged, has not moved since the merge, and the merge was
 at least fourteen days ago.
 
 
+## Is the fleet in the state the fleet intends?
+
+Every gate above checks **this repository**. The four outages that cost the most
+were all on the other side of that boundary — pools pinned to an old release, a
+lane configured but never armed, a required check no workflow emits, wedged
+queued runs hiding real demand — and they share a shape: **a repository in the
+broken state looks exactly like a repository that is simply idle.**
+
+[`fleet/repos.tsv`](fleet/repos.tsv) declares every repository in the account
+and what it is supposed to be; `fleet-audit.yml` checks each one daily and
+reports in both directions, so a repository nobody onboarded is a finding rather
+than an absence. Every unknown is a finding too — the inverse of the reaper's
+rule, because this one only reports, and "did not check" must never render like
+"found nothing". [`docs/fleet-audit.md`](docs/fleet-audit.md) has the tiers, the
+`fail:`/`warn:` split, and what an operator sets.
+
+
 ## Releasing a version
 
 `VERSION` holds the tag this repository currently publishes. Bump it **in the
