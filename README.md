@@ -760,6 +760,20 @@ is right for both a lint job and an integration suite — and alert on it togeth
 with `ci_demand_runs_skipped`, because it rides the same sweep and is a lower
 bound whenever that sweep ran out of budget.
 
+`ci_demand_runs_skipped` covers budget truncation only, and there is a second
+kind it cannot see. A workflow run can wedge in `queued` permanently — no API
+call clears one; `cancel` and `force-cancel` both 409, `DELETE` and `rerun`
+403 — and the queued-run page the sweep reads holds 50. Corpses accumulate and
+never leave, so a repository that collects 50 of them pushes every real queued
+run off that page: the sweep sees nothing to skip, publishes a clean demand of
+0, and the pool sits at zero with every signal green. The sweep therefore asks
+GitHub for runs created within `DEMAND_MAX_AGE` (6h) rather than filtering them
+out after the fetch, which also stops each corpse costing a job-list call out
+of the budget. Measured 2026-08-27, before the filter: Apigee-Portal 24 queued
+of which 0 were real, IntegrateIT 31 of which 5 were real. The in-progress list
+is deliberately not filtered this way — a long build can be older than the
+window and still hold live work.
+
 `ci_poller_heartbeat` is published on every tick including a failed one:
 "no data" there means the controller is down, which no other series can
 distinguish from "the pool is idle".
