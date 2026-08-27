@@ -124,11 +124,13 @@ The token is minted **owner-wide** (`owner:` on `create-github-app-token`). The
 default installation token is scoped to the repository the workflow runs in,
 which is the one repository the audit does not need to read.
 
-### The App needs `Variables: read` and `Secrets: read`
+### The App needs `Variables: read`, `Secrets: read` and `Administration: read`
 
-Read-only, both of them, and the second one reads only the **names** — the
-Actions secrets API never returns a value to anyone. Without them the audit is
-still useful, but it cannot tell you whether a lane is armed.
+All three read-only, and the secrets one reads only the **names** — the Actions
+secrets API never returns a value to anyone. Without the first two the audit
+cannot tell you whether a lane is armed; without the third it cannot see a
+single self-hosted runner, so the whole pool-health half of the report is
+inert.
 
 It matters more than it sounds, because of how those two endpoints refuse: a
 token without the scope gets a `403` whose body is as empty as the answer for a
@@ -139,6 +141,13 @@ daily. The audit now captures the refusal as its own fact and reports
 `warn:lane-arming-unreadable` / `warn:lane-secrets-unreadable` instead of
 asserting the opposite of the truth, which is the failure this whole file
 exists to catch and was, briefly, committing itself.
+
+The runners endpoint sprang the same trap in the quieter direction: `.runners`
+is `null` on a refusal body, `null | length` is `0`, and the corrected run
+reported Apigee-Portal, IntegrateIT and Borsh-Tablet-App — 37 registered
+runners between them — as having none under demand. It is type-checked now and
+reports `warn:runner-count-unknown`. Two endpoints, two directions, one lesson:
+**a count parsed out of an error body is not a count.**
 
 A permission added to an App is a *request* until the installation owner
 accepts it, and until then the App behaves exactly as though it had never been
