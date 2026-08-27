@@ -208,15 +208,22 @@ facts_for() {
       facts="$facts;reaper_pin=$(pin_in "$reaper" 'branch-reaper\.yml')"
     }
 
-    local vars
-    vars=$(api "repos/$OWNER/$repo/actions/variables?per_page=100")
+    # A 403 AND AN EMPTY LIST ARE THE SAME BYTES HERE, so the exit status is
+    # captured as its own fact. Without it a token that cannot see variables
+    # reports every repository in the fleet as `lane-not-enabled`, which is
+    # what the first live run under the App token did.
+    local vars vars_ok=1
+    vars=$(api "repos/$OWNER/$repo/actions/variables?per_page=100") || vars_ok=0
     # per_page=100 is load-bearing: variables paginate at 30, and a repository
     # with a wall of CI_* variables reports MERGE_LANE_* as absent on page one.
+    facts="$facts;vars_readable=$vars_ok"
     facts="$facts;enabled=$(printf '%s' "$vars" | jq -r '.variables[]?|select(.name=="MERGE_LANE_ENABLED").value // empty' 2>/dev/null)"
     facts="$facts;armed=$(printf '%s' "$vars" | jq -r '.variables[]?|select(.name=="MERGE_LANE_ARMED").value // empty' 2>/dev/null)"
 
-    local secrets
-    secrets=$(api "repos/$OWNER/$repo/actions/secrets?per_page=100" | jq -r '.secrets[]?.name // empty' 2>/dev/null)
+    local secrets raw_secrets secrets_ok=1
+    raw_secrets=$(api "repos/$OWNER/$repo/actions/secrets?per_page=100") || secrets_ok=0
+    facts="$facts;secrets_readable=$secrets_ok"
+    secrets=$(printf '%s' "$raw_secrets" | jq -r '.secrets[]?.name // empty' 2>/dev/null)
     facts="$facts;app_id=$(printf '%s\n' "$secrets" | grep -cx MERGE_APP_ID >/dev/null && echo 1 || echo 0)"
     facts="$facts;app_key=$(printf '%s\n' "$secrets" | grep -cx MERGE_APP_PRIVATE_KEY >/dev/null && echo 1 || echo 0)"
 

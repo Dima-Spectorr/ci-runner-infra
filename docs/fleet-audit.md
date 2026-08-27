@@ -99,7 +99,7 @@ findings and holds every judgement.
 
 The split is not tidiness. `fleet-audit.yml` runs on a **schedule**, and a
 schedule is dispatched from the default branch only — so the pull request that
-changes the rule cannot exercise it, whatever CI says. The 53 cases in
+changes the rule cannot exercise it, whatever CI says. The 61 cases in
 `fleet-audit-decision.selftest.sh`, wired into `ci.yml`, are what stands in for
 the run that cannot happen. Most of them assert that a specific broken state is
 still **reported**, which is the opposite weighting to the reaper's self-test
@@ -123,6 +123,27 @@ Two things the operator sets:
 The token is minted **owner-wide** (`owner:` on `create-github-app-token`). The
 default installation token is scoped to the repository the workflow runs in,
 which is the one repository the audit does not need to read.
+
+### The App needs `Variables: read` and `Secrets: read`
+
+Read-only, both of them, and the second one reads only the **names** — the
+Actions secrets API never returns a value to anyone. Without them the audit is
+still useful, but it cannot tell you whether a lane is armed.
+
+It matters more than it sounds, because of how those two endpoints refuse: a
+token without the scope gets a `403` whose body is as empty as the answer for a
+repository that genuinely has no variables. The first live run under the App
+token, on 2026-08-27, reported **every repository in the fleet** as
+`lane-not-enabled` — including the twelve where the lane merges pull requests
+daily. The audit now captures the refusal as its own fact and reports
+`warn:lane-arming-unreadable` / `warn:lane-secrets-unreadable` instead of
+asserting the opposite of the truth, which is the failure this whole file
+exists to catch and was, briefly, committing itself.
+
+A permission added to an App is a *request* until the installation owner
+accepts it, and until then the App behaves exactly as though it had never been
+added — so grant it on the App, then accept it on the installation, then
+dispatch the audit and check the warnings are gone.
 
 ### The account listing has two scopes, and the report says which
 

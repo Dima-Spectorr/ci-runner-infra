@@ -66,8 +66,22 @@ _fleet_say() {
 #   want_pin      the sha every caller should pin
 #   enabled       value of MERGE_LANE_ENABLED
 #   armed         value of MERGE_LANE_ARMED
+#   vars_readable 0 if the variables API refused the token — see below
 #   app_id        1 if the MERGE_APP_ID secret exists
 #   app_key       1 if the MERGE_APP_PRIVATE_KEY secret exists
+#   secrets_readable  0 if the secrets API refused the token
+#
+# READABILITY IS A SEPARATE FACT FROM THE VALUE, and it has to be, because the
+# variables and secrets APIs answer a token that lacks the scope with a 403 and
+# a token that is fine with an empty list — and `MERGE_LANE_ENABLED` being
+# absent looks exactly the same from here. The first live run under the App
+# token reported EVERY repository as `lane-not-enabled`, including the twelve
+# where the lane merges pull requests daily, because the App had no
+# `Variables: read`. An audit that confidently states the opposite of the truth
+# is worse than one that says nothing: it is the failure this file was written
+# to catch, committed by this file. Only an explicit `0` means unreadable; an
+# absent fact is read as readable, so a caller that does not supply it keeps
+# the old behaviour rather than silently warning on every repository.
 #   checks_match  1 if the caller's required-checks equal the ruleset's
 #   ruleset       1 if a ruleset protects the default branch
 #   has_ci        1 if the repository has any workflow at all
@@ -82,6 +96,7 @@ fleet_verdict() {
   local tier="" has_lane="" has_guard="" has_reaper=""
   local lane_pin="" guard_pin="" reaper_pin="" want_pin=""
   local enabled="" armed="" app_id="" app_key=""
+  local vars_readable="" secrets_readable=""
   local checks_match="" ruleset="" has_ci=""
   local runners="" online="" corpses="" demand="" page=""
   local found=0
@@ -108,8 +123,10 @@ fleet_verdict() {
       want_pin) want_pin="$value" ;;
       enabled) enabled="$value" ;;
       armed) armed="$value" ;;
+      vars_readable) vars_readable="$value" ;;
       app_id) app_id="$value" ;;
       app_key) app_key="$value" ;;
+      secrets_readable) secrets_readable="$value" ;;
       checks_match) checks_match="$value" ;;
       ruleset) ruleset="$value" ;;
       has_ci) has_ci="$value" ;;
@@ -205,7 +222,10 @@ fleet_verdict() {
     # `MERGE_LANE_ENABLED` gates the job itself, so an unset variable is a lane
     # that skips on every CI completion. Skipped renders as neither red nor
     # green; the repository merges nothing and looks untouched.
-    if [ "$enabled" != "true" ]; then
+    if [ "$vars_readable" = "0" ]; then
+      # Not "not enabled" — "not known". See the note at the top of the file.
+      _fleet_say "warn:lane-arming-unreadable token-lacks-variables-read"
+    elif [ "$enabled" != "true" ]; then
       _fleet_say "fail:lane-not-enabled enabled=${enabled:-<unset>}"
     elif [ "$armed" != "true" ]; then
       # Enabled but not armed is the deliberate dry-run state, and it is a
@@ -217,7 +237,9 @@ fleet_verdict() {
     # ordinary state; enabled-without-them is a lane that goes red on every run
     # with an authentication error, which reads like a broken lane rather than
     # an unfinished setup.
-    if [ "$enabled" = "true" ]; then
+    if [ "$secrets_readable" = "0" ]; then
+      _fleet_say "warn:lane-secrets-unreadable token-lacks-secrets-read"
+    elif [ "$enabled" = "true" ]; then
       [ "$app_id" != "1" ] && _fleet_say "fail:missing-app-id-secret"
       [ "$app_key" != "1" ] && _fleet_say "fail:missing-app-key-secret"
     fi
