@@ -89,6 +89,7 @@ _fleet_say() {
 #   online        count of those that are online
 #   corpses       queued runs OUTSIDE the demand window
 #   demand        queued runs INSIDE it — what the controller scales on
+#   settled       the subset of that demand older than the pool's boot grace
 #   page          the size of the queued-run page the controller reads
 # ---------------------------------------------------------------------------
 fleet_verdict() {
@@ -98,7 +99,7 @@ fleet_verdict() {
   local enabled="" armed="" app_id="" app_key=""
   local vars_readable="" secrets_readable=""
   local checks_match="" ruleset="" has_ci=""
-  local runners="" online="" corpses="" demand="" page=""
+  local runners="" online="" corpses="" demand="" settled="" page=""
   local found=0
 
   # `IFS` is scoped to the `read` rather than to the function: a function-local
@@ -134,6 +135,7 @@ fleet_verdict() {
       online) online="$value" ;;
       corpses) corpses="$value" ;;
       demand) demand="$value" ;;
+      settled) settled="$value" ;;
       page) page="$value" ;;
     esac
   done
@@ -298,7 +300,16 @@ fleet_verdict() {
       if [ -z "$demand" ]; then
         _fleet_say "warn:demand-unknown cannot-judge-empty-pool"
       elif [ "$demand" != "0" ]; then
-        _fleet_say "fail:no-runners-under-demand queued=$demand"
+        # And demand alone is still not enough. These pools scale FROM zero, so
+        # between the first queued run and the first registered host there is a
+        # boot window in which an empty pool and a broken pool look identical.
+        # Reported without it, the audit failed a repository whose pull request
+        # was forty seconds old while its MIG was already at targetSize 2.
+        if [ -z "$settled" ]; then
+          _fleet_say "warn:demand-age-unknown queued=$demand"
+        elif [ "$settled" != "0" ]; then
+          _fleet_say "fail:no-runners-under-demand queued=$settled"
+        fi
       fi
     elif [ "$online" = "0" ]; then
       # Distinguished from an empty pool deliberately, and unconditional on

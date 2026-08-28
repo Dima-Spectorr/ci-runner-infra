@@ -29,7 +29,7 @@ HEALTHY_POOL="tier=pool;has_lane=1;has_guard=1;has_reaper=1"
 HEALTHY_POOL="$HEALTHY_POOL;lane_pin=$WANT;guard_pin=$WANT;reaper_pin=$WANT;want_pin=$WANT"
 HEALTHY_POOL="$HEALTHY_POOL;enabled=true;armed=true;app_id=1;app_key=1"
 HEALTHY_POOL="$HEALTHY_POOL;checks_match=1;ruleset=1;runners=4;online=4"
-HEALTHY_POOL="$HEALTHY_POOL;corpses=0;demand=0;page=50"
+HEALTHY_POOL="$HEALTHY_POOL;corpses=0;demand=0;settled=0;page=50"
 
 # has <expected-substring> <description> <facts>
 has() {
@@ -194,8 +194,17 @@ hasnt "required-checks-disagree" "a dry-run lane does not report a check disagre
 # for it, which is the noise that teaches people to stop reading an audit.
 hasnt "fail:" "an idle pool at zero runners is not a failure" \
   "$(swap runners 0 | sed 's/;online=[^;]*/;online=0/')"
-has "fail:no-runners-under-demand" "zero runners WITH queued work is the failure" \
-  "$(swap runners 0 | sed 's/;online=[^;]*/;online=0/;s/;demand=[^;]*/;demand=7/')"
+has "fail:no-runners-under-demand" "zero runners WITH work queued past the boot grace is the failure" \
+  "$(swap runners 0 | sed 's/;online=[^;]*/;online=0/;s/;demand=[^;]*/;demand=7/;s/;settled=[^;]*/;settled=7/')"
+# THE FALSE POSITIVE THIS GRACE EXISTS FOR. A pool that scales from zero has no
+# runners for the first minutes of every queue, and the audit runs once a day
+# against whatever pull request happens to be seconds old at the time.
+hasnt "no-runners-under-demand" "demand younger than the boot grace is not yet the pool's debt" \
+  "$(swap runners 0 | sed 's/;online=[^;]*/;online=0/;s/;demand=[^;]*/;demand=2/;s/;settled=[^;]*/;settled=0/')"
+has "ok:compliant" "and that repository reads compliant rather than silent" \
+  "$(swap runners 0 | sed 's/;online=[^;]*/;online=0/;s/;demand=[^;]*/;demand=2/;s/;settled=[^;]*/;settled=0/')"
+has "warn:demand-age-unknown" "demand whose age could not be read is a warning, not a pass" \
+  "$(swap runners 0 | sed 's/;online=[^;]*/;online=0/;s/;demand=[^;]*/;demand=7/;s/;settled=[^;]*/;settled=/')"
 has "warn:demand-unknown" "an empty pool whose demand could not be read is reported" \
   "$(swap runners 0 | sed 's/;online=[^;]*/;online=0/;s/;demand=[^;]*/;demand=/')"
 # Unconditional on demand: hosts that registered and then went unreachable are

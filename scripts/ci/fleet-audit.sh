@@ -43,6 +43,13 @@ DEMAND_MAX_AGE="${DEMAND_MAX_AGE:-21600}"
 # The page the controller reads. Corpses are counted against it because the harm
 # is proportional to it, not to an absolute number.
 QUEUED_PAGE="${QUEUED_PAGE:-50}"
+# How long a queued run is allowed to wait before its pool owes it a runner.
+# These pools scale from zero: demand appears, the autoscaler reacts, a host
+# boots, installs and registers — measured on this fleet, two to four minutes.
+# A run queued more recently than this is not evidence of a pool that will not
+# scale; it is a pool that has not finished scaling, and reporting it turns
+# every repository with a fresh pull request red once a day.
+DEMAND_GRACE="${DEMAND_GRACE:-900}"
 
 command -v gh >/dev/null 2>&1 || { echo "fleet-audit: gh is not on PATH" >&2; exit 2; }
 [ -r "$MANIFEST" ] || { echo "fleet-audit: cannot read $MANIFEST" >&2; exit 2; }
@@ -148,26 +155,35 @@ checks_agree() {
   if [ "$from_lane" = "$from_ruleset" ]; then echo 1; else echo 0; fi
 }
 
-# queue_facts <repo> — prints `<corpses> <demand>`, or nothing if either read
-# failed. Corpses are queued runs the demand sweep will never act on; demand is
-# the queued runs inside the window, which is what the controller scales on.
+# queue_facts <repo> — prints `<corpses> <demand> <settled>`, or nothing if any
+# read failed. Corpses are queued runs the demand sweep will never act on;
+# demand is the queued runs inside the window, which is what the controller
+# scales on; settled is the subset of that demand old enough that a healthy
+# pool would already be serving it.
 #
-# BOTH, FROM ONE PLACE, BECAUSE THE POOL RULE NEEDS THEM TOGETHER. A pool with
-# no registered runners is the normal state of a healthy pool — these scale to
-# zero — and is a failure only when something is waiting for it.
+# ALL THREE, FROM ONE PLACE, BECAUSE THE POOL RULE NEEDS THEM TOGETHER. A pool
+# with no registered runners is the normal state of a healthy pool — these
+# scale to zero — and is a failure only when something has been waiting for it
+# longer than it takes to boot a host.
 queue_facts() {
-  local total recent since
+  local total recent settled since until_
   total=$(api "repos/$OWNER/$1/actions/runs?status=queued&per_page=$QUEUED_PAGE" \
           | jq -r '.total_count // empty' 2>/dev/null)
   [ -z "$total" ] && return 0
   # `gh api` hands the path to curl verbatim, so `>=` and the timestamp's colons
   # are encoded here rather than by a library.
   since=$(date -u -d "@$(( $(date -u +%s) - DEMAND_MAX_AGE ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
-  [ -z "$since" ] && return 0
+  until_=$(date -u -d "@$(( $(date -u +%s) - DEMAND_GRACE ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  { [ -z "$since" ] || [ -z "$until_" ]; } && return 0
   recent=$(api "repos/$OWNER/$1/actions/runs?status=queued&per_page=$QUEUED_PAGE&created=%3E%3D${since//:/%3A}" \
            | jq -r '.total_count // empty' 2>/dev/null)
   [ -z "$recent" ] && return 0
-  echo "$(( total - recent )) $recent"
+  # The range is the whole point: inside the controller's window AND outside the
+  # boot grace. A run in neither is not the pool's debt yet.
+  settled=$(api "repos/$OWNER/$1/actions/runs?status=queued&per_page=$QUEUED_PAGE&created=${since//:/%3A}..${until_//:/%3A}" \
+            | jq -r '.total_count // empty' 2>/dev/null)
+  [ -z "$settled" ] && return 0
+  echo "$(( total - recent )) $recent $settled"
 }
 
 facts_for() {
@@ -245,10 +261,10 @@ facts_for() {
       | jq -r "$runner_count (.runners|length) else empty end" 2>/dev/null)"
     facts="$facts;online=$(printf '%s' "$runners" \
       | jq -r "$runner_count ([.runners[]|select(.status==\"online\")]|length) else empty end" 2>/dev/null)"
-    local q corpses="" demand=""
+    local q corpses="" demand="" settled=""
     q=$(queue_facts "$repo")
-    [ -n "$q" ] && { corpses="${q%% *}"; demand="${q##* }"; }
-    facts="$facts;corpses=$corpses;demand=$demand;page=$QUEUED_PAGE"
+    [ -n "$q" ] && { corpses=${q%% *}; settled=${q##* }; demand=$(printf %s "$q" | cut -d" " -f2); }
+    facts="$facts;corpses=$corpses;demand=$demand;settled=$settled;page=$QUEUED_PAGE"
   fi
 
   # ONE strip for every fact, at the boundary. `jq` on a Windows workstation
