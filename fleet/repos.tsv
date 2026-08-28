@@ -21,9 +21,13 @@
 #            Audited for pins, arming, required-check agreement AND pool health.
 #   lane     the merge lane and its guards, on GitHub-hosted runners.
 #            Audited for everything except pool health.
+#   checks   CI gates, and deliberately no merge lane: changes land by direct
+#            push, so there is no pull request for a lane to gate. The mirror
+#            image of `dormant` — audited to confirm the checks are STILL
+#            there, because a repository that lost them looks like a quiet one.
 #   dormant  no CI at all. Audited to confirm it STILL has no CI: the day
-#            somebody adds a workflow, the repository has become a `lane`
-#            repository whose merges nothing serves, and that is the finding.
+#            somebody adds a workflow, the repository has become a `lane` or a
+#            `checks` repository, and that is the finding.
 #   empty    no default branch. Nothing to audit until it has one.
 #   source   this repository. It calls its own workflows through the `-self`
 #            variants rather than pinning a release of itself.
@@ -55,5 +59,5 @@ ASP	dormant	no workflows
 Borsh	dormant	no workflows, superseded by Borsh-Tablet-App
 SafetyOfficer-Legacy	dormant	no workflows, read-only reference of the legacy system
 Study-App	dormant	no workflows
-claude-config	dormant	no workflows, distributed by clone rather than CI
+claude-config	checks	syntax gates on 45 PowerShell + 6 JS files; pushed to directly, no PRs to gate
 modern-fileserver	dormant	no workflows
