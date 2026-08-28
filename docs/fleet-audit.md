@@ -75,6 +75,24 @@ abstract; it is whether anything else in the system would ever tell you.
 Only `fail:` turns the run red. A dry-run lane is a legitimate place to sit for
 a while, and an audit that goes red for it is an audit people stop reading.
 
+
+### An empty pool is only a failure once the boot grace has passed
+
+These pools scale from zero, so between the first queued run and the first
+registered host there is a window in which a healthy pool and a broken one look
+identical: no runners, work waiting. Measured on this fleet that window is two
+to four minutes.
+
+So the pool rule does not fail on demand — it fails on demand **older than
+`DEMAND_GRACE`** (15 minutes, deliberately generous; a pool that will not scale
+stays that way for hours). Without it the audit reported `mot-claude` as having
+no runners under demand while its MIG was already at `targetSize 2`, forty
+seconds after somebody opened a pull request. A daily audit that reds on
+whichever repository happens to have fresh work is one people stop reading, and
+that is the failure mode this whole file was written against.
+
+Demand whose age could not be read is `warn:demand-age-unknown`, not a pass.
+
 ## Running it
 
 ```bash
