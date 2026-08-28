@@ -43,12 +43,14 @@ reviewable a year later.
 |---|---|---|
 | `pool` | Self-hosted runners in a GCP project, plus the full lane | Everything, including pool health and the queued-run page |
 | `lane` | The merge lane and its guards on GitHub-hosted runners | Everything except pool health |
-| `dormant` | No CI at all | That it **still** has none — the day a workflow appears, it has become a `lane` repository whose merges nothing serves |
+| `checks` | CI gates, deliberately no merge lane — changes land by direct push | That the checks are **still** there; a repository that lost them looks exactly like a quiet one |
+| `dormant` | No CI at all | That it **still** has none — the day a workflow appears it has become a `lane` or `checks` repository, and nobody said so |
 | `empty` | No default branch | That it still has none |
 | `source` | This repository | Nothing pin-related: it calls its own workflows through the `-self` variants |
 
-`dormant` is the row that earns the manifest. Its exemption is conditional on a
-fact that can change without anyone deciding to change it.
+`dormant` and `checks` are the rows that earn the manifest. Each is exempt from
+the lane for a reason, and each reason is a fact that can change without anyone
+deciding to change it — a workflow appearing, or a workflow going away.
 
 ## Every unknown is a finding
 

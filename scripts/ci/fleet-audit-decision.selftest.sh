@@ -68,7 +68,7 @@ has "ok:compliant" "a healthy lane repository is compliant" \
 
 # THE INVARIANT THE WHOLE AUDIT RESTS ON. An empty result and a clean result
 # must never render the same, in any tier — including a tier nobody recognised.
-for t in pool lane dormant empty source nonsense ""; do
+for t in pool lane checks dormant empty source nonsense ""; do
   out=$(fleet_verdict "tier=$t")
   if [ -n "$out" ]; then
     PASS=$((PASS + 1))
@@ -86,6 +86,13 @@ has "fail:dormant-repo-has-ci" "a dormant repository that grew CI must be reclas
   "tier=dormant;has_ci=1"
 has "warn:ci-unknown" "a dormant repository whose workflows could not be listed is a warning" \
   "tier=dormant"
+has "ok:compliant" "a checks repository with CI is compliant" "tier=checks;has_ci=1"
+has "fail:checks-repo-has-no-ci" "a checks repository that lost its CI must be reclassified" \
+  "tier=checks;has_ci=0"
+has "warn:ci-unknown" "a checks repository whose workflows could not be listed is a warning" \
+  "tier=checks"
+hasnt "no-merge-lane" "a checks repository is never reported as missing the lane" \
+  "tier=checks;has_ci=1"
 has "ok:compliant" "an empty repository is compliant" "tier=empty;has_ci=0"
 has "fail:empty-repo-has-ci" "an empty repository that grew CI must be reclassified" \
   "tier=empty;has_ci=1"

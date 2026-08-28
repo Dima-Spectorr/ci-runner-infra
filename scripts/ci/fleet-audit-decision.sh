@@ -56,7 +56,7 @@ _fleet_say() {
 # abstract; it is whether anything else in the system would ever tell you.
 #
 # Facts, all optional, all defaulting to unknown:
-#   tier          pool | lane | dormant | empty | source | (anything else)
+#   tier          pool | lane | checks | dormant | empty | source | (anything else)
 #   has_lane      1 if .github/workflows/merge-lane.yml exists
 #   has_guard     1 if the pr-guard caller exists
 #   has_reaper    1 if the branch-reaper caller exists
@@ -155,10 +155,24 @@ fleet_verdict() {
       # THE ROW THAT EARNS THE MANIFEST. A dormant repository is exempt from the
       # lane because it has no CI for a lane to gate on. Add one workflow and
       # that reason is void — but nothing anywhere would have said so, and the
-      # repository would sit there running checks that gate no merge.
-      [ "$has_ci" = "1" ] && _fleet_say "fail:dormant-repo-has-ci reclassify=lane"
+      # repository would sit there running checks that gate no merge. Whether it
+      # becomes `lane` or `checks` is a human call: it turns on whether changes
+      # arrive by pull request at all.
+      [ "$has_ci" = "1" ] && _fleet_say "fail:dormant-repo-has-ci reclassify=lane-or-checks"
       [ "$has_ci" = "" ] && _fleet_say "warn:ci-unknown could-not-list-workflows"
       [ "$found" = "0" ] && echo "ok:compliant tier=dormant"
+      return 0
+      ;;
+    checks)
+      # The mirror image of `dormant`, and it exists for the same reason. This
+      # repository has CI and deliberately no merge lane: its changes land by
+      # direct push, so there is no pull request for a lane to gate. The fact
+      # its exemption rests on is that the checks are actually there — take the
+      # workflow away and the repository is running nothing, which reads exactly
+      # like a healthy quiet one.
+      [ "$has_ci" = "0" ] && _fleet_say "fail:checks-repo-has-no-ci reclassify=dormant"
+      [ "$has_ci" = "" ] && _fleet_say "warn:ci-unknown could-not-list-workflows"
+      [ "$found" = "0" ] && echo "ok:compliant tier=checks"
       return 0
       ;;
     source)
