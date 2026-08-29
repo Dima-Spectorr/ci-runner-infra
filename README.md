@@ -798,7 +798,10 @@ inside exactly like a project with nothing wrong. `--email` is optional and
 omitting it adopts the channel the project already pages; an address is needed
 only to bootstrap a project that has never had one, or to disambiguate a project
 that has several. The step never fails the apply: a build account without
-`roles/monitoring.editor` gets a warning naming the role.
+`roles/monitoring.alertPolicyEditor` and `roles/monitoring.notificationChannelEditor`
+gets a warning naming the roles. Those two rather than `roles/monitoring.editor`
+(#548) — the step writes alert policies and, on a project's first run, the one
+channel they point at, and nothing else `editor` would also open up.
 
 Two of the thirteen watch the
 cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it

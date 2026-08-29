@@ -366,9 +366,10 @@ resource "google_cloudbuild_trigger" "apply" {
           else
             echo "WARNING: could not bring the alert policies up to date (exit $rc)."
             echo "This does NOT fail the apply. The usual cause is that the build"
-            echo "account lacks roles/monitoring.editor in this project; the other"
-            echo "is a project with no email notification channel yet, which needs"
-            echo "one manual run with --email <addr> to bootstrap."
+            echo "account lacks roles/monitoring.alertPolicyEditor and"
+            echo "roles/monitoring.notificationChannelEditor in this project; the"
+            echo "other is a project with no email notification channel yet, which"
+            echo "needs one manual run with --email <addr> to bootstrap."
           fi
         EOT
         ]

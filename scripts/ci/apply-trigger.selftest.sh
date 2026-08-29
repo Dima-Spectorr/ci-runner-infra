@@ -255,7 +255,14 @@ reconciles_alerts_without_gating_the_apply() {
   ! matches "$block" 'curl'                   || return 1
   # Swallowed exit status, and a warning that names the remedy.
   matches "$block" 'rc=\$\?'                  || return 1
-  matches "$block" 'monitoring.editor'        || return 1
+  # BOTH roles, and never the broad one. The step creates the notification
+  # channel on a project's first run as well as the policies, so a warning
+  # naming only the policy role sends the reader to a grant that still fails
+  # there — and `monitoring.editor` would also open dashboards, uptime checks
+  # and log-based metrics that this step never touches (#548).
+  matches "$block" 'monitoring.alertPolicyEditor'         || return 1
+  matches "$block" 'monitoring.notificationChannelEditor' || return 1
+  ! matches "$block" 'roles/monitoring.editor'            || return 1
 }
 
 # 14. No inbox literal anywhere in the module. The address is the one thing here
