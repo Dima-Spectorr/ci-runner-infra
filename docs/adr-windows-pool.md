@@ -1,6 +1,16 @@
 # Windows as a first-class pool
 
-Status: **proposed** (design only; nothing here is implemented).
+Status: **accepted, and built in `ci-runner-host-pool` — but never once run.**
+`host_os = "windows"` exists end to end in the module (#76, 2026-08-16): the boot
+script, the beacon publisher, the service shim, the plan-time refusals, and the
+image template `packer/ci-host-image-win.pkr.hcl`. What does **not** exist is a
+way to *build* that image. `cloudbuild.yaml` drives the Linux template only, and
+`ci-host-image-trigger` names that file and nothing else, so no
+`ci-runner-host-win` image has ever been produced in any project in the fleet
+and no Windows pool of this module has ever booted a host. Read "the module
+supports Windows" as "the module is ready for the first one", not as "there is
+one running": until the image build path lands (#543), a root that declares a
+Windows pool plans clean and applies into a MIG with no image to name.
 Supersedes: the "Windows" section of `docs/onboarding-a-repository.md`, which
 records the current state rather than a decision.
 Amended 2026-08-22: §4's refusal of a container runtime is re-affirmed, and the

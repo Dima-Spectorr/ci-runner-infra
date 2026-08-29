@@ -988,6 +988,11 @@ it as a broken image.
 1. Build the Windows image (`packer/ci-host-image-win.pkr.hcl`) and note both
    its `image_version` (the artifact) and its `image_contract_version` (the
    contract the boot script asserts against `windows_image_min_version`).
+   **Nothing builds it yet** — `cloudbuild.yaml` and `ci-host-image-trigger`
+   both drive the Linux template only, and as of 2026-08-29 no
+   `ci-runner-host-win` image exists in any project in the fleet. Until #543
+   lands, this step is a hand-typed `packer build` and the rest of this
+   sequence has nothing to point `host_image` at.
 2. Stand the pool up **alongside** whatever runs your Windows jobs today, on its
    own labels, with `min_hosts = 0` and `slots_per_host = 1`.
 3. Apply, and watch the first host register. A Windows host that boots silently
