@@ -72,14 +72,6 @@ Disarm by setting `CODEX_REVIEW_ARMED` to anything else. Setting
 
 ## The caller
 
-> **The pin below is not usable yet.** `codex-review.yml` is newer than every
-> release that exists — v5.76.0 was cut before it merged and does not carry it —
-> so the sha in the `uses:` line resolves to a tree that does not contain it and
-> a caller copying this today gets *reusable workflow not found*. The release
-> that carries it is cut once this merges, and the line is bumped to that sha
-> then. Until you see a pin whose trailing comment is **v5.77.0 or later**, this
-> file is a design, not an instruction.
-
 ```yaml
 name: Codex review
 
@@ -100,7 +92,14 @@ jobs:
     if: >-
       vars.CODEX_REVIEW_ENABLED == 'true' &&
       github.event.workflow_run.conclusion == 'success'
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/codex-review.yml@17cf4b3059dac1bbd9613b34465d6d8951abba34 # v5.75.0
+    # `check-runner-policy.sh` RUNNER7 refuses to decide the runner scope and
+    # timeouts of a workflow it cannot read, and this one is in another
+    # repository. The marker records that a human read it — one job,
+    # `timeout-minutes: 10`, `contents: read` + `pull-requests: write`, and a
+    # `runs-on` YOUR file supplies — and points at the issue where that reading
+    # lives. Open one; the gate rejects a marker without an issue number.
+    # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/codex-review.yml, #<issue>): read and recorded there
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/codex-review.yml@d8d1e6d8be794657066a8d32a0327b62172ea299 # v5.77.0
     permissions:
       contents: read
       pull-requests: write
