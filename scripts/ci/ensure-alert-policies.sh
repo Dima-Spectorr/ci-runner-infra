@@ -21,10 +21,18 @@
 # Usage:
 #   ensure-alert-policies.sh --project <id> --email <addr> [--account <sa-email>]
 #                            [--poll-interval-seconds <n>] [--cache-stale-hours <n>]
+#                            [--register-grace-seconds <n>] [--drain-grace-seconds <n>]
 #                            [--dry-run]
 #
 #   --poll-interval-seconds must match the pool's `poll_interval_seconds`: the
 #   slow-tick threshold is derived from it, because the watchdog window is.
+#
+#   --register-grace-seconds and --drain-grace-seconds must match the pool's
+#   variables of the same name. THIS IS NOT DECORATION, and getting it wrong is
+#   what made this script's own alerting unreadable for a fortnight: both of the
+#   thresholds below are statements about how long the pool is ALLOWED to take,
+#   so a literal that disagrees with the pool pages on supported behaviour. See
+#   the queue and idle policies for the derivation in each case.
 #
 #   --cache-stale-hours must be BELOW the pool's `cache_snapshot_max_age_hours`.
 #   Set at or above it, the alert fires only once hosts have already started
@@ -48,6 +56,11 @@ POLL=20
 # warning are the whole point — at 168 the first notification a human gets is
 # every host in the pool starting cold.
 CACHE_STALE_HOURS=48
+# Both mirror the ci-runner-host-pool defaults. A pool that sets its own must
+# pass it here too; the two policies that read them say what goes wrong if it
+# does not.
+REGISTER_GRACE=600
+DRAIN_GRACE=900
 while [ $# -gt 0 ]; do
   case "$1" in
     --project) PROJECT="$2"; shift 2 ;;
@@ -55,6 +68,8 @@ while [ $# -gt 0 ]; do
     --account) ACCOUNT="$2"; shift 2 ;;
     --poll-interval-seconds) POLL="$2"; shift 2 ;;
     --cache-stale-hours) CACHE_STALE_HOURS="$2"; shift 2 ;;
+    --register-grace-seconds) REGISTER_GRACE="$2"; shift 2 ;;
+    --drain-grace-seconds) DRAIN_GRACE="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -65,6 +80,10 @@ case "$POLL" in ''|*[!0-9]*) echo "--poll-interval-seconds must be a whole numbe
 [ "$POLL" -ge 1 ] || { echo "--poll-interval-seconds must be >= 1" >&2; exit 2; }
 case "$CACHE_STALE_HOURS" in ''|*[!0-9]*) echo "--cache-stale-hours must be a whole number of hours" >&2; exit 2 ;; esac
 [ "$CACHE_STALE_HOURS" -ge 1 ] || { echo "--cache-stale-hours must be >= 1" >&2; exit 2; }
+case "$REGISTER_GRACE" in ''|*[!0-9]*) echo "--register-grace-seconds must be a whole number of seconds" >&2; exit 2 ;; esac
+[ "$REGISTER_GRACE" -ge 1 ] || { echo "--register-grace-seconds must be >= 1" >&2; exit 2; }
+case "$DRAIN_GRACE" in ''|*[!0-9]*) echo "--drain-grace-seconds must be a whole number of seconds" >&2; exit 2 ;; esac
+[ "$DRAIN_GRACE" -ge 1 ] || { echo "--drain-grace-seconds must be >= 1" >&2; exit 2; }
 
 # Same expression the module and the watchdog use, as a pure function so the
 # self-test can exercise the deployed text rather than a copy of it.
@@ -75,7 +94,30 @@ watchdog_threshold() {
   echo "$t"
 }
 WATCHDOG_THRESHOLD="$(watchdog_threshold "$POLL")"
-SLOW_TICK=$(( WATCHDOG_THRESHOLD / 2 ))
+# Four fifths of the watchdog window, not half of it. Half is not a precursor,
+# it is the middle of the healthy range: a pool polling every 20s has a 300s
+# window, and 150s ticks are ordinary on a busy repository — measured over one
+# week on this fleet, the slow-tick policy opened ten incidents and every one of
+# them peaked at 179s, comfortably inside a window nothing was close to
+# exhausting. At four fifths the alert keeps a full tick of warning before the
+# watchdog restarts anything and stops claiming a healthy tick is an emergency.
+SLOW_TICK=$(( WATCHDOG_THRESHOLD * 4 / 5 ))
+# ONE ALIGNMENT WINDOW BEYOND THE POOL'S OWN BOOT BUDGET, and nothing shorter is
+# defensible. register_grace_seconds is the pool's statement of how long a host
+# may take from creation to its last agent registering; a job that arrives at a
+# pool scaled to zero cannot be served before that time has passed, by
+# definition. The old literal of 600 equalled the Linux boot budget exactly, so
+# every cold start raced its own alert — and on Windows, where the module floors
+# the grace at 1200, it fired at half the permitted boot time. Two pools in this
+# fleet sit at zero almost always, so almost every job there was a cold start:
+# they produced 72 of the 184 incidents measured in the week before this change
+# while serving barely a host of real work.
+QUEUE_WAIT=$(( REGISTER_GRACE + 300 ))
+# Same shape against the drain side: drain_grace_seconds is how long a host may
+# sit idle before the controller is expected to drain it, so the alert has to
+# start one window after that and not at a literal that a pool with a wider warm
+# window would breach continuously.
+IDLE_THRESHOLD=$(( DRAIN_GRACE + 300 ))
 
 # The corporate proxy blackholes the token endpoint; without this every call
 # below fails as an auth error rather than a network one, which sends the reader
@@ -258,24 +300,28 @@ EOF
 EOF
     ;;
     idle) cat <<EOF
-{ "displayName": "CI runners / pool not scaling to zero (idle host 20m)",
-  "combiner": "OR",
+{ "displayName": "CI runners / pool not scaling to zero (unpinned idle host)",
+  "combiner": "AND_WITH_MATCHING_RESOURCE",
   "documentation": { "mimeType": "text/markdown", "content":
-    "A warm host has been idle past the drain threshold and was not removed — scale-to-zero is broken and the pool is burning money. Check controller drain logs and the MIG autoscaler. If ci_runner_list_blind_ticks is also non-zero, THAT is the cause and this alert is a symptom." },
-  "conditions": [ { "displayName": "ci_host_idle_seconds_max > 1200 for 10m",
-    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 1200.0, "duration": "600s",
+    "A warm host with no pin on it has been idle past this pool's drain threshold of ${DRAIN_GRACE}s and was not removed — scale-to-zero is broken and the pool is burning money. Check controller drain logs and the MIG autoscaler. If ci_runner_list_blind_ticks is also non-zero, THAT is the cause and this alert is a symptom.\n\nTHE SECOND CONDITION IS WHAT MAKES THIS READABLE. Idle time alone does not mean a host should have gone: pull-request host affinity holds a host for its pull request deliberately, and such a host reports exactly the idle seconds of one the drain loop forgot. Measured over a week on the busiest repository in this fleet, ci_pin_holds_honoured was non-zero for 565 of 1609 samples on one pool and 508 of 800 on the other — which accounted for very nearly every sample where idle time passed the threshold. On idle time alone this policy opened twenty incidents in that week and every one of them was affinity working as designed, so requiring BOTH conditions on the same resource is the difference between an alert about scale-to-zero and an alert about the pool being used.\n\nAND_WITH_MATCHING_RESOURCE, not AND: the controller publishes both series per pool under a generic_node whose namespace IS the pool name, so matching on the resource is what keeps a pin on one pool from silencing an idle host on another." },
+  "conditions": [ { "displayName": "ci_host_idle_seconds_max > ${IDLE_THRESHOLD} for 10m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": ${IDLE_THRESHOLD}.0, "duration": "600s",
       "filter": "metric.type=\"custom.googleapis.com/ci/ci_host_idle_seconds_max\" AND resource.type=\"generic_node\"",
+      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } },
+    { "displayName": "ci_pin_holds_honoured < 1 for 10m",
+    "conditionThreshold": { "comparison": "COMPARISON_LT", "thresholdValue": 1.0, "duration": "600s",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_pin_holds_honoured\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
     queue) cat <<EOF
-{ "displayName": "CI runners / queue starved (job waiting 10m)",
+{ "displayName": "CI runners / queue starved (job waiting past the boot budget)",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "A queued job has waited past the SLO without a slot. Either the pool hit max_hosts, hosts failed to boot, or the runner agent is offline. Compare ci_hosts_running with ci_mig_target_size, then read the host serial logs." },
-  "conditions": [ { "displayName": "ci_queue_wait_seconds_max > 600 for 10m",
-    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 600.0, "duration": "600s",
+    "A queued job has waited ${QUEUE_WAIT}s without a slot — this pool's register_grace_seconds of ${REGISTER_GRACE}s plus one alignment window, which is the longest a COLD start is allowed to take. Either the pool hit max_hosts, hosts failed to boot, or the runner agent is offline. Compare ci_hosts_running with ci_mig_target_size, then read the host serial logs.\n\nThe threshold is derived rather than fixed because the fixed one was wrong in the only way that matters: at 600s it equalled the Linux boot budget exactly, so a single job arriving at a pool scaled to zero raced its own alert, and on a Windows pool — where the module floors register_grace_seconds at 1200 — it fired at half the boot time the pool was configured to permit. Pass --register-grace-seconds whenever the pool overrides it.\n\nBEFORE BELIEVING THIS ONE, LOOK AT HOW LONG THE WAIT IS. ci_queue_wait_seconds_max is the age of the oldest QUEUED run, and GitHub leaves runs queued that can never be served — a run whose branch was deleted, or one left behind by a merge-queue branch — which no drain, no scale-up and no re-run will clear. Such a corpse pins this series at its own age until the controller expires the demand a day later, then the next tick rediscovers it, which reads as the alert flapping rather than as one stuck run. A wait of hours on a pool with spare max_hosts is that, not starvation: on this fleet the median breaching sample was 10.6 hours while the pool sat healthy. List the repository's queued runs by age, and delete the ones whose pull request has already merged." },
+  "conditions": [ { "displayName": "ci_queue_wait_seconds_max > ${QUEUE_WAIT} for 15m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": ${QUEUE_WAIT}.0, "duration": "900s",
       "filter": "metric.type=\"custom.googleapis.com/ci/ci_queue_wait_seconds_max\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
@@ -297,7 +343,7 @@ EOF
 { "displayName": "CI runners / tick approaching the watchdog threshold",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "A controller tick is taking longer than ${SLOW_TICK}s — half this pool's watchdog threshold of ${WATCHDOG_THRESHOLD}s (max(300, poll_interval_seconds * 10), with poll_interval_seconds=${POLL}). This is the precursor to a total blackout, not a slowdown: once a tick outlasts the threshold the watchdog restarts the controller mid-tick, the restart prevents the heartbeat that would have stopped it, and every series — heartbeat included — goes absent while systemd still reports active (running). Two pools in this fleet ran that way for hours on 2026-08-14. Demand costs one API call per active workflow run, so the usual cause is a busier repository; lower demand_budget_seconds, or raise poll_interval_seconds AND re-run this script so the threshold follows the wider watchdog window. Check ci_demand_runs_skipped." },
+    "A controller tick is taking longer than ${SLOW_TICK}s — four fifths of this pool's watchdog threshold of ${WATCHDOG_THRESHOLD}s (max(300, poll_interval_seconds * 10), with poll_interval_seconds=${POLL}). This is the precursor to a total blackout, not a slowdown: once a tick outlasts the threshold the watchdog restarts the controller mid-tick, the restart prevents the heartbeat that would have stopped it, and every series — heartbeat included — goes absent while systemd still reports active (running). Two pools in this fleet ran that way for hours on 2026-08-14. Demand costs one API call per active workflow run, so the usual cause is a busier repository; lower demand_budget_seconds, or raise poll_interval_seconds AND re-run this script so the threshold follows the wider watchdog window. Check ci_demand_runs_skipped.\n\nFour fifths and not half, which is what this was until it was measured: half the window is the middle of the healthy range, not a precursor to anything. A pool polling every 20s has a 300s window, and a 150s tick is ordinary on a busy repository — over one week this policy opened ten incidents at half and every one of them peaked at 179s, nowhere near exhausting a window nothing was close to exhausting. At four fifths there is still a full tick of warning before the watchdog restarts anything." },
   "conditions": [ { "displayName": "ci_tick_seconds > ${SLOW_TICK} for 10m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": ${SLOW_TICK}.0, "duration": "600s",
       "filter": "metric.type=\"custom.googleapis.com/ci/ci_tick_seconds\" AND resource.type=\"generic_node\"",
@@ -333,9 +379,9 @@ EOF
 { "displayName": "CI runners / capacity on paper only (slots registered short of slots built)",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "Hosts are RUNNING and past their registration grace, and fewer runner agents answer than the pool was built with. This is the one alert that separates 'the pool is fine and jobs are queuing' from 'the pool is not there': ci_slots_total is arithmetic — hosts x slots — so it reads identically whether every agent registered or none did, and every other series stays green through all three of the failures below.\n\nRead ci_slots_registered next to ci_slots_total to size the gap, then the host serial log. Three causes, in rough order of likelihood: a host that registered NOTHING (its config.sh never completed — check the registration token and egress to github.com); a host whose slot units died before the agent started (a truncated generated hook is 203/EXEC, and the host still reports healthy); or a slot the host's own sweep CONDEMNED after CONDEMN_MAX consecutive failures to reach a clean state, which is the sweep working — the slot was failing every job it claimed — and grep 'taking it out of service' in the host's syslog will say so.\n\nA controller that cannot read the runner list contributes to neither side of this, by construction, so an unreadable API cannot raise it. Sustained non-zero only: a host replaced mid-window is excluded by the grace, but a rolling recycle can still tick it briefly." },
-  "conditions": [ { "displayName": "ci_slots_missing > 0 for 15m",
-    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "900s",
+    "Hosts are RUNNING and past their registration grace, and fewer runner agents answer than the pool was built with. This is the one alert that separates 'the pool is fine and jobs are queuing' from 'the pool is not there': ci_slots_total is arithmetic — hosts x slots — so it reads identically whether every agent registered or none did, and every other series stays green through all three of the failures below.\n\nRead ci_slots_registered next to ci_slots_total to size the gap, then the host serial log. Three causes, in rough order of likelihood: a host that registered NOTHING (its config.sh never completed — check the registration token and egress to github.com); a host whose slot units died before the agent started (a truncated generated hook is 203/EXEC, and the host still reports healthy); or a slot the host's own sweep CONDEMNED after CONDEMN_MAX consecutive failures to reach a clean state, which is the sweep working — the slot was failing every job it claimed — and grep 'taking it out of service' in the host's syslog will say so.\n\nA controller that cannot read the runner list contributes to neither side of this, by construction, so an unreadable API cannot raise it. Sustained non-zero only, for thirty minutes: a host replaced mid-window is excluded by the grace, but a rolling recycle still ticks it, and at fifteen minutes a recycle that paused between hosts — which is what a cordon does, one host at a time — outlasted the window and paged for a pool being upgraded exactly as intended." },
+  "conditions": [ { "displayName": "ci_slots_missing > 0 for 30m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
       "filter": "metric.type=\"custom.googleapis.com/ci/ci_slots_missing\" AND resource.type=\"generic_node\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MIN" } ] } } ],
   "notificationChannels": [ "$channel" ] }
@@ -503,6 +549,7 @@ ensure_descriptor() {  # <short name> <description> [label ...]
 ensure_descriptor ci_poller_heartbeat        "1 on every controller tick. Absence means the controller is dead."
 ensure_descriptor ci_runner_list_blind_ticks "Consecutive ticks the controller could not read the GitHub runner list. Non-zero means scale-in is suspended."
 ensure_descriptor ci_host_idle_seconds_max   "Longest idle time across warm hosts."
+ensure_descriptor ci_pin_holds_honoured      "Warm hosts kept alive this tick because a pull request is pinned to them. Read WITH ci_host_idle_seconds_max and never alone: idle time on a pinned host is affinity working, not a drain that failed, and the two together are what distinguish the pool being used from scale-to-zero being broken."
 ensure_descriptor ci_queue_wait_seconds_max  "Longest time a queued job has waited for a slot."
 ensure_descriptor ci_drain_verdicts          "Drain-loop outcomes, labelled by outcome." outcome
 ensure_descriptor ci_tick_seconds            "Controller tick duration. Approaching the watchdog threshold means an imminent restart loop in which nothing is published at all."
@@ -567,6 +614,29 @@ for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsm
   name="${name_all%%$'\n'*}"
   id_all="$(printf '%s\n' "$existing" | awk -F'\t' -v n="$name" '$1==n {print $2}')"
   id="${id_all%%$'\n'*}"
+
+  # A policy this script has RENAMED is not a policy this script has never seen.
+  # The inventory above is keyed on displayName and nothing else, so the moment a
+  # name in policy_json() changes, the old policy stops matching, looks absent,
+  # and the run creates a second one beside it — leaving the old thresholds live,
+  # still notifying, and no longer reachable from this file. That is the same
+  # double-page the duplicate check below reports, except this script would have
+  # caused it. Fall back to the name the policy used to carry: PATCH sends the
+  # whole policy, displayName included, so updating the old id renames it in
+  # place. Add a row here whenever a displayName changes, and only ever remove
+  # one once every project has been synced past it.
+  if [ -z "$id" ]; then
+    former=""
+    case "$key" in
+      idle)  former="CI runners / pool not scaling to zero (idle host 20m)" ;;
+      queue) former="CI runners / queue starved (job waiting 10m)" ;;
+    esac
+    if [ -n "$former" ]; then
+      id_all="$(printf '%s\n' "$existing" | awk -F'\t' -v n="$former" '$1==n {print $2}')"
+      id="${id_all%%$'\n'*}"
+      [ -z "$id" ] || echo "$PROJECT: renaming ${id##*/} — '$former' becomes '$name'" >&2
+    fi
+  fi
 
   # Taking the first match keeps the script running, but two policies with one
   # displayName is a state it must not pass over in silence: this run updates one

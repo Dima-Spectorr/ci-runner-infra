@@ -52,7 +52,14 @@ check "a fast poll cannot lower the window below the floor" 300 "$(watchdog_thre
 check "a 60s poll widens the window to 600s" 600 "$(watchdog_threshold 60)"
 # The false page from the review: 200s ticks on a 60s poll are healthy, and a
 # fixed 150s threshold pages for them.
-check "half a 600s window is 300s, not 150s" 300 "$(( $(watchdog_threshold 60) / 2 ))"
+check "a 600s window derives 480s, not a fixed 150s" 480 "$(( $(watchdog_threshold 60) * 4 / 5 ))"
+# Four fifths and not half, which is what shipped first. Half a 300s window is
+# 150s, and a tick of 150s on a 20s poll is the middle of the healthy range —
+# measured over a week, every incident this raised peaked at 179s against a
+# window nothing came near exhausting. The alert is meant to be the precursor to
+# the watchdog restarting the controller, so it has to sit close enough to the
+# window to mean that, and still leave a full tick of warning.
+check "the default window warns at 240s, not at 150s" 240 "$(( $(watchdog_threshold 20) * 4 / 5 ))"
 
 # ── structural: the tested text is the shipped text ──────────────────────────
 # A grep for a literal line of shell: the $(…) and "$VAR" inside these patterns
@@ -66,6 +73,59 @@ check "the controller uses the tested budget rule" yes \
 # shellcheck disable=SC2016
 check "the alert script uses the tested threshold rule" yes \
   "$(found "$ALERTS" 'WATCHDOG_THRESHOLD="$(watchdog_threshold "$POLL")"')"
+
+# shellcheck disable=SC2016
+check "the slow-tick threshold is four fifths of the window" yes \
+  "$(found "$ALERTS" 'SLOW_TICK=$(( WATCHDOG_THRESHOLD * 4 / 5 ))')"
+
+# The two thresholds that must follow the POOL's own configuration rather than a
+# literal. A pool may widen either grace — Windows is FORCED to, the module
+# floors register_grace_seconds at 1200 there — and a fixed threshold then fires
+# at half the boot time the pool is configured to permit, on every cold start,
+# forever. Both derive from the value passed in, plus one alignment window.
+# shellcheck disable=SC2016
+check "the queue threshold follows register_grace_seconds" yes \
+  "$(found "$ALERTS" 'QUEUE_WAIT=$(( REGISTER_GRACE + 300 ))')"
+# shellcheck disable=SC2016
+check "the idle threshold follows drain_grace_seconds" yes \
+  "$(found "$ALERTS" 'IDLE_THRESHOLD=$(( DRAIN_GRACE + 300 ))')"
+
+# Neither may be spent as a literal in the policy body: an interpolated
+# threshold that some later edit pins back to a number is the same bug with the
+# derivation still sitting above it, looking correct.
+check "no policy hard-codes the old 600s queue threshold" yes \
+  "$(if grep -q '"thresholdValue": 600\.0' "$ALERTS"; then echo no; else echo yes; fi)"
+check "no policy hard-codes the old 1200s idle threshold" yes \
+  "$(if grep -q '"thresholdValue": 1200\.0' "$ALERTS"; then echo no; else echo yes; fi)"
+
+# Idle time alone does not mean a host should have gone: a pull request pinned
+# to a host holds it warm on purpose and reports exactly the idle seconds of one
+# the drain loop forgot. The pairing is the whole alert, and it has to be
+# AND_WITH_MATCHING_RESOURCE — plain AND would let a pin on one pool silence a
+# genuinely stuck host on another.
+check "the idle policy pairs idle time with the pin holds" yes \
+  "$(if sed -n '/pool not scaling to zero/,/^EOF/p' "$ALERTS" \
+      | grep -q 'ci_pin_holds_honoured'; then echo yes; else echo no; fi)"
+check "the idle policy matches the two conditions per resource" yes \
+  "$(if sed -n '/pool not scaling to zero/,/^EOF/p' "$ALERTS" \
+      | grep -q '"combiner": "AND_WITH_MATCHING_RESOURCE"'; then echo yes; else echo no; fi)"
+# A policy naming a descriptor this script never declares is rejected 404 on a
+# project where no host has published that series yet, and the run defers it.
+check "the paired metric is declared as a descriptor" yes \
+  "$(found "$ALERTS" 'ensure_descriptor ci_pin_holds_honoured')"
+
+# Renaming a policy without this lookup does not rename anything: the inventory
+# is keyed on displayName, the old policy stops matching, and the run creates a
+# second one beside it — old thresholds still live, still notifying, no longer
+# reachable from the file. Both policies renamed in this change need a row.
+check "the sync loop can find a policy under its former name" yes \
+  "$(if sed -n '/^for key in heartbeat/,/^done/p' "$ALERTS" \
+      | grep -q 'former='; then echo yes; else echo no; fi)"
+for old in "CI runners / queue starved (job waiting 10m)" \
+           "CI runners / pool not scaling to zero (idle host 20m)"; do
+  check "the former name is still looked up: ${old##*/ }" yes \
+    "$(if grep -qF "$old" "$ALERTS"; then echo yes; else echo no; fi)"
+done
 
 # The deadline must cover the run-list calls too — starting it after them was
 # how the budget came to authorise twice its own value.

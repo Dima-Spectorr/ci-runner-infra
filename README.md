@@ -789,7 +789,7 @@ window and still hold live work.
 distinguish from "the pool is idle".
 
 `scripts/ci/ensure-alert-policies.sh --project <id> --email <addr>` brings one
-project's policies up to the fleet's, idempotently. Two of the ten watch the
+project's policies up to the fleet's, idempotently. Two of the thirteen watch the
 cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it
 below the pool's `cache_snapshot_max_age_hours`, or the first notice anyone gets
 is every host starting cold) and *hydrate failing on a configured pool*, which
@@ -799,7 +799,35 @@ controller policies: their series appear once per boot, and asking a sporadic
 series to hold a condition for ten minutes silences exactly the pool with few
 boots and every one of them broken.
 
-The ninth watches the egress record. `modules/ci-runner-network` logs the runner
+**Three of the thresholds are derived from the pool's own configuration, and a
+pool that overrides either grace has to pass it here too** —
+`--register-grace-seconds` and `--drain-grace-seconds`, defaulting to the
+module's 600 and 900. *Queue starved* fires at `register_grace_seconds` plus one
+alignment window, because a job arriving at a pool scaled to zero cannot be
+served before a host has booted and registered: at the flat 600s it used to
+carry, every cold start raced its own alert, and on Windows — where the module
+floors the grace at 1200 — it fired at half the boot time the pool was
+configured to permit. *Not scaling to zero* fires one window past
+`drain_grace_seconds`, and only where `ci_pin_holds_honoured` is zero on the same
+resource: pull-request host affinity holds a host warm deliberately, and such a
+host reports exactly the idle seconds of one the drain loop forgot. *Tick
+approaching the watchdog* sits at four fifths of the watchdog window rather than
+half of it — half is the middle of the healthy range, not a precursor to
+anything.
+
+Together those three were most of the mail this fleet produced. Measured over the
+week to 2026-08-29 across the three projects that have these policies, they
+opened 184 incidents — 368 notifications — of which the great majority were the
+pool behaving exactly as configured; replayed against the same seven days, the
+thresholds above open 97. **Read *queue starved* against how long the wait is
+before believing it:** `ci_queue_wait_seconds_max` is the age of the oldest
+queued run, and GitHub leaves runs queued that can never be served — a branch
+deleted, a merge-queue branch gone — which no scale-up clears and which pin the
+series at their own age until the controller expires the demand a day later.
+That expire-and-rediscover cycle is what makes the incident look like flapping
+rather than one stuck run.
+
+One more watches the egress record. `modules/ci-runner-network` logs the runner
 firewall rules, so a refused outbound connection is now an entry rather than a
 test client hanging until the job times out; a log-based metric counts those and
 *egress refused* pages on a sustained run. The refusals are the alertable half.
