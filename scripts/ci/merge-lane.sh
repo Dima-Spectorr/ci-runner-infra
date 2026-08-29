@@ -472,14 +472,66 @@ review_answered() {
 # would charge a pull request for the whole of its own CI run and, on one that
 # has been open for a day, would expire the grace before the first pass.
 #
-# The last required check to finish is that moment, read from the check-run
-# surface. Prints "" when it cannot be read, which `lane_review_gate` treats as
-# a reason to merge rather than a reason to wait forever.
+# The last REQUIRED check to finish is that moment, and it is read from BOTH
+# surfaces, for the same two reasons `check_counts` reads both.
+#
+# A REQUIRED CONTEXT MAY BE A LEGACY COMMIT STATUS, which is a different API
+# surface and carries no check-run and so no `completed_at` at all. A repository
+# whose required contexts are statuses therefore had NO CLOCK: this read came
+# back empty, `lane_review_gate` treats an unreadable clock as expired, and the
+# hold ended the moment it began — armed, reporting nothing wrong, and waiting
+# for nobody.
+#
+# AND THE READ IS FILTERED TO THE CONFIGURED REQUIRED CONTEXTS. Unfiltered, any
+# check run at all moved the clock forward — a slow optional job, a coverage
+# bot, a fork's leftover — and held a green pull request past the grace the
+# operator configured. Neither defect can merge something unreviewed that would
+# not otherwise have merged; this gate fails open by design, so the cost is a
+# hold that is too short or too long. Both were reported by the review on #517
+# and deferred to #527.
+#
+# The unfiltered maximum survives as a FALLBACK, and only as one: a repository
+# that names a required context nothing publishes would otherwise be handed an
+# empty clock, which is precisely the "expired" reading this function exists to
+# stop producing by accident.
+#
+# Prints "" when neither surface answers, which `lane_review_gate` treats as a
+# reason to merge rather than a reason to wait forever.
 # ---------------------------------------------------------------------------
 review_clock() {
-  local sha="$1" latest ts
-  latest="$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" \
-    --jq '.check_runs[] | .completed_at // empty' 2>/dev/null | LC_ALL=C sort | tail -1 || true)"
+  local sha="$1" runs statuses req latest ts
+
+  # The exit status is kept for the reason `check_counts` spells out: `gh api`
+  # writes the error BODY to stdout on a non-2xx, so a swallowed failure does
+  # not leave the stream empty, it leaves one more object in it.
+  runs="$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" \
+    --jq '.check_runs[] | select(.completed_at) | {name: .name, at: .completed_at}' 2>/dev/null)" || runs=''
+
+  # A repository may legitimately publish no commit statuses, and the merge App
+  # may not hold `Commit statuses: read`. `check_counts` is where that is
+  # announced — once, from a file — and saying it a second time per pull request
+  # is the volume at which an operator learns to scroll past it.
+  statuses="$(gh api --paginate "repos/$R/commits/$sha/status?per_page=100" \
+    --jq '.statuses[] | select(.updated_at) | {name: .context, at: .updated_at}' 2>/dev/null)" || statuses=''
+
+  # The required list as JSON, one name per line: a required context may contain
+  # spaces, so it is never word-split.
+  req="$(printf '%s\n' "${REQUIRED[@]}" | jq -R . | jq -s .)"
+
+  # `--paginate` emits one document per page, so these are streams of objects
+  # rather than one array and `-s` collects them. The timestamps are ISO-8601 in
+  # UTC, where lexical order IS chronological order.
+  latest="$(printf '%s\n%s\n' "$runs" "$statuses" \
+    | jq -r -s --argjson req "$req" '
+        [ .[]
+          | select(type == "object"
+                   and (.name | type) == "string"
+                   and (.at | type) == "string"
+                   and .at != "") ] as $all
+        | ( [ $all[] | select([.name] | inside($req)) | .at ] | max )
+          // ( [ $all[] | .at ] | max )
+          // empty' 2>/dev/null)" || latest=''
+
   [ -n "$latest" ] || {
     echo ''
     return 0

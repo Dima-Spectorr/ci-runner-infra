@@ -1553,7 +1553,32 @@ the_review_clock_starts_at_green() {
   local code
   code=$(code_of "$1")
   matches "$code" 'check-runs\?per_page=100' || return 1
-  matches "$code" 'completed_at // empty'
+  matches "$code" 'select\(\.completed_at\)'
+}
+
+# A REQUIRED CONTEXT MAY BE A LEGACY COMMIT STATUS, and `check_counts` already
+# accepts one — so a repository whose required contexts are all statuses is a
+# supported configuration with no check-runs at all. Read only the check-run
+# surface and that repository has no clock: empty reads as expired, and the hold
+# ends the moment it begins. The failure is silent on both sides, which is why it
+# is asserted here rather than left to a repository to discover.
+the_review_clock_reads_the_commit_status_surface() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'commits/\$sha/status\?per_page=100' || return 1
+  matches "$code" '\.statuses\[\]' || return 1
+  matches "$code" 'select\(\.updated_at\)'
+}
+
+# And it counts only the checks the operator called required. Unfiltered, a slow
+# optional job or a coverage bot moves the clock forward and holds a green pull
+# request past the configured grace — the same list `check_counts` judges, or
+# the two disagree about when the pull request went green.
+the_review_clock_is_confined_to_the_required_contexts() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '--argjson req' || return 1
+  matches "$code" 'inside\(\$req\)'
 }
 
 passes_the_review_gate_to_the_driver() {
@@ -1570,6 +1595,8 @@ check the_review_gate_is_asked_only_of_a_ready_merge "$DRIVER" "the review reads
 check an_unreadable_review_surface_is_not_an_unanswered_one "$DRIVER" "an unreadable review surface counts as nobody having answered, so a rate limit holds a green pull request for the whole grace and then blames the reviewer"
 check both_review_surfaces_are_read "$DRIVER" "only the review surface is read, so a Codex review that found nothing — which publishes a summary comment and no review — reads as no review at all"
 check the_review_clock_starts_at_green "$DRIVER" "the review grace is measured from something other than the last check finishing, so a pull request opened yesterday exhausts it before the reviewer is even asked"
+check the_review_clock_reads_the_commit_status_surface "$DRIVER" "the review clock reads only the check-run surface, so a repository whose required contexts are legacy commit statuses has no clock at all — the grace expires the instant it is armed and the gate waits for nobody, with nothing in any log saying so"
+check the_review_clock_is_confined_to_the_required_contexts "$DRIVER" "the review clock counts any check at all, so a slow optional job or a coverage bot moves it forward and holds a green pull request well past the grace the operator configured"
 check the_unreviewed_verdict_reaches_the_merge "$DRIVER" "the unreviewed verdict does not survive the walk, so the annotation an operator reads to spot a reviewer that has stopped answering is written empty or not at all"
 check passes_the_review_gate_to_the_driver "$CALLEE" "the workflow declares the review gate but never hands it to the driver, so a repository that arms it merges unreviewed and nothing says so"
 
@@ -1591,9 +1618,15 @@ mutate "an unreadable review surface starts counting as zero answers" "$DRIVER" 
 mutate "the comment surface is dropped, so a clean review reads as no review" "$DRIVER" \
   's@issues/\$num/comments?per_page=100@issues/$num/comments-unused?per_page=100@' \
   both_review_surfaces_are_read
-mutate "the review clock goes back to the head commit date" "$DRIVER" \
-  's@completed_at // empty@committer.date // empty@' \
+mutate "the review clock goes back to when the checks started" "$DRIVER" \
+  's@select(.completed_at) | {name: .name, at: .completed_at}@select(.started_at) | {name: .name, at: .started_at}@' \
   the_review_clock_starts_at_green
+mutate "the review clock drops the commit-status surface" "$DRIVER" \
+  's@commits/\$sha/status?per_page=100@commits/$sha/status-unused?per_page=100@' \
+  the_review_clock_reads_the_commit_status_surface
+mutate "the review clock stops confining itself to the required contexts" "$DRIVER" \
+  's@select(\[.name\] | inside(\$req))@select(true)@' \
+  the_review_clock_is_confined_to_the_required_contexts
 mutate "the review bots stop reaching the driver" "$CALLEE" \
   's@REVIEW_BOTS_INPUT: [$][{][{] inputs.review-bots [}][}]@REVIEW_BOTS_UNUSED: ${{ inputs.review-bots }}@' \
   passes_the_review_gate_to_the_driver

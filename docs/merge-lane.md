@@ -539,6 +539,28 @@ vendor's billing page authority over this repository. So the wait is bounded by
 `review-grace-seconds`, and past it the lane merges and writes a warning
 annotation naming the pull request and the sha.
 
+**The grace is measured from the moment the reviewers could have started —
+the last *required* check to finish, on either surface.** Not the head commit's
+date, which would charge a pull request for the whole of its own CI run and
+expire the grace before the first pass on anything opened yesterday. Two things
+follow, and both were live defects until #527:
+
+- **A required context can be a legacy commit status**, which `check_counts`
+  already accepts. Statuses are a different API and carry no check-run, so a
+  repository whose required contexts are statuses had no clock at all: the read
+  came back empty, an unreadable clock reads as expired, and the hold ended the
+  moment it began — armed, green, and waiting for nobody. Both surfaces are
+  read now.
+- **Only the configured required contexts count.** Unfiltered, any check run at
+  all moved the clock forward — a slow optional job, a coverage bot, a fork's
+  leftover — and held a green pull request past the grace you configured.
+
+When neither surface names a required context, the newest timestamp of anything
+on the commit is used instead. That fallback is deliberate: a repository whose
+required list names something nothing publishes would otherwise be handed an
+empty clock, which is the "expired" reading this whole paragraph exists to stop
+producing by accident.
+
 The annotation is written **beside the merge**, not during the walk. A pass
 classifies every open pull request and merges at most a handful of them, so a
 warning written where the verdict is computed would name candidates that were
