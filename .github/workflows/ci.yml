@@ -638,6 +638,18 @@ jobs:
       - name: merge-lane structural self-test
         run: bash scripts/ci/merge-lane.selftest.sh
 
+      # THE OTHER HALF OF THE LANE'S REVIEW GATE, AND THE HALF THAT SPENDS
+      # MONEY.
+      #
+      # `codex-review-self.yml` is a `workflow_run` workflow, so like the lane
+      # it cannot be exercised by the pull request that changes it — and unlike
+      # the lane, the cost of it being wrong is billed to an account rather than
+      # paid in waiting. A trigger that fired on `pull_request` would be the
+      # vendor's automatic review this replaces, and would look completely
+      # normal in the diff. This is the only thing that catches that.
+      - name: codex-review self-test
+        run: bash scripts/ci/codex-review.selftest.sh
+
       # The base-health names are a contract that spans two files with nothing
       # joining them. A name that matches no job counts as MISSING, and missing
       # does not halt — so a typo, or renaming the job that answers, fails

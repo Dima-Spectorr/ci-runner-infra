@@ -1,0 +1,204 @@
+# =============================================================================
+# codex-review — ask an automated reviewer to read a pull request, once, when
+# its CI is green.
+#
+# WHAT THIS REPLACES
+#
+# The reviewer's own "review every new pull request" switch, which is turned off
+# in the account. That switch pays for a review of every version of every
+# branch. A branch that goes red twice before it goes green costs three reviews,
+# two of them of code that was already known to be broken and that nobody kept.
+#
+# The version worth reading is the one that is a candidate to merge, and the
+# cheapest available signal that a version might be that one is its own CI going
+# green. So the request moves here: one comment, on a successful CI completion,
+# once per head sha. The argument in full, with the invariants, is in
+# `scripts/ci/codex-review-decision.sh`.
+#
+# THIS DOES NOT GATE ANYTHING
+#
+# It asks. It does not wait for the answer and it does not decide whether the
+# answer was any good. Holding the merge until the reviewer has answered is the
+# merge lane's job — `review-bots` in `merge-lane.yml` — and the two halves are
+# deliberately separate, because they spend different things: this one spends
+# credits, that one spends time. Either works without the other. Armed together
+# they are a review that lands before the merge instead of after it.
+#
+# WHY A REUSABLE WORKFLOW
+#
+# The same argument `merge-lane.yml` makes: a fleet of repositories needing the
+# same logic is a fleet of copies of every future fix. The consumer writes a
+# caller holding the `workflow_run` trigger — which cannot live here, because
+# `workflow_call` is the only trigger a callee may declare.
+#
+# WHY IT RUNS THE DEFAULT BRANCH'S CODE
+#
+# `workflow_run` checks out the default branch, not the pull request, and here
+# that is a security property rather than an inconvenience. This job can comment
+# on a pull request, and a comment is an instruction to an agent with repository
+# access. If it ever executed a script authored in the pull request under
+# review, any contributor could put words in the reviewer's prompt. Nothing
+# below reads a byte from the head ref: the driver is the one checked out here,
+# and every fact about the pull request comes from the API.
+# =============================================================================
+name: Codex review
+
+on:
+  workflow_call:
+    inputs:
+      head-sha:
+        description: >-
+          The head sha of the completed CI run. The pull requests this commit is
+          the HEAD of are the ones a review is asked for; a commit that is
+          merely contained by a pull request is not one of them.
+        required: true
+        type: string
+      conclusion:
+        description: >-
+          The completed CI run's conclusion. Anything but the exact string
+          `success` spends nothing, which is the entire point of this workflow.
+          Passing a constant here, or forgetting to pass it at all, restores the
+          behaviour this replaces.
+        required: true
+        type: string
+      review-command:
+        description: >-
+          The comment that asks for the review. Defaults to Codex's on-demand
+          trigger. It is an input rather than a constant because the reviewer is
+          not part of this fleet's contract, the phrase is the vendor's to
+          change, and a repository may want a different reviewer entirely.
+        required: false
+        default: '@codex review'
+        type: string
+      skip-authors:
+        description: >-
+          Space-separated author logins whose pull requests are never reviewed.
+          In practice the dependency bots: a lockfile bump is not what the
+          credits are for, and on a busy repository it is most of the volume.
+        required: false
+        default: ''
+        type: string
+      runs-on:
+        description: >-
+          The runner label. A JSON array in the string is decoded, so several
+          labels can be passed through a `type: string` input.
+        required: false
+        default: ubuntu-latest
+        type: string
+      implementation-repository:
+        description: >-
+          The repository holding the driver this workflow runs. There is no
+          context naming the callee's repository, so it has to be said.
+        required: false
+        default: Dima-Spectorr/ci-runner-infra
+        type: string
+      implementation-ref:
+        description: >-
+          The ref of that repository to check out. Defaults to
+          `github.job_workflow_sha`, the commit of this very workflow file,
+          which makes driver and workflow the same release by construction and
+          removes the second unchecked pin that a caller would otherwise repeat
+          below its own `uses:` line.
+        required: false
+        default: ''
+        type: string
+      dry-run:
+        description: >-
+          Anything but the exact string `false` decides and logs without
+          commenting. Fail-safe in the direction that does not spend money, and
+          it is the honest way to arm this: a `workflow_run` workflow cannot run
+          on the pull request that adds it, so the first live execution is the
+          first CI completion after the merge. Read a pass of real verdicts
+          before letting it buy anything.
+        required: false
+        default: 'true'
+        type: string
+    secrets:
+      review-app-id:
+        description: >-
+          Optional. The App that posts the request comment. Unset means the
+          caller's own `GITHUB_TOKEN`, which posts as `github-actions[bot]`.
+
+
+          Why it is optional and not simply one or the other: GitHub delivers
+          the `issue_comment` webhook to installed Apps whichever identity
+          wrote the comment — the suppression rule people remember is about
+          triggering further workflows, not about Apps — but a reviewer is free
+          to ignore bot comments as a loop guard, and no documentation promises
+          it will not. So arm this with the built-in token, read the pull
+          request, and set these only if the reviewer stayed silent. Nothing
+          here can tell the two cases apart on its own.
+        required: false
+      review-app-private-key:
+        description: The private key for `review-app-id`.
+        required: false
+
+jobs:
+  review:
+    name: Ask for a review
+    # dynamic-runner-allowed(review, #515): the label is a workflow_call input, scoped by the calling repository
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    timeout-minutes: 10
+
+    # NO `concurrency:` HERE, ON PURPOSE.
+    #
+    # A callee that declares a concurrency group joins the CALLER's run to that
+    # group — the two are one run to GitHub — so a group shared with, or
+    # cancelling, the caller kills a job that has no log and no steps and looks
+    # like a lost runner. Serialising two runs for the same head sha is the
+    # caller's job, and `codex-review-self.yml` does it there.
+
+    # `secrets.*` CANNOT BE READ IN AN `if:`. The App is therefore detected
+    # through an env var carrying the App ID — which is not a secret in any
+    # meaningful sense, it is a number printed on the App's settings page — and
+    # the private key is never named outside the step that mints the token.
+    # `merge-lane.yml` hits the same wall and solves it with a repository
+    # variable; here the caller may not have one, so it is carried through.
+    env:
+      REVIEW_APP_ID: ${{ secrets.review-app-id }}
+
+    permissions:
+      # `pull-requests: write` is what posts the comment when no App is
+      # configured. It is a ceiling, not a grant: a caller that passes an App
+      # token still needs it to be no wider than this.
+      contents: read
+      pull-requests: write
+
+    steps:
+      # The IMPLEMENTATION repository, not the caller's. In a `workflow_call`
+      # the `github` context belongs to the caller, so a bare checkout here
+      # would clone a tree that does not contain the driver and the run would
+      # die at its last step.
+      - name: Check out the driver
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ inputs.implementation-repository }}
+          ref: ${{ inputs.implementation-ref || github.job_workflow_sha }}
+          persist-credentials: false
+
+      # The fleet's own images do not ship `gh`, and the driver is all `gh api`.
+      # On a pool host a missing binary would read as "no pull requests found"
+      # and the job would go green having asked for nothing.
+      - name: Ensure the GitHub CLI
+        run: bash scripts/ci/ensure-gh.sh
+
+      - name: Mint the review App token
+        id: token
+        if: env.REVIEW_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.review-app-id }}
+          private-key: ${{ secrets.review-app-private-key }}
+
+      - name: Ask for the review
+        env:
+          # The App token when there is one, the caller's own token otherwise.
+          # See the `review-app-id` description for why both are supported and
+          # which to reach for first.
+          GH_TOKEN: ${{ steps.token.outputs.token || github.token }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          CONCLUSION: ${{ inputs.conclusion }}
+          REVIEW_COMMAND: ${{ inputs.review-command }}
+          SKIP_AUTHORS: ${{ inputs.skip-authors }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: bash scripts/ci/codex-review.sh

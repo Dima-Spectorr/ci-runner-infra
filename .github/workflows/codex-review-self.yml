@@ -1,0 +1,123 @@
+name: Codex review (this repository)
+
+# This repository publishes the trigger, so it is the first place the trigger
+# has to work — the same argument `merge-lane-self.yml` and `ci.yml` already
+# make for every other rule shipped from here.
+#
+# THE TRIGGER CANNOT LIVE IN THE REUSABLE WORKFLOW.
+#
+# `workflow_call` is the only trigger a callee may declare, so the `workflow_run`
+# half is necessarily the consumer's. That is the entire content of this file,
+# and of the equivalent file in every consuming repository.
+#
+# AND THE TRIGGER IS THE WHOLE CHANGE.
+#
+# A `pull_request` trigger here would be the vendor's automatic review rebuilt
+# in YAML: it would ask before CI had said anything, which is the behaviour this
+# exists to stop. `scripts/ci/codex-review.selftest.sh` asserts, with a
+# mutation, that this file grows no such trigger.
+#
+# THIS FILE DOES NOT RUN ON THE PULL REQUEST THAT CHANGES IT.
+#
+# GitHub dispatches `workflow_run` from the DEFAULT BRANCH only, so a change
+# here is unexercised until it merges, whatever CI says.
+# `scripts/ci/codex-review.selftest.sh` is what stands in for the run that
+# cannot happen.
+
+on:
+  # GitHub dispatches this itself the moment CI finishes. There is no schedule
+  # and there deliberately is none: a sweep would re-examine every open pull
+  # request every fifteen minutes, and the only thing standing between that and
+  # a repeat purchase is the dedupe marker. The merge lane's sweep exists
+  # because a merge moves the base and nothing else announces it; nothing
+  # equivalent is true here — a version that has gone green has already produced
+  # the one event that matters.
+  workflow_run:
+    # By NAME, which is the only handle `workflow_run` offers, so renaming
+    # `ci.yml`'s `name:` key detaches this silently.
+    workflows: [CI]
+    types: [completed]
+
+  workflow_dispatch:
+    inputs:
+      head-sha:
+        # No `${{ }}` anywhere in this description: Actions PARSES input
+        # descriptions, and an expression in one is a startup failure with zero
+        # jobs and no log to explain it.
+        description: The head sha to ask for a review of, for a manual run.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# SERIALISED PER COMMIT, AND THE GROUP IS THE CALLER'S.
+#
+# Two CI runs completing for the same head sha — a re-run, or a matrix leg
+# finishing late — would otherwise race on the dedupe marker and could both
+# find it absent. `cancel-in-progress: false` because the loser must still run:
+# it will read the marker the winner wrote and skip, which is the correct
+# outcome and costs one API read.
+#
+# The group lives here rather than in the callee for a reason that has cost this
+# fleet a day before now: a reusable workflow's job is part of the CALLER's run,
+# so a group declared there can cancel the run that called it, and the symptom
+# is a job that completes in one second, before it started, with no log.
+concurrency:
+  group: codex-review-${{ github.event.workflow_run.head_sha || inputs.head-sha }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    # NOT WIRED YET IS NOT THE SAME AS OFF.
+    #
+    # Unset means this never runs at all, which is the right default for a
+    # workflow that spends money: a repository that copies the file without
+    # deciding to pay has not decided to pay.
+    #
+    # The second half of the condition is what keeps the log readable. Without
+    # it, every red CI completion would start a job whose only output is
+    # `skip:not-green` — a run per failure, on a repository whose failures are
+    # the common case. The driver checks the conclusion again anyway; that is
+    # the gate, this is the noise filter, and the driver's copy is the one the
+    # self-test holds.
+    if: >-
+      vars.CODEX_REVIEW_ENABLED == 'true' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    uses: ./.github/workflows/codex-review.yml
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      head-sha: ${{ github.event.workflow_run.head_sha || inputs.head-sha }}
+      # A manual dispatch asserts the green rather than reading it — there is no
+      # run to read it from — and that is the operator's call to make. Every
+      # other path takes the real conclusion.
+      conclusion: ${{ github.event.workflow_run.conclusion || 'success' }}
+      # The dependency bots. Their pull requests are a lockfile diff and a
+      # changelog; paying to have those read is most of the volume and none of
+      # the value.
+      skip-authors: dependabot[bot]
+      # GitHub-hosted on purpose, the same choice `ci.yml` and the merge lane
+      # make: the repository that DEFINES the fleet must not need the fleet to
+      # be healthy. Free, because this repository is public.
+      runs-on: ubuntu-latest
+      # ARMED BY A VARIABLE, NOT BY A COMMIT.
+      #
+      # A `workflow_run` workflow cannot run on the pull request that adds it,
+      # so the first live execution is the first CI completion after this
+      # merges. Reading a pass of real verdicts before letting it buy anything
+      # is the only honest order — and a repository variable means arming it
+      # does not need another pull request.
+      #
+      # Unset or anything but the exact string `false` means DRY RUN. Fail-safe
+      # in the direction that does not spend.
+      dry-run: ${{ vars.CODEX_REVIEW_ARMED != 'true' }}
+    secrets:
+      # Unset on purpose, for now. The built-in token posts as
+      # `github-actions[bot]`, and whether the reviewer answers a bot comment is
+      # the one thing about this design that cannot be settled by reading
+      # documentation. Arm it, read the pull request, and set these only if the
+      # reviewer stayed silent — the reasoning is in `codex-review.yml`.
+      review-app-id: ${{ secrets.REVIEW_APP_ID }}
+      review-app-private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}

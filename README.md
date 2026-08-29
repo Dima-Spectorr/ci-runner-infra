@@ -1001,6 +1001,19 @@ request, and each one a run this model does not perform.
 [`docs/merge-lane.md`](docs/merge-lane.md) has the design, the two-variable
 cutover, and the per-repository migration.
 
+The lane is also where the fleet's **AI code review** now lands, rather than
+after the merge. The vendor's own "review every new pull request" switch pays
+for a review of every version of every branch — a branch that goes red twice
+before it goes green costs three reviews, two of them of code nobody kept. So
+that switch goes off and the request moves into the fleet: one comment, on a
+successful CI completion, once per green head sha. The lane then holds the
+merge until the reviewer answers — bounded, and the **only** gate in it that
+fails open, because a Codex account out of credits never answers at all and a
+fail-closed hold would stop every repository merging anything, indefinitely,
+with nothing red to explain why. [`docs/ai-code-review.md`](docs/ai-code-review.md)
+has the two arming variables, the caller, and the one thing an operator has to
+turn off by hand in the reviewer's own account.
+
 The lane leaves the head branch behind on purpose — a branch deleted seconds
 after a squash merge is a branch nobody can cherry-pick from — so the tidying
 is a separate daily job with its own arming variable and its own dry-run
