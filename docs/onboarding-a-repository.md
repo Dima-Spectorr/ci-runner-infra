@@ -724,8 +724,14 @@ version that is a candidate to merge**, and the merge lane you just wired holds
 that version until the answer arrives.
 
 The copyable caller, the rules and the whole argument:
-[`ai-code-review.md`](ai-code-review.md). Four things to get right here, each of
-which has already cost this fleet something:
+[`ai-code-review.md`](ai-code-review.md). Copy its `uses:` line exactly as that
+document has it — it pins a released sha, and a caller pinned to a release cut
+before `codex-review.yml` existed fails with *reusable workflow not found*. If
+that document still carries a blockquote saying the pin is not usable yet, the
+release carrying it has not been cut and this step waits for one.
+
+Four things to get right here, each of which has already cost this fleet
+something:
 
 - **Turn OFF automatic reviews at
   [chatgpt.com/codex/settings/code-review](https://chatgpt.com/codex/settings/code-review).**
@@ -735,8 +741,10 @@ which has already cost this fleet something:
   the step that produces the entire saving; everything else is machinery around
   it.**
 - **Set `CODEX_REVIEW_TOKEN` — a personal access token, not the built-in one and
-  not an App.** Codex charges the Codex account of the GitHub *user* who asked,
-  and refuses a bot outright. Armed without it the run is **green**, the refusal
+  not an App.** A fine-grained token on the account whose Codex account pays,
+  scoped to this repository, with **pull requests: read and write** and nothing
+  else. Codex charges the Codex account of the GitHub *user* who asked, and
+  refuses a bot outright. Armed without it the run is **green**, the refusal
   comment arrives, and the dedupe marker is written anyway, so the commit is
   never asked about again: the repository is silently unreviewed while the
   dashboards say the reviewer is merely slow.
