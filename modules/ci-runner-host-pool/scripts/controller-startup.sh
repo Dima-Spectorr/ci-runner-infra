@@ -505,6 +505,19 @@ budget_allows_call() {
   [ $(( $1 + $3 )) -le "$2" ]
 }
 
+# Does this token LOOK like the ISO-8601 instant GitHub returns? Only the shape
+# is tested; `date` still does the parsing. The two jobs are separate on purpose
+# — `date -d` is a natural-language parser, not a validator, and it maps `-`,
+# `0`, `Z` and the empty string onto today at 00:00:00 with exit status 0. Every
+# one of those reaches the stamp loops (jq writes `-` for a run with no job in a
+# given state), and each one turns a job-age gauge into seconds-since-midnight.
+is_iso8601() {
+  case "$1" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 collect_demand() {
   local runs jobs
   # Per pool now, not per controller. The sweep itself is still ONE pass over
@@ -763,7 +776,18 @@ collect_demand() {
       D_QUEUED["$c_pool"]=$(( D_QUEUED["$c_pool"] + ${q:-0} ))
       D_EXPIRED["$c_pool"]=$(( D_EXPIRED["$c_pool"] + ${expired_n:-0} ))
 
+      # The shape test is the guard; `date` is not. GNU date accepts `-`, `0`,
+      # `Z` and the empty string, exits 0 for each, and resolves every one of
+      # them to TODAY AT 00:00:00 — so `|| continue` never fires and the sweep
+      # measures the age of midnight. jq writes `-` into this column whenever a
+      # run has no job in this state (a tab field cannot be empty or `read`
+      # collapses the columns), which is most runs, most ticks. Because D_WAIT
+      # is a high-water mark the bad value does not merely join the real ones,
+      # it buries them: after roughly 00:10 UTC nothing true can be reported
+      # again until midnight. Measured on ci-runner-host-iit, both gauges
+      # tracked the clock 1:1 all day, peaking at 86398 (#518).
       for s in $stamps; do
+        is_iso8601 "$s" || continue
         epoch=$(date -d "$s" +%s 2>/dev/null) || continue
         wait=$((now - epoch))
         [ "$wait" -gt "${D_WAIT[$c_pool]}" ] && D_WAIT["$c_pool"]=$wait
@@ -782,6 +806,7 @@ collect_demand() {
       # gauge whose threshold is measured in minutes, and which is about to be
       # correct on the next tick anyway.
       for s in $running; do
+        is_iso8601 "$s" || continue   # same sentinel, same midnight — see above
         epoch=$(date -d "$s" +%s 2>/dev/null) || continue
         wait=$((now - epoch))
         [ "$wait" -gt "${D_RUNNING[$c_pool]}" ] && D_RUNNING["$c_pool"]=$wait

@@ -819,13 +819,21 @@ Together those three were most of the mail this fleet produced. Measured over th
 week to 2026-08-29 across the three projects that have these policies, they
 opened 184 incidents — 368 notifications — of which the great majority were the
 pool behaving exactly as configured; replayed against the same seven days, the
-thresholds above open 97. **Read *queue starved* against how long the wait is
-before believing it:** `ci_queue_wait_seconds_max` is the age of the oldest
-queued run, and GitHub leaves runs queued that can never be served — a branch
-deleted, a merge-queue branch gone — which no scale-up clears and which pin the
-series at their own age until the controller expires the demand a day later.
-That expire-and-rediscover cycle is what makes the incident look like flapping
-rather than one stuck run.
+thresholds above open 97.
+
+The residual *queue starved* incidents on `ci-runner-host-iit` were not
+starvation and were not, as this section first claimed, wedged queued runs
+either — the sweep filters queued runs to the last six hours, so it never sees
+those. `ci_queue_wait_seconds_max` and `ci_job_running_seconds_max` were
+reporting **seconds since UTC midnight**. `collect_demand()` writes a `-` into a
+stamp column when a run has no job in that state, since a tab-separated field
+cannot be empty, and `date -d -` exits 0 and returns today at 00:00:00 — as do
+`date -d 0`, `date -d Z` and `date -d ''`. Both stamp loops now test the token's
+shape before parsing it; `date` is a natural-language parser, not a validator,
+and its exit status was never the guard it looked like. Because the accumulator
+is a high-water mark the sentinel buried every real sample rather than joining
+them, so after roughly 00:10 UTC neither gauge could report anything true until
+midnight (#518).
 
 One more watches the egress record. `modules/ci-runner-network` logs the runner
 firewall rules, so a refused outbound connection is now an entry rather than a
