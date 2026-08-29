@@ -114,10 +114,14 @@ jobs:
       # in the direction that does not spend.
       dry-run: ${{ vars.CODEX_REVIEW_ARMED != 'true' }}
     secrets:
-      # Unset on purpose, for now. The built-in token posts as
-      # `github-actions[bot]`, and whether the reviewer answers a bot comment is
-      # the one thing about this design that cannot be settled by reading
-      # documentation. Arm it, read the pull request, and set these only if the
-      # reviewer stayed silent — the reasoning is in `codex-review.yml`.
+      # THE ONE THAT ACTUALLY MATTERS. Measured on #529: asked as
+      # `github-actions[bot]`, Codex answered "To use Codex here, create a Codex
+      # account and connect to github". It charges the Codex account of the
+      # GitHub USER who asked, and a bot cannot have one — so this must be a
+      # fine-grained PAT belonging to the account that pays. Unset, this
+      # workflow posts a comment, gets that refusal, and writes the dedupe
+      # marker anyway: green, and silently unreviewed.
+      review-token: ${{ secrets.CODEX_REVIEW_TOKEN }}
+      # Kept for a reviewer that does honour App identities. Codex does not.
       review-app-id: ${{ secrets.REVIEW_APP_ID }}
       review-app-private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}

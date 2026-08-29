@@ -72,6 +72,14 @@ Disarm by setting `CODEX_REVIEW_ARMED` to anything else. Setting
 
 ## The caller
 
+> **The pin below is not usable yet.** `codex-review.yml` is newer than every
+> release that exists — v5.76.0 was cut before it merged and does not carry it —
+> so the sha in the `uses:` line resolves to a tree that does not contain it and
+> a caller copying this today gets *reusable workflow not found*. The release
+> that carries it is cut once this merges, and the line is bumped to that sha
+> then. Until you see a pin whose trailing comment is **v5.77.0 or later**, this
+> file is a design, not an instruction.
+
 ```yaml
 name: Codex review
 
@@ -170,22 +178,60 @@ long as the pull request stays open.
   findings, only a reaction and a summary comment naming the commit, so the lane
   reads both surfaces.
 
-## The one thing that has to be verified live, once
+## The identity that asks — measured, not guessed
 
-**Does the reviewer answer a comment written by a bot?**
+**The built-in token does not work, and neither does an App.** This was an open
+question in the design and it is now answered, live, on
+[#529](https://github.com/Dima-Spectorr/ci-runner-infra/pull/529): the request
+was posted as `github-actions[bot]`, Codex answered within seconds, and the
+answer was
 
-The request is a comment, so the identity that posts it has to be one the
-reviewer's App reacts to. `GITHUB_TOKEN` posts as `github-actions[bot]`. GitHub
-delivers the `issue_comment` webhook to installed Apps either way — the
-suppression rule people remember is about triggering further *workflows*, not
-about Apps — but a reviewer is free to ignore bot comments as a loop guard, and
-no documentation promises it will not.
+> To use Codex here, create a Codex account and connect to github.
 
-Nothing in the code can tell the two cases apart, which is why this is written
-down rather than detected. **After arming the first repository, read the pull
-request.** If the reviewer answered, the built-in token is enough for the whole
-fleet. If it did not, pass the `review-app-id` / `review-app-private-key`
-secrets — the merge App's credentials, or a PAT — and it will.
+Codex attributes a requested review to **the Codex account of the GitHub user
+who asked for it**, and charges that account. `github-actions[bot]` has no Codex
+account and cannot be given one; nor can a GitHub App, for the same reason. The
+failure is not a loop guard ignoring bots — the App replies, it just declines.
+
+So `review-token` is not a fallback, it is **the** configuration:
+
+1. On the GitHub account whose Codex account pays for reviews, create a
+   fine-grained personal access token scoped to the repositories being armed,
+   with **pull requests: read and write** and nothing else.
+2. Store it as the repository secret `CODEX_REVIEW_TOKEN`.
+3. Pass it to the callee as `review-token`.
+
+Without it the workflow runs green, posts its comment, gets the refusal above,
+and no review happens — and because the request *was* posted, the dedupe marker
+was written too, so it will not be retried for that commit. **A repository armed
+without the token is a repository that is silently not reviewed.**
+
+`review-app-id` / `review-app-private-key` remain declared and remain preferred
+for any *other* reviewer that does honour App identities; they are simply not a
+solution for Codex.
+
+## Your CI must run when a draft is marked ready
+
+The rule declines to spend on a draft, and this trigger is dispatched by CI
+completions only. `opened, synchronize, reopened` — the default `pull_request`
+activity types — contain no event for *marked ready*. Put together, a draft
+whose last push went green sits at that same green sha when it becomes ready,
+produces no further completion, and is never reviewed; the merge lane then holds
+it for its grace and merges it unreviewed, which reads as a slow reviewer rather
+than as a request nobody made.
+
+So a repository arming this needs its CI workflow to say:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+```
+
+It costs one extra run per draft that becomes ready — the same work the pull
+request needed anyway, moved earlier. This repository's own `ci.yml` says it,
+and `codex-review.selftest.sh` asserts it there with a mutation; for a consuming
+repository, whose CI workflow this fleet does not own, it is this paragraph.
 
 ## Self-tests
 

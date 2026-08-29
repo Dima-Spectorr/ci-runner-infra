@@ -15,21 +15,20 @@
 # answered is the merge lane's job — `review-bots` there — and the two halves
 # are deliberately separate: this one spends credits, that one spends time.
 #
-# THE TOKEN QUESTION, WHICH YOU MUST VERIFY ONCE.
+# THE TOKEN QUESTION, WHICH IS ANSWERED: YOU NEED A HUMAN'S TOKEN.
 #
 # The review is requested by COMMENTING, so whatever identity posts the comment
-# has to be one the reviewer's App reacts to. The built-in `GITHUB_TOKEN` posts
-# as `github-actions[bot]`; an App token posts as that App. GitHub delivers the
-# `issue_comment` webhook to installed Apps either way — the suppression rule
-# people remember applies to triggering further *workflows*, not to Apps — but
-# a reviewer is free to ignore bot comments as a loop guard, and no
-# documentation promises it will not.
+# has to be one the reviewer's App acts on. Measured live on #529: the request
+# went out as `github-actions[bot]`, and Codex replied "To use Codex here,
+# create a Codex account and connect to github". It attributes a requested
+# review to the Codex account of the GitHub USER who asked, and charges that
+# account — and neither `github-actions[bot]` nor an App can have one.
 #
-# So: after arming this for the first time, read the pull request. If the
-# reviewer answered, the built-in token is enough for the whole fleet. If it did
-# not, pass `review-token` — the merge App's token, or a PAT — and it will.
-# Nothing here can tell the two apart on its own, which is why it is written
-# down rather than detected.
+# So `review-token` is not a fallback, it is the configuration: a fine-grained
+# PAT belonging to the account that pays for Codex, scoped to pull requests:
+# write. Armed without it, this posts a comment, receives the refusal, and
+# writes the dedupe marker anyway — so the commit is never retried and the
+# repository is silently unreviewed. `docs/ai-code-review.md` has the setup.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,6 +55,17 @@ if [ "${DRY_RUN:-true}" = "false" ]; then
 fi
 
 echo "codex-review: repo=$R sha=${HEAD_SHA:0:8} conclusion=${CONCLUSION:-unknown} armed=$ARMED"
+
+# ARMED WITHOUT A HUMAN'S TOKEN IS THE SILENT FAILURE THIS WHOLE FILE EXISTS TO
+# AVOID, SO IT IS SAID OUT LOUD ON EVERY RUN.
+#
+# It is a warning and not an error on purpose: this workflow is generic and a
+# reviewer that DOES honour bot identities would be configured exactly this way.
+# For Codex it is fatal in effect — the comment posts, the refusal comes back,
+# the dedupe marker is written, and the commit is never asked about again.
+if [ "$ARMED" = "true" ] && [ "${HUMAN_TOKEN:-false}" != "true" ]; then
+  echo "::warning::codex-review: armed without \`review-token\`, so the request will be posted by a bot. Codex charges the Codex account of the user who asked and refuses a bot outright — if that is your reviewer, this repository is green and silently unreviewed. See docs/ai-code-review.md."
+fi
 
 # THE PULL REQUESTS THIS COMMIT IS THE HEAD OF.
 #
@@ -93,6 +103,22 @@ if [ -z "$prs" ]; then
 fi
 
 requested=0
+# A POST THAT FAILED IS A REVIEW THAT WAS NEVER ASKED FOR, AND THE RUN SAYS SO.
+#
+# The loop below does not stop on one failure — one 403 on one pull request
+# should not cost the others their review — but the run must not conclude
+# `success` either. The merge lane is on the other end of this: it holds a green
+# pull request waiting for an answer, waits out `review-grace-seconds`, and
+# merges unreviewed. A green run here would make that look like a slow reviewer
+# rather than a request that was never put, and the two need different fixes.
+#
+# An UNREADABLE COMMENT SURFACE lands in the same place, by the same argument.
+# It suppresses the request — that direction cannot spend twice — and a
+# suppressed request is a request that was never put, so it is counted and the
+# run is red. It gets its own counter because the two need different fixes: a
+# refused POST is a permission, an unreadable list is usually the API.
+failed=0
+unread=0
 while IFS=$'\t' read -r num draft state author; do
   [ -n "$num" ] || continue
 
@@ -121,8 +147,9 @@ while IFS=$'\t' read -r num draft state author; do
       already=1
     fi
   else
-    echo "codex-review: #$num — the comment surface is unreadable, so this counts as already asked rather than risking a second paid review"
+    echo "::error::codex-review: #$num — the comment surface is unreadable, so this counts as already asked rather than risking a second paid review. Nothing was asked for ${HEAD_SHA:0:8} and nothing will ask again unless CI completes again."
     already=1
+    unread=$((unread + 1))
   fi
 
   verdict="$(review_request_verdict "$CONCLUSION" "$isdraft" "$state" "$already" "$author" "$SKIP_AUTHORS")"
@@ -153,7 +180,17 @@ $(review_marker "$HEAD_SHA")"
     # silently either, because the merge lane is now waiting for an answer to a
     # question that was never put.
     echo "::error::codex-review: could not comment on #$num. Without the comment nothing was asked, and the merge lane will wait out its review grace and merge unreviewed."
+    failed=$((failed + 1))
   fi
 done <<<"$prs"
 
 echo "codex-review: asked for $requested review(s)"
+
+if [ "$unread" -gt 0 ]; then
+  echo "::error::codex-review: $unread pull request(s) were suppressed by an unreadable comment surface, not by a decision."
+fi
+
+if [ $((failed + unread)) -gt 0 ]; then
+  echo "::error::codex-review: $((failed + unread)) pull request(s) were not asked. The run is red on purpose — see the annotations above for which, and note that a green run here is what tells an operator the reviewer is slow rather than unasked."
+  exit 1
+fi

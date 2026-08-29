@@ -3,7 +3,22 @@ name: CI
 # GitHub-hosted runners on purpose: this repo defines the self-hosted fleet, so
 # it must not need the fleet to be healthy in order to fix the fleet.
 on:
+  # `ready_for_review` IS THE ONE THAT IS NOT DEFAULT, AND IT IS HERE FOR THE
+  # AUTOMATED REVIEW.
+  #
+  # The default set is `opened, synchronize, reopened`. Marking a draft ready is
+  # none of them, so without this a draft whose last push went green stays at
+  # that same green sha when it becomes ready and produces no further CI
+  # completion. `codex-review-self.yml` is dispatched by CI completions only —
+  # deliberately, a sweep would re-read every open pull request forever — and
+  # the review trigger declines to spend on a draft. The two rules meet in a
+  # pull request that is green, ready, and never reviewed, which the merge lane
+  # then holds for its grace and merges unreviewed.
+  #
+  # The cost is one extra run per draft that becomes ready. That is the same
+  # work the pull request was going to need anyway, moved earlier.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
 

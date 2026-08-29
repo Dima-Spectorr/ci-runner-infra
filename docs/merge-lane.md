@@ -539,6 +539,13 @@ vendor's billing page authority over this repository. So the wait is bounded by
 `review-grace-seconds`, and past it the lane merges and writes a warning
 annotation naming the pull request and the sha.
 
+The annotation is written **beside the merge**, not during the walk. A pass
+classifies every open pull request and merges at most a handful of them, so a
+warning written where the verdict is computed would name candidates that were
+never merged — including in a dry run, which merges nothing at all. Since this
+annotation is what an operator reads to decide the reviewer is down, a warning
+for a merge that did not happen is worse than no warning.
+
 That warning is the thing to watch. On one pull request it is a slow reviewer.
 On **every** pull request it is a reviewer that is down — credits, most likely
 — and the number is not what is wrong.

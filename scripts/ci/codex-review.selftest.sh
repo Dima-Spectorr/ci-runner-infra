@@ -182,7 +182,13 @@ fails_closed_on_an_unreadable_pull_request_list() {
   code=$(code_of "$1")
   matches "$code" 'if ! prs="\$\(gh api --paginate' || return 1
   matches "$code" '::error::codex-review: could not read the pull requests' || return 1
-  matches "$code" '^  exit 1$'
+  # Scoped to the lines that follow THAT annotation, not to the file. There is a
+  # second `exit 1` at the end of the driver now — the one that reddens a run
+  # whose comment POST failed — and a bare file-wide search for it would let
+  # this one be deleted while the check went on passing.
+  local window
+  window=$(printf '%s\n' "$code" | grep -A3 -F '::error::codex-review: could not read the pull requests' || true)
+  matches "$window" '^  exit 1$'
 }
 
 # Only the pull requests this commit is the HEAD of. Without the filter, a merge
@@ -204,6 +210,56 @@ reads_every_page() {
   [ "${n:-0}" -eq 2 ]
 }
 
+# A REQUEST THAT WAS NEVER POSTED MUST REDDEN THE RUN.
+#
+# The annotation alone is not enough. A green run here is what tells an operator
+# that the reviewer is slow; if a 403 on the comment POST leaves the run green,
+# the only visible consequence is the merge lane waiting out its grace and
+# merging unreviewed — and that symptom points at the reviewer rather than at
+# the permission. The loop still finishes: one refused pull request must not
+# cost the others their review.
+reddens_the_run_when_a_request_could_not_be_posted() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'failed=\$\(\(failed \+ 1\)\)' || return 1
+  matches "$code" 'if \[ \$\(\(failed \+ unread\)\) -gt 0 \]; then'
+}
+
+# THE OTHER WAY A REQUEST GOES MISSING WITHOUT ANYONE DECIDING IT SHOULD.
+#
+# An unreadable comment surface suppresses the request, and that is correct —
+# it is the direction that cannot spend twice. What is not correct is doing it
+# quietly: nothing was asked for this sha, and nothing will ask again unless CI
+# completes again, so the run must end red for the same reason a refused POST
+# does. Separate counter, because a refused POST is a permission and an
+# unreadable list is usually the API, and the two need different fixes.
+reddens_the_run_when_the_comment_surface_was_unreadable() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'unread=\$\(\(unread \+ 1\)\)' || return 1
+  matches "$code" 'if \[ \$\(\(failed \+ unread\)\) -gt 0 \]; then'
+}
+
+# A DRAFT THAT BECOMES READY MUST PRODUCE A CI COMPLETION.
+#
+# This is the one property that lives in a file neither the caller nor the
+# callee owns, and it is asserted here because nothing else would notice it
+# going. The rule declines to spend on a draft; the caller is dispatched by CI
+# completions only. `opened, synchronize, reopened` — the default set — contains
+# no event for "marked ready", so a draft whose last push went green sits at
+# that same green sha when it becomes ready, produces no completion, and is
+# never reviewed. The merge lane then holds it for its grace and merges it
+# unreviewed, which reads as a slow reviewer.
+#
+# Consumers own their own CI workflow, so for them this is documentation
+# (`docs/ai-code-review.md`) rather than a gate. Here it is a gate.
+reruns_ci_when_a_draft_becomes_ready() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^  pull_request:' || return 1
+  matches "$code" '^    types: \[.*ready_for_review.*\]'
+}
+
 check() { # <predicate> <file> <description>
   if "$1" "$2"; then ok; else bad "$3"; fi
 }
@@ -215,6 +271,9 @@ check asks_and_records_in_one_comment "$DRIVER" "the request and the record are 
 check fails_closed_on_an_unreadable_pull_request_list "$DRIVER" "an unreadable pull request list is treated as an empty one, so the workflow goes green having asked for nothing and the merge lane blames the reviewer"
 check reviews_only_the_head_of_a_pull_request "$DRIVER" "any pull request containing the commit is reviewed, so a merge to the base asks for a review of the whole backlog"
 check reads_every_page "$DRIVER" "a list read is unpaginated, so on a busy pull request the marker falls off the end of the first page and the same commit is reviewed again on every CI completion"
+check reddens_the_run_when_a_request_could_not_be_posted "$DRIVER" "a comment POST that fails leaves the run green, so the only visible symptom is the merge lane merging unreviewed and the blame lands on the reviewer rather than on the permission"
+check reddens_the_run_when_the_comment_surface_was_unreadable "$DRIVER" "an unreadable comment surface suppresses the request and leaves the run green, so nothing was asked for this sha, nothing will ask again, and the only symptom is the merge lane merging unreviewed"
+check reruns_ci_when_a_draft_becomes_ready "$ROOT/.github/workflows/ci.yml" "CI does not run when a draft is marked ready, so a draft that went green while it was a draft produces no further completion, is never asked for a review, and the merge lane merges it unreviewed"
 
 # --- the driver, actually run ------------------------------------------------
 #
@@ -354,6 +413,13 @@ mutate "the comment read loses its pagination" "$DRIVER" \
   's|gh api --paginate "repos/\$R/issues|gh api "repos/$R/issues|' reads_every_page
 mutate "the unreadable pull request list stops being fatal" "$DRIVER" \
   's|^  exit 1$|  exit 0|' fails_closed_on_an_unreadable_pull_request_list
+mutate "a failed request stops reddening the run" "$DRIVER" \
+  's|^    failed=$((failed + 1))$|    :|' reddens_the_run_when_a_request_could_not_be_posted
+mutate "an unreadable comment surface stops reddening the run" "$DRIVER" \
+  's|^    unread=$((unread + 1))$|    :|' reddens_the_run_when_the_comment_surface_was_unreadable
+mutate "CI stops running when a draft is marked ready" "$ROOT/.github/workflows/ci.yml" \
+  's|^    types: \[opened, synchronize, reopened, ready_for_review\]$|    types: [opened, synchronize, reopened]|' \
+  reruns_ci_when_a_draft_becomes_ready
 
 if [ "$FAIL" -gt 0 ]; then
   echo "codex-review: $FAIL failed, $PASS passed"
