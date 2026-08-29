@@ -110,6 +110,28 @@ if [ "${#BASE_HEALTH[@]}" -eq 0 ]; then
   BASE_HEALTH=("${REQUIRED[@]}")
 fi
 
+# THE AUTOMATED REVIEWERS THIS LANE WAITS FOR, BY LOGIN.
+#
+# Empty — the default — means the gate is not armed and the lane behaves exactly
+# as it did before it existed. A repository arms it by naming the bots whose
+# review it wants to land BEFORE the merge, in practice
+# `chatgpt-codex-connector[bot]` and `copilot-pull-request-reviewer[bot]`.
+#
+# The reason there is anything to wait for: this fleet stopped paying for a
+# Codex review of a red pull request, so the review is now requested at the
+# moment CI goes green — which is the same `workflow_run` that dispatches this
+# lane. Without the gate the lane merges while the reviewer is still reading.
+mapfile -t REVIEW_BOTS < <(printf '%s\n' "${REVIEW_BOTS_INPUT:-}" | sed 's/[[:space:]]*$//' | grep -v '^$' || true)
+
+# HOW LONG A GREEN PULL REQUEST WAITS FOR THEM.
+#
+# Ten minutes, which is longer than either reviewer takes on this fleet (Codex
+# 2-4 minutes from the request, Copilot under one) and short enough that a
+# vendor outage costs one wait rather than a morning. Past it the lane merges
+# and SAYS it merged unreviewed — see `lane_review_gate` for why this is the one
+# gate here that fails open.
+REVIEW_GRACE="${REVIEW_GRACE:-600}"
+
 # HOW LONG THE LANE WAITS FOR A TIP TO ANSWER FOR ITSELF BEFORE GIVING UP ON IT.
 #
 # On an armed base the lane merges only onto a tip whose base-health checks have
@@ -372,6 +394,98 @@ already_released() {
   # exits on its first match closes the pipe and the writer dies on SIGPIPE,
   # which this repository has been bitten by often enough to have a gate for.
   printf '%s\n' "$bodies" | grep -cF -- "$(released_marker "$sha")" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# review_answered <pr> <sha> — how many of `REVIEW_BOTS` have published
+# something about EXACTLY this commit.
+#
+# TWO SURFACES, BECAUSE A CLEAN REVIEW LEAVES NO REVIEW.
+#
+# The obvious surface is `/pulls/<n>/reviews`, where each entry carries the
+# `commit_id` it was written against — that is the answer for a reviewer with
+# something to say. But Codex publishes a review object only when it HAS
+# findings; when it finds nothing it reacts with a thumbs-up and updates one
+# summary comment naming the commit it reviewed. Reading only the first surface
+# would therefore hold every clean pull request for the full grace and then
+# merge it with a warning, which is the worst of both behaviours: the lane
+# waits, and the warning that means "nobody reviewed this" starts appearing on
+# pull requests that were reviewed.
+#
+# So an issue comment by the same login that NAMES the head sha counts too. The
+# abbreviated form is what both vendors print, and it is matched as a literal.
+#
+# Costs two API reads, and only ever for a pull request the lane has already
+# decided to merge — a handful per pass, not one per open pull request.
+#
+# Unreadable reads as -1, never as 0. "The lane could not look" and "nobody has
+# answered" are different facts, and `lane_review_gate` merges on the first
+# rather than holding a green pull request over a rate limit.
+# ---------------------------------------------------------------------------
+review_answered() {
+  # `short` is deliberately a SECOND `local`. Assignments within one `local`
+  # statement are not visible to later assignments in that same statement, so
+  # `short="${sha:0:7}"` beside `sha="$2"` would read whatever `sha` held in the
+  # enclosing scope — empty, here, which makes the comment surface match every
+  # comment ever written and every pull request look reviewed. shellcheck calls
+  # it SC2318 and it is the reason this is two lines.
+  local num="$1" sha="$2" bot n=0
+  local short="${sha:0:7}"
+  local reviews comments
+
+  if ! reviews="$(gh api --paginate "repos/$R/pulls/$num/reviews?per_page=100" \
+    --jq '.[] | [.user.login, .commit_id] | @tsv' 2>/dev/null)"; then
+    echo -1
+    return 0
+  fi
+  if ! comments="$(gh api --paginate "repos/$R/issues/$num/comments?per_page=100" \
+    --jq '.[] | [.user.login, (.body | gsub("[\n\r]"; " "))] | @tsv' 2>/dev/null)"; then
+    echo -1
+    return 0
+  fi
+
+  for bot in "${REVIEW_BOTS[@]}"; do
+    if printf '%s\n' "$reviews" | grep -cF -- "$bot	$sha" >/dev/null; then
+      n=$((n + 1))
+      continue
+    fi
+    if printf '%s\n' "$comments" | awk -F'\t' -v b="$bot" '$1 == b' \
+      | grep -cF -- "$short" >/dev/null; then
+      n=$((n + 1))
+    fi
+  done
+
+  echo "$n"
+}
+
+# ---------------------------------------------------------------------------
+# review_clock <sha> — seconds since the reviewers could have STARTED.
+#
+# Not the age of the head commit. The review is requested when CI goes green,
+# so the clock that bounds the wait has to start there too; the commit date
+# would charge a pull request for the whole of its own CI run and, on one that
+# has been open for a day, would expire the grace before the first pass.
+#
+# The last required check to finish is that moment, read from the check-run
+# surface. Prints "" when it cannot be read, which `lane_review_gate` treats as
+# a reason to merge rather than a reason to wait forever.
+# ---------------------------------------------------------------------------
+review_clock() {
+  local sha="$1" latest ts
+  latest="$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" \
+    --jq '.check_runs[] | .completed_at // empty' 2>/dev/null | LC_ALL=C sort | tail -1 || true)"
+  [ -n "$latest" ] || {
+    echo ''
+    return 0
+  }
+  ts="$(date -u -d "$latest" +%s 2>/dev/null || true)"
+  [[ "$ts" =~ ^[0-9]+$ ]] || {
+    echo ''
+    return 0
+  }
+  local age=$((now - ts))
+  [ "$age" -ge 0 ] || age=0
+  echo "$age"
 }
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1145,39 @@ one_pass() {
     verdict="$(lane_verdict "$isdraft" "$LANE_BASE" "$LANE_BASE" "$conflict" \
       "${#REQUIRED[@]}" "$green" "$missing" "$failed" "$pending" "$behind" "$age" "$BUDGET" \
       "$LANE_STRICT")"
+
+    # THE AUTOMATED-REVIEW GATE, AND IT IS ASKED LAST ON PURPOSE.
+    #
+    # Only a pull request that is already `merge:ready` gets these two API
+    # reads, so the cost is a handful per pass rather than one per open pull
+    # request — the same argument the `behind_by` read makes above, and the
+    # difference between a pass that finishes and one the job timeout kills.
+    #
+    # A hold becomes `wait:review`, which is not actionable, so the pull request
+    # keeps its place, the queue table says what it is waiting for, and the next
+    # CI completion or the fifteen-minute sweep asks again. Nothing is
+    # announced and nothing is commented: a reviewer taking two minutes is not
+    # an event.
+    if [ "${#REVIEW_BOTS[@]}" -gt 0 ] && [ "${verdict%%:*}" = "merge" ]; then
+      local answered review_age review_verdict
+      answered="$(review_answered "$num" "$sha")"
+      review_age="$(review_clock "$sha")"
+      review_verdict="$(lane_review_gate "${#REVIEW_BOTS[@]}" "$answered" "$review_age" "$REVIEW_GRACE")"
+      case "$review_verdict" in
+        review:hold*)
+          verdict="wait:review ${review_verdict#review:hold }"
+          ;;
+        review:unreviewed*)
+          # LOUD, BECAUSE IT IS THE ONLY THING THIS GATE CAN GET WRONG. The
+          # merge goes ahead — see `lane_review_gate` for why it must — and an
+          # annotation is what an operator can find afterwards. A lane warning
+          # this on every pull request is a reviewer that has stopped
+          # answering, most likely a Codex account out of credits, and that is
+          # a fact worth reading in the run rather than inferring from silence.
+          echo "::warning::lane: #$num merging UNREVIEWED — $review_verdict. The required checks are green; the automated reviewers did not answer for ${sha:0:8} in time. If this appears on every pull request, the reviewer is down (Codex credits are the usual cause), not slow."
+          ;;
+      esac
+    fi
 
     echo "lane: #$num $verdict (sha=${sha:0:8} priority=$priority behind=$behind_cell)"
 

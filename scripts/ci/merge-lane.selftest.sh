@@ -896,7 +896,11 @@ halts_when_the_base_itself_is_red() {
   # spend a call per open pull request reaching a verdict it will not act on.
   local halt_line walk_line
   halt_line=$(grep -n '^  if lane_base_is_broken ' "$1" | head -n1 | cut -d: -f1)
-  walk_line=$(grep -n 'gh api --paginate "repos/\$R/pulls' "$1" | head -n1 | cut -d: -f1)
+  # The OPEN-LIST read specifically. `repos/$R/pulls` alone also matches the
+  # per-pull-request reads — `/pulls/<n>/reviews`, `/pulls/<n>/files` — and the
+  # first of those to appear in the file would be compared instead, which
+  # answers a different question and can only answer it by accident.
+  walk_line=$(grep -n 'gh api --paginate "repos/\$R/pulls?state=open' "$1" | head -n1 | cut -d: -f1)
   [ -n "$halt_line" ] && [ -n "$walk_line" ] && [ "$halt_line" -lt "$walk_line" ]
 }
 
@@ -1465,6 +1469,113 @@ mutate "the documented example loses its RUNNER7 declaration" "$DOC" \
 mutate "the documented label gate goes back to the bare variable, which is empty when unset" "$DOC" \
   "s@require-label: \\\${{ vars.MERGE_LANE_REQUIRE_LABEL || 'ready-to-merge' }}@require-label: \\\${{ vars.MERGE_LANE_REQUIRE_LABEL }}@" \
   documented_label_gate_fails_closed
+
+# ---------------------------------------------------------------------------
+# The automated-review gate.
+#
+# This is the one gate in the lane that FAILS OPEN, and the properties worth
+# asserting are all about keeping that honest. Two ways to get it wrong:
+#
+#   1. It stops being bounded — a reviewer that never answers then holds every
+#      green pull request in the fleet forever, which is a vendor's billing
+#      page acquiring merge authority. Nothing about a hold announces itself,
+#      so this failure is silent by construction.
+#   2. It stops being paid for — the reads move out of the `merge:ready` arm
+#      and become two API calls on every open pull request on every pass, which
+#      is exactly the cost that had the lane killed by its own job timeout on
+#      IntegrateIT (#444).
+#
+# And one that is not a failure mode at all: the gate cannot approve anything.
+# It only ever converts a `merge` into a `wait`.
+# ---------------------------------------------------------------------------
+
+# The wait is bounded, and the expiry says so out loud. A hold with no grace and
+# no annotation is the deadlock above.
+the_review_wait_is_bounded() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'lane_review_gate .*REVIEW_GRACE' || return 1
+  matches "$code" 'REVIEW_GRACE="\$\{REVIEW_GRACE:-[0-9]+\}"' || return 1
+  matches "$code" '::warning::lane: #\$num merging UNREVIEWED'
+}
+
+# Only a pull request the lane has already decided to merge pays for the two
+# reads. `#444` is what this costs when it is wrong.
+the_review_gate_is_asked_only_of_a_ready_merge() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '\[ "\$\{verdict%%:\*\}" = "merge" \]' || return 1
+  before "$code" 'verdict="\$\(lane_verdict' 'answered="\$\(review_answered'
+}
+
+# An unreadable surface is not an unanswered one. `review_answered` returning 0
+# on a rate limit would hold a green pull request for the whole grace on every
+# pass and then merge it with a warning that names the wrong cause.
+an_unreadable_review_surface_is_not_an_unanswered_one() {
+  local code n
+  code=$(code_of "$1")
+  n=$(printf '%s\n' "$code" | grep -cE '^    echo -1$')
+  [ "${n:-0}" -eq 2 ]
+}
+
+# A clean Codex review publishes no review object at all — only a summary
+# comment naming the commit. Reading one surface holds every clean pull request
+# for the full grace and then warns that nobody reviewed it.
+both_review_surfaces_are_read() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'pulls/\$num/reviews' || return 1
+  matches "$code" 'issues/\$num/comments\?per_page=100' || return 1
+  matches "$code" 'grep -cF -- "\$short"'
+}
+
+# The clock starts when CI went green, not when the branch was pushed. The
+# commit date would charge a pull request for its own CI run and expire the
+# grace before the first pass on anything opened yesterday.
+the_review_clock_starts_at_green() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'check-runs\?per_page=100' || return 1
+  matches "$code" 'completed_at // empty'
+}
+
+passes_the_review_gate_to_the_driver() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      review-bots:' || return 1
+  matches "$code" '^      review-grace-seconds:' || return 1
+  matches "$code" 'REVIEW_BOTS_INPUT: \$\{\{ inputs.review-bots \}\}' || return 1
+  matches "$code" 'REVIEW_GRACE: \$\{\{ inputs.review-grace-seconds \}\}'
+}
+
+check the_review_wait_is_bounded "$DRIVER" "the wait for an automated review has no ceiling or expires silently, so a reviewer that stops answering — a Codex account out of credits is the ordinary way — holds every green pull request in the fleet with nothing in any log saying why"
+check the_review_gate_is_asked_only_of_a_ready_merge "$DRIVER" "the review reads happen before the merge verdict, so every open pull request pays two API calls per pass and the cost tracks the size of the repository — the #444 defect, rebuilt"
+check an_unreadable_review_surface_is_not_an_unanswered_one "$DRIVER" "an unreadable review surface counts as nobody having answered, so a rate limit holds a green pull request for the whole grace and then blames the reviewer"
+check both_review_surfaces_are_read "$DRIVER" "only the review surface is read, so a Codex review that found nothing — which publishes a summary comment and no review — reads as no review at all"
+check the_review_clock_starts_at_green "$DRIVER" "the review grace is measured from something other than the last check finishing, so a pull request opened yesterday exhausts it before the reviewer is even asked"
+check passes_the_review_gate_to_the_driver "$CALLEE" "the workflow declares the review gate but never hands it to the driver, so a repository that arms it merges unreviewed and nothing says so"
+
+mutate "the review gate loses its grace and becomes an unbounded hold" "$DRIVER" \
+  's|"\$review_age" "\$REVIEW_GRACE"|"$review_age" ""|' \
+  the_review_wait_is_bounded
+mutate "merging unreviewed downgrades to a notice, which writes no annotation" "$DRIVER" \
+  's@::warning::lane: #\$num merging UNREVIEWED@::notice::lane: #$num merging UNREVIEWED@' \
+  the_review_wait_is_bounded
+mutate "the review reads stop being confined to a ready merge" "$DRIVER" \
+  's|= "merge" \]; then|= "" ]; then|' \
+  the_review_gate_is_asked_only_of_a_ready_merge
+mutate "an unreadable review surface starts counting as zero answers" "$DRIVER" \
+  's@^    echo -1$@    echo 0@' \
+  an_unreadable_review_surface_is_not_an_unanswered_one
+mutate "the comment surface is dropped, so a clean review reads as no review" "$DRIVER" \
+  's@issues/\$num/comments?per_page=100@issues/$num/comments-unused?per_page=100@' \
+  both_review_surfaces_are_read
+mutate "the review clock goes back to the head commit date" "$DRIVER" \
+  's@completed_at // empty@committer.date // empty@' \
+  the_review_clock_starts_at_green
+mutate "the review bots stop reaching the driver" "$CALLEE" \
+  's@REVIEW_BOTS_INPUT: [$][{][{] inputs.review-bots [}][}]@REVIEW_BOTS_UNUSED: ${{ inputs.review-bots }}@' \
+  passes_the_review_gate_to_the_driver
 
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane: $FAIL failed, $PASS passed"
