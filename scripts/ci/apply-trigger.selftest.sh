@@ -245,9 +245,15 @@ rejects_a_credential_in_backend_config() {
 #     APPLY over a warning — and a fleet whose applies are routinely red is a
 #     fleet that stops reading them, which is how the first failure came back.
 reconciles_alerts_without_gating_the_apply() {
-  local block
-  block=$(awk '/id         = "alert-policies"/,/^      }/' "$1")
-  # The step must exist, or every assertion below is vacuous.
+  local block step
+  # The body lives in `local.alert_step_script` so the precondition below can
+  # measure it, so the assertions read the local — and the step separately, to
+  # keep "the step exists" from being satisfied by a local nothing references.
+  block=$(awk '/^  alert_step_script = <<-EOT/,/^  EOT$/' "$1")
+  step=$(awk '/id     = "alert-policies"/,/^      }/' "$1")
+  # The step must exist and must be the local's only consumer, or every
+  # assertion below is vacuous.
+  matches "$step"  'script = local.alert_step_script' || return 1
   matches "$block" 'ensure-alert-policies.sh' || return 1
   # The script is CARRIED, not fetched: a curl at build time runs whatever the
   # URL serves now, not what this module was pinned to.
@@ -263,6 +269,28 @@ reconciles_alerts_without_gating_the_apply() {
   matches "$block" 'monitoring.alertPolicyEditor'         || return 1
   matches "$block" 'monitoring.notificationChannelEditor' || return 1
   ! matches "$block" 'roles/monitoring.editor'            || return 1
+  # CARRIED IN `script`, NEVER IN `args`. A build step ARGUMENT is capped at
+  # 10,000 characters and this body is ~25 KB, so as an argument every build the
+  # trigger fires is refused at FIRE time: terraform is green, the trigger
+  # exists, each build dies in under a second with "build step N arg 1 too long
+  # (max: 10000)", and from GitHub the commit merges with the check-run stuck
+  # `queued`. It shipped that way, and for as long as it was live nothing in the
+  # fleet applied. `entrypoint` beside `script` is itself an error.
+  ! matches "$step" 'args'       || return 1
+  ! matches "$step" 'entrypoint' || return 1
+}
+
+# 13b. And the plan fails on the limit `script` does NOT escape. Past roughly
+#      128 KiB Cloud Build accepts a build, hands back an id, and never
+#      schedules it — no BUILD phase, no log, no error, every step QUEUED until
+#      the queue TTL expires. `ci-runner-cache-warmer` measured that cliff and
+#      carries the same guard; this step was written afterwards and reintroduced
+#      the argument cap the warmer's header already warned about, which is the
+#      reason the guard is asserted here rather than left to be remembered.
+fails_the_plan_before_the_build_is_unschedulable() {
+  local block; block=$(awk '/lifecycle \{/,/^  \}/' "$1")
+  matches "$block" 'precondition'                    || return 1
+  matches "$block" 'length\(local.alert_step_script\)' || return 1
 }
 
 # 14. No inbox literal anywhere in the module. The address is the one thing here
@@ -326,6 +354,7 @@ check defaults_to_the_generation_already_deployed "$VARS" "github_connection has
 check passes_the_backend_config_through           "$MAIN" "init drops backend_config, or builds it unsorted — a root that supplies its bucket at init time cannot use this module, or its trigger is rewritten on every apply"
 check rejects_a_credential_in_backend_config      "$VARS" "backend_config accepts a credential key — it would be stored in the trigger's build config and printed in every build log, with nothing going red"
 check reconciles_alerts_without_gating_the_apply  "$MAIN" "the alert-policy step is missing, fetches its script at build time, or propagates its exit status — a project silently runs unmonitored, or a missing monitoring grant turns every apply in the fleet red"
+check fails_the_plan_before_the_build_is_unschedulable "$MAIN" "nothing measures the embedded script — past roughly 128 KiB Cloud Build accepts the build, never schedules it, and reports nothing anywhere"
 check names_no_inbox                              "$VARS" "an email address is defaulted in the module — ten roots would page an inbox nobody chose, and it would work, which is why nothing would go red"
 check constrains_the_value_it_shells_out          "$VARS" "alert_notification_email reaches a shell command unvalidated — a quote in it runs arbitrary commands as the project's build account"
 
@@ -400,6 +429,15 @@ mutate "'a failure should be a failure' — the exit status propagated" "$MAIN" 
 # every apply depend on github.com, running whatever the tag serves today.
 mutate "'just fetch the script' — carried copy replaced with a download" "$MAIN" \
   's#printf .*base64 -d.*#curl -fsSL https://example/x.sh -o /workspace/ensure-alert-policies.sh#' reconciles_alerts_without_gating_the_apply
+# THE EDIT THAT SHIPPED. `script` is the newer field and `args` is what every
+# other step in this file uses, so writing it the way its neighbours are written
+# is the natural mistake — and it is invisible until a build fires.
+mutate "'write it like the other steps' — the body moved back into args" "$MAIN" \
+  's|        script = local.alert_step_script|        entrypoint = "bash"\n        args       = ["-c", local.alert_step_script]|' reconciles_alerts_without_gating_the_apply
+# "The precondition is noise, terraform validate passes either way" — and it
+# does, right up to the size where the build is accepted and never runs.
+mutate "'a magic number in a precondition' — the size guard removed" "$MAIN" \
+  '/lifecycle {/,/^  }/d' fails_the_plan_before_the_build_is_unschedulable
 # "Everyone gets the same alerts anyway" — the default that quietly pages an
 # inbox no project chose.
 mutate "'give it a sensible default' — an address defaulted in the module" "$VARS" \
