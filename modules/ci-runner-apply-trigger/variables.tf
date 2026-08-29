@@ -220,3 +220,66 @@ variable "scheduler_service_account" {
   default     = null
   description = "Account the scheduler authenticates as when it calls the run API. Defaults to service_account. Needs cloudbuild.builds.create on the trigger, and must live in THIS project — Cloud Scheduler mints its token through its own service agent, which is per-project."
 }
+
+# --- alert policies ------------------------------------------------------------
+#
+# The apply is the only thing in these projects that runs with project-scoped
+# credentials on a schedule, which is why the fleet's alerting is reconciled
+# from here. See the `alert-policies` step in main.tf for why it is best-effort.
+
+variable "manage_alert_policies" {
+  type        = bool
+  default     = true
+  description = <<-EOT
+    Bring this project's CI alert policies up to the fleet's set on every apply.
+
+    On by default, and that default is the point: measured on 2026-08-29, four of the ten pool projects had NO CI alert policies at all, because the script that creates them was operator-run and nobody had run it there. Opt-out rather than opt-in, because a project that forgets is exactly the project that needs it.
+
+    The step never fails the build — a project whose build account cannot write monitoring policies gets a warning naming the role, not a red apply.
+  EOT
+}
+
+variable "alert_notification_email" {
+  type        = string
+  default     = null
+  description = <<-EOT
+    Address every policy in this project pages. Null (the default) ADOPTS the email notification channel the project already has, which is what makes this work unattended in ten roots without an inbox literal in any of them.
+
+    Set it only to bootstrap a project that has never had a channel, or to disambiguate one that has more than one — the script refuses to choose in both cases rather than pointing thirteen policies at an inbox nobody reads.
+  EOT
+
+  # This value is interpolated into a shell command in the build step, inside
+  # single quotes. An address containing a quote would close them and run the
+  # rest as a command, AS THE PROJECT'S BUILD ACCOUNT — the one identity in this
+  # design that can write infrastructure. Validated to an address shape here
+  # rather than escaped there, because the escaping would live in a heredoc that
+  # nobody re-reads and the shape is what the input is supposed to be anyway.
+  validation {
+    condition     = var.alert_notification_email == null || can(regex("^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$", coalesce(var.alert_notification_email, "x@y.zz")))
+    error_message = "alert_notification_email must be a plain email address — it is interpolated into the build's shell command, so anything else is refused here rather than quoted there."
+  }
+}
+
+variable "alert_poll_interval_seconds" {
+  type        = number
+  default     = null
+  description = "The pool's poll_interval_seconds, when it is not the module default. The slow-tick threshold is derived from it, so a value that disagrees with the pool pages on supported behaviour. Null passes nothing and the script uses the same default the pool does."
+}
+
+variable "alert_register_grace_seconds" {
+  type        = number
+  default     = null
+  description = "The pool's register_grace_seconds, when it is not the module default. It is a statement about how long a host is ALLOWED to take to register, so a threshold below it pages for a pool behaving as configured."
+}
+
+variable "alert_drain_grace_seconds" {
+  type        = number
+  default     = null
+  description = "The pool's drain_grace_seconds, when it is not the module default. Same reasoning as register grace: the alert must not fire inside the window the pool is permitted to use."
+}
+
+variable "alert_cache_stale_hours" {
+  type        = number
+  default     = null
+  description = "Snapshot age that pages, which must stay BELOW the pool's cache_snapshot_max_age_hours. At or above it, the first notification anyone gets is every host in the pool starting cold — the outage, not the warning."
+}

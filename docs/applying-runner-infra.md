@@ -170,6 +170,32 @@ for R in projects/<project>/roles/ciRunnerApplyIamReader \
 done
 ```
 
+### The one WRITE grant, and why it is separate
+
+`roles/monitoring.editor` is what the `alert-policies` step needs, and it is the
+only grant in this document that is not read-only — so it is listed apart from
+the four above rather than folded into the same loop, where it would inherit
+their "the security property is untouched" sentence and stop being a decision.
+
+```bash
+gcloud projects add-iam-policy-binding <project> --condition=None \
+  --member=serviceAccount:<sa>@<project>.iam.gserviceaccount.com \
+  --role=roles/monitoring.editor
+```
+
+It is genuinely optional. Without it the apply still succeeds and prints a
+warning naming this role — that is deliberate, because a missing observability
+grant must not turn an infrastructure apply red. What you lose is the property
+the step was added for: the project's alert policies stop being reconciled, and
+drift there is invisible from inside the project, since a project with no
+policies and a project with nothing wrong look identical.
+
+The scope is narrow in the way that matters here: `monitoring.editor` can write
+alert policies, notification channels and log metrics, and cannot read or write
+anything outside Cloud Monitoring. It cannot touch IAM, so the property the
+four read-only roles preserve — an apply that would change an identity stops red
+— is unaffected.
+
 The custom role exists rather than `roles/iam.securityReviewer` because
 `getIamPolicy` on the project is the single permission the refresh actually
 needs, and securityReviewer carries a large read surface for it. **Every one of

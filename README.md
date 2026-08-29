@@ -788,8 +788,19 @@ window and still hold live work.
 "no data" there means the controller is down, which no other series can
 distinguish from "the pool is idle".
 
-`scripts/ci/ensure-alert-policies.sh --project <id> --email <addr>` brings one
-project's policies up to the fleet's, idempotently. Two of the thirteen watch the
+`scripts/ci/ensure-alert-policies.sh --project <id> [--email <addr>]` brings one
+project's policies up to the fleet's, idempotently. **You should not normally
+have to run it**: `ci-runner-apply-trigger` carries it as a build step and
+reconciles the policies on every apply (`manage_alert_policies`, on by default).
+That step exists because the hand-run version did not roll out — on 2026-08-29,
+four of the ten pool projects had no CI alert policies at all, which looks from
+inside exactly like a project with nothing wrong. `--email` is optional and
+omitting it adopts the channel the project already pages; an address is needed
+only to bootstrap a project that has never had one, or to disambiguate a project
+that has several. The step never fails the apply: a build account without
+`roles/monitoring.editor` gets a warning naming the role.
+
+Two of the thirteen watch the
 cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it
 below the pool's `cache_snapshot_max_age_hours`, or the first notice anyone gets
 is every host starting cold) and *hydrate failing on a configured pool*, which
