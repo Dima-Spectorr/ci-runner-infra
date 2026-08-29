@@ -121,7 +121,13 @@ fi
 # Codex review of a red pull request, so the review is now requested at the
 # moment CI goes green — which is the same `workflow_run` that dispatches this
 # lane. Without the gate the lane merges while the reviewer is still reading.
-mapfile -t REVIEW_BOTS < <(printf '%s\n' "${REVIEW_BOTS_INPUT:-}" | sed 's/[[:space:]]*$//' | grep -v '^$' || true)
+#
+# Trimmed at BOTH ends. A block scalar in a caller is indented, and a login with
+# a leading space matches no review and no comment — so the gate would hold
+# every green pull request for the full grace and then merge it with the warning
+# that means "the reviewer is down". An indentation typo must not be able to
+# produce that.
+mapfile -t REVIEW_BOTS < <(printf '%s\n' "${REVIEW_BOTS_INPUT:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' || true)
 
 # HOW LONG A GREEN PULL REQUEST WAITS FOR THEM.
 #
@@ -1158,6 +1164,7 @@ one_pass() {
     # CI completion or the fifteen-minute sweep asks again. Nothing is
     # announced and nothing is commented: a reviewer taking two minutes is not
     # an event.
+    local unreviewed=''
     if [ "${#REVIEW_BOTS[@]}" -gt 0 ] && [ "${verdict%%:*}" = "merge" ]; then
       local answered review_age review_verdict
       answered="$(review_answered "$num" "$sha")"
@@ -1168,13 +1175,20 @@ one_pass() {
           verdict="wait:review ${review_verdict#review:hold }"
           ;;
         review:unreviewed*)
-          # LOUD, BECAUSE IT IS THE ONLY THING THIS GATE CAN GET WRONG. The
-          # merge goes ahead — see `lane_review_gate` for why it must — and an
-          # annotation is what an operator can find afterwards. A lane warning
-          # this on every pull request is a reviewer that has stopped
-          # answering, most likely a Codex account out of credits, and that is
-          # a fact worth reading in the run rather than inferring from silence.
-          echo "::warning::lane: #$num merging UNREVIEWED — $review_verdict. The required checks are green; the automated reviewers did not answer for ${sha:0:8} in time. If this appears on every pull request, the reviewer is down (Codex credits are the usual cause), not slow."
+          # RECORDED HERE, ANNOUNCED WHERE THE MERGE HAPPENS.
+          #
+          # This is the walk. Every ready pull request whose grace has expired
+          # passes through it, and most of them are not going to be merged this
+          # pass: the ranking has not been computed yet, a dry run acts on
+          # nothing at all, and the base may have moved since. Warning here
+          # produced one annotation per candidate for merges that never
+          # happened — and this annotation is documented as the operator's
+          # detection surface for a reviewer that has stopped answering, so a
+          # false one costs an outage investigation and hides the real ones.
+          #
+          # The flag rides the candidate tuple and is spoken at the point of no
+          # return, beside the merge it describes.
+          unreviewed="$review_verdict"
           ;;
       esac
     fi
@@ -1209,7 +1223,10 @@ one_pass() {
     if lane_admits "$verdict"; then
       local key
       key="$(lane_rank "$verdict" "$priority" "${age:-0}")"
-      candidates+=("$key	$num	$sha	$verdict")
+      # Five fields now. The fifth is the review gate's verdict when it decided
+      # to merge unreviewed, and empty otherwise — carried rather than announced
+      # so the annotation is spoken beside the merge it describes.
+      candidates+=("$key	$num	$sha	$verdict	$unreviewed")
     fi
   done
 
@@ -1240,8 +1257,8 @@ one_pass() {
   local ranked
   ranked="$(printf '%s\n' "${candidates[@]}" | LC_ALL=C sort)"
 
-  local action_num action_sha action_verdict
-  IFS=$'\t' read -r _ action_num action_sha action_verdict <<<"$(head -n1 <<<"$ranked")"
+  local action_num action_sha action_verdict action_unreviewed
+  IFS=$'\t' read -r _ action_num action_sha action_verdict action_unreviewed <<<"$(head -n1 <<<"$ranked")"
 
   if [ "$DRY_RUN" = "true" ]; then
     echo "::notice::dry-run — would take '$action_verdict' on #$action_num"
@@ -1293,7 +1310,7 @@ one_pass() {
   fi
 
   PASS_ACTED=0
-  while IFS=$'\t' read -r _ action_num action_sha action_verdict; do
+  while IFS=$'\t' read -r _ action_num action_sha action_verdict action_unreviewed; do
     [ -n "$action_num" ] || continue
     [ "$PASS_ACTED" -lt "$batch" ] || break
     if [ "$PASS_ACTED" -gt 0 ]; then
@@ -1339,6 +1356,17 @@ one_pass() {
     # every other candidate in the repository, on every pass, forever: measured
     # on two repositories where a single workflow-touching pull request held the
     # whole backlog. It is skipped, not merged and not counted.
+    # LOUD, BECAUSE IT IS THE ONLY THING THE REVIEW GATE CAN GET WRONG, and
+    # said here because here is where the merge actually happens. The merge goes
+    # ahead — see `lane_review_gate` for why it must — and this annotation is
+    # what an operator can find afterwards. One of these on a slow day is the
+    # gate working. One on every pull request is a reviewer that has stopped
+    # answering, most likely a Codex account out of credits, and that is a fact
+    # worth reading in the run rather than inferring from silence.
+    if [ -n "$action_unreviewed" ]; then
+      echo "::warning::lane: #$action_num merging UNREVIEWED — $action_unreviewed. The required checks are green; the automated reviewers did not answer for ${action_sha:0:8} in time. If this appears on every pull request, the reviewer is down (Codex credits are the usual cause), not slow."
+    fi
+
     local take_rc=0
     lane_take_action "$action_num" "$action_sha" "$action_verdict" || take_rc=$?
     if [ "$take_rc" -ne 0 ]; then

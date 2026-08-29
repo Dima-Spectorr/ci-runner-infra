@@ -1496,7 +1496,24 @@ the_review_wait_is_bounded() {
   code=$(code_of "$1")
   matches "$code" 'lane_review_gate .*REVIEW_GRACE' || return 1
   matches "$code" 'REVIEW_GRACE="\$\{REVIEW_GRACE:-[0-9]+\}"' || return 1
-  matches "$code" '::warning::lane: #\$num merging UNREVIEWED'
+  # `#$action_num`, not `#$num`: the annotation is written where the merge is
+  # taken, not where the candidate is classified. The walk sees every expired
+  # candidate and merges at most one of them, so an annotation written in the
+  # walk claims merges that never happen — and this is the surface an operator
+  # reads to decide the reviewer is down.
+  matches "$code" '::warning::lane: #\$action_num merging UNREVIEWED'
+}
+
+# The verdict has to SURVIVE the walk to be sayable at the merge. It rides the
+# candidate tuple; a tuple that drops the field turns the annotation into a
+# permanently empty string and the detection surface goes quiet rather than
+# noisy — the failure direction that is never noticed.
+the_unreviewed_verdict_reaches_the_merge() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'candidates\+=\("\$key.*\$unreviewed"\)' || return 1
+  matches "$code" 'read -r _ action_num action_sha action_verdict action_unreviewed' || return 1
+  matches "$code" 'if \[ -n "\$action_unreviewed" \]; then'
 }
 
 # Only a pull request the lane has already decided to merge pays for the two
@@ -1553,14 +1570,18 @@ check the_review_gate_is_asked_only_of_a_ready_merge "$DRIVER" "the review reads
 check an_unreadable_review_surface_is_not_an_unanswered_one "$DRIVER" "an unreadable review surface counts as nobody having answered, so a rate limit holds a green pull request for the whole grace and then blames the reviewer"
 check both_review_surfaces_are_read "$DRIVER" "only the review surface is read, so a Codex review that found nothing — which publishes a summary comment and no review — reads as no review at all"
 check the_review_clock_starts_at_green "$DRIVER" "the review grace is measured from something other than the last check finishing, so a pull request opened yesterday exhausts it before the reviewer is even asked"
+check the_unreviewed_verdict_reaches_the_merge "$DRIVER" "the unreviewed verdict does not survive the walk, so the annotation an operator reads to spot a reviewer that has stopped answering is written empty or not at all"
 check passes_the_review_gate_to_the_driver "$CALLEE" "the workflow declares the review gate but never hands it to the driver, so a repository that arms it merges unreviewed and nothing says so"
 
 mutate "the review gate loses its grace and becomes an unbounded hold" "$DRIVER" \
   's|"\$review_age" "\$REVIEW_GRACE"|"$review_age" ""|' \
   the_review_wait_is_bounded
 mutate "merging unreviewed downgrades to a notice, which writes no annotation" "$DRIVER" \
-  's@::warning::lane: #\$num merging UNREVIEWED@::notice::lane: #$num merging UNREVIEWED@' \
+  's@::warning::lane: #\$action_num merging UNREVIEWED@::notice::lane: #$action_num merging UNREVIEWED@' \
   the_review_wait_is_bounded
+mutate "the unreviewed verdict stops riding the candidate tuple" "$DRIVER" \
+  's@	\$unreviewed")@")@' \
+  the_unreviewed_verdict_reaches_the_merge
 mutate "the review reads stop being confined to a ready merge" "$DRIVER" \
   's|= "merge" \]; then|= "" ]; then|' \
   the_review_gate_is_asked_only_of_a_ready_merge

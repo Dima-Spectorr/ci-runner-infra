@@ -93,6 +93,15 @@ if [ -z "$prs" ]; then
 fi
 
 requested=0
+# A POST THAT FAILED IS A REVIEW THAT WAS NEVER ASKED FOR, AND THE RUN SAYS SO.
+#
+# The loop below does not stop on one failure — one 403 on one pull request
+# should not cost the others their review — but the run must not conclude
+# `success` either. The merge lane is on the other end of this: it holds a green
+# pull request waiting for an answer, waits out `review-grace-seconds`, and
+# merges unreviewed. A green run here would make that look like a slow reviewer
+# rather than a request that was never put, and the two need different fixes.
+failed=0
 while IFS=$'\t' read -r num draft state author; do
   [ -n "$num" ] || continue
 
@@ -153,7 +162,13 @@ $(review_marker "$HEAD_SHA")"
     # silently either, because the merge lane is now waiting for an answer to a
     # question that was never put.
     echo "::error::codex-review: could not comment on #$num. Without the comment nothing was asked, and the merge lane will wait out its review grace and merge unreviewed."
+    failed=$((failed + 1))
   fi
 done <<<"$prs"
 
 echo "codex-review: asked for $requested review(s)"
+
+if [ "$failed" -gt 0 ]; then
+  echo "::error::codex-review: $failed pull request(s) were not asked. The run is red on purpose — see the annotations above for which, and note that a green run here is what tells an operator the reviewer is slow rather than unasked."
+  exit 1
+fi

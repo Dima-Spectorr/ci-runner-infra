@@ -72,6 +72,14 @@ Disarm by setting `CODEX_REVIEW_ARMED` to anything else. Setting
 
 ## The caller
 
+> **The pin below is not usable yet.** `codex-review.yml` is newer than every
+> release that exists — v5.76.0 was cut before it merged and does not carry it —
+> so the sha in the `uses:` line resolves to a tree that does not contain it and
+> a caller copying this today gets *reusable workflow not found*. The release
+> that carries it is cut once this merges, and the line is bumped to that sha
+> then. Until you see a pin whose trailing comment is **v5.77.0 or later**, this
+> file is a design, not an instruction.
+
 ```yaml
 name: Codex review
 
@@ -185,7 +193,33 @@ Nothing in the code can tell the two cases apart, which is why this is written
 down rather than detected. **After arming the first repository, read the pull
 request.** If the reviewer answered, the built-in token is enough for the whole
 fleet. If it did not, pass the `review-app-id` / `review-app-private-key`
-secrets — the merge App's credentials, or a PAT — and it will.
+secrets — the merge App's credentials — and it will. A repository with a
+personal access token and no App passes it as `review-token` instead; the App is
+preferred where there is one, because its token is minted per run and expires
+while a personal access token does not.
+
+## Your CI must run when a draft is marked ready
+
+The rule declines to spend on a draft, and this trigger is dispatched by CI
+completions only. `opened, synchronize, reopened` — the default `pull_request`
+activity types — contain no event for *marked ready*. Put together, a draft
+whose last push went green sits at that same green sha when it becomes ready,
+produces no further completion, and is never reviewed; the merge lane then holds
+it for its grace and merges it unreviewed, which reads as a slow reviewer rather
+than as a request nobody made.
+
+So a repository arming this needs its CI workflow to say:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+```
+
+It costs one extra run per draft that becomes ready — the same work the pull
+request needed anyway, moved earlier. This repository's own `ci.yml` says it,
+and `codex-review.selftest.sh` asserts it there with a mutation; for a consuming
+repository, whose CI workflow this fleet does not own, it is this paragraph.
 
 ## Self-tests
 

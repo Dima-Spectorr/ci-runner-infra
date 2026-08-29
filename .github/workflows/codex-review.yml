@@ -132,6 +132,21 @@ on:
       review-app-private-key:
         description: The private key for `review-app-id`.
         required: false
+      review-token:
+        description: >-
+          Optional. A token to post the request comment with, for a caller that
+          has a personal access token but no App. Same purpose as
+          `review-app-id`, one step cruder, and it is declared because a
+          reusable workflow cannot be handed a secret it does not declare — a
+          fallback the documentation recommends and the interface refuses is a
+          fallback nobody can configure.
+
+
+          The App is preferred where there is one: its token is minted per run
+          and expires, a personal access token does not. This wins over
+          `review-app-id` when both are set, on the grounds that the more
+          explicit of two optional settings is the one the operator meant.
+        required: false
 
 jobs:
   review:
@@ -192,10 +207,11 @@ jobs:
 
       - name: Ask for the review
         env:
-          # The App token when there is one, the caller's own token otherwise.
-          # See the `review-app-id` description for why both are supported and
-          # which to reach for first.
-          GH_TOKEN: ${{ steps.token.outputs.token || github.token }}
+          # The explicit token if the caller passed one, the App's minted token
+          # if it configured an App, and the caller's own `GITHUB_TOKEN`
+          # otherwise. See the `review-app-id` and `review-token` descriptions
+          # for why all three are supported and which to reach for first.
+          GH_TOKEN: ${{ secrets.review-token || steps.token.outputs.token || github.token }}
           HEAD_SHA: ${{ inputs.head-sha }}
           CONCLUSION: ${{ inputs.conclusion }}
           REVIEW_COMMAND: ${{ inputs.review-command }}
