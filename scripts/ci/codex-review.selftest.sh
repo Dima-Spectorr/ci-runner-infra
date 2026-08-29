@@ -260,6 +260,23 @@ reruns_ci_when_a_draft_becomes_ready() {
   matches "$code" '^    types: \[.*ready_for_review.*\]'
 }
 
+# A marker is a comment, and on a public repository a comment is something a
+# stranger can write. Matched by text alone it is a suppression anyone can post:
+# the run concludes `skip:already-requested`, nothing is asked, nothing is red,
+# and the merge lane waits out its grace and merges unreviewed.
+#
+# Asserted structurally as well as behaviourally because the behavioural cases
+# need `jq` and skip without it — and the machine this is edited on is exactly
+# the kind that skips.
+authenticates_the_dedupe_marker() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'gh api user --jq' || return 1
+  matches "$code" 'marker_author_filter="select\(.user.login == ' || return 1
+  matches "$code" "marker_author_filter='select\\(.user.type == " || return 1
+  matches "$code" '\$marker_author_filter'
+}
+
 check() { # <predicate> <file> <description>
   if "$1" "$2"; then ok; else bad "$3"; fi
 }
@@ -273,6 +290,7 @@ check reviews_only_the_head_of_a_pull_request "$DRIVER" "any pull request contai
 check reads_every_page "$DRIVER" "a list read is unpaginated, so on a busy pull request the marker falls off the end of the first page and the same commit is reviewed again on every CI completion"
 check reddens_the_run_when_a_request_could_not_be_posted "$DRIVER" "a comment POST that fails leaves the run green, so the only visible symptom is the merge lane merging unreviewed and the blame lands on the reviewer rather than on the permission"
 check reddens_the_run_when_the_comment_surface_was_unreadable "$DRIVER" "an unreadable comment surface suppresses the request and leaves the run green, so nothing was asked for this sha, nothing will ask again, and the only symptom is the merge lane merging unreviewed"
+check authenticates_the_dedupe_marker "$DRIVER" "the dedupe marker is matched by text alone, so anyone who can comment on a pull request can suppress its review by posting the marker before CI finishes — and the run says skip:already-requested for a review nobody asked for"
 check reruns_ci_when_a_draft_becomes_ready "$ROOT/.github/workflows/ci.yml" "CI does not run when a draft is marked ready, so a draft that went green while it was a draft produces no further completion, is never asked for a review, and the merge lane merges it unreviewed"
 
 # --- the driver, actually run ------------------------------------------------
@@ -296,11 +314,30 @@ run_driver() { # <fixture> <env...> — prints the driver's output, exit code la
   bin="$(mktemp -d)"
   cat >"$bin/gh" <<STUB
 #!/usr/bin/env bash
-# Stub. Answers the three reads/writes the driver makes and nothing else, so an
+# Stub. Answers the four reads/writes the driver makes and nothing else, so an
 # unanticipated call shows up as an empty answer rather than a plausible one.
+#
+# The comment read is the one case that does REAL work: it runs the driver's own
+# \`--jq\` program over \$STUB_COMMENTS. A stub that ignored the filter and
+# returned bodies would pass whatever the driver asked for, which is exactly the
+# property under test here — who wrote the marker.
 case "\$*" in
+  user*|*" user"*)
+    # \`/user\` answers a personal access token and refuses the built-in
+    # \`GITHUB_TOKEN\` and an App installation token. Unset login stands for
+    # the refusal.
+    [ -n "\${STUB_LOGIN:-}" ] || exit 1
+    printf '%s\n' "\$STUB_LOGIN"
+    ;;
   *"/pulls?per_page=100"*) cat "$fixture" ;;
-  *"/comments?per_page=100"*) printf '' ;;
+  *"/comments?per_page=100"*)
+    expr='' prev=''
+    for a in "\$@"; do
+      [ "\$prev" = "--jq" ] && expr="\$a"
+      prev="\$a"
+    done
+    printf '%s' "\${STUB_COMMENTS:-[]}" | jq -r "\$expr"
+    ;;
   *"/comments"*) echo "STUB-COMMENT-POSTED" >&2 ;;
   *) printf '' ;;
 esac
@@ -376,6 +413,44 @@ if "$_probe/x" 2>/dev/null; then
   driver_case "the run finishes rather than being killed mid-loop" \
     "$TWO_PRS" 'exit=0' \
     GITHUB_REPOSITORY=o/r HEAD_SHA=abc1234def CONCLUSION=success DRY_RUN=true
+
+  # WHOSE MARKER COUNTS. These need a real `jq`, because the property is the
+  # driver's own filter program and a stub that ignored it would assert nothing.
+  if command -v jq >/dev/null 2>&1; then
+    MARKER='<!-- codex-review:requested:abc1234def -->'
+    BY_STRANGER="[{\"user\":{\"login\":\"drive-by\",\"type\":\"User\"},\"body\":\"$MARKER\"}]"
+    BY_REQUESTER="[{\"user\":{\"login\":\"asker\",\"type\":\"User\"},\"body\":\"$MARKER\"}]"
+    BY_BOT="[{\"user\":{\"login\":\"github-actions[bot]\",\"type\":\"Bot\"},\"body\":\"$MARKER\"}]"
+
+    # The reported hole: anyone who can comment posts the marker before CI
+    # finishes and the review is silently never asked for.
+    driver_case "a stranger's marker does not suppress the request" \
+      "$ONE_PR" 'request:green' \
+      GITHUB_REPOSITORY=o/r HEAD_SHA=abc1234def CONCLUSION=success DRY_RUN=true \
+      STUB_LOGIN=asker STUB_COMMENTS="$BY_STRANGER"
+
+    # And the half that must not break while fixing it: a filter that stops
+    # matching the workflow's own marker buys a review per CI completion.
+    driver_case "the requester's own marker still suppresses the request" \
+      "$ONE_PR" 'skip:already-requested' \
+      GITHUB_REPOSITORY=o/r HEAD_SHA=abc1234def CONCLUSION=success DRY_RUN=true \
+      STUB_LOGIN=asker STUB_COMMENTS="$BY_REQUESTER"
+
+    # Built-in token: `/user` refuses, so the login cannot be resolved and the
+    # filter falls back to "written by a Bot" — still no human, still its own
+    # marker.
+    driver_case "with no resolvable login a bot's own marker still suppresses" \
+      "$ONE_PR" 'skip:already-requested' \
+      GITHUB_REPOSITORY=o/r HEAD_SHA=abc1234def CONCLUSION=success DRY_RUN=true \
+      STUB_COMMENTS="$BY_BOT"
+
+    driver_case "with no resolvable login a stranger's marker is still refused" \
+      "$ONE_PR" 'request:green' \
+      GITHUB_REPOSITORY=o/r HEAD_SHA=abc1234def CONCLUSION=success DRY_RUN=true \
+      STUB_COMMENTS="$BY_STRANGER"
+  else
+    echo "note: no jq on this machine, so the marker-authorship cases are skipped"
+  fi
 else
   echo "note: this filesystem grants no execute bit, so the stub-driven driver cases are skipped"
 fi
@@ -417,6 +492,8 @@ mutate "a failed request stops reddening the run" "$DRIVER" \
   's|^    failed=$((failed + 1))$|    :|' reddens_the_run_when_a_request_could_not_be_posted
 mutate "an unreadable comment surface stops reddening the run" "$DRIVER" \
   's|^    unread=$((unread + 1))$|    :|' reddens_the_run_when_the_comment_surface_was_unreadable
+mutate "the marker is read back from any author again" "$DRIVER" \
+  's@\$marker_author_filter | @@' authenticates_the_dedupe_marker
 mutate "CI stops running when a draft is marked ready" "$ROOT/.github/workflows/ci.yml" \
   's|^    types: \[opened, synchronize, reopened, ready_for_review\]$|    types: [opened, synchronize, reopened]|' \
   reruns_ci_when_a_draft_becomes_ready

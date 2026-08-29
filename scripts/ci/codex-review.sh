@@ -117,6 +117,44 @@ requested=0
 # suppressed request is a request that was never put, so it is counted and the
 # run is red. It gets its own counter because the two need different fixes: a
 # refused POST is a permission, an unreadable list is usually the API.
+
+# WHOSE MARKER COUNTS.
+#
+# The marker is a comment, and a comment is something anyone with read access to
+# a public repository can write. Matched by text alone, that means anybody can
+# post `<!-- codex-review:requested:<sha> -->` before CI finishes and this run
+# will conclude `skip:already-requested` for a review that was never asked for.
+# Nothing is red anywhere on that path — the merge lane simply waits out its
+# grace and merges the change unreviewed, which is indistinguishable from a
+# second CI completion on an already-reviewed commit.
+#
+# So the marker has to be attributed, and the identity is not a constant: it is
+# a human under `review-token` (which Codex requires — see the header), an App
+# under `review-app-id`, and `github-actions[bot]` under the built-in token.
+# Asking the token who it is answers this without any configuration:
+#
+#   RESOLVED — accept only that login's markers. Exact, and the case that
+#   matters, because a `review-token` deployment is the one doing real work.
+#
+#   NOT RESOLVED — `/user` is not available to the built-in `GITHUB_TOKEN` or to
+#   an App installation token, and both of those post as a Bot. So fall back to
+#   "written by a Bot", which still excludes every human account and is
+#   therefore still a fix for what was reported. It is weaker, not absent: a
+#   different App commenting the exact marker would pass.
+#
+# What this must never do is stop matching the workflow's OWN marker. That
+# failure is silent and expensive — one paid review per CI completion, for as
+# long as the pull request stays open — which is why the fallback is generous
+# rather than empty.
+if requester="$(gh api user --jq '.login' 2>/dev/null)" && [ -n "$requester" ]; then
+  marker_author_filter="select(.user.login == \"$requester\")"
+  echo "codex-review: markers are accepted from $requester only"
+else
+  requester=''
+  marker_author_filter='select(.user.type == "Bot")'
+  echo "codex-review: the token does not resolve to a login — markers are accepted from any Bot. Under \`review-token\` this would be exact; see docs/ai-code-review.md."
+fi
+
 failed=0
 unread=0
 while IFS=$'\t' read -r num draft state author; do
@@ -134,13 +172,15 @@ while IFS=$'\t' read -r num draft state author; do
 
   # Invariant B, and the only read this script makes per pull request. The
   # marker lives in the comment it wrote last time, because this fleet keeps no
-  # state of its own — see `review_marker`.
+  # state of its own — see `review_marker` — and is read back only from an
+  # author `marker_author_filter` accepts, for the reason argued above it.
   #
   # An unreadable comment surface counts as ALREADY REQUESTED, which is the
   # direction that cannot spend money twice. The failure it produces instead is
   # a review somebody has to ask for by hand, and that is visible.
   already=0
-  if bodies="$(gh api --paginate "repos/$R/issues/$num/comments?per_page=100" --jq '.[].body' 2>/dev/null)"; then
+  if bodies="$(gh api --paginate "repos/$R/issues/$num/comments?per_page=100" \
+    --jq ".[] | $marker_author_filter | .body" 2>/dev/null)"; then
     # `grep -c ... >/dev/null`, never `-q`: under `pipefail` a `-q` that exits on
     # its first match closes the pipe and the writer dies on SIGPIPE.
     if printf '%s\n' "$bodies" | grep -cF -- "$(review_marker "$HEAD_SHA")" >/dev/null; then
