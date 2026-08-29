@@ -170,18 +170,33 @@ for R in projects/<project>/roles/ciRunnerApplyIamReader \
 done
 ```
 
-### The one WRITE grant, and why it is separate
+### The WRITE grants, and why they are separate
 
-`roles/monitoring.editor` is what the `alert-policies` step needs, and it is the
-only grant in this document that is not read-only — so it is listed apart from
-the four above rather than folded into the same loop, where it would inherit
-their "the security property is untouched" sentence and stop being a decision.
+These are the only grants in this document that are not read-only — so they are
+listed apart from the four above rather than folded into the same loop, where
+they would inherit their "the security property is untouched" sentence and stop
+being a decision.
 
 ```bash
-gcloud projects add-iam-policy-binding <project> --condition=None \
-  --member=serviceAccount:<sa>@<project>.iam.gserviceaccount.com \
-  --role=roles/monitoring.editor
+for R in roles/monitoring.alertPolicyEditor roles/monitoring.notificationChannelEditor; do
+  gcloud projects add-iam-policy-binding <project> --condition=None \
+    --member=serviceAccount:<sa>@<project>.iam.gserviceaccount.com --role="$R"
+done
 ```
+
+**Two narrow roles rather than `roles/monitoring.editor`,** which is what this
+document asked for until 2026-08-29 (#548). The step writes exactly two kinds of
+object: the alert policies, and — on the first run in a project, where none
+exists yet — the one email notification channel they all point at. `editor`
+grants both of those and also dashboards, uptime checks, log-based metrics,
+monitoring groups, and services/SLOs, none of which `ensure-alert-policies.sh`
+touches. The pair above is the same capability with none of that surface.
+
+The channel half is easy to miss, and missing it is worse than over-granting:
+`monitoring.viewer` (already in the loop above) can *read* channels, so a project
+that already has one works fine on `alertPolicyEditor` alone — and the first
+project that does not have one fails, in the step whose whole design is that it
+must not fail loudly.
 
 It is genuinely optional. Without it the apply still succeeds and prints a
 warning naming this role — that is deliberate, because a missing observability
@@ -190,11 +205,10 @@ the step was added for: the project's alert policies stop being reconciled, and
 drift there is invisible from inside the project, since a project with no
 policies and a project with nothing wrong look identical.
 
-The scope is narrow in the way that matters here: `monitoring.editor` can write
-alert policies, notification channels and log metrics, and cannot read or write
-anything outside Cloud Monitoring. It cannot touch IAM, so the property the
-four read-only roles preserve — an apply that would change an identity stops red
-— is unaffected.
+The scope is narrow in the way that matters here: neither role can read or write
+anything outside Cloud Monitoring, and neither can touch IAM — so the property
+the four read-only roles preserve, that an apply which would change an identity
+stops red, is unaffected.
 
 The custom role exists rather than `roles/iam.securityReviewer` because
 `getIamPolicy` on the project is the single permission the refresh actually
