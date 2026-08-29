@@ -63,8 +63,18 @@ permissions:
 # fleet a day before now: a reusable workflow's job is part of the CALLER's run,
 # so a group declared there can cancel the run that called it, and the symptom
 # is a job that completes in one second, before it started, with no log.
+#
+# THE MANUAL LEG IS KEYED APART, ON `github.run_id`.
+#
+# Keying a `workflow_dispatch` on the sha too looks like the same dedupe, and it
+# is not: with `cancel-in-progress: false` only ONE run may be pending per
+# group, so a third manual request for one sha EVICTS the queued second — it
+# disappears without executing, without a log, and without a conclusion anyone
+# can read. The dedupe that matters is the marker, not this group; two manual
+# runs for one sha are meant to happen, and the loser reads the marker and
+# skips. Reported by a consumer's vendored concurrency gate, 2026-08-29.
 concurrency:
-  group: codex-review-${{ github.event.workflow_run.head_sha || inputs.head-sha }}
+  group: codex-review-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
