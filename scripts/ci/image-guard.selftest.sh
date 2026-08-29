@@ -78,9 +78,11 @@ render() {
 # renderer that ignored it would be testing the bug.
 render_guard() {
   local version="$1" sha="${2-3133b15}" zone="${3-us-central1-a}" tag="${4-ci-runner}" loc="${5-us-central1}"
+  local host_os="${6-linux}" family="${7-ci-runner-host}"
   render "$GUARD" \
     "_IMAGE_VERSION=$version" "SHORT_SHA=$sha" "_ZONE=$zone" \
-    "_NETWORK_TAG=$tag" "_IMAGE_STORAGE_LOCATION=$loc"
+    "_NETWORK_TAG=$tag" "_IMAGE_STORAGE_LOCATION=$loc" \
+    "_HOST_OS=$host_os" "_IMAGE_FAMILY=$family"
 }
 
 # The ONE thing rewritten that Cloud Build would not: `/workspace` is the
@@ -181,6 +183,79 @@ for pair in "_ZONE:3" "_NETWORK_TAG:4" "_IMAGE_STORAGE_LOCATION:5"; do
     bad "an empty $name should be refused, got rc=$rc: $out"
   fi
 done
+
+# ---- the OS/family pairing --------------------------------------------------
+#
+# A GCE image family points at its NEWEST member, so a family holding both a
+# Linux and a Windows image hands whichever pool applies next the wrong kernel —
+# and the guest agent's response to that mispairing is to run no boot script at
+# all, which from outside is a host that booted fine and never registered. The
+# same refusal ci-runner-host-pool makes at plan time is made here, before forty
+# minutes of packer publish the image under the poisoned family.
+#
+# `windows` + a Linux family is the direction that actually matters:
+# ci-runner-host-pool resolves a Windows pool by matching `ci-runner-host-win`
+# in the image NAME, so an image published anywhere else cannot be named by one.
+out="$(run_guard 'v1-0-0' '3133b15' 'us-central1-a' 'ci-runner' 'us-central1' 'windows' 'ci-runner-host')"; rc=$?
+if [ "$rc" -ne 0 ] && [[ "$out" == *'_HOST_OS is windows'* ]]; then
+  ok "a Windows build into the Linux family is refused"
+else
+  bad "a Windows build into the Linux family should be refused, got rc=$rc: $out"
+fi
+
+out="$(run_guard 'v3-0-0' '3133b15' 'us-central1-a' 'ci-runner' 'us-central1' 'linux' 'ci-runner-host-win')"; rc=$?
+if [ "$rc" -ne 0 ] && [[ "$out" == *'_HOST_OS is linux'* ]]; then
+  ok "a Linux build into the Windows family is refused"
+else
+  bad "a Linux build into the Windows family should be refused, got rc=$rc: $out"
+fi
+
+# Anything that is neither. A typo here would otherwise fall through to the
+# Linux template in the packer step and build the wrong image successfully.
+out="$(run_guard 'v3-0-0' '3133b15' 'us-central1-a' 'ci-runner' 'us-central1' 'win' 'ci-runner-host-win')"; rc=$?
+if [ "$rc" -ne 0 ] && [[ "$out" == *"_HOST_OS is 'win'"* ]]; then
+  ok "an unrecognised _HOST_OS is refused rather than defaulted"
+else
+  bad "an unrecognised _HOST_OS should be refused, got rc=$rc: $out"
+fi
+
+# Both correct pairings still pass, or the checks above are just a way of
+# failing every build.
+for pair in "linux:ci-runner-host" "windows:ci-runner-host-win"; do
+  os=${pair%:*}; fam=${pair#*:}
+  out="$(run_guard 'v1-0-0' '3133b15' 'us-central1-a' 'ci-runner' 'us-central1' "$os" "$fam")"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ok "$os into $fam passes"
+  else
+    bad "$os into $fam should pass, got rc=$rc: $out"
+  fi
+done
+
+# The packer step must actually reach the Windows template, and must not hand it
+# a variable it does not declare — packer FAILS on an undeclared `-var`, so
+# `vuln_fail_on` leaking into the Windows branch ends the build before the first
+# provisioner rather than being ignored.
+if grep -q 'TEMPLATE=ci-host-image-win.pkr.hcl' "$CONFIG"; then
+  ok "the packer step selects the Windows template on _HOST_OS=windows"
+else
+  bad "no branch in the packer step selects packer/ci-host-image-win.pkr.hcl"
+fi
+#
+# Anchored on the `set --` lines rather than on an if/fi range: there is more
+# than one `_HOST_OS = windows` branch in this step, and a range match happily
+# spans two of them and reports both halves as one.
+var_branch="$(grep -n 'set -- "\$\$@" -var' "$CONFIG")"
+win_line="$(printf '%s\n' "$var_branch" | grep image_contract_version | cut -d: -f1)"
+lin_line="$(printf '%s\n' "$var_branch" | grep vuln_fail_on | cut -d: -f1)"
+cond_line="$(grep -n "if \[ '\${_HOST_OS}' = windows \]; then" "$CONFIG" | head -1 | cut -d: -f1)"
+else_line="$(awk 'NR>c && /^ *else$/ {print NR; exit}' c="${cond_line:-0}" "$CONFIG")"
+if [ -n "$win_line" ] && [ -n "$lin_line" ] && [ -n "$cond_line" ] && [ -n "$else_line" ] &&
+   [ "$win_line" -gt "$cond_line" ] && [ "$win_line" -lt "$else_line" ] &&
+   [ "$lin_line" -gt "$else_line" ]; then
+  ok "image_contract_version is Windows-only and vuln_fail_on Linux-only"
+else
+  bad "the -var branches are wrong; packer rejects an undeclared -var (windows=$win_line linux=$lin_line if=$cond_line else=$else_line)"
+fi
 
 # The option that was tried and did not work. Its absence is asserted so that
 # turning it on again — the obvious-looking fix, and the one already measured
@@ -338,11 +413,18 @@ mutate "the version taken back into double quotes" \
 #
 # Derived from the template rather than listed here, so a new provisioner is
 # caught the day it is added instead of the day it matters.
+#
+# BOTH templates, since `_HOST_OS=windows` made the second one buildable. The
+# Windows one uploads only from `packer/windows/`, which `packer/**` already
+# covers — but "covers it today" is the state this check exists to keep true,
+# and a Windows provisioner reaching outside `packer/` would otherwise be
+# unwatched with nothing to say so.
 PKR="$ROOT/packer/ci-host-image.pkr.hcl"
+PKR_WIN="$ROOT/packer/ci-host-image-win.pkr.hcl"
 TRIGGER_VARS="$ROOT/modules/ci-host-image-trigger/variables.tf"
 packer_upload_paths_are_watched() {
-  if [ ! -r "$PKR" ] || [ ! -r "$TRIGGER_VARS" ]; then
-    bad "cannot read the packer template or the trigger's variables — this check would be vacuous"
+  if [ ! -r "$PKR" ] || [ ! -r "$PKR_WIN" ] || [ ! -r "$TRIGGER_VARS" ]; then
+    bad "cannot read a packer template or the trigger's variables — this check would be vacuous"
     return
   fi
   # `source = "../<path>"` in a provisioner: the `..` is what makes it a file
@@ -352,7 +434,7 @@ packer_upload_paths_are_watched() {
     [ -n "$path" ] || continue
     grep -qF "\"$path\"" "$TRIGGER_VARS" || unwatched="$unwatched $path"
   done <<EOF
-$(grep -oE 'source[[:space:]]*=[[:space:]]*"\.\./[^"]+"' "$PKR" | sed 's/.*"\.\.\///; s/"$//' | sort -u)
+$(grep -hoE 'source[[:space:]]*=[[:space:]]*"\.\./[^"]+"' "$PKR" "$PKR_WIN" | sed 's/.*"\.\.\///; s/"$//' | sort -u)
 EOF
   printf '%s' "$unwatched"
 }
