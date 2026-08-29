@@ -991,8 +991,8 @@ it as a broken image.
    **Nothing builds it yet** — `cloudbuild.yaml` and `ci-host-image-trigger`
    both drive the Linux template only, and as of 2026-08-29 no
    `ci-runner-host-win` image exists in any project in the fleet. Until #543
-   lands, this step is a hand-typed `packer build` and the rest of this
-   sequence has nothing to point `host_image` at.
+   lands, this step is a hand-typed `packer build packer/ci-host-image-win.pkr.hcl`
+   and the rest of this sequence has nothing to point `win_host_image` at.
 2. Stand the pool up **alongside** whatever runs your Windows jobs today, on its
    own labels, with `min_hosts = 0` and `slots_per_host = 1`.
 3. Apply, and watch the first host register. A Windows host that boots silently
