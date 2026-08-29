@@ -92,6 +92,13 @@ jobs:
     if: >-
       vars.CODEX_REVIEW_ENABLED == 'true' &&
       github.event.workflow_run.conclusion == 'success'
+    # `check-runner-policy.sh` RUNNER7 refuses to decide the runner scope and
+    # timeouts of a workflow it cannot read, and this one is in another
+    # repository. The marker records that a human read it — one job,
+    # `timeout-minutes: 10`, `contents: read` + `pull-requests: write`, and a
+    # `runs-on` YOUR file supplies — and points at the issue where that reading
+    # lives. Open one; the gate rejects a marker without an issue number.
+    # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/codex-review.yml, #<issue>): read and recorded there
     uses: Dima-Spectorr/ci-runner-infra/.github/workflows/codex-review.yml@d8d1e6d8be794657066a8d32a0327b62172ea299 # v5.77.0
     permissions:
       contents: read
