@@ -511,9 +511,27 @@ budget_allows_call() {
 # `0`, `Z` and the empty string onto today at 00:00:00 with exit status 0. Every
 # one of those reaches the stamp loops (jq writes `-` for a run with no job in a
 # given state), and each one turns a job-age gauge into seconds-since-midnight.
+#
+# An INSTANT, so the zone is required rather than optional: `date -d` reads a
+# zoneless timestamp in the controller's local time, which is a silently wrong
+# age rather than a rejected token, and a trailing-junk token would sail past a
+# looser test for the same reason the sentinel did. Fractional seconds are
+# accepted because they are still an instant — GitHub does not emit them today,
+# and a guard that rejected them would drop real stamps the day it started to.
 is_iso8601() {
-  case "$1" in
-    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*) return 0 ;;
+  local rest
+  rest="${1#[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]}"
+  [ "$rest" != "$1" ] || return 1          # no date-time head, nothing was cut
+  case "$rest" in
+    .[0-9]*)                               # optional fraction, any precision
+      rest="${rest#.}"
+      while :; do
+        case "$rest" in [0-9]*) rest="${rest#?}" ;; *) break ;; esac
+      done
+      ;;
+  esac
+  case "$rest" in
+    Z|+[0-9][0-9]:[0-9][0-9]|-[0-9][0-9]:[0-9][0-9]) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -685,7 +703,12 @@ collect_demand() {
           # whitespace — so a run with in-flight jobs and no queued ones would
           # hand the in-flight stamps to the queued column and report a job
           # that started ten minutes ago as having waited ten minutes.
-          # `date -d -` fails and the stamp is skipped, which is the intent.
+          # What skips this sentinel is is_iso8601 in the reader, and nothing
+          # else. This comment used to claim `date -d -` fails; it does not —
+          # it exits 0 and returns today at 00:00:00, which is how both job-age
+          # gauges came to report seconds since midnight (#518). Any reader of
+          # this column must test the shape of a token before parsing it.
+          # (No apostrophes in here: the jq program is a single-quoted string.)
           ([ $mine[] | select(.status == "queued") | .started_at // .created_at ]
              | join(" ") | if . == "" then "-" else . end),
           ([ $mine[] | select(.status == "in_progress") | .started_at // empty ]

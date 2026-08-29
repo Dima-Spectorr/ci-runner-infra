@@ -66,12 +66,25 @@ for junk in - 0 Z; do
 done
 check "a real GitHub instant is accepted" accept \
   "$(if is_iso8601 2026-08-29T00:00:06Z; then echo accept; else echo reject; fi)"
-# A fractional-second or offset form is still an instant; the trailing glob has
-# to allow it or a valid stamp would be silently dropped and read as no demand.
-check "an offset instant is accepted" accept \
-  "$(if is_iso8601 2026-08-29T00:00:06+03:00; then echo accept; else echo reject; fi)"
-check "a date with no time is rejected" reject \
-  "$(if is_iso8601 2026-08-29; then echo accept; else echo reject; fi)"
+# A fractional-second or offset form is still an instant, and both must pass or
+# a valid stamp is silently dropped and the pool reads as having no demand.
+# GitHub emits neither today, which is exactly why they are asserted: a later
+# tightening of the guard would otherwise break them the day a producer starts.
+for good in 2026-08-29T00:00:06+03:00 2026-08-29T00:00:06-05:30 \
+            2026-08-29T00:00:06.123Z  2026-08-29T00:00:06.123456789+03:00; do
+  check "accepted: $good" accept \
+    "$(if is_iso8601 "$good"; then echo accept; else echo reject; fi)"
+done
+
+# The zone is required, not optional. `date -d` reads a zoneless timestamp in
+# the controller's local time and a trailing-junk one by ignoring the junk —
+# both are a silently wrong age rather than a rejected token, which is the same
+# failure the sentinel caused and the reason the shape test exists at all.
+for bad in 2026-08-29 2026-08-29T00:00:06 2026-08-29T00:00:06Zjunk \
+           2026-08-29T00:00:06.Z 2026-08-29T00:00:06+3:00 26-08-29T00:00:06Z; do
+  check "rejected: $bad" reject \
+    "$(if is_iso8601 "$bad"; then echo accept; else echo reject; fi)"
+done
 
 # Both loops, because both were wrong in the same way: the queued-stamp loop
 # pegged ci_queue_wait_seconds_max and the in-progress one pegged
