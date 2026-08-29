@@ -222,7 +222,22 @@ reddens_the_run_when_a_request_could_not_be_posted() {
   local code
   code=$(code_of "$1")
   matches "$code" 'failed=\$\(\(failed \+ 1\)\)' || return 1
-  matches "$code" 'if \[ "\$failed" -gt 0 \]; then'
+  matches "$code" 'if \[ \$\(\(failed \+ unread\)\) -gt 0 \]; then'
+}
+
+# THE OTHER WAY A REQUEST GOES MISSING WITHOUT ANYONE DECIDING IT SHOULD.
+#
+# An unreadable comment surface suppresses the request, and that is correct —
+# it is the direction that cannot spend twice. What is not correct is doing it
+# quietly: nothing was asked for this sha, and nothing will ask again unless CI
+# completes again, so the run must end red for the same reason a refused POST
+# does. Separate counter, because a refused POST is a permission and an
+# unreadable list is usually the API, and the two need different fixes.
+reddens_the_run_when_the_comment_surface_was_unreadable() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'unread=\$\(\(unread \+ 1\)\)' || return 1
+  matches "$code" 'if \[ \$\(\(failed \+ unread\)\) -gt 0 \]; then'
 }
 
 # A DRAFT THAT BECOMES READY MUST PRODUCE A CI COMPLETION.
@@ -257,6 +272,7 @@ check fails_closed_on_an_unreadable_pull_request_list "$DRIVER" "an unreadable p
 check reviews_only_the_head_of_a_pull_request "$DRIVER" "any pull request containing the commit is reviewed, so a merge to the base asks for a review of the whole backlog"
 check reads_every_page "$DRIVER" "a list read is unpaginated, so on a busy pull request the marker falls off the end of the first page and the same commit is reviewed again on every CI completion"
 check reddens_the_run_when_a_request_could_not_be_posted "$DRIVER" "a comment POST that fails leaves the run green, so the only visible symptom is the merge lane merging unreviewed and the blame lands on the reviewer rather than on the permission"
+check reddens_the_run_when_the_comment_surface_was_unreadable "$DRIVER" "an unreadable comment surface suppresses the request and leaves the run green, so nothing was asked for this sha, nothing will ask again, and the only symptom is the merge lane merging unreviewed"
 check reruns_ci_when_a_draft_becomes_ready "$ROOT/.github/workflows/ci.yml" "CI does not run when a draft is marked ready, so a draft that went green while it was a draft produces no further completion, is never asked for a review, and the merge lane merges it unreviewed"
 
 # --- the driver, actually run ------------------------------------------------
@@ -399,6 +415,8 @@ mutate "the unreadable pull request list stops being fatal" "$DRIVER" \
   's|^  exit 1$|  exit 0|' fails_closed_on_an_unreadable_pull_request_list
 mutate "a failed request stops reddening the run" "$DRIVER" \
   's|^    failed=$((failed + 1))$|    :|' reddens_the_run_when_a_request_could_not_be_posted
+mutate "an unreadable comment surface stops reddening the run" "$DRIVER" \
+  's|^    unread=$((unread + 1))$|    :|' reddens_the_run_when_the_comment_surface_was_unreadable
 mutate "CI stops running when a draft is marked ready" "$ROOT/.github/workflows/ci.yml" \
   's|^    types: \[opened, synchronize, reopened, ready_for_review\]$|    types: [opened, synchronize, reopened]|' \
   reruns_ci_when_a_draft_becomes_ready

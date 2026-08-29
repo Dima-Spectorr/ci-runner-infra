@@ -101,7 +101,14 @@ requested=0
 # pull request waiting for an answer, waits out `review-grace-seconds`, and
 # merges unreviewed. A green run here would make that look like a slow reviewer
 # rather than a request that was never put, and the two need different fixes.
+#
+# An UNREADABLE COMMENT SURFACE lands in the same place, by the same argument.
+# It suppresses the request — that direction cannot spend twice — and a
+# suppressed request is a request that was never put, so it is counted and the
+# run is red. It gets its own counter because the two need different fixes: a
+# refused POST is a permission, an unreadable list is usually the API.
 failed=0
+unread=0
 while IFS=$'\t' read -r num draft state author; do
   [ -n "$num" ] || continue
 
@@ -130,8 +137,9 @@ while IFS=$'\t' read -r num draft state author; do
       already=1
     fi
   else
-    echo "codex-review: #$num — the comment surface is unreadable, so this counts as already asked rather than risking a second paid review"
+    echo "::error::codex-review: #$num — the comment surface is unreadable, so this counts as already asked rather than risking a second paid review. Nothing was asked for ${HEAD_SHA:0:8} and nothing will ask again unless CI completes again."
     already=1
+    unread=$((unread + 1))
   fi
 
   verdict="$(review_request_verdict "$CONCLUSION" "$isdraft" "$state" "$already" "$author" "$SKIP_AUTHORS")"
@@ -168,7 +176,11 @@ done <<<"$prs"
 
 echo "codex-review: asked for $requested review(s)"
 
-if [ "$failed" -gt 0 ]; then
-  echo "::error::codex-review: $failed pull request(s) were not asked. The run is red on purpose — see the annotations above for which, and note that a green run here is what tells an operator the reviewer is slow rather than unasked."
+if [ "$unread" -gt 0 ]; then
+  echo "::error::codex-review: $unread pull request(s) were suppressed by an unreadable comment surface, not by a decision."
+fi
+
+if [ $((failed + unread)) -gt 0 ]; then
+  echo "::error::codex-review: $((failed + unread)) pull request(s) were not asked. The run is red on purpose — see the annotations above for which, and note that a green run here is what tells an operator the reviewer is slow rather than unasked."
   exit 1
 fi
