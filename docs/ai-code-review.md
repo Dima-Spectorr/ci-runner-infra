@@ -159,6 +159,30 @@ that can half-happen: a marker without a request is a review nobody ever asks
 for, and a request without a marker is one paid review per CI completion for as
 long as the pull request stays open.
 
+**Only the requester's own marker counts.** A comment is something a stranger
+can write on a public repository, so a marker matched by text alone is a
+suppression anyone can post: comment `<!-- codex-review:requested:<sha> -->`
+before CI finishes and the green run concludes `skip:already-requested` for a
+review that was never asked for. Nothing goes red on that path — the merge lane
+simply waits out its grace and merges unreviewed.
+
+So the driver asks the token who it is, once, and filters the comment read by
+the answer:
+
+| the token | `/user` says | markers accepted from |
+|---|---|---|
+| `review-token` (a PAT) | that login | **that login only** |
+| an App installation token | refuses | any Bot |
+| the built-in `GITHUB_TOKEN` | refuses | any Bot |
+
+The fallback is deliberately generous rather than empty. A filter that stopped
+matching the workflow's *own* marker would buy a review on every CI completion
+for the life of the pull request — a louder failure than the one being fixed —
+and both bot-identity cases genuinely cannot resolve a login. "Any Bot" still
+excludes every human account, which is the reported hole closed; a different
+App posting the exact marker would still pass, and under `review-token` (which
+Codex requires anyway) none of that applies.
+
 ## The wait, on the merge lane's side
 
 `review-bots` on `merge-lane.yml`, documented in
