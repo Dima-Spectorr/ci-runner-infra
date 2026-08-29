@@ -112,7 +112,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: codex-review-${{ github.event.workflow_run.head_sha || inputs.head-sha }}
+  # The manual leg is keyed on `github.run_id`, NOT on the sha. With
+  # `cancel-in-progress: false` only one run may be pending per group, so a
+  # third manual request for one sha would evict the queued second — gone with
+  # no log and no conclusion. What stops a repeat purchase is the marker, not
+  # this group.
+  group: codex-review-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
