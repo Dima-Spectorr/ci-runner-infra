@@ -78,6 +78,7 @@ check "a date with no time is rejected" reject \
 # ci_job_running_seconds_max, each to seconds-since-UTC-midnight, on every pool,
 # every day (#518). D_WAIT is a high-water mark, so the sentinel does not join
 # the real samples — it buries them.
+# shellcheck disable=SC2016  # the $s is the text being matched, not an expansion
 guarded=$(sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -c 'is_iso8601 "\$s" || continue')
 check "both stamp loops guard the token before parsing it" 2 "$guarded"
 
