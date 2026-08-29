@@ -715,7 +715,53 @@ One property to accept before you wire it: **`workflow_run` is dispatched from
 the default branch only**, so the pull request that adds the lane cannot run it.
 The first evidence is the first CI completion after the merge — watch that one.
 
-## 10. Add the repository to the fleet manifest
+## 10. Wire the AI code review — on green CI only
+
+The vendor's own "review every pull request" switch pays for a review of every
+version of every branch. A branch that goes red twice before it goes green buys
+three reviews, two of them of code nobody kept. This asks **once, for the
+version that is a candidate to merge**, and the merge lane you just wired holds
+that version until the answer arrives.
+
+The copyable caller, the rules and the whole argument:
+[`ai-code-review.md`](ai-code-review.md). Four things to get right here, each of
+which has already cost this fleet something:
+
+- **Turn OFF automatic reviews at
+  [chatgpt.com/codex/settings/code-review](https://chatgpt.com/codex/settings/code-review).**
+  It is an account-level setting on the vendor's side, reachable from no
+  workflow, API or Terraform. Until it is off nothing is saved — the repository
+  pays for every red version *and* for the green one this asks about. **This is
+  the step that produces the entire saving; everything else is machinery around
+  it.**
+- **Set `CODEX_REVIEW_TOKEN` — a personal access token, not the built-in one and
+  not an App.** Codex charges the Codex account of the GitHub *user* who asked,
+  and refuses a bot outright. Armed without it the run is **green**, the refusal
+  comment arrives, and the dedupe marker is written anyway, so the commit is
+  never asked about again: the repository is silently unreviewed while the
+  dashboards say the reviewer is merely slow.
+- **`workflows: [CI]` matches your CI workflow by its `name:` key, exactly.**
+  A repository whose workflow is called `ci`, or has no `name:` at all (it then
+  displays as its path), needs the trigger written to match — otherwise the
+  caller never fires and nothing anywhere is red.
+- **Add `ready_for_review` to your CI workflow's `pull_request` types.** The
+  rule declines to spend on a draft, and the caller is dispatched by CI
+  completions only. The default types contain no event for *marked ready*, so a
+  draft that went green while it was a draft produces no completion when it
+  becomes ready and is never reviewed — and the lane merges it unreviewed after
+  the grace.
+
+Arm it in two steps, in this order, because a `workflow_run` workflow cannot run
+on the pull request that adds it and the first live execution is the first CI
+completion after the merge: `CODEX_REVIEW_ENABLED=true` first, which logs a pass
+of real verdicts and buys nothing, then `CODEX_REVIEW_ARMED=true`.
+
+Then watch the merge lane for `::warning::lane: #<n> merging UNREVIEWED`. Once,
+on a slow day, is the gate working as designed. **On every pull request it means
+the reviewer is down** — an account out of credits is the usual cause — and the
+lane is merging everything unreviewed while looking entirely green.
+
+## 11. Add the repository to the fleet manifest
 
 One row in [`fleet/repos.tsv`](../fleet/repos.tsv): the name, the tier (`pool`
 for what you just built), and the reason. This is the last step and it is not
