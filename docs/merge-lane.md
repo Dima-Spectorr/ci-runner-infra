@@ -262,6 +262,14 @@ jobs:
       # Optional. An issue whose body the lane rewrites with the queue after
       # every run — see "Seeing the queue". Unset means the job summary only.
       status-issue: ${{ vars.MERGE_LANE_STATUS_ISSUE }}
+      # Hold a green pull request until the robots have read it — see
+      # "Waiting for the automated reviewers". Required if this repository asks
+      # Codex for a review only once CI is green, which is the fleet default:
+      # without it the lane merges while the review is still being written.
+      review-bots: |
+        chatgpt-codex-connector[bot]
+        copilot-pull-request-reviewer[bot]
+      review-grace-seconds: 600
       dry-run: ${{ vars.MERGE_LANE_ARMED != 'true' }}
     secrets:
       app-id: ${{ secrets.MERGE_APP_ID }}
@@ -496,6 +504,50 @@ fork guard. The repositories that need this trigger are the ones on
 `ubuntu-latest`, so nothing in the file is fleet-reachable and the rule is
 already satisfied. If you add the trigger to a lane running on a pool label,
 RUNNER4 will stop you, and it is right to.
+
+### Waiting for the automated reviewers
+
+Codex reviews cost credits, and the fleet was spending them on pull requests
+that were about to change. A red pull request gets pushed again; the review of
+the version that failed is a review nobody keeps, and the fix then buys a
+second one. So the fleet stopped asking at *pull request opened* and started
+asking at **CI green** — see `docs/ai-code-review.md` for that half.
+
+That creates the problem this gate solves. The review request and the merge
+decision are now dispatched by the *same* `workflow_run` completion, so the
+lane, left alone, merges while the reviewer is still reading. The credits then
+buy a comment on a closed pull request, which is worse than not asking.
+
+`review-bots` names the logins to wait for. A pull request that is otherwise
+`merge:ready` becomes `wait:review` until each of them has published something
+about **the head sha** — the queue table says so, nothing is commented, and the
+next CI completion or the fifteen-minute sweep asks again.
+
+**Two surfaces are read, and the second one is not optional.** Codex publishes
+a review object only when it has findings; when it finds nothing it reacts with
+a thumbs-up and edits one summary comment naming the commit it read. A gate
+that only knew about `/pulls/<n>/reviews` would hold every clean pull request
+for the whole grace and then merge it warning that nobody had reviewed it — so
+an issue comment by the same login naming the head sha counts as an answer.
+
+**This is the only gate in the lane that fails open, and that was a decision
+rather than an oversight.** The reviewers are third parties. The case that
+settles the direction is the ordinary one: a Codex account runs out of credits
+and then publishes nothing, for any pull request, until somebody tops it up. A
+gate that failed closed there would stop the whole fleet merging and hand a
+vendor's billing page authority over this repository. So the wait is bounded by
+`review-grace-seconds`, and past it the lane merges and writes a warning
+annotation naming the pull request and the sha.
+
+That warning is the thing to watch. On one pull request it is a slow reviewer.
+On **every** pull request it is a reviewer that is down — credits, most likely
+— and the number is not what is wrong.
+
+The gate can only ever delay a merge the required checks have already approved.
+It never approves one, and it is asked only of a pull request already ranked
+`merge:ready`, so it costs two API reads per merge rather than two per open
+pull request per pass. That distinction is #444, and it is what keeps a pass
+inside the job's timeout.
 
 ### Behind the base is only a problem if the base says so
 

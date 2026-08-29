@@ -162,6 +162,51 @@ on:
         required: false
         default: 0
         type: number
+      review-bots:
+        description: >-
+          Newline-separated logins of the automated reviewers a green pull
+          request waits for before it merges. Empty — the default — means no
+          wait at all, which is how this lane behaved before the input existed.
+
+
+          It exists because the fleet stopped paying for a review of a red pull
+          request. Codex reviews cost credits and a red pull request is going to
+          be pushed again, so the review is now requested when CI goes GREEN —
+          which is the same `workflow_run` completion that dispatches this lane.
+          Without a wait the lane merges while the reviewer is still reading,
+          and the credits buy a comment on a closed pull request.
+
+
+          The logins are the ones that appear on the pull request, and they are
+          bots rather than people:
+          `chatgpt-codex-connector[bot]` and `copilot-pull-request-reviewer[bot]`.
+          A login that never answers costs one grace period per pull request and
+          nothing else, because this gate FAILS OPEN.
+        required: false
+        default: ''
+        type: string
+      review-grace-seconds:
+        description: >-
+          How long a green pull request waits for `review-bots` before it merges
+          unreviewed and says so in a warning annotation.
+
+
+          The fail-open direction is deliberate and it is the operator's call,
+          recorded here: the reviewers are third parties, and a Codex account
+          that runs out of credits publishes NOTHING, for any pull request,
+          until somebody tops it up. A gate that failed closed on that would
+          hand a vendor's billing page merge authority over the whole fleet.
+          A gate that fails open costs, at worst, one unreviewed merge per pull
+          request and a warning naming exactly what happened.
+
+
+          Ten minutes is comfortably longer than either reviewer takes here
+          (Codex 2-4 minutes from the request, Copilot under one). A lane
+          warning about an unreviewed merge on EVERY pull request has a reviewer
+          that is down; the number is not what is wrong.
+        required: false
+        default: 600
+        type: number
       runs-on:
         description: >-
           Where the lane runs. Defaults to `ubuntu-latest`, which is free and
@@ -463,6 +508,8 @@ jobs:
           LANE_BASE: ${{ inputs.base }}
           REQUIRED_CHECKS: ${{ inputs.required-checks }}
           BASE_HEALTH_CHECKS: ${{ inputs.base-health-checks }}
+          REVIEW_BOTS_INPUT: ${{ inputs.review-bots }}
+          REVIEW_GRACE: ${{ inputs.review-grace-seconds }}
           BUDGET: ${{ inputs.inflight-budget-seconds }}
           PASS_BUDGET: ${{ inputs.pass-budget-seconds }}
           MAX_ACTIONS: ${{ inputs.max-actions }}

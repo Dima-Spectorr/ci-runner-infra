@@ -95,6 +95,20 @@ jobs:
       runs-on: ubuntu-latest
       # `.mergify.yml`'s `checks_timeout` was 30 min. Kept, unchanged.
       inflight-budget-seconds: 1800
+      # HOLD A GREEN PULL REQUEST UNTIL THE ROBOTS HAVE READ IT.
+      #
+      # The fleet stopped asking Codex to review a RED pull request: it costs
+      # credits, and code that is about to be pushed again is code reviewed
+      # twice. The request therefore moved to the CI-green moment — the same
+      # `workflow_run` completion that dispatches this lane — so without this
+      # input the lane would merge while the review was still being written.
+      #
+      # Both reviewers, because both are already installed here and both are
+      # read the same way. Neither can block a merge for longer than
+      # `review-grace-seconds`.
+      review-bots: |
+        chatgpt-codex-connector[bot]
+        copilot-pull-request-reviewer[bot]
       # The queue view Mergify had and this lane owes back. The job summary is
       # unconditional; this is the pinned issue, and it is a VARIABLE because
       # the issue has to exist before it can be named and creating it is an

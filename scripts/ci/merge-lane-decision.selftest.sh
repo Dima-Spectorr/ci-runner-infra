@@ -247,6 +247,52 @@ deadline running "an unreadable start time does not expire the pass" "" 600 9999
 deadline running "an unreadable clock does not expire the pass" 1000 600 ""
 deadline running "a clock that went backwards is not an expiry" 9999 600 1000
 
+# --- the automated-review gate ------------------------------------------------
+#
+# The asymmetry is the OPPOSITE of every other rule in this file, and that is
+# deliberate rather than sloppy: the reviewers are third parties, and the case
+# the operator named — Codex out of credits, so nothing is ever published for
+# any pull request — makes a gate that fails closed into a vendor's billing
+# page holding merge authority over the whole fleet. Every malformed input is
+# therefore asserted to read as "merge, and say it was unreviewed".
+#
+# What keeps that honest is that the gate can only ever DELAY a merge the
+# required checks have already approved. It never approves one.
+review() { # <expected-prefix> <desc> <args...>
+  local want="$1" desc="$2" got
+  shift 2
+  got=$(lane_review_gate "$@")
+  if [[ "$got" == "$want"* ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  args: %s\n  want: %s*\n  got:  %s\n' "$desc" "$*" "$want" "$got"
+  fi
+}
+
+# args: expected answered age grace
+review "review:off" "a repository that never asked for the gate does not get it" 0 0 10 900
+review "review:off" "an unreadable expected count is not a request for a gate" "" 0 10 900
+review "review:off" "a garbled expected count does not arm anything" two 0 10 900
+
+review "review:answered" "both reviewers answered this sha" 2 2 10 900
+review "review:answered" "more answers than expected is still answered" 2 3 10 900
+review "review:hold" "one of two answered, well inside the grace" 2 1 10 900
+review "review:hold" "nobody has answered yet, one second short of the grace" 2 0 899 900
+# The boundary, in the direction that merges: at exactly the grace the wait is
+# over. A `>` here would hold one pass longer on every unanswered pull request.
+review "review:unreviewed" "the grace is spent at the boundary, not one second after" 2 0 900 900
+review "review:unreviewed" "long past the grace" 2 0 99999 900
+
+# Never a deadlock. Each of these is a way the caller can fail to know
+# something, and none of them may stop the fleet merging.
+review "review:unreviewed" "an unreadable answer count merges rather than holds" 2 "" 10 900
+review "review:unreviewed" "an unreadable clock merges rather than holds forever" 2 0 "" 900
+review "review:unreviewed" "a missing grace merges rather than holds forever" 2 0 10 ""
+review "review:unreviewed" "a garbled grace is a typo, not an unbounded hold" 2 0 10 "fifteen minutes"
+# A grace of 0 is the documented way to arm the trigger and none of the wait.
+review "review:unreviewed" "a grace of 0 never holds" 2 0 0 0
+
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane-decision: $FAIL failed, $PASS passed"
   exit 1

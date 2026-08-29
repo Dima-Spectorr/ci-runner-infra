@@ -375,3 +375,95 @@ lane_pass_expired() {
 
   [ "$spent" -ge "$budget" ]
 }
+
+# ---------------------------------------------------------------------------
+# lane_review_gate — may a green pull request merge before the automated
+# reviewers have said anything about the code that is about to land?
+#
+#   lane_review_gate <expected> <answered> <age> <grace>
+#
+# expected   how many reviewer identities this repository waits for, from
+#            configuration. 0 means the gate is not armed.
+# answered   how many of them have published something ABOUT THE HEAD SHA.
+# age        seconds since the review could have started — the moment the last
+#            required check finished, not the moment the branch was pushed.
+#            "" when the caller could not read it.
+# grace      seconds to wait before merging unreviewed anyway.
+#
+# WHY THIS EXISTS
+#
+# Codex reviews cost credits, so this fleet stopped asking for one until CI is
+# green: a red pull request is going to be pushed again, and a review of code
+# nobody will keep is a review paid for twice. That change moves the review to
+# the same instant the lane decides to merge — both are dispatched by the same
+# `workflow_run` on CI completion — and a review that arrives after the merge
+# is not a review. Hence a gate: green is necessary, no longer sufficient.
+#
+# AND WHY IT FAILS OPEN, WHICH IS UNLIKE EVERYTHING ELSE IN THIS FILE.
+#
+# Every other gate here fails CLOSED, because the cost of being wrong is
+# merging something unchecked. This one cannot. The reviewers are third parties
+# outside the repository, and the operator was explicit about the case that
+# decides the direction: Codex runs out of credits and then NOTHING is ever
+# published, for any pull request, indefinitely. A gate that failed closed on
+# that would stop the fleet merging until somebody noticed and reached for the
+# variable — a vendor's billing page silently becoming this repository's merge
+# authority.
+#
+# So the wait is bounded and the expiry is loud. Past `grace` the lane merges
+# and says it merged unreviewed, which is a line an operator can find. The
+# required checks have not moved: this gate only ever delays a merge that
+# invariants A through D have already approved.
+#
+# An unreadable clock is treated as EXPIRED for the same reason. The failure
+# mode of the other reading is a lane that holds every green pull request
+# forever over a missing timestamp, and nothing in a hold announces itself the
+# way a merge does.
+#
+# Prints one `review:reason key=value...` line and returns 0. `hold` is the only
+# verdict that stops a merge.
+#
+# Verdicts:
+#   review:off              nothing configured; the gate is not armed
+#   review:answered         every expected reviewer has answered this sha
+#   review:hold             still waiting, inside the grace
+#   review:unreviewed       the grace is spent; merge anyway, and say so
+# ---------------------------------------------------------------------------
+lane_review_gate() {
+  local expected="${1:-}" answered="${2:-}" age="${3:-}" grace="${4:-}"
+
+  # Not armed, or armed with something unreadable. A repository that has not
+  # asked for this gate must not have it, and a garbled count is not a request.
+  if ! [[ "$expected" =~ ^[0-9]+$ ]] || [ "$expected" -eq 0 ]; then
+    echo "review:off"
+    return 0
+  fi
+
+  # An unreadable answer count is not "nobody answered" — it is the caller
+  # having failed to read the API, and holding on that is the deadlock this
+  # gate must never produce.
+  if ! [[ "$answered" =~ ^[0-9]+$ ]]; then
+    echo "review:unreviewed reason=unreadable expected=$expected"
+    return 0
+  fi
+
+  if [ "$answered" -ge "$expected" ]; then
+    echo "review:answered answered=$answered expected=$expected"
+    return 0
+  fi
+
+  # Fail open, both ways: a clock the caller could not read and a grace that is
+  # not a number both mean the lane proceeds rather than stalls.
+  if ! [[ "$age" =~ ^[0-9]+$ ]] || ! [[ "$grace" =~ ^[0-9]+$ ]]; then
+    echo "review:unreviewed reason=no-clock answered=$answered expected=$expected"
+    return 0
+  fi
+
+  if [ "$age" -ge "$grace" ]; then
+    echo "review:unreviewed reason=grace-expired answered=$answered expected=$expected age=$age grace=$grace"
+    return 0
+  fi
+
+  echo "review:hold answered=$answered expected=$expected age=$age grace=$grace"
+  return 0
+}
