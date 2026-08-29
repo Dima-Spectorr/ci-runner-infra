@@ -67,6 +67,21 @@ the driver reads it the same way, so a caller that forgets the input, a typo, or
 a variable that does not exist all land on "decide and log" rather than on
 "spend".
 
+Measured on the CarListPrice pilot, 2026-08-29 — the first time the **pinned**
+caller form ran anywhere, since this repository's own caller uses `uses: ./`:
+
+```
+codex-review: repo=Dima-Spectorr/CarListPrice sha=94f73e59 conclusion=success armed=false
+codex-review: #66 request:green (sha=94f73e59 author=Dima-Spectorr)
+dry-run — would ask for a review of #66 at 94f73e59
+codex-review: asked for 0 review(s)
+```
+
+That run also said *"the token does not resolve to a login — markers are
+accepted from any Bot"*, which is the dedupe fallback doing its job and, at the
+same time, the reason `review-token` is not optional. See "The identity that
+asks", below.
+
 Disarm by setting `CODEX_REVIEW_ARMED` to anything else. Setting
 `CODEX_REVIEW_ENABLED` to anything else stops the workflow running at all.
 
@@ -80,18 +95,29 @@ on:
     workflows: [CI]
     types: [completed]
 
+  # So the dry run can be asked for, rather than waited for. Without this the
+  # only way to produce a verdict is for somebody to open a pull request.
+  workflow_dispatch:
+    inputs:
+      head-sha:
+        # No `${{ }}` in this description: Actions PARSES input descriptions,
+        # and an expression in one is a startup failure — zero jobs, no log.
+        description: The head sha to ask for a review of, for a manual run.
+        required: true
+        type: string
+
 permissions:
   contents: read
 
 concurrency:
-  group: codex-review-${{ github.event.workflow_run.head_sha }}
+  group: codex-review-${{ github.event.workflow_run.head_sha || inputs.head-sha }}
   cancel-in-progress: false
 
 jobs:
   review:
     if: >-
       vars.CODEX_REVIEW_ENABLED == 'true' &&
-      github.event.workflow_run.conclusion == 'success'
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
     # `check-runner-policy.sh` RUNNER7 refuses to decide the runner scope and
     # timeouts of a workflow it cannot read, and this one is in another
     # repository. The marker records that a human read it — one job,
@@ -104,14 +130,24 @@ jobs:
       contents: read
       pull-requests: write
     with:
-      head-sha: ${{ github.event.workflow_run.head_sha }}
-      conclusion: ${{ github.event.workflow_run.conclusion }}
+      head-sha: ${{ github.event.workflow_run.head_sha || inputs.head-sha }}
+      # A manual run ASSERTS the green rather than reading it — there is no run
+      # to read it from — and that is the operator's call. Not a constant: pass
+      # one and every CI completion asks for a review again.
+      conclusion: ${{ github.event.workflow_run.conclusion || 'success' }}
       skip-authors: dependabot[bot]
+      # The same label your CI jobs use. On a private repository `ubuntu-latest`
+      # bills GitHub-hosted minutes; on a repository with a pool, use the pool.
       runs-on: ubuntu-latest
       dry-run: ${{ vars.CODEX_REVIEW_ARMED != 'true' }}
+    secrets:
+      # NOT OPTIONAL IN PRACTICE — see "The identity that asks", below. Omit it
+      # and this runs green, comments, is refused, and writes the dedupe marker
+      # anyway.
+      review-token: ${{ secrets.CODEX_REVIEW_TOKEN }}
 ```
 
-Three things about that file are load-bearing:
+Four things about that file are load-bearing:
 
 - **`workflow_run`, never `pull_request`.** A `pull_request` trigger here is the
   vendor's automatic review rebuilt in YAML — it asks before CI has said
@@ -124,6 +160,16 @@ Three things about that file are load-bearing:
 - **The concurrency group is the caller's.** A reusable workflow's job belongs
   to the caller's run, so a group declared in the callee can cancel the run that
   called it — a job that finishes in one second, before it started, with no log.
+- **The dispatch is what makes the dry run readable.** `CODEX_REVIEW_ENABLED`
+  logs verdicts without commenting, and that pass is the only place they can be
+  read — but with `workflow_run` as the sole trigger, producing one means waiting
+  for somebody to open a pull request. On the CarListPrice pilot there were none
+  open, so setting the variable produced nothing and there was no way to ask.
+  `inputs.head-sha` therefore appears in three places — the trigger, the
+  concurrency group (empty there means every manual run shares one group), and
+  the `if:` — and the description carries no `${{ }}`, because Actions parses
+  input descriptions and an expression in one is a startup failure with zero jobs
+  and no log.
 
 There is **no schedule**. The merge lane has one because a merge moves the base
 and nothing announces that; nothing equivalent is true here. A version that has
