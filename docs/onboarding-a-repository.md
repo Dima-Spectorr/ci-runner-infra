@@ -988,11 +988,17 @@ it as a broken image.
 1. Build the Windows image (`packer/ci-host-image-win.pkr.hcl`) and note both
    its `image_version` (the artifact) and its `image_contract_version` (the
    contract the boot script asserts against `windows_image_min_version`).
-   **Nothing builds it yet** — `cloudbuild.yaml` and `ci-host-image-trigger`
-   both drive the Linux template only, and as of 2026-08-29 no
-   `ci-runner-host-win` image exists in any project in the fleet. Until #543
-   lands, this step is a hand-typed `packer build packer/ci-host-image-win.pkr.hcl`
-   and the rest of this sequence has nothing to point `win_host_image` at.
+   `cloudbuild.yaml` builds it on `_HOST_OS=windows` (#543); the Linux
+   template is still what it builds when that substitution is absent, so an
+   existing `ci-host-image-trigger` is unaffected and a Windows image needs
+   either its own trigger or a one-off `gcloud builds submit` — the header of
+   `cloudbuild.yaml` carries a copyable one. The image **must** be published
+   under its own family, `ci-runner-host-win`: a family points at its newest
+   member, so one family holding both kernels hands whichever pool applies
+   next the wrong one, and the build refuses the pairing before packer starts.
+   As of 2026-08-29 no `ci-runner-host-win` image has been produced in any
+   project in the fleet yet, so you are the first — expect this step, not the
+   ones after it, to be where the surprises are.
 2. Stand the pool up **alongside** whatever runs your Windows jobs today, on its
    own labels, with `min_hosts = 0` and `slots_per_host = 1`.
 3. Apply, and watch the first host register. A Windows host that boots silently

@@ -1,4 +1,12 @@
-# Builds the golden CI host image.
+# Builds a golden CI host image — Linux by default, Windows with
+# `_HOST_OS=windows`.
+#
+# Until 2026-08-29 it built the Linux template and only the Linux template, in
+# both `packer init` and `packer build`, and `ci-host-image-trigger` names this
+# file and nothing else. `ci-runner-host-pool` has supported `host_os =
+# "windows"` end to end since #76 — so the module was complete, the image it
+# needs had no way to be produced, and no Windows pool had ever booted a host in
+# any project in the fleet (#543). `_HOST_OS` is that missing half.
 #
 # Runs on Cloud Build, never on a workstation — a local image build saturates
 # the machine, and the artifact must come from a reproducible, auditable
@@ -24,6 +32,17 @@
 #     --gcs-source-staging-dir=gs://<bucket-in-an-allowed-location>/source \
 #     --substitutions=_ZONE=<zone>,_SUBNETWORK=<subnet>,_IMAGE_VERSION=v3-0-0
 #
+# and for the Windows image, which must carry its own family — a family points
+# at its newest member, so one family holding both kernels hands whichever pool
+# applies next the wrong one, and `guard` refuses the pairing:
+#
+#   gcloud builds submit --config cloudbuild.yaml \
+#     --project=<project> \
+#     --region=<region> \
+#     --gcs-source-staging-dir=gs://<bucket-in-an-allowed-location>/source \
+#     --substitutions=_HOST_OS=windows,_IMAGE_FAMILY=ci-runner-host-win,\
+# _ZONE=<zone>,_SUBNETWORK=<subnet>,_IMAGE_VERSION=v1-0-0,_IMAGE_STORAGE_LOCATION=<region>
+#
 # --region and --gcs-source-staging-dir are NOT optional on an estate with
 # constraints/gcp.resourceLocations. Without them gcloud stages the source to
 # the `us` multi-region and runs the build there, and the API rejects the
@@ -44,6 +63,25 @@
 # inherit the extra gigabytes.
 
 substitutions:
+  # WHICH golden image this build produces. `linux` builds
+  # packer/ci-host-image.pkr.hcl; `windows` builds
+  # packer/ci-host-image-win.pkr.hcl. Defaulted to linux so every trigger that
+  # existed before this substitution did keeps building exactly what it built.
+  #
+  # One config rather than two files, because the halves that differ are the
+  # template name and its variable list — everything above and below them (the
+  # version guard, the IAP-tunnelled packer fetch, the family/version report) is
+  # the same build, and a second copy of it is a second place to fix the next
+  # thing `guard` learns. The halves that DO differ are branched explicitly in
+  # `packer` below rather than papered over with a shared variable list: the
+  # Windows template has no `vuln_fail_on` and produces no scan artifacts, and
+  # packer rejects a `-var` the template does not declare.
+  _HOST_OS: linux
+  # Windows only, and it is not the same number as _IMAGE_VERSION. The version
+  # names the ARTIFACT; the contract version is what the boot script asserts
+  # against the pool's `windows_image_min_version`, so it moves only when the
+  # image changes something a host depends on. Ignored for a Linux build.
+  _IMAGE_CONTRACT_VERSION: "1"
   _ZONE: ""
   _NETWORK: ""
   _SUBNETWORK: default
@@ -110,6 +148,8 @@ steps:
         # reports on it.
         IMAGE_VERSION='${_IMAGE_VERSION}'
         SHORT_SHA='${SHORT_SHA}'
+        HOST_OS='${_HOST_OS}'
+        IMAGE_FAMILY='${_IMAGE_FAMILY}'
         ZONE='${_ZONE}'
         NETWORK_TAG='${_NETWORK_TAG}'
         IMAGE_STORAGE_LOCATION='${_IMAGE_STORAGE_LOCATION}'
@@ -145,6 +185,43 @@ steps:
             echo "_IMAGE_VERSION is '$$IMAGE_VERSION' — a substitution in it was never resolved."
             echo "Nesting one substitution inside another does not work here (see options above)."
             echo "Pass a literal _IMAGE_VERSION, or leave it empty and let this step derive one."
+            exit 1
+            ;;
+        esac
+        # THE SAME REFUSAL ci-runner-host-pool MAKES AT PLAN TIME, made here at
+        # build time, and for the same reason: a family points at its NEWEST
+        # member, so one family holding both a Linux and a Windows image hands
+        # whichever pool applies next the wrong kernel — and the guest agent's
+        # response to that mispairing is to run no boot script at all, which
+        # looks like a host that booted fine and never registered.
+        #
+        # Checked here rather than left to packer, because packer would build
+        # for forty minutes first and only then publish the image under the
+        # wrong family, at which point the family is already poisoned.
+        case "$$HOST_OS" in
+          linux)
+            case "$$IMAGE_FAMILY" in
+              *-win|*-win-*|*windows*)
+                echo "_HOST_OS is linux but _IMAGE_FAMILY is '$$IMAGE_FAMILY'."
+                echo "A family holding both kernels hands the next pool the wrong one."
+                exit 1
+                ;;
+            esac
+            ;;
+          windows)
+            case "$$IMAGE_FAMILY" in
+              ci-runner-host-win*) ;;
+              *)
+                echo "_HOST_OS is windows but _IMAGE_FAMILY is '$$IMAGE_FAMILY'."
+                echo "ci-runner-host-pool resolves a Windows pool by matching"
+                echo "'ci-runner-host-win' in the image name, so an image published"
+                echo "under any other family cannot be named by one."
+                exit 1
+                ;;
+            esac
+            ;;
+          *)
+            echo "_HOST_OS is '$$HOST_OS'; it must be 'linux' or 'windows'."
             exit 1
             ;;
         esac
@@ -188,13 +265,26 @@ steps:
         # forty-minute build.
         mkdir -p image-scan
         cd packer
-        packer init ci-host-image.pkr.hcl
+        # WHICH TEMPLATE. `guard` has already refused every _HOST_OS that is not
+        # one of these two, so this needs no third branch — but it is a `case`
+        # rather than a ternary so that adding one is an edit here and not a
+        # silent fallthrough to Linux.
+        case '${_HOST_OS}' in
+          windows) TEMPLATE=ci-host-image-win.pkr.hcl ;;
+          *)       TEMPLATE=ci-host-image.pkr.hcl ;;
+        esac
+        packer init "$$TEMPLATE"
         # $$ throughout: Cloud Build resolves `$name` as a substitution and
         # rejects the build config outright when the name is not one it knows,
         # so a plain shell variable here fails before a step ever runs. `$$`
         # is the documented escape and reaches the shell as a single `$`.
-        rc=0
-        packer build \
+        #
+        # The variables the two templates share, and then the ones only one of
+        # them declares. Split rather than merged, because packer FAILS on a
+        # `-var` naming a variable the template does not declare — so handing
+        # the Windows template `vuln_fail_on` would not be harmlessly ignored,
+        # it would end the build before the first provisioner.
+        set -- \
           -var "project_id=$PROJECT_ID" \
           -var "zone=${_ZONE}" \
           -var "network=${_NETWORK}" \
@@ -204,9 +294,14 @@ steps:
           -var "image_storage_locations=[\"${_IMAGE_STORAGE_LOCATION}\"]" \
           -var "image_version=$$IMAGE_VERSION" \
           -var "runner_version=${_RUNNER_VERSION}" \
-          -var "warm_cache_script=${_WARM_CACHE_SCRIPT}" \
-          -var "vuln_fail_on=${_VULN_FAIL_ON}" \
-          ci-host-image.pkr.hcl || rc=$$?
+          -var "warm_cache_script=${_WARM_CACHE_SCRIPT}"
+        if [ '${_HOST_OS}' = windows ]; then
+          set -- "$$@" -var "image_contract_version=${_IMAGE_CONTRACT_VERSION}"
+        else
+          set -- "$$@" -var "vuln_fail_on=${_VULN_FAIL_ON}"
+        fi
+        rc=0
+        packer build "$$@" "$$TEMPLATE" || rc=$$?
 
         # PUBLISHED HERE, NOT IN A LATER STEP, and that is the whole point.
         #
@@ -216,6 +311,20 @@ steps:
         # whose report nobody needs, and never on the ones where the report IS
         # the output. The exit code is held and re-raised below instead.
         cd ..
+        # …of a LINUX build. The Windows template runs no scanner and downloads
+        # no artifacts, so image-scan/ is empty and every line below would
+        # report its own absence: an unmatched glob into `gcloud storage cp`, a
+        # missing verdict.txt, two warnings that describe a build working
+        # exactly as designed. Skipped outright instead — a warning that fires
+        # on every green build is how a fleet learns to stop reading warnings.
+        #
+        # The gap is real and is NOT hidden by skipping it: a Windows image
+        # ships with no SBOM and no vulnerability verdict, which is a smaller
+        # promise than the Linux one makes and has to be read as such.
+        if [ '${_HOST_OS}' = windows ]; then
+          echo "no SBOM or scan report: the Windows template runs no scanner (see packer/ci-host-image-win.pkr.hcl)"
+          exit $$rc
+        fi
         # Packer's directory download puts the tree under its own basename, so
         # the artifacts land in image-scan/ci-image-scan/ rather than in
         # image-scan/. Flatten before publishing: the extra path segment reached
