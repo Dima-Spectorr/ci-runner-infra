@@ -22,6 +22,8 @@ ALERTS="$ROOT/scripts/ci/ensure-alert-policies.sh"
 # shellcheck disable=SC1090
 source <(sed -n '/^budget_allows_call()/,/^}/p' "$CTRL")
 # shellcheck disable=SC1090
+source <(sed -n '/^is_iso8601()/,/^}/p' "$CTRL")
+# shellcheck disable=SC1090
 source <(sed -n '/^watchdog_threshold()/,/^}/p' "$ALERTS")
 
 pass=0; fail=0
@@ -45,6 +47,39 @@ check "a call that exactly fits is started" start "$(verdict 170 200 30)"
 
 check "past the deadline, nothing starts" skip "$(verdict 201 200 30)"
 check "at the deadline, nothing starts" skip "$(verdict 200 200 30)"
+
+# ── a job-age gauge must not measure the age of midnight ─────────────────────
+#
+# jq writes `-` into a stamp column when a run has no job in that state, because
+# a tab-separated field cannot be empty. The stamp loops used to hand every word
+# straight to `date -d` and trust its exit status to reject the rest.
+#
+# It does not reject it. This is the whole finding, asserted against the real
+# binary rather than described: if a later reader ever wonders why the shape
+# test is there, this line answers it.
+midnight=$(date -u -d "$(date -u +%Y-%m-%d)" +%s)
+for junk in - 0 Z; do
+  check "date accepts '$junk' and calls it midnight — hence the shape test" \
+    "$midnight" "$(date -u -d "$junk" +%s 2>/dev/null || echo rejected)"
+  check "the shape test rejects '$junk'" reject \
+    "$(if is_iso8601 "$junk"; then echo accept; else echo reject; fi)"
+done
+check "a real GitHub instant is accepted" accept \
+  "$(if is_iso8601 2026-08-29T00:00:06Z; then echo accept; else echo reject; fi)"
+# A fractional-second or offset form is still an instant; the trailing glob has
+# to allow it or a valid stamp would be silently dropped and read as no demand.
+check "an offset instant is accepted" accept \
+  "$(if is_iso8601 2026-08-29T00:00:06+03:00; then echo accept; else echo reject; fi)"
+check "a date with no time is rejected" reject \
+  "$(if is_iso8601 2026-08-29; then echo accept; else echo reject; fi)"
+
+# Both loops, because both were wrong in the same way: the queued-stamp loop
+# pegged ci_queue_wait_seconds_max and the in-progress one pegged
+# ci_job_running_seconds_max, each to seconds-since-UTC-midnight, on every pool,
+# every day (#518). D_WAIT is a high-water mark, so the sentinel does not join
+# the real samples — it buries them.
+guarded=$(sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -c 'is_iso8601 "\$s" || continue')
+check "both stamp loops guard the token before parsing it" 2 "$guarded"
 
 # ── the alert threshold follows the watchdog window ──────────────────────────
 check "default poll: floor applies" 300 "$(watchdog_threshold 20)"
