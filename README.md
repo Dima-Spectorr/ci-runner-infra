@@ -789,7 +789,7 @@ window and still hold live work.
 distinguish from "the pool is idle".
 
 `scripts/ci/ensure-alert-policies.sh --project <id> --email <addr>` brings one
-project's policies up to the fleet's, idempotently. Two of the ten watch the
+project's policies up to the fleet's, idempotently. Two of the thirteen watch the
 cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it
 below the pool's `cache_snapshot_max_age_hours`, or the first notice anyone gets
 is every host starting cold) and *hydrate failing on a configured pool*, which
@@ -827,7 +827,7 @@ series at their own age until the controller expires the demand a day later.
 That expire-and-rediscover cycle is what makes the incident look like flapping
 rather than one stuck run.
 
-The ninth watches the egress record. `modules/ci-runner-network` logs the runner
+One more watches the egress record. `modules/ci-runner-network` logs the runner
 firewall rules, so a refused outbound connection is now an entry rather than a
 test client hanging until the job times out; a log-based metric counts those and
 *egress refused* pages on a sustained run. The refusals are the alertable half.
