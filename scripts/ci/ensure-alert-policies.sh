@@ -19,10 +19,17 @@
 # history and leaves a window with no policy at all.
 #
 # Usage:
-#   ensure-alert-policies.sh --project <id> --email <addr> [--account <sa-email>]
+#   ensure-alert-policies.sh --project <id> [--email <addr>] [--account <sa-email>]
 #                            [--poll-interval-seconds <n>] [--cache-stale-hours <n>]
 #                            [--register-grace-seconds <n>] [--drain-grace-seconds <n>]
 #                            [--dry-run]
+#
+#   --email is OPTIONAL, and omitting it is what lets an unattended build run
+#   this. With no address the script ADOPTS the project's existing email
+#   notification channel — the one every policy in that project already pages —
+#   and refuses to guess when there is none or more than one. An address is
+#   still required to BOOTSTRAP a project that has never had a channel, because
+#   inventing one would silently point thirteen policies at nobody.
 #
 #   --poll-interval-seconds must match the pool's `poll_interval_seconds`: the
 #   slow-tick threshold is derived from it, because the watchdog window is.
@@ -75,7 +82,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$PROJECT" ] || { echo "--project is required" >&2; exit 2; }
-[ -n "$EMAIL" ]   || { echo "--email is required (the channel every policy notifies)" >&2; exit 2; }
+# --email is NOT validated here. An empty address means "adopt whatever channel
+# this project already pages", which cannot be decided until the channels have
+# been listed — see the notification-channel section below.
 case "$POLL" in ''|*[!0-9]*) echo "--poll-interval-seconds must be a whole number of seconds" >&2; exit 2 ;; esac
 [ "$POLL" -ge 1 ] || { echo "--poll-interval-seconds must be >= 1" >&2; exit 2; }
 case "$CACHE_STALE_HOURS" in ''|*[!0-9]*) echo "--cache-stale-hours must be a whole number of hours" >&2; exit 2 ;; esac
@@ -237,6 +246,30 @@ ch_status="$(mon GET 'notificationChannels?pageSize=1000')"
 [ "$ch_status" = "200" ] || {
   echo "$PROJECT: cannot list notification channels (HTTP $ch_status)" >&2
   sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
+# No address given: adopt the one this project already pages. This is the mode
+# an unattended apply runs in, and the reason the whole script can now be a
+# build step rather than something an operator has to remember — a project is
+# brought up to date without anyone naming an inbox in ten terraform roots.
+#
+# It refuses to guess in both directions, and neither refusal is pedantry.
+# ZERO channels is a project that has never been bootstrapped: creating one
+# would need an address, and the only address available to a build is one it
+# invented. MORE THAN ONE is worse than ambiguous — picking either silently
+# gives thirteen policies a destination that half the people who set this
+# project up do not read, and the incident that proves it is the one nobody
+# was paged for.
+if [ -z "$EMAIL" ]; then
+  adopted="$(json_pairs notificationChannels type \
+    | awk -F'\t' '$1=="email" && $3!="" {print $3}' | sort -u)"
+  n="$(printf '%s\n' "$adopted" | grep -c . || true)"
+  case "$n" in
+    1) EMAIL="$adopted"; echo "adopting this project's existing email channel: $EMAIL" ;;
+    0) echo "$PROJECT: no email notification channel exists, so there is nothing to adopt — re-run with --email <addr> once to bootstrap it" >&2; exit 2 ;;
+    *) echo "$PROJECT: $n email notification channels exist and this script will not choose between them — re-run with --email <addr>:" >&2
+       printf '%s\n' "$adopted" | sed 's/^/  /' >&2; exit 2 ;;
+  esac
+fi
+
 channel="$(json_pairs notificationChannels type \
   | awk -F'\t' -v e="$EMAIL" '$1=="email" && $3==e {print $2; exit}')"
 

@@ -93,6 +93,28 @@ locals {
   ) : null
 
   repository_id = local.gen2 ? coalesce(var.github_repository, try(google_cloudbuildv2_repository.repo[0].id, "")) : null
+
+  # The alerting script, carried into the build rather than fetched at build
+  # time. Same construction as ci-runner-cache-warmer: ONE copy in
+  # scripts/ci/, embedded from there, so the build cannot run a version that
+  # drifted from the one CI tests. A `curl` of the raw file would be the other
+  # option and is strictly worse — it makes every apply depend on github.com
+  # being reachable from inside the project, and it runs whatever that URL
+  # serves at the moment of the build rather than what this module was pinned
+  # to.
+  alert_script_gz = base64gzip(file("${path.module}/../../scripts/ci/ensure-alert-policies.sh"))
+
+  # Only the flags the caller actually set. The script's own defaults mirror the
+  # ci-runner-host-pool defaults, so a pool that has not overridden anything
+  # wants NO flags here — passing the numbers again from a second place is how
+  # the two fall out of step.
+  alert_flags = join(" ", compact([
+    var.alert_notification_email == null ? "" : "--email '${var.alert_notification_email}'",
+    var.alert_poll_interval_seconds == null ? "" : "--poll-interval-seconds ${var.alert_poll_interval_seconds}",
+    var.alert_register_grace_seconds == null ? "" : "--register-grace-seconds ${var.alert_register_grace_seconds}",
+    var.alert_drain_grace_seconds == null ? "" : "--drain-grace-seconds ${var.alert_drain_grace_seconds}",
+    var.alert_cache_stale_hours == null ? "" : "--cache-stale-hours ${var.alert_cache_stale_hours}",
+  ]))
 }
 
 # Registered here rather than required as an input, because a connection is
@@ -298,6 +320,59 @@ resource "google_cloudbuild_trigger" "apply" {
         fi
       EOT
       ]
+    }
+
+    # The alert policies, brought up to the fleet's set on every apply.
+    #
+    # WHY THIS IS A BUILD STEP AND NOT A RUNBOOK LINE: it was a runbook line,
+    # and the measurement is in issue #531. `ensure-alert-policies.sh` was the
+    # only thing that ever created these policies and nothing called it, so what
+    # a project had was whatever an operator last remembered to run there. On
+    # 2026-08-29, of the ten pool projects, three were current, three were two
+    # policies behind under their old names, and FOUR HAD NONE AT ALL — no
+    # controller-dead alert, no drain-failing alert, no host-went-away alert.
+    # That is the opposite failure from an alert flood and it is the more
+    # expensive one, because a project with no policies looks exactly like a
+    # project with nothing wrong.
+    #
+    # It runs here, in the trigger that already holds project-scoped
+    # credentials, rather than in the daily GitHub audit — which would need a
+    # workload identity federation provider and a monitoring account per
+    # project, i.e. the IAM surface this module's header explains it will not
+    # create.
+    #
+    # BEST-EFFORT, DELIBERATELY, and this is the load-bearing decision. The
+    # account is the project's existing CD account, chosen because it CANNOT
+    # escalate; monitoring.alertPolicies is not among the things it can
+    # necessarily do. Failing the build on that would turn "your alerting is one
+    # policy behind" into "your infrastructure apply is red", in every project
+    # that has not been granted the role — a red build over a warning, which is
+    # how a fleet learns to ignore red builds. So it prints what to grant and
+    # exits 0.
+    dynamic "step" {
+      for_each = var.manage_alert_policies ? [1] : []
+      content {
+        id         = "alert-policies"
+        name       = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+        entrypoint = "bash"
+        args = ["-c", <<-EOT
+          set -u
+          printf '%s' '${local.alert_script_gz}' | base64 -d | gzip -d > /workspace/ensure-alert-policies.sh
+          chmod +x /workspace/ensure-alert-policies.sh
+          rc=0
+          bash /workspace/ensure-alert-policies.sh --project '${var.project_id}' ${local.alert_flags} || rc=$?
+          if [ "$rc" = "0" ]; then
+            echo "alert policies: this project matches the fleet set"
+          else
+            echo "WARNING: could not bring the alert policies up to date (exit $rc)."
+            echo "This does NOT fail the apply. The usual cause is that the build"
+            echo "account lacks roles/monitoring.editor in this project; the other"
+            echo "is a project with no email notification channel yet, which needs"
+            echo "one manual run with --email <addr> to bootstrap."
+          fi
+        EOT
+        ]
+      }
     }
   }
 }

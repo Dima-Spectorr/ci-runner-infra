@@ -237,6 +237,54 @@ rejects_a_credential_in_backend_config() {
   matches "$block" 'lower\(k\)'       || return 1
 }
 
+# 13. The alert-policy step reconciles this project's policies on every apply,
+#     and CANNOT fail the build. Both halves are the finding from issue #531,
+#     from opposite directions: without the step, four of ten pool projects ran
+#     with no alerting at all; with a step that propagates its exit status, a
+#     project whose build account cannot write monitoring policies gets a RED
+#     APPLY over a warning — and a fleet whose applies are routinely red is a
+#     fleet that stops reading them, which is how the first failure came back.
+reconciles_alerts_without_gating_the_apply() {
+  local block
+  block=$(awk '/id         = "alert-policies"/,/^      }/' "$1")
+  # The step must exist, or every assertion below is vacuous.
+  matches "$block" 'ensure-alert-policies.sh' || return 1
+  # The script is CARRIED, not fetched: a curl at build time runs whatever the
+  # URL serves now, not what this module was pinned to.
+  matches "$block" 'alert_script_gz'          || return 1
+  ! matches "$block" 'curl'                   || return 1
+  # Swallowed exit status, and a warning that names the remedy.
+  matches "$block" 'rc=\$\?'                  || return 1
+  matches "$block" 'monitoring.editor'        || return 1
+}
+
+# 14. No inbox literal anywhere in the module. The address is the one thing here
+#     that is a customer fact, and a default would put it in ten roots at once —
+#     silently, because a wrong-but-present address alerts successfully to
+#     somebody who is not on call.
+names_no_inbox() {
+  # The file's CONTENT, not its path — `matches` takes text, and handing it a
+  # filename is a check that always passes.
+  #
+  # Scoped to `default =` rather than the whole file, because two descriptions
+  # legitimately SHOW an address shape (`name@project.iam.gserviceaccount.com`)
+  # to say what the input must look like. Prose that describes a format is not
+  # a value anything is sent to; a default is.
+  ! matches "$(cat "$1")" 'default *= *"[^"]*[a-zA-Z0-9._%+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}' || return 1
+}
+
+# 15. The one input that reaches a shell command is constrained to what it is
+#     supposed to be. It is interpolated inside single quotes in the build step,
+#     so a quote in the value closes them and the remainder runs as the
+#     project's BUILD ACCOUNT — the identity that writes infrastructure. This is
+#     the check that would have been "nobody would put a quote in an email
+#     address", which is true right up until a copy-paste puts a newline in one.
+constrains_the_value_it_shells_out() {
+  local block; block=$(var_block alert_notification_email "$1")
+  matches "$block" 'validation'  || return 1
+  matches "$block" 'regex\('     || return 1
+}
+
 echo "apply-trigger self-test:"
 
 # The helpers carry the traps they were written to avoid, so they are checked
@@ -270,6 +318,9 @@ check selects_one_github_generation               "$MAIN" "the trigger does not 
 check defaults_to_the_generation_already_deployed "$VARS" "github_connection has a default — every already-onboarded 1st-gen root would move generation at its next -upgrade"
 check passes_the_backend_config_through           "$MAIN" "init drops backend_config, or builds it unsorted — a root that supplies its bucket at init time cannot use this module, or its trigger is rewritten on every apply"
 check rejects_a_credential_in_backend_config      "$VARS" "backend_config accepts a credential key — it would be stored in the trigger's build config and printed in every build log, with nothing going red"
+check reconciles_alerts_without_gating_the_apply  "$MAIN" "the alert-policy step is missing, fetches its script at build time, or propagates its exit status — a project silently runs unmonitored, or a missing monitoring grant turns every apply in the fleet red"
+check names_no_inbox                              "$VARS" "an email address is defaulted in the module — ten roots would page an inbox nobody chose, and it would work, which is why nothing would go red"
+check constrains_the_value_it_shells_out          "$VARS" "alert_notification_email reaches a shell command unvalidated — a quote in it runs arbitrary commands as the project's build account"
 
 mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
   local desc="$1" f="$2" prog="$3" pred="$4" tmp
@@ -333,6 +384,23 @@ mutate "'the docs cover it' — credential denylist removed" "$VARS" \
 # The version written from one backend's docs, which lets `Credentials` past.
 mutate "'keys are lowercase anyway' — case folding dropped" "$VARS" \
   's|for k in keys(var.backend_config) : lower(k)|for k in keys(var.backend_config) : k|' rejects_a_credential_in_backend_config
+
+# "A step that can fail should fail the build" — the reasonable-sounding edit
+# that turns a missing monitoring grant into a red apply in every project.
+mutate "'a failure should be a failure' — the exit status propagated" "$MAIN" \
+  's/|| rc=\$?/|| exit $?/' reconciles_alerts_without_gating_the_apply
+# "Embedding a 30KB script in the build config is silly" — and the fetch makes
+# every apply depend on github.com, running whatever the tag serves today.
+mutate "'just fetch the script' — carried copy replaced with a download" "$MAIN" \
+  's#printf .*base64 -d.*#curl -fsSL https://example/x.sh -o /workspace/ensure-alert-policies.sh#' reconciles_alerts_without_gating_the_apply
+# "Everyone gets the same alerts anyway" — the default that quietly pages an
+# inbox no project chose.
+mutate "'give it a sensible default' — an address defaulted in the module" "$VARS" \
+  '/^variable "alert_notification_email"/,/^}/ s|default     = null|default     = "ci-oncall@example.com"|' names_no_inbox
+
+# "It is an email address, what could it contain" — the validation deleted.
+mutate "'the type already says string' — address validation removed" "$VARS" \
+  '/^variable "alert_notification_email"/,/^}/ { /validation {/,/^  }$/d }' constrains_the_value_it_shells_out
 
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
