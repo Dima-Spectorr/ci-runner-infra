@@ -67,12 +67,14 @@ the driver reads it the same way, so a caller that forgets the input, a typo, or
 a variable that does not exist all land on "decide and log" rather than on
 "spend".
 
-Measured on the CarListPrice pilot, 2026-08-29 — the first time the **pinned**
-caller form ran anywhere, since this repository's own caller uses `uses: ./`:
+Measured on the first consuming repository, 2026-08-29 — the first time the
+**pinned** caller form ran anywhere, since this repository's own caller uses
+`uses: ./`. Owner and repository redacted, because the literals gate does not
+allow them here:
 
 ```
-codex-review: repo=Dima-Spectorr/CarListPrice sha=94f73e59 conclusion=success armed=false
-codex-review: #66 request:green (sha=94f73e59 author=Dima-Spectorr)
+codex-review: repo=<owner>/<repo> sha=94f73e59 conclusion=success armed=false
+codex-review: #66 request:green (sha=94f73e59 author=<login>)
 dry-run — would ask for a review of #66 at 94f73e59
 codex-review: asked for 0 review(s)
 ```
@@ -163,7 +165,7 @@ Four things about that file are load-bearing:
 - **The dispatch is what makes the dry run readable.** `CODEX_REVIEW_ENABLED`
   logs verdicts without commenting, and that pass is the only place they can be
   read — but with `workflow_run` as the sole trigger, producing one means waiting
-  for somebody to open a pull request. On the CarListPrice pilot there were none
+  for somebody to open a pull request. On the pilot repository there were none
   open, so setting the variable produced nothing and there was no way to ask.
   `inputs.head-sha` therefore appears in three places — the trigger, the
   concurrency group (empty there means every manual run shares one group), and
