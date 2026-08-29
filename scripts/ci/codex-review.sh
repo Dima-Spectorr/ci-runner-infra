@@ -15,21 +15,20 @@
 # answered is the merge lane's job — `review-bots` there — and the two halves
 # are deliberately separate: this one spends credits, that one spends time.
 #
-# THE TOKEN QUESTION, WHICH YOU MUST VERIFY ONCE.
+# THE TOKEN QUESTION, WHICH IS ANSWERED: YOU NEED A HUMAN'S TOKEN.
 #
 # The review is requested by COMMENTING, so whatever identity posts the comment
-# has to be one the reviewer's App reacts to. The built-in `GITHUB_TOKEN` posts
-# as `github-actions[bot]`; an App token posts as that App. GitHub delivers the
-# `issue_comment` webhook to installed Apps either way — the suppression rule
-# people remember applies to triggering further *workflows*, not to Apps — but
-# a reviewer is free to ignore bot comments as a loop guard, and no
-# documentation promises it will not.
+# has to be one the reviewer's App acts on. Measured live on #529: the request
+# went out as `github-actions[bot]`, and Codex replied "To use Codex here,
+# create a Codex account and connect to github". It attributes a requested
+# review to the Codex account of the GitHub USER who asked, and charges that
+# account — and neither `github-actions[bot]` nor an App can have one.
 #
-# So: after arming this for the first time, read the pull request. If the
-# reviewer answered, the built-in token is enough for the whole fleet. If it did
-# not, pass `review-token` — the merge App's token, or a PAT — and it will.
-# Nothing here can tell the two apart on its own, which is why it is written
-# down rather than detected.
+# So `review-token` is not a fallback, it is the configuration: a fine-grained
+# PAT belonging to the account that pays for Codex, scoped to pull requests:
+# write. Armed without it, this posts a comment, receives the refusal, and
+# writes the dedupe marker anyway — so the commit is never retried and the
+# repository is silently unreviewed. `docs/ai-code-review.md` has the setup.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,6 +55,17 @@ if [ "${DRY_RUN:-true}" = "false" ]; then
 fi
 
 echo "codex-review: repo=$R sha=${HEAD_SHA:0:8} conclusion=${CONCLUSION:-unknown} armed=$ARMED"
+
+# ARMED WITHOUT A HUMAN'S TOKEN IS THE SILENT FAILURE THIS WHOLE FILE EXISTS TO
+# AVOID, SO IT IS SAID OUT LOUD ON EVERY RUN.
+#
+# It is a warning and not an error on purpose: this workflow is generic and a
+# reviewer that DOES honour bot identities would be configured exactly this way.
+# For Codex it is fatal in effect — the comment posts, the refusal comes back,
+# the dedupe marker is written, and the commit is never asked about again.
+if [ "$ARMED" = "true" ] && [ "${HUMAN_TOKEN:-false}" != "true" ]; then
+  echo "::warning::codex-review: armed without \`review-token\`, so the request will be posted by a bot. Codex charges the Codex account of the user who asked and refuses a bot outright — if that is your reviewer, this repository is green and silently unreviewed. See docs/ai-code-review.md."
+fi
 
 # THE PULL REQUESTS THIS COMMIT IS THE HEAD OF.
 #

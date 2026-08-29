@@ -217,4 +217,10 @@ jobs:
           REVIEW_COMMAND: ${{ inputs.review-command }}
           SKIP_AUTHORS: ${{ inputs.skip-authors }}
           DRY_RUN: ${{ inputs.dry-run }}
+          # Not the token — a boolean about it. Codex charges the Codex account
+          # of the GitHub USER who asked and refuses a bot outright, so asking
+          # as `github-actions[bot]` produces a green run, a refusal comment,
+          # and a dedupe marker that stops it ever being retried. The driver
+          # says so rather than letting a repository sit silently unreviewed.
+          HUMAN_TOKEN: ${{ secrets.review-token != '' }}
         run: bash scripts/ci/codex-review.sh
