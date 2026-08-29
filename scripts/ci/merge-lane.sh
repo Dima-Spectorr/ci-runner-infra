@@ -423,7 +423,14 @@ already_released() {
 # rather than holding a green pull request over a rate limit.
 # ---------------------------------------------------------------------------
 review_answered() {
-  local num="$1" sha="$2" short="${sha:0:7}" bot n=0
+  # `short` is deliberately a SECOND `local`. Assignments within one `local`
+  # statement are not visible to later assignments in that same statement, so
+  # `short="${sha:0:7}"` beside `sha="$2"` would read whatever `sha` held in the
+  # enclosing scope — empty, here, which makes the comment surface match every
+  # comment ever written and every pull request look reviewed. shellcheck calls
+  # it SC2318 and it is the reason this is two lines.
+  local num="$1" sha="$2" bot n=0
+  local short="${sha:0:7}"
   local reviews comments
 
   if ! reviews="$(gh api --paginate "repos/$R/pulls/$num/reviews?per_page=100" \
