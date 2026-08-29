@@ -13,6 +13,11 @@
 # `request` costs credits, repeatedly, silently, on every CI completion for as
 # long as the pull request is open. So every unreadable input is asserted to
 # decline to spend.
+#
+# Every pattern below matches the TEXT of a workflow or a script, in which
+# `${{ ... }}` and `$num` are the literal characters that have to be there.
+# Single quotes are the point, not an oversight.
+# shellcheck disable=SC2016
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

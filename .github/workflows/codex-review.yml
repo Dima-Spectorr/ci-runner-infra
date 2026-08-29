@@ -136,7 +136,7 @@ on:
 jobs:
   review:
     name: Ask for a review
-    # dynamic-runner-allowed(codex-review, #515): the label is a workflow_call input, scoped by the calling repository
+    # dynamic-runner-allowed(review, #515): the label is a workflow_call input, scoped by the calling repository
     runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
     timeout-minutes: 10
 
