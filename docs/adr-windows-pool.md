@@ -15,6 +15,13 @@ the family name out of `var.image` (main.tf), it never resolves the image — an
 then fails the `apply` when Compute is asked to create the instance template and
 no such image exists to boot from. Build the image first; the plan will not tell
 you that you have not.
+Amended 2026-08-29 (#553): the build path had a second missing half, found
+before the first build rather than during it. The Windows template reaches its
+builder over WinRM/5986 through an IAP tunnel, and `ci-runner-network` opened
+tcp:22 and nothing else — so the build could not connect in any project in the
+fleet, and would have shown that as a forty-minute hang rather than an error.
+`ci-runner-network` now also opens 5986 from the IAP range, to an
+image-builder tag that no runner host carries.
 Supersedes: the "Windows" section of `docs/onboarding-a-repository.md`, which
 records the current state rather than a decision.
 Amended 2026-08-22: §4's refusal of a container runtime is re-affirmed, and the

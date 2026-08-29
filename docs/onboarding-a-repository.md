@@ -999,6 +999,15 @@ it as a broken image.
    As of 2026-08-29 no `ci-runner-host-win` image has been produced in any
    project in the fleet yet, so you are the first — expect this step, not the
    ones after it, to be where the surprises are.
+
+   **Apply `ci-runner-network` before you start the build.** The Windows
+   template reaches its builder over WinRM/5986 through the IAP tunnel, and the
+   module's `<prefix>-allow-iap-winrm` rule is the only thing that opens that
+   port. Pass the module's `image_builder_network_tag` output to the build as
+   `_IMAGE_BUILDER_NETWORK_TAG`. Get this wrong and the build does not fail —
+   it sits at "Waiting for WinRM to become available" for the plugin's whole
+   timeout, which is why `cloudbuild.yaml`'s guard refuses an empty tag, and
+   refuses the runner tag, before packer starts (#553).
 2. Stand the pool up **alongside** whatever runs your Windows jobs today, on its
    own labels, with `min_hosts = 0` and `slots_per_host = 1`.
 3. Apply, and watch the first host register. A Windows host that boots silently

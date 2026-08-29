@@ -30,10 +30,27 @@ variable "runner_network_tag" {
   description = "Network tag the firewall rules target. Must match the tag the pool module puts on the instance template and controller VM."
 }
 
+variable "image_builder_network_tag" {
+  type        = string
+  default     = null
+  description = <<-EOT
+    Network tag carried ONLY by the transient Packer VM that builds the Windows
+    golden image, and the only tag tcp:5986 (WinRM over TLS, which is how the
+    Windows template talks to its builder through the IAP tunnel) is opened to.
+
+    Deliberately not `runner_network_tag`: a remote-management port on a
+    long-lived host that runs untrusted lockfile code is a different thing from
+    the same port on a VM that exists for one build. Defaults to
+    `<name_prefix>-image-builder`. Whatever this resolves to must be passed to
+    the image build as well — `_IMAGE_BUILDER_NETWORK_TAG` in cloudbuild.yaml —
+    or the tunnel has no rule to match and Packer hangs until its timeout.
+  EOT
+}
+
 variable "iap_source_range" {
   type        = string
   default     = "35.235.240.0/20"
-  description = "Google IAP TCP-forwarding source range. SSH ingress is allowed only from here."
+  description = "Google IAP TCP-forwarding source range. SSH ingress, and WinRM ingress to the image builder, are allowed only from here."
 }
 
 variable "health_check_source_ranges" {

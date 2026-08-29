@@ -79,10 +79,12 @@ render() {
 render_guard() {
   local version="$1" sha="${2-3133b15}" zone="${3-us-central1-a}" tag="${4-ci-runner}" loc="${5-us-central1}"
   local host_os="${6-linux}" family="${7-ci-runner-host}"
+  local builder_tag="${8-ci-runners-image-builder}"
   render "$GUARD" \
     "_IMAGE_VERSION=$version" "SHORT_SHA=$sha" "_ZONE=$zone" \
     "_NETWORK_TAG=$tag" "_IMAGE_STORAGE_LOCATION=$loc" \
-    "_HOST_OS=$host_os" "_IMAGE_FAMILY=$family"
+    "_HOST_OS=$host_os" "_IMAGE_FAMILY=$family" \
+    "_IMAGE_BUILDER_NETWORK_TAG=$builder_tag"
 }
 
 # The ONE thing rewritten that Cloud Build would not: `/workspace` is the
@@ -219,6 +221,36 @@ else
   bad "an unrecognised _HOST_OS should be refused, got rc=$rc: $out"
 fi
 
+# THE TUNNEL. A Windows build with no image-builder tag has no firewall rule
+# matching its WinRM connection, and Packer's response to that is to WAIT — the
+# forty-minute-hang shape, not a failure. Refused in the guard instead.
+out="$(run_guard 'v1-0-0' '3133b15' 'us-central1-a' 'ci-runner' 'us-central1' 'windows' 'ci-runner-host-win' '')"; rc=$?
+if [ "$rc" -ne 0 ] && [[ "$out" == *'_IMAGE_BUILDER_NETWORK_TAG is empty'* ]]; then
+  ok "a Windows build with no image-builder tag is refused"
+else
+  bad "a Windows build with no image-builder tag should be refused, got rc=$rc: $out"
+fi
+
+# The tempting wrong fix for the above: reuse _NETWORK_TAG, which every project
+# already has. That opens 5986 on every runner host in the project rather than
+# on one VM for one build, and it does it silently because the build then works.
+out="$(run_guard 'v1-0-0' '3133b15' 'us-central1-a' 'ci-runner' 'us-central1' 'windows' 'ci-runner-host-win' 'ci-runner')"; rc=$?
+if [ "$rc" -ne 0 ] && [[ "$out" == *'must not equal _NETWORK_TAG'* ]]; then
+  ok "reusing the runner tag as the image-builder tag is refused"
+else
+  bad "reusing the runner tag should be refused, got rc=$rc: $out"
+fi
+
+# The Linux build must NOT need it — its communicator is SSH on 22, which the
+# existing iap_ssh rule already covers, and requiring it would make this change
+# a breaking one for every pool in the fleet.
+out="$(run_guard 'v3-0-0' '3133b15' 'us-central1-a' 'ci-runner' 'us-central1' 'linux' 'ci-runner-host' '')"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "a Linux build does not require an image-builder tag"
+else
+  bad "a Linux build should not require an image-builder tag, got rc=$rc: $out"
+fi
+
 # Both correct pairings still pass, or the checks above are just a way of
 # failing every build.
 for pair in "linux:ci-runner-host" "windows:ci-runner-host-win"; do
@@ -247,7 +279,11 @@ fi
 var_branch="$(grep -n 'set -- "\$\$@" -var' "$CONFIG")"
 win_line="$(printf '%s\n' "$var_branch" | grep image_contract_version | cut -d: -f1)"
 lin_line="$(printf '%s\n' "$var_branch" | grep vuln_fail_on | cut -d: -f1)"
-cond_line="$(grep -n "if \[ '\${_HOST_OS}' = windows \]; then" "$CONFIG" | head -1 | cut -d: -f1)"
+# The LAST such `if` before the Windows `-var` line, not the first in the step:
+# the same condition also selects the network tags a few lines earlier, and
+# anchoring on `head -1` would measure the wrong branch and still pass.
+cond_line="$(grep -n "if \[ '\${_HOST_OS}' = windows \]; then" "$CONFIG" | cut -d: -f1 |
+  awk -v w="${win_line:-0}" '$1 < w { c = $1 } END { if (c) print c }')"
 else_line="$(awk 'NR>c && /^ *else$/ {print NR; exit}' c="${cond_line:-0}" "$CONFIG")"
 if [ -n "$win_line" ] && [ -n "$lin_line" ] && [ -n "$cond_line" ] && [ -n "$else_line" ] &&
    [ "$win_line" -gt "$cond_line" ] && [ "$win_line" -lt "$else_line" ] &&
@@ -255,6 +291,18 @@ if [ -n "$win_line" ] && [ -n "$lin_line" ] && [ -n "$cond_line" ] && [ -n "$els
   ok "image_contract_version is Windows-only and vuln_fail_on Linux-only"
 else
   bad "the -var branches are wrong; packer rejects an undeclared -var (windows=$win_line linux=$lin_line if=$cond_line else=$else_line)"
+fi
+
+# The builder tag has to reach the VM, not just the guard. A guard that
+# validates an input the packer step then drops is the worst of both: it passes
+# every test here and hangs in the build. The Linux tag list must stay a single
+# tag — the second one exists only to open 5986.
+tags_win="$(grep -c 'NETWORK_TAGS=.\[.\${_NETWORK_TAG}\".\"\${_IMAGE_BUILDER_NETWORK_TAG}\"\]' "$CONFIG" || true)"
+tags_lin="$(grep -c 'NETWORK_TAGS=.\[.\${_NETWORK_TAG}\"\]' "$CONFIG" || true)"
+if [ "$tags_win" -ge 1 ] && [ "$tags_lin" -ge 1 ] && grep -q 'network_tags=\$\$NETWORK_TAGS' "$CONFIG"; then
+  ok "the Windows builder carries both tags and the Linux builder only the runner tag"
+else
+  bad "the packer step does not pass the image-builder tag on Windows (win=$tags_win lin=$tags_lin)"
 fi
 
 # The option that was tried and did not work. Its absence is asserted so that

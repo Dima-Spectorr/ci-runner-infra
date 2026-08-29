@@ -18,6 +18,7 @@ Tenancy-agnostic — no customer literals.
 | Rule | Direction | Purpose |
 |---|---|---|
 | `<prefix>-allow-iap-ssh` | ingress | `tcp:22` from `35.235.240.0/20` only. Operators reach machines with no external address this way — and so does the controller's idle probe, which is why a host outside this rule can never be scaled in. |
+| `<prefix>-allow-iap-winrm` | ingress | `tcp:5986` from `35.235.240.0/20`, to `<prefix>-image-builder` and **no other tag**. The Windows golden image is built by a Packer VM with no external address that is reached over WinRM-on-TLS through the IAP tunnel; without this rule the build does not fail, it waits until the plugin times out. The tag is deliberately not the runner tag: 5986 belongs on a VM that lives for one build, not on hosts that run pull-request code for months. A rule whose target tag is on no instance permits nothing, so this costs no surface in a project that never builds a Windows image. |
 | `<prefix>-allow-health` | ingress | MIG / load-balancer health-check ranges → tagged hosts. |
 | `<prefix>-allow-egress` | egress | `tcp:443` + `tcp/udp:53`. GitHub, the package registries, Google APIs, DNS. **Logged** — this is the destination record. |
 | `<prefix>-allow-egress-db` | egress | Common database ports, **RFC1918 destinations only**. Logged. |
@@ -81,7 +82,7 @@ Adding a port is routine. Widening `database_egress_ranges` needs an argument.
 ## Variables
 
 Required: `project_id`, `network`.
-Optional: `name_prefix`, `runner_network_tag`, `iap_source_range`,
+Optional: `name_prefix`, `runner_network_tag`, `image_builder_network_tag`, `iap_source_range`,
 `health_check_source_ranges`, `egress_destination_ranges`, `egress_tcp_ports`,
 `egress_udp_ports`, `database_egress_ports`, `database_egress_ranges`,
 `firewall_logging`.
@@ -90,6 +91,12 @@ Optional: `name_prefix`, `runner_network_tag`, `iap_source_range`,
 
 `runner_network_tag` — pass it into `ci-runner-host-pool`'s `network_tags` so
 these rules apply to the pool's machines.
+
+`image_builder_network_tag` — pass it to the Windows image build as
+`_IMAGE_BUILDER_NETWORK_TAG`. Never into a pool's `network_tags`: that would put
+the one tag 5986 is open to onto every runner host, which is the whole thing
+this separation exists to prevent, and `cloudbuild.yaml`'s guard refuses the
+same mistake from the other side.
 
 ## Use it by tag, never vendored
 

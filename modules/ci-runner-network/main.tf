@@ -16,6 +16,8 @@
 #
 # Resources:
 #   google_compute_firewall (iap)    — tcp:22 ingress from the IAP range only
+#   google_compute_firewall (winrm)  — tcp:5986 from the IAP range, to the
+#                                      image-builder tag ONLY (never a runner)
 #   google_compute_firewall (health) — health-check ranges -> tagged VMs
 #   google_compute_firewall (egress) — explicit egress restricted to HTTPS + DNS
 #
@@ -38,6 +40,11 @@ locals {
   # pool connect out to". `denied` and `all` both log the deny.
   log_allowed = var.firewall_logging == "all"
   log_denied  = var.firewall_logging != "off"
+
+  # Derived rather than a plain default, because a default cannot read
+  # name_prefix and a fixed literal would collide between two projects sharing
+  # a VPC — the shared-network deployment this module already supports.
+  image_builder_network_tag = coalesce(var.image_builder_network_tag, "${var.name_prefix}-image-builder")
 
   # INCLUDE_ALL_METADATA, deliberately, and it is the more expensive choice.
   # A destination IP on its own is not an answer: nobody reading an alert can
@@ -66,6 +73,49 @@ resource "google_compute_firewall" "iap_ssh" {
 
   # Who reached a warm host, and when. Low volume by nature — a human opening a
   # tunnel — and the one ingress worth a record.
+  dynamic "log_config" {
+    for_each = local.log_allowed ? [1] : []
+    content {
+      metadata = local.firewall_log_metadata
+    }
+  }
+}
+
+# IAP WinRM — the Windows GOLDEN-IMAGE BUILD, and nothing else.
+#
+# `packer/ci-host-image-win.pkr.hcl` builds with `omit_external_ip = true`,
+# `use_iap = true` and `communicator = "winrm"` with `winrm_use_ssl = true`,
+# which is port 5986. IAP TCP forwarding needs an ingress rule for the port it
+# is forwarding, exactly as the tcp:22 rule above exists for SSH — so without
+# this rule Packer sits at "Waiting for WinRM to become available" until the
+# plugin's timeout, in every project in the fleet. The build path merged in
+# #543/#551; this is the half that lets it connect.
+#
+# WHY ITS OWN TAG AND NOT `runner_network_tag`. 5986 on a runner host is a
+# remote-management port on a machine that runs untrusted lockfile code and
+# holds a GCP identity, standing open for the life of the pool. The builder VM
+# exists for the ~40 minutes of one image build. Putting the port on a tag that
+# only the builder carries is what keeps those two facts separate — and it is
+# why this rule is unconditional and still adds no surface: a firewall rule
+# whose target tag is on no instance permits nothing. The builder carries BOTH
+# tags — `runner_network_tag` for egress (the allow rules above target it) and
+# this one for the tunnel in.
+resource "google_compute_firewall" "iap_winrm" {
+  project = var.project_id
+  name    = "${var.name_prefix}-allow-iap-winrm"
+  network = var.network
+
+  direction     = "INGRESS"
+  source_ranges = [var.iap_source_range]
+  target_tags   = [local.image_builder_network_tag]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["5986"]
+  }
+
+  # Rarer than the SSH tunnel and worth more: this records every connection to
+  # a machine whose output the whole fleet then boots from.
   dynamic "log_config" {
     for_each = local.log_allowed ? [1] : []
     content {
