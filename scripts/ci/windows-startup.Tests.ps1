@@ -967,6 +967,107 @@ Describe 'acl inheritance flags' {
     }
 }
 
+# THE SAME DISTINCTION, IN THE OTHER FILE THAT MAKES IT
+#
+# windows-boot-wrapper.ps1 has its own Protect-Path, because it runs BEFORE the
+# boot script it unpacks exists. It hardens two things with one function: C:\ci,
+# a directory, and the unpacked script, a file. It used to pass
+# InheritanceFlags::None for both.
+#
+# That bricked every host from the Windows golden image on its FIRST boot
+# (measured 2026-08-30). SetAccessRuleProtection($true, $false)
+# drops the inherited ACEs, so two flagless grants left C:\ci as
+# D:PAI(A;;FA;;;SY)(A;;FA;;;BA) -- applying to that directory and to nothing
+# underneath it. Every child recomputed to D:AI with zero ACEs, and an empty
+# DACL denies everyone, SYSTEM included. Phase 0 could no longer read
+# image-version.txt, half a second later and on every boot thereafter.
+#
+# The wrapper is a Terraform template (it carries a ${gz} placeholder), so it
+# cannot be dot-sourced. The function is lifted out and RUN against a fake ACL
+# instead: what is asserted is the flags it actually passes, not the text.
+Describe 'boot wrapper path hardening' {
+    BeforeAll {
+        $wrapperPath = Join-Path $PSScriptRoot '../../modules/ci-runner-host-pool/scripts/windows-boot-wrapper.ps1'
+        if (-not (Test-Path -LiteralPath $wrapperPath)) {
+            throw "the boot wrapper is not at $wrapperPath"
+        }
+        $wrapperText = Get-Content -Raw -LiteralPath $wrapperPath
+        $match = [regex]::Match($wrapperText, '(?ms)^function Protect-Path.*?^\}')
+        if (-not $match.Success) {
+            throw 'Protect-Path is no longer a top-level function in windows-boot-wrapper.ps1'
+        }
+        $script:ProtectPathSource = $match.Value
+    }
+
+    # Returns the fake ACL that Protect-Path was handed, with the rules it added.
+    function Invoke-ProtectPath {
+        param([bool] $IsContainer, [string] $Source)
+
+        & {
+            param($isContainer, $source)
+
+            $acl = New-Object psobject
+            $acl | Add-Member -MemberType NoteProperty -Name Access -Value @()
+            $acl | Add-Member -MemberType NoteProperty -Name Protection -Value $null
+            $acl | Add-Member -MemberType NoteProperty -Name Rules -Value ([System.Collections.ArrayList]::new())
+            $acl | Add-Member -MemberType NoteProperty -Name Saved -Value $false
+            $acl | Add-Member -MemberType ScriptMethod -Name SetAccessRuleProtection -Value {
+                param($protect, $preserve) $this.Protection = @($protect, $preserve)
+            }
+            $acl | Add-Member -MemberType ScriptMethod -Name RemoveAccessRule -Value { param($rule) $true }
+            $acl | Add-Member -MemberType ScriptMethod -Name AddAccessRule -Value {
+                param($rule) $null = $this.Rules.Add($rule)
+            }
+
+            function Get-Acl { param([string] $LiteralPath) $acl }
+            function Set-Acl { param([string] $LiteralPath, $AclObject) $AclObject.Saved = $true }
+            function Get-Item {
+                param([string] $LiteralPath)
+                [pscustomobject]@{ PSIsContainer = $isContainer }
+            }
+
+            . ([scriptblock]::Create($source))
+            Protect-Path 'the-path'
+            $acl
+        } $IsContainer $Source
+    }
+
+    It 'makes the directory grants inheritable, or every child loses all access' {
+        $acl = Invoke-ProtectPath -IsContainer $true -Source $script:ProtectPathSource
+
+        $acl.Rules.Count | Should -Be 2
+        foreach ($rule in $acl.Rules) {
+            $rule.InheritanceFlags.HasFlag(
+                [System.Security.AccessControl.InheritanceFlags]::ContainerInherit) | Should -BeTrue
+            $rule.InheritanceFlags.HasFlag(
+                [System.Security.AccessControl.InheritanceFlags]::ObjectInherit) | Should -BeTrue
+        }
+    }
+
+    It 'gives the unpacked script no flags, because .NET rejects any on a file' {
+        $acl = Invoke-ProtectPath -IsContainer $false -Source $script:ProtectPathSource
+
+        $acl.Rules.Count | Should -Be 2
+        foreach ($rule in $acl.Rules) {
+            $rule.InheritanceFlags | Should -Be ([System.Security.AccessControl.InheritanceFlags]::None)
+        }
+    }
+
+    It 'still protects the path and does not copy the inherited ACEs it just dropped' {
+        $acl = Invoke-ProtectPath -IsContainer $true -Source $script:ProtectPathSource
+
+        $acl.Protection | Should -Be @($true, $false)
+        $acl.Saved | Should -BeTrue
+    }
+
+    It 'grants exactly SYSTEM and Administrators, by SID' {
+        $acl = Invoke-ProtectPath -IsContainer $true -Source $script:ProtectPathSource
+
+        ($acl.Rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object) |
+            Should -Be @('S-1-5-18', 'S-1-5-32-544')
+    }
+}
+
 # THE DISTINCTION THIS SUITE EXISTS FOR MOST
 #
 # Get-MetadataValue used to swallow every exception into '', which made a flaky

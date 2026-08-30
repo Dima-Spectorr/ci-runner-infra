@@ -79,15 +79,44 @@ function Write-WrapperLine([string] $Message) {
 # SYSTEM and Administrators, named by SID because their display names are
 # localised -- the same idiom, and the same two principals, as Protect-CiDirectory
 # in the boot script. Applied BEFORE anything is written underneath.
+#
+# THE INHERITANCE FLAGS ARE NOT A STYLE CHOICE, AND THEY DIFFER BY TARGET.
+#
+# This function is called on a DIRECTORY (C:\ci) and on a FILE (the unpacked
+# boot script), and the two need opposite answers:
+#
+#   file      NO flags. FileSecurity.AddAccessRule REJECTS a rule that carries
+#             them -- "No flags can be set. Parameter name: inheritanceFlags" --
+#             and that throw lands under $ErrorActionPreference = 'Stop' above.
+#   directory ContainerInherit + ObjectInherit. SetAccessRuleProtection($true,
+#             $false) has just dropped every inherited ACE, so these two grants
+#             are the ONLY access the tree has left. Without the flags they
+#             apply to C:\ci and to nothing underneath it, and every child --
+#             including image-version.txt, which the golden image ships -- is
+#             left with a DACL that inherits nothing and contains nothing. An
+#             empty DACL denies EVERYONE, SYSTEM included.
+#
+# Measured 2026-08-30: hardcoding ::None for both bricked every host from the
+# Windows golden image on its first boot. C:\ci came out
+# D:PAI(A;;FA;;;SY)(A;;FA;;;BA) and the marker D:AI with no ACEs, so phase 0's
+# `Get-Content` on it failed with UnauthorizedAccess half a second later -- and
+# on every subsequent boot, permanently, because the host can no longer read the
+# file that gates the rest of the script. Test-Path still returned true (it needs
+# only traverse on the parent), which is why it read as a missing-file or
+# slow-boot problem for hours.
 function Protect-Path([string] $Path) {
     $acl = Get-Acl -LiteralPath $Path
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRule($rule) | Out-Null }
+    $inherit = [System.Security.AccessControl.InheritanceFlags]::None
+    if ((Get-Item -LiteralPath $Path).PSIsContainer) {
+        $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    }
     foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
         $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
                     [System.Security.Principal.SecurityIdentifier]::new($sid),
                     'FullControl',
-                    [System.Security.AccessControl.InheritanceFlags]::None,
+                    $inherit,
                     [System.Security.AccessControl.PropagationFlags]::None,
                     [System.Security.AccessControl.AccessControlType]::Allow))) | Out-Null
     }
