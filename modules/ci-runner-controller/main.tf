@@ -80,7 +80,30 @@ locals {
   # reads a script incrementally as it runs; `set -euo pipefail` makes a
   # truncated blob a loud boot failure rather than a controller running a prefix
   # of its own decision rules.
-  controller_startup_gz = base64gzip(local.controller_startup_source)
+  # AND IT IS FOLDED, FOR THE REASON `ci-runner-host-pool` RECORDS AT LENGTH.
+  #
+  # `base64gzip` returns ONE line. GCE accepts a metadata value whose longest
+  # line runs to six figures — the template is created, the plan and the apply
+  # are green — and then every `instances.insert` from that template hangs about
+  # two minutes and fails with an unexplained `Internal error`. See #434 and the
+  # measurement in `ci-runner-host-pool`'s `b64_fold_columns`.
+  #
+  # This module shipped without the fold, and the margin it was living on is
+  # the point. The two templates that bracketed the limit in August were 130,244
+  # characters (created fine) and 142,189 (every create failed); this module
+  # renders 127,328. That is under three thousand characters of headroom — ONE
+  # more decision-rule script in the concatenation — and neither `plan` nor
+  # `apply` reads a line length, so the first thing that would say so is a
+  # controller MIG stuck at `creating` and every pool it serves at zero hosts.
+  #
+  # The v5.85.0 apply on 2026-08-30 did hit an `Internal error` inserting the
+  # controller from the unfolded template. It retried and came up, so that one
+  # was the transient kind and NOT this failure; what it showed is how little is
+  # left between the two. The pool module reached the same conclusion about its
+  # own 130,244 and folded rather than trimmed.
+  b64_fold_columns = 76
+
+  controller_startup_gz = join("\n", regexall(".{1,${local.b64_fold_columns}}", base64gzip(local.controller_startup_source)))
 
   controller_startup = <<-EOT
     #!/usr/bin/env bash
@@ -206,6 +229,17 @@ resource "google_compute_instance_template" "controller" {
     precondition {
       condition     = length(local.controller_startup) < 262144
       error_message = "controller '${var.name}' renders a ${length(local.controller_startup)}-character boot script and a GCE metadata value is capped at 262144. The script is already gzipped into its wrapper, so the SOURCE has outgrown even the compressed form: shorten the decision-rule scripts under modules/ci-runner-host-pool/scripts/, or move part of the controller onto the golden image. Left to the apply this is an Error 413 at create time, on a plan that read clean."
+    }
+
+    # And the LINE-length gate, which the size gate above cannot stand in for:
+    # the value that took three controller MIGs down in August was 142 KiB,
+    # comfortably inside the 256 KiB cap this precondition checks. The size gate
+    # was copied here when this module was written and the line gate was not,
+    # which is how the module came to render an unfolded blob and pass its own
+    # plan.
+    precondition {
+      condition     = length([for line in split("\n", local.controller_startup) : line if length(line) > 4096]) == 0
+      error_message = "controller '${var.name}' renders a boot script containing a line of more than 4096 characters. The template is created and the apply is green; every instance built FROM it then hangs about two minutes and fails with an unexplained `Internal error` (measured 2026-08-26, and again on 2026-08-30 when this module rendered the blob unfolded), which is a controller MIG stuck at `creating` and every pool it serves sitting at zero hosts. Fold the base64 blob: join(\"\\n\", regexall(\".{1,76}\", base64gzip(...)))."
     }
   }
 }
