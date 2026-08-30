@@ -254,13 +254,17 @@ check "the rate-limit ceiling is enforced"          32 "$(clamp_fetch_concurrenc
 # at once do not fail — they hand each other's body back, which is a wrong
 # demand count with nothing red anywhere. The concurrent path must therefore use
 # the caller-named variant.
-# shellcheck disable=SC2016
+# Every needle below is a literal excerpt of controller-startup.sh, so a `$` is
+# the character being searched for and a trailing `\` is the line continuation
+# that excerpt ends on — both are quoted exactly on purpose.
+# shellcheck disable=SC2016,SC1003
 check "the fan-out uses the fork-safe fetch, not gh_api" yes \
   "$(found "$CTRL" 'gh_api_fetch "$tok" "repos/$REPO_FULL/actions/runs/$id/jobs?per_page=100" \')"
 check "the fork-safe fetch never writes the shared body path" yes \
   "$(if sed -n '/^gh_api_fetch()/,/^}/p' "$CTRL" | grep -q 'STATE_DIR/api\.'; then echo no; else echo yes; fi)"
 # A partially written body from a killed curl read as a job list is a silently
 # short demand count, so the payload is renamed into place only on success.
+# shellcheck disable=SC2016
 check "the fetch renames into place rather than writing in place" yes \
   "$(if sed -n '/^gh_api_fetch()/,/^}/p' "$CTRL" | grep -q 'mv -f "\$dest.part" "\$dest"'; then echo yes; else echo no; fi)"
 
@@ -303,6 +307,7 @@ if sed -n '/^collect_demand()/,/^}/p' "$CTRL" \
 else
   check "the payload directory is cleared before the sweep" yes no
 fi
+# shellcheck disable=SC2016
 check "the payload directory is cleared after the sweep" yes \
   "$(if [ "$(sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -c 'rm -rf "\$jobs_dir"')" -ge 2 ]; then echo yes; else echo no; fi)"
 

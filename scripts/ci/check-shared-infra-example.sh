@@ -219,6 +219,7 @@ while IFS= read -r line; do
   calls=$((calls + 1))
   # Argument count with every $(…) and "…" collapsed to a single token first,
   # so a jq program full of spaces counts as the one argument it is.
+  # shellcheck disable=SC2016  # sed programs, matched literally against the anchor's text
   n=$(printf '%s\n' "$line" \
     | sed -e 's/\$([^)]*)/A/g' -e 's/"[^"]*"/A/g' -e 's/^[[:space:]]*publish[[:space:]]*//' \
     | tr -s ' ' '\n' | grep -c '.')
