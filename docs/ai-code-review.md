@@ -253,6 +253,43 @@ Codex requires anyway) none of that applies.
 - A **clean** review counts. Codex publishes no review object when it has no
   findings, only a reaction and a summary comment naming the commit, so the lane
   reads both surfaces.
+- **A reviewer that reports it cannot review counts too, and this is the third
+  surface.** Copilot answers a rate limit by concluding *its own* check run red
+  against the head sha — `copilot-pull-request-reviewer`, `failure`, an HTTP 429
+  in the body — and publishing neither a review nor a comment. On the two
+  surfaces above that is indistinguishable from "still reading", so the lane used
+  to hold the pull request for the whole grace and then merge it with a warning
+  naming a cause that was not the cause. Measured 2026-08-30: the limit is
+  **account-wide and lasted seven hours**, so it hit every open pull request in
+  every repository in the fleet simultaneously.
+
+  The lane now reads the head sha's check runs and treats a **non-green
+  conclusion on a check run named for one of the `review-bots`** (the login
+  without its `[bot]` suffix — the mapping GitHub uses for a reviewer App) as an
+  answer. It is: the reviewer looked at this commit and said it cannot review it,
+  and that answer will not change on its own.
+
+  Only a **non-green** conclusion counts. A reviewer that ran and had findings
+  also concludes its check run, green, and those findings land on one of the two
+  surfaces a moment later — counting that would discharge the gate ahead of the
+  review it exists to wait for. The gate is not weakened for a reviewer that is
+  actually available.
+
+  The pass log says so: `lane: #<n> — 1 of 2 reviewer(s) answered ... by
+  reporting they could not review it`. A **notice**, not the `UNREVIEWED`
+  warning, which stays reserved for a merge that genuinely went out with nobody
+  having looked.
+
+### The red check itself stays red, and that is not ours to fix
+
+`copilot-pull-request-reviewer` is a check run published by GitHub's own Copilot
+App. No workflow in this repository creates it and nothing here can change its
+conclusion, so during a rate limit it will show red on the pull request. What
+this repository controls is that the red **costs nothing**: it is not in
+`required-checks`, so it never blocks a merge, and as of the surface above it no
+longer holds the lane either. If an operator wants the red gone entirely, the
+only lever is disabling automatic Copilot review in the repository's settings —
+which removes the reviewer, not the outage.
 
 ## The identity that asks — measured, not guessed
 

@@ -1522,7 +1522,7 @@ the_review_gate_is_asked_only_of_a_ready_merge() {
   local code
   code=$(code_of "$1")
   matches "$code" '\[ "\$\{verdict%%:\*\}" = "merge" \]' || return 1
-  before "$code" 'verdict="\$\(lane_verdict' 'answered="\$\(review_answered'
+  before "$code" 'verdict="\$\(lane_verdict' 'read -r answered unavailable'
 }
 
 # An unreadable surface is not an unanswered one. `review_answered` returning 0
@@ -1531,8 +1531,33 @@ the_review_gate_is_asked_only_of_a_ready_merge() {
 an_unreadable_review_surface_is_not_an_unanswered_one() {
   local code n
   code=$(code_of "$1")
-  n=$(printf '%s\n' "$code" | grep -cE '^    echo -1$')
+  n=$(printf '%s\n' "$code" | grep -cE '^    echo "-1 0"$')
   [ "${n:-0}" -eq 2 ]
+}
+
+# A REVIEWER THAT CANNOT REVIEW HAS ANSWERED, and the lane must stop waiting for
+# it. Copilot reports a rate limit by CONCLUDING ITS OWN CHECK RUN red against
+# the head sha and publishing neither a review nor a comment — measured
+# 2026-08-30, on every pull request in the fleet at once, for seven hours.
+# Without this surface each of those pull requests burns the full grace and then
+# merges with a warning naming a cause that is not the cause.
+#
+# Three things have to hold together, and the last is the one that matters:
+# only a NON-GREEN conclusion counts. A reviewer that ran and had something to
+# say also concludes its check run — green — and its findings arrive on the two
+# surfaces above a moment later. Counting that would discharge the gate ahead of
+# the review it exists to wait for, which is worse than the delay it fixes.
+a_reviewer_that_declined_counts_as_answered() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'commits/\$sha/check-runs\?per_page=100' || return 1
+  matches "$code" 'conclusion != "success"' || return 1
+  # The login is `x[bot]`; the check run is named `x`.
+  matches "$code" 'grep -cxF -- "\$\{bot%\\\[bot\\\]\}"' || return 1
+  # Counted separately as well as into `answered`, or the log cannot tell a
+  # reviewed pull request from one nobody could review.
+  matches "$code" 'u=\$\(\(u \+ 1\)\)' || return 1
+  matches "$code" 'echo "\$n \$u"'
 }
 
 # A clean Codex review publishes no review object at all — only a summary
@@ -1594,6 +1619,7 @@ check the_review_wait_is_bounded "$DRIVER" "the wait for an automated review has
 check the_review_gate_is_asked_only_of_a_ready_merge "$DRIVER" "the review reads happen before the merge verdict, so every open pull request pays two API calls per pass and the cost tracks the size of the repository — the #444 defect, rebuilt"
 check an_unreadable_review_surface_is_not_an_unanswered_one "$DRIVER" "an unreadable review surface counts as nobody having answered, so a rate limit holds a green pull request for the whole grace and then blames the reviewer"
 check both_review_surfaces_are_read "$DRIVER" "only the review surface is read, so a Codex review that found nothing — which publishes a summary comment and no review — reads as no review at all"
+check a_reviewer_that_declined_counts_as_answered "$DRIVER" "a reviewer that reported it CANNOT review — a rate-limited Copilot, which fails its own check run and publishes nothing else — is still waited for, so every green pull request in the fleet burns the full grace and then merges with a warning blaming the wrong thing"
 check the_review_clock_starts_at_green "$DRIVER" "the review grace is measured from something other than the last check finishing, so a pull request opened yesterday exhausts it before the reviewer is even asked"
 check the_review_clock_reads_the_commit_status_surface "$DRIVER" "the review clock reads only the check-run surface, so a repository whose required contexts are legacy commit statuses has no clock at all — the grace expires the instant it is armed and the gate waits for nobody, with nothing in any log saying so"
 check the_review_clock_is_confined_to_the_required_contexts "$DRIVER" "the review clock counts any check at all, so a slow optional job or a coverage bot moves it forward and holds a green pull request well past the grace the operator configured"
@@ -1613,8 +1639,14 @@ mutate "the review reads stop being confined to a ready merge" "$DRIVER" \
   's|= "merge" \]; then|= "" ]; then|' \
   the_review_gate_is_asked_only_of_a_ready_merge
 mutate "an unreadable review surface starts counting as zero answers" "$DRIVER" \
-  's@^    echo -1$@    echo 0@' \
+  's@^    echo "-1 0"$@    echo "0 0"@' \
   an_unreadable_review_surface_is_not_an_unanswered_one
+mutate "the declined-reviewer surface is dropped, so a rate limit reads as silence" "$DRIVER" \
+  's@commits/\$sha/check-runs?per_page=100@commits/$sha/check-runs-unused?per_page=100@' \
+  a_reviewer_that_declined_counts_as_answered
+mutate "a GREEN reviewer check run starts discharging the gate ahead of its own review" "$DRIVER" \
+  's@select(.conclusion != "success" and@select(.conclusion != "no-such-conclusion" and@' \
+  a_reviewer_that_declined_counts_as_answered
 mutate "the comment surface is dropped, so a clean review reads as no review" "$DRIVER" \
   's@issues/\$num/comments?per_page=100@issues/$num/comments-unused?per_page=100@' \
   both_review_surfaces_are_read
