@@ -145,6 +145,21 @@ more than one App, so this is the established pattern.
 | Pull requests | Read & write | list, read mergeability, comment on a release |
 | Checks | Read | the required-check state on the head sha |
 | Commit statuses | Read | the OTHER surface a required context can live on |
+| Actions | Read | the `workflow_run` that dispatched this pass |
+| Workflows | Read & write | merging a pull request that touches `.github/workflows/` |
+
+**Workflows is not optional either, on a fleet where most pull requests are
+workflow pull requests.** GitHub refuses an App token that writes under
+`.github/workflows/` regardless of `Contents: write`, and a squash merge counts
+as writing those files. Measured 2026-08-26 on Print-Server and entity-platform:
+the lane logged `merge:ready` for every candidate and then `done, 0 action(s)`,
+with every pull request reading `mergeable: true` and `mergeable_state: clean`.
+The real cause was one line above the annotation, on `gh`'s stderr — *refusing
+to allow a GitHub App to create or update workflow ... without `workflows`
+permission (HTTP 403)*. The refusal is deterministic, so the same pull request
+is refused on every pass. **The permission is per-installation and has to be
+accepted on each one**, so a repository onboarded later starts out with this
+hole even though the fleet's other installations are fine.
 
 **Commit statuses is not optional padding, and leaving it out has a measured
 cost.** A required context may be a legacy commit status rather than a
