@@ -999,51 +999,57 @@ Describe 'boot wrapper path hardening' {
         $script:ProtectPathSource = $match.Value
     }
 
-    # Returns the fake ACL that Protect-Path was handed, with the rules it added.
-    function Invoke-ProtectPath {
-        param([bool] $IsContainer, [string] $Source)
+    # Defined in BeforeAll, not in the Describe body. The body runs at DISCOVERY
+    # and the It blocks run afterwards in a different scope, so a helper declared
+    # out there is gone by the time a test calls it -- CommandNotFoundException on
+    # every case, which reads like four bugs and is one scoping mistake.
+    BeforeAll {
+        # Returns the fake ACL that Protect-Path was handed, with the rules it added.
+        function Invoke-ProtectPath {
+            param([bool] $IsContainer, [string] $Source)
 
-        # NOT named $acl. The stubs below are called from INSIDE Protect-Path,
-        # which has its own $acl local, and a scriptblock function body resolves
-        # variables up the CALLER's scope chain -- so a stub saying `$acl` would
-        # hand back the callee's own half-assigned variable instead of this one.
-        # For the same reason .GetNewClosure() is wrong here: it snapshots the
-        # scope it is created in, which is not the one holding these.
-        $fake = New-Object psobject
-        $fake | Add-Member -MemberType NoteProperty -Name Access -Value @()
-        $fake | Add-Member -MemberType NoteProperty -Name Protection -Value $null
-        $fake | Add-Member -MemberType NoteProperty -Name Rules -Value ([System.Collections.ArrayList]::new())
-        $fake | Add-Member -MemberType NoteProperty -Name Saved -Value $false
-        $fake | Add-Member -MemberType ScriptMethod -Name SetAccessRuleProtection -Value {
-            $this.Protection = @($args[0], $args[1])
+            # NOT named $acl. The stubs below are called from INSIDE Protect-Path,
+            # which has its own $acl local, and a scriptblock function body resolves
+            # variables up the CALLER's scope chain -- so a stub saying `$acl` would
+            # hand back the callee's own half-assigned variable instead of this one.
+            # For the same reason .GetNewClosure() is wrong here: it snapshots the
+            # scope it is created in, which is not the one holding these.
+            $fake = New-Object psobject
+            $fake | Add-Member -MemberType NoteProperty -Name Access -Value @()
+            $fake | Add-Member -MemberType NoteProperty -Name Protection -Value $null
+            $fake | Add-Member -MemberType NoteProperty -Name Rules -Value ([System.Collections.ArrayList]::new())
+            $fake | Add-Member -MemberType NoteProperty -Name Saved -Value $false
+            $fake | Add-Member -MemberType ScriptMethod -Name SetAccessRuleProtection -Value {
+                $this.Protection = @($args[0], $args[1])
+            }
+            $fake | Add-Member -MemberType ScriptMethod -Name RemoveAccessRule -Value { $true }
+            $fake | Add-Member -MemberType ScriptMethod -Name AddAccessRule -Value {
+                $null = $this.Rules.Add($args[0])
+            }
+            $fakeItem = [pscustomobject]@{ PSIsContainer = $IsContainer }
+
+            # Compiled out here rather than inline below: PSReviewUnusedParameter
+            # does not look inside a nested scriptblock, so a $Source referenced
+            # only in there reads to the analyzer as a parameter nobody used.
+            $definition = [scriptblock]::Create($Source)
+
+            # Get-Acl and Set-Acl are Windows-only and do not exist at all on the
+            # runner this suite runs on, so these are stand-ins rather than
+            # overrides -- but a literal `function Get-Acl` still trips
+            # PSAvoidOverwritingBuiltInCmdlets, so they go in through the function:
+            # provider. Scoped to this scriptblock, which is also where Protect-Path
+            # is defined, so nothing outside this call sees them.
+            & {
+                $null = New-Item -Path 'function:Get-Acl' -Value { $fake }
+                $null = New-Item -Path 'function:Set-Acl' -Value { $fake.Saved = $true }
+                $null = New-Item -Path 'function:Get-Item' -Value { $fakeItem }
+
+                . $definition
+                Protect-Path 'the-path'
+            }
+
+            $fake
         }
-        $fake | Add-Member -MemberType ScriptMethod -Name RemoveAccessRule -Value { $true }
-        $fake | Add-Member -MemberType ScriptMethod -Name AddAccessRule -Value {
-            $null = $this.Rules.Add($args[0])
-        }
-        $fakeItem = [pscustomobject]@{ PSIsContainer = $IsContainer }
-
-        # Compiled out here rather than inline below: PSReviewUnusedParameter
-        # does not look inside a nested scriptblock, so a $Source referenced
-        # only in there reads to the analyzer as a parameter nobody used.
-        $definition = [scriptblock]::Create($Source)
-
-        # Get-Acl and Set-Acl are Windows-only and do not exist at all on the
-        # runner this suite runs on, so these are stand-ins rather than
-        # overrides -- but a literal `function Get-Acl` still trips
-        # PSAvoidOverwritingBuiltInCmdlets, so they go in through the function:
-        # provider. Scoped to this scriptblock, which is also where Protect-Path
-        # is defined, so nothing outside this call sees them.
-        & {
-            $null = New-Item -Path 'function:Get-Acl' -Value { $fake }
-            $null = New-Item -Path 'function:Set-Acl' -Value { $fake.Saved = $true }
-            $null = New-Item -Path 'function:Get-Item' -Value { $fakeItem }
-
-            . $definition
-            Protect-Path 'the-path'
-        }
-
-        $fake
     }
 
     It 'makes the directory grants inheritable, or every child loses all access' {
