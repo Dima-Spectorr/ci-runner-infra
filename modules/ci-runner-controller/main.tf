@@ -176,7 +176,11 @@ resource "google_compute_instance_template" "controller" {
     "ci-app-key-secret"        = var.github_app_private_key_secret
     "ci-poll-seconds"          = tostring(var.poll_interval_seconds)
     "ci-demand-budget-seconds" = tostring(var.demand_budget_seconds)
-    "ci-metric-prefix"         = var.metric_prefix
+    # How much of that budget's work fits in it. This module sweeps once for the
+    # WHOLE repository rather than once per pool, so it has the most runs to get
+    # through and the least budget to do it in.
+    "ci-demand-fetch-concurrency" = tostring(var.demand_fetch_concurrency)
+    "ci-metric-prefix"            = var.metric_prefix
     # The queue's branch, so the parking sweep can tell a pull request that will
     # never be admitted from one that is simply waiting its turn.
     "ci-queue-base" = var.queue_base_branch

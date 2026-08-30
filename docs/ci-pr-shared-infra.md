@@ -82,8 +82,8 @@ jobs:
       migrate: ./scripts/db-migrate.sh "$DATABASE_URL"
 ```
 
-Outputs are `runs-on`, `addr` and `pg`, read exactly as they would be from a
-local job. Three things about this call are not decoration:
+Outputs are `runs-on`, `addr`, `pg`, `pinned` and `slots`, read exactly as they
+would be from a local job. Three things about this call are not decoration:
 
 - **The ref is a SHA with a version comment**, not `@v5` and not `@main`. This
   document said `@v5` until #351, and that call could not be green anywhere:
@@ -299,6 +299,63 @@ throwaway Postgres on this job's own runtime when there is not, so the suite
 cannot tell the difference. It also publishes `shared`, which is worth logging:
 a run where *every* job reports `0` is a run whose anchor never pinned
 anything — a fleet problem currently wearing a green tick.
+
+### Size a fan-out from `slots`, never from a constant
+
+The same "normal Tuesday" degrade decides how wide a matrix should be, and this
+is the part consumers get wrong.
+
+Rule 1 puts every job of a **pinned** run on one host. That host has
+`slots_per_host` runner agents, and `--reserve-slot` holds one of them for the
+shared stack, so a pinned run can execute `slots_per_host - 1` jobs at a time —
+the anchor publishes exactly that as **`slots`**. Fanning out wider than
+`slots` on a pinned run is strictly worse than fanning out narrower: the
+surplus legs queue behind their own siblings on one machine, so each leg pays a
+fresh fixed cost (checkout, toolchain, cache pull, ~1 minute here) for work that
+would otherwise have shared one. The run gets longer.
+
+An **unpinned** run has no such ceiling — it is scheduled across the whole pool
+— and the anchor publishes `pinned=0`, `slots=0`, where `0` means *not
+host-limited* rather than *no capacity*.
+
+The trap is that the pinned case is the one people design for and the unpinned
+case is the one that mostly happens. Measured on this fleet across 15
+consecutive runs of one repository's PR check, **14 ran unpinned** — they spread
+across 3 to 6 hosts — while their shard count was a compile-time constant
+justified in a comment by the pinned host's slot budget. Every one of those runs
+serialised its test suite against a limit that was not there, and nothing looked
+wrong: the run was green, the hosts were busy, the shards were balanced.
+
+So derive the width instead of writing it down:
+
+```yaml
+  build:
+    needs: [anchor]
+    outputs:
+      # Pinned: the free slots on the held host. Unpinned: a pool-wide width,
+      # bounded by what the suite can usefully be split into.
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - id: plan
+        env:
+          PINNED: ${{ needs.anchor.outputs.pinned }}
+          SLOTS: ${{ needs.anchor.outputs.slots }}
+        run: |
+          n=6
+          [ "$PINNED" = 1 ] && n="$SLOTS"
+          printf 'shards=%s\n' "$(jq -cn --argjson n "$n" '[range(1; $n + 1)]')" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: [anchor, build]
+    strategy:
+      matrix:
+        shard: ${{ fromJSON(needs.build.outputs.shards) }}
+    runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
+```
+
+Read `pinned` rather than the length of `runs-on`: the array already carries the
+fact, but only as its length, and a consumer that re-derives it from there
+breaks the day a pool gains a label.
 
 **The URL carries `?sslmode=disable`, and the consumer must not add it again.**
 The server runs `trust` with no TLS on both branches, and the address alone

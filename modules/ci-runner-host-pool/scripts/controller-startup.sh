@@ -346,6 +346,54 @@ POLL=${POLL:-20}
 DEMAND_BUDGET=$(md "instance/attributes/ci-demand-budget-seconds")
 DEMAND_BUDGET=${DEMAND_BUDGET:-90}
 DEMAND_RUNS_SKIPPED=0
+
+# HOW MANY OF THE PER-RUN JOB LISTS ARE IN FLIGHT AT ONCE.
+#
+# The sweep costs one API call per unfinished run, and it spent them ONE AT A
+# TIME. That is a latency problem, not a throughput one: each call is a round
+# trip to api.github.com from the pool's region, and the controller does nothing
+# but wait for it. So the number of runs a tick can examine was
+# DEMAND_BUDGET / round-trip, and on a busy repository that is far fewer runs
+# than the repository has.
+#
+# Measured on ci-runner-host-iit, 2026-08-30, at 21 of 21 runners busy:
+# `ci_demand_runs_skipped` sat between 6 and 24 on EVERY tick of a two-hour
+# window while `ci_demand` reported 5-13. The autoscaler was therefore sizing
+# the pool against roughly half its real demand, recommending 4 hosts for a pool
+# whose every slot was occupied, and PR jobs queued 3-12 minutes waiting for a
+# host the metric never asked for. Every part of that reads as healthy: demand
+# is a number, it is non-zero, and the pool is at the size that number implies.
+#
+# Fetching in parallel removes the serialisation without touching a single
+# accounting rule — the same job lists, the same jq, the same budget, in the
+# same order. What it changes is how many of them fit in the budget.
+#
+# EIGHT, and the ceiling is GitHub's secondary rate limit rather than the
+# machine: the documented guidance is no more than 100 concurrent requests
+# against the REST API, and this fleet runs one controller per pool project
+# against one installation. Eight is an order of magnitude inside that and still
+# turns a 27-run sweep from 27 round trips into 4.
+#
+# A pool that sets this to 0, to empty, or to something that is not a number
+# would fan out zero calls and report demand 0 for ever — which is the exact
+# failure this whole block exists to end, reintroduced through the knob that
+# fixes it. So the value is CLAMPED rather than rejected: a controller that
+# refuses to boot over a tuning knob is worse than one that ignores it, and a
+# pure function is a thing the selftest can exercise without a metadata server.
+clamp_fetch_concurrency() { # <raw> -> a usable count on stdout
+  local v="$1"
+  case "$v" in
+    ''|*[!0-9]*) printf '8'; return 0 ;;
+  esac
+  [ "$v" -ge 1 ] || { printf '1'; return 0; }
+  # Upper bound is GitHub's secondary rate limit, not the machine: the
+  # documented guidance is no more than 100 concurrent REST requests per
+  # installation, and one controller per pool project shares that budget with
+  # its siblings. 32 leaves room for every pool in a fleet at once.
+  [ "$v" -le 32 ] || { printf '32'; return 0; }
+  printf '%s' "$v"
+}
+DEMAND_FETCH_CONCURRENCY=$(clamp_fetch_concurrency "$(md "instance/attributes/ci-demand-fetch-concurrency")")
 # The demand sweep's per-pool results. One sweep fills all four; pool_select()
 # hands the selected pool's values to the tick as the globals it always used.
 declare -A D_TOTAL=() D_QUEUED=() D_WAIT=() D_RUNNING=() D_EXPIRED=()
@@ -477,6 +525,39 @@ gh_api() {
   case "$status" in
     2*) cat "$STATE_DIR/api.body"; return 0 ;;
   esac
+  return 1
+}
+
+# The same GET, to a CALLER-NAMED file, safe to run in a background subshell.
+#
+# gh_api cannot be: it writes every response to the one fixed pair of paths
+# $STATE_DIR/api.body and $STATE_DIR/api.status, which is exactly right for a
+# sequential caller that reads the status afterwards, and a data race the moment
+# two of them run at once. Two concurrent gh_api calls do not fail — they hand
+# each other's body back, which is a wrong demand count with nothing red
+# anywhere. So the concurrent path gets its own function rather than a flag on
+# that one, and the two cannot be confused at a call site.
+#
+# THE TOKEN IS AN ARGUMENT, not a call to gh_token. gh_token caches the
+# installation token in the globals GH_TOKEN/GH_TOKEN_EXPIRY, and a global set
+# inside a background subshell dies with it — so a fan-out that called it would
+# read the App private key out of Secret Manager and mint a fresh installation
+# token once per branch, every tick, for ever. The caller resolves it once, in
+# the parent, where the cache is real.
+#
+# Written to a temporary path and renamed on success, so a partially-written
+# body from a killed curl can never be read as a job list: the reader tests for
+# the final name, and a failed call simply leaves it absent.
+gh_api_fetch() { # <token> <api-path> <destination-file>
+  local tok="$1" path="$2" dest="$3" status
+  status=$(curl "${CURL_TIMEOUTS[@]}" -sS -o "$dest.part" -w '%{http_code}' \
+    -H "Authorization: Bearer $tok" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/$path" 2>>"$LOG") || status="000"
+  case "$status" in
+    2*) mv -f "$dest.part" "$dest" && return 0 ;;
+  esac
+  rm -f "$dest.part"
   return 1
 }
 
@@ -634,6 +715,31 @@ collect_demand() {
   # The budget bounds the tick instead of hoping the repo stays quiet.
   local examined=0 skipped=0
 
+  # ── phase 1: FETCH, in parallel ──────────────────────────────────────────
+  #
+  # See DEMAND_FETCH_CONCURRENCY. The order is still queued-runs-first, and the
+  # budget still authorises each call individually — what changed is that the
+  # controller no longer sits idle through one round trip before starting the
+  # next, which is what made a busy repository unmeasurable.
+  #
+  # A DIRECTORY PER TICK, removed at the end of the sweep and again before the
+  # next one starts. A leftover file from a previous tick would be read as this
+  # tick's answer for a run the budget skipped — stale demand presented as
+  # fresh, which is worse than the truncation it would be hiding.
+  local jobs_dir tok
+  jobs_dir="$STATE_DIR/demand-jobs"
+  rm -rf "$jobs_dir"
+  mkdir -p "$jobs_dir" || return 0
+
+  # ONCE, in the parent, so the cache in gh_token is the one that answers and
+  # the children are handed a string. See gh_api_fetch.
+  tok=$(gh_token) || { rm -rf "$jobs_dir"; return 0; }
+
+  # Every pid is waited on EXPLICITLY rather than with a bare `wait`: this
+  # process also runs the liveness responder and other long-lived background
+  # work, and a bare `wait` would block the sweep on whichever of those happens
+  # to be alive.
+  local pids=() p
   local id
   for id in $ids; do
     # The call must FIT, not merely start: one begun a second before the
@@ -644,7 +750,36 @@ collect_demand() {
       continue
     fi
     examined=$((examined + 1))
-    jobs=$(gh_api "repos/$REPO_FULL/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || continue
+    gh_api_fetch "$tok" "repos/$REPO_FULL/actions/runs/$id/jobs?per_page=100" \
+      "$jobs_dir/$id" 2>/dev/null &
+    pids+=("$!")
+    if [ "${#pids[@]}" -ge "$DEMAND_FETCH_CONCURRENCY" ]; then
+      for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+      pids=()
+    fi
+  done
+  for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+
+  # ── phase 2: COUNT ───────────────────────────────────────────────────────
+  #
+  # Unchanged, and deliberately still sequential: it is jq and shell arithmetic
+  # over payloads already on disk, and the accumulators below are shared state
+  # that a subshell could not write back to.
+  #
+  # Bounded by the SAME deadline. Fetching in parallel moved the tick's cost
+  # from the network to jq, and a repository busy enough to fill the fetch phase
+  # can now hand this loop more payloads than the budget covers. A run whose
+  # payload arrived but was never counted is under-reported demand exactly like
+  # one never fetched, so it lands on the same counter and the same log line
+  # rather than vanishing into a number that looks complete.
+  for id in $ids; do
+    [ -s "$jobs_dir/$id" ] || continue
+    if ! budget_allows_call "$(date +%s)" "$deadline" 0; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    jobs=$(cat "$jobs_dir/$id" 2>/dev/null) || continue
+    [ -n "$jobs" ] || continue
 
     # One line per POOL, from one pass over one job list. The candidate set —
     # unfinished, labelled, not pinned — is computed once and then intersected
@@ -841,8 +976,12 @@ collect_demand() {
   # demand is a pool that does not scale out — the exact symptom this fleet keeps
   # misreading as "the autoscaler is broken". Published as a series too, so the
   # budget being too small for a repo is visible without reading a controller log.
+  # The payloads are this tick's answer and nothing reads them after it. Left
+  # behind they would be the next tick's stale answer for a run it skipped.
+  rm -rf "$jobs_dir"
+
   DEMAND_RUNS_SKIPPED=$skipped
-  [ "$skipped" -gt 0 ] && log "demand budget ${DEMAND_BUDGET}s exhausted after $examined run(s): $skipped run(s) not examined this tick — demand is a LOWER BOUND, and a skipped in_progress run may still hold queued jobs"
+  [ "$skipped" -gt 0 ] && log "demand budget ${DEMAND_BUDGET}s exhausted after $examined run(s) at fetch concurrency ${DEMAND_FETCH_CONCURRENCY}: $skipped run(s) not examined this tick — demand is a LOWER BOUND, and a skipped in_progress run may still hold queued jobs"
   return 0
 }
 

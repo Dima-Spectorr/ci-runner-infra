@@ -224,5 +224,87 @@ ds=$(date -u -d "@0" +%Y-%m-%dT%H:%M:%SZ)
 check "the cutoff is URL-encoded" "&created=%3E%3D1970-01-01T00%3A00%3A00Z" \
   "&created=%3E%3D${ds//:/%3A}"
 
+# ── the sweep fetches in parallel, and does it safely ────────────────────────
+#
+# WHY THIS BLOCK EXISTS. The sweep spent its budget one round trip at a time, so
+# the runs a tick could examine was DEMAND_BUDGET / round-trip rather than the
+# runs the repository had. Measured on ci-runner-host-iit, 2026-08-30, at 21 of
+# 21 runners busy: ci_demand_runs_skipped between 6 and 24 on every tick of a
+# two-hour window while ci_demand reported 5-13, so the autoscaler sized the
+# pool against roughly half its demand and PR jobs queued 3-12 minutes. Nothing
+# was red: demand was a number, it was non-zero, and the pool was the size that
+# number implied.
+#
+# Parallel fetching is easy to get subtly wrong in ways that are also not red,
+# which is what each check below is for.
+
+# The clamp is a pure function precisely so it can be exercised here rather than
+# against a metadata server.
+source <(sed -n '/^clamp_fetch_concurrency()/,/^}/p' "$CTRL")
+check "an unset fetch concurrency falls back to 8"  8  "$(clamp_fetch_concurrency "")"
+check "a non-numeric fetch concurrency falls back"  8  "$(clamp_fetch_concurrency "eight")"
+# 0 is the value that would make the sweep fetch nothing and report demand 0
+# for ever — the failure the fan-out exists to end, reintroduced through its
+# own knob.
+check "zero is clamped up, never honoured"          1  "$(clamp_fetch_concurrency 0)"
+check "a sane value is passed through"              12 "$(clamp_fetch_concurrency 12)"
+check "the rate-limit ceiling is enforced"          32 "$(clamp_fetch_concurrency 500)"
+
+# gh_api writes every response to ONE fixed pair of paths. Two of those running
+# at once do not fail — they hand each other's body back, which is a wrong
+# demand count with nothing red anywhere. The concurrent path must therefore use
+# the caller-named variant.
+# shellcheck disable=SC2016
+check "the fan-out uses the fork-safe fetch, not gh_api" yes \
+  "$(found "$CTRL" 'gh_api_fetch "$tok" "repos/$REPO_FULL/actions/runs/$id/jobs?per_page=100" \')"
+check "the fork-safe fetch never writes the shared body path" yes \
+  "$(if sed -n '/^gh_api_fetch()/,/^}/p' "$CTRL" | grep -q 'STATE_DIR/api\.'; then echo no; else echo yes; fi)"
+# A partially written body from a killed curl read as a job list is a silently
+# short demand count, so the payload is renamed into place only on success.
+check "the fetch renames into place rather than writing in place" yes \
+  "$(if sed -n '/^gh_api_fetch()/,/^}/p' "$CTRL" | grep -q 'mv -f "\$dest.part" "\$dest"'; then echo yes; else echo no; fi)"
+
+# gh_token caches the installation token in globals, and a global set inside a
+# background subshell dies with it. A fan-out that called it would read the App
+# private key out of Secret Manager and mint a token once per branch, per tick,
+# for ever.
+check "the fork-safe fetch takes the token as an argument" yes \
+  "$(if sed -n '/^gh_api_fetch()/,/^}/p' "$CTRL" | grep -q 'gh_token'; then echo no; else echo yes; fi)"
+# shellcheck disable=SC2016
+check "the token is resolved once, in the parent" yes \
+  "$(found "$CTRL" 'tok=$(gh_token) || { rm -rf "$jobs_dir"; return 0; }')"
+
+# A bare `wait` blocks on every background job this process owns, including the
+# liveness responder, so each pid is waited on by name.
+check "the sweep waits on named pids, never bare" yes \
+  "$(if sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -qE '^\s*wait\s*$'; then echo no; else echo yes; fi)"
+# shellcheck disable=SC2016
+check "every batch is drained before the next starts" yes \
+  "$(found "$CTRL" 'for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done')"
+
+# Fetching in parallel moves the tick's cost from the network to jq. A repo busy
+# enough to fill the fetch phase can hand the counting loop more payloads than
+# the budget covers, and a payload fetched but never counted is under-reported
+# demand exactly like one never fetched.
+if sed -n '/phase 2: COUNT/,/^}/p' "$CTRL" \
+   | awk '/budget_allows_call/{b=NR} /skipped=\$\(\(skipped \+ 1\)\)/{s=NR} END{exit !(b && s && b < s)}'; then
+  check "the counting phase is bounded by the same deadline" yes yes
+else
+  check "the counting phase is bounded by the same deadline" yes no
+fi
+
+# A leftover payload from a previous tick is the next tick's answer for a run it
+# skipped: stale demand presented as fresh, which is worse than the truncation
+# it hides. Cleared on the way in AND on the way out — the way out alone leaves
+# a controller killed mid-sweep seeding the next one.
+if sed -n '/^collect_demand()/,/^}/p' "$CTRL" \
+   | awk '/jobs_dir="\$STATE_DIR\/demand-jobs"/{d=NR} /rm -rf "\$jobs_dir"/{if(!f)f=NR} END{exit !(d && f && d < f)}'; then
+  check "the payload directory is cleared before the sweep" yes yes
+else
+  check "the payload directory is cleared before the sweep" yes no
+fi
+check "the payload directory is cleared after the sweep" yes \
+  "$(if [ "$(sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -c 'rm -rf "\$jobs_dir"')" -ge 2 ]; then echo yes; else echo no; fi)"
+
 echo "demand-budget selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
