@@ -200,12 +200,36 @@ on:
           request and a warning naming exactly what happened.
 
 
-          Ten minutes is comfortably longer than either reviewer takes here
-          (Codex 2-4 minutes from the request, Copilot under one). A lane
-          warning about an unreviewed merge on EVERY pull request has a reviewer
-          that is down; the number is not what is wrong.
+          SIXTY SECONDS, AND THE OPERATOR'S REASONING FOR IT.
+
+
+          It was ten minutes, chosen as "comfortably longer than either reviewer
+          takes". That reasoning had the clock wrong. A reviewer does not start
+          when this gate starts: Copilot begins at PULL REQUEST OPEN and has had
+          the entire CI run — minutes, on this fleet — to finish before the lane
+          ever looks. Ten minutes on top of that is ten minutes of nothing, paid
+          on every pull request in the fleet, and it is the single largest source
+          of green-to-merged latency left in this lane.
+
+
+          Sixty seconds is what the gate is actually for: closing the race
+          between the review and the merge, which are dispatched by the SAME
+          `workflow_run` completion and land within a second of each other. It
+          is not a wait for a reviewer to think.
+
+
+          THE COST, STATED PLAINLY, BECAUSE IT IS REAL. Codex is not asked until
+          CI goes green — that is the whole point of `codex-review.yml`, which
+          declines to buy a review of a red pull request — so it starts at the
+          same instant this clock does and takes 2-4 minutes. At sixty seconds
+          it will essentially never be waited for, and its review will arrive on
+          a merged pull request. The gate fails open, so nothing breaks and
+          nothing is lost except the ordering; the findings are still published
+          and still readable. A repository that wants Codex to land BEFORE the
+          merge must pass a number larger than the review takes, and pay that
+          latency on every pull request to get it.
         required: false
-        default: 600
+        default: 60
         type: number
       runs-on:
         description: >-
