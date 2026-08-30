@@ -295,7 +295,7 @@ jobs:
       review-bots: |
         chatgpt-codex-connector[bot]
         copilot-pull-request-reviewer[bot]
-      review-grace-seconds: 600
+      review-grace-seconds: 60
       dry-run: ${{ vars.MERGE_LANE_ARMED != 'true' }}
     secrets:
       app-id: ${{ secrets.MERGE_APP_ID }}
@@ -573,6 +573,22 @@ gate that failed closed there would stop the whole fleet merging and hand a
 vendor's billing page authority over this repository. So the wait is bounded by
 `review-grace-seconds`, and past it the lane merges and writes a warning
 annotation naming the pull request and the sha.
+
+**Sixty seconds, not ten minutes.** The grace closes a *race*, not a think.
+The review request and the lane are dispatched by the same `workflow_run`
+completion and land within about a second of each other; without a hold the
+review is bought and then arrives on a commit already on the default branch.
+A minute covers that. It was 600 on the reasoning that it should outlast
+a reviewer, which had the clock wrong — Copilot starts at pull-request *open*
+and has had the whole CI run to finish before the lane ever looks, so the extra
+ten minutes bought nothing and were paid on every pull request in the fleet.
+
+The cost is real and worth stating: Codex *is* only asked at CI-green, so it
+starts when this clock does and takes 2-4 minutes. At sixty seconds it will
+not be waited for, and its findings will land on a merged pull request. The gate
+fails open, so nothing is lost but the ordering. A repository that wants Codex
+to land before the merge passes a larger number and pays that latency on every
+pull request to get it.
 
 **The grace is measured from the moment the reviewers could have started —
 the last *required* check to finish, on either surface.** Not the head commit's
