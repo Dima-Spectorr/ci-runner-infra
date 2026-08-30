@@ -571,6 +571,39 @@ pool can therefore stay on the old template for as long as it stays busy.
 So an apply moves the *definition*. Getting it onto machines is a separate
 concern, and it belongs to the controller.
 
+### A trigger can be refused before it starts, and it looks like a slow queue
+
+A trigger's build config is validated when a build FIRES, not when terraform
+creates it. So a trigger can plan clean, apply clean, look correct in the
+console, and refuse every build it ever fires. What you see from GitHub is a
+commit that merged with its `ci-runner-apply-*` check-run sitting `queued`, and
+what you see in Cloud Build is a sub-second `FAILURE` with no trigger name and
+no streamable log. Nothing anywhere is red.
+
+Read `statusDetail`, which is the only place the reason appears:
+
+```bash
+gcloud builds list --project <id> --region <region> --limit 5 --format='value(id,status,statusDetail)'
+```
+
+This happened on 2026-08-29 across the fleet: the `alert-policies` step carried
+a ~25 KB script in a build-step **argument**, which caps at 10,000 characters,
+so every apply in every project was refused at fire time. For as long as it was
+live NOTHING applied anywhere — each project kept whatever runner configuration
+it had when the step landed, while its merges read as delivered.
+
+**A refused trigger cannot repair itself.** The build that would apply the fix
+is the build that is refused, so recovering needs one out-of-band apply per
+project — run the root by hand, or from a build submitted directly rather than
+through the trigger — after which the replaced trigger fires normally again.
+
+Two limits produce this shape and the module now guards both: a step argument
+is refused above 10,000 characters, and a whole build config above roughly
+128 KiB is *accepted*, given an id, and never scheduled — no BUILD phase, no
+log, every step `QUEUED` until the queue TTL expires. `script` escapes the
+first and not the second, which is why the step uses `script` and a
+`precondition` measures it.
+
 ---
 
 ## The controller is a managed group of size 1 (#308)

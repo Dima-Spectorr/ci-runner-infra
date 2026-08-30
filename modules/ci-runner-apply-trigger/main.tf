@@ -104,6 +104,28 @@ locals {
   # to.
   alert_script_gz = base64gzip(file("${path.module}/../../scripts/ci/ensure-alert-policies.sh"))
 
+  # Hoisted out of the step so the precondition on the trigger can MEASURE it.
+  # Inline in the resource it was unmeasurable, and unmeasurable is how a 25 KB
+  # blob sat in a 10,000-character argument through a review and an apply.
+  alert_step_script = <<-EOT
+    #!/usr/bin/env bash
+    set -u
+    printf '%s' '${local.alert_script_gz}' | base64 -d | gzip -d > /workspace/ensure-alert-policies.sh
+    chmod +x /workspace/ensure-alert-policies.sh
+    rc=0
+    bash /workspace/ensure-alert-policies.sh --project '${var.project_id}' ${local.alert_flags} || rc=$?
+    if [ "$rc" = "0" ]; then
+      echo "alert policies: this project matches the fleet set"
+    else
+      echo "WARNING: could not bring the alert policies up to date (exit $rc)."
+      echo "This does NOT fail the apply. The usual cause is that the build"
+      echo "account lacks roles/monitoring.alertPolicyEditor and"
+      echo "roles/monitoring.notificationChannelEditor in this project; the"
+      echo "other is a project with no email notification channel yet, which"
+      echo "needs one manual run with --email <addr> to bootstrap."
+    fi
+  EOT
+
   # Only the flags the caller actually set. The script's own defaults mirror the
   # ci-runner-host-pool defaults, so a pool that has not overridden anything
   # wants NO flags here — passing the numbers again from a second place is how
@@ -349,31 +371,66 @@ resource "google_cloudbuild_trigger" "apply" {
     # that has not been granted the role — a red build over a warning, which is
     # how a fleet learns to ignore red builds. So it prints what to grant and
     # exits 0.
+    #
+    # AND IT CARRIES ITS SCRIPT IN `script`, NEVER IN `args`. A build step
+    # ARGUMENT is capped at 10,000 characters; `script` has no such cap. The
+    # blob below is ~25 KB, so as an argument it made every build the trigger
+    # fired invalid — and the refusal happens at FIRE time, not at apply time,
+    # so terraform is green, the trigger exists, and each build dies in under a
+    # second with
+    #
+    #   invalid build: invalid .steps field: build step 5 arg 1 too long
+    #   (max: 10000)
+    #
+    # which no amount of escaping fixes. That is not a hypothetical: it shipped,
+    # and for as long as it was live NOTHING in the fleet applied. Every project
+    # in it kept whatever runner configuration it had when the step landed, and
+    # the failure is invisible from GitHub — the commit merges, the check-run
+    # sits `queued`, and the pins look delivered. `ci-runner-cache-warmer` hit
+    # this same cap first and its header records the same three limits; this
+    # step was written afterwards and reintroduced the one it warns about.
+    #
+    # Setting `entrypoint` beside `script` is an error, so this step has none.
+    # `script` honours the shebang, which is why there is one.
     dynamic "step" {
       for_each = var.manage_alert_policies ? [1] : []
       content {
-        id         = "alert-policies"
-        name       = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
-        entrypoint = "bash"
-        args = ["-c", <<-EOT
-          set -u
-          printf '%s' '${local.alert_script_gz}' | base64 -d | gzip -d > /workspace/ensure-alert-policies.sh
-          chmod +x /workspace/ensure-alert-policies.sh
-          rc=0
-          bash /workspace/ensure-alert-policies.sh --project '${var.project_id}' ${local.alert_flags} || rc=$?
-          if [ "$rc" = "0" ]; then
-            echo "alert policies: this project matches the fleet set"
-          else
-            echo "WARNING: could not bring the alert policies up to date (exit $rc)."
-            echo "This does NOT fail the apply. The usual cause is that the build"
-            echo "account lacks roles/monitoring.alertPolicyEditor and"
-            echo "roles/monitoring.notificationChannelEditor in this project; the"
-            echo "other is a project with no email notification channel yet, which"
-            echo "needs one manual run with --email <addr> to bootstrap."
-          fi
-        EOT
-        ]
+        id     = "alert-policies"
+        name   = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+        script = local.alert_step_script
       }
+    }
+  }
+
+  # THE OTHER CLIFF, TURNED INTO A PLAN FAILURE.
+  #
+  # The 10,000-character ARGUMENT cap is now prevented by construction — the one
+  # step with an unbounded body carries it in `script`, which has no cap. What
+  # `script` does NOT escape is the whole-build size limit `ci-runner-cache-warmer`
+  # measured: past roughly 128 KiB Cloud Build accepts the build, hands back an
+  # id, and never schedules it. No BUILD phase, no log, no error, until the queue
+  # TTL expires.
+  #
+  # Both failures are invisible from the outside — the trigger exists, terraform
+  # is green, the merge looks delivered, and the runner configuration silently
+  # stops reaching any machine. So the growing input is measured here, where
+  # somebody is reading the output. `ensure-alert-policies.sh` is the input that
+  # grows; every other step in this build is a fixed handful of lines.
+  # It binds only when the step is actually in the build. `local.alert_step_script`
+  # is computed either way — a local has no `count` — so an unconditional guard
+  # would fail the plan of a root that opted OUT of the step, over the size of a
+  # body its build does not contain. The measurement is of what ships, not of
+  # what was rendered.
+  #
+  # 100000 rather than 131072 because the guard's job is to be hit while there is
+  # still somewhere to go: the cliff is the size of the WHOLE build config, and
+  # this local is only its largest part. The ~28 KiB of headroom is the rest of
+  # the steps, the substitutions and the options — which grow too, and which no
+  # single number here can see.
+  lifecycle {
+    precondition {
+      condition     = !var.manage_alert_policies || length(local.alert_step_script) < 100000
+      error_message = "the alert-policies step is ${length(local.alert_step_script)} bytes of embedded script. Cloud Build silently never schedules a build once the whole config passes roughly 128 KiB — it fetches source, finishes SETUPBUILD, and sits with every step QUEUED until the queue TTL expires, with no error anywhere. This guard trips at 100000 to leave room for the rest of the config, which is why the number is lower than the cliff. Fetch ensure-alert-policies.sh from a bucket at build time instead of embedding it, or split the policies across steps."
     }
   }
 }
