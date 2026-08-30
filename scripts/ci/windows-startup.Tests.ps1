@@ -1023,6 +1023,11 @@ Describe 'boot wrapper path hardening' {
         }
         $fakeItem = [pscustomobject]@{ PSIsContainer = $IsContainer }
 
+        # Compiled out here rather than inline below: PSReviewUnusedParameter
+        # does not look inside a nested scriptblock, so a $Source referenced
+        # only in there reads to the analyzer as a parameter nobody used.
+        $definition = [scriptblock]::Create($Source)
+
         # Get-Acl and Set-Acl are Windows-only and do not exist at all on the
         # runner this suite runs on, so these are stand-ins rather than
         # overrides -- but a literal `function Get-Acl` still trips
@@ -1034,7 +1039,7 @@ Describe 'boot wrapper path hardening' {
             $null = New-Item -Path 'function:Set-Acl' -Value { $fake.Saved = $true }
             $null = New-Item -Path 'function:Get-Item' -Value { $fakeItem }
 
-            . ([scriptblock]::Create($Source))
+            . $definition
             Protect-Path 'the-path'
         }
 
