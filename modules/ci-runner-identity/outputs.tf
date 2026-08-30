@@ -13,7 +13,16 @@ output "controller_service_account_email" {
 }
 
 output "app_key_secret_name" {
-  description = "Pass to ci-runner-host-pool as `github_app_private_key_secret`. The value must be added out of band before a host can register."
+  description = <<-EOT
+    Pass to ci-runner-host-pool as `github_app_private_key_secret`.
+
+    When this module creates the secret (`create_app_key_secret`, the default)
+    it is created EMPTY, and the PEM must be added out of band with
+    `gcloud secrets versions add` before a host can register. With the flag
+    false the name refers to a secret another root owns, which already has its
+    version — there is nothing to add, and adding one would be a second key on
+    a secret a live pool is reading.
+  EOT
   value       = local.app_key_secret_id
 }
 

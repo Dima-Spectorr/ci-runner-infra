@@ -30,7 +30,7 @@ variable "app_key_secret_id" {
 variable "create_app_key_secret" {
   description = <<-EOT
     Create the App-key secret named by `app_key_secret_id`, rather than pointing
-    at one another root already owns.
+    at one that another root already owns.
 
     Leave true for a pool that is the first in its project. Set it false for a
     SECOND identity in a project whose key already exists, where creating one
