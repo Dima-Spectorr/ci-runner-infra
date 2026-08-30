@@ -1,4 +1,4 @@
-# Pester tests for the Windows host boot script's PURE functions.
+﻿# Pester tests for the Windows host boot script's PURE functions.
 #
 # The companion file is windows-beacon.Tests.ps1 and its header applies here
 # too: a gate that READS code is not a test, so the decidable half of the boot
@@ -964,6 +964,130 @@ Describe 'acl inheritance flags' {
     It 'gives a file ACE no flags at all, because .NET rejects any' {
         Get-AclInheritanceFlag -IsContainer $false |
             Should -Be ([System.Security.AccessControl.InheritanceFlags]::None)
+    }
+}
+
+# THE SAME DISTINCTION, IN THE OTHER FILE THAT MAKES IT
+#
+# windows-boot-wrapper.ps1 has its own Protect-Path, because it runs BEFORE the
+# boot script it unpacks exists. It hardens two things with one function: C:\ci,
+# a directory, and the unpacked script, a file. It used to pass
+# InheritanceFlags::None for both.
+#
+# That bricked every host from the Windows golden image on its FIRST boot
+# (measured 2026-08-30). SetAccessRuleProtection($true, $false)
+# drops the inherited ACEs, so two flagless grants left C:\ci as
+# D:PAI(A;;FA;;;SY)(A;;FA;;;BA) -- applying to that directory and to nothing
+# underneath it. Every child recomputed to D:AI with zero ACEs, and an empty
+# DACL denies everyone, SYSTEM included. Phase 0 could no longer read
+# image-version.txt, half a second later and on every boot thereafter.
+#
+# HOW THIS IS TESTED, AND WHY IT IS SPLIT IN TWO
+#
+# Protect-Path as a whole cannot be run here. It constructs a SecurityIdentifier,
+# which throws PlatformNotSupportedException the moment it is touched -- this
+# suite runs pwsh on LINUX, where Windows principals do not exist. The wrapper is
+# also a Terraform template (it carries a ${gz} placeholder), so it cannot be
+# dot-sourced either.
+#
+# So the decision that was wrong -- and only that -- was pulled out into
+# Get-AclInheritanceFlag, exactly as the boot script already does. It is a pure
+# enum choice, it runs anywhere, and it is lifted out and EXECUTED below.
+#
+# What cannot be executed is asserted structurally instead, on the parsed AST
+# rather than on a text match: that Protect-Path asks that function for the flag
+# instead of hardcoding one, and that it hands it the container-ness of the path.
+# That pairing is what makes the executable half meaningful -- a correct decision
+# function the caller ignores would be worth nothing.
+Describe 'boot wrapper path hardening' {
+    BeforeAll {
+        $wrapperPath = Join-Path $PSScriptRoot '../../modules/ci-runner-host-pool/scripts/windows-boot-wrapper.ps1'
+        if (-not (Test-Path -LiteralPath $wrapperPath)) {
+            throw "the boot wrapper is not at $wrapperPath"
+        }
+        $wrapperText = Get-Content -Raw -LiteralPath $wrapperPath
+
+        # The template cannot be dot-sourced, so both functions are lifted out of
+        # it by parsing the file. Parsing rather than regex: a brace inside a
+        # string or a comment ends a regex match in the wrong place, silently, and
+        # what comes back still looks like a function.
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $wrapperText, [ref] $null, [ref] $parseErrors)
+
+        $functions = @{}
+        foreach ($f in $ast.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            $functions[$f.Name] = $f
+        }
+
+        foreach ($required in @('Get-AclInheritanceFlag', 'Protect-Path')) {
+            if (-not $functions.ContainsKey($required)) {
+                throw "$required is no longer a function in windows-boot-wrapper.ps1"
+            }
+        }
+
+        $script:ProtectPathAst = $functions['Protect-Path']
+
+        # The pure half, made callable. Only the enum decision runs here; nothing
+        # in it touches a Windows principal, so it is safe on this runner.
+        . ([scriptblock]::Create($functions['Get-AclInheritanceFlag'].Extent.Text))
+    }
+
+    # THE EXECUTABLE HALF -- the decision that was actually wrong.
+
+    It 'makes a directory grant inheritable, or every child loses all access' {
+        $flags = Get-AclInheritanceFlag -IsContainer $true
+
+        $flags.HasFlag(
+            [System.Security.AccessControl.InheritanceFlags]::ContainerInherit) | Should -BeTrue
+        $flags.HasFlag(
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit) | Should -BeTrue
+    }
+
+    It 'gives the unpacked script no flags, because .NET rejects any on a file' {
+        Get-AclInheritanceFlag -IsContainer $false |
+            Should -Be ([System.Security.AccessControl.InheritanceFlags]::None)
+    }
+
+    # THE STRUCTURAL HALF -- that the caller actually uses the decision. A correct
+    # Get-AclInheritanceFlag that Protect-Path ignores would be worth nothing, and
+    # ignoring it is precisely the bug that bricked the fleet.
+
+    It 'asks for the flag instead of hardcoding one' {
+        $calls = $script:ProtectPathAst.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)
+        $names = $calls | ForEach-Object { $_.GetCommandName() }
+
+        $names | Should -Contain 'Get-AclInheritanceFlag'
+    }
+
+    It 'never names an InheritanceFlags value directly, which is how ::None got hardcoded for both' {
+        $literals = $script:ProtectPathAst.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.TypeExpressionAst] -or
+              $args[0] -is [System.Management.Automation.Language.ConvertExpressionAst] }, $true)
+
+        ($literals | Where-Object { "$_" -match 'InheritanceFlags' }) | Should -BeNullOrEmpty
+    }
+
+    It 'decides from the container-ness of the path it was given' {
+        $text = $script:ProtectPathAst.Extent.Text
+
+        $text | Should -Match 'PSIsContainer'
+        $text | Should -Match 'Get-AclInheritanceFlag[^\r\n]*PSIsContainer'
+    }
+
+    It 'still protects the path without copying the inherited ACEs it just dropped' {
+        $script:ProtectPathAst.Extent.Text |
+            Should -Match 'SetAccessRuleProtection\(\$true,\s*\$false\)'
+    }
+
+    It 'grants exactly SYSTEM and Administrators, by SID' {
+        $strings = $script:ProtectPathAst.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true)
+        $sids = $strings | ForEach-Object { $_.Value } | Where-Object { $_ -match '^S-1-' } | Sort-Object
+
+        $sids | Should -Be @('S-1-5-18', 'S-1-5-32-544')
     }
 }
 
