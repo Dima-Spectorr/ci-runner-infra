@@ -997,13 +997,15 @@ Describe 'boot wrapper path hardening' {
             throw 'Protect-Path is no longer a top-level function in windows-boot-wrapper.ps1'
         }
         $script:ProtectPathSource = $match.Value
-    }
 
-    # Defined in BeforeAll, not in the Describe body. The body runs at DISCOVERY
-    # and the It blocks run afterwards in a different scope, so a helper declared
-    # out there is gone by the time a test calls it -- CommandNotFoundException on
-    # every case, which reads like four bugs and is one scoping mistake.
-    BeforeAll {
+        # Defined in here, not in the Describe body. The body runs at DISCOVERY
+        # and the It blocks run afterwards in a different scope, so a helper
+        # declared out there is gone by the time a test calls it --
+        # CommandNotFoundException on every case, which reads like four bugs and
+        # is one scoping mistake. It goes in THIS BeforeAll rather than a second
+        # one: a block may only have one, and Pester fails discovery for the
+        # whole FILE if it finds two, taking 200-odd unrelated tests with it.
+
         # Returns the fake ACL that Protect-Path was handed, with the rules it added.
         function Invoke-ProtectPath {
             param([bool] $IsContainer, [string] $Source)
