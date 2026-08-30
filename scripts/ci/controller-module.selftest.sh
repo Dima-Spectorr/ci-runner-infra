@@ -300,10 +300,18 @@ check "the gzipped controller boot script fits in a metadata value (${_gz} < ${_
 # `${...}` here is HCL interpolation that has to reach main.tf unexpanded.
 # shellcheck disable=SC2016
 _fold='join("\n", regexall(".{1,${local.b64_fold_columns}}", base64gzip(local.controller_startup_source)))'
-check "the controller blob is folded, not one enormous line" \
-  yes "$(grep -qF "$_fold" "$POOL_TF/main.tf" && echo yes || echo no)"
-check "the plan refuses a controller boot script with a long line" \
-  yes "$(grep -qF 'for line in split("\n", local.controller_startup) : line if length(line) > 4096' "$POOL_TF/main.tf" && echo yes || echo no)"
+# BOTH modules render a controller boot script, and for a while only one of them
+# was asked: `ci-runner-controller` shipped with the size gate copied over and
+# the fold and the line gate left behind, while these two checks read `$POOL_TF`
+# twice and reported green. A check that names one module cannot notice the
+# other, and the module it was not naming was rendering 127,328 characters on
+# one line — under three thousand short of the width that failed every create.
+for m in "$POOL_TF" "$CTRL_TF"; do
+  check "the controller blob is folded, not one enormous line ($(basename "$m"))" \
+    yes "$(grep -qF "$_fold" "$m/main.tf" && echo yes || echo no)"
+  check "the plan refuses a controller boot script with a long line ($(basename "$m"))" \
+    yes "$(grep -qF 'for line in split("\n", local.controller_startup) : line if length(line) > 4096' "$m/main.tf" && echo yes || echo no)"
+done
 
 echo
 echo "$pass passed, $fail failed"
