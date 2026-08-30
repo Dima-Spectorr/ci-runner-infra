@@ -235,13 +235,58 @@ excludes every human account, which is the reported hole closed; a different
 App posting the exact marker would still pass, and under `review-token` (which
 Codex requires anyway) none of that applies.
 
+## The fleet gates on Copilot alone
+
+`review-bots` names `copilot-pull-request-reviewer[bot]` and nothing else. Codex
+was on that list from the day the gate shipped, and taking it off was the fix to
+a fault that had been running for two weeks.
+
+**The list is what the gate EXPECTS.** A login on it that cannot answer is not a
+harmless extra — it is a permanent shortfall. Two independent reasons made Codex
+one:
+
+1. **It was never asked.** `codex-review-self.yml` computes
+   `dry-run: ${{ vars.CODEX_REVIEW_ARMED != 'true' }}`, and that variable is
+   `false` in this repository and unset in the other sixteen. The workflow ran
+   on every green CI completion in the fleet, decided, and commented nothing.
+   Codex last spoke on 2026-08-15.
+2. **Asked, it would have refused.** Codex bills a requested review to the
+   asker's own Codex account. `github-actions[bot]` has none and an App cannot
+   have one, so it answers the request with a refusal rather than a review. See
+   *Who asks matters* above.
+
+So `answered=1 expected=2` was permanent, and every merge in all seventeen
+repositories carried `::warning::lane: #<n> merging UNREVIEWED` — the annotation
+this document calls *the one thing worth alerting a human about*. Firing it on
+every merge is how it stopped being worth reading.
+
+**To put Codex back**, all three of these, together:
+
+| | |
+|---|---|
+| `CODEX_REVIEW_TOKEN` (secret) | a fine-grained PAT — Pull requests: read and write — belonging to the account that pays for Codex. Not an App: an App token fails for the same billing reason `github-actions[bot]` does. |
+| `CODEX_REVIEW_ARMED` (variable) | `true`, which is what takes `codex-review.yml` out of dry-run and lets it spend. |
+| `review-bots` | add `chatgpt-codex-connector[bot]` back to the caller. |
+
+Arming the first two without the third means Codex reviews and the lane does not
+wait for it. The third without the first two is the fault described above. Also
+raise `review-grace-seconds` if the review is meant to land *before* the merge:
+Codex is only asked at CI-green, so it starts when the grace clock starts and
+takes 2-4 minutes.
+
+None of this affects `@codex review` typed by a human on a pull request, which
+works now and always did — a person has a Codex account to bill.
+
 ## The wait, on the merge lane's side
 
 `review-bots` on `merge-lane.yml`, documented in
 [`docs/merge-lane.md`](merge-lane.md). The short version:
 
 - It waits for a named set of reviewer logins, bounded by `review-grace-seconds`
-  (default 600).
+  (default 60 — see *The grace closes a race, not a think* in
+  [`docs/merge-lane.md`](merge-lane.md)).
+- **This fleet names one login: `copilot-pull-request-reviewer[bot]`.** Why not
+  Codex, and how to put it back, is the section below.
 - **It fails open, and it is the only gate in that lane that does.** Codex runs
   out of credits; when it does no review is ever published, and a fail-closed
   hold would stop the fleet merging anything at all, indefinitely, with nothing

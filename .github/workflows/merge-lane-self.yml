@@ -95,19 +95,27 @@ jobs:
       runs-on: ubuntu-latest
       # `.mergify.yml`'s `checks_timeout` was 30 min. Kept, unchanged.
       inflight-budget-seconds: 1800
-      # HOLD A GREEN PULL REQUEST UNTIL THE ROBOTS HAVE READ IT.
+      # HOLD A GREEN PULL REQUEST UNTIL THE ROBOT HAS READ IT.
       #
-      # The fleet stopped asking Codex to review a RED pull request: it costs
-      # credits, and code that is about to be pushed again is code reviewed
-      # twice. The request therefore moved to the CI-green moment — the same
-      # `workflow_run` completion that dispatches this lane — so without this
-      # input the lane would merge while the review was still being written.
+      # COPILOT ALONE, AND THE ABSENCE OF CODEX HERE IS THE POINT.
       #
-      # Both reviewers, because both are already installed here and both are
-      # read the same way. Neither can block a merge for longer than
-      # `review-grace-seconds`.
+      # This list is what the gate EXPECTS, so a login on it that cannot answer
+      # is not a harmless extra — it is a permanent shortfall. Codex was on this
+      # list from the day the gate shipped and answered once: 2026-08-15. It
+      # bills a requested review to the asker's own Codex account, and there is
+      # no account to bill for `github-actions[bot]` or for an App, so it
+      # declines rather than ignores. `CODEX_REVIEW_ARMED` is unset across the
+      # fleet on top of that, so it was never even asked. The measured result
+      # was `answered=1 expected=2` on every pull request in every repository,
+      # for two weeks — every merge annotated `merging UNREVIEWED`, an
+      # annotation that means "a reviewer is down, go look", firing on merges
+      # where nothing was wrong. A warning that is always on is not a warning.
+      #
+      # Turning it back on is two settings and this line: a fine-grained PAT of
+      # the account that pays for Codex in `CODEX_REVIEW_TOKEN`, and
+      # `CODEX_REVIEW_ARMED=true`. Until both exist, naming it here only lies.
+      # `@codex review` typed by a human still works and always did.
       review-bots: |
-        chatgpt-codex-connector[bot]
         copilot-pull-request-reviewer[bot]
       # The queue view Mergify had and this lane owes back. The job summary is
       # unconditional; this is the pinned issue, and it is a VARIABLE because

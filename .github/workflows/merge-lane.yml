@@ -182,10 +182,19 @@ on:
 
 
           The logins are the ones that appear on the pull request, and they are
-          bots rather than people:
-          `chatgpt-codex-connector[bot]` and `copilot-pull-request-reviewer[bot]`.
-          A login that never answers costs one grace period per pull request and
-          nothing else, because this gate FAILS OPEN.
+          bots rather than people —
+          `copilot-pull-request-reviewer[bot]` is what this fleet names.
+
+
+          NAME ONLY A REVIEWER THAT CAN ACTUALLY ANSWER. This list is what the
+          gate EXPECTS, so a login that never answers is a permanent shortfall,
+          not a harmless extra: every merge is then annotated UNREVIEWED, and a
+          warning that fires on every merge stops being read. It costs one grace
+          period per pull request and nothing else, because this gate FAILS
+          OPEN, but the annotation is the real cost. Measured on this fleet with
+          `chatgpt-codex-connector[bot]` named and never armed: two weeks of
+          `answered=1 expected=2` on every pull request in seventeen
+          repositories.
         required: false
         default: ''
         type: string

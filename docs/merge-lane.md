@@ -303,12 +303,14 @@ jobs:
       # Optional. An issue whose body the lane rewrites with the queue after
       # every run — see "Seeing the queue". Unset means the job summary only.
       status-issue: ${{ vars.MERGE_LANE_STATUS_ISSUE }}
-      # Hold a green pull request until the robots have read it — see
-      # "Waiting for the automated reviewers". Required if this repository asks
-      # Codex for a review only once CI is green, which is the fleet default:
-      # without it the lane merges while the review is still being written.
+      # Hold a green pull request until the robot has read it — see
+      # "Waiting for the automated reviewers". Name ONLY a reviewer that can
+      # actually answer here: this is what the gate EXPECTS, so a login that
+      # never answers annotates every merge UNREVIEWED forever. Codex is
+      # deliberately absent — docs/ai-code-review.md, "The fleet gates on
+      # Copilot alone", has the measurement and the three settings that put it
+      # back.
       review-bots: |
-        chatgpt-codex-connector[bot]
         copilot-pull-request-reviewer[bot]
       review-grace-seconds: 60
       dry-run: ${{ vars.MERGE_LANE_ARMED != 'true' }}

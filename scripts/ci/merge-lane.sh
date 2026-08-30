@@ -115,7 +115,12 @@ fi
 # Empty — the default — means the gate is not armed and the lane behaves exactly
 # as it did before it existed. A repository arms it by naming the bots whose
 # review it wants to land BEFORE the merge, in practice
-# `chatgpt-codex-connector[bot]` and `copilot-pull-request-reviewer[bot]`.
+# `copilot-pull-request-reviewer[bot]`.
+#
+# NAME ONLY A REVIEWER THAT CAN ANSWER. This is what the gate EXPECTS, so a
+# login that never answers is a permanent shortfall and every merge carries the
+# UNREVIEWED annotation — which then means nothing, on the merges where it
+# would have meant something.
 #
 # The reason there is anything to wait for: this fleet stopped paying for a
 # Codex review of a red pull request, so the review is now requested at the
