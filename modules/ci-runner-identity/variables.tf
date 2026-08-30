@@ -49,6 +49,14 @@ variable "create_app_key_secret" {
     manage. That is the intent — but nothing here can check the secret exists,
     so a typo in `app_key_secret_id` is a 404 at apply time on a plan that read
     clean, not a plan-time error.
+
+    Choose it when the pool is created. Flipping true -> false on a pool that
+    has already applied asks Terraform to stop managing a `prevent_destroy`
+    resource, which it plans as a destroy and then REFUSES — the apply stops,
+    naming a lifecycle rule, and stays stopped until someone removes the secret
+    from state by hand. That refusal is the protection working, not a bug: the
+    alternative is deleting the one copy of a key that exists in no state file,
+    no repository and no backup.
   EOT
   type        = bool
   default     = true
