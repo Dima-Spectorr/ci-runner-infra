@@ -62,12 +62,47 @@ variable "create_app_key_secret" {
   default     = true
 }
 
+variable "controller_service_account_email" {
+  description = <<-EOT
+    Reuse an EXISTING controller account instead of creating one. Empty (the
+    default) creates this pool's own, which is right for the first pool in a
+    project.
+
+    The case it exists for is the same as `create_app_key_secret`'s: a second
+    pool in a project that already has a controller. A shared controller is one
+    VM running as one account, so the second pool must hand
+    `ci-runner-host-pool` that same account — with its own, the controller has
+    no rights in the second pool's MIG and can never delete a host there. That
+    failure is silent: the pool scales out under `ONLY_UP` and never back, which
+    is indistinguishable on every chart from a pool that is simply always busy.
+
+    Set it and this module creates NOTHING for the controller — not the account,
+    and not one of its grants. Every controller grant here is either
+    project-level (metrics, logs, instance-admin, IAP) or on the one App-key
+    secret, so the first identity's copies already cover this pool. Writing them
+    again would put two Terraform resources on one identical binding, and
+    removing either would revoke it for both.
+
+    Pass the FIRST identity's `controller_service_account_email` output. Passing
+    this pool's own host account is refused at plan time; passing an account
+    that does not exist is not, because nothing here can look one up — that is a
+    controller which never scales the pool in, on a plan that read clean.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "grant_compute_admin" {
   description = <<-EOT
     Grant roles/compute.instanceAdmin.v1 so the controller can delete hosts —
     the pool's only scale-in path. Set false only when a narrower custom role
     is bound to this account elsewhere; with neither, the pool scales out and
     never back down.
+
+    Ignored when `controller_service_account_email` reuses an existing account:
+    that account already holds the role from the identity that created it, and
+    the role is project-level, so a second binding here would add nothing while
+    making either root's removal revoke it for both.
   EOT
   type        = bool
   default     = true

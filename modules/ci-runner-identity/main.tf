@@ -41,8 +41,18 @@ resource "google_service_account" "runner" {
     # reduction below and finding #1958 with it, while every grant here still
     # reads as removed. Refused at plan time.
     precondition {
-      condition     = var.host_os != "windows" || var.create_controller_service_account
-      error_message = "host_os = \"windows\" requires create_controller_service_account = true — a Windows host account is deliberately stripped of the App-key read, and collapsing the controller onto it hands that read (and instance-admin) back to job code."
+      condition     = var.host_os != "windows" || var.create_controller_service_account || var.controller_service_account_email != ""
+      error_message = "host_os = \"windows\" requires a controller account that is not this host account — either create_controller_service_account = true, or controller_service_account_email naming the one a shared controller already runs as. A Windows host account is deliberately stripped of the App-key read, and collapsing the controller onto it hands that read (and instance-admin) back to job code."
+    }
+
+    # The reuse path takes an email this module cannot resolve, so it cannot see
+    # that the email it was handed IS this pool's host account — which would
+    # collapse the two accounts by the back door, silently, on a plan that reads
+    # clean. It can compare the strings: a service account's email is derived
+    # entirely from inputs already present here.
+    precondition {
+      condition     = var.controller_service_account_email == "" || var.controller_service_account_email != "${var.account_id}@${var.project_id}.iam.gserviceaccount.com"
+      error_message = "controller_service_account_email is this pool's own host account — that is the collapse create_controller_service_account exists to refuse, reached by a different route. Pass the FIRST pool's `controller_service_account_email` output."
     }
   }
 }
@@ -61,7 +71,7 @@ resource "google_service_account" "runner" {
 #
 # The controller runs no build input, so instance-admin is bounded there.
 resource "google_service_account" "controller" {
-  count = var.create_controller_service_account ? 1 : 0
+  count = local.controller_grants
 
   project = var.project_id
   # 30-character cap on an account id, and `-ctl` costs four. Truncate the same
@@ -73,7 +83,26 @@ resource "google_service_account" "controller" {
 }
 
 locals {
-  controller_email = var.create_controller_service_account ? google_service_account.controller[0].email : google_service_account.runner.email
+  # Does this identity OWN a controller, or is it the second pool in a project
+  # whose controller already exists?
+  #
+  # A shared controller is ONE VM running as ONE account, so a second pool must
+  # hand `ci-runner-host-pool` that same account or the controller has no rights
+  # in the second pool's MIG and can never delete a host there — the pool scales
+  # out under ONLY_UP and never back, which reads as a healthy pool that is
+  # simply always busy.
+  #
+  # Reuse creates NOTHING for the controller: not the account, and not one of
+  # its grants. Every controller grant this module writes is either project-level
+  # (metrics, logs, instance-admin, IAP) or on the one App-key secret, so the
+  # first identity's copies already cover the second pool. Writing them again
+  # from a second resource would put two Terraform resources on one identical
+  # binding, where removing either one revokes it for both.
+  controller_grants = var.controller_service_account_email == "" && var.create_controller_service_account ? 1 : 0
+
+  controller_email = var.controller_service_account_email != "" ? var.controller_service_account_email : (
+    local.controller_grants == 1 ? google_service_account.controller[0].email : google_service_account.runner.email
+  )
 
   # Every grant on the HOST account is reachable by any job that runs on a host,
   # and on Windows there is no fence that changes that (see `host_os`). So on
@@ -137,7 +166,7 @@ resource "google_secret_manager_secret_iam_member" "runner_reads_key" {
 # The controller reads the key to mint an installation token for the queue
 # poll; a host reads it for its slots' registration tokens.
 resource "google_secret_manager_secret_iam_member" "controller_reads_key" {
-  count = var.create_controller_service_account ? 1 : 0
+  count = local.controller_grants
 
   project   = var.project_id
   secret_id = local.app_key_secret_id
@@ -162,7 +191,7 @@ resource "google_project_iam_member" "metrics" {
 }
 
 resource "google_project_iam_member" "controller_metrics" {
-  count = var.create_controller_service_account ? 1 : 0
+  count = local.controller_grants
 
   project = var.project_id
   role    = "roles/monitoring.metricWriter"
@@ -178,7 +207,7 @@ resource "google_project_iam_member" "logs" {
 }
 
 resource "google_project_iam_member" "controller_logs" {
-  count = var.create_controller_service_account ? 1 : 0
+  count = local.controller_grants
 
   project = var.project_id
   role    = "roles/logging.logWriter"
@@ -198,7 +227,7 @@ resource "google_project_iam_member" "controller_logs" {
 # a custom role limited to compute.instances.delete /
 # compute.instanceGroupManagers.update and pass grant_compute_admin = false.
 resource "google_project_iam_member" "compute" {
-  count   = var.grant_compute_admin ? 1 : 0
+  count   = var.grant_compute_admin && var.controller_service_account_email == "" ? 1 : 0
   project = var.project_id
   role    = "roles/compute.instanceAdmin.v1"
   member  = "serviceAccount:${local.controller_email}"
@@ -213,7 +242,7 @@ resource "google_project_iam_member" "compute" {
 # predate the identity split carried the permission on the old runner account
 # and lost it when the controller moved to its own.
 resource "google_project_iam_member" "controller_iap_tunnel" {
-  count   = var.grant_compute_admin ? 1 : 0
+  count   = var.grant_compute_admin && var.controller_service_account_email == "" ? 1 : 0
   project = var.project_id
   role    = "roles/iap.tunnelResourceAccessor"
   member  = "serviceAccount:${local.controller_email}"
