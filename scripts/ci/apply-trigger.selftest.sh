@@ -291,6 +291,10 @@ fails_the_plan_before_the_build_is_unschedulable() {
   local block; block=$(awk '/lifecycle \{/,/^  \}/' "$1")
   matches "$block" 'precondition'                    || return 1
   matches "$block" 'length\(local.alert_step_script\)' || return 1
+  # And it binds only when the step ships. The local is computed either way — a
+  # local has no `count` — so an unconditional guard fails the plan of a root
+  # that opted OUT, over the size of a body its build does not contain.
+  matches "$block" 'var.manage_alert_policies'         || return 1
 }
 
 # 14. No inbox literal anywhere in the module. The address is the one thing here
@@ -438,6 +442,10 @@ mutate "'write it like the other steps' — the body moved back into args" "$MAI
 # does, right up to the size where the build is accepted and never runs.
 mutate "'a magic number in a precondition' — the size guard removed" "$MAIN" \
   '/lifecycle {/,/^  }/d' fails_the_plan_before_the_build_is_unschedulable
+# "The guard should just measure the script" — and a root that set
+# manage_alert_policies = false gets a plan failure about a step it does not have.
+mutate "'the flag is irrelevant to a length' — opt-out dropped from the guard" "$MAIN" \
+  's|condition     = !var.manage_alert_policies \|\| length|condition     = length|' fails_the_plan_before_the_build_is_unschedulable
 # "Everyone gets the same alerts anyway" — the default that quietly pages an
 # inbox no project chose.
 mutate "'give it a sensible default' — an address defaulted in the module" "$VARS" \

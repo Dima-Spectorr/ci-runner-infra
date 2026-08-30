@@ -416,10 +416,21 @@ resource "google_cloudbuild_trigger" "apply" {
   # stops reaching any machine. So the growing input is measured here, where
   # somebody is reading the output. `ensure-alert-policies.sh` is the input that
   # grows; every other step in this build is a fixed handful of lines.
+  # It binds only when the step is actually in the build. `local.alert_step_script`
+  # is computed either way — a local has no `count` — so an unconditional guard
+  # would fail the plan of a root that opted OUT of the step, over the size of a
+  # body its build does not contain. The measurement is of what ships, not of
+  # what was rendered.
+  #
+  # 100000 rather than 131072 because the guard's job is to be hit while there is
+  # still somewhere to go: the cliff is the size of the WHOLE build config, and
+  # this local is only its largest part. The ~28 KiB of headroom is the rest of
+  # the steps, the substitutions and the options — which grow too, and which no
+  # single number here can see.
   lifecycle {
     precondition {
-      condition     = length(local.alert_step_script) < 100000
-      error_message = "the alert-policies step is ${length(local.alert_step_script)} bytes of embedded script, and Cloud Build silently never schedules a build past roughly 128 KiB — it fetches source, finishes SETUPBUILD, and sits with every step QUEUED until the queue TTL expires, with no error anywhere. Fetch ensure-alert-policies.sh from a bucket at build time instead of embedding it, or split the policies across steps."
+      condition     = !var.manage_alert_policies || length(local.alert_step_script) < 100000
+      error_message = "the alert-policies step is ${length(local.alert_step_script)} bytes of embedded script. Cloud Build silently never schedules a build once the whole config passes roughly 128 KiB — it fetches source, finishes SETUPBUILD, and sits with every step QUEUED until the queue TTL expires, with no error anywhere. This guard trips at 100000 to leave room for the rest of the config, which is why the number is lower than the cliff. Fetch ensure-alert-policies.sh from a bucket at build time instead of embedding it, or split the policies across steps."
     }
   }
 }
