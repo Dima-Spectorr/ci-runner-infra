@@ -150,6 +150,34 @@ on:
           in pin-only mode — both say "there is no shared stack", which is the
           only thing a consumer has to act on.
         value: ${{ jobs.anchor.outputs.pg }}
+      pinned:
+        description: >-
+          `1` when this run holds a host and every consumer job will land on it,
+          `0` on every degrade — a fork, a host that predates the contract, or a
+          host another run already holds. `runs-on` already carries that fact,
+          but only as the LENGTH of an array, which a caller cannot branch on
+          without re-parsing it.
+        value: ${{ jobs.anchor.outputs.pinned }}
+      slots:
+        description: >-
+          How many of this run's jobs can run AT ONCE when pinned: the host's
+          slot count minus the one `--reserve-slot` holds for the shared stack.
+          `0` when unpinned, which means "not host-limited" rather than "no
+          capacity" — an unpinned run is scheduled across the whole pool.
+
+          WHAT THIS IS FOR. A caller that fans out (test shards, matrix legs)
+          has to choose a width, and the only correct width depends on something
+          only the anchor knows. Pinned, more legs than free slots is strictly
+          worse than fewer: the surplus legs queue behind their own siblings on
+          one host, so the run gets longer, not shorter. Unpinned, that ceiling
+          does not exist and a width chosen for it leaves the pool idle.
+
+          Measured on this fleet: 14 of 15 consecutive runs of one repository's
+          PR check landed UNPINNED (they spread across 3-6 hosts), while their
+          shard count was a compile-time constant justified by the pinned case.
+          Every one of those runs was serialised against a limit that was not
+          there.
+        value: ${{ jobs.anchor.outputs.slots }}
 
 permissions:
   contents: read
@@ -200,6 +228,8 @@ jobs:
       runs-on: ${{ steps.up.outputs.runs-on }}
       addr: ${{ steps.up.outputs.addr }}
       pg: ${{ steps.up.outputs.pg }}
+      pinned: ${{ steps.up.outputs.pinned }}
+      slots: ${{ steps.up.outputs.slots }}
     steps:
       # The CALLER's repository at the caller's sha: in a `workflow_call` the
       # `github` context is the caller's event, so this is the tree whose
@@ -225,16 +255,41 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Every exit below publishes all three outputs. `addr` and `pg` are
+          # Every exit below publishes all five outputs. `addr` and `pg` are
           # published EMPTY on a degrade rather than omitted, so a consumer that
           # reads them gets an obviously-blank value instead of the literal
           # string `null` that a missing output yields.
-          publish() { # <runs-on-json> <addr> <pg>
+          #
+          # `pinned` and `slots` are NOT defaulted by the caller for the same
+          # reason: `needs.anchor.outputs.slots` on a path that forgot to set it
+          # is the string `null`, and `fromJSON(null)` fails inside whatever job
+          # consumed it, long after the anchor went green. Both are therefore
+          # arguments here rather than optional, so a new degrade branch cannot
+          # be added without stating what it means for a fan-out.
+          publish() { # <runs-on-json> <addr> <pg> <pinned:0|1> <slots>
             {
               printf 'runs-on=%s\n' "$1"
               printf 'addr=%s\n' "$2"
               printf 'pg=%s\n' "$3"
+              printf 'pinned=%s\n' "$4"
+              printf 'slots=%s\n' "$5"
             } >> "$GITHUB_OUTPUT"
+          }
+
+          # The concurrency a pinned run actually gets. `CI_HOST_SLOTS` is set
+          # by the host at boot beside `CI_HOST_LABEL`; one slot is held by
+          # `--reserve-slot` for the shared stack and is not available to jobs.
+          #
+          # Floored at 1 rather than reported as 0: a single-slot host is a
+          # legitimate, if unusual, pool configuration, and 0 is the value that
+          # means "unpinned, not host-limited" — a caller that read 0 here would
+          # fan out as if it had the whole pool while holding one machine.
+          free_slots() {
+            local s="${CI_HOST_SLOTS:-}"
+            case "$s" in
+              ''|*[!0-9]*) printf '1'; return 0 ;;
+            esac
+            [ "$s" -gt 1 ] && printf '%s' "$((s - 1))" || printf '1'
           }
 
           # The pool, unpinned. Built with jq so the label is DATA: a printf
@@ -248,7 +303,7 @@ jobs:
           # to bring up its own throwaway service on this leg, or not run on
           # forks.
           if [ "${IS_FORK:-false}" = "true" ]; then
-            publish "$(jq -cn --arg r "$HOSTED_RUNNER" '[$r]')" "" ""
+            publish "$(jq -cn --arg r "$HOSTED_RUNNER" '[$r]')" "" "" 0 0
             echo "::notice::fork pull request — the whole run stays on hosted runners"
             exit 0
           fi
@@ -257,7 +312,7 @@ jobs:
           # contract: degrade to unpinned scheduling, do not fail. A gate that
           # bricks every run on an old host is a gate that gets reverted.
           if [ -z "${CI_HOST_LABEL:-}" ]; then
-            publish "$pool" "" ""
+            publish "$pool" "" "" 0 0
             echo "::notice::host predates the affinity contract — running unpinned"
             exit 0
           fi
@@ -278,7 +333,7 @@ jobs:
           # `--reserve-slot` is what keeps the stack alive after this job ends.
           if [ "$(ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL" --reserve-slot \
                     | sed -n 's/^pinned=//p')" != 1 ]; then
-            publish "$pool" "" ""
+            publish "$pool" "" "" 0 0
             echo "::notice::another run holds this host — running unpinned"
             exit 0
           fi
@@ -302,7 +357,7 @@ jobs:
           # A consumer using `shared-infra-db` therefore falls back on its own
           # leg without needing to know which of the two happened.
           if [ -z "$COMPOSE_FILE_IN" ]; then
-            publish "$pinned" "$CI_SHARED_INFRA_ADDR" ""
+            publish "$pinned" "$CI_SHARED_INFRA_ADDR" "" 1 "$(free_slots)"
             echo "::notice::pinned ${CI_HOST_LABEL} with no shared stack — compose-file is empty"
             exit 0
           fi
@@ -319,4 +374,4 @@ jobs:
               bash -c "$MIGRATE"
           fi
 
-          publish "$pinned" "$CI_SHARED_INFRA_ADDR" "$pg"
+          publish "$pinned" "$CI_SHARED_INFRA_ADDR" "$pg" 1 "$(free_slots)"

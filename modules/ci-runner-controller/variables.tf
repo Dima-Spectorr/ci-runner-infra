@@ -178,6 +178,32 @@ variable "demand_budget_seconds" {
   default     = 45
 }
 
+variable "demand_fetch_concurrency" {
+  description = <<-EOT
+    How many per-run job lists the demand sweep fetches at once. The sweep costs
+    one API call per unfinished run and spent them one at a time, so the runs a
+    tick could examine was the budget divided by one round trip to GitHub —
+    fewer runs than a busy repository has, and one controller here sweeps for
+    every pool in the repository.
+
+    An exhausted sweep is not visible as a failure: measured on
+    ci-runner-host-iit on 2026-08-30, `ci_demand_runs_skipped` sat between 6 and
+    24 on every tick while `ci_demand` reported 5-13 and all 21 runners were
+    busy, so the autoscaler sized the pool against half its demand and jobs
+    queued for hosts the metric never asked for.
+
+    Clamped by the controller to 1..32; the ceiling is GitHub's secondary rate
+    limit, which every controller on the installation shares.
+  EOT
+  type        = number
+  default     = 8
+
+  validation {
+    condition     = var.demand_fetch_concurrency >= 1 && var.demand_fetch_concurrency <= 32 && floor(var.demand_fetch_concurrency) == var.demand_fetch_concurrency
+    error_message = "demand_fetch_concurrency must be a whole number between 1 and 32: 0 would fetch nothing and report demand 0 for ever, and a value above 32 risks GitHub's secondary rate limit, which is shared across every pool controller on the installation."
+  }
+}
+
 variable "queue_base_branch" {
   description = "The branch the merge queue admits. The controller compares every open pull request's base against it and reports one that is green and can never be queued (ci_prs_green_and_unqueued). Never a literal in the controller: a repository whose queue targets something else would otherwise read as entirely parked."
   type        = string

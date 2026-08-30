@@ -365,6 +365,68 @@ variable "demand_budget_seconds" {
   # beside the identity-split check that hit the same boundary.
 }
 
+variable "demand_fetch_concurrency" {
+  description = <<-EOT
+    How many of the per-run job lists the demand sweep fetches AT ONCE.
+
+    `demand_budget_seconds` bounds how long a tick may spend counting demand;
+    this bounds how much it gets done in that time. The sweep costs one API call
+    per unfinished run and used to spend them one at a time, so the runs a tick
+    could examine was the budget divided by one round trip to api.github.com —
+    on a busy repository, far fewer runs than the repository has.
+
+    That shortfall is invisible from the outside. Measured on ci-runner-host-iit
+    on 2026-08-30 with 21 of 21 runners busy, `ci_demand_runs_skipped` sat
+    between 6 and 24 on every tick of a two-hour window while `ci_demand`
+    reported 5-13: the autoscaler was sizing the pool against roughly half its
+    real demand, recommending 4 hosts for a pool with every slot occupied, and
+    PR jobs queued 3-12 minutes for a host the metric never asked for. Demand
+    was a number, it was non-zero, and the pool was the size that number implied.
+
+    The ceiling is GitHub's secondary rate limit rather than the machine —
+    the documented guidance is no more than 100 concurrent REST requests per
+    installation, shared by every pool controller in the fleet — so the
+    controller clamps this to 1..32 and falls back to the default rather than
+    refusing to boot over a tuning knob.
+  EOT
+  type        = number
+  default     = 8
+
+  validation {
+    condition     = var.demand_fetch_concurrency >= 1 && var.demand_fetch_concurrency <= 32 && floor(var.demand_fetch_concurrency) == var.demand_fetch_concurrency
+    error_message = "demand_fetch_concurrency must be a whole number between 1 and 32: 0 would fetch nothing and report demand 0 for ever, and a value above 32 risks GitHub's secondary rate limit, which is shared across every pool controller on the installation."
+  }
+}
+
+variable "autoscaler_headroom_slots" {
+  description = <<-EOT
+    Slots per host the autoscaler pretends do not exist, so the pool grows as it
+    approaches full instead of after it is already starved.
+
+    `single_instance_assignment` tells the autoscaler how many jobs one host
+    serves. Set to the true `slots_per_host` it is a zero-headroom target: the
+    pool is sized to hold exactly the demand already counted, so a host is only
+    ever added once demand has been queued long enough to be measured — and
+    because a new host takes minutes to boot, image-load and register its
+    agents, the jobs that triggered the scale-out wait the whole of that.
+
+    Subtracting a slot understates each host's capacity, which asks for the next
+    host one slot earlier. It costs at most one extra host per pool at steady
+    state; `mode = ONLY_UP` plus the controller's own idle drain reclaims it.
+
+    0 restores the old zero-headroom behaviour. The effective assignment is
+    floored at 1, so this cannot be set high enough to make the autoscaler
+    believe a host serves no jobs at all.
+  EOT
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.autoscaler_headroom_slots >= 0 && floor(var.autoscaler_headroom_slots) == var.autoscaler_headroom_slots
+    error_message = "autoscaler_headroom_slots must be a whole number of slots, 0 or more."
+  }
+}
+
 variable "warm_schedules" {
   description = <<-EOT
     Optional autoscaler scaling schedules — a warm floor that applies only

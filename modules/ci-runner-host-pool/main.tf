@@ -766,8 +766,15 @@ resource "google_compute_region_autoscaler" "hosts" {
       # the pool is left with a MIG and no scaling policy.
       filter = "resource.type = \"generic_node\" AND metric.labels.repo = \"${local.repo_full}\" AND metric.labels.pool = \"${var.name}\""
 
-      # Demand is counted in JOBS; a host serves `slots_per_host` of them.
-      single_instance_assignment = var.slots_per_host
+      # Demand is counted in JOBS; a host serves `slots_per_host` of them —
+      # MINUS the headroom, so the pool grows as it approaches full rather than
+      # after it is already starved. See `autoscaler_headroom_slots`; 0 restores
+      # the exact-capacity target.
+      #
+      # Floored at 1: headroom at or above slots_per_host would tell the
+      # autoscaler a host serves no jobs, and an assignment of 0 is a division
+      # by zero the API rejects — a pool that then has no scaling policy at all.
+      single_instance_assignment = max(1, var.slots_per_host - var.autoscaler_headroom_slots)
     }
 
     dynamic "scaling_schedules" {
@@ -900,7 +907,9 @@ resource "google_compute_instance_template" "controller" {
     "ci-recycle-max-unavailable" = tostring(var.recycle_max_unavailable)
     "ci-poll-seconds"            = tostring(var.poll_interval_seconds)
     "ci-demand-budget-seconds"   = tostring(var.demand_budget_seconds)
-    "ci-metric-prefix"           = var.metric_prefix
+    # How much of that budget's work fits in it. See demand_fetch_concurrency.
+    "ci-demand-fetch-concurrency" = tostring(var.demand_fetch_concurrency)
+    "ci-metric-prefix"            = var.metric_prefix
     # The queue's branch, so the parking sweep can tell a pull request that will
     # never be admitted from one that is simply waiting its turn.
     "ci-queue-base" = var.queue_base_branch

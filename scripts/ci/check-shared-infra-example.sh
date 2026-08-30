@@ -200,5 +200,39 @@ else
   bad "the example calls .github/workflows/shared-infra-anchor.yml and this repository does not have it — every adopter's anchor job would fail to resolve"
 fi
 
+# EVERY DEGRADE BRANCH PUBLISHES EVERY OUTPUT.
+#
+# The anchor exits from six places, and a caller reads the outputs from a job
+# that has already gone green — so an output a branch forgot is not a failure
+# there, it is the literal string `null` arriving in whatever job consumed it,
+# minutes later, in a matrix expression that cannot be read from the anchor's
+# log. That is why `addr` and `pg` have always been published empty rather than
+# omitted, and it is why `pinned` and `slots` are positional arguments to
+# `publish` rather than optional ones.
+#
+# Positional is not enforcement on its own — bash does not check arity — so this
+# gate counts the arguments statically and moves the discovery to review time.
+ANCHOR="$REPO_ROOT/.github/workflows/shared-infra-anchor.yml"
+calls=0
+short=0
+while IFS= read -r line; do
+  calls=$((calls + 1))
+  # Argument count with every $(…) and "…" collapsed to a single token first,
+  # so a jq program full of spaces counts as the one argument it is.
+  # shellcheck disable=SC2016  # sed programs, matched literally against the anchor's text
+  n=$(printf '%s\n' "$line" \
+    | sed -e 's/\$([^)]*)/A/g' -e 's/"[^"]*"/A/g' -e 's/^[[:space:]]*publish[[:space:]]*//' \
+    | tr -s ' ' '\n' | grep -c '.')
+  [ "$n" -ge 5 ] || short=$((short + 1))
+done < <(grep -E '^[[:space:]]*publish[[:space:]]+' "$ANCHOR")
+
+if [ "$calls" -eq 0 ]; then
+  bad "the anchor publishes its outputs nowhere — either the helper was renamed or this check stopped asserting anything"
+elif [ "$short" -ne 0 ]; then
+  bad "$short of $calls publish() call(s) in the anchor pass fewer than 5 arguments: a degrade branch that omits one hands the caller the literal string 'null' for that output, which fails in the consuming job long after the anchor went green"
+else
+  ok
+fi
+
 printf 'shared-infra example: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
