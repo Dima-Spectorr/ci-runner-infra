@@ -27,12 +27,82 @@ variable "app_key_secret_id" {
   type        = string
 }
 
+variable "create_app_key_secret" {
+  description = <<-EOT
+    Create the App-key secret named by `app_key_secret_id`, rather than pointing
+    at one that another root already owns.
+
+    Leave true for a pool that is the first in its project. Set it false for a
+    SECOND identity in a project whose key already exists, where creating one
+    would mean a second empty secret — and, because the secret carries
+    `prevent_destroy`, one Terraform can never take back.
+
+    The case it exists for is a Windows pool. A Windows host account is stripped
+    of the App-key read (`host_os`), and a Windows pool requires the CONTROLLER
+    to mint registration tokens, so nothing the identity creates ever reads the
+    key: the secret would be created empty, never given a version, never read,
+    and never removable. False makes the identity point at the key the project's
+    existing pool already has, which is also the key the shared controller
+    already reads.
+
+    Set it false and the grants this module writes land on a secret it does not
+    manage. That is the intent — but nothing here can check the secret exists,
+    so a typo in `app_key_secret_id` is a 404 at apply time on a plan that read
+    clean, not a plan-time error.
+
+    Choose it when the pool is created. Flipping true -> false on a pool that
+    has already applied asks Terraform to stop managing a `prevent_destroy`
+    resource, which it plans as a destroy and then REFUSES — the apply stops,
+    naming a lifecycle rule, and stays stopped until someone removes the secret
+    from state by hand. That refusal is the protection working, not a bug: the
+    alternative is deleting the one copy of a key that exists in no state file,
+    no repository and no backup.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "controller_service_account_email" {
+  description = <<-EOT
+    Reuse an EXISTING controller account instead of creating one. Empty (the
+    default) creates this pool's own, which is right for the first pool in a
+    project.
+
+    The case it exists for is the same as `create_app_key_secret`'s: a second
+    pool in a project that already has a controller. A shared controller is one
+    VM running as one account, so the second pool must hand
+    `ci-runner-host-pool` that same account — with its own, the controller has
+    no rights in the second pool's MIG and can never delete a host there. That
+    failure is silent: the pool scales out under `ONLY_UP` and never back, which
+    is indistinguishable on every chart from a pool that is simply always busy.
+
+    Set it and this module creates NOTHING for the controller — not the account,
+    and not one of its grants. Every controller grant here is either
+    project-level (metrics, logs, instance-admin, IAP) or on the one App-key
+    secret, so the first identity's copies already cover this pool. Writing them
+    again would put two Terraform resources on one identical binding, and
+    removing either would revoke it for both.
+
+    Pass the FIRST identity's `controller_service_account_email` output. Passing
+    this pool's own host account is refused at plan time; passing an account
+    that does not exist is not, because nothing here can look one up — that is a
+    controller which never scales the pool in, on a plan that read clean.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "grant_compute_admin" {
   description = <<-EOT
     Grant roles/compute.instanceAdmin.v1 so the controller can delete hosts —
     the pool's only scale-in path. Set false only when a narrower custom role
     is bound to this account elsewhere; with neither, the pool scales out and
     never back down.
+
+    Ignored when `controller_service_account_email` reuses an existing account:
+    that account already holds the role from the identity that created it, and
+    the role is project-level, so a second binding here would add nothing while
+    making either root's removal revoke it for both.
   EOT
   type        = bool
   default     = true

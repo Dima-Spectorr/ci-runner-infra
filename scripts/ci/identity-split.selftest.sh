@@ -192,7 +192,8 @@ moved_pair() { # <address> -> yes|no
 for addr in \
   'google_secret_manager_secret_iam_member.runner_reads_key' \
   'google_project_iam_member.metrics' \
-  'google_project_iam_member.logs'; do
+  'google_project_iam_member.logs' \
+  'google_secret_manager_secret.app_key'; do
   if matches "$(moved_pair "$addr")" '^yes$'; then
     ok "state move declared for $addr"
   else
@@ -204,7 +205,12 @@ done
 #     account. Collapsed onto the host account, the App-key read and
 #     instance-admin are back on the machine that runs pull-request code, and
 #     every check above still passes.
-if matches "$(block 'resource "google_service_account" "runner"' "$IDENTITY/main.tf")" 'var\.host_os != "windows" \|\| var\.create_controller_service_account'; then
+#
+#     TWO ways to have a separate one now — create it, or name one a shared
+#     controller already runs as — so the condition names both legs. Matching
+#     only the first would keep passing if the second were dropped, which is the
+#     leg a Windows pool in a project that already has a controller takes.
+if matches "$(block 'resource "google_service_account" "runner"' "$IDENTITY/main.tf")" 'var\.host_os != "windows" \|\| var\.create_controller_service_account \|\| var\.controller_service_account_email != ""'; then
   ok "a windows pool is refused without the controller split"
 else
   bad "nothing stops host_os = windows with create_controller_service_account = false, which hands the App key straight back to job code"
@@ -237,6 +243,68 @@ if matches "$(grep -c 'merge(local.controller_registration_metadata, {' "$POOL/m
   ok "and it is merged into the controller's metadata"
 else
   bad "local.controller_registration_metadata is not merged into the controller metadata — the key is defined and never rendered"
+fi
+
+# 16. A second identity in a project — which is what a Windows pool alongside a
+#     Linux one is — may point at the App key that already exists instead of
+#     creating a second, empty one. The default has to stay TRUE: false on a
+#     first pool means the grants land on a secret nobody created, which is a
+#     404 at apply time on a plan that read clean.
+if matches "$(block '^variable "create_app_key_secret"' "$IDENTITY/variables.tf")" '^  default     = true'; then
+  ok "create_app_key_secret is opt-out, so a first pool still creates its key"
+else
+  bad "create_app_key_secret is missing or does not default to true — an existing pool would stop managing the secret its hosts read"
+fi
+
+# 17. And both grants and the output must read the LOCAL, not the resource.
+#     Reading `google_secret_manager_secret.app_key[0].…` anywhere else is an
+#     index into a zero-length list the moment a consumer opts out: the module
+#     stops planning at all, for every caller, with an error about the resource
+#     rather than about the flag. Asserting the local is defined is not enough —
+#     the failure is in what still reads around it.
+if matches "$(block '^locals \{' "$IDENTITY/main.tf")" 'app_key_secret_id = var\.create_app_key_secret \? google_secret_manager_secret\.app_key\[0\]' &&
+  matches "$(awk '/^moved \{/ { inb=1 } !inb { print } inb && /^\}/ { inb=0 }' "$IDENTITY/main.tf" |
+    grep -c 'google_secret_manager_secret\.app_key\[0\]')" '^1$' &&
+  ! matches "$(cat "$IDENTITY/outputs.tf")" 'google_secret_manager_secret\.app_key'; then
+  ok "the secret id is read through one local, so opting out plans cleanly"
+else
+  bad "something still reads google_secret_manager_secret.app_key directly — with create_app_key_secret = false that is an index into an empty list, and the module stops planning"
+fi
+
+# 18. The same second pool reuses the project's CONTROLLER account rather than
+#     minting a second one. Every controller resource must therefore be counted
+#     by the one local — a resource left on the raw
+#     `var.create_controller_service_account` still creates an unused, fully
+#     privileged identity (App-key read, metrics, logs) beside the shared one,
+#     which is exactly what this module's header forbids adding for convenience.
+ctl_raw="$(grep -c 'count = var\.create_controller_service_account ? 1 : 0' "$IDENTITY/main.tf" || true)"
+if matches "$(block '^locals \{' "$IDENTITY/main.tf")" 'controller_grants = var\.controller_service_account_email == "" && var\.create_controller_service_account' &&
+  matches "$ctl_raw" '^0$' &&
+  matches "$(grep -c 'count = local\.controller_grants' "$IDENTITY/main.tf")" '^4$'; then
+  ok "every controller resource is counted by one local, so reuse creates none of them"
+else
+  bad "a controller resource is still counted on var.create_controller_service_account — with controller_service_account_email set that mints a second privileged identity beside the shared one, or double-writes a binding either root's removal revokes"
+fi
+
+# 19. And the project-level grants must drop out on the reuse path too. These
+#     are `google_project_iam_member`, so a second resource holding the SAME
+#     project+role+member as the first identity's is not additive in any useful
+#     sense: it plans clean, applies clean, and then removing EITHER root
+#     revokes instance-admin from the account that deletes hosts in both pools.
+if matches "$(grep -c 'count   = var\.grant_compute_admin && var\.controller_service_account_email == "" ? 1 : 0' "$IDENTITY/main.tf")" '^2$' &&
+  matches "$(grep -c 'count   = var\.grant_compute_admin ? 1 : 0' "$IDENTITY/main.tf" || true)" '^0$'; then
+  ok "instance-admin and IAP are not re-granted to a controller account this module did not create"
+else
+  bad "grant_compute_admin still writes project IAM on the reuse path — two resources on one binding, and either root's removal takes scale-in away from both pools"
+fi
+
+# 20. Reuse must not be reachable to the ONE account it exists to keep separate.
+#     The email is an input this module cannot resolve, so the host account
+#     cannot be recognised by identity — only by name, which is derived here.
+if matches "$(cat "$IDENTITY/main.tf")" 'var\.controller_service_account_email != "\$\{var\.account_id\}@\$\{var\.project_id\}\.iam\.gserviceaccount\.com"'; then
+  ok "passing this pool's own host account as the controller is refused at plan time"
+else
+  bad "nothing refuses controller_service_account_email = this pool's host account — that is the collapse create_controller_service_account rejects, reached by a route with no check on it"
 fi
 
 if [ "$fail" -eq 0 ]; then
