@@ -48,11 +48,15 @@
 #
 # WHAT THE CONSUMER MUST PROVIDE
 #
-# A GitHub App with `Contents: write`, `Pull requests: write`, `Checks: read`,
-# `Commit statuses: read`, `Actions: read`, `Metadata: read`, installed on the
+# A GitHub App with `Contents: write`, `Pull requests: write`, `Workflows:
+# write`, `Checks: read`, `Commit statuses: read`, `Actions: read`,
+# `Metadata: read`, installed on the
 # repository — `Commit statuses` because a required context may be a legacy
 # status rather than a check-run, and a 403 there is a surface the lane cannot
-# see rather than a surface with nothing on it — plus
+# see rather than a surface with nothing on it; `Workflows` because GitHub
+# refuses an App token that writes under `.github/workflows/` whatever
+# `Contents` says, and a squash merge counts as writing them, so without it
+# every workflow pull request is refused on every pass — plus
 # `Issues: write` if and only if `status-issue` is set, which GitHub treats as a
 # separate permission from `Pull requests: write` even though a pull request is
 # an issue. Without it the lane warns and keeps merging. This is
