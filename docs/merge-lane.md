@@ -187,10 +187,12 @@ on:
     types: [completed]
   schedule:
     - cron: '*/15 * * * *'   # the backstop — see below
-  # Only if you gate on a label (`MERGE_LANE_REQUIRE_LABEL`). Labelling is the
-  # last thing to happen on a pull request whose CI is already green, and
-  # nothing else dispatches the lane for it. See "A label applied after the
-  # green", below.
+  # `labeled` matters only if you re-narrow with `require-label`, which the
+  # fleet default no longer does. Under a label gate, labelling is the last
+  # thing to happen on a pull request whose CI is already green, and nothing
+  # else dispatches the lane for it. See "A label applied after the green",
+  # below. `ready_for_review` is worth keeping either way: leaving draft is
+  # also a state change no CI completion follows.
   pull_request_target:
     types: [labeled, ready_for_review]
   workflow_dispatch:
@@ -243,19 +245,43 @@ jobs:
       # request may sit in flight. It must expire before the job's
       # `timeout-minutes` does — see "What a pass costs".
       pass-budget-seconds: 600
-      # OPT-IN FOR THE FIRST ARMED WEEK. An armed lane merges every open pull
-      # request that is green, and a repository migrating off Mergify is holding
-      # a backlog of exactly those — arming wide open merges months of stale work
-      # in one pass.
+      # EMPTY IS THE FLEET DEFAULT, since 2026-08-30. Every open, non-draft,
+      # unconflicted pull request on the base is a candidate — the behaviour
+      # Mergify's `auto_merge_conditions` had, and the standard this fleet
+      # migrated onto: auto-merge on green, no required human approval.
       #
-      # THE FALLBACK IS THE LABEL, NOT EMPTY. `${{ vars.X }}` renders as an empty
-      # string when the variable is unset, mistyped, or cleared later, and empty
-      # means "no label required" — so wiring it bare fails OPEN, and a forgotten
-      # setting releases the backlog. Widening is a pull request, deliberately.
-      require-label: ${{ vars.MERGE_LANE_REQUIRE_LABEL || 'ready-to-merge' }}
-      # Optional, and the one exception to that label. Dependabot's weekly bump
-      # of the pins above is the update nobody is ever going to label by hand in
-      # fourteen repositories — see "Tracking this repository automatically".
+      # It used to be a label gate, and that was a MIGRATION guard rather than
+      # the end state: a repository arming the lane while still holding a
+      # Mergify-era backlog would have merged months of stale work in one pass.
+      # Once the backlog is walked, the guard is the only thing left stopping
+      # merges.
+      #
+      # It was removed because a label nobody applies does not make merging
+      # careful, it makes it manual — and it fails in the direction that looks
+      # healthy. Measured across the fleet on 2026-08-30: pull requests sat
+      # green and `clean` for hours while every pass logged `skip:no-label` and
+      # ended SUCCESS. A pass that skipped your pull request is indistinguishable
+      # from one that took it unless you read the log.
+      #
+      # IF YOU RE-NARROW IT, THE FALLBACK IS THE LABEL, NOT EMPTY — copy this
+      # line exactly, and never the bare variable:
+      #
+      #   require-label: ${{ vars.MERGE_LANE_REQUIRE_LABEL || 'ready-to-merge' }}
+      #
+      # `${{ vars.X }}` on its own renders as an empty string when the variable
+      # is unset, mistyped, or cleared later by someone tidying settings, and
+      # empty means "no label required" — so the bare form fails OPEN and a
+      # forgotten setting releases the backlog. With the `|| 'literal'` fallback,
+      # widening stays a pull request. That is why THIS file widened by editing
+      # the line rather than by clearing the variable.
+      #
+      # Narrowing does not make the lane a review gate either way: required
+      # checks, base health and `review-bots` are what decide.
+      require-label: ''
+      # Optional, and a no-op unless you re-narrow with a label. Dependabot's
+      # weekly bump of the pins above is the update nobody is ever going to
+      # label by hand in fourteen repositories — see "Tracking this repository
+      # automatically".
       # Waives the LABEL only, and only for a diff in which every changed line
       # names a ci-runner-infra reusable workflow.
       pin-bump-actor: ${{ vars.MERGE_LANE_PIN_BUMP_ACTOR }}
@@ -306,6 +332,10 @@ jobs:
 > are migrating an older caller, **delete the `implementation-ref` line**.
 >
 > ### Tracking this repository automatically
+>
+> **Only applies under a label gate.** The fleet default is `require-label: ''`,
+> where the pin bump is a candidate like any other pull request and none of the
+> below is needed.
 >
 > A label gate and "every repository picks up the shared workflows on its own"
 > are in direct conflict, and the conflict is silent. Dependabot opens the pin
@@ -460,13 +490,18 @@ can walk is busy, not broken, and the next CI completion or cron tick starts a
 fresh walk.
 
 If you see that warning regularly, the answers in order are: narrow the
-candidate set with `require-label`, close what is stale, or raise
+candidate set with `require-label` (which reintroduces "A label applied after
+the green", below), close what is stale, or raise
 `pass-budget-seconds` **together with** the job's `timeout-minutes`. The
 self-test refuses a budget that does not leave the lane two minutes to publish
 its summary inside the ceiling — a run that merges and then reports nothing
 about it is worse than one that merges nothing.
 
 ### A label applied after the green
+
+**Only applies under a label gate**, which the fleet default no longer is — see
+`require-label` in the caller above. Kept because re-narrowing a single
+repository is legitimate, and this is the failure it brings back.
 
 The two triggers above answer *CI finished* and *time passed*. Neither answers
 **a human labelled it**, and under `MERGE_LANE_REQUIRE_LABEL` that is the event
