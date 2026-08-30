@@ -104,14 +104,25 @@ function Write-WrapperLine([string] $Message) {
 # file that gates the rest of the script. Test-Path still returned true (it needs
 # only traverse on the parent), which is why it read as a missing-file or
 # slow-boot problem for hours.
+#
+# The decision is its own function, mirroring Get-AclInheritanceFlag in the boot
+# script, so that it can be TESTED. Everything else in Protect-Path is
+# Windows-only -- SecurityIdentifier throws PlatformNotSupportedException the
+# moment it is constructed -- and this suite runs pwsh on Linux, so the function
+# as a whole cannot be executed by a test at all. This part is a pure enum
+# choice, it runs anywhere, and it is the part that was wrong.
+function Get-AclInheritanceFlag([bool] $IsContainer) {
+    if ($IsContainer) {
+        return [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    }
+    return [System.Security.AccessControl.InheritanceFlags]::None
+}
+
 function Protect-Path([string] $Path) {
     $acl = Get-Acl -LiteralPath $Path
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRule($rule) | Out-Null }
-    $inherit = [System.Security.AccessControl.InheritanceFlags]::None
-    if ((Get-Item -LiteralPath $Path).PSIsContainer) {
-        $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-    }
+    $inherit = Get-AclInheritanceFlag -IsContainer ((Get-Item -LiteralPath $Path).PSIsContainer)
     foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
         $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
                     [System.Security.Principal.SecurityIdentifier]::new($sid),

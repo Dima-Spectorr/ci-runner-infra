@@ -1,4 +1,4 @@
-# Pester tests for the Windows host boot script's PURE functions.
+﻿# Pester tests for the Windows host boot script's PURE functions.
 #
 # The companion file is windows-beacon.Tests.ps1 and its header applies here
 # too: a gate that READS code is not a test, so the decidable half of the boot
@@ -982,9 +982,23 @@ Describe 'acl inheritance flags' {
 # DACL denies everyone, SYSTEM included. Phase 0 could no longer read
 # image-version.txt, half a second later and on every boot thereafter.
 #
-# The wrapper is a Terraform template (it carries a ${gz} placeholder), so it
-# cannot be dot-sourced. The function is lifted out and RUN against a fake ACL
-# instead: what is asserted is the flags it actually passes, not the text.
+# HOW THIS IS TESTED, AND WHY IT IS SPLIT IN TWO
+#
+# Protect-Path as a whole cannot be run here. It constructs a SecurityIdentifier,
+# which throws PlatformNotSupportedException the moment it is touched -- this
+# suite runs pwsh on LINUX, where Windows principals do not exist. The wrapper is
+# also a Terraform template (it carries a ${gz} placeholder), so it cannot be
+# dot-sourced either.
+#
+# So the decision that was wrong -- and only that -- was pulled out into
+# Get-AclInheritanceFlag, exactly as the boot script already does. It is a pure
+# enum choice, it runs anywhere, and it is lifted out and EXECUTED below.
+#
+# What cannot be executed is asserted structurally instead, on the parsed AST
+# rather than on a text match: that Protect-Path asks that function for the flag
+# instead of hardcoding one, and that it hands it the container-ness of the path.
+# That pairing is what makes the executable half meaningful -- a correct decision
+# function the caller ignores would be worth nothing.
 Describe 'boot wrapper path hardening' {
     BeforeAll {
         $wrapperPath = Join-Path $PSScriptRoot '../../modules/ci-runner-host-pool/scripts/windows-boot-wrapper.ps1'
@@ -992,101 +1006,88 @@ Describe 'boot wrapper path hardening' {
             throw "the boot wrapper is not at $wrapperPath"
         }
         $wrapperText = Get-Content -Raw -LiteralPath $wrapperPath
-        $match = [regex]::Match($wrapperText, '(?ms)^function Protect-Path.*?^\}')
-        if (-not $match.Success) {
-            throw 'Protect-Path is no longer a top-level function in windows-boot-wrapper.ps1'
+
+        # The template cannot be dot-sourced, so both functions are lifted out of
+        # it by parsing the file. Parsing rather than regex: a brace inside a
+        # string or a comment ends a regex match in the wrong place, silently, and
+        # what comes back still looks like a function.
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $wrapperText, [ref] $null, [ref] $parseErrors)
+
+        $functions = @{}
+        foreach ($f in $ast.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            $functions[$f.Name] = $f
         }
-        $script:ProtectPathSource = $match.Value
 
-        # Defined in here, not in the Describe body. The body runs at DISCOVERY
-        # and the It blocks run afterwards in a different scope, so a helper
-        # declared out there is gone by the time a test calls it --
-        # CommandNotFoundException on every case, which reads like four bugs and
-        # is one scoping mistake. It goes in THIS BeforeAll rather than a second
-        # one: a block may only have one, and Pester fails discovery for the
-        # whole FILE if it finds two, taking 200-odd unrelated tests with it.
-
-        # Returns the fake ACL that Protect-Path was handed, with the rules it added.
-        function Invoke-ProtectPath {
-            param([bool] $IsContainer, [string] $Source)
-
-            # NOT named $acl. The stubs below are called from INSIDE Protect-Path,
-            # which has its own $acl local, and a scriptblock function body resolves
-            # variables up the CALLER's scope chain -- so a stub saying `$acl` would
-            # hand back the callee's own half-assigned variable instead of this one.
-            # For the same reason .GetNewClosure() is wrong here: it snapshots the
-            # scope it is created in, which is not the one holding these.
-            $fake = New-Object psobject
-            $fake | Add-Member -MemberType NoteProperty -Name Access -Value @()
-            $fake | Add-Member -MemberType NoteProperty -Name Protection -Value $null
-            $fake | Add-Member -MemberType NoteProperty -Name Rules -Value ([System.Collections.ArrayList]::new())
-            $fake | Add-Member -MemberType NoteProperty -Name Saved -Value $false
-            $fake | Add-Member -MemberType ScriptMethod -Name SetAccessRuleProtection -Value {
-                $this.Protection = @($args[0], $args[1])
+        foreach ($required in @('Get-AclInheritanceFlag', 'Protect-Path')) {
+            if (-not $functions.ContainsKey($required)) {
+                throw "$required is no longer a function in windows-boot-wrapper.ps1"
             }
-            $fake | Add-Member -MemberType ScriptMethod -Name RemoveAccessRule -Value { $true }
-            $fake | Add-Member -MemberType ScriptMethod -Name AddAccessRule -Value {
-                $null = $this.Rules.Add($args[0])
-            }
-            $fakeItem = [pscustomobject]@{ PSIsContainer = $IsContainer }
-
-            # Compiled out here rather than inline below: PSReviewUnusedParameter
-            # does not look inside a nested scriptblock, so a $Source referenced
-            # only in there reads to the analyzer as a parameter nobody used.
-            $definition = [scriptblock]::Create($Source)
-
-            # Get-Acl and Set-Acl are Windows-only and do not exist at all on the
-            # runner this suite runs on, so these are stand-ins rather than
-            # overrides -- but a literal `function Get-Acl` still trips
-            # PSAvoidOverwritingBuiltInCmdlets, so they go in through the function:
-            # provider. Scoped to this scriptblock, which is also where Protect-Path
-            # is defined, so nothing outside this call sees them.
-            & {
-                $null = New-Item -Path 'function:Get-Acl' -Value { $fake }
-                $null = New-Item -Path 'function:Set-Acl' -Value { $fake.Saved = $true }
-                $null = New-Item -Path 'function:Get-Item' -Value { $fakeItem }
-
-                . $definition
-                Protect-Path 'the-path'
-            }
-
-            $fake
         }
+
+        $script:ProtectPathAst = $functions['Protect-Path']
+
+        # The pure half, made callable. Only the enum decision runs here; nothing
+        # in it touches a Windows principal, so it is safe on this runner.
+        . ([scriptblock]::Create($functions['Get-AclInheritanceFlag'].Extent.Text))
     }
 
-    It 'makes the directory grants inheritable, or every child loses all access' {
-        $acl = Invoke-ProtectPath -IsContainer $true -Source $script:ProtectPathSource
+    # THE EXECUTABLE HALF -- the decision that was actually wrong.
 
-        $acl.Rules.Count | Should -Be 2
-        foreach ($rule in $acl.Rules) {
-            $rule.InheritanceFlags.HasFlag(
-                [System.Security.AccessControl.InheritanceFlags]::ContainerInherit) | Should -BeTrue
-            $rule.InheritanceFlags.HasFlag(
-                [System.Security.AccessControl.InheritanceFlags]::ObjectInherit) | Should -BeTrue
-        }
+    It 'makes a directory grant inheritable, or every child loses all access' {
+        $flags = Get-AclInheritanceFlag -IsContainer $true
+
+        $flags.HasFlag(
+            [System.Security.AccessControl.InheritanceFlags]::ContainerInherit) | Should -BeTrue
+        $flags.HasFlag(
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit) | Should -BeTrue
     }
 
     It 'gives the unpacked script no flags, because .NET rejects any on a file' {
-        $acl = Invoke-ProtectPath -IsContainer $false -Source $script:ProtectPathSource
-
-        $acl.Rules.Count | Should -Be 2
-        foreach ($rule in $acl.Rules) {
-            $rule.InheritanceFlags | Should -Be ([System.Security.AccessControl.InheritanceFlags]::None)
-        }
+        Get-AclInheritanceFlag -IsContainer $false |
+            Should -Be ([System.Security.AccessControl.InheritanceFlags]::None)
     }
 
-    It 'still protects the path and does not copy the inherited ACEs it just dropped' {
-        $acl = Invoke-ProtectPath -IsContainer $true -Source $script:ProtectPathSource
+    # THE STRUCTURAL HALF -- that the caller actually uses the decision. A correct
+    # Get-AclInheritanceFlag that Protect-Path ignores would be worth nothing, and
+    # ignoring it is precisely the bug that bricked the fleet.
 
-        $acl.Protection | Should -Be @($true, $false)
-        $acl.Saved | Should -BeTrue
+    It 'asks for the flag instead of hardcoding one' {
+        $calls = $script:ProtectPathAst.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)
+        $names = $calls | ForEach-Object { $_.GetCommandName() }
+
+        $names | Should -Contain 'Get-AclInheritanceFlag'
+    }
+
+    It 'never names an InheritanceFlags value directly, which is how ::None got hardcoded for both' {
+        $literals = $script:ProtectPathAst.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.TypeExpressionAst] -or
+              $args[0] -is [System.Management.Automation.Language.ConvertExpressionAst] }, $true)
+
+        ($literals | Where-Object { "$_" -match 'InheritanceFlags' }) | Should -BeNullOrEmpty
+    }
+
+    It 'decides from the container-ness of the path it was given' {
+        $text = $script:ProtectPathAst.Extent.Text
+
+        $text | Should -Match 'PSIsContainer'
+        $text | Should -Match 'Get-AclInheritanceFlag[^\r\n]*PSIsContainer'
+    }
+
+    It 'still protects the path without copying the inherited ACEs it just dropped' {
+        $script:ProtectPathAst.Extent.Text |
+            Should -Match 'SetAccessRuleProtection\(\$true,\s*\$false\)'
     }
 
     It 'grants exactly SYSTEM and Administrators, by SID' {
-        $acl = Invoke-ProtectPath -IsContainer $true -Source $script:ProtectPathSource
+        $strings = $script:ProtectPathAst.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true)
+        $sids = $strings | ForEach-Object { $_.Value } | Where-Object { $_ -match '^S-1-' } | Sort-Object
 
-        ($acl.Rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object) |
-            Should -Be @('S-1-5-18', 'S-1-5-32-544')
+        $sids | Should -Be @('S-1-5-18', 'S-1-5-32-544')
     }
 }
 
