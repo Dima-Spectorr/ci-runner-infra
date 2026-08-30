@@ -424,9 +424,37 @@ already_released() {
 # Costs two API reads, and only ever for a pull request the lane has already
 # decided to merge — a handful per pass, not one per open pull request.
 #
+# AND A THIRD SURFACE: A REVIEWER THAT SAID IT COULD NOT REVIEW.
+#
+# A reviewer is a third party and it can be UNAVAILABLE — rate-limited, out of
+# credits, or refusing the requester outright. When that happens it publishes no
+# review and no comment, so the two surfaces above are silent in exactly the way
+# "still reading" is silent, and the lane holds the pull request for the whole
+# grace before merging with a warning that says nobody answered.
+#
+# It is not silent everywhere, though. Copilot posts its own check run against
+# the head sha and CONCLUDES IT — measured 2026-08-30, `copilot-pull-request-
+# reviewer` came back `failure` with an HTTP 429 and a reset seven hours out,
+# on every pull request in the fleet at once. That conclusion is an answer: the
+# reviewer looked at this commit and reported that it cannot review it. Waiting
+# out a grace for a reviewer that has already said so buys nothing, and doing it
+# on every pull request in seventeen repositories for seven hours buys nothing
+# seventeen times over.
+#
+# The check run is matched by NAME against the login without its `[bot]` suffix,
+# which is the mapping GitHub uses for a reviewer App. Only a NON-green
+# conclusion counts. A green one means the reviewer ran and had something to
+# say, and what it said will arrive on one of the two surfaces above — counting
+# it here would merge ahead of the review the gate exists to wait for.
+#
 # Unreadable reads as -1, never as 0. "The lane could not look" and "nobody has
 # answered" are different facts, and `lane_review_gate` merges on the first
 # rather than holding a green pull request over a rate limit.
+#
+# Prints TWO numbers: `<answered> <unavailable>`, where `unavailable` is the
+# subset of `answered` that answered by being unable to answer. The caller needs
+# both because they merge for the same reason and mean opposite things to an
+# operator.
 # ---------------------------------------------------------------------------
 review_answered() {
   # `short` is deliberately a SECOND `local`. Assignments within one `local`
@@ -435,20 +463,30 @@ review_answered() {
   # enclosing scope — empty, here, which makes the comment surface match every
   # comment ever written and every pull request look reviewed. shellcheck calls
   # it SC2318 and it is the reason this is two lines.
-  local num="$1" sha="$2" bot n=0
+  local num="$1" sha="$2" bot n=0 u=0
   local short="${sha:0:7}"
-  local reviews comments
+  local reviews comments declined
 
   if ! reviews="$(gh api --paginate "repos/$R/pulls/$num/reviews?per_page=100" \
     --jq '.[] | [.user.login, .commit_id] | @tsv' 2>/dev/null)"; then
-    echo -1
+    echo "-1 0"
     return 0
   fi
   if ! comments="$(gh api --paginate "repos/$R/issues/$num/comments?per_page=100" \
     --jq '.[] | [.user.login, (.body | gsub("[\n\r]"; " "))] | @tsv' 2>/dev/null)"; then
-    echo -1
+    echo "-1 0"
     return 0
   fi
+
+  # The third surface is ADDITIVE, so an unreadable one is not fatal the way the
+  # two above are: it leaves this empty and the gate falls back to the grace,
+  # which is the behaviour that existed before it. `|| true` rather than a
+  # branch, for that reason.
+  declined="$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" \
+    --jq '.check_runs[]
+          | select(.status == "completed")
+          | select(.conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")
+          | .name' 2>/dev/null || true)"
 
   for bot in "${REVIEW_BOTS[@]}"; do
     if printf '%s\n' "$reviews" | grep -cF -- "$bot	$sha" >/dev/null; then
@@ -458,10 +496,18 @@ review_answered() {
     if printf '%s\n' "$comments" | awk -F'\t' -v b="$bot" '$1 == b' \
       | grep -cF -- "$short" >/dev/null; then
       n=$((n + 1))
+      continue
+    fi
+    # Anchored whole-line (`-x`): a reviewer App's check run is named for the
+    # App, and a substring match would let an unrelated red check named after it
+    # discharge the gate.
+    if printf '%s\n' "$declined" | grep -cxF -- "${bot%\[bot\]}" >/dev/null; then
+      n=$((n + 1))
+      u=$((u + 1))
     fi
   done
 
-  echo "$n"
+  echo "$n $u"
 }
 
 # ---------------------------------------------------------------------------
@@ -1218,10 +1264,25 @@ one_pass() {
     # an event.
     local unreviewed=''
     if [ "${#REVIEW_BOTS[@]}" -gt 0 ] && [ "${verdict%%:*}" = "merge" ]; then
-      local answered review_age review_verdict
-      answered="$(review_answered "$num" "$sha")"
+      local answered unavailable review_age review_verdict
+      # `|| true`: under `set -e` a `read` that finds nothing would abort the
+      # whole pass. It cannot here — `review_answered` always prints two fields
+      # — and a lane that stops merging over a defensive read is a worse failure
+      # than the one being defended against.
+      read -r answered unavailable <<<"$(review_answered "$num" "$sha")" || true
       review_age="$(review_clock "$sha")"
-      review_verdict="$(lane_review_gate "${#REVIEW_BOTS[@]}" "$answered" "$review_age" "$REVIEW_GRACE")"
+      review_verdict="$(lane_review_gate "${#REVIEW_BOTS[@]}" "$answered" "$review_age" "$REVIEW_GRACE" "$unavailable")"
+      # A NOTICE, NOT A WARNING, AND SAID HERE RATHER THAN AT THE MERGE.
+      #
+      # An unavailable reviewer is not an unreviewed merge — the pull request may
+      # still be reviewed by everyone else on the list, and it merges on the
+      # normal path with the normal verdict. But it IS the fact that explains a
+      # red check nobody can turn green, so it belongs in the log next to the
+      # pull request it applies to. `::warning::` is reserved for the merge that
+      # actually went out unreviewed; spending it here would blunt that one.
+      if [ "${unavailable:-0}" -gt 0 ]; then
+        echo "lane: #$num — ${unavailable} of ${#REVIEW_BOTS[@]} reviewer(s) answered for ${sha:0:8} by reporting they could not review it (a failed check run of their own; rate limit or credits are the usual cause). Not waiting out the grace for a reviewer that has already said no."
+      fi
       case "$review_verdict" in
         review:hold*)
           verdict="wait:review ${review_verdict#review:hold }"

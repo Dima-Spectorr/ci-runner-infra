@@ -293,6 +293,28 @@ review "review:unreviewed" "a garbled grace is a typo, not an unbounded hold" 2 
 # A grace of 0 is the documented way to arm the trigger and none of the wait.
 review "review:unreviewed" "a grace of 0 never holds" 2 0 0 0
 
+# A REVIEWER THAT ANSWERED BY DECLINING. It counts toward `answered` — that is
+# the caller's job, not the gate's — and the gate's only duty is to say so, so
+# that "reviewed" and "nobody could review" do not read identically in a log.
+# The distinction is the whole point: the merge is the same either way, and one
+# of them is a fleet-wide outage of the reviewer.
+review "review:answered answered=2 expected=2 unavailable=1" \
+  "one reviewer answered and one declined; the verdict names the decline" 2 2 10 900 1
+review "review:answered answered=2 expected=2 unavailable=2" \
+  "both reviewers declined, so nothing waits on either" 2 2 10 900 2
+# Silent when there is nothing to report, so the common line does not grow a
+# `unavailable=0` that an operator has to learn to ignore.
+review "review:answered answered=2 expected=2" \
+  "a normal review says nothing about availability" 2 2 10 900 0
+review "review:answered answered=2 expected=2" \
+  "the argument is optional, and its absence is not a decline" 2 2 10 900
+# Malformed input follows this file's rule: it changes no decision, and it does
+# not get to put a number into a verdict line.
+review "review:answered answered=2 expected=2" \
+  "a garbled count is dropped rather than printed as fact" 2 2 10 900 some
+# It rides through `answered`, so it can never by itself release a hold.
+review "review:hold" "a decline the caller did not count still holds" 2 1 10 900 0
+
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane-decision: $FAIL failed, $PASS passed"
   exit 1

@@ -380,15 +380,21 @@ lane_pass_expired() {
 # lane_review_gate — may a green pull request merge before the automated
 # reviewers have said anything about the code that is about to land?
 #
-#   lane_review_gate <expected> <answered> <age> <grace>
+#   lane_review_gate <expected> <answered> <age> <grace> [unavailable]
 #
 # expected   how many reviewer identities this repository waits for, from
 #            configuration. 0 means the gate is not armed.
 # answered   how many of them have published something ABOUT THE HEAD SHA.
+#            Includes `unavailable`: reporting that you cannot review is an
+#            answer, and it is the one answer that will never change on its own.
 # age        seconds since the review could have started — the moment the last
 #            required check finished, not the moment the branch was pushed.
 #            "" when the caller could not read it.
 # grace      seconds to wait before merging unreviewed anyway.
+# unavailable how many of `answered` answered by declining — optional, defaults
+#            to 0, and it changes no decision. It rides through so the verdict
+#            line distinguishes "reviewed" from "nobody could review", which are
+#            the same merge and completely different operationally.
 #
 # WHY THIS EXISTS
 #
@@ -425,12 +431,22 @@ lane_pass_expired() {
 #
 # Verdicts:
 #   review:off              nothing configured; the gate is not armed
-#   review:answered         every expected reviewer has answered this sha
+#   review:answered         every expected reviewer has answered this sha —
+#                           with `unavailable=n` when n of them answered by
+#                           reporting they could not review it
 #   review:hold             still waiting, inside the grace
 #   review:unreviewed       the grace is spent; merge anyway, and say so
 # ---------------------------------------------------------------------------
 lane_review_gate() {
-  local expected="${1:-}" answered="${2:-}" age="${3:-}" grace="${4:-}"
+  local expected="${1:-}" answered="${2:-}" age="${3:-}" grace="${4:-}" unavailable="${5:-0}"
+  local unavail_note=''
+  # Reported only when it is a number and non-zero. A garbled value must not
+  # appear in a verdict line that an operator reads as fact. An `if`, not a
+  # `&&` chain: this file is sourced into `set -e`, where a chain that ends
+  # false is a non-zero command and would abort the pass.
+  if [[ "$unavailable" =~ ^[0-9]+$ ]] && [ "$unavailable" -gt 0 ]; then
+    unavail_note=" unavailable=$unavailable"
+  fi
 
   # Not armed, or armed with something unreadable. A repository that has not
   # asked for this gate must not have it, and a garbled count is not a request.
@@ -448,7 +464,7 @@ lane_review_gate() {
   fi
 
   if [ "$answered" -ge "$expected" ]; then
-    echo "review:answered answered=$answered expected=$expected"
+    echo "review:answered answered=$answered expected=$expected$unavail_note"
     return 0
   fi
 
