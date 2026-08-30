@@ -192,7 +192,8 @@ moved_pair() { # <address> -> yes|no
 for addr in \
   'google_secret_manager_secret_iam_member.runner_reads_key' \
   'google_project_iam_member.metrics' \
-  'google_project_iam_member.logs'; do
+  'google_project_iam_member.logs' \
+  'google_secret_manager_secret.app_key'; do
   if matches "$(moved_pair "$addr")" '^yes$'; then
     ok "state move declared for $addr"
   else
@@ -237,6 +238,32 @@ if matches "$(grep -c 'merge(local.controller_registration_metadata, {' "$POOL/m
   ok "and it is merged into the controller's metadata"
 else
   bad "local.controller_registration_metadata is not merged into the controller metadata — the key is defined and never rendered"
+fi
+
+# 16. A second identity in a project — which is what a Windows pool alongside a
+#     Linux one is — may point at the App key that already exists instead of
+#     creating a second, empty one. The default has to stay TRUE: false on a
+#     first pool means the grants land on a secret nobody created, which is a
+#     404 at apply time on a plan that read clean.
+if matches "$(block '^variable "create_app_key_secret"' "$IDENTITY/variables.tf")" '^  default     = true'; then
+  ok "create_app_key_secret is opt-out, so a first pool still creates its key"
+else
+  bad "create_app_key_secret is missing or does not default to true — an existing pool would stop managing the secret its hosts read"
+fi
+
+# 17. And both grants and the output must read the LOCAL, not the resource.
+#     Reading `google_secret_manager_secret.app_key[0].…` anywhere else is an
+#     index into a zero-length list the moment a consumer opts out: the module
+#     stops planning at all, for every caller, with an error about the resource
+#     rather than about the flag. Asserting the local is defined is not enough —
+#     the failure is in what still reads around it.
+if matches "$(block '^locals \{' "$IDENTITY/main.tf")" 'app_key_secret_id = var\.create_app_key_secret \? google_secret_manager_secret\.app_key\[0\]' &&
+  matches "$(awk '/^moved \{/ { inb=1 } !inb { print } inb && /^\}/ { inb=0 }' "$IDENTITY/main.tf" |
+    grep -c 'google_secret_manager_secret\.app_key\[0\]')" '^1$' &&
+  ! matches "$(cat "$IDENTITY/outputs.tf")" 'google_secret_manager_secret\.app_key'; then
+  ok "the secret id is read through one local, so opting out plans cleanly"
+else
+  bad "something still reads google_secret_manager_secret.app_key directly — with create_app_key_secret = false that is an index into an empty list, and the module stops planning"
 fi
 
 if [ "$fail" -eq 0 ]; then

@@ -27,6 +27,33 @@ variable "app_key_secret_id" {
   type        = string
 }
 
+variable "create_app_key_secret" {
+  description = <<-EOT
+    Create the App-key secret named by `app_key_secret_id`, rather than pointing
+    at one another root already owns.
+
+    Leave true for a pool that is the first in its project. Set it false for a
+    SECOND identity in a project whose key already exists, where creating one
+    would mean a second empty secret — and, because the secret carries
+    `prevent_destroy`, one Terraform can never take back.
+
+    The case it exists for is a Windows pool. A Windows host account is stripped
+    of the App-key read (`host_os`), and a Windows pool requires the CONTROLLER
+    to mint registration tokens, so nothing the identity creates ever reads the
+    key: the secret would be created empty, never given a version, never read,
+    and never removable. False makes the identity point at the key the project's
+    existing pool already has, which is also the key the shared controller
+    already reads.
+
+    Set it false and the grants this module writes land on a secret it does not
+    manage. That is the intent — but nothing here can check the secret exists,
+    so a typo in `app_key_secret_id` is a 404 at apply time on a plan that read
+    clean, not a plan-time error.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "grant_compute_admin" {
   description = <<-EOT
     Grant roles/compute.instanceAdmin.v1 so the controller can delete hosts —

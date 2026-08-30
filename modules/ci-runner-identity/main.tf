@@ -80,9 +80,18 @@ locals {
   # Windows the host account gets none of them: 1 on linux, 0 on windows, and
   # one name so the three resources below cannot drift apart.
   host_grants = var.host_os == "windows" ? 0 : 1
+
+  # The id is `var.app_key_secret_id` either way — a secret_id is the name the
+  # caller chose, not something the API assigns. Reading it back off the
+  # resource when this module owns it is still what orders the grants after the
+  # create; when it does not, there is nothing to order against and the grants
+  # land on a secret some other root manages.
+  app_key_secret_id = var.create_app_key_secret ? google_secret_manager_secret.app_key[0].secret_id : var.app_key_secret_id
 }
 
 resource "google_secret_manager_secret" "app_key" {
+  count = var.create_app_key_secret ? 1 : 0
+
   project   = var.project_id
   secret_id = var.app_key_secret_id
 
@@ -120,7 +129,7 @@ resource "google_secret_manager_secret_iam_member" "runner_reads_key" {
   count = local.host_grants
 
   project   = var.project_id
-  secret_id = google_secret_manager_secret.app_key.secret_id
+  secret_id = local.app_key_secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.runner.email}"
 }
@@ -131,7 +140,7 @@ resource "google_secret_manager_secret_iam_member" "controller_reads_key" {
   count = var.create_controller_service_account ? 1 : 0
 
   project   = var.project_id
-  secret_id = google_secret_manager_secret.app_key.secret_id
+  secret_id = local.app_key_secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.controller[0].email}"
 }
@@ -259,4 +268,13 @@ moved {
 moved {
   from = google_project_iam_member.logs
   to   = google_project_iam_member.logs[0]
+}
+
+# And the App-key secret, for the same reason and with a sharper edge: it
+# carries `prevent_destroy`, so a pool that has applied before would not merely
+# see a destroy-and-create planned for it — it would see an apply that REFUSES,
+# naming a lifecycle rule, on a change that was meant to leave it alone.
+moved {
+  from = google_secret_manager_secret.app_key
+  to   = google_secret_manager_secret.app_key[0]
 }
