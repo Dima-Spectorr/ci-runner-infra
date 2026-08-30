@@ -1003,33 +1003,42 @@ Describe 'boot wrapper path hardening' {
     function Invoke-ProtectPath {
         param([bool] $IsContainer, [string] $Source)
 
+        # NOT named $acl. The stubs below are called from INSIDE Protect-Path,
+        # which has its own $acl local, and a scriptblock function body resolves
+        # variables up the CALLER's scope chain -- so a stub saying `$acl` would
+        # hand back the callee's own half-assigned variable instead of this one.
+        # For the same reason .GetNewClosure() is wrong here: it snapshots the
+        # scope it is created in, which is not the one holding these.
+        $fake = New-Object psobject
+        $fake | Add-Member -MemberType NoteProperty -Name Access -Value @()
+        $fake | Add-Member -MemberType NoteProperty -Name Protection -Value $null
+        $fake | Add-Member -MemberType NoteProperty -Name Rules -Value ([System.Collections.ArrayList]::new())
+        $fake | Add-Member -MemberType NoteProperty -Name Saved -Value $false
+        $fake | Add-Member -MemberType ScriptMethod -Name SetAccessRuleProtection -Value {
+            $this.Protection = @($args[0], $args[1])
+        }
+        $fake | Add-Member -MemberType ScriptMethod -Name RemoveAccessRule -Value { $true }
+        $fake | Add-Member -MemberType ScriptMethod -Name AddAccessRule -Value {
+            $null = $this.Rules.Add($args[0])
+        }
+        $fakeItem = [pscustomobject]@{ PSIsContainer = $IsContainer }
+
+        # Get-Acl and Set-Acl are Windows-only and do not exist at all on the
+        # runner this suite runs on, so these are stand-ins rather than
+        # overrides -- but a literal `function Get-Acl` still trips
+        # PSAvoidOverwritingBuiltInCmdlets, so they go in through the function:
+        # provider. Scoped to this scriptblock, which is also where Protect-Path
+        # is defined, so nothing outside this call sees them.
         & {
-            param($isContainer, $source)
+            $null = New-Item -Path 'function:Get-Acl' -Value { $fake }
+            $null = New-Item -Path 'function:Set-Acl' -Value { $fake.Saved = $true }
+            $null = New-Item -Path 'function:Get-Item' -Value { $fakeItem }
 
-            $acl = New-Object psobject
-            $acl | Add-Member -MemberType NoteProperty -Name Access -Value @()
-            $acl | Add-Member -MemberType NoteProperty -Name Protection -Value $null
-            $acl | Add-Member -MemberType NoteProperty -Name Rules -Value ([System.Collections.ArrayList]::new())
-            $acl | Add-Member -MemberType NoteProperty -Name Saved -Value $false
-            $acl | Add-Member -MemberType ScriptMethod -Name SetAccessRuleProtection -Value {
-                param($protect, $preserve) $this.Protection = @($protect, $preserve)
-            }
-            $acl | Add-Member -MemberType ScriptMethod -Name RemoveAccessRule -Value { param($rule) $true }
-            $acl | Add-Member -MemberType ScriptMethod -Name AddAccessRule -Value {
-                param($rule) $null = $this.Rules.Add($rule)
-            }
-
-            function Get-Acl { param([string] $LiteralPath) $acl }
-            function Set-Acl { param([string] $LiteralPath, $AclObject) $AclObject.Saved = $true }
-            function Get-Item {
-                param([string] $LiteralPath)
-                [pscustomobject]@{ PSIsContainer = $isContainer }
-            }
-
-            . ([scriptblock]::Create($source))
+            . ([scriptblock]::Create($Source))
             Protect-Path 'the-path'
-            $acl
-        } $IsContainer $Source
+        }
+
+        $fake
     }
 
     It 'makes the directory grants inheritable, or every child loses all access' {
