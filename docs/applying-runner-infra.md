@@ -651,6 +651,33 @@ log, every step `QUEUED` until the queue TTL expires. `script` escapes the
 first and not the second, which is why the step uses `script` and a
 `precondition` measures it.
 
+### What now notices, since nothing did
+
+The whole of the above was found by hand, twice, because a project that has
+stopped receiving infrastructure looks exactly like one that is fine: the pool
+keeps scaling, the controller keeps publishing, and every dashboard stays green.
+The controller now watches its own project's apply trigger — it is the one
+process that already runs in every project — with a single `gcloud builds list`
+every 15 minutes. It reads **builds** rather than triggers on purpose:
+`cloudbuild.triggers.list` cannot be held by a custom role, while a build
+carries its trigger's name in `substitutions.TRIGGER_NAME`.
+
+| Series | Non-zero means |
+|---|---|
+| `ci_apply_build_failed` | the newest `ci-runner-apply-*` build did not succeed — a refusal at submit is a failure like any other here |
+| `ci_apply_build_missing` | there is no apply build at all: the trigger is deleted, renamed, or no longer firing |
+| `ci_apply_build_age_seconds` | age of the newest build. Staleness is a threshold in the **policy**, not in the rule, so a project can pick its own |
+| `ci_apply_check_denied` | the controller could not read builds. A check that cannot read must not publish a zero that reads as healthy |
+
+All four are published on every tick **including their zeros** — a series that
+appears only when broken is indistinguishable from a controller that stopped
+publishing — and all four are conditions on the `applystale` alert policy. The
+grant behind them is `roles/cloudbuild.builds.viewer`, read-only, and applies
+only where this module created the controller account.
+
+This does not make the trigger repair itself. It makes the out-of-band apply
+above something you are told to run rather than something you discover.
+
 ---
 
 ## The controller is a managed group of size 1 (#308)
