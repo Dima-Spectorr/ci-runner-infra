@@ -300,6 +300,12 @@ locals {
     # be repository-wide rather than pool-wide, which changes where it is CALLED
     # from and not what is delivered.
     file("${path.module}/scripts/parked-decision.sh"),
+    # The apply-freshness rule, on every pool for the same reason as the three
+    # above. It is a PROJECT fact rather than a pool one, which again changes
+    # where it is called from and not what is shipped — and shipping it
+    # selectively would leave exactly the projects that opted out unable to
+    # report the failure that hides best.
+    file("${path.module}/scripts/apply-decision.sh"),
     file("${path.module}/scripts/telemetry.sh"),
     file("${path.module}/scripts/watchdog-decision.sh"),
     # Ahead of the controller itself, and not merely by convention: the

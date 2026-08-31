@@ -431,6 +431,17 @@ jobs:
       - name: parked-decision self-test
         run: bash scripts/ci/parked-decision.selftest.sh
 
+      # The rule that says whether a project is still RECEIVING infrastructure,
+      # and the only check here whose subject is the control plane rather than
+      # the pool. Its failure mode is the worst shape available: a check that
+      # reports green on a project it never read is indistinguishable from a
+      # project that is fine, which is precisely the invisibility it was built
+      # to end. So the case list drives every broken arm -- including the
+      # sub-second submit refusal that writes no log at all -- and treats the
+      # healthy state as one case rather than the whole set.
+      - name: apply-decision self-test
+        run: bash scripts/ci/apply-decision.selftest.sh
+
 
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a

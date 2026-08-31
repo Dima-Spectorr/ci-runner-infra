@@ -248,6 +248,33 @@ resource "google_project_iam_member" "controller_iap_tunnel" {
   member  = "serviceAccount:${local.controller_email}"
 }
 
+# The controller is the only thing running in this project that can see whether
+# the project is still RECEIVING runner infrastructure. The apply trigger's build
+# config is validated at fire time, so a config that outgrows one of Cloud
+# Build's size cliffs is refused sub-second, with no log and no build steps — the
+# explanation lives only in the build resource, and the audit entry for it is
+# indistinguishable from a healthy build being created. collect_apply_build()
+# reads it with one `gcloud builds list`.
+#
+# Read-only, and it reads BUILDS rather than triggers on purpose: listing
+# triggers needs `cloudbuild.triggers.list`, which no custom role can hold, while
+# a build carries its trigger's name in `substitutions.TRIGGER_NAME`.
+#
+# Optional in the sense that matters: without it the check publishes
+# ci_apply_check_denied = 1 and says DENIED in the log, rather than publishing a
+# zero that reads as healthy. That is the whole design — the failure this watches
+# for is a silent green, so its own absence must not produce one.
+resource "google_project_iam_member" "controller_build_reader" {
+  # Counted by the same local as the rest of the controller's grants, not by
+  # grant_compute_admin: reading builds has nothing to do with deleting hosts,
+  # and a project_iam_member re-written on the reuse path is one binding held by
+  # two roots, where either root's removal revokes it for both pools.
+  count   = local.controller_grants ? 1 : 0
+  project = var.project_id
+  role    = "roles/cloudbuild.builds.viewer"
+  member  = "serviceAccount:${local.controller_email}"
+}
+
 # Deliberately NOT granted here: storage, artifact registry, deploy, or any
 # data-plane role. A pipeline that needs one asks for it explicitly in the
 # consuming stack, where the grant is visible in that repo's review.
