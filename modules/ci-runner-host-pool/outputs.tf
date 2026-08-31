@@ -296,6 +296,34 @@ output "metric_names" {
       # a permission — and because a denied sweep leaves every other series here
       # publishing the same unbroken zero a healthy repository publishes.
       "ci_parked_sweep_denied",
+      # --- the apply trigger --------------------------------------------------
+      # PROJECT facts, published under every pool's label like the heartbeat, so
+      # read them with max() and never sum(). They answer a question no other
+      # series here asks: not "is this pool healthy" but "is this project still
+      # RECEIVING the configuration that makes it healthy".
+      #
+      # The state they exist for is invisible everywhere else. A build config
+      # that outgrows a Cloud Build size cliff is refused when the build FIRES —
+      # under a second, no log, no steps, the whole explanation in the build's
+      # own statusDetail — and the audit entry Cloud Logging keeps looks exactly
+      # like a healthy build being created. So the pool goes on serving jobs
+      # from whatever configuration it had when the refusal began, and every
+      # other series in this list stays green while nothing lands.
+      #
+      # Age is the half that catches a trigger which stopped FIRING, which
+      # leaves no failed build behind at all; the alert threshold is two of
+      # whatever `apply_schedule` the project runs.
+      "ci_apply_build_age_seconds",
+      "ci_apply_build_failed",
+      # A successful listing that found no apply build, kept apart from
+      # `failed` because a trigger that never fires is a different thing to go
+      # and look at than a trigger that fires and loses.
+      "ci_apply_build_missing",
+      # And the watcher's watcher, on the same argument as ci_parked_sweep_denied
+      # above: a refused CHECK freezes the three series above at their last
+      # readings, which is not a zero — it is a stale green, the exact shape
+      # this whole block was added to stop producing.
+      "ci_apply_check_denied",
       # --- the cache hydrate --------------------------------------------------
       # Published by the HOST, not the controller, and once per boot rather than
       # per tick: the hydrate finishes before the runner agent registers, so the

@@ -60,6 +60,7 @@ locals {
     # that is. A shared controller serving four pools sweeps one repository, so
     # it asks this question once and publishes the answer under every pool.
     file("${local.pool_scripts}/parked-decision.sh"),
+    file("${local.pool_scripts}/apply-decision.sh"),
     file("${local.pool_scripts}/telemetry.sh"),
     file("${local.pool_scripts}/watchdog-decision.sh"),
     # Before the controller, always: pool_table_parse is called at FILE SCOPE,

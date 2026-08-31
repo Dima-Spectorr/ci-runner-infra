@@ -1368,6 +1368,159 @@ collect_parked() {
   return 0
 }
 
+# --- the apply trigger -------------------------------------------------------
+#
+# The one thing in this project that nothing else watches: the Cloud Build
+# trigger that applies the runner infrastructure. It is the build that maintains
+# every alert policy in this project, so it is also the build whose failure no
+# policy in this project can report — and it fails in a shape that is invisible
+# by construction.
+#
+# A trigger's build config is validated when a build FIRES, not when Terraform
+# creates it. A config that has grown past one of Cloud Build's size cliffs is
+# refused at submit: sub-second FAILURE, no log, no build steps, the whole
+# explanation in the build's own `statusDetail`. `ci-runner-apply-entity-platform`
+# sat in that state from 2026-08-30 and was found by hand on 2026-08-31 while
+# somebody was doing something else. The pool kept serving jobs the whole time,
+# on whatever configuration it had when the refusal started, and every dashboard
+# in the project stayed green — because a pool that stops receiving infrastructure
+# and a pool with nothing to receive look exactly alike.
+#
+# Cloud Logging cannot see it. Measured on the real refusal: there is no build
+# log at all, and the `CreateBuild` audit entry is severity NOTICE with
+# `granted: true` and an empty `status` — indistinguishable from a healthy build
+# being created. So a log-based metric would report green on precisely the
+# projects that are broken, and the refusal exists in exactly one place: the
+# build resource, readable only through the Cloud Build API.
+#
+# Hence here. The controller already runs continuously in every pool project and
+# already publishes to the alert policies this would need, so the check costs one
+# `gcloud builds list` and no new credential beyond `cloudbuild.builds.list` —
+# which, unlike `cloudbuild.triggers.*`, IS available to a custom role.
+#
+# It reads BUILDS, never triggers, and that is not an accident: listing triggers
+# needs `cloudbuild.triggers.list`, which no custom role can hold. A build
+# carries its trigger's name in `substitutions.TRIGGER_NAME`, so the newest apply
+# build is reachable with the one permission that can be granted narrowly.
+APPLY_TRIGGER_PREFIX=${APPLY_TRIGGER_PREFIX:-ci-runner-apply-}
+# Fifteen minutes. The trigger it watches fires daily, so polling it on the tick
+# interval would spend the demand budget — the standing lesson of
+# ci_demand_runs_skipped — to re-learn a fact that changes once a day.
+APPLY_CHECK_INTERVAL=900
+APPLY_CHECK_LAST=0
+# Deliberately NOT reset between sweeps, for the same reason the parked counters
+# are not: on the ticks in between, these keep reporting what the last real sweep
+# found rather than flickering to a zero that reads as healthy.
+APPLY_BUILD_AGE=0
+APPLY_BUILD_FAILED=0
+# The two ways the numbers above are not answers. `missing` is a successful list
+# that found no apply build at all — the trigger that never fires, which produces
+# no failure to find and is the half of this that a status check alone would
+# miss. `denied` is the list itself being refused, which makes both of the
+# numbers above stale rather than merely zero. They are separate because the
+# operator's next move differs: one is a trigger to go look at, the other is a
+# grant to go make.
+APPLY_BUILD_MISSING=0
+APPLY_CHECK_DENIED=0
+
+collect_apply_build() {
+  local now
+  now=$(date +%s)
+  [ $((now - APPLY_CHECK_LAST)) -ge "$APPLY_CHECK_INTERVAL" ] || return 0
+  APPLY_CHECK_LAST=$now
+
+  # The controller's own region. The apply trigger is a project fact rather than
+  # a pool fact, and REGION is per-pool and only set inside pool_select().
+  local zone region
+  zone=$(md "instance/zone")
+  region="${zone##*/}"
+  region="${region%-*}"
+  if [ -z "$region" ]; then
+    log "apply check: cannot read this instance's zone — skipping (counters keep their previous values)"
+    return 0
+  fi
+
+  # `timeout` for the reason every gcloud call in this file is bounded: gcloud
+  # carries its own retry loop and can outlive a tick. Newest first, and one
+  # page rather than one row, because the newest build of the apply trigger may
+  # sit behind other builds in this project.
+  local rows
+  if ! rows=$(timeout 60 gcloud builds list \
+    --project="$PROJECT" --region="$region" --limit=50 \
+    --format='value(substitutions.TRIGGER_NAME,status,createTime)' 2>&1); then
+    APPLY_CHECK_DENIED=1
+    # DENIED is the word the runbook tells the operator to grep for, so the path
+    # that raises the counter has to print it.
+    log "apply check: DENIED listing builds in $PROJECT/$region — this call needs cloudbuild.builds.list; ci_apply_build_age_seconds and ci_apply_build_failed are now STALE, not zero: ${rows%%$'\n'*}"
+    return 0
+  fi
+  APPLY_CHECK_DENIED=0
+
+  local name status created found=0 newest_status="" newest_created=""
+  while IFS=$'\t' read -r name status created; do
+    case "$name" in "$APPLY_TRIGGER_PREFIX"*) ;; *) continue ;; esac
+    # The ROW is what found means, not the status on it. A build whose status
+    # column came back empty is a build that exists and did not succeed, which
+    # is `failed:unknown` — deriving found from the status instead would file it
+    # as `missing` and describe a trigger that is firing as one that stopped.
+    found=1
+    newest_status="$status"
+    newest_created="$created"
+    break
+  done <<<"$rows"
+
+  local age=-1 created_epoch
+  if [ "$found" = "1" ]; then
+    created_epoch=$(date -d "$newest_created" +%s 2>/dev/null) || created_epoch=0
+    [ "$created_epoch" -gt 0 ] && age=$((now - created_epoch))
+  fi
+
+  local verdict
+  verdict=$(apply_verdict "$found" "$newest_status" "$age")
+
+  case "$verdict" in
+    missing)
+      # A successful list with no apply build in it. Not a failure — worse: this
+      # is the trigger that has stopped firing, which by definition leaves no
+      # FAILURE behind to be found. Age keeps its previous value rather than
+      # resetting, because a 0 here would read as "applied a moment ago".
+      #
+      # ci_apply_build_failed is CLEARED here rather than left standing. Its
+      # descriptor says "the newest apply build did not succeed", and on this
+      # arm there is no newest apply build for it to be describing — a series
+      # that keeps asserting a build nobody can go and read is a triage dead
+      # end. Nothing is silenced by it: this arm raises ci_apply_build_missing,
+      # the same policy alerts on both, and the age keeps its previous value.
+      APPLY_BUILD_MISSING=1
+      APPLY_BUILD_FAILED=0
+      log "apply check: no ${APPLY_TRIGGER_PREFIX}* build in the last 50 builds of $PROJECT/$region — the trigger is not firing, and a trigger that never fires produces no failure to alert on"
+      return 0
+      ;;
+    failed:*)
+      APPLY_BUILD_MISSING=0
+      APPLY_BUILD_FAILED=1
+      [ "$age" -ge 0 ] && APPLY_BUILD_AGE=$age
+      # The refusal's whole explanation is in statusDetail and nowhere else, so
+      # the log line carries the query: an operator who reaches this alert and
+      # finds only "FAILURE" has to go and run it by hand anyway.
+      log "apply check: the newest apply build in $PROJECT/$region is ${verdict#failed:} (created $newest_created) — this project is no longer receiving runner infrastructure; read its statusDetail with 'gcloud builds list --project=$PROJECT --region=$region --limit=50 --format=\"value(substitutions.TRIGGER_NAME,status,statusDetail)\" | grep \"^$APPLY_TRIGGER_PREFIX\" | head -1'"
+      ;;
+    inflight:*)
+      # Still running. The previous verdict stands rather than being reported as
+      # a green that has not happened yet — but the age does advance, because
+      # the build exists and its create time is a fact.
+      APPLY_BUILD_MISSING=0
+      [ "$age" -ge 0 ] && APPLY_BUILD_AGE=$age
+      ;;
+    ok)
+      APPLY_BUILD_MISSING=0
+      APPLY_BUILD_FAILED=0
+      [ "$age" -ge 0 ] && APPLY_BUILD_AGE=$age
+      ;;
+  esac
+  return 0
+}
+
 # --- hosts -------------------------------------------------------------------
 
 collect_runners() {
@@ -2980,6 +3133,13 @@ tick() {
   # parked-decision.sh for why a fleet control plane is nonetheless the right
   # place for it.
   collect_parked
+
+  # Same placement and the same contract again: project-wide, on its own
+  # interval, and nothing in the pool loop waits on it. It is the only sweep here
+  # that looks at the control plane rather than at the work — see
+  # collect_apply_build() for why a pool controller is nonetheless the only thing
+  # in the project that can see this.
+  collect_apply_build
   local p
   for p in "${POOLS[@]}"; do
     pool_select "$p"
@@ -3491,6 +3651,27 @@ queue_controller_series() {
   # `checks: read` publishes an unbroken zero from every other series in this
   # block — which is exactly what a repository with nothing parked publishes.
   queue_series "ci_parked_sweep_denied" "$PARKED_DENIED"
+
+  # Whether this project is still receiving runner infrastructure. A PROJECT
+  # fact published under every pool's label, for the same reason the heartbeat
+  # is — read it with max() across pools, never sum().
+  #
+  # Age rather than a timestamp, so one threshold works in every project: alert
+  # above two of whatever `apply_schedule` that project uses. It is the half that
+  # catches a trigger which stopped firing, and there is no failure to find in
+  # that case, which is why it is not enough to publish the status alone.
+  queue_series "ci_apply_build_age_seconds" "$APPLY_BUILD_AGE"
+  # 1 means the newest apply build did not succeed. Includes the refusal this
+  # was built for, whose FAILURE lasts a fraction of a second and writes no log.
+  queue_series "ci_apply_build_failed" "$APPLY_BUILD_FAILED"
+  # And the two series that decide whether the zeros above can be believed.
+  # `missing` is the trigger not firing at all; `denied` is the check itself
+  # being refused, which leaves the two numbers above frozen at whatever the last
+  # sweep that worked found. Both published every tick, 0 included — a series
+  # that appears only when it fires cannot be told apart from a controller that
+  # stopped publishing, which is the failure this whole collector exists to end.
+  queue_series "ci_apply_build_missing" "$APPLY_BUILD_MISSING"
+  queue_series "ci_apply_check_denied" "$APPLY_CHECK_DENIED"
 }
 
 # --- install / run -----------------------------------------------------------

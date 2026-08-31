@@ -444,6 +444,31 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    applystale) cat <<EOF
+{ "displayName": "CI runners / this project has stopped receiving runner infrastructure",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "The Cloud Build trigger that applies this project's runner infrastructure is not landing changes any more. Nothing else in this project can report that, and this alert is the only reason it is not invisible.\n\nWhy it hides. A trigger's build config is validated when a build FIRES, not when Terraform creates it. A config that outgrows one of Cloud Build's two size cliffs — 10,000 characters per build-step argument, and roughly 128 KiB for the whole config — is REFUSED at submit: a FAILURE lasting a fraction of a second, with no build log, no steps, and the entire explanation in the build's own \`statusDetail\`. The audit entry Cloud Logging does keep is severity NOTICE with \`granted: true\` and an empty status, indistinguishable from a healthy build being created, so no log-based metric can tell them apart. Meanwhile the pool keeps serving jobs on whatever configuration it had when the refusal started, every other policy here stays green, and the trigger looks correct in the console. \`ci-runner-apply-entity-platform\` sat like that from 2026-08-30 and was found by hand the next day, by somebody doing something else.\n\nThree conditions, and WHICH one fired decides what you do:\n\n- **ci_apply_build_failed** — the newest apply build did not succeed. Read its explanation first, because a refusal says nothing in the log. Ask for a page and pick the apply build out of it rather than taking the newest build in the project, which in a project that builds anything else is somebody else's: \`gcloud builds list --project <id> --region <region> --limit 50 --format='value(substitutions.TRIGGER_NAME,status,statusDetail,createTime)' | grep '^ci-runner-apply-' | head -1\`. If statusDetail names a size limit, the trigger CANNOT REPAIR ITSELF — the build that would apply the fix is the build being refused — and recovery is one out-of-band \`gcloud builds submit\` per project, described in docs/applying-runner-infra.md.\n- **ci_apply_build_missing** — no apply build at all in this project's recent history. The trigger is not firing, which produces no failure to find; check that the scheduler job and the trigger still exist and that \`apply_schedule\` is set.\n- **ci_apply_check_denied** — the CHECK is refused, so the two conditions above are stale rather than green. The controller needs \`roles/cloudbuild.builds.viewer\`; grep 'apply check: DENIED' in the controller's syslog.\n\nThe age condition is the half that catches a trigger which quietly stopped firing, and it is set at two days because the apply runs daily. Read every series with max() across pools: they are PROJECT facts published under each pool's label, exactly like the heartbeat." },
+  "conditions": [
+    { "displayName": "ci_apply_build_failed > 0 for 30m",
+      "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
+        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_build_failed\" AND resource.type=\"generic_node\"",
+        "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } },
+    { "displayName": "ci_apply_build_missing > 0 for 30m",
+      "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
+        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_build_missing\" AND resource.type=\"generic_node\"",
+        "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } },
+    { "displayName": "ci_apply_check_denied > 0 for 30m",
+      "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
+        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_check_denied\" AND resource.type=\"generic_node\"",
+        "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } },
+    { "displayName": "ci_apply_build_age_seconds > 2 days for 1h",
+      "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 172800.0, "duration": "3600s",
+        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_build_age_seconds\" AND resource.type=\"generic_node\"",
+        "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
     hostvanished) cat <<EOF
 { "displayName": "CI runners / a host went away under a running job",
   "combiner": "OR",
@@ -595,6 +620,10 @@ ensure_descriptor ci_slots_missing           "Slots the pool was built with that
 ensure_descriptor ci_prs_green_and_unqueued "Open pull requests that are green and can never enter the merge queue, labelled by the entry condition they fail. A repository fact published under every pool label -- read with max(), never sum()." reason
 ensure_descriptor ci_parked_prs_skipped     "Pull requests the parking sweep did not examine. Non-zero makes ci_prs_green_and_unqueued a lower bound."
 ensure_descriptor ci_pinned_jobs_host_vanished "Jobs found RUNNING on a host that no longer exists, counted per job and before any per-run de-duplication. Such a job reports no conclusion at all until GitHub's 24-hour timeout, so everything waiting on its status - a merge queue above all - waits out its own timeout instead. Non-zero is live work that lost its machine; grep 'went away under a running job' for the instance."
+ensure_descriptor ci_apply_build_age_seconds "Age of the newest ci-runner-apply-* Cloud Build in this project. The half of the apply check that catches a trigger which stopped FIRING - that state produces no failed build to find. A project fact published under every pool label; read with max(), never sum()."
+ensure_descriptor ci_apply_build_failed     "1 when the newest apply build did not succeed. Includes the refusal this was built for: a build config that outgrows a Cloud Build size cliff fails in under a second with no log and no steps, and its only explanation is the build's own statusDetail."
+ensure_descriptor ci_apply_build_missing    "1 when a successful listing found no apply build at all. Distinct from failed on purpose - a trigger that never fires leaves nothing behind to be red - and distinct from denied, because this one is a trigger to go and look at rather than a grant to go and make."
+ensure_descriptor ci_apply_check_denied     "1 when the apply check itself was refused, which makes ci_apply_build_age_seconds and ci_apply_build_failed STALE rather than zero. The controller needs roles/cloudbuild.builds.viewer; grep 'apply check: DENIED' for the error."
 ensure_descriptor ci_parked_sweep_denied    "Parking sweeps GitHub refused (401/403/404). Non-zero means ci_prs_green_and_unqueued is inert rather than zero. Either call can be the refused one and they need different permissions - listing pull requests needs 'pull_requests: read', reading check runs needs 'checks: read' - and a bad App key or installation id reads the same, so grep 'parked sweep: DENIED' for which."
 # Published by the HOST once per boot, not by the controller per tick. Declared
 # here for the same reason as the rest — a pool that has never booted a host
@@ -632,7 +661,7 @@ no_such_metric() {
 }
 
 deferred=""
-for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied hostvanished egressdenied; do
+for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied applystale hostvanished egressdenied; do
   policy_json "$key" >"$tmp/p.json"
   # Neither of these ends in `| head -1`, and that is deliberate. This script
   # runs `set -euo pipefail`; under both options a reader that stops early sends
