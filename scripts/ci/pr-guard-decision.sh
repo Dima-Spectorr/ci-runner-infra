@@ -175,11 +175,11 @@ guard_rereview() {
     [ -n "$login" ] || continue
     mine="$(printf '%s\n' "$reviews" | awk -F'\t' -v b="$login" '$1 == b { print $2 }')"
 
-    if printf '%s\n' "$mine" | grep -qxF -- "$head"; then
+    if printf '%s\n' "$mine" | grep -cxF -- "$head" >/dev/null; then
       printf '%s\tanswered\n' "$login"
-    elif printf '%s\n' "$pending" | sed 's/\[bot\]$//' | grep -qxF -- "$login"; then
+    elif printf '%s\n' "$pending" | sed 's/\[bot\]$//' | grep -cxF -- "$login" >/dev/null; then
       printf '%s\tpending\n' "$login"
-    elif printf '%s\n' "$mine" | grep -q '[^[:space:]]'; then
+    elif printf '%s\n' "$mine" | grep -c '[^[:space:]]' >/dev/null; then
       printf '%s\tstale\n' "$login"
     else
       printf '%s\tabsent\n' "$login"

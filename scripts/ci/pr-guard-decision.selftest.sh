@@ -118,9 +118,9 @@ expect "$COP	answered" "an answer for this head outranks an outstanding request"
 # login without it, and a mismatch here reports every reviewer `absent` — which
 # re-requests nothing and looks, in the log, exactly like working correctly.
 expect "$COP	answered" "the configured login may carry a [bot] suffix" \
-  guard_rereview "$HEAD" "$COP[bot]" "$COP	$HEAD" ''
+  guard_rereview "$HEAD" "${COP}[bot]" "$COP	$HEAD" ''
 expect "$COP	pending" "so may the pending one" \
-  guard_rereview "$HEAD" "$COP" "$COP	$OLD" "$COP[bot]"
+  guard_rereview "$HEAD" "$COP" "$COP	$OLD" "${COP}[bot]"
 
 # ANOTHER REVIEWER'S REVIEW IS NOT THIS ONE'S. Matching the sha without the
 # login would mark every configured reviewer answered the moment any one of
