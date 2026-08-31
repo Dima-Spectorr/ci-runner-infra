@@ -9,9 +9,9 @@
 # raise something is driven with the shape that actually occurred, and the
 # healthy arm is one case out of the set rather than the whole set.
 #
-# The states below are not invented. `ci-runner-apply-entity-platform` in
-# mot-safetyofficer was refused at submit from 2026-08-30: a FAILURE lasting
-# under a second, no build log, no steps, the explanation only in statusDetail.
+# The states below are not invented. One pool project's apply trigger was
+# refused at submit from 2026-08-30: a FAILURE lasting under a second, no build
+# log, no steps, the explanation only in statusDetail.
 # From this rule's side that is indistinguishable from any other failure, which
 # is the point — the rule does not need to understand the refusal, it needs to
 # stop calling it green.
