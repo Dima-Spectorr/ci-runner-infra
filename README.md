@@ -1100,7 +1100,7 @@ Consumers choose how they adopt:
 
 | pin | adopts | costs |
 |---|---|---|
-| `?ref=v5.7.0` | when the repository opens and merges a bump | one pull request per release, per repository |
+| `?ref=vX.Y.Z` | when the repository opens and merges a bump | one pull request per release, per repository |
 | `?ref=v5` | at its next `terraform apply` | nothing, and no review of what changed |
 
 Either way a release does not repin anybody, and **nothing applies Terraform** —
