@@ -280,7 +280,7 @@ fi
 ctl_raw="$(grep -c 'count = var\.create_controller_service_account ? 1 : 0' "$IDENTITY/main.tf" || true)"
 if matches "$(block '^locals \{' "$IDENTITY/main.tf")" 'controller_grants = var\.controller_service_account_email == "" && var\.create_controller_service_account' &&
   matches "$ctl_raw" '^0$' &&
-  matches "$(grep -cE 'count += local\.controller_grants' "$IDENTITY/main.tf")" '^5$'; then
+  matches "$(grep -cE 'count[[:space:]]+= local\.controller_grants' "$IDENTITY/main.tf")" '^5$'; then
   ok "every controller resource is counted by one local, so reuse creates none of them"
 else
   bad "a controller resource is still counted on var.create_controller_service_account — with controller_service_account_email set that mints a second privileged identity beside the shared one, or double-writes a binding either root's removal revokes"
