@@ -1531,7 +1531,7 @@ the_review_gate_is_asked_only_of_a_ready_merge() {
 an_unreadable_review_surface_is_not_an_unanswered_one() {
   local code n
   code=$(code_of "$1")
-  n=$(printf '%s\n' "$code" | grep -cE '^    echo "-1 0"$')
+  n=$(printf '%s\n' "$code" | grep -cE '^    echo "-1 0 0"$')
   [ "${n:-0}" -eq 2 ]
 }
 
@@ -1557,7 +1557,30 @@ a_reviewer_that_declined_counts_as_answered() {
   # Counted separately as well as into `answered`, or the log cannot tell a
   # reviewed pull request from one nobody could review.
   matches "$code" 'u=\$\(\(u \+ 1\)\)' || return 1
-  matches "$code" 'echo "\$n \$u"'
+  matches "$code" 'echo "\$n \$u \$s"'
+}
+
+# A REVIEWER THAT READ AN EARLIER COMMIT IS NOT A REVIEWER THAT IS DOWN, and
+# until this counter existed both printed `answered=0`. Copilot reviews the
+# first push and stops — fourteen of fifteen merged multi-commit pull requests
+# in the fleet had no Copilot review on the head that landed — so the annotation
+# documented as "a reviewer is down, go look" was firing on a healthy reviewer
+# that was simply never asked again. `pr-guard` asks; this is what says so when
+# that did not work.
+#
+# `stale` must stay DISJOINT from `answered`: a review of an older tree says
+# nothing about the new one, and counting it would merge ahead of the review the
+# gate exists to wait for. The `continue` above it is what keeps that true.
+a_review_of_an_earlier_commit_is_counted_but_not_answered() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 's=\$\(\(s \+ 1\)\)' || return 1
+  # Reached only after every answer arm has declined it.
+  before "$code" 'u=\$\(\(u \+ 1\)\)' 's=\$\(\(s \+ 1\)\)' || return 1
+  # Rides to the gate, and the gate is what puts it in the verdict line.
+  matches "$code" 'lane_review_gate .*"\$unavailable" "\$stale"' || return 1
+  # And the annotation reads it, or the operator is sent to the wrong place.
+  matches "$code" "\\*' stale='\\*)"
 }
 
 # A clean Codex review publishes no review object at all — only a summary
@@ -1620,6 +1643,7 @@ check the_review_gate_is_asked_only_of_a_ready_merge "$DRIVER" "the review reads
 check an_unreadable_review_surface_is_not_an_unanswered_one "$DRIVER" "an unreadable review surface counts as nobody having answered, so a rate limit holds a green pull request for the whole grace and then blames the reviewer"
 check both_review_surfaces_are_read "$DRIVER" "only the review surface is read, so a Codex review that found nothing — which publishes a summary comment and no review — reads as no review at all"
 check a_reviewer_that_declined_counts_as_answered "$DRIVER" "a reviewer that reported it CANNOT review — a rate-limited Copilot, which fails its own check run and publishes nothing else — is still waited for, so every green pull request in the fleet burns the full grace and then merges with a warning blaming the wrong thing"
+check a_review_of_an_earlier_commit_is_counted_but_not_answered "$DRIVER" "a reviewer that read an EARLIER commit here reads identically to a reviewer that is down, so every moved head merges with an annotation sending an operator to check a vendor outage that is not happening"
 check the_review_clock_starts_at_green "$DRIVER" "the review grace is measured from something other than the last check finishing, so a pull request opened yesterday exhausts it before the reviewer is even asked"
 check the_review_clock_reads_the_commit_status_surface "$DRIVER" "the review clock reads only the check-run surface, so a repository whose required contexts are legacy commit statuses has no clock at all — the grace expires the instant it is armed and the gate waits for nobody, with nothing in any log saying so"
 check the_review_clock_is_confined_to_the_required_contexts "$DRIVER" "the review clock counts any check at all, so a slow optional job or a coverage bot moves it forward and holds a green pull request well past the grace the operator configured"
@@ -1638,8 +1662,14 @@ mutate "the unreviewed verdict stops riding the candidate tuple" "$DRIVER" \
 mutate "the review reads stop being confined to a ready merge" "$DRIVER" \
   's|= "merge" \]; then|= "" ]; then|' \
   the_review_gate_is_asked_only_of_a_ready_merge
+mutate "a review of an earlier commit stops being counted, so it reads as an outage" "$DRIVER" \
+  's@s=$((s + 1))@:@' \
+  a_review_of_an_earlier_commit_is_counted_but_not_answered
+mutate "the stale count stops riding to the gate, so no verdict line carries it" "$DRIVER" \
+  's@"$unavailable" "$stale"@"$unavailable"@' \
+  a_review_of_an_earlier_commit_is_counted_but_not_answered
 mutate "an unreadable review surface starts counting as zero answers" "$DRIVER" \
-  's@^    echo "-1 0"$@    echo "0 0"@' \
+  's@^    echo "-1 0 0"$@    echo "0 0 0"@' \
   an_unreadable_review_surface_is_not_an_unanswered_one
 mutate "the declined-reviewer surface is dropped, so a rate limit reads as silence" "$DRIVER" \
   's@commits/\$sha/check-runs?per_page=100@commits/$sha/check-runs-unused?per_page=100@' \

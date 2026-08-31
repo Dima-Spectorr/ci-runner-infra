@@ -325,6 +325,67 @@ works now and always did — a person has a Codex account to bill.
   warning, which stays reserved for a merge that genuinely went out with nobody
   having looked.
 
+### Copilot does not re-review a head that moved — so `pr-guard` asks again
+
+The third surface above fixed a reviewer that was *down*. This is the other half,
+and it was the more common one by far: a reviewer in perfect health that was
+never asked a second time.
+
+**Copilot reviews the first push to a pull request and then stops.** Measured
+across the fleet on 2026-08-30: **fourteen of fifteen merged multi-commit pull
+requests had no Copilot review on the head that actually landed.** On the first
+push it is not slow — it answered a median of **1580 seconds before** the last
+required check finished, and 11 out of 11 times within 60 seconds of being asked.
+So the grace was never the problem, and raising it fixes nothing: on
+IntegrateIT #14070 the head moved nine minutes after the review, and the merge
+came 22 minutes later — the old 600-second grace would have produced the
+identical annotation.
+
+What the lane saw was `answered=0 expected=1`, permanently, for any pull request
+whose head moved after its first review. It waited out the grace and stamped
+`UNREVIEWED` — the annotation documented three bullets up as *the reviewer is
+down, go look*. It was pointing at a vendor outage that was not happening, on
+most merges in the fleet, which is exactly how such a warning stops being read.
+
+**The re-request happens at push time, in `pr-guard`, and that is the design.**
+`pr-guard` already runs on `synchronize` for every open pull request in the
+fleet, needs no App — the caller's own `GITHUB_TOKEN` with `pull-requests:
+write` is enough — and, decisively, a review requested on the push runs *beside*
+CI. CI here takes tens of minutes and a review takes a few, so the review has
+landed long before the lane asks. **It adds nothing to the time a green pull
+request waits**, which is the constraint the last three releases were spent on.
+
+Its `review-bots` input defaults to `copilot-pull-request-reviewer[bot]` and
+should match the lane's. Only a reviewer that has published a review on an
+**earlier commit of this same pull request** is asked again:
+
+| state | what it means | what happens |
+|---|---|---|
+| `answered` | it reviewed this exact head | nothing |
+| `pending`  | it has an outstanding request | nothing — re-asking **replaces** the request in flight, so a branch pushed twice would cancel its own review |
+| `stale`    | it reviewed an earlier commit here | re-requested |
+| `absent`   | it has never reviewed this pull request | nothing — it is either still on its first pass or not configured here, and asking would be a poke in the dark on every push |
+
+The request goes through the GraphQL `requestReviews` mutation with `botIds` and
+`union: true`. **REST cannot do it**: `POST /pulls/{n}/requested_reviewers`
+refuses a bot login outright with `422 Reviews may only be requested from
+collaborators`. The reviewer's node id is only reachable as the **author of a
+review it has already published** — `suggestedActors` returns
+`copilot-swe-agent`, which is the coding agent and a different bot.
+
+Every call fails soft and says so in the log. A fork's token is read-only and a
+caller may not hold `pull-requests: write`; a guard that went red because it
+could not *ask* for a review would be a worse version of the problem it fixes.
+The lane's grace is still the fallback.
+
+**And the lane now says which failure it is.** `review_answered` counts a review
+of an earlier commit as `stale` — never as an answer, because a review of an
+older tree says nothing about the new one — and that count rides into the
+verdict line as `stale=<n>`. Where it appears, the annotation reads *a reviewer
+reviewed an EARLIER commit and was never asked about this head … that is not an
+outage*, and points at `pr-guard` instead of at a vendor status page. Without
+`stale=`, the wording is unchanged and still means what it always did.
+
 ### The red check itself stays red, and that is not ours to fix
 
 `copilot-pull-request-reviewer` is a check run published by GitHub's own Copilot

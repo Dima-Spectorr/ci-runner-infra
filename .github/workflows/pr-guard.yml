@@ -107,6 +107,32 @@ on:
         required: false
         default: 30
         type: number
+      review-bots:
+        description: >-
+          Automated reviewers to keep pointed at the CURRENT head, one login per
+          line. Should match the merge lane's `review-bots`, because this is
+          what makes that gate's answer mean something.
+
+          Copilot reviews the first push to a pull request and then stops:
+          measured across the fleet on 2026-08-30, fourteen of fifteen merged
+          multi-commit pull requests had no Copilot review on the head that
+          actually landed. The lane then asks about a commit nobody was asked
+          about, waits out its grace and annotates the merge `UNREVIEWED` — a
+          warning whose documented meaning is "a reviewer is down, go look".
+          Firing it on a healthy reviewer is how it stops being read.
+
+          Asking here rather than at merge time is the whole point: CI on this
+          fleet takes tens of minutes and a review takes a few, so a review
+          requested on the push runs BESIDE the checks and has landed before the
+          lane asks. It adds nothing to the time a green pull request waits.
+
+          DEFAULT-ON. A default only reaches a caller that omits the input, and
+          every caller omits this one today, so this is how the behaviour
+          arrives fleet-wide without sixteen pull requests. Set it to an empty
+          string to opt out.
+        required: false
+        default: copilot-pull-request-reviewer[bot]
+        type: string
       implementation-repository:
         description: >-
           Where `scripts/ci/pr-guard.sh` lives. A reusable workflow's
@@ -207,4 +233,5 @@ jobs:
           ENFORCE_FRESHNESS: ${{ inputs.enforce-freshness }}
           ENFORCE_OVERLAP: ${{ inputs.enforce-overlap }}
           MAX_COMPARE: ${{ inputs.max-compare }}
+          REVIEW_BOTS_INPUT: ${{ inputs.review-bots }}
         run: bash scripts/ci/pr-guard.sh
