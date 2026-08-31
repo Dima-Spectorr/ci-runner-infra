@@ -1485,11 +1485,14 @@ collect_apply_build() {
       # FAILURE behind to be found. Age keeps its previous value rather than
       # resetting, because a 0 here would read as "applied a moment ago".
       #
-      # ci_apply_build_failed is deliberately left ALONE rather than cleared: a
-      # project whose newest apply failed and whose apply build has since aged
-      # off the page has not been fixed by ageing off the page. The staleness
-      # errs towards raising, and the missing signal is raised beside it.
+      # ci_apply_build_failed is CLEARED here rather than left standing. Its
+      # descriptor says "the newest apply build did not succeed", and on this
+      # arm there is no newest apply build for it to be describing — a series
+      # that keeps asserting a build nobody can go and read is a triage dead
+      # end. Nothing is silenced by it: this arm raises ci_apply_build_missing,
+      # the same policy alerts on both, and the age keeps its previous value.
       APPLY_BUILD_MISSING=1
+      APPLY_BUILD_FAILED=0
       log "apply check: no ${APPLY_TRIGGER_PREFIX}* build in the last 50 builds of $PROJECT/$region — the trigger is not firing, and a trigger that never fires produces no failure to alert on"
       return 0
       ;;
