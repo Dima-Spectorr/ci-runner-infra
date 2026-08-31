@@ -208,6 +208,19 @@ expect 'audible' "the reviews read reports its own failure" \
 expect 'audible' "and so does the re-request mutation" \
   quiet_gh 'pullRequest \{ number \} \} \}. --silent'
 
+# A reviewer missing from the `reviewRequests` page reads as `stale`, not
+# `pending`, and the stale arm re-asks — which REPLACES the request in flight.
+# So a page size below the maximum is not a tidier query, it is this guard
+# cancelling the review it exists to leave alone. Asserted as a number rather
+# than as the literal text, so raising it stays legal and lowering it does not.
+guard_page() { # <connection name>
+  local n
+  n="$(sed -n "s/.*$1(first:\([0-9]\+\)).*/\1/p" "$DRV" 2>/dev/null | head -1)"
+  if [ "${n:-0}" -ge 100 ]; then printf 'max'; else printf 'truncating(%s)' "${n:-unset}"; fi
+}
+expect 'max' "the pending-reviewer page is not truncated" \
+  guard_page 'reviewRequests'
+
 printf 'pr-guard decision: %d checks pass' "$PASS"
 if [ "$FAIL" -gt 0 ]; then
   printf ', %d FAILED\n' "$FAIL"
