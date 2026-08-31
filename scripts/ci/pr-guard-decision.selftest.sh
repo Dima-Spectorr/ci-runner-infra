@@ -189,6 +189,25 @@ expect 'yes' "the workflow hands review-bots to the driver" \
 expect 'yes' "and the input has a non-empty default, or it reaches no caller" \
   wired '^ +default: copilot-pull-request-reviewer\[bot\]$'
 
+# --- the two API calls must be able to say WHY they failed --------------------
+# Both fail soft by design, so their only report is what `gh` wrote to stderr:
+# a caller missing `pull-requests: write`, a fork's read-only token and a
+# GraphQL outage are three different operator actions and one identical
+# "could not". A `2>/dev/null` here reads like ordinary tidying and silently
+# converts every one of them into the same unactionable line.
+DRV="$HERE/pr-guard.sh"
+quiet_gh() { # <regex matching the gh invocation>
+  if [ -f "$DRV" ] && grep -E "$1" "$DRV" | grep -c '2>/dev/null' >/dev/null; then
+    printf 'silenced'
+  else
+    printf 'audible'
+  fi
+}
+expect 'audible' "the reviews read reports its own failure" \
+  quiet_gh '^ +-f query="\$guard_gql"'
+expect 'audible' "and so does the re-request mutation" \
+  quiet_gh 'pullRequest \{ number \} \} \}. --silent'
+
 printf 'pr-guard decision: %d checks pass' "$PASS"
 if [ "$FAIL" -gt 0 ]; then
   printf ', %d FAILED\n' "$FAIL"

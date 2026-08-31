@@ -104,8 +104,14 @@ else
   # `-f` for the strings and `-F` only for the number: `-F` COERCES, so an
   # owner or repository name that happens to be all digits would arrive as an
   # Int and the server would reject the query against `String!`.
+  #
+  # `gh`'s stderr is deliberately NOT redirected, here or on the mutation below.
+  # This section is written to fail soft and say why, and a swallowed error
+  # leaves only "it did not work": the difference between a caller missing
+  # `pull-requests: write`, a fork's read-only token and a GraphQL outage is the
+  # whole of the diagnosis, and it exists nowhere but in that message.
   guard_pr="$(gh api graphql -f o="${R%%/*}" -f r="${R#*/}" -F n="$PR_NUMBER" \
-    -f query="$guard_gql" 2>/dev/null || true)"
+    -f query="$guard_gql" || true)"
 
   guard_pr_id="$(jq -r '.data.repository.pullRequest.id // empty' <<<"$guard_pr" 2>/dev/null || true)"
 
@@ -148,11 +154,13 @@ else
     if gh api graphql -f p="$guard_pr_id" -f b="$guard_bid" \
       -f query='mutation($p:ID!,$b:ID!) {
         requestReviews(input:{pullRequestId:$p, botIds:[$b], union:true}) {
-          pullRequest { number } } }' --silent 2>/dev/null; then
+          pullRequest { number } } }' --silent; then
       echo "pr-guard: asked $guard_bot to review ${HEAD_SHA:0:8} — it had reviewed an earlier commit here"
     else
       # `union:true` above so this never drops a reviewer somebody else added.
-      echo "pr-guard: could not ask $guard_bot to review ${HEAD_SHA:0:8} — the merge lane falls back to its grace"
+      # `gh`'s own error is on the line above this one, unredirected: the reason
+      # is what an operator needs, and this line cannot carry it.
+      echo "pr-guard: could not ask $guard_bot to review ${HEAD_SHA:0:8} — the merge lane falls back to its grace (reason above)"
     fi
   done < <(guard_rereview "$HEAD_SHA" "$(printf '%s\n' "${GUARD_REVIEW_BOTS[@]}")" \
     "$guard_reviews" "$guard_pending")
