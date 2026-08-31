@@ -1580,7 +1580,19 @@ a_review_of_an_earlier_commit_is_counted_but_not_answered() {
   # Rides to the gate, and the gate is what puts it in the verdict line.
   matches "$code" 'lane_review_gate .*"\$unavailable" "\$stale"' || return 1
   # And the annotation reads it, or the operator is sent to the wrong place.
-  matches "$code" "\\*' stale='\\*)"
+  matches "$code" "\\*' stale='\\*)" || return 1
+  # BOTH surfaces, exactly as the answer arms above read both. A reviewer whose
+  # only surface is a summary comment would otherwise never be stale, however
+  # many earlier commits it had spoken about, and the annotation would go back
+  # to naming an outage that is not happening — for precisely the reviewer this
+  # function grew its second surface to accommodate.
+  #
+  # ANCHORED ON THE `||`, and that is the whole assertion. Written without it,
+  # this matched the `answered` arm forty lines up — which reads `$comments`
+  # too — so it passed with the stale arm reading one surface, which is the
+  # exact defect it claims to exclude. Mutation-checked: swapping `$comments`
+  # for `$reviews` on this line must turn it red.
+  matches "$code" '\|\| printf .%s.n. "[$]comments"'
 }
 
 # A clean Codex review publishes no review object at all — only a summary

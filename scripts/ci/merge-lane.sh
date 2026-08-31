@@ -534,7 +534,15 @@ review_answered() {
     # this way: it reviews the first push and then stops. `pr-guard` asks it
     # again on every push, and this counter is what tells an operator which of
     # the two failures they are looking at when that did not work.
-    if printf '%s\n' "$reviews" | awk -F'\t' -v b="$bot" '$1 == b' | grep -c . >/dev/null; then
+    #
+    # BOTH surfaces, because `answered` above reads both. A reviewer that
+    # publishes an issue comment rather than a review — the fallback this
+    # function has carried for exactly that case — would otherwise be counted
+    # `stale=0` no matter how many earlier commits it had spoken about, and the
+    # annotation would send an operator looking for an outage again. Presence on
+    # either surface with nothing for THIS head is the whole signal.
+    if printf '%s\n' "$reviews" | awk -F'\t' -v b="$bot" '$1 == b' | grep -c . >/dev/null \
+      || printf '%s\n' "$comments" | awk -F'\t' -v b="$bot" '$1 == b' | grep -c . >/dev/null; then
       s=$((s + 1))
     fi
   done
