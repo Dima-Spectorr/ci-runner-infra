@@ -378,6 +378,13 @@ caller may not hold `pull-requests: write`; a guard that went red because it
 could not *ask* for a review would be a worse version of the problem it fixes.
 The lane's grace is still the fallback.
 
+**Confirmed live on the pull request that introduced it** (#595, 2026-08-31).
+The second push classified `copilot-pull-request-reviewer=stale`, logged `asked
+copilot-pull-request-reviewer to review 166b42f5`, and Copilot published a review
+on that head minutes later. So `github-actions[bot]`'s own `GITHUB_TOKEN` does
+carry enough authority for the mutation — no App and no PAT — which is the part
+that could not be established without running it.
+
 **And the lane now says which failure it is.** `review_answered` counts a review
 of an earlier commit as `stale` — never as an answer, because a review of an
 older tree says nothing about the new one — and that count rides into the
