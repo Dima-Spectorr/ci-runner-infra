@@ -92,12 +92,20 @@ else
   # unexpanded — that is the entire point of passing them with `-F`. Double
   # quoting here is the change that would break it, and it would break it by
   # substituting shell values into a query the server then rejects.
+  #
+  # Both page sizes are GraphQL's maximum, and `reviewRequests` is the one that
+  # matters: a bot missing from that page is classified `stale` rather than
+  # `pending`, and re-asking REPLACES the request in flight — so a truncated
+  # page makes this guard cancel the very review it is trying not to disturb.
+  # Neither list is paginated beyond one page; at 100 outstanding requests or
+  # 100 reviews on a single pull request the failure is the reviewer being
+  # missed, which is the fail-soft direction (grace, no re-request).
   # shellcheck disable=SC2016
   guard_gql='query($o:String!,$r:String!,$n:Int!) {
     repository(owner:$o, name:$r) { pullRequest(number:$n) {
       id
       reviews(last:100) { nodes { commit { oid } author { login ... on Bot { id } } } }
-      reviewRequests(first:20) { nodes { requestedReviewer {
+      reviewRequests(first:100) { nodes { requestedReviewer {
         ... on Bot { login } ... on User { login } } } }
     } }
   }'

@@ -400,9 +400,9 @@ lane_pass_expired() {
 #            to 0, and it too changes no decision. It is disjoint from
 #            `answered`: a review of an older tree says nothing about the new
 #            one. It rides through because `answered=0` alone cannot tell an
-#            operator apart a reviewer that is DOWN from one that is healthy and
-#            was not asked, and the annotation this feeds is documented to mean
-#            the first.
+#            operator tell a reviewer that is DOWN apart from one that is
+#            healthy and was simply not asked, and the annotation this feeds is
+#            documented to mean the first.
 #
 # WHY THIS EXISTS
 #
