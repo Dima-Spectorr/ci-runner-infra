@@ -204,7 +204,7 @@ quiet_gh() { # <regex matching the gh invocation>
   fi
 }
 expect 'audible' "the reviews read reports its own failure" \
-  quiet_gh '^ +-f query="\$guard_gql"'
+  quiet_gh '^ +-f query="[$]guard_gql"'
 expect 'audible' "and so does the re-request mutation" \
   quiet_gh 'pullRequest \{ number \} \} \}. --silent'
 
