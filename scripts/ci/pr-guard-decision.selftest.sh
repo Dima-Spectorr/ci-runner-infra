@@ -121,6 +121,14 @@ expect "$COP	answered" "the configured login may carry a [bot] suffix" \
   guard_rereview "$HEAD" "${COP}[bot]" "$COP	$HEAD" ''
 expect "$COP	pending" "so may the pending one" \
   guard_rereview "$HEAD" "$COP" "$COP	$OLD" "${COP}[bot]"
+# And so may the REVIEW's own author. GitHub returns a bot login suffixed in
+# some responses and bare in others; stripping only the configured side would
+# read a review that exists as no review at all, which is the same wrong answer
+# in the opposite direction — `stale` for a head already reviewed.
+expect "$COP	answered" "and so may the login on the review itself" \
+  guard_rereview "$HEAD" "$COP" "${COP}[bot]	$HEAD" ''
+expect "$COP	stale" "which must not hide an earlier review either" \
+  guard_rereview "$HEAD" "${COP}[bot]" "${COP}[bot]	$OLD" ''
 
 # ANOTHER REVIEWER'S REVIEW IS NOT THIS ONE'S. Matching the sha without the
 # login would mark every configured reviewer answered the moment any one of

@@ -108,6 +108,16 @@ else
     -f query="$guard_gql" 2>/dev/null || true)"
 
   guard_pr_id="$(jq -r '.data.repository.pullRequest.id // empty' <<<"$guard_pr" 2>/dev/null || true)"
+
+  # A read that failed and a pull request nobody has reviewed produce the same
+  # empty lists, and would print the same four `absent` lines — "did not check"
+  # rendering as "found nothing", which is the failure this guard exists to stop
+  # doing elsewhere. The pull request's node id is present in every successful
+  # response and in none of the failures, so its absence names the read.
+  if [ -z "$guard_pr_id" ]; then
+    echo "pr-guard: could not read #$PR_NUMBER's reviews — no review is re-requested, and the reviewer states below are unknown rather than absent"
+  fi
+
   guard_reviews="$(jq -r '.data.repository.pullRequest.reviews.nodes[]?
       | select(.author != null and .commit != null)
       | [.author.login, .commit.oid] | @tsv' <<<"$guard_pr" 2>/dev/null || true)"
@@ -125,7 +135,11 @@ else
     # review.
     if [ "$guard_state" != "stale" ]; then continue; fi
 
-    guard_bid="$(printf '%s\n' "$guard_ids" | awk -F'\t' -v b="$guard_bot" '$1 == b { print $2; exit }')"
+    # Suffix-stripped on both sides, as in `guard_rereview`: `guard_bot` is the
+    # normalised login and `guard_ids` carries whatever the API returned, so a
+    # bare `==` would lose the node id for the one reviewer we mean to re-ask.
+    guard_bid="$(printf '%s\n' "$guard_ids" \
+      | awk -F'\t' -v b="$guard_bot" '{ a = $1; sub(/\[bot\]$/, "", a) } a == b { print $2; exit }')"
     if [ -z "$guard_pr_id" ] || [ -z "$guard_bid" ]; then
       echo "pr-guard: $guard_bot reviewed an earlier commit, but its node id is unreadable — not re-requested"
       continue

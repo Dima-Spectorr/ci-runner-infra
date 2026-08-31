@@ -173,7 +173,14 @@ guard_rereview() {
   while IFS= read -r bot; do
     login="$(printf '%s' "$bot" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/\[bot\]$//')"
     [ -n "$login" ] || continue
-    mine="$(printf '%s\n' "$reviews" | awk -F'\t' -v b="$login" '$1 == b { print $2 }')"
+    # The reviewer's login is normalised on BOTH sides, not just on the
+    # configured one. GitHub returns a bot as `name` in some responses and
+    # `name[bot]` in others, and a comparison that strips the suffix from the
+    # configured list only would read a review it does have as no review at
+    # all — reporting `stale` for an answered head, or `absent` for a stale
+    # one. Same reason the pending list is stripped below.
+    mine="$(printf '%s\n' "$reviews" \
+      | awk -F'\t' -v b="$login" '{ a = $1; sub(/\[bot\]$/, "", a) } a == b { print $2 }')"
 
     if printf '%s\n' "$mine" | grep -cxF -- "$head" >/dev/null; then
       printf '%s\tanswered\n' "$login"

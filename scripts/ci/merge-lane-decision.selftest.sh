@@ -312,6 +312,21 @@ review "review:answered answered=2 expected=2" \
 # not get to put a number into a verdict line.
 review "review:answered answered=2 expected=2" \
   "a garbled count is dropped rather than printed as fact" 2 2 10 900 some
+
+# AND IT RIDES THE VERDICTS THAT ARE NOT `answered`, which is where an operator
+# most needs it: a merge annotated `UNREVIEWED` reads as a reviewer that never
+# spoke, and `unavailable=` is what says one of them spoke by declining. It was
+# on `review:answered` alone — the one line whose reader is least likely to go
+# looking — so all four now carry it, in the same order every time.
+review "review:unreviewed reason=grace-expired answered=1 expected=2 age=900 grace=60 unavailable=1" \
+  "a decline is named on the line that produces the annotation" 2 1 900 60 1
+review "review:hold answered=1 expected=2 age=10 grace=900 unavailable=1" \
+  "and while the lane is still waiting" 2 1 10 900 1
+review "review:unreviewed reason=no-clock answered=1 expected=2 unavailable=1" \
+  "and when the clock could not be read" 2 1 x 900 1
+# Both counters on one line, in a fixed order, so a log grep is stable.
+review "review:hold answered=0 expected=2 age=10 grace=900 unavailable=1 stale=1" \
+  "unavailable comes before stale, always" 2 0 10 900 1 1
 # It rides through `answered`, so it can never by itself release a hold.
 review "review:hold" "a decline the caller did not count still holds" 2 1 10 900 0
 

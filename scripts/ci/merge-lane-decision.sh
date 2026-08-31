@@ -487,15 +487,15 @@ lane_review_gate() {
   # Fail open, both ways: a clock the caller could not read and a grace that is
   # not a number both mean the lane proceeds rather than stalls.
   if ! [[ "$age" =~ ^[0-9]+$ ]] || ! [[ "$grace" =~ ^[0-9]+$ ]]; then
-    echo "review:unreviewed reason=no-clock answered=$answered expected=$expected$stale_note"
+    echo "review:unreviewed reason=no-clock answered=$answered expected=$expected$unavail_note$stale_note"
     return 0
   fi
 
   if [ "$age" -ge "$grace" ]; then
-    echo "review:unreviewed reason=grace-expired answered=$answered expected=$expected age=$age grace=$grace$stale_note"
+    echo "review:unreviewed reason=grace-expired answered=$answered expected=$expected age=$age grace=$grace$unavail_note$stale_note"
     return 0
   fi
 
-  echo "review:hold answered=$answered expected=$expected age=$age grace=$grace$stale_note"
+  echo "review:hold answered=$answered expected=$expected age=$age grace=$grace$unavail_note$stale_note"
   return 0
 }
