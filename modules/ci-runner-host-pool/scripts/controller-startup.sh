@@ -1456,17 +1456,21 @@ collect_apply_build() {
   fi
   APPLY_CHECK_DENIED=0
 
-  local name status created newest_status="" newest_created=""
+  local name status created found=0 newest_status="" newest_created=""
   while IFS=$'\t' read -r name status created; do
     case "$name" in "$APPLY_TRIGGER_PREFIX"*) ;; *) continue ;; esac
+    # The ROW is what found means, not the status on it. A build whose status
+    # column came back empty is a build that exists and did not succeed, which
+    # is `failed:unknown` — deriving found from the status instead would file it
+    # as `missing` and describe a trigger that is firing as one that stopped.
+    found=1
     newest_status="$status"
     newest_created="$created"
     break
   done <<<"$rows"
 
-  local found=0 age=-1 created_epoch
-  if [ -n "$newest_status" ]; then
-    found=1
+  local age=-1 created_epoch
+  if [ "$found" = "1" ]; then
     created_epoch=$(date -d "$newest_created" +%s 2>/dev/null) || created_epoch=0
     [ "$created_epoch" -gt 0 ] && age=$((now - created_epoch))
   fi
@@ -1480,6 +1484,11 @@ collect_apply_build() {
       # is the trigger that has stopped firing, which by definition leaves no
       # FAILURE behind to be found. Age keeps its previous value rather than
       # resetting, because a 0 here would read as "applied a moment ago".
+      #
+      # ci_apply_build_failed is deliberately left ALONE rather than cleared: a
+      # project whose newest apply failed and whose apply build has since aged
+      # off the page has not been fixed by ageing off the page. The staleness
+      # errs towards raising, and the missing signal is raised beside it.
       APPLY_BUILD_MISSING=1
       log "apply check: no ${APPLY_TRIGGER_PREFIX}* build in the last 50 builds of $PROJECT/$region — the trigger is not firing, and a trigger that never fires produces no failure to alert on"
       return 0
@@ -1491,7 +1500,7 @@ collect_apply_build() {
       # The refusal's whole explanation is in statusDetail and nowhere else, so
       # the log line carries the query: an operator who reaches this alert and
       # finds only "FAILURE" has to go and run it by hand anyway.
-      log "apply check: the newest apply build in $PROJECT/$region is ${verdict#failed:} (created $newest_created) — this project is no longer receiving runner infrastructure; read its statusDetail with 'gcloud builds list --project=$PROJECT --region=$region --limit=1 --format=\"value(status,statusDetail)\"'"
+      log "apply check: the newest apply build in $PROJECT/$region is ${verdict#failed:} (created $newest_created) — this project is no longer receiving runner infrastructure; read its statusDetail with 'gcloud builds list --project=$PROJECT --region=$region --limit=50 --format=\"value(substitutions.TRIGGER_NAME,status,statusDetail)\" | grep \"^$APPLY_TRIGGER_PREFIX\" | head -1'"
       ;;
     inflight:*)
       # Still running. The previous verdict stands rather than being reported as
