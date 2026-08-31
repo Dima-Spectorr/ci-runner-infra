@@ -225,6 +225,53 @@ Verify before wiring it, rather than assuming a CD account is narrow:
 gcloud projects get-iam-policy <project> --flatten="bindings[].members" --filter="bindings.members:<sa>@<project>.iam.gserviceaccount.com" --format="value(bindings.role)"
 ```
 
+### The grants that arrive one project at a time
+
+The list above is what the root needs to *start*. What it needs afterwards grows
+whenever a module starts managing a new resource kind — and the apply SA's role
+set lives nowhere in this repository, so the module cannot state the grant it now
+needs. The gap surfaces only as a red apply, in whichever project happens to lack
+it, days after the release merged green everywhere.
+
+Four have been found that way. They are listed here so the fifth is a lookup
+rather than another red build:
+
+| Grant | The resource that needs it | Found |
+|---|---|---|
+| `roles/compute.securityAdmin` | `ci-runner-network` manages firewall rules | 2026-08-29, 403 in 3 of 4 projects |
+| `logging.logMetrics.create/get/update` (custom `ciRunnerApplyLogMetrics`) | the alert-policies step reconciles log-based metrics | 2026-08-31 |
+| `compute.firewalls.create` (custom `ciRunnerApplyFirewall`) | `google_compute_firewall.iap_winrm`, added with the Windows pool | 2026-08-31 |
+| `roles/iam.serviceAccountUser` **on the apply SA itself** | the trigger carries `service_account = <the apply SA>`, and rewriting a trigger that names a service account is `actAs` on that account | 2026-08-31 |
+
+The last one is the one worth reading twice, because its 403 does not say what it
+is. Terraform reports it as
+`Error updating Trigger "...": googleapi: Error 403: The caller does not have permission`,
+which reads as a missing `cloudbuild.triggers.update` — and that is a dead end:
+`cloudbuild.triggers.*` is not assignable to a custom role, and appears in no
+predefined `cloudbuild.*` role. The denial is not on the trigger at all. Read the
+audit log rather than the Terraform error:
+
+```bash
+gcloud logging read 'protoPayload.authorizationInfo.granted=false AND protoPayload.authenticationInfo.principalEmail="<sa>@<project>.iam.gserviceaccount.com"' \
+  --project=<project> --freshness=6h --limit=5 \
+  --format='value(timestamp,protoPayload.methodName,protoPayload.authorizationInfo[].permission)'
+```
+
+It names `iam.serviceAccounts.actAs`, and the fix is a binding on the account
+resource, not on the project:
+
+```bash
+gcloud iam service-accounts add-iam-policy-binding <sa>@<project>.iam.gserviceaccount.com \
+  --member=serviceAccount:<sa>@<project>.iam.gserviceaccount.com \
+  --role=roles/iam.serviceAccountUser --project=<project>
+```
+
+The projects where this never appeared already had it for another reason —
+`mot-apps-modern`'s applier holds project-level `roles/iam.serviceAccountUser`,
+`mot-safetyofficer`'s holds a custom `deployerJobIamSetter` that carries `actAs`.
+Neither was granted for the trigger, which is why the requirement stayed hidden
+until it hit the one project with neither.
+
 **The scheduled run is not optional on a repository that pins `?ref=v5`.** It
 has no commit to push when v5.7.1 ships, so the push trigger never fires and
 the release sits in the tag forever. `apply_schedule` is the only trigger that
