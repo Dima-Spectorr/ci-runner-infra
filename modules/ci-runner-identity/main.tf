@@ -269,7 +269,7 @@ resource "google_project_iam_member" "controller_build_reader" {
   # grant_compute_admin: reading builds has nothing to do with deleting hosts,
   # and a project_iam_member re-written on the reuse path is one binding held by
   # two roots, where either root's removal revokes it for both pools.
-  count   = local.controller_grants ? 1 : 0
+  count   = local.controller_grants
   project = var.project_id
   role    = "roles/cloudbuild.builds.viewer"
   member  = "serviceAccount:${local.controller_email}"

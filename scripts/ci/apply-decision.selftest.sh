@@ -67,7 +67,7 @@ expect "missing" "an empty found flag is not a healthy project" "" SUCCESS 10
 expect "missing" "a non-numeric found flag is not a healthy project" x SUCCESS 10
 expect "missing" "found=2 is not found=1" 2 SUCCESS 10
 expect "failed:unknown" "a build found with no status is not a pass" 1 "" 10
-expect "missing" "no arguments at all does not report a healthy project" ""
+expect "missing" "no arguments at all does not report a healthy project"
 
 # --- in flight is not green ---------------------------------------------------
 # Reporting a success that has not happened yet is how a watcher ends up
