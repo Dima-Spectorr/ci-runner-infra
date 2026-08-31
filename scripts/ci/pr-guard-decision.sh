@@ -124,6 +124,77 @@ guard_overlap() {
 }
 
 # ---------------------------------------------------------------------------
+# guard_rereview <head-sha> <bots> <reviews> <pending>
+#
+# Which of this repository's automated reviewers have said something about the
+# CURRENT head, and which reviewed an earlier one and were never asked again.
+#
+#   bots     newline-separated logins, with or without a `[bot]` suffix — the
+#            same value `review-bots` carries into the merge lane.
+#   reviews  `login<TAB>commit-oid`, one per published review on this pull
+#            request, in any order.
+#   pending  newline-separated logins with an OUTSTANDING review request.
+#
+# Prints `login<TAB>state` per configured reviewer, `[bot]` stripped:
+#   answered — it reviewed this exact head; nothing to do
+#   pending  — it has been asked about something and has not answered yet
+#   stale    — it reviewed an EARLIER commit on this pull request and has not
+#              been asked about this one
+#   absent   — it has never reviewed this pull request at all
+#
+# ONLY `stale` IS ACTIONABLE, and the other three are the reason this is a
+# function rather than a one-line grep.
+#
+# `absent` is deliberately left alone. A reviewer that has never spoken here is
+# either still on its first pass — it is fast, but it is not instant — or is not
+# configured on this repository at all, and asking it again on every push would
+# be a poke in the dark that produces nothing and looks, in the log, exactly
+# like the thing that does work.
+#
+# `pending` is left alone for a sharper reason: a re-request replaces the
+# outstanding one. Asking again for a review already in flight restarts it, so a
+# pull request pushed twice in quick succession would keep cancelling its own
+# review and never get one.
+#
+# `answered` is matched on the FULL oid and nothing shorter. An abbreviated
+# match is a prefix match, and a prefix match against the wrong commit is the
+# one error this must not make: it would report a head as reviewed that nobody
+# has looked at.
+# ---------------------------------------------------------------------------
+guard_rereview() {
+  local head="${1:-}" bots="${2:-}" reviews="${3:-}" pending="${4:-}"
+  local bot login mine
+
+  # No head, nothing to compare against. Silence rather than four `absent`
+  # lines: a caller that could not read the sha has not learned that nobody
+  # reviewed it.
+  [ -n "$head" ] || return 0
+
+  while IFS= read -r bot; do
+    login="$(printf '%s' "$bot" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/\[bot\]$//')"
+    [ -n "$login" ] || continue
+    # The reviewer's login is normalised on BOTH sides, not just on the
+    # configured one. GitHub returns a bot as `name` in some responses and
+    # `name[bot]` in others, and a comparison that strips the suffix from the
+    # configured list only would read a review it does have as no review at
+    # all — reporting `stale` for an answered head, or `absent` for a stale
+    # one. Same reason the pending list is stripped below.
+    mine="$(printf '%s\n' "$reviews" \
+      | awk -F'\t' -v b="$login" '{ a = $1; sub(/\[bot\]$/, "", a) } a == b { print $2 }')"
+
+    if printf '%s\n' "$mine" | grep -cxF -- "$head" >/dev/null; then
+      printf '%s\tanswered\n' "$login"
+    elif printf '%s\n' "$pending" | sed 's/\[bot\]$//' | grep -cxF -- "$login" >/dev/null; then
+      printf '%s\tpending\n' "$login"
+    elif printf '%s\n' "$mine" | grep -c '[^[:space:]]' >/dev/null; then
+      printf '%s\tstale\n' "$login"
+    else
+      printf '%s\tabsent\n' "$login"
+    fi
+  done <<<"$bots"
+}
+
+# ---------------------------------------------------------------------------
 # guard_exit <verdict>...
 #
 # The whole run's exit status from the verdicts it reached. Non-zero only when

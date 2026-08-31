@@ -45,6 +45,127 @@ fi
 
 echo "pr-guard: #$PR_NUMBER base=$BASE head=$HEAD_SHA max-behind=$MAX_BEHIND compare-cap=$MAX_COMPARE"
 
+# --- the reviewer that read the last push and not this one -------------------
+# Copilot reviews the FIRST push to a pull request and then stops. Measured
+# across the fleet on 2026-08-30: fourteen of fifteen merged multi-commit pull
+# requests had no Copilot review on the head that actually landed. The merge
+# lane asks about the head it is about to merge, finds nothing, waits out its
+# grace and annotates the merge `UNREVIEWED` — a warning documented to mean "a
+# reviewer is down, go look". It had been firing on a reviewer in perfect
+# health that simply was not asked again, which is how such a warning stops
+# being read. See `docs/ai-code-review.md`.
+#
+# ASKED HERE, ON THE PUSH, AND THAT IS THE WHOLE DESIGN. CI on this fleet takes
+# tens of minutes and a review takes a few, so a review requested now runs
+# beside the checks and has landed long before the lane asks. Asking at merge
+# time would work too and would add the review's latency to every merge, which
+# is precisely what the last three releases went to removing.
+#
+# DRAFTS ARE EXCLUDED BY THE EXIT ABOVE, deliberately. A reviewer does not read
+# a draft, the lane does not merge one, and `ready_for_review` brings the pull
+# request back through here.
+#
+# EVERY CALL FAILS SOFT. A fork's token is read-only and a caller may not hold
+# `pull-requests: write`; a guard that went red because it could not ASK for a
+# review would be a worse version of the problem it fixes. The lane's grace is
+# the fallback and it still works — it is just louder than it needs to be.
+mapfile -t GUARD_REVIEW_BOTS < <(printf '%s\n' "${REVIEW_BOTS_INPUT:-}" \
+  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' || true)
+FORK="$(jq -r '.head.repo.fork // false' <<<"$pr")"
+
+if [ "${#GUARD_REVIEW_BOTS[@]}" -eq 0 ]; then
+  echo "pr-guard: no review-bots configured — not asking anyone for a review"
+elif [ "$FORK" = "true" ]; then
+  echo "pr-guard: #$PR_NUMBER is from a fork — the token is read-only, so no review is requested"
+else
+  # ONE READ FOR ALL THREE FACTS, AND IT HAS TO BE GRAPHQL. REST answers none of
+  # them together: `/pulls/<n>/requested_reviewers` omits bots entirely, and
+  # POSTing to it refuses a bot login outright — `422 Reviews may only be
+  # requested from collaborators`, measured 2026-08-30. The reviewer's node id
+  # is only reachable as the AUTHOR of a review it has already published;
+  # `suggestedActors` returns `copilot-swe-agent`, which is the coding agent and
+  # a different bot.
+  #
+  # The pull request number rides in as a VARIABLE, never interpolated into the
+  # program text — the same argument the `--argjson` comment below makes.
+  # SC2016: `$o`, `$r` and `$n` are GRAPHQL variables and must reach the server
+  # unexpanded — that is the entire point of passing them with `-F`. Double
+  # quoting here is the change that would break it, and it would break it by
+  # substituting shell values into a query the server then rejects.
+  # shellcheck disable=SC2016
+  guard_gql='query($o:String!,$r:String!,$n:Int!) {
+    repository(owner:$o, name:$r) { pullRequest(number:$n) {
+      id
+      reviews(last:100) { nodes { commit { oid } author { login ... on Bot { id } } } }
+      reviewRequests(first:20) { nodes { requestedReviewer {
+        ... on Bot { login } ... on User { login } } } }
+    } }
+  }'
+  # `-f` for the strings and `-F` only for the number: `-F` COERCES, so an
+  # owner or repository name that happens to be all digits would arrive as an
+  # Int and the server would reject the query against `String!`.
+  #
+  # `gh`'s stderr is deliberately NOT redirected, here or on the mutation below.
+  # This section is written to fail soft and say why, and a swallowed error
+  # leaves only "it did not work": the difference between a caller missing
+  # `pull-requests: write`, a fork's read-only token and a GraphQL outage is the
+  # whole of the diagnosis, and it exists nowhere but in that message.
+  guard_pr="$(gh api graphql -f o="${R%%/*}" -f r="${R#*/}" -F n="$PR_NUMBER" \
+    -f query="$guard_gql" || true)"
+
+  guard_pr_id="$(jq -r '.data.repository.pullRequest.id // empty' <<<"$guard_pr" 2>/dev/null || true)"
+
+  # A read that failed and a pull request nobody has reviewed produce the same
+  # empty lists, and would print the same four `absent` lines — "did not check"
+  # rendering as "found nothing", which is the failure this guard exists to stop
+  # doing elsewhere. The pull request's node id is present in every successful
+  # response and in none of the failures, so its absence names the read.
+  if [ -z "$guard_pr_id" ]; then
+    echo "pr-guard: could not read #$PR_NUMBER's reviews — no review is re-requested, and the reviewer states below are unknown rather than absent"
+  fi
+
+  guard_reviews="$(jq -r '.data.repository.pullRequest.reviews.nodes[]?
+      | select(.author != null and .commit != null)
+      | [.author.login, .commit.oid] | @tsv' <<<"$guard_pr" 2>/dev/null || true)"
+  guard_pending="$(jq -r '.data.repository.pullRequest.reviewRequests.nodes[]?
+      | .requestedReviewer.login // empty' <<<"$guard_pr" 2>/dev/null || true)"
+  guard_ids="$(jq -r '.data.repository.pullRequest.reviews.nodes[]?
+      | select(.author.id != null) | [.author.login, .author.id] | @tsv' <<<"$guard_pr" 2>/dev/null || true)"
+
+  while IFS=$'\t' read -r guard_bot guard_state; do
+    [ -n "$guard_bot" ] || continue
+    echo "pr-guard: review $guard_bot=$guard_state"
+    # Only `stale` is actionable, and `guard_rereview` documents why each of the
+    # other three is not — `pending` in particular, where re-asking REPLACES the
+    # request in flight and a pull request pushed twice would cancel its own
+    # review.
+    if [ "$guard_state" != "stale" ]; then continue; fi
+
+    # Suffix-stripped on both sides, as in `guard_rereview`: `guard_bot` is the
+    # normalised login and `guard_ids` carries whatever the API returned, so a
+    # bare `==` would lose the node id for the one reviewer we mean to re-ask.
+    guard_bid="$(printf '%s\n' "$guard_ids" \
+      | awk -F'\t' -v b="$guard_bot" '{ a = $1; sub(/\[bot\]$/, "", a) } a == b { print $2; exit }')"
+    if [ -z "$guard_pr_id" ] || [ -z "$guard_bid" ]; then
+      echo "pr-guard: $guard_bot reviewed an earlier commit, but its node id is unreadable — not re-requested"
+      continue
+    fi
+    # shellcheck disable=SC2016  # `$p` and `$b` are GraphQL variables, as above.
+    if gh api graphql -f p="$guard_pr_id" -f b="$guard_bid" \
+      -f query='mutation($p:ID!,$b:ID!) {
+        requestReviews(input:{pullRequestId:$p, botIds:[$b], union:true}) {
+          pullRequest { number } } }' --silent; then
+      echo "pr-guard: asked $guard_bot to review ${HEAD_SHA:0:8} — it had reviewed an earlier commit here"
+    else
+      # `union:true` above so this never drops a reviewer somebody else added.
+      # `gh`'s own error is on the line above this one, unredirected: the reason
+      # is what an operator needs, and this line cannot carry it.
+      echo "pr-guard: could not ask $guard_bot to review ${HEAD_SHA:0:8} — the merge lane falls back to its grace (reason above)"
+    fi
+  done < <(guard_rereview "$HEAD_SHA" "$(printf '%s\n' "${GUARD_REVIEW_BOTS[@]}")" \
+    "$guard_reviews" "$guard_pending")
+fi
+
 # --- how stale is it? --------------------------------------------------------
 # `|| true` is safe here ONLY because `guard_freshness` re-validates: anything
 # that is not a plain number becomes `unknown`, which never fails the run. That

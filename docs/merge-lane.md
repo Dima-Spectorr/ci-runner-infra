@@ -591,6 +591,16 @@ vendor's billing page authority over this repository. So the wait is bounded by
 `review-grace-seconds`, and past it the lane merges and writes a warning
 annotation naming the pull request and the sha.
 
+**Two annotations, because they send you to different places.** A verdict
+carrying `stale=<n>` means a listed reviewer read an **earlier commit on this
+same pull request** and was never asked about the head that landed — a healthy
+reviewer, an unasked commit, not an outage. `pr-guard` re-requests the review on
+every push precisely so this does not happen, so seeing `stale=` means that did
+not work and the place to look is the guard's run on the last push, not a
+vendor's status page. Without `stale=`, the annotation means what it always
+meant: nobody answered at all, and on every pull request that is a reviewer that
+is down.
+
 **Sixty seconds, not ten minutes.** The grace closes a *race*, not a think.
 The review request and the lane are dispatched by the same `workflow_run`
 completion and land within about a second of each other; without a hold the
@@ -900,6 +910,16 @@ workflow, [`pr-guard.yml`](../.github/workflows/pr-guard.yml):
    request, intersected with the changed-file list of every other open one
    against the same base. Overlaps are reported as a table naming the other pull
    request and the shared paths.
+3. **Has the automated reviewer seen *this* head?** Copilot reviews the first
+   push and then stops — fourteen of fifteen merged multi-commit pull requests
+   in the fleet had no Copilot review on the head that landed. The lane then
+   asks about a commit nobody was asked about and annotates the merge
+   `UNREVIEWED`, which is documented below to mean the reviewer is *down*. The
+   guard re-requests the review instead, and does it **here, on the push**, so
+   the review runs beside CI and costs the merge nothing. `review-bots` defaults
+   to `copilot-pull-request-reviewer[bot]`; set it to an empty string to opt
+   out. The full argument, including what is *not* re-requested and why, is in
+   [`docs/ai-code-review.md`](ai-code-review.md).
 
 It runs on `pull_request` — `opened`, `synchronize`, `reopened`,
 `ready_for_review` — so the answer is re-computed on every push, and it leaves

@@ -395,6 +395,14 @@ lane_pass_expired() {
 #            to 0, and it changes no decision. It rides through so the verdict
 #            line distinguishes "reviewed" from "nobody could review", which are
 #            the same merge and completely different operationally.
+# stale      how many EXPECTED reviewers reviewed an earlier commit on this pull
+#            request and were never asked about this head — optional, defaults
+#            to 0, and it too changes no decision. It is disjoint from
+#            `answered`: a review of an older tree says nothing about the new
+#            one. It rides through because `answered=0` alone cannot tell an
+#            operator apart a reviewer that is DOWN from one that is healthy and
+#            was not asked, and the annotation this feeds is documented to mean
+#            the first.
 #
 # WHY THIS EXISTS
 #
@@ -438,8 +446,16 @@ lane_pass_expired() {
 #   review:unreviewed       the grace is spent; merge anyway, and say so
 # ---------------------------------------------------------------------------
 lane_review_gate() {
-  local expected="${1:-}" answered="${2:-}" age="${3:-}" grace="${4:-}" unavailable="${5:-0}"
-  local unavail_note=''
+  local expected="${1:-}" answered="${2:-}" age="${3:-}" grace="${4:-}" unavailable="${5:-0}" stale="${6:-0}"
+  local unavail_note='' stale_note=''
+  # Same shape and same reason as `unavail_note`: a count, carried into the
+  # verdict line, deciding nothing. It is the difference between "no reviewer
+  # answered" and "the reviewer answered an earlier commit and was not asked
+  # about this one", which are the same merge and completely different things
+  # for an operator to go and look at.
+  if [[ "$stale" =~ ^[0-9]+$ ]] && [ "$stale" -gt 0 ]; then
+    stale_note=" stale=$stale"
+  fi
   # Reported only when it is a number and non-zero. A garbled value must not
   # appear in a verdict line that an operator reads as fact. An `if`, not a
   # `&&` chain: this file is sourced into `set -e`, where a chain that ends
@@ -471,15 +487,15 @@ lane_review_gate() {
   # Fail open, both ways: a clock the caller could not read and a grace that is
   # not a number both mean the lane proceeds rather than stalls.
   if ! [[ "$age" =~ ^[0-9]+$ ]] || ! [[ "$grace" =~ ^[0-9]+$ ]]; then
-    echo "review:unreviewed reason=no-clock answered=$answered expected=$expected"
+    echo "review:unreviewed reason=no-clock answered=$answered expected=$expected$unavail_note$stale_note"
     return 0
   fi
 
   if [ "$age" -ge "$grace" ]; then
-    echo "review:unreviewed reason=grace-expired answered=$answered expected=$expected age=$age grace=$grace"
+    echo "review:unreviewed reason=grace-expired answered=$answered expected=$expected age=$age grace=$grace$unavail_note$stale_note"
     return 0
   fi
 
-  echo "review:hold answered=$answered expected=$expected age=$age grace=$grace"
+  echo "review:hold answered=$answered expected=$expected age=$age grace=$grace$unavail_note$stale_note"
   return 0
 }

@@ -456,10 +456,26 @@ already_released() {
 # answered" are different facts, and `lane_review_gate` merges on the first
 # rather than holding a green pull request over a rate limit.
 #
-# Prints TWO numbers: `<answered> <unavailable>`, where `unavailable` is the
-# subset of `answered` that answered by being unable to answer. The caller needs
-# both because they merge for the same reason and mean opposite things to an
-# operator.
+# AND A FOURTH FACT, WHICH IS NOT AN ANSWER: A REVIEWER THAT READ AN EARLIER
+# COMMIT ON THIS PULL REQUEST.
+#
+# Copilot reviews the first push and then stops — fourteen of fifteen merged
+# multi-commit pull requests in the fleet had no Copilot review on the head that
+# landed (measured 2026-08-30). A review of an older tree says nothing about the
+# new one, so it must not count as an answer, and it does not. But it is also
+# not an outage, and until now the two rendered identically: `answered=0` on
+# every pull request whose head moved, and an `UNREVIEWED` annotation that means
+# "a reviewer is down, go look" firing on a reviewer in perfect health. That is
+# the same failure this gate exists to prevent, one level up.
+#
+# `pr-guard` now asks the reviewer again on every push, which is why this is a
+# COUNTER rather than a decision — it changes nothing, and it is what tells an
+# operator which of the two failures they are reading when that did not work.
+#
+# Prints THREE numbers: `<answered> <unavailable> <stale>`. `unavailable` is the
+# subset of `answered` that answered by being unable to answer — the caller
+# needs both because they merge for the same reason and mean opposite things to
+# an operator. `stale` is disjoint from `answered`.
 # ---------------------------------------------------------------------------
 review_answered() {
   # `short` is deliberately a SECOND `local`. Assignments within one `local`
@@ -468,18 +484,18 @@ review_answered() {
   # enclosing scope — empty, here, which makes the comment surface match every
   # comment ever written and every pull request look reviewed. shellcheck calls
   # it SC2318 and it is the reason this is two lines.
-  local num="$1" sha="$2" bot n=0 u=0
+  local num="$1" sha="$2" bot n=0 u=0 s=0
   local short="${sha:0:7}"
   local reviews comments declined
 
   if ! reviews="$(gh api --paginate "repos/$R/pulls/$num/reviews?per_page=100" \
     --jq '.[] | [.user.login, .commit_id] | @tsv' 2>/dev/null)"; then
-    echo "-1 0"
+    echo "-1 0 0"
     return 0
   fi
   if ! comments="$(gh api --paginate "repos/$R/issues/$num/comments?per_page=100" \
     --jq '.[] | [.user.login, (.body | gsub("[\n\r]"; " "))] | @tsv' 2>/dev/null)"; then
-    echo "-1 0"
+    echo "-1 0 0"
     return 0
   fi
 
@@ -509,10 +525,21 @@ review_answered() {
     if printf '%s\n' "$declined" | grep -cxF -- "${bot%\[bot\]}" >/dev/null; then
       n=$((n + 1))
       u=$((u + 1))
+      continue
+    fi
+    # NOT AN ANSWER, BUT NOT AN OUTAGE EITHER. A review of an EARLIER commit on
+    # this same pull request says nothing about the code that is about to land —
+    # that is why it does not count above — but it does say the reviewer is
+    # alive and was simply never asked about this head. Copilot behaves exactly
+    # this way: it reviews the first push and then stops. `pr-guard` asks it
+    # again on every push, and this counter is what tells an operator which of
+    # the two failures they are looking at when that did not work.
+    if printf '%s\n' "$reviews" | awk -F'\t' -v b="$bot" '$1 == b' | grep -c . >/dev/null; then
+      s=$((s + 1))
     fi
   done
 
-  echo "$n $u"
+  echo "$n $u $s"
 }
 
 # ---------------------------------------------------------------------------
@@ -1269,14 +1296,14 @@ one_pass() {
     # an event.
     local unreviewed=''
     if [ "${#REVIEW_BOTS[@]}" -gt 0 ] && [ "${verdict%%:*}" = "merge" ]; then
-      local answered unavailable review_age review_verdict
+      local answered unavailable stale review_age review_verdict
       # `|| true`: under `set -e` a `read` that finds nothing would abort the
-      # whole pass. It cannot here — `review_answered` always prints two fields
-      # — and a lane that stops merging over a defensive read is a worse failure
-      # than the one being defended against.
-      read -r answered unavailable <<<"$(review_answered "$num" "$sha")" || true
+      # whole pass. It cannot here — `review_answered` always prints three
+      # fields — and a lane that stops merging over a defensive read is a worse
+      # failure than the one being defended against.
+      read -r answered unavailable stale <<<"$(review_answered "$num" "$sha")" || true
       review_age="$(review_clock "$sha")"
-      review_verdict="$(lane_review_gate "${#REVIEW_BOTS[@]}" "$answered" "$review_age" "$REVIEW_GRACE" "$unavailable")"
+      review_verdict="$(lane_review_gate "${#REVIEW_BOTS[@]}" "$answered" "$review_age" "$REVIEW_GRACE" "$unavailable" "$stale")"
       # A NOTICE, NOT A WARNING, AND SAID HERE RATHER THAN AT THE MERGE.
       #
       # An unavailable reviewer is not an unreviewed merge — the pull request may
@@ -1482,7 +1509,22 @@ one_pass() {
     # answering, most likely a Codex account out of credits, and that is a fact
     # worth reading in the run rather than inferring from silence.
     if [ -n "$action_unreviewed" ]; then
-      echo "::warning::lane: #$action_num merging UNREVIEWED — $action_unreviewed. The required checks are green; the automated reviewers did not answer for ${action_sha:0:8} in time. If this appears on every pull request, the reviewer is down (Codex credits are the usual cause), not slow."
+      # TWO DIFFERENT FACTS, AND THE ANNOTATION HAS TO NAME WHICH. `stale=` in
+      # the verdict means a listed reviewer read an EARLIER commit here and was
+      # never asked about this one — a healthy reviewer, an unasked head — and
+      # it used to render identically to a reviewer that is down. Sending an
+      # operator to check a vendor's status page over a Copilot that simply does
+      # not re-review a moved head is how this warning stopped being read.
+      # `pr-guard` asks on every push; seeing `stale=` here means that did not
+      # work, which is a defect in this repository rather than an outage.
+      case "$action_unreviewed" in
+        *' stale='*)
+          echo "::warning::lane: #$action_num merging UNREVIEWED — $action_unreviewed. The required checks are green; a reviewer reviewed an EARLIER commit on this pull request and was never asked about ${action_sha:0:8}. That is not an outage — check that \`pr-guard\` ran on the last push and could re-request the review."
+          ;;
+        *)
+          echo "::warning::lane: #$action_num merging UNREVIEWED — $action_unreviewed. The required checks are green; the automated reviewers did not answer for ${action_sha:0:8} in time. If this appears on every pull request, the reviewer is down (rate limit or credits are the usual cause), not slow."
+          ;;
+      esac
     fi
 
     local take_rc=0
