@@ -56,6 +56,15 @@ having installed nothing. Both read from the outside as a cache that is merely
 cold. Override only for a repository whose build genuinely is not
 `turbo run build`, and expect to revisit it.
 
+**Every install gets one retry, fifteen seconds apart.** The warm fires
+unattended at 04:00, the fleet's hosts share one egress IP, and the next fire is
+twenty-four hours away — so a transfer reset in the middle of a download is not a
+build that failed, it is a day of cold host caches with nothing red to point at.
+Build `2ee657b0` (2026-09-01) died exactly that way, on corepack fetching
+`pnpm-9.15.0.tgz`. One retry, not a loop: a reset clears at once or does not
+clear at all, and a build that keeps trying a dead network holds a host slot
+while it does it. A second failure is a real one and reads as one.
+
 **The build step installs twice, on purpose.** The publishing script stages the
 package stores under `mktemp -d`, and only `/workspace` survives between Cloud
 Build steps. With npm that is invisible; pnpm's `node_modules` is a tree of links

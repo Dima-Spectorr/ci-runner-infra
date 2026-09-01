@@ -376,13 +376,49 @@ locals {
   # Build environment entry (`CACHE_PREPARE=…`), and an entry carrying newlines is
   # a thing to find out about in a nightly log. `join(" ", …)` is what keeps the
   # ladder readable here and a single line there.
+  # THE RUNGS THEMSELVES, one per package manager, kept apart from the `if` chain
+  # so each can be wrapped once below rather than written twice by hand.
+  install_attempts = {
+    pnpm   = "pnpm install --frozen-lockfile @FLAGS@"
+    yarn   = "yarn install --immutable @YARN@ || yarn install --frozen-lockfile @FLAGS@"
+    npm_ci = "npm ci @FLAGS@"
+    npm_i  = "npm install --no-audit --no-fund @FLAGS@"
+  }
+
+  # A NETWORK FLAKE IS NOT A REASON TO LOSE THE NIGHT. Every rung gets ONE retry,
+  # fifteen seconds apart, because what this answers is not a wrong command:
+  # build `2ee657b0-4cc2-4722-bdf3-4ce766e5a55e` (2026-09-01 04:00) died in
+  # `dependencies` when corepack's download of `pnpm-9.15.0.tgz` was reset
+  # mid-transfer. The fleet's hosts share one egress IP, the warm fires
+  # unattended at 04:00, and the next fire is twenty-four hours away — so the
+  # first anyone sees of a reset is a host cache a full day stale, with nothing
+  # red to point at. Fifteen seconds is the cheaper side of that.
+  #
+  # ONE retry, not a loop: a reset mid-download clears immediately or does not
+  # clear at all, and a build that keeps trying a dead network holds a host slot
+  # while it does it. A second failure is a real one and should read as one.
+  #
+  # THE COMMAND IS REPEATED RATHER THAN PUT IN A SHELL FUNCTION, and that is
+  # deliberate. A function needs `"$@"`, and every `$` this module emits is
+  # doubled on its way into a Cloud Build step — `"$$@"` is the build's PID
+  # followed by a literal `@`, which is the exact class of defect that published
+  # an empty turbo prefix for months (see `--cache-dir` below). Nothing rendered
+  # here contains a `$` at all, so the escaping cannot reach it.
+  #
+  # `{ …; }` groups the yarn rung's own Berry-then-classic fallback, so the
+  # retry covers the pair and not just the classic half.
+  install_retried = {
+    for manager, cmd in local.install_attempts :
+    manager => "{ ${cmd}; } || { echo '[warm] ${manager} install failed; one retry in 15s' >&2; sleep 15; ${cmd}; }"
+  }
+
   install_ladder = join(" ", [
-    "if [ -f pnpm-lock.yaml ]; then corepack enable >/dev/null 2>&1 || true; pnpm install --frozen-lockfile @FLAGS@;",
+    "if [ -f pnpm-lock.yaml ]; then corepack enable >/dev/null 2>&1 || true; ${local.install_retried["pnpm"]};",
     # Berry and classic disagree on both flags, and which one a repository is on
     # is not knowable from the lockfile name. Berry first, classic as the fallback.
-    "elif [ -f yarn.lock ]; then corepack enable >/dev/null 2>&1 || true; yarn install --immutable @YARN@ || yarn install --frozen-lockfile @FLAGS@;",
-    "elif [ -f package-lock.json ]; then npm ci @FLAGS@;",
-    "elif [ -f package.json ]; then npm install --no-audit --no-fund @FLAGS@;",
+    "elif [ -f yarn.lock ]; then corepack enable >/dev/null 2>&1 || true; ${local.install_retried["yarn"]};",
+    "elif [ -f package-lock.json ]; then ${local.install_retried["npm_ci"]};",
+    "elif [ -f package.json ]; then ${local.install_retried["npm_i"]};",
     "else echo '[warm] no lockfile and no package.json at the repository root; nothing to install'; fi",
   ])
 
