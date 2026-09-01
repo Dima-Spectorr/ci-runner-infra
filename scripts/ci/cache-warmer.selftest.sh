@@ -476,6 +476,38 @@ if validates_scan_allow_path "$VARS"; then ok; else
   bad "cache_scan_allow_file is no longer validated — it is pasted into a single-quoted shell string in the step that holds the warmer's write credential"
 fi
 
+# 17. EVERY INSTALL RUNG SURVIVES ONE NETWORK RESET. The warm fires unattended at
+#     04:00 and the next fire is a day away, so a transfer reset costs a full day
+#     of stale host caches with nothing red to point at — measured on build
+#     `2ee657b0` (2026-09-01), which died in `dependencies` when corepack's
+#     download of `pnpm-9.15.0.tgz` was reset mid-transfer.
+#
+#     Asserted on the RENDERED rungs, not on the presence of the word "retry":
+#     the ladder is a single line built by interpolation, and the shape that
+#     matters is `{ cmd; } || { …; sleep …; cmd; }` — a retry written as a shell
+#     function would need `"$@"`, whose `$` this module's own escaping rule turns
+#     into the build's PID. So the absence of a `$` is part of the check.
+retries_each_install() { # <file>
+  local code rendered
+  code=$(code_of "$1")
+  matches "$code" 'install_attempts = \{' || return 1
+  matches "$code" 'install_retried = \{' || return 1
+  # The wrapper: grouped, one retry, a pause between the two attempts.
+  rendered=$(printf '%s\n' "$code" | grep -F 'manager => "{ ${cmd}; } ||') || return 1
+  matches "$rendered" 'sleep 15; \$\{cmd\}; \}' || return 1
+  # Nothing rendered into the rung may carry a `$` that reaches the shell.
+  ! matches "$rendered" '"\$@"' || return 1
+  # And the ladder must actually USE the wrapped rungs. A chain that still names
+  # the bare command is a retry that exists in the file and nowhere else.
+  # `matches` is grep -E, so the shell's `||` has to be escaped out of alternation.
+  ! matches "$code" 'then corepack enable >/dev/null 2>&1 \|\| true; pnpm install' || return 1
+  [ "$(printf '%s\n' "$code" | grep -cF 'local.install_retried[')" -eq 4 ]
+}
+
+if retries_each_install "$MAIN"; then ok; else
+  bad "an install rung no longer survives a single network reset — the warm runs unattended at 04:00 against a shared egress IP, so one reset mid-download costs a day of stale host caches and nothing goes red"
+fi
+
 # --- mutations -----------------------------------------------------------------
 
 mutate() { # <description> <file> <sed-program> <predicate>
@@ -673,6 +705,25 @@ mutate "the size guard removed" "$MAIN" \
 mutate "the staging script escaped again" "$MAIN" \
   's@stage_script = local\.stage_script_raw@stage_script = replace(local.stage_script_raw, "$", "$$")@' \
   has_no_dollar_escaping
+
+# The retry defined and then not reached — the shape a refactor produces when it
+# rewrites one rung of the chain and leaves the rest, and the one an assertion on
+# the word "retry" alone would pass.
+mutate "one rung left calling the bare install" "$MAIN" \
+  's|\${local\.install_retried\["pnpm"\]}|pnpm install --frozen-lockfile @FLAGS@|' \
+  retries_each_install
+
+# A retry with no pause is not a retry against a reset connection; it is two
+# failures a millisecond apart.
+mutate "the pause between the two attempts removed" "$MAIN" \
+  's|sleep 15; ||' \
+  retries_each_install
+
+# The natural way to write this — and the way that renders `"$$@"`, the build's
+# PID followed by a literal `@`, because every `$` in a step command is doubled.
+mutate "the retry written through a shell function" "$MAIN" \
+  's|sleep 15; ${cmd}; }|sleep 15; \\"$@\\"; }|' \
+  retries_each_install
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
