@@ -486,7 +486,7 @@ fi
 #     the ladder is a single line built by interpolation, and the shape that
 #     matters is `{ cmd; } || { …; sleep …; cmd; }` — a retry written as a shell
 #     function would need `"$@"`, whose `$` this module's own escaping rule turns
-#     into the build's PID. So the absence of a `$` is part of the check.
+#     into the build's PID. So the absence of `"$@"` is part of the check.
 retries_each_install() { # <file>
   local code rendered
   code=$(code_of "$1")
@@ -495,7 +495,7 @@ retries_each_install() { # <file>
   # The wrapper: grouped, one retry, a pause between the two attempts.
   rendered=$(printf '%s\n' "$code" | grep -F 'manager => "{ ${cmd}; } ||') || return 1
   matches "$rendered" 'sleep 15; \$\{cmd\}; \}' || return 1
-  # Nothing rendered into the rung may carry a `$` that reaches the shell.
+  # No rung may reach the shell through `"$@"` - that `$` becomes the build PID.
   ! matches "$rendered" '"\$@"' || return 1
   # And the ladder must actually USE the wrapped rungs. A chain that still names
   # the bare command is a retry that exists in the file and nowhere else.
