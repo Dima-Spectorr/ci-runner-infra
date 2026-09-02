@@ -79,9 +79,12 @@ cat > "$tmp/listing.json" <<'JSON'
 ]}
 JSON
 
-# The intended body, as the script composes it: no name, no records, no
-# `enabled`, no condition names -- and no thresholdValue on the `> 0`
-# condition, because the script writes 0 and the server drops it.
+# The intended body, derived from the listing so the two agree by construction:
+# no name, no records, no `enabled`, no condition names. Note what it does NOT
+# strip -- the `> 0` condition has no thresholdValue here because the LISTING
+# omits it. The script itself emits `"thresholdValue": 0.0` for that condition;
+# reconciling absent against 0.0 is exactly what policy_unchanged() is for, and
+# the "absent threshold equals 0" case below is the assertion that proves it.
 python3 - "$tmp/listing.json" "$tmp/base.json" <<'PY'
 import json, sys
 p = json.load(open(sys.argv[1], encoding="utf-8"))["alertPolicies"][0]
@@ -94,13 +97,25 @@ PY
 # check <expected rc> <description> [python mutation applied to `q`]
 check() {
   local want="$1" desc="$2" mut="${3:-}"
-  python3 - "$tmp/base.json" "$tmp/p.json" "$mut" <<'PY'
+  # Build the fixture, and treat a failure to build it as a failed case. A
+  # mutation that raises leaves json.dump unreached, so without this the file
+  # from the PREVIOUS case is what gets compared -- and since that file is
+  # usually base-identical, a broken `check 0` would pass for the one reason the
+  # test exists to rule out. Deleting it first turns a silent skip into a loud
+  # one either way.
+  rm -f "$tmp/p.json"
+  if ! python3 - "$tmp/base.json" "$tmp/p.json" "$mut" <<'PY'
 import json, sys
 q = json.load(open(sys.argv[1], encoding="utf-8"))
 if sys.argv[3]:
     exec(sys.argv[3])
 json.dump(q, open(sys.argv[2], "w", encoding="utf-8"))
 PY
+  then
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s (fixture generation failed — the mutation did not apply)\n' "$desc"
+    return
+  fi
   policy_unchanged "projects/p/alertPolicies/1" "$tmp/p.json" "$tmp/listing.json"
   local got=$?
   if [ "$got" = "$want" ]; then
