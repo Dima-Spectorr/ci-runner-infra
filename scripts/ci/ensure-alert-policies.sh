@@ -784,7 +784,7 @@ for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsm
   fi
 
   # Taking the first match keeps the script running, but two policies with one
-  # displayName is a state it must not pass over in silence: this run updates one
+  # displayName is a state it must not pass over in silence: this run manages one
   # of them and the other keeps whatever thresholds it was created with, so the
   # project pages twice and only one of the pages reflects the file. Found live
   # as a byte-identical pair — the shape the POST-is-never-retried rule in mon()
@@ -793,7 +793,7 @@ for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsm
   # operator decision, not something a sync script should do unprompted.
   dupes="$(printf '%s\n' "$id_all" | grep -c . || true)"
   [ "${dupes:-0}" -le 1 ] || {
-    echo "$PROJECT: $dupes policies share the name '$name' — updating ${id##*/} and leaving the rest stale. Delete the extras." >&2; }
+    echo "$PROJECT: $dupes policies share the name '$name' — this run manages ${id##*/} only (writing it or leaving it alone) and the rest stay stale. Delete the extras." >&2; }
 
   # Nothing to say to the API when the live policy already says this. Checked
   # before the dry-run branch so a dry run reports the same three-way verdict a
