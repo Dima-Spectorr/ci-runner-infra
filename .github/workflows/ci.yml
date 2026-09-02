@@ -442,6 +442,16 @@ jobs:
       - name: apply-decision self-test
         run: bash scripts/ci/apply-decision.selftest.sh
 
+      # The same control plane, one layer down: whether the apply is allowed to
+      # touch an alert policy at all. Updating one closes its open incidents and
+      # the next evaluation re-opens and re-notifies, so the unconditional PATCH
+      # this replaced mailed every currently-true condition once an hour, around
+      # the clock, describing nothing that had changed. The comparison that
+      # stops it is now the only thing between an operator's threshold edit and
+      # a change that silently never deploys, so it is tested from both sides.
+      - name: alert-policy idempotence self-test
+        run: bash scripts/ci/alert-policy-idempotence.selftest.sh
+
 
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a

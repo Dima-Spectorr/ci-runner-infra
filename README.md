@@ -803,7 +803,16 @@ gets a warning naming the roles. Those two rather than `roles/monitoring.editor`
 (#548) — the step writes alert policies and, on a project's first run, the one
 channel they point at, and nothing else `editor` would also open up.
 
-Two of the thirteen watch the
+**"Idempotently" is load-bearing, and it was aspirational until #625.** Updating
+an alert policy closes its open incidents; the next evaluation opens new ones and
+notifies. The apply runs hourly, so an unconditional rewrite mailed every
+currently-true condition once an hour, describing nothing that had changed — the
+alert flood IntegrateIT reported on 2026-09-02. A run against an up-to-date
+project now writes nothing and says `unchanged` per policy. If you change a
+threshold and the run still says `unchanged`, that is a bug in the comparison
+(`policy_unchanged`), not a project that was already correct.
+
+Two of the fourteen watch the
 cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it
 below the pool's `cache_snapshot_max_age_hours`, or the first notice anyone gets
 is every host starting cold) and *hydrate failing on a configured pool*, which
