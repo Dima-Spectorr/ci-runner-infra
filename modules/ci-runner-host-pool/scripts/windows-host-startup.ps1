@@ -2935,7 +2935,24 @@ function Get-ProbeFailure {
             "ACLs are unproved, and $sawType")
     }
     if ((& $get 'cacheWritable') -ne $true) {
-        $fail.Add('the warm cache is not writable by a slot, so every job on this host repopulates it')
+        # The exception is APPENDED, for the reason the sibling arm appends its
+        # type: this finding denies the boot, and without the cause the operator
+        # is told the cache is unwritable and given nothing to act on.
+        $why = 'no exception was recorded'
+        $cacheType = [string] (& $get 'cacheErrorType')
+        $cacheText = [string] (& $get 'cacheError')
+        if (-not [string]::IsNullOrWhiteSpace($cacheType)) {
+            $why = "the exception was $cacheType"
+            if (-not [string]::IsNullOrWhiteSpace($cacheText)) { $why += ": $cacheText" }
+        }
+        # Says WORKSPACE, not "warm cache". The payload writes its probe file
+        # into the slot's own workspace, which is where a job's checkout and
+        # build output go -- a slot that cannot write there cannot run anything
+        # at all, which is why this one is fatal. The old wording named the
+        # dependency cache, which this check has never touched, and sent the
+        # operator to look at C:\ci-cache for a fault that was in C:\ci\slots\N.
+        $fail.Add('a slot cannot write to its own workspace, so no job on this host could check out ' +
+            "or build -- $why")
     }
     if ((& $get 'dnsResolved') -ne $true) {
         $fail.Add('name resolution failed from a slot context, so no agent on this host could reach GitHub')
@@ -3096,7 +3113,7 @@ try {
     runningAs = ''; hostToken = `$false; secretStatus = `$null; metricStatus = `$null
     impersonateStatus = `$null; impersonateAttempts = `$null
     brokerEmail = ''; siblingStatus = 'unrun'; siblingErrorType = ''
-    cacheWritable = `$false; dnsResolved = `$false
+    cacheWritable = `$false; dnsResolved = `$false; cacheErrorType = ''; cacheError = ''
 }
 
 # WHO IS ANSWERING. Every other field in this document queries the metadata
@@ -3188,8 +3205,50 @@ try {
 try {
     `$probe = Join-Path '$CacheRoot' ('probe-' + [guid]::NewGuid().ToString('N') + '.tmp')
     Set-Content -LiteralPath `$probe -Value 'probe' -ErrorAction Stop
-    Remove-Item -LiteralPath `$probe -Force -ErrorAction SilentlyContinue
+    # THE WRITE IS THE VERDICT. It is recorded HERE, before any attempt to clean
+    # up, because the tidying used to be inside the same try and a failure to
+    # remove the file was therefore reported as a failure to write it.
+    #
+    # Measured on ci-runner-host-win-iit-nn3l, 2026-09-02, as the slot user in
+    # its own workspace: Set-Content succeeds, and `Remove-Item -Force` on the
+    # file it just created throws UnauthorizedAccessException -- while
+    # [System.IO.File]::Delete on an identical file in the same directory as the
+    # same account succeeds. The account owns the file and its ACE carries
+    # DELETE (0x1301bf); whatever the provider does on top of the delete is what
+    # is refused, and it is refused for a slot and not for SYSTEM, which is why
+    # nothing else in this boot ever hit it.
+    #
+    # -ErrorAction SilentlyContinue did not contain it either: the provider
+    # raises a TERMINATING exception, which that preference does not suppress,
+    # so it escaped into the catch below and left cacheWritable false. Phase 6
+    # turns that into Deny-Boot, so a host whose workspace was perfectly
+    # writable refused to register -- the whole Windows pool, every boot.
     `$r.cacheWritable = `$true
+} catch {
+    # RECORDED, NOT SWALLOWED. This is the only check in the payload whose
+    # failure is fatal to the boot AND whose cause is invisible from the outside:
+    # the two capability checks name a status code, the sibling read records its
+    # exception type, and this one used to discard the exception entirely -- so a
+    # host denied over it told the operator the cache was unwritable and nothing
+    # about why, on a path where 'the write threw' and 'the directory is not
+    # there' are different faults with different fixes.
+    `$r.cacheErrorType = `$_.Exception.GetType().FullName
+    `$r.cacheError = (`$_.Exception.Message -replace '[\x00-\x1f]', ' ')
+    if (`$r.cacheError.Length -gt 300) { `$r.cacheError = `$r.cacheError.Substring(0, 300) }
+}
+
+# Tidying, deliberately OUTSIDE the block above and deliberately not the
+# provider: [System.IO.File]::Delete is the call that a slot account is actually
+# allowed to make here. If it fails the probe file stays behind -- a few bytes
+# per boot in a workspace the slot reset wipes anyway -- and the verdict above
+# is untouched, which is the whole point of the split.
+# The try wraps the Test-Path as well as the delete, and it has to: this payload
+# runs under $ErrorActionPreference = 'Stop', so an unguarded probe of the path
+# would abort the whole script before the result document is written -- turning
+# a failure to tidy up into no verdict at all, which is the larger version of
+# the bug being fixed here.
+try {
+    if (`$probe -and (Test-Path -LiteralPath `$probe)) { [System.IO.File]::Delete(`$probe) }
 } catch { `$null = `$_ }
 
 try {
@@ -3888,6 +3947,33 @@ function Invoke-BoundedNative {
         negative code precisely because a killed robocopy exits with one. .NET's
         Kill() terminates the child with -1, so this names what the child would
         have reported anyway rather than inventing a sentinel.
+
+        $proc.Handle IS READ AND DISCARDED, AND IT IS LOAD-BEARING
+
+        Measured on ci-runner-host-win-iit-nn3l, 2026-09-02: `Start-Process
+        -PassThru` hands back a Process whose ExitCode is $null after the child
+        has exited, even though WaitForExit($ms) returned $true and the child
+        wrote its success text to stdout. .NET only keeps the native process
+        handle alive once something has asked the Process object for it; nothing
+        here did, so by the time ExitCode was read the handle was gone and the
+        property answered $null instead of throwing.
+
+        That default is the worst possible one for this function. $null is not 0,
+        so `$owner.ExitCode -ne 0` was TRUE for an icacls run that had succeeded,
+        and Test-RobocopySuccess rejected every copy for the same reason -- so the
+        entire Windows warm-cache path refused itself, every boot, on calls that
+        worked. The log said `(exit )` with nothing between the parentheses,
+        because the empty string is what $null interpolates to.
+
+        Reading .Handle once, immediately after the start, is what makes ExitCode
+        answer. It is read into $null because the VALUE is not wanted -- the side
+        effect is.
+
+        The check below it is not redundant with the fix: a property that can
+        answer $null must never again be read straight into a caller's `-ne 0`,
+        and "did not check" must not render as "found nothing" (the invariant the
+        scan in Protect-CacheMaster is built on). If it is ever $null again this
+        returns -1 and SAYS SO, rather than silently condemning a call that ran.
     #>
     [CmdletBinding()]
     param(
@@ -3914,6 +4000,11 @@ function Invoke-BoundedNative {
     try {
         $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -NoNewWindow `
             -RedirectStandardOutput $out -RedirectStandardError $err
+        # Read for the side effect, not the value -- see the .Handle section above.
+        # It has to happen HERE, between the start and the first wait: the handle
+        # is what keeps ExitCode answerable, and the window in which it is still
+        # there to be kept is the one before the child exits.
+        $null = $proc.Handle
         if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
             # The short second wait is so the exit code and the handles are
             # settled before the finally block disposes it. Neither call can
@@ -3938,11 +4029,19 @@ function Invoke-BoundedNative {
         # redirected streams are still being drained, and ExitCode is only settled
         # after the full wait.
         $proc.WaitForExit()
+        $code = $proc.ExitCode
+        if ($null -eq $code) {
+            return [pscustomobject] @{
+                ExitCode = -1
+                Error    = ("$What exited without reporting a code -- the process handle was not " +
+                    'retained, so this is a defect in this function and not a fact about the child')
+            }
+        }
         $text = ''
-        if ($proc.ExitCode -ne 0) {
+        if ($code -ne 0) {
             $text = Format-NativeErrorText -Text ([string] (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue))
         }
-        return [pscustomobject] @{ ExitCode = $proc.ExitCode; Error = $text }
+        return [pscustomobject] @{ ExitCode = $code; Error = $text }
     } catch {
         return [pscustomobject] @{ ExitCode = -1; Error = "$What could not be started: $($_.Exception.Message)" }
     } finally {

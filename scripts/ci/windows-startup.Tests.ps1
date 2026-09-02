@@ -2042,6 +2042,39 @@ Describe 'probe payload' {
         $script:Payload | Should -Match 'Start-Sleep -Seconds 10'
         $script:Payload | Should -Match 'impersonateAttempts'
     }
+
+    # THE VERDICT IS THE WRITE, AND THE CLEANUP MUST NOT BE ABLE TO OVERTURN IT.
+    # Measured on ci-runner-host-win-iit-nn3l, 2026-09-02: as the slot account,
+    # in the slot's own workspace, Set-Content creates the probe file and
+    # `Remove-Item -Force` on it throws UnauthorizedAccessException, while
+    # [System.IO.File]::Delete on an identical file in the same directory as the
+    # same account succeeds. The removal sat inside the same try as the write,
+    # and a terminating provider exception is not suppressed by
+    # -ErrorAction SilentlyContinue, so the tidying failure was recorded as
+    # 'the slot cannot write here' -- which phase 6 turns into Deny-Boot.
+    #
+    # Asserted on the emitted payload rather than the source: this text lives in
+    # a here-string where every `$` is escaped, so the source and the thing that
+    # actually runs on the host are different strings.
+    It 'records the workspace verdict before it tries to clean up' {
+        $lines = $script:Payload -split "`r?`n"
+        $wrote = @($lines | Select-String -SimpleMatch -Pattern '$r.cacheWritable = $true' |
+            ForEach-Object { $_.LineNumber })
+        $tidied = @($lines | Select-String -SimpleMatch -Pattern '[System.IO.File]::Delete($probe)' |
+            ForEach-Object { $_.LineNumber })
+        $wrote | Should -HaveCount 1
+        $tidied | Should -HaveCount 1
+        $wrote[0] | Should -BeLessThan $tidied[0] -Because (
+            'a delete that runs first can throw, and the verdict would never be set')
+    }
+
+    It 'never removes the probe file through the provider' {
+        # The provider call is the one the slot account is refused. Naming it
+        # here is what stops it being restored as a tidier-looking one-liner.
+        $probeBlock = ($script:Payload -split "`r?`n" |
+            Where-Object { $_ -match '\$probe' }) -join "`n"
+        $probeBlock | Should -Not -Match 'Remove-Item'
+    }
 }
 
 Describe 'probe literal safety' {
@@ -2916,5 +2949,132 @@ Describe 'the hardlink probe''s bound' {
         $r = Get-CacheLinkRecord -Entries @($null) -DeadlineUtc ([datetime]::UtcNow.AddMinutes(5))
         $r.Records | Should -HaveCount 0
         $r.TimedOut | Should -Be $false
+    }
+}
+
+Describe 'bounded native exit code' {
+    # THE SAME KIND OF ASSERTION AS 'service config P/Invoke null strings', AND
+    # FOR THE SAME REASON: the defect is only observable on a Windows host, and
+    # the guarantee that prevents it is decidable from the source.
+    #
+    # Measured on ci-runner-host-win-iit-nn3l, 2026-09-02. `Start-Process
+    # -PassThru` returns a Process whose native handle .NET only keeps alive
+    # once something has asked the object for it. Nothing here had, so after the
+    # child exited `$proc.ExitCode` answered $null instead of 0 -- and $null is
+    # not 0, so `-ne 0` was TRUE for every call that had SUCCEEDED. icacls
+    # /setowner, icacls /reset and every robocopy in the slot seeding loop were
+    # read as failures, the whole Windows warm-cache path refused itself on
+    # every boot, and the log said `(exit )` because $null interpolates to the
+    # empty string.
+    #
+    # Two things are asserted, not one. The handle read is the fix; the $null
+    # guard is what stops the same class of defect from being silent again if
+    # the read is ever removed or reordered. Ordering is checked by extent
+    # offset rather than by matching text, because "the file contains a handle
+    # read somewhere" is exactly the assertion that would keep passing after the
+    # read moved below the wait, where it is useless.
+    BeforeAll {
+        $startupPath = Join-Path $PSScriptRoot '../../modules/ci-runner-host-pool/scripts/windows-host-startup.ps1'
+        if (-not (Test-Path -LiteralPath $startupPath)) {
+            throw "the boot script is not at $startupPath"
+        }
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $startupPath, [ref] $null, [ref] $null)
+        $fn = $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Invoke-BoundedNative'
+            }, $true)
+        if ($fn.Count -ne 1) { throw "expected one Invoke-BoundedNative, found $($fn.Count)" }
+        $script:BoundedFn = $fn[0]
+
+        # The body only. The .DESCRIPTION above it spells out `$proc.Handle` and
+        # `$proc.ExitCode` in prose, and a search that reads the comment would
+        # pass on a function that had had the fix deleted.
+        $script:BoundedBody = $script:BoundedFn.Body.EndBlock
+
+        $starts = $script:BoundedBody.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandAst] -and
+                "$($node.GetCommandName())" -eq 'Start-Process'
+            }, $true)
+        if ($starts.Count -ne 1) { throw "expected one Start-Process, found $($starts.Count)" }
+        $script:StartOffset = $starts[0].Extent.StartOffset
+
+        $script:HandleReads = $script:BoundedBody.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                "$($node.Member)" -eq 'Handle'
+            }, $true)
+
+        $script:Waits = $script:BoundedBody.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                "$($node.Member)" -eq 'WaitForExit'
+            }, $true)
+    }
+
+    It 'reads the process handle exactly once, so ExitCode stays answerable' {
+        $script:HandleReads.Count | Should -Be 1 -Because (
+            'the read is for its side effect -- it keeps the native handle alive -- ' +
+            'and a second one would suggest the first was believed to be a value')
+    }
+
+    It 'reads the handle after the start and before any wait' {
+        # The window in which the handle is still there to be kept open is the
+        # one between the start and the child exiting. A read placed after the
+        # wait compiles, runs, returns a handle-shaped thing on a live process
+        # and does nothing at all for a fast child that has already exited --
+        # which is every icacls call this function makes.
+        $script:Waits.Count | Should -BeGreaterThan 0
+        $firstWait = ($script:Waits | ForEach-Object { $_.Extent.StartOffset } | Sort-Object)[0]
+        $handleAt = $script:HandleReads[0].Extent.StartOffset
+        $handleAt | Should -BeGreaterThan $script:StartOffset
+        $handleAt | Should -BeLessThan $firstWait
+    }
+
+    It 'never hands a caller an ExitCode it read straight out of the Process' {
+        # $proc.ExitCode may be read, but not into the returned object and not
+        # into a comparison: it is the property that can answer $null. It has to
+        # go through a local that is guarded first.
+        $exitReads = $script:BoundedBody.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                "$($node.Member)" -eq 'ExitCode' -and
+                "$($node.Expression)" -eq '$proc'
+            }, $true)
+        $exitReads.Count | Should -Be 1
+        $assigned = $script:BoundedBody.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                "$($node.Right)" -eq '$proc.ExitCode'
+            }, $true)
+        $assigned.Count | Should -Be 1 -Because 'the only legal use of the property is to bind it to a local'
+        "$($assigned[0].Left)" | Should -Be '$code'
+    }
+
+    It 'returns -1 and says so when the process reports no code at all' {
+        # Without this the next regression is silent again: a property that can
+        # answer $null must never render as "the call failed" with nothing
+        # between the parentheses.
+        $guards = $script:BoundedBody.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                $node.Operator -eq 'Ieq' -and
+                ("$($node.Left)" -eq '$null' -or "$($node.Right)" -eq '$null') -and
+                ("$($node.Left)" -eq '$code' -or "$($node.Right)" -eq '$code')
+            }, $true)
+        $guards.Count | Should -Be 1
+        $guardAt = $guards[0].Extent.StartOffset
+        # And it has to come before the comparison that decides success, or it
+        # guards nothing that matters.
+        $success = $script:BoundedBody.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                $node.Operator -eq 'Ine' -and
+                "$($node.Left)" -eq '$code'
+            }, $true)
+        $success.Count | Should -Be 1
+        $guardAt | Should -BeLessThan $success[0].Extent.StartOffset
     }
 }
