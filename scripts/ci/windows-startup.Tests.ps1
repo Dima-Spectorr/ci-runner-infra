@@ -1330,6 +1330,71 @@ Describe 'service logon account' {
     }
 }
 
+Describe 'service config P/Invoke null strings' {
+    # THE FAILURE THIS CATCHES CANNOT BE CAUGHT BY RUNNING ANYTHING HERE.
+    # Grant-ServiceLogonAccount is advapi32 P/Invoke, so it exists only on a
+    # Windows host; this suite is pwsh on ubuntu-latest. What IS decidable off
+    # the host is the argument that broke it: PowerShell marshals $null into a
+    # [string] parameter as the EMPTY STRING, and OpenSCManagerW("", "", ...)
+    # is win32 123 rather than the local SCM. That cost the first Windows host
+    # in the fleet to reach this phase its whole boot on 2026-09-02, and the
+    # host before it had died in phase 0, so nothing had ever executed the line.
+    #
+    # ChangeServiceConfigW is the reason this is an assertion over the SOURCE
+    # and not just over OpenSCManagerW: there, "" is accepted, and blanks the
+    # field. A boot that got past the SCM on a repaired first argument would
+    # have erased the agent's binary path instead of failing.
+    BeforeAll {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:StartupPath, [ref] $null, [ref] $null)
+        $fn = $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Grant-ServiceLogonAccount'
+            }, $true)
+        if ($fn.Count -ne 1) { throw "expected one Grant-ServiceLogonAccount, found $($fn.Count)" }
+        $script:GrantFn = $fn[0]
+
+        # Only the CALLS. The P/Invoke signatures are a here-string of C# in the
+        # same function and they legitimately spell the parameters `string`.
+        $script:ServiceConfigCalls = $script:GrantFn.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                "$($node.Expression)" -eq '[CiHostPool.ServiceConfig]'
+            }, $true)
+    }
+
+    It 'calls all four entry points, so a rename cannot empty this test' {
+        $names = $script:ServiceConfigCalls | ForEach-Object { "$($_.Member)" } | Sort-Object -Unique
+        $names | Should -Contain 'OpenSCManagerW'
+        $names | Should -Contain 'OpenServiceW'
+        $names | Should -Contain 'ChangeServiceConfigW'
+    }
+
+    It 'never passes a bare $null where the API wants a NULL string' {
+        foreach ($call in $script:ServiceConfigCalls) {
+            foreach ($arg in $call.Arguments) {
+                "$arg" | Should -Not -Be '$null' -Because (
+                    "$($call.Member) receives it as an empty string, which the SCM " +
+                    'rejects as win32 123 and ChangeServiceConfigW accepts as "blank this field"')
+            }
+        }
+    }
+
+    # An empty string variable would pass the assertion above and fail exactly
+    # the way $null did, so the substitute is named too. [NullString]::Value is
+    # the only value in PowerShell that marshals to a real NULL pointer.
+    It 'binds the substitute to [NullString]::Value and nothing else' {
+        $assignments = $script:GrantFn.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                "$($node.Left)" -eq '$nullStr'
+            }, $true)
+        $assignments.Count | Should -Be 1
+        "$($assignments[0].Right)" | Should -Be '[NullString]::Value'
+    }
+}
+
 Describe 'boot logging stays out of the success stream' {
     # THIS IS THE ONE BLOCK IN THIS FILE THAT MUST NOT MOCK Write-BootLog.
     #
