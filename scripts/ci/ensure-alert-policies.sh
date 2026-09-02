@@ -229,8 +229,8 @@ PY
 # Updating an alert policy CLOSES its open incidents; re-evaluation then opens
 # new ones and notifies again. So an unconditional PATCH re-sends a mail for
 # every condition that is currently true, on every run — and this script runs
-# from the apply trigger, which is scheduled HOURLY. Measured on mot-integrateit
-# 2026-09-02: all fourteen policies carried a mutationRecord from 15:39:33-57,
+# from the apply trigger, which is scheduled HOURLY. Measured on one pool
+# project on 2026-09-02: all fourteen carried a mutationRecord from 15:39:33-57,
 # the apply that had just run, while only three conditions were true anywhere in
 # the fleet. Every hour, around the clock, those same three shipped a fresh mail
 # each. That is the whole of the "huge amount of alerts with no CI problem" this
