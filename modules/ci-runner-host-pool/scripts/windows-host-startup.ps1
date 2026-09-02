@@ -6285,8 +6285,26 @@ public static extern bool CloseServiceHandle(IntPtr handle);
 '@
     }
 
+    # EVERY NULL STRING HERE IS [NullString]::Value, AND NONE OF THEM MAY BE $null.
+    #
+    # PowerShell binds $null to a [string] parameter as the EMPTY STRING, not as
+    # a null pointer, and this is the one API surface where the difference is
+    # fatal. Measured 2026-09-02 on ci-runner-host-win-iit-nn3l, the first
+    # Windows host in the fleet ever to reach this phase: OpenSCManagerW($null,
+    # $null, ...) arrived as OpenSCManagerW("", "", ...), and an EMPTY database
+    # name is not a defaulted one -- the SCM rejects it with win32 123,
+    # ERROR_INVALID_NAME, which reads like a path bug and is nothing of the kind.
+    # The boot then Deny-Boots, the host registers no agent, and the pool sits at
+    # zero slots looking like an image problem.
+    #
+    # ChangeServiceConfigW is worse than an error, because it SUCCEEDS: NULL
+    # means "leave this field alone" and "" means "set this field to empty", so
+    # the four $nulls below would have blanked the agent's binary path, load
+    # order group, dependencies and display name on the way to setting its logon
+    # account. [NullString]::Value is the only value that marshals to a real NULL.
+    $nullStr = [NullString]::Value
     $noChange = [uint32]::MaxValue
-    $manager = [CiHostPool.ServiceConfig]::OpenSCManagerW($null, $null, 0x0001)
+    $manager = [CiHostPool.ServiceConfig]::OpenSCManagerW($nullStr, $nullStr, 0x0001)
     if ($manager -eq [IntPtr]::Zero) {
         Deny-Boot "cannot open the service control manager (win32 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
     }
@@ -6303,7 +6321,8 @@ public static extern bool CloseServiceHandle(IntPtr handle);
         $password = [System.Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode(
             $Credential.Password)
         $ok = [CiHostPool.ServiceConfig]::ChangeServiceConfigW($service, $noChange, $noChange,
-            $noChange, $null, $null, [IntPtr]::Zero, $null, $Credential.UserName, $password, $null)
+            $noChange, $nullStr, $nullStr, [IntPtr]::Zero, $nullStr, $Credential.UserName,
+            $password, $nullStr)
         if (-not $ok) {
             Deny-Boot ("cannot set $ServiceName to run as $($Credential.UserName) " +
                 "(win32 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())) -- an agent " +
