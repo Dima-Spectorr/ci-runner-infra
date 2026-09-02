@@ -221,6 +221,84 @@ for item in doc.get(key) or []:
 PY
 }
 
+# policy_unchanged <policy id> <intended body file> <saved listing> — 0 when the
+# live policy already says exactly what the intended body says.
+#
+# WHY THIS EXISTS, AND IT IS NOT AN OPTIMISATION.
+#
+# Updating an alert policy CLOSES its open incidents; re-evaluation then opens
+# new ones and notifies again. So an unconditional PATCH re-sends a mail for
+# every condition that is currently true, on every run — and this script runs
+# from the apply trigger, which is scheduled HOURLY. Measured on mot-integrateit
+# 2026-09-02: all fourteen policies carried a mutationRecord from 15:39:33-57,
+# the apply that had just run, while only three conditions were true anywhere in
+# the fleet. Every hour, around the clock, those same three shipped a fresh mail
+# each. That is the whole of the "huge amount of alerts with no CI problem" this
+# fleet has been reporting: the notifications were not describing new faults,
+# they were describing this script touching a policy that had not changed.
+#
+# The comparison is exact and the normalisation is closed, both measured against
+# the live API rather than assumed:
+#
+#   the server ADDS   name, creationRecord, mutationRecord, enabled (default
+#                     true), and a name on every condition;
+#   the server OMITS  thresholdValue when it is zero -- ten of the fourteen
+#                     policies here are `> 0` conditions, so failing to fold
+#                     absent into 0.0 would make MOST of them look permanently
+#                     changed and fix nothing.
+#
+# It FAILS OPEN: anything unexpected -- a parse error, a policy the listing does
+# not contain, a shape this does not model -- returns non-zero and the PATCH goes
+# ahead. The cost of a wrong "changed" is one redundant notification, which is
+# the behaviour being replaced; the cost of a wrong "unchanged" is a threshold
+# edit that silently never lands. Those are not symmetric, so this only ever errs
+# toward writing.
+policy_unchanged() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+
+pid, intended_path, listing_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def norm(p):
+    p = dict(p)
+    for k in ("name", "creationRecord", "mutationRecord"):
+        p.pop(k, None)
+    # Absent means enabled on the read side; the intended bodies never set it.
+    p["enabled"] = bool(p.get("enabled", True))
+    p["notificationChannels"] = sorted(p.get("notificationChannels") or [])
+    conds = []
+    for c in p.get("conditions") or []:
+        c = dict(c)
+        c.pop("name", None)
+        for key in ("conditionThreshold", "conditionAbsent"):
+            if key not in c:
+                continue
+            b = dict(c[key])
+            if key == "conditionThreshold":
+                b["thresholdValue"] = float(b.get("thresholdValue", 0.0))
+            b["duration"] = b.get("duration", "0s")
+            c[key] = b
+        conds.append(c)
+    # Order is meaningful to the operator reading the policy, so it is compared
+    # as written rather than sorted: a reordering IS a change worth landing.
+    p["conditions"] = conds
+    return p
+
+try:
+    with open(intended_path, encoding="utf-8") as fh:
+        intended = json.load(fh)
+    with open(listing_path, encoding="utf-8") as fh:
+        live = [x for x in (json.load(fh).get("alertPolicies") or [])
+                if x.get("name") == pid]
+    if len(live) != 1:
+        sys.exit(1)
+    sys.exit(0 if norm(live[0]) == norm(intended) else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
 tmp="$(mktemp -d)"; chmod 700 "$tmp"; trap 'rm -rf "$tmp"' EXIT
 
 # ── notification channel ──────────────────────────────────────────────────────
@@ -644,6 +722,11 @@ pl_status="$(mon GET 'alertPolicies?pageSize=1000')"
   echo "$PROJECT: cannot list alert policies (HTTP $pl_status)" >&2
   sed -n '1,20p' "$tmp/api.out" >&2; exit 1; }
 existing="$(json_pairs alertPolicies displayName)"
+# Keep the whole listing, not just the name/id pairs: every `mon` call below
+# overwrites $tmp/api.out, and policy_unchanged needs the live BODIES. Comparing
+# against this snapshot rather than re-GETting each policy also means the
+# comparison is one page for fourteen policies instead of fourteen round trips.
+cp "$tmp/api.out" "$tmp/existing.json"
 
 # A policy that names a metric descriptor which does not exist YET is rejected
 # 404. That is not a broken policy — Monitoring creates a custom descriptor on
@@ -711,6 +794,14 @@ for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsm
   dupes="$(printf '%s\n' "$id_all" | grep -c . || true)"
   [ "${dupes:-0}" -le 1 ] || {
     echo "$PROJECT: $dupes policies share the name '$name' — updating ${id##*/} and leaving the rest stale. Delete the extras." >&2; }
+
+  # Nothing to say to the API when the live policy already says this. Checked
+  # before the dry-run branch so a dry run reports the same three-way verdict a
+  # real run takes, rather than promising an update that would not happen.
+  if [ -n "$id" ] && policy_unchanged "$id" "$tmp/p.json" "$tmp/existing.json"; then
+    printf '%s: unchanged %s\n' "$PROJECT" "$name"
+    continue
+  fi
 
   if [ "$DRY" = "1" ]; then
     printf '%s: would %s — %s\n' "$PROJECT" "$([ -n "$id" ] && echo update || echo create)" "$name"
