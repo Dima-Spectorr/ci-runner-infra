@@ -3221,8 +3221,12 @@ try {
     # -ErrorAction SilentlyContinue did not contain it either: the provider
     # raises a TERMINATING exception, which that preference does not suppress,
     # so it escaped into the catch below and left cacheWritable false. Phase 6
-    # turns that into Deny-Boot, so a host whose workspace was perfectly
-    # writable refused to register -- the whole Windows pool, every boot.
+    # refuses a host over that, so one whose workspace was perfectly writable
+    # never registered -- the whole Windows pool, every boot.
+    #
+    # (The name of that refusal is deliberately not written here: this text is
+    # emitted into the payload, and a test asserts the unprivileged script
+    # cannot so much as name the function that denies a boot.)
     `$r.cacheWritable = `$true
 } catch {
     # RECORDED, NOT SWALLOWED. This is the only check in the payload whose
