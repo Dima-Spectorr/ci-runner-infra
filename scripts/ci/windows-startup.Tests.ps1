@@ -1345,8 +1345,17 @@ Describe 'service config P/Invoke null strings' {
     # field. A boot that got past the SCM on a repaired first argument would
     # have erased the agent's binary path instead of failing.
     BeforeAll {
+        # Re-derived from $PSScriptRoot rather than read from the root BeforeAll's
+        # $script:StartupPath, matching 'boot wrapper path hardening' above: every
+        # other block in this file that needs a path builds its own, and a shared
+        # one would make this block's result depend on Pester's scoping rather
+        # than on the boot script.
+        $startupPath = Join-Path $PSScriptRoot '../../modules/ci-runner-host-pool/scripts/windows-host-startup.ps1'
+        if (-not (Test-Path -LiteralPath $startupPath)) {
+            throw "the boot script is not at $startupPath"
+        }
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-            $script:StartupPath, [ref] $null, [ref] $null)
+            $startupPath, [ref] $null, [ref] $null)
         $fn = $ast.FindAll({
                 param($node)
                 $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
@@ -1369,6 +1378,7 @@ Describe 'service config P/Invoke null strings' {
         $names | Should -Contain 'OpenSCManagerW'
         $names | Should -Contain 'OpenServiceW'
         $names | Should -Contain 'ChangeServiceConfigW'
+        $names | Should -Contain 'CloseServiceHandle'
     }
 
     It 'never passes a bare $null where the API wants a NULL string' {
