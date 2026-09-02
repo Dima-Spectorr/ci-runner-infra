@@ -1066,6 +1066,20 @@ the call is not started at all. A killed `robocopy` reports `-1`, which
 `Test-RobocopySuccess` already rejects -- that rejection was written for a
 crashed copy and covers this for the same reason.
 
+**The one line in that function nobody should tidy away is the read of
+`$proc.Handle`.** .NET keeps a started process's native handle alive only once
+something has asked the `Process` object for it. Measured on
+`ci-runner-host-win-iit-nn3l`, 2026-09-02: nothing had, so after the child
+exited `ExitCode` answered `$null` rather than throwing -- and `$null -ne 0` is
+true, so **every successful call was reported as a failure**. Both `icacls`
+runs and every `robocopy` in the seeding loop were rejected on calls that had
+worked, the whole warm-cache path refused itself on every boot, and the log said
+`(exit )` because that is what `$null` interpolates to. The read is for its side
+effect, it has to sit between the start and the first wait, and a code that
+still comes back `$null` now returns `-1` with a message naming this function as
+the defect -- the same rule the rest of this design follows, that "did not
+check" must never render as "found nothing".
+
 The recursive scan of the master is **deliberately not** bounded this way. It
 runs on this thread, inside the filesystem, and Windows PowerShell 5.1 offers no
 way to abandon it: a runspace with a deadline moves the block to another thread
