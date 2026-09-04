@@ -232,6 +232,7 @@ _sweep_timeout=$(sed -n '/ci-slot-sweep.service/,/^EOF$/p' "$HOST_STARTUP" |
   sed -n 's/^TimeoutStartSec=\([0-9]*\).*/\1/p' | head -1)
 _sweep_interval=$(sed -n '/ci-slot-sweep.timer/,/^EOF$/p' "$HOST_STARTUP" |
   sed -n 's/^OnUnitActiveSec=\([0-9]*\).*/\1/p' | head -1)
+# shellcheck disable=SC2016  # the $window is the shipping source text being matched, not a variable to expand.
 _floor=$(sed -n 's/.*\$window" -lt \([0-9]*\).*/\1/p' \
   "$HERE/../../modules/ci-runner-host-pool/scripts/recycle-decision.sh" | head -1)
 
