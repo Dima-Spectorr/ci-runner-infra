@@ -324,6 +324,25 @@ constrains_the_value_it_shells_out() {
   matches "$block" 'regex\('     || return 1
 }
 
+# 16. The schedule states that it is running. `paused` is optional, and leaving
+#     it out does not mean "enabled" — it means terraform holds no opinion, so a
+#     job paused by hand stays paused through every later apply with no diff in
+#     any plan. Nothing else in the fleet can report it either: the job exists,
+#     the trigger exists, the console shows both green, and the only symptom is
+#     a release that stops arriving at one project.
+#
+#     Measured: `ci-runner-apply-integrateit-scheduled` was paused by hand on
+#     2026-09-02 after twelve consecutive green applies, and that project
+#     then received no runner infrastructure for two days — including the fix
+#     for the false "controller dead" alert that project itself had raised.
+#     Stating it makes the next apply from any source the way back.
+declares_the_schedule_is_running() {
+  local block; block=$(awk '/^resource "google_cloud_scheduler_job"/,/^}/' "$1" | grep -vE '^[[:space:]]*#')
+  # The block must exist, or this reads as a pass on a module with no schedule.
+  matches "$block" 'name *= *"\$\{local\.trigger_name\}-scheduled"' || return 1
+  matches "$block" '^[[:space:]]*paused *= *false'                  || return 1
+}
+
 echo "apply-trigger self-test:"
 
 # The helpers carry the traps they were written to avoid, so they are checked
@@ -361,6 +380,7 @@ check reconciles_alerts_without_gating_the_apply  "$MAIN" "the alert-policy step
 check fails_the_plan_before_the_build_is_unschedulable "$MAIN" "nothing measures the embedded script — past roughly 128 KiB Cloud Build accepts the build, never schedules it, and reports nothing anywhere"
 check names_no_inbox                              "$VARS" "an email address is defaulted in the module — ten roots would page an inbox nobody chose, and it would work, which is why nothing would go red"
 check constrains_the_value_it_shells_out          "$VARS" "alert_notification_email reaches a shell command unvalidated — a quote in it runs arbitrary commands as the project's build account"
+check declares_the_schedule_is_running            "$MAIN" "the scheduler job does not state paused = false — a job paused by hand stays paused through every later apply, with no diff in any plan and nothing red anywhere"
 
 mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
   local desc="$1" f="$2" prog="$3" pred="$4" tmp
@@ -454,6 +474,11 @@ mutate "'give it a sensible default' — an address defaulted in the module" "$V
 # "It is an email address, what could it contain" — the validation deleted.
 mutate "'the type already says string' — address validation removed" "$VARS" \
   '/^variable "alert_notification_email"/,/^}/ { /validation {/,/^  }$/d }' constrains_the_value_it_shells_out
+
+# "It is enabled, why say so" — and that omission is what let a hand-paused job
+# survive two days of applies on one consumer project, unseen by every plan.
+mutate "'terraform does not need to state the obvious' — paused dropped" "$MAIN" \
+  '/^resource "google_cloud_scheduler_job"/,/^}/ { /^  paused = false$/d }' declares_the_schedule_is_running
 
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

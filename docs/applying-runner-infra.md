@@ -277,6 +277,21 @@ has no commit to push when v5.7.1 ships, so the push trigger never fires and
 the release sits in the tag forever. `apply_schedule` is the only trigger that
 ever fires for that release — the push trigger cannot see it.
 
+**And pausing that job is a commit, not a click.** The module states `paused =
+false`, so a job paused by hand is resumed by the next apply from any source.
+Omitting the field does not mean "enabled" — it means terraform holds no
+opinion, and a hand-paused job then survives every later plan without producing
+a diff. There is nothing red to find: the job exists, the trigger exists, both
+look healthy in the console, and the only symptom is a project that quietly
+stops receiving releases. `ci-runner-apply-integrateit-scheduled` was paused
+that way on 2026-09-02 after twelve green hourly applies, and `mot-integrateit`
+went two days without runner infrastructure — including the fix for the false
+"controller dead" alert that project had itself raised. The controller reported
+it correctly throughout (`ci_apply_build_missing = 1`, which the *this project
+has stopped receiving runner infrastructure* policy watches); what was missing
+was a way back. To silence the schedule for real maintenance, set
+`apply_schedule = null` in the consumer root and merge it.
+
 **`tf-apply-guard.sh` does not run here, and that is deliberate.** The guard
 refuses an apply whose checkout is not the remote default branch, and demands a
 plan-derived token before a destroy — a human-at-a-laptop defence, and the

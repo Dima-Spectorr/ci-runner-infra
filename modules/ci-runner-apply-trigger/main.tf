@@ -499,6 +499,29 @@ resource "google_cloud_scheduler_job" "daily_apply" {
     retry_count = 1
   }
 
+  # STATED, BECAUSE A PAUSE IS OTHERWISE INVISIBLE TO EVERY APPLY THAT FOLLOWS.
+  #
+  # `paused` is optional, and omitting it does not mean "running" — it means
+  # terraform has no opinion, so a job paused by hand stays paused through every
+  # subsequent apply and no plan ever shows a diff. Nothing else notices either:
+  # the job still exists, the trigger still exists, the console shows both, and
+  # the only symptom is a release that stops arriving.
+  #
+  # Measured: `ci-runner-apply-integrateit-scheduled` was paused by hand at
+  # 2026-09-02T16:18Z, after twelve consecutive green hourly applies. For two
+  # days after that, that project received no runner infrastructure at all —
+  # including the fix for the false "controller dead" alert that project itself
+  # had raised. The controller reported it correctly the whole time
+  # (`ci_apply_build_missing = 1`, which is what the "stopped receiving runner
+  # infrastructure" policy watches); what was missing was any path back. This
+  # line is that path: the next apply from ANY source — a push to the root, a
+  # manual run — resumes the schedule instead of preserving the pause.
+  #
+  # It also makes the pause a decision with a name on it. Silencing this job for
+  # real maintenance is now a commit, not a click, and a click is reverted within
+  # the hour by the automation it was meant to stop.
+  paused = false
+
   # Cross-variable, so it cannot be a `validation` block on either one — and it
   # only has to hold when the job is actually created, which a precondition on
   # this resource expresses exactly.
