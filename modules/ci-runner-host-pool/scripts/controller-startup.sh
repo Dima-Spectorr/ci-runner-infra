@@ -2098,6 +2098,40 @@ idle_seconds() {
   echo $((now - since))
 }
 
+# How long this host has read `partial` WITHOUT INTERRUPTION, for the
+# capacity-lost arm of recycle_decision().
+#
+# Same shape as idle_seconds() and for the same reason: the decision is a pure
+# function, so the clock has to live out here. Any reading OTHER than `partial`
+# clears the file — including `unknown`. A tick that could not ask GitHub is not
+# evidence the host is still degraded, and letting it hold the timer would let a
+# run of blind ticks accumulate into a delete nobody could justify afterwards.
+# The cost of clearing is one more grace window before the host is recycled,
+# which is the direction this rule should be wrong in.
+partial_seconds() {
+  local host="$1" reg="$2"
+  local f="$STATE_DIR/partial-$host"
+  local now
+  now=$(date +%s)
+
+  if [ "$reg" != "partial" ]; then
+    rm -f "$f"
+    echo 0
+    return 0
+  fi
+
+  if [ ! -f "$f" ]; then
+    echo "$now" >"$f"
+    echo 0
+    return 0
+  fi
+
+  local since
+  since=$(cat "$f" 2>/dev/null)
+  [ -n "$since" ] || { echo "$now" >"$f"; echo 0; return 0; }
+  echo $((now - since))
+}
+
 # --- registration tokens -------------------------------------------------------
 #
 # Inert unless the pool set `controller_mints_registration_token`, which today
@@ -3059,7 +3093,7 @@ drain_host() {
   # -- so nothing is being forgotten, and a leftover file would be a veto with
   # no host to apply to.
   rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/seen-$host" "$STATE_DIR/beaconmiss-$host" \
-    "$STATE_DIR/pinhold-$host"
+    "$STATE_DIR/pinhold-$host" "$STATE_DIR/partial-$host"
   log "drain $host: deregistered and deleted"
   DRAINED=$((DRAINED + 1))
   return 0
@@ -3382,8 +3416,11 @@ tick_pool() {
     cordoned=0
     [ -f "$STATE_DIR/cordon-$host" ] && cordoned=1
 
+    partial_for=$(partial_seconds "$host" "$HOST_REG")
+
     verdict=$(recycle_decision "$status" "$tpl" "$busy" "$HOST_REG" \
-      "$age" "$REGISTER_GRACE" "$recycling" "$RECYCLE_MAX_UNAVAILABLE" "$cordoned")
+      "$age" "$REGISTER_GRACE" "$recycling" "$RECYCLE_MAX_UNAVAILABLE" "$cordoned" \
+      "$partial_for")
 
     # THE PIN HOLD VETO, first half. A cordon is not "less than" a delete here:
     # it deregisters the host's idle agents, and a cordoned host stops answering
@@ -3443,14 +3480,22 @@ tick_pool() {
         # the pool size under a label that means nothing and bury the six that
         # do. A skip is interesting exactly when the mechanism HAD something to
         # do and did not do it.
-        if [ "$tpl" != "current" ]; then
+        #
+        # `partial` widens that, because the second recycle reason does not go
+        # through the template at all: a host on a CURRENT template that has
+        # lost registered capacity is precisely the case this mechanism was
+        # extended to catch, and the ticks it spends inside the hysteresis
+        # window are the only warning that it is about to act. Gated on the
+        # template alone, those ticks would publish nothing and the eventual
+        # delete would arrive with no run-up behind it.
+        if [ "$tpl" != "current" ] || [ "$HOST_REG" = "partial" ]; then
           skip_reason=${verdict#skip:}
           skip_reason=${skip_reason%% *}
           skip_reason=${skip_reason%%=*}
           case "$skip_reason" in
             # Closed set, so the label can never be widened by a verdict string
             # somebody edits later without also editing the publisher.
-            disabled | not-running | template | registration-unknown | booting | at-capacity) ;;
+            disabled | not-running | template | registration-unknown | booting | at-capacity | partial-grace) ;;
             *) skip_reason=other ;;
           esac
           RECYCLE_SKIPS["$skip_reason"]=$((${RECYCLE_SKIPS["$skip_reason"]:-0} + 1))
@@ -3626,7 +3671,7 @@ tick_pool() {
   # appears only when it fires is a reason nobody can build an alert on, because
   # the absence of the series and the absence of the problem look identical.
   local reason
-  for reason in disabled not-running template registration-unknown booting at-capacity other; do
+  for reason in disabled not-running template registration-unknown booting at-capacity partial-grace other; do
     queue_series "ci_recycle_verdicts" "${RECYCLE_SKIPS["$reason"]:-0}" \
       "\"outcome\":\"skip-$reason\""
   done

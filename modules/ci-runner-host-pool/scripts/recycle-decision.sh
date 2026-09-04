@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# ci-runner-host-pool — when a host on a STALE instance template may be retired,
-# as a PURE function.
+# ci-runner-host-pool — when a host that cannot be repaired in place may be
+# retired, as a PURE function. Two conditions qualify: an instance template the
+# apply has moved past, and registered capacity the host has lost and cannot get
+# back. Both are answered with the same bounded cordon-then-retire sequence.
 #
 # WHY THIS FILE EXISTS
 #
@@ -53,7 +55,8 @@
 
 # recycle_decision <instance_status> <template_state> <busy_slots> \
 #                  <registration_state> <age_seconds> <register_grace_seconds> \
-#                  <in_flight> <max_unavailable> <already_cordoned>
+#                  <in_flight> <max_unavailable> <already_cordoned> \
+#                  <partial_for_seconds>
 #
 #   instance_status     : GCE instanceStatus. Only RUNNING is recycled; every
 #                         other state is drain_decision's business, and it
@@ -72,6 +75,13 @@
 #   in_flight           : hosts already mid-recycle (cordoned, not yet gone).
 #   max_unavailable     : how many may be mid-recycle at once. 0 = disabled.
 #   already_cordoned    : 1 if THIS host is one of the in_flight ones.
+#   partial_for_seconds : how long this host has read `partial` WITHOUT
+#                         INTERRUPTION. 0 when it is not partial now, and 0 for
+#                         a caller that does not track it -- which keeps this
+#                         parameter's absence meaning "no capacity-lost recycle
+#                         ever", the same way max_unavailable=0 does. Compared
+#                         against max(register_grace, 960s); the floor is the
+#                         slot sweep's own worst case, derived at rule 2.
 #
 # Echoes "cordon:<reason>", "retire:<reason>" or "skip:<reason>". Always exits 0
 # -- the verdict is the output, not the status, so a `set -e` caller cannot be
@@ -86,6 +96,7 @@ recycle_decision() {
   local in_flight="${7:-0}"
   local max_unavail="${8:-0}"
   local cordoned="${9:-0}"
+  local partial_for="${10:-0}"
 
   # 0. Off. A mechanism that deletes machines on a schedule nobody triggered
   #    needs a switch that stops it without a rollback, and this is it.
@@ -102,13 +113,75 @@ recycle_decision() {
     return 0
   fi
 
-  # 2. Indeterminate template fails SAFE, and this is the branch that matters
-  #    most. `unknown` is what a gcloud hiccup, a quota error or a renamed field
-  #    reads as — and treating that as "stale" would cordon EVERY host in the
-  #    pool at once on a transient API failure. Recycling late costs one release
-  #    cycle; recycling the whole fleet on a bad read costs the pool.
-  if [ "$template" != "stale" ]; then
-    echo "skip:template=$template"
+  # 2. WHY this host would be recycled. There are two reasons, and a host that
+  #    has neither is left alone.
+  #
+  #    `stale-template` is the original: an apply moved the definition and this
+  #    host did not move with it. Indeterminate template fails SAFE, and this is
+  #    the branch that matters most — `unknown` is what a gcloud hiccup, a quota
+  #    error or a renamed field reads as, and treating it as "stale" would
+  #    cordon EVERY host in the pool at once on a transient API failure.
+  #    Recycling late costs one release cycle; recycling the whole fleet on a
+  #    bad read costs the pool.
+  #
+  #    `capacity-lost` is the second, and it is about capacity rather than code.
+  #    drain_host() deregisters a host's agents one at a time and aborts the
+  #    moment GitHub refuses one for executing a job — the 422 mid-job guard.
+  #    That refusal protects the running job; it does not put back the agents
+  #    already removed. Agents here are not --ephemeral and their unit is
+  #    Restart=no, so a deregistered slot stays deregistered: the host goes on
+  #    advertising slots that no longer exist, and cannot register them again
+  #    without config.sh and a fresh token. The worker-gate arms of the same
+  #    function are worse — they abort AFTER the whole loop, so every slot is
+  #    gone.
+  #
+  #    Measured on the Telnet pool 2026-09-04: one slot of four lost at
+  #    13:11:46Z to a drain aborted by a job that arrived in the same tick,
+  #    still missing 55 minutes later, and recovered only because the host
+  #    happened to go idle again and be drained for an unrelated reason. Nothing
+  #    was going to repair it: drain_decision's idle-past-grace rule was the
+  #    only path left, and on a pool sitting at its min_hosts floor — or one
+  #    that never goes idle for the grace window — that path never fires.
+  #
+  #    HYSTERESIS, because `partial` is also a normal transient — and the window
+  #    is NOT simply reg_grace. ci-slot-sweep stops a dirty slot's agent while it
+  #    resets the workspace and starts it again, ordinarily inside about ninety
+  #    seconds. Ordinarily is not the bound. Its unit carries TimeoutStartSec=900
+  #    on a 30-second timer, deliberately generous so that one wedged docker call
+  #    cannot stop every later sweep on the host — so a slot that is coming back
+  #    can legitimately be missing for roughly 930 seconds, and the host reads
+  #    `partial` for every one of them.
+  #
+  #    A recycle rule that fires inside that window RACES THE HOST'S OWN REPAIR
+  #    and wins: the slot would have returned, and instead the pool cordons the
+  #    host's remaining idle slots and deletes it. So the window is the larger of
+  #    reg_grace — the same window that decides `absent` means dead, because it
+  #    answers the same question — and the sweep's own worst case plus its timer
+  #    interval. The floor is what keeps a pool that has lowered reg_grace for
+  #    faster scale-in from quietly buying host churn with it.
+  local window="$reg_grace"
+  [ "$window" -lt 960 ] && window=960
+
+  local reason=""
+  if [ "$template" = "stale" ]; then
+    reason="stale-template"
+  elif [ "$reg" = "partial" ] && [ "$partial_for" -ge "$window" ]; then
+    reason="capacity-lost"
+  fi
+
+  #    The two no-reason outcomes are reported apart, because they are not the
+  #    same non-event. A host that is merely on a current template is the answer
+  #    for every healthy host on every tick. A host reading `partial` INSIDE the
+  #    hysteresis window is the mechanism watching something: either a sweep
+  #    that is about to hand the slot back, or the first ticks of capacity that
+  #    is gone for good. Collapsing the second into the first would publish the
+  #    interesting case under the label of the boring one.
+  if [ -z "$reason" ]; then
+    if [ "$reg" = "partial" ]; then
+      echo "skip:partial-grace partial_for=${partial_for}s<${window}s template=$template"
+    else
+      echo "skip:template=$template reg=$reg"
+    fi
     return 0
   fi
 
@@ -150,7 +223,7 @@ recycle_decision() {
   #    slot whose deregistration failed once must not be the reason a host takes
   #    another job.
   if [ "$busy" -gt 0 ]; then
-    echo "cordon:stale-template busy=$busy"
+    echo "cordon:$reason busy=$busy"
     return 0
   fi
 
@@ -164,9 +237,14 @@ recycle_decision() {
   #    the entire point. Draining at the floor here is not churn, it is the
   #    replacement.
   #
+  #    Both reasons want the same thing here. A stale host kept warm keeps the
+  #    wrong startup script warm; a capacity-lost host kept warm keeps slots that
+  #    do not exist in the pool's arithmetic, which is worse than being one host
+  #    short — a job routes to capacity that cannot run it.
+  #
   #    The CALLER must still run the full drain sequence — deregister, verify no
   #    Runner.Worker survives, then delete. This verdict authorises that
   #    sequence; it does not authorise a bare delete.
-  echo "retire:stale-template reg=$reg cordoned=$cordoned"
+  echo "retire:$reason reg=$reg cordoned=$cordoned"
   return 0
 }

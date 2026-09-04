@@ -1234,6 +1234,70 @@ done
 check "slots: both series are published" "2" \
   "$(grep -cE 'queue_series "ci_slots_(registered|missing)"' "$CTRL")"
 
+# ── the hysteresis clock behind the capacity-lost recycle ────────────────────
+#
+# recycle_decision() is a pure function, so the clock that decides whether
+# `partial` has held long enough lives out here, in partial_seconds(). Two
+# properties matter, and neither is visible by reading the decision rule:
+#
+#  1. it must compute its own clock (the v5.1.5 crash above, in a new function);
+#  2. ANY reading other than `partial` must CLEAR the timer -- including
+#     `unknown`. A tick that could not ask GitHub is not evidence the host is
+#     still degraded, and a run of blind ticks accumulating into a delete is the
+#     failure mode this whole family of rules is built to refuse. Clearing costs
+#     one more grace window; not clearing costs a host nobody can justify.
+#
+# Run for real against a scratch STATE_DIR, because the file is the state.
+check "partial_seconds computes its own clock" ok \
+  "$(run_fn partial_seconds 'partial_seconds host present' 'STATE_DIR=/tmp')"
+
+_psd=$(mktemp -d)
+_ps() { # <reg> -> the function's output, against a persistent STATE_DIR
+  bash -c "
+    set -uo pipefail
+    STATE_DIR=$_psd
+    $(fn partial_seconds)
+    partial_seconds h1 '$1'
+  " 2>&1
+}
+# A first partial tick starts the clock at zero rather than reporting the whole
+# uptime -- a host that has been up for hours must not be recycled on the first
+# tick its registration slips.
+check "partial_seconds: the first partial tick starts the clock" "0" "$(_ps partial)"
+check "partial_seconds: the marker survives a second partial tick" "yes" \
+  "$(_before=$(cat "$_psd/partial-h1"); _ps partial >/dev/null
+     [ "$(cat "$_psd/partial-h1")" = "$_before" ] && echo yes || echo no)"
+# Backdate the marker: this is the only way to observe accumulation without
+# making the test sleep. Reading the elapsed value straight after writing it
+# would be a race against the second boundary, which is why the tick above is
+# asserted on the marker rather than on the number it returns.
+echo $(($(date +%s) - 900)) >"$_psd/partial-h1"
+check "partial_seconds: an old marker accumulates" "yes" \
+  "$(_v=$(_ps partial); [ "$_v" -ge 900 ] && [ "$_v" -lt 910 ] && echo yes || echo "$_v")"
+# ...and the reset. `present` clears it, and `unknown` must too.
+check "partial_seconds: present clears the clock" "0" "$(_ps present)"
+check "partial_seconds: the marker file is gone after a reset" "no" \
+  "$([ -f "$_psd/partial-h1" ] && echo yes || echo no)"
+echo $(($(date +%s) - 900)) >"$_psd/partial-h1"
+check "partial_seconds: an unreadable registration clears it too" "0" "$(_ps unknown)"
+check "partial_seconds: unknown left no marker behind" "no" \
+  "$([ -f "$_psd/partial-h1" ] && echo yes || echo no)"
+rm -rf "$_psd"
+
+# The clock is only useful if it reaches the rule. Both halves asserted: the
+# call site passes it, and the host's marker is removed with the host -- a
+# leftover would hand a later host of the same name a clock it never started.
+# shellcheck disable=SC2016
+grep -q 'partial_for=$(partial_seconds "$host" "$HOST_REG")' "$CTRL" && r=yes || r=no
+check "partial_seconds: the tick computes it" yes "$r"
+# shellcheck disable=SC2016
+grep -A2 'recycle_decision "\$status"' "$CTRL" | grep -q '"\$partial_for")' && r=yes || r=no
+check "partial_seconds: recycle_decision receives it as its tenth argument" yes "$r"
+# shellcheck disable=SC2016
+sed -n '/^  rm -f "\$STATE_DIR\/idle-\$host"/,/pinhold/p' "$CTRL" \
+  | grep -q '"\$STATE_DIR/partial-\$host"' && r=yes || r=no
+check "partial_seconds: the marker is cleaned up with the host" yes "$r"
+
 # THE LAST LINES IN THE FILE, and `exit` rather than a bare test, so that a check
 # appended below them cannot silently become the script's exit status again.
 echo "controller-scope selftest: $pass passed, $fail failed"

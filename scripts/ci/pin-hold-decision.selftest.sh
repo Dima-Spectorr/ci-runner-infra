@@ -376,9 +376,14 @@ wired "the count is published" 'queue_series "ci_guest_attributes_denied" "\$ga_
 # which is how nine hosts sat on a stale template for a day underneath a
 # `ci_hosts_stale_template` of 9 that was already saying so.
 wired "skip verdicts are counted" 'RECYCLE_SKIPS\["\$skip_reason"\]='
-wired "skips are counted only while the template is not current" '\[ "\$tpl" != "current" \]'
+# ...and only for a host the mechanism could have acted on: a current template
+# OR registered capacity the host has lost. The second half is not optional --
+# the capacity-lost reason never consults the template, so gated on `$tpl` alone
+# the ticks leading up to that delete would publish nothing at all.
+wired "skips are counted while the template is not current" '\[ "\$tpl" != "current" \]'
+wired "a partial host is counted whatever its template" '\|\| \[ "\$HOST_REG" = "partial" \]'
 wired "the reasons are a closed set" \
-  'disabled \| not-running \| template \| registration-unknown \| booting \| at-capacity\)'
+  'disabled \| not-running \| template \| registration-unknown \| booting \| at-capacity \| partial-grace\)'
 wired "the zeroes are published too" 'for reason in disabled not-running template'
 wired "skips share the recycle series" 'outcome\\":\\"skip-\$reason'
 

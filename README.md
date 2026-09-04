@@ -146,12 +146,60 @@ argued for `0` is handled where it belongs: `recycle_decision()` skips on
 `template=unknown` and on `registration=unknown`, so only a template positively
 determined to be stale is ever acted on.
 
+### The other way a host stops being repairable: capacity it cannot get back
+
+The same cordon-then-retire path answers a second condition, and this one has
+nothing to do with templates. `drain_host()` deregisters a host's agents one at
+a time and stops the moment GitHub refuses one for executing a job — the 422
+that is the mid-job guard. That refusal protects the running job. It does not
+put back the agents already removed, and since agents here are not `--ephemeral`
+and their unit is `Restart=no`, a deregistered slot **stays** deregistered: the
+host goes on being counted for `slots_per_host` while fewer than that many can
+take work. Re-registering needs `config.sh` and a fresh registration token, so
+nothing on the host repairs it. The worker-gate arms of the same function are
+worse, because they stop *after* the whole loop — every slot gone, host still in
+service.
+
+Measured on the Telnet pool 2026-09-04: one slot of four lost at 13:11:46Z to a
+drain aborted by a job that arrived in the same tick, still missing 55 minutes
+later, and recovered only because the host happened to go idle again and be
+drained for an unrelated reason. Nothing was going to repair it — on a pool
+sitting at its `min_hosts` floor, or one that never goes idle for the warm
+window, that path never fires and the phantom slot lives as long as the host.
+
+So a host whose registration reads `partial` and stays that way is recycled for
+`capacity-lost`, on exactly the same bounded, never-interrupting sequence, with
+the same `recycle_max_unavailable` budget and the same fail-safes — `unknown` is
+still not a reason to delete anything.
+
+**With hysteresis**, because `partial` is also a normal transient: `ci-slot-sweep`
+stops a dirty slot's agent while it resets the workspace and starts it again,
+ordinarily inside about ninety seconds. Ordinarily is not the bound — its unit
+carries `TimeoutStartSec=900` on a 30-second timer, deliberately generous so one
+wedged `docker` call cannot stop every later sweep on the host. A slot that *is*
+coming back can therefore be missing for roughly 930 seconds. A recycle firing
+inside that window would race the host's own repair and win, so the window is
+`max(register_grace, 960s)`: the grace, because it is the same question `absent`
+answers, and the floor, so a pool that lowered `register_grace` for faster
+scale-in does not quietly buy host churn with it. The two numbers live in
+different files, and `recycle-decision.selftest.sh` fails if the sweep's bound
+ever grows past the floor.
+
+Any reading other than `partial` — including `unknown` — clears the clock. A run
+of blind ticks must never accumulate into a delete.
+
 Two series make it observable. `ci_hosts_stale_template` climbs when a template
 lands and falls back to zero as hosts are replaced; **stuck** above zero is the
 state that was invisible on 2026-08-15 — alert on sustained non-zero, not on the
 spike, because the spike is a release working. `ci_recycle_verdicts` counts
 `cordoned` and `retired` per tick: `cordoned` climbing while `retired` stays flat
 means the recycle is working and the hosts are not leaving — jobs that never end.
+The same series carries the refusals as `skip-<reason>`, published as a fixed set
+including the zeroes, so every host the mechanism could have acted on is either
+moved or named with the reason it was not. `skip-partial-grace` is the run-up to
+a `capacity-lost` retirement: a host ticking there for a minute or two is a slot
+sweep finishing, and one that stays there until it retires is capacity that never
+came back.
 
 ### What is in the golden image, and whether it may ship
 
@@ -890,7 +938,7 @@ modules/ci-host-image-trigger/   the golden image, rebuilt by a merge instead of
 modules/ci-runner-host-pool/     the module consumers reference
   scripts/drain-decision.sh      pure scale-in rule (unit-tested)
   scripts/orphan-decision.sh     pure registration-reap rule (unit-tested)
-  scripts/recycle-decision.sh    pure stale-template recycle rule (unit-tested)
+  scripts/recycle-decision.sh    pure host-retirement rule (unit-tested)
   scripts/host-startup.sh        registers K agents; installs nothing
   scripts/controller-startup.sh  poll, publish, drain
   scripts/telemetry.sh           the single metric publisher
