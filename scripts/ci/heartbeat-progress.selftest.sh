@@ -27,9 +27,11 @@
 # Tenancy-agnostic — no customer literals.
 #
 # The stubs below (date, log, logger, the collect_* phases, tick_pool) are
-# called only from the tick() this file `eval`s out of the controller, so
-# shellcheck's reachability pass sees no caller and reports every one of them as
-# dead code. Same reason as multi-pool.selftest.sh and metric-contract.
+# called only from the tick() this file `eval`s out of the controller, so the
+# reachability pass sees no caller and reports every one of them as dead code.
+# Same reason as multi-pool.selftest.sh and metric-contract.selftest.sh.
+# (A comment line may not BEGIN with the linter's own name — it is read as a
+# malformed directive, SC1073.)
 # shellcheck disable=SC2317
 
 set -uo pipefail
