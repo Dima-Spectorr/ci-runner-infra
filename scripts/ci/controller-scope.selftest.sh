@@ -1282,6 +1282,18 @@ echo $(($(date +%s) - 900)) >"$_psd/partial-h1"
 check "partial_seconds: an unreadable registration clears it too" "0" "$(_ps unknown)"
 check "partial_seconds: unknown left no marker behind" "no" \
   "$([ -f "$_psd/partial-h1" ] && echo yes || echo no)"
+# A marker that is not a number is the dangerous input: bash arithmetic reads it
+# as 0, which would put this host's partial age at seconds-since-the-epoch and
+# clear every hysteresis window in one tick. It must restamp, not accumulate.
+printf 'not-a-clock' >"$_psd/partial-h1"
+check "partial_seconds: a corrupt marker restamps instead of reading as epoch" "0" \
+  "$(_ps partial)"
+check "partial_seconds: the restamped marker is a plain number" "yes" \
+  "$(case "$(cat "$_psd/partial-h1")" in "" | *[!0-9]*) echo no ;; *) echo yes ;; esac)"
+# A marker dated in the future -- a clock step back, or a restored disk image --
+# clamps to zero rather than going negative into the comparison.
+echo $(($(date +%s) + 600)) >"$_psd/partial-h1"
+check "partial_seconds: a future marker clamps to zero" "0" "$(_ps partial)"
 rm -rf "$_psd"
 
 # The clock is only useful if it reaches the rule. Both halves asserted: the

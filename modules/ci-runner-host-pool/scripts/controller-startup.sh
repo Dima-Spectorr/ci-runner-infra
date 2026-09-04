@@ -2094,8 +2094,16 @@ idle_seconds() {
 
   local since
   since=$(cat "$f" 2>/dev/null)
-  [ -n "$since" ] || { echo "$now" >"$f"; echo 0; return 0; }
-  echo $((now - since))
+  # A marker that is not a plain number is not a clock. Bash arithmetic would
+  # read it as 0 and hand back an age of "seconds since the epoch", which is
+  # past every window this controller has. Restamp instead — the same thing an
+  # absent file means — and lose one grace window rather than the host.
+  case "$since" in
+    "" | *[!0-9]*) echo "$now" >"$f"; echo 0; return 0 ;;
+  esac
+  local gap=$((now - since))
+  [ "$gap" -lt 0 ] && gap=0
+  echo "$gap"
 }
 
 # How long this host has read `partial` WITHOUT INTERRUPTION, for the
@@ -2128,8 +2136,15 @@ partial_seconds() {
 
   local since
   since=$(cat "$f" 2>/dev/null)
-  [ -n "$since" ] || { echo "$now" >"$f"; echo 0; return 0; }
-  echo $((now - since))
+  # Same validation as idle_seconds(), and it matters more here: a marker read
+  # as 0 would put this host's partial age at decades, clearing the hysteresis
+  # window in one tick and retiring a host whose slot sweep was still running.
+  case "$since" in
+    "" | *[!0-9]*) echo "$now" >"$f"; echo 0; return 0 ;;
+  esac
+  local gap=$((now - since))
+  [ "$gap" -lt 0 ] && gap=0
+  echo "$gap"
 }
 
 # --- registration tokens -------------------------------------------------------
