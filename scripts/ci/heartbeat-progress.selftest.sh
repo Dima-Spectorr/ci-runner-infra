@@ -183,15 +183,74 @@ check "a tick blocked inside one phase is still judged wedged" \
 # A structural check, because deleting a `beat` reintroduces the incident
 # silently: the tick would still pass every test above that does not walk the
 # phase it guards. Every phase call in tick() must be followed by one.
+# The invariant, stated as the gap it forbids: between any phase call and the
+# NEXT one there must be a beat, and the last phase must be followed by one
+# before tick() ends. Deliberately not "the line after the call" — a phase may
+# be followed by a log line or an `if` block, and collect_runners is called as
+# the condition of one — and deliberately not a fixed lookahead window either.
+#
+# The first version of this check was both: `grep -A2` for a fixed set of
+# indents. It matched neither `collect_runners` (called as `if collect_runners;
+# then`) nor `tick_pool` (four spaces of indent, not six), and two comment lines
+# sat inside its two-line window — so the phase most likely to be the slow one
+# was not checked at all, and the check passed vacuously. Caught in review on
+# the PR that introduced it.
 missing=$(
   awk '/^tick\(\) \{/,/^\}/' "$CTRL" |
-    grep -A2 -E '^  (collect_runners|collect_demand|collect_outcomes|collect_parked|collect_apply_build|    tick_pool)' |
-    awk '/^  (collect_|    tick_pool)/ { phase=$1; found=0; next }
-         /beat/ { found=1 }
-         /^--$/ { if (phase != "" && found == 0) print phase; phase="" }
-         END { if (phase != "" && found == 0) print phase }'
+    awk '
+      # A phase call in any of its forms: bare, or as the condition of an if.
+      {
+        line = $0
+        sub(/^[ \t]+/, "", line)
+        sub(/^if /, "", line)
+        sub(/;.*$/, "", line)
+      }
+      line == "beat" { seen = 1; next }
+      line ~ /^(collect_runners|collect_demand|collect_outcomes|collect_parked|collect_apply_build|tick_pool)$/ {
+        if (phase != "" && seen == 0) print phase
+        phase = line; seen = 0; next
+      }
+      END { if (phase != "" && seen == 0) print phase }
+    '
 )
 check "every phase of tick() is followed by a beat" "" "$missing"
+
+# …and the check above is only worth having if it fails when it should. Delete
+# the beat that follows one named phase and confirm that that phase, and only
+# that phase, is reported.
+for victim in collect_runners collect_demand collect_outcomes collect_parked collect_apply_build tick_pool; do
+  mutant=$(
+    awk -v victim="$victim" '
+      /^tick\(\) \{/,/^\}/ {
+        line = $0
+        sub(/^[ \t]+/, "", line)
+        sub(/^if /, "", line)
+        sub(/;.*$/, "", line)
+        if (line == victim) { armed = 1; print; next }
+        if (armed && line == "beat") { armed = 0; next }   # drop exactly one
+        print
+        next
+      }
+      { print }
+    ' "$CTRL" |
+      awk '/^tick\(\) \{/,/^\}/' |
+      awk '
+        {
+          line = $0
+          sub(/^[ \t]+/, "", line)
+          sub(/^if /, "", line)
+          sub(/;.*$/, "", line)
+        }
+        line == "beat" { seen = 1; next }
+        line ~ /^(collect_runners|collect_demand|collect_outcomes|collect_parked|collect_apply_build|tick_pool)$/ {
+          if (phase != "" && seen == 0) print phase
+          phase = line; seen = 0; next
+        }
+        END { if (phase != "" && seen == 0) print phase }
+      '
+  )
+  check "removing the beat after $victim is caught" "$victim" "$mutant"
+done
 
 # The per-host walk, which is where a tick's minutes actually go.
 check "the host walk beats once per host" \
