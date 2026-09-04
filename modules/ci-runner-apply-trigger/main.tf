@@ -518,8 +518,10 @@ resource "google_cloud_scheduler_job" "daily_apply" {
   # manual run — resumes the schedule instead of preserving the pause.
   #
   # It also makes the pause a decision with a name on it. Silencing this job for
-  # real maintenance is now a commit, not a click, and a click is reverted within
-  # the hour by the automation it was meant to stop.
+  # real maintenance is now a commit, not a click — a click is undone by the next
+  # apply that touches this resource, whenever that is. How soon depends on the
+  # root: a push to it applies immediately, and `var.apply_schedule` may be
+  # hourly or weekly. What the pause can no longer do is outlive every apply.
   paused = false
 
   # Cross-variable, so it cannot be a `validation` block on either one — and it
