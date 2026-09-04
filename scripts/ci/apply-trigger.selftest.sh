@@ -477,8 +477,14 @@ mutate "'the type already says string' — address validation removed" "$VARS" \
 
 # "It is enabled, why say so" — and that omission is what let a hand-paused job
 # survive two days of applies on one consumer project, unseen by every plan.
+#
+# The address is the same normalized shape the check reads, not the line as it
+# is written today: an exact `^  paused = false$` would stop matching the moment
+# terraform fmt re-indented it or somebody appended a comment, and a mutation
+# that deletes nothing is a mutation this file reports as "not detected" — a red
+# test over an edit nobody made.
 mutate "'terraform does not need to state the obvious' — paused dropped" "$MAIN" \
-  '/^resource "google_cloud_scheduler_job"/,/^}/ { /^  paused = false$/d }' declares_the_schedule_is_running
+  '/^resource "google_cloud_scheduler_job"/,/^}/ { /^[[:space:]]*paused[[:space:]]*=[[:space:]]*false/d }' declares_the_schedule_is_running
 
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
