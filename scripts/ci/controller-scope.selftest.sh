@@ -1309,6 +1309,12 @@ check "partial_seconds: recycle_decision receives it as its tenth argument" yes 
 sed -n '/^  rm -f "\$STATE_DIR\/idle-\$host"/,/pinhold/p' "$CTRL" \
   | grep -q '"\$STATE_DIR/partial-\$host"' && r=yes || r=no
 check "partial_seconds: the marker is cleaned up with the host" yes "$r"
+# ...and it is scoped. tick_pool() declares its per-host variables in one local
+# list; a name left off it becomes a global that survives into the next pool's
+# tick, so a host that was never partial could be recycled on the previous
+# pool's clock.
+grep -q '^  local host status .* partial_for$' "$CTRL" && r=yes || r=no
+check "partial_seconds: partial_for is local to tick_pool" yes "$r"
 
 # THE LAST LINES IN THE FILE, and `exit` rather than a bare test, so that a check
 # appended below them cannot silently become the script's exit status again.

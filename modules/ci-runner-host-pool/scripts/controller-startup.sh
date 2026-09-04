@@ -3301,7 +3301,7 @@ tick_pool() {
   # about. slots_known is the denominator that goes with it: without it a blind
   # tick and a fleet-wide outage produce the same pair of numbers.
   local slots_registered=0 slots_known=0
-  local host status host_tpl host_uri busy idle age verdict hold tpl cordoned recycling
+  local host status host_tpl host_uri busy idle age verdict hold tpl cordoned recycling partial_for
   local skip_reason
 
   # Hosts already mid-recycle, counted BEFORE any decision this tick, so every
