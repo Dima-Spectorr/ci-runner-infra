@@ -25,6 +25,12 @@
 # two phases does not.
 #
 # Tenancy-agnostic — no customer literals.
+#
+# The stubs below (date, log, logger, the collect_* phases, tick_pool) are
+# called only from the tick() this file `eval`s out of the controller, so
+# shellcheck's reachability pass sees no caller and reports every one of them as
+# dead code. Same reason as multi-pool.selftest.sh and metric-contract.
+# shellcheck disable=SC2317
 
 set -uo pipefail
 
@@ -107,8 +113,14 @@ slow_out=$(
   queue_outcome_series() { :; }
   flush_series() { :; }
 
+  # The state tick() reads, set here because the phases that would normally set
+  # it are stubbed. Read only inside the eval'd tick(), so SC2034 for the same
+  # reason the stubs above are SC2317.
+  # shellcheck disable=SC2034
   BLIND_TICKS=0
+  # shellcheck disable=SC2034
   RUNNER_LIST_STATUS=200
+  # shellcheck disable=SC2034
   POOLS=(a b)
 
   # shellcheck disable=SC1090
