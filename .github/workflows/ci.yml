@@ -460,6 +460,15 @@ jobs:
       - name: watchdog-decision self-test
         run: bash scripts/ci/watchdog-decision.selftest.sh
 
+      # The other half of that verdict: its INPUT. The heartbeat used to be
+      # written only around the tick, so its age was the elapsed time of the
+      # tick in progress — a tick slower than the threshold read as a wedge, and
+      # the restart killed it before it published anything. IntegrateIT ran that
+      # loop for 54 minutes on 2026-09-03 with `NRestarts=0`. Deleting a `beat`
+      # re-opens it silently, so the boundaries are asserted structurally too.
+      - name: heartbeat-progress self-test
+        run: bash scripts/ci/heartbeat-progress.selftest.sh
+
       # A bound that is not a bound: a call allowed to START inside the budget
       # spends its whole timeout beyond it, and a fixed alert threshold pages
       # for a wider watchdog window it knows nothing about. Both were review

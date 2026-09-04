@@ -34,6 +34,40 @@ log() {
   logger -t ci-controller -- "$*" 2>/dev/null || true
 }
 
+# beat — "the loop moved". The watchdog's only input, written at every point in
+# a tick where progress can be proven.
+#
+# WHY THE TICK WRITES IT AND NOT ONLY THE LOOP AROUND IT (2026-09-03)
+#
+# The heartbeat used to be written twice, both times in run_loop(): once before
+# the tick and once after. That makes its age equal to the ELAPSED TIME OF THE
+# CURRENT TICK, so a tick that legitimately outruns the watchdog threshold is
+# indistinguishable from a wedge — and the restart the watchdog then issues
+# kills the tick before it can finish, which is the loop watchdog-decision.sh
+# was written to break. The uptime grace added there did not break that loop, it
+# PACED it:
+#
+#   restart -> hold:restarted-70s -> 140s -> 210s -> 280s -> restart -> ...
+#
+# The IntegrateIT controller ran exactly that on 2026-09-03: one restart every
+# 350s for 54 minutes, and four such windows in three days. `NRestarts=0`
+# throughout (the watchdog calls `systemctl restart`, so systemd's own counter
+# never moves), the unit `active (running)`, and NOT ONE metric published —
+# every series is queued during the tick and flushed at its end, so a tick that
+# is always killed flushes nothing. What reached the humans was
+# `ci_poller_heartbeat` absent for 10m: an alert that says "the controller is
+# dead" about a controller whose only problem was that its own watchdog would
+# not let it finish a tick.
+#
+# So the heartbeat now means "a phase of the tick completed", not "a tick
+# completed". A slow tick keeps it fresh, because a slow tick is still moving; a
+# tick blocked on one call still ages it out, because nothing between two phases
+# writes it and every call in this file is bounded. The watchdog rule itself is
+# unchanged — it was never the half that was wrong.
+beat() {
+  date +%s >"$STATE_DIR/heartbeat" 2>/dev/null || true
+}
+
 # Every outbound call in this file is bounded by these. The controller is a
 # `Type=simple` unit running `while true; do tick; sleep POLL; done`, so an
 # unbounded socket does not fail — it STOPS THE LOOP. The process stays alive, so
@@ -3117,7 +3151,10 @@ tick() {
     log "GitHub runner list unavailable this tick (status=$RUNNER_LIST_STATUS, consecutive=$BLIND_TICKS) — every host reads reg=unknown and nothing will be drained (fail-safe)"
   fi
 
+  beat
+
   collect_demand
+  beat
 
   # Deliberately BEFORE the pool loop, unlike the single-pool controller that
   # ran it last. It is still the work nothing waits on — no host is drained and
@@ -3126,6 +3163,7 @@ tick() {
   # one it belongs to. It carries its own budget and its own interval; on most
   # ticks it returns immediately.
   collect_outcomes
+  beat
 
   # Same placement, same reasoning, as the outcome sweep: repository-wide, on
   # its own interval, and nothing in the pool loop waits on what it finds. It is
@@ -3133,6 +3171,7 @@ tick() {
   # parked-decision.sh for why a fleet control plane is nonetheless the right
   # place for it.
   collect_parked
+  beat
 
   # Same placement and the same contract again: project-wide, on its own
   # interval, and nothing in the pool loop waits on it. It is the only sweep here
@@ -3140,10 +3179,14 @@ tick() {
   # collect_apply_build() for why a pool controller is nonetheless the only thing
   # in the project that can see this.
   collect_apply_build
+  beat
   local p
   for p in "${POOLS[@]}"; do
     pool_select "$p"
     tick_pool
+    # One pool's walk is minutes of work on its own, so the next pool's turn is
+    # a progress point in its own right.
+    beat
   done
 
   # The controller-wide facts, published under EVERY pool's label. A pool whose
@@ -3286,6 +3329,12 @@ tick_pool() {
 
   while IFS=, read -r host status host_tpl host_uri; do
     [ -n "$host" ] || continue
+
+    # Per HOST, not per pool. The walk is where a tick's minutes are actually
+    # spent — a drain deregisters an agent, deletes an instance and waits on
+    # both — and a sixteen-host pool walked at ten seconds a host is a tick the
+    # watchdog would otherwise judge wedged halfway through.
+    beat
 
     host_facts "$host"
     busy=$HOST_BUSY
@@ -3961,19 +4010,19 @@ LIVEZSVCEOF
 run_loop() {
   log "controller loop starting"
   while true; do
-    # Written BEFORE the tick as well as after it. The heartbeat is LOCAL
-    # liveness — "this loop is turning" — and a tick can legitimately run for
-    # minutes on a repo with many active runs. Writing it only afterwards made
-    # a slow tick indistinguishable from a wedged one, and the watchdog's
-    # restart then killed the tick before it could write the file that would
-    # have stopped the restarting (see watchdog-decision.sh). A tick genuinely
-    # stuck on a call still ages this file out, because the write happens once
-    # per iteration, not once per second.
-    date +%s >"$STATE_DIR/heartbeat" 2>/dev/null || true
+    # The loop's own two beats, around a tick that now also beats at every
+    # phase boundary of its own (see beat()). Writing it ONLY here — before and
+    # after — was the 2026-09-03 bug: the age was then the elapsed time of the
+    # tick in progress, a slow tick was indistinguishable from a wedged one,
+    # and the watchdog's restart killed the tick before it could write the file
+    # that would have stopped the restarting (see watchdog-decision.sh). These
+    # two stay because they cover what the tick itself cannot: the sleep
+    # between ticks, and a tick that fails before its first phase.
+    beat
     tick || log "tick failed"
     # After it too, so an ordinary tick keeps the file at most one tick old
     # rather than one tick plus its own duration.
-    date +%s >"$STATE_DIR/heartbeat" 2>/dev/null || true
+    beat
     sleep "$POLL"
   done
 }

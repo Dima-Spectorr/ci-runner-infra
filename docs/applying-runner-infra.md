@@ -797,6 +797,16 @@ the tick heartbeat file is fresh, and 503 otherwise. A TCP check would pass for
 a controller whose tick loop has stopped — the wedge keeps the socket open —
 which is exactly the state worth catching.
 
+The heartbeat means **the loop moved**, not **a tick finished**: the controller
+rewrites it at every phase boundary of a tick and once per host in a pool walk.
+It was written only around the tick until 2026-09-03, which made its age the
+elapsed time of the tick in progress — so a tick that legitimately ran past the
+threshold read as a wedge, and the restart killed it before it flushed anything.
+The controller then looked dead to `ci_poller_heartbeat` while systemd reported
+it `active (running)` with `NRestarts=0`, because the watchdog restarts the unit
+itself. A phase that never returns still reaches no boundary, so a genuine wedge
+still ages the file out.
+
 Its threshold is **three times** the watchdog's, deliberately. The watchdog
 restarts a unit; this deletes a machine. The cheaper remedy gets first refusal.
 
