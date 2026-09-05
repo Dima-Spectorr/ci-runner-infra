@@ -127,7 +127,16 @@ want "the log-based egress policy is not muted" "0" "$gce_muted"
 # ---------------------------------------------------------------------------
 docs=$(printf '%s\n' "$plain" | grep -c '"documentation": { "mimeType": "text/markdown", "content":')
 notes=$(printf '%s\n' "$muted" | grep -c 'MUTED POOLS: pool-broken\.')
-want "every policy's documentation names the muted pool" "$docs" "$notes"
+want "every policy that was muted says so" "$((docs - 1))" "$notes"
+
+# The one policy that must NOT carry the note is the one that could not be
+# muted. Caught in production on the first apply: the note went onto all
+# fourteen, so the egress policy read "this policy no longer pages for them"
+# while it went on paging for exactly those pools. A mute that lies about its
+# own scope is worse than no mute, because that sentence is what an operator
+# would rely on to decide the silence was deliberate.
+egress_note=$(printf '%s\n' "$muted" | grep -c 'MUTED POOLS.*runner firewall refused' || true)
+want "the policy that could not be muted does not claim to be" "0" "$egress_note"
 
 # ---------------------------------------------------------------------------
 # 4. Muting one pool must not mute another.
