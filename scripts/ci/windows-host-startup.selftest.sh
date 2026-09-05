@@ -490,6 +490,32 @@ has_profile_template_before_registration() { # <file>
   # and without this its very first job is failed for a reset with no
   # predecessor to undo.
   matches "$code" 'WriteAllText\(\(Get-SlotMarkerPath -Index \$Index\), .clean.' || return 1
+
+  # THE PROBE BEING GONE IS NOT THE HIVE BEING UNLOADED
+  #
+  # Windows unloads a user hive asynchronously after the last session using it
+  # ends; stopping and deleting the probe service only makes the unload possible.
+  # Measured 2026-09-05 on a Windows pool: the service was deleted at 06:36:11,
+  # the capture ran at 06:36:12, and robocopy answered `ERROR 32 (0x00000020)
+  # Copying File C:\Users\ci-s1\NTUSER.DAT` -- a sharing violation on the hive,
+  # exit 9, boot denied. Every boot of that host for six days, and the pool
+  # rebuilt it into the same failure each time.
+  matches "$code" 'Wait-SlotHiveUnloaded -Sid \$sid -TimeoutSeconds \$script:ProfileHiveUnloadSeconds' || return 1
+  # HKU losing the SID is the test, because nothing else distinguishes a stopped
+  # service from a released hive.
+  matches "$code" 'Test-Path -LiteralPath "Registry::HKEY_USERS\\\$Sid"' || return 1
+  # Fatal, like the other two failures here. A template captured without
+  # NTUSER.DAT is a template that restores everything except the one file that
+  # carries what a job left in HKCU.
+  matches "$code" "Deny-Boot \(\"slot \\\$Index's profile hive is still loaded" || return 1
+
+  # BEFORE the copy, which is the whole point -- a wait that runs afterwards
+  # observes the failure it exists to prevent.
+  local wait_at copy_at
+  wait_at=$(printf '%s\n' "$code" | grep -n 'Wait-SlotHiveUnloaded -Sid \$sid' | head -1 | cut -d: -f1)
+  copy_at=$(printf '%s\n' "$code" | grep -n "capturing slot \$Index's profile template" | head -1 | cut -d: -f1)
+  [ -n "$wait_at" ] && [ -n "$copy_at" ] || return 1
+  [ "$wait_at" -lt "$copy_at" ] || return 1
 }
 
 # --- phase 5: the two obligations the controller cannot check ----------------
@@ -1520,6 +1546,17 @@ mutate "the captured directory no longer checked against its slot" \
   has_profile_template_before_registration
 mutate "the first marker dropped, failing every slot's first job" \
   's|\[System.IO.File\]::WriteAllText((Get-SlotMarkerPath -Index \$Index), .clean.,||' \
+  has_profile_template_before_registration
+# 3e. The hive wait removed, weakened, or moved behind the copy it guards. This
+# is the fault that denied one pool's Windows host every boot for six days.
+mutate "the capture racing the hive again" \
+  's|if (-not (Wait-SlotHiveUnloaded -Sid \$sid -TimeoutSeconds \$script:ProfileHiveUnloadSeconds)) {|if ($false) {|' \
+  has_profile_template_before_registration
+mutate "a hive that never unloads allowed to boot anyway" \
+  "s|Deny-Boot (\"slot \\\$Index's profile hive is still loaded|Write-BootLog (\"slot \$Index's profile hive is still loaded|" \
+  has_profile_template_before_registration
+mutate "the wait made unconditional, so it waits for nothing" \
+  's|if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\\\$Sid")) { return \$true }|return $true|' \
   has_profile_template_before_registration
 
 # 4. The broker regresses to the Linux shape, or to checking the daemon.

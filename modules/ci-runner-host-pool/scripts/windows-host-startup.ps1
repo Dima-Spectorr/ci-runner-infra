@@ -176,6 +176,23 @@ $script:SlotResetPollSeconds = 2
 # hang, not to police a duration.
 $script:ProfileTemplateSeconds = 600
 
+# How long the capture waits for the probe account's registry hive to leave HKU
+# before it copies the profile. NOT the same clock as the capture's own bound:
+# this one is spent before robocopy starts, on a condition Windows satisfies on
+# its own schedule.
+#
+# Windows unloads a user hive ASYNCHRONOUSLY after the last session using it
+# ends. Stopping and deleting the probe service does not unload it; it only makes
+# the unload possible. Measured on a Windows pool 2026-09-05: the probe service
+# was deleted at 06:36:11 and the capture ran at 06:36:12, one second later, into
+# `ERROR 32 (0x00000020) Copying File C:\Users\ci-s1\NTUSER.DAT` -- a sharing
+# violation on the hive, exit 9, and a denied boot on every single boot of that
+# host for six days.
+#
+# Generous, because nothing is waiting on it and the cost of being short is a
+# host that never registers.
+$script:ProfileHiveUnloadSeconds = 120
+
 # The bound on every RESTORE afterwards, and it is deliberately much shorter than
 # the capture's. THE RESET SERVICE SERVES EVERY SLOT FROM ONE SERIAL LOOP, so
 # this bound is not just how long one slot's own reset may take -- it is how long
@@ -6160,6 +6177,37 @@ function Install-SlotResetService {
     Write-BootLog "phase 4: $script:SlotResetServiceName started as LocalSystem"
 }
 
+function Wait-SlotHiveUnloaded {
+    <#
+      .SYNOPSIS
+        Block until the slot's registry hive has left HKU, or the bound expires.
+      .DESCRIPTION
+        THIS IS THE SECOND COPY OF THIS WAIT, AND THE DUPLICATION IS DELIBERATE
+
+        The reset service carries its own `Wait-HiveUnloaded`, because that
+        service is rendered from a here-string into a standalone script and can
+        call nothing defined here. Same condition, same test, two scopes -- like
+        `$script:CacheDirs` and `Get-SlotCacheEnvironment`, and asserted by a test
+        rather than trusted to stay in step.
+
+        HKU losing the SID is how the host says the session is really gone.
+        Nothing else does: a service can be stopped, its registration deleted and
+        its process reaped while the hive it loaded is still open, because the
+        User Profile Service unloads on its own schedule and not on ours.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Sid,
+        [Parameter(Mandatory = $true)][int] $TimeoutSeconds
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$Sid")) { return $true }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Seconds 1
+    }
+}
+
 function Save-SlotProfileTemplate {
     <#
       .SYNOPSIS
@@ -6177,8 +6225,17 @@ function Save-SlotProfileTemplate {
 
         The hive matters, which is why the window matters. HKCU is a persistence
         surface in its own right -- Run keys, HKCU\Environment, an ExecutionPolicy
-        -- and NTUSER.DAT is only copyable while the account has no session. The
-        probe's service is stopped and removed by the time this runs, so it is.
+        -- and NTUSER.DAT is only copyable while the account has no session.
+
+        THE PROBE BEING GONE IS NOT THE SAME FACT AS THE HIVE BEING UNLOADED, AND
+        THIS FUNCTION USED TO ASSUME IT WAS. Stopping and deleting the probe's
+        service makes the unload possible; Windows performs it asynchronously,
+        afterwards. Measured 2026-09-05 on a Windows pool: service deleted at
+        06:36:11, capture at 06:36:12, `ERROR 32 (0x00000020) Copying File
+        C:\Users\ci-s1\NTUSER.DAT` -- a sharing violation, robocopy exit 9, boot
+        denied. Every boot of that host for six days, deterministically, and the
+        pool rebuilt it into the same failure each time. So the wait is explicit
+        now, and the deadline is its own.
 
         Fatal on failure. A slot with no template is a slot the reset service will
         refuse to reset, which is a slot every one of whose jobs fails at the gate.
@@ -6210,6 +6267,18 @@ function Save-SlotProfileTemplate {
     if (-not (Test-SlotProfileDirectory -Path $profileDir -Index $Index)) {
         Deny-Boot ("slot $Index resolved to '$profileDir', which is not its profile -- refusing to " +
             'capture a template from it')
+    }
+
+    # BEFORE anything is created, and before robocopy is spawned. The hive is the
+    # one file in the profile that another process can still be holding, and a
+    # capture that starts while it is loaded fails on that file alone -- exit 9,
+    # "some files copied, some could not be", which denies the boot over a
+    # condition that would have cleared on its own within a minute.
+    if (-not (Wait-SlotHiveUnloaded -Sid $sid -TimeoutSeconds $script:ProfileHiveUnloadSeconds)) {
+        Deny-Boot ("slot $Index's profile hive is still loaded at HKU\$sid after " +
+            "$($script:ProfileHiveUnloadSeconds)s -- NTUSER.DAT cannot be copied out from " +
+            'under a live session, so the template would be missing the one file that carries ' +
+            'what a job left in HKCU')
     }
 
     New-Item -ItemType Directory -Force -Path $script:ProfileTemplateRoot | Out-Null
