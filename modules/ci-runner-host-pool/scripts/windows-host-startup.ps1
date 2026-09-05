@@ -4044,6 +4044,28 @@ function Invoke-BoundedNative {
         $text = ''
         if ($code -ne 0) {
             $text = Format-NativeErrorText -Text ([string] (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue))
+            # STDOUT IS READ WHEN STDERR IS EMPTY, AND ROBOCOPY IS WHY
+            #
+            # robocopy writes NOTHING to stderr. Its per-file failures -- the
+            # ERROR lines that name the path and the Win32 code -- go to stdout
+            # along with everything else, so reading stderr alone turns the one
+            # call whose failure denies the boot into a call that cannot say why.
+            #
+            # Measured on ci-runner-host-win-iit-nn3l, 2026-09-05: the profile
+            # template capture exited 9 (1 = some files copied, 8 = some could
+            # not be) and the boot log carried the exit code and not one word
+            # about which file, on a host that then sat RUNNING and registered
+            # nothing for eight hours. The evidence robocopy had already printed
+            # was discarded in this function, three lines above the log line that
+            # said it had none.
+            #
+            # stderr stays FIRST because it is the better channel where a child
+            # uses it -- icacls writes its per-file denials there, and those
+            # should not be displaced by whatever it also put on stdout. This is
+            # a fallback for the children that have no stderr, not a merge.
+            if (-not $text) {
+                $text = Format-NativeErrorText -Text ([string] (Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue))
+            }
         }
         return [pscustomobject] @{ ExitCode = $code; Error = $text }
     } catch {
