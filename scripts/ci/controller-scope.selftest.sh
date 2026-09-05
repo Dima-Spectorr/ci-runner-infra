@@ -1316,6 +1316,48 @@ check "partial_seconds: the marker is cleaned up with the host" yes "$r"
 grep -q '^  local host status .* partial_for$' "$CTRL" && r=yes || r=no
 check "partial_seconds: partial_for is local to tick_pool" yes "$r"
 
+# --- pool_size accounting -----------------------------------------------------
+#
+# ci_hosts_running and ci_slots_total are derived from pool_size, which counts
+# RUNNING hosts only. drain_decision deletes a TERMINATED or SUSPENDED host
+# unconditionally, so a decrement that does not ask the status subtracts a host
+# that was never added -- measured as ci_hosts_running = -1 and
+# ci_slots_total = -4 on ci-runner-host-telnet, 2026-09-04.
+#
+# Asserted as a property of EVERY decrement rather than of the two that exist
+# today: a third one added later is caught by the same check.
+# shellcheck disable=SC2016  # the $((pool_size - 1)) is the shipping source text being matched, not an expression to evaluate.
+_dec=$(grep -c 'pool_size=$((pool_size - 1))' "$CTRL")
+check "pool_size: every decrement is accounted for" "yes" \
+  "$([ "$_dec" -ge 1 ] && echo yes || echo no)"
+_unguarded=$(awk '
+  /pool_size=\$\(\(pool_size - 1\)\)/ { if (prev !~ /\$status" = "RUNNING"/) bad++ }
+  # Comment-only lines are skipped, so `prev` is the previous line of CODE. A
+  # comment between the guard and the decrement is a documented decrement, not
+  # an unguarded one, and must not read as a failure.
+  /[^[:space:]]/ && $0 !~ /^[[:space:]]*#/ { prev = $0 }
+  END { print bad + 0 }
+' "$CTRL")
+check "pool_size: no decrement runs without a RUNNING guard above it" "0" "$_unguarded"
+# The floor is the second line of defence and it must sit BEFORE the publish,
+# not after -- a clamp downstream of queue_series would publish the bad values
+# and then correct a variable nobody reads again.
+_clamp=$(awk '
+  /if \[ "\$pool_size" -lt 0 \]/ { seen = NR }
+  # BOTH publishes that consume pool_size, not just the obvious one:
+  # ci_slots_total is pool_size x SLOTS, so a reorder that left it in front of
+  # the clamp would publish a negative total while this check stayed green.
+  /queue_series "ci_hosts_running"/ { if (seen && seen < NR) running = 1 }
+  /queue_series "ci_slots_total"/ { if (seen && seen < NR) total = 1 }
+  END { print (running && total) ? 1 : 0 }
+' "$CTRL")
+check "pool_size: the negative clamp precedes both publishes that consume it" "1" "$_clamp"
+# And it is not silent. A clamp that fixes the number without saying so turns
+# the next accounting bug into a series that merely looks plausible.
+# shellcheck disable=SC2016  # the $pool_size is the shipping source text being matched, not a variable to expand.
+grep -A2 'if \[ "\$pool_size" -lt 0 \]' "$CTRL" | grep -q '^ *log "BUG' && r=yes || r=no
+check "pool_size: the clamp logs that it fired" yes "$r"
+
 # THE LAST LINES IN THE FILE, and `exit` rather than a bare test, so that a check
 # appended below them cannot silently become the script's exit status again.
 echo "controller-scope selftest: $pass passed, $fail failed"
