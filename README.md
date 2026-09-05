@@ -860,6 +860,22 @@ project now writes nothing and says `unchanged` per policy. If you change a
 threshold and the run still says `unchanged`, that is a bug in the comparison
 (`policy_unchanged`), not a project that was already correct.
 
+**Muting one pool without blinding the others** — `alert_muted_pools` on
+`ci-runner-apply-trigger` (`--muted-pool` on the script) drops a named pool out of
+every pool-scoped condition filter in that project. Reach for it when a pool is
+known broken, already tracked, and pages continuously while the fix is being
+proven. The obvious alternative, a Cloud Monitoring snooze, is scoped to the
+*policy* rather than the pool: on this fleet several pools share a project, so
+snoozing the one that is failing also blinds the ones that are fine.
+
+A muted pool is **unwatched**, not fixed — it keeps publishing and keeps failing,
+and simply stops being reportable. That is the failure mode this whole section
+exists to prevent, so the mute is deliberately not silent: the exclusion is
+visible in each condition filter and every muted policy's documentation opens by
+naming the pool it stopped paging for. Take it out as soon as the fix lands. The
+log-based egress policy is unaffected — it keys on `gce_instance` and carries no
+pool label, so there is nothing to exclude on.
+
 Two of the fourteen watch the
 cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it
 below the pool's `cache_snapshot_max_age_hours`, or the first notice anyone gets
