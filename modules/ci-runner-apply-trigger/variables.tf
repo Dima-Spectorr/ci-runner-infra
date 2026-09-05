@@ -283,3 +283,36 @@ variable "alert_cache_stale_hours" {
   default     = null
   description = "Snapshot age that pages, which must stay BELOW the pool's cache_snapshot_max_age_hours. At or above it, the first notification anyone gets is every host in the pool starting cold — the outage, not the warning."
 }
+
+variable "alert_muted_pools" {
+  type        = list(string)
+  default     = []
+  description = <<-EOT
+    Pools that must NOT page from this project's alert policies, excluded by name
+    from every pool-scoped condition filter.
+
+    This exists because the alternative is a Cloud Monitoring snooze, and a snooze
+    is scoped to the POLICY: silencing a broken pool that way also blinds every
+    healthy pool sharing the project, which on this fleet is the normal case
+    rather than the exception.
+
+    A muted pool is UNWATCHED. Nothing else about it changes — it keeps publishing,
+    keeps failing, and stops being reportable. Set this only for a pool that is
+    known broken and already tracked somewhere a human will look, and remove it as
+    soon as the fix is proven. The exclusion is visible in each condition filter
+    and named in each policy's documentation, so an operator who opens the policy
+    can see it is quiet on purpose; nobody who does not open it can.
+
+    The log-based egress policy is unaffected: it keys on gce_instance and carries
+    no pool label, so there is nothing to exclude on.
+  EOT
+
+  validation {
+    # These names are interpolated into a shell command inside a Cloud Build
+    # step. Terraform is not an attacker, but "the value came from our own
+    # config" is the provenance every injection has; a pool name never needs
+    # more than this.
+    condition     = alltrue([for p in var.alert_muted_pools : can(regex("^[A-Za-z0-9._-]+$", p))])
+    error_message = "alert_muted_pools entries must match ^[A-Za-z0-9._-]+$."
+  }
+}

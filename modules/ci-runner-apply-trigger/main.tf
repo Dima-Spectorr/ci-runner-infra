@@ -136,6 +136,9 @@ locals {
     var.alert_register_grace_seconds == null ? "" : "--register-grace-seconds ${var.alert_register_grace_seconds}",
     var.alert_drain_grace_seconds == null ? "" : "--drain-grace-seconds ${var.alert_drain_grace_seconds}",
     var.alert_cache_stale_hours == null ? "" : "--cache-stale-hours ${var.alert_cache_stale_hours}",
+    # Repeated once per pool rather than a comma list: the script validates each
+    # name on its own, so a bad one names itself instead of failing the batch.
+    join(" ", [for p in var.alert_muted_pools : "--muted-pool '${p}'"]),
   ]))
 }
 

@@ -452,6 +452,14 @@ jobs:
       - name: alert-policy idempotence self-test
         run: bash scripts/ci/alert-policy-idempotence.selftest.sh
 
+      # A mute is the only change here that fails silently in the direction that
+      # costs the most: too wide, and the project stops mailing altogether, which
+      # from the console is indistinguishable from a project with nothing wrong.
+      # Asserted from both sides -- the named pool excluded everywhere, every
+      # other pool still matched, and an unmuted render byte-identical to before.
+      - name: alert pool-mute self-test
+        run: bash scripts/ci/alert-pool-mute.selftest.sh
+
 
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a

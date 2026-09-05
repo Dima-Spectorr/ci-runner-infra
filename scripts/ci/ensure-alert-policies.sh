@@ -22,7 +22,7 @@
 #   ensure-alert-policies.sh --project <id> [--email <addr>] [--account <sa-email>]
 #                            [--poll-interval-seconds <n>] [--cache-stale-hours <n>]
 #                            [--register-grace-seconds <n>] [--drain-grace-seconds <n>]
-#                            [--dry-run]
+#                            [--muted-pool <pool-name>]... [--dry-run]
 #
 #   --email is OPTIONAL, and omitting it is what lets an unattended build run
 #   this. With no address the script ADOPTS the project's existing email
@@ -44,6 +44,21 @@
 #   --cache-stale-hours must be BELOW the pool's `cache_snapshot_max_age_hours`.
 #   Set at or above it, the alert fires only once hosts have already started
 #   refusing the snapshot — which is the outage, not the warning.
+#
+#   --muted-pool excludes ONE pool from every pool-scoped policy in this
+#   project, by appending `AND metric.labels.pool!="<name>"` to each condition
+#   filter. Repeat it to mute several. This exists because the alternative is a
+#   Cloud Monitoring snooze, and a snooze is scoped to the POLICY: muting a
+#   broken pool that way also blinds every healthy pool sharing the project,
+#   which on this fleet is the normal case. It is deliberately NOT silent — the
+#   exclusion is visible in the condition filter, and every muted policy's
+#   documentation says which pool it stopped paging for and why to look. Mute a
+#   pool that is KNOWN broken and already tracked; a mute that outlives its
+#   issue is how a project ends up looking healthy because nothing can report.
+#
+#   The log-based `ci_egress_denied` policy is NOT muted by this flag. It keys on
+#   gce_instance rather than the controller's generic_node series and carries no
+#   pool label, so there is nothing to exclude on; it stays live for every pool.
 #
 #   --account selects a per-command identity for a project in another
 #   organisation. It is never exported: GOOGLE_APPLICATION_CREDENTIALS is shared
@@ -68,6 +83,7 @@ CACHE_STALE_HOURS=48
 # does not.
 REGISTER_GRACE=600
 DRAIN_GRACE=900
+MUTED_POOLS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --project) PROJECT="$2"; shift 2 ;;
@@ -77,6 +93,7 @@ while [ $# -gt 0 ]; do
     --cache-stale-hours) CACHE_STALE_HOURS="$2"; shift 2 ;;
     --register-grace-seconds) REGISTER_GRACE="$2"; shift 2 ;;
     --drain-grace-seconds) DRAIN_GRACE="$2"; shift 2 ;;
+    --muted-pool) MUTED_POOLS="${MUTED_POOLS:+$MUTED_POOLS }$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -93,6 +110,33 @@ case "$REGISTER_GRACE" in ''|*[!0-9]*) echo "--register-grace-seconds must be a 
 [ "$REGISTER_GRACE" -ge 1 ] || { echo "--register-grace-seconds must be >= 1" >&2; exit 2; }
 case "$DRAIN_GRACE" in ''|*[!0-9]*) echo "--drain-grace-seconds must be a whole number of seconds" >&2; exit 2 ;; esac
 [ "$DRAIN_GRACE" -ge 1 ] || { echo "--drain-grace-seconds must be >= 1" >&2; exit 2; }
+
+# The mute, resolved once into two strings the policy heredocs interpolate.
+#
+# MUTE_FILTER is appended to every generic_node condition filter; MUTE_NOTE is
+# prefixed to every policy's documentation. They move together on purpose. A
+# filter term that pages nobody and says nothing about it is indistinguishable,
+# from the console, from a policy that simply never fires — and this script's
+# whole reason to exist is that unreported observability is worse than none.
+#
+# The character class is the guard, not decoration: these values are pasted into
+# a JSON string that is pasted into a Monitoring filter expression, so a name
+# carrying a quote or a backslash would close both. Pool names are Terraform
+# resource names, which never need more than this.
+MUTE_FILTER=""
+MUTE_NOTE=""
+if [ -n "$MUTED_POOLS" ]; then
+  muted_list=""
+  for muted_pool in $MUTED_POOLS; do
+    case "$muted_pool" in
+      ''|*[!A-Za-z0-9._-]*)
+        echo "--muted-pool must be a pool name of [A-Za-z0-9._-]: '$muted_pool'" >&2; exit 2 ;;
+    esac
+    MUTE_FILTER="$MUTE_FILTER AND metric.labels.pool!=\\\"$muted_pool\\\""
+    muted_list="${muted_list:+$muted_list, }$muted_pool"
+  done
+  MUTE_NOTE="MUTED POOLS: $muted_list. This policy no longer pages for them -- their series are excluded in the condition filters below. Nothing else about those pools changed, so they are unwatched until the mute is removed; take it out as soon as whatever it is waiting on is proven. "
+fi
 
 # Same expression the module and the watchdog use, as a pure function so the
 # self-test can exercise the deployed text rather than a copy of it.
@@ -390,10 +434,10 @@ policy_json() {  # <key> -> a full alertPolicy body on stdout
 { "displayName": "CI runners / controller dead (no heartbeat 10m)",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "The CI warm-host controller stopped reporting. Jobs will queue and the pool will not scale. Since #308 the controller is a managed group of size 1, so a DELETED one is rebuilt on its own and this alert should clear within a few minutes -- one that does not clear is a controller that boots and cannot tick, not a missing machine. Find the VM with 'gcloud compute instance-groups managed list-instances <name>-controller' (the instance name carries a suffix and changes on every rebuild) and read its ci-controller.service." },
+    "${MUTE_NOTE}The CI warm-host controller stopped reporting. Jobs will queue and the pool will not scale. Since #308 the controller is a managed group of size 1, so a DELETED one is rebuilt on its own and this alert should clear within a few minutes -- one that does not clear is a controller that boots and cannot tick, not a missing machine. Find the VM with 'gcloud compute instance-groups managed list-instances <name>-controller' (the instance name carries a suffix and changes on every rebuild) and read its ci-controller.service." },
   "conditions": [ { "displayName": "ci_poller_heartbeat absent for 10m",
     "conditionAbsent": { "duration": "600s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_poller_heartbeat\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_poller_heartbeat\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MEAN" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -402,10 +446,10 @@ EOF
 { "displayName": "CI runners / scale-in suspended (controller blind to the runner list)",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "The controller cannot read the GitHub runner list, so every host reads reg=unknown and NOTHING is drained. That is the correct fail-safe — a host that cannot be proven idle must not be deleted mid-job — but the pool now holds its hosts indefinitely and the heartbeat still reports 1, so nothing else will tell you. Check the GitHub App installation, the token, and egress from the controller. Fires only on a sustained run: a single blind tick is ordinary API noise." },
+    "${MUTE_NOTE}The controller cannot read the GitHub runner list, so every host reads reg=unknown and NOTHING is drained. That is the correct fail-safe — a host that cannot be proven idle must not be deleted mid-job — but the pool now holds its hosts indefinitely and the heartbeat still reports 1, so nothing else will tell you. Check the GitHub App installation, the token, and egress from the controller. Fires only on a sustained run: a single blind tick is ordinary API noise." },
   "conditions": [ { "displayName": "ci_runner_list_blind_ticks > 3 for 10m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 3.0, "duration": "600s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_runner_list_blind_ticks\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_runner_list_blind_ticks\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -414,14 +458,14 @@ EOF
 { "displayName": "CI runners / pool not scaling to zero (unpinned idle host)",
   "combiner": "AND_WITH_MATCHING_RESOURCE",
   "documentation": { "mimeType": "text/markdown", "content":
-    "A warm host with no pin on it has been idle past this pool's drain threshold of ${DRAIN_GRACE}s and was not removed — scale-to-zero is broken and the pool is burning money. Check controller drain logs and the MIG autoscaler. If ci_runner_list_blind_ticks is also non-zero, THAT is the cause and this alert is a symptom.\n\nTHE SECOND CONDITION IS WHAT MAKES THIS READABLE. Idle time alone does not mean a host should have gone: pull-request host affinity holds a host for its pull request deliberately, and such a host reports exactly the idle seconds of one the drain loop forgot. Measured over a week on the busiest repository in this fleet, ci_pin_holds_honoured was non-zero for 565 of 1609 samples on one pool and 508 of 800 on the other — which accounted for very nearly every sample where idle time passed the threshold. On idle time alone this policy opened twenty incidents in that week and every one of them was affinity working as designed, so requiring BOTH conditions on the same resource is the difference between an alert about scale-to-zero and an alert about the pool being used.\n\nAND_WITH_MATCHING_RESOURCE, not AND: the controller publishes both series per pool under a generic_node whose namespace IS the pool name, so matching on the resource is what keeps a pin on one pool from silencing an idle host on another." },
+    "${MUTE_NOTE}A warm host with no pin on it has been idle past this pool's drain threshold of ${DRAIN_GRACE}s and was not removed — scale-to-zero is broken and the pool is burning money. Check controller drain logs and the MIG autoscaler. If ci_runner_list_blind_ticks is also non-zero, THAT is the cause and this alert is a symptom.\n\nTHE SECOND CONDITION IS WHAT MAKES THIS READABLE. Idle time alone does not mean a host should have gone: pull-request host affinity holds a host for its pull request deliberately, and such a host reports exactly the idle seconds of one the drain loop forgot. Measured over a week on the busiest repository in this fleet, ci_pin_holds_honoured was non-zero for 565 of 1609 samples on one pool and 508 of 800 on the other — which accounted for very nearly every sample where idle time passed the threshold. On idle time alone this policy opened twenty incidents in that week and every one of them was affinity working as designed, so requiring BOTH conditions on the same resource is the difference between an alert about scale-to-zero and an alert about the pool being used.\n\nAND_WITH_MATCHING_RESOURCE, not AND: the controller publishes both series per pool under a generic_node whose namespace IS the pool name, so matching on the resource is what keeps a pin on one pool from silencing an idle host on another." },
   "conditions": [ { "displayName": "ci_host_idle_seconds_max > ${IDLE_THRESHOLD} for 10m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": ${IDLE_THRESHOLD}.0, "duration": "600s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_host_idle_seconds_max\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_host_idle_seconds_max\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } },
     { "displayName": "ci_pin_holds_honoured < 1 for 10m",
     "conditionThreshold": { "comparison": "COMPARISON_LT", "thresholdValue": 1.0, "duration": "600s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_pin_holds_honoured\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_pin_holds_honoured\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -430,10 +474,10 @@ EOF
 { "displayName": "CI runners / queue starved (job waiting past the boot budget)",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "A queued job has waited ${QUEUE_WAIT}s without a slot — this pool's register_grace_seconds of ${REGISTER_GRACE}s plus one alignment window, which is the longest a COLD start is allowed to take. Either the pool hit max_hosts, hosts failed to boot, or the runner agent is offline. Compare ci_hosts_running with ci_mig_target_size, then read the host serial logs.\n\nThe threshold is derived rather than fixed because the fixed one was wrong in the only way that matters: at 600s it equalled the Linux boot budget exactly, so a single job arriving at a pool scaled to zero raced its own alert, and on a Windows pool — where the module floors register_grace_seconds at 1200 — it fired at half the boot time the pool was configured to permit. Pass --register-grace-seconds whenever the pool overrides it.\n\nBEFORE BELIEVING THIS ONE, LOOK AT HOW LONG THE WAIT IS, AND AT THE CLOCK. A wait that equals the time since UTC midnight is the controller reporting the age of midnight, not the age of a job: the demand sweep writes a sentinel into the stamp column for a run with no queued job, and GNU date resolves that sentinel — and 0, and Z, and the empty string — to today at 00:00:00 with exit status 0. Fixed in #518 by testing the token's shape before parsing it; a pool still reporting the sawtooth is running a controller from an instance template cut before that, so check the template's date before investigating the pool. Otherwise a wait of hours on a pool with spare max_hosts is genuine: list the repository's queued runs by age and find what no host will take." },
+    "${MUTE_NOTE}A queued job has waited ${QUEUE_WAIT}s without a slot — this pool's register_grace_seconds of ${REGISTER_GRACE}s plus one alignment window, which is the longest a COLD start is allowed to take. Either the pool hit max_hosts, hosts failed to boot, or the runner agent is offline. Compare ci_hosts_running with ci_mig_target_size, then read the host serial logs.\n\nThe threshold is derived rather than fixed because the fixed one was wrong in the only way that matters: at 600s it equalled the Linux boot budget exactly, so a single job arriving at a pool scaled to zero raced its own alert, and on a Windows pool — where the module floors register_grace_seconds at 1200 — it fired at half the boot time the pool was configured to permit. Pass --register-grace-seconds whenever the pool overrides it.\n\nBEFORE BELIEVING THIS ONE, LOOK AT HOW LONG THE WAIT IS, AND AT THE CLOCK. A wait that equals the time since UTC midnight is the controller reporting the age of midnight, not the age of a job: the demand sweep writes a sentinel into the stamp column for a run with no queued job, and GNU date resolves that sentinel — and 0, and Z, and the empty string — to today at 00:00:00 with exit status 0. Fixed in #518 by testing the token's shape before parsing it; a pool still reporting the sawtooth is running a controller from an instance template cut before that, so check the template's date before investigating the pool. Otherwise a wait of hours on a pool with spare max_hosts is genuine: list the repository's queued runs by age and find what no host will take." },
   "conditions": [ { "displayName": "ci_queue_wait_seconds_max > ${QUEUE_WAIT} for 15m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": ${QUEUE_WAIT}.0, "duration": "900s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_queue_wait_seconds_max\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_queue_wait_seconds_max\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -442,10 +486,10 @@ EOF
 { "displayName": "CI runners / drain failing",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "The controller's drain loop is erroring. Hosts either leak (cost) or are deleted mid-job (flaky CI). Read the drain verdicts in the controller log." },
+    "${MUTE_NOTE}The controller's drain loop is erroring. Hosts either leak (cost) or are deleted mid-job (flaky CI). Read the drain verdicts in the controller log." },
   "conditions": [ { "displayName": "ci_drain_verdicts{outcome=error} > 0 for 15m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "900s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_drain_verdicts\" AND resource.type=\"generic_node\" AND metric.labels.outcome=\"error\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_drain_verdicts\" AND resource.type=\"generic_node\"${MUTE_FILTER} AND metric.labels.outcome=\"error\"",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -454,10 +498,10 @@ EOF
 { "displayName": "CI runners / tick approaching the watchdog threshold",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "A controller tick is taking longer than ${SLOW_TICK}s — four fifths of this pool's watchdog threshold of ${WATCHDOG_THRESHOLD}s (max(300, poll_interval_seconds * 10), with poll_interval_seconds=${POLL}). This is the precursor to a total blackout, not a slowdown: once a tick outlasts the threshold the watchdog restarts the controller mid-tick, the restart prevents the heartbeat that would have stopped it, and every series — heartbeat included — goes absent while systemd still reports active (running). Two pools in this fleet ran that way for hours on 2026-08-14. Demand costs one API call per active workflow run, so the usual cause is a busier repository; lower demand_budget_seconds, or raise poll_interval_seconds AND re-run this script so the threshold follows the wider watchdog window. Check ci_demand_runs_skipped.\n\nFour fifths and not half, which is what this was until it was measured: half the window is the middle of the healthy range, not a precursor to anything. A pool polling every 20s has a 300s window, and a 150s tick is ordinary on a busy repository — over one week this policy opened ten incidents at half and every one of them peaked at 179s, nowhere near exhausting a window nothing was close to exhausting. At four fifths there is still a full tick of warning before the watchdog restarts anything." },
+    "${MUTE_NOTE}A controller tick is taking longer than ${SLOW_TICK}s — four fifths of this pool's watchdog threshold of ${WATCHDOG_THRESHOLD}s (max(300, poll_interval_seconds * 10), with poll_interval_seconds=${POLL}). This is the precursor to a total blackout, not a slowdown: once a tick outlasts the threshold the watchdog restarts the controller mid-tick, the restart prevents the heartbeat that would have stopped it, and every series — heartbeat included — goes absent while systemd still reports active (running). Two pools in this fleet ran that way for hours on 2026-08-14. Demand costs one API call per active workflow run, so the usual cause is a busier repository; lower demand_budget_seconds, or raise poll_interval_seconds AND re-run this script so the threshold follows the wider watchdog window. Check ci_demand_runs_skipped.\n\nFour fifths and not half, which is what this was until it was measured: half the window is the middle of the healthy range, not a precursor to anything. A pool polling every 20s has a 300s window, and a 150s tick is ordinary on a busy repository — over one week this policy opened ten incidents at half and every one of them peaked at 179s, nowhere near exhausting a window nothing was close to exhausting. At four fifths there is still a full tick of warning before the watchdog restarts anything." },
   "conditions": [ { "displayName": "ci_tick_seconds > ${SLOW_TICK} for 10m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": ${SLOW_TICK}.0, "duration": "600s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_tick_seconds\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_tick_seconds\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -466,10 +510,10 @@ EOF
 { "displayName": "CI runners / cache snapshot going stale",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "Hosts are booting on a shared-cache snapshot older than ${CACHE_STALE_HOURS}h, so the publishing run has stopped producing one. Nothing is broken yet — a stale snapshot is still hydrated, and hosts keep serving jobs — which is why this needs an alert: the failure is a scheduled workflow that quietly stopped, and it stays invisible until the age passes the pool's cache_snapshot_max_age_hours and every host starts cold. Check the publish-cache-snapshot workflow's last run and the pointer object (gcloud storage cat gs://<bucket>/cache/<pool>/current). Read next to ci_cache_snapshot_bytes: a snapshot that stopped growing is a publish that started failing before this did." },
+    "${MUTE_NOTE}Hosts are booting on a shared-cache snapshot older than ${CACHE_STALE_HOURS}h, so the publishing run has stopped producing one. Nothing is broken yet — a stale snapshot is still hydrated, and hosts keep serving jobs — which is why this needs an alert: the failure is a scheduled workflow that quietly stopped, and it stays invisible until the age passes the pool's cache_snapshot_max_age_hours and every host starts cold. Check the publish-cache-snapshot workflow's last run and the pointer object (gcloud storage cat gs://<bucket>/cache/<pool>/current). Read next to ci_cache_snapshot_bytes: a snapshot that stopped growing is a publish that started failing before this did." },
   "conditions": [ { "displayName": "ci_cache_snapshot_age_hours > ${CACHE_STALE_HOURS}",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": ${CACHE_STALE_HOURS}.0, "duration": "0s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_cache_snapshot_age_hours\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_cache_snapshot_age_hours\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
       "aggregations": [ { "alignmentPeriod": "3600s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -478,10 +522,10 @@ EOF
 { "displayName": "CI runners / cache hydrate failing on a configured pool",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "Hosts in a pool that HAS a snapshot bucket are registering without the shared cache. The layer fails open by design, so nothing is red: jobs run, they just run cold, and the only other symptom is CI getting slower over weeks. The verdict label says which of the dozen exits was taken — no-snapshot and bad-pointer mean the publish side, too-old, too-big and too-big-expanded mean a bound (the last one means the archive decompressed to more than eight times its own size, so the host refused it rather than unpack part of it), download-timeout and unpack-timeout mean cache_hydrate_budget_seconds is too small for the snapshot's size, scan-refused means the archive failed the host's own safety scan and SHOULD be investigated as a publish that produced something a host would not unpack. not-configured is excluded here: it is the correct steady state for a pool with no bucket, and paging on it would page every pool that never wanted this feature — a host that could not READ its configuration reports no-metadata-server instead, which is included. Read /var/log/ci-runner-startup.log on a recent host." },
+    "${MUTE_NOTE}Hosts in a pool that HAS a snapshot bucket are registering without the shared cache. The layer fails open by design, so nothing is red: jobs run, they just run cold, and the only other symptom is CI getting slower over weeks. The verdict label says which of the dozen exits was taken — no-snapshot and bad-pointer mean the publish side, too-old, too-big and too-big-expanded mean a bound (the last one means the archive decompressed to more than eight times its own size, so the host refused it rather than unpack part of it), download-timeout and unpack-timeout mean cache_hydrate_budget_seconds is too small for the snapshot's size, scan-refused means the archive failed the host's own safety scan and SHOULD be investigated as a publish that produced something a host would not unpack. not-configured is excluded here: it is the correct steady state for a pool with no bucket, and paging on it would page every pool that never wanted this feature — a host that could not READ its configuration reports no-metadata-server instead, which is included. Read /var/log/ci-runner-startup.log on a recent host." },
   "conditions": [ { "displayName": "ci_cache_hydrate_verdict{verdict!=hydrated,not-configured} > 0",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "0s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_cache_hydrate_verdict\" AND resource.type=\"generic_node\" AND metric.labels.verdict!=\"hydrated\" AND metric.labels.verdict!=\"not-configured\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_cache_hydrate_verdict\" AND resource.type=\"generic_node\"${MUTE_FILTER} AND metric.labels.verdict!=\"hydrated\" AND metric.labels.verdict!=\"not-configured\"",
       "aggregations": [ { "alignmentPeriod": "3600s", "perSeriesAligner": "ALIGN_SUM" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -490,10 +534,10 @@ EOF
 { "displayName": "CI runners / capacity on paper only (slots registered short of slots built)",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "Hosts are RUNNING and past their registration grace, and fewer runner agents answer than the pool was built with. This is the one alert that separates 'the pool is fine and jobs are queuing' from 'the pool is not there': ci_slots_total is arithmetic — hosts x slots — so it reads identically whether every agent registered or none did, and every other series stays green through every one of the failures below.\n\nRead ci_slots_registered next to ci_slots_total to size the gap, then the host serial log. Four causes, in rough order of likelihood -- three that a host arrives at on its own, then a fourth the pool inflicted on itself, in its own paragraph below. First the three: a host that registered NOTHING (its config.sh never completed — check the registration token and egress to github.com); a host whose slot units died before the agent started (a truncated generated hook is 203/EXEC, and the host still reports healthy); or a slot the host's own sweep CONDEMNED after CONDEMN_MAX consecutive failures to reach a clean state, which is the sweep working — the slot was failing every job it claimed — and grep 'taking it out of service' in the host's syslog will say so.\n\nA fourth cause, and the one that used to persist longest: a drain that was ABORTED after deregistering some of the host's agents. The abort is correct — GitHub answers 422 for an agent executing a job, and the worker gates stop for a live Runner.Worker — but it does not put the removed agents back, and agents here are not --ephemeral with Restart=no units, so those slots stay gone. Since v5.93.0 the pool recovers this itself: a host whose registration reads 'partial' continuously past the hysteresis window — max(register_grace, 960s), the floor being the slot sweep's own worst case, so the rule cannot race a slot that is coming back — is retired for capacity-lost on the ordinary cordon-then-retire path, and the autoscaler rebuilds it. So a host in that state raising THIS alert means the recovery did not act either — read ci_recycle_verdicts and expect skip-partial-grace climbing during the hysteresis window, then either retired, or a skip reason naming what blocked it (at-capacity is a budget of one already spent elsewhere; disabled is recycle_max_unavailable = 0).\n\nA controller that cannot read the runner list contributes to neither side of this, by construction, so an unreadable API cannot raise it. Sustained non-zero only, for thirty minutes: a host replaced mid-window is excluded by the grace, but a rolling recycle still ticks it, and at fifteen minutes a recycle that paused between hosts — which is what a cordon does, one host at a time — outlasted the window and paged for a pool being upgraded exactly as intended." },
+    "${MUTE_NOTE}Hosts are RUNNING and past their registration grace, and fewer runner agents answer than the pool was built with. This is the one alert that separates 'the pool is fine and jobs are queuing' from 'the pool is not there': ci_slots_total is arithmetic — hosts x slots — so it reads identically whether every agent registered or none did, and every other series stays green through every one of the failures below.\n\nRead ci_slots_registered next to ci_slots_total to size the gap, then the host serial log. Four causes, in rough order of likelihood -- three that a host arrives at on its own, then a fourth the pool inflicted on itself, in its own paragraph below. First the three: a host that registered NOTHING (its config.sh never completed — check the registration token and egress to github.com); a host whose slot units died before the agent started (a truncated generated hook is 203/EXEC, and the host still reports healthy); or a slot the host's own sweep CONDEMNED after CONDEMN_MAX consecutive failures to reach a clean state, which is the sweep working — the slot was failing every job it claimed — and grep 'taking it out of service' in the host's syslog will say so.\n\nA fourth cause, and the one that used to persist longest: a drain that was ABORTED after deregistering some of the host's agents. The abort is correct — GitHub answers 422 for an agent executing a job, and the worker gates stop for a live Runner.Worker — but it does not put the removed agents back, and agents here are not --ephemeral with Restart=no units, so those slots stay gone. Since v5.93.0 the pool recovers this itself: a host whose registration reads 'partial' continuously past the hysteresis window — max(register_grace, 960s), the floor being the slot sweep's own worst case, so the rule cannot race a slot that is coming back — is retired for capacity-lost on the ordinary cordon-then-retire path, and the autoscaler rebuilds it. So a host in that state raising THIS alert means the recovery did not act either — read ci_recycle_verdicts and expect skip-partial-grace climbing during the hysteresis window, then either retired, or a skip reason naming what blocked it (at-capacity is a budget of one already spent elsewhere; disabled is recycle_max_unavailable = 0).\n\nA controller that cannot read the runner list contributes to neither side of this, by construction, so an unreadable API cannot raise it. Sustained non-zero only, for thirty minutes: a host replaced mid-window is excluded by the grace, but a rolling recycle still ticks it, and at fifteen minutes a recycle that paused between hosts — which is what a cordon does, one host at a time — outlasted the window and paged for a pool being upgraded exactly as intended." },
   "conditions": [ { "displayName": "ci_slots_missing > 0 for 30m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_slots_missing\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_slots_missing\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MIN" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -502,10 +546,10 @@ EOF
 { "displayName": "CI runners / a green pull request cannot enter the merge queue",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "An open pull request has every check green and can NEVER be merged, because it fails one of the queue's entry conditions. Read the metric's \`reason\` label for which one: \`draft\` (nobody promoted it out of draft), \`base\` (it targets a branch the queue does not admit — usually a sibling feature branch an agent session stacked it on), or both.\n\nThis is the only alert here that fires on a state every other surface reports as healthy. Mergify does not fail an unmet entry condition, it reports NEUTRAL, which renders as a grey dot beside forty green ticks: no red check, no comment, no timer. Two repositories in this fleet reported 'CI is making no progress' in one week and neither had a failing job: two green DRAFTS nobody promoted in one, and a pull request BASED on a sibling feature branch in the other. Both were found days later by a human wondering why something had not landed.\n\nThe controller's log names the pull request number: grep 'cannot enter the merge queue' in the controller's syslog. Fix it in the repository — promote the draft, or retarget the base — not here. Read with max() across pools: the count is a REPOSITORY fact and every pool on the controller publishes the same one.\n\nA long window on purpose. A draft opened and promoted within the hour is somebody working, not an incident; only a pull request that stays finished-and-parked is worth a page. If ci_parked_prs_skipped is non-zero the count is a lower bound — the sweep hit its budget or its candidate ceiling." },
+    "${MUTE_NOTE}An open pull request has every check green and can NEVER be merged, because it fails one of the queue's entry conditions. Read the metric's \`reason\` label for which one: \`draft\` (nobody promoted it out of draft), \`base\` (it targets a branch the queue does not admit — usually a sibling feature branch an agent session stacked it on), or both.\n\nThis is the only alert here that fires on a state every other surface reports as healthy. Mergify does not fail an unmet entry condition, it reports NEUTRAL, which renders as a grey dot beside forty green ticks: no red check, no comment, no timer. Two repositories in this fleet reported 'CI is making no progress' in one week and neither had a failing job: two green DRAFTS nobody promoted in one, and a pull request BASED on a sibling feature branch in the other. Both were found days later by a human wondering why something had not landed.\n\nThe controller's log names the pull request number: grep 'cannot enter the merge queue' in the controller's syslog. Fix it in the repository — promote the draft, or retarget the base — not here. Read with max() across pools: the count is a REPOSITORY fact and every pool on the controller publishes the same one.\n\nA long window on purpose. A draft opened and promoted within the hour is somebody working, not an incident; only a pull request that stays finished-and-parked is worth a page. If ci_parked_prs_skipped is non-zero the count is a lower bound — the sweep hit its budget or its candidate ceiling." },
   "conditions": [ { "displayName": "ci_prs_green_and_unqueued > 0 for 60m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "3600s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_prs_green_and_unqueued\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_prs_green_and_unqueued\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -514,10 +558,10 @@ EOF
 { "displayName": "CI runners / the parking sweep is being refused",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "GitHub is refusing the parking sweep, so the alert above it can never fire. This is the watcher's watcher, and it exists because the feature it guards fails by looking healthy: a sweep that is refused publishes an unbroken ci_prs_green_and_unqueued of ZERO, which is precisely what a repository with nothing parked publishes.\n\nThe sweep makes two calls and either can be the refused one, so read the log line before granting anything: listing open pull requests needs \`pull_requests: read\`, and \`commits/<sha>/check-runs\` needs \`checks: read\`. Almost always the GitHub App installation for this repository holds the older permission set. Nothing else about the controller degrades - demand, draining and recycling all keep working, which is why nobody notices. Grant the permission on the App, then ACCEPT it on the installation: a permission added to an App stays pending until the installation approves it, and a pending permission behaves exactly like one that was never granted.\n\nDistinct from ci_parked_prs_skipped on purpose. Skipped means the sweep ran out of budget and will retry; this means it was refused and will be refused again in five minutes, forever. Grep 'parked sweep: DENIED' in the controller's syslog for the status GitHub actually returned - 401 is a bad App key or installation id rather than a missing permission, and 404 on a sha the same token just listed is a permission answer wearing another number.\n\nRead with max() across pools, like everything else the controller publishes per repository. Fires after 30m: a single refused sweep during a GitHub incident is not worth a page, five in a row is." },
+    "${MUTE_NOTE}GitHub is refusing the parking sweep, so the alert above it can never fire. This is the watcher's watcher, and it exists because the feature it guards fails by looking healthy: a sweep that is refused publishes an unbroken ci_prs_green_and_unqueued of ZERO, which is precisely what a repository with nothing parked publishes.\n\nThe sweep makes two calls and either can be the refused one, so read the log line before granting anything: listing open pull requests needs \`pull_requests: read\`, and \`commits/<sha>/check-runs\` needs \`checks: read\`. Almost always the GitHub App installation for this repository holds the older permission set. Nothing else about the controller degrades - demand, draining and recycling all keep working, which is why nobody notices. Grant the permission on the App, then ACCEPT it on the installation: a permission added to an App stays pending until the installation approves it, and a pending permission behaves exactly like one that was never granted.\n\nDistinct from ci_parked_prs_skipped on purpose. Skipped means the sweep ran out of budget and will retry; this means it was refused and will be refused again in five minutes, forever. Grep 'parked sweep: DENIED' in the controller's syslog for the status GitHub actually returned - 401 is a bad App key or installation id rather than a missing permission, and 404 on a sha the same token just listed is a permission answer wearing another number.\n\nRead with max() across pools, like everything else the controller publishes per repository. Fires after 30m: a single refused sweep during a GitHub incident is not worth a page, five in a row is." },
   "conditions": [ { "displayName": "ci_parked_sweep_denied > 0 for 30m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_parked_sweep_denied\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_parked_sweep_denied\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -526,23 +570,23 @@ EOF
 { "displayName": "CI runners / this project has stopped receiving runner infrastructure",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "The Cloud Build trigger that applies this project's runner infrastructure is not landing changes any more. Nothing else in this project can report that, and this alert is the only reason it is not invisible.\n\nWhy it hides. A trigger's build config is validated when a build FIRES, not when Terraform creates it. A config that outgrows one of Cloud Build's two size cliffs — 10,000 characters per build-step argument, and roughly 128 KiB for the whole config — is REFUSED at submit: a FAILURE lasting a fraction of a second, with no build log, no steps, and the entire explanation in the build's own \`statusDetail\`. The audit entry Cloud Logging does keep is severity NOTICE with \`granted: true\` and an empty status, indistinguishable from a healthy build being created, so no log-based metric can tell them apart. Meanwhile the pool keeps serving jobs on whatever configuration it had when the refusal started, every other policy here stays green, and the trigger looks correct in the console. \`ci-runner-apply-entity-platform\` sat like that from 2026-08-30 and was found by hand the next day, by somebody doing something else.\n\nThree conditions, and WHICH one fired decides what you do:\n\n- **ci_apply_build_failed** — the newest apply build did not succeed. Read its explanation first, because a refusal says nothing in the log. Ask for a page and pick the apply build out of it rather than taking the newest build in the project, which in a project that builds anything else is somebody else's: \`gcloud builds list --project <id> --region <region> --limit 50 --format='value(substitutions.TRIGGER_NAME,status,statusDetail,createTime)' | grep '^ci-runner-apply-' | head -1\`. If statusDetail names a size limit, the trigger CANNOT REPAIR ITSELF — the build that would apply the fix is the build being refused — and recovery is one out-of-band \`gcloud builds submit\` per project, described in docs/applying-runner-infra.md.\n- **ci_apply_build_missing** — no apply build at all in this project's recent history. The trigger is not firing, which produces no failure to find; check that the scheduler job and the trigger still exist and that \`apply_schedule\` is set.\n- **ci_apply_check_denied** — the CHECK is refused, so the two conditions above are stale rather than green. The controller needs \`roles/cloudbuild.builds.viewer\`; grep 'apply check: DENIED' in the controller's syslog.\n\nThe age condition is the half that catches a trigger which quietly stopped firing, and it is set at two days because the apply runs daily. Read every series with max() across pools: they are PROJECT facts published under each pool's label, exactly like the heartbeat." },
+    "${MUTE_NOTE}The Cloud Build trigger that applies this project's runner infrastructure is not landing changes any more. Nothing else in this project can report that, and this alert is the only reason it is not invisible.\n\nWhy it hides. A trigger's build config is validated when a build FIRES, not when Terraform creates it. A config that outgrows one of Cloud Build's two size cliffs — 10,000 characters per build-step argument, and roughly 128 KiB for the whole config — is REFUSED at submit: a FAILURE lasting a fraction of a second, with no build log, no steps, and the entire explanation in the build's own \`statusDetail\`. The audit entry Cloud Logging does keep is severity NOTICE with \`granted: true\` and an empty status, indistinguishable from a healthy build being created, so no log-based metric can tell them apart. Meanwhile the pool keeps serving jobs on whatever configuration it had when the refusal started, every other policy here stays green, and the trigger looks correct in the console. \`ci-runner-apply-entity-platform\` sat like that from 2026-08-30 and was found by hand the next day, by somebody doing something else.\n\nThree conditions, and WHICH one fired decides what you do:\n\n- **ci_apply_build_failed** — the newest apply build did not succeed. Read its explanation first, because a refusal says nothing in the log. Ask for a page and pick the apply build out of it rather than taking the newest build in the project, which in a project that builds anything else is somebody else's: \`gcloud builds list --project <id> --region <region> --limit 50 --format='value(substitutions.TRIGGER_NAME,status,statusDetail,createTime)' | grep '^ci-runner-apply-' | head -1\`. If statusDetail names a size limit, the trigger CANNOT REPAIR ITSELF — the build that would apply the fix is the build being refused — and recovery is one out-of-band \`gcloud builds submit\` per project, described in docs/applying-runner-infra.md.\n- **ci_apply_build_missing** — no apply build at all in this project's recent history. The trigger is not firing, which produces no failure to find; check that the scheduler job and the trigger still exist and that \`apply_schedule\` is set.\n- **ci_apply_check_denied** — the CHECK is refused, so the two conditions above are stale rather than green. The controller needs \`roles/cloudbuild.builds.viewer\`; grep 'apply check: DENIED' in the controller's syslog.\n\nThe age condition is the half that catches a trigger which quietly stopped firing, and it is set at two days because the apply runs daily. Read every series with max() across pools: they are PROJECT facts published under each pool's label, exactly like the heartbeat." },
   "conditions": [
     { "displayName": "ci_apply_build_failed > 0 for 30m",
       "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
-        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_build_failed\" AND resource.type=\"generic_node\"",
+        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_build_failed\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
         "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } },
     { "displayName": "ci_apply_build_missing > 0 for 30m",
       "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
-        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_build_missing\" AND resource.type=\"generic_node\"",
+        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_build_missing\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
         "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } },
     { "displayName": "ci_apply_check_denied > 0 for 30m",
       "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "1800s",
-        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_check_denied\" AND resource.type=\"generic_node\"",
+        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_check_denied\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
         "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } },
     { "displayName": "ci_apply_build_age_seconds > 2 days for 1h",
       "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 172800.0, "duration": "3600s",
-        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_build_age_seconds\" AND resource.type=\"generic_node\"",
+        "filter": "metric.type=\"custom.googleapis.com/ci/ci_apply_build_age_seconds\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
         "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -551,10 +595,10 @@ EOF
 { "displayName": "CI runners / a host went away under a running job",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "A job was found RUNNING on a host that no longer exists. The controller cancels the run so it reports something, and this counts the jobs it found.\n\nWhy it is worth a page rather than a line in a log: a slot that dies holding a job produces NO SIGNAL. GitHub leaves the check run \`in_progress\` with nothing behind it — not success, not failure, not cancelled — until its own 24-hour timeout. Nothing is red, nothing is queued, the pool reports healthy, and the job simply never finishes. Everything waiting on that status then waits out ITS timeout instead: a merge queue does not read a missing status as a failure, it reads it as 'still checking' and holds the entry for its full window before dequeuing on a timeout that names no cause. Measured on one repository, that is 150 minutes spent on a pull request whose own CI had been green for hours.\n\nSo the cancellation is the REMEDY, not the incident. The incident is upstream, and it is one of: a slot poisoned mid-run, an agent that stopped answering, host maintenance or an operator delete-instances against a busy host, or a MIG recreate. Grep 'went away under a running job' in the controller's syslog for the instance name, then look at that slot's history — a host that appears here repeatedly is a host to recycle, not a job to re-run.\n\nTwo clocks have to run out before anything is cancelled, and the absence clock is required: the controller refuses this verdict entirely unless it can say how long the host has been continuously missing from the MIG list, and a tick with no host list at all resets every clock rather than advancing it. A false positive here is live work thrown away, so the rule is deliberately slower than the queued-job equivalent.\n\nRead with max() across pools. Fires on any occurrence within the window — this is not a rate to tolerate." },
+    "${MUTE_NOTE}A job was found RUNNING on a host that no longer exists. The controller cancels the run so it reports something, and this counts the jobs it found.\n\nWhy it is worth a page rather than a line in a log: a slot that dies holding a job produces NO SIGNAL. GitHub leaves the check run \`in_progress\` with nothing behind it — not success, not failure, not cancelled — until its own 24-hour timeout. Nothing is red, nothing is queued, the pool reports healthy, and the job simply never finishes. Everything waiting on that status then waits out ITS timeout instead: a merge queue does not read a missing status as a failure, it reads it as 'still checking' and holds the entry for its full window before dequeuing on a timeout that names no cause. Measured on one repository, that is 150 minutes spent on a pull request whose own CI had been green for hours.\n\nSo the cancellation is the REMEDY, not the incident. The incident is upstream, and it is one of: a slot poisoned mid-run, an agent that stopped answering, host maintenance or an operator delete-instances against a busy host, or a MIG recreate. Grep 'went away under a running job' in the controller's syslog for the instance name, then look at that slot's history — a host that appears here repeatedly is a host to recycle, not a job to re-run.\n\nTwo clocks have to run out before anything is cancelled, and the absence clock is required: the controller refuses this verdict entirely unless it can say how long the host has been continuously missing from the MIG list, and a tick with no host list at all resets every clock rather than advancing it. A false positive here is live work thrown away, so the rule is deliberately slower than the queued-job equivalent.\n\nRead with max() across pools. Fires on any occurrence within the window — this is not a rate to tolerate." },
   "conditions": [ { "displayName": "ci_pinned_jobs_host_vanished > 0 for 15m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "900s",
-      "filter": "metric.type=\"custom.googleapis.com/ci/ci_pinned_jobs_host_vanished\" AND resource.type=\"generic_node\"",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_pinned_jobs_host_vanished\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
       "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
   "notificationChannels": [ "$channel" ] }
 EOF
@@ -563,7 +607,7 @@ EOF
 { "displayName": "CI runners / egress refused",
   "combiner": "OR",
   "documentation": { "mimeType": "text/markdown", "content":
-    "A warm host tried to open an outbound connection the runner firewall refused. Read the entries — logName compute.googleapis.com/firewall, jsonPayload.disposition=DENIED — for the destination address and port. Two very different causes, and the log tells them apart: an ordinary port the pool legitimately needs and nobody added (add it to egress_tcp_ports, or to database_egress_ports if it is a database on a private address), or a job reaching somewhere it has no business reaching, which is a warm host running third-party code from a lockfile. Before this metric existed the first case looked like a test client hanging until the job timed out, and the second looked like nothing at all. Fires on a sustained run, not a single refusal: one blocked probe is ordinary." },
+    "${MUTE_NOTE}A warm host tried to open an outbound connection the runner firewall refused. Read the entries — logName compute.googleapis.com/firewall, jsonPayload.disposition=DENIED — for the destination address and port. Two very different causes, and the log tells them apart: an ordinary port the pool legitimately needs and nobody added (add it to egress_tcp_ports, or to database_egress_ports if it is a database on a private address), or a job reaching somewhere it has no business reaching, which is a warm host running third-party code from a lockfile. Before this metric existed the first case looked like a test client hanging until the job timed out, and the second looked like nothing at all. Fires on a sustained run, not a single refusal: one blocked probe is ordinary." },
   "conditions": [ { "displayName": "ci_egress_denied > 0 for 15m",
     "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "900s",
       "filter": "metric.type=\"logging.googleapis.com/user/ci_egress_denied\" AND resource.type=\"gce_instance\"",
