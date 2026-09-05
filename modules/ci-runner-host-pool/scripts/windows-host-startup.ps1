@@ -6177,6 +6177,76 @@ function Install-SlotResetService {
     Write-BootLog "phase 4: $script:SlotResetServiceName started as LocalSystem"
 }
 
+function Invoke-BootSlotQuiesce {
+    <#
+      .SYNOPSIS
+        Terminate every process still owned by the slot, and SAY WHAT THEY WERE.
+      .DESCRIPTION
+        THE THIRD COPY OF THE RESET'S QUIESCE, AND THE BOOT PATH SHOULD HAVE HAD
+        ONE FROM THE START. The reset service does three things in order -- stop
+        the service, quiesce the SID, wait for the hive -- and the boot path did
+        only the first and the third. Stopping a service ends the service's own
+        process; it does not reap whatever that process started, and a survivor
+        running as the slot holds the hive open for as long as it lives.
+
+        Measured 2026-09-05, once the wait added in #656 made the condition
+        legible: probe service deleted at 07:29:48, hive STILL loaded at 07:31:49
+        -- 121 seconds later, and it was never going to unload. That is not a
+        slow unload. Something was holding it, which the boot path had no step
+        that would have released and no log line that would have named.
+
+        SO THIS LOGS BEFORE IT KILLS, unconditionally, INCLUDING WHEN IT FINDS
+        NOTHING. A quiesce that silently succeeds leaves the next person with the
+        same absent evidence this function was written to supply: if the hive is
+        still held after a clean sweep, the log has to be able to say the sweep
+        was clean, or the next investigation starts where this one did.
+
+        Terminating is safe here in a way it is not mid-job: this runs at boot,
+        before phase 5 registers any agent, so nothing owned by the slot is doing
+        work anybody is waiting on.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Sid,
+        [Parameter(Mandatory = $true)][int] $Index
+    )
+
+    $survivors = @()
+    foreach ($pass in @('first', 'second')) {
+        $victims = @()
+        foreach ($p in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
+            $owner = ''
+            try {
+                $owner = [string] (Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid `
+                        -ErrorAction Stop).Sid
+            } catch { $null = $_ }
+            if (Test-SlotProcessKillable -OwnerSid $owner -SlotSid $Sid `
+                    -ProcessId ([int] $p.ProcessId) -SpareProcessId @($PID)) {
+                $victims += [pscustomobject]@{ Id = [int] $p.ProcessId; Name = [string] $p.Name }
+            }
+        }
+        if ($victims.Count -eq 0) {
+            if ($pass -eq 'first') {
+                Write-BootLog "phase 4: slot $Index has no process of its own left to quiesce"
+            }
+            $survivors = @()
+            break
+        }
+        $shown = ($victims | ForEach-Object { "$($_.Name)($($_.Id))" }) -join ', '
+        Write-BootLog "phase 4: $pass quiesce pass on slot $Index -- still owned by $($Sid): $shown"
+        foreach ($victim in $victims) {
+            try { Stop-Process -Id $victim.Id -Force -ErrorAction Stop } catch { $null = $_ }
+        }
+        $survivors = $victims
+        Start-Sleep -Seconds 2
+    }
+
+    if ($survivors.Count -gt 0) {
+        $shown = ($survivors | ForEach-Object { "$($_.Name)($($_.Id))" }) -join ', '
+        Write-BootLog "phase 4: slot $Index still has processes after two quiesce passes: $shown"
+    }
+}
+
 function Wait-SlotHiveUnloaded {
     <#
       .SYNOPSIS
@@ -6274,11 +6344,19 @@ function Save-SlotProfileTemplate {
     # capture that starts while it is loaded fails on that file alone -- exit 9,
     # "some files copied, some could not be", which denies the boot over a
     # condition that would have cleared on its own within a minute.
+    # RELEASE THE HIVE, THEN WAIT FOR IT -- in that order, because waiting for a
+    # condition nothing will bring about is just a slower denial. The reset
+    # service has always done both; the boot path did neither, then only the
+    # wait, and the wait alone measured 121 seconds of a hive that was held
+    # rather than slow.
+    Invoke-BootSlotQuiesce -Sid $sid -Index $Index
+
     if (-not (Wait-SlotHiveUnloaded -Sid $sid -TimeoutSeconds $script:ProfileHiveUnloadSeconds)) {
         Deny-Boot ("slot $Index's profile hive is still loaded at HKU\$sid after " +
             "$($script:ProfileHiveUnloadSeconds)s -- NTUSER.DAT cannot be copied out from " +
             'under a live session, so the template would be missing the one file that carries ' +
-            'what a job left in HKCU')
+            'what a job left in HKCU. The quiesce lines above this one say what was still ' +
+            'running as the slot, or that nothing was')
     }
 
     New-Item -ItemType Directory -Force -Path $script:ProfileTemplateRoot | Out-Null
