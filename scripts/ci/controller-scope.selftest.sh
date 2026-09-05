@@ -1055,6 +1055,7 @@ check "gate/windows: another org constraint is not this one" \
 # Falsification: cut the flag out of the call and the reclaim above goes back to
 # being a permanent keep. Without this the four checks above pass against a rule
 # that never reads the twelfth argument at all.
+# shellcheck disable=SC2016  # the sed script must carry the literal $ names.
 check "gate/windows: dropping the flag restores the host nobody could delete" \
   "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
   "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 0 3 0 4000 \
