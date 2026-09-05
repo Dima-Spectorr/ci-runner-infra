@@ -3477,7 +3477,14 @@ tick_pool() {
           recycling=$((recycling + 1))
         fi
         if drain_host "$host"; then
-          pool_size=$((pool_size - 1))
+          # ONLY a host this tick actually COUNTED may be discounted. pool_size
+          # was built from the RUNNING hosts alone in the walk above, so
+          # subtracting for a host in any other state removes a host that was
+          # never added -- see the note at the drain arm below, where the same
+          # correction is made for the same reason.
+          if [ "$status" = "RUNNING" ]; then
+            pool_size=$((pool_size - 1))
+          fi
           RETIRED=$((RETIRED + 1))
           rm -f "$STATE_DIR/cordon-$host"
         fi
@@ -3541,7 +3548,24 @@ tick_pool() {
         log "$host: $verdict"
         draining=$((draining + 1))
         if drain_host "$host"; then
-          pool_size=$((pool_size - 1))
+          # THE COUNT AND THE DISCOUNT MUST AGREE ON WHAT A HOST IS.
+          #
+          # pool_size counts RUNNING hosts and nothing else. drain_decision, by
+          # contrast, deletes a TERMINATED or SUSPENDED host UNCONDITIONALLY --
+          # that is rule 1, and it is correct: a host in that state is gone, and
+          # waiting for it to go idle would wait forever. So the two disagree
+          # about which hosts exist, and an unguarded decrement here subtracts a
+          # host that was never added.
+          #
+          # Measured on ci-runner-host-telnet 2026-09-04: a pool of one whose
+          # only host was already TERMINATED published ci_hosts_running = -1 and
+          # ci_slots_total = -4 for the tick that reaped it. The slotsmissing policy
+          # sends the on-call to read ci_slots_total next to ci_slots_registered to
+          # size the gap, so a negative total is not cosmetic -- it inverts the
+          # arithmetic they were sent to read.
+          if [ "$status" = "RUNNING" ]; then
+            pool_size=$((pool_size - 1))
+          fi
         fi
         ;;
       *) : ;;
@@ -3589,6 +3613,16 @@ tick_pool() {
   # with no third one to explain them is how a correct autoscaler gets blamed.
   # Sustained >0 is a repository problem to go and close, not a fleet problem.
   queue_series "ci_demand_expired" "$DEMAND_EXPIRED"
+  # A FLOOR, kept even though the arithmetic above is now correct. These two
+  # series are counts of things that exist, so a negative one is never a reading
+  # -- it is a bug that has already happened, and it reaches an alert policy
+  # before it reaches anybody who could fix it. The guard costs one comparison
+  # and bounds the blast radius of the NEXT accounting mistake to a wrong number
+  # rather than an inverted one. The log line is what stops it being silent.
+  if [ "$pool_size" -lt 0 ]; then
+    log "BUG: pool_size=$pool_size — clamped to 0 (a host was discounted that was never counted)"
+    pool_size=0
+  fi
   queue_series "ci_hosts_running" "$pool_size"
   # Published so saturation is expressible as a ratio in one alert policy that
   # works for every pool, rather than a per-pool threshold copied by hand.

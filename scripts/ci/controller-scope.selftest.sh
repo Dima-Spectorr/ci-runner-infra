@@ -1316,6 +1316,39 @@ check "partial_seconds: the marker is cleaned up with the host" yes "$r"
 grep -q '^  local host status .* partial_for$' "$CTRL" && r=yes || r=no
 check "partial_seconds: partial_for is local to tick_pool" yes "$r"
 
+# --- pool_size accounting -----------------------------------------------------
+#
+# ci_hosts_running and ci_slots_total are derived from pool_size, which counts
+# RUNNING hosts only. drain_decision deletes a TERMINATED or SUSPENDED host
+# unconditionally, so a decrement that does not ask the status subtracts a host
+# that was never added -- measured as ci_hosts_running = -1 and
+# ci_slots_total = -4 on ci-runner-host-telnet, 2026-09-04.
+#
+# Asserted as a property of EVERY decrement rather than of the two that exist
+# today: a third one added later is caught by the same check.
+_dec=$(grep -c 'pool_size=$((pool_size - 1))' "$CTRL")
+check "pool_size: every decrement is accounted for" "yes" \
+  "$([ "$_dec" -ge 1 ] && echo yes || echo no)"
+_unguarded=$(awk '
+  /pool_size=\$\(\(pool_size - 1\)\)/ { if (prev !~ /\$status" = "RUNNING"/) bad++ }
+  /[^[:space:]]/ { prev = $0 }
+  END { print bad + 0 }
+' "$CTRL")
+check "pool_size: no decrement runs without a RUNNING guard above it" "0" "$_unguarded"
+# The floor is the second line of defence and it must sit BEFORE the publish,
+# not after -- a clamp downstream of queue_series would publish the bad value
+# and then correct a variable nobody reads again.
+_clamp=$(awk '
+  /if \[ "\$pool_size" -lt 0 \]/ { seen = NR }
+  /queue_series "ci_hosts_running"/ { if (seen && seen < NR) ok = 1 }
+  END { print ok + 0 }
+' "$CTRL")
+check "pool_size: the negative clamp precedes the publish" "1" "$_clamp"
+# And it is not silent. A clamp that fixes the number without saying so turns
+# the next accounting bug into a series that merely looks plausible.
+grep -A2 'if \[ "\$pool_size" -lt 0 \]' "$CTRL" | grep -q '^ *log "BUG' && r=yes || r=no
+check "pool_size: the clamp logs that it fired" yes "$r"
+
 # THE LAST LINES IN THE FILE, and `exit` rather than a bare test, so that a check
 # appended below them cannot silently become the script's exit status again.
 echo "controller-scope selftest: $pass passed, $fail failed"
