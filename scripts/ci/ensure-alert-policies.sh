@@ -83,7 +83,7 @@ CACHE_STALE_HOURS=48
 # does not.
 REGISTER_GRACE=600
 DRAIN_GRACE=900
-MUTED_POOLS=""
+MUTED_POOLS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --project) PROJECT="$2"; shift 2 ;;
@@ -93,7 +93,7 @@ while [ $# -gt 0 ]; do
     --cache-stale-hours) CACHE_STALE_HOURS="$2"; shift 2 ;;
     --register-grace-seconds) REGISTER_GRACE="$2"; shift 2 ;;
     --drain-grace-seconds) DRAIN_GRACE="$2"; shift 2 ;;
-    --muted-pool) MUTED_POOLS="${MUTED_POOLS:+$MUTED_POOLS }$2"; shift 2 ;;
+    --muted-pool) MUTED_POOLS+=("$2"); shift 2 ;;
     --dry-run) DRY=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -125,9 +125,18 @@ case "$DRAIN_GRACE" in ''|*[!0-9]*) echo "--drain-grace-seconds must be a whole 
 # resource names, which never need more than this.
 MUTE_FILTER=""
 MUTE_NOTE=""
-if [ -n "$MUTED_POOLS" ]; then
+#
+# MUTED_POOLS is an ARRAY and is iterated quoted, which is not stylistic. Held as
+# a space-joined string it would be re-split here, so ONE argument containing a
+# space -- `--muted-pool "web pool"`, a name pasted from a console display, two
+# names typed without the second flag -- would arrive as two tokens, each of
+# which passes the character class on its own. The operator would be told
+# nothing and the run would mute a second pool they never named. That is
+# precisely the over-broad silent mute this whole feature is built to avoid, so
+# it must be an argument error, not a wider mute.
+if [ "${#MUTED_POOLS[@]}" -gt 0 ]; then
   muted_list=""
-  for muted_pool in $MUTED_POOLS; do
+  for muted_pool in "${MUTED_POOLS[@]}"; do
     case "$muted_pool" in
       ''|*[!A-Za-z0-9._-]*)
         echo "--muted-pool must be a pool name of [A-Za-z0-9._-]: '$muted_pool'" >&2; exit 2 ;;

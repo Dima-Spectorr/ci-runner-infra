@@ -54,11 +54,14 @@ PJ="$(sed -n '/^policy_json() {/,/^}$/p' "$SRC")"
 KEYS="$(sed -n 's/^for key in \(.*\); do$/\1/p' "$SRC")"
 [ -n "$KEYS" ] || { echo "FAIL: the policy key list was not found in ensure-alert-policies.sh"; exit 1; }
 
-# render <muted-pools> -> every policy body, concatenated, on stdout
-# Runs in a subshell so one render's variables cannot leak into the next.
+# render [<muted-pool>...] -> every policy body, concatenated, on stdout
+# Runs in a subshell so one render's variables cannot leak into the next. Pools
+# arrive as separate arguments, matching the shipping script's array, so a name
+# containing a space stays ONE name here too -- a test that pre-splits its own
+# fixtures cannot see the splitting bug.
 render() (
   set -uo pipefail
-  MUTED_POOLS="$1"
+  MUTED_POOLS=("$@")
   # The literals policy_json interpolates. Values are irrelevant to this test --
   # only their presence is, because `set -u` in the shipping script means an
   # undefined one would abort the render rather than emit a wrong policy.
@@ -70,9 +73,9 @@ render() (
   for key in $KEYS; do policy_json "$key"; done
 )
 
-plain="$(render '')"
+plain="$(render)"
 [ -n "$plain" ] || { echo "FAIL: rendering with no mute produced nothing"; exit 1; }
-muted="$(render 'ci-runner-host-win-iit')"
+muted="$(render pool-broken)"
 [ -n "$muted" ] || { echo "FAIL: rendering with a mute produced nothing"; exit 1; }
 
 # ---------------------------------------------------------------------------
@@ -84,7 +87,7 @@ muted="$(render 'ci-runner-host-win-iit')"
 # and a PATCH closes open incidents, which re-notifies. That is the exact mail
 # flood the idempotence test was written for, re-introduced from a new angle.
 # ---------------------------------------------------------------------------
-if [ "$plain" = "$(render '')" ]; then ok; else bad "two unmuted renders disagree"; fi
+if [ "$plain" = "$(render)" ]; then ok; else bad "two unmuted renders disagree"; fi
 case "$plain" in
   *'MUTED POOLS'*) bad "an unmuted policy carries the mute note" ;;
   *'metric.labels.pool!='*) bad "an unmuted policy carries a pool exclusion" ;;
@@ -99,7 +102,7 @@ esac
 # have to audit fourteen policies by hand to find the one that still mails.
 # ---------------------------------------------------------------------------
 scoped_plain=$(printf '%s\n' "$plain" | grep -c 'resource\.type=\\"generic_node\\"')
-excluded=$(printf '%s\n' "$muted" | grep -c 'resource\.type=\\"generic_node\\" AND metric\.labels\.pool!=\\"ci-runner-host-win-iit\\"')
+excluded=$(printf '%s\n' "$muted" | grep -c 'resource\.type=\\"generic_node\\" AND metric\.labels\.pool!=\\"pool-broken\\"')
 want "every generic_node condition carries the exclusion" "$scoped_plain" "$excluded"
 
 leftover=$(printf '%s\n' "$muted" | grep -c 'resource\.type=\\"generic_node\\"[^ ]' || true)
@@ -120,26 +123,26 @@ want "the log-based egress policy is not muted" "0" "$gce_muted"
 # what makes "this is quiet because we made it quiet" legible at a glance.
 # ---------------------------------------------------------------------------
 docs=$(printf '%s\n' "$plain" | grep -c '"documentation": { "mimeType": "text/markdown", "content":')
-notes=$(printf '%s\n' "$muted" | grep -c 'MUTED POOLS: ci-runner-host-win-iit\.')
+notes=$(printf '%s\n' "$muted" | grep -c 'MUTED POOLS: pool-broken\.')
 want "every policy's documentation names the muted pool" "$docs" "$notes"
 
 # ---------------------------------------------------------------------------
 # 4. Muting one pool must not mute another.
 #
-# The reason this flag exists at all. `ci-runner-host-iit` shares mot-integrateit
+# The reason this flag exists at all. `pool-healthy` shares mot-integrateit
 # with the muted Windows pool and is healthy and busy; if this assertion fails,
 # the flag has become the snooze it was written to avoid.
 # ---------------------------------------------------------------------------
 case "$muted" in
-  *'metric.labels.pool!=\"ci-runner-host-iit\"'*) bad "muting the Windows pool also excluded the Linux pool" ;;
+  *'metric.labels.pool!=\"pool-healthy\"'*) bad "muting the Windows pool also excluded the Linux pool" ;;
   *) ok ;;
 esac
 
-two="$(render 'ci-runner-host-win-iit ci-runner-host-print')"
-a=$(printf '%s\n' "$two" | grep -c 'pool!=\\"ci-runner-host-win-iit\\" AND metric\.labels\.pool!=\\"ci-runner-host-print\\"')
+two="$(render pool-broken pool-other)"
+a=$(printf '%s\n' "$two" | grep -c 'pool!=\\"pool-broken\\" AND metric\.labels\.pool!=\\"pool-other\\"')
 want "two mutes chain onto the same filter" "$scoped_plain" "$a"
 case "$two" in
-  *'MUTED POOLS: ci-runner-host-win-iit, ci-runner-host-print.'*) ok ;;
+  *'MUTED POOLS: pool-broken, pool-other.'*) ok ;;
   *) bad "the note does not list both muted pools" ;;
 esac
 
@@ -151,8 +154,11 @@ esac
 # looks right and parses wrong. Parsing every body is cheaper than reading them.
 # ---------------------------------------------------------------------------
 if command -v python3 >/dev/null 2>&1; then
-  for pools in '' 'ci-runner-host-win-iit' 'ci-runner-host-win-iit ci-runner-host-print'; do
-    if render "$pools" | python3 -c '
+  for pools in '' 'pool-broken' 'pool-broken pool-other'; do
+    # Unquoted on purpose: these fixtures ARE space-separated lists, and render
+    # now takes one pool per argument.
+    # shellcheck disable=SC2086
+    if render $pools | python3 -c '
 import json, sys
 raw = sys.stdin.read()
 dec, i, n = json.JSONDecoder(), 0, 0
@@ -182,14 +188,18 @@ fi
 # ---------------------------------------------------------------------------
 refuses() { # <pool value>
   ( set -uo pipefail
-    MUTED_POOLS="$1"
+    MUTED_POOLS=("$1")
     eval "$MUTE_BLOCK" ) >/dev/null 2>&1
   [ "$?" = "2" ]
 }
-for evil in 'a"' 'a\b' 'a"OR"1' 'a b/c' 'pool;rm -rf /' '$(id)'; do
+# 'a b' and '' are the two that a space-joined accumulator lets through, and both
+# fail OPEN: one silently mutes a pool nobody named, the other writes a note
+# claiming a mute that did not happen. They are listed first because they are the
+# cases the character class alone does not catch.
+for evil in 'a b' '' ' ' 'a"' 'a\b' 'a"OR"1' 'a b/c' 'pool;rm -rf /' '$(id)'; do
   if refuses "$evil"; then ok; else bad "a pool name that cannot be safely quoted was accepted: $evil"; fi
 done
-for good in ci-runner-host-win-iit ci-runner-host-brosh-mq pool_1 pool.a; do
+for good in pool-broken pool-b.q pool_1 pool.a; do
   if refuses "$good"; then bad "a legitimate pool name was refused: $good"; else ok; fi
 done
 
