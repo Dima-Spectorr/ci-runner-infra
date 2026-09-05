@@ -59,21 +59,17 @@ KEYS="$(sed -n 's/^for key in \(.*\); do$/\1/p' "$SRC")"
 # arrive as separate arguments, matching the shipping script's array, so a name
 # containing a space stays ONE name here too -- a test that pre-splits its own
 # fixtures cannot see the splitting bug.
+# Everything assigned below is read inside the eval'd blocks, which the linter
+# sees only as an opaque string -- hence the whole-function SC2034. The values
+# are irrelevant to this test; only their presence is, because `set -u` in the
+# shipping script means an undefined one aborts the render rather than emitting
+# a wrong policy.
+# shellcheck disable=SC2034
 render() (
   set -uo pipefail
   MUTED_POOLS=("$@")
-  # The literals policy_json interpolates. Values are irrelevant to this test --
-  # only their presence is, because `set -u` in the shipping script means an
-  # undefined one would abort the render rather than emit a wrong policy.
-  # shellcheck cannot see through the eval below, so every one of these reads as
-  # unused. They are the literals policy_json interpolates, and the shipping
-  # script runs under `set -u` -- an undefined one aborts the render rather than
-  # emitting a wrong policy, which is the point of setting them here.
-  # shellcheck disable=SC2034
   channel="projects/p/notificationChannels/1"
-  # shellcheck disable=SC2034
   POLL=20; WATCHDOG_THRESHOLD=300; SLOW_TICK=240; QUEUE_WAIT=900
-  # shellcheck disable=SC2034
   IDLE_THRESHOLD=1200; DRAIN_GRACE=900; REGISTER_GRACE=600; CACHE_STALE_HOURS=48
   eval "$MUTE_BLOCK" || exit 1
   eval "$PJ"
@@ -193,10 +189,10 @@ fi
 # first injection. Refusing is also the honest failure: a name that needs a
 # quote is not a pool name.
 # ---------------------------------------------------------------------------
+# MUTED_POOLS is read inside the eval'd block, same blind spot as render().
+# shellcheck disable=SC2034
 refuses() { # <pool value>
   ( set -uo pipefail
-    # Read by the lifted block, which shellcheck sees only as a string.
-    # shellcheck disable=SC2034
     MUTED_POOLS=("$1")
     eval "$MUTE_BLOCK" ) >/dev/null 2>&1
   [ "$?" = "2" ]
@@ -205,8 +201,9 @@ refuses() { # <pool value>
 # fail OPEN: one silently mutes a pool nobody named, the other writes a note
 # claiming a mute that did not happen. They are listed first because they are the
 # cases the character class alone does not catch.
-# shellcheck disable=SC2016  # `$(id)` must stay literal -- expanding it here
-# would test a name the script never sees.
+# The single quotes below are the fixture: `$(id)` must reach the script as
+# eight literal characters. Expanding it here would test a name nobody types.
+# shellcheck disable=SC2016
 for evil in 'a b' '' ' ' 'a"' 'a\b' 'a"OR"1' 'a b/c' 'pool;rm -rf /' '$(id)'; do
   if refuses "$evil"; then ok; else bad "a pool name that cannot be safely quoted was accepted: $evil"; fi
 done
