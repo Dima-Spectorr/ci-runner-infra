@@ -145,6 +145,15 @@ output "metric_names" {
       # it holds everything forever", and until it existed the two were the same
       # number on the same chart. Alert on ANY non-zero: unlike a hold, an org
       # policy does not lapse, and no amount of waiting clears it.
+      #
+      # Sustained non-zero no longer means the pool is stuck. Both gates now
+      # read the refusal as what it is — the channel is off, so there is no
+      # hold and no beacon to be had — and act rather than veto. What it does
+      # mean is that on this project a Windows host is judged on its GitHub
+      # registration and its age alone: the second gate has no independent
+      # evidence of a worker, so slots_per_host jobs ride on GitHub's refusal to
+      # deregister a busy agent. That is worth knowing, and it is why the series
+      # stays alertable after the fix.
       "ci_guest_attributes_denied",
       "ci_hosts_running",
       "ci_hosts_max",

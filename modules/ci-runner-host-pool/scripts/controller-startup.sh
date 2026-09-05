@@ -2777,22 +2777,25 @@ beacon_gate() {
   local host="$1" zone="$2" regs="$3"
   local raw rc line key val present=0 workers="" ts_raw="" ts=0 now age misses
   local mf="$STATE_DIR/beaconmiss-$host"
-  local errf
+  local errf denied=0
 
-  # The error text is kept now, not discarded. The BEHAVIOUR here is unchanged
-  # on purpose — unlike a pin hold, a beacon that cannot be read is the loss of
-  # the only evidence this host is idle, so `keep` is still the right answer
-  # whatever the reason. What was missing was any way to tell a fleet that will
-  # never delete another Windows host from one that simply has nothing to
-  # delete, and that is what the counter below buys.
+  # The error text is kept, and now it is also ANSWERED. A beacon that cannot be
+  # read is normally the loss of the only evidence a host is idle, so `keep` is
+  # right whatever the reason — but a policy refusal is not a reason that will
+  # pass. It refuses every read on this project forever, so it does not describe
+  # a lost reading, it describes a host that has no beacon and never will.
+  # beacon_decision() takes that as its twelfth argument and hands the case to
+  # its never-booted arm, which still needs the grace, an empty GitHub agent
+  # list, and N confirmations before it deletes anything.
   errf=$(mktemp 2>/dev/null) || errf=""
   raw=$(timeout 60 gcloud compute instances get-guest-attributes "$host" \
     --project="$PROJECT" --zone="$zone" --query-path="$BEACON_NS/" \
     --format="csv[no-heading](key,value)" 2>"${errf:-/dev/null}")
   rc=$?
   if [ "$rc" != "0" ] && [ -n "$errf" ] && guest_attributes_denied "$(cat "$errf")"; then
+    denied=1
     note_guest_attributes_denied
-    log "beacon: guest attributes are disabled by org policy -- $host cannot publish one, so it can never be drained on idleness"
+    log "beacon: guest attributes are disabled by org policy -- $host cannot publish one, so it is judged on registration and age alone"
   fi
   [ -z "$errf" ] || rm -f "$errf"
 
@@ -2827,16 +2830,23 @@ EOF
   misses=$(cat "$mf" 2>/dev/null)
   case "${misses:-}" in '' | *[!0-9]*) misses=0 ;; esac
 
-  # The counter advances on the ONE branch it belongs to — a read that SUCCEEDED
-  # and found no beacon — and is cleared by anything else, so a failed read can
-  # never accumulate towards a deletion. Written after the verdict so this tick
-  # is judged on the count it entered with.
+  # The counter advances on the two branches where "no beacon" is a FACT rather
+  # than a gap — a read that succeeded and found none, and a read the org policy
+  # refused, which is the same fact stated by the project instead of the host —
+  # and is cleared by anything else, so a transient failure can never accumulate
+  # towards a deletion. Written after the verdict so this tick is judged on the
+  # count it entered with.
+  #
+  # THE DENIED ARM IS NOT OPTIONAL. Without it `misses` sits at 0 for the life
+  # of the fleet, rule 2c never reaches its confirmation threshold, and the
+  # twelfth argument above buys a verdict of `keep:unconfirmed` in perpetuity —
+  # a fix that is green in every test and inert on every machine.
   local verdict
   verdict=$(beacon_decision "$rc" "$present" "$workers" "$ts" "$now" \
     "$BEACON_INTERVAL" "$age" "$REGISTER_GRACE" "$regs" "$misses" \
-    "$ORPHAN_CONFIRM_TICKS")
+    "$ORPHAN_CONFIRM_TICKS" "$denied")
 
-  if [ "$rc" = "0" ] && [ "$present" != "1" ]; then
+  if { [ "$rc" = "0" ] || [ "$denied" = "1" ]; } && [ "$present" != "1" ]; then
     printf '%s' "$((misses + 1))" >"$mf"
   else
     rm -f "$mf"

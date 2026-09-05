@@ -801,6 +801,9 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <ssh-out>
   # GATE_CTRL_OS (env, default linux) is what the CONTROLLER's own metadata
   # says. Passed as an environment override rather than a 12th positional so the
   # two cases that care about it do not have to restate every other argument.
+  # GATE_GA_ERR (env, default empty) is what the failing guest-attribute read
+  # writes to STDERR. Empty is an unexplained failure; the org-policy text is
+  # the standing refusal, and the gate answers them differently.
   # -> ssh=<n> ga=<n> del=<n> rc=<n> clear=<n> held=<n> und=<n> fb=<n>
   local os="${1:-linux}" ga="${2:-}" garc="${3:-0}" derc="${4:-0}"
   local runners="${5:-1}" misses="${6:-0}" sshout="${7:-0}" age="${8:-0}"
@@ -890,7 +893,11 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <ssh-out>
         case \"\$*\" in
           *'compute ssh'*) printf '%s\n' '$sshout'; return 0 ;;
           *get-guest-attributes*)
-            [ $garc -eq 0 ] || return $garc
+            # The stderr matters as much as the status. beacon_gate classifies
+            # the refusal by grepping gcloud's own message for the constraint
+            # id, so a stub that fails silently exercises only half the branch
+            # -- and the half it skips is the one that authorises a deletion.
+            [ $garc -eq 0 ] || { printf '%s\n' '${GATE_GA_ERR:-}' >&2; return $garc; }
             cat '$dir/ga.csv'; return 0 ;;
           *'instances describe'*)
             [ $derc -eq 0 ] || return $derc
@@ -1004,6 +1011,54 @@ check "gate/windows: an unconfirmed beacon-less host keeps" \
   "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" "$(gate_seq windows '' 0 0 0 1 0 4000)"
 check "gate/windows: a confirmed never-booted host is deleted" \
   "ssh=0 ga=1 del=1 rc=0 clear=1 held=0 und=0 fb=0" "$(gate_seq windows '' 0 0 0 3 0 4000)"
+
+# --- the read the ORG refuses, end to end ------------------------------------
+#
+# Same four shapes again, with the read failing and gcloud saying WHY on stderr.
+# constraints/compute.disableGuestAttributesAccess is not a bad minute: it
+# refuses every read on the project, so the beacon does not exist and never
+# will. Read as an ordinary failure it shadows all of rule 2, and the four
+# checks above become unreachable on exactly the projects that need them --
+# measured in production on a project that enforces it, where one host that had
+# denied its own boot sat RUNNING and undeletable for hours.
+#
+# The keeps are what make the delete safe: young, or known to GitHub, or
+# unconfirmed, and the host stays.
+GA_POLICY_ERR='ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 412: Constraint constraints/compute.disableGuestAttributesAccess violated for project 000000000000.'
+
+check "gate/windows: a refused read still keeps a young host" \
+  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 0 0 0 60)"
+check "gate/windows: a refused read still keeps a host that HAD agents" \
+  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 2 9 0 4000)"
+check "gate/windows: a refused read still needs its confirmations" \
+  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 0 1 0 4000)"
+check "gate/windows: a host that can never publish a beacon is finally reclaimable" \
+  "ssh=0 ga=1 del=1 rc=0 clear=1 held=0 und=0 fb=0" \
+  "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 0 3 0 4000)"
+
+# The SAME arguments with no explanation on stderr, which is every other reason
+# a read fails -- quota above all, and quota arrives when the fleet is busy.
+# This is the one line that keeps the change from being "non-zero deletes".
+check "gate/windows: an unexplained read failure with the same shape still keeps" \
+  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "$(gate_seq windows '' 1 0 0 3 0 4000)"
+# ...and so does a DIFFERENT org constraint. The org enforces dozens; only this
+# one means there is no beacon.
+check "gate/windows: another org constraint is not this one" \
+  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "$(GATE_GA_ERR='ERROR: HTTPError 412: Constraint constraints/compute.disableSerialPortAccess violated for project 1.' \
+    gate_seq windows '' 1 0 0 3 0 4000)"
+
+# Falsification: cut the flag out of the call and the reclaim above goes back to
+# being a permanent keep. Without this the four checks above pass against a rule
+# that never reads the twelfth argument at all.
+check "gate/windows: dropping the flag restores the host nobody could delete" \
+  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 0 3 0 4000 \
+    's/"\$ORPHAN_CONFIRM_TICKS" "\$denied"/"$ORPHAN_CONFIRM_TICKS"/')"
 
 # --- the OS itself cannot be established: fail CLOSED ------------------------
 #

@@ -96,6 +96,43 @@ expect keep "nor is the second-to-last one" \
 expect delete "confirmed never-booted is reclaimed" \
   0 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 0 2 "$NEED"
 
+# --- the read was REFUSED, which is not the read failing ----------------------
+# constraints/compute.disableGuestAttributesAccess turns the channel off for the
+# whole project. Every read fails, every tick, forever — so "we did not get an
+# answer this time" is the wrong sentence: there is no beacon here and there
+# never will be. Read as an ordinary failure it shadows all of rule 2, and the
+# never-booted arm above becomes unreachable on exactly the projects that need
+# it. Measured in production 2026-09-05 on a project that enforces the
+# constraint: a host that had denied its own boot sat RUNNING and undeletable
+# for hours, alerting twice over.
+#
+# The twelfth argument is what tells the two apart. Nothing else about the rule
+# moves: these cases are the same shapes as the never-booted block, and they
+# answer the same way.
+expect keep "a refused read still keeps a booting host" \
+  1 0 "" 0 "$NOW" "$INT" 60 "$GRACE" 0 9 "$NEED" 1
+expect keep "a refused read still keeps a host GitHub knows has agents" \
+  1 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 1 99 "$NEED" 1
+expect keep "a refused read still needs its confirmations" \
+  1 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 0 1 "$NEED" 1
+expect delete "a host that can never publish a beacon is reclaimable once confirmed" \
+  1 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 0 2 "$NEED" 1
+
+# The distinction has to be the POLICY FLAG and not the non-zero status, or the
+# quota case above starts deleting hosts on a busy fleet. Same arguments as the
+# delete directly above; only the twelfth changes.
+expect keep "an ordinary read failure with the same shape is still a keep" \
+  1 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 0 2 "$NEED" 0
+expect keep "and a caller that omits the flag entirely gets the old behaviour" \
+  1 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 0 2 "$NEED"
+
+# The flag lets the rule reach rule 2. It must not let it reach rule 3d, which
+# needs a beacon this project cannot produce — `present` is 0 whenever a read
+# was refused, so the affirmative delete stays out of reach by construction.
+# Asserted anyway, because a later edit could move the flag test past rule 2.
+expect keep "the flag never authorises the idle-beacon delete on a booting host" \
+  1 0 0 "$NOW" "$NOW" "$INT" 60 "$GRACE" 0 9 "$NEED" 1
+
 # --- degraded state 3: the beacon is stale ------------------------------------
 # The publisher died. The host may be perfectly busy; we simply no longer know,
 # and "no longer know" is a keep.
