@@ -1332,19 +1332,26 @@ check "pool_size: every decrement is accounted for" "yes" \
   "$([ "$_dec" -ge 1 ] && echo yes || echo no)"
 _unguarded=$(awk '
   /pool_size=\$\(\(pool_size - 1\)\)/ { if (prev !~ /\$status" = "RUNNING"/) bad++ }
-  /[^[:space:]]/ { prev = $0 }
+  # Comment-only lines are skipped, so `prev` is the previous line of CODE. A
+  # comment between the guard and the decrement is a documented decrement, not
+  # an unguarded one, and must not read as a failure.
+  /[^[:space:]]/ && $0 !~ /^[[:space:]]*#/ { prev = $0 }
   END { print bad + 0 }
 ' "$CTRL")
 check "pool_size: no decrement runs without a RUNNING guard above it" "0" "$_unguarded"
 # The floor is the second line of defence and it must sit BEFORE the publish,
-# not after -- a clamp downstream of queue_series would publish the bad value
+# not after -- a clamp downstream of queue_series would publish the bad values
 # and then correct a variable nobody reads again.
 _clamp=$(awk '
   /if \[ "\$pool_size" -lt 0 \]/ { seen = NR }
-  /queue_series "ci_hosts_running"/ { if (seen && seen < NR) ok = 1 }
-  END { print ok + 0 }
+  # BOTH publishes that consume pool_size, not just the obvious one:
+  # ci_slots_total is pool_size x SLOTS, so a reorder that left it in front of
+  # the clamp would publish a negative total while this check stayed green.
+  /queue_series "ci_hosts_running"/ { if (seen && seen < NR) running = 1 }
+  /queue_series "ci_slots_total"/ { if (seen && seen < NR) total = 1 }
+  END { print (running && total) ? 1 : 0 }
 ' "$CTRL")
-check "pool_size: the negative clamp precedes the publish" "1" "$_clamp"
+check "pool_size: the negative clamp precedes both publishes that consume it" "1" "$_clamp"
 # And it is not silent. A clamp that fixes the number without saying so turns
 # the next accounting bug into a series that merely looks plausible.
 # shellcheck disable=SC2016  # the $pool_size is the shipping source text being matched, not a variable to expand.
