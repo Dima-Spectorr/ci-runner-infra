@@ -129,9 +129,9 @@ want "every policy's documentation names the muted pool" "$docs" "$notes"
 # ---------------------------------------------------------------------------
 # 4. Muting one pool must not mute another.
 #
-# The reason this flag exists at all. `pool-healthy` shares mot-integrateit
-# with the muted Windows pool and is healthy and busy; if this assertion fails,
-# the flag has become the snooze it was written to avoid.
+# The reason this flag exists at all. A muted pool almost always shares its
+# project with pools that are fine and busy; if this assertion fails, the flag
+# has become the policy-scoped snooze it was written to avoid.
 # ---------------------------------------------------------------------------
 case "$muted" in
   *'metric.labels.pool!=\"pool-healthy\"'*) bad "muting the Windows pool also excluded the Linux pool" ;;
