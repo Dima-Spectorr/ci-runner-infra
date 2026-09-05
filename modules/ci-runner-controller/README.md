@@ -27,13 +27,13 @@ instance group forever and reports a perfectly healthy, permanently empty pool.
 
 ```hcl
 module "linux_ci" {
-  source            = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.95.0"
+  source            = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.96.0"
   manage_controller = false
   # …
 }
 
 module "controller" {
-  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.95.0"
+  source = "git::https://github.com/Dima-Spectorr/ci-runner-infra.git//modules/ci-runner-controller?ref=v5.96.0"
 
   name  = "<repo>-controller"
   pools = [module.linux_ci.pool_descriptor, module.windows_ci.pool_descriptor]
