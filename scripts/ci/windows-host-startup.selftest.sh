@@ -509,12 +509,29 @@ has_profile_template_before_registration() { # <file>
   # carries what a job left in HKCU.
   matches "$code" "Deny-Boot \(\"slot \\\$Index's profile hive is still loaded" || return 1
 
+  # AND THE HIVE HAS TO BE RELEASED, NOT MERELY WAITED FOR
+  #
+  # Measured 2026-09-05, once the wait made the condition legible: probe service
+  # deleted at 07:29:48, hive still loaded at 07:31:49 -- 121s later, and never
+  # going to unload. Stopping a service does not reap what that service started,
+  # and a survivor owned by the slot holds the hive for as long as it lives. The
+  # reset service has always stopped, quiesced and then waited; the boot path
+  # must do the same three things in the same order.
+  matches "$code" 'Invoke-BootSlotQuiesce -Sid \$sid -Index \$Index' || return 1
+  # It logs even when it finds nothing, because "the sweep was clean" is the
+  # evidence the NEXT investigation needs if the hive is still held afterwards.
+  matches "$code" 'has no process of its own left to quiesce' || return 1
+
   # BEFORE the copy, which is the whole point -- a wait that runs afterwards
-  # observes the failure it exists to prevent.
-  local wait_at copy_at
+  # observes the failure it exists to prevent. And the quiesce before the wait,
+  # for the same reason: waiting for a condition nothing will bring about is
+  # only a slower denial.
+  local quiesce_at wait_at copy_at
+  quiesce_at=$(printf '%s\n' "$code" | grep -n 'Invoke-BootSlotQuiesce -Sid \$sid' | head -1 | cut -d: -f1)
   wait_at=$(printf '%s\n' "$code" | grep -n 'Wait-SlotHiveUnloaded -Sid \$sid' | head -1 | cut -d: -f1)
   copy_at=$(printf '%s\n' "$code" | grep -n "capturing slot \$Index's profile template" | head -1 | cut -d: -f1)
-  [ -n "$wait_at" ] && [ -n "$copy_at" ] || return 1
+  [ -n "$quiesce_at" ] && [ -n "$wait_at" ] && [ -n "$copy_at" ] || return 1
+  [ "$quiesce_at" -lt "$wait_at" ] || return 1
   [ "$wait_at" -lt "$copy_at" ] || return 1
 }
 
@@ -1557,6 +1574,12 @@ mutate "a hive that never unloads allowed to boot anyway" \
   has_profile_template_before_registration
 mutate "the wait made unconditional, so it waits for nothing" \
   's|if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\\\$Sid")) { return \$true }|return $true|' \
+  has_profile_template_before_registration
+mutate "the hive waited for but never released" \
+  's|    Invoke-BootSlotQuiesce -Sid \$sid -Index \$Index|    # quiesce removed|' \
+  has_profile_template_before_registration
+mutate "a quiesce that finds nothing and says nothing" \
+  's|has no process of its own left to quiesce|found nothing|' \
   has_profile_template_before_registration
 
 # 4. The broker regresses to the Linux shape, or to checking the daemon.
