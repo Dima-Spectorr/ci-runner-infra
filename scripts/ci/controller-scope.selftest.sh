@@ -1326,6 +1326,7 @@ check "partial_seconds: partial_for is local to tick_pool" yes "$r"
 #
 # Asserted as a property of EVERY decrement rather than of the two that exist
 # today: a third one added later is caught by the same check.
+# shellcheck disable=SC2016  # the $((pool_size - 1)) is the shipping source text being matched, not an expression to evaluate.
 _dec=$(grep -c 'pool_size=$((pool_size - 1))' "$CTRL")
 check "pool_size: every decrement is accounted for" "yes" \
   "$([ "$_dec" -ge 1 ] && echo yes || echo no)"
@@ -1346,6 +1347,7 @@ _clamp=$(awk '
 check "pool_size: the negative clamp precedes the publish" "1" "$_clamp"
 # And it is not silent. A clamp that fixes the number without saying so turns
 # the next accounting bug into a series that merely looks plausible.
+# shellcheck disable=SC2016  # the $pool_size is the shipping source text being matched, not a variable to expand.
 grep -A2 'if \[ "\$pool_size" -lt 0 \]' "$CTRL" | grep -q '^ *log "BUG' && r=yes || r=no
 check "pool_size: the clamp logs that it fired" yes "$r"
 
