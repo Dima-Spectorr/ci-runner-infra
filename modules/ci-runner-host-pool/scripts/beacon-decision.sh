@@ -41,7 +41,7 @@
 
 # beacon_decision <read_status> <key_present> <workers> <ts_epoch> <now_epoch> \
 #                 <publish_interval> <instance_age> <register_grace> \
-#                 <registrations> <misses> <required_misses>
+#                 <registrations> <misses> <required_misses> <policy_denied>
 #
 #   read_status     : exit status of the get-guest-attributes call. NON-ZERO IS
 #                     NOT "no workers" — it is "we did not get an answer". This
@@ -64,6 +64,13 @@
 #   misses          : consecutive ticks this host has been seen beacon-less.
 #   required_misses : how many such ticks are needed. The same
 #                     orphan_confirm_ticks the reaper uses.
+#   policy_denied   : 1 when read_status is non-zero BECAUSE the org policy
+#                     constraints/compute.disableGuestAttributesAccess refused
+#                     it. Not "the read failed" — "there is no beacon on this
+#                     project and there never will be". The caller establishes
+#                     this by matching the constraint id in gcloud's own stderr,
+#                     text no job can write, so it is not a lever a host can
+#                     pull on the controller.
 #
 # Echoes "delete:<reason>" or "keep:<reason>". Always exits 0 — the verdict is
 # the output, not the status, exactly like the other three rules.
@@ -79,13 +86,46 @@ beacon_decision() {
   local regs="${9:-0}"
   local misses="${10:-0}"
   local need="${11:-2}"
+  local policy_denied="${12:-0}"
 
   # 1. The mechanism itself failed: API error, timeout, permission, quota. Guest
   #    attributes are rate-limited to 10 queries per minute per instance, so a
   #    controller that read every host every tick would manufacture exactly this
   #    case at scale. Treating it as idleness would delete hosts because the
   #    fleet got busy, which is the worst possible correlation.
-  if [ "$read_status" != "0" ]; then
+  #
+  #    A POLICY REFUSAL IS NOT THAT FAILURE, AND READING IT AS ONE MADE 2c
+  #    UNREACHABLE
+  #
+  #    Every reason above is transient and load-correlated. The org policy that
+  #    turns guest attributes off is neither: it is a standing fact about the
+  #    project, it refuses every read equally, and it will still refuse the next
+  #    one. So the beacon does not exist, will never exist, and "we could not
+  #    read it this time" is the wrong sentence about it.
+  #
+  #    Read as an ordinary failure it shadows the whole of rule 2 -- including
+  #    2c, whose comment says in as many words what it is there to prevent: a
+  #    permanent, billing, invisible resident of a pool that reports the right
+  #    number of hosts. Measured in production 2026-09-05 on a Windows pool in a
+  #    project that enforces the constraint: ci_guest_attributes_denied
+  #    published on every tick for hours while a host that had denied its own
+  #    boot and registered nothing sat RUNNING and undeletable -- drain_decision
+  #    saying `drain:never-registered`, drain_host aborting on this rule every
+  #    time, and ci_host_idle_seconds_max climbing past 21000 on a pool whose
+  #    only host was dead. Six days old, and nothing in the fleet could take it.
+  #
+  #    Falling through does NOT weaken the gate. `present` is 0 whenever the
+  #    read failed, so this lands in rule 2 and nowhere else: a host still
+  #    booting keeps at 2a, a host GitHub knows has agents keeps at 2b, and only
+  #    2c -- no beacon possible, no agent in GitHub's list, past the grace, and
+  #    confirmed over ticks -- can delete. The affirmative `delete:idle` at 3d
+  #    stays out of reach, because it needs a beacon this project cannot have.
+  #
+  #    The same misreading vetoed every drain and every recycle in the fleet
+  #    through the pin-hold gate until 2026-08-24. This is the beacon half of
+  #    that fix, and it was left behind because a veto that KEEPS a host looks
+  #    safe from every angle except the one where the host is already dead.
+  if [ "$read_status" != "0" ] && [ "$policy_denied" != "1" ]; then
     echo "keep:read-failed status=$read_status"
     return 0
   fi

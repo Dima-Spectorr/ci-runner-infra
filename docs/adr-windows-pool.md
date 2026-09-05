@@ -369,6 +369,7 @@ returns `delete:` or `keep:`:
 | observed | verdict | why |
 |---|---|---|
 | read failed (API error, timeout, permission) | `keep:` | the mechanism broke; a broken mechanism tells us nothing about the host |
+| read **refused** by `constraints/compute.disableGuestAttributesAccess` | falls through to the rows below | not a broken mechanism — a standing fact about the project. The channel is off, so no host here can ever publish a beacon, and treating that as "we did not get an answer" makes the never-booted row unreachable on exactly the projects that need it. The controller establishes this from gcloud's own stderr, which no job can write |
 | read succeeded, key **present**, `ts` within 3× the publish interval, `workers = 0` | `delete:` | the only affirmative case |
 | read succeeded, key present, fresh, `workers > 0` | `keep:` | a job worker is alive |
 | read succeeded, key present, `ts` **stale** | `keep:` | the publisher died. The host may be perfectly busy; we no longer know |

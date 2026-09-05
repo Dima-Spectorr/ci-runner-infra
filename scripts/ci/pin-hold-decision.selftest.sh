@@ -343,19 +343,39 @@ esac
 # --- the wiring of the off switch ---------------------------------------------
 #
 # Both gates classify, because both read the same namespace through the same
-# API and the policy refuses both. They then diverge on PURPOSE, and that
-# divergence is the point of the change: a pin hold that cannot exist is no
-# reason to keep a host, but a beacon that cannot be read is still the loss of
-# the only evidence a Windows host is idle. So the pin-hold gate frees and the
-# beacon gate keeps -- and BOTH count, so the fleet can see it.
+# API and the policy refuses both. They then diverge on PURPOSE: a pin hold that
+# cannot exist is no reason to keep a host, and a beacon that cannot exist is no
+# reason to keep one either -- but the beacon gate reaches that answer through
+# the never-booted arm, which still demands the grace, an empty GitHub agent
+# list and N confirmations, where the pin-hold gate simply frees. BOTH count, so
+# the fleet can see it.
+#
+# The beacon half arrived a release later, on 2026-09-05, and the gap is the
+# lesson: a veto that KEEPS a host reads as safe from every angle except the one
+# where the host is already dead, so it was left in place while the pin-hold
+# half was fixed. It cost a pool of one broken host, undeletable, alerting twice
+# an hour.
 counted "both gates classify the refusal" 'guest_attributes_denied "\$\(cat "\$errf"\)"' 2
 counted "neither gate throws the error away any more" '\-\-format="csv\[no-heading\]\(key,value\)" 2>/dev/null' 0
 wired "the classification reaches the rule" \
   'pin_hold_decision "\$rc" "\$present" "\$hold_raw" "\$c_run" "\$c_exp" \\$'
 wired "the rule is given the flag" '"\$now" "\$PIN_HOLD_MAX" "\$disabled"'
-# The beacon gate must NOT have gained a free path. Its keep is still correct.
-counted "the beacon rule is unchanged" \
+counted "the beacon gate calls its rule once, and only once" \
   'beacon_decision "\$rc" "\$present" "\$workers" "\$ts" "\$now" \\$' 1
+wired "the beacon rule is given the flag too" \
+  '"\$ORPHAN_CONFIRM_TICKS" "\$denied"'
+# THE HALF THAT WOULD SHIP INERT. The flag lets the verdict reach rule 2c, and
+# 2c counts ticks -- but the miss counter only ever advanced on a read that
+# SUCCEEDED, so under a standing refusal it sits at 0 for the life of the fleet
+# and 2c answers `keep:unconfirmed` forever. Green everywhere, dead on every
+# machine. The counter has to recognise the refusal as well as the rule does.
+wired "the miss counter advances under a refusal as well as a success" \
+  'if \{ \[ "\$rc" = "0" \] \|\| \[ "\$denied" = "1" \]; \} && \[ "\$present" != "1" \]; then'
+# And the flag is set from the classifier, not from the status: a quota error is
+# also a non-zero rc, and reading THAT as "no beacon here, ever" is how a busy
+# fleet starts deleting the hosts that made it busy.
+wired "the beacon flag is set only by the classifier" '^ +denied=1$'
+counted "nothing sets it from a bare non-zero status" 'denied=\$rc' 0
 
 # A FILE, not a variable, and the assertion says so. Both gates are called as
 # `x=$(gate ...)` -- a subshell -- so a counter variable incremented inside
