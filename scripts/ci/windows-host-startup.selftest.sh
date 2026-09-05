@@ -2078,6 +2078,25 @@ has_bounded_native_calls() { # <file>
   # tree walks are the expensive half, and a seal that started its own clock would
   # hand the copies a budget that had already been spent.
   matches "$code" 'Protect-CacheMaster -SlotUsers \$slotUsers -StartedUtc \$startedUtc' || return 1
+
+  # A FAILED CALL SAYS WHY, AND FOR ROBOCOPY THAT MEANS READING STDOUT
+  #
+  # robocopy writes nothing to stderr: the ERROR lines that name the file and the
+  # Win32 code go to stdout with everything else. Two of this wrapper's four call
+  # sites are robocopy, and one of them denies the boot when it fails -- so a
+  # wrapper that reads stderr alone turns the loudest failure on the host into an
+  # exit code with no cause attached.
+  #
+  # Measured on ci-runner-host-win-iit-nn3l, 2026-09-05: the profile-template
+  # capture exited 9 and the boot log said only that, on a host that then sat
+  # RUNNING and registered nothing for eight hours.
+  matches "$code" 'Format-NativeErrorText -Text .*Get-Content -LiteralPath \$err' || return 1
+  matches "$code" 'Format-NativeErrorText -Text .*Get-Content -LiteralPath \$out' || return 1
+  # ORDER IS PART OF THE INVARIANT, not a detail of how it was written. icacls
+  # writes its per-file denials to stderr and prints on stdout too; reading stdout
+  # first would displace the better channel on the two icacls call sites. So this
+  # is a fallback for children with no stderr, and the guard is what makes it one.
+  matches "$code" 'if \(-not \$text\) \{$' || return 1
 }
 
 has_slot_cache_isolation() { # <file>
@@ -2278,6 +2297,12 @@ mutate "a spent budget read as unbounded rather than as already over" \
   has_bounded_native_calls
 mutate "seconds-left allowed to go negative, which reads as unbounded downstream" \
   's|if ($left -lt 0) { return 0 }|$null = $left|' \
+  has_bounded_native_calls
+mutate "a robocopy failure left with no cause, because only stderr is read and it writes none" \
+  's|^ *if (-not \$text) {$|            if ($false) {|' \
+  has_bounded_native_calls
+mutate "stdout read first, displacing the stderr icacls actually uses" \
+  's|Get-Content -LiteralPath \$err|Get-Content -LiteralPath $out|' \
   has_bounded_native_calls
 mutate "the seal given its own clock, so its two tree walks escape the budget" \
   's|-SlotUsers $slotUsers -StartedUtc $startedUtc|-SlotUsers $slotUsers|' \
