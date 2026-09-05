@@ -266,12 +266,18 @@ build {
   #    consuming repositories run (`scripts/ci/check-merge-queue-single-step.sh`)
   #    needs it and deliberately installs nothing, so naming it here is what
   #    stops a base-image change from turning a required check red fleet-wide.
+  #
+  #    postgresql-client is here for the same reason: a consuming repository's
+  #    test suite shells out to `psql` (its own migration-apply script) rather
+  #    than talking to Postgres over a driver, and that suite deliberately
+  #    FAILS rather than skips when the binary is absent — a GitHub-hosted
+  #    image carries it, this base Ubuntu image does not.
   provisioner "shell" {
     inline = [
       "set -eux",
       "export DEBIAN_FRONTEND=noninteractive",
       "apt-get update -qq",
-      "apt-get install -y -qq curl jq git openssl ca-certificates gnupg unzip rsync python3-pip python3-venv python3-yaml",
+      "apt-get install -y -qq curl jq git openssl ca-certificates gnupg unzip rsync python3-pip python3-venv python3-yaml postgresql-client",
       # PEP 668: Ubuntu 24.04 marks its system python EXTERNALLY-MANAGED, so
       # even with pip installed, `python3 -m pip install …` aborts with "This
       # environment is externally managed" — a DIFFERENT failure from the
@@ -519,7 +525,7 @@ build {
   provisioner "shell" {
     inline = [
       "set -eux",
-      "for b in node npm pwsh python3 git jq curl unzip rsync openssl docker; do sudo -u runner -i command -v $b >/dev/null || { echo \"MISSING from runner PATH: $b\"; exit 1; }; done",
+      "for b in node npm pwsh python3 git jq curl unzip rsync openssl docker psql; do sudo -u runner -i command -v $b >/dev/null || { echo \"MISSING from runner PATH: $b\"; exit 1; }; done",
       "sudo -u runner -i node --version",
       # pip is a MODULE, not a binary on PATH — `command -v pip3` can succeed on
       # a host where `python3 -m pip` (what workflows actually write) does not.
