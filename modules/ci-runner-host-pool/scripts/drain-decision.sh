@@ -28,7 +28,7 @@
 
 # drain_decision <instance_status> <busy_slots> <idle_seconds> <grace_seconds> \
 #                <pool_size> <min_hosts> <registration_state> \
-#                [age_seconds] [register_grace_seconds]
+#                [age_seconds] [register_grace_seconds] [roster_state]
 #
 #   instance_status     : GCE instanceStatus (RUNNING, TERMINATED, ...).
 #   busy_slots          : how many of this host's K runner agents are executing
@@ -54,6 +54,18 @@
 #                         healthy. Default 0 keeps old callers honest: with no
 #                         age they get the pre-boot-grace behaviour.
 #   register_grace_seconds : how long absent is allowed to mean "still booting".
+#   roster_state        : whether the GitHub runner listing the busy/registration
+#                         columns were read from was READ IN FULL --
+#                           complete = every registered agent in the repository
+#                                      was seen
+#                           partial  = the listing was truncated, capped, or
+#                                      otherwise short of the whole roster
+#                         Default "complete" keeps old callers on the previous
+#                         behaviour, the same convention age_seconds uses.
+#                         It exists because `absent` is not an observation, it
+#                         is the ABSENCE of one, and a truncated listing
+#                         manufactures it for a host that is running jobs. See
+#                         rule 2b.
 #
 # Echoes "drain:<reason>" or "keep:<reason>". Always exits 0 -- the verdict is
 # the output, not the status, so a `set -e` caller cannot be tripped by a keep.
@@ -67,6 +79,7 @@ drain_decision() {
   local reg="${7:-unknown}"
   local age="${8:-0}"
   local reg_grace="${9:-0}"
+  local roster="${10:-complete}"
 
   # 1. A host in a terminal power state can hold no job. Delete unconditionally.
   #    This is the path that reclaims a host that crashed or was stopped out of
@@ -83,6 +96,37 @@ drain_decision() {
   #    while sparing an idle one costs one host for one more cycle.
   if [ "$reg" = "unknown" ]; then
     echo "keep:registration-unknown"
+    return 0
+  fi
+
+  # 2b. A MISSING AGENT IS ONLY EVIDENCE IF THE WHOLE ROSTER WAS READ.
+  #
+  #    `absent` and `partial` are not readings, they are the failure to find a
+  #    reading. Both are computed by counting how many of this host's agents
+  #    appear in one GitHub runner listing — so a listing that stopped short
+  #    reports them for a host whose agents are up and executing jobs, and it
+  #    reports busy=0 for the same reason. Rules 3 and 5 then read a working
+  #    host as a dead one.
+  #
+  #    Worse than a wrong verdict, it is a wrong verdict the caller's mid-job
+  #    guard cannot catch: that guard is GitHub REFUSING to deregister a busy
+  #    agent, and a host with no visible agent ids has nothing to be refused.
+  #    Both halves of the protection fail on the same input, in the same
+  #    direction.
+  #
+  #    And it fails FLEET-WIDE. A truncated listing is not a property of one
+  #    host, so every host past the cut answers identically in the same tick.
+  #    Observed 2026-09-06: 176 slots read through a single unpaginated
+  #    100-record page, four waves in 25 minutes, nine pull requests, and one
+  #    wave that killed shard 1 of one PR, shard 5 of another and two unrelated
+  #    jobs in the SAME SECOND on different hosts. Simultaneity across
+  #    independent hosts is the signature of a fleet-uniform input, and this is
+  #    the fleet-uniform input.
+  #
+  #    `present` is exempt: all K of that host's agents were seen, so its busy
+  #    count is whole regardless of who else was cut off.
+  if [ "$roster" != "complete" ] && [ "$reg" != "present" ]; then
+    echo "keep:roster-incomplete reg=$reg roster=$roster"
     return 0
   fi
 

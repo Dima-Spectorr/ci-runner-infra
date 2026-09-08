@@ -847,10 +847,14 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <ssh-out>
   # runs the unreadable case against `command not found` rather than against the
   # classifier -- the answer comes out the same way for the wrong reason, and the
   # one branch this gate exists to hold would be unfalsifiable.
-  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+  # fetch_runner_roster is in here because drain_host's empty-id re-ask calls
+  # it. Stubbing it instead would test the stub: the whole point of the re-ask
+  # is that it must walk the roster to its END before absence counts as proof,
+  # and a stub that always says "complete" removes exactly that.
+  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$(fn host_age_seconds)" "$(fn instance_host_os)" \
     "$(fn guest_attributes_denied)" "$(fn note_guest_attributes_denied)" \
-    "$(fn beacon_gate)" "$(fn drain_host)")
+    "$(fn beacon_gate)" "$(fn fetch_runner_roster)" "$(fn drain_host)")
   [ -n "$mut" ] && code=$(printf '%s\n' "$code" | sed "$mut")
 
   zone=test-zone-a
@@ -882,6 +886,13 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <ssh-out>
       WORKER_GATE_OS_FALLBACK=0
       CONTROLLER_HOST_OS=${GATE_CTRL_OS:-linux}
       CURL_TIMEOUTS=(--connect-timeout 10 --max-time 30)
+      # The live-worker probe is bounded now, and the re-ask walks pages. Both
+      # names are read under \`set -u\`, so an unbound one would abort the
+      # subshell and every check below would read as a hold for the wrong
+      # reason.
+      WORKER_GATE_SSH_TIMEOUT=120
+      RUNNER_PAGE_MAX=20
+      RUNNER_LIST_STATUS=ok
       RUNNERS_JSON=\$(cat '$dir/runners.json')
       log() { :; }
       gh_token() { echo installation-token; }
@@ -891,7 +902,21 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <ssh-out>
       gcloud() {
         echo \"\$*\" >>'$dir/calls'
         case \"\$*\" in
-          *'compute ssh'*) printf '%s\n' '$sshout'; return 0 ;;
+          # SSHFAIL is how a case says the probe did not RUN — no output and a
+          # non-zero status, which is what an IAP tunnel failure, a missing
+          # firewall rule or the \`timeout\` expiring all look like. It is a
+          # distinct fixture from an empty answer on purpose: the old gate could
+          # not tell either of them from 'no workers', and the two are now
+          # separately falsifiable.
+          *'compute ssh'*)
+            [ '$sshout' = SSHFAIL ] && return 255
+            # EMPTY is a sentinel and not simply the empty string, because the
+            # positional default above is \`\${7:-0}\`: passing '' would silently
+            # become the answer '0' and the case would assert the opposite of
+            # what it reads. A ran-but-said-nothing probe is exit 0 with no
+            # output, which is what this prints.
+            [ '$sshout' = EMPTY ] && { printf '\n'; return 0; }
+            printf '%s\n' '$sshout'; return 0 ;;
           *get-guest-attributes*)
             # The stderr matters as much as the status. beacon_gate classifies
             # the refusal by grepping gcloud's own message for the constraint
@@ -944,12 +969,31 @@ check "gate/linux: pgrep says zero, the host is deleted" \
   "ssh=1 ga=0 del=1 rc=0 clear=1 held=0 und=0 fb=0" "$(gate_seq linux)"
 check "gate/linux: pgrep says two, the host is kept" \
   "ssh=1 ga=0 del=0 rc=1 clear=0 held=1 und=0 fb=0" "$(gate_seq linux '' 0 0 1 0 2)"
-# An unreachable host produces no output at all, and today that DELETES: the
-# `-n "$workers"` test is false, so the gate abstains. Asserted rather than
-# fixed — changing it is a separate decision about Linux behaviour, and this PR
-# is the one that must not make it by accident.
-check "gate/linux: an empty pgrep answer still deletes, as it does today" \
-  "ssh=1 ga=0 del=1 rc=0 clear=1 held=0 und=0 fb=0" "$(gate_seq linux '' 0 0 1 0 '')"
+# THE SEPARATE DECISION ABOUT LINUX BEHAVIOUR, NOW MADE (issue #17022).
+#
+# An unreachable host produces no output at all, and this used to DELETE: the
+# `-n "$workers"` test was false, so the gate abstained and fell through to
+# delete-instances. The previous revision of this file asserted that as
+# "still deletes, as it does today" and deferred the change. Deferring it cost
+# nine pull requests on 2026-09-06 and a frozen merge lane on 2026-09-08 —
+# this is the LAST gate before an instance delete, and the one input it could
+# not distinguish (no answer) is the one a busy or degraded fleet produces most.
+# It now answers the way the unknown-OS branch four lines above it already did:
+# an unknown host is kept, and the log line says which host and why.
+check "gate/linux: an empty pgrep answer is no answer, and keeps the host" \
+  "ssh=1 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" "$(gate_seq linux '' 0 0 1 0 EMPTY)"
+check "gate/linux: an ssh that fails outright keeps the host" \
+  "ssh=1 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" "$(gate_seq linux '' 0 0 1 0 SSHFAIL)"
+# Not every non-empty string is a count. A tunnel that prints a warning where a
+# number belongs must not be read as a busy host OR as an idle one.
+check "gate/linux: a non-numeric pgrep answer keeps the host" \
+  "ssh=1 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" \
+  "$(gate_seq linux '' 0 0 1 0 'ERROR: could not connect')"
+# The counters are load-bearing: `und` is the series an operator reads to tell
+# this hold apart from a real busy host (`held`), and a hold that incremented
+# `held` would hide a broken probe inside normal traffic.
+check "gate/linux: a real live worker is still held, not undetermined" \
+  "ssh=1 ga=0 del=0 rc=1 clear=0 held=1 und=0 fb=0" "$(gate_seq linux '' 0 0 1 0 7)"
 # The Linux path must never touch the guest-attribute API, and never pays for a
 # beacon read it would not understand.
 check "gate/linux: guest attributes are never read" \

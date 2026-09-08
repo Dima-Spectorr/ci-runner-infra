@@ -87,6 +87,14 @@ CURL_MAX_TIME=30   # keep in step with --max-time below; the demand budget
                    # reserves one of these before starting another call
 CURL_TIMEOUTS=(--connect-timeout 10 --max-time "$CURL_MAX_TIME")
 
+# The live-worker probe in drain_host is an IAP-tunnelled ssh, not a describe,
+# so it gets more than the `timeout 60` the metadata calls use: it negotiates a
+# tunnel and may have to generate a key on first use. It is still BOUNDED,
+# because this call is the last gate before an instance delete and an unbounded
+# gate that hangs is a gate that stalls the tick for every other pool. Expiring
+# is not a pass -- see the probe itself, which treats no answer as unknown.
+WORKER_GATE_SSH_TIMEOUT=120
+
 md() {
   curl "${CURL_TIMEOUTS[@]}" -fsS -H "Metadata-Flavor: Google" \
     "http://metadata.google.internal/computeMetadata/v1/$1" 2>/dev/null
@@ -470,6 +478,16 @@ REPO_FULL="$OWNER/$REPO"
 GH_TOKEN=""
 GH_TOKEN_EXPIRY=0
 RUNNER_LIST_STATUS="ok"
+# Whether the last runner listing was read to its END, or stopped short.
+# "complete" | "partial". Fed to drain_decision as roster_state, where it is the
+# difference between "this host has no agents" and "this listing never got as
+# far as this host's agents" -- see drain-decision.sh rule 2b.
+RUNNER_ROSTER="partial"
+# Pages of 100 the roster reader will walk before it gives up and calls the
+# answer partial. Bounded on purpose: an unbounded loop against a paginated API
+# is how a controller tick stops being a tick. 20 pages is 2000 agents, an order
+# of magnitude above the largest pool this fleet has ever run.
+RUNNER_PAGE_MAX=20
 # Consecutive ticks that could not read the runner list. Reset on the first
 # successful read, published every tick. In-memory on purpose: a controller
 # restart genuinely starts a new run of ticks, and a counter surviving on disk
@@ -1557,25 +1575,117 @@ collect_apply_build() {
 
 # --- hosts -------------------------------------------------------------------
 
-collect_runners() {
-  # One page of 100 covers max_hosts * slots for every pool in this fleet;
-  # paginate rather than silently truncate if that stops being true.
-  # The status is read back from disk because this call runs in a command
-  # substitution: an assignment gh_api made would happen in a subshell and be
-  # gone by the time this line runs. That is why 36 consecutive
-  # blind ticks were logged as `status=` — the one field that says WHY the pool
-  # stopped draining was the one field the subshell ate.
-  RUNNERS_JSON=$(gh_api "repos/$REPO_FULL/actions/runners?per_page=100") || {
-    RUNNERS_JSON=""
-    RUNNER_LIST_STATUS="$(cat "$STATE_DIR/api.status" 2>/dev/null)"
-    RUNNER_LIST_STATUS="${RUNNER_LIST_STATUS:-unknown}"
+# fetch_runner_roster <destination-file>
+#
+# Walks /actions/runners to its END and writes ONE merged {"runners":[...]}
+# document, so every existing `.runners[]?` reader works unchanged.
+#
+# THE STATE IS THE RETURN CODE, NOT A GLOBAL. This function's callers include
+# drain_host, which needs its own listing without disturbing the tick's --- and
+# a function that both echoes a document and sets a global cannot be used in a
+# command substitution, because the assignment happens in a subshell and is gone
+# by the time anyone reads it. That is the same trap the old status-on-disk
+# comment below was written to escape; a file plus an exit code has no subshell
+# to lose.
+#
+#   0  complete -- the last page came back short, so the roster ENDED
+#   2  partial  -- the page cap was reached with pages still to come. The
+#                  document is still written and still usable: a host that WAS
+#                  seen is seen correctly. What it may not do is prove absence.
+#   1  failed   -- nothing usable was written.
+#
+# The status is read back from disk because gh_api runs in a command
+# substitution: an assignment it made would happen in a subshell and be gone by
+# the time this line runs. That is why 36 consecutive blind ticks were logged as
+# `status=` — the one field that says WHY the pool stopped draining was the one
+# field the subshell ate.
+fetch_runner_roster() {
+  local dest="$1"
+  local page=1 body count acc=""
+
+  while [ "$page" -le "$RUNNER_PAGE_MAX" ]; do
+    body=$(gh_api "repos/$REPO_FULL/actions/runners?per_page=100&page=$page") || {
+      RUNNER_LIST_STATUS="$(cat "$STATE_DIR/api.status" 2>/dev/null)"
+      RUNNER_LIST_STATUS="${RUNNER_LIST_STATUS:-unknown}"
+      return 1
+    }
+    if [ -z "$body" ]; then
+      RUNNER_LIST_STATUS="empty-body"
+      return 1
+    fi
+
+    # An unreadable page is a FAILURE, never an empty page. `.runners | length`
+    # on a body that is not the document we asked for would otherwise answer
+    # "no agents here" and feed rule 5 the absence it must never be given.
+    count=$(printf '%s' "$body" | jq -r '.runners | length' 2>/dev/null)
+    case "$count" in
+      '' | *[!0-9]*)
+        RUNNER_LIST_STATUS="unparseable-page$page"
+        return 1
+        ;;
+    esac
+
+    acc="$acc$body"
+
+    if [ "$count" -lt 100 ]; then
+      printf '%s' "$acc" | jq -s '{runners: (map(.runners[]?))}' >"$dest.part" 2>/dev/null || {
+        rm -f "$dest.part"
+        RUNNER_LIST_STATUS="unmergeable"
+        return 1
+      }
+      mv -f "$dest.part" "$dest" || return 1
+      RUNNER_LIST_STATUS="ok"
+      return 0
+    fi
+
+    page=$((page + 1))
+  done
+
+  printf '%s' "$acc" | jq -s '{runners: (map(.runners[]?))}' >"$dest.part" 2>/dev/null || {
+    rm -f "$dest.part"
+    RUNNER_LIST_STATUS="unmergeable"
     return 1
   }
+  mv -f "$dest.part" "$dest" || return 1
+  RUNNER_LIST_STATUS="page-cap"
+  return 2
+}
+
+collect_runners() {
+  # ONE PAGE OF 100 WAS NOT ENOUGH, AND THE COST OF FINDING OUT WAS NINE PULL
+  # REQUESTS. This read used to be a single unpaginated `?per_page=100`, with a
+  # comment asserting that covered max_hosts * slots for every pool in this
+  # fleet. It stopped being true. On 2026-09-06 the repository carried 176 slots
+  # across 45 hosts with 108 offline registrations, and offline registrations
+  # occupy page 1 exactly like live ones -- so the agents that were CUT OFF were
+  # disproportionately the working ones. Every host past record 100 read
+  # present=0 -> reg=absent -> busy=0, drain_decision rule 5 returned
+  # drain:never-registered for all of them in the same tick, and the mid-job
+  # guard could not refuse a deregistration for agent ids it could not see.
+  #
+  # So: walk every page, and when the walk cannot be finished, SAY SO rather
+  # than handing a short list to a rule that reads shortness as death.
+  local dest="$STATE_DIR/runners.json" rc
+  fetch_runner_roster "$dest"
+  rc=$?
+  case "$rc" in
+    0) RUNNER_ROSTER="complete" ;;
+    2)
+      RUNNER_ROSTER="partial"
+      log "runner roster hit the ${RUNNER_PAGE_MAX}-page cap — the listing is TRUNCATED, so no host will be drained on an absent or partial registration this tick (fail-safe); raise RUNNER_PAGE_MAX if this pool really is that large"
+      ;;
+    *)
+      RUNNERS_JSON=""
+      RUNNER_ROSTER="partial"
+      return 1
+      ;;
+  esac
+  RUNNERS_JSON=$(cat "$dest" 2>/dev/null)
   if [ -z "$RUNNERS_JSON" ]; then
     RUNNER_LIST_STATUS="empty-body"
+    RUNNER_ROSTER="partial"
     return 1
   fi
-  RUNNER_LIST_STATUS="ok"
   return 0
 }
 
@@ -2979,10 +3089,23 @@ drain_host() {
   # list first: if the agents came up between the verdict and now, the host is
   # alive and may already be holding work.
   if [ -z "$ids" ]; then
-    local fresh
-    fresh=$(gh_api "repos/$REPO_FULL/actions/runners?per_page=100" 2>/dev/null)
-    ids=$(printf '%s' "$fresh" | jq -r --arg h "$host" \
-      '.runners[]? | select(.name | startswith($h + "-s")) | .id' 2>/dev/null)
+    # THE RE-ASK MUST BE A BETTER QUESTION THAN THE ONE THAT GOT US HERE. It
+    # used to repeat the same single unpaginated page that produced the empty
+    # id list, so on a fleet past 100 registrations it confirmed the wrong
+    # answer and the drain proceeded with NOTHING left to protect the host: no
+    # ids means no deregistration, and no deregistration means the 422 mid-job
+    # refusal below can never fire.
+    local fresh rc
+    fresh="$STATE_DIR/drain-reask.json"
+    fetch_runner_roster "$fresh"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      log "drain $host: could not read the runner roster in full (rc=$rc status=$RUNNER_LIST_STATUS) — absence is unproven, aborting"
+      DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
+      return 1
+    fi
+    ids=$(jq -r --arg h "$host" \
+      '.runners[]? | select(.name | startswith($h + "-s")) | .id' <"$fresh" 2>/dev/null)
     if [ -n "$ids" ]; then
       log "drain $host: agents registered between the poll and the drain — aborting"
       rm -f "$STATE_DIR/idle-$host"
@@ -3093,11 +3216,37 @@ drain_host() {
   fi
 
   if [ "$host_os" = "linux" ]; then
-    local workers
-    workers=$(gcloud compute ssh "$host" --zone="$zone" --project="$PROJECT" \
+    # THIS GATE USED TO FAIL OPEN, WHICH IS THE ONE THING IT MAY NOT DO.
+    #
+    # It is the LAST question asked before the delete, and it was asked in a
+    # form that cannot tell "no workers" from "no answer": an ssh that failed,
+    # timed out, lost its IAP tunnel or hit a permission error produced an empty
+    # string, `[ -n "$workers" ]` was false, and control fell straight through
+    # to delete-instances. A host nothing had been able to ask about was deleted
+    # on the strength of not having answered -- and unlike the unknown-OS branch
+    # directly above, which fails CLOSED and says why, this one was silent about
+    # it. It was also the only gcloud call in this file with no `timeout`, so
+    # the failure it could not distinguish was also the failure it invited.
+    #
+    # An answer is now a COUNT or it is not an answer. Empty, non-numeric or a
+    # non-zero exit all mean the same thing they mean one branch up: unknown,
+    # therefore kept. A wrong keep bills for one host until the next tick; a
+    # wrong delete costs up to slots_per_host merge-blocking jobs.
+    local raw workers
+    raw=$(timeout "$WORKER_GATE_SSH_TIMEOUT" gcloud compute ssh "$host" \
+      --zone="$zone" --project="$PROJECT" \
       --tunnel-through-iap --command 'pgrep -fc "Runner.Worker" || true' \
-      2>/dev/null | tr -d '[:space:]')
-    if [ -n "$workers" ] && [ "$workers" != "0" ]; then
+      2>/dev/null) || raw=""
+    workers=$(printf '%s' "$raw" | tr -d '[:space:]')
+    case "$workers" in
+      '' | *[!0-9]*)
+        log "drain $host: the live-worker probe returned no usable count (got '${workers:-<empty>}'; ssh/IAP failure or ${WORKER_GATE_SSH_TIMEOUT}s timeout) — cannot prove this host is idle, leaving host up"
+        WORKER_GATE_UNDETERMINED=$((WORKER_GATE_UNDETERMINED + 1))
+        DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
+        return 1
+        ;;
+    esac
+    if [ "$workers" != "0" ]; then
       log "drain $host: $workers job worker(s) still alive after deregistration — leaving host up"
       WORKER_GATE_HELD=$((WORKER_GATE_HELD + 1))
       DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
@@ -3537,7 +3686,7 @@ tick_pool() {
     esac
 
     verdict=$(drain_decision "$status" "$busy" "$idle" "$GRACE" "$pool_size" "$MIN_HOSTS" "$HOST_REG" \
-      "$age" "$REGISTER_GRACE")
+      "$age" "$REGISTER_GRACE" "$RUNNER_ROSTER")
 
     # THE PIN HOLD VETO, second half. Same gate, same cache, the other path.
     case "$verdict" in
