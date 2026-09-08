@@ -113,9 +113,49 @@ expect keep "partial but recently idle stays warm" \
 expect drain "partial + idle past grace = degraded capacity we are paying for" \
   RUNNING 0 1000 900 3 0 partial
 
+# --- a truncated roster may not be read as absence (issue #17022) ---------------
+# The 2026-09-06 kill wave: 176 slots read through a single unpaginated
+# 100-record page, so every host past the cut reported present=0 -> absent,
+# busy=0, and rule 5 drained hosts that were running jobs. The tenth argument is
+# how the caller says "I did not get to the end of the list", and NO amount of
+# apparent absence may authorise a delete while it says partial.
+expect keep "absent on a truncated roster is unproven, not dead" \
+  RUNNING 0 5 900 3 0 absent 900 600 partial
+expect keep "…even for a host the controller has known for hours" \
+  RUNNING 0 5 900 8 0 absent 86400 600 partial
+expect keep "partial registration on a truncated roster is also unproven" \
+  RUNNING 0 1000 900 3 0 partial 900 600 partial
+expect drain "…and the SAME host drains once the roster is read in full" \
+  RUNNING 0 5 900 3 0 absent 900 600 complete
+expect drain "…as does the partial-registration host" \
+  RUNNING 0 1000 900 3 0 partial 900 600 complete
+# A host whose K slots were ALL seen has a whole busy count regardless of who
+# else was cut off, so truncation must not pin an idle pool at full size for
+# ever — that would trade this defect for the immortal-VM one.
+expect drain "a fully-present idle host still drains on a truncated roster" \
+  RUNNING 0 1000 900 3 0 present 900 600 partial
+expect keep "…and a busy one still does not" \
+  RUNNING 2 0 900 3 0 present 900 600 partial
+# Rule 1 outranks it: a host in a terminal power state holds no job, whatever
+# the roster says, and it is the only path that reclaims one.
+expect drain "a TERMINATED host is still reclaimed on a truncated roster" \
+  TERMINATED 0 0 900 3 0 absent 900 600 partial
+# An unreadable roster stays rule 2's answer, not rule 2b's, so the existing
+# blind-tick alerting keeps naming the condition it was written for.
+expect keep "an unreadable roster is still registration-unknown" \
+  RUNNING 0 5 900 3 0 unknown 900 600 partial
+# Anything that is not the word "complete" is treated as incomplete: a caller
+# that grows a third roster state must opt IN to draining on absence.
+expect keep "an unrecognised roster state is treated as incomplete" \
+  RUNNING 0 5 900 3 0 absent 900 600 sometimes
+
 # --- defaults ------------------------------------------------------------------
 expect keep "no arguments at all must not authorise a deletion" \
   ""
+# The tenth argument defaults to complete so the nine-argument callers and every
+# case above it keep their meaning; the controller passes it explicitly.
+expect drain "an omitted roster state keeps the pre-#17022 behaviour" \
+  RUNNING 0 5 900 3 0 absent 900 600
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
