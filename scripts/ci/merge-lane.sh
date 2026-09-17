@@ -1903,6 +1903,9 @@ publish_status_issue() {
   # positive number is an operator typo, and it gets said out loud rather than
   # turning into a PATCH against a nonsense path.
   [ -n "$STATUS_ISSUE" ] || return 0
+  # A skipped run leaves the issue alone: rewriting it would replace the last
+  # real snapshot with an empty one, for two calls of a quota already short.
+  [ -z "$LANE_SKIP_REASON" ] || return 0
   if [[ ! "$STATUS_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
     echo "::warning::status-issue is '$STATUS_ISSUE', which is not an issue number — the queue was written to the job summary only"
     return 0
@@ -1974,11 +1977,7 @@ skip_reason_of_run="$LANE_SKIP_REASON"
 lane_quota_allows "run end" || true
 LANE_SKIP_REASON="$skip_reason_of_run"
 publish_step_summary
-if [ -z "$LANE_SKIP_REASON" ]; then
-  # Rewriting the queue issue with "skipped" would replace the last real
-  # snapshot with an empty one, and costs two calls of a quota already short.
-  publish_status_issue
-fi
+publish_status_issue
 
 echo "lane: done, $acted action(s), $(lane_calls) API call(s) spent by this run (a paginated read counts once)"
 
