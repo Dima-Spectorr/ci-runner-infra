@@ -296,6 +296,19 @@ on:
         required: false
         default: 600
         type: number
+      quota-floor:
+        description: >-
+          The remaining merge-App API quota below which a pass does not start.
+          Every repository's lane and branch reaper share ONE App installation
+          and therefore ONE hourly quota, and a pass started on an almost-empty
+          one does not merge anything: it goes blind part-way through its reads
+          and spends the calls another repository needed. Below the floor the
+          run logs a `SKIPPED, not idle` warning with the reset time, stays
+          green, and the next trigger or the cron backstop resumes it. `0`
+          disables the guard. See docs/merge-lane.md, "The App quota is shared".
+        required: false
+        default: 500
+        type: number
       require-up-to-date:
         description: >-
           Whether a pull request must be up to date with the base before the
@@ -549,6 +562,7 @@ jobs:
           REVIEW_GRACE: ${{ inputs.review-grace-seconds }}
           BUDGET: ${{ inputs.inflight-budget-seconds }}
           PASS_BUDGET: ${{ inputs.pass-budget-seconds }}
+          QUOTA_FLOOR: ${{ inputs.quota-floor }}
           MAX_ACTIONS: ${{ inputs.max-actions }}
           REQUIRE_UP_TO_DATE: ${{ inputs.require-up-to-date }}
           REQUIRE_LABEL: ${{ inputs.require-label }}

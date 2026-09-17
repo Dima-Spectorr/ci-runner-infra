@@ -514,6 +514,60 @@ self-test refuses a budget that does not leave the lane two minutes to publish
 its summary inside the ceiling — a run that merges and then reports nothing
 about it is worse than one that merges nothing.
 
+### The App quota is shared
+
+Every repository's lane and branch reaper authenticate as **one** merge App
+installation, and an installation has **one** hourly REST quota however many
+repositories it spans (GitHub starts an installation at 5,000 an hour and scales
+it with repository count to a ceiling of 12,500; every lane run now logs the
+installation's actual `limit`). `pr-guard` runs on the job's own
+`GITHUB_TOKEN` and does not draw on it.
+
+**Measured 2026-09-17.** From 12:57 UTC every lane in the fleet failed with
+`API rate limit exceeded for installation` at "cannot list the open pull
+requests", and green, clean pull requests on Telnet-Emulation sat unmerged. The
+App-token runs in the hour before: Telnet-Emulation 33, Manar 25, IntegrateIT 22,
+Specaria-Platform / Print-Server / Apigee-Portal 4 each, DataRetrival 3,
+SOAP-To-REST 2. The top consumer was one repository and one pattern:
+Telnet-Emulation had 35 open pull requests of which **33 were stale Dependabot
+drafts** (28 of them conflicting). A draft's verdict is `skip:draft` whatever its
+checks say, but it was decided *after* the per-candidate reads — a detail read,
+a head-commit read and both check surfaces, four calls apiece. The last good run
+before the outage logged 27 draft skips: about **115 calls for a pass that could
+not merge anything**, times ~33 `workflow_run` triggers an hour, is ~3,800 calls
+— most of the shared quota spent by one repository before any other lane asked.
+The base-health read was also made twice per pass on the same tip.
+
+What changed:
+
+- **A draft is decided from the list read**, before the label gate and before
+  any per-candidate call, so it costs nothing — the same rule #444 applied to the
+  label. The Telnet-Emulation pass above drops to roughly the base reads plus the
+  ready pull requests: ~25 calls instead of ~115.
+- **The base-health read is made once per pass**, not once to halt and again to
+  vouch for the same tip.
+- **Every pass logs what it cost.** Each candidate line carries `api-calls=N`,
+  and the run logs `quota at pass start` / `quota at run end` (remaining, limit,
+  used, reset) and `N API call(s) spent by this run`. A paginated read counts
+  once, so the figure is a floor. When the quota runs short again, compare these
+  lines across repositories instead of guessing.
+- **A pass does not start below `quota-floor`** (default 500). The run logs
+  `::warning::lane: SKIPPED, not idle — …` with the reset time, the job summary
+  says *Skipped, not idle*, the queue issue keeps its last real snapshot, and the
+  run stays green; the next trigger or cron tick resumes it. That is a skip, not
+  blindness: a read that fails for any other reason still fails the run.
+- **A rate-limited status read no longer asks for a permission.** The
+  commit-status warning used to say "grant the merge App `Commit statuses:
+  read`" on any failure; on 2026-09-17 that was a 403 from the exhausted quota,
+  on an App that already had the grant (the runs before 12:57 read the surface
+  without the warning). It now names the rate limit when that is the cause.
+
+If `SKIPPED, not idle` appears every hour, a repository is overspending. The
+usual causes, in order: a pile of stale drafts or conflicting pull requests that
+nobody closes (non-draft conflicts still pay their reads), a CI workflow whose
+completions fire the lane many times an hour, and a `require-label` pin waiver
+reading files for every unlabelled candidate.
+
 ### A label applied after the green
 
 **Only applies under a label gate**, which the fleet default no longer is — see
