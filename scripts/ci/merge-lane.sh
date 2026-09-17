@@ -58,6 +58,69 @@ trap 'rm -rf "$LANE_TMP"' EXIT
 STATUS_WARN_ONCE="$LANE_TMP/status-surface-warned"
 
 # ---------------------------------------------------------------------------
+# THE APP QUOTA IS SHARED, SO THE LANE COUNTS WHAT IT SPENDS AND STOPS SHORT.
+#
+# Every repository's lane, and its branch reaper, authenticate as ONE merge App
+# installation, and an installation has ONE hourly REST quota however many
+# repositories it spans. On 2026-09-17 it ran out at 12:57 UTC and every lane in
+# the fleet went blind on `API rate limit exceeded for installation` — green,
+# mergeable pull requests sat unmerged for the rest of the hour. Nothing in the
+# log said how much a pass cost, so nobody could say which repository spent it.
+#
+# The counter is a FILE, appended to, for the reason `STATUS_WARN_ONCE` is one:
+# almost every call happens inside a `$(...)` subshell, where a shell variable
+# increment dies. A paginated read counts once however many pages it walks, so
+# the number is a floor. `rate_limit` is not counted — GitHub does not charge
+# for it.
+LANE_CALLS="$LANE_TMP/api-calls"
+: >"$LANE_CALLS"
+gh() {
+  if [ "${1:-}" = api ] && [ "${2:-}" != rate_limit ]; then printf . >>"$LANE_CALLS"; fi
+  command gh "$@"
+}
+lane_calls() { wc -c <"$LANE_CALLS" | tr -d '[:space:]'; }
+
+# The remaining quota below which a pass does not start. A pass that begins on
+# an almost-empty quota does not merge anything — it fails part-way through its
+# reads, blind — and it spends the last calls another repository's lane needed
+# to merge its own ready pull request. Zero disables the guard.
+QUOTA_FLOOR="${QUOTA_FLOOR:-500}"
+if ! [[ "$QUOTA_FLOOR" =~ ^[0-9]+$ ]]; then
+  echo "lane: quota-floor is '$QUOTA_FLOOR', which is not a whole number" >&2
+  exit 1
+fi
+
+# Prints `limit remaining used reset`, or nothing when the read fails. An
+# unreadable quota does NOT hold the lane: the reads that follow fail loudly on
+# their own if the quota really is gone, and a guard that stopped on its own
+# failure would turn a flaky endpoint into a silent outage.
+lane_quota() {
+  local q
+  q="$(command gh api rate_limit --jq '.resources.core | "\(.limit) \(.remaining) \(.used) \(.reset)"' 2>/dev/null)" || return 0
+  [[ "$q" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]] && printf '%s' "$q"
+  return 0
+}
+
+LANE_SKIP_REASON=''
+# Returns 1, with the reason in `LANE_SKIP_REASON`, when the quota is below the
+# floor. <label> names the moment in the log.
+lane_quota_allows() {
+  local label="$1" q limit remaining used reset
+  q="$(lane_quota)"
+  if [ -z "$q" ]; then
+    echo "lane: quota at $label: unreadable (spent by this run so far: $(lane_calls))"
+    return 0
+  fi
+  read -r limit remaining used reset <<<"$q"
+  echo "lane: quota at $label: remaining=$remaining of limit=$limit used=$used resets=$(date -u -d "@$reset" +%H:%M:%SZ) (spent by this run so far: $(lane_calls))"
+  if [ "$QUOTA_FLOOR" -gt 0 ] && [ "$remaining" -lt "$QUOTA_FLOOR" ]; then
+    LANE_SKIP_REASON="the merge App's shared API quota is at $remaining of $limit, under the floor of $QUOTA_FLOOR, until $(date -u -d "@$reset" +%H:%M:%SZ)"
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # THE QUEUE, AS SOMETHING YOU CAN LOOK AT.
 #
 # Mergify had a dashboard. This lane keeps no queue — it recomputes the
@@ -294,14 +357,27 @@ check_counts() {
   # per open pull request on IntegrateIT and on Apigee-Portal, which is the
   # volume at which an operator learns to scroll past the one line that names
   # the permission they are missing.
+  #
+  # AND IT SAYS WHICH 403. An exhausted App quota is also a 403, and on
+  # 2026-09-17 every blind lane in the fleet told its operator to grant a
+  # permission the App already had. The error text is kept so the two cannot be
+  # confused: a rate limit is named as one, and only a genuine refusal asks for
+  # the grant.
+  local status_err
+  status_err="$(mktemp)"
   if ! statuses="$(gh api --paginate "repos/$R/commits/$sha/status?per_page=100" \
-    --jq '.statuses[] | {name: .context, state: (if .state == "pending" then "pending" else .state end), at: (.updated_at // "")}' 2>/dev/null)"; then
+    --jq '.statuses[] | {name: .context, state: (if .state == "pending" then "pending" else .state end), at: (.updated_at // "")}' 2>"$status_err")"; then
     statuses=""
     if [ ! -e "$STATUS_WARN_ONCE" ]; then
       : >"$STATUS_WARN_ONCE"
-      echo "lane: WARNING the commit-status surface is unreadable — grant the merge App 'Commit statuses: read'. Check-runs are still read; a required check that is a legacy commit status will count as MISSING and hold the lane." >&2
+      if grep -qi 'rate limit' "$status_err"; then
+        echo "lane: WARNING the commit-status surface is unreadable because the merge App's API quota is exhausted ($(tr '\n' ' ' <"$status_err" | cut -c1-200)) — this is not a missing permission. See docs/merge-lane.md, \"The App quota is shared\"." >&2
+      else
+        echo "lane: WARNING the commit-status surface is unreadable — grant the merge App 'Commit statuses: read'. Check-runs are still read; a required check that is a legacy commit status will count as MISSING and hold the lane." >&2
+      fi
     fi
   fi
+  rm -f "$status_err"
 
   # Newest wins per name. `--paginate` emits one document per page, so these are
   # streams of objects rather than one array; `-s` collects the stream. The
@@ -742,6 +818,7 @@ LANE_HALT_REASON=''
 # is the opposite instruction: somebody IS watching this base and has not
 # reported yet.
 LANE_BASE_VERDICT=''
+LANE_BASE_JUST_READ=''
 lane_base_is_broken() {
   local base_sha="$1" counts green missing failed pending
   # DYNAMIC SCOPE, DELIBERATELY, AND THIS IS THE WHOLE MECHANISM. `check_counts`
@@ -891,7 +968,13 @@ lane_base_is_vouched() {
   # Not armed: nothing answers for this base at all, so there is nothing to wait
   # for and #450's batch is the point. Most of the fleet, and it is unchanged.
   [ -n "$LANE_BASE_ARMED" ] || return 0
-  lane_base_is_broken "$sha" || true
+  # The top of a pass has read this exact tip a moment ago to decide the halt;
+  # reading it again is two calls of the shared App quota for the same answer.
+  # Consumed once, so the batch's post-merge call always reads its new tip.
+  if [ "$sha" != "$LANE_BASE_JUST_READ" ]; then
+    lane_base_is_broken "$sha" || true
+  fi
+  LANE_BASE_JUST_READ=''
   # Spelled as `if`, not `[ … ] && return`: that form is only survivable under
   # `set -e` because every caller happens to invoke this as an `if` condition,
   # and the next one that does not would turn a wait into a silent exit.
@@ -1003,6 +1086,7 @@ one_pass() {
   # because the run loop starts the next pass immediately and a lane run
   # triggered seconds after another one's merge would otherwise walk straight
   # past a tip whose health nobody has reported yet.
+  LANE_BASE_JUST_READ="$base_sha"
   if ! lane_base_is_vouched "$base_sha" "$base_at"; then
     LANE_HALT_REASON="the base-health check on the tip of $LANE_BASE ($base_sha) is '$LANE_BASE_VERDICT' — waiting for it to answer"
     echo "::notice::lane: $LANE_HALT_REASON. Something answers for this base and has not yet answered for this commit; merging now would stack onto a tip nothing has vouched for. The lane resumes on its own, and proceeds regardless after ${BASE_HEALTH_GRACE}s."
@@ -1100,6 +1184,26 @@ one_pass() {
       break
     fi
     read_count=$((read_count + 1))
+
+    # A DRAFT IS DECIDED BY THE LIST, SO IT COSTS NOTHING.
+    #
+    # `lane_verdict` answers `skip:draft` for a draft whatever its checks,
+    # mergeability or age say, so every per-pull-request read below was spent on
+    # an answer the list already carried. It was the lane's largest cost on the
+    # fleet's shared App quota: on Telnet-Emulation, 2026-09-17, 27 of 29 open
+    # pull requests were stale Dependabot drafts, each paying a detail read, a
+    # head-commit read and both check surfaces — about four calls apiece, on
+    # every one of ~33 runs an hour — and from 12:57 UTC every lane in the fleet
+    # was blind on `API rate limit exceeded for installation`. Above the label
+    # gate too, whose pin waiver pays a files read. See docs/merge-lane.md,
+    # "The App quota is shared".
+    if [ "$draft" = "true" ]; then
+      echo "lane: #$num skip:draft"
+      queue_row 9 "$num" "$list_title" skip:draft '' '' ''
+      continue
+    fi
+    local pr_calls_before
+    pr_calls_before="$(lane_calls)"
 
     # THE CHEAP GATE GOES FIRST, AND COSTS NOTHING.
     #
@@ -1346,7 +1450,7 @@ one_pass() {
       esac
     fi
 
-    echo "lane: #$num $verdict (sha=${sha:0:8} priority=$priority behind=$behind_cell)"
+    echo "lane: #$num $verdict (sha=${sha:0:8} priority=$priority behind=$behind_cell api-calls=$(($(lane_calls) - pr_calls_before)))"
 
     # Ranked exactly as the lane ranks it when it is actionable, and parked
     # behind everything actionable when it is not — so the top row is always the
@@ -1395,7 +1499,7 @@ one_pass() {
     echo "::warning::lane: pass truncated after ${PASS_BUDGET}s — read $read_count of $total open pull request(s) on $LANE_BASE. The rest are UNREAD this pass, not idle. The next pass starts from the top of the list again, so raise 'pass-budget-seconds' (keeping it under the job's timeout-minutes), narrow the candidate set with a label, or close what is stale."
     local j jdx
     for ((j = truncated_at; j < total; j++)); do
-      jdx=$((j * 5))
+      jdx=$((j * 6))
       queue_row 8 "${pr_fields[jdx]}" "${pr_fields[jdx + 4]}" wait:not-read-this-pass '' '' ''
     done
   fi
@@ -1728,6 +1832,10 @@ render_queue() {
   # Before the table, because it explains why the table is not moving. A halted
   # pass renders no rows at all — it returns before the walk — so without this
   # the snapshot would read exactly like a quiet base with nothing open.
+  if [ -n "$LANE_SKIP_REASON" ]; then
+    printf '> **Skipped, not idle.** %s. Nothing was read, so the table below says nothing about any pull request. The lane resumes by itself once the quota resets.\n\n' "$LANE_SKIP_REASON"
+  fi
+
   if [ -n "$LANE_HALT_REASON" ]; then
     printf '> **Halted.** %s\n>\n' "$LANE_HALT_REASON"
     printf '> Nothing merges while the base is red: the next merge would bury the commit that broke it. The lane resumes by itself once those checks pass.\n\n'
@@ -1737,7 +1845,7 @@ render_queue() {
     # "Nothing open" and "the lane stopped before it looked" are different
     # facts, and rendering them identically is the same defect the sort key's
     # `8` tier exists to prevent.
-    if [ -n "$LANE_HALT_REASON" ]; then
+    if [ -n "$LANE_HALT_REASON" ] || [ -n "$LANE_SKIP_REASON" ]; then
       printf '_The open list was not read on this pass._\n\n'
     else
       printf '_No open pull requests on `%s`._\n\n' "$LANE_BASE"
@@ -1795,6 +1903,9 @@ publish_status_issue() {
   # positive number is an operator typo, and it gets said out loud rather than
   # turning into a PATCH against a nonsense path.
   [ -n "$STATUS_ISSUE" ] || return 0
+  # A skipped run leaves the issue alone: rewriting it would replace the last
+  # real snapshot with an empty one, for two calls of a quota already short.
+  [ -z "$LANE_SKIP_REASON" ] || return 0
   if [[ ! "$STATUS_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
     echo "::warning::status-issue is '$STATUS_ISSUE', which is not an issue number — the queue was written to the job summary only"
     return 0
@@ -1807,7 +1918,12 @@ publish_status_issue() {
   # merges code; the one thing it must not do is destroy the text explaining
   # what is being merged. One GET, once per run, to make that impossible.
   local kind
-  kind="$(gh api "repos/$R/issues/$STATUS_ISSUE" --jq 'if .pull_request then "pull-request" else "issue" end' 2>/dev/null || echo 'unreadable')"
+  # `gh api` writes the error BODY to stdout on a non-2xx, so a fallback after
+  # `||` is appended to that body instead of replacing it — which is how a
+  # rate-limited run reported the issue as reading as '{'.
+  if ! kind="$(gh api "repos/$R/issues/$STATUS_ISSUE" --jq 'if .pull_request then "pull-request" else "issue" end' 2>/dev/null)"; then
+    kind='unreadable'
+  fi
   if [ "$kind" != "issue" ]; then
     echo "::warning::not publishing the queue to #$STATUS_ISSUE — it reads as '$kind', and this lane only ever rewrites the body of a plain issue. The queue is in the job summary."
     return 0
@@ -1837,6 +1953,12 @@ while [ "$acted" -lt "$MAX_ACTIONS" ]; do
     echo "::warning::lane: stopping after $acted action(s) — the ${PASS_BUDGET}s pass budget is spent. Whatever is still actionable is picked up by the next trigger or by the cron backstop; nothing is lost."
     break
   fi
+  # Asked before EVERY pass, not once: a run that merges re-reads the world, and
+  # a quota that was fine for the first pass can be gone by the third.
+  if ! lane_quota_allows "pass start"; then
+    echo "::warning::lane: SKIPPED, not idle — $LANE_SKIP_REASON. Nothing was read this pass, so there is no verdict for any pull request; the lane resumes on the next trigger or the cron backstop once the quota resets. If this repeats every hour, a repository is overspending — compare the 'api-calls' figures in each lane's log (docs/merge-lane.md, \"The App quota is shared\")."
+    break
+  fi
   if one_pass; then
     acted=$((acted + PASS_ACTED))
     # The world changed: a merge just moved the base, so everything else is now
@@ -1851,10 +1973,13 @@ done
 # After the loop, so the snapshot describes the world the lane is LEAVING
 # rather than the one it found — a pull request it just merged is gone from it,
 # and the one that was behind that merge no longer is.
+skip_reason_of_run="$LANE_SKIP_REASON"
+lane_quota_allows "run end" || true
+LANE_SKIP_REASON="$skip_reason_of_run"
 publish_step_summary
 publish_status_issue
 
-echo "lane: done, $acted action(s)"
+echo "lane: done, $acted action(s), $(lane_calls) API call(s) spent by this run (a paginated read counts once)"
 
 # After the summary and the queue issue, so an operator looking at a red lane
 # still gets whatever the run managed to see.

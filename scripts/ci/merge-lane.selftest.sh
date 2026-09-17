@@ -1133,6 +1133,66 @@ tells_an_unanswered_tip_from_an_unwatched_one() {
   matches "$code" "^    LANE_BASE_VERDICT='inert'\$"
 }
 
+# ---------------------------------------------------------------------------
+# The shared App quota. 2026-09-17: every lane in the fleet went blind on
+# `API rate limit exceeded for installation`, and the largest spender was one
+# repository paying four reads apiece for 27 drafts it could never merge.
+# ---------------------------------------------------------------------------
+
+# A draft is `skip:draft` whatever else is true, so it is decided from the list
+# read, above the label gate (whose pin waiver pays a files read) and above the
+# detail read.
+skips_a_draft_before_it_spends_anything() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^    if \[ "\$draft" = "true" \]; then$' || return 1
+  matches "$code" 'queue_row 9 "\$num" "\$list_title" skip:draft' || return 1
+  before "$code" '^    if \[ "\$draft" = "true" \]; then$' '",\$list_labels," != ' || return 1
+  before "$code" '^    if \[ "\$draft" = "true" \]; then$' 'mapfile -t detail_lines'
+}
+
+# Every `gh api` goes through a counter that survives a subshell, and the run
+# says what it spent — without that, an exhausted quota cannot be attributed.
+counts_what_it_spends() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^LANE_CALLS="\$LANE_TMP/' || return 1
+  matches "$code" '^gh\(\) \{$' || return 1
+  matches "$code" 'printf \. >>"\$LANE_CALLS"' || return 1
+  matches "$code" 'command gh "\$@"' || return 1
+  matches "$code" 'api-calls=' || return 1
+  matches "$code" 'API call\(s\) spent by this run'
+}
+
+# Below the floor the pass does not start, and says so as a warning naming the
+# quota — never a quiet "nothing actionable". And the guard must not turn its
+# own failure to read the quota into a skip.
+stops_short_of_an_exhausted_quota() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^QUOTA_FLOOR="\$\{QUOTA_FLOOR:-500\}"' || return 1
+  matches "$code" '^  if ! lane_quota_allows "pass start"; then$' || return 1
+  matches "$code" '::warning::lane: SKIPPED, not idle' || return 1
+  matches "$code" '\[ "\$remaining" -lt "\$QUOTA_FLOOR" \]' || return 1
+  before "$code" '^  if ! lane_quota_allows "pass start"; then$' '^  if one_pass; then$' || return 1
+  matches "$code" 'unreadable \(spent by this run so far'
+}
+
+passes_the_quota_floor_to_the_driver() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      quota-floor:' || return 1
+  matches "$code" 'QUOTA_FLOOR: \$\{\{ inputs.quota-floor \}\}'
+}
+
+# A 403 from the exhausted quota is not a missing permission.
+tells_a_rate_limit_from_a_missing_grant() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" "grep -qi 'rate limit' \"\\\$status_err\"" || return 1
+  matches "$code" 'this is not a missing permission'
+}
+
 echo "merge-lane self-test:"
 check waits_for_the_tip_between_merges "$DRIVER" "a batch keeps merging after the first merge without re-reading the base, so two pull requests that are green alone and broken together bury the rest of the backlog on top of the break"
 check waits_for_the_tip_at_the_top_of_a_pass "$DRIVER" "only the batch waits for the tip to answer, so the run loop's next pass merges onto it anyway and the rule is undone by the loop around it"
@@ -1431,6 +1491,27 @@ mutate "the pin waiver stops reaching the driver" "$CALLEE" \
 mutate "the authoritative gate sinks back below the loop that sleeps" "$DRIVER" \
   's@",\$labels," != @",$detail_labels," != @' \
   skips_before_it_sleeps
+
+check skips_a_draft_before_it_spends_anything "$DRIVER" "a draft pays a detail read, a head-commit read and both check surfaces for a verdict the list already carried, and a repository full of stale drafts spends the fleet's shared App quota"
+check counts_what_it_spends "$DRIVER" "the lane does not count its API calls, so an exhausted shared quota cannot be attributed to the repository that spent it"
+check stops_short_of_an_exhausted_quota "$DRIVER" "a pass starts on an almost-empty shared quota, goes blind part-way, and spends the calls another repository needed to merge"
+check passes_the_quota_floor_to_the_driver "$CALLEE" "quota-floor is declared but never reaches the driver"
+check tells_a_rate_limit_from_a_missing_grant "$DRIVER" "a rate-limited status read tells the operator to grant a permission the App already has"
+mutate "a draft goes back to being judged after the per-candidate reads" "$DRIVER" \
+  's@^    if \[ "\$draft" = "true" \]; then$@    if false; then@' \
+  skips_a_draft_before_it_spends_anything
+mutate "the call counter is bypassed" "$DRIVER" \
+  's@printf \. >>"\$LANE_CALLS"@:@' \
+  counts_what_it_spends
+mutate "the quota guard is dropped from the run loop" "$DRIVER" \
+  's@^  if ! lane_quota_allows "pass start"; then$@  if false; then@' \
+  stops_short_of_an_exhausted_quota
+mutate "the quota floor stops reaching the driver" "$CALLEE" \
+  's@^          QUOTA_FLOOR: .*@          X_UNUSED_QUOTA: 0@' \
+  passes_the_quota_floor_to_the_driver
+mutate "the rate-limit 403 is reported as a missing grant again" "$DRIVER" \
+  "s@grep -qi 'rate limit' \"\\\$status_err\"@false@" \
+  tells_a_rate_limit_from_a_missing_grant
 
 mutate "the pass loses its deadline and waits for the job's ceiling instead" "$DRIVER" \
   's@^    if lane_pass_expired @    if false \&\& lane_deadline_gone @' \
