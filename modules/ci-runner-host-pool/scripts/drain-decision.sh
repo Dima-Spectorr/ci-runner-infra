@@ -26,6 +26,30 @@
 #
 # Tenancy-agnostic — no customer literals, no project/repo knowledge.
 
+# mig_action_in_flight <current_action>
+#
+#   current_action : the MIG's `currentAction` for the host (NONE, CREATING,
+#                    DELETING, ABANDONING, RECREATING, ...).
+#
+# Succeeds when the MIG is already REMOVING the host. drain_host() deletes
+# through the MIG and returns as soon as the MIG accepts the request, so for the
+# next tick or two the host still lists -- STOPPING, not gone -- and rule 1 of
+# drain_decision reads STOPPING as a crashed host to reap. The second
+# delete-instances then fails and the controller reports a drain error it caused
+# itself. `currentAction` is what separates the two: a host stopped out of band
+# reports NONE, a host being deleted reports DELETING. Observed 2026-09-18 on
+# three consecutive scale-ins, 48s after each successful drain.
+#
+# Only DELETING and ABANDONING: every other action, empty included, leaves the
+# host to the verdicts, so a missing column degrades to the old behaviour rather
+# than to a host that is never reaped.
+mig_action_in_flight() {
+  case "${1:-}" in
+    DELETING | ABANDONING) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # drain_decision <instance_status> <busy_slots> <idle_seconds> <grace_seconds> \
 #                <pool_size> <min_hosts> <registration_state> \
 #                [age_seconds] [register_grace_seconds] [roster_state]

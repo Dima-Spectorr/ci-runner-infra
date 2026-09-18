@@ -190,7 +190,7 @@ check "host row: the tab-separated shape really did shift" \
   "$(row "$(printf 'h1\t\ttpl-a\thttps://x/zones/z/instances/h1')" "$(printf '\t')")"
 
 # shellcheck disable=SC2016
-grep -q 'format="csv\[no-heading\](name,instanceStatus,version.instanceTemplate.basename(),instance.uri())"' "$CTRL" \
+grep -q 'format="csv\[no-heading\](name,instanceStatus,version.instanceTemplate.basename(),instance.uri(),currentAction)"' "$CTRL" \
   && r=yes || r=no
 check "host row: collect_hosts asks gcloud for CSV, and for the URI as a URI" yes "$r"
 
@@ -234,8 +234,11 @@ check "zone_of_uri: a bare host name yields nothing" "" "$(zone_of_uri 'ci-runne
 check "zone_of_uri: an empty string yields nothing" "" "$(zone_of_uri '')"
 check "zone_of_uri: a zone URI with no instance yields nothing" "" \
   "$(zone_of_uri 'https://www.googleapis.com/compute/v1/projects/p/zones/test-zone-a')"
-r=$(grep -c 'while IFS=, read -r host status host_tpl host_uri' "$CTRL")
+r=$(grep -c 'while IFS=, read -r host status host_tpl host_uri host_action; do' "$CTRL")
 check "host row: both host walks split on the comma" 2 "$r"
+# Five names, not four: with four, `read` glues the fifth column onto the
+# self-link ("https://.../instances/h,DELETING") and every zone derived from it
+# is wrong, while currentAction silently reads empty.
 # Three since classify_pinned() landed: the drain walk, the orphan reaper, and
 # the pinned-job classifier all derive the live-host list from $HOSTS the same
 # way. This number is the count of readers, so a new one added with the wrong

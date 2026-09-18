@@ -157,5 +157,30 @@ expect keep "no arguments at all must not authorise a deletion" \
 expect drain "an omitted roster state keeps the pre-#17022 behaviour" \
   RUNNING 0 5 900 3 0 absent 900 600
 
+# --- a delete already in flight ----------------------------------------------
+# The regression: drain_host's own delete leaves the host listed as STOPPING,
+# rule 1 reads that as a crashed host, and the second delete-instances fails.
+# The controller asks mig_action_in_flight BEFORE any verdict, so that host is
+# skipped; a STOPPING host with no MIG action is still reaped.
+action() { # <want: yes|no> <description> <current_action>
+  local got=no
+  mig_action_in_flight "$3" && got=yes
+  if [ "$got" = "$1" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  action: %s\n  want: %s\n  got:  %s\n' "$2" "$3" "$1" "$got"
+  fi
+}
+action yes "the MIG deleting the host (our own drain) is a delete in flight" DELETING
+action yes "the MIG abandoning the host is a delete in flight" ABANDONING
+action no "no MIG action: an out-of-band stop is still ours to reap" NONE
+action no "a missing column must not exempt a host from reaping" ""
+action no "a host being created is not being removed" CREATING
+action no "a host being recreated is not being removed" RECREATING
+action no "gcloud prints the enum upper-case; nothing else matches" deleting
+expect drain "STOPPING with no delete in flight is still a terminal host" \
+  STOPPING 0 0 900 1 0 absent
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
