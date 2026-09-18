@@ -760,23 +760,24 @@ check "regtoken: and it carries only the issued marker, never the token" yes "$r
 grep -q -- '--keys="$REG_TOKEN_KEY"' "$CTRL" && r=yes || r=no
 check "regtoken: the delete never takes the issued marker with it" yes "$r"
 
-# ── the SECOND delete gate, under both values of ci-host-os ──────────────────
+# ── the drain's idle proof, and the order it runs in (#930) ─────────────────
 #
-# drain_host()'s first gate is GitHub's refusal to deregister a runner that is
-# executing a job, and it is OS-independent. The second gate asks the host
-# whether a `Runner.Worker` process is still alive, and THAT question has two
-# implementations: `gcloud compute ssh … pgrep` on Linux, and the host-published
-# beacon read back through the compute API on Windows.
+# drain_host() proves a host idle and only THEN deregisters its agents. The
+# proof is GitHub's own `busy` flag read from a fresh, complete roster, plus the
+# host's beacon on Windows; GitHub's 422 on a DELETE is the guard for a job
+# assigned after the read. Nothing logs in to the host.
 #
-# This is the one change in the Windows sequence that can break a Linux pool,
-# and the ADR names the precedent by version: v5.1.4 shipped because the diff
-# was read instead of the function being run. So the function is RUN, under both
-# values, against a fake compute API, and judged on the calls it made and the
-# verdict it reached — never on the text of the branch.
+# The property #930 is about is `dereg=0` on every keep: a drain that stops for
+# ANY reason -- a busy agent, a roster it cannot read, a beacon that says keep,
+# an OS it cannot establish -- must stop with every agent still registered.
+# The order used to be the reverse, the proof was an IAP-SSH probe the
+# controller could not log in to make, and every idle host in a pool was
+# stripped of its agents and then kept: GitHub `total_count: 0`, MIG healthy,
+# twice in six hours on 2026-09-17.
 #
-# The Linux assertion is deliberately the strongest one available: the recorded
-# argv of the ssh invocation, byte for byte, plus the verdict for each of the
-# three answers pgrep can give (a count, zero, and nothing at all).
+# So the function is RUN, against a fake GitHub and a fake compute API, and
+# judged on the calls it made -- `dereg` is the number of DELETEs sent to
+# GitHub, `del` the number of instance deletes -- never on the text of a branch.
 BEACON="$ROOT/modules/ci-runner-host-pool/scripts/beacon-decision.sh"
 [ -r "$BEACON" ] || { echo "FAIL: missing $BEACON — every gate check below is vacuous"; exit 1; }
 # Read once, into a variable, rather than `cat`-ed inside the runner: the runner
@@ -787,39 +788,53 @@ BEACON_SRC=$(cat "$BEACON")
 grep -q '^beacon_decision() {' "$BEACON" || {
   echo "FAIL: beacon_decision() not found in $BEACON — the windows cases would all read keep"; exit 1; }
 
+roster_json() { # <agents> <busy|NULL> -> a GitHub runner listing for host h1
+  local n="$1" b="$2" i out="" sep="" flag
+  for ((i = 1; i <= n; i++)); do
+    if [ "$b" = NULL ]; then flag=''
+    elif [ "$i" -le "$b" ]; then flag=',"busy":true'
+    else flag=',"busy":false'; fi
+    out="$out$sep{\"id\":$((10 + i)),\"name\":\"h1-s$i\"$flag}"
+    sep=,
+  done
+  printf '{"runners":[%s]}' "$out"
+}
+
 # shellcheck disable=SC2016
-gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <ssh-out>
+gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
   #            <age> [mutation-sed] [emit]
   # <os> is what the INSTANCE's own metadata says: linux | windows | none (a
   # host from a template predating `ci-host-os`) | anything else (a value this
   # controller does not know) | nozone (the MIG reported no self-link, so there
   # is no instance to address at all).
   # <ga-csv> is what `get-guest-attributes --format=csv(key,value)` returns.
-  # <runners> is how many agents GitHub lists for the host BEFORE the drain.
+  # <runners> is how many agents GitHub lists for the host.
+  # <busy> is how many of them the FRESH roster reports busy; NULL is a roster
+  # with no busy field at all, and ROSTERFAIL is a roster that cannot be read.
   # <age> is how long this controller has known the host, in seconds.
-  # [emit]=argv prints the recorded ssh command line instead of the summary.
-  # GATE_CTRL_OS (env, default linux) is what the CONTROLLER's own metadata
-  # says. Passed as an environment override rather than a 12th positional so the
-  # two cases that care about it do not have to restate every other argument.
-  # GATE_GA_ERR (env, default empty) is what the failing guest-attribute read
-  # writes to STDERR. Empty is an unexplained failure; the org-policy text is
-  # the standing refusal, and the gate answers them differently.
-  # -> ssh=<n> ga=<n> del=<n> rc=<n> clear=<n> held=<n> und=<n> fb=<n>
+  # [emit]=events prints the structured events instead of the summary.
+  # Env: GATE_CTRL_OS (the controller's own ci-host-os, default linux);
+  # GATE_GA_ERR (stderr of a failing guest-attribute read); GATE_FRESH_RUNNERS
+  # (agents in the fresh roster, default <runners>); GATE_DEL_CODE (GitHub's
+  # answer to a DELETE, default 204); GATE_MIG_RC (delete-instances status).
+  # -> ssh=<n> ga=<n> dereg=<n> del=<n> rc=<n> clear=<n> held=<n> und=<n> fb=<n> err=<n>
   local os="${1:-linux}" ga="${2:-}" garc="${3:-0}" derc="${4:-0}"
-  local runners="${5:-1}" misses="${6:-0}" sshout="${7:-0}" age="${8:-0}"
+  local runners="${5:-1}" misses="${6:-0}" busy="${7:-0}" age="${8:-0}"
   local mut="${9:-}" emit="${10:-}"
-  local dir out code zone summary
+  local dir out code zone summary rfail=0
   dir=$(mktemp -d)
   : >"$dir/calls"
+  : >"$dir/curls"
+  : >"$dir/events"
   : >"$dir/log"
   printf '%s' "$ga" >"$dir/ga.csv"
 
-  case "$runners" in
-    0) printf '{"runners":[]}' >"$dir/runners.json" ;;
-    1) printf '{"runners":[{"id":11,"name":"h1-s1","busy":false}]}' >"$dir/runners.json" ;;
-    *) printf '%s' '{"runners":[{"id":11,"name":"h1-s1","busy":false},{"id":12,"name":"h1-s2","busy":false}]}' \
-      >"$dir/runners.json" ;;
-  esac
+  roster_json "$runners" 0 >"$dir/runners.json"
+  if [ "$busy" = ROSTERFAIL ]; then
+    rfail=1
+    busy=0
+  fi
+  roster_json "${GATE_FRESH_RUNNERS:-$runners}" "$busy" >"$dir/fresh.json"
 
   # A REAL instance's metadata: the boot script is in there too, it is tens of
   # kilobytes, and it contains both commas and newlines. That is not decoration
@@ -839,22 +854,14 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <ssh-out>
   printf '%s' "$(($(date +%s) - age))" >"$dir/seen-h1"
   [ "$misses" = "0" ] || printf '%s' "$misses" >"$dir/beaconmiss-h1"
 
-  # All four functions the gate is made of, mutated as ONE body: the branch
-  # lives in drain_host, the I/O in beacon_gate, and a mutation that could only
-  # reach one of them would leave half the gate unfalsifiable.
-  # guest_attributes_denied is extracted too, and it is not optional decoration:
-  # beacon_gate calls it on every failed read, and a harness that leaves it out
-  # runs the unreadable case against `command not found` rather than against the
-  # classifier -- the answer comes out the same way for the wrong reason, and the
-  # one branch this gate exists to hold would be unfalsifiable.
-  # fetch_runner_roster is in here because drain_host's empty-id re-ask calls
-  # it. Stubbing it instead would test the stub: the whole point of the re-ask
-  # is that it must walk the roster to its END before absence counts as proof,
-  # and a stub that always says "complete" removes exactly that.
-  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+  # Every function the gate is made of, mutated as ONE body. fetch_runner_roster
+  # is the real one: the proof is only as good as its insistence on reading the
+  # roster to its END, and a stub that always says "complete" removes exactly
+  # that. guest_attributes_denied is real for the same reason on the beacon side.
+  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$(fn host_age_seconds)" "$(fn instance_host_os)" \
     "$(fn guest_attributes_denied)" "$(fn note_guest_attributes_denied)" \
-    "$(fn beacon_gate)" "$(fn fetch_runner_roster)" "$(fn drain_host)")
+    "$(fn beacon_gate)" "$(fn fetch_runner_roster)" "$(fn drain_fail)" "$(fn drain_host)")
   [ -n "$mut" ] && code=$(printf '%s\n' "$code" | sed "$mut")
 
   zone=test-zone-a
@@ -871,379 +878,254 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <ssh-out>
       REGION=test-region
       BEACON_NS=ci
       # note_guest_attributes_denied reads this, and under \`set -u\` an unbound
-      # name would abort the whole subshell rather than fail one check. Empty is
-      # the real controller's own 'nowhere to record it' value, so the counter
-      # returns early and the gate is judged on its verdict, not on its bookkeeping.
+      # name would abort the whole subshell rather than fail one check.
       GA_DENIED_FILE=''
       BEACON_INTERVAL=30
       REGISTER_GRACE=600
       ORPHAN_CONFIRM_TICKS=3
       DRAINED=0
       DRAIN_ABORTED=0
+      DRAIN_ERRORS=0
       WORKER_GATE_CLEAR=0
       WORKER_GATE_HELD=0
       WORKER_GATE_UNDETERMINED=0
       WORKER_GATE_OS_FALLBACK=0
       CONTROLLER_HOST_OS=${GATE_CTRL_OS:-linux}
       CURL_TIMEOUTS=(--connect-timeout 10 --max-time 30)
-      # The live-worker probe is bounded now, and the re-ask walks pages. Both
-      # names are read under \`set -u\`, so an unbound one would abort the
-      # subshell and every check below would read as a hold for the wrong
-      # reason.
-      WORKER_GATE_SSH_TIMEOUT=120
       RUNNER_PAGE_MAX=20
       RUNNER_LIST_STATUS=ok
       RUNNERS_JSON=\$(cat '$dir/runners.json')
       log() { :; }
+      event() { echo \"\$1 \$2\" >>'$dir/events'; }
       gh_token() { echo installation-token; }
-      gh_api() { echo '{\"runners\":[]}'; }
-      curl() { echo 204; }
+      # The FRESH roster drain_host reads for itself. A failure is a non-zero
+      # status with the reason on disk, which is how the real gh_api reports it.
+      gh_api() {
+        [ $rfail -eq 0 ] || { echo 503 >'$dir/api.status'; return 1; }
+        cat '$dir/fresh.json'
+      }
+      curl() { echo \"\$*\" >>'$dir/curls'; echo '${GATE_DEL_CODE:-204}'; }
       timeout() { shift; \"\$@\"; }
       gcloud() {
         echo \"\$*\" >>'$dir/calls'
         case \"\$*\" in
-          # SSHFAIL is how a case says the probe did not RUN — no output and a
-          # non-zero status, which is what an IAP tunnel failure, a missing
-          # firewall rule or the \`timeout\` expiring all look like. It is a
-          # distinct fixture from an empty answer on purpose: the old gate could
-          # not tell either of them from 'no workers', and the two are now
-          # separately falsifiable.
-          *'compute ssh'*)
-            [ '$sshout' = SSHFAIL ] && return 255
-            # EMPTY is a sentinel and not simply the empty string, because the
-            # positional default above is \`\${7:-0}\`: passing '' would silently
-            # become the answer '0' and the case would assert the opposite of
-            # what it reads. A ran-but-said-nothing probe is exit 0 with no
-            # output, which is what this prints.
-            [ '$sshout' = EMPTY ] && { printf '\n'; return 0; }
-            printf '%s\n' '$sshout'; return 0 ;;
+          *'compute ssh'*) return 255 ;;
           *get-guest-attributes*)
             # The stderr matters as much as the status. beacon_gate classifies
             # the refusal by grepping gcloud's own message for the constraint
-            # id, so a stub that fails silently exercises only half the branch
-            # -- and the half it skips is the one that authorises a deletion.
+            # id, so a stub that fails silently exercises only half the branch.
             [ $garc -eq 0 ] || { printf '%s\n' '${GATE_GA_ERR:-}' >&2; return $garc; }
             cat '$dir/ga.csv'; return 0 ;;
           *'instances describe'*)
             [ $derc -eq 0 ] || return $derc
             cat '$dir/meta.json'; return 0 ;;
           *'instances list'*) printf '%s\n' '$zone'; return 0 ;;
+          *delete-instances*) return ${GATE_MIG_RC:-0} ;;
         esac
         return 0
       }
       $BEACON_SRC
       $code
       drain_host h1
-      echo \"rc=\$? clear=\$WORKER_GATE_CLEAR held=\$WORKER_GATE_HELD und=\$WORKER_GATE_UNDETERMINED fb=\$WORKER_GATE_OS_FALLBACK\"
+      echo \"rc=\$? clear=\$WORKER_GATE_CLEAR held=\$WORKER_GATE_HELD und=\$WORKER_GATE_UNDETERMINED fb=\$WORKER_GATE_OS_FALLBACK err=\$DRAIN_ERRORS\"
     " 2>&1
   )
 
-  if [ "$emit" = "argv" ]; then
-    # No `| head`: under pipefail a reader that closes early takes the writer
-    # down with SIGPIPE, and the harness has already paid for that once. There
-    # is at most one ssh line, and none is an empty answer the check reports.
-    grep 'compute ssh' "$dir/calls"
+  if [ "$emit" = "events" ]; then
+    tr '\n' ';' <"$dir/events"
     rm -rf "$dir"
     return
   fi
 
   summary=$(printf '%s' "$out" | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
-  printf 'ssh=%s ga=%s del=%s %s' \
+  printf 'ssh=%s ga=%s dereg=%s del=%s %s' \
     "$(grep -c 'compute ssh' "$dir/calls")" \
     "$(grep -c 'get-guest-attributes' "$dir/calls")" \
+    "$(grep -c -- '-X DELETE' "$dir/curls")" \
     "$(grep -c 'delete-instances' "$dir/calls")" \
     "$summary"
   rm -rf "$dir"
 }
 
-# --- linux: the path that already exists, and must not have moved ------------
-#
-# The command, byte for byte. `$*` joins the argv with a single space, so the
-# `--command` string is visible whole — this fails on a changed flag, a dropped
-# `--tunnel-through-iap`, or a rewritten pgrep expression.
-check "gate/linux: the ssh command is unchanged, byte for byte" \
-  'compute ssh h1 --zone=test-zone-a --project=test-project --tunnel-through-iap --command pgrep -fc "Runner.Worker" || true' \
-  "$(gate_seq linux '' 0 0 1 0 0 0 '' argv)"
+# --- linux: the proof is GitHub's, and it comes first ------------------------
+check "gate/linux: an idle host is deregistered and deleted" \
+  "ssh=0 ga=0 dereg=1 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" "$(gate_seq linux)"
+check "gate/linux: both agents of an idle two-slot host are deregistered" \
+  "ssh=0 ga=0 dereg=2 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" "$(gate_seq linux '' 0 0 2)"
 
-check "gate/linux: pgrep says zero, the host is deleted" \
-  "ssh=1 ga=0 del=1 rc=0 clear=1 held=0 und=0 fb=0" "$(gate_seq linux)"
-check "gate/linux: pgrep says two, the host is kept" \
-  "ssh=1 ga=0 del=0 rc=1 clear=0 held=1 und=0 fb=0" "$(gate_seq linux '' 0 0 1 0 2)"
-# THE SEPARATE DECISION ABOUT LINUX BEHAVIOUR, NOW MADE (issue #17022).
-#
-# An unreachable host produces no output at all, and this used to DELETE: the
-# `-n "$workers"` test was false, so the gate abstained and fell through to
-# delete-instances. The previous revision of this file asserted that as
-# "still deletes, as it does today" and deferred the change. Deferring it cost
-# nine pull requests on 2026-09-06 and a frozen merge lane on 2026-09-08 —
-# this is the LAST gate before an instance delete, and the one input it could
-# not distinguish (no answer) is the one a busy or degraded fleet produces most.
-# It now answers the way the unknown-OS branch four lines above it already did:
-# an unknown host is kept, and the log line says which host and why.
-check "gate/linux: an empty pgrep answer is no answer, and keeps the host" \
-  "ssh=1 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" "$(gate_seq linux '' 0 0 1 0 EMPTY)"
-check "gate/linux: an ssh that fails outright keeps the host" \
-  "ssh=1 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" "$(gate_seq linux '' 0 0 1 0 SSHFAIL)"
-# Not every non-empty string is a count. A tunnel that prints a warning where a
-# number belongs must not be read as a busy host OR as an idle one.
-check "gate/linux: a non-numeric pgrep answer keeps the host" \
-  "ssh=1 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" \
-  "$(gate_seq linux '' 0 0 1 0 'ERROR: could not connect')"
-# The counters are load-bearing: `und` is the series an operator reads to tell
-# this hold apart from a real busy host (`held`), and a hold that incremented
-# `held` would hide a broken probe inside normal traffic.
-check "gate/linux: a real live worker is still held, not undetermined" \
-  "ssh=1 ga=0 del=0 rc=1 clear=0 held=1 und=0 fb=0" "$(gate_seq linux '' 0 0 1 0 7)"
-# The Linux path must never touch the guest-attribute API, and never pays for a
-# beacon read it would not understand.
+# THE REGRESSION (#930). Each of these used to deregister first and ask second.
+check "gate/linux: a busy agent keeps the host AND every registration" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" "$(gate_seq linux '' 0 0 1 0 1)"
+check "gate/linux: one busy agent of two keeps both registered" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" "$(gate_seq linux '' 0 0 2 0 1)"
+check "gate/linux: the idle proof cannot complete -- runners stay registered, drain errors" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=1 fb=0 err=1" "$(gate_seq linux '' 0 0 1 0 ROSTERFAIL)"
+check "gate/linux: an unprovable drain emits an ERROR event, not only a log line" \
+  "ERROR drain-error;" "$(gate_seq linux '' 0 0 1 0 ROSTERFAIL 0 '' events)"
+# Only an explicit `busy: false` proves idle. A roster that omits the flag is a
+# roster that did not say.
+check "gate/linux: a missing busy flag is not idle" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" "$(gate_seq linux '' 0 0 1 0 NULL)"
+# A host the tick saw with no agents, that has some now, came alive in between.
+check "gate/linux: agents that registered since the poll abort the drain" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=0 fb=0 err=0" \
+  "$(GATE_FRESH_RUNNERS=1 gate_seq linux '' 0 0 0)"
+# The zombie #930 left behind: a RUNNING host with no agents at all. It must be
+# reclaimable, or the pool sits at max_hosts with nothing registered.
+check "gate/linux: a host with no agents left is deleted, not kept forever" \
+  "ssh=0 ga=0 dereg=0 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" "$(gate_seq linux '' 0 0 0)"
+check "gate/linux: a 422 mid-deregistration aborts (a job just started)" \
+  "ssh=0 ga=0 dereg=1 del=0 rc=1 clear=1 held=0 und=0 fb=0 err=0" \
+  "$(GATE_DEL_CODE=422 gate_seq linux)"
+check "gate/linux: any other DELETE answer is a drain error" \
+  "ssh=0 ga=0 dereg=1 del=0 rc=1 clear=1 held=0 und=0 fb=0 err=1" \
+  "$(GATE_DEL_CODE=502 gate_seq linux)"
+check "gate/linux: a failed instance delete is a drain error" \
+  "ssh=0 ga=0 dereg=1 del=1 rc=1 clear=1 held=0 und=0 fb=0 err=1" \
+  "$(GATE_MIG_RC=1 gate_seq linux)"
+check "gate/linux: every step of a drain is a structured event" \
+  "INFO drain-probe;INFO drain-deregister;INFO drain-delete;" \
+  "$(gate_seq linux '' 0 0 1 0 0 0 '' events)"
+# The Linux path never touches the guest-attribute API and never logs in.
 check "gate/linux: guest attributes are never read" \
-  "ssh=1 ga=0 del=1 rc=0 clear=1 held=0 und=0 fb=0" \
+  "ssh=0 ga=0 dereg=1 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" \
   "$(gate_seq linux $'workers,0\nts,2030-01-01T00:00:00Z' 0 0 1 0 0)"
 
-# --- windows: no inbound path, ever ------------------------------------------
-#
-# `ssh=0` in every case below is the property the whole option-(ii) decision in
-# the ADR rests on: a Windows host needs no sshd, no IAP firewall rule and no
-# administrator session from the controller onto a machine running pull-request
-# code. One `gcloud compute ssh` against a Windows host would re-import all
-# three, and it would hang rather than fail.
+# --- windows: the beacon, also BEFORE deregistration --------------------------
 NOW_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 check "gate/windows: a fresh beacon reporting zero workers deletes" \
-  "ssh=0 ga=1 del=1 rc=0 clear=1 held=0 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=1 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" \
   "$(gate_seq windows "$(printf 'workers,0\nts,%s' "$NOW_TS")")"
-check "gate/windows: a fresh beacon reporting a live worker keeps" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+check "gate/windows: a fresh beacon reporting a live worker keeps, registered" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(gate_seq windows "$(printf 'workers,2\nts,%s' "$NOW_TS")")"
-
-# Guest attributes that cannot be READ. Non-zero is not "no workers", it is "we
-# did not get an answer" — and the API rate-limits this call per instance, so a
-# busy fleet manufactures exactly this. Reading it as idle would delete hosts
-# because the pool got busy.
+check "gate/windows: a busy agent keeps before the beacon is even read" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
+  "$(gate_seq windows "$(printf 'workers,0\nts,%s' "$NOW_TS")" 0 0 1 0 1)"
 check "gate/windows: unreadable guest attributes keep the host" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(gate_seq windows "$(printf 'workers,0\nts,%s' "$NOW_TS")" 1)"
-
-# A stale beacon is a DEAD PUBLISHER, not an idle host: the host may be
-# perfectly busy and we no longer know. 3x the 30s interval is the ceiling, so
-# 600s is far past it.
 check "gate/windows: a stale beacon keeps the host" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(gate_seq windows "$(printf 'workers,0\nts,%s' \
     "$(date -u -d '600 seconds ago' +%Y-%m-%dT%H:%M:%SZ)")")"
-
-# A beacon whose timestamp cannot be parsed at all — a publisher writing
-# something else into a namespace job code can also write to.
 check "gate/windows: an unparseable beacon timestamp keeps the host" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(gate_seq windows "$(printf 'workers,0\nts,not-a-time')")"
-
-# No beacon at all. The three ways that ends, in order of how much is known:
-#  * young  — still booting, and a Windows boot is minutes;
-#  * had agents — the boot script DID reach registration, so the publisher is
-#    what is broken and a worker can exist where we cannot see it. This is the
-#    case that proves the registration count is taken BEFORE drain_host
-#    deregisters everything, because afterwards GitHub answers 0 for every host;
-#  * old, never registered, confirmed across ticks — the only delete in the
-#    whole rule without positive evidence, and it is confined to a host that
-#    never became a runner.
 check "gate/windows: no beacon on a young host keeps it" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" "$(gate_seq windows '' 0 0 0 0 0 60)"
-check "gate/windows: no beacon on a host that HAD agents keeps it" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" "$(gate_seq windows '' 0 0 2 9 0 4000)"
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" "$(gate_seq windows '' 0 0 0 0 0 60)"
+check "gate/windows: no beacon on a host that HAS agents keeps it" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" "$(gate_seq windows '' 0 0 2 9 0 4000)"
 check "gate/windows: an unconfirmed beacon-less host keeps" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" "$(gate_seq windows '' 0 0 0 1 0 4000)"
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" "$(gate_seq windows '' 0 0 0 1 0 4000)"
 check "gate/windows: a confirmed never-booted host is deleted" \
-  "ssh=0 ga=1 del=1 rc=0 clear=1 held=0 und=0 fb=0" "$(gate_seq windows '' 0 0 0 3 0 4000)"
+  "ssh=0 ga=1 dereg=0 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" "$(gate_seq windows '' 0 0 0 3 0 4000)"
 
 # --- the read the ORG refuses, end to end ------------------------------------
-#
-# Same four shapes again, with the read failing and gcloud saying WHY on stderr.
-# constraints/compute.disableGuestAttributesAccess is not a bad minute: it
-# refuses every read on the project, so the beacon does not exist and never
-# will. Read as an ordinary failure it shadows all of rule 2, and the four
-# checks above become unreachable on exactly the projects that need them --
-# measured in production on a project that enforces it, where one host that had
-# denied its own boot sat RUNNING and undeletable for hours.
-#
-# The keeps are what make the delete safe: young, or known to GitHub, or
-# unconfirmed, and the host stays.
 GA_POLICY_ERR='ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 412: Constraint constraints/compute.disableGuestAttributesAccess violated for project 000000000000.'
 
 check "gate/windows: a refused read still keeps a young host" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 0 0 0 60)"
-check "gate/windows: a refused read still keeps a host that HAD agents" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+check "gate/windows: a refused read still keeps a host that HAS agents" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 2 9 0 4000)"
 check "gate/windows: a refused read still needs its confirmations" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 0 1 0 4000)"
 check "gate/windows: a host that can never publish a beacon is finally reclaimable" \
-  "ssh=0 ga=1 del=1 rc=0 clear=1 held=0 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=0 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" \
   "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 0 3 0 4000)"
-
-# The SAME arguments with no explanation on stderr, which is every other reason
-# a read fails -- quota above all, and quota arrives when the fleet is busy.
-# This is the one line that keeps the change from being "non-zero deletes".
 check "gate/windows: an unexplained read failure with the same shape still keeps" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(gate_seq windows '' 1 0 0 3 0 4000)"
-# ...and so does a DIFFERENT org constraint. The org enforces dozens; only this
-# one means there is no beacon.
 check "gate/windows: another org constraint is not this one" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(GATE_GA_ERR='ERROR: HTTPError 412: Constraint constraints/compute.disableSerialPortAccess violated for project 1.' \
     gate_seq windows '' 1 0 0 3 0 4000)"
-
-# Falsification: cut the flag out of the call and the reclaim above goes back to
-# being a permanent keep. Without this the four checks above pass against a rule
-# that never reads the twelfth argument at all.
 # shellcheck disable=SC2016  # the sed script must carry the literal $ names.
 check "gate/windows: dropping the flag restores the host nobody could delete" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 0 3 0 4000 \
     's/"\$ORPHAN_CONFIRM_TICKS" "\$denied"/"$ORPHAN_CONFIRM_TICKS"/')"
 
-# --- the OS itself cannot be established: fail CLOSED ------------------------
-#
-# `und=1` and `del=0` in all three. A host whose OS is unknown is a host nobody
-# can ask the worker question about, and "nothing" has never authorised a
-# deletion. The cost of being wrong the other way is not symmetric: a spurious
-# keep bills for one host until the next tick, a spurious delete costs up to
-# `slots_per_host` merge-blocking jobs and reports nothing.
-#
+# --- the OS itself cannot be established: fail CLOSED, agents kept ------------
 check "gate/unknown: a ci-host-os this controller does not know keeps the host" \
-  "ssh=0 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" "$(gate_seq freebsd)"
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=1 fb=0 err=1" "$(gate_seq freebsd)"
 check "gate/unknown: an unreadable instance describe keeps the host" \
-  "ssh=0 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" "$(gate_seq linux '' 0 1)"
-# No self-link from the MIG means no zone, and until now that SKIPPED the second
-# gate and deleted the host anyway — a delete on a host nothing had been able to
-# ask about. Now it is the same `unknown` as the rest.
-check "gate/unknown: no zone no longer skips the gate and deletes" \
-  "ssh=0 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" "$(gate_seq nozone)"
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=1 fb=0 err=1" "$(gate_seq linux '' 0 1)"
+check "gate/unknown: no zone keeps the host" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=1 fb=0 err=1" "$(gate_seq nozone)"
 
 # --- the host predates `ci-host-os` entirely: fall back, do NOT deadlock ------
-#
-# `absent` is NOT `unknown`, and the difference is the whole fleet. Every host
-# running when this ships carries no `ci-host-os`: the key lives on the instance
-# template, the autoscaler is ONLY_UP so it never removes a host, `update_policy`
-# is OPPORTUNISTIC so a host only reaches the new template by being recreated,
-# and drain_host() below is the only code in the system that deletes one. Fail
-# closed on `absent` and the loop closes on itself — no host can be deleted until
-# it has the key, and no host can get the key until it is deleted — so the pool
-# sits at max hosts and bills for them until a human intervenes.
-#
-# So `absent` resolves against the CONTROLLER's own `ci-host-os`. That is not the
-# inference the design refuses (a missing key read as linux with nothing else to
-# go on): a pool is one MIG, one instance template, one `var.host_os`, and the
-# pre-key template generation is provably Linux-only because Windows pools did
-# not exist before the key. On a Linux pool the fallback runs the gate `main`
-# runs today, so it is not a new risk.
-check "gate/legacy: an absent ci-host-os on a linux controller runs the ssh gate" \
-  "ssh=1 ga=0 del=1 rc=0 clear=1 held=0 und=0 fb=1" "$(gate_seq none)"
-# The same command, not merely "an" ssh: the fallback must be the gate that ships
-# today, byte for byte, or it is a new Linux behaviour wearing a fallback's name.
-check "gate/legacy: the fallback runs the unchanged ssh command" \
-  'compute ssh h1 --zone=test-zone-a --project=test-project --tunnel-through-iap --command pgrep -fc "Runner.Worker" || true' \
-  "$(gate_seq none '' 0 0 1 0 0 0 '' argv)"
-check "gate/legacy: the fallback still holds a host with a live worker" \
-  "ssh=1 ga=0 del=0 rc=1 clear=0 held=1 und=0 fb=1" "$(gate_seq none '' 0 0 1 0 2)"
-# A Windows pool cannot have a host older than the key, so an absent key there is
-# anomalous rather than legacy, and the fallback stays shut. `ssh=0` is the point:
-# the one thing that must never happen is an ssh at a Windows host.
+check "gate/legacy: an absent ci-host-os on a linux controller drains as linux" \
+  "ssh=0 ga=0 dereg=1 del=1 rc=0 clear=1 held=0 und=0 fb=1 err=0" "$(gate_seq none)"
+check "gate/legacy: the fallback still holds a host with a busy agent" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" "$(gate_seq none '' 0 0 1 0 1)"
 check "gate/legacy: an absent ci-host-os on a windows controller keeps the host" \
-  "ssh=0 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=1 fb=0 err=1" \
   "$(GATE_CTRL_OS=windows gate_seq none)"
-# And a controller whose own key is unreadable resolves nothing either.
 check "gate/legacy: a controller with no ci-host-os of its own keeps the host" \
-  "ssh=0 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=1 fb=0 err=1" \
   "$(GATE_CTRL_OS=unknown gate_seq none)"
 
 # --- the mutations: every check above must be seen to FAIL ------------------
 #
-# A predicate that cannot be made to go false is asserting nothing. Each edit
-# below is the plausible bad one — the shape a careless change actually takes,
-# where the surrounding bookkeeping survives — and each anchor was confirmed to
-# exist in the shipping file before the expectation was written.
-#
-# M1: the Windows arm is short-circuited. The beacon read disappears and the
-# host falls through to the fail-closed arm, so a perfectly idle Windows host
-# is never deletable and the pool stops scaling in.
+# M0 is #930 itself: the busy proof is skipped, and a host with a job on it has
+# its agent deregistered (the stub's DELETE answers 204, as GitHub would for an
+# agent whose job was assigned after the read).
+# shellcheck disable=SC2016
+check "gate/mutation: skipping the busy proof deregisters a working host" \
+  "ssh=0 ga=0 dereg=1 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" \
+  "$(gate_seq linux '' 0 0 1 0 1 0 's/if \[ "\$busy" -gt 0 \]; then/if false; then/')"
+# M1: the Windows arm is short-circuited; an idle Windows host is never deletable.
 # shellcheck disable=SC2016
 check "gate/mutation: removing the windows arm stops the beacon read" \
-  "ssh=0 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=1 fb=0 err=1" \
   "$(gate_seq windows "$(printf 'workers,0\nts,%s' "$NOW_TS")" 0 0 1 0 0 0 \
     's/if \[ "\$host_os" = "windows" \]; then/if false; then/')"
-
-# M2: the OS is taken from this controller's own configuration instead of from
-# the host — the mixed-rollout mistake, in one line. A Windows host is then
-# ssh'd into. It has no sshd, the call returns nothing, and `-n "$workers"` is
-# false, so the gate abstains and the host is DELETED mid-job. `ssh=1` is the
-# whole finding.
+# M2: the OS is taken from the controller instead of the host. The beacon read
+# disappears (ga=0) and a Windows host with two live workers is deleted.
 # shellcheck disable=SC2016
-check "gate/mutation: trusting the controller's own OS ssh's into a Windows host" \
-  "ssh=1 ga=0 del=1 rc=0 clear=1 held=0 und=0 fb=0" \
-  "$(gate_seq windows "$(printf 'workers,2\nts,%s' "$NOW_TS")" 0 0 1 0 '' 0 \
+check "gate/mutation: trusting the controller's own OS skips a Windows beacon" \
+  "ssh=0 ga=0 dereg=1 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" \
+  "$(gate_seq windows "$(printf 'workers,2\nts,%s' "$NOW_TS")" 0 0 1 0 0 0 \
     's/host_os=\$(instance_host_os "\$host" "\$zone")/host_os=linux/')"
-
-# M3: the fail-closed arm is removed. A host of unknown OS then walks straight
-# past both implementations of the gate to the delete — which is precisely what
-# happens today when the zone is empty, and is the behaviour this PR changes.
-# The fixture is a host with an OS this controller does not recognise, not one
-# with no key at all: the latter is now resolved by the legacy arm and would
-# never reach this branch, so the mutation would go unnoticed.
+# M3: the fail-closed arm is removed, and a host of unknown OS is deleted.
 # shellcheck disable=SC2016
 check "gate/mutation: without the fail-closed arm an unknown host is deleted" \
-  "ssh=0 ga=0 del=1 rc=0 clear=0 held=0 und=0 fb=0" \
+  "ssh=0 ga=0 dereg=1 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" \
   "$(gate_seq freebsd '' 0 0 1 0 0 0 's/elif \[ "\$host_os" != "linux" \]; then/elif false; then/')"
-
-# M7: the legacy fallback is removed — the shape a future cleanup takes when it
-# retires the arm one release too early. Every pre-key host then reads
-# `undetermined` and is kept, which is the fleet-wide scale-in deadlock: nothing
-# deletes a host, so nothing ever gives one the key. It looks safe in review and
-# in the logs, and it bills at max hosts.
+# M7: the legacy fallback is removed -- the fleet-wide scale-in deadlock.
 # shellcheck disable=SC2016
 check "gate/mutation: removing the legacy fallback deadlocks a pre-key host" \
-  "ssh=0 ga=0 del=0 rc=1 clear=0 held=0 und=1 fb=0" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=1 fb=0 err=1" \
   "$(gate_seq none '' 0 0 1 0 0 0 's/if \[ "\$host_os" = "absent" \]; then/if false; then/')"
-
-# M8: the fallback ignores the controller's own OS and resolves every pre-key
-# host to linux. On a Windows pool an anomalous absent key would then be ssh'd
-# into a machine with no sshd — no answer, read as no workers, deleted mid-job.
+# M8: the fallback ignores the controller's own OS on a Windows pool.
 # shellcheck disable=SC2016
-check "gate/mutation: an unconditional fallback ssh's into a windows pool's host" \
-  "ssh=1 ga=0 del=1 rc=0 clear=1 held=0 und=0 fb=1" \
-  "$(GATE_CTRL_OS=windows gate_seq none '' 0 0 1 0 '' 0 \
+check "gate/mutation: an unconditional fallback drains a windows pool's host as linux" \
+  "ssh=0 ga=0 dereg=1 del=1 rc=0 clear=1 held=0 und=0 fb=1 err=0" \
+  "$(GATE_CTRL_OS=windows gate_seq none '' 0 0 1 0 0 0 \
     's/if \[ "\$CONTROLLER_HOST_OS" = "linux" \]; then/if true; then/')"
-
-# M4: the registration count is taken AFTER the deregistrations rather than
-# before. GitHub then reports zero agents for every host, the
-# "registered-without-beacon" row can never fire, and a host whose publisher
-# died — but whose boot script plainly reached registration — is deleted on the
-# never-booted arm with a job possibly still running on it.
-check "gate/mutation: counting registrations after the drain deletes a live host" \
-  "ssh=0 ga=1 del=1 rc=0 clear=1 held=0 und=0 fb=0" \
+# M4: the registration count is zeroed, so a host whose publisher died but
+# whose agents are registered reads as never-booted and is deleted.
+check "gate/mutation: losing the registration count deletes a live host" \
+  "ssh=0 ga=1 dereg=2 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" \
   "$(gate_seq windows '' 0 0 2 9 0 4000 '/^  regs=/a regs=0')"
-
-# M5: the beacon's timestamp is dropped on the floor and the rule is handed a 0,
-# which it reads as "the caller could not parse it". The affirmative case stops
-# being reachable at all — the pool never scales in, and it looks like a beacon
-# problem rather than a plumbing one.
+# M5: the beacon's timestamp is dropped; the affirmative case becomes unreachable.
 # shellcheck disable=SC2016
 check "gate/mutation: dropping the parsed timestamp makes the delete unreachable" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(gate_seq windows "$(printf 'workers,0\nts,%s' "$NOW_TS")" 0 0 1 0 0 0 \
     's/"\$ts" "\$now"/0 "\$now"/')"
-
-# M6: the published count is never captured, only the key's presence. Every
-# beacon then reads as unparseable, which keeps — safe, and completely inert.
-# The gate would be a no-op that nothing distinguishes from a working one.
+# M6: the published count is never captured; the gate becomes inert.
 # shellcheck disable=SC2016
 check "gate/mutation: not capturing the worker count makes the gate inert" \
-  "ssh=0 ga=1 del=0 rc=1 clear=0 held=1 und=0 fb=0" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(gate_seq windows "$(printf 'workers,0\nts,%s' "$NOW_TS")" 0 0 1 0 0 0 \
     's/{ present=1; workers="\$val"; }/present=1/')"
+
 
 # The summary and the verdict used to sit HERE, with eighty more checks below
 # them. `[ "$fail" -eq 0 ]` in the middle of a script is not a gate: its status
