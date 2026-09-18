@@ -822,18 +822,12 @@ variable "network_tags" {
     tags this module always applies ("ci-runner-host" / "ci-runner-controller"
     and the pool name).
 
-    Pass the tag the project's firewall rules target. On `host_os = "linux"` it
-    is not decoration: the controller verifies a host is truly idle over IAP-SSH
-    before deleting it, so a host the IAP rule does not reach fails that check,
-    the drain aborts, and the pool never scales in — the exact failure this
-    module exists to fix.
-
-    That contract is Linux-only. A Windows pool's liveness gate is outbound —
-    the host publishes what it knows about itself to guest attributes and the
-    controller reads it through the compute API — so a Windows host needs NO
-    inbound path from the controller at all: no IAP-SSH rule, no tag, no
-    listener. A reader of a Windows pool should not go hunting for a firewall
-    rule that must not exist.
+    Pass the tag the project's firewall rules target. The controller needs NO
+    inbound path to a host on either OS: it proves a host idle from GitHub's
+    own `busy` flag on a fresh runner roster, plus — on Windows — the beacon
+    the host publishes to guest attributes and the controller reads through the
+    compute API. Nothing logs in to a host (#930 removed the IAP-SSH probe), so
+    a reader should not go hunting for a controller-to-host firewall rule.
 
     Reserved: no tag here may start with `ci-shared-infra-`. That namespace
     belongs to `shared_infra_id`, and a tag passed in by hand is the other way

@@ -41,12 +41,26 @@ itself as a test failure, so nobody finds out from here.
 | 1 | **The roster was read in full** | `fetch_runner_roster()` → `drain_decision` rule 2b | the runner listing was truncated, capped, or unreadable, and the host is not fully `present` |
 | 2 | **The verdict authorises it** | `drain_decision()` | busy slots, inside the idle grace, at the floor, still booting, registration unknown |
 | 3 | **No pin hold** | `pin_hold_gate()` | a job is pinned to this host |
-| 4 | **GitHub let the agents go** | `drain_host()` DELETE loop | any agent returns HTTP 422 — GitHub refuses to deregister an agent that is executing a job. **This is the mid-job guard.** |
-| 5 | **No worker process is alive** | `drain_host()` live-worker probe | a `Runner.Worker` is running, **or the probe could not be answered at all** |
+| 4 | **The host is proven idle** | `drain_host()` idle proof | a fresh, complete runner roster does not show an explicit `busy: false` on **every** agent of the host (a missing flag counts as busy), the roster cannot be read in full, or — on Windows — the host's beacon does not say clear |
+| 5 | **GitHub let the agents go** | `drain_host()` DELETE loop | any agent returns HTTP 422 — GitHub refuses to deregister an agent that is executing a job. **This is the guard for a job assigned after gate 4's read.** |
 
-Order matters and is part of the contract: **deregister first, delete second.**
-Deregistering is what makes the host ineligible for new work, so gates 4 and 5
-are not racing the scheduler while they run.
+Order matters and is part of the contract: **prove idle first, deregister
+second, delete third.** A drain that stops at gate 4 — for *any* reason — stops
+with every agent still registered, so a refusal never costs the pool a runner.
+
+> **Why the order changed (2026-09-17, #930).** The drain used to deregister
+> first and then ask the host, over an IAP-tunnelled ssh, whether a
+> `Runner.Worker` was alive. The controller's service account could not log in
+> to the host through OS Login, so that probe never answered; the drain kept
+> the host — with its agents already gone. Every idle host in a pool ended up
+> `RUNNING`, billed, and serving nothing: GitHub `total_count: 0`, MIG stable,
+> no alert, twice in six hours. Nothing logs in to a host any more.
+
+A 422 part-way through the loop leaves the agents already deregistered gone and
+the rest registered; the host is running the job that caused it, and the next
+idle window completes the drain. A failure of the instance delete *after* every
+agent is deregistered leaves a runner-less host, which the next tick reads as
+`absent`, re-proves idle with nothing to deregister, and deletes.
 
 ## Absence is not an observation
 
@@ -58,9 +72,10 @@ one GitHub runner listing. So a listing that stops short reports them for a
 host whose agents are up and executing jobs, and reports `busy = 0` for the
 same reason.
 
-That is worse than a wrong verdict, because it defeats gate 4 in the same
-stroke: the mid-job guard is GitHub refusing to deregister a busy agent, and a
-host with no visible agent ids has nothing to be refused. **Both halves of the
+That is worse than a wrong verdict, because it defeats gates 4 and 5 in the
+same stroke: the idle proof reads `busy` off agents it can see, the mid-job
+guard is GitHub refusing to deregister a busy agent, and a host with no visible
+agent ids has nothing to read and nothing to be refused. **Both halves of the
 protection fail on the same input, in the same direction.**
 
 And it fails fleet-wide. A truncated listing is not a property of one host, so
@@ -92,22 +107,23 @@ immortal-VM one.
 
 ## No answer is not a "no"
 
-Gate 5 asks the host, over an IAP-tunnelled ssh, how many `Runner.Worker`
-processes are alive. It used to read an empty reply — a failed tunnel, a
-missing firewall rule, a permission error, a hang — as *zero workers*, and fall
-through to the delete. It was also the only such call with no timeout, so the
-failure it could not distinguish was the failure it invited.
-
-The probe is now bounded (`WORKER_GATE_SSH_TIMEOUT`), and an answer is a
-**count** or it is not an answer. Empty, non-numeric, or a non-zero exit are
-all `undetermined`, and `undetermined` keeps the host.
+Gate 4 reads GitHub's own `busy` flag. An agent whose flag is missing, or a
+roster that cannot be parsed, is not an idle agent: `busy != false` counts as
+busy, and an unreadable roster is `undetermined`. On Windows the host's beacon,
+read back through the compute API, must also say clear; a stale, missing or
+unparseable beacon keeps the host. An answer is an explicit *idle* or it is
+not an answer, and no answer keeps the host **with its agents registered**.
 
 ## What an operator should see
 
 **Time series** (`ci_worker_gate_verdicts`, `ci_drain_verdicts`):
 
-* `outcome="undetermined"` rising — the live-worker probe is not getting
-  answers. Usually IAP, a firewall rule, or the controller's service account.
+* `ci_drain_verdicts{outcome="error"}` above zero — drains are failing for a
+  reason other than a busy host (roster unreadable, no token, a DELETE or
+  instance delete that errored). This feeds the **drain failing** alert. Every
+  agent is left registered, so the pool is safe and oversized.
+* `outcome="undetermined"` rising — the idle proof is not getting answers:
+  the roster cannot be read in full, or a Windows beacon cannot be read.
   The fleet is **safe** while this is high, and **oversized**: nothing is being
   deleted. This is the series that tells a broken probe apart from a genuinely
   busy fleet, which is `outcome="held"`.
@@ -115,13 +131,18 @@ all `undetermined`, and `undetermined` keeps the host.
 * `ci_hosts_running` flat at max while demand is low, with either of the above
   elevated, is a stuck scale-in rather than a healthy warm pool.
 
-**Log lines**, on the controller:
+**Log lines**, in Cloud Logging under `logName="projects/<project>/logs/ci-controller"`
+(structured: `jsonPayload.event`, `.host`, `.reason`/`.result`), and on the
+controller's own log file:
 
 ```
 runner roster hit the <N>-page cap — the listing is TRUNCATED, so no host will be drained ...
-drain <host>: could not read the runner roster in full (rc=<n> status=<s>) — absence is unproven, aborting
-drain <host>: the live-worker probe returned no usable count (...) — cannot prove this host is idle, leaving host up
-drain <host>: runner <id> refused deregistration (HTTP 422) — host is working, aborting
+drain <host>: could not read the runner roster in full (rc=<n> status=<s>) -- idle is unproven, every agent left registered   [ERROR, drain-error]
+drain <host>: idle proof failed -- <n> agent(s) busy on GitHub, every agent left registered                                   [drain-probe]
+drain <host>: idle proof failed -- <beacon verdict>, every agent left registered                                             [drain-probe, windows]
+drain <host>: idle proof passed -- 0 of <k> agent(s) busy on GitHub                                                          [drain-probe]
+drain <host>: runner <id> refused deregistration (HTTP 422) -- a job started, aborting after <d> of <k>                      [WARNING, drain-deregister]
+drain <host>: deregistered <k> agent(s) and deleted                                                                          [drain-delete]
 GitHub runner list unavailable this tick (status=..., consecutive=<n>) — ... nothing will be drained (fail-safe)
 ```
 

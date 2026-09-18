@@ -10,14 +10,13 @@
 # outside the host, is unforgeable from inside it, and does not care what OS the
 # host runs.
 #
-# The second gate exists because the first has a window — an agent can be
-# deregistered while its worker is still winding down, and an agent can die
-# leaving a worker behind. So the controller asks the host directly whether a
-# worker process remains. On Linux it asks over `gcloud compute ssh
-# --tunnel-through-iap` and reads `pgrep -fc Runner.Worker`. On Windows there is
-# no sshd and no pgrep, so the host publishes the same count OUTBOUND into its
-# own guest attributes and the controller reads it through the compute API it
-# already calls:
+# GitHub's `busy` flag has a window — an agent can die leaving a worker behind.
+# On Windows the controller therefore also asks the host whether a worker
+# process remains. There is no sshd and no pgrep, so the host publishes the
+# count OUTBOUND into its own guest attributes and the controller reads it
+# through the compute API it already calls. (Linux hosts used to be asked over
+# `gcloud compute ssh --tunnel-through-iap`; that probe could not log in and
+# was removed in #930 — a Linux host's idle proof is the roster alone.)
 #
 #   ci/workers  = count of Runner.Worker.exe
 #   ci/ts       = RFC3339 UTC time of that count

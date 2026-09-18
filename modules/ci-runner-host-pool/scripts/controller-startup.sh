@@ -34,6 +34,68 @@ log() {
   logger -t ci-controller -- "$*" 2>/dev/null || true
 }
 
+# event <severity> <kind> <host> <message> [key=value ...]
+#
+# A decision the on-call must be able to read WITHOUT a shell on this VM. log()
+# reaches the local file and journald only, and nothing on the controller image
+# ships either to Cloud Logging -- so on 2026-09-17 a pool drained to zero
+# runners twice in six hours and the controller's own account of it existed
+# nowhere anyone could query; every piece of evidence came off the HOSTS'
+# serial consoles (#930). An event is the same human line, plus one structured
+# entry queued for Cloud Logging (log `ci-controller`, flushed once per tick by
+# flush_events). `jq --arg` builds it, so a message carrying quotes or newlines
+# cannot break the entry or smuggle a field into it.
+EVENTS_MAX=500
+event() {
+  local sev="$1" kind="$2" host="$3" msg="$4" kv
+  shift 4
+  log "$msg"
+  local args=()
+  for kv in "$@"; do args+=(--arg "${kv%%=*}" "${kv#*=}"); done
+  jq -cn --arg severity "$sev" --arg event "$kind" --arg host "$host" \
+    --arg message "$msg" --arg pool "${POOL:-}" --arg repo "${REPO_FULL:-}" \
+    "${args[@]}" '$ARGS.named' >>"$STATE_DIR/events.jsonl" 2>/dev/null || true
+}
+
+# flush_events — every queued event in ONE entries:write, bounded like every
+# other call here. Never retried: a failed flush is logged locally and the
+# batch dropped, so a Logging outage costs log lines, never a stalled tick or a
+# file that grows without bound. The token travels over a pipe, not argv, for
+# the reason flush_series (telemetry.sh) gives; the body goes over stdin as
+# well, because 500 entries can exceed the kernel's 128 KiB cap on one argument.
+flush_events() {
+  local q="$STATE_DIR/events.jsonl" batch="$STATE_DIR/events.flush"
+  local body token http out iid zone
+  [ -s "$q" ] || return 0
+  mv -f "$q" "$batch" 2>/dev/null || return 0
+  iid=$(md "instance/id")
+  zone=$(md "instance/zone")
+  zone=${zone##*/}
+  body=$(tail -n "$EVENTS_MAX" "$batch" | jq -cs --arg lg_name "projects/$PROJECT/logs/ci-controller" \
+    --arg lg_project "$PROJECT" --arg lg_instance "$iid" --arg lg_zone "$zone" \
+    '{logName: $lg_name,
+      resource: {type: "gce_instance", labels: {project_id: $lg_project, instance_id: $lg_instance, zone: $lg_zone}},
+      labels: {component: "ci-controller"},
+      entries: map({severity: .severity, jsonPayload: del(.severity)})}' 2>/dev/null)
+  rm -f "$batch"
+  [ -n "$body" ] || { log "events: could not assemble the batch -- dropped"; return 1; }
+  token=$(md "instance/service-accounts/default/token" \
+    | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  [ -n "$token" ] || { log "events: no access token -- batch dropped"; return 1; }
+  out=$(mktemp) || out=/dev/null
+  http=$(printf '%s' "$body" | curl "${CURL_TIMEOUTS[@]}" -s -o "$out" -w '%{http_code}' -X POST \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
+    -H "Content-Type: application/json" \
+    "https://logging.googleapis.com/v2/entries:write" --data-binary @-)
+  if [ "$http" != "200" ]; then
+    log "events: POST entries:write -> HTTP $http: $(head -c 400 "$out")"
+    [ "$out" = /dev/null ] || rm -f "$out"
+    return 1
+  fi
+  [ "$out" = /dev/null ] || rm -f "$out"
+  return 0
+}
+
 # beat — "the loop moved". The watchdog's only input, written at every point in
 # a tick where progress can be proven.
 #
@@ -86,14 +148,6 @@ beat() {
 CURL_MAX_TIME=30   # keep in step with --max-time below; the demand budget
                    # reserves one of these before starting another call
 CURL_TIMEOUTS=(--connect-timeout 10 --max-time "$CURL_MAX_TIME")
-
-# The live-worker probe in drain_host is an IAP-tunnelled ssh, not a describe,
-# so it gets more than the `timeout 60` the metadata calls use: it negotiates a
-# tunnel and may have to generate a key on first use. It is still BOUNDED,
-# because this call is the last gate before an instance delete and an unbounded
-# gate that hangs is a gate that stalls the tick for every other pool. Expiring
-# is not a pass -- see the probe itself, which treats no answer as unknown.
-WORKER_GATE_SSH_TIMEOUT=120
 
 md() {
   curl "${CURL_TIMEOUTS[@]}" -fsS -H "Metadata-Flavor: Google" \
@@ -3071,84 +3125,97 @@ PIN_ATTR_EOF
 # --- drain -------------------------------------------------------------------
 #
 # The verdict from drain_decision() authorises this sequence and nothing less.
-# A bare instance delete would race a job that started between the poll and the
-# delete; deregistering first closes that race because GitHub REFUSES to remove
-# an agent that is executing a job, and that refusal is the mid-job guard.
+#
+# PROVE FIRST, DEREGISTER SECOND (#930). Deregistering an agent cannot be undone
+# from here: agents are not --ephemeral, their units are Restart=no, and only
+# the host's own boot script ever registers a slot. So every question that can
+# stop a drain is asked while the agents are STILL REGISTERED, and a question
+# that cannot be answered stops the drain with every agent left in place.
+#
+# The order used to be the other way round -- deregister, then ask the host over
+# IAP-SSH whether a Runner.Worker was alive -- and that made any probe failure
+# unrecoverable. On a project where the controller cannot log in to its hosts
+# (OS Login: "does not have login permission"), the probe never answered, so
+# every host that went idle for the grace period was stripped of its agents and
+# then kept, forever: MIG stable and RUNNING, autoscaler ONLY_UP, GitHub
+# `total_count: 0`, every job queued. Twice in six hours on 2026-09-17.
+#
+# The idle proof now needs no login and no inbound path at all. It is GitHub's
+# own `busy` flag, read from a FRESH, COMPLETE roster at drain time (the tick's
+# roster is up to a poll old), and then GitHub's refusal (HTTP 422) to delete an
+# agent that is executing a job -- the mid-job guard for a job assigned between
+# the read and the DELETE. A Windows host additionally has to pass its beacon,
+# which is also read before anything is deregistered.
+#
+# Every step emits a structured event, and every way the drain can fail to
+# COMPLETE counts DRAIN_ERRORS, published as ci_drain_verdicts{outcome=error}
+# -- the series the "drain failing" policy watches, and which nothing used to
+# publish, so that policy could not fire.
+drain_fail() { # <host> <reason> <message>
+  event ERROR drain-error "$1" "drain $1: $3" reason="$2"
+  DRAIN_ERRORS=$((DRAIN_ERRORS + 1))
+  DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
+}
+
 drain_host() {
   local host="$1"
-  local ids id refused=0
+  local ids id tick_ids busy rc fresh tok code regs deregistered=0
 
-  ids=$(printf '%s' "$RUNNERS_JSON" | jq -r --arg h "$host" \
-    '.runners[]? | select(.name | startswith($h + "-s")) | .id' 2>/dev/null)
+  tok=$(gh_token) || {
+    drain_fail "$host" no-token "no GitHub token -- nothing deregistered"
+    return 1
+  }
 
-  local tok
-  tok=$(gh_token) || { log "drain $host: no token, aborting drain"; return 1; }
-
-  # An "absent" host has no ids to deregister, so the 422 mid-job guard below
-  # has nothing to refuse and cannot protect it. Re-ask GitHub with a FRESH
-  # list first: if the agents came up between the verdict and now, the host is
-  # alive and may already be holding work.
-  if [ -z "$ids" ]; then
-    # THE RE-ASK MUST BE A BETTER QUESTION THAN THE ONE THAT GOT US HERE. It
-    # used to repeat the same single unpaginated page that produced the empty
-    # id list, so on a fleet past 100 registrations it confirmed the wrong
-    # answer and the drain proceeded with NOTHING left to protect the host: no
-    # ids means no deregistration, and no deregistration means the 422 mid-job
-    # refusal below can never fire.
-    local fresh rc
-    fresh="$STATE_DIR/drain-reask.json"
-    fetch_runner_roster "$fresh"
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-      log "drain $host: could not read the runner roster in full (rc=$rc status=$RUNNER_LIST_STATUS) — absence is unproven, aborting"
-      DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
-      return 1
-    fi
-    ids=$(jq -r --arg h "$host" \
-      '.runners[]? | select(.name | startswith($h + "-s")) | .id' <"$fresh" 2>/dev/null)
-    if [ -n "$ids" ]; then
-      log "drain $host: agents registered between the poll and the drain — aborting"
-      rm -f "$STATE_DIR/idle-$host"
-      DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
-      return 1
-    fi
+  # GATE 1: a complete, fresh roster. A partial one (page cap) cannot prove
+  # absence, and it cannot prove idleness either: an agent on a page we did not
+  # read is an agent whose `busy` we never saw.
+  fresh="$STATE_DIR/drain-reask.json"
+  fetch_runner_roster "$fresh"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    WORKER_GATE_UNDETERMINED=$((WORKER_GATE_UNDETERMINED + 1))
+    drain_fail "$host" roster-unreadable "could not read the runner roster in full (rc=$rc status=$RUNNER_LIST_STATUS) -- idle is unproven, every agent left registered"
+    return 1
   fi
+  ids=$(jq -r --arg h "$host" \
+    '.runners[]? | select(.name | startswith($h + "-s")) | .id' <"$fresh" 2>/dev/null)
+  busy=$(jq -r --arg h "$host" \
+    '[.runners[]? | select(.name | startswith($h + "-s")) | select(.busy != false)] | length' \
+    <"$fresh" 2>/dev/null)
+  case "$busy" in
+    '' | *[!0-9]*)
+      WORKER_GATE_UNDETERMINED=$((WORKER_GATE_UNDETERMINED + 1))
+      drain_fail "$host" roster-unparseable "the runner roster could not be read for busy flags -- idle is unproven, every agent left registered"
+      return 1
+      ;;
+  esac
 
-  # Counted BEFORE the deregistrations below, because after them GitHub's list
-  # is empty by construction. beacon_decision() reads this to tell "the boot
-  # script never ran" apart from "the publisher is broken on a host that DID
-  # register" — and asking GitHub after the drain answers 0 for both.
-  local regs
-  regs=$(printf '%s\n' "$ids" | grep -c '[0-9]')
-
-  for id in $ids; do
-    local code
-    code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
-      -H "Authorization: Bearer $tok" \
-      -H "Accept: application/vnd.github+json" \
-      "https://api.github.com/repos/$REPO_FULL/actions/runners/$id")
-    case "$code" in
-      204 | 404) ;; # gone, or already gone
-      *)
-        # 422 here means "that runner is running a job" — a job started between
-        # the poll and now. Abort the whole drain: a host with one live job is
-        # a host that keeps all its slots.
-        log "drain $host: runner $id refused deregistration (HTTP $code) — host is working, aborting"
-        refused=1
-        break
-        ;;
-    esac
-  done
-
-  if [ "$refused" -eq 1 ]; then
+  # A host the tick saw with NO agents that now has some came alive between the
+  # verdict and now, and may already be holding work.
+  tick_ids=$(printf '%s' "$RUNNERS_JSON" | jq -r --arg h "$host" \
+    '.runners[]? | select(.name | startswith($h + "-s")) | .id' 2>/dev/null)
+  if [ -z "$tick_ids" ] && [ -n "$ids" ]; then
+    event INFO drain-abort "$host" "drain $host: agents registered between the poll and the drain -- aborting" reason=registered-since-poll
     rm -f "$STATE_DIR/idle-$host"
     DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
     return 1
   fi
 
-  # Second gate: even with every registration gone, do not delete while a job
-  # process is alive on the box. Checked from here rather than on the host
-  # because the host has no permission to remove itself from the MIG.
+  # `busy != false` above, not `busy == true`: an agent whose flag is missing or
+  # null is one GitHub did not say is idle, and only an explicit false proves it.
+  if [ "$busy" -gt 0 ]; then
+    event INFO drain-probe "$host" "drain $host: idle proof failed -- $busy agent(s) busy on GitHub, every agent left registered" result=busy busy="$busy"
+    rm -f "$STATE_DIR/idle-$host"
+    WORKER_GATE_HELD=$((WORKER_GATE_HELD + 1))
+    DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
+    return 1
+  fi
+
+  # Counted from the same roster, before anything is deregistered.
+  # beacon_decision() reads it to tell "the boot script never ran" apart from
+  # "the publisher is broken on a host that DID register".
+  regs=$(printf '%s\n' "$ids" | grep -c '[0-9]')
+
   local zone
   zone=$(gcloud compute instances list --project="$PROJECT" \
     --filter="name=$host" --format="value(zone)" 2>/dev/null | head -1)
@@ -3166,22 +3233,14 @@ drain_host() {
   # A host that carries no `ci-host-os` was built from the template that existed
   # before the key, and on this pool that template is the controller's own OS:
   # one MIG, one instance template, one `var.host_os`, published to the hosts and
-  # to the controller from the same variable. Without this arm the pool cannot
-  # scale in at all — see instance_host_os() for why that state is permanent
-  # rather than transient — and for a Linux pool the fallback is the gate that
-  # `main` runs today, so it is not a new risk, it is the absence of a new one.
-  #
-  # It is NOT the inference PR 7 refuses. That one was "a missing key means
-  # linux" with nothing else to go on. This is scoped to a template generation
-  # that is provably Linux-only: Windows pools did not exist before the key, so
-  # an absent key on a Windows controller is anomalous and keeps.
+  # to the controller from the same variable. Windows pools did not exist before
+  # the key, so an absent key on a Windows controller is anomalous and keeps.
   if [ "$host_os" = "absent" ]; then
     if [ "$CONTROLLER_HOST_OS" = "linux" ]; then
       log "drain $host: LEGACY HOST — no ci-host-os on the instance, resolving to linux from this controller's own ci-host-os; it will carry the key once this delete replaces it"
       WORKER_GATE_OS_FALLBACK=$((WORKER_GATE_OS_FALLBACK + 1))
       host_os="linux"
     else
-      log "drain $host: no ci-host-os on the instance and this controller is ci-host-os=$CONTROLLER_HOST_OS, which cannot predate the key — leaving host up"
       host_os="unknown"
     fi
   fi
@@ -3191,74 +3250,59 @@ drain_host() {
     verdict=$(beacon_gate "$host" "$zone" "$regs")
     case "$verdict" in
       delete:*)
-        log "drain $host: beacon gate clear ($verdict)"
+        event INFO drain-probe "$host" "drain $host: idle proof passed -- 0 of $regs agent(s) busy, beacon clear ($verdict)" result=idle agents="$regs" beacon="$verdict"
         WORKER_GATE_CLEAR=$((WORKER_GATE_CLEAR + 1))
         ;;
       *)
-        log "drain $host: $verdict — leaving host up"
+        event INFO drain-probe "$host" "drain $host: idle proof failed -- $verdict, every agent left registered" result=beacon-keep beacon="$verdict"
         WORKER_GATE_HELD=$((WORKER_GATE_HELD + 1))
         DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
         return 1
         ;;
     esac
   elif [ "$host_os" != "linux" ]; then
-    # FAIL CLOSED, and this is a deliberate change to the Linux path's DEGRADED
-    # case. Until now an unreadable zone skipped the second gate entirely and
-    # the host was deleted anyway — a delete on a host nothing had been able to
-    # ask about. There is now a second way to arrive here (the OS itself is
-    # unreadable), and both answers are the same one: an unknown host is kept.
-    # A wrong keep bills for one host until the next tick; a wrong delete costs
-    # up to slots_per_host merge-blocking jobs, and nobody finds out from here.
-    log "drain $host: cannot establish how to ask this host for live workers (ci-host-os=$host_os, zone=${zone:-unknown}) — leaving host up"
+    # FAIL CLOSED. An unknown host is kept, and now it keeps its agents too.
     WORKER_GATE_UNDETERMINED=$((WORKER_GATE_UNDETERMINED + 1))
-    DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
+    drain_fail "$host" os-undetermined "cannot establish how to ask this host for live workers (ci-host-os=$host_os, zone=${zone:-unknown}) -- every agent left registered"
     return 1
-  fi
-
-  if [ "$host_os" = "linux" ]; then
-    # THIS GATE USED TO FAIL OPEN, WHICH IS THE ONE THING IT MAY NOT DO.
-    #
-    # It is the LAST question asked before the delete, and it was asked in a
-    # form that cannot tell "no workers" from "no answer": an ssh that failed,
-    # timed out, lost its IAP tunnel or hit a permission error produced an empty
-    # string, `[ -n "$workers" ]` was false, and control fell straight through
-    # to delete-instances. A host nothing had been able to ask about was deleted
-    # on the strength of not having answered -- and unlike the unknown-OS branch
-    # directly above, which fails CLOSED and says why, this one was silent about
-    # it. It was also the only gcloud call in this file with no `timeout`, so
-    # the failure it could not distinguish was also the failure it invited.
-    #
-    # An answer is now a COUNT or it is not an answer. Empty, non-numeric or a
-    # non-zero exit all mean the same thing they mean one branch up: unknown,
-    # therefore kept. A wrong keep bills for one host until the next tick; a
-    # wrong delete costs up to slots_per_host merge-blocking jobs.
-    local raw workers
-    raw=$(timeout "$WORKER_GATE_SSH_TIMEOUT" gcloud compute ssh "$host" \
-      --zone="$zone" --project="$PROJECT" \
-      --tunnel-through-iap --command 'pgrep -fc "Runner.Worker" || true' \
-      2>/dev/null) || raw=""
-    workers=$(printf '%s' "$raw" | tr -d '[:space:]')
-    case "$workers" in
-      '' | *[!0-9]*)
-        log "drain $host: the live-worker probe returned no usable count (got '${workers:-<empty>}'; ssh/IAP failure or ${WORKER_GATE_SSH_TIMEOUT}s timeout) — cannot prove this host is idle, leaving host up"
-        WORKER_GATE_UNDETERMINED=$((WORKER_GATE_UNDETERMINED + 1))
-        DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
-        return 1
-        ;;
-    esac
-    if [ "$workers" != "0" ]; then
-      log "drain $host: $workers job worker(s) still alive after deregistration — leaving host up"
-      WORKER_GATE_HELD=$((WORKER_GATE_HELD + 1))
-      DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
-      return 1
-    fi
+  else
+    event INFO drain-probe "$host" "drain $host: idle proof passed -- 0 of $regs agent(s) busy on GitHub" result=idle agents="$regs"
     WORKER_GATE_CLEAR=$((WORKER_GATE_CLEAR + 1))
   fi
 
+  # Only now, with the host proven idle, is anything deregistered. 422 is a job
+  # assigned since the roster read: abort, and the host keeps every agent that
+  # is still registered. Anything else is not an answer about the host at all.
+  for id in $ids; do
+    code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
+      -H "Authorization: Bearer $tok" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/$REPO_FULL/actions/runners/$id")
+    case "$code" in
+      204 | 404)
+        deregistered=$((deregistered + 1))
+        event INFO drain-deregister "$host" "drain $host: runner $id deregistered (HTTP $code)" runner_id="$id" http="$code"
+        ;;
+      422)
+        event WARNING drain-deregister "$host" "drain $host: runner $id refused deregistration (HTTP 422) -- a job started, aborting after $deregistered of $regs" runner_id="$id" http=422
+        rm -f "$STATE_DIR/idle-$host"
+        DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
+        return 1
+        ;;
+      *)
+        drain_fail "$host" deregister-failed "runner $id deregistration returned HTTP ${code:-none} -- aborting after $deregistered of $regs"
+        return 1
+        ;;
+    esac
+  done
+
+  # A failure HERE leaves a host with no agents, and that is recoverable: the
+  # next tick reads it as absent, the fresh roster confirms it, the proof passes
+  # with nothing to deregister, and the delete is retried.
   gcloud compute instance-groups managed delete-instances "$MIG" \
     --region="$REGION" --project="$PROJECT" \
     --instances="$host" >>"$LOG" 2>&1 || {
-      log "drain $host: delete-instances failed"
+      drain_fail "$host" delete-failed "delete-instances failed after deregistering $deregistered agent(s) -- retried next tick"
       return 1
     }
 
@@ -3268,7 +3312,7 @@ drain_host() {
   # no host to apply to.
   rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/seen-$host" "$STATE_DIR/beaconmiss-$host" \
     "$STATE_DIR/pinhold-$host" "$STATE_DIR/partial-$host"
-  log "drain $host: deregistered and deleted"
+  event INFO drain-delete "$host" "drain $host: deregistered $deregistered agent(s) and deleted" deregistered="$deregistered"
   DRAINED=$((DRAINED + 1))
   return 0
 }
@@ -3319,7 +3363,10 @@ cordon_host() {
       -H "Accept: application/vnd.github+json" \
       "https://api.github.com/repos/$REPO_FULL/actions/runners/$id")
     case "$code" in
-      204 | 404) gone=$((gone + 1)) ;;
+      204 | 404)
+        gone=$((gone + 1))
+        event INFO cordon-deregister "$host" "cordon $host: runner $id deregistered (HTTP $code)" runner_id="$id" http="$code"
+        ;;
       *)
         # 422: executing a job. Expected, and the entire mid-job guarantee.
         held=$((held + 1))
@@ -3327,7 +3374,7 @@ cordon_host() {
     esac
   done
 
-  log "cordon $host: $gone slot(s) removed from the pool, $held still finishing work"
+  event INFO cordon "$host" "cordon $host: $gone slot(s) removed from the pool, $held still finishing work" removed="$gone" held="$held"
   CORDONED=$((CORDONED + 1))
   return 0
 }
@@ -3411,6 +3458,7 @@ tick() {
 
   # One request per tick, every pool's series together.
   flush_series
+  flush_events || true
 }
 
 # tick_pool — everything that is true of ONE pool. Unchanged from the
@@ -3419,6 +3467,7 @@ tick() {
 tick_pool() {
   DRAINED=0
   DRAIN_ABORTED=0
+  DRAIN_ERRORS=0
   REAPED=0
   CORDONED=0
   RETIRED=0
@@ -3616,7 +3665,7 @@ tick_pool() {
 
     case "$verdict" in
       cordon:*)
-        log "$host: $verdict"
+        event INFO drain-decision "$host" "$host: $verdict" verdict="$verdict"
         if [ "$cordoned" -eq 0 ]; then
           recycling=$((recycling + 1))
         fi
@@ -3630,7 +3679,7 @@ tick_pool() {
         continue
         ;;
       retire:*)
-        log "$host: $verdict"
+        event INFO drain-decision "$host" "$host: $verdict" verdict="$verdict"
         draining=$((draining + 1))
         if [ "$cordoned" -eq 0 ]; then
           recycling=$((recycling + 1))
@@ -3704,7 +3753,7 @@ tick_pool() {
 
     case "$verdict" in
       drain:*)
-        log "$host: $verdict"
+        event INFO drain-decision "$host" "$host: $verdict" verdict="$verdict"
         draining=$((draining + 1))
         if drain_host "$host"; then
           # THE COUNT AND THE DISCOUNT MUST AGREE ON WHAT A HOST IS.
@@ -3821,6 +3870,12 @@ tick_pool() {
   queue_series "ci_mig_target_size" "$target"
   queue_series "ci_drain_verdicts" "$DRAINED" '"outcome":"drained"'
   queue_series "ci_drain_verdicts" "$DRAIN_ABORTED" '"outcome":"aborted"'
+  # A drain that could not COMPLETE -- the idle proof unreadable, a
+  # deregistration or a delete that failed. A subset of `aborted`, split out
+  # because it is the only one that is never the system working, and the one
+  # the "drain failing" policy alerts on. Nothing published it before #930, so
+  # that policy watched a series that could not exist.
+  queue_series "ci_drain_verdicts" "$DRAIN_ERRORS" '"outcome":"error"'
   # The SECOND delete gate, split out of ci_drain_verdicts because "aborted"
   # cannot distinguish the three things that stop a delete here, and only one of
   # them is the system working. `held` is the gate doing its job — a worker is

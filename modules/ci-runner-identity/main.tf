@@ -233,14 +233,13 @@ resource "google_project_iam_member" "compute" {
   member  = "serviceAccount:${local.controller_email}"
 }
 
-# The drain checks for live Runner.Worker processes over
-# `gcloud compute ssh --tunnel-through-iap` (controller-startup.sh) before it
-# deletes a host. That call needs iap.tunnelInstances.accessViaIAP, which
-# roles/compute.instanceAdmin.v1 does NOT include — so without this grant the
-# SSH fails, its failure is suppressed, the worker list comes back empty, and
-# the controller deletes the host having verified nothing. The pools that
-# predate the identity split carried the permission on the old runner account
-# and lost it when the controller moved to its own.
+# UNUSED since #930: the drain no longer checks for live Runner.Worker
+# processes over `gcloud compute ssh --tunnel-through-iap` -- it proves a host
+# idle from GitHub's `busy` flag (plus the Windows beacon) and never logs in to
+# a host. That probe never worked on OS Login hosts anyway: this role opens the
+# IAP tunnel, but the account was never granted an OS Login role, so sshd
+# refused it inside the guest. The grant is kept until its removal is approved
+# as the IAM change it is; tracked as a follow-up issue.
 resource "google_project_iam_member" "controller_iap_tunnel" {
   count   = var.grant_compute_admin && var.controller_service_account_email == "" ? 1 : 0
   project = var.project_id
