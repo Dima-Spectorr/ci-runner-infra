@@ -108,6 +108,47 @@ variable "grant_compute_admin" {
   default     = true
 }
 
+variable "controller_build_reader_role" {
+  description = <<-EOT
+    The role bound to the controller so its apply check can read builds. The
+    default is the predefined read-only role, which is what every consumer gets
+    unless it says otherwise.
+
+    It exists because the predefined role is wider than the check: the check
+    calls builds.get and builds.list and nothing else, while
+    roles/cloudbuild.builds.viewer also carries remotebuildexecution.blobs.get
+    — a data-plane read the controller has no use for. A project that cares
+    about that difference defines a custom role holding exactly the two build
+    permissions and names it here.
+
+    The second reason is the one that forced the variable. Some projects
+    deliberately deny their apply service account the ability to WRITE project
+    IAM — it holds resourcemanager.projects.getIamPolicy and nothing more — so
+    that a runner-infrastructure apply cannot change who can do what in the
+    project. In such a project this binding cannot be created by the apply at
+    all: google_project_iam_member calls setIamPolicy and gets a 403, on every
+    run, forever. There the binding is granted out of band by an IAM
+    administrator and ADOPTED by the apply through an `import` block in the
+    consuming root, and this variable is how the root tells the module which
+    role was granted so the imported state and the configuration agree.
+
+    Naming a project-scoped custom role here (projects/<id>/roles/<roleId>) is
+    the expected shape for that case; the value is passed through verbatim, so
+    an organisation-scoped custom role works identically.
+
+    Changing it rebinds: Terraform destroys the old binding and creates the new
+    one, which an apply account that cannot write project IAM cannot do. Change
+    it in the same change that moves the out-of-band grant.
+  EOT
+  type        = string
+  default     = "roles/cloudbuild.builds.viewer"
+
+  validation {
+    condition     = length(var.controller_build_reader_role) > 0
+    error_message = "controller_build_reader_role must name a role; leave it unset to use the predefined read-only role."
+  }
+}
+
 variable "create_controller_service_account" {
   description = <<-EOT
     Create a separate `<account_id>-ctl` identity for the pool CONTROLLER, and
