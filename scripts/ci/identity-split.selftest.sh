@@ -137,6 +137,21 @@ if matches "$(grep -c 'resource "google_project_iam_member" "controller_iap_tunn
 else
   bad "controller_iap_tunnel removed or undocumented — the apply SA cannot destroy project IAM; remove the binding out of band first (#932)"
 fi
+# 8b. The build-reader role is configurable, and its DEFAULT is the predefined
+#     read-only role. The variable exists for a project whose apply account
+#     cannot write project IAM at all: there the binding is granted out of band
+#     and adopted with an `import` block in the consuming root, so the role has
+#     to be nameable. A default that drifted away from the predefined role would
+#     rebind for every consumer of the floating major tag at its next apply —
+#     destroy plus create on project IAM, which is exactly the 403 this variable
+#     exists to route around.
+if matches "$(block 'resource "google_project_iam_member" "controller_build_reader"' "$IDENTITY/main.tf")" 'role[[:space:]]*=[[:space:]]*var\.controller_build_reader_role' &&
+  matches "$(block 'variable "controller_build_reader_role"' "$IDENTITY/variables.tf")" 'default[[:space:]]*=[[:space:]]*"roles/cloudbuild\.builds\.viewer"'; then
+  ok "build-reader role is a variable defaulting to the predefined read-only role"
+else
+  bad "controller_build_reader_role is missing, unused, or no longer defaults to roles/cloudbuild.builds.viewer — every consumer would rebind project IAM on its next apply"
+fi
+
 if grep -Eq '^[[:space:]]*role[[:space:]]*=[[:space:]]*"roles/compute\.os(Admin)?Login"' "$IDENTITY/main.tf"; then
   bad "ci-runner-identity grants an OS Login role — nothing in the controller logs in to a host"
 else
