@@ -241,14 +241,20 @@ else
   bad "reusing the runner tag should be refused, got rc=$rc: $out"
 fi
 
-# The Linux build must NOT need it — its communicator is SSH on 22, which the
-# existing iap_ssh rule already covers, and requiring it would make this change
-# a breaking one for every pool in the fleet.
+# The Linux build needs it too since #932: its communicator is SSH on 22, and
+# ci-runner-network now opens 22 to the image-builder tag and not (by default)
+# to the runner tag. Without it the Linux build waits out its SSH timeout.
 out="$(run_guard 'v3-0-0' '3133b15' 'us-central1-a' 'ci-runner' 'us-central1' 'linux' 'ci-runner-host' '')"; rc=$?
-if [ "$rc" -eq 0 ]; then
-  ok "a Linux build does not require an image-builder tag"
+if [ "$rc" -ne 0 ] && [[ "$out" == *'_IMAGE_BUILDER_NETWORK_TAG is empty'* ]]; then
+  ok "a Linux build with no image-builder tag is refused"
 else
-  bad "a Linux build should not require an image-builder tag, got rc=$rc: $out"
+  bad "a Linux build with no image-builder tag should be refused, got rc=$rc: $out"
+fi
+out="$(run_guard 'v3-0-0' '3133b15' 'us-central1-a' 'ci-runner' 'us-central1' 'linux' 'ci-runner-host' 'ci-runner')"; rc=$?
+if [ "$rc" -ne 0 ] && [[ "$out" == *'must not equal _NETWORK_TAG'* ]]; then
+  ok "a Linux build reusing the runner tag as the image-builder tag is refused"
+else
+  bad "a Linux build reusing the runner tag should be refused, got rc=$rc: $out"
 fi
 
 # Both correct pairings still pass, or the checks above are just a way of
@@ -295,14 +301,15 @@ fi
 
 # The builder tag has to reach the VM, not just the guard. A guard that
 # validates an input the packer step then drops is the worst of both: it passes
-# every test here and hangs in the build. The Linux tag list must stay a single
-# tag — the second one exists only to open 5986.
-tags_win="$(grep -c 'NETWORK_TAGS=.\[.\${_NETWORK_TAG}\".\"\${_IMAGE_BUILDER_NETWORK_TAG}\"\]' "$CONFIG" || true)"
-tags_lin="$(grep -c 'NETWORK_TAGS=.\[.\${_NETWORK_TAG}\"\]' "$CONFIG" || true)"
-if [ "$tags_win" -ge 1 ] && [ "$tags_lin" -ge 1 ] && grep -q 'network_tags=\$\$NETWORK_TAGS' "$CONFIG"; then
-  ok "the Windows builder carries both tags and the Linux builder only the runner tag"
+# every test here and hangs in the build. Since #932 EVERY builder carries both
+# tags (22 and 5986 are open only to the image-builder tag), so there must be
+# no single-tag list left for either OS to fall into.
+tags_both="$(grep -c 'NETWORK_TAGS=.\[.\${_NETWORK_TAG}\".\"\${_IMAGE_BUILDER_NETWORK_TAG}\"\]' "$CONFIG" || true)"
+tags_one="$(grep -c 'NETWORK_TAGS=.\[.\${_NETWORK_TAG}\"\]' "$CONFIG" || true)"
+if [ "$tags_both" -ge 1 ] && [ "$tags_one" -eq 0 ] && grep -q 'network_tags=\$\$NETWORK_TAGS' "$CONFIG"; then
+  ok "every builder carries both the runner and the image-builder tag"
 else
-  bad "the packer step does not pass the image-builder tag on Windows (win=$tags_win lin=$tags_lin)"
+  bad "the packer step does not pass the image-builder tag to every build (both=$tags_both single=$tags_one)"
 fi
 
 # The option that was tried and did not work. Its absence is asserted so that

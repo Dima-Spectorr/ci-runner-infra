@@ -142,6 +142,10 @@ gcloud compute ssh <controller-instance> --zone=<zone> --project=<project> \
   --tunnel-through-iap --command 'journalctl -u ci-controller -n 300 --no-pager'
 ```
 
+The controller has no SSH ingress by default (#932): set
+`iap_ssh_to_runner_hosts = true` on `ci-runner-network` and apply before this,
+and set it back afterwards.
+
 Look for `parked sweep: DENIED`, which names the status it got back — so a 403 is
 distinguishable from a transient 5xx by reading the line. Silence is the pass.
 

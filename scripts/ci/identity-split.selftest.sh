@@ -126,13 +126,15 @@ else
   bad "nothing rejects job_service_account_email == controller_service_account_email"
 fi
 
-# 8. The drain verifies live workers over IAP before deleting a host. Without
-#    the tunnel role that SSH fails, the failure is suppressed, and the host is
-#    deleted having verified nothing — a silent downgrade, not an outage.
-if grep -q 'roles/iap.tunnelResourceAccessor' "$IDENTITY/main.tf"; then
-  ok "controller holds the IAP tunnel role the drain probe needs"
+# 8. No login path from the controller onto a host (#932). The drain proves a
+#    host idle from GitHub's `busy` flag since #930 and never logs in, so an IAP
+#    tunnel or OS Login grant on the controller is standing access with no
+#    user. Asserted on role strings, not the old resource name, so a re-add
+#    under any name is caught.
+if grep -Eq '^[[:space:]]*role[[:space:]]*=[[:space:]]*"roles/(iap\.tunnelResourceAccessor|compute\.os(Admin)?Login)"' "$IDENTITY/main.tf"; then
+  bad "ci-runner-identity grants an IAP tunnel or OS Login role — nothing in the controller logs in to a host"
 else
-  bad "controller has no roles/iap.tunnelResourceAccessor — the drain's worker check cannot run"
+  ok "controller holds no IAP tunnel or OS Login role"
 fi
 
 # 9. The Windows host identity (ADR §3A). A Windows host cannot fence job code
@@ -291,9 +293,10 @@ fi
 #     project+role+member as the first identity's is not additive in any useful
 #     sense: it plans clean, applies clean, and then removing EITHER root
 #     revokes instance-admin from the account that deletes hosts in both pools.
-if matches "$(grep -c 'count   = var\.grant_compute_admin && var\.controller_service_account_email == "" ? 1 : 0' "$IDENTITY/main.tf")" '^2$' &&
+#     One such grant since #932 (instance-admin); the IAP tunnel grant is gone.
+if matches "$(grep -c 'count   = var\.grant_compute_admin && var\.controller_service_account_email == "" ? 1 : 0' "$IDENTITY/main.tf")" '^1$' &&
   matches "$(grep -c 'count   = var\.grant_compute_admin ? 1 : 0' "$IDENTITY/main.tf" || true)" '^0$'; then
-  ok "instance-admin and IAP are not re-granted to a controller account this module did not create"
+  ok "instance-admin is not re-granted to a controller account this module did not create"
 else
   bad "grant_compute_admin still writes project IAM on the reuse path — two resources on one binding, and either root's removal takes scale-in away from both pools"
 fi

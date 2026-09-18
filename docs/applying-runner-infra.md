@@ -495,12 +495,14 @@ module "ci_host_image_trigger" {
   # The EXISTING account the build runs as. This module mints no identity.
   service_account = "<existing-image-builder-sa>@<project>.iam.gserviceaccount.com"
 
-  # Where Packer's build VM runs, and which network it must sit on for the
-  # project's IAP-SSH rule to reach it.
-  zone        = "<zone>"
-  network     = var.network
-  subnetwork  = var.subnet_name
-  network_tag = module.ci_runner_network.runner_network_tag
+  # Where Packer's build VM runs, and which network it must sit on. The runner
+  # tag gives it egress; the image-builder tag is the only one the project's
+  # IAP-SSH (and WinRM) rule reaches (#932), and the build refuses without it.
+  zone                      = "<zone>"
+  network                   = var.network
+  subnetwork                = var.subnet_name
+  network_tag               = module.ci_runner_network.runner_network_tag
+  image_builder_network_tag = module.ci_runner_network.image_builder_network_tag
 
   # Required. Empty is the failure that arrives at the END of the build.
   image_storage_location = "<region>"
@@ -581,10 +583,12 @@ list off `packer/ci-host-image.pkr.hcl` rather than off the apply trigger:
 | `roles/iam.serviceAccountUser` | on the account attached to the build VM — creating a VM with a service account is `actAs` on that account |
 | `roles/logging.logWriter` | a build naming its own service account must write to Cloud Logging; without it the submission is refused, not merely quiet |
 
-The project also needs an IAP-SSH firewall rule targeting `network_tag` —
-`ci-runner-network` already creates one, and `network_tag` defaults to the tag
-it applies. A build VM on the wrong network or without the tag fails after boot,
-as an SSH timeout that reads like a broken image.
+The project also needs an IAP-SSH firewall rule reaching the build VM —
+`ci-runner-network` creates one, targeting its `image_builder_network_tag`
+output (not the runner tag, since #932), so pass that output as the trigger's
+`image_builder_network_tag`. Left unset, the build's `guard` step refuses in
+under a second; a build VM on the wrong network fails after boot, as an SSH
+timeout that reads like a broken image.
 
 ### The third prerequisite is a branch rule, not a permission
 

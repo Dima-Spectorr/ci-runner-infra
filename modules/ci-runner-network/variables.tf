@@ -34,9 +34,10 @@ variable "image_builder_network_tag" {
   type        = string
   default     = null
   description = <<-EOT
-    Network tag carried ONLY by the transient Packer VM that builds the Windows
-    golden image, and the only tag tcp:5986 (WinRM over TLS, which is how the
-    Windows template talks to its builder through the IAP tunnel) is opened to.
+    Network tag carried ONLY by the transient Packer VM that builds a golden
+    image. tcp:22 (the Linux template's SSH communicator) is opened to it, and
+    it is the only tag tcp:5986 (WinRM over TLS, which is how the Windows
+    template talks to its builder through the IAP tunnel) is opened to.
 
     Deliberately not `runner_network_tag`: a remote-management port on a
     long-lived host that runs untrusted lockfile code is a different thing from
@@ -47,10 +48,23 @@ variable "image_builder_network_tag" {
   EOT
 }
 
+variable "iap_ssh_to_runner_hosts" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Also open tcp:22 from the IAP range to `runner_network_tag` — every runner
+    host and the controller. Off by default (#932): since #930 nothing automated
+    logs in to a host (the controller proves idleness from GitHub's `busy` flag),
+    so the port would be surface with no user. Turn it on only for a debugging
+    session that needs a shell, and off again after. The image build does not
+    need it; it reaches its VM through the image-builder tag.
+  EOT
+}
+
 variable "iap_source_range" {
   type        = string
   default     = "35.235.240.0/20"
-  description = "Google IAP TCP-forwarding source range. SSH ingress, and WinRM ingress to the image builder, are allowed only from here."
+  description = "Google IAP TCP-forwarding source range. SSH and WinRM ingress to the image builder (and SSH to runner hosts, when iap_ssh_to_runner_hosts) are allowed only from here."
 }
 
 variable "health_check_source_ranges" {
