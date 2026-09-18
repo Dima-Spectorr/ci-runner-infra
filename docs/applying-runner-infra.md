@@ -694,6 +694,15 @@ publishing — and all four are conditions on the `applystale` alert policy. The
 grant behind them is `roles/cloudbuild.builds.viewer`, read-only, and applies
 only where this module created the controller account.
 
+The role is the identity module's `controller_build_reader_role`, defaulting to
+that predefined role. A project overrides it with a narrower project-scoped
+custom role holding exactly `cloudbuild.builds.get` and `cloudbuild.builds.list`
+— the predefined role also carries `remotebuildexecution.blobs.get`, which the
+check never uses. A project whose apply account deliberately cannot write
+project IAM has no other option: the binding is granted out of band and adopted
+into state with an `import` block in that project's own root, and this variable
+is what makes the configuration agree with what was imported.
+
 This does not make the trigger repair itself. It makes the out-of-band apply
 above something you are told to run rather than something you discover.
 

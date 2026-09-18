@@ -266,9 +266,22 @@ resource "google_project_iam_member" "controller_build_reader" {
   # grant_compute_admin: reading builds has nothing to do with deleting hosts,
   # and a project_iam_member re-written on the reuse path is one binding held by
   # two roots, where either root's removal revokes it for both pools.
+  #
+  # The role is a variable, and defaults to the predefined read-only one so no
+  # consumer changes by this being configurable. Two reasons a project overrides
+  # it. The predefined role is wider than the check — which calls builds.get and
+  # builds.list, and nothing else — because it also carries
+  # remotebuildexecution.blobs.get, a data-plane read the controller never
+  # makes. And a project may deny its APPLY account the ability to write project
+  # IAM at all, deliberately, so that a runner-infrastructure apply cannot
+  # change who can do what; there this binding can never be created from here,
+  # because google_project_iam_member calls setIamPolicy and is refused. Such a
+  # project has an IAM administrator grant a narrow custom role out of band,
+  # adopts the binding into state with an `import` block in its own root, and
+  # names the role it granted here so state and configuration agree.
   count   = local.controller_grants
   project = var.project_id
-  role    = "roles/cloudbuild.builds.viewer"
+  role    = var.controller_build_reader_role
   member  = "serviceAccount:${local.controller_email}"
 }
 
