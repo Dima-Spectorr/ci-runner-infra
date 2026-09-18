@@ -78,7 +78,7 @@ variable "controller_service_account_email" {
 
     Set it and this module creates NOTHING for the controller — not the account,
     and not one of its grants. Every controller grant here is either
-    project-level (metrics, logs, instance-admin) or on the one App-key
+    project-level (metrics, logs, instance-admin, IAP) or on the one App-key
     secret, so the first identity's copies already cover this pool. Writing them
     again would put two Terraform resources on one identical binding, and
     removing either would revoke it for both.

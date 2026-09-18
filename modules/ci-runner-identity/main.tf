@@ -94,7 +94,7 @@ locals {
   #
   # Reuse creates NOTHING for the controller: not the account, and not one of
   # its grants. Every controller grant this module writes is either project-level
-  # (metrics, logs, instance-admin) or on the one App-key secret, so the
+  # (metrics, logs, instance-admin, IAP) or on the one App-key secret, so the
   # first identity's copies already cover the second pool. Writing them again
   # from a second resource would put two Terraform resources on one identical
   # binding, where removing either one revokes it for both.
@@ -233,14 +233,17 @@ resource "google_project_iam_member" "compute" {
   member  = "serviceAccount:${local.controller_email}"
 }
 
-# NO IAP TUNNEL, NO OS LOGIN (#932). The controller used to hold
-# roles/iap.tunnelResourceAccessor for the drain's `gcloud compute ssh
-# --tunnel-through-iap` Runner.Worker probe. #930 replaced that probe with
-# GitHub's `busy` flag (plus the Windows beacon); the controller never logs in
-# to a host, so the grant was removed rather than left as standing access. It
-# never held an OS Login role, which is also why the probe never worked.
-# Re-adding either is re-adding a login path from the fleet's most privileged
-# account onto every host; identity-split.selftest.sh refuses it.
+# Unused since #931; kept because the apply SA cannot remove project IAM (403 on destroy) -- removal tracked in #932.
+# The drain proves a host idle from GitHub's `busy` flag (plus the Windows
+# beacon) and never logs in to a host, and runner hosts have no IAP-SSH ingress
+# by default, so this grant opens nothing an automated path uses. An IAM admin
+# removes the binding out of band, then this resource goes with it.
+resource "google_project_iam_member" "controller_iap_tunnel" {
+  count   = var.grant_compute_admin && var.controller_service_account_email == "" ? 1 : 0
+  project = var.project_id
+  role    = "roles/iap.tunnelResourceAccessor"
+  member  = "serviceAccount:${local.controller_email}"
+}
 
 # The controller is the only thing running in this project that can see whether
 # the project is still RECEIVING runner infrastructure. The apply trigger's build
