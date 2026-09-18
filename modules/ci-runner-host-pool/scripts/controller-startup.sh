@@ -71,10 +71,10 @@ flush_events() {
   iid=$(md "instance/id")
   zone=$(md "instance/zone")
   zone=${zone##*/}
-  body=$(tail -n "$EVENTS_MAX" "$batch" | jq -cs --arg log "projects/$PROJECT/logs/ci-controller" \
-    --arg p "$PROJECT" --arg i "$iid" --arg z "$zone" \
-    '{logName: $log,
-      resource: {type: "gce_instance", labels: {project_id: $p, instance_id: $i, zone: $z}},
+  body=$(tail -n "$EVENTS_MAX" "$batch" | jq -cs --arg lg_name "projects/$PROJECT/logs/ci-controller" \
+    --arg lg_project "$PROJECT" --arg lg_instance "$iid" --arg lg_zone "$zone" \
+    '{logName: $lg_name,
+      resource: {type: "gce_instance", labels: {project_id: $lg_project, instance_id: $lg_instance, zone: $lg_zone}},
       labels: {component: "ci-controller"},
       entries: map({severity: .severity, jsonPayload: del(.severity)})}' 2>/dev/null)
   rm -f "$batch"
