@@ -1789,9 +1789,16 @@ collect_hosts() {
   # Bare `instance` is not the answer either — in list-instances it renders as
   # the SCOPE, the bare zone name, rather than as the link. `.uri()` is the spelling that asks for the URI
   # and says so.
+  #
+  # `currentAction` is the fifth column, and LAST so an empty value cannot shift
+  # the self-link. It is the MIG's own word for what it is doing to the host,
+  # and the only one that tells OUR delete apart from a crash: drain_host()'s
+  # delete-instances returns once the MIG accepts it, so for the next tick or
+  # two the host still lists as STOPPING -- which drain rule 1 reads as a dead
+  # host to reap. See mig_action_in_flight().
   HOSTS=$(gcloud compute instance-groups managed list-instances "$MIG" \
     --region="$REGION" --project="$PROJECT" \
-    --format="csv[no-heading](name,instanceStatus,version.instanceTemplate.basename(),instance.uri())" 2>/dev/null)
+    --format="csv[no-heading](name,instanceStatus,version.instanceTemplate.basename(),instance.uri(),currentAction)" 2>/dev/null)
 }
 
 # One describe per tick for both facts we need from the MIG: the target size we
@@ -3509,7 +3516,7 @@ tick_pool() {
   # about. slots_known is the denominator that goes with it: without it a blind
   # tick and a fleet-wide outage produce the same pair of numbers.
   local slots_registered=0 slots_known=0
-  local host status host_tpl host_uri busy idle age verdict hold tpl cordoned recycling partial_for
+  local host status host_tpl host_uri host_action busy idle age verdict hold tpl cordoned recycling partial_for
   local skip_reason
 
   # Hosts already mid-recycle, counted BEFORE any decision this tick, so every
@@ -3578,13 +3585,13 @@ tick_pool() {
   fi
 
   # `IFS=,` on both walks, and it is not cosmetic — see collect_hosts.
-  while IFS=, read -r host status host_tpl host_uri; do
+  while IFS=, read -r host status host_tpl host_uri host_action; do
     [ -n "$host" ] || continue
     [ "$status" = "RUNNING" ] && pool_size=$((pool_size + 1))
     [ "$(template_state "$host_tpl")" = "stale" ] && stale_hosts=$((stale_hosts + 1))
   done <<<"$HOSTS"
 
-  while IFS=, read -r host status host_tpl host_uri; do
+  while IFS=, read -r host status host_tpl host_uri host_action; do
     [ -n "$host" ] || continue
 
     # Per HOST, not per pool. The walk is where a tick's minutes are actually
@@ -3628,6 +3635,16 @@ tick_pool() {
     # it. It is read from HOST_BUSY above, after host_facts.
     if [ "$MINT_REG" = "true" ] && [ -n "$host_uri" ]; then
       registration_token_step "$host" "$host_uri" "$HOST_REG" "$age" "$status" "$busy"
+    fi
+
+    # A host the MIG is already deleting or abandoning is past every verdict
+    # below. Asked before the recycle rule so neither the retire nor the drain
+    # path re-issues a delete the MIG is still carrying out -- the second
+    # delete-instances fails, and that failure surfaced as a drain-error on
+    # every ordinary scale-in.
+    if mig_action_in_flight "$host_action"; then
+      event INFO drain-decision "$host" "$host: keep:delete-in-progress action=$host_action status=${status:-none}" verdict=keep:delete-in-progress action="$host_action"
+      continue
     fi
 
     # The recycle rule is asked FIRST, and a cordon/retire verdict ends this
