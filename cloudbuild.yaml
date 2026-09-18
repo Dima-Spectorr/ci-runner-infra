@@ -44,11 +44,11 @@
 # _IMAGE_BUILDER_NETWORK_TAG=ci-runners-image-builder,\
 # _ZONE=<zone>,_SUBNETWORK=<subnet>,_IMAGE_VERSION=v1-0-0,_IMAGE_STORAGE_LOCATION=<region>
 #
-# _IMAGE_BUILDER_NETWORK_TAG is required for Windows and has no default: the
-# Windows template talks to its builder over WinRM/5986 through an IAP tunnel,
-# and ci-runner-network opens 5986 to that tag alone (its
-# `image_builder_network_tag` output). Apply that module before the first
-# Windows build, or the build hangs rather than failing.
+# _IMAGE_BUILDER_NETWORK_TAG is required for BOTH host OSes and has no default:
+# the Linux template talks to its builder over SSH/22 and the Windows one over
+# WinRM/5986, both through an IAP tunnel, and ci-runner-network opens those
+# ports to that tag alone (its `image_builder_network_tag` output). Apply that
+# module before the first build, or the build hangs rather than failing.
 #
 # --region and --gcs-source-staging-dir are NOT optional on an estate with
 # constraints/gcp.resourceLocations. Without them gcloud stages the source to
@@ -92,15 +92,16 @@ substitutions:
   _ZONE: ""
   _NETWORK: ""
   _SUBNETWORK: default
-  # Must match the tag the project's IAP-SSH firewall rule targets, or the
-  # tunnel to the (external-IP-less) build VM cannot be established.
+  # The runner tag: ci-runner-network's egress rules target it, so without it
+  # the build VM reaches nothing.
   _NETWORK_TAG: ci-runner
-  # Windows only, and required there. The tag ci-runner-network opens tcp:5986
-  # to — the port the Windows template's WinRM communicator reaches through the
-  # IAP tunnel. Empty by default because it must NOT be guessed: a value that
-  # no firewall rule targets fails as a 40-minute hang, and _NETWORK_TAG's own
-  # value would open a remote-management port on every runner host. Read it
-  # from the network module's `image_builder_network_tag` output.
+  # Required for BOTH host OSes (#932). The tag ci-runner-network opens tcp:22
+  # and tcp:5986 to from IAP — the ports the Linux (SSH) and Windows (WinRM)
+  # communicators reach the external-IP-less VM through. Empty by default
+  # because it must NOT be guessed: a value that no firewall rule targets fails
+  # as a 40-minute hang, and _NETWORK_TAG's own value would open remote-access
+  # ports on every runner host. Read it from the network module's
+  # `image_builder_network_tag` output.
   _IMAGE_BUILDER_NETWORK_TAG: ""
   _PACKER_VERSION: "1.11.2"
   _IMAGE_VERSION: ""
@@ -234,32 +235,34 @@ steps:
                 exit 1
                 ;;
             esac
-            # The tunnel, not the image. The Windows template connects over
-            # WinRM/5986 and ci-runner-network opens that port to exactly one
-            # tag; a build that does not carry it does not fail, it WAITS —
-            # "Waiting for WinRM to become available" until the plugin's
-            # timeout, which is the most expensive shape a missing input can
-            # take here. Refuse it in the guard instead, in under a second.
-            if [ -z "$$IMAGE_BUILDER_NETWORK_TAG" ]; then
-              echo "_HOST_OS is windows but _IMAGE_BUILDER_NETWORK_TAG is empty."
-              echo "The Windows build reaches its VM over WinRM/5986 through IAP,"
-              echo "and only the image-builder tag has that port open. Pass the"
-              echo "ci-runner-network module's image_builder_network_tag output."
-              exit 1
-            fi
-            if [ "$$IMAGE_BUILDER_NETWORK_TAG" = "$$NETWORK_TAG" ]; then
-              echo "_IMAGE_BUILDER_NETWORK_TAG must not equal _NETWORK_TAG."
-              echo "They are the same tag only if 5986 is open on every runner"
-              echo "host in the project — a remote-management port on machines"
-              echo "that run untrusted lockfile code and hold a GCP identity."
-              exit 1
-            fi
             ;;
           *)
             echo "_HOST_OS is '$$HOST_OS'; it must be 'linux' or 'windows'."
             exit 1
             ;;
         esac
+        # The tunnel, not the image — for BOTH host OSes since #932. The Linux
+        # template connects over SSH/22 and the Windows one over WinRM/5986, and
+        # ci-runner-network opens both ports from IAP to exactly one tag: the
+        # image-builder tag (22 no longer reaches the runner tag by default). A
+        # build that does not carry it does not fail, it WAITS — an SSH or WinRM
+        # timeout, the most expensive shape a missing input can take here.
+        # Refuse it in the guard instead, in under a second.
+        if [ -z "$$IMAGE_BUILDER_NETWORK_TAG" ]; then
+          echo "_HOST_OS is $$HOST_OS but _IMAGE_BUILDER_NETWORK_TAG is empty."
+          echo "The build reaches its VM through IAP (SSH/22 on Linux, WinRM/5986"
+          echo "on Windows), and only the image-builder tag has those ports open."
+          echo "Pass the ci-runner-network module's image_builder_network_tag"
+          echo "output (ci-host-image-trigger: image_builder_network_tag)."
+          exit 1
+        fi
+        if [ "$$IMAGE_BUILDER_NETWORK_TAG" = "$$NETWORK_TAG" ]; then
+          echo "_IMAGE_BUILDER_NETWORK_TAG must not equal _NETWORK_TAG."
+          echo "They are the same tag only if 22 and 5986 are open on every runner"
+          echo "host in the project — remote-access ports on machines that run"
+          echo "untrusted lockfile code and hold a GCP identity."
+          exit 1
+        fi
         [ -n "$$ZONE" ] || { echo "_ZONE is required"; exit 1; }
         [ -n "$$NETWORK_TAG" ] || { echo "_NETWORK_TAG is required (IAP firewall target tag)"; exit 1; }
         # Required, not optional: leaving it to GCE picks a multi-region that
@@ -320,16 +323,13 @@ steps:
         # the Windows template `vuln_fail_on` would not be harmlessly ignored,
         # it would end the build before the first provisioner.
         #
-        # THE WINDOWS BUILDER CARRIES TWO TAGS. The runner tag is what the
-        # egress allows in ci-runner-network target, so it is needed to reach
-        # anything at all; the image-builder tag is the only one tcp:5986 is
-        # opened to, and 5986 is how this template's WinRM communicator reaches
-        # the VM through the IAP tunnel. Neither alone is enough, and the
-        # Linux build needs only the first — its communicator is SSH on 22.
-        NETWORK_TAGS='["${_NETWORK_TAG}"]'
-        if [ '${_HOST_OS}' = windows ]; then
-          NETWORK_TAGS='["${_NETWORK_TAG}","${_IMAGE_BUILDER_NETWORK_TAG}"]'
-        fi
+        # EVERY BUILDER CARRIES TWO TAGS. The runner tag is what the egress
+        # allows in ci-runner-network target, so it is needed to reach anything
+        # at all; the image-builder tag is the only one tcp:22 and tcp:5986 are
+        # opened to from IAP, and those are how the Linux (SSH) and Windows
+        # (WinRM) communicators reach the VM through the tunnel. Neither alone
+        # is enough. Since #932 the runner tag no longer has 22 open by default.
+        NETWORK_TAGS='["${_NETWORK_TAG}","${_IMAGE_BUILDER_NETWORK_TAG}"]'
         set -- \
           -var "project_id=$PROJECT_ID" \
           -var "zone=${_ZONE}" \

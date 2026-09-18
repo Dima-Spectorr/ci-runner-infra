@@ -15,7 +15,9 @@
 # in by self-link / name; this module only adds the firewall rules.
 #
 # Resources:
-#   google_compute_firewall (iap)    — tcp:22 ingress from the IAP range only
+#   google_compute_firewall (iap)    — tcp:22 from the IAP range, to the
+#                                      image-builder tag (runner hosts only
+#                                      when var.iap_ssh_to_runner_hosts)
 #   google_compute_firewall (winrm)  — tcp:5986 from the IAP range, to the
 #                                      image-builder tag ONLY (never a runner)
 #   google_compute_firewall (health) — health-check ranges -> tagged VMs
@@ -55,8 +57,22 @@ locals {
   firewall_log_metadata = "INCLUDE_ALL_METADATA"
 }
 
-# IAP SSH — operators reach the no-external-IP VMs only through
-# `gcloud compute ssh --tunnel-through-iap`. No broad 0.0.0.0/0:22.
+# IAP SSH — the LINUX GOLDEN-IMAGE BUILD, and runner hosts only on request.
+#
+# `packer/ci-host-image.pkr.hcl` builds with `omit_external_ip = true` and
+# `use_iap = true` over the SSH communicator, so its transient build VM needs
+# tcp:22 from the IAP range. That VM carries the image-builder tag (the root
+# cloudbuild.yaml puts it on every build, Linux and Windows), so that is what
+# this rule targets.
+#
+# RUNNER HOSTS ARE NOT TARGETED BY DEFAULT (#932). The controller's idle probe
+# was the only automated consumer of tcp:22 on a runner host, and #930 replaced
+# it with GitHub's `busy` flag; a port open on a machine that runs untrusted
+# lockfile code and holds a GCP identity is then surface with no user.
+# `iap_ssh_to_runner_hosts = true` re-adds the runner tag for an operator who
+# needs a shell on a host (or on the controller, which carries the same tag).
+# The rule's address and name do not change, so flipping it is an in-place
+# update of target_tags, not a replace.
 resource "google_compute_firewall" "iap_ssh" {
   project = var.project_id
   name    = "${var.name_prefix}-allow-iap-ssh"
@@ -64,15 +80,15 @@ resource "google_compute_firewall" "iap_ssh" {
 
   direction     = "INGRESS"
   source_ranges = [var.iap_source_range]
-  target_tags   = [var.runner_network_tag]
+  target_tags   = concat([local.image_builder_network_tag], var.iap_ssh_to_runner_hosts ? [var.runner_network_tag] : [])
 
   allow {
     protocol = "tcp"
     ports    = ["22"]
   }
 
-  # Who reached a warm host, and when. Low volume by nature — a human opening a
-  # tunnel — and the one ingress worth a record.
+  # Who reached a build VM (or, opted in, a warm host), and when. Low volume by
+  # nature — one build, or a human opening a tunnel — and worth a record.
   dynamic "log_config" {
     for_each = local.log_allowed ? [1] : []
     content {

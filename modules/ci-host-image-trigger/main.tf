@@ -103,6 +103,9 @@ locals {
     var.image_version == null ? {} : { _IMAGE_VERSION = var.image_version },
     var.runner_version == null ? {} : { _RUNNER_VERSION = var.runner_version },
     var.packer_version == null ? {} : { _PACKER_VERSION = var.packer_version },
+    # Omitted when null so the build's guard names the missing input, instead of
+    # receiving "" and the caller reading an empty value as a deliberate one.
+    var.image_builder_network_tag == null ? {} : { _IMAGE_BUILDER_NETWORK_TAG = var.image_builder_network_tag },
   )
 }
 

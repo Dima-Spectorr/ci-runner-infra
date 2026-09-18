@@ -109,7 +109,13 @@ variable "subnetwork" {
 variable "network_tag" {
   type        = string
   default     = "ci-runner"
-  description = "Network tag put on the build VM (`_NETWORK_TAG`). MUST match the tag the project's IAP-SSH firewall rule targets, or the tunnel to the (external-IP-less) build VM never opens and Packer waits out its SSH timeout. Defaults to the tag `ci-runner-network` applies."
+  description = "Runner network tag put on the build VM (`_NETWORK_TAG`) — the tag `ci-runner-network`'s egress rules target, so the build VM can reach anything at all. Defaults to the tag `ci-runner-network` applies. It no longer carries the IAP tunnel: that is `image_builder_network_tag` (#932)."
+}
+
+variable "image_builder_network_tag" {
+  type        = string
+  default     = null
+  description = "Image-builder network tag put on the build VM (`_IMAGE_BUILDER_NETWORK_TAG`) — pass `ci-runner-network`'s `image_builder_network_tag` output. It is the only tag tcp:22 (Linux SSH communicator) and tcp:5986 (Windows WinRM) are opened to from IAP, so the build cannot reach its external-IP-less VM without it. Required by the build for BOTH host OSes; left null it is not sent and the build's `guard` step refuses in under a second, naming this input, rather than Packer waiting out its SSH timeout. Not defaulted because it must not be guessed: it derives from the network module's name_prefix."
 }
 
 variable "image_family" {

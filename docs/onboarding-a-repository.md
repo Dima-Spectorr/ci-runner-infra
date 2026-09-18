@@ -141,7 +141,7 @@ module "ci_runner_pool" {
 }
 ```
 
-`module.ci_runner_network` (IAP-SSH + health-check ingress, narrowed egress, an
+`module.ci_runner_network` (IAP ingress to the image builder only, health-check ingress, narrowed egress, an
 explicit deny-all, and database egress to private addresses only) is per
 *project*, not per pool. Instantiate it once; if the project already runs a pool,
 reuse the existing tag instead of declaring a second copy.
@@ -402,7 +402,10 @@ gcloud compute instance-groups managed describe <name>-hosts \
 A host that boots but registers **zero** slots is the expected shape of a
 *safety* failure, not a mystery: the startup script refuses to register agents if
 it cannot mask the rootful Docker daemon or cannot install the metadata fence.
-Read `/var/log/ci-host.log` on the host over IAP-SSH.
+Read `/var/log/ci-host.log` on the host. Runner hosts have no SSH ingress by
+default (#932); for the debugging session set `iap_ssh_to_runner_hosts = true`
+on `ci-runner-network`, apply, `gcloud compute ssh <host> --tunnel-through-iap`,
+and set it back afterwards.
 
 `0` in check 3 on an idle repository is scale-to-zero working, not a broken
 pool. Compare against the queue before treating it as an outage.
@@ -1024,7 +1027,7 @@ it as a broken image.
 |---|---|
 | jobs queue forever, no error | `runner_labels` vs `runs-on` (§2) |
 | hosts run, zero slots registered | `/var/log/ci-host.log` — the fail-closed guards (§5) |
-| pool never scales in | the IAP firewall tag: the drain proves a host idle over IAP-SSH, and a host outside the rule fails that probe |
+| pool never scales in | the controller's drain events in Cloud Logging (`logs/ci-controller`): since #930 it proves a host idle from GitHub's `busy` flag (plus the beacon on Windows), so a refusal names the gate that stopped it — no firewall rule is involved |
 | pool never scales out | `ci_demand` on the pool. A flat 0 with jobs queued is a label-set mismatch, not a quiet fleet — the controller matches the configured labels PLUS the agent's read-only three (§2), folded. `ci_demand` non-zero and hosts flat is `max_hosts`, or an expired queue: check `ci_demand_expired` |
 | first host never registers | the App key secret version (§3) |
 | a Windows job fails at "Initialize containers" | `container:`/`services:` on a Windows pool — there is no container runtime. `check-runner-policy.sh` (`RUNNER8`) catches this in your own CI |
