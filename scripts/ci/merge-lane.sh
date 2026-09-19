@@ -1773,11 +1773,18 @@ lane_report_refusal() {
       # per refused sha — `already_commented_refusal` is the marker, same
       # pattern as `already_released` above — so a base that stays disagreed
       # for several passes does not get commented on every single one.
+      # `|| true`, deliberately unlike `already_released`'s comment below: this
+      # candidate is already being skipped rather than merged, so a comment
+      # that fails to post must not, under `set -e`, take the WHOLE PASS down
+      # with it — that would turn a one-candidate refusal back into the exact
+      # head-of-line block this case exists to end. Logged, not swallowed.
       if [ -n "$sha" ] && ! already_commented_refusal "$num" "$sha"; then
-        gh api "repos/$R/issues/$num/comments" -f body="$(printf '%s\n\n%s\n\n%s\n' \
+        if ! gh api "repos/$R/issues/$num/comments" -f body="$(printf '%s\n\n%s\n\n%s\n' \
           "The merge lane tried to merge this pull request and GitHub refused: \`$err\`." \
           "The lane's own read of ${sha:0:8} called the required checks green; GitHub's ruleset disagreed at merge time, most likely because a newer check run for the same commit was still in flight. This pull request was skipped for this pass — not demoted — and the lane will try it again on the next pass once the disagreement resolves itself." \
-          "$(refused_marker "$sha")")" --silent 2>/dev/null || true
+          "$(refused_marker "$sha")")" --silent 2>&1; then
+          echo "::warning::could not comment #$num's skip — it is still visible above, in the run log" >&2
+        fi
       fi
       return 2
       ;;
