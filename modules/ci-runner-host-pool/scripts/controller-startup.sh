@@ -3409,7 +3409,7 @@ cordon_host() {
     if [ -z "$zone" ]; then
       # No zone means no instance to address, and a guessed one is a call
       # against some other machine. Same refusal registration_token_step makes.
-      log "cordon $host: no zone in the MIG self-link — cannot set ci-cordon, the cordon falls back to deregistration alone"
+      log "cordon $host: no zone in the instance self-link — cannot set ci-cordon, the cordon falls back to deregistration alone"
     elif timeout 60 gcloud compute instances add-metadata "$host" \
       --project="$PROJECT" --zone="$zone" \
       --metadata=ci-cordon=1 >/dev/null 2>&1; then
@@ -3778,9 +3778,10 @@ tick_pool() {
         # dark rather than merely un-recycled. The marker is already written, so
         # the next tick resumes this host's cordon where this one stopped.
         # `$host_uri` and not just the name: the host-side half of the cordon is
-        # a setMetadata, and a setMetadata needs the zone, which only the MIG's
-        # self-link carries. An empty uri is handled inside — it disables that
-        # half rather than guessing a zone.
+        # a setMetadata, and a setMetadata needs the zone, which only the
+        # instance self-link carries — the MIG's managed-instance list is where
+        # the tick already reads it from. An empty uri is handled inside: it
+        # disables that half rather than guessing a zone.
         cordon_host "$host" "$host_uri" || log "$host: cordon incomplete — retrying next tick"
         continue
         ;;

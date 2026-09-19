@@ -298,7 +298,8 @@ d=$(sed -n '/^variable "recycle_cordon_stops_agents"/,/^}/p' "$POOL_TF/variables
   grep -oE 'default *= *(true|false)' | grep -oE '(true|false)')
 check "the pool module ships the cordon flag off" false "$d"
 
-# The zone is derived from the MIG self-link the tick already holds. Called with
+# The zone is derived from the instance self-link the tick already holds — the
+# one the MIG's managed-instance list hands it. Called with
 # one argument the function still deregisters, so the loss is invisible: the
 # cordon simply never converges.
 # shellcheck disable=SC2016  # the `$host`/`$host_uri` here are source text being
