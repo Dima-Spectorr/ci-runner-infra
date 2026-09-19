@@ -698,14 +698,36 @@ that image a real answer is separate work, not a line in this one.
   The image bakes the pinned runtime once, as an **archive** at
   `/opt/ci-tool-cache` — root-owned, mode `0444`, with its `SHA256SUMS` and a
   `MANIFEST` of `<tool>	<version>	<arch>	<archive>` rows taken at bake time.
-  Boot verifies the digest once, then extracts one private copy per slot into
-  `/var/lib/ci-cache/<idx>/tools/<tool>/<version>/<arch>` plus the sibling
-  `<arch>.complete` marker `@actions/tool-cache`'s `find()` tests for, and points
-  the agent unit at it with `RUNNER_TOOL_CACHE` **and** `AGENT_TOOLSDIRECTORY`
-  (`HostContext.cs` reads the first, older agents the second; neither is inherited
-  from anything, so both are set explicitly). That path is outside every `_work`
-  and outside every `$HOME`, so **the sweep does not touch it** and the runtime
-  survives for the life of the host.
+  `/opt/ci/job-hooks/seed-tool-cache.sh` verifies that archive and extracts one
+  private copy per slot into `/var/lib/ci-cache/<idx>/tools/<tool>/<version>/<arch>`
+  plus the sibling `<arch>.complete` marker `@actions/tool-cache`'s `find()` tests
+  for, and the agent unit is pointed at it with `RUNNER_TOOL_CACHE` **and**
+  `AGENT_TOOLSDIRECTORY` (`HostContext.cs` reads the first, older agents the second;
+  neither is inherited from anything, so both are set explicitly). That path is
+  outside every `_work` and outside every `$HOME`, so **the sweep does not empty
+  it** — the archive in `/opt` is what survives for the life of the host.
+
+  **The slot's copy is rebuilt from that archive at every job boundary**, which is
+  a security requirement and not tidiness. Moving the cache out of `_work` makes it
+  the first slot-writable tree of directly-executed binaries to outlive a job: the
+  runner's own `<work>/_tool` was inside the tree the reset renames away, so a job
+  that rewrote `bin/node` lost it at the boundary. The seeder therefore runs from
+  the reset on `completed` and `boot` (`started` would re-extract a tree that has
+  already been replaced), moving the slot's copy aside *before* it reads the master
+  so that "could not verify the master" cannot leave a job's leftovers in place. A
+  job may write in the tree freely — the `setup-*` actions must be able to — and
+  one local extraction, against the ~21s download it replaces, is the price of
+  bounding that write.
+
+  A read-only shared directory was the alternative and does not work: it turns
+  every cache *miss* into `EACCES` rather than the download it should be, and
+  breaks `npm i -g`, which writes inside the runtime's own tree. Making only the
+  baked version read-only fails for a subtler reason — its parent has to stay
+  slot-writable for a second version to be installed beside it, and a writable
+  parent lets the slot rename the read-only tree aside. When the seeder gives up it
+  leaves an **empty slot-owned** directory behind, because the agent unit already
+  carries `RUNNER_TOOL_CACHE` and a missing directory there would fail the job
+  instead of downloading.
 
   An **archive** rather than an extracted tree under `/opt/ci-cache` for two
   reasons: a Node install is full of relative symlinks (`bin/npx` →
@@ -715,8 +737,10 @@ that image a real answer is separate work, not a line in this one.
   same shape `/opt/ci-images` already uses for content that gets executed.
 
   The master is **read-mostly and never written at job time**: root verifies and
-  reads it, each slot writes only its own copy, so concurrent cross-slot reads are
-  all that ever happens to it and there is no race to lose. The copy is writable
+  reads it — on every seed, not once per boot, because "it was good at boot" is not
+  a statement about the bytes an extraction two hundred jobs later is about to run
+  — and each slot writes only its own copy, so concurrent cross-slot reads are all
+  that ever happens to it and there is no race to lose. The copy is writable
   and slot-owned on purpose — a job that asks for a runtime this image did not
   bake, or runs `npm i -g`, must get a download and not an `EACCES`.
 
@@ -744,6 +768,8 @@ that image a real answer is separate work, not a line in this one.
     baked node 24.21.0`. It is a report and not a control — the slot owns that
     directory and root only reads names in it — which is the right shape: a slot
     that lies about its own miss has chosen to be slow, and reaches nothing else.
+    The report is bounded at 32 markers and the names are sanitised before they
+    reach the log, because both the count and the text are the job's to choose.
 
   The pin itself lives in `packer/ci-host-image.pkr.hcl` as
   `tool_cache_node_version` + `tool_cache_node_sha256`, and it is the *build*
@@ -761,7 +787,9 @@ that image a real answer is separate work, not a line in this one.
   bounds keep that survival finite. A pool serves one repository, so an entry can
   only reach jobs from the repository that produced it. The writable cache is per
   slot, so it reaches *later jobs on that slot* and never a job running beside it
-  — that is the bound the rejected shared tree did not have. And it lives on the
+  — that is the bound the rejected shared tree did not have. (The tool cache is
+  narrower still: it is rebuilt from the verified archive at every job boundary, so
+  nothing a job wrote there reaches even the next job on the same slot.) And it lives on the
   host's own disk: `/var/lib/ci-cache` is built at boot, survives a reboot, and
   dies when the instance is deleted, so a poisoned entry cannot outlive a
   recycle.
