@@ -31,6 +31,10 @@ HEALTHY_POOL="$HEALTHY_POOL;enabled=true;armed=true;app_id=1;app_key=1"
 HEALTHY_POOL="$HEALTHY_POOL;checks_match=1;ruleset=1;runners=4;online=4"
 HEALTHY_POOL="$HEALTHY_POOL;corpses=0;demand=0;settled=0;page=50"
 
+# The source repository with nothing waiting to be published. Every backlog
+# case below is this string with one fact changed.
+HEALTHY_SOURCE="tier=source;tag_readable=1;backlog=0;backlog_hours=0"
+
 # has <expected-substring> <description> <facts>
 has() {
   local want="$1" desc="$2" facts="$3" got
@@ -96,9 +100,9 @@ hasnt "no-merge-lane" "a checks repository is never reported as missing the lane
 has "ok:compliant" "an empty repository is compliant" "tier=empty;has_ci=0"
 has "fail:empty-repo-has-ci" "an empty repository that grew CI must be reclassified" \
   "tier=empty;has_ci=1"
-has "ok:compliant" "the source repository has no pin to itself" "tier=source"
+has "ok:compliant" "the source repository has no pin to itself" "$HEALTHY_SOURCE"
 hasnt "pin-stale" "the source repository is never reported as stale" \
-  "tier=source;lane_pin=$OLD;want_pin=$WANT"
+  "$HEALTHY_SOURCE;lane_pin=$OLD;want_pin=$WANT"
 
 # --- onboarding ---------------------------------------------------------------
 has "fail:no-merge-lane" "a pool repository with no lane is a failure" \
@@ -225,6 +229,148 @@ has "fail:queued-page-full" "a full page of corpses is a failure" "$(swap corpse
 hasnt "queued-page" "a handful of corpses is not yet a finding" "$(swap corpses 3)"
 hasnt "queued-page" "an unknown corpse count does not divide by an unknown page" \
   "$(swap page '')"
+
+# --- the unreleased backlog ---------------------------------------------------
+#
+# #960: `afc9bf3` merged to the default branch touching `scripts/`, moved no
+# version, and therefore reached no consumer — and every gate stayed green,
+# because none of them asks that question. Bumping per pull request is NOT the
+# fix and is not what is asserted here: two pull requests in flight both pick
+# the same next number and the loser reddens the default branch for every open
+# pull request, which is why the number is batched into a later
+# `chore(release)`. What was missing is a bound on how long that batch may sit.
+#
+# The default is 72 hours. Measured over 120 released-surface merges on this
+# repository, 119 were swept up inside 53 hours and the one omission sat 227.
+# The cases below are written against the constant rather than a literal, so a
+# change to the number does not silently make them assert nothing.
+MAXH="$FLEET_BACKLOG_MAX_HOURS_DEFAULT"
+OVER=$((MAXH + 1))
+YOUNG=$((MAXH - 1))
+
+has "ok:compliant" "an empty backlog is the healthy end state" "$HEALTHY_SOURCE"
+has "backlog=0" "and it says so with a number, not just a word" "$HEALTHY_SOURCE"
+hasnt "unreleased-backlog" "an empty backlog produces no backlog finding" "$HEALTHY_SOURCE"
+
+# A BATCH ON ITS WAY IS NOT A DEFECT. This is the state five of the last eight
+# released-surface merges were in, deliberately, and an audit that reports it
+# is an audit that reports the repository's normal Tuesday.
+YOUNG_BACKLOG="tier=source;tag_readable=1;backlog=4;backlog_hours=$YOUNG"
+hasnt "fail:" "a backlog under the ceiling is not a failure" "$YOUNG_BACKLOG"
+hasnt "warn:" "nor a warning" "$YOUNG_BACKLOG"
+has "ok:compliant" "a young backlog reads compliant rather than silent" "$YOUNG_BACKLOG"
+# Reported WITH its numbers, so a reader can watch a batch approach the ceiling
+# instead of meeting it for the first time on the day it crosses.
+has "backlog=4 oldest=${YOUNG}h max=${MAXH}h" "and carries what it is waiting on" "$YOUNG_BACKLOG"
+
+# THE FINDING THE WHOLE RULE EXISTS FOR.
+OLD_BACKLOG="tier=source;tag_readable=1;backlog=4;backlog_hours=$OVER"
+has "fail:unreleased-backlog" "work older than the ceiling is a failure" "$OLD_BACKLOG"
+has "commits=4 oldest=${OVER}h max=${MAXH}h" "and says how much, how old, and against what" "$OLD_BACKLOG"
+has "open-a-chore-release-pull-request" "and what to do about it" "$OLD_BACKLOG"
+hasnt "ok:compliant" "a failing repository never also reads compliant" "$OLD_BACKLOG"
+# The boundary itself. `-gt` here would let a backlog sit exactly on the
+# ceiling forever and report it as healthy.
+has "fail:unreleased-backlog" "exactly at the ceiling is already too long" \
+  "tier=source;tag_readable=1;backlog=1;backlog_hours=$MAXH"
+
+# THE TAG IS THE FLOOR OF THE WHOLE MEASUREMENT. `git fetch --tags` does not
+# move a local tag that already exists, so a stale read is the expected failure
+# rather than an exotic one — and an unreadable floating tag is not a missing
+# observation, it is the ref every consumer in the fleet pins being gone or
+# pointing at something no release produced. publish-tag.yml fails the release
+# rather than move a tag on an unreadable version; this takes the same stance.
+NO_TAG="tier=source;tag_readable=0"
+has "fail:release-tag-unreadable" "an unreadable floating tag is a failure" "$NO_TAG"
+hasnt "backlog=0" "an unreadable tag never reads as an empty backlog" "$NO_TAG"
+hasnt "ok:compliant" "nor as compliant" "$NO_TAG"
+
+# An unknown that is only an unknown: the tag resolved, the comparison did not.
+has "warn:unreleased-backlog-unknown" "a comparison that failed is reported, not passed" \
+  "tier=source;tag_readable=1"
+hasnt "backlog=0" "and is never rendered as an empty backlog" "tier=source;tag_readable=1"
+has "warn:unreleased-backlog-age-unknown" "a backlog whose age is unknown is reported" \
+  "tier=source;tag_readable=1;backlog=9"
+hasnt "ok:compliant" "and is never read as young" "tier=source;tag_readable=1;backlog=9"
+# `[ x -ge y ]` on a non-numeric operand exits 2, which is falsey — so a
+# malformed fact would take the "not over the ceiling" branch and pass quietly.
+has "warn:unreleased-backlog-unknown" "a malformed count is a finding, not a silent pass" \
+  "tier=source;tag_readable=1;backlog=lots"
+has "warn:unreleased-backlog-age-unknown" "a malformed age is a finding, not a silent pass" \
+  "tier=source;tag_readable=1;backlog=9;backlog_hours=ages"
+hasnt "fail:unreleased-backlog commits" "a malformed age is not reported as over the ceiling" \
+  "tier=source;tag_readable=1;backlog=9;backlog_hours=ages"
+
+# THE OPT-OUT, and the one thing it must not do: be quiet. `0` is how every
+# numeric knob in merge-lane.yml spells "off". A watchdog somebody disabled and
+# a watchdog that found nothing must not render the same line.
+OFF="tier=source;tag_readable=1;backlog=99;backlog_hours=99999;backlog_max_hours=0"
+hasnt "fail:" "the opt-out suppresses the finding" "$OFF"
+has "backlog-watchdog=off" "and says out loud that it is off" "$OFF"
+# An unset knob must arm the watchdog, not disable it — the inverse of the
+# `require-label` polarity, and the reason the workflow may wire it straight to
+# a variable.
+has "fail:unreleased-backlog" "an unset ceiling falls back to the default, armed" \
+  "tier=source;tag_readable=1;backlog=2;backlog_hours=$OVER;backlog_max_hours="
+# An operator-supplied ceiling is honoured.
+has "fail:unreleased-backlog" "a tightened ceiling is honoured" \
+  "tier=source;tag_readable=1;backlog=2;backlog_hours=5;backlog_max_hours=4"
+hasnt "fail:" "a loosened ceiling is honoured" \
+  "tier=source;tag_readable=1;backlog=2;backlog_hours=5;backlog_max_hours=400"
+
+# No other tier grows a backlog finding: every consumer repository pins this
+# one, so the question is meaningless for them and a line per repository per
+# day is how an audit gets ignored.
+for t in pool lane checks dormant empty; do
+  hasnt "unreleased-backlog" "tier=$t is never audited for an unreleased backlog" \
+    "tier=$t;has_ci=1;has_lane=1;has_guard=1;has_reaper=1;want_pin=$WANT;lane_pin=$WANT;guard_pin=$WANT;reaper_pin=$WANT;enabled=true;armed=true;app_id=1;app_key=1;checks_match=1;ruleset=1;runners=1;online=1;corpses=0;demand=0;settled=0;page=50"
+done
+
+# --- what counts as a released surface ----------------------------------------
+#
+# The rule above is handed a COUNT; which paths produced it is decided by the
+# collector's pattern, so the exemptions are asserted against that pattern
+# directly. A backlog made only of exempt paths must count zero, or the
+# watchdog fires on documentation.
+#
+# `packer/` is exempt on evidence, not on taste: the host image is built by a
+# push-to-branch Cloud Build trigger (modules/ci-host-image-trigger/main.tf,
+# `branch = local.branch_regex`, `^main$` by default) reading
+# `packer/ci-host-image.pkr.hcl` from that workspace. No `?ref=` pin reaches
+# into that path, so a packer change is published by the merge itself.
+COLLECTOR="$HERE/fleet-audit.sh"
+SURFACE=$(grep -oE 'RELEASED_SURFACE="\$\{RELEASED_SURFACE:-[^}]*\}"' "$COLLECTOR" \
+  | sed -E 's/.*:-(.*)\}"/\1/')
+if [ -z "$SURFACE" ]; then
+  FAIL=$((FAIL + 1))
+  printf 'FAIL: could not read RELEASED_SURFACE out of %s — every case below would be vacuous\n' "$COLLECTOR"
+else
+  surface_says() { # <expected: yes|no> <path>
+    local want="$1" path="$2" n
+    n=$(printf '%s\n' "$path" | grep -cE "$SURFACE")
+    if { [ "$want" = yes ] && [ "${n:-0}" -gt 0 ]; } || { [ "$want" = no ] && [ "${n:-0}" = 0 ]; }; then
+      PASS=$((PASS + 1))
+    else
+      FAIL=$((FAIL + 1))
+      printf 'FAIL: %s should be %s a released surface under /%s/\n' "$path" \
+        "$([ "$want" = yes ] && echo IN || echo OUT OF)" "$SURFACE"
+    fi
+  }
+  surface_says yes 'modules/ci-runner-pool/main.tf'
+  surface_says yes 'scripts/ci/merge-lane.sh'
+  # A consumer pins `?ref=` at a module path only. These reach their readers
+  # from the default branch, so a merge publishes them.
+  surface_says no 'docs/merge-lane.md'
+  surface_says no 'fleet/repos.tsv'
+  surface_says no '.github/workflows/ci.yml'
+  surface_says no 'packer/ci-host-image.pkr.hcl'
+  surface_says no 'README.md'
+  surface_says no 'VERSION'
+  # Anchored: a path that merely CONTAINS the word is not a released surface,
+  # and an unanchored pattern would quietly make every exemption above false.
+  surface_says no 'docs/modules/overview.md'
+  surface_says no 'customer/scripts/notes.txt'
+fi
 
 printf 'fleet-audit-decision: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

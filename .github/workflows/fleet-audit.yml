@@ -90,6 +90,16 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           FLEET_OWNER: ${{ github.repository_owner }}
+          # How long work merged to the default branch may sit unpublished
+          # before the audit calls it an omission rather than a batch. Wired
+          # STRAIGHT to a variable, which merge-lane.yml's `require-label`
+          # warns against — and safely, because the polarity is the opposite
+          # one. There, an unset variable renders as the empty string and empty
+          # means "no label required", so a missing setting widens what merges.
+          # Here empty means "use the rule's own default" and only an explicit
+          # `0` disables the watchdog, so a variable nobody set, mistyped, or
+          # tidied away leaves the check armed.
+          BACKLOG_MAX_HOURS: ${{ vars.UNRELEASED_BACKLOG_MAX_HOURS }}
         run: |
           set -uo pipefail
           # `tee`, so the findings are in the job log even when the report step
