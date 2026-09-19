@@ -373,7 +373,9 @@ holds_a_success_while_a_later_suite_of_the_app_is_unfinished() {
   code=$(code_of "$1")
   matches "$code" 'newer_incomplete: \(\(\$suites' || return 1
   matches "$code" '\.status != "completed"' || return 1
-  matches "$code" '\.created_at > \$w\.created_at' || return 1
+  matches "$code" '\[\.created_at, \.id\]' || return 1
+  matches "$code" '\[\$w\.created_at, \$w\.suite\]' || return 1
+  ! matches "$code" '\.created_at > \$w\.created_at' || return 1
   matches "$code" 'if \[ "\$state" = "success" \] && \[ "\$auth_newer" = "true" \]; then' || return 1
   ! matches "$code" 'elif \[ "\$auth_newer" = "true" \]; then'
 }
@@ -1560,6 +1562,9 @@ mutate "the hold on a later unfinished suite of the same app is dropped" "$DRIVE
 mutate "the hold becomes an elif on the superseded-suite branch, so it is skipped when the authority is a different suite" "$DRIVER" \
   's@if \[ "\$state" = "success" \] && \[ "\$auth_newer" = "true" \]; then@elif [ "$auth_newer" = "true" ]; then@' \
   holds_a_success_while_a_later_suite_of_the_app_is_unfinished
+mutate "the later-suite test orders suites by the timestamp alone, so a same-second sibling never holds" "$DRIVER" \
+  's@\[\.created_at, \.id\]@[.created_at]@' \
+  holds_a_success_while_a_later_suite_of_the_app_is_unfinished
 mutate "the later-suite test stops scoping itself to the winning app" "$DRIVER" \
   's@select(\.app == \$w\.app$@select(true or .app == $w.app@' \
   does_not_wait_on_an_unrelated_apps_suite
@@ -2178,7 +2183,29 @@ behavioural_check_counts_cases() {
     "{\"check_suites\":[$(_bh_suite 999999999 github-actions completed 2026-09-01T06:00:00Z),$(_bh_suite 1000000000 github-actions completed 2026-09-01T06:00:00Z)]}" \
     "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T09:00:00Z"' github-actions 999999999),$(_bh_run 'CI summary (rollup)' completed '"failure"' '"2026-09-01T08:00:00Z"' github-actions 1000000000)]}"
 
-  # 9. THE COMMON CASE IS UNTOUCHED: one suite, one run, green stays green.
+  # 9. THE HOLD ORDERS ON THE PAIR TOO, and this is the shape that makes it
+  #    matter: the later, still-running suite was created in the SAME SECOND as
+  #    the one that posted the name green. Same-second siblings are the NORM on
+  #    this fleet — this change's own head carries two, a Telnet-Emulation head
+  #    carried five — so comparing `created_at` as a string on its own means the
+  #    hold never fires and #955's stale green is trusted: `1 0 0 0`.
+  case_ "a later suite of the app created in the SAME SECOND, still running, holds the name" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 80 github-actions completed 2026-09-19T12:55:50Z),$(_bh_suite 81 github-actions in_progress 2026-09-19T12:55:50Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-19T13:10:00Z"' github-actions 80),$(_bh_run 'Web build' in_progress null null github-actions 81)]}"
+
+  # 10. AND A LATER SUITE THE API RETURNED WITHOUT A `created_at` STILL HOLDS.
+  #     The projection defaults a missing timestamp to `""`, and `"" > "2026-.."`
+  #     is false, so a timestamp-only comparison silently stops holding for
+  #     exactly the suite it knows least about. The id ordering decides instead.
+  case_ "a later suite with no created_at in the read still holds the name" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 90 github-actions completed 2026-09-19T12:55:50Z),{\"id\":91,\"app\":{\"slug\":\"github-actions\"},\"status\":\"queued\",\"created_at\":null}]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-19T13:10:00Z"' github-actions 90)]}"
+
+  # 11. THE COMMON CASE IS UNTOUCHED: one suite, one run, green stays green.
   case_ "one suite, one run: its own suite is authoritative and the success stands" \
     "1 0 0 0" \
     'CI summary (rollup)' \

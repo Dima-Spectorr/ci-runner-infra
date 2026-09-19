@@ -438,6 +438,24 @@ check_counts() {
   # the hold, like `BASE_HEALTH_MAX_STALENESS`, is tracked in #963 rather
   # than folded in here.
   #
+  # THE HOLD ORDERS SUITES THE SAME WAY THE AUTHORITY DOES, on
+  # `[created_at, id]` and not on `created_at` alone. Same-second sibling suites
+  # are the NORM on this fleet, not an edge case — this change's own head has
+  # two `github-actions` suites at the same second, and a Telnet-Emulation head
+  # was measured with five inside one second. Comparing the timestamp string by
+  # itself means a later suite created in the SAME second never holds anything,
+  # and the #955 stale green is trusted again; it also means a suite whose
+  # `created_at` came back empty never holds, because `"" > "2026-..."` is
+  # false. Comparing the PAIR fixes the same-second case, because the suite id
+  # increases monotonically and so breaks the tie in creation order.
+  #
+  # IT DOES NOT FIX THE EMPTY-TIMESTAMP CASE, because a pair comparison decides
+  # on its first element and `"" < "2026-..."` whatever follows it. That case
+  # needs its own arm, and it gets the id ordering on its own: a suite the read
+  # could not place in time is placed by its id, which for one app is the same
+  # order. It is not widened to "any suite with no timestamp holds" — an OLDER
+  # incomplete suite is still not a reason to distrust a green.
+  #
   # EVERY `sort_by` CARRIES THE FULL GROUPING KEY. jq's `group_by` sorts
   # internally, so a partial sort happens to work; depending on that is an
   # implicit contract, and the suite id is there as the tie-break so two suites
@@ -466,7 +484,10 @@ check_counts() {
                   newer_incomplete: (($suites
                     | map(select(.app == $w.app
                                  and .status != "completed"
-                                 and .created_at > $w.created_at))
+                                 and (([.created_at, .id]
+                                       > [$w.created_at, $w.suite])
+                                      or (.created_at == ""
+                                          and .id > $w.suite))))
                     | length) > 0)}}})
        | reduce .[] as $e ({}; . * $e)')"
 
@@ -518,7 +539,7 @@ check_counts() {
   # suite-scoped, always trusted as before).
   all="$(printf '%s\n%s\n' "$runs" "$statuses" \
     | jq -s '[.[] | select(type == "object" and (.name | type) == "string")]
-             | sort_by(.at) | group_by(.name) | map(.[-1])
+             | sort_by([.name, .at]) | group_by(.name) | map(.[-1])
              | map({(.name): {state: .state, origin: .origin, app: .app, suite: .suite}}) | add // {}')"
 
   # An empty `all` is what the poisoned stream produced, and it is not the same
@@ -1992,9 +2013,15 @@ lane_report_refusal() {
       # for this exact head sha and ranked the pull request `merge:ready`, then
       # the merge API refused it with this 405 because the RULESET disagreed —
       # it was waiting on a check_suite the lane's flat, suite-blind read could
-      # not see was newer. That disagreement is a `check_counts` question for
-      # another day (see docs/merge-lane.md, "Superseded check_suite vs a
-      # required context"); what belongs HERE is that this refusal is about
+      # not see was newer. THAT DISAGREEMENT IS NOW CORRELATED IN
+      # `check_counts` — it resolves a required name against the suite that
+      # actually posted it, per (app, name), and holds a green whose app has a
+      # later unfinished suite (see docs/merge-lane.md, "Superseded check_suite
+      # vs a required context"). This arm is the residual belt: the correlation
+      # reads the API's answer at one instant, a suite can appear between that
+      # read and the merge call, and a legacy commit status is deliberately not
+      # suite-scoped at all. So the 405 must still be survivable, and what
+      # belongs HERE is that this refusal is about
       # THIS pull request's OWN required checks and nothing else in the
       # repository — no other candidate's checks, and no shared state like the
       # base tip, changed because GitHub said this. Ending the batch over it

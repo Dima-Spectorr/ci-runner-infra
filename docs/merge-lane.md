@@ -1172,7 +1172,12 @@ the newest-by-`created_at` suite of that app that actually posted a run of it. A
 otherwise it is re-derived from what that suite itself posted for the same name.
 A `success` that IS from the authoritative suite is still held as `pending` while
 the same app has a suite created LATER that has not `completed` — one that may
-yet post its own occurrence. Nothing that was already non-green is touched: the
+yet post its own occurrence. "Later" is ordered on `[created_at, suite id]`, not
+on the timestamp alone: same-second sibling suites are the NORM here (two on
+ci-runner-infra `04e788fa`, five within one second on Telnet-Emulation
+`1da9a01`), and a suite id increases monotonically, so it is what actually
+resolves both a same-second tie and a suite the read returned without a
+timestamp. Nothing that was already non-green is touched: the
 correlation can only turn a `success` into `pending` or into whatever the
 authoritative suite said, never the reverse, which is why it could ship
 unconditionally rather than behind a flag.
@@ -1213,9 +1218,10 @@ suites on this fleet all belong to other apps, which are never consulted — and
 the failure mode is a loud, retrying wait rather than the silent
 `missing-required` skip a per-app rule produces. A staleness bound on the hold
 is tracked in [ci-runner-infra#963](https://github.com/Dima-Spectorr/ci-runner-infra/issues/963),
-not folded into this change.
-
-- **ci-runner-infra PR #961**, sha `afc45a0`: three sibling suites of
+not folded into this change. A required name answered by a LEGACY COMMIT STATUS
+is likewise not suite-scoped — statuses have no check_suite to correlate against
+— so it is trusted exactly as it was before this change; that is pre-existing
+and intentional, not an oversight.
 
 A suite from an app that never posts a required name (this sha's
 `google-cloud-build`, `google-cloud-developer-connect`, `claude`,
