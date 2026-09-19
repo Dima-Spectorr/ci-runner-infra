@@ -931,6 +931,42 @@ Two consequences worth stating plainly:
   And note what it replaces. Past the grace, the unfixed behaviour is to merge
   *unvouched*, on no answer at all. A green answer from four minutes ago is
   strictly more information than that, not less.
+- **`newer-incomplete-max-staleness-seconds` (default `3600`) bounds a
+  different wait — the hold on a green check whose app still has an unfinished
+  check_suite.** The lane will not merge a required check that is green in one
+  check_suite while the same app has a *later* suite that has not `completed`,
+  because that suite may still post its own occurrence of the name; without the
+  hold GitHub calls the context `expected` and refuses the merge with a 405.
+  That hold had no ceiling. A check_suite that never completes — which is what
+  GitHub leaves behind for a workflow whose trigger never schedules a job, and
+  exactly what the permanently-`queued` suites described below are — would hold
+  every required name of that app for as long as the head sha lives, while the
+  ruleset itself was satisfied the whole time. Those suites all belong to *other*
+  apps today, which the hold never consults; nothing in the read guarantees that
+  stays true.
+
+  **An hour, because that is above every wait measured here.** Scale-from-zero
+  warm-up is two to four minutes against a fifteen-minute `DEMAND_GRACE`
+  ([fleet-audit.md](fleet-audit.md)), no job is given a `timeout-minutes` above
+  thirty, and the worst real wait on record is a required job queued for
+  thirty-one minutes behind hardcoded pool labels
+  ([merge-queue-stall-recovery.md](merge-queue-stall-recovery.md)). Raise it in
+  a repository whose checks legitimately post later than that.
+
+  **The clock runs on the newest suite still holding, not on how long the lane
+  has waited.** One suite stuck for three hours does not expire the hold while a
+  sibling created thirty seconds ago is still running — that one has not had its
+  chance yet, and it is the one that might post the name. The escape only ever
+  *declines* the downgrade: a check that is red, absent or genuinely pending
+  cannot reach it. A holding suite whose `created_at` the read did not return has
+  no computable age and keeps holding, because unknown is not old.
+
+  **It is loud.** When it fires the run carries a `::warning::` naming the app,
+  the check, the suite id, its age and the bound, and telling you what to
+  conclude if the merge then 405s anyway: the suite is posting late rather than
+  stuck, and this number is too low for the repository. **Setting `0` gives up
+  the bound** and restores the unbounded hold — the safest reading against a
+  405, and the one that can leave a head sha unmergeable forever.
 - **Wake the lane on the health job, not only on CI.** Add the health workflow's
   `name:` to your caller's `workflow_run: workflows:` list. Its completion is
   the event that unblocks the next merge, and a caller that only listens to CI
@@ -1211,14 +1247,18 @@ Three measured shapes drove the design:
   Reads all three green now. Under per-app authority it read `3 missing`.
 
 The hold on a later, unfinished same-app suite is the one part of this with a
-residual risk, and it is named rather than hidden: a same-app suite that sticks
-non-`completed` forever would hold that app's required names `pending` for as
-long as the sha lives. None has been observed here — the permanently-`queued`
-suites on this fleet all belong to other apps, which are never consulted — and
-the failure mode is a loud, retrying wait rather than the silent
-`missing-required` skip a per-app rule produces. A staleness bound on the hold
-is tracked in [ci-runner-infra#963](https://github.com/Dima-Spectorr/ci-runner-infra/issues/963),
-not folded into this change. A required name answered by a LEGACY COMMIT STATUS
+residual risk, and it is bounded rather than merely named: a same-app suite that
+sticks non-`completed` forever would otherwise hold that app's required names
+`pending` for as long as the sha lives, with the ruleset itself satisfied the
+whole time. None has been observed here — the permanently-`queued` suites on
+this fleet all belong to other apps, which are never consulted — and the failure
+mode is a loud, retrying wait rather than the silent `missing-required` skip a
+per-app rule produces. Since
+[ci-runner-infra#963](https://github.com/Dima-Spectorr/ci-runner-infra/issues/963)
+the hold expires anyway, one hour after the newest suite still holding was
+created — `newer-incomplete-max-staleness-seconds`, documented with the other
+base-health knobs above, and loud when it fires.
+A required name answered by a LEGACY COMMIT STATUS
 is likewise not suite-scoped — statuses have no check_suite to correlate against
 — so it is trusted exactly as it was before this change; that is pre-existing
 and intentional, not an oversight.

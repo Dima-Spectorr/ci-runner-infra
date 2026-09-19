@@ -371,7 +371,11 @@ picks_the_authoritative_suite_per_check_name() {
 holds_a_success_while_a_later_suite_of_the_app_is_unfinished() {
   local code
   code=$(code_of "$1")
-  matches "$code" 'newer_incomplete: \(\(\$suites' || return 1
+  # The holding suites are selected out of `$suites` once, as `$holders`, and
+  # the flag is derived from that set — the staleness escape (#963) needs the
+  # identity of the newest of them, not only whether any exist.
+  matches "$code" '\) as \$holders$' || return 1
+  matches "$code" 'newer_incomplete: \(\(\$holders \| length\) > 0\)' || return 1
   matches "$code" '\.status != "completed"' || return 1
   matches "$code" '\[\.created_at, \.id\]' || return 1
   matches "$code" '\[\$w\.created_at, \$w\.suite\]' || return 1
@@ -1248,6 +1252,81 @@ the_window_walk_is_bounded() {
   matches "$code" '^    \[ "\$hops" -lt "\$BASE_HEALTH_MAX_HOPS" \] \|\| break$'
 }
 
+# THE NEWER-INCOMPLETE HOLD HAS A CEILING (#963). Without one, a same-app
+# check_suite that never reaches `completed` -- GitHub's behaviour for a
+# workflow whose trigger never schedules a job -- holds every required name of
+# that app `pending` for as long as the head sha lives, with the ruleset itself
+# satisfied the whole time. Unlike the base-health window this one is ON by
+# default, because an unbounded hold wedges a repository rather than relaxing a
+# gate; `0` is the opt-out.
+the_newer_incomplete_hold_is_bounded() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^NEWER_INCOMPLETE_MAX_STALENESS="\$\{NEWER_INCOMPLETE_MAX_STALENESS:-3600\}"$' || return 1
+  matches "$code" '\[ "\$NEWER_INCOMPLETE_MAX_STALENESS" -gt 0 \]' || return 1
+  matches "$code" '\[ "\$hold_age" -ge "\$NEWER_INCOMPLETE_MAX_STALENESS" \]'
+}
+
+# AND THE ESCAPE CAN ONLY DECLINE THE DOWNGRADE. It sits INSIDE the branch that
+# applies the hold, whose guard is a surviving `success`, so a `failure` from
+# the authoritative suite (PR #1582), an `absent` and a genuine `pending` cannot
+# reach it at all. The `state="pending"` it guards has to be on the ELSE arm:
+# moved out beside the escape, or written as an assignment the escape merely
+# skips past, the bound stops being a property of where the code sits.
+the_bound_can_only_decline_the_downgrade() {
+  local code arm
+  code=$(code_of "$1")
+  matches "$code" '^        if \[ "\$state" = "success" \] && \[ "\$auth_newer" = "true" \]; then$' || return 1
+  # SLICED TO THE ESCAPE'S OWN ARM, NOT GREPPED OVER THE WHOLE FUNCTION. A bare
+  # `else` and a bare `state="pending"` also occur in the superseded-suite arm
+  # above, so assertions written on them alone stayed GREEN when the downgrade
+  # at the end of THIS arm was deleted — review of #963 caught it, and it is
+  # the wrong-arm failure this repository has recorded before. The slice runs
+  # from the bound's own test to that `if`'s `fi`, so only the escape can
+  # satisfy it.
+  arm=$(printf '%s\n' "$code" \
+    | sed -n '/\[ "\$hold_age" -ge "\$NEWER_INCOMPLETE_MAX_STALENESS" \]; then/,/^          fi$/p')
+  matches "$arm" '^          else$' || return 1
+  matches "$arm" '^            state="pending"$'
+}
+
+# AND IT IS MEASURED ON THE NEWEST SUITE STILL HOLDING, NOT THE OLDEST. The
+# intuitive bound -- expire once the hold has lasted long enough -- walks past a
+# suite created seconds ago the moment one ancient stuck sibling crosses the
+# line, which is #955 again with a timer on it. An undated holder takes the slot
+# with an empty timestamp so the age cannot be computed and the hold stands:
+# unknown is not old, and expiring on an unreadable read is the unsafe
+# direction.
+the_bound_reads_the_newest_holding_suite() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'sort_by\(\[\.created_at, \.id\]\) \| \.\[-1\]\.created_at' || return 1
+  matches "$code" 'if \(\$undated \| length\) > 0 then ""' || return 1
+  matches "$code" '^          if \[ -n "\$auth_newer_at" \]; then$'
+}
+
+# AND IT SAYS SO. A silent escape rebuilds the defect the per-app authority
+# produced -- a required check quietly stopping being consulted -- which is
+# strictly worse than the 405 it replaces, because a 405 is at least loud. The
+# annotation names the app, the check, the suite, its age and the bound, and it
+# goes to STDERR because this function's stdout is its return value.
+the_expired_hold_warns() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^            echo "::warning::lane: \$sha — check .\$name. is green and app .\$winner_app. has suite \$auth_newer_id still unfinished' || return 1
+  matches "$code" 'past the \$\{NEWER_INCOMPLETE_MAX_STALENESS\}s bound.*" >&2$'
+}
+
+# The knob has to reach the driver, the same way the list and the grace do. A
+# workflow input nothing reads is a repository that set the value, watched the
+# lane go on halting, and has no way to tell which end is wrong.
+passes_the_hold_bound_to_the_driver() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      newer-incomplete-max-staleness-seconds:$' || return 1
+  matches "$code" '^          NEWER_INCOMPLETE_MAX_STALENESS: \$\{\{ inputs\.newer-incomplete-max-staleness-seconds \}\}$'
+}
+
 # The knob has to reach the driver, the same way the list and the grace do. A
 # workflow input nothing reads is a repository that set the value, watched the
 # lane go on halting, and has no way to tell which end is wrong.
@@ -1361,6 +1440,11 @@ check the_staleness_window_closes_after_the_lane_merges "$DRIVER" "an ancestor's
 check a_red_ancestor_inside_the_window_halts_the_lane "$DRIVER" "the walk searches past a red ancestor for an older green one, so a base that is broken and has said so reads as vouched"
 check the_window_walk_is_bounded "$DRIVER" "the ancestor walk is unbounded in age or in hops, so any green commit in history vouches for the tip, or a pass is spent at two check reads per commit proving nothing answered"
 check passes_the_staleness_window_to_the_driver "$CALLEE" "the workflow declares the staleness window but never hands it to the driver, so a repository that sets it watches the lane go on halting with no way to tell which end is wrong"
+check the_newer_incomplete_hold_is_bounded "$DRIVER" "the hold on a later unfinished suite of the same app has no ceiling, so one suite that never completes holds every required name of that app pending for as long as the head sha lives while the ruleset itself is satisfied"
+check the_bound_can_only_decline_the_downgrade "$DRIVER" "the staleness escape sits outside the branch that only a surviving success reaches, so a bound meant to decline one downgrade can turn a red, absent or genuinely pending check into a pass"
+check the_bound_reads_the_newest_holding_suite "$DRIVER" "the hold expires on the oldest holding suite or on a suite whose creation time could not be read, so a suite created seconds ago is walked past and the #955 405 comes back with a timer on it"
+check the_expired_hold_warns "$DRIVER" "the hold expires silently, which is the per-app defect rebuilt — a required check quietly stopping being consulted, and strictly worse than the 405 it replaces because a 405 is at least loud"
+check passes_the_hold_bound_to_the_driver "$CALLEE" "the workflow declares the hold bound but never hands it to the driver, so a repository whose jobs legitimately queue longer than the default has no way to raise it"
 check decides_armed_ness_before_the_batch_moves_the_tip "$DRIVER" "armed-ness is decided against a tip a merge just created, where the post-merge run does not exist yet, so every armed base reads as unarmed and the gate is off when it matters"
 check costs_an_unarmed_base_nothing "$DRIVER" "an inert base pays two API calls per merge to re-learn that nothing answers for it"
 check tells_an_unanswered_tip_from_an_unwatched_one "$DRIVER" "'nobody is watching' and 'nobody has answered yet' collapse into one verdict, so an armed base reads as unarmed and the batch stacks onto an unvouched tip"
@@ -1628,6 +1712,18 @@ mutate "the ancestor walk loses its age bound" "$DRIVER" \
   's@^    \[ "\$age" -lt "\$BASE_HEALTH_MAX_STALENESS" \] || break$@    :@' the_window_walk_is_bounded
 mutate "the workflow stops handing the staleness window to the driver" "$CALLEE" \
   's@^          BASE_HEALTH_MAX_STALENESS: .*$@          BASE_HEALTH_MAX_STALENESS: 0@' passes_the_staleness_window_to_the_driver
+mutate "the hold on a later unfinished suite loses its ceiling again" "$DRIVER" \
+  's@^NEWER_INCOMPLETE_MAX_STALENESS=.*$@NEWER_INCOMPLETE_MAX_STALENESS="${NEWER_INCOMPLETE_MAX_STALENESS:-0}"@' the_newer_incomplete_hold_is_bounded
+mutate "the staleness escape moves out beside the hold instead of guarding it" "$DRIVER" \
+  's@^          else$@          fi\n          if false; then@' the_bound_can_only_decline_the_downgrade
+mutate "the bound is measured against the oldest holding suite" "$DRIVER" \
+  's@sort_by(\[\.created_at, \.id\]) | \.\[-1\]\.created_at@sort_by([.created_at, .id]) | .[0].created_at@' the_bound_reads_the_newest_holding_suite
+mutate "an undated holding suite is treated as infinitely old" "$DRIVER" \
+  's@newer_at: (if (\$undated | length) > 0 then ""@newer_at: (if false then ""@' the_bound_reads_the_newest_holding_suite
+mutate "the expired hold stops annotating the run" "$DRIVER" \
+  's@^            echo "::warning::lane: \$sha — check@            : "lane: $sha — check@' the_expired_hold_warns
+mutate "the workflow stops handing the hold bound to the driver" "$CALLEE" \
+  's@^          NEWER_INCOMPLETE_MAX_STALENESS: .*$@          NEWER_INCOMPLETE_MAX_STALENESS: 0@' passes_the_hold_bound_to_the_driver
 mutate "armed-ness starts being decided against the tip the merge just made" "$DRIVER" \
   's@^  if \[ "\$LANE_BASE_VERDICT" = .inert. \]; then LANE_BASE_ARMED=..; else LANE_BASE_ARMED=1; fi$@  :@' decides_armed_ness_before_the_batch_moves_the_tip
 mutate "an unwatched base becomes indistinguishable from an unanswered one" "$DRIVER" \
@@ -2079,7 +2175,24 @@ behavioural_check_counts_cases() {
     return
   fi
 
-  # case <description> <expected "green missing failed pending"> <names,newline-separated> <suites-json> <runs-json>
+  # An ISO-8601 timestamp N seconds before NOW. The staleness cases below are
+  # the only ones whose answer depends on the real clock, and a fixed date in
+  # them would mean a case that passes today and reads differently every day
+  # after — the fixtures elsewhere in this block are anchored dates precisely
+  # because nothing else here reads a clock.
+  _bh_ago() { # <seconds-ago>
+    date -u -d "@$(( $(date -u +%s) - $1 ))" +%Y-%m-%dT%H:%M:%SZ
+  }
+
+  # case <description> <expected "green missing failed pending"> <names,newline-separated> <suites-json> <runs-json> [hold-bound-seconds] [stderr-ere, '!' prefix to assert absence]
+  #
+  # THE HOLD BOUND DEFAULTS TO `0` — UNBOUNDED — FOR EVERY CASE THAT DOES NOT
+  # ASK FOR IT, and that is not the driver's default. The fixtures below are
+  # anchored to fixed dates months in the past, so under the shipped one-hour
+  # bound every hold in them would read as expired and the cases would assert
+  # the escape instead of the behaviour they were written for. `0` pins them to
+  # the pre-#963 semantics they document; the bound itself is exercised by the
+  # cases that pass it explicitly, against clock-relative timestamps.
   local desc want got
   case_() {
     desc="$1" want="$2"
@@ -2090,14 +2203,37 @@ behavioural_check_counts_cases() {
     local -a REQUIRED=()
     local line
     while IFS= read -r line; do [ -n "$line" ] && REQUIRED+=("$line"); done <<<"$3"
+    # shellcheck disable=SC2034  # Read by the evalled `check_counts`. A directive split over two comment lines makes ShellCheck 0.10 parse the second as its own directive and emit SC1073/SC1072, so this stays on one line.
+    local NEWER_INCOMPLETE_MAX_STALENESS="${6:-0}"
+    local want_err="${7:-}"
     # shellcheck disable=SC2034  # Read (and set) by the evalled `check_counts`.
     LANE_FATAL=0
-    got="$(check_counts 0000000000000000000000000000000000000000 2>/dev/null)"
+    got="$(check_counts 0000000000000000000000000000000000000000 2>"$fix/err.txt")"
     if [ "$got" = "$want" ]; then
       printf 'PASS %s\n' "$desc"
     else
       printf 'FAIL %s — want [%s] got [%s]\n' "$desc" "$want" "$got"
     fi
+    # The annotation is an assertion of its own, so it is counted as one. An
+    # escape that fires without saying so passes the counts and is exactly the
+    # silent-skip defect this bound is not allowed to become.
+    case "$want_err" in
+      '') : ;;
+      '!'*)
+        if grep -qE -- "${want_err#!}" "$fix/err.txt"; then
+          printf 'FAIL %s — stderr matched [%s] and must not\n' "$desc" "${want_err#!}"
+        else
+          printf 'PASS %s (no annotation)\n' "$desc"
+        fi
+        ;;
+      *)
+        if grep -qE -- "$want_err" "$fix/err.txt"; then
+          printf 'PASS %s (annotation)\n' "$desc"
+        else
+          printf 'FAIL %s — stderr did not match [%s]: [%s]\n' "$desc" "$want_err" "$(tr '\n' ' ' <"$fix/err.txt")"
+        fi
+        ;;
+    esac
   }
 
   # 1. THE DEFECT THIS REWORK EXISTS FOR. Three suites of ONE app created five
@@ -2209,7 +2345,95 @@ behavioural_check_counts_cases() {
     "{\"check_suites\":[$(_bh_suite 90 github-actions completed 2026-09-19T12:55:50Z),{\"id\":91,\"app\":{\"slug\":\"github-actions\"},\"status\":\"queued\",\"created_at\":null}]}" \
     "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-19T13:10:00Z"' github-actions 90)]}"
 
-  # 11. THE COMMON CASE IS UNTOUCHED: one suite, one run, green stays green.
+  # 12. BOTH SIDES OF THE #963 BOUND, AND THIS IS THE SIDE THAT KEEPS #955
+  #     FIXED. The later suite of the same app has been running for five
+  #     minutes against a one-hour bound. It has not had its chance yet, so the
+  #     hold holds and nothing is annotated — an escape that fires here is the
+  #     405 handed back with a timer on it.
+  case_ "the hold holds while the later suite of the app is younger than the bound" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 100 github-actions completed "$(_bh_ago 1200)"),$(_bh_suite 101 github-actions in_progress "$(_bh_ago 300)")]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' "\"$(_bh_ago 600)\"" github-actions 100)]}" \
+    3600 '!::warning::'
+
+  # 13. AND THE OTHER SIDE. The same shape with the holding suite two hours old
+  #     against a one-hour bound: it has had its chance, the hold expires, the
+  #     green is taken — and it is ANNOUNCED. This is the case a repository
+  #     whose suite sticks non-`completed` forever lands in, which before #963
+  #     was a lane that never merged that sha and never said why.
+  case_ "the hold expires once the later suite of the app is older than the bound, and says so" \
+    "1 0 0 0" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 110 github-actions completed "$(_bh_ago 10800)"),$(_bh_suite 111 github-actions queued "$(_bh_ago 7200)")]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' "\"$(_bh_ago 9000)\"" github-actions 110)]}" \
+    3600 "::warning::lane: .* suite 111 still unfinished .* past the 3600s bound"
+
+  # 13b. AND THE BOUND IS MEASURED ON THE NEWEST HOLDER, WHICH IS THE WHOLE
+  #      ARGUMENT OF #963 AND THE COUNTER-INTUITIVE HALF. TWO suites of the app
+  #      are holding: one stuck for three hours, one created five minutes ago.
+  #      The old one has had its chance; the new one has not, and it is the one
+  #      that may still post the name — so the hold stands. Measured on the
+  #      OLDEST holder instead, this reads green and hands back the #955 405
+  #      with a delay in front of it.
+  case_ "one stuck holder past the bound does not expire the hold while a fresh holder is still running" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 160 github-actions completed "$(_bh_ago 14400)"),$(_bh_suite 161 github-actions queued "$(_bh_ago 10800)"),$(_bh_suite 162 github-actions in_progress "$(_bh_ago 300)")]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' "\"$(_bh_ago 12000)\"" github-actions 160)]}" \
+    3600 '!::warning::'
+
+  # 14. THE ESCAPE RESCUES NOTHING THAT WAS NOT ALREADY GREEN, part one: the
+  #     PR #1582 shape with the bound wide open. The newest suite that posted
+  #     the name posted it RED, so the name never reaches the hold at all and
+  #     the bound cannot reach the name. Still `failed`, and no annotation —
+  #     an escape that can soften a red into a merge is a lane that merges
+  #     broken code.
+  case_ "an expired bound does not rescue a name the authoritative suite posted red" \
+    "0 0 1 0" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 120 github-actions completed "$(_bh_ago 10800)"),$(_bh_suite 121 github-actions completed "$(_bh_ago 9000)"),$(_bh_suite 122 github-actions queued "$(_bh_ago 7200)")]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' "\"$(_bh_ago 3000)\"" github-actions 120),$(_bh_run 'CI summary (rollup)' completed '"failure"' "\"$(_bh_ago 4000)\"" github-actions 121)]}" \
+    3600 '!::warning::'
+
+  # 15. PART TWO: a required name NOBODY posted. `absent` is decided before any
+  #     of this — the hold and its escape only ever see a surviving `success` —
+  #     so a stale suite of the app cannot conjure a check that does not exist.
+  #     This is the `missing-required` skip the per-app authority produced, and
+  #     the bound must not be a second route back to it.
+  case_ "an expired bound does not rescue a name nothing ever posted" \
+    "0 1 0 0" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 130 github-actions completed "$(_bh_ago 10800)"),$(_bh_suite 131 github-actions queued "$(_bh_ago 7200)")]}" \
+    "{\"check_runs\":[$(_bh_run 'Web build' completed '"success"' "\"$(_bh_ago 9000)\"" github-actions 130)]}" \
+    3600 '!::warning::'
+
+  # 16. `0` IS THE OPT-OUT AND IT IS EXACTLY TODAY'S BEHAVIOUR. The same suite
+  #     as case 13, two hours stuck, with the bound off: held, forever, with no
+  #     annotation. A repository that would rather wedge than risk the 405 sets
+  #     this and gets the pre-#963 lane back.
+  case_ "the bound set to 0 restores the unbounded hold" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 140 github-actions completed "$(_bh_ago 10800)"),$(_bh_suite 141 github-actions queued "$(_bh_ago 7200)")]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' "\"$(_bh_ago 9000)\"" github-actions 140)]}" \
+    0 '!::warning::'
+
+  # 17. AN AGE THE READ CANNOT SUPPLY IS NOT AN OLD AGE. The holding suite came
+  #     back with no `created_at` — the case PR #961 gave the ordering its own
+  #     arm for — so the bound has nothing to measure. Expiring on it would mean
+  #     a partial or failed read starts trusting stale greens, which is the
+  #     unsafe direction, so the hold stands and nothing is annotated. Note the
+  #     dated sibling: the undated holder must win the comparison outright
+  #     rather than being sorted below a timestamp that IS readable.
+  case_ "a holding suite with no created_at keeps holding, because unknown is not old" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 150 github-actions completed "$(_bh_ago 10800)"),$(_bh_suite 151 github-actions queued "$(_bh_ago 7200)"),{\"id\":152,\"app\":{\"slug\":\"github-actions\"},\"status\":\"queued\",\"created_at\":null}]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' "\"$(_bh_ago 9000)\"" github-actions 150)]}" \
+    3600 '!::warning::'
+
+  # 18. THE COMMON CASE IS UNTOUCHED: one suite, one run, green stays green.
   case_ "one suite, one run: its own suite is authoritative and the success stands" \
     "1 0 0 0" \
     'CI summary (rollup)' \
