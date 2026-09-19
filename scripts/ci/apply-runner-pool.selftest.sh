@@ -100,12 +100,21 @@ applies_only_what_it_printed() {
   ! matches "$code" 'terraform apply .*-auto-approve' || return 1
 }
 
-# The wrapper replaces terraform's exit code with its own and captures stderr
-# into an output — with -detailed-exitcode that is not a cosmetic difference,
-# it destroys the very signal the plan step branches on.
+# The `hashicorp/setup-terraform` wrapper replaces terraform's exit code with
+# its own and captures stderr into an output — with -detailed-exitcode that is
+# not a cosmetic difference, it destroys the very signal the plan step branches
+# on. It used to be disabled by `terraform_wrapper: false`; the workflow now
+# installs the terraform binary itself, so the assertion is that the ACTION is
+# ABSENT. Stronger than the flag: there is no wrapper left to re-enable. The
+# same change is what put a retry around the DOWNLOAD, which the action did
+# bare — #271's flake, in the setup half — so the retry and the checksum are
+# asserted here too rather than in a check of their own.
 reads_terraforms_own_exit_code() {
   local code; code=$(code_of "$1")
-  matches "$code" 'terraform_wrapper: false' || return 1
+  ! matches "$code" 'hashicorp/setup-terraform' || return 1
+  matches "$code" 'curl --fail --location' || return 1
+  matches "$code" '\-\-retry-all-errors' || return 1
+  matches "$code" 'sha256sum -c' || return 1
 }
 
 # Two applies on one root race for the state lock. Terraform would fail the
@@ -194,8 +203,10 @@ mutate "apply re-plans instead of using the saved plan" \
   's|terraform apply -input=false -lock-timeout=5m tf.plan|terraform apply -input=false -auto-approve|' applies_only_what_it_printed
 mutate "plan no longer saved" \
   's|-out=tf.plan||'                                               applies_only_what_it_printed
-mutate "wrapper re-enabled" \
-  's|terraform_wrapper: false|terraform_wrapper: true|'            reads_terraforms_own_exit_code
+mutate "the wrapping setup action reinstated" \
+  's|- name: install terraform (retried)|- uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd|' reads_terraforms_own_exit_code
+mutate "the terraform download loses its retry" \
+  's|--retry-all-errors ||'                                        reads_terraforms_own_exit_code
 mutate "concurrency keyed off the root, so roots collide" \
   's|group: apply-runner-pool-|group: apply-|'                     serialises_applies_per_root
 mutate "in-flight apply becomes cancellable" \
@@ -207,7 +218,7 @@ mutate "pull_request_target left open" \
 mutate "the refusal downgraded to a warning" \
   's|^          exit 1$||'                                         refuses_a_pull_request_apply
 mutate "an action pinned by tag" \
-  's|uses: hashicorp/setup-terraform@[0-9a-f]*|uses: hashicorp/setup-terraform@v3|' pins_every_action_by_sha
+  's|uses: actions/checkout@[0-9a-f]*|uses: actions/checkout@v4|' pins_every_action_by_sha
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

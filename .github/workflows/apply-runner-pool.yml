@@ -102,13 +102,70 @@ jobs:
           workload_identity_provider: ${{ inputs.workload_identity_provider }}
           service_account: ${{ inputs.service_account }}
 
-      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
-        with:
-          terraform_version: ${{ inputs.terraform_version }}
-          # The wrapper replaces terraform's exit code with its own and eats
-          # stderr into an output — an apply that failed then reads as a step
-          # that passed with an unread message.
-          terraform_wrapper: false
+      # WHY NOT `hashicorp/setup-terraform`, WHICH THIS REPLACED.
+      #
+      # Two reasons, and they were previously answered by two different means.
+      #
+      # 1. THE WRAPPER. The action installs a `terraform` wrapper that replaces
+      #    terraform's exit code with its own and eats stderr into an output —
+      #    an apply that failed then reads as a step that passed with an unread
+      #    message. `terraform_wrapper: false` turned it off; installing the
+      #    binary means there is no wrapper to turn off, which is strictly
+      #    stronger than a flag somebody can flip back.
+      # 2. THE DOWNLOAD. The action fetches the release with no retry, so a
+      #    transient TLS reset reaching releases.hashicorp.com failed the whole
+      #    apply before terraform ran once — the same flake `terraform init` has
+      #    been wrapped against since #271. `curl --retry` covers it, and
+      #    `--retry-all-errors` is required because the failure is a socket
+      #    disconnect rather than an HTTP status. The checksum is verified so a
+      #    truncated download fails here rather than mid-apply.
+      #
+      # This job is GitHub-hosted (`ubuntu-latest`, deliberately — see
+      # `runs_off_the_pool_it_applies`), where `curl` and `unzip` are both
+      # preinstalled, so this needs no install step of its own.
+      - name: install terraform (retried)
+        env:
+          TERRAFORM_VERSION: ${{ inputs.terraform_version }}
+        run: |
+          set -euo pipefail
+          base="https://releases.hashicorp.com/terraform/$TERRAFORM_VERSION"
+          zip="terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          sums="terraform_${TERRAFORM_VERSION}_SHA256SUMS"
+          work=$(mktemp -d)
+          # Removed on EVERY exit, not just the happy one: `set -e` means a
+          # failed curl or a bad checksum leaves the step without reaching a
+          # cleanup line, and this runs on a self-hosted pool as well as a
+          # GitHub-hosted runner, where a leaked directory outlives the job.
+          trap 'rm -rf "$work"' EXIT
+          for f in "$zip" "$sums"; do
+            # --max-time is PER ATTEMPT and --retry-max-time is the window in
+            # which a NEW attempt may start, so the per-attempt bound has to be
+            # the smaller of the two: at 300 against 180 one hung attempt burns
+            # the whole retry budget and the retries never happen -- which is
+            # the un-retried download this step exists to remove. 120s is ample
+            # for a ~30 MB archive off a GitHub-hosted runner, and 600s leaves
+            # room for all five attempts plus their delays.
+            curl --fail --location --silent --show-error \
+              --connect-timeout 15 --max-time 120 \
+              --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 600 \
+              -o "$work/$f" "$base/$f"
+          done
+          # One line is selected, not the whole file: the sums file lists every
+          # platform and `sha256sum -c` would fail on the archives that were
+          # never downloaded. `awk` on the FILENAME FIELD rather than `grep` on
+          # a pattern, because the archive name contains dots and a regex built
+          # from it is not a literal match. The line is re-emitted in
+          # `sha256sum`'s own two-space format, and selecting nothing yields
+          # empty stdin, which `sha256sum -c` rejects — so a version whose sums
+          # file does not name this archive fails here rather than installing
+          # nothing and reading as success.
+          ( cd "$work" &&
+            awk -v z="$zip" '$2 == z { printf "%s  %s\n", $1, z }' "$sums" |
+              sha256sum -c - )
+          mkdir -p "$HOME/.local/bin"
+          unzip -q -o "$work/$zip" terraform -d "$HOME/.local/bin"
+          chmod 0755 "$HOME/.local/bin/terraform"
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
 
       # -upgrade, not a plain init. A consumer pinning ?ref=v5 has the previous
       # v5 already cached in .terraform from the last run on a fresh checkout it

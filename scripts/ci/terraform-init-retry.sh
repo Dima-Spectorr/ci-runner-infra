@@ -69,8 +69,8 @@ is_permanent() { printf '%s' "$1" | grep -Eqi "$PERMANENT_PATTERNS"; }
 init_module() { # <module-dir>
   local dir="$1" attempt=1 wait="$BACKOFF" out rc
   # A terraform that is not installed is not a flake. If the setup step ever
-  # regresses — `hashicorp/setup-terraform` skipped, PATH not exported into
-  # this shell — every module fails identically, and without this the job
+  # regresses — the `install terraform (retried)` step skipped, or its
+  # $GITHUB_PATH line dropped — every module fails identically, and without this the job
   # spends ATTEMPTS calls and the whole backoff per module before saying so,
   # with a "could not run terraform" buried under retry warnings that suggest
   # a registry problem. Only the FIRST word is checked, because TF_BIN may

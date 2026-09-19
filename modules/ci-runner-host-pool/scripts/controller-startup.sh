@@ -404,6 +404,12 @@ POOL_ROLE="ci"
 POOL_JOBS_PER_CHECK=1
 BEACON_INTERVAL=30
 PIN_ORPHAN_GRACE=900
+# DIAGNOSTIC ONLY — no capacity, no verdict and no delete reads this. A cordon
+# still holding a slot this long after it started has made no progress, and
+# cordon_host() says so on ci_recycle_verdicts{outcome=cordon-no-progress}. An
+# hour is GitHub's own bound on a job it will admit to, and the host unit's
+# TimeoutStopSec, so a cordon past it is not "a long job" any more.
+CORDON_NO_PROGRESS_SECONDS=3600
 # The configured list, verbatim — kept for parity with `config.sh --labels` and
 # read by the multi-pool test, not by any routing decision in this file.
 # shellcheck disable=SC2034
@@ -3347,9 +3353,45 @@ drain_host() {
 # or finds it working again and refuses again. The host leaves a poll later than
 # the ideal — it never leaves with a job on it, which is the property that
 # matters.
+#
+# …and that last paragraph is also the livelock in #948: a slot that keeps being
+# handed work is a cordon that never converges. This function does not fix that
+# — it MEASURES it, via cordon_seconds() and the cordon-no-progress outcome
+# below, so the state stops being invisible.
+
+# How long this host has been cordoned, from the cordon marker's mtime-free
+# contents. Same write-once/validate/clear-on-state-change shape as
+# partial_seconds(), and for the same reason: the age has to survive a tick that
+# re-issues the cordon.
+#
+# The marker is CLEARED elsewhere — the retire branch removes it, and the
+# per-pool sweep removes it for a host that no longer exists — so there is no
+# state-change arm here to write. What there is instead is the validation:
+# every marker written before this change was `: >`, i.e. empty, and an empty or
+# non-numeric body read as 0 would put this cordon's age at decades and report
+# no-progress on the first tick after an upgrade. So a body that is not a plain
+# integer is restamped to now and reported as 0, which is the direction this
+# rule should be wrong in.
+cordon_seconds() {
+  local host="$1"
+  local f="$STATE_DIR/cordon-$host"
+  local now since gap
+  now=$(date +%s)
+
+  [ -f "$f" ] || { echo 0; return 0; }
+
+  since=$(cat "$f" 2>/dev/null)
+  case "$since" in
+    "" | *[!0-9]*) echo "$now" >"$f"; echo 0; return 0 ;;
+  esac
+  gap=$((now - since))
+  [ "$gap" -lt 0 ] && gap=0
+  echo "$gap"
+}
+
 cordon_host() {
   local host="$1"
-  local ids id gone=0 held=0
+  local ids id gone=0 held=0 failed=0
 
   ids=$(printf '%s' "$RUNNERS_JSON" | jq -r --arg h "$host" \
     '.runners[]? | select(.name | startswith($h + "-s")) | .id' 2>/dev/null)
@@ -3361,7 +3403,17 @@ cordon_host() {
   # halfway has already removed slots from the pool; without the marker the next
   # tick would not count this host against the budget and would cordon a second
   # one beside it.
-  : >"$STATE_DIR/cordon-$host"
+  #
+  # WRITTEN ONCE, and the `-f` guard is the whole point. `: >` ran on every
+  # cordon pass, so it truncated the marker and restamped its mtime to "last
+  # tick" rather than "cordon start" — which made a cordon's age underivable
+  # anywhere, and unrecoverable after the fact, on exactly the hosts where the
+  # age is the only evidence that #948 is happening.
+  if [ ! -f "$STATE_DIR/cordon-$host" ]; then
+    date +%s >"$STATE_DIR/cordon-$host"
+  fi
+  local cordon_age
+  cordon_age=$(cordon_seconds "$host")
 
   for id in $ids; do
     local code
@@ -3374,15 +3426,43 @@ cordon_host() {
         gone=$((gone + 1))
         event INFO cordon-deregister "$host" "cordon $host: runner $id deregistered (HTTP $code)" runner_id="$id" http="$code"
         ;;
-      *)
-        # 422: executing a job. Expected, and the entire mid-job guarantee.
+      422)
+        # Executing a job. Expected, and the entire mid-job guarantee.
         held=$((held + 1))
+        ;;
+      *)
+        # NO USABLE ANSWER ABOUT THE SLOT. 401 and 403 (a bad token, or a
+        # secondary rate limit) ARE answers, but they are answers about this
+        # controller's credential rather than about whether the slot is busy;
+        # 5xx and 000 — the latter being curl's value for a call that never
+        # completed — are not answers at all. All of them used to land in the
+        # 422 arm with no log line, so a credential fault or a rate limit
+        # produced the identical "N still finishing work" message as a healthy
+        # busy pool — and specifically, it looked exactly like #948 and would be
+        # misdiagnosed as it. drain_host()'s deregister loop has always
+        # separated these; this is the same split, counted rather than aborting,
+        # because a cordon walks the whole list by design.
+        failed=$((failed + 1))
+        event WARNING cordon-deregister "$host" "cordon $host: runner $id deregistration returned HTTP ${code:-none} -- not a mid-job hold, slot left registered" runner_id="$id" http="${code:-none}"
         ;;
     esac
   done
 
-  event INFO cordon "$host" "cordon $host: $gone slot(s) removed from the pool, $held still finishing work" removed="$gone" held="$held"
+  event INFO cordon "$host" "cordon $host: $gone slot(s) removed from the pool, $held still finishing work, $failed with no usable answer (cordon age ${cordon_age}s)" removed="$gone" held="$held" failed="$failed" cordon_age="$cordon_age"
   CORDONED=$((CORDONED + 1))
+  CORDON_HELD=$((CORDON_HELD + held))
+  CORDON_ERRORS=$((CORDON_ERRORS + failed))
+
+  # THE OBSERVABILITY HALF OF #948, and only that half. A cordon still holding a
+  # slot after CORDON_NO_PROGRESS_SECONDS has removed nothing this tick and is
+  # no closer to retiring than when it started: the held slot kept being handed
+  # work. Counted here and published on ci_recycle_verdicts with the rest of the
+  # accounting, so it needs no metrics path of its own.
+  if [ "$held" -gt 0 ] && [ "$gone" -eq 0 ] &&
+    [ "$cordon_age" -ge "$CORDON_NO_PROGRESS_SECONDS" ]; then
+    CORDON_NO_PROGRESS=$((CORDON_NO_PROGRESS + 1))
+    event WARNING cordon-no-progress "$host" "cordon $host: no progress in ${cordon_age}s -- $held slot(s) still held, 0 removed; the held slot is still being handed work (#948)" held="$held" cordon_age="$cordon_age"
+  fi
   return 0
 }
 
@@ -3477,6 +3557,11 @@ tick_pool() {
   DRAIN_ERRORS=0
   REAPED=0
   CORDONED=0
+  # Per-tick cordon accounting, reset with the rest. `held` and `errors` are not
+  # the same event and used to be the same counter: see cordon_host().
+  CORDON_HELD=0
+  CORDON_ERRORS=0
+  CORDON_NO_PROGRESS=0
   RETIRED=0
   WORKER_GATE_CLEAR=0
   WORKER_GATE_HELD=0
@@ -3945,6 +4030,23 @@ tick_pool() {
   # hosts are not leaving.
   queue_series "ci_recycle_verdicts" "$CORDONED" '"outcome":"cordoned"'
   queue_series "ci_recycle_verdicts" "$RETIRED" '"outcome":"retired"'
+  # The three that separate a cordon that is WORKING from one that is not, and
+  # from one that never got an answer. Published as a fixed set including the
+  # zeroes, for the reason the skip reasons below give: a series that appears
+  # only when it fires is a series nobody can alert on.
+  #
+  #   cordon-held         slots refused with 422 -- a job is finishing. Normal.
+  #   cordon-error        the DELETE yielded no usable answer about the slot:
+  #                       401/403 answer about the credential, 5xx and a curl
+  #                       timeout answer nothing. Non-zero means the cordon is
+  #                       blind, not busy, and it used to be indistinguishable
+  #                       from cordon-held.
+  #   cordon-no-progress  a cordon past CORDON_NO_PROGRESS_SECONDS that removed
+  #                       nothing this tick: the held slot keeps being handed
+  #                       work. #948. Visible here, not yet fixed.
+  queue_series "ci_recycle_verdicts" "$CORDON_HELD" '"outcome":"cordon-held"'
+  queue_series "ci_recycle_verdicts" "$CORDON_ERRORS" '"outcome":"cordon-error"'
+  queue_series "ci_recycle_verdicts" "$CORDON_NO_PROGRESS" '"outcome":"cordon-no-progress"'
   # And the refusals, on the SAME series, so one chart reads as an accounting:
   # every stale host this tick either moved or is named here with the reason it
   # did not. Published as a fixed set including the zeroes -- a reason that
