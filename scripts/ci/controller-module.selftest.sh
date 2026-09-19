@@ -301,6 +301,8 @@ check "the pool module ships the cordon flag off" false "$d"
 # The zone is derived from the MIG self-link the tick already holds. Called with
 # one argument the function still deregisters, so the loss is invisible: the
 # cordon simply never converges.
+# shellcheck disable=SC2016  # the `$host`/`$host_uri` here are source text being
+# matched literally, not expansions this test wants resolved.
 grep -q 'cordon_host "$host" "$host_uri"' "$STARTUP" && r=yes || r=no
 check "the tick passes cordon_host the host's self-link so it can find the zone" yes "$r"
 
