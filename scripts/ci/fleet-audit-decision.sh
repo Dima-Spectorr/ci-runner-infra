@@ -41,6 +41,13 @@ _fleet_say() {
   echo "$1"
 }
 
+# _fleet_is_number — a fact that may be compared with `-ge`.
+#
+# `[ "$x" -ge "$y" ]` on a non-numeric operand exits 2, and 2 is falsey, so an
+# unparseable fact silently takes the "not over the threshold" branch. Every
+# numeric comparison in this file guards its operands with this first.
+_fleet_is_number() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
 # ---------------------------------------------------------------------------
 # fleet_verdict — every finding for one repository.
 #
@@ -91,7 +98,52 @@ _fleet_say() {
 #   demand        queued runs INSIDE it — what the controller scales on
 #   settled       the subset of that demand older than the pool's boot grace
 #   page          the size of the queued-run page the controller reads
+#
+# `source` tier only — the unreleased backlog (see the rule below):
+#   tag_readable      1 when the floating major tag resolved, 0 when it did not
+#   backlog           commits on the default branch newer than that tag which
+#                     touch a released surface; "" when it could not be counted
+#   backlog_hours     age in whole hours of the OLDEST of those commits; "" when
+#                     it could not be determined
+#   backlog_max_hours how long that oldest commit may sit before the delay has
+#                     become an omission. "" takes the default below; `0` opts
+#                     out, the same spelling every numeric knob in merge-lane.yml
+#                     uses for "turn this off".
 # ---------------------------------------------------------------------------
+
+# How long finished work may sit on the default branch unpublished before this
+# stops being a batch and starts being an omission.
+#
+# DERIVED, NOT CHOSEN. Measured over the 120 first-parent merges on this
+# repository's default branch that touched `modules/` or `scripts/` and were not
+# themselves a `chore(release)`, timed to the next `chore(release)` merge:
+#
+#   0h: 84   1h: 13   2h: 7   3h: 6   4h: 2   8h: 2
+#   30h: 1   31h: 1   52h: 2   53h: 1
+#   227h: 1   <- a9644d7, "a truncated runner listing … deleted it" (#765)
+#
+# 119 of 120 were swept up inside 53 hours. The single outlier, a9644d7, sat for
+# nine and a half days — a controller fix that deleted working hosts, merged and
+# reaching nobody — and nothing anywhere said so.
+#
+# WHAT THIS DOES AND DOES NOT CATCH. It would NOT have caught the commit #960
+# was filed about: `afc9bf3` (#957) was published about two hours after it
+# merged and never came close to any threshold worth setting. That is the point
+# rather than a gap. #960 found a real hole by looking at a case that happened
+# to fall through it, and the hole is that NOTHING bounds the wait — not that
+# any particular commit waited too long. So this is a bound on the batch, and
+# a9644d7 is what an unbounded batch actually costs.
+#
+# 72 hours is above every healthy observation with room to spare and far below
+# the one real failure, so it fires on the shape that went wrong and is silent
+# on the shape that is working as intended. It is a ceiling, NOT a target: a
+# backlog under it is a perfectly healthy state and is reported as compliant.
+#
+# The default lives HERE and nowhere else on purpose. fleet-audit.sh passes the
+# operator's override through unchanged and supplies no default of its own; two
+# copies of a number like this drift, and the copy that drifts is the one that
+# silently stops matching what the rule actually enforces.
+FLEET_BACKLOG_MAX_HOURS_DEFAULT=72
 fleet_verdict() {
   local facts="${1:-}"
   local tier="" has_lane="" has_guard="" has_reaper=""
@@ -100,6 +152,7 @@ fleet_verdict() {
   local vars_readable="" secrets_readable=""
   local checks_match="" ruleset="" has_ci=""
   local runners="" online="" corpses="" demand="" settled="" page=""
+  local tag_readable="" backlog="" backlog_hours="" backlog_max_hours=""
   local found=0
 
   # `IFS` is scoped to the `read` rather than to the function: a function-local
@@ -137,6 +190,10 @@ fleet_verdict() {
       demand) demand="$value" ;;
       settled) settled="$value" ;;
       page) page="$value" ;;
+      tag_readable) tag_readable="$value" ;;
+      backlog) backlog="$value" ;;
+      backlog_hours) backlog_hours="$value" ;;
+      backlog_max_hours) backlog_max_hours="$value" ;;
     esac
   done
 
@@ -180,7 +237,96 @@ fleet_verdict() {
     source)
       # This repository calls its own workflows through the `-self` variants, so
       # it has no pin to itself and pin rules would report a false stale.
-      [ "$found" = "0" ] && echo "ok:compliant tier=source"
+      #
+      # WHAT IT IS AUDITED FOR INSTEAD: THE UNRELEASED BACKLOG.
+      #
+      # Nothing else in the fleet can ask this question. Every consumer pins
+      # `?ref=vX.Y.Z` or `?ref=v5`, so a change to a released surface reaches
+      # nobody until the floating major tag moves past it — and the tag moves
+      # only when a `chore(release)` pull request bumps `VERSION`.
+      #
+      # THE DELAY IS DELIBERATE AND IS NOT WHAT IS BEING CHECKED. `VERSION` is
+      # deliberately NOT bumped in the pull request that makes the change:
+      # measured over the last 25 first-parent merges, five of the last eight
+      # released-surface merges moved no version, because two pull requests in
+      # flight at once both pick the same next number and the loser reddens the
+      # default branch for every open pull request. Batching is the fix for
+      # that, and a per-pull-request bump gate would reinstate it.
+      #
+      # What went missing is the OTHER end of the batch. A batch nobody sweeps
+      # up is indistinguishable from a batch on its way — the same shape as
+      # every other finding in this file, and the reason #960 was filed. So the
+      # rule is not "did this commit bump" but "has the OLDEST thing waiting
+      # been waiting too long".
+      #
+      # WHY THIS IS NOT A PULL-REQUEST CHECK, AND WHY IT IS NOT RED ON `main`.
+      # The condition becomes true through the passage of time, not through a
+      # push, so no push-triggered check can fire on it; this audit already runs
+      # daily from a schedule, which is the trigger the condition needs. And a
+      # scheduled workflow is not a pull request's check, so a `fail:` here
+      # turns THIS run red and posts to the audit issue without reddening the
+      # default branch — deliberate, because a red default branch blocks and
+      # confuses every open pull request, and because release-tag.yml already
+      # records what a check that is red on every successful release costs: it
+      # trains everyone to ignore the one signal that says a tag sits at the
+      # wrong commit.
+      if [ "$backlog_max_hours" = "0" ]; then
+        # The opt-out, spelled the way every numeric knob in merge-lane.yml
+        # spells it. Reported rather than silent: a watchdog somebody turned off
+        # and a watchdog that finds nothing must not render the same, which is
+        # the invariant this whole file exists for.
+        #
+        # DELIBERATELY BEFORE THE TAG CHECK, so `0` silences the unreadable-tag
+        # finding too. The tag is only read in order to bound the backlog, so an
+        # operator who has said they do not want the backlog bounded is not left
+        # with a daily failure about the input to a measurement nobody is
+        # taking. The tag itself is not unwatched: publish-tag.yml asserts the
+        # floating tag on every push, and release-tag.yml on every tag.
+        echo "ok:compliant tier=source backlog-watchdog=off"
+        return 0
+      fi
+      local max="${backlog_max_hours:-$FLEET_BACKLOG_MAX_HOURS_DEFAULT}"
+
+      if [ "$tag_readable" = "0" ]; then
+        # A `fail:`, not the `warn:` this file gives every other unknown — and
+        # the difference is what the unknown is ABOUT. Every other unknown here
+        # is a fact about somebody else's repository that the audit merely
+        # failed to fetch. This one is the floating tag every consumer in the
+        # fleet pins: unreadable means either the ref is gone or it resolves to
+        # something no release produced, and both of those are the outage, not a
+        # failure to observe it. publish-tag.yml takes exactly this stance about
+        # an unreadable version: fail the release rather than move the tag
+        # blind. Read as "no tag, so nothing is unreleased" it would be silent
+        # forever, which is the one answer that must never be possible here.
+        _fleet_say "fail:release-tag-unreadable cannot-bound-the-unreleased-backlog"
+      elif ! _fleet_is_number "$backlog"; then
+        # Absent AND malformed, together. A non-numeric count reaching `[ -ge ]`
+        # makes the test exit 2, which reads as "not over the threshold" — a
+        # quiet pass produced by a broken fact, the exact failure mode this file
+        # refuses everywhere else.
+        _fleet_say "warn:unreleased-backlog-unknown could-not-compare-default-branch-to-tag"
+      elif [ "$backlog" = "0" ]; then
+        : # Nothing waiting. The healthy end state, reported as compliant below.
+      elif ! _fleet_is_number "$backlog_hours" || ! _fleet_is_number "$max"; then
+        # The count is known and the age (or the ceiling to judge it against) is
+        # not, so the one thing the rule actually judges is missing. A backlog
+        # whose age cannot be read is never read as young.
+        _fleet_say "warn:unreleased-backlog-age-unknown commits=$backlog oldest=${backlog_hours:-<unset>} max=${max:-<unset>}"
+      elif [ "$backlog_hours" -ge "$max" ]; then
+        _fleet_say "fail:unreleased-backlog commits=$backlog oldest=${backlog_hours}h max=${max}h open-a-chore-release-pull-request"
+      fi
+
+      if [ "$found" = "0" ]; then
+        # A non-empty backlog under the ceiling is HEALTHY, and says so with its
+        # numbers attached. Printing them on the compliant line is what lets a
+        # reader watch a batch grow toward the ceiling instead of finding out
+        # only on the day it crosses.
+        if [ -n "$backlog" ] && [ "$backlog" != "0" ]; then
+          echo "ok:compliant tier=source backlog=$backlog oldest=${backlog_hours}h max=${max}h"
+        else
+          echo "ok:compliant tier=source backlog=0"
+        fi
+      fi
       return 0
       ;;
     pool|lane) : ;;
