@@ -9,8 +9,15 @@
 # git, the snippet lives in Markdown, and neither knows about the other.
 #
 # `VERSION` is that connection. It is the version this repo claims to publish,
-# it is bumped in the same pull request as the change being released, and every
-# documented pin is asserted against it here.
+# and every documented pin is asserted against it here.
+#
+# NOT "bumped in the same pull request as the change being released" — that is
+# not how this repository releases, and the assertion below does not need it to
+# be. The number moves either in the change itself or in a later
+# `chore(release)` pull request; whichever it is, the pins must name it in that
+# same pull request, which is all this file checks. What bounds the gap between
+# a merged change and the number moving is the fleet audit's unreleased-backlog
+# watchdog (docs/fleet-audit.md), not this gate.
 #
 # Deliberately NOT asserted against `git tag`: at pull-request time the tag for
 # the version being released does not exist yet, so a tag-based check would

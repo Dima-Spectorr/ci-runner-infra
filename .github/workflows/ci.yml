@@ -807,6 +807,16 @@ jobs:
       - name: fleet-audit decision self-test
         run: bash scripts/ci/fleet-audit-decision.selftest.sh
 
+      # The collector's one judgement, stubbed. A STEP in the existing job, not
+      # a job of its own: a new job name is a new check name, and the ruleset
+      # and `merge-lane-self.yml` are separate edits that neither reads the
+      # other — a required name nothing emits blocks every merge silently. This
+      # job is already a `needs:` of the `Shell (syntax + drain rule)`
+      # aggregate, which IS the required name, so the assertions gate merges
+      # without anything outside this file having to change.
+      - name: fleet-audit collector self-test
+        run: bash scripts/ci/fleet-audit-collector.selftest.sh
+
   shell-runner-policy:
     name: Shell — runner policy
     runs-on: ubuntu-latest

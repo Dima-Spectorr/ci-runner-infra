@@ -338,7 +338,7 @@ backlog_facts() {
   local -a list=()
   mapfile -t list <<< "$entries"
 
-  local entry csha cdate cts body hits n=0 count=0 oldest="" capped=0 unread=0 skew=0
+  local entry csha cdate cts body hits n=0 count=0 oldest="" capped=0 unread=0 skew=0 undated=0
   for entry in "${list[@]}"; do
     [ -z "$entry" ] && continue
     n=$((n + 1))
@@ -366,8 +366,14 @@ backlog_facts() {
     cts=$(epoch_of "$cdate")
     # Unparseable or absent: this commit cannot date the backlog. The loop moves
     # on rather than substituting a number, and the tail below refuses to call
-    # the result an age.
-    [ -z "$cts" ] && continue
+    # the result an age. It is REMEMBERED, because "the oldest thing waiting has
+    # no readable date" is not the same as "there is nothing older than what I
+    # did date" — the self-test caught a matching commit with an unparseable
+    # date rendering as an entirely empty backlog.
+    if [ -z "$cts" ]; then
+      undated=$((undated + 1))
+      continue
+    fi
     # A COMMIT DATED IN THE FUTURE IS SKEW, AND SKEW IS UNKNOWN, NOT HEALTHY.
     # Clamping a negative age to zero read as "published moments ago" and, since
     # the age is taken from the FIRST match, it also stopped genuinely old
@@ -386,17 +392,24 @@ backlog_facts() {
   done
 
   # THE ONLY WAY TO PRINT `backlog=0` IS TO HAVE LOOKED AT EVERY COMMIT AND
-  # READ EVERY ONE OF THEM. Anything the walk could not resolve — a truncated
-  # scan, a refused commit read, a clock in the future — reports the count it
-  # has and NO age, which the rule turns into a warning. An age it could not
-  # establish is never rendered as a young one, and a walk it could not finish
-  # is never rendered as an empty backlog.
-  if [ -n "$oldest" ]; then
-    printf 'tag_readable=1;backlog=%s;backlog_hours=%s' "$count" "$oldest"
-  elif [ "$capped" = "1" ]; then
+  # READ EVERY ONE OF THEM — AND THE ONLY WAY TO PRINT AN AGE IS THE SAME.
+  # Anything the walk could not resolve — a truncated scan, a refused commit
+  # read, a clock in the future, a date that would not parse — reports the count
+  # it has and NO age, which the rule turns into a warning.
+  #
+  # THE UNKNOWNS ARE CHECKED BEFORE THE AGE, not after, and that ordering is the
+  # correction the self-test forced. The age is taken from the OLDEST matching
+  # commit, so when that one is the unreadable one, the first age the walk does
+  # establish belongs to a YOUNGER commit — and reporting it understates the
+  # backlog in exactly the direction that lets it slip under the threshold. An
+  # age established while something older was unreadable is not an age.
+  local unknown=$(( unread + skew + undated ))
+  if [ "$capped" = "1" ]; then
     printf 'tag_readable=1;backlog=%s' "$ahead"
-  elif [ "$unread" -gt 0 ] || [ "$skew" -gt 0 ]; then
-    printf 'tag_readable=1;backlog=%s' "$(( count > 0 ? count : unread + skew ))"
+  elif [ "$unknown" -gt 0 ]; then
+    printf 'tag_readable=1;backlog=%s' "$(( count > unknown ? count : unknown ))"
+  elif [ -n "$oldest" ]; then
+    printf 'tag_readable=1;backlog=%s;backlog_hours=%s' "$count" "$oldest"
   else
     printf 'tag_readable=1;backlog=0;backlog_hours=0'
   fi
