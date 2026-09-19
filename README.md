@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.106.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.107.0"
   # ...
 }
 ```
@@ -636,13 +636,16 @@ that image a real answer is separate work, not a line in this one.
 
   **Which caches are wired is a shorter list than it looks.** Nine are:
   npm, Yarn, pnpm's store, Go's *module* cache, pip, uv, Maven, NuGet, Composer.
-  Three are deliberately left alone. `GOCACHE`, Go's build cache, is not safe for
+  Two are deliberately left alone. `GOCACHE`, Go's build cache, is not safe for
   concurrent builds (golang/go#43645) and is a different directory from
-  `GOMODCACHE`. The Actions tool cache (`RUNNER_TOOL_CACHE`) has no locking at
-  all (actions/toolkit#804), and the `setup-*` actions treat it as a directory
-  they own and prune, so seeding it would buy a rebuild rather than a saving.
-  Gradle's `GRADLE_RO_DEP_CACHE` requires that nothing writes to it while builds
-  read it, which a slot's own live cache is not.
+  `GOMODCACHE`. Gradle's `GRADLE_RO_DEP_CACHE` requires that nothing writes to it
+  while builds read it, which a slot's own live cache is not.
+
+  The Actions tool cache (`RUNNER_TOOL_CACHE`) used to be on that list for the
+  same reason — no locking at all (actions/toolkit#804), and the `setup-*` actions
+  prune it as though they own it — and it is now wired, because the reason applies
+  to *sharing one directory between slots* and not to seeding a per-slot one. See
+  the next bullet.
 
   Go gets no `GOFLAGS=-modcacherw`. Go writes its module cache read-only by
   design, because `go.sum` authenticates the module *zip* at download and the
@@ -684,6 +687,75 @@ that image a real answer is separate work, not a line in this one.
   variables at all rather than variables pointing at a directory that is not
   there — the latter is a hard per-job failure, i.e. a missing speed-up turned
   into a broken pool.
+* **The runtime toolchain is baked into the image and seeded per slot.** A
+  `setup-node` / `setup-python` step resolves its version out of the runner's tool
+  cache, and the runner's default tool cache is `<work>/_tool` — inside the tree
+  the slot sweep empties between jobs. So every job re-downloaded the same pinned
+  runtime from `github.com`: measured at **215s of 637s of job wall time** across
+  an 11-job run, and a 93s `main-health` job wrapping a 10s type-check, which is
+  the merge lane's throughput ceiling (#962).
+
+  The image bakes the pinned runtime once, as an **archive** at
+  `/opt/ci-tool-cache` — root-owned, mode `0444`, with its `SHA256SUMS` and a
+  `MANIFEST` of `<tool>	<version>	<arch>	<archive>` rows taken at bake time.
+  Boot verifies the digest once, then extracts one private copy per slot into
+  `/var/lib/ci-cache/<idx>/tools/<tool>/<version>/<arch>` plus the sibling
+  `<arch>.complete` marker `@actions/tool-cache`'s `find()` tests for, and points
+  the agent unit at it with `RUNNER_TOOL_CACHE` **and** `AGENT_TOOLSDIRECTORY`
+  (`HostContext.cs` reads the first, older agents the second; neither is inherited
+  from anything, so both are set explicitly). That path is outside every `_work`
+  and outside every `$HOME`, so **the sweep does not touch it** and the runtime
+  survives for the life of the host.
+
+  An **archive** rather than an extracted tree under `/opt/ci-cache` for two
+  reasons: a Node install is full of relative symlinks (`bin/npx` →
+  `../lib/node_modules/npm/bin/npx-cli.js`) which the master's hostility scan
+  refuses outright, and a single file with a recorded digest spares root a
+  recursive `chown`/`chmod` walk over a symlinked tree on every boot. It is the
+  same shape `/opt/ci-images` already uses for content that gets executed.
+
+  The master is **read-mostly and never written at job time**: root verifies and
+  reads it, each slot writes only its own copy, so concurrent cross-slot reads are
+  all that ever happens to it and there is no race to lose. The copy is writable
+  and slot-owned on purpose — a job that asks for a runtime this image did not
+  bake, or runs `npm i -g`, must get a download and not an `EACCES`.
+
+  **A version mismatch must be loud, and there are three places it can be.** A
+  baked version that disagrees with the one a workflow pins does not fail:
+  `setup-node` silently downloads, exactly as it did before, so the image would be
+  larger and the fleet no faster while every measurement looked unchanged. That is
+  the repository's no-silent-fallback rule with a stopwatch attached, so each layer
+  reports at the point it can actually tell:
+
+  * **Bake time** — the provisioner checks the archive's digest against the pin
+    *and* runs `bin/node --version` against the extracted tree. A version moved
+    without its digest, or a digest that does not describe the version it claims,
+    fails the image build.
+  * **Boot** — a master that is missing, unverifiable, or not root-owned and
+    slot-unwritable is refused by name, and the host logs which runtimes it did
+    seed. It fails **open**, like every other cache step: a host without a tool
+    cache is as slow as every host was before this existed, and a host that
+    refuses to register is absent.
+  * **Per job** — the slot sweep reports it. The only things in a slot's tool
+    cache are what boot extracted and what a job wrote, and the `setup-*` actions
+    write exactly when they *miss*, so a `<tool>/<version>/<arch>.complete` the
+    MANIFEST does not name **is** a miss, and the log line names both sides:
+    `TOOL CACHE MISS — a job put node 24.22.0 (x64) in its tool cache; this image
+    baked node 24.21.0`. It is a report and not a control — the slot owns that
+    directory and root only reads names in it — which is the right shape: a slot
+    that lies about its own miss has chosen to be slow, and reaches nothing else.
+
+  The pin itself lives in `packer/ci-host-image.pkr.hcl` as
+  `tool_cache_node_version` + `tool_cache_node_sha256`, and it is the *build*
+  toolchain — distinct from `node_major`, the system Node on `PATH` for
+  `#!/usr/bin/env node` shims. It must be an exact `X.Y.Z`, because the tool cache
+  resolves a version as a directory *name*: `"24"` bakes a tree nothing ever
+  finds.
+
+  **This reaches a pool only when that pool recycles.** It is an image change, so
+  it takes effect on hosts built from a template created after the apply; it
+  cannot speed up a host that is already running.
+
 * **A warm cache is untrusted build input.** A poisoned cache entry survives to
   the next job, which the old destroy-per-job model made impossible. Three
   bounds keep that survival finite. A pool serves one repository, so an entry can

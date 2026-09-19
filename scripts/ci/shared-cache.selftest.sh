@@ -33,9 +33,11 @@
 #                     write, so pnpm and uv — whose whole performance model is
 #                     hardlinking out of the store — silently fall back to
 #                     copying, and the cache buys nothing.
-#   unsafe sharing    GOCACHE (golang/go#43645) and RUNNER_TOOL_CACHE
+#   unsafe sharing    GOCACHE (golang/go#43645) and the Actions tool cache
 #                     (actions/toolkit#804) are documented as NOT safe for
-#                     concurrent writers.
+#                     concurrent writers. GOCACHE is therefore absent outright;
+#                     the tool cache is present but per-slot, and this file
+#                     asserts it never names the shared read-only master (#962).
 #   root operates in a job-writable directory
 #                     The escalation, stated correctly — an earlier revision of
 #                     this file stated it wrongly and asserted the wrong fix.
@@ -110,7 +112,7 @@ skip() { SKIP=$((SKIP + 1)); printf 'SKIP: %s\n' "$1"; }
 # can never be what satisfies the check for it. This matters more here than
 # anywhere else in the repository, because the comments in this section NAME
 # every variable and every mechanism that must not be present — `GOCACHE`,
-# `RUNNER_TOOL_CACHE`, `cp -al`, `2775` and `UMask` all appear as documented
+# `GOCACHE`, `cp -al`, `2775` and `UMask` all appear as documented
 # rejections, so a check reading raw text would see them and pass.
 #
 # Takes one file or several. Several is what lets a predicate assert over a pair
@@ -395,15 +397,35 @@ has_atomic_seed() { # <file>
 
 # Documented as unsafe for concurrent writers by their own maintainers, and
 # excluded even though each slot now has its own copy: GOCACHE is unsafe between
-# the parallel builds INSIDE one job too, and the setup-* actions prune the tool
-# cache as though they own it.
+# the parallel builds INSIDE one job too.
+#
+# RUNNER_TOOL_CACHE / AGENT_TOOLSDIRECTORY WERE on this list and are no longer,
+# and the reason they were is still true: the setup-* actions prune and rewrite
+# the tool cache as though they own it (actions/toolkit#804), so two slots MUST
+# NOT be pointed at one directory. What changed is not that judgement — it is
+# that #962 measured what the exclusion cost (215s of 637s of job wall time on
+# a consumer repository's 11-job run spent re-downloading the same pinned Node),
+# and the image now bakes the runtime once and gives every slot its OWN writable
+# copy of it. So the invariant here is no longer "these variables are absent"; it
+# is that where they ARE set they name the per-slot path and never the shared
+# master, which stays root-owned and read-only.
 has_no_unsafe_sharing() { # <file>
   local code
   code=$(code_of "$1")
   ! matches "$code" 'GOCACHE'              || return 1
-  ! matches "$code" 'RUNNER_TOOL_CACHE'    || return 1
-  ! matches "$code" 'AGENT_TOOLSDIRECTORY' || return 1
   ! matches "$code" 'GRADLE_RO_DEP_CACHE'  || return 1
+  # Per-slot, by the same $c the dependency caches use, and NEVER the baked
+  # master: one shared tool cache is the concurrent-writer bug above, and it is
+  # also read-only, which turns every cache MISS into an EACCES the job cannot
+  # explain instead of the download it should have been.
+  ! matches "$code" 'RUNNER_TOOL_CACHE=.*TOOL_CACHE_MASTER'    || return 1
+  ! matches "$code" 'AGENT_TOOLSDIRECTORY=.*TOOL_CACHE_MASTER' || return 1
+  ! matches "$code" 'RUNNER_TOOL_CACHE=/opt'                   || return 1
+  ! matches "$code" 'AGENT_TOOLSDIRECTORY=/opt'                || return 1
+  if matches "$code" 'Environment=RUNNER_TOOL_CACHE='; then
+    matches "$code" '^Environment=RUNNER_TOOL_CACHE=\$c/\$TOOL_CACHE_NAME$'    || return 1
+    matches "$code" '^Environment=AGENT_TOOLSDIRECTORY=\$c/\$TOOL_CACHE_NAME$' || return 1
+  fi
   # -modcacherw makes Go's extracted modules writable. go.sum authenticates the
   # module ZIP at download; the build compiles from the extracted tree and never
   # re-hashes it, which is why `go mod verify` is a separate command. Read-only
@@ -1851,7 +1873,7 @@ mutate 'a torn seed becomes visible' has_atomic_seed \
   's|"\$dst/\.seed-\$d"|"$dst/$d"|g'
 
 mutate 'GOCACHE is shared'          has_no_unsafe_sharing 's|^Environment=GOMODCACHE=.*$|Environment=GOCACHE=$c/go-build|'
-mutate 'the tool cache is shared'   has_no_unsafe_sharing 's|^Environment=UV_CACHE_DIR=.*$|Environment=RUNNER_TOOL_CACHE=$c/tools|'
+mutate 'the tool cache points at the read-only baked master' has_no_unsafe_sharing   's@^Environment=RUNNER_TOOL_CACHE=.*$@Environment=RUNNER_TOOL_CACHE=$TOOL_CACHE_MASTER/$TOOL_CACHE_NAME@'
 mutate '-modcacherw comes back'     has_no_unsafe_sharing 's|^Environment=GOMODCACHE=(.*)$|Environment=GOMODCACHE=\1\nEnvironment=GOFLAGS=-modcacherw|'
 
 mutate 'a cache failure blocks registration' has_fail_open \
