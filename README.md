@@ -1138,12 +1138,59 @@ rule, because this one only reports, and "did not check" must never render like
 
 ## Releasing a version
 
-`VERSION` holds the tag this repository currently publishes. Bump it **in the
-same pull request as the change being released**. CI asserts that every module
-pin printed in the documentation names the version in `VERSION`
-(`scripts/ci/docs-pins.selftest.sh`) — the README quickstart had otherwise sat
-three minor versions behind the fleet, in the one line a new consumer is most
-likely to paste verbatim.
+`VERSION` holds the tag this repository currently publishes. **The number may
+move in the change itself, or in a later `chore(release): vX.Y.Z — <title>`
+pull request that sweeps up everything waiting behind it. Both happen here, and
+both are correct.** Of the last eight merges to main touching a released
+surface — `modules/`, `scripts/` — four moved `VERSION` themselves and four
+left it untouched to be swept up later. Either way the guarantee is the same:
+the number moves within a bounded time, and the watchdog below is what bounds
+it.
+
+**Why there is no gate demanding the bump in the same pull request.** `VERSION`
+is a single line holding a single number, and the next number is decided when
+the branch is written rather than when it merges. Two pull requests in flight at
+once both pick the same one; whichever merges second either conflicts or lands a
+version that has already been published, and main goes red for every open pull
+request until somebody sorts it out. A gate requiring every released-surface
+pull request to bump would make that collision the *normal* path rather than an
+occasional one. Deferring the bump is the escape from it — and its only cost is
+that a merged fix is not yet a released fix, which is a question about elapsed
+time and is therefore answered by a clock rather than by a pull-request check.
+
+CI asserts that every module pin printed in the documentation names the version
+in `VERSION` (`scripts/ci/docs-pins.selftest.sh`), so moving the number and
+re-pinning the documentation happen in the same release pull request — the
+README quickstart had otherwise sat three minor versions behind the fleet, in
+the one line a new consumer is most likely to paste verbatim.
+
+**What stops a deferred bump from becoming an omission.** Until the number moves
+and `publish-tag.yml` advances the floating tag behind it, nothing a consumer
+pins has changed, so a merged change has reached nobody. That delay is normal
+and short: of the 120 released-surface merges
+measured on this repository, 119 were published inside 53 hours. One was not —
+it sat for nine and a half days, reaching no consumer, with every gate green,
+and would have gone unnoticed if a later release had not happened to sweep it
+up. The delay was never the defect; nobody noticing was.
+
+So the daily [fleet audit](.github/workflows/fleet-audit.yml) asks it. It reads
+the floating `v5` tag **from the API, never from a checkout** — `git fetch
+--tags` does not move a tag that already exists locally, which gives a wrong
+answer in both directions — lists the commits on main newer than that tag which
+touch a released surface, and reports a failure when the **oldest** of them has
+been waiting longer than 72 hours. That number is a ceiling on the wait, not a
+target: a non-empty backlog under it is reported as compliant, with its size and
+age attached, so a batch can be watched growing rather than met on the day it
+crosses. An unreadable tag is a failure too, never an empty backlog. Override
+the ceiling with the `UNRELEASED_BACKLOG_MAX_HOURS` repository variable; `0`
+turns the watchdog off, and says so in the report rather than going quiet.
+
+It is deliberately **not** a pull-request check. The condition becomes true
+through the passage of time rather than through a push, so no push-triggered
+check could fire on it — and a red default branch blocks and confuses every open
+pull request, while a check that is red on states that are legitimate teaches
+everyone to ignore it (see the note in `release-tag.yml`). The audit runs on a
+schedule, posts to the audit issue, and reddens its own run only.
 
 **The tag is created for you.** On every push to main, `publish-tag.yml` reads
 `VERSION` and creates that annotated tag at the merge commit if it does not
