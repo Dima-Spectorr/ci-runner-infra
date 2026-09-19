@@ -166,6 +166,38 @@ on:
         required: false
         default: 0
         type: number
+      newer-incomplete-max-staleness-seconds:
+        description: >-
+          How long a later, unfinished check_suite of the SAME app may keep a
+          required check that is otherwise green on hold. One hour by default.
+
+
+          The lane holds a green required check while the app that posted it
+          has a suite created after the authoritative one that has not reached
+          `completed`, because that suite may still post its own occurrence of
+          the name -- without the hold, GitHub calls the context `expected` and
+          refuses the merge with a 405. The hold has no ceiling of its own: a
+          suite that never completes, which is what GitHub does with a workflow
+          whose trigger never schedules a job, would hold every required name of
+          that app for as long as the head sha lives while the ruleset itself is
+          satisfied.
+
+
+          The bound is on the AGE OF THE NEWEST SUITE STILL HOLDING, not on how
+          long the lane has waited -- a suite created seconds ago deserves the
+          wait however long a stuck sibling has sat there. Past it the lane
+          takes the green and says so with a warning naming the app, the check,
+          the suite and its age; it never upgrades a check that is red, absent
+          or genuinely pending.
+
+
+          Raise it on a repository whose required jobs legitimately queue for
+          longer than this. `0` turns the bound off and restores the unbounded
+          hold, which is the safest reading against a 405 and the one that can
+          wedge.
+        required: false
+        default: 3600
+        type: number
       review-bots:
         description: >-
           Newline-separated logins of the automated reviewers a green pull
@@ -571,6 +603,7 @@ jobs:
           PRIORITY_PREFIX: ${{ inputs.priority-label-prefix }}
           BASE_HEALTH_GRACE: ${{ inputs.base-health-grace-seconds }}
           BASE_HEALTH_MAX_STALENESS: ${{ inputs.base-health-max-staleness-seconds }}
+          NEWER_INCOMPLETE_MAX_STALENESS: ${{ inputs.newer-incomplete-max-staleness-seconds }}
           STATUS_ISSUE: ${{ inputs.status-issue }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: bash scripts/ci/merge-lane.sh

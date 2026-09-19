@@ -270,6 +270,48 @@ BASE_HEALTH_MAX_STALENESS="${BASE_HEALTH_MAX_STALENESS:-0}"
 # behind" the window exists to bridge.
 BASE_HEALTH_MAX_HOPS=5
 
+# HOW LONG A LATER, UNFINISHED SUITE OF THE SAME APP MAY HOLD A REQUIRED CHECK
+# THAT IS OTHERWISE GREEN.
+#
+# `check_counts` downgrades a surviving `success` to `pending` while the app
+# that posted it has a check_suite created AFTER the authoritative one for that
+# name and not yet `completed` — the hold that keeps #955 fixed
+# (Telnet-Emulation PR #1354: the ruleset called the required context
+# `expected`, the lane called it green, GitHub refused the merge with a 405).
+# Read the hold's own block inside `check_counts` before touching this number.
+#
+# THE HOLD HAD NO CEILING, AND THAT IS #963. A suite that sticks non-`completed`
+# forever — GitHub's behaviour for a workflow whose trigger never schedules a
+# job — holds EVERY required name of that app `pending` for as long as the sha
+# lives, while the ruleset itself is satisfied the whole time. It has not been
+# observed here: the permanently-`queued` suites on this fleet
+# (`google-cloud-build`, `google-cloud-developer-connect`, `claude`) all belong
+# to OTHER apps, which the hold never consults. But nothing in the read makes
+# it impossible, and an unbounded hold is a wedged repository rather than a
+# slow one.
+#
+# ONE HOUR, AND DELIBERATELY NOT TIGHT. The hold is the only thing standing
+# between the lane and a 405, so the bound is sized against the slowest HONEST
+# queue-to-post latency MEASURED on this fleet rather than the typical one.
+# Three figures set the floor: scale-from-zero warm-up is two to four minutes
+# and `DEMAND_GRACE` allows fifteen (`docs/fleet-audit.md`); no job here is
+# given a `timeout-minutes` above thirty; and the worst real wait on record is
+# a required job that sat queued for THIRTY-ONE MINUTES because a workflow
+# hardcoded the CI pool's labels, for sixty-five seconds of work
+# (`docs/ci-merge-queue-baseline.md`, `docs/merge-queue-stall-recovery.md`).
+# An hour is roughly twice that worst documented wait and above every other
+# figure, which is the margin wanted here. What the non-zero
+# default costs, said plainly: a suite that genuinely needs more than an hour
+# to post its first occurrence of a required name gets its predecessor's green
+# trusted, and the lane may take one 405 — loud, logged, and retried on the
+# next pass — where today it would have waited. That is the trade #963 asks
+# for, and unlike `BASE_HEALTH_MAX_STALENESS` it arrives at every consumer when
+# `v5` moves, which is why it is bounded high rather than opted into.
+#
+# `0` IS THE OPT-OUT, NOT THE DEFAULT. It restores the unbounded hold, for a
+# repository that would rather wedge than risk the 405.
+NEWER_INCOMPLETE_MAX_STALENESS="${NEWER_INCOMPLETE_MAX_STALENESS:-3600}"
+
 # Whether anything answers for the base tip at all, decided once per pass and
 # read by `lane_base_is_vouched`. Empty means inert, which is the whole fleet
 # minus the repositories that have been armed.
@@ -429,14 +471,32 @@ check_counts() {
   # `google-cloud-build`, `claude`, ... observed permanently `queued`) is never
   # consulted for a name it never posted.
   #
-  # THE RESIDUAL RISK, NAMED RATHER THAN HIDDEN: a suite of the SAME app that
-  # sticks non-`completed` forever would hold that app's names `pending` for as
-  # long as the sha lives. None has been observed on this fleet — the
-  # permanently-`queued` suites are all other apps — and the failure mode is a
-  # LOUD one (the lane logs the wait and retries) rather than the silent
-  # `missing-required` skip the per-app version produced. A staleness bound on
-  # the hold, like `BASE_HEALTH_MAX_STALENESS`, is tracked in #963 rather
-  # than folded in here.
+  # THE RESIDUAL RISK IS NOW BOUNDED RATHER THAN MERELY NAMED (#963). A suite
+  # of the SAME app that sticks non-`completed` forever would otherwise hold
+  # that app's names `pending` for as long as the sha lives, with the ruleset
+  # satisfied the whole time. `NEWER_INCOMPLETE_MAX_STALENESS` is the ceiling on
+  # that, and the entry carries the two fields the escape needs to apply it:
+  # `newer_id` and `newer_at`, the identity and creation time of the holding
+  # suite the bound is measured against.
+  #
+  # THE BOUND IS ON THE AGE OF THE HOLDING SUITE, NOT ON THE LANE'S OWN WAIT,
+  # SO THE FIELDS DESCRIBE THE NEWEST HOLDER AND NOT THE OLDEST. The intuitive
+  # reading — expire once the hold has lasted long enough — is the wrong one
+  # here. The hold exists because some later suite MIGHT STILL POST the name,
+  # and a suite created thirty seconds ago genuinely deserves the wait however
+  # long an older sibling has been stuck. So the question is "has EVERY suite
+  # that could still post this name had its chance", which is answered by the
+  # NEWEST of them: bound the oldest instead and a brand-new suite is walked
+  # past the moment one ancient sibling crosses the line, which is #955 again
+  # with a timer on it.
+  #
+  # A HOLDER WITH NO `created_at` MAKES THE AGE UNKNOWN, AND UNKNOWN IS NOT
+  # OLD. The read can return an empty timestamp — the arm above exists for it —
+  # and treating that as infinitely old would expire the hold on the suite the
+  # lane knows LEAST about, which is the unsafe direction: a failed or partial
+  # read would start trusting stale greens. So an undated holder wins the
+  # `newer_at` slot outright with `""`, the escape declines to compute an age,
+  # and the hold stands until that suite either completes or comes back dated.
   #
   # THE HOLD ORDERS SUITES THE SAME WAY THE AUTHORITY DOES, on
   # `[created_at, id]` and not on `created_at` alone. Same-second sibling suites
@@ -479,16 +539,25 @@ check_counts() {
        | group_by([.app, .name])
        | map(.[-1])
        | map(. as $w
+             | ($suites
+                | map(select(.app == $w.app
+                             and .status != "completed"
+                             and (([.created_at, .id]
+                                   > [$w.created_at, $w.suite])
+                                  or (.created_at == ""
+                                      and .id > $w.suite))))) as $holders
+             | ($holders | map(select(.created_at == "")) | sort_by(.id)) as $undated
              | {($w.app): {($w.name):
                  {id: $w.suite, status: $w.status,
-                  newer_incomplete: (($suites
-                    | map(select(.app == $w.app
-                                 and .status != "completed"
-                                 and (([.created_at, .id]
-                                       > [$w.created_at, $w.suite])
-                                      or (.created_at == ""
-                                          and .id > $w.suite))))
-                    | length) > 0)}}})
+                  newer_incomplete: (($holders | length) > 0),
+                  newer_id: (if ($undated | length) > 0 then $undated[-1].id
+                             elif ($holders | length) > 0
+                             then ($holders | sort_by([.created_at, .id]) | .[-1].id)
+                             else 0 end),
+                  newer_at: (if ($undated | length) > 0 then ""
+                             elif ($holders | length) > 0
+                             then ($holders | sort_by([.created_at, .id]) | .[-1].created_at)
+                             else "" end)}}})
        | reduce .[] as $e ({}; . * $e)')"
 
   # The status surface is treated differently on purpose. A repository may
@@ -570,6 +639,7 @@ check_counts() {
   local -a were_skipped=()
   for name in "${REQUIRED[@]}"; do
     local winner_origin winner_app winner_suite auth_id auth_newer auth_state
+    local auth_newer_id auth_newer_at
     state="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].state // "absent"')"
     winner_origin="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].origin // ""')"
 
@@ -591,6 +661,11 @@ check_counts() {
       winner_suite="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].suite // -1')"
       auth_id="$(printf '%s' "$name_auth" | jq -r --arg a "$winner_app" --arg n "$name" '.[$a][$n].id // ""')"
       auth_newer="$(printf '%s' "$name_auth" | jq -r --arg a "$winner_app" --arg n "$name" '.[$a][$n].newer_incomplete // false')"
+      # The identity and creation time of the NEWEST suite doing the holding —
+      # read whether or not the hold fires, so the staleness escape below and
+      # its warning describe the same suite the hold is about.
+      auth_newer_id="$(printf '%s' "$name_auth" | jq -r --arg a "$winner_app" --arg n "$name" '.[$a][$n].newer_id // 0')"
+      auth_newer_at="$(printf '%s' "$name_auth" | jq -r --arg a "$winner_app" --arg n "$name" '.[$a][$n].newer_at // ""')"
 
       if [ -z "$auth_id" ]; then
         # NO SILENT FALLBACK: an app that posted a check-run of this name but
@@ -649,8 +724,60 @@ check_counts() {
         # Applying it AFTER both arms, and only to a surviving `success`, keeps
         # a `failure` from the authoritative suite as `failure` (#1582) rather
         # than softening it into a wait.
+        #
+        # AND IT IS BOUNDED (#963). The hold is unbounded on its own: a same-app
+        # suite that never reaches `completed` holds this name for as long as
+        # the sha lives. Past `NEWER_INCOMPLETE_MAX_STALENESS` the newest suite
+        # that could still post the name has had its chance and the hold is
+        # declined — see the knob's own block for the number and what it costs.
+        #
+        # THE ESCAPE CAN ONLY DECLINE ONE DOWNGRADE, WHICH IS WHY IT LIVES
+        # INSIDE THIS `if` AND NOT BESIDE IT. Everything reachable from here has
+        # already survived the authority check as a `success`; the escape's only
+        # possible effect is to leave `$state` as the `success` it already was.
+        # A `failure` (PR #1582), an `absent`, a genuine `pending` — none of
+        # them can reach this branch at all, so "the bound never upgrades
+        # anything" is a property of where the code sits rather than of reading
+        # it carefully.
+        #
+        # THE CLOCK IS THE ONE THE REST OF THE FILE USES — `date -u +%s` against
+        # a `date -u -d` parse of the API timestamp, as the base-health grace
+        # and the window walk both do. It is read here rather than taken from
+        # `LANE_STARTED` because this is a verdict about the world as it is now,
+        # and `check_counts` runs in a COMMAND SUBSTITUTION: the assignment
+        # below dies with the subshell, which is fine because nothing outside
+        # wants it, and is exactly why the warn-once guards nearby are files.
+        #
+        # AN UNPARSEABLE OR EMPTY `newer_at` RESOLVES TO AGE ZERO, not to an
+        # enormous age. Same direction as the undated arm in `name_auth` above
+        # and the OPPOSITE of the grace clock's fallback: there an unbounded
+        # wait was the worse failure, here the permissive reading would trust a
+        # stale green on a timestamp the lane could not read.
         if [ "$state" = "success" ] && [ "$auth_newer" = "true" ]; then
-          state="pending"
+          local hold_age=0 hold_now
+          if [ -n "$auth_newer_at" ]; then
+            hold_now="$(date -u +%s)"
+            hold_age=$(( hold_now - $(date -u -d "$auth_newer_at" +%s 2>/dev/null || echo "$hold_now") ))
+          fi
+          if [ "$NEWER_INCOMPLETE_MAX_STALENESS" -gt 0 ] \
+            && [ "$hold_age" -ge "$NEWER_INCOMPLETE_MAX_STALENESS" ]; then
+            # NOT A SILENT FALLBACK, AND NOT WARN-ONCE EITHER. A silent escape
+            # would rebuild the class of defect the per-app authority produced —
+            # a required check quietly stopping being consulted — which review
+            # of PR #961 called strictly worse than the 405 it replaces, because
+            # a 405 is at least loud. It is not deduplicated to a file the way
+            # the unverifiable-correlation warnings are: this one is the reason
+            # a merge is being ATTEMPTED, so the operator needs it on the pass
+            # that merged, naming the suite to go and look at.
+            #
+            # STDERR, like every other diagnostic in this function, because this
+            # function's stdout IS its return value. The runner parses workflow
+            # commands off both streams, so the `::warning::` annotation still
+            # appears.
+            echo "::warning::lane: $sha — check '$name' is green and app '$winner_app' has suite $auth_newer_id still unfinished (created $auth_newer_at, ${hold_age}s ago, past the ${NEWER_INCOMPLETE_MAX_STALENESS}s bound), so the hold on it is expired and the green is taken. If GitHub now refuses the merge with a 405 saying the context is expected, that suite is posting late rather than stuck and this repository's newer-incomplete-max-staleness-seconds is too low." >&2
+          else
+            state="pending"
+          fi
         fi
       fi
       # else: this run's suite is the authoritative one for its name and the
