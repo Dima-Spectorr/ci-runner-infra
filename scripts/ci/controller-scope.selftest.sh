@@ -1403,11 +1403,13 @@ cordon_seq() {
       # the real filter selects '<host>-s*' names, which is a separate concern
       # and is covered where the roster is parsed.
       jq() { local i=1 n; n=\$(wc -l <'$dir/codes'); while [ \"\$i\" -le \"\$n\" ]; do echo \"\$i\"; i=\$((i + 1)); done; }
-      # `none` is curl printing NOTHING -- a connection that died before -w
-      # could write a status at all. `000` is curl's own value for the same
-      # class of failure when it does get to write one. Both are tested: an
-      # empty \$code and a literal 000 are different strings, and the arm has
-      # to catch both.
+      # A code of 'none' is curl printing NOTHING -- a connection that died
+      # before -w could write a status at all. 000 is curl's own value for the
+      # same class of failure when it DOES get to write one. Both are tested:
+      # an empty \$code and a literal 000 are different strings, and the arm
+      # has to catch both. No backticks anywhere in this string: shellcheck
+      # reads the outer file, where a backtick inside these double quotes is a
+      # command substitution and not the prose it looks like (SC2006).
       curl() { local n c; n=\$(( \$(cat '$dir/ncalls' 2>/dev/null || echo 0) + 1 )); echo \"\$n\" >'$dir/ncalls'; c=\$(sed -n \"\${n}p\" '$dir/codes'); [ \"\$c\" = none ] || printf '%s' \"\$c\"; }
       $(fn cordon_seconds)
       $(fn cordon_host)
