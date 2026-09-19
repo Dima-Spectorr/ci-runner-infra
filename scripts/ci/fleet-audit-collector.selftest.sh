@@ -342,5 +342,32 @@ reset_fixture
 F_CMP='{"ahead_by":4,"base_commit":{"commit":{"committer":{"date":"'"$(iso 7200)"'"}}},"commits":[]}'
 is "tag_readable=1" "ahead_by with an empty commit list is unknown"
 
+
+# --- the two guards around the collector ---------------------------------------
+#
+# Neither is a judgement inside backlog_facts(), and both fail the way this
+# whole file exists to catch: quietly, leaving an audit that still reports
+# facts. Each is decided once at load, so each is asserted by re-entering the
+# script in a subshell rather than by calling a function.
+
+# A cap that `test` cannot compare is not a cap. `[ "$n" -gt abc ]` EXITS 2
+# rather than returning false, the walk then reads that as "not past the cap",
+# and one operator typo turns a 40-call audit into one call per commit.
+load() { FLEET_AUDIT_LIB=1 FLEET_OWNER=acct FLOATING_TAG=v9 BACKLOG_SCAN_MAX="$1" \
+  bash -c 'source "$0" && printf "%s" "$BACKLOG_SCAN_MAX"' "$HERE/fleet-audit.sh" 2>/dev/null; }
+eq "$(load abc)" "40" "a scan cap that is not a number falls back to the default"
+eq "$(load '')"  "40" "an empty scan cap falls back to the default"
+eq "$(load 7)"   "7"  "a numeric scan cap is honoured"
+eq "$(load 0)"   "0"  "zero is a whole number, and still caps the walk at zero"
+
+# The library guard has to mean the same thing however the file was entered.
+# EXECUTED with the variable set, a bare top-level `return` is an error that
+# stops nothing under `set -uo pipefail`, so the audit it was told not to run
+# runs anyway — against the real account, from a test.
+eq "$(FLEET_AUDIT_LIB=1 bash "$HERE/fleet-audit.sh" >/dev/null 2>&1; echo "$?")" "0" \
+   "the library guard stops an EXECUTED run instead of falling through it"
+eq "$(FLEET_AUDIT_LIB=1 bash "$HERE/fleet-audit.sh" 2>&1 >/dev/null | wc -l | tr -d ' ')" "0" \
+   "and it stops quietly, with nothing on stderr"
+
 printf '\nfleet-audit collector self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
