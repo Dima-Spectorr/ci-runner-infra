@@ -114,6 +114,25 @@ SLOT_TEMPLATE="$SB/template"
 PIN_DIR="$SLOT_STATE/.pin"
 SLOTS=$IDX
 
+# The tool cache the reset hook REPORTS on. Bound here for the same reason
+# SLOT_USER_PREFIX is bound further down: host-startup.sh bakes these three into
+# the hook at write time, the expansion below runs under `set -u`, and a name it
+# has not heard of does not render empty — it aborts the whole here-document.
+# expand_into catches that and says so, which is the only reason this is a line
+# of setup rather than an afternoon.
+#
+# Pointed inside $SB like everything else here. This file runs under `sudo -n` on
+# a real slot host, where /var/lib/ci-cache and /opt/ci-tool-cache exist and
+# belong to live jobs; the hook only reads names out of them, but a fixture that
+# can reach a production path at all is a fixture one edit away from writing to
+# it.
+# shellcheck disable=SC2034  # read by the here-document bodies, through the eval
+CACHE_SLOTS="$SB/cache"
+# shellcheck disable=SC2034
+TOOL_CACHE_MASTER="$SB/tool-master"
+# shellcheck disable=SC2034
+TOOL_CACHE_NAME=tools
+
 WORK="$SLOT_ROOT/$IDX/_work"
 WORKSPACE="$WORK/$OWNER/$REPO"
 MARKER="$SLOT_STATE/$IDX/clean"
