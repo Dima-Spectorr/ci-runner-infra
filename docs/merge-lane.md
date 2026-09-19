@@ -985,6 +985,59 @@ Two consequences worth stating plainly:
   `pull_request` publishes nothing on the tip, which is the same silent disarm
   arrived at without anyone choosing it.
 
+#### The throughput ceiling this gate buys, and which way out was taken (#959)
+
+The gate has a measured price, and it is a **ceiling** rather than a slowdown:
+roughly `3600 / (base_health_duration + poll_interval)` merges per hour, per
+repository. Below that rate it is free; above it, no amount of per-PR CI speed
+is visible, because the queue is not waiting on CI.
+
+**Measured** — `Telnet-Emulation`, 2026-09-19 10:50Z–11:42Z: 14 merges in 52
+minutes, inter-merge gaps 3, 3, 7, 3, 3, 3, 2, 3, 3, 5, 6, 6, 3, 5 minutes
+(median 3). `main-health` over the same window, 8 runs: 83, 84, 95, 99, 140,
+221, 86 seconds — median ~93s. The gap *is* the health job plus the poll
+interval; nothing else in the window accounts for it, and 7 of the 11 open
+non-draft pull requests sat `CLEAN` throughout. So a 20-PR backlog takes 75+
+minutes to drain however fast the per-PR checks get.
+
+Four ways out were considered. **Option 2 was taken; 3 and 4 were not**, and for
+the same reason: they spend a safety property that was added on purpose, and a
+throughput argument is not enough to buy it back.
+
+| | Option | Taken | Why |
+|---|---|---|---|
+| 1 | Do nothing | no | The ceiling sits above the normal arrival rate, but it bites exactly when it hurts — once a backlog has already formed. |
+| 2 | **Make the health job itself faster** | **yes** | Gives up no safety at all: every merge still waits for a fresh green answer on the tip it is landing on. Only the answer arrives sooner. |
+| 3 | Bounded staleness (`base-health-max-staleness-seconds > 0`) | no, but available | Lets an *ancestor's* answer vouch for a tip nothing has answered for. Implemented, documented above, and deliberately **opt-in per repository** — one repository outrunning its health job is not a reason to relax the gate on the others. |
+| 4 | Merge a batch, then health-check once | no | Largest gain, largest blast radius: a batch that breaks the base implicates several pull requests at once and makes bisection harder. That guarantee is the reason the gate exists, so spending it for cadence is the one trade this design refuses. |
+
+**What option 2 actually was, and the prediction it has to answer for.** The
+first move on it is the baked tool cache (#962): a pool host now carries the
+pinned runtime outside every slot's `_work`, so `setup-node` stops
+re-downloading it per job. Measured on the same repository and day, run
+`35440557902`: 11 jobs, 637s of job wall time, **215s of it — 34% — in `Set up
+Node.js`**. A `main-health` job wrapping a 10s type-check spent 93s, nearly all
+of it setup. See the baked-runtime-toolchain bullet under *Isolation rules* in
+[`README.md`](../README.md) for what is baked, how an operator changes it, and
+why the slot's copy is rebuilt at every job boundary.
+
+The prediction is falsifiable and should be checked rather than assumed: once
+the image rolls out, `main-health` should fall from ~93s to roughly 30s and the
+ceiling should rise from ~16 to ~40 merges/hour, with the gate unchanged. If it
+does not, option 2 is exhausted and the trade in rows 3 and 4 has to be decided
+rather than avoided.
+
+**A repository can be paying the ceiling without ever getting an answer.** With
+`base-health-checks` unset the gate falls back to `required-checks`, which are
+pull-request checks that never run on the base tip (see the bullet above). The
+answer is then `unanswered` by construction, every merge waits out the full
+`base-health-grace-seconds` and proceeds anyway — all cost, no safety. Observed
+on this repository on 2026-09-19: one all-green pull request with no competing
+candidate took 23.5 minutes to merge across five lane passes. Run
+[`check-base-health-contract.sh`](../scripts/ci/check-base-health-contract.sh)
+before concluding a repository is merely slow; #967 tracks the related case
+where a *completed* success on the tip still reads as unanswered.
+
 #### And the half that runs before the lane: `pr-guard`
 
 The base-health gate is a backstop — it acts after something has already
