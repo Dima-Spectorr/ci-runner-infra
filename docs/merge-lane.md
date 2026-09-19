@@ -1142,6 +1142,30 @@ queue can express: **priority**. A label like `merge-lane/priority-10` orders
 the lane ahead of the default 50, so a docs-only fix does not queue behind an
 infrastructure change.
 
+### Superseded check_suite vs a required context
+
+A merge can come back refused with a 405, `Required status check "X" is
+expected.`, on a candidate the lane's own read just called green. Measured on
+Telnet-Emulation run 35428114193 (PR #1354, sha `5d824839`): the head sha had
+picked up four separate check_suites for `CI summary (rollup)` over about an
+hour (two `workflow_dispatch` re-dispatches plus a `pull_request`-triggered
+rerun, no new commit). `check_counts()` flattens check-runs across every
+check_suite for a sha and keeps, per name, whichever occurrence has the latest
+`completed_at`/`started_at` — at merge time that was a completed, successful
+run from a now-superseded suite. GitHub's ruleset evaluates a required context
+against the *current* check_suite for the ref, and that suite had not yet
+posted its own copy of the check, so it read as absent.
+
+The lane treats this refusal as being about ONE candidate's own head — see
+`lane_report_refusal()` — and skips it for the pass rather than ending the
+batch, which is the head-of-line-blocking fix. It does **not** change how
+`check_counts()` computes greenness: correlating a check-run read to
+check_suite lineage (or otherwise detecting a newer, not-yet-reporting suite)
+is a greenness-semantics decision that would apply fleet-wide the moment `v5`
+moves, and belongs in its own change, not bundled with a fall-through fix.
+Tracked as the follow-up in
+[ci-runner-infra#955](https://github.com/Dima-Spectorr/ci-runner-infra/issues/955).
+
 ## Where the logic lives, and why it is testable
 
 Neither the workflow nor the API driver can be exercised by the pull request
