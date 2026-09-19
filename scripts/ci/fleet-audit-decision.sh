@@ -120,13 +120,23 @@ _fleet_is_number() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; es
 #
 #   0h: 84   1h: 13   2h: 7   3h: 6   4h: 2   8h: 2
 #   30h: 1   31h: 1   52h: 2   53h: 1
-#   227h: 1   <- the omission #960 reported
+#   227h: 1   <- a9644d7, "a truncated runner listing … deleted it" (#765)
 #
-# 119 of 120 were swept up inside 53 hours. The single outlier sat for nine and
-# a half days and reached no consumer, and nothing anywhere said so. 72 hours is
-# above every healthy observation with room to spare and far below the one real
-# failure, so it fires on the shape that went wrong and is silent on the shape
-# that is working as intended. It is a ceiling on the batch, NOT a target: a
+# 119 of 120 were swept up inside 53 hours. The single outlier, a9644d7, sat for
+# nine and a half days — a controller fix that deleted working hosts, merged and
+# reaching nobody — and nothing anywhere said so.
+#
+# WHAT THIS DOES AND DOES NOT CATCH. It would NOT have caught the commit #960
+# was filed about: `afc9bf3` (#957) was published about two hours after it
+# merged and never came close to any threshold worth setting. That is the point
+# rather than a gap. #960 found a real hole by looking at a case that happened
+# to fall through it, and the hole is that NOTHING bounds the wait — not that
+# any particular commit waited too long. So this is a bound on the batch, and
+# a9644d7 is what an unbounded batch actually costs.
+#
+# 72 hours is above every healthy observation with room to spare and far below
+# the one real failure, so it fires on the shape that went wrong and is silent
+# on the shape that is working as intended. It is a ceiling, NOT a target: a
 # backlog under it is a perfectly healthy state and is reported as compliant.
 #
 # The default lives HERE and nowhere else on purpose. fleet-audit.sh passes the
@@ -265,6 +275,13 @@ fleet_verdict() {
         # spells it. Reported rather than silent: a watchdog somebody turned off
         # and a watchdog that finds nothing must not render the same, which is
         # the invariant this whole file exists for.
+        #
+        # DELIBERATELY BEFORE THE TAG CHECK, so `0` silences the unreadable-tag
+        # finding too. The tag is only read in order to bound the backlog, so an
+        # operator who has said they do not want the backlog bounded is not left
+        # with a daily failure about the input to a measurement nobody is
+        # taking. The tag itself is not unwatched: publish-tag.yml asserts the
+        # floating tag on every push, and release-tag.yml on every tag.
         echo "ok:compliant tier=source backlog-watchdog=off"
         return 0
       fi
