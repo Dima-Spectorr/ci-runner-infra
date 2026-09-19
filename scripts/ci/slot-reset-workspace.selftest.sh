@@ -94,25 +94,63 @@ IDX=987654
 
 render_hook() { # <template> <slot-root> -> path to a runnable hook
   local tmpl="$1" out="$2/hook.sh"
-  # A subshell, so the four names below are scoped to this expansion and cannot
-  # leak into the next case's. They are plain assignments rather than a prefix on
+  # A subshell, so the names below are scoped to this expansion and cannot leak
+  # into the next case's. They are plain assignments rather than a prefix on
   # `eval`, because a prefix on a BUILTIN is exactly the shape whose scope differs
   # between shells and modes — and the whole point here is to reproduce the host's
   # expansion faithfully, not to be terse about it.
+  #
+  # EVERY write-time name the template expands has to be here. host-startup.sh
+  # runs under `set -u` and so does this file, so one the fixture has not heard of
+  # does not render as an empty string — it aborts the expansion. See the guard
+  # below for why that is worth a paragraph.
   (
     SLOT_ROOT="$2/slots"
     SLOT_STATE="$2/state"
     SLOT_TEMPLATE="$2/template"
     SLOT_USER_PREFIX="ci-s"
     PIN_DIR="$2/pin"
+    # The tool cache the hook REPORTS on (it never sweeps it). Pointed inside the
+    # fixture, like everything else here, so nothing can reach /var/lib/ci-cache
+    # or /opt/ci-tool-cache on a host that has them.
+    CACHE_SLOTS="$2/cache"
+    TOOL_CACHE_MASTER="$2/tool-master"
+    TOOL_CACHE_NAME="tools"
     export SLOT_ROOT SLOT_STATE SLOT_TEMPLATE SLOT_USER_PREFIX PIN_DIR
+    export CACHE_SLOTS TOOL_CACHE_MASTER TOOL_CACHE_NAME
     eval "cat <<EOF
 $(cat "$tmpl")
 EOF"
-  ) >"$out" 2>/dev/null
+  ) >"$out" 2>"$2/render.err"
+  # AN EMPTY HOOK IS NOT A HOOK, AND IT PASSES EVERY "DID NOT HAPPEN" ASSERTION.
+  #
+  # This render used to swallow stderr. When the hook grew a line expanding a name
+  # the list above did not carry, `set -u` killed the expansion, `$out` came back
+  # zero bytes, and running a zero-byte script does nothing and exits 0 — so the
+  # case that asserts the job FAILS saw success, the case that asserts the
+  # workspace is recreated saw it absent, and the mutation guard saw a fixture it
+  # had never touched. Four red checks, none of them naming the cause, all of them
+  # about slot resets and none of them about the one thing that went wrong.
+  #
+  # So the render answers for itself, here, once, and prints what the shell said.
+  if [ ! -s "$out" ]; then
+    printf 'FAIL: the slot-reset hook rendered empty — the fixture is missing a name the template expands:\n' >&2
+    sed 's/^/  /' "$2/render.err" >&2
+    exit 1
+  fi
   chmod 0755 "$out"
   printf '%s\n' "$out"
 }
+
+# Render once HERE, at the top level, before any case depends on it.
+#
+# Not decoration: every real render below happens inside a command substitution,
+# where `exit` leaves the substitution and not this script — so the guard above
+# could print and still be walked past. Called plainly, it ends the run, which is
+# what a fixture that cannot build its own subject should do.
+PROBE="$TMP/probe"
+mkdir -p "$PROBE"
+render_hook "$BODY" "$PROBE" >/dev/null
 
 # Shims. The hook runs as root on a host; here it runs as whoever invoked the
 # test, so the three things only root can do are answered rather than performed.
