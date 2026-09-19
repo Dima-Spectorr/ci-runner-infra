@@ -2058,7 +2058,11 @@ behavioural_check_counts_cases() {
       esac
     done
     case "$url" in
-      */check-runs*) jq -c "$prog" "$fix/runs.json" ;;
+      # Teed to a file, not just returned: case 12 below inspects the
+      # PROJECTED run — the driver's own `--jq` program applied to the
+      # fixture — rather than re-deriving what it should say. `tee` still
+      # passes the bytes through, so every other case is unaffected.
+      */check-runs*) jq -c "$prog" "$fix/runs.json" | tee "$fix/runs-proj.json" ;;
       */check-suites*) jq -c "$prog" "$fix/suites.json" ;;
       */status*) jq -c "$prog" "$fix/statuses.json" ;;
       *) echo "behavioural stub: unexpected gh call for '$url'" >&2; return 1 ;;
@@ -2211,6 +2215,35 @@ behavioural_check_counts_cases() {
     'CI summary (rollup)' \
     "{\"check_suites\":[$(_bh_suite 60 github-actions completed 2026-09-01T06:00:00Z)]}" \
     "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T07:00:00Z"' github-actions 60)]}"
+
+  # 12. THE DEAD FALLBACK ITSELF (ci-runner-infra#961 follow-up, Copilot
+  #     review). `.app.id | tostring` on a null id is the literal string
+  #     `"null"`, which is truthy, so `// "unknown"` in
+  #     `.app.slug // (.app.id | tostring) // "unknown"` can never fire — the
+  #     fallback is dead code. This does not assert on that jq TEXT (the
+  #     anti-pattern #961 itself shipped past — 221 passing text assertions
+  #     around a P0). It runs the driver's own `--jq` program, unmodified,
+  #     against a check-runs payload whose `.app` is absent entirely, via the
+  #     `tee` above, and reads the field the projection actually produced.
+  #     Against the old expression this fails with `app=null`.
+  printf '%s' "{\"check_suites\":[$(_bh_suite 100 github-actions completed 2026-09-19T12:00:00Z)]}" \
+    >"$fix/suites.json"
+  printf '%s' '{"check_runs":[{"name":"CI summary (rollup)","status":"completed","conclusion":"success","completed_at":"2026-09-19T12:00:05Z","started_at":null,"check_suite":{"id":100}}]}' \
+    >"$fix/runs.json"
+  printf '{"statuses":[]}' >"$fix/statuses.json"
+  rm -f "$STATUS_WARN_ONCE" "$SUITE_WARN_ONCE" "$fix/runs-proj.json"
+  # shellcheck disable=SC2034  # Read by the evalled check_counts.
+  local -a REQUIRED=('CI summary (rollup)')
+  # shellcheck disable=SC2034  # Read (and set) by the evalled `check_counts`.
+  LANE_FATAL=0
+  check_counts 0000000000000000000000000000000000000000 >/dev/null 2>/dev/null
+  local dead_app
+  dead_app="$(jq -r '.app' "$fix/runs-proj.json" 2>/dev/null)"
+  if [ "$dead_app" = "unknown" ]; then
+    printf 'PASS %s\n' "the dead fallback: a run whose app is absent keys as unknown, not the literal string null"
+  else
+    printf 'FAIL the dead fallback: a run whose app is absent keys as unknown, not null — got app=%s\n' "$dead_app"
+  fi
 
   rm -rf "$fix"
 }
