@@ -3431,12 +3431,15 @@ cordon_host() {
         held=$((held + 1))
         ;;
       *)
-        # NOT an answer about the slot at all. 401/403 (token, or a secondary
-        # rate limit), 5xx, or 000 for a curl that never completed all used to
-        # land in the 422 arm with no log line, so a credential fault or a rate
-        # limit produced the identical "N still finishing work" message as a
-        # healthy busy pool — and specifically, it looked exactly like #948 and
-        # would be misdiagnosed as it. drain_host()'s deregister loop has always
+        # NO USABLE ANSWER ABOUT THE SLOT. 401 and 403 (a bad token, or a
+        # secondary rate limit) ARE answers, but they are answers about this
+        # controller's credential rather than about whether the slot is busy;
+        # 5xx and 000 — the latter being curl's value for a call that never
+        # completed — are not answers at all. All of them used to land in the
+        # 422 arm with no log line, so a credential fault or a rate limit
+        # produced the identical "N still finishing work" message as a healthy
+        # busy pool — and specifically, it looked exactly like #948 and would be
+        # misdiagnosed as it. drain_host()'s deregister loop has always
         # separated these; this is the same split, counted rather than aborting,
         # because a cordon walks the whole list by design.
         failed=$((failed + 1))
@@ -3445,7 +3448,7 @@ cordon_host() {
     esac
   done
 
-  event INFO cordon "$host" "cordon $host: $gone slot(s) removed from the pool, $held still finishing work, $failed unanswered (cordon age ${cordon_age}s)" removed="$gone" held="$held" failed="$failed" cordon_age="$cordon_age"
+  event INFO cordon "$host" "cordon $host: $gone slot(s) removed from the pool, $held still finishing work, $failed with no usable answer (cordon age ${cordon_age}s)" removed="$gone" held="$held" failed="$failed" cordon_age="$cordon_age"
   CORDONED=$((CORDONED + 1))
   CORDON_HELD=$((CORDON_HELD + held))
   CORDON_ERRORS=$((CORDON_ERRORS + failed))
@@ -4033,9 +4036,11 @@ tick_pool() {
   # only when it fires is a series nobody can alert on.
   #
   #   cordon-held         slots refused with 422 -- a job is finishing. Normal.
-  #   cordon-error        the DELETE was not answered (401/403/5xx/timeout).
-  #                       Non-zero means the cordon is blind, not busy, and it
-  #                       used to be indistinguishable from cordon-held.
+  #   cordon-error        the DELETE yielded no usable answer about the slot:
+  #                       401/403 answer about the credential, 5xx and a curl
+  #                       timeout answer nothing. Non-zero means the cordon is
+  #                       blind, not busy, and it used to be indistinguishable
+  #                       from cordon-held.
   #   cordon-no-progress  a cordon past CORDON_NO_PROGRESS_SECONDS that removed
   #                       nothing this tick: the held slot keeps being handed
   #                       work. #948. Visible here, not yet fixed.

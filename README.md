@@ -196,10 +196,11 @@ spike, because the spike is a release working. `ci_recycle_verdicts` counts
 means the recycle is working and the hosts are not leaving — jobs that never end.
 The same series also carries the three outcomes that say whether a cordon is
 working: `cordon-held` (a slot refused with 422 — a job is finishing, normal),
-`cordon-error` (the deregistration was not answered at all — 401, 403 secondary
-rate limit, 5xx or a curl timeout; the cordon is **blind**, not busy, and these
-used to be reported as `held` and were therefore indistinguishable from a healthy
-busy pool) and `cordon-no-progress` (a cordon older than an hour that removed
+`cordon-error` (the deregistration yielded no usable answer about the slot — a
+401 or a 403 secondary rate limit answers about the controller's credential, a
+5xx or a curl timeout answers nothing; either way the cordon is **blind**, not
+busy, and these used to be reported as `held` and were therefore
+indistinguishable from a healthy busy pool) and `cordon-no-progress` (a cordon older than an hour that removed
 nothing this tick — the held slot keeps being handed work; see issue #948, which
 this reports and does not yet fix).
 The same series carries the refusals as `skip-<reason>`, published as a fixed set

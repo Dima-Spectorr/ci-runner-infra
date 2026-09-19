@@ -1466,7 +1466,7 @@ check "cordon: a curl that answered nothing at all is an error too" \
 # And the mixture, which is the row an operator actually reads: one slot gone,
 # one finishing a job, one unanswered. Three distinct numbers -- and before this
 # change the last two were the same number.
-check "cordon: held and unanswered are separate columns" "1|1|1|0|1|stamped" \
+check "cordon: held and no-usable-answer are separate columns" "1|1|1|0|1|stamped" \
   "$(cordon_seq 204,422,401)"
 
 # THE CHECKS D2 EXISTS FOR. The marker carries the cordon's START, so a pass that
@@ -1492,10 +1492,10 @@ check "cordon: inside the window a held slot is just a long job" \
 # pool, so the next tick is strictly closer to a retire.
 check "cordon: an old cordon that removed a slot is not no-progress" \
   "1|1|0|0|0|kept=7200" "$(cordon_seq 204,422 7200)"
-# An unanswered DELETE is not no-progress either. It is already warned about as
-# an error, and reporting it on BOTH would send a token fault to the livelock
-# alert -- the exact confusion D1 removes.
-check "cordon: an unanswered DELETE on an old cordon is not no-progress" \
+# A DELETE with no usable answer is not no-progress either. It is already warned
+# about as an error, and reporting it on BOTH would send a token fault to the
+# livelock alert -- the exact confusion D1 removes.
+check "cordon: a DELETE with no usable answer on an old cordon is not no-progress" \
   "0|0|1|0|1|kept=7200" "$(cordon_seq 401 7200)"
 
 # And the publish. A counter nothing sends is a counter nobody sees, and the

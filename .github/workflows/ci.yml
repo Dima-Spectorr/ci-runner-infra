@@ -1127,22 +1127,32 @@ jobs:
           zip="terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
           sums="terraform_${TERRAFORM_VERSION}_SHA256SUMS"
           work=$(mktemp -d)
+          # Removed on EVERY exit, not just the happy one: `set -e` means a
+          # failed curl or a bad checksum leaves the step without reaching a
+          # cleanup line, and this runs on a self-hosted pool as well as a
+          # GitHub-hosted runner, where a leaked directory outlives the job.
+          trap 'rm -rf "$work"' EXIT
           for f in "$zip" "$sums"; do
             curl --fail --location --silent --show-error \
               --connect-timeout 15 --max-time 300 \
               --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 180 \
               -o "$work/$f" "$base/$f"
           done
-          # `grep` first, then `-c -`: the sums file lists every platform, and
-          # `sha256sum -c` on the whole file fails on the archives that were
-          # never downloaded. A `grep` that matches nothing yields an empty
-          # stdin, which `sha256sum -c` rejects, so a version whose sums file
-          # does not name this archive fails here rather than passing silently.
-          ( cd "$work" && grep " $zip\$" "$sums" | sha256sum -c - )
+          # One line is selected, not the whole file: the sums file lists every
+          # platform and `sha256sum -c` would fail on the archives that were
+          # never downloaded. `awk` on the FILENAME FIELD rather than `grep` on
+          # a pattern, because the archive name contains dots and a regex built
+          # from it is not a literal match. The line is re-emitted in
+          # `sha256sum`'s own two-space format, and selecting nothing yields
+          # empty stdin, which `sha256sum -c` rejects — so a version whose sums
+          # file does not name this archive fails here rather than installing
+          # nothing and reading as success.
+          ( cd "$work" &&
+            awk -v z="$zip" '$2 == z { printf "%s  %s\n", $1, z }' "$sums" |
+              sha256sum -c - )
           mkdir -p "$HOME/.local/bin"
           unzip -q -o "$work/$zip" terraform -d "$HOME/.local/bin"
           chmod 0755 "$HOME/.local/bin/terraform"
-          rm -rf "$work"
           echo "$HOME/.local/bin" >>"$GITHUB_PATH"
 
       - run: terraform fmt -check -recursive
