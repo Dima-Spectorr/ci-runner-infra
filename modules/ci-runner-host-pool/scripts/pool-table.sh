@@ -60,6 +60,8 @@
 #   14 beacon_interval          seconds between a Windows host's beacon writes
 #   15 pin_orphan_grace_seconds how long a pinned job may wait for its host
 #   16 runner_labels            comma-separated, exactly what the agents register
+#   17 recycle_cordon_stops_agents  true | false — whether a cordon also tells
+#                               the host to stop its own idle agents (#948)
 #
 # Echoes rows and returns 0 when at least one row is valid; returns 1 when the
 # document cannot be parsed at all or yields no valid row.
@@ -114,17 +116,25 @@ pool_table_parse() {
       (.role // "ci"),
       (.beacon_interval // 30),
       (.pin_orphan_grace_seconds // 900),
-      (.runner_labels // "")
+      (.runner_labels // ""),
+      # Compared rather than tested for truthiness, exactly like
+      # mints_registration_token above and for a sharper version of the same
+      # reason: the string "false" is true in jq, and this column arms a
+      # mechanism that STOPS RUNNER AGENTS. A table that said "false" and got a
+      # cordon taking every idle slot on the host down is not a wrong number, it
+      # is capacity leaving the pool.
+      (if (.recycle_cordon_stops_agents == true or .recycle_cordon_stops_agents == "true")
+       then "true" else "false" end)
     ] | @tsv | gsub("\u001f"; " ")' 2>/dev/null | tr '\t' '\037') || {
     echo "reject::the pool table is not valid JSON" >&2
     return 1
   }
 
   local name mig region slots minh maxh grace reg_grace ticks recycle
-  local host_os mint role beacon pin labels
+  local host_os mint role beacon pin labels cordon_stop
   local kept=0 why
   while IFS=$'\037' read -r name mig region slots minh maxh grace reg_grace \
-    ticks recycle host_os mint role beacon pin labels; do
+    ticks recycle host_os mint role beacon pin labels cordon_stop; do
     [ -n "${name:-}" ] || continue
 
     # First reason wins, and every test is guarded on the ones before it, so a
@@ -197,9 +207,10 @@ pool_table_parse() {
       continue
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$name" "$mig" "$region" "$slots" "$minh" "$maxh" "$grace" "$reg_grace" \
-      "$ticks" "$recycle" "$host_os" "$mint" "$role" "$beacon" "$pin" "$labels"
+      "$ticks" "$recycle" "$host_os" "$mint" "$role" "$beacon" "$pin" "$labels" \
+      "$cordon_stop"
     kept=$((kept + 1))
   done <<POOL_TABLE_EOF
 $rows

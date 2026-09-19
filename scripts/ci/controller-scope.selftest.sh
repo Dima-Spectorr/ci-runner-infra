@@ -218,7 +218,7 @@ check "host row: no basename transform shares the key with the self-link" 0 "$r"
 # guard each call site already had, and the wrong answer looked like a right one.
 # shellcheck disable=SC2016
 r=$(grep -c 'zone=$(zone_of_uri "$uri")' "$CTRL")
-check "host row: all four zone derivations go through zone_of_uri" 4 "$r"
+check "host row: all five zone derivations go through zone_of_uri" 5 "$r"
 # ONE, and it is zone_of_uri's own body. A second is a call site that went back
 # to doing it by hand, which is the regression this whole section is about.
 # shellcheck disable=SC2016
@@ -749,9 +749,24 @@ check "regtoken: the token is passed by file, never on the command line" yes "$r
 # fine only because its value is the literal `1`. This asserts that stays true:
 # the day someone puts anything else behind `--metadata=` on this call, it is on
 # the process table of a host running a pull request.
+#
+# It used to read "there is exactly one of these", and #948 added a second —
+# `--metadata=ci-cordon=1` on the cordon, the same shape and the same argument.
+# So the invariant is stated as what it always meant: every value that reaches
+# gcloud's argv this way is a LITERAL. A `$` behind `--metadata=` is a value
+# read from somewhere else, and somewhere else is where the tokens are.
+#
+# The VALUE, which is everything after the last `=`. The KEY may be built from
+# a variable — `${REG_TOKEN_KEY}-issued` is — and a key name is not a secret.
 # shellcheck disable=SC2016
-grep -c -- '--metadata=' "$CTRL" | grep -qx 1 && r=yes || r=no
-check "regtoken: exactly one --metadata on the mint call" yes "$r"
+r=$(grep -o -- '--metadata=[^ ]*' "$CTRL" | sed 's/.*=//' | grep -c '\$')
+check "regtoken: no --metadata value is interpolated onto the command line" 0 "$r"
+
+# And the count still moves only on purpose: a third one is a review, not a
+# diff that slides past because the assertion above happens to still hold.
+# shellcheck disable=SC2016
+r=$(grep -c -- '--metadata=' "$CTRL")
+check "regtoken: still only the two known --metadata arguments" 2 "$r"
 # shellcheck disable=SC2016
 grep -q -- '--metadata="${REG_TOKEN_KEY}-issued=1"' "$CTRL" && r=yes || r=no
 check "regtoken: and it carries only the issued marker, never the token" yes "$r"

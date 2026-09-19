@@ -900,6 +900,69 @@ variable "recycle_max_unavailable" {
   }
 }
 
+variable "recycle_cordon_stops_agents" {
+  description = <<-EOT
+    Whether a CORDONED host also stops its own idle runner agents, so the slot
+    GitHub refused to deregister leaves the pool as soon as its job finishes
+    instead of being handed another one.
+
+    Why this exists (#948). Cordoning deregisters a host's IDLE agents; the one
+    executing a job is refused with 422, and that refusal is the mid-job
+    guarantee. But the refused slot is still REGISTERED — the 422 protects the
+    job, it does not take the agent out of the scheduler — so the instant that
+    job lands the slot is an eligible, long-polling runner again. On an idle
+    pool the next tick reads busy=0 and retires the host. On a SATURATED one the
+    slot simply takes more work, forever.
+
+    It is self-reinforcing: the cordon removed this host's other slots from a
+    pool that already had a backlog, so the survivors are busy a larger fraction
+    of the time, so an idle observation is less likely still. And a host already
+    cordoned is exempt from the recycle budget, so at the default
+    `recycle_max_unavailable = 1` one stuck host pins every other host in the
+    pool on the stale template with it. Measured 2026-09-19: the held slot took
+    new work 31 and then 63 minutes after being cordoned, with 18 runs queued,
+    and the apply that caused the recycle had reported SUCCESS an hour earlier.
+
+    There is no GitHub primitive for this. The repository-scope runner API has
+    no pause, disable or quiesce; runner groups are org/enterprise-only and
+    these agents register at repository scope; stripping labels rests on
+    actions/runner#4225, where the scheduler keeps assigning on the old label
+    set while the UI shows the new one — a visible livelock made invisible. A
+    deadline that escalates to a DELETE is answered 422; one that escalates to a
+    kill drops a running job.
+
+    So the mechanism is local and this module already ships it: with this ON,
+    `cordon_host` sets `ci-cordon=1` on the instance, and the host's existing
+    root-run 30-second slot sweep stops `ci-runner@N.service` for any slot with
+    no live `Runner.Worker` — and, `Restart=no`, does not start it again. A
+    stopped agent is not long-polling, so it is not a scheduling target, and it
+    drops out of the repository's runner list. `busy` therefore reaches 0 within
+    one JOB duration rather than whenever a poll happens to sample an idle
+    instant. Nothing running is ever interrupted; the terminating condition just
+    stops depending on luck.
+
+    DEFAULT false, the same way `recycle_max_unavailable` shipped: this is a
+    fleet behaviour change and `v5` is `main`, so every consuming repository
+    takes it the moment the tag moves. Enable on one pool, verify, then widen.
+
+    TWO THINGS TO KNOW BEFORE ENABLING:
+
+    1. The sweep lives in the HOST boot script, so it takes effect only on hosts
+       built from a template created after the apply. It cannot rescue a host
+       that is already stuck, and it reaches a pool only after that pool has
+       completed one recycle under the old rules.
+    2. A cordoned host is short of registered slots BY DESIGN for the life of
+       the cordon. The controller therefore excludes cordoned hosts from both
+       sides of `ci_slots_missing`, so the "capacity that exists on paper only"
+       alert does not fire on a recycle that is working correctly.
+
+    Linux only today. Windows pools livelock identically and have no equivalent
+    sweep; see the follow-up issue.
+  EOT
+  type        = bool
+  default     = false
+}
+
 # --- the cache snapshot ---------------------------------------------------------
 
 variable "cache_snapshot_bucket" {

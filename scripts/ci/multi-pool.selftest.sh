@@ -57,6 +57,7 @@ select_out=$(
 
   declare -A P_MIG P_REGION P_SLOTS P_MIN P_MAX P_GRACE P_REGGRACE P_TICKS
   declare -A P_RECYCLE P_HOST_OS P_MINT P_ROLE P_BEACON P_PIN P_LABELS
+  declare -A P_CORDON_STOP
   # D_EXPIRED is declared even though pool_select reads it as `${...:-0}`: an
   # associative subscript on a variable bash has never seen is parsed as
   # ARITHMETIC, so `${D_EXPIRED[$POOL]:-0}` with POOL=a dies under `set -u` as
@@ -93,6 +94,11 @@ select_out=$(
   P_MIG[b]=mig-b
   P_HOST_OS[a]=linux
   P_HOST_OS[b]=windows
+  # #948. Carried over from pool a, this one does not misreport anything — it
+  # tells a host to STOP ITS RUNNER AGENTS the next time the pool it does not
+  # belong to cordons one.
+  P_CORDON_STOP[a]=true
+  P_CORDON_STOP[b]=false
   P_MINT[a]=false
   P_MINT[b]=true
   D_TOTAL[a]=7
@@ -114,10 +120,11 @@ select_out=$(
   MIG_TEMPLATE="ci-lin-tpl-v5"
 
   pool_select b
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$POOL" "$MIG" "$CONTROLLER_HOST_OS" "$MINT_REG" "$RUNNER_MATCH_LABELS" \
     "$MIG_BASE" "$MIG_TARGET" "$MIG_TEMPLATE" \
-    "$DEMAND_TOTAL" "$DEMAND_QUEUED" "$RUNNING_MAX" "$POOL_JOBS_PER_CHECK"
+    "$DEMAND_TOTAL" "$DEMAND_QUEUED" "$RUNNING_MAX" "$POOL_JOBS_PER_CHECK" \
+    "$RECYCLE_CORDON_STOPS_AGENTS"
 )
 check "pool_select: the second pool's own fields are all in place" \
   "b|mig-b|windows|true|b,self-hosted,x64" \
@@ -142,6 +149,13 @@ check "pool_select: demand comes from the sweep's per-pool result" \
 check "pool_select: jobs-per-check is this pool's, not the previous pool's" \
   "3" \
   "$(printf '%s' "$select_out" | cut -d'|' -f12)"
+
+# #948. Carried over, this is not a wrong reading — it is pool b cordoning a
+# host and telling that host to stop every idle agent on it, on the authority
+# of a flag pool a set. Pool b said false and must read false.
+check "pool_select: the host-side cordon flag is this pool's" \
+  "false" \
+  "$(printf '%s' "$select_out" | cut -d'|' -f13)"
 
 # --- 2. the marker sweep cannot reach another pool's markers ------------------
 #
@@ -264,7 +278,7 @@ legacy=$(
   printf '%s' "$POOLS_JSON" | pool_table_parse 2>/dev/null | tr '\t' '|'
 )
 check "legacy: one row, and every absent key took its default" \
-  "telnet|ci-runner-host-telnet|region-1|3|0|6|900|600|3|1|linux|false|ci|30|900|self-hosted,linux,gcp" \
+  "telnet|ci-runner-host-telnet|region-1|3|0|6|900|600|3|1|linux|false|ci|30|900|self-hosted,linux,gcp|false" \
   "$legacy"
 
 echo

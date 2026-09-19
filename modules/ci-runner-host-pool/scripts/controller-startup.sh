@@ -219,6 +219,7 @@ if [ -z "${POOLS_JSON:-}" ]; then
     --arg reggrace "$(md "instance/attributes/ci-register-grace-seconds")" \
     --arg ticks "$(md "instance/attributes/ci-orphan-confirm-ticks")" \
     --arg recycle "$(md "instance/attributes/ci-recycle-max-unavailable")" \
+    --arg cordonstop "$(md "instance/attributes/ci-recycle-cordon-stops-agents")" \
     --arg hostos "$(md "instance/attributes/ci-host-os")" \
     --arg mint "$(md "instance/attributes/ci-mint-registration-token")" \
     --arg beacon "$(md "instance/attributes/ci-beacon-interval")" \
@@ -231,6 +232,12 @@ if [ -z "${POOLS_JSON:-}" ]; then
          register_grace_seconds: ($reggrace | nz),
          orphan_confirm_ticks: ($ticks | nz),
          recycle_max_unavailable: ($recycle | nz),
+         # `nz` like every other key, so an absent attribute — which is every
+         # controller rendered before #948 — reaches the parser as null and
+         # takes the parser default, false. A controller too old to carry the
+         # key is a controller whose HOSTS are too old to have the sweep that
+         # reads it, so false is the only answer that is not a lie.
+         recycle_cordon_stops_agents: ($cordonstop | nz),
          host_os: ($hostos | nz),
          mints_registration_token: ($mint | nz),
          beacon_interval: ($beacon | nz),
@@ -240,7 +247,7 @@ fi
 
 POOLS=()
 declare -A P_MIG=() P_REGION=() P_SLOTS=() P_MIN=() P_MAX=() P_GRACE=()
-declare -A P_REGGRACE=() P_TICKS=() P_RECYCLE=() P_HOST_OS=() P_MINT=()
+declare -A P_REGGRACE=() P_TICKS=() P_RECYCLE=() P_CORDON_STOP=() P_HOST_OS=() P_MINT=()
 declare -A P_ROLE=() P_BEACON=() P_PIN=() P_LABELS=() P_LABELS_JSON=()
 declare -A P_MATCH_JSON=() P_MATCH_CSV=()
 
@@ -270,7 +277,8 @@ POOL_TABLE_REJECTED=0
 # row with an empty column, so there is no run of empty fields for `read` to
 # collapse. See the note in pool-table.sh.
 while IFS=$'\t' read -r p_name p_mig p_region p_slots p_min p_max p_grace \
-  p_reggrace p_ticks p_recycle p_hostos p_mint p_role p_beacon p_pin p_labels; do
+  p_reggrace p_ticks p_recycle p_hostos p_mint p_role p_beacon p_pin p_labels \
+  p_cordonstop; do
   [ -n "$p_name" ] || continue
   POOLS+=("$p_name")
   P_MIG["$p_name"]="$p_mig"
@@ -282,6 +290,7 @@ while IFS=$'\t' read -r p_name p_mig p_region p_slots p_min p_max p_grace \
   P_REGGRACE["$p_name"]="$p_reggrace"
   P_TICKS["$p_name"]="$p_ticks"
   P_RECYCLE["$p_name"]="$p_recycle"
+  P_CORDON_STOP["$p_name"]="$p_cordonstop"
   P_HOST_OS["$p_name"]="$p_hostos"
   P_MINT["$p_name"]="$p_mint"
   P_ROLE["$p_name"]="$p_role"
@@ -358,6 +367,7 @@ pool_select() {
   REGISTER_GRACE="${P_REGGRACE[$POOL]}"
   ORPHAN_CONFIRM_TICKS="${P_TICKS[$POOL]}"
   RECYCLE_MAX_UNAVAILABLE="${P_RECYCLE[$POOL]}"
+  RECYCLE_CORDON_STOPS_AGENTS="${P_CORDON_STOP[$POOL]}"
   CONTROLLER_HOST_OS="${P_HOST_OS[$POOL]}"
   MINT_REG="${P_MINT[$POOL]}"
   POOL_ROLE="${P_ROLE[$POOL]}"
@@ -392,6 +402,10 @@ GRACE=900
 REGISTER_GRACE=600
 ORPHAN_CONFIRM_TICKS=3
 RECYCLE_MAX_UNAVAILABLE=0
+# OFF until a pool is selected and says otherwise. The same direction every
+# other pre-select default here points: a read before the first select must not
+# be able to take an agent down.
+RECYCLE_CORDON_STOPS_AGENTS=false
 CONTROLLER_HOST_OS="unknown"
 MINT_REG=false
 # Read in tick_pool: the role is what decides whether a pool publishes the
@@ -3341,15 +3355,69 @@ drain_host() {
 # deregistered slot stays deregistered — while the job it is running finishes
 # untouched. It retires on a later tick, from recycle_decision's retire branch.
 #
-# The held slot is still registered, so for up to one poll interval after its
-# job lands it can be handed another one. That is why the cordon is re-issued
-# every tick instead of once: the next tick either finds it idle and removes it,
-# or finds it working again and refuses again. The host leaves a poll later than
-# the ideal — it never leaves with a job on it, which is the property that
-# matters.
+# The held slot is still registered, so after its job lands it can be handed
+# another one. That is why the cordon is re-issued every tick: the next tick
+# either finds it idle and removes it, or finds it working again and refuses
+# again.
+#
+# THIS COMMENT USED TO SAY "for up to one poll interval", AND THAT IS NOT A
+# BOUND (#948). A poll interval is a SAMPLING RATE against jobs arriving out of
+# a queue, not a deadline. On a saturated pool every sample can miss, and on
+# 2026-09-19 every sample did for 63 minutes: the held slot took new work at +31
+# and +63 minutes while 18 runs sat queued, and because rule 5 of
+# recycle_decision exempts an already-cordoned host from the budget, that one
+# host held the whole pool's recycle allowance the entire time. Worse, it is
+# self-reinforcing — the cordon removed this host's other slots from a pool that
+# already had a backlog, so the survivors are busy a larger fraction of the time
+# and an idle observation gets LESS likely, not more.
+#
+# THE FIX IS HOST-SIDE, because GitHub has no primitive for it: the
+# repository-scope runner API has no pause/disable/quiesce, runner groups are
+# org-only and these agents register at repository scope, and a deadline that
+# escalates to DELETE is answered 422 while one that escalates to a kill drops a
+# running job. So with `recycle_cordon_stops_agents` on, the cordon writes
+# `ci-cordon=1` to the instance and the HOST's own root slot sweep stops each
+# `ci-runner@N.service` as it goes idle. Units are Restart=no, a stopped agent
+# is not long-polling and therefore not a scheduling target, and it drops out of
+# the repository's runner list — so `busy` reaches 0 one JOB after the cordon
+# rather than one lucky sample later. Nothing running is interrupted either way.
 cordon_host() {
-  local host="$1"
-  local ids id gone=0 held=0
+  local host="$1" uri="${2:-}"
+  local ids id gone=0 held=0 zone
+
+  # THE HOST-SIDE FLAG GOES FIRST, before the token and before the marker.
+  #
+  # It is the only half of this function with a TERMINATING condition in it, and
+  # it is the half that cannot hurt anything: it stops provably-idle agents and
+  # nothing else. Everything below needs a GitHub token, and the whole point of
+  # #948 is that the deregistration half can fail to make progress — so ordering
+  # the flag behind `gh_token || return 1` would mean a token fault takes out
+  # the one mechanism that was going to unstick the host.
+  #
+  # Re-issued every tick, exactly like the deregistrations below and for the
+  # same reason: it is idempotent, it costs one bounded call per cordoned host
+  # per tick (at most `recycle_max_unavailable` of them, one by default), and a
+  # setMetadata that quietly did not land must not be the reason a host takes
+  # another job forever.
+  #
+  # NON-FATAL on failure. A cordon that cannot write the flag is exactly the
+  # cordon this module shipped before #948 — slower, not broken — and the
+  # controller runs under `set -e`, so an unguarded gcloud here would kill the
+  # tick and take every series this pool publishes down with it.
+  if [ "${RECYCLE_CORDON_STOPS_AGENTS:-false}" = "true" ]; then
+    zone=$(zone_of_uri "$uri")
+    if [ -z "$zone" ]; then
+      # No zone means no instance to address, and a guessed one is a call
+      # against some other machine. Same refusal registration_token_step makes.
+      log "cordon $host: no zone in the MIG self-link — cannot set ci-cordon, the cordon falls back to deregistration alone"
+    elif timeout 60 gcloud compute instances add-metadata "$host" \
+      --project="$PROJECT" --zone="$zone" \
+      --metadata=ci-cordon=1 >/dev/null 2>&1; then
+      event INFO cordon-flag "$host" "cordon $host: ci-cordon=1 set — its own sweep now stops each slot as that slot goes idle" zone="$zone"
+    else
+      log "cordon $host: could not set ci-cordon=1 — the cordon falls back to deregistration alone and may not converge while the pool is saturated (#948)"
+    fi
+  fi
 
   ids=$(printf '%s' "$RUNNERS_JSON" | jq -r --arg h "$host" \
     '.runners[]? | select(.name | startswith($h + "-s")) | .id' 2>/dev/null)
@@ -3608,6 +3676,11 @@ tick_pool() {
     [ "$idle" -gt "$idle_max" ] && idle_max=$idle
     age=$(host_age_seconds "$host")
 
+    # Read HERE rather than beside the recycle rule below, because the slot
+    # accounting that follows has to know about it. One file test.
+    cordoned=0
+    [ -f "$STATE_DIR/cordon-$host" ] && cordoned=1
+
     # SLOTS THAT ANSWER, over hosts old enough to have answered. A host still
     # inside its registration grace has not registered YET, and a host that is
     # not RUNNING is booting or on its way out; counting either as short of
@@ -3615,8 +3688,21 @@ tick_pool() {
     # event, which is how a series stops being alerted on. A tick that could not
     # read the runner list contributes nothing to either side — HOST_PRESENT is
     # -1 there, and a blind tick must not read as an outage.
+    #
+    # A CORDONED HOST IS EXCLUDED FROM BOTH SIDES (#948), and this is a
+    # prerequisite of the host-side cordon rather than a cosmetic one. A cordon
+    # deregisters idle slots on purpose; with `recycle_cordon_stops_agents` on
+    # it also stops them, so a cordoned host is short of registered slots BY
+    # CONSTRUCTION for the whole recycle. Counting that gap makes
+    # `ci_slots_missing` — the series whose entire meaning is "capacity that
+    # exists on paper only" — non-zero for every correct recycle, and its alert
+    # fires at 30 minutes. That is the same alert dying of noise that the
+    # comment above is already guarding against for booting hosts; a host being
+    # deliberately taken out of service is not capacity anybody has lost.
+    # Excluded from both `known` and `registered`, so the host contributes
+    # nothing rather than a negative.
     if [ "$HOST_PRESENT" -ge 0 ] && [ "$status" = "RUNNING" ] &&
-      [ "$age" -ge "$REGISTER_GRACE" ]; then
+      [ "$cordoned" -eq 0 ] && [ "$age" -ge "$REGISTER_GRACE" ]; then
       slots_known=$((slots_known + SLOTS))
       slots_registered=$((slots_registered + HOST_PRESENT))
     fi
@@ -3653,8 +3739,7 @@ tick_pool() {
     # deliberately retired could instead be kept as "warm" — warm being the
     # exact property that keeps the wrong startup script alive.
     tpl=$(template_state "$host_tpl")
-    cordoned=0
-    [ -f "$STATE_DIR/cordon-$host" ] && cordoned=1
+    # `cordoned` is read further up, with the slot accounting that also needs it.
 
     partial_for=$(partial_seconds "$host" "$HOST_REG")
 
@@ -3692,7 +3777,11 @@ tick_pool() {
         # dies mid-tick publishes none of the series it queued, so the pool goes
         # dark rather than merely un-recycled. The marker is already written, so
         # the next tick resumes this host's cordon where this one stopped.
-        cordon_host "$host" || log "$host: cordon incomplete — retrying next tick"
+        # `$host_uri` and not just the name: the host-side half of the cordon is
+        # a setMetadata, and a setMetadata needs the zone, which only the MIG's
+        # self-link carries. An empty uri is handled inside — it disables that
+        # half rather than guessing a zone.
+        cordon_host "$host" "$host_uri" || log "$host: cordon incomplete — retrying next tick"
         continue
         ;;
       retire:*)

@@ -167,6 +167,69 @@ unrelated jobs on different hosts**. Two corroborating reads, both cheap:
 * the controller log at that timestamp names the host and the verdict. If it
   names none, the deletion did not come from here.
 
+## A cordon has two halves, and only one of them is GitHub's (#948)
+
+Recycling a host onto a new instance template runs the same five gates — it
+ends in `drain_host()` like any other deletion. What comes first is a CORDON:
+the controller deregisters the host's agents so that the pool stops growing a
+host it is about to delete, and GitHub answers **HTTP 422** for the one agent
+that is executing a job. That 422 is gate 5 arriving early, and it is correct.
+
+It is also not a quiesce. The refused agent stays **registered**: the 422
+protects the job, it does not take the agent out of the scheduler. The instant
+that job finishes the slot is an eligible, long-polling runner again, so on a
+saturated pool it simply takes more work. `busy` never reads `0`, the RETIRE
+verdict never fires, and the host sits cordoned on a stale template
+indefinitely — while `recycle-decision.sh` exempts an already-cordoned host
+from `recycle_max_unavailable`, so that one host blocks the recycle of every
+other host in its pool. Measured 2026-09-19: new jobs landing 31 and 63 minutes
+after the cordon, 18 runs queued.
+
+There is no GitHub call that fixes this. The repository-scope runner API has no
+pause, disable or quiesce; runner groups are org/enterprise-only and these
+agents register at repo scope; label-stripping rests on actions/runner#4225,
+where the scheduler keeps assigning on the old label set while the UI shows the
+new one. A deadline that forces the cordon is worse: the DELETE still returns
+422, and escalating to a kill drops a running job that GitHub does not requeue.
+
+So the second half is **local**, and this module has shipped the primitive
+since #278.
+
+| | |
+|---|---|
+| **Controller** | on cordon, sets instance metadata `ci-cordon=1` on that host (`cordon_host()`) |
+| **Host** | the root `ci-slot-sweep.timer`, every 30s, reads the flag and — for any slot with no live `Runner.Worker` — stops `ci-runner@N.service` and does not restart it |
+| **Why it works** | units are `Restart=no`; a stopped agent is not long-polling, so it cannot be assigned work, and it leaves the repository's runner list |
+| **Terminating condition** | the controller's next tick reads `busy=0` → `retire:stale-template` → `drain_host`, and all five gates above still apply |
+
+The wait is now one **job** long instead of however long it takes a poll to
+catch an idle instant. Three properties are part of the contract:
+
+* **Only when provably idle.** The stop is gated on the same
+  `pgrep -f 'Runner\.Worker'` the sweep already makes. A slot with a live worker
+  is left completely alone; the next sweep finds it idle thirty seconds later.
+* **The flag read fails OPEN.** An unreachable metadata server reads as *not*
+  cordoned. The other direction would stop every agent on every host the moment
+  the endpoint blips.
+* **A cordoned host does not go back into service.** Both restart paths — the
+  slot sweep's post-reset restart and the pin sweep's end-of-hold restart —
+  are gated on the flag. Either one un-gated hands the slot back to the
+  scheduler and the host never empties.
+
+A cordoned host is therefore short of registered slots **by design**, for the
+length of the cordon. The controller excludes cordoned hosts from both sides of
+`ci_slots_missing` so that a recycle working correctly does not page anybody.
+
+Opt-in per pool via `recycle_cordon_stops_agents`, **default `false`**. Two
+things follow from that default and from where the code lives:
+
+* The sweep is part of the **host boot script**, so a pool only gains this
+  after it has built hosts from a template created by the apply that turned the
+  flag on. It cannot rescue a host that is already stuck, and it reaches a pool
+  one full recycle — under the old rules — after the apply.
+* Linux only. Windows hosts have no slot sweep to carry the flag and livelock
+  identically; tracked separately.
+
 ## Changing this contract
 
 * A new call that deletes, resizes, abandons or rolls a host is a change to the

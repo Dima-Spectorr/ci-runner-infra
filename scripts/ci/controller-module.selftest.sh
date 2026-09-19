@@ -86,15 +86,20 @@ check "the sibling path the controller module uses resolves" yes \
 # --- 3 + 4. the descriptor speaks the parser's vocabulary ----------------------
 
 # The columns, read out of the parser rather than restated here: every default
-# in its jq block plus the one column that is compared instead of defaulted.
+# in its jq block plus the columns that are COMPARED instead of defaulted. The
+# compared ones are the booleans — in jq the string "false" is truthy, so they
+# are written `(if (.x == true or .x == "true") ...)` and carry no `//`. They
+# used to be one column and were matched by name; a second one arrived with
+# #948, so they are matched by shape now and a third costs nothing.
 columns=$(
   {
     sed -n '/^  rows=/,/@tsv/p' "$TABLE" | grep -o '(\.[a-z_]* //' |
       tr -d '(. /'
-    grep -o '\.mints_registration_token' "$TABLE" | head -1 | tr -d '.'
+    sed -n '/^  rows=/,/@tsv/p' "$TABLE" | grep -o '(\.[a-z_]* ==' |
+      tr -d '(. ='
   } | sort -u
 )
-check "the parser still declares sixteen columns" 16 \
+check "the parser still declares seventeen columns" 17 \
   "$(printf '%s\n' "$columns" | grep -c .)"
 
 # `value = {` inside the pool_descriptor output, keys only.
@@ -249,6 +254,69 @@ r=$(awk '/touch "\$STATE_DIR\/heartbeat"/ { t = NR }
          /^BindReadOnlyPaths=/ { b = NR }
          END { print (t > 0 && b > 0 && t < b) ? "yes" : "no" }' "$STARTUP")
 check "the heartbeat is created before the unit that bind-mounts it" yes "$r"
+
+# --- 8. the cordon reaches the HOST, not just GitHub (#948) -------------------
+#
+# A cordon deregisters the idle slots and gets HTTP 422 on the one that is
+# executing — by design, that 422 is what protects the running job. But the
+# held slot stays REGISTERED, so on a saturated pool GitHub keeps scheduling
+# onto it, `busy` never reads 0, and RETIRE never fires: the host sits cordoned
+# forever on a stale template, and because a cordoned host is exempt from
+# `recycle_max_unavailable`, it blocks the recycle of every other host in its
+# pool. Measured at 63 minutes with 18 runs queued.
+#
+# The second half of the cordon is therefore local: the controller writes
+# `ci-cordon=1` onto the instance and the host's own root slot sweep stops each
+# agent as that agent goes idle. A stopped agent is not long-polling, so it is
+# not a scheduling target. Every check below is of a link that fails SILENTLY —
+# the cordon still logs, still deregisters, still looks like it worked, and the
+# pool livelocks exactly as it did before the fix.
+
+_cordon=$(sed -n '/^cordon_host()/,/^}/p' "$STARTUP")
+
+check "cordon_host writes the cordon flag onto the instance" yes \
+  "$(printf '%s' "$_cordon" | grep -q 'add-metadata' && echo yes || echo no)"
+
+check "and the flag it writes is the one the host reads" yes \
+  "$(printf '%s' "$_cordon" | grep -q 'ci-cordon=1' && echo yes || echo no)"
+
+# Explicit --project and --zone. A gcloud call in the controller that inherits
+# either from the environment works on every host in the controller's own zone
+# and silently addresses nothing for a pool whose MIG spans others.
+for _flag in --project= --zone=; do
+  check "the add-metadata call passes $_flag explicitly" yes \
+    "$(printf '%s' "$_cordon" | grep -q -- "$_flag" && echo yes || echo no)"
+done
+
+# Gated, and defaulting OFF. v5 is main, so a merge here is live for every
+# consuming repository the moment the tag moves; this mechanism takes runner
+# agents down, so it is opt-in per pool exactly as recycle_max_unavailable was.
+check "stopping the host's agents is gated on the pool's flag" yes \
+  "$(printf '%s' "$_cordon" | grep -q 'RECYCLE_CORDON_STOPS_AGENTS' && echo yes || echo no)"
+
+d=$(sed -n '/^variable "recycle_cordon_stops_agents"/,/^}/p' "$POOL_TF/variables.tf" |
+  grep -oE 'default *= *(true|false)' | grep -oE '(true|false)')
+check "the pool module ships the cordon flag off" false "$d"
+
+# The zone is derived from the MIG self-link the tick already holds. Called with
+# one argument the function still deregisters, so the loss is invisible: the
+# cordon simply never converges.
+grep -q 'cordon_host "$host" "$host_uri"' "$STARTUP" && r=yes || r=no
+check "the tick passes cordon_host the host's self-link so it can find the zone" yes "$r"
+
+# The single-pool metadata path. A controller rendered by the pool module reads
+# one key per field rather than the table, and a field with no key there reads
+# empty — arming nothing, on precisely the pools that have no controller module.
+grep -q '"ci-recycle-cordon-stops-agents"' "$POOL_TF/main.tf" && r=yes || r=no
+check "the pool module renders the flag as its own metadata key too" yes "$r"
+grep -q 'ci-recycle-cordon-stops-agents' "$STARTUP" && r=yes || r=no
+check "and the controller reads that key when it has no table" yes "$r"
+
+# A cordoned host is short of registered slots BY DESIGN, for as long as the
+# cordon lasts. Counted, it drives ci_slots_missing non-zero on every recycle
+# and pages somebody for the fix working correctly.
+grep -q 'cordoned" -eq 0 \] &&' "$STARTUP" && r=yes || r=no
+check "cordoned hosts are excluded from the slots-missing accounting" yes "$r"
 
 # --- the controller boot script still fits in a metadata value ----------------
 #

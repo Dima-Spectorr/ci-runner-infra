@@ -1753,6 +1753,18 @@ publish() { # <payload>
     >/dev/null 2>&1 || true
 }
 
+# Is this host cordoned? Same read, same fail-open reasoning, as the slot
+# sweep's — see the long note there (#948). This sweep needs it for one
+# decision: whether to put the released slot's agent back.
+cordoned() {
+  local v
+  v=\$(curl --silent --fail --connect-timeout 3 --max-time 10 \
+    -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/ci-cordon" \
+    2>/dev/null) || return 1
+  [ "\$v" = "1" ]
+}
+
 [ -f "\$RECORD" ] || exit 0
 
 # The SAME lock ci-pin-hold takes to admit a run. Without it a sweep releasing
@@ -1923,14 +1935,24 @@ if [ "\$rc" != 0 ]; then
   exit 0
 fi
 
-if ! systemctl start "ci-runner@\$slot.service" >/dev/null 2>&1; then
+# THE HOLD IS OVER, BUT THE HOST MAY BE ON ITS WAY OUT (#948). A cordoned host
+# is one the controller has judged obsolete and is waiting to empty, and the one
+# thing that keeps it from emptying is a slot taking another job. Releasing the
+# reservation is still right — the record has expired and the stack is down —
+# but the agent stays stopped, so the release does not hand the pool back a slot
+# on a machine that is being recycled. The record is cleared either way: leaving
+# it would make every later sweep redo a teardown of nothing.
+outcome="torn down, reset and back in service"
+if cordoned; then
+  outcome="torn down and reset, but left DOWN — the host is cordoned and the recycle needs the slot to stay out of the pool"
+elif ! systemctl start "ci-runner@\$slot.service" >/dev/null 2>&1; then
   say "slot \$slot: torn down and reset, but the agent would not start — the hold stays in place so the next sweep retries"
   exit 0
 fi
 
 rm -f -- "\$RECORD"
 publish ""
-say "slot \$slot: torn down, reset and back in service"
+say "slot \$slot: \$outcome"
 exit 0
 EOF
   chown root:root /opt/ci/job-hooks/pin-sweep.sh || return 1
@@ -2034,6 +2056,29 @@ CONDEMN_MAX=3
 
 say() { logger -t ci-slot-sweep -- "\$*" 2>/dev/null || true; echo "slot sweep: \$*" >&2; }
 
+# THE HOST-SIDE CORDON (#948).
+#
+# Read live, once per sweep, and never captured at boot: the controller writes
+# this key with \`add-metadata\` HOURS after the host came up, when an apply has
+# moved the instance template past it. A value read at install time is always
+# empty and the gate would never fire.
+#
+# Bounded and fail-OPEN. A metadata server that cannot be reached reads as "not
+# cordoned", which is the direction that leaves agents running — the failure
+# this must not have is a transient curl error taking a healthy host's slots
+# down. A host that really is cordoned gets asked again in thirty seconds.
+cordoned() {
+  local v
+  v=\$(curl --silent --fail --connect-timeout 3 --max-time 10 \
+    -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/ci-cordon" \
+    2>/dev/null) || return 1
+  [ "\$v" = "1" ]
+}
+
+CORDONED=0
+cordoned && CORDONED=1
+
 for idx in \$(seq 1 "\$SLOTS"); do
   u="\$SLOT_USER_PREFIX\$idx"
   dir="\$SLOT_STATE/\$idx"
@@ -2041,6 +2086,53 @@ for idx in \$(seq 1 "\$SLOTS"); do
   since="\$dir/dirty-since"
 
   id "\$u" >/dev/null 2>&1 || continue
+
+  # A CORDONED HOST, and this is deliberately the FIRST thing asked about a
+  # slot — before the clean marker, before the dirty clock, before the state
+  # directory even has to exist. The controller has decided this machine is
+  # obsolete and is waiting for it to empty; whether a slot is clean or dirty
+  # has stopped being interesting, because nothing here is going back into
+  # service.
+  #
+  # WHY THIS EXISTS (#948). Cordoning deregisters the host's IDLE agents, and
+  # GitHub refuses (422) to deregister the one executing a job — that refusal is
+  # the mid-job guarantee and it stays. But the refused slot is still
+  # REGISTERED: the 422 protects the job, it does not take the agent out of the
+  # scheduler. So the instant that job lands the slot is an eligible,
+  # long-polling runner again, and on a saturated pool it simply takes more
+  # work. Measured 2026-09-19: new jobs at +31 and +63 minutes after the cordon,
+  # and because a cordoned host is exempt from the recycle budget it pinned
+  # every other host in its pool on the stale template too.
+  #
+  # There is no GitHub call that fixes this — the repository-scope runner API
+  # has no pause, disable or quiesce. But there is a LOCAL one, and this script
+  # has shipped it since #278: stop the unit. Units are Restart=no, a stopped
+  # agent is not long-polling and so cannot be assigned anything, and it drops
+  # out of the repository's runner list — which is what lets the controller's
+  # next tick read busy=0 and retire the host. The wait becomes one JOB long
+  # instead of however long it takes a poll to catch an idle instant.
+  #
+  # ONLY WHEN PROVABLY IDLE. The pgrep is the same test the sweep already makes
+  # below, and the same residual window applies: a job assigned between the
+  # pgrep and the stop is killed by the stop, not requeued. That window is
+  # sub-second and the module already accepts it on this exact code path; what
+  # it buys is a host that finishes its recycle at all. A slot with a live
+  # worker is left completely alone — the next sweep, thirty seconds later,
+  # finds it idle and takes it down then.
+  if [ "\$CORDONED" = 1 ]; then
+    if pgrep -u "\$u" -f 'Runner\.Worker' >/dev/null 2>&1; then
+      continue
+    fi
+    if systemctl is-active --quiet "ci-runner@\$idx.service"; then
+      if systemctl stop "ci-runner@\$idx.service" >/dev/null 2>&1; then
+        say "slot \$idx: the host is cordoned and this slot is idle — agent stopped, so no further job can be assigned to a host that is being recycled"
+      else
+        say "slot \$idx: the host is cordoned but this slot's agent would not stop — the next sweep retries"
+      fi
+    fi
+    continue
+  fi
+
   [ -d "\$dir" ] || continue
 
   # Clean is the ordinary case and the cheap one, and it clears the clock: a
@@ -2155,7 +2247,17 @@ for idx in \$(seq 1 "\$SLOTS"); do
   # Back into the pool either way. A slot left down by a failed reset would be
   # capacity lost to the bookkeeping rather than to the fault, and the marker is
   # what keeps a job from running on it — not the agent being absent.
-  if [ "\$was_active" = 1 ] &&
+  #
+  # "Either way" is now "either way, unless the host is cordoned". The cordon
+  # gate at the top of the loop already continues past here, so this is a
+  # second lock on the same door — and it is worth the two lines, because what
+  # it guards against is putting a slot back into the pool on a machine the
+  # controller is waiting to delete, which is precisely the livelock #948 is
+  # about. A restart path that stops being unreachable after some future edit
+  # would re-open it silently.
+  if [ "\$CORDONED" = 1 ]; then
+    say "slot \$idx: not restarting its agent — the host is cordoned and is being recycled"
+  elif [ "\$was_active" = 1 ] &&
     ! systemctl start "ci-runner@\$idx.service" >/dev/null 2>&1; then
     say "slot \$idx: reset, but its agent would not start again — the next sweep retries"
   fi

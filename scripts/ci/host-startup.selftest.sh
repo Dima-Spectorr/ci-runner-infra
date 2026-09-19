@@ -1210,6 +1210,57 @@ has_slot_sweep() { # <file>
   matches "$code" '/opt/ci/job-hooks/slot-reset\.sh completed "\\\$idx"' || return 1
 }
 
+# --- the host half of a cordon (#948) -----------------------------------------
+#
+# Cordoning deregisters a host's IDLE agents and GitHub answers 422 for the one
+# executing a job. That 422 is the mid-job guarantee and it stays — but it does
+# not take the agent out of the SCHEDULER. The refused slot is still registered,
+# so the moment its job lands it is an eligible long-polling runner again, and
+# on a saturated pool it just takes more work: `busy` never reads 0, RETIRE
+# never fires, and the host stays pinned to a stale template. Because a cordoned
+# host is exempt from `recycle_max_unavailable`, that one host then blocks the
+# recycle of every other host in its pool. Measured 2026-09-19: new jobs at +31
+# and +63 minutes, 18 runs queued.
+#
+# No GitHub call fixes it — the repository-scope runner API has no pause,
+# disable or quiesce, runner groups are org-only, and label-stripping rests on
+# actions/runner#4225. The fix is local and this script has shipped the
+# primitive since #278: stop the unit. Every assertion below is a link in that
+# chain, and every one of them fails SILENTLY — the cordon still logs, still
+# deregisters, and the pool livelocks exactly as it did before.
+has_host_cordon() { # <file>
+  local code
+  code=$(code_of "$1")
+
+  # The flag is read from the metadata server at each sweep, not from a file
+  # written at boot: the controller sets it on a RUNNING instance, hours after
+  # this script finished.
+  matches "$code" 'instance/attributes/ci-cordon' || return 1
+  matches "$code" 'CORDONED=0' || return 1
+  matches "$code" 'cordoned && CORDONED=1' || return 1
+
+  # FAIL-OPEN. An unreachable metadata server must read as "not cordoned": the
+  # other direction stops every agent on every host the moment the endpoint
+  # blips, which is the whole fleet, in thirty seconds.
+  matches "$code" '2>/dev/null\) \|\| return 1' || return 1
+
+  # ONLY WHEN PROVABLY IDLE — the same witness the sweep already uses. Without
+  # it the stop lands on a live worker and kills a job that GitHub will not
+  # requeue, which is strictly worse than the livelock it fixes.
+  matches "$code" 'if \[ "\\\$CORDONED" = 1 \]; then' || return 1
+  matches "$code" 'the host is cordoned and this slot is idle' || return 1
+  matches "$code" 'the host is cordoned but this slot.s agent would not stop' || return 1
+
+  # AND IT MUST NOT COME BACK. The sweep's own recovery path puts a slot back
+  # into service after a reset; on a cordoned host that hands the scheduler the
+  # slot again and the host never empties.
+  matches "$code" 'not restarting its agent — the host is cordoned' || return 1
+
+  # The pin sweep is the second restarter, and it is the easier one to forget:
+  # it runs on its own timer, ends a hold, and puts the slot back.
+  matches "$code" 'left DOWN — the host is cordoned' || return 1
+}
+
 # #278 — A SLOT THAT FAILS EVERY JOB IS STILL CAPACITY.
 #
 # The sweep above removes the largest source of condemned slots; it cannot
@@ -1357,6 +1408,12 @@ if has_slot_sweep "$SCRIPT"; then
   ok
 else
   bad "a slot left dirty by a job that never reached its completed hook is never reset — it refuses every job afterwards, fails each one in seconds, and therefore WINS the queue ahead of healthy slots, so re-running the workflow spreads the outage instead of clearing it (IntegrateIT, 12 of 24 slots, 2026-08-23)"
+fi
+
+if has_host_cordon "$SCRIPT"; then
+  ok
+else
+  bad "a cordoned host never stops its own idle agents — the slot GitHub refused to deregister (422) stays registered and keeps taking new work, so busy never reads 0, the host is never retired, and because a cordoned host is exempt from the recycle budget it blocks every other host in its pool from recycling too (#948, measured at 63 minutes with 18 runs queued)"
 fi
 
 if has_slot_condemn "$SCRIPT"; then
@@ -1925,8 +1982,18 @@ mutate "a plain pin takes its slot away"    's@\[ "\\\$reserve" = 1 \] && \[ -f@
 mutate "resets no longer serialised"        's@exec 9>>"\\\$SLOT_STATE/\\\$idx/\.reset\.lock"@exec 9>/dev/null #@'          has_slot_reset
 mutate "the lock taken but not waited for"  's@flock -w 300 9@flock -n 9@'                                                has_slot_reset
 
+# the host half of the cordon (#948). Each of these is a mutation that leaves a
+# host cordoned, logging, deregistered — and still taking jobs.
+mutate "the cordon flag never read"         's@instance/attributes/ci-cordon@instance/attributes/ci-nonesuch@g'          has_host_cordon
+mutate "cordon fails CLOSED on a blip"      's@2>/dev/null) || return 1@2>/dev/null) || return 0@g'                      has_host_cordon
+mutate "the flag read once and cached off"  's@^cordoned && CORDONED=1$@true@'                                           has_host_cordon
+mutate "a cordoned host stops nothing"      's@^  if \[ "\\\$CORDONED" = 1 \]; then$@  if false; then@'                  has_host_cordon
+mutate "a stop that failed reads as stopped" 's@the host is cordoned but this slot.s agent would not stop@the host is cordoned and this slot is idle@' has_host_cordon
+mutate "the sweep puts a cordoned slot back" 's@not restarting its agent — the host is cordoned@putting it back anyway@' has_host_cordon
+mutate "the pin sweep puts it back"         's@left DOWN — the host is cordoned@back in service@'                        has_host_cordon
+
 # the sweep
-mutate "the sweep not installed"            's@^  install_slot_sweep ||$@  true \&\& #@'                                  has_slot_sweep
+mutate "the sweep not installed"          's@^  install_slot_sweep ||$@  true \&\& #@'                                  has_slot_sweep
 mutate "a failed sweep install kills boot"  's@^  install_slot_sweep ||$@  install_slot_sweep || die@'                    has_slot_sweep
 mutate "the sweep never runs"               's@systemctl enable --now ci-slot-sweep\.timer@systemctl enable ci-slot-sweep.timer@' has_slot_sweep
 mutate "a wedged sweep blocks every later one" 's@^TimeoutStartSec=900$@TimeoutStartSec=infinity@'                        has_slot_sweep
