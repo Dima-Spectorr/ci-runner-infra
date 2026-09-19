@@ -1158,13 +1158,40 @@ posted its own copy of the check, so it read as absent.
 
 The lane treats this refusal as being about ONE candidate's own head — see
 `lane_report_refusal()` — and skips it for the pass rather than ending the
-batch, which is the head-of-line-blocking fix. It does **not** change how
-`check_counts()` computes greenness: correlating a check-run read to
-check_suite lineage (or otherwise detecting a newer, not-yet-reporting suite)
-is a greenness-semantics decision that would apply fleet-wide the moment `v5`
-moves, and belongs in its own change, not bundled with a fall-through fix.
-Tracked as the follow-up in
+batch, which is the head-of-line-blocking fix. That PR (#957) deliberately did
+**not** change how `check_counts()` computes greenness, because correlating a
+check-run read to check_suite lineage is a greenness-semantics decision that
+applies fleet-wide the moment `v5` moves.
+
+**That correlation now exists**, landed as the follow-up tracked in
 [ci-runner-infra#955](https://github.com/Dima-Spectorr/ci-runner-infra/issues/955).
+`check_counts()` reads `commits/{sha}/check-suites` alongside check-runs and
+picks, per app, whichever suite has the newest `created_at` — the same suite
+GitHub's ruleset itself asks. A `success` for a required name is trusted only
+when it came from that suite; otherwise it is re-derived from what the
+authoritative suite itself has posted for that name (if anything), or held as
+`pending` while that suite is still running. Nothing that was already
+non-green is touched — the correlation can only turn a `success` into
+`pending` or `absent`, never the reverse, which is why it could ship
+unconditionally rather than behind a flag.
+
+Two measured shapes drove the design, both on Telnet-Emulation, both the same
+app (`github-actions`) posting to the same sha from two suites:
+
+- **PR #1354**, sha `5d824839`: the newest suite for the app had been created
+  but had not yet posted `CI summary (rollup)` at all — an older, superseded
+  suite's completed success was what the flattened read returned. Reads as
+  `pending` now: the lane waits rather than attempting the 405.
+- **PR #1582**, sha `50a857fd`: the newest suite for the app (a
+  `workflow_dispatch` re-dispatch) HAD posted the check, as a `failure`, over
+  an older `pull_request` suite's stale `success`. Reads as `failed` now — the
+  lane never attempts a merge on it.
+
+A suite from an app that never posts a required name (this sha's
+`google-cloud-build`, `google-cloud-developer-connect`, `claude`,
+`mot-integrateit`, `the-merge-app` — all `queued` and never completing) is read
+and then never looked up, so a permanently-unfinished, unrelated suite cannot
+hang a verdict on the ones that matter.
 
 ## Where the logic lives, and why it is testable
 

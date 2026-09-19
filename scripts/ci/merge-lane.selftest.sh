@@ -304,6 +304,100 @@ fails_closed_on_an_unreadable_check_surface() {
   matches "$code" 'cannot read the check-runs of \$sha — the lane is blind, not idle" >&2'
 }
 
+# A check-suites read that fails is the SAME class of blindness as a check-runs
+# read that fails: the lane can no longer tell which suite is current, and
+# trusting a `success` without that answer is exactly the defect this file
+# exists to close (ci-runner-infra#955's follow-up). Fails the whole run rather
+# than one candidate, mirroring `fails_closed_on_an_unreadable_check_surface`.
+fails_closed_on_an_unreadable_check_suite_surface() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'if ! suites="\$\(gh api --paginate "repos/\$R/commits/\$sha/check-suites' || return 1
+  matches "$code" 'cannot read the check-suites of \$sha — the lane is blind, not idle" >&2'
+}
+
+# `check-suites` past the first page is the same truncation `check-runs` was
+# already fixed for, on the same endpoint family: a commit with more than a
+# handful of suites — this repository's own CI plus every bot integration —
+# would silently lose the newest one past a hundred, and the newest one is
+# the entire point of reading this endpoint at all.
+reads_every_page_of_check_suites() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'gh api --paginate "repos/\$R/commits/\$sha/check-suites\?per_page=100"'
+}
+
+# THE ROOT-CAUSE FIX ITSELF (ci-runner-infra#955's follow-up to #957): a
+# `success` is only ever trusted when the run that reported it belongs to the
+# suite that is newest-by-`created_at` FOR ITS APP — the same suite GitHub's
+# ruleset asks. Selection is PER APP, not overall, so one app's fresh suite
+# (CodeQL, Copilot, this repository's own CI) cannot discard another's.
+picks_the_authoritative_suite_per_app() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'sort_by\(\.created_at\) \| group_by\(\.app\) \| map\(\.\[-1\]\)' || return 1
+  matches "$code" 'map\(\{\(\.app\): \{id: \.id, status: \.status\}\}\)'
+}
+
+# The correlation is asked ONLY of a `success` from a check-run (never a
+# legacy commit status, which has no suite concept, and never a state that was
+# already non-green). This is the property that makes the whole change
+# strictly stricter: everything that was not already a trusted `success` is
+# untouched.
+only_downgrades_a_success_from_a_run() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'if \[ "\$state" = "success" \] && \[ "\$winner_origin" = "run" \]' || return 1
+  # And the two outcomes that fix Telnet-Emulation PR #1354 (not yet posted,
+  # wait) and PR #1582 (posted as a failure, over a stale success, do not
+  # attempt) both exist.
+  matches "$code" 'state="pending"' || return 1
+  matches "$code" 'state="\$auth_state"'
+}
+
+# A `success` whose own suite is NOT the authoritative one asks what the
+# authoritative suite itself posted for the SAME name — not "was anything from
+# it green", the per-name lookup that is the whole point of `auth_filtered`.
+# Without it, PR #1582's shape (a newer suite's genuine FAILURE sitting right
+# next to an older suite's stale success) resolves to "absent" instead of
+# "failed", which is a hold rather than the correct red.
+asks_the_authoritative_suite_for_the_same_name() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'auth_filtered="\$\(printf' || return 1
+  matches "$code" 'map\(select\(\(\$auth\[\.app\]\.id // -999\) == \.suite\)\)' || return 1
+  matches "$code" 'auth_state="\$\(printf .%s. "\$auth_filtered"'
+}
+
+# NO SILENT FALLBACK: an app whose check-suites entry cannot be found at all —
+# which should never happen, since every check-run belongs to a check_suite —
+# is held rather than trusted, and said once rather than swallowed. Trusting an
+# unverifiable green here is exactly the class of mistake this file's own
+# "no silent fallbacks" rule exists to catch.
+holds_rather_than_trusts_an_unverifiable_success() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'if \[ -z "\$auth_id" \]; then' || return 1
+  matches "$code" 'SUITE_WARN_ONCE="\$LANE_TMP/' || return 1
+  matches "$code" 'cannot verify it is the current suite, holding rather than trusting the green'
+}
+
+# An app that never posts a required name at all (this sha carries suites from
+# `google-cloud-build`, `claude`, and others that stay `queued` forever) must
+# never be asked to complete before a verdict is reached — the correlation is
+# looked up only for the app that actually posted the winning entry, so an
+# unrelated permanently-queued suite cannot hang every pull request in the
+# repository.
+does_not_wait_on_an_unrelated_apps_suite() {
+  local code
+  code=$(code_of "$1")
+  # The authoritative map is built for every app the suites read returns, but
+  # it is only ever INDEXED by `$winner_app` — never iterated or required to be
+  # `completed` as a whole.
+  matches "$code" 'auth_id="\$\(printf .%s. "\$authoritative" \| jq -r --arg a "\$winner_app"' || return 1
+  ! matches "$code" 'for app in.*authoritative'
+}
+
 # The other half of the same 403: the status surface being unreadable is NOT a
 # reason to stop merging on the check-runs that are readable, but it is a reason
 # to say so. Without the warning, a required context that is a legacy commit
@@ -1256,6 +1350,13 @@ check fails_closed_on_empty_configuration "$DRIVER" "empty configuration does no
 check reads_every_page "$DRIVER" "a list endpoint is read unpaginated, so a required check or a whole pull request can be invisible"
 check fails_closed_on_an_unreadable_comparison "$DRIVER" "a failed base comparison reads as up-to-date, which is the one answer that lets a merge through"
 check fails_closed_on_an_unreadable_check_surface "$DRIVER" "a failed check read is swallowed into the stream as a nameless object, and every required check on a green pull request then counts as FAILED"
+check fails_closed_on_an_unreadable_check_suite_surface "$DRIVER" "a failed check-suites read is not treated as blindness, so the lane keeps trusting a success it can no longer verify against the current suite"
+check reads_every_page_of_check_suites "$DRIVER" "the check-suites read is not paginated, so a commit with more than a hundred suites loses the newest one past the first page — the exact suite the correlation exists to find"
+check picks_the_authoritative_suite_per_app "$DRIVER" "the authoritative suite is picked overall rather than per app, so one app's fresh suite discards another app's still-relevant one"
+check only_downgrades_a_success_from_a_run "$DRIVER" "the correlation touches a state other than a check-run's success, so a state that was already non-green changes meaning and the fix is no longer provably one-directional"
+check asks_the_authoritative_suite_for_the_same_name "$DRIVER" "a stale success is discarded without asking what the authoritative suite itself posted for the same name, so PR #1582's genuine failure resolves to a hold instead of red"
+check holds_rather_than_trusts_an_unverifiable_success "$DRIVER" "an app with no check_suite in the read is trusted as green by default, which is the silent fallback this file's own rule forbids"
+check does_not_wait_on_an_unrelated_apps_suite "$DRIVER" "the correlation is made to wait on every suite completing rather than only the one for the app that matters, so a permanently-queued unrelated suite (google-cloud-build, claude, ...) hangs every verdict on the commit"
 check says_so_when_the_status_surface_is_unreadable "$DRIVER" "a 403 on the commit-status surface is silent, so a required legacy status reads as missing with nothing naming the cause"
 check asks_again_when_mergeability_is_not_computed_yet "$DRIVER" "the lane reads mergeability once, and the first read is the request rather than the answer, so a stale pull request waits forever"
 check says_it_once_across_subshells "$DRIVER" "the once-guard is a shell variable set inside a subshell, so the warning prints once per pull request instead of once per run"
@@ -1397,6 +1498,25 @@ mutate "the status 403 goes quiet again" "$DRIVER" \
 mutate "a check-surface diagnostic goes to stdout, where it is read as the counts" "$DRIVER" \
   's@the lane is blind, not idle" >&2@the lane is blind, not idle"@' \
   fails_closed_on_an_unreadable_check_surface
+
+mutate "the check-suites read swallows its exit status" "$DRIVER" \
+  's@if ! suites="\$(gh api --paginate "repos/\$R/commits/\$sha/check-suites@if false; suites="$(gh api --paginate "repos/$R/commits/$sha/check-suites@' \
+  fails_closed_on_an_unreadable_check_suite_surface
+mutate "the check-suites read drops its --paginate flag" "$DRIVER" \
+  's@gh api --paginate "repos/\$R/commits/\$sha/check-suites?per_page=100"@gh api "repos/$R/commits/$sha/check-suites?per_page=100"@' \
+  reads_every_page_of_check_suites
+mutate "the authoritative suite is picked overall instead of per app" "$DRIVER" \
+  's@sort_by(\.created_at) \| group_by(\.app) \| map(\.\[-1\])@sort_by(.created_at) | map(.[-1:]) | add@' \
+  picks_the_authoritative_suite_per_app
+mutate "the downgrade stops checking the winner's origin, so a legacy status could be correlated too" "$DRIVER" \
+  's@if \[ "\$state" = "success" \] && \[ "\$winner_origin" = "run" \]; then@if [ "$state" = "success" ]; then@' \
+  only_downgrades_a_success_from_a_run
+mutate "a stale success is discarded to absent instead of asking the authoritative suite for the same name" "$DRIVER" \
+  's@printf .%s. "\$auth_filtered"@printf "%s" "\$auth_filtered_UNUSED"@' \
+  asks_the_authoritative_suite_for_the_same_name
+mutate "an app with no check_suite in the read is trusted as green instead of held" "$DRIVER" \
+  's@if \[ -z "\$auth_id" \]; then@if false; then@' \
+  holds_rather_than_trusts_an_unverifiable_success
 mutate "a skipped requirement goes back to counting as red" "$DRIVER" \
   's@        were_skipped+=("\$name")@        failed=$((failed + 1))@' \
   counts_a_skipped_requirement_as_passing

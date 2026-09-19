@@ -56,6 +56,7 @@ R="$GITHUB_REPOSITORY"
 LANE_TMP="$(mktemp -d)"
 trap 'rm -rf "$LANE_TMP"' EXIT
 STATUS_WARN_ONCE="$LANE_TMP/status-surface-warned"
+SUITE_WARN_ONCE="$LANE_TMP/suite-lineage-warned"
 
 # ---------------------------------------------------------------------------
 # THE APP QUOTA IS SHARED, SO THE LANE COUNTS WHAT IT SPENDS AND STOPS SHORT.
@@ -305,6 +306,22 @@ LANE_STARTED="$now"
 # A name that appears more than once — a re-run, or a matrix leg sharing a name
 # — is resolved to its NEWEST occurrence, because that is the one the pull
 # request displays and the one a human means by "it is green now".
+#
+# THAT RESOLUTION IS NOT ENOUGH ON ITS OWN, AND A `success` GETS ONE MORE
+# CHECK. "Newest occurrence across every check_suite for the sha" is not the
+# same question GitHub's ruleset asks — it asks the CURRENT check_suite per
+# app — and a re-dispatch (`workflow_dispatch`, or a `pull_request` rerun)
+# leaves a superseded suite's occurrence sitting in the stream with its own
+# timestamp. Measured twice on Telnet-Emulation: PR #1354 attempted a merge
+# while the newest suite for the app had not yet posted the required check at
+# all (a 405, "is expected"); PR #1582 attempted one while the newest suite
+# HAD posted it, as a FAILURE, over an older suite's stale success. Both are
+# the same lineage question, so a `success` is re-verified against whichever
+# suite is newest-by-`created_at` FOR ITS APP before it is trusted — see the
+# block below `check_counts` fetches the suites for. Nothing that was already
+# non-green is touched by this: only `success` can be downgraded, never the
+# reverse, which is what keeps this change strictly stricter than what it
+# replaces.
 # ---------------------------------------------------------------------------
 # `--paginate` on both, and it is not defensive padding. A commit in this
 # repository already carries more than twenty check-runs and the shard count
@@ -314,7 +331,7 @@ LANE_STARTED="$now"
 # `mergify-nudge` documents the same truncation for the same endpoint.
 check_counts() {
   local sha="$1"
-  local runs statuses all
+  local runs statuses suites all authoritative auth_filtered
 
   # `|| true` DOES NOT MEAN "NO DATA". `gh api` writes the error BODY to
   # STDOUT on a non-2xx, so a swallowed failure does not leave the stream
@@ -335,12 +352,57 @@ check_counts() {
   # would be read as the counts, which is the same class of mistake the rest of
   # this comment is about.
   if ! runs="$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" \
-    --jq '.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // "")}' 2>/dev/null)"; then
+    --jq '.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // ""), origin: "run", app: (.app.slug // (.app.id | tostring) // "unknown"), suite: (.check_suite.id // -1)}' 2>/dev/null)"; then
     echo "lane: cannot read the check-runs of $sha — the lane is blind, not idle" >&2
     LANE_FATAL=1
     echo "0 ${#REQUIRED[@]} 0 0"
     return
   fi
+
+  # WHICH check_suite IS THE ONE GITHUB'S RULESET ACTUALLY EVALUATES.
+  #
+  # A re-dispatch (`workflow_dispatch`, or a `pull_request` rerun) creates a
+  # BRAND NEW check_suite on the same sha rather than updating the old one, and
+  # the ruleset asks only the newest suite per app whether a required context
+  # passed. `check-runs` on its own cannot tell a suite apart from its
+  # predecessor — two occurrences of "CI summary (rollup)" look identical
+  # except for which `check_suite.id` posted them — so the suite list is read
+  # separately and used to pick, per app, which suite is authoritative.
+  #
+  # PER APP, NOT OVERALL. A commit here routinely carries suites from several
+  # apps at once (this repository's own CI, Copilot, CodeQL, Dependabot) and
+  # each answers independently; "newest overall" would let one app's fresh
+  # suite silently discard another app's still-relevant one. It is also not
+  # "prefer the suite for this trigger event": two suites from the SAME app
+  # (`github-actions`, one `pull_request`, one `workflow_dispatch`) on the same
+  # sha is the exact shape measured on Telnet-Emulation PR #1582 — the
+  # `workflow_dispatch` suite was created after and reported after, and posted
+  # a FAILURE the `pull_request` suite's stale success would otherwise have
+  # buried. Newest by `created_at`, within each app, is what tracks the
+  # ruleset's own notion of "the current suite" through both a re-dispatch and
+  # a genuine rerun.
+  #
+  # `--paginate`, same reason as check-runs: this repository's commits carry
+  # more than a handful of suites (CI plus every bot integration), and a
+  # first-page-only read is the exact defect `check-runs` was already fixed
+  # for.
+  if ! suites="$(gh api --paginate "repos/$R/commits/$sha/check-suites?per_page=100" \
+    --jq '.check_suites[] | {id: .id, app: (.app.slug // (.app.id | tostring) // "unknown"), status: .status, created_at: (.created_at // "")}' 2>/dev/null)"; then
+    echo "lane: cannot read the check-suites of $sha — the lane is blind, not idle" >&2
+    LANE_FATAL=1
+    echo "0 ${#REQUIRED[@]} 0 0"
+    return
+  fi
+
+  # Per app: {id, status} of whichever suite was CREATED last. Suites from apps
+  # that never touch a required check (this sha's `google-cloud-build`,
+  # `claude`, and so on) are read here too and then simply never looked up —
+  # nothing requires them to finish, so a permanently-`queued` unrelated suite
+  # cannot hang a verdict on the ones that matter.
+  authoritative="$(printf '%s\n' "$suites" \
+    | jq -s '[.[] | select(type == "object" and (.app | type) == "string")]
+             | sort_by(.created_at) | group_by(.app) | map(.[-1])
+             | map({(.app): {id: .id, status: .status}}) | add // {}')"
 
   # The status surface is treated differently on purpose. A repository may
   # legitimately publish no commit statuses at all, and the merge App may not
@@ -366,7 +428,7 @@ check_counts() {
   local status_err
   status_err="$(mktemp)"
   if ! statuses="$(gh api --paginate "repos/$R/commits/$sha/status?per_page=100" \
-    --jq '.statuses[] | {name: .context, state: (if .state == "pending" then "pending" else .state end), at: (.updated_at // "")}' 2>"$status_err")"; then
+    --jq '.statuses[] | {name: .context, state: (if .state == "pending" then "pending" else .state end), at: (.updated_at // ""), origin: "status", app: "", suite: -1}' 2>"$status_err")"; then
     statuses=""
     if [ ! -e "$STATUS_WARN_ONCE" ]; then
       : >"$STATUS_WARN_ONCE"
@@ -384,9 +446,14 @@ check_counts() {
   # `select` is the second belt on the failure above: anything without a string
   # name is not a check, and one of them must never be able to void the whole
   # aggregation.
+  # The winner keeps its origin/app/suite alongside its state now — the
+  # classifier below needs them to know whether a `success` came from a
+  # check-run (suite-scoped, and so correlatable) or a legacy status (not
+  # suite-scoped, always trusted as before).
   all="$(printf '%s\n%s\n' "$runs" "$statuses" \
     | jq -s '[.[] | select(type == "object" and (.name | type) == "string")]
-             | sort_by(.at) | group_by(.name) | map(.[-1]) | map({(.name): .state}) | add // {}')"
+             | sort_by(.at) | group_by(.name) | map(.[-1])
+             | map({(.name): {state: .state, origin: .origin, app: .app, suite: .suite}}) | add // {}')"
 
   # An empty `all` is what the poisoned stream produced, and it is not the same
   # thing as a commit with no checks — that is `{}`. Never let it fall through
@@ -398,10 +465,79 @@ check_counts() {
     return
   fi
 
+  # Same newest-wins-per-name resolution, but restricted up front to
+  # check-runs that belong to the AUTHORITATIVE suite for their app — the one
+  # `authoritative` just picked. This is what a name reads as if only the
+  # current suite lineage is asked, which is what the classifier falls back to
+  # whenever the flattened `all` above disagrees with it.
+  auth_filtered="$(printf '%s\n' "$runs" \
+    | jq -s --argjson auth "$authoritative" \
+      '[.[] | select(type == "object" and (.name | type) == "string")]
+       | map(select(($auth[.app].id // -999) == .suite))
+       | sort_by(.at) | group_by(.name) | map(.[-1]) | map({(.name): .state}) | add // {}')"
+
   local green=0 missing=0 failed=0 pending=0 name state
   local -a were_skipped=()
   for name in "${REQUIRED[@]}"; do
-    state="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n] // "absent"')"
+    local winner_origin winner_app winner_suite auth_id auth_status auth_state
+    state="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].state // "absent"')"
+    winner_origin="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].origin // ""')"
+
+    # THE FIX, AND THE ONLY THING IT TOUCHES: a `success` is never trusted as
+    # the answer for a name unless it came from the suite the ruleset itself
+    # would ask — everything else `all` already produced (pending, failed,
+    # absent, skipped, cancelled/stale, a legacy status) passes through
+    # unchanged below, exactly as before this block existed.
+    #
+    # THIS IS WHY THE CHANGE CAN ONLY MAKE THE LANE STRICTER. It can turn a
+    # `success` into `pending` or `absent` (never the reverse), and it never
+    # touches a name whose winning answer was not already `success` from a
+    # check-run. A run whose OWN suite already IS the authoritative one keeps
+    # its `success` — the common case, one suite per sha, is untouched.
+    if [ "$state" = "success" ] && [ "$winner_origin" = "run" ]; then
+      winner_app="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].app // ""')"
+      winner_suite="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].suite // -1')"
+      auth_id="$(printf '%s' "$authoritative" | jq -r --arg a "$winner_app" '.[$a].id // ""')"
+      auth_status="$(printf '%s' "$authoritative" | jq -r --arg a "$winner_app" '.[$a].status // ""')"
+
+      if [ -z "$auth_id" ]; then
+        # NO SILENT FALLBACK: an app that posted a check-run but has no entry
+        # in the check-suites read is a correlation the lane cannot verify, and
+        # an unverifiable green is held, not trusted. This should not happen —
+        # every check-run belongs to a check_suite — so it is warned once
+        # rather than swallowed.
+        if [ ! -e "$SUITE_WARN_ONCE" ]; then
+          : >"$SUITE_WARN_ONCE"
+          echo "lane: WARNING $sha — check '$name' was posted by app '$winner_app' but no check_suite for that app came back from the check-suites read; cannot verify it is the current suite, holding rather than trusting the green." >&2
+        fi
+        state="pending"
+      elif [ "$auth_id" != "$winner_suite" ]; then
+        # The run that said `success` belongs to a SUPERSEDED suite for this
+        # app. Ask what the authoritative suite itself has to say.
+        auth_state="$(printf '%s' "$auth_filtered" | jq -r --arg n "$name" '.[$n] // ""')"
+        if [ -n "$auth_state" ]; then
+          # The authoritative suite posted its OWN occurrence of this name —
+          # trust that one instead, whatever it says (success, failure,
+          # pending...). This is the Telnet-Emulation PR #1582 case: the
+          # newest suite for the same app posted a FAILURE over an older
+          # suite's stale success.
+          state="$auth_state"
+        elif [ "$auth_status" != "completed" ]; then
+          # The authoritative suite exists and is still running (queued /
+          # in_progress) and has not posted this name yet. This is the
+          # original #955 case: wait, do not attempt.
+          state="pending"
+        else
+          # The authoritative suite completed and never posted this name at
+          # all — same as any other check that never reported, i.e. missing,
+          # not green.
+          state="absent"
+        fi
+      fi
+      # else: the winning run's own suite IS the authoritative one — success
+      # stands, unchanged.
+    fi
+
     case "$state" in
       success) green=$((green + 1)) ;;
       pending | queued | in_progress) pending=$((pending + 1)) ;;
