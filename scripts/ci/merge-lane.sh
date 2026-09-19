@@ -56,6 +56,7 @@ R="$GITHUB_REPOSITORY"
 LANE_TMP="$(mktemp -d)"
 trap 'rm -rf "$LANE_TMP"' EXIT
 STATUS_WARN_ONCE="$LANE_TMP/status-surface-warned"
+SUITE_WARN_ONCE="$LANE_TMP/suite-lineage-warned"
 
 # ---------------------------------------------------------------------------
 # THE APP QUOTA IS SHARED, SO THE LANE COUNTS WHAT IT SPENDS AND STOPS SHORT.
@@ -305,6 +306,25 @@ LANE_STARTED="$now"
 # A name that appears more than once — a re-run, or a matrix leg sharing a name
 # — is resolved to its NEWEST occurrence, because that is the one the pull
 # request displays and the one a human means by "it is green now".
+#
+# THAT RESOLUTION IS NOT ENOUGH ON ITS OWN, AND A `success` GETS ONE MORE
+# CHECK. "Newest occurrence across every check_suite for the sha" is not the
+# same question GitHub's ruleset asks — it asks the CURRENT lineage for THAT
+# CHECK — and a re-dispatch (`workflow_dispatch`, or a `pull_request` rerun)
+# leaves a superseded suite's occurrence sitting in the stream with its own
+# timestamp. Measured twice on Telnet-Emulation: PR #1354 attempted a merge
+# while the newest suite for the app had not yet posted the required check at
+# all (a 405, "is expected"); PR #1582 attempted one while the newest suite
+# HAD posted it, as a FAILURE, over an older suite's stale success.
+#
+# THE AUTHORITY KEY IS (APP, CHECK NAME), NOT APP. One app contributes MANY
+# CONCURRENT suites to one sha — one per workflow file, on the first push, not
+# only on a rerun — so "the newest suite for the app" is not a lineage at all.
+# See the block below `check_counts` fetches the suites for, which carries the
+# measurement that killed the per-app version. Nothing that was already
+# non-green is touched by this: only `success` can be downgraded, never the
+# reverse, which is what keeps this change strictly stricter than what it
+# replaces.
 # ---------------------------------------------------------------------------
 # `--paginate` on both, and it is not defensive padding. A commit in this
 # repository already carries more than twenty check-runs and the shard count
@@ -314,7 +334,7 @@ LANE_STARTED="$now"
 # `mergify-nudge` documents the same truncation for the same endpoint.
 check_counts() {
   local sha="$1"
-  local runs statuses all
+  local runs statuses suites suites_json all name_auth auth_filtered
 
   # `|| true` DOES NOT MEAN "NO DATA". `gh api` writes the error BODY to
   # STDOUT on a non-2xx, so a swallowed failure does not leave the stream
@@ -335,12 +355,141 @@ check_counts() {
   # would be read as the counts, which is the same class of mistake the rest of
   # this comment is about.
   if ! runs="$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" \
-    --jq '.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // "")}' 2>/dev/null)"; then
+    --jq '.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // ""), origin: "run", app: (.app.slug // (.app.id | tostring) // "unknown"), suite: (.check_suite.id // -1)}' 2>/dev/null)"; then
     echo "lane: cannot read the check-runs of $sha — the lane is blind, not idle" >&2
     LANE_FATAL=1
     echo "0 ${#REQUIRED[@]} 0 0"
     return
   fi
+
+  # WHICH check_suite IS THE ONE GITHUB'S RULESET ACTUALLY EVALUATES.
+  #
+  # A re-dispatch (`workflow_dispatch`, or a `pull_request` rerun) creates a
+  # BRAND NEW check_suite on the same sha rather than updating the old one, and
+  # the ruleset asks the CURRENT suite — not every suite that ever existed —
+  # whether a required context passed. `check-runs` on its own cannot tell a
+  # suite apart from its predecessor: two occurrences of "CI summary (rollup)"
+  # look identical except for which `check_suite.id` posted them. So the suite
+  # list is read separately, for the `created_at` and `status` that `check-runs`
+  # does not carry, and the correlation is made below.
+  #
+  # WHAT THIS LIST IS *NOT* USED FOR IS "the newest suite of each app". A single
+  # push creates several concurrent suites for the SAME app, one per workflow
+  # file, so that rule makes one workflow's suite speak for another workflow's
+  # checks and deletes them. The measurement is in the block that builds
+  # `name_auth`; it is why the key is (app, name).
+  #
+  # It is also not "prefer the suite for this trigger event": two suites from
+  # the SAME app (`github-actions`, one `pull_request`, one `workflow_dispatch`)
+  # on the same sha is the exact shape measured on Telnet-Emulation PR #1582 —
+  # the `workflow_dispatch` suite was created after and reported after, and
+  # posted a FAILURE the `pull_request` suite's stale success would otherwise
+  # have buried.
+  #
+  # `--paginate`, same reason as check-runs: this repository's commits carry
+  # more than a handful of suites (CI plus every bot integration), and a
+  # first-page-only read is the exact defect `check-runs` was already fixed
+  # for.
+  if ! suites="$(gh api --paginate "repos/$R/commits/$sha/check-suites?per_page=100" \
+    --jq '.check_suites[] | {id: .id, app: (.app.slug // (.app.id | tostring) // "unknown"), status: .status, created_at: (.created_at // "")}' 2>/dev/null)"; then
+    echo "lane: cannot read the check-suites of $sha — the lane is blind, not idle" >&2
+    LANE_FATAL=1
+    echo "0 ${#REQUIRED[@]} 0 0"
+    return
+  fi
+
+  # PER (APP, CHECK NAME). NOT PER APP — THAT WAS MEASURED WRONG.
+  #
+  # GitHub creates CONCURRENT SIBLING check_suites for the same app on a single
+  # push, one per workflow file, and not only on a rerun. Measured on this
+  # change's own first head sha, `afc45a0`: app `github-actions` had THREE
+  # suites created five seconds apart, ALL THREE of this repository's required
+  # checks sitting in the OLDEST of them, and one unrelated run in each of the
+  # two newer ones. "Newest suite per app" therefore made the Copilot-trigger
+  # suite authoritative for everything, every required check resolved to
+  # ABSENT, and the lane skipped `missing-required` for as long as that sha
+  # lived with nothing anywhere red. That is strictly worse than the 405 this
+  # function exists to stop, so the authority key is narrower:
+  #
+  # For a check NAME, the authoritative answer comes from the newest-by-
+  # `created_at` suite OF THAT APP THAT ACTUALLY POSTED A RUN OF THAT NAME. A
+  # newer suite's `failure` still overrides an older suite's stale `success`
+  # for the SAME name (PR #1582), while a sibling suite that never posts the
+  # name can no longer delete it.
+  #
+  # `newer_incomplete` IS THE OTHER HALF, AND IT IS WHAT KEEPS #955 FIXED. In
+  # that shape the app's newest suite had not posted the required name AT ALL
+  # yet, so per-name authority on its own would hand the verdict straight back
+  # to the older suite's stale `success` — the exact 405. So each entry also
+  # records whether the app has a suite CREATED AFTER the authoritative one
+  # that is not `completed`: one that may still post this name. That holds the
+  # name as `pending` — wait, retry — instead of trusting the green. It does not
+  # wedge the way the per-app version did: the hold lifts by itself once the
+  # app's own suites are all `completed`, and a suite of ANOTHER app (this sha's
+  # `google-cloud-build`, `claude`, ... observed permanently `queued`) is never
+  # consulted for a name it never posted.
+  #
+  # THE RESIDUAL RISK, NAMED RATHER THAN HIDDEN: a suite of the SAME app that
+  # sticks non-`completed` forever would hold that app's names `pending` for as
+  # long as the sha lives. None has been observed on this fleet — the
+  # permanently-`queued` suites are all other apps — and the failure mode is a
+  # LOUD one (the lane logs the wait and retries) rather than the silent
+  # `missing-required` skip the per-app version produced. A staleness bound on
+  # the hold, like `BASE_HEALTH_MAX_STALENESS`, is tracked in #963 rather
+  # than folded in here.
+  #
+  # THE HOLD ORDERS SUITES THE SAME WAY THE AUTHORITY DOES, on
+  # `[created_at, id]` and not on `created_at` alone. Same-second sibling suites
+  # are the NORM on this fleet, not an edge case — this change's own head has
+  # two `github-actions` suites at the same second, and a Telnet-Emulation head
+  # was measured with five inside one second. Comparing the timestamp string by
+  # itself means a later suite created in the SAME second never holds anything,
+  # and the #955 stale green is trusted again; it also means a suite whose
+  # `created_at` came back empty never holds, because `"" > "2026-..."` is
+  # false. Comparing the PAIR fixes the same-second case, because the suite id
+  # increases monotonically and so breaks the tie in creation order.
+  #
+  # IT DOES NOT FIX THE EMPTY-TIMESTAMP CASE, because a pair comparison decides
+  # on its first element and `"" < "2026-..."` whatever follows it. That case
+  # needs its own arm, and it gets the id ordering on its own: a suite the read
+  # could not place in time is placed by its id, which for one app is the same
+  # order. It is not widened to "any suite with no timestamp holds" — an OLDER
+  # incomplete suite is still not a reason to distrust a green.
+  #
+  # EVERY `sort_by` CARRIES THE FULL GROUPING KEY. jq's `group_by` sorts
+  # internally, so a partial sort happens to work; depending on that is an
+  # implicit contract, and the suite id is there as the tie-break so two suites
+  # created in the same second resolve the same way on every run. It is sorted
+  # AS A NUMBER: GitHub's suite ids increase monotonically, so a lexicographic
+  # tie-break would put `1000000000` before `999999999` and hand the tie to the
+  # EARLIER suite — backwards from the intent.
+  suites_json="$(printf '%s\n' "$suites" \
+    | jq -s '[.[] | select(type == "object" and (.app | type) == "string")]')"
+
+  name_auth="$(printf '%s\n' "$runs" \
+    | jq -s --argjson suites "$suites_json" \
+      '($suites | map({key: (.id | tostring), value: .}) | from_entries) as $smap
+       | [ .[]
+           | select(type == "object" and (.name | type) == "string")
+           | select($smap[(.suite | tostring)] != null)
+           | {name: .name, app: .app, suite: .suite,
+              created_at: ($smap[(.suite | tostring)].created_at // ""),
+              status: ($smap[(.suite | tostring)].status // "")} ]
+       | sort_by([.app, .name, .created_at, .suite])
+       | group_by([.app, .name])
+       | map(.[-1])
+       | map(. as $w
+             | {($w.app): {($w.name):
+                 {id: $w.suite, status: $w.status,
+                  newer_incomplete: (($suites
+                    | map(select(.app == $w.app
+                                 and .status != "completed"
+                                 and (([.created_at, .id]
+                                       > [$w.created_at, $w.suite])
+                                      or (.created_at == ""
+                                          and .id > $w.suite))))
+                    | length) > 0)}}})
+       | reduce .[] as $e ({}; . * $e)')"
 
   # The status surface is treated differently on purpose. A repository may
   # legitimately publish no commit statuses at all, and the merge App may not
@@ -366,7 +515,7 @@ check_counts() {
   local status_err
   status_err="$(mktemp)"
   if ! statuses="$(gh api --paginate "repos/$R/commits/$sha/status?per_page=100" \
-    --jq '.statuses[] | {name: .context, state: (if .state == "pending" then "pending" else .state end), at: (.updated_at // "")}' 2>"$status_err")"; then
+    --jq '.statuses[] | {name: .context, state: (if .state == "pending" then "pending" else .state end), at: (.updated_at // ""), origin: "status", app: "", suite: -1}' 2>"$status_err")"; then
     statuses=""
     if [ ! -e "$STATUS_WARN_ONCE" ]; then
       : >"$STATUS_WARN_ONCE"
@@ -384,9 +533,14 @@ check_counts() {
   # `select` is the second belt on the failure above: anything without a string
   # name is not a check, and one of them must never be able to void the whole
   # aggregation.
+  # The winner keeps its origin/app/suite alongside its state now — the
+  # classifier below needs them to know whether a `success` came from a
+  # check-run (suite-scoped, and so correlatable) or a legacy status (not
+  # suite-scoped, always trusted as before).
   all="$(printf '%s\n%s\n' "$runs" "$statuses" \
     | jq -s '[.[] | select(type == "object" and (.name | type) == "string")]
-             | sort_by(.at) | group_by(.name) | map(.[-1]) | map({(.name): .state}) | add // {}')"
+             | sort_by([.name, .at]) | group_by(.name) | map(.[-1])
+             | map({(.name): {state: .state, origin: .origin, app: .app, suite: .suite}}) | add // {}')"
 
   # An empty `all` is what the poisoned stream produced, and it is not the same
   # thing as a commit with no checks — that is `{}`. Never let it fall through
@@ -398,10 +552,113 @@ check_counts() {
     return
   fi
 
+  # Same newest-wins-per-name resolution, but restricted up front to the
+  # check-runs that belong to the authoritative suite FOR THAT (app, name) —
+  # the one `name_auth` just picked. This is what a name reads as if only its
+  # own current lineage is asked, which is what the classifier falls back to
+  # whenever the flattened `all` above disagrees with it. Keyed by app AND name
+  # for the same reason `name_auth` is: two apps may publish the same context.
+  auth_filtered="$(printf '%s\n' "$runs" \
+    | jq -s --argjson auth "$name_auth" \
+      '[.[] | select(type == "object" and (.name | type) == "string")]
+       | map(select((($auth[.app][.name].id) // -999) == .suite))
+       | sort_by([.app, .name, .at]) | group_by([.app, .name]) | map(.[-1])
+       | map({(.app): {(.name): .state}})
+       | reduce .[] as $e ({}; . * $e)')"
+
   local green=0 missing=0 failed=0 pending=0 name state
   local -a were_skipped=()
   for name in "${REQUIRED[@]}"; do
-    state="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n] // "absent"')"
+    local winner_origin winner_app winner_suite auth_id auth_newer auth_state
+    state="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].state // "absent"')"
+    winner_origin="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].origin // ""')"
+
+    # THE FIX, AND THE ONLY THING IT TOUCHES: a `success` is never trusted as
+    # the answer for a name unless it came from the suite the ruleset itself
+    # would ask FOR THAT NAME — everything else `all` already produced
+    # (pending, failed, absent, skipped, cancelled/stale, a legacy status)
+    # passes through unchanged below, exactly as before this block existed.
+    #
+    # THIS IS WHY THE CHANGE CAN ONLY MAKE THE LANE STRICTER. It can turn a
+    # `success` into `pending` or into whatever the authoritative suite posted
+    # for the same name (never the reverse — nothing here can produce a
+    # `success` that `all` did not already hold), and it never touches a name
+    # whose winning answer was not already `success` from a check-run. A run
+    # whose OWN suite already IS the authoritative one for its name keeps its
+    # `success` unless the app has a later suite still running.
+    if [ "$state" = "success" ] && [ "$winner_origin" = "run" ]; then
+      winner_app="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].app // ""')"
+      winner_suite="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].suite // -1')"
+      auth_id="$(printf '%s' "$name_auth" | jq -r --arg a "$winner_app" --arg n "$name" '.[$a][$n].id // ""')"
+      auth_newer="$(printf '%s' "$name_auth" | jq -r --arg a "$winner_app" --arg n "$name" '.[$a][$n].newer_incomplete // false')"
+
+      if [ -z "$auth_id" ]; then
+        # NO SILENT FALLBACK: an app that posted a check-run of this name but
+        # has no check_suite behind it in the check-suites read is a
+        # correlation the lane cannot verify, and an unverifiable green is
+        # held, not trusted. This should not happen — every check-run belongs
+        # to a check_suite — so it is warned once rather than swallowed.
+        if [ ! -e "$SUITE_WARN_ONCE" ]; then
+          : >"$SUITE_WARN_ONCE"
+          echo "lane: WARNING $sha — check '$name' was posted by app '$winner_app' but no check_suite behind that run came back from the check-suites read; cannot verify it is the current suite, holding rather than trusting the green." >&2
+        fi
+        state="pending"
+      else
+        if [ "$auth_id" != "$winner_suite" ]; then
+          # The run that said `success` belongs to a SUPERSEDED suite for this
+          # name. Ask what the authoritative suite for the name itself said.
+          auth_state="$(printf '%s' "$auth_filtered" | jq -r --arg a "$winner_app" --arg n "$name" '.[$a][$n] // ""')"
+          if [ -n "$auth_state" ]; then
+            # The authoritative suite posted its OWN occurrence of this name —
+            # trust that one instead, whatever it says (success, failure,
+            # pending...). This is the Telnet-Emulation PR #1582 case: a newer
+            # suite of the same app posted a FAILURE over an older suite's
+            # stale success, and it is also the sibling-suite case where the
+            # newest suite that posted the name disagrees with an older one.
+            state="$auth_state"
+          else
+            # UNREACHABLE BY CONSTRUCTION, AND STILL NOT A SILENT PASS. The
+            # authoritative suite for a name is chosen from the suites that
+            # posted a run of that name, so `auth_filtered` always holds one.
+            # If that ever stops being true the answer is unverifiable, and an
+            # unverifiable green is held — never trusted.
+            if [ ! -e "$SUITE_WARN_ONCE" ]; then
+              : >"$SUITE_WARN_ONCE"
+              echo "lane: WARNING $sha — check '$name' resolved to authoritative suite $auth_id for app '$winner_app', which then reported no occurrence of it; holding rather than trusting the green." >&2
+            fi
+            state="pending"
+          fi
+        fi
+
+        # THE LATER-UNFINISHED-SUITE HOLD APPLIES TO WHATEVER GREEN SURVIVED
+        # THE AUTHORITY CHECK, from EITHER arm above. The app has a suite
+        # created after the authoritative one for this name that has not
+        # `completed`, so it may still post its own occurrence and it may not
+        # be green. This is the original #955 / PR #1354 case: the newest suite
+        # for the app had been created and had not yet posted the required
+        # check, and the ruleset called it `expected` while the lane called it
+        # green. Wait, do not attempt.
+        #
+        # IT MUST NOT BE AN `elif` ON THE SUPERSEDED-SUITE BRANCH. Review of
+        # the first version of this rework caught exactly that: with three
+        # sibling suites S1 < S2 < S3 where S1 and S2 both posted the name
+        # green and S3 is still running, the flattened winner can be S1 (its
+        # run finished LAST) while the authority is S2 — the superseded arm
+        # then substituted S2's own `success` and never consulted the hold,
+        # resurrecting the #955 405 through the one path that skipped it.
+        # Applying it AFTER both arms, and only to a surviving `success`, keeps
+        # a `failure` from the authoritative suite as `failure` (#1582) rather
+        # than softening it into a wait.
+        if [ "$state" = "success" ] && [ "$auth_newer" = "true" ]; then
+          state="pending"
+        fi
+      fi
+      # else: this run's suite is the authoritative one for its name and the
+      # app has nothing later still running — success stands, unchanged. This
+      # is the common case, including the sibling-suite shape where the
+      # required checks live in an older suite than its completed siblings.
+    fi
+
     case "$state" in
       success) green=$((green + 1)) ;;
       pending | queued | in_progress) pending=$((pending + 1)) ;;
@@ -1756,9 +2013,15 @@ lane_report_refusal() {
       # for this exact head sha and ranked the pull request `merge:ready`, then
       # the merge API refused it with this 405 because the RULESET disagreed —
       # it was waiting on a check_suite the lane's flat, suite-blind read could
-      # not see was newer. That disagreement is a `check_counts` question for
-      # another day (see docs/merge-lane.md, "Superseded check_suite vs a
-      # required context"); what belongs HERE is that this refusal is about
+      # not see was newer. THAT DISAGREEMENT IS NOW CORRELATED IN
+      # `check_counts` — it resolves a required name against the suite that
+      # actually posted it, per (app, name), and holds a green whose app has a
+      # later unfinished suite (see docs/merge-lane.md, "Superseded check_suite
+      # vs a required context"). This arm is the residual belt: the correlation
+      # reads the API's answer at one instant, a suite can appear between that
+      # read and the merge call, and a legacy commit status is deliberately not
+      # suite-scoped at all. So the 405 must still be survivable, and what
+      # belongs HERE is that this refusal is about
       # THIS pull request's OWN required checks and nothing else in the
       # repository — no other candidate's checks, and no shared state like the
       # base tip, changed because GitHub said this. Ending the batch over it

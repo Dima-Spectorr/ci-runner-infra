@@ -304,6 +304,144 @@ fails_closed_on_an_unreadable_check_surface() {
   matches "$code" 'cannot read the check-runs of \$sha — the lane is blind, not idle" >&2'
 }
 
+# A check-suites read that fails is the SAME class of blindness as a check-runs
+# read that fails: the lane can no longer tell which suite is current, and
+# trusting a `success` without that answer is exactly the defect this file
+# exists to close (ci-runner-infra#955's follow-up). Fails the whole run rather
+# than one candidate, mirroring `fails_closed_on_an_unreadable_check_surface`.
+fails_closed_on_an_unreadable_check_suite_surface() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'if ! suites="\$\(gh api --paginate "repos/\$R/commits/\$sha/check-suites' || return 1
+  matches "$code" 'cannot read the check-suites of \$sha — the lane is blind, not idle" >&2'
+}
+
+# `check-suites` past the first page is the same truncation `check-runs` was
+# already fixed for, on the same endpoint family: a commit with more than a
+# handful of suites — this repository's own CI plus every bot integration —
+# would silently lose the newest one past a hundred, and the newest one is
+# the entire point of reading this endpoint at all.
+reads_every_page_of_check_suites() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'gh api --paginate "repos/\$R/commits/\$sha/check-suites\?per_page=100"'
+}
+
+# THE ROOT-CAUSE FIX ITSELF (ci-runner-infra#955's follow-up to #957), AND THE
+# GRANULARITY THE FIRST ATTEMPT GOT WRONG.
+#
+# A `success` is only ever trusted when the run that reported it belongs to the
+# newest-by-`created_at` suite that posted THAT CHECK NAME for that app. The
+# first attempt keyed the authority on the APP alone, and a single push creates
+# SIBLING suites for one app — one per workflow file — so the newest of them
+# spoke for names it had never posted and deleted them. Measured on this
+# change's own first head sha: three `github-actions` suites five seconds
+# apart, every required check in the oldest, all three resolving to `absent`.
+#
+# THE ASSERTION IS ON THE GROUPING KEY, not on the literal text of a pipeline:
+# the property is "the authority is resolved per (app, name)", and the sort that
+# feeds a `group_by` must carry the FULL grouping key rather than relying on
+# `group_by` sorting internally. The behavioural cases at the bottom of this
+# file test the resulting VERDICTS; this one guards the shape of the relation.
+picks_the_authoritative_suite_per_check_name() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'sort_by\(\[\.app, \.name, \.created_at' || return 1
+  matches "$code" 'group_by\(\[\.app, \.name\]\)' || return 1
+  # And no `group_by` anywhere in the driver is fed by a partial sort key.
+  ! matches "$code" 'sort_by\(\.created_at\) \| group_by\(\.app\)'
+}
+
+# The other half of the same relation, and the half that keeps #955 fixed. Once
+# the authority is per name, the app's newest suite not having posted the name
+# YET no longer downgrades anything by itself — so each entry carries whether
+# the app has a suite created LATER than the authoritative one that has not
+# `completed`, and that holds the name as `pending` rather than trusting the
+# green. Without it, PR #1354's shape resolves straight back to the stale
+# success that produced the 405.
+#
+# AND IT IS APPLIED TO WHATEVER GREEN SURVIVED THE AUTHORITY CHECK, from EITHER
+# arm — not as an `elif` on the "my own suite is the authoritative one" arm.
+# With sibling suites S1 < S2 < S3 where S1 and S2 both posted the name green
+# and S3 is still running, the flattened winner can be S1 (its run finished
+# LAST) while the authority is S2; an `elif` then substitutes S2's own success
+# and skips the hold, resurrecting the 405 through the one path that never
+# consulted it. Guarding it on `$state` = `success` is what keeps a `failure`
+# from the authoritative suite red (#1582) instead of softening it to a wait.
+holds_a_success_while_a_later_suite_of_the_app_is_unfinished() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'newer_incomplete: \(\(\$suites' || return 1
+  matches "$code" '\.status != "completed"' || return 1
+  matches "$code" '\[\.created_at, \.id\]' || return 1
+  matches "$code" '\[\$w\.created_at, \$w\.suite\]' || return 1
+  ! matches "$code" '\.created_at > \$w\.created_at' || return 1
+  matches "$code" 'if \[ "\$state" = "success" \] && \[ "\$auth_newer" = "true" \]; then' || return 1
+  ! matches "$code" 'elif \[ "\$auth_newer" = "true" \]; then'
+}
+
+# The correlation is asked ONLY of a `success` from a check-run (never a
+# legacy commit status, which has no suite concept, and never a state that was
+# already non-green). This is the property that makes the whole change
+# strictly stricter: everything that was not already a trusted `success` is
+# untouched.
+only_downgrades_a_success_from_a_run() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'if \[ "\$state" = "success" \] && \[ "\$winner_origin" = "run" \]' || return 1
+  # And the two outcomes that fix Telnet-Emulation PR #1354 (not yet posted,
+  # wait) and PR #1582 (posted as a failure, over a stale success, do not
+  # attempt) both exist.
+  matches "$code" 'state="pending"' || return 1
+  matches "$code" 'state="\$auth_state"'
+}
+
+# A `success` whose own suite is NOT the authoritative one asks what the
+# authoritative suite itself posted for the SAME name — not "was anything from
+# it green", the per-name lookup that is the whole point of `auth_filtered`.
+# Without it, PR #1582's shape (a newer suite's genuine FAILURE sitting right
+# next to an older suite's stale success) resolves to "absent" instead of
+# "failed", which is a hold rather than the correct red.
+asks_the_authoritative_suite_for_the_same_name() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'auth_filtered="\$\(printf' || return 1
+  matches "$code" 'map\(select\(\(\(\$auth\[\.app\]\[\.name\]\.id\) // -999\) == \.suite\)\)' || return 1
+  matches "$code" 'auth_state="\$\(printf .%s. "\$auth_filtered"'
+}
+
+# NO SILENT FALLBACK: an app whose check-suites entry cannot be found at all —
+# which should never happen, since every check-run belongs to a check_suite —
+# is held rather than trusted, and said once rather than swallowed. Trusting an
+# unverifiable green here is exactly the class of mistake this file's own
+# "no silent fallbacks" rule exists to catch.
+holds_rather_than_trusts_an_unverifiable_success() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'if \[ -z "\$auth_id" \]; then' || return 1
+  matches "$code" 'SUITE_WARN_ONCE="\$LANE_TMP/' || return 1
+  matches "$code" 'cannot verify it is the current suite, holding rather than trusting the green'
+}
+
+# An app that never posts a required name at all (this sha carries suites from
+# `google-cloud-build`, `claude`, and others that stay `queued` forever) must
+# never be asked to complete before a verdict is reached — the correlation is
+# looked up only for the app that actually posted the winning entry, so an
+# unrelated permanently-queued suite cannot hang every pull request in the
+# repository.
+does_not_wait_on_an_unrelated_apps_suite() {
+  local code
+  code=$(code_of "$1")
+  # The authority map is built from every suite the read returns, but it is only
+  # ever INDEXED by (`$winner_app`, `$name`) — never iterated, and no suite is
+  # required to be `completed` as a whole. `newer_incomplete` is likewise scoped
+  # to suites of the SAME app, so another app's permanently-`queued` suite is
+  # not part of any hold.
+  matches "$code" 'auth_id="\$\(printf .%s. "\$name_auth" \| jq -r --arg a "\$winner_app" --arg n "\$name"' || return 1
+  matches "$code" 'select\(\.app == \$w\.app$' || return 1
+  ! matches "$code" 'for app in.*name_auth'
+}
+
 # The other half of the same 403: the status surface being unreadable is NOT a
 # reason to stop merging on the check-runs that are readable, but it is a reason
 # to say so. Without the warning, a required context that is a legacy commit
@@ -1256,6 +1394,14 @@ check fails_closed_on_empty_configuration "$DRIVER" "empty configuration does no
 check reads_every_page "$DRIVER" "a list endpoint is read unpaginated, so a required check or a whole pull request can be invisible"
 check fails_closed_on_an_unreadable_comparison "$DRIVER" "a failed base comparison reads as up-to-date, which is the one answer that lets a merge through"
 check fails_closed_on_an_unreadable_check_surface "$DRIVER" "a failed check read is swallowed into the stream as a nameless object, and every required check on a green pull request then counts as FAILED"
+check fails_closed_on_an_unreadable_check_suite_surface "$DRIVER" "a failed check-suites read is not treated as blindness, so the lane keeps trusting a success it can no longer verify against the current suite"
+check reads_every_page_of_check_suites "$DRIVER" "the check-suites read is not paginated, so a commit with more than a hundred suites loses the newest one past the first page — the exact suite the correlation exists to find"
+check picks_the_authoritative_suite_per_check_name "$DRIVER" "the authoritative suite is picked per app rather than per check name, so a sibling suite of the same app speaks for checks it never posted and deletes them"
+check holds_a_success_while_a_later_suite_of_the_app_is_unfinished "$DRIVER" "a later, unfinished suite of the same app no longer holds a name, so PR #1354's shape resolves back to the stale success that produced the 405"
+check only_downgrades_a_success_from_a_run "$DRIVER" "the correlation touches a state other than a check-run's success, so a state that was already non-green changes meaning and the fix is no longer provably one-directional"
+check asks_the_authoritative_suite_for_the_same_name "$DRIVER" "a stale success is discarded without asking what the authoritative suite itself posted for the same name, so PR #1582's genuine failure resolves to a hold instead of red"
+check holds_rather_than_trusts_an_unverifiable_success "$DRIVER" "an app with no check_suite in the read is trusted as green by default, which is the silent fallback this file's own rule forbids"
+check does_not_wait_on_an_unrelated_apps_suite "$DRIVER" "the correlation is made to wait on every suite completing rather than only the one for the app that matters, so a permanently-queued unrelated suite (google-cloud-build, claude, ...) hangs every verdict on the commit"
 check says_so_when_the_status_surface_is_unreadable "$DRIVER" "a 403 on the commit-status surface is silent, so a required legacy status reads as missing with nothing naming the cause"
 check asks_again_when_mergeability_is_not_computed_yet "$DRIVER" "the lane reads mergeability once, and the first read is the request rather than the answer, so a stale pull request waits forever"
 check says_it_once_across_subshells "$DRIVER" "the once-guard is a shell variable set inside a subshell, so the warning prints once per pull request instead of once per run"
@@ -1397,6 +1543,40 @@ mutate "the status 403 goes quiet again" "$DRIVER" \
 mutate "a check-surface diagnostic goes to stdout, where it is read as the counts" "$DRIVER" \
   's@the lane is blind, not idle" >&2@the lane is blind, not idle"@' \
   fails_closed_on_an_unreadable_check_surface
+
+mutate "the check-suites read swallows its exit status" "$DRIVER" \
+  's@if ! suites="\$(gh api --paginate "repos/\$R/commits/\$sha/check-suites@if false; suites="$(gh api --paginate "repos/$R/commits/$sha/check-suites@' \
+  fails_closed_on_an_unreadable_check_suite_surface
+mutate "the check-suites read drops its --paginate flag" "$DRIVER" \
+  's@gh api --paginate "repos/\$R/commits/\$sha/check-suites?per_page=100"@gh api "repos/$R/commits/$sha/check-suites?per_page=100"@' \
+  reads_every_page_of_check_suites
+mutate "the authority key collapses from (app, name) back to app" "$DRIVER" \
+  's@group_by(\[\.app, \.name\])@group_by([.app])@' \
+  picks_the_authoritative_suite_per_check_name
+mutate "the sort that feeds the grouping drops part of the grouping key" "$DRIVER" \
+  's@sort_by(\[\.app, \.name, \.created_at, \.suite\])@sort_by([.created_at])@' \
+  picks_the_authoritative_suite_per_check_name
+mutate "the hold on a later unfinished suite of the same app is dropped" "$DRIVER" \
+  's@&& \[ "\$auth_newer" = "true" \]; then@\&\& false; then@' \
+  holds_a_success_while_a_later_suite_of_the_app_is_unfinished
+mutate "the hold becomes an elif on the superseded-suite branch, so it is skipped when the authority is a different suite" "$DRIVER" \
+  's@if \[ "\$state" = "success" \] && \[ "\$auth_newer" = "true" \]; then@elif [ "$auth_newer" = "true" ]; then@' \
+  holds_a_success_while_a_later_suite_of_the_app_is_unfinished
+mutate "the later-suite test orders suites by the timestamp alone, so a same-second sibling never holds" "$DRIVER" \
+  's@\[\.created_at, \.id\]@[.created_at]@' \
+  holds_a_success_while_a_later_suite_of_the_app_is_unfinished
+mutate "the later-suite test stops scoping itself to the winning app" "$DRIVER" \
+  's@select(\.app == \$w\.app$@select(true or .app == $w.app@' \
+  does_not_wait_on_an_unrelated_apps_suite
+mutate "the downgrade stops checking the winner's origin, so a legacy status could be correlated too" "$DRIVER" \
+  's@if \[ "\$state" = "success" \] && \[ "\$winner_origin" = "run" \]; then@if [ "$state" = "success" ]; then@' \
+  only_downgrades_a_success_from_a_run
+mutate "a stale success is discarded to absent instead of asking the authoritative suite for the same name" "$DRIVER" \
+  's@printf .%s. "\$auth_filtered"@printf "%s" "\$auth_filtered_UNUSED"@' \
+  asks_the_authoritative_suite_for_the_same_name
+mutate "an app with no check_suite in the read is trusted as green instead of held" "$DRIVER" \
+  's@if \[ -z "\$auth_id" \]; then@if false; then@' \
+  holds_rather_than_trusts_an_unverifiable_success
 mutate "a skipped requirement goes back to counting as red" "$DRIVER" \
   's@        were_skipped+=("\$name")@        failed=$((failed + 1))@' \
   counts_a_skipped_requirement_as_passing
@@ -1811,6 +1991,239 @@ mutate "the review clock stops confining itself to the required contexts" "$DRIV
 mutate "the review bots stop reaching the driver" "$CALLEE" \
   's@REVIEW_BOTS_INPUT: [$][{][{] inputs.review-bots [}][}]@REVIEW_BOTS_UNUSED: ${{ inputs.review-bots }}@' \
   passes_the_review_gate_to_the_driver
+
+
+# ---------------------------------------------------------------------------
+# BEHAVIOURAL CASES: `check_counts` RUN, NOT READ.
+#
+# Everything above this line asserts on the TEXT, for the reason the header
+# gives — a `workflow_run` workflow cannot be exercised by the pull request that
+# changes it. That reasoning covers the WIRING. It does not cover the
+# CLASSIFIER, and the cost of pretending it did is on the record: the first
+# attempt at the check_suite correlation passed 221 text assertions while
+# resolving every required check on its own head commit to `absent`, which would
+# have stopped the lane in every consuming repository with more than one
+# workflow file. A property nothing executes is a property nothing tests.
+#
+# So `check_counts` is lifted out of the driver by name — the idiom
+# `controller-scope.selftest.sh` already uses — and run against fixtures that
+# are REAL GitHub payload shapes, through the driver's own `--jq` projections:
+# the `gh` stub takes the `--jq` program out of the arguments it was called with
+# and applies it to the fixture, so the projections are under test too and a
+# fixture cannot drift into a shape the API never produces.
+#
+# THE SUITE SHAPES BELOW ARE MEASURED, NOT INVENTED. Case 1 is this change's own
+# first head sha; case 2 is Telnet-Emulation PR #1354 (ci-runner-infra#955);
+# case 3 is Telnet-Emulation PR #1582.
+# ---------------------------------------------------------------------------
+_bh_suite() { # <id> <app> <status> <created_at>
+  printf '{"id":%s,"app":{"slug":"%s"},"status":"%s","created_at":"%s"}' "$1" "$2" "$3" "$4"
+}
+_bh_run() { # <name> <status> <conclusion-json> <completed_at-json> <app> <suite-id>
+  printf '{"name":"%s","status":"%s","conclusion":%s,"completed_at":%s,"started_at":null,"app":{"slug":"%s"},"check_suite":{"id":%s}}' \
+    "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+# Runs in a COMMAND SUBSTITUTION, which is a subshell — so the `gh` stub and the
+# evalled `check_counts` die with it and cannot reach any assertion above. One
+# line per case on stdout; the caller turns those into ok/bad.
+behavioural_check_counts_cases() {
+  if ! command -v jq >/dev/null 2>&1; then
+    # NOT A SKIP. Without jq these cases assert nothing, and "asserts nothing"
+    # reported as "passes" is the failure mode this whole block exists to end.
+    echo 'FAIL jq is not on PATH, so the behavioural check_counts cases cannot run at all'
+    return
+  fi
+
+  local fix
+  fix="$(mktemp -d)"
+
+  # shellcheck disable=SC2034  # read by the evalled check_counts, not here.
+  local R="owner/repo" LANE_FATAL=0 BASE_TIP_READ=0
+  local STATUS_WARN_ONCE="$fix/status-warned" SUITE_WARN_ONCE="$fix/suite-warned"
+
+  # The driver calls `gh api --paginate <url> --jq <program>`. The stub answers
+  # the three surfaces `check_counts` reads and refuses anything else loudly,
+  # so a new call added to the function shows up as a failure rather than as
+  # silently empty data.
+  # shellcheck disable=SC2317  # Every line here is reached through the evalled
+  # `check_counts`, which shellcheck cannot see calling it.
+  gh() {
+    local url="" prog=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --jq) prog="$2"; shift 2 ;;
+        repos/*) url="$1"; shift ;;
+        *) shift ;;
+      esac
+    done
+    case "$url" in
+      */check-runs*) jq -c "$prog" "$fix/runs.json" ;;
+      */check-suites*) jq -c "$prog" "$fix/suites.json" ;;
+      */status*) jq -c "$prog" "$fix/statuses.json" ;;
+      *) echo "behavioural stub: unexpected gh call for '$url'" >&2; return 1 ;;
+    esac
+  }
+
+  # `sed -n '/^name() {/,/^}/p'` — the extraction idiom used by
+  # `controller-scope.selftest.sh`. If it ever comes back empty the eval defines
+  # nothing and every case below fails, which is the right direction.
+  eval "$(sed -n '/^check_counts() {/,/^}/p' "$DRIVER")"
+  if ! declare -F check_counts >/dev/null 2>&1; then
+    echo 'FAIL check_counts could not be lifted out of the driver, so no behavioural case ran'
+    rm -rf "$fix"
+    return
+  fi
+
+  # case <description> <expected "green missing failed pending"> <names,newline-separated> <suites-json> <runs-json>
+  local desc want got
+  case_() {
+    desc="$1" want="$2"
+    printf '%s' "$4" >"$fix/suites.json"
+    printf '%s' "$5" >"$fix/runs.json"
+    printf '{"statuses":[]}' >"$fix/statuses.json"
+    rm -f "$STATUS_WARN_ONCE" "$SUITE_WARN_ONCE"
+    local -a REQUIRED=()
+    local line
+    while IFS= read -r line; do [ -n "$line" ] && REQUIRED+=("$line"); done <<<"$3"
+    # shellcheck disable=SC2034  # Read (and set) by the evalled `check_counts`.
+    LANE_FATAL=0
+    got="$(check_counts 0000000000000000000000000000000000000000 2>/dev/null)"
+    if [ "$got" = "$want" ]; then
+      printf 'PASS %s\n' "$desc"
+    else
+      printf 'FAIL %s — want [%s] got [%s]\n' "$desc" "$want" "$got"
+    fi
+  }
+
+  # 1. THE DEFECT THIS REWORK EXISTS FOR. Three suites of ONE app created five
+  #    seconds apart on a single push, all three required checks in the OLDEST,
+  #    one unrelated run in each newer sibling. Per-app authority reads
+  #    `0 3 0 0` — three missing, lane skips `missing-required` forever with
+  #    nothing red. Per-name authority reads them green.
+  case_ "sibling suites: the required checks live in the oldest suite of the app" \
+    "3 0 0 0" \
+    "$(printf '%s\n' 'Shell (syntax + drain rule)' 'Terraform (fmt + validate)' 'Genericity (no customer or repo literals)')" \
+    "{\"check_suites\":[$(_bh_suite 1 github-actions completed 2026-09-19T12:05:22Z),$(_bh_suite 2 github-actions completed 2026-09-19T12:05:23Z),$(_bh_suite 3 github-actions completed 2026-09-19T12:05:27Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'Shell (syntax + drain rule)' completed '"success"' '"2026-09-19T12:20:00Z"' github-actions 1),$(_bh_run 'Terraform (fmt + validate)' completed '"success"' '"2026-09-19T12:19:00Z"' github-actions 1),$(_bh_run 'Genericity (no customer or repo literals)' completed '"success"' '"2026-09-19T12:18:00Z"' github-actions 1),$(_bh_run 'guard / PR guard' completed '"success"' '"2026-09-19T12:06:00Z"' github-actions 2),$(_bh_run 'copilot-pull-request-reviewer' completed '"success"' '"2026-09-19T12:07:00Z"' github-actions 3)]}"
+
+  # 2. ci-runner-infra#955 / Telnet-Emulation PR #1354 STILL HOLDS. The app's
+  #    newest suite was created and has NOT posted the required name; an older
+  #    suite holds a completed `success`. GitHub called the context `expected`
+  #    and refused the merge with a 405. Pending — wait — not green, and not
+  #    `absent` either.
+  case_ "#955: the app has a later suite still running that has not posted the name" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 10 github-actions completed 2026-08-25T06:36:51Z),$(_bh_suite 11 github-actions in_progress 2026-08-25T07:00:39Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-08-25T06:59:47Z"' github-actions 10),$(_bh_run 'Web build' in_progress null null github-actions 11)]}"
+
+  # 3. Telnet-Emulation PR #1582 STILL HOLDS. The newest suite posted the SAME
+  #    name as a FAILURE; the older suite's stale `success` has the later
+  #    `completed_at`, so the flatten-by-time picks it. Red, not green, and not
+  #    a hold: a hold would retry an attempt that cannot succeed.
+  case_ "#1582: the newest suite that posted the name has it red, over a stale success" \
+    "0 0 1 0" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 20 github-actions completed 2026-09-01T06:00:00Z),$(_bh_suite 21 github-actions completed 2026-09-01T07:00:00Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T09:00:00Z"' github-actions 20),$(_bh_run 'CI summary (rollup)' completed '"failure"' '"2026-09-01T08:00:00Z"' github-actions 21)]}"
+
+  # 4. THE TWO SHAPES TOGETHER, which is where a per-app rule is not merely
+  #    wrong but wrong in BOTH directions: three sibling suites, the name posted
+  #    red in the middle one and stale-green in the oldest, and the NEWEST
+  #    sibling never posts it at all. The answer is the red one — the newest
+  #    suite that actually posted the name — not the newest suite.
+  case_ "siblings: the newest suite that posted the name is red while an older sibling is green" \
+    "0 0 1 0" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 30 github-actions completed 2026-09-01T06:00:00Z),$(_bh_suite 31 github-actions completed 2026-09-01T06:00:05Z),$(_bh_suite 32 github-actions completed 2026-09-01T06:00:09Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T09:00:00Z"' github-actions 30),$(_bh_run 'CI summary (rollup)' completed '"failure"' '"2026-09-01T08:00:00Z"' github-actions 31),$(_bh_run 'copilot-pull-request-reviewer' completed '"success"' '"2026-09-01T06:02:00Z"' github-actions 32)]}"
+
+  # 5. A DIFFERENT app's suite, created later and `queued` forever, is what
+  #    every commit in this fleet actually carries (`google-cloud-build`,
+  #    `claude`, ...). It must not hold a name it never posted — the hold is
+  #    scoped to suites of the SAME app.
+  case_ "another app's permanently-queued suite holds nothing" \
+    "1 0 0 0" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 40 github-actions completed 2026-09-01T06:00:00Z),$(_bh_suite 41 google-cloud-build queued 2026-09-01T06:00:10Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T07:00:00Z"' github-actions 40)]}"
+
+  # 6. NO SILENT FALLBACK, EXECUTED. A run whose check_suite is absent from the
+  #    check-suites read cannot be correlated, so its green is held.
+  case_ "a run whose check_suite is missing from the read is held, never trusted" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 50 some-other-app completed 2026-09-01T06:00:00Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T07:00:00Z"' github-actions 51)]}"
+
+  # 7. THE SHAPE A REVIEW OF THIS VERY CHANGE CAUGHT, and the reason the hold is
+  #    not an `elif`. THREE sibling suites: S1 and S2 BOTH posted the name
+  #    green, S3 is still running and has not posted it. S1's run finished LAST,
+  #    so the flatten picks S1 — but the authority for the name is S2, so the
+  #    superseded-suite arm is the one taken, and if the `newer_incomplete` hold
+  #    lives on the other arm it is never consulted: the answer comes back
+  #    `1 0 0 0`, green, which is the #955 405 all over again through the one
+  #    path that skipped the check. Must read as a hold.
+  case_ "a later suite of the app is still running while the authority for the name is a THIRD, superseded-from sibling" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 70 github-actions completed 2026-09-01T06:00:00Z),$(_bh_suite 71 github-actions completed 2026-09-01T06:00:05Z),$(_bh_suite 72 github-actions in_progress 2026-09-01T06:00:09Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T09:00:00Z"' github-actions 70),$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T08:00:00Z"' github-actions 71),$(_bh_run 'Web build' in_progress null null github-actions 72)]}"
+
+  # 8. THE TIE-BREAK IS NUMERIC. Two suites of the app created in the SAME
+  #    second, so `created_at` cannot order them and the suite id decides.
+  #    GitHub's ids increase monotonically, so the LARGER id is the later
+  #    suite — and it posted the name red over the smaller one's stale green.
+  #    Sorted as strings, `"1000000000" < "999999999"`, the authority inverts to
+  #    the earlier suite and the answer comes back green.
+  case_ "two suites of the app created in the same second are tie-broken by suite id as a number, not a string" \
+    "0 0 1 0" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 999999999 github-actions completed 2026-09-01T06:00:00Z),$(_bh_suite 1000000000 github-actions completed 2026-09-01T06:00:00Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T09:00:00Z"' github-actions 999999999),$(_bh_run 'CI summary (rollup)' completed '"failure"' '"2026-09-01T08:00:00Z"' github-actions 1000000000)]}"
+
+  # 9. THE HOLD ORDERS ON THE PAIR TOO, and this is the shape that makes it
+  #    matter: the later, still-running suite was created in the SAME SECOND as
+  #    the one that posted the name green. Same-second siblings are the NORM on
+  #    this fleet — this change's own head carries two, a Telnet-Emulation head
+  #    carried five — so comparing `created_at` as a string on its own means the
+  #    hold never fires and #955's stale green is trusted: `1 0 0 0`.
+  case_ "a later suite of the app created in the SAME SECOND, still running, holds the name" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 80 github-actions completed 2026-09-19T12:55:50Z),$(_bh_suite 81 github-actions in_progress 2026-09-19T12:55:50Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-19T13:10:00Z"' github-actions 80),$(_bh_run 'Web build' in_progress null null github-actions 81)]}"
+
+  # 10. AND A LATER SUITE THE API RETURNED WITHOUT A `created_at` STILL HOLDS.
+  #     The projection defaults a missing timestamp to `""`, and `"" > "2026-.."`
+  #     is false, so a timestamp-only comparison silently stops holding for
+  #     exactly the suite it knows least about. The id ordering decides instead.
+  case_ "a later suite with no created_at in the read still holds the name" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 90 github-actions completed 2026-09-19T12:55:50Z),{\"id\":91,\"app\":{\"slug\":\"github-actions\"},\"status\":\"queued\",\"created_at\":null}]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-19T13:10:00Z"' github-actions 90)]}"
+
+  # 11. THE COMMON CASE IS UNTOUCHED: one suite, one run, green stays green.
+  case_ "one suite, one run: its own suite is authoritative and the success stands" \
+    "1 0 0 0" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 60 github-actions completed 2026-09-01T06:00:00Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T07:00:00Z"' github-actions 60)]}"
+
+  rm -rf "$fix"
+}
+
+_bh_out="$(behavioural_check_counts_cases)"
+while IFS= read -r _bh_line; do
+  case "$_bh_line" in
+    PASS\ *) ok ;;
+    FAIL\ *) bad "behavioural check_counts: ${_bh_line#FAIL }" ;;
+    '') : ;;
+    *) bad "behavioural check_counts: unparseable result line '$_bh_line'" ;;
+  esac
+done <<<"$_bh_out"
 
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane: $FAIL failed, $PASS passed"

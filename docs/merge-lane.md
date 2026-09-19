@@ -1158,13 +1158,76 @@ posted its own copy of the check, so it read as absent.
 
 The lane treats this refusal as being about ONE candidate's own head — see
 `lane_report_refusal()` — and skips it for the pass rather than ending the
-batch, which is the head-of-line-blocking fix. It does **not** change how
-`check_counts()` computes greenness: correlating a check-run read to
-check_suite lineage (or otherwise detecting a newer, not-yet-reporting suite)
-is a greenness-semantics decision that would apply fleet-wide the moment `v5`
-moves, and belongs in its own change, not bundled with a fall-through fix.
-Tracked as the follow-up in
+batch, which is the head-of-line-blocking fix. That PR (#957) deliberately did
+**not** change how `check_counts()` computes greenness, because correlating a
+check-run read to check_suite lineage is a greenness-semantics decision that
+applies fleet-wide the moment `v5` moves.
+
+**That correlation now exists**, landed as the follow-up tracked in
 [ci-runner-infra#955](https://github.com/Dima-Spectorr/ci-runner-infra/issues/955).
+`check_counts()` reads `commits/{sha}/check-suites` alongside check-runs and
+resolves, **per (app, check name)**, which suite is authoritative for that name:
+the newest-by-`created_at` suite of that app that actually posted a run of it. A
+`success` for a required name is trusted only when it came from that suite;
+otherwise it is re-derived from what that suite itself posted for the same name.
+A `success` that IS from the authoritative suite is still held as `pending` while
+the same app has a suite created LATER that has not `completed` — one that may
+yet post its own occurrence. "Later" is ordered on `[created_at, suite id]`, not
+on the timestamp alone: same-second sibling suites are the NORM here (two on
+ci-runner-infra `04e788fa`, five within one second on Telnet-Emulation
+`1da9a01`), and a suite id increases monotonically, so it is what actually
+resolves both a same-second tie and a suite the read returned without a
+timestamp. Nothing that was already non-green is touched: the
+correlation can only turn a `success` into `pending` or into whatever the
+authoritative suite said, never the reverse, which is why it could ship
+unconditionally rather than behind a flag.
+
+**The authority key is (app, name) and not app, and that distinction is the
+whole difficulty.** One app contributes SEVERAL CONCURRENT suites to one sha —
+one per workflow file, on the first push, not only on a rerun. A rule of "the
+newest suite per app" therefore lets one workflow's suite answer for another
+workflow's checks, which means DELETING them: they resolve to `absent`, the lane
+skips on `missing-required` for as long as the sha lives, and nothing anywhere is
+red. That was the first attempt at this fix, and it was caught on its own pull
+request's head commit (three `github-actions` suites five seconds apart, all
+three required checks in the oldest of them). It is a worse failure than the 405
+it replaces, because a 405 is at least loud.
+
+Three measured shapes drove the design:
+
+- **PR #1354** (Telnet-Emulation), sha `5d824839`: the newest suite for the app
+  had been created but had not yet posted `CI summary (rollup)` at all — an
+  older, superseded suite's completed success was what the flattened read
+  returned. Reads as `pending` now: the lane waits rather than attempting the
+  405. This is the shape `newer_incomplete` exists for; per-name authority alone
+  would hand the verdict straight back to the stale success.
+- **PR #1582** (Telnet-Emulation), sha `50a857fd`: the newest suite for the app
+  (a `workflow_dispatch` re-dispatch) HAD posted the check, as a `failure`, over
+  an older `pull_request` suite's stale `success`. Reads as `failed` now — the
+  lane never attempts a merge on it.
+- **ci-runner-infra PR #961**, sha `afc45a0`: three sibling suites of
+  `github-actions` created five seconds apart on one push, all three required
+  contexts inside the OLDEST, an unrelated single run in each of the other two.
+  Reads all three green now. Under per-app authority it read `3 missing`.
+
+The hold on a later, unfinished same-app suite is the one part of this with a
+residual risk, and it is named rather than hidden: a same-app suite that sticks
+non-`completed` forever would hold that app's required names `pending` for as
+long as the sha lives. None has been observed here — the permanently-`queued`
+suites on this fleet all belong to other apps, which are never consulted — and
+the failure mode is a loud, retrying wait rather than the silent
+`missing-required` skip a per-app rule produces. A staleness bound on the hold
+is tracked in [ci-runner-infra#963](https://github.com/Dima-Spectorr/ci-runner-infra/issues/963),
+not folded into this change. A required name answered by a LEGACY COMMIT STATUS
+is likewise not suite-scoped — statuses have no check_suite to correlate against
+— so it is trusted exactly as it was before this change; that is pre-existing
+and intentional, not an oversight.
+
+A suite from an app that never posts a required name (this sha's
+`google-cloud-build`, `google-cloud-developer-connect`, `claude`,
+`mot-integrateit`, `the-merge-app` — all `queued` and never completing) is read
+and then never looked up, so a permanently-unfinished, unrelated suite cannot
+hang a verdict on the ones that matter.
 
 ## Where the logic lives, and why it is testable
 
