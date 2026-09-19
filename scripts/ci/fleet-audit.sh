@@ -65,7 +65,20 @@ RELEASED_SURFACE="${RELEASED_SURFACE:-^(modules|scripts)/}"
 # bounded walk, because one API call per commit against a tag that has not moved
 # in months would be hundreds. Past the cap the age is reported as unknown
 # rather than guessed — see backlog_facts().
-BACKLOG_SCAN_MAX="${BACKLOG_SCAN_MAX:-40}"
+#
+# A NON-NUMERIC OVERRIDE MUST NOT REMOVE THE CAP. `[ "$n" -gt abc ]` is an
+# ERROR, not a false: `test` writes "integer expression expected" and exits 2,
+# the `if` reads that as "not past the cap", and the walk then makes one API
+# call per commit with nothing bounding it — an operator's typo quietly turning
+# a bounded audit into an unbounded one while it still reports facts. Refuse
+# the value once, here, rather than once per commit on stderr.
+BACKLOG_SCAN_MAX_DEFAULT=40
+BACKLOG_SCAN_MAX="${BACKLOG_SCAN_MAX:-$BACKLOG_SCAN_MAX_DEFAULT}"
+if ! _fleet_is_number "$BACKLOG_SCAN_MAX"; then
+  echo "fleet-audit: BACKLOG_SCAN_MAX=\"$BACKLOG_SCAN_MAX\" is not a whole number;" \
+       "using $BACKLOG_SCAN_MAX_DEFAULT" >&2
+  BACKLOG_SCAN_MAX="$BACKLOG_SCAN_MAX_DEFAULT"
+fi
 # The tag the backlog is measured from. Empty — the normal case — derives it
 # from VERSION's major, which is the ref consumers pin. An override exists so
 # the collector can be exercised by hand against a tag that is known to be
@@ -518,11 +531,23 @@ facts_for() {
 #
 # `backlog_facts` is the one part of this file with a self-test, and it can only
 # have one because the test stubs `api` and sources this file for the functions
-# without running the audit. `return` at the top level of a sourced file is
-# legal and exits the source; in an executed file it is an error that changes
-# nothing, and the variable is set by nothing but the self-test, so a real run
-# cannot take this branch by accident.
-[ "${FLEET_AUDIT_LIB:-}" = "1" ] && return 0
+# without running the audit.
+#
+# THE GUARD HAS TO MEAN THE SAME THING IN BOTH MODES. `return` at the top level
+# of a SOURCED file is legal and ends the source; in an EXECUTED file it is an
+# error, and since this script runs under `set -uo pipefail` rather than `-e`
+# that error does not stop anything — bash writes "can only `return' from a
+# function or sourced script" and then runs the entire audit that the variable
+# just asked it not to run. Falling through to `exit 0` makes the two readings
+# agree: asked not to run, it does not run, however it was invoked.
+# Asking `return` whether it worked is the only reading that cannot be fooled.
+# Comparing BASH_SOURCE[0] with $0 looks tidier and is wrong: `bash -c 'source
+# "$0"' <path>` sets $0 TO that path, so a genuine source reads as an execution
+# and this exits the caller's shell. Found by the assertions below.
+# shellcheck disable=SC2317  # reachable when EXECUTED, where `return` fails
+if [ "${FLEET_AUDIT_LIB:-}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 command -v gh >/dev/null 2>&1 || { echo "fleet-audit: gh is not on PATH" >&2; exit 2; }
 [ -r "$MANIFEST" ] || { echo "fleet-audit: cannot read $MANIFEST" >&2; exit 2; }
