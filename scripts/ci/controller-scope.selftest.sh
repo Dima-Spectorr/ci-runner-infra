@@ -1358,6 +1358,175 @@ check "pool_size: the negative clamp precedes both publishes that consume it" "1
 grep -A2 'if \[ "\$pool_size" -lt 0 \]' "$CTRL" | grep -q '^ *log "BUG' && r=yes || r=no
 check "pool_size: the clamp logs that it fired" yes "$r"
 
+# ── the cordon: what a refusal MEANS, and how old the cordon is ──────────────
+#
+# Two defects, both of which made a cordon unreadable from the outside.
+#
+# D1. Every HTTP code that was not 204/404 landed in one arm labelled "still
+#     finishing work", with no log line. So a 401 (token), a 403 (secondary rate
+#     limit), a 5xx and a curl that never completed (000) all produced the same
+#     message as a healthy busy pool -- and specifically the same message as the
+#     livelock in #948, which is what they would have been diagnosed as.
+#     drain_host()'s deregister loop has always split these; the cordon now does
+#     too, counted rather than aborting, because a cordon walks the whole list.
+#
+# D2. `: >"$STATE_DIR/cordon-$host"` ran on EVERY cordon pass, and the cordon is
+#     re-issued every tick. So the marker's timestamp was always "last tick",
+#     never "cordon start", and a cordon's age was underivable anywhere -- on
+#     exactly the hosts where the age is the only evidence of #948.
+#
+# RUN, not grepped, for the reason at the top of this file: the counting is
+# arithmetic across three variables and a grep cannot tell 422 from 403.
+#
+# cordon_seq <codes> [marker-age|none] -> gone|held|failed|noprog|warns|marker
+#   <codes>       comma list of HTTP codes the DELETE returns, one runner each.
+#                 An empty element is curl returning nothing at all.
+#   <marker-age>  seconds ago the cordon marker was stamped, or `none` for a
+#                 host being cordoned for the first time. `empty` writes the
+#                 marker the OLD code wrote -- zero bytes -- which is what every
+#                 marker on disk looks like at the moment this ships.
+#   marker        the marker's content as a verdict: `kept=<age>` when the
+#                 pre-existing stamp survived the pass, `restamped`/`stamped`
+#                 when it was written this pass, `absent` when there is none.
+cordon_seq() {
+  local codes="$1" mage="${2:-none}"
+  local dir out now
+  dir=$(mktemp -d)
+  now=$(date +%s)
+  case "$mage" in
+    none) ;;
+    empty) : >"$dir/cordon-h1" ;;
+    *) echo $((now - mage)) >"$dir/cordon-h1" ;;
+  esac
+  printf '%s\n' "$codes" | tr ',' '\n' >"$dir/codes"
+
+  out=$(
+    bash -c "
+      set -uo pipefail
+      STATE_DIR='$dir'
+      REPO_FULL=test-owner/test-repo
+      CURL_TIMEOUTS=(--connect-timeout 10 --max-time 30)
+      CORDON_NO_PROGRESS_SECONDS=3600
+      CORDONED=0; CORDON_HELD=0; CORDON_ERRORS=0; CORDON_NO_PROGRESS=0
+      RUNNERS_JSON='{}'
+      log() { :; }
+      # The severity and the event name are what an operator greps for, so they
+      # are what is recorded -- not the message text.
+      event() { printf '%s %s\n' \"\$1\" \"\$2\" >>'$dir/events'; }
+      gh_token() { echo installation-token; }
+      # One id per code. Stubbed because this harness must not need jq on PATH;
+      # the real filter selects '<host>-s*' names, which is a separate concern
+      # and is covered where the roster is parsed.
+      jq() { local i=1 n; n=\$(wc -l <'$dir/codes'); while [ \"\$i\" -le \"\$n\" ]; do echo \"\$i\"; i=\$((i + 1)); done; }
+      # A code of 'none' is curl printing NOTHING -- a connection that died
+      # before -w could write a status at all. 000 is curl's own value for the
+      # same class of failure when it DOES get to write one. Both are tested:
+      # an empty \$code and a literal 000 are different strings, and the arm
+      # has to catch both. No backticks anywhere in this string: shellcheck
+      # reads the outer file, where a backtick inside these double quotes is a
+      # command substitution and not the prose it looks like (SC2006).
+      curl() { local n c; n=\$(( \$(cat '$dir/ncalls' 2>/dev/null || echo 0) + 1 )); echo \"\$n\" >'$dir/ncalls'; c=\$(sed -n \"\${n}p\" '$dir/codes'); [ \"\$c\" = none ] || printf '%s' \"\$c\"; }
+      $(fn cordon_seconds)
+      $(fn cordon_host)
+      cordon_host h1 >/dev/null 2>&1
+      printf '%s|%s|%s|%s' \"\$CORDON_HELD\" \"\$CORDON_ERRORS\" \"\$CORDON_NO_PROGRESS\" \"\$CORDONED\"
+    " 2>&1
+  )
+  case "$out" in
+    [0-9]*'|'[0-9]*'|'[0-9]*'|'[0-9]*) ;;
+    *) printf 'shell-error: %s' "$(printf '%s' "$out" | head -1)"; rm -rf "$dir"; return ;;
+  esac
+
+  local held errs noprog gone marker body
+  held=${out%%|*}; out=${out#*|}
+  errs=${out%%|*}; out=${out#*|}
+  noprog=${out%%|*}
+  gone=$(grep -c '^INFO cordon-deregister$' "$dir/events" 2>/dev/null)
+  body=$(cat "$dir/cordon-h1" 2>/dev/null)
+  if [ ! -f "$dir/cordon-h1" ]; then
+    marker=absent
+  elif [ "$mage" = none ] || [ "$mage" = empty ]; then
+    # Written this pass. Only that it is a usable stamp matters.
+    case "$body" in "" | *[!0-9]*) marker=unstamped ;; *) marker=stamped ;; esac
+  elif [ "$body" = "$((now - mage))" ]; then
+    marker="kept=$mage"
+  else
+    marker=restamped
+  fi
+  printf '%s|%s|%s|%s|%s|%s' "${gone:-0}" "$held" "$errs" "$noprog" \
+    "$(grep -c '^WARNING ' "$dir/events" 2>/dev/null)" "$marker"
+  rm -rf "$dir"
+}
+
+# The ordinary cordon: both slots idle, both gone, nothing held, nothing warned.
+check "cordon: two idle slots are removed and nothing is held" "2|0|0|0|0|stamped" \
+  "$(cordon_seq 204,204)"
+
+# THE CHECKS D1 EXISTS FOR. A 422 is a job finishing and is NOT a warning; a 401,
+# a 403, a 500 and a curl that returned nothing are, and none of them may be
+# counted as held. Each is asserted on its own, because one arm that swallowed
+# all four would pass a test that only tried one of them.
+check "cordon: a 422 is held, silently, and is not an error" "1|1|0|0|0|stamped" \
+  "$(cordon_seq 204,422)"
+check "cordon: a 401 is an error, not work in progress" "1|0|1|0|1|stamped" \
+  "$(cordon_seq 204,401)"
+check "cordon: a 403 rate limit is an error, not work in progress" "1|0|1|0|1|stamped" \
+  "$(cordon_seq 204,403)"
+check "cordon: a 500 is an error, not work in progress" "1|0|1|0|1|stamped" \
+  "$(cordon_seq 204,500)"
+check "cordon: curl's own 000 is an error, not work in progress" \
+  "1|0|1|0|1|stamped" "$(cordon_seq 204,000)"
+check "cordon: a curl that answered nothing at all is an error too" \
+  "1|0|1|0|1|stamped" "$(cordon_seq 204,none)"
+# And the mixture, which is the row an operator actually reads: one slot gone,
+# one finishing a job, one unanswered. Three distinct numbers -- and before this
+# change the last two were the same number.
+check "cordon: held and no-usable-answer are separate columns" "1|1|1|0|1|stamped" \
+  "$(cordon_seq 204,422,401)"
+
+# THE CHECKS D2 EXISTS FOR. The marker carries the cordon's START, so a pass that
+# re-issues the cordon must not touch it.
+check "cordon: an existing marker is not re-truncated or restamped" \
+  "0|1|0|0|0|kept=600" "$(cordon_seq 422 600)"
+check "cordon: a first cordon stamps the marker with a readable time" \
+  "0|1|0|0|0|stamped" "$(cordon_seq 422 none)"
+# Every marker on disk at the moment this ships is zero bytes, written by `: >`.
+# Read as 0 it would put the cordon's age at decades and fire no-progress on the
+# first tick after the upgrade, so it is restamped to now and reported as young.
+check "cordon: a legacy zero-byte marker is restamped, not read as the epoch" \
+  "0|1|0|0|0|stamped" "$(cordon_seq 422 empty)"
+
+# THE OBSERVABILITY HALF OF #948. A cordon past the window that removed NOTHING
+# and still holds a slot is not converging: the held slot keeps being handed
+# work. Signalled here; NOT fixed here.
+check "cordon: a held slot past the window is reported as no progress" \
+  "0|1|0|1|1|kept=7200" "$(cordon_seq 422 7200)"
+check "cordon: inside the window a held slot is just a long job" \
+  "0|1|0|0|0|kept=1800" "$(cordon_seq 422 1800)"
+# Progress this tick is progress, however old the cordon: a slot came out of the
+# pool, so the next tick is strictly closer to a retire.
+check "cordon: an old cordon that removed a slot is not no-progress" \
+  "1|1|0|0|0|kept=7200" "$(cordon_seq 204,422 7200)"
+# A DELETE with no usable answer is not no-progress either. It is already warned
+# about as an error, and reporting it on BOTH would send a token fault to the
+# livelock alert -- the exact confusion D1 removes.
+check "cordon: a DELETE with no usable answer on an old cordon is not no-progress" \
+  "0|0|1|0|1|kept=7200" "$(cordon_seq 401 7200)"
+
+# And the publish. A counter nothing sends is a counter nobody sees, and the
+# three labels go out as a fixed set including the zeroes for the reason the skip
+# reasons do: a series that appears only when it fires cannot be alerted on.
+for _o in cordon-held cordon-error cordon-no-progress; do
+  grep -qF "\"outcome\":\"$_o\"" "$CTRL" && r=yes || r=no
+  check "cordon: $_o is published on ci_recycle_verdicts" yes "$r"
+done
+# Reset per tick, like every other per-tick delta. Left unreset they would
+# accumulate across pools on a controller that serves four.
+for _v in CORDON_HELD CORDON_ERRORS CORDON_NO_PROGRESS; do
+  grep -qE "^  $_v=0\$" "$CTRL" && r=yes || r=no
+  check "cordon: $_v is reset at the top of tick_pool" yes "$r"
+done
+
 # THE LAST LINES IN THE FILE, and `exit` rather than a bare test, so that a check
 # appended below them cannot silently become the script's exit status again.
 echo "controller-scope selftest: $pass passed, $fail failed"

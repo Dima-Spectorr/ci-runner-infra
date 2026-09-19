@@ -73,6 +73,16 @@
 # than whenever a sample happens to land. Same rule, an input that now converges.
 # Behind `recycle_cordon_stops_agents`, default false.
 #
+# WHAT THE CORDON PROVIDES, STATED WITHOUT THE OVERCLAIM: no job is ever
+# interrupted, and a slot once removed from the pool never comes back. It does
+# NOT provide "no new job can ever reach this host again" on its own — only the
+# host-side half makes that true, and only on a pool whose hosts are new enough
+# to have the sweep that reads the flag. So the measurement added in #951 stays:
+# cordon_host() publishes ci_recycle_verdicts{outcome=cordon-no-progress} for a
+# cordon that has removed nothing since it started. With the flag off, or on a
+# pool still running older hosts, that series is the livelock being visible
+# rather than silent. Do not re-add the stronger claim unconditionally.
+#
 # ROLLING, NOT ALL AT ONCE. Cordoning is not free: a cordoned host's idle slots
 # leave the pool immediately, so cordoning every stale host at once removes the
 # fleet's whole spare capacity in one tick and every queued job waits for a
