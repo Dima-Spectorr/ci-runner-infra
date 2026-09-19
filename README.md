@@ -636,13 +636,20 @@ that image a real answer is separate work, not a line in this one.
 
   **Which caches are wired is a shorter list than it looks.** Nine are:
   npm, Yarn, pnpm's store, Go's *module* cache, pip, uv, Maven, NuGet, Composer.
-  Three are deliberately left alone. `GOCACHE`, Go's build cache, is not safe for
+  Two are deliberately left alone. `GOCACHE`, Go's build cache, is not safe for
   concurrent builds (golang/go#43645) and is a different directory from
-  `GOMODCACHE`. The Actions tool cache (`RUNNER_TOOL_CACHE`) has no locking at
-  all (actions/toolkit#804), and the `setup-*` actions treat it as a directory
-  they own and prune, so seeding it would buy a rebuild rather than a saving.
-  Gradle's `GRADLE_RO_DEP_CACHE` requires that nothing writes to it while builds
-  read it, which a slot's own live cache is not.
+  `GOMODCACHE`; a per-slot copy does not fix it, because the unsafe concurrency
+  is between the parallel builds inside one job. Gradle's `GRADLE_RO_DEP_CACHE`
+  requires that nothing writes to it while builds read it, which a slot's own
+  live cache is not.
+
+  **The Actions tool cache used to be on that list and no longer is.** It was
+  excluded on actions/toolkit#804 — no locking — and on the `setup-*` actions
+  pruning it as though they own it. The first is a *concurrent-writer* failure
+  and does not reach a path scoped to one slot, which runs one job at a time:
+  the identical argument that already makes the nine caches above safe. The
+  second is answered by re-seeding rather than by abstaining. It has its own
+  bullet below, because it is not seeded the way these are.
 
   Go gets no `GOFLAGS=-modcacherw`. Go writes its module cache read-only by
   design, because `go.sum` authenticates the module *zip* at download and the
@@ -669,6 +676,39 @@ that image a real answer is separate work, not a line in this one.
 
   Do it in the job that needs it, not fleet-wide: the mode is per-slot and the
   host rebuilds it on the next boot either way.
+
+* **The pinned Node runtime is baked too, and it is re-seeded before every
+  job.** Same two-tier shape, a separate tree, and one difference that is the
+  whole feature. `/opt/ci-toolcache` is a second root-owned, read-only master
+  holding each baked runtime in the layout `actions/setup-node` resolves
+  against — `node/<version>/x64` plus the sibling `x64.complete` marker the
+  toolkit actually tests for. Each slot gets its own copy at
+  `/var/lib/ci-cache/<idx>/tool-cache`, and `RUNNER_TOOL_CACHE` points there:
+  **outside `_work`**, because `slot-reset.sh started` wipes `_work/_tool` at
+  the start of every job. That is why baking into the runner's default tool
+  cache path would have bought nothing at all.
+
+  Unlike the dependency caches, this tree is **replaced, not kept** — the same
+  seeder runs again from the job-start reset. It is on `PATH` and is executed,
+  so what a job begins with has to be a property of a tree only root writes,
+  the same rule that rebuilds the slot home from its template between jobs. It
+  is also what makes a prune by a `setup-*` action cost exactly one job.
+
+  Measured, `Telnet-Emulation` run `35440557902` on 2026-09-19: 11 jobs, 637s
+  of job wall time, **215s of it — 34% — in `Set up Node.js`**, downloading the
+  same ~60 MB tarball once per job on a host that already had it.
+
+  To benefit, a repository must pin the **exact** version, not a major or
+  `lts/*`. Anything else downloads, silently, exactly as before — this
+  repository cannot see a consuming workflow's `setup-node` call and no gate
+  here can make that loud. What is baked, how a pool operator changes it, and
+  the full table of what is and is not detectable:
+  [`docs/baked-tool-cache.md`](docs/baked-tool-cache.md).
+
+  A shared, group-writable tool cache is still forbidden and still asserted
+  against by `scripts/ci/shared-cache.selftest.sh` — `chgrp ci`, `2775`,
+  `UMask=0002` and `cp -al` seeding are all refused exactly as before. The rule
+  got narrower, not quieter.
 
   **A `container:` job gets no cache reuse.** These are systemd `Environment=`
   lines on the agent unit, and the runner passes only the workflow's own

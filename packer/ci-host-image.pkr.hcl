@@ -130,6 +130,60 @@ variable "node_major" {
   default     = "24"
 }
 
+variable "tool_cache_node_versions" {
+  type        = map(string)
+  description = <<-EOT
+    EXACT Node.js runtimes baked into the Actions TOOL CACHE, keyed by the exact
+    version and valued by the SHA-256 of `node-v<version>-linux-x64.tar.gz` as
+    published in https://nodejs.org/dist/v<version>/SHASUMS256.txt.
+
+    THIS IS NOT `node_major`, and conflating the two is the mistake this
+    paragraph exists to prevent. `node_major` is the SYSTEM node on PATH — a
+    host baseline so that a `#!/usr/bin/env node` shim resolves, explicitly not
+    a build toolchain, and a repository that wants a different major does not
+    need it changed. This variable is the other half: it is the toolchain a
+    repository asks for BY NAME with `actions/setup-node`, pre-placed where the
+    action looks so that asking for it costs nothing.
+
+    WHY IT EXISTS (measured, Telnet-Emulation run 35440557902, 2026-09-19).
+    Eleven jobs, 637s of job wall time, of which 215s — 34% — was `Set up
+    Node.js` pulling a ~60 MB runtime tarball from github.com. Per job, per
+    slot, per host, forever, because nothing on the host had it. `main-health`
+    was the clearest case: 93s of job for a 10s type-check, and that latency
+    caps the merge lane's throughput directly (#959).
+
+    HOW A VERSION IS RESOLVED, and why an exact version and not a range. The
+    toolkit's `tc.find('node', <spec>, 'x64')` tests for the marker file
+    `<root>/node/<version>/x64.complete` and returns `<root>/node/<version>/x64`
+    when it is there. Nothing else is consulted. So the baked version has to be
+    exactly what the consuming repository pins, character for character — and a
+    repository that pins anything else is not broken by this, it simply gets
+    today's behaviour and downloads. That degradation is SILENT by construction:
+    this image cannot see a consuming repository's `setup-node` call, and no
+    gate here can make it loud. What is made loud instead is drift on THIS side
+    — see `scripts/ci/shared-cache.selftest.sh`, which asserts that this map,
+    host-startup.sh's reader and the documentation name the same set — and
+    discoverability on the consumer's side, via the MANIFEST baked beside the
+    tree and the `tool cache:` line every host logs at boot.
+    `docs/baked-tool-cache.md` states plainly what remains undetectable.
+
+    SUPPORT WINDOW. `scripts/ci/scan-support-windows.sh` reads these lines
+    weekly and on any pull request touching packer/, exactly as it reads
+    `node_major` — a baked version that ages quietly is the same failure one
+    level down.
+
+    Several entries are allowed and cost disk: a Node 24 tree unpacks to about
+    110 MB, and every slot holds its own copy (K+1 per host). Keep the list to
+    what consumers actually pin.
+  EOT
+  # 24.21.0 is what the fleet's consumers pin today (`runtime-pin`, tied to
+  # their services/*/Dockerfile) and is inside the 24 LTS window that
+  # `node_major` above documents.
+  default = {
+    "24.21.0" = "6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff"
+  }
+}
+
 variable "vuln_fail_on" {
   type        = string
   description = <<-EOT
@@ -409,6 +463,82 @@ build {
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
+  # 5b. The baked Actions TOOL CACHE, and why it is a second master rather than
+  #     a directory inside /opt/ci-cache.
+  #
+  #     /opt/ci-cache is the DEPENDENCY cache: repo-specific content, warmed by
+  #     a consumer-supplied script, hydrated at boot from the pool's GCS
+  #     snapshot, published back by `scripts/ci/publish-cache-snapshot.sh`, and
+  #     treated as untrusted build input throughout. This tree is none of those
+  #     things — it is repo-agnostic, it is produced HERE from a
+  #     checksum-verified upstream tarball, and nothing at runtime republishes
+  #     it. Putting it under /opt/ci-cache would enrol it in the snapshot cycle:
+  #     the publisher would ship a 110 MB runtime into every pool's snapshot and
+  #     a hydrate would overwrite the image's copy with whatever a snapshot
+  #     carried. Two masters, two lifecycles, no drift.
+  #
+  #     WHAT THE LAYOUT HAS TO BE, exactly. `actions/setup-node` resolves
+  #     through the toolkit's `tc.find('node', <version>, 'x64')`, which tests
+  #     for the marker FILE `<root>/node/<version>/x64.complete` and, only if it
+  #     is present, returns the directory `<root>/node/<version>/x64`. Get the
+  #     marker wrong — omit it, or write it inside the directory instead of
+  #     beside it — and the action finds nothing, downloads exactly as before,
+  #     and the whole change buys nothing while every gate stays green. That is
+  #     why `node --version` is asserted out of the baked tree below rather than
+  #     the extraction merely being checked for success.
+  #
+  #     The MANIFEST is the single readable statement of what was baked. The
+  #     host logs it at boot and `docs/baked-tool-cache.md` explains it; a pool
+  #     operator asking "what does this image have" does not have to read HCL.
+  provisioner "shell" {
+    # pipefail: `curl | sha256sum` and `find | while` below both hide a failure
+    # without it, and this block's whole value is that a bad download stops the
+    # build instead of producing an image whose tool cache is quietly wrong.
+    # See check-packer-inline-shell.sh for why execute_command does not decide
+    # the interpreter.
+    inline_shebang = "/bin/bash -e"
+    inline = [
+      "set -euxo pipefail",
+      "mkdir -p /opt/ci-toolcache",
+      # Written from the Packer variable, then READ by the loop. The loop never
+      # names a version of its own, so there is exactly one place a version is
+      # declared and the image cannot bake a set the manifest does not list.
+      "printf '%s\\n' ${join(" ", [for v, s in var.tool_cache_node_versions : "'node ${v} ${s}'"])} > /tmp/toolcache.want",
+      ": > /opt/ci-toolcache/MANIFEST",
+      "while read -r tool ver sha; do",
+      "  [ -n \"$tool\" ] || continue",
+      "  curl -fsSL -o /tmp/node.tgz \"https://nodejs.org/dist/v$ver/node-v$ver-linux-x64.tar.gz\"",
+      # The checksum is pinned in this repository, not fetched beside the
+      # artifact: a SHASUMS file served by the same host as the tarball
+      # authenticates nothing a compromised host could not also serve.
+      "  echo \"$sha  /tmp/node.tgz\" | sha256sum -c -",
+      # .tar.gz and not .tar.xz deliberately: gzip is always present on the base
+      # image, xz-utils is not guaranteed, and a missing decompressor here would
+      # fail the build for a reason that has nothing to do with the runtime.
+      "  rm -rf /tmp/nodeext && mkdir -p /tmp/nodeext",
+      "  tar xzf /tmp/node.tgz -C /tmp/nodeext && rm -f /tmp/node.tgz",
+      "  mkdir -p \"/opt/ci-toolcache/$tool/$ver\"",
+      "  rm -rf \"/opt/ci-toolcache/$tool/$ver/x64\"",
+      "  mv \"/tmp/nodeext/node-v$ver-linux-x64\" \"/opt/ci-toolcache/$tool/$ver/x64\"",
+      "  rmdir /tmp/nodeext",
+      # The marker, BESIDE the arch directory. This single line is the
+      # difference between a tool cache and 110 MB of dead disk.
+      "  touch \"/opt/ci-toolcache/$tool/$ver/x64.complete\"",
+      "  got=$(\"/opt/ci-toolcache/$tool/$ver/x64/bin/node\" --version)",
+      "  [ \"$got\" = \"v$ver\" ] || { echo \"baked $tool $ver but its binary reports $got\" >&2; exit 1; }",
+      "  printf '%s %s\\n' \"$tool\" \"$ver\" >> /opt/ci-toolcache/MANIFEST",
+      "done < /tmp/toolcache.want",
+      "rm -f /tmp/toolcache.want",
+      "[ -s /opt/ci-toolcache/MANIFEST ] || { echo 'no runtime was baked into the tool cache' >&2; exit 1; }",
+      # NOT scanned or sealed here. Step 6 between this block and 6b runs the
+      # consumer's warm script as root, so anything sealed at this point is
+      # sealed before the one layer in this build that is arbitrary repo-
+      # supplied code. The scan and the seal are in 6b, beside /opt/ci-cache's
+      # and for the identical reason.
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
   # 6. Repo-supplied cache warming. Optional, and deliberately the LAST layer:
   #    everything above is identical for every consumer, so a change here does
   #    not invalidate the expensive layers.
@@ -492,6 +622,41 @@ build {
       # can write into. go+rX gives back traversal and read without making a data
       # file executable (X is directory-or-already-executable).
       "chmod -R go-w,go+rX /opt/ci-cache",
+
+      # The baked tool cache is scanned and sealed HERE, not in 5b where it was
+      # written, for the reason this whole block exists: step 6 in between ran
+      # the consumer's warm script as root, and what it left behind is not
+      # assumed. Sealing in 5b would seal a tree before the one layer of this
+      # build that is arbitrary repo-supplied code.
+      #
+      # The predicate is NOT /opt/ci-cache's, and the difference is deliberate.
+      # That one refuses a symlink outright. This tree cannot: a Node
+      # distribution ships `bin/npm`, `bin/npx` and `bin/corepack` as relative
+      # symlinks into `lib/node_modules`, so "no symlinks" would refuse every
+      # valid runtime. What is dangerous is a symlink that LEAVES the tree —
+      # `chmod -R go+rX` widens what it reaches and the host's `cp -a` carries
+      # the link into every slot's copy — so the rule is narrowed to that, and
+      # only that. Everything else the cache scan refuses is refused here
+      # unchanged. host-startup.sh's tool_cache_master_is_hostile() re-runs the
+      # same predicate at boot, so an image sealed by an older template is still
+      # judged by the current rule.
+      "bad=$(find /opt/ci-toolcache \\( -type b -o -type c -o -type p -o -type s -o -perm /6000 \\) -printf '%y %M %p\\n' -quit)",
+      "[ -z \"$bad\" ] || { echo \"tool cache holds a node or setuid entry: $(clean \"$bad\")\" >&2; exit 1; }",
+      "bad=$(find /opt/ci-toolcache -type l -printf '%p %l\\n' | awk '$2 ~ /^\\// { print; exit }')",
+      "[ -z \"$bad\" ] || { echo \"tool cache holds an absolute symlink: $(clean \"$bad\")\" >&2; exit 1; }",
+      "bad=$(find /opt/ci-toolcache -type l -printf '%p\\n' | while read -r l; do r=$(readlink -m \"$l\"); case \"$r\" in /opt/ci-toolcache/*) ;; *) printf '%s -> %s' \"$l\" \"$r\"; break ;; esac; done)",
+      "[ -z \"$bad\" ] || { echo \"tool cache holds a symlink leaving the tree: $(clean \"$bad\")\" >&2; exit 1; }",
+      "command -v getcap >/dev/null || { echo 'getcap missing: cannot scan the tool cache for file capabilities' >&2; exit 1; }",
+      "bad=$(getcap -r /opt/ci-toolcache 2>/dev/null)",
+      "[ -z \"$bad\" ] || { echo \"tool cache holds a file capability: $(clean \"$bad\")\" >&2; exit 1; }",
+      "ino=$(find /opt/ci-toolcache -type f -links +1 -printf '%n %i\\n' | awk '{ n[$2] = $1; c[$2]++ } END { for (i in c) if (c[i] < n[i]) { print i; exit } }')",
+      "[ -z \"$ino\" ] || { echo \"tool cache holds a hardlink to a file outside the tree: $(clean \"$(find /opt/ci-toolcache -inum \"$ino\" -printf '%y %M %p\\n' -quit)\")\" >&2; exit 1; }",
+      # go-w and not a-w, for the same reason /opt/ci-cache keeps the owner
+      # write bit: the host copies this tree per slot with `cp -a`, which
+      # preserves mode, and a tool cache no slot can write is one the setup
+      # actions fail on rather than hit.
+      "chown -Rh root:root /opt/ci-toolcache",
+      "chmod -R go-w,go+rX /opt/ci-toolcache",
 
       # Baked image archives live in /opt/ci-images, NOT under /opt/ci-cache,
       # and the separation is the control rather than a tidiness choice.

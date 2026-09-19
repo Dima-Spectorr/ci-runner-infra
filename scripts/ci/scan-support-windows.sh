@@ -226,10 +226,22 @@ scan_inventory() {
   # months earlier. An image that ages quietly is the whole complaint.
   #
   # A repository that wants a major the image does not bake still gets it:
-  # `actions/setup-node` prepends its own toolchain to PATH, and the per-slot
-  # tool cache in host-startup.sh is left to the setup actions on purpose. The
-  # baked version is a HOST BASELINE, so what matters is that the baseline stays
-  # supported, not that it is the newest.
+  # `actions/setup-node` prepends its own toolchain to PATH and downloads what
+  # it cannot find. The baked version is a HOST BASELINE, so what matters is
+  # that the baseline stays supported, not that it is the newest.
+  #
+  # TWO declarations are read here and they are NOT the same thing (#962):
+  #
+  #   node_major                the SYSTEM node on PATH, a major.
+  #   tool_cache_node_versions  the EXACT versions unpacked into the Actions
+  #                             tool cache, which `setup-node` resolves against.
+  #
+  # The second one has the wider blast radius of the two despite looking like an
+  # optimisation: a repository that pins one of these versions runs it for every
+  # job on every host, so a baked runtime that has left its upstream support
+  # window is an unsupported runtime shipped fleet-wide by default. It is under
+  # this scan for exactly that reason, and `scripts/ci/shared-cache.selftest.sh`
+  # asserts that it still is.
   while IFS= read -r f; do
     # awk over the whole block, not `grep -A<n>`: a multi-line `description`
     # heredoc sits between the variable and its `default`, so any fixed context
@@ -244,6 +256,18 @@ scan_inventory() {
               print; exit} inblock && /^}/{exit}' "$f" 2>/dev/null)"
     line="$(printf '%s' "$raw" | tr -cd '0-9.')"
     [ -n "$line" ] && emit nodejs "$line" "${f#"$REPO_ROOT"/}" "$(trim "$raw")"
+    # The tool-cache map. Same awk-over-the-block reason as above, and the same
+    # raw-line-as-evidence rule: each map entry is emitted with ITS OWN line, so
+    # "did this pull request choose this?" is asked about the version that was
+    # added rather than about the variable that contains it.
+    while IFS= read -r raw; do
+      line="$(printf '%s' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+      [ -n "$line" ] && emit nodejs "$line" "${f#"$REPO_ROOT"/}" "$(trim "$raw")"
+    done < <(awk '/^variable "tool_cache_node_versions"/{inblock=1}
+                  inblock && /^[[:space:]]*default[[:space:]]*=/{indefault=1; next}
+                  indefault && /^[[:space:]]*}/{exit}
+                  indefault && /=/{print}
+                  inblock && !indefault && /^}/{exit}' "$f" 2>/dev/null)
     # `ubuntu-2404-lts-amd64` — the host OS, whose end of life ends the security
     # updates for everything else baked on top of it.
     raw="$(grep -m1 -E 'ubuntu-[0-9]{4}-lts' "$f" 2>/dev/null | head -n1)"

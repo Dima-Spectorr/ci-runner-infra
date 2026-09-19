@@ -1253,6 +1253,29 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
   fi
 fi
 
+# THE TOOL CACHE IS RE-SEEDED HERE, not only at boot.
+#
+# This is the honest answer to the objection that killed the first version of
+# this idea: the setup-* actions treat the tool cache as theirs and will prune
+# or overwrite entries in it. They still will — and now a prune costs exactly
+# ONE job, because the next job starts against a fresh copy of the root-owned
+# master. Worst case degrades to the download every job did before this existed.
+#
+# It runs at 'started' and at 'boot' and NOT at 'completed': what matters is the
+# state a job BEGINS in, and doing it twice per job would double the copy for a
+# tree that is about to be replaced anyway.
+#
+# \`rc\` is deliberately untouched. A slot that could not be given a tool cache
+# is a slot whose jobs download their runtime; failing the job over that would
+# turn a performance feature into an availability risk, which is the one thing
+# this layer is not allowed to be. The seeder clears its own ready marker before
+# it starts copying, so a failure here leaves the slot honestly cacheless rather
+# than pointing at a half-written tree.
+if [ "\$stage" != completed ] && [ -x /opt/ci/job-hooks/seed-tool-cache.sh ]; then
+  /opt/ci/job-hooks/seed-tool-cache.sh "\$idx" ||
+    say "slot \$idx: could not re-seed the baked tool cache — this job will download its runtime"
+fi
+
 # Written LAST and only on success, into a directory no slot can write. It is
 # the assertion "this slot is in the state the template describes", and a reset
 # that half-failed has not earned it. Not written at 'started', because the slot
@@ -2747,6 +2770,40 @@ seed_slot_template() {
 CACHE_MASTER="/opt/ci-cache"
 CACHE_SLOTS="/var/lib/ci-cache"
 
+# The ACTIONS TOOL CACHE, a second master with a different lifecycle.
+#
+# Baked by packer (`packer/ci-host-image.pkr.hcl`, step 5b) from a
+# checksum-verified upstream tarball, in the layout the toolkit resolves
+# against: `<master>/node/<version>/x64` plus the marker FILE
+# `<master>/node/<version>/x64.complete` beside it. `actions/setup-node` tests
+# that marker and nothing else, so a tree without it is 110 MB of disk that
+# every job ignores while it downloads the runtime anyway.
+#
+# WHY IT IS NOT A DIRECTORY UNDER $CACHE_MASTER. That tree is the DEPENDENCY
+# cache: per-repository, hydrated at boot from the pool's GCS snapshot and
+# published back by the publisher. This one is repo-agnostic and comes only
+# from the image. Folded into the snapshot cycle it would be published into
+# every pool's snapshot and then overwritten on the next hydrate by whatever a
+# snapshot happened to carry — a runtime whose version nobody chose.
+#
+# The per-slot copy lives at $CACHE_SLOTS/<idx>/$TOOLCACHE_DIR, INSIDE the
+# root-owned 0710 directory the dependency caches already use, so it inherits
+# that isolation unchanged. It deliberately does NOT live under a slot's
+# `_work`: `slot-reset.sh started` wipes and recreates `_work/_tool` empty
+# before the first step of every job (see the reset), so a tool cache left at
+# the runner's default path is destroyed before anything can read it. That is
+# the trap this whole change exists to step around, and it is why baking the
+# image alone would have changed nothing measurable.
+TOOLCACHE_MASTER="/opt/ci-toolcache"
+TOOLCACHE_DIR="tool-cache"
+# Root-owned, outside the master, and written only after the master has passed
+# its scan at boot. The per-job re-seed tests for it instead of re-scanning a
+# 110 MB tree on every job start — which is sound because nothing between that
+# scan and the job can write the master: it is root-owned 0755 and no slot has
+# a name in it. Outside the master because the master is the thing being
+# judged, and a verdict stored inside its own subject is not a verdict.
+TOOLCACHE_OK="$CACHE_SLOTS/.tool-master-ok"
+
 # Where a downloaded snapshot is unpacked and inspected before any of it is
 # allowed into the master. Under /opt and NOT under $CACHE_MASTER: the master is
 # scanned as a whole, and a staging tree inside it would be scanned along with
@@ -3722,6 +3779,302 @@ provision_shared_cache() {
   log "dependency cache seeded for $SLOTS slot(s) from $CACHE_MASTER (${#CACHE_DIRS[@]} tool caches, read-only master)"
 }
 
+# --- the baked tool cache -----------------------------------------------------
+#
+# Refuse the tool-cache master if it holds anything a root-run recursive walk,
+# or the later `cp -a`, must not propagate.
+#
+# NOT the same predicate as cache_master_is_hostile(), and the difference is one
+# line of it: that one refuses a symlink OUTRIGHT, and this tree cannot live
+# under that rule. A Node distribution ships `bin/npm`, `bin/npx` and
+# `bin/corepack` as RELATIVE symlinks into `lib/node_modules`, so "no symlinks"
+# would refuse every valid runtime and the pool would silently run with no tool
+# cache at all. What is actually dangerous is a symlink LEAVING the tree,
+# because `chmod -R go+rX` widens whatever it reaches and `cp -a` carries the
+# link into every slot's copy. So the rule is narrowed to exactly that, and
+# nothing else is relaxed: device, fifo and socket nodes, setuid bits, file
+# capabilities and smuggled hardlinks are all still refused.
+#
+# The same scan runs at BAKE time in packer/ci-host-image.pkr.hcl, and for the
+# reason the dependency cache also scans twice: /opt/ci-toolcache is on the boot
+# disk and survives a reset, so the image is not the only way content can have
+# reached it.
+# Takes no argument on purpose, unlike cache_master_is_hostile(): there is
+# exactly one tool-cache master and a second tree to scan would be a second
+# place a runtime could come from.
+tool_cache_master_is_hostile() {
+  local bad root="$TOOLCACHE_MASTER"
+  bad=$(find "$root" \
+    \( -type b -o -type c -o -type p -o -type s -o -perm /6000 \) \
+    -printf '%y %M %p\n' -quit 2>/dev/null)
+  if [ -n "$bad" ]; then
+    log "refusing $root: it holds a node or setuid entry ($(safe_for_log "$bad"))"
+    return 0
+  fi
+  # Absolute first, because it is the cheap half of the question.
+  bad=$(find "$root" -type l -printf '%p %l\n' 2>/dev/null | awk '$2 ~ /^\// { print; exit }')
+  if [ -n "$bad" ]; then
+    log "refusing $root: it holds an absolute symlink ($(safe_for_log "$bad"))"
+    return 0
+  fi
+  # `readlink -m` and not `-e`: a link into a path that does not exist YET is
+  # still a link out of the tree, and -e would quietly report nothing for it.
+  bad=$(find "$root" -type l -printf '%p\n' 2>/dev/null | while read -r l; do
+    r=$(readlink -m "$l")
+    case "$r" in
+    "$root"/*) ;;
+    *)
+      printf '%s -> %s' "$l" "$r"
+      break
+      ;;
+    esac
+  done)
+  if [ -n "$bad" ]; then
+    log "refusing $root: it holds a symlink leaving the tree ($(safe_for_log "$bad"))"
+    return 0
+  fi
+  if ! command -v getcap >/dev/null 2>&1; then
+    log "refusing $root: getcap is missing, so its file capabilities cannot be scanned"
+    return 0
+  fi
+  bad=$(getcap -r "$root" 2>/dev/null)
+  if [ -n "$bad" ]; then
+    log "refusing $root: it holds a file capability ($(safe_for_log "$bad"))"
+    return 0
+  fi
+  # Counted, not forbidden — the long form of why is in cache_master_is_hostile.
+  local ino
+  ino=$(find "$root" -type f -links +1 -printf '%n %i\n' 2>/dev/null |
+    awk '{ n[$2] = $1; c[$2]++ } END { for (i in c) if (c[i] < n[i]) { print i; exit } }')
+  if [ -n "$ino" ]; then
+    bad=$(find "$root" -inum "$ino" -printf '%y %M %p\n' -quit 2>/dev/null)
+    log "refusing $root: it holds a hardlink to a file outside the tree ($(safe_for_log "$bad"))"
+    return 0
+  fi
+  return 1
+}
+
+# Scan the tool-cache master once per boot, seal it, say what is in it, and
+# publish the verdict the per-job re-seed reads.
+#
+# FAILS OPEN, like every other cache path here: a host with no tool cache is a
+# host whose jobs download their runtime, which is what every host did before
+# this existed. A host that refuses to register is a host the pool answers by
+# queueing jobs forever.
+provision_tool_cache_master() {
+  rm -f "$TOOLCACHE_OK"
+  if [ ! -d "$TOOLCACHE_MASTER" ]; then
+    log "no $TOOLCACHE_MASTER on this image — every job will download its own runtime, as before"
+    return 1
+  fi
+  if tool_cache_master_is_hostile; then
+    log "jobs will run without a baked tool cache"
+    return 1
+  fi
+  # -Rh, status checked: see the dependency-cache master for the whole argument.
+  # A half-failed chown leaves a slot-owned file inside a tree copied into every
+  # other slot, which is the cross-slot channel this section exists to prevent.
+  if ! chown -Rh root:root "$TOOLCACHE_MASTER" 2>/dev/null; then
+    log "could not take ownership of $TOOLCACHE_MASTER — refusing to seed from it"
+    return 1
+  fi
+  if ! chmod -R go-w,go+rX "$TOOLCACHE_MASTER" 2>/dev/null; then
+    log "could not seal $TOOLCACHE_MASTER read-only — refusing to seed from it"
+    return 1
+  fi
+
+  # WHAT IS BAKED, said out loud, once per boot.
+  #
+  # This repository cannot intercept a consuming repository's `setup-node` call
+  # and cannot make a version mismatch fail there — the action simply downloads,
+  # silently, exactly as it does today. What it CAN do is make the baked set
+  # discoverable, so "why is this job still twenty seconds slower" has an answer
+  # a reader can find in the host's own log rather than by unpacking an image.
+  # The MANIFEST is written by packer from the ONE declaration of these
+  # versions; nothing here restates them, precisely so the two cannot drift.
+  local listed=0 tool ver
+  if [ -s "$TOOLCACHE_MASTER/MANIFEST" ]; then
+    while read -r tool ver; do
+      [ -n "${tool:-}" ] && [ -n "${ver:-}" ] || continue
+      if [ -f "$TOOLCACHE_MASTER/$tool/$ver/x64.complete" ]; then
+        listed=$((listed + 1))
+        log "tool cache: $tool $ver (a repository pinning exactly this gets it for free; anything else downloads)"
+      else
+        # LOUD, and this is the drift that IS detectable here: the manifest says
+        # a version was baked and the marker the toolkit tests for is missing.
+        # Without the marker `tc.find` returns nothing and the job downloads — a
+        # change that buys nothing while every gate stays green, which is the
+        # exact shape this whole layer was opened against.
+        log "tool cache: $tool $ver is in the manifest but has no x64.complete marker — the setup actions will NOT find it and will download instead"
+      fi
+    done <"$TOOLCACHE_MASTER/MANIFEST"
+  else
+    log "tool cache: $TOOLCACHE_MASTER has no MANIFEST — this image predates the baked tool cache, or the bake did not finish"
+  fi
+  if [ "$listed" -eq 0 ]; then
+    log "no usable runtime in $TOOLCACHE_MASTER — jobs will download their own"
+    return 1
+  fi
+
+  mkdir -p "$CACHE_SLOTS" || return 1
+  chown root:root "$CACHE_SLOTS" 2>/dev/null || true
+  chmod 0755 "$CACHE_SLOTS" 2>/dev/null || true
+  : >"$TOOLCACHE_OK" || return 1
+  chown root:root "$TOOLCACHE_OK" 2>/dev/null || true
+  chmod 0644 "$TOOLCACHE_OK" 2>/dev/null || true
+}
+
+# The per-slot re-seed, installed as a script rather than written twice.
+#
+# ONE implementation, two callers: this boot, and `slot-reset.sh started` before
+# every job. Writing it inline in both places is how a writer and a reader end
+# up disagreeing — this fleet has already had a pool sit at zero, stable and
+# green, because two modules defaulted one name differently.
+install_tool_cache_seeder() {
+  mkdir -p /opt/ci/job-hooks || return 1
+  cat >/opt/ci/job-hooks/seed-tool-cache.sh <<EOF
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as ROOT. See install_tool_cache_seeder().
+#
+# Give slot \$1 its own copy of the baked tool cache, REPLACING whatever is
+# there. Called once at boot and again at the start of every job.
+#
+# Why replace rather than keep: this tree is on PATH and is EXECUTED, so what a
+# job starts with must be a property of a tree root writes and no slot can
+# reach — the same rule that rebuilds the slot home from its template between
+# jobs instead of cleaning it, and the same rule that wipes \`_work/_tool\`. It
+# also answers, for free, the documented objection that the setup-* actions
+# prune the tool cache as though they own it: a prune now costs ONE job, and the
+# worst case degrades to the download every job did before this existed.
+set -uo pipefail
+
+TOOLCACHE_MASTER="$TOOLCACHE_MASTER"
+TOOLCACHE_OK="$TOOLCACHE_OK"
+TOOLCACHE_DIR="$TOOLCACHE_DIR"
+CACHE_SLOTS="$CACHE_SLOTS"
+SLOT_USER_PREFIX="$SLOT_USER_PREFIX"
+
+say() {
+  logger -t ci-tool-cache -- "\$*" 2>/dev/null || true
+  echo "tool cache: \$*" >&2
+}
+
+# The index is the only input and it decides which tree root deletes, so it is
+# shape-checked before anything else — the same rule slot-reset.sh states.
+idx="\${1:-}"
+case "\$idx" in
+'' | *[!0-9]*)
+  say "refusing: bad slot index"
+  exit 1
+  ;;
+esac
+u="\$SLOT_USER_PREFIX\$idx"
+id -u "\$u" >/dev/null 2>&1 || {
+  say "refusing: slot \$idx has no user on this host"
+  exit 1
+}
+
+# The boot-time verdict. Absent means the master was missing, hostile or empty,
+# and the honest answer is to leave the slot without a tool cache: the setup
+# actions then download, which is what they did before this existed.
+[ -f "\$TOOLCACHE_OK" ] || exit 0
+[ -d "\$TOOLCACHE_MASTER" ] || exit 0
+
+dst="\$CACHE_SLOTS/\$idx"
+# Root-owned, slot-group, 0710 — identical to the dependency cache's slot
+# directory and for the identical reason: root creates, renames and chowns names
+# in here, and a slot that owned it could swap one for a symlink between root's
+# test and root's call. The \`r\` bit is withheld because a tool opens its cache
+# by absolute path and never lists the directory above it.
+mkdir -p "\$dst" || {
+  say "slot \$idx: could not create its cache directory"
+  exit 1
+}
+chown root:"\$u" "\$dst" || {
+  say "slot \$idx: could not own its cache directory"
+  exit 1
+}
+chmod 0710 "\$dst" || {
+  say "slot \$idx: could not restrict its cache directory"
+  exit 1
+}
+
+# Cleared FIRST. Between here and the rename the slot has no tool cache, and the
+# marker must not claim otherwise: tool_cache_env() reads it at unit-write time,
+# and a job that started against a half-copied tree is a hard failure rather
+# than the cache miss this layer promises.
+rm -f "\$dst/.\$TOOLCACHE_DIR.ready"
+
+# Staged under a name in the ROOT-owned \$dst, never in a slot-owned directory
+# where it could be pre-created as a symlink for \`cp\` to follow as root.
+rm -rf "\$dst/.seed-\$TOOLCACHE_DIR"
+if ! cp -a --no-preserve=ownership "\$TOOLCACHE_MASTER" "\$dst/.seed-\$TOOLCACHE_DIR" 2>/dev/null; then
+  rm -rf "\$dst/.seed-\$TOOLCACHE_DIR"
+  say "slot \$idx: could not copy the tool cache — its jobs will download their runtime"
+  exit 1
+fi
+# The master is sealed go-w and \`cp -a\` preserves mode, so directories arrive
+# without the write bit the setup actions need to add a version of their own.
+# BEFORE the chown, not after: while the tree is still root-owned no other uid
+# can create a name in it, so there is nothing to substitute during the window
+# between find's lstat and the batched chmod. One chown later this would be a
+# root-privileged walk inside a uid-controlled namespace.
+find "\$dst/.seed-\$TOOLCACHE_DIR" -type d -exec chmod u+rwx {} + 2>/dev/null || true
+chown -R "\$u:\$u" "\$dst/.seed-\$TOOLCACHE_DIR" 2>/dev/null || true
+
+# ATOMIC. rename(2) either happens or does not, so the path named by
+# RUNNER_TOOL_CACHE is never a partly-copied tree. The outgoing copy is moved
+# aside first — into the root-owned \$dst — because \`mv -T\` onto an existing
+# directory fails, and removing the live one first would leave a window in which
+# the path does not exist at all.
+rm -rf "\$dst/.\$TOOLCACHE_DIR.previous"
+if [ -e "\$dst/\$TOOLCACHE_DIR" ] || [ -L "\$dst/\$TOOLCACHE_DIR" ]; then
+  mv -T "\$dst/\$TOOLCACHE_DIR" "\$dst/.\$TOOLCACHE_DIR.previous" 2>/dev/null || true
+fi
+if ! mv -T "\$dst/.seed-\$TOOLCACHE_DIR" "\$dst/\$TOOLCACHE_DIR" 2>/dev/null; then
+  rm -rf "\$dst/.seed-\$TOOLCACHE_DIR"
+  mv -T "\$dst/.\$TOOLCACHE_DIR.previous" "\$dst/\$TOOLCACHE_DIR" 2>/dev/null || true
+  say "slot \$idx: could not publish the tool cache — its jobs will download their runtime"
+  exit 1
+fi
+rm -rf "\$dst/.\$TOOLCACHE_DIR.previous"
+
+# Written LAST, in the root-owned \$dst so a slot cannot forge it and be handed
+# a variable pointing at a directory it does not control.
+: >"\$dst/.\$TOOLCACHE_DIR.ready" || exit 1
+EOF
+  [ -s /opt/ci/job-hooks/seed-tool-cache.sh ] ||
+    {
+      log "seed-tool-cache.sh came out empty — a name in its here-document did not expand"
+      return 1
+    }
+  bash -n /opt/ci/job-hooks/seed-tool-cache.sh ||
+    {
+      log "seed-tool-cache.sh is not parseable — refusing to install it"
+      return 1
+    }
+  # Root-owned and not slot-writable: slot-reset.sh executes this as root on
+  # behalf of every slot, so a slot that could rewrite it would be running code
+  # as root on every other slot's job.
+  chown root:root /opt/ci/job-hooks/seed-tool-cache.sh || return 1
+  chmod 0755 /opt/ci/job-hooks/seed-tool-cache.sh || return 1
+}
+
+# Seed every slot at boot, so the FIRST job on a fresh host is already fast.
+# Without this the first job of each slot pays the download, because the re-seed
+# on its own job-start hook runs too late to be read by the unit that already
+# started.
+provision_tool_cache() {
+  provision_tool_cache_master || return 1
+  install_tool_cache_seeder || return 1
+  local i
+  for i in $(seq 1 "$SLOTS"); do
+    /opt/ci/job-hooks/seed-tool-cache.sh "$i" ||
+      log "slot $i: could not seed its tool cache — its jobs will download their runtime"
+  done
+  log "tool cache seeded for $SLOTS slot(s) from $TOOLCACHE_MASTER (replaced again at every job start)"
+}
+
 # The systemd `Environment=` lines that point slot $1's build tools at its own
 # cache.
 #
@@ -3732,12 +4085,42 @@ provision_shared_cache() {
 #   * GOCACHE (Go's BUILD cache) — golang/go#43645: concurrent builds sharing one
 #     GOCACHE is not safe. GOMODCACHE, the downloaded-module cache, is a
 #     different directory and is the one worth sharing, so only that is set.
-#   * RUNNER_TOOL_CACHE / AGENT_TOOLSDIRECTORY — the tool-cache library has no
-#     locking (actions/toolkit#804: two jobs extracting a JDK into one directory
-#     fail with "cannot remove ...: Directory not empty"). Per-slot seeding would
-#     in principle fix that, but the setup-* actions treat the tool cache as a
-#     place they OWN and prune, and a pruned hardlink tree is a slow rebuild for
-#     every slot rather than a shared saving. It stays per-slot and untouched.
+#   * AGENT_TOOLSDIRECTORY — the Azure Pipelines spelling of the tool cache.
+#     Nothing on this host reads it, and setting a second name for one directory
+#     is a second thing to keep in agreement. RUNNER_TOOL_CACHE is what the
+#     Actions toolkit reads; that one IS set, per slot, by tool_cache_env().
+#
+# RUNNER_TOOL_CACHE USED TO BE ON THAT LIST, AND THIS IS THE REVERSAL (#962).
+# The rule did not go away — it got NARROWER, and what is now forbidden is a
+# SHARED, group-writable tool cache. Both of the original objections are on the
+# record and both were answered rather than waived:
+#
+#   * actions/toolkit#804, no locking (two jobs extracting a JDK into one
+#     directory fail with "cannot remove ...: Directory not empty"). That is a
+#     CONCURRENT-WRITER failure. The path below is scoped to one slot, and a
+#     slot runs one job at a time, so it has exactly one writer — the same
+#     argument that already makes the per-slot package caches safe, and the
+#     design it rejected was the group-writable shared tree, which this is not.
+#   * "the setup-* actions treat the tool cache as a place they OWN and prune".
+#     Answered by RE-SEEDING at every job start (see seed-tool-cache.sh, invoked
+#     from slot-reset.sh `started`) rather than only at boot. A prune then costs
+#     ONE job instead of every job until the host reboots, and the worst case
+#     degrades to precisely today's behaviour: the action downloads.
+#
+# What the reversal buys, measured on Telnet-Emulation run 35440557902
+# (2026-09-19): eleven jobs, 637s of job wall time, 215s of it — 34% — spent in
+# `Set up Node.js` pulling a ~60 MB tarball from github.com. `main-health` was
+# 93s of job around a 10s type-check, and that latency caps the merge lane's
+# throughput directly (#959). The prediction this is falsifiable against:
+# main-health ~93s -> ~30s, merge ceiling ~16/h -> ~40/h.
+#
+# The tree is REPLACED at every job start rather than persisted, which is the
+# one place this differs from the package caches, and deliberately so: it is on
+# PATH and its contents are EXECUTED. That is the same reason the slot home is
+# rebuilt from the template between jobs instead of being cleaned, and the same
+# reason `_work/_tool` was wiped. A package cache a job poisons costs the next
+# job on that slot a bad dependency; a tool cache a job poisons IS the next
+# job's `node`.
 #
 # GOFLAGS=-modcacherw is deliberately NOT set. Go writes its module cache
 # read-only by design so that a build cannot edit a dependency after go.sum
@@ -3810,6 +4193,27 @@ Environment=UV_CACHE_DIR=$c/uv
 Environment=MAVEN_ARGS=-Dmaven.repo.local=$c/m2
 Environment=NUGET_PACKAGES=$c/nuget
 Environment=COMPOSER_CACHE_DIR=$c/composer
+EOF
+}
+
+# The one variable that points `actions/setup-node` (and every other setup-*
+# action) at this slot's own copy of the baked tool cache.
+#
+# Separate from cache_env() and gated on its OWN marker, because the two layers
+# fail independently: a host whose GCS snapshot never arrived still has the
+# tool cache the image baked, and emitting nothing because the unrelated
+# dependency-cache seeding failed would throw away the larger of the two
+# savings for no reason.
+#
+# The marker, not the directory — same rule cache_env() states: the directory
+# is created by the first line of the seeder and the marker by its last, so
+# testing the directory would point the runner at a half-copied tree, which is
+# a hard per-job failure rather than the cache miss this layer promises.
+tool_cache_env() {
+  local c="$CACHE_SLOTS/$1"
+  [ -f "$c/.$TOOLCACHE_DIR.ready" ] || return 0
+  cat <<EOF
+Environment=RUNNER_TOOL_CACHE=$c/$TOOLCACHE_DIR
 EOF
 }
 
@@ -4909,6 +5313,11 @@ install_slot() {
   # default under the slot's home — slower, and correct.
   local CACHE_ENV; CACHE_ENV=$(cache_env "$idx")
 
+  # Empty when this slot has no seeded TOOL cache, which leaves the runner's
+  # own default — a path inside `_work` that slot-reset.sh wipes at every job
+  # start — and the setup actions download, exactly as they did before #962.
+  local TOOL_CACHE_ENV; TOOL_CACHE_ENV=$(tool_cache_env "$idx")
+
   # What makes the remote build cache seamless: the repository sets nothing, and
   # a workflow that never heard of this fleet gets cache hits because `turbo`
   # reads these three variables out of its environment.
@@ -5138,6 +5547,7 @@ NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
 BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 $BROKER_ENV
 $CACHE_ENV
+$TOOL_CACHE_ENV
 $TURBO_ENV
 $SHARE_ENV
 # The label a job pins the rest of its workflow run to. Read by the anchor job,
@@ -5307,6 +5717,12 @@ main() {
   # whether to point the agent at it. Fails OPEN: the return value is deliberately
   # ignored.
   provision_shared_cache || true
+  # Same placement and the same failure rule, for the same two reasons: it
+  # chowns a tree per slot user, and install_slot reads whether the slot ended
+  # up with one before it decides to write RUNNER_TOOL_CACHE. Fails OPEN — a
+  # host with no baked runtime downloads one per job, which is what every host
+  # in this fleet did before this existed.
+  provision_tool_cache || true
 
   install_dockerd_unit
   # The template must be on disk AND known to systemd before the first

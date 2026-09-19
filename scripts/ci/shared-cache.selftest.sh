@@ -33,9 +33,25 @@
 #                     write, so pnpm and uv — whose whole performance model is
 #                     hardlinking out of the store — silently fall back to
 #                     copying, and the cache buys nothing.
-#   unsafe sharing    GOCACHE (golang/go#43645) and RUNNER_TOOL_CACHE
-#                     (actions/toolkit#804) are documented as NOT safe for
-#                     concurrent writers.
+#   unsafe sharing    GOCACHE (golang/go#43645) is documented as NOT safe for
+#                     concurrent writers — and unsafe between the parallel
+#                     builds INSIDE one job, which a per-slot copy does not fix,
+#                     so it stays excluded outright.
+#                     RUNNER_TOOL_CACHE USED TO BE ON THAT LIST AND NO LONGER IS
+#                     (#962). actions/toolkit#804 is a CONCURRENT-WRITER
+#                     failure: two jobs writing one tool cache at the same
+#                     moment. A path scoped to one slot has one job at a time —
+#                     the identical argument that already makes the per-slot
+#                     npm, pnpm, Maven and uv caches safe. So the rule below got
+#                     NARROWER rather than quieter: what is forbidden is a
+#                     SHARED, group-writable tool cache. A RUNNER_TOOL_CACHE
+#                     pointing at the master, at a sibling slot's tree, or at
+#                     any path not under this slot's own directory is still a
+#                     failure, and is asserted as one. AGENT_TOOLSDIRECTORY
+#                     stays excluded outright: it is a SECOND spelling of the
+#                     same path, and two spellings of one location is exactly
+#                     how a writer and a reader end up disagreeing about which
+#                     tree was seeded. One name, asserted once.
 #   root operates in a job-writable directory
 #                     The escalation, stated correctly — an earlier revision of
 #                     this file stated it wrongly and asserted the wrong fix.
@@ -82,6 +98,11 @@ PUBSH="$HERE/publish-cache-snapshot.sh"
 # like a rule that moved.
 SCANSH="$HERE/scan-cache-credentials.sh"
 PUBDOC="$HERE/../../docs/publishing-a-cache-snapshot.md"
+# The baked tool cache (#962). The doc is not documentation-for-its-own-sake
+# here: it is the human-readable copy of the packer map, and it is compared
+# against it, because a pool operator reads this page to decide what to pin.
+TCDOC="$HERE/../../docs/baked-tool-cache.md"
+SUPSCAN="$HERE/scan-support-windows.sh"
 
 PASS=0
 FAIL=0
@@ -105,6 +126,8 @@ skip() { SKIP=$((SKIP + 1)); printf 'SKIP: %s\n' "$1"; }
 [ -f "$PUBSH" ] || { echo "FAIL: missing $PUBSH"; exit 1; }
 [ -f "$SCANSH" ] || { echo "FAIL: missing $SCANSH"; exit 1; }
 [ -f "$PUBDOC" ] || { echo "FAIL: missing $PUBDOC"; exit 1; }
+[ -f "$TCDOC" ] || { echo "FAIL: missing $TCDOC"; exit 1; }
+[ -f "$SUPSCAN" ] || { echo "FAIL: missing $SUPSCAN"; exit 1; }
 
 # Code only: full-line comments stripped, so the prose explaining an invariant
 # can never be what satisfies the check for it. This matters more here than
@@ -117,6 +140,26 @@ skip() { SKIP=$((SKIP + 1)); printf 'SKIP: %s\n' "$1"; }
 # of files that were once one file: `-h` so no `==>` header can ever satisfy a
 # pattern, and the concatenation order is the caller's, never glob order.
 code_of() { grep -hvE '^[[:space:]]*#' "$@"; }
+
+# ONE function's body, and the reason this exists is a defect class this
+# repository has already shipped: an assertion can pass because a DIFFERENT arm
+# satisfies it. `tool_cache_master_is_hostile()` (#962) is deliberately a near
+# copy of `cache_master_is_hostile()`, so every pattern naming `getcap -r`, the
+# hardlink count or a `find "$root"` now appears twice in this script — and a
+# mutation that deletes the dependency-cache scan entirely would be "caught" by
+# the tool-cache one and reported green.
+#
+# Two spellings, because the two needs are opposite: read ONE arm, or read
+# everything EXCEPT one arm.
+fn_of() { # <file> <name>
+  awk -v n="$2" '$0 ~ "^" n "\\(\\)" { f = 1 } f { print } f && /^}$/ { exit }' "$1"
+}
+drop_fn() { # <name>   (filters stdin)
+  awk -v n="$1" '
+    $0 ~ "^" n "\\(\\)" { skip = 1 }
+    skip && /^}$/ { skip = 0; next }
+    !skip { print }'
+}
 
 # Never `... | grep -q` under `set -o pipefail`: grep exits on the match, the
 # writer takes SIGPIPE and exits 141, and pipefail reports a SUCCESSFUL match as
@@ -317,7 +360,10 @@ has_root_owned_namespace() { # <file>
 # propagate to every slot.
 has_hostile_entry_refusal() { # <file>
   local code
-  code=$(code_of "$1")
+  # The tool-cache scan is excluded by NAME, not by pattern. It asserts the same
+  # things about a different tree, so without this a mutation deleting the whole
+  # dependency-cache scan reads as green — see fn_of/drop_fn above.
+  code=$(code_of "$1" | drop_fn tool_cache_master_is_hostile)
   # shellcheck disable=SC1003  # the trailing `\\` is an ERE for the literal
   # line-continuation backslash the scan is wrapped with, not a quote escape.
   matches "$code" 'find "\$root" \\'                                || return 1
@@ -395,13 +441,17 @@ has_atomic_seed() { # <file>
 
 # Documented as unsafe for concurrent writers by their own maintainers, and
 # excluded even though each slot now has its own copy: GOCACHE is unsafe between
-# the parallel builds INSIDE one job too, and the setup-* actions prune the tool
-# cache as though they own it.
+# the parallel builds INSIDE one job too, which a per-slot copy does not fix.
+#
+# RUNNER_TOOL_CACHE is NOT on this list any more, and the narrower rule that
+# replaced it is has_per_slot_tool_cache() below. The reversal is argued in the
+# header of this file; what is asserted here is only the half that did not
+# change — that no name pointing a tool at a tree two slots can both write may
+# appear in this script.
 has_no_unsafe_sharing() { # <file>
   local code
   code=$(code_of "$1")
   ! matches "$code" 'GOCACHE'              || return 1
-  ! matches "$code" 'RUNNER_TOOL_CACHE'    || return 1
   ! matches "$code" 'AGENT_TOOLSDIRECTORY' || return 1
   ! matches "$code" 'GRADLE_RO_DEP_CACHE'  || return 1
   # -modcacherw makes Go's extracted modules writable. go.sum authenticates the
@@ -409,6 +459,166 @@ has_no_unsafe_sharing() { # <file>
   # re-hashes it, which is why `go mod verify` is a separate command. Read-only
   # is that tree's only protection, and a per-slot cache does not need it lifted.
   ! matches "$code" 'modcacherw'           || return 1
+}
+
+# THE NARROWED RULE (#962). A tool cache is allowed — a SHARED one is not.
+#
+# Every assertion here is the difference between the design that was rejected in
+# review and the one that shipped, so each one is the whole feature when it
+# fails. The variable must name a path under the slot's OWN directory; it must
+# not name the master, which is root-owned and read-only and which every slot
+# would then be writing into; and it must be gated on its own ready marker,
+# because the tool cache and the dependency cache fail independently and a slot
+# handed a variable pointing at a tree that was never copied is worse than a
+# slot with no variable at all.
+#
+# The last two are why this is not merely "a cache, but per slot": the tree must
+# sit OUTSIDE `_work`, which slot-reset.sh wipes at every job start, and it must
+# be REPLACED before every job rather than kept — which is simultaneously what
+# makes a prune by a setup-* action cost one job instead of the host's life.
+has_per_slot_tool_cache() { # <file>
+  local code env
+  code=$(code_of "$1")
+  # SCOPED TO tool_cache_env(). `cache_env()` two functions up contains a
+  # byte-identical `c="$CACHE_SLOTS/$1"`, so an unscoped assertion here would be
+  # satisfied by the dependency cache's arm and this predicate would pass on a
+  # tool cache that had stopped being per-slot altogether.
+  env=$(fn_of "$1" tool_cache_env)
+  [ -n "$env" ] || return 1
+  matches "$env" 'Environment=RUNNER_TOOL_CACHE=\$c/\$TOOLCACHE_DIR'  || return 1
+  matches "$env" 'c="\$CACHE_SLOTS/\$1"'                              || return 1
+  # Its OWN marker, not the dependency cache's: the two layers fail separately.
+  matches "$env" '\[ -f "\$c/\.\$TOOLCACHE_DIR\.ready" \]'            || return 1
+  # Never the master. A RUNNER_TOOL_CACHE naming the shared tree is the rejected
+  # design wearing the new name.
+  ! matches "$code" 'RUNNER_TOOL_CACHE=\$TOOLCACHE_MASTER'            || return 1
+  ! matches "$code" 'RUNNER_TOOL_CACHE=\$CACHE_MASTER'                || return 1
+  # The master stays root-owned and unwritable by any slot.
+  matches "$code" 'chown -Rh root:root "\$TOOLCACHE_MASTER"'          || return 1
+  matches "$code" 'chmod -R go-w,go\+rX "\$TOOLCACHE_MASTER"'         || return 1
+  # Atomic publish, same shape and same reason as the dependency cache.
+  matches "$code" 'cp -a --no-preserve=ownership "\\\$TOOLCACHE_MASTER" "\\\$dst/\.seed-\\\$TOOLCACHE_DIR"' || return 1
+  matches "$code" 'mv -T "\\\$dst/\.seed-\\\$TOOLCACHE_DIR" "\\\$dst/\\\$TOOLCACHE_DIR"'                   || return 1
+  # RE-SEEDED AT JOB START. Without this the tree is baked once and drifts for
+  # the life of the host, and the documented objection — that the setup-*
+  # actions prune the tool cache as though they own it — goes unanswered.
+  matches "$code" 'seed-tool-cache\.sh "\\\$idx"'                     || return 1
+  matches "$code" '\[ "\\\$stage" != completed \]'                    || return 1
+  # And it must never be able to fail a job: a slot with no tool cache is a slot
+  # that downloads, which is what every slot did before this existed.
+  matches "$code" 'provision_tool_cache [|][|] true'                  || return 1
+}
+
+# The shared, group-writable tool cache is STILL refused — the rejected design
+# must not come back through the door #962 opened.
+#
+# Separate from has_no_shared_writable_tree() on purpose: that one guards the
+# dependency master, and a later edit that widened only the tool-cache master
+# would leave it green while handing every slot a writable copy of a tree that
+# is on PATH.
+has_no_shared_writable_tool_cache() { # <file>
+  local code
+  code=$(code_of "$1")
+  ! matches "$code" 'chgrp.*TOOLCACHE_MASTER'           || return 1
+  ! matches "$code" 'chmod.*2775.*TOOLCACHE'            || return 1
+  # Either order, because a `chmod go+w "$TOOLCACHE_MASTER"` reads the widening
+  # BEFORE the path and a one-sided pattern would not see it.
+  ! matches "$code" 'chmod.*(go|o|a)\+w.*TOOLCACHE'     || return 1
+  ! matches "$code" 'chmod.*TOOLCACHE.*(go|o|a)\+w'     || return 1
+  # The seal itself must still be there; "no widening" is also satisfied by no
+  # sealing at all, which is the same outcome arrived at by omission.
+  matches "$code" 'chmod -R go-w,go\+rX "\$TOOLCACHE_MASTER"' || return 1
+  # `cp -al` would make the slot copy hardlinks into the master, so a job that
+  # opened one for writing would be writing into every other slot's copy. It is
+  # also the seeding shortcut `fs.protected_hardlinks` already rules out.
+  ! matches "$code" 'cp -al[^\n]*TOOLCACHE'             || return 1
+}
+
+# ONE DECLARATION OF THE BAKED VERSIONS, and a test that the copies agree.
+#
+# This repository has already been bitten by a writer and a reader defaulting
+# the same name differently and leaving a pool at zero, stable and green. The
+# defence here is that there is exactly ONE place a version number is written —
+# the packer variable — and that everything else either derives it at runtime or
+# is checked against it:
+#
+#   packer          the map, with the SHA-256 of each tarball. AUTHORITATIVE.
+#   host-startup.sh must name NO version at all. It reads the MANIFEST the bake
+#                   wrote, so it cannot disagree; a literal appearing here is
+#                   the drift, not the symptom of it.
+#   the doc         restates the set for a human, between markers, and is
+#                   compared line for line.
+#
+# Takes the packer template as its argument so a mutation of the packer file is
+# seen; the other two are read from their globals.
+has_agreeing_tool_cache_pin() { # <packer>
+  local want have code
+  # The map keys, from the `default` block of the variable and nowhere else.
+  want=$(awk '
+    /^variable "tool_cache_node_versions"/ { v = 1 }
+    v && /^[[:space:]]*default[[:space:]]*=/ { d = 1; next }
+    d && /^[[:space:]]*}/ { exit }
+    d && /=/ { gsub(/[" ]/, "", $1); if ($1 != "") print "node " $1 }
+  ' "$1" | sort -u)
+  [ -n "$want" ] || return 1
+
+  have=$(awk '
+    /<!-- baked-tool-cache:begin -->/ { d = 1; next }
+    /<!-- baked-tool-cache:end -->/ { d = 0 }
+    d && /^node [0-9]/ { print }
+  ' "$TCDOC" | sort -u)
+  [ "$want" = "$have" ] || return 1
+
+  # No version literal on the host side. `node/<x>.<y>.<z>` is the shape a
+  # well-meaning edit would introduce while "making the log clearer".
+  code=$(code_of "$SCRIPT")
+  ! matches "$code" 'node/[0-9]+\.[0-9]+\.[0-9]+' || return 1
+  # And it must actually read the manifest, or "names no version" is satisfied
+  # by naming nothing at all.
+  matches "$code" 'TOOLCACHE_MASTER/MANIFEST'     || return 1
+}
+
+# The same weekly discipline `node_major` is under. A baked runtime that has
+# left its upstream support window is a host shipping an unsupported runtime to
+# every job that pins it, and the scanner is the only thing that would say so.
+has_tool_cache_support_window() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'tool_cache_node_versions' || return 1
+}
+
+# The bake-time half of the tool-cache scan, and the ORDER is the assertion.
+#
+# The tree is written in step 5b, but step 6 between 5b and 6b runs the
+# consumer's `warm_cache_script` as root — this repository's own README calls a
+# warm cache "untrusted build input" — so a scan that runs where the tree was
+# written judges it before the one layer of the build that is arbitrary
+# repo-supplied code. Sealing early is not a weaker gate, it is a gate aimed at
+# the wrong moment, and it reads as correct on every line. So the seal must come
+# AFTER the warm-script provisioner, and that is compared by position.
+#
+# The predicate itself is narrower than /opt/ci-cache's and that is deliberate:
+# a Node distribution ships bin/npm, bin/npx and bin/corepack as relative
+# symlinks, so refusing `-type l` outright would refuse every valid runtime.
+# Only an absolute symlink and one that leaves the tree are refused, which is
+# the same rule tool_cache_master_is_hostile() applies at boot.
+has_packer_tool_cache_seal() { # <file>
+  local code seal warm
+  [ -f "$1" ] || return 1
+  code=$(code_of "$1")
+  matches "$code" 'chown -Rh root:root /opt/ci-toolcache'  || return 1
+  matches "$code" 'chmod -R go-w,go\+rX /opt/ci-toolcache'  || return 1
+  matches "$code" 'find /opt/ci-toolcache -type l'          || return 1
+  matches "$code" 'readlink -m'                             || return 1
+  # The path is matched to its END. `/opt/ci-toolcache` alone is a prefix of
+  # every path that starts with it, so a scan retargeted at a tree that does not
+  # exist would satisfy an unanchored pattern and the mutation below proved it.
+  matches "$code" 'getcap -r /opt/ci-toolcache 2>/dev/null' || return 1
+  matches "$code" 'find /opt/ci-toolcache -type f -links \+1' || return 1
+  warm=$(printf '%s\n' "$code" | grep -n 'var\.warm_cache_script' | head -n1 | cut -d: -f1)
+  seal=$(printf '%s\n' "$code" | grep -n 'chmod -R go-w,go+rX /opt/ci-toolcache' | head -n1 | cut -d: -f1)
+  [ -n "$warm" ] && [ -n "$seal" ] || return 1
+  [ "$seal" -gt "$warm" ]          || return 1
 }
 
 # The cache is the only layer in this script allowed to fail open. A host with no
@@ -1684,6 +1894,11 @@ run 'the master root is repaired, its contents never'    has_master_root_heal   
 run 'the image build aborts on a hostile warm cache'     has_packer_gate_that_aborts "$PACKER"
 run 'the seed is published atomically'                   has_atomic_seed           "$SCRIPT"
 run 'no concurrency-unsafe cache is shared'              has_no_unsafe_sharing     "$SCRIPT"
+run 'the tool cache is per-slot, outside _work, re-seeded' has_per_slot_tool_cache "$SCRIPT"
+run 'no shared group-writable tool cache'                has_no_shared_writable_tool_cache "$SCRIPT"
+run 'the baked versions are declared in exactly one place' has_agreeing_tool_cache_pin "$PACKER"
+run 'the baked runtimes are under a support window'      has_tool_cache_support_window "$SUPSCAN"
+run 'the tool cache is sealed after the warm script'     has_packer_tool_cache_seal "$PACKER"
 run 'a cache failure never blocks registration'          has_fail_open             "$SCRIPT"
 run 'a retired slot cache is removed before seeding'     has_retired_slot_prune    "$SCRIPT"
 run 'slot primary group is asserted'                     has_primary_group_assert  "$SCRIPT"
@@ -1851,8 +2066,42 @@ mutate 'a torn seed becomes visible' has_atomic_seed \
   's|"\$dst/\.seed-\$d"|"$dst/$d"|g'
 
 mutate 'GOCACHE is shared'          has_no_unsafe_sharing 's|^Environment=GOMODCACHE=.*$|Environment=GOCACHE=$c/go-build|'
-mutate 'the tool cache is shared'   has_no_unsafe_sharing 's|^Environment=UV_CACHE_DIR=.*$|Environment=RUNNER_TOOL_CACHE=$c/tools|'
+mutate 'AGENT_TOOLSDIRECTORY returns as a second spelling' has_no_unsafe_sharing \
+  's|^Environment=UV_CACHE_DIR=.*$|Environment=AGENT_TOOLSDIRECTORY=$c/tools|'
 mutate '-modcacherw comes back'     has_no_unsafe_sharing 's|^Environment=GOMODCACHE=(.*)$|Environment=GOMODCACHE=\1\nEnvironment=GOFLAGS=-modcacherw|'
+
+# THE TOOL CACHE (#962), broken the five ways a later edit plausibly would.
+# Each of these is a change that reads as a simplification in a diff and gives
+# back the whole feature, or gives back the design that was rejected in review.
+mutate 'the tool cache points at the shared master' has_per_slot_tool_cache \
+  's|^Environment=RUNNER_TOOL_CACHE=\$c/\$TOOLCACHE_DIR$|Environment=RUNNER_TOOL_CACHE=$TOOLCACHE_MASTER|'
+mutate 'the tool cache stops being per-slot' has_per_slot_tool_cache \
+  's@^  local c="\$CACHE_SLOTS/\$1"$@  local c="$CACHE_SLOTS"@'
+mutate 'the tool cache trusts its directory, not its marker' has_per_slot_tool_cache \
+  's@^  \[ -f "\$c/\.\$TOOLCACHE_DIR\.ready" \] \|\| return 0$@  [ -d "$c" ] || return 0@'
+mutate 'the tool cache is seeded at boot and never again' has_per_slot_tool_cache \
+  's@^  /opt/ci/job-hooks/seed-tool-cache\.sh "\\\$idx" \|\|$@  true ||@'
+mutate 'a torn tool cache becomes visible' has_per_slot_tool_cache \
+  's@"\\\$dst/\.seed-\\\$TOOLCACHE_DIR"@"\\$dst/\\$TOOLCACHE_DIR"@g'
+# `[|][|]` and not `\|\|`: under `sed -E` a backslashed pipe is still an
+# alternation metacharacter, so `a \|\| b` matches the EMPTY string between
+# every pair of characters and the substitution lands on every line in the file
+# while cmp still reports a change. The mutation looks applied and tests
+# nothing. A bracket expression is the only spelling that means one pipe.
+mutate 'a missing tool cache blocks registration' has_per_slot_tool_cache \
+  's@provision_tool_cache [|][|] true@provision_tool_cache [|][|] die "no tool cache"@'
+mutate 'the master stops being sealed read-only' has_no_shared_writable_tool_cache \
+  's|chmod -R go-w,go\+rX "\$TOOLCACHE_MASTER"|chmod go+w "$TOOLCACHE_MASTER"|'
+
+# The pin. Mutated on the PACKER side, because that is the side a version
+# actually changes on — an operator bumps the map and forgets the page, which
+# is precisely the drift this repository has been bitten by before.
+mutate_file "$PACKER" 'a baked version is added without updating the doc' has_agreeing_tool_cache_pin \
+  's@^    "24\.21\.0" = "(.*)"$@    "24.21.0" = "\1"\n    "22.14.0" = "\1"@'
+mutate_file "$PACKER" 'the baked version changes without updating the doc' has_agreeing_tool_cache_pin \
+  's@^    "24\.21\.0" = @    "24.90.0" = @'
+mutate_file "$SUPSCAN" 'the baked runtimes drop out of the support scan' has_tool_cache_support_window \
+  's@tool_cache_node_versions@node_major@g'
 
 mutate 'a cache failure blocks registration' has_fail_open \
   's|provision_shared_cache \|\| true|provision_shared_cache \|\| die "no cache"|'
@@ -1906,6 +2155,22 @@ mutate_file "$PACKER" 'the image bakes a cache no slot can write' has_packer_gat
 # `..n` and not `.n`: inside the HCL string the newline is written `\\n`.
 mutate_file "$PACKER" 'the image gate refusal names the path but not the reason' has_packer_gate_that_aborts \
   "s@-printf '%y %M %p..n' -quit@-print -quit@"
+
+# The tool-cache seal, and the first of these is the revision this block was
+# written to reject: a seal that is correct in every line and runs one
+# provisioner too early. The two `d` commands are written BEFORE the insert on
+# purpose — sed runs them first on each line, so the warm-script line (which
+# does not yet hold the seal) survives, and the real seal lines later in the
+# file are removed. The net effect is a MOVE, which no single substitution can
+# express.
+mutate_file "$PACKER" 'the tool cache is sealed before the warm script runs' has_packer_tool_cache_seal \
+  's@chmod -R go-w,go\+rX /opt/ci-toolcache@@; s@chown -Rh root:root /opt/ci-toolcache@@; s@^( *)scripts( *)= \[var\.warm_cache_script@\1"chown -Rh root:root /opt/ci-toolcache",\n\1"chmod -R go-w,go+rX /opt/ci-toolcache",\n&@'
+mutate_file "$PACKER" 'the baked runtime stops being scanned for capabilities' has_packer_tool_cache_seal \
+  's@getcap -r /opt/ci-toolcache@getcap -r /opt/ci-toolcache-unused@'
+mutate_file "$PACKER" 'the baked runtime stops being scanned for smuggled hardlinks' has_packer_tool_cache_seal \
+  's@find /opt/ci-toolcache -type f -links \+1@find /opt/ci-toolcache -type f@'
+mutate_file "$PACKER" 'the baked runtime is shipped group-writable' has_packer_tool_cache_seal \
+  's@chmod -R go-w,go\+rX /opt/ci-toolcache@chmod -R go+w /opt/ci-toolcache@'
 
 # The snapshot layer. The first two are the exact edits that would turn a host
 # into a publisher, which is the whole thing this design exists to prevent.

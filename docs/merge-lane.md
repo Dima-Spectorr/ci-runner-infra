@@ -949,6 +949,57 @@ Two consequences worth stating plainly:
   `pull_request` publishes nothing on the tip, which is the same silent disarm
   arrived at without anyone choosing it.
 
+#### The throughput ceiling, and which way out of it was taken (#959)
+
+The gate above has a measured price, and it is a ceiling rather than a
+slowdown: roughly `3600 / (base_health_duration + poll_interval)` merges per
+hour, per repository.
+
+**Measured** — `Telnet-Emulation`, 2026-09-19 10:50Z–11:42Z: 14 merges in 52
+minutes; inter-merge gaps 3, 3, 7, 3, 3, 3, 2, 3, 3, 5, 6, 6, 3, 5 minutes
+(median 3). `main-health` over the same window, 8 runs: 83, 84, 95, 99, 140,
+221, 86 seconds — median ~93s. The gap *is* the health job plus the poll
+interval; nothing else in the window accounts for it. So a 20-PR backlog takes
+75+ minutes to drain however fast per-PR CI gets, and further investment in
+per-PR CI speed is invisible behind this ceiling once a queue has formed.
+
+Four ways out were on the table. **Option 2 was taken. Options 3 and 4 were
+not**, and the reason is the same for both: they trade away a property that was
+added on purpose, and a throughput argument is not enough to buy it back.
+
+| | Option | Taken | Why |
+|---|---|---|---|
+| 1 | Do nothing | no | The ceiling is above the normal arrival rate, but it bites exactly when it hurts — once a backlog has already formed. |
+| 2 | **Make the health job itself faster** | **yes** | **Gives up no safety at all.** Every merge still waits for a fresh, green answer on the tip it is landing on. Only the answer arrives sooner. |
+| 3 | Bounded staleness (`base-health-max-staleness-seconds > 0`) | no | Lets an *ancestor's* answer vouch for a tip nothing has answered for. It is a real option, it is implemented, and it stays **opt-in per repository** — one repository outrunning its health job is not a reason to relax the gate on the twelve that have not. |
+| 4 | Merge a batch, then health-check once | no | Largest gain, largest blast radius: a batch that breaks `main` implicates several pull requests at once and makes bisection harder. This is the guarantee the gate exists to provide, so spending it for cadence is the one trade this design refuses. |
+
+**What was actually done for option 2, and the falsifiable prediction.**
+
+The first cut at it is the baked tool cache (#962, [`baked-tool-cache.md`](baked-tool-cache.md)).
+Measured on the same repository and the same day, run `35440557902`: 11 jobs,
+637s of job wall time, **215s of it — 34% — in `Set up Node.js`**, downloading
+the same ~60 MB runtime once per job. A pool host now carries the pinned
+runtime already unpacked, so a job that pins it skips that download.
+
+The prediction, stated so the next reader can falsify it rather than re-derive
+it:
+
+- `main-health` median **93s → ~73s** (−20s, one runtime download), *provided
+  the repository pins the exact baked version*. It does not become a 30-second
+  job — the remaining ~73s is the health job's own work, and that slack is not
+  this change's to claim.
+- The lane's ceiling on that repository **~16/h → ~19/h**.
+- If the median does not move, the first thing to check is the pin: an
+  inexact `node-version` resolves at job time and downloads regardless, and
+  **nothing in this repository can detect that** — see the table of what is and
+  is not detectable in [`baked-tool-cache.md`](baked-tool-cache.md).
+
+If a repository needs more than option 2 buys, the next move is still not
+options 3 or 4 by default: it is to point `base-health-checks` at a smaller
+job. The gate reads the names you give it, and a two-minute health job and a
+thirty-minute suite cost the lane very different amounts.
+
 #### And the half that runs before the lane: `pr-guard`
 
 The base-health gate is a backstop — it acts after something has already
