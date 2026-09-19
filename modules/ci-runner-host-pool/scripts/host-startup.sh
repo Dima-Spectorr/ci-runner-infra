@@ -5078,8 +5078,19 @@ ExecStart=$dir/run.sh
 # means a stopped agent stays stopped and the host really does go quiet.
 Restart=no
 KillSignal=SIGTERM
-# Long enough for a job to finish once it has been asked to stop. A CI job that
-# exceeds this was going to be killed by GitHub's own timeout anyway.
+# A BOUND ON HOW LONG systemd WAITS, NOT A DRAIN CONTRACT. SIGTERM to run.sh is
+# not "finish the current job and exit": actions/runner#3308 reports the signal
+# KILLING the running job rather than draining it, and GitHub publishes no
+# graceful-drain contract for a self-hosted agent. So this number does not make
+# stopping a busy slot safe — nothing here does. It exists only so that systemd
+# does not SIGKILL an agent that IS shutting down cleanly (an idle one, or one
+# whose job ended between the signal and the timeout) while it tears down.
+#
+# The property that keeps jobs alive is upstream of this unit: the controller
+# never asks a busy slot to stop. It deregisters through the GitHub API, which
+# answers 422 for an agent executing a job, and both the drain and the cordon
+# treat that refusal as final. Do not read this timeout as a licence to stop a
+# busy slot on the grounds that it will drain — it will not.
 TimeoutStopSec=3600
 
 [Install]

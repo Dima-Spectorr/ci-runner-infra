@@ -28,17 +28,37 @@
 #
 #   CORDON   deregister the host's IDLE agents. GitHub REFUSES to deregister an
 #            agent that is executing a job (422), and that refusal is the
-#            mid-job guard: the working slot survives, its job runs to
-#            completion, and no new job can ever reach this host again because
-#            every other slot is gone from the pool. Agents here are not
-#            --ephemeral and their unit is Restart=no, so a deregistered slot
-#            stays deregistered.
+#            mid-job guard: the working slot survives and its job runs to
+#            completion. Agents here are not --ephemeral and their unit is
+#            Restart=no, so a deregistered slot stays deregistered.
 #   RETIRE   once the last job lands and busy reaches 0, hand the host to
 #            drain_host() — deregister the remainder, verify no Runner.Worker
 #            survives, delete.
 #
 # Nothing is killed. The host simply stops accepting work and leaves when it is
 # empty.
+#
+# THE INVARIANT THE CORDON ACTUALLY PROVIDES — and the one it does NOT.
+#
+# PROVIDES: no job is ever interrupted, and a slot once removed from the pool
+# never comes back.
+#
+# DOES NOT PROVIDE: "no new job can ever reach this host again." That claim was
+# asserted here, and it is false. The HELD slot is not one of the "other" slots
+# the cordon removed — it is still registered with GitHub, still answering the
+# pool's labels, and the moment its job lands it is eligible for the next one.
+# Under sustained demand it can be handed work indefinitely, busy never reaches
+# 0, the retire phase is never entered, and the host is cordoned forever with
+# its capacity gone from the pool. That is the livelock in issue #948.
+#
+# The cordon is re-issued every tick, which is what makes it eventually
+# convergent on an idle pool and NOT convergent on a busy one. As of this
+# writing the behavioural fix is still open on #948; what exists today is the
+# measurement — cordon_host() publishes
+# ci_recycle_verdicts{outcome=cordon-no-progress} for a cordon that has removed
+# nothing since it started, so the state is visible instead of silent. Do not
+# re-add the stronger claim to this comment without the host-side guard that
+# would make it true.
 #
 # ROLLING, NOT ALL AT ONCE. Cordoning is not free: a cordoned host's idle slots
 # leave the pool immediately, so cordoning every stale host at once removes the

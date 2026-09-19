@@ -1094,9 +1094,56 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
-        with:
-          terraform_version: 1.9.8
+
+      # WHY NOT `hashicorp/setup-terraform`, WHICH THIS REPLACED.
+      #
+      # That action downloads the release over the network with NO retry of its
+      # own, and this job's required-check name is `Terraform (fmt + validate)`
+      # whose first `run` step is `terraform fmt -check -recursive`. So
+      # `Client network socket disconnected before secure TLS connection was
+      # established` in the setup step failed a clean pull request under a check
+      # name that reads as a FORMATTING error, and the author went looking at
+      # their own whitespace. It is the same class of flake `terraform init`
+      # below has been wrapped against since #271, on the same required check,
+      # and the setup step was the half that was left bare.
+      #
+      # This is GitHub-hosted egress from `ubuntu-latest` to
+      # releases.hashicorp.com. It is NOT the fleet's Cloud NAT and NOT the
+      # in-module container-MTU problem; neither is a cause here.
+      #
+      # `curl --retry` IS the fix, and it is why this is a `run` step rather
+      # than a retry wrapped around the action: there is no third-party retry
+      # action to pin, `--retry-all-errors` covers the TLS reset that a
+      # status-code-only retry would not, and the checksum is verified so a
+      # TRUNCATED download fails as a checksum error instead of as a terraform
+      # that misbehaves later. Not `continue-on-error`, and the job stays
+      # required.
+      - name: install terraform (retried)
+        env:
+          TERRAFORM_VERSION: 1.9.8
+        run: |
+          set -euo pipefail
+          base="https://releases.hashicorp.com/terraform/$TERRAFORM_VERSION"
+          zip="terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          sums="terraform_${TERRAFORM_VERSION}_SHA256SUMS"
+          work=$(mktemp -d)
+          for f in "$zip" "$sums"; do
+            curl --fail --location --silent --show-error \
+              --connect-timeout 15 --max-time 300 \
+              --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 180 \
+              -o "$work/$f" "$base/$f"
+          done
+          # `grep` first, then `-c -`: the sums file lists every platform, and
+          # `sha256sum -c` on the whole file fails on the archives that were
+          # never downloaded. A `grep` that matches nothing yields an empty
+          # stdin, which `sha256sum -c` rejects, so a version whose sums file
+          # does not name this archive fails here rather than passing silently.
+          ( cd "$work" && grep " $zip\$" "$sums" | sha256sum -c - )
+          mkdir -p "$HOME/.local/bin"
+          unzip -q -o "$work/$zip" terraform -d "$HOME/.local/bin"
+          chmod 0755 "$HOME/.local/bin/terraform"
+          rm -rf "$work"
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
 
       - run: terraform fmt -check -recursive
 
