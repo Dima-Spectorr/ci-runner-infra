@@ -483,6 +483,17 @@ already_released() {
   printf '%s\n' "$bodies" | grep -cF -- "$(released_marker "$sha")" >/dev/null
 }
 
+# Same idea, for the required-status-check refusal below: one comment per
+# refused sha, not one per pass. The lane keeps no state of its own, so the
+# marker IS the record.
+refused_marker() { printf '<!-- merge-lane:refused:%s -->' "$1"; }
+
+already_commented_refusal() {
+  local num="$1" sha="$2" bodies
+  bodies="$(gh api --paginate "repos/$R/issues/$num/comments?per_page=100" --jq '.[].body' 2>/dev/null || true)"
+  printf '%s\n' "$bodies" | grep -cF -- "$(refused_marker "$sha")" >/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # review_answered <pr> <sha> — how many of `REVIEW_BOTS` have published
 # something about EXACTLY this commit.
@@ -1729,7 +1740,7 @@ lane_is_pin_bump() {
 # overwhelmingly workflow pull requests. Whatever GitHub said is now quoted.
 # ---------------------------------------------------------------------------
 lane_report_refusal() {
-  local what="$1" num="$2" err="$3"
+  local what="$1" num="$2" err="$3" sha="${4:-}"
   # One line: an annotation is one line, and a multi-line body would be
   # truncated at the first newline with the reason usually below it.
   err="$(printf '%s' "$err" | tr '\n' ' ')"
@@ -1737,6 +1748,37 @@ lane_report_refusal() {
   case "$err" in
     *'workflows'*permission*)
       echo "::error::$what of #$num was refused: the merge App may not write \`.github/workflows/**\` on this installation. Grant the App the \"Workflows\" repository permission (read and write) and accept the request on each installation — until then EVERY pull request that touches a workflow file is unmergeable by the lane, and only those. GitHub said: $err"
+      return 2
+      ;;
+    *'Required status check'*'is expected'*)
+      # THE HEAD-OF-LINE BLOCKER. Measured on Telnet-Emulation run 35428114193:
+      # `check_counts` had read a completed, successful `CI summary (rollup)`
+      # for this exact head sha and ranked the pull request `merge:ready`, then
+      # the merge API refused it with this 405 because the RULESET disagreed —
+      # it was waiting on a check_suite the lane's flat, suite-blind read could
+      # not see was newer. That disagreement is a `check_counts` question for
+      # another day (see docs/merge-lane.md, "Superseded check_suite vs a
+      # required context"); what belongs HERE is that this refusal is about
+      # THIS pull request's OWN required checks and nothing else in the
+      # repository — no other candidate's checks, and no shared state like the
+      # base tip, changed because GitHub said this. Ending the batch over it
+      # starves every ready pull request behind this one, on every pass, for as
+      # long as the disagreement lasts — measured at 47 minutes on #1422 while
+      # this exact candidate sat refused at the head of the queue. So it is
+      # skipped, not merged and not counted, and the batch moves on.
+      echo "::warning::$what of #$num was refused: GitHub's ruleset says a required check is not yet posted for ${num}'s head, though the lane's own read called it green — a check_suite disagreement, not a change to anything else in the repository. Skipping #$num for this pass; it is re-read, not demoted. GitHub said: $err"
+      # NOT SILENT ON THE PULL REQUEST ITSELF. The Action log rotates out of
+      # easy reach; an operator (or the author) looking at the pull request
+      # is the one who most needs to know it was skipped and why. One comment
+      # per refused sha — `already_commented_refusal` is the marker, same
+      # pattern as `already_released` above — so a base that stays disagreed
+      # for several passes does not get commented on every single one.
+      if [ -n "$sha" ] && ! already_commented_refusal "$num" "$sha"; then
+        gh api "repos/$R/issues/$num/comments" -f body="$(printf '%s\n\n%s\n\n%s\n' \
+          "The merge lane tried to merge this pull request and GitHub refused: \`$err\`." \
+          "The lane's own read of ${sha:0:8} called the required checks green; GitHub's ruleset disagreed at merge time, most likely because a newer check run for the same commit was still in flight. This pull request was skipped for this pass — not demoted — and the lane will try it again on the next pass once the disagreement resolves itself." \
+          "$(refused_marker "$sha")")" --silent 2>/dev/null || true
+      fi
       return 2
       ;;
   esac
@@ -1778,7 +1820,7 @@ lane_take_action() {
         # because every caller happens to be a condition, and a future one
         # that is not would exit the run instead of reporting the refusal.
         local rc=0
-        lane_report_refusal merge "$action_num" "$merge_err" || rc=$?
+        lane_report_refusal merge "$action_num" "$merge_err" "$action_sha" || rc=$?
         return "$rc"
       fi
       ;;
@@ -1795,7 +1837,7 @@ lane_take_action() {
         # because every caller happens to be a condition, and a future one
         # that is not would exit the run instead of reporting the refusal.
         local rc=0
-        lane_report_refusal update "$action_num" "$update_err" || rc=$?
+        lane_report_refusal update "$action_num" "$update_err" "$action_sha" || rc=$?
         return "$rc"
       fi
       ;;

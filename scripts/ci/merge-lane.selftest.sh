@@ -871,6 +871,27 @@ names_the_workflows_permission_refusal() {
   matches "$code" '^      return 2$'
 }
 
+# Measured on Telnet-Emulation run 35428114193: the merge API refused a
+# `merge:ready` candidate with a 405, "Required status check \"CI summary
+# (rollup)\" is expected." — a disagreement between the lane's own read and
+# GitHub's ruleset about that ONE pull request's head, not a fact about the
+# base or any other candidate. Reported as the generic "head moved" this ends
+# the batch on every pass, so this one refused candidate — sitting oldest and
+# therefore first in the ranking — starves every ready pull request behind it.
+# Measured: PR #1422 sat green-but-unmerged for 47 minutes because of exactly
+# this. It must be named and skipped, not merged and not counted.
+names_the_required_status_check_refusal() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" "^    \*'Required status check'\*'is expected'\*)\$" || return 1
+  matches "$code" '^      return 2$' || return 1
+  # And it must not fail silently on the pull request itself — an Action log
+  # rotates out of easy reach; the comment is what the author and an operator
+  # both see without going and finding this run.
+  matches "$code" 'already_commented_refusal "\$num" "\$sha"' || return 1
+  matches "$code" 'refused_marker "\$sha"'
+}
+
 # "Not asked" and "up to date" are different facts. The verdict does not care —
 # it never reads `behind` on a non-strict base — but the queue table is what an
 # operator reads to decide whether the lane is working, and a column of zeroes
@@ -1249,6 +1270,7 @@ check stops_batching_at_the_pass_deadline "$DRIVER" "the batch keeps merging pas
 check ends_the_batch_on_a_refusal "$DRIVER" "a refused action does not stop the batch, so the lane keeps working down a ranking the refusal just proved stale"
 check quotes_what_github_actually_said "$DRIVER" "a refusal is reported as a guess while GitHub's own reason is thrown away, so a lane that logs merge:ready and then acts on nothing cannot be diagnosed at all"
 check names_the_workflows_permission_refusal "$DRIVER" "a pull request the App may never merge — it touches a workflow file — reads as a transient refusal and ends the batch on every pass, so one of them starves the whole repository"
+check names_the_required_status_check_refusal "$DRIVER" "a required-status-check 405 — the lane's own read disagreeing with GitHub's ruleset about ONE candidate's head — reads as a transient refusal and ends the batch on every pass, so the oldest ready pull request starves every candidate behind it"
 check halts_when_the_base_itself_is_red "$DRIVER" "the lane keeps merging onto a base whose own required checks are failing, burying the commit that broke it under everything that follows"
 check only_a_definite_failure_halts_the_lane "$DRIVER" "the base-health gate halts on something other than a definite failure, which deadlocks every repository whose required checks run on pull_request only"
 check says_on_the_snapshot_that_it_halted "$DRIVER" "a halted lane renders exactly like a base with nothing open, so the queue view reports a quiet day while nothing can merge"
@@ -1436,6 +1458,10 @@ mutate "gh's stderr goes back to the log instead of the annotation" "$DRIVER" \
   's@ --silent 2>&1)"@ --silent)"@' quotes_what_github_actually_said
 mutate "the workflows-permission refusal stops being named" "$DRIVER" \
   "s@^    \*'workflows'\*permission\*)\$@    *'workflows-never'*permission*)@" names_the_workflows_permission_refusal
+mutate "the required-status-check refusal stops being named" "$DRIVER" \
+  "s@^    \*'Required status check'\*'is expected'\*)\$@    *'Required status check-never'*'is expected'*)@" names_the_required_status_check_refusal
+mutate "the required-status-check refusal stops commenting on the pull request" "$DRIVER" \
+  's@already_commented_refusal "\$num" "\$sha"@false@' names_the_required_status_check_refusal
 mutate "the unasked comparison starts reporting itself as up to date" "$DRIVER" \
   "s@^      behind_cell='n/a'\$@      behind_cell=\"\$behind\"@" says_when_it_did_not_ask_how_far_behind
 
