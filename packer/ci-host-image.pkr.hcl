@@ -101,6 +101,88 @@ variable "source_image_family" {
   default = "ubuntu-2404-lts-amd64"
 }
 
+variable "tool_cache_node_version" {
+  type        = string
+  description = <<-EOT
+    The EXACT node runtime pre-baked into the shared Actions tool cache, or ""
+    to bake none.
+
+    This is not `node_major`, and the two are unrelated. `node_major` is the
+    system node on PATH, there so that a marketplace action's
+    `#!/usr/bin/env node` shim resolves at all. This one is the BUILD toolchain
+    a repository selects with actions/setup-node, and it has to be an exact
+    `X.Y.Z` because that is what setup-node looks up.
+
+    WHY THE IMAGE BAKES IT AT ALL
+
+    `actions/setup-node` resolves its runtime out of the tool cache the runner
+    points it at, and until this existed that cache was the runner's default:
+    `<work>/_tool`, inside the slot's own `_work` directory. That location is
+    wrong twice over. It is per-slot, so four slots on one host each hold their
+    own copy; and it is inside the tree the slot sweep empties between jobs, so
+    the copy does not survive to the next job. The download is therefore repaid
+    per slot per job and amortised nowhere.
+
+    Measured on a consumer repository's 11-job run, 2026-09-19 (see #962):
+    215s of 637s of job wall time — 34% — was `Set up Node.js`, of which ~21s
+    per job was `Acquiring 24.21.0 - x64 from https://github.com/...` pulling a
+    ~60MB tarball. A `main-health` job whose real work is a 10s type-check spent
+    36s on setup.
+
+    WHY IT IS PINNED AND WHAT HAPPENS WHEN THE PIN IS WRONG
+
+    setup-node looks for `<cache>/node/<version>/x64` plus a sibling
+    `<version>/x64.complete` marker and falls back to downloading when either is
+    absent (actions/toolkit, `tool-cache`'s `find()`). That fallback is SILENT —
+    it is exactly the behaviour this variable exists to remove — so a baked
+    version that disagrees with what repositories pin would leave the image
+    bigger, the fleet no faster, and every measurement looking as it does today.
+
+    Three things make the disagreement loud instead:
+
+      * this build. The bake below extracts the archive and runs
+        `bin/node --version`, and a value that is not `v<this>` fails the image
+        build rather than shipping.
+      * the host boot. `provision_tool_cache` in host-startup.sh logs what it
+        seeded, per slot, and logs a refusal when the image baked nothing.
+      * the slot sweep. `slot-reset.sh` reports any version a JOB wrote into the
+        slot's tool cache that this image did not bake — which, because the
+        seeded cache is the only other thing in there, is precisely the set of
+        cache misses. That is the signal that says "the pin drifted" without
+        anybody having to read a workflow file.
+
+    Consuming repositories pin the same value in their workflows with a
+    `runtime-pin` comment tying it to `services/*/Dockerfile`; this default
+    tracks it. A pool whose repositories pin something else keeps today's
+    behaviour — a download, and a sweep line naming the version it wanted.
+  EOT
+  # 24.21.0 because that is what the fleet's consumers pin today: six jobs in
+  # one consumer's ci.yml carry `# runtime-pin: must match services/*/Dockerfile`.
+  # Moving this means moving tool_cache_node_sha256 in the same commit.
+  default     = "24.21.0"
+}
+
+variable "tool_cache_node_sha256" {
+  type        = string
+  description = <<-EOT
+    SHA-256 of `node-v<tool_cache_node_version>-linux-x64.tar.gz` as published in
+    that release's `SHASUMS256.txt`.
+
+    Pinned in the repository rather than fetched alongside the tarball, and the
+    difference is the whole point: verifying a download against a sums file
+    served from the same host at the same moment authenticates nothing a
+    compromised mirror could not also have written. A digest in the repository
+    was reviewed by a human in a pull request, which is the only moment this
+    artefact is actually vouched for.
+
+    Required whenever `tool_cache_node_version` is non-empty — the bake refuses
+    to run with one set and the other blank, because a version bumped without
+    its digest would otherwise verify a new tarball against an old hash and fail
+    in a way that reads like a network problem.
+  EOT
+  default     = "6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff"
+}
+
 variable "node_major" {
   type        = string
   description = <<-EOT
@@ -405,6 +487,95 @@ build {
       # wheel. See host-startup.sh's "the dependency cache" section.
       "mkdir -p /opt/ci-cache && chown -R root:root /opt/ci-cache",
       "chmod 0755 /opt/ci-cache",
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
+  # 5b. The shared Actions tool cache.
+  #
+  #     ONE archive, root-owned and read-only, at /opt/ci-tool-cache. Each slot
+  #     extracts its own copy at boot into /var/lib/ci-cache/<idx>/tools and the
+  #     agent is pointed there, so `actions/setup-node` finds the runtime
+  #     locally instead of pulling ~60MB from github.com on every job.
+  #
+  #     AN ARCHIVE AND NOT AN EXTRACTED TREE, which is the one design decision
+  #     here worth writing down. The extracted tree would let the boot use the
+  #     same `cp -a` the dependency cache uses, and it cannot, for two reasons
+  #     that both point the same way:
+  #
+  #       * a node install is full of relative symlinks (`bin/npx` ->
+  #         `../lib/node_modules/npm/bin/npx-cli.js`, `bin/corepack`), and the
+  #         seal in 6b below refuses any tree under /opt/ci-cache holding a link
+  #         at all. That refusal is correct for a tree a consumer's warm script
+  #         wrote and would have to be weakened to admit this one.
+  #       * root would then be walking that tree with `chown -R`/`chmod -R` on
+  #         every boot. host-startup.sh's rule is that root never operates on a
+  #         path inside a namespace an untrusted uid controls, and a FILE whose
+  #         digest is recorded here needs none of that walking: the boot verifies
+  #         one checksum and lets the SLOT USER extract it into the slot's own
+  #         directory.
+  #
+  #     That is the same shape as /opt/ci-images: a baked archive plus a
+  #     SHA256SUMS taken at the only moment the content is known good, consumed
+  #     per slot at boot. NOT under /opt/ci-cache, for the same reason
+  #     /opt/ci-images is not — what is written here is extracted and then
+  #     EXECUTED by every slot on the host, so a job able to write it would be
+  #     running its own `node` in every other slot.
+  #
+  #     Placed before the warm-cache layer so a consumer-supplied script cannot
+  #     see, precede or interfere with it, and after the runner so a failure here
+  #     does not invalidate the expensive layers above.
+  provisioner "shell" {
+    # `pipefail`: the checksum is verified through a pipe into `sha256sum -c`,
+    # and without it a `printf` that failed would leave the verification passing.
+    # See check-packer-inline-shell.sh for why the default shebang is dash.
+    inline_shebang = "/bin/bash -e"
+    inline = [
+      "set -euxo pipefail",
+      "D=/opt/ci-tool-cache",
+      "V='${var.tool_cache_node_version}'",
+      "S='${var.tool_cache_node_sha256}'",
+      "install -d -o root -g root -m 0755 \"$D\"",
+      # An EMPTY manifest and not an absent one. host-startup.sh reads this file
+      # to learn what the image baked, and "the file is missing" and "the image
+      # deliberately baked nothing" are different states that deserve different
+      # log lines on a host.
+      "if [ -z \"$V\" ]; then : >\"$D/MANIFEST\"; chmod 0444 \"$D/MANIFEST\"; echo 'tool cache: no runtime pinned — this image bakes none'; exit 0; fi",
+      "[ -n \"$S\" ] || { echo 'tool_cache_node_version is set but tool_cache_node_sha256 is empty — a version moved without its digest' >&2; exit 1; }",
+      # X.Y.Z, checked here rather than trusted. setup-node looks the version up
+      # as an exact directory name, so a major-only value like "24" would bake a
+      # tree nothing ever finds — a silent no-op, which is the failure this whole
+      # layer exists to remove.
+      "case \"$V\" in ''|*[!0-9.]*|*..*|.*|*.) echo \"tool_cache_node_version must be X.Y.Z, got '$V'\" >&2; exit 1 ;; esac",
+      "A=\"node-v$V-linux-x64.tar.gz\"",
+      "curl -fsSL --retry 3 --retry-all-errors -o \"/tmp/$A\" \"https://nodejs.org/dist/v$V/$A\"",
+      "printf '%s  %s\n' \"$S\" \"/tmp/$A\" | sha256sum -c -",
+      # THE ASSERTION THIS LAYER RESTS ON, and it is checked here because this is
+      # the only place it can fail usefully. On a host a wrong version is not an
+      # error: setup-node simply does not find what it asked for and downloads
+      # it, so the symptom is "CI did not get faster" — the most believable wrong
+      # explanation there is.
+      "rm -rf /tmp/tool-cache-probe && mkdir -p /tmp/tool-cache-probe",
+      "tar -xzf \"/tmp/$A\" -C /tmp/tool-cache-probe --strip-components=1",
+      "got=$(/tmp/tool-cache-probe/bin/node --version)",
+      "[ \"$got\" = \"v$V\" ] || { echo \"the archive for v$V reports $got — the pin and the artefact disagree\" >&2; exit 1; }",
+      "rm -rf /tmp/tool-cache-probe",
+      "mv \"/tmp/$A\" \"$D/$A\"",
+      # Recorded relative to the directory, so a host verifies it with a plain
+      # `cd $D && sha256sum -c SHA256SUMS` and never has to reconstruct a path.
+      "printf '%s  %s\n' \"$S\" \"$A\" >\"$D/SHA256SUMS\"",
+      # tool, version, arch, archive — the four things a host needs to build the
+      # `<cache>/node/<version>/x64` layout setup-node looks for, and the record
+      # the slot sweep compares a job's downloads against.
+      "printf 'node\t%s\tx64\t%s\n' \"$V\" \"$A\" >\"$D/MANIFEST\"",
+      "chown -Rh root:root \"$D\"",
+      # 0444 on the files and 0755 on the directory: every slot user reads all
+      # three, none of them may write any. Not `chmod -R`, because the directory
+      # and the files want different modes and -R would give the files the
+      # directory's.
+      "chmod 0755 \"$D\"",
+      "chmod 0444 \"$D/$A\" \"$D/SHA256SUMS\" \"$D/MANIFEST\"",
+      "echo \"tool cache: baked node v$V ($(du -h \"$D/$A\" | cut -f1))\"",
     ]
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }

@@ -1381,7 +1381,7 @@ has_baked_image_audit() { # <file>
 # text back into the file the host actually gets.
 generated_scripts_parse() { # <file>
   local name body tmp rc=0
-  for name in slot-reset slot-sweep pin-hold pin-sweep baked-image-audit; do
+  for name in slot-reset slot-sweep pin-hold pin-sweep baked-image-audit seed-tool-cache; do
     body=$(awk -v n="$name" '
       $0 == "  cat >/opt/ci/job-hooks/" n ".sh <<EOF" { on = 1; next }
       on && $0 == "EOF" { exit }
@@ -2122,6 +2122,193 @@ if grep -qF 'line if length(line) > 4096' "$_main"; then
 else
   bad "the module no longer refuses a boot script with a line over 4096 characters at plan time, so an unfolded blob would reach a template again -- green apply, and every instance created from it fails two minutes in."
 fi
+
+# --- the baked Actions tool cache --------------------------------------------
+#
+# The third silent failure in this file, and it is silent in a way the other two
+# are not: every part of it can be wrong while the host boots clean, serves jobs
+# and passes every other gate here. `actions/setup-node` responds to a tool cache
+# it cannot use by DOWNLOADING — no error, no warning, just the ~21s per job this
+# layer was added to remove (#962: 215s of 637s of job wall time on one consumer's
+# 11-job run).
+#
+# So "the image got bigger and CI did not get faster" is the whole failure mode,
+# and there is no host-side symptom to alert on. It is pinned here instead.
+has_baked_tool_cache() { # <file>
+  local code joined flat
+  code=$(code_of "$1")
+  joined=$(joined_code_of "$1")
+  # Line order matters twice below, and a predicate over a folded single line is
+  # how that is expressed without parsing the file.
+  flat=$(printf '%s' "$code" | tr '\n' '@')
+
+  # 1. THE LOCATION, which is the entire defect being fixed. The runner's default
+  #    tool cache is `<work>/_tool`, inside the tree slot-reset.sh empties between
+  #    jobs, so the download is repaid per slot per job. The seeded cache has to
+  #    sit under $CACHE_SLOTS — outside every slot's _work — and the env vars have
+  #    to name that path and not a path under $SLOT_ROOT.
+  matches "$code" '^TOOL_CACHE_MASTER="/opt/ci-tool-cache"$'              || return 1
+  matches "$code" '^SLOTS_DIR="\$CACHE_SLOTS"$'                           || return 1
+  matches "$code" 'dst="\\\$SLOTS_DIR/\\\$idx"'                           || return 1
+  matches "$code" 'tools="\\\$dst/\\\$NAME"'                              || return 1
+  matches "$code" '^Environment=RUNNER_TOOL_CACHE=\$c/\$TOOL_CACHE_NAME$' || return 1
+  ! matches "$code" 'RUNNER_TOOL_CACHE=.*SLOT_ROOT'                       || return 1
+  ! matches "$code" 'RUNNER_TOOL_CACHE=.*_work'                           || return 1
+
+  # 2. THE MARKER. @actions/tool-cache's find() tests for
+  #    `<tool>/<version>/<arch>` AND a sibling `<arch>.complete`, and treats a
+  #    missing marker as a miss. A seeded runtime without it is a directory
+  #    setup-node walks straight past on its way to github.com — the layer costs
+  #    image size and buys nothing, which is exactly the shape that gets shipped.
+  matches "$code" ': >"\\\$stage/\\\$tool/\\\$version/\\\$arch\.complete"' || return 1
+
+  # 3. THE VARIABLES REACH THE UNIT. Computed and never interpolated is a whole
+  #    layer that silently does nothing — the same hole item 3 of
+  #    has_turbo_cache pins for TURBO_ENV.
+  matches "$code" 'TOOL_ENV=\$\(tool_cache_env "\$idx"\)'                 || return 1
+  matches "$code" '^\$TOOL_ENV$'                                          || return 1
+
+  # 4. THE ARCHIVE IS VERIFIED BEFORE IT IS EXTRACTED INTO EVERY SLOT, on every
+  #    seed and not once per boot. This tree is extracted and then EXECUTED by
+  #    every slot on the host, and /opt survives a reset, so the digest the image
+  #    recorded is the only thing that says the bytes are still the bytes the
+  #    build vouched for.
+  matches "$joined" 'sha256sum -c --quiet SHA256SUMS'                     || return 1
+  matches "$joined" 'refusing \\\$MASTER: SHA256SUMS does not verify'     || return 1
+  #    ...refused outright if anything in the master is not root-owned and
+  #    unwritable by a slot...
+  matches "$joined" '! -user root -o -perm /022'                          || return 1
+  #    ...and the two lists are cross-checked, because `sha256sum -c` verifies the
+  #    files SHA256SUMS names while the loop extracts the files MANIFEST names.
+  #    Nothing else ties them together, so a manifest row naming an archive no
+  #    digest covers would be extracted on every slot with a clean boot log.
+  matches "$joined" 'grep -qF "  \\\$archive" "\\\$MASTER/SHA256SUMS"'    || return 1
+  #    A digest authenticates whatever was pinned and says nothing about what it
+  #    CONTAINS: as root, tar restores recorded modes, so a setuid file in a tree
+  #    an unprivileged slot owns and executes is local root.
+  matches "$joined" '\-\-no-same-permissions'                            || return 1
+  matches "$joined" '\-perm /6000'                                        || return 1
+
+  # 5. ROOT NEVER OPERATES INSIDE A NAMESPACE A SLOT OWNS. The staging tree is
+  #    root-owned for the whole of its life and published by rename; the slot is
+  #    given ownership only once nothing more will be created in it. Same rule the
+  #    dependency-cache section states, same ordering as seed_slot_cache.
+  matches "$code" 'chown -R "\\\$u:\\\$u" "\\\$stage"'                    || return 1
+  matches "$code" 'mv -T "\\\$stage" "\\\$tools"'                         || return 1
+  # The chown must come BEFORE the publish: a tree handed to the slot after it is
+  # already reachable at its final name is a window, not an atomic publish.
+  matches "$flat" 'chown -R "\\\$u:\\\$u" "\\\$stage"([^@]*@){1,4}[^@]*mv -T "\\\$stage" "\\\$tools"' || return 1
+
+  # 6. IT IS RE-SEEDED AT EVERY JOB BOUNDARY, and this is the assertion that makes
+  #    the whole layer safe rather than merely fast. The tree is deliberately
+  #    outside the swept `_work`, which makes it the first slot-writable tree of
+  #    directly-EXECUTED binaries to outlive a job: before this existed, a job that
+  #    rewrote `bin/node` lost it when `_work` was renamed away. Replacing the tree
+  #    from the verified master at the reset boundary is what restores that bound,
+  #    and a regression to "bless whatever the slot left behind" would otherwise
+  #    pass every other check in this file.
+  matches "$code" '/opt/ci/job-hooks/seed-tool-cache\.sh "\\\$idx"'       || return 1
+  matches "$flat" 'case "\\\$stage" in@[^@]*completed\|boot\)@.*/opt/ci/job-hooks/seed-tool-cache\.sh "\\\$idx"' || return 1
+  # And the slot's own copy is moved aside BEFORE the master is read, so that
+  # "could not verify the master" does not leave a job's leftovers in place for the
+  # next job to execute. That ordering is the difference between failing open and
+  # failing into the one state this is guarding against.
+  matches "$flat" 'mv -T "\\\$tools" "\\\$prev"[^@]*@.*\[ ! -d "\\\$MASTER" \]' || return 1
+  # Failing open has to be ARRANGED, because the fail-open state is not the absent
+  # one: the unit already carries RUNNER_TOOL_CACHE, and a missing directory under
+  # root-owned $CACHE_SLOTS/<idx> makes setup-node fail the job with EACCES instead
+  # of downloading. An empty slot-owned directory is what "download it" looks like.
+  matches "$code" '^ensure_empty\(\) \{'                                  || return 1
+  matches "$joined" 'trap .rc=\\\$\?; \[ "\\\$rc" = 0 \] \|\| ensure_empty' || return 1
+  # The seeder is root-owned and not readable or writable by a slot: it extracts
+  # archives into every slot on the host.
+  matches "$code" 'chown root:root /opt/ci/job-hooks/seed-tool-cache\.sh' || return 1
+  matches "$code" 'chmod 0700 /opt/ci/job-hooks/seed-tool-cache\.sh'      || return 1
+
+  # 7. A MISS IS NOT SILENT. The sweep reports any runtime a JOB wrote into the
+  #    slot's tool cache that the image did not bake — which, because the seeded
+  #    cache is the only other thing in there, is precisely the set of misses.
+  #    This is the only signal that distinguishes "the pin holds" from "the pin
+  #    drifted and nothing changed", because nothing on the host reads workflows.
+  matches "$code" 'TOOL CACHE MISS'                                       || return 1
+  matches "$code" 'MANIFEST'                                              || return 1
+  #    It is a report over names a SLOT chose, so it is bounded and sanitised: the
+  #    count of markers is the job's to pick, and a raw name in a root-emitted log
+  #    line can be shaped to forge a second line.
+  matches "$joined" '\-gt 32'                                             || return 1
+  matches "$code" 'safe "\\\$t_tool"'                                     || return 1
+
+  # 8. THE TWO CACHES CANNOT COLLIDE. A `tools` dependency cache and the tool cache
+  #    would be one directory seeded twice, and whichever ran second would publish
+  #    its content under the other's name.
+  matches "$joined" '\[ "\$d" = "\$TOOL_CACHE_NAME" \]'                   || return 1
+
+  # 9. IT NEVER TAKES THE HOST DOWN. A tool cache that refuses to register agents
+  #    has turned a speed layer into an outage; a host without one is merely as
+  #    slow as every host was before it existed.
+  ! matches "$joined" 'provision_tool_cache \|\| die'                     || return 1
+  matches "$code" 'provision_tool_cache \|\| true'                        || return 1
+}
+
+if has_baked_tool_cache "$SCRIPT"; then
+  ok
+else
+  bad "the baked tool cache is mis-wired — seeded inside the tree the sweep empties, missing the .complete marker find() tests for, pointed at by variables that never reach the unit, extracted unverified, published non-atomically, NOT REBUILT at the job boundary (so one job's rewritten bin/node runs in the next), or fatal at boot. Every one of those presents as a host that boots clean and downloads its runtime anyway, which is the failure this layer exists to end (#962)"
+fi
+
+# The pin, and the one thing about it that can be checked without a host: the
+# version the image bakes is an exact X.Y.Z. setup-node looks the version up as a
+# directory NAME, so a major-only value like "24" bakes a tree nothing ever finds
+# — a silent no-op with the image-size cost still paid.
+_pkr="$HERE/../../packer/ci-host-image.pkr.hcl"
+_pin=$(sed -n '/variable "tool_cache_node_version"/,/^}/p' "$_pkr" | sed -n 's/^  default     = "\(.*\)"$/\1/p')
+if printf '%s' "$_pin" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  ok
+else
+  bad "packer's tool_cache_node_version default is '${_pin:-<unreadable>}', which is not an exact X.Y.Z. setup-node resolves the version as a directory name, so anything else bakes a runtime no job ever finds and the download stays."
+fi
+_sha=$(sed -n '/variable "tool_cache_node_sha256"/,/^}/p' "$_pkr" | sed -n 's/^  default     = "\(.*\)"$/\1/p')
+if printf '%s' "$_sha" | grep -qE '^[0-9a-f]{64}$'; then
+  ok
+else
+  bad "packer's tool_cache_node_sha256 default is not a 64-character hex digest, so the baked archive is verified against nothing and a version bumped without its digest fails the image build as what looks like a network error."
+fi
+
+# --- mutation cases: prove the checks above can actually fail ------------------
+mutate "tool cache back inside the swept _work" \
+  's|^TOOL_CACHE_MASTER="/opt/ci-tool-cache"$|TOOL_CACHE_MASTER="/opt/ci/slots/_work/_tool"|' has_baked_tool_cache
+mutate "the .complete marker dropped" \
+  's@\.complete"@.written"@' has_baked_tool_cache
+mutate "the variables never reach the unit" \
+  's|^\$TOOL_ENV$|# $TOOL_ENV|' has_baked_tool_cache
+mutate "the archive extracted unverified" \
+  's|sha256sum -c --quiet SHA256SUMS|true SHA256SUMS|' has_baked_tool_cache
+mutate "the master no longer has to be root-owned" \
+  's|! -user root -o -perm /022|-newer /dev/null|' has_baked_tool_cache
+mutate "a manifest row no digest covers is extracted anyway" \
+  's@grep -qF@true@' has_baked_tool_cache
+mutate "tar restores the recorded modes, setuid included" \
+  's@ --no-same-permissions@@' has_baked_tool_cache
+mutate "a setuid file in the baked archive is published" \
+  's@-perm /6000@-newer /dev/null@' has_baked_tool_cache
+mutate "the slot owns the staging tree before it is published" \
+  's@^chown -R "\\\$u:\\\$u" "\\\$stage".*$@: ownership is handed over after the rename@' has_baked_tool_cache
+mutate "the tool cache is never rebuilt at the job boundary" \
+  's@/opt/ci/job-hooks/seed-tool-cache.sh "@/opt/ci/job-hooks/absent.sh "@' has_baked_tool_cache
+mutate "the slot's own copy is kept when the master cannot be verified" \
+  's@mv -T "\\\$tools" "\\\$prev"@true@' has_baked_tool_cache
+mutate "a failed re-seed leaves no directory for the runner to use" \
+  's@^ensure_empty@_unused_empty@' has_baked_tool_cache
+mutate "a miss stops being reported" \
+  's|TOOL CACHE MISS|tool cache note|' has_baked_tool_cache
+mutate "the miss report is unbounded" \
+  's@-gt 32@-lt 0@' has_baked_tool_cache
+mutate "slot-chosen names go into the log raw" \
+  's@safe "\\\$t_tool"@printf %s "\\\$t_tool"@' has_baked_tool_cache
+mutate "the two caches may collide on one directory" \
+  's@\[ "\$d" = "\$TOOL_CACHE_NAME" \]@false@' has_baked_tool_cache
+mutate "a tool cache problem takes the host down" \
+  's@^  provision_tool_cache .*$@  provision_tool_cache || die "no tool cache"@' has_baked_tool_cache
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
