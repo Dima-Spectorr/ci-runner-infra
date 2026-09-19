@@ -138,9 +138,16 @@ jobs:
           # GitHub-hosted runner, where a leaked directory outlives the job.
           trap 'rm -rf "$work"' EXIT
           for f in "$zip" "$sums"; do
+            # --max-time is PER ATTEMPT and --retry-max-time is the window in
+            # which a NEW attempt may start, so the per-attempt bound has to be
+            # the smaller of the two: at 300 against 180 one hung attempt burns
+            # the whole retry budget and the retries never happen -- which is
+            # the un-retried download this step exists to remove. 120s is ample
+            # for a ~30 MB archive off a GitHub-hosted runner, and 600s leaves
+            # room for all five attempts plus their delays.
             curl --fail --location --silent --show-error \
-              --connect-timeout 15 --max-time 300 \
-              --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 180 \
+              --connect-timeout 15 --max-time 120 \
+              --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 600 \
               -o "$work/$f" "$base/$f"
           done
           # One line is selected, not the whole file: the sums file lists every
