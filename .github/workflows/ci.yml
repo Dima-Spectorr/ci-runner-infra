@@ -866,7 +866,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # `fetch-depth: 0` for the VERSION-bump gate at the end of this job: it
+      # diffs the pull request against its MERGE BASE, and a depth-1 checkout
+      # has no merge base to find. The gate treats an unreachable base as a
+      # hard error rather than a pass, so getting this wrong reddens the job
+      # loudly instead of quietly exempting every pull request.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
 
       # …and then this repository's own workflows. It publishes the rule, so it
       # is the first place the rule must hold. `--forks=allowed` is the strict
@@ -998,6 +1005,27 @@ jobs:
 
       - name: playwright pin
         run: bash scripts/ci/check-playwright-pin.sh
+
+      # The other half of the docs-pin rule, and the one that was prose until
+      # #960. docs-pins asserts the documentation against `VERSION`; nothing
+      # asserted that `VERSION` MOVED when the released code did. `afc9bf3`
+      # merged without a bump, `publish-tag.yml` correctly wrote nothing, and
+      # the fix sat in main released to none of the consumers pinning `?ref=v5`
+      # — with every check on the pull request green.
+      - name: VERSION bump rule self-test
+        run: bash scripts/ci/check-version-bump.sh --selftest
+
+      # The gate itself. The pull request's base sha, head sha and labels are
+      # passed IN rather than read from the API inside the script, so the rule
+      # stays a pure function of three strings and the self-test above can
+      # drive every branch of it. All three are empty on the `push` leg, which
+      # is how the gate knows there is no merge base to reason about.
+      - name: VERSION bump
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: bash scripts/ci/check-version-bump.sh
 
   # THE NAME THE REST OF THE WORLD WAITS FOR.
   #

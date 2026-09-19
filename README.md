@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.106.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.107.0"
   # ...
 }
 ```
@@ -1144,6 +1144,35 @@ pin printed in the documentation names the version in `VERSION`
 (`scripts/ci/docs-pins.selftest.sh`) — the README quickstart had otherwise sat
 three minor versions behind the fleet, in the one line a new consumer is most
 likely to paste verbatim.
+
+**The bump is a gate, not a convention.** `scripts/ci/check-version-bump.sh`
+fails a pull request whose diff touches `modules/` or `scripts/` while `VERSION`
+is unchanged against the merge base, and the failure names the current version
+and the next minor so the fix is one edit rather than a trip back here. It was
+prose only until issue #960, which is what that prose cost: `afc9bf3` — a merge
+lane fix — merged without a bump, `publish-tag.yml` correctly found nothing to
+move, and the change sat in main released to none of the fourteen repositories
+pinning `?ref=v5`. Every check on that pull request was green, and the only way
+to notice was to run `git ls-remote origin refs/tags/v5` afterwards and reason
+about what came back. `docs-pins.selftest.sh` could not have caught it: it
+compares the documentation to `VERSION`, so a `VERSION` nobody touched is
+trivially self-consistent.
+
+A change that genuinely reaches no consumer — a self-test-only edit, a comment,
+a revert of something never released — escapes with the **`no-release`** label
+on the pull request. The escape is the thing that gets justified, never the
+bump, and it prints its reason into the log so an operator reading a green run
+can see that the rule was waived rather than satisfied. It does not license a
+`VERSION` that moves *backwards*; nothing does.
+
+Two things the gate cannot see, and both stay a matter of judgement. It cannot
+tell a **minor** from a **patch** — it only asks that the number moved forward,
+and the next-minor it suggests is a default, not a verdict on the change. And
+the released surface is a path list, not an analysis: a change under `docs/`,
+`fleet/`, `.github/` or `packer/` is exempt because none of those reach a
+consumer through `?ref=`, but a genuinely consumer-visible change smuggled into
+one of them would pass. The gate ends the *silent* omission; it does not decide
+the release for you.
 
 **The tag is created for you.** On every push to main, `publish-tag.yml` reads
 `VERSION` and creates that annotated tag at the merge commit if it does not
