@@ -355,7 +355,7 @@ check_counts() {
   # would be read as the counts, which is the same class of mistake the rest of
   # this comment is about.
   if ! runs="$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" \
-    --jq '.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // ""), origin: "run", app: (.app.slug // (.app.id | tostring) // "unknown"), suite: (.check_suite.id // -1)}' 2>/dev/null)"; then
+    --jq '.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // ""), origin: "run", app: ((.app.slug // .app.id // "unknown") | tostring), suite: (.check_suite.id // -1)}' 2>/dev/null)"; then
     echo "lane: cannot read the check-runs of $sha — the lane is blind, not idle" >&2
     LANE_FATAL=1
     echo "0 ${#REQUIRED[@]} 0 0"
@@ -391,7 +391,7 @@ check_counts() {
   # first-page-only read is the exact defect `check-runs` was already fixed
   # for.
   if ! suites="$(gh api --paginate "repos/$R/commits/$sha/check-suites?per_page=100" \
-    --jq '.check_suites[] | {id: .id, app: (.app.slug // (.app.id | tostring) // "unknown"), status: .status, created_at: (.created_at // "")}' 2>/dev/null)"; then
+    --jq '.check_suites[] | {id: .id, app: ((.app.slug // .app.id // "unknown") | tostring), status: .status, created_at: (.created_at // "")}' 2>/dev/null)"; then
     echo "lane: cannot read the check-suites of $sha — the lane is blind, not idle" >&2
     LANE_FATAL=1
     echo "0 ${#REQUIRED[@]} 0 0"
