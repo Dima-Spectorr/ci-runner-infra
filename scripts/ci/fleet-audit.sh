@@ -51,6 +51,29 @@ QUEUED_PAGE="${QUEUED_PAGE:-50}"
 # every repository with a fresh pull request red once a day.
 DEMAND_GRACE="${DEMAND_GRACE:-900}"
 
+# How long unreleased work may sit on the default branch. PASSED THROUGH
+# UNCHANGED, with no default of its own: the number and the reasoning behind it
+# live in fleet-audit-decision.sh, and a second copy here is a copy that drifts.
+# Empty means "whatever the rule's default is"; `0` turns the watchdog off.
+BACKLOG_MAX_HOURS="${BACKLOG_MAX_HOURS:-}"
+# The released surfaces. A change outside these reaches consumers without a tag:
+# `docs/`, `fleet/` and `.github/` are read from the default branch, and
+# `packer/` is built by a push-to-branch Cloud Build trigger
+# (modules/ci-host-image-trigger/main.tf) rather than through any `?ref=` pin.
+RELEASED_SURFACE="${RELEASED_SURFACE:-^(modules|scripts)/}"
+# How many commits of backlog are walked one-by-one for their file lists. A
+# bounded walk, because one API call per commit against a tag that has not moved
+# in months would be hundreds. Past the cap the age is reported as unknown
+# rather than guessed — see backlog_facts().
+BACKLOG_SCAN_MAX="${BACKLOG_SCAN_MAX:-40}"
+# The tag the backlog is measured from. Empty — the normal case — derives it
+# from VERSION's major, which is the ref consumers pin. An override exists so
+# the collector can be exercised by hand against a tag that is known to be
+# behind the default branch; on a healthy repository the derived tag is at the
+# tip, so every code path past the first comparison would otherwise be dead on
+# the only repository it ever runs against.
+FLOATING_TAG="${FLOATING_TAG:-}"
+
 command -v gh >/dev/null 2>&1 || { echo "fleet-audit: gh is not on PATH" >&2; exit 2; }
 [ -r "$MANIFEST" ] || { echo "fleet-audit: cannot read $MANIFEST" >&2; exit 2; }
 # Exit 2, not a run against an empty owner: every read would 404 and the rule
@@ -186,6 +209,140 @@ queue_facts() {
   echo "$(( total - recent )) $recent $settled"
 }
 
+# floating_tag — the major tag consumers pin, derived from VERSION rather than
+# written down. A literal `v5` here would be a version literal in a file that
+# outlives the major, and it would keep reading a tag that stopped moving.
+floating_tag() {
+  local version
+  version=$(tr -d ' \r\n' < "$ROOT/VERSION" 2>/dev/null)
+  [ -z "$version" ] && return 0
+  version="${version#v}"
+  [ -z "${version%%.*}" ] && return 0
+  printf 'v%s' "${version%%.*}"
+}
+
+# is_sha <string> — a full, lowercase object name and nothing else.
+is_sha() {
+  [ "${#1}" = 40 ] || return 1
+  [ -z "$(printf '%s' "$1" | tr -d '0-9a-f')" ]
+}
+
+# backlog_facts <repo> — how much finished work is sitting on the default branch
+# that no consumer can reach yet, and how old the oldest of it is.
+#
+# THE TAG IS READ FROM THE API, NEVER FROM THE CHECKOUT. `git fetch --tags` does
+# not move a local tag that already exists, so a workspace that has ever fetched
+# `v5` keeps whatever it saw first — and a floating tag is the one ref where
+# that is guaranteed to be wrong. It fails in BOTH directions: a stale local tag
+# behind the real one invents a backlog that was published days ago, and a local
+# tag ahead of it (a fetch from a workspace that pushed one) reports an empty
+# backlog while real work sits unreleased. `--force` would fix the fetch and not
+# the class of bug; reading the ref the consumer reads cannot be stale at all.
+#
+# The tag is ANNOTATED — publish-tag.yml creates it that way — so `git/ref`
+# answers with the tag object, and the commit is one dereference further in.
+# Comparing the tag object's own sha against the branch is a comparison between
+# two different kinds of object, which the compare endpoint answers with a 404
+# that would read here as "could not compare" every single day.
+#
+# Prints a fact string; `tag_readable=0` on any failure to resolve the tag,
+# which the rule treats as a failure rather than an empty backlog.
+backlog_facts() {
+  local repo="$1" tag ref otype sha head cmp ahead
+  tag="${FLOATING_TAG:-$(floating_tag)}"
+  [ -z "$tag" ] && { printf 'tag_readable=0'; return 0; }
+
+  ref=$(api "repos/$OWNER/$repo/git/ref/tags/$tag")
+  otype=$(printf '%s' "$ref" | jq -r '.object.type // empty' 2>/dev/null | tr -d '\r')
+  sha=$(printf '%s' "$ref" | jq -r '.object.sha // empty' 2>/dev/null | tr -d '\r')
+  case "$otype" in
+    tag) sha=$(api "repos/$OWNER/$repo/git/tags/$sha" | jq -r '.object.sha // empty' 2>/dev/null | tr -d '\r') ;;
+    commit) : ;;
+    # Neither, which includes the empty body a 404 leaves behind. "Resolves to
+    # something unexpected" and "does not resolve" are the same finding: the
+    # audit cannot bound the backlog either way.
+    *) sha="" ;;
+  esac
+  is_sha "$sha" || { printf 'tag_readable=0'; return 0; }
+
+  head=$(api "repos/$OWNER/$repo" | jq -r '.default_branch // empty' 2>/dev/null | tr -d '\r')
+  [ -z "$head" ] && { printf 'tag_readable=1'; return 0; }
+
+  cmp=$(api "repos/$OWNER/$repo/compare/$sha...$head?per_page=100")
+  ahead=$(printf '%s' "$cmp" | jq -r '.ahead_by // empty' 2>/dev/null | tr -d '\r')
+  # Empty, not zero. `.ahead_by // empty` on a refusal body yields nothing, and
+  # reading that as zero is precisely the "backlog is empty" answer this
+  # function must never give by accident.
+  [ -z "$ahead" ] && { printf 'tag_readable=1'; return 0; }
+  [ "$ahead" = "0" ] && { printf 'tag_readable=1;backlog=0;backlog_hours=0'; return 0; }
+
+  # THE BACKLOG CLOCK CANNOT START BEFORE THE TAG MOVED. A commit's own date is
+  # when it was written, which on a branch that sat open for a week is earlier
+  # than the day it landed. Nothing can have been waiting for publication longer
+  # than the current tag has been the current tag, so the tag's commit date is
+  # the floor — free, from the compare response that was fetched anyway.
+  local base_ts now_ts
+  base_ts=$(date -u -d "$(printf '%s' "$cmp" | jq -r '.base_commit.commit.committer.date // empty' 2>/dev/null | tr -d '\r')" +%s 2>/dev/null)
+  now_ts=$(date -u +%s)
+
+  # THE CHEAP ANSWER FIRST. The compare response already carries the union of
+  # every file changed across the range, so a range that touches no released
+  # surface at all is settled without a single further call — which is the
+  # common case on a documentation-only day. Only when the union is complete,
+  # though: the endpoint caps `files` at 300, and "no match in the first 300"
+  # is not "no match".
+  local nfiles nmatch
+  nfiles=$(printf '%s' "$cmp" | jq -r '(.files // []) | length' 2>/dev/null | tr -d '\r')
+  nmatch=$(printf '%s' "$cmp" | jq -r '(.files // [])[].filename // empty' 2>/dev/null \
+           | tr -d '\r' | grep -cE "$RELEASED_SURFACE")
+  if [ -n "$nfiles" ] && [ "$nfiles" -lt 300 ] 2>/dev/null && [ "${nmatch:-0}" = "0" ]; then
+    printf 'tag_readable=1;backlog=0;backlog_hours=0'
+    return 0
+  fi
+
+  # Otherwise one commit at a time, OLDEST FIRST — which is the order compare
+  # returns them in, and the order the rule needs, because the finding is about
+  # the oldest thing waiting rather than how many things are waiting.
+  local entries
+  entries=$(printf '%s' "$cmp" \
+    | jq -r '(.commits // [])[] | "\(.sha) \(.commit.committer.date)"' 2>/dev/null | tr -d '\r')
+  [ -z "$entries" ] && { printf 'tag_readable=1'; return 0; }
+  local -a list=()
+  mapfile -t list <<< "$entries"
+
+  local entry csha cdate cts hits n=0 count=0 oldest="" capped=0
+  for entry in "${list[@]}"; do
+    [ -z "$entry" ] && continue
+    n=$((n + 1))
+    if [ "$n" -gt "$BACKLOG_SCAN_MAX" ]; then capped=1; break; fi
+    csha="${entry%% *}"
+    cdate="${entry#* }"
+    hits=$(api "repos/$OWNER/$repo/commits/$csha" \
+           | jq -r '(.files // [])[].filename // empty' 2>/dev/null | tr -d '\r' \
+           | grep -cE "$RELEASED_SURFACE")
+    [ "${hits:-0}" -gt 0 ] 2>/dev/null || continue
+    count=$((count + 1))
+    if [ -z "$oldest" ]; then
+      cts=$(date -u -d "$cdate" +%s 2>/dev/null)
+      [ -z "$cts" ] && continue
+      [ -n "$base_ts" ] && [ "$cts" -lt "$base_ts" ] 2>/dev/null && cts="$base_ts"
+      oldest=$(( (now_ts - cts) / 3600 ))
+      [ "$oldest" -lt 0 ] && oldest=0
+    fi
+  done
+
+  if [ -n "$oldest" ]; then
+    printf 'tag_readable=1;backlog=%s;backlog_hours=%s' "$count" "$oldest"
+  elif [ "$capped" = "1" ]; then
+    # Walked the cap and found nothing released yet, with more to go. The count
+    # is real and the age is not known, so it is reported WITHOUT an age and the
+    # rule warns — never as a young backlog, and never as an empty one.
+    printf 'tag_readable=1;backlog=%s' "$ahead"
+  else
+    printf 'tag_readable=1;backlog=0;backlog_hours=0'
+  fi
+}
+
 facts_for() {
   local repo="$1" tier="$2" want="$3"
   local lane guard reaper workflows
@@ -245,6 +402,13 @@ facts_for() {
 
     facts="$facts;checks_match=$(checks_agree "$lane" "$repo")"
     facts="$facts;ruleset=$(api "repos/$OWNER/$repo/rulesets" | jq -r 'if type=="array" then (if length>0 then 1 else 0 end) else empty end' 2>/dev/null)"
+  fi
+
+  # The source repository is the only one with an unreleased backlog to have:
+  # it is what every other repository pins. Collected only here, because these
+  # are several API calls and they answer a question no other tier can ask.
+  if [ "$tier" = "source" ]; then
+    facts="$facts;backlog_max_hours=$BACKLOG_MAX_HOURS;$(backlog_facts "$repo")"
   fi
 
   if [ "$tier" = "pool" ]; then
