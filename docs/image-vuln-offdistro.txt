@@ -184,6 +184,10 @@ CVE-2026-64269 linux-kernel
 # This records what the image CONTAINS. It is not a finding that these are
 # unreachable: the CI hosts BOOT this kernel, so a local-privilege-escalation in
 # it is exercisable by anything that can run code in a job on the host.
+#
+# 2026-09-19: "no base-image roll clears them" was true when written and is not
+# true now — the roll to the 7.0 HWE kernel (next section) stopped 44 of these
+# from matching. They are kept rather than pruned; see below for why.
 CVE-2026-64046 linux-kernel Ubuntu priority medium on linux-gcp 6.17.0-1022.25, no fixed package released; grype rated it critical off the kernel binary and compared upstream 5.5,5.10.258,5.15.209,6.1.175,6.6.142,6.12.92,6.18.34,7.0.11 against an Ubuntu ABI revision. Reviewed 2026-09-05 (build 89857a70).
 CVE-2026-64047 linux-kernel Ubuntu priority medium on linux-gcp 6.17.0-1022.25, no fixed package released; grype rated it critical off the kernel binary and compared upstream 5.5,5.10.258,5.15.209,6.1.175,6.6.142,6.12.92,6.18.34,7.0.11 against an Ubuntu ABI revision. Reviewed 2026-09-05 (build 89857a70).
 CVE-2026-64055 linux-kernel Ubuntu priority medium on linux-gcp 6.17.0-1022.25, no fixed package released; grype rated it critical off the kernel binary and compared upstream 5.10.258,5.15.209,6.1.175,6.6.142,6.12.92,6.18.34,7.0.11 against an Ubuntu ABI revision. Reviewed 2026-09-05 (build 89857a70).
@@ -210,6 +214,36 @@ CVE-2026-64397 linux-kernel Ubuntu priority medium on linux-gcp 6.17.0-1022.25, 
 CVE-2026-64399 linux-kernel Ubuntu priority medium on linux-gcp 6.17.0-1022.25, no fixed package released; grype rated it critical off the kernel binary and compared upstream 6.1.178,6.6.145,6.12.96,6.18.39,7.1.4 against an Ubuntu ABI revision. Reviewed 2026-09-05 (build 89857a70).
 CVE-2026-64439 linux-kernel Ubuntu priority medium on linux-gcp 6.17.0-1022.25, no fixed package released; grype rated it critical off the kernel binary and compared upstream 6.18.39,7.1.4 against an Ubuntu ABI revision. Reviewed 2026-09-05 (build 89857a70).
 CVE-2026-64450 linux-kernel Ubuntu priority medium on linux-gcp 6.17.0-1022.25, no fixed package released; grype rated it critical off the kernel binary and compared upstream 5.10.261,5.15.212,6.1.178,6.6.145,6.12.96,6.18.39,7.1.4 against an Ubuntu ABI revision. Reviewed 2026-09-05 (build 89857a70).
+# ── linux-kernel — new pairs from the 2026-09-19 scan (build e8712ba0) ───────
+#
+# This time the kernel DID change. The base image rolled from
+# `ubuntu-2404-noble-amd64-v20260903` to `...-v20260918`, and with it the HWE
+# kernel: `linux-gcp 6.17.0-1022.25` -> `linux-gcp 7.0.0-1011.11~24.04.1`,
+# booting `linux-modules-7.0.0-1011-gcp`. Still noble; still the newest image in
+# the `ubuntu-2404-lts-amd64` family. Ubuntu marks `linux-gcp-6.17` on noble
+# "Ignored end of life, was needed", which is what that rebase was for.
+#
+# One rebase produced BOTH halves of that day's report — these 4 new pairs and
+# 44 entries "no longer seen" — and neither half is a change in what this image
+# vendors. The 44 are 6.17-era ids the 7.0 binary no longer matches; they are
+# left in place, because a pruned pair that reappears is a red build and a stale
+# line costs nothing. Expect the same shape in both directions at the next roll.
+#
+# The 4 below are the group's own rationale in its strongest form. For every one
+# of them, Ubuntu's data on the INSTALLED deb says this kernel is fine — three
+# "Not affected" on noble `linux-gcp`, one fixed five ABI revisions ago — while
+# grype, reading a version string out of the kernel binary and comparing it to
+# upstream, rates the same CVE critical. The deb side and the binary side of the
+# same scan disagree, and the deb side is the one consulting Ubuntu.
+#
+# Recorded per line: Ubuntu's priority, Ubuntu's status for noble `linux-gcp`,
+# and the upstream versions grype compared against.
+CVE-2026-53055 linux-kernel Ubuntu priority high; noble linux-gcp "Not affected", and this image runs 7.0.0-1011.11~24.04.1; grype rated it critical off the kernel binary and compared upstream 6.18.33,7.0.10 against an Ubuntu ABI revision. Reviewed 2026-09-19 (build e8712ba0).
+CVE-2026-64122 linux-kernel Ubuntu priority medium; noble linux-gcp "Not affected", and this image runs 7.0.0-1011.11~24.04.1; grype rated it critical off the kernel binary and compared upstream 6.18.34,7.0.11 against an Ubuntu ABI revision. Reviewed 2026-09-19 (build e8712ba0).
+CVE-2026-64136 linux-kernel Ubuntu priority medium; noble linux-gcp fixed in 6.8.0-1067.75 and this image runs 7.0.0-1011.11~24.04.1, so the fix is long installed; grype rated it critical off the kernel binary and compared upstream 6.6.142,6.12.92,6.18.34,7.0.11 against an Ubuntu ABI revision. Reviewed 2026-09-19 (build e8712ba0).
+CVE-2026-64410 linux-kernel Ubuntu priority medium; noble linux-gcp "Not affected", and this image runs 7.0.0-1011.11~24.04.1; grype rated it critical off the kernel binary and compared upstream 7.1.4 against an Ubuntu ABI revision. Reviewed 2026-09-19 (build e8712ba0).
+
+
 # ── golang.org/x/crypto — vendored in dockerd / containerd / snapd ───────────
 GHSA-5cgq-3rg8-m6cv golang.org/x/crypto
 GHSA-89gr-r52h-f8rx golang.org/x/crypto
