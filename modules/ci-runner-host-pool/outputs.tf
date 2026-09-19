@@ -53,17 +53,24 @@ output "controller_zone" {
 output "pool_descriptor" {
   description = "This pool as one row of a controller's `ci-pools` table. Feed to modules/ci-runner-controller."
   value = {
-    name                     = var.name
-    mig                      = google_compute_region_instance_group_manager.hosts.name
-    region                   = var.region
-    slots                    = var.slots_per_host
-    min_hosts                = var.min_hosts
-    max_hosts                = var.max_hosts
-    drain_grace_seconds      = var.drain_grace_seconds
-    register_grace_seconds   = var.register_grace_seconds
-    orphan_confirm_ticks     = var.orphan_confirm_ticks
-    recycle_max_unavailable  = var.recycle_max_unavailable
-    host_os                  = var.host_os
+    name                    = var.name
+    mig                     = google_compute_region_instance_group_manager.hosts.name
+    region                  = var.region
+    slots                   = var.slots_per_host
+    min_hosts               = var.min_hosts
+    max_hosts               = var.max_hosts
+    drain_grace_seconds     = var.drain_grace_seconds
+    register_grace_seconds  = var.register_grace_seconds
+    orphan_confirm_ticks    = var.orphan_confirm_ticks
+    recycle_max_unavailable = var.recycle_max_unavailable
+    host_os                 = var.host_os
+
+    # Carried rather than left to the parser's default for the same reason
+    # `role` is: the parser defaults it to false, and false is right for a pool
+    # that says nothing — but a pool that has been switched ON must not be
+    # silently switched off again by moving to a shared controller.
+    recycle_cordon_stops_agents = var.recycle_cordon_stops_agents
+
     mints_registration_token = var.controller_mints_registration_token
     runner_labels            = local.runner_labels
 

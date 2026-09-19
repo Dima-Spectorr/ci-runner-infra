@@ -520,6 +520,18 @@ resource "google_compute_instance_template" "host" {
     "ci-pool"                = var.name
     "ci-metric-prefix"       = var.metric_prefix
 
+    # THE CORDON FLAG, declared empty so the key exists from boot (#948).
+    #
+    # Terraform never sets it to anything else — the CONTROLLER writes
+    # `ci-cordon=1` onto one INSTANCE with `add-metadata` when it cordons that
+    # host, and instances are not managed here, so there is nothing for the two
+    # writers to fight over. Declaring it is worth the line anyway: the host's
+    # slot sweep reads it every 30 seconds, and a key that exists reads as an
+    # empty string rather than as a 404 the reader has to tell apart from a
+    # metadata server that is briefly unreachable. Empty means "not cordoned",
+    # which is also what a host booted from an older template gets.
+    "ci-cordon" = ""
+
     # Job credentials. The broker source travels as metadata rather than being
     # baked into the image, so ONE image keeps serving every pool while the
     # broker stays reviewable and versioned with the module.
@@ -911,8 +923,14 @@ resource "google_compute_instance_template" "controller" {
     "ci-register-grace-seconds"  = tostring(var.register_grace_seconds)
     "ci-orphan-confirm-ticks"    = tostring(var.orphan_confirm_ticks)
     "ci-recycle-max-unavailable" = tostring(var.recycle_max_unavailable)
-    "ci-poll-seconds"            = tostring(var.poll_interval_seconds)
-    "ci-demand-budget-seconds"   = tostring(var.demand_budget_seconds)
+    # Whether a cordon also tells the host to stop its own idle agents, which is
+    # what stops the held slot being handed another job (#948). Rendered as the
+    # literal "true"/"false" the pool table compares against, never as a bare
+    # bool: in jq the STRING "false" is truthy, and this key arms a mechanism
+    # that takes runner agents down.
+    "ci-recycle-cordon-stops-agents" = tostring(var.recycle_cordon_stops_agents)
+    "ci-poll-seconds"                = tostring(var.poll_interval_seconds)
+    "ci-demand-budget-seconds"       = tostring(var.demand_budget_seconds)
     # How much of that budget's work fits in it. See demand_fetch_concurrency.
     "ci-demand-fetch-concurrency" = tostring(var.demand_fetch_concurrency)
     "ci-metric-prefix"            = var.metric_prefix

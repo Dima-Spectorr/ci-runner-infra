@@ -93,7 +93,8 @@ FULL='[{"name":"linux-ci","mig":"ci-linux-mig","region":"europe-west4",
   "register_grace_seconds":602,"orphan_confirm_ticks":4,
   "recycle_max_unavailable":2,"host_os":"linux",
   "mints_registration_token":false,"role":"ci","beacon_interval":31,
-  "pin_orphan_grace_seconds":903,"runner_labels":"self-hosted,linux-ci,Repo"}]'
+  "pin_orphan_grace_seconds":903,"runner_labels":"self-hosted,linux-ci,Repo",
+  "recycle_cordon_stops_agents":true}]'
 
 # --- the column-order contract ------------------------------------------------
 # controller-startup.sh reads these rows POSITIONALLY. Appending a column is
@@ -118,6 +119,7 @@ want_field "column 13 is role" 13 ci
 want_field "column 14 is beacon_interval" 14 31
 want_field "column 15 is pin_orphan_grace_seconds" 15 903
 want_field "column 16 is runner_labels" 16 "self-hosted,linux-ci,Repo"
+want_field "column 17 is recycle_cordon_stops_agents" 17 true
 
 # --- the four-pool shape this table exists for --------------------------------
 # Order is contract, not incidental: the tick walks the table in order, and the
@@ -174,6 +176,21 @@ want_field 'the string "false" does not arm token minting' 12 false
 run '[{"name":"p","mig":"m","region":"r","runner_labels":"a",
   "mints_registration_token":true}]'
 want_field "a real true does arm token minting" 12 true
+
+# The same trap, one column further along and with a sharper edge (#948). This
+# column arms a cordon that STOPS RUNNER AGENTS on the host, so a quoted boolean
+# is not a wrong number, it is capacity leaving the pool on the next recycle.
+# And a pool that says NOTHING must read false: v5 is main, so the day this
+# merges every consuming repository is running the new parser against a table
+# written before the column existed.
+run '[{"name":"p","mig":"m","region":"r","runner_labels":"a"}]'
+want_field "a pool that never heard of the cordon flag reads false" 17 false
+run '[{"name":"p","mig":"m","region":"r","runner_labels":"a",
+  "recycle_cordon_stops_agents":"false"}]'
+want_field 'the string "false" does not arm the host-side cordon' 17 false
+run '[{"name":"p","mig":"m","region":"r","runner_labels":"a",
+  "recycle_cordon_stops_agents":true}]'
+want_field "a real true does arm the host-side cordon" 17 true
 
 # --- rejections, one per validation branch ------------------------------------
 # Each of these is a row the controller must refuse to act on, and must SAY it

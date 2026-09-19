@@ -46,6 +46,9 @@ variable "pools" {
     role                     = optional(string)
     beacon_interval          = optional(number)
     pin_orphan_grace_seconds = optional(number)
+    # Per pool, not per controller (#948): this arms a mechanism that stops
+    # runner agents, and it is rolled out one pool at a time.
+    recycle_cordon_stops_agents = optional(bool)
   }))
 
   validation {

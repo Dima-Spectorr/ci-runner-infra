@@ -38,27 +38,50 @@
 # Nothing is killed. The host simply stops accepting work and leaves when it is
 # empty.
 #
-# THE INVARIANT THE CORDON ACTUALLY PROVIDES — and the one it does NOT.
+# THE HELD SLOT IS NOT "OTHER", AND THIS COMMENT USED TO SAY IT WAS (#948).
 #
-# PROVIDES: no job is ever interrupted, and a slot once removed from the pool
-# never comes back.
+# It read "no new job can ever reach this host again because every other slot is
+# gone from the pool". "every OTHER slot" was load-bearing and wrong. The slot
+# GitHub refused to deregister is still REGISTERED — the 422 protects the job on
+# it, it does not take the agent out of the scheduler — so the moment that job
+# lands the slot is an ordinary, eligible, long-polling runner again.
 #
-# DOES NOT PROVIDE: "no new job can ever reach this host again." That claim was
-# asserted here, and it is false. The HELD slot is not one of the "other" slots
-# the cordon removed — it is still registered with GitHub, still answering the
-# pool's labels, and the moment its job lands it is eligible for the next one.
-# Under sustained demand it can be handed work indefinitely, busy never reaches
-# 0, the retire phase is never entered, and the host is cordoned forever with
-# its capacity gone from the pool. That is the livelock in issue #948.
+# On an idle pool that is invisible: the next tick reads busy=0 and retires. On
+# a SATURATED one it is a livelock, and a self-reinforcing one, because the
+# cordon removed this host's other slots from a pool that already has a backlog:
+# fewer slots against the same queue means the survivors — including the held
+# one — are busy a larger fraction of the time, which makes an idle observation
+# LESS likely, which keeps the cordon from completing. Rule 5 below then exempts
+# an already-cordoned host from the budget, so with max_unavailable=1 one stuck
+# host pins every other host in its pool on the stale template too. Measured on
+# 2026-09-19: the held slot took new work 31 minutes after being cordoned, and
+# again at 63 minutes, while 18 runs sat queued.
 #
-# The cordon is re-issued every tick, which is what makes it eventually
-# convergent on an idle pool and NOT convergent on a busy one. As of this
-# writing the behavioural fix is still open on #948; what exists today is the
-# measurement — cordon_host() publishes
-# ci_recycle_verdicts{outcome=cordon-no-progress} for a cordon that has removed
-# nothing since it started, so the state is visible instead of silent. Do not
-# re-add the stronger claim to this comment without the host-side guard that
-# would make it true.
+# The tick interval bounds nothing here. `cordon_host` calls the exposure "up to
+# one poll interval", but that is a SAMPLING RATE against a Poisson arrival
+# process, not a deadline — every sample can miss, and for an hour they all did.
+#
+# THE RULE BELOW IS UNCHANGED, AND DELIBERATELY SO. Both directions that would
+# have changed it are dead ends: GitHub's repository-scope runner API has no
+# pause/disable/quiesce primitive at all, and a deadline that escalates to a
+# DELETE is answered 422 while one that escalates to a kill drops a running job —
+# the one thing this whole two-phase design exists to prevent. The fix is in the
+# I/O layer instead: on cordon the controller sets `ci-cordon=1` on the instance,
+# and the host's own root slot sweep stops each agent as it goes idle. A stopped
+# agent is not long-polling, so it is not a scheduling target, and it leaves the
+# repository's runner list — so `busy` reaches 0 within one JOB duration rather
+# than whenever a sample happens to land. Same rule, an input that now converges.
+# Behind `recycle_cordon_stops_agents`, default false.
+#
+# WHAT THE CORDON PROVIDES, STATED WITHOUT THE OVERCLAIM: no job is ever
+# interrupted, and a slot once removed from the pool never comes back. It does
+# NOT provide "no new job can ever reach this host again" on its own — only the
+# host-side half makes that true, and only on a pool whose hosts are new enough
+# to have the sweep that reads the flag. So the measurement added in #951 stays:
+# cordon_host() publishes ci_recycle_verdicts{outcome=cordon-no-progress} for a
+# cordon that has removed nothing since it started. With the flag off, or on a
+# pool still running older hosts, that series is the livelock being visible
+# rather than silent. Do not re-add the stronger claim unconditionally.
 #
 # ROLLING, NOT ALL AT ONCE. Cordoning is not free: a cordoned host's idle slots
 # leave the pool immediately, so cordoning every stale host at once removes the
