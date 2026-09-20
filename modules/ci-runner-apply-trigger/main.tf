@@ -118,11 +118,18 @@ locals {
       echo "alert policies: this project matches the fleet set"
     else
       echo "WARNING: could not bring the alert policies up to date (exit $rc)."
-      echo "This does NOT fail the apply. The usual cause is that the build"
-      echo "account lacks roles/monitoring.alertPolicyEditor and"
-      echo "roles/monitoring.notificationChannelEditor in this project; the"
-      echo "other is a project with no email notification channel yet, which"
-      echo "needs one manual run with --email <addr> to bootstrap."
+      echo "This does NOT fail the apply, so nothing else will ever report it:"
+      echo "read the lines ABOVE this one, which name what was refused."
+      echo "Known causes, in the order they bite:"
+      echo "  logging.logMetrics create/get/list/update — the log-based metrics."
+      echo "    Grant the whole custom role ciRunnerApplyLogMetrics, not just"
+      echo "    create: the script reads each metric before it writes it."
+      echo "    See docs/applying-runner-infra.md."
+      echo "  roles/monitoring.viewer           — reads descriptors and policies."
+      echo "  roles/monitoring.alertPolicyEditor — writes the policies."
+      echo "  roles/monitoring.notificationChannelEditor — first channel only."
+      echo "The remaining cause is a project with no email notification channel"
+      echo "yet, which needs one manual run with --email <addr> to bootstrap."
     fi
   EOT
 
