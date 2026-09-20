@@ -668,11 +668,17 @@ ensure_log_metric() {  # <name> <description> <filter>
     echo "$PROJECT: ${verb}d  log metric $name"
     return 0
   fi
+  # This branch catches EVERY failure of the write, not only a 403 — a bad
+  # filter, a transient API error and a missing grant all land here. So lead
+  # with gcloud's own words and make the IAM advice conditional on them;
+  # asserting "you lack a permission" would send an operator hunting a grant
+  # they already hold while the real error scrolls past.
+  echo "$PROJECT: cannot $verb log metric $name — the policy that names it is deferred below, the rest still sync" >&2
+  sed -n '1,5p' "$tmp/logmetric.err" >&2
   # Name the permission for the verb that was actually refused: telling an
   # operator to grant `create` when `update` was denied sends them to check a
   # grant they already have.
-  echo "$PROJECT: cannot $verb log metric $name (needs logging.logMetrics.$verb — custom role ciRunnerApplyLogMetrics, which carries create/get/list/update) — the policy that names it is deferred below, the rest still sync" >&2
-  sed -n '1,5p' "$tmp/logmetric.err" >&2
+  echo "  If that error is PERMISSION_DENIED, the build account needs logging.logMetrics.$verb — grant the whole custom role ciRunnerApplyLogMetrics (create/get/list/update), not $verb alone. Any other error above is not an IAM problem." >&2
   log_metric_denied="${log_metric_denied}${name}"$'\n'
   return 0
 }
@@ -924,10 +930,11 @@ if [ -n "$deferred" ]; then
     echo "$PROJECT: and this run could not write these LOG-BASED metrics:" >&2
     printf '%s' "$log_metric_denied" | sed 's/^/  /' >&2
     echo "A policy above that names one of them will keep deferring until the" >&2
-    echo "build account can write log metrics — logMetrics create/get/list/" >&2
-    echo "update, the whole custom role ciRunnerApplyLogMetrics. That is a" >&2
-    echo "PERMISSION problem, not the 'come back once a host has published'" >&2
-    echo "case, and re-running alone will not clear it." >&2
+    echo "write succeeds, and re-running alone will not clear it — this is NOT" >&2
+    echo "the 'come back once a host has published' case. The error printed by" >&2
+    echo "the metric step above says which failure it was; if it is" >&2
+    echo "PERMISSION_DENIED, grant the whole custom role" >&2
+    echo "ciRunnerApplyLogMetrics — logMetrics create/get/list/update." >&2
   fi
   exit 1
 fi
@@ -939,7 +946,8 @@ if [ -n "$log_metric_denied" ]; then
   echo >&2
   echo "$PROJECT: could not write these log-based metrics:" >&2
   printf '%s' "$log_metric_denied" | sed 's/^/  /' >&2
-  echo "Every alert policy WAS synced. Grant the build account" >&2
+  echo "Every alert policy WAS synced. The error printed by the metric step" >&2
+  echo "above says why; if it is PERMISSION_DENIED, grant the build account" >&2
   echo "the whole custom role ciRunnerApplyLogMetrics — logMetrics" >&2
   echo "create/get/list/update, not create alone: this script reads each" >&2
   echo "metric before it writes it." >&2
