@@ -58,9 +58,15 @@ run_case() { # <ok|denied>  -> stdout of the subshell; rc is the subshell's
   local behaviour="$1"
   (
     set -euo pipefail
+    # All three are read by the lifted function through `eval`, and the stub
+    # replaces the gcloud wrapper it calls — none of which shellcheck can see.
+    # shellcheck disable=SC2034
     PROJECT=testproject
+    # shellcheck disable=SC2034
     DRY=0
+    # shellcheck disable=SC2034
     tmp="$tmpd"
+    # shellcheck disable=SC2317
     g() {
       if [ "$behaviour" = "denied" ]; then
         # A sentinel the script's OWN message cannot contain. Asserting on the
@@ -84,9 +90,11 @@ run_case() { # <ok|denied>  -> stdout of the subshell; rc is the subshell's
 out="$(run_case denied)"; rc=$?
 err="$(cat "$tmpd/stderr.txt")"
 
-[ "$rc" = "0" ] \
-  && ok "a denied log metric leaves the script running" \
-  || bad "a denied log metric ended the script (rc=$rc) — all fourteen policies would be skipped"
+if [ "$rc" = "0" ]; then
+  ok "a denied log metric leaves the script running"
+else
+  bad "a denied log metric ended the script (rc=$rc) — all fourteen policies would be skipped"
+fi
 
 case "$out" in
   *REACHED_POLICY_LOOP*) ok "execution continues to the policy loop" ;;
@@ -112,9 +120,11 @@ esac
 # ── ok: the happy path must stay silent and record nothing ───────────────────
 out="$(run_case ok)"; rc=$?
 
-[ "$rc" = "0" ] \
-  && ok "a writable log metric succeeds" \
-  || bad "the happy path failed (rc=$rc)"
+if [ "$rc" = "0" ]; then
+  ok "a writable log metric succeeds"
+else
+  bad "the happy path failed (rc=$rc)"
+fi
 
 case "$out" in
   *'DENIED=[]'*) ok "nothing is recorded when the metric writes cleanly" ;;
@@ -136,21 +146,25 @@ fi
 blockrc() { # <log_metric_denied value> -> rc
   (
     set -euo pipefail
+    # Read by the lifted block through `eval`, which shellcheck cannot follow.
+    # shellcheck disable=SC2034
     PROJECT=testproject
     log_metric_denied="$1"
     eval "$BLOCK"
   ) >/dev/null 2>&1
 }
 
-blockrc "ci_egress_denied"$'\n'
-[ "$?" = "1" ] \
-  && ok "a denial with nothing deferred still fails the run" \
-  || bad "a denied metric with no deferred policy exited 0 — the run reports success while an alert is missing"
+if blockrc "ci_egress_denied"$'\n'; then
+  bad "a denied metric with no deferred policy exited 0 — the run reports success while an alert is missing"
+else
+  ok "a denial with nothing deferred still fails the run"
+fi
 
-blockrc ""
-[ "$?" = "0" ] \
-  && ok "a clean run is not failed by the denial block" \
-  || bad "the denial block failed a run that denied nothing"
+if blockrc ""; then
+  ok "a clean run is not failed by the denial block"
+else
+  bad "the denial block failed a run that denied nothing"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

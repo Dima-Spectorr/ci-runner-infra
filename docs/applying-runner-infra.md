@@ -223,7 +223,7 @@ non-zero saying so.
 cannot stop a fleet from receiving runner configuration. That is the right
 trade, and it means the exit code is for a human running the script by hand —
 it will not turn anything red. Until the fleet audit counts policies per project
-(#978), the check is manual and it is a **count, not a glance**: fourteen is the
+(#979), the check is manual and it is a **count, not a glance**: fourteen is the
 expected number of `CI runners / *` policies in a project, and thirteen is what
 a project has when this grant is missing and someone bootstrapped the rest by
 hand.
