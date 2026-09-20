@@ -934,7 +934,8 @@ if [ -n "$deferred" ]; then
     echo "the 'come back once a host has published' case. The error printed by" >&2
     echo "the metric step above says which failure it was; if it is" >&2
     echo "PERMISSION_DENIED, grant the whole custom role" >&2
-    echo "ciRunnerApplyLogMetrics — logMetrics create/get/list/update." >&2
+    echo "ciRunnerApplyLogMetrics, which carries the four permissions" >&2
+    echo "logging.logMetrics.create/get/list/update." >&2
   fi
   exit 1
 fi
@@ -948,8 +949,8 @@ if [ -n "$log_metric_denied" ]; then
   printf '%s' "$log_metric_denied" | sed 's/^/  /' >&2
   echo "Every alert policy WAS synced. The error printed by the metric step" >&2
   echo "above says why; if it is PERMISSION_DENIED, grant the build account" >&2
-  echo "the whole custom role ciRunnerApplyLogMetrics — logMetrics" >&2
-  echo "create/get/list/update, not create alone: this script reads each" >&2
-  echo "metric before it writes it." >&2
+  echo "the whole custom role ciRunnerApplyLogMetrics — all four of" >&2
+  echo "logging.logMetrics.create/get/list/update, not create alone:" >&2
+  echo "this script reads each metric before it writes it." >&2
   exit 1
 fi

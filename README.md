@@ -958,7 +958,7 @@ that has several. The step never fails the apply: a build account
 missing `roles/monitoring.alertPolicyEditor` or
 `roles/monitoring.notificationChannelEditor` gets a warning naming the roles.
 Those two rather than `roles/monitoring.editor` (#548) — the step writes alert
-policies and, on a project’s first run, the one channel they point at, and
+policies and, on a project's first run, the one channel they point at, and
 nothing else `editor` would also open up. It also writes one *log-based* metric,
 which is a Logging object and not a Monitoring one, so it needs
 `logging.logMetrics.create/get/list/update` as well — the whole custom role

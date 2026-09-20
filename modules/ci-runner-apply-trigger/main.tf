@@ -121,7 +121,7 @@ locals {
       echo "This does NOT fail the apply, so nothing else will ever report it:"
       echo "read the lines ABOVE this one, which name what was refused."
       echo "Known causes, in the order they bite:"
-      echo "  logging.logMetrics create/get/list/update — the log-based metrics."
+      echo "  logging.logMetrics.create/get/list/update — the log-based metrics."
       echo "    Grant the whole custom role ciRunnerApplyLogMetrics, not just"
       echo "    create: the script reads each metric before it writes it."
       echo "    See docs/applying-runner-infra.md."
