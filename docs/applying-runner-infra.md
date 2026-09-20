@@ -186,11 +186,48 @@ done
 
 **Two narrow roles rather than `roles/monitoring.editor`,** which is what this
 document asked for until 2026-08-29 (#548). The step writes exactly two kinds of
-object: the alert policies, and — on the first run in a project, where none
-exists yet — the one email notification channel they all point at. `editor`
-grants both of those and also dashboards, uptime checks, log-based metrics,
-monitoring groups, and services/SLOs, none of which `ensure-alert-policies.sh`
-touches. The pair above is the same capability with none of that surface.
+Monitoring object: the alert policies, and — on the first run in a project,
+where none exists yet — the one email notification channel they all point at.
+`editor` grants both of those and also dashboards, uptime checks, log-based
+metrics, monitoring groups, and services/SLOs. The pair above is the same
+capability with none of that surface.
+
+**It also writes one thing that is not a Monitoring object at all** (#978).
+`ci_egress_denied` is a *log-based* metric, so it needs
+`logging.logMetrics.create/get/list/update` — the custom
+`ciRunnerApplyLogMetrics` already listed in the arrive-one-project-at-a-time
+table below (found 2026-08-31), not a `monitoring.*` role. It is one role, not
+one permission: the script calls `describe` before it writes, and an account
+with `create` alone fails that probe silently, takes the create path against a
+metric that already exists, and is refused for `ALREADY_EXISTS` forever.
+Narrowing away from
+`roles/monitoring.editor` in #548 dropped it silently, because `editor` had been
+covering it by accident; #548 and the first log-based metric shipped in the
+*same release*, v5.85.0.
+
+The cost was the whole feature, everywhere. The script creates its log metrics
+before it syncs the policies, and it runs under `set -e`, so the missing grant
+ended every run before the policy loop: measured 2026-09-20, **five of the ten
+pool projects were syncing zero of fourteen policies**, including ones whose
+apply had been green throughout. (The other five had been granted the role on
+2026-08-31 and were at fourteen.) The step is non-blocking by design, so
+nothing turned red for any of it — and the one policy nobody had bootstrapped
+by hand, `applystale`, which reports a project that has stopped applying, was
+therefore missing from all five.
+
+Since #978 the script fails soft here: a denied log metric defers only the
+policy that names it, the other thirteen still sync, and the *script* exits
+non-zero saying so.
+
+**Nothing consumes that exit code today.** The build step absorbs it
+(`… || rc=$?`) and prints a warning, deliberately, so that a monitoring problem
+cannot stop a fleet from receiving runner configuration. That is the right
+trade, and it means the exit code is for a human running the script by hand —
+it will not turn anything red. Until the fleet audit counts policies per project
+(#979), the check is manual and it is a **count, not a glance**: fourteen is the
+expected number of `CI runners / *` policies in a project, and thirteen is what
+a project has when this grant is missing and someone bootstrapped the rest by
+hand.
 
 The channel half is easy to miss, and missing it is worse than over-granting:
 `monitoring.viewer` (already in the loop above) can *read* channels, so a project

@@ -954,11 +954,20 @@ four of the ten pool projects had no CI alert policies at all, which looks from
 inside exactly like a project with nothing wrong. `--email` is optional and
 omitting it adopts the channel the project already pages; an address is needed
 only to bootstrap a project that has never had one, or to disambiguate a project
-that has several. The step never fails the apply: a build account without
-`roles/monitoring.alertPolicyEditor` and `roles/monitoring.notificationChannelEditor`
-gets a warning naming the roles. Those two rather than `roles/monitoring.editor`
-(#548) — the step writes alert policies and, on a project's first run, the one
-channel they point at, and nothing else `editor` would also open up.
+that has several. The step never fails the apply: a build account
+missing `roles/monitoring.alertPolicyEditor` or
+`roles/monitoring.notificationChannelEditor` gets a warning naming the roles.
+Those two rather than `roles/monitoring.editor` (#548) — the step writes alert
+policies and, on a project's first run, the one channel they point at, and
+nothing else `editor` would also open up. It also writes one *log-based* metric,
+which is a Logging object and not a Monitoring one, so it needs
+`logging.logMetrics.create/get/list/update` as well — the whole custom role
+`ciRunnerApplyLogMetrics`, not just `create`, because the script reads the
+metric before writing it. **That is the grant #548 dropped by accident** (#978):
+the script writes its log metrics before the policy loop and runs under
+`set -e`, so five of the ten pool projects were syncing zero of fourteen
+policies until 2026-09-20, including ones whose apply had been green
+throughout.
 
 **"Idempotently" is load-bearing, and it was aspirational until #625.** Updating
 an alert policy closes its open incidents; the next evaluation opens new ones and

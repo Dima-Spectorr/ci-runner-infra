@@ -636,17 +636,79 @@ EOF
 #
 # Created before the policy, because a policy naming a metric type Cloud
 # Monitoring has never seen is rejected outright.
+# A log metric this account may not write must NOT take the rest of the sync
+# with it, and for most of this script's life it did. Under `set -euo pipefail`
+# an unchecked failure here ends the script BEFORE the policy loop below, so a
+# single denied permission skipped all fourteen policies rather than the one
+# that needed the metric.
+#
+# Measured 2026-09-20: five of the ten pool projects — including ones whose
+# apply had been green for months — held no `logging.logMetrics.create`, so
+# `ci_egress_denied` 403'd on every run, the loop never ran in any of them, and
+# the thirteen policies that existed were residue from an older bootstrap. The
+# fourteenth, `applystale`, was added after that bootstrap and was therefore
+# MISSING FROM ALL FIVE — the alert whose whole job is to report a
+# project that has stopped applying. Two projects then stopped applying for
+# three weeks and were found by hand. The step is non-blocking by design, so
+# nothing turned red the entire time.
+#
+# Failing soft costs exactly the egress alert: the policy naming this metric is
+# answered "Cannot find metric", lands in `deferred` below, is reported by name,
+# and still exits non-zero. Blast radius now matches the cause.
+log_metric_denied=""
+
 ensure_log_metric() {  # <name> <description> <filter>
-  local name="$1" desc="$2" filter="$3"
-  if g logging metrics describe "$name" >/dev/null 2>&1; then
-    if [ "$DRY" = "1" ]; then echo "$PROJECT: would update log metric $name"; return 0; fi
-    g logging metrics update "$name" --description="$desc" --log-filter="$filter" >/dev/null
-    echo "$PROJECT: updated  log metric $name"
-  else
-    if [ "$DRY" = "1" ]; then echo "$PROJECT: would create log metric $name"; return 0; fi
-    g logging metrics create "$name" --description="$desc" --log-filter="$filter" >/dev/null
-    echo "$PROJECT: created  log metric $name"
+  local name="$1" desc="$2" filter="$3" verb=create
+  # `describe` is also the permission probe: an account that cannot read the
+  # metric cannot write it either, and both land on the create path, which
+  # reports the real error rather than a misleading "already exists".
+  g logging metrics describe "$name" >/dev/null 2>&1 && verb=update
+  if [ "$DRY" = "1" ]; then echo "$PROJECT: would $verb log metric $name"; return 0; fi
+  if g logging metrics "$verb" "$name" --description="$desc" --log-filter="$filter" >/dev/null 2>"$tmp/logmetric.err"; then
+    echo "$PROJECT: ${verb}d  log metric $name"
+    return 0
   fi
+  # This branch catches EVERY failure of the write, not only a 403 — a bad
+  # filter, a transient API error and a missing grant all land here. So lead
+  # with gcloud's own words and make the IAM advice conditional on them;
+  # asserting "you lack a permission" would send an operator hunting a grant
+  # they already hold while the real error scrolls past.
+  echo "$PROJECT: cannot $verb log metric $name — the policy that names it is deferred below, the rest still sync" >&2
+  sed -n '1,5p' "$tmp/logmetric.err" >&2
+  # This branch runs for EVERY failure of the write, so the remediation is
+  # matched against what gcloud actually said rather than listed as a menu. A
+  # menu is not free: an operator reading IAM advice under a bad-filter error
+  # audits a grant they already hold, which is the failure this whole script
+  # exists to stop producing.
+  case "$(cat "$tmp/logmetric.err")" in
+    *PERMISSION_DENIED*|*"Permission denied"*)
+      # Name the verb that was actually refused: telling an operator to grant
+      # `create` when `update` was denied sends them to a grant they have.
+      echo "  This is an IAM denial: the account needs logging.logMetrics.$verb." >&2
+      echo "  Grant the whole custom role ciRunnerApplyLogMetrics — all of" >&2
+      echo "    logging.logMetrics.create/get/list/update, not $verb alone." >&2
+      echo "  Re-running will not clear this." >&2
+      ;;
+    *ALREADY_EXISTS*|*"already exists"*)
+      # IAM too, despite never saying so, and only reachable on the create
+      # path: `describe` above is silent on failure, so an account holding
+      # `create` but not `get` fails the probe, takes the create path against
+      # a metric that is already there, and is refused forever.
+      echo "  This is also IAM, though it does not say so: the metric exists" >&2
+      echo "    but the account could not READ it (logging.logMetrics.get), so" >&2
+      echo "    the probe above fell through to create." >&2
+      echo "  Grant the whole custom role ciRunnerApplyLogMetrics — all of" >&2
+      echo "    logging.logMetrics.create/get/list/update, not create alone." >&2
+      echo "  Re-running will not clear this." >&2
+      ;;
+    *)
+      echo "  This is NOT an IAM denial — do not go grant anything yet. Check" >&2
+      echo "    the log filter this script passes, then re-run: a transient API" >&2
+      echo "    fault clears on its own." >&2
+      ;;
+  esac
+  log_metric_denied="${log_metric_denied}${name}"$'\n'
+  return 0
 }
 
 ensure_log_metric ci_egress_denied \
@@ -891,5 +953,28 @@ if [ -n "$deferred" ]; then
   printf '%s' "$deferred" | sed 's/^/  /' >&2
   echo "Every other policy WAS synced. Re-run once a host has published the" >&2
   echo "series — a descriptor appears on its first point, then within 10 minutes." >&2
+  if [ -n "$log_metric_denied" ]; then
+    echo >&2
+    echo "$PROJECT: and this run could not write these LOG-BASED metrics:" >&2
+    printf '%s' "$log_metric_denied" | sed 's/^/  /' >&2
+    echo "A policy above that names one of them will keep deferring until the" >&2
+    echo "write succeeds. This is NOT the 'come back once a host has published'" >&2
+    echo "case above, and whether a re-run clears it depends on which failure" >&2
+    echo "it was — the metric step printed the error and the remediation for it" >&2
+    echo "at the top of this run's output. Read that rather than retrying." >&2
+  fi
+  exit 1
+fi
+
+# A denied log metric with nothing deferred still has to be non-zero. Otherwise
+# the run reports success while an alert the fleet is supposed to have is
+# missing — which is the exact shape that hid this for months.
+if [ -n "$log_metric_denied" ]; then
+  echo >&2
+  echo "$PROJECT: could not write these log-based metrics:" >&2
+  printf '%s' "$log_metric_denied" | sed 's/^/  /' >&2
+  echo "Every alert policy WAS synced. The metric step printed the error and" >&2
+  echo "the remediation for it at the top of this run's output — the fix" >&2
+  echo "differs by error, so read it there rather than assuming a grant." >&2
   exit 1
 fi
