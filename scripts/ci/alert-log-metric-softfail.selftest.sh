@@ -111,6 +111,14 @@ case "$err" in
   *) bad "stderr does not name the ciRunnerApplyLogMetrics custom role; got: $err" ;;
 esac
 
+# The stub denies `describe` too, so this is the create path — where a missing
+# `get` surfaces as ALREADY_EXISTS rather than a denial. An operator who reads
+# "not a permission problem" there goes hunting the log filter for a grant.
+case "$err" in
+  *ALREADY_EXISTS*) ok "the create path names ALREADY_EXISTS as an IAM symptom" ;;
+  *) bad "the create path does not explain ALREADY_EXISTS; got: $err" ;;
+esac
+
 # The underlying API error must survive, not be swallowed by our own message.
 case "$err" in
   *GCLOUD_STDERR_SENTINEL_7f3a*) ok "the underlying API error is surfaced" ;;

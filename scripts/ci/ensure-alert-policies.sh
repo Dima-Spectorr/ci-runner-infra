@@ -678,7 +678,22 @@ ensure_log_metric() {  # <name> <description> <filter>
   # Name the permission for the verb that was actually refused: telling an
   # operator to grant `create` when `update` was denied sends them to check a
   # grant they already have.
-  echo "  If that error is PERMISSION_DENIED, the build account needs logging.logMetrics.$verb — grant the whole custom role ciRunnerApplyLogMetrics (create/get/list/update), not $verb alone. Any other error above is not an IAM problem." >&2
+  echo "  PERMISSION_DENIED — the build account needs logging.logMetrics.$verb." >&2
+  if [ "$verb" = create ]; then
+    # ALREADY_EXISTS is the create path's IAM symptom, not a contradiction of
+    # it: the `describe` probe above is silent on failure, so an account
+    # holding `create` but not `get` falls through to create a metric that is
+    # already there and is refused forever. Only reachable on this path —
+    # printing it on the update path would send an operator after a grant that
+    # has nothing to do with what they are seeing.
+    echo "  ALREADY_EXISTS — also IAM: the metric exists but the account could" >&2
+    echo "    not READ it (logging.logMetrics.get), so the probe fell through" >&2
+    echo "    to create. Granting create alone will not clear this." >&2
+  fi
+  echo "  Either way, grant the whole custom role ciRunnerApplyLogMetrics — all" >&2
+  echo "    of logging.logMetrics.create/get/list/update, not $verb alone." >&2
+  echo "  Any other error is more likely the log filter or a transient API" >&2
+  echo "    fault than a grant; read the message above before touching IAM." >&2
   log_metric_denied="${log_metric_denied}${name}"$'\n'
   return 0
 }
