@@ -963,10 +963,11 @@ nothing else `editor` would also open up. It also writes one *log-based* metric,
 which is a Logging object and not a Monitoring one, so it needs
 `logging.logMetrics.create/get/list/update` as well — the whole custom role
 `ciRunnerApplyLogMetrics`, not just `create`, because the script reads the
-metric before writing it. **That is the grant #548 dropped by accident and
-nobody held** (#978): the script writes its log metrics before the policy loop
-and runs under `set -e`, so every project was syncing zero of fourteen policies
-until 2026-09-20, including projects whose apply had been green throughout.
+metric before writing it. **That is the grant #548 dropped by accident** (#978):
+the script writes its log metrics before the policy loop and runs under
+`set -e`, so five of the ten pool projects were syncing zero of fourteen
+policies until 2026-09-20, including ones whose apply had been green
+throughout.
 
 **"Idempotently" is load-bearing, and it was aspirational until #625.** Updating
 an alert policy closes its open incidents; the next evaluation opens new ones and

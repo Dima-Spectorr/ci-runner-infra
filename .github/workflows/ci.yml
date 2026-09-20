@@ -462,11 +462,12 @@ jobs:
 
       # The alert sync creates its log-based metrics BEFORE it syncs the
       # fourteen policies, and it runs under `set -e`. So an account that cannot
-      # write one metric skipped every policy, in every project, for months --
-      # and the apply step is non-blocking, so nothing ever turned red. The one
-      # policy nobody had bootstrapped by hand, `applystale`, therefore never
-      # existed anywhere in the fleet; it is the alert that reports a project
-      # which has stopped applying, and two projects did exactly that for three
+      # write one metric skipped every policy in that project, for months -- and
+      # the apply step is non-blocking, so nothing ever turned red. Measured
+      # 2026-09-20: five of the ten pool projects. The one policy nobody had
+      # bootstrapped by hand, `applystale`, was therefore missing from all five;
+      # it is the alert that reports a project which has stopped applying, and
+      # two projects did exactly that for three
       # weeks before a human noticed. Asserted from both sides: a denied metric
       # must not stop the run, and must still make the run fail loudly.
       - name: alert log-metric soft-fail self-test

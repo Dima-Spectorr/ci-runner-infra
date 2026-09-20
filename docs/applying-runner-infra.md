@@ -207,12 +207,13 @@ covering it by accident; #548 and the first log-based metric shipped in the
 
 The cost was the whole feature, everywhere. The script creates its log metrics
 before it syncs the policies, and it runs under `set -e`, so the missing grant
-ended every run before the policy loop: measured 2026-09-20, **five of five
-projects were syncing zero of fourteen policies**, including projects whose
-apply had been green throughout. The step is non-blocking by design, so nothing
-turned red for any of it — and the one policy nobody had bootstrapped by hand,
-`applystale`, which reports a project that has stopped applying, had therefore
-never existed anywhere in the fleet.
+ended every run before the policy loop: measured 2026-09-20, **five of the ten
+pool projects were syncing zero of fourteen policies**, including ones whose
+apply had been green throughout. (The other five had been granted the role on
+2026-08-31 and were at fourteen.) The step is non-blocking by design, so
+nothing turned red for any of it — and the one policy nobody had bootstrapped
+by hand, `applystale`, which reports a project that has stopped applying, was
+therefore missing from all five.
 
 Since #978 the script fails soft here: a denied log metric defers only the
 policy that names it, the other thirteen still sync, and the *script* exits

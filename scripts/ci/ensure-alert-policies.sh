@@ -644,10 +644,10 @@ EOF
 #
 # Measured 2026-09-20: five of the ten pool projects — including ones whose
 # apply had been green for months — held no `logging.logMetrics.create`, so
-# `ci_egress_denied` 403'd on every run, the loop never ran anywhere, and the
-# thirteen policies that existed were residue from an older bootstrap. The
-# fourteenth, `applystale`, was added after that bootstrap and had therefore
-# NEVER EXISTED ANYWHERE IN THE FLEET — the alert whose whole job is to report a
+# `ci_egress_denied` 403'd on every run, the loop never ran in any of them, and
+# the thirteen policies that existed were residue from an older bootstrap. The
+# fourteenth, `applystale`, was added after that bootstrap and was therefore
+# MISSING FROM ALL FIVE — the alert whose whole job is to report a
 # project that has stopped applying. Two projects then stopped applying for
 # three weeks and were found by hand. The step is non-blocking by design, so
 # nothing turned red the entire time.
@@ -675,25 +675,38 @@ ensure_log_metric() {  # <name> <description> <filter>
   # they already hold while the real error scrolls past.
   echo "$PROJECT: cannot $verb log metric $name — the policy that names it is deferred below, the rest still sync" >&2
   sed -n '1,5p' "$tmp/logmetric.err" >&2
-  # Name the permission for the verb that was actually refused: telling an
-  # operator to grant `create` when `update` was denied sends them to check a
-  # grant they already have.
-  echo "  PERMISSION_DENIED — the build account needs logging.logMetrics.$verb." >&2
-  if [ "$verb" = create ]; then
-    # ALREADY_EXISTS is the create path's IAM symptom, not a contradiction of
-    # it: the `describe` probe above is silent on failure, so an account
-    # holding `create` but not `get` falls through to create a metric that is
-    # already there and is refused forever. Only reachable on this path —
-    # printing it on the update path would send an operator after a grant that
-    # has nothing to do with what they are seeing.
-    echo "  ALREADY_EXISTS — also IAM: the metric exists but the account could" >&2
-    echo "    not READ it (logging.logMetrics.get), so the probe fell through" >&2
-    echo "    to create. Granting create alone will not clear this." >&2
-  fi
-  echo "  Either way, grant the whole custom role ciRunnerApplyLogMetrics — all" >&2
-  echo "    of logging.logMetrics.create/get/list/update, not $verb alone." >&2
-  echo "  Any other error is more likely the log filter or a transient API" >&2
-  echo "    fault than a grant; read the message above before touching IAM." >&2
+  # This branch runs for EVERY failure of the write, so the remediation is
+  # matched against what gcloud actually said rather than listed as a menu. A
+  # menu is not free: an operator reading IAM advice under a bad-filter error
+  # audits a grant they already hold, which is the failure this whole script
+  # exists to stop producing.
+  case "$(cat "$tmp/logmetric.err")" in
+    *PERMISSION_DENIED*|*"Permission denied"*)
+      # Name the verb that was actually refused: telling an operator to grant
+      # `create` when `update` was denied sends them to a grant they have.
+      echo "  This is an IAM denial: the account needs logging.logMetrics.$verb." >&2
+      echo "  Grant the whole custom role ciRunnerApplyLogMetrics — all of" >&2
+      echo "    logging.logMetrics.create/get/list/update, not $verb alone." >&2
+      echo "  Re-running will not clear this." >&2
+      ;;
+    *ALREADY_EXISTS*|*"already exists"*)
+      # IAM too, despite never saying so, and only reachable on the create
+      # path: `describe` above is silent on failure, so an account holding
+      # `create` but not `get` fails the probe, takes the create path against
+      # a metric that is already there, and is refused forever.
+      echo "  This is also IAM, though it does not say so: the metric exists" >&2
+      echo "    but the account could not READ it (logging.logMetrics.get), so" >&2
+      echo "    the probe above fell through to create." >&2
+      echo "  Grant the whole custom role ciRunnerApplyLogMetrics — all of" >&2
+      echo "    logging.logMetrics.create/get/list/update, not create alone." >&2
+      echo "  Re-running will not clear this." >&2
+      ;;
+    *)
+      echo "  This is NOT an IAM denial — do not go grant anything yet. Check" >&2
+      echo "    the log filter this script passes, then re-run: a transient API" >&2
+      echo "    fault clears on its own." >&2
+      ;;
+  esac
   log_metric_denied="${log_metric_denied}${name}"$'\n'
   return 0
 }
@@ -945,12 +958,10 @@ if [ -n "$deferred" ]; then
     echo "$PROJECT: and this run could not write these LOG-BASED metrics:" >&2
     printf '%s' "$log_metric_denied" | sed 's/^/  /' >&2
     echo "A policy above that names one of them will keep deferring until the" >&2
-    echo "write succeeds, and re-running alone will not clear it — this is NOT" >&2
-    echo "the 'come back once a host has published' case. The error printed by" >&2
-    echo "the metric step above says which failure it was; if it is" >&2
-    echo "PERMISSION_DENIED, grant the whole custom role" >&2
-    echo "ciRunnerApplyLogMetrics, which carries the four permissions" >&2
-    echo "logging.logMetrics.create/get/list/update." >&2
+    echo "write succeeds. This is NOT the 'come back once a host has published'" >&2
+    echo "case above, and whether a re-run clears it depends on which failure" >&2
+    echo "it was — the metric step printed the error and the remediation for it" >&2
+    echo "at the top of this run's output. Read that rather than retrying." >&2
   fi
   exit 1
 fi
@@ -962,10 +973,8 @@ if [ -n "$log_metric_denied" ]; then
   echo >&2
   echo "$PROJECT: could not write these log-based metrics:" >&2
   printf '%s' "$log_metric_denied" | sed 's/^/  /' >&2
-  echo "Every alert policy WAS synced. The error printed by the metric step" >&2
-  echo "above says why; if it is PERMISSION_DENIED, grant the build account" >&2
-  echo "the whole custom role ciRunnerApplyLogMetrics — all four of" >&2
-  echo "logging.logMetrics.create/get/list/update, not create alone:" >&2
-  echo "this script reads each metric before it writes it." >&2
+  echo "Every alert policy WAS synced. The metric step printed the error and" >&2
+  echo "the remediation for it at the top of this run's output — the fix" >&2
+  echo "differs by error, so read it there rather than assuming a grant." >&2
   exit 1
 fi

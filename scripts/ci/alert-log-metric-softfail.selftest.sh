@@ -10,11 +10,11 @@
 # and skipped ALL FOURTEEN POLICIES — not just the one policy that needs the
 # metric.
 #
-# Measured 2026-09-20 across five projects, including ones whose apply had been
-# green for months: none of the build accounts held the permission, so the
-# policy loop had never run in ANY of them. Thirteen policies existed as residue
+# Measured 2026-09-20: five of the ten pool projects, including ones whose apply
+# had been green for months, held no `logging.logMetrics.create`, so the policy
+# loop had never run in ANY of them. Thirteen policies existed as residue
 # from an older manual bootstrap; the fourteenth, `applystale`, was added after
-# that bootstrap and had therefore never existed anywhere in the fleet. That is
+# that bootstrap and was therefore missing from all five. That is
 # the alert that reports a project which has stopped receiving infrastructure —
 # so the bug deleted precisely the alarm for the outage it was causing, and two
 # projects then sat un-applied for three weeks before a human noticed.
@@ -54,7 +54,7 @@ tmpd="$(mktemp -d)"; trap 'rm -rf "$tmpd"' EXIT
 # Run the function exactly as the script runs it: under `set -euo pipefail`, in
 # a subshell, with `g` stubbed. The marker printed AFTER the call is the whole
 # point — under the old unchecked code the subshell died before reaching it.
-run_case() { # <ok|denied>  -> stdout of the subshell; rc is the subshell's
+run_case() { # <ok|denied|already_exists|transient>  -> stdout; rc is the subshell's
   local behaviour="$1"
   (
     set -euo pipefail
@@ -68,13 +68,27 @@ run_case() { # <ok|denied>  -> stdout of the subshell; rc is the subshell's
     tmp="$tmpd"
     # shellcheck disable=SC2317
     g() {
-      if [ "$behaviour" = "denied" ]; then
-        # A sentinel the script's OWN message cannot contain. Asserting on the
-        # permission name instead would pass even if the function stopped
-        # forwarding gcloud's stderr, because our message already names it.
-        echo "GCLOUD_STDERR_SENTINEL_7f3a: Permission denied" >&2
-        return 1
-      fi
+      # Each arm emits the real API's wording, because the function now
+      # SELECTS its remediation by matching this text. A single generic
+      # failure stub would let one arm's assertion pass on another arm's
+      # output — the function would look error-aware while printing the same
+      # advice for everything.
+      #
+      # Every message carries a sentinel the script's own text cannot contain,
+      # so "the underlying error survived" is asserted independently of "we
+      # named the right cause": our message already names the permission, so
+      # matching on that alone would pass even if gcloud's stderr were dropped.
+      case "$behaviour" in
+        denied)
+          echo "GCLOUD_STDERR_SENTINEL_7f3a: PERMISSION_DENIED: caller lacks permission" >&2
+          return 1 ;;
+        already_exists)
+          echo "GCLOUD_STDERR_SENTINEL_7f3a: ALREADY_EXISTS: metric already exists" >&2
+          return 1 ;;
+        transient)
+          echo "GCLOUD_STDERR_SENTINEL_7f3a: INTERNAL: backend error, please retry" >&2
+          return 1 ;;
+      esac
       return 0
     }
     eval "$FN"
@@ -111,18 +125,66 @@ case "$err" in
   *) bad "stderr does not name the ciRunnerApplyLogMetrics custom role; got: $err" ;;
 esac
 
-# The stub denies `describe` too, so this is the create path — where a missing
-# `get` surfaces as ALREADY_EXISTS rather than a denial. An operator who reads
-# "not a permission problem" there goes hunting the log filter for a grant.
+# Each arm must print ITS remediation and not the others'. Without this, a
+# function that prints every hint for every error satisfies each arm's positive
+# assertion while giving an operator a menu to guess from — which is the state
+# this replaced.
 case "$err" in
-  *ALREADY_EXISTS*) ok "the create path names ALREADY_EXISTS as an IAM symptom" ;;
-  *) bad "the create path does not explain ALREADY_EXISTS; got: $err" ;;
+  *"could not READ it"*) bad "a plain denial also printed the ALREADY_EXISTS explanation" ;;
+  *) ok "a denial does not print the ALREADY_EXISTS explanation" ;;
 esac
 
 # The underlying API error must survive, not be swallowed by our own message.
 case "$err" in
   *GCLOUD_STDERR_SENTINEL_7f3a*) ok "the underlying API error is surfaced" ;;
   *) bad "the API error was swallowed; got: $err" ;;
+esac
+
+# ── already_exists: IAM wearing a different error code ───────────────────────
+#
+# The create path's IAM symptom. `describe` is silent on failure, so an account
+# holding `create` but not `get` fails the probe, creates against an existing
+# metric, and is refused ALREADY_EXISTS forever. An operator told that is "not
+# a permission problem" goes hunting the log filter for a grant.
+out="$(run_case already_exists)"; rc=$?
+err="$(cat "$tmpd/stderr.txt")"
+
+if [ "$rc" = "0" ]; then
+  ok "an ALREADY_EXISTS metric leaves the script running"
+else
+  bad "an ALREADY_EXISTS metric ended the script (rc=$rc)"
+fi
+
+case "$err" in
+  *"could not READ it"*) ok "ALREADY_EXISTS is explained as a missing read, not a create" ;;
+  *) bad "ALREADY_EXISTS was not explained as an IAM read failure; got: $err" ;;
+esac
+
+case "$err" in
+  *"NOT an IAM denial"*) bad "ALREADY_EXISTS was steered away from IAM — the one wrong answer here" ;;
+  *) ok "ALREADY_EXISTS is not steered away from IAM" ;;
+esac
+
+# ── transient: the arm that must NOT send anyone to IAM ──────────────────────
+out="$(run_case transient)"; rc=$?
+err="$(cat "$tmpd/stderr.txt")"
+
+if [ "$rc" = "0" ]; then
+  ok "a transient API fault leaves the script running"
+else
+  bad "a transient API fault ended the script (rc=$rc)"
+fi
+
+case "$err" in
+  *"NOT an IAM denial"*) ok "a non-permission error is not blamed on IAM" ;;
+  *) bad "a transient error was not distinguished from a denial; got: $err" ;;
+esac
+
+# The specific waste this prevents: an operator auditing a role they already
+# hold while a backend error clears itself on the next run.
+case "$err" in
+  *ciRunnerApplyLogMetrics*) bad "a transient error still told the operator to grant the role" ;;
+  *) ok "a transient error does not name a role to grant" ;;
 esac
 
 # ── ok: the happy path must stay silent and record nothing ───────────────────
