@@ -1035,8 +1035,9 @@ answer is then `unanswered` by construction, every merge waits out the full
 on this repository on 2026-09-19: one all-green pull request with no competing
 candidate took 23.5 minutes to merge across five lane passes. Run
 [`check-base-health-contract.sh`](../scripts/ci/check-base-health-contract.sh)
-before concluding a repository is merely slow; #967 tracks the related case
-where a *completed* success on the tip still reads as unanswered.
+before concluding a repository is merely slow. The related case where a
+*completed* success on the tip still read as unanswered was #967, fixed in
+v5.107.1 (see "The hold on a later, unfinished same-app suite" below).
 
 #### And the half that runs before the lane: `pr-guard`
 
@@ -1311,6 +1312,29 @@ per-app rule produces. Since
 the hold expires anyway, one hour after the newest suite still holding was
 created — `newer-incomplete-max-staleness-seconds`, documented with the other
 base-health knobs above, and loud when it fires.
+
+**Since [ci-runner-infra#967](https://github.com/Dima-Spectorr/ci-runner-infra/issues/967)
+the hold is scoped to the same WORKFLOW, not merely the same app.** GitHub
+creates one `github-actions` suite per workflow file on every push, all in the
+same second, and a suite of workflow A can never post a check-run that workflow
+B emits. Measured on IntegrateIT tip `db03f376` (2026-09-27): `main-health`
+completed `success` in its own suite, and the base-health gate still read the
+tip `unanswered` because the same push's `pr-check` suite (one id later) was
+running and four Dependabot update suites sat `queued`. When some name is held,
+the lane reads `actions/runs?head_sha=` to map each suite to its workflow and
+drops holders of a different workflow. A holder the read cannot place — another
+app's suite, or one the read did not return — still holds, and if the read
+fails (the merge App lacks **Actions: read**) the pre-#967 hold stands and the
+lane warns once naming the permission. The #955 re-dispatch shape is the same
+workflow, so it is still held.
+
+**The base-health read now says what it retrieved.** On any base-health verdict
+other than `healthy` (and on `inert` only when the grace clock is armed) the
+lane log carries, per required name, the raw rows the read returned — origin,
+state, time, app, suite — the state it resolved to, and why a green was held.
+"Matched nothing", "matched a different row" and "matched and held" are
+distinguishable from the log alone.
+
 A required name answered by a LEGACY COMMIT STATUS
 is likewise not suite-scoped — statuses have no check_suite to correlate against
 — so it is trusted exactly as it was before this change; that is pre-existing

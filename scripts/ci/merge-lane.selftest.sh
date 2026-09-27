@@ -2135,8 +2135,9 @@ behavioural_check_counts_cases() {
   fix="$(mktemp -d)"
 
   # shellcheck disable=SC2034  # read by the evalled check_counts, not here.
-  local R="owner/repo" LANE_FATAL=0 BASE_TIP_READ=0
+  local R="owner/repo" LANE_FATAL=0 BASE_TIP_READ=0 LANE_BASE_DIAG=''
   local STATUS_WARN_ONCE="$fix/status-warned" SUITE_WARN_ONCE="$fix/suite-warned"
+  local WORKFLOW_WARN_ONCE="$fix/workflow-warned"
 
   # The driver calls `gh api --paginate <url> --jq <program>`. The stub answers
   # the three surfaces `check_counts` reads and refuses anything else loudly,
@@ -2161,6 +2162,12 @@ behavioural_check_counts_cases() {
       */check-runs*) jq -c "$prog" "$fix/runs.json" | tee "$fix/runs-proj.json" ;;
       */check-suites*) jq -c "$prog" "$fix/suites.json" ;;
       */status*) jq -c "$prog" "$fix/statuses.json" ;;
+      # The workflow lineage (#967). Read only when some name is held; a
+      # `wfruns.fail` marker makes the read fail the way a 403 does.
+      */actions/runs*)
+        [ ! -e "$fix/wfruns.fail" ] || return 1
+        jq -c "$prog" "$fix/wfruns.json"
+        ;;
       *) echo "behavioural stub: unexpected gh call for '$url'" >&2; return 1 ;;
     esac
   }
@@ -2184,7 +2191,12 @@ behavioural_check_counts_cases() {
     date -u -d "@$(( $(date -u +%s) - $1 ))" +%Y-%m-%dT%H:%M:%SZ
   }
 
-  # case <description> <expected "green missing failed pending"> <names,newline-separated> <suites-json> <runs-json> [hold-bound-seconds] [stderr-ere, '!' prefix to assert absence]
+  # case <description> <expected "green missing failed pending"> <names,newline-separated> <suites-json> <runs-json> [hold-bound-seconds] [stderr-ere, '!' prefix to assert absence] [actions-runs-json, or FAIL for an unreadable one]
+  #
+  # WITHOUT THE EIGHTH ARGUMENT THE WORKFLOW LINEAGE IS EMPTY, and an empty
+  # lineage is the pre-#967 hold: no suite can be placed in a workflow, so none
+  # is excluded. Every case written before #967 therefore asserts exactly what
+  # it did; the cases that exercise the lineage pass it explicitly.
   #
   # THE HOLD BOUND DEFAULTS TO `0` — UNBOUNDED — FOR EVERY CASE THAT DOES NOT
   # ASK FOR IT, and that is not the driver's default. The fixtures below are
@@ -2199,7 +2211,12 @@ behavioural_check_counts_cases() {
     printf '%s' "$4" >"$fix/suites.json"
     printf '%s' "$5" >"$fix/runs.json"
     printf '{"statuses":[]}' >"$fix/statuses.json"
-    rm -f "$STATUS_WARN_ONCE" "$SUITE_WARN_ONCE"
+    rm -f "$STATUS_WARN_ONCE" "$SUITE_WARN_ONCE" "$WORKFLOW_WARN_ONCE" "$fix/wfruns.fail"
+    case "${8:-}" in
+      FAIL) printf '{"workflow_runs":[]}' >"$fix/wfruns.json"; : >"$fix/wfruns.fail" ;;
+      '') printf '{"workflow_runs":[]}' >"$fix/wfruns.json" ;;
+      *) printf '%s' "$8" >"$fix/wfruns.json" ;;
+    esac
     local -a REQUIRED=()
     local line
     while IFS= read -r line; do [ -n "$line" ] && REQUIRED+=("$line"); done <<<"$3"
@@ -2467,6 +2484,63 @@ behavioural_check_counts_cases() {
     printf 'PASS %s\n' "the dead fallback: a run whose app is absent keys as unknown, not the literal string null"
   else
     printf 'FAIL the dead fallback: a run whose app is absent keys as unknown, not null — got app=%s\n' "$dead_app"
+  fi
+
+  # 13. ci-runner-infra#967, THE MEASURED SHAPE (IntegrateIT tip db03f376,
+  #     2026-09-27). `main-health` completed `success` in its own workflow's
+  #     suite; the same push's `pr-check` suite — created the same second, one
+  #     id later — was still running, and four Dependabot update suites sat
+  #     queued. None of them can ever post `main-health`. Before #967 this read
+  #     `0 0 0 1` and the base-health gate called the tip `unanswered`. Bound 0,
+  #     so it is the lineage and not the staleness escape that lets it through.
+  local wf967
+  wf967='{"workflow_runs":[{"check_suite_id":98370149347,"workflow_id":501},{"check_suite_id":98370150479,"workflow_id":502},{"check_suite_id":98370159084,"workflow_id":503},{"check_suite_id":98370159363,"workflow_id":503},{"check_suite_id":98370159568,"workflow_id":503},{"check_suite_id":98370163784,"workflow_id":503}]}'
+  local suites967 runs967
+  suites967="{\"check_suites\":[$(_bh_suite 98370149347 github-actions completed 2026-09-27T15:18:08Z),$(_bh_suite 98370150479 github-actions in_progress 2026-09-27T15:18:08Z),$(_bh_suite 98370159084 github-actions queued 2026-09-27T15:18:30Z),$(_bh_suite 98370159363 github-actions queued 2026-09-27T15:18:31Z),$(_bh_suite 98370159568 github-actions queued 2026-09-27T15:18:31Z),$(_bh_suite 98370163784 github-actions queued 2026-09-27T15:18:40Z)]}"
+  runs967="{\"check_runs\":[$(_bh_run 'main-health' completed '"success"' '"2026-09-27T15:25:00Z"' github-actions 98370149347),$(_bh_run 'shard 1' in_progress null null github-actions 98370150479)]}"
+  case_ "#967: a later unfinished suite of ANOTHER workflow of the app does not hold a green" \
+    "1 0 0 0" 'main-health' "$suites967" "$runs967" 0 '' "$wf967"
+
+  # 14. #955 THROUGH THE LINEAGE. The same shape as case 2, but the lineage is
+  #     readable and says the later suite is the SAME workflow — a re-dispatch
+  #     that has not posted the name yet. Still held.
+  case_ "#955 with the lineage read: a later suite of the SAME workflow still holds" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 10 github-actions completed 2026-08-25T06:36:51Z),$(_bh_suite 11 github-actions in_progress 2026-08-25T07:00:39Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-08-25T06:59:47Z"' github-actions 10),$(_bh_run 'Web build' in_progress null null github-actions 11)]}" \
+    0 '' '{"workflow_runs":[{"check_suite_id":10,"workflow_id":7},{"check_suite_id":11,"workflow_id":7}]}'
+
+  # 15. A HOLDER THE LINEAGE CANNOT PLACE STILL HOLDS. Suite 11 is absent from
+  #     `actions/runs` (not an Actions run the read returned), so nothing proves
+  #     it cannot post the name. Unknown is the hold, never the green.
+  case_ "#967: a later unfinished suite the lineage cannot place still holds" \
+    "0 0 0 1" \
+    'CI summary (rollup)' \
+    "{\"check_suites\":[$(_bh_suite 10 github-actions completed 2026-08-25T06:36:51Z),$(_bh_suite 11 github-actions in_progress 2026-08-25T07:00:39Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-08-25T06:59:47Z"' github-actions 10)]}" \
+    0 '' '{"workflow_runs":[{"check_suite_id":10,"workflow_id":7}]}'
+
+  # 16. AN UNREADABLE LINEAGE (the App lacks `Actions: read`) keeps the pre-#967
+  #     hold and SAYS so, once. The #967 shape then reads pending again — the
+  #     safe direction — and the warning names the permission to grant.
+  case_ "#967: an unreadable actions/runs keeps the hold and warns" \
+    "0 0 0 1" 'main-health' "$suites967" "$runs967" 0 "Actions: read" FAIL
+
+  # 17. THE DIAGNOSTIC. On the base tip every required name leaves a line of
+  #     what the read retrieved and what it resolved to — the evidence #967
+  #     had to reconstruct by hand. A held name says why it was held.
+  local diag_file="$fix/diag.txt"
+  : >"$diag_file"
+  BASE_TIP_READ=1 LANE_BASE_DIAG="$diag_file"
+  case_ "#967 diagnostic: a base-tip read of a held name" \
+    "0 0 0 1" 'main-health' "$suites967" "$runs967" 0 '' FAIL
+  # shellcheck disable=SC2034  # Read by the evalled check_counts.
+  BASE_TIP_READ=0 LANE_BASE_DIAG=''
+  if grep -qE "^lane: base-health read of 00000000 — 'main-health': retrieved 1 row\(s\) \[run success at=2026-09-27T15:25:00Z app=github-actions suite=98370149347\]; resolved 'pending' — green held: suite 98370163784 " "$diag_file"; then
+    printf 'PASS %s\n' "#967 diagnostic: the line names the row retrieved, the state resolved and the holding suite"
+  else
+    printf 'FAIL #967 diagnostic: unexpected line [%s]\n' "$(tr '\n' ' ' <"$diag_file")"
   fi
 
   rm -rf "$fix"
