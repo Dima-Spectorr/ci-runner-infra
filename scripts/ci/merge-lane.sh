@@ -57,6 +57,12 @@ LANE_TMP="$(mktemp -d)"
 trap 'rm -rf "$LANE_TMP"' EXIT
 STATUS_WARN_ONCE="$LANE_TMP/status-surface-warned"
 SUITE_WARN_ONCE="$LANE_TMP/suite-lineage-warned"
+WORKFLOW_WARN_ONCE="$LANE_TMP/workflow-lineage-warned"
+# What the last base-health read RETRIEVED, one line per required name, written
+# by `check_counts` from inside its subshell and printed by `lane_base_is_broken`
+# only when the verdict is not `healthy` (#967). A file for the same reason the
+# warn-once markers are files.
+LANE_BASE_DIAG="$LANE_TMP/base-health-read"
 
 # ---------------------------------------------------------------------------
 # THE APP QUOTA IS SHARED, SO THE LANE COUNTS WHAT IT SPENDS AND STOPS SHORT.
@@ -526,9 +532,28 @@ check_counts() {
   suites_json="$(printf '%s\n' "$suites" \
     | jq -s '[.[] | select(type == "object" and (.app | type) == "string")]')"
 
-  name_auth="$(printf '%s\n' "$runs" \
-    | jq -s --argjson suites "$suites_json" \
-      '($suites | map({key: (.id | tostring), value: .}) | from_entries) as $smap
+  # A HOLDER MUST BE ABLE TO POST THE NAME, WHICH MEANS THE SAME WORKFLOW (#967).
+  #
+  # "A later unfinished suite of the same app" was the whole test, and for
+  # `github-actions` that is nearly every commit: GitHub creates one suite PER
+  # WORKFLOW FILE on a push, all in the same second, and a suite for workflow A
+  # can never post a check-run that workflow B's job emits. Measured on
+  # IntegrateIT 2026-09-27, tip `db03f376`: `main-health` completed `success` in
+  # suite 98370149347, and the lane read it `pending` for as long as the SAME
+  # push's `pr-check` suite (98370150479, created the same second, one id later)
+  # was still running and four Dependabot update suites sat `queued` — so the
+  # base-health gate reported `unanswered` on a tip that had answered green,
+  # and every merge waited out the grace clock instead of the health job.
+  #
+  # #955, the case the hold exists for, is a RE-DISPATCH of the same workflow:
+  # a new suite of the SAME workflow that has not posted the name yet. That is
+  # still held. `$wf` maps a suite id to the id of the Actions workflow behind
+  # it, read from `actions/runs` only when some name is actually held (below);
+  # a suite it does not know — another app's, or one the read did not return —
+  # is not excluded, so an unknown lineage keeps the hold exactly as before.
+  local auth_prog wf_json='{}' wf_runs
+  # shellcheck disable=SC2016  # A jq program: `$suites`, `$wf` and `$w` are jq variables, not shell ones.
+  auth_prog='($suites | map({key: (.id | tostring), value: .}) | from_entries) as $smap
        | [ .[]
            | select(type == "object" and (.name | type) == "string")
            | select($smap[(.suite | tostring)] != null)
@@ -539,9 +564,13 @@ check_counts() {
        | group_by([.app, .name])
        | map(.[-1])
        | map(. as $w
+             | ($wf[($w.suite | tostring)]) as $w_wf
              | ($suites
                 | map(select(.app == $w.app
                              and .status != "completed"
+                             and ($w_wf == null
+                                  or $wf[(.id | tostring)] == null
+                                  or $wf[(.id | tostring)] == $w_wf)
                              and (([.created_at, .id]
                                    > [$w.created_at, $w.suite])
                                   or (.created_at == ""
@@ -558,7 +587,28 @@ check_counts() {
                              elif ($holders | length) > 0
                              then ($holders | sort_by([.created_at, .id]) | .[-1].created_at)
                              else "" end)}}})
-       | reduce .[] as $e ({}; . * $e)')"
+       | reduce .[] as $e ({}; . * $e)'
+  name_auth="$(printf '%s\n' "$runs" \
+    | jq -s --argjson suites "$suites_json" --argjson wf "$wf_json" "$auth_prog")"
+
+  # ONLY WHEN SOMETHING IS HELD. The workflow lineage is one more paginated read,
+  # and on the common sha — nothing of the app still running after the suite
+  # that answered — it could not change a single verdict, so it is not paid for.
+  # A failed read keeps `{}`, which is the hold exactly as it stood before this
+  # existed: the unsafe direction here is trusting a green, never holding one.
+  if [ "$(printf '%s' "$name_auth" | jq '[.[][] | .newer_incomplete] | any')" = "true" ]; then
+    if wf_runs="$(gh api --paginate "repos/$R/actions/runs?head_sha=$sha&per_page=100" \
+      --jq '.workflow_runs[] | {suite: .check_suite_id, workflow: .workflow_id}' 2>/dev/null)"; then
+      wf_json="$(printf '%s\n' "$wf_runs" \
+        | jq -s '[.[] | select(type == "object" and .suite != null and .workflow != null)
+                 | {key: (.suite | tostring), value: .workflow}] | from_entries')"
+      name_auth="$(printf '%s\n' "$runs" \
+        | jq -s --argjson suites "$suites_json" --argjson wf "$wf_json" "$auth_prog")"
+    elif [ ! -e "$WORKFLOW_WARN_ONCE" ]; then
+      : >"$WORKFLOW_WARN_ONCE"
+      echo "lane: WARNING $sha — could not read which workflow each check_suite belongs to (actions/runs), so a green check is held while ANY later suite of its app is unfinished, not only a re-run of its own workflow. Grant the merge App 'Actions: read'." >&2
+    fi
+  fi
 
   # The status surface is treated differently on purpose. A repository may
   # legitimately publish no commit statuses at all, and the merge App may not
@@ -639,7 +689,7 @@ check_counts() {
   local -a were_skipped=()
   for name in "${REQUIRED[@]}"; do
     local winner_origin winner_app winner_suite auth_id auth_newer auth_state
-    local auth_newer_id auth_newer_at
+    local auth_newer_id auth_newer_at why=''
     state="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].state // "absent"')"
     winner_origin="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].origin // ""')"
 
@@ -678,6 +728,7 @@ check_counts() {
           echo "lane: WARNING $sha — check '$name' was posted by app '$winner_app' but no check_suite behind that run came back from the check-suites read; cannot verify it is the current suite, holding rather than trusting the green." >&2
         fi
         state="pending"
+        why="green held: its suite $winner_suite is not in the check-suites read"
       else
         if [ "$auth_id" != "$winner_suite" ]; then
           # The run that said `success` belongs to a SUPERSEDED suite for this
@@ -702,6 +753,7 @@ check_counts() {
               echo "lane: WARNING $sha — check '$name' resolved to authoritative suite $auth_id for app '$winner_app', which then reported no occurrence of it; holding rather than trusting the green." >&2
             fi
             state="pending"
+            why="green held: authoritative suite $auth_id posted no occurrence of it"
           fi
         fi
 
@@ -777,6 +829,7 @@ check_counts() {
             echo "::warning::lane: $sha — check '$name' is green and app '$winner_app' has suite $auth_newer_id still unfinished (created $auth_newer_at, ${hold_age}s ago, past the ${NEWER_INCOMPLETE_MAX_STALENESS}s bound), so the hold on it is expired and the green is taken. If GitHub now refuses the merge with a 405 saying the context is expected, that suite is posting late rather than stuck and this repository's newer-incomplete-max-staleness-seconds is too low." >&2
           else
             state="pending"
+            why="green held: suite $auth_newer_id of app '$winner_app' (created ${auth_newer_at:-at an unknown time}) is later, unfinished, and of the same workflow or one the read could not place"
           fi
         fi
       fi
@@ -784,6 +837,21 @@ check_counts() {
       # app has nothing later still running — success stands, unchanged. This
       # is the common case, including the sibling-suite shape where the
       # required checks live in an older suite than its completed siblings.
+    fi
+
+    # WHAT WAS RETRIEVED, NOT ONLY WHAT IT COUNTED AS (#967). On the base tip
+    # every required name leaves one line saying which rows the read returned
+    # for it — origin, state, time, app, suite — what it resolved to, and why.
+    # `lane_base_is_broken` prints them only on a verdict that is not `healthy`,
+    # which is exactly when "matched nothing", "matched a different row" and
+    # "matched and held" have to be told apart from the log alone.
+    if [ "${BASE_TIP_READ:-0}" = "1" ] && [ -n "${LANE_BASE_DIAG:-}" ]; then
+      local retrieved
+      retrieved="$(printf '%s\n%s\n' "$runs" "$statuses" | jq -rs --arg n "$name" \
+        '[.[] | select(type == "object" and .name == $n)
+          | "\(.origin) \(.state) at=\(.at) app=\(if .app == "" then "-" else .app end) suite=\(.suite)"]
+         | if length == 0 then "no row of that name" else "\(length) row(s) [" + join("; ") + "]" end')"
+      echo "lane: base-health read of ${sha:0:8} — '$name': retrieved ${retrieved:-nothing parseable}; resolved '$state'${why:+ — $why}" >>"$LANE_BASE_DIAG"
     fi
 
     case "$state" in
@@ -1230,6 +1298,7 @@ lane_base_is_broken() {
   # is routinely superseded by the next merge. See the classifier for the five
   # consecutive cancellations that made this necessary.
   local BASE_TIP_READ=1
+  : >"$LANE_BASE_DIAG"
   counts="$(check_counts "$base_sha")"
   read -r green missing failed pending <<<"$counts"
   # Classified from the same counts, and ordered by which fact outranks which.
@@ -1250,6 +1319,17 @@ lane_base_is_broken() {
     fi
   else
     LANE_BASE_VERDICT='inert'
+  fi
+  # The derived counts alone made #967 unfalsifiable from outside for a week:
+  # they cannot say whether a required name matched no row, a different row, or
+  # a green row that was then held. Printed on every verdict but `healthy`,
+  # with the counts, so one pass's log answers that on its own. `inert` on a
+  # base nothing has armed is the fleet's quiet normal and stays quiet; on an
+  # ARMED base it is the post-merge tip, and is worth the same lines.
+  if [ "$LANE_BASE_VERDICT" != 'healthy' ] \
+    && { [ "$LANE_BASE_VERDICT" != 'inert' ] || [ -n "$LANE_BASE_ARMED" ]; }; then
+    echo "lane: base-health on ${base_sha:0:8} is '$LANE_BASE_VERDICT' (green=${green:-0} missing=${missing:-0} failed=${failed:-0} pending=${pending:-0})"
+    cat "$LANE_BASE_DIAG" 2>/dev/null || true
   fi
   [ "${failed:-0}" -gt 0 ]
 }
