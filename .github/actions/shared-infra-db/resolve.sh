@@ -10,24 +10,32 @@
 # Contract with action.yml — every one of these is set by the caller:
 #   PG ADDR IMAGE DB_USER DB_PASSWORD DB_NAME HEALTH_TIMEOUT GITHUB_OUTPUT
 #
-# Three knobs exist only so the selftest does not sleep for real time or depend
+# Four knobs exist only so the selftest does not sleep for real time or depend
 # on the RNG. They default to the production values and are never set by
 # action.yml.
-#   PG_RETRY_SLEEP      seconds between port attempts (default 3)
-#   PG_POLL_SLEEP       seconds between health polls  (default 1)
-#   PG_PORT_CANDIDATES  whitespace-separated ports drawn IN ORDER before
-#                       falling back to $RANDOM (default: empty, i.e. always
-#                       random). A test that leaves the draw to $RANDOM cannot
-#                       prove the busy-port filter or the retry blacklist: with
-#                       the filter deleted a random candidate still lands in the
-#                       free half about half the time, so the assertion passes
-#                       on a broken script whenever the RNG is kind.
+#   PG_RETRY_SLEEP        seconds between port attempts (default 3)
+#   PG_POLL_SLEEP         seconds between health polls (default 1), also used
+#                         between shared-stack probe attempts
+#   PG_PORT_CANDIDATES    whitespace-separated ports drawn IN ORDER before
+#                         falling back to $RANDOM (default: empty, i.e. always
+#                         random). A test that leaves the draw to $RANDOM cannot
+#                         prove the busy-port filter or the retry blacklist: with
+#                         the filter deleted a random candidate still lands in
+#                         the free half about half the time, so the assertion
+#                         passes on a broken script whenever the RNG is kind.
+#   PG_SHARED_PROBE_TIMEOUT
+#                         seconds to spend confirming the SHARED branch is
+#                         actually reachable before trusting it (default 10).
+#                         Zero means "one attempt, no retry" — what the
+#                         selftest wants, since it never needs the probe to
+#                         outlast a real container's boot.
 set -euo pipefail
 
 : "${GITHUB_OUTPUT:?}"
 retry_sleep="${PG_RETRY_SLEEP:-3}"
 poll_sleep="${PG_POLL_SLEEP:-1}"
 candidates="${PG_PORT_CANDIDATES:-}"
+shared_probe_timeout="${PG_SHARED_PROBE_TIMEOUT:-10}"
 
 # `?sslmode=disable`, on BOTH branches, appended here rather than at either call
 # site so the two cannot drift apart.
@@ -62,6 +70,36 @@ publish() { # <base-url> <port> <shared>
 # stack and the fallback are indistinguishable to the suite.
 auth="$DB_USER"
 [ -z "$DB_PASSWORD" ] || auth="${DB_USER}:${DB_PASSWORD}"
+
+# NEVER PUBLISH THE SHARED URL WITHOUT DIALING IT FIRST (#1377).
+#
+# The anchor bookkeeping (`PG`/`ADDR`, the port band) says a stack was brought
+# up at some point in this run — it says nothing about whether the container is
+# still there when THIS job resolves the URL, possibly minutes and several
+# other jobs later. Measured in IntegrateIT run 36367254132: the anchor's own
+# band arithmetic was consistent (port 35300 correctly identified as this
+# slot's), `docker ps -a --filter name=postgres` on the same host, same job,
+# showed no container at all. Something reaped it between bring-up and this
+# resolve — a recycle, an OOM, a `docker prune` — and this action published a
+# URL to a database that provably was not there, so every suite that dialed it
+# got ECONNREFUSED wearing a schema-shaped stack trace.
+#
+# So the shared branch DIALS before it PUBLISHES. `pg_isready` is on every
+# fleet host's PATH (`packer/ci-host-image.pkr.hcl` installs
+# `postgresql-client` for exactly this kind of direct-to-Postgres probe) and
+# is a real protocol handshake, not just a TCP connect — a container that
+# accepts the connection but is still in crash-recovery is not "ready" either.
+# A host that somehow lacks the binary (never true on the fleet; not
+# impossible on a hand-rolled runner) falls back to a bare TCP dial, which
+# still catches the one failure mode this issue is about: nothing listening at
+# all.
+probe_shared_stack() { # <host> <port>
+  if command -v pg_isready >/dev/null 2>&1; then
+    pg_isready -h "$1" -p "$2" -U "$DB_USER" -d "$DB_NAME" -t 2 >/dev/null 2>&1
+  else
+    ( exec 3<>"/dev/tcp/$1/$2" ) >/dev/null 2>&1
+  fi
+}
 
 if [ -n "$PG" ]; then
   # The shared stack, at the host's VPC address — the same address rule 3 has
@@ -127,13 +165,35 @@ if [ -n "$PG" ]; then
     echo "::notice::the shared stack is published in THIS slot (${PG} is in this slot's band ${CI_SHARED_INFRA_PORT_MIN}-${CI_SHARED_INFRA_PORT_MAX}) — using loopback, because ${ADDR}:${PG} hairpins back to this namespace and only works from a sibling"
   fi
 
-  publish "postgres://${auth}@${host}:${PG}/${DB_NAME}" "$PG" 1
-  echo "::notice::using the run's shared stack at ${host}:${PG}"
-  exit 0
+  probe_deadline=$(( SECONDS + shared_probe_timeout ))
+  shared_ready=0
+  while :; do
+    if probe_shared_stack "$host" "$PG"; then
+      shared_ready=1
+      break
+    fi
+    [ "$SECONDS" -lt "$probe_deadline" ] || break
+    sleep "$poll_sleep"
+  done
+
+  if [ "$shared_ready" = 1 ]; then
+    publish "postgres://${auth}@${host}:${PG}/${DB_NAME}" "$PG" 1
+    echo "::notice::using the run's shared stack at ${host}:${PG}"
+    exit 0
+  fi
+
+  # NOT A FAILURE YET. The anchor said there was a stack; there provably is not
+  # one answering at ${host}:${PG} now. Fall through to the same throwaway this
+  # action already starts when the anchor degrades outright (below) — the
+  # symptom this job faces is identical either way: no Postgres to connect to.
+  echo "::warning::the run's shared stack at ${host}:${PG} did not accept a connection within ${shared_probe_timeout}s — the anchor published it but it is not there now (recycled slot, OOM, host restart). Starting a throwaway Postgres for this job alone instead of publishing a URL nothing is listening on."
+  shared_stack_degraded=1
 fi
 
-# No shared stack. Everything below is the degraded leg.
-echo "::notice::the anchor published no shared stack — starting a throwaway Postgres for this job alone"
+if [ "${shared_stack_degraded:-0}" = 0 ]; then
+  # No shared stack. Everything below is the degraded leg.
+  echo "::notice::the anchor published no shared stack — starting a throwaway Postgres for this job alone"
+fi
 
 # FAIL FAST, AND ONLY HERE. The two preconditions below belong to the fallback,
 # not to the action: the shared branch above is a string concatenation and works
