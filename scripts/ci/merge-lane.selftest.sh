@@ -1034,6 +1034,18 @@ names_the_required_status_check_refusal() {
   matches "$code" 'refused_marker "\$sha"'
 }
 
+# Measured on IntegrateIT run 36408270569 (lane v5.107.1): the merge API refused
+# #21400 with "Repository rule violations found  Waiting on code owner review
+# from <owner>." — a review requirement on that ONE pull request, which the
+# lane's check-based read cannot see. Reported as the generic "head moved" it
+# ended the batch on every pass, and nothing merged for 2.5 hours behind it.
+names_the_review_refusal() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" "^    \*'code owner review'\*\|\*'approving review'\*\|\*'conversation must be resolved'\*\)\$" || return 1
+  matches "$code" 'lane_comment_refusal_once "\$num" "\$sha" "\$err"'
+}
+
 # "Not asked" and "up to date" are different facts. The verdict does not care —
 # it never reads `behind` on a non-strict base — but the queue table is what an
 # operator reads to decide whether the lane is working, and a column of zeroes
@@ -1501,6 +1513,7 @@ check ends_the_batch_on_a_refusal "$DRIVER" "a refused action does not stop the 
 check quotes_what_github_actually_said "$DRIVER" "a refusal is reported as a guess while GitHub's own reason is thrown away, so a lane that logs merge:ready and then acts on nothing cannot be diagnosed at all"
 check names_the_workflows_permission_refusal "$DRIVER" "a pull request the App may never merge — it touches a workflow file — reads as a transient refusal and ends the batch on every pass, so one of them starves the whole repository"
 check names_the_required_status_check_refusal "$DRIVER" "a required-status-check 405 — the lane's own read disagreeing with GitHub's ruleset about ONE candidate's head — reads as a transient refusal and ends the batch on every pass, so the oldest ready pull request starves every candidate behind it"
+check names_the_review_refusal "$DRIVER" "a 405 for a missing code-owner or approving review — a requirement on ONE pull request the lane's check read cannot see — reads as a transient refusal and ends the batch on every pass, so one unreviewed pull request at the head of the ranking stops every merge in the repository"
 check halts_when_the_base_itself_is_red "$DRIVER" "the lane keeps merging onto a base whose own required checks are failing, burying the commit that broke it under everything that follows"
 check only_a_definite_failure_halts_the_lane "$DRIVER" "the base-health gate halts on something other than a definite failure, which deadlocks every repository whose required checks run on pull_request only"
 check says_on_the_snapshot_that_it_halted "$DRIVER" "a halted lane renders exactly like a base with nothing open, so the queue view reports a quiet day while nothing can merge"
@@ -1738,6 +1751,8 @@ mutate "the required-status-check refusal stops being named" "$DRIVER" \
   "s@^    \*'Required status check'\*'is expected'\*)\$@    *'Required status check-never'*'is expected'*)@" names_the_required_status_check_refusal
 mutate "the required-status-check refusal stops commenting on the pull request" "$DRIVER" \
   's@already_commented_refusal "\$num" "\$sha"@false@' names_the_required_status_check_refusal
+mutate "the review-requirement refusal stops being named" "$DRIVER" \
+  "s@^    \*'code owner review'\*@    *'code owner review-never'*@" names_the_review_refusal
 mutate "the unasked comparison starts reporting itself as up to date" "$DRIVER" \
   "s@^      behind_cell='n/a'\$@      behind_cell=\"\$behind\"@" says_when_it_did_not_ask_how_far_behind
 
@@ -2555,6 +2570,81 @@ while IFS= read -r _bh_line; do
     *) bad "behavioural check_counts: unparseable result line '$_bh_line'" ;;
   esac
 done <<<"$_bh_out"
+
+# ---------------------------------------------------------------------------
+# BEHAVIOURAL CASES: `lane_report_refusal` RUN, NOT READ.
+#
+# The return code IS the contract — 2 skips one candidate and the batch goes on,
+# 1 ends the pass — and a case arm whose glob misses GitHub's real wording falls
+# silently to 1. The texts below are what the merge API actually said (the
+# review one is IntegrateIT run 36408270569, #21400, verbatim, with the owner
+# replaced), so a glob that stops matching them fails here. Same lift-by-name
+# idiom as above; `gh` is stubbed to record comment posts.
+# ---------------------------------------------------------------------------
+behavioural_refusal_cases() {
+  local fix
+  fix="$(mktemp -d)"
+  # shellcheck disable=SC2034  # read by the evalled driver functions.
+  local R="owner/repo"
+  : >"$fix/posted"
+  # shellcheck disable=SC2317  # reached through the evalled functions.
+  gh() {
+    case "$*" in
+      *'/comments?per_page=100'*) cat "$fix/posted" ;;
+      *'/comments'*) printf '%s\n' "$*" >>"$fix/posted" ;;
+      *) echo "refusal stub: unexpected gh call '$*'" >&2; return 1 ;;
+    esac
+  }
+  local fn
+  for fn in refused_marker already_commented_refusal lane_comment_refusal_once lane_report_refusal; do
+    eval "$(sed -n "/^${fn}() {/,/^}/p" "$DRIVER")"
+    if ! declare -F "$fn" >/dev/null 2>&1; then
+      echo "FAIL $fn could not be lifted out of the driver, so no refusal case ran"
+      rm -rf "$fix"
+      return
+    fi
+  done
+
+  _rc_case() { # <label> <want-rc> <err> <sha>
+    local rc=0
+    lane_report_refusal merge 7 "$3" "$4" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" = "$2" ]; then printf 'PASS %s\n' "$1"; else printf 'FAIL %s — returned %s, want %s\n' "$1" "$rc" "$2"; fi
+  }
+  local codeowner
+  codeowner='gh: Repository rule violations found
+
+Waiting on code owner review from some-owner. (HTTP 405)'
+  _rc_case "a code-owner review 405 skips the candidate, not the pass" 2 "$codeowner" aaaa1111
+  _rc_case "an approving-review 405 skips the candidate" 2 'gh: At least 1 approving review is required by reviewers with write access. (HTTP 405)' bbbb2222
+  _rc_case "a required-status-check 405 still skips the candidate" 2 'gh: Required status check "ci" is expected. (HTTP 405)' cccc3333
+  _rc_case "a workflows-permission refusal still skips the candidate" 2 'gh: refusing to allow a GitHub App to create or update workflow without `workflows` permission (HTTP 403)' ''
+  _rc_case "an unrecognised refusal still ends the pass" 1 'gh: Head branch was modified. Review and try the merge again. (HTTP 409)' dddd4444
+
+  # One comment per refused sha: the code-owner case above posted for aaaa1111;
+  # a second pass on the same sha must not post again.
+  _rc_case "a repeat of the code-owner 405 still skips" 2 "$codeowner" aaaa1111
+  local n
+  n=$(grep -c 'merge-lane:refused:aaaa1111' "$fix/posted" || true)
+  if [ "$n" = 1 ]; then printf 'PASS %s\n' "the code-owner skip is commented on the pull request once per sha"
+  else printf 'FAIL the code-owner skip was commented %s time(s) for one sha, want 1\n' "$n"; fi
+
+  # A comment that cannot be posted must not take the pass down.
+  # shellcheck disable=SC2317  # reached through the evalled functions.
+  gh() { return 1; }
+  _rc_case "an unpostable comment still returns the skip" 2 "$codeowner" eeee5555
+
+  rm -rf "$fix"
+}
+
+_rf_out="$(behavioural_refusal_cases)"
+while IFS= read -r _rf_line; do
+  case "$_rf_line" in
+    PASS\ *) ok ;;
+    FAIL\ *) bad "behavioural lane_report_refusal: ${_rf_line#FAIL }" ;;
+    '') : ;;
+    *) bad "behavioural lane_report_refusal: unparseable result line '$_rf_line'" ;;
+  esac
+done <<<"$_rf_out"
 
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane: $FAIL failed, $PASS passed"

@@ -2189,6 +2189,32 @@ lane_is_pin_bump() {
 }
 
 # ---------------------------------------------------------------------------
+# Say it ON THE PULL REQUEST, once per refused sha, for a refusal that skips
+# the candidate rather than ending the pass. The Action log rotates out of easy
+# reach; an operator (or the author) looking at the pull request is the one who
+# most needs to know it was skipped and why. `already_commented_refusal` is the
+# marker, same pattern as `already_released`, so a refusal that lasts several
+# passes is not commented on every single one.
+# Never fatal, deliberately unlike `already_released`'s comment: the candidate
+# is already being skipped rather than merged, so a comment that fails to post
+# must not, under `set -e`, take the WHOLE PASS down with it — that would turn a
+# one-candidate refusal back into the exact head-of-line block the skip exists
+# to end. Logged, not swallowed.
+# ---------------------------------------------------------------------------
+lane_comment_refusal_once() {
+  local num="$1" sha="$2" err="$3" why="$4"
+  [ -n "$sha" ] || return 0
+  if already_commented_refusal "$num" "$sha"; then return 0; fi
+  if ! gh api "repos/$R/issues/$num/comments" -f body="$(printf '%s\n\n%s\n\n%s\n' \
+    "The merge lane tried to merge this pull request and GitHub refused: \`$err\`." \
+    "$why" \
+    "$(refused_marker "$sha")")" --silent 2>&1; then
+    echo "::warning::could not comment #$num's skip — it is still visible above, in the run log" >&2
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Say why GitHub refused, in GitHub's own words, and RETURN the code the caller
 # passes on: 2 when the refusal is about this pull request alone, so the batch
 # can go on, 1 when the world moved and the pass has to re-read it.
@@ -2237,25 +2263,32 @@ lane_report_refusal() {
       # this exact candidate sat refused at the head of the queue. So it is
       # skipped, not merged and not counted, and the batch moves on.
       echo "::warning::$what of #$num was refused: GitHub's ruleset says a required check is not yet posted for ${num}'s head, though the lane's own read called it green — a check_suite disagreement, not a change to anything else in the repository. Skipping #$num for this pass; it is re-read, not demoted. GitHub said: $err"
-      # NOT SILENT ON THE PULL REQUEST ITSELF. The Action log rotates out of
-      # easy reach; an operator (or the author) looking at the pull request
-      # is the one who most needs to know it was skipped and why. One comment
-      # per refused sha — `already_commented_refusal` is the marker, same
-      # pattern as `already_released` above — so a base that stays disagreed
-      # for several passes does not get commented on every single one.
-      # `|| true`, deliberately unlike `already_released`'s comment below: this
-      # candidate is already being skipped rather than merged, so a comment
-      # that fails to post must not, under `set -e`, take the WHOLE PASS down
-      # with it — that would turn a one-candidate refusal back into the exact
-      # head-of-line block this case exists to end. Logged, not swallowed.
-      if [ -n "$sha" ] && ! already_commented_refusal "$num" "$sha"; then
-        if ! gh api "repos/$R/issues/$num/comments" -f body="$(printf '%s\n\n%s\n\n%s\n' \
-          "The merge lane tried to merge this pull request and GitHub refused: \`$err\`." \
-          "The lane's own read of ${sha:0:8} called the required checks green; GitHub's ruleset disagreed at merge time, most likely because a newer check run for the same commit was still in flight. This pull request was skipped for this pass — not demoted — and the lane will try it again on the next pass once the disagreement resolves itself." \
-          "$(refused_marker "$sha")")" --silent 2>&1; then
-          echo "::warning::could not comment #$num's skip — it is still visible above, in the run log" >&2
-        fi
-      fi
+      # NOT SILENT ON THE PULL REQUEST ITSELF — see `lane_comment_refusal_once`.
+      lane_comment_refusal_once "$num" "$sha" "$err" \
+        "The lane's own read of ${sha:0:8} called the required checks green; GitHub's ruleset disagreed at merge time, most likely because a newer check run for the same commit was still in flight. This pull request was skipped for this pass — not demoted — and the lane will try it again on the next pass once the disagreement resolves itself."
+      return 2
+      ;;
+    *'code owner review'*|*'approving review'*|*'conversation must be resolved'*)
+      # A REVIEW THE LANE CANNOT GIVE. Measured on IntegrateIT run 36408270569
+      # (lane v5.107.1, 2026-09-28): the merge API refused #21400 with a 405,
+      # "Repository rule violations found  Waiting on code owner review from
+      # <owner>." The lane ranks on checks, not on reviews, so a ruleset (or
+      # branch protection) that also requires a code-owner or approving review,
+      # or resolved conversations, is invisible to `check_counts` and the pull
+      # request reads `merge:ready`. That refusal is about THIS pull request's
+      # own reviews and nothing else in the repository, so — exactly like the
+      # required-status-check arm above — it is skipped and the batch moves on.
+      # Falling through to the default arm ENDED THE PASS instead: #21400 sat
+      # first in the ranking on every pass, and nothing merged in IntegrateIT
+      # for 2.5 hours while about 17 pull requests were `merge:ready`.
+      # Not classified up front as a `wait:` verdict on purpose: `reviewDecision`
+      # is GraphQL-only (one more call per candidate per pass against the
+      # fleet's shared App quota, #928), and it cannot see a bypass actor, so it
+      # would hold pull requests GitHub would in fact merge. The merge call is
+      # the one read that is never wrong about it.
+      echo "::warning::$what of #$num was refused: GitHub requires a review on #$num that it does not have yet (a code-owner or approving review, or a resolved conversation) — about this pull request only. Skipping #$num for this pass; it is tried again every pass and merges once the review lands. GitHub said: $err"
+      lane_comment_refusal_once "$num" "$sha" "$err" \
+        "The lane's read of ${sha:0:8} called the required checks green, but this repository also requires a review the lane cannot give — a code-owner or approving review, or a resolved conversation. This pull request was skipped for this pass, not demoted, and other pull requests keep merging past it. The lane tries it again on every pass and merges it on the first pass after the review lands."
       return 2
       ;;
   esac

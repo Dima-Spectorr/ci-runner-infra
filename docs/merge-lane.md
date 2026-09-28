@@ -787,6 +787,31 @@ single reading of the ranking, stopping the moment GitHub refuses anything —
 that refusal is the signal the world moved, and the next pass reads the world it
 moved to. On a strict base the behaviour is unchanged: one action, then re-read.
 
+**Except a refusal that is about that one pull request only.** Those are
+skipped — the candidate is not merged, not counted, not demoted, and the batch
+goes on to the next one; `lane_report_refusal()` returns `2` for them instead of
+`1`. Every skip is named in the run log in GitHub's own words, and the ones a
+contributor can act on are also commented on the pull request once per head sha
+(`<!-- merge-lane:refused:<sha> -->`). The skip arms, in order:
+
+| GitHub says | Why it is this pull request only | Commented |
+|---|---|---|
+| ``… without `workflows` permission`` (403) | the App may not write `.github/workflows/**` on this installation — see above | no (an installation fix, not the author's) |
+| `Required status check "X" is expected.` (405) | a check_suite disagreement about this head — see "Superseded check_suite vs a required context" | yes |
+| `Waiting on code owner review from …` / `… approving review is required …` / `A conversation must be resolved …` (405) | the ruleset or branch protection also requires a review, which the lane's check-based read cannot see, so the pull request reads `merge:ready` | yes |
+
+The review arm is measured: IntegrateIT run 36408270569 (lane v5.107.1,
+2026-09-28), #21400 refused with `Repository rule violations found  Waiting on
+code owner review from <owner>.` Before the arm existed that fell to the
+"head moved" default, which ENDS the pass; #21400 ranked first on every pass
+and nothing merged in the repository for 2.5 hours while about 17 pull requests
+were `merge:ready`. Such a pull request is **not** classified up front as a
+`wait:` verdict: `reviewDecision` is GraphQL-only — one more call per candidate
+per pass against the App's shared quota — and it cannot see a ruleset bypass
+actor, so it would hold pull requests GitHub would in fact merge. The merge
+call is the one read that is never wrong about it; it is retried every pass and
+lands on the first pass after the review does.
+
 For the same reason the lane **skips the `behind_by` comparison entirely** when
 the base is non-strict — one API call per pull request per pass that no verdict
 consults. The queue table then shows `n/a` in the *behind* column rather than

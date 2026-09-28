@@ -56,7 +56,7 @@ ref-scoped `principalSet` is how it is bounded. Read the section below.
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.107.1"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.107.2"
 
   project_id     = var.project_id
   region         = "<region>"
@@ -401,7 +401,7 @@ repository's README anyway. Anything that *is* a secret stays where it is.
 
 ```hcl
 module "ci_runner_apply_identity" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.107.1"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.107.2"
 
   project_id             = var.project_id
   name                   = var.pool_name
@@ -518,7 +518,7 @@ provisioner has already run.
 
 ```hcl
 module "ci_host_image_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.107.1"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.107.2"
 
   project_id   = var.project_id
   region       = "<region>"
