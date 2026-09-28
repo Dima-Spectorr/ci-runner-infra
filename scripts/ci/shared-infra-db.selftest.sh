@@ -55,6 +55,19 @@ STUB
 # `docker` stub. `DOCKER_REFUSE` is a space-separated list of host ports whose
 # `run` must fail, standing in for RootlessKit's bind error. Every invocation is
 # appended to $TMP/calls so the assertions can read what was actually attempted.
+# `pg_isready` stub: stands in for the SHARED-branch probe added for #1377.
+# `PG_ISREADY_RC` is the exit code it reports (default 0 = the stack answers).
+# Kept a separate binary from the `docker` stub's `exec` case (which is the
+# FALLBACK container's own `docker exec … pg_isready`, controlled by
+# `DOCKER_ISREADY_RC`) because the two probes are genuinely different things:
+# the shared branch dials the network directly, the fallback shells into a
+# container it just started.
+cat > "$BIN/pg_isready" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${PG_ISREADY_CALLS:-/dev/null}"
+exit "${PG_ISREADY_RC:-0}"
+STUB
+
 cat > "$BIN/docker" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$DOCKER_CALLS"
@@ -80,11 +93,18 @@ case "$1" in
   *)      exit 0 ;;
 esac
 STUB
-chmod +x "$BIN/ss" "$BIN/docker"
+chmod +x "$BIN/ss" "$BIN/docker" "$BIN/pg_isready"
 
 # run_resolve <name> — drives resolve.sh in a clean output/calls sandbox.
 # Reads the caller's PG/ADDR/SS_BUSY/DOCKER_REFUSE/PG_PORT_CANDIDATES from the
 # environment; sets OUT, CALLS and RC for the assertions.
+#
+# PG_ISREADY_RC defaults to 0 (the shared stack answers) so every PRE-EXISTING
+# "shared" case below keeps asserting the healthy path without having to name
+# the knob; only the new not-actually-there cases set it non-zero.
+# PG_SHARED_PROBE_TIMEOUT defaults to 0 — one probe attempt, no retry — so
+# these tests do not spend real wall-clock time waiting out a stack that the
+# stub has already decided will never answer.
 run_resolve() {
   OUT="$TMP/out.$1"
   CALLS="$TMP/calls.$1"
@@ -95,6 +115,7 @@ run_resolve() {
   GITHUB_OUTPUT="$OUT" \
   DOCKER_CALLS="$CALLS" \
   DOCKER_LAST_PORT_FILE="$TMP/lastport.$1" \
+  PG_ISREADY_CALLS="$TMP/isready.$1" \
   RUNNER_OS=Linux \
   GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 GITHUB_JOB=selftest \
   PG="${PG:-}" ADDR="${ADDR:-}" \
@@ -102,11 +123,13 @@ run_resolve() {
   DB_USER="${DB_USER:-ci}" DB_PASSWORD="${DB_PASSWORD:-}" DB_NAME="${DB_NAME:-app}" \
   HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-30}" \
   PG_RETRY_SLEEP=0 PG_POLL_SLEEP=0 \
+  PG_SHARED_PROBE_TIMEOUT="${PG_SHARED_PROBE_TIMEOUT:-0}" \
   PG_PORT_CANDIDATES="${PG_PORT_CANDIDATES:-}" \
   CI_SHARED_INFRA_PORT_MIN="${CI_SHARED_INFRA_PORT_MIN:-}" \
   CI_SHARED_INFRA_PORT_MAX="${CI_SHARED_INFRA_PORT_MAX:-}" \
   SS_BUSY="${SS_BUSY:-}" DOCKER_REFUSE="${DOCKER_REFUSE:-}" \
   DOCKER_ISREADY_RC="${DOCKER_ISREADY_RC:-0}" \
+  PG_ISREADY_RC="${PG_ISREADY_RC:-0}" \
   bash "$RESOLVE" >"$TMP/stdout.$1" 2>&1
   RC=$?
 }
@@ -176,6 +199,39 @@ got() { sed -n "s/^$2=//p" "$1"; }
   ok "shared with a non-numeric band: keeps addr" \
      "$([ "$(got "$OUT" url)" = 'postgres://ci@10.0.0.7:35100/app?sslmode=disable' ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharedbadband" ) || true
+
+# ---------------------------------------------------------------------------
+# #1377 — the shared branch is DIALED, not trusted from bookkeeping alone.
+# ---------------------------------------------------------------------------
+
+# The anchor published a stack, but nothing answers at host:port — the exact
+# shape of the bug: `docker ps` empty, ECONNREFUSED downstream. The action
+# must NOT publish that URL as shared=1; it must fall through to the same
+# throwaway fallback a degraded anchor already gets.
+( PG=35100 ADDR=10.0.0.7 PG_ISREADY_RC=2 PG_PORT_CANDIDATES="24001" run_resolve sharedunreachable
+  ok "unreachable shared stack: probes before publishing" \
+     "$([ -s "$TMP/isready.sharedunreachable" ] && echo 1 || echo 0)"
+  ok "unreachable shared stack: does not publish the dead URL" \
+     "$([ "$(got "$OUT" url)" != 'postgres://ci@10.0.0.7:35100/app?sslmode=disable' ] && echo 1 || echo 0)"
+  ok "unreachable shared stack: falls back to a throwaway instead" \
+     "$([ "$(got "$OUT" shared)" = 0 ] && echo 1 || echo 0)"
+  ok "unreachable shared stack: the fallback url carries the drawn port" \
+     "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:24001/app?sslmode=disable' ] && echo 1 || echo 0)"
+  ok "unreachable shared stack: exits 0 (the job still gets a database)" \
+     "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+  ok "unreachable shared stack: says why" \
+     "$(grep -q 'did not accept a connection' "$TMP/stdout.sharedunreachable" && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharedunreachable" ) || true
+
+# The same failure on the owning slot's OWN band (loopback rewrite already
+# applied) must probe the post-rewrite host, not the pre-rewrite one.
+( PG=35100 ADDR=10.0.0.7 CI_SHARED_INFRA_PORT_MIN=35100 CI_SHARED_INFRA_PORT_MAX=35199 \
+    PG_ISREADY_RC=2 PG_PORT_CANDIDATES="24002" run_resolve sharedownunreachable
+  ok "unreachable shared stack on own band: probes loopback, not addr" \
+     "$(grep -q -- '-h 127.0.0.1 -p 35100' "$TMP/isready.sharedownunreachable" && echo 1 || echo 0)"
+  ok "unreachable shared stack on own band: still falls back" \
+     "$([ "$(got "$OUT" shared)" = 0 ] && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharedownunreachable" ) || true
 
 # ---------------------------------------------------------------------------
 # The fallback draws its own port.
