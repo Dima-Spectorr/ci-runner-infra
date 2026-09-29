@@ -885,6 +885,7 @@ check "and the marker means it"                        test -f "$MARKER"
 # Without the unit stop the timer -- which has no process to kill -- survives,
 # while the service's process is still reached by the kill loop: that is the
 # narrowed spare doing its half.
+# shellcheck disable=SC2016  # the rendered hook's literal $uid
 sed '/^  stop_user_units "\$uid" || units_rc=1$/d' "$RESET" >"$MUTANT"
 chmod 0755 "$MUTANT"
 check_not "the unit-stop mutation applied" cmp -s "$RESET" "$MUTANT"
