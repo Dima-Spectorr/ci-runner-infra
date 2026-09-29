@@ -140,10 +140,12 @@ SINCE="$SLOT_STATE/$IDX/dirty-since"
 
 made_user=0
 made_unit=0
+made_rundir=0
 DAEMON_UNIT="ci-dockerd@$IDX.service"
 cleanup() {
   # The stand-in daemon first: userdel refuses an account with a live process.
   [ "$made_unit" = 1 ] && systemctl stop "$DAEMON_UNIT" >/dev/null 2>&1
+  [ "$made_rundir" = 1 ] && rm -rf -- "/run/$U"
   [ "$made_user" = 1 ] && userdel --remove --force "$U" >/dev/null 2>&1
   rm -rf -- "$SB"
 }
@@ -512,8 +514,7 @@ seed_spared() {
   make_sock "$SLOT_TMP/dotnet-diagnostic-999999999-1-socket"
   mkfifo "$SLOT_TMP/clr-debug-pipe-$dpid-1-in" "$SLOT_TMP/clr-debug-pipe-999999999-1-in"
   printf 'carried data\n' >"$SLOT_TMP/dotnet-diagnostic-$dpid-2-socket"
-  install -d "$SLOT_TMP/rootlesskit-b123" "$SLOT_TMP/.dotnet/shm" "$SLOT_TMP/.dotnet/lockfiles" \
-    "$SLOT_TMP/.dotnet/junk"
+  install -d "$SLOT_TMP/.dotnet/shm" "$SLOT_TMP/.dotnet/lockfiles" "$SLOT_TMP/.dotnet/junk"
 }
 seed_spared
 "$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
@@ -522,7 +523,6 @@ check "a dead pid's diagnostic socket goes"            test ! -e "$SLOT_TMP/dotn
 check "a live pid's debug pipe survives"               test -p "$SLOT_TMP/clr-debug-pipe-$dpid-1-in"
 check "a dead pid's debug pipe goes"                   test ! -e "$SLOT_TMP/clr-debug-pipe-999999999-1-in"
 check "a regular file under a live pid's name goes"    test ! -e "$SLOT_TMP/dotnet-diagnostic-$dpid-2-socket"
-check "rootlesskit's copy-up directory survives"       test -d "$SLOT_TMP/rootlesskit-b123"
 check ".dotnet/shm survives"                           test -d "$SLOT_TMP/.dotnet/shm"
 check ".dotnet/lockfiles survives"                     test -d "$SLOT_TMP/.dotnet/lockfiles"
 check "anything else in .dotnet goes"                  test ! -e "$SLOT_TMP/.dotnet/junk"
@@ -535,6 +535,60 @@ seed_spared
 "$MUTANT" completed "$IDX" >>"$HOOKLOG" 2>&1
 check "without the pid rule a dead pid's socket survives -- so the check is live" \
   test -S "$SLOT_TMP/dotnet-diagnostic-999999999-1-socket"
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+
+# ROOTLESSKIT'S COPY-UP DIRECTORY (#1387). rootlesskit makes it, binds /etc onto
+# it, moves the bind away and removes it, all before dockerd makes its socket; a
+# live host had none left in any slot's /tmp. So it is spared only while that
+# can still be running -- no socket at /run/<slot>/docker.sock -- and only in
+# the shape it has then: an empty real directory the slot owns. The socket here
+# is a bound, never-listening stand-in, removed again before the sweep section.
+DSOCK="/run/$U/docker.sock"
+if [ ! -e "/run/$U" ] && install -d -o "$U" -g "$U" -m 0700 "/run/$U"; then
+  made_rundir=1
+fi
+check "the suite owns /run/$U for the stand-in socket" test "$made_rundir" = 1
+seed_copyup() {
+  rm -rf -- "$SLOT_TMP"/rootlesskit-*
+  install -d -o "$U" -g "$U" -m 0700 "$SLOT_TMP/rootlesskit-b1" "$SLOT_TMP/rootlesskit-b2" \
+    "$SLOT_TMP/rootlesskit-b4"
+  printf 'carried data\n' >"$SLOT_TMP/rootlesskit-b2/stash"
+  install -d -o root -g root -m 0700 "$SLOT_TMP/rootlesskit-b3"
+  install -d -o "$U" -g "$U" -m 0700 "$SLOT_TMP/rootlesskit-b4/.hidden"
+}
+copyup_reset() { # <script> <with|without> -- one completed reset, the socket as named
+  rm -f -- "$DSOCK"
+  if [ "$2" = with ]; then make_sock "$DSOCK"; fi
+  seed_copyup
+  "$1" completed "$IDX" >>"$HOOKLOG" 2>&1
+  rm -f -- "$DSOCK"
+}
+copyup_reset "$RESET" without
+check "before the socket, an empty slot-owned copy-up dir survives" test -d "$SLOT_TMP/rootlesskit-b1"
+check "one holding a file goes"                        test ! -e "$SLOT_TMP/rootlesskit-b2"
+check "one owned by anyone but the slot goes"          test ! -e "$SLOT_TMP/rootlesskit-b3"
+check "one holding only a dot-entry goes"              test ! -e "$SLOT_TMP/rootlesskit-b4"
+copyup_reset "$RESET" with
+check "once the socket exists, even an empty one goes" test ! -e "$SLOT_TMP/rootlesskit-b1"
+
+# Each of the three conditions broken back, and the assertion it backs notices.
+# shellcheck disable=SC2016  # the patterns are the RENDERED hook's literal $sock/$1/$uid; nothing here may expand them
+sed 's/rootlesskit-\*) \[ ! -S "\$sock" \] && /rootlesskit-*) /' "$RESET" >"$MUTANT"
+check_not "the socket-rule mutation applied" cmp -s "$RESET" "$MUTANT"
+copyup_reset "$MUTANT" with
+check "without the socket rule an empty one survives the socket -- so the check is live" \
+  test -d "$SLOT_TMP/rootlesskit-b1"
+sed 's/ -maxdepth 0 -type d -empty -print/ -maxdepth 0 -type d -print/' "$RESET" >"$MUTANT"
+check_not "the emptiness mutation applied" cmp -s "$RESET" "$MUTANT"
+copyup_reset "$MUTANT" without
+check "without the emptiness rule the stash survives -- so the check is live" \
+  test -f "$SLOT_TMP/rootlesskit-b2/stash"
+# shellcheck disable=SC2016  # as above: the rendered hook's literal text
+sed 's/\[ "\$(stat -c .%u. -- "\$1" 2>\/dev\/null)" = "\$uid" \] &&$/true \&\&/' "$RESET" >"$MUTANT"
+check_not "the owner mutation applied" cmp -s "$RESET" "$MUTANT"
+copyup_reset "$MUTANT" without
+check "without the owner rule root's directory survives -- so the check is live" \
+  test -d "$SLOT_TMP/rootlesskit-b3"
 "$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
 
 # Through the HOST namespace, with no daemon: nothing may be emptied, because
