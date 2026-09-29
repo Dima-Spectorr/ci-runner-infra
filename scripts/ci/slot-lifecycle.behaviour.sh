@@ -695,47 +695,25 @@ fake_as_slot() {
     >>"$HOOKLOG" 2>&1
 }
 check "the stand-in docker runs as the slot user" fake_as_slot
+# The RENDERED reset, not host-startup.sh's text: install_job_hooks writes it
+# through an unquoted here-document, which joins every backslash-continued line.
+# So `DOCKER_HOST="unix://$sock" \` + an indented `docker ps` arrives as ONE line
+# with a run of spaces between the two -- and a pattern that wants exactly one
+# space, or `docker` at the start of a line, leaves the real docker in place,
+# talking to a stand-in daemon that hangs up on it (#1394).
 fake_docker() { # <script> <out> -- the same reset, with every docker call on the stand-in
-  sed "s#^\([[:space:]]*\)docker #\1$FAKEBIN/docker #; s#\(DOCKER_HOST=\"unix://\\\$sock\"\) docker #\1 $FAKEBIN/docker #" "$1" >"$2"
+  sed "s#^\([[:space:]]*\)docker #\1$FAKEBIN/docker #; s#\(DOCKER_HOST=\"unix://\\\$sock\"\)[[:space:]]\{1,\}docker #\1 $FAKEBIN/docker #" "$1" >"$2"
   chmod 0755 "$2"
 }
 FAKED="$SB/slot-reset.faked.sh"
 fake_docker "$RESET" "$FAKED"
-check_not "every docker call is on the stand-in" grep -qE '^[[:space:]]*docker |" docker ' "$FAKED"
+check_not "every docker call is on the stand-in" grep -qE '^[[:space:]]*docker |"[[:space:]]+docker ' "$FAKED"
 
-# TEMP-DBG-1392 begin -- removed before the final push
-cat >"$SB/dbg-block" <<DBG
-{
-  echo "DBG id=\$(id) pwd=\$(pwd) umask=\$(umask) SUDO_UID=\${SUDO_UID:-unset}"
-  ls -ld "$SB" "$FAKEBIN" "$FAKEBIN/docker" "/run/\$u" "\$sock"
-  timeout 30 sudo -u "\$u" /bin/sh -c 'echo DBG sudo-sh-ok; id'; echo "DBG sh rc=\$?"
-  timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" "$FAKEBIN/docker" ps; echo "DBG fake rc=\$?"
-  sudo -u "\$u" "$FAKEBIN/docker" ps; echo "DBG fake-no-timeout rc=\$?"
-  "$FAKEBIN/docker" ps; echo "DBG fake-as-root rc=\$?"
-  echo "DBG calls:"; cat "$FAKECALLS"
-  ps -o pid,ppid,pgid,sid,tty,user,cmd -p \$\$
-  grep -E 'Cap(Eff|Bnd)|NoNewPrivs|Seccomp' /proc/\$\$/status
-  ls -l /proc/\$\$/fd
-} >&2 2>&1
-DBG
-dbg_faked() { # <out> <stub quiesce 0|1>
-  awk -v f="$SB/dbg-block" '/^    if ! cids=/ { while ((getline l < f) > 0) print l; close(f) } { print }' "$FAKED" |
-    sed "\\#$FAKEBIN/docker# { s# 2>/dev/null##; s# 2>&1##; }" >"$1"
-  if [ "$2" = 1 ]; then sed -i 's/^  quiesce_slot || rc=1$/  : quiesce stubbed/' "$1"; fi
-  chmod 0755 "$1"
-}
-for stub in 1 0; do
-  dbg_faked "$SB/dbg-$stub.sh" "$stub"
-  echo "  DBG ==== faked reset, quiesce stubbed=$stub, stubbed-line: $(grep -c 'quiesce stubbed' "$SB/dbg-$stub.sh")"
-  rm -f -- "$MARKER" "$SB/ps-fails"
-  reset_once "$SB/dbg-$stub.sh"
-  echo "  DBG rc=$rc marker=$(test -f "$MARKER" && echo yes || echo no)"
-  sed 's/^/  DBG RUN: /' "$RUNLOG"
-done
-# TEMP-DBG-1392 end
 
 rm -f -- "$MARKER" "$SB/ps-fails"
+: >"$FAKECALLS"
 reset_once "$FAKED"
+check "the reset's own docker calls reach the stand-in" grep -q ': ps --all' "$FAKECALLS"
 check "with docker answering, the slot is marked clean" test -f "$MARKER"
 
 rm -f -- "$MARKER"
@@ -746,7 +724,8 @@ check "and the slot is not marked clean"               test ! -f "$MARKER"
 check "and says why"                                   grep -q 'could not list the containers' "$RUNLOG"
 
 # Put the pipe back, and the same failure earns the marker -- so the check is live.
-sed 's#docker ps --all --quiet --no-trunc 2>/dev/null); then#docker ps --all --quiet --no-trunc 2>/dev/null | sort -u); then#' \
+# shellcheck disable=SC2016  # the rendered hook's literal $derr; nothing here may expand it
+sed 's#docker ps --all --quiet --no-trunc 2>"\$derr"); then#docker ps --all --quiet --no-trunc 2>"$derr" | sort -u); then#' \
   "$FAKED" >"$MUTANT"
 chmod 0755 "$MUTANT"
 check_not "the pipe mutation applied" cmp -s "$FAKED" "$MUTANT"

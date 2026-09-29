@@ -674,7 +674,7 @@ has_listing_fails_closed() { # <file>
   matches "$code" '^    if ! ids=\\\$\(timeout 30 sudo' || return 1
   matches "$code" '^      if ! info=\\\$\(timeout 60 sudo' || return 1
   matches "$code" 'could not list the containers the last job left' || return 1
-  counts "$code" 'docker (ps|image ls) --all --quiet --no-trunc 2>/dev/null \|' 0 || return 1
+  counts "$code" 'docker (ps|image ls) --all --quiet --no-trunc 2>[^ ]* \|' 0 || return 1
 }
 
 # THE MARKER IS A CLAIM ABOUT WRITERS, NOT ABOUT FILES (#237 finding 3).
@@ -1989,7 +1989,7 @@ mutate "tags pruned through a foreign socket" 's/if \[ "\\$dsock" != foreign \] 
 mutate "stragglers quiesced after the check"  '/^  quiesce_slot || rc=1$/d; /^  dsock=\\$(daemon_sock)$/a\  quiesce_slot || rc=1' has_socket_identity
 mutate "no re-check after the prune"          's/^    \[ "\\$(daemon_sock)" = "\\$dsock" \] ||$/    true ||/'      has_socket_identity
 mutate "a failed docker ps reads as empty"    's/^    if ! cids=/    if cids=/'                                          has_listing_fails_closed
-mutate "docker ps piped into sort again"      's|docker ps --all --quiet --no-trunc 2>/dev/null); then|docker ps --all --quiet --no-trunc 2>/dev/null \| sort -u); then|' has_listing_fails_closed
+mutate "docker ps piped into sort again"      's|docker ps --all --quiet --no-trunc 2>"\\\$derr"); then|docker ps --all --quiet --no-trunc 2>"\\$derr" \| sort -u); then|' has_listing_fails_closed
 mutate "a failed image ls reads as empty"     's/^    if ! ids=/    if ids=/'                                            has_listing_fails_closed
 mutate "a failed image inspect is ignored"    's/^      if ! info=/      if info=/'                                      has_listing_fails_closed
 mutate "no daemon now fails closed"          "s/'' | 0 | \*\[!0-9\]\*) echo absent; return 0 ;;/'' | 0 | *[!0-9]*) echo foreign; return 0 ;;/" has_socket_identity

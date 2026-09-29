@@ -1052,6 +1052,13 @@ daemon_sock() { # prints: absent | starting | ours | foreign
   echo foreign
 }
 
+# WHAT DOCKER SAID when a call below fails, so the log names the cause and not
+# only the step. Kept in the slot's root-owned state directory, which the slot
+# cannot write, and passed through safe(): the daemon is the slot's, so its
+# words are the slot's too. One line, bounded.
+derr="\$SLOT_STATE/\$idx/.docker-stderr"
+docker_said() { [ -s "\$derr" ] && printf ' (docker: %s)' "\$(safe "\$(head -n 1 "\$derr")")"; }
+
 dsock=""
 if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
   # THE PROCESSES THAT WERE NEVER IN A CONTAINER go FIRST, and outside the
@@ -1103,8 +1110,8 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
     # one a leftover had stopped -- read as "no containers", and the marker went
     # on over a live stack. So the listing is taken first, without a pipe.
     if ! cids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-                 docker ps --all --quiet --no-trunc 2>/dev/null); then
-      say "slot \$idx: could not list the containers the last job left -- the slot is not clean"
+                 docker ps --all --quiet --no-trunc 2>"\$derr"); then
+      say "slot \$idx: could not list the containers the last job left -- the slot is not clean\$(docker_said)"
       rc=1
       cids=""
     fi
@@ -1113,14 +1120,14 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
       # word-splitting is the point -- one id per argument.
       # shellcheck disable=SC2086
       if timeout 180 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-           docker rm --force --volumes -- \$cids >/dev/null 2>&1; then
+           docker rm --force --volumes -- \$cids >/dev/null 2>"\$derr"; then
         say "slot \$idx: removed \$(printf '%s\n' "\$cids" | grep -c .) container(s) left behind by the last job"
       else
         # Fail closed. A container this reset could not remove is still holding
         # its band ports, and the marker is exactly the claim it must not get:
         # the next job on this slot is failed rather than run into a port
         # collision, or into somebody else's database.
-        say "slot \$idx: could not remove the containers left behind by the last job"
+        say "slot \$idx: could not remove the containers left behind by the last job\$(docker_said)"
         rc=1
       fi
     fi
@@ -1129,8 +1136,8 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
     # carry the previous pull request's database into the next run's stack under
     # the same compose project name.
     timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-      docker network prune --force >/dev/null 2>&1 ||
-      { say "slot \$idx: could not prune the last job's networks"; rc=1; }
+      docker network prune --force >/dev/null 2>"\$derr" ||
+      { say "slot \$idx: could not prune the last job's networks\$(docker_said)"; rc=1; }
     # \`--all\` covers NAMED volumes and not merely anonymous ones, which is the
     # half that matters: \`docker compose\` names its volumes after the project,
     # so the next run under the same project name would inherit the last pull
@@ -1139,10 +1146,10 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
     # and refuse the marker for every job it ever runs. So the older spelling
     # is tried before that is called a failure.
     timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-      docker volume prune --force --all >/dev/null 2>&1 ||
+      docker volume prune --force --all >/dev/null 2>"\$derr" ||
       timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-        docker volume prune --force >/dev/null 2>&1 ||
-      { say "slot \$idx: could not prune the last job's volumes"; rc=1; }
+        docker volume prune --force >/dev/null 2>"\$derr" ||
+      { say "slot \$idx: could not prune the last job's volumes\$(docker_said)"; rc=1; }
     # And the name is still the same daemon's AFTER the prune. Nothing of the
     # slot's should be left running to swap it, but a prune that reached
     # something else is exactly what this reset must not certify.
@@ -1627,8 +1634,8 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
     # would have found are exactly what the next job must not inherit. Taken
     # without a pipe, so the status is docker's and not sort's.
     if ! ids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-                docker image ls --all --quiet --no-trunc 2>/dev/null); then
-      say "slot \$idx: could not list the local images -- no tag was checked and the slot is not clean"
+                docker image ls --all --quiet --no-trunc 2>"\$derr"); then
+      say "slot \$idx: could not list the local images -- no tag was checked and the slot is not clean\$(docker_said)"
       rc=1
       ids=""
     fi
@@ -1643,8 +1650,8 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
       if ! info=\$(timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
                    docker image inspect \
                    --format '{{.Id}} {{len .RepoDigests}} {{range .RepoTags}}{{.}} {{end}}' \
-                   \$ids 2>/dev/null); then
-        say "slot \$idx: could not inspect the local images -- the slot is not clean"
+                   \$ids 2>"\$derr"); then
+        say "slot \$idx: could not inspect the local images -- the slot is not clean\$(docker_said)"
         rc=1
       fi
       while read -r id ndig tags; do
