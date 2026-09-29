@@ -955,6 +955,162 @@ check "and it is put back into service"            test ! -e "$CONDEMNED"
 check "and it owes nothing"                        test ! -e "$BURNS"
 check "and its clock is cleared"                   test ! -f "$SINCE"
 
+# --- the pin hold's guest attribute (#1393) ------------------------------------
+#
+# ci-pin-hold publishes the hold to a guest attribute as best effort, and on a
+# host that never wrote ci/ a lost PUT reads to the controller as a FREE host
+# (#1384). The sweep is what republishes it. That is a property of two scripts
+# and a metadata server taking turns, so it is run, not grepped.
+#
+# THE METADATA SERVER IS A STUB, and it has to be. This suite runs on a real
+# pool host, and a PUT that reached the real server would publish a fake hold on
+# the CI runner running it -- which the controller would then honour.
+PIN_STUB="$SB/metadata-stub"
+install -d -m 0755 "$PIN_STUB"
+export STUB_ATTR="$SB/pin-attr" STUB_PUTS="$SB/pin-puts" STUB_REFUSE="$SB/pin-refuse"
+cat >"$PIN_STUB/curl" <<'STUB'
+#!/usr/bin/env bash
+# Answers ONLY the pin-hold attribute; anything else reads as unreachable.
+put=0; data=""; url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -X) [ "$2" = PUT ] && put=1; shift 2 ;;
+    --data) data="$2"; shift 2 ;;
+    -H | --connect-timeout | --max-time) shift 2 ;;
+    http://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+case "$url" in */instance/guest-attributes/ci/pin-hold) ;; *) exit 7 ;; esac
+if [ "$put" = 1 ]; then
+  printf '%s\n' "$data" >>"$STUB_PUTS"
+  [ -e "$STUB_REFUSE" ] && exit 22
+  printf '%s' "$data" >"$STUB_ATTR"
+  exit 0
+fi
+[ -f "$STUB_ATTR" ] || exit 22
+cat "$STUB_ATTR"
+STUB
+chmod 0755 "$PIN_STUB/curl"
+
+# Bound for the expansion under `set -u`, as SLOT_USER_PREFIX is above.
+# shellcheck disable=SC2034
+PIN_DEFAULT_TTL=1800
+# shellcheck disable=SC2034
+PIN_MAX_TTL=7200
+# shellcheck disable=SC2034
+HOST_LABEL=host-lifecycle-test
+
+PINHOLD="$SB/pin-hold.sh"
+PINSWEEP="$SB/pin-sweep.sh"
+: >"$NOISE"
+expand_into "$PINHOLD" "$(body_of 'cat >/opt/ci/job-hooks/pin-hold\.sh <<EOF')" || {
+  echo "FAIL: the pin-hold here-document did not expand"
+  exit 1
+}
+expand_into "$PINSWEEP" "$(body_of 'cat >/opt/ci/job-hooks/pin-sweep\.sh <<EOF')" || {
+  echo "FAIL: the pin-sweep here-document did not expand"
+  exit 1
+}
+chmod 0755 "$PINHOLD" "$PINSWEEP"
+
+HOLD="$PIN_DIR/host"
+SWEEPOUT="$SB/pin-sweep-output"
+BOOT=$(cat /proc/sys/kernel/random/boot_id)
+
+run_pin_sweep() { # [script] — one tick, against the stub, output kept
+  : >"$SWEEPOUT"
+  PATH="$PIN_STUB:$PATH" "${1:-$PINSWEEP}" >>"$SWEEPOUT" 2>&1
+  cat "$SWEEPOUT" >>"$HOOKLOG"
+}
+write_hold() { # <expiry> — a plain (non-reserving) hold, as ci-pin-hold writes one
+  printf 'run=4242\nslot=%s\nttl=600\nexpiry=%s\nreserve=0\nboot=%s\n' "$IDX" "$1" "$BOOT" >"$HOLD"
+}
+hold_expiry() { sed -n 's/^expiry=//p' "$HOLD"; }
+attr_is() { [ -f "$STUB_ATTR" ] && [ "$(cat "$STUB_ATTR")" = "$1" ]; }
+puts() { if [ -f "$STUB_PUTS" ]; then wc -l <"$STUB_PUTS"; else echo 0; fi; }
+mutant() { # <dest> <sed-program> — true only when the program changed something
+  sed "$2" "$PINSWEEP" >"$1" && chmod 0755 "$1" && ! cmp -s "$PINSWEEP" "$1"
+}
+
+echo
+echo "pin hold: the sweep republishes a hold the first PUT lost (#1393)"
+check "the hold script parses"                  bash -n "$PINHOLD"
+check "the sweep script parses"                 bash -n "$PINSWEEP"
+check "and expanding them executed nothing"     test ! -s "$NOISE"
+
+rm -f -- "$HOLD" "$STUB_ATTR" "$STUB_PUTS"
+: >"$STUB_REFUSE"
+SUDO_UID=$(id -u "$U") PATH="$PIN_STUB:$PATH" "$PINHOLD" --run 4242 --ttl 10m >"$SB/pin-out" 2>>"$HOOKLOG"
+check "the hold is granted while the metadata server refuses writes" grep -qx 'pinned=1' "$SB/pin-out"
+check "and the record is on disk"               test -f "$HOLD"
+check "and the PUT was tried"                   test "$(puts)" = 1
+check "and lost -- nothing is published"        test ! -e "$STUB_ATTR"
+WANT="4242 $(hold_expiry)"
+
+run_pin_sweep
+check "a sweep that is also refused says so"    grep -q 'could not publish' "$SWEEPOUT"
+check "and leaves the record alone"             test -f "$HOLD"
+
+rm -f -- "$STUB_REFUSE"
+run_pin_sweep
+check "the next sweep publishes the live hold"  attr_is "$WANT"
+
+n=$(puts)
+run_pin_sweep
+check "a confirmed hold costs no write"         test "$(puts)" = "$n"
+
+printf 'something else' >"$STUB_ATTR"
+run_pin_sweep
+check "a published value that drifted is rewritten" attr_is "$WANT"
+
+echo
+echo "pin hold: an expired hold is released, never republished"
+write_hold "$(( $(date +%s) - 5 ))"
+printf '%s' "4242 $(hold_expiry)" >"$STUB_ATTR"
+rm -f -- "$STUB_PUTS"
+run_pin_sweep
+check_not "the expired hold is not republished" grep -q '^4242 ' "$STUB_PUTS"
+check "its attribute is cleared"                attr_is ""
+check "and the record is gone"                  test ! -e "$HOLD"
+run_pin_sweep
+check "nothing is published once it is released" test "$(puts)" = 1
+
+echo
+echo "pin hold: each assertion above fails against the bug it names"
+#
+# The same discipline as the structural suite's mutate(): break the sweep the
+# way #1393 describes, run the scenario again, and require the assertion to see
+# it. A mutation that applies to nothing is itself a failure.
+M="$SB/pin-sweep.mutant"
+
+if mutant "$M" 's@|| publish "\$want"@|| :@'; then
+  write_hold "$(( $(date +%s) + 600 ))"; rm -f -- "$STUB_ATTR" "$STUB_REFUSE"
+  run_pin_sweep "$M"
+  check_not "without the republish, a lost hold stays lost -- so the check is live" attr_is "4242 $(hold_expiry)"
+else bad "mutation did not apply: the live republish"; fi
+
+if mutant "$M" 's@\[ "\$have" = "\$want" \] || publish@publish@'; then
+  write_hold "$(( $(date +%s) + 600 ))"; rm -f -- "$STUB_REFUSE"
+  printf '%s' "4242 $(hold_expiry)" >"$STUB_ATTR"
+  n=$(puts); run_pin_sweep "$M"
+  check_not "an unconditional publish writes a confirmed hold -- so the check is live" test "$(puts)" = "$n"
+else bad "mutation did not apply: the read-back"; fi
+
+if mutant "$M" 's@if \[ "\$expiry" -gt "\$now" \]; then@if true; then@'; then
+  write_hold "$(( $(date +%s) - 5 ))"; rm -f -- "$STUB_PUTS" "$STUB_ATTR" "$STUB_REFUSE"
+  run_pin_sweep "$M"
+  check "a sweep that treats expired as live republishes it -- so the check is live" grep -q '^4242 ' "$STUB_PUTS"
+else bad "mutation did not apply: the expiry test"; fi
+
+if mutant "$M" 's@>/dev/null 2>&1 || { say "could not publish@>/dev/null 2>\&1 || true || { say "could not publish@'; then
+  write_hold "$(( $(date +%s) + 600 ))"; rm -f -- "$STUB_ATTR"; : >"$STUB_REFUSE"
+  run_pin_sweep "$M"
+  check_not "a swallowed refusal says nothing -- so the check is live" grep -q 'could not publish' "$SWEEPOUT"
+else bad "mutation did not apply: the refusal message"; fi
+
+rm -f -- "$HOLD" "$STUB_REFUSE"
+
 if [ "$FAIL" -gt 0 ] && [ -s "$HOOKLOG" ]; then
   echo
   echo "what the hooks said:"
