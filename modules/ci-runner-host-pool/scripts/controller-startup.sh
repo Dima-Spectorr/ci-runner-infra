@@ -638,10 +638,87 @@ gh_token() {
   sig=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(printf '%s' "$key") | _b64)
   jwt="$header.$payload.$sig"
 
-  local resp
-  resp=$(curl "${CURL_TIMEOUTS[@]}" -fsS -X POST -H "Authorization: Bearer $jwt" \
-    -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/app/installations/$INSTALL_ID/access_tokens") || return 1
+  # DOWN-SCOPED (#1419): this controller's ONE repository, and exactly the
+  # permissions its general call paths use — every gh_api / gh_api_fetch read,
+  # the runner list/delete and the registration token:
+  #   actions: read         runs, run jobs (demand, outcome attribution, pins)
+  #   administration: write runners list + DELETE, registration-token
+  #   checks: read          commits/{sha}/check-runs (parked sweep)
+  #   pull_requests: read   pulls?state=open (parked sweep)
+  # metadata: read is implicit. NEVER actions: write here: cancel and re-run get
+  # their own dedicated mint (#1413), so the token every read carries cannot
+  # cancel or dispatch anything.
+  #
+  # A mint asking for a permission the installation does not grant — or for a
+  # repository the installation does not select — is refused with 422 and
+  # returns NO token. So the mint NARROWS, one tier at a time, and never widens:
+  #   full   all four above
+  #   core   actions:read + administration:write. The parked sweep's two
+  #          optional reads are dropped; that sweep reports DENIED, as it did
+  #          before the scope existed.
+  #   admin  administration:write only. Demand goes blind, but the runner
+  #          list/DELETE (drain, cordon, orphan reap) and the registration
+  #          token (Windows hosts) keep working, as they did unscoped.
+  # Each narrowing is a WARNING; a 422 at `admin` is an ERROR and a blind tick.
+  # No path here sends an unscoped request. The tier reached is remembered for
+  # an hour in a FILE (every caller runs gh_token inside `$(...)`), so a
+  # degraded installation costs one mint per call; after that the full set is
+  # tried again, and a grant made in the meantime is picked up.
+  local scope="full" narrowed at perms body resp code msg
+  narrowed=$(cat "$STATE_DIR/gh-token-narrowed" 2>/dev/null) || narrowed=""
+  at=${narrowed#* }
+  case "$narrowed" in
+    "core "* | "admin "*)
+      case "$at" in
+        "" | *[!0-9]*) ;;
+        *) [ "$now" -lt "$((at + 3600))" ] && scope="${narrowed%% *}" ;;
+      esac
+      ;;
+  esac
+  while :; do
+    case "$scope" in
+      full) perms='{"actions":"read","administration":"write","checks":"read","pull_requests":"read"}' ;;
+      core) perms='{"actions":"read","administration":"write"}' ;;
+      *) perms='{"administration":"write"}' ;;
+    esac
+    body=$(jq -cn --arg r "$REPO" --argjson p "$perms" '{repositories: [$r], permissions: $p}') || return 1
+    # Body and status in one capture, never a file: the body IS the token.
+    resp=$(curl "${CURL_TIMEOUTS[@]}" -sS -X POST -w '\n%{http_code}' -H "Authorization: Bearer $jwt" \
+      -H "Accept: application/vnd.github+json" \
+      -d "$body" \
+      "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" 2>>"$LOG") || resp=$'\n000'
+    code=${resp##*$'\n'}
+    resp=${resp%$'\n'*}
+    [ "$code" = 201 ] && break
+    if [ "$code" != 422 ]; then
+      log "installation token mint failed: HTTP $code"
+      return 1
+    fi
+    msg=$(printf '%s' "$resp" | jq -r '.message // empty' 2>/dev/null)
+    case "$scope" in
+      full)
+        scope="core"
+        printf 'core %s' "$now" >"$STATE_DIR/gh-token-narrowed" 2>/dev/null || true
+        throttled_event "$STATE_DIR/gh-token-narrowed.event" core WARNING gh-token-scope-narrowed "" \
+          "installation token: 422 for $REPO_FULL with checks:read + pull_requests:read ($msg) -- the installation lacks them or does not select this repository; minting actions:read + administration:write only, and the parked sweep reports DENIED until both are granted" \
+          missing="checks:read,pull_requests:read" tier=core http="$code"
+        ;;
+      core)
+        scope="admin"
+        printf 'admin %s' "$now" >"$STATE_DIR/gh-token-narrowed" 2>/dev/null || true
+        throttled_event "$STATE_DIR/gh-token-narrowed.event" admin WARNING gh-token-scope-narrowed "" \
+          "installation token: 422 for $REPO_FULL with actions:read + administration:write ($msg) -- the installation lacks Actions: read or does not select this repository; minting administration:write only, so demand is BLIND while drain, cordon, orphan reap and registration keep working" \
+          missing="actions:read" tier=admin http="$code"
+        ;;
+      *)
+        event ERROR gh-token-scope-refused "" \
+          "installation token REFUSED (HTTP 422) for $REPO_FULL even with administration:write alone ($msg) -- the installation lacks Administration: write or does not select this repository; the controller is blind; NOT retried unscoped" \
+          missing="administration:write" tier=admin http="$code"
+        return 1
+        ;;
+    esac
+  done
+  [ "$scope" = full ] && rm -f "$STATE_DIR/gh-token-narrowed"
 
   GH_TOKEN=$(printf '%s' "$resp" | jq -r '.token // empty')
   [ -n "$GH_TOKEN" ] || return 1

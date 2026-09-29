@@ -208,11 +208,37 @@ gh_token() {
   # `printf` is a shell builtin, so nothing execs with the JWT in ITS argv either,
   # and the config file is a process substitution: the fd belongs to root, it has
   # no name a slot user could open, and it is gone when curl exits.
-  curl "${CURL_TIMEOUTS[@]}" -fsS -X POST \
+  #
+  # DOWN-SCOPED (#1419): ONE repository, ONE permission. An unscoped mint carries
+  # every permission the App holds on every repository of the installation, and
+  # this host runs untrusted job code. The only call made with this token is
+  # registration_token below, which needs Administration: write and nothing else
+  # (metadata: read is implicit on every token). A refused scoped mint is FATAL
+  # to this boot and never retried unscoped: widening the token to get past a
+  # 422 is exactly the exposure the scope removes.
+  #
+  # REPO is interpolated into the body, so it must be a bare repository name —
+  # the same shape variables.tf validates. Built with printf: the host has no jq.
+  case "$REPO" in
+    "" | *[!A-Za-z0-9_.-]*) log "refusing to mint: '$REPO' is not a bare repository name"; return 1 ;;
+  esac
+  local body resp code
+  body=$(printf '{"repositories":["%s"],"permissions":{"administration":"write"}}' "$REPO")
+  # Body and status in one capture, never a file: the body IS the token.
+  resp=$(curl "${CURL_TIMEOUTS[@]}" -sS -X POST -w '\n%{http_code}' \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$jwt") \
     -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" \
-    | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+    -d "$body" \
+    "https://api.github.com/app/installations/$INSTALL_ID/access_tokens") || resp=$'\n000'
+  code=${resp##*$'\n'}
+  if [ "$code" != 201 ]; then
+    local hint=""
+    [ "$code" = 422 ] && hint=" -- the installation lacks Administration: write or does not select this repository; NOT retried unscoped"
+    # The message only, never the body: a 2xx body is a token.
+    log "installation token mint (repositories=[$REPO] administration=write) refused: HTTP $code $(printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')$hint"
+    return 1
+  fi
+  printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
 registration_token() {

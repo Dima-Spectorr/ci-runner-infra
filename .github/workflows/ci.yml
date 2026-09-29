@@ -392,6 +392,12 @@ jobs:
       - name: controller module self-test
         run: bash scripts/ci/controller-module.selftest.sh
 
+      # Every App installation-token mint names ONE repository and the exact
+      # permissions its path uses (#1419). An unscoped token works BETTER, so
+      # nothing else would ever turn red on the regression.
+      - name: app token scope self-test
+        run: bash scripts/ci/app-token-scope.selftest.sh
+
       - name: drain-decision self-test
         run: bash scripts/ci/drain-decision.selftest.sh
 
