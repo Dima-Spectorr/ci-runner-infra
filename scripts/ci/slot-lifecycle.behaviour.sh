@@ -545,7 +545,12 @@ check "without the pid rule a dead pid's socket survives -- so the check is live
 # the shape it has then: an empty real directory the slot owns. The socket here
 # is a bound, never-listening stand-in, removed again before the sweep section.
 DSOCK="/run/$U/docker.sock"
-if [ ! -e "/run/$U" ] && install -d -o "$U" -g "$U" -m 0700 "/run/$U"; then
+# A LEFTOVER /run/$U is this suite's own, from a run that was killed before its
+# cleanup (#1392 T1): the account is created above and the suite refuses to
+# start if it already existed, so no live slot can own this path here. Refusing
+# on it would fail every later run on that machine until someone removed it.
+rm -rf -- "/run/$U"
+if install -d -o "$U" -g "$U" -m 0700 "/run/$U"; then
   made_rundir=1
 fi
 check "the suite owns /run/$U for the stand-in socket" test "$made_rundir" = 1
@@ -627,18 +632,11 @@ echo "the daemon's socket, moved by the job (#1392)"
 # prune that does reach it fails in milliseconds instead of waiting out three
 # docker timeouts -- which is also why the positive case below is asserted on
 # the classification and not on the marker.
-DSOCK="/run/$U/docker.sock"
+# /run/$U and $DSOCK are the copy-up section's, still in place (and emptied of
+# its stand-in socket).
 MOVED="/run/$U/x.sock"
 RUNLOG="$SB/run-output"
-# A LEFTOVER /run/$U is this suite's own, from a run that was killed before its
-# cleanup: the account is created above and the suite refuses to start if it
-# already existed, so no live slot can own this path here. Refusing on it would
-# fail every later run on that machine until someone removed it by hand.
-rm -rf -- "/run/$U"
-if install -d -o "$U" -g "$U" -m 0700 "/run/$U"; then
-  made_rundir=1
-fi
-check "the suite owns /run/$U for the stand-in socket" test "$made_rundir" = 1
+check "/run/$U is still there for the stand-in daemon" test -d "/run/$U"
 LISTENER='import socket, sys
 s = socket.socket(socket.AF_UNIX)
 s.bind(sys.argv[1])

@@ -1201,9 +1201,10 @@ chmod 0750 "\$home" || { say "slot \$idx: could not chmod \$home"; rc=1; }
 # WHAT SURVIVES is what the two processes that outlive jobs keep there, and
 # only in a shape a job cannot use to carry data across the boundary:
 #
-#   rootlesskit-*          rootlesskit's --copy-up=/etc makes a bind directory
+#   rootlesskit-*          dockerd-rootless.sh passes --copy-up=/etc AND
+#                          --copy-up=/run, and each makes a bind directory
 #                          here (os.MkdirTemp("/tmp", "rootlesskit-b")), binds
-#                          /etc onto it, MOVES that bind to /etc/.ro<N> and
+#                          the original onto it, MOVES that bind to <dir>/.ro<N> and
 #                          removes the directory -- all before dockerd makes its
 #                          socket. Removing it mid copy-up fails the daemon, and
 #                          BindsTo then takes the agent down for good (Restart=no).
