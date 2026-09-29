@@ -407,6 +407,124 @@ wired "the reasons are a closed set" \
 wired "the zeroes are published too" 'for reason in disabled not-running template'
 wired "skips share the recycle series" 'outcome\\":\\"skip-\$reason'
 
+# --- a namespace that was never written is not a failed read (#1384) ----------
+#
+# Hosts built from a template that predates the publisher have no `ci/`
+# namespace, and asking for one that does not exist is a 404 -- not an empty
+# list. Read as "we did not get an answer", that held every such host forever:
+# `ci_pin_holds_honoured` equal to the pool's host count, `ci_demand=0`, idle
+# for an hour past a 900s grace, `min_hosts=0`, and no drain and no recycle,
+# because both go through this gate. So the gate is RUN here, end to end, from
+# the drain verdict through pin_hold_gate's real body, with gcloud answering in
+# the three shapes that matter.
+NS404="ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 404: The resource 'ci/' of type 'Guest Attribute' was not found. This command is authenticated as sa@example.iam.gserviceaccount.com which is the active account specified by the [core/account] property."
+INST404="ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 404: The resource 'projects/p/zones/test-zone-a/instances/h1' was not found. This command is authenticated as sa@example.iam.gserviceaccount.com which is the active account specified by the [core/account] property"
+
+# shellcheck source=/dev/null
+source "$MOD/drain-decision.sh"
+# shellcheck source=/dev/null
+source "$MOD/beacon-decision.sh"
+
+ctl_fn() { sed -n "/^$1() {/,/^}/p" "$CTL"; }
+GATE_CODE=$(printf '%s\n' "$(ctl_fn zone_of_uri)" "$(ctl_fn guest_attributes_denied)" \
+  "$(ctl_fn note_guest_attributes_denied)" "$(ctl_fn pin_hold_gate)")
+case "$GATE_CODE" in
+  *'pin_hold_gate() {'*'guest_attributes_namespace_absent'*) ;;
+  *)
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: pin_hold_gate() could not be extracted, or it no longer classifies the namespace 404\n'
+    ;;
+esac
+
+# gate_run <gcloud-rc> <gcloud-stderr> [csv-rows] [cached "run expiry"] [sed-mutation]
+# -> pin_hold_gate's verdict for host h1, cache file state appended as " cache=<...>"
+gate_run() {
+  local garc="$1" gerr="$2" rows="${3:-}" cache="${4:-}" mut="${5:-}"
+  local dir code
+  dir=$(mktemp -d)
+  [ -z "$cache" ] || printf '%s' "$cache" >"$dir/pinhold-h1"
+  code="$GATE_CODE"
+  [ -z "$mut" ] || code=$(printf '%s\n' "$code" | sed "$mut")
+  (
+    STATE_DIR="$dir"
+    PROJECT=test-project
+    BEACON_NS=ci
+    PIN_HOLD_KEY=pin-hold
+    PIN_HOLD_MAX=7200
+    GA_DENIED_FILE=""
+    log() { :; }
+    event() { :; }
+    timeout() { shift; "$@"; }
+    gcloud() {
+      [ "$garc" -eq 0 ] || { printf '%s\n' "$gerr" >&2; return "$garc"; }
+      printf '%s' "$rows"
+    }
+    eval "$code"
+    v=$(pin_hold_gate h1 "https://www.googleapis.com/compute/v1/projects/test-project/zones/test-zone-a/instances/h1")
+    printf '%s cache=%s' "$v" "$(cat "$dir/pinhold-h1" 2>/dev/null)"
+  )
+  rm -rf "$dir"
+}
+
+gate_expect() { # <description> <expected-prefix> <got>
+  if [[ "$3" == "$2"* ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  want: %s*\n  got:  %s\n' "$1" "$2" "$3"
+  fi
+}
+
+# The whole path, from the verdict the tick reaches for an idle host past its
+# grace, through the veto, to "the removal proceeds".
+e2e_drain=$(drain_decision RUNNING 0 3000 900 3 0 present 5000 600 complete)
+gate_expect "an idle host past grace reaches a drain verdict" "drain:idle-past-grace" "$e2e_drain"
+gate_expect "a host with no ci/ namespace is free, so its drain proceeds" \
+  "free:no-hold cache=" "$(gate_run 1 "$NS404")"
+# The fact is "no rows", not "no veto": a hold this controller already saw
+# still governs, exactly as it would for a successful read that found nothing.
+gate_expect "a remembered live hold survives a namespace 404" \
+  "hold:run=88 expiry=9999999999 live cached" \
+  "$(gate_run 1 "$NS404" "" "88 9999999999")"
+# The neighbours stay failures. Each can hide a hold that is really there.
+gate_expect "a missing INSTANCE is still a failed read" \
+  "hold:run= expiry=0 read-failed status=1" "$(gate_run 1 "$INST404")"
+gate_expect "a failed read leaves the cache untouched" \
+  "hold:run=88 expiry=9999999999 read-failed status=1 cache=88 9999999999" \
+  "$(gate_run 1 "$INST404" "" "88 9999999999")"
+gate_expect "a 404 on some other namespace is still a failed read" \
+  "hold:run= expiry=0 read-failed" \
+  "$(gate_run 1 "ERROR: HTTPError 404: The resource 'other/' of type 'Guest Attribute' was not found.")"
+gate_expect "a rate limit is still a failed read" \
+  "hold:run= expiry=0 read-failed status=1" \
+  "$(gate_run 1 "ERROR: HTTPError 429: Quota exceeded for quota metric 'Guest attribute queries'")"
+gate_expect "a silent failure is still a failed read" \
+  "hold:run= expiry=0 read-failed status=124" "$(gate_run 124 "")"
+# And a real read still behaves as before: the classification added no path
+# around a live published hold.
+SOON=$(($(date -u +%s) + 600))
+gate_expect "a live published hold still vetoes" \
+  "hold:run=77 expiry=$SOON live published" \
+  "$(gate_run 0 "" "pin-hold,77 $SOON")"
+# THE MUTATION, run rather than imagined: with the new arm deleted, the
+# namespace 404 is read-failed again and the host is held -- the #1384 bug.
+# If this ever reads `free`, the assertions above are passing on something
+# other than the classification.
+# shellcheck disable=SC2016  # the sed script carries the literal $ names.
+gate_expect "without the classification, the namespace 404 holds the host again" \
+  "hold:run= expiry=0 read-failed status=1" \
+  "$(gate_run 1 "$NS404" "" "" 's/guest_attributes_namespace_absent "\$(cat "\$errf")" "\$BEACON_NS"/false/')"
+
+# And the wiring: BOTH readers classify it, from the caller's error text.
+counted "both gates classify the namespace 404" \
+  'guest_attributes_namespace_absent "\$\(cat "\$errf"\)" "\$BEACON_NS"; then$' 2
+
+# The veto reaches Cloud Logging. log() stops at this VM's own file, which is
+# why a veto that never lifted was invisible on three pools (#1384).
+counted "both vetoes are events" 'event WARNING pin-hold-veto "\$host" "\$host: \$verdict -- VETOED by pin hold' 2
+counted "no veto is left on log() alone" '^ +log "\$host: \$verdict -- VETOED' 0
+wired "an unexplained beacon read failure is an event too" 'event WARNING beacon-read-failed "\$host"'
+
 if [ "$FAIL" -gt 0 ]; then
   echo "pin-hold-decision: $FAIL failed, $PASS passed"
   exit 1

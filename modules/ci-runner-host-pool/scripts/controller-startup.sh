@@ -2987,6 +2987,17 @@ beacon_gate() {
     denied=1
     note_guest_attributes_denied
     log "beacon: guest attributes are disabled by org policy -- $host cannot publish one, so it is judged on registration and age alone"
+  elif [ "$rc" != "0" ] && [ -n "$errf" ] && guest_attributes_namespace_absent "$(cat "$errf")" "$BEACON_NS"; then
+    # The namespace has never been written on this host (#1384): a read that
+    # SUCCEEDED and found no beacon, which the miss counter below then counts.
+    rc=0
+    raw=""
+  elif [ "$rc" != "0" ]; then
+    # Every other failure keeps the host, and is the only evidence a stuck pool
+    # leaves -- so it goes to Cloud Logging, not just to this VM's own file.
+    event WARNING beacon-read-failed "$host" \
+      "beacon: guest-attribute read of $host failed (status=$rc) -- kept: $(head -c 300 "${errf:-/dev/null}" 2>/dev/null | tr '\r\n' '  ')" \
+      status="$rc"
   fi
   [ -z "$errf" ] || rm -f "$errf"
 
@@ -3096,6 +3107,14 @@ pin_hold_gate() {
     disabled=1
     note_guest_attributes_denied
     log "pin-hold: guest attributes are disabled by org policy -- no hold can be published, so the veto on $host is not honoured"
+  elif [ "$rc" != "0" ] && [ -n "$errf" ] && guest_attributes_namespace_absent "$(cat "$errf")" "$BEACON_NS"; then
+    # The second failure that is not a failure (#1384): the namespace has never
+    # been written on this host, so no key -- no hold -- can be in it. That is
+    # a read that SUCCEEDED and returned no rows, and it is handed on as one,
+    # so the monotonic cache below still governs exactly as it would for that
+    # read: a hold remembered from earlier stays live until it lapses.
+    rc=0
+    raw=""
   fi
   [ -z "$errf" ] || rm -f "$errf"
 
@@ -3847,7 +3866,9 @@ tick_pool() {
         hold=$(pin_hold_gate "$host" "$host_uri")
         case "$hold" in
           hold:*)
-            log "$host: $verdict -- VETOED by pin hold ($hold)"
+            # An event, not a bare log(): log() reaches this VM's file and
+            # journald only, so a veto that never lifts was invisible (#1384).
+            event WARNING pin-hold-veto "$host" "$host: $verdict -- VETOED by pin hold ($hold)" verdict="$verdict" hold="$hold"
             PIN_HELD=$((PIN_HELD + 1))
             continue
             ;;
@@ -3940,7 +3961,7 @@ tick_pool() {
         hold=$(pin_hold_gate "$host" "$host_uri")
         case "$hold" in
           hold:*)
-            log "$host: $verdict -- VETOED by pin hold ($hold)"
+            event WARNING pin-hold-veto "$host" "$host: $verdict -- VETOED by pin hold ($hold)" verdict="$verdict" hold="$hold"
             PIN_HELD=$((PIN_HELD + 1))
             continue
             ;;

@@ -169,6 +169,47 @@ expect delete "modest skew inside one interval is still usable" \
 # argument gets the safe verdict, not the destructive one.
 expect keep "no arguments at all is a keep" # (no args)
 
+# --- guest_attributes_namespace_absent (#1384) ----------------------------------
+# The one 404 that is a successful read with no rows: the namespace was never
+# written on this host. Every neighbouring failure must stay a failure, because
+# each of those can hide a hold or a beacon that is really there.
+absent() { # <description> <expected 0|1> <text> [namespace]
+  local got=0
+  guest_attributes_namespace_absent "$3" "${4-ci}" || got=1
+  if [ "$got" = "$2" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  text: %s\n  want: %s got: %s\n' "$1" "$3" "$2" "$got"
+  fi
+}
+# Verbatim from a live pool host on 2026-09-29.
+NS404="ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 404: The resource 'ci/' of type 'Guest Attribute' was not found. This command is authenticated as sa@example.iam.gserviceaccount.com which is the active account specified by the [core/account] property."
+absent "the live namespace 404 is recognised" 0 "$NS404"
+absent "a line-wrapped namespace 404 is recognised" 0 \
+  "$(printf "ERROR: HTTPError 404: The resource 'ci/' of type 'Guest\nAttribute' was not found.")"
+absent "a CRLF namespace 404 is recognised" 0 \
+  "$(printf "HTTPError 404: The resource 'ci/' of type 'Guest Attribute' was not found.\r\n")"
+# Same call, same moment, a host that is gone. Verbatim too.
+absent "a missing INSTANCE is not a missing namespace" 1 \
+  "ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 404: The resource 'projects/p/zones/z/instances/h1' was not found. This command is authenticated as sa@example.iam.gserviceaccount.com"
+absent "a missing KEY is not a missing namespace" 1 \
+  "ERROR: HTTPError 404: The resource 'ci/pin-hold' of type 'Guest Attribute' was not found."
+absent "another namespace is not the one asked for" 1 \
+  "ERROR: HTTPError 404: The resource 'other/' of type 'Guest Attribute' was not found."
+absent "the right text under another status is not this" 1 \
+  "ERROR: HTTPError 403: The resource 'ci/' of type 'Guest Attribute' was not found."
+absent "the org-policy refusal is not this" 1 \
+  "ERROR: HTTPError 412: Constraint constraints/compute.disableGuestAttributesAccess violated for project 1."
+absent "a rate limit is not this" 1 "ERROR: HTTPError 429: Quota exceeded for quota metric 'Guest attribute queries'"
+absent "an empty error is not this" 1 ""
+# The text names the bare '/' resource, so this fails only because the empty
+# namespace is refused -- not because the text happened not to match.
+absent "no namespace to match against is never a match" 1 \
+  "ERROR: HTTPError 404: The resource '/' of type 'Guest Attribute' was not found." ""
+absent "a namespace that is not a plain name is never a match" 1 \
+  "ERROR: HTTPError 404: The resource '*/' of type 'Guest Attribute' was not found." '*'
+
 if [ "$FAIL" -gt 0 ]; then
   echo "beacon-decision: $FAIL failed, $PASS passed"
   exit 1
