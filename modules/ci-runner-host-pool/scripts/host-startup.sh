@@ -891,9 +891,30 @@ dbus_is_stock() { # <FragmentPath> <DropInPaths> of dbus.service
   done
   return 0
 }
+# A MANAGER THAT IS UP BUT NOT YET ANSWERING. At boot, user@<uid> reports
+# active before its private bus accepts \`systemctl --user -M\`, and a refusal
+# there took every slot of every freshly booted host out of service. Wait for
+# it briefly; if it still does not answer AT BOOT, nothing a job could have
+# left can exist yet, so there is nothing to stop. After a job it stays a
+# refusal -- that is the case the check exists for.
+user_manager_answers() { # -- 0 once \`systemctl --user -M\` answers, within ~30s
+  local n=0
+  until timeout -k 5 10 systemctl --user -M "\$u@" show -p Version --value >/dev/null 2>&1; do
+    n=\$((n + 1)); [ "\$n" -ge 10 ] && return 1
+    sleep 3
+  done
+}
 stop_user_units() { # <uid>
   local all names frag drop
   timeout -k 5 10 systemctl is-active --quiet "user@\$1.service" 2>/dev/null || return 0
+  if ! user_manager_answers; then
+    if [ "\$stage" = boot ]; then
+      say "slot \$idx: \$u's service manager does not answer yet at boot -- no job has run, nothing to stop"
+      return 0
+    fi
+    say "slot \$idx: \$u's service manager does not answer -- refusing to call this slot clean"
+    return 1
+  fi
   frag=\$(timeout -k 5 30 systemctl --user -M "\$u@" show -p FragmentPath --value dbus.service 2>/dev/null) &&
     drop=\$(timeout -k 5 30 systemctl --user -M "\$u@" show -p DropInPaths --value dbus.service 2>/dev/null) ||
     { say "slot \$idx: could not read the user bus unit of \$u -- refusing to call this slot clean"; return 1; }
