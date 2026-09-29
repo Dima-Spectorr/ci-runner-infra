@@ -473,6 +473,14 @@ jobs:
       - name: alert log-metric soft-fail self-test
         run: bash scripts/ci/alert-log-metric-softfail.selftest.sh
 
+      # The pin-hold alerts (#1388). A stuck veto mutes 'not scaling to zero'
+      # by design, so three pools sat full and idle for weeks with nothing
+      # paging. Every way these two can be wrong is silent -- a series nobody
+      # writes, an event nobody sends -- so each is pinned against the WRITER
+      # (controller-startup.sh), and the real body against policy_unchanged().
+      - name: alert held-pool self-test
+        run: bash scripts/ci/alert-held-pool.selftest.sh
+
 
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a

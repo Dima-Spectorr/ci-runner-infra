@@ -127,7 +127,12 @@ want "the log-based egress policy is not muted" "0" "$gce_muted"
 # ---------------------------------------------------------------------------
 docs=$(printf '%s\n' "$plain" | grep -c '"documentation": { "mimeType": "text/markdown", "content":')
 notes=$(printf '%s\n' "$muted" | grep -c 'MUTED POOLS: pool-broken\.')
-want "every policy that was muted says so" "$((docs - 1))" "$notes"
+# The log-based policies key on gce_instance and cannot be muted, so they are
+# the ones without the note. Counted from the render rather than written as a
+# literal: a literal went stale the moment a second log-based policy arrived.
+unmutable=$(printf '%s\n' "$plain" | grep -c 'resource\.type=\\"gce_instance\\"' || true)
+want "two policies here are log-based and cannot be muted" "2" "$unmutable"
+want "every policy that was muted says so" "$((docs - unmutable))" "$notes"
 
 # The one policy that must NOT carry the note is the one that could not be
 # muted. Caught in production on the first apply: the note went onto all
@@ -137,6 +142,8 @@ want "every policy that was muted says so" "$((docs - 1))" "$notes"
 # would rely on to decide the silence was deliberate.
 egress_note=$(printf '%s\n' "$muted" | grep -c 'MUTED POOLS.*runner firewall refused' || true)
 want "the policy that could not be muted does not claim to be" "0" "$egress_note"
+keep_note=$(printf '%s\n' "$muted" | grep -c 'MUTED POOLS.*spent two hours keeping hosts' || true)
+want "the unverified-keep policy does not claim to be muted" "0" "$keep_note"
 
 # ---------------------------------------------------------------------------
 # 4. Muting one pool must not mute another.
