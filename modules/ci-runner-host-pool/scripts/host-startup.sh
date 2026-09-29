@@ -1054,7 +1054,16 @@ daemon_sock() { # prints: absent | starting | ours | foreign
 
 dsock=""
 if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
+  # THE PROCESSES THAT WERE NEVER IN A CONTAINER go FIRST, and outside the
+  # socket test: a slot whose daemon is gone can still have been handed a job
+  # that backgrounded something. First because of #1392: a straggler still
+  # running while the socket is classified could move or replace the name
+  # between that check and the prune below. quiesce_slot spares the daemon's own
+  # unit (ci-dockerd@<idx>, and user@<uid>), so the daemon and the containers
+  # under it are untouched here and are removed through docker right after.
+  quiesce_slot || rc=1
   dsock=\$(daemon_sock)
+  say "slot \$idx: \$sock reads as \$dsock"
   if [ "\$dsock" = foreign ]; then
     say "slot \$idx: its daemon is running but \$sock is not the socket it listens on -- a job moved or replaced it, so no container was reclaimed and the slot is not clean"
     rc=1
@@ -1088,8 +1097,18 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
     # here, and a job is free to have started containers without compose at all.
     # \`-v\` takes the anonymous volumes with them, which is where a database that
     # was never meant to persist put its data.
-    cids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-             docker ps --all --quiet --no-trunc 2>/dev/null | sort -u)
+    #
+    # A FAILED listing is not an empty one. Piped straight into sort, the status
+    # was sort's: a \`docker ps\` that timed out or errored -- a slow daemon, or
+    # one a leftover had stopped -- read as "no containers", and the marker went
+    # on over a live stack. So the listing is taken first, without a pipe.
+    if ! cids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+                 docker ps --all --quiet --no-trunc 2>/dev/null); then
+      say "slot \$idx: could not list the containers the last job left -- the slot is not clean"
+      rc=1
+      cids=""
+    fi
+    cids=\$(printf '%s\n' "\$cids" | sort -u)
     if [ -n "\$cids" ]; then
       # word-splitting is the point -- one id per argument.
       # shellcheck disable=SC2086
@@ -1124,14 +1143,14 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
       timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
         docker volume prune --force >/dev/null 2>&1 ||
       { say "slot \$idx: could not prune the last job's volumes"; rc=1; }
+    # And the name is still the same daemon's AFTER the prune. Nothing of the
+    # slot's should be left running to swap it, but a prune that reached
+    # something else is exactly what this reset must not certify.
+    [ "\$(daemon_sock)" = "\$dsock" ] ||
+      { say "slot \$idx: \$sock changed under the prune -- the slot is not clean"; rc=1; }
   else
     say "slot \$idx: no docker socket at \$sock -- no container was reclaimed and no image tag was checked"
   fi
-
-  # AND THE PROCESSES THAT WERE NEVER IN A CONTAINER, which is why this sits
-  # outside the socket test rather than inside it: a slot whose daemon is gone
-  # can still have been handed a job that backgrounded something.
-  quiesce_slot || rc=1
 fi
 
 # EMPTY THE CURRENT DIRECTORY, minus what <spare-fn> claims. Used from inside a
@@ -1604,8 +1623,16 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
   # 1 for that above, and asking a job's listener what to untag proves nothing.
   if [ "\$dsock" != foreign ] && [ -S "\$sock" ]; then
 
-    ids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-            docker image ls --all --quiet --no-trunc 2>/dev/null | sort -u)
+    # A failed listing or inspect is not an empty one (#1392 review): the tags it
+    # would have found are exactly what the next job must not inherit. Taken
+    # without a pipe, so the status is docker's and not sort's.
+    if ! ids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+                docker image ls --all --quiet --no-trunc 2>/dev/null); then
+      say "slot \$idx: could not list the local images -- no tag was checked and the slot is not clean"
+      rc=1
+      ids=""
+    fi
+    ids=\$(printf '%s\n' "\$ids" | sort -u)
     if [ -n "\$ids" ]; then
       # One inspect for the whole store rather than one per image: a slot that
       # has run a few builds holds dozens, and this runs between every pair of
@@ -1613,10 +1640,13 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
       #
       # word-splitting \$ids is the point -- one id per argument.
       # shellcheck disable=SC2086
-      info=\$(timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
-              docker image inspect \
-              --format '{{.Id}} {{len .RepoDigests}} {{range .RepoTags}}{{.}} {{end}}' \
-              \$ids 2>/dev/null)
+      if ! info=\$(timeout 60 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
+                   docker image inspect \
+                   --format '{{.Id}} {{len .RepoDigests}} {{range .RepoTags}}{{.}} {{end}}' \
+                   \$ids 2>/dev/null); then
+        say "slot \$idx: could not inspect the local images -- the slot is not clean"
+        rc=1
+      fi
       while read -r id ndig tags; do
         [ -n "\$id" ] || continue
         [ "\$ndig" = 0 ] || continue

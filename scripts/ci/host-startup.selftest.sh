@@ -653,6 +653,28 @@ has_socket_identity() { # <file>
   matches "$code" "'' \| 0 \| \*\[!0-9\]\*\) echo absent; return 0 ;;" || return 1
   # 6. The image-tag prune never goes through a foreign socket either.
   matches "$code" 'if \[ "\\\$dsock" != foreign \] && \[ -S "\\\$sock" \]; then' || return 1
+  # 7. The job's stragglers are stopped BEFORE the classification, so none is
+  #    left to swap the name between the check and the prune ...
+  local quiesce
+  quiesce=$(printf '%s\n' "$code" | grep -n 'quiesce_slot || rc=1' | head -1 | cut -d: -f1)
+  [ -n "$quiesce" ] && [ "$quiesce" -lt "$classify" ] || return 1
+  # 8. ... and the name is classified again after the prune, failing closed.
+  [ "$(printf '%s\n' "$code" | grep -A1 -E '^    \[ "\\\$\(daemon_sock\)" = "\\\$dsock" \] \|\|$' |
+    grep -cE 'changed under the prune.*rc=1; \}$')" -ge 1 ] || return 1
+}
+
+# A FAILED DOCKER LISTING IS NOT AN EMPTY ONE (#1392 review). A docker ps piped
+# into sort took sort's status, so a listing that timed out or errored read as
+# "no containers" and the marker went on over a live stack. Each listing the
+# reset makes is taken without a pipe and fails the reset closed.
+has_listing_fails_closed() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^    if ! cids=\\\$\(timeout 30 sudo' || return 1
+  matches "$code" '^    if ! ids=\\\$\(timeout 30 sudo' || return 1
+  matches "$code" '^      if ! info=\\\$\(timeout 60 sudo' || return 1
+  matches "$code" 'could not list the containers the last job left' || return 1
+  counts "$code" 'docker (ps|image ls) --all --quiet --no-trunc 2>/dev/null \|' 0 || return 1
 }
 
 # THE MARKER IS A CLAIM ABOUT WRITERS, NOT ABOUT FILES (#237 finding 3).
@@ -992,6 +1014,12 @@ if has_socket_identity "$SCRIPT"; then
   ok
 else
   bad "the reset trusts whatever is at the slot's docker.sock — a job that renames the daemon's socket, or listens at the name itself, escapes the container and volume prune and the slot is still marked clean (#1392)"
+fi
+
+if has_listing_fails_closed "$SCRIPT"; then
+  ok
+else
+  bad "a docker listing that failed or timed out reads as an empty one — the reset writes the clean marker over containers or tags it never saw (#1392 review)"
 fi
 
 if has_slot_quiesce "$SCRIPT"; then
@@ -1958,7 +1986,13 @@ mutate "the listener's identity not checked"  's/\[ "\\$p" = "\\$peer" \] && { e
 mutate "a symlink at the name is trusted"     's/if \[ ! -S "\\$sock" \] || \[ -L "\\$sock" \]; then echo foreign/if [ ! -S "\\$sock" ]; then echo foreign/' has_socket_identity
 mutate "a name before the bind is trusted"    's/then echo foreign; else echo starting; fi/then echo starting; else echo starting; fi/' has_socket_identity
 mutate "tags pruned through a foreign socket" 's/if \[ "\\$dsock" != foreign \] && \[ -S "\\$sock" \]; then/if [ -S "\\$sock" ]; then/' has_socket_identity
-mutate "no daemon now fails closed"           "s/'' | 0 | \*\[!0-9\]\*) echo absent; return 0 ;;/'' | 0 | *[!0-9]*) echo foreign; return 0 ;;/" has_socket_identity
+mutate "stragglers quiesced after the check"  '/^  quiesce_slot || rc=1$/d; /^  dsock=\\$(daemon_sock)$/a\  quiesce_slot || rc=1' has_socket_identity
+mutate "no re-check after the prune"          's/^    \[ "\\$(daemon_sock)" = "\\$dsock" \] ||$/    true ||/'      has_socket_identity
+mutate "a failed docker ps reads as empty"    's/^    if ! cids=/    if cids=/'                                          has_listing_fails_closed
+mutate "docker ps piped into sort again"      's|docker ps --all --quiet --no-trunc 2>/dev/null); then|docker ps --all --quiet --no-trunc 2>/dev/null \| sort -u); then|' has_listing_fails_closed
+mutate "a failed image ls reads as empty"     's/^    if ! ids=/    if ids=/'                                            has_listing_fails_closed
+mutate "a failed image inspect is ignored"    's/^      if ! info=/      if info=/'                                      has_listing_fails_closed
+mutate "no daemon now fails closed"          "s/'' | 0 | \*\[!0-9\]\*) echo absent; return 0 ;;/'' | 0 | *[!0-9]*) echo foreign; return 0 ;;/" has_socket_identity
 
 mutate "nothing sweeps the last job's processes" '/quiesce_slot || rc=1/d'                                                has_slot_quiesce
 mutate "a sweep that fails no longer withdraws the marker" 's@quiesce_slot || rc=1@quiesce_slot@'                         has_slot_quiesce

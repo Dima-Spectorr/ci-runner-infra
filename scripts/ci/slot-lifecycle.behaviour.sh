@@ -661,10 +661,57 @@ reset_once() { # <script> -- one completed reset; its output kept apart as well
   return 0
 }
 refused_socket() { grep -q 'is not the socket it listens on' "$RUNLOG"; }
+reads_as() { grep -q "$DSOCK reads as $1\$" "$RUNLOG"; }
 
-# The daemon's own socket, where it belongs: not called foreign.
+# The daemon's own socket, where it belongs: classified as the daemon's -- not
+# merely "not foreign", which absent and starting would pass as well.
 reset_once "$RESET"
-check_not "the daemon's own socket is not called foreign" refused_socket
+check "the daemon's own socket reads as ours"          reads_as ours
+check_not "and is not called foreign"                  refused_socket
+
+# A FAILED LISTING IS NOT AN EMPTY ONE (#1392 review). A docker ps piped into
+# sort took sort's status, so a listing that errored or timed out -- a slow
+# daemon, or one a leftover had stopped -- read as "no containers" and the
+# marker went on over a live stack. Here docker is a stand-in, swapped in for
+# every call the reset makes, that answers everything empty and succeeds, and
+# fails ps on demand. Everything else about the slot is healthy, so the ps
+# failure is the only thing that can cost the marker.
+FAKEBIN="$SB/fakebin"
+install -d -m 0755 "$FAKEBIN"
+cat >"$FAKEBIN/docker" <<FAKE
+#!/bin/sh
+[ "\$1" = ps ] && [ -f "$SB/ps-fails" ] && exit 1
+exit 0
+FAKE
+chmod 0755 "$FAKEBIN/docker"
+fake_docker() { # <script> <out> -- the same reset, with every docker call on the stand-in
+  sed "s#^\([[:space:]]*\)docker #\1$FAKEBIN/docker #; s#\(DOCKER_HOST=\"unix://\\\$sock\"\) docker #\1 $FAKEBIN/docker #" "$1" >"$2"
+  chmod 0755 "$2"
+}
+FAKED="$SB/slot-reset.faked.sh"
+fake_docker "$RESET" "$FAKED"
+check_not "every docker call is on the stand-in" grep -qE '^[[:space:]]*docker |" docker ' "$FAKED"
+
+rm -f -- "$MARKER" "$SB/ps-fails"
+reset_once "$FAKED"
+check "with docker answering, the slot is marked clean" test -f "$MARKER"
+
+rm -f -- "$MARKER"
+: >"$SB/ps-fails"
+reset_once "$FAKED"
+check "a failed docker ps fails the reset"             test "$rc" != 0
+check "and the slot is not marked clean"               test ! -f "$MARKER"
+check "and says why"                                   grep -q 'could not list the containers' "$RUNLOG"
+
+# Put the pipe back, and the same failure earns the marker -- so the check is live.
+sed 's#docker ps --all --quiet --no-trunc 2>/dev/null); then#docker ps --all --quiet --no-trunc 2>/dev/null | sort -u); then#' \
+  "$FAKED" >"$MUTANT"
+chmod 0755 "$MUTANT"
+check_not "the pipe mutation applied" cmp -s "$FAKED" "$MUTANT"
+rm -f -- "$MARKER"
+reset_once "$MUTANT"
+check "piped into sort, the failed ps earns the marker -- so the check is live" test -f "$MARKER"
+rm -f -- "$SB/ps-fails"
 
 # Renamed by the job.
 rm -f -- "$MARKER" "$BURNS_1392"
@@ -695,21 +742,32 @@ for _ in $(seq 1 50); do
 done
 check "the job's own listener is up at the name"       test -S "$DSOCK"
 reset_once "$RESET"
+# The quiesce now runs BEFORE the classification (#1392 review), so the job's
+# listener is gone by then and what is left at the name answers nobody.
 check "a job's listener at the name fails the reset"   test "$rc" != 0
 check "and is called foreign"                          refused_socket
 check "and the slot is not marked clean"               test ! -f "$MARKER"
-# The quiesce has already stopped it; this makes sure by pid, so the stand-in
-# daemon -- the same program -- is never the one hit.
+# By pid, so the stand-in daemon -- the same program -- is never the one hit.
 kill "$fake" >/dev/null 2>&1
 wait "$fake" >/dev/null 2>&1
 
-# Break the listener's identity check: the job's listener is then trusted.
+# A listener the quiesce does NOT stop -- root's here, standing in for anything
+# outside the slot uid's reach -- is what the peer check is for. Refused as
+# foreign, and with the check broken back it is trusted.
+rm -f -- "$DSOCK" "$MARKER"
+python3 -c "$LISTENER" "$DSOCK" >/dev/null 2>&1 &
+fake=$!
+for _ in $(seq 1 50); do
+  [ -S "$DSOCK" ] && break
+  sleep 0.1
+done
+reset_once "$RESET"
+check "a listener outside the daemon's unit is called foreign" refused_socket
+check "and the slot is not marked clean"               test ! -f "$MARKER"
 # shellcheck disable=SC2016  # the rendered hook's literal $p/$peer
 sed 's/\[ "\$p" = "\$peer" \] && { echo ours/true \&\& { echo ours/' "$RESET" >"$MUTANT"
 check_not "the peer mutation applied" cmp -s "$RESET" "$MUTANT"
-rm -f -- "$DSOCK"
-sudo -u "$U" python3 -c "$LISTENER" "$DSOCK" >/dev/null 2>&1 &
-fake=$!
+check "the outside listener is still up for the mutant" test -S "$DSOCK"
 for _ in $(seq 1 50); do
   [ -S "$DSOCK" ] && break
   sleep 0.1
@@ -718,8 +776,8 @@ done
 # assertion below would pass for that reason instead.
 check "the stand-in daemon is still up for the mutant" systemctl is-active --quiet "$DAEMON_UNIT"
 reset_once "$MUTANT"
-check_not "without the peer check the job's listener is trusted -- so the check is live" \
-  refused_socket
+check "without the peer check the job's listener reads as ours -- so the check is live" \
+  reads_as ours
 kill "$fake" >/dev/null 2>&1
 wait "$fake" >/dev/null 2>&1
 
