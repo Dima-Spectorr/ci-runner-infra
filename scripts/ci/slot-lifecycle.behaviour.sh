@@ -481,6 +481,49 @@ seed_slot_tmp
 check "without the call, the leftover survives -- so the check above is live" test -d "$SLOT_TMP/a-fixed-dir"
 "$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
 
+# A symlink the job planted, pointing at a HOST directory: the link goes, the
+# target and its content do not.
+HOST_TARGET=$(mktemp -d /tmp/slot-lifecycle-target.XXXXXX)
+printf 'host data\n' >"$HOST_TARGET/keep"
+ln -s "$HOST_TARGET" "$SLOT_TMP/evil"
+chown -h "$U:$U" "$SLOT_TMP/evil"
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+check "a planted symlink is removed"                   test ! -L "$SLOT_TMP/evil"
+check "and the host directory it named is untouched"   test -f "$HOST_TARGET/keep"
+rm -rf -- "$HOST_TARGET"
+
+# WHAT IS SPARED, and only in the shape the runtime uses. $dpid is a live
+# process of the slot uid; 999999999 is above any pid_max, so never alive.
+make_sock() { python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"; }
+seed_spared() {
+  make_sock "$SLOT_TMP/dotnet-diagnostic-$dpid-1-socket"
+  make_sock "$SLOT_TMP/dotnet-diagnostic-999999999-1-socket"
+  mkfifo "$SLOT_TMP/clr-debug-pipe-$dpid-1-in" "$SLOT_TMP/clr-debug-pipe-999999999-1-in"
+  printf 'carried data\n' >"$SLOT_TMP/dotnet-diagnostic-$dpid-2-socket"
+  install -d "$SLOT_TMP/rootlesskit-b123" "$SLOT_TMP/.dotnet/shm" "$SLOT_TMP/.dotnet/lockfiles" \
+    "$SLOT_TMP/.dotnet/junk"
+}
+seed_spared
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+check "a live pid's diagnostic socket survives"        test -S "$SLOT_TMP/dotnet-diagnostic-$dpid-1-socket"
+check "a dead pid's diagnostic socket goes"            test ! -e "$SLOT_TMP/dotnet-diagnostic-999999999-1-socket"
+check "a live pid's debug pipe survives"               test -p "$SLOT_TMP/clr-debug-pipe-$dpid-1-in"
+check "a dead pid's debug pipe goes"                   test ! -e "$SLOT_TMP/clr-debug-pipe-999999999-1-in"
+check "a regular file under a live pid's name goes"    test ! -e "$SLOT_TMP/dotnet-diagnostic-$dpid-2-socket"
+check "rootlesskit's copy-up directory survives"       test -d "$SLOT_TMP/rootlesskit-b123"
+check ".dotnet/shm survives"                           test -d "$SLOT_TMP/.dotnet/shm"
+check ".dotnet/lockfiles survives"                     test -d "$SLOT_TMP/.dotnet/lockfiles"
+check "anything else in .dotnet goes"                  test ! -e "$SLOT_TMP/.dotnet/junk"
+
+# Break the pid rule back and prove the dead-pid assertions notice.
+sed 's/tmp_pid_alive "\${p%%-\*}"/true/' "$RESET" >"$MUTANT"
+check_not "the pid-rule mutation applied" cmp -s "$RESET" "$MUTANT"
+seed_spared
+"$MUTANT" completed "$IDX" >>"$HOOKLOG" 2>&1
+check "without the pid rule a dead pid's socket survives -- so the check is live" \
+  test -S "$SLOT_TMP/dotnet-diagnostic-999999999-1-socket"
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+
 # Through the HOST namespace, with no daemon: nothing may be emptied, because
 # the only /tmp left to find is the host's.
 systemctl stop "$DAEMON_UNIT" >/dev/null 2>&1
@@ -488,6 +531,19 @@ made_unit=0
 "$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
 check "with no daemon the reset still succeeds"        test "$?" = 0
 check "and the HOST /tmp is still untouched"           test -f "$HOST_SENTINEL"
+
+# A daemon WITHOUT PrivateTmp resolves to the host's /tmp through /proc as well.
+# The guard must refuse it. (Its mutation is not run here: a broken guard would
+# empty this machine's /tmp. host-startup.selftest.sh mutates it structurally.)
+if systemd-run --quiet --unit="$DAEMON_UNIT" --uid="$U" sleep 600 >>"$HOOKLOG" 2>&1; then
+  made_unit=1
+  sleep 1
+fi
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+check "a daemon sharing the host /tmp is refused, and the host /tmp survives" test -f "$HOST_SENTINEL"
+check "and the refusal is logged" grep -q 'is not a private one' "$HOOKLOG"
+systemctl stop "$DAEMON_UNIT" >/dev/null 2>&1
+made_unit=0
 rm -f -- "$HOST_SENTINEL"
 
 # --- the sweep ----------------------------------------------------------------

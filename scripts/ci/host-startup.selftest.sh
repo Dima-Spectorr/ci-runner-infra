@@ -207,8 +207,20 @@ has_slot_tmp_reset() { # <file>
   local code
   code=$(code_of "$1")
   matches "$code" 'systemctl show -p MainPID --value "ci-dockerd@\\\$idx\.service"' || return 1
-  matches "$code" 'ns="/proc/\\\$dpid/root/\\\$d"' || return 1
+  # entered ONCE and emptied relative to that handle (a reused pid mid-wipe
+  # cannot redirect a later rm), and '.' is what the checks are made on
+  matches "$code" 'cd "/proc/\\\$dpid/root/\\\$d"' || return 1
   matches "$code" '\[ "\\\$mine" = "\\\$host" \]' || return 1
+  matches "$code" '\[ "\\\$owner" != "\\\$uid" \]' || return 1
+  # rootlesskit's copy-up directory lives in /tmp for the daemon's whole life,
+  # and boot must not wipe while the copy-up is still running
+  matches "$code" 'rootlesskit-\*\) \[ -d' || return 1
+  matches "$code" 'while \[ ! -S "\\\$sock" \]' || return 1
+  # the .NET names are spared only while their pid is a live slot process
+  [ "$(printf '%s\n' "$code" | grep -cE 'tmp_pid_alive "\\\$\{p%%-\*\}"')" -ge 2 ] || return 1
+  # one filesystem, for /tmp and for the home alike
+  matches "$code" 'rm -rf --one-file-system -- "\./\\\$e"' || return 1
+  matches "$code" '^\( cd -- "\\\$home" && empty_here' || return 1
   matches "$code" '^  reset_slot_tmp all \|\| rc=1$' || return 1
   matches "$code" '^  reset_slot_tmp fixed \|\| rc=1$' || return 1
   matches "$code" '^tmp_fixed=".*gitleaks\.tmp.*"$'
@@ -353,7 +365,7 @@ has_slot_reset() { # <file>
   # REPLACEMENT, not cleaning. The home is emptied and the template copied back;
   # a predicate that only looked for an `rm` would have passed on the denylist
   # this replaces, so both halves are pinned.
-  matches "$code" 'find "\\\$home" -mindepth 1 -maxdepth 1 -exec rm -rf' || return 1
+  matches "$code" '^\( cd -- "\\\$home" && empty_here "\\\$home" spare_nothing \)' || return 1
   matches "$code" 'cp -a "\\\$SLOT_TEMPLATE/\." "\\\$home/"' || return 1
   # …and the previous job's workspace and tool cache go with it
   matches "$code" 'work="\\\$SLOT_ROOT/\\\$idx/_work"' || return 1
@@ -624,7 +636,7 @@ has_slot_quiesce() { # <file>
 
   containers=$(printf '%s\n' "$code" | grep -n 'docker rm --force --volumes' | head -1 | cut -d: -f1)
   quiesce=$(printf '%s\n' "$code" | grep -n 'quiesce_slot || rc=1' | head -1 | cut -d: -f1)
-  home_wipe=$(printf '%s\n' "$code" | grep -n 'find "\\\$home" -mindepth 1' | head -1 | cut -d: -f1)
+  home_wipe=$(printf '%s\n' "$code" | grep -n 'cd -- "\\\$home" && empty_here' | head -1 | cut -d: -f1)
   marker_write=$(printf '%s\n' "$code" | grep -n ': >"\\\$marker"' | head -1 | cut -d: -f1)
   [ -n "$containers" ] && [ -n "$quiesce" ] && [ -n "$home_wipe" ] && [ -n "$marker_write" ] || return 1
 
@@ -1804,7 +1816,14 @@ mutate "probe back to a name in /etc/hosts" 's|^DNS_PROBE_NAME=.*|DNS_PROBE_NAME
 mutate "daemon mount-namespace probe removed" 's|nsenter -t "$dpid" -m -n -- getent ahostsv4|nsenter --net="/run/netns/$ns" getent ahostsv4|' has_host_resolver
 mutate "slots share /tmp again"          's/^PrivateTmp=yes$/PrivateTmp=no/'                           has_slot_tmp_isolation
 mutate "only the daemon gets a private /tmp" 's/^JoinsNamespaceOf=ci-dockerd@\$idx\.service$/#&/'      has_slot_tmp_isolation
-mutate "reset empties the literal /tmp"     's|ns="/proc/\\$dpid/root/\\$d"|ns="/\\$d"|'                  has_slot_tmp_reset
+mutate "reset empties the literal /tmp"     's|cd "/proc/\\$dpid/root/\\$d"|cd "/\\$d"|'                  has_slot_tmp_reset
+mutate "fixed-path list emptied"            's/^tmp_fixed="gitleaks\.tmp"$/tmp_fixed=""/'                  has_slot_tmp_reset
+mutate "namespace owner not checked"        's/\[ "\\$owner" != "\\$uid" \]/false/g'                      has_slot_tmp_reset
+mutate "rootlesskit copy-up dir not spared" 's/rootlesskit-\*) \[ -d/rootlesskit-NOPE) [ -d/'              has_slot_tmp_reset
+mutate "boot wipes during the copy-up"      's/while \[ ! -S "\\$sock" \]/while false/'                   has_slot_tmp_reset
+mutate ".NET names spared for a dead pid"   's/tmp_pid_alive "\\${p%%-\*}"/true/g'                        has_slot_tmp_reset
+mutate "wipe crosses filesystems"           's|rm -rf --one-file-system -- "\./\\$e"|rm -rf -- "./\\$e"|' has_slot_tmp_reset
+mutate "home back to a crossing find"       's|^( cd -- "\\$home" && empty_here.*|find "\\$home" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +|' has_slot_tmp_reset
 mutate "host-/tmp guard dropped"            's/\[ "\\$mine" = "\\$host" \]/false/'                        has_slot_tmp_reset
 mutate "/tmp not emptied at the boundary"   's/^  reset_slot_tmp all || rc=1$/  :/'                        has_slot_tmp_reset
 mutate "leftover download kept at started"  's/^  reset_slot_tmp fixed || rc=1$/  :/'                      has_slot_tmp_reset
@@ -1835,7 +1854,7 @@ mutate "hook install no longer fatal"     's@install_job_hooks || die.*@install_
 mutate "template build no longer fatal"   's@seed_slot_template || die.*@seed_slot_template || true@'              has_slot_reset
 mutate "reset script left slot-writable"  's@chmod 0755 /opt/ci/job-hooks/slot-reset.sh@chmod 0777 /opt/ci/job-hooks/slot-reset.sh@' has_slot_reset
 mutate "home cleaned, never replaced"     's@^cp -a "\\\$SLOT_TEMPLATE/\." "\\\$home/".*@:@'                       has_slot_reset
-mutate "home never emptied"               's@^find "\\\$home" -mindepth 1.*@:@'                                    has_slot_reset
+mutate "home never emptied"               's@^( cd -- "\\\$home" && empty_here.*@:@'                                  has_slot_reset
 mutate "home taken from the environment"  's@^home=\\\$(getent passwd.*@home="\$HOME"@'                           has_slot_reset
 mutate "slot names its own index"         's@if \[ -n "\\\${SUDO_UID:-}" \]@if [ -n "\${CI_SLOT:-}" ]@'           has_slot_reset
 mutate "sudoers widened to any argument"  's@ started, /opt/ci/job-hooks/slot-reset.sh completed@@'                has_slot_reset
@@ -1894,7 +1913,7 @@ mutate "the sweep kills the agent that called it" 's|keep="\\$keep\\$p "|keep="\
 mutate "the slot's own dockerd is swept away"  '/user@\\$1/d'                                                             has_slot_quiesce
 mutate "a root sweep no longer spares the agent" 's|ci-runner@\\$idx.service|ci-runner@0.service|'                        has_slot_quiesce
 mutate "a zombie is counted as a survivor"     '/= Z ] \&\& continue/d'                                                   has_slot_quiesce
-mutate "the home wipe stops being the anchor"  '/find "\\$home" -mindepth 1/d'                                            has_slot_quiesce
+mutate "the home wipe stops being the anchor"  '/cd -- "\\$home" \&\& empty_here/d'                                            has_slot_quiesce
 mutate "a job can name itself out of the sweep" 's|{line##|{line#|g'                                                      has_slot_quiesce
 
 mutate "App JWT back in curl argv"        's@-K <(printf.*\$jwt")@-H "Authorization: Bearer $jwt"@'          has_secrets_out_of_argv
