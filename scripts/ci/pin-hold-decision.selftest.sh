@@ -446,15 +446,27 @@ gate_run() {
   code="$GATE_CODE"
   [ -z "$mut" ] || code=$(printf '%s\n' "$code" | sed "$mut")
   (
+    # Read by the lifted pin_hold_gate through `eval`, and the stubs below replace
+    # what it calls -- none of which shellcheck can see.
+    # shellcheck disable=SC2034
     STATE_DIR="$dir"
+    # shellcheck disable=SC2034
     PROJECT=test-project
+    # shellcheck disable=SC2034
     BEACON_NS=ci
+    # shellcheck disable=SC2034
     PIN_HOLD_KEY=pin-hold
+    # shellcheck disable=SC2034
     PIN_HOLD_MAX=7200
+    # shellcheck disable=SC2034
     GA_DENIED_FILE=""
+    # shellcheck disable=SC2317
     log() { :; }
+    # shellcheck disable=SC2317
     event() { :; }
+    # shellcheck disable=SC2317
     timeout() { shift; "$@"; }
+    # shellcheck disable=SC2317
     gcloud() {
       [ "$garc" -eq 0 ] || { printf '%s\n' "$gerr" >&2; return "$garc"; }
       printf '%s' "$rows"
