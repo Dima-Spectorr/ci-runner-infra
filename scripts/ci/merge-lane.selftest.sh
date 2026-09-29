@@ -213,6 +213,110 @@ passes_the_app_credentials() {
   matches "$code" '^      app-private-key: \$\{\{ secrets\.'
 }
 
+# A review is fired by anyone, a fork's author included, and a fork's review
+# event carries no secrets — so the token step can only go red. The `if:` must
+# answer same-repository heads only for that event, and leave every other event
+# alone.
+LANE_FORK_GUARD="(github.event_name != 'pull_request_review' || github.event.pull_request.head.repo.full_name == github.repository)"
+
+answers_reviews_from_this_repository_only() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^  pull_request_review:$' || return 1
+  printf '%s\n' "$code" | grep -A1 -E '^  pull_request_review:$' | grep -cE '^    types: \[submitted\]$' >/dev/null || return 1
+  printf '%s\n' "$code" | grep -E "^    if: vars\.MERGE_LANE_ENABLED == 'true' && " | grep -cF -- "$LANE_FORK_GUARD" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# The documented callers: what every private consumer copies (#1380)
+# ---------------------------------------------------------------------------
+#
+# A self-hosted host starts only for real pull-request CI. The template is two
+# files: `merge-lane.yml` answers CI completions on the pool label (the host is
+# still warm), `merge-lane-events.yml` answers everything else on a hosted
+# runner. Each property below is read from ONE fenced block of the doc, picked
+# by its `name:` line, so a sibling block can never be what satisfies it.
+
+# Prints the ```yaml block whose first line is exactly `name: <name>`.
+doc_block() { # <doc> <workflow name>
+  awk -v want="name: $2" '
+    /^```yaml$/            { inblk = 1; first = 1; keep = 0; buf = ""; next }
+    inblk && /^```$/       { if (keep) printf "%s", buf; inblk = 0; next }
+    inblk                  { if (first) { keep = ($0 == want); first = 0 }
+                             buf = buf $0 "\n" }
+  ' "$1"
+}
+
+# The `on:` keys of a workflow text, comments stripped.
+triggers_of() { # <workflow text>
+  printf '%s\n' "$1" | grep -vE '^[[:space:]]*#' |
+    awk '/^on:/ { on = 1; next } on && /^[^ ]/ { exit } on && /^  [a-z_]+:/ { print }'
+}
+
+POOL_CALLER_NAME='Merge lane'
+EVENTS_CALLER_NAME='Merge lane (events)'
+
+# The pool label is reachable from a CI completion and from nothing else: a
+# timer, a label, a review or a dispatch on this file would each start a host.
+documented_pool_caller_listens_to_ci_only() {
+  local blk
+  blk=$(doc_block "$1" "$POOL_CALLER_NAME")
+  [ -n "$blk" ] || return 1
+  [ "$(triggers_of "$blk")" = "  workflow_run:" ]
+}
+
+# Every `runs-on` in the events file is the hosted image — a pool label there
+# is a host started by a label, a review or a timer.
+documented_events_caller_runs_hosted() {
+  local blk all hosted
+  blk=$(doc_block "$1" "$EVENTS_CALLER_NAME")
+  [ -n "$blk" ] || return 1
+  all=$(printf '%s\n' "$blk" | grep -vE '^[[:space:]]*#' | grep -cE '^ *runs-on:')
+  hosted=$(printf '%s\n' "$blk" | grep -vE '^[[:space:]]*#' | grep -cE '^ *runs-on: ubuntu-latest$')
+  [ "${all:-0}" -gt 0 ] && [ "$all" = "$hosted" ]
+}
+
+documented_events_caller_answers_reviews_from_this_repository_only() {
+  local blk tmp rc
+  blk=$(doc_block "$1" "$EVENTS_CALLER_NAME")
+  [ -n "$blk" ] || return 1
+  tmp=$(mktemp)
+  printf '%s\n' "$blk" >"$tmp"
+  answers_reviews_from_this_repository_only "$tmp"
+  rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
+# The backstop is once a day on the hosted file, and no documented caller
+# carries a short timer — `*/15` against a fifteen-minute idle grace is what
+# kept five idle pools up around the clock.
+documented_backstop_is_daily() {
+  local events pool
+  events=$(doc_block "$1" "$EVENTS_CALLER_NAME" | grep -vE '^[[:space:]]*#')
+  pool=$(doc_block "$1" "$POOL_CALLER_NAME" | grep -vE '^[[:space:]]*#')
+  [ -n "$events" ] && [ -n "$pool" ] || return 1
+  matches "$events" "^    - cron: '[0-9]+ [0-9]+ \* \* \*'\$" || return 1
+  ! matches "$events"$'\n'"$pool" 'cron:.*\*/'
+}
+
+# Both files are one lane: the same repository-wide group, the markers the
+# consumer gates demand, and the operator's switch.
+documented_callers_are_one_lane() {
+  local name blk code
+  for name in "$POOL_CALLER_NAME" "$EVENTS_CALLER_NAME"; do
+    blk=$(doc_block "$1" "$name")
+    [ -n "$blk" ] || return 1
+    code=$(printf '%s\n' "$blk" | grep -vE '^[[:space:]]*#')
+    matches "$code" '^  group: merge-lane$' || return 1
+    matches "$code" '^  cancel-in-progress: false$' || return 1
+    matches "$code" "^    if: vars\.MERGE_LANE_ENABLED == 'true'" || return 1
+    matches "$blk" '^# concurrency-serialization: intentional[[:space:]]*[—-]' || return 1
+    matches "$blk" '^ *# remote-reusable-allowed\(Dima-Spectorr/ci-runner-infra/\.github/workflows/merge-lane\.yml, #' || return 1
+    matches "$code" 'merge-lane\.yml@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+$' || return 1
+  done
+}
+
 # ---------------------------------------------------------------------------
 # The driver: what it does with a verdict
 # ---------------------------------------------------------------------------
@@ -257,7 +361,7 @@ reads_both_check_surfaces() {
 waits_for_the_app_to_exist() {
   local code
   code=$(code_of "$1")
-  matches "$code" "^ *if: vars.MERGE_LANE_ENABLED == 'true'$"
+  matches "$code" "^ *if: vars.MERGE_LANE_ENABLED == 'true'( && .*)?$"
 }
 
 # A reusable workflow's `actions/checkout` clones the CALLER. Without an
@@ -1482,6 +1586,12 @@ check has_a_backstop_sweep "$CALLER" "there is no sweep, so a pull request needi
 check arms_deliberately "$CALLER" "the lane is not armed by an explicit variable, so it cannot be landed in dry run"
 check passes_the_app_credentials "$CALLER" "the caller does not pass App credentials, so the lane cannot authenticate"
 check waits_for_the_app_to_exist "$CALLER" "the caller runs before an operator confirms the App exists, so it goes red on every CI completion and that red stops meaning anything"
+check answers_reviews_from_this_repository_only "$CALLER" "the caller does not wake on a submitted review, or answers a fork's review, whose run has no secrets and can only go red"
+check documented_pool_caller_listens_to_ci_only "$DOC" "the documented pool-label caller answers something other than a CI completion, so a timer, a label or a review starts a self-hosted host on its own"
+check documented_events_caller_runs_hosted "$DOC" "the documented events caller runs on something other than the hosted image, so a label, a review or the backstop starts a self-hosted host"
+check documented_events_caller_answers_reviews_from_this_repository_only "$DOC" "the documented events caller does not wake on a submitted review, or answers a fork's review with no secrets to mint the token"
+check documented_backstop_is_daily "$DOC" "a documented caller carries a short timer again, which against the idle grace keeps a pool host up around the clock"
+check documented_callers_are_one_lane "$DOC" "the two documented callers do not share the merge-lane group, the markers or the operator's switch, so they can run two passes at once or fail the consumer gates"
 
 check merges_only_the_sha_it_verified "$DRIVER" "the merge is not conditional on the verified sha, so a push mid-pass merges unverified code"
 check treats_a_non_verdict_as_a_failure "$DRIVER" "a skipped or neutral required check counts as success, so the lane merges what nothing checked"
@@ -1605,7 +1715,44 @@ mutate "the backstop sweep is removed" "$CALLER" \
 mutate "the lane is armed unconditionally" "$CALLER" \
   's@dry-run: .*MERGE_LANE_ARMED.*@dry-run: false@' arms_deliberately
 mutate "the caller runs before the App is provisioned" "$CALLER" \
-  "s@^    if: vars.MERGE_LANE_ENABLED == 'true'\$@    name: lane@" waits_for_the_app_to_exist
+  "s@^    if: vars.MERGE_LANE_ENABLED == 'true'@    if: true@" waits_for_the_app_to_exist
+mutate "the caller stops waking on a review" "$CALLER" \
+  's|^  pull_request_review:$|  x-pull_request_review:|' answers_reviews_from_this_repository_only
+mutate "the caller wakes on every review action, not a submitted one" "$CALLER" \
+  's|^    types: \[submitted\]$|    types: [submitted, edited, dismissed]|' answers_reviews_from_this_repository_only
+mutate "the caller answers a fork's review" "$CALLER" \
+  "s@ \&\& (github.event_name != 'pull_request_review' || github.event.pull_request.head.repo.full_name == github.repository)@@" \
+  answers_reviews_from_this_repository_only
+
+mutate "the documented pool caller gains a timer" "$DOC" \
+  "s@^    workflows: \[CI, main-health\]\$@    workflows: [CI, main-health]\n  schedule:\n    - cron: '0 * * * *'@" \
+  documented_pool_caller_listens_to_ci_only
+mutate "the documented pool caller gains the label trigger" "$DOC" \
+  '/^name: Merge lane$/,/^```$/ s@^permissions:$@  pull_request_target:\n    types: [labeled]\npermissions:@' \
+  documented_pool_caller_listens_to_ci_only
+mutate "the documented events caller moves onto the pool label" "$DOC" \
+  '/^name: Merge lane (events)$/,/^```$/ s@^      runs-on: ubuntu-latest$@      runs-on: your-linux-pool-label@' \
+  documented_events_caller_runs_hosted
+mutate "the documented events caller loses every runs-on" "$DOC" \
+  '/^name: Merge lane (events)$/,/^```$/ s@^      runs-on: ubuntu-latest$@@' \
+  documented_events_caller_runs_hosted
+mutate "the documented events caller stops waking on a review" "$DOC" \
+  's|^  pull_request_review:$|  x-pull_request_review:|' documented_events_caller_answers_reviews_from_this_repository_only
+mutate "the documented events caller answers a fork's review" "$DOC" \
+  "s@ \&\& (github.event_name != 'pull_request_review' || github.event.pull_request.head.repo.full_name == github.repository)@@" \
+  documented_events_caller_answers_reviews_from_this_repository_only
+mutate "the documented backstop goes back to every fifteen minutes" "$DOC" \
+  "s@^    - cron: '17 5 \* \* \*'\$@    - cron: '*/15 * * * *'@" documented_backstop_is_daily
+mutate "the documented backstop is dropped" "$DOC" \
+  "s@^    - cron: '17 5 \* \* \*'\$@@" documented_backstop_is_daily
+mutate "the documented events caller takes a group of its own" "$DOC" \
+  '/^name: Merge lane (events)$/,/^```$/ s@^  group: merge-lane$@  group: merge-lane-events@' documented_callers_are_one_lane
+mutate "the documented pool caller takes a group of its own" "$DOC" \
+  '/^name: Merge lane$/,/^```$/ s@^  group: merge-lane$@  group: merge-lane-ci@' documented_callers_are_one_lane
+mutate "the documented events caller loses the operator's switch" "$DOC" \
+  "/^name: Merge lane (events)\$/,/^\`\`\`\$/ s@^    if: vars.MERGE_LANE_ENABLED == 'true' \&\& @    if: @" documented_callers_are_one_lane
+mutate "the documented events caller loses its RUNNER7 marker" "$DOC" \
+  '/^name: Merge lane (events)$/,/^```$/ s@^    # remote-reusable-allowed(@    # reusable(@' documented_callers_are_one_lane
 mutate "the private key stops being passed" "$CALLER" \
   's@^      app-private-key: .*@      app-private-key: literal-key@' passes_the_app_credentials
 

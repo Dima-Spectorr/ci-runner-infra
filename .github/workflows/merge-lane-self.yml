@@ -42,10 +42,19 @@ on:
   # the happy path and finite on the unhappy one.
   #
   # Free here: this repository is PUBLIC, so GitHub-hosted minutes are unmetered.
-  # A private consumer should point `runs-on` at the fleet instead of dropping
-  # the schedule — it is the only thing that recovers a missed dispatch.
+  # A private consumer must NOT copy this timer: its template runs the backstop
+  # once a day on a hosted runner, and never a timer on a pool label, which
+  # keeps a self-hosted host up around the clock (#1380, docs/merge-lane.md).
   schedule:
     - cron: '*/15 * * * *'
+
+  # An approval, or Copilot answering, can make a green pull request mergeable
+  # with no CI completion after it — and it is what ends the `review-bots`
+  # grace without waiting for the sweep. Anyone may review, including a fork's
+  # author, and a fork's review event runs with no secrets, so the job's `if:`
+  # answers same-repository heads only. Hosted, like everything in this file.
+  pull_request_review:
+    types: [submitted]
 
   workflow_dispatch:
 
@@ -71,7 +80,11 @@ jobs:
     #
     # `secrets.*` cannot be read in an `if:`, which is why this is a variable
     # rather than a test for the secret itself.
-    if: vars.MERGE_LANE_ENABLED == 'true'
+    #
+    # The second half is the fork guard for `pull_request_review`: a review on
+    # a fork's pull request carries no secrets, so the token step could only go
+    # red. Every other event here is same-repository by construction.
+    if: vars.MERGE_LANE_ENABLED == 'true' && (github.event_name != 'pull_request_review' || github.event.pull_request.head.repo.full_name == github.repository)
     uses: ./.github/workflows/merge-lane.yml
     permissions:
       contents: read

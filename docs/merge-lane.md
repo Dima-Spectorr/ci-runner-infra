@@ -182,12 +182,33 @@ Store the credentials as repository (or account-level) secrets:
 
 ## Wiring a repository
 
-One file. The reusable half lives here; `workflow_call` is the only trigger a
-callee may declare, so the `workflow_run` half is necessarily yours.
+Two files. The reusable half lives here; `workflow_call` is the only trigger a
+callee may declare, so the trigger half is necessarily yours — and it is split
+in two by **the rule this fleet runs on: a self-hosted host starts only for real
+pull-request CI, never for the lane on its own** (#1380).
+
+| File | Triggers | `runs-on` | Why that runner |
+|---|---|---|---|
+| `merge-lane.yml` | `workflow_run` (CI / base-health completed) **only** | your pool label | the host that just ran CI is still inside the controller's idle grace, so the pass costs nothing |
+| `merge-lane-events.yml` | `pull_request_target` labeled / ready_for_review, `pull_request_review` submitted, a daily `schedule`, `workflow_dispatch` | `ubuntu-latest` | nothing warmed a host for these, and starting one to answer "nothing to merge" is exactly what kept five idle pools up all day |
+
+Both files carry the **same** `concurrency: group: merge-lane`. A concurrency
+group is repository-wide, not per workflow, so there is still exactly one pass
+at a time across both files.
+
+Why two files rather than one with `runs-on` chosen by event: a pool label must
+never sit in a workflow a `pull_request_target` or `pull_request_review` event
+can reach. Split, that is visible in the file's `on:` block and the self-test
+pins it; in one file it would rest on an expression no gate can read.
 
 ```yaml
 name: Merge lane
 
+# CI completions ONLY. This is the one trigger that arrives while a pool host
+# is already warm — it just ran the CI that completed — so the lane pass rides
+# on it for free. Every other trigger lives in merge-lane-events.yml on a
+# GitHub-hosted runner: never add a schedule, a pull_request_target or a
+# pull_request_review here, because each would start a pool host by itself.
 on:
   workflow_run:
     # Must match each workflow's `name:` exactly.
@@ -195,22 +216,15 @@ on:
     # LIST THE BASE-HEALTH WORKFLOW HERE TOO if you have armed the gate. On an
     # armed base the lane merges only onto a tip that has answered green, so the
     # completion of that job is precisely the event that unblocks the next
-    # merge. Leave it out and the lane still gets there — the cron backstop and
-    # the next CI completion both wake it — but a backlog drains at whichever of
-    # those happens to fire rather than as fast as the base can vouch for itself.
+    # merge. Leave it out and the lane still gets there — the next CI completion
+    # or the daily backstop wakes it — but a backlog drains at whichever of those
+    # happens to fire rather than as fast as the base can vouch for itself.
+    #
+    # A merge moves the base. If your CI workflow also runs on `push` to the
+    # base, its completion re-dispatches the lane here, on a still-warm host.
+    # If it does not, add `push: branches: [<base>]` to merge-lane-events.yml.
     workflows: [CI, main-health]
     types: [completed]
-  schedule:
-    - cron: '*/15 * * * *'   # the backstop — see below
-  # `labeled` matters only if you re-narrow with `require-label`, which the
-  # fleet default no longer does. Under a label gate, labelling is the last
-  # thing to happen on a pull request whose CI is already green, and nothing
-  # else dispatches the lane for it. See "A label applied after the green",
-  # below. `ready_for_review` is worth keeping either way: leaving draft is
-  # also a state change no CI completion follows.
-  pull_request_target:
-    types: [labeled, ready_for_review]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -219,7 +233,9 @@ permissions:
 # of open pull requests and could both act on it. The marker is what
 # `check-workflow-concurrency.sh` requires in exchange for a constant group key
 # — it accepts that a third request evicts the pending run, which costs nothing
-# here because the lane re-reads live state on the next CI completion or cron.
+# here because the lane re-reads live state on the next trigger. The SAME group
+# as merge-lane-events.yml: groups are repository-wide, so the two files still
+# run one pass at a time between them.
 # concurrency-serialization: intentional — one merge decision at a time
 concurrency:
   group: merge-lane
@@ -247,7 +263,8 @@ jobs:
         Your other required check
       # A LINUX label. `self-hosted` alone matches the fleet's Windows pool too,
       # and the lane is bash: `mapfile`, `date -u -d`, `jq`. Use the same
-      # Linux-scoped label your CI jobs use. See "minutes", below.
+      # Linux-scoped label your CI jobs use — the pool that just ran the CI
+      # this run completed, so the host is warm. See "Minutes", below.
       #
       # NOT A YAML SEQUENCE. This is a `type: string` input, so
       # `runs-on: [self-hosted, linux]` here is a parse error and the workflow
@@ -319,6 +336,94 @@ jobs:
       app-private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
 ```
 
+The second file answers every event that is NOT a CI completion. Nothing warmed
+a host for these, so they run GitHub-hosted: about one billed minute each, and
+only when a person or a bot actually did something. Keep its `with:` block
+identical to `merge-lane.yml`'s except for `runs-on` — the same lane, reached a
+different way.
+
+```yaml
+name: Merge lane (events)
+
+# Everything that is not a CI completion, on a GitHub-hosted runner. A pool
+# label must NEVER appear in this file: `pull_request_target` and
+# `pull_request_review` reach it, and so does a timer — each would start a
+# self-hosted host just to answer "nothing to merge". CI completions are
+# merge-lane.yml's, on the pool host that is still warm from the CI itself.
+on:
+  # Leaving draft, and — under a `require-label` gate only — labelling, are
+  # state changes no CI completion follows. See "A label applied after the
+  # green", below.
+  pull_request_target:
+    types: [labeled, ready_for_review]
+  # An approval, or an automated reviewer answering, can make a green pull
+  # request mergeable with no CI completion after it. This is also what ends
+  # the lane's `review-bots` grace without waiting for the backstop.
+  pull_request_review:
+    types: [submitted]
+  # The backstop, not the mechanism: it recovers a dispatch GitHub dropped.
+  # Once a day, never on a short timer — see "The schedule is a backstop".
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The SAME group as merge-lane.yml, on purpose: a concurrency group is
+# repository-wide, so one pass at a time still holds across both files.
+# concurrency-serialization: intentional — one merge decision at a time
+concurrency:
+  group: merge-lane
+  cancel-in-progress: false
+
+jobs:
+  lane:
+    # Off until an operator confirms the App secrets exist. And a review on a
+    # FORK's pull request runs with no secrets at all, so the App token cannot
+    # be minted and the run would only go red: skip it. A same-repository head
+    # is the only review this file answers; a fork's pull request still reaches
+    # the lane through its CI completion.
+    if: vars.MERGE_LANE_ENABLED == 'true' && (github.event_name != 'pull_request_review' || github.event.pull_request.head.repo.full_name == github.repository)
+    # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml, #<issue>): read and recorded there
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@d8d1e6d8be794657066a8d32a0327b62172ea299 # v5.77.0
+    permissions:
+      contents: read
+    with:
+      base: main
+      required-checks: |
+        Your required check
+        Your other required check
+      # GitHub-hosted, and nothing else. See the header.
+      runs-on: ubuntu-latest
+      inflight-budget-seconds: 1800
+      pass-budget-seconds: 600
+      require-label: ''
+      pin-bump-actor: ${{ vars.MERGE_LANE_PIN_BUMP_ACTOR }}
+      status-issue: ${{ vars.MERGE_LANE_STATUS_ISSUE }}
+      review-bots: |
+        copilot-pull-request-reviewer[bot]
+      review-grace-seconds: 60
+      dry-run: ${{ vars.MERGE_LANE_ARMED != 'true' }}
+    secrets:
+      app-id: ${{ secrets.MERGE_APP_ID }}
+      app-private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+```
+
+> **Migrating an existing single-file caller.** Before #1380 the template was
+> one `merge-lane.yml` carrying every trigger on the pool label, with
+> `cron: '*/15 * * * *'` — which, against a fifteen-minute controller idle
+> grace, kept a pool host up around the clock on repositories with no open
+> work. To migrate: (1) in `merge-lane.yml`, delete the `schedule`,
+> `pull_request_target` and `workflow_dispatch` triggers so only
+> `workflow_run` remains; (2) add `merge-lane-events.yml` above, copying your
+> `with:` values across and changing only `runs-on` to `ubuntu-latest`; (3) if
+> your CI workflow does not run on `push` to the base, add `push: branches:
+> [<base>]` to the events file so a merge still wakes the lane. Both files keep
+> the one `merge-lane` concurrency group. Land it as one pull request — a
+> window with only half of it on the base loses nothing, the lane just runs
+> less often.
+
 > **The two markers in that example are not decoration, and admin merge will
 > not tell you so.** A caller without them is rejected by gates several repos in
 > this fleet already vendor: `check-workflow-concurrency.sh` wants the top-level
@@ -389,10 +494,17 @@ jobs:
 > repos/OWNER/ci-runner-infra/commits/<sha>` returning 422 is the cheap check
 > that whatever you are about to paste is a commit at all.
 
-**The schedule is a backstop, not the mechanism.** A merge moves the base, which
-makes every other open pull request one commit behind — and that is not a CI
-completion, so nothing would dispatch the lane to notice. It is also what
-recovers a missed dispatch. Do not drop it.
+**The schedule is a backstop, not the mechanism — and it runs once a day, on
+a hosted runner.** What wakes the lane is events: a CI completion, a review, a
+label, leaving draft. A merge moves the base, which makes every other open pull
+request one commit behind; that is covered by your CI's own `push` run on the
+base, whose completion dispatches `merge-lane.yml` on a still-warm host (add
+`push: branches: [<base>]` to the events file if your CI does not run on push).
+What is left for the schedule is recovering a dispatch GitHub dropped, and a day
+is an acceptable ceiling for that. Do not drop it, and **never put a timer on a
+pool label**: it was `*/15` on the pool until #1380, and against a
+fifteen-minute idle grace that kept a host up around the clock — 56 to 78 lane
+passes a day on five repositories that opened no pull request at all.
 
 **`required-checks` must name checks that exist.** A name matching nothing is
 counted as missing and blocks every merge. That is the safe direction, but it is
@@ -464,11 +576,27 @@ lane is broken", and that exact confusion cost an hour during the cutover.
 the fleet to be healthy in order to merge a fix to the fleet.*
 
 Every other repository in the fleet is **private**, where GitHub-hosted minutes
-are billed. Those should pass `runs-on: self-hosted`: fleet minutes are free and
-unmetered, and the lane holds a slot for as long as the walk takes — seconds on
-a quiet base, minutes on a busy one, and never more than `pass-budget-seconds`.
-That is still not the runner-hour `mergify-nudge` spent deliberately asleep, but
-it is not free either, which is the next section.
+are billed — and where a self-hosted minute is not free either, because a pool
+host that has to START for the lane costs a boot plus the controller's idle
+grace, not the few seconds the pass takes. So the rule is (#1380):
+
+- **A self-hosted host starts only for real pull-request CI.** The lane never
+  starts one on its own.
+- **A lane pass after a CI completion runs on the pool label** (`merge-lane.yml`,
+  `workflow_run` only). The host that ran that CI is still inside its idle
+  grace, so the pass rides on it for nothing.
+- **Every other trigger runs on `ubuntu-latest`** (`merge-lane-events.yml`):
+  labelled, ready for review, a review submitted, the daily backstop, a manual
+  dispatch. About one billed minute each, and only when a person or a bot
+  acted.
+- **Never a timer on a pool label.** Measured 2026-09-29, before this rule:
+  five private repositories ran 56–78 scheduled lane passes a day with zero
+  pull requests opened, because `*/15` against a fifteen-minute idle grace
+  meant their pools never reached zero.
+
+Either way the lane holds a slot for as long as the walk takes — seconds on a
+quiet base, minutes on a busy one, and never more than `pass-budget-seconds`,
+which is the next section.
 
 ### What a pass costs, and why it has a deadline
 
@@ -583,16 +711,17 @@ So the ordinary sequence is: CI completes, the lane runs, logs
 `skip:no-label`, and stops. The label arrives a minute later and dispatches
 nothing. The pull request is then green, labelled, `mergeable_state: clean`,
 and waiting on the schedule — which reads as a broken lane, because every
-visible signal says it should have merged. On `*/15` that is a quarter of an
-hour and merely annoying. On the daily cron a repository on hosted runners uses
-to stay cheap, it is **up to 24 hours**, which is worse than the Mergify
-latency this lane was built to remove.
+visible signal says it should have merged. On the daily backstop every caller
+now runs, that is **up to 24 hours**, which is worse than the Mergify latency
+this lane was built to remove.
 
-`pull_request_target: [labeled, ready_for_review]` closes it, and it is the
-cheap fix rather than the thorough one on purpose: it dispatches once per label
-event instead of every fifteen minutes forever, so a repository paying for
-hosted minutes gets seconds of latency for a few seconds of billing. Tightening
-the cron instead buys the same latency at 96 runs a day.
+`pull_request_target: [labeled, ready_for_review]` in `merge-lane-events.yml`
+closes it, and it is the cheap fix rather than the thorough one on purpose: it
+dispatches once per label event, on a hosted runner, instead of on a timer, so
+the repository gets seconds of latency for about a billed minute. Tightening the
+cron instead buys the same latency at 96 runs a day. `pull_request_review:
+[submitted]` closes the same gap for an approval or a bot review arriving after
+the green — also a state change no CI completion follows.
 
 Two things make `pull_request_target` safe here, and both must stay true:
 
@@ -606,10 +735,16 @@ Two things make `pull_request_target` safe here, and both must stay true:
 
 `check-runner-policy.sh` RUNNER4 sees `pull_request_target` and marks the
 workflow fork-reachable, which means any **fleet-reachable** job in it needs a
-fork guard. The repositories that need this trigger are the ones on
-`ubuntu-latest`, so nothing in the file is fleet-reachable and the rule is
-already satisfied. If you add the trigger to a lane running on a pool label,
+fork guard. The trigger lives only in `merge-lane-events.yml`, which runs on
+`ubuntu-latest`, so nothing in that file is fleet-reachable and the rule is
+satisfied by construction. If you move the trigger into the pool-label file,
 RUNNER4 will stop you, and it is right to.
+
+`pull_request_review` is the one trigger here a fork CAN fire — anyone may
+review — but a fork's review event runs with no secrets, so the App token could
+not be minted anyway. The events file's `if:` skips it unless the head is in
+the same repository; a fork's pull request still reaches the lane through its
+CI completion.
 
 ### Waiting for the automated reviewers
 
@@ -995,8 +1130,9 @@ Two consequences worth stating plainly:
 - **Wake the lane on the health job, not only on CI.** Add the health workflow's
   `name:` to your caller's `workflow_run: workflows:` list. Its completion is
   the event that unblocks the next merge, and a caller that only listens to CI
-  learns the tip went green whenever the cron backstop next fires — a fifteen
-  minute pause between merges on a base that answered in two.
+  learns the tip went green only at the next CI completion or the daily
+  backstop — a pause between merges measured in hours on a base that answered
+  in two minutes.
 - **Join the names to the jobs, or the gate disarms itself in silence.** The
   names in `base-health-checks` are matched literally against the check-runs on
   the tip, and a name that matches nothing counts as MISSING — which does not
