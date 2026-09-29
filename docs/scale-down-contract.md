@@ -62,6 +62,48 @@ idle window completes the drain. A failure of the instance delete *after* every
 agent is deregistered leaves a runner-less host, which the next tick reads as
 `absent`, re-proves idle with nothing to deregister, and deletes.
 
+## A hold that cannot be read is held — for ever
+
+Gate 3 fails closed like the rest: a guest-attribute read that fails is
+`hold:… read-failed`, because a live hold may be sitting behind it. **A host
+whose read keeps failing therefore stays held on every tick, on BOTH removal
+paths** — the drain and the stale-template recycle go through the same gate, so
+the host can neither leave nor be replaced by one that would read cleanly.
+
+Two failures are not failures, and the controller classifies them from gcloud's
+own error text (text no job can write):
+
+| gcloud says | Meaning | Treated as |
+|---|---|---|
+| `HTTPError 412: Constraint constraints/compute.disableGuestAttributesAccess violated` | guest attributes are off for the project, write included | no hold can exist → `free:guest-attributes-unavailable` |
+| `HTTPError 404: The resource 'ci/' of type 'Guest Attribute' was not found` | the host has never written the namespace (a template older than the publisher) | a successful read with no rows → the cache decides, usually `free:no-hold` |
+
+Everything else — including a 404 for a missing **instance**, a missing key, a
+403, a 429, a timeout — stays `read-failed`, and stays held.
+
+> **Measured 2026-09-29 (#1384).** Three pools on a 2026-08-26 template sat full
+> and idle — 3/3, 3/3 and 4/4 hosts held, `ci_demand = 0`, idle 2221–3573 s
+> against a 900 s grace, `min_hosts = 0`. Every held host answered the
+> namespace 404. The veto line reached only the controller's local log.
+
+**How it shows.** A veto is now an event — `jsonPayload.event =
+"pin-hold-veto"` in the `ci-controller` log, with the verdict, the hold reason
+and, for a failed read, the first 300 bytes of gcloud's error — and a beacon
+read that keeps a host is `beacon-read-failed`. Both are sent when their class
+changes (`live-published`, `live-cached` at INFO; `read-failed`, `no-zone`,
+`malformed-hold` at WARNING; the beacon's by status) and otherwise once every
+10 minutes per host, so a state that never changes still shows up every
+10 minutes without filling every tick's 500-entry event batch. The
+metric is `ci_pin_holds_honoured`, and **it is also what mutes *Not scaling to
+zero***, so a stuck veto silences the alert that would otherwise catch it. The
+alert shape for this failure is therefore:
+
+* `ci_pin_holds_honoured` equal to the pool's running hosts, with `ci_demand = 0`,
+  for longer than `PIN_HOLD_MAX` (7200 s) — no legitimate hold outlives that
+  ceiling without a renewing run, and a renewing run is demand; or
+* any `pin-hold-veto` event whose `hold` contains `read-failed`, repeating for
+  the same host across that window.
+
 ## Absence is not an observation
 
 Gate 1 is the one that was missing, and it is the subtlest.

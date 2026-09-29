@@ -214,3 +214,114 @@ beacon_decision() {
   echo "delete:idle workers=0 beacon_age=${beacon_age}s"
   return 0
 }
+
+# guest_attributes_namespace_absent <stderr-text> <namespace> -> 0 when the
+# read failed ONLY because the namespace itself does not exist on the instance,
+# 1 for every other outcome.
+#
+# Here rather than in its own file because both gates that need it -- the
+# beacon's and the pin hold's -- run on every controller, this file is
+# concatenated ahead of pin-hold-decision.sh on every one of them, and the
+# end-to-end drain harness already loads it.
+#
+# WHY A 404 CAN BE A SUCCESSFUL READ (#1384)
+#
+# Both gates read the whole `<namespace>/` in one call. Asked for a namespace
+# nothing has EVER written into, the compute API does not answer with an empty
+# list -- it answers 404. Verbatim from a live pool host on 2026-09-29:
+#
+#   ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 404: The
+#   resource 'ci/' of type 'Guest Attribute' was not found.
+#
+# A host built from a template that predates the publisher has no `ci/`
+# namespace at all. Read as "we did not get an answer", that made every pin
+# hold on those hosts `hold:... read-failed`, vetoed every drain AND every
+# recycle -- and since the recycle is the only thing that would have replaced
+# the host with one that publishes, it did so permanently. Three pools sat idle
+# and full for hours with `ci_pin_holds_honoured` equal to their host count. A
+# namespace that does not exist holds no key, so there is no hold and no beacon
+# behind this failure: it is the same fact as a read that succeeded and
+# returned no rows, and the callers treat it exactly so.
+#
+# NARROW ON PURPOSE. Only the guest-attribute resource type, and only the
+# namespace the caller asked for. The neighbouring 404s are NOT this:
+#
+#   * a missing INSTANCE -- "The resource 'projects/p/zones/z/instances/h' was
+#     not found" -- names no guest attribute and stays a read failure; and
+#   * a missing KEY, or some other namespace, names a different resource and
+#     stays a read failure.
+#
+# The text can only come from gcloud on the controller -- the resource name in
+# it is the query path the CONTROLLER sent, not anything a job wrote -- so this
+# is not a lever job code can pull to talk the controller out of a veto.
+# Line-wrapped and CRLF output is normalised, and `LC_ALL=C` for the reason
+# guest_attributes_denied gives. An empty namespace, or one carrying anything
+# but [A-Za-z0-9_-], is refused outright: an empty one would match the bare
+# `'/'` resource, and the rule should never have to reason about a quote or a
+# slash inside the name it is matching. Pure: no I/O, no globals.
+guest_attributes_namespace_absent() {
+  local text="${1:-}" ns="${2:-}"
+  [ -n "$ns" ] || return 1
+  case "$ns" in *[!A-Za-z0-9_-]*) return 1 ;; esac
+  text=$(printf '%s' "$text" | LC_ALL=C tr '\r\n\t' '   ' | LC_ALL=C tr -s ' ')
+  case "$text" in
+    *"HTTPError 404: The resource '$ns/' of type 'Guest Attribute' was not found"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# event_throttle_decision <previous "class epoch"> <class> <now> <interval>
+#   -> "emit" or "quiet"
+#
+# WHY THE GATES' EVENTS ARE RATE-LIMITED. A veto, or a read that keeps failing,
+# is re-decided on EVERY tick for EVERY host it affects. Sent as an event each
+# time, a healthy two-hour pin hold alone is hundreds of entries per host, and a
+# fleet-wide 429 or API outage is one per host per tick -- all competing for
+# flush_events' 500-entry batch with the drain and cordon events that matter.
+#
+# So an event is sent when the CLASS of the answer changes (a hold that goes
+# from `live published` to `read-failed` is news; the same hold seen again is
+# not), and otherwise once per <interval> as a heartbeat, so a state that never
+# changes -- which is exactly the #1384 failure -- is still visible in the log
+# for as long as it lasts.
+#
+# The class is the caller's, and must not carry anything that moves every tick
+# (an expiry, a remaining-seconds count), or every tick is a change. Anything
+# the caller cannot vouch for -- no record, a malformed one, a clock that went
+# backwards -- emits: a duplicate line is cheap, a silent state is what this
+# replaced. Pure: no I/O, no globals.
+event_throttle_decision() {
+  local prev="${1:-}" class="${2:-}" now="${3:-}" interval="${4:-600}"
+  local p_class p_at
+  case "$now" in '' | *[!0-9]*) echo emit; return 0 ;; esac
+  case "$interval" in '' | *[!0-9]*) interval=600 ;; esac
+  p_class=${prev%% *}
+  p_at=${prev#* }
+  if [ -z "$prev" ] || [ "$p_at" = "$prev" ]; then echo emit; return 0; fi
+  case "$p_at" in '' | *[!0-9]*) echo emit; return 0 ;; esac
+  if [ "$p_class" != "$class" ]; then echo emit; return 0; fi
+  if [ "$p_at" -gt "$now" ] || [ "$now" -ge "$((p_at + interval))" ]; then
+    echo emit
+    return 0
+  fi
+  echo quiet
+}
+
+# pin_hold_class <pin_hold_decision verdict> -> "<class> <severity>"
+#
+# The veto event's class and severity. A LIVE hold is the mechanism working --
+# a pull request between tiers keeping its host -- and is INFO. Everything else
+# that vetoes is a hold the controller could not verify, and is WARNING: the
+# read failed, the host had no zone to read from, or the publisher wrote
+# garbage. Only the reason word is used, never the run or expiry, for the
+# reason event_throttle_decision gives. Pure.
+pin_hold_class() {
+  case "${1:-}" in
+    *" live published"*) echo "live-published INFO" ;;
+    *" live cached"*) echo "live-cached INFO" ;;
+    *" read-failed"*) echo "read-failed WARNING" ;;
+    *" no-zone"*) echo "no-zone WARNING" ;;
+    *" malformed-hold"*) echo "malformed-hold WARNING" ;;
+    *) echo "other WARNING" ;;
+  esac
+}

@@ -846,6 +846,13 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
   : >"$dir/events"
   : >"$dir/log"
   printf '%s' "$ga" >"$dir/ga.csv"
+  # Through a FILE, not spliced into the script below: gcloud's real 404 text
+  # quotes the resource ('ci/'), and a single quote inside the single-quoted
+  # splice ends the string -- the stub then emits a mangled error and every
+  # case built on it passes or fails for the wrong reason.
+  printf '%s\n' "${GATE_GA_ERR:-}" >"$dir/ga.err"
+  # The beacon failure event's throttle state from an earlier tick, if any.
+  [ -z "${GATE_BEACONERR:-}" ] || printf '%s' "$GATE_BEACONERR" >"$dir/beaconerr-h1"
 
   roster_json "$runners" 0 >"$dir/runners.json"
   if [ "$busy" = ROSTERFAIL ]; then
@@ -876,8 +883,8 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
   # is the real one: the proof is only as good as its insistence on reading the
   # roster to its END, and a stub that always says "complete" removes exactly
   # that. guest_attributes_denied is real for the same reason on the beacon side.
-  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-    "$(fn host_age_seconds)" "$(fn instance_host_os)" \
+  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "$(fn throttled_event)" "$(fn host_age_seconds)" "$(fn instance_host_os)" \
     "$(fn guest_attributes_denied)" "$(fn note_guest_attributes_denied)" \
     "$(fn beacon_gate)" "$(fn fetch_runner_roster)" "$(fn drain_fail)" "$(fn drain_host)")
   [ -n "$mut" ] && code=$(printf '%s\n' "$code" | sed "$mut")
@@ -899,6 +906,7 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
       # name would abort the whole subshell rather than fail one check.
       GA_DENIED_FILE=''
       BEACON_INTERVAL=30
+      EVENT_HEARTBEAT=600
       REGISTER_GRACE=600
       ORPHAN_CONFIRM_TICKS=3
       DRAINED=0
@@ -932,7 +940,7 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
             # The stderr matters as much as the status. beacon_gate classifies
             # the refusal by grepping gcloud's own message for the constraint
             # id, so a stub that fails silently exercises only half the branch.
-            [ $garc -eq 0 ] || { printf '%s\n' '${GATE_GA_ERR:-}' >&2; return $garc; }
+            [ $garc -eq 0 ] || { cat '$dir/ga.err' >&2; return $garc; }
             cat '$dir/ga.csv'; return 0 ;;
           *'instances describe'*)
             [ $derc -eq 0 ] || return $derc
@@ -1067,6 +1075,50 @@ check "gate/windows: dropping the flag restores the host nobody could delete" \
   "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
   "$(GATE_GA_ERR="$GA_POLICY_ERR" gate_seq windows '' 1 0 0 3 0 4000 \
     's/"\$ORPHAN_CONFIRM_TICKS" "\$denied"/"$ORPHAN_CONFIRM_TICKS"/')"
+
+# --- the namespace nobody ever wrote, end to end (#1384) ----------------------
+# A host from a template older than the publisher has no ci/ namespace, and the
+# API answers that with a 404. It is "read OK, no beacon" -- the host is judged
+# exactly as one whose read succeeded and found none -- and never "read failed",
+# which kept such hosts for ever. The instance-404 beside it stays a failure.
+GA_NS404="ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 404: The resource 'ci/' of type 'Guest Attribute' was not found. This command is authenticated as sa@example.iam.gserviceaccount.com which is the active account specified by the [core/account] property."
+GA_INST404="ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 404: The resource 'projects/test-project/zones/test-zone-a/instances/h1' was not found."
+check "gate/windows: a never-written namespace is reclaimable once confirmed" \
+  "ssh=0 ga=1 dereg=0 del=1 rc=0 clear=1 held=0 und=0 fb=0 err=0" \
+  "$(GATE_GA_ERR="$GA_NS404" gate_seq windows '' 1 0 0 3 0 4000)"
+check "gate/windows: a never-written namespace still needs its confirmations" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
+  "$(GATE_GA_ERR="$GA_NS404" gate_seq windows '' 1 0 0 1 0 4000)"
+check "gate/windows: a never-written namespace still keeps a host that HAS agents" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
+  "$(GATE_GA_ERR="$GA_NS404" gate_seq windows '' 1 0 2 9 0 4000)"
+check "gate/windows: a missing INSTANCE is still a failed read" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
+  "$(GATE_GA_ERR="$GA_INST404" gate_seq windows '' 1 0 0 3 0 4000)"
+# shellcheck disable=SC2016  # the sed script must carry the literal $ names.
+check "gate/windows: dropping the namespace arm restores the host nobody could delete" \
+  "ssh=0 ga=1 dereg=0 del=0 rc=1 clear=0 held=1 und=0 fb=0 err=0" \
+  "$(GATE_GA_ERR="$GA_NS404" gate_seq windows '' 1 0 0 3 0 4000 \
+    's/guest_attributes_namespace_absent "\$(cat "\$errf")" "\$BEACON_NS"/false/')"
+# The read that DOES keep is the only trace a stuck pool leaves, so it reaches
+# Cloud Logging as an event; the namespace 404 does not, because it is not one.
+check "gate/windows: an unexplained read failure is an event" \
+  "WARNING beacon-read-failed;INFO drain-probe;" \
+  "$(GATE_GA_ERR="$GA_INST404" gate_seq windows '' 1 0 0 3 0 4000 '' events)"
+# Throttled: the same failure sent a minute ago is not sent again, a different
+# status is, and one sent a heartbeat ago is sent again.
+check "gate/windows: a repeated read failure inside the heartbeat is not re-sent" \
+  "INFO drain-probe;" \
+  "$(GATE_BEACONERR="status-1 $(($(date +%s) - 60))" GATE_GA_ERR="$GA_INST404" gate_seq windows '' 1 0 0 3 0 4000 '' events)"
+check "gate/windows: a read failure with a new status is sent at once" \
+  "WARNING beacon-read-failed;INFO drain-probe;" \
+  "$(GATE_BEACONERR="status-124 $(($(date +%s) - 60))" GATE_GA_ERR="$GA_INST404" gate_seq windows '' 1 0 0 3 0 4000 '' events)"
+check "gate/windows: a read failure past the heartbeat is sent again" \
+  "WARNING beacon-read-failed;INFO drain-probe;" \
+  "$(GATE_BEACONERR="status-1 $(($(date +%s) - 700))" GATE_GA_ERR="$GA_INST404" gate_seq windows '' 1 0 0 3 0 4000 '' events)"
+check "gate/windows: a never-written namespace is not reported as a failure" \
+  "INFO drain-probe;" \
+  "$(GATE_GA_ERR="$GA_NS404" gate_seq windows '' 1 0 0 1 0 4000 '' events)"
 
 # --- the OS itself cannot be established: fail CLOSED, agents kept ------------
 check "gate/unknown: a ci-host-os this controller does not know keeps the host" \
