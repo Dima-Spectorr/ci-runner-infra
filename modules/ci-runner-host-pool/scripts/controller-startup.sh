@@ -719,10 +719,12 @@ gh_actions_token() {
 
 # gh_actions_post <run_id> <cancel|rerun> — sets ACT_CLASS and ACT_CODE.
 #
-# The response HEADERS are captured, because actions_write_class needs two of
-# them to tell a missing permission from a rate limit; both answer 403.
+# The response HEADERS and BODY are both captured, because actions_write_class
+# needs them to tell a missing permission from a rate limit; both answer 403,
+# and only the body's own message says which. The body of these two endpoints
+# is an empty success or a short error document; it never carries a token.
 gh_actions_post() {
-  local run_id="$1" verb="$2" hdr rem ra
+  local run_id="$1" verb="$2" hdr bodyf rem ra body
   ACT_CLASS=transient
   ACT_CODE=""
   gh_actions_token
@@ -732,14 +734,16 @@ gh_actions_post() {
     *) ACT_CODE="mint-${GH_ACT_MINT#transient:}"; return 0 ;;
   esac
   hdr="$STATE_DIR/actions-post.hdr"
-  ACT_CODE=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -D "$hdr" -w '%{http_code}' -X POST \
+  bodyf="$STATE_DIR/actions-post.body"
+  ACT_CODE=$(curl "${CURL_TIMEOUTS[@]}" -s -o "$bodyf" -D "$hdr" -w '%{http_code}' -X POST \
     -H "Authorization: Bearer $GH_ACT_TOKEN" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/$REPO_FULL/actions/runs/$run_id/$verb") || ACT_CODE=000
   rem=$(tr -d '\r' <"$hdr" 2>/dev/null | awk -F': *' 'tolower($1) == "x-ratelimit-remaining" { v = $2 } END { print v }')
   ra=$(tr -d '\r' <"$hdr" 2>/dev/null | awk -F': *' 'tolower($1) == "retry-after" { v = $2 } END { print v }')
-  rm -f "$hdr"
-  ACT_CLASS=$(actions_write_class "$ACT_CODE" "$rem" "$ra")
+  body=$(head -c 4096 "$bodyf" 2>/dev/null)
+  rm -f "$hdr" "$bodyf"
+  ACT_CLASS=$(actions_write_class "$ACT_CODE" "$rem" "$ra" "$body")
   return 0
 }
 

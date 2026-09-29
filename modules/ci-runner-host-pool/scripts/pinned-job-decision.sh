@@ -572,28 +572,36 @@ pin_rerun_decision() {
   fi
 }
 
-# actions_write_class <http_code> <x-ratelimit-remaining> <retry-after>
+# actions_write_class <http_code> <x-ratelimit-remaining> <retry-after> <body>
 #
-# What a cancel or re-run response MEANS, from the code and two headers.
+# What a cancel or re-run response MEANS, from the code, two headers and the
+# response body.
 #
 # A 403 is NOT always "this App lacks Actions: write". GitHub answers 403 for a
-# primary rate limit (x-ratelimit-remaining: 0) and for a secondary one (a
-# retry-after header), and reading either as a permission refusal would record
-# the run as `refused`, so it would never be re-run, over a limit that clears in
-# minutes. So a 403 is a refusal only when the limit is provably NOT the cause:
-# remaining is a number above zero AND there is no retry-after. A missing header
-# is unknown, and unknown is transient.
+# primary rate limit (x-ratelimit-remaining: 0) and for a secondary one, which
+# carries a retry-after header only SOMETIMES: a secondary-limit 403 can arrive
+# with requests remaining and no retry-after at all. Reading any of those as a
+# permission refusal records the run as `refused`, so it is never re-run, over a
+# limit that clears in minutes.
+#
+# And a permission refusal is the unlikely reading to begin with: the POST is
+# made with the down-scoped token, and that token was only minted because the
+# installation holds Actions: write (the mint answers 422 otherwise). So a 403
+# is a refusal ONLY when GitHub says so in the body, with its permission
+# message, "Resource not accessible by integration", and no rate-limit signal
+# contradicts it (remaining 0, or a retry-after). Anything else is transient.
 #
 # Echoes `ok`, `refused`, `transient` or `failed`. Pure.
 actions_write_class() {
-  local code="${1:-}" rem="${2:-}" ra="${3:-}"
+  local code="${1:-}" rem="${2:-}" ra="${3:-}" body="${4:-}"
   case "$code" in
     201 | 202 | 204) echo ok; return 0 ;;
     403)
-      case "$rem" in
-        "" | *[!0-9]*) echo transient; return 0 ;;
+      case "$body" in
+        *"Resource not accessible by integration"*) ;;
+        *) echo transient; return 0 ;;
       esac
-      if [ "$rem" -gt 0 ] && [ -z "$ra" ]; then echo refused; else echo transient; fi
+      if [ -n "$ra" ] || [ "$rem" = 0 ]; then echo transient; else echo refused; fi
       return 0
       ;;
     429 | 5?? | 000 | "") echo transient ;;

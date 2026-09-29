@@ -62,8 +62,10 @@ installation token, minted per controller with `repositories: [<its repo>]`
 and `permissions: {actions: write}`. So a cancel or re-run can only ever reach
 that one repository's runs. Every read keeps the ordinary installation token.
 A missing grant surfaces at that mint as HTTP 422. A 403 on the POST counts as a
-refusal only when `x-ratelimit-remaining` is above zero and there is no
-`retry-after`; otherwise it is a rate limit and is retried on a later tick. A
+refusal only when its body says `Resource not accessible by integration` and
+there is no rate-limit signal (`x-ratelimit-remaining: 0` or a `retry-after`).
+Any other 403 is a rate limit, and a secondary limit can arrive with neither
+header, so it is retried on a later tick. A
 refusal falls back to a WARNING `pinned-run-unservable` event that names the run
 and says to re-run it in full, which is exactly the behaviour before the grant.
 

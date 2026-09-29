@@ -437,15 +437,24 @@ is "the later states are cancel-only too: done" cancel-only: "$(pin_orphan_actio
 is "the later states are cancel-only too: superseded" cancel-only: "$(pin_orphan_action superseded)"
 is "the later states are cancel-only too: declined" cancel-only: "$(pin_orphan_action declined)"
 
-# F2: a 403 is a permission refusal only when it is provably not a rate limit.
-is "F2: 403 with requests left and no retry-after is a refusal" refused \
-  "$(actions_write_class 403 4999 "")"
-is "F2: 403 with the primary limit exhausted is transient" transient \
-  "$(actions_write_class 403 0 "")"
-is "F2: 403 with retry-after (secondary limit) is transient" transient \
-  "$(actions_write_class 403 4999 60)"
-is "F2: 403 with no rate-limit header is transient (unknown)" transient \
-  "$(actions_write_class 403 "" "")"
+# F2 + N1: a 403 is a permission refusal only when GitHub's body says so, and no
+# rate-limit signal contradicts it. Everything else is a limit, retried later.
+DENY='{"message":"Resource not accessible by integration","documentation_url":"x","status":"403"}'
+LIMIT='{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again.","status":"403"}'
+is "N1: 403 saying Resource not accessible by integration is a refusal" refused \
+  "$(actions_write_class 403 4999 "" "$DENY")"
+is "N1: and it is a refusal even when the rate-limit header is missing" refused \
+  "$(actions_write_class 403 "" "" "$DENY")"
+is "N1: a secondary-limit 403 with requests left and NO retry-after is transient" transient \
+  "$(actions_write_class 403 4999 "" "$LIMIT")"
+is "N1: a 403 with an empty body is transient" transient \
+  "$(actions_write_class 403 4999 "" "")"
+is "F2: 403 with the primary limit exhausted is transient, whatever the body" transient \
+  "$(actions_write_class 403 0 "" "$DENY")"
+is "F2: 403 with retry-after is transient, whatever the body" transient \
+  "$(actions_write_class 403 4999 60 "$DENY")"
+is "F2: 403 with no rate-limit header and no permission message is transient" transient \
+  "$(actions_write_class 403 "" "" "")"
 is "F2: 429 is transient" transient "$(actions_write_class 429 4999 "")"
 is "F2: a 5xx is transient" transient "$(actions_write_class 502 4999 "")"
 is "F2: no response at all is transient" transient "$(actions_write_class 000 "" "")"
@@ -480,6 +489,10 @@ fi
 # shellcheck disable=SC2016  # the controller source is the literal under test
 src_has "F2: the write captures its response headers" '-D "$hdr"'
 src_has "F2: and reads x-ratelimit-remaining" '"x-ratelimit-remaining"'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "N1: the write captures its response body for the classifier" '-o "$bodyf" -D "$hdr"'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "N1: and hands it to actions_write_class" 'actions_write_class "$ACT_CODE" "$rem" "$ra" "$body"'
 src_has "F2: and retry-after" '"retry-after"'
 # F1: the cancelled attempt is recorded.
 # shellcheck disable=SC2016  # the controller source is the literal under test
@@ -609,14 +622,17 @@ mutant "F4: a superseded run re-run anyway" \
 mutant "F4: an unanswered newer-run check read as none" \
   's/    # Unknown: fall through to the clock/    echo "rerun:assumed"; return 0\n    # Unknown: fall through to the clock/' \
   pin_rerun_decision cancelled 60 completed 900 1 1 cancelled push "" wait:
+mutant "N1: the body check dropped (a secondary-limit 403 read as a refusal)" \
+  's/        \*) echo transient; return 0 ;;/        *) ;;/' \
+  actions_write_class 403 4999 "" "$LIMIT" transient
 # shellcheck disable=SC2016
-mutant "F2: every 403 read as a refusal again" \
-  's/if \[ "\$rem" -gt 0 \] \&\& \[ -z "\$ra" \]; then echo refused/if true; then echo refused/' \
-  actions_write_class 403 0 "" transient
+mutant "F2: the primary limit ignored" \
+  's/if \[ -n "\$ra" \] || \[ "\$rem" = 0 \]; then/if [ -n "$ra" ]; then/' \
+  actions_write_class 403 0 "" "$DENY" transient
 # shellcheck disable=SC2016
 mutant "F2: retry-after ignored" \
-  's/\[ "\$rem" -gt 0 \] \&\& \[ -z "\$ra" \]/[ "$rem" -gt 0 ]/' \
-  actions_write_class 403 4999 60 transient
+  's/if \[ -n "\$ra" \] || \[ "\$rem" = 0 \]; then/if [ "$rem" = 0 ]; then/' \
+  actions_write_class 403 4999 60 "$DENY" transient
 mutant "F3: a mint 422 read as transient (the missing permission never surfaced)" \
   's/    422) echo refused ;;/    422) echo transient ;;/' \
   actions_token_mint_class 422 refused
