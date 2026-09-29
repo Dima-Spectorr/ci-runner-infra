@@ -617,6 +617,41 @@ pool label**: it was `*/15` on the pool until #1380, and against a
 fifteen-minute idle grace that kept a host up around the clock — 56 to 78 lane
 passes a day on five repositories that opened no pull request at all.
 
+**A hold that ends on a clock has no event, so the run waits out a short one
+itself (#1402).** The `*/15` timer did a second job nobody had written down: it
+was the only thing that woke the lane when a clock-based hold ran out. Once it
+was gone, a green, clean pull request held by the 60-second review grace, whose
+reviewer never answered, waited for the daily backstop (a consumer repository,
+2026-09-29: `wait:review ... age=21 grace=60`, then 27 minutes until a manual
+dispatch). Now, when a pass acts on nothing and its earliest clock hold clears
+within **180 seconds**, the run sleeps until it clears and reads the world
+again. It does this only when the pass budget holds the wait **plus** one more
+full walk of the open list. That walk is budgeted as the longest of: the pass
+that just ended, the last pass in the run that walked the list, and a
+30-second floor. A pass the base-health gate halts walks nothing, so its own
+few seconds would under-budget the read. It waits at most three times a run,
+never in a dry run, and never after a blind pass (one that could not read the
+base or the open list, `LANE_FATAL`), which has nothing to re-read and fails
+the run. The run keeps the `merge-lane` group throughout, so passes stay one at a
+time. The read after the wait is a full, live read: a review that landed during
+the wait counts, and so does a base that moved. The decision is
+`lane_clock_wait` in `merge-lane-decision.sh`.
+
+Every clock-based hold, and what wakes the lane when it clears:
+
+| hold | default | what wakes the lane |
+|---|---|---|
+| `wait:review` (`review-grace-seconds`) | 60s | a review arriving (relay). Silence: the in-run wait while ≤180s is left, otherwise only the daily backstop, so keep the grace short |
+| base-health halt (`base-health-grace-seconds`) | 900s | the health workflow's completion, whatever its conclusion, **if you list it in `merge-lane.yml`'s `workflow_run`**. A job that never reports: the in-run wait covers only the last 180s of the grace, otherwise only the backstop (#1373) |
+| `drop:budget-exceeded` (`inflight-budget-seconds`) | 1800s | nothing, and nothing needs to: a drop releases a pull request that cannot merge yet, and its next CI completion wakes the lane |
+| newer-incomplete hold (`newer-incomplete-max-staleness-seconds`) | 3600s | the later suite's completion, if its workflow is in your `workflow_run` list. The expiry itself: only the backstop |
+| `wait:mergeability-unknown` | not a clock | the next event, or the backstop |
+
+A long clock is not waited out on purpose: a runner sleeping for minutes to
+learn what the backstop learns anyway is the cost #1380 removed. Re-triggering
+the lane at a set time would need the merge App to hold `Actions: write`, which
+it does not.
+
 **`required-checks` must name checks that exist.** A name matching nothing is
 counted as missing and blocks every merge. That is the safe direction, but it is
 a total stop, so keep it in step with your CI.
@@ -874,8 +909,12 @@ buy a comment on a closed pull request, which is worse than not asking.
 
 `review-bots` names the logins to wait for. A pull request that is otherwise
 `merge:ready` becomes `wait:review` until each of them has published something
-about **the head sha** — the queue table says so, nothing is commented, and the
-next CI completion or the fifteen-minute sweep asks again.
+about **the head sha** — the queue table says so and nothing is commented. A
+review that arrives wakes the lane through the review relay. A grace that runs
+out wakes nothing, because a clock is not an event: while no more than 180
+seconds are left, the run that saw the hold sleeps until it clears and reads
+again. Past that, the lane waits for the next event or the daily backstop. See
+"The schedule is a backstop" (#1402).
 
 **Two surfaces are read, and the second one is not optional.** Codex publishes
 a review object only when it has findings; when it finds nothing it reacts with

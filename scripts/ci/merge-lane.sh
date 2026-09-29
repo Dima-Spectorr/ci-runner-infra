@@ -276,6 +276,30 @@ BASE_HEALTH_MAX_STALENESS="${BASE_HEALTH_MAX_STALENESS:-0}"
 # behind" the window exists to bridge.
 BASE_HEALTH_MAX_HOPS=5
 
+# A SHORT CLOCK IS WAITED OUT IN THE RUN, BECAUSE NO EVENT FIRES WHEN IT CLEARS
+# (#1402). The review grace and the base-health grace both end on a clock. A
+# reviewer or a health job that answers wakes the lane, and one that stays
+# silent does not, so a run that ended on that hold left a green pull request
+# for the daily backstop. See `lane_clock_wait`.
+#
+# Three minutes covers the 60-second review grace the fleet runs with, and the
+# tail of a base-health grace, with room to spare. It stays well inside the
+# default ten-minute pass budget, whose read after the wait also has to fit.
+# Three waits a run bounds the reads they cost in the merge App's shared quota.
+# Constants, not inputs: waiting fits inside the pass budget by construction,
+# which is the knob a repository already has.
+CLOCK_WAIT_CAP=180
+CLOCK_WAIT_MAX=3
+# The epoch at which the earliest clock-held pull request of the CURRENT pass
+# clears, from `lane_clock_earliest`. Reset at the top of every pass.
+LANE_CLOCK_CLEARS_AT=''
+# How long the last pass that WALKED the open list took, and the least any read
+# after a wait is budgeted to cost. A pass the base-health gate halts walks
+# nothing, so its own duration says nothing about the read after the wait. See
+# `lane_walk_estimate`.
+LANE_LAST_WALK_SECONDS=''
+CLOCK_WALK_FLOOR=30
+
 # HOW LONG A LATER, UNFINISHED SUITE OF THE SAME APP MAY HOLD A REQUIRED CHECK
 # THAT IS OTHERWISE GREEN.
 #
@@ -1484,6 +1508,10 @@ lane_base_is_vouched() {
     echo "::warning::lane: nothing has answered for ${sha:0:8} in ${age}s (grace ${BASE_HEALTH_GRACE}s) — proceeding unvouched. A base-health job that never reports leaves this gate inert; check that it is not being cancelled before it finishes."
     return 0
   fi
+  # A clock hold. The health job's completion wakes the lane when it reports.
+  # When it never reports, this grace clears with no event, so the run loop
+  # is told when (#1402).
+  LANE_CLOCK_CLEARS_AT="$(lane_clock_earliest "$LANE_CLOCK_CLEARS_AT" "$((now + BASE_HEALTH_GRACE - age))")"
   return 1
 }
 
@@ -1521,6 +1549,10 @@ one_pass() {
     return 1
   fi
   read -r base_sha base_at <<<"$base_read"
+
+  # Every pass starts with no clock hold. Only a hold THIS pass saw may keep the
+  # run waiting.
+  LANE_CLOCK_CLEARS_AT=''
 
   lane_resolve_strict
 
@@ -1602,7 +1634,8 @@ one_pass() {
   # And it says WHY, for the reason the base comparison says why: on a schedule,
   # a missing App permission and a transient 5xx print the same line every
   # fifteen minutes forever, and nothing distinguishes them.
-  local prs_raw='' list_err
+  local prs_raw='' list_err walk_began
+  walk_began="$(date -u +%s)"
   list_err="$(mktemp)"
   if ! prs_raw="$(gh api --paginate "repos/$R/pulls?state=open&base=$LANE_BASE&per_page=100" \
     --jq '.[] | (.number|tostring), .head.sha, (.draft|tostring), ((.labels // []) | map(.name) | join(",")), ((.title // "") | gsub("[\r\n]"; " ")), (.user.login // "")' 2>"$list_err")"; then
@@ -1877,8 +1910,9 @@ one_pass() {
     # difference between a pass that finishes and one the job timeout kills.
     #
     # A hold becomes `wait:review`, which is not actionable, so the pull request
-    # keeps its place, the queue table says what it is waiting for, and the next
-    # CI completion or the fifteen-minute sweep asks again. Nothing is
+    # keeps its place and the queue table says what it is waiting for. A review
+    # that arrives wakes the lane through the relay. A grace that runs out wakes
+    # nothing, so the run loop waits out a short one itself (#1402). Nothing is
     # announced and nothing is commented: a reviewer taking two minutes is not
     # an event.
     local unreviewed=''
@@ -1905,6 +1939,18 @@ one_pass() {
       case "$review_verdict" in
         review:hold*)
           verdict="wait:review ${review_verdict#review:hold }"
+          # The grace clears at the review clock's origin plus the grace, and
+          # no event fires when it does (#1402). `review_age` is measured
+          # against the pass's `now`. When it is positive, `now - review_age`
+          # IS that origin. When it is 0, the age may have been CLAMPED: a
+          # required check that finished after `now` was taken makes a
+          # negative age, and `now + grace` would then wake the run before
+          # the grace cleared. So a zero age reads a fresh clock instead,
+          # which can only be late, never early. A hold is only ever returned
+          # for a numeric age and grace.
+          local review_origin="$((now - review_age))"
+          if [ "$review_age" -eq 0 ]; then review_origin="$(date -u +%s)"; fi
+          LANE_CLOCK_CLEARS_AT="$(lane_clock_earliest "$LANE_CLOCK_CLEARS_AT" "$((review_origin + REVIEW_GRACE))")"
           ;;
         review:unreviewed*)
           # RECORDED HERE, ANNOUNCED WHERE THE MERGE HAPPENS.
@@ -1978,6 +2024,9 @@ one_pass() {
       queue_row 8 "${pr_fields[jdx]}" "${pr_fields[jdx + 4]}" wait:not-read-this-pass '' '' ''
     done
   fi
+
+  # What a full walk costs here, for budgeting a read after a clock wait.
+  LANE_LAST_WALK_SECONDS=$(($(date -u +%s) - walk_began))
 
   if [ "${#candidates[@]}" -eq 0 ]; then
     echo "lane: nothing actionable this pass"
@@ -2496,6 +2545,8 @@ acted=0
 PASS_ACTED=0
 # Set by `one_pass` when the lane could not read the world it is meant to judge.
 LANE_FATAL=0
+# How many short clocks this run has waited out. See `lane_clock_wait`.
+clock_waits=0
 while [ "$acted" -lt "$MAX_ACTIONS" ]; do
   # `MAX_ACTIONS` bounds how much the lane DOES; this bounds how long it takes
   # to do it. Each pass re-walks the whole list, so four actions can cost four
@@ -2511,6 +2562,7 @@ while [ "$acted" -lt "$MAX_ACTIONS" ]; do
     echo "::warning::lane: SKIPPED, not idle — $LANE_SKIP_REASON. Nothing was read this pass, so there is no verdict for any pull request; the lane resumes on the next trigger or the cron backstop once the quota resets. If this repeats every hour, a repository is overspending — compare the 'api-calls' figures in each lane's log (docs/merge-lane.md, \"The App quota is shared\")."
     break
   fi
+  pass_began="$(date -u +%s)"
   if one_pass; then
     acted=$((acted + PASS_ACTED))
     # The world changed: a merge just moved the base, so everything else is now
@@ -2518,6 +2570,43 @@ while [ "$acted" -lt "$MAX_ACTIONS" ]; do
     # gathered before it.
     now="$(date -u +%s)"
   else
+    # NOTHING TO ACT ON, BUT PERHAPS ONLY FOR A FEW MORE SECONDS (#1402).
+    #
+    # A pass held by a short clock (the review grace, or the tail of the
+    # base-health grace) ends here with nothing actionable. No event fires when
+    # that clock clears, so ending the run leaves the pull request for the daily
+    # backstop. When the clock is short and the pass budget holds the wait AND
+    # one more full walk, sleep it out and read the world again. The walk is
+    # budgeted by `lane_walk_estimate`, never by this pass alone: a pass the
+    # base-health gate halted walked nothing. The next pass reads everything
+    # live, so a review that landed during the sleep counts.
+    #
+    # Never on a blind pass (`LANE_FATAL`), which has nothing to re-read, and
+    # never in a dry run, which acts on nothing and would sleep to report a
+    # verdict it would not take.
+    pass_ended="$(date -u +%s)"
+    clock_verdict="nowait:not-applicable"
+    if [ "$LANE_FATAL" -eq 0 ] && [ "$DRY_RUN" != "true" ]; then
+      clock_verdict="$(lane_clock_wait "$LANE_CLOCK_CLEARS_AT" "$pass_ended" "$LANE_STARTED" "$PASS_BUDGET" \
+        "$(lane_walk_estimate "$((pass_ended - pass_began))" "$LANE_LAST_WALK_SECONDS" "$CLOCK_WALK_FLOOR")" \
+        "$CLOCK_WAIT_CAP" "$clock_waits" "$CLOCK_WAIT_MAX")"
+    fi
+    case "$clock_verdict" in
+      wait:clock*)
+        clock_sleep="${clock_verdict##*seconds=}"
+        clock_waits=$((clock_waits + 1))
+        echo "lane: nothing actionable yet, and a hold clears in ${clock_sleep}s with no event behind it — waiting it out and reading again (wait $clock_waits of $CLOCK_WAIT_MAX)"
+        sleep "$clock_sleep"
+        # The clocks are measured against `now`. Without this the read after the
+        # wait would compute the same ages and find the same hold.
+        now="$(date -u +%s)"
+        continue
+        ;;
+      nowait:no-clock | nowait:not-applicable) ;;
+      *)
+        echo "lane: a clock hold is not waited out in this run — ${clock_verdict}. A review, a base-health completion or the daily backstop wakes the lane next."
+        ;;
+    esac
     break
   fi
 done
