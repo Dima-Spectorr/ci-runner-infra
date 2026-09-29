@@ -1115,11 +1115,21 @@ chmod 0750 "\$home" || { say "slot \$idx: could not chmod \$home"; rc=1; }
 # WHAT SURVIVES is what the two processes that outlive jobs keep there, and
 # only in a shape a job cannot use to carry data across the boundary:
 #
-#   rootlesskit-*          rootlesskit's --copy-up=/etc makes its bind directory
-#                          here (os.MkdirTemp("/tmp", "rootlesskit-b")) and the
-#                          daemon's /etc symlinks point into it for its whole
-#                          life. Removing it mid copy-up fails the daemon, and
+#   rootlesskit-*          rootlesskit's --copy-up=/etc makes a bind directory
+#                          here (os.MkdirTemp("/tmp", "rootlesskit-b")), binds
+#                          /etc onto it, MOVES that bind to /etc/.ro<N> and
+#                          removes the directory -- all before dockerd makes its
+#                          socket. Removing it mid copy-up fails the daemon, and
 #                          BindsTo then takes the agent down for good (Restart=no).
+#                          So it is spared only in the shape the copy-up leaves
+#                          it in, and only while that can still be running: an
+#                          EMPTY real directory owned by the slot, with no daemon
+#                          socket yet (#1387). A live host (rootlesskit 3.1.0,
+#                          four slots an hour up) had no rootlesskit-* in any
+#                          slot's /tmp, and each daemon's /etc was a tmpfs whose
+#                          links name .ro<N>/, never /tmp -- so once the socket
+#                          exists, or once one holds anything, it is a job's, and
+#                          it goes like the rest.
 #   dotnet-diagnostic-<pid>-*, clr-debug-pipe-<pid>-*
 #                          the .NET runtime's socket and debug fifos -- spared
 #                          only while <pid> is a live process of this slot, and
@@ -1141,10 +1151,17 @@ tmp_pid_alive() { # <pid> -- a live process of this slot's uid
   case "\$1" in '' | *[!0-9]*) return 1 ;; esac
   [ -d "/proc/\$1" ] && [ "\$(stat -c '%u' "/proc/\$1" 2>/dev/null)" = "\$uid" ]
 }
+tmp_copyup_dir() { # <name> -- rootlesskit's copy-up directory, as it is while in use
+  # find, not a glob: it counts dot-entries too, and a find that cannot read the
+  # directory prints nothing, which reads as NOT empty -- a doubt removes it.
+  [ -d "\$1" ] && [ ! -L "\$1" ] &&
+    [ "\$(stat -c '%u' -- "\$1" 2>/dev/null)" = "\$uid" ] &&
+    [ -n "\$(find "./\$1" -maxdepth 0 -type d -empty -print 2>/dev/null)" ]
+}
 tmp_spare() { # <name>
   local p
   case "\$1" in
-    rootlesskit-*) [ -d "\$1" ] && [ ! -L "\$1" ] ;;
+    rootlesskit-*) [ ! -S "\$sock" ] && tmp_copyup_dir "\$1" ;;
     .dotnet) [ -d "\$1" ] && [ ! -L "\$1" ] ;;
     dotnet-diagnostic-*)
       p=\${1#dotnet-diagnostic-}

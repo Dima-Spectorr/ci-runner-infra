@@ -212,9 +212,12 @@ has_slot_tmp_reset() { # <file>
   matches "$code" 'cd "/proc/\\\$dpid/root/\\\$d"' || return 1
   matches "$code" '\[ "\\\$mine" = "\\\$host" \]' || return 1
   matches "$code" '\[ "\\\$owner" != "\\\$uid" \]' || return 1
-  # rootlesskit's copy-up directory lives in /tmp for the daemon's whole life,
+  # rootlesskit's copy-up directory is spared only while the copy-up can still
+  # be running (no daemon socket yet), and only empty and the slot's own (#1387),
   # and boot must not wipe while the copy-up is still running
-  matches "$code" 'rootlesskit-\*\) \[ -d' || return 1
+  matches "$code" 'rootlesskit-\*\) \[ ! -S "\\\$sock" \] && tmp_copyup_dir "\\\$1" ;;' || return 1
+  matches "$code" 'stat -c .%u. -- "\\\$1" 2>/dev/null\)" = "\\\$uid" \] &&$' || return 1
+  matches "$code" 'find "\./\\\$1" -maxdepth 0 -type d -empty -print' || return 1
   matches "$code" 'while \[ ! -S "\\\$sock" \]' || return 1
   # the .NET names are spared only while their pid is a live slot process
   [ "$(printf '%s\n' "$code" | grep -cE 'tmp_pid_alive "\\\$\{p%%-\*\}"')" -ge 2 ] || return 1
@@ -1819,7 +1822,10 @@ mutate "only the daemon gets a private /tmp" 's/^JoinsNamespaceOf=ci-dockerd@\$i
 mutate "reset empties the literal /tmp"     's|cd "/proc/\\$dpid/root/\\$d"|cd "/\\$d"|'                  has_slot_tmp_reset
 mutate "fixed-path list emptied"            's/^tmp_fixed="gitleaks\.tmp"$/tmp_fixed=""/'                  has_slot_tmp_reset
 mutate "namespace owner not checked"        's/\[ "\\$owner" != "\\$uid" \]/false/g'                      has_slot_tmp_reset
-mutate "rootlesskit copy-up dir not spared" 's/rootlesskit-\*) \[ -d/rootlesskit-NOPE) [ -d/'              has_slot_tmp_reset
+mutate "rootlesskit copy-up dir not spared" 's/rootlesskit-\*) \[ ! -S/rootlesskit-NOPE) [ ! -S/'          has_slot_tmp_reset
+mutate "copy-up dir spared after the socket" 's/rootlesskit-\*) \[ ! -S "\\$sock" \] && /rootlesskit-*) /' has_slot_tmp_reset
+mutate "copy-up dir spared with content"    's/ -maxdepth 0 -type d -empty -print/ -maxdepth 0 -type d -print/' has_slot_tmp_reset
+mutate "copy-up dir spared for any owner"   's/\[ "\\$(stat -c .%u. -- "\\$1" 2>\/dev\/null)" = "\\$uid" \] &&$/true \&\&/' has_slot_tmp_reset
 mutate "boot wipes during the copy-up"      's/while \[ ! -S "\\$sock" \]/while false/'                   has_slot_tmp_reset
 mutate ".NET names spared for a dead pid"   's/tmp_pid_alive "\\${p%%-\*}"/true/g'                        has_slot_tmp_reset
 mutate "wipe crosses filesystems"           's|rm -rf --one-file-system -- "\./\\$e"|rm -rf -- "./\\$e"|' has_slot_tmp_reset
