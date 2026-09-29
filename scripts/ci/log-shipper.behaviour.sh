@@ -51,15 +51,31 @@ mkdir -p "$BIN"
 
 cat >"$BIN/journalctl" <<'STUB'
 #!/usr/bin/env bash
-# Records its argv, then replays the fixture journal after --after-cursor.
+# Records its argv, then replays the fixture journal after --after-cursor,
+# honouring --lines= the way systemd 255 does: +N is the oldest N, N the newest.
 printf '%s\n' "$@" >"$STUB_DIR/journalctl.argv"
-after=""
-for a in "$@"; do case "$a" in --after-cursor=*) after="${a#--after-cursor=}" ;; esac; done
+after="" lines=""
+for a in "$@"; do
+  case "$a" in
+    --after-cursor=*) after="${a#--after-cursor=}" ;;
+    --lines=*) lines="${a#--lines=}" ;;
+  esac
+done
+# The failure modes the shipper must tell apart, as journalctl reports them.
+if [ -f "$STUB_DIR/jfail" ]; then echo "Failed to open journal: Too many open files" >&2; exit 1; fi
+if [ "$after" = rejected ]; then echo "Failed to seek to cursor: Invalid argument" >&2; exit 1; fi
 if [ -z "$after" ]; then
   cat "$STUB_DIR/journal.jsonl"
 else
   awk -v c="\"__CURSOR\":\"$after\"" 'found { print; next } index($0, c) { found = 1 }' "$STUB_DIR/journal.jsonl"
-fi
+fi >"$STUB_DIR/jsel"
+case "$lines" in
+  +*) awk -v n="${lines#+}" 'NR <= n' "$STUB_DIR/jsel" ;;
+  '') cat "$STUB_DIR/jsel" ;;
+  *) tail -n "$lines" "$STUB_DIR/jsel" ;;
+esac
+# A journal that stalls mid-entry: a line cut short, then nothing until killed.
+if [ -f "$STUB_DIR/jhang" ]; then printf '{"__CURSOR":"cut","MESS'; exec sleep 30; fi
 STUB
 
 cat >"$BIN/curl" <<'STUB'
@@ -132,7 +148,7 @@ run_suite() {
     env PATH="$BIN:$PATH" STUB_DIR="$SD" CI_LOG_SHIPPER_STATE="$st" \
       CI_LOG_SHIPPER_ENDPOINT=https://logging.stub/v2/entries:write \
       CI_LOG_SHIPPER_METADATA=http://md.stub/computeMetadata/v1 \
-      CI_LOG_SHIPPER_MAX="${MAX:-200}" bash "$sh" >/dev/null 2>&1
+      CI_LOG_SHIPPER_MAX="${MAX:-200}" CI_LOG_SHIPPER_JOURNAL_TIMEOUT="${JT:-20}" bash "$sh" >/dev/null 2>&1
   }
   posts() { find "$SD" -maxdepth 1 -name 'post.*.json' | wc -l; }
   cursor() { cat "$st/cursor" 2>/dev/null; }
@@ -236,6 +252,50 @@ run_suite() {
   [ "$(jq -r '[.entries[].jsonPayload.message] | join(",")' "$SD/post.$last.json")" = b3 ] ||
     fail "the rest of the backlog did not follow on the next run"
   grep -qx -- '--after-cursor=c11' "$SD/journalctl.argv" || fail "the next run did not resume from the saved cursor"
+  grep -qx -- '--lines=+2' "$SD/journalctl.argv" || fail "journalctl is not asked for the OLDEST n (--lines=+N)"
+
+  # 7. journalctl fails for a reason that is not the cursor: the cursor stays.
+  # Deleting it on any non-zero exit restarts from --boot, and a failure that
+  # repeats then never moves again (#1410 review F2).
+  fixture c13 ci-slot-reset '"after a failure"' >>"$SD/journal.jsonl"
+  : >"$SD/jfail"
+  ship
+  [ "$(cursor)" = c12 ] || fail "a journalctl failure that is not about the cursor lost the cursor (now '$(cursor)')"
+  rm -f "$SD/jfail"
+  ship
+  [ "$(cursor)" = c13 ] || fail "the run after a journalctl failure did not resume from the cursor"
+
+  # 8. A cursor journalctl refuses to seek to: reset, and start over from the boot.
+  printf '%s' rejected >"$st/cursor"
+  ship
+  [ -e "$st/cursor" ] && fail "a cursor journalctl refused was kept -- the shipper would be stuck on it forever"
+  ship
+  grep -qx -- '--boot' "$SD/journalctl.argv" || fail "after a refused cursor the next run did not restart from the boot"
+
+  # 9. Out of time mid-entry: ship the whole entries, keep the cut one for later.
+  base_journal >"$SD/journal.jsonl"
+  printf '%s' c2 >"$st/cursor"
+  : >"$SD/jhang"
+  last=$(posts)
+  JT=2 ship
+  rm -f "$SD/jhang"
+  if [ "$(posts)" -le "$last" ]; then
+    fail "a timed-out read shipped nothing -- a slow journal would never make progress"
+  else
+    [ "$(jq '.entries | length' "$SD/post.$(posts).json")" = 3 ] ||
+      fail "a timed-out read did not ship exactly its three complete entries"
+  fi
+  [ "$(cursor)" = c5 ] || fail "a timed-out read did not move the cursor to its last COMPLETE entry (got '$(cursor)')"
+
+  # 10. More than a pipe buffer (64 KiB) in one batch: all of it, in one write.
+  : >"$SD/journal.jsonl"
+  local i big
+  big=$(head -c 1900 /dev/zero | tr '\0' y)
+  for i in $(seq 100 139); do fixture "c$i" ci-slot-reset "\"$big\""; done >"$SD/journal.jsonl"
+  rm -f "$st/cursor"
+  ship
+  [ "$(jq '.entries | length' "$SD/post.$(posts).json")" = 40 ] || fail "a batch over 64 KiB was not shipped whole"
+  [ "$(cursor)" = c139 ] || fail "a batch over 64 KiB did not move the cursor to its end"
 
   cat "$f"
 }
@@ -267,8 +327,12 @@ mutate "an extra identifier is shipped"      's/^IDENTIFIERS=(ci-slot-reset /IDE
 mutate "the cursor moves on any answer"      's/^  \*) note "entries:write -> HTTP/  *) advance; note "entries:write -> HTTP/'
 mutate "an accepted write keeps the cursor"  's/^  200) advance ;;$/  200) ;;/'
 mutate "a 400 is resent forever"             '/^    advance ;;$/d'
-mutate "the batch is unbounded"              's/ | head -n "\$MAX" >/ >/'
-mutate "a backlog is shipped from its end"   's/ | head -n "\$MAX" >/ | tail -n "$MAX" >/'
+mutate "the batch is unbounded"              's/ "--lines=+\$MAX" / /'
+mutate "a backlog is shipped from its end"   's/"--lines=+\$MAX"/"--lines=$MAX"/'
+mutate "the cursor goes on any failure"      's/if \[ -n "\$cursor" \] && grep -q .Failed to seek to cursor. "\$errf" 2>\/dev\/null; then/if [ -n "$cursor" ]; then/'
+mutate "a refused cursor is kept"            's/^      rm -f "\$cursor_file"$/      :/'
+mutate "a timed-out read is discarded"       's/-- shipping the complete entries it wrote" ;;/-- retrying"; exit 0 ;;/'
+mutate "one bad line fails the whole batch"  's/\[inputs | fromjson? | select(type == "object")\] | map(/[inputs | fromjson] | map(/'
 mutate "control characters pass through"     's/map(if \. < 32 or \. == 127 then 32 else \. end)/map(.)/'
 mutate "messages are not cut"                's/| implode | \.\[0:\$n\];/| implode;/'
 mutate "the token goes in argv"              's/-K <(printf .header = "Authorization: Bearer %s"\\n. "\$token")/-H "Authorization: Bearer $token"/'

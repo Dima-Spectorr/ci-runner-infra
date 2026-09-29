@@ -1857,6 +1857,14 @@ take_lock() { # <what>
 
 say() { logger -t ci-pin-hold -- "\$*" 2>/dev/null || true; echo "pin hold: \$*" >&2; }
 
+# The reset's safe(), for the same reason: a job reaches this through sudo, and
+# the sudoers rule's trailing \`*\` lets it append any argument it likes. Echoed
+# raw into a root log line, that argument is text a job writes into the log
+# the slot alerts read (#1403).
+safe() {
+  printf '%.120s' "\$(printf '%s' "\$1" | tr '\n\t' '  ' | tr -d '\000-\037')"
+}
+
 boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
 
 # The guest attribute the controller reads. Best effort by design: the hold on
@@ -1960,7 +1968,7 @@ case "\${1:-}" in
         --run) [ "\$#" -ge 2 ] || { say "refusing: --run needs a value"; exit 1; }; run="\$2"; shift 2 ;;
         --ttl) [ "\$#" -ge 2 ] || { say "refusing: --ttl needs a value"; exit 1; }; ttl_text="\$2"; shift 2 ;;
         --reserve-slot) reserve=1; shift ;;
-        *) say "refusing: unknown argument '\$1'"; exit 1 ;;
+        *) say "refusing: unknown argument '\$(safe "\$1")'"; exit 1 ;;
       esac
     done
 
@@ -2053,7 +2061,7 @@ case "\${1:-}" in
     while [ "\$#" -gt 0 ]; do
       case "\$1" in
         --run) [ "\$#" -ge 2 ] || { say "refusing: --run needs a value"; exit 1; }; renew_run="\$2"; shift 2 ;;
-        *) say "refusing: unknown argument '\$1'"; exit 1 ;;
+        *) say "refusing: unknown argument '\$(safe "\$1")'"; exit 1 ;;
       esac
     done
     # An absent or empty --run is not an identity claim, and renewing on one
@@ -2984,8 +2992,11 @@ EOF
 # sender's socket credentials, which a client cannot forge, and every one of
 # these tools runs as root (the hooks reach the reset through sudo). A job on a
 # slot can run `logger -t ci-slot-reset condemned` all day; it is a different
-# uid, so it neither forges an alert nor spends this host's quota. The rest of
-# the journal is never read: this is four tags, not a syslog pipe.
+# uid, so its lines are never read. The rest of the journal is never read
+# either: this is four tags, not a syslog pipe. What a job CAN do is get text
+# quoted inside a root line (a tool-cache directory name, its daemon's error, an
+# argument to pin-hold), which is why the alert's metric matches whole anchored
+# sentences per tag, never a phrase (ensure-alert-policies.sh).
 #
 # THE TEXT. The reset already passes every slot-chosen value through safe()
 # before it reaches `logger`. The shipper does not trust that: jq builds the
@@ -3009,6 +3020,7 @@ ENDPOINT="${CI_LOG_SHIPPER_ENDPOINT:-https://logging.googleapis.com/v2/entries:w
 MD_BASE="${CI_LOG_SHIPPER_METADATA:-http://metadata.google.internal/computeMetadata/v1}"
 JOURNALCTL="${CI_LOG_SHIPPER_JOURNALCTL:-journalctl}"
 MAX="${CI_LOG_SHIPPER_MAX:-200}"
+JTIMEOUT="${CI_LOG_SHIPPER_JOURNAL_TIMEOUT:-20}"
 MSG_MAX=2000
 LOG_ID=ci-slot-lifecycle
 IDENTIFIERS=(ci-slot-reset ci-slot-sweep ci-pin-hold ci-pin-sweep)
@@ -3033,29 +3045,42 @@ matches=()
 for id in "${IDENTIFIERS[@]}"; do matches+=("SYSLOG_IDENTIFIER=$id"); done
 matches+=(_UID=0)
 
-# head, not `journalctl -n`: -n keeps the NEWEST n, and this wants the oldest n
-# after the cursor, or a backlog would be shipped from its end and the middle
-# lost. journalctl dies of SIGPIPE when head has enough, which is 141, not a
-# failure.
-timeout 20 "$JOURNALCTL" "${opts[@]}" "${matches[@]}" 2>/dev/null | head -n "$MAX" >"$batch"
-jrc=${PIPESTATUS[0]}
+# --lines=+N: the OLDEST N after the cursor (systemd >= 255, which is what the
+# image's Ubuntu 24.04 ships), so journalctl stops by itself and a backlog is
+# shipped from its start. NOT `| head`: a systemd service starts with SIGPIPE
+# ignored, so a journalctl whose reader has gone does not die of 141 -- it
+# fails its write, or walks the whole backlog into the deadline, and either way
+# the batch is lost every run (#1410 review). The output goes to a FILE.
+errf="$STATE_DIR/journal.err"
+timeout "$JTIMEOUT" "$JOURNALCTL" "${opts[@]}" "--lines=+$MAX" "${matches[@]}" >"$batch" 2>"$errf"
+jrc=$?
 case "$jrc" in
-  0 | 141) ;;
-  124) note "journalctl timed out -- retrying next run"; exit 0 ;;
+  0) ;;
+  124)
+    # Out of time with some of it read: ship what is complete. A line cut
+    # mid-entry is not JSON, and the parse below skips it; the cursor then
+    # stops at the last whole entry, so the cut one is read again next run.
+    note "journalctl timed out after ${JTIMEOUT}s -- shipping the complete entries it wrote" ;;
   *)
-    # A cursor journalctl will not seek to: the next run starts over from this
-    # boot, which resends at most one boot's worth (and insertId absorbs it).
-    if [ -n "$cursor" ]; then
-      note "journalctl refused the saved cursor (exit $jrc) -- restarting from this boot"
+    # The cursor goes ONLY when journalctl says the cursor is what it refused.
+    # Any other failure keeps it: deleting it on every non-zero exit turns one
+    # bad run into a restart from --boot, and a failure that repeats into a
+    # shipper that silently never moves again.
+    if [ -n "$cursor" ] && grep -q 'Failed to seek to cursor' "$errf" 2>/dev/null; then
+      note "journalctl refused the saved cursor -- restarting from this boot"
       rm -f "$cursor_file"
+    else
+      note "journalctl exited $jrc -- cursor kept, retrying next run: $(head -c 300 "$errf" 2>/dev/null | tr -d '\000-\037')"
     fi
     exit 0 ;;
 esac
 [ -s "$batch" ] || exit 0
 
-n=$(grep -c . "$batch")
-last=$(tail -n 1 "$batch" | jq -r '.__CURSOR // empty' 2>/dev/null)
-[ -n "$last" ] || { note "the last journal entry carries no cursor -- $n entries not shipped"; exit 0; }
+# Line by line and tolerant: a line that is not JSON is skipped rather than
+# failing the whole batch, which would otherwise be retried forever.
+n=$(jq -Rn '[inputs | fromjson? | select(type == "object")] | length' "$batch" 2>/dev/null)
+last=$(jq -Rr 'fromjson? | select(type == "object") | .__CURSOR // empty' "$batch" 2>/dev/null | tail -n 1)
+[ -n "$last" ] || { note "no entry in the batch carries a cursor -- ${n:-0} entries not shipped"; exit 0; }
 
 project=$(md project/project-id)
 iid=$(md instance/id)
@@ -3066,7 +3091,7 @@ pool=$(md instance/attributes/ci-pool)
 [ -n "$project" ] && [ -n "$iid" ] && [ -n "$zone" ] ||
   { note "metadata server unreachable -- $n entries kept for the next run"; exit 0; }
 
-body=$(jq -cs --arg lg "projects/$project/logs/$LOG_ID" --arg project "$project" \
+body=$(jq -cRn --arg lg "projects/$project/logs/$LOG_ID" --arg project "$project" \
   --arg iid "$iid" --arg zone "$zone" --arg host "$host" --arg pool "$pool" \
   --argjson msgmax "$MSG_MAX" '
   def text: if type == "string" then .
@@ -3079,11 +3104,11 @@ body=$(jq -cs --arg lg "projects/$project/logs/$LOG_ID" --arg project "$project"
     resource: {type: "gce_instance", labels: {project_id: $project, instance_id: $iid, zone: $zone}},
     labels: {pool: $pool, host: $host},
     partialSuccess: true,
-    entries: map({
+    entries: ([inputs | fromjson? | select(type == "object")] | map({
       severity: sev,
       insertId: ((._BOOT_ID // "" | clean(40)) + "-" + (.__MONOTONIC_TIMESTAMP // "" | clean(24))),
       jsonPayload: {identifier: (.SYSLOG_IDENTIFIER // "" | clean(40)), message: (.MESSAGE // "" | clean($msgmax))}
-    } + (if (.__REALTIME_TIMESTAMP // "" | stamp) then {timestamp: (.__REALTIME_TIMESTAMP | stamp)} else {} end)) }' \
+    } + (if (.__REALTIME_TIMESTAMP // "" | stamp) then {timestamp: (.__REALTIME_TIMESTAMP | stamp)} else {} end))) }' \
   "$batch" 2>/dev/null)
 [ -n "$body" ] || { note "could not assemble the batch -- $n entries kept for the next run"; exit 0; }
 
@@ -3128,6 +3153,10 @@ TimeoutStartSec=120
 # Idle priority: this must never be what a job waits behind.
 Nice=19
 IOSchedulingClass=idle
+# systemd starts a service with SIGPIPE ignored. Nothing in the shipper pipes
+# into a reader that stops early any more, but a pipeline added later would
+# otherwise hang or fail instead of ending the way it does in a shell.
+IgnoreSIGPIPE=no
 ExecStart=/opt/ci/log-shipper.sh
 EOF
 

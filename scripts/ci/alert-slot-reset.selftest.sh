@@ -98,26 +98,94 @@ check_all() (
     /^say\(\) \{ logger -t / { tag = $0; sub(/.*logger -t /, "", tag); sub(/ .*/, "", tag) }
     /say "/ { print tag "\t" $0 }
   ' "$hs" >"$d/says"
-  phrases="$(printf '%s' "$lf" | grep -oE 'jsonPayload\.message:"[^"]+"' | sed 's/^jsonPayload\.message:"//; s/"$//')"
-  [ -n "$phrases" ] || fail "the filter matches no jsonPayload.message phrase"
-  while IFS= read -r ph; do
-    [ -n "$ph" ] || continue
-    if [ "$ph" = "reads as foreign" ]; then
-      # Rendered from a variable: the reset prints "reads as \$dsock", and
-      # daemon_sock() answers `foreign` for a name that is not its daemon's.
-      rows="$(grep -F 'reads as \$dsock' "$d/says")"
-      grep -q 'echo foreign' "$hs" || fail "daemon_sock no longer answers 'foreign'"
-    else
-      rows="$(grep -F -- "$ph" "$d/says")"
+  # Every message condition is paired with the tag that writes it, and anchored
+  # at both ends. A bare `jsonPayload.message:"..."` is a substring search, and
+  # root lines under these tags quote text a job chose (#1410 review F1).
+  pairs="$(printf '%s' "$lf" | grep -oE 'jsonPayload\.identifier="[^"]+" AND jsonPayload\.message=~"[^"]+"' |
+    sed -E 's/^jsonPayload\.identifier="([^"]+)" AND jsonPayload\.message=~"([^"]+)"$/\1\t\2/')"
+  [ -n "$pairs" ] || fail "the filter pairs no identifier with a message regex"
+  nmsg="$(printf '%s' "$lf" | grep -oE 'jsonPayload\.message' | grep -c .)"
+  npair="$(printf '%s\n' "$pairs" | grep -c .)"
+  [ "$nmsg" = "$npair" ] || fail "$((nmsg - npair)) message condition(s) are not paired with an identifier and a =~ regex"
+  while IFS=$'\t' read -r id re; do
+    [ -n "$id" ] || continue
+    case "$re" in ^slot\ *\$) ;; *) fail "not anchored at both ends from 'slot <n>: ': $re" ;; esac
+    case "$re" in *'.*'* | *'.+'*) fail "a wildcard where only a computed field belongs: $re" ;; esac
+    case " $ids " in *" $id "*) ;; *) fail "'$id' is not a tag the shipper sends" ;; esac
+  done <<<"$pairs"
+
+  # filter_hit <identifier> <message> -- the filter's conditions, evaluated.
+  # Here-strings, never `printf | grep -q`: under pipefail that is the #1409
+  # race, where a match is reported as a failure.
+  filter_hit() {
+    local id re
+    while IFS=$'\t' read -r id re; do
+      [ "$id" = "$1" ] && grep -Eq -- "$re" <<<"$2" && return 0
+    done <<<"$pairs"
+    return 1
+  }
+
+  # The writer: every say line, rendered with the values the reset computes.
+  render_say() { # <raw line> -> the message it logs
+    local m="$1"
+    m="${m#*say \"}"; m="${m%\"*}"
+    m="${m//'\$idx'/3}"; m="${m//'\$sock'//run/user/1003/docker.sock}"; m="${m//'\$dsock'/foreign}"
+    m="${m//'\$burns'/4}"; m="${m//'\$left'/2}"; m="${m//'\$u'/ci-s3}"
+    printf '%s' "$m"
+  }
+  : >"$d/alerting"
+  while IFS=$'\t' read -r tag raw; do
+    msg="$(render_say "$raw")"
+    if filter_hit "$tag" "$msg"; then
+      printf '%s\t%s\n' "$tag" "$msg" >>"$d/alerting"
     fi
-    [ -n "$rows" ] || { fail "no say line in host-startup.sh prints '$ph' any more"; continue; }
-    while IFS=$'\t' read -r tag _; do
-      case " $ids " in *" $tag "*) ;; *) fail "'$ph' is written under tag '$tag', which the shipper does not send" ;; esac
-    done <<<"$rows"
-    # The recovery line must not page.
-    grep -F 'clean again after being condemned' "$d/says" | grep -qF -- "$ph" &&
-      fail "'$ph' also matches the recovery line -- a slot coming BACK would page"
-  done <<<"$phrases"
+  done <"$d/says"
+  # Each condition must be satisfied by a line the writer really prints.
+  while IFS=$'\t' read -r id re; do
+    [ -n "$id" ] || continue
+    ok_=""
+    while IFS=$'\t' read -r tag msg; do
+      [ "$tag" = "$id" ] && grep -Eq -- "$re" <<<"$msg" && { ok_=1; break; }
+    done <"$d/alerting"
+    [ -n "$ok_" ] || fail "no say line in host-startup.sh, under $id, matches: $re"
+  done <<<"$pairs"
+  # ...and the four failures the policy documents are all among them.
+  for ph in "is not the socket it listens on" "reads as foreign" "refusing to call this slot clean" "taking it out of service"; do
+    grep -F -- "$ph" "$d/alerting" >/dev/null 2>&1 || fail "no alerting line says '$ph' any more"
+  done
+  grep -q 'echo foreign' "$hs" || fail "daemon_sock no longer answers 'foreign'"
+
+  # The recovery line must not page.
+  while IFS=$'\t' read -r tag raw; do
+    filter_hit "$tag" "$(render_say "$raw")" && fail "the recovery line pages: a slot coming BACK would alert"
+  done < <(grep -F 'clean again after being condemned' "$d/says")
+
+  # --- 3b. forgeries: text a job chooses, in root lines under shipped tags -------
+  # Each payload is an alerting sentence, or its bare phrase, planted where a
+  # job can plant it. None may match.
+  payloads=()
+  while IFS=$'\t' read -r _ msg; do payloads+=("$msg"); done <"$d/alerting"
+  payloads+=("is not the socket it listens on" "x reads as foreign" "refusing to call this slot clean" "taking it out of service")
+  tcm="$(grep -F 'TOOL CACHE MISS — a job put' "$d/says")"
+  [ -n "$tcm" ] || fail "the TOOL CACHE MISS line moved -- the forgery below would test nothing"
+  dsaid="$(grep -F 'could not list the containers the last job left' "$d/says")"
+  [ -n "$dsaid" ] || fail "the docker_said line moved -- the forgery below would test nothing"
+  for pl in "${payloads[@]}"; do
+    # (a) a directory name in the slot's tool cache.
+    raw="${tcm#*$'\t'}"
+    raw="${raw//'\$(safe "\$t_tool")'/"$pl"}";raw="${raw//'\$(safe "\$t_ver")'/1.0}"; raw="${raw//'\$(safe "\$t_arch")'/x64}"
+    filter_hit "${tcm%%$'\t'*}" "$(render_say "$raw")" && fail "a tool-cache directory named '$pl' forges a page"
+    # (b) an argument a job appends to pin-hold through sudo.
+    filter_hit ci-pin-hold "refusing: unknown argument '$pl'" && fail "a pin-hold argument '$pl' forges a page"
+    filter_hit ci-slot-reset "refusing: unknown argument '$pl'" && fail "a pin-hold-shaped line under the reset's tag, carrying '$pl', forges a page"
+    # (c) the slot daemon's own error text.
+    raw="${dsaid#*$'\t'}"
+    raw="${raw//'\$(docker_said)'/" (docker: $pl)"}"
+    filter_hit "${dsaid%%$'\t'*}" "$(render_say "$raw")" && fail "a docker error reading '$pl' forges a page"
+  done
+  # And the argument is sanitised before it is logged at all.
+  grep -qF "unknown argument '\\\$(safe \"\\\$1\")'" "$hs" || fail "pin-hold logs its unknown argument without safe()"
+  grep -qF "unknown argument '\\\$1'" "$hs" && fail "pin-hold still logs an unknown argument raw"
 
   # --- 4. idempotence against the REAL body -------------------------------------
   eval "$PU"
@@ -151,8 +219,16 @@ mutate "the policy is not synced"          src 's/ unverifiedkeep slotreset; do$
 mutate "the metric is never created"       src 's/^ensure_log_metric ci_slot_reset_failures /ensure_log_metric ci_slot_reset_failurez /'
 mutate "the policy watches another metric" src 's@logging.googleapis.com/user/ci_slot_reset_failures@logging.googleapis.com/user/ci_slot_resets@'
 mutate "the filter reads another log"      src "s@'logName:\"logs/ci-slot-lifecycle\" AND@'logName:\"logs/ci-slot-reset\" AND@"
-mutate "the filter pages on recovery"      src 's@jsonPayload.message:"taking it out of service"@jsonPayload.message:"condemned"@'
-mutate "a phrase nobody prints"            src 's@jsonPayload.message:"refusing to call this slot clean"@jsonPayload.message:"refusing to call the slot clean"@'
+mutate "the filter pages on recovery"      src 's@\[0-9\]+ consecutive failures to reach a clean state — taking it out of service rather than letting it keep winning jobs it will burn\$@[^ ]+ again after being condemned — putting it back into service$@'
+mutate "a phrase nobody prints"            src 's@refusing to call this slot clean\$"@refusing to call the slot clean$"@'
+mutate "a bare phrase beside the pairs"    src 's@ OR (jsonPayload.identifier="ci-slot-sweep"@ OR jsonPayload.message:"taking it out of service" OR (jsonPayload.identifier="ci-slot-sweep"@'
+mutate "a condition unanchored at the end" src 's@\[^ \]+ reads as foreign\$"@[^ ]+ reads as foreign"@'
+mutate "a wildcard where a field belongs"  src 's@\[^ \]+ reads as foreign\$"@.+ reads as foreign$"@'
+mutate "a condition under the wrong tag"   src 's@(jsonPayload.identifier="ci-slot-sweep" AND@(jsonPayload.identifier="ci-slot-reset" AND@'
+# The forgeries alone: anchored at both ends, no .* or .+, the writer's own
+# line still matches -- only a planted phrase shows the field is too wide.
+mutate "a field wide enough to plant into" src 's@\[^ \]+ reads as foreign\$"@[^!]+ reads as foreign[^!]*$"@'
+mutate "pin-hold logs its argument raw"    hs  "s@unknown argument '\\\\\$(safe \"\\\\\$1\")'@unknown argument '\\\\\$1'@"
 mutate "the counter is averaged"           src '/ci_slot_reset_failures\\" AND/{n;s/ALIGN_SUM/ALIGN_MEAN/}'
 mutate "the window is not ten minutes"     src '/ci_slot_reset_failures\\" AND/{n;s/"600s"/"3600s"/}'
 mutate "the pool mute reaches it"          src 's@ci_slot_reset_failures\\" AND resource.type=\\"gce_instance\\""@ci_slot_reset_failures\\" AND resource.type=\\"gce_instance\\"${MUTE_FILTER}"@'

@@ -1048,14 +1048,20 @@ One more watches the slots themselves rather than the pool:
   host's journal to Cloud Logging. Each Linux host now runs
   `ci-log-shipper.timer`: every 30 s it reads the journal from a saved cursor,
   matching only the tags `ci-slot-reset`, `ci-slot-sweep`, `ci-pin-hold` and
-  `ci-pin-sweep` AND `_UID=0`, so a job cannot forge a line. It sends up to 200
+  `ci-pin-sweep` AND `_UID=0`, so a job cannot write a line of its own (it can
+  still get text quoted inside a root line — see the metric below). It sends up to 200
   entries in one `entries:write` to the log `ci-slot-lifecycle` (labels `pool`,
   `host`), and moves the cursor only on an accepted write. An outage delays
   lines but does not lose them. The log-based metric `ci_slot_reset_failures`
   counts *is not the socket it listens on*, *reads as foreign*, *refusing to
   call this slot clean* and *taking it out of service* (the condemn line; not
-  "condemned", which the recovery line also says). The policy fires on any one
-  in 10 minutes. It keys on the host's `gce_instance`, so `--muted-pool` cannot
+  "condemned", which the recovery line also says). Each is one full `say`
+  sentence, anchored at both ends and paired with the tag that writes it, not a
+  phrase search: some root lines under these tags quote text a job chose (a
+  tool-cache directory name, the slot daemon's error, an argument passed to
+  pin-hold), and a bare phrase let those forge a page. The self-test plants each
+  phrase in all three places and proves none matches. The policy fires on any
+  one in 10 minutes. It keys on the host's `gce_instance`, so `--muted-pool` cannot
   reach it. `ci_slots_missing` still catches a condemned slot as lost
   capacity, 30 minutes later and without the reason.
 

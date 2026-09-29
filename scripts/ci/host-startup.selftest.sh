@@ -1498,8 +1498,11 @@ has_log_shipper() { # <file>
   # Root only: _UID is stamped by journald from the socket's credentials, so a
   # job cannot forge a line the alert counts.
   matches "$code" '^matches\+=\(_UID=0\)$' || return 1
-  # The journal is read through the match set and nothing else, oldest first.
-  matches "$code" '^timeout 20 "\$JOURNALCTL" "\$\{opts\[@\]\}" "\$\{matches\[@\]\}" 2>/dev/null \| head -n "\$MAX" >"\$batch"$' || return 1
+  # The journal is read through the match set and nothing else, oldest first,
+  # into a FILE: a service starts with SIGPIPE ignored, so a `| head` reader
+  # that stops early leaves journalctl failing or running into the deadline.
+  matches "$code" '^timeout "\$JTIMEOUT" "\$JOURNALCTL" "\$\{opts\[@\]\}" "--lines=\+\$MAX" "\$\{matches\[@\]\}" >"\$batch" 2>"\$errf"$' || return 1
+  matches "$code" '^IgnoreSIGPIPE=no$' || return 1
   # The host's token never goes in argv.
   matches "$code" "-K <\\(printf 'header = \"Authorization: Bearer %s\"\\\\n' \"\\\$token\"\\)" || return 1
 
@@ -2146,12 +2149,14 @@ mutate "log shipper failure made fatal"      's@^  install_log_shipper ||$@  ins
 mutate "log shipper installed but not armed" 's@systemctl enable --now ci-log-shipper.timer@systemctl enable ci-log-shipper.timer@' has_log_shipper
 mutate "log shipper oneshot without a deadline" 's@^TimeoutStartSec=120$@@'                                           has_log_shipper
 mutate "any uid's lines are shipped"         's@^matches+=(_UID=0)$@:@'                                               has_log_shipper
-mutate "the whole journal is read"           's@ "\${matches\[\@\]}" 2>/dev/null | head@ 2>/dev/null | head@'         has_log_shipper
+mutate "the whole journal is read"           's@ "\${matches\[\@\]}" >"\$batch"@ >"$batch"@'                          has_log_shipper
+mutate "journalctl piped into head again"    's@ "\${matches\[\@\]}" >"\$batch" 2>"\$errf"$@ "${matches[\@]}" 2>"$errf" | head -n "$MAX" >"$batch"@' has_log_shipper
+mutate "SIGPIPE left ignored in the unit"    's@^IgnoreSIGPIPE=no$@@'                                                  has_log_shipper
 mutate "the host token goes in argv"         's@-K <(printf .header = "Authorization: Bearer %s"\\n. "\$token")@-H "Authorization: Bearer $token"@' has_log_shipper
 mutate "a slot tool falls out of the ship list" 's@^IDENTIFIERS=(ci-slot-reset ci-slot-sweep @IDENTIFIERS=(ci-slot-reset @' has_log_shipper
 mutate "an unrelated tag is shipped"         's@^IDENTIFIERS=(ci-slot-reset @IDENTIFIERS=(ci-controller ci-slot-reset @'   has_log_shipper
 mutate "a renamed slot tool is not followed" 's@logger -t ci-pin-sweep@logger -t ci-pin-reaper@'                     has_log_shipper
-mutate "the generated shipper does not parse" 's@^n=\$(grep -c . "\$batch")$@n=$(grep -c . "$batch"@'                has_log_shipper
+mutate "the generated shipper does not parse" 's@^\[ -s "\$batch" \] || exit 0$@[ -s "$batch" ] || exit 0 )@'        has_log_shipper
 mutate "image store owner no longer checked" 's@not \\\$u:\\\$u -- another account owns@is fine@'                     has_baked_image_audit
 mutate "image store mode no longer checked"  's@0\\\$droot_mode & 066@0@'                                             has_baked_image_audit
 mutate "symlinked manifest reads as a file"  's@if \[ -L "\\\$manifest" \]@if false@'                                 has_baked_image_audit
