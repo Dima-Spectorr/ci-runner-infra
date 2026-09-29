@@ -221,9 +221,11 @@ run_suite() {
   [ "$(cursor)" = c9 ] || fail "the run after the token came back did not ship"
 
   # 6. Bounded, and a backlog is shipped from its START.
-  fixture c10 ci-slot-reset '"b1"' >>"$SD/journal.jsonl"
-  fixture c11 ci-slot-reset '"b2"' >>"$SD/journal.jsonl"
-  fixture c12 ci-slot-reset '"b3"' >>"$SD/journal.jsonl"
+  {
+    fixture c10 ci-slot-reset '"b1"'
+    fixture c11 ci-slot-reset '"b2"'
+    fixture c12 ci-slot-reset '"b3"'
+  } >>"$SD/journal.jsonl"
   MAX=2 ship
   last=$(posts)
   [ "$(jq -r '[.entries[].jsonPayload.message] | join(",")' "$SD/post.$last.json")" = b1,b2 ] ||
