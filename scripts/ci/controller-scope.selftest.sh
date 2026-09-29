@@ -1359,7 +1359,7 @@ grep -A2 'recycle_decision "\$status"' "$CTRL" | grep -q '"\$partial_for")' && r
 check "partial_seconds: recycle_decision receives it as its tenth argument" yes "$r"
 # shellcheck disable=SC2016
 sed -n '/^  rm -f "\$STATE_DIR\/idle-\$host"/,/pinhold/p' "$CTRL" \
-  | grep -q '"\$STATE_DIR/partial-\$host"' && r=yes || r=no
+  | grep '"\$STATE_DIR/partial-\$host"' >/dev/null && r=yes || r=no
 check "partial_seconds: the marker is cleaned up with the host" yes "$r"
 # ...and it is scoped. tick_pool() declares its per-host variables in one local
 # list; a name left off it becomes a global that survives into the next pool's
