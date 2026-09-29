@@ -703,6 +703,37 @@ FAKED="$SB/slot-reset.faked.sh"
 fake_docker "$RESET" "$FAKED"
 check_not "every docker call is on the stand-in" grep -qE '^[[:space:]]*docker |" docker ' "$FAKED"
 
+# TEMP-DBG-1392 begin -- removed before the final push
+cat >"$SB/dbg-block" <<DBG
+{
+  echo "DBG id=\$(id) pwd=\$(pwd) umask=\$(umask) SUDO_UID=\${SUDO_UID:-unset}"
+  ls -ld "$SB" "$FAKEBIN" "$FAKEBIN/docker" "/run/\$u" "\$sock"
+  timeout 30 sudo -u "\$u" /bin/sh -c 'echo DBG sudo-sh-ok; id'; echo "DBG sh rc=\$?"
+  timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" "$FAKEBIN/docker" ps; echo "DBG fake rc=\$?"
+  sudo -u "\$u" "$FAKEBIN/docker" ps; echo "DBG fake-no-timeout rc=\$?"
+  "$FAKEBIN/docker" ps; echo "DBG fake-as-root rc=\$?"
+  echo "DBG calls:"; cat "$FAKECALLS"
+  ps -o pid,ppid,pgid,sid,tty,user,cmd -p \$\$
+  grep -E 'Cap(Eff|Bnd)|NoNewPrivs|Seccomp' /proc/\$\$/status
+  ls -l /proc/\$\$/fd
+} >&2 2>&1
+DBG
+dbg_faked() { # <out> <stub quiesce 0|1>
+  awk -v f="$SB/dbg-block" '/^    if ! cids=/ { while ((getline l < f) > 0) print l; close(f) } { print }' "$FAKED" |
+    sed "\\#$FAKEBIN/docker# { s# 2>/dev/null##; s# 2>&1##; }" >"$1"
+  if [ "$2" = 1 ]; then sed -i 's/^  quiesce_slot || rc=1$/  : quiesce stubbed/' "$1"; fi
+  chmod 0755 "$1"
+}
+for stub in 1 0; do
+  dbg_faked "$SB/dbg-$stub.sh" "$stub"
+  echo "  DBG ==== faked reset, quiesce stubbed=$stub, stubbed-line: $(grep -c 'quiesce stubbed' "$SB/dbg-$stub.sh")"
+  rm -f -- "$MARKER" "$SB/ps-fails"
+  reset_once "$SB/dbg-$stub.sh"
+  echo "  DBG rc=$rc marker=$(test -f "$MARKER" && echo yes || echo no)"
+  sed 's/^/  DBG RUN: /' "$RUNLOG"
+done
+# TEMP-DBG-1392 end
+
 rm -f -- "$MARKER" "$SB/ps-fails"
 reset_once "$FAKED"
 check "with docker answering, the slot is marked clean" test -f "$MARKER"
