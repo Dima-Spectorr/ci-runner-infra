@@ -3049,6 +3049,81 @@ Waiting on code owner review from some-owner. (HTTP 405)'
   rm -rf "$fix"
 }
 
+# ---------------------------------------------------------------------------
+# A short clock is waited out in the run, because no event fires when it
+# clears (#1402). The decision is `lane_clock_wait`, tested next door. What is
+# asserted here is the wiring: both clock holds report when they clear, every
+# pass starts with no hold, the run loop asks the decision with the cap and
+# the pass budget, and after the sleep it re-reads `now`. Without that last
+# step the next pass computes the same ages and finds the same hold, so the
+# lane sleeps and reads for nothing.
+# ---------------------------------------------------------------------------
+review_hold_records_its_clock() {
+  matches "$(code_of "$1" | sed -n '/^        review:hold\*)$/,/^          ;;$/p')" \
+    '^          LANE_CLOCK_CLEARS_AT="\$\(lane_clock_earliest "\$LANE_CLOCK_CLEARS_AT" "\$\(\(now \+ REVIEW_GRACE - review_age\)\)"\)"$'
+}
+base_health_hold_records_its_clock() {
+  matches "$(code_of "$1" | sed -n '/^lane_base_is_vouched() {$/,/^}$/p')" \
+    '^  LANE_CLOCK_CLEARS_AT="\$\(lane_clock_earliest "\$LANE_CLOCK_CLEARS_AT" "\$\(\(now \+ BASE_HEALTH_GRACE - age\)\)"\)"$'
+}
+every_pass_starts_with_no_clock() {
+  matches "$(code_of "$1" | sed -n '/^one_pass() {$/,/^}$/p')" "^  LANE_CLOCK_CLEARS_AT=''$"
+}
+asks_the_clock_decision_within_the_budget() {
+  local code
+  code="$(code_of "$1")"
+  matches "$code" '^      clock_verdict="\$\(lane_clock_wait "\$LANE_CLOCK_CLEARS_AT" "\$pass_ended" "\$LANE_STARTED" \\$' || return 1
+  matches "$code" '^        "\$PASS_BUDGET" "\$\(\(pass_ended - pass_began\)\)" "\$CLOCK_WAIT_CAP" "\$clock_waits" "\$CLOCK_WAIT_MAX"\)"$' || return 1
+  matches "$code" '^CLOCK_WAIT_CAP=[0-9]+$'
+}
+never_waits_blind_or_dry() {
+  matches "$(code_of "$1")" '^    if \[ "\$LANE_FATAL" -eq 0 \] && \[ "\$DRY_RUN" != "true" \]; then$'
+}
+rereads_now_after_the_wait() {
+  # The three lines have to be ADJACENT code lines, in this order: sleep,
+  # refresh the clock, start the next pass.
+  local run
+  run="$(code_of "$1" | grep -A2 -E '^        sleep "\$clock_sleep"$' | tr '\n' '|')"
+  matches "$run" '^        sleep "\$clock_sleep"\|        now="\$\(date -u \+%s\)"\|        continue\|$'
+}
+# The cap has to leave the read after the wait room inside the DEFAULT pass
+# budget, or the fleet's default configuration can never take a wait at all.
+cap_fits_the_default_budget() {
+  local cap budget
+  cap="$(sed -n 's/^CLOCK_WAIT_CAP=\([0-9]*\)$/\1/p' "$1")"
+  budget="$(sed -n '/^      pass-budget-seconds:$/,/^        default:/ s/^        default: \([0-9]*\)$/\1/p' "$CALLEE")"
+  [[ "$cap" =~ ^[0-9]+$ ]] && [[ "$budget" =~ ^[0-9]+$ ]] && [ "$cap" -lt "$budget" ]
+}
+
+check review_hold_records_its_clock "$DRIVER" "the review-bots hold does not tell the run when it clears (#1402)"
+check base_health_hold_records_its_clock "$DRIVER" "the base-health hold does not tell the run when it clears (#1402)"
+check every_pass_starts_with_no_clock "$DRIVER" "a pass inherits the previous pass's clock hold"
+check asks_the_clock_decision_within_the_budget "$DRIVER" "the run loop does not ask lane_clock_wait with the cap and the pass budget"
+check never_waits_blind_or_dry "$DRIVER" "the run may wait out a clock on a blind pass or in a dry run"
+check rereads_now_after_the_wait "$DRIVER" "the run does not re-read now after waiting out a clock"
+check cap_fits_the_default_budget "$DRIVER" "CLOCK_WAIT_CAP does not fit inside the default pass budget"
+
+mutate "the review hold stops recording its clock" "$DRIVER" \
+  '/REVIEW_GRACE - review_age))")"$/d' review_hold_records_its_clock
+mutate "the base-health hold stops recording its clock" "$DRIVER" \
+  '/BASE_HEALTH_GRACE - age))")"$/d' base_health_hold_records_its_clock
+mutate "the per-pass reset is removed" "$DRIVER" \
+  "s@^  LANE_CLOCK_CLEARS_AT=''\$@  :@" every_pass_starts_with_no_clock
+mutate "the cap is replaced by the pass budget" "$DRIVER" \
+  's@"\$CLOCK_WAIT_CAP" "\$clock_waits"@"\$PASS_BUDGET" "\$clock_waits"@' asks_the_clock_decision_within_the_budget
+mutate "the wait stops counting the walk after it" "$DRIVER" \
+  's@"\$((pass_ended - pass_began))"@0@' asks_the_clock_decision_within_the_budget
+mutate "a dry run may sleep" "$DRIVER" \
+  's@ && \[ "\$DRY_RUN" != "true" \]; then$@; then@' never_waits_blind_or_dry
+mutate "a blind pass may sleep" "$DRIVER" \
+  's@^    if \[ "\$LANE_FATAL" -eq 0 \] && @    if @' never_waits_blind_or_dry
+mutate "the clock is not re-read after the wait" "$DRIVER" \
+  's@^        now="\$(date -u +%s)"$@        :@' rereads_now_after_the_wait
+mutate "the wait no longer sleeps" "$DRIVER" \
+  's@^        sleep "\$clock_sleep"$@        :@' rereads_now_after_the_wait
+mutate "the cap grows past the default budget" "$DRIVER" \
+  's@^CLOCK_WAIT_CAP=.*@CLOCK_WAIT_CAP=900@' cap_fits_the_default_budget
+
 _rf_out="$(behavioural_refusal_cases)"
 while IFS= read -r _rf_line; do
   case "$_rf_line" in

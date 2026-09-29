@@ -360,6 +360,85 @@ review "review:unreviewed reason=grace-expired answered=0 expected=1 age=900 gra
 review "review:answered answered=2 expected=2 unavailable=1" \
   "a fully answered pull request has nothing stale left to say" 2 2 10 900 1 1
 
+# --- a short clock is waited out in the run, a long one is not (#1402) ---------
+# The review grace clears with no event behind it, so a run that ended on a
+# `wait:review` hold left a green pull request for the daily backstop.
+# `clock` compares the WHOLE line: the seconds value is the sleep itself, and a
+# wrong one either re-reads before the clock clears or overshoots the budget.
+clock() {
+  local want="$1" desc="$2"
+  shift 2
+  local got
+  got=$(lane_clock_wait "$@")
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  args: %s\n  want: %s\n  got:  %s\n' "$desc" "$*" "$want" "$got"
+  fi
+}
+# args: clears_at now started budget last_pass cap waits_done max_waits
+T=1000000
+# mot-claude#991's shape: age=21 of grace=60, so the clock clears 39s from now.
+clock "wait:clock seconds=40" "the 60s review grace with 39s left is waited out, plus one second" \
+  $((T + 39)) "$T" $((T - 20)) 600 20 180 0 3
+clock "wait:clock seconds=1" "a clock that already cleared during the walk re-reads at once" \
+  $((T - 5)) "$T" $((T - 20)) 600 20 180 0 3
+clock "wait:clock seconds=180" "exactly the cap is still short" \
+  $((T + 179)) "$T" "$T" 600 20 180 0 3
+clock "nowait:over-cap seconds=181 cap=180" "one second past the cap is a long clock" \
+  $((T + 180)) "$T" "$T" 600 20 180 0 3
+clock "nowait:over-cap seconds=841 cap=180" "the 900s base-health grace from a fresh tip is left to its event" \
+  $((T + 840)) "$T" "$T" 600 20 180 0 3
+# The budget must hold the wait AND the read after it, or the run truncates the
+# read it waited for, or outlives the job.
+clock "wait:clock seconds=40" "wait plus walk exactly at the budget still fits" \
+  $((T + 39)) "$T" $((T - 540)) 600 20 180 0 3
+clock "nowait:over-budget seconds=40 spent=541 walk=20 budget=600" "one second over the budget does not" \
+  $((T + 39)) "$T" $((T - 541)) 600 20 180 0 3
+clock "nowait:over-budget seconds=40 spent=0 walk=580 budget=600" "a slow walk is counted, not assumed free" \
+  $((T + 39)) "$T" "$T" 600 580 180 0 3
+clock "nowait:no-deadline budget=0" "a budget of 0 bounds nothing, so nothing is waited" \
+  $((T + 39)) "$T" "$T" 0 20 180 0 3
+clock "nowait:no-deadline budget=ten" "a garbled budget is not a deadline" \
+  $((T + 39)) "$T" "$T" ten 20 180 0 3
+clock "wait:clock seconds=40" "a clock read backwards counts as no time spent" \
+  $((T + 39)) "$T" $((T + 50)) 600 20 180 0 3
+clock "nowait:over-budget seconds=40 spent=0 walk=20 budget=59" "and never as time given back" \
+  $((T + 39)) "$T" $((T + 50)) 59 20 180 0 3
+# Bounded in count as well as in time.
+clock "wait:clock seconds=40" "the last permitted wait" \
+  $((T + 39)) "$T" "$T" 600 20 180 2 3
+clock "nowait:waits-spent waits=3 max=3" "no fourth wait" \
+  $((T + 39)) "$T" "$T" 600 20 180 3 3
+clock "nowait:waits-spent waits=0 max=" "no limit given is no wait" \
+  $((T + 39)) "$T" "$T" 600 20 180 0 ""
+# Nothing held, or nothing readable: the run ends exactly as it always did.
+clock "nowait:no-clock" "no clock-held pull request" "" "$T" "$T" 600 20 180 0 3
+clock "nowait:no-clock" "a garbled clock" soon "$T" "$T" 600 20 180 0 3
+clock "nowait:unreadable now=$T started=$T last-pass=" "an unmeasured walk" \
+  $((T + 39)) "$T" "$T" 600 "" 180 0 3
+clock "nowait:no-cap cap=x" "a garbled cap" $((T + 39)) "$T" "$T" 600 20 x 0 3
+
+# lane_clock_earliest: the first clock to clear is the one worth waiting for.
+earliest() {
+  local want="$1" desc="$2" got
+  shift 2
+  got=$(lane_clock_earliest "$@")
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  args: %s\n  want: %s\n  got:  %s\n' "$desc" "$*" "$want" "$got"
+  fi
+}
+earliest 100 "the sooner of two" 200 100
+earliest 100 "whichever side it is on" 100 200
+earliest 100 "equal is equal" 100 100
+earliest 300 "first clock of the pass" "" 300
+earliest 300 "a garbled candidate is ignored" 300 soon
+earliest "" "nothing held" "" ""
+
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane-decision: $FAIL failed, $PASS passed"
   exit 1

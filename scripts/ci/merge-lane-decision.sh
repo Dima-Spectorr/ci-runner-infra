@@ -499,3 +499,127 @@ lane_review_gate() {
   echo "review:hold answered=$answered expected=$expected age=$age grace=$grace$unavail_note$stale_note"
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# lane_clock_earliest — the sooner of two moments a held pull request clears.
+#
+#   lane_clock_earliest <current> <candidate>
+#
+# Prints the smaller of the two epoch values, ignoring either one that is not a
+# whole number, and prints nothing when neither is. The pass folds every clock
+# it was held by into one value, because the lane only needs to know when the
+# FIRST of them clears. The read after that sees all of them again.
+# ---------------------------------------------------------------------------
+lane_clock_earliest() {
+  local current="${1:-}" candidate="${2:-}"
+  [[ "$current" =~ ^[0-9]+$ ]] || current=''
+  [[ "$candidate" =~ ^[0-9]+$ ]] || candidate=''
+  if [ -z "$current" ]; then
+    printf '%s\n' "$candidate"
+  elif [ -z "$candidate" ] || [ "$current" -le "$candidate" ]; then
+    printf '%s\n' "$current"
+  else
+    printf '%s\n' "$candidate"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# lane_clock_wait — should the run wait out a short clock and read again,
+# rather than end and leave the pull request for the next event?
+#
+#   lane_clock_wait <clears_at> <now> <started> <pass_budget> <last_pass> \
+#                   <cap> <waits_done> <max_waits>
+#
+# clears_at    epoch at which the earliest clock-held pull request clears, from
+#              `lane_clock_earliest`, or "" when nothing was held by a clock
+# now          epoch now
+# started      epoch the run started, which is where the pass budget counts from
+# pass_budget  `pass-budget-seconds`. 0 means the budget is off.
+# last_pass    seconds the pass that just ended took, which is the estimate of
+#              what the read after the wait will cost
+# cap          the longest wait the run will take in-pass
+# waits_done   how many waits this run has already taken
+# max_waits    how many it may take in all
+#
+# WHY THIS EXISTS (#1402)
+#
+# Some holds wait on a CLOCK rather than on an event: the `review-bots` grace
+# and the base-health grace. When the reviewer or the health job does answer,
+# that answer is an event and it wakes the lane. When it stays silent, which is
+# exactly the case both graces were added for, nothing happens at the moment
+# the clock runs out. The fifteen-minute pool cron used to hide this. Once it
+# was removed (#1380/#1381), a green, clean pull request held by a 60-second
+# review grace sat until the daily backstop. Measured on 2026-09-29: a pull
+# request logged `wait:review ... age=21 grace=60` and then waited 27 minutes
+# for a manual dispatch.
+#
+# So a SHORT clock is waited out here, inside the run that saw it. The run keeps
+# the lane's concurrency group while it waits, so passes stay one at a time, and
+# the read after the wait re-reads everything live. A review that landed during
+# the wait is seen, and so is a base that moved.
+#
+# A LONG clock is not waited out. Sleeping on a runner for minutes to learn what
+# the daily backstop would learn is the cost #1380 removed. `cap` is where
+# short ends.
+#
+# EVERY LIMIT FAILS TOWARD NOT WAITING. The lane has always ended a run without
+# waiting, so declining costs one pull request its wait for the backstop. A wait
+# that outlives the job costs the whole run: a job killed by `timeout-minutes`
+# reports `cancelled`, with no summary and no queue. That is why the wait, PLUS
+# one more pass of the size just measured, has to fit inside the pass budget. It
+# is also why a budget of 0, which bounds nothing, means no waiting.
+#
+# Prints one line:
+#   wait:clock seconds=N              sleep N seconds, then read again
+#   nowait:<reason> key=value...      end the run as before
+# ---------------------------------------------------------------------------
+lane_clock_wait() {
+  local clears_at="${1:-}" now="${2:-}" started="${3:-}" budget="${4:-}"
+  local last_pass="${5:-}" cap="${6:-}" done_n="${7:-}" max_n="${8:-}"
+
+  if ! [[ "$clears_at" =~ ^[0-9]+$ ]]; then
+    echo "nowait:no-clock"
+    return 0
+  fi
+  local n
+  for n in "$now" "$started" "$last_pass"; do
+    if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+      echo "nowait:unreadable now=$now started=$started last-pass=$last_pass"
+      return 0
+    fi
+  done
+  if ! [[ "$max_n" =~ ^[0-9]+$ ]] || ! [[ "$done_n" =~ ^[0-9]+$ ]] || [ "$done_n" -ge "$max_n" ]; then
+    echo "nowait:waits-spent waits=$done_n max=$max_n"
+    return 0
+  fi
+  if ! [[ "$budget" =~ ^[0-9]+$ ]] || [ "$budget" -eq 0 ]; then
+    echo "nowait:no-deadline budget=$budget"
+    return 0
+  fi
+  if ! [[ "$cap" =~ ^[0-9]+$ ]]; then
+    echo "nowait:no-cap cap=$cap"
+    return 0
+  fi
+
+  # One second past the moment it clears. Every clock here counts in whole
+  # seconds, and a read that lands in the same second the clock clears must
+  # already see it cleared.
+  local wait=$((clears_at - now))
+  [ "$wait" -ge 0 ] || wait=0
+  wait=$((wait + 1))
+
+  if [ "$wait" -gt "$cap" ]; then
+    echo "nowait:over-cap seconds=$wait cap=$cap"
+    return 0
+  fi
+
+  local spent=$((now - started))
+  [ "$spent" -ge 0 ] || spent=0
+  if [ $((spent + wait + last_pass)) -gt "$budget" ]; then
+    echo "nowait:over-budget seconds=$wait spent=$spent walk=$last_pass budget=$budget"
+    return 0
+  fi
+
+  echo "wait:clock seconds=$wait"
+  return 0
+}
