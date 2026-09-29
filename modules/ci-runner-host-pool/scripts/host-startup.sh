@@ -1984,6 +1984,14 @@ take_lock() { # <what>
 
 say() { logger -t ci-pin-hold -- "\$*" 2>/dev/null || true; echo "pin hold: \$*" >&2; }
 
+# The reset's safe(), for the same reason: a job reaches this through sudo, and
+# the sudoers rule's trailing \`*\` lets it append any argument it likes. Echoed
+# raw into a root log line, that argument is text a job writes into the log
+# the slot alerts read (#1403).
+safe() {
+  printf '%.120s' "\$(printf '%s' "\$1" | tr '\n\t' '  ' | tr -d '\000-\037')"
+}
+
 boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
 
 # The guest attribute the controller reads. Best effort by design: the hold on
@@ -2087,7 +2095,7 @@ case "\${1:-}" in
         --run) [ "\$#" -ge 2 ] || { say "refusing: --run needs a value"; exit 1; }; run="\$2"; shift 2 ;;
         --ttl) [ "\$#" -ge 2 ] || { say "refusing: --ttl needs a value"; exit 1; }; ttl_text="\$2"; shift 2 ;;
         --reserve-slot) reserve=1; shift ;;
-        *) say "refusing: unknown argument '\$1'"; exit 1 ;;
+        *) say "refusing: unknown argument '\$(safe "\$1")'"; exit 1 ;;
       esac
     done
 
@@ -2180,7 +2188,7 @@ case "\${1:-}" in
     while [ "\$#" -gt 0 ]; do
       case "\$1" in
         --run) [ "\$#" -ge 2 ] || { say "refusing: --run needs a value"; exit 1; }; renew_run="\$2"; shift 2 ;;
-        *) say "refusing: unknown argument '\$1'"; exit 1 ;;
+        *) say "refusing: unknown argument '\$(safe "\$1")'"; exit 1 ;;
       esac
     done
     # An absent or empty --run is not an identity claim, and renewing on one
@@ -3091,6 +3099,230 @@ EOF
 
   systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
   systemctl enable --now ci-baked-image-audit.timer >>/var/log/ci-host.log 2>&1 || return 1
+}
+
+# --- the slot-lifecycle log shipper -------------------------------------------
+#
+# THE GAP (#1403, measured 2026-09-29): the reset, the sweeps and the pin tools
+# write their verdicts through `logger`, and NOTHING ships a host's journal to
+# Cloud Logging -- no ops agent on the image, no fluent config, and the guest
+# agent forwards only its own lines. The one copy that did reach it was a reset
+# the startup script ran itself, because its stderr lands in
+# google_metadata_script_runner. Every reset run by a job hook, by an agent
+# unit's ExecStartPre or by the sweep went to the local journal and nowhere
+# else. So a slot condemned for burning jobs, or a reset that failed closed on
+# every host (#1394 made that more likely, by design), could be read only with
+# a shell on the VM: no metric could count it and no alert could fire on it.
+#
+# THE SHAPE. A oneshot on a timer, not a follower: every 30 seconds it reads the
+# journal from a saved cursor, sends up to CI_LOG_SHIPPER_MAX entries in ONE
+# entries:write with the instance's own token, and moves the cursor only when
+# the write was accepted. That buys every property the reset needs from it:
+#
+#   the reset never waits on it -- `logger` returns once journald has the line,
+#   and the shipper reads the journal later, in its own unit;
+#
+#   an outage costs latency, not lines -- a refused or timed-out write leaves
+#   the cursor where it was, the next run resends the same batch, and the
+#   journal is the buffer (at-least-once; insertId is the entry's boot id and
+#   monotonic stamp, so Cloud Logging collapses a resend of the same entry);
+#
+#   order is the journal's -- one batch, in journal order, cursor after it;
+#
+#   it is bounded -- one batch per run, a message cut at 2000 characters, one
+#   curl with a deadline, and a unit deadline behind that;
+#
+#   it cannot wedge on a poison entry -- a 400 is a batch Cloud Logging will
+#   never accept, so it is dropped (and said locally) rather than resent forever.
+#
+# ONLY THESE IDENTIFIERS, AND ONLY FROM ROOT. The match set is the slot tools'
+# own tags ANDed with _UID=0. `_UID` is a field journald stamps from the
+# sender's socket credentials, which a client cannot forge, and every one of
+# these tools runs as root (the hooks reach the reset through sudo). A job on a
+# slot can run `logger -t ci-slot-reset condemned` all day; it is a different
+# uid, so its lines are never read. The rest of the journal is never read
+# either: this is four tags, not a syslog pipe. What a job CAN do is get text
+# quoted inside a root line (a tool-cache directory name, its daemon's error, an
+# argument to pin-hold), which is why the alert's metric matches whole anchored
+# sentences per tag, never a phrase (ensure-alert-policies.sh).
+#
+# THE TEXT. The reset already passes every slot-chosen value through safe()
+# before it reaches `logger`. The shipper does not trust that: jq builds the
+# body, so no message can break the JSON or add a field to it; control
+# characters become spaces; a message journald stored as bytes (not valid
+# UTF-8) keeps only its printable ASCII.
+#
+# The host account already holds roles/logging.logWriter (ci-runner-identity),
+# for the same reason the controller's does. Nothing here needs a new grant.
+install_log_shipper() {
+  mkdir -p /opt/ci || return 1
+  cat >/opt/ci/log-shipper.sh <<'EOF'
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as root on a timer. See install_log_shipper().
+set -uo pipefail
+
+# The overrides exist for scripts/ci/log-shipper.behaviour.sh. The unit sets
+# none of them, and only root can start this with an environment of its own.
+STATE_DIR="${CI_LOG_SHIPPER_STATE:-/var/lib/ci-log-shipper}"
+ENDPOINT="${CI_LOG_SHIPPER_ENDPOINT:-https://logging.googleapis.com/v2/entries:write}"
+MD_BASE="${CI_LOG_SHIPPER_METADATA:-http://metadata.google.internal/computeMetadata/v1}"
+JOURNALCTL="${CI_LOG_SHIPPER_JOURNALCTL:-journalctl}"
+MAX="${CI_LOG_SHIPPER_MAX:-200}"
+JTIMEOUT="${CI_LOG_SHIPPER_JOURNAL_TIMEOUT:-20}"
+MSG_MAX=2000
+LOG_ID=ci-slot-lifecycle
+IDENTIFIERS=(ci-slot-reset ci-slot-sweep ci-pin-hold ci-pin-sweep)
+
+# Its own tag is not in the list above, so what it says about itself is never
+# shipped back through it.
+note() { logger -t ci-log-shipper -- "$*" 2>/dev/null || true; echo "log shipper: $*" >&2; }
+
+md() {
+  curl --connect-timeout 5 --max-time 10 -fsS -H 'Metadata-Flavor: Google' "$MD_BASE/$1" 2>/dev/null
+}
+
+mkdir -p "$STATE_DIR" 2>/dev/null && chmod 0700 "$STATE_DIR" 2>/dev/null ||
+  { note "cannot create $STATE_DIR -- nothing shipped"; exit 0; }
+cursor_file="$STATE_DIR/cursor"
+batch="$STATE_DIR/batch.jsonl"
+
+cursor=$(cat "$cursor_file" 2>/dev/null) || cursor=""
+opts=(--no-pager --output=json)
+if [ -n "$cursor" ]; then opts+=("--after-cursor=$cursor"); else opts+=(--boot); fi
+matches=()
+for id in "${IDENTIFIERS[@]}"; do matches+=("SYSLOG_IDENTIFIER=$id"); done
+matches+=(_UID=0)
+
+# --lines=+N: the OLDEST N after the cursor (systemd >= 255, which is what the
+# image's Ubuntu 24.04 ships), so journalctl stops by itself and a backlog is
+# shipped from its start. NOT `| head`: a systemd service starts with SIGPIPE
+# ignored, so a journalctl whose reader has gone does not die of 141 -- it
+# fails its write, or walks the whole backlog into the deadline, and either way
+# the batch is lost every run (#1410 review). The output goes to a FILE.
+errf="$STATE_DIR/journal.err"
+timeout "$JTIMEOUT" "$JOURNALCTL" "${opts[@]}" "--lines=+$MAX" "${matches[@]}" >"$batch" 2>"$errf"
+jrc=$?
+case "$jrc" in
+  0) ;;
+  124)
+    # Out of time with some of it read: ship what is complete. A line cut
+    # mid-entry is not JSON, and the parse below skips it; the cursor then
+    # stops at the last whole entry, so the cut one is read again next run.
+    note "journalctl timed out after ${JTIMEOUT}s -- shipping the complete entries it wrote" ;;
+  *)
+    # The cursor goes ONLY when journalctl says the cursor is what it refused.
+    # Any other failure keeps it: deleting it on every non-zero exit turns one
+    # bad run into a restart from --boot, and a failure that repeats into a
+    # shipper that silently never moves again.
+    if [ -n "$cursor" ] && grep -q 'Failed to seek to cursor' "$errf" 2>/dev/null; then
+      note "journalctl refused the saved cursor -- restarting from this boot"
+      rm -f "$cursor_file"
+    else
+      note "journalctl exited $jrc -- cursor kept, retrying next run: $(head -c 300 "$errf" 2>/dev/null | tr -d '\000-\037')"
+    fi
+    exit 0 ;;
+esac
+[ -s "$batch" ] || exit 0
+
+# Line by line and tolerant: a line that is not JSON is skipped rather than
+# failing the whole batch, which would otherwise be retried forever.
+n=$(jq -Rn '[inputs | fromjson? | select(type == "object")] | length' "$batch" 2>/dev/null)
+last=$(jq -Rr 'fromjson? | select(type == "object") | .__CURSOR // empty' "$batch" 2>/dev/null | tail -n 1)
+[ -n "$last" ] || { note "no entry in the batch carries a cursor -- ${n:-0} entries not shipped"; exit 0; }
+
+project=$(md project/project-id)
+iid=$(md instance/id)
+zone=$(md instance/zone)
+zone=${zone##*/}
+host=$(md instance/name)
+pool=$(md instance/attributes/ci-pool)
+[ -n "$project" ] && [ -n "$iid" ] && [ -n "$zone" ] ||
+  { note "metadata server unreachable -- $n entries kept for the next run"; exit 0; }
+
+body=$(jq -cRn --arg lg "projects/$project/logs/$LOG_ID" --arg project "$project" \
+  --arg iid "$iid" --arg zone "$zone" --arg host "$host" --arg pool "$pool" \
+  --argjson msgmax "$MSG_MAX" '
+  def text: if type == "string" then .
+            elif type == "array" then map(select(type == "number" and . >= 32 and . < 127)) | implode
+            else "" end;
+  def clean($n): text | explode | map(if . < 32 or . == 127 then 32 else . end) | implode | .[0:$n];
+  def stamp: tostring | if test("^[0-9]{7,}$") then (.[0:-6] | tonumber | todate | rtrimstr("Z")) + "." + .[-6:] + "Z" else null end;
+  def sev: {"0":"EMERGENCY","1":"ALERT","2":"CRITICAL","3":"ERROR","4":"WARNING","5":"NOTICE","6":"INFO","7":"DEBUG"}[(.PRIORITY // "5") | tostring] // "DEFAULT";
+  { logName: $lg,
+    resource: {type: "gce_instance", labels: {project_id: $project, instance_id: $iid, zone: $zone}},
+    labels: {pool: $pool, host: $host},
+    partialSuccess: true,
+    entries: ([inputs | fromjson? | select(type == "object")] | map({
+      severity: sev,
+      insertId: ((._BOOT_ID // "" | clean(40)) + "-" + (.__MONOTONIC_TIMESTAMP // "" | clean(24))),
+      jsonPayload: {identifier: (.SYSLOG_IDENTIFIER // "" | clean(40)), message: (.MESSAGE // "" | clean($msgmax))}
+    } + (if (.__REALTIME_TIMESTAMP // "" | stamp) then {timestamp: (.__REALTIME_TIMESTAMP | stamp)} else {} end))) }' \
+  "$batch" 2>/dev/null)
+[ -n "$body" ] || { note "could not assemble the batch -- $n entries kept for the next run"; exit 0; }
+
+token=$(md instance/service-accounts/default/token | jq -r '.access_token // empty' 2>/dev/null)
+[ -n "$token" ] || { note "no access token -- $n entries kept for the next run"; exit 0; }
+
+# The token travels over a pipe, never argv, where any process on the host
+# could read it; the body over stdin because 200 entries can pass the kernel's
+# per-argument cap.
+out=$(mktemp) || out=/dev/null
+http=$(printf '%s' "$body" | curl --connect-timeout 10 --max-time 30 -s -o "$out" -w '%{http_code}' -X POST \
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
+  -H 'Content-Type: application/json' --data-binary @- "$ENDPOINT" 2>/dev/null)
+advance() {
+  printf '%s' "$last" >"$cursor_file.tmp" && mv -f "$cursor_file.tmp" "$cursor_file"
+}
+case "$http" in
+  200) advance ;;
+  400)
+    note "entries:write -> HTTP 400, a batch it will never accept -- $n entries dropped: $(head -c 300 "$out" | tr -d '\000-\037')"
+    advance ;;
+  *) note "entries:write -> HTTP ${http:-none} -- $n entries kept for the next run" ;;
+esac
+[ "$out" = /dev/null ] || rm -f "$out"
+rm -f "$batch"
+exit 0
+EOF
+  chown root:root /opt/ci/log-shipper.sh || return 1
+  chmod 0755 /opt/ci/log-shipper.sh || return 1
+
+  cat >/etc/systemd/system/ci-log-shipper.service <<'EOF'
+[Unit]
+Description=Ship the slot tools' journal lines to Cloud Logging
+After=network-online.target
+
+[Service]
+Type=oneshot
+# A oneshot with no deadline blocks its own timer forever. Every call inside is
+# already bounded (journalctl 20s, metadata 10s each, the write 30s), so this is
+# the backstop rather than the control.
+TimeoutStartSec=120
+# Idle priority: this must never be what a job waits behind.
+Nice=19
+IOSchedulingClass=idle
+# systemd starts a service with SIGPIPE ignored. Nothing in the shipper pipes
+# into a reader that stops early any more, but a pipeline added later would
+# otherwise hang or fail instead of ending the way it does in a shell.
+IgnoreSIGPIPE=no
+ExecStart=/opt/ci/log-shipper.sh
+EOF
+
+  cat >/etc/systemd/system/ci-log-shipper.timer <<'EOF'
+[Unit]
+Description=Ship the slot tools' journal lines every 30 seconds
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
+  systemctl enable --now ci-log-shipper.timer >>/var/log/ci-host.log 2>&1 || return 1
 }
 
 # --- registry credentials for job containers ----------------------------------
@@ -6304,6 +6536,13 @@ main() {
   # a fleet outage of the kind the sweep is here to end.
   install_slot_sweep ||
     log "the idle slot sweep did not install — a slot left dirty by a cancelled job will stay dirty until this host is recycled"
+
+  # Fails OPEN, for the sweep's reason: without it the host resets, sweeps and
+  # pins exactly as before and only Cloud Logging loses the account of it. Its
+  # first run reads the journal from the start of this boot, so the resets the
+  # installs above already ran are not lost by coming after them.
+  install_log_shipper ||
+    log "the slot-lifecycle log shipper did not install — reset and sweep verdicts on this host stay in its journal, and the condemned-slot alert cannot see them"
 
   if [ "$failures" -ge "$SLOTS" ]; then
     # Zero registered agents = a host GitHub will never send work to. It cannot
