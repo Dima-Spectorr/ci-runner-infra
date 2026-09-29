@@ -336,7 +336,12 @@ INFO `pinned-run-rerun` event. There is one controller re-run per run id: a run
 that is unservable again afterwards is only cancelled, with a WARNING
 `pinned-run-unservable` event for a person, so a persistent fault cannot loop.
 Both calls need `Actions: write` ([github-app-permissions.md](github-app-permissions.md)).
-A 403 falls back to the same WARNING, naming the run and the move that clears it.
+They go out on a token down-scoped to the one repository. A permission refusal
+falls back to the same WARNING, naming the run and the move that clears it. A
+rate-limit 403 is retried instead. The re-run is only for the attempt the
+controller cancelled, only for `push`, `pull_request` and `merge_group` runs,
+and never when a newer run of the same workflow exists on the branch: the goal
+is to unstick CI, never to replay old code.
 
 **Runbook: re-run a pinned workflow in full, never with `--failed`.** `gh run
 rerun <id>` re-runs the anchor, which pins the run to a live host. `gh run rerun

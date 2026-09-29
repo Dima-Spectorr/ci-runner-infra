@@ -44,9 +44,28 @@ never `rerun-failed-jobs`), so the anchor job re-pins the run to a live host
 **What it enables in the controller.** At most one controller-initiated re-run
 per run id, recorded in the controller's state directory. A run that is
 unservable again after that is only cancelled, with a WARNING for a person. A
-successful re-run is an INFO `pinned-run-rerun` event. A 403 on either call
-falls back to a WARNING `pinned-run-unservable` event that names the run and says
-to re-run it in full, which is exactly the behaviour before the grant.
+successful re-run is an INFO `pinned-run-rerun` event. The re-run is narrower
+than "any cancelled run":
+
+* **Only the attempt the controller cancelled**, and only if it concluded
+  `cancelled`. If a person re-ran it in the meantime, or it finished on its own,
+  the controller closes its record silently.
+* **Only CI events: `push`, `pull_request`, `merge_group`.** Never
+  `workflow_dispatch`, `schedule`, or any deploy-style trigger (`deployment`,
+  `release`, `workflow_run`, `repository_dispatch`, ...). The goal is to unstick
+  CI, never to replay old code. Those runs are cancelled with a WARNING.
+* **Never when a newer run of the same workflow exists on the same branch.**
+  That run is cancelled with a WARNING `pinned-run-superseded`.
+
+**The write token is down-scoped.** Cancel and re-run are posted with a second
+installation token, minted per controller with `repositories: [<its repo>]`
+and `permissions: {actions: write}`. So a cancel or re-run can only ever reach
+that one repository's runs. Every read keeps the ordinary installation token.
+A missing grant surfaces at that mint as HTTP 422. A 403 on the POST counts as a
+refusal only when `x-ratelimit-remaining` is above zero and there is no
+`retry-after`; otherwise it is a rate limit and is retried on a later tick. A
+refusal falls back to a WARNING `pinned-run-unservable` event that names the run
+and says to re-run it in full, which is exactly the behaviour before the grant.
 
 **Blast radius.** `Actions: write` lets this App, in every repository its
 installation covers, cancel, re-run and delete workflow runs, dispatch
@@ -56,7 +75,11 @@ workflow's own token. It still cannot change a repository's contents: no push,
 no merge, no comment, no review. The App private key stays in Secret Manager,
 readable only by the host service account and never by the account job code
 runs as (the identity split below), so job code cannot use this permission.
-That split is what makes the grant acceptable.
+That split is what makes the grant acceptable. **What it does not narrow:** the
+controller's ordinary installation token is unscoped, so once the grant lands,
+that token also carries `Actions: write` on every repository in the
+installation. The controller only ever uses it for reads, but the capability is
+there.
 
 **Owner steps.** Exactly the procedure under [How to grant it](#how-to-grant-it):
 the App owner sets **Repository permissions → Actions** to **Read and write**

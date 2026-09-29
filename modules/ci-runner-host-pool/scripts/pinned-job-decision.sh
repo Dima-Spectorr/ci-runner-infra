@@ -444,6 +444,9 @@ pin_sight_decision() {
 #   rerun      the controller already re-ran this run in full ONCE
 #   refused    GitHub refused a cancel or a re-run with 403 (no Actions: write)
 #   gaveup     the cancel never completed inside PIN_RERUN_MAX_WAIT
+#   done       a person re-ran it, or it finished, after the cancel (silent)
+#   superseded a newer run of the same workflow on the same branch exists
+#   declined   its event is not on pin_rerun_event_allowed's allowlist
 #
 # Echoes `cancel-then-rerun:<reason>` or `cancel-only:<reason>`. Always exits 0.
 #
@@ -457,12 +460,39 @@ pin_orphan_action() {
   case "${1:-}" in
     rerun) echo "cancel-only:the controller already re-ran this run once" ;;
     gaveup) echo "cancel-only:an earlier cancel never completed" ;;
+    done) echo "cancel-only:a person re-ran it or it finished since the controller cancelled it" ;;
+    superseded) echo "cancel-only:a newer run of this workflow exists" ;;
+    declined) echo "cancel-only:its event is not on the re-run allowlist" ;;
     refused) echo "cancel-only:GitHub refused this App (Actions: write not granted)" ;;
     *) echo "cancel-then-rerun:unservable, not yet re-run by the controller" ;;
   esac
 }
 
-# pin_rerun_decision <ledger_state> <seconds_since_cancel> <run_status> <max_wait>
+# pin_rerun_event_allowed <event>
+#
+# THE RE-RUN ALLOWLIST. The owner's intent is "unstick CI", never "replay old
+# code": a re-run executes the run's ORIGINAL commit with the workflow's own
+# token. For CI events that is harmless (the same checks, on the same commit,
+# against the same base) and it is what unblocks a merge lane. For anything
+# else it is not: `workflow_dispatch` carries a person's inputs from an earlier
+# moment, `schedule` runs are replaced by the next tick of the schedule anyway,
+# and `deployment`/`release`/`workflow_run`/`repository_dispatch` are
+# deploy-style triggers whose replay could ship an old build. So:
+#
+#   allowed : push, pull_request, merge_group
+#   never   : everything else, including an empty or unreadable event
+#
+# Exit 0 = allowed. Pure.
+pin_rerun_event_allowed() {
+  case "${1:-}" in
+    push | pull_request | merge_group) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# pin_rerun_decision <ledger_state> <seconds_since_cancel> <run_status> <max_wait> \
+#                    <recorded_attempt> <current_attempt> <conclusion> <event> \
+#                    <superseded>
 #
 # The second half of cancel-then-rerun, asked once per tick for every run whose
 # ledger says a cancel was accepted. A re-run is only accepted for a COMPLETED
@@ -470,22 +500,69 @@ pin_orphan_action() {
 # tick, once GitHub reports the run completed. That keeps it out of the tick's
 # time budget entirely: there is no poll, only a read per pending run.
 #
+#   recorded_attempt : the run_attempt the controller cancelled (in the ledger)
+#   current_attempt  : the run's run_attempt now
+#   conclusion       : the run's conclusion now
+#   event            : the run's triggering event (pin_rerun_event_allowed)
+#   superseded       : 1 when a NEWER run of the same workflow on the same
+#                      branch exists, 0 when none does, empty when the lookup
+#                      failed
+#
 # Echoes one of:
-#   rerun:<reason>    POST .../runs/{id}/rerun now (full, never rerun-failed-jobs)
-#   wait:<reason>     look again next tick
-#   give-up:<reason>  the cancel has not completed in max_wait; stop and warn
-#   skip:<reason>     nothing pending for this run (including the cap)
+#   rerun:<reason>       POST .../runs/{id}/rerun now (full, never rerun-failed-jobs)
+#   wait:<reason>        look again next tick
+#   give-up:<reason>     the cancel has not completed in max_wait; stop and warn
+#   done:<reason>        the run is no longer the controller's to act on; close
+#                        the entry SILENTLY (a person re-ran it, or it finished)
+#   superseded:<reason>  a newer run exists; do not replay old code, warn
+#   declined:<reason>    the event is not on the allowlist; do not re-run, warn
+#   skip:<reason>        nothing pending for this run (including the cap)
+#
+# THE RE-RUN IS KEYED ON THE ATTEMPT THE CONTROLLER CANCELLED, not on the run
+# id alone. `completed` on its own says nothing about who completed it: a
+# person may have re-run the run in the meantime (a new attempt, possibly
+# already finished), or the run may have finished before the cancel landed.
+# Re-running either would be the controller overriding a human or replaying a
+# result, so the only state that earns a re-run is: the same attempt, completed,
+# and concluded `cancelled`.
 pin_rerun_decision() {
   local state="${1:-}" since="${2:-}" status="${3:-}" max="${4:-}"
+  local rec="${5:-}" cur="${6:-}" concl="${7:-}" event="${8:-}" superseded="${9:-}"
   case "$state" in
     cancelled) ;;
     rerun) echo "skip:already re-run once by the controller (cap)"; return 0 ;;
     *) echo "skip:no cancel pending (${state:-none})"; return 0 ;;
   esac
+
+  # A readable attempt that moved on is somebody else's action: silent.
+  case "$cur" in
+    "" | *[!0-9]*) ;;
+    *)
+      if [ "$cur" != "$rec" ]; then
+        echo "done:attempt is $cur, the controller cancelled attempt ${rec:-unrecorded}"
+        return 0
+      fi
+      ;;
+  esac
+
   if [ "$status" = completed ]; then
-    echo "rerun:the cancelled run has completed"
-    return 0
+    case "$rec" in
+      "" | *[!0-9]*) echo "done:no recorded attempt, so no proof this is the run the controller cancelled"; return 0 ;;
+    esac
+    case "$cur" in
+      "" | *[!0-9]*) echo "done:unreadable current attempt, so no proof this is the run the controller cancelled"; return 0 ;;
+    esac
+    [ "$concl" = cancelled ] || { echo "done:finished on its own (${concl:-no conclusion})"; return 0; }
+    pin_rerun_event_allowed "$event" \
+      || { echo "declined:event ${event:-unknown} is never re-run automatically"; return 0; }
+    case "$superseded" in
+      1) echo "superseded:a newer run of this workflow on this branch exists"; return 0 ;;
+      0) echo "rerun:attempt $rec was cancelled by the controller and nothing newer exists"; return 0 ;;
+    esac
+    # Unknown: fall through to the clock, which waits and eventually gives up.
+    status="completed, newer-run check unreadable"
   fi
+
   case "$since" in "" | *[!0-9]*) echo "wait:unreadable cancel stamp"; return 0 ;; esac
   case "$max" in "" | *[!0-9]*) echo "wait:unreadable max wait"; return 0 ;; esac
   if [ "$since" -gt "$max" ]; then
@@ -493,6 +570,50 @@ pin_rerun_decision() {
   else
     echo "wait:run is ${status:-unreadable}, ${since}s after the cancel"
   fi
+}
+
+# actions_write_class <http_code> <x-ratelimit-remaining> <retry-after>
+#
+# What a cancel or re-run response MEANS, from the code and two headers.
+#
+# A 403 is NOT always "this App lacks Actions: write". GitHub answers 403 for a
+# primary rate limit (x-ratelimit-remaining: 0) and for a secondary one (a
+# retry-after header), and reading either as a permission refusal would record
+# the run as `refused`, so it would never be re-run, over a limit that clears in
+# minutes. So a 403 is a refusal only when the limit is provably NOT the cause:
+# remaining is a number above zero AND there is no retry-after. A missing header
+# is unknown, and unknown is transient.
+#
+# Echoes `ok`, `refused`, `transient` or `failed`. Pure.
+actions_write_class() {
+  local code="${1:-}" rem="${2:-}" ra="${3:-}"
+  case "$code" in
+    201 | 202 | 204) echo ok; return 0 ;;
+    403)
+      case "$rem" in
+        "" | *[!0-9]*) echo transient; return 0 ;;
+      esac
+      if [ "$rem" -gt 0 ] && [ -z "$ra" ]; then echo refused; else echo transient; fi
+      return 0
+      ;;
+    429 | 5?? | 000 | "") echo transient ;;
+    *) echo failed ;;
+  esac
+}
+
+# actions_token_mint_class <http_code>
+#
+# The down-scoped Actions token (repositories: [this repo], permissions:
+# {actions: write}) is refused at MINT time with 422 when the installation does
+# not hold Actions: write, or does not cover the repository. That is the
+# permission refusal, arriving before any cancel is posted. Anything else that is
+# not 201 is transient: a JWT clock skew, a rate limit, an outage.
+actions_token_mint_class() {
+  case "${1:-}" in
+    201) echo ok ;;
+    422) echo refused ;;
+    *) echo transient ;;
+  esac
 }
 
 # rerun_run_decision <run_attempt> <created_epoch> <run_started_epoch> <now> <max_age>

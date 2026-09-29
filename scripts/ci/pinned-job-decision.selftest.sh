@@ -386,13 +386,13 @@ is "a 403 falls back to cancel plus WARNING" cancel-only: \
 is "a cancel that never completed is not retried into a re-run" cancel-only: \
   "$(pin_orphan_action gaveup)"
 is "cancel-then-rerun: re-run once the cancelled run has completed" rerun: \
-  "$(pin_rerun_decision cancelled 60 completed 900)"
+  "$(pin_rerun_decision cancelled 60 completed 900 1 1 cancelled push 0)"
 is "cancel-then-rerun: wait while the cancel is still landing" wait: \
-  "$(pin_rerun_decision cancelled 60 in_progress 900)"
+  "$(pin_rerun_decision cancelled 60 in_progress 900 1 1)"
 is "and at exactly max wait it still waits" wait: \
-  "$(pin_rerun_decision cancelled 900 queued 900)"
+  "$(pin_rerun_decision cancelled 900 queued 900 1 1)"
 is "give up when the cancel never completes" give-up: \
-  "$(pin_rerun_decision cancelled 901 queued 900)"
+  "$(pin_rerun_decision cancelled 901 queued 900 1 1)"
 is "an unreadable run status waits rather than re-running blind" wait: \
   "$(pin_rerun_decision cancelled 60 "" 900)"
 is "the cap again: a ledger saying rerun is never re-run a second time" skip: \
@@ -404,9 +404,85 @@ is "no ledger, no re-run" skip: \
 is "an unreadable cancel stamp waits, it does not error" wait: \
   "$(pin_rerun_decision cancelled x queued 900)"
 
+# 5. Security review F1: the re-run is keyed on the ATTEMPT the controller
+#    cancelled, and on a `cancelled` conclusion. Anything else was somebody
+#    else's doing, and is closed silently.
+is "F1: a person re-ran it since (attempt moved on): done, silently" done: \
+  "$(pin_rerun_decision cancelled 60 completed 900 1 2 success push 0)"
+is "F1: and a moved attempt still running is done too, not waited on" done: \
+  "$(pin_rerun_decision cancelled 60 in_progress 900 1 2 "" push 0)"
+is "F1: the same attempt that finished on its own is not replayed" done: \
+  "$(pin_rerun_decision cancelled 60 completed 900 1 1 failure push 0)"
+is "F1: no recorded attempt, no proof, no re-run" done: \
+  "$(pin_rerun_decision cancelled 60 completed 900 "" 1 cancelled push 0)"
+is "F1: an unreadable current attempt, no proof, no re-run" done: \
+  "$(pin_rerun_decision cancelled 60 completed 900 1 "" cancelled push 0)"
+
+# F4: unstick CI, never replay old code.
+is "F4: a newer run of the same workflow on the branch: superseded, not re-run" superseded: \
+  "$(pin_rerun_decision cancelled 60 completed 900 1 1 cancelled push 1)"
+is "F4: the newer-run check could not be answered: wait, never assume no" wait: \
+  "$(pin_rerun_decision cancelled 60 completed 900 1 1 cancelled push "")"
+is "F4: and that wait is still bounded" give-up: \
+  "$(pin_rerun_decision cancelled 901 completed 900 1 1 cancelled push "")"
+for _ev in push pull_request merge_group; do
+  is "F4: event $_ev is on the allowlist" rerun: \
+    "$(pin_rerun_decision cancelled 60 completed 900 1 1 cancelled "$_ev" 0)"
+done
+for _ev in workflow_dispatch schedule deployment release workflow_run repository_dispatch "" pull_request_target; do
+  is "F4: event [${_ev}] is never re-run automatically" declined: \
+    "$(pin_rerun_decision cancelled 60 completed 900 1 1 cancelled "$_ev" 0)"
+done
+is "the later states are cancel-only too: done" cancel-only: "$(pin_orphan_action done)"
+is "the later states are cancel-only too: superseded" cancel-only: "$(pin_orphan_action superseded)"
+is "the later states are cancel-only too: declined" cancel-only: "$(pin_orphan_action declined)"
+
+# F2: a 403 is a permission refusal only when it is provably not a rate limit.
+is "F2: 403 with requests left and no retry-after is a refusal" refused \
+  "$(actions_write_class 403 4999 "")"
+is "F2: 403 with the primary limit exhausted is transient" transient \
+  "$(actions_write_class 403 0 "")"
+is "F2: 403 with retry-after (secondary limit) is transient" transient \
+  "$(actions_write_class 403 4999 60)"
+is "F2: 403 with no rate-limit header is transient (unknown)" transient \
+  "$(actions_write_class 403 "" "")"
+is "F2: 429 is transient" transient "$(actions_write_class 429 4999 "")"
+is "F2: a 5xx is transient" transient "$(actions_write_class 502 4999 "")"
+is "F2: no response at all is transient" transient "$(actions_write_class 000 "" "")"
+is "F2: 202 (cancel accepted) is ok" ok "$(actions_write_class 202 4999 "")"
+is "F2: 201 (re-run accepted) is ok" ok "$(actions_write_class 201 4999 "")"
+is "F2: 404 is a failure, not a refusal" failed "$(actions_write_class 404 4999 "")"
+# F3: the down-scoped token is refused at MINT when the permission is missing.
+is "F3: a 422 at mint is the missing permission" refused "$(actions_token_mint_class 422)"
+is "F3: a 201 at mint is a token" ok "$(actions_token_mint_class 201)"
+is "F3: anything else at mint is transient" transient "$(actions_token_mint_class 403)"
+
 # --- #490, the caller -----------------------------------------------------------
 # shellcheck disable=SC2016  # the controller source is the literal under test
-src_has "the controller re-runs in FULL, never rerun-failed-jobs" 'actions/runs/$pr_id/rerun"'
+src_has "the controller re-runs in FULL, never rerun-failed-jobs" 'gh_actions_post "$pr_id" rerun'
+# F3: writes go through the down-scoped token, reads keep the installation one.
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "F3: the Actions token is scoped to this repository and actions:write alone" \
+  '{repositories: [$r], permissions: {actions: "write"}}'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "F3: the cancel and re-run POST carry the scoped token" 'Authorization: Bearer $GH_ACT_TOKEN'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "F3: the cancel goes through gh_actions_post" 'gh_actions_post "$run" cancel'
+_unscoped_writes=$(grep -cE 'actions/runs/\$(run|pr_id)/(cancel|rerun)' "$CONTROLLER" || true)
+if [ "$_unscoped_writes" = 0 ]; then
+  printf 'ok   %s\n' "F3: no cancel or re-run URL is built outside gh_actions_post"
+else
+  printf 'FAIL %s\n' "F3: $_unscoped_writes cancel/re-run call(s) bypass the scoped token"; fail=1
+fi
+# F2: the headers that tell a rate limit from a refusal are captured.
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "F2: the write captures its response headers" '-D "$hdr"'
+src_has "F2: and reads x-ratelimit-remaining" '"x-ratelimit-remaining"'
+src_has "F2: and retry-after" '"retry-after"'
+# F1: the cancelled attempt is recorded.
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "F1: the ledger records the cancelled attempt" 'pin_ledger_write "$run" cancelled "$attempt"'
+src_has "F4: a superseded run is a WARNING of its own kind" 'WARNING pinned-run-superseded'
 if grep -F 'rerun-failed-jobs"' "$CONTROLLER" >/dev/null; then
   printf 'FAIL %s\n' "the controller calls rerun-failed-jobs, which keeps the dead pin"; fail=1
 else
@@ -505,7 +581,7 @@ mutant "a 403 no longer falls back" \
 # shellcheck disable=SC2016
 mutant "the re-run no longer waits for a completed run" \
   's/if \[ "\$status" = completed \]; then/if true; then/' \
-  pin_rerun_decision cancelled 60 in_progress 900 wait:
+  pin_rerun_decision cancelled 60 in_progress 900 1 1 cancelled push 0 wait:
 mutant "the re-run cap in the pending step removed" \
   's/    rerun) echo "skip:already re-run once/    rerun) echo "rerun:already re-run once/' \
   pin_rerun_decision rerun 60 completed 900 skip:
@@ -513,6 +589,35 @@ mutant "the re-run cap in the pending step removed" \
 mutant "the give-up bound removed" \
   's/if \[ "\$since" -gt "\$max" \]; then/if false; then/' \
   pin_rerun_decision cancelled 901 queued 900 give-up:
+
+# shellcheck disable=SC2016
+mutant "F1: the attempt check removed (a human's re-run overridden)" \
+  's/if \[ "\$cur" != "\$rec" \]; then/if false; then/' \
+  pin_rerun_decision cancelled 60 completed 900 1 2 cancelled push 0 done:
+# shellcheck disable=SC2016
+mutant "F1: any conclusion re-run, not only cancelled" \
+  's/\[ "\$concl" = cancelled \] || {/true || {/' \
+  pin_rerun_decision cancelled 60 completed 900 1 1 failure push 0 done:
+mutant "F4: the allowlist widened to workflow_dispatch" \
+  's/    push | pull_request | merge_group) return 0 ;;/    push | pull_request | merge_group | workflow_dispatch) return 0 ;;/' \
+  pin_rerun_decision cancelled 60 completed 900 1 1 cancelled workflow_dispatch 0 declined:
+mutant "F4: a superseded run re-run anyway" \
+  's/      1) echo "superseded:/      1) echo "rerun:/' \
+  pin_rerun_decision cancelled 60 completed 900 1 1 cancelled push 1 superseded:
+mutant "F4: an unanswered newer-run check read as none" \
+  's/    # Unknown: fall through to the clock/    echo "rerun:assumed"; return 0\n    # Unknown: fall through to the clock/' \
+  pin_rerun_decision cancelled 60 completed 900 1 1 cancelled push "" wait:
+# shellcheck disable=SC2016
+mutant "F2: every 403 read as a refusal again" \
+  's/if \[ "\$rem" -gt 0 \] \&\& \[ -z "\$ra" \]; then echo refused/if true; then echo refused/' \
+  actions_write_class 403 0 "" transient
+# shellcheck disable=SC2016
+mutant "F2: retry-after ignored" \
+  's/\[ "\$rem" -gt 0 \] \&\& \[ -z "\$ra" \]/[ "$rem" -gt 0 ]/' \
+  actions_write_class 403 4999 60 transient
+mutant "F3: a mint 422 read as transient (the missing permission never surfaced)" \
+  's/    422) echo refused ;;/    422) echo transient ;;/' \
+  actions_token_mint_class 422 refused
 
 [ "$fail" = 0 ] && printf '\npinned-job-decision: all cases pass\n'
 exit "$fail"
