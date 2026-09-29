@@ -971,8 +971,94 @@ if [ -f "\$PIN_DIR/host" ]; then
       ;;
   esac
 fi
+
+# THE SOCKET MUST BE THE DAEMON'S, or nothing is pruned through it and the slot
+# is not called clean (#1392).
+#
+# The slot owns /run/<slot> (0700), so a job can \`mv docker.sock x.sock\`. The
+# daemon goes on listening on the renamed inode, and this reset used to read
+# "no socket" as "no daemon": it skipped the container and volume prune and
+# still wrote the marker, so the next job -- another pull request's, possibly --
+# connected to x.sock and found the last job's database. A job can equally put
+# a listener of its OWN at the name, and the prune then asks that listener, not
+# the daemon, what is left to remove.
+#
+# So two facts are read from the kernel, never from a name the slot controls:
+#
+#   bound     a process in ci-dockerd@<idx>'s cgroup holds a unix socket that
+#             its own network namespace lists under \$sock. The kernel keeps the
+#             name a socket was BOUND under through any rename, so this is true
+#             for a renamed socket and false for a daemon still starting.
+#   answers   a connection to the NAME \$sock reaches a listener (SO_PEERCRED)
+#             that is a process in that same cgroup. The slot cannot put a
+#             process into a root-owned unit's cgroup.
+#
+# A daemon that has bound its socket and does not answer at \$sock -- the file
+# gone, renamed, replaced or a symlink -- is a slot whose containers this reset
+# cannot reach, and that is fail-closed: rc=1, no marker, and the ordinary
+# unclean path from there (the next job is refused, the burn is counted, the
+# sweep keeps retrying and condemns a slot that stays this way). MainPID 0, no
+# daemon at all, is today's case and keeps today's handling: nothing is running
+# that could hold a container.
+daemon_procs() { # every pid in the daemon unit's cgroup tree, one per line
+  local cg
+  cg=\$(systemctl show -p ControlGroup --value "ci-dockerd@\$idx.service" 2>/dev/null) || return 0
+  [ -n "\$cg" ] && [ -d "/sys/fs/cgroup\$cg" ] || return 0
+  find "/sys/fs/cgroup\$cg" -name cgroup.procs -exec cat {} + 2>/dev/null
+}
+sock_bound_by() { # <pid> -- it holds a socket its netns lists under \$sock
+  local l inos=""
+  for l in /proc/"\$1"/fd/*; do
+    l=\$(readlink "\$l" 2>/dev/null) || continue
+    case "\$l" in socket:*) inos="\$inos \$(printf '%s' "\$l" | tr -dc 0-9)" ;; esac
+  done
+  [ -n "\$inos" ] || return 1
+  awk -v s="\$sock" -v inos="\$inos" '
+    BEGIN { n = split(inos, a, " "); for (i = 1; i <= n; i++) held[a[i]] = 1 }
+    NR > 1 && \$8 == s && (\$7 in held) { found = 1 }
+    END { exit !found }' "/proc/\$1/net/unix" 2>/dev/null
+}
+sock_peer() { # the pid listening behind the NAME \$sock, as the kernel reports it
+  timeout 10 python3 -c 'import socket, struct, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+s.connect(sys.argv[1])
+print(struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[0])' "\$sock" 2>/dev/null
+}
+daemon_sock() { # prints: absent | starting | ours | foreign
+  local dpid procs p peer bound=0 tick=0
+  dpid=\$(systemctl show -p MainPID --value "ci-dockerd@\$idx.service" 2>/dev/null) || dpid=""
+  case "\$dpid" in '' | 0 | *[!0-9]*) echo absent; return 0 ;; esac
+  while :; do
+    procs=\$(daemon_procs)
+    for p in \$procs; do sock_bound_by "\$p" && { bound=1; break; }; done
+    # Boot only: the agent's ExecStartPre fires as soon as the daemon has
+    # forked, before it has bound anything. Bounded, like the /tmp wait below.
+    if [ "\$bound" = 1 ] || [ "\$stage" != boot ] || [ "\$tick" -ge 120 ]; then
+      break
+    fi
+    sleep 0.5
+    tick=\$((tick + 1))
+  done
+  if [ "\$bound" = 0 ]; then
+    # Not bound yet, so nothing at the name can be the daemon's.
+    if [ -e "\$sock" ] || [ -L "\$sock" ]; then echo foreign; else echo starting; fi
+    return 0
+  fi
+  if [ ! -S "\$sock" ] || [ -L "\$sock" ]; then echo foreign; return 0; fi
+  peer=\$(sock_peer) || peer=""
+  case "\$peer" in '' | 0 | *[!0-9]*) echo foreign; return 0 ;; esac
+  for p in \$procs; do [ "\$p" = "\$peer" ] && { echo ours; return 0; }; done
+  echo foreign
+}
+
+dsock=""
 if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
-  if [ -S "\$sock" ]; then
+  dsock=\$(daemon_sock)
+  if [ "\$dsock" = foreign ]; then
+    say "slot \$idx: its daemon is running but \$sock is not the socket it listens on -- a job moved or replaced it, so no container was reclaimed and the slot is not clean"
+    rc=1
+  elif [ -S "\$sock" ]; then
     # THE CONTAINERS, and they go BEFORE the tags -- a running container holds a
     # reference to its image and the untag below would fail on it.
     #
@@ -1513,7 +1599,9 @@ fi
 # it does not name. A tag that will not go IS a failure: that slot is poisoned,
 # and the marker is exactly the claim it must not get.
 if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
-  if [ -S "\$sock" ]; then
+  # Never through a socket the daemon does not answer on (#1392): rc is already
+  # 1 for that above, and asking a job's listener what to untag proves nothing.
+  if [ "\$dsock" != foreign ] && [ -S "\$sock" ]; then
 
     ids=\$(timeout 30 sudo -u "\$u" DOCKER_HOST="unix://\$sock" \
             docker image ls --all --quiet --no-trunc 2>/dev/null | sort -u)
@@ -4633,7 +4721,9 @@ DNS_PROBE_NAME="oauth2.googleapis.com"
 # The units that join a slot namespace bind /etc/netns/<ns>/resolv.conf over
 # /etc/resolv.conf (see start_slot_dockerd), and for the agent that is enough.
 # It is not enough for the daemon. `ci-dockerd@` execs dockerd-rootless.sh,
-# which runs under `rootlesskit --copy-up=/etc`: that replaces /etc with a
+# which runs under `rootlesskit --copy-up=/etc --copy-up=/run` (both, in
+# upstream's script; the /run one is there so the daemon can create
+# /run/docker). The /etc one is what matters here: it replaces /etc with a
 # tmpfs copy inside its own mount namespace, and on Ubuntu /etc/resolv.conf is
 # a SYMLINK to ../run/systemd/resolve/stub-resolv.conf. The copy-up reproduces
 # the symlink, the symlink re-resolves to the stub, and the daemon is back on
@@ -5121,8 +5211,8 @@ EOF
       fi
       # …and that the daemon can RESOLVE, asked from inside its own mount
       # namespace rather than from the unit's. Those are different namespaces:
-      # dockerd-rootless.sh runs under `rootlesskit --copy-up=/etc`, which
-      # gives the daemon a private /etc that the drop-in's BindReadOnlyPaths
+      # dockerd-rootless.sh runs under `rootlesskit --copy-up=/etc
+      # --copy-up=/run`, and the /etc one gives the daemon a private /etc that the drop-in's BindReadOnlyPaths
       # never reaches. Every probe above this line passes on a daemon pinned to
       # 127.0.0.53 — the two in slot_runtime_usable ask the unit's view, and
       # the namespace read just above asks about networking, not naming. This
