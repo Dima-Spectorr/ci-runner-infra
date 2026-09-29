@@ -524,6 +524,29 @@ lane_clock_earliest() {
 }
 
 # ---------------------------------------------------------------------------
+# lane_walk_estimate — what the read after a wait should be budgeted to cost.
+#
+#   lane_walk_estimate <measured> <last_walk> <floor>
+#
+# The largest of the three whole numbers, and any one that is not a whole
+# number is ignored. `measured` is how long the pass that just ended took. It is
+# NOT enough alone: a pass halted by the base-health gate returns before it
+# walks anything, so it measures a second or two, and the read after the wait
+# will walk the whole open list. `last_walk` is the duration of the last pass in
+# this run that did walk the list ("" when none has), and `floor` is the
+# smallest estimate ever allowed. Prints the floor when nothing else is
+# readable.
+# ---------------------------------------------------------------------------
+lane_walk_estimate() {
+  local best=0 v
+  for v in "${1:-}" "${2:-}" "${3:-}"; do
+    [[ "$v" =~ ^[0-9]+$ ]] || continue
+    [ "$v" -le "$best" ] || best="$v"
+  done
+  echo "$best"
+}
+
+# ---------------------------------------------------------------------------
 # lane_clock_wait — should the run wait out a short clock and read again,
 # rather than end and leave the pull request for the next event?
 #
@@ -535,8 +558,9 @@ lane_clock_earliest() {
 # now          epoch now
 # started      epoch the run started, which is where the pass budget counts from
 # pass_budget  `pass-budget-seconds`. 0 means the budget is off.
-# last_pass    seconds the pass that just ended took, which is the estimate of
-#              what the read after the wait will cost
+# last_pass    the seconds the read after the wait is budgeted to cost, from
+#              `lane_walk_estimate`. It is never just the pass that ended,
+#              because a halted pass walks nothing.
 # cap          the longest wait the run will take in-pass
 # waits_done   how many waits this run has already taken
 # max_waits    how many it may take in all
@@ -566,7 +590,8 @@ lane_clock_earliest() {
 # waiting, so declining costs one pull request its wait for the backstop. A wait
 # that outlives the job costs the whole run: a job killed by `timeout-minutes`
 # reports `cancelled`, with no summary and no queue. That is why the wait, PLUS
-# one more pass of the size just measured, has to fit inside the pass budget. It
+# one more full walk as `lane_walk_estimate` sizes it, has to fit inside the
+# pass budget. It
 # is also why a budget of 0, which bounds nothing, means no waiting.
 #
 # Prints one line:

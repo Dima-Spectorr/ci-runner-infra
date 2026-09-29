@@ -439,6 +439,34 @@ earliest 300 "first clock of the pass" "" 300
 earliest 300 "a garbled candidate is ignored" 300 soon
 earliest "" "nothing held" "" ""
 
+# lane_walk_estimate: the read after a wait is budgeted as a full walk.
+walk() {
+  local want="$1" desc="$2" got
+  shift 2
+  got=$(lane_walk_estimate "$@")
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  args: %s\n  want: %s\n  got:  %s\n' "$desc" "$*" "$want" "$got"
+  fi
+}
+# A base-health halt returns before the walk: two seconds measured, a
+# 200-second walk earlier in the run. Budgeting two would let the wait crowd
+# out the read it waits for.
+walk 200 "a halted pass is budgeted as the last full walk, not its own two seconds" 2 200 30
+walk 30 "with no walk yet, the floor" 2 "" 30
+walk 95 "a pass that walked longer than the last one counts in full" 95 40 30
+walk 30 "the floor holds when every walk was quick" 5 10 30
+walk 30 "garbled values are ignored, never read as zero cost" x y 30
+walk 30 "a garbled value after a good one does not replace it" 30 x ""
+walk 0 "nothing readable and no floor is zero, not an invented cost" "" "" ""
+# Wired into the wait: the same halted pass, budgeted as a full walk, no
+# longer fits a wait that a two-second estimate would have allowed.
+clock "nowait:over-budget seconds=40 spent=400 walk=200 budget=600" \
+  "the walk estimate, not the halted pass, decides whether the wait fits" \
+  $((T + 39)) "$T" $((T - 400)) 600 "$(lane_walk_estimate 2 200 30)" 180 0 3
+
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane-decision: $FAIL failed, $PASS passed"
   exit 1

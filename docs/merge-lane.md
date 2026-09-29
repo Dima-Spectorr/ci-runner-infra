@@ -621,13 +621,18 @@ passes a day on five repositories that opened no pull request at all.
 itself (#1402).** The `*/15` timer did a second job nobody had written down: it
 was the only thing that woke the lane when a clock-based hold ran out. Once it
 was gone, a green, clean pull request held by the 60-second review grace, whose
-reviewer never answered, waited for the daily backstop (`mot-claude#991`,
+reviewer never answered, waited for the daily backstop (a consumer repository,
 2026-09-29: `wait:review ... age=21 grace=60`, then 27 minutes until a manual
 dispatch). Now, when a pass acts on nothing and its earliest clock hold clears
 within **180 seconds**, the run sleeps until it clears and reads the world
-again. It does this only when the pass budget holds the wait **plus** another
-read of the size just measured, at most three times a run, and never in a dry
-run. The run keeps the `merge-lane` group throughout, so passes stay one at a
+again. It does this only when the pass budget holds the wait **plus** one more
+full walk of the open list. That walk is budgeted as the longest of: the pass
+that just ended, the last pass in the run that walked the list, and a
+30-second floor. A pass the base-health gate halts walks nothing, so its own
+few seconds would under-budget the read. It waits at most three times a run,
+never in a dry run, and never after a blind pass (one that could not read the
+base or the open list, `LANE_FATAL`), which has nothing to re-read and fails
+the run. The run keeps the `merge-lane` group throughout, so passes stay one at a
 time. The read after the wait is a full, live read: a review that landed during
 the wait counts, and so does a base that moved. The decision is
 `lane_clock_wait` in `merge-lane-decision.sh`.

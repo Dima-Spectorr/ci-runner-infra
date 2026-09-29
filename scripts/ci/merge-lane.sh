@@ -293,6 +293,12 @@ CLOCK_WAIT_MAX=3
 # The epoch at which the earliest clock-held pull request of the CURRENT pass
 # clears, from `lane_clock_earliest`. Reset at the top of every pass.
 LANE_CLOCK_CLEARS_AT=''
+# How long the last pass that WALKED the open list took, and the least any read
+# after a wait is budgeted to cost. A pass the base-health gate halts walks
+# nothing, so its own duration says nothing about the read after the wait. See
+# `lane_walk_estimate`.
+LANE_LAST_WALK_SECONDS=''
+CLOCK_WALK_FLOOR=30
 
 # HOW LONG A LATER, UNFINISHED SUITE OF THE SAME APP MAY HOLD A REQUIRED CHECK
 # THAT IS OTHERWISE GREEN.
@@ -1628,7 +1634,8 @@ one_pass() {
   # And it says WHY, for the reason the base comparison says why: on a schedule,
   # a missing App permission and a transient 5xx print the same line every
   # fifteen minutes forever, and nothing distinguishes them.
-  local prs_raw='' list_err
+  local prs_raw='' list_err walk_began
+  walk_began="$(date -u +%s)"
   list_err="$(mktemp)"
   if ! prs_raw="$(gh api --paginate "repos/$R/pulls?state=open&base=$LANE_BASE&per_page=100" \
     --jq '.[] | (.number|tostring), .head.sha, (.draft|tostring), ((.labels // []) | map(.name) | join(",")), ((.title // "") | gsub("[\r\n]"; " ")), (.user.login // "")' 2>"$list_err")"; then
@@ -1933,10 +1940,17 @@ one_pass() {
         review:hold*)
           verdict="wait:review ${review_verdict#review:hold }"
           # The grace clears at the review clock's origin plus the grace, and
-          # no event fires when it does (#1402). `review_age` was measured
-          # against this same `now`, so the sum is that origin exactly. A hold
-          # is only ever returned for a numeric age and grace.
-          LANE_CLOCK_CLEARS_AT="$(lane_clock_earliest "$LANE_CLOCK_CLEARS_AT" "$((now + REVIEW_GRACE - review_age))")"
+          # no event fires when it does (#1402). `review_age` is measured
+          # against the pass's `now`. When it is positive, `now - review_age`
+          # IS that origin. When it is 0, the age may have been CLAMPED: a
+          # required check that finished after `now` was taken makes a
+          # negative age, and `now + grace` would then wake the run before
+          # the grace cleared. So a zero age reads a fresh clock instead,
+          # which can only be late, never early. A hold is only ever returned
+          # for a numeric age and grace.
+          local review_origin="$((now - review_age))"
+          if [ "$review_age" -eq 0 ]; then review_origin="$(date -u +%s)"; fi
+          LANE_CLOCK_CLEARS_AT="$(lane_clock_earliest "$LANE_CLOCK_CLEARS_AT" "$((review_origin + REVIEW_GRACE))")"
           ;;
         review:unreviewed*)
           # RECORDED HERE, ANNOUNCED WHERE THE MERGE HAPPENS.
@@ -2010,6 +2024,9 @@ one_pass() {
       queue_row 8 "${pr_fields[jdx]}" "${pr_fields[jdx + 4]}" wait:not-read-this-pass '' '' ''
     done
   fi
+
+  # What a full walk costs here, for budgeting a read after a clock wait.
+  LANE_LAST_WALK_SECONDS=$(($(date -u +%s) - walk_began))
 
   if [ "${#candidates[@]}" -eq 0 ]; then
     echo "lane: nothing actionable this pass"
@@ -2559,8 +2576,10 @@ while [ "$acted" -lt "$MAX_ACTIONS" ]; do
     # base-health grace) ends here with nothing actionable. No event fires when
     # that clock clears, so ending the run leaves the pull request for the daily
     # backstop. When the clock is short and the pass budget holds the wait AND
-    # another read, sleep it out and read the world again. The next pass reads
-    # everything live, so a review that landed during the sleep counts.
+    # one more full walk, sleep it out and read the world again. The walk is
+    # budgeted by `lane_walk_estimate`, never by this pass alone: a pass the
+    # base-health gate halted walked nothing. The next pass reads everything
+    # live, so a review that landed during the sleep counts.
     #
     # Never on a blind pass (`LANE_FATAL`), which has nothing to re-read, and
     # never in a dry run, which acts on nothing and would sleep to report a
@@ -2568,8 +2587,9 @@ while [ "$acted" -lt "$MAX_ACTIONS" ]; do
     pass_ended="$(date -u +%s)"
     clock_verdict="nowait:not-applicable"
     if [ "$LANE_FATAL" -eq 0 ] && [ "$DRY_RUN" != "true" ]; then
-      clock_verdict="$(lane_clock_wait "$LANE_CLOCK_CLEARS_AT" "$pass_ended" "$LANE_STARTED" \
-        "$PASS_BUDGET" "$((pass_ended - pass_began))" "$CLOCK_WAIT_CAP" "$clock_waits" "$CLOCK_WAIT_MAX")"
+      clock_verdict="$(lane_clock_wait "$LANE_CLOCK_CLEARS_AT" "$pass_ended" "$LANE_STARTED" "$PASS_BUDGET" \
+        "$(lane_walk_estimate "$((pass_ended - pass_began))" "$LANE_LAST_WALK_SECONDS" "$CLOCK_WALK_FLOOR")" \
+        "$CLOCK_WAIT_CAP" "$clock_waits" "$CLOCK_WAIT_MAX")"
     fi
     case "$clock_verdict" in
       wait:clock*)

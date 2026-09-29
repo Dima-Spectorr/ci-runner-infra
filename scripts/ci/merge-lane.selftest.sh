@@ -3059,8 +3059,13 @@ Waiting on code owner review from some-owner. (HTTP 405)'
 # lane sleeps and reads for nothing.
 # ---------------------------------------------------------------------------
 review_hold_records_its_clock() {
-  matches "$(code_of "$1" | sed -n '/^        review:hold\*)$/,/^          ;;$/p')" \
-    '^          LANE_CLOCK_CLEARS_AT="\$\(lane_clock_earliest "\$LANE_CLOCK_CLEARS_AT" "\$\(\(now \+ REVIEW_GRACE - review_age\)\)"\)"$'
+  local arm
+  arm="$(code_of "$1" | sed -n '/^        review:hold\*)$/,/^          ;;$/p')"
+  matches "$arm" '^          LANE_CLOCK_CLEARS_AT="\$\(lane_clock_earliest "\$LANE_CLOCK_CLEARS_AT" "\$\(\(review_origin \+ REVIEW_GRACE\)\)"\)"$' || return 1
+  matches "$arm" '^          local review_origin="\$\(\(now - review_age\)\)"$' || return 1
+  # A zero age may be a clamped negative one, so it reads a fresh clock: a
+  # wake that is late costs a second, one that is early costs a whole read.
+  matches "$arm" '^          if \[ "\$review_age" -eq 0 \]; then review_origin="\$\(date -u \+%s\)"; fi$'
 }
 base_health_hold_records_its_clock() {
   matches "$(code_of "$1" | sed -n '/^lane_base_is_vouched() {$/,/^}$/p')" \
@@ -3072,12 +3077,34 @@ every_pass_starts_with_no_clock() {
 asks_the_clock_decision_within_the_budget() {
   local code
   code="$(code_of "$1")"
-  matches "$code" '^      clock_verdict="\$\(lane_clock_wait "\$LANE_CLOCK_CLEARS_AT" "\$pass_ended" "\$LANE_STARTED" \\$' || return 1
-  matches "$code" '^        "\$PASS_BUDGET" "\$\(\(pass_ended - pass_began\)\)" "\$CLOCK_WAIT_CAP" "\$clock_waits" "\$CLOCK_WAIT_MAX"\)"$' || return 1
-  matches "$code" '^CLOCK_WAIT_CAP=[0-9]+$'
+  matches "$code" '^      clock_verdict="\$\(lane_clock_wait "\$LANE_CLOCK_CLEARS_AT" "\$pass_ended" "\$LANE_STARTED" "\$PASS_BUDGET" \\$' || return 1
+  matches "$code" '^        "\$\(lane_walk_estimate "\$\(\(pass_ended - pass_began\)\)" "\$LANE_LAST_WALK_SECONDS" "\$CLOCK_WALK_FLOOR"\)" \\$' || return 1
+  matches "$code" '^        "\$CLOCK_WAIT_CAP" "\$clock_waits" "\$CLOCK_WAIT_MAX"\)"$' || return 1
+  matches "$code" '^CLOCK_WAIT_CAP=[0-9]+$' || return 1
+  matches "$code" '^CLOCK_WALK_FLOOR=[1-9][0-9]*$'
 }
+# The walk estimate needs a walk to remember: the duration of the last pass
+# that read the open list, taken inside `one_pass` after the walk loop.
+remembers_the_last_walk() {
+  local body
+  body="$(code_of "$1" | sed -n '/^one_pass() {$/,/^}$/p')"
+  matches "$body" '^  walk_began="\$\(date -u \+%s\)"$' || return 1
+  matches "$body" '^  LANE_LAST_WALK_SECONDS=\$\(\(\$\(date -u \+%s\) - walk_began\)\)$'
+}
+# The guard, the decision call and the `fi` as ONE adjacent block. The `if`
+# line existing proves nothing: a `fi; if true; then` slipped in under it would
+# ask the decision on a blind pass or in a dry run with the guard still there.
 never_waits_blind_or_dry() {
-  matches "$(code_of "$1")" '^    if \[ "\$LANE_FATAL" -eq 0 \] && \[ "\$DRY_RUN" != "true" \]; then$'
+  local run
+  run="$(code_of "$1" | grep -A4 -E '^    if \[ "\$LANE_FATAL" -eq 0 \] && \[ "\$DRY_RUN" != "true" \]; then$' | tr '\n' '|')"
+  matches "$run" '^    if \[ "\$LANE_FATAL" -eq 0 \] && \[ "\$DRY_RUN" != "true" \]; then\|      clock_verdict="\$\(lane_clock_wait [^|]*\|        "\$\(lane_walk_estimate [^|]*\|        "\$CLOCK_WAIT_CAP" [^|]*\|    fi\|$'
+}
+# The count is what bounds the waits. Without the increment `CLOCK_WAIT_MAX` is
+# never reached, and only the pass budget stops a run that keeps waking early.
+counts_its_waits() {
+  local arm
+  arm="$(code_of "$1" | sed -n '/^      wait:clock\*)$/,/^        ;;$/p')"
+  matches "$arm" '^        clock_waits=\$\(\(clock_waits \+ 1\)\)$'
 }
 rereads_now_after_the_wait() {
   # The three lines have to be ADJACENT code lines, in this order: sleep,
@@ -3102,9 +3129,21 @@ check asks_the_clock_decision_within_the_budget "$DRIVER" "the run loop does not
 check never_waits_blind_or_dry "$DRIVER" "the run may wait out a clock on a blind pass or in a dry run"
 check rereads_now_after_the_wait "$DRIVER" "the run does not re-read now after waiting out a clock"
 check cap_fits_the_default_budget "$DRIVER" "CLOCK_WAIT_CAP does not fit inside the default pass budget"
+check remembers_the_last_walk "$DRIVER" "one_pass does not record how long its walk took"
+check counts_its_waits "$DRIVER" "the run does not count its clock waits, so CLOCK_WAIT_MAX never binds"
 
 mutate "the review hold stops recording its clock" "$DRIVER" \
-  '/REVIEW_GRACE - review_age))")"$/d' review_hold_records_its_clock
+  '/(review_origin + REVIEW_GRACE))")"$/d' review_hold_records_its_clock
+mutate "a clamped review age is trusted as the origin" "$DRIVER" \
+  '/^          if \[ "\$review_age" -eq 0 \]; then review_origin=/d' review_hold_records_its_clock
+mutate "the wait count is never incremented" "$DRIVER" \
+  '/^        clock_waits=\$((clock_waits + 1))$/d' counts_its_waits
+mutate "a fi; if true bypass under the guard" "$DRIVER" \
+  's@^\(    if \[ "\$LANE_FATAL" -eq 0 \] && \[ "\$DRY_RUN" != "true" \]; then\)$@\1\n    fi; if true; then@' never_waits_blind_or_dry
+mutate "the walk is budgeted as the halted pass alone" "$DRIVER" \
+  's@"\$(lane_walk_estimate "\$((pass_ended - pass_began))" "\$LANE_LAST_WALK_SECONDS" "\$CLOCK_WALK_FLOOR")"@"$((pass_ended - pass_began))"@' asks_the_clock_decision_within_the_budget
+mutate "the walk duration is never recorded" "$DRIVER" \
+  '/^  LANE_LAST_WALK_SECONDS=\$((/d' remembers_the_last_walk
 mutate "the base-health hold stops recording its clock" "$DRIVER" \
   '/BASE_HEALTH_GRACE - age))")"$/d' base_health_hold_records_its_clock
 mutate "the per-pass reset is removed" "$DRIVER" \
