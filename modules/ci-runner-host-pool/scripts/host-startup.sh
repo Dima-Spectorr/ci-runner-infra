@@ -1048,13 +1048,196 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
   quiesce_slot || rc=1
 fi
 
-# THE HOME, wholesale. -mindepth 1 so the home itself keeps its inode, its
-# ownership and its mode: the shell dotfiles, the caches a tool decided to put
-# there and anything a job planted are all just entries inside it.
-find "\$home" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || { say "slot \$idx: could not empty \$home"; rc=1; }
+# EMPTY THE CURRENT DIRECTORY, minus what <spare-fn> claims. Used from inside a
+# subshell that has already cd'd to the target, so every removal is relative to
+# a directory handle taken ONCE -- nothing is re-resolved through a path a job
+# or a recycled pid could change between two rm calls.
+#
+# ONE FILESYSTEM. A depth-1 entry on another device is a mount point: rm would
+# empty the filesystem mounted there and then fail on EBUSY, every reset, so it
+# is left in place and named. --one-file-system keeps rm from crossing into a
+# mount deeper down for the same reason. A symlink is never a mount point here
+# and rm removes the link, never its target.
+spare_nothing() { return 1; }
+empty_here() { # <label> <spare-fn>
+  local here e dev bad=0
+  here=\$(stat -c '%d' .) || return 1
+  for e in .[!.]* ..?* *; do
+    [ -e "\$e" ] || [ -L "\$e" ] || continue
+    "\$2" "\$e" && continue
+    if [ ! -L "\$e" ]; then
+      dev=\$(stat -c '%d' -- "\$e" 2>/dev/null) || dev=""
+      if [ "\$dev" != "\$here" ]; then
+        say "slot \$idx: \$1/\$(safe "\$e") is on another filesystem -- left in place"
+        continue
+      fi
+    fi
+    rm -rf --one-file-system -- "./\$e" || bad=1
+  done
+  return "\$bad"
+}
+
+# THE HOME, wholesale. Its entries, not the directory, so the home itself keeps
+# its inode, its ownership and its mode: the shell dotfiles, the caches a tool
+# decided to put there and anything a job planted are all just entries inside it.
+( cd -- "\$home" && empty_here "\$home" spare_nothing ) || { say "slot \$idx: could not empty \$home"; rc=1; }
 cp -a "\$SLOT_TEMPLATE/." "\$home/" || { say "slot \$idx: could not restore \$home from \$SLOT_TEMPLATE"; rc=1; }
 chown -R "\$u:\$u" "\$home" || { say "slot \$idx: could not chown \$home"; rc=1; }
 chmod 0750 "\$home" || { say "slot \$idx: could not chmod \$home"; rc=1; }
+
+# THE SLOT'S PRIVATE /tmp, emptied the way the home is (#1383).
+#
+# PrivateTmp on the daemon and the agent (#25) keeps one slot's /tmp away from
+# its SIBLINGS. It does nothing about the slot's own next job: the namespace
+# lives as long as the daemon does, which is many jobs, so whatever a job left
+# at a fixed path is still there for the one after it. gitleaks-action downloads
+# to /tmp/gitleaks.tmp, and a second gitleaks job on the same slot died with
+# "Destination file path ... already exists" -- a security gate failing over a
+# file the diff never touched. A GitHub-hosted runner starts every job on an
+# empty /tmp; this is what gives a slot the same.
+#
+# THE PATH IS NEVER THE LITERAL /tmp. Three callers run this script and only
+# one of them is inside the slot's namespace: the job hooks, which sudo from the
+# agent. The boot reset is ExecStartPre=+, which systemd runs WITHOUT the unit's
+# sandboxing, and the idle and pin sweeps are root timers -- for all three, /tmp
+# is the HOST's, and emptying it would take every other slot's daemon state and
+# every root service's scratch with it. So the directory is reached through the
+# namespace's owner, the slot's daemon: /proc/<its pid>/root/tmp resolves in its
+# mount namespace whatever namespace this script is standing in.
+#
+# And it is still checked against the host's before anything goes. A daemon
+# that somehow lost PrivateTmp would resolve to the host /tmp by that route too;
+# that is a real fault, but it is the isolation #25 owns, and this script
+# answering it by emptying the host /tmp would be the worse of the two. Refused
+# with a line in the log, and NOT a refused marker: a mistaken refusal here must
+# cost a leftover file, never every slot on the host.
+#
+# WHAT SURVIVES is what the two processes that outlive jobs keep there, and
+# only in a shape a job cannot use to carry data across the boundary:
+#
+#   rootlesskit-*          rootlesskit's --copy-up=/etc makes its bind directory
+#                          here (os.MkdirTemp("/tmp", "rootlesskit-b")) and the
+#                          daemon's /etc symlinks point into it for its whole
+#                          life. Removing it mid copy-up fails the daemon, and
+#                          BindsTo then takes the agent down for good (Restart=no).
+#   dotnet-diagnostic-<pid>-*, clr-debug-pipe-<pid>-*
+#                          the .NET runtime's socket and debug fifos -- spared
+#                          only while <pid> is a live process of this slot, and
+#                          only as a socket / a fifo, which hold no data.
+#   .dotnet/shm, .dotnet/lockfiles
+#                          its named-mutex state. Anything else in .dotnet goes.
+#
+# At BOOT the agent's ExecStartPre fires as soon as the Type=simple daemon has
+# forked, which is while the copy-up is still running. So boot waits for the
+# daemon's socket first -- a bounded wait -- and leaves /tmp alone if it never
+# appears: the slot's first job boundary empties it instead.
+#
+# 'all' at completed and boot, when the quiesce above has stopped every writer
+# the last job had. At 'started', and on a slot a live run holds -- where the
+# run's own processes are deliberately spared and may still be using /tmp --
+# only the fixed download paths in \$tmp_fixed go, and never a directory.
+tmp_fixed="gitleaks.tmp"
+tmp_pid_alive() { # <pid> -- a live process of this slot's uid
+  case "\$1" in '' | *[!0-9]*) return 1 ;; esac
+  [ -d "/proc/\$1" ] && [ "\$(stat -c '%u' "/proc/\$1" 2>/dev/null)" = "\$uid" ]
+}
+tmp_spare() { # <name>
+  local p
+  case "\$1" in
+    rootlesskit-*) [ -d "\$1" ] && [ ! -L "\$1" ] ;;
+    .dotnet) [ -d "\$1" ] && [ ! -L "\$1" ] ;;
+    dotnet-diagnostic-*)
+      p=\${1#dotnet-diagnostic-}
+      [ -S "\$1" ] && tmp_pid_alive "\${p%%-*}" ;;
+    clr-debug-pipe-*)
+      p=\${1#clr-debug-pipe-}
+      [ -p "\$1" ] && tmp_pid_alive "\${p%%-*}" ;;
+    *) return 1 ;;
+  esac
+}
+dotnet_spare() { # <name> -- inside .dotnet
+  case "\$1" in shm | lockfiles) [ -d "\$1" ] && [ ! -L "\$1" ] ;; *) return 1 ;; esac
+}
+reset_slot_tmp() { # <all|fixed>
+  # uid is local here and still visible to tmp_pid_alive: bash scopes locals
+  # dynamically, so every function this one calls reads it.
+  local dpid uid owner d name tick bad=0
+  dpid=\$(systemctl show -p MainPID --value "ci-dockerd@\$idx.service" 2>/dev/null) || dpid=""
+  case "\$dpid" in
+    '' | 0 | *[!0-9]*)
+      # No daemon, no namespace: the next one systemd starts comes with an empty
+      # /tmp of its own, so there is nothing of the last job's to find.
+      say "slot \$idx: its daemon is not running -- no private /tmp to empty"
+      return 0
+      ;;
+  esac
+  uid=\$(id -u "\$u" 2>/dev/null) ||
+    { say "slot \$idx: could not resolve the uid of \$u -- its private /tmp was not emptied"; return 1; }
+  # The pid systemd named, still the slot's own process when it is read. A daemon
+  # that exited in between has taken its namespace with it.
+  owner=\$(stat -c '%u' "/proc/\$dpid" 2>/dev/null) || owner=""
+  if [ "\$owner" != "\$uid" ]; then
+    say "slot \$idx: pid \$dpid is no longer \$u's daemon -- leaving its /tmp alone"
+    return 0
+  fi
+  # Boot only: not while the daemon is still copying /etc up (see above).
+  if [ "\$1" = all ] && [ "\$stage" = boot ]; then
+    tick=0
+    while [ ! -S "\$sock" ] && [ "\$tick" -lt 120 ]; do
+      sleep 0.5
+      tick=\$((tick + 1))
+    done
+    if [ ! -S "\$sock" ]; then
+      say "slot \$idx: its daemon has no socket yet -- leaving /tmp to the first job boundary"
+      return 0
+    fi
+  fi
+  for d in tmp var/tmp; do
+    # INTO the directory once, and everything after is relative to that handle.
+    # A pid that exits and is reused mid-wipe cannot redirect a later rm to
+    # another process's root, because no later rm goes through /proc at all.
+    # The checks are then made on '.' itself, AFTER the cd, so what is verified
+    # is exactly what gets emptied.
+    (
+      cd "/proc/\$dpid/root/\$d" 2>/dev/null || exit 0
+      mine=\$(stat -c '%d:%i' . 2>/dev/null) || mine=""
+      now=\$(stat -L -c '%d:%i' "/proc/\$dpid/root/\$d" 2>/dev/null) || now=""
+      host=\$(stat -L -c '%d:%i' "/proc/1/root/\$d" 2>/dev/null) || host=""
+      owner=\$(stat -c '%u' "/proc/\$dpid" 2>/dev/null) || owner=""
+      if [ "\$owner" != "\$uid" ] || [ -z "\$mine" ] || [ "\$mine" != "\$now" ]; then
+        say "slot \$idx: its daemon changed under the reset -- leaving its /\$d alone"
+        exit 0
+      fi
+      if [ -z "\$host" ] || [ "\$mine" = "\$host" ]; then
+        say "slot \$idx: its daemon's /\$d is not a private one -- refusing to empty what may be the host's"
+        exit 0
+      fi
+      if [ "\$1" = all ]; then
+        rc_d=0
+        empty_here "/\$d" tmp_spare || rc_d=1
+        if [ -d .dotnet ] && [ ! -L .dotnet ]; then
+          ( cd .dotnet && empty_here "/\$d/.dotnet" dotnet_spare ) || rc_d=1
+        fi
+        [ "\$rc_d" = 0 ] || { say "slot \$idx: could not empty its private /\$d"; exit 1; }
+      else
+        for name in \$tmp_fixed; do
+          # A file or a link at the name, never a directory: rm -f on a symlink
+          # removes the link and never what it points at, and a directory there
+          # is not a download leftover.
+          if [ -f "./\$name" ] || [ -L "./\$name" ]; then
+            rm -f -- "./\$name" || { say "slot \$idx: could not remove /\$d/\$name"; exit 1; }
+          fi
+        done
+      fi
+    ) || bad=1
+  done
+  return "\$bad"
+}
+if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
+  reset_slot_tmp all || rc=1
+else
+  reset_slot_tmp fixed || rc=1
+fi
 
 # THE TOOL CACHE IS NOT SWEPT, AND THAT IS THE POINT — but it is REPORTED.
 #
