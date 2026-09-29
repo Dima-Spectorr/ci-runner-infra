@@ -994,7 +994,7 @@ naming the pool it stopped paging for. Take it out as soon as the fix lands. The
 log-based egress policy is unaffected — it keys on `gce_instance` and carries no
 pool label, so there is nothing to exclude on.
 
-Two of the fourteen watch the
+Two of the sixteen watch the
 cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it
 below the pool's `cache_snapshot_max_age_hours`, or the first notice anyone gets
 is every host starting cold) and *hydrate failing on a configured pool*, which
@@ -1019,6 +1019,32 @@ host reports exactly the idle seconds of one the drain loop forgot. *Tick
 approaching the watchdog* sits at four fifths of the watchdog window rather than
 half of it — half is the middle of the healthy range, not a precursor to
 anything.
+
+That mute on *not scaling to zero* is also its blind spot: a pin-hold veto that
+never lifts keeps `ci_pin_holds_honoured` non-zero, so the policy stands down
+for exactly the pool it should catch. Three pools sat full and idle that way for
+weeks (#1384). Two policies close it (#1388):
+
+* *Pool cannot reach zero* — `ci_pin_holds_honoured / ci_hosts_running >= 1`
+  AND `ci_demand < 1`, matched on the pool's resource, both for 7200 s. The
+  ratio is a `denominatorFilter` on an ordinary threshold condition, not MQL
+  or PromQL, so `policy_unchanged` compares it like every other policy. It is
+  `>=` because a TERMINATED host can be held without counting as running. 7200 s
+  is the controller's `PIN_HOLD_MAX`: no hold outlives it unless a run renews
+  it, and a renewing run is demand.
+* *Hosts kept on an unverifiable guest-attribute read* — the part of a pool
+  that the ratio cannot see, and beacon keeps, which never count as holds at all.
+  The log-based metric `ci_unverified_host_keeps` counts the controller's
+  WARNING `beacon-read-failed` and `pin-hold-veto` events. Each is sent once per
+  host every 10 minutes while the failure lasts, so the policy sums over 1200 s
+  and pages after 7200 s. Like *egress refused* it keys on the controller's
+  `gce_instance` and `--muted-pool` cannot reach it.
+
+The host's own slot-reset lines (`is not the socket it listens on`, a slot
+*condemned*) are **not** alertable: they go to the host's syslog through
+`logger`, and nothing ships a host's syslog to Cloud Logging. Only the
+startup-script runner, the guest agent and the controller's events reach it.
+`ci_slots_missing` is the series that does catch a condemned slot.
 
 Together those three were most of the mail this fleet produced. Measured over the
 week to 2026-08-29 across the three projects that have these policies, they

@@ -1229,6 +1229,15 @@ has_pin_hold() { # <file>
   matches "$code" 'systemctl is-active --quiet "ci-runner@\\\$slot\.service"; then' || return 1
   matches "$code" 'systemctl stop "ci-runner@\\\$slot\.service"' || return 1
 
+  # A LIVE HOLD IS REPUBLISHED UNTIL THE ATTRIBUTE CONFIRMS IT (#1393). The PUT
+  # that took the hold is best effort, and on a host with no ci/ namespace a
+  # lost PUT reads to the controller as a free host (#1384). The sweep reads
+  # the attribute back and writes whenever it is not the record on disk, and a
+  # write it could not make is said rather than swallowed.
+  matches "$code" 'have=\\\$\(published\) \|\| have=""' || return 1
+  matches "$code" '\[ "\\\$have" = "\\\$want" \] \|\| publish "\\\$want"' || return 1
+  matches "$code" '>/dev/null 2>&1 \|\| \{ say "could not publish .\\\$1. to guest attributes"; return 1; \}' || return 1
+
   # …and at expiry it tears the run's stack down, resets, and only THEN clears
   # the record and starts the agent. FAIL CLOSED: a teardown that did not finish
   # leaves the agent DOWN and the hold in place for the next sweep, because a
@@ -2113,6 +2122,9 @@ mutate "a one-slot host allowed to reserve" 's@refusing --reserve-slot: this hos
 mutate "the hold forgets which boot"        's@boot=%s@host=%s@'                                              has_pin_hold
 mutate "a hold honoured across a reboot"    's@releasing it as orphaned@keeping it@'                                 has_pin_hold
 mutate "a plain pin takes its slot away"    's@\[ "\\\$reserve" = 1 \] && \[ -f@[ -f@'                                     has_pin_hold
+mutate "a lost hold PUT never republished"  's@\[ "\\\$have" = "\\\$want" \] || publish "\\\$want"@:@'                    has_pin_hold
+mutate "the republish trusts no read-back"  's@have=\\\$(published) || have=""@have=""@'                                  has_pin_hold
+mutate "a refused sweep PUT swallowed"      's@>/dev/null 2>&1 || { say "could not publish@>/dev/null 2>\&1 || true || { say "could not publish@' has_pin_hold
 
 # the reset's lock — root became a second caller the day the sweep arrived
 mutate "resets no longer serialised"        's@exec 9>>"\\\$SLOT_STATE/\\\$idx/\.reset\.lock"@exec 9>/dev/null #@'          has_slot_reset
