@@ -836,6 +836,35 @@ collect_demand() {
   local runs_ip
   runs_ip=$(gh_api "repos/$REPO_FULL/actions/runs?status=in_progress&per_page=50" 2>/dev/null)
 
+  # RE-RUNS, WHICH THE WINDOW ABOVE CANNOT SEE (#490). `created` matches the
+  # run's created_at, and a re-run keeps it: a `gh run rerun` of a run pushed
+  # more than DEMAND_MAX_AGE ago is queued NOW, with fresh jobs, and the list
+  # above never returns it. Its unpinned jobs were never demand, and a job it
+  # re-queued pinned to a host long since deleted (what `--failed` does) was
+  # never reaped. So one more page of queued runs, UNFILTERED, is read for the
+  # attempts rerun_run_decision says are live. Only the id list grows: a corpse
+  # on this page costs a jq row, never a job fetch, which is the property the
+  # window exists to protect. Its own spelling (`per_page` first) so the budget
+  # self-test's literal keeps meaning the windowed call.
+  local runs_rr rr_ids="" rr_id rr_attempt rr_created rr_started
+  runs_rr=$(gh_api "repos/$REPO_FULL/actions/runs?per_page=100&status=queued" 2>/dev/null)
+  while IFS=$'\t' read -r rr_id rr_attempt rr_created rr_started; do
+    case "$rr_id" in "" | *[!0-9]*) continue ;; esac
+    case "$(rerun_run_decision "$rr_attempt" "$rr_created" "$rr_started" "$sweep_start" "$DEMAND_MAX_AGE")" in
+      fetch:*) rr_ids="${rr_ids}${rr_id}
+" ;;
+    esac
+  done <<<"$(printf '%s' "$runs_rr" | jq -r '
+    .workflow_runs[]?
+    | select((.run_attempt // 1) > 1)
+    # `-`, never "", for an unparseable stamp: tab is IFS whitespace, so an
+    # empty field COLLAPSES under `read` and hands run_started_at to the
+    # created column. rerun_run_decision reads `-` as unreadable, as it should.
+    | [ (.id | tostring), (.run_attempt | tostring),
+        ((.created_at // "") | fromdateiso8601? // "-" | tostring),
+        ((.run_started_at // "") | fromdateiso8601? // "-" | tostring) ]
+    | @tsv' 2>/dev/null)"
+
   # QUEUED RUNS FIRST, and no `sort -u` across the two lists: the order decides
   # what survives the budget below, and queued jobs are the ones the pool has to
   # scale out FOR. `awk '!seen[$0]++'` keeps that order while still visiting a
@@ -849,8 +878,13 @@ collect_demand() {
   # logged rather than treated as harmless: the honest statement is that demand
   # is a lower bound, full stop.
   local ids
-  ids=$(printf '%s\n%s' "$runs" "$runs_ip" \
-    | jq -r '.workflow_runs[]?.id' 2>/dev/null | awk 'NF && !seen[$0]++')
+  # Re-runs sit between the two: they are queued work, so they rank with the
+  # queued list, but after it, because the window holds the newer pushes.
+  ids=$( {
+    printf '%s' "$runs" | jq -r '.workflow_runs[]?.id' 2>/dev/null
+    printf '%s' "$rr_ids"
+    printf '%s' "$runs_ip" | jq -r '.workflow_runs[]?.id' 2>/dev/null
+  } | awk 'NF && !seen[$0]++')
   [ -n "$ids" ] || return 0
 
   local now
@@ -1837,9 +1871,18 @@ collect_hosts() {
   # delete-instances returns once the MIG accepts it, so for the next tick or
   # two the host still lists as STOPPING -- which drain rule 1 reads as a dead
   # host to reap. See mig_action_in_flight().
-  HOSTS=$(gcloud compute instance-groups managed list-instances "$MIG" \
+  #
+  # HOSTS_LISTED records whether the call SUCCEEDED, which an empty $HOSTS alone
+  # cannot say: a failed listing and a pool at zero both come back empty, and
+  # only the second may be read as "no pinned host exists" (pin_sight_decision,
+  # #490). Reset first, so a tick whose listing fails never inherits the last
+  # tick's success.
+  HOSTS_LISTED=0
+  if HOSTS=$(gcloud compute instance-groups managed list-instances "$MIG" \
     --region="$REGION" --project="$PROJECT" \
-    --format="csv[no-heading](name,instanceStatus,version.instanceTemplate.basename(),instance.uri(),currentAction)" 2>/dev/null)
+    --format="csv[no-heading](name,instanceStatus,version.instanceTemplate.basename(),instance.uri(),currentAction)" 2>/dev/null); then
+    HOSTS_LISTED=1
+  fi
 }
 
 # One describe per tick for both facts we need from the MIG: the target size we
@@ -1847,6 +1890,7 @@ collect_hosts() {
 # THIS pool can create. Kept together so the reaper never costs an extra call.
 MIG_BASE=""
 MIG_TARGET=0
+HOSTS_LISTED=0
 MIG_TEMPLATE=""
 
 collect_mig() {
@@ -1923,8 +1967,14 @@ classify_pinned() {
   # cancellations is wrong. Same fail-safe the drain path and the reaper take:
   # a tick that cannot see is a tick that does not act. Pinned work is still
   # counted, so the metric does not collapse to zero at the same moment.
-  local blind=0
-  [ -n "$live" ] || blind=1
+  #
+  # ...UNLESS THE MIG ITSELF SAYS ZERO (#490). The pool at zero is where a job
+  # pinned to a deleted host ends up, since pinned work never scales a pool
+  # out, so reading every empty list as blind made that wedge permanent. The
+  # rule, and the three facts it needs to agree, is pin_sight_decision.
+  local blind=0 sight
+  sight=$(pin_sight_decision "${HOSTS_LISTED:-0}" "$live" "$MIG_BASE" "$MIG_TARGET")
+  case "$sight" in blind:*) blind=1 ;; esac
 
   # PINNED_JOBS holds one record per JOB; cancellation is per RUN. A matrix of
   # eight pinned jobs is one wedged run, and posting eight cancels to it would
@@ -2004,7 +2054,7 @@ classify_pinned() {
         esac
         if [ "$blind" = 1 ]; then
           DEMAND_PINNED=$((DEMAND_PINNED + 1))
-          log "pinned run $run: $verdict — NOT cancelled, this tick has no host list (fail-safe)"
+          log "pinned run $run: $verdict — NOT cancelled, this tick cannot see its hosts (${sight#blind:}; fail-safe)"
           continue
         fi
         case "$gone" in *" $run "*) continue ;; esac
@@ -2035,14 +2085,19 @@ classify_pinned() {
             # counting it as handled is what stops the log repeating per tick.
             gone="$gone$run "
             PIN_ORPHANED=$((PIN_ORPHANED + 1))
-            log "pinned run $run: $verdict — cancelled (HTTP $code)"
+            pin_run_warning "$run" cancelled "$pin_host" \
+              "pinned run $run: $verdict — cancelled (HTTP $code). Re-run it in full ('gh run rerun $run', never --failed): a --failed re-run keeps the dead host's pin and queues forever"
             ;;
           *)
-            # Most likely the app lacks Actions: write. Say so once per tick
-            # rather than retrying: the job still cannot run, and a wedge nobody
-            # can see is exactly what this function exists to prevent.
+            # Most likely the app lacks Actions: write, which the documented
+            # App does not hold (docs/github-app-permissions.md). Say so rather
+            # than retrying: the job still cannot run, and a wedge nobody can
+            # see is exactly what this function exists to prevent. An EVENT,
+            # not only a log line, because the on-call has no shell here and
+            # the one thing that clears this is a person acting on the run.
             DEMAND_PINNED=$((DEMAND_PINNED + 1))
-            log "pinned run $run: $verdict — cancel REFUSED (HTTP $code); the run will wait for GitHub's own timeout"
+            pin_run_warning "$run" "refused-$code" "$pin_host" \
+              "pinned run $run: $verdict — cancel REFUSED (HTTP $code; the App needs Actions: write to cancel). Cancel it and re-run it in full ('gh run rerun $run', never --failed); until then it waits for GitHub's 24h timeout"
             ;;
         esac
         ;;
@@ -2051,7 +2106,26 @@ classify_pinned() {
 $PINNED_JOBS
 PINNED_EOF
 
+  # One throttle file per run that was ever warned about; a day is past
+  # GitHub's own 24-hour timeout, so no run older than that can still be queued.
+  find "$STATE_DIR" -maxdepth 1 -name 'pinwarn-*' -mmin +1440 -delete 2>/dev/null || true
   return 0
+}
+
+# pin_run_warning <run_id> <outcome> <pin_host> <message>
+#
+# The operator-facing half of the pinned sweep (#490). A run pinned to a host
+# that no longer exists is cleared by exactly one move: cancel it and re-run it
+# IN FULL, so its anchor re-pins to a live host. `gh run rerun --failed` keeps
+# the old `host-*` label and re-creates the wedge. The controller only cancels:
+# re-dispatching needs Actions: write, which the App is documented not to hold.
+# So this is a WARNING event (Cloud Logging, via event()) naming the run and
+# the move, throttled per run so a refused cancel repeats every EVENT_HEARTBEAT
+# rather than every tick. The run id is numeric by the caller's own check.
+pin_run_warning() {
+  local run_id="$1" outcome="$2" host="$3" msg="$4"
+  throttled_event "$STATE_DIR/pinwarn-$run_id" "$outcome" WARNING pinned-run-unservable \
+    "$host" "$msg" run="$run_id" outcome="$outcome"
 }
 
 reap_orphan_registrations() {

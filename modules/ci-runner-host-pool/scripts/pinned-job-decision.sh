@@ -387,3 +387,104 @@ pinned_job_decision() {
     echo "vanished:$pin_host went away under a running job (${clock}s)"
   fi
 }
+
+# pin_sight_decision <list_ok> <live_hosts_csv> <mig_base> <mig_target>
+#
+# Whether THIS tick may treat "the pinned host is not in the list" as evidence.
+#
+#   list_ok        : 1 when the instance listing call exited 0, anything else
+#                    when it failed or the caller cannot say.
+#   live_hosts_csv : the instance names that listing returned.
+#   mig_base       : the MIG's baseInstanceName, empty when the describe failed.
+#   mig_target     : the MIG's targetSize from the same describe.
+#
+# Echoes `sighted:<reason>` or `blind:<reason>`. Always exits 0.
+#
+# WHY THIS IS A RULE OF ITS OWN (#490). The pinned sweep used to call any tick
+# with an empty host list blind: "the list call failed" and "the pool is at
+# zero" look the same from the list alone, and acting on the first cancels
+# every pinned run in the repository. The fail-safe was right about the failure
+# and wrong about the other half. A pool at zero is EXACTLY where a job pinned
+# to a deleted host lands, because a pinned job is not scale-out demand and so
+# nothing ever brings a host back. Measured on a consumer repository 2026-09-29:
+# pool at 0, 0 runners online, a re-queued job pinned to a host drained hours
+# earlier, and the sweep blind on every tick by construction.
+#
+# So an empty list counts as sight only when three independent facts agree: the
+# listing SUCCEEDED, the MIG describe SUCCEEDED (it is what fills mig_base), and
+# the MIG itself says its target is zero. Any disagreement (a target above zero
+# with nothing listed is a MIG mid-create, or a listing that lied) stays blind,
+# which is the old behaviour and the safe one. A host that is booting is LISTED
+# (the MIG reports it with an empty status while CREATING), so it never reaches
+# this rule at all.
+pin_sight_decision() {
+  local ok="${1:-}" live="${2:-}" base="${3:-}" target="${4:-}"
+
+  # A non-empty list is sight however it was obtained, unchanged from before.
+  [ -n "$live" ] && { echo "sighted:hosts listed"; return 0; }
+
+  [ "$ok" = 1 ] || { echo "blind:the host listing failed"; return 0; }
+  [ -n "$base" ] || { echo "blind:the MIG describe failed"; return 0; }
+  case "$target" in
+    0) echo "sighted:pool at zero (listing and describe both succeeded, target 0)" ;;
+    "" | *[!0-9]*) echo "blind:unreadable MIG target size [$target]" ;;
+    *) echo "blind:MIG target $target but no host listed" ;;
+  esac
+}
+
+# rerun_run_decision <run_attempt> <created_epoch> <run_started_epoch> <now> <max_age>
+#
+# Whether a queued run the windowed run list could NOT have returned must be
+# fetched anyway, because it is a RE-RUN.
+#
+# GitHub's `created` filter on `GET /actions/runs` matches the run's
+# `created_at`, and a re-run KEEPS it: `gh run rerun` (full or `--failed`)
+# bumps `run_attempt` and `run_started_at` and creates fresh job objects, but
+# the run is still the one created at the original push. Measured 2026-09-29 on
+# a consumer repository: created_at 06:32, run_started_at 12:44, run_attempt 3.
+# The controller's queued-run list is filtered to DEMAND_MAX_AGE of creation, so
+# a re-run of anything older than that was invisible to the whole sweep: never
+# counted as demand, and never reaped when pinned to a host that no longer
+# exists. That is #490, reached through the obvious operator move after a flake.
+#
+# Echoes `fetch:<reason>` or `skip:<reason>`. Always exits 0.
+#
+#   * A first attempt is never fetched here: inside the window the filtered
+#     list already has it, and outside it the run is exactly the corpse the
+#     filter exists to keep off the page.
+#   * A re-run CREATED inside the window is already listed; skipping it keeps
+#     its job list from being fetched twice.
+#   * Otherwise the latest attempt's own start decides, against the same
+#     window. An attempt that started before it is a corpse like any other.
+#   * An unreadable start is fetched: one job call too many costs a second of
+#     budget, while a dropped re-run is a wedge nobody can see.
+#   * An unreadable attempt or clock is skipped: without them the rule cannot
+#     tell a re-run from a corpse, and a repository can hold dozens of corpses.
+rerun_run_decision() {
+  local attempt="${1:-}" created="${2:-}" started="${3:-}" now="${4:-}" max_age="${5:-}"
+
+  case "$now" in "" | *[!0-9]*) echo "skip:unreadable clock"; return 0 ;; esac
+  case "$max_age" in "" | *[!0-9]*) echo "skip:unreadable window"; return 0 ;; esac
+  case "$attempt" in "" | *[!0-9]*) echo "skip:unreadable run_attempt [$attempt]"; return 0 ;; esac
+  [ "$attempt" -gt 1 ] || { echo "skip:first attempt, the created filter owns it"; return 0; }
+
+  local since=$((now - max_age))
+  case "$created" in
+    "" | *[!0-9]*) ;;
+    *)
+      if [ "$created" -ge "$since" ]; then
+        echo "skip:created inside the window, already listed"
+        return 0
+      fi
+      ;;
+  esac
+
+  case "$started" in
+    "" | *[!0-9]*) echo "fetch:attempt $attempt with an unreadable start (fail-safe)"; return 0 ;;
+  esac
+  if [ "$started" -ge "$since" ]; then
+    echo "fetch:attempt $attempt started $((now - started))s ago on a run created before the window"
+  else
+    echo "skip:attempt $attempt started before the window too"
+  fi
+}

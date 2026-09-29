@@ -295,5 +295,153 @@ pin_is "an upper-case pin is folded, not refused" \
 expect ignore: "a label carrying pattern syntax is still refused by rule 1b" \
   queued "self-hosted,linux,host-ci-lin-*" "$POOL" "$BASE" "$LIVE" 99999 300
 
+# --- #490: a re-run pinned to a host that no longer exists --------------------
+#
+# Live 2026-09-29 on a consumer repository: `gh run rerun --failed` on a run from
+# that morning re-queued its jobs with the ORIGINAL `host-*` pin, naming a host
+# drained and deleted hours earlier. The pool was at zero, nothing served the
+# label, the base stayed red, and the merge lane held every PR in the repo. Two
+# separate things kept the sweep from ever reaping it, and each has a rule here.
+
+is() { # <desc> <expected-prefix> <got>
+  case "$3" in
+    "$2"*) printf 'ok   %s\n' "$1" ;;
+    *) printf 'FAIL %s\n       want %s...\n       got  %s\n' "$1" "$2" "$3"; fail=1 ;;
+  esac
+}
+
+# 1. The sweep never SAW the run: the queued list is filtered on created_at, and
+#    a re-run keeps it. rerun_run_decision decides which attempts to fetch anyway.
+NOW=1000000; MAX=21600
+is "a re-run of a run created before the window, started inside it, is fetched" fetch: \
+  "$(rerun_run_decision 2 $((NOW - 30000)) $((NOW - 60)) $NOW $MAX)"
+is "the live shape: attempt 3, created 6h12m before its re-run started" fetch: \
+  "$(rerun_run_decision 3 $((NOW - 22320)) $((NOW - 60)) $NOW $MAX)"
+is "a first attempt outside the window is a corpse, never fetched" skip: \
+  "$(rerun_run_decision 1 $((NOW - 30000)) $((NOW - 30000)) $NOW $MAX)"
+is "a re-run whose own start is also outside the window is a corpse" skip: \
+  "$(rerun_run_decision 2 $((NOW - 90000)) $((NOW - 30000)) $NOW $MAX)"
+is "a re-run created inside the window is already listed, not fetched twice" skip: \
+  "$(rerun_run_decision 2 $((NOW - 60)) $((NOW - 30)) $NOW $MAX)"
+is "the window edge matches the server filter: created exactly at the cutoff is listed" skip: \
+  "$(rerun_run_decision 2 $((NOW - MAX)) $((NOW - 30)) $NOW $MAX)"
+is "a start exactly at the cutoff is still inside the window" fetch: \
+  "$(rerun_run_decision 2 $((NOW - 90000)) $((NOW - MAX)) $NOW $MAX)"
+is "an unreadable start on a re-run is fetched, not dropped (fail-safe)" fetch: \
+  "$(rerun_run_decision 2 $((NOW - 90000)) - $NOW $MAX)"
+is "an unreadable created on a re-run falls through to its start" fetch: \
+  "$(rerun_run_decision 2 - $((NOW - 60)) $NOW $MAX)"
+is "an unreadable attempt cannot tell a re-run from a corpse, so it is skipped" skip: \
+  "$(rerun_run_decision x $((NOW - 90000)) $((NOW - 60)) $NOW $MAX)"
+is "an unreadable clock acts on nothing" skip: \
+  "$(rerun_run_decision 2 $((NOW - 90000)) $((NOW - 60)) "" $MAX)"
+
+# ...and once seen, its re-queued job is judged on its OWN age: the jobs of a
+# re-run are fresh objects, so the grace window still protects a booting host.
+expect wait: "a re-run's fresh pinned job gets the grace window like any other" \
+  queued "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 60 300
+expect orphan: "and a re-run pinned to a host that is gone is reaped after it" \
+  queued "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 301 300
+
+# 2. The sweep was BLIND: a pool at zero lists nothing, and an empty list was
+#    always read as a failed listing. pin_sight_decision tells the two apart.
+is "a listed host is sight, as before" sighted: \
+  "$(pin_sight_decision 1 "$LIVE" "$BASE" 2)"
+is "a pool at zero with a good listing and a good describe is sight" sighted: \
+  "$(pin_sight_decision 1 "" "$BASE" 0)"
+is "a failed listing is blind, whatever the MIG says" blind: \
+  "$(pin_sight_decision 0 "" "$BASE" 0)"
+is "a failed describe is blind (MIG_TARGET defaults to 0 on failure)" blind: \
+  "$(pin_sight_decision 1 "" "" 0)"
+is "a MIG creating a host but listing none yet is blind, not empty" blind: \
+  "$(pin_sight_decision 1 "" "$BASE" 1)"
+is "an unreadable target is blind" blind: \
+  "$(pin_sight_decision 1 "" "$BASE" "")"
+expect orphan: "so a pool at zero reaps a job pinned to its deleted host after grace" \
+  queued "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "" 301 300 30000
+
+# 3. What must NOT be reaped, unchanged by any of the above.
+#    A host that exists but whose agents are offline is still LISTED by the MIG,
+#    so the job is pinned work (reported on ci_demand_pinned), never an orphan:
+#    the pin-hold and drain paths own that host, not this sweep.
+expect pinned: "a host present in the MIG with its agents offline is not reaped" \
+  queued "self-hosted,linux,host-ci-lin-a1b2" "$POOL" "$BASE" "$LIVE" 99999 300
+#    A booting host is listed while CREATING (empty status), so it is live too.
+expect pinned: "a host the MIG is still creating is live, not gone" \
+  queued "self-hosted,linux,host-ci-lin-boot" "$POOL" "$BASE" "$LIVE,ci-lin-boot" 99999 300
+expect wait: "a host not listed yet is waited on inside the grace window" \
+  queued "self-hosted,linux,host-ci-lin-boot" "$POOL" "$BASE" "$LIVE" 120 300
+
+# --- #490, the caller -----------------------------------------------------------
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "collect_hosts records whether the listing succeeded" 'HOSTS_LISTED=1'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "classify_pinned asks pin_sight_decision, with the listing's success" \
+  'sight=$(pin_sight_decision "${HOSTS_LISTED:-0}" "$live" "$MIG_BASE" "$MIG_TARGET")'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "the demand sweep reads an UNFILTERED queued page for re-runs" \
+  'actions/runs?per_page=100&status=queued"'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "and asks rerun_run_decision which of them to fetch" \
+  'rerun_run_decision "$rr_attempt" "$rr_created" "$rr_started" "$sweep_start" "$DEMAND_MAX_AGE"'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "the re-run ids join the fetch list" 'printf '"'"'%s'"'"' "$rr_ids"'
+src_has "a cancelled pinned run tells the operator to re-run it in full" 'never --failed'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "and so does a refused one, as an event rather than a log line" 'pin_run_warning "$run" "refused-$code"'
+
+# The re-run page must never carry the created filter: that filter is the bug.
+_rr_line=$(grep -F 'actions/runs?per_page=100&status=queued' "$CONTROLLER" || true)
+case "$_rr_line" in
+  *created=*) printf 'FAIL %s\n' "the re-run page is filtered on created_at -- it would miss every re-run of an old run"; fail=1 ;;
+  "") printf 'FAIL %s\n' "the re-run page is missing"; fail=1 ;;
+  *) printf 'ok   %s\n' "the re-run page is not filtered on created_at" ;;
+esac
+
+# --- mutants: each rule above must fail when the one line that makes it true is broken
+#
+# Each mutant rewrites the decision file, sources the copy in a subshell, and
+# asserts the case it targets now gives the WRONG answer. A mutant that still
+# passes means the case above is not actually testing that line.
+DECISION="$here/../../modules/ci-runner-host-pool/scripts/pinned-job-decision.sh"
+mutant() { # <desc> <sed-expr> <call...> -- <prefix the ORIGINAL gives>
+  local desc="$1" expr="$2"; shift 2
+  local want="${*: -1}" call=("${@:1:$#-1}") m got
+  m=$(mktemp)
+  sed -e "$expr" "$DECISION" >"$m"
+  if cmp -s "$m" "$DECISION"; then
+    printf 'FAIL mutant did not apply: %s\n' "$desc"; fail=1; rm -f "$m"; return
+  fi
+  got=$( . "$m"; "${call[@]}" )
+  rm -f "$m"
+  case "$got" in
+    "$want"*) printf 'FAIL mutant survived: %s (still %s)\n' "$desc" "$got"; fail=1 ;;
+    *) printf 'ok   mutant killed: %s\n' "$desc" ;;
+  esac
+}
+# shellcheck disable=SC2016  # sed expressions: every $ is text in the decision file
+mutant "an empty pool read as blind again (the #490 wedge)" \
+  's/    0) echo "sighted:pool at zero/    0) echo "blind:pool at zero/' \
+  pin_sight_decision 1 "" "$BASE" 0 sighted:
+# shellcheck disable=SC2016
+mutant "the listing's success ignored" \
+  's/\[ "\$ok" = 1 \] || {/true || {/' \
+  pin_sight_decision 0 "" "$BASE" 0 blind:
+mutant "a target above zero trusted as empty" \
+  's/    \*) echo "blind:MIG target/    *) echo "sighted:MIG target/' \
+  pin_sight_decision 1 "" "$BASE" 1 blind:
+# shellcheck disable=SC2016
+mutant "re-runs judged on created_at instead of their own start" \
+  's/if \[ "\$started" -ge "\$since" \]; then/if [ "$created" -ge "$since" ]; then/' \
+  rerun_run_decision 2 $((NOW - 30000)) $((NOW - 60)) $NOW $MAX fetch:
+# shellcheck disable=SC2016
+mutant "first attempts fetched too (every corpse costs a job call)" \
+  's/\[ "\$attempt" -gt 1 \]/[ "$attempt" -gt 0 ]/' \
+  rerun_run_decision 1 $((NOW - 30000)) $((NOW - 60)) $NOW $MAX skip:
+# shellcheck disable=SC2016
+mutant "a re-run created inside the window fetched twice" \
+  's/if \[ "\$created" -ge "\$since" \]; then/if false; then/' \
+  rerun_run_decision 2 $((NOW - 60)) $((NOW - 30)) $NOW $MAX skip:
+
 [ "$fail" = 0 ] && printf '\npinned-job-decision: all cases pass\n'
 exit "$fail"

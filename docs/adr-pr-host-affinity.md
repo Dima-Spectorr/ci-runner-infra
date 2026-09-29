@@ -311,6 +311,36 @@ the whole point; a re-run anchors somewhere alive.
 rule — a job that was already RUNNING when its host went away is covered by
 §2.6b, under stricter conditions.)*
 
+**Two doors the detector did not watch, both closed by #490.** Found 2026-09-29
+on a consumer repository, where `gh run rerun --failed` re-queued a run's jobs
+with the ORIGINAL `host-*` pin, naming a host drained and deleted hours before:
+
+1. *It never saw the run.* The queued-run list is filtered on `created_at`
+   (`DEMAND_MAX_AGE`, to keep corpses off the page), and a re-run keeps its
+   original `created_at`; only `run_attempt`, `run_started_at` and the job
+   objects are new. So the sweep also reads one unfiltered page of queued runs
+   and fetches the re-run attempts `rerun_run_decision` says are live (judged on
+   `run_started_at`).
+2. *It was blind whenever the pool was at zero.* An empty host list was always
+   read as a failed listing. But a pool at zero is exactly where such a job
+   lands, because pinned work never scales a pool out. `pin_sight_decision` now
+   reads an empty list as sight when the listing succeeded, the MIG describe
+   succeeded and the MIG's target size is zero; anything else stays blind.
+
+What the controller does then is **cancel, not re-run**. A full re-run
+(`POST /runs/{id}/rerun`) would re-pin, but it needs `Actions: write`, and the
+App is documented without it ([github-app-permissions.md](github-app-permissions.md)),
+which also means the cancel itself may be refused. Either way the controller
+sends a WARNING `pinned-run-unservable` event to Cloud Logging naming the run and
+the one move that clears it.
+
+**Runbook: re-run a pinned workflow in full, never with `--failed`.** `gh run
+rerun <id>` re-runs the anchor, which pins the run to a live host. `gh run rerun
+<id> --failed` keeps the old `host-*` label on every re-queued job, and if that
+host is gone the run queues until the controller cancels it, or until GitHub's
+24-hour timeout where the cancel is refused. If one is already stuck: `gh run
+cancel <id>`, then `gh run rerun <id>`.
+
 **A queued pinned job is not the only way a run depends on a host.** A supported
 workflow finishes every Linux consumer and then spends a long tail in the
 unpinned Windows job, still talking to the Linux stack across the band. If the

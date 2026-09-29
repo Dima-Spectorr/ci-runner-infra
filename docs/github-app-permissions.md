@@ -33,6 +33,16 @@ Two facts shape everything below:
 | **Checks** | Read | `GET /repos/{owner}/{repo}/commits/{ref}/check-runs` | the merge-queue **parking detector** can never report. Signalled: `ci_parked_sweep_denied` non-zero, log `parked sweep: DENIED`, `parkeddenied` alert after 30 min |
 | **Pull requests** | Read | `GET /repos/{owner}/{repo}/pulls?state=open` | same detector, one step earlier — log `parked sweep: cannot list open pull requests` |
 
+**`Actions: write` is not on this list either, and the controller still tries
+one call that needs it**: `POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel`,
+for a run whose job is pinned to a host that no longer exists (ADR
+[§2.6](adr-pr-host-affinity.md)). Without the permission the cancel is refused,
+and the controller sends a WARNING `pinned-run-unservable` event instead, naming
+the run and saying to cancel it and re-run it in full. It never re-runs a run
+itself. Granting the permission would let it cancel, but it would also let the
+identity that job code runs beside dispatch and re-run workflows. That is a
+decision for the App owner, not a default.
+
 **`Contents` is no longer on this list**, and if your App still has it, revoke it.
 It bought exactly one call — `GET /repos/{owner}/{repo}/contents/.mergify.yml`,
 so a merge-queue pool could derive its own ceiling from the repository's Mergify
