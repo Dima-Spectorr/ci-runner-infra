@@ -76,6 +76,50 @@ precisely so that `Contents: write` never lands on the identity that self-hosted
 job code runs beside. That argument is unchanged and is the reason this list
 must stay read-only.
 
+## Every token is down-scoped
+
+What the App holds is the CEILING; no token the fleet mints carries all of it.
+Every `POST /app/installations/{id}/access_tokens` sends a body naming the ONE
+repository the pool serves (`ci-github-repo`, the same value the pool's
+Terraform `github_repo` sets) and exactly the permissions its call path uses
+(#1419). `Metadata: read` is implicit on every token.
+
+| Token | Minted by | `repositories` | `permissions` | Calls made with it |
+|---|---|---|---|---|
+| host registration | `host-startup.sh` `gh_token`, at boot | `[<pool repo>]` | `administration: write` | `POST .../actions/runners/registration-token` — nothing else |
+| controller general | `controller-startup.sh` `gh_token` | `[<pool repo>]` | `actions: read`, `administration: write`, `checks: read`, `pull_requests: read` | runs, run jobs, runner list + `DELETE`, registration-token, `pulls`, `check-runs` |
+| controller general, narrowed | same, after a 422 on the set above | `[<pool repo>]` | `actions: read`, `administration: write` | the same, minus the parked sweep (which reports `DENIED`) |
+| controller actions write | #1413's `gh_actions_token` | `[<pool repo>]` | `actions: write` | `POST .../runs/{id}/cancel`, `.../rerun` |
+
+The Windows pool mints nothing on the host: the controller writes the
+registration token into the host's metadata (`ci-registration-token`).
+
+**Why the host token matters most.** A pool host runs untrusted job code. The
+installation token lives only in a local variable of root's boot script, is
+passed to curl through a process-substitution config (never argv, never a file
+a slot user could open), and dies with that script. No slot user ever sees it; the registration token it
+buys reaches each slot's `config.sh` through the environment, never argv. Scoping it caps the damage of a leak anyway: without
+a scope it would carry everything the App holds on every repository of the
+installation — including `Actions: write` once that is granted.
+
+**A refused scoped mint never widens.** GitHub refuses (HTTP 422) a mint that
+asks for a permission the installation does not grant, and returns no token.
+
+* The **host** logs `installation token mint (...) refused: HTTP 422` and the
+  boot fails: without `Administration: write` it could not register anyway.
+* The **controller** treats `checks: read` and `pull_requests: read` as the
+  optional grants they are (the table above): on a 422 it re-mints with the
+  core pair only, sends a WARNING `gh-token-scope-narrowed` event naming the two
+  permissions, and remembers that for an hour so a degraded installation costs
+  one mint per call. The parked sweep then reports `DENIED`, as it did before
+  scoping. A 422 on the core pair is an ERROR `gh-token-scope-refused` and a
+  blind tick. **No path sends an unscoped request.**
+
+Adding a call to either script means adding its permission to that mint's
+body and to this table; `scripts/ci/app-token-scope.selftest.sh` fails any mint
+that sends no `repositories` + `permissions` body or asks for `actions: write`
+outside `gh_actions_token`.
+
 ## Who grants it
 
 Two different people may be involved, and the split is what makes this take

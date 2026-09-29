@@ -638,10 +638,66 @@ gh_token() {
   sig=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(printf '%s' "$key") | _b64)
   jwt="$header.$payload.$sig"
 
-  local resp
-  resp=$(curl "${CURL_TIMEOUTS[@]}" -fsS -X POST -H "Authorization: Bearer $jwt" \
-    -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/app/installations/$INSTALL_ID/access_tokens") || return 1
+  # DOWN-SCOPED (#1419): this controller's ONE repository, and exactly the
+  # permissions its general call paths use — every gh_api / gh_api_fetch read,
+  # the runner list/delete and the registration token:
+  #   actions: read         runs, run jobs (demand, outcome attribution, pins)
+  #   administration: write runners list + DELETE, registration-token
+  #   checks: read          commits/{sha}/check-runs (parked sweep)
+  #   pull_requests: read   pulls?state=open (parked sweep)
+  # metadata: read is implicit. NEVER actions: write here: cancel and re-run get
+  # their own dedicated mint (#1413), so the token every read carries cannot
+  # cancel or dispatch anything.
+  #
+  # A mint asking for a permission the installation does not grant is refused
+  # with 422 and returns NO token. The parked sweep's two reads are optional
+  # grants (docs/github-app-permissions.md), and a controller blinded over one
+  # of them would stop scaling the whole pool — so on a 422 the mint NARROWS to
+  # the core pair and says so with a WARNING; the parked sweep then reports
+  # DENIED exactly as it did before the scope existed. It never WIDENS: a 422
+  # on the core pair is a refused mint and a blind tick, loudly, and no path
+  # here sends an unscoped request. The narrowing is remembered for an hour in
+  # a FILE (every caller runs gh_token inside `$(...)`), so a degraded
+  # installation costs one mint per call, not two; after that the full set is
+  # tried again, and a grant made in the meantime is picked up.
+  local scope="full" narrowed perms body resp code
+  narrowed=$(cat "$STATE_DIR/gh-token-narrowed" 2>/dev/null) || narrowed=""
+  case "$narrowed" in
+    "" | *[!0-9]*) ;;
+    *) [ "$now" -lt "$((narrowed + 3600))" ] && scope="core" ;;
+  esac
+  while :; do
+    case "$scope" in
+      full) perms='{"actions":"read","administration":"write","checks":"read","pull_requests":"read"}' ;;
+      *) perms='{"actions":"read","administration":"write"}' ;;
+    esac
+    body=$(jq -cn --arg r "$REPO" --argjson p "$perms" '{repositories: [$r], permissions: $p}') || return 1
+    # Body and status in one capture, never a file: the body IS the token.
+    resp=$(curl "${CURL_TIMEOUTS[@]}" -sS -X POST -w '\n%{http_code}' -H "Authorization: Bearer $jwt" \
+      -H "Accept: application/vnd.github+json" \
+      -d "$body" \
+      "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" 2>>"$LOG") || resp=$'\n000'
+    code=${resp##*$'\n'}
+    resp=${resp%$'\n'*}
+    [ "$code" = 201 ] && break
+    if [ "$code" = 422 ] && [ "$scope" = full ]; then
+      printf '%s' "$now" >"$STATE_DIR/gh-token-narrowed" 2>/dev/null || true
+      throttled_event "$STATE_DIR/gh-token-narrowed.event" narrowed WARNING gh-token-scope-narrowed "" \
+        "installation token: 422 on checks:read + pull_requests:read for $REPO_FULL ($(printf '%s' "$resp" | jq -r '.message // empty' 2>/dev/null)) -- minting actions:read + administration:write only; the parked sweep will report DENIED until the installation grants both" \
+        missing="checks:read,pull_requests:read" http="$code"
+      scope="core"
+      continue
+    fi
+    if [ "$code" = 422 ]; then
+      event ERROR gh-token-scope-refused "" \
+        "installation token REFUSED (HTTP 422) for $REPO_FULL with actions:read + administration:write ($(printf '%s' "$resp" | jq -r '.message // empty' 2>/dev/null)) -- the controller is blind until the installation grants both and selects this repository; NOT retried unscoped" \
+        missing="actions:read,administration:write" http="$code"
+    else
+      log "installation token mint failed: HTTP $code"
+    fi
+    return 1
+  done
+  [ "$scope" = full ] && rm -f "$STATE_DIR/gh-token-narrowed"
 
   GH_TOKEN=$(printf '%s' "$resp" | jq -r '.token // empty')
   [ -n "$GH_TOKEN" ] || return 1
