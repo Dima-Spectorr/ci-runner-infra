@@ -678,12 +678,23 @@ check_not "and is not called foreign"                  refused_socket
 # failure is the only thing that can cost the marker.
 FAKEBIN="$SB/fakebin"
 install -d -m 0755 "$FAKEBIN"
+FAKECALLS="$SB/fake-calls"
+: >"$FAKECALLS"
+chmod 0666 "$FAKECALLS"
 cat >"$FAKEBIN/docker" <<FAKE
 #!/bin/sh
+echo "\$(id -un): \$*" >>"$FAKECALLS"
 [ "\$1" = ps ] && [ -f "$SB/ps-fails" ] && exit 1
 exit 0
 FAKE
 chmod 0755 "$FAKEBIN/docker"
+# The transport first, on its own, so a failure below is about the reset and
+# not about the stand-in being unreachable as the slot.
+fake_as_slot() {
+  timeout 30 sudo -u "$U" DOCKER_HOST="unix://$DSOCK" "$FAKEBIN/docker" network prune --force \
+    >>"$HOOKLOG" 2>&1
+}
+check "the stand-in docker runs as the slot user" fake_as_slot
 fake_docker() { # <script> <out> -- the same reset, with every docker call on the stand-in
   sed "s#^\([[:space:]]*\)docker #\1$FAKEBIN/docker #; s#\(DOCKER_HOST=\"unix://\\\$sock\"\) docker #\1 $FAKEBIN/docker #" "$1" >"$2"
   chmod 0755 "$2"
@@ -712,6 +723,8 @@ rm -f -- "$MARKER"
 reset_once "$MUTANT"
 check "piped into sort, the failed ps earns the marker -- so the check is live" test -f "$MARKER"
 rm -f -- "$SB/ps-fails"
+# What the stand-in was asked, kept with the hooks' own output for a failed run.
+sed 's/^/  stand-in docker: /' "$FAKECALLS" >>"$HOOKLOG"
 
 # Renamed by the job.
 rm -f -- "$MARKER" "$BURNS_1392"
