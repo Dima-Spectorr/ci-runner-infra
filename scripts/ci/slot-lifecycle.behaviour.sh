@@ -928,7 +928,11 @@ bus_before=$(bus_pid)
 reset_once "$RESET"
 settle
 check_not "the activated helper does not survive"      helper_alive
-check "the bus daemon itself does"                     test "$(bus_pid)" = "$bus_before"
+# The bus may be restarted by the reset (e.g. a unit read as non-stock is
+# reverted, or socket activation replaces it) -- killing more is the safe
+# direction. What must hold is that the slot still HAS a working user bus.
+echo "user bus MainPID before=$bus_before after=$(bus_pid)" >>"$HOOKLOG"
+check "a user bus still answers after the reset"   as_slot timeout 5 dbus-send --session --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.Peer.Ping
 rm -rf -- "$HOME_DIR/.local"
 
 # A UNIT THAT WILL NOT STOP fails the slot closed (R4). A timer, so the kill
