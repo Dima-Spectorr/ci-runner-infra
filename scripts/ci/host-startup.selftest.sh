@@ -1477,6 +1477,53 @@ has_baked_image_audit() { # <file>
   matches "$code" 'elif \[ -f "\\\$manifest" \]' || return 1
 }
 
+# The slot-lifecycle log shipper (#1403). Without it the reset's verdicts reach
+# the host's journal and nothing else, so a condemned slot or a fleet-wide
+# fail-closed reset cannot be counted or alerted on. What it DOES is run in
+# log-shipper.behaviour.sh; what is pinned here is what that suite cannot see:
+# that the host installs and arms it, that its failure cannot take the host
+# down, and that its match set is exactly the slot tools' own tags -- read from
+# the `logger -t` calls that write them, so a new tool, or a renamed one, cannot
+# silently fall out of the alert.
+has_log_shipper() { # <file>
+  local code ids tags t body tmp
+  code=$(code_of "$1")
+
+  matches "$code" 'install_log_shipper \|\|$' || return 1
+  ! matches "$code" 'install_log_shipper \|\| die' || return 1
+  matches "$code" 'systemctl enable --now ci-log-shipper\.timer' || return 1
+  # A oneshot with no deadline blocks its own timer forever.
+  matches "$code" '^TimeoutStartSec=120$' || return 1
+
+  # Root only: _UID is stamped by journald from the socket's credentials, so a
+  # job cannot forge a line the alert counts.
+  matches "$code" '^matches\+=\(_UID=0\)$' || return 1
+  # The journal is read through the match set and nothing else, oldest first.
+  matches "$code" '^timeout 20 "\$JOURNALCTL" "\$\{opts\[@\]\}" "\$\{matches\[@\]\}" 2>/dev/null \| head -n "\$MAX" >"\$batch"$' || return 1
+  # The host's token never goes in argv.
+  matches "$code" "-K <\\(printf 'header = \"Authorization: Bearer %s\"\\\\n' \"\\\$token\"\\)" || return 1
+
+  ids=$(printf '%s\n' "$code" | sed -n 's/^IDENTIFIERS=(\(.*\))$/\1/p')
+  [ -n "$ids" ] || return 1
+  tags=$(printf '%s\n' "$code" | grep -oE 'logger -t ci-(slot|pin)-[a-z]+' | sed 's/.* //' | sort -u)
+  [ -n "$tags" ] || return 1
+  for t in $tags; do case " $ids " in *" $t "*) ;; *) return 1 ;; esac; done
+  for t in $ids; do case $'\n'"$tags"$'\n' in *$'\n'"$t"$'\n'*) ;; *) return 1 ;; esac; done
+
+  # A quoted here-document, so the body is the file the host gets, byte for
+  # byte. An empty extraction is a moved anchor, not a clean parse.
+  body=$(awk '
+    $0 == "  cat >/opt/ci/log-shipper.sh <<'"'"'EOF'"'"'" { on = 1; next }
+    on && $0 == "EOF" { exit }
+    on { print }
+  ' "$1")
+  [ -n "$body" ] || return 1
+  tmp=$(mktemp)
+  printf '%s\n' "$body" >"$tmp"
+  bash -n "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+}
+
 # The scripts this boot script WRITES are never run by anything here, so a
 # syntax error in any of them survives every text predicate above and first
 # appears on a live host as a slot that will not pin — or, worse, a sweeper that
@@ -1531,6 +1578,12 @@ if has_baked_image_audit "$SCRIPT"; then
   ok
 else
   bad "nothing re-checks the baked-image manifest after boot — on a host that runs for days the prune in #250 is deciding which image tags may survive a reset from a claim made once, at boot, over a store that has changed since (issue #251)"
+fi
+
+if has_log_shipper "$SCRIPT"; then
+  ok
+else
+  bad "the slot tools' journal lines do not reach Cloud Logging, or reach it from any uid — a condemned slot, or a reset failing closed on every host, is visible only from a shell on the VM and the condemned-slot alert never fires (#1403)"
 fi
 
 if generated_scripts_parse "$SCRIPT"; then
@@ -2088,6 +2141,17 @@ mutate "audit failure made fatal"            's@^  install_baked_image_audit ||$
 mutate "dead manifest id no longer reported" 's@say "slot \\\$idx: the manifest names@: "slot \$idx: the manifest names@' has_baked_image_audit
 mutate "manifest mode no longer checked"     's@not root:root:644@is fine@'                                           has_baked_image_audit
 mutate "state directory no longer checked"   's@not root:root:755@is fine@g'                                          has_baked_image_audit
+
+mutate "log shipper failure made fatal"      's@^  install_log_shipper ||$@  install_log_shipper || die@'             has_log_shipper
+mutate "log shipper installed but not armed" 's@systemctl enable --now ci-log-shipper.timer@systemctl enable ci-log-shipper.timer@' has_log_shipper
+mutate "log shipper oneshot without a deadline" 's@^TimeoutStartSec=120$@@'                                           has_log_shipper
+mutate "any uid's lines are shipped"         's@^matches+=(_UID=0)$@:@'                                               has_log_shipper
+mutate "the whole journal is read"           's@ "\${matches\[\@\]}" 2>/dev/null | head@ 2>/dev/null | head@'         has_log_shipper
+mutate "the host token goes in argv"         's@-K <(printf .header = "Authorization: Bearer %s"\\n. "\$token")@-H "Authorization: Bearer $token"@' has_log_shipper
+mutate "a slot tool falls out of the ship list" 's@^IDENTIFIERS=(ci-slot-reset ci-slot-sweep @IDENTIFIERS=(ci-slot-reset @' has_log_shipper
+mutate "an unrelated tag is shipped"         's@^IDENTIFIERS=(ci-slot-reset @IDENTIFIERS=(ci-controller ci-slot-reset @'   has_log_shipper
+mutate "a renamed slot tool is not followed" 's@logger -t ci-pin-sweep@logger -t ci-pin-reaper@'                     has_log_shipper
+mutate "the generated shipper does not parse" 's@^n=\$(grep -c . "\$batch")$@n=$(grep -c . "$batch"@'                has_log_shipper
 mutate "image store owner no longer checked" 's@not \\\$u:\\\$u -- another account owns@is fine@'                     has_baked_image_audit
 mutate "image store mode no longer checked"  's@0\\\$droot_mode & 066@0@'                                             has_baked_image_audit
 mutate "symlinked manifest reads as a file"  's@if \[ -L "\\\$manifest" \]@if false@'                                 has_baked_image_audit

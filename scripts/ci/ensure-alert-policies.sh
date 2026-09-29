@@ -685,6 +685,29 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    # The HOSTS' own account of a slot that could not be made clean (#1403).
+    # Until the log shipper these lines reached the host's journal and nothing
+    # else, so a slot condemned for burning jobs -- or a reset failing closed on
+    # every host at once, which #1394 made likelier by design -- could be read
+    # only from a shell on the VM. ci_slots_missing sees a condemned slot as a
+    # gap in capacity, thirty minutes later and without the reason; this sees
+    # the reset say it, on the host that said it.
+    #
+    # Keyed on the host's gce_instance, like the other log metrics, so
+    # --muted-pool cannot reach it; the entry's own labels carry pool and host.
+    # Any occurrence in ten minutes: none of these lines is ordinary.
+    slotreset) cat <<EOF
+{ "displayName": "CI runners / a slot failed its reset (condemned, or refused clean)",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "A host's slot reset refused to call a slot clean, or the slot sweep took a slot out of service. Both are the reset working -- it fails CLOSED, so the slot stops taking jobs rather than run one on a previous job's leftovers -- and both mean a slot, or a whole host, is not serving.\n\nRead the lines: in Cloud Logging, log ci-slot-lifecycle, grouped by labels.host and labels.pool (jsonPayload.identifier is the tool, jsonPayload.message the verdict). Four phrases feed this metric:\n\n- **is not the socket it listens on** / **reads as foreign** -- the slot's docker socket name no longer points at its own daemon: a job moved or replaced it, so no container was reclaimed (#1392). One slot is a job doing something odd; every slot on every host is a reset regression, and the pool is failing closed.\n- **refusing to call this slot clean** -- a process of the last job would not die, or the slot user's uid could not be resolved.\n- **taking it out of service** -- CONDEMN_MAX consecutive failures to reach a clean state; the sweep condemned the slot. ci_slots_missing will follow.\n\nA slot comes back on its own once a reset earns the marker ('clean again after being condemned' in the same log). A host whose slots keep landing here is a host to recycle. Nothing reaches this log from a job: the shipper sends only root's lines for the slot tools' tags." },
+  "conditions": [ { "displayName": "ci_slot_reset_failures > 0 in 10m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "0s",
+      "filter": "metric.type=\"logging.googleapis.com/user/ci_slot_reset_failures\" AND resource.type=\"gce_instance\"",
+      "aggregations": [ { "alignmentPeriod": "600s", "perSeriesAligner": "ALIGN_SUM" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
   esac
 }
 
@@ -784,6 +807,16 @@ ensure_log_metric ci_egress_denied \
 ensure_log_metric ci_unverified_host_keeps \
   "Controller events for a host kept because its guest attributes could not be read or verified: beacon-read-failed, and pin-hold-veto at WARNING. Sustained non-zero is hosts that will never drain." \
   'logName:"logs/ci-controller" AND severity=WARNING AND (jsonPayload.event="beacon-read-failed" OR jsonPayload.event="pin-hold-veto")'
+
+# The HOSTS' slot-tool lines, as the log shipper in host-startup.sh sends them
+# (log `ci-slot-lifecycle`, one entry per journal line, the verdict in
+# jsonPayload.message). Matched on the reset's and the sweep's own phrases, which
+# alert-slot-reset.selftest.sh pins against the `say` lines that write them.
+# "taking it out of service" and not "condemned": the recovery line says
+# "clean again after being condemned", and that must not page.
+ensure_log_metric ci_slot_reset_failures \
+  "Slot resets that failed closed or condemned a slot, from the hosts' ci-slot-lifecycle log: a socket that is not the slot daemon's, a slot refused as clean, a slot taken out of service." \
+  'logName:"logs/ci-slot-lifecycle" AND (jsonPayload.message:"is not the socket it listens on" OR jsonPayload.message:"reads as foreign" OR jsonPayload.message:"refusing to call this slot clean" OR jsonPayload.message:"taking it out of service")'
 
 # ── metric descriptors ────────────────────────────────────────────────────────
 # An alert policy cannot be created against a metric type Cloud Monitoring has
@@ -934,7 +967,7 @@ no_such_metric() {
 }
 
 deferred=""
-for key in heartbeat blind idle heldpool queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied applystale hostvanished egressdenied unverifiedkeep; do
+for key in heartbeat blind idle heldpool queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied applystale hostvanished egressdenied unverifiedkeep slotreset; do
   policy_json "$key" >"$tmp/p.json"
   # Neither of these ends in `| head -1`, and that is deliberate. This script
   # runs `set -euo pipefail`; under both options a reader that stops early sends

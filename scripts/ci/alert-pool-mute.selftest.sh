@@ -131,7 +131,7 @@ notes=$(printf '%s\n' "$muted" | grep -c 'MUTED POOLS: pool-broken\.')
 # the ones without the note. Counted from the render rather than written as a
 # literal: a literal went stale the moment a second log-based policy arrived.
 unmutable=$(printf '%s\n' "$plain" | grep -c 'resource\.type=\\"gce_instance\\"' || true)
-want "two policies here are log-based and cannot be muted" "2" "$unmutable"
+want "three policies here are log-based and cannot be muted" "3" "$unmutable"
 want "every policy that was muted says so" "$((docs - unmutable))" "$notes"
 
 # The one policy that must NOT carry the note is the one that could not be
