@@ -2170,11 +2170,25 @@ LOCK="\$PIN_DIR/.lock"
 
 say() { logger -t ci-pin-sweep -- "\$*" 2>/dev/null || true; echo "pin sweep: \$*" >&2; }
 
+# The same PUT as ci-pin-hold's publish, and the same failure handling: a write
+# the metadata server refused is SAID, never swallowed, and never fatal. The
+# record on disk is the truth this host acts on. This copy used to end in
+# \`|| true\`, so a sweep that could not publish a live hold left no trace at all.
 publish() { # <payload>
   curl --silent --show-error --fail --connect-timeout 3 --max-time 10 \
     -X PUT --data "\$1" -H "Metadata-Flavor: Google" \
     "http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/ci/pin-hold" \
-    >/dev/null 2>&1 || true
+    >/dev/null 2>&1 || { say "could not publish '\$1' to guest attributes"; return 1; }
+}
+
+# What the controller would read right now. Empty when it cannot be read: the
+# metadata server did not answer, or the attribute -- or the whole ci/ namespace
+# -- was never written. Every one of those means "not confirmed".
+published() {
+  curl --silent --fail --connect-timeout 3 --max-time 10 \
+    -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/ci/pin-hold" \
+    2>/dev/null
 }
 
 # Is this host cordoned? Same read, same fail-open reasoning, as the slot
@@ -2238,10 +2252,17 @@ if [ "\$boot" != "\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]; then
 fi
 
 if [ "\$expiry" -gt "\$now" ]; then
-  # Live. Republish, because a guest attribute is not durable across everything
-  # that can reset one, and the controller reads the attribute rather than this
-  # file.
-  publish "\$run \$expiry"
+  # Live. REPUBLISHED UNTIL CONFIRMED (#1393). The controller reads the
+  # attribute, not this file, and the PUT that took the hold is best effort. On a
+  # host that never wrote ci/ before, one lost PUT is a host the controller
+  # reads as FREE (#1384), and the next job's renew -- the only other writer --
+  # may never come. So every tick reads the attribute back and writes it
+  # whenever it is not the record on disk: absent, different and unreadable all
+  # mean write. A confirmed value costs one local GET and no write. An expired
+  # hold never reaches this line; the release paths below clear it instead.
+  want="\$run \$expiry"
+  have=\$(published) || have=""
+  [ "\$have" = "\$want" ] || publish "\$want"
 
   # And take a RESERVED slot out of service the moment it goes idle. The stack
   # belongs to this slot's rootless daemon and this slot's uid; a released slot
