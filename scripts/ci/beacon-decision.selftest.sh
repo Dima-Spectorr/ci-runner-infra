@@ -210,6 +210,52 @@ absent "no namespace to match against is never a match" 1 \
 absent "a namespace that is not a plain name is never a match" 1 \
   "ERROR: HTTPError 404: The resource '*/' of type 'Guest Attribute' was not found." '*'
 
+# --- event_throttle_decision / pin_hold_class ------------------------------------
+# A gate's event is sent when its class changes and on a heartbeat -- never on
+# every tick, and never withheld when the record cannot be trusted.
+throttle() { # <description> <expected> <prev> <class> <now> [interval]
+  local got
+  got=$(event_throttle_decision "$3" "$4" "$5" "${6:-600}")
+  if [ "$got" = "$2" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  want: %s got: %s\n' "$1" "$2" "$got"
+  fi
+}
+throttle "the first event of an episode is sent" emit "" read-failed 1000
+throttle "the same class inside the heartbeat is quiet" quiet "read-failed 1000" read-failed 1060
+throttle "one second short of the heartbeat is still quiet" quiet "read-failed 1000" read-failed 1599
+throttle "the heartbeat sends it again" emit "read-failed 1000" read-failed 1600
+throttle "a change of class is sent at once" emit "live-published 1000" read-failed 1060
+throttle "a record with no time is sent" emit "read-failed" read-failed 1060
+throttle "a record with a garbage time is sent" emit "read-failed abc" read-failed 1060
+throttle "a clock that went backwards is sent" emit "read-failed 2000" read-failed 1060
+throttle "an unreadable clock is sent" emit "read-failed 1000" read-failed ""
+throttle "a garbage interval falls back to the default" quiet "read-failed 1000" read-failed 1060 "x"
+
+cls() { # <description> <expected> <verdict>
+  local got
+  got=$(pin_hold_class "$3")
+  if [ "$got" = "$2" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  want: %s got: %s\n' "$1" "$2" "$got"
+  fi
+}
+cls "a live published hold is the mechanism working" "live-published INFO" \
+  "hold:run=77 expiry=1600 live published remaining=600s"
+cls "a live cached hold is the mechanism working" "live-cached INFO" \
+  "hold:run=77 expiry=1600 live cached clamped remaining=60s"
+cls "a failed read is a warning" "read-failed WARNING" "hold:run= expiry=0 read-failed status=1"
+cls "no zone is a warning" "no-zone WARNING" "hold:run= expiry=0 no-zone"
+cls "a malformed publish is a warning" "malformed-hold WARNING" "hold:run= expiry=0 malformed-hold"
+cls "anything unrecognised is a warning, never INFO" "other WARNING" "hold:something new"
+cls "the class carries no expiry, so a moving deadline is not a change" \
+  "$(pin_hold_class "hold:run=77 expiry=1600 live published remaining=600s")" \
+  "hold:run=77 expiry=9999 live published remaining=1s"
+
 if [ "$FAIL" -gt 0 ]; then
   echo "beacon-decision: $FAIL failed, $PASS passed"
   exit 1

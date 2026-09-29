@@ -443,6 +443,10 @@ gate_run() {
   local dir code
   dir=$(mktemp -d)
   [ -z "$cache" ] || printf '%s' "$cache" >"$dir/pinhold-h1"
+  # A veto episode and an error left from an earlier tick, so each run shows
+  # whether the gate ended or kept them.
+  printf 'read-failed 1' >"$dir/pinveto-h1"
+  printf 'stale error' >"$dir/pinerr-h1"
   code="$GATE_CODE"
   [ -z "$mut" ] || code=$(printf '%s\n' "$code" | sed "$mut")
   (
@@ -474,6 +478,8 @@ gate_run() {
     eval "$code"
     v=$(pin_hold_gate h1 "https://www.googleapis.com/compute/v1/projects/test-project/zones/test-zone-a/instances/h1")
     printf '%s cache=%s' "$v" "$(cat "$dir/pinhold-h1" 2>/dev/null)"
+    printf '|veto=%s|err=%s' "$([ -e "$dir/pinveto-h1" ] && echo kept || echo ended)" \
+      "$(cat "$dir/pinerr-h1" 2>/dev/null)"
   )
   rm -rf "$dir"
 }
@@ -533,9 +539,106 @@ counted "both gates classify the namespace 404" \
 
 # The veto reaches Cloud Logging. log() stops at this VM's own file, which is
 # why a veto that never lifted was invisible on three pools (#1384).
-counted "both vetoes are events" 'event WARNING pin-hold-veto "\$host" "\$host: \$verdict -- VETOED by pin hold' 2
+counted "both vetoes are events" '^ +pin_veto_event "\$host" "\$verdict" "\$hold"$' 2
 counted "no veto is left on log() alone" '^ +log "\$host: \$verdict -- VETOED' 0
-wired "an unexplained beacon read failure is an event too" 'event WARNING beacon-read-failed "\$host"'
+wired "the veto event is throttled per host" 'throttled_event "\$STATE_DIR/pinveto-\$host" "\$cls" "\$sev" pin-hold-veto'
+wired "an unexplained beacon read failure is a throttled event too" \
+  'throttled_event "\$STATE_DIR/beaconerr-\$host" "status-\$rc" WARNING beacon-read-failed'
+# A marker per host that nothing reaps is a file per host the pool ever had.
+host_gone=$(awk '/rm -f "\$STATE_DIR\/idle-\$host" "\$STATE_DIR\/seen-\$host"/ { on = 1 } on { print } on && !/\\$/ { exit }' "$CTL")
+for sf in pinveto pinerr beaconerr; do
+  case "$host_gone" in
+    *"\"\$STATE_DIR/$sf-\$host\""*) PASS=$((PASS + 1)) ;;
+    *) FAIL=$((FAIL + 1)); printf 'FAIL: the %s marker goes when the host does\n' "$sf" ;;
+  esac
+  wired "the $sf marker is in the stale-marker sweep" "\"\\\$STATE_DIR\"/$sf-\\*"
+  wired "the sweep strips the $sf prefix" "mname=\\\$\\{mname#$sf-\\}"
+done
+
+# --- what the gate leaves for the veto event (F2) ------------------------------
+# gcloud's own words are the only account of an unexplained failure, so the
+# gate keeps them; any read that answered clears them, and a free host ends the
+# veto episode so its next hold is sent at once.
+gate_expect "an unexplained failure keeps gcloud's error for the event" \
+  "hold:run= expiry=0 read-failed status=1 cache=|veto=kept|err=ERROR: HTTPError 429" \
+  "$(gate_run 1 "ERROR: HTTPError 429: Quota exceeded for quota metric 'Guest attribute queries'")"
+gate_expect "the kept error is bounded to 300 bytes" \
+  "hold:run= expiry=0 read-failed status=1 cache=|veto=kept|err=$(printf 'x%.0s' $(seq 300))" \
+  "$(gate_run 1 "$(printf 'x%.0s' $(seq 400))")"
+[[ "$(gate_run 1 "$(printf 'x%.0s' $(seq 400))")" == *"err=$(printf 'x%.0s' $(seq 301))"* ]] &&
+  { FAIL=$((FAIL + 1)); printf 'FAIL: the kept error is longer than 300 bytes\n'; } || PASS=$((PASS + 1))
+gate_expect "a namespace 404 ends the episode and leaves no error behind" \
+  "free:no-hold cache=|veto=ended|err=" "$(gate_run 1 "$NS404")"
+got=$(gate_run 0 "" "pin-hold,77 $SOON")
+if [[ "$got" == "hold:run=77 expiry=$SOON live published "*" cache=77 $SOON|veto=kept|err=" ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  printf 'FAIL: a live hold keeps the episode but clears a stale error\n  got: %s\n' "$got"
+fi
+
+# --- the veto event: sent on a change of class, and on a heartbeat (F1) --------
+#
+# The same veto is re-decided every tick for every held host; sent every time
+# it is hundreds of entries per hold and competes for flush_events' 500-entry
+# batch. The sequence below is one host over several ticks, on a fake clock,
+# through the real throttled_event and pin_veto_event.
+VETO_CODE=$(printf '%s\n' "$(ctl_fn throttled_event)" "$(ctl_fn pin_veto_event)")
+# veto_seq [sed-mutation] -> one "<sev>:<class>:<error>" per SENT event, ';'-joined
+veto_seq() {
+  local mut="${1:-}" dir code
+  dir=$(mktemp -d)
+  code="$VETO_CODE"
+  [ -z "$mut" ] || code=$(printf '%s\n' "$code" | sed "$mut")
+  (
+    # shellcheck disable=SC2034
+    STATE_DIR="$dir"
+    # shellcheck disable=SC2034
+    EVENT_HEARTBEAT=600
+    NOW=1000000
+    # shellcheck disable=SC2317
+    date() { echo "$NOW"; }
+    # shellcheck disable=SC2317
+    log() { :; }
+    # shellcheck disable=SC2317
+    event() {
+      local sev="$1" kv cls="" er=""
+      shift 4
+      for kv in "$@"; do
+        case "$kv" in class=*) cls=${kv#class=} ;; error=*) er=${kv#error=} ;; esac
+      done
+      printf '%s:%s:%s;' "$sev" "$cls" "$er" >>"$dir/sent"
+    }
+    eval "$code"
+    live="hold:run=77 expiry=1000600 live published remaining=600s"
+    pin_veto_event h1 drain:idle-past-grace "$live"            # t0: first -> sent
+    NOW=1000060; pin_veto_event h1 drain:idle-past-grace "hold:run=77 expiry=1000600 live published remaining=540s"  # same class -> quiet
+    NOW=1000599; pin_veto_event h1 drain:idle-past-grace "$live" # one second short of the heartbeat -> quiet
+    NOW=1000600; pin_veto_event h1 drain:idle-past-grace "$live" # heartbeat -> sent
+    printf 'HTTPError 503: backend\n' >"$dir/pinerr-h1"
+    NOW=1000660; pin_veto_event h1 drain:idle-past-grace "hold:run= expiry=0 read-failed status=1" # class change -> sent
+    NOW=1000720; pin_veto_event h1 drain:idle-past-grace "hold:run= expiry=0 read-failed status=1" # same -> quiet
+    cat "$dir/sent"
+  )
+  rm -rf "$dir"
+}
+gate_expect "the veto is sent on change and on heartbeat, not every tick" \
+  "INFO:live-published:;INFO:live-published:;WARNING:read-failed:HTTPError 503: backend ;" \
+  "$(veto_seq)"
+# Mutations, run: each must change the sequence, or the case above is passing
+# on something other than the rule it names.
+# shellcheck disable=SC2016
+vm=$(veto_seq 's/"$(event_throttle_decision "$prev" "$class" "$now" "$EVENT_HEARTBEAT")" = "emit"/true/')
+[ "$vm" != "$(veto_seq)" ] && PASS=$((PASS + 1)) ||
+  { FAIL=$((FAIL + 1)); printf 'FAIL: removing the throttle did not change the veto sequence\n'; }
+# shellcheck disable=SC2016
+vm=$(veto_seq 's/printf .%s %s. "$class" "$now" >"$sf"/:/')
+[ "$vm" != "$(veto_seq)" ] && PASS=$((PASS + 1)) ||
+  { FAIL=$((FAIL + 1)); printf 'FAIL: not recording the sent class did not change the veto sequence\n'; }
+# shellcheck disable=SC2016
+vm=$(veto_seq 's/err=$(head -c 300 "$STATE_DIR\/pinerr-$host"/err=$(: "$STATE_DIR\/pinerr-$host"/')
+[ "$vm" != "$(veto_seq)" ] && PASS=$((PASS + 1)) ||
+  { FAIL=$((FAIL + 1)); printf 'FAIL: dropping the error did not change the veto sequence\n'; }
 
 if [ "$FAIL" -gt 0 ]; then
   echo "pin-hold-decision: $FAIL failed, $PASS passed"

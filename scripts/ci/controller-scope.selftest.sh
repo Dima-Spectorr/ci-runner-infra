@@ -851,6 +851,8 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
   # splice ends the string -- the stub then emits a mangled error and every
   # case built on it passes or fails for the wrong reason.
   printf '%s\n' "${GATE_GA_ERR:-}" >"$dir/ga.err"
+  # The beacon failure event's throttle state from an earlier tick, if any.
+  [ -z "${GATE_BEACONERR:-}" ] || printf '%s' "$GATE_BEACONERR" >"$dir/beaconerr-h1"
 
   roster_json "$runners" 0 >"$dir/runners.json"
   if [ "$busy" = ROSTERFAIL ]; then
@@ -881,8 +883,8 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
   # is the real one: the proof is only as good as its insistence on reading the
   # roster to its END, and a stub that always says "complete" removes exactly
   # that. guest_attributes_denied is real for the same reason on the beacon side.
-  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-    "$(fn host_age_seconds)" "$(fn instance_host_os)" \
+  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "$(fn throttled_event)" "$(fn host_age_seconds)" "$(fn instance_host_os)" \
     "$(fn guest_attributes_denied)" "$(fn note_guest_attributes_denied)" \
     "$(fn beacon_gate)" "$(fn fetch_runner_roster)" "$(fn drain_fail)" "$(fn drain_host)")
   [ -n "$mut" ] && code=$(printf '%s\n' "$code" | sed "$mut")
@@ -904,6 +906,7 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
       # name would abort the whole subshell rather than fail one check.
       GA_DENIED_FILE=''
       BEACON_INTERVAL=30
+      EVENT_HEARTBEAT=600
       REGISTER_GRACE=600
       ORPHAN_CONFIRM_TICKS=3
       DRAINED=0
@@ -1102,6 +1105,17 @@ check "gate/windows: dropping the namespace arm restores the host nobody could d
 check "gate/windows: an unexplained read failure is an event" \
   "WARNING beacon-read-failed;INFO drain-probe;" \
   "$(GATE_GA_ERR="$GA_INST404" gate_seq windows '' 1 0 0 3 0 4000 '' events)"
+# Throttled: the same failure sent a minute ago is not sent again, a different
+# status is, and one sent a heartbeat ago is sent again.
+check "gate/windows: a repeated read failure inside the heartbeat is not re-sent" \
+  "INFO drain-probe;" \
+  "$(GATE_BEACONERR="status-1 $(($(date +%s) - 60))" GATE_GA_ERR="$GA_INST404" gate_seq windows '' 1 0 0 3 0 4000 '' events)"
+check "gate/windows: a read failure with a new status is sent at once" \
+  "WARNING beacon-read-failed;INFO drain-probe;" \
+  "$(GATE_BEACONERR="status-124 $(($(date +%s) - 60))" GATE_GA_ERR="$GA_INST404" gate_seq windows '' 1 0 0 3 0 4000 '' events)"
+check "gate/windows: a read failure past the heartbeat is sent again" \
+  "WARNING beacon-read-failed;INFO drain-probe;" \
+  "$(GATE_BEACONERR="status-1 $(($(date +%s) - 700))" GATE_GA_ERR="$GA_INST404" gate_seq windows '' 1 0 0 3 0 4000 '' events)"
 check "gate/windows: a never-written namespace is not reported as a failure" \
   "INFO drain-probe;" \
   "$(GATE_GA_ERR="$GA_NS404" gate_seq windows '' 1 0 0 1 0 4000 '' events)"

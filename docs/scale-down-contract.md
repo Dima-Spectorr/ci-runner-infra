@@ -86,9 +86,14 @@ Everything else — including a 404 for a missing **instance**, a missing key, a
 > against a 900 s grace, `min_hosts = 0`. Every held host answered the
 > namespace 404. The veto line reached only the controller's local log.
 
-**How it shows.** Every veto is now an event — `jsonPayload.event =
-"pin-hold-veto"` in the `ci-controller` log, with the verdict and the hold
-reason — and a beacon read that keeps a host is `beacon-read-failed`. The
+**How it shows.** A veto is now an event — `jsonPayload.event =
+"pin-hold-veto"` in the `ci-controller` log, with the verdict, the hold reason
+and, for a failed read, the first 300 bytes of gcloud's error — and a beacon
+read that keeps a host is `beacon-read-failed`. Both are sent when their class
+changes (`live-published`, `live-cached` at INFO; `read-failed`, `no-zone`,
+`malformed-hold` at WARNING; the beacon's by status) and otherwise once every
+10 minutes per host, so a state that never changes still shows up every
+10 minutes without filling every tick's 500-entry event batch. The
 metric is `ci_pin_holds_honoured`, and **it is also what mutes *Not scaling to
 zero***, so a stuck veto silences the alert that would otherwise catch it. The
 alert shape for this failure is therefore:

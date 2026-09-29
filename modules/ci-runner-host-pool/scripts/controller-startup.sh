@@ -57,6 +57,27 @@ event() {
     "${args[@]}" '$ARGS.named' >>"$STATE_DIR/events.jsonl" 2>/dev/null || true
 }
 
+# throttled_event <state-file> <class> <severity> <kind> <host> <message> [k=v ...]
+#
+# event(), but only when <class> differs from the last one sent for this state
+# file, or EVENT_HEARTBEAT seconds have passed since it -- see
+# event_throttle_decision (beacon-decision.sh) for why. A suppressed repeat
+# still reaches log(), so the VM's own file keeps the per-tick record. The
+# state is a FILE because both callers can run inside a `$(...)` subshell.
+EVENT_HEARTBEAT=600
+throttled_event() {
+  local sf="$1" class="$2" now prev
+  shift 2
+  now=$(date -u +%s)
+  prev=$(cat "$sf" 2>/dev/null) || prev=""
+  if [ "$(event_throttle_decision "$prev" "$class" "$now" "$EVENT_HEARTBEAT")" = "emit" ]; then
+    printf '%s %s' "$class" "$now" >"$sf" 2>/dev/null || true
+    event "$@" class="$class"
+  else
+    log "$4"
+  fi
+}
+
 # flush_events — every queued event in ONE entries:write, bounded like every
 # other call here. Never retried: a failed flush is logged locally and the
 # batch dropped, so a Logging outage costs log lines, never a stalled tick or a
@@ -2968,7 +2989,7 @@ beacon_gate() {
   local host="$1" zone="$2" regs="$3"
   local raw rc line key val present=0 workers="" ts_raw="" ts=0 now age misses
   local mf="$STATE_DIR/beaconmiss-$host"
-  local errf denied=0
+  local errf denied=0 err
 
   # The error text is kept, and now it is also ANSWERED. A beacon that cannot be
   # read is normally the loss of the only evidence a host is idle, so `keep` is
@@ -2995,9 +3016,16 @@ beacon_gate() {
   elif [ "$rc" != "0" ]; then
     # Every other failure keeps the host, and is the only evidence a stuck pool
     # leaves -- so it goes to Cloud Logging, not just to this VM's own file.
-    event WARNING beacon-read-failed "$host" \
-      "beacon: guest-attribute read of $host failed (status=$rc) -- kept: $(head -c 300 "${errf:-/dev/null}" 2>/dev/null | tr '\r\n' '  ')" \
-      status="$rc"
+    # Throttled per host on the status, so a fleet-wide 429 or outage cannot
+    # flood the batch.
+    err=$(head -c 300 "${errf:-/dev/null}" 2>/dev/null | tr '\r\n' '  ')
+    throttled_event "$STATE_DIR/beaconerr-$host" "status-$rc" WARNING beacon-read-failed "$host" \
+      "beacon: guest-attribute read of $host failed (status=$rc) -- kept: $err" \
+      status="$rc" error="$err"
+  fi
+  # A read that answered ends the failure episode: the next failure is news.
+  if [ "$rc" = "0" ] || [ "$denied" = "1" ]; then
+    rm -f "$STATE_DIR/beaconerr-$host"
   fi
   [ -z "$errf" ] || rm -f "$errf"
 
@@ -3116,6 +3144,15 @@ pin_hold_gate() {
     rc=0
     raw=""
   fi
+  # Any OTHER failure keeps the host, and gcloud's own words are the only
+  # account of why. Kept beside the cache for the veto event to carry, and
+  # cleared by any read that answered, so a stale error never rides along on a
+  # later veto that has a different cause.
+  if [ "$rc" != "0" ] && [ "$disabled" != "1" ] && [ -n "$errf" ]; then
+    head -c 300 "$errf" >"$STATE_DIR/pinerr-$host" 2>/dev/null || true
+  else
+    rm -f "$STATE_DIR/pinerr-$host"
+  fi
   [ -z "$errf" ] || rm -f "$errf"
 
   # FIRST occurrence wins, for the same reason beacon_gate does it: guest
@@ -3138,6 +3175,10 @@ PIN_ATTR_EOF
   now=$(date -u +%s)
   verdict=$(pin_hold_decision "$rc" "$present" "$hold_raw" "$c_run" "$c_exp" \
     "$now" "$PIN_HOLD_MAX" "$disabled")
+
+  # A free host ends the veto episode, so the next hold on it is news and is
+  # sent at once rather than waiting out the previous hold's heartbeat.
+  case "$verdict" in free:*) rm -f "$STATE_DIR/pinveto-$host" ;; esac
 
   # The cache is written only from a read that SUCCEEDED. A failed read is not
   # evidence about a hold in either direction, and letting it rewrite the file
@@ -3166,6 +3207,22 @@ PIN_ATTR_EOF
 
   printf '%s' "$verdict"
   return 0
+}
+
+# pin_veto_event <host> <removal-verdict> <hold-verdict>
+#
+# The veto, sent to Cloud Logging (#1384: log() alone made a veto that never
+# lifted invisible) -- but only when its CLASS changes or once per heartbeat,
+# because the same veto is re-decided every tick. INFO for a live hold, which
+# is the mechanism working; WARNING for a hold nobody could verify, carrying
+# the first 300 bytes of gcloud's error when the read failed.
+pin_veto_event() {
+  local host="$1" verdict="$2" hold="$3" cls sev err
+  read -r cls sev <<<"$(pin_hold_class "$hold")"
+  err=$(head -c 300 "$STATE_DIR/pinerr-$host" 2>/dev/null | tr '\r\n' '  ')
+  throttled_event "$STATE_DIR/pinveto-$host" "$cls" "$sev" pin-hold-veto "$host" \
+    "$host: $verdict -- VETOED by pin hold ($hold)${err:+ -- $err}" \
+    verdict="$verdict" hold="$hold" error="$err"
 }
 
 # --- drain -------------------------------------------------------------------
@@ -3357,7 +3414,8 @@ drain_host() {
   # -- so nothing is being forgotten, and a leftover file would be a veto with
   # no host to apply to.
   rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/seen-$host" "$STATE_DIR/beaconmiss-$host" \
-    "$STATE_DIR/pinhold-$host" "$STATE_DIR/partial-$host"
+    "$STATE_DIR/pinhold-$host" "$STATE_DIR/partial-$host" "$STATE_DIR/pinveto-$host" \
+    "$STATE_DIR/pinerr-$host" "$STATE_DIR/beaconerr-$host"
   event INFO drain-delete "$host" "drain $host: deregistered $deregistered agent(s) and deleted" deregistered="$deregistered"
   DRAINED=$((DRAINED + 1))
   return 0
@@ -3733,7 +3791,8 @@ tick_pool() {
   # markers whose host name this pool's MIG could have created are considered,
   # and if the MIG's base name could not be read, nothing is swept at all.
   for f in "$STATE_DIR"/cordon-* "$STATE_DIR"/regtoken-* "$STATE_DIR"/regkey-* \
-    "$STATE_DIR"/regfail-* "$STATE_DIR"/beaconmiss-* "$STATE_DIR"/pinhold-*; do
+    "$STATE_DIR"/regfail-* "$STATE_DIR"/beaconmiss-* "$STATE_DIR"/pinhold-* \
+    "$STATE_DIR"/pinveto-* "$STATE_DIR"/pinerr-* "$STATE_DIR"/beaconerr-*; do
     [ -n "$live_hosts" ] || break
     [ -n "$MIG_BASE" ] || break
     [ -e "$f" ] || continue
@@ -3744,6 +3803,9 @@ tick_pool() {
     mname=${mname#regfail-}
     mname=${mname#beaconmiss-}
     mname=${mname#pinhold-}
+    mname=${mname#pinveto-}
+    mname=${mname#pinerr-}
+    mname=${mname#beaconerr-}
     case "$mname" in "$MIG_BASE"-*) ;; *) continue ;; esac
     case $'\n'"$live_hosts"$'\n' in
       *$'\n'"$mname"$'\n'*) ;;
@@ -3868,7 +3930,7 @@ tick_pool() {
           hold:*)
             # An event, not a bare log(): log() reaches this VM's file and
             # journald only, so a veto that never lifts was invisible (#1384).
-            event WARNING pin-hold-veto "$host" "$host: $verdict -- VETOED by pin hold ($hold)" verdict="$verdict" hold="$hold"
+            pin_veto_event "$host" "$verdict" "$hold"
             PIN_HELD=$((PIN_HELD + 1))
             continue
             ;;
@@ -3961,7 +4023,7 @@ tick_pool() {
         hold=$(pin_hold_gate "$host" "$host_uri")
         case "$hold" in
           hold:*)
-            event WARNING pin-hold-veto "$host" "$host: $verdict -- VETOED by pin hold ($hold)" verdict="$verdict" hold="$hold"
+            pin_veto_event "$host" "$verdict" "$hold"
             PIN_HELD=$((PIN_HELD + 1))
             continue
             ;;

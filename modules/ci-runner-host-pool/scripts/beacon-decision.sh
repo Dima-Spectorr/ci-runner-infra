@@ -269,3 +269,59 @@ guest_attributes_namespace_absent() {
     *) return 1 ;;
   esac
 }
+
+# event_throttle_decision <previous "class epoch"> <class> <now> <interval>
+#   -> "emit" or "quiet"
+#
+# WHY THE GATES' EVENTS ARE RATE-LIMITED. A veto, or a read that keeps failing,
+# is re-decided on EVERY tick for EVERY host it affects. Sent as an event each
+# time, a healthy two-hour pin hold alone is hundreds of entries per host, and a
+# fleet-wide 429 or API outage is one per host per tick -- all competing for
+# flush_events' 500-entry batch with the drain and cordon events that matter.
+#
+# So an event is sent when the CLASS of the answer changes (a hold that goes
+# from `live published` to `read-failed` is news; the same hold seen again is
+# not), and otherwise once per <interval> as a heartbeat, so a state that never
+# changes -- which is exactly the #1384 failure -- is still visible in the log
+# for as long as it lasts.
+#
+# The class is the caller's, and must not carry anything that moves every tick
+# (an expiry, a remaining-seconds count), or every tick is a change. Anything
+# the caller cannot vouch for -- no record, a malformed one, a clock that went
+# backwards -- emits: a duplicate line is cheap, a silent state is what this
+# replaced. Pure: no I/O, no globals.
+event_throttle_decision() {
+  local prev="${1:-}" class="${2:-}" now="${3:-}" interval="${4:-600}"
+  local p_class p_at
+  case "$now" in '' | *[!0-9]*) echo emit; return 0 ;; esac
+  case "$interval" in '' | *[!0-9]*) interval=600 ;; esac
+  p_class=${prev%% *}
+  p_at=${prev#* }
+  if [ -z "$prev" ] || [ "$p_at" = "$prev" ]; then echo emit; return 0; fi
+  case "$p_at" in '' | *[!0-9]*) echo emit; return 0 ;; esac
+  if [ "$p_class" != "$class" ]; then echo emit; return 0; fi
+  if [ "$p_at" -gt "$now" ] || [ "$now" -ge "$((p_at + interval))" ]; then
+    echo emit
+    return 0
+  fi
+  echo quiet
+}
+
+# pin_hold_class <pin_hold_decision verdict> -> "<class> <severity>"
+#
+# The veto event's class and severity. A LIVE hold is the mechanism working --
+# a pull request between tiers keeping its host -- and is INFO. Everything else
+# that vetoes is a hold the controller could not verify, and is WARNING: the
+# read failed, the host had no zone to read from, or the publisher wrote
+# garbage. Only the reason word is used, never the run or expiry, for the
+# reason event_throttle_decision gives. Pure.
+pin_hold_class() {
+  case "${1:-}" in
+    *" live published"*) echo "live-published INFO" ;;
+    *" live cached"*) echo "live-cached INFO" ;;
+    *" read-failed"*) echo "read-failed WARNING" ;;
+    *" no-zone"*) echo "no-zone WARNING" ;;
+    *" malformed-hold"*) echo "malformed-hold WARNING" ;;
+    *) echo "other WARNING" ;;
+  esac
+}
