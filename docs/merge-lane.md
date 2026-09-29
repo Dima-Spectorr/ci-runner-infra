@@ -190,16 +190,34 @@ pull-request CI, never for the lane on its own** (#1380).
 | File | Triggers | `runs-on` | Why that runner |
 |---|---|---|---|
 | `merge-lane.yml` | `workflow_run` (CI / base-health completed) **only** | your pool label | the host that just ran CI is still inside the controller's idle grace, so the pass costs nothing |
-| `merge-lane-events.yml` | `pull_request_target` labeled / ready_for_review, `pull_request_review` submitted, a daily `schedule`, `workflow_dispatch` | `ubuntu-latest` | nothing warmed a host for these, and starting one to answer "nothing to merge" is exactly what kept five idle pools up all day |
+| `merge-lane-events.yml` | `pull_request_target` labeled / ready_for_review, `workflow_run` of the review relay, a daily `schedule`, `workflow_dispatch` | `ubuntu-latest` | nothing warmed a host for these, and starting one to answer "nothing to merge" is exactly what kept five idle pools up all day |
+| `merge-lane-review-relay.yml` | `pull_request_review` submitted | `ubuntu-latest` | holds nothing: no secrets, no checkout, `permissions: {}`, one `run: 'true'` step. Its completion is the wake-up |
 
-Both files carry the **same** `concurrency: group: merge-lane`. A concurrency
-group is repository-wide, not per workflow, so there is still exactly one pass
-at a time across both files.
+Both lane files carry the **same** job-level `concurrency: group: merge-lane`.
+A concurrency group is repository-wide, not per workflow, so there is still
+exactly one pass at a time across both files. It sits on the `lane:` job rather
+than the workflow because a workflow-level group is joined by every run —
+including one whose `if:` is about to skip the job — and a third arrival evicts
+the pending member, so a run that would have done nothing could push out a real
+pass. Each file still declares a top-level group keyed on `github.run_id`,
+which joins nothing and evicts nothing; it is there because the fleet's
+`check-workflow-concurrency.sh` requires every workflow to declare one.
 
 Why two files rather than one with `runs-on` chosen by event: a pool label must
-never sit in a workflow a `pull_request_target` or `pull_request_review` event
-can reach. Split, that is visible in the file's `on:` block and the self-test
-pins it; in one file it would rest on an expression no gate can read.
+never sit in a workflow a `pull_request_target` event can reach. Split, that is
+visible in the file's `on:` block and the self-test pins it; in one file it
+would rest on an expression no gate can read.
+
+**Why a review reaches the lane through a relay, and never directly.**
+`pull_request_review` runs the workflow as defined at the *pull request's*
+merge ref. A lane caller listening to it would run the pull request's own copy
+of the caller — whose `uses:` line the pull request can re-point — with the
+merge App key, every time Copilot reviews a branch. A same-repository guard does
+not close that: a Dependabot branch, or any branch pushed by someone with write
+but not merge authority, passes it. The relay has nothing to take, and the lane
+hears it through `workflow_run`, which always runs the **default branch's**
+definition. The relay's job always runs rather than skipping, so there is
+always a completed run to relay.
 
 ```yaml
 name: Merge lane
@@ -207,8 +225,8 @@ name: Merge lane
 # CI completions ONLY. This is the one trigger that arrives while a pool host
 # is already warm — it just ran the CI that completed — so the lane pass rides
 # on it for free. Every other trigger lives in merge-lane-events.yml on a
-# GitHub-hosted runner: never add a schedule, a pull_request_target or a
-# pull_request_review here, because each would start a pool host by itself.
+# GitHub-hosted runner: never add a schedule, a pull_request_target, a review
+# or a review relay here, because each would start a pool host by itself.
 on:
   workflow_run:
     # Must match each workflow's `name:` exactly.
@@ -229,16 +247,10 @@ on:
 permissions:
   contents: read
 
-# Serialization is the point, not a concession: two lane runs read the same list
-# of open pull requests and could both act on it. The marker is what
-# `check-workflow-concurrency.sh` requires in exchange for a constant group key
-# — it accepts that a third request evicts the pending run, which costs nothing
-# here because the lane re-reads live state on the next trigger. The SAME group
-# as merge-lane-events.yml: groups are repository-wide, so the two files still
-# run one pass at a time between them.
-# concurrency-serialization: intentional — one merge decision at a time
+# Per run: joins nothing, evicts nothing. `check-workflow-concurrency.sh` wants
+# a top-level block on every workflow; the serialization is on the job below.
 concurrency:
-  group: merge-lane
+  group: merge-lane-ci-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -246,6 +258,17 @@ jobs:
     # Off until an operator confirms the App secrets exist — a dry run still
     # mints the token, so without this the job is red on every CI completion.
     if: vars.MERGE_LANE_ENABLED == 'true'
+    # Serialization is the point, not a concession: two lane runs read the same
+    # list of open pull requests and could both act on it. On the JOB, so a run
+    # whose `if:` skips it never joins the group and never evicts a real pending
+    # pass. The SAME group as merge-lane-events.yml: groups are repository-wide,
+    # so the two files still run one pass at a time between them. A third
+    # arrival evicts the pending one, which costs nothing because the lane
+    # re-reads live state on the next trigger.
+    # concurrency-serialization: intentional — one merge decision at a time
+    concurrency:
+      group: merge-lane
+      cancel-in-progress: false
     # `check-runner-policy.sh` RUNNER7 refuses to decide the runner scope and
     # timeouts of a workflow it cannot read, and this one is in another
     # repository. The marker records that a human read it — one job,
@@ -346,10 +369,10 @@ different way.
 name: Merge lane (events)
 
 # Everything that is not a CI completion, on a GitHub-hosted runner. A pool
-# label must NEVER appear in this file: `pull_request_target` and
-# `pull_request_review` reach it, and so does a timer — each would start a
-# self-hosted host just to answer "nothing to merge". CI completions are
-# merge-lane.yml's, on the pool host that is still warm from the CI itself.
+# label must NEVER appear in this file: `pull_request_target` reaches it, and
+# so do a review and a timer — each would start a self-hosted host just to
+# answer "nothing to merge". CI completions are merge-lane.yml's, on the pool
+# host that is still warm from the CI itself.
 on:
   # Leaving draft, and — under a `require-label` gate only — labelling, are
   # state changes no CI completion follows. See "A label applied after the
@@ -357,10 +380,13 @@ on:
   pull_request_target:
     types: [labeled, ready_for_review]
   # An approval, or an automated reviewer answering, can make a green pull
-  # request mergeable with no CI completion after it. This is also what ends
-  # the lane's `review-bots` grace without waiting for the backstop.
-  pull_request_review:
-    types: [submitted]
+  # request mergeable with no CI completion after it, and it is what ends the
+  # lane's `review-bots` grace without waiting for the backstop. Heard through
+  # the secretless relay, NEVER as `pull_request_review` here: that event runs
+  # the pull request's own copy of this file, with the merge App key.
+  workflow_run:
+    workflows: [Merge lane review relay]
+    types: [completed]
   # The backstop, not the mechanism: it recovers a dispatch GitHub dropped.
   # Once a day, never on a short timer — see "The schedule is a backstop".
   schedule:
@@ -370,21 +396,23 @@ on:
 permissions:
   contents: read
 
-# The SAME group as merge-lane.yml, on purpose: a concurrency group is
-# repository-wide, so one pass at a time still holds across both files.
-# concurrency-serialization: intentional — one merge decision at a time
+# Per run: joins nothing, evicts nothing. `check-workflow-concurrency.sh` wants
+# a top-level block on every workflow; the serialization is on the job below.
 concurrency:
-  group: merge-lane
+  group: merge-lane-events-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
   lane:
-    # Off until an operator confirms the App secrets exist. And a review on a
-    # FORK's pull request runs with no secrets at all, so the App token cannot
-    # be minted and the run would only go red: skip it. A same-repository head
-    # is the only review this file answers; a fork's pull request still reaches
-    # the lane through its CI completion.
-    if: vars.MERGE_LANE_ENABLED == 'true' && (github.event_name != 'pull_request_review' || github.event.pull_request.head.repo.full_name == github.repository)
+    # Off until an operator confirms the App secrets exist.
+    if: vars.MERGE_LANE_ENABLED == 'true'
+    # The SAME group as merge-lane.yml, on the job, on purpose: a concurrency
+    # group is repository-wide, so one pass at a time still holds across both
+    # files, and a run whose `if:` skips the job never evicts a real pass.
+    # concurrency-serialization: intentional — one merge decision at a time
+    concurrency:
+      group: merge-lane
+      cancel-in-progress: false
     # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml, #<issue>): read and recorded there
     uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@d8d1e6d8be794657066a8d32a0327b62172ea299 # v5.77.0
     permissions:
@@ -410,18 +438,56 @@ jobs:
       app-private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
 ```
 
+The third file is the review relay. Its `name:` must match the events file's
+`workflow_run: workflows:` entry exactly. Copy it verbatim: it names no pool,
+no customer and no secret, and anything added to it runs with whatever the pull
+request under review put there.
+
+```yaml
+name: Merge lane review relay
+
+# A submitted review wakes the merge lane through this file, never directly.
+# `pull_request_review` runs the workflow as defined at the PULL REQUEST's merge
+# ref, so this file holds nothing worth taking: no secrets, no checkout, no
+# token permissions, one step that does nothing. Its only output is its
+# COMPLETION, which merge-lane-events.yml hears through `workflow_run` — and
+# that always runs the DEFAULT BRANCH's definition. The job always runs (no
+# `if:`), so there is always a completed run to relay.
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+# One run per review, each in its own group: a relay that evicted another would
+# drop the wake-up it exists to carry.
+concurrency:
+  group: merge-lane-review-relay-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Relay the review to the merge lane
+        run: 'true'
+```
+
 > **Migrating an existing single-file caller.** Before #1380 the template was
 > one `merge-lane.yml` carrying every trigger on the pool label, with
 > `cron: '*/15 * * * *'` — which, against a fifteen-minute controller idle
 > grace, kept a pool host up around the clock on repositories with no open
 > work. To migrate: (1) in `merge-lane.yml`, delete the `schedule`,
 > `pull_request_target` and `workflow_dispatch` triggers so only
-> `workflow_run` remains; (2) add `merge-lane-events.yml` above, copying your
+> `workflow_run` remains, and move `concurrency: group: merge-lane` from the
+> workflow onto the `lane:` job, leaving a per-run group at the top; (2) add
+> `merge-lane-events.yml` and `merge-lane-review-relay.yml` above, copying your
 > `with:` values across and changing only `runs-on` to `ubuntu-latest`; (3) if
 > your CI workflow does not run on `push` to the base, add `push: branches:
-> [<base>]` to the events file so a merge still wakes the lane. Both files keep
-> the one `merge-lane` concurrency group. Land it as one pull request — a
-> window with only half of it on the base loses nothing, the lane just runs
+> [<base>]` to the events file so a merge still wakes the lane. Never add
+> `pull_request_review` to either lane file. Land it as one pull request — a
+> window with only part of it on the base loses nothing, the lane just runs
 > less often.
 
 > **The two markers in that example are not decoration, and admin merge will
@@ -719,9 +785,9 @@ this lane was built to remove.
 closes it, and it is the cheap fix rather than the thorough one on purpose: it
 dispatches once per label event, on a hosted runner, instead of on a timer, so
 the repository gets seconds of latency for about a billed minute. Tightening the
-cron instead buys the same latency at 96 runs a day. `pull_request_review:
-[submitted]` closes the same gap for an approval or a bot review arriving after
-the green — also a state change no CI completion follows.
+cron instead buys the same latency at 96 runs a day. The review relay closes
+the same gap for an approval or a bot review arriving after the green — also a
+state change no CI completion follows.
 
 Two things make `pull_request_target` safe here, and both must stay true:
 
@@ -740,11 +806,13 @@ fork guard. The trigger lives only in `merge-lane-events.yml`, which runs on
 satisfied by construction. If you move the trigger into the pool-label file,
 RUNNER4 will stop you, and it is right to.
 
-`pull_request_review` is the one trigger here a fork CAN fire — anyone may
-review — but a fork's review event runs with no secrets, so the App token could
-not be minted anyway. The events file's `if:` skips it unless the head is in
-the same repository; a fork's pull request still reaches the lane through its
-CI completion.
+`pull_request_review` is NOT safe the same way, which is why no lane file
+carries it. Unlike `pull_request_target`, it runs the workflow as defined at the
+pull request's merge ref, and anyone — a fork's author, a review bot on every
+pull request, Dependabot's branches included — can fire it. RUNNER4 counts it,
+and `pull_request_review_comment`, as fork-reachable for that reason. The lane
+hears reviews only through the secretless relay's completion; see "Why a
+review reaches the lane through a relay", above.
 
 ### Waiting for the automated reviewers
 

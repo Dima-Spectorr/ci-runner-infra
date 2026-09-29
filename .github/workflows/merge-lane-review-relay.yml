@@ -1,0 +1,40 @@
+name: Merge lane review relay
+
+# A SUBMITTED REVIEW WAKES THE LANE — THROUGH THIS FILE, NEVER DIRECTLY.
+#
+# An approval, or Copilot answering, can make a green pull request mergeable
+# with no CI completion after it, and it is what ends the lane's `review-bots`
+# grace without waiting for the sweep. But `pull_request_review` runs the
+# workflow as defined at the PULL REQUEST's merge ref: a lane caller listening
+# to it directly would run the pull request's own copy of the lane — its
+# `merge-lane.sh`, or a re-pointed `uses:` — holding the merge App key, every
+# time a bot reviews a branch. That includes a Dependabot branch, which a
+# same-repository guard lets through.
+#
+# So this file holds nothing worth taking: no secrets, no checkout, no token
+# permissions, one step that does nothing. Its only output is its COMPLETION,
+# and `merge-lane-self.yml` listens for that with `workflow_run` — which always
+# runs the DEFAULT BRANCH's definition, whatever this run was triggered from.
+#
+# The job always runs (no `if:`), so there is always a completed run to relay;
+# nothing here depends on how GitHub treats a run whose only job was skipped.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+# One run per review, each in its own group: a relay that evicted another would
+# drop the wake-up it exists to carry.
+concurrency:
+  group: merge-lane-review-relay-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Relay the review to the merge lane
+        run: 'true'

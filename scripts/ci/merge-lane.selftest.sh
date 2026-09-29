@@ -35,6 +35,7 @@ DRIVER="$ROOT/scripts/ci/merge-lane.sh"
 DECISION="$ROOT/scripts/ci/merge-lane-decision.sh"
 CI="$ROOT/.github/workflows/ci.yml"
 DOC="$ROOT/docs/merge-lane.md"
+RELAY="$ROOT/.github/workflows/merge-lane-review-relay.yml"
 
 PASS=0
 FAIL=0
@@ -44,7 +45,7 @@ bad() {
   printf 'FAIL: %s\n' "$1"
 }
 
-for f in "$CALLEE" "$CALLER" "$DRIVER" "$DECISION" "$CI" "$DOC"; do
+for f in "$CALLEE" "$CALLER" "$DRIVER" "$DECISION" "$CI" "$DOC" "$RELAY"; do
   [ -f "$f" ] || {
     printf 'FAIL: missing %s — every check below would be vacuous\n' "$f"
     exit 1
@@ -184,7 +185,7 @@ triggers_on_ci_completion() {
   local code
   code=$(code_of "$1")
   matches "$code" '^  workflow_run:' || return 1
-  matches "$code" '^    workflows: \[CI\]' || return 1
+  matches "$code" '^    workflows: \[CI(, [^]]+)?\]$' || return 1
   matches "$code" '^    types: \[completed\]'
 }
 
@@ -211,20 +212,6 @@ passes_the_app_credentials() {
   code=$(code_of "$1")
   matches "$code" '^      app-id: \$\{\{ secrets\.' || return 1
   matches "$code" '^      app-private-key: \$\{\{ secrets\.'
-}
-
-# A review is fired by anyone, a fork's author included, and a fork's review
-# event carries no secrets — so the token step can only go red. The `if:` must
-# answer same-repository heads only for that event, and leave every other event
-# alone.
-LANE_FORK_GUARD="(github.event_name != 'pull_request_review' || github.event.pull_request.head.repo.full_name == github.repository)"
-
-answers_reviews_from_this_repository_only() {
-  local code
-  code=$(code_of "$1")
-  matches "$code" '^  pull_request_review:$' || return 1
-  printf '%s\n' "$code" | grep -A1 -E '^  pull_request_review:$' | grep -cE '^    types: \[submitted\]$' >/dev/null || return 1
-  printf '%s\n' "$code" | grep -E "^    if: vars\.MERGE_LANE_ENABLED == 'true' && " | grep -cF -- "$LANE_FORK_GUARD" >/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -276,18 +263,6 @@ documented_events_caller_runs_hosted() {
   [ "${all:-0}" -gt 0 ] && [ "$all" = "$hosted" ]
 }
 
-documented_events_caller_answers_reviews_from_this_repository_only() {
-  local blk tmp rc
-  blk=$(doc_block "$1" "$EVENTS_CALLER_NAME")
-  [ -n "$blk" ] || return 1
-  tmp=$(mktemp)
-  printf '%s\n' "$blk" >"$tmp"
-  answers_reviews_from_this_repository_only "$tmp"
-  rc=$?
-  rm -f "$tmp"
-  return "$rc"
-}
-
 # The backstop is once a day on the hosted file, and no documented caller
 # carries a short timer — `*/15` against a fifteen-minute idle grace is what
 # kept five idle pools up around the clock.
@@ -300,23 +275,101 @@ documented_backstop_is_daily() {
   ! matches "$events"$'\n'"$pool" 'cron:.*\*/'
 }
 
-# Both files are one lane: the same repository-wide group, the markers the
-# consumer gates demand, and the operator's switch.
+RELAY_NAME='Merge lane review relay'
+
+# ---- Shared by this repository's own files and the documented template ----
+#
+# Each takes workflow TEXT, so one predicate answers for a file here and for a
+# fenced block of the doc. Comments are stripped inside, so the prose arguing
+# for a property can never be what satisfies it.
+
+# THE SERIALISATION LIVES ON THE JOB. A workflow-level group is joined by every
+# run, including one whose `if:` skips the job, and a third arrival evicts the
+# pending member — so a run that would do nothing could push out a real pass. A
+# top-level group may remain (a consumer gate demands one) only if it is per
+# run, where it joins nothing.
+serialised_at_the_job() { # <text>
+  local code top
+  code=$(printf '%s\n' "$1" | grep -vE '^[[:space:]]*#')
+  printf '%s\n' "$code" | grep -A2 -E '^    concurrency:$' | grep -cE '^      group: merge-lane$' >/dev/null || return 1
+  printf '%s\n' "$code" | grep -A2 -E '^    concurrency:$' | grep -cE '^      cancel-in-progress: false$' >/dev/null || return 1
+  top=$(printf '%s\n' "$code" | awk '/^concurrency:/ { g = 1; next } g && /^[^ ]/ { exit } g')
+  if [ -n "$top" ]; then
+    matches "$top" '^  group: .*\$\{\{ github\.run_id \}\}$' || return 1
+  fi
+  ! matches "$code" '^  group: merge-lane$'
+}
+
+# NO LANE FILE HEARS A REVIEW DIRECTLY. `pull_request_review` runs the workflow
+# as defined at the PULL REQUEST's merge ref — the pull request's own lane, or a
+# re-pointed `uses:`, holding the merge App key. A same-repository guard does
+# not close it: a Dependabot branch passes one.
+hears_no_review_directly() { # <text>
+  ! matches "$(triggers_of "$1")" '^  pull_request_review(_comment)?:$'
+}
+
+# …and hears it through the relay's completion instead, which `workflow_run`
+# always runs from the DEFAULT BRANCH's definition.
+hears_reviews_through_the_relay() { # <text>
+  local code
+  code=$(printf '%s\n' "$1" | grep -vE '^[[:space:]]*#')
+  matches "$(triggers_of "$1")" '^  workflow_run:$' || return 1
+  matches "$code" "^    workflows: \\[([^]]*, )?$RELAY_NAME(, [^]]*)?\\]\$"
+}
+
+# THE RELAY HOLDS NOTHING WORTH TAKING. It runs whatever the pull request under
+# review put in it, so: its one trigger, no token permissions, no secret, no
+# action (a checkout included), hosted, and a job that ALWAYS runs — a skipped
+# job would leave nothing certain to relay.
+relay_holds_nothing() { # <text>
+  local code all hosted
+  code=$(printf '%s\n' "$1" | grep -vE '^[[:space:]]*#')
+  matches "$code" "^name: $RELAY_NAME\$" || return 1
+  [ "$(triggers_of "$1")" = "  pull_request_review:" ] || return 1
+  matches "$code" '^permissions: \{\}$' || return 1
+  ! matches "$code" 'secrets\.' || return 1
+  ! matches "$code" '^ +(- )?uses:' || return 1
+  ! matches "$code" '^    if:' || return 1
+  all=$(printf '%s\n' "$code" | grep -cE '^ *runs-on:')
+  hosted=$(printf '%s\n' "$code" | grep -cE '^ *runs-on: ubuntu-latest$')
+  [ "${all:-0}" -gt 0 ] && [ "$all" = "$hosted" ] || return 1
+  matches "$code" "^        run: 'true'\$"
+}
+
+self_caller_serialises_at_the_job() { serialised_at_the_job "$(cat "$1")"; }
+self_caller_hears_no_review_directly() { hears_no_review_directly "$(cat "$1")"; }
+self_caller_hears_reviews_through_the_relay() { hears_reviews_through_the_relay "$(cat "$1")"; }
+self_relay_holds_nothing() { relay_holds_nothing "$(cat "$1")"; }
+
+# Both documented lane files are one lane: the job-level group, no review
+# heard directly, the exact operator switch, and the markers the consumer
+# gates demand.
 documented_callers_are_one_lane() {
   local name blk code
   for name in "$POOL_CALLER_NAME" "$EVENTS_CALLER_NAME"; do
     blk=$(doc_block "$1" "$name")
     [ -n "$blk" ] || return 1
     code=$(printf '%s\n' "$blk" | grep -vE '^[[:space:]]*#')
-    matches "$code" '^  group: merge-lane$' || return 1
-    matches "$code" '^  cancel-in-progress: false$' || return 1
-    matches "$code" "^    if: vars\.MERGE_LANE_ENABLED == 'true'" || return 1
-    matches "$blk" '^# concurrency-serialization: intentional[[:space:]]*[—-]' || return 1
+    serialised_at_the_job "$blk" || return 1
+    hears_no_review_directly "$blk" || return 1
+    matches "$code" "^    if: vars\.MERGE_LANE_ENABLED == 'true'\$" || return 1
+    matches "$blk" '^ *# concurrency-serialization: intentional[[:space:]]*[—-]' || return 1
     matches "$blk" '^ *# remote-reusable-allowed\(Dima-Spectorr/ci-runner-infra/\.github/workflows/merge-lane\.yml, #' || return 1
     matches "$code" 'merge-lane\.yml@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+$' || return 1
   done
 }
 
+documented_events_caller_hears_reviews_through_the_relay() {
+  local blk
+  blk=$(doc_block "$1" "$EVENTS_CALLER_NAME")
+  [ -n "$blk" ] && hears_reviews_through_the_relay "$blk"
+}
+
+documented_relay_holds_nothing() {
+  local blk
+  blk=$(doc_block "$1" "$RELAY_NAME")
+  [ -n "$blk" ] && relay_holds_nothing "$blk"
+}
 # ---------------------------------------------------------------------------
 # The driver: what it does with a verdict
 # ---------------------------------------------------------------------------
@@ -361,7 +414,7 @@ reads_both_check_surfaces() {
 waits_for_the_app_to_exist() {
   local code
   code=$(code_of "$1")
-  matches "$code" "^ *if: vars.MERGE_LANE_ENABLED == 'true'( && .*)?$"
+  matches "$code" "^ *if: vars.MERGE_LANE_ENABLED == 'true'$"
 }
 
 # A reusable workflow's `actions/checkout` clones the CALLER. Without an
@@ -1002,7 +1055,7 @@ documented_example_carries_one_pin() {
 documented_example_survives_the_consumer_gates() {
   local doc="$1"
   grep -qE '^concurrency:' "$doc" || return 1
-  grep -qE '^# concurrency-serialization: intentional[[:space:]]*[—-]' "$doc" || return 1
+  grep -qE '^ *# concurrency-serialization: intentional[[:space:]]*[—-]' "$doc" || return 1
   grep -qE '^ *# remote-reusable-allowed\(Dima-Spectorr/ci-runner-infra/\.github/workflows/merge-lane\.yml, #' "$doc"
 }
 
@@ -1586,10 +1639,14 @@ check has_a_backstop_sweep "$CALLER" "there is no sweep, so a pull request needi
 check arms_deliberately "$CALLER" "the lane is not armed by an explicit variable, so it cannot be landed in dry run"
 check passes_the_app_credentials "$CALLER" "the caller does not pass App credentials, so the lane cannot authenticate"
 check waits_for_the_app_to_exist "$CALLER" "the caller runs before an operator confirms the App exists, so it goes red on every CI completion and that red stops meaning anything"
-check answers_reviews_from_this_repository_only "$CALLER" "the caller does not wake on a submitted review, or answers a fork's review, whose run has no secrets and can only go red"
+check self_caller_hears_no_review_directly "$CALLER" "the caller listens to pull_request_review itself, so a bot review runs the pull request's own copy of the lane holding the merge App key"
+check self_caller_hears_reviews_through_the_relay "$CALLER" "the caller does not hear the review relay, so an approval or a bot review after the green waits for the sweep"
+check self_caller_serialises_at_the_job "$CALLER" "the caller does not serialise on the lane job, or keeps a constant workflow-level group, so a run whose job skips can evict a real pending pass"
+check self_relay_holds_nothing "$RELAY" "the review relay holds a secret, a permission, an action or a pool label, or can skip its only job — and it runs whatever the pull request under review put in it"
 check documented_pool_caller_listens_to_ci_only "$DOC" "the documented pool-label caller answers something other than a CI completion, so a timer, a label or a review starts a self-hosted host on its own"
 check documented_events_caller_runs_hosted "$DOC" "the documented events caller runs on something other than the hosted image, so a label, a review or the backstop starts a self-hosted host"
-check documented_events_caller_answers_reviews_from_this_repository_only "$DOC" "the documented events caller does not wake on a submitted review, or answers a fork's review with no secrets to mint the token"
+check documented_events_caller_hears_reviews_through_the_relay "$DOC" "the documented events caller does not hear the review relay, so a consumer's approvals and bot reviews wait for the daily backstop"
+check documented_relay_holds_nothing "$DOC" "the documented review relay holds a secret, a permission, an action or a pool label, or can skip its only job"
 check documented_backstop_is_daily "$DOC" "a documented caller carries a short timer again, which against the idle grace keeps a pool host up around the clock"
 check documented_callers_are_one_lane "$DOC" "the two documented callers do not share the merge-lane group, the markers or the operator's switch, so they can run two passes at once or fail the consumer gates"
 
@@ -1709,20 +1766,46 @@ mutate "the CLI install step is dropped" "$CALLEE" \
   's@^        run: bash scripts/ci/ensure-gh\.sh$@        run: true@' guarantees_the_cli_it_runs_on
 
 mutate "the caller stops listening to CI" "$CALLER" \
-  's|^    workflows: \[CI\]|    workflows: [Something Else]|' triggers_on_ci_completion
+  's|^    workflows: \[CI|    workflows: [Something Else|' triggers_on_ci_completion
 mutate "the backstop sweep is removed" "$CALLER" \
   's|^  schedule:|  x-schedule:|' has_a_backstop_sweep
 mutate "the lane is armed unconditionally" "$CALLER" \
   's@dry-run: .*MERGE_LANE_ARMED.*@dry-run: false@' arms_deliberately
 mutate "the caller runs before the App is provisioned" "$CALLER" \
   "s@^    if: vars.MERGE_LANE_ENABLED == 'true'@    if: true@" waits_for_the_app_to_exist
-mutate "the caller stops waking on a review" "$CALLER" \
-  's|^  pull_request_review:$|  x-pull_request_review:|' answers_reviews_from_this_repository_only
-mutate "the caller wakes on every review action, not a submitted one" "$CALLER" \
-  's|^    types: \[submitted\]$|    types: [submitted, edited, dismissed]|' answers_reviews_from_this_repository_only
-mutate "the caller answers a fork's review" "$CALLER" \
-  "s@ \&\& (github.event_name != 'pull_request_review' || github.event.pull_request.head.repo.full_name == github.repository)@@" \
-  answers_reviews_from_this_repository_only
+mutate "the operator's switch is widened with an || true" "$CALLER" \
+  "s@^\(    if: vars.MERGE_LANE_ENABLED == 'true'\)\$@\1 \&\& github.actor != 'x' || true@" waits_for_the_app_to_exist
+mutate "the caller listens to pull_request_review directly" "$CALLER" \
+  's|^  workflow_dispatch:$|  pull_request_review:\n    types: [submitted]\n  workflow_dispatch:|' self_caller_hears_no_review_directly
+mutate "the caller listens to pull_request_review_comment directly" "$CALLER" \
+  's|^  workflow_dispatch:$|  pull_request_review_comment:\n  workflow_dispatch:|' self_caller_hears_no_review_directly
+mutate "the caller stops hearing the relay" "$CALLER" \
+  's|^    workflows: \[CI, Merge lane review relay\]$|    workflows: [CI]|' self_caller_hears_reviews_through_the_relay
+mutate "the lane job loses its concurrency group" "$CALLER" \
+  's|^    concurrency:$|    x-concurrency:|' self_caller_serialises_at_the_job
+mutate "the lane job's group stops being the lane's" "$CALLER" \
+  's|^      group: merge-lane$|      group: merge-lane-self|' self_caller_serialises_at_the_job
+mutate "the lane job becomes cancellable" "$CALLER" \
+  's|^      cancel-in-progress: false$|      cancel-in-progress: true|' self_caller_serialises_at_the_job
+mutate "a constant workflow-level group comes back beside the job's" "$CALLER" \
+  's|^permissions:$|concurrency:\n  group: merge-lane-self\npermissions:|' self_caller_serialises_at_the_job
+
+mutate "the relay is renamed away from what the lane listens for" "$RELAY" \
+  's|^name: Merge lane review relay$|name: Review relay|' self_relay_holds_nothing
+mutate "the relay gains a second trigger" "$RELAY" \
+  's|^  pull_request_review:$|  pull_request_target:\n  pull_request_review:|' self_relay_holds_nothing
+mutate "the relay gains token permissions" "$RELAY" \
+  's|^permissions: {}$|permissions:\n  contents: read|' self_relay_holds_nothing
+mutate "the relay reads a secret" "$RELAY" \
+  "s|^        run: 'true'\$|        run: 'true'\n        env: {K: \"\${{ secrets.MERGE_APP_ID }}\"}|" self_relay_holds_nothing
+mutate "the relay checks out the pull request" "$RELAY" \
+  's|^    steps:$|    steps:\n      - uses: actions/checkout@v4|' self_relay_holds_nothing
+mutate "the relay's job can skip" "$RELAY" \
+  's|^    runs-on: ubuntu-latest$|    if: github.event.review.state == '"'"'approved'"'"'\n    runs-on: ubuntu-latest|' self_relay_holds_nothing
+mutate "the relay moves onto a pool" "$RELAY" \
+  's|^    runs-on: ubuntu-latest$|    runs-on: your-linux-pool-label|' self_relay_holds_nothing
+mutate "the relay's step stops running" "$RELAY" \
+  "s|^        run: 'true'\$|        shell: bash|" self_relay_holds_nothing
 
 mutate "the documented pool caller gains a timer" "$DOC" \
   "s@^    workflows: \[CI, main-health\]\$@    workflows: [CI, main-health]\n  schedule:\n    - cron: '0 * * * *'@" \
@@ -1736,23 +1819,38 @@ mutate "the documented events caller moves onto the pool label" "$DOC" \
 mutate "the documented events caller loses every runs-on" "$DOC" \
   '/^name: Merge lane (events)$/,/^```$/ s@^      runs-on: ubuntu-latest$@@' \
   documented_events_caller_runs_hosted
-mutate "the documented events caller stops waking on a review" "$DOC" \
-  's|^  pull_request_review:$|  x-pull_request_review:|' documented_events_caller_answers_reviews_from_this_repository_only
-mutate "the documented events caller answers a fork's review" "$DOC" \
-  "s@ \&\& (github.event_name != 'pull_request_review' || github.event.pull_request.head.repo.full_name == github.repository)@@" \
-  documented_events_caller_answers_reviews_from_this_repository_only
 mutate "the documented backstop goes back to every fifteen minutes" "$DOC" \
   "s@^    - cron: '17 5 \* \* \*'\$@    - cron: '*/15 * * * *'@" documented_backstop_is_daily
 mutate "the documented backstop is dropped" "$DOC" \
   "s@^    - cron: '17 5 \* \* \*'\$@@" documented_backstop_is_daily
 mutate "the documented events caller takes a group of its own" "$DOC" \
-  '/^name: Merge lane (events)$/,/^```$/ s@^  group: merge-lane$@  group: merge-lane-events@' documented_callers_are_one_lane
+  '/^name: Merge lane (events)$/,/^```$/ s@^      group: merge-lane$@      group: merge-lane-events@' documented_callers_are_one_lane
 mutate "the documented pool caller takes a group of its own" "$DOC" \
-  '/^name: Merge lane$/,/^```$/ s@^  group: merge-lane$@  group: merge-lane-ci@' documented_callers_are_one_lane
-mutate "the documented events caller loses the operator's switch" "$DOC" \
-  "/^name: Merge lane (events)\$/,/^\`\`\`\$/ s@^    if: vars.MERGE_LANE_ENABLED == 'true' \&\& @    if: @" documented_callers_are_one_lane
+  '/^name: Merge lane$/,/^```$/ s@^      group: merge-lane$@      group: merge-lane-ci@' documented_callers_are_one_lane
+mutate "the documented events caller serialises at the workflow again" "$DOC" \
+  '/^name: Merge lane (events)$/,/^```$/ s@^  group: merge-lane-events-.*$@  group: merge-lane@' documented_callers_are_one_lane
+mutate "the documented pool caller's workflow group stops being per run" "$DOC" \
+  '/^name: Merge lane$/,/^```$/ s@^  group: merge-lane-ci-.*$@  group: merge-lane-ci@' documented_callers_are_one_lane
+mutate "the documented events caller hears pull_request_review directly" "$DOC" \
+  '/^name: Merge lane (events)$/,/^```$/ s@^  workflow_dispatch:$@  pull_request_review:\n    types: [submitted]\n  workflow_dispatch:@' documented_callers_are_one_lane
+mutate "the documented pool caller hears pull_request_review directly" "$DOC" \
+  '/^name: Merge lane$/,/^```$/ s@^permissions:$@  pull_request_review:\npermissions:@' documented_callers_are_one_lane
+mutate "the documented events caller's switch is widened with an || true" "$DOC" \
+  "/^name: Merge lane (events)\$/,/^\`\`\`\$/ s@^\(    if: vars.MERGE_LANE_ENABLED == 'true'\)\$@\1 || true@" documented_callers_are_one_lane
+mutate "the documented pool caller loses its serialization marker" "$DOC" \
+  '/^name: Merge lane$/,/^```$/ s@^    # concurrency-serialization: intentional@    # serialised@' documented_callers_are_one_lane
 mutate "the documented events caller loses its RUNNER7 marker" "$DOC" \
   '/^name: Merge lane (events)$/,/^```$/ s@^    # remote-reusable-allowed(@    # reusable(@' documented_callers_are_one_lane
+mutate "the documented events caller stops hearing the relay" "$DOC" \
+  's@^    workflows: \[Merge lane review relay\]$@    workflows: [Review relay]@' documented_events_caller_hears_reviews_through_the_relay
+mutate "the documented relay is renamed away from its listener" "$DOC" \
+  's@^name: Merge lane review relay$@name: Review relay@' documented_relay_holds_nothing
+mutate "the documented relay gains token permissions" "$DOC" \
+  '/^name: Merge lane review relay$/,/^```$/ s@^permissions: {}$@permissions: write-all@' documented_relay_holds_nothing
+mutate "the documented relay's job can skip" "$DOC" \
+  '/^name: Merge lane review relay$/,/^```$/ s@^    runs-on: ubuntu-latest$@    if: false\n    runs-on: ubuntu-latest@' documented_relay_holds_nothing
+mutate "the documented relay checks out the pull request" "$DOC" \
+  '/^name: Merge lane review relay$/,/^```$/ s|^    steps:$|    steps:\n      - uses: actions/checkout@v4|' documented_relay_holds_nothing
 mutate "the private key stops being passed" "$CALLER" \
   's@^      app-private-key: .*@      app-private-key: literal-key@' passes_the_app_credentials
 
