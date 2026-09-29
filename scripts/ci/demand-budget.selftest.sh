@@ -154,10 +154,10 @@ check "no policy hard-codes the old 1200s idle threshold" yes \
 # genuinely stuck host on another.
 check "the idle policy pairs idle time with the pin holds" yes \
   "$(if sed -n '/pool not scaling to zero/,/^EOF/p' "$ALERTS" \
-      | grep -q 'ci_pin_holds_honoured'; then echo yes; else echo no; fi)"
+      | grep 'ci_pin_holds_honoured' >/dev/null; then echo yes; else echo no; fi)"
 check "the idle policy matches the two conditions per resource" yes \
   "$(if sed -n '/pool not scaling to zero/,/^EOF/p' "$ALERTS" \
-      | grep -q '"combiner": "AND_WITH_MATCHING_RESOURCE"'; then echo yes; else echo no; fi)"
+      | grep '"combiner": "AND_WITH_MATCHING_RESOURCE"' >/dev/null; then echo yes; else echo no; fi)"
 # A policy naming a descriptor this script never declares is rejected 404 on a
 # project where no host has published that series yet, and the run defers it.
 check "the paired metric is declared as a descriptor" yes \
@@ -169,7 +169,7 @@ check "the paired metric is declared as a descriptor" yes \
 # reachable from the file. Both policies renamed in this change need a row.
 check "the sync loop can find a policy under its former name" yes \
   "$(if sed -n '/^for key in heartbeat/,/^done/p' "$ALERTS" \
-      | grep -q 'former='; then echo yes; else echo no; fi)"
+      | grep 'former=' >/dev/null; then echo yes; else echo no; fi)"
 for old in "CI runners / queue starved (job waiting 10m)" \
            "CI runners / pool not scaling to zero (idle host 20m)"; do
   check "the former name is still looked up: ${old##*/ }" yes \
@@ -261,19 +261,19 @@ check "the rate-limit ceiling is enforced"          32 "$(clamp_fetch_concurrenc
 check "the fan-out uses the fork-safe fetch, not gh_api" yes \
   "$(found "$CTRL" 'gh_api_fetch "$tok" "repos/$REPO_FULL/actions/runs/$id/jobs?per_page=100" \')"
 check "the fork-safe fetch never writes the shared body path" yes \
-  "$(if sed -n '/^gh_api_fetch()/,/^}/p' "$CTRL" | grep -q 'STATE_DIR/api\.'; then echo no; else echo yes; fi)"
+  "$(if sed -n '/^gh_api_fetch()/,/^}/p' "$CTRL" | grep 'STATE_DIR/api\.' >/dev/null; then echo no; else echo yes; fi)"
 # A partially written body from a killed curl read as a job list is a silently
 # short demand count, so the payload is renamed into place only on success.
 # shellcheck disable=SC2016
 check "the fetch renames into place rather than writing in place" yes \
-  "$(if sed -n '/^gh_api_fetch()/,/^}/p' "$CTRL" | grep -q 'mv -f "\$dest.part" "\$dest"'; then echo yes; else echo no; fi)"
+  "$(if sed -n '/^gh_api_fetch()/,/^}/p' "$CTRL" | grep 'mv -f "\$dest.part" "\$dest"' >/dev/null; then echo yes; else echo no; fi)"
 
 # gh_token caches the installation token in globals, and a global set inside a
 # background subshell dies with it. A fan-out that called it would read the App
 # private key out of Secret Manager and mint a token once per branch, per tick,
 # for ever.
 check "the fork-safe fetch takes the token as an argument" yes \
-  "$(if sed -n '/^gh_api_fetch()/,/^}/p' "$CTRL" | grep -q 'gh_token'; then echo no; else echo yes; fi)"
+  "$(if sed -n '/^gh_api_fetch()/,/^}/p' "$CTRL" | grep 'gh_token' >/dev/null; then echo no; else echo yes; fi)"
 # shellcheck disable=SC2016
 check "the token is resolved once, in the parent" yes \
   "$(found "$CTRL" 'tok=$(gh_token) || { rm -rf "$jobs_dir"; return 0; }')"
@@ -281,7 +281,7 @@ check "the token is resolved once, in the parent" yes \
 # A bare `wait` blocks on every background job this process owns, including the
 # liveness responder, so each pid is waited on by name.
 check "the sweep waits on named pids, never bare" yes \
-  "$(if sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -qE '^\s*wait\s*$'; then echo no; else echo yes; fi)"
+  "$(if sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -E '^\s*wait\s*$' >/dev/null; then echo no; else echo yes; fi)"
 # shellcheck disable=SC2016
 check "every batch is drained before the next starts" yes \
   "$(found "$CTRL" 'for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done')"
