@@ -50,11 +50,20 @@ mint_violations() {
           function flush() {
             if (fn != "" && mint) {
               if (!scoped) print file ": " fn ": mint body names no repositories + permissions"
-              if (body !~ /-d "\$body"/)  print file ": " fn ": mint sends no body"
-              if (fn != "gh_actions_token" && body ~ /"?actions"?[[:space:]]*:[[:space:]]*"write"/) \
-                print file ": " fn ": mint requests actions write"
+              # One body per mint: a second, body-less access_tokens curl (an
+              # "unscoped fallback") is exactly what this must refuse.
+              if (sends != mint) print file ": " fn ": " mint " mint(s) but " sends " scoped body flag(s)"
+              if (fn != "gh_actions_token" && aw) print file ": " fn ": mint requests actions write"
             }
-            fn = ""; body = ""; mint = 0; scoped = 0
+            fn = ""; body = ""; mint = 0; scoped = 0; sends = 0; aw = 0
+          }
+          # actions write in ANY form: a JSON literal, a key/value in a message
+          # or jq program, a permission whose value is a variable, or a jq
+          # --arg / --argjson carrying the word write.
+          function actions_write(l) {
+            return l ~ /actions(\\?")?[[:space:]]*[:=][[:space:]]*(\\?")?write/ \
+                || l ~ /actions(\\?")?[[:space:]]*:[[:space:]]*(\\?")?\$/ \
+                || l ~ /--arg(json)?[[:space:]]+[A-Za-z_]+[[:space:]]+['"'"'"]?"?write/
           }
           /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/ { flush(); fn = $1; sub(/\(\).*/, "", fn) }
           # Comments are not code: a comment naming a permission scopes nothing.
@@ -62,7 +71,9 @@ mint_violations() {
           # ONE line carrying both keys is the body being built; the words
           # scattered across a log message are not.
           fn != "" && !/^[[:space:]]*#/ && /repositories/ && /permissions/ { scoped = 1 }
-          fn != "" && /access_tokens/ && !/^[[:space:]]*#/ { mint = 1 }
+          fn != "" && /access_tokens/ && !/^[[:space:]]*#/ { mint++ }
+          fn != "" && /-d "\$body"/ && !/^[[:space:]]*#/ { sends++ }
+          fn != "" && !/^[[:space:]]*#/ && actions_write($0) { aw = 1 }
           fn == "" && /access_tokens/ && !/^[[:space:]]*#/ { print file ": mint outside a function" }
           /^}/ { flush() }
           END { flush() }
@@ -104,6 +115,20 @@ mutant "host asks actions write"  "$HOST" 's/"administration":"write"/"administr
 mutant "controller asks actions write" "$CTRL" 's/"checks":"read"/"checks":"read","actions":"write"/'
 mutant "controller body dropped"  "$CTRL" '/-d "\$body"/d'
 mutant "controller permissions dropped" "$CTRL" 's/permissions: \$p/scope: $p/'
+mutant "controller body-less fallback mint" "$CTRL" \
+  '/^    msg=\$(printf/i\    resp=$(curl -sS -X POST "https://api.github.com/app/installations/$INSTALL_ID/access_tokens")'
+mutant "host body-less fallback mint" "$HOST" \
+  '/^  code=\${resp##/a\  [ "$code" = 201 ] || resp=$(curl -sS -X POST "https://api.github.com/app/installations/$INSTALL_ID/access_tokens")'
+mutant "controller actions write via --arg" "$CTRL" \
+  's/--argjson p "\$perms" /--argjson p "$perms" --arg lvl write /'
+mutant "controller actions from a variable" "$CTRL" \
+  's/core) perms=.*/core) perms="{\\"actions\\":$lvl}" ;;/'
+
+# #1413's dedicated mint is the ONE place actions: write is allowed, and it
+# must stay exactly that: one repository, actions write, nothing else.
+check "gh_actions_token is the only actions-write mint, and exactly that" \
+  "body=\$(jq -cn --arg r \"\$REPO\" '{repositories: [\$r], permissions: {actions: \"write\"}}')" \
+  "$(sed -n '/^gh_actions_token() {/,/^}/p' "$CTRL" | grep 'body=\$(jq' | sed 's/^ *//')"
 
 # A mint in a PowerShell script is reported, not waved through.
 printf 'Invoke-RestMethod "https://api.github.com/app/installations/1/access_tokens"\n' >"$WORK/mint.ps1"
@@ -153,6 +178,7 @@ calls() { tr -d ' ' <"$WORK/run/calls" | paste -sd '|' -; }
 
 FULL='{"repositories":["svc-repo"],"permissions":{"actions":"read","administration":"write","checks":"read","pull_requests":"read"}}'
 CORE='{"repositories":["svc-repo"],"permissions":{"actions":"read","administration":"write"}}'
+ADMIN='{"repositories":["svc-repo"],"permissions":{"administration":"write"}}'
 HOSTB='{"repositories":["svc-repo"],"permissions":{"administration":"write"}}'
 
 # Controller, granted everything: one mint, the full scoped set.
@@ -167,15 +193,43 @@ check "controller: 422 retries NARROWER, never unscoped" "$FULL|$CORE" "$(calls)
 check "controller: narrowing is a WARNING" "WARNING gh-token-scope-narrowed" "$(cat "$WORK/run/events")"
 check "controller: narrowing is remembered" "yes" "$([ -s "$WORK/run/state/gh-token-narrowed" ] && echo yes || echo no)"
 
-# Controller, core pair refused: fails loud, no third and no unscoped call.
-r=$(run_mint "$CTRL" 422)
-check "controller: core 422 is a refused mint" "rc=1 out=" "$r"
-check "controller: core 422 never widens" "$FULL|$CORE" "$(calls)"
-check "controller: core 422 is an ERROR" "WARNING gh-token-scope-narrowed|ERROR gh-token-scope-refused" "$(paste -sd '|' - <"$WORK/run/events")"
+# Controller, Actions: read missing (or repo not selected): third tier,
+# administration:write alone, so drain/cordon/orphan/registration survive.
+r=$(run_mint "$CTRL" 422 422 201)
+check "controller: core 422 narrows to admin and succeeds" "rc=0 out=tok-3" "$r"
+check "controller: tiers only ever narrow" "$FULL|$CORE|$ADMIN" "$(calls)"
+check "controller: each narrowing is a WARNING" \
+  "WARNING gh-token-scope-narrowed|WARNING gh-token-scope-narrowed" "$(paste -sd '|' - <"$WORK/run/events")"
+check "controller: admin tier is remembered" "admin" "$(cut -d' ' -f1 <"$WORK/run/state/gh-token-narrowed")"
 
-# Controller, a narrowing recorded this hour: straight to the core pair.
-r=$(T_PRE='date +%s >"$STATE_DIR/gh-token-narrowed"' run_mint "$CTRL" 201)
-check "controller: remembered narrowing mints core once" "rc=0 out=tok-1 $CORE" "$r $(calls)"
+# Controller, even administration:write refused: fails loud, no fourth and no
+# unscoped call.
+r=$(run_mint "$CTRL" 422)
+check "controller: admin 422 is a refused mint" "rc=1 out=" "$r"
+check "controller: admin 422 never widens" "$FULL|$CORE|$ADMIN" "$(calls)"
+check "controller: admin 422 is an ERROR" \
+  "WARNING gh-token-scope-narrowed|WARNING gh-token-scope-narrowed|ERROR gh-token-scope-refused" \
+  "$(paste -sd '|' - <"$WORK/run/events")"
+
+# Controller, a narrowing recorded this hour: straight to that tier.
+r=$(T_PRE='printf "core %s" "$(date +%s)" >"$STATE_DIR/gh-token-narrowed"' run_mint "$CTRL" 201)
+check "controller: remembered core narrowing mints core once" "rc=0 out=tok-1 $CORE" "$r $(calls)"
+r=$(T_PRE='printf "admin %s" "$(date +%s)" >"$STATE_DIR/gh-token-narrowed"' run_mint "$CTRL" 201)
+check "controller: remembered admin narrowing mints admin once" "rc=0 out=tok-1 $ADMIN" "$r $(calls)"
+r=$(T_PRE='printf "admin %s" "$(( $(date +%s) - 7200 ))" >"$STATE_DIR/gh-token-narrowed"' run_mint "$CTRL" 201)
+check "controller: an expired narrowing retries the full set" "rc=0 out=tok-1 $FULL" "$r $(calls)"
+
+# Behavioural mutant: a third tier that still asks for actions:read is not a
+# third tier, and the tier test must see it.
+sed "s/\*) perms='{\"administration\":\"write\"}' ;;/*) perms='{\"actions\":\"read\",\"administration\":\"write\"}' ;;/" \
+  "$CTRL" >"$WORK/ctrl-mutant.sh"
+if cmp -s "$WORK/ctrl-mutant.sh" "$CTRL"; then
+  check "mutant third tier keeps actions:read applies" "changed" "unchanged"
+else
+  run_mint "$WORK/ctrl-mutant.sh" 422 422 201 >/dev/null
+  check "mutant third tier keeps actions:read is caught" "caught" \
+    "$([ "$(calls)" != "$FULL|$CORE|$ADMIN" ] && echo caught || echo missed)"
+fi
 
 # Controller, a transient failure: no retry at all.
 r=$(run_mint "$CTRL" 502)

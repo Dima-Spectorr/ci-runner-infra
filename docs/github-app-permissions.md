@@ -145,6 +145,7 @@ Terraform `github_repo` sets) and exactly the permissions its call path uses
 | host registration | `host-startup.sh` `gh_token`, at boot | `[<pool repo>]` | `administration: write` | `POST .../actions/runners/registration-token` — nothing else |
 | controller general | `controller-startup.sh` `gh_token` | `[<pool repo>]` | `actions: read`, `administration: write`, `checks: read`, `pull_requests: read` | runs, run jobs, runner list + `DELETE`, registration-token, `pulls`, `check-runs` |
 | controller general, narrowed | same, after a 422 on the set above | `[<pool repo>]` | `actions: read`, `administration: write` | the same, minus the parked sweep (which reports `DENIED`) |
+| controller general, admin only | same, after a 422 on the pair above | `[<pool repo>]` | `administration: write` | runner list + `DELETE` (drain, cordon, orphan reap), registration-token; demand is blind |
 | controller actions write | #1413's `gh_actions_token` | `[<pool repo>]` | `actions: write` | `POST .../runs/{id}/cancel`, `.../rerun` |
 
 The Windows pool mints nothing on the host: the controller writes the
@@ -159,7 +160,8 @@ a scope it would carry everything the App holds on every repository of the
 installation — including `Actions: write` once that is granted.
 
 **A refused scoped mint never widens.** GitHub refuses (HTTP 422) a mint that
-asks for a permission the installation does not grant, and returns no token.
+asks for a permission the installation does not grant, or for a repository the
+installation does not select, and returns no token.
 
 * The **host** logs `installation token mint (...) refused: HTTP 422` and the
   boot fails: without `Administration: write` it could not register anyway.
@@ -168,8 +170,11 @@ asks for a permission the installation does not grant, and returns no token.
   core pair only, sends a WARNING `gh-token-scope-narrowed` event naming the two
   permissions, and remembers that for an hour so a degraded installation costs
   one mint per call. The parked sweep then reports `DENIED`, as it did before
-  scoping. A 422 on the core pair is an ERROR `gh-token-scope-refused` and a
-  blind tick. **No path sends an unscoped request.**
+  scoping. A 422 on the core pair narrows once more, to `administration: write`
+  alone (a second WARNING, `tier=admin`): demand goes blind, but draining,
+  cordoning, orphan reaping and Windows registration keep working as they did
+  with the unscoped token. A 422 even there is an ERROR `gh-token-scope-refused`
+  and a blind tick. **No path sends an unscoped request.**
 
 Adding a call to either script means adding its permission to that mint's
 body and to this table; `scripts/ci/app-token-scope.selftest.sh` fails any mint
