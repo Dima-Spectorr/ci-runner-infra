@@ -725,6 +725,29 @@ has_slot_quiesce() { # <file>
   #    container processes under them. The daemon has to outlive the reset: the
   #    image-tag audit still talks to it and the next job needs its socket;
   matches "$code" 'user@\\\$1\\\.service' || return 1
+  #    but ONLY the manager and its bus, not the whole user@ tree (#1395): a
+  #    job's \`systemd-run --user\` unit lives in that tree, and sparing all of
+  #    it let the unit run on into the next job. And the daemon anchored under
+  #    system.slice, so a job's own user unit of that name is not spared.
+  local spare
+  spare=$(printf '%s\n' "$code" | grep -cF 'user@\$1\.service/(init\.scope|session\.slice/dbus\.service)\$|^0::/system\.slice/(.*/)?ci-dockerd@\${5:-%}\.service(/|\$)"')
+  [ "${spare:-0}" -eq 1 ] || return 1
+  #    Containers by DESCENT from the daemon's processes, not by a scope name a
+  #    job can choose.
+  matches "$code" 'case "\\\$dk" in \*" \\\$p "\*\) spared=1; break ;; esac' || return 1
+  matches "$code" 'ci-dockerd@\\\$\{5:-%\}\.service" 2>/dev/null\) \|\| cg=""' || return 1
+  #    And the job's own units are STOPPED before the kill loop -- services,
+  #    sockets, timers and paths, sparing only the user bus -- and a unit that
+  #    will not stop fails the slot closed.
+  local stop scan
+  stop=$(printf '%s\n' "$code" | grep -n 'stop_user_units "\\\$uid" || units_rc=1' | head -1 | cut -d: -f1)
+  scan=$(printf '%s\n' "$code" | grep -n 'targets=\\\$(slot_stragglers' | head -1 | cut -d: -f1)
+  [ -n "$stop" ] && [ -n "$scan" ] && [ "$stop" -lt "$scan" ] || return 1
+  matches "$code" '--type=service,socket,timer,path' || return 1
+  matches "$code" 'systemctl --user -M "\\\$u@" stop -- \\\$names' || return 1
+  matches "$code" '\$1 != "dbus.service" && \\\$1 != "dbus.socket"' || return 1
+  matches "$code" 'would not stop: .* -- refusing to call this slot clean' || return 1
+  counts "$code" '\|\| return "\\\$units_rc"' 3 || return 1
   #    and the agent's own tree when the caller is NOT the agent. The idle sweep
   #    and the sweeper's teardown are root timers: without this they would kill
   #    the listener of every slot they touched.
@@ -2013,6 +2036,16 @@ mutate "a root sweep no longer spares the agent" 's|ci-runner@\\$idx.service|ci-
 mutate "a zombie is counted as a survivor"     '/= Z ] \&\& continue/d'                                                   has_slot_quiesce
 mutate "the home wipe stops being the anchor"  '/cd -- "\\$home" \&\& empty_here/d'                                            has_slot_quiesce
 mutate "a job can name itself out of the sweep" 's|{line##|{line#|g'                                                      has_slot_quiesce
+# #1395: a job's own user unit must not outlive the reset.
+mutate "the whole user@ tree is spared again"    's#/(init\\.scope|session\\.slice/dbus\\.service)\\\$##'                    has_slot_quiesce
+mutate "a user unit named after the daemon is spared" 's#|^0::/system\\.slice/(\.\*/)?ci-dockerd#|ci-dockerd#'              has_slot_quiesce
+mutate "containers are no longer spared by descent" '/case "\\\$dk" in/d'                                                   has_slot_quiesce
+mutate "the job's units are never stopped"       '/stop_user_units "\\\$uid" || units_rc=1/d'                               has_slot_quiesce
+mutate "a unit that will not stop is called clean" 's/stop_user_units "\\\$uid" || units_rc=1/stop_user_units "\\$uid" || :/' has_slot_quiesce
+mutate "a job's timer is left armed"             's/--type=service,socket,timer,path/--type=service/g'                      has_slot_quiesce
+mutate "the stop verdict is dropped by the loop" '0,/|| return "\\\$units_rc"/s//|| return 0/'                              has_slot_quiesce
+mutate "a unit that would not stop is not named" 's/would not stop: \(.*\) -- refusing to call this slot clean/would not stop: \1/' has_slot_quiesce
+mutate "the user bus is stopped with the rest"   's/ && \\\$1 != "dbus.service"//'                                           has_slot_quiesce
 
 mutate "App JWT back in curl argv"        's@-K <(printf.*\$jwt")@-H "Authorization: Bearer $jwt"@'          has_secrets_out_of_argv
 mutate "registration token back in curl argv" 's@-K <(printf.*\$tok")@-H "Authorization: Bearer $tok"@'          has_secrets_out_of_argv
