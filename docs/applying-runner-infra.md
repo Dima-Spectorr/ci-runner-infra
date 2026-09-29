@@ -56,7 +56,7 @@ ref-scoped `principalSet` is how it is bounded. Read the section below.
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.108.1"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.109.0"
 
   project_id     = var.project_id
   region         = "<region>"
@@ -224,11 +224,13 @@ non-zero saying so.
 cannot stop a fleet from receiving runner configuration. That is the right
 trade, and it means the exit code is for a human running the script by hand —
 it will not turn anything red. Until the fleet audit counts policies per project
-(#979), the check is manual and it is a **count, not a glance**: sixteen is the
-expected number of `CI runners / *` policies in a project since #1388. Two of
-them are log-based: *egress refused* and *hosts kept on an unverifiable
-guest-attribute read*. So a project missing this grant syncs fourteen and
-defers both, and a project bootstrapped by hand before #978 may show thirteen.
+(#979), the check is manual and it is a **count, not a glance**: seventeen is
+the expected number of `CI runners / *` policies in a project since #1403. Three
+of them are log-based: *egress refused*, *hosts kept on an unverifiable
+guest-attribute read* and *a slot failed its reset* (`ci_slot_reset_failures`,
+over the hosts' `ci-slot-lifecycle` log). So a project missing this grant syncs
+fourteen and defers all three, and a project bootstrapped by hand before #978
+may show thirteen.
 
 The channel half is easy to miss, and missing it is worse than over-granting:
 `monitoring.viewer` (already in the loop above) can *read* channels, so a project
@@ -402,7 +404,7 @@ repository's README anyway. Anything that *is* a secret stays where it is.
 
 ```hcl
 module "ci_runner_apply_identity" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.108.1"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.109.0"
 
   project_id             = var.project_id
   name                   = var.pool_name
@@ -519,7 +521,7 @@ provisioner has already run.
 
 ```hcl
 module "ci_host_image_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.108.1"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.109.0"
 
   project_id   = var.project_id
   region       = "<region>"

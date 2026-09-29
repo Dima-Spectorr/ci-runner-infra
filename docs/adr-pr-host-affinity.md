@@ -311,6 +311,45 @@ the whole point; a re-run anchors somewhere alive.
 rule — a job that was already RUNNING when its host went away is covered by
 §2.6b, under stricter conditions.)*
 
+**Two doors the detector did not watch, both closed by #490.** Found 2026-09-29
+on a consumer repository, where `gh run rerun --failed` re-queued a run's jobs
+with the ORIGINAL `host-*` pin, naming a host drained and deleted hours before:
+
+1. *It never saw the run.* The queued-run list is filtered on `created_at`
+   (`DEMAND_MAX_AGE`, to keep corpses off the page), and a re-run keeps its
+   original `created_at`; only `run_attempt`, `run_started_at` and the job
+   objects are new. So the sweep also reads one unfiltered page of queued runs
+   and fetches the re-run attempts `rerun_run_decision` says are live (judged on
+   `run_started_at`).
+2. *It was blind whenever the pool was at zero.* An empty host list was always
+   read as a failed listing. But a pool at zero is exactly where such a job
+   lands, because pinned work never scales a pool out. `pin_sight_decision` now
+   reads an empty list as sight when the listing succeeded, the MIG describe
+   succeeded and the MIG's target size is zero; anything else stays blind.
+
+What the controller does then is **cancel, then re-run in full, once**. A re-run
+is accepted only for a completed run, so the controller cancels first and
+records the run in its state directory. On a later tick, once GitHub reports
+the run completed, it posts `POST /runs/{id}/rerun`, never
+`rerun-failed-jobs`, and the anchor re-pins the run to a live host. That sends an
+INFO `pinned-run-rerun` event. There is one controller re-run per run id: a run
+that is unservable again afterwards is only cancelled, with a WARNING
+`pinned-run-unservable` event for a person, so a persistent fault cannot loop.
+Both calls need `Actions: write` ([github-app-permissions.md](github-app-permissions.md)).
+They go out on a token down-scoped to the one repository. A permission refusal
+falls back to the same WARNING, naming the run and the move that clears it. A
+rate-limit 403 is retried instead. The re-run is only for the attempt the
+controller cancelled, only for `push`, `pull_request` and `merge_group` runs,
+and never when a newer run of the same workflow exists on the branch: the goal
+is to unstick CI, never to replay old code.
+
+**Runbook: re-run a pinned workflow in full, never with `--failed`.** `gh run
+rerun <id>` re-runs the anchor, which pins the run to a live host. `gh run rerun
+<id> --failed` keeps the old `host-*` label on every re-queued job, and if that
+host is gone the run queues until the controller cancels it, or until GitHub's
+24-hour timeout where the cancel is refused. If one is already stuck: `gh run
+cancel <id>`, then `gh run rerun <id>`.
+
 **A queued pinned job is not the only way a run depends on a host.** A supported
 workflow finishes every Linux consumer and then spends a long tail in the
 unpinned Windows job, still talking to the Linux stack across the band. If the

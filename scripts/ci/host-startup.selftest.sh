@@ -724,7 +724,52 @@ has_slot_quiesce() { # <file>
   #    the slot's service manager -- rootless dockerd, its containerd and the
   #    container processes under them. The daemon has to outlive the reset: the
   #    image-tag audit still talks to it and the next job needs its socket;
-  matches "$code" 'user@\\\$1\\\.service' || return 1
+  matches "$code" 'user@\\\$1\.service' || return 1
+  #    but NOTHING under user@ by cgroup (#1395): every cgroup there is the
+  #    slot's to write, and the bus forks a job's activated helper into its
+  #    own. The manager, its (sd-pam) and the bus daemon are spared BY PID,
+  #    read after the unit stop and before the first scan. The daemon's cgroup
+  #    is the one cgroup spared, anchored under system.slice so a job's own
+  #    user unit of that name is not.
+  local spare
+  spare=$(printf '%s\n' "$code" | grep -cF 'grep -qE "^0::/system\.slice/(.*/)?ci-dockerd@\${5:-%}\.service(/|\$)" "\$d/cgroup"')
+  [ "${spare:-0}" -eq 1 ] || return 1
+  counts "$code" 'grep -qE .*user@\\\$1\\\.service/' 0 || return 1
+  local pids
+  pids=$(printf '%s\n' "$code" | grep -n 'keep="\\\$keep\\\$(user_manager_pids "\\\$uid"')
+  pids=${pids%%:*}
+  matches "$code" 'show -p MainPID --value "user@\\\$1\.service"' || return 1
+  matches "$code" 'ps --ppid "\\\$m" -o pid= --sort=start_time' || return 1
+  matches "$code" 'show -p MainPID --value dbus\.service' || return 1
+  #    and a user bus that is not the stock unit is reverted and stopped.
+  matches "$code" 'if ! dbus_is_stock "\\\$frag" "\\\$drop"; then' || return 1
+  matches "$code" 'systemctl --user -M "\\\$u@" revert dbus\.service' || return 1
+  matches "$code" '/usr/lib/systemd/user/\* \| /etc/systemd/user/\*\) ;; \*\) return 1 ;;' || return 1
+  #    Every systemctl here is bounded, and killed if TERM does not end it.
+  counts "$code" 'timeout [0-9]+ systemctl --user' 0 || return 1
+  counts "$code" 'systemctl is-active --quiet "user@' 1 || return 1
+  matches "$code" 'timeout -k 5 10 systemctl is-active --quiet "user@' || return 1
+  #    Containers by DESCENT from the daemon's processes, not by a scope name a
+  #    job can choose.
+  matches "$code" 'case "\\\$dk" in \*" \\\$p "\*\) spared=1; break ;; esac' || return 1
+  matches "$code" 'ci-dockerd@\\\$\{5:-%\}\.service" 2>/dev/null\) \|\| cg=""' || return 1
+  #    And the job's own units are STOPPED before the kill loop -- services,
+  #    sockets, timers and paths, sparing only the user bus -- and a unit that
+  #    will not stop fails the slot closed.
+  local stop scan
+  # Captured whole and cut with parameter expansion: never `grep | head` under
+  # pipefail (#1409).
+  stop=$(printf '%s\n' "$code" | grep -n 'stop_user_units "\\\$uid" || units_rc=1')
+  stop=${stop%%$'\n'*}; stop=${stop%%:*}
+  scan=$(printf '%s\n' "$code" | grep -n 'targets=\\\$(slot_stragglers')
+  scan=${scan%%$'\n'*}; scan=${scan%%:*}
+  [ -n "$stop" ] && [ -n "$pids" ] && [ -n "$scan" ] || return 1
+  [ "$stop" -lt "$pids" ] && [ "$pids" -lt "$scan" ] || return 1
+  matches "$code" '--type=service,socket,timer,path' || return 1
+  matches "$code" 'systemctl --user -M "\\\$u@" stop -- \\\$names' || return 1
+  matches "$code" '\$1 != "dbus.service" && \\\$1 != "dbus.socket"' || return 1
+  matches "$code" 'would not stop: .* -- refusing to call this slot clean' || return 1
+  counts "$code" '\|\| return "\\\$units_rc"' 3 || return 1
   #    and the agent's own tree when the caller is NOT the agent. The idle sweep
   #    and the sweeper's teardown are root timers: without this they would kill
   #    the listener of every slot they touched.
@@ -1486,6 +1531,56 @@ has_baked_image_audit() { # <file>
   matches "$code" 'elif \[ -f "\\\$manifest" \]' || return 1
 }
 
+# The slot-lifecycle log shipper (#1403). Without it the reset's verdicts reach
+# the host's journal and nothing else, so a condemned slot or a fleet-wide
+# fail-closed reset cannot be counted or alerted on. What it DOES is run in
+# log-shipper.behaviour.sh; what is pinned here is what that suite cannot see:
+# that the host installs and arms it, that its failure cannot take the host
+# down, and that its match set is exactly the slot tools' own tags -- read from
+# the `logger -t` calls that write them, so a new tool, or a renamed one, cannot
+# silently fall out of the alert.
+has_log_shipper() { # <file>
+  local code ids tags t body tmp
+  code=$(code_of "$1")
+
+  matches "$code" 'install_log_shipper \|\|$' || return 1
+  ! matches "$code" 'install_log_shipper \|\| die' || return 1
+  matches "$code" 'systemctl enable --now ci-log-shipper\.timer' || return 1
+  # A oneshot with no deadline blocks its own timer forever.
+  matches "$code" '^TimeoutStartSec=120$' || return 1
+
+  # Root only: _UID is stamped by journald from the socket's credentials, so a
+  # job cannot forge a line the alert counts.
+  matches "$code" '^matches\+=\(_UID=0\)$' || return 1
+  # The journal is read through the match set and nothing else, oldest first,
+  # into a FILE: a service starts with SIGPIPE ignored, so a `| head` reader
+  # that stops early leaves journalctl failing or running into the deadline.
+  matches "$code" '^timeout "\$JTIMEOUT" "\$JOURNALCTL" "\$\{opts\[@\]\}" "--lines=\+\$MAX" "\$\{matches\[@\]\}" >"\$batch" 2>"\$errf"$' || return 1
+  matches "$code" '^IgnoreSIGPIPE=no$' || return 1
+  # The host's token never goes in argv.
+  matches "$code" "-K <\\(printf 'header = \"Authorization: Bearer %s\"\\\\n' \"\\\$token\"\\)" || return 1
+
+  ids=$(printf '%s\n' "$code" | sed -n 's/^IDENTIFIERS=(\(.*\))$/\1/p')
+  [ -n "$ids" ] || return 1
+  tags=$(printf '%s\n' "$code" | grep -oE 'logger -t ci-(slot|pin)-[a-z]+' | sed 's/.* //' | sort -u)
+  [ -n "$tags" ] || return 1
+  for t in $tags; do case " $ids " in *" $t "*) ;; *) return 1 ;; esac; done
+  for t in $ids; do case $'\n'"$tags"$'\n' in *$'\n'"$t"$'\n'*) ;; *) return 1 ;; esac; done
+
+  # A quoted here-document, so the body is the file the host gets, byte for
+  # byte. An empty extraction is a moved anchor, not a clean parse.
+  body=$(awk '
+    $0 == "  cat >/opt/ci/log-shipper.sh <<'"'"'EOF'"'"'" { on = 1; next }
+    on && $0 == "EOF" { exit }
+    on { print }
+  ' "$1")
+  [ -n "$body" ] || return 1
+  tmp=$(mktemp)
+  printf '%s\n' "$body" >"$tmp"
+  bash -n "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+}
+
 # The scripts this boot script WRITES are never run by anything here, so a
 # syntax error in any of them survives every text predicate above and first
 # appears on a live host as a slot that will not pin — or, worse, a sweeper that
@@ -1540,6 +1635,12 @@ if has_baked_image_audit "$SCRIPT"; then
   ok
 else
   bad "nothing re-checks the baked-image manifest after boot — on a host that runs for days the prune in #250 is deciding which image tags may survive a reset from a claim made once, at boot, over a store that has changed since (issue #251)"
+fi
+
+if has_log_shipper "$SCRIPT"; then
+  ok
+else
+  bad "the slot tools' journal lines do not reach Cloud Logging, or reach it from any uid — a condemned slot, or a reset failing closed on every host, is visible only from a shell on the VM and the condemned-slot alert never fires (#1403)"
 fi
 
 if generated_scripts_parse "$SCRIPT"; then
@@ -2013,6 +2114,22 @@ mutate "a root sweep no longer spares the agent" 's|ci-runner@\\$idx.service|ci-
 mutate "a zombie is counted as a survivor"     '/= Z ] \&\& continue/d'                                                   has_slot_quiesce
 mutate "the home wipe stops being the anchor"  '/cd -- "\\$home" \&\& empty_here/d'                                            has_slot_quiesce
 mutate "a job can name itself out of the sweep" 's|{line##|{line#|g'                                                      has_slot_quiesce
+# #1395: a job's own user unit must not outlive the reset.
+mutate "the whole user@ tree is spared again"    's#grep -qE "^0::/system#grep -qE "user@\\$1\\.service|^0::/system#'       has_slot_quiesce
+mutate "a user unit named after the daemon is spared" 's#"^0::/system\\.slice/(\.\*/)?ci-dockerd#"ci-dockerd#'              has_slot_quiesce
+mutate "the manager and its bus are not spared by pid" '/keep="\\$keep\\$(user_manager_pids/d'                              has_slot_quiesce
+mutate "the bus pid is read before the unit stop" '/keep="\\$keep\\$(user_manager_pids/d; /^  # The units FIRST/i\  keep="\\$keep\\$(user_manager_pids "\\$uid" | tr '"'"'\\n'"'"' '"'"' '"'"')"' has_slot_quiesce
+mutate "(sd-pam) is picked by name, not by age"   's/ --sort=start_time//'                                                   has_slot_quiesce
+mutate "a non-stock user bus is left running"     '/revert dbus\.service/d'                                                  has_slot_quiesce
+mutate "a user drop-in reads as stock"            's#/usr/lib/systemd/user/\* | /etc/systemd/user/\*) ;; \*) return 1 ;;#*) ;;#g' has_slot_quiesce
+mutate "a hung systemctl is never killed"         's/timeout -k 5 /timeout /g'                                               has_slot_quiesce
+mutate "containers are no longer spared by descent" '/case "\\\$dk" in/d'                                                   has_slot_quiesce
+mutate "the job's units are never stopped"       '/stop_user_units "\\\$uid" || units_rc=1/d'                               has_slot_quiesce
+mutate "a unit that will not stop is called clean" 's/stop_user_units "\\\$uid" || units_rc=1/stop_user_units "\\$uid" || :/' has_slot_quiesce
+mutate "a job's timer is left armed"             's/--type=service,socket,timer,path/--type=service/g'                      has_slot_quiesce
+mutate "the stop verdict is dropped by the loop" '0,/|| return "\\\$units_rc"/s//|| return 0/'                              has_slot_quiesce
+mutate "a unit that would not stop is not named" 's/would not stop: \(.*\) -- refusing to call this slot clean/would not stop: \1/' has_slot_quiesce
+mutate "the user bus is stopped with the rest"   's/ && \\\$1 != "dbus.service"//'                                           has_slot_quiesce
 
 mutate "App JWT back in curl argv"        's@-K <(printf.*\$jwt")@-H "Authorization: Bearer $jwt"@'          has_secrets_out_of_argv
 mutate "registration token back in curl argv" 's@-K <(printf.*\$tok")@-H "Authorization: Bearer $tok"@'          has_secrets_out_of_argv
@@ -2097,6 +2214,19 @@ mutate "audit failure made fatal"            's@^  install_baked_image_audit ||$
 mutate "dead manifest id no longer reported" 's@say "slot \\\$idx: the manifest names@: "slot \$idx: the manifest names@' has_baked_image_audit
 mutate "manifest mode no longer checked"     's@not root:root:644@is fine@'                                           has_baked_image_audit
 mutate "state directory no longer checked"   's@not root:root:755@is fine@g'                                          has_baked_image_audit
+
+mutate "log shipper failure made fatal"      's@^  install_log_shipper ||$@  install_log_shipper || die@'             has_log_shipper
+mutate "log shipper installed but not armed" 's@systemctl enable --now ci-log-shipper.timer@systemctl enable ci-log-shipper.timer@' has_log_shipper
+mutate "log shipper oneshot without a deadline" 's@^TimeoutStartSec=120$@@'                                           has_log_shipper
+mutate "any uid's lines are shipped"         's@^matches+=(_UID=0)$@:@'                                               has_log_shipper
+mutate "the whole journal is read"           's@ "\${matches\[\@\]}" >"\$batch"@ >"$batch"@'                          has_log_shipper
+mutate "journalctl piped into head again"    's@ "\${matches\[\@\]}" >"\$batch" 2>"\$errf"$@ "${matches[\@]}" 2>"$errf" | head -n "$MAX" >"$batch"@' has_log_shipper
+mutate "SIGPIPE left ignored in the unit"    's@^IgnoreSIGPIPE=no$@@'                                                  has_log_shipper
+mutate "the host token goes in argv"         's@-K <(printf .header = "Authorization: Bearer %s"\\n. "\$token")@-H "Authorization: Bearer $token"@' has_log_shipper
+mutate "a slot tool falls out of the ship list" 's@^IDENTIFIERS=(ci-slot-reset ci-slot-sweep @IDENTIFIERS=(ci-slot-reset @' has_log_shipper
+mutate "an unrelated tag is shipped"         's@^IDENTIFIERS=(ci-slot-reset @IDENTIFIERS=(ci-controller ci-slot-reset @'   has_log_shipper
+mutate "a renamed slot tool is not followed" 's@logger -t ci-pin-sweep@logger -t ci-pin-reaper@'                     has_log_shipper
+mutate "the generated shipper does not parse" 's@^\[ -s "\$batch" \] || exit 0$@[ -s "$batch" ] || exit 0 )@'        has_log_shipper
 mutate "image store owner no longer checked" 's@not \\\$u:\\\$u -- another account owns@is fine@'                     has_baked_image_audit
 mutate "image store mode no longer checked"  's@0\\\$droot_mode & 066@0@'                                             has_baked_image_audit
 mutate "symlinked manifest reads as a file"  's@if \[ -L "\\\$manifest" \]@if false@'                                 has_baked_image_audit

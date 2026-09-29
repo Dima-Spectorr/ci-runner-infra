@@ -765,7 +765,15 @@ rc=0
 # right after -- the removal is what comes last, and the marker is written over
 # a slot nothing has been able to touch since.
 slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, or empty> <slot idx>
-  local d owner pid line rest state ppid p hops spared
+  local d owner pid line rest state ppid p hops spared cg dk=""
+  # THE DAEMON'S OWN PROCESSES, read once per scan: a container's processes are
+  # spared below by DESCENT from one of these (#1395). Re-read on every scan
+  # because a container the daemon restarts gets a new shim.
+  cg=\$(systemctl show -p ControlGroup --value "ci-dockerd@\${5:-%}.service" 2>/dev/null) || cg=""
+  if [ -n "\$cg" ] && [ -d "/sys/fs/cgroup\$cg" ]; then
+    dk=\$(find "/sys/fs/cgroup\$cg" -name cgroup.procs -exec cat {} + 2>/dev/null | tr '\n' ' ')
+    [ -n "\$dk" ] && dk=" \$dk"
+  fi
   # ONE stat for the whole of /proc rather than one per pid, and the difference
   # is not cosmetic: this runs between every pair of jobs on a host with several
   # hundred processes, and a fork each was a fifth of a second of the job
@@ -794,21 +802,23 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     rest=\${line##*') '}
     read -r state _ <<< "\$rest"
     [ "\$state" = Z ] && continue
-    # EVERYTHING THE SLOT'S OWN SERVICE MANAGER SUPERVISES IS SPARED, matched on
-    # the cgroup rather than on a list of program names: \`user@<uid>.service\` is
-    # rootless dockerd, its containerd, and the container processes underneath
-    # them. The daemon has to survive -- the image-tag audit further down still
-    # talks to it and the next job needs its socket -- and the containers under
-    # it are already gone by the time this runs, removed through docker, which
-    # is where that job belongs and where \`-v\` takes their volumes with them.
+    # NOTHING UNDER \`user@<uid>.service\` IS SPARED BY CGROUP (#1395). The slot's
+    # service manager, its (sd-pam) and the user bus arrive in \$2 BY PID --
+    # see user_manager_pids -- because every cgroup in that subtree is the
+    # slot's to write: a job can move itself into init.scope, and the bus forks
+    # a job's D-Bus-activated helper straight into dbus.service's cgroup.
+    # Everything else there is a job's: \`systemd-run --user\` units in app.slice
+    # or any slice they name, and sparing the whole tree let them run on into
+    # the next job. Their units are stopped by stop_user_units before this
+    # runs; what they leave is killed here.
     #
-    # AND \`ci-dockerd@<idx>.service\` BY NAME, because on this host the rootless
-    # daemon is NOT under \`user@<uid>.service\`. It is a SYSTEM unit with
-    # \`User=ci-s%i\` (see the unit written further down), so its processes are
-    # owned by the slot uid -- which is what selects them here -- while its
-    # cgroup is \`ci-dockerd@<idx>.service\`. The \`user@\` test above therefore
-    # matched nothing, and dockerd, its containerd, rootlesskit and the network
-    # helper were reaped as "processes that outlived the last job".
+    # \`ci-dockerd@<idx>.service\` IS spared by cgroup, anchored under system.slice so a
+    # job's own user unit of the same name is not spared: the rootless daemon
+    # is a SYSTEM unit with \`User=ci-s%i\` (see the unit written further down),
+    # so its processes are owned by the slot uid -- which is what selects them
+    # here -- while its cgroup is \`ci-dockerd@<idx>.service\`. Without this,
+    # dockerd, its containerd, rootlesskit and the network helper were reaped
+    # as "processes that outlived the last job".
     #
     # That is how a whole fleet lost its runners on 2026-08-24. The agent unit
     # declares \`BindsTo=ci-dockerd@<idx>.service\`, so killing the daemon stopped
@@ -822,8 +832,18 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     #
     # every slot, every host, every boot. The pool then drained the host as a
     # failed registration and rebuilt it from the same template, forever.
-    grep -qE "user@\$1\.service|ci-dockerd@\${5:-%}\.service" "\$d/cgroup" 2>/dev/null && continue
-    # AND THE AGENT'S OWN TREE, when the agent is not already on the chain above.
+    grep -qE "^0::/system\.slice/(.*/)?ci-dockerd@\${5:-%}\.service(/|\$)" "\$d/cgroup" 2>/dev/null && continue
+    # AND THE AGENT'S OWN TREE, when the agent is not already on the chain above,
+    # AND EVERY CONTAINER, by descent from the daemon's processes: a container's
+    # cgroup is \`user@<uid>.service/user.slice/docker-<id>.scope\` (the cgroup
+    # driver is systemd), and a job can create a scope of that name itself, so
+    # the name proves nothing. Descent does -- a container's init is a child of
+    # a containerd shim in the daemon's cgroup, and a job cannot reparent a
+    # process there. Containers are spared, not killed, because the prune right
+    # after removes them through docker, and a container killed under a restart
+    # policy would be restarted by the daemon and fought here until the sweep
+    # gave up and failed a clean slot closed.
+    #
     # See quiesce_slot for which caller is which; here it is one parent walk per
     # candidate, stopped at pid 1 and bounded so that a /proc read racing with an
     # exiting process cannot spin.
@@ -833,10 +853,11 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     # and it is reparented -- cgroup membership does not follow reparenting -- so
     # a cgroup test spares precisely the leftovers this exists to remove. Descent
     # from the agent's main pid does not: a straggler's chain reaches pid 1.
-    if [ -n "\$3" ]; then
+    if [ -n "\$3" ] || [ -n "\$dk" ]; then
       p=\$pid; hops=0; spared=0
       while [ -n "\$p" ] && [ "\$p" != 0 ] && [ "\$p" != 1 ] && [ "\$hops" -lt 64 ]; do
-        if [ "\$p" = "\$3" ]; then spared=1; break; fi
+        if [ -n "\$3" ] && [ "\$p" = "\$3" ]; then spared=1; break; fi
+        case "\$dk" in *" \$p "*) spared=1; break ;; esac
         line=\$(cat "/proc/\$p/stat" 2>/dev/null) || break
         rest=\${line##*') '}
         read -r state ppid _ <<< "\$rest"
@@ -850,6 +871,104 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     fi
     printf '%s\n' "\$pid"
   done <<< "\$(stat -c '%n %u' /proc/[0-9]* 2>/dev/null)"
+}
+
+# A JOB'S OWN UNITS IN THE SLOT'S SERVICE MANAGER (#1395).
+#
+# The slot user lingers -- runc needs its user manager to create each
+# container's cgroup scope -- so that manager outlives every job. From inside a
+# job, \`systemd-run --user --unit=x sleep 1d\` hands a process to it: the unit
+# lands in \`user@<uid>.service/app.slice\`, outside the agent's cgroup, and
+# \`--on-calendar\`, \`--path-property\` or \`--socket-property\` leave a timer, a
+# path or a socket that runs the job's code again, in the NEXT job's slot.
+# Measured on a live host 2026-09-29 (systemd 255): the unit survived the reset.
+#
+# So every live service, socket, timer and path the manager has is stopped,
+# except the user bus -- dbus.service and the dbus.socket that activates it,
+# which runc talks to for every container. Scopes are not listed: a container
+# IS a scope, removed through docker right after, and a scope a job made is a
+# set of processes the kill loop below reaches. Stock units (gpg-agent's
+# sockets and the like) go too; they are socket-activated and a job that needs
+# one starts its own, and a gpg-agent carried over from the last job is its
+# cache of the last job's keys.
+#
+# FAILS CLOSED on what is still running afterwards, not on what stop said: a
+# job can set RefuseManualStop=, and a unit that will not stop is a unit the
+# next job inherits. No manager at all is not a failure -- nothing of a job's
+# can run under a manager that is not there.
+user_units() { # <listing> -- the unit names in it a job could have made
+  printf '%s\n' "\$1" | awk '\$1 != "" && \$1 != "dbus.service" && \$1 != "dbus.socket" && \$3 != "inactive" && \$3 != "failed" { print \$1 }'
+}
+#
+# THE USER BUS ITSELF, when its unit is not the stock one: a job can add a
+# drop-in under ~/.config/systemd/user/dbus.service.d, daemon-reload and
+# restart the bus, and the running daemon then carries the job's ExecStart= or
+# ExecStartPost= into every later job -- the home wipe removes the file, not
+# the process. \`revert\` drops every user drop-in and override for the unit and
+# reloads; the stop then lets dbus.socket start the stock one on first use.
+dbus_is_stock() { # <FragmentPath> <DropInPaths> of dbus.service
+  local p
+  case "\$1" in /usr/lib/systemd/user/* | /etc/systemd/user/*) ;; *) return 1 ;; esac
+  # word-splitting is the point: DropInPaths is space-separated, and a path a
+  # job wrote with a space in it fails the case below all the same.
+  # shellcheck disable=SC2086
+  for p in \$2; do
+    case "\$p" in /usr/lib/systemd/user/* | /etc/systemd/user/*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+stop_user_units() { # <uid>
+  local all names frag drop
+  timeout -k 5 10 systemctl is-active --quiet "user@\$1.service" 2>/dev/null || return 0
+  frag=\$(timeout -k 5 30 systemctl --user -M "\$u@" show -p FragmentPath --value dbus.service 2>/dev/null) &&
+    drop=\$(timeout -k 5 30 systemctl --user -M "\$u@" show -p DropInPaths --value dbus.service 2>/dev/null) ||
+    { say "slot \$idx: could not read the user bus unit of \$u -- refusing to call this slot clean"; return 1; }
+  if ! dbus_is_stock "\$frag" "\$drop"; then
+    say "slot \$idx: the user bus of \$u is not the stock unit (\$(safe "\$frag \$drop")) -- reverting and stopping it"
+    timeout -k 5 30 systemctl --user -M "\$u@" revert dbus.service >/dev/null 2>&1
+    timeout -k 5 60 systemctl --user -M "\$u@" stop dbus.service >/dev/null 2>&1
+  fi
+  all=\$(timeout -k 5 30 systemctl --user -M "\$u@" list-units --no-legend --plain \
+    --type=service,socket,timer,path 2>/dev/null) ||
+    { say "slot \$idx: could not list the units of \$u's service manager -- refusing to call this slot clean"; return 1; }
+  names=\$(user_units "\$all")
+  [ -n "\$names" ] || return 0
+  say "slot \$idx: stopping \$(printf '%s\n' "\$names" | grep -c .) unit(s) the last job left in its service manager: \$(safe "\$(printf '%s' "\$names" | tr '\n' ' ')")"
+  # word-splitting is the point -- one unit per argument, and a unit name holds
+  # no whitespace.
+  # shellcheck disable=SC2086
+  timeout -k 5 60 systemctl --user -M "\$u@" stop -- \$names >/dev/null 2>&1
+  # shellcheck disable=SC2086
+  timeout -k 5 30 systemctl --user -M "\$u@" kill --signal=SIGKILL -- \$names >/dev/null 2>&1
+  timeout -k 5 30 systemctl --user -M "\$u@" reset-failed >/dev/null 2>&1
+  all=\$(timeout -k 5 30 systemctl --user -M "\$u@" list-units --no-legend --plain \
+    --type=service,socket,timer,path 2>/dev/null) ||
+    { say "slot \$idx: could not list the units of \$u's service manager -- refusing to call this slot clean"; return 1; }
+  names=\$(user_units "\$all")
+  [ -z "\$names" ] && return 0
+  say "slot \$idx: unit(s) of the last job would not stop: \$(safe "\$(printf '%s' "\$names" | tr '\n' ' ')") -- refusing to call this slot clean"
+  return 1
+}
+
+# WHAT OF THE SLOT'S SERVICE MANAGER SURVIVES, BY PID (#1395): the manager
+# (user@<uid>'s MainPID), its (sd-pam) -- the manager's EARLIEST child, forked
+# when the manager started and so before any job could fork one -- and the user
+# bus daemon (dbus.service's MainPID, read after stop_user_units has replaced a
+# non-stock one). runc creates every container's scope through the manager
+# and the bus, so the next job's first container needs all three. Nothing else
+# in their cgroups is spared: a D-Bus-activated helper is forked into
+# dbus.service's cgroup by the bus itself.
+user_manager_pids() { # <uid> -- one pid per line
+  local m kids d
+  m=\$(timeout -k 5 10 systemctl show -p MainPID --value "user@\$1.service" 2>/dev/null) || return 0
+  case "\$m" in '' | 0 | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "\$m"
+  kids=\$(ps --ppid "\$m" -o pid= --sort=start_time 2>/dev/null)
+  # shellcheck disable=SC2086
+  set -- \$kids
+  [ -n "\${1:-}" ] && printf '%s\n' "\$1"
+  d=\$(timeout -k 5 10 systemctl --user -M "\$u@" show -p MainPID --value dbus.service 2>/dev/null) || d=""
+  case "\$d" in '' | 0 | *[!0-9]*) ;; *) printf '%s\n' "\$d" ;; esac
 }
 
 # WHAT A JOB LEFT RUNNING OUTSIDE A CONTAINER.
@@ -894,7 +1013,7 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
 # uninterruptible I/O -- the slot is not in the state the template describes,
 # and the marker is exactly the claim it must not get.
 quiesce_slot() {
-  local uid keep p line rest state ppid agent unit targets tick left
+  local uid keep p line rest state ppid agent unit targets tick left units_rc=0
   uid=\$(id -u "\$u" 2>/dev/null) ||
     { say "slot \$idx: could not resolve the uid of \$u -- refusing to call this slot clean"; return 1; }
 
@@ -931,8 +1050,14 @@ quiesce_slot() {
     fi
   fi
 
+  # The units FIRST: a unit with Restart= would otherwise be respawned by its
+  # manager as fast as the loop below kills it, and a timer has no process for
+  # the loop to find at all.
+  stop_user_units "\$uid" || units_rc=1
+  keep="\$keep\$(user_manager_pids "\$uid" | tr '\n' ' ')"
+
   targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
-  [ -n "\$targets" ] || return 0
+  [ -n "\$targets" ] || return "\$units_rc"
   say "slot \$idx: \$(printf '%s\n' "\$targets" | grep -c .) process(es) outlived the last job -- terminating them"
 
   tick=0
@@ -942,7 +1067,7 @@ quiesce_slot() {
     kill -TERM \$targets 2>/dev/null
     sleep 0.5
     targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
-    [ -n "\$targets" ] || return 0
+    [ -n "\$targets" ] || return "\$units_rc"
     tick=\$((tick + 1))
   done
 
@@ -952,7 +1077,7 @@ quiesce_slot() {
     kill -KILL \$targets 2>/dev/null
     sleep 0.5
     targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
-    [ -n "\$targets" ] || return 0
+    [ -n "\$targets" ] || return "\$units_rc"
     tick=\$((tick + 1))
   done
 
@@ -1096,8 +1221,10 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
   # that backgrounded something. First because of #1392: a straggler still
   # running while the socket is classified could move or replace the name
   # between that check and the prune below. quiesce_slot spares the daemon's own
-  # unit (ci-dockerd@<idx>, and user@<uid>), so the daemon and the containers
-  # under it are untouched here and are removed through docker right after.
+  # unit (ci-dockerd@<idx>), the containers descended from it, and the slot's
+  # user manager and user bus -- nothing else it runs (#1395) -- so the daemon
+  # and the containers are untouched here and are removed through docker right
+  # after.
   quiesce_slot || rc=1
   dsock=\$(daemon_sock)
   say "slot \$idx: \$sock reads as \$dsock"
@@ -1883,6 +2010,14 @@ take_lock() { # <what>
 
 say() { logger -t ci-pin-hold -- "\$*" 2>/dev/null || true; echo "pin hold: \$*" >&2; }
 
+# The reset's safe(), for the same reason: a job reaches this through sudo, and
+# the sudoers rule's trailing \`*\` lets it append any argument it likes. Echoed
+# raw into a root log line, that argument is text a job writes into the log
+# the slot alerts read (#1403).
+safe() {
+  printf '%.120s' "\$(printf '%s' "\$1" | tr '\n\t' '  ' | tr -d '\000-\037')"
+}
+
 boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
 
 # The guest attribute the controller reads. Best effort by design: the hold on
@@ -1986,7 +2121,7 @@ case "\${1:-}" in
         --run) [ "\$#" -ge 2 ] || { say "refusing: --run needs a value"; exit 1; }; run="\$2"; shift 2 ;;
         --ttl) [ "\$#" -ge 2 ] || { say "refusing: --ttl needs a value"; exit 1; }; ttl_text="\$2"; shift 2 ;;
         --reserve-slot) reserve=1; shift ;;
-        *) say "refusing: unknown argument '\$1'"; exit 1 ;;
+        *) say "refusing: unknown argument '\$(safe "\$1")'"; exit 1 ;;
       esac
     done
 
@@ -2079,7 +2214,7 @@ case "\${1:-}" in
     while [ "\$#" -gt 0 ]; do
       case "\$1" in
         --run) [ "\$#" -ge 2 ] || { say "refusing: --run needs a value"; exit 1; }; renew_run="\$2"; shift 2 ;;
-        *) say "refusing: unknown argument '\$1'"; exit 1 ;;
+        *) say "refusing: unknown argument '\$(safe "\$1")'"; exit 1 ;;
       esac
     done
     # An absent or empty --run is not an identity claim, and renewing on one
@@ -2990,6 +3125,230 @@ EOF
 
   systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
   systemctl enable --now ci-baked-image-audit.timer >>/var/log/ci-host.log 2>&1 || return 1
+}
+
+# --- the slot-lifecycle log shipper -------------------------------------------
+#
+# THE GAP (#1403, measured 2026-09-29): the reset, the sweeps and the pin tools
+# write their verdicts through `logger`, and NOTHING ships a host's journal to
+# Cloud Logging -- no ops agent on the image, no fluent config, and the guest
+# agent forwards only its own lines. The one copy that did reach it was a reset
+# the startup script ran itself, because its stderr lands in
+# google_metadata_script_runner. Every reset run by a job hook, by an agent
+# unit's ExecStartPre or by the sweep went to the local journal and nowhere
+# else. So a slot condemned for burning jobs, or a reset that failed closed on
+# every host (#1394 made that more likely, by design), could be read only with
+# a shell on the VM: no metric could count it and no alert could fire on it.
+#
+# THE SHAPE. A oneshot on a timer, not a follower: every 30 seconds it reads the
+# journal from a saved cursor, sends up to CI_LOG_SHIPPER_MAX entries in ONE
+# entries:write with the instance's own token, and moves the cursor only when
+# the write was accepted. That buys every property the reset needs from it:
+#
+#   the reset never waits on it -- `logger` returns once journald has the line,
+#   and the shipper reads the journal later, in its own unit;
+#
+#   an outage costs latency, not lines -- a refused or timed-out write leaves
+#   the cursor where it was, the next run resends the same batch, and the
+#   journal is the buffer (at-least-once; insertId is the entry's boot id and
+#   monotonic stamp, so Cloud Logging collapses a resend of the same entry);
+#
+#   order is the journal's -- one batch, in journal order, cursor after it;
+#
+#   it is bounded -- one batch per run, a message cut at 2000 characters, one
+#   curl with a deadline, and a unit deadline behind that;
+#
+#   it cannot wedge on a poison entry -- a 400 is a batch Cloud Logging will
+#   never accept, so it is dropped (and said locally) rather than resent forever.
+#
+# ONLY THESE IDENTIFIERS, AND ONLY FROM ROOT. The match set is the slot tools'
+# own tags ANDed with _UID=0. `_UID` is a field journald stamps from the
+# sender's socket credentials, which a client cannot forge, and every one of
+# these tools runs as root (the hooks reach the reset through sudo). A job on a
+# slot can run `logger -t ci-slot-reset condemned` all day; it is a different
+# uid, so its lines are never read. The rest of the journal is never read
+# either: this is four tags, not a syslog pipe. What a job CAN do is get text
+# quoted inside a root line (a tool-cache directory name, its daemon's error, an
+# argument to pin-hold), which is why the alert's metric matches whole anchored
+# sentences per tag, never a phrase (ensure-alert-policies.sh).
+#
+# THE TEXT. The reset already passes every slot-chosen value through safe()
+# before it reaches `logger`. The shipper does not trust that: jq builds the
+# body, so no message can break the JSON or add a field to it; control
+# characters become spaces; a message journald stored as bytes (not valid
+# UTF-8) keeps only its printable ASCII.
+#
+# The host account already holds roles/logging.logWriter (ci-runner-identity),
+# for the same reason the controller's does. Nothing here needs a new grant.
+install_log_shipper() {
+  mkdir -p /opt/ci || return 1
+  cat >/opt/ci/log-shipper.sh <<'EOF'
+#!/usr/bin/env bash
+# Installed by host-startup.sh. Runs as root on a timer. See install_log_shipper().
+set -uo pipefail
+
+# The overrides exist for scripts/ci/log-shipper.behaviour.sh. The unit sets
+# none of them, and only root can start this with an environment of its own.
+STATE_DIR="${CI_LOG_SHIPPER_STATE:-/var/lib/ci-log-shipper}"
+ENDPOINT="${CI_LOG_SHIPPER_ENDPOINT:-https://logging.googleapis.com/v2/entries:write}"
+MD_BASE="${CI_LOG_SHIPPER_METADATA:-http://metadata.google.internal/computeMetadata/v1}"
+JOURNALCTL="${CI_LOG_SHIPPER_JOURNALCTL:-journalctl}"
+MAX="${CI_LOG_SHIPPER_MAX:-200}"
+JTIMEOUT="${CI_LOG_SHIPPER_JOURNAL_TIMEOUT:-20}"
+MSG_MAX=2000
+LOG_ID=ci-slot-lifecycle
+IDENTIFIERS=(ci-slot-reset ci-slot-sweep ci-pin-hold ci-pin-sweep)
+
+# Its own tag is not in the list above, so what it says about itself is never
+# shipped back through it.
+note() { logger -t ci-log-shipper -- "$*" 2>/dev/null || true; echo "log shipper: $*" >&2; }
+
+md() {
+  curl --connect-timeout 5 --max-time 10 -fsS -H 'Metadata-Flavor: Google' "$MD_BASE/$1" 2>/dev/null
+}
+
+mkdir -p "$STATE_DIR" 2>/dev/null && chmod 0700 "$STATE_DIR" 2>/dev/null ||
+  { note "cannot create $STATE_DIR -- nothing shipped"; exit 0; }
+cursor_file="$STATE_DIR/cursor"
+batch="$STATE_DIR/batch.jsonl"
+
+cursor=$(cat "$cursor_file" 2>/dev/null) || cursor=""
+opts=(--no-pager --output=json)
+if [ -n "$cursor" ]; then opts+=("--after-cursor=$cursor"); else opts+=(--boot); fi
+matches=()
+for id in "${IDENTIFIERS[@]}"; do matches+=("SYSLOG_IDENTIFIER=$id"); done
+matches+=(_UID=0)
+
+# --lines=+N: the OLDEST N after the cursor (systemd >= 255, which is what the
+# image's Ubuntu 24.04 ships), so journalctl stops by itself and a backlog is
+# shipped from its start. NOT `| head`: a systemd service starts with SIGPIPE
+# ignored, so a journalctl whose reader has gone does not die of 141 -- it
+# fails its write, or walks the whole backlog into the deadline, and either way
+# the batch is lost every run (#1410 review). The output goes to a FILE.
+errf="$STATE_DIR/journal.err"
+timeout "$JTIMEOUT" "$JOURNALCTL" "${opts[@]}" "--lines=+$MAX" "${matches[@]}" >"$batch" 2>"$errf"
+jrc=$?
+case "$jrc" in
+  0) ;;
+  124)
+    # Out of time with some of it read: ship what is complete. A line cut
+    # mid-entry is not JSON, and the parse below skips it; the cursor then
+    # stops at the last whole entry, so the cut one is read again next run.
+    note "journalctl timed out after ${JTIMEOUT}s -- shipping the complete entries it wrote" ;;
+  *)
+    # The cursor goes ONLY when journalctl says the cursor is what it refused.
+    # Any other failure keeps it: deleting it on every non-zero exit turns one
+    # bad run into a restart from --boot, and a failure that repeats into a
+    # shipper that silently never moves again.
+    if [ -n "$cursor" ] && grep -q 'Failed to seek to cursor' "$errf" 2>/dev/null; then
+      note "journalctl refused the saved cursor -- restarting from this boot"
+      rm -f "$cursor_file"
+    else
+      note "journalctl exited $jrc -- cursor kept, retrying next run: $(head -c 300 "$errf" 2>/dev/null | tr -d '\000-\037')"
+    fi
+    exit 0 ;;
+esac
+[ -s "$batch" ] || exit 0
+
+# Line by line and tolerant: a line that is not JSON is skipped rather than
+# failing the whole batch, which would otherwise be retried forever.
+n=$(jq -Rn '[inputs | fromjson? | select(type == "object")] | length' "$batch" 2>/dev/null)
+last=$(jq -Rr 'fromjson? | select(type == "object") | .__CURSOR // empty' "$batch" 2>/dev/null | tail -n 1)
+[ -n "$last" ] || { note "no entry in the batch carries a cursor -- ${n:-0} entries not shipped"; exit 0; }
+
+project=$(md project/project-id)
+iid=$(md instance/id)
+zone=$(md instance/zone)
+zone=${zone##*/}
+host=$(md instance/name)
+pool=$(md instance/attributes/ci-pool)
+[ -n "$project" ] && [ -n "$iid" ] && [ -n "$zone" ] ||
+  { note "metadata server unreachable -- $n entries kept for the next run"; exit 0; }
+
+body=$(jq -cRn --arg lg "projects/$project/logs/$LOG_ID" --arg project "$project" \
+  --arg iid "$iid" --arg zone "$zone" --arg host "$host" --arg pool "$pool" \
+  --argjson msgmax "$MSG_MAX" '
+  def text: if type == "string" then .
+            elif type == "array" then map(select(type == "number" and . >= 32 and . < 127)) | implode
+            else "" end;
+  def clean($n): text | explode | map(if . < 32 or . == 127 then 32 else . end) | implode | .[0:$n];
+  def stamp: tostring | if test("^[0-9]{7,}$") then (.[0:-6] | tonumber | todate | rtrimstr("Z")) + "." + .[-6:] + "Z" else null end;
+  def sev: {"0":"EMERGENCY","1":"ALERT","2":"CRITICAL","3":"ERROR","4":"WARNING","5":"NOTICE","6":"INFO","7":"DEBUG"}[(.PRIORITY // "5") | tostring] // "DEFAULT";
+  { logName: $lg,
+    resource: {type: "gce_instance", labels: {project_id: $project, instance_id: $iid, zone: $zone}},
+    labels: {pool: $pool, host: $host},
+    partialSuccess: true,
+    entries: ([inputs | fromjson? | select(type == "object")] | map({
+      severity: sev,
+      insertId: ((._BOOT_ID // "" | clean(40)) + "-" + (.__MONOTONIC_TIMESTAMP // "" | clean(24))),
+      jsonPayload: {identifier: (.SYSLOG_IDENTIFIER // "" | clean(40)), message: (.MESSAGE // "" | clean($msgmax))}
+    } + (if (.__REALTIME_TIMESTAMP // "" | stamp) then {timestamp: (.__REALTIME_TIMESTAMP | stamp)} else {} end))) }' \
+  "$batch" 2>/dev/null)
+[ -n "$body" ] || { note "could not assemble the batch -- $n entries kept for the next run"; exit 0; }
+
+token=$(md instance/service-accounts/default/token | jq -r '.access_token // empty' 2>/dev/null)
+[ -n "$token" ] || { note "no access token -- $n entries kept for the next run"; exit 0; }
+
+# The token travels over a pipe, never argv, where any process on the host
+# could read it; the body over stdin because 200 entries can pass the kernel's
+# per-argument cap.
+out=$(mktemp) || out=/dev/null
+http=$(printf '%s' "$body" | curl --connect-timeout 10 --max-time 30 -s -o "$out" -w '%{http_code}' -X POST \
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
+  -H 'Content-Type: application/json' --data-binary @- "$ENDPOINT" 2>/dev/null)
+advance() {
+  printf '%s' "$last" >"$cursor_file.tmp" && mv -f "$cursor_file.tmp" "$cursor_file"
+}
+case "$http" in
+  200) advance ;;
+  400)
+    note "entries:write -> HTTP 400, a batch it will never accept -- $n entries dropped: $(head -c 300 "$out" | tr -d '\000-\037')"
+    advance ;;
+  *) note "entries:write -> HTTP ${http:-none} -- $n entries kept for the next run" ;;
+esac
+[ "$out" = /dev/null ] || rm -f "$out"
+rm -f "$batch"
+exit 0
+EOF
+  chown root:root /opt/ci/log-shipper.sh || return 1
+  chmod 0755 /opt/ci/log-shipper.sh || return 1
+
+  cat >/etc/systemd/system/ci-log-shipper.service <<'EOF'
+[Unit]
+Description=Ship the slot tools' journal lines to Cloud Logging
+After=network-online.target
+
+[Service]
+Type=oneshot
+# A oneshot with no deadline blocks its own timer forever. Every call inside is
+# already bounded (journalctl 20s, metadata 10s each, the write 30s), so this is
+# the backstop rather than the control.
+TimeoutStartSec=120
+# Idle priority: this must never be what a job waits behind.
+Nice=19
+IOSchedulingClass=idle
+# systemd starts a service with SIGPIPE ignored. Nothing in the shipper pipes
+# into a reader that stops early any more, but a pipeline added later would
+# otherwise hang or fail instead of ending the way it does in a shell.
+IgnoreSIGPIPE=no
+ExecStart=/opt/ci/log-shipper.sh
+EOF
+
+  cat >/etc/systemd/system/ci-log-shipper.timer <<'EOF'
+[Unit]
+Description=Ship the slot tools' journal lines every 30 seconds
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >>/var/log/ci-host.log 2>&1 || return 1
+  systemctl enable --now ci-log-shipper.timer >>/var/log/ci-host.log 2>&1 || return 1
 }
 
 # --- registry credentials for job containers ----------------------------------
@@ -5130,9 +5489,10 @@ Environment=PATH=/usr/bin:/usr/sbin:/bin:/sbin
 # first, so it is worth fixing on the host rather than in every workflow.
 PrivateTmp=yes
 # Hide every other uid's processes from this slot. Set here as well as on the
-# agent because the two SHARE a mount namespace (JoinsNamespaceOf), and /proc is
-# a property of that namespace rather than of either unit: setting it on one
-# side only would leave which view wins depending on which started first.
+# agent because each unit gets its OWN mount namespace -- JoinsNamespaceOf
+# shares the private /tmp and the network namespace, not the mount namespace;
+# measured 2026-09-29, the runner, rootlesskit and dockerd each have a
+# different one (#1395) -- so a setting on one side only reaches that side.
 #
 # Ignored with a warning by systemd older than 247, which is why it is not the
 # argument for anything — it is the belt over the tokens already being out of
@@ -6202,6 +6562,13 @@ main() {
   # a fleet outage of the kind the sweep is here to end.
   install_slot_sweep ||
     log "the idle slot sweep did not install — a slot left dirty by a cancelled job will stay dirty until this host is recycled"
+
+  # Fails OPEN, for the sweep's reason: without it the host resets, sweeps and
+  # pins exactly as before and only Cloud Logging loses the account of it. Its
+  # first run reads the journal from the start of this boot, so the resets the
+  # installs above already ran are not lost by coming after them.
+  install_log_shipper ||
+    log "the slot-lifecycle log shipper did not install — reset and sweep verdicts on this host stay in its journal, and the condemned-slot alert cannot see them"
 
   if [ "$failures" -ge "$SLOTS" ]; then
     # Zero registered agents = a host GitHub will never send work to. It cannot

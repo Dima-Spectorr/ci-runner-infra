@@ -498,6 +498,13 @@ jobs:
       - name: alert held-pool self-test
         run: bash scripts/ci/alert-held-pool.selftest.sh
 
+      # The condemned-slot alert (#1403) counts lines a HOST writes, in a log
+      # the host's shipper names, by phrases the reset prints -- three files
+      # agreeing on four strings, and every disagreement is an alert that never
+      # fires. Each string is pinned against host-startup.sh, the writer.
+      - name: alert slot-reset self-test
+        run: bash scripts/ci/alert-slot-reset.selftest.sh
+
 
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a
@@ -567,6 +574,13 @@ jobs:
       # completed one. It FAILS rather than skips if it cannot get root.
       - name: slot lifecycle behaviour
         run: sudo -n bash scripts/ci/slot-lifecycle.behaviour.sh
+
+      # The log shipper that carries those verdicts to Cloud Logging (#1403),
+      # RUN rather than read: extracted as the host writes it and driven against
+      # a stub journal, metadata server and Logging endpoint -- the match set,
+      # the payload, and a cursor that moves only on an accepted write. No root.
+      - name: log shipper behaviour
+        run: bash scripts/ci/log-shipper.behaviour.sh
 
   shell-infra:
     name: Shell — shared infra and Windows host boot

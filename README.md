@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.108.1"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.109.0"
   # ...
 }
 ```
@@ -994,7 +994,7 @@ naming the pool it stopped paging for. Take it out as soon as the fix lands. The
 log-based egress policy is unaffected — it keys on `gce_instance` and carries no
 pool label, so there is nothing to exclude on.
 
-Two of the sixteen watch the
+Two of the seventeen watch the
 cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it
 below the pool's `cache_snapshot_max_age_hours`, or the first notice anyone gets
 is every host starting cold) and *hydrate failing on a configured pool*, which
@@ -1040,11 +1040,30 @@ weeks (#1384). Two policies close it (#1388):
   and pages after 7200 s. Like *egress refused* it keys on the controller's
   `gce_instance` and `--muted-pool` cannot reach it.
 
-The host's own slot-reset lines (`is not the socket it listens on`, a slot
-*condemned*) are **not** alertable: they go to the host's syslog through
-`logger`, and nothing ships a host's syslog to Cloud Logging. Only the
-startup-script runner, the guest agent and the controller's events reach it.
-`ci_slots_missing` is the series that does catch a condemned slot.
+One more watches the slots themselves rather than the pool:
+
+* *A slot failed its reset (condemned, or refused clean)* — the host's own
+  account of a slot it could not make clean (#1403). The reset, the slot sweep
+  and the pin tools write through `logger`, and until #1403 nothing shipped a
+  host's journal to Cloud Logging. Each Linux host now runs
+  `ci-log-shipper.timer`: every 30 s it reads the journal from a saved cursor,
+  matching only the tags `ci-slot-reset`, `ci-slot-sweep`, `ci-pin-hold` and
+  `ci-pin-sweep` AND `_UID=0`, so a job cannot write a line of its own (it can
+  still get text quoted inside a root line — see the metric below). It sends up to 200
+  entries in one `entries:write` to the log `ci-slot-lifecycle` (labels `pool`,
+  `host`), and moves the cursor only on an accepted write. An outage delays
+  lines but does not lose them. The log-based metric `ci_slot_reset_failures`
+  counts *is not the socket it listens on*, *reads as foreign*, *refusing to
+  call this slot clean* and *taking it out of service* (the condemn line; not
+  "condemned", which the recovery line also says). Each is one full `say`
+  sentence, anchored at both ends and paired with the tag that writes it, not a
+  phrase search: some root lines under these tags quote text a job chose (a
+  tool-cache directory name, the slot daemon's error, an argument passed to
+  pin-hold), and a bare phrase let those forge a page. The self-test plants each
+  phrase in all three places and proves none matches. The policy fires on any
+  one in 10 minutes. It keys on the host's `gce_instance`, so `--muted-pool` cannot
+  reach it. `ci_slots_missing` still catches a condemned slot as lost
+  capacity, 30 minutes later and without the reason.
 
 Together those three were most of the mail this fleet produced. Measured over the
 week to 2026-08-29 across the three projects that have these policies, they
