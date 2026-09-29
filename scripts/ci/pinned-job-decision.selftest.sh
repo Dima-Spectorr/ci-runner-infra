@@ -295,5 +295,347 @@ pin_is "an upper-case pin is folded, not refused" \
 expect ignore: "a label carrying pattern syntax is still refused by rule 1b" \
   queued "self-hosted,linux,host-ci-lin-*" "$POOL" "$BASE" "$LIVE" 99999 300
 
+# --- #490: a re-run pinned to a host that no longer exists --------------------
+#
+# Live 2026-09-29 on a consumer repository: `gh run rerun --failed` on a run from
+# that morning re-queued its jobs with the ORIGINAL `host-*` pin, naming a host
+# drained and deleted hours earlier. The pool was at zero, nothing served the
+# label, the base stayed red, and the merge lane held every PR in the repo. Two
+# separate things kept the sweep from ever reaping it, and each has a rule here.
+
+is() { # <desc> <expected-prefix> <got>
+  case "$3" in
+    "$2"*) printf 'ok   %s\n' "$1" ;;
+    *) printf 'FAIL %s\n       want %s...\n       got  %s\n' "$1" "$2" "$3"; fail=1 ;;
+  esac
+}
+
+# 1. The sweep never SAW the run: the queued list is filtered on created_at, and
+#    a re-run keeps it. rerun_run_decision decides which attempts to fetch anyway.
+NOW=1000000; MAX=21600
+is "a re-run of a run created before the window, started inside it, is fetched" fetch: \
+  "$(rerun_run_decision 2 $((NOW - 30000)) $((NOW - 60)) $NOW $MAX)"
+is "the live shape: attempt 3, created 6h12m before its re-run started" fetch: \
+  "$(rerun_run_decision 3 $((NOW - 22320)) $((NOW - 60)) $NOW $MAX)"
+is "a first attempt outside the window is a corpse, never fetched" skip: \
+  "$(rerun_run_decision 1 $((NOW - 30000)) $((NOW - 30000)) $NOW $MAX)"
+is "a re-run whose own start is also outside the window is a corpse" skip: \
+  "$(rerun_run_decision 2 $((NOW - 90000)) $((NOW - 30000)) $NOW $MAX)"
+is "a re-run created inside the window is already listed, not fetched twice" skip: \
+  "$(rerun_run_decision 2 $((NOW - 60)) $((NOW - 30)) $NOW $MAX)"
+is "the window edge matches the server filter: created exactly at the cutoff is listed" skip: \
+  "$(rerun_run_decision 2 $((NOW - MAX)) $((NOW - 30)) $NOW $MAX)"
+is "a start exactly at the cutoff is still inside the window" fetch: \
+  "$(rerun_run_decision 2 $((NOW - 90000)) $((NOW - MAX)) $NOW $MAX)"
+is "an unreadable start on a re-run is fetched, not dropped (fail-safe)" fetch: \
+  "$(rerun_run_decision 2 $((NOW - 90000)) - $NOW $MAX)"
+is "an unreadable created on a re-run falls through to its start" fetch: \
+  "$(rerun_run_decision 2 - $((NOW - 60)) $NOW $MAX)"
+is "an unreadable attempt cannot tell a re-run from a corpse, so it is skipped" skip: \
+  "$(rerun_run_decision x $((NOW - 90000)) $((NOW - 60)) $NOW $MAX)"
+is "an unreadable clock acts on nothing" skip: \
+  "$(rerun_run_decision 2 $((NOW - 90000)) $((NOW - 60)) "" $MAX)"
+
+# ...and once seen, its re-queued job is judged on its OWN age: the jobs of a
+# re-run are fresh objects, so the grace window still protects a booting host.
+expect wait: "a re-run's fresh pinned job gets the grace window like any other" \
+  queued "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 60 300
+expect orphan: "and a re-run pinned to a host that is gone is reaped after it" \
+  queued "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 301 300
+
+# 2. The sweep was BLIND: a pool at zero lists nothing, and an empty list was
+#    always read as a failed listing. pin_sight_decision tells the two apart.
+is "a listed host is sight, as before" sighted: \
+  "$(pin_sight_decision 1 "$LIVE" "$BASE" 2)"
+is "a pool at zero with a good listing and a good describe is sight" sighted: \
+  "$(pin_sight_decision 1 "" "$BASE" 0)"
+is "a failed listing is blind, whatever the MIG says" blind: \
+  "$(pin_sight_decision 0 "" "$BASE" 0)"
+is "a failed describe is blind (MIG_TARGET defaults to 0 on failure)" blind: \
+  "$(pin_sight_decision 1 "" "" 0)"
+is "a MIG creating a host but listing none yet is blind, not empty" blind: \
+  "$(pin_sight_decision 1 "" "$BASE" 1)"
+is "an unreadable target is blind" blind: \
+  "$(pin_sight_decision 1 "" "$BASE" "")"
+expect orphan: "so a pool at zero reaps a job pinned to its deleted host after grace" \
+  queued "self-hosted,linux,host-ci-lin-dead" "$POOL" "$BASE" "" 301 300 30000
+
+# 3. What must NOT be reaped, unchanged by any of the above.
+#    A host that exists but whose agents are offline is still LISTED by the MIG,
+#    so the job is pinned work (reported on ci_demand_pinned), never an orphan:
+#    the pin-hold and drain paths own that host, not this sweep.
+expect pinned: "a host present in the MIG with its agents offline is not reaped" \
+  queued "self-hosted,linux,host-ci-lin-a1b2" "$POOL" "$BASE" "$LIVE" 99999 300
+#    A booting host is listed while CREATING (empty status), so it is live too.
+expect pinned: "a host the MIG is still creating is live, not gone" \
+  queued "self-hosted,linux,host-ci-lin-boot" "$POOL" "$BASE" "$LIVE,ci-lin-boot" 99999 300
+expect wait: "a host not listed yet is waited on inside the grace window" \
+  queued "self-hosted,linux,host-ci-lin-boot" "$POOL" "$BASE" "$LIVE" 120 300
+
+# 4. Cancel, then ONE full re-run by the controller (owner decision 2026-09-29:
+#    the App gets Actions: write). A re-run needs a completed run, so the cancel
+#    comes first and the re-run follows on a later tick.
+is "an unservable run never acted on is cancelled, then re-run" cancel-then-rerun: \
+  "$(pin_orphan_action "")"
+is "a run still queued after its cancel is cancelled again, still owed its re-run" cancel-then-rerun: \
+  "$(pin_orphan_action cancelled)"
+is "the cap: a run the controller already re-ran is only cancelled, never re-run again" cancel-only: \
+  "$(pin_orphan_action rerun)"
+is "a 403 falls back to cancel plus WARNING" cancel-only: \
+  "$(pin_orphan_action refused)"
+is "a cancel that never completed is not retried into a re-run" cancel-only: \
+  "$(pin_orphan_action gaveup)"
+is "cancel-then-rerun: re-run once the cancelled run has completed" rerun: \
+  "$(pin_rerun_decision cancelled 60 completed 900 1 1 cancelled push 0)"
+is "cancel-then-rerun: wait while the cancel is still landing" wait: \
+  "$(pin_rerun_decision cancelled 60 in_progress 900 1 1)"
+is "and at exactly max wait it still waits" wait: \
+  "$(pin_rerun_decision cancelled 900 queued 900 1 1)"
+is "give up when the cancel never completes" give-up: \
+  "$(pin_rerun_decision cancelled 901 queued 900 1 1)"
+is "an unreadable run status waits rather than re-running blind" wait: \
+  "$(pin_rerun_decision cancelled 60 "" 900)"
+is "the cap again: a ledger saying rerun is never re-run a second time" skip: \
+  "$(pin_rerun_decision rerun 60 completed 900)"
+is "a 403 recorded on the ledger is never re-run" skip: \
+  "$(pin_rerun_decision refused 60 completed 900)"
+is "no ledger, no re-run" skip: \
+  "$(pin_rerun_decision "" 60 completed 900)"
+is "an unreadable cancel stamp waits, it does not error" wait: \
+  "$(pin_rerun_decision cancelled x queued 900)"
+
+# 5. Security review F1: the re-run is keyed on the ATTEMPT the controller
+#    cancelled, and on a `cancelled` conclusion. Anything else was somebody
+#    else's doing, and is closed silently.
+is "F1: a person re-ran it since (attempt moved on): done, silently" done: \
+  "$(pin_rerun_decision cancelled 60 completed 900 1 2 success push 0)"
+is "F1: and a moved attempt still running is done too, not waited on" done: \
+  "$(pin_rerun_decision cancelled 60 in_progress 900 1 2 "" push 0)"
+is "F1: the same attempt that finished on its own is not replayed" done: \
+  "$(pin_rerun_decision cancelled 60 completed 900 1 1 failure push 0)"
+is "F1: no recorded attempt, no proof, no re-run" done: \
+  "$(pin_rerun_decision cancelled 60 completed 900 "" 1 cancelled push 0)"
+is "F1: an unreadable current attempt, no proof, no re-run" done: \
+  "$(pin_rerun_decision cancelled 60 completed 900 1 "" cancelled push 0)"
+
+# F4: unstick CI, never replay old code.
+is "F4: a newer run of the same workflow on the branch: superseded, not re-run" superseded: \
+  "$(pin_rerun_decision cancelled 60 completed 900 1 1 cancelled push 1)"
+is "F4: the newer-run check could not be answered: wait, never assume no" wait: \
+  "$(pin_rerun_decision cancelled 60 completed 900 1 1 cancelled push "")"
+is "F4: and that wait is still bounded" give-up: \
+  "$(pin_rerun_decision cancelled 901 completed 900 1 1 cancelled push "")"
+for _ev in push pull_request merge_group; do
+  is "F4: event $_ev is on the allowlist" rerun: \
+    "$(pin_rerun_decision cancelled 60 completed 900 1 1 cancelled "$_ev" 0)"
+done
+for _ev in workflow_dispatch schedule deployment release workflow_run repository_dispatch "" pull_request_target; do
+  is "F4: event [${_ev}] is never re-run automatically" declined: \
+    "$(pin_rerun_decision cancelled 60 completed 900 1 1 cancelled "$_ev" 0)"
+done
+is "the later states are cancel-only too: done" cancel-only: "$(pin_orphan_action "done")"
+is "the later states are cancel-only too: superseded" cancel-only: "$(pin_orphan_action superseded)"
+is "the later states are cancel-only too: declined" cancel-only: "$(pin_orphan_action declined)"
+
+# F2 + N1: a 403 is a permission refusal only when GitHub's body says so, and no
+# rate-limit signal contradicts it. Everything else is a limit, retried later.
+DENY='{"message":"Resource not accessible by integration","documentation_url":"x","status":"403"}'
+LIMIT='{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again.","status":"403"}'
+is "N1: 403 saying Resource not accessible by integration is a refusal" refused \
+  "$(actions_write_class 403 4999 "" "$DENY")"
+is "N1: and it is a refusal even when the rate-limit header is missing" refused \
+  "$(actions_write_class 403 "" "" "$DENY")"
+is "N1: a secondary-limit 403 with requests left and NO retry-after is transient" transient \
+  "$(actions_write_class 403 4999 "" "$LIMIT")"
+is "N1: a 403 with an empty body is transient" transient \
+  "$(actions_write_class 403 4999 "" "")"
+is "F2: 403 with the primary limit exhausted is transient, whatever the body" transient \
+  "$(actions_write_class 403 0 "" "$DENY")"
+is "F2: 403 with retry-after is transient, whatever the body" transient \
+  "$(actions_write_class 403 4999 60 "$DENY")"
+is "F2: 403 with no rate-limit header and no permission message is transient" transient \
+  "$(actions_write_class 403 "" "" "")"
+is "F2: 429 is transient" transient "$(actions_write_class 429 4999 "")"
+is "F2: a 5xx is transient" transient "$(actions_write_class 502 4999 "")"
+is "F2: no response at all is transient" transient "$(actions_write_class 000 "" "")"
+is "F2: 202 (cancel accepted) is ok" ok "$(actions_write_class 202 4999 "")"
+is "F2: 201 (re-run accepted) is ok" ok "$(actions_write_class 201 4999 "")"
+is "F2: 404 is a failure, not a refusal" failed "$(actions_write_class 404 4999 "")"
+# F3: the down-scoped token is refused at MINT when the permission is missing.
+is "F3: a 422 at mint is the missing permission" refused "$(actions_token_mint_class 422)"
+is "F3: a 201 at mint is a token" ok "$(actions_token_mint_class 201)"
+is "F3: anything else at mint is transient" transient "$(actions_token_mint_class 403)"
+
+# --- #490, the caller -----------------------------------------------------------
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "the controller re-runs in FULL, never rerun-failed-jobs" 'gh_actions_post "$pr_id" rerun'
+# F3: writes go through the down-scoped token, reads keep the installation one.
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "F3: the Actions token is scoped to this repository and actions:write alone" \
+  '{repositories: [$r], permissions: {actions: "write"}}'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "F3: the cancel and re-run POST carry the scoped token" 'Authorization: Bearer $GH_ACT_TOKEN'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "F3: the cancel goes through gh_actions_post" 'gh_actions_post "$run" cancel'
+# The pattern matches the literal $run / $pr_id spellings in the controller source.
+# shellcheck disable=SC2016
+_unscoped_writes=$(grep -cE 'actions/runs/\$(run|pr_id)/(cancel|rerun)' "$CONTROLLER" || true)
+if [ "$_unscoped_writes" = 0 ]; then
+  printf 'ok   %s\n' "F3: no cancel or re-run URL is built outside gh_actions_post"
+else
+  printf 'FAIL %s\n' "F3: $_unscoped_writes cancel/re-run call(s) bypass the scoped token"; fail=1
+fi
+# F2: the headers that tell a rate limit from a refusal are captured.
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "F2: the write captures its response headers" '-D "$hdr"'
+src_has "F2: and reads x-ratelimit-remaining" '"x-ratelimit-remaining"'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "N1: the write captures its response body for the classifier" '-o "$bodyf" -D "$hdr"'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "N1: and hands it to actions_write_class" 'actions_write_class "$ACT_CODE" "$rem" "$ra" "$body"'
+src_has "F2: and retry-after" '"retry-after"'
+# F1: the cancelled attempt is recorded.
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "F1: the ledger records the cancelled attempt" 'pin_ledger_write "$run" cancelled "$attempt"'
+src_has "F4: a superseded run is a WARNING of its own kind" 'WARNING pinned-run-superseded'
+if grep -F 'rerun-failed-jobs"' "$CONTROLLER" >/dev/null; then
+  printf 'FAIL %s\n' "the controller calls rerun-failed-jobs, which keeps the dead pin"; fail=1
+else
+  printf 'ok   %s\n' "the controller never calls rerun-failed-jobs"
+fi
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "a 201 records the cap before anything else" 'pin_ledger_write "$pr_id" rerun'
+src_has "a successful re-run is an INFO event" 'event INFO pinned-run-rerun'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "a refused re-run is recorded and warned about" 'pin_ledger_write "$pr_id" refused'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "the cancel stamp is written once, not per tick" '[ -n "$ledger" ] || pin_ledger_write "$run" cancelled'
+_cls_at=$(grep -n '^  classify_pinned$' "$CONTROLLER" | tail -1 | cut -d: -f1)
+_rr_at=$(grep -n '^  rerun_cancelled_pinned$' "$CONTROLLER" | tail -1 | cut -d: -f1)
+if [ -n "$_cls_at" ] && [ -n "$_rr_at" ] && [ "$_rr_at" -gt "$_cls_at" ]; then
+  printf 'ok   %s\n' "the pending re-runs are finished every tick, after the sweep"
+else
+  printf 'FAIL %s\n' "rerun_cancelled_pinned is not called after classify_pinned (cls=$_cls_at rr=$_rr_at)"; fail=1
+fi
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "collect_hosts records whether the listing succeeded" 'HOSTS_LISTED=1'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "classify_pinned asks pin_sight_decision, with the listing's success" \
+  'sight=$(pin_sight_decision "${HOSTS_LISTED:-0}" "$live" "$MIG_BASE" "$MIG_TARGET")'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "the demand sweep reads an UNFILTERED queued page for re-runs" \
+  'actions/runs?per_page=100&status=queued"'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "and asks rerun_run_decision which of them to fetch" \
+  'rerun_run_decision "$rr_attempt" "$rr_created" "$rr_started" "$sweep_start" "$DEMAND_MAX_AGE"'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "the re-run ids join the fetch list" 'printf '"'"'%s'"'"' "$rr_ids"'
+src_has "a cancelled pinned run tells the operator to re-run it in full" 'never --failed'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "and so does a refused one, as an event rather than a log line" 'pin_run_warning "$run" "refused-$code"'
+
+# The re-run page must never carry the created filter: that filter is the bug.
+_rr_line=$(grep -F 'actions/runs?per_page=100&status=queued' "$CONTROLLER" || true)
+case "$_rr_line" in
+  *created=*) printf 'FAIL %s\n' "the re-run page is filtered on created_at -- it would miss every re-run of an old run"; fail=1 ;;
+  "") printf 'FAIL %s\n' "the re-run page is missing"; fail=1 ;;
+  *) printf 'ok   %s\n' "the re-run page is not filtered on created_at" ;;
+esac
+
+# --- mutants: each rule above must fail when the one line that makes it true is broken
+#
+# Each mutant rewrites the decision file, sources the copy in a subshell, and
+# asserts the case it targets now gives the WRONG answer. A mutant that still
+# passes means the case above is not actually testing that line.
+DECISION="$here/../../modules/ci-runner-host-pool/scripts/pinned-job-decision.sh"
+mutant() { # <desc> <sed-expr> <call...> -- <prefix the ORIGINAL gives>
+  local desc="$1" expr="$2"; shift 2
+  local want="${*: -1}" call=("${@:1:$#-1}") m got
+  m=$(mktemp)
+  sed -e "$expr" "$DECISION" >"$m"
+  if cmp -s "$m" "$DECISION"; then
+    printf 'FAIL mutant did not apply: %s\n' "$desc"; fail=1; rm -f "$m"; return
+  fi
+  got=$( . "$m"; "${call[@]}" )
+  rm -f "$m"
+  case "$got" in
+    "$want"*) printf 'FAIL mutant survived: %s (still %s)\n' "$desc" "$got"; fail=1 ;;
+    *) printf 'ok   mutant killed: %s\n' "$desc" ;;
+  esac
+}
+# shellcheck disable=SC2016  # sed expressions: every $ is text in the decision file
+mutant "an empty pool read as blind again (the #490 wedge)" \
+  's/    0) echo "sighted:pool at zero/    0) echo "blind:pool at zero/' \
+  pin_sight_decision 1 "" "$BASE" 0 sighted:
+# shellcheck disable=SC2016
+mutant "the listing's success ignored" \
+  's/\[ "\$ok" = 1 \] || {/true || {/' \
+  pin_sight_decision 0 "" "$BASE" 0 blind:
+mutant "a target above zero trusted as empty" \
+  's/    \*) echo "blind:MIG target/    *) echo "sighted:MIG target/' \
+  pin_sight_decision 1 "" "$BASE" 1 blind:
+# shellcheck disable=SC2016
+mutant "re-runs judged on created_at instead of their own start" \
+  's/if \[ "\$started" -ge "\$since" \]; then/if [ "$created" -ge "$since" ]; then/' \
+  rerun_run_decision 2 $((NOW - 30000)) $((NOW - 60)) $NOW $MAX fetch:
+# shellcheck disable=SC2016
+mutant "first attempts fetched too (every corpse costs a job call)" \
+  's/\[ "\$attempt" -gt 1 \]/[ "$attempt" -gt 0 ]/' \
+  rerun_run_decision 1 $((NOW - 30000)) $((NOW - 60)) $NOW $MAX skip:
+# shellcheck disable=SC2016
+mutant "a re-run created inside the window fetched twice" \
+  's/if \[ "\$created" -ge "\$since" \]; then/if false; then/' \
+  rerun_run_decision 2 $((NOW - 60)) $((NOW - 30)) $NOW $MAX skip:
+
+mutant "the cap removed: a run already re-run is re-run again" \
+  's/    rerun) echo "cancel-only:the controller already re-ran/    rerun) echo "cancel-then-rerun:the controller already re-ran/' \
+  pin_orphan_action rerun cancel-only:
+mutant "a 403 no longer falls back" \
+  's/    refused) echo "cancel-only:/    refused) echo "cancel-then-rerun:/' \
+  pin_orphan_action refused cancel-only:
+# shellcheck disable=SC2016
+mutant "the re-run no longer waits for a completed run" \
+  's/if \[ "\$status" = completed \]; then/if true; then/' \
+  pin_rerun_decision cancelled 60 in_progress 900 1 1 cancelled push 0 wait:
+mutant "the re-run cap in the pending step removed" \
+  's/    rerun) echo "skip:already re-run once/    rerun) echo "rerun:already re-run once/' \
+  pin_rerun_decision rerun 60 completed 900 skip:
+# shellcheck disable=SC2016
+mutant "the give-up bound removed" \
+  's/if \[ "\$since" -gt "\$max" \]; then/if false; then/' \
+  pin_rerun_decision cancelled 901 queued 900 give-up:
+
+# shellcheck disable=SC2016
+mutant "F1: the attempt check removed (a human's re-run overridden)" \
+  's/if \[ "\$cur" != "\$rec" \]; then/if false; then/' \
+  pin_rerun_decision cancelled 60 completed 900 1 2 cancelled push 0 done:
+# shellcheck disable=SC2016
+mutant "F1: any conclusion re-run, not only cancelled" \
+  's/\[ "\$concl" = cancelled \] || {/true || {/' \
+  pin_rerun_decision cancelled 60 completed 900 1 1 failure push 0 done:
+mutant "F4: the allowlist widened to workflow_dispatch" \
+  's/    push | pull_request | merge_group) return 0 ;;/    push | pull_request | merge_group | workflow_dispatch) return 0 ;;/' \
+  pin_rerun_decision cancelled 60 completed 900 1 1 cancelled workflow_dispatch 0 declined:
+mutant "F4: a superseded run re-run anyway" \
+  's/      1) echo "superseded:/      1) echo "rerun:/' \
+  pin_rerun_decision cancelled 60 completed 900 1 1 cancelled push 1 superseded:
+mutant "F4: an unanswered newer-run check read as none" \
+  's/    # Unknown: fall through to the clock/    echo "rerun:assumed"; return 0\n    # Unknown: fall through to the clock/' \
+  pin_rerun_decision cancelled 60 completed 900 1 1 cancelled push "" wait:
+mutant "N1: the body check dropped (a secondary-limit 403 read as a refusal)" \
+  's/        \*) echo transient; return 0 ;;/        *) ;;/' \
+  actions_write_class 403 4999 "" "$LIMIT" transient
+# shellcheck disable=SC2016
+mutant "F2: the primary limit ignored" \
+  's/if \[ -n "\$ra" \] || \[ "\$rem" = 0 \]; then/if [ -n "$ra" ]; then/' \
+  actions_write_class 403 0 "" "$DENY" transient
+# shellcheck disable=SC2016
+mutant "F2: retry-after ignored" \
+  's/if \[ -n "\$ra" \] || \[ "\$rem" = 0 \]; then/if [ "$rem" = 0 ]; then/' \
+  actions_write_class 403 4999 60 "$DENY" transient
+mutant "F3: a mint 422 read as transient (the missing permission never surfaced)" \
+  's/    422) echo refused ;;/    422) echo transient ;;/' \
+  actions_token_mint_class 422 refused
+
 [ "$fail" = 0 ] && printf '\npinned-job-decision: all cases pass\n'
 exit "$fail"

@@ -649,6 +649,104 @@ gh_token() {
   printf '%s' "$GH_TOKEN"
 }
 
+# --- the Actions-write token (#490) --------------------------------------------
+#
+# The installation token above is UNSCOPED: once the App holds Actions: write,
+# it can cancel, re-run and dispatch workflows in EVERY repository the
+# installation covers, not only this controller's. It is used for every read in
+# this file, and is left exactly as it is so none of them change.
+#
+# The two WRITES this controller makes (cancel and re-run a pinned run) use a
+# second token instead, minted down-scoped to this controller's one repository
+# and to `actions: write` alone. A bug or an injected run id can then reach
+# nothing beyond this repository's runs.
+#
+# GLOBALS, not stdout, and so never called inside `$(...)`: a cache set in a
+# subshell dies with it, and every call would mint a fresh token.
+GH_ACT_TOKEN=""
+GH_ACT_TOKEN_EXPIRY=0
+GH_ACT_MINT=""      # ok | refused:<code> | transient:<code>
+ACT_CLASS=""        # gh_actions_post's result: ok | refused | transient | failed
+ACT_CODE=""
+
+# gh_app_jwt — the App's 9-minute JWT on stdout. The same construction gh_token
+# uses, for the second mint.
+gh_app_jwt() {
+  local now key header payload sig
+  now=$(date +%s)
+  key=$(timeout 60 gcloud secrets versions access latest --secret="$KEY_SECRET" 2>/dev/null)
+  [ -n "$key" ] || { log "cannot read App key secret $KEY_SECRET"; return 1; }
+  _b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+  header=$(printf '{"alg":"RS256","typ":"JWT"}' | _b64)
+  payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$APP_ID" | _b64)
+  sig=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(printf '%s' "$key") | _b64)
+  printf '%s.%s.%s' "$header" "$payload" "$sig"
+}
+
+# gh_actions_token — fills GH_ACT_TOKEN, and GH_ACT_MINT with the outcome.
+gh_actions_token() {
+  local now jwt body resp code
+  now=$(date +%s)
+  if [ -n "$GH_ACT_TOKEN" ] && [ "$now" -lt "$((GH_ACT_TOKEN_EXPIRY - 300))" ]; then
+    GH_ACT_MINT=ok
+    return 0
+  fi
+  GH_ACT_TOKEN=""
+  jwt=$(gh_app_jwt) || { GH_ACT_MINT="transient:no-jwt"; return 0; }
+  body=$(jq -cn --arg r "$REPO" '{repositories: [$r], permissions: {actions: "write"}}')
+  # Body and status in one capture, never a file: the body IS the token.
+  resp=$(curl "${CURL_TIMEOUTS[@]}" -sS -X POST -w '\n%{http_code}' \
+    -H "Authorization: Bearer $jwt" \
+    -H "Accept: application/vnd.github+json" \
+    -d "$body" \
+    "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" 2>>"$LOG") || resp=$'\n000'
+  code=${resp##*$'\n'}
+  case "$(actions_token_mint_class "$code")" in
+    ok)
+      GH_ACT_TOKEN=$(printf '%s' "${resp%$'\n'*}" | jq -r '.token // empty' 2>/dev/null)
+      if [ -n "$GH_ACT_TOKEN" ]; then
+        GH_ACT_TOKEN_EXPIRY=$((now + 3600))
+        GH_ACT_MINT=ok
+      else
+        GH_ACT_MINT="transient:$code"
+      fi
+      ;;
+    refused) GH_ACT_MINT="refused:$code" ;;
+    *) GH_ACT_MINT="transient:$code" ;;
+  esac
+  return 0
+}
+
+# gh_actions_post <run_id> <cancel|rerun> — sets ACT_CLASS and ACT_CODE.
+#
+# The response HEADERS and BODY are both captured, because actions_write_class
+# needs them to tell a missing permission from a rate limit; both answer 403,
+# and only the body's own message says which. The body of these two endpoints
+# is an empty success or a short error document; it never carries a token.
+gh_actions_post() {
+  local run_id="$1" verb="$2" hdr bodyf rem ra body
+  ACT_CLASS=transient
+  ACT_CODE=""
+  gh_actions_token
+  case "$GH_ACT_MINT" in
+    ok) ;;
+    refused:*) ACT_CLASS=refused; ACT_CODE="mint-${GH_ACT_MINT#refused:}"; return 0 ;;
+    *) ACT_CODE="mint-${GH_ACT_MINT#transient:}"; return 0 ;;
+  esac
+  hdr="$STATE_DIR/actions-post.hdr"
+  bodyf="$STATE_DIR/actions-post.body"
+  ACT_CODE=$(curl "${CURL_TIMEOUTS[@]}" -s -o "$bodyf" -D "$hdr" -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer $GH_ACT_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$REPO_FULL/actions/runs/$run_id/$verb") || ACT_CODE=000
+  rem=$(tr -d '\r' <"$hdr" 2>/dev/null | awk -F': *' 'tolower($1) == "x-ratelimit-remaining" { v = $2 } END { print v }')
+  ra=$(tr -d '\r' <"$hdr" 2>/dev/null | awk -F': *' 'tolower($1) == "retry-after" { v = $2 } END { print v }')
+  body=$(head -c 4096 "$bodyf" 2>/dev/null)
+  rm -f "$hdr" "$bodyf"
+  ACT_CLASS=$(actions_write_class "$ACT_CODE" "$rem" "$ra" "$body")
+  return 0
+}
+
 # Body on stdout, and the reason in $STATE_DIR/api.status when there is no body.
 # A FILE, not a variable: callers assign the body with `X=$(gh_api …)`, so every
 # variable this function sets lives and dies in that subshell. With
@@ -836,6 +934,35 @@ collect_demand() {
   local runs_ip
   runs_ip=$(gh_api "repos/$REPO_FULL/actions/runs?status=in_progress&per_page=50" 2>/dev/null)
 
+  # RE-RUNS, WHICH THE WINDOW ABOVE CANNOT SEE (#490). `created` matches the
+  # run's created_at, and a re-run keeps it: a `gh run rerun` of a run pushed
+  # more than DEMAND_MAX_AGE ago is queued NOW, with fresh jobs, and the list
+  # above never returns it. Its unpinned jobs were never demand, and a job it
+  # re-queued pinned to a host long since deleted (what `--failed` does) was
+  # never reaped. So one more page of queued runs, UNFILTERED, is read for the
+  # attempts rerun_run_decision says are live. Only the id list grows: a corpse
+  # on this page costs a jq row, never a job fetch, which is the property the
+  # window exists to protect. Its own spelling (`per_page` first) so the budget
+  # self-test's literal keeps meaning the windowed call.
+  local runs_rr rr_ids="" rr_id rr_attempt rr_created rr_started
+  runs_rr=$(gh_api "repos/$REPO_FULL/actions/runs?per_page=100&status=queued" 2>/dev/null)
+  while IFS=$'\t' read -r rr_id rr_attempt rr_created rr_started; do
+    case "$rr_id" in "" | *[!0-9]*) continue ;; esac
+    case "$(rerun_run_decision "$rr_attempt" "$rr_created" "$rr_started" "$sweep_start" "$DEMAND_MAX_AGE")" in
+      fetch:*) rr_ids="${rr_ids}${rr_id}
+" ;;
+    esac
+  done <<<"$(printf '%s' "$runs_rr" | jq -r '
+    .workflow_runs[]?
+    | select((.run_attempt // 1) > 1)
+    # `-`, never "", for an unparseable stamp: tab is IFS whitespace, so an
+    # empty field COLLAPSES under `read` and hands run_started_at to the
+    # created column. rerun_run_decision reads `-` as unreadable, as it should.
+    | [ (.id | tostring), (.run_attempt | tostring),
+        ((.created_at // "") | fromdateiso8601? // "-" | tostring),
+        ((.run_started_at // "") | fromdateiso8601? // "-" | tostring) ]
+    | @tsv' 2>/dev/null)"
+
   # QUEUED RUNS FIRST, and no `sort -u` across the two lists: the order decides
   # what survives the budget below, and queued jobs are the ones the pool has to
   # scale out FOR. `awk '!seen[$0]++'` keeps that order while still visiting a
@@ -849,8 +976,13 @@ collect_demand() {
   # logged rather than treated as harmless: the honest statement is that demand
   # is a lower bound, full stop.
   local ids
-  ids=$(printf '%s\n%s' "$runs" "$runs_ip" \
-    | jq -r '.workflow_runs[]?.id' 2>/dev/null | awk 'NF && !seen[$0]++')
+  # Re-runs sit between the two: they are queued work, so they rank with the
+  # queued list, but after it, because the window holds the newer pushes.
+  ids=$( {
+    printf '%s' "$runs" | jq -r '.workflow_runs[]?.id' 2>/dev/null
+    printf '%s' "$rr_ids"
+    printf '%s' "$runs_ip" | jq -r '.workflow_runs[]?.id' 2>/dev/null
+  } | awk 'NF && !seen[$0]++')
   [ -n "$ids" ] || return 0
 
   local now
@@ -1038,7 +1170,10 @@ collect_demand() {
       | .jobs[]?
       | select(.status == "queued" or .status == "in_progress")
       | select( ((jlabels | map(select(startswith("host-")))) - $known_labels | length) > 0 )
-      | [ $rid, .status, ((.labels // []) | join(",")), (.created_at // .started_at // "") ]
+      # run_attempt LAST, so the four fields before it keep their meaning: the
+      # re-run ledger records which attempt the controller cancelled (#490).
+      | [ $rid, .status, ((.labels // []) | join(",")), (.created_at // .started_at // ""),
+          ((.run_attempt // 0) | tostring) ]
       | @tsv' 2>/dev/null)
     if [ -n "$pinned_recs" ]; then
       PINNED_JOBS="${PINNED_JOBS}${pinned_recs}
@@ -1837,9 +1972,18 @@ collect_hosts() {
   # delete-instances returns once the MIG accepts it, so for the next tick or
   # two the host still lists as STOPPING -- which drain rule 1 reads as a dead
   # host to reap. See mig_action_in_flight().
-  HOSTS=$(gcloud compute instance-groups managed list-instances "$MIG" \
+  #
+  # HOSTS_LISTED records whether the call SUCCEEDED, which an empty $HOSTS alone
+  # cannot say: a failed listing and a pool at zero both come back empty, and
+  # only the second may be read as "no pinned host exists" (pin_sight_decision,
+  # #490). Reset first, so a tick whose listing fails never inherits the last
+  # tick's success.
+  HOSTS_LISTED=0
+  if HOSTS=$(gcloud compute instance-groups managed list-instances "$MIG" \
     --region="$REGION" --project="$PROJECT" \
-    --format="csv[no-heading](name,instanceStatus,version.instanceTemplate.basename(),instance.uri(),currentAction)" 2>/dev/null)
+    --format="csv[no-heading](name,instanceStatus,version.instanceTemplate.basename(),instance.uri(),currentAction)" 2>/dev/null); then
+    HOSTS_LISTED=1
+  fi
 }
 
 # One describe per tick for both facts we need from the MIG: the target size we
@@ -1847,6 +1991,7 @@ collect_hosts() {
 # THIS pool can create. Kept together so the reaper never costs an extra call.
 MIG_BASE=""
 MIG_TARGET=0
+HOSTS_LISTED=0
 MIG_TEMPLATE=""
 
 collect_mig() {
@@ -1923,8 +2068,14 @@ classify_pinned() {
   # cancellations is wrong. Same fail-safe the drain path and the reaper take:
   # a tick that cannot see is a tick that does not act. Pinned work is still
   # counted, so the metric does not collapse to zero at the same moment.
-  local blind=0
-  [ -n "$live" ] || blind=1
+  #
+  # ...UNLESS THE MIG ITSELF SAYS ZERO (#490). The pool at zero is where a job
+  # pinned to a deleted host ends up, since pinned work never scales a pool
+  # out, so reading every empty list as blind made that wedge permanent. The
+  # rule, and the three facts it needs to agree, is pin_sight_decision.
+  local blind=0 sight
+  sight=$(pin_sight_decision "${HOSTS_LISTED:-0}" "$live" "$MIG_BASE" "$MIG_TARGET")
+  case "$sight" in blind:*) blind=1 ;; esac
 
   # PINNED_JOBS holds one record per JOB; cancellation is per RUN. A matrix of
   # eight pinned jobs is one wedged run, and posting eight cancels to it would
@@ -1934,19 +2085,23 @@ classify_pinned() {
   # which is still pinned demand, because the job is still sitting there.
   local tried=" " gone=" "
   local now run status labels created age epoch verdict token code
-  local pin_host missing
+  local pin_host missing ledger action attempt
   now=$(date +%s)
 
   # The absence clock is refreshed BEFORE any verdict is asked for, so every job
   # in this loop is judged against the same reading of the same tick.
   refresh_host_liveness "$live" "$now" "$blind"
 
-  while IFS=$(printf '\t') read -r run status labels created; do
+  while IFS=$(printf '\t') read -r run status labels created attempt; do
     [ -n "$run" ] || continue
 
     # An unparseable timestamp yields age 0, which reads as "just queued" and
     # therefore as "wait". Erring toward the grace window is the whole posture.
+    # Shape-tested first: `date -d` accepts a bare number (and an empty string)
+    # as a time of day, and an empty created_at collapses under the tab IFS so
+    # that run_attempt would arrive here in its place (#518's lesson).
     age=0
+    case "$created" in *T*) ;; *) created="unparseable" ;; esac
     if epoch=$(date -d "$created" +%s 2>/dev/null); then
       age=$((now - epoch))
       [ "$age" -lt 0 ] && age=0
@@ -2004,7 +2159,7 @@ classify_pinned() {
         esac
         if [ "$blind" = 1 ]; then
           DEMAND_PINNED=$((DEMAND_PINNED + 1))
-          log "pinned run $run: $verdict — NOT cancelled, this tick has no host list (fail-safe)"
+          log "pinned run $run: $verdict — NOT cancelled, this tick cannot see its hosts (${sight#blind:}; fail-safe)"
           continue
         fi
         case "$gone" in *" $run "*) continue ;; esac
@@ -2016,33 +2171,64 @@ classify_pinned() {
             continue
             ;;
         esac
-        # A run nothing can cancel is a run still sitting in the queue: counted,
-        # so ci_demand_pinned shows the wedge instead of reporting zero of it.
-        token=$(gh_token) || {
-          DEMAND_PINNED=$((DEMAND_PINNED + 1))
-          tried="$tried$run "
-          log "pinned run $run: $verdict — no token, not cancelled"
-          continue
-        }
         tried="$tried$run "
-        code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X POST \
-          -H "Authorization: Bearer $token" \
-          -H "Accept: application/vnd.github+json" \
-          "https://api.github.com/repos/$REPO_FULL/actions/runs/$run/cancel")
-        case "$code" in
-          202 | 409)
+        # CANCEL, THEN A FULL RE-RUN ON A LATER TICK (#490). A re-run is only
+        # accepted for a completed run, so the cancel comes first and
+        # rerun_cancelled_pinned finishes the job once GitHub says the run is
+        # completed. The ledger decides whether this run may still get one:
+        # pin_orphan_action caps it at one controller re-run per run id.
+        #
+        # Posted with the DOWN-SCOPED Actions token (gh_actions_post), never
+        # the installation-wide one, and classified from the response headers
+        # as well as the code: a 403 is a rate limit as often as a permission.
+        ledger=$(pin_ledger_read "$run")
+        action=$(pin_orphan_action "${ledger%% *}")
+        gh_actions_post "$run" cancel
+        code="$ACT_CODE"
+        case "$code" in 409) ACT_CLASS=ok ;; esac
+        case "$ACT_CLASS" in
+          transient | failed)
+            # Rate-limited, an outage, or a mint that did not happen: the run is
+            # still sitting in the queue, so it is counted, and the next tick
+            # tries again. Not recorded, so nothing is decided on it.
+            DEMAND_PINNED=$((DEMAND_PINNED + 1))
+            log "pinned run $run: $verdict — cancel not accepted (HTTP $code, $ACT_CLASS); trying again next tick"
+            continue
+            ;;
+        esac
+        case "$ACT_CLASS" in
+          ok)
             # 409 = already finishing. The run is leaving either way, and
             # counting it as handled is what stops the log repeating per tick.
             gone="$gone$run "
             PIN_ORPHANED=$((PIN_ORPHANED + 1))
-            log "pinned run $run: $verdict — cancelled (HTTP $code)"
+            case "$action" in
+              cancel-then-rerun:*)
+                # Stamped once: a second cancel of a run still queued must not
+                # restart the clock that pin_rerun_decision gives up on.
+                # With the ATTEMPT that was cancelled: the re-run is keyed on it.
+                [ -n "$ledger" ] || pin_ledger_write "$run" cancelled "$attempt"
+                log "pinned run $run: $verdict — cancelled (HTTP $code); a full re-run follows once it has completed"
+                ;;
+              *)
+                pin_run_warning "$run" cancelled "$pin_host" \
+                  "pinned run $run: $verdict — cancelled (HTTP $code), NOT re-run: ${action#*:}. Look at why it is unservable, then re-run it in full ('gh run rerun $run', never --failed)"
+                ;;
+            esac
             ;;
           *)
-            # Most likely the app lacks Actions: write. Say so once per tick
-            # rather than retrying: the job still cannot run, and a wedge nobody
-            # can see is exactly what this function exists to prevent.
+            # `refused`: a 403 that is provably not a rate limit, or a 422 at
+            # mint, i.e. the App without Actions: write
+            # (docs/github-app-permissions.md). Recorded, so no re-run is
+            # attempted on the strength of it. Say so rather than retrying: the
+            # job still cannot run, and a wedge nobody can see is exactly what
+            # this function exists to prevent. An EVENT, not only a log line,
+            # because the on-call has no shell here and the one thing that
+            # clears this is a person acting on the run.
             DEMAND_PINNED=$((DEMAND_PINNED + 1))
-            log "pinned run $run: $verdict — cancel REFUSED (HTTP $code); the run will wait for GitHub's own timeout"
+            [ -z "$ledger" ] && pin_ledger_write "$run" refused
+            pin_run_warning "$run" "refused-$code" "$pin_host" \
+              "pinned run $run: $verdict — cancel REFUSED (HTTP $code; the App needs Actions: write to cancel). Cancel it and re-run it in full ('gh run rerun $run', never --failed); until then it waits for GitHub's 24h timeout"
             ;;
         esac
         ;;
@@ -2051,6 +2237,152 @@ classify_pinned() {
 $PINNED_JOBS
 PINNED_EOF
 
+  # The throttle and ledger files are pruned by rerun_cancelled_pinned, which
+  # runs every tick; this function returns early whenever nothing is pinned.
+  return 0
+}
+
+# pin_run_warning <run_id> <outcome> <pin_host> <message>
+#
+# The operator-facing half of the pinned sweep (#490). A run pinned to a host
+# that no longer exists is cleared by exactly one move: cancel it and re-run it
+# IN FULL, so its anchor re-pins to a live host. `gh run rerun --failed` keeps
+# the old `host-*` label and re-creates the wedge. The controller makes that
+# move itself once per run (rerun_cancelled_pinned); this WARNING is for every
+# case where it cannot or may not: a 403 (Actions: write not granted), a run it
+# already re-ran once, a cancel that never completed. An event reaches Cloud
+# Logging via event(), throttled per run so a refused cancel repeats every EVENT_HEARTBEAT
+# rather than every tick. The run id is numeric by the caller's own check.
+pin_run_warning() {
+  local run_id="$1" outcome="$2" host="$3" msg="$4"
+  throttled_event "$STATE_DIR/pinwarn-$run_id" "$outcome" WARNING pinned-run-unservable \
+    "$host" "$msg" run="$run_id" outcome="$outcome"
+}
+
+# --- the re-run ledger (#490) --------------------------------------------------
+#
+# One file per run id, `pinrerun-<id>`, holding "<state> <epoch>". The states
+# are pin_orphan_action's. It is a FILE because the cap it enforces (one
+# controller re-run per run id) has to survive the tick, and a day of files is
+# a few bytes each. Callers pass a run id already checked to be numeric.
+PIN_RERUN_MAX_WAIT=900
+
+pin_ledger_read() { # <run_id>
+  cat "$STATE_DIR/pinrerun-$1" 2>/dev/null || true
+}
+
+pin_ledger_write() { # <run_id> <state> [run_attempt]
+  printf '%s %s %s' "$2" "$(date +%s)" "${3:-}" >"$STATE_DIR/pinrerun-$1" 2>/dev/null || true
+}
+
+# rerun_cancelled_pinned
+#
+# Finishes cancel-then-rerun. Runs every tick, OUTSIDE classify_pinned, because
+# a cancelled run leaves the queued list: the sweep that cancelled it will never
+# see it again, so only the ledger remembers it is owed a re-run.
+#
+# `POST .../runs/{id}/rerun` and never `rerun-failed-jobs`: the full re-run
+# re-runs the anchor, which pins the run to a host that is alive. The failed-jobs
+# variant keeps the old `host-*` label and recreates the wedge.
+rerun_cancelled_pinned() {
+  local f pr_id led state stamp rec now since run_json rstatus rattempt concl rev wf branch
+  local superseded decision
+  now=$(date +%s)
+  for f in "$STATE_DIR"/pinrerun-*; do
+    [ -e "$f" ] || continue
+    pr_id=${f##*/pinrerun-}
+    case "$pr_id" in "" | *[!0-9]*) rm -f "$f"; continue ;; esac
+    led=$(cat "$f" 2>/dev/null) || continue
+    state="" stamp="" rec=""
+    read -r state stamp rec <<<"$led"
+    [ "$state" = cancelled ] || continue
+    since=""
+    case "$stamp" in "" | *[!0-9]*) ;; *) since=$((now - stamp)) ;; esac
+
+    # Every fact the decision needs, from ONE read of the run. `-` for a
+    # missing value, so the tab split below cannot collapse a field.
+    run_json=$(gh_api "repos/$REPO_FULL/actions/runs/$pr_id" 2>/dev/null)
+    rstatus="" rattempt="" concl="" rev="" wf="" branch=""
+    IFS=$'\t' read -r rstatus rattempt concl rev wf branch <<<"$(printf '%s' "$run_json" | jq -r '
+      [ (.status // "-"), ((.run_attempt // "-") | tostring), (.conclusion // "-"),
+        (.event // "-"), ((.workflow_id // "-") | tostring), (.head_branch // "-") ]
+      | @tsv' 2>/dev/null)"
+    [ "$rstatus" = - ] && rstatus=""
+    [ "$rattempt" = - ] && rattempt=""
+    [ "$concl" = - ] && concl=""
+    [ "$rev" = - ] && rev=""
+
+    # IS THERE A NEWER RUN? Asked only when the answer can matter (the run
+    # concluded cancelled), and empty when it cannot be answered, which the
+    # decision reads as "wait" rather than as "no". Run ids are allocated in
+    # increasing order, so "newer" is a larger id on the same workflow and
+    # branch. The branch is URL-encoded: it is text somebody chose.
+    superseded=""
+    if [ "$concl" = cancelled ] && [ -n "$branch" ] && [ "$branch" != - ]; then
+      case "$wf" in
+        "" | - | *[!0-9]*) ;;
+        *)
+          superseded=$(gh_api "repos/$REPO_FULL/actions/workflows/$wf/runs?per_page=20&branch=$(printf '%s' "$branch" | jq -sRr @uri)" 2>/dev/null \
+            | jq -r --argjson id "$pr_id" '[.workflow_runs[]? | select(.id > $id)] | if length > 0 then 1 else 0 end' 2>/dev/null)
+          ;;
+      esac
+    fi
+
+    decision=$(pin_rerun_decision "$state" "$since" "$rstatus" "$PIN_RERUN_MAX_WAIT" \
+      "$rec" "$rattempt" "$concl" "$rev" "$superseded")
+    case "$decision" in
+      done:*)
+        # A person re-ran it, or it finished on its own: not the controller's
+        # business any more, and not worth anybody's attention either.
+        pin_ledger_write "$pr_id" "done" "$rec"
+        log "pinned run $pr_id: ${decision#done:}; nothing to re-run"
+        ;;
+      superseded:*)
+        pin_ledger_write "$pr_id" superseded "$rec"
+        throttled_event "$STATE_DIR/pinwarn-$pr_id" superseded WARNING pinned-run-superseded "" \
+          "pinned run $pr_id: cancelled and NOT re-run, ${decision#superseded:}; re-running would replay older code" \
+          run="$pr_id" outcome=superseded
+        ;;
+      declined:*)
+        pin_ledger_write "$pr_id" declined "$rec"
+        pin_run_warning "$pr_id" declined "" \
+          "pinned run $pr_id: cancelled and NOT re-run, ${decision#declined:}. If it still matters, re-run it in full ('gh run rerun $pr_id', never --failed)"
+        ;;
+      rerun:*)
+        gh_actions_post "$pr_id" rerun
+        case "$ACT_CLASS" in
+          ok)
+            # Recorded BEFORE anything else can fail: this is the cap.
+            pin_ledger_write "$pr_id" rerun "$rec"
+            event INFO pinned-run-rerun "" \
+              "pinned run $pr_id: cancelled and re-run in full by the controller (HTTP $ACT_CODE); its anchor re-pins to a live host" \
+              run="$pr_id"
+            ;;
+          refused)
+            pin_ledger_write "$pr_id" refused "$rec"
+            pin_run_warning "$pr_id" "rerun-refused-$ACT_CODE" "" \
+              "pinned run $pr_id: cancelled, but the full re-run was REFUSED (HTTP $ACT_CODE; the App needs Actions: write). Re-run it in full ('gh run rerun $pr_id', never --failed)"
+            ;;
+          *)
+            # A rate limit, an outage, or GitHub not ready: the ledger still
+            # says cancelled, so the next tick asks again until
+            # PIN_RERUN_MAX_WAIT runs out.
+            log "pinned run $pr_id: full re-run not accepted (HTTP $ACT_CODE, $ACT_CLASS); asking again next tick"
+            ;;
+        esac
+        ;;
+      give-up:*)
+        pin_ledger_write "$pr_id" gaveup
+        pin_run_warning "$pr_id" gaveup "" \
+          "pinned run $pr_id: cancelled but not re-run (${decision#give-up:}). Re-run it in full ('gh run rerun $pr_id', never --failed)"
+        ;;
+    esac
+  done
+
+  # Kept a week, so the one-re-run cap outlives any plausible retry of the
+  # same run; GitHub's own queue limit is a day.
+  find "$STATE_DIR" -maxdepth 1 -name 'pinrerun-*' -mmin +10080 -delete 2>/dev/null || true
+  find "$STATE_DIR" -maxdepth 1 -name 'pinwarn-*' -mmin +1440 -delete 2>/dev/null || true
   return 0
 }
 
@@ -3745,6 +4077,7 @@ tick_pool() {
   # tick for as long as the pinned job stays queued.
   collect_mig
   classify_pinned
+  rerun_cancelled_pinned
 
   local pool_size=0 slots_busy=0 idle_max=0 draining=0 stale_hosts=0
   # Slots that answered, summed only over hosts the runner list could speak

@@ -387,3 +387,296 @@ pinned_job_decision() {
     echo "vanished:$pin_host went away under a running job (${clock}s)"
   fi
 }
+
+# pin_sight_decision <list_ok> <live_hosts_csv> <mig_base> <mig_target>
+#
+# Whether THIS tick may treat "the pinned host is not in the list" as evidence.
+#
+#   list_ok        : 1 when the instance listing call exited 0, anything else
+#                    when it failed or the caller cannot say.
+#   live_hosts_csv : the instance names that listing returned.
+#   mig_base       : the MIG's baseInstanceName, empty when the describe failed.
+#   mig_target     : the MIG's targetSize from the same describe.
+#
+# Echoes `sighted:<reason>` or `blind:<reason>`. Always exits 0.
+#
+# WHY THIS IS A RULE OF ITS OWN (#490). The pinned sweep used to call any tick
+# with an empty host list blind: "the list call failed" and "the pool is at
+# zero" look the same from the list alone, and acting on the first cancels
+# every pinned run in the repository. The fail-safe was right about the failure
+# and wrong about the other half. A pool at zero is EXACTLY where a job pinned
+# to a deleted host lands, because a pinned job is not scale-out demand and so
+# nothing ever brings a host back. Measured on a consumer repository 2026-09-29:
+# pool at 0, 0 runners online, a re-queued job pinned to a host drained hours
+# earlier, and the sweep blind on every tick by construction.
+#
+# So an empty list counts as sight only when three independent facts agree: the
+# listing SUCCEEDED, the MIG describe SUCCEEDED (it is what fills mig_base), and
+# the MIG itself says its target is zero. Any disagreement (a target above zero
+# with nothing listed is a MIG mid-create, or a listing that lied) stays blind,
+# which is the old behaviour and the safe one. A host that is booting is LISTED
+# (the MIG reports it with an empty status while CREATING), so it never reaches
+# this rule at all.
+pin_sight_decision() {
+  local ok="${1:-}" live="${2:-}" base="${3:-}" target="${4:-}"
+
+  # A non-empty list is sight however it was obtained, unchanged from before.
+  [ -n "$live" ] && { echo "sighted:hosts listed"; return 0; }
+
+  [ "$ok" = 1 ] || { echo "blind:the host listing failed"; return 0; }
+  [ -n "$base" ] || { echo "blind:the MIG describe failed"; return 0; }
+  case "$target" in
+    0) echo "sighted:pool at zero (listing and describe both succeeded, target 0)" ;;
+    "" | *[!0-9]*) echo "blind:unreadable MIG target size [$target]" ;;
+    *) echo "blind:MIG target $target but no host listed" ;;
+  esac
+}
+
+# pin_orphan_action <ledger_state>
+#
+# What the controller does with a run the sweep has just called unservable
+# (`orphan`/`vanished`), given what it already did to that run. The ledger is
+# one file per run id in the state directory; its states are written by the
+# caller and mean:
+#
+#   ""         never acted on
+#   cancelled  a cancel was accepted; a full re-run is pending (pin_rerun_decision)
+#   rerun      the controller already re-ran this run in full ONCE
+#   refused    GitHub refused a cancel or a re-run with 403 (no Actions: write)
+#   gaveup     the cancel never completed inside PIN_RERUN_MAX_WAIT
+#   done       a person re-ran it, or it finished, after the cancel (silent)
+#   superseded a newer run of the same workflow on the same branch exists
+#   declined   its event is not on pin_rerun_event_allowed's allowlist
+#
+# Echoes `cancel-then-rerun:<reason>` or `cancel-only:<reason>`. Always exits 0.
+#
+# THE CAP IS THE POINT. A full re-run re-runs the anchor, which re-pins to a
+# live host, so it clears the wedge #490 found. But a run that is unservable
+# AGAIN after the controller's own re-run is not a stale pin any more; it is a
+# workflow or a fleet fault, and re-running it again would loop for as long as
+# the fault lasts. So exactly one controller-initiated re-run per run id, and
+# every later verdict on that run is cancel plus a WARNING for a person.
+pin_orphan_action() {
+  case "${1:-}" in
+    rerun) echo "cancel-only:the controller already re-ran this run once" ;;
+    gaveup) echo "cancel-only:an earlier cancel never completed" ;;
+    done) echo "cancel-only:a person re-ran it or it finished since the controller cancelled it" ;;
+    superseded) echo "cancel-only:a newer run of this workflow exists" ;;
+    declined) echo "cancel-only:its event is not on the re-run allowlist" ;;
+    refused) echo "cancel-only:GitHub refused this App (Actions: write not granted)" ;;
+    *) echo "cancel-then-rerun:unservable, not yet re-run by the controller" ;;
+  esac
+}
+
+# pin_rerun_event_allowed <event>
+#
+# THE RE-RUN ALLOWLIST. The owner's intent is "unstick CI", never "replay old
+# code": a re-run executes the run's ORIGINAL commit with the workflow's own
+# token. For CI events that is harmless (the same checks, on the same commit,
+# against the same base) and it is what unblocks a merge lane. For anything
+# else it is not: `workflow_dispatch` carries a person's inputs from an earlier
+# moment, `schedule` runs are replaced by the next tick of the schedule anyway,
+# and `deployment`/`release`/`workflow_run`/`repository_dispatch` are
+# deploy-style triggers whose replay could ship an old build. So:
+#
+#   allowed : push, pull_request, merge_group
+#   never   : everything else, including an empty or unreadable event
+#
+# Exit 0 = allowed. Pure.
+pin_rerun_event_allowed() {
+  case "${1:-}" in
+    push | pull_request | merge_group) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# pin_rerun_decision <ledger_state> <seconds_since_cancel> <run_status> <max_wait> \
+#                    <recorded_attempt> <current_attempt> <conclusion> <event> \
+#                    <superseded>
+#
+# The second half of cancel-then-rerun, asked once per tick for every run whose
+# ledger says a cancel was accepted. A re-run is only accepted for a COMPLETED
+# run, and a cancel is asynchronous (202), so the re-run happens on a later
+# tick, once GitHub reports the run completed. That keeps it out of the tick's
+# time budget entirely: there is no poll, only a read per pending run.
+#
+#   recorded_attempt : the run_attempt the controller cancelled (in the ledger)
+#   current_attempt  : the run's run_attempt now
+#   conclusion       : the run's conclusion now
+#   event            : the run's triggering event (pin_rerun_event_allowed)
+#   superseded       : 1 when a NEWER run of the same workflow on the same
+#                      branch exists, 0 when none does, empty when the lookup
+#                      failed
+#
+# Echoes one of:
+#   rerun:<reason>       POST .../runs/{id}/rerun now (full, never rerun-failed-jobs)
+#   wait:<reason>        look again next tick
+#   give-up:<reason>     the cancel has not completed in max_wait; stop and warn
+#   done:<reason>        the run is no longer the controller's to act on; close
+#                        the entry SILENTLY (a person re-ran it, or it finished)
+#   superseded:<reason>  a newer run exists; do not replay old code, warn
+#   declined:<reason>    the event is not on the allowlist; do not re-run, warn
+#   skip:<reason>        nothing pending for this run (including the cap)
+#
+# THE RE-RUN IS KEYED ON THE ATTEMPT THE CONTROLLER CANCELLED, not on the run
+# id alone. `completed` on its own says nothing about who completed it: a
+# person may have re-run the run in the meantime (a new attempt, possibly
+# already finished), or the run may have finished before the cancel landed.
+# Re-running either would be the controller overriding a human or replaying a
+# result, so the only state that earns a re-run is: the same attempt, completed,
+# and concluded `cancelled`.
+pin_rerun_decision() {
+  local state="${1:-}" since="${2:-}" status="${3:-}" max="${4:-}"
+  local rec="${5:-}" cur="${6:-}" concl="${7:-}" event="${8:-}" superseded="${9:-}"
+  case "$state" in
+    cancelled) ;;
+    rerun) echo "skip:already re-run once by the controller (cap)"; return 0 ;;
+    *) echo "skip:no cancel pending (${state:-none})"; return 0 ;;
+  esac
+
+  # A readable attempt that moved on is somebody else's action: silent.
+  case "$cur" in
+    "" | *[!0-9]*) ;;
+    *)
+      if [ "$cur" != "$rec" ]; then
+        echo "done:attempt is $cur, the controller cancelled attempt ${rec:-unrecorded}"
+        return 0
+      fi
+      ;;
+  esac
+
+  if [ "$status" = completed ]; then
+    case "$rec" in
+      "" | *[!0-9]*) echo "done:no recorded attempt, so no proof this is the run the controller cancelled"; return 0 ;;
+    esac
+    case "$cur" in
+      "" | *[!0-9]*) echo "done:unreadable current attempt, so no proof this is the run the controller cancelled"; return 0 ;;
+    esac
+    [ "$concl" = cancelled ] || { echo "done:finished on its own (${concl:-no conclusion})"; return 0; }
+    pin_rerun_event_allowed "$event" \
+      || { echo "declined:event ${event:-unknown} is never re-run automatically"; return 0; }
+    case "$superseded" in
+      1) echo "superseded:a newer run of this workflow on this branch exists"; return 0 ;;
+      0) echo "rerun:attempt $rec was cancelled by the controller and nothing newer exists"; return 0 ;;
+    esac
+    # Unknown: fall through to the clock, which waits and eventually gives up.
+    status="completed, newer-run check unreadable"
+  fi
+
+  case "$since" in "" | *[!0-9]*) echo "wait:unreadable cancel stamp"; return 0 ;; esac
+  case "$max" in "" | *[!0-9]*) echo "wait:unreadable max wait"; return 0 ;; esac
+  if [ "$since" -gt "$max" ]; then
+    echo "give-up:still ${status:-unreadable} ${since}s after the cancel"
+  else
+    echo "wait:run is ${status:-unreadable}, ${since}s after the cancel"
+  fi
+}
+
+# actions_write_class <http_code> <x-ratelimit-remaining> <retry-after> <body>
+#
+# What a cancel or re-run response MEANS, from the code, two headers and the
+# response body.
+#
+# A 403 is NOT always "this App lacks Actions: write". GitHub answers 403 for a
+# primary rate limit (x-ratelimit-remaining: 0) and for a secondary one, which
+# carries a retry-after header only SOMETIMES: a secondary-limit 403 can arrive
+# with requests remaining and no retry-after at all. Reading any of those as a
+# permission refusal records the run as `refused`, so it is never re-run, over a
+# limit that clears in minutes.
+#
+# And a permission refusal is the unlikely reading to begin with: the POST is
+# made with the down-scoped token, and that token was only minted because the
+# installation holds Actions: write (the mint answers 422 otherwise). So a 403
+# is a refusal ONLY when GitHub says so in the body, with its permission
+# message, "Resource not accessible by integration", and no rate-limit signal
+# contradicts it (remaining 0, or a retry-after). Anything else is transient.
+#
+# Echoes `ok`, `refused`, `transient` or `failed`. Pure.
+actions_write_class() {
+  local code="${1:-}" rem="${2:-}" ra="${3:-}" body="${4:-}"
+  case "$code" in
+    201 | 202 | 204) echo ok; return 0 ;;
+    403)
+      case "$body" in
+        *"Resource not accessible by integration"*) ;;
+        *) echo transient; return 0 ;;
+      esac
+      if [ -n "$ra" ] || [ "$rem" = 0 ]; then echo transient; else echo refused; fi
+      return 0
+      ;;
+    429 | 5?? | 000 | "") echo transient ;;
+    *) echo failed ;;
+  esac
+}
+
+# actions_token_mint_class <http_code>
+#
+# The down-scoped Actions token (repositories: [this repo], permissions:
+# {actions: write}) is refused at MINT time with 422 when the installation does
+# not hold Actions: write, or does not cover the repository. That is the
+# permission refusal, arriving before any cancel is posted. Anything else that is
+# not 201 is transient: a JWT clock skew, a rate limit, an outage.
+actions_token_mint_class() {
+  case "${1:-}" in
+    201) echo ok ;;
+    422) echo refused ;;
+    *) echo transient ;;
+  esac
+}
+
+# rerun_run_decision <run_attempt> <created_epoch> <run_started_epoch> <now> <max_age>
+#
+# Whether a queued run the windowed run list could NOT have returned must be
+# fetched anyway, because it is a RE-RUN.
+#
+# GitHub's `created` filter on `GET /actions/runs` matches the run's
+# `created_at`, and a re-run KEEPS it: `gh run rerun` (full or `--failed`)
+# bumps `run_attempt` and `run_started_at` and creates fresh job objects, but
+# the run is still the one created at the original push. Measured 2026-09-29 on
+# a consumer repository: created_at 06:32, run_started_at 12:44, run_attempt 3.
+# The controller's queued-run list is filtered to DEMAND_MAX_AGE of creation, so
+# a re-run of anything older than that was invisible to the whole sweep: never
+# counted as demand, and never reaped when pinned to a host that no longer
+# exists. That is #490, reached through the obvious operator move after a flake.
+#
+# Echoes `fetch:<reason>` or `skip:<reason>`. Always exits 0.
+#
+#   * A first attempt is never fetched here: inside the window the filtered
+#     list already has it, and outside it the run is exactly the corpse the
+#     filter exists to keep off the page.
+#   * A re-run CREATED inside the window is already listed; skipping it keeps
+#     its job list from being fetched twice.
+#   * Otherwise the latest attempt's own start decides, against the same
+#     window. An attempt that started before it is a corpse like any other.
+#   * An unreadable start is fetched: one job call too many costs a second of
+#     budget, while a dropped re-run is a wedge nobody can see.
+#   * An unreadable attempt or clock is skipped: without them the rule cannot
+#     tell a re-run from a corpse, and a repository can hold dozens of corpses.
+rerun_run_decision() {
+  local attempt="${1:-}" created="${2:-}" started="${3:-}" now="${4:-}" max_age="${5:-}"
+
+  case "$now" in "" | *[!0-9]*) echo "skip:unreadable clock"; return 0 ;; esac
+  case "$max_age" in "" | *[!0-9]*) echo "skip:unreadable window"; return 0 ;; esac
+  case "$attempt" in "" | *[!0-9]*) echo "skip:unreadable run_attempt [$attempt]"; return 0 ;; esac
+  [ "$attempt" -gt 1 ] || { echo "skip:first attempt, the created filter owns it"; return 0; }
+
+  local since=$((now - max_age))
+  case "$created" in
+    "" | *[!0-9]*) ;;
+    *)
+      if [ "$created" -ge "$since" ]; then
+        echo "skip:created inside the window, already listed"
+        return 0
+      fi
+      ;;
+  esac
+
+  case "$started" in
+    "" | *[!0-9]*) echo "fetch:attempt $attempt with an unreadable start (fail-safe)"; return 0 ;;
+  esac
+  if [ "$started" -ge "$since" ]; then
+    echo "fetch:attempt $attempt started $((now - started))s ago on a run created before the window"
+  else
+    echo "skip:attempt $attempt started before the window too"
+  fi
+}
