@@ -1084,12 +1084,16 @@ echo "pin hold: each assertion above fails against the bug it names"
 # it. A mutation that applies to nothing is itself a failure.
 M="$SB/pin-sweep.mutant"
 
+# The sed pattern matches the literal $vars in the script under test.
+# shellcheck disable=SC2016
 if mutant "$M" 's@|| publish "\$want"@|| :@'; then
   write_hold "$(( $(date +%s) + 600 ))"; rm -f -- "$STUB_ATTR" "$STUB_REFUSE"
   run_pin_sweep "$M"
   check_not "without the republish, a lost hold stays lost -- so the check is live" attr_is "4242 $(hold_expiry)"
 else bad "mutation did not apply: the live republish"; fi
 
+# The sed pattern matches the literal $vars in the script under test.
+# shellcheck disable=SC2016
 if mutant "$M" 's@\[ "\$have" = "\$want" \] || publish@publish@'; then
   write_hold "$(( $(date +%s) + 600 ))"; rm -f -- "$STUB_REFUSE"
   printf '%s' "4242 $(hold_expiry)" >"$STUB_ATTR"
@@ -1097,6 +1101,8 @@ if mutant "$M" 's@\[ "\$have" = "\$want" \] || publish@publish@'; then
   check_not "an unconditional publish writes a confirmed hold -- so the check is live" test "$(puts)" = "$n"
 else bad "mutation did not apply: the read-back"; fi
 
+# The sed pattern matches the literal $vars in the script under test.
+# shellcheck disable=SC2016
 if mutant "$M" 's@if \[ "\$expiry" -gt "\$now" \]; then@if true; then@'; then
   write_hold "$(( $(date +%s) - 5 ))"; rm -f -- "$STUB_PUTS" "$STUB_ATTR" "$STUB_REFUSE"
   run_pin_sweep "$M"
