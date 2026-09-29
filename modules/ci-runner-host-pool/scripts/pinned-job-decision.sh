@@ -432,6 +432,69 @@ pin_sight_decision() {
   esac
 }
 
+# pin_orphan_action <ledger_state>
+#
+# What the controller does with a run the sweep has just called unservable
+# (`orphan`/`vanished`), given what it already did to that run. The ledger is
+# one file per run id in the state directory; its states are written by the
+# caller and mean:
+#
+#   ""         never acted on
+#   cancelled  a cancel was accepted; a full re-run is pending (pin_rerun_decision)
+#   rerun      the controller already re-ran this run in full ONCE
+#   refused    GitHub refused a cancel or a re-run with 403 (no Actions: write)
+#   gaveup     the cancel never completed inside PIN_RERUN_MAX_WAIT
+#
+# Echoes `cancel-then-rerun:<reason>` or `cancel-only:<reason>`. Always exits 0.
+#
+# THE CAP IS THE POINT. A full re-run re-runs the anchor, which re-pins to a
+# live host, so it clears the wedge #490 found. But a run that is unservable
+# AGAIN after the controller's own re-run is not a stale pin any more; it is a
+# workflow or a fleet fault, and re-running it again would loop for as long as
+# the fault lasts. So exactly one controller-initiated re-run per run id, and
+# every later verdict on that run is cancel plus a WARNING for a person.
+pin_orphan_action() {
+  case "${1:-}" in
+    rerun) echo "cancel-only:the controller already re-ran this run once" ;;
+    gaveup) echo "cancel-only:an earlier cancel never completed" ;;
+    refused) echo "cancel-only:GitHub refused this App (Actions: write not granted)" ;;
+    *) echo "cancel-then-rerun:unservable, not yet re-run by the controller" ;;
+  esac
+}
+
+# pin_rerun_decision <ledger_state> <seconds_since_cancel> <run_status> <max_wait>
+#
+# The second half of cancel-then-rerun, asked once per tick for every run whose
+# ledger says a cancel was accepted. A re-run is only accepted for a COMPLETED
+# run, and a cancel is asynchronous (202), so the re-run happens on a later
+# tick, once GitHub reports the run completed. That keeps it out of the tick's
+# time budget entirely: there is no poll, only a read per pending run.
+#
+# Echoes one of:
+#   rerun:<reason>    POST .../runs/{id}/rerun now (full, never rerun-failed-jobs)
+#   wait:<reason>     look again next tick
+#   give-up:<reason>  the cancel has not completed in max_wait; stop and warn
+#   skip:<reason>     nothing pending for this run (including the cap)
+pin_rerun_decision() {
+  local state="${1:-}" since="${2:-}" status="${3:-}" max="${4:-}"
+  case "$state" in
+    cancelled) ;;
+    rerun) echo "skip:already re-run once by the controller (cap)"; return 0 ;;
+    *) echo "skip:no cancel pending (${state:-none})"; return 0 ;;
+  esac
+  if [ "$status" = completed ]; then
+    echo "rerun:the cancelled run has completed"
+    return 0
+  fi
+  case "$since" in "" | *[!0-9]*) echo "wait:unreadable cancel stamp"; return 0 ;; esac
+  case "$max" in "" | *[!0-9]*) echo "wait:unreadable max wait"; return 0 ;; esac
+  if [ "$since" -gt "$max" ]; then
+    echo "give-up:still ${status:-unreadable} ${since}s after the cancel"
+  else
+    echo "wait:run is ${status:-unreadable}, ${since}s after the cancel"
+  fi
+}
+
 # rerun_run_decision <run_attempt> <created_epoch> <run_started_epoch> <now> <max_age>
 #
 # Whether a queued run the windowed run list could NOT have returned must be

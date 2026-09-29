@@ -327,12 +327,16 @@ with the ORIGINAL `host-*` pin, naming a host drained and deleted hours before:
    reads an empty list as sight when the listing succeeded, the MIG describe
    succeeded and the MIG's target size is zero; anything else stays blind.
 
-What the controller does then is **cancel, not re-run**. A full re-run
-(`POST /runs/{id}/rerun`) would re-pin, but it needs `Actions: write`, and the
-App is documented without it ([github-app-permissions.md](github-app-permissions.md)),
-which also means the cancel itself may be refused. Either way the controller
-sends a WARNING `pinned-run-unservable` event to Cloud Logging naming the run and
-the one move that clears it.
+What the controller does then is **cancel, then re-run in full, once**. A re-run
+is accepted only for a completed run, so the controller cancels first and
+records the run in its state directory. On a later tick, once GitHub reports
+the run completed, it posts `POST /runs/{id}/rerun`, never
+`rerun-failed-jobs`, and the anchor re-pins the run to a live host. That sends an
+INFO `pinned-run-rerun` event. There is one controller re-run per run id: a run
+that is unservable again afterwards is only cancelled, with a WARNING
+`pinned-run-unservable` event for a person, so a persistent fault cannot loop.
+Both calls need `Actions: write` ([github-app-permissions.md](github-app-permissions.md)).
+A 403 falls back to the same WARNING, naming the run and the move that clears it.
 
 **Runbook: re-run a pinned workflow in full, never with `--failed`.** `gh run
 rerun <id>` re-runs the anchor, which pins the run to a live host. `gh run rerun

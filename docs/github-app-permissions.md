@@ -29,19 +29,39 @@ Two facts shape everything below:
 |---|---|---|---|
 | **Metadata** | Read | mandatory for every App | nothing works |
 | **Administration** | Read & write | `POST /repos/{owner}/{repo}/actions/runners/registration-token`, `GET /repos/{owner}/{repo}/actions/runners` | **hosts cannot register.** The one permission here that fails loudly — a host boots, cannot get a token, and the pool serves nothing |
-| **Actions** | Read | `GET /repos/{owner}/{repo}/actions/runs`, `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs` | the controller sees no demand, publishes none, and the pool never scales out. Reads on every chart as a quiet repository |
+| **Actions** | Read & write | read: `GET /repos/{owner}/{repo}/actions/runs`, `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`; write: `POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel`, `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun` | without read: the controller sees no demand, publishes none, and the pool never scales out (reads on every chart as a quiet repository). Without write: a run pinned to a deleted host is never cancelled or re-run. Signalled: WARNING `pinned-run-unservable` events with `outcome` `refused-403` or `rerun-refused-403` |
 | **Checks** | Read | `GET /repos/{owner}/{repo}/commits/{ref}/check-runs` | the merge-queue **parking detector** can never report. Signalled: `ci_parked_sweep_denied` non-zero, log `parked sweep: DENIED`, `parkeddenied` alert after 30 min |
 | **Pull requests** | Read | `GET /repos/{owner}/{repo}/pulls?state=open` | same detector, one step earlier — log `parked sweep: cannot list open pull requests` |
 
-**`Actions: write` is not on this list either, and the controller still tries
-one call that needs it**: `POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel`,
-for a run whose job is pinned to a host that no longer exists (ADR
-[§2.6](adr-pr-host-affinity.md)). Without the permission the cancel is refused,
-and the controller sends a WARNING `pinned-run-unservable` event instead, naming
-the run and saying to cancel it and re-run it in full. It never re-runs a run
-itself. Granting the permission would let it cancel, but it would also let the
-identity that job code runs beside dispatch and re-run workflows. That is a
-decision for the App owner, not a default.
+### `Actions: write` — required since #490 (owner decision 2026-09-29)
+
+**Why.** A job pinned to a host that no longer exists can never run. The
+controller clears it the only way that works: it cancels the run, and once
+GitHub reports it completed, it re-runs it in full (`POST .../runs/{id}/rerun`,
+never `rerun-failed-jobs`), so the anchor job re-pins the run to a live host
+(ADR [§2.6](adr-pr-host-affinity.md)). Both calls need `Actions: write`.
+
+**What it enables in the controller.** At most one controller-initiated re-run
+per run id, recorded in the controller's state directory. A run that is
+unservable again after that is only cancelled, with a WARNING for a person. A
+successful re-run is an INFO `pinned-run-rerun` event. A 403 on either call
+falls back to a WARNING `pinned-run-unservable` event that names the run and says
+to re-run it in full, which is exactly the behaviour before the grant.
+
+**Blast radius.** `Actions: write` lets this App, in every repository its
+installation covers, cancel, re-run and delete workflow runs, dispatch
+`workflow_dispatch` workflows, and edit Actions variables and settings — so it
+can START workflows, and a started workflow runs the repository's code with the
+workflow's own token. It still cannot change a repository's contents: no push,
+no merge, no comment, no review. The App private key stays in Secret Manager,
+readable only by the host service account and never by the account job code
+runs as (the identity split below), so job code cannot use this permission.
+That split is what makes the grant acceptable.
+
+**Owner steps.** Exactly the procedure under [How to grant it](#how-to-grant-it):
+the App owner sets **Repository permissions → Actions** to **Read and write**
+and saves, then every installation owner **accepts** the request. Until the
+acceptance, nothing changes, and the controller keeps emitting the 403 WARNING.
 
 **`Contents` is no longer on this list**, and if your App still has it, revoke it.
 It bought exactly one call — `GET /repos/{owner}/{repo}/contents/.mergify.yml`,
@@ -72,8 +92,9 @@ green and going nowhere. Mergify has been removed from every repository in the
 fleet and [the merge lane](merge-lane.md) replaced it, so the sweep, its
 `gh_api_post` call site and the two alerts that watched it are all deleted.
 
-**The only write this App still holds is `Administration`, and it buys exactly
-one thing: a runner registration token.** Nothing on this list can change the
+**The App holds two writes: `Administration`, which buys exactly one thing, a
+runner registration token, and `Actions`, which buys cancelling and re-running
+a run pinned to a dead host (above).** Nothing on this list can change the
 CONTENT of a consumer repository — it cannot comment, merge, push, edit a
 branch, alter a review, or approve. That is worth more than the recovery it
 replaced, and it is the state to keep the App in: every future request for a
@@ -84,7 +105,7 @@ Merge authority deliberately lives elsewhere. The merge lane's App is a
 different identity with its own installation and its own blast radius,
 precisely so that `Contents: write` never lands on the identity that self-hosted
 job code runs beside. That argument is unchanged and is the reason this list
-must stay read-only.
+must stay free of any CONTENT write.
 
 ## Who grants it
 

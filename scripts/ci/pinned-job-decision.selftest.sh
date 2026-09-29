@@ -372,7 +372,60 @@ expect pinned: "a host the MIG is still creating is live, not gone" \
 expect wait: "a host not listed yet is waited on inside the grace window" \
   queued "self-hosted,linux,host-ci-lin-boot" "$POOL" "$BASE" "$LIVE" 120 300
 
+# 4. Cancel, then ONE full re-run by the controller (owner decision 2026-09-29:
+#    the App gets Actions: write). A re-run needs a completed run, so the cancel
+#    comes first and the re-run follows on a later tick.
+is "an unservable run never acted on is cancelled, then re-run" cancel-then-rerun: \
+  "$(pin_orphan_action "")"
+is "a run still queued after its cancel is cancelled again, still owed its re-run" cancel-then-rerun: \
+  "$(pin_orphan_action cancelled)"
+is "the cap: a run the controller already re-ran is only cancelled, never re-run again" cancel-only: \
+  "$(pin_orphan_action rerun)"
+is "a 403 falls back to cancel plus WARNING" cancel-only: \
+  "$(pin_orphan_action refused)"
+is "a cancel that never completed is not retried into a re-run" cancel-only: \
+  "$(pin_orphan_action gaveup)"
+is "cancel-then-rerun: re-run once the cancelled run has completed" rerun: \
+  "$(pin_rerun_decision cancelled 60 completed 900)"
+is "cancel-then-rerun: wait while the cancel is still landing" wait: \
+  "$(pin_rerun_decision cancelled 60 in_progress 900)"
+is "and at exactly max wait it still waits" wait: \
+  "$(pin_rerun_decision cancelled 900 queued 900)"
+is "give up when the cancel never completes" give-up: \
+  "$(pin_rerun_decision cancelled 901 queued 900)"
+is "an unreadable run status waits rather than re-running blind" wait: \
+  "$(pin_rerun_decision cancelled 60 "" 900)"
+is "the cap again: a ledger saying rerun is never re-run a second time" skip: \
+  "$(pin_rerun_decision rerun 60 completed 900)"
+is "a 403 recorded on the ledger is never re-run" skip: \
+  "$(pin_rerun_decision refused 60 completed 900)"
+is "no ledger, no re-run" skip: \
+  "$(pin_rerun_decision "" 60 completed 900)"
+is "an unreadable cancel stamp waits, it does not error" wait: \
+  "$(pin_rerun_decision cancelled x queued 900)"
+
 # --- #490, the caller -----------------------------------------------------------
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "the controller re-runs in FULL, never rerun-failed-jobs" 'actions/runs/$pr_id/rerun"'
+if grep -F 'rerun-failed-jobs"' "$CONTROLLER" >/dev/null; then
+  printf 'FAIL %s\n' "the controller calls rerun-failed-jobs, which keeps the dead pin"; fail=1
+else
+  printf 'ok   %s\n' "the controller never calls rerun-failed-jobs"
+fi
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "a 201 records the cap before anything else" 'pin_ledger_write "$pr_id" rerun'
+src_has "a successful re-run is an INFO event" 'event INFO pinned-run-rerun'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "a refused re-run is recorded and warned about" 'pin_ledger_write "$pr_id" refused'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "the cancel stamp is written once, not per tick" '[ -n "$ledger" ] || pin_ledger_write "$run" cancelled'
+_cls_at=$(grep -n '^  classify_pinned$' "$CONTROLLER" | tail -1 | cut -d: -f1)
+_rr_at=$(grep -n '^  rerun_cancelled_pinned$' "$CONTROLLER" | tail -1 | cut -d: -f1)
+if [ -n "$_cls_at" ] && [ -n "$_rr_at" ] && [ "$_rr_at" -gt "$_cls_at" ]; then
+  printf 'ok   %s\n' "the pending re-runs are finished every tick, after the sweep"
+else
+  printf 'FAIL %s\n' "rerun_cancelled_pinned is not called after classify_pinned (cls=$_cls_at rr=$_rr_at)"; fail=1
+fi
 # shellcheck disable=SC2016  # the controller source is the literal under test
 src_has "collect_hosts records whether the listing succeeded" 'HOSTS_LISTED=1'
 # shellcheck disable=SC2016  # the controller source is the literal under test
@@ -442,6 +495,24 @@ mutant "first attempts fetched too (every corpse costs a job call)" \
 mutant "a re-run created inside the window fetched twice" \
   's/if \[ "\$created" -ge "\$since" \]; then/if false; then/' \
   rerun_run_decision 2 $((NOW - 60)) $((NOW - 30)) $NOW $MAX skip:
+
+mutant "the cap removed: a run already re-run is re-run again" \
+  's/    rerun) echo "cancel-only:the controller already re-ran/    rerun) echo "cancel-then-rerun:the controller already re-ran/' \
+  pin_orphan_action rerun cancel-only:
+mutant "a 403 no longer falls back" \
+  's/    refused) echo "cancel-only:/    refused) echo "cancel-then-rerun:/' \
+  pin_orphan_action refused cancel-only:
+# shellcheck disable=SC2016
+mutant "the re-run no longer waits for a completed run" \
+  's/if \[ "\$status" = completed \]; then/if true; then/' \
+  pin_rerun_decision cancelled 60 in_progress 900 wait:
+mutant "the re-run cap in the pending step removed" \
+  's/    rerun) echo "skip:already re-run once/    rerun) echo "rerun:already re-run once/' \
+  pin_rerun_decision rerun 60 completed 900 skip:
+# shellcheck disable=SC2016
+mutant "the give-up bound removed" \
+  's/if \[ "\$since" -gt "\$max" \]; then/if false; then/' \
+  pin_rerun_decision cancelled 901 queued 900 give-up:
 
 [ "$fail" = 0 ] && printf '\npinned-job-decision: all cases pass\n'
 exit "$fail"
