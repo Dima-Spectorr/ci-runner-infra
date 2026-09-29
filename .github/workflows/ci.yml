@@ -21,6 +21,17 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+  # Run CI on any branch by hand, e.g. a branch pushed without a pull request,
+  # which the two triggers above never see (#1391). No job here is path-filtered
+  # or event-gated, so every run is already a full run and `force_full_ci` has
+  # nothing to widen. The input exists so the fleet-wide override is spelled the
+  # same everywhere, and must widen any path filter added here later.
+  workflow_dispatch:
+    inputs:
+      force_full_ci:
+        description: Run every job regardless of path filters (every run is already full here).
+        type: boolean
+        default: true
 
 permissions:
   contents: read
