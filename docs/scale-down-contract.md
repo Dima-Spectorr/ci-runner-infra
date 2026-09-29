@@ -104,6 +104,14 @@ alert shape for this failure is therefore:
 * any `pin-hold-veto` event whose `hold` contains `read-failed`, repeating for
   the same host across that window.
 
+Both are synced by `scripts/ci/ensure-alert-policies.sh` (#1388). The first is
+*pool cannot reach zero* (`heldpool`). The second is *hosts kept on an
+unverifiable guest-attribute read* (`unverifiedkeep`), which also counts
+WARNING `beacon-read-failed`. Its log-based metric carries no host label, so it
+reads "some host kept this way, continuously" rather than "the same host".
+The events repeat per host while the failure lasts, which makes those the same
+thing in practice.
+
 ## Absence is not an observation
 
 Gate 1 is the one that was missing, and it is the subtlest.

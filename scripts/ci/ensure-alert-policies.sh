@@ -479,6 +479,44 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    # THE HOLE IN THE POLICY ABOVE, closed (#1388). `idle` is muted by
+    # ci_pin_holds_honoured on purpose, so a pin-hold veto that never lifts
+    # silences the one alert that would otherwise catch a pool stuck warm. That is
+    # not hypothetical: on 2026-09-29 three pools sat 3/3, 3/3 and 4/4 held with
+    # ci_demand = 0 for weeks (#1384), and nothing paged.
+    #
+    # "Every running host is held" is a RATIO, and the policy says it as one:
+    # conditionThreshold's denominatorFilter divides the held count by the
+    # running count per series, which needs neither MQL (deprecated) nor PromQL
+    # (a second condition schema policy_unchanged() would have to learn). The two
+    # series carry the same metric and resource labels, so they pair per pool.
+    # GE rather than EQ: drain_decision also vetoes a TERMINATED host, which
+    # counts as held but not as running, so a stuck pool can read above 1. A pool
+    # at zero divides by zero and produces no point, which is the right answer:
+    # there is nothing to hold.
+    #
+    # 7200s is the controller's PIN_HOLD_MAX. No single hold outlives it, and a
+    # run that renews one is demand, so every host held past it with nothing
+    # queued is a veto that is not a hold. Both conditions carry that duration and
+    # match on the resource, for the same reason `idle` does.
+    heldpool) cat <<EOF
+{ "displayName": "CI runners / pool cannot reach zero (every host held by a pin, no demand)",
+  "combiner": "AND_WITH_MATCHING_RESOURCE",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "${MUTE_NOTE}Every RUNNING host in this pool has been kept by the pin-hold veto for two hours while nothing is queued, so the pool cannot drain and never will on its own. It is also the state that silences 'pool not scaling to zero': that policy stands down while ci_pin_holds_honoured is non-zero, deliberately, so a veto that never lifts hides behind it.\n\nTwo hours is PIN_HOLD_MAX. No legitimate hold outlives it without a run renewing it, and a renewing run is demand -- so this is not affinity working. It is a hold the controller could not verify and keeps anyway. Read the controller's events: in Cloud Logging, log ci-controller, jsonPayload.event=\"pin-hold-veto\". The hold field says why. read-failed carries the first 300 bytes of gcloud's error; a 404 on the ci/ guest-attribute namespace was #1384 and is fixed in v5.108.0, so a pool still showing it runs a controller template cut before that. no-zone and malformed-hold are the other two WARNING classes. Compare with 'hosts kept on an unverifiable guest-attribute read', which fires on the same events for a PART of a pool.\n\nNothing is lost by waiting to read it: the held hosts are idle. They cost money until the veto lifts or they are deleted by hand." },
+  "conditions": [ { "displayName": "ci_pin_holds_honoured / ci_hosts_running >= 1 for 2h",
+    "conditionThreshold": { "comparison": "COMPARISON_GE", "thresholdValue": 1.0, "duration": "7200s",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_pin_holds_honoured\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
+      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MEAN" } ],
+      "denominatorFilter": "metric.type=\"custom.googleapis.com/ci/ci_hosts_running\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
+      "denominatorAggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MEAN" } ] } },
+    { "displayName": "ci_demand < 1 for 2h",
+    "conditionThreshold": { "comparison": "COMPARISON_LT", "thresholdValue": 1.0, "duration": "7200s",
+      "filter": "metric.type=\"custom.googleapis.com/ci/ci_demand\" AND resource.type=\"generic_node\"${MUTE_FILTER}",
+      "aggregations": [ { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MAX" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
     queue) cat <<EOF
 { "displayName": "CI runners / queue starved (job waiting past the boot budget)",
   "combiner": "OR",
@@ -624,6 +662,29 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    # The per-host half of heldpool. A host the controller keeps because it could
+    # not READ the host's guest attributes is invisible in every series: the
+    # beacon keep is not a pin hold, so ci_pin_holds_honoured never moves, and a
+    # pin veto on some hosts of a pool never reaches the ratio above. The events
+    # are the only record. Both are throttled to one per host per 10 minutes
+    # while the state lasts, so a 1200s sum window always holds one for a failure
+    # that is still going on, and the 2h duration is PIN_HOLD_MAX again.
+    #
+    # Log-based, so it keys on the CONTROLLER's gce_instance and carries no pool
+    # label -- like egressdenied, --muted-pool cannot exclude it, and it does not
+    # claim to.
+    unverifiedkeep) cat <<EOF
+{ "displayName": "CI runners / hosts kept on an unverifiable guest-attribute read",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "The controller has spent two hours keeping hosts it could not ask about. Every drain and every recycle reads the host's ci/ guest attributes first, and a read that fails KEEPS the host: that is the right fail-safe for one tick, because a host that cannot be proven idle must not be deleted mid-job, and the wrong one for two hours, because it means those hosts will never drain.\n\nTwo events feed this, both WARNING, both in Cloud Logging under log ci-controller: jsonPayload.event=\"beacon-read-failed\" (the idle beacon could not be read; the status and error fields carry gcloud's exit and first 300 bytes) and jsonPayload.event=\"pin-hold-veto\" at WARNING (a pin hold the controller could not verify -- read-failed, no-zone or malformed-hold in the hold field). Group them by jsonPayload.host and jsonPayload.pool. A 403 naming guest attributes is an org policy and reads differently; a 429 is the 10-reads-per-minute-per-instance quota; a 404 on the ci/ namespace is #1384, fixed in v5.108.0, on a controller cut before it.\n\nThis keys on the controller's VM, not a pool, so --muted-pool does not reach it. When EVERY host of a pool is held this way, 'pool cannot reach zero' fires as well, and that one names the pool." },
+  "conditions": [ { "displayName": "ci_unverified_host_keeps > 0 for 2h",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 0.0, "duration": "7200s",
+      "filter": "metric.type=\"logging.googleapis.com/user/ci_unverified_host_keeps\" AND resource.type=\"gce_instance\"",
+      "aggregations": [ { "alignmentPeriod": "1200s", "perSeriesAligner": "ALIGN_SUM" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
   esac
 }
 
@@ -715,6 +776,15 @@ ensure_log_metric ci_egress_denied \
   "Outbound connections the CI runner firewall refused. Non-zero is either a port the pool needs and nobody added, or a job reaching somewhere it should not." \
   'logName:"compute.googleapis.com%2Ffirewall" AND jsonPayload.rule_details.direction="EGRESS" AND jsonPayload.disposition="DENIED"'
 
+# The controller's own events (flush_events in controller-startup.sh), not a
+# platform log: `ci-controller` is the log it writes, `event` the field it keys
+# on. Only WARNING, because pin-hold-veto is also sent at INFO for a live hold,
+# which is affinity working and must not count. Matched on the log's short name
+# so the filter names no project.
+ensure_log_metric ci_unverified_host_keeps \
+  "Controller events for a host kept because its guest attributes could not be read or verified: beacon-read-failed, and pin-hold-veto at WARNING. Sustained non-zero is hosts that will never drain." \
+  'logName:"logs/ci-controller" AND severity=WARNING AND (jsonPayload.event="beacon-read-failed" OR jsonPayload.event="pin-hold-veto")'
+
 # ── metric descriptors ────────────────────────────────────────────────────────
 # An alert policy cannot be created against a metric type Cloud Monitoring has
 # never seen: the API answers "Cannot find metric(s) that match type = ...".
@@ -801,6 +871,11 @@ ensure_descriptor ci_poller_heartbeat        "1 on every controller tick. Absenc
 ensure_descriptor ci_runner_list_blind_ticks "Consecutive ticks the controller could not read the GitHub runner list. Non-zero means scale-in is suspended."
 ensure_descriptor ci_host_idle_seconds_max   "Longest idle time across warm hosts."
 ensure_descriptor ci_pin_holds_honoured      "Warm hosts kept alive this tick because a pull request is pinned to them. Read WITH ci_host_idle_seconds_max and never alone: idle time on a pinned host is affinity working, not a drain that failed, and the two together are what distinguish the pool being used from scale-to-zero being broken."
+# The two heldpool reads besides the holds. Every controller already writes
+# both, so in a pool project these are no-ops; declared so a project whose
+# controller has not ticked yet gets the policy instead of a deferral.
+ensure_descriptor ci_hosts_running           "RUNNING hosts in the pool this tick. The denominator of 'every host held': ci_pin_holds_honoured equal to it with ci_demand at 0 is a pool that cannot drain."
+ensure_descriptor ci_demand                  "Jobs this pool should be running for, excluding pinned ones. The autoscaler's only input."
 ensure_descriptor ci_queue_wait_seconds_max  "Longest time a queued job has waited for a slot."
 ensure_descriptor ci_drain_verdicts          "Drain-loop outcomes, labelled by outcome." outcome
 ensure_descriptor ci_tick_seconds            "Controller tick duration. Approaching the watchdog threshold means an imminent restart loop in which nothing is published at all."
@@ -859,7 +934,7 @@ no_such_metric() {
 }
 
 deferred=""
-for key in heartbeat blind idle queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied applystale hostvanished egressdenied; do
+for key in heartbeat blind idle heldpool queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied applystale hostvanished egressdenied unverifiedkeep; do
   policy_json "$key" >"$tmp/p.json"
   # Neither of these ends in `| head -1`, and that is deliberate. This script
   # runs `set -euo pipefail`; under both options a reader that stops early sends

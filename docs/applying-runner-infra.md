@@ -224,10 +224,11 @@ non-zero saying so.
 cannot stop a fleet from receiving runner configuration. That is the right
 trade, and it means the exit code is for a human running the script by hand —
 it will not turn anything red. Until the fleet audit counts policies per project
-(#979), the check is manual and it is a **count, not a glance**: fourteen is the
-expected number of `CI runners / *` policies in a project, and thirteen is what
-a project has when this grant is missing and someone bootstrapped the rest by
-hand.
+(#979), the check is manual and it is a **count, not a glance**: sixteen is the
+expected number of `CI runners / *` policies in a project since #1388. Two of
+them are log-based: *egress refused* and *hosts kept on an unverifiable
+guest-attribute read*. So a project missing this grant syncs fourteen and
+defers both, and a project bootstrapped by hand before #978 may show thirteen.
 
 The channel half is easy to miss, and missing it is worse than over-granting:
 `monitoring.viewer` (already in the loop above) can *read* channels, so a project
