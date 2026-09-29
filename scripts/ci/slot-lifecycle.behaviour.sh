@@ -139,7 +139,11 @@ MARKER="$SLOT_STATE/$IDX/clean"
 SINCE="$SLOT_STATE/$IDX/dirty-since"
 
 made_user=0
+made_unit=0
+DAEMON_UNIT="ci-dockerd@$IDX.service"
 cleanup() {
+  # The stand-in daemon first: userdel refuses an account with a live process.
+  [ "$made_unit" = 1 ] && systemctl stop "$DAEMON_UNIT" >/dev/null 2>&1
   [ "$made_user" = 1 ] && userdel --remove --force "$U" >/dev/null 2>&1
   rm -rf -- "$SB"
 }
@@ -409,6 +413,82 @@ check "a _work replaced by a symlink is refused" test "$rc" != 0
 check "and the slot is not marked clean"         test ! -f "$MARKER"
 check "and the symlink target is untouched"      test -d /tmp
 rm -f -- "$WORK"
+
+echo
+echo "the slot's private /tmp (#1383)"
+#
+# PrivateTmp keeps one slot's /tmp from its siblings, and the namespace lives as
+# long as the daemon -- many jobs. gitleaks-action downloads to the fixed path
+# /tmp/gitleaks.tmp, so the second gitleaks job on a slot died on the first
+# one's file. The reset now empties that /tmp, and it has to find it through the
+# daemon: the root callers modelled here run in the HOST namespace, where the
+# literal /tmp is everybody's.
+#
+# So the daemon is real enough to own a namespace: a transient unit under the
+# exact name the reset asks systemd about, as the slot user, with PrivateTmp --
+# the three things the reset checks. It is spared by the quiesce the same way
+# the real daemon is, by its cgroup name.
+seed_work
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+HOST_SENTINEL=$(mktemp /tmp/slot-lifecycle-host.XXXXXX)
+dpid=""
+if systemd-run --quiet --unit="$DAEMON_UNIT" --uid="$U" -p PrivateTmp=yes \
+     sleep 600 >>"$HOOKLOG" 2>&1; then
+  made_unit=1
+  # MainPID is set at fork, before systemd has built the namespace. Wait until
+  # the process IS sleep, or /proc/<pid>/root/tmp can still be the host's.
+  for _ in $(seq 1 50); do
+    dpid=$(systemctl show -p MainPID --value "$DAEMON_UNIT" 2>/dev/null)
+    case "$dpid" in '' | 0) dpid="" ;; *) [ "$(cat "/proc/$dpid/comm" 2>/dev/null)" = sleep ] && break ;; esac
+    sleep 0.1
+  done
+fi
+SLOT_TMP="/proc/${dpid:-0}/root/tmp"
+private_tmp() {
+  [ -n "$dpid" ] && [ -d "$SLOT_TMP" ] &&
+    [ "$(stat -L -c '%d:%i' "$SLOT_TMP")" != "$(stat -L -c '%d:%i' /tmp)" ]
+}
+check "the stand-in daemon has a private /tmp to reset" private_tmp
+
+seed_slot_tmp() {
+  printf 'a previous download\n' >"$SLOT_TMP/gitleaks.tmp"
+  install -d -o "$U" -g "$U" "$SLOT_TMP/a-fixed-dir" "$SLOT_TMP/.dotnet"
+  chown "$U:$U" "$SLOT_TMP/gitleaks.tmp"
+}
+seed_slot_tmp
+in_workspace started
+rc=$?
+check "started succeeds with a leftover download"      test "$rc" = 0
+check "started removes the fixed-path download"        test ! -e "$SLOT_TMP/gitleaks.tmp"
+check "started leaves the rest of /tmp to the job boundary" test -d "$SLOT_TMP/a-fixed-dir"
+in_workspace completed
+rc=$?
+check "completed succeeds"                             test "$rc" = 0
+check "completed empties the slot's /tmp"              test ! -e "$SLOT_TMP/a-fixed-dir"
+check "the agent's runtime directory survives"         test -d "$SLOT_TMP/.dotnet"
+check "the stand-in daemon survived the quiesce"       test -d "/proc/${dpid:-0}"
+check "the HOST /tmp is untouched"                     test -f "$HOST_SENTINEL"
+check "and the marker means it"                        test -f "$MARKER"
+
+# Break it back, and prove the assertions above notice: the same reset with the
+# emptying call removed must leave the directory where the job put it.
+MUTANT="$SB/slot-reset.mutant.sh"
+sed 's/^  reset_slot_tmp all || rc=1$/  :/' "$RESET" >"$MUTANT"
+chmod 0755 "$MUTANT"
+check_not "the mutation applied" cmp -s "$RESET" "$MUTANT"
+seed_slot_tmp
+"$MUTANT" completed "$IDX" >>"$HOOKLOG" 2>&1
+check "without the call, the leftover survives -- so the check above is live" test -d "$SLOT_TMP/a-fixed-dir"
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+
+# Through the HOST namespace, with no daemon: nothing may be emptied, because
+# the only /tmp left to find is the host's.
+systemctl stop "$DAEMON_UNIT" >/dev/null 2>&1
+made_unit=0
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+check "with no daemon the reset still succeeds"        test "$?" = 0
+check "and the HOST /tmp is still untouched"           test -f "$HOST_SENTINEL"
+rm -f -- "$HOST_SENTINEL"
 
 # --- the sweep ----------------------------------------------------------------
 #

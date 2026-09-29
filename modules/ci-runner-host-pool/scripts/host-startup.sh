@@ -1056,6 +1056,96 @@ cp -a "\$SLOT_TEMPLATE/." "\$home/" || { say "slot \$idx: could not restore \$ho
 chown -R "\$u:\$u" "\$home" || { say "slot \$idx: could not chown \$home"; rc=1; }
 chmod 0750 "\$home" || { say "slot \$idx: could not chmod \$home"; rc=1; }
 
+# THE SLOT'S PRIVATE /tmp, emptied the way the home is (#1383).
+#
+# PrivateTmp on the daemon and the agent (#25) keeps one slot's /tmp away from
+# its SIBLINGS. It does nothing about the slot's own next job: the namespace
+# lives as long as the daemon does, which is many jobs, so whatever a job left
+# at a fixed path is still there for the one after it. gitleaks-action downloads
+# to /tmp/gitleaks.tmp, and a second gitleaks job on the same slot died with
+# "Destination file path ... already exists" -- a security gate failing over a
+# file the diff never touched. A GitHub-hosted runner starts every job on an
+# empty /tmp; this is what gives a slot the same.
+#
+# THE PATH IS NEVER THE LITERAL /tmp. Three callers run this script and only
+# one of them is inside the slot's namespace: the job hooks, which sudo from the
+# agent. The boot reset is ExecStartPre=+, which systemd runs WITHOUT the unit's
+# sandboxing, and the idle and pin sweeps are root timers -- for all three, /tmp
+# is the HOST's, and emptying it would take every other slot's daemon state and
+# every root service's scratch with it. So the directory is reached through the
+# namespace's owner, the slot's daemon: /proc/<its pid>/root/tmp resolves in its
+# mount namespace whatever namespace this script is standing in.
+#
+# And it is still checked against the host's before anything goes. A daemon
+# that somehow lost PrivateTmp would resolve to the host /tmp by that route too;
+# that is a real fault, but it is the isolation #25 owns, and this script
+# answering it by emptying the host /tmp would be the worse of the two. Refused
+# with a line in the log, and NOT a refused marker: a mistaken refusal here must
+# cost a leftover file, never every slot on the host.
+#
+# WHAT SURVIVES is what the two processes that outlive jobs keep there: the .NET
+# runtime under the agent writes its diagnostic socket, its debug pipes and its
+# named-mutex directory into /tmp, and they are the agent's, not the last job's.
+#
+# 'all' at completed and boot, when the quiesce above has stopped every writer
+# the last job had. At 'started', and on a slot a live run holds -- where the
+# run's own processes are deliberately spared and may still be using /tmp --
+# only the fixed download paths in \$tmp_fixed go, and never a directory.
+tmp_fixed="gitleaks.tmp"
+reset_slot_tmp() { # <all|fixed>
+  local dpid uid owner d ns host mine name f bad=0
+  dpid=\$(systemctl show -p MainPID --value "ci-dockerd@\$idx.service" 2>/dev/null) || dpid=""
+  case "\$dpid" in
+    '' | 0 | *[!0-9]*)
+      # No daemon, no namespace: the next one systemd starts comes with an empty
+      # /tmp of its own, so there is nothing of the last job's to find.
+      say "slot \$idx: its daemon is not running -- no private /tmp to empty"
+      return 0
+      ;;
+  esac
+  uid=\$(id -u "\$u" 2>/dev/null) ||
+    { say "slot \$idx: could not resolve the uid of \$u -- its private /tmp was not emptied"; return 1; }
+  # The pid systemd named, still the slot's own process when it is read. A daemon
+  # that exited in between has taken its namespace with it.
+  owner=\$(stat -c '%u' "/proc/\$dpid" 2>/dev/null) || owner=""
+  if [ "\$owner" != "\$uid" ]; then
+    say "slot \$idx: pid \$dpid is no longer \$u's daemon -- leaving its /tmp alone"
+    return 0
+  fi
+  for d in tmp var/tmp; do
+    ns="/proc/\$dpid/root/\$d"
+    [ -d "\$ns" ] || continue
+    mine=\$(stat -L -c '%d:%i' "\$ns" 2>/dev/null) || mine=""
+    host=\$(stat -L -c '%d:%i' "/proc/1/root/\$d" 2>/dev/null) || host=""
+    if [ -z "\$mine" ] || [ -z "\$host" ] || [ "\$mine" = "\$host" ]; then
+      say "slot \$idx: its daemon's /\$d is not a private one -- refusing to empty what may be the host's"
+      continue
+    fi
+    if [ "\$1" = all ]; then
+      find "\$ns" -mindepth 1 -maxdepth 1 \
+        ! -name .dotnet ! -name 'dotnet-diagnostic-*' ! -name 'clr-debug-pipe-*' \
+        -exec rm -rf -- {} + ||
+        { say "slot \$idx: could not empty its private /\$d"; bad=1; }
+    else
+      for name in \$tmp_fixed; do
+        f="\$ns/\$name"
+        # A file or a link at the name, never a directory: rm -f on a symlink
+        # removes the link and never what it points at, and a directory there
+        # is not a download leftover.
+        if [ -f "\$f" ] || [ -L "\$f" ]; then
+          rm -f -- "\$f" || { say "slot \$idx: could not remove /\$d/\$name"; bad=1; }
+        fi
+      done
+    fi
+  done
+  return "\$bad"
+}
+if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
+  reset_slot_tmp all || rc=1
+else
+  reset_slot_tmp fixed || rc=1
+fi
+
 # THE TOOL CACHE IS NOT SWEPT, AND THAT IS THE POINT — but it is REPORTED.
 #
 # $CACHE_SLOTS/<idx>/$TOOL_CACHE_NAME is outside _work and outside the home, so

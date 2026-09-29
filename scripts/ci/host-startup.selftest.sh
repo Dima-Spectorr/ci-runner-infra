@@ -197,6 +197,23 @@ has_slot_tmp_isolation() { # <file>
   matches "$code" '^JoinsNamespaceOf=ci-dockerd@\$idx\.service$'
 }
 
+# ...and the private /tmp outlives the job, because it lives as long as the
+# daemon (#1383): a download to a fixed path there (gitleaks-action's
+# /tmp/gitleaks.tmp) failed the NEXT job on the same slot. The reset empties it,
+# and three callers run the reset in the HOST mount namespace, so the directory
+# must be reached through the daemon's pid and checked against the host's before
+# anything is removed -- the literal /tmp there is every slot's and root's.
+has_slot_tmp_reset() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'systemctl show -p MainPID --value "ci-dockerd@\\\$idx\.service"' || return 1
+  matches "$code" 'ns="/proc/\\\$dpid/root/\\\$d"' || return 1
+  matches "$code" '\[ "\\\$mine" = "\\\$host" \]' || return 1
+  matches "$code" '^  reset_slot_tmp all \|\| rc=1$' || return 1
+  matches "$code" '^  reset_slot_tmp fixed \|\| rc=1$' || return 1
+  matches "$code" '^tmp_fixed=".*gitleaks\.tmp.*"$'
+}
+
 # Each slot's daemon picks a host port for a service container out of
 # /proc/sys/net/ipv4/ip_local_port_range, and RootlessKit binds that number in
 # the ONE shared host netns. Every slot reading the same default range picks the
@@ -855,6 +872,12 @@ if has_slot_tmp_isolation "$SCRIPT"; then
   ok
 else
   bad "slots share /tmp, or the agent does not share its daemon's — a fixed path there is owned by whichever slot ran first and every other slot gets EACCES on it (SOAP-To-REST #2017)"
+fi
+
+if has_slot_tmp_reset "$SCRIPT"; then
+  ok
+else
+  bad "the slot reset does not empty the slot's private /tmp through its daemon's namespace, or does so without checking it is not the host's — a fixed-path download one job leaves there fails the next job on the slot (#1383), and a literal /tmp from a root caller is the host's"
 fi
 
 if has_port_isolation "$SCRIPT"; then
@@ -1781,6 +1804,11 @@ mutate "probe back to a name in /etc/hosts" 's|^DNS_PROBE_NAME=.*|DNS_PROBE_NAME
 mutate "daemon mount-namespace probe removed" 's|nsenter -t "$dpid" -m -n -- getent ahostsv4|nsenter --net="/run/netns/$ns" getent ahostsv4|' has_host_resolver
 mutate "slots share /tmp again"          's/^PrivateTmp=yes$/PrivateTmp=no/'                           has_slot_tmp_isolation
 mutate "only the daemon gets a private /tmp" 's/^JoinsNamespaceOf=ci-dockerd@\$idx\.service$/#&/'      has_slot_tmp_isolation
+mutate "reset empties the literal /tmp"     's|ns="/proc/\\$dpid/root/\\$d"|ns="/\\$d"|'                  has_slot_tmp_reset
+mutate "host-/tmp guard dropped"            's/\[ "\\$mine" = "\\$host" \]/false/'                        has_slot_tmp_reset
+mutate "/tmp not emptied at the boundary"   's/^  reset_slot_tmp all || rc=1$/  :/'                        has_slot_tmp_reset
+mutate "leftover download kept at started"  's/^  reset_slot_tmp fixed || rc=1$/  :/'                      has_slot_tmp_reset
+mutate "namespace owner not the slot daemon" 's/--value "ci-dockerd@\\$idx.service"/--value "ci-runner@\\$idx.service"/' has_slot_tmp_reset
 
 mutate "one namespace for every slot"        "s|printf 'ci-s%s'|printf 'ci-shared'|"                                         has_port_isolation
 mutate "daemon left in the host namespace"   's|^NetworkNamespacePath=/run/netns/\$(slot_netns "\$idx")$||'                     has_port_isolation
