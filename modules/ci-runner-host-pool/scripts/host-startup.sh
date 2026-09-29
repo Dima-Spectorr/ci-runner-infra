@@ -776,17 +776,17 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     rest=\${line##*') '}
     read -r state _ <<< "\$rest"
     [ "\$state" = Z ] && continue
-    # THE SLOT'S SERVICE MANAGER ITSELF IS SPARED, and nothing else it runs
-    # (#1395). \`user@<uid>.service/init.scope\` is \`systemd --user\` and its
-    # (sd-pam); \`session.slice/dbus.service\` is the user bus. runc creates every
-    # container's cgroup scope through both, so the next job's first container
-    # needs them. Everything ELSE under \`user@<uid>.service\` is a job's: a job
-    # can \`systemd-run --user\` a unit into app.slice (or any slice it names),
-    # and sparing the whole tree let that unit run on into the next job -- the
-    # user manager lingers, so nothing else ever stops it. Its units are stopped
-    # by stop_user_units before this runs; what they leave is killed here.
+    # NOTHING UNDER \`user@<uid>.service\` IS SPARED BY CGROUP (#1395). The slot's
+    # service manager, its (sd-pam) and the user bus arrive in \$2 BY PID --
+    # see user_manager_pids -- because every cgroup in that subtree is the
+    # slot's to write: a job can move itself into init.scope, and the bus forks
+    # a job's D-Bus-activated helper straight into dbus.service's cgroup.
+    # Everything else there is a job's: \`systemd-run --user\` units in app.slice
+    # or any slice they name, and sparing the whole tree let them run on into
+    # the next job. Their units are stopped by stop_user_units before this
+    # runs; what they leave is killed here.
     #
-    # AND \`ci-dockerd@<idx>.service\` BY NAME, anchored under system.slice so a
+    # \`ci-dockerd@<idx>.service\` IS spared by cgroup, anchored under system.slice so a
     # job's own user unit of the same name is not spared: the rootless daemon
     # is a SYSTEM unit with \`User=ci-s%i\` (see the unit written further down),
     # so its processes are owned by the slot uid -- which is what selects them
@@ -806,7 +806,7 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     #
     # every slot, every host, every boot. The pool then drained the host as a
     # failed registration and rebuilt it from the same template, forever.
-    grep -qE "^0::/user\.slice/user-\$1\.slice/user@\$1\.service/(init\.scope|session\.slice/dbus\.service)\$|^0::/system\.slice/(.*/)?ci-dockerd@\${5:-%}\.service(/|\$)" "\$d/cgroup" 2>/dev/null && continue
+    grep -qE "^0::/system\.slice/(.*/)?ci-dockerd@\${5:-%}\.service(/|\$)" "\$d/cgroup" 2>/dev/null && continue
     # AND THE AGENT'S OWN TREE, when the agent is not already on the chain above,
     # AND EVERY CONTAINER, by descent from the daemon's processes: a container's
     # cgroup is \`user@<uid>.service/user.slice/docker-<id>.scope\` (the cgroup
@@ -873,10 +873,36 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
 user_units() { # <listing> -- the unit names in it a job could have made
   printf '%s\n' "\$1" | awk '\$1 != "" && \$1 != "dbus.service" && \$1 != "dbus.socket" && \$3 != "inactive" && \$3 != "failed" { print \$1 }'
 }
+#
+# THE USER BUS ITSELF, when its unit is not the stock one: a job can add a
+# drop-in under ~/.config/systemd/user/dbus.service.d, daemon-reload and
+# restart the bus, and the running daemon then carries the job's ExecStart= or
+# ExecStartPost= into every later job -- the home wipe removes the file, not
+# the process. \`revert\` drops every user drop-in and override for the unit and
+# reloads; the stop then lets dbus.socket start the stock one on first use.
+dbus_is_stock() { # <FragmentPath> <DropInPaths> of dbus.service
+  local p
+  case "\$1" in /usr/lib/systemd/user/* | /etc/systemd/user/*) ;; *) return 1 ;; esac
+  # word-splitting is the point: DropInPaths is space-separated, and a path a
+  # job wrote with a space in it fails the case below all the same.
+  # shellcheck disable=SC2086
+  for p in \$2; do
+    case "\$p" in /usr/lib/systemd/user/* | /etc/systemd/user/*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
 stop_user_units() { # <uid>
-  local all names
-  systemctl is-active --quiet "user@\$1.service" 2>/dev/null || return 0
-  all=\$(timeout 30 systemctl --user -M "\$u@" list-units --no-legend --plain \
+  local all names frag drop
+  timeout -k 5 10 systemctl is-active --quiet "user@\$1.service" 2>/dev/null || return 0
+  frag=\$(timeout -k 5 30 systemctl --user -M "\$u@" show -p FragmentPath --value dbus.service 2>/dev/null) &&
+    drop=\$(timeout -k 5 30 systemctl --user -M "\$u@" show -p DropInPaths --value dbus.service 2>/dev/null) ||
+    { say "slot \$idx: could not read the user bus unit of \$u -- refusing to call this slot clean"; return 1; }
+  if ! dbus_is_stock "\$frag" "\$drop"; then
+    say "slot \$idx: the user bus of \$u is not the stock unit (\$(safe "\$frag \$drop")) -- reverting and stopping it"
+    timeout -k 5 30 systemctl --user -M "\$u@" revert dbus.service >/dev/null 2>&1
+    timeout -k 5 60 systemctl --user -M "\$u@" stop dbus.service >/dev/null 2>&1
+  fi
+  all=\$(timeout -k 5 30 systemctl --user -M "\$u@" list-units --no-legend --plain \
     --type=service,socket,timer,path 2>/dev/null) ||
     { say "slot \$idx: could not list the units of \$u's service manager -- refusing to call this slot clean"; return 1; }
   names=\$(user_units "\$all")
@@ -885,17 +911,38 @@ stop_user_units() { # <uid>
   # word-splitting is the point -- one unit per argument, and a unit name holds
   # no whitespace.
   # shellcheck disable=SC2086
-  timeout 60 systemctl --user -M "\$u@" stop -- \$names >/dev/null 2>&1
+  timeout -k 5 60 systemctl --user -M "\$u@" stop -- \$names >/dev/null 2>&1
   # shellcheck disable=SC2086
-  timeout 30 systemctl --user -M "\$u@" kill --signal=SIGKILL -- \$names >/dev/null 2>&1
-  timeout 30 systemctl --user -M "\$u@" reset-failed >/dev/null 2>&1
-  all=\$(timeout 30 systemctl --user -M "\$u@" list-units --no-legend --plain \
+  timeout -k 5 30 systemctl --user -M "\$u@" kill --signal=SIGKILL -- \$names >/dev/null 2>&1
+  timeout -k 5 30 systemctl --user -M "\$u@" reset-failed >/dev/null 2>&1
+  all=\$(timeout -k 5 30 systemctl --user -M "\$u@" list-units --no-legend --plain \
     --type=service,socket,timer,path 2>/dev/null) ||
     { say "slot \$idx: could not list the units of \$u's service manager -- refusing to call this slot clean"; return 1; }
   names=\$(user_units "\$all")
   [ -z "\$names" ] && return 0
   say "slot \$idx: unit(s) of the last job would not stop: \$(safe "\$(printf '%s' "\$names" | tr '\n' ' ')") -- refusing to call this slot clean"
   return 1
+}
+
+# WHAT OF THE SLOT'S SERVICE MANAGER SURVIVES, BY PID (#1395): the manager
+# (user@<uid>'s MainPID), its (sd-pam) -- the manager's EARLIEST child, forked
+# when the manager started and so before any job could fork one -- and the user
+# bus daemon (dbus.service's MainPID, read after stop_user_units has replaced a
+# non-stock one). runc creates every container's scope through the manager
+# and the bus, so the next job's first container needs all three. Nothing else
+# in their cgroups is spared: a D-Bus-activated helper is forked into
+# dbus.service's cgroup by the bus itself.
+user_manager_pids() { # <uid> -- one pid per line
+  local m kids d
+  m=\$(timeout -k 5 10 systemctl show -p MainPID --value "user@\$1.service" 2>/dev/null) || return 0
+  case "\$m" in '' | 0 | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "\$m"
+  kids=\$(ps --ppid "\$m" -o pid= --sort=start_time 2>/dev/null)
+  # shellcheck disable=SC2086
+  set -- \$kids
+  [ -n "\${1:-}" ] && printf '%s\n' "\$1"
+  d=\$(timeout -k 5 10 systemctl --user -M "\$u@" show -p MainPID --value dbus.service 2>/dev/null) || d=""
+  case "\$d" in '' | 0 | *[!0-9]*) ;; *) printf '%s\n' "\$d" ;; esac
 }
 
 # WHAT A JOB LEFT RUNNING OUTSIDE A CONTAINER.
@@ -981,6 +1028,7 @@ quiesce_slot() {
   # manager as fast as the loop below kills it, and a timer has no process for
   # the loop to find at all.
   stop_user_units "\$uid" || units_rc=1
+  keep="\$keep\$(user_manager_pids "\$uid" | tr '\n' ' ')"
 
   targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
   [ -n "\$targets" ] || return "\$units_rc"
