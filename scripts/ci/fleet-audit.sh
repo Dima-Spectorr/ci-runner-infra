@@ -119,6 +119,89 @@ pin_in() {
     | head -1 | grep -oE '[0-9a-f]{40}$'
 }
 
+# --- the two-file lane (#1380, #1382) ------------------------------------------
+#
+# A private consumer's lane is `merge-lane.yml` (CI completions, pool label) and
+# `merge-lane-events.yml` (everything else, hosted), woken on a review by
+# `merge-lane-review-relay.yml`. Three things drift between those files and
+# nothing in the consumer says so: the events file's pin, the relay's `name:`
+# against the events file's `workflows:` entry (a rename detaches the wake-up
+# silently), and the two `with:` blocks, which must be the same lane reached two
+# ways. Pure text functions, so the collector self-test holds them.
+
+# workflow_name_of <text> — the top-level `name:`, unquoted; empty if absent.
+workflow_name_of() {
+  printf '%s\n' "$1" | tr -d '\r' | grep -m1 -E '^name:' |
+    sed -E "s/^name:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/"
+}
+
+# workflow_run_names_of <text> — one line per name in `workflow_run.workflows`,
+# inline `[a, b]` or a YAML sequence, unquoted.
+workflow_run_names_of() {
+  # No interval expressions and no POSIX classes inside awk: the hosted image's
+  # default awk is not guaranteed to be gawk.
+  printf '%s\n' "$1" | tr -d '\r' | grep -vE '^[[:space:]]*#' | awk '
+    /^  workflow_run:/                 { wr = 1; next }
+    wr && /^  [^ ]/                    { wr = 0 }
+    wr && /^[^ ]/                      { wr = 0 }
+    wr && /^    workflows:/            { ws = 1
+                                         line = $0
+                                         sub(/^    workflows:[ \t]*/, "", line)
+                                         sub(/[ \t]+#.*$/, "", line)
+                                         if (line ~ /^\[/) {
+                                           sub(/^\[/, "", line); sub(/\][ \t]*$/, "", line)
+                                           n = split(line, parts, ",")
+                                           for (i = 1; i <= n; i++) print parts[i]
+                                           ws = 0
+                                         }
+                                         next }
+    wr && ws && /^      - /            { line = $0; sub(/^      - /, "", line)
+                                         sub(/[ \t]+#.*$/, "", line); print line; next }
+    wr && ws                           { ws = 0 }
+  ' | sed -E "s/^[[:space:]]+//; s/[[:space:]]+$//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/" | grep -v '^$'
+}
+
+# relay_agrees <events-text> <relay-text> — 1 when the relay's `name:` is one of
+# the names the events file's `workflow_run` hears, 0 when it is not, empty when
+# either side could not be read.
+relay_agrees() {
+  local name heard
+  [ -n "$1" ] && [ -n "$2" ] || return 0
+  name=$(workflow_name_of "$2")
+  [ -n "$name" ] || return 0
+  heard=$(workflow_run_names_of "$1")
+  # Nothing heard is the PARSER's silence as often as the file's: an indent or
+  # a list form it does not read yields the same empty list. Unknown, never a
+  # mismatch — docs/fleet-audit.md: an unread fact is a warning, not a fail.
+  [ -n "$heard" ] || return 0
+  if printf '%s\n' "$heard" | grep -cxF -- "$name" >/dev/null; then echo 1; else echo 0; fi
+}
+
+# lane_with_of <text> — the lane job's `with:` block, comments, blank lines and
+# the `runs-on:` key removed: the one input the two files legitimately differ in.
+lane_with_of() {
+  # A line indented four spaces or fewer ends the block. Blank lines and
+  # full-line comments do not — they are dropped BEFORE the indentation test,
+  # so a comment at any indent inside the block can neither end it nor count.
+  # A trailing ` # …` is stripped from each kept line.
+  printf '%s\n' "$1" | tr -d '\r' | awk '
+    /^    with:[ \t]*(#.*)?$/  { w = 1; next }
+    w && /^[ \t]*(#.*)?$/      { next }
+    w                          { match($0, /^ */); if (RLENGTH <= 4) w = 0 }
+    w                          { sub(/[ \t]+#.*$/, ""); sub(/[ \t]+$/, ""); print }
+  ' | grep -vE '^      runs-on:'
+}
+
+# with_agrees <lane-text> <events-text> — 1 when the two `with:` blocks are the
+# same apart from `runs-on`, 0 when they differ, empty when either is unread.
+with_agrees() {
+  local a b
+  a=$(lane_with_of "$1")
+  b=$(lane_with_of "$2")
+  [ -n "$a" ] && [ -n "$b" ] || return 0
+  if [ "$a" = "$b" ]; then echo 1; else echo 0; fi
+}
+
 # want_pin — the commit every caller should pin: the tag this repository's
 # VERSION names, dereferenced. NOT the tag name and NOT the floating `v5`: a
 # caller runs on hosts holding a GCP identity, so it pins an immutable commit.
@@ -430,8 +513,8 @@ backlog_facts() {
 
 facts_for() {
   local repo="$1" tier="$2" want="$3"
-  local lane guard reaper workflows
-  local has_lane=0 has_guard=0 has_reaper=0 has_ci=""
+  local lane guard reaper events relay workflows
+  local has_lane=0 has_guard=0 has_reaper=0 has_events=0 has_relay=0 has_ci=""
 
   workflows=$(api "repos/$OWNER/$repo/contents/.github/workflows" | jq -r '.[].name // empty' 2>/dev/null)
   if [ -n "$workflows" ]; then
@@ -443,6 +526,8 @@ facts_for() {
     printf '%s\n' "$workflows" | grep -cx 'merge-lane.yml' >/dev/null && has_lane=1
     printf '%s\n' "$workflows" | grep -cx 'pr-guard-self.yml' >/dev/null && has_guard=1
     printf '%s\n' "$workflows" | grep -cx 'branch-reaper-self.yml' >/dev/null && has_reaper=1
+    printf '%s\n' "$workflows" | grep -cx 'merge-lane-events.yml' >/dev/null && has_events=1
+    printf '%s\n' "$workflows" | grep -cx 'merge-lane-review-relay.yml' >/dev/null && has_relay=1
   else
     # An empty listing is either "no workflows" or "the read failed", and the
     # two must not render alike. The repository itself answers: a repository
@@ -457,6 +542,23 @@ facts_for() {
   if [ "$has_lane" = "1" ]; then
     lane=$(file_at "$repo" ".github/workflows/merge-lane.yml")
     facts="$facts;lane_pin=$(pin_in "$lane" 'merge-lane\.yml')"
+    facts="$facts;has_events=$has_events"
+    [ "$has_events" = "1" ] && {
+      # The events file calls the same callee, so it carries the same kind of
+      # pin — and drifts from merge-lane.yml's exactly the way the guard and
+      # reaper pins drifted from each other.
+      events=$(file_at "$repo" ".github/workflows/merge-lane-events.yml")
+      facts="$facts;events_pin=$(pin_in "$events" 'merge-lane\.yml')"
+      facts="$facts;with_match=$(with_agrees "$lane" "$events")"
+      if [ "$has_relay" = "1" ]; then
+        relay=$(file_at "$repo" ".github/workflows/merge-lane-review-relay.yml")
+        facts="$facts;relay_match=$(relay_agrees "$events" "$relay")"
+      else
+        # No relay at all: whatever name the events file listens for, nothing
+        # emits it, so a review never wakes the lane.
+        facts="$facts;relay_match=0"
+      fi
+    }
     [ "$has_guard" = "1" ] && {
       guard=$(file_at "$repo" ".github/workflows/pr-guard-self.yml")
       facts="$facts;guard_pin=$(pin_in "$guard" 'pr-guard\.yml')"

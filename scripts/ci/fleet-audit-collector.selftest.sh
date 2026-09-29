@@ -17,6 +17,10 @@
 # of the two shapes it expects: a number the collector established, or a count
 # with NO age, which the rule turns into a warning.
 #
+# It also holds the pure text readers for the two-file lane (#1382): the events
+# file's pin, the relay's name against what the events file hears, and the two
+# `with:` blocks — fed the documented template itself, near the end.
+#
 # No network and no `gh`: the file is sourced with FLEET_AUDIT_LIB=1, which
 # stops it before its run section, and `api` is replaced below.
 set -uo pipefail
@@ -342,6 +346,127 @@ reset_fixture
 F_CMP='{"ahead_by":4,"base_commit":{"commit":{"committer":{"date":"'"$(iso 7200)"'"}}},"commits":[]}'
 is "tag_readable=1" "ahead_by with an empty commit list is unknown"
 
+# --- the two-file lane: events pin, relay name, with: blocks (#1382) ----------
+#
+# The fixtures ARE the documented template, read out of docs/merge-lane.md: the
+# files a consumer copies are the files the audit has to parse, so a template
+# edit the parser cannot read fails here rather than in the first audit after
+# a consumer copies it.
+DOC="$HERE/../../docs/merge-lane.md"
+doc_block() { # <workflow name>
+  awk -v want="name: $1" '
+    /^```yaml$/            { inblk = 1; first = 1; keep = 0; buf = ""; next }
+    inblk && /^```$/       { if (keep) printf "%s", buf; inblk = 0; next }
+    inblk                  { if (first) { keep = ($0 == want); first = 0 }
+                             buf = buf $0 "\n" }
+  ' "$DOC"
+}
+T_POOL=$(doc_block 'Merge lane')
+T_EVENTS=$(doc_block 'Merge lane (events)')
+T_RELAY=$(doc_block 'Merge lane review relay')
+eq "$([ -n "$T_POOL" ] && [ -n "$T_EVENTS" ] && [ -n "$T_RELAY" ] && echo 1)" 1 \
+   "all three template blocks are found in the doc, so no case below is vacuous"
+
+# The events file carries the same pin the pool file does, and pin_in reads it.
+eq "$(pin_in "$T_EVENTS" 'merge-lane\.yml' | grep -cE '^[0-9a-f]{40}$')" 1 \
+   "the events template's pin is readable by pin_in"
+eq "$(pin_in "$T_EVENTS" 'merge-lane\.yml')" "$(pin_in "$T_POOL" 'merge-lane\.yml')" \
+   "the two lane templates pin the same commit"
+
+eq "$(workflow_name_of "$T_RELAY")" "Merge lane review relay" "the relay's name is read from its name: line"
+eq "$(workflow_name_of "name: 'Quoted relay'  # x")" "Quoted relay" "a quoted, commented name: is unquoted"
+eq "$(relay_agrees "$T_EVENTS" "$T_RELAY")" 1 "the documented relay matches what the events template hears"
+# edited <before> <after> <description> — every fixture below is the template
+# with one substitution, and a `${var/pattern/…}` whose pattern misses returns
+# the text UNCHANGED. The case after it would then assert on the healthy
+# template and could pass for that reason alone, so each edit is asserted to
+# have landed before it is used.
+edited() {
+  if [ "$1" != "$2" ]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1)); printf 'FAIL: the fixture edit changed nothing: %s\n' "$3"; fi
+}
+
+X="${T_RELAY/name: Merge lane review relay/name: Review relay}"
+edited "$T_RELAY" "$X" "relay renamed"
+eq "$(relay_agrees "$T_EVENTS" "$X")" 0 "a relay renamed away from the events file's workflows: entry is a mismatch"
+
+X="${T_EVENTS/workflows: \[Merge lane review relay\]/workflows: [Other relay]}"
+edited "$T_EVENTS" "$X" "events hears another name"
+eq "$(relay_agrees "$X" "$T_RELAY")" 0 "an events file listening for a different name is a mismatch"
+
+# The YAML-sequence spelling of the list is heard the same as the inline one.
+X="${T_EVENTS/    workflows: \[Merge lane review relay\]/    workflows:
+      - \"Merge lane review relay\"}"
+edited "$T_EVENTS" "$X" "sequence form"
+eq "$(relay_agrees "$X" "$T_RELAY")" 1 "a sequence-form workflows: list is read"
+
+# A comment line inside the sequence does not end the list early...
+X="${T_EVENTS/    workflows: \[Merge lane review relay\]/    workflows:
+      # the relay, by its name: line
+      - Merge lane review relay}"
+edited "$T_EVENTS" "$X" "comment inside a sequence"
+eq "$(relay_agrees "$X" "$T_RELAY")" 1 "a comment inside a sequence-form list does not end it"
+
+# ...and a name that appears only in a trailing comment is not heard.
+X="${T_EVENTS/workflows: \[Merge lane review relay\]/workflows: [CI] # not yet, Merge lane review relay}"
+edited "$T_EVENTS" "$X" "name in a trailing comment"
+eq "$(relay_agrees "$X" "$T_RELAY")" 0 "the relay's name in a trailing comment is not what the events file hears"
+
+# A list the parser cannot read — here indented deeper than it expects — yields
+# NOTHING heard. That is the parser's silence, not the file's: unknown, never a
+# mismatch, so the rule warns rather than fails.
+X="${T_EVENTS/    workflows: \[Merge lane review relay\]/      workflows: [Merge lane review relay]}"
+edited "$T_EVENTS" "$X" "unreadable indentation"
+eq "$(relay_agrees "$X" "$T_RELAY")" "" "an events file whose workflows: list cannot be parsed is unknown, not a mismatch"
+eq "$(relay_agrees "name: x" "$T_RELAY")" "" "an events file with no workflow_run at all is unknown, not a mismatch"
+
+eq "$(relay_agrees "" "$T_RELAY")" "" "an unread events file is unknown, not a mismatch"
+eq "$(relay_agrees "$T_EVENTS" "")" "" "an unread relay is unknown, not a mismatch"
+
+# The two with: blocks. The documented pair differs only in runs-on and in
+# comments, and both of those are ignored — anything else is drift.
+eq "$(with_agrees "$T_POOL" "$T_EVENTS")" 1 "the documented lane templates agree apart from runs-on"
+
+X="${T_EVENTS/review-grace-seconds: 60/review-grace-seconds: 600}"
+edited "$T_EVENTS" "$X" "different input value"
+eq "$(with_agrees "$T_POOL" "$X")" 0 "a different input value in the events file is drift"
+
+X="${T_EVENTS/        Your other required check
+/}"
+edited "$T_EVENTS" "$X" "required check removed"
+eq "$(with_agrees "$T_POOL" "$X")" 0 "a required check missing from the events file is drift"
+
+X="${T_EVENTS/      pass-budget-seconds: 600
+/}"
+edited "$T_EVENTS" "$X" "input removed"
+eq "$(with_agrees "$T_POOL" "$X")" 0 "an input only one file sets is drift"
+
+X="${T_EVENTS/runs-on: ubuntu-latest/runs-on: some-other-label}"
+edited "$T_EVENTS" "$X" "runs-on changed"
+eq "$(with_agrees "$T_POOL" "$X")" 1 "runs-on alone is not drift"
+
+# The block ends at the next job-level key: secrets: must not be read as input.
+X="${T_EVENTS/app-id: \$\{\{ secrets.MERGE_APP_ID \}\}/app-id: x}"
+edited "$T_EVENTS" "$X" "secrets changed"
+eq "$(with_agrees "$T_POOL" "$X")" 1 "the secrets: block after with: is not part of it"
+
+# A comment indented LESS than the inputs, inside the block, neither ends it
+# nor counts: the input after it is still read, and still compared.
+X="${T_EVENTS/      review-grace-seconds: 60/  # a shallow note inside with:
+      review-grace-seconds: 60}"
+edited "$T_EVENTS" "$X" "shallow comment inside with"
+eq "$(with_agrees "$T_POOL" "$X")" 1 "a shallow comment inside with: does not end the block"
+Y="${X/review-grace-seconds: 60/review-grace-seconds: 61}"
+edited "$X" "$Y" "shallow comment then drift"
+eq "$(with_agrees "$T_POOL" "$Y")" 0 "an input after a shallow comment is still compared"
+
+# A trailing comment on an input is not part of its value.
+X="${T_EVENTS/review-grace-seconds: 60/review-grace-seconds: 60  # the fleet default}"
+edited "$T_EVENTS" "$X" "trailing comment"
+eq "$(with_agrees "$T_POOL" "$X")" 1 "a trailing comment on an input is not drift"
+
+eq "$(with_agrees "" "$T_EVENTS")" "" "an unread lane file is unknown, not drift"
+eq "$(with_agrees "$T_POOL" "name: x")" "" "a file with no with: block is unknown, not drift"
 
 # --- the two guards around the collector ---------------------------------------
 #

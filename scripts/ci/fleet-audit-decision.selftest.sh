@@ -144,6 +144,38 @@ hasnt "lane-pin-stale" "an unreadable pin is not ALSO reported as stale" "$(swap
 hasnt "guard-pin-unreadable" "a missing caller is not reported for its missing pin" \
   "$(swap has_guard 0 | sed "s/;guard_pin=[^;]*/;guard_pin=/")"
 
+# --- the two-file lane (#1382) ----------------------------------------------------
+# The healthy pool with a healthy events file beside the pool caller. Each case
+# is this string with one fact changed.
+TWO_FILE="$HEALTHY_POOL;has_events=1;events_pin=$WANT;relay_match=1;with_match=1"
+two() { printf '%s' "$TWO_FILE" | sed "s/;$1=[^;]*/;$1=$2/"; }
+has "ok:compliant" "a healthy two-file lane is compliant" "$TWO_FILE"
+has "fail:events-pin-stale" "a stale pin in merge-lane-events.yml is a failure" "$(two events_pin "$OLD")"
+hasnt "lane-pin-stale" "a stale events pin is not reported against the pool caller" "$(two events_pin "$OLD")"
+has "warn:events-pin-unreadable" "an events file with an unreadable pin is reported" "$(two events_pin '')"
+has "fail:relay-name-mismatch" "a relay renamed away from what the events file hears is a failure" \
+  "$(two relay_match 0)"
+has "warn:relay-name-unreadable" "an unread relay name is a warning, not a pass" "$(two relay_match '')"
+has "fail:lane-with-drift" "two with: blocks that differ beyond runs-on are a failure" "$(two with_match 0)"
+has "warn:lane-with-unreadable" "unread with: blocks are a warning, not a pass" "$(two with_match '')"
+# A repository still on the single-file caller has no events file: none of the
+# events rules may fire, whatever stale facts ride along.
+for f in "events_pin=$OLD" "relay_match=0" "with_match=0"; do
+  for rule in events-pin relay-name lane-with; do
+    hasnt "$rule" "a single-file lane is not judged on the events file ($f)" \
+      "$HEALTHY_POOL;has_events=0;$f"
+  done
+done
+# Each finding is its own line: a stale events pin and a drifted with: block
+# are two things to fix, not one.
+got=$(fleet_verdict "$(two events_pin "$OLD" | sed 's/;with_match=[^;]*/;with_match=0/')")
+if [ "$(printf '%s\n' "$got" | grep -cE '^fail:(events-pin-stale|lane-with-drift)')" = "2" ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  printf 'FAIL: a stale events pin and a with: drift must produce two findings\n  got:\n%s\n' "$got"
+fi
+
 # --- arming -------------------------------------------------------------------
 has "fail:lane-not-enabled" "an unset MERGE_LANE_ENABLED is a failure" "$(swap enabled '')"
 has "fail:lane-not-enabled" "MERGE_LANE_ENABLED=false is a failure" "$(swap enabled false)"

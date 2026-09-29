@@ -199,9 +199,25 @@ exactly one pass at a time across both files. It sits on the `lane:` job rather
 than the workflow because a workflow-level group is joined by every run —
 including one whose `if:` is about to skip the job — and a third arrival evicts
 the pending member, so a run that would have done nothing could push out a real
-pass. Each file still declares a top-level group keyed on `github.run_id`,
-which joins nothing and evicts nothing; it is there because the fleet's
-`check-workflow-concurrency.sh` requires every workflow to declare one.
+pass. Each lane file — this repository's own `merge-lane-self.yml` included —
+still declares a top-level group keyed per run, which joins nothing and evicts
+nothing; it is there because the fleet's `check-workflow-concurrency.sh`
+requires every workflow to declare one. The events file keys it on
+`github.event.pull_request.number || github.run_id`: the stricter vendored
+copies of that gate (IntegrateIT's) require a per-pull-request key on any
+workflow `pull_request_target` reaches, and a second label event on the same
+pull request losing its pending slot costs nothing — the lane re-reads live
+state.
+
+A pass woken by a completed run from a **fork** is skipped at the job's `if:`
+unless that run's event was `pull_request` — both lane files carry the same
+line. In a public repository anyone can review a fork's pull request, and each
+review would otherwise buy a pass that spends the merge App's API quota. The
+test is on `workflow_run.event`, which GitHub sets, and never on
+`workflow_run.name`, which the fork sets: a fork workflow named `CI` on
+`pull_request_review` would pass a name test and, in `merge-lane.yml`, start a
+pool host on every review. A fork's genuine CI completion ran on
+`pull_request` and still wakes the lane.
 
 Why two files rather than one with `runs-on` chosen by event: a pool label must
 never sit in a workflow a `pull_request_target` event can reach. Split, that is
@@ -247,8 +263,9 @@ on:
 permissions:
   contents: read
 
-# Per run: joins nothing, evicts nothing. `check-workflow-concurrency.sh` wants
-# a top-level block on every workflow; the serialization is on the job below.
+# Keyed per run — joins nothing, evicts nothing. `check-workflow-concurrency.sh`
+# wants a top-level block on every workflow; the serialization is on the job
+# below.
 concurrency:
   group: merge-lane-ci-${{ github.run_id }}
   cancel-in-progress: false
@@ -257,7 +274,14 @@ jobs:
   lane:
     # Off until an operator confirms the App secrets exist — a dry run still
     # mints the token, so without this the job is red on every CI completion.
-    if: vars.MERGE_LANE_ENABLED == 'true'
+    #
+    # The second half is the fork skip. A fork controls its own workflows'
+    # `name:`, so one declaring `name: CI` on `pull_request_review` would wake
+    # this file — and start a pool host — on every review. `workflow_run.event`
+    # is set by GitHub and cannot be spoofed: a completed run from another
+    # repository passes only when it ran on `pull_request`, which is what a
+    # fork's genuine CI is. Keep the line exactly as it is.
+    if: vars.MERGE_LANE_ENABLED == 'true' && (github.event_name != 'workflow_run' || github.event.workflow_run.head_repository.full_name == github.repository || github.event.workflow_run.event == 'pull_request')
     # Serialization is the point, not a concession: two lane runs read the same
     # list of open pull requests and could both act on it. On the JOB, so a run
     # whose `if:` skips it never joins the group and never evicts a real pending
@@ -396,16 +420,20 @@ on:
 permissions:
   contents: read
 
-# Per run: joins nothing, evicts nothing. `check-workflow-concurrency.sh` wants
-# a top-level block on every workflow; the serialization is on the job below.
+# Keyed per pull request, or per run for an event that has none — joins
+# nothing a real pass needs, evicts nothing. `check-workflow-concurrency.sh`
+# wants a top-level block on every workflow, and its stricter vendored copies
+# want a per-pull-request key wherever `pull_request_target` is a trigger. The
+# serialization is on the job below.
 concurrency:
-  group: merge-lane-events-${{ github.run_id }}
+  group: merge-lane-events-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   lane:
-    # Off until an operator confirms the App secrets exist.
-    if: vars.MERGE_LANE_ENABLED == 'true'
+    # Off until an operator confirms the App secrets exist. The second half
+    # is the fork skip — the same line as merge-lane.yml's, see there.
+    if: vars.MERGE_LANE_ENABLED == 'true' && (github.event_name != 'workflow_run' || github.event.workflow_run.head_repository.full_name == github.repository || github.event.workflow_run.event == 'pull_request')
     # The SAME group as merge-lane.yml, on the job, on purpose: a concurrency
     # group is repository-wide, so one pass at a time still holds across both
     # files, and a run whose `if:` skips the job never evicts a real pass.
@@ -489,6 +517,23 @@ jobs:
 > `pull_request_review` to either lane file. Land it as one pull request — a
 > window with only part of it on the base loses nothing, the lane just runs
 > less often.
+>
+> **A repository that gates runners to "self-hosted only" needs two
+> exemptions.** Some consumers vendor a runner-policy gate that rejects any
+> GitHub-hosted `runs-on`. The events file and the relay are hosted on purpose,
+> so each needs that gate's exemption marker, naming an issue that records why:
+> one directly above the events file's `lane:` job `uses:` line (the callee
+> receives `runs-on: ubuntu-latest` as an input there), and one directly above
+> the relay job's `runs-on:`. In the form IntegrateIT's gate reads:
+>
+> ```text
+> # github-hosted-allowed(#<issue>): non-CI lane passes run hosted so the pool never starts for them
+> # github-hosted-allowed(#<issue>): the relay holds no secret and no token scope
+> ```
+>
+> IntegrateIT landed exactly this in IntegrateIT#21880, recorded in
+> IntegrateIT#21881. Without them the migration pull request is red on the
+> consumer's own gate.
 
 > **The two markers in that example are not decoration, and admin merge will
 > not tell you so.** A caller without them is rejected by gates several repos in

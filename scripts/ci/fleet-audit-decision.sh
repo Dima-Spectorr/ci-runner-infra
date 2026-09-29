@@ -67,9 +67,16 @@ _fleet_is_number() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; es
 #   has_lane      1 if .github/workflows/merge-lane.yml exists
 #   has_guard     1 if the pr-guard caller exists
 #   has_reaper    1 if the branch-reaper caller exists
+#   has_events    1 if .github/workflows/merge-lane-events.yml exists (#1380)
 #   lane_pin      the sha the lane caller pins, "" if unread
 #   guard_pin     ditto for the guard
 #   reaper_pin    ditto for the reaper
+#   events_pin    ditto for merge-lane-events.yml, when it exists
+#   relay_match   1 if the review relay's `name:` is what the events file's
+#                 `workflow_run: workflows:` hears, 0 if not (or no relay), ""
+#                 if unread
+#   with_match    1 if the two lane files' `with:` blocks agree apart from
+#                 `runs-on`, 0 if they differ, "" if unread
 #   want_pin      the sha every caller should pin
 #   enabled       value of MERGE_LANE_ENABLED
 #   armed         value of MERGE_LANE_ARMED
@@ -148,6 +155,7 @@ fleet_verdict() {
   local facts="${1:-}"
   local tier="" has_lane="" has_guard="" has_reaper=""
   local lane_pin="" guard_pin="" reaper_pin="" want_pin=""
+  local has_events="" events_pin="" relay_match="" with_match=""
   local enabled="" armed="" app_id="" app_key=""
   local vars_readable="" secrets_readable=""
   local checks_match="" ruleset="" has_ci=""
@@ -175,6 +183,10 @@ fleet_verdict() {
       guard_pin) guard_pin="$value" ;;
       reaper_pin) reaper_pin="$value" ;;
       want_pin) want_pin="$value" ;;
+      has_events) has_events="$value" ;;
+      events_pin) events_pin="$value" ;;
+      relay_match) relay_match="$value" ;;
+      with_match) with_match="$value" ;;
       enabled) enabled="$value" ;;
       armed) armed="$value" ;;
       vars_readable) vars_readable="$value" ;;
@@ -359,9 +371,10 @@ fleet_verdict() {
       _fleet_say "warn:expected-pin-unknown"
     else
       local name pin present
-      for name in lane guard reaper; do
+      for name in lane events guard reaper; do
         case "$name" in
           lane) pin="$lane_pin"; present="$has_lane" ;;
+          events) pin="$events_pin"; present="$has_events" ;;
           guard) pin="$guard_pin"; present="$has_guard" ;;
           reaper) pin="$reaper_pin"; present="$has_reaper" ;;
         esac
@@ -377,6 +390,28 @@ fleet_verdict() {
           _fleet_say "fail:${name}-pin-stale pin=${pin:0:8} want=${want_pin:0:8}"
         fi
       done
+    fi
+
+    # --- the two-file lane (#1380, #1382) ------------------------------------
+    #
+    # Both are `fail:` because nothing else would ever say so. A relay renamed
+    # away from the events file's `workflows:` entry completes on every review
+    # and wakes nothing: reviews quietly wait for the daily backstop. Two
+    # `with:` blocks that differ are two lanes — a pass woken by a label or a
+    # review merges against different required checks, budgets or reviewers
+    # than one woken by CI, and both go green. An unread fact is a warning,
+    # never a pass: the same rule every pin above follows.
+    if [ "$has_events" = "1" ]; then
+      case "$relay_match" in
+        1) : ;;
+        0) _fleet_say "fail:relay-name-mismatch relay-name-is-not-what-merge-lane-events-hears" ;;
+        *) _fleet_say "warn:relay-name-unreadable" ;;
+      esac
+      case "$with_match" in
+        1) : ;;
+        0) _fleet_say "fail:lane-with-drift merge-lane-and-merge-lane-events-differ-beyond-runs-on" ;;
+        *) _fleet_say "warn:lane-with-unreadable" ;;
+      esac
     fi
 
     # --- arming --------------------------------------------------------------
