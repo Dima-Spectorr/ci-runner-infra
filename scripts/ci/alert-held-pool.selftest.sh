@@ -153,7 +153,8 @@ need(m.rsplit("/", 1)[1] in re.findall(r"^ensure_log_metric (\S+)", src, re.M),
 print("\n".join(fails))
 sys.exit(1 if fails else 0)
 PY
-if [ "$?" = 0 ]; then ok; else
+shape_rc=$?
+if [ "$shape_rc" = 0 ]; then ok; else
   while IFS= read -r line; do [ -n "$line" ] && bad "$line"; done <"$tmp/shape.out"; fi
 
 # --- 3. the log filter matches what the controller sends ---------------------
