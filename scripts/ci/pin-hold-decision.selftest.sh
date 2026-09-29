@@ -629,16 +629,25 @@ gate_expect "the veto is sent on change and on heartbeat, not every tick" \
 # on something other than the rule it names.
 # shellcheck disable=SC2016
 vm=$(veto_seq 's/"$(event_throttle_decision "$prev" "$class" "$now" "$EVENT_HEARTBEAT")" = "emit"/true/')
-[ "$vm" != "$(veto_seq)" ] && PASS=$((PASS + 1)) ||
-  { FAIL=$((FAIL + 1)); printf 'FAIL: removing the throttle did not change the veto sequence\n'; }
+if [ "$vm" != "$(veto_seq)" ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1)); printf 'FAIL: removing the throttle did not change the veto sequence\n'
+fi
 # shellcheck disable=SC2016
 vm=$(veto_seq 's/printf .%s %s. "$class" "$now" >"$sf"/:/')
-[ "$vm" != "$(veto_seq)" ] && PASS=$((PASS + 1)) ||
-  { FAIL=$((FAIL + 1)); printf 'FAIL: not recording the sent class did not change the veto sequence\n'; }
+if [ "$vm" != "$(veto_seq)" ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1)); printf 'FAIL: not recording the sent class did not change the veto sequence\n'
+fi
 # shellcheck disable=SC2016
 vm=$(veto_seq 's/err=$(head -c 300 "$STATE_DIR\/pinerr-$host"/err=$(: "$STATE_DIR\/pinerr-$host"/')
-[ "$vm" != "$(veto_seq)" ] && PASS=$((PASS + 1)) ||
-  { FAIL=$((FAIL + 1)); printf 'FAIL: dropping the error did not change the veto sequence\n'; }
+if [ "$vm" != "$(veto_seq)" ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1)); printf 'FAIL: dropping the error did not change the veto sequence\n'
+fi
 
 if [ "$FAIL" -gt 0 ]; then
   echo "pin-hold-decision: $FAIL failed, $PASS passed"
