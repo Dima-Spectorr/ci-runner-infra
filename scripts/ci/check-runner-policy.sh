@@ -239,7 +239,8 @@ ensure_yaml() {
 # Loads one workflow and emits TAB-separated records:
 #
 #   #ERR\t<message>                  the document does not load
-#   #PR                              a `pull_request` trigger is present
+#   #PR                              a `pull_request`, `pull_request_review` or
+#                                    `pull_request_review_comment` trigger is present
 #   #PRTARGET                        a `pull_request_target` trigger is present
 #   #CALLINPUTREQ\t<name>            a `workflow_call` input declared REQUIRED
 #   #RUNSONINPUT\t<id>\t<name>       runs-on reads `inputs.<name>`
@@ -297,7 +298,12 @@ elif triggers is not None:
 else:
     names = []
 names = [str(n) for n in names]
-if "pull_request" in names:
+# A review event is fork-reachable exactly as a `pull_request` is: anyone may
+# review a fork's pull request (a bot does it on every one), and GitHub runs the
+# workflow as defined at the PULL REQUEST's merge ref — fork-authored YAML
+# choosing its own `runs-on`. So both review events answer RUNNER4 the same way.
+if ("pull_request" in names or "pull_request_review" in names
+        or "pull_request_review_comment" in names):
     out("#PR")
 if "pull_request_target" in names:
     out("#PRTARGET")
@@ -1971,6 +1977,37 @@ jobs:
   build:
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # A review runs the workflow from the pull request's merge ref, and anyone —
+  # a fork's author, a review bot — can submit one. #1380.
+  expect "pull_request_review counts as fork-reachable" "RUNNER4" "" allowed \
+'on:
+  pull_request_review:
+    types: [submitted]
+jobs:
+  build:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "pull_request_review_comment counts as fork-reachable" "RUNNER4" "" allowed \
+'on:
+  pull_request_review_comment:
+jobs:
+  build:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect "a review trigger on a hosted image reaches no pool" "" "" allowed \
+'on:
+  pull_request_review:
+    types: [submitted]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
     steps: [{run: "true"}]'
 
   expect "declared scope not carried" "RUNNER2" "OtherRepo" blocked \

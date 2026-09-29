@@ -32,7 +32,13 @@ on:
     # By NAME, which is the only handle `workflow_run` offers — so renaming
     # `ci.yml`'s `name:` key detaches this silently, and the self-test asserts
     # the two agree for exactly that reason.
-    workflows: [CI]
+    #
+    # The review relay is here for a submitted review — an approval, or Copilot
+    # answering — which can make a green pull request mergeable with no CI
+    # completion after it. NEVER `pull_request_review` on this file itself: that
+    # event runs the pull request's own copy of this workflow and of the lane,
+    # holding the merge App key. See `merge-lane-review-relay.yml`.
+    workflows: [CI, Merge lane review relay]
     types: [completed]
 
   # The backstop, not the mechanism. A merge moves the base, and every other
@@ -42,8 +48,9 @@ on:
   # the happy path and finite on the unhappy one.
   #
   # Free here: this repository is PUBLIC, so GitHub-hosted minutes are unmetered.
-  # A private consumer should point `runs-on` at the fleet instead of dropping
-  # the schedule — it is the only thing that recovers a missed dispatch.
+  # A private consumer must NOT copy this timer: its template runs the backstop
+  # once a day on a hosted runner, and never a timer on a pool label, which
+  # keeps a self-hosted host up around the clock (#1380, docs/merge-lane.md).
   schedule:
     - cron: '*/15 * * * *'
 
@@ -72,6 +79,16 @@ jobs:
     # `secrets.*` cannot be read in an `if:`, which is why this is a variable
     # rather than a test for the secret itself.
     if: vars.MERGE_LANE_ENABLED == 'true'
+    # ONE PASS AT A TIME, DECIDED BY THE JOB THAT ACTUALLY RUNS.
+    #
+    # At the job, not the workflow: a workflow-level group is joined by every
+    # run, including one whose `if:` above is about to skip the job, and a third
+    # arrival evicts the pending member — so a run that would have done nothing
+    # could push out a real pass. A skipped job never joins this group.
+    # concurrency-serialization: intentional — one merge decision at a time
+    concurrency:
+      group: merge-lane
+      cancel-in-progress: false
     uses: ./.github/workflows/merge-lane.yml
     permissions:
       contents: read
