@@ -277,7 +277,11 @@ seed_work() {
 # directory. Reproducing that is the whole point of this fixture: it is the
 # thing the reset can delete out from under the hook that comes after it.
 in_workspace() { # <stage>
-  ( cd "$WORKSPACE" 2>/dev/null || exit 127; "$RESET" "$1" "$IDX" >>"$HOOKLOG" 2>&1 )
+  # A missing workspace is a FIXTURE fault, and it used to be a silent one: 127
+  # with nothing in the hook log, which reads as the reset failing. Say so.
+  ( cd "$WORKSPACE" 2>/dev/null ||
+      { echo "in_workspace $1: $WORKSPACE does not exist -- the hook was never run" >>"$HOOKLOG"; exit 127; }
+    "$RESET" "$1" "$IDX" >>"$HOOKLOG" 2>&1 )
 }
 
 # --- the stages ---------------------------------------------------------------
@@ -451,11 +455,17 @@ private_tmp() {
 check "the stand-in daemon has a private /tmp to reset" private_tmp
 
 seed_slot_tmp() {
+  # Removed first: the slot owns it and /tmp is sticky, so Ubuntu's
+  # fs.protected_regular refuses even root an O_CREAT on the old copy.
+  rm -f -- "$SLOT_TMP/gitleaks.tmp"
   printf 'a previous download\n' >"$SLOT_TMP/gitleaks.tmp"
   install -d -o "$U" -g "$U" "$SLOT_TMP/a-fixed-dir" "$SLOT_TMP/.dotnet"
   chown "$U:$U" "$SLOT_TMP/gitleaks.tmp"
 }
 seed_slot_tmp
+# The completed reset above emptied _work, and in_workspace runs each hook FROM
+# the workspace, as the runner does: without a fresh one the hook never starts.
+seed_work
 in_workspace started
 rc=$?
 check "started succeeds with a leftover download"      test "$rc" = 0
@@ -496,6 +506,8 @@ rm -rf -- "$HOST_TARGET"
 # process of the slot uid; 999999999 is above any pid_max, so never alive.
 make_sock() { python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"; }
 seed_spared() {
+  # The live-pid entries SURVIVE a reset by design, so a re-seed meets them.
+  rm -f -- "$SLOT_TMP/dotnet-diagnostic-$dpid-1-socket" "$SLOT_TMP/clr-debug-pipe-$dpid-1-in"
   make_sock "$SLOT_TMP/dotnet-diagnostic-$dpid-1-socket"
   make_sock "$SLOT_TMP/dotnet-diagnostic-999999999-1-socket"
   mkfifo "$SLOT_TMP/clr-debug-pipe-$dpid-1-in" "$SLOT_TMP/clr-debug-pipe-999999999-1-in"
@@ -516,6 +528,7 @@ check ".dotnet/lockfiles survives"                     test -d "$SLOT_TMP/.dotne
 check "anything else in .dotnet goes"                  test ! -e "$SLOT_TMP/.dotnet/junk"
 
 # Break the pid rule back and prove the dead-pid assertions notice.
+# shellcheck disable=SC2016  # the pattern is the RENDERED hook's literal ${p%%-*}; nothing here may expand it
 sed 's/tmp_pid_alive "\${p%%-\*}"/true/' "$RESET" >"$MUTANT"
 check_not "the pid-rule mutation applied" cmp -s "$RESET" "$MUTANT"
 seed_spared
