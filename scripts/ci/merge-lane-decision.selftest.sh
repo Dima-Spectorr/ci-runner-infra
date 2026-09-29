@@ -379,7 +379,7 @@ clock() {
 }
 # args: clears_at now started budget last_pass cap waits_done max_waits
 T=1000000
-# mot-claude#991's shape: age=21 of grace=60, so the clock clears 39s from now.
+# The live shape that found this: age=21 of grace=60, so the clock clears 39s from now.
 clock "wait:clock seconds=40" "the 60s review grace with 39s left is waited out, plus one second" \
   $((T + 39)) "$T" $((T - 20)) 600 20 180 0 3
 clock "wait:clock seconds=1" "a clock that already cleared during the walk re-reads at once" \
