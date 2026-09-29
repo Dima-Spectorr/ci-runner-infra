@@ -170,19 +170,26 @@ relay_agrees() {
   name=$(workflow_name_of "$2")
   [ -n "$name" ] || return 0
   heard=$(workflow_run_names_of "$1")
+  # Nothing heard is the PARSER's silence as often as the file's: an indent or
+  # a list form it does not read yields the same empty list. Unknown, never a
+  # mismatch — docs/fleet-audit.md: an unread fact is a warning, not a fail.
+  [ -n "$heard" ] || return 0
   if printf '%s\n' "$heard" | grep -cxF -- "$name" >/dev/null; then echo 1; else echo 0; fi
 }
 
 # lane_with_of <text> — the lane job's `with:` block, comments, blank lines and
 # the `runs-on:` key removed: the one input the two files legitimately differ in.
 lane_with_of() {
-  # A line indented four spaces or fewer ends the block; blank lines do not.
+  # A line indented four spaces or fewer ends the block. Blank lines and
+  # full-line comments do not — they are dropped BEFORE the indentation test,
+  # so a comment at any indent inside the block can neither end it nor count.
+  # A trailing ` # …` is stripped from each kept line.
   printf '%s\n' "$1" | tr -d '\r' | awk '
-    /^    with:[ \t]*$/    { w = 1; next }
-    w && /^[ \t]*$/        { next }
-    w                      { match($0, /^ */); if (RLENGTH <= 4) w = 0 }
-    w                      { print }
-  ' | grep -vE '^[[:space:]]*#' | grep -vE '^      runs-on:' | sed -E 's/[[:space:]]+$//'
+    /^    with:[ \t]*(#.*)?$/  { w = 1; next }
+    w && /^[ \t]*(#.*)?$/      { next }
+    w                          { match($0, /^ */); if (RLENGTH <= 4) w = 0 }
+    w                          { sub(/[ \t]+#.*$/, ""); sub(/[ \t]+$/, ""); print }
+  ' | grep -vE '^      runs-on:'
 }
 
 # with_agrees <lane-text> <events-text> — 1 when the two `with:` blocks are the

@@ -209,11 +209,15 @@ workflow `pull_request_target` reaches, and a second label event on the same
 pull request losing its pending slot costs nothing — the lane re-reads live
 state.
 
-A pass woken by the review relay for a **fork's** pull request is skipped at
-the job's `if:` (`github.event.workflow_run.head_repository.full_name !=
-github.repository`). In a public repository anyone can review a fork's pull
-request, and each review would otherwise buy a hosted pass that spends the
-merge App's API quota. Only the relay's wake-up is filtered.
+A pass woken by a completed run from a **fork** is skipped at the job's `if:`
+unless that run's event was `pull_request` — both lane files carry the same
+line. In a public repository anyone can review a fork's pull request, and each
+review would otherwise buy a pass that spends the merge App's API quota. The
+test is on `workflow_run.event`, which GitHub sets, and never on
+`workflow_run.name`, which the fork sets: a fork workflow named `CI` on
+`pull_request_review` would pass a name test and, in `merge-lane.yml`, start a
+pool host on every review. A fork's genuine CI completion ran on
+`pull_request` and still wakes the lane.
 
 Why two files rather than one with `runs-on` chosen by event: a pool label must
 never sit in a workflow a `pull_request_target` event can reach. Split, that is
@@ -270,7 +274,14 @@ jobs:
   lane:
     # Off until an operator confirms the App secrets exist — a dry run still
     # mints the token, so without this the job is red on every CI completion.
-    if: vars.MERGE_LANE_ENABLED == 'true'
+    #
+    # The second half is the fork skip. A fork controls its own workflows'
+    # `name:`, so one declaring `name: CI` on `pull_request_review` would wake
+    # this file — and start a pool host — on every review. `workflow_run.event`
+    # is set by GitHub and cannot be spoofed: a completed run from another
+    # repository passes only when it ran on `pull_request`, which is what a
+    # fork's genuine CI is. Keep the line exactly as it is.
+    if: vars.MERGE_LANE_ENABLED == 'true' && (github.event_name != 'workflow_run' || github.event.workflow_run.head_repository.full_name == github.repository || github.event.workflow_run.event == 'pull_request')
     # Serialization is the point, not a concession: two lane runs read the same
     # list of open pull requests and could both act on it. On the JOB, so a run
     # whose `if:` skips it never joins the group and never evicts a real pending
@@ -421,11 +432,8 @@ concurrency:
 jobs:
   lane:
     # Off until an operator confirms the App secrets exist. The second half
-    # skips a pass woken by a review of a FORK's pull request: anyone can
-    # review one in a public repository, and each such review would buy a
-    # hosted pass that spends the merge App's API quota. Only the relay's
-    # wake-up is filtered; every other event, and a fork's CI, still passes.
-    if: vars.MERGE_LANE_ENABLED == 'true' && (github.event.workflow_run.name != 'Merge lane review relay' || github.event.workflow_run.head_repository.full_name == github.repository)
+    # is the fork skip — the same line as merge-lane.yml's, see there.
+    if: vars.MERGE_LANE_ENABLED == 'true' && (github.event_name != 'workflow_run' || github.event.workflow_run.head_repository.full_name == github.repository || github.event.workflow_run.event == 'pull_request')
     # The SAME group as merge-lane.yml, on the job, on purpose: a concurrency
     # group is repository-wide, so one pass at a time still holds across both
     # files, and a run whose `if:` skips the job never evicts a real pass.

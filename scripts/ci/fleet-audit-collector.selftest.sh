@@ -376,39 +376,95 @@ eq "$(pin_in "$T_EVENTS" 'merge-lane\.yml')" "$(pin_in "$T_POOL" 'merge-lane\.ym
 eq "$(workflow_name_of "$T_RELAY")" "Merge lane review relay" "the relay's name is read from its name: line"
 eq "$(workflow_name_of "name: 'Quoted relay'  # x")" "Quoted relay" "a quoted, commented name: is unquoted"
 eq "$(relay_agrees "$T_EVENTS" "$T_RELAY")" 1 "the documented relay matches what the events template hears"
-eq "$(relay_agrees "$T_EVENTS" "${T_RELAY/name: Merge lane review relay/name: Review relay}")" 0 \
-   "a relay renamed away from the events file's workflows: entry is a mismatch"
-eq "$(relay_agrees "${T_EVENTS/workflows: \[Merge lane review relay\]/workflows: [Other relay]}" "$T_RELAY")" 0 \
-   "an events file listening for a different name is a mismatch"
+# edited <before> <after> <description> — every fixture below is the template
+# with one substitution, and a `${var/pattern/…}` whose pattern misses returns
+# the text UNCHANGED. The case after it would then assert on the healthy
+# template and could pass for that reason alone, so each edit is asserted to
+# have landed before it is used.
+edited() {
+  if [ "$1" != "$2" ]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1)); printf 'FAIL: the fixture edit changed nothing: %s\n' "$3"; fi
+}
+
+X="${T_RELAY/name: Merge lane review relay/name: Review relay}"
+edited "$T_RELAY" "$X" "relay renamed"
+eq "$(relay_agrees "$T_EVENTS" "$X")" 0 "a relay renamed away from the events file's workflows: entry is a mismatch"
+
+X="${T_EVENTS/workflows: \[Merge lane review relay\]/workflows: [Other relay]}"
+edited "$T_EVENTS" "$X" "events hears another name"
+eq "$(relay_agrees "$X" "$T_RELAY")" 0 "an events file listening for a different name is a mismatch"
+
 # The YAML-sequence spelling of the list is heard the same as the inline one.
-SEQ_EVENTS="${T_EVENTS/    workflows: \[Merge lane review relay\]/    workflows:
+X="${T_EVENTS/    workflows: \[Merge lane review relay\]/    workflows:
       - \"Merge lane review relay\"}"
-eq "$(relay_agrees "$SEQ_EVENTS" "$T_RELAY")" 1 "a sequence-form workflows: list is read"
+edited "$T_EVENTS" "$X" "sequence form"
+eq "$(relay_agrees "$X" "$T_RELAY")" 1 "a sequence-form workflows: list is read"
+
 # A comment line inside the sequence does not end the list early...
-CMT_EVENTS="${T_EVENTS/    workflows: \[Merge lane review relay\]/    workflows:
+X="${T_EVENTS/    workflows: \[Merge lane review relay\]/    workflows:
       # the relay, by its name: line
       - Merge lane review relay}"
-eq "$(relay_agrees "$CMT_EVENTS" "$T_RELAY")" 1 "a comment inside a sequence-form list does not end it"
+edited "$T_EVENTS" "$X" "comment inside a sequence"
+eq "$(relay_agrees "$X" "$T_RELAY")" 1 "a comment inside a sequence-form list does not end it"
+
 # ...and a name that appears only in a trailing comment is not heard.
-eq "$(relay_agrees "${T_EVENTS/workflows: \[Merge lane review relay\]/workflows: [CI] # not yet, Merge lane review relay}" "$T_RELAY")" 0 \
-   "the relay's name in a trailing comment is not what the events file hears"
+X="${T_EVENTS/workflows: \[Merge lane review relay\]/workflows: [CI] # not yet, Merge lane review relay}"
+edited "$T_EVENTS" "$X" "name in a trailing comment"
+eq "$(relay_agrees "$X" "$T_RELAY")" 0 "the relay's name in a trailing comment is not what the events file hears"
+
+# A list the parser cannot read — here indented deeper than it expects — yields
+# NOTHING heard. That is the parser's silence, not the file's: unknown, never a
+# mismatch, so the rule warns rather than fails.
+X="${T_EVENTS/    workflows: \[Merge lane review relay\]/      workflows: [Merge lane review relay]}"
+edited "$T_EVENTS" "$X" "unreadable indentation"
+eq "$(relay_agrees "$X" "$T_RELAY")" "" "an events file whose workflows: list cannot be parsed is unknown, not a mismatch"
+eq "$(relay_agrees "name: x" "$T_RELAY")" "" "an events file with no workflow_run at all is unknown, not a mismatch"
+
 eq "$(relay_agrees "" "$T_RELAY")" "" "an unread events file is unknown, not a mismatch"
 eq "$(relay_agrees "$T_EVENTS" "")" "" "an unread relay is unknown, not a mismatch"
 
 # The two with: blocks. The documented pair differs only in runs-on and in
 # comments, and both of those are ignored — anything else is drift.
 eq "$(with_agrees "$T_POOL" "$T_EVENTS")" 1 "the documented lane templates agree apart from runs-on"
-eq "$(with_agrees "$T_POOL" "${T_EVENTS/review-grace-seconds: 60/review-grace-seconds: 600}")" 0 \
-   "a different input value in the events file is drift"
-eq "$(with_agrees "$T_POOL" "${T_EVENTS/        Your other required check
-/}")" 0 "a required check missing from the events file is drift"
-eq "$(with_agrees "$T_POOL" "${T_EVENTS/      pass-budget-seconds: 600
-/}")" 0 "an input only one file sets is drift"
-eq "$(with_agrees "$T_POOL" "${T_EVENTS/runs-on: ubuntu-latest/runs-on: some-other-label}")" 1 \
-   "runs-on alone is not drift"
+
+X="${T_EVENTS/review-grace-seconds: 60/review-grace-seconds: 600}"
+edited "$T_EVENTS" "$X" "different input value"
+eq "$(with_agrees "$T_POOL" "$X")" 0 "a different input value in the events file is drift"
+
+X="${T_EVENTS/        Your other required check
+/}"
+edited "$T_EVENTS" "$X" "required check removed"
+eq "$(with_agrees "$T_POOL" "$X")" 0 "a required check missing from the events file is drift"
+
+X="${T_EVENTS/      pass-budget-seconds: 600
+/}"
+edited "$T_EVENTS" "$X" "input removed"
+eq "$(with_agrees "$T_POOL" "$X")" 0 "an input only one file sets is drift"
+
+X="${T_EVENTS/runs-on: ubuntu-latest/runs-on: some-other-label}"
+edited "$T_EVENTS" "$X" "runs-on changed"
+eq "$(with_agrees "$T_POOL" "$X")" 1 "runs-on alone is not drift"
+
 # The block ends at the next job-level key: secrets: must not be read as input.
-eq "$(with_agrees "$T_POOL" "${T_EVENTS/app-id: \$\{\{ secrets.MERGE_APP_ID \}\}/app-id: x}")" 1 \
-   "the secrets: block after with: is not part of it"
+X="${T_EVENTS/app-id: \$\{\{ secrets.MERGE_APP_ID \}\}/app-id: x}"
+edited "$T_EVENTS" "$X" "secrets changed"
+eq "$(with_agrees "$T_POOL" "$X")" 1 "the secrets: block after with: is not part of it"
+
+# A comment indented LESS than the inputs, inside the block, neither ends it
+# nor counts: the input after it is still read, and still compared.
+X="${T_EVENTS/      review-grace-seconds: 60/  # a shallow note inside with:
+      review-grace-seconds: 60}"
+edited "$T_EVENTS" "$X" "shallow comment inside with"
+eq "$(with_agrees "$T_POOL" "$X")" 1 "a shallow comment inside with: does not end the block"
+Y="${X/review-grace-seconds: 60/review-grace-seconds: 61}"
+edited "$X" "$Y" "shallow comment then drift"
+eq "$(with_agrees "$T_POOL" "$Y")" 0 "an input after a shallow comment is still compared"
+
+# A trailing comment on an input is not part of its value.
+X="${T_EVENTS/review-grace-seconds: 60/review-grace-seconds: 60  # the fleet default}"
+edited "$T_EVENTS" "$X" "trailing comment"
+eq "$(with_agrees "$T_POOL" "$X")" 1 "a trailing comment on an input is not drift"
+
 eq "$(with_agrees "" "$T_EVENTS")" "" "an unread lane file is unknown, not drift"
 eq "$(with_agrees "$T_POOL" "name: x")" "" "a file with no with: block is unknown, not drift"
 

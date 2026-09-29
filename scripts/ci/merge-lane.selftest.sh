@@ -324,26 +324,23 @@ keeps_a_per_run_top_level_group() { # <text>
   matches "$top" '^  cancel-in-progress: false$'
 }
 
-# THE LANE JOB'S `if:` IS ONE OF TWO EXACT LINES (T1, extended by #1382).
+# THE LANE JOB'S `if:` IS ONE EXACT LINE (T1, extended by #1382).
 #
 # Exact, because the failure it guards is a widening nobody sees: `|| true`, or
 # a second clause that happens to be true, and the lane runs before the App
-# exists. A file that hears the review relay carries the operator's switch AND
-# the fork-review skip — a relay run whose reviewed pull request lives in
-# another repository is dropped, since in a public repository anyone can review
-# a fork and each review would buy a pass that spends the App's quota. A file
-# that does not hear the relay carries the switch alone. Nothing else passes.
+# exists. Every lane file carries the operator's switch AND the fork skip: a
+# completed run from another repository wakes the lane only if it ran on
+# `pull_request`. Keyed on `workflow_run.event`, which GitHub sets, and never
+# on `workflow_run.name`, which a fork sets — a fork workflow named `CI` on
+# `pull_request_review` passes any name test, and on the pool file starts a
+# host per review. `github.event_name != 'workflow_run'` lets the sweep and a
+# dispatch through, where `workflow_run` is null. Nothing else passes.
 LANE_SWITCH="if: vars.MERGE_LANE_ENABLED == 'true'"
-FORK_REVIEW_SKIP="(github.event.workflow_run.name != '$RELAY_NAME' || github.event.workflow_run.head_repository.full_name == github.repository)"
+FORK_SKIP="(github.event_name != 'workflow_run' || github.event.workflow_run.head_repository.full_name == github.repository || github.event.workflow_run.event == 'pull_request')"
 guards_the_lane_job() { # <text>
-  local ifs want
+  local ifs
   ifs=$(printf '%s\n' "$1" | grep -vE '^[[:space:]]*#' | grep -E '^    if:')
-  if hears_reviews_through_the_relay "$1"; then
-    want="    $LANE_SWITCH && $FORK_REVIEW_SKIP"
-  else
-    want="    $LANE_SWITCH"
-  fi
-  [ "$ifs" = "$want" ]
+  [ "$ifs" = "    $LANE_SWITCH && $FORK_SKIP" ]
 }
 
 # Apigee-Portal's `workflow-expression-injection.test.ts` flags a workflow whose
@@ -1887,8 +1884,14 @@ mutate "the caller drops the fork-review skip" "$CALLER" \
   "s@^\(    if: vars.MERGE_LANE_ENABLED == 'true'\) \&\& .*\$@\1@" waits_for_the_app_to_exist
 mutate "the fork-review skip is inverted, so only a fork's review wakes the lane" "$CALLER" \
   's@head_repository\.full_name == github\.repository@head_repository.full_name != github.repository@' waits_for_the_app_to_exist
-mutate "the fork-review skip stops scoping itself to the relay, so a fork's CI completion is dropped too" "$CALLER" \
-  "s@(github.event.workflow_run.name != 'Merge lane review relay' || @(@" waits_for_the_app_to_exist
+mutate "the fork skip goes back to trusting the fork-controlled workflow name" "$CALLER" \
+  "s@github.event.workflow_run.event == 'pull_request'@github.event.workflow_run.name == 'CI'@" waits_for_the_app_to_exist
+mutate "the fork skip drops the event clause, so a fork's genuine CI no longer wakes the lane" "$CALLER" \
+  "s@ || github.event.workflow_run.event == 'pull_request')@)@" waits_for_the_app_to_exist
+mutate "the fork skip drops the non-workflow_run clause, so the sweep and a dispatch are skipped" "$CALLER" \
+  "s@(github.event_name != 'workflow_run' || @(@" waits_for_the_app_to_exist
+mutate "the fork skip accepts any event from a fork" "$CALLER" \
+  "s@github.event.workflow_run.event == 'pull_request'@github.event.workflow_run.event != ''@" waits_for_the_app_to_exist
 mutate "the caller loses its per-run top-level group" "$CALLER" \
   '/^concurrency:$/,/^  cancel-in-progress: false$/d' self_caller_keeps_a_per_run_top_level_group
 mutate "the caller's top-level group stops being per run" "$CALLER" \
@@ -1958,7 +1961,15 @@ mutate "the documented pool caller hears pull_request_review directly" "$DOC" \
 mutate "the documented events caller's switch is widened with an || true" "$DOC" \
   "/^name: Merge lane (events)\$/,/^\`\`\`\$/ s@^\(    if: vars.MERGE_LANE_ENABLED == 'true'.*\)\$@\1 || true@" documented_callers_are_one_lane
 mutate "the documented pool caller's switch is widened with an || true" "$DOC" \
-  "/^name: Merge lane\$/,/^\`\`\`\$/ s@^\(    if: vars.MERGE_LANE_ENABLED == 'true'\)\$@\1 || true@" documented_callers_are_one_lane
+  "/^name: Merge lane\$/,/^\`\`\`\$/ s@^\(    if: vars.MERGE_LANE_ENABLED == 'true'.*\)\$@\1 || true@" documented_callers_are_one_lane
+mutate "the documented pool caller drops the fork skip, so a fork's review starts a pool host" "$DOC" \
+  "/^name: Merge lane\$/,/^\`\`\`\$/ s@^\(    if: vars.MERGE_LANE_ENABLED == 'true'\) \&\& .*\$@\1@" documented_callers_are_one_lane
+mutate "the documented pool caller's fork skip trusts the workflow name" "$DOC" \
+  "/^name: Merge lane\$/,/^\`\`\`\$/ s@github.event.workflow_run.event == 'pull_request'@github.event.workflow_run.name == 'CI'@" \
+  documented_callers_are_one_lane
+mutate "the documented events caller's fork skip drops the event clause" "$DOC" \
+  "/^name: Merge lane (events)\$/,/^\`\`\`\$/ s@ || github.event.workflow_run.event == 'pull_request')@)@" \
+  documented_callers_are_one_lane
 mutate "the documented events caller drops the fork-review skip" "$DOC" \
   "/^name: Merge lane (events)\$/,/^\`\`\`\$/ s@^\(    if: vars.MERGE_LANE_ENABLED == 'true'\) \&\& .*\$@\1@" documented_callers_are_one_lane
 mutate "the documented events caller's fork-review skip is inverted" "$DOC" \
