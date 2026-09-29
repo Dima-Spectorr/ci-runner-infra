@@ -142,10 +142,16 @@ SINCE="$SLOT_STATE/$IDX/dirty-since"
 made_user=0
 made_unit=0
 made_rundir=0
+made_linger=0
 DAEMON_UNIT="ci-dockerd@$IDX.service"
 cleanup() {
   # The stand-in daemon first: userdel refuses an account with a live process.
   [ "$made_unit" = 1 ] && systemctl stop "$DAEMON_UNIT" >/dev/null 2>&1
+  # And the slot's user manager, for the same reason (#1395).
+  if [ "$made_linger" = 1 ]; then
+    loginctl disable-linger "$U" >/dev/null 2>&1
+    systemctl stop "user@$(id -u "$U").service" >/dev/null 2>&1
+  fi
   [ "$made_rundir" = 1 ] && rm -rf -- "/run/$U"
   [ "$made_user" = 1 ] && userdel --remove --force "$U" >/dev/null 2>&1
   rm -rf -- "$SB"
@@ -813,6 +819,143 @@ rm -rf -- "/run/$U"
 made_rundir=0
 "$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
 check "with the daemon gone the slot comes back clean" test -f "$MARKER"
+
+echo
+echo "the slot's user manager: a job's own units (#1395)"
+#
+# A slot user lingers, so its user manager outlives every job, and a job can
+# hand it a process: `systemd-run --user --unit=x sleep 1d` lands in
+# user@<uid>.service/app.slice, outside the agent's cgroup, and the quiesce used
+# to spare that whole tree. Measured live 2026-09-29: the unit ran on into the
+# next job. So here the manager is real (linger, as on a host), the job's units
+# are started AS THE SLOT, from the slot's own bus, and the reset must leave
+# the manager and its bus up and nothing else of the job's.
+SUID=$(id -u "$U")
+UBUS="/run/user/$SUID/bus"
+if loginctl enable-linger "$U" >>"$HOOKLOG" 2>&1; then
+  made_linger=1
+fi
+for _ in $(seq 1 100); do
+  [ -S "$UBUS" ] && break
+  sleep 0.1
+done
+check "the slot has a user manager and a user bus" test -S "$UBUS"
+as_slot() { sudo -u "$U" XDG_RUNTIME_DIR="/run/user/$SUID" DBUS_SESSION_BUS_ADDRESS="unix:path=$UBUS" "$@"; }
+unit_live() { # <unit> -- live in the slot's manager
+  timeout 10 systemctl --user -M "$U@" is-active --quiet "$1" >/dev/null 2>&1
+}
+seed_units() {
+  timeout 10 systemctl --user -M "$U@" stop probe-1395.service probe-1395t.timer >/dev/null 2>&1
+  timeout 10 systemctl --user -M "$U@" reset-failed >/dev/null 2>&1
+  as_slot systemd-run --user --quiet --unit=probe-1395 sleep 600 >>"$HOOKLOG" 2>&1
+  as_slot systemd-run --user --quiet --unit=probe-1395t --on-active=1h true >>"$HOOKLOG" 2>&1
+  for _ in $(seq 1 50); do
+    unit_live probe-1395.service && unit_live probe-1395t.timer && break
+    sleep 0.1
+  done
+}
+settle() { sleep 0.5; } # the manager notices an emptied cgroup asynchronously
+user_manager_up() { systemctl is-active --quiet "user@$SUID.service" && unit_live dbus.service && test -S "$UBUS"; }
+
+seed_units
+check "the job's service is running before the reset" unit_live probe-1395.service
+check "the job's timer is armed before the reset"     unit_live probe-1395t.timer
+
+# HELD first: a slot a live run holds keeps everything, exactly as before.
+printf 'run=4242\nslot=%s\nttl=600\nexpiry=%s\nreserve=0\nboot=%s\n' "$IDX" \
+  "$(( $(date +%s) + 600 ))" "$(cat /proc/sys/kernel/random/boot_id)" >"$PIN_DIR/host"
+reset_once "$RESET"
+settle
+check "a held slot keeps the job's service"            unit_live probe-1395.service
+check "a held slot keeps the job's timer"              unit_live probe-1395t.timer
+rm -f -- "$PIN_DIR/host"
+
+rm -f -- "$MARKER"
+reset_once "$RESET"
+settle
+check "the reset succeeds with the job's units to stop" test "$rc" = 0
+check "and says what it stopped"                       grep -q 'unit(s) the last job left in its service manager' "$RUNLOG"
+check_not "the job's service does not survive"         unit_live probe-1395.service
+check_not "the job's timer does not survive"           unit_live probe-1395t.timer
+check "the user manager and its bus survive"           user_manager_up
+check "and the marker means it"                        test -f "$MARKER"
+
+# Each half broken back, and the assertion it backs notices.
+#
+# Without the unit stop the timer -- which has no process to kill -- survives,
+# while the service's process is still reached by the kill loop: that is the
+# narrowed spare doing its half.
+# shellcheck disable=SC2016  # the rendered hook's literal $uid
+sed '/^  stop_user_units "\$uid" || units_rc=1$/d' "$RESET" >"$MUTANT"
+chmod 0755 "$MUTANT"
+check_not "the unit-stop mutation applied" cmp -s "$RESET" "$MUTANT"
+seed_units
+check "seeded for the unit-stop mutant"                unit_live probe-1395.service
+reset_once "$MUTANT"
+settle
+check "without the unit stop the job's timer survives -- so the check is live" unit_live probe-1395t.timer
+check_not "and the narrowed spare still reaches the service's process" unit_live probe-1395.service
+reset_once "$RESET"
+
+# ...and with the whole user@ tree spared again as well, the service survives
+# too -- so the narrowing is what reached it above.
+# shellcheck disable=SC2016  # the rendered hook's literal regex
+sed '/^  stop_user_units "\$uid" || units_rc=1$/d; s#grep -qE "^0::/system#grep -qE "user@[0-9]*\\.service|^0::/system#' "$RESET" >"$MUTANT"
+check_not "the spare-widening mutation applied" cmp -s "$RESET" "$MUTANT"
+seed_units
+check "seeded for the spare-widening mutant"           unit_live probe-1395.service
+reset_once "$MUTANT"
+settle
+check "with the whole tree spared the job's service survives -- so the check is live" unit_live probe-1395.service
+reset_once "$RESET"
+settle
+check_not "and the real reset still takes it"          unit_live probe-1395.service
+
+# A HELPER THE BUS FORKS (#1395 R1). Classic D-Bus activation -- a service file
+# in the job's own home with no SystemdService= -- makes dbus-daemon fork the
+# job's program into dbus.service's cgroup, with no cgroup write by the job.
+# Only the bus daemon itself is spared, by pid.
+ACT_DIR="$HOME_DIR/.local/share/dbus-1/services"
+install -d -o "$U" -g "$U" "$HOME_DIR/.local" "$HOME_DIR/.local/share" "$HOME_DIR/.local/share/dbus-1" "$ACT_DIR"
+printf '[D-BUS Service]\nName=org.probe1395\nExec=/bin/sleep 600\n' >"$ACT_DIR/org.probe1395.service"
+chown "$U:$U" "$ACT_DIR/org.probe1395.service"
+bus_pid() { timeout 10 systemctl --user -M "$U@" show -p MainPID --value dbus.service 2>/dev/null; }
+helper_alive() { pgrep -u "$U" -f '^/bin/sleep 600$' >/dev/null 2>&1; }
+as_slot timeout 5 dbus-send --session --print-reply --dest=org.probe1395 / org.freedesktop.DBus.Peer.Ping >>"$HOOKLOG" 2>&1
+for _ in $(seq 1 30); do helper_alive && break; sleep 0.1; done
+check "the bus forked the job's activated helper"      helper_alive
+bus_before=$(bus_pid)
+reset_once "$RESET"
+settle
+check_not "the activated helper does not survive"      helper_alive
+# The bus may be restarted by the reset (e.g. a unit read as non-stock is
+# reverted, or socket activation replaces it) -- killing more is the safe
+# direction. What must hold is that the slot still HAS a working user bus.
+echo "user bus MainPID before=$bus_before after=$(bus_pid)" >>"$HOOKLOG"
+check "a user bus still answers after the reset"   as_slot timeout 5 dbus-send --session --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.Peer.Ping
+rm -rf -- "$HOME_DIR/.local"
+
+# A UNIT THAT WILL NOT STOP fails the slot closed (R4). A timer, so the kill
+# loop has no process to fail on and the verdict is the unit stop's alone.
+as_slot systemd-run --user --quiet --unit=probe-1395r --on-active=1h \
+  --timer-property=RefuseManualStop=yes true >>"$HOOKLOG" 2>&1
+check "the unstoppable timer is armed"                 unit_live probe-1395r.timer
+rm -f -- "$MARKER"
+reset_once "$RESET"
+check "a unit that will not stop fails the reset"      test "$rc" != 0
+check "and says so"                                    grep -q 'would not stop' "$RUNLOG"
+check "and the slot is not marked clean"               test ! -f "$MARKER"
+# shellcheck disable=SC2016  # the rendered hook's literal text
+sed '/would not stop: /{n;s/^  return 1$/  return 0/}' "$RESET" >"$MUTANT"
+check_not "the fail-closed mutation applied" cmp -s "$RESET" "$MUTANT"
+check "the unstoppable timer is still armed for the mutant" unit_live probe-1395r.timer
+rm -f -- "$MARKER"
+reset_once "$MUTANT"
+check "without the final return 1 the unstoppable unit earns the marker -- so the check is live" test -f "$MARKER"
+
+loginctl disable-linger "$U" >>"$HOOKLOG" 2>&1
+systemctl stop "user@$SUID.service" >>"$HOOKLOG" 2>&1
+made_linger=0
 
 # --- the sweep ----------------------------------------------------------------
 #

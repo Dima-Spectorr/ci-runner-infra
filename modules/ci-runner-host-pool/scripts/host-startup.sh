@@ -739,7 +739,15 @@ rc=0
 # right after -- the removal is what comes last, and the marker is written over
 # a slot nothing has been able to touch since.
 slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, or empty> <slot idx>
-  local d owner pid line rest state ppid p hops spared
+  local d owner pid line rest state ppid p hops spared cg dk=""
+  # THE DAEMON'S OWN PROCESSES, read once per scan: a container's processes are
+  # spared below by DESCENT from one of these (#1395). Re-read on every scan
+  # because a container the daemon restarts gets a new shim.
+  cg=\$(systemctl show -p ControlGroup --value "ci-dockerd@\${5:-%}.service" 2>/dev/null) || cg=""
+  if [ -n "\$cg" ] && [ -d "/sys/fs/cgroup\$cg" ]; then
+    dk=\$(find "/sys/fs/cgroup\$cg" -name cgroup.procs -exec cat {} + 2>/dev/null | tr '\n' ' ')
+    [ -n "\$dk" ] && dk=" \$dk"
+  fi
   # ONE stat for the whole of /proc rather than one per pid, and the difference
   # is not cosmetic: this runs between every pair of jobs on a host with several
   # hundred processes, and a fork each was a fifth of a second of the job
@@ -768,21 +776,23 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     rest=\${line##*') '}
     read -r state _ <<< "\$rest"
     [ "\$state" = Z ] && continue
-    # EVERYTHING THE SLOT'S OWN SERVICE MANAGER SUPERVISES IS SPARED, matched on
-    # the cgroup rather than on a list of program names: \`user@<uid>.service\` is
-    # rootless dockerd, its containerd, and the container processes underneath
-    # them. The daemon has to survive -- the image-tag audit further down still
-    # talks to it and the next job needs its socket -- and the containers under
-    # it are already gone by the time this runs, removed through docker, which
-    # is where that job belongs and where \`-v\` takes their volumes with them.
+    # NOTHING UNDER \`user@<uid>.service\` IS SPARED BY CGROUP (#1395). The slot's
+    # service manager, its (sd-pam) and the user bus arrive in \$2 BY PID --
+    # see user_manager_pids -- because every cgroup in that subtree is the
+    # slot's to write: a job can move itself into init.scope, and the bus forks
+    # a job's D-Bus-activated helper straight into dbus.service's cgroup.
+    # Everything else there is a job's: \`systemd-run --user\` units in app.slice
+    # or any slice they name, and sparing the whole tree let them run on into
+    # the next job. Their units are stopped by stop_user_units before this
+    # runs; what they leave is killed here.
     #
-    # AND \`ci-dockerd@<idx>.service\` BY NAME, because on this host the rootless
-    # daemon is NOT under \`user@<uid>.service\`. It is a SYSTEM unit with
-    # \`User=ci-s%i\` (see the unit written further down), so its processes are
-    # owned by the slot uid -- which is what selects them here -- while its
-    # cgroup is \`ci-dockerd@<idx>.service\`. The \`user@\` test above therefore
-    # matched nothing, and dockerd, its containerd, rootlesskit and the network
-    # helper were reaped as "processes that outlived the last job".
+    # \`ci-dockerd@<idx>.service\` IS spared by cgroup, anchored under system.slice so a
+    # job's own user unit of the same name is not spared: the rootless daemon
+    # is a SYSTEM unit with \`User=ci-s%i\` (see the unit written further down),
+    # so its processes are owned by the slot uid -- which is what selects them
+    # here -- while its cgroup is \`ci-dockerd@<idx>.service\`. Without this,
+    # dockerd, its containerd, rootlesskit and the network helper were reaped
+    # as "processes that outlived the last job".
     #
     # That is how a whole fleet lost its runners on 2026-08-24. The agent unit
     # declares \`BindsTo=ci-dockerd@<idx>.service\`, so killing the daemon stopped
@@ -796,8 +806,18 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     #
     # every slot, every host, every boot. The pool then drained the host as a
     # failed registration and rebuilt it from the same template, forever.
-    grep -qE "user@\$1\.service|ci-dockerd@\${5:-%}\.service" "\$d/cgroup" 2>/dev/null && continue
-    # AND THE AGENT'S OWN TREE, when the agent is not already on the chain above.
+    grep -qE "^0::/system\.slice/(.*/)?ci-dockerd@\${5:-%}\.service(/|\$)" "\$d/cgroup" 2>/dev/null && continue
+    # AND THE AGENT'S OWN TREE, when the agent is not already on the chain above,
+    # AND EVERY CONTAINER, by descent from the daemon's processes: a container's
+    # cgroup is \`user@<uid>.service/user.slice/docker-<id>.scope\` (the cgroup
+    # driver is systemd), and a job can create a scope of that name itself, so
+    # the name proves nothing. Descent does -- a container's init is a child of
+    # a containerd shim in the daemon's cgroup, and a job cannot reparent a
+    # process there. Containers are spared, not killed, because the prune right
+    # after removes them through docker, and a container killed under a restart
+    # policy would be restarted by the daemon and fought here until the sweep
+    # gave up and failed a clean slot closed.
+    #
     # See quiesce_slot for which caller is which; here it is one parent walk per
     # candidate, stopped at pid 1 and bounded so that a /proc read racing with an
     # exiting process cannot spin.
@@ -807,10 +827,11 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     # and it is reparented -- cgroup membership does not follow reparenting -- so
     # a cgroup test spares precisely the leftovers this exists to remove. Descent
     # from the agent's main pid does not: a straggler's chain reaches pid 1.
-    if [ -n "\$3" ]; then
+    if [ -n "\$3" ] || [ -n "\$dk" ]; then
       p=\$pid; hops=0; spared=0
       while [ -n "\$p" ] && [ "\$p" != 0 ] && [ "\$p" != 1 ] && [ "\$hops" -lt 64 ]; do
-        if [ "\$p" = "\$3" ]; then spared=1; break; fi
+        if [ -n "\$3" ] && [ "\$p" = "\$3" ]; then spared=1; break; fi
+        case "\$dk" in *" \$p "*) spared=1; break ;; esac
         line=\$(cat "/proc/\$p/stat" 2>/dev/null) || break
         rest=\${line##*') '}
         read -r state ppid _ <<< "\$rest"
@@ -824,6 +845,104 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
     fi
     printf '%s\n' "\$pid"
   done <<< "\$(stat -c '%n %u' /proc/[0-9]* 2>/dev/null)"
+}
+
+# A JOB'S OWN UNITS IN THE SLOT'S SERVICE MANAGER (#1395).
+#
+# The slot user lingers -- runc needs its user manager to create each
+# container's cgroup scope -- so that manager outlives every job. From inside a
+# job, \`systemd-run --user --unit=x sleep 1d\` hands a process to it: the unit
+# lands in \`user@<uid>.service/app.slice\`, outside the agent's cgroup, and
+# \`--on-calendar\`, \`--path-property\` or \`--socket-property\` leave a timer, a
+# path or a socket that runs the job's code again, in the NEXT job's slot.
+# Measured on a live host 2026-09-29 (systemd 255): the unit survived the reset.
+#
+# So every live service, socket, timer and path the manager has is stopped,
+# except the user bus -- dbus.service and the dbus.socket that activates it,
+# which runc talks to for every container. Scopes are not listed: a container
+# IS a scope, removed through docker right after, and a scope a job made is a
+# set of processes the kill loop below reaches. Stock units (gpg-agent's
+# sockets and the like) go too; they are socket-activated and a job that needs
+# one starts its own, and a gpg-agent carried over from the last job is its
+# cache of the last job's keys.
+#
+# FAILS CLOSED on what is still running afterwards, not on what stop said: a
+# job can set RefuseManualStop=, and a unit that will not stop is a unit the
+# next job inherits. No manager at all is not a failure -- nothing of a job's
+# can run under a manager that is not there.
+user_units() { # <listing> -- the unit names in it a job could have made
+  printf '%s\n' "\$1" | awk '\$1 != "" && \$1 != "dbus.service" && \$1 != "dbus.socket" && \$3 != "inactive" && \$3 != "failed" { print \$1 }'
+}
+#
+# THE USER BUS ITSELF, when its unit is not the stock one: a job can add a
+# drop-in under ~/.config/systemd/user/dbus.service.d, daemon-reload and
+# restart the bus, and the running daemon then carries the job's ExecStart= or
+# ExecStartPost= into every later job -- the home wipe removes the file, not
+# the process. \`revert\` drops every user drop-in and override for the unit and
+# reloads; the stop then lets dbus.socket start the stock one on first use.
+dbus_is_stock() { # <FragmentPath> <DropInPaths> of dbus.service
+  local p
+  case "\$1" in /usr/lib/systemd/user/* | /etc/systemd/user/*) ;; *) return 1 ;; esac
+  # word-splitting is the point: DropInPaths is space-separated, and a path a
+  # job wrote with a space in it fails the case below all the same.
+  # shellcheck disable=SC2086
+  for p in \$2; do
+    case "\$p" in /usr/lib/systemd/user/* | /etc/systemd/user/*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+stop_user_units() { # <uid>
+  local all names frag drop
+  timeout -k 5 10 systemctl is-active --quiet "user@\$1.service" 2>/dev/null || return 0
+  frag=\$(timeout -k 5 30 systemctl --user -M "\$u@" show -p FragmentPath --value dbus.service 2>/dev/null) &&
+    drop=\$(timeout -k 5 30 systemctl --user -M "\$u@" show -p DropInPaths --value dbus.service 2>/dev/null) ||
+    { say "slot \$idx: could not read the user bus unit of \$u -- refusing to call this slot clean"; return 1; }
+  if ! dbus_is_stock "\$frag" "\$drop"; then
+    say "slot \$idx: the user bus of \$u is not the stock unit (\$(safe "\$frag \$drop")) -- reverting and stopping it"
+    timeout -k 5 30 systemctl --user -M "\$u@" revert dbus.service >/dev/null 2>&1
+    timeout -k 5 60 systemctl --user -M "\$u@" stop dbus.service >/dev/null 2>&1
+  fi
+  all=\$(timeout -k 5 30 systemctl --user -M "\$u@" list-units --no-legend --plain \
+    --type=service,socket,timer,path 2>/dev/null) ||
+    { say "slot \$idx: could not list the units of \$u's service manager -- refusing to call this slot clean"; return 1; }
+  names=\$(user_units "\$all")
+  [ -n "\$names" ] || return 0
+  say "slot \$idx: stopping \$(printf '%s\n' "\$names" | grep -c .) unit(s) the last job left in its service manager: \$(safe "\$(printf '%s' "\$names" | tr '\n' ' ')")"
+  # word-splitting is the point -- one unit per argument, and a unit name holds
+  # no whitespace.
+  # shellcheck disable=SC2086
+  timeout -k 5 60 systemctl --user -M "\$u@" stop -- \$names >/dev/null 2>&1
+  # shellcheck disable=SC2086
+  timeout -k 5 30 systemctl --user -M "\$u@" kill --signal=SIGKILL -- \$names >/dev/null 2>&1
+  timeout -k 5 30 systemctl --user -M "\$u@" reset-failed >/dev/null 2>&1
+  all=\$(timeout -k 5 30 systemctl --user -M "\$u@" list-units --no-legend --plain \
+    --type=service,socket,timer,path 2>/dev/null) ||
+    { say "slot \$idx: could not list the units of \$u's service manager -- refusing to call this slot clean"; return 1; }
+  names=\$(user_units "\$all")
+  [ -z "\$names" ] && return 0
+  say "slot \$idx: unit(s) of the last job would not stop: \$(safe "\$(printf '%s' "\$names" | tr '\n' ' ')") -- refusing to call this slot clean"
+  return 1
+}
+
+# WHAT OF THE SLOT'S SERVICE MANAGER SURVIVES, BY PID (#1395): the manager
+# (user@<uid>'s MainPID), its (sd-pam) -- the manager's EARLIEST child, forked
+# when the manager started and so before any job could fork one -- and the user
+# bus daemon (dbus.service's MainPID, read after stop_user_units has replaced a
+# non-stock one). runc creates every container's scope through the manager
+# and the bus, so the next job's first container needs all three. Nothing else
+# in their cgroups is spared: a D-Bus-activated helper is forked into
+# dbus.service's cgroup by the bus itself.
+user_manager_pids() { # <uid> -- one pid per line
+  local m kids d
+  m=\$(timeout -k 5 10 systemctl show -p MainPID --value "user@\$1.service" 2>/dev/null) || return 0
+  case "\$m" in '' | 0 | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "\$m"
+  kids=\$(ps --ppid "\$m" -o pid= --sort=start_time 2>/dev/null)
+  # shellcheck disable=SC2086
+  set -- \$kids
+  [ -n "\${1:-}" ] && printf '%s\n' "\$1"
+  d=\$(timeout -k 5 10 systemctl --user -M "\$u@" show -p MainPID --value dbus.service 2>/dev/null) || d=""
+  case "\$d" in '' | 0 | *[!0-9]*) ;; *) printf '%s\n' "\$d" ;; esac
 }
 
 # WHAT A JOB LEFT RUNNING OUTSIDE A CONTAINER.
@@ -868,7 +987,7 @@ slot_stragglers() { # <uid> <pids to spare> <agent pid, or empty> <agent unit, o
 # uninterruptible I/O -- the slot is not in the state the template describes,
 # and the marker is exactly the claim it must not get.
 quiesce_slot() {
-  local uid keep p line rest state ppid agent unit targets tick left
+  local uid keep p line rest state ppid agent unit targets tick left units_rc=0
   uid=\$(id -u "\$u" 2>/dev/null) ||
     { say "slot \$idx: could not resolve the uid of \$u -- refusing to call this slot clean"; return 1; }
 
@@ -905,8 +1024,14 @@ quiesce_slot() {
     fi
   fi
 
+  # The units FIRST: a unit with Restart= would otherwise be respawned by its
+  # manager as fast as the loop below kills it, and a timer has no process for
+  # the loop to find at all.
+  stop_user_units "\$uid" || units_rc=1
+  keep="\$keep\$(user_manager_pids "\$uid" | tr '\n' ' ')"
+
   targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
-  [ -n "\$targets" ] || return 0
+  [ -n "\$targets" ] || return "\$units_rc"
   say "slot \$idx: \$(printf '%s\n' "\$targets" | grep -c .) process(es) outlived the last job -- terminating them"
 
   tick=0
@@ -916,7 +1041,7 @@ quiesce_slot() {
     kill -TERM \$targets 2>/dev/null
     sleep 0.5
     targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
-    [ -n "\$targets" ] || return 0
+    [ -n "\$targets" ] || return "\$units_rc"
     tick=\$((tick + 1))
   done
 
@@ -926,7 +1051,7 @@ quiesce_slot() {
     kill -KILL \$targets 2>/dev/null
     sleep 0.5
     targets=\$(slot_stragglers "\$uid" "\$keep" "\$agent" "\$unit" "\$idx")
-    [ -n "\$targets" ] || return 0
+    [ -n "\$targets" ] || return "\$units_rc"
     tick=\$((tick + 1))
   done
 
@@ -1070,8 +1195,10 @@ if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
   # that backgrounded something. First because of #1392: a straggler still
   # running while the socket is classified could move or replace the name
   # between that check and the prune below. quiesce_slot spares the daemon's own
-  # unit (ci-dockerd@<idx>, and user@<uid>), so the daemon and the containers
-  # under it are untouched here and are removed through docker right after.
+  # unit (ci-dockerd@<idx>), the containers descended from it, and the slot's
+  # user manager and user bus -- nothing else it runs (#1395) -- so the daemon
+  # and the containers are untouched here and are removed through docker right
+  # after.
   quiesce_slot || rc=1
   dsock=\$(daemon_sock)
   say "slot \$idx: \$sock reads as \$dsock"
@@ -5104,9 +5231,10 @@ Environment=PATH=/usr/bin:/usr/sbin:/bin:/sbin
 # first, so it is worth fixing on the host rather than in every workflow.
 PrivateTmp=yes
 # Hide every other uid's processes from this slot. Set here as well as on the
-# agent because the two SHARE a mount namespace (JoinsNamespaceOf), and /proc is
-# a property of that namespace rather than of either unit: setting it on one
-# side only would leave which view wins depending on which started first.
+# agent because each unit gets its OWN mount namespace -- JoinsNamespaceOf
+# shares the private /tmp and the network namespace, not the mount namespace;
+# measured 2026-09-29, the runner, rootlesskit and dockerd each have a
+# different one (#1395) -- so a setting on one side only reaches that side.
 #
 # Ignored with a warning by systemd older than 247, which is why it is not the
 # argument for anything — it is the belt over the tokens already being out of

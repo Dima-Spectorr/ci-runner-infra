@@ -724,7 +724,52 @@ has_slot_quiesce() { # <file>
   #    the slot's service manager -- rootless dockerd, its containerd and the
   #    container processes under them. The daemon has to outlive the reset: the
   #    image-tag audit still talks to it and the next job needs its socket;
-  matches "$code" 'user@\\\$1\\\.service' || return 1
+  matches "$code" 'user@\\\$1\.service' || return 1
+  #    but NOTHING under user@ by cgroup (#1395): every cgroup there is the
+  #    slot's to write, and the bus forks a job's activated helper into its
+  #    own. The manager, its (sd-pam) and the bus daemon are spared BY PID,
+  #    read after the unit stop and before the first scan. The daemon's cgroup
+  #    is the one cgroup spared, anchored under system.slice so a job's own
+  #    user unit of that name is not.
+  local spare
+  spare=$(printf '%s\n' "$code" | grep -cF 'grep -qE "^0::/system\.slice/(.*/)?ci-dockerd@\${5:-%}\.service(/|\$)" "\$d/cgroup"')
+  [ "${spare:-0}" -eq 1 ] || return 1
+  counts "$code" 'grep -qE .*user@\\\$1\\\.service/' 0 || return 1
+  local pids
+  pids=$(printf '%s\n' "$code" | grep -n 'keep="\\\$keep\\\$(user_manager_pids "\\\$uid"')
+  pids=${pids%%:*}
+  matches "$code" 'show -p MainPID --value "user@\\\$1\.service"' || return 1
+  matches "$code" 'ps --ppid "\\\$m" -o pid= --sort=start_time' || return 1
+  matches "$code" 'show -p MainPID --value dbus\.service' || return 1
+  #    and a user bus that is not the stock unit is reverted and stopped.
+  matches "$code" 'if ! dbus_is_stock "\\\$frag" "\\\$drop"; then' || return 1
+  matches "$code" 'systemctl --user -M "\\\$u@" revert dbus\.service' || return 1
+  matches "$code" '/usr/lib/systemd/user/\* \| /etc/systemd/user/\*\) ;; \*\) return 1 ;;' || return 1
+  #    Every systemctl here is bounded, and killed if TERM does not end it.
+  counts "$code" 'timeout [0-9]+ systemctl --user' 0 || return 1
+  counts "$code" 'systemctl is-active --quiet "user@' 1 || return 1
+  matches "$code" 'timeout -k 5 10 systemctl is-active --quiet "user@' || return 1
+  #    Containers by DESCENT from the daemon's processes, not by a scope name a
+  #    job can choose.
+  matches "$code" 'case "\\\$dk" in \*" \\\$p "\*\) spared=1; break ;; esac' || return 1
+  matches "$code" 'ci-dockerd@\\\$\{5:-%\}\.service" 2>/dev/null\) \|\| cg=""' || return 1
+  #    And the job's own units are STOPPED before the kill loop -- services,
+  #    sockets, timers and paths, sparing only the user bus -- and a unit that
+  #    will not stop fails the slot closed.
+  local stop scan
+  # Captured whole and cut with parameter expansion: never `grep | head` under
+  # pipefail (#1409).
+  stop=$(printf '%s\n' "$code" | grep -n 'stop_user_units "\\\$uid" || units_rc=1')
+  stop=${stop%%$'\n'*}; stop=${stop%%:*}
+  scan=$(printf '%s\n' "$code" | grep -n 'targets=\\\$(slot_stragglers')
+  scan=${scan%%$'\n'*}; scan=${scan%%:*}
+  [ -n "$stop" ] && [ -n "$pids" ] && [ -n "$scan" ] || return 1
+  [ "$stop" -lt "$pids" ] && [ "$pids" -lt "$scan" ] || return 1
+  matches "$code" '--type=service,socket,timer,path' || return 1
+  matches "$code" 'systemctl --user -M "\\\$u@" stop -- \\\$names' || return 1
+  matches "$code" '\$1 != "dbus.service" && \\\$1 != "dbus.socket"' || return 1
+  matches "$code" 'would not stop: .* -- refusing to call this slot clean' || return 1
+  counts "$code" '\|\| return "\\\$units_rc"' 3 || return 1
   #    and the agent's own tree when the caller is NOT the agent. The idle sweep
   #    and the sweeper's teardown are root timers: without this they would kill
   #    the listener of every slot they touched.
@@ -2013,6 +2058,22 @@ mutate "a root sweep no longer spares the agent" 's|ci-runner@\\$idx.service|ci-
 mutate "a zombie is counted as a survivor"     '/= Z ] \&\& continue/d'                                                   has_slot_quiesce
 mutate "the home wipe stops being the anchor"  '/cd -- "\\$home" \&\& empty_here/d'                                            has_slot_quiesce
 mutate "a job can name itself out of the sweep" 's|{line##|{line#|g'                                                      has_slot_quiesce
+# #1395: a job's own user unit must not outlive the reset.
+mutate "the whole user@ tree is spared again"    's#grep -qE "^0::/system#grep -qE "user@\\$1\\.service|^0::/system#'       has_slot_quiesce
+mutate "a user unit named after the daemon is spared" 's#"^0::/system\\.slice/(\.\*/)?ci-dockerd#"ci-dockerd#'              has_slot_quiesce
+mutate "the manager and its bus are not spared by pid" '/keep="\\$keep\\$(user_manager_pids/d'                              has_slot_quiesce
+mutate "the bus pid is read before the unit stop" '/keep="\\$keep\\$(user_manager_pids/d; /^  # The units FIRST/i\  keep="\\$keep\\$(user_manager_pids "\\$uid" | tr '"'"'\\n'"'"' '"'"' '"'"')"' has_slot_quiesce
+mutate "(sd-pam) is picked by name, not by age"   's/ --sort=start_time//'                                                   has_slot_quiesce
+mutate "a non-stock user bus is left running"     '/revert dbus\.service/d'                                                  has_slot_quiesce
+mutate "a user drop-in reads as stock"            's#/usr/lib/systemd/user/\* | /etc/systemd/user/\*) ;; \*) return 1 ;;#*) ;;#g' has_slot_quiesce
+mutate "a hung systemctl is never killed"         's/timeout -k 5 /timeout /g'                                               has_slot_quiesce
+mutate "containers are no longer spared by descent" '/case "\\\$dk" in/d'                                                   has_slot_quiesce
+mutate "the job's units are never stopped"       '/stop_user_units "\\\$uid" || units_rc=1/d'                               has_slot_quiesce
+mutate "a unit that will not stop is called clean" 's/stop_user_units "\\\$uid" || units_rc=1/stop_user_units "\\$uid" || :/' has_slot_quiesce
+mutate "a job's timer is left armed"             's/--type=service,socket,timer,path/--type=service/g'                      has_slot_quiesce
+mutate "the stop verdict is dropped by the loop" '0,/|| return "\\\$units_rc"/s//|| return 0/'                              has_slot_quiesce
+mutate "a unit that would not stop is not named" 's/would not stop: \(.*\) -- refusing to call this slot clean/would not stop: \1/' has_slot_quiesce
+mutate "the user bus is stopped with the rest"   's/ && \\\$1 != "dbus.service"//'                                           has_slot_quiesce
 
 mutate "App JWT back in curl argv"        's@-K <(printf.*\$jwt")@-H "Authorization: Bearer $jwt"@'          has_secrets_out_of_argv
 mutate "registration token back in curl argv" 's@-K <(printf.*\$tok")@-H "Authorization: Bearer $tok"@'          has_secrets_out_of_argv
