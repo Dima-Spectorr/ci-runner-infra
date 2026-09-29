@@ -59,6 +59,14 @@ on:
 permissions:
   contents: read
 
+# Keyed per run — joins nothing, evicts nothing. Every lane file declares a
+# top-level block (the fleet's `check-workflow-concurrency.sh` demands one, and
+# `docs/merge-lane.md` says each file keeps it); the serialization that matters
+# is the job-level group below.
+concurrency:
+  group: merge-lane-self-${{ github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   lane:
     # DRY RUN IS NOT THE SAME AS NOT WIRED YET.
@@ -78,7 +86,14 @@ jobs:
     #
     # `secrets.*` cannot be read in an `if:`, which is why this is a variable
     # rather than a test for the secret itself.
-    if: vars.MERGE_LANE_ENABLED == 'true'
+    #
+    # THE SECOND HALF SKIPS A FORK'S REVIEW (#1382). This repository is public,
+    # so anyone can review a fork's pull request, and every review wakes a
+    # hosted pass through the relay that spends the merge App's API quota. A
+    # relay run carries the reviewed pull request's head repository; when that
+    # is not this one, the pass is skipped. Only the relay's wake-up is
+    # filtered — a CI completion, the sweep and a dispatch all pass unchanged.
+    if: vars.MERGE_LANE_ENABLED == 'true' && (github.event.workflow_run.name != 'Merge lane review relay' || github.event.workflow_run.head_repository.full_name == github.repository)
     # ONE PASS AT A TIME, DECIDED BY THE JOB THAT ACTUALLY RUNS.
     #
     # At the job, not the workflow: a workflow-level group is joined by every

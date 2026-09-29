@@ -65,6 +65,27 @@ So a pin that could not be read is `warn:lane-pin-unreadable`, not silence; a
 ruleset that could not be compared is `warn:required-checks-uncomparable`, not a
 pass; an unrecognised tier is `fail:unknown-tier`, not a default.
 
+### The two-file lane
+
+A repository on the split lane (`docs/merge-lane.md`, "Wiring a repository")
+has a second caller, `merge-lane-events.yml`, and a review relay beside it.
+When the events file exists the audit also reads it, and reports:
+
+- `fail:events-pin-stale` / `warn:events-pin-unreadable` — the events file's
+  pin, judged exactly like `merge-lane.yml`'s. The two drift apart the way the
+  guard and reaper pins did.
+- `fail:relay-name-mismatch` — the relay's `name:` is not an entry in the events
+  file's `workflow_run: workflows:` list, or there is no relay at all. Every
+  review then completes a relay run that wakes nothing, and approvals wait for
+  the daily backstop with nothing red anywhere.
+- `fail:lane-with-drift` — the two files' `with:` blocks differ in anything but
+  `runs-on` (comments and blank lines ignored). That is two lanes: a pass woken
+  by a label or a review gates on different checks or budgets than one woken
+  by CI.
+
+An unread relay or `with:` block is a `warn:`, never a pass. A repository still
+on the single-file caller has no events file and none of these rules apply.
+
 ## `fail:` versus `warn:`
 
 `fail:` is for state that **silently stops work** — a merge that can never
