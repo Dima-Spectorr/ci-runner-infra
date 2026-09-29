@@ -622,6 +622,61 @@ has_container_reclaim() { # <file>
   matches "$code" 'could not remove the containers left behind' || return 1
 }
 
+# THE SOCKET THE PRUNE TALKS TO IS THE DAEMON'S (#1392). The slot owns
+# /run/<slot>, so a job can rename docker.sock -- the daemon keeps listening on
+# the renamed inode -- or put a listener of its own at the name. Both used to
+# read as "no daemon" or as the daemon, and either way the containers and
+# volumes survived under a marker that said they had not.
+has_socket_identity() { # <file>
+  local code classify prune
+  code=$(code_of "$1")
+  # 1. Classified before the prune, and a foreign socket fails closed: rc=1 on
+  #    the line right after the branch opens, before any docker call.
+  matches "$code" '^  dsock=\\\$\(daemon_sock\)$' || return 1
+  [ "$(printf '%s\n' "$code" | grep -A2 -E '^  if \[ "\\\$dsock" = foreign \]; then$' |
+    grep -cE '^    rc=1$')" -ge 1 ] || return 1
+  classify=$(printf '%s\n' "$code" | grep -n 'dsock=\\\$(daemon_sock)' | head -1 | cut -d: -f1)
+  prune=$(printf '%s\n' "$code" | grep -n 'docker ps --all --quiet --no-trunc' | head -1 | cut -d: -f1)
+  [ -n "$classify" ] && [ -n "$prune" ] && [ "$classify" -lt "$prune" ] || return 1
+  # 2. "Bound" is read from the kernel's listing, which keeps the bind-time name
+  #    through a rename, and only for sockets the daemon's cgroup holds.
+  matches "$code" 'systemctl show -p ControlGroup --value "ci-dockerd@\\\$idx\.service"' || return 1
+  matches "$code" 'NR > 1 && \\\$8 == s && \(\\\$7 in held\)' || return 1
+  # 3. The NAME must reach a listener in that cgroup, by SO_PEERCRED.
+  matches "$code" 'socket\.SO_PEERCRED' || return 1
+  matches "$code" 'for p in \\\$procs; do \[ "\\\$p" = "\\\$peer" \] && \{ echo ours; return 0; \}; done' || return 1
+  # 4. Bound but not answering -- missing, not a socket, or a symlink -- is
+  #    foreign; and a name present before the daemon bound anything is too.
+  matches "$code" 'if \[ ! -S "\\\$sock" \] \|\| \[ -L "\\\$sock" \]; then echo foreign; return 0; fi' || return 1
+  matches "$code" 'if \[ -e "\\\$sock" \] \|\| \[ -L "\\\$sock" \]; then echo foreign; else echo starting; fi' || return 1
+  # 5. No daemon at all keeps today's handling.
+  matches "$code" "'' \| 0 \| \*\[!0-9\]\*\) echo absent; return 0 ;;" || return 1
+  # 6. The image-tag prune never goes through a foreign socket either.
+  matches "$code" 'if \[ "\\\$dsock" != foreign \] && \[ -S "\\\$sock" \]; then' || return 1
+  # 7. The job's stragglers are stopped BEFORE the classification, so none is
+  #    left to swap the name between the check and the prune ...
+  local quiesce
+  quiesce=$(printf '%s\n' "$code" | grep -n 'quiesce_slot || rc=1' | head -1 | cut -d: -f1)
+  [ -n "$quiesce" ] && [ "$quiesce" -lt "$classify" ] || return 1
+  # 8. ... and the name is classified again after the prune, failing closed.
+  [ "$(printf '%s\n' "$code" | grep -A1 -E '^    \[ "\\\$\(daemon_sock\)" = "\\\$dsock" \] \|\|$' |
+    grep -cE 'changed under the prune.*rc=1; \}$')" -ge 1 ] || return 1
+}
+
+# A FAILED DOCKER LISTING IS NOT AN EMPTY ONE (#1392 review). A docker ps piped
+# into sort took sort's status, so a listing that timed out or errored read as
+# "no containers" and the marker went on over a live stack. Each listing the
+# reset makes is taken without a pipe and fails the reset closed.
+has_listing_fails_closed() { # <file>
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^    if ! cids=\\\$\(timeout 30 sudo' || return 1
+  matches "$code" '^    if ! ids=\\\$\(timeout 30 sudo' || return 1
+  matches "$code" '^      if ! info=\\\$\(timeout 60 sudo' || return 1
+  matches "$code" 'could not list the containers the last job left' || return 1
+  counts "$code" 'docker (ps|image ls) --all --quiet --no-trunc 2>[^ ]* \|' 0 || return 1
+}
+
 # THE MARKER IS A CLAIM ABOUT WRITERS, NOT ABOUT FILES (#237 finding 3).
 #
 # Every step of the old reset was correct and the ORDER was not: the home was
@@ -953,6 +1008,18 @@ if has_container_reclaim "$SCRIPT"; then
   ok
 else
   bad "a stack the last run left detached keeps this slot's band ports bound and its database reachable — the next run assigned this slot either cannot start its own services or connects to a finished pull request's, and neither says so"
+fi
+
+if has_socket_identity "$SCRIPT"; then
+  ok
+else
+  bad "the reset trusts whatever is at the slot's docker.sock — a job that renames the daemon's socket, or listens at the name itself, escapes the container and volume prune and the slot is still marked clean (#1392)"
+fi
+
+if has_listing_fails_closed "$SCRIPT"; then
+  ok
+else
+  bad "a docker listing that failed or timed out reads as an empty one — the reset writes the clean marker over containers or tags it never saw (#1392 review)"
 fi
 
 if has_slot_quiesce "$SCRIPT"; then
@@ -1910,6 +1977,22 @@ mutate "containers left for the next run"    's|docker ps --all --quiet --no-tru
 mutate "named volumes survive the reset"     's|docker volume prune --force --all|docker volume prune --force|'               has_container_reclaim
 mutate "a stuck container no longer fails"   's|could not remove the containers left behind|removed nothing behind|'          has_container_reclaim
 mutate "a stuck tag no longer fails the slot" 's|could not drop local image tag|dropped nothing for|'                     has_local_tag_prune
+
+mutate "a moved socket is not classified"     's/^  dsock=\\$(daemon_sock)$/  dsock=absent/'                              has_socket_identity
+mutate "a foreign socket still earns the marker" '/^  if \[ "\\$dsock" = foreign \]; then$/,+2 s/^    rc=1$/    :/'      has_socket_identity
+mutate "classified after the prune"           '/^  dsock=\\$(daemon_sock)$/d; /docker volume prune --force --all/a\  dsock=\\$(daemon_sock)' has_socket_identity
+mutate "bound read from any socket"           's/NR > 1 && \\$8 == s && (\\$7 in held)/NR > 1 \&\& \\$8 == s/'      has_socket_identity
+mutate "the listener's identity not checked"  's/\[ "\\$p" = "\\$peer" \] && { echo ours/true \&\& { echo ours/'       has_socket_identity
+mutate "a symlink at the name is trusted"     's/if \[ ! -S "\\$sock" \] || \[ -L "\\$sock" \]; then echo foreign/if [ ! -S "\\$sock" ]; then echo foreign/' has_socket_identity
+mutate "a name before the bind is trusted"    's/then echo foreign; else echo starting; fi/then echo starting; else echo starting; fi/' has_socket_identity
+mutate "tags pruned through a foreign socket" 's/if \[ "\\$dsock" != foreign \] && \[ -S "\\$sock" \]; then/if [ -S "\\$sock" ]; then/' has_socket_identity
+mutate "stragglers quiesced after the check"  '/^  quiesce_slot || rc=1$/d; /^  dsock=\\$(daemon_sock)$/a\  quiesce_slot || rc=1' has_socket_identity
+mutate "no re-check after the prune"          's/^    \[ "\\$(daemon_sock)" = "\\$dsock" \] ||$/    true ||/'      has_socket_identity
+mutate "a failed docker ps reads as empty"    's/^    if ! cids=/    if cids=/'                                          has_listing_fails_closed
+mutate "docker ps piped into sort again"      's|docker ps --all --quiet --no-trunc 2>"\\\$derr"); then|docker ps --all --quiet --no-trunc 2>"\\$derr" \| sort -u); then|' has_listing_fails_closed
+mutate "a failed image ls reads as empty"     's/^    if ! ids=/    if ids=/'                                            has_listing_fails_closed
+mutate "a failed image inspect is ignored"    's/^      if ! info=/      if info=/'                                      has_listing_fails_closed
+mutate "no daemon now fails closed"          "s/'' | 0 | \*\[!0-9\]\*) echo absent; return 0 ;;/'' | 0 | *[!0-9]*) echo foreign; return 0 ;;/" has_socket_identity
 
 mutate "nothing sweeps the last job's processes" '/quiesce_slot || rc=1/d'                                                has_slot_quiesce
 mutate "a sweep that fails no longer withdraws the marker" 's@quiesce_slot || rc=1@quiesce_slot@'                         has_slot_quiesce

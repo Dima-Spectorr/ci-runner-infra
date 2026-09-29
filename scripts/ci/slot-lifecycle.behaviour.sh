@@ -136,6 +136,7 @@ TOOL_CACHE_NAME=tools
 WORK="$SLOT_ROOT/$IDX/_work"
 WORKSPACE="$WORK/$OWNER/$REPO"
 MARKER="$SLOT_STATE/$IDX/clean"
+BURNS_1392="$SLOT_STATE/$IDX/burns"
 SINCE="$SLOT_STATE/$IDX/dirty-since"
 
 made_user=0
@@ -544,7 +545,12 @@ check "without the pid rule a dead pid's socket survives -- so the check is live
 # the shape it has then: an empty real directory the slot owns. The socket here
 # is a bound, never-listening stand-in, removed again before the sweep section.
 DSOCK="/run/$U/docker.sock"
-if [ ! -e "/run/$U" ] && install -d -o "$U" -g "$U" -m 0700 "/run/$U"; then
+# A LEFTOVER /run/$U is this suite's own, from a run that was killed before its
+# cleanup (#1392 T1): the account is created above and the suite refuses to
+# start if it already existed, so no live slot can own this path here. Refusing
+# on it would fail every later run on that machine until someone removed it.
+rm -rf -- "/run/$U"
+if install -d -o "$U" -g "$U" -m 0700 "/run/$U"; then
   made_rundir=1
 fi
 check "the suite owns /run/$U for the stand-in socket" test "$made_rundir" = 1
@@ -612,6 +618,201 @@ check "and the refusal is logged" grep -q 'is not a private one' "$HOOKLOG"
 systemctl stop "$DAEMON_UNIT" >/dev/null 2>&1
 made_unit=0
 rm -f -- "$HOST_SENTINEL"
+
+echo
+echo "the daemon's socket, moved by the job (#1392)"
+#
+# The slot owns /run/<slot>, so a job can rename docker.sock. The daemon keeps
+# listening on the renamed inode, and the reset used to read the missing name as
+# "no daemon": it skipped the container and volume prune and wrote the marker
+# anyway, handing the next job the last one's database through the new name.
+#
+# The stand-in daemon is a real listener in the unit the reset asks systemd
+# about, bound where the real one binds. It accepts and hangs up at once, so a
+# prune that does reach it fails in milliseconds instead of waiting out three
+# docker timeouts -- which is also why the positive case below is asserted on
+# the classification and not on the marker.
+# /run/$U and $DSOCK are the copy-up section's, still in place (and emptied of
+# its stand-in socket).
+MOVED="/run/$U/x.sock"
+RUNLOG="$SB/run-output"
+check "/run/$U is still there for the stand-in daemon" test -d "/run/$U"
+LISTENER='import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+s.listen(8)
+while True:
+    c, _ = s.accept()
+    c.close()'
+if systemd-run --quiet --unit="$DAEMON_UNIT" --uid="$U" python3 -c "$LISTENER" "$DSOCK" \
+     >>"$HOOKLOG" 2>&1; then
+  made_unit=1
+fi
+for _ in $(seq 1 50); do
+  [ -S "$DSOCK" ] && break
+  sleep 0.1
+done
+check "the stand-in daemon listens at the slot's socket" test -S "$DSOCK"
+
+reset_once() { # <script> -- one completed reset; its output kept apart as well
+  "$1" completed "$IDX" >"$RUNLOG" 2>&1
+  rc=$?
+  cat "$RUNLOG" >>"$HOOKLOG"
+  return 0
+}
+refused_socket() { grep -q 'is not the socket it listens on' "$RUNLOG"; }
+reads_as() { grep -q "$DSOCK reads as $1\$" "$RUNLOG"; }
+
+# The daemon's own socket, where it belongs: classified as the daemon's -- not
+# merely "not foreign", which absent and starting would pass as well.
+reset_once "$RESET"
+check "the daemon's own socket reads as ours"          reads_as ours
+check_not "and is not called foreign"                  refused_socket
+
+# A FAILED LISTING IS NOT AN EMPTY ONE (#1392 review). A docker ps piped into
+# sort took sort's status, so a listing that errored or timed out -- a slow
+# daemon, or one a leftover had stopped -- read as "no containers" and the
+# marker went on over a live stack. Here docker is a stand-in, swapped in for
+# every call the reset makes, that answers everything empty and succeeds, and
+# fails ps on demand. Everything else about the slot is healthy, so the ps
+# failure is the only thing that can cost the marker.
+FAKEBIN="$SB/fakebin"
+install -d -m 0755 "$FAKEBIN"
+FAKECALLS="$SB/fake-calls"
+: >"$FAKECALLS"
+chmod 0666 "$FAKECALLS"
+cat >"$FAKEBIN/docker" <<FAKE
+#!/bin/sh
+echo "\$(id -un): \$*" >>"$FAKECALLS"
+[ "\$1" = ps ] && [ -f "$SB/ps-fails" ] && exit 1
+exit 0
+FAKE
+chmod 0755 "$FAKEBIN/docker"
+# The transport first, on its own, so a failure below is about the reset and
+# not about the stand-in being unreachable as the slot.
+fake_as_slot() {
+  timeout 30 sudo -u "$U" DOCKER_HOST="unix://$DSOCK" "$FAKEBIN/docker" network prune --force \
+    >>"$HOOKLOG" 2>&1
+}
+check "the stand-in docker runs as the slot user" fake_as_slot
+# The RENDERED reset, not host-startup.sh's text: install_job_hooks writes it
+# through an unquoted here-document, which joins every backslash-continued line.
+# So `DOCKER_HOST="unix://$sock" \` + an indented `docker ps` arrives as ONE line
+# with a run of spaces between the two -- and a pattern that wants exactly one
+# space, or `docker` at the start of a line, leaves the real docker in place,
+# talking to a stand-in daemon that hangs up on it (#1394).
+fake_docker() { # <script> <out> -- the same reset, with every docker call on the stand-in
+  sed "s#^\([[:space:]]*\)docker #\1$FAKEBIN/docker #; s#\(DOCKER_HOST=\"unix://\\\$sock\"\)[[:space:]]\{1,\}docker #\1 $FAKEBIN/docker #" "$1" >"$2"
+  chmod 0755 "$2"
+}
+FAKED="$SB/slot-reset.faked.sh"
+fake_docker "$RESET" "$FAKED"
+check_not "every docker call is on the stand-in" grep -qE '^[[:space:]]*docker |"[[:space:]]+docker ' "$FAKED"
+
+
+rm -f -- "$MARKER" "$SB/ps-fails"
+: >"$FAKECALLS"
+reset_once "$FAKED"
+check "the reset's own docker calls reach the stand-in" grep -q ': ps --all' "$FAKECALLS"
+check "with docker answering, the slot is marked clean" test -f "$MARKER"
+
+rm -f -- "$MARKER"
+: >"$SB/ps-fails"
+reset_once "$FAKED"
+check "a failed docker ps fails the reset"             test "$rc" != 0
+check "and the slot is not marked clean"               test ! -f "$MARKER"
+check "and says why"                                   grep -q 'could not list the containers' "$RUNLOG"
+
+# Put the pipe back, and the same failure earns the marker -- so the check is
+# live. The hook runs under pipefail, so the pipe alone would still carry
+# docker's status; the old listing's status was sort's, and that is restored
+# with pipefail off inside the substitution.
+# shellcheck disable=SC2016  # the rendered hook's literal $derr; nothing here may expand it
+sed 's#if ! cids=\$(timeout 30 #if ! cids=$(set +o pipefail; timeout 30 #; s#docker ps --all --quiet --no-trunc 2>"\$derr"); then#docker ps --all --quiet --no-trunc 2>"$derr" | sort -u); then#' \
+  "$FAKED" >"$MUTANT"
+chmod 0755 "$MUTANT"
+check_not "the pipe mutation applied" cmp -s "$FAKED" "$MUTANT"
+rm -f -- "$MARKER"
+reset_once "$MUTANT"
+check "piped into sort, the failed ps earns the marker -- so the check is live" test -f "$MARKER"
+rm -f -- "$SB/ps-fails"
+# What the stand-in was asked, kept with the hooks' own output for a failed run.
+sed 's/^/  stand-in docker: /' "$FAKECALLS" >>"$HOOKLOG"
+
+# Renamed by the job.
+rm -f -- "$MARKER" "$BURNS_1392"
+sudo -u "$U" mv -- "$DSOCK" "$MOVED"
+reset_once "$RESET"
+check "a renamed socket fails the reset"               test "$rc" != 0
+check "and says why"                                   refused_socket
+check "and the slot is not marked clean"               test ! -f "$MARKER"
+check "and the failure is counted like any unclean reset" grep -qx 1 "$BURNS_1392"
+
+# Break the fail-closed branch back: the same rename must then earn the marker,
+# which is the leak -- so the assertions above are live.
+# shellcheck disable=SC2016  # the rendered hook's literal $dsock; nothing here may expand it
+sed 's/if \[ "\$dsock" = foreign \]; then/if false; then/' "$RESET" >"$MUTANT"
+check_not "the fail-closed mutation applied" cmp -s "$RESET" "$MUTANT"
+rm -f -- "$MARKER"
+reset_once "$MUTANT"
+check "without the branch the renamed socket earns the marker -- so the check is live" \
+  test -f "$MARKER"
+
+# A listener of the JOB's own at the name, the daemon's renamed out of the way.
+rm -f -- "$MARKER"
+sudo -u "$U" python3 -c "$LISTENER" "$DSOCK" >/dev/null 2>&1 &
+fake=$!
+for _ in $(seq 1 50); do
+  [ -S "$DSOCK" ] && break
+  sleep 0.1
+done
+check "the job's own listener is up at the name"       test -S "$DSOCK"
+reset_once "$RESET"
+# The quiesce now runs BEFORE the classification (#1392 review), so the job's
+# listener is gone by then and what is left at the name answers nobody.
+check "a job's listener at the name fails the reset"   test "$rc" != 0
+check "and is called foreign"                          refused_socket
+check "and the slot is not marked clean"               test ! -f "$MARKER"
+# By pid, so the stand-in daemon -- the same program -- is never the one hit.
+kill "$fake" >/dev/null 2>&1
+wait "$fake" >/dev/null 2>&1
+
+# A listener the quiesce does NOT stop -- root's here, standing in for anything
+# outside the slot uid's reach -- is what the peer check is for. Refused as
+# foreign, and with the check broken back it is trusted.
+rm -f -- "$DSOCK" "$MARKER"
+python3 -c "$LISTENER" "$DSOCK" >/dev/null 2>&1 &
+fake=$!
+for _ in $(seq 1 50); do
+  [ -S "$DSOCK" ] && break
+  sleep 0.1
+done
+reset_once "$RESET"
+check "a listener outside the daemon's unit is called foreign" refused_socket
+check "and the slot is not marked clean"               test ! -f "$MARKER"
+# shellcheck disable=SC2016  # the rendered hook's literal $p/$peer
+sed 's/\[ "\$p" = "\$peer" \] && { echo ours/true \&\& { echo ours/' "$RESET" >"$MUTANT"
+check_not "the peer mutation applied" cmp -s "$RESET" "$MUTANT"
+check "the outside listener is still up for the mutant" test -S "$DSOCK"
+for _ in $(seq 1 50); do
+  [ -S "$DSOCK" ] && break
+  sleep 0.1
+done
+# Without a live daemon the reset says nothing about the socket at all, and the
+# assertion below would pass for that reason instead.
+check "the stand-in daemon is still up for the mutant" systemctl is-active --quiet "$DAEMON_UNIT"
+reset_once "$MUTANT"
+check "without the peer check the job's listener reads as ours -- so the check is live" \
+  reads_as ours
+kill "$fake" >/dev/null 2>&1
+wait "$fake" >/dev/null 2>&1
+
+systemctl stop "$DAEMON_UNIT" >/dev/null 2>&1
+made_unit=0
+rm -rf -- "/run/$U"
+made_rundir=0
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+check "with the daemon gone the slot comes back clean" test -f "$MARKER"
 
 # --- the sweep ----------------------------------------------------------------
 #
