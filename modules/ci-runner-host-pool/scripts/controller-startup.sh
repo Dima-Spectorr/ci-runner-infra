@@ -2330,7 +2330,7 @@ rerun_cancelled_pinned() {
       done:*)
         # A person re-ran it, or it finished on its own: not the controller's
         # business any more, and not worth anybody's attention either.
-        pin_ledger_write "$pr_id" done "$rec"
+        pin_ledger_write "$pr_id" "done" "$rec"
         log "pinned run $pr_id: ${decision#done:}; nothing to re-run"
         ;;
       superseded:*)

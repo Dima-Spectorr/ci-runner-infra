@@ -433,7 +433,7 @@ for _ev in workflow_dispatch schedule deployment release workflow_run repository
   is "F4: event [${_ev}] is never re-run automatically" declined: \
     "$(pin_rerun_decision cancelled 60 completed 900 1 1 cancelled "$_ev" 0)"
 done
-is "the later states are cancel-only too: done" cancel-only: "$(pin_orphan_action done)"
+is "the later states are cancel-only too: done" cancel-only: "$(pin_orphan_action "done")"
 is "the later states are cancel-only too: superseded" cancel-only: "$(pin_orphan_action superseded)"
 is "the later states are cancel-only too: declined" cancel-only: "$(pin_orphan_action declined)"
 
@@ -468,6 +468,8 @@ src_has "F3: the Actions token is scoped to this repository and actions:write al
 src_has "F3: the cancel and re-run POST carry the scoped token" 'Authorization: Bearer $GH_ACT_TOKEN'
 # shellcheck disable=SC2016  # the controller source is the literal under test
 src_has "F3: the cancel goes through gh_actions_post" 'gh_actions_post "$run" cancel'
+# The pattern matches the literal $run / $pr_id spellings in the controller source.
+# shellcheck disable=SC2016
 _unscoped_writes=$(grep -cE 'actions/runs/\$(run|pr_id)/(cancel|rerun)' "$CONTROLLER" || true)
 if [ "$_unscoped_writes" = 0 ]; then
   printf 'ok   %s\n' "F3: no cancel or re-run URL is built outside gh_actions_post"
