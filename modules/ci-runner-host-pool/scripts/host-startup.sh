@@ -1057,7 +1057,11 @@ daemon_sock() { # prints: absent | starting | ours | foreign
 # cannot write, and passed through safe(): the daemon is the slot's, so its
 # words are the slot's too. One line, bounded.
 derr="\$SLOT_STATE/\$idx/.docker-stderr"
-docker_said() { [ -s "\$derr" ] && printf ' (docker: %s)' "\$(safe "\$(head -n 1 "\$derr")")"; }
+# 0600 once: a later \`2>"\$derr"\` truncates it but keeps the mode, so another
+# slot's user never reads this slot's container names out of an error.
+install -m 0600 /dev/null "\$derr" 2>/dev/null || :
+# Bounded read: a job's own listener can answer with an error of any length.
+docker_said() { [ -s "\$derr" ] && printf ' (docker: %s)' "\$(safe "\$(head -c 4096 "\$derr" | head -n 1)")"; }
 
 dsock=""
 if [ "\$stage" != started ] && [ "\$prune" = 1 ]; then
