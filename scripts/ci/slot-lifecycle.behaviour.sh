@@ -723,9 +723,12 @@ check "a failed docker ps fails the reset"             test "$rc" != 0
 check "and the slot is not marked clean"               test ! -f "$MARKER"
 check "and says why"                                   grep -q 'could not list the containers' "$RUNLOG"
 
-# Put the pipe back, and the same failure earns the marker -- so the check is live.
+# Put the pipe back, and the same failure earns the marker -- so the check is
+# live. The hook runs under pipefail, so the pipe alone would still carry
+# docker's status; the old listing's status was sort's, and that is restored
+# with pipefail off inside the substitution.
 # shellcheck disable=SC2016  # the rendered hook's literal $derr; nothing here may expand it
-sed 's#docker ps --all --quiet --no-trunc 2>"\$derr"); then#docker ps --all --quiet --no-trunc 2>"$derr" | sort -u); then#' \
+sed 's#if ! cids=\$(timeout 30 #if ! cids=$(set +o pipefail; timeout 30 #; s#docker ps --all --quiet --no-trunc 2>"\$derr"); then#docker ps --all --quiet --no-trunc 2>"$derr" | sort -u); then#' \
   "$FAKED" >"$MUTANT"
 chmod 0755 "$MUTANT"
 check_not "the pipe mutation applied" cmp -s "$FAKED" "$MUTANT"
