@@ -6639,7 +6639,11 @@ namespace CiBoot {
     if ($hr -ne 0 -and $hr -ne -2147024713) {
         throw ('CreateProfile for slot {0} returned 0x{1:X8}' -f $Index, $hr)
     }
-    Write-BootLog "phase 4: slot $Index had never logged on -- created its profile at $path"
+    if ($hr -eq 0) {
+        Write-BootLog "phase 4: slot $Index had never logged on -- created its profile at $path"
+    } else {
+        Write-BootLog "phase 4: slot $Index's profile already existed when CreateProfile ran"
+    }
 }
 
 function Save-SlotProfileTemplate {
