@@ -196,8 +196,24 @@ $script:ProfileTemplateSeconds = 600
 # schedule; it does not release it at all. So the wait covers only a genuinely
 # slow unload, and a hive still loaded after it is unloaded by
 # Invoke-SlotHiveRelease, with its own short bound below.
+#
+# AND A HIVE EVEN THAT CANNOT UNLOAD IS CAPTURED LIVE (#898). Two v5.109 boots:
+# `reg unload` as SYSTEM refused with "Access is denied" -- open keys -- with no
+# slot process left and nothing of this script's own open. The holder is the
+# host, not the slot, so the hive's CONTENTS are still pristine; `reg save`
+# snapshots a loaded hive consistently, and robocopy leaves the hive files alone.
 $script:ProfileHiveUnloadSeconds = 30
 $script:ProfileHiveReleaseSeconds = 15
+
+# The two hives a profile carries: HKU suffix -> file under the profile. The
+# reset script carries the same table (Get-SlotResetScript), asserted by a test.
+$script:ProfileHives = @(
+    @{ Suffix = ''; File = 'NTUSER.DAT' },
+    @{ Suffix = '_Classes'; File = 'AppData\Local\Microsoft\Windows\UsrClass.dat' }
+)
+# Every file of a loaded hive robocopy must skip: the hive, its .LOG1/.LOG2, and
+# the {guid}.TM.blf/.regtrans-ms transaction logs, which all share the prefix.
+$script:ProfileHiveFilePatterns = @('NTUSER.DAT*', 'UsrClass.dat*')
 
 # The bound on every RESTORE afterwards, and it is deliberately much shorter than
 # the capture's. THE RESET SERVICE SERVES EVERY SLOT FROM ONE SERIAL LOOP, so
@@ -1595,6 +1611,100 @@ function Invoke-HiveRelease {
     $ErrorActionPreference = $previous
 }
 
+# The boot script's $script:ProfileHives and $script:ProfileHiveFilePatterns,
+# for the reason Wait-HiveUnloaded is a copy, and asserted equal by a test.
+$ProfileHives = @(
+    @{ Suffix = ''; File = 'NTUSER.DAT' },
+    @{ Suffix = '_Classes'; File = 'AppData\Local\Microsoft\Windows\UsrClass.dat' }
+)
+$ProfileHiveFilePatterns = @('NTUSER.DAT*', 'UsrClass.dat*')
+
+# #898: the host keeps a slot's hive loaded after everything of the slot is gone,
+# and `reg unload` is refused. REG_FORCE_RESTORE replaces the CONTENTS of a
+# loaded hive from the template's file, open handles or not -- the one supported
+# way to reset a hive nobody will unload. SYSTEM holds both privileges the call
+# needs, disabled; they are enabled on this process's token only.
+$HiveRestoreSource = @"
+using System;
+using System.Runtime.InteropServices;
+namespace CiSlotReset {
+public static class Hive {
+    [StructLayout(LayoutKind.Sequential)] struct Luid { public uint Low; public int High; }
+    [StructLayout(LayoutKind.Sequential)] struct TokenPrivileges { public uint Count; public Luid Luid; public uint Attributes; }
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool LookupPrivilegeValueW(string system, string name, out Luid luid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivileges state, uint length, IntPtr previous, IntPtr returned);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    static extern int RegOpenKeyExW(IntPtr root, string subKey, uint options, uint access, out IntPtr key);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    static extern int RegRestoreKeyW(IntPtr key, string file, uint flags);
+    [DllImport("advapi32.dll")] static extern int RegCloseKey(IntPtr key);
+    static readonly IntPtr Users = new IntPtr(unchecked((int) 0x80000003));
+    static int Enable(string privilege) {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x28, out token)) { return Marshal.GetLastWin32Error(); }
+        try {
+            Luid luid;
+            if (!LookupPrivilegeValueW(null, privilege, out luid)) { return Marshal.GetLastWin32Error(); }
+            TokenPrivileges state = new TokenPrivileges();
+            state.Count = 1; state.Luid = luid; state.Attributes = 2;
+            if (!AdjustTokenPrivileges(token, false, ref state, 0, IntPtr.Zero, IntPtr.Zero)) { return Marshal.GetLastWin32Error(); }
+            return Marshal.GetLastWin32Error();
+        } finally { CloseHandle(token); }
+    }
+    public static int Restore(string hive, string file) {
+        int error = Enable("SeRestorePrivilege");
+        if (error == 0) { error = Enable("SeBackupPrivilege"); }
+        if (error != 0) { return error; }
+        IntPtr key;
+        error = RegOpenKeyExW(Users, hive, 0, 0xF003F, out key);
+        if (error != 0) { return error; }
+        try { return RegRestoreKeyW(key, file, 8); } finally { RegCloseKey(key); }
+    }
+}
+}
+"@
+
+# After the mirror, which skipped the hive files. A hive still loaded gets the
+# template's contents in place; one the host has unloaded by now gets the file.
+# A template hive that does not exist was never created in the pristine profile,
+# so there is nothing to restore it to. Any failure is no marker.
+function Restore-LiveHive {
+    param(
+        [Parameter(Mandatory = $true)][string] $Sid,
+        [Parameter(Mandatory = $true)][int] $Index,
+        [Parameter(Mandatory = $true)][string] $Template,
+        [Parameter(Mandatory = $true)][string] $ProfileDir
+    )
+    foreach ($hive in $ProfileHives) {
+        $name = "$Sid$($hive.Suffix)"
+        $source = Join-Path $Template $hive.File
+        if (-not (Test-Path -LiteralPath $source)) { continue }
+        if ([Microsoft.Win32.Registry]::Users.GetSubKeyNames() -contains $name) {
+            if (-not ('CiSlotReset.Hive' -as [type])) { Add-Type -TypeDefinition $HiveRestoreSource }
+            $error32 = [CiSlotReset.Hive]::Restore($name, $source)
+            if ($error32 -ne 0) {
+                Write-ResetLog "slot $Index -- RegRestoreKey HKU\$name from $source failed, win32 $error32"
+                return $false
+            }
+            Write-ResetLog "slot $Index -- HKU\$name restored in place from $source"
+        } else {
+            try {
+                Copy-Item -LiteralPath $source -Destination (Join-Path $ProfileDir $hive.File) -Force -ErrorAction Stop
+            } catch {
+                Write-ResetLog "slot $Index -- could not restore $($hive.File) ($($_.Exception.Message))"
+                return $false
+            }
+        }
+    }
+    return $true
+}
+
 # /MIR, because the claim is "nothing of the last job survives" and a copy that
 # only adds is a copy that keeps whatever was added. /COPY:DAT and not :DATS: the
 # destination is the live profile and its ACL is the host's, not the template's.
@@ -1610,17 +1720,20 @@ function Copy-ProfileTree {
     param(
         [Parameter(Mandatory = $true)][string] $Source,
         [Parameter(Mandatory = $true)][string] $Destination,
-        [int] $TimeoutSeconds = @COPY_SECONDS@
+        [int] $TimeoutSeconds = @COPY_SECONDS@,
+        [switch] $SkipHives
     )
     $out = [System.IO.Path]::GetTempFileName()
     $err = [System.IO.Path]::GetTempFileName()
     $proc = $null
     $code = -1
+    $mirror = @($Source, $Destination, '/MIR', '/XJ', '/COPY:DAT', '/R:1', '/W:1',
+        '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+    if ($SkipHives) { $mirror += @('/XF') + $ProfileHiveFilePatterns }
     try {
         $proc = Start-Process -FilePath 'robocopy.exe' -PassThru -NoNewWindow `
             -RedirectStandardOutput $out -RedirectStandardError $err `
-            -ArgumentList @($Source, $Destination, '/MIR', '/XJ', '/COPY:DAT', '/R:1', '/W:1',
-            '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+            -ArgumentList $mirror
         if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
             try { $proc.Kill(); [void] $proc.WaitForExit(5000) } catch { $null = $_ }
             Write-ResetLog "robocopy did not finish within $TimeoutSeconds s and was killed"
@@ -1690,15 +1803,21 @@ function Invoke-SlotReset {
         Write-ResetLog "slot $Index still has a process running as $sid -- no marker"
         return
     }
+    $live = $false
     if (-not (Wait-HiveUnloaded -Sid $sid -TimeoutSeconds $QuiesceWaitSeconds)) {
         Invoke-HiveRelease -Sid $sid -Index $Index
         if (-not (Wait-HiveUnloaded -Sid $sid -TimeoutSeconds 15)) {
-            Write-ResetLog "slot $Index -- the profile hive did not unload, even forced, so nothing was replaced"
-            return
+            # Nothing of the slot runs (the quiesce said so): the host holds it.
+            Write-ResetLog "slot $Index -- the profile hive did not unload, even forced; restoring it in place"
+            $live = $true
         }
     }
-    if (-not (Copy-ProfileTree -Source $template -Destination $profileDir)) {
+    if (-not (Copy-ProfileTree -Source $template -Destination $profileDir -SkipHives:$live)) {
         Write-ResetLog "slot $Index -- robocopy could not restore $profileDir from $template"
+        return
+    }
+    if ($live -and -not (Restore-LiveHive -Sid $sid -Index $Index -Template $template -ProfileDir $profileDir)) {
+        Write-ResetLog "slot $Index -- the loaded hive could not be restored, so no marker"
         return
     }
 
@@ -6384,6 +6503,59 @@ function Invoke-SlotHiveRelease {
     $ErrorActionPreference = $previous
 }
 
+function Save-SlotHive {
+    <#
+      .SYNOPSIS
+        Put a slot's hives into its template while the host still holds them loaded.
+      .DESCRIPTION
+        THE CAPTURE'S ANSWER TO A HIVE NOTHING ON THIS HOST WILL UNLOAD (#898)
+
+        The robocopy before this skipped every hive file, because a loaded hive
+        is a sharing violation. `reg save` reads the hive through the registry
+        instead, and writes a consistent file with no logs to replay -- which is
+        what a hive file copied from an unloaded profile would have been. The
+        slot runs nothing (the quiesce said so), so what is saved is what phase
+        6's probe left and nothing else, the same claim the file copy made.
+
+        A hive the host HAS unloaded by now is copied as a file, and a hive that
+        was never created is skipped: UsrClass.dat is made on first use, not at
+        logon. Fatal on any other failure, for the reason the copy's is.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Sid,
+        [Parameter(Mandatory = $true)][int] $Index,
+        [Parameter(Mandatory = $true)][string] $ProfileDir,
+        [Parameter(Mandatory = $true)][string] $Template
+    )
+    foreach ($hive in $script:ProfileHives) {
+        $name = "$Sid$($hive.Suffix)"
+        $source = Join-Path $ProfileDir $hive.File
+        $target = Join-Path $Template $hive.File
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+        if ([Microsoft.Win32.Registry]::Users.GetSubKeyNames() -contains $name) {
+            # Continue around the native call, for the reason in Install-BeaconService.
+            $previous = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            $out = & reg.exe save "HKU\$name" $target /y 2>&1
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = $previous
+            if ($code -ne 0) {
+                Deny-Boot ("could not save slot $Index's loaded hive HKU\$name (reg save exit $code -- " +
+                    ((@($out) -join ' ') -replace '\s+', ' ') + ') -- the template would be missing it')
+            }
+            Write-BootLog "phase 4: slot $Index's HKU\$name saved live to $target"
+        } elseif (Test-Path -LiteralPath $source) {
+            try {
+                Copy-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
+            } catch {
+                Deny-Boot ("could not copy slot $Index's unloaded hive $source " +
+                    "($($_.Exception.Message)) -- the template would be missing it")
+            }
+        }
+    }
+}
+
 function Save-SlotProfileTemplate {
     <#
       .SYNOPSIS
@@ -6457,17 +6629,16 @@ function Save-SlotProfileTemplate {
     # rather than slow.
     Invoke-BootSlotQuiesce -Sid $sid -Index $Index
 
+    $live = $false
     if (-not (Wait-SlotHiveUnloaded -Sid $sid -TimeoutSeconds $script:ProfileHiveUnloadSeconds)) {
         # Nothing runs as the slot any more (the quiesce said so), so the hive is
         # held by the profile service's own reference, and no amount of waiting
-        # ends that. Unload it, and deny only if even that fails.
+        # ends that. Unload it, and capture it live only if even that fails.
         Invoke-SlotHiveRelease -Sid $sid -Index $Index
         if (-not (Wait-SlotHiveUnloaded -Sid $sid -TimeoutSeconds $script:ProfileHiveReleaseSeconds)) {
-            Deny-Boot ("slot $Index's profile hive is still loaded at HKU\$sid after " +
-                "$($script:ProfileHiveUnloadSeconds)s and a forced unload -- NTUSER.DAT cannot be " +
-                'copied out from under a live session, so the template would be missing the one ' +
-                'file that carries what a job left in HKCU. The quiesce and release lines above ' +
-                'this one say what was still running as the slot and what held the hive')
+            Write-BootLog ("phase 4: slot $Index's hive is held by the host, not the slot -- " +
+                'capturing it live with reg save')
+            $live = $true
         }
     }
 
@@ -6485,15 +6656,17 @@ function Save-SlotProfileTemplate {
     # never registers -- which past the registration grace reads to
     # drain_decision.sh as never-registered, so the pool rebuilds it from the same
     # image forever. A pristine profile is small, so the bound is generous.
-    $copy = Invoke-BoundedNative -FilePath 'robocopy.exe' -TimeoutSeconds $script:ProfileTemplateSeconds `
-        -What "capturing slot $Index's profile template" -ArgumentList @(
-        $profileDir, $template, '/MIR', '/XJ', '/COPY:DAT', '/R:1', '/W:1',
+    $mirror = @($profileDir, $template, '/MIR', '/XJ', '/COPY:DAT', '/R:1', '/W:1',
         '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+    if ($live) { $mirror += @('/XF') + $script:ProfileHiveFilePatterns }
+    $copy = Invoke-BoundedNative -FilePath 'robocopy.exe' -TimeoutSeconds $script:ProfileTemplateSeconds `
+        -What "capturing slot $Index's profile template" -ArgumentList $mirror
     if (-not (Test-RobocopySuccess -ExitCode $copy.ExitCode)) {
         if ($copy.Error) { Write-BootLog "robocopy: $($copy.Error)" }
         Deny-Boot ("could not capture slot $Index's profile template (robocopy exit " +
             "$($copy.ExitCode)) -- every job on this slot would fail at its gate")
     }
+    if ($live) { Save-SlotHive -Sid $sid -Index $Index -ProfileDir $profileDir -Template $template }
 
     # The first marker, written by the same hand that captured the template. A
     # freshly booted slot IS clean -- nothing has run on it -- and without this its
