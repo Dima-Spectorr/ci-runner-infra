@@ -2734,6 +2734,44 @@ function Get-RedactedLine {
     return $Line.Replace($Secret, '***')
 }
 
+function Get-RedactedDiagnosticLine {
+    <#
+      .SYNOPSIS
+        One line of an agent's OWN log or event text, credentials struck. Pure.
+      .DESCRIPTION
+        Get-RedactedLine strikes the one secret this script holds. The runner's
+        _diag log and its event-log text are not ours: they can carry the OAuth
+        access token the agent trades its key for, a JWT it signed, or a token a
+        workflow printed -- none of which this script knows. So after the
+        literal strike they are struck by SHAPE: GitHub's token prefixes, a
+        JWT's dotted base64url segments, `Bearer <x>`, `<secret-ish name>=<x>`,
+        and any unbroken run of 40+ base64 characters (an RSA parameter).
+
+        Over-redaction is the accepted cost: a 40-hex commit SHA comes out as
+        *** too. A line that loses a SHA is still a diagnosis; a line that
+        carries a token is an incident on a serial console.
+
+        Capped, because one runaway line (a JSON body the runner logs whole)
+        would otherwise flood the serial port every other boot line shares.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string] $Line,
+        [AllowNull()][AllowEmptyString()][string] $Secret = '',
+        [int] $MaxLength = 400
+    )
+
+    $text = Get-RedactedLine -Line $Line -Secret $Secret
+    $text = $text -replace '(?i)\b(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})', '***'
+    $text = $text -replace 'eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}(\.[A-Za-z0-9_-]*)?', '***'
+    $text = $text -replace '(?i)\b(bearer|basic)\s+[^\s"'',;]+', '$1 ***'
+    $text = $text -replace ('(?i)(token|password|secret|authorization|credential|private_?key)' +
+        '(["'']?\s*[:=]\s*["'']?)[^\s"'',;}]+'), '$1$2***'
+    $text = $text -replace '[A-Za-z0-9+/_-]{40,}={0,2}', '***'
+    if ($text.Length -gt $MaxLength) { $text = $text.Substring(0, $MaxLength) + ' [truncated]' }
+    return $text
+}
+
 function Get-RunnerServiceName {
     <#
       .SYNOPSIS
@@ -7400,6 +7438,266 @@ function Wait-RegistrationTokenRemoved {
         'stopped above, so no further job can land here, and the host goes idle and is drained.')
 }
 
+# --- phase 5: what the agents did after registering (#898) --------------------
+#
+# DIAGNOSTICS, AND THE ONLY PART OF PHASE 5 THAT MAY NOT DENY THE BOOT.
+#
+# Register-SlotAgent proves the service is Running as the slot account, and on
+# ci-runner-host-win-iit-fb0s that proof held for both slots while GitHub listed
+# both agents offline. Running is a fact about RunnerService.exe; online is a
+# fact about the Runner.Listener.exe it spawns, and nothing above looks at the
+# second. That host had no SSH, no IAP and no guest attributes, so the serial
+# port is the only channel out -- and the answer has to be written to it at
+# boot, because nobody can come back and ask.
+#
+# Everything below reads and logs. A throw anywhere is caught and logged: the
+# agents are already registered, and a diagnostic that took them down would be
+# the worst trade in this file.
+$script:AgentWatchSeconds = 180
+$script:AgentWatchPollSeconds = 30
+$script:AgentDiagTailLines = 40
+
+function Write-EventDiagnostic {
+    <#
+      .SYNOPSIS
+        Log recent event-log entries from one provider that match a pattern.
+      .DESCRIPTION
+        One provider per call, never an array. Get-WinEvent answers a filter
+        naming a provider the host does not have with an error rather than an
+        empty set, and under SilentlyContinue that error is an empty result for
+        EVERY provider in the filter -- including the ones that do exist.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $LogName,
+        [Parameter(Mandatory = $true)][string] $Provider,
+        [Parameter(Mandatory = $true)][datetime] $Since,
+        [Parameter(Mandatory = $true)][string] $Prefix,
+        [string] $Pattern = '',
+        [AllowEmptyString()][string] $Secret = '',
+        [int] $Max = 40
+    )
+
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{ LogName = $LogName; ProviderName = $Provider; StartTime = $Since } `
+                -ErrorAction SilentlyContinue |
+                Where-Object { -not $Pattern -or ([string] $_.Message) -match $Pattern } |
+                Select-Object -First $Max)
+        if ($events.Count -eq 0) {
+            Write-BootLog "$Prefix no $LogName/$Provider entries since $($Since.ToUniversalTime().ToString('HH:mm:ss'))Z"
+            return
+        }
+        # Get-WinEvent returns newest first; the log reads oldest first.
+        [array]::Reverse($events)
+        foreach ($e in $events) {
+            $text = ([string] $e.Message -replace '\s+', ' ').Trim()
+            Write-BootLog ("$Prefix $($e.TimeCreated.ToUniversalTime().ToString('HH:mm:ss'))Z " +
+                "$Provider id=$($e.Id) " + (Get-RedactedDiagnosticLine -Line $text -Secret $Secret))
+        }
+    } catch {
+        Write-BootLog "$Prefix could not read $LogName/$Provider ($($_.Exception.Message))"
+    }
+}
+
+function Write-SlotAgentState {
+    <#
+      .SYNOPSIS
+        One line per slot: the service, WHO it runs as, its exit codes, its listener.
+      .DESCRIPTION
+        The listener count is the column the rest of this file never had.
+        RunnerService.exe catches a listener that dies, waits five seconds and
+        spawns another, and only stops itself on exit code 0 or 1 -- so a
+        listener that crashes on every start leaves the SERVICE Running forever.
+        State=Running with listeners=0 on every poll is that loop. win32exit and
+        svcexit are the SCM's own record once the service does stop: 1069 is a
+        logon failure, 99 is RunnerService's catch-all, 1 is a listener that
+        refused its configuration.
+
+        The service name reaches WQL only after coming out of the SYSTEM-only
+        file Register-SlotAgent wrote it to, having passed Get-RunnerServiceName.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable] $Agent,
+        [Parameter(Mandatory = $true)][int] $Elapsed
+    )
+
+    $prefix = "phase 5 diag: slot $($Agent.Index) t+${Elapsed}s"
+    try {
+        if (-not $Agent.Service) {
+            Write-BootLog "$prefix no recorded service name at $(Get-SlotRunnerServicePath -Index $Agent.Index)"
+            return
+        }
+        $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$($Agent.Service)'" -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            Write-BootLog "$prefix service $($Agent.Service) does not exist"
+            return
+        }
+        $root = $Agent.Runner + '\'
+        $listeners = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='Runner.Listener.exe'" `
+                -ErrorAction SilentlyContinue | Where-Object {
+                $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)
+            })
+        Write-BootLog ("$prefix state=$($svc.State) startmode=$($svc.StartMode) startname=$($svc.StartName) " +
+            "pid=$($svc.ProcessId) win32exit=$($svc.ExitCode) svcexit=$($svc.ServiceSpecificExitCode) " +
+            "listeners=$($listeners.Count)")
+    } catch {
+        Write-BootLog "$prefix could not read the service ($($_.Exception.Message))"
+    }
+}
+
+function Write-SlotAgentEvidence {
+    <#
+      .SYNOPSIS
+        Once per slot, after the watch: ACLs, profile, the listener's log, SCM events.
+      .DESCRIPTION
+        Each section answers one of the hypotheses #898 could not settle from
+        the code alone, and each is its own try so one unreadable answer does
+        not cost the others:
+
+          * acl      -- can the slot account read `.runner`, `.credentials` and
+                        `.credentials_rsaparams`? config.cmd wrote them as SYSTEM.
+                        The key is DPAPI LocalMachine, so readable is sufficient.
+          * profile  -- did the service logon load the slot's own profile, or a
+                        TEMPORARY one (Status bit 1)? Phase 4 rewrites that hive.
+          * _diag    -- the listener's own account of why it is not connected.
+          * scm      -- 7000/7038/7041 logon and start failures, 7031/7034 crashes.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable] $Agent,
+        [Parameter(Mandatory = $true)][datetime] $Since,
+        [AllowEmptyString()][string] $Secret = ''
+    )
+
+    $prefix = "phase 5 diag: slot $($Agent.Index)"
+    $leaf = '\\' + [regex]::Escape($Agent.User) + '$'
+
+    foreach ($name in @('.runner', '.credentials', '.credentials_rsaparams', '_diag')) {
+        $path = Join-Path $Agent.Runner $name
+        try {
+            if (-not (Test-Path -LiteralPath $path)) {
+                Write-BootLog "$prefix acl $name absent"
+                continue
+            }
+            $acl = Get-Acl -LiteralPath $path
+            $mine = @($acl.Access | Where-Object { $_.IdentityReference.Value -match $leaf } | ForEach-Object {
+                    "$($_.AccessControlType):$($_.FileSystemRights)$(if ($_.IsInherited) { ':inherited' })"
+                })
+            $held = 'NONE'
+            if ($mine.Count -gt 0) { $held = $mine -join ',' }
+            Write-BootLog "$prefix acl $name owner=$($acl.Owner) $($Agent.User)=$held"
+        } catch {
+            Write-BootLog "$prefix acl $name unreadable ($($_.Exception.Message))"
+        }
+    }
+
+    try {
+        $sid = ([System.Security.Principal.NTAccount]::new($Agent.User)).Translate(
+            [System.Security.Principal.SecurityIdentifier]).Value
+        $userProfile = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue
+        if ($userProfile) {
+            Write-BootLog ("$prefix profile $($userProfile.LocalPath) loaded=$($userProfile.Loaded) " +
+                "status=$($userProfile.Status) (1=temporary, 8=corrupt)")
+        } else {
+            Write-BootLog "$prefix profile none for $($Agent.User) ($sid)"
+        }
+    } catch {
+        Write-BootLog "$prefix profile unreadable ($($_.Exception.Message))"
+    }
+
+    try {
+        $logs = @(Get-ChildItem -LiteralPath (Join-Path $Agent.Runner '_diag') -Filter 'Runner_*.log' -File `
+                -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)
+        if ($logs.Count -eq 0) {
+            Write-BootLog "$prefix _diag has no Runner_*.log -- the listener never wrote a line"
+        } else {
+            # The count is itself evidence: every listener start opens a new file,
+            # so a count that climbs across one boot is the crash-restart loop.
+            Write-BootLog "$prefix _diag $($logs.Count) Runner_*.log file(s), newest $($logs[0].Name):"
+            foreach ($line in @(Get-Content -LiteralPath $logs[0].FullName -Tail $script:AgentDiagTailLines `
+                        -ErrorAction Stop)) {
+                Write-BootLog ("$prefix | " + (Get-RedactedDiagnosticLine -Line ([string] $line) -Secret $Secret))
+            }
+        }
+    } catch {
+        Write-BootLog "$prefix _diag unreadable ($($_.Exception.Message))"
+    }
+
+    # The SCM names the service by its DISPLAY name, which carries the agent
+    # name; a logon failure (7038) names the account instead. The agent half is
+    # dropped when there is no service name: an empty alternative matches every
+    # event on the host.
+    $pattern = '\\' + [regex]::Escape($Agent.User) + '\b'
+    if ($Agent.Service) {
+        $pattern = [regex]::Escape($Agent.Service.Substring($Agent.Service.LastIndexOf('.') + 1)) + '|' + $pattern
+    }
+    Write-EventDiagnostic -LogName 'System' -Provider 'Service Control Manager' -Since $Since `
+        -Prefix "$prefix scm" -Pattern $pattern -Secret $Secret -Max 20
+}
+
+function Write-AgentDiagnostic {
+    <#
+      .SYNOPSIS
+        Watch the registered agents for a bounded window and log what they did.
+      .DESCRIPTION
+        THE WINDOW IS BOUNDED AND THE FUNCTION CANNOT THROW. It runs after the
+        agents are registered and the token witness is done, so every job it
+        could delay is already dispatchable; it only holds the startup script
+        open. The last section is the Application log, where RunnerService.exe
+        writes each line the listener prints under source ActionsRunnerService
+        -- the listener's stdout, which is where "Listening for Jobs" or the
+        reason it never gets there appears. That source is shared by every
+        slot, so it is logged once, not per slot.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][array] $Provisioned,
+        [Parameter(Mandatory = $true)][datetime] $Since,
+        [AllowEmptyString()][string] $Secret = '',
+        [int] $WatchSeconds = $script:AgentWatchSeconds,
+        [int] $PollSeconds = $script:AgentWatchPollSeconds
+    )
+
+    try {
+        $agents = @()
+        foreach ($slot in $Provisioned) {
+            $service = ''
+            try {
+                $service = ([System.IO.File]::ReadAllText((Get-SlotRunnerServicePath -Index $slot.Index))).Trim()
+            } catch {
+                $service = ''
+            }
+            $agents += @{
+                Index   = $slot.Index
+                User    = $slot.User
+                Service = $service
+                Runner  = (Join-Path (Get-SlotWorkspacePath -Index $slot.Index) 'runner')
+            }
+        }
+
+        Write-BootLog "phase 5 diag: watching $($agents.Count) agent(s) for ${WatchSeconds}s"
+        $deadline = (Get-Date).AddSeconds($WatchSeconds)
+        while ($true) {
+            $elapsed = [int] ((Get-Date) - $Since).TotalSeconds
+            foreach ($agent in $agents) { Write-SlotAgentState -Agent $agent -Elapsed $elapsed }
+            if ((Get-Date) -ge $deadline) { break }
+            Start-Sleep -Seconds $PollSeconds
+        }
+
+        foreach ($agent in $agents) { Write-SlotAgentEvidence -Agent $agent -Since $Since -Secret $Secret }
+        Write-EventDiagnostic -LogName 'Application' -Provider 'ActionsRunnerService' -Since $Since `
+            -Prefix 'phase 5 diag: runner' -Secret $Secret -Max 60
+        foreach ($provider in @('Application Error', '.NET Runtime')) {
+            Write-EventDiagnostic -LogName 'Application' -Provider $provider -Since $Since `
+                -Prefix 'phase 5 diag: crash' -Pattern 'Runner\.|RunnerService' -Secret $Secret -Max 10
+        }
+        Write-BootLog 'phase 5 diag: done'
+    } catch {
+        Write-BootLog "phase 5 diag: stopped early ($($_.Exception.Message)) -- the boot is unaffected"
+    }
+}
+
 function Invoke-Phase5Registration {
     <#
       .SYNOPSIS
@@ -7431,6 +7729,9 @@ function Invoke-Phase5Registration {
     )
 
     $regToken = Wait-RegistrationToken
+    # Taken before the first config.cmd, so the event-log reads below include the
+    # start config.cmd itself makes under the SCM default account.
+    $registeringSince = Get-Date
     foreach ($slot in $Provisioned) {
         $cache = ''
         if ($CachePaths.Contains($slot.Index)) { $cache = [string] $CachePaths[$slot.Index] }
@@ -7449,6 +7750,11 @@ function Invoke-Phase5Registration {
     # metadata it was spent from, and the host is the only thing in a position to
     # look. See Wait-RegistrationTokenRemoved for why the failure is fatal.
     Wait-RegistrationTokenRemoved
+
+    # AFTER the witness, never before it: the witness is a security bound and
+    # this is a log. Handed the token so a listener that echoes it is redacted
+    # by value as well as by shape. See Write-AgentDiagnostic.
+    Write-AgentDiagnostic -Provisioned $Provisioned -Since $registeringSince -Secret $regToken
 }
 
 # --- phase 6: the boot probe, the harness -------------------------------------
