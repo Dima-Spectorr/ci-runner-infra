@@ -5064,10 +5064,14 @@ function Get-CacheMasterSize {
     #>
     [CmdletBinding()]
     param([string] $Master = $script:CacheMaster)
-    $sum = (Get-ChildItem -LiteralPath $Master -Recurse -Force -File -ErrorAction SilentlyContinue |
-            Measure-Object -Property Length -Sum).Sum
-    if ($null -eq $sum) { return [long] 0 }
-    return [long] $sum
+    # Summed by hand: on Windows PowerShell 5.1, Measure-Object over an empty
+    # pipeline returns nothing, and `.Sum` on that throws under StrictMode -- which
+    # is exactly the first boot, when the master is still empty (#898).
+    [long] $sum = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath $Master -Recurse -Force -File -ErrorAction SilentlyContinue)) {
+        $sum += [long] $file.Length
+    }
+    return $sum
 }
 
 function Get-CacheVolumeFreeByte {
