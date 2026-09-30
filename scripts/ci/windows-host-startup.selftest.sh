@@ -404,6 +404,17 @@ has_fail_closed_slot_reset() { # <file>
   local restore
   restore=$(printf '%s\n' "$reset" | grep -n 'if (\$live -and -not (Restore-LiveHive' | head -1 | cut -d: -f1)
   [ -n "$restore" ] && [ "$copy" -lt "$restore" ] && [ "$restore" -lt "$mark" ] || return 1
+  # /XF matches at every depth and /MIR never purges what it excludes, so a
+  # job's `Downloads\NTUSER.DAT.x` would survive: everything hive-named goes,
+  # except what the delete finds OPEN (0x80070020, sharing violation).
+  local sweep
+  sweep=$(printf '%s\n' "$reset" | grep -n 'if (\$live -and -not (Clear-StrayHiveFile' | head -1 | cut -d: -f1)
+  [ -n "$sweep" ] && [ "$copy" -lt "$sweep" ] && [ "$sweep" -lt "$mark" ] || return 1
+  matches "$reset" 'if \(\$inner\.HResult -eq -2147024864\) \{ continue \}' || return 1
+  # A LOADED hive the template cannot restore is refused, never skipped.
+  matches "$reset" 'is loaded and the template has no' || return 1
+  # …and the privileges go off again: robocopy children inherit the token.
+  matches "$reset" 'Set\("SeRestorePrivilege", 0\);' || return 1
   # The two copies of the hive table say the same thing.
   local boot_pat reset_pat
   boot_pat=$(printf '%s\n' "$code" | sed -n "s|^\\\$script:ProfileHiveFilePatterns = \(.*\)$|\1|p" | head -1)
@@ -1735,6 +1746,18 @@ mutate "a hive restore that yields to open handles (#898)" \
   has_fail_closed_slot_reset
 mutate "a reset mirror that overwrites the held hive files (#898)" \
   's|-Destination \$profileDir -SkipHives:\$live|-Destination $profileDir|' \
+  has_fail_closed_slot_reset
+mutate "hive-named files a job planted left to survive the reset" \
+  's|if (\$live -and -not (Clear-StrayHiveFile|if ($false -and -not (Clear-StrayHiveFile|' \
+  has_fail_closed_slot_reset
+mutate "a stray the delete refuses treated as the host's" \
+  's|if (\$inner\.HResult -eq -2147024864) { continue }|continue|' \
+  has_fail_closed_slot_reset
+mutate "a loaded hive with no template skipped, not refused" \
+  's|is loaded and the template has no|has no|' \
+  has_fail_closed_slot_reset
+mutate "restore privileges left enabled for robocopy to inherit" \
+  's|Set("SeRestorePrivilege", 0);||' \
   has_fail_closed_slot_reset
 mutate "the reset's hive table drifting from the boot's" \
   "s|^\\\$ProfileHiveFilePatterns = @('NTUSER.DAT\*', 'UsrClass.dat\*')|\$ProfileHiveFilePatterns = @('NTUSER.DAT')|" \

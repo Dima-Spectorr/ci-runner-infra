@@ -1645,35 +1645,70 @@ public static class Hive {
     static extern int RegRestoreKeyW(IntPtr key, string file, uint flags);
     [DllImport("advapi32.dll")] static extern int RegCloseKey(IntPtr key);
     static readonly IntPtr Users = new IntPtr(unchecked((int) 0x80000003));
-    static int Enable(string privilege) {
+    static int Set(string privilege, uint attributes) {
         IntPtr token;
         if (!OpenProcessToken(GetCurrentProcess(), 0x28, out token)) { return Marshal.GetLastWin32Error(); }
         try {
             Luid luid;
             if (!LookupPrivilegeValueW(null, privilege, out luid)) { return Marshal.GetLastWin32Error(); }
             TokenPrivileges state = new TokenPrivileges();
-            state.Count = 1; state.Luid = luid; state.Attributes = 2;
+            state.Count = 1; state.Luid = luid; state.Attributes = attributes;
             if (!AdjustTokenPrivileges(token, false, ref state, 0, IntPtr.Zero, IntPtr.Zero)) { return Marshal.GetLastWin32Error(); }
             return Marshal.GetLastWin32Error();
         } finally { CloseHandle(token); }
     }
     public static int Restore(string hive, string file) {
-        int error = Enable("SeRestorePrivilege");
-        if (error == 0) { error = Enable("SeBackupPrivilege"); }
-        if (error != 0) { return error; }
-        IntPtr key;
-        error = RegOpenKeyExW(Users, hive, 0, 0xF003F, out key);
-        if (error != 0) { return error; }
-        try { return RegRestoreKeyW(key, file, 8); } finally { RegCloseKey(key); }
+        try {
+            int error = Set("SeRestorePrivilege", 2);
+            if (error == 0) { error = Set("SeBackupPrivilege", 2); }
+            if (error != 0) { return error; }
+            IntPtr key;
+            error = RegOpenKeyExW(Users, hive, 0, 0xF003F, out key);
+            if (error != 0) { return error; }
+            try { return RegRestoreKeyW(key, file, 8); } finally { RegCloseKey(key); }
+        } finally {
+            // Disabled again at once: robocopy children inherit this token.
+            Set("SeRestorePrivilege", 0);
+            Set("SeBackupPrivilege", 0);
+        }
     }
 }
 }
 "@
 
+# /XF is a bare-name match at EVERY depth, and /MIR does not purge what it
+# excludes -- so a job's `Downloads\NTUSER.DAT.x` would outlive every live reset.
+# After the mirror, every file with a hive's name is deleted, and the only ones
+# allowed to stay are those the delete finds OPEN (sharing violation): nothing of
+# the slot runs, so an open file is the host's own hive or its log. Anything else
+# that will not go -- read-only, a deny ACE -- is no marker.
+function Clear-StrayHiveFile {
+    param(
+        [Parameter(Mandatory = $true)][string] $ProfileDir,
+        [Parameter(Mandatory = $true)][int] $Index
+    )
+    $files = @(Get-ChildItem -LiteralPath $ProfileDir -Recurse -Force -File -ErrorAction Stop |
+            Where-Object { $name = $_.Name; @($ProfileHiveFilePatterns | Where-Object { $name -like $_ }).Count -gt 0 })
+    foreach ($f in $files) {
+        try {
+            $f.Attributes = [System.IO.FileAttributes]::Normal
+            [System.IO.File]::Delete($f.FullName)
+        } catch {
+            $inner = $_.Exception
+            while ($inner.InnerException) { $inner = $inner.InnerException }
+            if ($inner.HResult -eq -2147024864) { continue }
+            Write-ResetLog "slot $Index -- could not remove $($f.FullName) ($($inner.Message))"
+            return $false
+        }
+    }
+    return $true
+}
+
 # After the mirror, which skipped the hive files. A hive still loaded gets the
 # template's contents in place; one the host has unloaded by now gets the file.
-# A template hive that does not exist was never created in the pristine profile,
-# so there is nothing to restore it to. Any failure is no marker.
+# A LOADED hive with no template file is refused rather than left as the job
+# left it: HKCU\Software\Classes is where a COM hijack lives. Any failure is no
+# marker.
 function Restore-LiveHive {
     param(
         [Parameter(Mandatory = $true)][string] $Sid,
@@ -1684,8 +1719,15 @@ function Restore-LiveHive {
     foreach ($hive in $ProfileHives) {
         $name = "$Sid$($hive.Suffix)"
         $source = Join-Path $Template $hive.File
-        if (-not (Test-Path -LiteralPath $source)) { continue }
-        if ([Microsoft.Win32.Registry]::Users.GetSubKeyNames() -contains $name) {
+        $loaded = [Microsoft.Win32.Registry]::Users.GetSubKeyNames() -contains $name
+        if (-not (Test-Path -LiteralPath $source)) {
+            if ($loaded) {
+                Write-ResetLog "slot $Index -- HKU\$name is loaded and the template has no $($hive.File) to restore it from"
+                return $false
+            }
+            continue
+        }
+        if ($loaded) {
             if (-not ('CiSlotReset.Hive' -as [type])) { Add-Type -TypeDefinition $HiveRestoreSource }
             $error32 = [CiSlotReset.Hive]::Restore($name, $source)
             if ($error32 -ne 0) {
@@ -1814,6 +1856,10 @@ function Invoke-SlotReset {
     }
     if (-not (Copy-ProfileTree -Source $template -Destination $profileDir -SkipHives:$live)) {
         Write-ResetLog "slot $Index -- robocopy could not restore $profileDir from $template"
+        return
+    }
+    if ($live -and -not (Clear-StrayHiveFile -ProfileDir $profileDir -Index $Index)) {
+        Write-ResetLog "slot $Index -- a file named like a hive survived the mirror, so no marker"
         return
     }
     if ($live -and -not (Restore-LiveHive -Sid $sid -Index $Index -Template $template -ProfileDir $profileDir)) {
