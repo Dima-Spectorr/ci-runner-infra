@@ -973,6 +973,15 @@ Describe 'slot service environment' {
         $one['TMP'] | Should -Be $one['TEMP']
         $one['TMP'] | Should -Not -Be $two['TMP']
     }
+
+    # A slot is not an administrator, so setup-dotnet's default under Program
+    # Files is refused; each slot installs into its own workspace instead (#898).
+    It 'gives each slot its own .NET install directory inside its workspace' {
+        $one = Get-SlotServiceEnvironment -Index 1 -SlotRoot '/ci/slots'
+        $two = Get-SlotServiceEnvironment -Index 2 -SlotRoot '/ci/slots'
+        $one['DOTNET_INSTALL_DIR'] | Should -BeLike ((Get-SlotWorkspacePath -Index 1 -Root '/ci/slots') + '*')
+        $one['DOTNET_INSTALL_DIR'] | Should -Not -Be $two['DOTNET_INSTALL_DIR']
+    }
 }
 
 # The job hook is a FILE locked by the same function that locks the directories,
