@@ -404,6 +404,19 @@ has_fail_closed_slot_reset() { # <file>
   local restore
   restore=$(printf '%s\n' "$reset" | grep -n 'if (\$live -and -not (Restore-LiveHive' | head -1 | cut -d: -f1)
   [ -n "$restore" ] && [ "$copy" -lt "$restore" ] && [ "$restore" -lt "$mark" ] || return 1
+  # /XF matches at every depth and /MIR never purges what it excludes, so a
+  # job's `Downloads\NTUSER.DAT.x` would survive: everything hive-named goes,
+  # except what the delete finds OPEN (0x80070020, sharing violation).
+  local sweep
+  sweep=$(printf '%s\n' "$reset" | grep -n 'if (\$live -and -not (Clear-StrayHiveFile' | head -1 | cut -d: -f1)
+  [ -n "$sweep" ] && [ "$copy" -lt "$sweep" ] && [ "$sweep" -lt "$mark" ] || return 1
+  # …and only where the real hives live: open anywhere else is something the
+  # quiesce missed.
+  matches "$reset" 'if \(\$inner\.HResult -eq -2147024864 -and \$hiveDirs -contains \$f\.DirectoryName\) \{ continue \}' || return 1
+  # A LOADED hive the template cannot restore is refused, never skipped.
+  matches "$reset" 'is loaded and the template has no' || return 1
+  # …and the privileges go off again: robocopy children inherit the token.
+  matches "$reset" 'Set\("SeRestorePrivilege", 0\);' || return 1
   # The two copies of the hive table say the same thing.
   local boot_pat reset_pat
   boot_pat=$(printf '%s\n' "$code" | sed -n "s|^\\\$script:ProfileHiveFilePatterns = \(.*\)$|\1|p" | head -1)
@@ -526,6 +539,11 @@ has_profile_template_before_registration() { # <file>
   # host holds the hive even after `reg unload`, so a hive still loaded is
   # captured LIVE -- robocopy skips the hive files and `reg save` snapshots them
   # -- and a save that fails is fatal.
+  # Only the probe's slot has ever logged on, so every other slot's profile is
+  # created here, from Default, before the capture reads ProfileList.
+  matches "$code" 'if \(-not \(Test-Path -LiteralPath \$key\)\) \{ Initialize-SlotProfile -Sid \$sid -Index \$Index \}' || return 1
+  matches "$code" 'CreateProfile\(\$Sid, \(Get-SlotUserName -Index \$Index\), \$path, 260\)' || return 1
+  matches "$code" 'if \(\$hr -ne 0 -and \$hr -ne -2147024713\) \{' || return 1
   matches "$code" "capturing it live with reg save" || return 1
   matches "$code" "if \(\\\$live\) \{ \\\$mirror \+= @\('/XF'\) \+ \\\$script:ProfileHiveFilePatterns \}" || return 1
   matches "$code" '& reg\.exe save "HKU\\\$name" \$target /y 2>&1' || return 1
@@ -1601,6 +1619,12 @@ mutate "templates captured after the agents are registered" \
 mutate "a slot with no capturable profile allowed to boot" \
   's|Deny-Boot ("slot \$Index has no profile in the account database |Write-BootLog ("slot $Index has no profile in the account database |' \
   has_profile_template_before_registration
+mutate "a slot that never logged on left with no profile" \
+  's|if (-not (Test-Path -LiteralPath \$key)) { Initialize-SlotProfile -Sid \$sid -Index \$Index }||' \
+  has_profile_template_before_registration
+mutate "a failed CreateProfile treated as success" \
+  's|if (\$hr -ne 0 -and \$hr -ne -2147024713) {|if ($false) {|' \
+  has_profile_template_before_registration
 mutate "the captured directory no longer checked against its slot" \
   's|if (-not (Test-SlotProfileDirectory -Path \$profileDir -Index \$Index)) {|if ($false) {|' \
   has_profile_template_before_registration
@@ -1735,6 +1759,21 @@ mutate "a hive restore that yields to open handles (#898)" \
   has_fail_closed_slot_reset
 mutate "a reset mirror that overwrites the held hive files (#898)" \
   's|-Destination \$profileDir -SkipHives:\$live|-Destination $profileDir|' \
+  has_fail_closed_slot_reset
+mutate "hive-named files a job planted left to survive the reset" \
+  's|if (\$live -and -not (Clear-StrayHiveFile|if ($false -and -not (Clear-StrayHiveFile|' \
+  has_fail_closed_slot_reset
+mutate "a stray the delete refuses treated as the host's" \
+  's|if (\$inner\.HResult -eq -2147024864 -and \$hiveDirs -contains \$f\.DirectoryName) { continue }|continue|' \
+  has_fail_closed_slot_reset
+mutate "an open hive-named stray tolerated anywhere in the profile" \
+  's| -and \$hiveDirs -contains \$f\.DirectoryName) { continue }|) { continue }|' \
+  has_fail_closed_slot_reset
+mutate "a loaded hive with no template skipped, not refused" \
+  's|is loaded and the template has no|has no|' \
+  has_fail_closed_slot_reset
+mutate "restore privileges left enabled for robocopy to inherit" \
+  's|Set("SeRestorePrivilege", 0);||' \
   has_fail_closed_slot_reset
 mutate "the reset's hive table drifting from the boot's" \
   "s|^\\\$ProfileHiveFilePatterns = @('NTUSER.DAT\*', 'UsrClass.dat\*')|\$ProfileHiveFilePatterns = @('NTUSER.DAT')|" \
