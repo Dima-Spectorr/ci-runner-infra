@@ -2665,6 +2665,11 @@ function Get-SlotServiceEnvironment {
     $block['ACTIONS_RUNNER_HOOK_JOB_STARTED'] = $StartedHookPath
     $block['ACTIONS_RUNNER_HOOK_JOB_COMPLETED'] = $CompletedHookPath
 
+    # setup-dotnet installs into C:\Program Files\dotnet unless told otherwise, and
+    # a slot account is deliberately not an administrator (#898). Its own
+    # workspace is the one place it can write that no other slot can.
+    $block['DOTNET_INSTALL_DIR'] = Join-Path (Get-SlotWorkspacePath -Index $Index -Root $SlotRoot) 'dotnet'
+
     # The label the rest of a workflow run pins itself to, read by the anchor
     # job (docs/adr-pr-host-affinity.md). Absent, the anchor runs the workflow
     # unpinned -- a degradation, not a failure, which is why this one is allowed
