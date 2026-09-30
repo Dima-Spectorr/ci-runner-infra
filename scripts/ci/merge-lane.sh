@@ -2362,6 +2362,23 @@ lane_report_refusal() {
         "The lane's own read of ${sha:0:8} called the required checks green; GitHub's ruleset disagreed at merge time, most likely because a newer check run for the same commit was still in flight. This pull request was skipped for this pass — not demoted — and the lane will try it again on the next pass once the disagreement resolves itself."
       return 2
       ;;
+    *'Required status check'*'is failing'*)
+      # THE SAME DISAGREEMENT, OTHER DIRECTION. Measured on IntegrateIT runs
+      # 36732975055..36733945176 (2026-09-30): #22329's `ci` FAILED on its
+      # `pull_request` run and then PASSED on a later `workflow_dispatch` run of
+      # the same workflow for the same head. `check_counts` reads check runs by
+      # commit and takes the newer green; the ruleset only counts the suite
+      # attached to the pull request, so it still read the failure and the merge
+      # API refused with a 405. That refusal says nothing about any other
+      # candidate or the base, yet it fell to the default arm and ENDED THE PASS
+      # — #22329 ranked first on every pass and nothing merged for ~45 minutes
+      # while ten pull requests were `merge:ready`. Skipped, not merged and not
+      # counted, exactly like the `is expected` arm above.
+      echo "::warning::$what of #$num was refused: GitHub's ruleset says a required check is FAILING on ${num}'s head, though the lane's own read called it green — usually a green re-run that GitHub does not attach to the pull request (a manual or dispatched run) over a failed pull-request run. Skipping #$num for this pass; it is re-read, not demoted. GitHub said: $err"
+      lane_comment_refusal_once "$num" "$sha" "$err" \
+        "The lane's own read of ${sha:0:8} called the required checks green, but GitHub's ruleset reports a required check as failing — most often a green re-run started by hand or by dispatch, which GitHub does not count for the pull request, over a failed run that it does. Re-run the failed pull-request check (or push) so the ruleset sees a green one. This pull request was skipped for this pass, not demoted, and other pull requests keep merging past it."
+      return 2
+      ;;
     *'code owner review'*|*'approving review'*|*'conversation must be resolved'*)
       # A REVIEW THE LANE CANNOT GIVE. Measured on IntegrateIT run 36408270569
       # (lane v5.107.1, 2026-09-28): the merge API refused #21400 with a 405,
