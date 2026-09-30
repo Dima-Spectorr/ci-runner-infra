@@ -1138,6 +1138,25 @@ So the lane does not try to prevent it. It **bounds** it, with two things:
    caused it rather than the batch it arrived in — see *once the gate is armed*
    below.
 
+   **The one exception is the fix itself (#1443).** Halting outright also
+   refused the pull request that would clear the break, so a red base still
+   reads the queue — and admits exactly one candidate per run, only if all of
+   these hold:
+
+   - every required check is green on its head, as for any merge;
+   - its head **contains the red tip** (`behind_by` 0 against that sha — asked
+     once even on a base that does not otherwise require up-to-date branches);
+   - every check **failing on the base passed** on its head — a *skipped* one
+     does not count, because it has not shown the break is gone.
+
+   The log says `lane: base is red; #N is green on <checks> against the current
+   tip <sha> — merging it as the base fix`, the queue row reads `merge` /
+   `base-fix`, and every other candidate reads `wait` / `base-red …` with the
+   condition it missed. After the fix merges the run ends: the new tip has not
+   answered yet, and the base's own post-merge run decides what merges next. If
+   the base-health read cannot name which check failed, the pass halts exactly
+   as before.
+
 **The gate fails open, deliberately, and it is only as good as your post-merge
 CI.** Only a definite failure halts it. A check that is *missing* or *pending*
 on the base tip does not, because most repositories run their required checks on

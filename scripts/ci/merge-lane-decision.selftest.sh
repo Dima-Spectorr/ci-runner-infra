@@ -467,6 +467,57 @@ clock "nowait:over-budget seconds=40 spent=400 walk=200 budget=600" \
   "the walk estimate, not the halted pass, decides whether the wait fits" \
   $((T + 39)) "$T" $((T - 400)) 600 "$(lane_walk_estimate 2 200 30)" 180 0 3
 
+# ---------------------------------------------------------------------------
+# #1443 — A RED BASE ADMITS ITS OWN FIX, AND NOTHING ELSE.
+# args: verdict behind fixed failing. Every wait arm starts `wait:base-red`, so
+# each case pins the field that names WHICH arm answered — a trailing space
+# after a number, so `behind=1` cannot be satisfied by `behind=10`.
+basefix() {
+  local want="$1" desc="$2" got
+  shift 2
+  got=$(lane_base_fix_verdict "$@")
+  if [[ "$got" == "$want"* ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  args: %s\n  want: %s*\n  got:  %s\n' "$desc" "$*" "$want" "$got"
+  fi
+}
+basefix "merge:base-fix fixes=2/2" "red base + green PR up to date that passes what fails there merges" \
+  "merge:ready" 0 2 2
+basefix "wait:base-red behind=1 " "red base + green PR behind the red tip halts" "merge:ready" 1 2 2
+basefix "wait:base-red behind=unknown " "an unread comparison is not up to date" "merge:ready" "" 2 2
+basefix "wait:base-red behind=x " "a garbled comparison is not up to date" "merge:ready" x 2 2
+basefix "wait:base-red fixes=1/2 " "red base + PR still failing one of the base's failing checks halts" \
+  "merge:ready" 0 1 2
+basefix "wait:base-red fixes=0/0 " "an empty failing set admits nothing" "merge:ready" 0 0 0
+basefix "wait:base-red fixes=?/2 " "an unread fix count admits nothing" "merge:ready" 0 "" 2
+basefix "wait:base-red holds update:behind" "an update waits: the run it starts is not a fix" \
+  "update:behind" 0 2 2
+basefix "wait:base-red holds drop:expired" "a drop waits too, so a red base comments nothing" \
+  "drop:expired in-flight" 0 2 2
+basefix "skip:red" "a verdict that was never going to act passes through unchanged" "skip:red" 0 2 2
+basefix "wait:review" "a review hold stays a review hold" "wait:review grace" 0 2 2
+
+# How many of the ranking a pass may act on. args: strict max acted red.
+batch() {
+  local want="$1" desc="$2" got
+  shift 2
+  got=$(lane_batch_size "$@")
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  args: %s\n  want: %s\n  got:  %s\n' "$desc" "$*" "$want" "$got"
+  fi
+}
+batch 1 "red base, two eligible: only one merges, even on a non-strict base" 0 4 0 1
+batch 4 "a green non-strict base drains the rest of the run's budget" 0 4 0 ""
+batch 2 "the budget already spent is not spent again" 0 4 2 ""
+batch 1 "a strict base acts once and re-reads" 1 4 0 ""
+batch 1 "a spent budget still allows the pass its one action" 0 4 4 ""
+batch 1 "a garbled budget acts once" 0 x 0 ""
+
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane-decision: $FAIL failed, $PASS passed"
   exit 1
