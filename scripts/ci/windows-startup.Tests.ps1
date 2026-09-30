@@ -1576,6 +1576,45 @@ Describe 'boot log redaction' {
     }
 }
 
+# The post-registration diagnostics (#898) log the runner's OWN _diag and event
+# text to the serial port. None of the tokens in it are known to this script, so
+# they are struck by shape; each shape below is one that reaches that text.
+Describe 'agent diagnostic redaction' {
+    It 'strikes the registration token by value' {
+        Get-RedactedDiagnosticLine -Line 'reg AABBCCDD here' -Secret 'AABBCCDD' |
+            Should -Be 'reg *** here'
+    }
+
+    It 'strikes a GitHub token by its prefix' {
+        Get-RedactedDiagnosticLine -Line 'got ghs_abcdefghijklmnopqrstuv0123 ok' |
+            Should -Be 'got *** ok'
+    }
+
+    It 'strikes a JWT' {
+        Get-RedactedDiagnosticLine -Line 'jwt eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl end' |
+            Should -Be 'jwt *** end'
+    }
+
+    It 'strikes a bearer credential and a named secret value' {
+        $out = Get-RedactedDiagnosticLine -Line 'Authorization: Bearer abc.def and "token": "zzz9", password=hunter2'
+        $out | Should -Not -Match 'abc\.def|zzz9|hunter2'
+    }
+
+    It 'strikes a long base64 run such as an RSA parameter' {
+        Get-RedactedDiagnosticLine -Line 'd MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7 end' |
+            Should -Be 'd *** end'
+    }
+
+    It 'leaves an ordinary runner line readable' {
+        $line = '[2026-09-30 11:43:50Z INFO Runner] Listening for Jobs'
+        Get-RedactedDiagnosticLine -Line $line | Should -Be $line
+    }
+
+    It 'caps a runaway line' {
+        (Get-RedactedDiagnosticLine -Line ('x y ' * 400)).Length | Should -BeLessOrEqual 412
+    }
+}
+
 Describe 'service environment block' {
     It 'renders each entry as NAME=VALUE' {
         $v = Get-ServiceEnvironmentValue -Environment ([ordered] @{ TMP = '/t'; TEMP = '/t' })

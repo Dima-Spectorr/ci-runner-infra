@@ -3091,6 +3091,122 @@ mutate_file "$SCAN_PS" "the offender chosen out of a hashtable, so the build nam
   's|foreach ($entry in $order) {|foreach ($entry in $names.Keys) {|' \
   has_hardlink_scan_script
 
+# --- invariant 15: the agents' own account of why they are offline (#898) ---
+#
+# ci-runner-host-win-iit-fb0s registered both agents, proved both services
+# Running as their slot accounts, and GitHub listed both offline -- on a host
+# with no SSH, no IAP and no guest attributes. The serial port is the only way
+# out, so phase 5 now watches its agents and logs the service state, the
+# listener, its _diag tail and the event log. Three ways a later edit breaks
+# that without any error:
+#
+#   it can deny the boot    a diagnostic that throws takes down agents that are
+#                           already registered and serving;
+#   it can leak             the _diag tail and event text are the runner's own,
+#                           and can carry tokens this script never held;
+#   it can go silent        a dropped column (the listener count) or source is
+#                           exactly the evidence the next offline host needs.
+has_agent_diagnostics() { # <file>
+  local code diag
+  code=$(code_of "$1")
+  diag=$(printf '%s\n' "$code" | awk '/^\$script:AgentWatchSeconds = /{on=1} /^function Invoke-Phase5Registration/{on=0} on')
+  [ -n "$diag" ] || return 1
+
+  # Called once, AFTER the token witness: that is a security bound, this a log.
+  local calls call_at witness_at
+  calls=$(printf '%s\n' "$code" | grep -c '^    Write-AgentDiagnostic -Provisioned \$Provisioned -Since \$registeringSince -Secret \$regToken$')
+  [ "$calls" -eq 1 ] || return 1
+  call_at=$(printf '%s\n' "$code" | grep -n '^    Write-AgentDiagnostic -Provisioned' | cut -d: -f1)
+  witness_at=$(printf '%s\n' "$code" | grep -n '^    Wait-RegistrationTokenRemoved$' | cut -d: -f1 | sed -n 1p)
+  [ -n "$witness_at" ] && [ "$witness_at" -lt "$call_at" ] || return 1
+
+  # Never denies, never changes the host. Every one of these is a way for a
+  # log to take down an agent that is already serving.
+  if matches "$diag" '(^|[^A-Za-z-])(throw|Deny-Boot|Stop-Service|Start-Service|Restart-Service|Set-Acl|Set-ItemProperty|New-ItemProperty|Remove-Item)([^A-Za-z-]|$)'; then
+    return 1
+  fi
+  matches "$diag" 'Write-BootLog "phase 5 diag: stopped early' || return 1
+
+  # Bounded, and short: it holds the startup script open.
+  local watch
+  watch=$(printf '%s\n' "$code" | sed -n 's/^\$script:AgentWatchSeconds = \([0-9][0-9]*\)$/\1/p')
+  [ -n "$watch" ] && [ "$watch" -le 300 ] || return 1
+  matches "$diag" '\$deadline = \(Get-Date\)\.AddSeconds\(\$WatchSeconds\)' || return 1
+  matches "$diag" 'if \(\(Get-Date\) -ge \$deadline\) \{ break \}' || return 1
+
+  # Every line of the runner's own text goes through the shape redaction.
+  matches "$diag" 'Get-RedactedDiagnosticLine -Line \(\[string\] \$line\) -Secret \$Secret' || return 1
+  matches "$diag" 'Get-RedactedDiagnosticLine -Line \$text -Secret \$Secret' || return 1
+  matches "$code" "'\[A-Za-z0-9\+/_-\]\{40,\}=\{0,2\}'" || return 1
+  matches "$code" 'gh\[pousr\]_' || return 1
+
+  # The evidence itself.
+  matches "$diag" 'startname=\$\(\$svc\.StartName\)' || return 1
+  matches "$diag" 'win32exit=\$\(\$svc\.ExitCode\) svcexit=\$\(\$svc\.ServiceSpecificExitCode\)' || return 1
+  matches "$diag" 'listeners=\$\(\$listeners\.Count\)' || return 1
+  matches "$diag" "Get-Content -LiteralPath \\\$logs\[0\]\.FullName -Tail \\\$script:AgentDiagTailLines" || return 1
+  matches "$diag" "-Provider 'Service Control Manager'" || return 1
+  matches "$diag" "-Provider 'ActionsRunnerService'" || return 1
+}
+
+if has_agent_diagnostics "$SCRIPT"; then
+  ok
+else
+  bad "phase 5 no longer logs what its agents did after registering, or can deny the boot or leak a token doing it — the only evidence an offline Windows agent leaves on a host nobody can log into (#898)"
+fi
+
+mutate "the diagnostics dropped from phase 5" \
+  's|^    Write-AgentDiagnostic -Provisioned .*|    $null = $regToken|' \
+  has_agent_diagnostics
+mutate "the diagnostics moved ahead of the token witness" \
+  's|^    Wait-RegistrationTokenRemoved$|    Write-AgentDiagnostic -Provisioned $Provisioned -Since $registeringSince -Secret $regToken\n    Wait-RegistrationTokenRemoved|' \
+  has_agent_diagnostics
+mutate "the registration token no longer handed to the redaction" \
+  's|-Since \$registeringSince -Secret \$regToken$|-Since $registeringSince|' \
+  has_agent_diagnostics
+mutate "a diagnostic failure denies the boot" \
+  's|Write-BootLog "phase 5 diag: stopped early|Deny-Boot "phase 5 diag: stopped early|' \
+  has_agent_diagnostics
+mutate "a diagnostic failure rethrown" \
+  's|^        Write-BootLog "phase 5 diag: stopped early.*|        throw|' \
+  has_agent_diagnostics
+mutate "a diagnostic that restarts the agent it is watching" \
+  "s|Write-BootLog 'phase 5 diag: done'|Start-Service -Name x; Write-BootLog 'phase 5 diag: done'|" \
+  has_agent_diagnostics
+mutate "the watch left unbounded" \
+  '/^function Write-AgentDiagnostic/,/^function Invoke-Phase5Registration/s|if ((Get-Date) -ge \$deadline) { break }|if ($false) { break }|' \
+  has_agent_diagnostics
+mutate "the watch stretched past what a startup script should hold open" \
+  's|^\$script:AgentWatchSeconds = 180$|$script:AgentWatchSeconds = 3600|' \
+  has_agent_diagnostics
+mutate "the _diag tail logged unredacted" \
+  's|(Get-RedactedDiagnosticLine -Line (\[string\] \$line) -Secret \$Secret)|[string] $line|' \
+  has_agent_diagnostics
+mutate "the event text logged unredacted" \
+  's|(Get-RedactedDiagnosticLine -Line \$text -Secret \$Secret)|$text|' \
+  has_agent_diagnostics
+mutate "the long-base64 redaction dropped, so an RSA parameter reaches the serial port" \
+  "s|'\[A-Za-z0-9+/_-\]{40,}={0,2}', '\*\*\*'|'(?!)', '***'|" \
+  has_agent_diagnostics
+mutate "the listener column dropped, so a crash loop reads as a Running service" \
+  's|listeners=\$(\$listeners\.Count)||' \
+  has_agent_diagnostics
+mutate "the exit codes dropped" \
+  's|win32exit=\$(\$svc\.ExitCode) ||' \
+  has_agent_diagnostics
+mutate "the logon account dropped from the status line" \
+  's|startname=\$(\$svc\.StartName) ||' \
+  has_agent_diagnostics
+mutate "the _diag tail no longer read" \
+  's|Get-Content -LiteralPath \$logs\[0\]\.FullName -Tail|Get-Content -LiteralPath $logs[0].FullName -TotalCount|' \
+  has_agent_diagnostics
+mutate "the SCM's own events no longer read" \
+  "s|-Provider 'Service Control Manager'|-Provider 'Nothing'|" \
+  has_agent_diagnostics
+mutate "the listener's stdout in the Application log no longer read" \
+  "s|-Provider 'ActionsRunnerService'|-Provider 'Nothing'|" \
+  has_agent_diagnostics
+
 # THE BOOT SCRIPT HAS TO FIT IN A METADATA VALUE.
 #
 # The same check host-startup.selftest.sh makes for Linux, and the reason it is
