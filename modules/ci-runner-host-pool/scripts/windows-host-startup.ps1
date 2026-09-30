@@ -6605,6 +6605,43 @@ function Save-SlotHive {
     }
 }
 
+function New-SlotProfile {
+    <#
+      .SYNOPSIS
+        Create a slot's profile from Default, without logging the slot on.
+      .DESCRIPTION
+        userenv!CreateProfile, as SYSTEM: the ProfileList entry and the directory,
+        copied from the Default profile, with no process running as the slot.
+        Throws on failure; the caller turns that into its own denial.
+        0x800700B7 (already exists) is success -- a profile a service made between
+        the check and this call is still the slot's profile.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Sid,
+        [Parameter(Mandatory = $true)][int] $Index
+    )
+    if (-not ('CiBoot.UserEnv' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace CiBoot {
+    public static class UserEnv {
+        [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
+        public static extern int CreateProfile(string sid, string user, StringBuilder path, uint cch);
+    }
+}
+"@
+    }
+    $path = New-Object System.Text.StringBuilder 260
+    $hr = [CiBoot.UserEnv]::CreateProfile($Sid, (Get-SlotUserName -Index $Index), $path, 260)
+    if ($hr -ne 0 -and $hr -ne -2147024713) {
+        throw ('CreateProfile for slot {0} returned 0x{1:X8}' -f $Index, $hr)
+    }
+    Write-BootLog "phase 4: slot $Index had never logged on -- created its profile at $path"
+}
+
 function Save-SlotProfileTemplate {
     <#
       .SYNOPSIS
@@ -6652,6 +6689,13 @@ function Save-SlotProfileTemplate {
         $account = New-Object System.Security.Principal.NTAccount((Get-SlotUserName -Index $Index))
         $sid = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
         $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
+        # ONLY THE PROBE'S SLOT HAS LOGGED ON. Phase 6 runs as slot 1 alone, so
+        # every other slot reaches this point with no profile at all -- measured
+        # 2026-09-30 on a two-slot Windows host: slot 1 captured, then "slot 2 has
+        # no profile in the account database", boot denied. Make it here, from
+        # Default, without a logon: the result is exactly as pristine as the
+        # probe's, and its hive was never loaded by anything a slot ran.
+        if (-not (Test-Path -LiteralPath $key)) { New-SlotProfile -Sid $sid -Index $Index }
         $raw = (Get-ItemProperty -LiteralPath $key -Name 'ProfileImagePath').ProfileImagePath
         $profileDir = [System.Environment]::ExpandEnvironmentVariables([string] $raw)
     } catch {
@@ -7832,9 +7876,10 @@ function Invoke-Main {
     #
     # A Windows profile does not exist until the account logs on, and phase 1
     # denies these accounts every logon type except service -- so the first
-    # profile on this host is the one phase 6's probe service just created. This
-    # is the single window in which every slot has a profile and no job has ever
-    # run in one: after the probe, before the agents. See Save-SlotProfileTemplate.
+    # profile on this host is the one phase 6's probe service just created. The
+    # probe runs as slot 1 only, so every other slot gets its profile made here,
+    # by New-SlotProfile. This is the single window in which no job has ever run
+    # in one: after the probe, before the agents. See Save-SlotProfileTemplate.
     Invoke-Phase4ProfileTemplate -Provisioned $provisioned
 
     # LAST, and the only phase that makes this host reachable by a job. Everything
