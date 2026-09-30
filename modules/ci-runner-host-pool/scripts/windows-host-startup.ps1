@@ -4027,6 +4027,19 @@ function Get-AncestorPath {
     return @()
 }
 
+function Test-ConfigOnlyStartFailed {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Output
+    )
+    $text = @($Output | ForEach-Object { [string] $_ })
+    $has = { param($pattern) [bool] (@($text | Where-Object { $_ -match $pattern }).Count) }
+    return ((& $has 'Runner successfully added') -and
+        (& $has 'Service \S+ successfully installed') -and
+        (& $has 'Cannot start the service') -and
+        -not (& $has '(?i)\b(unauthorized|forbidden|already exists|failed to (add|register|install))\b'))
+}
+
 function Grant-SlotDirectoryList {
     <#
       .SYNOPSIS
@@ -7339,6 +7352,16 @@ function Register-SlotAgent {
     foreach ($line in @($configOutput)) {
         Write-BootLog ("slot $($Slot.Index) config: " +
             (Get-RedactedLine -Line ([string] $line) -Secret $RegistrationToken))
+    }
+    # config.cmd --runasservice ends by starting the service as NETWORK SERVICE,
+    # which cannot list the slot's directories, so that start always fails. Whether
+    # config.cmd then exits 1 is a race on its own timeout. The start that matters
+    # is ours below, under the slot account; a registered, installed agent whose
+    # only failure was that first start is not a failed registration.
+    if ($configExit -ne 0 -and (Test-ConfigOnlyStartFailed -Output @($configOutput))) {
+        Write-BootLog ("slot $($Slot.Index): config.cmd exit $configExit came only from its own " +
+            'NETWORK SERVICE start; the agent is registered and installed, starting it as the slot account')
+        $configExit = 0
     }
     if ($configExit -ne 0) {
         Deny-Boot "slot $($Slot.Index): config.cmd failed (exit $configExit)"

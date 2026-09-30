@@ -993,6 +993,37 @@ Describe 'acl inheritance flags' {
     }
 }
 
+# config.cmd's own start runs as NETWORK SERVICE and always fails; its exit code
+# is a race (#898). Only that failure may be forgiven -- a registration that did
+# not happen must still deny the boot.
+Describe 'config.cmd start-only failure' {
+    BeforeAll {
+        $script:registered = @(
+            'v Runner successfully added',
+            'Service actions.runner.o-r.h-s2 successfully installed',
+            'Waiting for service to start...',
+            'Cannot start the service actions.runner.o-r.h-s2 in a timely fashion.')
+    }
+    It 'forgives a registered, installed agent whose only failure was the start' {
+        Test-ConfigOnlyStartFailed -Output $script:registered | Should -BeTrue
+    }
+    It 'does not forgive a run that never registered' {
+        Test-ConfigOnlyStartFailed -Output @($script:registered | Select-Object -Skip 1) | Should -BeFalse
+    }
+    It 'does not forgive a run whose service was never installed' {
+        Test-ConfigOnlyStartFailed -Output @($script:registered[0], $script:registered[3]) | Should -BeFalse
+    }
+    It 'does not forgive a failure that was not the start' {
+        Test-ConfigOnlyStartFailed -Output @($script:registered[0..1]) | Should -BeFalse
+    }
+    It 'does not forgive an authorization failure even with the start line' {
+        Test-ConfigOnlyStartFailed -Output @($script:registered + 'Http response code: Unauthorized') | Should -BeFalse
+    }
+    It 'handles empty output' {
+        Test-ConfigOnlyStartFailed -Output @() | Should -BeFalse
+    }
+}
+
 # The runner exits 1 unless it can list every directory above its root, and the
 # SCM reports that as "Incorrect function" (#898). These are the directories the
 # slot is granted list-only on, so an off-by-one here is either a runner that
