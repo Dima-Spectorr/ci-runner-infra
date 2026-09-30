@@ -6605,7 +6605,7 @@ function Save-SlotHive {
     }
 }
 
-function New-SlotProfile {
+function Initialize-SlotProfile {
     <#
       .SYNOPSIS
         Create a slot's profile from Default, without logging the slot on.
@@ -6699,7 +6699,7 @@ function Save-SlotProfileTemplate {
         # no profile in the account database", boot denied. Make it here, from
         # Default, without a logon: the result is exactly as pristine as the
         # probe's, and its hive was never loaded by anything a slot ran.
-        if (-not (Test-Path -LiteralPath $key)) { New-SlotProfile -Sid $sid -Index $Index }
+        if (-not (Test-Path -LiteralPath $key)) { Initialize-SlotProfile -Sid $sid -Index $Index }
         $raw = (Get-ItemProperty -LiteralPath $key -Name 'ProfileImagePath').ProfileImagePath
         $profileDir = [System.Environment]::ExpandEnvironmentVariables([string] $raw)
     } catch {
@@ -7882,7 +7882,7 @@ function Invoke-Main {
     # denies these accounts every logon type except service -- so the first
     # profile on this host is the one phase 6's probe service just created. The
     # probe runs as slot 1 only, so every other slot gets its profile made here,
-    # by New-SlotProfile. This is the single window in which no job has ever run
+    # by Initialize-SlotProfile. This is the single window in which no job has ever run
     # in one: after the probe, before the agents. See Save-SlotProfileTemplate.
     Invoke-Phase4ProfileTemplate -Provisioned $provisioned
 

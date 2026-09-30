@@ -541,7 +541,7 @@ has_profile_template_before_registration() { # <file>
   # -- and a save that fails is fatal.
   # Only the probe's slot has ever logged on, so every other slot's profile is
   # created here, from Default, before the capture reads ProfileList.
-  matches "$code" 'if \(-not \(Test-Path -LiteralPath \$key\)\) \{ New-SlotProfile -Sid \$sid -Index \$Index \}' || return 1
+  matches "$code" 'if \(-not \(Test-Path -LiteralPath \$key\)\) \{ Initialize-SlotProfile -Sid \$sid -Index \$Index \}' || return 1
   matches "$code" 'CreateProfile\(\$Sid, \(Get-SlotUserName -Index \$Index\), \$path, 260\)' || return 1
   matches "$code" 'if \(\$hr -ne 0 -and \$hr -ne -2147024713\) \{' || return 1
   matches "$code" "capturing it live with reg save" || return 1
@@ -1620,7 +1620,7 @@ mutate "a slot with no capturable profile allowed to boot" \
   's|Deny-Boot ("slot \$Index has no profile in the account database |Write-BootLog ("slot $Index has no profile in the account database |' \
   has_profile_template_before_registration
 mutate "a slot that never logged on left with no profile" \
-  's|if (-not (Test-Path -LiteralPath \$key)) { New-SlotProfile -Sid \$sid -Index \$Index }||' \
+  's|if (-not (Test-Path -LiteralPath \$key)) { Initialize-SlotProfile -Sid \$sid -Index \$Index }||' \
   has_profile_template_before_registration
 mutate "a failed CreateProfile treated as success" \
   's|if (\$hr -ne 0 -and \$hr -ne -2147024713) {|if ($false) {|' \
