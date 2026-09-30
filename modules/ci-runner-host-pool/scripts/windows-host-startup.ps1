@@ -3996,6 +3996,66 @@ function Protect-CiDirectory {
     Set-Acl -Path $Path -AclObject $acl
 }
 
+function Get-AncestorPath {
+    <#
+      .SYNOPSIS
+        Every directory from $Root down to $Path's parent, outermost first. Pure.
+      .DESCRIPTION
+        The runner will not start unless its account can list the contents of its
+        own root and EVERY directory above it (Runner.Listener's directory
+        permission check, before anything else runs). The error it raises is
+        UnauthorizedAccessException in its _diag log; the SCM only ever sees exit
+        code 1 and reports it as "Incorrect function", which is how #898 looked
+        from outside. This names the directories that check walks inside the
+        tree this script locks; everything above $Root is the image's and lists.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Root
+    )
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    $chain = @()
+    $cursor = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/'))
+    while ($cursor -and $cursor.Length -ge $rootFull.Length) {
+        $chain = @($cursor) + $chain
+        if ($cursor -eq $rootFull) { return $chain }
+        $cursor = [System.IO.Path]::GetDirectoryName($cursor)
+    }
+    # $Path is not under $Root: granting on whatever we walked would be granting
+    # outside the tree this script owns.
+    return @()
+}
+
+function Grant-SlotDirectoryList {
+    <#
+      .SYNOPSIS
+        Let one slot list ONE directory's entries -- no inheritance, no read of any child.
+      .DESCRIPTION
+        Added to the existing ACL rather than rewriting it, because the directories
+        this is for (C:\ci, C:\ci\slots) are locked by Protect-CiDirectory in phase 1
+        and that lock is the thing being preserved. Inheritance and propagation are
+        None, so the ACE applies to the directory object alone: the slot sees the
+        NAMES under C:\ci and cannot open, list or read C:\ci\bin or a sibling slot,
+        because each child's own ACL still decides. The phase 6 probe proves that
+        denial BEFORE this grant exists (it runs ahead of phase 5), so the no-
+        inheritance flags here are what keep it true afterwards.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $SlotUser
+    )
+    $acl = Get-Acl -Path $Path
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.NTAccount]::new($SlotUser),
+                [System.Security.AccessControl.FileSystemRights]'ListDirectory, ReadAttributes',
+                [System.Security.AccessControl.InheritanceFlags]::None,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow))) | Out-Null
+    Set-Acl -Path $Path -AclObject $acl
+}
+
 function Edit-InfPrivilege {
     <#
       .SYNOPSIS
@@ -7350,6 +7410,12 @@ function Register-SlotAgent {
     # read its own credentials never comes up, and a sibling that can read them is
     # the boundary this whole design is built on.
     Protect-CiDirectory -Path $agent -SlotUser $Slot.User
+
+    # The runner lists every directory above its root before it does anything
+    # else, and exits 1 when one refuses. See Get-AncestorPath.
+    foreach ($ancestor in @(Get-AncestorPath -Path $agent -Root $script:CiRoot)) {
+        Grant-SlotDirectoryList -Path $ancestor -SlotUser $Slot.User
+    }
 
     Write-ServiceEnvironment -ServiceName $serviceName -Environment $Environment
     Clear-ServiceRecoveryAction -ServiceName $serviceName -AgentName $name
