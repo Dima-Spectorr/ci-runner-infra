@@ -993,6 +993,34 @@ Describe 'acl inheritance flags' {
     }
 }
 
+# The runner exits 1 unless it can list every directory above its root, and the
+# SCM reports that as "Incorrect function" (#898). These are the directories the
+# slot is granted list-only on, so an off-by-one here is either a runner that
+# never starts or a grant on a directory the slot should not see into.
+Describe 'runner ancestor directories' {
+    It 'names every directory from the root down to the parent, outermost first' {
+        $chain = @(Get-AncestorPath -Path '/ci/slots/1/runner' -Root '/ci')
+        $chain | Should -Be @('/ci', '/ci/slots', '/ci/slots/1')
+    }
+
+    It 'never includes the runner directory itself' {
+        Get-AncestorPath -Path '/ci/slots/1/runner' -Root '/ci' | Should -Not -Contain '/ci/slots/1/runner'
+    }
+
+    It 'tolerates a trailing separator on either argument' {
+        @(Get-AncestorPath -Path '/ci/slots/1/runner/' -Root '/ci/') |
+            Should -Be @('/ci', '/ci/slots', '/ci/slots/1')
+    }
+
+    It 'grants nothing for a path outside the root' {
+        @(Get-AncestorPath -Path '/other/slots/1/runner' -Root '/ci').Count | Should -Be 0
+    }
+
+    It 'does not match a sibling that merely shares the prefix' {
+        @(Get-AncestorPath -Path '/cix/slots/1/runner' -Root '/ci').Count | Should -Be 0
+    }
+}
+
 # THE SAME DISTINCTION, IN THE OTHER FILE THAT MAKES IT
 #
 # windows-boot-wrapper.ps1 has its own Protect-Path, because it runs BEFORE the
