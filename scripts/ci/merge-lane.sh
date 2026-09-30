@@ -70,6 +70,7 @@ LANE_BASE_STATES="$LANE_TMP/base-health-states"
 # that turns the halt into "only a demonstrated fix merges".
 LANE_BASE_RED=''
 LANE_BASE_FAILING=()
+LANE_BASE_FIX_MERGED=''
 
 # ---------------------------------------------------------------------------
 # THE APP QUOTA IS SHARED, SO THE LANE COUNTS WHAT IT SPENDS AND STOPS SHORT.
@@ -950,7 +951,12 @@ check_counts() {
       local bucket="$state"
       case "$state" in
         success | skipped | pending | queued | in_progress | absent) ;;
-        cancelled | stale) [ "${BASE_TIP_READ:-0}" = "1" ] && bucket=pending || bucket=failed ;;
+        # Written `stale | cancelled`, not the counts' order: the selftest's
+        # pattern for the counts' arm must not be satisfied by this sibling.
+        stale | cancelled)
+          bucket=failed
+          if [ "${BASE_TIP_READ:-0}" = "1" ]; then bucket=pending; fi
+          ;;
         *) bucket=failed ;;
       esac
       printf '%s %s\n' "$bucket" "$name" >>"$LANE_STATE_SINK"
@@ -1384,6 +1390,51 @@ lane_base_is_broken() {
 }
 
 # ---------------------------------------------------------------------------
+# lane_base_fix_passed — how many of the base's failing checks PASSED on a head.
+#
+#   lane_base_fix_passed <sha> <states-file>
+#
+# Prints a count, compared against `${#LANE_BASE_FAILING[@]}` by
+# `lane_base_fix_verdict`. The states file is what the candidate's own
+# `check_counts` read recorded, so a name in both lists costs nothing more. The
+# base-health list may name checks the merge list does not; those are read once
+# more, on this head, with `REQUIRED` shadowed to exactly them — the same
+# dynamic-scope handle `lane_base_is_broken` uses.
+#
+# Only `success` counts. A check that SKIPPED on the fix has not shown the break
+# is gone: it may have skipped precisely because the fix did not touch what it
+# covers, and admitting that would merge onto a red base on no evidence (#1443).
+lane_record_states_of() { # <sha> <states-file> <name>...
+  local sha="$1" states="$2"
+  shift 2
+  local -a REQUIRED=("$@")
+  local LANE_STATE_SINK="$states"
+  check_counts "$sha" >/dev/null || true
+}
+
+lane_base_fix_passed() {
+  local sha="$1" states="$2" name bucket passed=0
+  local -A seen=()
+  local -a unread=()
+  while read -r bucket name; do
+    [ -n "$name" ] && seen["$name"]="$bucket"
+  done <"$states"
+  for name in "${LANE_BASE_FAILING[@]}"; do
+    [ -n "${seen[$name]+x}" ] || unread+=("$name")
+  done
+  if [ "${#unread[@]}" -gt 0 ]; then
+    lane_record_states_of "$sha" "$states" "${unread[@]}"
+    while read -r bucket name; do
+      [ -n "$name" ] && seen["$name"]="$bucket"
+    done <"$states"
+  fi
+  for name in "${LANE_BASE_FAILING[@]}"; do
+    [ "${seen[$name]:-}" = "success" ] && passed=$((passed + 1))
+  done
+  echo "$passed"
+}
+
+# ---------------------------------------------------------------------------
 # HAS ANYTHING VOUCHED FOR THIS TIP SINCE THE LAST THING THAT LANDED ON IT?
 #
 # The halt above asks one question — is the base RED — and it is asked once, at
@@ -1638,9 +1689,7 @@ one_pass() {
   LANE_BASE_JUST_READ="$base_sha"
   # A red tip has answered — red — and is handled by the admission above, so
   # it is not waited on as if it were silent.
-  if [ -n "$LANE_BASE_RED" ]; then
-    :
-  elif ! lane_base_is_vouched "$base_sha" "$base_at"; then
+  if [ -z "$LANE_BASE_RED" ] && ! lane_base_is_vouched "$base_sha" "$base_at"; then
     LANE_HALT_REASON="the base-health check on the tip of $LANE_BASE ($base_sha) is '$LANE_BASE_VERDICT' — waiting for it to answer"
     echo "::notice::lane: $LANE_HALT_REASON. Something answers for this base and has not yet answered for this commit; merging now would stack onto a tip nothing has vouched for. The lane resumes on its own, and proceeds regardless after ${BASE_HEALTH_GRACE}s."
     return 1
@@ -2020,6 +2069,24 @@ one_pass() {
       esac
     fi
 
+    # A RED BASE ADMITS ONLY ITS OWN FIX (#1443), decided last, on the verdict
+    # every other gate already agreed on. Contained-the-tip comes from the
+    # strict compare above; a base that does not require up-to-date branches
+    # never asked, so it asks here — once, and only for a candidate that would
+    # otherwise merge — against the red sha itself, not the branch name, which
+    # may have moved since. An unreadable answer is not "0 behind".
+    if [ -n "$LANE_BASE_RED" ]; then
+      local red_behind="$behind" fixed=0
+      if [ "${verdict%%:*}" = "merge" ]; then
+        if [ "$LANE_STRICT" = "0" ]; then
+          red_behind="$(gh api "repos/$R/compare/$base_sha...$sha" --jq '.behind_by' 2>/dev/null || echo '')"
+          behind_cell="${red_behind:-unread}"
+        fi
+        fixed="$(lane_base_fix_passed "$sha" "$head_states")"
+      fi
+      verdict="$(lane_base_fix_verdict "$verdict" "$red_behind" "$fixed" "${#LANE_BASE_FAILING[@]}")"
+    fi
+
     echo "lane: #$num $verdict (sha=${sha:0:8} priority=$priority behind=$behind_cell api-calls=$(($(lane_calls) - pr_calls_before)))"
 
     # Ranked exactly as the lane ranks it when it is actionable, and parked
@@ -2079,6 +2146,9 @@ one_pass() {
 
   if [ "${#candidates[@]}" -eq 0 ]; then
     echo "lane: nothing actionable this pass"
+    if [ -n "$LANE_BASE_RED" ]; then
+      echo "lane: $LANE_BASE stays halted — no open pull request is green, contains the red tip ${base_sha:0:8}, and passes what is failing on it"
+    fi
     return 1
   fi
 
@@ -2208,6 +2278,12 @@ one_pass() {
       esac
     fi
 
+    if [ -n "$LANE_BASE_RED" ]; then
+      local red_names
+      red_names="$(IFS=,; echo "${LANE_BASE_FAILING[*]}")"
+      echo "::notice::lane: base is red; #$action_num is green on ${red_names//,/, } against the current tip ${base_sha:0:8} — merging it as the base fix"
+    fi
+
     local take_rc=0
     lane_take_action "$action_num" "$action_sha" "$action_verdict" || take_rc=$?
     if [ "$take_rc" -ne 0 ]; then
@@ -2215,6 +2291,7 @@ one_pass() {
       continue
     fi
     PASS_ACTED=$((PASS_ACTED + 1))
+    if [ -n "$LANE_BASE_RED" ]; then LANE_BASE_FIX_MERGED=1; fi
   done <<<"$ranked"
 
   [ "$PASS_ACTED" -gt 0 ]
@@ -2501,14 +2578,15 @@ render_queue() {
 
   if [ -n "$LANE_HALT_REASON" ]; then
     printf '> **Halted.** %s\n>\n' "$LANE_HALT_REASON"
-    printf '> Nothing merges while the base is red: the next merge would bury the commit that broke it. The lane resumes by itself once those checks pass.\n\n'
+    printf '> Nothing merges while the base is red: the next merge would bury the commit that broke it. The one exception is the fix itself — one pull request per pass that is green on every required check, contains the red tip, and passes the checks failing there (verdict `merge`, reason `base-fix`). The lane resumes by itself once those checks pass.\n\n'
   fi
 
   if [ "${#QUEUE_ROWS[@]}" -eq 0 ]; then
     # "Nothing open" and "the lane stopped before it looked" are different
     # facts, and rendering them identically is the same defect the sort key's
-    # `8` tier exists to prevent.
-    if [ -n "$LANE_HALT_REASON" ] || [ -n "$LANE_SKIP_REASON" ]; then
+    # `8` tier exists to prevent. A red base that names its failing checks DID
+    # read the list, looking for its fix (#1443).
+    if [ -n "$LANE_SKIP_REASON" ] || { [ -n "$LANE_HALT_REASON" ] && [ -z "$LANE_BASE_RED" ]; }; then
       printf '_The open list was not read on this pass._\n\n'
     else
       printf '_No open pull requests on `%s`._\n\n' "$LANE_BASE"
@@ -2627,6 +2705,15 @@ while [ "$acted" -lt "$MAX_ACTIONS" ]; do
   pass_began="$(date -u +%s)"
   if one_pass; then
     acted=$((acted + PASS_ACTED))
+    # A BASE FIX ENDS THE RUN (#1443). The tip it created is seconds old, and a
+    # pass on it would read the base-health check as not-yet-reported — which
+    # on a base whose health list is only just arming reads `inert`, and the lane
+    # would carry on merging onto a tip nothing has vouched for. The post-merge
+    # run on the base answers that, and its completion triggers the next run.
+    if [ -n "$LANE_BASE_FIX_MERGED" ]; then
+      echo "lane: merged the base fix — ending this run; the base's own health run decides what merges next"
+      break
+    fi
     # The world changed: a merge just moved the base, so everything else is now
     # one commit behind and has to be re-read rather than judged on the facts
     # gathered before it.

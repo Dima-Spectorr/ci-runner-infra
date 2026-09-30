@@ -1207,12 +1207,13 @@ declares_its_inputs_without_a_live_expression() {
 # pass is stale the moment something merges, and a batch there would merge
 # against facts that no longer hold. So the widened budget has to stay welded
 # to `LANE_STRICT`; an unguarded `batch=` is the whole defect.
+#
+# The decision itself is `lane_batch_size`, exercised case by case in the
+# decision selftest. What is asserted here is that the driver hands it BOTH
+# facts — the strictness and whether the base is red (#1443) — since dropping
+# either argument turns its guard off without touching the function.
 batches_only_when_the_base_allows_it() {
-  local code
-  code=$(code_of "$1")
-  matches "$code" '^  local batch=1$' || return 1
-  matches "$code" '^  if \[ "\$LANE_STRICT" = "0" \] \&\& \[ "\$MAX_ACTIONS" -gt "\$acted" \]; then$' || return 1
-  matches "$code" '^    batch=\$\(\(MAX_ACTIONS - acted\)\)$'
+  matches "$(code_of "$1")" '^  batch="\$\(lane_batch_size "\$LANE_STRICT" "\$MAX_ACTIONS" "\$acted" "\$LANE_BASE_RED"\)"$'
 }
 
 # The batch is optional work; the pass deadline is not. A pass that ran out of
@@ -1367,6 +1368,60 @@ says_on_the_snapshot_that_it_halted() {
   matches "$code" '^      printf ._The open list was not read on this pass\._'
 }
 
+# A RED BASE ADMITS ITS OWN FIX, AND NOTHING ELSE (#1443).
+#
+# DataRetrival, 2026-09-30: the base went red, the hotfix was green on all six
+# required checks, and the lane refused it for two hours because the base was
+# red. The admission itself is `lane_base_fix_verdict` and `lane_batch_size`,
+# tested case by case in the decision selftest; these assert the driver wires
+# them so that a red base cannot quietly become a green one.
+#
+# The failing set is the base-health read's own record, and an empty one halts
+# exactly as before: "passes what fails on the base" is vacuous against nothing.
+names_what_is_failing_on_a_red_base() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" "^    mapfile -t LANE_BASE_FAILING < <\(sed -n 's/\^failed //p' \"\\\$LANE_BASE_STATES\"\)$" || return 1
+  matches "$code" '^    if \[ "\$\{#LANE_BASE_FAILING\[@\]\}" -eq 0 \]; then$'
+}
+
+# Every candidate's verdict passes through the admission once the base is red.
+admits_only_the_base_fix_on_a_red_base() {
+  matches "$(code_of "$1")" '^      verdict="\$\(lane_base_fix_verdict "\$verdict" "\$red_behind" "\$fixed" "\$\{#LANE_BASE_FAILING\[@\]\}"\)"$'
+}
+
+# The candidate's own check read records its per-name states on a red base, and
+# only there — the fix test needs them, nothing else does.
+records_the_head_states_on_a_red_base() {
+  matches "$(code_of "$1")" '^    counts="\$\(LANE_STATE_SINK="\$\{LANE_BASE_RED:\+\$head_states\}" check_counts "\$sha"\)"$'
+}
+
+# "Contains the red tip" on a non-strict base is asked of the red SHA. The
+# branch name may have moved since the pass read it, and a candidate built on
+# the newer tip was not tested against the one that is red.
+compares_the_fix_against_the_red_tip() {
+  matches "$(code_of "$1")" "^          red_behind=\"\\\$\(gh api \"repos/\\\$R/compare/\\\$base_sha\.\.\.\\\$sha\" "
+}
+
+# A skipped check has not shown the break is gone; only a pass counts.
+only_a_pass_counts_as_fixing_the_base() {
+  matches "$(code_of "$1")" '^    \[ "\$\{seen\[\$name\]:-\}" = "success" \] && passed='
+}
+
+# Said at the merge, in the words an operator will search for.
+announces_the_base_fix() {
+  matches "$(code_of "$1")" '^      echo "::notice::lane: base is red; #\$action_num is green on .* — merging it as the base fix"$'
+}
+
+# The tip a base fix creates is seconds old and has not answered; a next pass
+# on it could read `inert` and merge on. So the run ends after the fix.
+ends_the_run_after_a_base_fix() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^    if \[ -n "\$LANE_BASE_RED" \]; then LANE_BASE_FIX_MERGED=1; fi$' || return 1
+  matches "$code" '^    if \[ -n "\$LANE_BASE_FIX_MERGED" \]; then$'
+}
+
 # THE BASE-HEALTH GATE READS ITS OWN LIST, AND FALLS BACK TO THE STRICT ONE.
 # `BASE_HEALTH_CHECKS` exists so a repository whose required suite takes half an
 # hour can arm the gate against a cheap post-merge job instead. Two things have
@@ -1458,7 +1513,7 @@ waits_for_the_tip_between_merges() {
 # it: the run loop calls `one_pass` again immediately, and a lane run triggered
 # seconds after another one's merge would walk straight past an unanswered tip.
 waits_for_the_tip_at_the_top_of_a_pass() {
-  matches "$(code_of "$1")" '^  if ! lane_base_is_vouched "\$base_sha" "\$base_at"; then$'
+  matches "$(code_of "$1")" '^  if \[ -z "\$LANE_BASE_RED" \] \&\& ! lane_base_is_vouched "\$base_sha" "\$base_at"; then$'
 }
 
 # THE WAIT IS BOUNDED, AND THAT IS NOT A CONVENIENCE. The job answering for the
@@ -1802,6 +1857,13 @@ check names_the_failing_status_check_refusal "$DRIVER" "a 405 saying a required 
 check halts_when_the_base_itself_is_red "$DRIVER" "the lane keeps merging onto a base whose own required checks are failing, burying the commit that broke it under everything that follows"
 check only_a_definite_failure_halts_the_lane "$DRIVER" "the base-health gate halts on something other than a definite failure, which deadlocks every repository whose required checks run on pull_request only"
 check says_on_the_snapshot_that_it_halted "$DRIVER" "a halted lane renders exactly like a base with nothing open, so the queue view reports a quiet day while nothing can merge"
+check names_what_is_failing_on_a_red_base "$DRIVER" "a red base does not record which checks fail on it, or admits a fix against an empty list, so any green pull request merges onto the break"
+check admits_only_the_base_fix_on_a_red_base "$DRIVER" "a red base no longer filters the walk, so every green pull request merges onto the break"
+check records_the_head_states_on_a_red_base "$DRIVER" "the candidate's check states are not recorded on a red base, so the fix test re-reads every head or counts nothing as passing"
+check compares_the_fix_against_the_red_tip "$DRIVER" "a non-strict base does not check the fix contains the red tip, so a green branch cut before the break merges as its fix"
+check only_a_pass_counts_as_fixing_the_base "$DRIVER" "a skipped check counts as fixing the base, so a pull request that never ran the failing job merges onto the break"
+check announces_the_base_fix "$DRIVER" "a merge onto a red base is not announced, so an operator cannot tell a base fix from the halt being broken"
+check ends_the_run_after_a_base_fix "$DRIVER" "the run carries on after a base fix, onto a tip whose health has not been reported"
 check reads_its_own_list_on_the_base_tip "$DRIVER" "the base-health gate reads the merge list instead of its own, so arming it costs a full required suite on every push to the base"
 check falls_back_to_the_required_list "$DRIVER" "an unset base-health list resolves to nothing rather than to the required checks, and a gate reading an empty list passes on a base that is on fire"
 check scopes_the_shadow_to_the_gate "$DRIVER" "the base-health list leaks out of the gate and becomes what the MERGE is gated on, which is invariant B ungated by the input meant to make the gate affordable"
@@ -2115,7 +2177,27 @@ mutate "the detail read goes back to a tab split" "$DRIVER" \
   reads_the_detail_without_collapsing_an_empty_field
 
 mutate "the batch stops asking whether the base allows it" "$DRIVER" \
-  's@^  if \[ "\$LANE_STRICT" = "0" \] && @  if @' batches_only_when_the_base_allows_it
+  's@lane_batch_size "\$LANE_STRICT"@lane_batch_size "0"@' batches_only_when_the_base_allows_it
+mutate "a red base with no named failure admits a fix anyway" "$DRIVER" \
+  's|"\${#LANE_BASE_FAILING\[@\]}" -eq 0 \]; then$|"${#LANE_BASE_FAILING[@]}" -lt 0 ]; then|' names_what_is_failing_on_a_red_base
+mutate "the failing set is read from the wrong file" "$DRIVER" \
+  "s@sed -n 's/^failed //p' \"\\\$LANE_BASE_STATES\"@sed -n 's/^failed //p' \"\$LANE_BASE_DIAG\"@" names_what_is_failing_on_a_red_base
+mutate "a red base stops filtering the walk" "$DRIVER" \
+  '/^      verdict="\$(lane_base_fix_verdict /d' admits_only_the_base_fix_on_a_red_base
+mutate "the head read stops recording states" "$DRIVER" \
+  's@LANE_STATE_SINK="\${LANE_BASE_RED:+\$head_states}" check_counts@check_counts@' records_the_head_states_on_a_red_base
+mutate "the fix is compared against the moving branch name" "$DRIVER" \
+  's@compare/\$base_sha\.\.\.\$sha" --jq .\.behind_by. 2>/dev/null || echo@compare/$LANE_BASE...$sha" --jq '"'"'.behind_by'"'"' 2>/dev/null || echo@' compares_the_fix_against_the_red_tip
+mutate "a skipped check counts as fixing the base" "$DRIVER" \
+  's@\[ "\${seen\[\$name\]:-}" = "success" \]@[ "${seen[$name]:-}" != "failed" ]@' only_a_pass_counts_as_fixing_the_base
+mutate "the base fix merges without a word" "$DRIVER" \
+  '/merging it as the base fix"$/d' announces_the_base_fix
+mutate "a base fix is not recorded" "$DRIVER" \
+  '/^    if \[ -n "\$LANE_BASE_RED" \]; then LANE_BASE_FIX_MERGED=1; fi$/d' ends_the_run_after_a_base_fix
+mutate "the run loop ignores a base fix" "$DRIVER" \
+  's@^    if \[ -n "\$LANE_BASE_FIX_MERGED" \]; then$@    if false; then@' ends_the_run_after_a_base_fix
+mutate "a red base batches like a green one" "$DRIVER" \
+  's@"\$acted" "\$LANE_BASE_RED")"$@"$acted" "")"@' batches_only_when_the_base_allows_it
 mutate "the batch stops honouring the pass deadline" "$DRIVER"   's@^      if lane_pass_expired @      if false \&\& lane_pass_expired @' stops_batching_at_the_pass_deadline
 mutate "the base-health gate is removed, so the lane merges onto a red base" "$DRIVER" \
   's@^  if lane_base_is_broken "\$base_sha"; then$@  if false; then@' halts_when_the_base_itself_is_red
@@ -2138,7 +2220,9 @@ mutate "the base-tip reading mode is set for the merge path too" "$DRIVER" \
 mutate "the batch stops re-reading the base between merges" "$DRIVER" \
   's@^        if ! lane_base_is_vouched "\$tip_now" "\$tip_at"; then$@        if false; then@' waits_for_the_tip_between_merges
 mutate "only the batch waits, and the next pass merges anyway" "$DRIVER" \
-  's@^  if ! lane_base_is_vouched "\$base_sha" "\$base_at"; then$@  if false; then@' waits_for_the_tip_at_the_top_of_a_pass
+  's@^  if \[ -z "\$LANE_BASE_RED" \] && ! lane_base_is_vouched "\$base_sha" "\$base_at"; then$@  if false; then@' waits_for_the_tip_at_the_top_of_a_pass
+mutate "a green base skips the wait as if it were red" "$DRIVER" \
+  's@^  if \[ -z "\$LANE_BASE_RED" \] && @  if [ -n "$LANE_BASE_RED" ] \&\& @' waits_for_the_tip_at_the_top_of_a_pass
 mutate "the wait for a base-health answer loses its ceiling" "$DRIVER" \
   's@^  if \[ "\$age" -ge "\$BASE_HEALTH_GRACE" \]; then$@  if false; then@' the_wait_for_an_answer_is_bounded
 mutate "the staleness window becomes on-by-default for the whole fleet" "$DRIVER" \
@@ -2984,6 +3068,35 @@ behavioural_check_counts_cases() {
     printf 'PASS %s\n' "#967 diagnostic: the line names the row retrieved, the state resolved and the holding suite"
   else
     printf 'FAIL #967 diagnostic: unexpected line [%s]\n' "$(tr '\n' ' ' <"$diag_file")"
+  fi
+
+  # #1443: THE PER-NAME RECORD A RED BASE AND ITS FIX ARE JUDGED ON. One line
+  # per required name, in the counts' own terms: a skip is recorded as a skip
+  # (the fix test must not count it as passing), and a cancelled run off the
+  # base tip is a failure, as it is in the counts.
+  local sink_file="$fix/states"
+  : >"$sink_file"
+  local suites1443 runs1443
+  suites1443="{\"check_suites\":[$(_bh_suite 1443 github-actions completed 2026-09-30T08:00:00Z)]}"
+  runs1443="{\"check_runs\":[$(_bh_run 'typecheck' completed '"success"' '"2026-09-30T08:05:00Z"' github-actions 1443),$(_bh_run 'test' completed '"failure"' '"2026-09-30T08:06:00Z"' github-actions 1443),$(_bh_run 'e2e' completed '"skipped"' '"2026-09-30T08:07:00Z"' github-actions 1443),$(_bh_run 'lint' completed '"cancelled"' '"2026-09-30T08:08:00Z"' github-actions 1443)]}"
+  # shellcheck disable=SC2034  # Read by the evalled check_counts.
+  local LANE_STATE_SINK="$sink_file"
+  case_ "#1443 state record: the counts are unchanged by recording" \
+    "2 0 2 0" "$(printf '%s\n' typecheck test e2e lint)" "$suites1443" "$runs1443"
+  # shellcheck disable=SC2034  # Read by the evalled check_counts.
+  LANE_STATE_SINK=''
+  if [ "$(tr '\n' '|' <"$sink_file")" = "success typecheck|failed test|skipped e2e|failed lint|" ]; then
+    printf 'PASS %s\n' "#1443 state record: one line per name, a skip kept apart from a pass"
+  else
+    printf 'FAIL #1443 state record: unexpected [%s]\n' "$(tr '\n' '|' <"$sink_file")"
+  fi
+  : >"$sink_file"
+  case_ "#1443 state record: nothing is written when no sink is set" \
+    "2 0 2 0" "$(printf '%s\n' typecheck test e2e lint)" "$suites1443" "$runs1443"
+  if [ -s "$sink_file" ]; then
+    printf 'FAIL %s\n' "#1443 state record: a read with no sink wrote one anyway"
+  else
+    printf 'PASS %s\n' "#1443 state record: a read with no sink writes nothing"
   fi
 
   rm -rf "$fix"
