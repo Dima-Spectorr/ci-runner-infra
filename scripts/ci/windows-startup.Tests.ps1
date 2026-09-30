@@ -1024,6 +1024,26 @@ Describe 'config.cmd start-only failure' {
     }
 }
 
+# An empty master is the first boot; a throw here left the cache unprepared (#898).
+Describe 'dependency cache size' {
+    It 'is 0 for an empty master' {
+        Set-StrictMode -Version Latest
+        $empty = Join-Path $TestDrive 'empty-master'
+        New-Item -ItemType Directory -Path $empty | Out-Null
+        Get-CacheMasterSize -Master $empty | Should -Be 0
+    }
+    It 'is 0 for a missing master' {
+        Get-CacheMasterSize -Master (Join-Path $TestDrive 'absent') | Should -Be 0
+    }
+    It 'sums nested files' {
+        $m = Join-Path $TestDrive 'master'
+        New-Item -ItemType Directory -Path (Join-Path $m 'a') -Force | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $m 'x'), [byte[]]::new(3))
+        [System.IO.File]::WriteAllBytes((Join-Path $m 'a/y'), [byte[]]::new(4))
+        Get-CacheMasterSize -Master $m | Should -Be 7
+    }
+}
+
 # The runner exits 1 unless it can list every directory above its root, and the
 # SCM reports that as "Incorrect function" (#898). These are the directories the
 # slot is granted list-only on, so an off-by-one here is either a runner that
