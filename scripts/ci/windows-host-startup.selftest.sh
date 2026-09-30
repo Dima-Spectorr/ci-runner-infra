@@ -502,8 +502,9 @@ has_profile_template_before_registration() { # <file>
   # rebuilt it into the same failure each time.
   matches "$code" 'Wait-SlotHiveUnloaded -Sid \$sid -TimeoutSeconds \$script:ProfileHiveUnloadSeconds' || return 1
   # HKU losing the SID is the test, because nothing else distinguishes a stopped
-  # service from a released hive.
-  matches "$code" 'Test-Path -LiteralPath "Registry::HKEY_USERS\\\$Sid"' || return 1
+  # service from a released hive -- read from HKU's names, never by opening the
+  # SID's own key (see the #898 lines below).
+  matches "$code" 'Registry\]::Users\.GetSubKeyNames\(\) -notcontains \$Sid\) \{ return \$true \}' || return 1
   # Fatal, like the other two failures here. A template captured without
   # NTUSER.DAT is a template that restores everything except the one file that
   # carries what a job left in HKCU.
@@ -531,7 +532,11 @@ has_profile_template_before_registration() { # <file>
   # held it.
   matches "$code" '        Invoke-SlotHiveRelease -Sid \$sid -Index \$Index' || return 1
   matches "$code" '& reg\.exe unload "HKU\\\$name" 2>&1' || return 1
-  matches "$code" "ProviderName = 'Microsoft-Windows-User Profile Service'" || return 1
+  matches "$code" "Where-Object \{ \\\$_\.ProviderName -like '\*User Profile\*' \}" || return 1
+  # #898, the second live boot: an open key in the hive is what keeps it
+  # loaded, so nothing here may ask about a slot's hive by opening it.
+  ! matches "$code" 'Registry::HKEY_USERS' || return 1
+  matches "$code" '\[GC\]::WaitForPendingFinalizers\(\)' || return 1
 
   # BEFORE the copy, which is the whole point -- a wait that runs afterwards
   # observes the failure it exists to prevent. And the quiesce before the wait,
@@ -1584,7 +1589,7 @@ mutate "a hive that never unloads allowed to boot anyway" \
   "s|Deny-Boot (\"slot \\\$Index's profile hive is still loaded|Write-BootLog (\"slot \$Index's profile hive is still loaded|" \
   has_profile_template_before_registration
 mutate "the wait made unconditional, so it waits for nothing" \
-  's|if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\\\$Sid")) { return \$true }|return $true|' \
+  's|if (\[Microsoft\.Win32\.Registry\]::Users\.GetSubKeyNames() -notcontains \$Sid) { return \$true }|return $true|' \
   has_profile_template_before_registration
 mutate "the hive waited for but never released" \
   's|    Invoke-BootSlotQuiesce -Sid \$sid -Index \$Index|    # quiesce removed|' \
@@ -1597,6 +1602,12 @@ mutate "a held hive waited on but never unloaded (#898)" \
   has_profile_template_before_registration
 mutate "the release that unloads nothing" \
   's|& reg\.exe unload "HKU\\\$name" 2>&1|$null|' \
+  has_profile_template_before_registration
+mutate "a hive wait that holds the hive open itself (#898)" \
+  's|\[Microsoft\.Win32\.Registry\]::Users\.GetSubKeyNames() -notcontains \$Sid|Test-Path -LiteralPath "Registry::HKEY_USERS\\\$Sid"|' \
+  has_profile_template_before_registration
+mutate "an unload that asks before this process lets go" \
+  's|\[GC\]::WaitForPendingFinalizers()|$null|' \
   has_profile_template_before_registration
 
 # 4. The broker regresses to the Linux shape, or to checking the daemon.

@@ -1555,7 +1555,9 @@ function Invoke-SlotQuiesce {
 
 # NTUSER.DAT is held open for as long as anything runs as the account, and there
 # is no supported way to replace a loaded hive underneath a live session. HKU
-# losing the SID is how the host says the session is gone.
+# losing the SID is how the host says the session is gone. Asked by listing
+# HKU's names, never by opening the SID's key: an open key is exactly what keeps
+# a hive loaded (#898).
 function Wait-HiveUnloaded {
     param(
         [Parameter(Mandatory = $true)][string] $Sid,
@@ -1563,7 +1565,7 @@ function Wait-HiveUnloaded {
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ($true) {
-        if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$Sid")) { return $true }
+        if ([Microsoft.Win32.Registry]::Users.GetSubKeyNames() -notcontains $Sid) { return $true }
         if ((Get-Date) -ge $deadline) { return $false }
         Start-Sleep -Seconds 1
     }
@@ -1578,10 +1580,14 @@ function Invoke-HiveRelease {
         [Parameter(Mandatory = $true)][string] $Sid,
         [Parameter(Mandatory = $true)][int] $Index
     )
+    # Whatever this process may still hold in the hive, released first -- see
+    # Invoke-SlotHiveRelease in the boot script.
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     foreach ($name in @("$($Sid)_Classes", $Sid)) {
-        if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$name")) { continue }
+        if ([Microsoft.Win32.Registry]::Users.GetSubKeyNames() -notcontains $name) { continue }
         $out = & reg.exe unload "HKU\$name" 2>&1
         $code = $LASTEXITCODE
         Write-ResetLog ("slot $Index -- reg unload HKU\$name exit $code -- " + ((@($out) -join ' ') -replace '\s+', ' '))
@@ -6301,7 +6307,7 @@ function Wait-SlotHiveUnloaded {
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ($true) {
-        if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$Sid")) { return $true }
+        if ([Microsoft.Win32.Registry]::Users.GetSubKeyNames() -notcontains $Sid) { return $true }
         if ((Get-Date) -ge $deadline) { return $false }
         Start-Sleep -Seconds 1
     }
@@ -6334,12 +6340,15 @@ function Invoke-SlotHiveRelease {
         [Parameter(Mandatory = $true)][string] $Sid,
         [Parameter(Mandatory = $true)][int] $Index
     )
+    # By log and time, then by name: the provider is registered as
+    # 'Microsoft-Windows-User Profiles Service' and displayed as 'User Profile
+    # Service', and a filter spelled the second way matched nothing on the first
+    # live boot of this fix.
     $events = @()
     try {
-        $events = @(Get-WinEvent -MaxEvents 10 -ErrorAction Stop -FilterHashtable @{
-                LogName = 'Application'; ProviderName = 'Microsoft-Windows-User Profile Service'
-                StartTime = (Get-Date).AddMinutes(-15)
-            })
+        $events = @(Get-WinEvent -MaxEvents 200 -ErrorAction Stop -FilterHashtable @{
+                LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-15)
+            } | Where-Object { $_.ProviderName -like '*User Profile*' } | Select-Object -First 10)
     } catch { $null = $_ }
     foreach ($e in $events) {
         $text = ([string] $e.Message) -replace '\s+', ' '
@@ -6353,11 +6362,21 @@ function Invoke-SlotHiveRelease {
     } catch { $null = $_ }
     Write-BootLog "phase 4: slot $Index's hive is still loaded (ProfileList RefCount=$refCount) -- unloading it"
 
+    # The second live boot of this fix: `reg unload` as SYSTEM said "Access is
+    # denied" -- open keys in the hive -- with nothing running as the slot. The
+    # likeliest holder was THIS process: the wait asked Test-Path on
+    # Registry::HKEY_USERS\<sid> once a second, and each ask can leave a key
+    # handle open until the collector finalizes it. The waits now list HKU's
+    # names instead and never open the slot's key; this collects whatever an
+    # earlier phase may still hold before asking for the unload.
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+
     # Continue around the native call, for the reason in Install-BeaconService.
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     foreach ($name in @("$($Sid)_Classes", $Sid)) {
-        if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$name")) { continue }
+        if ([Microsoft.Win32.Registry]::Users.GetSubKeyNames() -notcontains $name) { continue }
         $out = & reg.exe unload "HKU\$name" 2>&1
         $code = $LASTEXITCODE
         Write-BootLog ("phase 4: reg unload HKU\$name exit $code -- " + ((@($out) -join ' ') -replace '\s+', ' '))
