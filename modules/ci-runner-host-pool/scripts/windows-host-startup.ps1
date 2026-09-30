@@ -189,9 +189,15 @@ $script:ProfileTemplateSeconds = 600
 # violation on the hive, exit 9, and a denied boot on every single boot of that
 # host for six days.
 #
-# Generous, because nothing is waiting on it and the cost of being short is a
-# host that never registers.
-$script:ProfileHiveUnloadSeconds = 120
+# NOT generous any more, because waiting was never the fix. Measured on
+# IntegrateIT 2026-09-11 and again 2026-09-29 (#898): quiesce finds no process
+# left as the slot, and the hive is STILL loaded 120s later, on every boot. The
+# User Profile Service does not release a service-logon profile on its own
+# schedule; it does not release it at all. So the wait covers only a genuinely
+# slow unload, and a hive still loaded after it is unloaded by
+# Invoke-SlotHiveRelease, with its own short bound below.
+$script:ProfileHiveUnloadSeconds = 30
+$script:ProfileHiveReleaseSeconds = 15
 
 # The bound on every RESTORE afterwards, and it is deliberately much shorter than
 # the capture's. THE RESET SERVICE SERVES EVERY SLOT FROM ONE SERIAL LOOP, so
@@ -1563,6 +1569,26 @@ function Wait-HiveUnloaded {
     }
 }
 
+# The boot path's Invoke-SlotHiveRelease, for the same reason (#898): with no
+# process left as the slot, the profile service still holds the hive and never
+# lets go. `reg unload` refuses a hive with open keys, so a real holder stays a
+# failed reset rather than a pulled hive.
+function Invoke-HiveRelease {
+    param(
+        [Parameter(Mandatory = $true)][string] $Sid,
+        [Parameter(Mandatory = $true)][int] $Index
+    )
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    foreach ($name in @("$($Sid)_Classes", $Sid)) {
+        if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$name")) { continue }
+        $out = & reg.exe unload "HKU\$name" 2>&1
+        $code = $LASTEXITCODE
+        Write-ResetLog ("slot $Index -- reg unload HKU\$name exit $code -- " + ((@($out) -join ' ') -replace '\s+', ' '))
+    }
+    $ErrorActionPreference = $previous
+}
+
 # /MIR, because the claim is "nothing of the last job survives" and a copy that
 # only adds is a copy that keeps whatever was added. /COPY:DAT and not :DATS: the
 # destination is the live profile and its ACL is the host's, not the template's.
@@ -1659,8 +1685,11 @@ function Invoke-SlotReset {
         return
     }
     if (-not (Wait-HiveUnloaded -Sid $sid -TimeoutSeconds $QuiesceWaitSeconds)) {
-        Write-ResetLog "slot $Index -- the profile hive did not unload, so nothing was replaced"
-        return
+        Invoke-HiveRelease -Sid $sid -Index $Index
+        if (-not (Wait-HiveUnloaded -Sid $sid -TimeoutSeconds 15)) {
+            Write-ResetLog "slot $Index -- the profile hive did not unload, even forced, so nothing was replaced"
+            return
+        }
     }
     if (-not (Copy-ProfileTree -Source $template -Destination $profileDir)) {
         Write-ResetLog "slot $Index -- robocopy could not restore $profileDir from $template"
@@ -6278,6 +6307,64 @@ function Wait-SlotHiveUnloaded {
     }
 }
 
+function Invoke-SlotHiveRelease {
+    <#
+      .SYNOPSIS
+        Unload a slot hive nothing is using any more, and SAY WHAT HELD IT.
+      .DESCRIPTION
+        THE WAIT ALONE NEVER WORKED ON A REAL HOST. #898: probe service deleted,
+        quiesce clean, and HKU\<sid> still present 120s later on every boot of
+        both IntegrateIT Windows hosts for eighteen days. The service-logon
+        profile keeps a reference in the User Profile Service after the service
+        is gone, and nothing on this host drops it.
+
+        So this unloads it as SYSTEM, `_Classes` first because it is mounted
+        after NTUSER.DAT and holds nothing of it. `reg unload` refuses a hive
+        that still has open keys, so this cannot pull a hive out from under a
+        live process -- a real holder turns into a logged refusal and the
+        caller's denial, as before.
+
+        EVIDENCE FIRST. The profile service's own events name the process
+        holding the hive (1530 lists it), and RefCount says whether the service
+        still counts a user. Both are logged whether or not the unload works,
+        so the boot log carries the cause, not only the outcome.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Sid,
+        [Parameter(Mandatory = $true)][int] $Index
+    )
+    $events = @()
+    try {
+        $events = @(Get-WinEvent -MaxEvents 10 -ErrorAction Stop -FilterHashtable @{
+                LogName = 'Application'; ProviderName = 'Microsoft-Windows-User Profile Service'
+                StartTime = (Get-Date).AddMinutes(-15)
+            })
+    } catch { $null = $_ }
+    foreach ($e in $events) {
+        $text = ([string] $e.Message) -replace '\s+', ' '
+        if ($text.Length -gt 600) { $text = $text.Substring(0, 600) }
+        Write-BootLog "phase 4: User Profile Service event $($e.Id): $text"
+    }
+    $refCount = 'absent'
+    try {
+        $refCount = [string] (Get-ItemProperty -ErrorAction Stop -Name 'RefCount' `
+                -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$Sid").RefCount
+    } catch { $null = $_ }
+    Write-BootLog "phase 4: slot $Index's hive is still loaded (ProfileList RefCount=$refCount) -- unloading it"
+
+    # Continue around the native call, for the reason in Install-BeaconService.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    foreach ($name in @("$($Sid)_Classes", $Sid)) {
+        if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$name")) { continue }
+        $out = & reg.exe unload "HKU\$name" 2>&1
+        $code = $LASTEXITCODE
+        Write-BootLog ("phase 4: reg unload HKU\$name exit $code -- " + ((@($out) -join ' ') -replace '\s+', ' '))
+    }
+    $ErrorActionPreference = $previous
+}
+
 function Save-SlotProfileTemplate {
     <#
       .SYNOPSIS
@@ -6352,11 +6439,17 @@ function Save-SlotProfileTemplate {
     Invoke-BootSlotQuiesce -Sid $sid -Index $Index
 
     if (-not (Wait-SlotHiveUnloaded -Sid $sid -TimeoutSeconds $script:ProfileHiveUnloadSeconds)) {
-        Deny-Boot ("slot $Index's profile hive is still loaded at HKU\$sid after " +
-            "$($script:ProfileHiveUnloadSeconds)s -- NTUSER.DAT cannot be copied out from " +
-            'under a live session, so the template would be missing the one file that carries ' +
-            'what a job left in HKCU. The quiesce lines above this one say what was still ' +
-            'running as the slot, or that nothing was')
+        # Nothing runs as the slot any more (the quiesce said so), so the hive is
+        # held by the profile service's own reference, and no amount of waiting
+        # ends that. Unload it, and deny only if even that fails.
+        Invoke-SlotHiveRelease -Sid $sid -Index $Index
+        if (-not (Wait-SlotHiveUnloaded -Sid $sid -TimeoutSeconds $script:ProfileHiveReleaseSeconds)) {
+            Deny-Boot ("slot $Index's profile hive is still loaded at HKU\$sid after " +
+                "$($script:ProfileHiveUnloadSeconds)s and a forced unload -- NTUSER.DAT cannot be " +
+                'copied out from under a live session, so the template would be missing the one ' +
+                'file that carries what a job left in HKCU. The quiesce and release lines above ' +
+                'this one say what was still running as the slot and what held the hive')
+        }
     }
 
     New-Item -ItemType Directory -Force -Path $script:ProfileTemplateRoot | Out-Null

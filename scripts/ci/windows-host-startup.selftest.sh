@@ -522,6 +522,17 @@ has_profile_template_before_registration() { # <file>
   # evidence the NEXT investigation needs if the hive is still held afterwards.
   matches "$code" 'has no process of its own left to quiesce' || return 1
 
+  # AND A HIVE NOTHING RUNS UNDER IS UNLOADED, NOT WAITED ON (#898)
+  #
+  # Measured on IntegrateIT 2026-09-11 and 2026-09-29: quiesce clean, hive still
+  # loaded 120s later, every boot for eighteen days. The profile service holds a
+  # service-logon hive and never lets go, so the boot path unloads it itself --
+  # after the wait, before the denial -- and logs what the profile service says
+  # held it.
+  matches "$code" '        Invoke-SlotHiveRelease -Sid \$sid -Index \$Index' || return 1
+  matches "$code" '& reg\.exe unload "HKU\\\$name" 2>&1' || return 1
+  matches "$code" "ProviderName = 'Microsoft-Windows-User Profile Service'" || return 1
+
   # BEFORE the copy, which is the whole point -- a wait that runs afterwards
   # observes the failure it exists to prevent. And the quiesce before the wait,
   # for the same reason: waiting for a condition nothing will bring about is
@@ -1580,6 +1591,12 @@ mutate "the hive waited for but never released" \
   has_profile_template_before_registration
 mutate "a quiesce that finds nothing and says nothing" \
   's|has no process of its own left to quiesce|found nothing|' \
+  has_profile_template_before_registration
+mutate "a held hive waited on but never unloaded (#898)" \
+  's|        Invoke-SlotHiveRelease -Sid \$sid -Index \$Index|        # release removed|' \
+  has_profile_template_before_registration
+mutate "the release that unloads nothing" \
+  's|& reg\.exe unload "HKU\\\$name" 2>&1|$null|' \
   has_profile_template_before_registration
 
 # 4. The broker regresses to the Linux shape, or to checking the daemon.
