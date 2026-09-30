@@ -501,6 +501,22 @@ $script:ServiceStopSeconds = 60
 # one that would have taken the queued job. That is the 2h55m outage, restated.
 $script:HttpTimeoutSeconds = 10
 
+# Pauses between attempts at phase 0's first guest-attribute write: five
+# attempts, 30s of sleep, at most 80s with every attempt timing out. #898: a
+# host that had passed phase 0 an hour earlier died on this ONE write, ~50ms
+# after the beacon service started, and refused to serve over what may be a
+# transient -- a single attempt cannot tell a hiccup from a closed path. Still
+# bounded: a path that is really closed must fail the boot, not stall it.
+$script:BootAttributeBackoffSeconds = @(2, 4, 8, 16)
+
+# The metadata server's answer when constraints/compute.disableGuestAttributesAccess
+# is enforced on the project (seen 2026-09-30 on a pool project: effective, inherited).
+# Measured on a GCE guest: PUT .../guest-attributes/... -> (403) Forbidden,
+# "Guest attributes endpoint access is disabled." No retry can succeed, and the
+# controller already has a mode for it -- controller-startup.sh judges such a
+# host on registration and age alone -- so phase 0 continues instead of denying.
+$script:GuestAttributesDisabledPattern = 'Guest attributes endpoint access is disabled'
+
 function Write-BootLog {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Message)
@@ -549,6 +565,52 @@ function Deny-Boot {
 # it on ubuntu-latest (scripts/ci/windows-startup.Tests.ps1). A gate that READS
 # code is not a test -- v5.1.4 passed every gate in ci.yml while every
 # controller in the fleet died on its first tick.
+
+function Publish-BootAttribute {
+    <#
+      .SYNOPSIS
+        Run phase 0's first guest-attribute write with a bounded retry, logging
+        WHY each failed attempt failed to the boot log. Returns $true on success.
+      .DESCRIPTION
+        $Write is called with one [ref] argument it must fill with the failure
+        reason and returns $true on success. Writer and sleeper are parameters
+        so the retry is tested without a metadata server or a clock.
+
+        The reasons go to Write-BootLog, i.e. the serial console, because the
+        writer's own record (the Windows event log) is invisible from outside
+        the host -- #898 was a boot denied with no reason anyone could read.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][scriptblock] $Write,
+        [AllowEmptyCollection()][int[]] $BackoffSeconds = $script:BootAttributeBackoffSeconds,
+        [scriptblock] $Sleep = { param([int] $Seconds) Start-Sleep -Seconds $Seconds },
+        # Set to $true when the refusal is the org policy's (see
+        # GuestAttributesDisabledPattern): no retry can succeed, so the loop
+        # stops at the first such answer.
+        [ref] $PolicyDisabled
+    )
+    if ($PolicyDisabled) { $PolicyDisabled.Value = $false }
+    $attempts = @($BackoffSeconds).Count + 1
+    for ($i = 1; $i -le $attempts; $i++) {
+        $reason = [ref] ''
+        $ok = & $Write $reason
+        if ($ok -is [bool] -and $ok) {
+            if ($i -gt 1) { Write-BootLog "phase 0: ci/boot write succeeded on attempt $i of $attempts" }
+            return $true
+        }
+        $why = [string] $reason.Value
+        if ([string]::IsNullOrWhiteSpace($why)) { $why = 'no reason reported by the writer' }
+        Write-BootLog "phase 0: ci/boot write attempt $i of $attempts failed: $why"
+        if ($why -match $script:GuestAttributesDisabledPattern) {
+            if ($PolicyDisabled) { $PolicyDisabled.Value = $true }
+            return $false
+        }
+        if ($i -lt $attempts) { & $Sleep $BackoffSeconds[$i - 1] }
+    }
+    return $false
+}
 
 function Test-ImageVersion {
     <#
@@ -3804,10 +3866,27 @@ function Invoke-Phase0Preflight {
     # at all on this instance -- and it is deliberately NOT delegated to the
     # service, whose own first write happens on its own schedule and whose
     # failure this process would never see.
+    #
+    # Retried, and every failed attempt's reason is on the serial console before
+    # Deny-Boot: see Publish-BootAttribute and #898. The scriptblock is NOT a
+    # closure -- GetNewClosure() would bind it to a dynamic module where the
+    # dot-sourced Write-GuestAttribute is not visible.
     . $beaconPath
-    if (-not (Write-GuestAttribute -Key 'boot' -Value (Get-BeaconTimestamp) -TimeoutSeconds $script:HttpTimeoutSeconds)) {
-        Deny-Boot ('the first guest-attribute write failed -- this host could never be safely ' +
-            'deleted, so it refuses to serve')
+    $policyDisabled = $false
+    $published = Publish-BootAttribute -PolicyDisabled ([ref] $policyDisabled) -Write {
+        param([ref] $Reason)
+        Write-GuestAttribute -Key 'boot' -Value (Get-BeaconTimestamp) -TimeoutSeconds $script:HttpTimeoutSeconds -FailureReason $Reason
+    }
+    if (-not $published -and $policyDisabled) {
+        # The controller's documented degraded mode, not a broken path: it
+        # judges this host on registration and age alone.
+        Write-BootLog ('phase 0: guest attributes are disabled by org policy -- no beacon ' +
+            'can be published; continuing, the controller judges this host on registration and age alone')
+        return $cfg
+    }
+    if (-not $published) {
+        Deny-Boot ('the first guest-attribute write failed on every attempt (reasons above) -- ' +
+            'this host could never be safely deleted, so it refuses to serve')
     }
     Write-BootLog 'phase 0: ci/boot published'
 
