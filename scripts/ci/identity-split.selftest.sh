@@ -330,6 +330,20 @@ else
   bad "nothing refuses controller_service_account_email = this pool's host account — that is the collapse create_controller_service_account rejects, reached by a route with no check on it"
 fi
 
+# 21. On Windows the controller writes the registration token onto the host,
+#     and setMetadata checks actAs on the host's account (#898). SA-scoped to
+#     this pool's host account, windows only, bound to the controller — never
+#     project-level, never on a linux pool.
+actas="$(block '^resource "google_service_account_iam_member" "controller_acts_as_windows_host"' "$IDENTITY/main.tf")"
+if matches "$actas" '^  count              = var\.host_os == "windows" \? 1 : 0' &&
+   matches "$actas" 'service_account_id = google_service_account\.runner\.name' &&
+   matches "$actas" 'role               = "roles/iam\.serviceAccountUser"' &&
+   matches "$actas" 'member             = "serviceAccount:\$\{local\.controller_email\}"'; then
+  ok "the controller may act as the Windows host account, and only that one"
+else
+  bad "the controller cannot act as the Windows host account (or the grant is broader) — every registration-token write is refused and the host denies boot at phase 5"
+fi
+
 if [ "$fail" -eq 0 ]; then
   echo "  identity split intact."
 else
