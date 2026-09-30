@@ -7355,7 +7355,22 @@ function Register-SlotAgent {
     Clear-ServiceRecoveryAction -ServiceName $serviceName -AgentName $name
     Grant-ServiceLogonAccount -ServiceName $serviceName -Credential $Slot.Credential
 
-    Start-Service -Name $serviceName -ErrorAction Stop
+    # A refused start used to reach the boot log as Start-Service's own sentence,
+    # "Failed to start service", which is every cause at once. The innermost
+    # exception carries the Win32 reason (1069 is a logon failure), and the SCM
+    # records the same refusal in the System log with the account it tried.
+    try {
+        Start-Service -Name $serviceName -ErrorAction Stop
+    } catch {
+        $inner = $_.Exception
+        while ($inner.InnerException) { $inner = $inner.InnerException }
+        $code = if ($inner -is [System.ComponentModel.Win32Exception]) { " win32=$($inner.NativeErrorCode)" } else { '' }
+        Write-BootLog "slot $($Slot.Index): $serviceName would not start --$code $($inner.Message)"
+        Write-EventDiagnostic -LogName 'System' -Provider 'Service Control Manager' `
+            -Since (Get-Date).AddMinutes(-10) -Prefix "slot $($Slot.Index) start diag: scm" `
+            -Pattern ([regex]::Escape($name) + '|\\' + [regex]::Escape($Slot.User) + '\b') -Max 10
+        Deny-Boot "slot $($Slot.Index): $serviceName would not start under $($Slot.User) --$code $($inner.Message)"
+    }
     $svc = Get-Service -Name $serviceName -ErrorAction Stop
     if ($svc.Status -ne 'Running') {
         Deny-Boot "slot $($Slot.Index): $serviceName is '$($svc.Status)', not Running"
