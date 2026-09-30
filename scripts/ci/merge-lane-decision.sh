@@ -321,6 +321,94 @@ lane_rank() {
 }
 
 # ---------------------------------------------------------------------------
+# lane_base_fix_verdict — on a RED base, may this candidate merge anyway? (#1443)
+#
+#   lane_base_fix_verdict <verdict> <behind> <fixed> <failing>
+#
+# A base whose base-health checks are FAILING halts the lane, because the next
+# merge would bury the commit that broke it. Halting EVERYTHING also blocks the
+# one pull request that would clear it: on DataRetrival, 2026-09-30, the hotfix
+# was green on every required check and the lane refused it on every pass for
+# two hours, until a human merged it by hand.
+#
+# So exactly one kind of pull request passes a red base, and only when all of
+# these hold:
+#
+#   a. <verdict> is `merge` — every required check is green on the head. The
+#      verdict comes from `lane_verdict`, so this is the same test as any merge.
+#   b. <behind> is 0 — the head CONTAINS the red tip. Its green was earned
+#      against the break, not against an older base that never had it.
+#   c. <fixed> of <failing> — every check failing on the base PASSED on this
+#      head (`success`; a skip is not a demonstration). A pull request that
+#      merely does not touch the break is still green there, and landing it
+#      would be the burial the halt exists to prevent.
+#
+# `update` and `drop` are held exactly as the halt held them before: they are
+# actions too, and nothing but a demonstrated fix acts on a red base. Every
+# other verdict (`skip`, `wait`) acts on nothing already, and passes through
+# unchanged so the queue keeps its more specific reason.
+#
+# Unparseable numbers fail CLOSED: an unread comparison is not "up to date",
+# and an unread check is not "passed".
+# ---------------------------------------------------------------------------
+lane_base_fix_verdict() {
+  local verdict="${1:-}" behind="${2:-}" fixed="${3:-}" failing="${4:-}"
+
+  case "${verdict%%:*}" in
+    merge) ;;
+    update | drop)
+      echo "wait:base-red holds ${verdict%% *}"
+      return 0
+      ;;
+    *)
+      echo "$verdict"
+      return 0
+      ;;
+  esac
+
+  if ! [[ "$behind" =~ ^[0-9]+$ ]] || [ "$behind" -gt 0 ]; then
+    echo "wait:base-red behind=${behind:-unknown} — does not contain the red tip"
+    return 0
+  fi
+
+  if ! [[ "$fixed" =~ ^[0-9]+$ ]] || ! [[ "$failing" =~ ^[0-9]+$ ]] \
+    || [ "$failing" -eq 0 ] || [ "$fixed" -lt "$failing" ]; then
+    echo "wait:base-red fixes=${fixed:-?}/${failing:-?} — does not pass what is failing on the base"
+    return 0
+  fi
+
+  echo "merge:base-fix fixes=$fixed/$failing"
+}
+
+# ---------------------------------------------------------------------------
+# lane_batch_size — how many of one pass's ranking the lane may act on.
+#
+#   lane_batch_size <strict> <max_actions> <acted> <base_red>
+#
+# One, normally: a merge moves the base, and on a strict base that invalidates
+# every `behind_by` the pass computed. On a NON-strict base a merge cannot make
+# another pull request's checks less green, so the pass may drain up to the
+# run's remaining `max_actions` — see the batch in `merge-lane.sh`.
+#
+# A RED base is one, always (#1443). The pass merges the base fix and stops, and
+# the next pass re-reads the base's health before anything else lands. Two
+# "fixes" in one batch is two merges onto a base nothing has re-read.
+# ---------------------------------------------------------------------------
+lane_batch_size() {
+  local strict="${1:-1}" max="${2:-1}" acted="${3:-0}" red="${4:-}"
+  if [ -n "$red" ]; then
+    echo 1
+    return 0
+  fi
+  if [ "$strict" = "0" ] && [[ "$max" =~ ^[0-9]+$ ]] && [[ "$acted" =~ ^[0-9]+$ ]] \
+    && [ "$max" -gt "$acted" ]; then
+    echo $((max - acted))
+    return 0
+  fi
+  echo 1
+}
+
+# ---------------------------------------------------------------------------
 # lane_pass_expired — has this pass spent its walking budget?
 #
 #   lane_pass_expired <started_epoch> <budget_seconds> <now_epoch>

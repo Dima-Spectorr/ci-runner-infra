@@ -63,6 +63,13 @@ WORKFLOW_WARN_ONCE="$LANE_TMP/workflow-lineage-warned"
 # only when the verdict is not `healthy` (#967). A file for the same reason the
 # warn-once markers are files.
 LANE_BASE_DIAG="$LANE_TMP/base-health-read"
+# The same read, as `<bucket> <name>` per base-health name, so a red base can
+# say WHICH checks failed (#1443). Read once, straight after the tip's verdict.
+LANE_BASE_STATES="$LANE_TMP/base-health-states"
+# Set for the pass when the base is red: the names failing on it, and the flag
+# that turns the halt into "only a demonstrated fix merges".
+LANE_BASE_RED=''
+LANE_BASE_FAILING=()
 
 # ---------------------------------------------------------------------------
 # THE APP QUOTA IS SHARED, SO THE LANE COUNTS WHAT IT SPENDS AND STOPS SHORT.
@@ -933,6 +940,21 @@ check_counts() {
       # something different from one that never needed to run.
       *) failed=$((failed + 1)) ;;
     esac
+    # PER NAME, FOR THE ONE CALLER THAT NEEDS NAMES (#1443). The counts cannot
+    # say WHICH check failed on a red base, nor whether a candidate's copy of
+    # it PASSED — as opposed to skipped. A file, because this function runs in
+    # a subshell. Unset for every other read, and dynamically scoped like
+    # `REQUIRED`. `failed` is the same condition the counts use, so the
+    # base's failing set is exactly what made it red.
+    if [ -n "${LANE_STATE_SINK:-}" ]; then
+      local bucket="$state"
+      case "$state" in
+        success | skipped | pending | queued | in_progress | absent) ;;
+        cancelled | stale) [ "${BASE_TIP_READ:-0}" = "1" ] && bucket=pending || bucket=failed ;;
+        *) bucket=failed ;;
+      esac
+      printf '%s %s\n' "$bucket" "$name" >>"$LANE_STATE_SINK"
+    fi
   done
   if [ "${#were_skipped[@]}" -gt 0 ]; then
     echo "lane: $sha — required and SKIPPED, counted as passing: $(
@@ -1323,6 +1345,9 @@ lane_base_is_broken() {
   # consecutive cancellations that made this necessary.
   local BASE_TIP_READ=1
   : >"$LANE_BASE_DIAG"
+  # Which names failed, for the base-fix admission (#1443).
+  local LANE_STATE_SINK="$LANE_BASE_STATES"
+  : >"$LANE_BASE_STATES"
   counts="$(check_counts "$base_sha")"
   read -r green missing failed pending <<<"$counts"
   # Classified from the same counts, and ordered by which fact outranks which.
@@ -1568,15 +1593,32 @@ one_pass() {
   # hundred pull requests to decide that would be a hundred calls spent on an
   # answer already known — and the snapshot still renders, carrying the reason.
   LANE_HALT_REASON=''
+  LANE_BASE_RED=''
+  LANE_BASE_FAILING=()
   # Read once, and BOTH answers taken from it: whether to halt, and whether
   # anything answers for this base at all. The second is what the batch consults
   # after each merge, and it has to be decided here — on a tip old enough for a
   # post-merge run to exist — rather than against the seconds-old tip a merge
   # just created. `broken` counts as armed: something is plainly reporting.
+  #
+  # A RED BASE HALTS EVERYTHING BUT ITS OWN FIX (#1443). Halting outright also
+  # refused the one pull request that would clear the break — DataRetrival,
+  # 2026-09-30, two hours with a green hotfix waiting until a human merged it.
+  # So the walk still runs, and admits only a candidate `lane_base_fix_verdict`
+  # accepts: green, built on this red tip, and passing what fails on it. Only
+  # when the read cannot NAME a failing check does the pass stop here as before
+  # — "passes what is failing" means nothing against an empty list.
   if lane_base_is_broken "$base_sha"; then
     LANE_HALT_REASON="a required check is FAILING on the tip of $LANE_BASE ($base_sha)"
     echo "::warning::lane: not merging — $LANE_HALT_REASON. Merging onto a base that is already red buries the commit that broke it. Fix the base, or re-run its checks if the failure was infrastructure; the lane resumes on its own once they pass."
-    return 1
+    mapfile -t LANE_BASE_FAILING < <(sed -n 's/^failed //p' "$LANE_BASE_STATES")
+    if [ "${#LANE_BASE_FAILING[@]}" -eq 0 ]; then
+      return 1
+    fi
+    LANE_BASE_RED=1
+    local failing_list
+    failing_list="$(IFS=,; echo "${LANE_BASE_FAILING[*]}")"
+    echo "lane: base is red on ${failing_list//,/, } — reading the queue for a pull request that fixes it; nothing else merges"
   fi
 
   # Taken from the read that just happened, and taken HERE rather than against
@@ -1594,7 +1636,11 @@ one_pass() {
   # triggered seconds after another one's merge would otherwise walk straight
   # past a tip whose health nobody has reported yet.
   LANE_BASE_JUST_READ="$base_sha"
-  if ! lane_base_is_vouched "$base_sha" "$base_at"; then
+  # A red tip has answered — red — and is handled by the admission above, so
+  # it is not waited on as if it were silent.
+  if [ -n "$LANE_BASE_RED" ]; then
+    :
+  elif ! lane_base_is_vouched "$base_sha" "$base_at"; then
     LANE_HALT_REASON="the base-health check on the tip of $LANE_BASE ($base_sha) is '$LANE_BASE_VERDICT' — waiting for it to answer"
     echo "::notice::lane: $LANE_HALT_REASON. Something answers for this base and has not yet answered for this commit; merging now would stack onto a tip nothing has vouched for. The lane resumes on its own, and proceeds regardless after ${BASE_HEALTH_GRACE}s."
     return 1
@@ -1890,8 +1936,11 @@ one_pass() {
       age=''
     fi
 
-    local counts green missing failed pending
-    counts="$(check_counts "$sha")"
+    local counts green missing failed pending head_states="$LANE_TMP/head-states"
+    : >"$head_states"
+    # On a red base the same read also records each name's state, so the
+    # base-fix test reuses it instead of reading the head again (#1443).
+    counts="$(LANE_STATE_SINK="${LANE_BASE_RED:+$head_states}" check_counts "$sha")"
     read -r green missing failed pending <<<"$counts"
 
     local isdraft=0
@@ -2080,15 +2129,11 @@ one_pass() {
   # and a strict base is the only place updates occur — so anything that is not
   # a merge ends the batch and the world is re-read.
   #
-  # Spelled as an `if` rather than the terser `[ … ] && batch=…` used elsewhere
-  # in this file. Under `set -e` that form is only survivable because `one_pass`
-  # is always called as the condition of an `if`, which suppresses errexit for
-  # the whole call; a future caller that runs it as a plain statement would turn
-  # every strict-base pass into a silent exit.
-  local batch=1
-  if [ "$LANE_STRICT" = "0" ] && [ "$MAX_ACTIONS" -gt "$acted" ]; then
-    batch=$((MAX_ACTIONS - acted))
-  fi
+  # Decided by `lane_batch_size`, a pure function, so the decision selftest can
+  # exercise it. On a RED base it is one, whatever the base's strictness: the one merge is
+  # the base fix, and the next pass re-reads the base's health (#1443).
+  local batch
+  batch="$(lane_batch_size "$LANE_STRICT" "$MAX_ACTIONS" "$acted" "$LANE_BASE_RED")"
 
   PASS_ACTED=0
   while IFS=$'\t' read -r _ action_num action_sha action_verdict action_unreviewed; do
