@@ -410,7 +410,9 @@ has_fail_closed_slot_reset() { # <file>
   local sweep
   sweep=$(printf '%s\n' "$reset" | grep -n 'if (\$live -and -not (Clear-StrayHiveFile' | head -1 | cut -d: -f1)
   [ -n "$sweep" ] && [ "$copy" -lt "$sweep" ] && [ "$sweep" -lt "$mark" ] || return 1
-  matches "$reset" 'if \(\$inner\.HResult -eq -2147024864\) \{ continue \}' || return 1
+  # …and only where the real hives live: open anywhere else is something the
+  # quiesce missed.
+  matches "$reset" 'if \(\$inner\.HResult -eq -2147024864 -and \$hiveDirs -contains \$f\.DirectoryName\) \{ continue \}' || return 1
   # A LOADED hive the template cannot restore is refused, never skipped.
   matches "$reset" 'is loaded and the template has no' || return 1
   # …and the privileges go off again: robocopy children inherit the token.
@@ -1751,7 +1753,10 @@ mutate "hive-named files a job planted left to survive the reset" \
   's|if (\$live -and -not (Clear-StrayHiveFile|if ($false -and -not (Clear-StrayHiveFile|' \
   has_fail_closed_slot_reset
 mutate "a stray the delete refuses treated as the host's" \
-  's|if (\$inner\.HResult -eq -2147024864) { continue }|continue|' \
+  's|if (\$inner\.HResult -eq -2147024864 -and \$hiveDirs -contains \$f\.DirectoryName) { continue }|continue|' \
+  has_fail_closed_slot_reset
+mutate "an open hive-named stray tolerated anywhere in the profile" \
+  's| -and \$hiveDirs -contains \$f\.DirectoryName) { continue }|) { continue }|' \
   has_fail_closed_slot_reset
 mutate "a loaded hive with no template skipped, not refused" \
   's|is loaded and the template has no|has no|' \

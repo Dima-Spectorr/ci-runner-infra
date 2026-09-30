@@ -1687,6 +1687,9 @@ function Clear-StrayHiveFile {
         [Parameter(Mandatory = $true)][string] $ProfileDir,
         [Parameter(Mandatory = $true)][int] $Index
     )
+    # Open is tolerated only where the host keeps the real hives; open anywhere
+    # else is something the quiesce missed, and no marker.
+    $hiveDirs = @($ProfileHives | ForEach-Object { Split-Path -Parent (Join-Path $ProfileDir $_.File) })
     $files = @(Get-ChildItem -LiteralPath $ProfileDir -Recurse -Force -File -ErrorAction Stop |
             Where-Object { $name = $_.Name; @($ProfileHiveFilePatterns | Where-Object { $name -like $_ }).Count -gt 0 })
     foreach ($f in $files) {
@@ -1696,7 +1699,7 @@ function Clear-StrayHiveFile {
         } catch {
             $inner = $_.Exception
             while ($inner.InnerException) { $inner = $inner.InnerException }
-            if ($inner.HResult -eq -2147024864) { continue }
+            if ($inner.HResult -eq -2147024864 -and $hiveDirs -contains $f.DirectoryName) { continue }
             Write-ResetLog "slot $Index -- could not remove $($f.FullName) ($($inner.Message))"
             return $false
         }
