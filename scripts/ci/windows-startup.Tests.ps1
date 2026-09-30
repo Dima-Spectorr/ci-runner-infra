@@ -3210,6 +3210,31 @@ Describe 'phase 0 first guest-attribute write retry' {
         $script:Logged[0] | Should -Be 'phase 0: ci/boot write attempt 1 of 1 failed: no reason reported by the writer'
     }
 
+    It 'stops at the first org-policy refusal and reports it, since no retry can succeed' {
+        $writer = {
+            param([ref] $Reason)
+            $script:Calls++
+            $Reason.Value = 'System.Net.WebException: The remote server returned an error: (403) Forbidden.; HTTP 403; body: Guest attributes endpoint access is disabled.'
+            return $false
+        }
+        $disabled = $null
+        $result = Publish-BootAttribute -Write $writer -BackoffSeconds @(2, 4, 8, 16) -Sleep $script:NoSleep -PolicyDisabled ([ref] $disabled)
+        $result | Should -BeFalse
+        $disabled | Should -BeTrue
+        $script:Calls | Should -Be 1
+        $script:Slept.Count | Should -Be 0
+        $script:Logged[0] | Should -Match '^phase 0: ci/boot write attempt 1 of 5 failed: .*endpoint access is disabled'
+    }
+
+    It 'does not report the org policy for any other failure' {
+        $disabled = $null
+        $result = Publish-BootAttribute -Write { param([ref] $Reason) $Reason.Value = 'HTTP 403 Forbidden'; $false } `
+            -BackoffSeconds @(1) -Sleep $script:NoSleep -PolicyDisabled ([ref] $disabled)
+        $result | Should -BeFalse
+        $disabled | Should -BeFalse
+        $script:Slept.Count | Should -Be 1
+    }
+
     It 'does not count a truthy non-boolean return as success' {
         $result = Publish-BootAttribute -Write { param([ref] $Reason) 'yes' } -BackoffSeconds @(1) -Sleep $script:NoSleep
         $result | Should -BeFalse

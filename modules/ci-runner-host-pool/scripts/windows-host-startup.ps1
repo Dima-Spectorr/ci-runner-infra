@@ -509,6 +509,14 @@ $script:HttpTimeoutSeconds = 10
 # bounded: a path that is really closed must fail the boot, not stall it.
 $script:BootAttributeBackoffSeconds = @(2, 4, 8, 16)
 
+# The metadata server's answer when constraints/compute.disableGuestAttributesAccess
+# is enforced on the project (mot-integrateit, 2026-09-30: effective, inherited).
+# Measured on a GCE guest: PUT .../guest-attributes/... -> (403) Forbidden,
+# "Guest attributes endpoint access is disabled." No retry can succeed, and the
+# controller already has a mode for it -- controller-startup.sh judges such a
+# host on registration and age alone -- so phase 0 continues instead of denying.
+$script:GuestAttributesDisabledPattern = 'Guest attributes endpoint access is disabled'
+
 function Write-BootLog {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Message)
@@ -577,8 +585,13 @@ function Publish-BootAttribute {
     param(
         [Parameter(Mandatory = $true)][scriptblock] $Write,
         [AllowEmptyCollection()][int[]] $BackoffSeconds = $script:BootAttributeBackoffSeconds,
-        [scriptblock] $Sleep = { param([int] $Seconds) Start-Sleep -Seconds $Seconds }
+        [scriptblock] $Sleep = { param([int] $Seconds) Start-Sleep -Seconds $Seconds },
+        # Set to $true when the refusal is the org policy's (see
+        # GuestAttributesDisabledPattern): no retry can succeed, so the loop
+        # stops at the first such answer.
+        [ref] $PolicyDisabled
     )
+    if ($PolicyDisabled) { $PolicyDisabled.Value = $false }
     $attempts = @($BackoffSeconds).Count + 1
     for ($i = 1; $i -le $attempts; $i++) {
         $reason = [ref] ''
@@ -590,6 +603,10 @@ function Publish-BootAttribute {
         $why = [string] $reason.Value
         if ([string]::IsNullOrWhiteSpace($why)) { $why = 'no reason reported by the writer' }
         Write-BootLog "phase 0: ci/boot write attempt $i of $attempts failed: $why"
+        if ($why -match $script:GuestAttributesDisabledPattern) {
+            if ($PolicyDisabled) { $PolicyDisabled.Value = $true }
+            return $false
+        }
         if ($i -lt $attempts) { & $Sleep $BackoffSeconds[$i - 1] }
     }
     return $false
@@ -3855,9 +3872,17 @@ function Invoke-Phase0Preflight {
     # closure -- GetNewClosure() would bind it to a dynamic module where the
     # dot-sourced Write-GuestAttribute is not visible.
     . $beaconPath
-    $published = Publish-BootAttribute -Write {
+    $policyDisabled = $false
+    $published = Publish-BootAttribute -PolicyDisabled ([ref] $policyDisabled) -Write {
         param([ref] $Reason)
         Write-GuestAttribute -Key 'boot' -Value (Get-BeaconTimestamp) -TimeoutSeconds $script:HttpTimeoutSeconds -FailureReason $Reason
+    }
+    if (-not $published -and $policyDisabled) {
+        # The controller's documented degraded mode, not a broken path: it
+        # judges this host on registration and age alone.
+        Write-BootLog ('phase 0: guest attributes are disabled by org policy -- no beacon ' +
+            'can be published; continuing, the controller judges this host on registration and age alone')
+        return $cfg
     }
     if (-not $published) {
         Deny-Boot ('the first guest-attribute write failed on every attempt (reasons above) -- ' +
