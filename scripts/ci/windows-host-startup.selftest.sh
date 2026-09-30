@@ -393,6 +393,22 @@ has_fail_closed_slot_reset() { # <file>
   matches "$reset" 'recorded an unusable runner service name' || return 1
   matches "$reset" 'still has a process running as' || return 1
   matches "$reset" 'the profile hive did not unload' || return 1
+  matches "$reset" 'the loaded hive could not be restored, so no marker' || return 1
+
+  # #898: a hive the host will not unload is reset IN PLACE. The mirror skips
+  # the hive files, then REG_FORCE_RESTORE (8) replaces the loaded hive's
+  # contents from the template -- after the mirror, before the marker.
+  matches "$reset" 'Copy-ProfileTree -Source \$template -Destination \$profileDir -SkipHives:\$live' || return 1
+  matches "$reset" 'if \(\$SkipHives\) \{ \$mirror \+= @\(./XF.\) \+ \$ProfileHiveFilePatterns \}' || return 1
+  matches "$reset" 'return RegRestoreKeyW\(key, file, 8\);' || return 1
+  local restore
+  restore=$(printf '%s\n' "$reset" | grep -n 'if (\$live -and -not (Restore-LiveHive' | head -1 | cut -d: -f1)
+  [ -n "$restore" ] && [ "$copy" -lt "$restore" ] && [ "$restore" -lt "$mark" ] || return 1
+  # The two copies of the hive table say the same thing.
+  local boot_pat reset_pat
+  boot_pat=$(printf '%s\n' "$code" | sed -n "s|^\\\$script:ProfileHiveFilePatterns = \(.*\)$|\1|p" | head -1)
+  reset_pat=$(printf '%s\n' "$reset" | sed -n "s|^\\\$ProfileHiveFilePatterns = \(.*\)$|\1|p" | head -1)
+  [ -n "$boot_pat" ] && [ "$boot_pat" = "$reset_pat" ] || return 1
 
   # A killed robocopy exits with an NTSTATUS as a NEGATIVE integer, and a bare
   # `-lt 8` reads every one of those as a mirror that succeeded. Both sides say
@@ -505,10 +521,18 @@ has_profile_template_before_registration() { # <file>
   # service from a released hive -- read from HKU's names, never by opening the
   # SID's own key (see the #898 lines below).
   matches "$code" 'Registry\]::Users\.GetSubKeyNames\(\) -notcontains \$Sid\) \{ return \$true \}' || return 1
-  # Fatal, like the other two failures here. A template captured without
-  # NTUSER.DAT is a template that restores everything except the one file that
-  # carries what a job left in HKCU.
-  matches "$code" "Deny-Boot \(\"slot \\\$Index's profile hive is still loaded" || return 1
+  # A template captured without NTUSER.DAT restores everything except the one
+  # file that carries what a job left in HKCU. #898, v5.109.3 and v5.109.4: the
+  # host holds the hive even after `reg unload`, so a hive still loaded is
+  # captured LIVE -- robocopy skips the hive files and `reg save` snapshots them
+  # -- and a save that fails is fatal.
+  matches "$code" "capturing it live with reg save" || return 1
+  matches "$code" "if \(\\\$live\) \{ \\\$mirror \+= @\('/XF'\) \+ \\\$script:ProfileHiveFilePatterns \}" || return 1
+  matches "$code" '& reg\.exe save "HKU\\\$name" \$target /y 2>&1' || return 1
+  matches "$code" "Deny-Boot \(\"could not save slot \\\$Index's loaded hive" || return 1
+  local save_at
+  save_at=$(printf '%s\n' "$code" | grep -n 'if (\$live) { Save-SlotHive -Sid \$sid' | head -1 | cut -d: -f1)
+  [ -n "$save_at" ] || return 1
 
   # AND THE HIVE HAS TO BE RELEASED, NOT MERELY WAITED FOR
   #
@@ -549,6 +573,9 @@ has_profile_template_before_registration() { # <file>
   [ -n "$quiesce_at" ] && [ -n "$wait_at" ] && [ -n "$copy_at" ] || return 1
   [ "$quiesce_at" -lt "$wait_at" ] || return 1
   [ "$wait_at" -lt "$copy_at" ] || return 1
+  # …and the live save AFTER the mirror: /MIR into the template would purge a
+  # hive saved before it.
+  [ "$copy_at" -lt "$save_at" ] || return 1
 }
 
 # --- phase 5: the two obligations the controller cannot check ----------------
@@ -1585,8 +1612,14 @@ mutate "the first marker dropped, failing every slot's first job" \
 mutate "the capture racing the hive again" \
   's|if (-not (Wait-SlotHiveUnloaded -Sid \$sid -TimeoutSeconds \$script:ProfileHiveUnloadSeconds)) {|if ($false) {|' \
   has_profile_template_before_registration
-mutate "a hive that never unloads allowed to boot anyway" \
-  "s|Deny-Boot (\"slot \\\$Index's profile hive is still loaded|Write-BootLog (\"slot \$Index's profile hive is still loaded|" \
+mutate "a live hive that failed to save allowed to boot anyway" \
+  "s|Deny-Boot (\"could not save slot \\\$Index's loaded hive|Write-BootLog (\"could not save slot \$Index's loaded hive|" \
+  has_profile_template_before_registration
+mutate "a live capture that copies the held hive files (#898)" \
+  "s|if (\\\$live) { \\\$mirror += @('/XF') + \\\$script:ProfileHiveFilePatterns }||" \
+  has_profile_template_before_registration
+mutate "a live capture that never saves the hive (#898)" \
+  's|if (\$live) { Save-SlotHive -Sid \$sid|if ($false) { Save-SlotHive -Sid $sid|' \
   has_profile_template_before_registration
 mutate "the wait made unconditional, so it waits for nothing" \
   's|if (\[Microsoft\.Win32\.Registry\]::Users\.GetSubKeyNames() -notcontains \$Sid) { return \$true }|return $true|' \
@@ -1693,6 +1726,18 @@ mutate "the refusal widened from this slot to any slot" \
   has_fail_closed_slot_reset
 mutate "the request poll widened past the request directories" \
   's|-File -Recurse -Depth 2 `|-File -Recurse `|' \
+  has_fail_closed_slot_reset
+mutate "a reset that marks clean without restoring a held hive (#898)" \
+  's|if (\$live -and -not (Restore-LiveHive|if ($false -and -not (Restore-LiveHive|' \
+  has_fail_closed_slot_reset
+mutate "a hive restore that yields to open handles (#898)" \
+  's|return RegRestoreKeyW(key, file, 8);|return RegRestoreKeyW(key, file, 0);|' \
+  has_fail_closed_slot_reset
+mutate "a reset mirror that overwrites the held hive files (#898)" \
+  's|-Destination \$profileDir -SkipHives:\$live|-Destination $profileDir|' \
+  has_fail_closed_slot_reset
+mutate "the reset's hive table drifting from the boot's" \
+  "s|^\\\$ProfileHiveFilePatterns = @('NTUSER.DAT\*', 'UsrClass.dat\*')|\$ProfileHiveFilePatterns = @('NTUSER.DAT')|" \
   has_fail_closed_slot_reset
 
 # 6. OBLIGATION (a): the one read becomes a per-slot read, in both spellings.

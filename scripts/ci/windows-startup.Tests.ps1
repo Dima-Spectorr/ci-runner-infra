@@ -782,6 +782,19 @@ Describe 'slot reset service body' {
         $script:Reset | Should -Match '& reg\.exe unload "HKU\\\$name" 2>&1'
     }
 
+    # #898, v5.109.4: even `reg unload` is refused, so a held hive is reset in
+    # place -- the mirror skips its files, then the restore, then the marker.
+    It 'restores a hive the host will not unload in place, before the marker' {
+        $body = ($script:Reset -split 'function Invoke-SlotReset')[1]
+        $copy = $body.IndexOf('Copy-ProfileTree -Source $template -Destination $profileDir -SkipHives:$live')
+        $restore = $body.IndexOf('Restore-LiveHive -Sid $sid')
+        $marker = $body.IndexOf("Write-Atomic -Path `$marker -Text 'clean'")
+        $copy | Should -BeGreaterThan 0
+        $restore | Should -BeGreaterThan $copy
+        $marker | Should -BeGreaterThan $restore
+        $script:Reset | Should -Match 'RegRestoreKeyW\(key, file, 8\)'
+    }
+
     # /MIR because the claim is that nothing of the last job survives and a copy
     # that only adds keeps whatever was added; /XJ so a junction a job planted is
     # replaced rather than followed out of the profile.
