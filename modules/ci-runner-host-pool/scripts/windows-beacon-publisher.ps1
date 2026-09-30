@@ -189,12 +189,18 @@ function Write-GuestAttribute {
         Never throws. A publisher that dies on one bad write leaves its host
         undeletable forever, which is a far worse outcome than a gap in the
         series the controller already knows how to interpret.
+
+        -FailureReason is for a caller that must SAY why a write failed. The
+        event log is invisible on the serial console, and #898 was a host that
+        refused to serve over a failed first write whose reason only that log
+        held.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string] $Key,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string] $Value,
-        [int] $TimeoutSeconds = 10
+        [int] $TimeoutSeconds = 10,
+        [ref] $FailureReason
     )
     try {
         Invoke-RestMethod -Method Put `
@@ -204,9 +210,56 @@ function Write-GuestAttribute {
             -TimeoutSec $TimeoutSeconds | Out-Null
         return $true
     } catch {
-        Write-EventLogSafe -Message "beacon: write of '$Key' failed: $($_.Exception.Message)"
+        $detail = Format-WebFailure -ErrorRecord $_
+        if ($null -ne $FailureReason) { $FailureReason.Value = $detail }
+        Write-EventLogSafe -Message "beacon: write of '$Key' failed: $detail"
         return $false
     }
+}
+
+function Format-WebFailure {
+    <#
+      .SYNOPSIS
+        One line saying why a web call failed: exception type and message, the
+        HTTP status if a response came back, the transport status on Windows
+        PowerShell, the response body, and up to three inner exceptions.
+      .DESCRIPTION
+        Pure, so it is tested. Properties are probed rather than assumed because
+        the shapes differ by runtime: Windows PowerShell 5.1 (the host) throws a
+        WebException whose Response is an HttpWebResponse; pwsh 7 (the test
+        runner) throws an HttpResponseException whose Response is an
+        HttpResponseMessage. Both expose StatusCode. Newlines are folded and the
+        result is capped, because it goes to a one-line serial log.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][System.Management.Automation.ErrorRecord] $ErrorRecord,
+        [int] $MaxLength = 600
+    )
+    if ($null -eq $ErrorRecord -or $null -eq $ErrorRecord.Exception) {
+        return 'unknown failure (no exception recorded)'
+    }
+    $ex = $ErrorRecord.Exception
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add("$($ex.GetType().FullName): $($ex.Message)")
+    $response = $null
+    if ($null -ne $ex.PSObject.Properties['Response']) { $response = $ex.Response }
+    if ($null -ne $response -and $null -ne $response.PSObject.Properties['StatusCode']) {
+        $parts.Add("HTTP $([int] $response.StatusCode) $($response.StatusCode)")
+    }
+    if ($ex -is [System.Net.WebException]) { $parts.Add("transport status $($ex.Status)") }
+    if ($null -ne $ErrorRecord.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($ErrorRecord.ErrorDetails.Message)) {
+        $parts.Add("body: $($ErrorRecord.ErrorDetails.Message)")
+    }
+    $inner = $ex.InnerException
+    for ($depth = 0; $null -ne $inner -and $depth -lt 3; $depth++) {
+        $parts.Add("inner $($inner.GetType().FullName): $($inner.Message)")
+        $inner = $inner.InnerException
+    }
+    $line = (($parts -join '; ') -replace '[\r\n]+', ' ').Trim()
+    if ($line.Length -gt $MaxLength) { $line = $line.Substring(0, $MaxLength) + '...' }
+    return $line
 }
 
 function Write-EventLogSafe {

@@ -188,3 +188,55 @@ Describe 'worker count' {
         0 | Should -Not -BeNullOrEmpty
     }
 }
+
+Describe 'web failure formatting' {
+    # #898: the reason a guest-attribute write failed has to be readable on the
+    # serial console, so it is one bounded line with everything that helps.
+    It 'names the exception type, message and transport status of a WebException' {
+        $ex = [System.Net.WebException]::new('Unable to connect to the remote server', [System.Net.WebExceptionStatus]::ConnectFailure)
+        $er = [System.Management.Automation.ErrorRecord]::new($ex, 'x', 'NotSpecified', $null)
+        Format-WebFailure -ErrorRecord $er |
+        Should -Be 'System.Net.WebException: Unable to connect to the remote server; transport status ConnectFailure'
+    }
+
+    It 'carries the HTTP status and the response body when a response came back' {
+        $resp = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]::PreconditionFailed)
+        $ex = [Microsoft.PowerShell.Commands.HttpResponseException]::new('Response status code does not indicate success: 412', $resp)
+        $er = [System.Management.Automation.ErrorRecord]::new($ex, 'x', 'NotSpecified', $null)
+        $er.ErrorDetails = [System.Management.Automation.ErrorDetails]::new("guest attributes`r`nare disabled")
+        $line = Format-WebFailure -ErrorRecord $er
+        $line | Should -Match 'HttpResponseException: Response status code does not indicate success: 412'
+        $line | Should -Match '; HTTP 412 PreconditionFailed'
+        $line | Should -Match '; body: guest attributes are disabled$'
+    }
+
+    It 'follows inner exceptions and folds newlines' {
+        $inner = [System.IO.IOException]::new("socket`nreset")
+        $ex = [System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.', $inner)
+        $er = [System.Management.Automation.ErrorRecord]::new($ex, 'x', 'NotSpecified', $null)
+        Format-WebFailure -ErrorRecord $er |
+        Should -Be 'System.Net.Http.HttpRequestException: An error occurred while sending the request.; inner System.IO.IOException: socket reset'
+    }
+
+    It 'is capped for a one-line log' {
+        $ex = [System.Exception]::new('x' * 5000)
+        $er = [System.Management.Automation.ErrorRecord]::new($ex, 'x', 'NotSpecified', $null)
+        (Format-WebFailure -ErrorRecord $er -MaxLength 100).Length | Should -Be 103
+    }
+
+    It 'survives a null record' {
+        Format-WebFailure -ErrorRecord $null | Should -Be 'unknown failure (no exception recorded)'
+    }
+
+    It 'fills -FailureReason and still never throws when the write fails' {
+        Mock -CommandName Write-EventLogSafe -MockWith { }
+        Mock -CommandName Invoke-RestMethod -MockWith {
+            throw [System.Net.WebException]::new('the operation has timed out', [System.Net.WebExceptionStatus]::Timeout)
+        }
+        $reason = [ref] ''
+        $ok = Write-GuestAttribute -Key 'boot' -Value 'x' -TimeoutSeconds 1 -FailureReason $reason
+        $ok | Should -BeFalse
+        $reason.Value | Should -Be 'System.Net.WebException: the operation has timed out; transport status Timeout'
+        Should -Invoke -CommandName Write-EventLogSafe -Times 1 -Exactly -ParameterFilter { $Message -like '*transport status Timeout' }
+    }
+}

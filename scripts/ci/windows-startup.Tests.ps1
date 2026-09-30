@@ -3143,3 +3143,84 @@ Describe 'bounded native exit code' {
         $guardAt | Should -BeLessThan $success[0].Extent.StartOffset
     }
 }
+
+Describe 'phase 0 first guest-attribute write retry' {
+    # #898: a host denied its boot over ONE failed ci/boot write, and the reason
+    # only reached the Windows event log. The retry must be bounded, and every
+    # failed attempt's reason must reach the boot log (serial) before Deny-Boot.
+    # The publisher's side -- Write-GuestAttribute filling -FailureReason -- is
+    # tested in windows-beacon.Tests.ps1.
+    BeforeEach {
+        $script:Logged = [System.Collections.Generic.List[string]]::new()
+        $script:Slept = [System.Collections.Generic.List[int]]::new()
+        $script:Calls = 0
+        Mock -CommandName Write-BootLog -MockWith { $script:Logged.Add($Message) }
+        $script:NoSleep = { param([int] $Seconds) $script:Slept.Add($Seconds) }
+    }
+
+    It 'succeeds on a later attempt and logs each earlier failure with its reason' {
+        $writer = {
+            param([ref] $Reason)
+            $script:Calls++
+            if ($script:Calls -lt 3) {
+                $Reason.Value = "HTTP 503 ServiceUnavailable (call $script:Calls)"
+                return $false
+            }
+            return $true
+        }
+        $result = Publish-BootAttribute -Write $writer -BackoffSeconds @(2, 4, 8, 16) -Sleep $script:NoSleep
+        $result | Should -BeOfType [bool]
+        $result | Should -BeTrue
+        $script:Calls | Should -Be 3
+        @($script:Slept) | Should -Be @(2, 4)
+        $script:Logged.Count | Should -Be 3
+        $script:Logged[0] | Should -Be 'phase 0: ci/boot write attempt 1 of 5 failed: HTTP 503 ServiceUnavailable (call 1)'
+        $script:Logged[1] | Should -Be 'phase 0: ci/boot write attempt 2 of 5 failed: HTTP 503 ServiceUnavailable (call 2)'
+        $script:Logged[2] | Should -Be 'phase 0: ci/boot write succeeded on attempt 3 of 5'
+    }
+
+    It 'neither logs nor sleeps when the first attempt succeeds' {
+        $result = Publish-BootAttribute -Write { param([ref] $Reason) $true } -BackoffSeconds @(2, 4) -Sleep $script:NoSleep
+        $result | Should -BeTrue
+        $script:Logged.Count | Should -Be 0
+        $script:Slept.Count | Should -Be 0
+    }
+
+    It 'gives up after the bounded attempts, logging every reason and not sleeping after the last' {
+        $writer = {
+            param([ref] $Reason)
+            $script:Calls++
+            $Reason.Value = "System.Net.WebException: timed out (call $script:Calls)"
+            return $false
+        }
+        $result = Publish-BootAttribute -Write $writer -BackoffSeconds @(2, 4, 8, 16) -Sleep $script:NoSleep
+        $result | Should -BeFalse
+        $script:Calls | Should -Be 5
+        @($script:Slept) | Should -Be @(2, 4, 8, 16)
+        $script:Logged.Count | Should -Be 5
+        for ($i = 1; $i -le 5; $i++) {
+            $script:Logged[$i - 1] | Should -Be "phase 0: ci/boot write attempt $i of 5 failed: System.Net.WebException: timed out (call $i)"
+        }
+    }
+
+    It 'says so when the writer fails without a reason' {
+        $result = Publish-BootAttribute -Write { param([ref] $Reason) $false } -BackoffSeconds @() -Sleep $script:NoSleep
+        $result | Should -BeFalse
+        $script:Logged.Count | Should -Be 1
+        $script:Logged[0] | Should -Be 'phase 0: ci/boot write attempt 1 of 1 failed: no reason reported by the writer'
+    }
+
+    It 'does not count a truthy non-boolean return as success' {
+        $result = Publish-BootAttribute -Write { param([ref] $Reason) 'yes' } -BackoffSeconds @(1) -Sleep $script:NoSleep
+        $result | Should -BeFalse
+    }
+
+    It 'keeps the default schedule bounded' {
+        $total = ($script:BootAttributeBackoffSeconds | Measure-Object -Sum).Sum
+        $total | Should -BeGreaterThan 0
+        $total | Should -BeLessOrEqual 60
+        # Worst case, every attempt running to its own timeout.
+        ($total + ($script:BootAttributeBackoffSeconds.Count + 1) * $script:HttpTimeoutSeconds) |
+        Should -BeLessOrEqual 120
+    }
+}
