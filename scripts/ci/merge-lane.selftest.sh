@@ -1290,6 +1290,18 @@ names_the_required_status_check_refusal() {
   matches "$code" 'refused_marker "\$sha"'
 }
 
+# Measured on IntegrateIT 2026-09-30: a green dispatched re-run over a failed
+# pull-request run made the lane read `ci` green while the ruleset read it
+# failing; the 405 "Required status check \"ci\" is failing." fell to the
+# default arm and ended every pass behind one candidate for ~45 minutes.
+names_the_failing_status_check_refusal() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" "^    \*'Required status check'\*'is failing'\*)\$" || return 1
+  matches "$code" '^      return 2$' || return 1
+  matches "$code" 'already_commented_refusal "\$num" "\$sha"'
+}
+
 # Measured on IntegrateIT run 36408270569 (lane v5.107.1): the merge API refused
 # #21400 with "Repository rule violations found  Waiting on code owner review
 # from <owner>." — a review requirement on that ONE pull request, which the
@@ -1786,6 +1798,7 @@ check quotes_what_github_actually_said "$DRIVER" "a refusal is reported as a gue
 check names_the_workflows_permission_refusal "$DRIVER" "a pull request the App may never merge — it touches a workflow file — reads as a transient refusal and ends the batch on every pass, so one of them starves the whole repository"
 check names_the_required_status_check_refusal "$DRIVER" "a required-status-check 405 — the lane's own read disagreeing with GitHub's ruleset about ONE candidate's head — reads as a transient refusal and ends the batch on every pass, so the oldest ready pull request starves every candidate behind it"
 check names_the_review_refusal "$DRIVER" "a 405 for a missing code-owner or approving review — a requirement on ONE pull request the lane's check read cannot see — reads as a transient refusal and ends the batch on every pass, so one unreviewed pull request at the head of the ranking stops every merge in the repository"
+check names_the_failing_status_check_refusal "$DRIVER" "a 405 saying a required check is FAILING while the lane read it green — a dispatched green re-run the ruleset does not count, over a failed pull-request run — reads as a transient refusal and ends the batch on every pass behind one candidate"
 check halts_when_the_base_itself_is_red "$DRIVER" "the lane keeps merging onto a base whose own required checks are failing, burying the commit that broke it under everything that follows"
 check only_a_definite_failure_halts_the_lane "$DRIVER" "the base-health gate halts on something other than a definite failure, which deadlocks every repository whose required checks run on pull_request only"
 check says_on_the_snapshot_that_it_halted "$DRIVER" "a halted lane renders exactly like a base with nothing open, so the queue view reports a quiet day while nothing can merge"
@@ -2164,6 +2177,8 @@ mutate "the required-status-check refusal stops being named" "$DRIVER" \
   "s@^    \*'Required status check'\*'is expected'\*)\$@    *'Required status check-never'*'is expected'*)@" names_the_required_status_check_refusal
 mutate "the required-status-check refusal stops commenting on the pull request" "$DRIVER" \
   's@already_commented_refusal "\$num" "\$sha"@false@' names_the_required_status_check_refusal
+mutate "the failing-status-check refusal stops being named" "$DRIVER" \
+  "s@^    \*'Required status check'\*'is failing'\*)\$@    *'Required status check-never'*'is failing'*)@" names_the_failing_status_check_refusal
 mutate "the review-requirement refusal stops being named" "$DRIVER" \
   "s@^    \*'code owner review'\*@    *'code owner review-never'*@" names_the_review_refusal
 mutate "the unasked comparison starts reporting itself as up to date" "$DRIVER" \
@@ -3030,6 +3045,7 @@ Waiting on code owner review from some-owner. (HTTP 405)'
   _rc_case "a code-owner review 405 skips the candidate, not the pass" 2 "$codeowner" aaaa1111
   _rc_case "an approving-review 405 skips the candidate" 2 'gh: At least 1 approving review is required by reviewers with write access. (HTTP 405)' bbbb2222
   _rc_case "a required-status-check 405 still skips the candidate" 2 'gh: Required status check "ci" is expected. (HTTP 405)' cccc3333
+  _rc_case "a failing-required-check 405 skips the candidate, not the pass" 2 'gh: Repository rule violations found  Required status check "ci" is failing.   (HTTP 405)' ffff6666
   _rc_case "a workflows-permission refusal still skips the candidate" 2 'gh: refusing to allow a GitHub App to create or update workflow without `workflows` permission (HTTP 403)' ''
   _rc_case "an unrecognised refusal still ends the pass" 1 'gh: Head branch was modified. Review and try the merge again. (HTTP 409)' dddd4444
 
