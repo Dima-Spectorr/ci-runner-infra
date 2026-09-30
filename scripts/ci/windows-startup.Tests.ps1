@@ -1,4 +1,4 @@
-﻿# Pester tests for the Windows host boot script's PURE functions.
+# Pester tests for the Windows host boot script's PURE functions.
 #
 # The companion file is windows-beacon.Tests.ps1 and its header applies here
 # too: a gate that READS code is not a test, so the decidable half of the boot
@@ -3180,7 +3180,7 @@ Describe 'phase 0 first guest-attribute write retry' {
     }
 
     It 'neither logs nor sleeps when the first attempt succeeds' {
-        $result = Publish-BootAttribute -Write { param([ref] $Reason) $true } -BackoffSeconds @(2, 4) -Sleep $script:NoSleep
+        $result = Publish-BootAttribute -Write { param([ref] $Reason) $null = $Reason; $true } -BackoffSeconds @(2, 4) -Sleep $script:NoSleep
         $result | Should -BeTrue
         $script:Logged.Count | Should -Be 0
         $script:Slept.Count | Should -Be 0
@@ -3204,7 +3204,7 @@ Describe 'phase 0 first guest-attribute write retry' {
     }
 
     It 'says so when the writer fails without a reason' {
-        $result = Publish-BootAttribute -Write { param([ref] $Reason) $false } -BackoffSeconds @() -Sleep $script:NoSleep
+        $result = Publish-BootAttribute -Write { param([ref] $Reason) $null = $Reason; $false } -BackoffSeconds @() -Sleep $script:NoSleep
         $result | Should -BeFalse
         $script:Logged.Count | Should -Be 1
         $script:Logged[0] | Should -Be 'phase 0: ci/boot write attempt 1 of 1 failed: no reason reported by the writer'
@@ -3236,7 +3236,7 @@ Describe 'phase 0 first guest-attribute write retry' {
     }
 
     It 'does not count a truthy non-boolean return as success' {
-        $result = Publish-BootAttribute -Write { param([ref] $Reason) 'yes' } -BackoffSeconds @(1) -Sleep $script:NoSleep
+        $result = Publish-BootAttribute -Write { param([ref] $Reason) $null = $Reason; 'yes' } -BackoffSeconds @(1) -Sleep $script:NoSleep
         $result | Should -BeFalse
     }
 

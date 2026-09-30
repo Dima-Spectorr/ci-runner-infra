@@ -510,7 +510,7 @@ $script:HttpTimeoutSeconds = 10
 $script:BootAttributeBackoffSeconds = @(2, 4, 8, 16)
 
 # The metadata server's answer when constraints/compute.disableGuestAttributesAccess
-# is enforced on the project (mot-integrateit, 2026-09-30: effective, inherited).
+# is enforced on the project (seen 2026-09-30 on a pool project: effective, inherited).
 # Measured on a GCE guest: PUT .../guest-attributes/... -> (403) Forbidden,
 # "Guest attributes endpoint access is disabled." No retry can succeed, and the
 # controller already has a mode for it -- controller-startup.sh judges such a
