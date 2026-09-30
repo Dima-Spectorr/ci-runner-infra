@@ -285,6 +285,27 @@ resource "google_project_iam_member" "controller_build_reader" {
   member  = "serviceAccount:${local.controller_email}"
 }
 
+# A Windows host cannot mint its own registration token (it holds no App-key
+# read — see `host_os`), so the controller mints it and writes it onto the host
+# as instance metadata. setMetadata on an instance checks actAs on the account
+# attached to it, which instance-admin does not carry: without this every write
+# is refused, the host waits out its 300s and denies boot at phase 5 (#898).
+#
+# One account, named — this pool's host account, not a project-level
+# serviceAccountUser. It does widen the controller: with instance-admin it can
+# now start or re-script a VM as the host account, and so reach the job
+# account through the host's tokenCreator. Accepted because the controller runs
+# no build input and already holds the App key, and on Windows the host account
+# holds nothing else (`host_grants` = 0) — the job account's grants are the
+# ceiling. Per pool, so it is written on the reuse path too: each pool's host
+# account is its own binding.
+resource "google_service_account_iam_member" "controller_acts_as_windows_host" {
+  count              = var.host_os == "windows" ? 1 : 0
+  service_account_id = google_service_account.runner.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${local.controller_email}"
+}
+
 # Deliberately NOT granted here: storage, artifact registry, deploy, or any
 # data-plane role. A pipeline that needs one asks for it explicitly in the
 # consuming stack, where the grant is visible in that repo's review.
