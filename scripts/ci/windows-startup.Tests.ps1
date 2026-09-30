@@ -769,6 +769,19 @@ Describe 'slot reset service body' {
         $copy | Should -BeGreaterThan $hive
     }
 
+    # #898: with nothing left running as the slot, the profile service still
+    # holds the hive and never lets go -- so a reset that only waits fails every
+    # job after the first. The release sits between the wait and the copy.
+    It 'unloads a hive the wait could not see released, before it copies' {
+        $body = ($script:Reset -split 'function Invoke-SlotReset')[1]
+        $hive = $body.IndexOf('Wait-HiveUnloaded')
+        $release = $body.IndexOf('Invoke-HiveRelease -Sid $sid -Index $Index')
+        $copy = $body.IndexOf('Copy-ProfileTree')
+        $release | Should -BeGreaterThan $hive
+        $copy | Should -BeGreaterThan $release
+        $script:Reset | Should -Match '& reg\.exe unload "HKU\\\$name" 2>&1'
+    }
+
     # /MIR because the claim is that nothing of the last job survives and a copy
     # that only adds keeps whatever was added; /XJ so a junction a job planted is
     # replaced rather than followed out of the profile.
