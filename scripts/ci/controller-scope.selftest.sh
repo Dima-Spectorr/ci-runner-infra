@@ -1701,7 +1701,7 @@ check "restart: a non-numeric id changes nothing" \
   "$(boot_seq "$_OLD_BOOT" 'h1,abc,2026-09-30T21:55:09.000-07:00')"
 check "restart: a start time that is not a timestamp changes nothing" \
   "$_UNTOUCHED boot=$_OLD_BOOT ev=0 kept=$_ALL stray=0" \
-  "$(boot_seq "$_OLD_BOOT" 'h1,4733205416644719969,$(touch pwned)')"
+  "$(boot_seq "$_OLD_BOOT" 'h1,4733205416644719969,2026;touch pwned')"
 # The name becomes a path. `stray` counts files in the state directory that are
 # not h1's, so a write under a name that is not a GCE instance name shows here.
 check "restart: a name that is not an instance name writes no file" \
@@ -1712,24 +1712,31 @@ check "restart: a name that is not an instance name writes no file" \
 # case red in the field that thing owns — an assertion that survives its own
 # mutation was being satisfied by a sibling.
 _inc() { boot_seq "$_OLD_BOOT" "$_NEW_ROW" "$1"; }
+# shellcheck disable=SC2016
 case "$(_inc 's@"\$STATE_DIR/seen-\$name" @@')" in
   "age=old idle=young partial=young verdict=drain:never-registered miss=none"*) r=caught ;; *) r=missed ;; esac
 check "restart mutation: seen- left behind is the incident again" caught "$r"
+# shellcheck disable=SC2016
 case "$(_inc 's@ "\$STATE_DIR/idle-\$name"@@')" in
   "age=young idle=old partial=young "*) r=caught ;; *) r=missed ;; esac
 check "restart mutation: idle- left behind keeps the old idle streak" caught "$r"
+# shellcheck disable=SC2016
 case "$(_inc 's@ "\$STATE_DIR/partial-\$name"@@')" in
   "age=young idle=young partial=old "*) r=caught ;; *) r=missed ;; esac
 check "restart mutation: partial- left behind keeps the old partial clock" caught "$r"
+# shellcheck disable=SC2016
 case "$(_inc 's@"\$STATE_DIR/beaconmiss-\$name" @@')" in
   *" miss=222 "*) r=caught ;; *) r=missed ;; esac
 check "restart mutation: beaconmiss- left behind keeps 222 misses" caught "$r"
+# shellcheck disable=SC2016
 case "$(_inc 's@^    \[ "\$known" = "\$boot" \] && continue$@    continue@')" in
   "$_UNTOUCHED boot=$_OLD_BOOT ev=0"*) r=caught ;; *) r=missed ;; esac
 check "restart mutation: a reset that never fires is seen" caught "$r"
+# shellcheck disable=SC2016
 case "$(boot_seq none "$_NEW_ROW" 's@^    if \[ -n "\$known" \]; then$@    if true; then@')" in
   "age=young"*) r=caught ;; *) r=missed ;; esac
 check "restart mutation: resetting on first sight is seen" caught "$r"
+# shellcheck disable=SC2016
 case "$(boot_seq "$_OLD_BOOT" 'h1,4733205416644719969,' 's@^    case "\$started" in .*$@@')" in
   "age=young"*) r=caught ;; *) r=missed ;; esac
 check "restart mutation: dropping the start-time check resets on an unreadable one" caught "$r"
@@ -1739,6 +1746,7 @@ check "restart mutation: dropping the start-time check resets on an unreadable o
 # pool, where it returned `name,<numeric id>,<RFC 3339 start time>` per host.
 boot_list() { # <MIG_BASE> <gcloud rc>
   local dir; dir=$(mktemp -d)
+  : >"$dir/calls"
   bash -c "
     set -uo pipefail
     PROJECT=test-project
@@ -1750,7 +1758,7 @@ boot_list() { # <MIG_BASE> <gcloud rc>
     collect_host_boots
     echo \"rc=\$? boots=[\$HOST_BOOTS]\"
   " 2>&1 | tr '\n' ' '
-  printf 'calls=%s' "$(cat "$dir/calls" 2>/dev/null | tr '\n' ';')"
+  printf 'calls=%s' "$(tr '\n' ';' <"$dir/calls" 2>/dev/null)"
   rm -rf "$dir"
 }
 check "boot list: one bounded list per pool, id and start time as CSV" \
@@ -1769,7 +1777,9 @@ check "boot list: the call is bounded by a timeout" yes "$r"
 _tick=$(fn tick_pool)
 _n() { printf '%s\n' "$_tick" | grep -n "$1" | head -1 | cut -d: -f1; }
 _mig=$(_n '^  collect_mig$'); _col=$(_n '^  collect_host_boots$')
-_fgt=$(_n '^  forget_restarted_hosts$'); _rd=$(_n 'age=\$(host_age_seconds "\$host")')
+_fgt=$(_n '^  forget_restarted_hosts$')
+# shellcheck disable=SC2016
+_rd=$(_n 'age=\$(host_age_seconds "\$host")')
 _cls=$(_n '^  classify_pinned$')
 if [ -n "$_mig" ] && [ -n "$_col" ] && [ -n "$_fgt" ] && [ -n "$_rd" ] && [ -n "$_cls" ] &&
   [ "$_mig" -lt "$_col" ] && [ "$_col" -lt "$_fgt" ] && [ "$_fgt" -lt "$_cls" ] && [ "$_fgt" -lt "$_rd" ]; then
