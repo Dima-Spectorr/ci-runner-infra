@@ -133,6 +133,30 @@ expect keep "and a caller that omits the flag entirely gets the old behaviour" \
 expect keep "the flag never authorises the idle-beacon delete on a booting host" \
   1 0 0 "$NOW" "$NOW" "$INT" 60 "$GRACE" 0 9 "$NEED" 1
 
+# --- registered, no beacon, and every agent offline ---------------------------
+# The host rebooted and its boot script stopped at the missing registration
+# token. GitHub still lists its agents, all offline, none busy. Measured
+# 2026-10-01: kept forever by the registered-without-beacon row, with the pool's
+# only host dead. The thirteenth argument is the offline count.
+expect keep:unconfirmed-all-offline "all agents offline still needs its confirmations" \
+  0 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 2 1 "$NEED" 0 2
+expect delete:registered-all-offline "all agents offline, confirmed, is reclaimable" \
+  0 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 2 2 "$NEED" 0 2
+expect delete:registered-all-offline "and so it is where the org policy refuses the read" \
+  1 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 2 2 "$NEED" 1 2
+expect keep:registered-without-beacon "one agent still online keeps the host" \
+  0 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 2 99 "$NEED" 0 1
+expect keep:registered-without-beacon "a caller that omits the count gets the old keep" \
+  0 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 2 99 "$NEED" 0
+expect keep:registered-without-beacon "a malformed count is not evidence" \
+  0 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 2 99 "$NEED" 0 "x"
+expect keep:booting "all offline inside the grace is a booting host" \
+  0 0 "" 0 "$NOW" "$INT" 60 "$GRACE" 2 99 "$NEED" 0 2
+expect keep:read-failed "all offline never overrides an ordinary read failure" \
+  1 0 "" 0 "$NOW" "$INT" 7200 "$GRACE" 2 99 "$NEED" 0 2
+expect keep "all offline never overrides a beacon that reports a worker" \
+  0 1 1 "$NOW" "$NOW" "$INT" 7200 "$GRACE" 2 99 "$NEED" 0 2
+
 # --- degraded state 3: the beacon is stale ------------------------------------
 # The publisher died. The host may be perfectly busy; we simply no longer know,
 # and "no longer know" is a keep.
