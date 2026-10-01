@@ -2578,6 +2578,10 @@ host_facts() {
 # one — after a controller restart every host reads young, so the worst case is
 # that a genuinely dead host survives one register-grace window instead of a
 # live one being shot.
+#
+# The file is named after the host, so it is only "how long we have known THIS
+# machine" while forget_restarted_hosts() keeps removing it when the machine
+# behind the name cold-starts. See there.
 host_age_seconds() {
   local host="$1"
   local f="$STATE_DIR/seen-$host"
@@ -2591,6 +2595,91 @@ host_age_seconds() {
   first=$(cat "$f" 2>/dev/null)
   [ -n "$first" ] || { echo "$now" >"$f"; echo 0; return 0; }
   echo $((now - first))
+}
+
+# --- which BOOT a host's clocks belong to ------------------------------------
+#
+# Every per-host clock above and below is a file named after the HOST, and a
+# host name outlives the machine behind it. A MIG `recreateInstances` keeps the
+# name — and, measured on a regional MIG, keeps the instance too: it is carried
+# out as an in-place `instances.update` (RECREATE_DISK + RESTART), so the
+# numeric id and the creationTimestamp are both UNCHANGED. The host that comes
+# back has a blank disk and no agents, and it inherited the dead host's
+# `seen-`, `idle-` and `beaconmiss-` files. It read `absent` with an age of six
+# and a half hours and 222 beacon misses, so drain rule 5 called it
+# never-registered, the beacon rule called it never-booted, and the controller
+# deleted it 96 seconds after it was recreated.
+#
+# So the clocks are tied to the BOOT: the instance id (a delete and re-insert
+# under one name) together with lastStartTimestamp (a recreate in place, or any
+# stop and start). When either moves, the machine has cold-started since those
+# clocks were stamped and they describe something that no longer exists.
+#
+# ONE list call per pool per tick, not a describe per host — the cost
+# host_age_seconds refuses is still refused. And the MIG's own list-instances
+# cannot answer this: it carries `id` but no start time, and the id alone
+# would have read the incident above as "nothing changed".
+#
+# A list that fails leaves HOST_BOOTS empty, and empty changes NOTHING: an
+# unreadable fact is not a restart. The direction this errs in is the one
+# host_age_seconds already chose — a host reads young, never old.
+HOST_BOOTS=""
+
+collect_host_boots() {
+  HOST_BOOTS=""
+  # Without the base name there is no bound on the list, and an unbounded one
+  # is every instance in the project.
+  [ -n "$MIG_BASE" ] || return 0
+  HOST_BOOTS=$(timeout 60 gcloud compute instances list --project="$PROJECT" \
+    --filter="name~^$MIG_BASE-" \
+    --format="csv[no-heading](name,id,lastStartTimestamp)" 2>/dev/null) || HOST_BOOTS=""
+  return 0
+}
+
+# forget_restarted_hosts
+# Compares each listed host's boot with the one its clocks were stamped under
+# (`boot-<host>`), and on a change removes the clocks so the readers restamp.
+#
+#   seen-        the age behind `keep:booting`, never-registered and never-booted.
+#   idle-        an idle streak the previous boot earned.
+#   partial-     likewise for the capacity-lost recycle.
+#   beaconmiss-  consecutive beacon-less reads; the new boot has had none.
+#   beaconerr- / pinerr- / pinveto-   throttle state for events about the old boot.
+#
+# DELIBERATELY LEFT ALONE, each for its own reason:
+#   pinhold-   the monotonic cache that makes a pin hold un-shortenable. It is
+#              about the host LABEL a run was promised, it only ever keeps, and
+#              it expires by itself.
+#   absent-    whether the NAME is listed, which a restart does not change.
+#   cordon-, regtoken-, regkey-, regfail-   the registration-credential path.
+#              Its rules are asked of the instance itself (instance_durable_facts)
+#              precisely because a marker is not evidence, and loosening any of
+#              them on an inference made here is not this function's call.
+#
+# A host seen for the first time, or one whose start time is not readable yet
+# (an instance still PROVISIONING has none), records nothing and resets nothing.
+forget_restarted_hosts() {
+  local name id started boot known f
+  while IFS=, read -r name id started; do
+    # The name becomes a path and the other two become a file's contents, so all
+    # three are checked: a value that is not what the API documents is skipped,
+    # never written.
+    case "$name" in "" | *[!a-z0-9-]*) continue ;; esac
+    case "$id" in "" | *[!0-9]*) continue ;; esac
+    case "$started" in "" | *[!0-9TZ:.+-]*) continue ;; esac
+    boot="$id/$started"
+    f="$STATE_DIR/boot-$name"
+    known=$(cat "$f" 2>/dev/null) || known=""
+    [ "$known" = "$boot" ] && continue
+    if [ -n "$known" ]; then
+      rm -f "$STATE_DIR/seen-$name" "$STATE_DIR/idle-$name" "$STATE_DIR/partial-$name" \
+        "$STATE_DIR/beaconmiss-$name" "$STATE_DIR/beaconerr-$name" \
+        "$STATE_DIR/pinerr-$name" "$STATE_DIR/pinveto-$name"
+      event INFO host-restarted "$name" "$name: cold-started since its clocks were stamped (was $known, now $boot) -- age, idle and beacon-miss clocks restart" was="$known" now="$boot"
+    fi
+    printf '%s' "$boot" >"$f" 2>/dev/null || true
+  done <<<"$HOST_BOOTS"
+  return 0
 }
 
 # --- the absence ledger -------------------------------------------------------
@@ -3831,7 +3920,7 @@ drain_host() {
   # no host to apply to.
   rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/seen-$host" "$STATE_DIR/beaconmiss-$host" \
     "$STATE_DIR/pinhold-$host" "$STATE_DIR/partial-$host" "$STATE_DIR/pinveto-$host" \
-    "$STATE_DIR/pinerr-$host" "$STATE_DIR/beaconerr-$host"
+    "$STATE_DIR/pinerr-$host" "$STATE_DIR/beaconerr-$host" "$STATE_DIR/boot-$host"
   event INFO drain-delete "$host" "drain $host: deregistered $deregistered agent(s) and deleted" deregistered="$deregistered"
   DRAINED=$((DRAINED + 1))
   return 0
@@ -4160,6 +4249,11 @@ tick_pool() {
   # anything -- it kills the controller, and systemd restarts it into the same
   # tick for as long as the pinned job stays queued.
   collect_mig
+  # AFTER collect_mig, which supplies the base name the list is bounded by, and
+  # BEFORE anything reads a per-host clock: a host that cold-started since the
+  # last tick must be judged this tick on a clock that starts now.
+  collect_host_boots
+  forget_restarted_hosts
   classify_pinned
   rerun_cancelled_pinned
 
