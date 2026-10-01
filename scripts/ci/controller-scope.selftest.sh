@@ -1579,6 +1579,221 @@ for _v in CORDON_HELD CORDON_ERRORS CORDON_NO_PROGRESS; do
   check "cordon: $_v is reset at the top of tick_pool" yes "$r"
 done
 
+# ── a host recreated under its own name must not inherit the dead one's clocks ─
+#
+# The incident: a Windows host dead for 6.5 hours was recreated by an operator.
+# `recreateInstances` kept the NAME — and the instance id and creationTimestamp
+# too, because a regional MIG carries it out as an in-place update — and 96
+# seconds later the controller deleted the new machine as
+# `drain:never-registered age=23531s>=1800s`, with the beacon rule agreeing on
+# `delete:never-booted … misses=222>=3`. Every number in that verdict belonged
+# to the previous boot: seen-, idle- and beaconmiss- are files named after the
+# host, and the name was the one thing that had not changed.
+#
+# So this RUNS the reset against a scratch STATE_DIR and judges it on what the
+# real readers and the real drain rule then say, not on which files exist.
+DRAIN_RULE="$ROOT/modules/ci-runner-host-pool/scripts/drain-decision.sh"
+[ -r "$DRAIN_RULE" ] || { echo "FAIL: missing $DRAIN_RULE — the restart verdicts below would be vacuous"; exit 1; }
+[ -n "$(fn forget_restarted_hosts)" ] || {
+  echo "FAIL: forget_restarted_hosts() not found in $CTRL — every restart check below would run an empty body"; exit 1; }
+[ -n "$(fn collect_host_boots)" ] || {
+  echo "FAIL: collect_host_boots() not found in $CTRL"; exit 1; }
+
+_OLD_BOOT='4733205416644719969/2026-09-30T15:23:01.000-07:00'
+_NEW_ROW='h1,4733205416644719969,2026-09-30T21:55:09.000-07:00'
+_SAME_ROW='h1,4733205416644719969,2026-09-30T15:23:01.000-07:00'
+
+# boot_seq <known-boot|none> <list rows> [mutation-sed]
+# A host first seen 23500s ago, idle for 22826s, with 222 beacon misses and
+# every other marker a host can carry. Prints what the tick would then read.
+boot_seq() {
+  local known="$1" rows="$2" mut="${3:-}"
+  local dir code now out
+  dir=$(mktemp -d)
+  now=$(date +%s)
+  # Created up front so "no event" counts as 0 rather than as an unreadable file.
+  : >"$dir/events"
+  printf '%s' "$((now - 23500))" >"$dir/seen-h1"
+  printf '%s' "$((now - 22826))" >"$dir/idle-h1"
+  printf '%s' "$((now - 5000))" >"$dir/partial-h1"
+  printf '222' >"$dir/beaconmiss-h1"
+  for _m in beaconerr pinerr pinveto pinhold cordon regtoken regkey regfail absent; do
+    printf 'x' >"$dir/$_m-h1"
+  done
+  [ "$known" = none ] || printf '%s' "$known" >"$dir/boot-h1"
+
+  code=$(printf '%s\n%s\n%s\n%s\n' "$(fn forget_restarted_hosts)" \
+    "$(fn host_age_seconds)" "$(fn idle_seconds)" "$(fn partial_seconds)")
+  [ -n "$mut" ] && code=$(printf '%s\n' "$code" | sed "$mut")
+
+  out=$(
+    cd "$dir" && bash -c "
+      set -uo pipefail
+      STATE_DIR='$dir'
+      HOST_BOOTS='$rows'
+      log() { :; }
+      event() { echo \"\$2 \$3\" >>'$dir/events'; }
+      . '$DRAIN_RULE'
+      $code
+      forget_restarted_hosts
+      age=\$(host_age_seconds h1)
+      idle=\$(idle_seconds h1 0)
+      part=\$(partial_seconds h1 partial)
+      a=old; [ \"\$age\" -lt 60 ] && a=young
+      i=old; [ \"\$idle\" -lt 60 ] && i=young
+      p=old; [ \"\$part\" -lt 60 ] && p=young
+      v=\$(drain_decision RUNNING 0 \"\$idle\" 900 1 0 absent \"\$age\" 1800)
+      echo \"age=\$a idle=\$i partial=\$p verdict=\${v%% *}\"
+    " 2>&1
+  )
+  printf '%s miss=%s boot=%s ev=%s kept=%s stray=%s' "$out" \
+    "$(cat "$dir/beaconmiss-h1" 2>/dev/null || echo none)" \
+    "$(cat "$dir/boot-h1" 2>/dev/null || echo none)" \
+    "$(grep -c '^host-restarted h1$' "$dir/events" 2>/dev/null || true)" \
+    "$(for _m in beaconerr pinerr pinveto pinhold cordon regtoken regkey regfail absent; do
+         [ -f "$dir/$_m-h1" ] && printf '%s,' "$_m"; done)" \
+    "$(find "$dir" -maxdepth 1 -type f ! -name '*-h1' ! -name events | wc -l | tr -d ' ')"
+  rm -rf "$dir"
+}
+
+_KEPT='pinhold,cordon,regtoken,regkey,regfail,absent,'
+_ALL='beaconerr,pinerr,pinveto,pinhold,cordon,regtoken,regkey,regfail,absent,'
+_NEW_BOOT='4733205416644719969/2026-09-30T21:55:09.000-07:00'
+_UNTOUCHED="age=old idle=old partial=old verdict=drain:never-registered miss=222"
+
+# THE NEGATIVE CONTROL FIRST: the same host, not restarted, really is deleted by
+# these inputs. Without this the `keep:booting` below could be the harness
+# reading every host as young.
+check "restart: an unrestarted host keeps its clocks, and the incident verdict reproduces" \
+  "$_UNTOUCHED boot=$_OLD_BOOT ev=0 kept=$_ALL stray=0" \
+  "$(boot_seq "$_OLD_BOOT" "$_SAME_ROW")"
+
+# The incident itself: same name, same id, a later start.
+check "restart: a host recreated in place reads young, and is kept as booting" \
+  "age=young idle=young partial=young verdict=keep:booting miss=none boot=$_NEW_BOOT ev=1 kept=$_KEPT stray=0" \
+  "$(boot_seq "$_OLD_BOOT" "$_NEW_ROW")"
+
+# A delete and re-insert under one name: the start time can coincide, the id cannot.
+check "restart: a new instance id under the same name resets too" \
+  "age=young idle=young partial=young verdict=keep:booting miss=none boot=99/2026-09-30T15:23:01.000-07:00 ev=1 kept=$_KEPT stray=0" \
+  "$(boot_seq "$_OLD_BOOT" 'h1,99,2026-09-30T15:23:01.000-07:00')"
+
+# First sight records and resets NOTHING. A controller that has never recorded
+# this host's boot has no evidence of a restart, and resetting on "no record"
+# would hand every host a fresh grace on the first tick after this ships.
+check "restart: a host with no recorded boot is recorded, not reset" \
+  "$_UNTOUCHED boot=$_NEW_BOOT ev=0 kept=$_ALL stray=0" \
+  "$(boot_seq none "$_NEW_ROW")"
+
+# An unreadable fact is not a restart: a failed list, a host missing from it,
+# an instance with no start time yet, and values that are not what the API
+# documents all leave both the clocks and the record alone.
+check "restart: an empty list changes nothing" \
+  "$_UNTOUCHED boot=$_OLD_BOOT ev=0 kept=$_ALL stray=0" "$(boot_seq "$_OLD_BOOT" '')"
+check "restart: another host's restart does not reset this one" \
+  "$_UNTOUCHED boot=$_OLD_BOOT ev=0 kept=$_ALL stray=1" \
+  "$(boot_seq "$_OLD_BOOT" 'h2,5,2026-09-30T21:55:09.000-07:00')"
+check "restart: a row with no start time changes nothing" \
+  "$_UNTOUCHED boot=$_OLD_BOOT ev=0 kept=$_ALL stray=0" \
+  "$(boot_seq "$_OLD_BOOT" 'h1,4733205416644719969,')"
+check "restart: a non-numeric id changes nothing" \
+  "$_UNTOUCHED boot=$_OLD_BOOT ev=0 kept=$_ALL stray=0" \
+  "$(boot_seq "$_OLD_BOOT" 'h1,abc,2026-09-30T21:55:09.000-07:00')"
+check "restart: a start time that is not a timestamp changes nothing" \
+  "$_UNTOUCHED boot=$_OLD_BOOT ev=0 kept=$_ALL stray=0" \
+  "$(boot_seq "$_OLD_BOOT" 'h1,4733205416644719969,2026;touch pwned')"
+# The name becomes a path. `stray` counts files in the state directory that are
+# not h1's, so a write under a name that is not a GCE instance name shows here.
+check "restart: a name that is not an instance name writes no file" \
+  "$_UNTOUCHED boot=$_OLD_BOOT ev=0 kept=$_ALL stray=0" \
+  "$(boot_seq "$_OLD_BOOT" 'H1_x,5,2026-09-30T21:55:09.000-07:00')"
+
+# MUTATIONS. Each removes one thing the reset does and must turn the incident
+# case red in the field that thing owns — an assertion that survives its own
+# mutation was being satisfied by a sibling.
+_inc() { boot_seq "$_OLD_BOOT" "$_NEW_ROW" "$1"; }
+# shellcheck disable=SC2016
+case "$(_inc 's@"\$STATE_DIR/seen-\$name" @@')" in
+  "age=old idle=young partial=young verdict=drain:never-registered miss=none"*) r=caught ;; *) r=missed ;; esac
+check "restart mutation: seen- left behind is the incident again" caught "$r"
+# shellcheck disable=SC2016
+case "$(_inc 's@ "\$STATE_DIR/idle-\$name"@@')" in
+  "age=young idle=old partial=young "*) r=caught ;; *) r=missed ;; esac
+check "restart mutation: idle- left behind keeps the old idle streak" caught "$r"
+# shellcheck disable=SC2016
+case "$(_inc 's@ "\$STATE_DIR/partial-\$name"@@')" in
+  "age=young idle=young partial=old "*) r=caught ;; *) r=missed ;; esac
+check "restart mutation: partial- left behind keeps the old partial clock" caught "$r"
+# shellcheck disable=SC2016
+case "$(_inc 's@"\$STATE_DIR/beaconmiss-\$name" @@')" in
+  *" miss=222 "*) r=caught ;; *) r=missed ;; esac
+check "restart mutation: beaconmiss- left behind keeps 222 misses" caught "$r"
+# shellcheck disable=SC2016
+case "$(_inc 's@^    \[ "\$known" = "\$boot" \] && continue$@    continue@')" in
+  "$_UNTOUCHED boot=$_OLD_BOOT ev=0"*) r=caught ;; *) r=missed ;; esac
+check "restart mutation: a reset that never fires is seen" caught "$r"
+# shellcheck disable=SC2016
+case "$(boot_seq none "$_NEW_ROW" 's@^    if \[ -n "\$known" \]; then$@    if true; then@')" in
+  "age=young"*) r=caught ;; *) r=missed ;; esac
+check "restart mutation: resetting on first sight is seen" caught "$r"
+# shellcheck disable=SC2016
+case "$(boot_seq "$_OLD_BOOT" 'h1,4733205416644719969,' 's@^    case "\$started" in .*$@@')" in
+  "age=young"*) r=caught ;; *) r=missed ;; esac
+check "restart mutation: dropping the start-time check resets on an unreadable one" caught "$r"
+
+# The list call. gcloud is a shell function in every harness here and accepts
+# any flag, so the projection is asserted as text — it was run against a live
+# pool, where it returned `name,<numeric id>,<RFC 3339 start time>` per host.
+boot_list() { # <MIG_BASE> <gcloud rc>
+  local dir; dir=$(mktemp -d)
+  : >"$dir/calls"
+  bash -c "
+    set -uo pipefail
+    PROJECT=test-project
+    MIG_BASE='$1'
+    HOST_BOOTS=stale-from-the-last-tick
+    timeout() { shift; \"\$@\"; }
+    gcloud() { echo \"\$*\" >>'$dir/calls'; echo 'h1,1,2026-01-01T00:00:00.000-07:00'; return $2; }
+    $(fn collect_host_boots)
+    collect_host_boots
+    echo \"rc=\$? boots=[\$HOST_BOOTS]\"
+  " 2>&1 | tr '\n' ' '
+  printf 'calls=%s' "$(tr '\n' ';' <"$dir/calls" 2>/dev/null)"
+  rm -rf "$dir"
+}
+check "boot list: one bounded list per pool, id and start time as CSV" \
+  'rc=0 boots=[h1,1,2026-01-01T00:00:00.000-07:00] calls=compute instances list --project=test-project --filter=name~^pool-a- --format=csv[no-heading](name,id,lastStartTimestamp);' \
+  "$(boot_list pool-a 0)"
+check "boot list: a failed list leaves nothing, not last tick's answer" \
+  'rc=0 boots=[] calls=compute instances list --project=test-project --filter=name~^pool-a- --format=csv[no-heading](name,id,lastStartTimestamp);' \
+  "$(boot_list pool-a 1)"
+check "boot list: no base name means no call at all, not an unbounded one" \
+  'rc=0 boots=[] calls=' "$(boot_list '' 0)"
+fn collect_host_boots | grep -c 'timeout 60 gcloud compute instances list' >/dev/null && r=yes || r=no
+check "boot list: the call is bounded by a timeout" yes "$r"
+
+# And it reaches the tick, in the one order that works: after collect_mig (the
+# base name), before the first reader of a per-host clock.
+_tick=$(fn tick_pool)
+_n() { printf '%s\n' "$_tick" | grep -n "$1" | head -1 | cut -d: -f1; }
+_mig=$(_n '^  collect_mig$'); _col=$(_n '^  collect_host_boots$')
+_fgt=$(_n '^  forget_restarted_hosts$')
+# shellcheck disable=SC2016
+_rd=$(_n 'age=\$(host_age_seconds "\$host")')
+_cls=$(_n '^  classify_pinned$')
+if [ -n "$_mig" ] && [ -n "$_col" ] && [ -n "$_fgt" ] && [ -n "$_rd" ] && [ -n "$_cls" ] &&
+  [ "$_mig" -lt "$_col" ] && [ "$_col" -lt "$_fgt" ] && [ "$_fgt" -lt "$_cls" ] && [ "$_fgt" -lt "$_rd" ]; then
+  r=yes
+else
+  r="mig=$_mig collect=$_col forget=$_fgt classify=$_cls read=$_rd"
+fi
+check "restart: the tick lists and forgets after collect_mig and before any clock is read" yes "$r"
+# shellcheck disable=SC2016
+fn drain_host | grep -c '"\$STATE_DIR/boot-\$host"' >/dev/null && r=yes || r=no
+check "restart: the boot record is removed with the host" yes "$r"
+grep -q '^HOST_BOOTS=""$' "$CTRL" && r=yes || r=no
+check "restart: HOST_BOOTS exists at file scope for a tick under set -u" yes "$r"
+
 # THE LAST LINES IN THE FILE, and `exit` rather than a bare test, so that a check
 # appended below them cannot silently become the script's exit status again.
 echo "controller-scope selftest: $pass passed, $fail failed"
