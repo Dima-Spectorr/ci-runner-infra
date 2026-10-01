@@ -40,7 +40,7 @@
 
 # beacon_decision <read_status> <key_present> <workers> <ts_epoch> <now_epoch> \
 #                 <publish_interval> <instance_age> <register_grace> \
-#                 <registrations> <misses> <required_misses> <policy_denied>
+#                 <registrations> <misses> <required_misses> <policy_denied> #                 <offline_registrations>
 #
 #   read_status     : exit status of the get-guest-attributes call. NON-ZERO IS
 #                     NOT "no workers" — it is "we did not get an answer". This
@@ -70,6 +70,10 @@
 #                     this by matching the constraint id in gcloud's own stderr,
 #                     text no job can write, so it is not a lever a host can
 #                     pull on the controller.
+#   offline_regs    : how many of `registrations` GitHub reports as OFFLINE --
+#                     no agent process holding a session with GitHub. Read from
+#                     the same complete roster the busy flags came from. A
+#                     caller that omits it gets 0, which is the old behaviour.
 #
 # Echoes "delete:<reason>" or "keep:<reason>". Always exits 0 — the verdict is
 # the output, not the status, exactly like the other three rules.
@@ -86,6 +90,8 @@ beacon_decision() {
   local misses="${10:-0}"
   local need="${11:-2}"
   local policy_denied="${12:-0}"
+  local offline="${13:-0}"
+  case "$offline" in '' | *[!0-9]*) offline=0 ;; esac
 
   # 1. The mechanism itself failed: API error, timeout, permission, quota. Guest
   #    attributes are rate-limited to 10 queries per minute per instance, so a
@@ -144,8 +150,39 @@ beacon_decision() {
     #     is what is broken — so a worker can exist and we cannot see it. This
     #     row is the reason the rule takes the registration count at all: it is
     #     what keeps 2c confined to hosts that never became runners.
+    #
+    #     THE EXCEPTION: EVERY ONE OF THOSE AGENTS IS OFFLINE
+    #
+    #     "A worker can exist and we cannot see it" needs an agent that is
+    #     connected to GitHub to have been handed the job. When GitHub reports
+    #     EVERY agent on the host offline, and (the caller's gate, before this
+    #     rule is asked) none of them busy, there is no session a job could have
+    #     arrived over and none one could report back over: the host is not
+    #     serving, whatever is or is not running on it. That is evidence from
+    #     outside the host, the same kind the busy flag is.
+    #
+    #     Without this arm such a host is the resident 2c exists to prevent,
+    #     reached by another door. Measured in production 2026-10-01 on a
+    #     Windows pool: the host rebooted itself, its boot script stopped at
+    #     the missing registration token exactly as designed ("the register-
+    #     grace drain reclaims it"), and that drain was refused HERE on every
+    #     tick for hours -- both agents offline, the pool's only host dead, the
+    #     MIG stable at its target, and a main-branch build queued behind it.
+    #
+    #     One offline agent among live ones is NOT this case and keeps: a slot
+    #     mid-reset is offline for a moment on a host that is serving. And it is
+    #     confirmed across ticks like 2c, so a host caught between agents
+    #     restarting is not taken on one reading.
     if [ "$regs" -gt 0 ]; then
-      echo "keep:registered-without-beacon regs=$regs age=$age"
+      if [ "$offline" -ge "$regs" ]; then
+        if [ "$misses" -lt "$need" ]; then
+          echo "keep:unconfirmed-all-offline misses=$misses<$need regs=$regs age=$age"
+          return 0
+        fi
+        echo "delete:registered-all-offline regs=$regs offline=$offline age=$age>=$grace misses=$misses>=$need"
+        return 0
+      fi
+      echo "keep:registered-without-beacon regs=$regs offline=$offline age=$age"
       return 0
     fi
 

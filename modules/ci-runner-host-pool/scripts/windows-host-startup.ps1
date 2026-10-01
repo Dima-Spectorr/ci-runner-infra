@@ -1514,6 +1514,24 @@ function Write-ResetLog {
     param([Parameter(Mandatory = $true)][string] $Message)
     $line = ('{0} slot-reset: {1}' -f (Get-Date).ToUniversalTime().ToString('o'), $Message)
     try { Add-Content -LiteralPath $LogPath -Value $line -ErrorAction Stop } catch { $null = $_ }
+    # ALSO to the serial console. This service is not the boot script: nothing
+    # captures its stdout, and the file above is on a host with no SSH, no IAP
+    # and (where the org policy says so) no guest attributes. Measured
+    # 2026-10-01: a slot's service was stopped for a reset and never came back,
+    # and the reason was written only where nobody could read it. Opened and
+    # closed per line, because COM1 is shared with the guest agent; a port that
+    # is busy loses the line, never the reset.
+    $port = $null
+    try {
+        $port = New-Object System.IO.Ports.SerialPort 'COM1', 115200, ([System.IO.Ports.Parity]::None), 8, ([System.IO.Ports.StopBits]::One)
+        $port.WriteTimeout = 2000
+        $port.Open()
+        $port.WriteLine($line)
+    } catch {
+        $null = $_
+    } finally {
+        if ($null -ne $port) { try { $port.Dispose() } catch { $null = $_ } }
+    }
 }
 
 # Written through a temporary file and moved into place. A reader polling this

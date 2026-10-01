@@ -3395,7 +3395,7 @@ note_guest_attributes_denied() {
 # the busy pool would present as read-failed, which is a keep — a drain that
 # stops working when the fleet gets busy.
 beacon_gate() {
-  local host="$1" zone="$2" regs="$3"
+  local host="$1" zone="$2" regs="$3" offline="${4:-0}"
   local raw rc line key val present=0 workers="" ts_raw="" ts=0 now age misses
   local mf="$STATE_DIR/beaconmiss-$host"
   local errf denied=0 err
@@ -3483,7 +3483,7 @@ EOF
   local verdict
   verdict=$(beacon_decision "$rc" "$present" "$workers" "$ts" "$now" \
     "$BEACON_INTERVAL" "$age" "$REGISTER_GRACE" "$regs" "$misses" \
-    "$ORPHAN_CONFIRM_TICKS" "$denied")
+    "$ORPHAN_CONFIRM_TICKS" "$denied" "$offline")
 
   if { [ "$rc" = "0" ] || [ "$denied" = "1" ]; } && [ "$present" != "1" ]; then
     printf '%s' "$((misses + 1))" >"$mf"
@@ -3727,6 +3727,13 @@ drain_host() {
   # beacon_decision() reads it to tell "the boot script never ran" apart from
   # "the publisher is broken on a host that DID register".
   regs=$(printf '%s\n' "$ids" | grep -c '[0-9]')
+  # How many of them GitHub reports offline, from the same roster. An explicit
+  # "offline" only: a missing or unknown status is not evidence of anything.
+  local offline
+  offline=$(jq -r --arg h "$host" \
+    '[.runners[]? | select(.name | startswith($h + "-s")) | select(.status == "offline")] | length' \
+    <"$fresh" 2>/dev/null)
+  case "${offline:-}" in '' | *[!0-9]*) offline=0 ;; esac
 
   local zone
   zone=$(gcloud compute instances list --project="$PROJECT" \
@@ -3759,7 +3766,7 @@ drain_host() {
 
   if [ "$host_os" = "windows" ]; then
     local verdict
-    verdict=$(beacon_gate "$host" "$zone" "$regs")
+    verdict=$(beacon_gate "$host" "$zone" "$regs" "$offline")
     case "$verdict" in
       delete:*)
         event INFO drain-probe "$host" "drain $host: idle proof passed -- 0 of $regs agent(s) busy, beacon clear ($verdict)" result=idle agents="$regs" beacon="$verdict"
