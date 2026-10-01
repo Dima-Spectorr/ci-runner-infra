@@ -869,6 +869,13 @@ jobs:
       - name: fleet-audit collector self-test
         run: bash scripts/ci/fleet-audit-collector.selftest.sh
 
+      # The lost-pass retry (#1463) also runs from a schedule on the default
+      # branch, and it ACTS — a dispatch in another repository. Its rule and its
+      # three parsers are pure, and every refusing arm is mutated out and
+      # re-run. A step here for the reason above: no new check name.
+      - name: merge-lane retry decision self-test
+        run: bash scripts/ci/merge-lane-retry-decision.selftest.sh
+
   shell-runner-policy:
     name: Shell — runner policy
     runs-on: ubuntu-latest

@@ -145,7 +145,7 @@ more than one App, so this is the established pattern.
 | Pull requests | Read & write | list, read mergeability, comment on a release |
 | Checks | Read | the required-check state on the head sha |
 | Commit statuses | Read | the OTHER surface a required context can live on |
-| Actions | Read | the `workflow_run` that dispatched this pass |
+| Actions | Read (**Read & write** to arm the lost-pass retry) | the `workflow_run` that dispatched this pass; write is what lets `merge-lane-retry.yml` dispatch a consumer's lane — see "A lost pass is retried" |
 | Workflows | Read & write | merging a pull request that touches `.github/workflows/` |
 
 **Workflows is not optional either, on a fleet where most pull requests are
@@ -648,9 +648,9 @@ Every clock-based hold, and what wakes the lane when it clears:
 | `wait:mergeability-unknown` | not a clock | the next event, or the backstop |
 
 A long clock is not waited out on purpose: a runner sleeping for minutes to
-learn what the backstop learns anyway is the cost #1380 removed. Re-triggering
-the lane at a set time would need the merge App to hold `Actions: write`, which
-it does not.
+learn what the backstop learns anyway is the cost #1380 removed. A hold that
+outlives the run on a pull request GitHub calls ready is picked up by the
+fleet-wide retry instead — see "A lost pass is retried" — once that is armed.
 
 **`required-checks` must name checks that exist.** A name matching nothing is
 counted as missing and blocks every merge. That is the safe direction, but it is
@@ -828,7 +828,8 @@ What changed:
 - **A pass does not start below `quota-floor`** (default 500). The run logs
   `::warning::lane: SKIPPED, not idle — …` with the reset time, the job summary
   says *Skipped, not idle*, the queue issue keeps its last real snapshot, and the
-  run stays green; the next trigger or cron tick resumes it. That is a skip, not
+  run stays green; the next trigger resumes it, and when no trigger comes the
+  fleet-wide retry does ("A lost pass is retried", below). That is a skip, not
   blindness: a read that fails for any other reason still fails the run.
 - **A rate-limited status read no longer asks for a permission.** The
   commit-status warning used to say "grant the merge App `Commit statuses:
@@ -841,6 +842,72 @@ usual causes, in order: a pile of stale drafts or conflicting pull requests that
 nobody closes (non-draft conflicts still pay their reads), a CI workflow whose
 completions fire the lane many times an hour, and a `require-label` pin waiver
 reading files for every unlabelled candidate.
+
+### A lost pass is retried
+
+A pass skipped under the quota floor ends green, and a pass that fails part-way
+on the quota ends red — and until #1463 neither was ever run again. The next
+trigger is a CI completion, which never comes when every pull request is
+already green, and a consumer's backstop is daily. DataRetrival, 2026-09-30 to
+10-01: twelve green pull requests sat until a person dispatched the lane.
+
+`merge-lane-retry.yml` closes that, once, for the whole fleet. It runs **in
+this repository only**, every fifteen minutes, on a hosted runner — free,
+because this repository is public, which is why the timer is here and not a
+short cron in each private consumer. For every `pool` and `lane` row of
+`fleet/repos.tsv` it dispatches that repository's lane on its default branch
+(read from the API) when **all** of these hold:
+
+- the repository has an open, non-draft pull request on its default branch
+  that GitHub reports as `CLEAN`, `UNSTABLE` or `HAS_HOOKS` — ready by the
+  ruleset's own required checks;
+- no lane run, in either lane file, has **succeeded** in the last 15 minutes
+  (`retry-after`), and none is queued or running;
+- it has dispatched that repository fewer than 4 times in the last six hours.
+
+So a lost pass is retried within 30 minutes: at most one tick that still sees
+it as recent, and the one after. The rule is `lane_retry_verdict` in
+`scripts/ci/merge-lane-retry-decision.sh`, pure, with every refusing arm
+mutation-tested in its self-test.
+
+**It never starts a pool host.** The dispatch goes to `merge-lane-events.yml`,
+which is hosted by construction. A `lane`-tier repository that still has only
+`merge-lane.yml` is dispatched through it (that tier is hosted); a `pool`-tier
+repository in that shape is **held and reported**, because its one file runs on
+the pool label. Migrate it (the note under "Wiring a repository") to be covered.
+
+**It does not drain the quota it is recovering from.** `rate_limit` is free and
+is read first; under the lane's floor the tick stops there. The pull-request
+read is one GraphQL query per repository, charged to the `graphql` bucket and
+not the REST one the lanes share. REST is spent only on a repository with a
+ready pull request: three reads and the dispatch.
+
+**Reading a run.** One line per repository, in the log and on the run summary:
+
+| line | meaning |
+|---|---|
+| `skip:nothing-ready` | no pull request GitHub calls ready |
+| `hold:recent-pass` / `hold:pass-in-flight` | the lane is doing its job; nothing to retry |
+| `dispatch:<file>` (`would-dispatch:` in a dry run) | a lane pass was started |
+| `hold:retries-exhausted` | four retries did not merge it: the lane is holding that pull request **on purpose** — read the lane's own summary, not this one |
+| `hold:pool-single-file` | an unmigrated pool repository; dispatching it would start a host |
+| `hold:events-workflow-disabled` / `hold:no-lane-workflow` | GitHub disabled the file, or it is not there |
+| `hold:unreadable` | a read failed; nothing is dispatched on a guess |
+| `HELD, not idle` | the App quota is under the floor; the next tick asks again |
+
+Everything from `hold:retries-exhausted` down is also a `::warning::`, because
+the run stays green.
+
+**Arming it.** Unarmed, every tick is a dry run. Two operator steps, in order:
+
+1. Grant the merge App **Actions: Read & write** and accept it on the
+   installation — dispatching a workflow in another repository is that
+   permission and nothing less. Until it is accepted an armed tick fails with
+   `the merge App may not dispatch a workflow`, naming this section.
+2. Set the repository variable `MERGE_LANE_RETRY_ARMED` to `true` here.
+
+`MERGE_LANE_ENABLED` gates the job as it does the fleet audit's: without the
+App secrets there is nothing to read with.
 
 ### A label applied after the green
 

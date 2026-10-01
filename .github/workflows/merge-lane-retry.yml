@@ -1,0 +1,116 @@
+name: Merge lane retry
+
+# A LOST LANE PASS IS RETRIED HERE, FOR THE WHOLE FLEET (#1463).
+#
+# A lane pass that is skipped under the App quota floor, or fails part-way on
+# the quota, used to wait for "the next trigger or the cron backstop". The next
+# trigger is a CI completion, and none comes when every pull request is already
+# green; the backstop in a consumer's `merge-lane-events.yml` is daily. So one
+# lost pass stalled a repository for up to a day, with nothing red anywhere.
+#
+# The two obvious fixes are the two things #1380 removed: a short timer on a
+# pool label keeps a self-hosted host up around the clock, and a short hosted
+# timer in every consumer is billed minutes in every private repository whether
+# or not anything is waiting. So the timer lives HERE, once, on a hosted runner
+# in the one public repository, and it dispatches a consumer's hosted lane file
+# only when that repository has a pull request GitHub calls ready and no lane
+# pass has succeeded recently. The rule is `scripts/ci/merge-lane-retry-decision.sh`.
+#
+# THIS FILE DOES NOT RUN ON THE PULL REQUEST THAT CHANGES IT.
+#
+# A `schedule` trigger is dispatched from the DEFAULT BRANCH only.
+# `scripts/ci/merge-lane-retry-decision.selftest.sh` runs in `ci.yml` and is
+# what stands in for the run that cannot happen here.
+
+on:
+  # Every fifteen minutes, which with the rule's fifteen-minute `retry-after`
+  # bounds a lost pass at thirty: at most one tick that still sees the lost
+  # pass as recent, and the one after it. Off the quarter hours, because GitHub
+  # delays a busy cron slot rather than queueing it — and every lane's own
+  # sweep in this account sits on one.
+  #
+  # Free here: this repository is PUBLIC, so GitHub-hosted minutes are
+  # unmetered. That is the whole reason the timer is in this file and not in
+  # each consumer's.
+  schedule:
+    - cron: '9,24,39,54 * * * *'
+
+  # How an operator reads the verdicts without waiting for the next tick.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Its own group: this file calls no reusable workflow and must never join a
+  # lane's `merge-lane` group, where a pending retry would evict a real pass.
+  #
+  # `cancel-in-progress: false`: a tick cancelled between two repositories has
+  # dispatched some and not others, and the next one cannot tell which.
+  group: merge-lane-retry
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    name: Retry lost lane passes
+    # GitHub-hosted, and nothing else. This is the watchdog for lanes whose
+    # pools may be dark, and a timer on a pool label is the cost #1380 removed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # ENABLED IS NOT ARMED. Reading another repository needs the App token, so
+    # until the App secrets exist this job would fail at its second step on
+    # every tick; `MERGE_LANE_ENABLED` is the operator's "the App exists".
+    # Whether it may ACT is `MERGE_LANE_RETRY_ARMED`, below.
+    if: vars.MERGE_LANE_ENABLED == 'true'
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # OWNER-WIDE, the same mint the fleet audit makes: the default
+      # installation token is scoped to this repository, which is the one
+      # repository this job does not dispatch into.
+      - name: Mint the App token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.MERGE_APP_ID }}
+          private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Retry lost lane passes
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          FLEET_OWNER: ${{ github.repository_owner }}
+          # The login a dispatch is made as, so the retry cap counts this
+          # watchdog's dispatches and never a person's.
+          APP_SLUG: ${{ steps.token.outputs.app-slug }}
+          # ARMED BY A VARIABLE, NOT BY A COMMIT — the lane's own order.
+          # Dispatching a workflow in another repository needs the merge App to
+          # hold `Actions: write`, which is the owner's grant to make and the
+          # installation's to accept. Until then a dry run prints exactly what
+          # it would send, and a tick is never red for a setup nobody finished.
+          #
+          # Anything but the exact string `true` is a DRY RUN: fail-safe in the
+          # direction that does not act.
+          RETRY_ARMED: ${{ vars.MERGE_LANE_RETRY_ARMED == 'true' }}
+        run: |
+          set -uo pipefail
+          RETRY_ACTOR=""
+          [ -n "$APP_SLUG" ] && RETRY_ACTOR="${APP_SLUG}[bot]"
+          export RETRY_ACTOR
+          # `tee`, so the verdicts are in the job log and on the run's summary
+          # page: one line per repository is the whole report.
+          bash scripts/ci/merge-lane-retry.sh 2>&1 | tee report.txt
+          status=${PIPESTATUS[0]}
+          {
+            echo '### Merge lane retry'
+            echo
+            echo '```'
+            cat report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
