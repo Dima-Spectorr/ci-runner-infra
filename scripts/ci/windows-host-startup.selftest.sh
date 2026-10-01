@@ -440,6 +440,12 @@ has_fail_closed_slot_reset() { # <file>
   matches "$reset" 'if \(-not \$proc\.WaitForExit\(\$TimeoutSeconds \* 1000\)\)' || return 1
   matches "$reset" '\$proc\.Kill\(\)' || return 1
 
+  # …and its exit code is READABLE. On the 5.1 that runs the payload a Process
+  # from Start-Process -PassThru holds no handle, ExitCode is $null once the
+  # child is gone, and `$null -ge 0` is false: every reset stopped the agent,
+  # mirrored the profile and never started it again (measured 2026-10-01).
+  matches "$reset" '^ *\$null = \$proc\.Handle$' || return 1
+
   # …and the RESTORE's bound fits inside the hook's wait, with the quiesce and
   # the hive wait ahead of it. The loop is serial, so this number is not "how
   # long this slot's reset may take", it is how long ANOTHER slot's gate sits
@@ -1589,6 +1595,9 @@ mutate "the agent started before its marker exists" \
   has_fail_closed_slot_reset
 mutate "a robocopy killed mid-mirror read as a success" \
   's|return (\$code -ge 0 -and \$code -lt 8)|return ($code -lt 8)|' \
+  has_fail_closed_slot_reset
+mutate "the mirror's exit code unreadable, so a reset that worked never restarts the agent" \
+  's|^        \$null = \$proc\.Handle$||' \
   has_fail_closed_slot_reset
 mutate "the mirror downgraded to a copy that only adds" \
   "s|\$Source, \$Destination, '/MIR', '/XJ'|\$Source, \$Destination, '/E', '/XJ'|" \

@@ -1859,6 +1859,15 @@ function Copy-ProfileTree {
         $proc = Start-Process -FilePath 'robocopy.exe' -PassThru -NoNewWindow `
             -RedirectStandardOutput $out -RedirectStandardError $err `
             -ArgumentList $mirror
+        # LOAD-BEARING, and the reason no slot ever took a second job. On the
+        # Windows PowerShell 5.1 that runs this payload, Start-Process -PassThru
+        # hands back a Process holding no handle, and ExitCode read after the
+        # child has gone is $null -- measured 2026-10-01 on 5.1.26100: a mirror
+        # that exited 1 read as $null, `$null -ge 0` is false, and every reset
+        # stopped the agent, mirrored the profile and returned without starting
+        # it again. Reading .Handle while the child is alive is what makes the
+        # code readable later; Invoke-BoundedNative does the same for the boot.
+        $null = $proc.Handle
         if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
             try { $proc.Kill(); [void] $proc.WaitForExit(5000) } catch { $null = $_ }
             Write-ResetLog "robocopy did not finish within $TimeoutSeconds s and was killed"
@@ -1877,6 +1886,13 @@ function Copy-ProfileTree {
     # Robocopy's exit code is a bit field: 0-7 is success and 8 or more is not.
     # NEGATIVE is a failure too -- a killed robocopy exits with the NTSTATUS as a
     # negative integer, and a bare `-lt 8` reads every one of those as success.
+    # The code is SAID when it is refused, an unreadable one included: the caller's
+    # line names the two directories and not why the mirror was not believed.
+    if ($null -eq $code) {
+        Write-ResetLog 'robocopy exited and its exit code could not be read -- treated as a failed mirror'
+        return $false
+    }
+    if ($code -lt 0 -or $code -gt 7) { Write-ResetLog "robocopy exit $code" }
     return ($code -ge 0 -and $code -lt 8)
 }
 
