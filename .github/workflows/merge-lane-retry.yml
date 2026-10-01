@@ -62,13 +62,17 @@ jobs:
     # until the App secrets exist this job would fail at its second step on
     # every tick; `MERGE_LANE_ENABLED` is the operator's "the App exists".
     # Whether it may ACT is `MERGE_LANE_RETRY_ARMED`, below.
-    if: vars.MERGE_LANE_ENABLED == 'true'
+    # The App key is a repository secret, so a dispatch from any other branch
+    # would mint the token for whatever that branch's copy of the script does.
+    if: vars.MERGE_LANE_ENABLED == 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
 
     permissions:
       contents: read
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # OWNER-WIDE, the same mint the fleet audit makes: the default
       # installation token is scoped to this repository, which is the one
@@ -80,6 +84,12 @@ jobs:
           app-id: ${{ secrets.MERGE_APP_ID }}
           private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          # Only what a retry reads and sends. The App can also merge; this
+          # token cannot.
+          permission-actions: write
+          permission-pull-requests: read
+          permission-contents: read
+          permission-metadata: read
 
       - name: Retry lost lane passes
         env:
