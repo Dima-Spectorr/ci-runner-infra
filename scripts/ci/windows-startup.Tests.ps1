@@ -819,6 +819,25 @@ Describe 'slot reset service body' {
         $script:Reset | Should -Not -Match '& robocopy'
     }
 
+    # Windows PowerShell 5.1 runs the payload, and there a Process from
+    # Start-Process -PassThru has no handle: ExitCode is $null once the child is
+    # gone, `$null -ge 0` is false, and a mirror that worked reads as one that
+    # failed -- so the agent was stopped and never started again. Pester runs on
+    # pwsh 7, which does not have the fault, so what is asserted is the ORDER:
+    # the handle is read after the start and before the wait.
+    It 'reads the mirror handle between the start and the wait, so its exit code is readable' {
+        $start = $script:Reset.IndexOf("Start-Process -FilePath 'robocopy.exe' -PassThru")
+        $handle = $script:Reset.IndexOf('$null = $proc.Handle')
+        $wait = $script:Reset.IndexOf('$proc.WaitForExit($TimeoutSeconds * 1000)')
+        $start | Should -BeGreaterThan -1
+        $handle | Should -BeGreaterThan $start
+        $wait | Should -BeGreaterThan $handle
+    }
+
+    It 'says so when the mirror exit code cannot be read, rather than failing silently' {
+        $script:Reset | Should -Match 'if \(\$null -eq \$code\) \{\s+Write-ResetLog [^\n]+\s+return \$false'
+    }
+
     # ...and substituted with the RESTORE budget, not the capture's. One serial
     # loop serves every slot, so this bound is how long another slot's gate waits
     # behind this one -- at the capture's 600 s it would outlast the hook's own
