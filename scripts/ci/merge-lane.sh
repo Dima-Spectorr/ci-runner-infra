@@ -70,6 +70,9 @@ LANE_BASE_STATES="$LANE_TMP/base-health-states"
 # that turns the halt into "only a demonstrated fix merges".
 LANE_BASE_RED=''
 LANE_BASE_FAILING=()
+# The REQUIRED checks failing on that red tip, read only when a failing name is
+# outside the required list — they stand in for a push-only one (#1482).
+LANE_BASE_REQ_FAILING=()
 LANE_BASE_FIX_MERGED=''
 
 # ---------------------------------------------------------------------------
@@ -1404,6 +1407,8 @@ lane_base_is_broken() {
 # Only `success` counts. A check that SKIPPED on the fix has not shown the break
 # is gone: it may have skipped precisely because the fix did not touch what it
 # covers, and admitting that would merge onto a red base on no evidence (#1443).
+# A push-only base-health check is the one exception, and stands in for nothing
+# on its own: see `lane_base_fix_count` (#1482).
 lane_record_states_of() { # <sha> <states-file> <name>...
   local sha="$1" states="$2"
   shift 2
@@ -1413,25 +1418,56 @@ lane_record_states_of() { # <sha> <states-file> <name>...
 }
 
 lane_base_fix_passed() {
-  local sha="$1" states="$2" name bucket passed=0
+  local sha="$1" states="$2" name bucket
   local -A seen=()
   local -a unread=()
   while read -r bucket name; do
     [ -n "$name" ] && seen["$name"]="$bucket"
   done <"$states"
-  for name in "${LANE_BASE_FAILING[@]}"; do
-    [ -n "${seen[$name]+x}" ] || unread+=("$name")
+  # The required checks failing on the base are read too: they stand in for a
+  # push-only base-health check the head can never report (#1482).
+  for name in "${LANE_BASE_FAILING[@]}" "${LANE_BASE_REQ_FAILING[@]}"; do
+    if [ -z "${seen[$name]+x}" ]; then
+      unread+=("$name")
+      seen["$name"]=unread
+    fi
   done
   if [ "${#unread[@]}" -gt 0 ]; then
     lane_record_states_of "$sha" "$states" "${unread[@]}"
-    while read -r bucket name; do
-      [ -n "$name" ] && seen["$name"]="$bucket"
-    done <"$states"
   fi
-  for name in "${LANE_BASE_FAILING[@]}"; do
-    [ "${seen[$name]:-}" = "success" ] && passed=$((passed + 1))
+  # The counting rule is `lane_base_fix_count`, tested case by case in the
+  # decision selftest.
+  lane_base_fix_count "$states" "$(printf '%s\n' "${LANE_BASE_FAILING[@]}")" \
+    "$(printf '%s\n' "${LANE_BASE_REQ_FAILING[@]}")" "$(printf '%s\n' "${REQUIRED[@]}")"
+}
+
+# ---------------------------------------------------------------------------
+# lane_base_read_required_failing — which REQUIRED checks fail on a red tip.
+#
+#   lane_base_read_required_failing <base-sha>
+#
+# Fills `LANE_BASE_REQ_FAILING`. Only asked when a check failing on the base is
+# outside the required list (#1482): `base-health-checks` may name a push-only
+# summary that no pull request ever reports, and what it summarises — the
+# required checks that are red on the same tip — is what a repair must turn
+# green instead. Read as a base tip (`BASE_TIP_READ`), so a superseded run is
+# not a failure; the diagnostics file is left alone, it was printed already.
+# Unreadable reads record nothing, so nothing stands in, and the repair waits.
+lane_base_read_required_failing() {
+  local states="$LANE_TMP/base-required-states"
+  : >"$states"
+  local BASE_TIP_READ=1 LANE_BASE_DIAG=''
+  lane_record_states_of "$1" "$states" "${REQUIRED[@]}"
+  mapfile -t LANE_BASE_REQ_FAILING < <(sed -n 's/^failed //p' "$states")
+}
+
+lane_name_in() { # <name> <list>...
+  local want="$1" n
+  shift
+  for n in "$@"; do
+    [ "$n" = "$want" ] && return 0
   done
-  echo "$passed"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -1646,6 +1682,7 @@ one_pass() {
   LANE_HALT_REASON=''
   LANE_BASE_RED=''
   LANE_BASE_FAILING=()
+  LANE_BASE_REQ_FAILING=()
   # Read once, and BOTH answers taken from it: whether to halt, and whether
   # anything answers for this base at all. The second is what the batch consults
   # after each merge, and it has to be decided here — on a tip old enough for a
@@ -1667,9 +1704,18 @@ one_pass() {
       return 1
     fi
     LANE_BASE_RED=1
-    local failing_list
+    local failing_list name
     failing_list="$(IFS=,; echo "${LANE_BASE_FAILING[*]}")"
     echo "lane: base is red on ${failing_list//,/, } — reading the queue for a pull request that fixes it; nothing else merges"
+    # A failing name outside the required list may be a push-only summary no
+    # pull request ever reports (#1482); read what it summarises.
+    for name in "${LANE_BASE_FAILING[@]}"; do
+      if ! lane_name_in "$name" "${REQUIRED[@]}"; then
+        lane_base_read_required_failing "$base_sha"
+        echo "lane: '$name' is not a required check — a candidate it never ran on shows the fix by passing the required checks failing on the base: ${LANE_BASE_REQ_FAILING[*]:-(none, so it cannot)}"
+        break
+      fi
+    done
   fi
 
   # Taken from the read that just happened, and taken HERE rather than against

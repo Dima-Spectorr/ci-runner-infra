@@ -499,6 +499,63 @@ basefix "wait:base-red holds drop:expired" "a drop waits too, so a red base comm
 basefix "skip:red" "a verdict that was never going to act passes through unchanged" "skip:red" 0 2 2
 basefix "wait:review" "a review hold stays a review hold" "wait:review grace" 0 2 2
 
+# ---------------------------------------------------------------------------
+# #1482 — A PUSH-ONLY BASE-HEALTH CHECK IS SHOWN FIXED BY THE REQUIRED CHECKS.
+# IntegrateIT: `main-health` runs on a push to main and never on a pull request,
+# so no head reports it. fixcount runs `lane_base_fix_count` on a head-states
+# file and feeds its count to `lane_base_fix_verdict`, exactly as the driver
+# does. args: head-states-lines failing base-required-failing required
+FIXDIR="$(mktemp -d)"
+trap 'rm -rf "$FIXDIR"' EXIT
+fixcount() {
+  local want="$1" desc="$2" states="$FIXDIR/states" failing="$4" fixed got nfail
+  printf '%b' "$3" >"$states"
+  fixed=$(lane_base_fix_count "$states" "$failing" "$5" "$6")
+  nfail=$(printf '%s\n' "$failing" | grep -c . || true)
+  got=$(lane_base_fix_verdict "merge:ready" 0 "$fixed" "$nfail")
+  if [[ "$got" == "$want"* ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  states: %s\n  want: %s*\n  got:  %s\n' "$desc" "$3" "$want" "$got"
+  fi
+}
+REQ=$'ci\ngeneric-binary'
+GREEN_HEAD='success ci\nsuccess generic-binary\nabsent main-health\n'
+fixcount "merge:base-fix fixes=1/1" \
+  "push-only base-health red + required ci red on the base + PR ci success merges" \
+  "$GREEN_HEAD" main-health ci "$REQ"
+fixcount "wait:base-red fixes=0/1 " \
+  "the same, but the PR's ci is failing: it waits" \
+  'failed ci\nsuccess generic-binary\nabsent main-health\n' main-health ci "$REQ"
+fixcount "wait:base-red fixes=0/1 " \
+  "base-health red with no required check failing on the base waits (fail closed)" \
+  "$GREEN_HEAD" main-health "" "$REQ"
+fixcount "wait:base-red fixes=0/1 " \
+  "a skipped required check is not a demonstration, even standing in" \
+  'skipped ci\nsuccess generic-binary\nabsent main-health\n' main-health ci "$REQ"
+fixcount "wait:base-red fixes=0/1 " \
+  "every required check failing on the base must pass, not just one" \
+  'success ci\nfailed generic-binary\nabsent main-health\n' main-health $'ci\ngeneric-binary' "$REQ"
+fixcount "wait:base-red fixes=0/1 " \
+  "a base-health check the head has not reported YET is pending, not push-only" \
+  'success ci\nsuccess generic-binary\npending main-health\n' main-health ci "$REQ"
+fixcount "wait:base-red fixes=0/1 " \
+  "a base-health check that RAN on the head and failed is not stood in for" \
+  'success ci\nsuccess generic-binary\nfailed main-health\n' main-health ci "$REQ"
+fixcount "wait:base-red fixes=0/1 " \
+  "an absent REQUIRED check never stands in for itself" \
+  'absent ci\nsuccess generic-binary\n' ci ci "$REQ"
+fixcount "wait:base-red fixes=0/1 " \
+  "an unreadable head (no states at all) counts nothing" \
+  '' main-health ci "$REQ"
+fixcount "merge:base-fix fixes=2/2" \
+  "a failing required check is still counted on its own success beside a push-only one" \
+  "$GREEN_HEAD" $'ci\nmain-health' ci "$REQ"
+fixcount "wait:base-red fixes=1/2 " \
+  "a skipped base-health check that ran on PRs is still not a pass (#1443)" \
+  'success ci\nsuccess generic-binary\nskipped lint\n' $'ci\nlint' ci "$REQ"
+
 # How many of the ranking a pass may act on. args: strict max acted red.
 batch() {
   local want="$1" desc="$2" got

@@ -381,6 +381,69 @@ lane_base_fix_verdict() {
 }
 
 # ---------------------------------------------------------------------------
+# lane_base_fix_count — how many of the base's failing checks a head has fixed.
+#
+#   lane_base_fix_count <head-states> <failing> <base-required-failing> <required>
+#
+# <head-states> is the `<bucket> <name>` file `check_counts` writes for the
+# head. The other three are newline-separated name lists: the base-health
+# checks failing on the red tip, the REQUIRED checks failing on that same tip,
+# and the required list itself. Prints the count `lane_base_fix_verdict` takes
+# as <fixed>.
+#
+# A failing check counts when it is `success` on the head. A skip never counts:
+# it may have skipped precisely because the head did not touch what it covers,
+# and admitting that merges onto a red base on no evidence (#1443).
+#
+# A PUSH-ONLY BASE-HEALTH CHECK IS SHOWN FIXED BY THE REQUIRED CHECKS (#1482).
+# `base-health-checks` may name a check that runs on a push to the base and
+# never on a pull request — IntegrateIT's `main-health`. No head can ever report
+# it, so counting only its own `success` refused every repair forever: lane run
+# 37278255198, `#23682 wait:base-red fixes=0/1` with `ci`, `build`,
+# `typecheck + lint` and `generic-binary` all green at behind=0, and the whole
+# repository frozen behind it. Such a check — not a required one, and with NO
+# check-run of that name on the head (`absent`) — counts as fixed when every
+# required check failing on the base tip is `success` on the head. Those do run
+# on pull requests, and they are what turned the summary red.
+#
+# Fail closed: with no required check failing on the base (the summary is red
+# for some other reason), or none readable, there is nothing to stand in for it
+# and it does not count. A head that merely has not reported it yet is
+# `pending`, not `absent`, and does not count either.
+# ---------------------------------------------------------------------------
+lane_base_fix_count() {
+  local states="${1:-}" failing="${2:-}" req_failing="${3:-}" required="${4:-}"
+  local bucket name proxy='' passed=0
+  local -A seen=() req=()
+  if [ -n "$states" ] && [ -r "$states" ]; then
+    while read -r bucket name; do
+      [ -n "$name" ] && seen["$name"]="$bucket"
+    done <"$states"
+  fi
+  while IFS= read -r name; do
+    [ -n "$name" ] && req["$name"]=1
+  done <<<"$required"
+  # `yes` only when at least one required check failed on the base AND every
+  # one of them passed on this head; a single miss, or an empty list, is no.
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if [ "${seen[$name]:-}" = "success" ]; then
+      [ -n "$proxy" ] || proxy=yes
+    else
+      proxy=no
+    fi
+  done <<<"$req_failing"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    [ "${seen[$name]:-}" = "success" ] && passed=$((passed + 1)) && continue
+    if [ "${seen[$name]:-}" = "absent" ] && [ -z "${req[$name]+x}" ] && [ "$proxy" = "yes" ]; then
+      passed=$((passed + 1))
+    fi
+  done <<<"$failing"
+  echo "$passed"
+}
+
+# ---------------------------------------------------------------------------
 # lane_batch_size — how many of one pass's ranking the lane may act on.
 #
 #   lane_batch_size <strict> <max_actions> <acted> <base_red>

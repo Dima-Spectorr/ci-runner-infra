@@ -1216,6 +1216,18 @@ So the lane does not try to prevent it. It **bounds** it, with two things:
    - every check **failing on the base passed** on its head — a *skipped* one
      does not count, because it has not shown the break is gone.
 
+   **A push-only base-health check is shown fixed by the required checks
+   (#1482).** `base-health-checks` may name a summary that runs on a push to the
+   base and never on a pull request (IntegrateIT's `main-health`), so no head
+   can ever report it. When such a check — not in `required-checks`, and with
+   no check-run of that name on the head — is failing on the base, the lane
+   reads the **required** checks on the same red tip, and the head counts as
+   fixing it only if every required check failing there is `success` on the
+   head. If no required check is failing on the base (the summary is red for
+   some other reason) or none can be read, nothing stands in and the candidate
+   waits. The log says `lane: '<name>' is not a required check — … passing the
+   required checks failing on the base: <names>`.
+
    The log says `lane: base is red; #N is green on <checks> against the current
    tip <sha> — merging it as the base fix`, the queue row reads `merge` /
    `base-fix`, and every other candidate reads `wait` / `base-red …` with the
