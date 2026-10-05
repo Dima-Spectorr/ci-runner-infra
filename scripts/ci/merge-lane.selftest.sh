@@ -1408,6 +1408,33 @@ only_a_pass_counts_as_fixing_the_base() {
   matches "$(code_of "$1")" '^    \[ "\$\{seen\[\$name\]:-\}" = "success" \] && passed='
 }
 
+# A PUSH-ONLY BASE-HEALTH CHECK IS STOOD IN FOR BY THE REQUIRED CHECKS (#1482).
+# IntegrateIT, lane run 37278255198: `main-health` never runs on a pull request,
+# so `#23682 wait:base-red fixes=0/1` with every required check green and the
+# repository frozen. The counting rule is `lane_base_fix_count`, tested case by
+# case in the decision selftest; these assert the driver reads the base's
+# failing REQUIRED checks when a failing name is outside the required list, and
+# hands them to the count.
+reads_the_required_checks_behind_a_push_only_failure() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      if ! lane_name_in "\$name" "\$\{REQUIRED\[@\]\}"; then$' || return 1
+  matches "$code" '^        lane_base_read_required_failing "\$base_sha"$' || return 1
+  matches "$code" '^  lane_record_states_of "\$1" "\$states" "\$\{REQUIRED\[@\]\}"$' || return 1
+  matches "$code" '^  local BASE_TIP_READ=1 LANE_BASE_DIAG=.*$'
+}
+hands_the_required_failures_to_the_count() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^  lane_base_fix_count "\$states" ' || return 1
+  matches "$code" '^    "\$\(printf .%s\\n. "\$\{LANE_BASE_REQ_FAILING\[@\]\}"\)" '
+}
+# The stand-in only for a name the head has no check-run of, and never for a
+# required one.
+stands_in_only_for_an_absent_non_required_check() {
+  matches "$(code_of "$1")" '^    if \[ "\$\{seen\[\$name\]:-\}" = "absent" \] && \[ -z "\$\{req\[\$name\]\+x\}" \] && \[ "\$proxy" = "yes" \]; then$'
+}
+
 # Said at the merge, in the words an operator will search for.
 announces_the_base_fix() {
   matches "$(code_of "$1")" '^      echo "::notice::lane: base is red; #\$action_num is green on .* — merging it as the base fix"$'
@@ -1861,7 +1888,10 @@ check names_what_is_failing_on_a_red_base "$DRIVER" "a red base does not record 
 check admits_only_the_base_fix_on_a_red_base "$DRIVER" "a red base no longer filters the walk, so every green pull request merges onto the break"
 check records_the_head_states_on_a_red_base "$DRIVER" "the candidate's check states are not recorded on a red base, so the fix test re-reads every head or counts nothing as passing"
 check compares_the_fix_against_the_red_tip "$DRIVER" "a non-strict base does not check the fix contains the red tip, so a green branch cut before the break merges as its fix"
-check only_a_pass_counts_as_fixing_the_base "$DRIVER" "a skipped check counts as fixing the base, so a pull request that never ran the failing job merges onto the break"
+check only_a_pass_counts_as_fixing_the_base "$DECISION" "a skipped check counts as fixing the base, so a pull request that never ran the failing job merges onto the break"
+check reads_the_required_checks_behind_a_push_only_failure "$DRIVER" "a red base whose failing check never runs on a pull request is not looked behind, so every repair is refused forever (#1482)"
+check hands_the_required_failures_to_the_count "$DRIVER" "the required checks failing on the base are read and never counted, so a push-only base-health check still refuses every repair (#1482)"
+check stands_in_only_for_an_absent_non_required_check "$DECISION" "the required checks stand in for a check that ran on the head, or for a required one, so a pull request that failed it merges onto the break (#1482)"
 check announces_the_base_fix "$DRIVER" "a merge onto a red base is not announced, so an operator cannot tell a base fix from the halt being broken"
 check ends_the_run_after_a_base_fix "$DRIVER" "the run carries on after a base fix, onto a tip whose health has not been reported"
 check reads_its_own_list_on_the_base_tip "$DRIVER" "the base-health gate reads the merge list instead of its own, so arming it costs a full required suite on every push to the base"
@@ -2188,8 +2218,18 @@ mutate "the head read stops recording states" "$DRIVER" \
   's@LANE_STATE_SINK="\${LANE_BASE_RED:+\$head_states}" check_counts@check_counts@' records_the_head_states_on_a_red_base
 mutate "the fix is compared against the moving branch name" "$DRIVER" \
   's@compare/\$base_sha\.\.\.\$sha" --jq .\.behind_by. 2>/dev/null || echo@compare/$LANE_BASE...$sha" --jq '"'"'.behind_by'"'"' 2>/dev/null || echo@' compares_the_fix_against_the_red_tip
-mutate "a skipped check counts as fixing the base" "$DRIVER" \
+mutate "a skipped check counts as fixing the base" "$DECISION" \
   's@\[ "\${seen\[\$name\]:-}" = "success" \]@[ "${seen[$name]:-}" != "failed" ]@' only_a_pass_counts_as_fixing_the_base
+mutate "a push-only failure is never looked behind" "$DRIVER" \
+  '/^        lane_base_read_required_failing "\$base_sha"$/d' reads_the_required_checks_behind_a_push_only_failure
+mutate "the base's required checks are read as a head, so a superseded run reads as failing" "$DRIVER" \
+  's@^  local BASE_TIP_READ=1 LANE_BASE_DIAG=.*$@  local LANE_BASE_DIAG=@' reads_the_required_checks_behind_a_push_only_failure
+mutate "the required failures are read and never counted" "$DRIVER" \
+  's|"\${LANE_BASE_REQ_FAILING\[@\]}")" "\$(printf|"")" "$(printf|' hands_the_required_failures_to_the_count
+mutate "the stand-in covers a check that ran and failed on the head" "$DECISION" \
+  's@\[ "\${seen\[\$name\]:-}" = "absent" \] && @[ "${seen[$name]:-}" != "success" ] \&\& @' stands_in_only_for_an_absent_non_required_check
+mutate "the stand-in covers a required check" "$DECISION" \
+  's@ && \[ -z "\${req\[\$name\]+x}" \]@@' stands_in_only_for_an_absent_non_required_check
 mutate "the base fix merges without a word" "$DRIVER" \
   '/merging it as the base fix"$/d' announces_the_base_fix
 mutate "a base fix is not recorded" "$DRIVER" \
