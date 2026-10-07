@@ -331,6 +331,80 @@ check "completed takes _actions"              test ! -e "$WORK/_actions/action.y
 check "completed takes the credential in _temp" test ! -e "$WORK/_temp/creds.json"
 
 echo
+echo "tool cache: a host image that carries the baked tool cache still earns the marker (#1499)"
+#
+# Every reset above ran with no tool cache at all: no MANIFEST, no slot tree. So
+# the block of the reset that REPORTS on the tool cache was skipped by its own
+# guard in every case in this file -- and that block looped over the slot's
+# *.complete files in a variable named `marker`, the same name the reset's last
+# statement writes the clean marker through. On a host whose image carries the
+# baked tool cache the loop ran, the name was left pointing at a runtime's
+# .complete file, and the reset truncated that, exited 0 and wrote no marker.
+# Nothing was logged; the next job's started hook failed it, and so did every
+# job after. The fixture that would have caught it is two files.
+#
+# The .complete file has CONTENT here, which a real one does not: an empty file
+# truncated is an empty file, and the second assertion below would then be true
+# of the bug.
+TC_TOOLS="$CACHE_SLOTS/$IDX/$TOOL_CACHE_NAME"
+TC_DONE="$TC_TOOLS/node/1.2.3/x64.complete"
+TC_LOG="$SB/tool-cache-run"
+seed_tool_cache() {
+  install -d -m 0755 "$TOOL_CACHE_MASTER" "$CACHE_SLOTS" "$CACHE_SLOTS/$IDX"
+  printf 'node\t1.2.3\tx64\tnode-v1.2.3-linux-x64.tar.gz\n' >"$TOOL_CACHE_MASTER/MANIFEST"
+  install -d -o "$U" -g "$U" -m 0755 "$TC_TOOLS" "$TC_TOOLS/node" "$TC_TOOLS/node/1.2.3"
+  printf 'extracted\n' >"$TC_DONE"
+  chown "$U:$U" "$TC_DONE"
+}
+tool_cache_reset() { # <script> <stage> -- one reset; its output kept apart as well
+  "$1" "$2" "$IDX" >"$TC_LOG" 2>&1
+  rc=$?
+  cat "$TC_LOG" >>"$HOOKLOG"
+  return 0
+}
+
+# 'completed' alone. 'boot' writes the marker through the same statement, and a
+# second boot reset here would spend its service-manager retries to prove
+# nothing the first case does not.
+seed_tool_cache
+rm -f -- "$MARKER"
+tool_cache_reset "$RESET" completed
+check "completed succeeds with a baked runtime in the slot's tool cache" test "$rc" = 0
+check "it writes the clean marker, at the marker's own path"             test -f "$MARKER"
+check "it leaves the runtime's .complete file as it was"                 grep -qx extracted "$TC_DONE"
+seed_work
+in_workspace started
+rc=$?
+check "and the next job's started hook passes on that slot" test "$rc" = 0
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+
+# BREAK IT BACK. The loop variable is given the marker's name again, and the two
+# assertions above must both go red against it. With the name restored the write
+# lands on the .complete file, so what stands between that and a reset reporting
+# success is the last check the reset makes -- which is asserted here as well:
+# it must fail, and say which file is missing.
+TC_MUT="$SB/slot-reset.tc-mutant.sh"
+sed 's/tc_done/marker/g' "$RESET" >"$TC_MUT"
+chmod 0755 "$TC_MUT"
+if cmp -s "$RESET" "$TC_MUT" || ! grep -q 'for marker in ' "$TC_MUT"; then
+  bad "mutation did not apply: the tool-cache loop variable"
+else
+  seed_tool_cache
+  rm -f -- "$MARKER"
+  tool_cache_reset "$TC_MUT" completed
+  check_not "with the loop reusing the marker's name, no clean marker is written -- so the check is live" test -f "$MARKER"
+  check_not "and the runtime's .complete file is truncated -- so that check is live too" grep -qx extracted "$TC_DONE"
+  check_not "a reset that wrote no marker does not report success"                       test "$rc" = 0
+  check "and it names the marker that is missing"  grep -q "clean marker $MARKER does not exist" "$TC_LOG"
+fi
+
+# Back to a clean slot and no tool cache, which is the state every section below
+# was written against.
+rm -rf -- "$TOOL_CACHE_MASTER" "$CACHE_SLOTS"
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+check "the slot is clean again once the tool cache is gone" test -f "$MARKER"
+
+echo
 echo "quiesce: a writer the last job left running"
 #
 # #237 finding 3, and the reason this suite exists rather than another static
