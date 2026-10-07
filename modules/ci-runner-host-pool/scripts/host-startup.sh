@@ -1577,30 +1577,39 @@ manifest="$TOOL_CACHE_MASTER/MANIFEST"
 if [ -d "\$tools" ] && [ -s "\$manifest" ]; then
   # Read ONCE, before the loop. The names the loop walks are the SLOT's, so
   # anything done per name is work a job gets to choose the amount of.
-  baked="\$(awk -F'\t' 'NF >= 3 { printf "%s%s %s", sep, \$1, \$2; sep = ", " }' "\$manifest")"
+  #
+  # NAMES OF THEIR OWN (#1499). This script is one global scope, top to bottom,
+  # and two names this block used to borrow are read far below it: "marker" is
+  # the slot's clean marker, written by the last statement of a reset, and
+  # "baked" is the path of the baked-image list the prune greps. Looping over
+  # the tool cache in "marker" left it pointing at a runtime's .complete file,
+  # so the reset truncated THAT, exited 0, and never wrote the clean marker:
+  # every job on a host whose image carries a baked tool cache failed at its
+  # started hook. Hence tc_baked and tc_done, which nothing else reads.
+  tc_baked="\$(awk -F'\t' 'NF >= 3 { printf "%s%s %s", sep, \$1, \$2; sep = ", " }' "\$manifest")"
   seen=0
-  for marker in "\$tools"/*/*/*.complete; do
+  for tc_done in "\$tools"/*/*/*.complete; do
     # The glob itself when nothing matched, which is the normal state on a slot
     # whose jobs all hit.
-    [ -e "\$marker" ] || continue
+    [ -e "\$tc_done" ] || continue
     # BOUNDED, because the count is the slot's to choose. A job that planted ten
     # thousand markers would otherwise decide how long root spends in the reset
     # that stands between it and the next job, and the reset is what the sweeper
     # runs under a timeout.
     seen=\$((seen + 1))
     if [ "\$seen" -gt 32 ]; then
-      say "slot \$idx: TOOL CACHE MISS — more than 32 runtimes in its tool cache, so reporting stopped there. This image baked \$baked."
+      say "slot \$idx: TOOL CACHE MISS — more than 32 runtimes in its tool cache, so reporting stopped there. This image baked \$tc_baked."
       break
     fi
-    t_arch=\${marker##*/}; t_arch=\${t_arch%.complete}
-    t_ver=\${marker%/*}; t_ver=\${t_ver##*/}
-    t_tool=\${marker%/*/*}; t_tool=\${t_tool##*/}
+    t_arch=\${tc_done##*/}; t_arch=\${t_arch%.complete}
+    t_ver=\${tc_done%/*}; t_ver=\${t_ver##*/}
+    t_tool=\${tc_done%/*/*}; t_tool=\${t_tool##*/}
     if awk -F'\t' -v t="\$t_tool" -v v="\$t_ver" -v a="\$t_arch" \
          'NF >= 3 && \$1 == t && \$2 == v && \$3 == a { hit = 1 } END { exit !hit }' \
          "\$manifest"; then
       continue
     fi
-    say "slot \$idx: TOOL CACHE MISS — a job put \$(safe "\$t_tool") \$(safe "\$t_ver") (\$(safe "\$t_arch")) in its tool cache; this image baked \$baked. The workflow pin and the image pin disagree, so that job downloaded its runtime from github.com and so will every job that asks for it."
+    say "slot \$idx: TOOL CACHE MISS — a job put \$(safe "\$t_tool") \$(safe "\$t_ver") (\$(safe "\$t_arch")) in its tool cache; this image baked \$tc_baked. The workflow pin and the image pin disagree, so that job downloaded its runtime from github.com and so will every job that asks for it."
   done
 fi
 
@@ -1869,6 +1878,18 @@ fi
 # nothing a run left behind outlives the run.
 if [ "\$rc" = 0 ] && [ "\$stage" != started ]; then
   : >"\$marker" || rc=1
+  # AND THEN LOOKED FOR, BY ITS OWN PATH (#1499). The write above goes through a
+  # name, and a name can be reassigned anywhere in the thousand lines between
+  # where it is set and here. When that happened the write succeeded -- on some
+  # other file -- and the reset exited 0 without a marker and without a word,
+  # so the only symptom was the NEXT job failing with "was not left clean". A
+  # reset may not claim success without its marker: the path is spelled out
+  # again rather than read back from the name, and its absence is a logged
+  # failure of THIS reset.
+  if [ ! -f "\$SLOT_STATE/\$idx/clean" ]; then
+    say "slot \$idx: the reset finished but its clean marker \$SLOT_STATE/\$idx/clean does not exist (the write went to \$(safe "\$marker")) -- the slot is NOT clean and this reset fails"
+    rc=1
+  fi
 fi
 
 # THE COUNT, decided by the same rc the marker was. A reset that reached the
