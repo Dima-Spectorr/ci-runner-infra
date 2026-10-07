@@ -29,6 +29,38 @@ STATE_DIR="/var/lib/ci-controller"
 SELF_INSTALL="/opt/ci-controller/controller.sh"
 LOG=/var/log/ci-controller.log
 
+# ONE VM, ONE PROCESS PER REPOSITORY (#1486).
+#
+# A controller given a `ci-repos` table runs this same file once per row, as
+# `ci-controller@<slug>.service`, and the unit names its repository in
+# CI_REPO_SLUG. Everything a tick remembers — heartbeat, ETag store, rate
+# ledger, jobs directory, drain counters, every marker — is reached through
+# STATE_DIR, so pointing STATE_DIR at the repository's own directory is the
+# whole of the isolation: no function below knows a second repository exists.
+#
+# The log moves with it for the same reason. Two loops appending to one file
+# would interleave lines that name a host and not a repository.
+#
+# With NO slug this is the controller it always was: one repository, the
+# original unit name and the original paths, so a controller upgraded in place
+# keeps every marker it had. STATE_ROOT is what the installer and the watchdog
+# address repositories under; in that shape it IS the state directory.
+STATE_ROOT="$STATE_DIR"
+REPO_SLUG="${CI_REPO_SLUG:-}"
+if [ -n "$REPO_SLUG" ]; then
+  # The slug becomes a path. It is written by this file's own installer from a
+  # value repo_slug() produced, so anything else here is a hand-edited unit —
+  # refused rather than followed out of the state directory.
+  case "$REPO_SLUG" in
+    *[!a-z0-9._-]* | [!a-z0-9]*)
+      echo "CI_REPO_SLUG '$REPO_SLUG' is not a repository slug — refusing to run" >&2
+      exit 1
+      ;;
+  esac
+  STATE_DIR="$STATE_ROOT/$REPO_SLUG"
+  LOG="/var/log/ci-controller-$REPO_SLUG.log"
+fi
+
 log() {
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >>"$LOG"
   logger -t ci-controller -- "$*" 2>/dev/null || true
@@ -175,12 +207,141 @@ md() {
     "http://metadata.google.internal/computeMetadata/v1/$1" 2>/dev/null
 }
 
+# --- the repositories table (#1486) -------------------------------------------
+
+# repo_slug <owner> <repo> — the repository's name on this machine: its unit
+# instance and its state directory.
+#
+# `<owner>-<repo>`, lower-cased, anything outside [a-z0-9._-] turned into a
+# dash. Lower-cased because GitHub compares both names case-insensitively, so
+# `Acme/App` and `acme/app` are ONE repository and must be one process.
+# modules/ci-runner-controller/repos-table computes the same string at plan
+# time; multi-repo.selftest.sh feeds both the same pairs.
+#
+# It is NOT injective — `a-b/c` and `a/b-c` are both `a-b-c` — and it does not
+# try to be. A collision is refused by repos_table_rows, loudly and for the
+# whole table, because two repositories under one slug would share drain
+# counters and delete each other's markers.
+repo_slug() {
+  local s
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
+  s=$(printf '%s-%s' "$1" "$2" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')
+  case "$s" in
+    [a-z0-9]*) printf '%s' "$s" ;;
+    *) return 1 ;;
+  esac
+}
+
+# repos_table_rows — the `ci-repos` JSON on stdin, one row per line on stdout:
+#
+#   <index>|<slug>|<owner>|<repo>|<app id>|<installation id>|<key secret>|<base>
+#
+# `|` and not a tab: an omitted App id is an EMPTY field, and `read` collapses a
+# run of tabs, which would slide every later column one to the left.
+#
+# A row is REJECTED (named on stderr, the rest still served) when a value could
+# not be written to a systemd EnvironmentFile intact — that file is not read by
+# a shell, so a space or a quote is not an injection, it is a value cut short.
+# The whole table is REFUSED (exit 2, nothing on stdout) when two rows share a
+# slug: there is no safe half of that to serve.
+repos_table_rows() {
+  local raw idx owner repo app inst key base slug seen=$'\n' out=""
+  raw=$(jq -r '
+    def safe: (. // "") | tostring;
+    def ok: test("^[A-Za-z0-9._/@:+-]*$");
+    if type != "array" then error("not a table") else . end
+    | to_entries[]
+    | [ (.key | tostring),
+        (.value.github_owner | safe), (.value.github_repo | safe),
+        (.value.github_app_id | safe), (.value.github_app_installation_id | safe),
+        (.value.github_app_private_key_secret | safe),
+        (.value.queue_base_branch | safe) ]
+    | if all(.[]; ok) then join("|") else "!" + .[0] end' 2>/dev/null) || return 1
+  while IFS='|' read -r idx owner repo app inst key base; do
+    [ -n "$idx" ] || continue
+    case "$idx" in
+      '!'*)
+        echo "ci-repos row ${idx#!}: a value has a character an environment file cannot carry — row rejected" >&2
+        continue
+        ;;
+    esac
+    slug=$(repo_slug "$owner" "$repo") || {
+      echo "ci-repos row $idx: owner '$owner' and repo '$repo' make no usable slug — row rejected" >&2
+      continue
+    }
+    case "$seen" in
+      *$'\n'"$slug"$'\n'*)
+        echo "ci-repos row $idx: slug '$slug' is already taken by another row — two repositories cannot share one state directory, so the WHOLE table is refused" >&2
+        return 2
+        ;;
+    esac
+    seen="$seen$slug"$'\n'
+    out="$out$idx|$slug|$owner|$repo|$app|$inst|$key|$base"$'\n'
+  done <<<"$raw"
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+# repo_slugs_to_retire <wanted> <present> — one slug per line each; prints every
+# present slug that is no longer wanted.
+#
+# A controller VM keeps its boot disk across a reset, so the units of a table
+# that has since lost a row are still enabled on it. Left alone, a repository
+# removed from the table goes on being drained by a process nothing configures.
+repo_slugs_to_retire() {
+  local s
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    case $'\n'"$1"$'\n' in
+      *$'\n'"$s"$'\n'*) ;;
+      *) printf '%s\n' "$s" ;;
+    esac
+  done <<<"$2"
+}
+
+# WHICH OF THE THREE THINGS THIS PROCESS IS.
+#
+#   no `ci-repos`, no slug   the single-repository controller. Unchanged.
+#   `ci-repos`, no slug      the INSTALLER of a table. It serves no repository
+#                            itself: it writes one unit per row and exits.
+#   `ci-repos` and a slug    one repository's process.
+#
+# The fourth combination — a slug and no table — is a unit left on the boot
+# disk by a table this controller no longer carries. systemd starts it at boot,
+# before the installer has had the chance to retire it, and it would then serve
+# a repository beside the single-repository unit. It exits instead.
+#
+# The value is gzipped, base64-encoded and folded by Terraform, because one
+# metadata line past 4096 characters breaks every instance built from the
+# template. Present but unreadable is a loud exit and never "no table": falling
+# through would start the single-repository path with no repository to serve.
+REPOS_RAW=$(md "instance/attributes/ci-repos")
+REPOS_JSON=""
+REPOS_INSTALLER=0
+if [ -n "$REPOS_RAW" ]; then
+  REPOS_JSON=$(printf '%s' "$REPOS_RAW" | base64 -d 2>/dev/null | gzip -dc 2>/dev/null) || REPOS_JSON=""
+  if [ -z "$REPOS_JSON" ]; then
+    echo "ci-repos metadata is present but does not unpack — refusing to guess which repositories to serve" >&2
+    exit 1
+  fi
+  [ -n "$REPO_SLUG" ] || REPOS_INSTALLER=1
+elif [ -n "$REPO_SLUG" ]; then
+  echo "repository unit '$REPO_SLUG' has no ci-repos table to belong to — this controller serves a single repository now, so this unit must not" >&2
+  exit 1
+fi
+
+# REPOSITORY SETTINGS: THE ENVIRONMENT FIRST, THEN METADATA.
+#
+# A repository's unit sets these from its row of the table, and the single-
+# repository controller sets none of them, so it reads exactly the metadata it
+# always read. That is the entire difference between the two — every function
+# below reads OWNER, REPO and the rest and cannot tell which one filled them.
 PROJECT=$(md "project/project-id")
-OWNER=$(md "instance/attributes/ci-github-owner")
-REPO=$(md "instance/attributes/ci-github-repo")
-APP_ID=$(md "instance/attributes/ci-app-id")
-INSTALL_ID=$(md "instance/attributes/ci-app-installation-id")
-KEY_SECRET=$(md "instance/attributes/ci-app-key-secret")
+OWNER="${CI_GITHUB_OWNER:-$(md "instance/attributes/ci-github-owner")}"
+REPO="${CI_GITHUB_REPO:-$(md "instance/attributes/ci-github-repo")}"
+APP_ID="${CI_APP_ID:-$(md "instance/attributes/ci-app-id")}"
+INSTALL_ID="${CI_APP_INSTALLATION_ID:-$(md "instance/attributes/ci-app-installation-id")}"
+KEY_SECRET="${CI_APP_KEY_SECRET:-$(md "instance/attributes/ci-app-key-secret")}"
 POLL=$(md "instance/attributes/ci-poll-seconds")
 METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 # The branch the merge queue admits. Read here rather than assumed, because the
@@ -189,7 +350,7 @@ METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 # not only in Terraform: a controller rendered before this key existed has no
 # such attribute, and `md` returns the empty string for one that is absent —
 # which would make every base comparison unequal.
-QUEUE_BASE=$(md "instance/attributes/ci-queue-base")
+QUEUE_BASE="${CI_QUEUE_BASE:-$(md "instance/attributes/ci-queue-base")}"
 : "${QUEUE_BASE:=main}"
 
 # Empty unless the root turned autohealing on. NO DEFAULT, deliberately — the
@@ -216,7 +377,18 @@ esac
 # and no table; it becomes a one-row table here and takes the same code path.
 # So there is no second implementation to keep in step, and no consumer has to
 # move Terraform state to keep the controller it already has running.
-POOLS_JSON=$(md "instance/attributes/ci-pools")
+#
+# A repository's unit names a FILE holding its row's pools (CI_POOLS_FILE): a
+# pool table is JSON, and JSON does not survive a systemd environment file.
+# Unreadable or empty falls through to metadata, where a table controller has
+# neither `ci-pools` nor the single-pool keys — so the synthesis below yields a
+# row with no name, the parser refuses it, and the process exits naming the
+# reason instead of serving some other repository's pools.
+POOLS_JSON=""
+[ -z "${CI_POOLS_FILE:-}" ] || POOLS_JSON=$(cat "$CI_POOLS_FILE" 2>/dev/null) || POOLS_JSON=""
+# The installer of a table has no pools of its own and must not synthesise any.
+[ "$REPOS_INSTALLER" != 1 ] || POOLS_JSON='[]'
+[ -n "$POOLS_JSON" ] || POOLS_JSON=$(md "instance/attributes/ci-pools")
 if [ -z "${POOLS_JSON:-}" ]; then
   # `nz` and not jq's `//`: an ABSENT metadata attribute reads as the empty
   # string, and in jq an empty string is truthy — `"" // 900` is `""`, not 900.
@@ -279,7 +451,9 @@ declare -A P_MATCH_JSON=() P_MATCH_CSV=()
 POOL_TABLE_REJECTED=0
 {
   pool_rejects=$(mktemp)
-  pool_rows=$(printf '%s' "$POOLS_JSON" | pool_table_parse 2>"$pool_rejects") || {
+  # The installer of a `ci-repos` table is the one process allowed past an
+  # empty table: it ticks nothing, it only writes the units that do.
+  pool_rows=$(printf '%s' "$POOLS_JSON" | pool_table_parse 2>"$pool_rejects") || [ "$REPOS_INSTALLER" = 1 ] || {
     echo "no usable pool in ci-pools metadata — this controller has nothing to manage" >&2
     cat "$pool_rejects" >&2
     rm -f "$pool_rejects"

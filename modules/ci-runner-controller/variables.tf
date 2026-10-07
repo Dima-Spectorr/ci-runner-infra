@@ -15,7 +15,7 @@ variable "zones" {
 }
 
 variable "name" {
-  description = "Name of the controller VM. One per repository, so a repository slug reads better here than a pool name."
+  description = "Name of the controller VM. One per repository in the single-repository shape, so a repository slug reads better here than a pool name; with `repos` it serves the whole table."
   type        = string
 }
 
@@ -51,10 +51,11 @@ variable "pools" {
     recycle_cordon_stops_agents = optional(bool)
   }))
 
-  validation {
-    condition     = length(var.pools) > 0
-    error_message = "pools must name at least one pool — a controller with an empty table exits on boot having served nothing, and every pool it was meant to serve holds its last size behind an ONLY_UP autoscaler."
-  }
+  # EMPTY MEANS "THE `repos` TABLE IS IN USE", and only that. "At least one pool"
+  # is still enforced — by ./repos-table, which is where both shapes are finally
+  # in one place: a controller given neither is refused there, at plan, with the
+  # message this variable used to carry.
+  default = []
 
   validation {
     condition     = length(distinct([for p in var.pools : p.name])) == length(var.pools)
@@ -145,28 +146,105 @@ variable "pools" {
 # at the default poll against an installation budget all four share, for one
 # answer — and the copy that trips the secondary rate limit blinds the others.
 variable "github_owner" {
-  description = "Owner of the repository whose runs this controller sweeps."
+  description = "Single-repository shape: owner of the repository whose runs this controller sweeps. Leave unset when `repos` is given."
   type        = string
+  default     = null
 }
 
 variable "github_repo" {
-  description = "Repository whose runs this controller sweeps. ONE — every pool in the table belongs to it."
+  description = "Single-repository shape: the repository whose runs this controller sweeps. ONE — every pool in `pools` belongs to it. Leave unset when `repos` is given."
   type        = string
+  default     = null
 }
 
 variable "github_app_id" {
-  description = "GitHub App id the controller authenticates as."
+  description = "GitHub App id the controller authenticates as. With `repos`, the default for every row that names none."
   type        = string
 }
 
 variable "github_app_installation_id" {
-  description = "Installation id of that App on the repository."
+  description = "Installation id of that App on the repository. With `repos`, the default for every row that names none."
   type        = string
 }
 
 variable "github_app_private_key_secret" {
-  description = "Secret Manager resource holding the App private key."
+  description = "Secret Manager resource holding the App private key. With `repos`, the default for every row that names none."
   type        = string
+}
+
+# --- many repositories on one controller (#1486) ---------------------------------
+
+variable "repos" {
+  description = <<-EOT
+    The repositories this controller serves, one row each. Give EITHER this OR
+    the single-repository `github_owner` / `github_repo` / `pools` — never
+    both; `./repos-table` refuses the plan otherwise.
+
+    The VM runs ONE PROCESS PER ROW: its own systemd unit
+    (`ci-controller@<slug>.service`), its own watchdog and its own state
+    directory (`/var/lib/ci-controller/<slug>`), where `<slug>` is
+    `<owner>-<repo>` lower-cased. A repository whose sweep is slow or wedged
+    therefore delays nobody else, and the watchdog and the health endpoint name
+    the one that stopped. Hosts are still never shared between repositories.
+
+    Per row:
+      github_owner / github_repo   the repository.
+      pools                        its pools, as `pool_descriptor` outputs —
+                                   the same columns as `pools`. Pool names must
+                                   be unique across the WHOLE table.
+      queue_base_branch            optional; defaults to `queue_base_branch`.
+      github_app_id, github_app_installation_id, github_app_private_key_secret
+                                   optional; default to the controller-wide
+                                   values, so a table whose repositories share
+                                   one App installation names them once.
+
+    Every row of one installation spends the SAME hourly GitHub budget, and
+    nothing here divides it yet: size the table against
+    `ci_github_rate_remaining` before adding the next repository.
+
+    Empty (the default) is the single-repository shape. That shape renders the
+    metadata it always has — no `ci-repos` key — so an existing consumer plans
+    no change.
+  EOT
+
+  # Written `list(` and `object({` on separate lines on purpose:
+  # scripts/ci/controller-module.selftest.sh reads the columns of the
+  # single-repository `pools` type out of this file by the shape of its opening
+  # line, and a second block opening the same way would be read as more of it.
+  type = list(
+    object({
+      github_owner                  = string
+      github_repo                   = string
+      queue_base_branch             = optional(string)
+      github_app_id                 = optional(string)
+      github_app_installation_id    = optional(string)
+      github_app_private_key_secret = optional(string)
+      # THE SAME COLUMNS AS `pools` ABOVE, and scripts/ci/multi-repo.selftest.sh
+      # fails when the two lists stop agreeing. A column added to one and not
+      # the other is a setting that works for a single repository and is
+      # refused — "an argument named X is not expected here" — in the table.
+      pools = list(object({
+        name                        = string
+        mig                         = string
+        region                      = string
+        runner_labels               = string
+        slots                       = optional(number)
+        min_hosts                   = optional(number)
+        max_hosts                   = optional(number)
+        drain_grace_seconds         = optional(number)
+        register_grace_seconds      = optional(number)
+        orphan_confirm_ticks        = optional(number)
+        recycle_max_unavailable     = optional(number)
+        host_os                     = optional(string)
+        mints_registration_token    = optional(bool)
+        role                        = optional(string)
+        beacon_interval             = optional(number)
+        pin_orphan_grace_seconds    = optional(number)
+        recycle_cordon_stops_agents = optional(bool)
+      }))
+    })
+  )
+  default = []
 }
 
 variable "poll_interval_seconds" {
