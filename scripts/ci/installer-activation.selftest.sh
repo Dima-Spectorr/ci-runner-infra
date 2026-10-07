@@ -33,13 +33,27 @@ bad() { echo "  FAIL  $1"; fail=1; }
 # Units the script writes to /etc/systemd/system, taken from the heredoc
 # redirections rather than from a hand-kept list, so a unit added later is
 # covered without editing this gate.
+#
+# `"$UNIT_DIR/` is the same directory under the name the per-repository
+# functions use (#1486), so the units they write are held to the same rule.
 units_written() { # <file>
-  grep -oE '>/etc/systemd/system/[A-Za-z0-9@._-]+' "$1" \
+  # shellcheck disable=SC2016  # the literal text `$UNIT_DIR`, as the installer spells it
+  grep -oE '>("\$UNIT_DIR|/etc/systemd/system)/[A-Za-z0-9@._-]+' "$1" \
     | sed 's|.*/||' | sort -u
 }
 
+# A TEMPLATE unit (`name@.service`) is never restarted under its own name — an
+# instance of it is. `name@<anything>.service` counts, and only that: a restart
+# of some OTHER template does not activate this one.
 restarted() { # <file> <unit>
-  grep -qE "systemctl[[:space:]]+restart[[:space:]]+$2([[:space:]]|$)" "$1"
+  case "$2" in
+    *@.*)
+      grep -qE "systemctl[[:space:]]+restart[[:space:]]+\"?${2%%@*}@[^[:space:]\"]+${2#*@}\"?([[:space:]]|$)" "$1"
+      ;;
+    *)
+      grep -qE "systemctl[[:space:]]+restart[[:space:]]+$2([[:space:]]|$)" "$1"
+      ;;
+  esac
 }
 
 echo "installer-activation self-test:"
@@ -85,6 +99,41 @@ if restarted "$FIX/good.sh" x.service; then
   ok "detector accepts an explicit restart"
 else
   bad "detector rejects an explicit restart — it would be turned off, not fixed"
+fi
+
+# Template units, written through the directory's variable name.
+cat >"$FIX/tpl-bad.sh" <<'TPLBADEOF'
+cat >"$UNIT_DIR/x@.service" <<EOF
+[Service]
+ExecStart=/opt/x.sh
+EOF
+systemctl enable "x@$s.service"
+systemctl restart "y@$s.service"
+TPLBADEOF
+
+cat >"$FIX/tpl-good.sh" <<'TPLGOODEOF'
+cat >"$UNIT_DIR/x@.service" <<EOF
+[Service]
+ExecStart=/opt/x.sh
+EOF
+systemctl enable "x@$s.service"
+systemctl restart "x@$s.service"
+TPLGOODEOF
+
+expect "$(units_written "$FIX/tpl-bad.sh")" "x@.service" \
+  "detector finds a template unit written under \$UNIT_DIR" \
+  "detector missed a template unit written under \$UNIT_DIR — the per-repository units would be unchecked"
+
+if restarted "$FIX/tpl-bad.sh" "x@.service"; then
+  bad "detector accepts the restart of a DIFFERENT template as activation"
+else
+  ok "detector rejects a template whose instances are only enabled"
+fi
+
+if restarted "$FIX/tpl-good.sh" "x@.service"; then
+  ok "detector accepts the restart of an instance of the template"
+else
+  bad "detector rejects the restart of a template's instance — the per-repository units could never pass"
 fi
 
 [ "$fail" -eq 0 ] || { echo "  activation UNVERIFIABLE (detectors are broken)."; exit 1; }
