@@ -435,8 +435,10 @@ for _keeps in \
   'pool      = var.name' \
   'metric.labels.pool = \"${var.name}\""' \
   'base_instance_name = "${var.name}-controller"'; do
+  # Not `grep -q`: it exits at the first match, and under pipefail the printf
+  # still writing a file-sized string dies of SIGPIPE — a match reads as "no".
   check "still on the pool name: ${_keeps%% *}" yes \
-    "$(printf '%s\n' "$_not_hosts_mig" | grep -qF -- "$_keeps" && echo yes || echo no)"
+    "$(printf '%s\n' "$_not_hosts_mig" | grep -F -- "$_keeps" >/dev/null && echo yes || echo no)"
 done
 
 # (c) The plan refuses a base name the OTHER controller would still claim. The
