@@ -74,6 +74,12 @@ locals {
   # read-only one.
   runner_labels = join(",", concat(["self-hosted", var.name], var.runner_labels))
 
+  # What host instances — and so runner agents — are named after. The pool name
+  # unless a consumer says otherwise, so an existing pool plans no change. Read
+  # by the host MIG and by nothing else in this file: labels, metrics, cache
+  # prefix and resource names all stay on `var.name`. See `instance_base_name`.
+  instance_base_name = coalesce(var.instance_base_name, var.name)
+
   # ONE expression for this pool's slice of the shared cache bucket, read by both
   # the IAM condition below and the host that fetches from it. Written twice they
   # would eventually disagree, and the failure is quiet in the worst way: every
@@ -721,7 +727,14 @@ resource "google_compute_region_instance_group_manager" "hosts" {
   region  = var.region
   name    = "${var.name}-hosts"
 
-  base_instance_name        = var.name
+  # THE ONE PLACE A HOST GETS ITS NAME. An instance is `<base>-<4 chars>`; the
+  # host reads that back from its own metadata and registers `<instance>-s<N>`
+  # with the label `host-<instance>`; and the controller reads this same field
+  # off the live group (`baseInstanceName`, in collect_mig) to decide which
+  # agents and which pinned runs are its own. Nothing else in the module or in
+  # any boot script derives a host or agent name from the pool name, so this
+  # line is the whole of `instance_base_name`.
+  base_instance_name        = local.instance_base_name
   distribution_policy_zones = length(var.zones) > 0 ? var.zones : null
 
   version {
@@ -732,6 +745,23 @@ resource "google_compute_region_instance_group_manager" "hosts" {
   # here would reset the pool on every apply, mid-job.
   lifecycle {
     ignore_changes = [target_size]
+
+    # A precondition rather than a variable `validation` for the reason given on
+    # the host template: it reads two variables, and that needs Terraform 1.9
+    # where this module supports >= 1.5.
+    #
+    # The controller's ownership test is the PREFIX `<base>-`, in three places
+    # (orphan_decision, pinned_job_decision, the marker sweep). `instance_base_name`
+    # exists for two pools that share a pool name — the same labels imply it,
+    # the pool name is one of them — so the other side's base is most likely
+    # that pool name. A base of `<name>-b` is then still inside the other
+    # controller's `<name>-*`, and it goes on reaping these agents and
+    # cancelling these pinned runs: the input set, and nothing changed. The
+    # reverse pairing fails the same way in the other direction.
+    precondition {
+      condition     = local.instance_base_name == var.name || (!startswith(local.instance_base_name, "${var.name}-") && !startswith(var.name, "${local.instance_base_name}-"))
+      error_message = "instance_base_name '${local.instance_base_name}' and pool name '${var.name}' must not be one another extended by a hyphen. A controller recognises its hosts by the prefix '<base>-', so the side holding the shorter name would still claim the other's hosts, reaping their agents and cancelling their pinned runs — the very thing this input is set to prevent. Use a name that shares no such prefix, e.g. 'ci-b-myrepo' beside 'ci-myrepo', not 'ci-myrepo-b'."
+    }
   }
 
   update_policy {

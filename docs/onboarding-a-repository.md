@@ -330,6 +330,45 @@ The controller counts demand against that same set. Labels that no workflow asks
 for produce a pool that never scales out; labels asked for but never registered
 produce jobs that never start.
 
+### Two pools with the same labels at once — moving a pool
+
+A pool being moved to another project exists twice for a while: the same pool
+name, the same labels, a controller on each side. That is supported, but only
+if the two sides' **hosts are named differently**, and by default they are not.
+
+A controller recognises its hosts and agents by the host MIG's base instance
+name, which defaults to the pool name. GitHub's runner list and run list are
+per repository, so each controller sees both pools' agents and both pools'
+pinned jobs — and with one base name between them, every agent of the other
+pool is "offline with no instance behind it" and every run pinned to the other
+pool's host is "pinned to a host that is gone". Each controller deregisters the
+other's slots and cancels the other's runs. Nothing errors; the pull requests
+just fail.
+
+Give the NEW pool a base name of its own, when you create it:
+
+```hcl
+module "ci_runner_pool" {
+  # ...
+  name               = "ci-myrepo"     # unchanged — it is one of the labels
+  instance_base_name = "ci-b-myrepo"   # hosts are ci-b-myrepo-xxxx
+}
+```
+
+Only the host and agent names change. The runner labels, the `pool` metric
+label, the cache prefix and every resource name stay on `name`, so workflows,
+dashboards and warm caches behave as before.
+
+Two rules, both enforced or stated by the module:
+
+- **Not `ci-myrepo-b`.** The controller's test is the prefix `<base>-`, so the
+  old controller would still claim `ci-myrepo-b-xxxx` as its own. The plan
+  refuses a base that is the pool name extended by a hyphen, and the reverse.
+- **Set it at creation, not afterwards.** The base name is immutable on a
+  managed instance group: changing it on a live pool replaces the group and
+  deletes every host at once, mid-job. The old pool keeps its name until it is
+  destroyed.
+
 ## 3. Put the App private key in Secret Manager
 
 The identity module creates the secret **container**; the value is added out of

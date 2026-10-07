@@ -384,6 +384,115 @@ for m in "$POOL_TF" "$CTRL_TF"; do
     yes "$(grep -qF 'for line in split("\n", local.controller_startup) : line if length(line) > 4096' "$m/main.tf" && echo yes || echo no)"
 done
 
+# --- 9. a host's name, and who recognises it (#1486) --------------------------
+#
+# `instance_base_name` lets two pools with the SAME runner labels coexist under
+# two controllers — a pool mid-move between projects — by giving one side's
+# hosts and agents a different name. It is one line of Terraform, and it is one
+# line only because of a chain nothing type-checks: the MIG names the instance,
+# the host names its agents after the instance, and the controller reads the
+# base name back off the live MIG rather than from the pool name or the pool
+# table. Break any link and the plan still applies and every decision self-test
+# still passes; what changes is that one controller starts reaping the other
+# pool's agents and cancelling its pinned runs. So each link is asserted.
+HOST_SH="$POOL_TF/scripts/host-startup.sh"
+WIN_PS1="$POOL_TF/scripts/windows-host-startup.ps1"
+
+# Blocks are extracted once and proved non-empty: a `sed` range that matches
+# nothing would make every `no`-expecting check below pass on an empty string.
+_base_var=$(sed -n '/^variable "instance_base_name"/,/^}/p' "$POOL_TF/variables.tf")
+_hosts_mig=$(sed -n '/^resource "google_compute_region_instance_group_manager" "hosts"/,/^}/p' "$POOL_TF/main.tf")
+_not_hosts_mig=$(sed '/^resource "google_compute_region_instance_group_manager" "hosts"/,/^}/d' "$POOL_TF/main.tf")
+_collect_mig=$(sed -n '/^collect_mig()/,/^}/p' "$STARTUP")
+for _blk in "$_base_var" "$_hosts_mig" "$_not_hosts_mig" "$_collect_mig"; do
+  check "a block section 9 reads was actually found" yes \
+    "$([ "$(printf '%s\n' "$_blk" | grep -c .)" -ge 5 ] && echo yes || echo no)"
+done
+
+# (a) An existing consumer plans no change: unset means the pool name.
+check "instance_base_name defaults to null" 1 \
+  "$(printf '%s\n' "$_base_var" | grep -cE '^  default +=  *null$')"
+check "and null resolves to the pool name" 1 \
+  "$(grep -cF 'instance_base_name = coalesce(var.instance_base_name, var.name)' "$POOL_TF/main.tf")"
+
+# (b) The host MIG is named from it — and is the only thing that is.
+check "the host MIG names its instances from the base name" \
+  "local.instance_base_name" \
+  "$(printf '%s\n' "$_hosts_mig" | grep -E '^  base_instance_name +=' | sed 's/.*= *//')"
+
+# Everything else stays on the pool name: labels, the `pool` metric label, the
+# cache prefix, tags, resource names. A second reader of the local is how a
+# renamed pool would quietly lose its cache or stop matching its autoscaler
+# filter; the variable itself is read exactly once, to build the local.
+check "nothing outside the host MIG reads the base name" 0 \
+  "$(printf '%s\n' "$_not_hosts_mig" | grep -c 'local\.instance_base_name')"
+check "the variable is read once, by the local" 1 \
+  "$(grep -c 'var\.instance_base_name' "$POOL_TF/main.tf")"
+# shellcheck disable=SC2016  # HCL interpolation, matched literally.
+for _keeps in \
+  'runner_labels = join(",", concat(["self-hosted", var.name], var.runner_labels))' \
+  'cache_prefix = "cache/${var.name}/"' \
+  'pool      = var.name' \
+  'metric.labels.pool = \"${var.name}\""' \
+  'base_instance_name = "${var.name}-controller"'; do
+  # Not `grep -q`: it exits at the first match, and under pipefail the printf
+  # still writing a file-sized string dies of SIGPIPE — a match reads as "no".
+  check "still on the pool name: ${_keeps%% *}" yes \
+    "$(printf '%s\n' "$_not_hosts_mig" | grep -F -- "$_keeps" >/dev/null && echo yes || echo no)"
+done
+
+# (c) The plan refuses a base name the OTHER controller would still claim. The
+# ownership test is the prefix `<base>-`, so a base that is the pool name plus
+# a hyphenated suffix — or the reverse — separates nothing. Both directions,
+# inside a precondition on the host MIG, with the unset case let through.
+_pre=$(printf '%s\n' "$_hosts_mig" | sed -n '/^    precondition {/,/^    }/p')
+check "the host MIG carries a precondition on the base name" yes \
+  "$([ "$(printf '%s\n' "$_pre" | grep -c .)" -ge 3 ] && echo yes || echo no)"
+# shellcheck disable=SC2016  # HCL interpolation, matched literally.
+check "it refuses a base that extends the pool name with a hyphen" 1 \
+  "$(printf '%s\n' "$_pre" | grep -E '^ +condition +=' | grep -cF '!startswith(local.instance_base_name, "${var.name}-")')"
+# shellcheck disable=SC2016
+check "and a pool name that extends the base with a hyphen" 1 \
+  "$(printf '%s\n' "$_pre" | grep -E '^ +condition +=' | grep -cF '!startswith(var.name, "${local.instance_base_name}-")')"
+check "and lets the default — base equal to the pool name — through" 1 \
+  "$(printf '%s\n' "$_pre" | grep -E '^ +condition +=' | grep -cF 'local.instance_base_name == var.name || (')"
+
+# (d) Agents are named after the INSTANCE on both operating systems, never
+# after the pool. A host script that built the name from `ci-pool` would
+# register the old names under the new instances, and the controller — which
+# joins an agent to a host by `<instance>-s` — would see every slot as missing.
+# shellcheck disable=SC2016  # shell and PowerShell source, matched literally.
+{
+  check "linux: the host's own name is the instance name" 1 \
+    "$(grep -cF 'HOSTNAME_SHORT=$(md "instance/name")' "$HOST_SH")"
+  check "linux: an agent is <instance>-s<N>" 1 \
+    "$(grep -cF 'local name="$HOSTNAME_SHORT-s$idx"' "$HOST_SH")"
+  check "linux: the affinity label is host-<instance>" 1 \
+    "$(grep -cF 'HOST_LABEL="host-$HOSTNAME_SHORT"' "$HOST_SH")"
+  check "windows: the host's own name is the instance name" 1 \
+    "$(grep -cE "InstanceName += Get-MetadataValue 'instance/name'" "$WIN_PS1")"
+  check "windows: an agent is <instance>-s<N>" 1 \
+    "$(grep -cF 'return "$InstanceName-s$Index"' "$WIN_PS1")"
+}
+
+# (e) The controller learns the base name from the live group — a GCE fact —
+# and hands THAT to both rules that delete or cancel. This is why the base name
+# is not a pool-table column: a shared controller, a per-pool controller and a
+# hand-written descriptor all get it from the same place, and a table column
+# would be a second copy that can disagree with the machines.
+check "collect_mig reads the group's baseInstanceName" yes \
+  "$(printf '%s\n' "$_collect_mig" | grep -q 'value(baseInstanceName,' && echo yes || echo no)"
+# shellcheck disable=SC2016
+check "the orphan reaper is bounded by it" 1 \
+  "$(grep -cF 'orphan_decision "$name" "$status" "$busy" "$MIG_BASE"' "$STARTUP")"
+# shellcheck disable=SC2016
+check "the pinned-run rule is bounded by it" 1 \
+  "$(grep -cF 'pinned_job_decision "$status" "$labels" "$RUNNER_MATCH_LABELS" "$MIG_BASE"' "$STARTUP")"
+check "the base name is not a descriptor key" 0 \
+  "$(printf '%s\n' "$descriptor" | grep -cx 'instance_base_name')"
+check "nor a column of the controller module's pools type" 0 \
+  "$(printf '%s\n' "$accepted" | grep -cx 'instance_base_name')"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

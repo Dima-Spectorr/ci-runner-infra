@@ -54,6 +54,53 @@ variable "name" {
   }
 }
 
+variable "instance_base_name" {
+  description = <<-EOT
+    Base name of this pool's HOST instances, and therefore of the runner agents
+    they register: a host is `<base>-<4 random characters>`, its agents are
+    `<host>-s<N>`, and its affinity label is `host-<host>`. Null — the default —
+    means the pool name, which is what every pool had before this input existed,
+    so a consumer that does not set it plans no change.
+
+    Set it for ONE situation: two pools that register the SAME runner labels
+    for the same repository at the same time, each with its own controller —
+    which is what a pool being moved to another project is, for as long as both
+    exist. A controller recognises its hosts and agents by this base name and by
+    nothing else: it reaps an offline agent named `<base>-…` whose instance it
+    cannot find, and it cancels a run pinned to `host-<base>-…` whose host it
+    cannot find. Two pools sharing a base name are, to each controller, one pool
+    with half its hosts missing — each deregisters the other's agents and
+    cancels the other's pinned runs. A distinct base name on one side is the
+    whole fix.
+
+    It changes the host and agent NAMES only. The runner labels, the `pool`
+    metric label, the cache prefix, the network tag, the service accounts and
+    every resource name keep the pool name, so workflows, dashboards, the
+    autoscaler and warm caches all behave as before.
+
+    It must not be the pool name extended by a hyphen (`<name>-…`), nor may the
+    pool name be this value extended by one: the controller's test is the prefix
+    `<base>-`, so such a pair is still one pool to the side holding the shorter
+    name. Choose a name that shares no such prefix — `ci-b-myrepo` beside
+    `ci-myrepo`, not `ci-myrepo-b`. The plan refuses the other shape.
+
+    Choose it when the pool is created. The base name is immutable on a managed
+    instance group, so changing it on a live pool replaces the group — every
+    host deleted at once, mid-job.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    # The same shape `name` is held to, deliberately: until this input existed
+    # the pool name WAS the base instance name, so this is the rule every host
+    # and agent name in the fleet already satisfies, and no tighter figure is
+    # asserted here than one that has been checked.
+    condition     = var.instance_base_name == null ? true : can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.instance_base_name))
+    error_message = "instance_base_name must be null or 1-63 characters, lowercase letters, digits and hyphens, starting with a letter and not ending in a hyphen."
+  }
+}
+
 variable "github_owner" {
   description = "GitHub organisation or user that owns the repository this pool serves."
   type        = string
