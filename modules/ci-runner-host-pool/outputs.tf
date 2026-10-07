@@ -267,6 +267,32 @@ output "metric_names" {
       # lower bound, so an apparently under-scaled pool may simply not have been
       # counted.
       "ci_demand_runs_skipped",
+      # --- what the controller spends on GitHub ------------------------------
+      # Read off the rate-limit headers of the controller's own responses, never
+      # estimated. `limit` and `remaining` are INSTALLATION facts — every
+      # repository of one App installation draws on the same hourly budget — and
+      # the other three are controller facts; all five are published under every
+      # pool's label, so read them with max() across pools and never sum().
+      #
+      # `limit` and `remaining` are ABSENT, not zero, on a tick whose responses
+      # carried no rate headers: zero remaining is the alarm, and a missing
+      # header is not one. The installation-token mints are counted in
+      # `requests` but never feed `limit`/`remaining`, because they are answered
+      # with the App's own budget rather than the installation's.
+      "ci_github_rate_limit",
+      "ci_github_rate_remaining",
+      # GitHub requests this tick, every call path included. Sum it over an hour
+      # and compare with ci_github_rate_limit to see the share one repository
+      # takes of a budget it shares.
+      "ci_github_requests",
+      # How many of those were answered 304 Not Modified. The two status
+      # run-list calls of the demand sweep are conditional; whether a 304 is
+      # billed is in the controller's `github-rate` event, not in this number.
+      "ci_github_not_modified",
+      # One full cycle, tick start to tick start: the tick's work plus the sleep
+      # after it. ci_tick_seconds is the work alone. Absent on the first tick
+      # after a controller start.
+      "ci_cycle_seconds",
       # --- the merge queue ----------------------------------------------------
       # Published ONLY by a pool whose role is `merge-queue`, and absent on every
       # CI pool. Absence here is normal and carries meaning; do not alert on it.

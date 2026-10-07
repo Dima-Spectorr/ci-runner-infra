@@ -311,5 +311,272 @@ fi
 check "the payload directory is cleared after the sweep" yes \
   "$(if [ "$(sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -c 'rm -rf "\$jobs_dir"')" -ge 2 ]; then echo yes; else echo no; fi)"
 
+# ── the GitHub budget is measured, and measuring it changes nothing (#1486) ──
+#
+# Every repository of one App installation shares one hourly budget, and
+# neither the real limit nor the real cost of a tick had been read off a
+# response. The functions below are the SHIPPED text, extracted and run against
+# a stubbed transport. Three properties matter and each has failed silently
+# somewhere in this repository before:
+#
+#   * a missing header must publish NOTHING — a gauge reading 0 remaining is the
+#     alarm, and a response without the header is not one;
+#   * a 304 must hand back exactly the body the 200 returned, or the demand
+#     sweep quietly reads a different run list than GitHub holds;
+#   * none of it may fail the call it rides on.
+yn() { if "$@"; then echo yes; else echo no; fi; }
+
+# A subject that extracts to nothing defines nothing, and every assertion after
+# it would then run against a function that does not exist — or, worse, against
+# a stub. Each one is checked for a body before it is trusted.
+for fn in gh_rate_fields gh_rate_note gh_rate_summarise gh_rate_tick_summary \
+          queue_github_rate_series gh_etag_read gh_etag_store gh_api gh_api_fetch; do
+  src=$(sed -n "/^${fn}() {/,/^}/p" "$CTRL")
+  check "extracted a real body for $fn" yes \
+    "$(if [ "$(printf '%s\n' "$src" | grep -c .)" -ge 3 ]; then echo yes; else echo no; fi)"
+  eval "$src"
+done
+
+W=$(mktemp -d)
+trap 'rm -rf "$W"' EXIT
+STATE_DIR="$W/state"
+# Read only inside the eval'd functions, which no static reader can see.
+# shellcheck disable=SC2034
+LOG=/dev/null
+# shellcheck disable=SC2034
+CURL_TIMEOUTS=()
+# shellcheck disable=SC2034
+CYCLE_SECONDS=""
+gh_token() { printf 'stub-token'; }
+event() { printf '%s\n' "$4" >>"$W/events"; }
+queue_series() { printf '%s=%s\n' "$1" "$2" >>"$W/series"; }
+fresh() { rm -rf "$W/state" "$W/calls" "$W/events" "$W/series"; mkdir -p "$W/state"; : >"$W/calls"; : >"$W/events"; : >"$W/series"; }
+
+# The transport. `rate` answers with all four headers, `bare` with none, `dead`
+# with no response at all (curl's own exit, no header file written). A request
+# whose If-None-Match equals the current validator is answered 304 with NO body.
+STUB_MODE=rate STUB_BODY='' STUB_ETAG='' STUB_LIMIT=5000 STUB_REM=4990 STUB_USED=10 STUB_RESET=1700000000
+curl() {
+  local a prev="" out="" dump="" inm="" url="" status=200
+  for a in "$@"; do
+    case "$prev" in
+      -o) out="$a" ;;
+      -D) dump="$a" ;;
+      -H) case "$a" in "If-None-Match: "*) inm="${a#If-None-Match: }" ;; esac ;;
+    esac
+    prev="$a"
+    url="$a"
+  done
+  printf '%s\t%s\n' "$url" "$inm" >>"$W/calls"
+  [ "$STUB_MODE" = dead ] && return 7
+  if [ -n "$inm" ] && [ "$inm" = "$STUB_ETAG" ]; then status=304; fi
+  if [ -n "$dump" ]; then
+    {
+      printf 'HTTP/2 %s\r\n' "$status"
+      if [ -n "$STUB_ETAG" ]; then printf 'ETag: %s\r\n' "$STUB_ETAG"; fi
+      if [ "$STUB_MODE" = rate ]; then
+        printf 'X-RateLimit-Limit: %s\r\nX-RateLimit-Remaining: %s\r\n' "$STUB_LIMIT" "$STUB_REM"
+        printf 'X-RateLimit-Used: %s\r\nX-RateLimit-Reset: %s\r\n' "$STUB_USED" "$STUB_RESET"
+      fi
+      printf '\r\n'
+    } >"$dump"
+  fi
+  if [ "$status" != 304 ] && [ -n "$out" ]; then printf '%s' "$STUB_BODY" >"$out"; fi
+  printf '%s' "$status"
+}
+ledger() { cat "$STATE_DIR/gh-rate.ledger" 2>/dev/null | tr '\n' '|'; }
+
+# --- the headers are captured on the GET paths, not only on the two writes ----
+fresh
+STUB_BODY='{"runs":1}'
+check "gh_api still returns the body" '{"runs":1}' "$(gh_api "repos/o/r/actions/runners")"
+check "gh_api notes the four rate headers of its response" \
+  "200 5000 4990 10 1700000000|" "$(ledger)"
+
+fresh
+STUB_REM=4321 STUB_USED=679
+gh_api_fetch stub-token "repos/o/r/actions/runs/1/jobs" "$W/state/job-1"
+check "the fork-safe fetch notes them too" "200 5000 4321 679 1700000000|" "$(ledger)"
+check "the fork-safe fetch still delivers its payload" '{"runs":1}' "$(cat "$W/state/job-1" 2>/dev/null)"
+check "the fork-safe fetch leaves no header file beside the payload" no \
+  "$(yn test -e "$W/state/job-1.hdr")"
+
+# A call that never got a response writes no header file. The previous call's
+# file must not be read as its answer: that would republish a `remaining` from
+# a request that succeeded as the state of one that could not connect.
+fresh
+STUB_REM=4990 STUB_USED=10
+gh_api "repos/o/r/a" >/dev/null
+STUB_MODE=dead
+gh_api "repos/o/r/b" >/dev/null
+STUB_MODE=rate
+check "a call with no response notes no headers, not the previous call's" \
+  "200 5000 4990 10 1700000000|000 - - - -|" "$(ledger)"
+
+# --- a missing header publishes nothing; a present one publishes ------------
+fresh
+STUB_MODE=bare
+gh_api "repos/o/r/a" >/dev/null
+STUB_MODE=rate
+check "a response without rate headers is noted as absent, never as 0" "200 - - - -|" "$(ledger)"
+gh_rate_tick_summary
+queue_github_rate_series
+check "missing headers publish the counts and NO rate gauge" \
+  "ci_github_requests=1 ci_github_not_modified=0" "$(tr '\n' ' ' <"$W/series" | sed 's/ $//')"
+
+# The positive control: without it the check above passes for a publisher that
+# publishes nothing at all.
+fresh
+gh_api "repos/o/r/a" >/dev/null
+gh_api "repos/o/r/b" >/dev/null
+gh_rate_tick_summary
+# shellcheck disable=SC2034
+CYCLE_SECONDS=23
+queue_github_rate_series
+CYCLE_SECONDS=""
+check "present headers publish limit, remaining, both counts and the cycle" \
+  "ci_github_requests=2 ci_github_not_modified=0 ci_github_rate_limit=5000 ci_github_rate_remaining=4990 ci_cycle_seconds=23" \
+  "$(tr '\n' ' ' <"$W/series" | sed 's/ $//')"
+check "the summary consumes the ledger, so a tick is not counted twice" no \
+  "$(yn test -e "$STATE_DIR/gh-rate.ledger")"
+
+# No ledger at all is "not measured", which is not the same as zero requests.
+fresh
+gh_rate_tick_summary
+queue_github_rate_series
+check "a tick with no ledger publishes nothing rather than zeros" "" "$(cat "$W/series")"
+
+# --- a 304 returns the stored body, and only a named call is conditional -----
+fresh
+STUB_ETAG='W/"abc123"' STUB_BODY='{"workflow_runs":[{"id":7}]}'
+first=$(gh_api "repos/o/r/actions/runs?status=queued&created=1" runs-queued)
+# The server would send something else if it were asked unconditionally; a 304
+# carries no body, so anything but the stored one here is a wrong run list.
+STUB_BODY='{"workflow_runs":[]}'
+second=$(gh_api "repos/o/r/actions/runs?status=queued&created=2" runs-queued)
+second_rc=$?
+check "the first named call sends no validator" "" "$(sed -n 1p "$W/calls" | cut -f2)"
+check "the second sends the stored validator as If-None-Match" 'W/"abc123"' "$(sed -n 2p "$W/calls" | cut -f2)"
+check "a 304 is noted as a 304" 304 "$(sed -n 2p "$STATE_DIR/gh-rate.ledger" | cut -d' ' -f1)"
+check "a 304 succeeds" 0 "$second_rc"
+check "a 304 returns exactly the body the 200 returned" "$first" "$second"
+check "…and that body is the real one" '{"workflow_runs":[{"id":7}]}' "$second"
+
+gh_api "repos/o/r/actions/runs?per_page=100&status=queued" >/dev/null
+check "an unnamed call is never conditional, whatever is stored" "" "$(sed -n 3p "$W/calls" | cut -f2)"
+gh_api "repos/o/r/actions/runs?status=in_progress" runs-in-progress >/dev/null
+check "one call's validator is not sent on another's" "" "$(sed -n 4p "$W/calls" | cut -f2)"
+
+# The list changed: a new validator, a new body, and the store follows.
+STUB_ETAG='W/"def456"' STUB_BODY='{"workflow_runs":[{"id":8}]}'
+third=$(gh_api "repos/o/r/actions/runs?status=queued&created=3" runs-queued)
+STUB_BODY='{"workflow_runs":[]}'
+fourth=$(gh_api "repos/o/r/actions/runs?status=queued&created=4" runs-queued)
+check "a changed list is returned fresh" '{"workflow_runs":[{"id":8}]}' "$third"
+check "…and the next 304 returns the NEW stored body" "$third" "$fourth"
+
+# A validator read back from disk becomes a request header. One that is not
+# shaped like a validator is dropped, and the call goes out unconditional.
+printf 'x\r\nX-Injected: 1' >"$STATE_DIR/etag-runs-queued.etag"
+check "a malformed stored validator is not sent" "" "$(gh_etag_read runs-queued)"
+STUB_ETAG='' STUB_BODY='{"runs":1}'
+
+# --- are 304s billed? the arithmetic the tick's one event reports ------------
+cat >"$W/ledger" <<'LEDGER'
+200 5000 4990 10 1700
+304 5000 4990 10 1700
+304 5000 4989 11 1700
+304 - - - -
+200 5000 4980 20 1700
+LEDGER
+check "304s are split into used-advanced, used-flat and not-comparable" \
+  "5 3 1 1 1 5000 4980" "$(gh_rate_summarise "$W/ledger")"
+
+# The window rolled over mid-tick: the new window's numbers are the budget now,
+# and the old one's low-water mark would read as an exhausted installation.
+printf '200 5000 12 4988 1700\n200 5000 4999 1 5300\n200 5000 12 4988 1700\n' >"$W/ledger"
+check "limit and remaining come from the latest window" "3 0 0 0 0 5000 4999" "$(gh_rate_summarise "$W/ledger")"
+
+fresh
+printf '200 5000 4990 10 1700\n304 5000 4990 10 1700\n304 5000 4989 11 1700\n' >"$STATE_DIR/gh-rate.ledger"
+gh_rate_tick_summary
+check "a tick that saw 304s writes exactly one event" 1 "$(grep -c . "$W/events")"
+check "…and it says how many advanced the used counter" yes \
+  "$(yn grep -q 'advanced across 1, did not advance across 1, not comparable 0' "$W/events")"
+check "the 304 count is what gets published" 2 "$GH_RATE_NOT_MODIFIED"
+fresh
+printf '200 5000 4990 10 1700\n' >"$STATE_DIR/gh-rate.ledger"
+gh_rate_tick_summary
+check "a tick with no 304 writes no event" 0 "$(grep -c . "$W/events")"
+
+# --- none of it may fail the call ------------------------------------------
+# The ledger path is a DIRECTORY, so every append is refused.
+fresh
+mkdir "$STATE_DIR/gh-rate.ledger"
+out=$(gh_api "repos/o/r/a")
+check "an unwritable ledger does not fail gh_api" "0 {\"runs\":1}" "$? $out"
+check "an unwritable ledger does not fail the note" 0 "$(gh_rate_note 200 /nonexistent; echo $?)"
+gh_rate_tick_summary
+check "an unreadable ledger does not fail the summary, and publishes nothing" "0 []" "$? [$GH_RATE_REQUESTS]"
+
+# --- the full cycle is measured start to start -------------------------------
+cycle_out=$(
+  CLOCK=1000
+  date() { printf '%s\n' "$CLOCK"; }
+  beat() { :; }
+  collect_runners() { return 0; }
+  collect_demand() { :; }
+  collect_outcomes() { :; }
+  collect_parked() { :; }
+  collect_apply_build() { :; }
+  pool_select() { :; }
+  tick_pool() { :; }
+  queue_controller_series() { :; }
+  queue_outcome_series() { :; }
+  flush_series() { :; }
+  flush_events() { :; }
+  gh_rate_tick_summary() { :; }
+  # shellcheck disable=SC2034
+  BLIND_TICKS=0 POOLS=(a) LAST_TICK_START=0
+  eval "$(sed -n '/^tick() {/,/^}/p' "$CTRL")"
+  tick
+  printf '[%s]' "$CYCLE_SECONDS"
+  CLOCK=$((CLOCK + 137))
+  tick
+  printf '[%s]' "$CYCLE_SECONDS"
+)
+check "the first tick has no cycle; the second measures start to start" "[][137]" "$cycle_out"
+
+# --- structural: the tested text is wired where it is tested -----------------
+check "the queued run list is conditional" yes \
+  "$(case "$qline" in *'$demand_since_q" runs-queued '*) echo yes ;; *) echo no ;; esac)"
+check "the in-progress run list is conditional" yes \
+  "$(case "$ipline" in *'per_page=50" runs-in-progress '*) echo yes ;; *) echo no ;; esac)"
+# The re-run page is deliberately NOT conditional in this change: the task is
+# the two status lists, and the third call has its own spelling for that reason.
+rrline=$(sed -n '/^collect_demand()/,/^}/p' "$CTRL" | grep -F 'actions/runs?per_page=100&status=queued')
+check "the re-run page is found, and left unconditional" yes \
+  "$(case "$rrline" in *'status=queued" 2>/dev/null)'*) echo yes ;; *) echo no ;; esac)"
+
+# EVERY call path: a function that talks to api.github.com and notes nothing is
+# a path whose requests are spent and never counted.
+unnoted=$(awk '
+  /^[a-z_]+\(\) \{/ { fn = $1; url = 0; note = 0; next }
+  /^[[:space:]]*#/ { next }
+  fn != "" && /"https:\/\/api\.github\.com\// { url++ }
+  fn != "" && /gh_rate_note / { note++ }
+  /^\}/ { if (fn != "" && url > 0) { seen++; if (note < url) printf "%s ", fn }; fn = "" }
+  END { printf "seen=%d", seen }' "$CTRL")
+check "every function that calls GitHub notes its requests (nine of them)" "seen=9" "$unnoted"
+
+if sed -n '/^tick() {/,/^}/p' "$CTRL" \
+   | awk '/gh_rate_tick_summary/{s=NR} /queue_controller_series/{q=NR} END{exit !(s && q && s < q)}'; then
+  check "the ledger is summarised before the tick's series are queued" yes yes
+else
+  check "the ledger is summarised before the tick's series are queued" yes no
+fi
+check "the controller series include the GitHub spend" yes \
+  "$(if sed -n '/^queue_controller_series() {/,/^}/p' "$CTRL" | grep -qx '  queue_github_rate_series'; then echo yes; else echo no; fi)"
+
 echo "demand-budget selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

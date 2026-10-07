@@ -877,6 +877,23 @@ collapses to zero the moment work starts), `ci_demand_queued`,
 `ci_runner_list_blind_ticks`, `ci_demand_runs_skipped`,
 `ci_outcome_runs_skipped`.
 
+**What the controller spends on GitHub.** `ci_github_rate_limit` and
+`ci_github_rate_remaining` are read off the rate-limit headers of the
+controller's own responses; `ci_github_requests` counts every GitHub request a
+tick made, `ci_github_not_modified` how many of them were answered
+`304 Not Modified`, and `ci_cycle_seconds` is one full cycle, tick start to tick
+start (`ci_tick_seconds` is the work alone, without the sleep). The limit and
+the remainder belong to the App **installation** — every repository it covers
+draws on one hourly budget — and all five are published under every pool's
+label, so read them with `max()` across pools, never `sum()`. The two rate
+gauges are **absent, not zero**, on a tick whose responses carried no rate
+headers. The two status run-list calls of the demand sweep send `If-None-Match`
+and reuse the stored body on a 304; each tick that received one writes a
+`github-rate` event (log `ci-controller`) saying across how many of them
+`x-ratelimit-used` advanced, which is how to tell whether GitHub bills a 304.
+One sample proves nothing, because other repositories spend the same budget —
+read the distribution.
+
 **The work, not the pool.** `ci_jobs_completed{workflow,outcome}` and
 `ci_job_seconds{workflow}` — per-tick deltas on a gauge, so sum them over a
 window rather than averaging, and read them next to `ci_poller_heartbeat`

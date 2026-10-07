@@ -615,6 +615,203 @@ DUR_AGE=999999999
 DUR_KEY="unknown"
 DUR_ISSUED="unknown"
 
+# --- GitHub rate telemetry (#1486) ---------------------------------------------
+#
+# What this controller SPENDS on GitHub, measured rather than counted from the
+# script. Every repository of one App installation draws on one hourly budget,
+# and neither the real limit nor the real cost of a tick had ever been read off
+# a response: the only place the headers were parsed was the two Actions writes,
+# to tell a rate limit from a missing permission.
+#
+# A LEDGER FILE, not counters. gh_api runs inside `$(...)` and gh_api_fetch in a
+# background subshell, so a variable either of them incremented would die with
+# its subshell — the same reason gh_api's status lives in a file. One line per
+# request, appended with a single short write (atomic under O_APPEND, so the
+# parallel job-list fetches cannot interleave), summarised and removed once per
+# tick by gh_rate_tick_summary:
+#
+#   <http-status> <limit> <remaining> <used> <reset>      `-` = header absent
+#
+# NOTHING HERE MAY FAIL OR DELAY A TICK. Every function returns 0, does no
+# network I/O, and costs one awk over a file of at most a few hundred lines. A
+# ledger that cannot be written loses the measurement, never the call.
+
+# gh_rate_fields <header-file> -> "<limit> <remaining> <used> <reset>"
+#
+# A field is `-` unless it is all digits: an absent header must stay ABSENT all
+# the way to the publisher, because a gauge reading 0 remaining is the alarm
+# this series exists to raise and a response without the header is not one.
+gh_rate_fields() {
+  [ -s "${1:-}" ] || { printf '%s\n' '- - - -'; return 0; }
+  tr -d '\r' <"$1" 2>/dev/null | awk -F': *' '
+    function num(v) { return (v ~ /^[0-9]+$/) ? v : "-" }
+    { k = tolower($1) }
+    k == "x-ratelimit-limit" { l = $2 }
+    k == "x-ratelimit-remaining" { r = $2 }
+    k == "x-ratelimit-used" { u = $2 }
+    k == "x-ratelimit-reset" { t = $2 }
+    END { printf "%s %s %s %s\n", num(l), num(r), num(u), num(t) }' 2>/dev/null
+  return 0
+}
+
+# gh_rate_note <http-status> [<header-file>] — one ledger line for one request.
+#
+# Called WITHOUT a header file for the two installation-token mints: they are
+# requests and are counted, but they are authenticated by the App's JWT and
+# answer with the APP's budget, not the installation's, so their headers would
+# publish somebody else's `remaining` under this series.
+gh_rate_note() {
+  local f=""
+  [ -n "${2:-}" ] && f=$(gh_rate_fields "$2" 2>/dev/null)
+  case "$f" in *" "*" "*" "*) ;; *) f="- - - -" ;; esac
+  printf '%s %s\n' "${1:-000}" "$f" >>"$STATE_DIR/gh-rate.ledger" 2>/dev/null || true
+  return 0
+}
+
+# gh_rate_summarise <ledger-file>
+#   -> "<requests> <not_modified> <used_advanced> <used_flat> <not_comparable> <limit> <remaining>"
+#
+# limit/remaining come from the line with the LATEST reset and, within it, the
+# LOWEST remaining — not simply the last line: the job lists are fetched in
+# parallel and land in the ledger out of order, and a window that rolled over
+# mid-tick must not be answered with the old window's low-water mark. Both are
+# `-` when no response carried them.
+#
+# The three middle numbers are the measurement the epic asks for: IS A 304
+# BILLED? For each 304, `x-ratelimit-used` is compared with the request before
+# it in the same window. The conditional calls are sequential (they precede the
+# fan-out), so the predecessor is the previous request this controller made.
+# Other repositories of the same installation spend the same budget, so one
+# sample proves nothing — `advanced` on a 304 can be a neighbour's request. The
+# distribution over many ticks is the answer: 304s that are free read `flat`
+# almost always, 304s that are billed never do.
+gh_rate_summarise() {
+  awk '
+    NF { n++ }
+    {
+      cmp = ($4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/)
+      if ($1 == "304") {
+        nm++
+        if (cmp && have && $5 == preset) { if ($4 + 0 > pused + 0) adv++; else flat++ }
+        else unk++
+      }
+      if (cmp) { pused = $4; preset = $5; have = 1 }
+      if ($2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/) {
+        t = ($5 ~ /^[0-9]+$/) ? $5 + 0 : 0
+        if (!seen || t > reset || (t == reset && $3 + 0 < rem + 0)) {
+          limit = $2; rem = $3; reset = t; seen = 1
+        }
+      }
+    }
+    END {
+      printf "%d %d %d %d %d %s %s\n", n, nm, adv, flat, unk, (seen ? limit : "-"), (seen ? rem : "-")
+    }' "$1" 2>/dev/null
+}
+
+# What the last tick spent. EMPTY, never 0, when it could not be measured: an
+# empty value publishes nothing (see queue_github_rate_series).
+GH_RATE_REQUESTS=""
+GH_RATE_NOT_MODIFIED=""
+GH_RATE_LIMIT=""
+GH_RATE_REMAINING=""
+# The previous tick's start and the cycle it closed (tick work + sleep). Empty
+# on the first tick of a process: there is no previous start to measure from.
+LAST_TICK_START=0
+CYCLE_SECONDS=""
+
+# gh_rate_tick_summary — fold the ledger into the four globals above and remove
+# it, once per tick, in the parent shell. No ledger means nothing was measured
+# (no request was made, or the state dir refused the write) and the two cannot
+# be told apart from here, so all four stay empty rather than claim a zero.
+#
+# At most ONE event per tick, and only when a 304 was received.
+gh_rate_tick_summary() {
+  local ledger="$STATE_DIR/gh-rate.ledger" out="" n nm adv flat unk lim rem v
+  GH_RATE_REQUESTS=""
+  GH_RATE_NOT_MODIFIED=""
+  GH_RATE_LIMIT=""
+  GH_RATE_REMAINING=""
+  [ -f "$ledger" ] || return 0
+  # Renamed before it is read, so a request noted while awk runs lands in the
+  # next tick's ledger instead of being truncated away.
+  mv -f "$ledger" "$ledger.tick" 2>/dev/null || { rm -f "$ledger" 2>/dev/null; return 0; }
+  out=$(gh_rate_summarise "$ledger.tick" 2>/dev/null) || out=""
+  rm -f "$ledger.tick" 2>/dev/null
+  read -r n nm adv flat unk lim rem <<<"$out" || true
+  for v in "${n:-}" "${nm:-}" "${adv:-}" "${flat:-}" "${unk:-}"; do
+    case "$v" in "" | *[!0-9]*) return 0 ;; esac
+  done
+  GH_RATE_REQUESTS="$n"
+  GH_RATE_NOT_MODIFIED="$nm"
+  case "${lim:-}" in "" | *[!0-9]*) ;; *) GH_RATE_LIMIT="$lim" ;; esac
+  case "${rem:-}" in "" | *[!0-9]*) ;; *) GH_RATE_REMAINING="$rem" ;; esac
+  if [ "$nm" -gt 0 ]; then
+    event INFO github-rate "" \
+      "github rate: $nm of $n request(s) answered 304 Not Modified; x-ratelimit-used advanced across $adv, did not advance across $flat, not comparable $unk (limit=${GH_RATE_LIMIT:-unknown} remaining=${GH_RATE_REMAINING:-unknown})" \
+      requests="$n" not_modified="$nm" used_advanced="$adv" used_flat="$flat" not_comparable="$unk" || true
+  fi
+  return 0
+}
+
+# queue_github_rate_series — the tick's GitHub spend, under the selected pool.
+#
+# INSTALLATION facts (limit, remaining) and CONTROLLER facts (requests, 304s,
+# cycle) published under every pool's label, exactly like the heartbeat: read
+# them with max() across pools, never sum(). An empty value queues NOTHING — a
+# response without the headers, or a ledger that could not be read, must not
+# reach a dashboard as "0 remaining".
+queue_github_rate_series() {
+  if [ -n "$GH_RATE_REQUESTS" ]; then queue_series "ci_github_requests" "$GH_RATE_REQUESTS"; fi
+  if [ -n "$GH_RATE_NOT_MODIFIED" ]; then queue_series "ci_github_not_modified" "$GH_RATE_NOT_MODIFIED"; fi
+  if [ -n "$GH_RATE_LIMIT" ]; then queue_series "ci_github_rate_limit" "$GH_RATE_LIMIT"; fi
+  if [ -n "$GH_RATE_REMAINING" ]; then queue_series "ci_github_rate_remaining" "$GH_RATE_REMAINING"; fi
+  # ci_tick_seconds is the WORK of a tick; this is work plus the sleep after it,
+  # start to start. It is the denominator of every "requests per hour" sum: the
+  # poll interval is configured, the cycle is what actually happened.
+  if [ -n "$CYCLE_SECONDS" ]; then queue_series "ci_cycle_seconds" "$CYCLE_SECONDS"; fi
+  return 0
+}
+
+# --- conditional requests (#1486) ----------------------------------------------
+#
+# The validator and the body it validates, per named call, in the state dir. On
+# a 304 the stored body is handed back, so a caller cannot tell the two answers
+# apart. The name, not the URL, is the key: the windowed queued-run list carries
+# a `created` cutoff that moves every tick, and GitHub derives the validator
+# from the response it would send, so an unchanged list still validates. If that
+# ever proved untrue the cost is bounded — a run past the window re-enters the
+# id list, costs one job fetch, and is dropped by the same DEMAND_MAX_AGE filter
+# that counts.
+
+# gh_etag_read <name> -> the stored validator, or nothing. Nothing unless the
+# BODY is there too (a validator without its body is a 304 with no answer), and
+# nothing for a value that is not shaped like one: this string becomes a request
+# header, and the file it comes from is state, not input we wrote this tick.
+gh_etag_read() {
+  local e=""
+  [ -s "$STATE_DIR/etag-$1.body" ] || return 0
+  e=$(head -c 200 "$STATE_DIR/etag-$1.etag" 2>/dev/null) || e=""
+  case "$e" in "" | *[!A-Za-z0-9\"/+=_.:-]*) return 0 ;; esac
+  printf '%s' "$e"
+}
+
+# gh_etag_store <name> <header-file> <body-file>
+#
+# The old validator is removed FIRST and the new one written LAST, so every
+# interruption leaves a body with no validator (the next call is unconditional)
+# and never a validator pointing at a body it did not come with.
+gh_etag_store() {
+  local base="$STATE_DIR/etag-$1" e=""
+  rm -f "$base.etag" 2>/dev/null
+  e=$(tr -d '\r' <"$2" 2>/dev/null | awk 'tolower($1) == "etag:" { sub(/^[^:]*:[ \t]*/, ""); v = $0 } END { print v }' 2>/dev/null) || e=""
+  [ -n "$e" ] || return 0
+  cp -f "$3" "$base.body.part" 2>/dev/null \
+    && mv -f "$base.body.part" "$base.body" 2>/dev/null \
+    && printf '%s' "$e" >"$base.etag.part" 2>/dev/null \
+    && mv -f "$base.etag.part" "$base.etag" 2>/dev/null
+  return 0
+}
+
 gh_token() {
   local now
   now=$(date +%s)
@@ -689,6 +886,7 @@ gh_token() {
       "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" 2>>"$LOG") || resp=$'\n000'
     code=${resp##*$'\n'}
     resp=${resp%$'\n'*}
+    gh_rate_note "$code"
     [ "$code" = 201 ] && break
     if [ "$code" != 422 ]; then
       log "installation token mint failed: HTTP $code"
@@ -778,6 +976,7 @@ gh_actions_token() {
     -d "$body" \
     "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" 2>>"$LOG") || resp=$'\n000'
   code=${resp##*$'\n'}
+  gh_rate_note "$code"
   case "$(actions_token_mint_class "$code")" in
     ok)
       GH_ACT_TOKEN=$(printf '%s' "${resp%$'\n'*}" | jq -r '.token // empty' 2>/dev/null)
@@ -819,6 +1018,7 @@ gh_actions_post() {
   rem=$(tr -d '\r' <"$hdr" 2>/dev/null | awk -F': *' 'tolower($1) == "x-ratelimit-remaining" { v = $2 } END { print v }')
   ra=$(tr -d '\r' <"$hdr" 2>/dev/null | awk -F': *' 'tolower($1) == "retry-after" { v = $2 } END { print v }')
   body=$(head -c 4096 "$bodyf" 2>/dev/null)
+  gh_rate_note "$ACT_CODE" "$hdr"
   rm -f "$hdr" "$bodyf"
   ACT_CLASS=$(actions_write_class "$ACT_CODE" "$rem" "$ra" "$body")
   return 0
@@ -836,16 +1036,46 @@ gh_actions_post() {
 # The status is ALSO written to $STATE_DIR/api.status, because callers assign
 # the body with `X=$(gh_api …)` and a variable set inside that subshell never
 # reaches them.
+#
+# gh_api <api-path> [<cache-name>]
+#
+# With a cache name the call is CONDITIONAL (#1486): the validator stored under
+# that name goes out as If-None-Match, and a 304 answers with the body stored
+# beside it — byte for byte what the 200 that produced the validator returned,
+# so the caller sees the same thing either way. Without a name nothing changes.
+#
+# The response headers go to a file removed BEFORE the call: curl opens its
+# dump file on the first header, so a call that never got a response would
+# otherwise leave the previous call's headers there to be noted as its own.
 gh_api() {
-  local tok status
+  local tok status cache="${2:-}" etag="" cond=() hdr="$STATE_DIR/api.hdr"
   tok=$(gh_token) || { printf 'no-token' >"$STATE_DIR/api.status"; return 1; }
-  status=$(curl "${CURL_TIMEOUTS[@]}" -sS -o "$STATE_DIR/api.body" -w '%{http_code}' \
+  if [ -n "$cache" ]; then
+    etag=$(gh_etag_read "$cache" 2>/dev/null) || etag=""
+    [ -n "$etag" ] && cond=(-H "If-None-Match: $etag")
+  fi
+  rm -f "$hdr" 2>/dev/null
+  status=$(curl "${CURL_TIMEOUTS[@]}" -sS -o "$STATE_DIR/api.body" -D "$hdr" -w '%{http_code}' \
     -H "Authorization: Bearer $tok" \
     -H "Accept: application/vnd.github+json" \
+    ${cond[@]+"${cond[@]}"} \
     "https://api.github.com/$1" 2>>"$LOG") || status="000"
   printf '%s' "$status" >"$STATE_DIR/api.status"
+  gh_rate_note "$status" "$hdr"
   case "$status" in
-    2*) cat "$STATE_DIR/api.body"; return 0 ;;
+    2*)
+      [ -n "$cache" ] && gh_etag_store "$cache" "$hdr" "$STATE_DIR/api.body"
+      cat "$STATE_DIR/api.body"
+      return 0
+      ;;
+    304)
+      # Only ever sent with a stored body, so this is the stored body's own
+      # validator coming back. Anything else falls through to the failure arm.
+      if [ -n "$cache" ] && [ -s "$STATE_DIR/etag-$cache.body" ]; then
+        cat "$STATE_DIR/etag-$cache.body"
+        return 0
+      fi
+      ;;
   esac
   return 1
 }
@@ -872,10 +1102,15 @@ gh_api() {
 # the final name, and a failed call simply leaves it absent.
 gh_api_fetch() { # <token> <api-path> <destination-file>
   local tok="$1" path="$2" dest="$3" status
-  status=$(curl "${CURL_TIMEOUTS[@]}" -sS -o "$dest.part" -w '%{http_code}' \
+  # The headers go beside the caller-named body, for the same reason the body
+  # does: a fixed path is a race between branches of the fan-out.
+  rm -f "$dest.hdr" 2>/dev/null
+  status=$(curl "${CURL_TIMEOUTS[@]}" -sS -o "$dest.part" -D "$dest.hdr" -w '%{http_code}' \
     -H "Authorization: Bearer $tok" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/$path" 2>>"$LOG") || status="000"
+  gh_rate_note "$status" "$dest.hdr"
+  rm -f "$dest.hdr" 2>/dev/null
   case "$status" in
     2*) mv -f "$dest.part" "$dest" && return 0 ;;
   esac
@@ -1007,9 +1242,13 @@ collect_demand() {
   # of sight of that line silently stops being checked.
   [ -n "$demand_since" ] && demand_since_q="&created=%3E%3D${demand_since//:/%3A}"
 
-  runs=$(gh_api "repos/$REPO_FULL/actions/runs?status=queued&per_page=50$demand_since_q" 2>/dev/null)
+  # CONDITIONAL, both of them (#1486): an idle repository answers these two with
+  # the same body tick after tick. A 304 hands back the stored body, so nothing
+  # below can tell the difference; what is being learned is whether GitHub
+  # bills a 304, which the tick's `github-rate` event reports.
+  runs=$(gh_api "repos/$REPO_FULL/actions/runs?status=queued&per_page=50$demand_since_q" runs-queued 2>/dev/null)
   local runs_ip
-  runs_ip=$(gh_api "repos/$REPO_FULL/actions/runs?status=in_progress&per_page=50" 2>/dev/null)
+  runs_ip=$(gh_api "repos/$REPO_FULL/actions/runs?status=in_progress&per_page=50" runs-in-progress 2>/dev/null)
 
   # RE-RUNS, WHICH THE WINDOW ABOVE CANNOT SEE (#490). `created` matches the
   # run's created_at, and a re-run keeps it: a `gh run rerun` of a run pushed
@@ -2488,10 +2727,12 @@ reap_orphan_registrations() {
     case "$verdict" in
       reap:*)
         local code
-        code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
+        rm -f "$STATE_DIR/api-write.hdr" 2>/dev/null
+        code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -D "$STATE_DIR/api-write.hdr" -w '%{http_code}' -X DELETE \
           -H "Authorization: Bearer $ORPHAN_TOKEN" \
           -H "Accept: application/vnd.github+json" \
           "https://api.github.com/repos/$REPO_FULL/actions/runners/$id")
+        gh_rate_note "$code" "$STATE_DIR/api-write.hdr"
         case "$code" in
           204 | 404)
             rm -f "$f"
@@ -2960,10 +3201,17 @@ write_registration_token() {
 
   tok=$(gh_token) || { log "regtoken: no installation token"; return 1; }
 
-  resp=$(curl "${CURL_TIMEOUTS[@]}" -fsS -X POST \
+  # Headers only: the body is the registration token and stays in the variable.
+  # `-f` leaves no status to note, so the ledger gets the outcome instead.
+  rm -f "$STATE_DIR/api-write.hdr" 2>/dev/null
+  resp=$(curl "${CURL_TIMEOUTS[@]}" -fsS -X POST -D "$STATE_DIR/api-write.hdr" \
     -H "Authorization: Bearer $tok" \
     -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/$REPO_FULL/actions/runners/registration-token") || return 1
+    "https://api.github.com/repos/$REPO_FULL/actions/runners/registration-token") || {
+    gh_rate_note failed "$STATE_DIR/api-write.hdr"
+    return 1
+  }
+  gh_rate_note ok "$STATE_DIR/api-write.hdr"
   reg=$(printf '%s' "$resp" | jq -r '.token // empty')
   [ -n "$reg" ] || return 1
 
@@ -3882,10 +4130,12 @@ drain_host() {
   # assigned since the roster read: abort, and the host keeps every agent that
   # is still registered. Anything else is not an answer about the host at all.
   for id in $ids; do
-    code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
+    rm -f "$STATE_DIR/api-write.hdr" 2>/dev/null
+    code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -D "$STATE_DIR/api-write.hdr" -w '%{http_code}' -X DELETE \
       -H "Authorization: Bearer $tok" \
       -H "Accept: application/vnd.github+json" \
       "https://api.github.com/repos/$REPO_FULL/actions/runners/$id")
+    gh_rate_note "$code" "$STATE_DIR/api-write.hdr"
     case "$code" in
       204 | 404)
         deregistered=$((deregistered + 1))
@@ -4072,10 +4322,12 @@ cordon_host() {
 
   for id in $ids; do
     local code
-    code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
+    rm -f "$STATE_DIR/api-write.hdr" 2>/dev/null
+    code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -D "$STATE_DIR/api-write.hdr" -w '%{http_code}' -X DELETE \
       -H "Authorization: Bearer $tok" \
       -H "Accept: application/vnd.github+json" \
       "https://api.github.com/repos/$REPO_FULL/actions/runners/$id")
+    gh_rate_note "$code" "$STATE_DIR/api-write.hdr"
     case "$code" in
       204 | 404)
         gone=$((gone + 1))
@@ -4134,6 +4386,11 @@ cordon_host() {
 tick() {
   local tick_start
   tick_start=$(date +%s)
+  # Start to start, so it covers the previous tick's work AND the sleep after
+  # it. Empty on a process's first tick: nothing to measure from.
+  CYCLE_SECONDS=""
+  if [ "${LAST_TICK_START:-0}" -gt 0 ]; then CYCLE_SECONDS=$((tick_start - LAST_TICK_START)); fi
+  LAST_TICK_START=$tick_start
 
   # A blind tick is not an error, it is a SUSPENSION: every host reads
   # reg=unknown, so nothing drains, in EVERY pool. One is unremarkable; a run of
@@ -4192,6 +4449,9 @@ tick() {
   # whether this tick could see GitHub at all.
   local tick_seconds
   tick_seconds=$(( $(date +%s) - tick_start ))
+  # After the last GitHub call of the tick and before anything is queued: one
+  # awk over the tick's ledger, no network, and it cannot fail the tick.
+  gh_rate_tick_summary || true
   for p in "${POOLS[@]}"; do
     pool_select "$p"
     queue_controller_series "$tick_seconds"
@@ -4781,6 +5041,8 @@ queue_controller_series() {
   # compared against is the whole loop. A per-pool split would be four values
   # none of which can be alerted on.
   queue_series "ci_tick_seconds" "$tick_seconds"
+  # What the tick spent on GitHub and how long the whole cycle took (#1486).
+  queue_github_rate_series
   # >0 means ci_demand is a lower bound this tick, so a pool that looks
   # under-scaled may simply not have been counted. Controller-wide: the sweep is
   # shared, so a run skipped for budget is skipped for every pool.
@@ -5125,6 +5387,9 @@ LIVEZSVCEOF
 
 run_loop() {
   log "controller loop starting"
+  # A ledger left by a process killed mid-tick would be billed to the first
+  # tick of this one.
+  rm -f "$STATE_DIR/gh-rate.ledger" "$STATE_DIR/gh-rate.ledger.tick" 2>/dev/null || true
   while true; do
     # The loop's own two beats, around a tick that now also beats at every
     # phase boundary of its own (see beat()). Writing it ONLY here — before and
