@@ -46,6 +46,23 @@ its sibling `ci-runner-host-pool` directory, which is on disk because a
 `git::…//modules/x` source clones the whole repository; a registry or archive
 source packs one subdirectory and would not carry it.
 
+## Several repositories on one controller
+
+Instead of `github_owner` / `github_repo` / `pools`, a controller can be given
+`repos`: a list of `{ github_owner, github_repo, pools }` rows, each optionally
+naming its own `queue_base_branch` and GitHub App. The VM then runs one process
+per row — `ci-controller@<owner>-<repo>.service`, state under
+`/var/lib/ci-controller/<owner>-<repo>/` — and each is the loop a
+single-repository controller runs. Exactly one of the two shapes; the plan
+refuses both and refuses neither.
+
+The rules that span inputs (which shape, unique pool names across the table,
+unique slugs, label isolation inside each repository) live in the provider-less
+`repos-table` submodule so `scripts/ci/multi-repo.selftest.sh --plan` can apply
+it offline. The single-repository shape renders the metadata it always did, so
+an existing consumer plans no change. A worked example is in
+[docs/onboarding-a-repository.md](../../docs/onboarding-a-repository.md).
+
 ## Watch this
 
 `ci_pool_table_rejected`. A pool whose row the controller refused is simply

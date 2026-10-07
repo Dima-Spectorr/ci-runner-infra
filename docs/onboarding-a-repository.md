@@ -632,6 +632,54 @@ Never write the controller's table by hand: `mig` is a *generated* name, and a
 wrong one gives you a controller that lists an empty instance group forever and
 reports a perfectly healthy, permanently empty pool. Pass `pool_descriptor`.
 
+### One controller for several repositories
+
+The block above is one controller VM per repository. A controller can instead
+be given a `repos` table and serve several repositories from one VM — one
+process per repository, each the same loop, each with its own state:
+
+```hcl
+module "ci_runner_controller" {
+  # …source, name, github app, network and service account as above
+
+  repos = [
+    {
+      github_owner = "example-org"
+      github_repo  = "first"
+      pools        = [module.first_pool.pool_descriptor, module.first_pool_mq.pool_descriptor]
+    },
+    {
+      github_owner      = "example-org"
+      github_repo       = "second"
+      queue_base_branch = "master"      # optional, defaults to the controller's
+      pools             = [module.second_pool.pool_descriptor]
+    },
+  ]
+}
+```
+
+Give it **either** `repos` **or** `github_owner` / `github_repo` / `pools`,
+never both; the plan refuses both and refuses neither. An existing
+single-repository block is unchanged and plans no change.
+
+- A row may name its own `github_app_id`, `github_app_installation_id` and
+  `github_app_private_key_secret`; a row that names none uses the controller's.
+  The controller's service account must be able to read every key secret a row
+  names — this module grants nothing.
+- Pool names are unique across the **whole** table. Label isolation between a
+  CI pool and a merge-queue pool is checked inside each repository: two
+  repositories using the same selector labels is normal, because a runner is
+  registered to one repository.
+- On the VM each repository is `ci-controller@<owner>-<repo>.service` (lower
+  case), with its state under `/var/lib/ci-controller/<owner>-<repo>/` and its
+  log at `/var/log/ci-controller-<owner>-<repo>.log`. The `repos_served` output
+  lists the names.
+- A wedged repository is restarted alone by its own watchdog. If that does not
+  revive it and autohealing is on, the liveness answer turns unhealthy and names
+  it (`wedged=<owner>-<repo>`), so the group rebuilds the VM.
+- Every repository on one controller that shares an App installation shares
+  that installation's API rate budget. Nothing divides it between them yet.
+
 ### `mq_max_hosts` is the size
 
 > **Applies only to a repository that still carries a sized merge-queue pool.**

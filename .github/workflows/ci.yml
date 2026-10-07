@@ -385,6 +385,15 @@ jobs:
       - name: multi-pool self-test
         run: bash scripts/ci/multi-pool.selftest.sh
 
+      # One controller VM, one process per repository (#1486). What only goes
+      # wrong once a second repository exists: two repositories under one slug
+      # sharing a state directory, a process reading another row's settings,
+      # the single-repository unit and a templated unit both serving, and one
+      # wedged repository hidden behind healthy ones. The shipped functions are
+      # extracted and run; the Terraform half is the `terraform` job's.
+      - name: multi-repo self-test
+        run: bash scripts/ci/multi-repo.selftest.sh
+
       # The seam between a pool and the controller that serves it: a
       # `pool_descriptor` output on one side, a jq parser on the other, and
       # Terraform checking neither. A key the parser never reads is not an
@@ -1246,6 +1255,15 @@ jobs:
             # unwrapped — a retry here would only hide genuine breakage.
             terraform -chdir="$m" validate
           done
+
+      # `validate` never evaluates a precondition, and every rule about WHICH
+      # shape a controller was given is one. They live in a module with no
+      # provider in it precisely so this can apply it offline and watch each
+      # refusal happen — both shapes at once, neither, one pool name under two
+      # repositories, two repositories under one slug (#1486). Here and not in
+      # the shell jobs because this is the job that has terraform.
+      - name: multi-repo self-test (the plan-time refusals)
+        run: bash scripts/ci/multi-repo.selftest.sh --plan
 
   genericity:
     name: Genericity (no customer or repo literals)
