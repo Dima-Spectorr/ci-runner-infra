@@ -182,7 +182,7 @@ variable "repos" {
 
     The VM runs ONE PROCESS PER ROW: its own systemd unit
     (`ci-controller@<slug>.service`), its own watchdog and its own state
-    directory (`/var/lib/ci-controller/<slug>`), where `<slug>` is
+    directory (`/var/lib/ci-controller/repos/<slug>`), where `<slug>` is
     `<owner>-<repo>` lower-cased. A repository whose sweep is slow or wedged
     therefore delays nobody else, and the watchdog and the health endpoint name
     the one that stopped. Hosts are still never shared between repositories.

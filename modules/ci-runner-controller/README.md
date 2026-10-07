@@ -52,7 +52,7 @@ Instead of `github_owner` / `github_repo` / `pools`, a controller can be given
 `repos`: a list of `{ github_owner, github_repo, pools }` rows, each optionally
 naming its own `queue_base_branch` and GitHub App. The VM then runs one process
 per row — `ci-controller@<owner>-<repo>.service`, state under
-`/var/lib/ci-controller/<owner>-<repo>/` — and each is the loop a
+`/var/lib/ci-controller/repos/<owner>-<repo>/` — and each is the loop a
 single-repository controller runs. Exactly one of the two shapes; the plan
 refuses both and refuses neither.
 
