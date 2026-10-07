@@ -671,8 +671,8 @@ single-repository block is unchanged and plans no change.
   repositories using the same selector labels is normal, because a runner is
   registered to one repository.
 - On the VM each repository is `ci-controller@<owner>-<repo>.service` (lower
-  case), with its state under `/var/lib/ci-controller/<owner>-<repo>/` and its
-  log at `/var/log/ci-controller-<owner>-<repo>.log`. The `repos_served` output
+  case), with its state under `/var/lib/ci-controller/repos/<owner>-<repo>/` and its
+  log at `/var/log/ci-controller/repos/<owner>-<repo>.log`. The `repos_served` output
   lists the names.
 - A wedged repository is restarted alone by its own watchdog. If that does not
   revive it and autohealing is on, the liveness answer turns unhealthy and names

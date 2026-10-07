@@ -72,7 +72,8 @@ trap 'rm -rf "$T"' EXIT
 TN=$(cygpath -m "$T" 2>/dev/null || echo "$T")
 
 for f in repo_slug repos_table_rows repo_slugs_to_retire repo_rows_install \
-  repo_units_write repo_units_activate repo_units_retire_all livez_script; do
+  repo_units_write repo_units_activate repo_units_retire_stale \
+  repo_units_retire_all livez_script install_self; do
   if [ -z "$(fn "$f")" ]; then
     echo "FAIL $f() not found in controller-startup.sh — every assertion on it would be vacuous"
     exit 1
@@ -89,6 +90,18 @@ row() { # <owner> <repo> <pools json> [extra json members]
 THREE="[$(row Acme App "$(pool app-linux gcp,app)" ',"github_app_id":"11","github_app_installation_id":"22","github_app_private_key_secret":"key-a","queue_base_branch":"main"'),$(row acme tools "$(pool tools-linux gcp,tools)" ',"queue_base_branch":"master"'),$(row other svc "$(pool svc-linux gcp,svc),$(pool svc-queue gcp,queue merge-queue)")]"
 ONE="[$(row acme solo "$(pool solo-linux gcp,solo)")]"
 COLLIDE="[$(row a-b c "$(pool p1 gcp,a)"),$(row a b-c "$(pool p2 gcp,b)")]"
+
+# poolx — a pool whose every address column is chosen, for the tables that are
+# wrong in exactly one of them.
+poolx() { # <name> <mig> <region> <labels> [extra json members]
+  printf '{"name":"%s","mig":"%s","region":"%s","runner_labels":"%s"%s}' "$1" "$2" "$3" "$4" "${5:-}"
+}
+# Two repositories, two pool NAMES, one managed group.
+SAMEMIG="[$(row acme one "$(poolx one-linux shared-mig r1 gcp,one)"),$(row acme two "$(poolx two-linux shared-mig r1 gcp,two)")]"
+# The same group NAME in two regions is two groups.
+TWOREGIONS="[$(row acme one "$(poolx one-linux shared-mig r1 gcp,one)"),$(row acme two "$(poolx two-linux shared-mig r2 gcp,two)")]"
+# One pool name, two groups — the VM must refuse this without Terraform's help.
+SAMENAME="[$(row acme one "$(poolx shared mig-a r1 gcp,one)"),$(row acme two "$(poolx shared mig-b r1 gcp,two)")]"
 
 if [ "${1:-}" != "--plan" ]; then
 
@@ -115,6 +128,26 @@ if [ "${1:-}" != "--plan" ]; then
   check "table: the rejected row is named" "yes" "$(has "$(printf '%s' "$unsafe" | repos_table_rows 2>&1 >/dev/null)" "ci-repos row 0")"
   check "table: something that is not a table is an error, not zero rows" "1" "$(printf '{"a":1}' | repos_table_rows >/dev/null 2>&1; echo $?)"
 
+  # One managed group under two rows: two processes draining each other's
+  # hosts. Refused HERE, on the VM — metadata is the boundary, Terraform is not.
+  check "table: one managed group under two rows refuses the WHOLE table (exit 2)" "2" "$(printf '%s' "$SAMEMIG" | repos_table_rows >/dev/null 2>&1; echo $?)"
+  check "table: and prints no row at all" "" "$(printf '%s' "$SAMEMIG" | repos_table_rows 2>/dev/null)"
+  check "table: the refusal names the group, region and all" "yes" "$(has "$(printf '%s' "$SAMEMIG" | repos_table_rows 2>&1 >/dev/null)" "managed group r1/shared-mig is named")"
+  check "table: the same group name in ANOTHER region is two groups, both served" "2" "$(printf '%s' "$TWOREGIONS" | repos_table_rows 2>/dev/null | grep -c .)"
+  check "table: one pool name under two rows refuses the WHOLE table (exit 2)" "2" "$(printf '%s' "$SAMENAME" | repos_table_rows >/dev/null 2>&1; echo $?)"
+  check "table: the refusal names the pool" "yes" "$(has "$(printf '%s' "$SAMENAME" | repos_table_rows 2>&1 >/dev/null)" "pool name shared is named")"
+  nomig="[$(row acme one "$(poolx one-linux '' r1 gcp,one)"),$(row acme two "$(poolx two-linux '' r1 gcp,two)")]"
+  check "table: two pools with NO group are two broken pools, not one shared group" "2" "$(printf '%s' "$nomig" | repos_table_rows 2>/dev/null | grep -c .)"
+
+  # The owner and the repository are NAMES, held to the patterns Terraform
+  # holds them to. Every character of `a/..` is one an environment file can
+  # carry, so before this the row was served.
+  dotdot="[$(row 'a/..' x "$(pool d gcp,d)"),$(row acme good "$(pool g gcp,g)")]"
+  check "table: an owner that is a path is rejected, the rest are served" "1|acme-good|acme|good||||" "$(printf '%s' "$dotdot" | repos_table_rows 2>/dev/null)"
+  check "table: and the rejected row is named" "yes" "$(has "$(printf '%s' "$dotdot" | repos_table_rows 2>&1 >/dev/null)" "ci-repos row 0")"
+  slashed="[$(row acme 'x/y' "$(pool d gcp,d)"),$(row acme good "$(pool g gcp,g)")]"
+  check "table: a repository with a slash in it is rejected, the rest are served" "1|acme-good|acme|good||||" "$(printf '%s' "$slashed" | repos_table_rows 2>/dev/null)"
+
   # --- 3. which units a changed table retires --------------------------------
   eval "$(fn repo_slugs_to_retire)"
   check "retire: a slug present and no longer wanted" "gone" "$(repo_slugs_to_retire $'a\nb' $'a\ngone\nb')"
@@ -124,8 +157,16 @@ if [ "${1:-}" != "--plan" ]; then
   # --- 4. the installer's files, for 1 row and for 3 -------------------------
   eval "$(fn repo_rows_install)"
   eval "$(fn repo_units_write)"
+  # WHERE a repository's directory goes is the shipped script's decision, so the
+  # shipped lines make it: the block that derives every path from STATE_DIR is
+  # run with STATE_DIR pointed at the scratch directory. Only the log directory
+  # is overridden — it is an absolute path on the machine.
+  state_block=$(sed -n '/^STATE_ROOT="\$STATE_DIR"$/,/^fi$/p' "$CTRL")
   install_into() { # <dir> <json>
-    UNIT_DIR="$1/units" REPOS_ETC="$1/etc" STATE_ROOT="$1/state" SELF_INSTALL=/opt/ci-controller/controller.sh
+    UNIT_DIR="$1/units" REPOS_ETC="$1/etc" STATE_DIR="$1/state" SELF_INSTALL=/opt/ci-controller/controller.sh
+    unset CI_REPO_SLUG
+    eval "$state_block"
+    REPOS_LOG_DIR="$1/log"
     mkdir -p "$UNIT_DIR" "$STATE_ROOT"
     repo_rows_install "$2"
   }
@@ -135,7 +176,17 @@ if [ "${1:-}" != "--plan" ]; then
   slugs3=$(install_into "$T/three" "$THREE" 2>/dev/null)
   check "install(3 rows): three slugs, in table order" "acme-app acme-tools other-svc" "$(printf '%s' "$slugs3" | tr '\n' ' ' | sed 's/ $//')"
   check "install(3 rows): three environment files" "3" "$(find "$T/three/etc" -name '*.env' | grep -c .)"
-  check "install(3 rows): three state directories" "3" "$(find "$T/three/state" -mindepth 1 -maxdepth 1 -type d | grep -c .)"
+  check "install(3 rows): three state directories, under repos/" "3" "$(find "$T/three/state/repos" -mindepth 1 -maxdepth 1 -type d | grep -c .)"
+  check "install(3 rows): and NOTHING ELSE is made in the single-repository state directory" "repos" "$(find "$T/three/state" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ' | sed 's/ $//')"
+  check "install: the directory its log goes to exists before its unit starts" "present" "$([ -d "$T/three/log" ] && echo present || echo gone)"
+  # A repository whose slug IS the name of a single-repository marker file. On a
+  # controller that served one repository before it was given a table, that
+  # file is still there.
+  mkdir -p "$T/marker/state"
+  echo 7 >"$T/marker/state/demand-jobs"
+  check "install: a slug named like a legacy marker is served" "demand-jobs" "$(install_into "$T/marker" "[$(row demand jobs "$(pool dj gcp,dj)")]" 2>/dev/null)"
+  check "install: its directory is under repos/" "present" "$([ -d "$T/marker/state/repos/demand-jobs" ] && echo present || echo gone)"
+  check "install: and the marker beside it is still the file it was" "7" "$(cat "$T/marker/state/demand-jobs" 2>/dev/null)"
   check "install: the environment file names the row's repository" "CI_GITHUB_OWNER=Acme CI_GITHUB_REPO=App" "$(grep -E '^CI_GITHUB_(OWNER|REPO)=' "$T/three/etc/acme-app.env" | tr '\n' ' ' | sed 's/ $//')"
   check "install: the row's own base branch, not the neighbour's" "CI_QUEUE_BASE=master" "$(grep '^CI_QUEUE_BASE=' "$T/three/etc/acme-tools.env")"
   check "install: the pools file holds THAT row's pools only" "svc-linux,svc-queue" "$(jq -r 'map(.name) | join(",")' "$T/three/etc/other-svc.pools.json")"
@@ -155,6 +206,7 @@ if [ "${1:-}" != "--plan" ]; then
 
   # --- 5. activation: exactly the table, never both shapes -------------------
   eval "$(fn repo_units_activate)"
+  eval "$(fn repo_units_retire_stale)"
   eval "$(fn repo_units_retire_all)"
   activate() { # <dir> <slugs> -> the systemctl calls, one per line
     : >"$1/calls"
@@ -180,6 +232,39 @@ if [ "${1:-}" != "--plan" ]; then
   check "activate: every stop comes before the first start" "yes" "$([ "${last_disable:-99}" -lt "${first_restart:-0}" ] && echo yes || echo no)"
   check "activate(1 row): exactly one controller instance" "1" "$(activate "$T/one" "$slugs1" | grep -c '^restart ci-controller@')"
 
+  # The installer retires what the table dropped BEFORE it can stop early, so
+  # the retirement is a function of its own and is run here on its own: with
+  # some rows wanted, and with none — the table that used to leave every unit
+  # of the previous one enabled.
+  retire_stale() { # <dir> <wanted slugs> -> the systemctl calls
+    : >"$1/calls"
+    (
+      UNIT_DIR="$1/units" REPOS_ETC="$1/etc" CALLS="$1/calls"
+      systemctl() { echo "$*" >>"$CALLS"; }
+      repo_units_retire_stale "$2" >/dev/null 2>&1
+    )
+    cat "$1/calls"
+  }
+  mkdir -p "$T/stale/units" "$T/stale/etc"
+  touch "$T/stale/etc/keep.env" "$T/stale/etc/keep.pools.json" "$T/stale/etc/drop.env" "$T/stale/etc/drop.pools.json"
+  check "retire-stale: only the row the table dropped is disabled, and nothing is started" "disable --now ci-controller@drop.service ci-controller-watchdog@drop.timer" "$(retire_stale "$T/stale" keep)"
+  check "retire-stale: its row files are gone, the kept row's are not" "keep.env keep.pools.json" "$(find "$T/stale/etc" -type f -printf '%f\n' | sort | tr '\n' ' ' | sed 's/ $//')"
+  touch "$T/stale/etc/drop.env"
+  check "retire-stale: a table with NO servable row retires every unit" "2" "$(retire_stale "$T/stale" '' | grep -c '^disable --now ci-controller@')"
+  check "retire-stale: and leaves no row file a unit could start from" "0" "$(find "$T/stale/etc" -type f | grep -c .)"
+  # WHERE the installer calls it. install_self is not executed here (it writes
+  # to /etc and /opt), so this is the order of its lines: after the rows are
+  # known, before the first exit.
+  inst=$(fn install_self)
+  at_rows=$(printf '%s\n' "$inst" | grep -n 'repo_slugs=\$(repo_rows_install ' | sed -n 1p | cut -d: -f1)
+  at_retire=$(printf '%s\n' "$inst" | grep -n '^ *repo_units_retire_stale "\$repo_slugs"' | sed -n 1p | cut -d: -f1)
+  at_exit=$(printf '%s\n' "$inst" | grep -n '^ *exit 1$' | sed -n 1p | cut -d: -f1)
+  check "installer: the rows, the retirement and the early exit were all found" "yes" "$([ -n "$at_rows" ] && [ -n "$at_retire" ] && [ -n "$at_exit" ] && echo yes || echo no)"
+  check "installer: stale units are retired once the rows are known" "yes" "$([ "${at_rows:-99}" -lt "${at_retire:-0}" ] && echo yes || echo no)"
+  check "installer: and BEFORE the exit for a table with no servable row" "yes" "$([ "${at_retire:-99}" -lt "${at_exit:-0}" ] && echo yes || echo no)"
+  check "installer: a repository's heartbeat is bound into the responder from under repos/" "yes" "$(has "$inst" 'livez_binds="$livez_binds $REPOS_STATE/$s/heartbeat"')"
+  check "installer: and it is that same path the responder is told to read" "yes" "$(has "$inst" 'livez_hbs="$livez_hbs(\"$s\", \"$REPOS_STATE/$s/heartbeat\"), "')"
+
   retire_all() { # <dir> -> the systemctl calls
     : >"$1/calls"
     (
@@ -195,7 +280,6 @@ if [ "${1:-}" != "--plan" ]; then
   check "legacy install: a controller that never had a table calls systemctl for nothing" "" "$(retire_all "$T/never")"
 
   # --- 6. the process: its state directory, and the shape it is in -----------
-  state_block=$(sed -n '/^STATE_ROOT="\$STATE_DIR"$/,/^fi$/p' "$CTRL")
   shape_block=$(sed -n '/^REPOS_RAW=\$(md /,/^fi$/p' "$CTRL")
   settings=$(grep -E '^(OWNER|REPO|APP_ID|INSTALL_ID|KEY_SECRET|QUEUE_BASE)=' "$CTRL")
   pools_block=$(sed -n '/^POOLS_JSON=""$/,/^fi$/p' "$CTRL")
@@ -213,7 +297,8 @@ if [ "${1:-}" != "--plan" ]; then
     )
   }
   check "legacy: no slug keeps the state directory and the log it always had" "/var/lib/ci-controller /var/log/ci-controller.log" "$(state_of '')"
-  check "repository process: its own state directory and its own log" "/var/lib/ci-controller/acme-app /var/log/ci-controller-acme-app.log" "$(state_of acme-app)"
+  check "repository process: its own state directory and its own log, both under repos/" "/var/lib/ci-controller/repos/acme-app /var/log/ci-controller/repos/acme-app.log" "$(state_of acme-app)"
+  check "repository process: a slug named like a legacy marker is a directory BELOW the markers, never one of them" "/var/lib/ci-controller/repos/demand-jobs /var/log/ci-controller/repos/demand-jobs.log" "$(state_of demand-jobs)"
   check "repository process: a slug that would leave the state directory is refused" "" "$(state_of '../etc')"
   check "repository process: a slug with a slash is refused" "" "$(state_of 'a/b')"
 
@@ -229,6 +314,13 @@ if [ "${1:-}" != "--plan" ]; then
   check "shape: no table, no slug — the single-repository controller" "0 " "$(shape_of '' '')"
   check "shape: a table and no slug — the installer, which serves nothing itself" "1 3" "$(shape_of "$PACKED" '')"
   check "shape: a table and a slug — one repository's process" "0 3" "$(shape_of "$PACKED" acme-app)"
+  # A unit left on the boot disk for a row the table has since lost. Its
+  # environment file and its pools file are still beside it, so nothing but
+  # this refusal stops it serving until — and unless — the installer gets to it.
+  check "shape: a slug the table does not hold exits — a left-over unit serves nothing" "" "$(shape_of "$PACKED" gone-repo)"
+  check "shape: a slug that is only the START of a row's slug exits too" "" "$(shape_of "$PACKED" acme-ap)"
+  check "shape: every slug of a table the parser refuses exits — there is no row to be" "" "$(shape_of "$(printf '%s' "$SAMEMIG" | gzip -c | base64 | tr -d '\r')" acme-one)"
+  check "shape: that same slug runs once the table is one the parser serves" "0 2" "$(shape_of "$(printf '%s' "$TWOREGIONS" | gzip -c | base64 | tr -d '\r')" acme-one)"
   check "shape: a slug with NO table exits — a left-over unit must not serve beside the single-repository one" "" "$(shape_of '' acme-app)"
   check "shape: a table that does not unpack exits rather than reading as no table" "" "$(shape_of 'not-a-table' '')"
 
@@ -272,17 +364,22 @@ if [ "${1:-}" != "--plan" ]; then
   # --- 7. the watchdog restarts ONE repository, and says which ---------------
   wd_body=$(sed -n '/^    cat <<WDEOF$/,/^WDEOF$/p' "$CTRL" | sed '1d;$d')
   check "extracted: the watchdog body is not empty" "yes" "$([ -n "$wd_body" ] && echo yes || echo no)"
-  mkdir -p "$T/wd/alpha" "$T/wd/beta"
-  touch "$T/wd/heartbeat" "$T/wd/alpha/heartbeat"
-  touch -d '2 hours ago' "$T/wd/beta/heartbeat"
+  mkdir -p "$T/wd/repos/alpha" "$T/wd/repos/beta"
+  touch "$T/wd/heartbeat" "$T/wd/repos/alpha/heartbeat"
+  touch -d '2 hours ago' "$T/wd/repos/beta/heartbeat"
   {
     echo 'watchdog_verdict() { if [ "$1" = 1 ] && [ "$2" -ge "$4" ]; then echo restart; else echo ok; fi; }'
     echo 'systemctl() { [ "$1" = show ] || echo "systemctl $*" >>"$CALLS"; }'
     echo 'logger() { echo "logger $*" >>"$CALLS"; }'
     # shellcheck disable=SC2034  # read by the heredoc the eval renders
     STATE_DIR="$T/wd" STATE_ROOT="$T/wd" wd_threshold=300
+    # Where a repository's heartbeat is, as the shipped script derives it.
+    unset CI_REPO_SLUG
+    eval "$state_block"
     eval "cat <<WDRENDER"$'\n'"$wd_body"$'\n'"WDRENDER"
   } >"$T/wd.sh"
+  check "watchdog: a repository's heartbeat is looked for under repos/" "yes" "$(has "$(cat "$T/wd.sh")" "HB=\"$T/wd/repos/\$1/heartbeat\"")"
+  check "watchdog: and the single-repository heartbeat where it always was" "yes" "$(has "$(cat "$T/wd.sh")" "HB=\"$T/wd/heartbeat\"")"
   watchdog() { # [slug] -> what it did
     : >"$T/wd.calls"
     CALLS="$T/wd.calls" bash "$T/wd.sh" "$@" >/dev/null 2>&1
@@ -377,6 +474,37 @@ else
   check "plan: the same labels in TWO repositories are not a collision" "yes" "$(has "$(tf across "{$APP,\"repos\":$across}")" 'Apply complete')"
   check "plan: a value an environment file would cut short is rejected" "yes" "$(has "$(tf unsafe "{$APP,\"repos\":[$(row acme one "$(pool p gcp,p)" ',"github_app_private_key_secret":"two words"')]}")" 'cut the value short')"
 
+  # NO TWO ROWS ON ONE MANAGED GROUP — and the VM, given the same table by
+  # somebody who is not this module, refuses it as well.
+  samemig_out=$(tf samemig "{$APP,\"repos\":$SAMEMIG}")
+  check "plan: one managed group under two rows is rejected" "yes" "$(has "$samemig_out" 'named by only ONE pool row')"
+  check "plan: and the refusal names the group" "yes" "$(has "$samemig_out" 'r1/shared-mig')"
+  check "plan: the VM refuses that table too (exit 2)" "2" "$(printf '%s' "$SAMEMIG" | repos_table_rows >/dev/null 2>&1; echo $?)"
+  check "plan: the same group name in ANOTHER region is two groups" "yes" "$(has "$(tf tworegions "{$APP,\"repos\":$TWOREGIONS}")" 'Apply complete')"
+
+  # A ROW THE PLAN ACCEPTS MUST BE A ROW THE VM ACCEPTS. Each case is one pool
+  # that is wrong in one column: the plan must refuse it for THAT reason, and
+  # the VM's own parser — the shipped function, sourced — must reject the very
+  # same pool. If the two ever disagree, one of these pairs says which way.
+  # shellcheck source=/dev/null
+  . "$ROOT/modules/ci-runner-host-pool/scripts/pool-table.sh"
+  vm_serves() { # <one pool's json> -> how many rows the VM's parser keeps
+    printf '[%s]' "$1" | pool_table_parse 2>/dev/null | grep -c .
+  }
+  check "plan: the VM's pool parser was loaded and serves a sound pool" "1" "$(vm_serves "$(poolx ok ok-mig r1 gcp,ok ',"slots":4,"min_hosts":0')")"
+  mirrored() { # <case> <the phrase of the refusal> <one pool's json>
+    check "plan($1): refused at plan" "yes" "$(has "$(tf "m-$1" "{$APP,\"repos\":[$(row acme one "$3")]}")" "$2")"
+    check "plan($1): and the VM's parser rejects the same pool" "0" "$(vm_serves "$3")"
+  }
+  mirrored slots-0 'must be at least 1' "$(poolx z z-mig r1 gcp,z ',"slots":0')"
+  mirrored no-mig 'must name its `mig` and its `region`' "$(poolx e '' r1 gcp,e)"
+  mirrored no-region 'must name its `mig` and its `region`' "$(poolx e e-mig '' gcp,e)"
+  mirrored no-labels 'must carry `runner_labels`' "$(poolx l l-mig r1 '')"
+  mirrored negative-min-hosts 'must each be a whole number' "$(poolx n n-mig r1 gcp,n ',"min_hosts":-1')"
+  mirrored fractional-grace 'must each be a whole number' "$(poolx f f-mig r1 gcp,f ',"drain_grace_seconds":1.5')"
+  mirrored bad-host-os 'host_os must be linux or windows' "$(poolx o o-mig r1 gcp,o ',"host_os":"macos"')"
+  mirrored bad-name 'a pool name may use only' "$(poolx 'p q' pq-mig r1 gcp,pq)"
+
   check "plan: the single-repository shape applies" "yes" "$(has "$(tf legacy "$LEGACY")" 'Apply complete')"
   check "plan: single-repository shape is 'legacy'" '"legacy"' "$(out legacy shape)"
   check "plan: and its ci-repos value is EMPTY — the parent renders no key" '""' "$(out legacy metadata_value)"
@@ -397,6 +525,7 @@ else
   check "plan: the VM's parser serves every row Terraform rendered" "3" "$(printf '%s' "$vm_rows" | grep -c .)"
   check "plan: a row's own App id reaches the VM" "0|acme-app|Acme|App|11|22|key-a|main" "$(printf '%s\n' "$vm_rows" | sed -n 1p)"
   check "plan: a row that names none gets the controller-wide values" "1|acme-tools|acme|tools|1|2|key|master" "$(printf '%s\n' "$vm_rows" | sed -n 2p)"
+  check "plan: and the VM's pool parser serves every pool Terraform rendered" "4" "$(printf '%s' "$unpacked" | jq -c '[.[].pools[]]' | pool_table_parse 2>/dev/null | grep -c .)"
   check "plan: every pool name in the table, in row order" "app-linux tools-linux svc-linux svc-queue" "$(out three pool_names | jq -r 'join(" ")')"
 fi
 

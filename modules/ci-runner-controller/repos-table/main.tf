@@ -94,6 +94,47 @@ locals {
   slugs      = [for r in local.rows : r.slug]
   pool_names = flatten([for r in local.rows : [for p in r.pools : p.name]])
 
+  # EVERY POOL OF EVERY ROW, AS THE VM'S PARSER WILL READ IT.
+  #
+  # modules/ci-runner-host-pool/scripts/pool-table.sh decides, on the VM, which
+  # pool rows a repository's process may serve. A row it rejects is not an
+  # error there, it is a pool nobody ticks — and a repository ALL of whose rows
+  # are rejected is a process that exits 1 on every start, a heartbeat that
+  # never moves, a liveness probe answering 503, and a managed group rebuilding
+  # the whole controller on a loop for one bad number.
+  #
+  # So every test that parser applies is applied here first, to the same
+  # values, with the same defaults (`slots` absent is 1; a number absent is a
+  # number). `try` and not a bare reference: this module takes `repos` as `any`,
+  # so a row written without a column has no such attribute at all.
+  #
+  # `numbers` holds the columns the parser tests with `*[!0-9]*` — every one of
+  # them is an operand of `[ … -gt … ]` somewhere in the tick, where a minus
+  # sign or a decimal point is `integer expression expected` and a dead tick.
+  pools_flat = flatten([
+    for r in local.rows : [
+      for p in r.pools : {
+        name          = p.name
+        mig           = try(p.mig, null) == null ? "" : tostring(p.mig)
+        region        = try(p.region, null) == null ? "" : tostring(p.region)
+        runner_labels = try(p.runner_labels, null) == null ? "" : tostring(p.runner_labels)
+        slots         = try(p.slots, null) == null ? 1 : p.slots
+        numbers = [
+          for k in ["slots", "min_hosts", "max_hosts", "drain_grace_seconds", "register_grace_seconds", "orphan_confirm_ticks", "recycle_max_unavailable", "beacon_interval", "pin_orphan_grace_seconds"] :
+          tostring(p[k]) if try(p[k], null) != null
+        ]
+      }
+    ]
+  ])
+
+  # Where each pool's hosts live. A pool row names a REGIONAL managed group, so
+  # `<region>/<mig>` is the whole of its address inside the controller's
+  # project — there is no zone column to add to it. A pool with no `mig` names
+  # no group, is refused below for that, and is left out of this comparison on
+  # the VM as well: two of them are two broken rows, not one shared group.
+  mig_locations     = [for p in local.pools_flat : "${p.region}/${p.mig}" if p.mig != ""]
+  mig_locations_dup = distinct([for l in local.mig_locations : l if length([for m in local.mig_locations : m if m == l]) > 1])
+
   # Everything a row hands to a systemd EnvironmentFile, which is read by
   # systemd and not by a shell: a space, a quote or a `$` there is not an
   # injection, it is a value silently cut short — an owner that reads as half
@@ -171,6 +212,39 @@ output "rows" {
       ]
     ]))
     error_message = "each pool's host_os must be linux or windows, and its role `ci` or `merge-queue`. The table parser rejects any other value and a rejected row is a pool that is never ticked."
+  }
+
+  # NO TWO ROWS MAY NAME ONE MANAGED GROUP. Unique pool NAMES do not give this:
+  # `app-linux` and `tools-linux` can both be pointed at the same group, and
+  # then two processes — registered to two different repositories — each see
+  # the other's hosts as machines with no runner of their own, and each drains
+  # them. controller-startup.sh's repos_table_rows refuses the same table on
+  # the VM, because metadata is the boundary there and this module is not.
+  precondition {
+    condition     = length(local.mig_locations_dup) == 0
+    error_message = "each managed group may be named by only ONE pool row of the whole `repos` table. A group under two rows is two repository processes each counting the other's hosts as its own orphans and deleting them. Named more than once (`<region>/<mig>`): ${join(", ", local.mig_locations_dup)}"
+  }
+
+  # A ROW THIS PLAN ACCEPTS MUST BE A ROW THE VM ACCEPTS — the four tests
+  # below are pool-table.sh's, in its order. See `pools_flat`.
+  precondition {
+    condition     = alltrue([for p in local.pools_flat : p.mig != "" && p.region != ""])
+    error_message = "every pool of `repos` must name its `mig` and its `region`. The VM's pool table parser rejects a row missing either — it names no machines — and a repository whose every pool is rejected is a process that exits on start, for ever, until the health check rebuilds the controller."
+  }
+
+  precondition {
+    condition     = alltrue([for p in local.pools_flat : p.runner_labels != ""])
+    error_message = "every pool of `repos` must carry `runner_labels`. An empty label set matches nothing under GitHub's superset rule, so the VM's pool table parser rejects the row rather than serve a pool that can never see demand."
+  }
+
+  precondition {
+    condition     = alltrue(flatten([for p in local.pools_flat : [for n in p.numbers : can(regex("^[0-9]+$", n))]]))
+    error_message = "a pool's slots, min_hosts, max_hosts, drain_grace_seconds, register_grace_seconds, orphan_confirm_ticks, recycle_max_unavailable, beacon_interval and pin_orphan_grace_seconds must each be a whole number, zero or more. The VM compares them with shell integer tests, where a minus sign or a decimal point is not a wrong answer but a dead tick, so its pool table parser rejects the row."
+  }
+
+  precondition {
+    condition     = alltrue([for p in local.pools_flat : p.slots >= 1])
+    error_message = "a pool's `slots` must be at least 1. Zero plans cleanly and is then rejected by the VM's pool table parser: the autoscaler divides demand by it, and a host with zero agents reads as present for ever. A repository whose only pool is rejected exits on every start until the health check rebuilds the controller."
   }
 
   precondition {
