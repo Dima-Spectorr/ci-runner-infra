@@ -79,5 +79,39 @@ expect keep "a non-slot name is not resolvable to an instance" \
 expect reap "prefix collision does not count as a live host" \
   "$BASE-ab-s1" offline 0 "$BASE" "$BASE-abcd" 2 2
 
+# --- two pools, one label set, two controllers (#1486) ------------------------
+# A pool being moved to another project exists twice for a while: the same
+# runner labels, the same pool name, a controller each. GitHub's runner list is
+# per repository, so each controller sees BOTH pools' agents, and each one's
+# live-host list holds only its own. With one base name between them every
+# agent of the other pool is "offline with no instance behind it" the moment it
+# blinks, and is deregistered. `instance_base_name` gives one side a different
+# base; the base is then the only thing telling the two apart, and these are
+# the two controllers' views of the same four agents.
+OTHER=ci-relocated-pool
+
+expect keep "a foreign base with the same labels is the other controller's to reap" \
+  "$OTHER-0ff6-s1" offline 0 "$BASE" "" 9 2
+expect keep "and it stays untouched however long it has been hostless here" \
+  "$OTHER-0ff6-s4" offline 0 "$BASE" "$BASE-pnph" 99 2
+expect reap "while this pool's own orphan is still reaped exactly as before" \
+  "$BASE-0ff6-s1" offline 0 "$BASE" "$BASE-pnph" 9 2
+expect keep "seen from the other controller, this pool's agents are the foreign ones" \
+  "$BASE-0ff6-s1" offline 0 "$OTHER" "" 9 2
+expect reap "and that controller reaps its own" \
+  "$OTHER-0ff6-s1" offline 0 "$OTHER" "$OTHER-pnph" 9 2
+
+# WHY THE MODULE REFUSES `<pool name>-<anything>` AS A BASE NAME. The bound is a
+# prefix, so a base that merely EXTENDS this one with a hyphen is still inside
+# it: this controller claims the other pool's agent, finds no instance of its
+# own behind it, and reaps a slot that is serving jobs somewhere else. That is
+# the failure the input exists to prevent, reached by the most natural choice of
+# name. The case below is that behaviour, pinned so that nobody relaxes the
+# precondition on the host MIG believing the decision function has their back.
+# If the bound ever becomes an exact match, this flips to `keep` and the
+# precondition can go.
+expect reap "a base that extends ours with a hyphen is still claimed — hence the precondition" \
+  "$BASE-b-0ff6-s1" offline 0 "$BASE" "$BASE-pnph" 9 2
+
 printf 'orphan-decision selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

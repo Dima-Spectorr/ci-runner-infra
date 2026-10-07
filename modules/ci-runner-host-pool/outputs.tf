@@ -88,6 +88,17 @@ output "runner_labels" {
   value       = local.runner_labels
 }
 
+output "instance_base_name" {
+  description = <<-EOT
+    Base name of this pool's host instances: hosts are `<this>-<4 chars>` and
+    their runner agents `<host>-s<N>`. The pool name unless `instance_base_name`
+    was set. Deliberately NOT a key of `pool_descriptor`: the controller reads
+    the base name off the live instance group every tick, and a second copy in
+    the pool table would be one that can disagree with the machines.
+  EOT
+  value       = local.instance_base_name
+}
+
 output "job_concurrency" {
   description = "Maximum concurrent jobs this pool can serve: max_hosts * slots_per_host."
   value       = var.max_hosts * var.slots_per_host

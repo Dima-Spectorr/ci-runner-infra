@@ -254,6 +254,47 @@ expect ignore: "a Windows job is not a Linux pool's, in any case" \
 src_has "the controller passes the set its agents answer to, not the configured one" \
   'pinned_job_decision "$status" "$labels" "$RUNNER_MATCH_LABELS"'
 
+# --- two pools, one label set, two controllers (#1486) ------------------------
+#
+# A pool being moved to another project exists twice for a while, with the SAME
+# labels and a controller each. The run list is per repository, so each
+# controller reads the other pool's pinned jobs, finds every one of its labels
+# to be its own, and — with one base name between the two — finds the pinned
+# host missing from its own MIG and cancels the run. `instance_base_name` gives
+# one side a different base, and rule 5 is then the whole of the separation.
+# Same labels on every line below: only the host named by the pin differs.
+OTHER_BASE="ci-moved"
+OTHER_LIVE="ci-moved-e5f6"
+
+expect ignore: "a pin to a foreign base with OUR labels is the other controller's, however old" \
+  queued "self-hosted,linux,gcp,Repo,host-ci-moved-e5f6" "$POOL" "$BASE" "$LIVE" 99999 300
+expect ignore: "and it is not ours to cancel as vanished either, with our host list empty" \
+  in_progress "self-hosted,linux,gcp,Repo,host-ci-moved-e5f6" "$POOL" "$BASE" "" 99999 300 99999
+expect orphan: "while a dead pin on our own base is still orphaned exactly as before" \
+  queued "self-hosted,linux,gcp,Repo,host-ci-lin-dead" "$POOL" "$BASE" "$LIVE" 99999 300
+expect ignore: "seen from the other controller, our pinned jobs are the foreign ones" \
+  queued "self-hosted,linux,gcp,Repo,host-ci-lin-a1b2" "$POOL" "$OTHER_BASE" "$OTHER_LIVE" 99999 300
+expect pinned: "and that controller still sees its own live pin" \
+  in_progress "self-hosted,linux,gcp,Repo,host-ci-moved-e5f6" "$POOL" "$OTHER_BASE" "$OTHER_LIVE" 0 300
+
+# WHY THE MODULE REFUSES `<pool name>-<anything>` AS A BASE NAME: rule 5 is a
+# prefix test, so a base that extends ours with a hyphen is still inside it and
+# its perfectly healthy pinned run is cancelled here as an orphan. Pinned as
+# the behaviour it is, so that the precondition on the host MIG is not relaxed
+# on the belief that this function would catch it. An exact-match rule 5 flips
+# this to `ignore:` and retires the precondition.
+expect orphan: "a base that extends ours with a hyphen is still claimed — hence the precondition" \
+  queued "self-hosted,linux,gcp,Repo,host-ci-lin-b-e5f6" "$POOL" "$BASE" "$LIVE" 99999 300
+
+# And the base the controller hands rule 5 is the one read off the LIVE group,
+# which is what makes a renamed pool need no controller change at all — and a
+# hand-written pool table unable to get it wrong. Passing the pool name here
+# instead would run every case above green and cancel every renamed pool's
+# pinned runs on the fleet.
+# shellcheck disable=SC2016  # matching shell source text literally, on purpose.
+src_has "the controller bounds a pin by the live group's base name, not the pool name" \
+  'pinned_job_decision "$status" "$labels" "$RUNNER_MATCH_LABELS" "$MIG_BASE"'
+
 # --- the name that becomes a path ---------------------------------------------
 #
 # pin_host_of is the one helper here whose answer a caller turns into a file
