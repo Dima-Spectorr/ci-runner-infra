@@ -29,6 +29,38 @@ STATE_DIR="/var/lib/ci-controller"
 SELF_INSTALL="/opt/ci-controller/controller.sh"
 LOG=/var/log/ci-controller.log
 
+# ONE VM, ONE PROCESS PER REPOSITORY (#1486).
+#
+# A controller given a `ci-repos` table runs this same file once per row, as
+# `ci-controller@<slug>.service`, and the unit names its repository in
+# CI_REPO_SLUG. Everything a tick remembers — heartbeat, ETag store, rate
+# ledger, jobs directory, drain counters, every marker — is reached through
+# STATE_DIR, so pointing STATE_DIR at the repository's own directory is the
+# whole of the isolation: no function below knows a second repository exists.
+#
+# The log moves with it for the same reason. Two loops appending to one file
+# would interleave lines that name a host and not a repository.
+#
+# With NO slug this is the controller it always was: one repository, the
+# original unit name and the original paths, so a controller upgraded in place
+# keeps every marker it had. STATE_ROOT is what the installer and the watchdog
+# address repositories under; in that shape it IS the state directory.
+STATE_ROOT="$STATE_DIR"
+REPO_SLUG="${CI_REPO_SLUG:-}"
+if [ -n "$REPO_SLUG" ]; then
+  # The slug becomes a path. It is written by this file's own installer from a
+  # value repo_slug() produced, so anything else here is a hand-edited unit —
+  # refused rather than followed out of the state directory.
+  case "$REPO_SLUG" in
+    *[!a-z0-9._-]* | [!a-z0-9]*)
+      echo "CI_REPO_SLUG '$REPO_SLUG' is not a repository slug — refusing to run" >&2
+      exit 1
+      ;;
+  esac
+  STATE_DIR="$STATE_ROOT/$REPO_SLUG"
+  LOG="/var/log/ci-controller-$REPO_SLUG.log"
+fi
+
 log() {
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >>"$LOG"
   logger -t ci-controller -- "$*" 2>/dev/null || true
@@ -175,12 +207,141 @@ md() {
     "http://metadata.google.internal/computeMetadata/v1/$1" 2>/dev/null
 }
 
+# --- the repositories table (#1486) -------------------------------------------
+
+# repo_slug <owner> <repo> — the repository's name on this machine: its unit
+# instance and its state directory.
+#
+# `<owner>-<repo>`, lower-cased, anything outside [a-z0-9._-] turned into a
+# dash. Lower-cased because GitHub compares both names case-insensitively, so
+# `Acme/App` and `acme/app` are ONE repository and must be one process.
+# modules/ci-runner-controller/repos-table computes the same string at plan
+# time; multi-repo.selftest.sh feeds both the same pairs.
+#
+# It is NOT injective — `a-b/c` and `a/b-c` are both `a-b-c` — and it does not
+# try to be. A collision is refused by repos_table_rows, loudly and for the
+# whole table, because two repositories under one slug would share drain
+# counters and delete each other's markers.
+repo_slug() {
+  local s
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
+  s=$(printf '%s-%s' "$1" "$2" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')
+  case "$s" in
+    [a-z0-9]*) printf '%s' "$s" ;;
+    *) return 1 ;;
+  esac
+}
+
+# repos_table_rows — the `ci-repos` JSON on stdin, one row per line on stdout:
+#
+#   <index>|<slug>|<owner>|<repo>|<app id>|<installation id>|<key secret>|<base>
+#
+# `|` and not a tab: an omitted App id is an EMPTY field, and `read` collapses a
+# run of tabs, which would slide every later column one to the left.
+#
+# A row is REJECTED (named on stderr, the rest still served) when a value could
+# not be written to a systemd EnvironmentFile intact — that file is not read by
+# a shell, so a space or a quote is not an injection, it is a value cut short.
+# The whole table is REFUSED (exit 2, nothing on stdout) when two rows share a
+# slug: there is no safe half of that to serve.
+repos_table_rows() {
+  local raw idx owner repo app inst key base slug seen=$'\n' out=""
+  raw=$(jq -r '
+    def safe: (. // "") | tostring;
+    def ok: test("^[A-Za-z0-9._/@:+-]*$");
+    if type != "array" then error("not a table") else . end
+    | to_entries[]
+    | [ (.key | tostring),
+        (.value.github_owner | safe), (.value.github_repo | safe),
+        (.value.github_app_id | safe), (.value.github_app_installation_id | safe),
+        (.value.github_app_private_key_secret | safe),
+        (.value.queue_base_branch | safe) ]
+    | if all(.[]; ok) then join("|") else "!" + .[0] end' 2>/dev/null) || return 1
+  while IFS='|' read -r idx owner repo app inst key base; do
+    [ -n "$idx" ] || continue
+    case "$idx" in
+      '!'*)
+        echo "ci-repos row ${idx#!}: a value has a character an environment file cannot carry — row rejected" >&2
+        continue
+        ;;
+    esac
+    slug=$(repo_slug "$owner" "$repo") || {
+      echo "ci-repos row $idx: owner '$owner' and repo '$repo' make no usable slug — row rejected" >&2
+      continue
+    }
+    case "$seen" in
+      *$'\n'"$slug"$'\n'*)
+        echo "ci-repos row $idx: slug '$slug' is already taken by another row — two repositories cannot share one state directory, so the WHOLE table is refused" >&2
+        return 2
+        ;;
+    esac
+    seen="$seen$slug"$'\n'
+    out="$out$idx|$slug|$owner|$repo|$app|$inst|$key|$base"$'\n'
+  done <<<"$raw"
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+# repo_slugs_to_retire <wanted> <present> — one slug per line each; prints every
+# present slug that is no longer wanted.
+#
+# A controller VM keeps its boot disk across a reset, so the units of a table
+# that has since lost a row are still enabled on it. Left alone, a repository
+# removed from the table goes on being drained by a process nothing configures.
+repo_slugs_to_retire() {
+  local s
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    case $'\n'"$1"$'\n' in
+      *$'\n'"$s"$'\n'*) ;;
+      *) printf '%s\n' "$s" ;;
+    esac
+  done <<<"$2"
+}
+
+# WHICH OF THE THREE THINGS THIS PROCESS IS.
+#
+#   no `ci-repos`, no slug   the single-repository controller. Unchanged.
+#   `ci-repos`, no slug      the INSTALLER of a table. It serves no repository
+#                            itself: it writes one unit per row and exits.
+#   `ci-repos` and a slug    one repository's process.
+#
+# The fourth combination — a slug and no table — is a unit left on the boot
+# disk by a table this controller no longer carries. systemd starts it at boot,
+# before the installer has had the chance to retire it, and it would then serve
+# a repository beside the single-repository unit. It exits instead.
+#
+# The value is gzipped, base64-encoded and folded by Terraform, because one
+# metadata line past 4096 characters breaks every instance built from the
+# template. Present but unreadable is a loud exit and never "no table": falling
+# through would start the single-repository path with no repository to serve.
+REPOS_RAW=$(md "instance/attributes/ci-repos")
+REPOS_JSON=""
+REPOS_INSTALLER=0
+if [ -n "$REPOS_RAW" ]; then
+  REPOS_JSON=$(printf '%s' "$REPOS_RAW" | base64 -d 2>/dev/null | gzip -dc 2>/dev/null) || REPOS_JSON=""
+  if [ -z "$REPOS_JSON" ]; then
+    echo "ci-repos metadata is present but does not unpack — refusing to guess which repositories to serve" >&2
+    exit 1
+  fi
+  [ -n "$REPO_SLUG" ] || REPOS_INSTALLER=1
+elif [ -n "$REPO_SLUG" ]; then
+  echo "repository unit '$REPO_SLUG' has no ci-repos table to belong to — this controller serves a single repository now, so this unit must not" >&2
+  exit 1
+fi
+
+# REPOSITORY SETTINGS: THE ENVIRONMENT FIRST, THEN METADATA.
+#
+# A repository's unit sets these from its row of the table, and the single-
+# repository controller sets none of them, so it reads exactly the metadata it
+# always read. That is the entire difference between the two — every function
+# below reads OWNER, REPO and the rest and cannot tell which one filled them.
 PROJECT=$(md "project/project-id")
-OWNER=$(md "instance/attributes/ci-github-owner")
-REPO=$(md "instance/attributes/ci-github-repo")
-APP_ID=$(md "instance/attributes/ci-app-id")
-INSTALL_ID=$(md "instance/attributes/ci-app-installation-id")
-KEY_SECRET=$(md "instance/attributes/ci-app-key-secret")
+OWNER="${CI_GITHUB_OWNER:-$(md "instance/attributes/ci-github-owner")}"
+REPO="${CI_GITHUB_REPO:-$(md "instance/attributes/ci-github-repo")}"
+APP_ID="${CI_APP_ID:-$(md "instance/attributes/ci-app-id")}"
+INSTALL_ID="${CI_APP_INSTALLATION_ID:-$(md "instance/attributes/ci-app-installation-id")}"
+KEY_SECRET="${CI_APP_KEY_SECRET:-$(md "instance/attributes/ci-app-key-secret")}"
 POLL=$(md "instance/attributes/ci-poll-seconds")
 METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 # The branch the merge queue admits. Read here rather than assumed, because the
@@ -189,7 +350,7 @@ METRIC_PREFIX=$(md "instance/attributes/ci-metric-prefix")
 # not only in Terraform: a controller rendered before this key existed has no
 # such attribute, and `md` returns the empty string for one that is absent —
 # which would make every base comparison unequal.
-QUEUE_BASE=$(md "instance/attributes/ci-queue-base")
+QUEUE_BASE="${CI_QUEUE_BASE:-$(md "instance/attributes/ci-queue-base")}"
 : "${QUEUE_BASE:=main}"
 
 # Empty unless the root turned autohealing on. NO DEFAULT, deliberately — the
@@ -216,7 +377,18 @@ esac
 # and no table; it becomes a one-row table here and takes the same code path.
 # So there is no second implementation to keep in step, and no consumer has to
 # move Terraform state to keep the controller it already has running.
-POOLS_JSON=$(md "instance/attributes/ci-pools")
+#
+# A repository's unit names a FILE holding its row's pools (CI_POOLS_FILE): a
+# pool table is JSON, and JSON does not survive a systemd environment file.
+# Unreadable or empty falls through to metadata, where a table controller has
+# neither `ci-pools` nor the single-pool keys — so the synthesis below yields a
+# row with no name, the parser refuses it, and the process exits naming the
+# reason instead of serving some other repository's pools.
+POOLS_JSON=""
+[ -z "${CI_POOLS_FILE:-}" ] || POOLS_JSON=$(cat "$CI_POOLS_FILE" 2>/dev/null) || POOLS_JSON=""
+# The installer of a table has no pools of its own and must not synthesise any.
+[ "$REPOS_INSTALLER" != 1 ] || POOLS_JSON='[]'
+[ -n "$POOLS_JSON" ] || POOLS_JSON=$(md "instance/attributes/ci-pools")
 if [ -z "${POOLS_JSON:-}" ]; then
   # `nz` and not jq's `//`: an ABSENT metadata attribute reads as the empty
   # string, and in jq an empty string is truthy — `"" // 900` is `""`, not 900.
@@ -279,7 +451,9 @@ declare -A P_MATCH_JSON=() P_MATCH_CSV=()
 POOL_TABLE_REJECTED=0
 {
   pool_rejects=$(mktemp)
-  pool_rows=$(printf '%s' "$POOLS_JSON" | pool_table_parse 2>"$pool_rejects") || {
+  # The installer of a `ci-repos` table is the one process allowed past an
+  # empty table: it ticks nothing, it only writes the units that do.
+  pool_rows=$(printf '%s' "$POOLS_JSON" | pool_table_parse 2>"$pool_rejects") || [ "$REPOS_INSTALLER" = 1 ] || {
     echo "no usable pool in ci-pools metadata — this controller has nothing to manage" >&2
     cat "$pool_rejects" >&2
     rm -f "$pool_rejects"
@@ -5105,6 +5279,204 @@ queue_controller_series() {
 
 # --- install / run -----------------------------------------------------------
 
+# Where a table controller's units and per-repository files live. Names, not
+# literals at each use, so multi-repo.selftest.sh can run the REAL functions
+# below against a scratch directory instead of reading their text.
+UNIT_DIR=/etc/systemd/system
+REPOS_ETC=/etc/ci-controller
+
+# repo_rows_install <ci-repos json> — write each servable row's environment file
+# and pool table, make its state directory, and print its slug.
+#
+# Nothing on stdout means nothing was written that a unit could start from: a
+# table refused for a slug collision writes no file at all, so the installer
+# exits rather than serving the rows that happened to come first.
+repo_rows_install() {
+  local rows idx slug owner repo app inst key base
+  rows=$(printf '%s' "$1" | repos_table_rows) || return 1
+  mkdir -p "$REPOS_ETC"
+  while IFS='|' read -r idx slug owner repo app inst key base; do
+    [ -n "$slug" ] || continue
+    # The pools go to a file of their own: JSON does not survive an environment
+    # file. A row whose pools cannot be written is skipped, not half-installed —
+    # its unit would start, find no table, and restart for ever.
+    printf '%s' "$1" | jq -c --argjson i "$idx" '.[$i].pools // []' >"$REPOS_ETC/$slug.pools.json" || continue
+    {
+      printf 'CI_GITHUB_OWNER=%s\n' "$owner"
+      printf 'CI_GITHUB_REPO=%s\n' "$repo"
+      printf 'CI_APP_ID=%s\n' "$app"
+      printf 'CI_APP_INSTALLATION_ID=%s\n' "$inst"
+      printf 'CI_APP_KEY_SECRET=%s\n' "$key"
+      printf 'CI_QUEUE_BASE=%s\n' "$base"
+      printf 'CI_POOLS_FILE=%s\n' "$REPOS_ETC/$slug.pools.json"
+    } >"$REPOS_ETC/$slug.env"
+    # The NAME of a secret, never its value — but root's loop is the only reader.
+    chmod 0600 "$REPOS_ETC/$slug.env" "$REPOS_ETC/$slug.pools.json"
+    mkdir -p "$STATE_ROOT/$slug"
+    printf '%s\n' "$slug"
+  done <<<"$rows"
+}
+
+# repo_units_write — the three template units of a table controller.
+#
+# `%i` is the slug. The controller unit hands it to the process as CI_REPO_SLUG
+# and loads that repository's environment file; a missing file fails the unit at
+# start, which is right — a slug with no row is not a repository to serve.
+repo_units_write() {
+  cat >"$UNIT_DIR/ci-controller@.service" <<EOF
+[Unit]
+Description=CI runner pool controller (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CI_REPO_SLUG=%i
+EnvironmentFile=$REPOS_ETC/%i.env
+ExecStart=$SELF_INSTALL --loop
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat >"$UNIT_DIR/ci-controller-watchdog@.service" <<EOF
+[Unit]
+Description=CI controller watchdog (%i) — restarts that repository's controller if its tick loop stalls
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ci-controller/watchdog.sh %i
+TimeoutStartSec=60
+EOF
+
+  cat >"$UNIT_DIR/ci-controller-watchdog@.timer" <<EOF
+[Unit]
+Description=Check the CI controller heartbeat of %i every minute
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=60
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# repo_units_activate <wanted slugs, one per line> — make the machine run
+# exactly those repositories and nothing else.
+#
+# The order is the guarantee. The single-repository unit goes first and the
+# rows the table dropped go second, both before anything is started, so at no
+# point is a repository served by two processes: two loops over one repository
+# each count the other's hosts as their own and drain them.
+repo_units_activate() {
+  local s present=""
+  systemctl disable --now ci-controller.service ci-controller-watchdog.timer || true
+  rm -f "$UNIT_DIR/ci-controller.service" "$UNIT_DIR/ci-controller-watchdog.service" "$UNIT_DIR/ci-controller-watchdog.timer"
+
+  for s in "$REPOS_ETC"/*.env; do
+    [ -f "$s" ] || continue
+    s=${s##*/}
+    present="$present${s%.env}"$'\n'
+  done
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    systemctl disable --now "ci-controller@$s.service" "ci-controller-watchdog@$s.timer" || true
+    # The state directory is left where it is: it holds drain counters for hosts
+    # that may still exist, and a row put back finds them.
+    rm -f "$REPOS_ETC/$s.env" "$REPOS_ETC/$s.pools.json"
+    echo "repository '$s' is no longer in ci-repos — its units are retired"
+  done <<<"$(repo_slugs_to_retire "$1" "$present")"
+
+  systemctl daemon-reload
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    systemctl enable "ci-controller@$s.service" "ci-controller-watchdog@$s.timer"
+    # RESTART, never `enable --now` — see the note in install_self: the previous
+    # version's process is already running from the boot disk.
+    systemctl restart "ci-controller@$s.service"
+    systemctl restart "ci-controller-watchdog@$s.timer"
+  done <<<"$1"
+}
+
+# repo_units_retire_all — the single-repository controller's half of the same
+# guarantee: no unit of a table this machine once carried is left enabled.
+repo_units_retire_all() {
+  local s
+  rm -rf "$UNIT_DIR/ci-controller-livez.service.d"
+  [ -d "$REPOS_ETC" ] || return 0
+  for s in "$REPOS_ETC"/*.env; do
+    [ -f "$s" ] || continue
+    s=${s##*/}
+    s=${s%.env}
+    systemctl disable --now "ci-controller@$s.service" "ci-controller-watchdog@$s.timer" || true
+    echo "repository '$s' belonged to a ci-repos table this controller no longer carries — its units are retired"
+  done
+  rm -rf "$REPOS_ETC"
+  rm -f "$UNIT_DIR/ci-controller@.service" "$UNIT_DIR/ci-controller-watchdog@.service" "$UNIT_DIR/ci-controller-watchdog@.timer"
+}
+
+# livez_script <heartbeats> <threshold> <port> — the liveness responder.
+#
+# <heartbeats> is a Python list body of ("<repository>", "<path>") pairs. The
+# single-repository controller passes one pair with an empty name, and for it
+# the answer is exactly what it always was.
+livez_script() {
+  cat <<LIVEZEOF
+import http.server, os, sys, time
+
+HBS = [$1]
+THRESHOLD = $2
+WEDGED = []
+
+def verdict():
+    # No heartbeat file yet: the group's initial_delay_sec covers a controller
+    # that has not reached its first tick; past that, an absent heartbeat is
+    # the same as an ancient one.
+    worst, stale = 0, []
+    for name, path in HBS:
+        try:
+            age = int(time.time() - os.stat(path).st_mtime)
+        except OSError:
+            age = THRESHOLD + 1
+        worst = max(worst, age)
+        if age >= THRESHOLD:
+            stale.append(name)
+    body = "age=%d threshold=%d" % (worst, THRESHOLD)
+    named = [n for n in stale if n]
+    if named:
+        body += " wedged=" + ",".join(named)
+    return (not stale), body, named
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        global WEDGED
+        if self.path.split("?")[0] != "/livez":
+            self.send_response(404); self.end_headers(); return
+        ok, body, named = verdict()
+        if named != WEDGED:
+            # Said once per change, to the journal: the probe's own answer is
+            # read by a load balancer and kept by nobody.
+            WEDGED = named
+            sys.stderr.write("wedged repositories: %s\n" % (",".join(named) or "none"))
+            sys.stderr.flush()
+        self.send_response(200 if ok else 503)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write((body + "\n").encode())
+
+    def log_message(self, *a):
+        # A probe every 30s, forever. Logging it buries the controller's own log.
+        pass
+
+if __name__ == "__main__":
+    http.server.HTTPServer(("0.0.0.0", $3), H).serve_forever()
+LIVEZEOF
+}
+
 install_self() {
   mkdir -p "$STATE_DIR" /opt/ci-controller
   install -m 0755 "$0" "$SELF_INSTALL"
@@ -5121,7 +5493,22 @@ install_self() {
       || log "jq is still missing after install — the controller cannot parse any GitHub response and every tick will be blind"
   fi
 
-  cat >/etc/systemd/system/ci-controller.service <<EOF
+  # ONE SHAPE OR THE OTHER, NEVER BOTH (#1486). A table controller writes the
+  # template units and one environment file per row; the single-repository
+  # controller writes the unit it always wrote, under the name it always had.
+  # Whichever it is, the OTHER shape's units are taken off the machine further
+  # down, before anything is started — the boot disk outlives the template that
+  # wrote them.
+  local repo_slugs=""
+  if [ "$REPOS_INSTALLER" = 1 ]; then
+    repo_slugs=$(repo_rows_install "$REPOS_JSON") || repo_slugs=""
+    if [ -z "$repo_slugs" ]; then
+      log "ci-repos holds no row this controller can serve — nothing installed, and every pool in the table is unserved"
+      exit 1
+    fi
+    repo_units_write
+  else
+    cat >/etc/systemd/system/ci-controller.service <<EOF
 [Unit]
 Description=CI runner pool controller ($POOL)
 After=network-online.target
@@ -5136,6 +5523,7 @@ RestartSec=15
 [Install]
 WantedBy=multi-user.target
 EOF
+  fi
 
   # --- watchdog --------------------------------------------------------------
   #
@@ -5170,6 +5558,14 @@ EOF
 HB="$STATE_DIR/heartbeat"
 THRESHOLD=$wd_threshold
 UNIT=ci-controller.service
+# One script for both shapes (#1486). With an argument it watches ONE
+# repository of a table: that repository's heartbeat, that repository's unit.
+# A wedged repository is therefore restarted alone, and the line logged below
+# names it — the others on this machine keep ticking.
+if [ -n "\${1:-}" ]; then
+  HB="$STATE_ROOT/\$1/heartbeat"
+  UNIT="ci-controller@\$1.service"
+fi
 
 now=\$(date +%s)
 present=0; age=0
@@ -5207,6 +5603,8 @@ WDEOF
   } >/opt/ci-controller/watchdog.sh
   chmod 0755 /opt/ci-controller/watchdog.sh
 
+  # A table controller's watchdog units are the templates repo_units_write made.
+  if [ "$REPOS_INSTALLER" != 1 ]; then
   cat >/etc/systemd/system/ci-controller-watchdog.service <<'WDSVCEOF'
 [Unit]
 Description=CI controller watchdog — restarts the controller if its tick loop stalls
@@ -5233,6 +5631,7 @@ AccuracySec=10s
 [Install]
 WantedBy=timers.target
 WDTIMEOF
+  fi
 
   # --- liveness responder (#308) ---------------------------------------------
   #
@@ -5262,35 +5661,31 @@ WDTIMEOF
     # as it should.
     touch "$STATE_DIR/heartbeat" 2>/dev/null || true
 
-    cat >/opt/ci-controller/livez.py <<LIVEZEOF
-import http.server, os, time
-
-HB = "$STATE_DIR/heartbeat"
-THRESHOLD = $((wd_threshold * 3))
-
-class H(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path.split("?")[0] != "/livez":
-            self.send_response(404); self.end_headers(); return
-        try:
-            age = int(time.time() - os.stat(HB).st_mtime)
-        except OSError:
-            # No heartbeat file yet. The group's initial_delay_sec covers a
-            # controller that has not reached its first tick; past that, an
-            # absent heartbeat is the same as an ancient one.
-            age = THRESHOLD + 1
-        ok = age < THRESHOLD
-        self.send_response(200 if ok else 503)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(("age=%d threshold=%d\n" % (age, THRESHOLD)).encode())
-
-    def log_message(self, *a):
-        # A probe every 30s, forever. Logging it buries the controller's own log.
-        pass
-
-http.server.HTTPServer(("0.0.0.0", $HEALTH_PORT), H).serve_forever()
-LIVEZEOF
+    # WHICH HEARTBEATS THE VERDICT IS OVER (#1486). The single-repository
+    # controller has the one above. A table controller has one per repository,
+    # and is unhealthy when ANY of them is stale: each repository's watchdog has
+    # already had three thresholds to restart its own unit, so a heartbeat that
+    # is still old is a repository nothing on this machine could revive — and a
+    # machine that answers 200 because its OTHER repositories are fine would
+    # leave that one unserved for good. The answer names it.
+    #
+    # Each path is bound into the responder's view by a drop-in beside the unit
+    # below; like the first, it must exist before the responder starts.
+    local livez_hbs="(\"\", \"$STATE_DIR/heartbeat\")" livez_binds="" s
+    local livez_dropin="$UNIT_DIR/ci-controller-livez.service.d"
+    rm -rf "$livez_dropin"
+    if [ -n "$repo_slugs" ]; then
+      livez_hbs=""
+      while IFS= read -r s; do
+        [ -n "$s" ] || continue
+        touch "$STATE_ROOT/$s/heartbeat" 2>/dev/null || true
+        livez_hbs="$livez_hbs(\"$s\", \"$STATE_ROOT/$s/heartbeat\"), "
+        livez_binds="$livez_binds $STATE_ROOT/$s/heartbeat"
+      done <<<"$repo_slugs"
+      mkdir -p "$livez_dropin"
+      printf '[Service]\nBindReadOnlyPaths=%s\n' "${livez_binds# }" >"$livez_dropin/repos.conf"
+    fi
+    livez_script "$livez_hbs" "$((wd_threshold * 3))" "$HEALTH_PORT" >/opt/ci-controller/livez.py
     chmod 0644 /opt/ci-controller/livez.py
 
     cat >/etc/systemd/system/ci-controller-livez.service <<'LIVEZSVCEOF'
@@ -5357,6 +5752,24 @@ LIVEZSVCEOF
     fi
   fi
 
+  # A table controller's units are enabled, restarted and — for a row the table
+  # no longer carries — retired by repo_units_activate, for the reason the note
+  # below gives at length. It also takes the single-repository unit off the
+  # machine FIRST, so there is no moment with both shapes running.
+  if [ "$REPOS_INSTALLER" = 1 ]; then
+    repo_units_activate "$repo_slugs" >>"$LOG" 2>&1
+    if [ -n "$HEALTH_PORT" ]; then
+      systemctl enable ci-controller-livez.service >>"$LOG" 2>&1 || true
+      systemctl restart ci-controller-livez.service >>"$LOG" 2>&1 || true
+    fi
+    log "controller installed for $(printf '%s' "$repo_slugs" | grep -c .) repositories ($(printf '%s' "$repo_slugs" | tr '\n' ' ')) poll=${POLL}s watchdog=${wd_threshold}s livez=${HEALTH_PORT:-off}"
+    return 0
+  fi
+  # And the converse: a controller that USED to carry a table still has those
+  # units on its boot disk. They refuse to run without a table (see the top of
+  # this file), but refusing every 15 seconds for ever is not the same as gone.
+  repo_units_retire_all >>"$LOG" 2>&1
+
   systemctl daemon-reload
   systemctl enable ci-controller.service
   systemctl enable ci-controller-watchdog.timer
@@ -5388,6 +5801,10 @@ LIVEZSVCEOF
 }
 
 run_loop() {
+  # A repository's directory is made by the installer; made here too, because a
+  # loop with nowhere to write its heartbeat is restarted by the watchdog for
+  # ever with nothing in any log to say why.
+  mkdir -p "$STATE_DIR"
   log "controller loop starting"
   # A ledger left by a process killed mid-tick would be billed to the first
   # tick of this one.
@@ -5411,6 +5828,16 @@ run_loop() {
 }
 
 case "${1:-}" in
-  --loop) run_loop ;;
+  --loop)
+    # The single-repository unit, started at boot on a controller that has since
+    # been given a table: it has no repository of its own and an empty pool
+    # table, and a loop over that would publish zeros for pools it does not
+    # serve. The installer removes the unit moments later.
+    if [ "$REPOS_INSTALLER" = 1 ]; then
+      echo "this controller carries a ci-repos table — repositories are served by ci-controller@<slug>.service, not by this unit" >&2
+      exit 1
+    fi
+    run_loop
+    ;;
   *) install_self ;;
 esac

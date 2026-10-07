@@ -14,7 +14,17 @@ output "controller_zone" {
 
 output "pools_served" {
   description = "Names of the pools this controller ticks, in table order. Compare against ci_pool_table_rejected: a pool listed here and rejected on the VM is being served by nobody."
-  value       = [for p in var.pools : p.name]
+  value       = local.repos_shape ? module.repos_table.pool_names : [for p in var.pools : p.name]
+}
+
+output "repos_served" {
+  description = "With `repos`: one slug per repository, in table order. Each is the instance name of that repository's unit on the VM (`ci-controller@<slug>.service`) and its state directory under /var/lib/ci-controller. Empty in the single-repository shape, which keeps the one `ci-controller.service`."
+  value       = module.repos_table.slugs
+}
+
+output "repos_table_json" {
+  description = "With `repos`: the table the VM is told, as readable JSON. The `ci-repos` metadata value is this, gzipped, base64-encoded and folded — read it off a live machine with `base64 -d | gunzip`. Empty in the single-repository shape."
+  value       = module.repos_table.repos_json
 }
 
 # The rendered table, so an operator can diff what the VM was told against what

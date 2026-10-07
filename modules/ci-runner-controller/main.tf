@@ -125,6 +125,52 @@ locals {
   # the safe direction: a pool that does not ask for token minting does not get
   # it.
   pools_json = jsonencode(var.pools)
+
+  # WHICH SHAPE, decided once and in the one place that sees both.
+  repos_shape = module.repos_table.shape == "repos"
+
+  # THE KEYS THAT DIFFER BETWEEN THE TWO SHAPES, and nothing else does.
+  #
+  # The single-repository shape renders exactly the three keys it always has,
+  # with the values it always had — so an existing consumer's instance template
+  # is byte-identical and its plan is empty. That is the compatibility promise
+  # of #1486 and it is held here, not by care: `ci-repos` is ABSENT in that
+  # shape rather than empty, because a key that is present and empty is still a
+  # change to every controller template in the fleet.
+  #
+  # The table shape renders ONLY `ci-repos`. The three single-repository keys
+  # are left out rather than blanked for the mirror-image reason: a repository
+  # process that lost its environment falls back to metadata, and what it must
+  # find there is nothing — a loud exit — not some other repository's table.
+  #
+  # `tomap` on both arms: the two object types differ, and a conditional whose
+  # arms differ in type is a plan-time error rather than a merge.
+  repo_metadata = local.repos_shape ? tomap({
+    "ci-repos" = module.repos_table.metadata_value
+    }) : tomap({
+    "ci-github-owner" = var.github_owner
+    "ci-github-repo"  = var.github_repo
+    # The table. Present, so the controller does NOT fall back to synthesising a
+    # one-row table from the single-pool keys — which is exactly what it would
+    # do here, and it would find none of them and serve nothing.
+    "ci-pools" = local.pools_json
+  })
+}
+
+# Both shapes meet here. No provider and no resources: it decides which shape
+# was given, refuses a table the VM could not serve, and renders `ci-repos`.
+module "repos_table" {
+  source = "./repos-table"
+
+  repos             = var.repos
+  github_owner      = var.github_owner
+  github_repo       = var.github_repo
+  legacy_pool_count = length(var.pools)
+
+  github_app_id                 = var.github_app_id
+  github_app_installation_id    = var.github_app_installation_id
+  github_app_private_key_secret = var.github_app_private_key_secret
+  queue_base_branch             = var.queue_base_branch
 }
 
 # Not every region has an "-a" zone, so the zone is read rather than assembled —
@@ -189,12 +235,11 @@ resource "google_compute_instance_template" "controller" {
     on_host_maintenance = "MIGRATE"
   }
 
-  metadata = {
+  metadata = merge(local.repo_metadata, {
     startup-script = local.controller_startup
 
-    # Per REPOSITORY. Everything per-pool is in the table below.
-    "ci-github-owner"          = var.github_owner
-    "ci-github-repo"           = var.github_repo
+    # Controller-wide. What names the REPOSITORY — owner, repo and its pool
+    # table, or the whole `ci-repos` table — is `local.repo_metadata`.
     "ci-app-id"                = var.github_app_id
     "ci-app-installation-id"   = var.github_app_installation_id
     "ci-app-key-secret"        = var.github_app_private_key_secret
@@ -209,17 +254,12 @@ resource "google_compute_instance_template" "controller" {
     # never be admitted from one that is simply waiting its turn.
     "ci-queue-base" = var.queue_base_branch
 
-    # The table. Present, so the controller does NOT fall back to synthesising a
-    # one-row table from the single-pool keys — which is exactly what it would
-    # do here, and it would find none of them and serve nothing.
-    "ci-pools" = local.pools_json
-
     # Empty unless autohealing is on, so the default path opens no port on the
     # one machine in the fleet that holds the App installation token.
     "ci-health-port" = var.controller_autohealing ? tostring(var.controller_health_port) : ""
 
     "block-project-ssh-keys" = "true"
-  }
+  })
 
   lifecycle {
     create_before_destroy = true
@@ -238,6 +278,11 @@ resource "google_compute_instance_template" "controller" {
     # was copied here when this module was written and the line gate was not,
     # which is how the module came to render an unfolded blob and pass its own
     # plan.
+    precondition {
+      condition     = length([for line in split("\n", module.repos_table.metadata_value) : line if length(line) > 4096]) == 0 && length(module.repos_table.metadata_value) < 262144
+      error_message = "controller '${var.name}' renders a `ci-repos` table that is ${length(module.repos_table.metadata_value)} characters, or has a line of more than 4096. Both limits are the ones recorded above for the boot script and they fail the same way: the template is created, and every instance built from it dies. The value is gzipped and folded by ./repos-table, so reaching either means the table itself has outgrown one controller."
+    }
+
     precondition {
       condition     = length([for line in split("\n", local.controller_startup) : line if length(line) > 4096]) == 0
       error_message = "controller '${var.name}' renders a boot script containing a line of more than 4096 characters. The template is created and the apply is green; every instance built FROM it then hangs about two minutes and fails with an unexplained `Internal error` (measured 2026-08-26, and again on 2026-08-30 when this module rendered the blob unfolded), which is a controller MIG stuck at `creating` and every pool it serves sitting at zero hosts. Fold the base64 blob: join(\"\\n\", regexall(\".{1,76}\", base64gzip(...)))."
