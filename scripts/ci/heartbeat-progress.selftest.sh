@@ -114,6 +114,7 @@ slow_out=$(
   queue_controller_series() { :; }
   queue_outcome_series() { :; }
   flush_series() { :; }
+  gh_rate_tick_summary() { :; }
 
   # The state tick() reads, set here because the phases that would normally set
   # it are stubbed. Read only inside the eval'd tick(), so SC2034 for the same
