@@ -154,6 +154,7 @@ curl() {
 }
 event() { printf "%s %s\n" "$1" "$2" >>"$W/events"; }
 throttled_event() { shift 2; event "$@"; }
+gh_rate_note() { :; }
 '
 
 # run_mint <file> <codes...> — runs gh_token from <file>, prints "rc=<n>".

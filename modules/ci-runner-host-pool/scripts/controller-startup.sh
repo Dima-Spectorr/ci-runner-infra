@@ -664,7 +664,9 @@ gh_rate_note() {
   local f=""
   [ -n "${2:-}" ] && f=$(gh_rate_fields "$2" 2>/dev/null)
   case "$f" in *" "*" "*" "*) ;; *) f="- - - -" ;; esac
-  printf '%s %s\n' "${1:-000}" "$f" >>"$STATE_DIR/gh-rate.ledger" 2>/dev/null || true
+  # stderr is silenced FIRST: redirections apply left to right, and a refused
+  # append reports itself on whatever stderr was at that moment.
+  printf '%s %s\n' "${1:-000}" "$f" 2>/dev/null >>"$STATE_DIR/gh-rate.ledger" || true
   return 0
 }
 

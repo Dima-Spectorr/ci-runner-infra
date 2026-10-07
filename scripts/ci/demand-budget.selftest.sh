@@ -381,10 +381,14 @@ curl() {
       printf '\r\n'
     } >"$dump"
   fi
-  if [ "$status" != 304 ] && [ -n "$out" ]; then printf '%s' "$STUB_BODY" >"$out"; fi
+  # As the real transport does: `-o` is truncated on a 304, so the body of the
+  # PREVIOUS response is not lying there to be mistaken for this one's.
+  if [ -n "$out" ]; then
+    if [ "$status" = 304 ]; then : >"$out"; else printf '%s' "$STUB_BODY" >"$out"; fi
+  fi
   printf '%s' "$status"
 }
-ledger() { cat "$STATE_DIR/gh-rate.ledger" 2>/dev/null | tr '\n' '|'; }
+ledger() { tr '\n' '|' <"$STATE_DIR/gh-rate.ledger"; }
 
 # --- the headers are captured on the GET paths, not only on the two writes ----
 fresh
@@ -488,9 +492,12 @@ cat >"$W/ledger" <<'LEDGER'
 304 5000 4989 11 1700
 304 - - - -
 200 5000 4980 20 1700
+304 5000 4980 20 1700
 LEDGER
+# Deliberately lopsided — one advanced, two flat — so that a summary with the
+# two counters swapped cannot produce the same line.
 check "304s are split into used-advanced, used-flat and not-comparable" \
-  "5 3 1 1 1 5000 4980" "$(gh_rate_summarise "$W/ledger")"
+  "6 4 1 2 1 5000 4980" "$(gh_rate_summarise "$W/ledger")"
 
 # The window rolled over mid-tick: the new window's numbers are the budget now,
 # and the old one's low-water mark would read as an exhausted installation.
@@ -498,12 +505,12 @@ printf '200 5000 12 4988 1700\n200 5000 4999 1 5300\n200 5000 12 4988 1700\n' >"
 check "limit and remaining come from the latest window" "3 0 0 0 0 5000 4999" "$(gh_rate_summarise "$W/ledger")"
 
 fresh
-printf '200 5000 4990 10 1700\n304 5000 4990 10 1700\n304 5000 4989 11 1700\n' >"$STATE_DIR/gh-rate.ledger"
+printf '200 5000 4990 10 1700\n304 5000 4990 10 1700\n304 5000 4989 11 1700\n304 5000 4989 11 1700\n' >"$STATE_DIR/gh-rate.ledger"
 gh_rate_tick_summary
 check "a tick that saw 304s writes exactly one event" 1 "$(grep -c . "$W/events")"
 check "…and it says how many advanced the used counter" yes \
-  "$(yn grep -q 'advanced across 1, did not advance across 1, not comparable 0' "$W/events")"
-check "the 304 count is what gets published" 2 "$GH_RATE_NOT_MODIFIED"
+  "$(yn grep -q 'advanced across 1, did not advance across 2, not comparable 0' "$W/events")"
+check "the 304 count is what gets published" 3 "$GH_RATE_NOT_MODIFIED"
 fresh
 printf '200 5000 4990 10 1700\n' >"$STATE_DIR/gh-rate.ledger"
 gh_rate_tick_summary
@@ -513,13 +520,18 @@ check "a tick with no 304 writes no event" 0 "$(grep -c . "$W/events")"
 # The ledger path is a DIRECTORY, so every append is refused.
 fresh
 mkdir "$STATE_DIR/gh-rate.ledger"
-out=$(gh_api "repos/o/r/a")
+# The refused append is the point of the case; its complaint is not output.
+out=$(gh_api "repos/o/r/a" 2>/dev/null)
 check "an unwritable ledger does not fail gh_api" "0 {\"runs\":1}" "$? $out"
 check "an unwritable ledger does not fail the note" 0 "$(gh_rate_note 200 /nonexistent; echo $?)"
 gh_rate_tick_summary
 check "an unreadable ledger does not fail the summary, and publishes nothing" "0 []" "$? [$GH_RATE_REQUESTS]"
 
 # --- the full cycle is measured start to start -------------------------------
+# The stubs in this subshell are called only from the tick() it evals out of the
+# controller, so the reachability pass sees no caller for any of them — the same
+# reason heartbeat-progress.selftest.sh carries this directive.
+# shellcheck disable=SC2317
 cycle_out=$(
   CLOCK=1000
   date() { printf '%s\n' "$CLOCK"; }
@@ -548,6 +560,9 @@ cycle_out=$(
 check "the first tick has no cycle; the second measures start to start" "[][137]" "$cycle_out"
 
 # --- structural: the tested text is wired where it is tested -----------------
+# The pattern is the controller's SOURCE text, where `$demand_since_q` is a
+# literal variable reference; expanding it here would match nothing.
+# shellcheck disable=SC2016
 check "the queued run list is conditional" yes \
   "$(case "$qline" in *'$demand_since_q" runs-queued '*) echo yes ;; *) echo no ;; esac)"
 check "the in-progress run list is conditional" yes \

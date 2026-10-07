@@ -306,6 +306,8 @@ reg_seq() { # <reg> <age> <pre> <status> [busy] [add-rc] [del-rc] [mutation-sed]
       REPO_FULL=test-owner/test-repo
       CURL_TIMEOUTS=(--connect-timeout 10 --max-time 30)
       log() { :; }
+      # The rate ledger is exercised in demand-budget.selftest.sh, not here.
+      gh_rate_note() { :; }
       gh_token() { echo installation-token; }
       curl() { echo '{\"token\":\"REGTOKEN\"}'; }
       jq() { echo REGTOKEN; }
@@ -922,6 +924,8 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
       RUNNER_LIST_STATUS=ok
       RUNNERS_JSON=\$(cat '$dir/runners.json')
       log() { :; }
+      # The rate ledger is exercised in demand-budget.selftest.sh, not here.
+      gh_rate_note() { :; }
       event() { echo \"\$1 \$2\" >>'$dir/events'; }
       gh_token() { echo installation-token; }
       # The FRESH roster drain_host reads for itself. A failure is a non-zero
@@ -1462,6 +1466,8 @@ cordon_seq() {
       CORDONED=0; CORDON_HELD=0; CORDON_ERRORS=0; CORDON_NO_PROGRESS=0
       RUNNERS_JSON='{}'
       log() { :; }
+      # The rate ledger is exercised in demand-budget.selftest.sh, not here.
+      gh_rate_note() { :; }
       # The severity and the event name are what an operator greps for, so they
       # are what is recorded -- not the message text.
       event() { printf '%s %s\n' \"\$1\" \"\$2\" >>'$dir/events'; }
