@@ -33,6 +33,7 @@ CALLEE="$ROOT/.github/workflows/merge-lane.yml"
 CALLER="$ROOT/.github/workflows/merge-lane-self.yml"
 DRIVER="$ROOT/scripts/ci/merge-lane.sh"
 DECISION="$ROOT/scripts/ci/merge-lane-decision.sh"
+FETCH="$ROOT/scripts/ci/merge-lane-fetch.sh"
 CI="$ROOT/.github/workflows/ci.yml"
 DOC="$ROOT/docs/merge-lane.md"
 RELAY="$ROOT/.github/workflows/merge-lane-review-relay.yml"
@@ -45,7 +46,7 @@ bad() {
   printf 'FAIL: %s\n' "$1"
 }
 
-for f in "$CALLEE" "$CALLER" "$DRIVER" "$DECISION" "$CI" "$DOC" "$RELAY"; do
+for f in "$CALLEE" "$CALLER" "$DRIVER" "$DECISION" "$FETCH" "$CI" "$DOC" "$RELAY"; do
   [ -f "$f" ] || {
     printf 'FAIL: missing %s — every check below would be vacuous\n' "$f"
     exit 1
@@ -3372,8 +3373,14 @@ a_fetch_job_never_counts_or_writes() {
   code="$(code_of "$1")"
   # Recorded before it is counted in this process, and replayed only after.
   before "$code" '^    if \[ -n "\$LANE_RECORD" \]; then$' '^    printf \. >>"\$LANE_CALLS"$' || return 1
-  before "$code" '^    printf \. >>"\$LANE_CALLS"$' '^    if \[ -n "\$LANE_REPLAY" \] && lane_gh_can_replay "\$@"; then$' || return 1
-  matches "$(code_of "$FETCH")" '^  if lane_gh_mutates "\$@"; then$'
+  before "$code" '^    printf \. >>"\$LANE_CALLS"$' '^    if \[ -n "\$LANE_REPLAY" \] && lane_gh_can_replay "\$@"; then$'
+}
+# The refusal comes before the call: a write a fetch job is asked for never
+# reaches the network, whatever the walk above it does.
+a_fetch_job_refuses_a_write() {
+  local code
+  code="$(code_of "$1")"
+  before "$code" '^  if lane_gh_mutates "\$@"; then$' '^  command gh "\$@" >"\$LANE_RECORD/\$n\.out"'
 }
 counts_the_reads_no_verdict_used() {
   matches "$(code_of "$1")" '^  for \(\(n = 0; n < unused; n\+\+\)\); do printf \. >>"\$LANE_CALLS"; done$'
@@ -3382,16 +3389,28 @@ the_fetch_can_be_turned_off() {
   local code
   code="$(code_of "$1")"
   matches "$code" '^FETCH_CONCURRENCY="\$\{FETCH_CONCURRENCY:-8\}"$' || return 1
-  matches "$code" '^  \[ "\$jobs" -gt 1 \] \|\| return 0$' || return 1
-  matches "$(cat "$WORKFLOW")" '^          FETCH_CONCURRENCY: \$\{\{ inputs\.fetch-concurrency \}\}$' || return 1
-  [ "$(awk '/^      fetch-concurrency:/{f=1} f&&/^ *default:/{print $2;exit}' "$WORKFLOW")" = 8 ]
+  matches "$code" '^  \[ "\$jobs" -gt 1 \] \|\| return 0$'
+}
+the_caller_can_set_the_fetch_concurrency() {
+  matches "$(code_of "$1")" '^          FETCH_CONCURRENCY: \$\{\{ inputs\.fetch-concurrency \}\}$' || return 1
+  [ "$(awk '/^      fetch-concurrency:/{f=1} f&&/^ *default:/{print $2;exit}' "$1")" = 8 ]
 }
 check fetches_before_it_walks "$DRIVER" "the walk runs before the fetch phase, so every head is read one after another again"
 check a_fetch_job_ranks_and_acts_on_nothing "$DRIVER" "a background fetch job runs on into the ranking and the action, so pull requests are merged concurrently"
 check reads_live_once_the_walk_is_over "$DRIVER" "the base tip or the action's own reads could be answered from a recording instead of live"
 check a_fetch_job_never_counts_or_writes "$DRIVER" "a fetch job counts its reads in the parent's file or is allowed to make a write"
 check counts_the_reads_no_verdict_used "$DRIVER" "reads a fetch job made that no verdict used are missing from the run's API count"
-check the_fetch_can_be_turned_off "$DRIVER" "fetch-concurrency does not reach the driver, or 1 no longer means a serial walk"
+check the_fetch_can_be_turned_off "$DRIVER" "the driver ignores fetch-concurrency, or 1 no longer means a serial walk"
+check a_fetch_job_refuses_a_write "$FETCH" "a fetch job is allowed to make a write call"
+check the_caller_can_set_the_fetch_concurrency "$CALLEE" "the fetch-concurrency input does not reach the driver, or its default is no longer 8"
+mutate "a fetch job makes whatever call it is asked for" "$FETCH" \
+  's|^  if lane_gh_mutates "\$@"; then$|  if false; then|' a_fetch_job_refuses_a_write
+mutate "the input stops reaching the driver" "$CALLEE" \
+  's|^          FETCH_CONCURRENCY: .*$|          FETCH_CONCURRENCY: 8|' the_caller_can_set_the_fetch_concurrency
+mutate "the input's default becomes serial" "$CALLEE" \
+  '/^      fetch-concurrency:/,/^        type:/s|^        default: 8$|        default: 1|' the_caller_can_set_the_fetch_concurrency
+mutate "a read is replayed before this process has counted it" "$DRIVER" \
+  's|^    printf \. >>"\$LANE_CALLS"$|    if [ -n "$LANE_REPLAY" ] \&\& lane_gh_can_replay "$@"; then\n      lane_gh_serve\n      return\n    fi\n&|' a_fetch_job_never_counts_or_writes
 mutate "the walk runs before the fetch" "$DRIVER" \
   's@^  lane_prefetch "\$total"$@  :@' fetches_before_it_walks
 mutate "a fetch job falls through into the ranking" "$DRIVER" \
