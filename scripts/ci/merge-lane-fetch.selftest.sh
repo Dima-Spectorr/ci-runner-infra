@@ -857,9 +857,11 @@ if [ "$FAIL" -gt 0 ]; then
   echo '--- serial run ---'
   cat "$WORK/run.serial/log"
   echo '--- concurrent run, differing lines ---'
-  diff "$WORK/run.serial/log.decided" "$WORK/run.concurrent/log.decided" | head -40
-  diff "$WORK/run.serial/calls.sorted" "$WORK/run.concurrent/calls.sorted" | head -20
-  diff "$WORK/run.serial/summary" "$WORK/run.concurrent/summary" | head -20
+  # `sed -n`, not `head`: it reads its input to the end, so `diff` is never
+  # cut off by a closed pipe (the pipefail reader gate, PFR2).
+  diff "$WORK/run.serial/log.decided" "$WORK/run.concurrent/log.decided" | sed -n '1,40p'
+  diff "$WORK/run.serial/calls.sorted" "$WORK/run.concurrent/calls.sorted" | sed -n '1,20p'
+  diff "$WORK/run.serial/summary" "$WORK/run.concurrent/summary" | sed -n '1,20p'
   echo "--- left behind: $(find "$WORK/run.serial/tmp" "$WORK/run.concurrent/tmp" -mindepth 1 | tr '\n' ' ')"
 fi
 
