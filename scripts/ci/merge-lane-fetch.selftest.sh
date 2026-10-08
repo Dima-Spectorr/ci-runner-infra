@@ -17,7 +17,9 @@
 # stays `ok` under its own mutation was asserting nothing, and is reported.
 #
 # Single quotes around `$`-text are patterns and sed programs, on purpose.
-# shellcheck disable=SC2016
+# And `say <id> $?` straight after a bare test reports THAT TEST's status, which
+# is the whole of what a case is: the condition is the assertion.
+# shellcheck disable=SC2016,SC2319
 
 set -uo pipefail
 
@@ -316,6 +318,8 @@ cases_spawn() { # <fetch-file>
     # shellcheck source=/dev/null
     source "$1"
     d="$(mktemp -d "$WORK/spawn.XXXXXX")"
+    # Read by the sourced file's functions, which shellcheck does not follow.
+    # shellcheck disable=SC2034
     LANE_RECORD='' LANE_REPLAY=''
     mkdir "$d/rec" "$d/flight" "$d/peak"
     total=7 jobs=3
@@ -324,6 +328,9 @@ cases_spawn() { # <fetch-file>
     # itself in flight, notes how many are, and — for the first head only —
     # stays in flight until a LATER head has finished, so the first head is
     # never the first to complete, however the scheduler behaves.
+    #
+    # Called by name, from `lane_fetch_spawn`, so it is not unreachable.
+    # shellcheck disable=SC2317
     job() {
       local i n
       : >"$d/started.$1"
@@ -669,7 +676,7 @@ if [ "$FAIL" -gt 0 ]; then
   diff "$WORK/run.serial/log.decided" "$WORK/run.concurrent/log.decided" | head -40
   diff "$WORK/run.serial/calls.sorted" "$WORK/run.concurrent/calls.sorted" | head -20
   diff "$WORK/run.serial/summary" "$WORK/run.concurrent/summary" | head -20
-  echo "--- left behind: $(ls -A "$WORK/run.serial/tmp" "$WORK/run.concurrent/tmp" | tr '\n' ' ')"
+  echo "--- left behind: $(find "$WORK/run.serial/tmp" "$WORK/run.concurrent/tmp" -mindepth 1 | tr '\n' ' ')"
 fi
 
 # <description> <script> <sed-program> <id>: the concurrent run of a broken copy
