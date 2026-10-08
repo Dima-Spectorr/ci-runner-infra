@@ -575,6 +575,152 @@ batch 1 "a strict base acts once and re-reads" 1 4 0 ""
 batch 1 "a spent budget still allows the pass its one action" 0 4 4 ""
 batch 1 "a garbled budget acts once" 0 x 0 ""
 
+# --- lane_settled_red: which heads may skip the rest of the reads --------------
+# args: green missing failed pending
+settled() {
+  local want="$1" desc="$2" got=no
+  shift 2
+  lane_settled_red "$@" && got=yes
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  args: %s\n  want: %s\n  got:  %s\n' "$desc" "$*" "$want" "$got"
+  fi
+}
+settled yes "every required check finished and one failed" 1 0 1 0
+settled yes "all of them failed" 0 0 3 0
+settled no  "all green is the merge case, and must be read in full" 2 0 0 0
+settled no  "a failure with one still RUNNING can outlive the budget and become a drop" 0 0 1 1
+settled no  "a failure with one MISSING can outlive the budget and become a drop" 0 1 1 0
+settled no  "nothing failed, one pending" 1 0 0 1
+settled no  "nothing failed, one missing" 1 1 0 0
+settled no  "an unreadable count proves nothing" 1 0 x 0
+settled no  "an empty read proves nothing" "" "" "" ""
+
+# THE PROOF THE SHORT CUT RESTS ON, BY ENUMERATION. For every count the
+# predicate accepts, no value of the three facts the lane then declines to read
+# — mergeability, distance from the base, head age — yields a verdict the lane
+# acts on, on either kind of base. If `lane_verdict` ever grows an arm that
+# could, this fails before the driver starts skipping a candidate.
+_sr_bad=0
+for _sr_counts in "1 0 1 0" "0 0 2 0" "5 0 1 0"; do
+  read -r _g _m _f _p <<<"$_sr_counts"
+  _t=$((_g + _m + _f + _p))
+  lane_settled_red "$_g" "$_m" "$_f" "$_p" || _sr_bad=$((_sr_bad + 1))
+  for _conflict in "" 0 1; do
+    for _behind in 0 7; do
+      for _age in "" 0 999999; do
+        for _strict in 0 1; do
+          _v=$(lane_verdict 0 "$LB" "$LB" "$_conflict" "$_t" "$_g" "$_m" "$_f" "$_p" "$_behind" "$_age" 1800 "$_strict")
+          if lane_admits "$_v"; then
+            _sr_bad=$((_sr_bad + 1))
+            printf 'FAIL: a settled-red head was admitted\n  counts: %s conflict=%s behind=%s age=%s strict=%s\n  got: %s\n' \
+              "$_sr_counts" "$_conflict" "$_behind" "$_age" "$_strict" "$_v"
+          fi
+        done
+      done
+    done
+  done
+done
+if [ "$_sr_bad" -eq 0 ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
+
+# --- lane_priority_of ----------------------------------------------------------
+prio() {
+  local want="$1" desc="$2" got
+  shift 2
+  got=$(lane_priority_of "$@")
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  args: %s\n  want: %s\n  got:  %s\n' "$desc" "$*" "$want" "$got"
+  fi
+}
+prio 50 "no label at all is the default" "" "lane/priority-"
+prio 50 "labels, none of them a priority" "bug,ready" "lane/priority-"
+prio 10 "a priority label among others" "bug,lane/priority-10,ready" "lane/priority-"
+prio 50 "a suffix that is not a number is not a priority" "lane/priority-high" "lane/priority-"
+prio 20 "the last numeric priority label wins, as it always did" "lane/priority-10,lane/priority-20" "lane/priority-"
+prio 50 "a label that is a bare number, without the prefix, is not a priority" "10,bug" "lane/priority-"
+prio 10 "a garbled label after a good one does not reset it" "lane/priority-10,lane/priority-x" "lane/priority-"
+
+# --- THE WINNER IS UNCHANGED ---------------------------------------------------
+# Two walks over the same open list. `full` is the walk as it was: every pull
+# request that is not a draft is read in full, judged and ranked. `short` is the
+# walk as it is now: a head `lane_settled_red` accepts is dismissed on its check
+# counts alone and never judged. The property is that both pick the SAME pull
+# request, in the same order behind it — not that either picks a particular one,
+# though each case names it so a fixture that drifted cannot pass by agreeing
+# with itself.
+#
+# One row per pull request:
+#   num draft conflict green missing failed pending behind age labels
+# `-` stands for an empty field. Required total is green+missing+failed+pending.
+_walk() { # <mode> <strict> <row>...
+  local mode="$1" strict="$2" row num draft conflict g m f p behind age labels v prio out=''
+  shift 2
+  for row in "$@"; do
+    read -r num draft conflict g m f p behind age labels <<<"$row"
+    [ "$conflict" = "-" ] && conflict=''
+    [ "$age" = "-" ] && age=''
+    [ "$labels" = "-" ] && labels=''
+    [ "$draft" = "1" ] && continue
+    if [ "$mode" = short ] && lane_settled_red "$g" "$m" "$f" "$p"; then continue; fi
+    v=$(lane_verdict 0 "$LB" "$LB" "$conflict" "$((g + m + f + p))" "$g" "$m" "$f" "$p" "$behind" "$age" 1800 "$strict")
+    lane_admits "$v" || continue
+    prio=$(lane_priority_of "$labels" "lane/priority-")
+    out+="$(lane_rank "$v" "$prio" "${age:-0}")	$num	${v%% *}"$'\n'
+  done
+  printf '%s' "$out" | LC_ALL=C sort | cut -f2,3 | tr '\t\n' '= '
+}
+same_winner() { # <want-order> <description> <strict> <row>...
+  local want="$1" desc="$2" strict="$3" full short
+  shift 3
+  full="$(_walk full "$strict" "$@")"
+  short="$(_walk short "$strict" "$@")"
+  if [ "$full" = "$short" ] && [ "$short" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  want:  %s\n  full:  %s\n  short: %s\n' "$desc" "$want" "$full" "$short"
+  fi
+}
+
+same_winner "104=merge:ready " "one ready among red, draft and conflicted" 0 \
+  "101 0 0 1 0 1 0 0 90000 -" \
+  "102 1 0 2 0 0 0 0 90000 -" \
+  "103 0 1 2 0 0 0 0 90000 -" \
+  "104 0 0 2 0 0 0 0 60 -" \
+  "105 0 - 1 0 1 0 0 90000 -" \
+  "106 0 1 0 0 2 0 0 90000 -"
+same_winner "203=merge:ready 201=merge:ready " "a priority label outranks an older ready one, and a red one with the best priority is no candidate" 0 \
+  "201 0 0 2 0 0 0 0 9000 -" \
+  "202 0 0 1 0 1 0 0 9000 lane/priority-1" \
+  "203 0 0 2 0 0 0 0 10 bug,lane/priority-10"
+same_winner "302=merge:ready 301=merge:ready 303=merge:ready " "a tie on priority goes to the oldest head, with red ones on both sides of it" 0 \
+  "300 0 0 1 0 1 0 0 99999 -" \
+  "301 0 0 2 0 0 0 0 500 -" \
+  "302 0 0 2 0 0 0 0 7000 -" \
+  "303 0 0 2 0 0 0 0 20 -" \
+  "304 0 0 0 0 2 0 0 5 -"
+same_winner "402=drop:budget-exceeded 403=merge:ready " "a failed head with a check still MISSING past the budget is a drop, ranks first, and is not dismissed" 0 \
+  "401 0 0 1 0 1 0 0 90000 -" \
+  "402 0 0 0 1 1 0 0 90000 -" \
+  "403 0 0 2 0 0 0 0 60 -"
+same_winner "502=drop:budget-exceeded 503=merge:ready " "and so is one with a check still PENDING past the budget" 0 \
+  "501 0 0 1 0 1 0 0 90000 -" \
+  "502 0 0 0 0 1 1 0 90000 -" \
+  "503 0 0 2 0 0 0 0 60 -"
+same_winner "602=merge:ready 601=update:behind " "on a strict base a ready one goes before a behind one, and a red behind one is neither" 1 \
+  "600 0 0 1 0 1 0 4 90000 -" \
+  "601 0 0 2 0 0 0 3 90000 -" \
+  "602 0 0 2 0 0 0 0 60 -"
+same_winner "" "nothing but red, draft and conflicted leaves nothing to act on" 0 \
+  "701 0 0 1 0 1 0 0 90000 -" \
+  "702 1 0 2 0 0 0 0 60 -" \
+  "703 0 1 2 0 0 0 0 60 -"
+
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane-decision: $FAIL failed, $PASS passed"
   exit 1

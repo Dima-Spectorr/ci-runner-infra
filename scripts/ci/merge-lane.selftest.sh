@@ -2361,6 +2361,83 @@ mutate "the authoritative gate sinks back below the loop that sleeps" "$DRIVER" 
   's@",\$labels," != @",$detail_labels," != @' \
   skips_before_it_sleeps
 
+# A SETTLED-RED HEAD IS DISMISSED ON ITS CHECKS ALONE, AND ONCE PER RUN.
+#
+# The decision itself — which counts prove a head cannot be acted on, and that
+# dismissing it leaves the ranking alone — is exercised in
+# `merge-lane-decision.selftest.sh`. These pin the WIRING, one property each, so
+# a mutation of one cannot be absorbed by another.
+counts_the_checks_before_the_detail_read() {
+  local code
+  code="$(code_of "$1")"
+  matches "$code" '^    if lane_settled_red "\$green" "\$missing" "\$failed" "\$pending"; then$' || return 1
+  before "$code" '^    if lane_settled_red "\$green" "\$missing" "\$failed" "\$pending"; then$' 'mapfile -t detail_lines' || return 1
+  before "$code" '^    if lane_settled_red "\$green" "\$missing" "\$failed" "\$pending"; then$' 'commits/\$sha" --jq .\.commit\.committer\.date' || return 1
+  before "$code" 'counted_sha="\$sha"$' '^    if lane_settled_red '
+}
+dismisses_only_what_the_rule_refuses() {
+  local code
+  code="$(code_of "$1")"
+  matches "$code" '^      if ! lane_admits "\$settled_verdict"; then$' || return 1
+  before "$code" '^      if ! lane_admits "\$settled_verdict"; then$' 'LANE_SETTLED\[\$num\]="\$sha\|\$LANE_PASS_NO\|\$green\|\$settled_verdict"'
+}
+carries_a_settled_head_only_on_the_same_sha() {
+  local code
+  code="$(code_of "$1")"
+  matches "$code" '^    if \[ -n "\$carried_sha" \] && \[ "\$carried_sha" = "\$sha" \]; then$' || return 1
+  matches "$code" '^declare -A LANE_SETTLED=\(\)$'
+}
+carries_after_the_list_gates() {
+  local code
+  code="$(code_of "$1")"
+  before "$code" '^    if \[ "\$draft" = "true" \]; then$' '^    if \[ -n "\$carried_sha" \] && ' || return 1
+  before "$code" '",\$list_labels," != ' '^    if \[ -n "\$carried_sha" \] && '
+}
+recounts_on_a_head_that_moved() {
+  local code
+  code="$(code_of "$1")"
+  matches "$code" '^    if \[ "\$sha" != "\$counted_sha" \]; then$' || return 1
+  before "$code" 'sha="\$\{detail_lines\[2\]\}"' '^    if \[ "\$sha" != "\$counted_sha" \]; then$' || return 1
+  before "$code" '^    if \[ "\$sha" != "\$counted_sha" \]; then$' 'verdict="\$\(lane_verdict "\$isdraft"'
+}
+says_what_it_did_not_read() {
+  local code
+  code="$(code_of "$1")"
+  matches "$code" 'echo "lane: #\$num \$settled_verdict .*were not read' || return 1
+  matches "$code" 'echo "lane: #\$num \$carried_verdict .*not re-read' || return 1
+  [ "$(printf '%s\n' "$code" | grep -cE 'queue_row "8:\$\(printf .%03d. "\$settled_priority"\)')" -eq 2 ]
+}
+check counts_the_checks_before_the_detail_read "$DRIVER" "a head whose required checks have all finished with one failed still pays the mergeability read, its sleeps, the head-commit read and the base comparison before being told skip:red"
+check dismisses_only_what_the_rule_refuses "$DRIVER" "a head is dismissed on its check counts without asking the rule whether that verdict is one the lane acts on"
+check carries_a_settled_head_only_on_the_same_sha "$DRIVER" "a later pass of the run re-reads every settled head, or carries one forward across a push"
+check carries_after_the_list_gates "$DRIVER" "a settled head is carried forward ahead of the draft or label gate, so a pull request that became a draft or lost its label still reads skip:red"
+check recounts_on_a_head_that_moved "$DRIVER" "the merge is decided on check counts taken from a head sha the pull request no longer has"
+check says_what_it_did_not_read "$DRIVER" "a pull request the lane did not read in full is logged, or shown in the queue, as if it had been"
+mutate "a settled head goes back to paying the detail read first" "$DRIVER" \
+  's@^    if lane_settled_red "\$green" "\$missing" "\$failed" "\$pending"; then$@    if false; then@' \
+  counts_the_checks_before_the_detail_read
+mutate "the head sha the checks were counted on is no longer remembered" "$DRIVER" \
+  's@ counted_sha="\$sha"$@ counted_sha=""@' \
+  counts_the_checks_before_the_detail_read
+mutate "a settled head is dismissed without asking the rule" "$DRIVER" \
+  's@^      if ! lane_admits "\$settled_verdict"; then$@      if true; then@' \
+  dismisses_only_what_the_rule_refuses
+mutate "a settled head is carried forward whatever its head sha now is" "$DRIVER" \
+  's@^    if \[ -n "\$carried_sha" \] && \[ "\$carried_sha" = "\$sha" \]; then$@    if [ -n "$carried_sha" ]; then@' \
+  carries_a_settled_head_only_on_the_same_sha
+mutate "the settled map becomes a plain variable" "$DRIVER" \
+  's@^declare -A LANE_SETTLED=()$@LANE_SETTLED=()@' \
+  carries_a_settled_head_only_on_the_same_sha
+mutate "a moved head is merged on the old head's check counts" "$DRIVER" \
+  's@^    if \[ "\$sha" != "\$counted_sha" \]; then$@    if false; then@' \
+  recounts_on_a_head_that_moved
+mutate "the dismissal stops saying what it did not read" "$DRIVER" \
+  's@were not read: none of them can make it actionable@@' \
+  says_what_it_did_not_read
+mutate "the carried verdict stops saying it was not re-read" "$DRIVER" \
+  's@ — not re-read: settled on this head@ — settled on this head@' \
+  says_what_it_did_not_read
+
 check skips_a_draft_before_it_spends_anything "$DRIVER" "a draft pays a detail read, a head-commit read and both check surfaces for a verdict the list already carried, and a repository full of stale drafts spends the fleet's shared App quota"
 check counts_what_it_spends "$DRIVER" "the lane does not count its API calls, so an exhausted shared quota cannot be attributed to the repository that spent it"
 check stops_short_of_an_exhausted_quota "$DRIVER" "a pass starts on an almost-empty shared quota, goes blind part-way, and spends the calls another repository needed to merge"

@@ -746,10 +746,11 @@ which is the next section.
 
 ### What a pass costs, and why it has a deadline
 
-A pass reads the open list once, then spends per candidate: a detail read, a
-base comparison, a head-commit read, and two paginated check reads — five or six
-calls, plus up to four seconds of sleep when GitHub has not computed
-mergeability yet. **The label gate is applied to the list read**, before any of
+A pass reads the open list once, then spends per candidate: the paginated check
+reads first, then a detail read, a base comparison and a head-commit read — five
+or six calls, plus up to four seconds of sleep when GitHub has not computed
+mergeability yet. A head whose checks already settle the question stops after
+the check reads ("A settled-red head is read once", below). **The label gate is applied to the list read**, before any of
 that, so a pull request that is not a candidate costs nothing at all. That
 ordering is the whole of issue #444 and it is asserted by the self-test; if it
 regresses, the cost of a pass goes back to tracking the number of open pull
@@ -787,6 +788,52 @@ the green", below), close what is stale, or raise
 self-test refuses a budget that does not leave the lane two minutes to publish
 its summary inside the ceiling — a run that merges and then reports nothing
 about it is worse than one that merges nothing.
+
+### A settled-red head is read once
+
+**Measured 2026-10-08**, on a repository with 53 open pull requests of which 43
+had a failed required check and nothing still running. A pass logged
+`merge:ready` for the one green pull request sixteen seconds in and merged it
+two and a half minutes later, because every other pull request was read in full
+first: five calls and about three seconds each to be told `skip:red`. The pass
+after the merge — the one that re-reads the world — then walked the same list
+again at six seconds apiece (the merge had reset every mergeability
+computation, so each read slept and asked again) and ended, five minutes later,
+on `nothing actionable`. The job held the lane's `concurrency` group throughout,
+so the next pull request to go green waited for all of it.
+
+A head is **settled red** when every required check has finished on it and at
+least one failed: `failed > 0`, `pending = 0`, `missing = 0`. For such a head
+the rule can only answer `skip:red`, `skip:conflict` or
+`wait:mergeability-unknown` — none of which the lane acts on — whatever its
+mergeability, its age and its distance from the base turn out to be.
+`lane_settled_red` is that test, and the decision self-test enumerates the
+claim. So:
+
+- **The check reads come first, and a settled-red head stops there.** It pays no
+  detail read, no mergeability sleeps, no head-commit read and no base
+  comparison. Its line reads `skip:red … — every required check has finished and
+  one failed, so mergeability, age and the base comparison were not read`. A
+  pull request that used to read `skip:conflict` because that came first now
+  reads `skip:red`; the queue shows `unread` (or `n/a`) under *behind*.
+- **A later pass of the same run does not read it again.** While the list still
+  shows the same head sha, the line reads `… api-calls=0 — not re-read: settled
+  on this head in pass N of this run`. A push changes the sha; a draft flip or
+  a label change is decided from the list before this is consulted. The only
+  other thing that can change the answer is a new check run on that head, and
+  its completion starts a lane run of its own. Nothing is remembered between
+  runs.
+
+**Which pull request wins is unchanged**: a settled-red head was never in the
+ranking. A failed head with a check still pending or missing is *not* settled —
+past the in-flight budget it becomes a `drop`, which ranks first — and is read
+in full as before.
+
+What this does not do is merge the green pull request before the walk ends. The
+ranking puts the **oldest** head first at equal priority, so the newest green
+pull request wins only once every older one has been shown not to be ready, and
+that takes its check reads. The walk is cheaper per pull request; it is still a
+walk.
 
 ### The App quota is shared
 
