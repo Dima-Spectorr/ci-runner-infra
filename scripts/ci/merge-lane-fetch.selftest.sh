@@ -103,9 +103,26 @@ if [ ! -e "$file" ]; then
   printf 'gh: Not Found (HTTP 404)\n' >&2
   exit 1
 fi
-if [ -n "$prog" ]; then jq -rc "$prog" "$file"; else cat "$file"; fi
+# `tr`: a jq built for Windows ends its lines with a carriage return, and this
+# file is run on a developer's machine as well as on a runner.
+if [ -n "$prog" ]; then jq -rc "$prog" "$file" | tr -d '\r'; else cat "$file"; fi
 STUB
 chmod +x "$WORK/bin/gh"
+
+# A clock that does not move, for the end-to-end runs only. The lane prints
+# ages and durations, and two runs a minute apart would differ in those and in
+# nothing else. A call that names its own instant (`-d`) is the real `date`.
+mkdir "$WORK/clock"
+REAL_DATE="$(command -v date)"
+export REAL_DATE
+cat >"$WORK/clock/date" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in -d | -d?* | --date | --date=*) exec "$REAL_DATE" "$@" ;; esac
+done
+exec "$REAL_DATE" -d '@1767400000' "$@"
+STUB
+chmod +x "$WORK/clock/date"
 export GH_STUB_LOG="$WORK/gh.log" GH_STUB_STATE="$WORK/state" GH_STUB_FIXTURES="$WORK/fix"
 mkdir "$GH_STUB_STATE"
 : >"$GH_STUB_LOG"
@@ -306,7 +323,7 @@ cases_spawn() { # <fetch-file>
     # Each job walks every head and reads the ones it claims. A read marks
     # itself in flight, notes how many are, and — for the first head only —
     # stays in flight until a LATER head has finished, so the first head is
-    # the last to complete however the scheduler behaves.
+    # never the first to complete, however the scheduler behaves.
     job() {
       local i n
       : >"$d/started.$1"
@@ -344,7 +361,8 @@ cases_spawn() { # <fetch-file>
     say more-than-one-in-flight $?
     [ "$(cat "$d"/claims.* | sort -n | tr '\n' ' ')" = '0 1 2 3 4 5 6 ' ]
     say every-head-claimed-once $?
-    [ "$(tail -1 "$d/order")" = 0 ] && [ "$(lane_fetch_state "$d/rec/0")" = ready ]
+    [ "$(head -1 "$d/order")" != 0 ] && [ "$(grep -cx 0 "$d/order")" -eq 1 ] \
+      && [ "$(lane_fetch_state "$d/rec/0")" = ready ]
     say out-of-order-completion $?
     [ "$spawn_rc" -eq 0 ] && [ "$(lane_fetch_state "$d/rec/5")" = missing ] \
       && [ "$(lane_fetch_count "$d/rec/5/seq")" -eq 1 ]
@@ -369,9 +387,16 @@ cases_kill() { # <fetch-file>
     LANE_FETCH_PIDS=("$!")
     one="$!"
     lane_fetch_kill
-    wait "$one" 2>/dev/null
+    n=0
+    while kill -0 "$one" 2>/dev/null && [ "$n" -lt 30 ]; do
+      n=$((n + 1))
+      command sleep 0.1
+    done
     ! kill -0 "$one" 2>/dev/null && [ "${#LANE_FETCH_PIDS[@]}" -eq 0 ]
-    say exit-kills-the-jobs $?
+    rc=$?
+    kill -9 "$one" 2>/dev/null
+    wait "$one" 2>/dev/null
+    say exit-kills-the-jobs "$rc"
 
     if ! command -v pgrep >/dev/null 2>&1; then
       # Said, not passed: without `pgrep` a job's children cannot be listed,
@@ -405,7 +430,7 @@ cases_kill() { # <fetch-file>
 # End to end: the driver itself, serial and concurrent, over one mixed queue.
 # ---------------------------------------------------------------------------
 REPO='example/repo'
-sha_of() { printf '%040d' "$1"; }
+sha_of() { printf '%08d%032d' "$1" 0; }
 fx() { # <url-without-query> <json> [n-th-read]
   local key
   key="$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"
@@ -427,6 +452,7 @@ build_fixtures() {
   local q='[{"name":"queue"}]' list='' n draft labels
   fx "repos/$REPO/commits/main" '{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","commit":{"committer":{"date":"2026-01-01T00:00:00Z"}}}'
   fx "repos/$REPO/rules/branches/main" '[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true}}]'
+  fx_checks bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb completed '"success"'
   for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
     draft=false labels="$q"
     case "$n" in
@@ -468,7 +494,7 @@ lane_run() { # <scripts-dir> <fetch-concurrency> <tag>
   mkdir "$out" "$out/tmp" "$out/state"
   : >"$out/calls"
   : >"$out/summary"
-  GH_STUB_LOG="$out/calls" GH_STUB_STATE="$out/state" TMPDIR="$out/tmp" \
+  PATH="$WORK/clock:$PATH" GH_STUB_LOG="$out/calls" GH_STUB_STATE="$out/state" TMPDIR="$out/tmp" \
     GH_TOKEN=stand-in GITHUB_REPOSITORY="$REPO" LANE_BASE=main REQUIRED_CHECKS=build \
     REQUIRE_LABEL=queue DRY_RUN=true STATUS_ISSUE='' GITHUB_STEP_SUMMARY="$out/summary" \
     FETCH_CONCURRENCY="$2" bash "$1/merge-lane.sh" >"$out/log" 2>&1
@@ -509,10 +535,10 @@ cases_e2e() {
   kinds=0
   for want in '#1 skip:draft' '#2 skip:no-label' '#3 skip:red' '#4 merge:' '#5 update:' '#6 skip:conflict' \
     '#8 wait:detail-unreadable' '#9 wait:base-comparison-unreadable' '#10 merge:' '#13 head moved' '#13 merge:' \
-    'DRY RUN'; do
+    '#7 drop:' 'dry-run — would take'; do
     if [ "$(grep -cF -- "$want" "$s/log")" -gt 0 ]; then kinds=$((kinds + 1)); else echo "  (serial run has no line with '$want')" >&2; fi
   done
-  [ "$kinds" -eq 12 ]
+  [ "$kinds" -eq 13 ]
   say e2e-queue-is-mixed $?
 }
 
@@ -555,6 +581,9 @@ mutant() {
   fi
 }
 
+# `e2e` as the only argument runs the end-to-end half alone, for iterating on
+# the driver; CI runs the file with no argument, which is everything.
+if [ "${1:-}" != e2e ]; then
 tally_lines "$(cases_core "$FETCH" 2>&1)" 22 core
 tally_lines "$(cases_spawn "$FETCH" 2>&1)" 7 spawn
 tally_lines "$(cases_kill "$FETCH" 2>&1)" 2 kill
@@ -625,6 +654,7 @@ mutant "the EXIT path signals nothing" cases_kill "$FETCH" \
   's|^    if \[ -n "\$pid" \]; then lane_kill_tree "\$pid"; fi$|    :|' exit-kills-the-jobs
 mutant "only the job is signalled, and its children are left running" cases_kill "$FETCH" \
   's|^  for kid in \$kids; do lane_kill_tree "\$kid"; done$|  :|' kill-reaches-the-children
+fi
 
 # --- end to end -------------------------------------------------------------
 build_fixtures
@@ -638,6 +668,8 @@ if [ "$FAIL" -gt 0 ]; then
   echo '--- concurrent run, differing lines ---'
   diff "$WORK/run.serial/log.decided" "$WORK/run.concurrent/log.decided" | head -40
   diff "$WORK/run.serial/calls.sorted" "$WORK/run.concurrent/calls.sorted" | head -20
+  diff "$WORK/run.serial/summary" "$WORK/run.concurrent/summary" | head -20
+  echo "--- left behind: $(ls -A "$WORK/run.serial/tmp" "$WORK/run.concurrent/tmp" | tr '\n' ' ')"
 fi
 
 # <description> <script> <sed-program> <id>: the concurrent run of a broken copy
