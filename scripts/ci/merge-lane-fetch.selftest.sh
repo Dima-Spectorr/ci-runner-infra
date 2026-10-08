@@ -3,9 +3,13 @@
 #
 # `merge-lane.selftest.sh` pins the WIRING of the fetch phase on the text of the
 # driver. This file runs the thing: the record/replay pair, the claim, the jobs
-# and the tally out of `merge-lane-fetch.sh`, and then the whole driver, twice,
-# against a stand-in for the API — once reading serially and once reading
-# concurrently — to show the two print the same lines in the same order.
+# and the tally out of `merge-lane-fetch.sh`, and then the whole driver against
+# a stand-in for the API: once reading serially and once reading concurrently,
+# to show the two print the same lines in the same order; a concurrent pass
+# whose clock passes the pass budget part-way, against a serial pass on the
+# later clock; and three passes over an empty queue for the line that says how
+# long the run waited — outside a workflow run, inside one whose times can be
+# read, and inside one whose times cannot.
 #
 # No network, no token, and nothing is written outside one temporary directory.
 # The stand-in is a `gh` placed first on PATH, because the code under test calls
@@ -87,6 +91,9 @@ case "$url" in
   rate_limit) echo '5000 4990 10 1900000000'; exit 0 ;;
 esac
 printf '%s\n' "$url" >>"$GH_STUB_LOG"
+# The one read that moves the clock, for the pass that runs out of time: see
+# the clock below.
+if [ -n "${GH_STUB_TRIP_ON:-}" ] && [ "${url%%\?*}" = "$GH_STUB_TRIP_ON" ]; then : >"$CLOCK_TRIPPED"; fi
 case "$url" in
   ok/*) printf 'out:%s\n' "$url"; exit 0 ;;
   fail/*)
@@ -114,6 +121,12 @@ chmod +x "$WORK/bin/gh"
 # A clock that does not move, for the end-to-end runs only. The lane prints
 # ages and durations, and two runs a minute apart would differ in those and in
 # nothing else. A call that names its own instant (`-d`) is the real `date`.
+#
+# It moves ONCE, and only when a case asks: from the moment the file named by
+# `CLOCK_TRIPPED` exists, every reading is a thousand seconds later — past the
+# default pass budget in one step. The stand-in for `gh` creates that file on
+# the read a case names, so a pass runs out of time at a known read rather than
+# after a sleep somebody tuned to one machine.
 mkdir "$WORK/clock"
 REAL_DATE="$(command -v date)"
 export REAL_DATE
@@ -122,7 +135,9 @@ cat >"$WORK/clock/date" <<'STUB'
 for a in "$@"; do
   case "$a" in -d | -d?* | --date | --date=*) exec "$REAL_DATE" "$@" ;; esac
 done
-exec "$REAL_DATE" -d '@1767400000' "$@"
+at=1767400000
+if [ -n "${CLOCK_TRIPPED:-}" ] && [ -e "$CLOCK_TRIPPED" ]; then at=$((at + 1000)); fi
+exec "$REAL_DATE" -d "@$at" "$@"
 STUB
 chmod +x "$WORK/clock/date"
 export GH_STUB_LOG="$WORK/gh.log" GH_STUB_STATE="$WORK/state" GH_STUB_FIXTURES="$WORK/fix"
@@ -213,6 +228,7 @@ cases_core() { # <fetch-file>
     lane_gh_record api ok/a --jq '.x, .y' >/dev/null 2>&1
     lane_fetch_seal
     LANE_REPLAY="$d/2"
+    # shellcheck disable=SC2251 # the status IS read, by `say` on the next line
     ! lane_gh_can_replay api ok/a --jq '.x,' '.y'
     say arguments-compared-whole $?
 
@@ -433,6 +449,63 @@ cases_kill() { # <fetch-file>
   )
 }
 
+# What a job takes from the shell that started it (#1510). The lane runs under
+# `errexit` and holds an EXIT trap that deletes its temporary directory; a job
+# must have neither.
+cases_shell() { # <fetch-file>
+  (
+    # shellcheck source=/dev/null
+    source "$1"
+    d="$(mktemp -d "$WORK/shell.XXXXXX")"
+    # Read by the sourced file's functions, which shellcheck does not follow.
+    # shellcheck disable=SC2034
+    LANE_RECORD='' LANE_REPLAY=''
+    # THIS FILE'S OWN EXIT TRAP DELETES ITS WORKING DIRECTORY, and `trap -p` in
+    # a subshell still prints it. Under the second mutation below a job re-arms
+    # whatever `trap -p` prints, so without a trap of this group's own every
+    # job of the first case would delete the directory every later group runs
+    # in — which is the damage the line under test exists to prevent, and it
+    # was observed here before this line was written.
+    trap : EXIT
+
+    # A command that fails in the middle of a job, in a shell where `errexit`
+    # is ON and is not being ignored: the subshell below is a plain command,
+    # not the condition of anything. The job must reach the line after it.
+    #
+    # Called by name, from `lane_fetch_spawn`, so it is not unreachable.
+    # shellcheck disable=SC2317
+    failing_job() {
+      false
+      : >"$d/after-failure.$1"
+    }
+    (
+      set -e
+      lane_fetch_spawn 2 failing_job
+    )
+    [ -e "$d/after-failure.0" ] && [ -e "$d/after-failure.1" ]
+    say a-failed-command-does-not-end-a-job $?
+
+    # The parent's EXIT trap runs once, when the PARENT exits — not once per
+    # job as each one ends. Counted after the jobs have finished and again
+    # after the parent has.
+    #
+    # WHAT THE MUTATION IS. bash already resets traps in a subshell, so deleting
+    # the job's `trap - EXIT` changes nothing and would prove nothing. The
+    # mutation re-arms the parent's trap inside the job instead, which is what
+    # that line is there to make impossible.
+    # shellcheck disable=SC2317
+    quiet_job() { : >"$d/quiet.$1"; }
+    (
+      trap 'printf . >>"$d/trap-ran"' EXIT
+      lane_fetch_spawn 2 quiet_job
+      lane_fetch_count "$d/trap-ran" >"$d/trap-ran-while-running"
+    )
+    [ -e "$d/quiet.0" ] && [ -e "$d/quiet.1" ] && [ "$(<"$d/trap-ran-while-running")" = 0 ] \
+      && [ "$(lane_fetch_count "$d/trap-ran")" -eq 1 ]
+    say a-job-does-not-run-the-exit-trap $?
+  )
+}
+
 # ---------------------------------------------------------------------------
 # End to end: the driver itself, serial and concurrent, over one mixed queue.
 # ---------------------------------------------------------------------------
@@ -441,7 +514,7 @@ sha_of() { printf '%08d%032d' "$1" 0; }
 fx() { # <url-without-query> <json> [n-th-read]
   local key
   key="$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"
-  printf '%s\n' "$2" >"$WORK/fix/$key${3:+.$3}"
+  printf '%s\n' "$2" >"${FX_DIR:-$WORK/fix}/$key${3:+.$3}"
 }
 fx_checks() { # <sha> <status> <conclusion-json>
   fx "repos/$REPO/commits/$1/check-runs" \
@@ -501,7 +574,11 @@ lane_run() { # <scripts-dir> <fetch-concurrency> <tag>
   mkdir "$out" "$out/tmp" "$out/state"
   : >"$out/calls"
   : >"$out/summary"
+  # The four names Actions sets are pinned, to nothing unless a case sets them:
+  # this file runs inside a workflow run too, and the lane would otherwise ask
+  # the stand-in about the run that is running the test.
   PATH="$WORK/clock:$PATH" GH_STUB_LOG="$out/calls" GH_STUB_STATE="$out/state" TMPDIR="$out/tmp" \
+    GITHUB_RUN_ID="${LANE_TEST_RUN_ID:-}" GITHUB_RUN_ATTEMPT=1 RUNNER_NAME=runner-b GITHUB_EVENT_NAME=workflow_run \
     GH_TOKEN=stand-in GITHUB_REPOSITORY="$REPO" LANE_BASE=main REQUIRED_CHECKS=build \
     REQUIRE_LABEL=queue DRY_RUN=true STATUS_ISSUE='' GITHUB_STEP_SUMMARY="$out/summary" \
     FETCH_CONCURRENCY="$2" bash "$1/merge-lane.sh" >"$out/log" 2>&1
@@ -550,6 +627,108 @@ cases_e2e() {
 }
 
 # ---------------------------------------------------------------------------
+# A CONCURRENT PASS THAT RUNS OUT OF TIME (#1510).
+#
+# Two jobs, and the clock passes the budget on the FIRST read of the sixth
+# head. What that leaves is the case the guide describes and nothing ran: heads
+# in hand when the budget went, a head each job claimed afterwards and never
+# read, and the rest untouched.
+#
+# HOW MANY HEADS WERE READ IS TAKEN FROM THE RUN, NOT WRITTEN HERE. It is six
+# when the other job is still inside an earlier head as the clock moves, and
+# seven if it claimed the next one a moment before. Either is the lane behaving
+# correctly, so every assertion below is stated for "the N the fetch phase
+# says it read" — and the first one bounds N, so none of them can pass on a
+# pass that was not cut, or on one that read nothing.
+# ---------------------------------------------------------------------------
+cut_run() { # <scripts-dir> <tag>
+  rm -f "$WORK/clock-cut"
+  GH_STUB_TRIP_ON="repos/$REPO/commits/$(sha_of 6)/check-runs" CLOCK_TRIPPED="$WORK/clock-cut" lane_run "$1" 2 "$2"
+}
+
+# <reference-run-tag> <cut-run-tag>
+cases_cut() {
+  local r="$WORK/run.$1" c="$WORK/run.$2" n i late=0 same=1 rows=0 strays=0 took
+  n="$(sed -n 's/^lane: fetch phase read \([0-9]*\) of 14 open pull request(s) in .*/\1/p' "$c/log")"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+
+  # A job asks the deadline question before each head, so the phase ends with
+  # the heads that were in flight and reads nothing after them.
+  for ((i = n + 1; i <= 14; i++)); do
+    late=$((late + $(grep -cF -- "$(sha_of "$i")" "$c/calls") + $(grep -c -e "/pulls/$i\$" -e "/pulls/$i?" "$c/calls")))
+  done
+  [ "$n" -ge 6 ] && [ "$n" -lt 14 ] && [ "$late" -eq 0 ]
+  say cut-fetch-stops-at-the-deadline $?
+
+  # Every head already read is judged, whatever the clock says, and judged as
+  # the serial walk judges it; the warning counts exactly those.
+  for ((i = 1; i <= n; i++)); do
+    grep "^lane: #$i " "$r/log" >"$WORK/cut.want"
+    grep "^lane: #$i " "$c/log" >"$WORK/cut.got"
+    if [ ! -s "$WORK/cut.want" ] || ! cmp -s "$WORK/cut.want" "$WORK/cut.got"; then same=0; fi
+  done
+  [ "$n" -gt 0 ] && [ "$same" -eq 1 ] \
+    && [ "$(grep -c "^::warning::lane: pass truncated after 600s — read $n of 14 open pull request(s) on main\. " "$c/log")" -eq 1 ]
+  say cut-read-heads-keep-their-verdicts $?
+
+  # Every head nobody read is a row saying so — the ones a job claimed and
+  # stopped on included — and none of them is given a verdict line.
+  for ((i = n + 1; i <= 14; i++)); do
+    rows=$((rows + $(grep -cF -- "| [#$i](https://github.com/$REPO/pull/$i) change $i | \`wait\` | not-read-this-pass |" "$c/summary")))
+    strays=$((strays + $(grep -c "^lane: #$i " "$c/log")))
+  done
+  [ "$n" -lt 14 ] && [ "$rows" -eq $((14 - n)) ] && [ "$(grep -c 'not-read-this-pass' "$c/summary")" -eq "$rows" ] && [ "$strays" -eq 0 ]
+  say cut-unread-heads-are-rows $?
+
+  # A deadline alone is NOT a disagreement between the two walks: every
+  # recording that was closed is used whole, and the head a job stopped on has
+  # no recording to disagree with. The warning is for a killed job or a replay
+  # that stopped matching, and a cut pass that printed it would train an
+  # operator to ignore it.
+  [ "$(grep -c '^::warning::lane: pass truncated ' "$c/log")" -eq 1 ] \
+    && [ "$(grep -c 'the fetch phase and the walk disagreed' "$c/log")" -eq 0 ] \
+    && [ "$(grep -c ' was not read by the fetch phase ' "$c/log")" -eq 0 ]
+  say cut-is-not-a-disagreement $?
+
+  # And the pass still acts on the best head it did read.
+  took="$(sed -n 's/^::notice::dry-run — would take .* on #\([0-9]*\)$/\1/p' "$c/log")"
+  [[ "$took" =~ ^[0-9]+$ ]] && [ "$took" -ge 1 ] && [ "$took" -le "$n" ]
+  say cut-still-acts-on-what-it-read $?
+}
+
+# ---------------------------------------------------------------------------
+# HOW LONG THE RUN WAITED FOR ITS RUNNER AND THE LOCK (#1510).
+#
+# Three runs over an empty queue: outside a workflow run, inside one whose
+# times can be read, and inside one whose times cannot.
+# ---------------------------------------------------------------------------
+wait_runs() { # <scripts-dir> <tag-suffix>
+  GH_STUB_FIXTURES="$WORK/fix-quiet" lane_run "$1" 8 "quiet$2"
+  GH_STUB_FIXTURES="$WORK/fix-quiet" LANE_TEST_RUN_ID=77 lane_run "$1" 8 "waited$2"
+  GH_STUB_FIXTURES="$WORK/fix-quiet" LANE_TEST_RUN_ID=78 lane_run "$1" 8 "unreadable$2"
+}
+
+# <outside-a-run-tag> <readable-tag> <unreadable-tag>
+cases_wait() {
+  local q="$WORK/run.$1" w="$WORK/run.$2" u="$WORK/run.$3"
+  local counts='s/[0-9]* API call(s) spent/N API call(s) spent/; s/so far: [0-9]*)/so far: N)/'
+  # One line, both figures, and the job is the one on THIS runner.
+  [ "$(grep -c '^lane: this run waited ' "$w/log")" -eq 1 ] \
+    && [ "$(grep -cF -- "lane: this run waited 30s for the 'merge-lane-main' lock and a runner — triggered 2026-01-03T00:26:00Z (workflow_run), on a runner 2026-01-03T00:26:30Z — and then spent 10s on job setup before this line." "$w/log")" -eq 1 ]
+  say wait-is-one-line-with-both-figures $?
+  [ -s "$q/log" ] && [ "$(grep -c -e '^lane: this run waited ' -e '^lane: could not read how long ' "$q/log")" -eq 0 ] \
+    && [ "$(grep -c 'actions/runs' "$q/calls")" -eq 0 ]
+  say wait-is-not-asked-outside-a-run $?
+  # A wait that cannot be read is one line. The run ends as it would have, and
+  # every other line is the same but for the two reads it counted.
+  grep -v '^lane: could not read how long ' "$u/log" | sed "$counts" >"$WORK/wait.got"
+  sed "$counts" "$q/log" >"$WORK/wait.want"
+  [ "$(grep -c "^lane: could not read how long this run waited for its runner and the 'merge-lane-main' lock " "$u/log")" -eq 1 ] \
+    && [ "$(cat "$u/rc")" = 0 ] && [ "$(cat "$q/rc")" = 0 ] && [ -s "$WORK/wait.want" ] && cmp -s "$WORK/wait.want" "$WORK/wait.got"
+  say wait-unreadable-changes-nothing $?
+}
+
+# ---------------------------------------------------------------------------
 # Running them.
 # ---------------------------------------------------------------------------
 tally_lines() { # <output> <how-many-expected> <group>
@@ -594,6 +773,7 @@ if [ "${1:-}" != e2e ]; then
 tally_lines "$(cases_core "$FETCH" 2>&1)" 22 core
 tally_lines "$(cases_spawn "$FETCH" 2>&1)" 7 spawn
 tally_lines "$(cases_kill "$FETCH" 2>&1)" 2 kill
+tally_lines "$(cases_shell "$FETCH" 2>&1)" 2 shell
 
 mutant "a replayed read loses its output" cases_core "$FETCH" \
   's|^  cat "\$LANE_REPLAY/\$m\.out"$|  :|' replay-stdout
@@ -661,6 +841,11 @@ mutant "the EXIT path signals nothing" cases_kill "$FETCH" \
   's|^    if \[ -n "\$pid" \]; then lane_kill_tree "\$pid"; fi$|    :|' exit-kills-the-jobs
 mutant "only the job is signalled, and its children are left running" cases_kill "$FETCH" \
   's|^  for kid in \$kids; do lane_kill_tree "\$kid"; done$|  :|' kill-reaches-the-children
+
+mutant "a job inherits errexit, so its first failed command ends it" cases_shell "$FETCH" \
+  '/^lane_fetch_spawn() {$/,/^}$/s|^      set +e$|      :|' a-failed-command-does-not-end-a-job
+mutant "a job arms the parent's EXIT trap for itself" cases_shell "$FETCH" \
+  '/^lane_fetch_spawn() {$/,/^}$/s|^      trap - EXIT$|      eval "$(trap -p EXIT)"|' a-job-does-not-run-the-exit-trap
 fi
 
 # --- end to end -------------------------------------------------------------
@@ -673,9 +858,11 @@ if [ "$FAIL" -gt 0 ]; then
   echo '--- serial run ---'
   cat "$WORK/run.serial/log"
   echo '--- concurrent run, differing lines ---'
-  diff "$WORK/run.serial/log.decided" "$WORK/run.concurrent/log.decided" | head -40
-  diff "$WORK/run.serial/calls.sorted" "$WORK/run.concurrent/calls.sorted" | head -20
-  diff "$WORK/run.serial/summary" "$WORK/run.concurrent/summary" | head -20
+  # `sed -n`, not `head`: it reads its input to the end, so `diff` is never
+  # cut off by a closed pipe (the pipefail reader gate, PFR2).
+  diff "$WORK/run.serial/log.decided" "$WORK/run.concurrent/log.decided" | sed -n '1,40p'
+  diff "$WORK/run.serial/calls.sorted" "$WORK/run.concurrent/calls.sorted" | sed -n '1,20p'
+  diff "$WORK/run.serial/summary" "$WORK/run.concurrent/summary" | sed -n '1,20p'
   echo "--- left behind: $(find "$WORK/run.serial/tmp" "$WORK/run.concurrent/tmp" -mindepth 1 | tr '\n' ' ')"
 fi
 
@@ -710,6 +897,97 @@ e2e_mutant "the run leaves its temporary directory behind" merge-lane.sh \
   "s|^trap 'lane_fetch_kill; rm -rf \"\\\$LANE_TMP\"' EXIT\$|trap 'lane_fetch_kill' EXIT|" e2e-nothing-left-behind
 e2e_mutant "a dry run acts" merge-lane.sh \
   's|^  if \[ "\$DRY_RUN" = "true" \]; then$|  if false; then|' e2e-no-write-in-a-dry-run
+
+# --- a concurrent pass that runs out of time ---------------------------------
+# The reference is a serial pass whose clock ALREADY reads the later time, with
+# the whole budget ahead of it: the deciding walk of the cut pass runs entirely
+# after the clock moved, so that is the serial walk its lines must equal.
+: >"$WORK/clock-late"
+CLOCK_TRIPPED="$WORK/clock-late" lane_run "$real" 1 late
+cut_run "$real" cut
+tally_lines "$(cases_cut late cut 2>&1)" 5 "cut pass"
+if [ "$FAIL" -gt 0 ]; then
+  echo '--- cut run ---'
+  cat "$WORK/run.cut/log" "$WORK/run.cut/summary"
+  echo '--- reads that reached the stand-in ---'
+  cat "$WORK/run.cut/calls.sorted"
+fi
+
+# <description> <script> <sed-program> <id>: the cut run of a broken copy.
+cut_mutant() {
+  local desc="$1" name="$2" prog="$3" id="$4" dir out
+  dir="$(scripts_copy mutant)"
+  if ! sed "$prog" "$HERE/$name" >"$dir/$name" 2>/dev/null; then
+    bad "the mutation program is not valid sed, so it asserts nothing: $desc"
+    return
+  fi
+  if cmp -s "$dir/$name" "$HERE/$name"; then
+    bad "mutation changed nothing, so it asserts nothing: $desc"
+    return
+  fi
+  cut_run "$dir" mutant
+  out="$(cases_cut late mutant 2>/dev/null)"
+  if [ "$(printf '%s\n' "$out" | grep -cxF -- "FAIL $id")" -eq 1 ]; then ok; else bad "mutation not detected by '$id': $desc"; fi
+}
+cut_mutant "a fetch job goes on reading past the deadline" merge-lane.sh \
+  's|^    if \[ -z "\$LANE_REPLAY" \] && lane_pass_expired |    if [ "$LANE_WALK_ROLE" != fetch ] \&\& [ -z "$LANE_REPLAY" ] \&\& lane_pass_expired |' cut-fetch-stops-at-the-deadline
+cut_mutant "a head already read is thrown away once the budget is spent" merge-lane.sh \
+  's|^    if \[ -z "\$LANE_REPLAY" \] && lane_pass_expired |    if lane_pass_expired |' cut-read-heads-keep-their-verdicts
+cut_mutant "the first unread head gets no row" merge-lane.sh \
+  's|^    for ((j = truncated_at; j < total; j++)); do$|    for ((j = truncated_at + 1; j < total; j++)); do|' cut-unread-heads-are-rows
+cut_mutant "the head a job stopped on is closed as if it had been read" merge-lane.sh \
+  's|^  if \[ "\$truncated_at" -lt 0 \]; then lane_fetch_seal; fi$|  lane_fetch_seal|' cut-is-not-a-disagreement
+cut_mutant "a pass that ran out of time acts on nothing" merge-lane.sh \
+  '/^  if \[ "\$truncated_at" -ge 0 \]; then$/a\    candidates=()' cut-still-acts-on-what-it-read
+
+# --- how long the run waited --------------------------------------------------
+# An empty queue: the line is printed before the list is read, so these runs
+# need no pull request and cost four reads each.
+mkdir "$WORK/fix-quiet"
+FX_DIR="$WORK/fix-quiet"
+fx "repos/$REPO/commits/main" '{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","commit":{"committer":{"date":"2026-01-01T00:00:00Z"}}}'
+fx "repos/$REPO/rules/branches/main" '[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true}}]'
+fx_checks bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb completed '"success"'
+fx "repos/$REPO/pulls" '[]'
+# Run 77: triggered at 00:26:00, taken by `runner-b` at 00:26:30, and the clock
+# reads 00:26:40. Two decoys: a job in progress on ANOTHER runner, and a job
+# this runner has already finished.
+fx "repos/$REPO/actions/runs/77/attempts/1" '{"run_started_at":"2026-01-03T00:26:00Z","created_at":"2026-01-03T00:20:00Z"}'
+fx "repos/$REPO/actions/runs/77/attempts/1/jobs" '{"jobs":[{"status":"in_progress","runner_name":"runner-a","started_at":"2026-01-03T00:26:05Z"},{"status":"completed","runner_name":"runner-b","started_at":"2026-01-03T00:26:01Z"},{"status":"in_progress","runner_name":"runner-b","started_at":"2026-01-03T00:26:30Z"},{"status":"queued","runner_name":null,"started_at":null}]}'
+unset FX_DIR
+wait_runs "$real" ''
+tally_lines "$(cases_wait quiet waited unreadable 2>&1)" 3 "wait line"
+if [ "$FAIL" -gt 0 ]; then
+  echo '--- run with a readable wait ---'
+  cat "$WORK/run.waited/log"
+  echo '--- run with an unreadable one ---'
+  cat "$WORK/run.unreadable/log"
+fi
+
+# <description> <sed-program> <id>
+wait_mutant() {
+  local desc="$1" prog="$2" id="$3" dir out
+  dir="$(scripts_copy mutant)"
+  if ! sed "$prog" "$DRIVER" >"$dir/merge-lane.sh" 2>/dev/null; then
+    bad "the mutation program is not valid sed, so it asserts nothing: $desc"
+    return
+  fi
+  if cmp -s "$dir/merge-lane.sh" "$DRIVER"; then
+    bad "mutation changed nothing, so it asserts nothing: $desc"
+    return
+  fi
+  wait_runs "$dir" .m
+  out="$(cases_wait quiet.m waited.m unreadable.m 2>/dev/null)"
+  if [ "$(printf '%s\n' "$out" | grep -cxF -- "FAIL $id")" -eq 1 ]; then ok; else bad "mutation not detected by '$id': $desc"; fi
+}
+wait_mutant "the first job in progress is taken, whichever runner has it" \
+  's|^    if \[ -n "\$at" \] && \[ "\$name" = "\${RUNNER_NAME:-}" \]; then$|    if [ -n "$at" ]; then|' wait-is-one-line-with-both-figures
+wait_mutant "the wait is measured from the run's first attempt, not this one" \
+  "s|--jq '\.run_started_at // empty'|--jq '.created_at // empty'|" wait-is-one-line-with-both-figures
+wait_mutant "the run is asked about where there is no run" \
+  's|^  \[ -n "\${GITHUB_RUN_ID:-}" \] \|\| return 0$|  :|' wait-is-not-asked-outside-a-run
+wait_mutant "a wait that cannot be read ends the run" \
+  's|^    echo "lane: could not read how long |    exit 1; echo "lane: could not read how long |' wait-unreadable-changes-nothing
 
 echo
 if [ "$FAIL" -gt 0 ]; then

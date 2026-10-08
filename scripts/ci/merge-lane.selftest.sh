@@ -344,7 +344,7 @@ guards_the_lane_job() { # <text>
   [ "$ifs" = "    $LANE_SWITCH && $FORK_SKIP" ]
 }
 
-# Apigee-Portal's `workflow-expression-injection.test.ts` flags a workflow whose
+# One consumer's `workflow-expression-injection.test.ts` flags a workflow whose
 # text matches `/(?:^|[\s{])(?:run|script)[ \t]*:/m` but yields no run body —
 # so a COMMENT reading "Per run: ..." fails a consumer's pull request that
 # copies the template (#1382). The same regex, in ERE, over every comment of a
@@ -451,7 +451,7 @@ documented_callers_keep_a_per_run_top_level_group() {
 }
 
 # The events file's top-level key is the per-pull-request one, exactly: the
-# stricter vendored `check-workflow-concurrency.sh` (IntegrateIT's) rejects a
+# stricter vendored `check-workflow-concurrency.sh` (one consumer's) rejects a
 # `run_id`-only group on a workflow `pull_request_target` reaches, so the next
 # repository that vendors it passes the template as-is.
 documented_events_caller_keys_per_pull_request() {
@@ -650,7 +650,7 @@ only_downgrades_a_success_from_a_run() {
   local code
   code=$(code_of "$1")
   matches "$code" 'if \[ "\$state" = "success" \] && \[ "\$winner_origin" = "run" \]' || return 1
-  # And the two outcomes that fix Telnet-Emulation PR #1354 (not yet posted,
+  # And the two outcomes that fix a consumer's PR #1354 (not yet posted,
   # wait) and PR #1582 (posted as a failure, over a stale success, do not
   # attempt) both exist.
   matches "$code" 'state="pending"' || return 1
@@ -951,7 +951,7 @@ before() { # <text> <ere-first> <ere-second>
 # and up to four seconds of sleeps on each candidate. When those were spent on
 # every open pull request — including the ones about to be skipped for want of
 # the label — the cost tracked the SIZE OF THE REPOSITORY rather than the depth
-# of the queue, and on IntegrateIT (~35 open) every pass ran past the job's
+# of the queue, and on one consumer (~35 open) every pass ran past the job's
 # fifteen-minute ceiling and was killed. Thirty consecutive runs merged nothing.
 #
 # The reason that went unnoticed for a day is the fact worth remembering: a
@@ -1272,7 +1272,7 @@ names_the_workflows_permission_refusal() {
   matches "$code" '^      return 2$'
 }
 
-# Measured on Telnet-Emulation run 35428114193: the merge API refused a
+# Measured on a consumer's run 35428114193: the merge API refused a
 # `merge:ready` candidate with a 405, "Required status check \"CI summary
 # (rollup)\" is expected." — a disagreement between the lane's own read and
 # GitHub's ruleset about that ONE pull request's head, not a fact about the
@@ -1293,7 +1293,7 @@ names_the_required_status_check_refusal() {
   matches "$code" 'refused_marker "\$sha"'
 }
 
-# Measured on IntegrateIT 2026-09-30: a green dispatched re-run over a failed
+# Measured on a consumer 2026-09-30: a green dispatched re-run over a failed
 # pull-request run made the lane read `ci` green while the ruleset read it
 # failing; the 405 "Required status check \"ci\" is failing." fell to the
 # default arm and ended every pass behind one candidate for ~45 minutes.
@@ -1305,7 +1305,7 @@ names_the_failing_status_check_refusal() {
   matches "$code" 'already_commented_refusal "\$num" "\$sha"'
 }
 
-# Measured on IntegrateIT run 36408270569 (lane v5.107.1): the merge API refused
+# Measured on a consumer's run 36408270569 (lane v5.107.1): the merge API refused
 # #21400 with "Repository rule violations found  Waiting on code owner review
 # from <owner>." — a review requirement on that ONE pull request, which the
 # lane's check-based read cannot see. Reported as the generic "head moved" it
@@ -1372,7 +1372,7 @@ says_on_the_snapshot_that_it_halted() {
 
 # A RED BASE ADMITS ITS OWN FIX, AND NOTHING ELSE (#1443).
 #
-# DataRetrival, 2026-09-30: the base went red, the hotfix was green on all six
+# A consumer, 2026-09-30: the base went red, the hotfix was green on all six
 # required checks, and the lane refused it for two hours because the base was
 # red. The admission itself is `lane_base_fix_verdict` and `lane_batch_size`,
 # tested case by case in the decision selftest; these assert the driver wires
@@ -1411,7 +1411,7 @@ only_a_pass_counts_as_fixing_the_base() {
 }
 
 # A PUSH-ONLY BASE-HEALTH CHECK IS STOOD IN FOR BY THE REQUIRED CHECKS (#1482).
-# IntegrateIT, lane run 37278255198: `main-health` never runs on a pull request,
+# A consumer, lane run 37278255198: `main-health` never runs on a pull request,
 # so `#23682 wait:base-red fixes=0/1` with every required check green and the
 # repository frozen. The counting rule is `lane_base_fix_count`, tested case by
 # case in the decision selftest; these assert the driver reads the base's
@@ -1563,7 +1563,7 @@ the_wait_for_an_answer_is_bounded() {
 # AND THE CEILING ABOVE IS NOT ITSELF A BOUND ON THE WAIT, WHICH IS WHY THE
 # WINDOW EXISTS. `age` is the TIP's age, so every merge that lands restarts the
 # clock from zero: each wait expires correctly and the sequence never does.
-# Measured on IntegrateIT, where a 6-14 minute health job answers for a `main`
+# Measured on a consumer, where a 6-14 minute health job answers for a `main`
 # that advances every 2-16 and the lane merged nothing for a working day.
 #
 # OFF UNLESS ASKED FOR. Thirteen armed repositories do not get a relaxed gate
@@ -1578,7 +1578,7 @@ the_staleness_window_is_off_by_default() {
 
 # AND IT IS CLOSED FOR THE REST OF A RUN THAT HAS MERGED. The other half of this
 # gate's job is stopping a batch piling onto a tip THE LANE ITSELF just made and
-# nothing has vouched for -- the Apigee-Portal case, #3568 and #3556, green
+# nothing has vouched for -- one consumer's case, #3568 and #3556, green
 # alone and broken together. An ancestor's answer predates that merge by
 # definition, so letting it speak for the new tip would undo the batch gate
 # through the window. Held on a RUN variable, not a pass one: the run loop
@@ -2512,7 +2512,7 @@ mutate "the documented label gate goes back to the bare variable, which is empty
 #   2. It stops being paid for — the reads move out of the `merge:ready` arm
 #      and become two API calls on every open pull request on every pass, which
 #      is exactly the cost that had the lane killed by its own job timeout on
-#      IntegrateIT (#444).
+#      one consumer (#444).
 #
 # And one that is not a failure mode at all: the gate cannot approve anything.
 # It only ever converts a `merge` into a `wait`.
@@ -2755,8 +2755,8 @@ mutate "the review bots stop reaching the driver" "$CALLEE" \
 # fixture cannot drift into a shape the API never produces.
 #
 # THE SUITE SHAPES BELOW ARE MEASURED, NOT INVENTED. Case 1 is this change's own
-# first head sha; case 2 is Telnet-Emulation PR #1354 (ci-runner-infra#955);
-# case 3 is Telnet-Emulation PR #1582.
+# first head sha; case 2 is a consumer's PR #1354 (ci-runner-infra#955);
+# case 3 is the same consumer's PR #1582.
 # ---------------------------------------------------------------------------
 _bh_suite() { # <id> <app> <status> <created_at>
   printf '{"id":%s,"app":{"slug":"%s"},"status":"%s","created_at":"%s"}' "$1" "$2" "$3" "$4"
@@ -2910,7 +2910,7 @@ behavioural_check_counts_cases() {
     "{\"check_suites\":[$(_bh_suite 1 github-actions completed 2026-09-19T12:05:22Z),$(_bh_suite 2 github-actions completed 2026-09-19T12:05:23Z),$(_bh_suite 3 github-actions completed 2026-09-19T12:05:27Z)]}" \
     "{\"check_runs\":[$(_bh_run 'Shell (syntax + drain rule)' completed '"success"' '"2026-09-19T12:20:00Z"' github-actions 1),$(_bh_run 'Terraform (fmt + validate)' completed '"success"' '"2026-09-19T12:19:00Z"' github-actions 1),$(_bh_run 'Genericity (no customer or repo literals)' completed '"success"' '"2026-09-19T12:18:00Z"' github-actions 1),$(_bh_run 'guard / PR guard' completed '"success"' '"2026-09-19T12:06:00Z"' github-actions 2),$(_bh_run 'copilot-pull-request-reviewer' completed '"success"' '"2026-09-19T12:07:00Z"' github-actions 3)]}"
 
-  # 2. ci-runner-infra#955 / Telnet-Emulation PR #1354 STILL HOLDS. The app's
+  # 2. ci-runner-infra#955 / a consumer's PR #1354 STILL HOLDS. The app's
   #    newest suite was created and has NOT posted the required name; an older
   #    suite holds a completed `success`. GitHub called the context `expected`
   #    and refused the merge with a 405. Pending — wait — not green, and not
@@ -2921,7 +2921,7 @@ behavioural_check_counts_cases() {
     "{\"check_suites\":[$(_bh_suite 10 github-actions completed 2026-08-25T06:36:51Z),$(_bh_suite 11 github-actions in_progress 2026-08-25T07:00:39Z)]}" \
     "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-08-25T06:59:47Z"' github-actions 10),$(_bh_run 'Web build' in_progress null null github-actions 11)]}"
 
-  # 3. Telnet-Emulation PR #1582 STILL HOLDS. The newest suite posted the SAME
+  # 3. The same consumer's PR #1582 STILL HOLDS. The newest suite posted the SAME
   #    name as a FAILURE; the older suite's stale `success` has the later
   #    `completed_at`, so the flatten-by-time picks it. Red, not green, and not
   #    a hold: a hold would retry an attempt that cannot succeed.
@@ -2989,7 +2989,7 @@ behavioural_check_counts_cases() {
   # 9. THE HOLD ORDERS ON THE PAIR TOO, and this is the shape that makes it
   #    matter: the later, still-running suite was created in the SAME SECOND as
   #    the one that posted the name green. Same-second siblings are the NORM on
-  #    this fleet — this change's own head carries two, a Telnet-Emulation head
+  #    this fleet — this change's own head carries two, a consumer's head
   #    carried five — so comparing `created_at` as a string on its own means the
   #    hold never fires and #955's stale green is trusted: `1 0 0 0`.
   case_ "a later suite of the app created in the SAME SECOND, still running, holds the name" \
@@ -3132,7 +3132,7 @@ behavioural_check_counts_cases() {
     printf 'FAIL the dead fallback: a run whose app is absent keys as unknown, not null — got app=%s\n' "$dead_app"
   fi
 
-  # 13. ci-runner-infra#967, THE MEASURED SHAPE (IntegrateIT tip db03f376,
+  # 13. ci-runner-infra#967, THE MEASURED SHAPE (a consumer's tip db03f376,
   #     2026-09-27). `main-health` completed `success` in its own workflow's
   #     suite; the same push's `pr-check` suite — created the same second, one
   #     id later — was still running, and four Dependabot update suites sat
@@ -3237,7 +3237,7 @@ done <<<"$_bh_out"
 # The return code IS the contract — 2 skips one candidate and the batch goes on,
 # 1 ends the pass — and a case arm whose glob misses GitHub's real wording falls
 # silently to 1. The texts below are what the merge API actually said (the
-# review one is IntegrateIT run 36408270569, #21400, verbatim, with the owner
+# review one is a consumer's run 36408270569, #21400, verbatim, with the owner
 # replaced), so a glob that stops matching them fails here. Same lift-by-name
 # idiom as above; `gh` is stubbed to record comment posts.
 # ---------------------------------------------------------------------------
