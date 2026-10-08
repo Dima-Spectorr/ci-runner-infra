@@ -756,6 +756,56 @@ ordering is the whole of issue #444 and it is asserted by the self-test; if it
 regresses, the cost of a pass goes back to tracking the number of open pull
 requests in the repository rather than the number the lane could act on.
 
+**Those reads are made for every candidate at once, and the verdicts are then
+given in list order.** The ranking cannot be cut short — the oldest head wins at
+equal priority, and a stuck head can become a `drop` that outranks every merge —
+so the winner is known only when the last head has been read. Read one after
+another, that cost roughly three to six seconds per open pull request before the
+first merge, on every pass. So a pass runs the walk twice over the same list:
+
+1. **Fetch.** Up to `fetch-concurrency` background jobs (default 8) run the
+   walk's own code, each taking the heads it manages to claim. They print
+   nothing and act on nothing; every read they make is recorded — arguments,
+   output, error text and exit status — per pull request. A job never makes a
+   write: a call that would mutate is refused and marks that recording as
+   unusable.
+2. **Decide.** The walk runs again in the foreground, in list order, exactly as
+   it always did, and each read is answered from the recording instead of the
+   network. Every verdict line, queue row and candidate comes from this second
+   run, so for a pass that finishes inside its budget they are byte-for-byte
+   what the serial walk prints, `api-calls=N` included. Everything after the
+   walk — the base's tip before acting, and every read and write of the action
+   itself — is live and serial, as before.
+
+The phase says what it cost in one line, ahead of the verdicts (the figures
+here are an illustration of the shape, not a measurement):
+
+```text
+lane: fetch phase read 52 of 52 open pull request(s) in 9s at concurrency 8, 247 API call(s) — every line below is decided from those reads, in list order
+```
+
+The number of reads does not change, so this moves no API quota — only how many
+requests are in flight together, which is what GitHub's secondary rate limits
+are about. Keep the input modest. `fetch-concurrency: 1` (or `0`) turns the
+phase off and each head is read in its turn; so does a pass with a single
+candidate.
+
+**A recording is never trusted past what it holds.** One that is missing, empty,
+cut short, or that stops matching what the deciding walk asks for is not taken
+as an answer: that head is read live, in its turn, which is the serial walk. The
+log names the head and the reason
+(`lane: #N was not read by the fetch phase — its recording is missing|empty|incomplete — so it is read now, in its turn`),
+and the pass ends with one warning:
+
+```text
+::warning::lane: the fetch phase and the walk disagreed — A head(s) had no usable recording and were read in their turn, B head(s) asked for a read their recording did not hold and were read live from there on, and C fetched read(s) were used by no verdict (counted against this run all the same). …
+```
+
+Once is a killed job or a pass deadline. On every pass it is a defect: set
+`fetch-concurrency: 1` and report it. The lane is correct without the phase and
+merely slow. Reads that no verdict used were still spent, so they are added to
+the run's `API call(s) spent` figure.
+
 It matters because the job has a `timeout-minutes` ceiling, and:
 
 > **A `timeout-minutes` kill is reported by GitHub as `cancelled`, not as
@@ -780,6 +830,18 @@ missing from the table reads as "not in the queue", which nobody can catch. The
 run then ends **green**: a repository with more open pull requests than one pass
 can walk is busy, not broken, and the next CI completion or cron tick starts a
 fresh walk.
+
+**Under a deadline, a concurrent pass may read more heads than a serial one
+would have before the cut.** Each fetch job asks the deadline question before
+it starts a head, as the serial walk does, but several jobs are reading at the
+same moment — so more heads are in hand when the budget runs out. A head whose
+reads are already recorded is given its verdict whatever the clock says: its
+cost was paid, and throwing it away would only make the next pass pay again.
+The pass still stops at the first head nobody read, and that head and the rest
+get their `wait:not-read-this-pass` rows. So the byte-for-byte equivalence with
+the serial walk is a statement about passes that finish in budget; a truncated
+pass differs only by having decided more, and it also reports the fetch
+disagreement warning above when a fetched read went unused.
 
 If you see that warning regularly, the answers in order are: narrow the
 candidate set with `require-label` (which reintroduces "A label applied after
@@ -1815,6 +1877,8 @@ that changes them. So nothing that decides anything lives in either:
 | [`merge-lane-decision.selftest.sh`](../scripts/ci/merge-lane-decision.selftest.sh) | 55 cases, weighted towards the arms that merge |
 | [`merge-lane.sh`](../scripts/ci/merge-lane.sh) | the API calls, deliberately dull |
 | [`merge-lane.selftest.sh`](../scripts/ci/merge-lane.selftest.sh) | Structural assertions on the workflows and the driver, each with a paired mutation |
+| [`merge-lane-fetch.sh`](../scripts/ci/merge-lane-fetch.sh) | the fetch phase: record, replay, claim, tally — it knows nothing about a verdict |
+| [`merge-lane-fetch.selftest.sh`](../scripts/ci/merge-lane-fetch.selftest.sh) | Runs the driver serially and concurrently against a stand-in API and compares the output line for line, each case with a paired mutation |
 | [`merge-lane.yml`](../.github/workflows/merge-lane.yml) | the reusable callee |
 | [`merge-lane-self.yml`](../.github/workflows/merge-lane-self.yml) | this repository's caller |
 
