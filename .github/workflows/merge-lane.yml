@@ -372,6 +372,21 @@ on:
         required: false
         default: 4
         type: number
+      fetch-concurrency:
+        description: >-
+          How many open pull requests the lane reads at the same time. The
+          ranking needs every head's facts before it can name a winner, so read
+          one after another a green pull request waits for all the others; read
+          together it waits for the slowest few. The reads themselves, their
+          number and every verdict are unchanged -- the lane still decides in
+          list order, from what was read -- so this moves no API quota, only
+          how many requests are in flight at once. Keep it modest: GitHub's
+          secondary rate limits are about concurrency. `1` (or `0`) reads
+          serially, as the lane did before, and is the switch to reach for if a
+          run ever reports that the fetch phase and the walk disagreed.
+        required: false
+        default: 8
+        type: number
       require-label:
         description: >-
           If set, only pull requests carrying this label are candidates. Empty
@@ -596,6 +611,7 @@ jobs:
           PASS_BUDGET: ${{ inputs.pass-budget-seconds }}
           QUOTA_FLOOR: ${{ inputs.quota-floor }}
           MAX_ACTIONS: ${{ inputs.max-actions }}
+          FETCH_CONCURRENCY: ${{ inputs.fetch-concurrency }}
           REQUIRE_UP_TO_DATE: ${{ inputs.require-up-to-date }}
           REQUIRE_LABEL: ${{ inputs.require-label }}
           PIN_BUMP_ACTOR: ${{ inputs.pin-bump-actor }}

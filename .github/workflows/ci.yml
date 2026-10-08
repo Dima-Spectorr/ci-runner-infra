@@ -751,6 +751,14 @@ jobs:
         run: bash scripts/ci/merge-lane-decision.selftest.sh
       - name: merge-lane structural self-test
         run: bash scripts/ci/merge-lane.selftest.sh
+      # The structural test above pins the fetch phase's WIRING on the text of
+      # the driver. This one runs it: the whole driver twice against a stand-in
+      # for the API, once reading serially and once reading concurrently, and
+      # the two must print the same lines in the same order. It is also the
+      # only place the kill-the-jobs-on-exit case runs — it needs `pgrep`,
+      # which a Linux runner has and a developer's Windows shell does not.
+      - name: merge-lane fetch-phase self-test
+        run: bash scripts/ci/merge-lane-fetch.selftest.sh
 
       # THE OTHER HALF OF THE LANE'S REVIEW GATE, AND THE HALF THAT SPENDS
       # MONEY.
