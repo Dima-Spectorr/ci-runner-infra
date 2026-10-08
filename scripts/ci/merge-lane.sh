@@ -15,6 +15,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/merge-lane-decision.sh"
+# shellcheck source=/dev/null
+source "$HERE/merge-lane-fetch.sh"
 
 : "${GH_TOKEN:?the merge App token is required}"
 : "${GITHUB_REPOSITORY:?}"
@@ -54,7 +56,9 @@ R="$GITHUB_REPOSITORY"
 # ABSENCE, and a file that has to be created and then deleted to mean "not yet"
 # is a name another process can win in between.
 LANE_TMP="$(mktemp -d)"
-trap 'rm -rf "$LANE_TMP"' EXIT
+# A run that ends while a fetch phase is in flight takes its jobs with it, and
+# only then removes what they were writing to. See `merge-lane-fetch.sh`.
+trap 'lane_fetch_kill; rm -rf "$LANE_TMP"' EXIT
 STATUS_WARN_ONCE="$LANE_TMP/status-surface-warned"
 SUITE_WARN_ONCE="$LANE_TMP/suite-lineage-warned"
 WORKFLOW_WARN_ONCE="$LANE_TMP/workflow-lineage-warned"
@@ -90,13 +94,58 @@ LANE_BASE_FIX_MERGED=''
 # increment dies. A paginated read counts once however many pages it walks, so
 # the number is a floor. `rate_limit` is not counted — GitHub does not charge
 # for it.
+#
+# THE SAME WRAPPER IS WHERE A READ IS RECORDED AND WHERE IT IS REPLAYED. A fetch
+# job (`LANE_RECORD` set) makes the read for real and writes it down, without
+# counting it here — its count travels in the head's result file, because this
+# process is the only one whose total anyone prints. The deciding walk
+# (`LANE_REPLAY` set) counts the read exactly as it always did and is answered
+# from the recording, so the `api-calls` on every line is the figure a serial
+# walk would have printed. A read the recording cannot answer goes to the
+# network, as before. See `merge-lane-fetch.sh`.
+LANE_RECORD=''
+LANE_REPLAY=''
 LANE_CALLS="$LANE_TMP/api-calls"
 : >"$LANE_CALLS"
 gh() {
-  if [ "${1:-}" = api ] && [ "${2:-}" != rate_limit ]; then printf . >>"$LANE_CALLS"; fi
+  if [ "${1:-}" = api ] && [ "${2:-}" != rate_limit ]; then
+    if [ -n "$LANE_RECORD" ]; then
+      lane_gh_record "$@"
+      return
+    fi
+    printf . >>"$LANE_CALLS"
+    if [ -n "$LANE_REPLAY" ] && lane_gh_can_replay "$@"; then
+      lane_gh_serve
+      return
+    fi
+  fi
   command gh "$@"
 }
 lane_calls() { wc -c <"$LANE_CALLS" | tr -d '[:space:]'; }
+
+# The walk sleeps between two reads of a pull request whose mergeability GitHub
+# has not computed yet. The fetch job already waited those seconds; the deciding
+# walk, about to be handed the recorded second answer, does not wait again. Any
+# other sleep — and this one, when the next read will be live — is a real one.
+sleep() {
+  if [ -n "$LANE_REPLAY" ] && lane_gh_has_next; then return 0; fi
+  command sleep "$@"
+}
+
+# How many pull requests are read at once. The reads are the same reads, so the
+# quota a pass spends does not change with this number; what changes is how many
+# requests are in flight together, and GitHub's secondary limits are about
+# exactly that — so the default is modest. `0` or `1` turns the fetch phase off
+# and the walk reads each head in its turn, as it did before there was one.
+FETCH_CONCURRENCY="${FETCH_CONCURRENCY:-8}"
+if ! [[ "$FETCH_CONCURRENCY" =~ ^[0-9]+$ ]]; then
+  echo "lane: fetch-concurrency is '$FETCH_CONCURRENCY', which is not a whole number" >&2
+  exit 1
+fi
+# Where this pass's recordings are, empty when there are none; and which of the
+# two walks this process is running.
+LANE_FETCH_DIR=''
+LANE_WALK_ROLE=decide
 
 # The remaining quota below which a pass does not start. A pass that begins on
 # an almost-empty quota does not merge anything — it fails part-way through its
@@ -1817,6 +1866,31 @@ one_pass() {
   # that pass — the worst one, the one that read nothing at all — as complete.
   local num sha draft i idx read_count=0 truncated_at=-1
 
+  # EVERY HEAD IS READ AT ONCE, AND THEN JUDGED IN LIST ORDER.
+  #
+  # The walk below costs several reads per open pull request, and the winner is
+  # known only when the last head has been read — so read one after another, a
+  # green pull request waited for all of them. `lane_prefetch` runs that same
+  # walk in a bounded number of background jobs that only record what they
+  # read; `lane_walk` then runs it here, in order, answered from the
+  # recordings. Whatever the walk decides, it decides in this second run.
+  lane_prefetch "$total"
+  lane_walk
+}
+
+# ---------------------------------------------------------------------------
+# The walk: every open pull request, in list order, then the ranking and the
+# action. Called by `one_pass`, and it finishes that function's work — the
+# locals it reads without declaring (`pr_fields`, `total`, `candidates`,
+# `base_sha`, `walk_began` and the loop's own) are `one_pass`'s, and its return
+# status is the pass's.
+#
+# It is its own function because it runs twice. A fetch job runs it with
+# `LANE_WALK_ROLE=fetch`: it takes only the heads it claims, records their
+# reads, and returns at the end of the loop having ranked nothing and acted on
+# nothing. Every line a job would print is discarded where the job is started.
+# ---------------------------------------------------------------------------
+lane_walk() {
   for ((i = 0; i < total; i++)); do
     idx=$((i * 6))
     num="${pr_fields[idx]}"
@@ -1838,7 +1912,15 @@ one_pass() {
     # as unread — see the queue rows below — because a candidate missing from
     # the snapshot reads as "not in the queue", which is a lie the operator has
     # no way to catch.
-    if lane_pass_expired "$LANE_STARTED" "$PASS_BUDGET" "$(date -u +%s)"; then
+    #
+    # A HEAD WHOSE READS ARE ALREADY IN HAND IS NOT "STARTED" BY JUDGING IT.
+    # `lane_walk_takes` sets `LANE_REPLAY` for one, and the deadline is then
+    # not asked: its cost was paid in the fetch phase, where each job asked
+    # this same question before reading it. So a fetch that used up the budget
+    # still leaves every head it read with a verdict, and the pass still stops
+    # at the first head nobody read.
+    lane_walk_takes "$i" || continue
+    if [ -z "$LANE_REPLAY" ] && lane_pass_expired "$LANE_STARTED" "$PASS_BUDGET" "$(date -u +%s)"; then
       truncated_at=$i
       break
     fi
@@ -2242,6 +2324,13 @@ one_pass() {
     fi
   done
 
+  # Everything from here on is read LIVE, in this process: the base's tip
+  # before acting, and every read the action itself makes.
+  LANE_REPLAY=''
+  # A fetch job has read what it claimed. It ranks nothing and acts on nothing.
+  if [ "$LANE_WALK_ROLE" = fetch ]; then return 0; fi
+  lane_fetch_settle "$total"
+
   # THE PASS RAN OUT OF TIME, AND SAYS SO.
   #
   # A warning annotation rather than a failure: a repository with more open pull
@@ -2413,6 +2502,97 @@ one_pass() {
   done <<<"$ranked"
 
   [ "$PASS_ACTED" -gt 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# THE FETCH PHASE, AND HOW THE WALK MEETS IT.
+#
+# `merge-lane-fetch.sh` holds the mechanism and the argument for it. These four
+# are the lane's side: start the jobs, give each head to exactly one of them,
+# hand the deciding walk each head's recording, and account for what was read.
+# ---------------------------------------------------------------------------
+
+# Heads the deciding walk had to read itself, this pass.
+LANE_FETCH_LIVE=0
+
+# Reads every open pull request in the background, at most `FETCH_CONCURRENCY`
+# at a time, and returns when all of them have finished. Prints the one line
+# that says what that cost, so the next measurement of the lane needs no log
+# archaeology. With one job or one pull request there is nothing to overlap, and
+# no recording directory means the walk reads live.
+lane_prefetch() { # <total>
+  LANE_FETCH_DIR=''
+  LANE_FETCH_LIVE=0
+  local total="$1" jobs="$FETCH_CONCURRENCY" began heads calls
+  [ "$jobs" -le "$total" ] || jobs="$total"
+  [ "$jobs" -gt 1 ] || return 0
+  began="$(date -u +%s)"
+  if ! LANE_FETCH_DIR="$(mktemp -d "$LANE_TMP/fetch.XXXXXX")"; then
+    LANE_FETCH_DIR=''
+    return 0
+  fi
+  lane_fetch_spawn "$jobs" lane_fetch_job
+  read -r heads calls <<<"$(lane_fetch_tally "$LANE_FETCH_DIR" "$total")"
+  echo "lane: fetch phase read $heads of $total open pull request(s) in $(($(date -u +%s) - began))s at concurrency $jobs, $calls API call(s) — every line below is decided from those reads, in list order"
+}
+
+# One background job. It owns a scratch directory, so the per-head state file
+# and the once-per-run warning markers the walk writes are its own: a marker a
+# job set would silence, in the deciding walk, a warning whose text the job had
+# just thrown away.
+lane_fetch_job() { # <job-number>
+  LANE_WALK_ROLE=fetch
+  LANE_TMP="$LANE_FETCH_DIR/job-$1"
+  mkdir "$LANE_TMP" || return 0
+  STATUS_WARN_ONCE="$LANE_TMP/status-surface-warned"
+  SUITE_WARN_ONCE="$LANE_TMP/suite-lineage-warned"
+  WORKFLOW_WARN_ONCE="$LANE_TMP/workflow-lineage-warned"
+  lane_walk >/dev/null 2>&1
+  # The head a job stopped on at the pass deadline was claimed and never read.
+  # Its recording stays open, so nothing mistakes it for a head with no reads.
+  if [ "$truncated_at" -lt 0 ]; then lane_fetch_seal; fi
+}
+
+# Asked once per head by both walks. A fetch job takes the head if no other job
+# has. The deciding walk takes every head, and is handed the recording when
+# there is a whole one — otherwise it says which kind of unusable it is and
+# reads the head itself, unless the pass deadline is about to record it as
+# unread anyway.
+lane_walk_takes() { # <index>
+  local rec='' state
+  if [ -n "$LANE_FETCH_DIR" ]; then rec="$LANE_FETCH_DIR/$1"; fi
+  if [ "$LANE_WALK_ROLE" = fetch ]; then
+    lane_fetch_claim "$rec"
+    return
+  fi
+  LANE_REPLAY=''
+  [ -n "$rec" ] || return 0
+  state="$(lane_fetch_state "$rec")"
+  if [ "$state" = ready ]; then
+    LANE_REPLAY="$rec"
+    return 0
+  fi
+  if ! lane_pass_expired "$LANE_STARTED" "$PASS_BUDGET" "$(date -u +%s)"; then
+    LANE_FETCH_LIVE=$((LANE_FETCH_LIVE + 1))
+    echo "lane: #$num was not read by the fetch phase — its recording is $state — so it is read now, in its turn"
+  fi
+  return 0
+}
+
+# After the deciding walk. Reads a job made that no verdict used were still
+# spent against the shared quota, so they are added to this run's count; and
+# any disagreement between the two walks is said once, loudly, because the
+# lane is correct without the fetch phase and merely slow.
+lane_fetch_settle() { # <total>
+  [ -n "$LANE_FETCH_DIR" ] || return 0
+  local unused diverged n
+  read -r unused diverged <<<"$(lane_fetch_unused "$LANE_FETCH_DIR" "$1")"
+  for ((n = 0; n < unused; n++)); do printf . >>"$LANE_CALLS"; done
+  if [ "$unused" -gt 0 ] || [ "$diverged" -gt 0 ] || [ "$LANE_FETCH_LIVE" -gt 0 ]; then
+    echo "::warning::lane: the fetch phase and the walk disagreed — $LANE_FETCH_LIVE head(s) had no usable recording and were read in their turn, $diverged head(s) asked for a read their recording did not hold and were read live from there on, and $unused fetched read(s) were used by no verdict (counted against this run all the same). No verdict was taken from a partial recording. Once is a killed job or a pass deadline; on every pass it is a defect — set 'fetch-concurrency' to 1, which reads serially, and report it."
+  fi
+  rm -rf "$LANE_FETCH_DIR"
+  LANE_FETCH_DIR=''
 }
 
 # ---------------------------------------------------------------------------

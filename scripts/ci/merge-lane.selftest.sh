@@ -723,7 +723,7 @@ says_it_once_across_subshells() {
   local code
   code=$(code_of "$1")
   matches "$code" 'LANE_TMP="\$\(mktemp -d\)"' || return 1
-  matches "$code" "trap 'rm -rf \"\\\$LANE_TMP\"' EXIT" || return 1
+  matches "$code" "trap 'lane_fetch_kill; rm -rf \"\\\$LANE_TMP\"' EXIT" || return 1
   matches "$code" 'STATUS_WARN_ONCE="\$LANE_TMP/' || return 1
   matches "$code" 'if \[ ! -e "\$STATUS_WARN_ONCE" \]' || return 1
   # And nothing may go back to a variable that a subshell throws away.
@@ -1031,7 +1031,8 @@ stops_walking_when_the_pass_runs_out_of_time() {
   # Anchored to the WALK's own call site. Matching the bare name would let this
   # be satisfied by one of the other two deadline checks — the action loop's and
   # the batch's — and a walk that lost its deadline would still pass.
-  matches "$code" '^    if lane_pass_expired "\$LANE_STARTED" "\$PASS_BUDGET" ' || return 1
+  # A head whose reads the fetch phase already holds is exempt, and only that.
+  matches "$code" '^    if \[ -z "\$LANE_REPLAY" \] && lane_pass_expired "\$LANE_STARTED" "\$PASS_BUDGET" ' || return 1
   # Asked at the top of the candidate loop AND around the action loop: four
   # actions are four full walks, and a run killed after its last merge but
   # before the summary reports nothing about what it merged.
@@ -2460,7 +2461,7 @@ mutate "the rate-limit 403 is reported as a missing grant again" "$DRIVER" \
   tells_a_rate_limit_from_a_missing_grant
 
 mutate "the pass loses its deadline and waits for the job's ceiling instead" "$DRIVER" \
-  's@^    if lane_pass_expired @    if false \&\& lane_deadline_gone @' \
+  's@^    if \[ -z "\$LANE_REPLAY" \] \&\& lane_pass_expired @    if false \&\& lane_deadline_gone @' \
   stops_walking_when_the_pass_runs_out_of_time
 mutate "the truncation flag goes back to 0, so a pass that read NOTHING reports as complete" "$DRIVER" \
   's@truncated_at=-1@truncated_at=0@' \
@@ -3332,11 +3333,79 @@ asks_the_clock_decision_within_the_budget() {
 # The walk estimate needs a walk to remember: the duration of the last pass
 # that read the open list, taken inside `one_pass` after the walk loop.
 remembers_the_last_walk() {
+  local body walk
+  body="$(code_of "$1" | sed -n '/^one_pass() {$/,/^}$/p')"
+  # The walk is a function of its own since it runs twice (#1508); the clock
+  # starts in `one_pass`, before the fetch phase, so the figure covers both.
+  walk="$(code_of "$1" | sed -n '/^lane_walk() {$/,/^}$/p')"
+  matches "$body" '^  walk_began="\$\(date -u \+%s\)"$' || return 1
+  matches "$walk" '^  LANE_LAST_WALK_SECONDS=\$\(\(\$\(date -u \+%s\) - walk_began\)\)$'
+}
+
+# --- every head is read at once, and judged in list order ----------------------
+# The mechanism is exercised for real, against a stand-in for the API, by
+# `merge-lane-fetch.selftest.sh`. What is pinned here is the wiring that test
+# cannot see being removed: that the fetch phase runs before the walk, that a
+# fetch job leaves before the ranking, that everything after the walk is read
+# live, and that the caller can turn the phase off.
+fetches_before_it_walks() {
   local body
   body="$(code_of "$1" | sed -n '/^one_pass() {$/,/^}$/p')"
-  matches "$body" '^  walk_began="\$\(date -u \+%s\)"$' || return 1
-  matches "$body" '^  LANE_LAST_WALK_SECONDS=\$\(\(\$\(date -u \+%s\) - walk_began\)\)$'
+  before "$body" '^  lane_prefetch "\$total"$' '^  lane_walk$'
 }
+a_fetch_job_ranks_and_acts_on_nothing() {
+  local walk
+  walk="$(code_of "$1" | sed -n '/^lane_walk() {$/,/^}$/p')"
+  before "$walk" '^  if \[ "\$LANE_WALK_ROLE" = fetch \]; then return 0; fi$' '^  ranked="\$\(printf' || return 1
+  before "$walk" '^  if \[ "\$LANE_WALK_ROLE" = fetch \]; then return 0; fi$' 'lane_take_action ' || return 1
+  # And its output never reaches the log: the deciding walk prints every line.
+  matches "$(code_of "$1")" '^  lane_walk >/dev/null 2>&1$'
+}
+reads_live_once_the_walk_is_over() {
+  local walk
+  walk="$(code_of "$1" | sed -n '/^lane_walk() {$/,/^}$/p')"
+  before "$walk" "^  LANE_REPLAY=''$" '^  if ! base_now="\$\(gh api ' || return 1
+  before "$walk" "^  LANE_REPLAY=''$" 'lane_take_action '
+}
+a_fetch_job_never_counts_or_writes() {
+  local code
+  code="$(code_of "$1")"
+  # Recorded before it is counted in this process, and replayed only after.
+  before "$code" '^    if \[ -n "\$LANE_RECORD" \]; then$' '^    printf \. >>"\$LANE_CALLS"$' || return 1
+  before "$code" '^    printf \. >>"\$LANE_CALLS"$' '^    if \[ -n "\$LANE_REPLAY" \] && lane_gh_can_replay "\$@"; then$' || return 1
+  matches "$(code_of "$FETCH")" '^  if lane_gh_mutates "\$@"; then$'
+}
+counts_the_reads_no_verdict_used() {
+  matches "$(code_of "$1")" '^  for \(\(n = 0; n < unused; n\+\+\)\); do printf \. >>"\$LANE_CALLS"; done$'
+}
+the_fetch_can_be_turned_off() {
+  local code
+  code="$(code_of "$1")"
+  matches "$code" '^FETCH_CONCURRENCY="\$\{FETCH_CONCURRENCY:-8\}"$' || return 1
+  matches "$code" '^  \[ "\$jobs" -gt 1 \] \|\| return 0$' || return 1
+  matches "$(cat "$WORKFLOW")" '^          FETCH_CONCURRENCY: \$\{\{ inputs\.fetch-concurrency \}\}$' || return 1
+  [ "$(awk '/^      fetch-concurrency:/{f=1} f&&/^ *default:/{print $2;exit}' "$WORKFLOW")" = 8 ]
+}
+check fetches_before_it_walks "$DRIVER" "the walk runs before the fetch phase, so every head is read one after another again"
+check a_fetch_job_ranks_and_acts_on_nothing "$DRIVER" "a background fetch job runs on into the ranking and the action, so pull requests are merged concurrently"
+check reads_live_once_the_walk_is_over "$DRIVER" "the base tip or the action's own reads could be answered from a recording instead of live"
+check a_fetch_job_never_counts_or_writes "$DRIVER" "a fetch job counts its reads in the parent's file or is allowed to make a write"
+check counts_the_reads_no_verdict_used "$DRIVER" "reads a fetch job made that no verdict used are missing from the run's API count"
+check the_fetch_can_be_turned_off "$DRIVER" "fetch-concurrency does not reach the driver, or 1 no longer means a serial walk"
+mutate "the walk runs before the fetch" "$DRIVER" \
+  's@^  lane_prefetch "\$total"$@  :@' fetches_before_it_walks
+mutate "a fetch job falls through into the ranking" "$DRIVER" \
+  's@^  if \[ "\$LANE_WALK_ROLE" = fetch \]; then return 0; fi$@  :@' a_fetch_job_ranks_and_acts_on_nothing
+mutate "a fetch job's lines reach the log" "$DRIVER" \
+  's@^  lane_walk >/dev/null 2>&1$@  lane_walk@' a_fetch_job_ranks_and_acts_on_nothing
+mutate "the replay stays armed after the walk" "$DRIVER" \
+  "s@^  LANE_REPLAY=''\$@  :@" reads_live_once_the_walk_is_over
+mutate "a fetch job counts in the parent's file" "$DRIVER" \
+  's@^    if \[ -n "\$LANE_RECORD" \]; then$@    if false; then@' a_fetch_job_never_counts_or_writes
+mutate "unused reads go uncounted" "$DRIVER" \
+  's@^  for ((n = 0; n < unused; n++)); do printf \. >>"\$LANE_CALLS"; done$@  :@' counts_the_reads_no_verdict_used
+mutate "one job still starts a fetch phase" "$DRIVER" \
+  's@^  \[ "\$jobs" -gt 1 \] || return 0$@  :@' the_fetch_can_be_turned_off
 # The guard, the decision call and the `fi` as ONE adjacent block. The `if`
 # line existing proves nothing: a `fi; if true; then` slipped in under it would
 # ask the decision on a blind pass or in a dry run with the guard still there.
