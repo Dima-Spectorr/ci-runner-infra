@@ -777,11 +777,12 @@ first merge, on every pass. So a pass runs the walk twice over the same list:
    walk — the base's tip before acting, and every read and write of the action
    itself — is live and serial, as before.
 
-The phase says what it cost in one line, ahead of the verdicts (the figures
-here are an illustration of the shape, not a measurement):
+The phase says what it cost in one line, ahead of the verdicts. This one is
+measured — the first live reading, 2026-10-08, on a consumer repository with
+forty open pull requests; the whole lane run took about 55 seconds:
 
 ```text
-lane: fetch phase read 52 of 52 open pull request(s) in 9s at concurrency 8, 247 API call(s) — every line below is decided from those reads, in list order
+lane: fetch phase read 40 of 40 open pull request(s) in 9s at concurrency 8, 99 API call(s) — every line below is decided from those reads, in list order
 ```
 
 The number of reads does not change, so this moves no API quota — only how many
@@ -801,10 +802,11 @@ and the pass ends with one warning:
 ::warning::lane: the fetch phase and the walk disagreed — A head(s) had no usable recording and were read in their turn, B head(s) asked for a read their recording did not hold and were read live from there on, and C fetched read(s) were used by no verdict (counted against this run all the same). …
 ```
 
-Once is a killed job or a pass deadline. On every pass it is a defect: set
+Once is a killed job. On every pass it is a defect: set
 `fetch-concurrency: 1` and report it. The lane is correct without the phase and
 merely slow. Reads that no verdict used were still spent, so they are added to
-the run's `API call(s) spent` figure.
+the run's `API call(s) spent` figure. A pass that runs out of time does **not**
+print this warning on that account — see "Under a deadline" below.
 
 It matters because the job has a `timeout-minutes` ceiling, and:
 
@@ -840,8 +842,31 @@ cost was paid, and throwing it away would only make the next pass pay again.
 The pass still stops at the first head nobody read, and that head and the rest
 get their `wait:not-read-this-pass` rows. So the byte-for-byte equivalence with
 the serial walk is a statement about passes that finish in budget; a truncated
-pass differs only by having decided more, and it also reports the fetch
-disagreement warning above when a fetched read went unused.
+pass differs only by having decided more.
+
+**A deadline is not a disagreement, and the pass does not report one.** Jobs
+claim heads in list order, so the heads that were read are always the first
+*N* of the list, with no gap. After the budget is spent each job claims one
+more head, asks the deadline question, and stops without reading it; that
+head's recording is left open and holds no reads, so there is nothing in it to
+go unused. The deciding walk gives the first *N* their verdicts from whole
+recordings, stops at head *N + 1*, and the fetch line and the truncation
+warning name the same *N*:
+
+```text
+lane: fetch phase read 6 of 14 open pull request(s) in …s at concurrency 2, 22 API call(s) — every line below is decided from those reads, in list order
+…
+::warning::lane: pass truncated after 600s — read 6 of 14 open pull request(s) on main. The rest are UNREAD this pass, not idle. …
+```
+
+This is run, not traced: `merge-lane-fetch.selftest.sh` cuts a concurrent pass
+at a known read and asserts the verdicts of the heads in hand against a serial
+walk, one `wait:not-read-this-pass` row for each of the others, an action on
+the best head that was read, and no disagreement warning. An earlier version of
+this section said a truncated pass also printed that warning; it does only when
+something else went wrong in the same pass — a job was killed, so a head in the
+middle of the list has no usable recording and the heads recorded after it are
+never reached.
 
 If you see that warning regularly, the answers in order are: narrow the
 candidate set with `require-label` (which reintroduces "A label applied after
@@ -850,6 +875,46 @@ the green", below), close what is stale, or raise
 self-test refuses a budget that does not leave the lane two minutes to publish
 its summary inside the ceiling — a run that merges and then reports nothing
 about it is worse than one that merges nothing.
+
+### How long the run waited before it started
+
+The time from a green check to the merge holds two waits that are over before
+the lane prints anything: for the `merge-lane-<base>` lock another run was
+holding, and for a runner. The lane reports them in one line, straight after
+its header, so green-to-merge time can be read from one log:
+
+```text
+lane: this run waited 41s for the 'merge-lane-main' lock and a runner — triggered 2026-10-08T10:02:03Z (workflow_run), on a runner 2026-10-08T10:02:44Z — and then spent 4s on job setup before this line. GitHub reports the lock and the runner as one wait.
+```
+
+(The figures above show the shape; they are not a measurement.)
+
+- **Triggered** is the run attempt's `run_started_at`: when the event produced
+  this run. For a `workflow_run` trigger that is the moment CI finished, so it
+  is the "green" end of green-to-merge. A re-run counts from the re-run.
+- **On a runner** is this job's `started_at` — the job in progress on the
+  runner the lane is on, since a called workflow's job name is the caller's to
+  choose.
+- **One figure for both waits.** The Actions API gives a job behind a
+  `concurrency` group a `created_at` and nothing more until a runner has it, so
+  there is no instant at which the lock was acquired to subtract. Long waits on
+  `ubuntu-latest` are the lock; long waits on a pool label are usually the pool
+  waking.
+- **Add the last line of the log** for the rest: the lane's own duration is the
+  distance from this line to `lane: done`.
+
+It costs two reads per run, counted in `API call(s) spent`, made with the merge
+App's token and needing its `Actions: read` — the permission the check_suite
+lineage read already asks for. Each read is bounded to ten seconds where the
+runner has `timeout`, both happen inside the pass budget, and a failure is one
+line and nothing else:
+
+```text
+lane: could not read how long this run waited for its runner and the 'merge-lane-main' lock (run attempt started 'unread', this job started 'unread') — nothing depends on it, the lane goes on
+```
+
+Outside a workflow run — the self-tests, a shell — nothing is asked and nothing
+is printed.
 
 ### A settled-red head is read once
 

@@ -424,12 +424,75 @@ LANE_MERGED_THIS_RUN=''
 echo "lane: base=$LANE_BASE required=${#REQUIRED[@]} budget=${BUDGET}s pass-budget=${PASS_BUDGET}s max-actions=$MAX_ACTIONS dry-run=$DRY_RUN"
 for c in "${REQUIRED[@]}"; do echo "lane: requires '$c'"; done
 
+# ---------------------------------------------------------------------------
+# HOW LONG THIS RUN WAITED BEFORE IT COULD START (#1510).
+#
+# Everything the lane prints is about what it did once it was running. The time
+# between a green check and the merge also holds two waits that happen BEFORE
+# the first line: for the `merge-lane-<base>` lock another run of the lane was
+# holding, and for a runner. Reading those used to take the Actions page of the
+# run beside this log; now it is one line in it.
+#
+# WHERE THE FIGURES COME FROM. The run attempt's `run_started_at` is when the
+# triggering event produced this run (for a `workflow_run` trigger, the moment
+# the CI run finished). This job's `started_at` is when a runner took it, which
+# is after BOTH waits. The Actions API publishes no instant for the lock being
+# acquired — a job behind it has a `created_at` and nothing else until a runner
+# has it — so the two are reported as ONE figure and the line says so, rather
+# than splitting it by a guess. The seconds from `started_at` to this line are
+# the job's own setup: checkout, the CLI, the token.
+#
+# THE JOB IS FOUND BY ITS RUNNER. In a `workflow_call` the job's display name
+# is the caller's to choose, and the caller's other jobs may be running beside
+# this one, so "the job in progress on the runner this process is on" is the
+# only description that is true in every repository.
+#
+# NOTHING DEPENDS ON THIS, AND IT CANNOT COST THE RUN. Outside Actions there is
+# no run to ask about and nothing is read. Each of the two reads is bounded
+# where `timeout` exists, a read that fails or returns something that is not a
+# time prints one line saying it could not be read, and the lane goes on. Both
+# are counted against this run like every other read. They need the merge App's
+# 'Actions: read', which the check_suite lineage read already asks for.
+# ---------------------------------------------------------------------------
+lane_report_wait() {
+  [ -n "${GITHUB_RUN_ID:-}" ] || return 0
+  local base triggered='' jobs='' started='' name at t0='' t1='' t2 bounded=(env)
+  base="repos/$R/actions/runs/$GITHUB_RUN_ID/attempts/${GITHUB_RUN_ATTEMPT:-1}"
+  # `env`, not the `gh` function above: `timeout` runs a program, not a function.
+  if command -v timeout >/dev/null 2>&1; then bounded=(timeout 10); fi
+  printf . >>"$LANE_CALLS"
+  triggered="$("${bounded[@]}" gh api "$base" --jq '.run_started_at // empty' 2>/dev/null)" || triggered=''
+  printf . >>"$LANE_CALLS"
+  jobs="$("${bounded[@]}" gh api "$base/jobs?per_page=100" \
+    --jq '.jobs[] | select(.status == "in_progress") | [.runner_name // "", .started_at // ""] | @tsv' 2>/dev/null)" || jobs=''
+  while IFS=$'\t' read -r name at; do
+    if [ -n "$at" ] && [ "$name" = "${RUNNER_NAME:-}" ]; then
+      started="$at"
+      break
+    fi
+  done <<<"$jobs"
+  if [[ "$triggered" =~ ^[0-9T:Z.+-]+$ ]] && [[ "$started" =~ ^[0-9T:Z.+-]+$ ]]; then
+    t0="$(date -u -d "$triggered" +%s 2>/dev/null)" || t0=''
+    t1="$(date -u -d "$started" +%s 2>/dev/null)" || t1=''
+  fi
+  t2="$(date -u +%s)"
+  if [[ "$t0" =~ ^[0-9]+$ ]] && [[ "$t1" =~ ^[0-9]+$ ]] && [ "$t1" -ge "$t0" ] && [ "$t2" -ge "$t1" ]; then
+    echo "lane: this run waited $((t1 - t0))s for the 'merge-lane-$LANE_BASE' lock and a runner — triggered $triggered (${GITHUB_EVENT_NAME:-unknown event}), on a runner $started — and then spent $((t2 - t1))s on job setup before this line. GitHub reports the lock and the runner as one wait."
+  else
+    echo "lane: could not read how long this run waited for its runner and the 'merge-lane-$LANE_BASE' lock (run attempt started '${triggered:-unread}', this job started '${started:-unread}') — nothing depends on it, the lane goes on"
+  fi
+  return 0
+}
+
 now="$(date -u +%s)"
 # The walking clock, set ONCE for the whole run and never refreshed. `now` above
 # is re-read after every action because the verdicts have to describe the world
 # as it is; this one is what the run is measured against, and a deadline that
 # reset itself after each merge would be no deadline at all.
 LANE_STARTED="$now"
+# After the clock is set, so the seconds these two reads take are inside the
+# pass budget rather than added to it.
+lane_report_wait || true
 
 # ---------------------------------------------------------------------------
 # check_counts <sha> — how the required checks stand on exactly this commit.
