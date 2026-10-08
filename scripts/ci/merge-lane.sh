@@ -310,6 +310,13 @@ LANE_CLOCK_CLEARS_AT=''
 # `lane_walk_estimate`.
 LANE_LAST_WALK_SECONDS=''
 CLOCK_WALK_FLOOR=30
+# Heads this RUN has already found settled red — every required check finished,
+# one failed — keyed by pull request number, holding `sha|pass|green|verdict`.
+# A later pass of the same run does not read such a head again while the list
+# still shows that sha. Never written anywhere, so it ends with the run. See
+# `lane_settled_red` and the walk in `one_pass`.
+declare -A LANE_SETTLED=()
+LANE_PASS_NO=0
 
 # HOW LONG A LATER, UNFINISHED SUITE OF THE SAME APP MAY HOLD A REQUIRED CHECK
 # THAT IS OTHERWISE GREEN.
@@ -1662,6 +1669,9 @@ one_pass() {
   fi
   read -r base_sha base_at <<<"$base_read"
 
+  # Counted for the log only: a head carried forward says which pass settled it.
+  LANE_PASS_NO=$((LANE_PASS_NO + 1))
+
   # Every pass starts with no clock hold. Only a hold THIS pass saw may keep the
   # run waiting.
   LANE_CLOCK_CLEARS_AT=''
@@ -1872,6 +1882,70 @@ one_pass() {
       fi
     fi
 
+    # THE CHECKS ARE READ FIRST, BECAUSE THEY ALONE CAN END THE QUESTION.
+    #
+    # A head whose every required check has finished, with one failed, is not a
+    # candidate whatever its mergeability, its age or its distance from the base
+    # say — `lane_settled_red` holds the argument. So those three reads, and the
+    # sleeps the mergeability one takes after a merge, are spent only on a pull
+    # request that can still be acted on. Measured on a repository with 53 open
+    # pull requests, 43 of them settled red: each paid five calls and about
+    # three seconds a pass, and six seconds on the pass after a merge, to be
+    # told `skip:red` — and the one green pull request waited behind all of it.
+    #
+    # WHAT THE LOG LINE NO LONGER SAYS, IT SAYS IT DOES NOT. Such a pull request
+    # used to read `skip:conflict` or `wait:mergeability-unknown` when that came
+    # first; it now reads `skip:red` and names what was not read. None of the
+    # three is acted on, so the ranking is unchanged — it was never in it.
+    #
+    # The priority and the head sha here are the LIST's copies. That is the
+    # cheap filter the label gate above already relies on: a push since the
+    # list read starts a CI run, and its completion wakes the lane.
+    local settled_priority settled_behind='unread' settled_verdict=''
+    settled_priority="$(lane_priority_of "$list_labels" "$PRIORITY_PREFIX")"
+    if [ "$LANE_STRICT" = "0" ]; then settled_behind='n/a'; fi
+
+    # AND WITHIN ONE RUN IT IS NOT READ TWICE. Every action is followed by a
+    # pass that re-reads the world, and for a settled head that re-read can only
+    # repeat itself: the checks it failed have finished, and the only thing that
+    # changes them — a new run on this head — reports to the lane when it
+    # completes and starts a run of its own. So a later pass of the SAME run
+    # carries the answer forward for as long as the list shows the same head
+    # sha, for zero calls. A push, a label change or a draft flip all arrive in
+    # the list read, which every pass still makes. Nothing outlives the run.
+    local carried_sha='' carried_pass='' carried_green='' carried_verdict=''
+    if [ -n "${LANE_SETTLED[$num]:-}" ]; then
+      IFS='|' read -r carried_sha carried_pass carried_green carried_verdict <<<"${LANE_SETTLED[$num]}"
+    fi
+    if [ -n "$carried_sha" ] && [ "$carried_sha" = "$sha" ]; then
+      echo "lane: #$num $carried_verdict (sha=${sha:0:8} priority=$settled_priority behind=$settled_behind api-calls=0) — not re-read: settled on this head in pass $carried_pass of this run, and only a new check run on it, which wakes the lane itself, can change that"
+      queue_row "8:$(printf '%03d' "$settled_priority"):$(printf '%08d' "$num")" \
+        "$num" "$list_title" "$carried_verdict" "$settled_priority" "$settled_behind" "$carried_green/${#REQUIRED[@]}"
+      continue
+    fi
+
+    local counts green missing failed pending head_states="$LANE_TMP/head-states" counted_sha="$sha"
+    : >"$head_states"
+    # On a red base the same read also records each name's state, so the
+    # base-fix test reuses it instead of reading the head again (#1443).
+    counts="$(LANE_STATE_SINK="${LANE_BASE_RED:+$head_states}" check_counts "$sha")"
+    read -r green missing failed pending <<<"$counts"
+
+    if lane_settled_red "$green" "$missing" "$failed" "$pending"; then
+      # Asked of the rule itself rather than spelled here, with the unread
+      # facts given their most favourable values: mergeable, current with the
+      # base, not in flight. If even that is not an action, nothing is.
+      settled_verdict="$(lane_verdict 0 "$LANE_BASE" "$LANE_BASE" 0 \
+        "${#REQUIRED[@]}" "$green" "$missing" "$failed" "$pending" 0 '' "$BUDGET" "$LANE_STRICT")"
+      if ! lane_admits "$settled_verdict"; then
+        LANE_SETTLED[$num]="$sha|$LANE_PASS_NO|$green|$settled_verdict"
+        echo "lane: #$num $settled_verdict (sha=${sha:0:8} priority=$settled_priority behind=$settled_behind api-calls=$(($(lane_calls) - pr_calls_before))) — every required check has finished and one failed, so mergeability, age and the base comparison were not read: none of them can make it actionable"
+        queue_row "8:$(printf '%03d' "$settled_priority"):$(printf '%08d' "$num")" \
+          "$num" "$list_title" "$settled_verdict" "$settled_priority" "$settled_behind" "$green/${#REQUIRED[@]}"
+        continue
+      fi
+    fi
+
     # `mergeable` is computed asynchronously and is null until GitHub has done
     # it, which is why the list call above is not enough — the list does not
     # carry it at all. Read per pull request, and let null stay null: the
@@ -1959,14 +2033,8 @@ one_pass() {
       *) conflict='' ;;
     esac
 
-    local priority=50 l _labels
-    IFS=',' read -ra _labels <<<"$labels"
-    for l in "${_labels[@]}"; do
-      if [[ "$l" == "$PRIORITY_PREFIX"* ]]; then
-        local p="${l#"$PRIORITY_PREFIX"}"
-        [[ "$p" =~ ^[0-9]+$ ]] && priority="$p"
-      fi
-    done
+    local priority
+    priority="$(lane_priority_of "$labels" "$PRIORITY_PREFIX")"
 
     # How far the base has moved since this branch last saw it. `behind_by` is
     # the whole of invariant C: it is what makes this a queue rather than plain
@@ -2031,12 +2099,16 @@ one_pass() {
       age=''
     fi
 
-    local counts green missing failed pending head_states="$LANE_TMP/head-states"
-    : >"$head_states"
-    # On a red base the same read also records each name's state, so the
-    # base-fix test reuses it instead of reading the head again (#1443).
-    counts="$(LANE_STATE_SINK="${LANE_BASE_RED:+$head_states}" check_counts "$sha")"
-    read -r green missing failed pending <<<"$counts"
+    # THE MERGE IS DECIDED ON THE HEAD THE DETAIL READ RETURNED. The checks were
+    # counted above on the list's copy of the head sha; if a commit was pushed
+    # in the seconds between the two reads, those counts describe a head that
+    # is no longer the pull request's, so they are counted again on this one.
+    if [ "$sha" != "$counted_sha" ]; then
+      echo "lane: #$num head moved since the list read (${counted_sha:0:8} → ${sha:0:8}) — counting its checks again on the new head"
+      : >"$head_states"
+      counts="$(LANE_STATE_SINK="${LANE_BASE_RED:+$head_states}" check_counts "$sha")"
+      read -r green missing failed pending <<<"$counts"
+    fi
 
     local isdraft=0
     [ "$draft" = "true" ] && isdraft=1

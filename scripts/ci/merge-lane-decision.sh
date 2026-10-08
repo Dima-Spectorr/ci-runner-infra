@@ -278,6 +278,59 @@ lane_admits() {
 }
 
 # ---------------------------------------------------------------------------
+# lane_settled_red — do a head's check counts ALONE prove it cannot be acted on?
+#
+#   lane_settled_red <required_green> <missing> <failed> <pending>
+#
+# Returns 0 when every required check has FINISHED on the head and at least one
+# of them failed: `failed > 0`, `pending = 0`, `missing = 0`. Returns 1 for
+# anything else, including a count that is not a number.
+#
+# WHY THIS ONE SHAPE, AND NO OTHER, MAY SKIP THE REST OF THE READS.
+#
+# `lane_verdict` asks its questions in a fixed order: draft, the in-flight
+# budget, mergeability, red, pending, missing, green, behind. For a head with
+# these counts the budget cannot fire — it needs `pending + missing > 0` — and
+# everything after it ends at `skip:red` or earlier: `wait:mergeability-unknown`
+# or `skip:conflict`. All three are verdicts the lane does not act on. So
+# whatever the mergeability read, the head-commit age and the base comparison
+# would have said, this pull request is not a candidate, and the caller may
+# decline to pay for them. It cannot change which pull request wins, because
+# this one was never in the ranking.
+#
+# A head that failed with something still PENDING or MISSING is deliberately not
+# settled: once it outlives the in-flight budget it becomes `drop`, which is an
+# action and ranks first. That needs its age, so it is read in full as before.
+# ---------------------------------------------------------------------------
+lane_settled_red() {
+  local green="${1:-}" missing="${2:-}" failed="${3:-}" pending="${4:-}" n
+  for n in "$green" "$missing" "$failed" "$pending"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  done
+  [ "$failed" -gt 0 ] && [ "$pending" -eq 0 ] && [ "$missing" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# lane_priority_of — the lane priority a label set carries.
+#
+#   lane_priority_of <labels-csv> <prefix>
+#
+# Prints the number after <prefix> on the LAST label that carries one, or 50
+# when none does. A suffix that is not a whole number is not a priority.
+# ---------------------------------------------------------------------------
+lane_priority_of() {
+  local labels="${1:-}" prefix="${2:-}" priority=50 l p _labels=()
+  IFS=',' read -ra _labels <<<"$labels"
+  for l in "${_labels[@]}"; do
+    if [[ "$l" == "$prefix"* ]]; then
+      p="${l#"$prefix"}"
+      [[ "$p" =~ ^[0-9]+$ ]] && priority="$p"
+    fi
+  done
+  echo "$priority"
+}
+
+# ---------------------------------------------------------------------------
 # lane_rank — the order candidates are considered in.
 #
 #   lane_rank <verdict> <priority> <age_seconds>
