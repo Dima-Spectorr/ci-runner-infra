@@ -151,7 +151,7 @@ more than one App, so this is the established pattern.
 **Workflows is not optional either, on a fleet where most pull requests are
 workflow pull requests.** GitHub refuses an App token that writes under
 `.github/workflows/` regardless of `Contents: write`, and a squash merge counts
-as writing those files. Measured 2026-08-26 on Print-Server and entity-platform:
+as writing those files. Measured 2026-08-26 on two consumer repositories:
 the lane logged `merge:ready` for every candidate and then `done, 0 action(s)`,
 with every pull request reading `mergeable: true` and `mergeable_state: clean`.
 The real cause was one line above the annotation, on `gh`'s stderr — *refusing
@@ -204,7 +204,7 @@ still declares a top-level group keyed per run, which joins nothing and evicts
 nothing; it is there because the fleet's `check-workflow-concurrency.sh`
 requires every workflow to declare one. The events file keys it on
 `github.event.pull_request.number || github.run_id`: the stricter vendored
-copies of that gate (IntegrateIT's) require a per-pull-request key on any
+copies of that gate (one consumer's) require a per-pull-request key on any
 workflow `pull_request_target` reaches, and a second label event on the same
 pull request losing its pending slot costs nothing — the lane re-reads live
 state.
@@ -524,16 +524,16 @@ jobs:
 > so each needs that gate's exemption marker, naming an issue that records why:
 > one directly above the events file's `lane:` job `uses:` line (the callee
 > receives `runs-on: ubuntu-latest` as an input there), and one directly above
-> the relay job's `runs-on:`. In the form IntegrateIT's gate reads:
+> the relay job's `runs-on:`. In the form that consumer's gate reads:
 >
 > ```text
 > # github-hosted-allowed(#<issue>): non-CI lane passes run hosted so the pool never starts for them
 > # github-hosted-allowed(#<issue>): the relay holds no secret and no token scope
 > ```
 >
-> IntegrateIT landed exactly this in IntegrateIT#21880, recorded in
-> IntegrateIT#21881. Without them the migration pull request is red on the
-> consumer's own gate.
+> A consumer repository landed exactly this, with an issue of its own recording
+> why. Without them the migration pull request is red on the consumer's own
+> gate.
 
 > **The two markers in that example are not decoration, and admin merge will
 > not tell you so.** A caller without them is rejected by gates several repos in
@@ -660,8 +660,8 @@ a total stop, so keep it in step with your CI.
 branch protection does with one and what Mergify did. A job behind a path filter
 did not run because the diff never reached it. The lane's first position was the
 opposite, and the fleet showed why that is wrong: on 2026-08-25 a pull request
-touching one Markdown file skipped `Web production build` on Apigee-Portal and
-*both* required jobs on CarListPrice, and the lane held both repositories on a
+touching one Markdown file skipped a required build job on one consumer repository and
+*both* required jobs on another, and the lane held both repositories on a
 change nothing could have broken while GitHub reported them mergeable — nothing
 red, nothing merging, which is the Mergify failure this lane exists to end.
 
@@ -818,7 +818,7 @@ which is also what an operator pressing *Cancel* produces, and what the
 is no annotation, no job summary, and no queue update. A lane dying of its own
 weight is therefore indistinguishable from a lane behaving correctly under load.
 
-Measured on `IntegrateIT` on 2026-08-25, with roughly thirty-five open pull
+Measured on a consumer repository on 2026-08-25, with roughly thirty-five open pull
 requests: **thirty consecutive runs, none of them reaching a merge, every one
 reported `cancelled`.** #11682 was green, labelled and clean throughout and had
 to be merged by hand.
@@ -973,11 +973,10 @@ installation's actual `limit`). `pr-guard` runs on the job's own
 
 **Measured 2026-09-17.** From 12:57 UTC every lane in the fleet failed with
 `API rate limit exceeded for installation` at "cannot list the open pull
-requests", and green, clean pull requests on Telnet-Emulation sat unmerged. The
-App-token runs in the hour before: Telnet-Emulation 33, Manar 25, IntegrateIT 22,
-Specaria-Platform / Print-Server / Apigee-Portal 4 each, DataRetrival 3,
-SOAP-To-REST 2. The top consumer was one repository and one pattern:
-Telnet-Emulation had 35 open pull requests of which **33 were stale Dependabot
+requests", and green, clean pull requests on a consumer repository sat unmerged.
+The App-token runs in the hour before, per repository: 33, 25, 22, then 4 each
+for three more, 3, and 2. The top consumer was one repository and one pattern:
+it had 35 open pull requests of which **33 were stale Dependabot
 drafts** (28 of them conflicting). A draft's verdict is `skip:draft` whatever its
 checks say, but it was decided *after* the per-candidate reads — a detail read,
 a head-commit read and both check surfaces, four calls apiece. The last good run
@@ -990,7 +989,7 @@ What changed:
 
 - **A draft is decided from the list read**, before the label gate and before
   any per-candidate call, so it costs nothing — the same rule #444 applied to the
-  label. The Telnet-Emulation pass above drops to roughly the base reads plus the
+  label. The pass measured above drops to roughly the base reads plus the
   ready pull requests: ~25 calls instead of ~115.
 - **The base-health read is made once per pass**, not once to halt and again to
   vouch for the same tip.
@@ -1022,7 +1021,7 @@ reading files for every unlabelled candidate.
 A pass skipped under the quota floor ends green, and a pass that fails part-way
 on the quota ends red — and until #1463 neither was ever run again. The next
 trigger is a CI completion, which never comes when every pull request is
-already green, and a consumer's backstop is daily. DataRetrival, 2026-09-30 to
+already green, and a consumer's backstop is daily. A consumer repository, 2026-09-30 to
 10-01: twelve green pull requests sat until a person dispatched the lane.
 
 `merge-lane-retry.yml` closes that, once, for the whole fleet. It runs **in
@@ -1256,7 +1255,7 @@ anyway:
   re-run lands, so the pull request goes straight back to being behind and
   **never converges**.
 
-Measured on IntegrateIT, 2026-08-25: about twenty of roughly seventy open pull
+Measured on a consumer repository, 2026-08-25: about twenty of roughly seventy open pull
 requests sat in `update:behind` on every pass of a base whose ruleset reported
 `strict_required_status_checks_policy: false`. The lane spent its entire
 `max-actions` budget updating branches that had been mergeable the whole time,
@@ -1328,7 +1327,7 @@ contributor can act on are also commented on the pull request once per head sha
 | `Required status check "X" is expected.` (405) | a check_suite disagreement about this head — see "Superseded check_suite vs a required context" | yes |
 | `Waiting on code owner review from …` / `… approving review is required …` / `A conversation must be resolved …` (405) | the ruleset or branch protection also requires a review, which the lane's check-based read cannot see, so the pull request reads `merge:ready` | yes |
 
-The review arm is measured: IntegrateIT run 36408270569 (lane v5.107.1,
+The review arm is measured: a consumer repository's run 36408270569 (lane v5.107.1,
 2026-09-28), #21400 refused with `Repository rule violations found  Waiting on
 code owner review from <owner>.` Before the arm existed that fell to the
 "head moved" default, which ENDS the pass; #21400 ranked first on every pass
@@ -1392,7 +1391,7 @@ So the lane does not try to prevent it. It **bounds** it, with two things:
 
    **A push-only base-health check is shown fixed by the required checks
    (#1482).** `base-health-checks` may name a summary that runs on a push to the
-   base and never on a pull request (IntegrateIT's `main-health`), so no head
+   base and never on a pull request (one consumer's `main-health`), so no head
    can ever report it. When such a check — not in `required-checks`, and with
    no check-run of that name on the head — is failing on the base, the lane
    reads the **required** checks on the same red tip, and the head counts as
@@ -1435,7 +1434,7 @@ merge — the cheap end of the trade, and the whole reason the gate is shaped th
 way.
 
 **When one run per merge is still too much, narrow what the gate reads.** On
-IntegrateIT the required `ci` takes about thirty minutes, and at the rate the
+one consumer repository the required `ci` takes about thirty minutes, and at the rate the
 lane now drains a backlog that is roughly twenty half-hour runs an hour to power
 a gate that asks a single yes/no question. `base-health-checks` points the gate
 at a different, cheaper list:
@@ -1487,7 +1486,7 @@ Two consequences worth stating plainly:
 - **That ceiling bounds one wait, not the waiting — and on a fast base the
   difference is a livelock.** The grace is measured from the *tip's* commit
   date, so every merge that lands restarts it from zero. Each wait expires
-  correctly and the sequence never does. Measured on IntegrateIT on 2026-08-26:
+  correctly and the sequence never does. Measured on a consumer repository on 2026-08-26:
   a 6–14 minute `main-health` against a `main` advancing every 2–16 minutes, and
   the lane merged nothing for a working day while the backlog went in by hand —
   which is itself what kept `main` moving. **It is silent.** The pass halts
@@ -1577,7 +1576,7 @@ roughly `3600 / (base_health_duration + poll_interval)` merges per hour, per
 repository. Below that rate it is free; above it, no amount of per-PR CI speed
 is visible, because the queue is not waiting on CI.
 
-**Measured** — `Telnet-Emulation`, 2026-09-19 10:50Z–11:42Z: 14 merges in 52
+**Measured** — a consumer repository, 2026-09-19 10:50Z–11:42Z: 14 merges in 52
 minutes, inter-merge gaps 3, 3, 7, 3, 3, 3, 2, 3, 3, 5, 6, 6, 3, 5 minutes
 (median 3). `main-health` over the same window, 8 runs: 83, 84, 95, 99, 140,
 221, 86 seconds — median ~93s. The gap *is* the health job plus the poll
@@ -1821,7 +1820,7 @@ infrastructure change.
 
 A merge can come back refused with a 405, `Required status check "X" is
 expected.`, on a candidate the lane's own read just called green. Measured on
-Telnet-Emulation run 35428114193 (PR #1354, sha `5d824839`): the head sha had
+a consumer repository's run 35428114193 (its PR #1354, sha `5d824839`): the head sha had
 picked up four separate check_suites for `CI summary (rollup)` over about an
 hour (two `workflow_dispatch` re-dispatches plus a `pull_request`-triggered
 rerun, no new commit). `check_counts()` flattens check-runs across every
@@ -1849,7 +1848,7 @@ A `success` that IS from the authoritative suite is still held as `pending` whil
 the same app has a suite created LATER that has not `completed` — one that may
 yet post its own occurrence. "Later" is ordered on `[created_at, suite id]`, not
 on the timestamp alone: same-second sibling suites are the NORM here (two on
-ci-runner-infra `04e788fa`, five within one second on Telnet-Emulation
+ci-runner-infra `04e788fa`, five within one second on a consumer repository's
 `1da9a01`), and a suite id increases monotonically, so it is what actually
 resolves both a same-second tie and a suite the read returned without a
 timestamp. Nothing that was already non-green is touched: the
@@ -1870,13 +1869,13 @@ it replaces, because a 405 is at least loud.
 
 Three measured shapes drove the design:
 
-- **PR #1354** (Telnet-Emulation), sha `5d824839`: the newest suite for the app
+- **PR #1354** (a consumer repository), sha `5d824839`: the newest suite for the app
   had been created but had not yet posted `CI summary (rollup)` at all — an
   older, superseded suite's completed success was what the flattened read
   returned. Reads as `pending` now: the lane waits rather than attempting the
   405. This is the shape `newer_incomplete` exists for; per-name authority alone
   would hand the verdict straight back to the stale success.
-- **PR #1582** (Telnet-Emulation), sha `50a857fd`: the newest suite for the app
+- **PR #1582** (the same consumer repository), sha `50a857fd`: the newest suite for the app
   (a `workflow_dispatch` re-dispatch) HAD posted the check, as a `failure`, over
   an older `pull_request` suite's stale `success`. Reads as `failed` now — the
   lane never attempts a merge on it.
@@ -1902,7 +1901,7 @@ base-health knobs above, and loud when it fires.
 the hold is scoped to the same WORKFLOW, not merely the same app.** GitHub
 creates one `github-actions` suite per workflow file on every push, all in the
 same second, and a suite of workflow A can never post a check-run that workflow
-B emits. Measured on IntegrateIT tip `db03f376` (2026-09-27): `main-health`
+B emits. Measured on a consumer repository's tip `db03f376` (2026-09-27): `main-health`
 completed `success` in its own suite, and the base-health gate still read the
 tip `unanswered` because the same push's `pr-check` suite (one id later) was
 running and four Dependabot update suites sat `queued`. When some name is held,
@@ -1927,7 +1926,7 @@ and intentional, not an oversight.
 
 A suite from an app that never posts a required name (this sha's
 `google-cloud-build`, `google-cloud-developer-connect`, `claude`,
-`mot-integrateit`, `the-merge-app` — all `queued` and never completing) is read
+`<consumer-project>`, `the-merge-app` — all `queued` and never completing) is read
 and then never looked up, so a permanently-unfinished, unrelated suite cannot
 hang a verdict on the ones that matter.
 

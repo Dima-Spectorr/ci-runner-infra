@@ -2652,7 +2652,7 @@ lane_fetch_settle() { # <total>
   read -r unused diverged <<<"$(lane_fetch_unused "$LANE_FETCH_DIR" "$1")"
   for ((n = 0; n < unused; n++)); do printf . >>"$LANE_CALLS"; done
   if [ "$unused" -gt 0 ] || [ "$diverged" -gt 0 ] || [ "$LANE_FETCH_LIVE" -gt 0 ]; then
-    echo "::warning::lane: the fetch phase and the walk disagreed — $LANE_FETCH_LIVE head(s) had no usable recording and were read in their turn, $diverged head(s) asked for a read their recording did not hold and were read live from there on, and $unused fetched read(s) were used by no verdict (counted against this run all the same). No verdict was taken from a partial recording. Once is a killed job or a pass deadline; on every pass it is a defect — set 'fetch-concurrency' to 1, which reads serially, and report it."
+    echo "::warning::lane: the fetch phase and the walk disagreed — $LANE_FETCH_LIVE head(s) had no usable recording and were read in their turn, $diverged head(s) asked for a read their recording did not hold and were read live from there on, and $unused fetched read(s) were used by no verdict (counted against this run all the same). No verdict was taken from a partial recording. Once is a killed job (a pass that merely ran out of time does not print this); on every pass it is a defect — set 'fetch-concurrency' to 1, which reads serially, and report it."
   fi
   rm -rf "$LANE_FETCH_DIR"
   LANE_FETCH_DIR=''

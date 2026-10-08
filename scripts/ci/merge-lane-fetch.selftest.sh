@@ -3,9 +3,13 @@
 #
 # `merge-lane.selftest.sh` pins the WIRING of the fetch phase on the text of the
 # driver. This file runs the thing: the record/replay pair, the claim, the jobs
-# and the tally out of `merge-lane-fetch.sh`, and then the whole driver, twice,
-# against a stand-in for the API — once reading serially and once reading
-# concurrently — to show the two print the same lines in the same order.
+# and the tally out of `merge-lane-fetch.sh`, and then the whole driver against
+# a stand-in for the API: once reading serially and once reading concurrently,
+# to show the two print the same lines in the same order; a concurrent pass
+# whose clock passes the pass budget part-way, against a serial pass on the
+# later clock; and three passes over an empty queue for the line that says how
+# long the run waited — outside a workflow run, inside one whose times can be
+# read, and inside one whose times cannot.
 #
 # No network, no token, and nothing is written outside one temporary directory.
 # The stand-in is a `gh` placed first on PATH, because the code under test calls
