@@ -228,6 +228,7 @@ cases_core() { # <fetch-file>
     lane_gh_record api ok/a --jq '.x, .y' >/dev/null 2>&1
     lane_fetch_seal
     LANE_REPLAY="$d/2"
+    # shellcheck disable=SC2251 # the status IS read, by `say` on the next line
     ! lane_gh_can_replay api ok/a --jq '.x,' '.y'
     say arguments-compared-whole $?
 
