@@ -110,6 +110,12 @@ lane_retry_sleep() { command sleep "$1"; }
 
 # `command gh "$@"`, made once more after a short rate-limit wait. The caller
 # receives the output, the error text and the status of the LAST attempt.
+#
+# READS ONLY. A write is made once: the wait can be up to LANE_RETRY_MAX_WAIT,
+# and what the lane decided on (reviews, labels, the base) can change in that
+# time, so repeating `PUT pulls/N/merge` after it would merge on a verdict never
+# re-checked. A refused write ends the pass; `recover` dispatches another that
+# decides again from live state.
 lane_gh_retry() {
   local d rc=0 wait
   if ! d="$(mktemp -d "${LANE_TMP:-${TMPDIR:-/tmp}}/retry.XXXXXX" 2>/dev/null)"; then
@@ -118,7 +124,9 @@ lane_gh_retry() {
   fi
   command gh "$@" >"$d/out" 2>"$d/err" || rc=$?
   if [ "$rc" -ne 0 ] && wait="$(lane_rate_limit_wait "$d/err")"; then
-    if [ "$wait" -gt "$LANE_RETRY_MAX_WAIT" ]; then
+    if lane_gh_mutates "$@"; then
+      echo "lane: rate limited on a write; a write is never repeated on the old verdict — the pass ends and the recover job decides again from live state" >&2
+    elif [ "$wait" -gt "$LANE_RETRY_MAX_WAIT" ]; then
       echo "lane: rate limited; the window reopens in ${wait}s, past the ${LANE_RETRY_MAX_WAIT}s a call may wait — not retried, the recover job dispatches a pass after it" >&2
     elif [ -n "${LANE_STARTED:-}" ] && [ -n "${PASS_BUDGET:-}" ] \
       && [ "$(($(date -u +%s) + wait))" -ge "$((LANE_STARTED + PASS_BUDGET))" ]; then

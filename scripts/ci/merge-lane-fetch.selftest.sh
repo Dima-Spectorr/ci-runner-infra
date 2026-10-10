@@ -83,7 +83,17 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --jq) prog="$2"; shift 2 ;;
     --paginate) shift ;;
-    -*) printf 'WRITE %s\n' "$*" >>"$GH_STUB_LOG"; exit 97 ;;
+    # A write is logged and refused. With GH_STUB_RATE_LIMIT_WRITES it is
+    # refused the way a drained installation quota refuses it, to show the
+    # retry does not repeat it.
+    -*)
+      printf 'WRITE %s\n' "$*" >>"$GH_STUB_LOG"
+      if [ -n "${GH_STUB_RATE_LIMIT_WRITES:-}" ]; then
+        printf 'gh: You have exceeded a secondary rate limit. (HTTP 403)\n' >&2
+        exit 1
+      fi
+      exit 97
+      ;;
     *) url="$1"; shift ;;
   esac
 done
@@ -809,6 +819,15 @@ cases_retry() { # <fetch-file>
     [ $? -ne 0 ] && [ "$(slept)" = 60 ] && [ "$(calls stuck/a)" -eq 2 ]
     say retry-only-once $?
 
+    # A WRITE is never made twice: after the wait the lane's verdict (reviews,
+    # labels, the base) may be stale, and a second `PUT pulls/N/merge` would act
+    # on it. One attempt, no sleep, the refusal handed back.
+    fresh
+    GH_STUB_RATE_LIMIT_WRITES=1 lane_gh_retry api -X PUT repos/o/r/pulls/1/merge >/dev/null 2>"$d/err"
+    [ $? -ne 0 ] && [ -z "$(slept)" ] && [ "$(grep -c '^WRITE ' "$GH_STUB_LOG")" -eq 1 ] \
+      && [ "$(grep -c 'a write is never repeated' "$d/err")" -eq 1 ]
+    say retry-never-repeats-a-write $?
+
     # The recording holds the answer the retry got, so a replaying job sees the
     # read succeed exactly as the recording job did.
     fresh
@@ -868,7 +887,7 @@ tally_lines "$(cases_core "$FETCH" 2>&1)" 22 core
 tally_lines "$(cases_spawn "$FETCH" 2>&1)" 7 spawn
 tally_lines "$(cases_kill "$FETCH" 2>&1)" 2 kill
 tally_lines "$(cases_shell "$FETCH" 2>&1)" 2 shell
-tally_lines "$(cases_retry "$FETCH" 2>&1)" 8 retry
+tally_lines "$(cases_retry "$FETCH" 2>&1)" 9 retry
 
 mutant "a call waits however long the window is" cases_retry "$FETCH" \
   's|^LANE_RETRY_MAX_WAIT=90$|LANE_RETRY_MAX_WAIT=99999|' retry-not-past-the-cap
@@ -884,6 +903,8 @@ mutant "a retry may outlast the pass budget" cases_retry "$FETCH" \
   's|^    elif \[ -n "\${LANE_STARTED:-}" \] && \[ -n "\${PASS_BUDGET:-}" \] \\$|    elif false \\|' retry-within-the-pass-budget
 mutant "a retried call is made twice more" cases_retry "$FETCH" \
   's|^      rc=0$|      rc=0; command gh "$@" >/dev/null 2>\&1|' retry-only-once
+mutant "a refused write is made once more after the wait" cases_retry "$FETCH" \
+  's|^    if lane_gh_mutates "\$@"; then$|    if false; then|' retry-never-repeats-a-write
 mutant "the recording bypasses the retry" cases_retry "$FETCH" \
   's|^  lane_gh_retry "\$@" >"\$LANE_RECORD/\$n\.out"|  command gh "$@" >"$LANE_RECORD/$n.out"|' retry-recorded-as-answered
 

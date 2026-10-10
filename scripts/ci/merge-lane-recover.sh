@@ -28,10 +28,15 @@
 #                and `repository_dispatch` are the documented exceptions to
 #                "a GITHUB_TOKEN event triggers no workflow").
 #
-# ONE dispatch, never a loop: the job runs only when the failed pass was NOT
-# itself a dispatched one (`github.event_name != 'workflow_dispatch'`), so a
-# pass that keeps failing — a revoked key — is red on the dispatched run and
-# goes no further.
+# ONE dispatch, never a loop. The dispatch carries `inputs.recovered=true`, and the
+# job does not run when the failed pass was itself dispatched
+# (`github.event_name == 'workflow_dispatch'`, or `github.event.inputs.recovered`
+# is set) or was started by the completion of a dispatched run
+# (`github.event.workflow_run.event == 'workflow_dispatch'`, the shape a
+# recover-workflow that is a CI workflow takes). A pass that keeps failing — a
+# revoked key — is red on the dispatched run and goes no further. The target
+# must therefore declare a `recovered` string input under `workflow_dispatch`;
+# GitHub refuses (422) a dispatch with an input the workflow does not declare.
 #
 # curl, not `gh`, in `dispatch`: the pool images do not ship `gh` and this job
 # does not install it.
@@ -57,12 +62,13 @@ recover_wait() {
 
 api() { # <method> <path> [body] — prints the HTTP status; the body goes to $RECOVER_BODY
   local method="$1" path="$2" body="${3:-}"
-  local -a args=(-sS -o "$RECOVER_BODY" -w '%{http_code}' -X "$method"
-    -H "Authorization: Bearer $DISPATCH_TOKEN"
+  local -a args=(-sS -o "$RECOVER_BODY" -w '%{http_code}' -X "$method" --config -
     -H 'Accept: application/vnd.github+json'
     -H 'X-GitHub-Api-Version: 2022-11-28')
   [ -z "$body" ] || args+=(-d "$body")
-  curl "${args[@]}" "${GITHUB_API_URL:-https://api.github.com}/$path"
+  # The token travels on stdin (`--config -`), never in argv, where `ps` and /proc
+  # would show it to every process on the host.
+  curl "${args[@]}" "${GITHUB_API_URL:-https://api.github.com}/$path" <<<"header = \"Authorization: Bearer $DISPATCH_TOKEN\""
 }
 
 read_reset() {
@@ -96,9 +102,9 @@ dispatch() {
   fi
   # The ref is spliced into a JSON body, so it is held to a branch name's shape.
   [[ "$ref" =~ ^[A-Za-z0-9._/-]+$ ]] || die "default branch '$ref' is not a plain branch name"
-  code="$(api POST "repos/$repo/actions/workflows/$wf/dispatches" "{\"ref\":\"$ref\"}")"
+  code="$(api POST "repos/$repo/actions/workflows/$wf/dispatches" "{\"ref\":\"$ref\",\"inputs\":{\"recovered\":\"true\"}}")"
   if [ "$code" != 204 ]; then
-    die "dispatching $wf on $ref was refused (HTTP $code): $(head -c 300 "$RECOVER_BODY"). A 403 is a caller that did not grant 'actions: write' to the reusable workflow's job; a 404 is a repository with no $wf."
+    die "dispatching $wf on $ref was refused (HTTP $code): $(head -c 300 "$RECOVER_BODY"). A 403 is a caller that did not grant 'actions: write' to the reusable workflow's job; a 404 is a repository with no $wf; a 422 is a $wf that does not declare the 'recovered' workflow_dispatch input (type: string) the recovery marks its pass with."
   fi
   echo "merge-lane-recover: dispatched $wf on $ref"
 }

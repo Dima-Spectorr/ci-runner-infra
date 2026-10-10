@@ -1123,7 +1123,14 @@ recovers_a_failed_pass() {
   code=$(code_of "$1")
   matches "$code" '^  recover:$' || return 1
   matches "$code" '^    needs: \[lane\]$' || return 1
-  matches "$code" "^    if: \\$\{\{ always\(\) && needs\.lane\.result == 'failure' && github\.event_name != 'workflow_dispatch' \}\}$" || return 1
+  matches "$code" "^    if: \\$\{\{ always\(\) && needs\.lane\.result == 'failure' && " || return 1
+  matches "$code" "^    if: .* && github\\.event_name != 'workflow_dispatch' && " || return 1
+  # The marker the recovery dispatch sets, and the event of a completed run that
+  # a CI recover-workflow re-triggers the lane with: the loop guard's other arms.
+  matches "$code" "^    if: .* && github\\.event\\.inputs\\.recovered != 'true' && " || return 1
+  matches "$code" "^    if: .* && github\\.event\\.workflow_run\\.event != 'workflow_dispatch' && " || return 1
+  # An outside contributor's draft/ready toggle must not hold the repo-wide group.
+  matches "$code" "^    if: .* && !\\(github\\.event_name == 'pull_request_target' && github\\.event\\.pull_request\\.head\\.repo\\.full_name != github\\.repository\\) \\}\\}\$" || return 1
   matches "$code" '^      actions: write$' || return 1
   matches "$code" '^          DISPATCH_TOKEN: \$\{\{ github\.token \}\}$' || return 1
   matches "$code" '^          RECOVER_WORKFLOW: \$\{\{ inputs\.recover-workflow \}\}$' || return 1
@@ -1158,6 +1165,8 @@ for ((i = 0; i < ${#args[@]}; i++)); do
   url="${args[i]}"
 done
 printf '%s\n' "$*" >>"$STUB_DIR/curl"
+# What arrives on stdin (`--config -`) is kept apart from argv.
+[ -t 0 ] || cat >>"$STUB_DIR/stdin"
 case "$url" in
   */dispatches) : >"$out"; printf '%s' "${STUB_DISPATCH_CODE:-204}" ;;
   */repos/*) printf '{"name":"r","default_branch":"trunk"}' >"$out"; printf 200 ;;
@@ -1166,10 +1175,10 @@ esac
 STUB
   chmod +x "$d/bin/sleep" "$d/bin/curl"
   rrun() { # <VAR=value>... — runs `dispatch` with those settings
-    rm -f "$d/slept" "$d/curl"
+    rm -f "$d/slept" "$d/curl" "$d/stdin"
     (
       export STUB_DIR="$d" PATH="$d/bin:$PATH" GITHUB_REPOSITORY=o/r \
-        GITHUB_API_URL=https://api.test DISPATCH_TOKEN=t \
+        GITHUB_API_URL=https://api.test DISPATCH_TOKEN=tok-SECRET-9f3a \
         RECOVER_WORKFLOW=merge-lane-events.yml DEFAULT_BRANCH=main APP_RESET='' \
         STUB_DISPATCH_CODE=204
       for kv in "$@"; do export "${kv?}"; done
@@ -1182,7 +1191,7 @@ STUB
   rrun; rc=$?
   [ "$rc" -eq 0 ] && [ "$(cat "$d/slept" 2>/dev/null)" = 60 ] \
     && grep -q 'repos/o/r/actions/workflows/merge-lane-events.yml/dispatches' "$d/curl" \
-    && grep -qF -- '-d {"ref":"main"}' "$d/curl"
+    && grep -qF -- '-d {"ref":"main","inputs":{"recovered":"true"}}' "$d/curl"
   res recover-floor-then-one-dispatch $?
 
   rrun "APP_RESET=$((now + 300))"; rc=$?
@@ -1195,7 +1204,7 @@ STUB
   res recover-wait-is-capped $?
 
   rrun DEFAULT_BRANCH=
-  grep -qF -- '-d {"ref":"trunk"}' "$d/curl"
+  grep -qF -- '-d {"ref":"trunk","inputs":{"recovered":"true"}}' "$d/curl"
   res recover-reads-the-default-branch $?
 
   rrun STUB_DISPATCH_CODE=403; rc=$?
@@ -1205,6 +1214,12 @@ STUB
   rrun 'RECOVER_WORKFLOW=../x.yml'; rc=$?
   [ "$rc" -ne 0 ] && [ ! -e "$d/curl" ]
   res recover-workflow-name-checked $?
+
+  # The token reaches curl on stdin, never in argv where `ps` shows it.
+  rrun
+  ! grep -qF -- tok-SECRET-9f3a "$d/curl" && grep -qF -- tok-SECRET-9f3a "$d/stdin" \
+    && grep -qF -- 'Authorization: Bearer tok-SECRET-9f3a' "$d/stdin"
+  res recover-token-not-in-argv $?
 
   rm -rf "$d"
 }
@@ -3614,7 +3629,15 @@ check documented_callers_grant_the_dispatch "$DOC" "the documented callers do no
 mutate "a cancelled (evicted) lane run is recovered" "$CALLEE" \
   "s@needs\.lane\.result == 'failure'@needs.lane.result != 'success'@" recovers_a_failed_pass
 mutate "a dispatched pass is recovered again, so a failing lane loops" "$CALLEE" \
-  "s@ && github\.event_name != 'workflow_dispatch' }}@ }}@" recovers_a_failed_pass
+  "s@ && github\.event_name != 'workflow_dispatch'@@" recovers_a_failed_pass
+mutate "a pass marked as recovered is recovered again" "$CALLEE" \
+  "s@ && github\.event\.inputs\.recovered != 'true'@@" recovers_a_failed_pass
+mutate "a pass started by a dispatched run's completion is recovered again" "$CALLEE" \
+  "s@ && github\.event\.workflow_run\.event != 'workflow_dispatch'@@" recovers_a_failed_pass
+mutate "a fork's draft/ready toggle can hold the merge-lane group" "$CALLEE" \
+  "s@ && !(github\.event_name == 'pull_request_target' && github\.event\.pull_request\.head\.repo\.full_name != github\.repository)@@" recovers_a_failed_pass
+mutate "the fork guard compares the wrong repository" "$CALLEE" \
+  "s@head\.repo\.full_name != github\.repository@head.repo.full_name != github.event.repository.full_name@" recovers_a_failed_pass
 mutate "the dispatch is made with the App's exhausted token" "$CALLEE" \
   's@DISPATCH_TOKEN: \${{ github\.token }}@DISPATCH_TOKEN: ${{ secrets.app-private-key }}@' recovers_a_failed_pass
 mutate "the recover job may not dispatch" "$CALLEE" \
@@ -3627,7 +3650,7 @@ mutate "a caller example drops the grant" "$DOC" \
   '0,/^      actions: write$/{/^      actions: write$/d}' documented_callers_grant_the_dispatch
 
 _rc_out="$(recover_cases "$RECOVER")"
-[ "$(printf '%s\n' "$_rc_out" | grep -c '^PASS ')" -eq 6 ] || bad "recover cases: expected 6 PASS lines, got: $(printf '%s' "$_rc_out" | tr '\n' ' ')"
+[ "$(printf '%s\n' "$_rc_out" | grep -c '^PASS ')" -eq 7 ] || bad "recover cases: expected 7 PASS lines, got: $(printf '%s' "$_rc_out" | tr '\n' ' ')"
 while IFS= read -r _rc_line; do
   case "$_rc_line" in
     PASS\ *) ok ;;
@@ -3638,6 +3661,8 @@ recover_mutant "the wait has no floor" 's@^RECOVER_MIN_WAIT=60$@RECOVER_MIN_WAIT
 recover_mutant "the window is ignored" 's@^    w=\$((reset - now + 5))$@    :@' recover-waits-for-the-window
 recover_mutant "the wait is uncapped" 's@^RECOVER_MAX_WAIT=900$@RECOVER_MAX_WAIT=99999@' recover-wait-is-capped
 recover_mutant "an unset default branch is not looked up" 's@^  if \[ -z "\$ref" \]; then$@  ref="${ref:-main}"; if false; then@' recover-reads-the-default-branch
+recover_mutant "the token goes back into curl argv" 's@-X "$method" --config -$@-X "$method" -H "Authorization: Bearer $DISPATCH_TOKEN"@' recover-token-not-in-argv
+recover_mutant "the dispatch no longer marks its pass" 's@,\\"inputs\\":{\\"recovered\\":\\"true\\"}@@' recover-floor-then-one-dispatch
 recover_mutant "a refused dispatch ends green" 's@^  if \[ "\$code" != 204 \]; then$@  if false; then@' recover-refusal-is-red
 recover_mutant "any workflow name is posted" 's@^  \[\[ "\$wf" =~ .*@  :@' recover-workflow-name-checked
 

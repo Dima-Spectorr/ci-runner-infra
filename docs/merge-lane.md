@@ -421,6 +421,16 @@ on:
   schedule:
     - cron: '17 5 * * *'
   workflow_dispatch:
+    # The `recover` job dispatches this file with `recovered: "true"` after a
+    # FAILED pass. GitHub refuses (422) a dispatch carrying an input the
+    # workflow does not declare, so it must be declared here. Nothing reads it
+    # in this file: the lane job's `if:` reads `github.event.inputs.recovered`.
+    inputs:
+      recovered:
+        description: Set by the lane's recover job on the one pass it dispatches
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -1122,11 +1132,36 @@ at most what the caller's job grants, so both caller examples above carry
 with a 403 and says so; the lane itself is unaffected.
 
 **One dispatch, never a loop.** The recovery's pass arrives as
-`workflow_dispatch`, and a failed dispatched pass is not recovered again. A pass
+`workflow_dispatch` carrying `inputs.recovered: "true"`, and a failed dispatched
+pass is not recovered again. `github` in a reusable workflow is the CALLER's
+context, so `recover` can read three things, and skips on any of them: the event
+name (`workflow_dispatch`), the marker (`github.event.inputs.recovered`), and
+`github.event.workflow_run.event == 'workflow_dispatch'`. The last is the loop
+a `recover-workflow` that is a CI workflow would otherwise make: its completion
+re-triggers the lane by `workflow_run`, which is neither a dispatch nor carries
+the input, but whose payload names the event of the run that completed. A pass
 that keeps failing (a revoked key, a removed App) is red on that run and the
 watchdog, after its own cap, reports it. A `cancelled` lane run is not
 recovered either: it is a pending pass evicted by a newer arrival, which reads
 live state.
+
+**Consumer change: declare the `recovered` input.** The dispatch sets
+`inputs.recovered`, and the REST API answers 422 to an input the target workflow
+does not declare, so the `recover-workflow` file (default
+`merge-lane-events.yml`) needs `workflow_dispatch: inputs: recovered:` as in the
+example above — a string, optional, never read by anything but the lane's `if:`.
+Without it the dispatch is refused with a 422 the log names and the lane is
+unaffected. A `recover-workflow` is expected to be the events file: pointing it
+at a CI workflow works only because of the `workflow_run` arm above.
+
+**A fork cannot hold the lock.** `recover` does not run for a `pull_request_target`
+event whose head repository is not this one (`github.event.pull_request.head.repo.full_name
+!= github.repository`; a deleted fork reads as a fork). Without it an outside
+contributor could toggle their own pull request between draft and ready to start
+lane runs, and each failing one would hold the repository-wide `merge-lane`
+concurrency group through the wait of up to 900s. The pass itself still runs
+and its failure is still red; only the recovery is skipped, and the watchdog
+and the next CI completion cover it.
 
 **The wait holds the caller's lock.** The caller job's `concurrency` group
 covers the whole called workflow, `recover` included, so other passes queue
@@ -1136,9 +1171,13 @@ App's window reopens would fail the same way.
 **Inside a pass, a rate-limited call is made once more** when the window
 reopens soon: a secondary limit (asks for a minute), or a primary one whose
 reset is under 90s away and inside the pass budget. Every `gh` call goes
-through `lane_gh_retry` in `merge-lane-fetch.sh` — live, recorded and written
-alike; a refused call was not carried out, so making a write again does not make
-it twice. Anything longer fails as before and is left to `recover`.
+through `lane_gh_retry` in `merge-lane-fetch.sh`, but only a READ is made again.
+A write (`gh api -X ...`, `-f`, `--input`: `PUT pulls/N/merge` above all) is
+attempted once, because the wait can be up to 90s and what the lane decided on
+(reviews, labels, the base) can change in it; repeating the merge afterwards
+would merge on a verdict nobody re-checked. A refused write ends the pass, and
+`recover` dispatches another that decides again from live state. Anything
+longer than the wait fails as before and is left to `recover`.
 
 ### A label applied after the green
 

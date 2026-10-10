@@ -509,7 +509,9 @@ on:
           The workflow file the `recover` job dispatches, once, after a lane
           pass FAILS — on the default branch, after the merge App's quota
           window reopens (at least 60s, at most 900s). It must call this
-          workflow and accept `workflow_dispatch`. The calling job must grant
+          workflow and accept `workflow_dispatch` with a string input named
+          `recovered` (the dispatch marks its pass with it; GitHub refuses an
+          undeclared input). The calling job must grant
           `actions: write` (and `contents: read`) for the dispatch to be
           allowed.
         required: false
@@ -664,6 +666,17 @@ jobs:
   # the recovery's own pass included — so a pass that keeps failing (a revoked
   # key) cannot become a dispatch loop.
   #
+  # The loop guard is three conditions, because `github` here is the CALLER's context:
+  # the event name (a dispatched pass), `github.event.inputs.recovered` (the marker
+  # the dispatch sets, for a pass reached some other way), and
+  # `github.event.workflow_run.event` (a recover-workflow that is a CI workflow
+  # re-triggers the lane by `workflow_run`, whose payload names the event of the
+  # run that completed). And never for a pull_request_target event from a FORK:
+  # an outside contributor can toggle draft/ready on their own pull request to
+  # start lane runs, and a failing one would hold the repo-wide merge-lane group
+  # for the wait. A deleted fork reads as a fork (null != this repository), so
+  # that arm fails closed.
+  #
   # The dispatch uses the run's GITHUB_TOKEN, not the App: the App's budget is
   # what just ran out, and GITHUB_TOKEN draws on the repository's own. That is
   # the one write this token makes, so it arrives as DISPATCH_TOKEN and never as
@@ -678,7 +691,7 @@ jobs:
   recover:
     name: Recover a failed lane pass
     needs: [lane]
-    if: ${{ always() && needs.lane.result == 'failure' && github.event_name != 'workflow_dispatch' }}
+    if: ${{ always() && needs.lane.result == 'failure' && github.event_name != 'workflow_dispatch' && github.event.inputs.recovered != 'true' && github.event.workflow_run.event != 'workflow_dispatch' && !(github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository) }}
     # dynamic-runner-allowed(recover, #402): the same caller-scoped label as the lane job
     runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
     # The wait is capped at 900s; the rest is the checkout and one POST.
