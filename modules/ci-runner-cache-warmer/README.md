@@ -18,7 +18,7 @@ Next to the pool, once per repository:
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.111.2"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.112.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -41,6 +41,7 @@ build**, and that is deliberate: the warm reads the repository.
 |---|---|
 | package manager | the lockfile — `pnpm-lock.yaml`, `yarn.lock`, `package-lock.json`, else a bare `package.json`. `corepack` is enabled for the first two, so the version the repository pins is the version that installs. |
 | the install | that manager's frozen-lockfile install, **without lifecycle scripts** for the snapshot, **with** them for the build step (see below) |
+| which tasks | `turbo_tasks`, `["build"]` by default. List every task a pull-request job reads from the pool (for example `["build", "typecheck", "lint"]`). A task the warm does not run is never published, so the job that runs it is cold on every pull request. This is the one build input a root sets, and it is a list of task names, not a command: the install and `--cache-dir` stay the module's. |
 | where turbo writes | the module passes `--cache-dir` itself, from `turbo_cache_dir`, so it cannot drift from where the publishing step looks — a repository whose own CI builds with `--cache-dir=.turbo` still overrides nothing |
 
 The rest of the defaults: nightly at 04:00 UTC, `node:22`, `E2_HIGHCPU_8`, a
@@ -48,13 +49,20 @@ one-hour timeout. `build_command = "true"` gives you the dependency snapshot and
 no build artifacts, which is the right setting for a repository with no turbo
 pipeline.
 
+The default build runs `turbo run <turbo_tasks> --continue=dependencies-successful`,
+so one failed task does not cancel the tasks queued behind it, while a task whose
+dependency failed is skipped rather than cached as a pass. If the repository's own CI raises
+node's heap for these tasks, set `build_node_max_old_space_mb` to the same value
+and size `machine_type` to fit. Node sizes its default heap from system RAM, and
+warm `f69cde75` (2026-10-02) lost a bundle to exit 134 on `E2_HIGHCPU_8`.
+
 `prepare_command` and `build_command` are still there, and the honest advice is
 not to use them. A command written here is a claim in a Terraform root about a
 repository that can change package managers without telling it, and a stale
 claim does not fail the apply — it fails inside a nightly build, or succeeds
 having installed nothing. Both read from the outside as a cache that is merely
 cold. Override only for a repository whose build genuinely is not
-`turbo run build`, and expect to revisit it.
+`turbo run <tasks>`, and expect to revisit it.
 
 **Every install gets one retry, fifteen seconds apart.** The warm fires
 unattended at 04:00, the fleet's hosts share one egress IP, and the next fire is

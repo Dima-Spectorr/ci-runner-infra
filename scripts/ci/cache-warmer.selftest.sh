@@ -508,6 +508,35 @@ if retries_each_install "$MAIN"; then ok; else
   bad "an install rung no longer survives a single network reset — the warm runs unattended at 04:00 against a shared egress IP, so one reset mid-download costs a day of stale host caches and nothing goes red"
 fi
 
+# 16. THE DEFAULT BUILD RUNS THE TASKS IT IS TOLD TO, AND ONLY TASK NAMES GET
+#     INTO THE COMMAND. A pull-request job that runs `typecheck` or `lint` reads
+#     the same pool as `build`. With `build` hard-coded, those tasks were never
+#     published and ran cold on every PR (IntegrateIT #25161). The names are
+#     joined into a shell command line, so the variable's validation is what
+#     keeps a `;` or `$(` out of it.
+runs_declared_tasks() { # <main.tf>
+  matches "$(code_of "$1")" 'turbo run \$\{join\(" ", var\.turbo_tasks\)\} \-\-continue=dependencies-successful \-\-cache-dir=' || return 1
+  ! matches "$(code_of "$1")" 'turbo run build \-\-cache-dir='
+}
+
+validates_task_names() { # <variables.tf>
+  local blk
+  blk=$(block_of "$1" turbo_tasks)
+  [ -n "$blk" ] || return 1
+  matches "$blk" 'default[[:space:]]*=[[:space:]]*\["build"\]' || return 1
+  matches "$blk" 'length\(var\.turbo_tasks\) > 0 && alltrue' || return 1
+  # The allowed set, verbatim. Widening it is a deliberate edit to this line too.
+  printf '%s\n' "$blk" | grep -qF '"^[A-Za-z0-9][A-Za-z0-9:#@._/-]{0,127}$"'
+}
+
+if runs_declared_tasks "$MAIN"; then ok; else
+  bad "the default build no longer runs var.turbo_tasks — a task a pull-request job reads from the pool is never warmed, and that job runs cold on every PR with nothing red"
+fi
+
+if validates_task_names "$VARS"; then ok; else
+  bad "turbo_tasks lost its default or its name validation — the names are joined into the build step's shell command, so an unvalidated entry is a second command"
+fi
+
 # --- mutations -----------------------------------------------------------------
 
 mutate() { # <description> <file> <sed-program> <predicate>
@@ -724,6 +753,24 @@ mutate "the pause between the two attempts removed" "$MAIN" \
 mutate "the retry written through a shell function" "$MAIN" \
   's|sleep 15; ${cmd}; }|sleep 15; \\"$@\\"; }|' \
   retries_each_install
+
+mutate "the default build hard-codes build again" "$MAIN" \
+  's@turbo run ${join(" ", var\.turbo_tasks)} --continue=dependencies-successful --cache-dir=@turbo run build --cache-dir=@' \
+  runs_declared_tasks
+
+mutate "the task-name validation widened to anything" "$VARS" \
+  's@\^\[A-Za-z0-9\]\[A-Za-z0-9:#\@._/-\]{0,127}\$@.*@' \
+  validates_task_names
+
+mutate "the task list run without --continue" "$MAIN" \
+  's@ --continue=dependencies-successful --cache-dir=@ --cache-dir=@' \
+  runs_declared_tasks
+
+# A bare --continue means `always`: a lint or typecheck whose ^build failed still
+# runs, and a false pass is cached under the right hash for every PR to replay.
+mutate "the task list run with a bare --continue" "$MAIN" \
+  's@ --continue=dependencies-successful --cache-dir=@ --continue --cache-dir=@' \
+  runs_declared_tasks
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

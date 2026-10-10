@@ -487,9 +487,25 @@ locals {
   # The `;` is load-bearing and is asserted by the self-test: the ladder ends in
   # `fi`, and `fi npx …` is a syntax error the whole build step dies on before
   # anything runs — a green apply, a red nightly build, an empty cache.
+  #
+  # The task list is `var.turbo_tasks`, joined with spaces. Each name is
+  # validated to a character set with no shell metacharacter in it, so the
+  # join cannot become a second command. A pull-request job that runs
+  # `typecheck` or `lint` reads its cache from the same pool as `build`, so a
+  # warm that only ran `build` left those jobs cold on every run.
+  #
+  # `--continue=dependencies-successful` keeps one failed task from cancelling
+  # every task not yet started. Measured on warm `f69cde75` (2026-10-02): one package's build hit
+  # the heap limit, and with more tasks queued behind it that would have
+  # cancelled every typecheck and lint task left. A failed task is never
+  # cached, so continuing publishes only tasks that succeeded. Not a bare
+  # `--continue` (= `always`): that still runs a `typecheck` or `lint` whose
+  # `^build` failed, and a pass against a missing upstream dist would be cached
+  # under the correct hash and replayed to every pull request. The build step
+  # already tolerates a non-zero exit (see the step below).
   build_command = coalesce(var.build_command, join(" ", [
     "${local.install_full};",
-    "npx --no-install turbo run build --cache-dir=${local.turbo_cache_dir_arg}",
+    "npx --no-install turbo run ${join(" ", var.turbo_tasks)} --continue=dependencies-successful --cache-dir=${local.turbo_cache_dir_arg}",
   ]))
 
   # Single-quoted so a directory with a space or a glob character in it is one
@@ -752,12 +768,21 @@ resource "google_cloudbuild_trigger" "warm" {
       id     = "build"
       name   = var.build_image
       script = "#!/usr/bin/env bash\n${local.build_command} || echo '[warm] build failed; publishing what it produced'\n"
-      env = [
+      #    NODE_OPTIONS raises V8's heap ceiling only when a root asks for it.
+      #    Node sizes its default heap from system RAM, so a type-aware lint or a
+      #    large bundle that passes on a 16 GB runner can abort on this machine
+      #    with exit 134. Turbo stops on that first failure, and every task not
+      #    yet started is never published. NODE_OPTIONS is not part of a task
+      #    hash unless a repository declares it, so raising it here does not
+      #    change which hashes the warm publishes.
+      env = concat([
         "TURBO_TELEMETRY_DISABLED=1",
         "CI=true",
         "WARM_TURBO_DIR=${var.turbo_cache_dir}",
         "TURBO_CACHE_DIR=${var.turbo_cache_dir}",
-      ]
+        ], var.build_node_max_old_space_mb == null ? [] : [
+        "NODE_OPTIONS=--max-old-space-size=${var.build_node_max_old_space_mb}",
+      ])
     }
 
     # 3. THE TURBO ARTIFACTS.
