@@ -763,6 +763,10 @@ cases_wait() {
 # only when that wait fits under the cap and inside the pass budget. Anything
 # else — a refusal that is not a rate limit, a window far off — is the caller's
 # answer at once; the `recover` job dispatches a pass after a long window.
+# SC2034: the LANE_* globals are read by the sourced fetch file. SC2317: the
+# sleep stub is called by lane_gh_retry. SC2181: each case asserts on the exit
+# code of a call whose output and stderr it also inspects.
+# shellcheck disable=SC2034,SC2317,SC2181
 cases_retry() { # <fetch-file>
   (
     # shellcheck source=/dev/null
