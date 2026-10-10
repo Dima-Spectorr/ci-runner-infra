@@ -532,7 +532,7 @@ validates_task_names() { # <variables.tf>
   matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*null[[:space:]]*$' || return 1
   matches "$blk" 'var\.turbo_tasks == null \? true : \(length\(var\.turbo_tasks\) > 0 && alltrue' || return 1
   # The allowed set, verbatim. Widening it is a deliberate edit to this line too.
-  printf '%s\n' "$blk" | grep -qF '"^[A-Za-z0-9][A-Za-z0-9:#@._/-]{0,127}$"'
+  printf '%s\n' "$blk" | grep -cF -- '"^[A-Za-z0-9][A-Za-z0-9:#@._/-]{0,127}$"' >/dev/null
 }
 
 if runs_declared_tasks "$MAIN"; then ok; else
@@ -572,7 +572,7 @@ excludes_by_default() { # <variables.tf>
   matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*\["test\*", "e2e\*", "deploy\*", "release\*", "publish\*", "\*migrate\*", "clean\*"\]' || return 1
   # Validated to a glob character set with no quote in it: each entry is pasted
   # between single quotes on the build step's command line.
-  printf '%s\n' "$blk" | grep -qF '"^[A-Za-z0-9*?][A-Za-z0-9*?:#@._/-]{0,127}$"'
+  printf '%s\n' "$blk" | grep -cF -- '"^[A-Za-z0-9*?][A-Za-z0-9*?:#@._/-]{0,127}$"' >/dev/null
 }
 
 derivation_is_safe() { # <derive-turbo-tasks.cjs>
@@ -582,7 +582,7 @@ derivation_is_safe() { # <derive-turbo-tasks.cjs>
   matches "$code" 'else if \(!info\.cached\) why = "cache: false";' || return 1
   matches "$code" 'if \(d\.cache !== false\) cur\.cached = true;' || return 1
   matches "$code" 'if \(d\.persistent === true\) cur\.persistent = true;' || return 1
-  printf '%s\n' "$code" | grep -qF 'const SAFE = /^[A-Za-z0-9][A-Za-z0-9:#@._\/-]{0,127}$/;' || return 1
+  printf '%s\n' "$code" | grep -cF -- 'const SAFE = /^[A-Za-z0-9][A-Za-z0-9:#@._\/-]{0,127}$/;' >/dev/null || return 1
   matches "$code" 'else if \(!SAFE\.test\(name\)\) why = "not a safe task name";' || return 1
   matches "$code" 'typeof declared !== "object" \|\| Array\.isArray\(declared\)' || return 1
   matches "$code" 'say\("tasks derived from "' || return 1
