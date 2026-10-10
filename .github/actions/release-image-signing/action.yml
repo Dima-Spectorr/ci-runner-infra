@@ -1,0 +1,138 @@
+# Release image signing — one step every product's release workflow calls to
+# sign its released image digests and prove the signatures, identically.
+#
+# A COMPOSITE ACTION, NOT A REUSABLE WORKFLOW, and the reason is the trust
+# condition, not style. Each product's signer is reachable only through a
+# Workload Identity provider whose attribute condition includes
+#
+#   assertion.job_workflow_ref.startsWith('<owner>/<repo>/<release_workflow>@refs/tags/v')
+#
+# (Specaria-Platform infra/terraform/customer/specaria/gcp-image-signing/
+# signing.tf, `release_token_condition`). A job inside a reusable workflow gets
+# the CALLEE's job_workflow_ref — `<owner>/ci-runner-infra/.github/workflows/...`
+# — so the provider would refuse its token, and making it accept that token
+# would let every repository that calls the shared workflow reach the signer.
+# A composite action runs as steps of the CALLER's job, whose job_workflow_ref
+# stays the product's own release workflow on its own tag, so the condition is
+# kept exactly as it is.
+#
+# THE CALLER'S JOB needs `permissions: id-token: write`, `gcloud` with the
+# `beta` component, `python3` and `openssl` on PATH (all present on
+# GitHub-hosted Ubuntu runners and the full cloud-sdk image), and the committed
+# public key PEM checked out.
+#
+# After this action the job's active Google credential IS the signer. Call it
+# last in the job, or re-authenticate before any later Google call.
+#
+# Contract, inputs and onboarding: docs/release-image-signing.md.
+name: Release image signing
+description: >-
+  Sign every released image digest with the product's release signer
+  (Binary Authorization sign-and-create via Workload Identity Federation), then
+  verify each attestation's signature against the committed public key for that
+  exact digest. Fails closed when required; a notice and no-op when not
+  required and unconfigured.
+
+inputs:
+  digests:
+    description: Digest-pinned image refs (`repo/name@sha256:<64 hex>`), separated by spaces or newlines.
+    required: false
+    default: ''
+  digests-file:
+    description: Path to a file of digest-pinned refs, one per line (blank lines and `#` comments ignored). Combined with `digests`.
+    required: false
+    default: ''
+  expected-count:
+    description: Optional. When set, the number of refs must equal it, so a release that lost an image fails instead of signing the rest.
+    required: false
+    default: ''
+  wif-provider:
+    description: Full resource name of the product's release-signing Workload Identity provider.
+    required: false
+    default: ''
+  signer-sa:
+    description: Email of the product's release signer service account.
+    required: false
+    default: ''
+  attestor:
+    description: Attestor name, bare or `projects/<project>/attestors/<name>`.
+    required: false
+    default: ''
+  attestor-project:
+    description: Project that owns the attestor (the signing project). May be empty only when `attestor` is fully qualified.
+    required: false
+    default: ''
+  key-version:
+    description: Full KMS crypto key VERSION resource name the signer signs with.
+    required: false
+    default: ''
+  public-key-pem:
+    description: Path (relative to the workspace) of the COMMITTED public key every attestation must verify against.
+    required: false
+    default: ''
+  previous-public-key-pem:
+    description: Optional second committed key, accepted ONLY during a key-rotation overlap window.
+    required: false
+    default: ''
+  required:
+    description: >-
+      `true` when this release may not publish unsigned (typically
+      RELEASE_SIGNING_REQUIRED=true on a stable tag). A missing input then fails
+      the step. `false`: unconfigured is a notice and a no-op.
+    required: false
+    default: 'false'
+
+outputs:
+  armed:
+    description: '`true` when every signing input was set and the step signed; `false` when it was skipped.'
+    value: ${{ steps.decide.outputs.armed }}
+  signed:
+    description: '`true` only when every digest carries an attestation whose signature verified against the committed key.'
+    value: ${{ steps.sign.outputs.signed == 'true' && 'true' || 'false' }}
+
+runs:
+  using: composite
+  steps:
+    # Every input reaches the shell through `env:`, never by `${{ }}` inside
+    # `run:` — a value is data to the script, not text spliced into it.
+    - name: Decide release signing
+      id: decide
+      shell: bash
+      env:
+        RIS_DIGESTS: ${{ inputs.digests }}
+        RIS_DIGESTS_FILE: ${{ inputs.digests-file }}
+        RIS_EXPECTED_COUNT: ${{ inputs.expected-count }}
+        RIS_WIF_PROVIDER: ${{ inputs.wif-provider }}
+        RIS_SIGNER_SA: ${{ inputs.signer-sa }}
+        RIS_ATTESTOR: ${{ inputs.attestor }}
+        RIS_ATTESTOR_PROJECT: ${{ inputs.attestor-project }}
+        RIS_KEY_VERSION: ${{ inputs.key-version }}
+        RIS_PUBLIC_KEY_PEM: ${{ inputs.public-key-pem }}
+        RIS_PUBLIC_KEY_PEM_PREVIOUS: ${{ inputs.previous-public-key-pem }}
+        RIS_REQUIRED: ${{ inputs.required }}
+      run: bash "$GITHUB_ACTION_PATH/release-image-signing.sh" decide
+
+    - name: Authenticate as the release signer
+      if: steps.decide.outputs.armed == 'true'
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ inputs.wif-provider }}
+        service_account: ${{ inputs.signer-sa }}
+
+    - name: Sign and verify released image digests
+      id: sign
+      if: steps.decide.outputs.armed == 'true'
+      shell: bash
+      env:
+        RIS_DIGESTS: ${{ inputs.digests }}
+        RIS_DIGESTS_FILE: ${{ inputs.digests-file }}
+        RIS_EXPECTED_COUNT: ${{ inputs.expected-count }}
+        RIS_WIF_PROVIDER: ${{ inputs.wif-provider }}
+        RIS_SIGNER_SA: ${{ inputs.signer-sa }}
+        RIS_ATTESTOR: ${{ inputs.attestor }}
+        RIS_ATTESTOR_PROJECT: ${{ inputs.attestor-project }}
+        RIS_KEY_VERSION: ${{ inputs.key-version }}
+        RIS_PUBLIC_KEY_PEM: ${{ inputs.public-key-pem }}
+        RIS_PUBLIC_KEY_PEM_PREVIOUS: ${{ inputs.previous-public-key-pem }}
+        RIS_REQUIRED: ${{ inputs.required }}
+      run: bash "$GITHUB_ACTION_PATH/release-image-signing.sh" sign
