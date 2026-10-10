@@ -19,10 +19,12 @@
 # THE CALLER'S JOB needs `permissions: id-token: write`, `gcloud` with the
 # `beta` component, `python3` and `openssl` on PATH (all present on
 # GitHub-hosted Ubuntu runners and the full cloud-sdk image), and the committed
-# public key PEM checked out.
+# public key PEM checked out and committed (git-tracked).
 #
-# After this action the job's active Google credential IS the signer. Call it
-# last in the job, or re-authenticate before any later Google call.
+# The signer's credential does NOT outlive this action. The auth step mints a
+# short-lived access token only — no credentials file, no exported GOOGLE_* or
+# CLOUDSDK_* variable — and the token reaches the sign step alone, through its
+# `env:`. Later steps of the caller's job keep whatever identity they had.
 #
 # Contract, inputs and onboarding: docs/release-image-signing.md.
 name: Release image signing
@@ -112,12 +114,18 @@ runs:
         RIS_REQUIRED: ${{ inputs.required }}
       run: bash "$GITHUB_ACTION_PATH/release-image-signing.sh" decide
 
+    # Token only: no gha-creds-*.json in the workspace and nothing exported to
+    # GITHUB_ENV, so no later step of the caller's job inherits the signer.
     - name: Authenticate as the release signer
+      id: auth
       if: steps.decide.outputs.armed == 'true'
       uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
       with:
         workload_identity_provider: ${{ inputs.wif-provider }}
         service_account: ${{ inputs.signer-sa }}
+        token_format: access_token
+        create_credentials_file: false
+        export_environment_variables: false
 
     - name: Sign and verify released image digests
       id: sign
@@ -135,4 +143,7 @@ runs:
         RIS_PUBLIC_KEY_PEM: ${{ inputs.public-key-pem }}
         RIS_PUBLIC_KEY_PEM_PREVIOUS: ${{ inputs.previous-public-key-pem }}
         RIS_REQUIRED: ${{ inputs.required }}
+        # The ONLY place the signer's token appears. The script hands it to
+        # gcloud as a 0600 file in its own temp dir and removes it on exit.
+        RIS_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
       run: bash "$GITHUB_ACTION_PATH/release-image-signing.sh" sign

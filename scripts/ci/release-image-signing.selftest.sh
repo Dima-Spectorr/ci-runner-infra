@@ -6,13 +6,18 @@
 #
 # What must hold, each as a case below:
 #   - a good signature over the right digest, against the committed key: PASS
-#   - signed with another key:                                         FAIL
+#   - signed with another key (fresh, or an ALREADY_EXISTS one):       FAIL
 #   - the signed payload names another digest:                         FAIL
 #   - sign-and-create "succeeds" but no attestation exists:            FAIL
-#   - required and an input missing:                                   FAIL
+#   - `attestations list` itself fails:                                FAIL
+#   - required and an input missing, or no access token at sign:       FAIL
+#   - a key that is untracked by git, or not EC P-256:                 FAIL
+#   - a newline in a value, a malformed attestor name or project:      FAIL
 #   - not required and unconfigured: a notice, armed=false, and gcloud never runs
+#   - the token reaches gcloud only as a 0600 file, never as RIS_ACCESS_TOKEN,
+#     and the file is gone when the step ends
 #
-# Needs bash, python3 and openssl — present on GitHub-hosted Ubuntu runners.
+# Needs bash, git, python3 and openssl — present on GitHub-hosted Ubuntu runners.
 
 set -uo pipefail
 
@@ -26,7 +31,7 @@ bad() { echo "  FAIL  $1"; fail=1; }
 
 echo "release-image-signing self-test:"
 
-for tool in python3 openssl base64; do
+for tool in git python3 openssl base64; do
   command -v "$tool" >/dev/null 2>&1 || { echo "  FAIL  $tool is not on PATH — the self-test cannot run, which is not a pass"; exit 1; }
 done
 [ -f "$SCRIPT" ] || { echo "  FAIL  $SCRIPT is missing"; exit 1; }
@@ -35,13 +40,25 @@ T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/keys"
 
+# The script requires the committed key to be TRACKED by git, so every case
+# runs inside a throwaway repository whose index holds the test PEMs.
+REPO="$T/repo"
+git init -q "$REPO"
+mkdir -p "$REPO/keys"
+
 openssl ecparam -name prime256v1 -genkey -noout -out "$T/keys/a.key" 2>/dev/null
-openssl ec -in "$T/keys/a.key" -pubout -out "$T/keys/a.pub.pem" 2>/dev/null
+openssl ec -in "$T/keys/a.key" -pubout -out "$REPO/keys/a.pub.pem" 2>/dev/null
 openssl ecparam -name prime256v1 -genkey -noout -out "$T/keys/b.key" 2>/dev/null
-openssl ec -in "$T/keys/b.key" -pubout -out "$T/keys/b.pub.pem" 2>/dev/null
-if [ ! -s "$T/keys/a.pub.pem" ] || [ ! -s "$T/keys/b.pub.pem" ]; then
-  echo "  FAIL  could not generate test keys"; exit 1
-fi
+openssl ec -in "$T/keys/b.key" -pubout -out "$REPO/keys/b.pub.pem" 2>/dev/null
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$T/keys/rsa.key" 2>/dev/null
+openssl pkey -in "$T/keys/rsa.key" -pubout -out "$REPO/keys/rsa.pub.pem" 2>/dev/null
+cp "$REPO/keys/a.pub.pem" "$REPO/keys/untracked.pub.pem"
+for k in a b rsa untracked; do
+  [ -s "$REPO/keys/$k.pub.pem" ] || { echo "  FAIL  could not generate test key $k"; exit 1; }
+done
+git -C "$REPO" add keys/a.pub.pem keys/b.pub.pem keys/rsa.pub.pem
+git -C "$REPO" ls-files --error-unmatch -- keys/untracked.pub.pem >/dev/null 2>&1 \
+  && { echo "  FAIL  the untracked fixture key is tracked — the case below would prove nothing"; exit 1; }
 
 D1="sha256:$(printf 'one' | openssl dgst -sha256 -r | cut -c1-64)"
 D2="sha256:$(printf 'two' | openssl dgst -sha256 -r | cut -c1-64)"
@@ -51,13 +68,21 @@ REF2="registry.example.test/demo/worker@$D2"
 
 # --- the stub -----------------------------------------------------------------
 # STUB_SIGN:   good | wrongdigest | none | fail | exists
+# STUB_LIST:   ok | fail
 # STUB_KEY:    private key sign-and-create signs with
 # STUB_STORE:  directory of attestations, one JSON list per digest
-# STUB_LOG:    every invocation, one line, plus the billing project it saw
+# STUB_LOG:    every invocation, one line, plus the billing project it saw,
+#              the token file's content and mode, and whether RIS_ACCESS_TOKEN
+#              leaked into gcloud's environment
 cat > "$T/bin/gcloud" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
-echo "gcloud $* | quota=${CLOUDSDK_BILLING_QUOTA_PROJECT:-}" >> "$STUB_LOG"
+tok=""; mode=""
+if [ -n "${CLOUDSDK_AUTH_ACCESS_TOKEN_FILE:-}" ] && [ -f "$CLOUDSDK_AUTH_ACCESS_TOKEN_FILE" ]; then
+  tok="$(cat "$CLOUDSDK_AUTH_ACCESS_TOKEN_FILE")"
+  mode="$(stat -c %a "$CLOUDSDK_AUTH_ACCESS_TOKEN_FILE")"
+fi
+echo "gcloud $* | quota=${CLOUDSDK_BILLING_QUOTA_PROJECT:-} | tok=$tok mode=$mode | env=${RIS_ACCESS_TOKEN:+LEAKED}" >> "$STUB_LOG"
 args=" $* "
 url=""
 for a in "$@"; do case "$a" in --artifact-url=*) url="${a#--artifact-url=}" ;; esac; done
@@ -81,6 +106,7 @@ case "$args" in
     if [ "$STUB_SIGN" = exists ]; then echo "ERROR: (gcloud) ALREADY_EXISTS: Requested entity already exists" >&2; exit 1; fi
     exit 0 ;;
   *" attestations list "*)
+    if [ "$STUB_LIST" = fail ]; then echo "ERROR: (gcloud) PERMISSION_DENIED: containeranalysis.occurrences.list" >&2; exit 1; fi
     if [ -f "$store" ]; then cat "$store"; else echo "[]"; fi
     exit 0 ;;
 esac
@@ -92,26 +118,29 @@ chmod +x "$T/bin/gcloud"
 PROVIDER="projects/123456789012/locations/global/workloadIdentityPools/github-release-signing/providers/demo"
 SIGNER="signer-demo@signing-proj-0.iam.gserviceaccount.com"
 KEYVER="projects/signing-proj-0/locations/global/keyRings/release-image-signing/cryptoKeys/image-signing-demo-v1/cryptoKeyVersions/1"
+NL=$'\n'
 
-# run <name> <mode> [VAR=value ...] — runs the script in a clean environment
-# carrying only what the case sets, and leaves RC, OUT, GH_OUT, LOG behind.
+# run <name> <mode> [VAR=value ...] — runs the script from inside the test
+# repository in a clean environment carrying only what the case sets, and
+# leaves RC, OUT, GH_OUT, LOG and TMP_LEFT behind.
 run() {
   local name="$1" mode="$2"; shift 2
   local case_dir="$T/case-$name"
-  mkdir -p "$case_dir/store"
+  mkdir -p "$case_dir/store" "$case_dir/tmp"
   : > "$case_dir/log"; : > "$case_dir/out"
-  OUT="$(env -i PATH="$T/bin:$PATH" HOME="$T" \
-      GITHUB_OUTPUT="$case_dir/out" \
+  OUT="$(cd "$REPO" && env -i PATH="$T/bin:$PATH" HOME="$T" \
+      GITHUB_OUTPUT="$case_dir/out" RUNNER_TEMP="$case_dir/tmp" \
       STUB_LOG="$case_dir/log" STUB_STORE="$case_dir/store" \
-      STUB_SIGN=good STUB_KEY="$T/keys/a.key" STUB_OTHER_DIGEST="$DX" \
+      STUB_SIGN=good STUB_LIST=ok STUB_KEY="$T/keys/a.key" STUB_OTHER_DIGEST="$DX" \
       RIS_WIF_PROVIDER="$PROVIDER" RIS_SIGNER_SA="$SIGNER" \
       RIS_ATTESTOR="demo-release-images" RIS_ATTESTOR_PROJECT="signing-proj-0" \
-      RIS_KEY_VERSION="$KEYVER" RIS_PUBLIC_KEY_PEM="$T/keys/a.pub.pem" \
-      RIS_DIGESTS="$REF1 $REF2" RIS_REQUIRED=true \
+      RIS_KEY_VERSION="$KEYVER" RIS_PUBLIC_KEY_PEM="keys/a.pub.pem" \
+      RIS_DIGESTS="$REF1 $REF2" RIS_REQUIRED=true RIS_ACCESS_TOKEN=stub-token \
       "$@" bash "$SCRIPT" "$mode" 2>&1)"
   RC=$?
   GH_OUT="$(cat "$case_dir/out")"
   LOG="$(cat "$case_dir/log")"
+  TMP_LEFT="$(ls -A "$case_dir/tmp")"
 }
 
 has() { printf '%s' "$1" | grep -cF -- "$2" >/dev/null; }
@@ -159,14 +188,38 @@ expect_fail "armed with no digests: fails" "no image digests"
 run tag-ref decide RIS_DIGESTS="registry.example.test/demo/app:v1.2.3"
 expect_fail "a tag instead of a digest: fails" "not a digest-pinned image ref"
 
-run missing-pem decide RIS_PUBLIC_KEY_PEM="$T/keys/absent.pem"
+run missing-pem decide RIS_PUBLIC_KEY_PEM="keys/absent.pem"
 expect_fail "committed key path missing: fails" "public-key-pem"
+
+run untracked-pem decide RIS_PUBLIC_KEY_PEM="keys/untracked.pub.pem"
+expect_fail "a key file git does not track: fails" "not tracked by git"
+
+run untracked-previous-pem decide RIS_PUBLIC_KEY_PEM_PREVIOUS="keys/untracked.pub.pem"
+expect_fail "an untracked previous key: fails" "previous-public-key-pem"
+
+run rsa-pem decide RIS_PUBLIC_KEY_PEM="keys/rsa.pub.pem"
+expect_fail "an RSA key instead of EC P-256: fails" "not an EC P-256 public key"
 
 run count-mismatch decide RIS_EXPECTED_COUNT=5
 expect_fail "expected-count mismatch: fails" "expected 5"
 
 run bad-provider decide RIS_WIF_PROVIDER="projects/x/providers/y"
 expect_fail "malformed provider name: fails" "wif-provider"
+
+run newline-provider decide RIS_WIF_PROVIDER="$PROVIDER${NL}$PROVIDER"
+expect_fail "a newline inside a value (provider): fails" "wif-provider is not"
+
+run newline-signer decide RIS_SIGNER_SA="$SIGNER${NL}evil"
+expect_fail "a newline inside a value (signer): fails" "signer-sa is not"
+
+run newline-project decide RIS_ATTESTOR_PROJECT="signing-proj-0${NL}other-proj-1"
+expect_fail "a newline inside a value (attestor project): fails" "attestor-project is not"
+
+run bad-attestor-name decide RIS_ATTESTOR="Demo.Release!"
+expect_fail "malformed attestor name: fails" "attestor is not an attestor name"
+
+run bad-attestor-project decide RIS_ATTESTOR_PROJECT="Bad_Project"
+expect_fail "malformed attestor project: fails" "attestor-project is not a project id"
 
 run attestor-conflict decide RIS_ATTESTOR="projects/elsewhere/attestors/demo-release-images"
 expect_fail "qualified attestor naming another project than attestor-project: fails" "refusing to guess"
@@ -184,17 +237,33 @@ check "  ...signed=true written" has "$GH_OUT" "signed=true"
 check "  ...one sign-and-create per digest" count_is "$LOG" "sign-and-create" 2
 check "  ...key version passed" has "$LOG" "--keyversion=$KEYVER"
 check "  ...attestor project passed" has "$LOG" "--attestor-project=signing-proj-0"
+check "  ...project passed explicitly" count_is "$LOG" "--project=signing-proj-0" 4
 check "  ...billed to the attestor project" has "$LOG" "quota=signing-proj-0"
+check "  ...token reached every sign/list as a 0600 file" count_is "$LOG" "tok=stub-token mode=600" 4
+check "  ...RIS_ACCESS_TOKEN never reached gcloud's environment" lacks "$LOG" "LEAKED"
+check "  ...token file removed when the step ends" is_empty "$TMP_LEFT"
+
+run no-token sign RIS_ACCESS_TOKEN=
+expect_fail "sign without the access token: fails" "without the signer's access token"
+check "  ...gcloud never ran" is_empty "$LOG"
 
 run wrong-key sign STUB_KEY="$T/keys/b.key"
 expect_fail "signed with another key: fails" "does not verify"
 check "  ...no signed=true on failure" lacks "$GH_OUT" "signed=true"
+check "  ...token file removed on failure too" is_empty "$TMP_LEFT"
+
+run exists-wrong-key sign STUB_SIGN=exists STUB_KEY="$T/keys/b.key"
+expect_fail "ALREADY_EXISTS signed by another key: fails" "does not verify"
 
 run wrong-digest sign STUB_SIGN=wrongdigest
 expect_fail "signed payload names another digest: fails" "does not verify"
 
 run missing-attestation sign STUB_SIGN=none
 expect_fail "no attestation after sign-and-create: fails" "No attestation found"
+
+run list-fails sign STUB_LIST=fail
+expect_fail "attestations list exiting 1: fails, never an empty pass" "Could not read attestations"
+check "  ...gcloud's own words are shown" has "$OUT" "PERMISSION_DENIED"
 
 run create-error sign STUB_SIGN=fail
 expect_fail "sign-and-create error: fails" "sign-and-create failed"
@@ -206,7 +275,7 @@ run qualified-attestor sign RIS_ATTESTOR="projects/signing-proj-0/attestors/demo
 expect_pass "qualified attestor, no attestor-project: passes" "OK   $REF1"
 check "  ...short attestor name passed" has "$LOG" "--attestor=demo-release-images "
 
-run rotation sign RIS_PUBLIC_KEY_PEM="$T/keys/b.pub.pem" RIS_PUBLIC_KEY_PEM_PREVIOUS="$T/keys/a.pub.pem"
+run rotation sign RIS_PUBLIC_KEY_PEM="keys/b.pub.pem" RIS_PUBLIC_KEY_PEM_PREVIOUS="keys/a.pub.pem"
 expect_pass "signed with the previous key inside a rotation window: passes" "OK   $REF1"
 
 run sign-unarmed sign RIS_KEY_VERSION=
@@ -214,12 +283,49 @@ expect_fail "sign never self-skips when an input is missing" "defect in the call
 
 # --- the action wiring --------------------------------------------------------
 # The script is only half: the action must pass inputs as env (never spliced
-# into shell), gate auth and sign on `decide`, and pin the auth action.
+# into shell), gate auth and sign on `decide`, pin the auth action, mint a
+# token only, and hand that token to the sign step alone.
+
+# Prints every line of shell in a YAML file's `run:` keys: the one-line form,
+# and every line of a `run: |` / `run: >` block body (lines indented deeper
+# than the key, or blank).
+run_bodies() {
+  awk '
+    function indent(s) { match(s, /^ */); return RLENGTH }
+    inblk && ($0 ~ /^[ \t]*$/ || indent($0) > blk) { print; next }
+    { inblk = 0 }
+    /^[ \t]*(- )?run:[ \t]*[|>][-+]?[ \t]*$/ { inblk = 1; blk = indent($0); next }
+    /^[ \t]*(- )?run:/ { print }
+  ' "$1"
+}
+
+# The scan must catch an expression on a block body's SECOND line, or a clean
+# result below proves nothing.
+FIX="$T/fixture-action.yml"
+{
+  echo "runs:"
+  echo "  using: composite"
+  echo "  steps:"
+  echo "    - shell: bash"
+  echo "      run: |"
+  echo "        echo safe"
+  echo "        echo \"\${{ inputs.evil }}\""
+  echo "    - shell: bash"
+  echo "      run: echo fine"
+} > "$FIX"
+check "fixture: the run-body scan catches \${{ inside a run: | block" has "$(run_bodies "$FIX")" "\${{"
+check "fixture: the run-body scan reads one-line run: too" has "$(run_bodies "$FIX")" "echo fine"
+
 A="$ACTION_DIR/action.yml"
 ACTION_TEXT="$(cat "$A")"
-check "action.yml splices no expression into a run: line" lacks "$(grep -E '^[[:space:]]*run:' "$A")" "\${{"
+check "action.yml has run: bodies to scan" has "$(run_bodies "$A")" "release-image-signing.sh"
+check "action.yml splices no expression into any run: body" lacks "$(run_bodies "$A")" "\${{"
 check "auth and sign are both gated on decide" count_is "$ACTION_TEXT" "if: steps.decide.outputs.armed == 'true'" 2
 check "auth action pinned by sha" has "$(grep -E 'uses: google-github-actions/auth@[0-9a-f]{40} # v' "$A")" "google-github-actions/auth@"
+check "auth mints an access token only" has "$ACTION_TEXT" "token_format: access_token"
+check "auth writes no credentials file" has "$ACTION_TEXT" "create_credentials_file: false"
+check "auth exports no GOOGLE_*/CLOUDSDK_* variables" has "$ACTION_TEXT" "export_environment_variables: false"
+check "the token output is referenced exactly once (the sign step's env)" count_is "$ACTION_TEXT" "steps.auth.outputs.access_token" 1
 check "composite action (keeps the caller's job_workflow_ref)" has "$ACTION_TEXT" "using: composite"
 
 if [ "$fail" -eq 0 ]; then

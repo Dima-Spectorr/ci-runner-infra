@@ -5,7 +5,12 @@
 #            $GITHUB_OUTPUT). Unconfigured and not required: a ::notice:: and
 #            armed=false. Required and any input missing: FAIL. Configured: every
 #            input is validated here, before any credential is minted.
-#   sign     Run as the signer (the action authenticates between the modes).
+#   sign     Run as the signer. The action mints a short-lived access token
+#            between the modes and hands it to THIS step only (RIS_ACCESS_TOKEN);
+#            no credentials file and no GOOGLE_* variable is created, so nothing
+#            later in the caller's job inherits the signer. The token is written
+#            to a 0600 file in this step's own temp dir for gcloud
+#            (auth/access_token_file) and removed on exit.
 #            `gcloud beta container binauthz attestations sign-and-create` per
 #            digest, then read every attestation back and check its signature
 #            with openssl against the committed public key, over a payload that
@@ -24,6 +29,14 @@
 set -euo pipefail
 
 log() { printf '  %s\n' "$*"; }
+
+# Whole-string match. `[[ =~ ]]` anchors on the WHOLE value, unlike a line
+# tool, which would accept "good\nanything" because one LINE matched. A newline
+# is refused outright: no input of this action can legitimately contain one.
+matches() { [[ $1 != *$'\n'* && $1 =~ $2 ]]; }
+
+RE_PROJECT='^[a-z][a-z0-9-]{4,28}[a-z0-9]$'
+RE_ATTESTOR='^[a-z0-9][a-z0-9_-]{0,98}[a-z0-9]$'
 die() { printf '::error title=Release image signing::%s\n' "$*"; exit 1; }
 
 out() {
@@ -53,7 +66,8 @@ input_name() {
 
 parse_required() {
   local v
-  v=$(printf '%s' "${RIS_REQUIRED:-false}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+  v="${RIS_REQUIRED:-false}"
+  v="${v,,}"
   case "$v" in
     true)     REQUIRED=1 ;;
     false|'') REQUIRED=0 ;;
@@ -65,6 +79,8 @@ parse_required() {
 # The attestor's project: explicit, or embedded in a qualified attestor name.
 # Never the build project — the release attestor lives in the signing project.
 normalise_attestor() {
+  # RIS_* arrive from the environment (action.yml), not from an assignment here.
+  # shellcheck disable=SC2153
   ATTESTOR="$RIS_ATTESTOR"
   ATTESTOR_PROJECT="${RIS_ATTESTOR_PROJECT:-}"
   case "$ATTESTOR" in
@@ -86,13 +102,19 @@ normalise_attestor() {
     || die "attestor-project is not set and attestor is not fully qualified. The attestor lives in the signing project; it is never assumed to be the build project."
 }
 
+# Runs after normalise_attestor, so ATTESTOR is the bare name and
+# ATTESTOR_PROJECT the explicit or embedded project.
 check_shapes() {
-  printf '%s' "$RIS_WIF_PROVIDER" | grep -cE '^projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]+/providers/[a-z0-9-]+$' >/dev/null \
+  matches "$RIS_WIF_PROVIDER" '^projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]+/providers/[a-z0-9-]+$' \
     || die "wif-provider is not a provider resource name (projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<id>): '$RIS_WIF_PROVIDER'."
-  printf '%s' "$RIS_SIGNER_SA" | grep -cE '^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]+\.iam\.gserviceaccount\.com$' >/dev/null \
+  matches "$RIS_SIGNER_SA" '^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$' \
     || die "signer-sa is not a service account email: '$RIS_SIGNER_SA'."
-  printf '%s' "$RIS_KEY_VERSION" | grep -cE '^projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+/cryptoKeyVersions/[0-9]+$' >/dev/null \
+  matches "$RIS_KEY_VERSION" '^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/locations/[a-z0-9-]+/keyRings/[A-Za-z0-9_-]+/cryptoKeys/[A-Za-z0-9_-]+/cryptoKeyVersions/[0-9]+$' \
     || die "key-version is not a KMS crypto key VERSION resource name: '$RIS_KEY_VERSION'."
+  matches "$ATTESTOR" "$RE_ATTESTOR" \
+    || die "attestor is not an attestor name (lowercase letters, digits, '-' and '_'): '$RIS_ATTESTOR'."
+  matches "$ATTESTOR_PROJECT" "$RE_PROJECT" \
+    || die "attestor-project is not a project id: '$ATTESTOR_PROJECT'."
 }
 
 # Fills REFS from RIS_DIGESTS and RIS_DIGESTS_FILE; every ref must be pinned by
@@ -115,20 +137,35 @@ load_refs() {
   fi
   [ "${#REFS[@]}" -gt 0 ] || die "no image digests were given (digests / digests-file) — nothing to sign."
   for r in "${REFS[@]}"; do
-    printf '%s' "$r" | grep -cE '^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$' >/dev/null \
+    matches "$r" '^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$' \
       || die "'$r' is not a digest-pinned image ref (<repo>/<name>@sha256:<64 hex>). Signatures are over digests, never tags."
   done
   if [ -n "${RIS_EXPECTED_COUNT:-}" ]; then
-    printf '%s' "$RIS_EXPECTED_COUNT" | grep -cE '^[0-9]+$' >/dev/null || die "expected-count must be a number, got '$RIS_EXPECTED_COUNT'."
+    matches "$RIS_EXPECTED_COUNT" '^[0-9]+$' || die "expected-count must be a number, got '$RIS_EXPECTED_COUNT'."
     [ "${#REFS[@]}" -eq "$RIS_EXPECTED_COUNT" ] \
       || die "expected $RIS_EXPECTED_COUNT digest-pinned refs, got ${#REFS[@]} — a release that lost an image must not sign the rest."
   fi
 }
 
+# A key the verify pass trusts must be one the repository COMMITTED: a file
+# the release workflow generated or downloaded at run time would let the run
+# vouch for itself. And it must be the algorithm the platform provisions
+# (EC_SIGN_P256_SHA256), so a wrong file fails here, by name, not at verify.
+check_one_key() { # <input name> <path>
+  local name="$1" pem="$2"
+  [[ $pem != *$'\n'* ]] || die "$name contains a newline."
+  [ -f "$pem" ] || die "$name '$pem' does not exist — commit the product's public key and point this input at it."
+  git ls-files --error-unmatch -- "$pem" >/dev/null 2>&1 \
+    || die "$name '$pem' is not tracked by git. The key every attestation is checked against must be the one committed to the repository."
+  command -v openssl >/dev/null 2>&1 || die "openssl is not on PATH — the key and every signature are checked with it."
+  openssl pkey -pubin -in "$pem" -noout -text 2>/dev/null | grep -c 'prime256v1' >/dev/null \
+    || die "$name '$pem' is not an EC P-256 public key. Release signing keys are EC_SIGN_P256_SHA256."
+}
+
 check_keys() {
-  [ -f "$RIS_PUBLIC_KEY_PEM" ] || die "public-key-pem '$RIS_PUBLIC_KEY_PEM' does not exist — commit the product's public key and point this input at it."
+  check_one_key public-key-pem "$RIS_PUBLIC_KEY_PEM"
   if [ -n "${RIS_PUBLIC_KEY_PEM_PREVIOUS:-}" ]; then
-    [ -f "$RIS_PUBLIC_KEY_PEM_PREVIOUS" ] || die "previous-public-key-pem is set but '$RIS_PUBLIC_KEY_PEM_PREVIOUS' does not exist."
+    check_one_key previous-public-key-pem "$RIS_PUBLIC_KEY_PEM_PREVIOUS"
   fi
 }
 
@@ -241,22 +278,37 @@ require_tools() {
 }
 
 do_sign() {
+  # Take the token out of the environment FIRST, into an unexported shell
+  # variable, so no child process (not even `gcloud --help` below) inherits it.
+  local token="${RIS_ACCESS_TOKEN:-}"
+  unset RIS_ACCESS_TOKEN
   parse_required
   scan_inputs
   [ "${#MISSING[@]}" -eq 0 ] || die "sign ran with inputs missing (${MISSING[*]}) — sign only runs armed, so this is a defect in the caller."
+  [ -n "$token" ] \
+    || die "sign ran without the signer's access token — the auth step must run with token_format: access_token, and only this step receives it."
   validate_armed
   require_tools
 
+  local work err ref digest count i ok key missing="" bad="" unreadable=""
+  work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ris.XXXXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'" EXIT
+  err="$work/err"
+
+  # The signer's token, readable by this user only, gone when the step ends.
+  # gcloud reads it through auth/access_token_file; it is never written to a
+  # gcloud config, a credentials file or an exported GOOGLE_* variable.
+  ( umask 077 && printf '%s' "$token" > "$work/token" )
+  token=""
+  export CLOUDSDK_AUTH_ACCESS_TOKEN_FILE="$work/token"
+  # The project is explicit on every call AND here, so nothing falls back to an
+  # ambient gcloud configuration's project.
+  export CLOUDSDK_CORE_PROJECT="$ATTESTOR_PROJECT"
   # Bill Binary Authorization / Container Analysis to the attestor's project.
   # Left to gcloud, a federated signer's calls can be attributed to a project
   # where those APIs are not enabled.
   export CLOUDSDK_BILLING_QUOTA_PROJECT="$ATTESTOR_PROJECT"
-
-  local work err ref digest count i ok key missing="" bad=""
-  work="$(mktemp -d)"
-  # shellcheck disable=SC2064
-  trap "rm -rf '$work'" EXIT
-  err="$work/err"
 
   echo "── signing ${#REFS[@]} digest(s)"
   for ref in "${REFS[@]}"; do
@@ -280,14 +332,19 @@ do_sign() {
   for ref in "${REFS[@]}"; do
     digest="${ref##*@}"
     rm -rf "$work/sig" && mkdir -p "$work/sig"
-    # A failed list (permissions, wrong project) yields no JSON: reported as a
-    # MISS, which fails the step — never a pass.
-    gcloud beta container binauthz attestations list \
-      --project="$ATTESTOR_PROJECT" \
-      --attestor="$ATTESTOR" \
-      --attestor-project="$ATTESTOR_PROJECT" \
-      --artifact-url="$ref" \
-      --format=json > "$work/list.json" 2>/dev/null || : > "$work/list.json"
+    # A failed list (permissions, wrong project) is its own failure, with
+    # gcloud's own words — never an empty list, and never a pass.
+    if ! gcloud beta container binauthz attestations list \
+        --project="$ATTESTOR_PROJECT" \
+        --attestor="$ATTESTOR" \
+        --attestor-project="$ATTESTOR_PROJECT" \
+        --artifact-url="$ref" \
+        --format=json > "$work/list.json" 2>"$err"; then
+      sed 's/^/    /' "$err"
+      log "FAIL $ref (attestations list failed)"
+      unreadable="$unreadable $ref"
+      continue
+    fi
 
     if ! python3 -c 'import json,sys; t=open(sys.argv[1]).read().strip(); sys.exit(0 if t and json.loads(t) else 1)' "$work/list.json" 2>/dev/null; then
       log "MISS $ref (no attestation)"
@@ -316,7 +373,8 @@ do_sign() {
     fi
   done
 
-  if [ -n "$missing$bad" ]; then
+  if [ -n "$missing$bad$unreadable" ]; then
+    [ -z "$unreadable" ] || printf '::error::Could not read attestations for:%s\n' "$unreadable"
     [ -z "$missing" ] || printf '::error::No attestation found for:%s\n' "$missing"
     [ -z "$bad" ] || printf '::error::Attestation signature does not verify against the committed public key for:%s\n' "$bad"
     die "refusing to publish: not every released digest carries a verified attestation."
