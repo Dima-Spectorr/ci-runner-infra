@@ -49,8 +49,9 @@ one-hour timeout. `build_command = "true"` gives you the dependency snapshot and
 no build artifacts, which is the right setting for a repository with no turbo
 pipeline.
 
-The default build runs `turbo run <turbo_tasks> --continue`, so one failed task
-does not cancel the tasks queued behind it. If the repository's own CI raises
+The default build runs `turbo run <turbo_tasks> --continue=dependencies-successful`,
+so one failed task does not cancel the tasks queued behind it, while a task whose
+dependency failed is skipped rather than cached as a pass. If the repository's own CI raises
 node's heap for these tasks, set `build_node_max_old_space_mb` to the same value
 and size `machine_type` to fit. Node sizes its default heap from system RAM, and
 warm `f69cde75` (2026-10-02) lost a bundle to exit 134 on `E2_HIGHCPU_8`.

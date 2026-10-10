@@ -515,7 +515,7 @@ fi
 #     joined into a shell command line, so the variable's validation is what
 #     keeps a `;` or `$(` out of it.
 runs_declared_tasks() { # <main.tf>
-  matches "$(code_of "$1")" 'turbo run \$\{join\(" ", var\.turbo_tasks\)\} \-\-continue \-\-cache-dir=' || return 1
+  matches "$(code_of "$1")" 'turbo run \$\{join\(" ", var\.turbo_tasks\)\} \-\-continue=dependencies-successful \-\-cache-dir=' || return 1
   ! matches "$(code_of "$1")" 'turbo run build \-\-cache-dir='
 }
 
@@ -755,7 +755,7 @@ mutate "the retry written through a shell function" "$MAIN" \
   retries_each_install
 
 mutate "the default build hard-codes build again" "$MAIN" \
-  's@turbo run ${join(" ", var\.turbo_tasks)} --continue --cache-dir=@turbo run build --cache-dir=@' \
+  's@turbo run ${join(" ", var\.turbo_tasks)} --continue=dependencies-successful --cache-dir=@turbo run build --cache-dir=@' \
   runs_declared_tasks
 
 mutate "the task-name validation widened to anything" "$VARS" \
@@ -763,7 +763,13 @@ mutate "the task-name validation widened to anything" "$VARS" \
   validates_task_names
 
 mutate "the task list run without --continue" "$MAIN" \
-  's@ --continue --cache-dir=@ --cache-dir=@' \
+  's@ --continue=dependencies-successful --cache-dir=@ --cache-dir=@' \
+  runs_declared_tasks
+
+# A bare --continue means `always`: a lint or typecheck whose ^build failed still
+# runs, and a false pass is cached under the right hash for every PR to replay.
+mutate "the task list run with a bare --continue" "$MAIN" \
+  's@ --continue=dependencies-successful --cache-dir=@ --continue --cache-dir=@' \
   runs_declared_tasks
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"

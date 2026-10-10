@@ -494,15 +494,18 @@ locals {
   # `typecheck` or `lint` reads its cache from the same pool as `build`, so a
   # warm that only ran `build` left those jobs cold on every run.
   #
-  # `--continue` keeps one failed task from cancelling every task not yet
-  # started. Measured on warm `f69cde75` (2026-10-02): one package's build hit
+  # `--continue=dependencies-successful` keeps one failed task from cancelling
+  # every task not yet started. Measured on warm `f69cde75` (2026-10-02): one package's build hit
   # the heap limit, and with more tasks queued behind it that would have
   # cancelled every typecheck and lint task left. A failed task is never
-  # cached, so continuing publishes only tasks that succeeded. The build step
+  # cached, so continuing publishes only tasks that succeeded. Not a bare
+  # `--continue` (= `always`): that still runs a `typecheck` or `lint` whose
+  # `^build` failed, and a pass against a missing upstream dist would be cached
+  # under the correct hash and replayed to every pull request. The build step
   # already tolerates a non-zero exit (see the step below).
   build_command = coalesce(var.build_command, join(" ", [
     "${local.install_full};",
-    "npx --no-install turbo run ${join(" ", var.turbo_tasks)} --continue --cache-dir=${local.turbo_cache_dir_arg}",
+    "npx --no-install turbo run ${join(" ", var.turbo_tasks)} --continue=dependencies-successful --cache-dir=${local.turbo_cache_dir_arg}",
   ]))
 
   # Single-quoted so a directory with a space or a glob character in it is one
