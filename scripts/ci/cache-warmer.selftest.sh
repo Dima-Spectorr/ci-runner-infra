@@ -32,6 +32,8 @@ ROOT="$HERE/../.."
 MAIN="$ROOT/modules/ci-runner-cache-warmer/main.tf"
 VARS="$ROOT/modules/ci-runner-cache-warmer/variables.tf"
 TURBO="$ROOT/modules/ci-runner-cache-warmer/scripts/warm-turbo.sh"
+DERIVE="$ROOT/modules/ci-runner-cache-warmer/scripts/derive-turbo-tasks.cjs"
+ALERT="$ROOT/modules/ci-runner-cache-warmer/alert.tf"
 SHARED="$ROOT/scripts/ci/publish-cache-snapshot.sh"
 SHAREDSCAN="$ROOT/scripts/ci/scan-cache-credentials.sh"
 
@@ -40,7 +42,7 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); }
 bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
 
-for f in "$MAIN" "$VARS" "$TURBO"; do
+for f in "$MAIN" "$VARS" "$TURBO" "$DERIVE" "$ALERT"; do
   [ -f "$f" ] || { echo "FAIL: missing $f"; exit 1; }
 done
 
@@ -386,7 +388,11 @@ has_config_under_the_cliff() { # <file>
   # publisher: a snapshot scanned by a rewritten scanner is a snapshot nobody
   # scanned, and it is published either way.
   matches "$code" '\$\{local\.scan_sha\}  \$\{local\.staged_dir\}/scan-cache-credentials\.sh' || return 1
-  [ "$(printf '%s\n' "$code" | grep -c 'sha256sum -c -')" -eq 2 ] || return 1
+  # Three staged-script runs: the publisher (with its library), the uploader,
+  # and the task derivation the build step runs before anything else.
+  matches "$code" 'derive_sha  = filesha256\(' || return 1
+  matches "$code" '\$\{local\.derive_sha\}  \$\{local\.staged_dir\}/derive-turbo-tasks\.cjs. \| sha256sum -c - >/dev/null \|\| exit 1' || return 1
+  [ "$(printf '%s\n' "$code" | grep -c 'sha256sum -c -')" -eq 3 ] || return 1
   matches "$code" 'condition     = local\.build_config_bytes < [0-9]+' || return 1
   # And the big script reaches the config exactly once. Twice is the 199 KB
   # config that never ran.
@@ -515,7 +521,8 @@ fi
 #     joined into a shell command line, so the variable's validation is what
 #     keeps a `;` or `$(` out of it.
 runs_declared_tasks() { # <main.tf>
-  matches "$(code_of "$1")" 'turbo run \$\{join\(" ", var\.turbo_tasks\)\} \-\-continue=dependencies-successful \-\-cache-dir=' || return 1
+  matches "$(code_of "$1")" 'turbo run \$\{local\.turbo_task_args\} \-\-continue=dependencies-successful \-\-cache-dir=' || return 1
+  matches "$(code_of "$1")" 'turbo_task_args = local\.derive_tasks \? "\$WARM_TASKS" : join\(" ", var\.turbo_tasks == null \? \[\] : var\.turbo_tasks\)' || return 1
   ! matches "$(code_of "$1")" 'turbo run build \-\-cache-dir='
 }
 
@@ -523,10 +530,10 @@ validates_task_names() { # <variables.tf>
   local blk
   blk=$(block_of "$1" turbo_tasks)
   [ -n "$blk" ] || return 1
-  matches "$blk" 'default[[:space:]]*=[[:space:]]*\["build"\]' || return 1
-  matches "$blk" 'length\(var\.turbo_tasks\) > 0 && alltrue' || return 1
+  matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*null[[:space:]]*$' || return 1
+  matches "$blk" 'var\.turbo_tasks == null \? true : \(length\(var\.turbo_tasks\) > 0 && alltrue' || return 1
   # The allowed set, verbatim. Widening it is a deliberate edit to this line too.
-  printf '%s\n' "$blk" | grep -qF '"^[A-Za-z0-9][A-Za-z0-9:#@._/-]{0,127}$"'
+  printf '%s\n' "$blk" | grep -cF -- '"^[A-Za-z0-9][A-Za-z0-9:#@._/-]{0,127}$"' >/dev/null
 }
 
 if runs_declared_tasks "$MAIN"; then ok; else
@@ -535,6 +542,106 @@ fi
 
 if validates_task_names "$VARS"; then ok; else
   bad "turbo_tasks lost its default or its name validation — the names are joined into the build step's shell command, so an unvalidated entry is a second command"
+fi
+
+# 17. BY DEFAULT THE WARM RUNS THE REPOSITORY'S OWN DECLARED TASKS. A list a
+#     root keeps goes stale the day the repository adds a task, and `["build"]`
+#     left typecheck and lint cold on every PR (IntegrateIT #25161). Each
+#     property below is one a later edit plausibly drops:
+#       derivation is the default, and only when neither override is set;
+#       the build step runs it BEFORE the build and fails loudly on nothing;
+#       the default exclusions are test* and e2e* (service-dependent tasks);
+#       the script leaves out persistent and cache:false tasks, refuses names
+#       outside the shell-safe set, and never falls back to a guess.
+derives_tasks_by_default() { # <main.tf>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'derive_tasks    = var\.build_command == null && var\.turbo_tasks == null' || return 1
+  # The step must RUN the measured script, not an inline copy without the derive.
+  matches "$code" '^[[:space:]]*script[[:space:]]*= local\.build_step_script$' || return 1
+  # `\\n`: main.tf holds a literal backslash-n (HCL's newline escape). A bare
+  # `\n` in an ERE is not that, and matched nothing.
+  matches "$code" 'build_step_script = "#!/usr/bin/env bash\\n\$\{local\.derive_step\}\$\{local\.build_command\}' || return 1
+  matches "$code" 'WARM_TASKS=\$\(node \$\{local\.staged_dir\}/derive-turbo-tasks\.cjs turbo\.json \$\{join\(" ", \[for g in var\.turbo_tasks_exclude : "'"'"'\$\{g\}'"'"'"\]\)\}\) \|\| \{ .*exit 1; \}' || return 1
+  matches "$code" "gzip -d > \\$\{local\.staged_dir\}/derive-turbo-tasks\.cjs"
+}
+
+excludes_by_default() { # <variables.tf>
+  local blk
+  blk=$(block_of "$1" turbo_tasks_exclude)
+  [ -n "$blk" ] || return 1
+  matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*\["test\*", "e2e\*", "deploy\*", "release\*", "publish\*", "\*migrate\*", "clean\*"\]' || return 1
+  # Validated to a glob character set with no quote in it: each entry is pasted
+  # between single quotes on the build step's command line.
+  printf '%s\n' "$blk" | grep -cF -- '"^[A-Za-z0-9*?][A-Za-z0-9*?:#@._/-]{0,127}$"' >/dev/null
+}
+
+derivation_is_safe() { # <derive-turbo-tasks.cjs>
+  local code
+  code=$(grep -vE '^[[:space:]]*//' "$1")
+  matches "$code" 'if \(info\.persistent\) why = "persistent";' || return 1
+  matches "$code" 'else if \(!info\.cached\) why = "cache: false";' || return 1
+  matches "$code" 'if \(d\.cache !== false\) cur\.cached = true;' || return 1
+  matches "$code" 'if \(d\.persistent === true\) cur\.persistent = true;' || return 1
+  printf '%s\n' "$code" | grep -cF -- 'const SAFE = /^[A-Za-z0-9][A-Za-z0-9:#@._\/-]{0,127}$/;' >/dev/null || return 1
+  matches "$code" 'else if \(!SAFE\.test\(name\)\) why = "not a safe task name";' || return 1
+  matches "$code" 'typeof declared !== "object" \|\| Array\.isArray\(declared\)' || return 1
+  matches "$code" 'say\("tasks derived from "' || return 1
+  matches "$code" 'say\("excluded: "' || return 1
+  matches "$code" 'process\.exit\(5\);' || return 1
+  ! matches "$code" '"build"'
+}
+
+if derives_tasks_by_default "$MAIN"; then ok; else
+  bad "the default build no longer derives its tasks from turbo.json before building — a task the repository adds is never warmed"
+fi
+if excludes_by_default "$VARS"; then ok; else
+  bad "turbo_tasks_exclude lost its test*/e2e* default or its glob validation — a service-dependent test task fails every warm, or a quote reaches the command line"
+fi
+if derivation_is_safe "$DERIVE"; then ok; else
+  bad "derive-turbo-tasks.cjs no longer leaves out persistent / cache:false tasks, checks names, logs both lists, or refuses an empty result — a watcher hangs the warm, or a guess hides a broken config"
+fi
+
+# 18. THE WARMER OWNS ITS ALARM, AND THE ALARM CANNOT BE SILENT. Measured
+#     2026-10-10: a consumer's warm ended in ERROR on at least eight nights in a
+#     row and nobody was told, because the only stale-cache policy lived in the
+#     pool's project and had never been installed there. The properties that make
+#     the module's own policy real, each a plausible later edit:
+#       the metric counts THIS trigger's builds, from the MAIN outcome line;
+#       the stale condition reads absence of DONE (the guarantee — a refused build
+#       logs nothing), and keeps `or vector(0)`, without which "no DONE at all"
+#       is an empty comparison and therefore silence;
+#       the failure condition counts anything that is not DONE;
+#       the policy notifies the declared channels, and the channels are required.
+owns_its_alarm() { # <alert.tf>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'resource "google_logging_metric" "warm_outcome"' || return 1
+  matches "$code" 'resource\.labels\.build_trigger_id=\\"\$\{google_cloudbuild_trigger\.warm\.trigger_id\}\\"' || return 1
+  matches "$code" 'labels\.build_step=\\"MAIN\\"' || return 1
+  matches "$code" 'outcome[[:space:]]*=[[:space:]]*"EXTRACT\(textPayload\)"' || return 1
+  matches "$code" 'outcome!=\\"DONE\\"\}\[1h\]\)\) > 0' || return 1
+  matches "$code" 'outcome=\\"DONE\\"\}\[\$\{var\.alert_stale_after_hours\}h\]\)\) or vector\(0\)\) < 1' || return 1
+  matches "$code" 'notification_channels[[:space:]]*=[[:space:]]*var\.alert_notification_channels' || return 1
+  matches "$code" 'combiner[[:space:]]*=[[:space:]]*"OR"'
+}
+
+requires_alert_channels() { # <variables.tf>
+  local blk
+  blk=$(block_of "$1" alert_notification_channels)
+  [ -n "$blk" ] || return 1
+  ! matches "$blk" '^[[:space:]]*default[[:space:]]*=' || return 1
+  matches "$blk" 'length\(var\.alert_notification_channels\) > 0 && alltrue' || return 1
+  blk=$(block_of "$1" alert_stale_after_hours)
+  matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*36[[:space:]]*$'
+}
+
+if owns_its_alarm "$ALERT"; then ok; else
+  bad "the warmer's own alert policy lost a property that makes it fire — a failing or never-run warm is a cold pool and nothing else turns red"
+fi
+
+if requires_alert_channels "$VARS"; then ok; else
+  bad "alert_notification_channels is no longer required and non-empty (or the stale default moved) — an alert nobody receives repeats the incident"
 fi
 
 # --- mutations -----------------------------------------------------------------
@@ -755,7 +862,7 @@ mutate "the retry written through a shell function" "$MAIN" \
   retries_each_install
 
 mutate "the default build hard-codes build again" "$MAIN" \
-  's@turbo run ${join(" ", var\.turbo_tasks)} --continue=dependencies-successful --cache-dir=@turbo run build --cache-dir=@' \
+  's@turbo run ${local\.turbo_task_args} --continue=dependencies-successful --cache-dir=@turbo run build --cache-dir=@' \
   runs_declared_tasks
 
 mutate "the task-name validation widened to anything" "$VARS" \
@@ -771,6 +878,81 @@ mutate "the task list run without --continue" "$MAIN" \
 mutate "the task list run with a bare --continue" "$MAIN" \
   's@ --continue=dependencies-successful --cache-dir=@ --continue --cache-dir=@' \
   runs_declared_tasks
+
+mutate "the build step inlines its own script and skips the derive" "$MAIN" \
+  's@script = local\.build_step_script$@script = local.build_command@' \
+  derives_tasks_by_default
+
+mutate "side-effecting tasks warmed by default" "$VARS" \
+  's@, "deploy\*", "release\*", "publish\*", "\*migrate\*", "clean\*"\]@]@' \
+  excludes_by_default
+
+mutate "derivation runs even when a list is given" "$MAIN" \
+  's@derive_tasks    = var\.build_command == null && var\.turbo_tasks == null@derive_tasks    = var.build_command == null@' \
+  derives_tasks_by_default
+
+mutate "the derive step never reaches the build script" "$MAIN" \
+  's@\\n${local\.derive_step}${local\.build_command}@\\n${local.build_command}@' \
+  derives_tasks_by_default
+
+mutate "an empty derivation builds anyway" "$MAIN" \
+  's@failing the build so the warmer alert fires. >&2; exit 1; }@failing the build so the warmer alert fires'"'"' >\&2; }@' \
+  derives_tasks_by_default
+
+mutate "the exclude globs dropped from the derivation" "$MAIN" \
+  's@derive-turbo-tasks\.cjs turbo\.json ${join(" ", \[for g in var\.turbo_tasks_exclude : "'"'"'${g}'"'"'"\])}@derive-turbo-tasks.cjs turbo.json@' \
+  derives_tasks_by_default
+
+mutate "test tasks warmed by default" "$VARS" \
+  's@default     = \["test\*", "e2e\*", @default     = [@' \
+  excludes_by_default
+
+mutate "a quote allowed into an exclude glob" "$VARS" \
+  's@\^\[A-Za-z0-9\*?\]\[A-Za-z0-9\*?:#\@._/-\]{0,127}\$@.*@' \
+  excludes_by_default
+
+mutate "a persistent task warmed" "$DERIVE" \
+  's@  if (info\.persistent) why = "persistent";@  if (false) why = "persistent";@' \
+  derivation_is_safe
+
+mutate "a cache:false task warmed" "$DERIVE" \
+  's@  else if (!info\.cached) why = "cache: false";@@' \
+  derivation_is_safe
+
+mutate "an unsafe task name passed to the shell" "$DERIVE" \
+  's@  else if (!SAFE\.test(name)) why = "not a safe task name";@@' \
+  derivation_is_safe
+
+mutate "nothing derived falls back to build" "$DERIVE" \
+  's@  process\.exit(5);@  process.stdout.write("build\n"); process.exit(0);@' \
+  derivation_is_safe
+mutate "the outcome metric counts every trigger's builds" "$ALERT" \
+  's|    "resource\.labels\.build_trigger_id=.*||' \
+  owns_its_alarm
+
+mutate "the stale condition loses vector(0) and goes silent with no DONE at all" "$ALERT" \
+  's| or vector(0))|)|' \
+  owns_its_alarm
+
+mutate "the failure condition counts only ERROR" "$ALERT" \
+  's|outcome!=\\"DONE\\"|outcome=\\"ERROR\\"|' \
+  owns_its_alarm
+
+mutate "the policy notifies nobody" "$ALERT" \
+  's|notification_channels = var\.alert_notification_channels|notification_channels = []|' \
+  owns_its_alarm
+
+mutate "the conditions combined with AND" "$ALERT" \
+  's|combiner     = "OR"|combiner     = "AND"|' \
+  owns_its_alarm
+
+mutate "the alert channels given an empty default" "$VARS" \
+  's|^  type        = list(string)$|&\n  default     = []|' \
+  requires_alert_channels
+
+mutate "the empty channel list accepted" "$VARS" \
+  's|length(var\.alert_notification_channels) > 0 \&\& alltrue|alltrue|' \
+  requires_alert_channels
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

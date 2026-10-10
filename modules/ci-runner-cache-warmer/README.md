@@ -18,7 +18,7 @@ Next to the pool, once per repository:
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.112.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.116.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -28,12 +28,15 @@ module "ci_cache_warmer" {
   github_owner = "my-org"
   github_repo  = "myrepo"
 
+  # Required, non-empty: who is told when a warm fails or goes stale.
+  alert_notification_channels = [var.ci_alert_channel]
+
   # 2nd-generation projects only; omit on a project using gen1 triggers.
   github_connection = var.cloudbuild_github_connection
 }
 ```
 
-Those six values plus a bucket are the whole configuration, and every one of
+Those six values, a bucket and an alert recipient are the whole configuration, and every one of
 them is a fact the root already knows. **Nothing here describes the repository's
 build**, and that is deliberate: the warm reads the repository.
 
@@ -41,15 +44,21 @@ build**, and that is deliberate: the warm reads the repository.
 |---|---|
 | package manager | the lockfile — `pnpm-lock.yaml`, `yarn.lock`, `package-lock.json`, else a bare `package.json`. `corepack` is enabled for the first two, so the version the repository pins is the version that installs. |
 | the install | that manager's frozen-lockfile install, **without lifecycle scripts** for the snapshot, **with** them for the build step (see below) |
-| which tasks | `turbo_tasks`, `["build"]` by default. List every task a pull-request job reads from the pool (for example `["build", "typecheck", "lint"]`). A task the warm does not run is never published, so the job that runs it is cold on every pull request. This is the one build input a root sets, and it is a list of task names, not a command: the install and `--cache-dir` stay the module's. |
+| which tasks | the repository's root `turbo.json`, by default (`turbo_tasks` unset). Every declared task (turbo 2 `tasks`, or turbo 1 `pipeline`; a `pkg#task` key counts as `task`) except: `cache: false` (never published), `persistent: true` (a watcher that never exits), and names matching `turbo_tasks_exclude`, `["test*", "e2e*", "deploy*", "release*", "publish*", "*migrate*", "clean*"]` by default (a deploy, release, publish, migrate or clean task must never run with the warmer's credentials; a test task needing a database or browser fails every warm and is never cached). The build log prints both lists with a reason per exclusion. A `turbo.json` that is missing, does not parse, or leaves nothing fails the build loudly; it never falls back to `build`. Set `turbo_tasks` to override all of this, e.g. `["build", "typecheck", "lint"]`. |
 | where turbo writes | the module passes `--cache-dir` itself, from `turbo_cache_dir`, so it cannot drift from where the publishing step looks — a repository whose own CI builds with `--cache-dir=.turbo` still overrides nothing |
+
+What the derivation cannot see, so needs an explicit `turbo_tasks`: a task
+declared only in a package-level `turbo.json` (`extends: ["//"]`), and anything a
+pull-request job runs outside turbo. An explicit `turbo_tasks` also ignores
+`turbo_tasks_exclude`. A task the warm does not run is never published, so the job
+that runs it is cold on every pull request.
 
 The rest of the defaults: nightly at 04:00 UTC, `node:22`, `E2_HIGHCPU_8`, a
 one-hour timeout. `build_command = "true"` gives you the dependency snapshot and
 no build artifacts, which is the right setting for a repository with no turbo
 pipeline.
 
-The default build runs `turbo run <turbo_tasks> --continue=dependencies-successful`,
+The default build runs `turbo run <tasks> --continue=dependencies-successful`,
 so one failed task does not cancel the tasks queued behind it, while a task whose
 dependency failed is skipped rather than cached as a pass. If the repository's own CI raises
 node's heap for these tasks, set `build_node_max_old_space_mb` to the same value
@@ -222,6 +231,43 @@ one. That is why `scripts/ci/cache-warmer.selftest.sh` asserts the structure
 (the prefixes, the write-once grants, the pointer condition, the schedule and
 the account allowed to fire it) with a mutation proof behind each one, and why
 `schedule` has no "off" value: use `disabled`, which at least shows up in a plan.
+
+### The warmer's own alert
+
+The structure can be right and the build can still fail every night: measured
+2026-10-10, one consumer's warm ended in `ERROR` on at least eight consecutive
+nights and nobody was told. The fleet's stale-cache policy lives in the POOL's
+project and is installed by that project's apply trigger, which had never run
+there. So the module now creates its own alarm, in its own project, in the same
+apply as the trigger (`alert.tf`):
+
+- a log-based metric `<trigger name>-outcome`, counting each build's final MAIN
+  log line (`DONE` on success, `ERROR` on failure) by `outcome`;
+- one alert policy, `CI cache warmer / <trigger name> failing or stale`, with two
+  conditions:
+  - **failed**: any outcome other than `DONE` in the last hour;
+  - **stale**: no `DONE` within `alert_stale_after_hours` (36 by default).
+
+**The stale condition is the guarantee, not the failed one.** A build refused at
+fire time writes no log line at all, a schedule that stopped firing writes
+nothing, and what a timed-out build logs is deliberately not assumed. Absence of
+success catches every one of them; the failed condition only gets there sooner
+when the build did log. Directly after the first apply the stale condition fires
+until the first warm succeeds, so fire the trigger once by hand (`trigger_id`
+output). With `disabled = true` the policy is created disabled.
+
+`alert_notification_channels` is required and must name at least one channel
+(`projects/<project>/notificationChannels/<id>`) in this module's project: an
+alert nobody receives is the incident it replaces.
+
+**The applying identity needs two more permissions** than before, in this
+module's project: `logging.logMetrics.create/get/update/delete` (a custom role
+holding only these — not `roles/logging.configWriter`, which also lets its
+holder create sinks and exclusions, i.e. export or drop the build logs) and `monitoring.alertPolicies.create/update/delete`
+(`roles/monitoring.alertPolicyEditor`), plus read on the notification channels
+it names (`roles/monitoring.notificationChannelViewer`). The plan also refuses
+a channel that is not in this module's project. Without them the apply
+fails at this module; it does not silently skip the alarm.
 
 ### Three refusals that all happen at FIRE time, and the last one says nothing
 

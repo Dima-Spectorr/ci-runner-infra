@@ -1231,6 +1231,43 @@ and `pull_request_review_comment`, as fork-reachable for that reason. The lane
 hears reviews only through the secretless relay's completion; see "Why a
 review reaches the lane through a relay", above.
 
+### Holding a pull request back, and the read right before the merge
+
+**Draft is the hold, everywhere.** A draft is skipped from the list read and
+refused again on the fresh read below.
+
+**Removing the label is a hold ONLY under a label gate.** With the fleet
+default `require-label: ''` — this repository, Apigee-Portal and
+Specaria-Platform as of 2026-10-10 — the lane never asked for a label, so taking
+one off changes nothing. That is what happened on #1514: PR #1513 lost
+`ready-to-merge` at 13:42:20Z, the pass that merged it (run 38056919548) only
+*started* at 13:45:03Z, logged `REQUIRE_LABEL:` empty, and merged it at
+13:45:20Z. No stale snapshot was involved; there was no gate to honour. To hold
+an ungated repository's pull request, mark it draft.
+
+**And the hold is re-read immediately before every merge call.** The walk reads
+every candidate first and the batch acts afterwards, up to `max-actions` merges,
+so the read a merge rests on can be the whole walk old — minutes on a large
+repository. So `lane_take_action` reads the pull request once more, right
+before the `PUT …/merge`, and `lane_premerge_verdict` (in
+`merge-lane-decision.sh`) answers `ok` or a skip:
+
+| fresh read shows | verdict | outcome |
+|---|---|---|
+| not `open` | `skip:not-open(<state>)` | not merged this pass |
+| a draft | `skip:draft` | not merged this pass |
+| a head other than the one whose checks were read | `skip:head-moved(a->b)` | not merged; the next pass reads the new head |
+| no `require-label` label, under a gate, and no pin-bump waiver for this head | `skip:label-removed(<label>)` | not merged this pass |
+| anything unreadable | `skip:fresh-read-unreadable` | fails closed |
+
+A skip is a `::warning::lane: #<n> NOT merged — …` line, and it skips that one
+pull request only: the batch goes on. The merge call still passes `sha=`, so a
+push between the fresh read and the call is refused by GitHub itself. Cost: one
+read per merge, never per candidate. Pinned by `lane_premerge_verdict`'s cases in
+`merge-lane-decision.selftest.sh` and by `behavioural_premerge_cases` in
+`merge-lane.selftest.sh`, which runs the real `lane_take_action` against a
+stubbed `gh` and fails if a held pull request reaches the merge call.
+
 ### Waiting for the automated reviewers
 
 Codex reviews cost credits, and the fleet was spending them on pull requests

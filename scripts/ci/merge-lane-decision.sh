@@ -525,6 +525,66 @@ lane_batch_size() {
 }
 
 # ---------------------------------------------------------------------------
+# lane_premerge_verdict — may the merge call go out, on a read made just now?
+#
+#   lane_premerge_verdict <require_label> <waived_sha> <verified_sha> \
+#                         <state> <draft> <head_sha> <labels>
+#
+# Prints `ok`, or `skip:<why>`. The first three are what the lane decided on;
+# the last four are a FRESH read of the pull request taken immediately before
+# the merge call (#1514).
+#
+# WHY THE WALK'S READ IS NOT ENOUGH. The walk reads every candidate first and
+# the batch acts afterwards, up to `max-actions` merges per pass, so the read a
+# merge rests on can be the whole walk old — minutes on a large repository. A
+# label removed or a draft flipped inside that window used to be merged anyway,
+# because nothing re-asked. `sha=` on the merge call closes the head half of
+# that race and GitHub refuses a draft itself; the LABEL is the lane's own
+# rule, so only the lane can re-check it. All of them are checked here so the
+# skip is logged in the lane's words rather than as an unexplained refusal.
+#
+# The label rule applies ONLY under a label gate. `require_label` empty — the
+# fleet default — means the lane never required a label, so removing one is not
+# a hold and never was; draft is. `waived_sha` is the head a pin-bump waiver was
+# granted for, and it waives the label for that head only.
+#
+# FAILS CLOSED. An empty or unexpected field is a read the lane does not
+# understand, and the answer to that is "do not merge this pass", never a guess.
+# ---------------------------------------------------------------------------
+lane_premerge_verdict() {
+  local require="${1:-}" waived="${2:-}" verified="${3:-}"
+  local state="${4:-}" draft="${5:-}" head="${6:-}" labels="${7:-}"
+  if [ -z "$verified" ] || [ -z "$head" ] || [ -z "$state" ]; then
+    echo "skip:fresh-read-unreadable"
+    return 0
+  fi
+  if [ "$state" != "open" ]; then
+    echo "skip:not-open($state)"
+    return 0
+  fi
+  case "$draft" in
+    false) ;;
+    true)
+      echo "skip:draft"
+      return 0
+      ;;
+    *)
+      echo "skip:fresh-read-unreadable"
+      return 0
+      ;;
+  esac
+  if [ "$head" != "$verified" ]; then
+    echo "skip:head-moved(${verified:0:8}->${head:0:8})"
+    return 0
+  fi
+  if [ -n "$require" ] && [[ ",$labels," != *",$require,"* ]] && [ "$waived" != "$verified" ]; then
+    echo "skip:label-removed($require)"
+    return 0
+  fi
+  echo ok
+}
+
+# ---------------------------------------------------------------------------
 # lane_pass_expired — has this pass spent its walking budget?
 #
 #   lane_pass_expired <started_epoch> <budget_seconds> <now_epoch>

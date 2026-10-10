@@ -161,6 +161,11 @@ if [ -n "${CACHE_SCAN_ALLOW_FILE:-}" ]; then
     scan_allow_label=$(printf '%s' "${scan_allow_line#*#}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     [ -n "$scan_allow_name" ] \
       || die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno has an empty comment — name the package that ships the file"
+    # A refusal prints `# <package that ships this file>` when the path names no
+    # package; pasted unedited it would excuse a digest nobody identified.
+    case "$scan_allow_label" in
+      '<'* ) die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno still has the placeholder comment — replace it with the package that ships the file: $(safe_path "$scan_allow_line")" ;;
+    esac
     scan_allow_digest=$(printf '%s' "$scan_allow_digest" | tr -d '[:space:]')
     [ -n "$scan_allow_digest" ] \
       || die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno has a comment but no digest: $(safe_path "$scan_allow_line")"
@@ -481,6 +486,8 @@ scan_file_holds_pem_block() { # <file>
 #   the floor the hash is an offline oracle with no rate limit, so the entry
 #   that would excuse it is one nobody may write down.
 SCAN_EXCUSABLE_MIN_BYTES=1024
+# How many refused files are explained in full before the rest are only counted.
+SCAN_EXPLAIN_MAX=20
 # The floor for one label, or a refusal. The default arm is what makes this a
 # whitelist rather than "anything but the token rule": a rule added to the scan
 # later is unexcusable until someone gives it a number here, in a diff.
@@ -535,8 +542,36 @@ scan_hit_digest_is_printable() { # <file>
   [ "$(wc -c <"$1")" -ge "$SCAN_EXCUSABLE_MIN_BYTES" ]
 }
 
+# Where a consumer adds an allowlist line. The caller knows which REPOSITORY
+# file it staged into CACHE_SCAN_ALLOW_FILE (the warmer stages a copy, so the
+# path this script reads is a build-local one nobody can edit) and says so in
+# CACHE_SCAN_ALLOW_SOURCE. Without it the report names the mechanism, not a path,
+# rather than guess one.
+scan_allow_target() {
+  if [ -n "${CACHE_SCAN_ALLOW_SOURCE:-}" ]; then
+    printf 'the repository file %s' "$(safe_path "$CACHE_SCAN_ALLOW_SOURCE")"
+  else
+    printf 'the allowlist file this job reads (CACHE_SCAN_ALLOW_FILE), or CACHE_SCAN_ALLOW_DIGESTS'
+  fi
+}
+
+# The package a cached file belongs to, from its path alone: the segment after
+# the LAST `node_modules/`, two segments for an `@scope/name`. A path with no
+# node_modules in it is not guessed at.
+scan_hit_package() { # <relative path>
+  local rel="$1" tail
+  case "$rel" in
+    */node_modules/* | node_modules/* ) tail="${rel##*node_modules/}" ;;
+    * ) printf '<package that ships this file>'; return 0 ;;
+  esac
+  case "$tail" in
+    @*/*/* | @*/* ) printf '%s' "$(printf '%s' "$tail" | cut -d/ -f1-2)" ;;
+    * ) printf '%s' "${tail%%/*}" ;;
+  esac
+}
+
 explain_credential_hit() { # <tree> <file>
-  local root="$1" file="$2" entry label pat n scheme
+  local root="$1" file="$2" entry label pat n scheme digest
   {
     printf 'the embedded-credential pass matched in %s\n' "$(safe_path "${file#"$root"/}")"
     printf '  file: %s bytes, %s line(s)\n' "$(wc -c <"$file")" "$(wc -l <"$file")"
@@ -591,10 +626,16 @@ explain_credential_hit() { # <tree> <file>
     if ! command -v sha256sum >/dev/null 2>&1; then
       printf '  no digest is printed: this machine has no sha256sum, so an allowlist entry for this file has to be computed somewhere that does\n'
     elif scan_hit_digest_is_printable "$file"; then
-      printf '  sha256: %s\n' "$(sha256sum <"$file" | cut -d' ' -f1)"
-      printf '  if this is a dependency fixture and not a leak, put that digest on CACHE_SCAN_ALLOW_DIGESTS -- or, past a handful, in the file CACHE_SCAN_ALLOW_FILE names -- in BOTH jobs\n'
+      digest=$(sha256sum <"$file" | cut -d' ' -f1)
+      printf '  sha256: %s\n' "$digest"
+      # Paste-ready, in the allowlist's own format. The parser refuses a digest
+      # with no comment naming the package, so the line carries one, read off
+      # the PATH (never the content) and passed through safe_path like every
+      # other path in this report.
+      printf '  if this is a dependency fixture and not a leak, add this line to %s:\n' "$(scan_allow_target)"
+      printf '    %s  # %s\n' "$digest" "$(safe_path "$(scan_hit_package "${file#"$root"/}")")"
     elif scan_hit_is_excusable "$file"; then
-      printf '  a named digest CAN excuse this file, but the log does not print it. A digest is offered only where the secret IS the file -- enough key material that a hash of it is no use to anyone. This file is not that: either its rule matches a header in front of a short string, or the rest of its bytes are a package README anyone can read. Either way the byte count, line count and match line above already narrow the preimage, so compute the digest yourself with CACHE_DRY_RUN=1 and put it in the file CACHE_SCAN_ALLOW_FILE names, in BOTH jobs\n'
+      printf '  a named digest CAN excuse this file, but the log does not print it. A digest is offered only where the secret IS the file -- enough key material that a hash of it is no use to anyone. This file is not that: either its rule matches a header in front of a short string, or the rest of its bytes are a package README anyone can read. Either way the byte count, line count and match line above already narrow the preimage, so compute the digest yourself with CACHE_DRY_RUN=1 and add it, with a comment naming the package, to %s\n' "$(scan_allow_target)"
     else
       printf '  no digest is printed for this file, and no list will excuse it at this size. A registry token is never excusable; a URL credential is, but only in a file of at least %s bytes, because below that its hash is an oracle for its own contents. Fix the cause instead -- a prepare command that authenticates, or a dependency that has no business being in the tree\n' "$SCAN_EXCUSABLE_MIN_BYTES"
     fi
@@ -624,7 +665,7 @@ scan_credentials_or_die() { # <tree>
     die "the content scan could not create its temporary directory"
   [ -d "$SCAN_TMPDIR" ] || die "not a directory: SCAN_TMPDIR=$(safe_path "$SCAN_TMPDIR")"
   local -a pass=()
-  local entry digest labels excused=0 unconfirmed=0 seen=0 hits rc=0
+  local entry digest labels excused=0 unconfirmed=0 seen=0 refused=0 first_refused="" hits rc=0
   for entry in "${CREDENTIAL_PATTERNS[@]}"; do pass+=(-e "${entry#*|}"); done
   # Listed to a file, and the exit status is checked. grep says 0 for "found",
   # 1 for "nothing", >=2 for "I broke" — and a >=2 that goes unread reads exactly
@@ -702,9 +743,21 @@ scan_credentials_or_die() { # <tree>
         fi
       fi
     fi
-    explain_credential_hit "$root" "$bad"
-    die "the staged tree holds what looks like an embedded credential ($(safe_path "${bad#"$root"/}")) — refusing to publish it"
+    # Explained, then counted — not fatal yet. Dying on the first hit hid every
+    # later one, so an allowlist was fixed one false positive per nightly run.
+    # Still fail-closed: the refusal below runs before anything is published.
+    # Bounded, because a cache full of hits would otherwise flood the log.
+    refused=$((refused + 1))
+    [ -n "$first_refused" ] || first_refused="${bad#"$root"/}"
+    if [ "$refused" -le "$SCAN_EXPLAIN_MAX" ]; then
+      explain_credential_hit "$root" "$bad"
+    fi
   done <"$hits"
+  if [ "$refused" -gt 0 ]; then
+    [ "$refused" -le "$SCAN_EXPLAIN_MAX" ] \
+      || log "the content scan explained the first $SCAN_EXPLAIN_MAX of $refused refused files"
+    die "the staged tree holds what looks like an embedded credential in $refused file(s), first $(safe_path "$first_refused") — refusing to publish it"
+  fi
   # grep said it found something and the loop saw nothing: the list was truncated
   # or never reached, and the difference between that and a clean tree is the
   # whole pass. Refuse rather than reason about which.

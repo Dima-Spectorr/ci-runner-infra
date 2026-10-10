@@ -83,6 +83,8 @@
 #   google_cloudbuild_trigger         — the build, manual-only, fired by the job
 #   google_cloud_scheduler_job        — the schedule
 #   google_storage_bucket_iam_member  — the four grants above
+#   google_logging_metric             — each build's final outcome (alert.tf)
+#   google_monitoring_alert_policy    — failing or stale warm, in this project (alert.tf)
 
 locals {
   # Both prefixes are written the same way in three modules — here, the host
@@ -202,6 +204,7 @@ locals {
   publish_gz = base64gzip(file("${path.module}/../../scripts/ci/publish-cache-snapshot.sh"))
   scan_gz    = base64gzip(file("${path.module}/../../scripts/ci/scan-cache-credentials.sh"))
   turbo_gz   = base64gzip(file("${path.module}/scripts/warm-turbo.sh"))
+  derive_gz  = base64gzip(file("${path.module}/scripts/derive-turbo-tasks.cjs"))
 
   # THE CREDENTIAL-SCAN LIBRARY IS STAGED AS A SIBLING, NOT CONCATENATED.
   #
@@ -230,6 +233,9 @@ locals {
     base64 -d <<'TURBO_GZ_EOF' | gzip -d > ${local.staged_dir}/warm-turbo.sh
     ${local.turbo_gz}
     TURBO_GZ_EOF
+    base64 -d <<'DERIVE_GZ_EOF' | gzip -d > ${local.staged_dir}/derive-turbo-tasks.cjs
+    ${local.derive_gz}
+    DERIVE_GZ_EOF
     chmod +x ${local.staged_dir}/publish-cache-snapshot.sh ${local.staged_dir}/scan-cache-credentials.sh ${local.staged_dir}/warm-turbo.sh
     ${local.stage_scan_allow}
   EOT
@@ -258,6 +264,7 @@ locals {
   publish_sha = filesha256("${path.module}/../../scripts/ci/publish-cache-snapshot.sh")
   scan_sha    = filesha256("${path.module}/../../scripts/ci/scan-cache-credentials.sh")
   turbo_sha   = filesha256("${path.module}/scripts/warm-turbo.sh")
+  derive_sha  = filesha256("${path.module}/scripts/derive-turbo-tasks.cjs")
 
   # AND getcap HAS TO BE IN THE IMAGE, WHICH IN A NODE IMAGE IT IS NOT.
   #
@@ -347,7 +354,13 @@ locals {
   # And the publisher reads the CAPTURE, never the checkout. The path is
   # validated, along with the quote that would end the string it is pasted
   # into — a `$` in it is now harmless, but a `'` still is not.
+  #
+  # CACHE_SCAN_ALLOW_SOURCE is set whether or not the file exists yet: it is the
+  # REPOSITORY path a refusal tells the consumer to edit (or create). The staged
+  # copy is a build-local path nobody can commit to.
   ensure_scan_allow = local.scan_allow_path == "" ? "" : join("", [
+    "CACHE_SCAN_ALLOW_SOURCE='${local.scan_allow_rel}'\n",
+    "export CACHE_SCAN_ALLOW_SOURCE\n",
     "if [ -f '${local.scan_allow_staged}' ]; then\n",
     "  CACHE_SCAN_ALLOW_FILE='${local.scan_allow_staged}'\n",
     "  export CACHE_SCAN_ALLOW_FILE\n",
@@ -503,9 +516,28 @@ locals {
   # `^build` failed, and a pass against a missing upstream dist would be cached
   # under the correct hash and replayed to every pull request. The build step
   # already tolerates a non-zero exit (see the step below).
+  #
+  # BY DEFAULT THE TASK LIST IS THE REPOSITORY'S OWN. With `turbo_tasks` unset
+  # (and no `build_command`), the build step first runs the staged
+  # derive-turbo-tasks.cjs against the checkout's turbo.json: every declared task
+  # except `cache: false`, `persistent: true` and names matching
+  # `turbo_tasks_exclude`, logged as included and excluded. A hand-kept list was
+  # the failure: `["build"]` warmed one task of the three a pull request read
+  # (IntegrateIT #25161), and any list a root keeps goes stale the day the
+  # repository adds a task. Nothing derived is a FAILED build, not a quiet
+  # `build` guess, so the warmer's own alert fires. `$WARM_TASKS` is unquoted on
+  # purpose: one word per task, each already checked against the same character
+  # set `turbo_tasks` is validated to.
+  derive_tasks    = var.build_command == null && var.turbo_tasks == null
+  turbo_task_args = local.derive_tasks ? "$WARM_TASKS" : join(" ", var.turbo_tasks == null ? [] : var.turbo_tasks)
+  derive_step = local.derive_tasks ? join("", [
+    "echo '${local.derive_sha}  ${local.staged_dir}/derive-turbo-tasks.cjs' | sha256sum -c - >/dev/null || exit 1\n",
+    "WARM_TASKS=$(node ${local.staged_dir}/derive-turbo-tasks.cjs turbo.json ${join(" ", [for g in var.turbo_tasks_exclude : "'${g}'"])}) || { echo '[warm] no turbo task could be derived (reason above); failing the build so the warmer alert fires' >&2; exit 1; }\n",
+  ]) : ""
+
   build_command = coalesce(var.build_command, join(" ", [
     "${local.install_full};",
-    "npx --no-install turbo run ${join(" ", var.turbo_tasks)} --continue=dependencies-successful --cache-dir=${local.turbo_cache_dir_arg}",
+    "npx --no-install turbo run ${local.turbo_task_args} --continue=dependencies-successful --cache-dir=${local.turbo_cache_dir_arg}",
   ]))
 
   # Single-quoted so a directory with a space or a glob character in it is one
@@ -514,7 +546,7 @@ locals {
   # getting that wrong is a build step that dies on a syntax error at fire time.
   turbo_cache_dir_arg = "'${replace(var.turbo_cache_dir, "'", "'\\''")}'"
 
-  build_step_script = "#!/usr/bin/env bash\n${local.build_command} || echo '[warm] build failed; publishing what it produced'\n"
+  build_step_script = "#!/usr/bin/env bash\n${local.derive_step}${local.build_command} || echo '[warm] build failed; publishing what it produced'\n"
 
   # Every byte this module hands Cloud Build, which is what the cliff above is
   # measured against. The env entries and the trigger's own fields add a little on
@@ -765,9 +797,11 @@ resource "google_cloudbuild_trigger" "warm" {
     #    carries the same value to a build_command a repository overrode, which
     #    turbo honours without a flag.
     step {
-      id     = "build"
-      name   = var.build_image
-      script = "#!/usr/bin/env bash\n${local.build_command} || echo '[warm] build failed; publishing what it produced'\n"
+      id   = "build"
+      name = var.build_image
+      #    The script the size budget measures IS the script that runs; a step
+      #    that inlined its own copy dropped the derive step and warmed nothing.
+      script = local.build_step_script
       #    NODE_OPTIONS raises V8's heap ceiling only when a root asks for it.
       #    Node sizes its default heap from system RAM, so a type-aware lint or a
       #    large bundle that passes on a 16 GB runner can abort on this machine

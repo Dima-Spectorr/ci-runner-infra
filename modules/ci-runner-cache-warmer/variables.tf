@@ -202,14 +202,15 @@ variable "build_command" {
 variable "turbo_tasks" {
   description = <<-EOT
     The turbo tasks the default `build_command` runs, in one `turbo run`
-    invocation. `["build"]` by default.
+    invocation. Unset (null) by default, which means: every task the
+    repository's root turbo.json declares, except `cache: false`,
+    `persistent: true` and names matching `turbo_tasks_exclude`. The build log
+    says which tasks were included and which were excluded, and why.
 
-    List every task a pull-request job runs through turbo and reads from the
-    pool, for example `["build", "typecheck", "lint"]`. A task the warm does not
+    Set it only to override the derivation, for example for a task declared in
+    a package-level turbo.json only, which the derivation does not read. An
+    explicit list overrides `turbo_tasks_exclude` too. A task the warm does not
     run is never in the pool, so the pull-request job runs it cold every time.
-    The pool is keyed by task hash, so a published task hits only when the
-    pull-request job hashes it the same way. Tasks that declare no `env` hash
-    the same in the warm and on a host.
 
     Ignored when `build_command` is set. Each entry is a turbo task name
     (`task` or `package#task`). The character set is limited to letters,
@@ -217,11 +218,36 @@ variable "turbo_tasks" {
     command line.
   EOT
   type        = list(string)
-  default     = ["build"]
+  default     = null
 
   validation {
-    condition     = length(var.turbo_tasks) > 0 && alltrue([for t in var.turbo_tasks : can(regex("^[A-Za-z0-9][A-Za-z0-9:#@._/-]{0,127}$", t))])
+    condition     = var.turbo_tasks == null ? true : (length(var.turbo_tasks) > 0 && alltrue([for t in var.turbo_tasks : can(regex("^[A-Za-z0-9][A-Za-z0-9:#@._/-]{0,127}$", t))]))
     error_message = "turbo_tasks must name at least one task, and each must be a turbo task name made of letters, digits and : # @ . _ / - only. The names are joined into the build step's shell command, so anything else could become a second command."
+  }
+}
+
+variable "turbo_tasks_exclude" {
+  description = <<-EOT
+    Glob patterns (`*` and `?`) of task NAMES left out of the task list derived
+    from turbo.json. Applied to the derived list only; an explicit
+    `turbo_tasks` overrides it. Matched against the name after any `pkg#`.
+
+    `["test*", "e2e*", "deploy*", "release*", "publish*", "*migrate*", "clean*"]`
+    by default. Side-effecting tasks (deploy, release, publish, migrate, clean)
+    must never run with the warmer's credentials. A test task that needs a database, a
+    browser or another service fails on every warm (a failed task is never
+    cached), and a slow one can push a shared warm past `build_timeout`. Set
+    `[]` to warm every cacheable task — which ALSO re-enables deploy, release,
+    publish, migrate and clean tasks; when overriding, keep those patterns.
+    Matching is case-sensitive and by name only, so a side-effecting task with
+    another name (e.g. `db:seed`, `upload`) must be added here.
+  EOT
+  type        = list(string)
+  default     = ["test*", "e2e*", "deploy*", "release*", "publish*", "*migrate*", "clean*"]
+
+  validation {
+    condition     = alltrue([for g in var.turbo_tasks_exclude : can(regex("^[A-Za-z0-9*?][A-Za-z0-9*?:#@._/-]{0,127}$", g))])
+    error_message = "turbo_tasks_exclude entries are task-name globs: letters, digits, * ? and : # @ . _ / - only. They are passed to the build step's shell command line."
   }
 }
 
@@ -359,4 +385,37 @@ variable "disabled" {
   description = "Create the trigger but do not let it fire. The honest way to stop warming — unlike removing the schedule, it is visible in a plan."
   type        = bool
   default     = false
+}
+
+variable "alert_notification_channels" {
+  description = <<-EOT
+    Notification channels the warmer's own alert policy notifies, as full
+    resource names (`projects/<project>/notificationChannels/<id>`), in this
+    module's project. Required and non-empty: a failing warm raises nothing
+    else, and an alert nobody receives is the incident this policy exists to
+    end.
+  EOT
+  type        = list(string)
+
+  validation {
+    condition     = length(var.alert_notification_channels) > 0 && alltrue([for c in var.alert_notification_channels : can(regex("^projects/[^/]+/notificationChannels/[^/]+$", c))])
+    error_message = "alert_notification_channels must name at least one channel, each as projects/<project>/notificationChannels/<id>. A warmer alert with no recipient is silent."
+  }
+}
+
+variable "alert_stale_after_hours" {
+  description = <<-EOT
+    The alert fires when no warm has succeeded for this many hours. 36 by
+    default: one missed nightly run plus margin. This condition — absence of
+    success — is the guarantee; it catches a build refused at fire time, a
+    schedule that stopped firing and a timeout alike, none of which needs to
+    log anything. Raise it with a less frequent `schedule`.
+  EOT
+  type        = number
+  default     = 36
+
+  validation {
+    condition     = var.alert_stale_after_hours >= 2 && var.alert_stale_after_hours <= 720 && floor(var.alert_stale_after_hours) == var.alert_stale_after_hours
+    error_message = "alert_stale_after_hours must be a whole number of hours between 2 and 720."
+  }
 }
