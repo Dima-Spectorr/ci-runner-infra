@@ -36,6 +36,7 @@ DECISION="$ROOT/scripts/ci/merge-lane-decision.sh"
 FETCH="$ROOT/scripts/ci/merge-lane-fetch.sh"
 CI="$ROOT/.github/workflows/ci.yml"
 DOC="$ROOT/docs/merge-lane.md"
+RECOVER="$ROOT/scripts/ci/merge-lane-recover.sh"
 RELAY="$ROOT/.github/workflows/merge-lane-review-relay.yml"
 
 PASS=0
@@ -1112,6 +1113,117 @@ required_checks_all_exist_in_ci() {
     sed -e '1d' -e '$d' -e 's/^        //' | grep -v '^ *#' | grep -v '^$')
 }
 
+# A FAILED PASS IS FOLLOWED BY ONE MORE. The `recover` job runs only on a
+# `failure` (never `cancelled`, an evicted pending pass), never after a pass
+# that was itself dispatched (that is the loop guard), dispatches with the
+# repository's token under a name the lane's steps never read, and waits for the
+# window the failed job read with the App's token.
+recovers_a_failed_pass() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^  recover:$' || return 1
+  matches "$code" '^    needs: \[lane\]$' || return 1
+  matches "$code" "^    if: \\$\{\{ always\(\) && needs\.lane\.result == 'failure' && github\.event_name != 'workflow_dispatch' \}\}$" || return 1
+  matches "$code" '^      actions: write$' || return 1
+  matches "$code" '^          DISPATCH_TOKEN: \$\{\{ github\.token \}\}$' || return 1
+  matches "$code" '^          RECOVER_WORKFLOW: \$\{\{ inputs\.recover-workflow \}\}$' || return 1
+  matches "$code" '^          APP_RESET: \$\{\{ needs\.lane\.outputs\.app-reset \}\}$' || return 1
+  matches "$code" '^      app-reset: \$\{\{ steps\.quota\.outputs\.reset \}\}$' || return 1
+  matches "$code" "^        if: \\$\{\{ failure\(\) && steps\.token\.outputs\.token != '' \}\}$" || return 1
+  matches "$code" '^        run: bash scripts/ci/merge-lane-recover\.sh read-reset$' || return 1
+  matches "$code" '^        run: bash scripts/ci/merge-lane-recover\.sh dispatch$' || return 1
+  matches "$code" '^        default: merge-lane-events\.yml$'
+}
+
+# The documented callers grant the dispatch, or every consumer who copies them
+# gets a `recover` job that 403s on the one thing it is for.
+documented_callers_grant_the_dispatch() {
+  [ "$(grep -cE '^      actions: write$' "$1")" -ge 2 ] || return 1
+  grep -qE 'must grant `actions: write`' "$1"
+}
+
+# The recovery script, run for real against a stand-in `curl` and `sleep`.
+# Prints `PASS <id>` / `FAIL <id>`.
+recover_cases() { # <script>
+  local s="$1" d now rc
+  d=$(mktemp -d)
+  mkdir "$d/bin"
+  printf '#!/bin/sh\necho "$1" >>"$STUB_DIR/slept"\n' >"$d/bin/sleep"
+  cat >"$d/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+out='' url=''
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  [ "${args[i]}" = -o ] && out="${args[i+1]}"
+  url="${args[i]}"
+done
+printf '%s\n' "$*" >>"$STUB_DIR/curl"
+case "$url" in
+  */dispatches) : >"$out"; printf '%s' "${STUB_DISPATCH_CODE:-204}" ;;
+  */repos/*) printf '{"name":"r","default_branch":"trunk"}' >"$out"; printf 200 ;;
+  *) printf 404 ;;
+esac
+STUB
+  chmod +x "$d/bin/sleep" "$d/bin/curl"
+  rrun() { # <VAR=value>... — runs `dispatch` with those settings
+    rm -f "$d/slept" "$d/curl"
+    (
+      export STUB_DIR="$d" PATH="$d/bin:$PATH" GITHUB_REPOSITORY=o/r \
+        GITHUB_API_URL=https://api.test DISPATCH_TOKEN=t \
+        RECOVER_WORKFLOW=merge-lane-events.yml DEFAULT_BRANCH=main APP_RESET='' \
+        STUB_DISPATCH_CODE=204
+      for kv in "$@"; do export "${kv?}"; done
+      bash "$s" dispatch
+    ) >/dev/null 2>&1
+  }
+  res() { if [ "$2" -eq 0 ]; then echo "PASS $1"; else echo "FAIL $1"; fi; }
+  now=$(date -u +%s)
+
+  rrun; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(cat "$d/slept" 2>/dev/null)" = 60 ] \
+    && grep -q 'repos/o/r/actions/workflows/merge-lane-events.yml/dispatches' "$d/curl" \
+    && grep -qF -- '-d {"ref":"main"}' "$d/curl"
+  res recover-floor-then-one-dispatch $?
+
+  rrun "APP_RESET=$((now + 300))"; rc=$?
+  w=$(cat "$d/slept" 2>/dev/null)
+  [ "$rc" -eq 0 ] && [ "${w:-0}" -ge 300 ] && [ "${w:-0}" -le 320 ]
+  res recover-waits-for-the-window $?
+
+  rrun "APP_RESET=$((now + 5000))"
+  [ "$(cat "$d/slept" 2>/dev/null)" = 900 ]
+  res recover-wait-is-capped $?
+
+  rrun DEFAULT_BRANCH=
+  grep -qF -- '-d {"ref":"trunk"}' "$d/curl"
+  res recover-reads-the-default-branch $?
+
+  rrun STUB_DISPATCH_CODE=403; rc=$?
+  [ "$rc" -ne 0 ]
+  res recover-refusal-is-red $?
+
+  rrun 'RECOVER_WORKFLOW=../x.yml'; rc=$?
+  [ "$rc" -ne 0 ] && [ ! -e "$d/curl" ]
+  res recover-workflow-name-checked $?
+
+  rm -rf "$d"
+}
+
+# <description> <sed-program> <id> — the mutated recovery script must FAIL <id>.
+recover_mutant() {
+  local desc="$1" prog="$2" id="$3" tmp out
+  tmp=$(mktemp)
+  if ! sed "$prog" "$RECOVER" >"$tmp" 2>/dev/null; then
+    bad "the mutation program is not valid sed, so it asserts nothing: $desc"
+  elif cmp -s "$tmp" "$RECOVER"; then
+    bad "mutation changed nothing, so it asserts nothing: $desc"
+  else
+    out=$(recover_cases "$tmp")
+    if [ "$(printf '%s\n' "$out" | grep -cxF -- "FAIL $id")" -eq 1 ]; then ok; else bad "mutation not detected by '$id': $desc"; fi
+  fi
+  rm -f "$tmp"
+}
+
 check() { # <predicate> <file> <description>
   if "$1" "$2"; then ok; else bad "$3"; fi
 }
@@ -1761,7 +1873,7 @@ counts_what_it_spends() {
   matches "$code" '^LANE_CALLS="\$LANE_TMP/' || return 1
   matches "$code" '^gh\(\) \{$' || return 1
   matches "$code" 'printf \. >>"\$LANE_CALLS"' || return 1
-  matches "$code" 'command gh "\$@"' || return 1
+  matches "$code" 'lane_gh_retry "\$@"' || return 1
   matches "$code" 'api-calls=' || return 1
   matches "$code" 'API call\(s\) spent by this run'
 }
@@ -1964,8 +2076,8 @@ mutate "the lane stops serialising" "$CALLEE" \
   's|^    concurrency:|    x-concurrency:|' serialises
 mutate "in-flight lanes become cancellable" "$CALLEE" \
   's|^      cancel-in-progress: false$|      cancel-in-progress: true|' serialises
-mutate "the job timeout is removed" "$CALLEE" \
-  's|^    timeout-minutes: 15$|    x: 15|' is_bounded
+mutate "the job timeouts are removed" "$CALLEE" \
+  's|^    timeout-minutes: [0-9][0-9]*$|    x: 15|' is_bounded
 mutate "required-checks becomes optional" "$CALLEE" \
   's|^        required: true$|        required: false|' demands_its_gate
 mutate "the callee inlines a decision instead of delegating" "$CALLEE" \
@@ -3380,7 +3492,7 @@ a_fetch_job_never_counts_or_writes() {
 a_fetch_job_refuses_a_write() {
   local code
   code="$(code_of "$1")"
-  before "$code" '^  if lane_gh_mutates "\$@"; then$' '^  command gh "\$@" >"\$LANE_RECORD/\$n\.out"'
+  before "$code" '^  if lane_gh_mutates "\$@"; then$' '^  lane_gh_retry "\$@" >"\$LANE_RECORD/\$n\.out"'
 }
 counts_the_reads_no_verdict_used() {
   matches "$(code_of "$1")" '^  for \(\(n = 0; n < unused; n\+\+\)\); do printf \. >>"\$LANE_CALLS"; done$'
@@ -3496,6 +3608,38 @@ mutate "the wait no longer sleeps" "$DRIVER" \
   's@^        sleep "\$clock_sleep"$@        :@' rereads_now_after_the_wait
 mutate "the cap grows past the default budget" "$DRIVER" \
   's@^CLOCK_WAIT_CAP=.*@CLOCK_WAIT_CAP=900@' cap_fits_the_default_budget
+
+check recovers_a_failed_pass "$CALLEE" "a failed lane pass is not followed by exactly one dispatched pass after the App's window, so every pull request that went green during it waits for an unrelated CI completion"
+check documented_callers_grant_the_dispatch "$DOC" "the documented callers do not grant actions: write, so a consumer who copies them gets a recover job that is refused with a 403"
+mutate "a cancelled (evicted) lane run is recovered" "$CALLEE" \
+  "s@needs\.lane\.result == 'failure'@needs.lane.result != 'success'@" recovers_a_failed_pass
+mutate "a dispatched pass is recovered again, so a failing lane loops" "$CALLEE" \
+  "s@ && github\.event_name != 'workflow_dispatch' }}@ }}@" recovers_a_failed_pass
+mutate "the dispatch is made with the App's exhausted token" "$CALLEE" \
+  's@DISPATCH_TOKEN: \${{ github\.token }}@DISPATCH_TOKEN: ${{ secrets.app-private-key }}@' recovers_a_failed_pass
+mutate "the recover job may not dispatch" "$CALLEE" \
+  's@^      actions: write$@      actions: read@' recovers_a_failed_pass
+mutate "the window is never read" "$CALLEE" \
+  's@^          APP_RESET: .*@          APP_RESET: ""@' recovers_a_failed_pass
+mutate "the recover-workflow input is ignored" "$CALLEE" \
+  's@^          RECOVER_WORKFLOW: .*@          RECOVER_WORKFLOW: merge-lane-events.yml@' recovers_a_failed_pass
+mutate "a caller example drops the grant" "$DOC" \
+  '0,/^      actions: write$/{/^      actions: write$/d}' documented_callers_grant_the_dispatch
+
+_rc_out="$(recover_cases "$RECOVER")"
+[ "$(printf '%s\n' "$_rc_out" | grep -c '^PASS ')" -eq 6 ] || bad "recover cases: expected 6 PASS lines, got: $(printf '%s' "$_rc_out" | tr '\n' ' ')"
+while IFS= read -r _rc_line; do
+  case "$_rc_line" in
+    PASS\ *) ok ;;
+    FAIL\ *) bad "behavioural merge-lane-recover: ${_rc_line#FAIL }" ;;
+  esac
+done <<<"$_rc_out"
+recover_mutant "the wait has no floor" 's@^RECOVER_MIN_WAIT=60$@RECOVER_MIN_WAIT=0@' recover-floor-then-one-dispatch
+recover_mutant "the window is ignored" 's@^    w=\$((reset - now + 5))$@    :@' recover-waits-for-the-window
+recover_mutant "the wait is uncapped" 's@^RECOVER_MAX_WAIT=900$@RECOVER_MAX_WAIT=99999@' recover-wait-is-capped
+recover_mutant "an unset default branch is not looked up" 's@^  if \[ -z "\$ref" \]; then$@  ref="${ref:-main}"; if false; then@' recover-reads-the-default-branch
+recover_mutant "a refused dispatch ends green" 's@^  if \[ "\$code" != 204 \]; then$@  if false; then@' recover-refusal-is-red
+recover_mutant "any workflow name is posted" 's@^  \[\[ "\$wf" =~ .*@  :@' recover-workflow-name-checked
 
 _rf_out="$(behavioural_refusal_cases)"
 while IFS= read -r _rf_line; do

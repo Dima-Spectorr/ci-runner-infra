@@ -56,6 +56,86 @@ lane_gh_mutates() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# A RATE-LIMITED CALL IS MADE ONCE MORE, WHEN THE WAIT IS SHORT.
+#
+# The merge App's installation budget is shared by every lane in the fleet, so
+# a pass can be refused part-way: `API rate limit exceeded for installation ID
+# ...` (HTTP 403), or a secondary limit (403 or 429). Before this, the first
+# such refusal ended the read with an error, and a pass that needed it failed;
+# every pull request that went green meanwhile then waited for the next
+# trigger. Measured on IntegrateIT 2026-10-10: two passes failed on it within a
+# minute and a green pull request sat for 824s.
+#
+# ONE retry, and only when the window reopens soon. A secondary limit asks for
+# a minute; a primary one reopens at the `reset` the free `rate_limit` read
+# reports, which can be most of an hour away. Waiting longer than
+# LANE_RETRY_MAX_WAIT, or past the pass budget, holds the lock for nothing:
+# the call fails as before, and the workflow's `recover` job dispatches one
+# more pass after the window. A refused call was not carried out, so making a
+# write again is not making it twice.
+#
+# Every call — read or write, recorded or live — goes through here: `gh()` in
+# merge-lane.sh and `lane_gh_record` below. None of them reads stdin.
+LANE_RETRY_MAX_WAIT=90
+
+# <stderr-file> — the seconds to wait before the call is worth making again,
+# or a failure when the error is not a rate limit at all.
+lane_rate_limit_wait() {
+  local err="$1" now reset
+  if grep -q 'HTTP 429' "$err"; then
+    :
+  elif grep -q 'HTTP 403' "$err" && grep -qi 'rate limit' "$err"; then
+    :
+  else
+    return 1
+  fi
+  if grep -qi 'secondary rate limit' "$err"; then
+    printf 60
+    return 0
+  fi
+  now="$(date -u +%s)"
+  reset="$(command gh api rate_limit --jq '.resources.core.reset' 2>/dev/null)" || reset=''
+  if [[ "$reset" =~ ^[0-9]+$ ]] && [ "$reset" -gt "$now" ]; then
+    printf '%s' "$((reset - now + 1))"
+  else
+    # The core bucket is not what refused it — a limit `rate_limit` does not
+    # report. A minute is what GitHub asks for.
+    printf 60
+  fi
+}
+
+# The one sleep the retry makes. A function so the self-test can see it.
+lane_retry_sleep() { command sleep "$1"; }
+
+# `command gh "$@"`, made once more after a short rate-limit wait. The caller
+# receives the output, the error text and the status of the LAST attempt.
+lane_gh_retry() {
+  local d rc=0 wait
+  if ! d="$(mktemp -d "${LANE_TMP:-${TMPDIR:-/tmp}}/retry.XXXXXX" 2>/dev/null)"; then
+    command gh "$@"
+    return
+  fi
+  command gh "$@" >"$d/out" 2>"$d/err" || rc=$?
+  if [ "$rc" -ne 0 ] && wait="$(lane_rate_limit_wait "$d/err")"; then
+    if [ "$wait" -gt "$LANE_RETRY_MAX_WAIT" ]; then
+      echo "lane: rate limited; the window reopens in ${wait}s, past the ${LANE_RETRY_MAX_WAIT}s a call may wait — not retried, the recover job dispatches a pass after it" >&2
+    elif [ -n "${LANE_STARTED:-}" ] && [ -n "${PASS_BUDGET:-}" ] \
+      && [ "$(($(date -u +%s) + wait))" -ge "$((LANE_STARTED + PASS_BUDGET))" ]; then
+      echo "lane: rate limited; a ${wait}s wait would outlast the ${PASS_BUDGET}s pass budget — not retried" >&2
+    else
+      echo "lane: rate limited; making this call once more in ${wait}s" >&2
+      lane_retry_sleep "$wait"
+      rc=0
+      command gh "$@" >"$d/out" 2>"$d/err" || rc=$?
+    fi
+  fi
+  cat "$d/out"
+  cat "$d/err" >&2
+  rm -rf "$d"
+  return "$rc"
+}
+
 # One read, made for real and written down. The caller still receives the
 # output, the error text and the exit status, because the walk needs them to
 # know which read comes next.
@@ -71,7 +151,7 @@ lane_gh_record() {
   fi
   n="$(lane_fetch_count "$LANE_RECORD/seq")"
   printf '%s\n' "$@" >"$LANE_RECORD/$n.args"
-  command gh "$@" >"$LANE_RECORD/$n.out" 2>"$LANE_RECORD/$n.err" || rc=$?
+  lane_gh_retry "$@" >"$LANE_RECORD/$n.out" 2>"$LANE_RECORD/$n.err" || rc=$?
   printf '%s' "$rc" >"$LANE_RECORD/$n.rc"
   # Counted last: a job killed part-way through a read leaves a call that was
   # never counted, so the recording reads as cut short rather than as complete.

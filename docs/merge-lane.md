@@ -295,14 +295,19 @@ jobs:
       cancel-in-progress: false
     # `check-runner-policy.sh` RUNNER7 refuses to decide the runner scope and
     # timeouts of a workflow it cannot read, and this one is in another
-    # repository. The marker records that a human read it — one job,
-    # `timeout-minutes: 15`, `contents: read`, and a `runs-on` YOUR file
+    # repository. The marker records that a human read it — the lane job
+    # (`timeout-minutes: 15`, `contents: read`), the `recover` job
+    # (`timeout-minutes: 20`, `actions: write`), and a `runs-on` YOUR file
     # supplies — and points at the issue where that reading lives. Open one;
     # the gate rejects a marker without an issue number, on purpose.
     # remote-reusable-allowed(Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml, #<issue>): read and recorded there
     uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@d8d1e6d8be794657066a8d32a0327b62172ea299 # v5.77.0
     permissions:
       contents: read
+      # The `recover` job dispatches one more pass after a FAILED one, with
+      # this run's GITHUB_TOKEN. A reusable workflow gets no more than its
+      # caller grants, so without this line that dispatch is a 403.
+      actions: write
     with:
       base: main
       required-checks: |
@@ -445,6 +450,10 @@ jobs:
     uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@d8d1e6d8be794657066a8d32a0327b62172ea299 # v5.77.0
     permissions:
       contents: read
+      # The `recover` job dispatches one more pass after a FAILED one, with
+      # this run's GITHUB_TOKEN. A reusable workflow gets no more than its
+      # caller grants, so without this line that dispatch is a 403.
+      actions: write
     with:
       base: main
       required-checks: |
@@ -1081,6 +1090,55 @@ the run stays green.
 
 `MERGE_LANE_ENABLED` gates the job as it does the fleet audit's: without the
 App secrets there is nothing to read with.
+
+### A failed pass is followed by one more
+
+The watchdog above is fleet-wide and slow by design: fifteen-minute ticks, and
+only after `retry-after`. A pass that FAILS is also followed up inside its own
+run, at once. `merge-lane.yml` has a second job, `recover`, which runs only
+when the `lane` job's result is `failure` and the run was not itself started by
+`workflow_dispatch`:
+
+1. The failed `lane` job reads, for free, when the merge App's quota window
+   reopens (`rate_limit`, `scripts/ci/merge-lane-recover.sh read-reset`).
+2. `recover` waits until then — never less than 60s, never more than 900s.
+3. It dispatches `recover-workflow` (default `merge-lane-events.yml`) on the
+   repository's default branch, ONCE.
+
+Measured on IntegrateIT 2026-10-10: two passes failed on `API rate limit exceeded
+for installation ID ...` within a minute, and a green pull request sat for 824s
+until an unrelated CI completion started another pass.
+
+**The dispatch uses the run's `GITHUB_TOKEN`, not the App.** The App's
+installation budget is what just ran out; `GITHUB_TOKEN` draws on the
+repository's own. A `workflow_dispatch` made with `GITHUB_TOKEN` does start a
+run — it is one of the two documented exceptions to "events from GITHUB_TOKEN
+trigger nothing". It reaches the script as `DISPATCH_TOKEN`, never `GH_TOKEN`,
+so the lane's own steps still cannot act as anything but the App.
+
+**The calling job must grant `actions: write`.** A reusable workflow's jobs get
+at most what the caller's job grants, so both caller examples above carry
+`actions: write` beside `contents: read`. Without it the `recover` job fails
+with a 403 and says so; the lane itself is unaffected.
+
+**One dispatch, never a loop.** The recovery's pass arrives as
+`workflow_dispatch`, and a failed dispatched pass is not recovered again. A pass
+that keeps failing (a revoked key, a removed App) is red on that run and the
+watchdog, after its own cap, reports it. A `cancelled` lane run is not
+recovered either: it is a pending pass evicted by a newer arrival, which reads
+live state.
+
+**The wait holds the caller's lock.** The caller job's `concurrency` group
+covers the whole called workflow, `recover` included, so other passes queue
+behind the wait. That is the point rather than a cost: a pass started before the
+App's window reopens would fail the same way.
+
+**Inside a pass, a rate-limited call is made once more** when the window
+reopens soon: a secondary limit (asks for a minute), or a primary one whose
+reset is under 90s away and inside the pass budget. Every `gh` call goes
+through `lane_gh_retry` in `merge-lane-fetch.sh` — live, recorded and written
+alike; a refused call was not carried out, so making a write again does not make
+it twice. Anything longer fails as before and is left to `recover`.
 
 ### A label applied after the green
 
