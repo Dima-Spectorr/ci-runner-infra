@@ -83,18 +83,49 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --jq) prog="$2"; shift 2 ;;
     --paginate) shift ;;
-    -*) printf 'WRITE %s\n' "$*" >>"$GH_STUB_LOG"; exit 97 ;;
+    # A write is logged and refused. With GH_STUB_RATE_LIMIT_WRITES it is
+    # refused the way a drained installation quota refuses it, to show the
+    # retry does not repeat it.
+    -*)
+      printf 'WRITE %s\n' "$*" >>"$GH_STUB_LOG"
+      if [ -n "${GH_STUB_RATE_LIMIT_WRITES:-}" ]; then
+        printf 'gh: You have exceeded a secondary rate limit. (HTTP 403)\n' >&2
+        exit 1
+      fi
+      exit 97
+      ;;
     *) url="$1"; shift ;;
   esac
 done
 case "$url" in
-  rate_limit) echo '5000 4990 10 1900000000'; exit 0 ;;
+  rate_limit)
+    # The retry asks for the core window's reset alone; everything else asks
+    # for the whole line.
+    if [ "$prog" = .resources.core.reset ]; then echo "${GH_STUB_RESET:-1}"; else echo '5000 4990 10 1900000000'; fi
+    exit 0
+    ;;
 esac
 printf '%s\n' "$url" >>"$GH_STUB_LOG"
 # The one read that moves the clock, for the pass that runs out of time: see
 # the clock below.
 if [ -n "${GH_STUB_TRIP_ON:-}" ] && [ "${url%%\?*}" = "$GH_STUB_TRIP_ON" ]; then : >"$CLOCK_TRIPPED"; fi
 case "$url" in
+  # Rate-limited on the first call, answered on the second: the three shapes
+  # GitHub refuses with.
+  limit/* | secondary/* | toomany/*)
+    k="retry_$(printf '%s' "$url" | tr -c 'A-Za-z0-9' '_')"
+    printf . >>"$GH_STUB_STATE/$k"
+    seen="$(cat "$GH_STUB_STATE/$k")"
+    if [ "${#seen}" -ge 2 ]; then printf 'out:%s\n' "$url"; exit 0; fi
+    case "$url" in
+      limit/*) printf 'gh: API rate limit exceeded for installation ID 1. (HTTP 403)\n' >&2 ;;
+      secondary/*) printf 'gh: You have exceeded a secondary rate limit. (HTTP 403)\n' >&2 ;;
+      *) printf 'gh: Too Many Requests (HTTP 429)\n' >&2 ;;
+    esac
+    exit 1
+    ;;
+  forbidden/*) printf 'gh: Resource not accessible by integration (HTTP 403)\n' >&2; exit 1 ;;
+  stuck/*) printf 'gh: You have exceeded a secondary rate limit. (HTTP 403)\n' >&2; exit 1 ;;
   ok/*) printf 'out:%s\n' "$url"; exit 0 ;;
   fail/*)
     printf '{"message":"boom %s"}\n' "$url"
@@ -728,6 +759,92 @@ cases_wait() {
   say wait-unreadable-changes-nothing $?
 }
 
+# A rate-limited call is made ONCE more, after the wait GitHub asks for, and
+# only when that wait fits under the cap and inside the pass budget. Anything
+# else — a refusal that is not a rate limit, a window far off — is the caller's
+# answer at once; the `recover` job dispatches a pass after a long window.
+# SC2034: the LANE_* globals are read by the sourced fetch file. SC2317: the
+# sleep stub is called by lane_gh_retry. SC2181: each case asserts on the exit
+# code of a call whose output and stderr it also inspects.
+# shellcheck disable=SC2034,SC2317,SC2181
+cases_retry() { # <fetch-file>
+  (
+    # shellcheck source=/dev/null
+    source "$1"
+    d="$(mktemp -d "$WORK/retry.XXXXXX")"
+    LANE_TMP="$d" LANE_RECORD='' LANE_REPLAY=''
+    unset LANE_STARTED PASS_BUDGET GH_STUB_RESET
+    # Every mutant runs this group again: each URL must be refused afresh.
+    rm -f "$GH_STUB_STATE"/retry_*
+    # Not `$d`: the retry has a local `d` of its own, and bash scoping is dynamic.
+    slept_file="$d/slept"
+    lane_retry_sleep() { echo "$1" >>"$slept_file"; }
+    fresh() { rm -f "$d/slept" "$d/err"; : >"$GH_STUB_LOG"; }
+    slept() { cat "$d/slept" 2>/dev/null; }
+    calls() { grep -cx "$1" "$GH_STUB_LOG"; }
+    now="$(date -u +%s)"
+
+    fresh
+    out="$(lane_gh_retry api secondary/a 2>"$d/err")"
+    [ $? -eq 0 ] && [ "$out" = 'out:secondary/a' ] && [ "$(slept)" = 60 ] && [ "$(calls secondary/a)" -eq 2 ]
+    say retry-secondary-once-after-a-minute $?
+
+    fresh
+    out="$(lane_gh_retry api toomany/a 2>"$d/err")"
+    [ $? -eq 0 ] && [ "$out" = 'out:toomany/a' ] && [ "$(slept)" = 60 ]
+    say retry-429 $?
+
+    # The clock is read again here: earlier cases take seconds on a slow shell.
+    fresh
+    now="$(date -u +%s)"
+    out="$(GH_STUB_RESET=$((now + 30)) lane_gh_retry api limit/a 2>"$d/err")"
+    rc=$?
+    w="$(slept)"
+    [ "$rc" -eq 0 ] && [ "$out" = 'out:limit/a' ] && [ "${w:-0}" -ge 25 ] && [ "${w:-0}" -le 31 ]
+    say retry-primary-waits-for-the-reset $?
+
+    fresh
+    GH_STUB_RESET=$((now + 600)) lane_gh_retry api limit/b >/dev/null 2>"$d/err"
+    [ $? -ne 0 ] && [ -z "$(slept)" ] && [ "$(calls limit/b)" -eq 1 ] && grep -q 'not retried' "$d/err"
+    say retry-not-past-the-cap $?
+
+    fresh
+    lane_gh_retry api forbidden/a >/dev/null 2>"$d/err"
+    [ $? -ne 0 ] && [ -z "$(slept)" ] && [ "$(calls forbidden/a)" -eq 1 ] && grep -q 'HTTP 403' "$d/err"
+    say retry-only-a-rate-limit $?
+
+    fresh
+    (LANE_STARTED="$now" PASS_BUDGET=30 lane_gh_retry api secondary/b >/dev/null 2>"$d/err")
+    [ $? -ne 0 ] && [ -z "$(slept)" ] && [ "$(calls secondary/b)" -eq 1 ] && grep -q 'pass budget' "$d/err"
+    say retry-within-the-pass-budget $?
+
+    fresh
+    lane_gh_retry api stuck/a >/dev/null 2>"$d/err"
+    [ $? -ne 0 ] && [ "$(slept)" = 60 ] && [ "$(calls stuck/a)" -eq 2 ]
+    say retry-only-once $?
+
+    # A WRITE is never made twice: after the wait the lane's verdict (reviews,
+    # labels, the base) may be stale, and a second `PUT pulls/N/merge` would act
+    # on it. One attempt, no sleep, the refusal handed back.
+    fresh
+    GH_STUB_RATE_LIMIT_WRITES=1 lane_gh_retry api -X PUT repos/o/r/pulls/1/merge >/dev/null 2>"$d/err"
+    [ $? -ne 0 ] && [ -z "$(slept)" ] && [ "$(grep -c '^WRITE ' "$GH_STUB_LOG")" -eq 1 ] \
+      && [ "$(grep -c 'a write is never repeated' "$d/err")" -eq 1 ]
+    say retry-never-repeats-a-write $?
+
+    # The recording holds the answer the retry got, so a replaying job sees the
+    # read succeed exactly as the recording job did.
+    fresh
+    lane_fetch_claim "$d/r"
+    out="$(lane_gh_record api secondary/c 2>/dev/null)"
+    rc=$?
+    lane_fetch_seal
+    [ "$rc" -eq 0 ] && [ "$out" = 'out:secondary/c' ] && [ "$(cat "$d/r/0.rc")" = 0 ] \
+      && [ "$(cat "$d/r/0.out")" = 'out:secondary/c' ]
+    say retry-recorded-as-answered $?
+  )
+}
+
 # ---------------------------------------------------------------------------
 # Running them.
 # ---------------------------------------------------------------------------
@@ -774,6 +891,26 @@ tally_lines "$(cases_core "$FETCH" 2>&1)" 22 core
 tally_lines "$(cases_spawn "$FETCH" 2>&1)" 7 spawn
 tally_lines "$(cases_kill "$FETCH" 2>&1)" 2 kill
 tally_lines "$(cases_shell "$FETCH" 2>&1)" 2 shell
+tally_lines "$(cases_retry "$FETCH" 2>&1)" 9 retry
+
+mutant "a call waits however long the window is" cases_retry "$FETCH" \
+  's|^LANE_RETRY_MAX_WAIT=90$|LANE_RETRY_MAX_WAIT=99999|' retry-not-past-the-cap
+mutant "a secondary limit is retried at once" cases_retry "$FETCH" \
+  '/secondary rate limit/,/return 0/s|printf 60|printf 0|' retry-secondary-once-after-a-minute
+mutant "a primary limit ignores the reset" cases_retry "$FETCH" \
+  's|^    printf .%s. "\$((reset - now + 1))"$|    printf 60|' retry-primary-waits-for-the-reset
+mutant "every 403 is retried" cases_retry "$FETCH" \
+  "s|grep -q 'HTTP 403' \"\\\$err\" && grep -qi 'rate limit' \"\\\$err\"|grep -q 'HTTP 403' \"\$err\"|" retry-only-a-rate-limit
+mutant "a 429 is not retried" cases_retry "$FETCH" \
+  "s|if grep -q 'HTTP 429' \"\\\$err\"; then|if false; then|" retry-429
+mutant "a retry may outlast the pass budget" cases_retry "$FETCH" \
+  's|^    elif \[ -n "\${LANE_STARTED:-}" \] && \[ -n "\${PASS_BUDGET:-}" \] \\$|    elif false \\|' retry-within-the-pass-budget
+mutant "a retried call is made twice more" cases_retry "$FETCH" \
+  's|^      rc=0$|      rc=0; command gh "$@" >/dev/null 2>\&1|' retry-only-once
+mutant "a refused write is made once more after the wait" cases_retry "$FETCH" \
+  's|^    if lane_gh_mutates "\$@"; then$|    if false; then|' retry-never-repeats-a-write
+mutant "the recording bypasses the retry" cases_retry "$FETCH" \
+  's|^  lane_gh_retry "\$@" >"\$LANE_RECORD/\$n\.out"|  command gh "$@" >"$LANE_RECORD/$n.out"|' retry-recorded-as-answered
 
 mutant "a replayed read loses its output" cases_core "$FETCH" \
   's|^  cat "\$LANE_REPLAY/\$m\.out"$|  :|' replay-stdout

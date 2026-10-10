@@ -504,6 +504,19 @@ on:
         required: false
         default: false
         type: boolean
+      recover-workflow:
+        description: >-
+          The workflow file the `recover` job dispatches, once, after a lane
+          pass FAILS — on the default branch, after the merge App's quota
+          window reopens (at least 60s, at most 900s). It must call this
+          workflow and accept `workflow_dispatch` with a string input named
+          `recovered` (the dispatch marks its pass with it; GitHub refuses an
+          undeclared input). The calling job must grant
+          `actions: write` (and `contents: read`) for the dispatch to be
+          allowed.
+        required: false
+        default: merge-lane-events.yml
+        type: string
     secrets:
       app-id:
         description: App ID of the merge App.
@@ -551,6 +564,11 @@ jobs:
       # out the default branch. Merging with it would trigger no downstream
       # workflow, which is the failure this whole design turns on.
       contents: read
+
+    # When the merge App's quota window reopens, read by the last step only
+    # when the pass FAILED. The `recover` job waits for it.
+    outputs:
+      app-reset: ${{ steps.quota.outputs.reset }}
 
     steps:
       # THE IMPLEMENTATION REPOSITORY, NOT THE CALLER'S.
@@ -623,3 +641,76 @@ jobs:
           STATUS_ISSUE: ${{ inputs.status-issue }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: bash scripts/ci/merge-lane.sh
+
+      # Only on a failed pass, and only once the token exists: `rate_limit` is
+      # free, and it is the one fact the `recover` job cannot read itself — it
+      # holds the repository's token, not the App's.
+      - name: Read when the merge App's quota window reopens
+        id: quota
+        if: ${{ failure() && steps.token.outputs.token != '' }}
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: bash scripts/ci/merge-lane-recover.sh read-reset
+
+  # A FAILED PASS IS FOLLOWED BY ONE MORE, AFTER THE APP'S WINDOW REOPENS.
+  #
+  # Without it, every pull request that went green during a failed pass waits
+  # for the next CI completion anywhere in the repository, or the consumer's
+  # daily backstop. The usual failure is the merge App's installation quota,
+  # which the whole fleet shares; `scripts/ci/merge-lane-recover.sh` holds the
+  # measurement and the argument.
+  #
+  # Only `failure`: a `cancelled` lane run is a pending pass evicted from the
+  # `merge-lane-<base>` group by a newer arrival, which reads live state, so
+  # nothing is stranded. And never after a pass that was itself DISPATCHED —
+  # the recovery's own pass included — so a pass that keeps failing (a revoked
+  # key) cannot become a dispatch loop.
+  #
+  # The loop guard is three conditions, because `github` here is the CALLER's context:
+  # the event name (a dispatched pass), `github.event.inputs.recovered` (the marker
+  # the dispatch sets, for a pass reached some other way), and
+  # `github.event.workflow_run.event` (a recover-workflow that is a CI workflow
+  # re-triggers the lane by `workflow_run`, whose payload names the event of the
+  # run that completed). And never for a pull_request_target event from a FORK:
+  # an outside contributor can toggle draft/ready on their own pull request to
+  # start lane runs, and a failing one would hold the repo-wide merge-lane group
+  # for the wait. A deleted fork reads as a fork (null != this repository), so
+  # that arm fails closed.
+  #
+  # The dispatch uses the run's GITHUB_TOKEN, not the App: the App's budget is
+  # what just ran out, and GITHUB_TOKEN draws on the repository's own. That is
+  # the one write this token makes, so it arrives as DISPATCH_TOKEN and never as
+  # GH_TOKEN, and the job holds `actions: write` and nothing else that writes.
+  # A caller must grant `actions: write` to the job that calls this workflow,
+  # or the dispatch is refused with a 403 the log names.
+  #
+  # Outside this file's `merge-lane-<base>` group, but inside the CALLER job's
+  # concurrency group, which covers the whole called workflow: other passes
+  # queue behind the wait. That is intended — a pass started before the App's
+  # window reopens would fail the same way.
+  recover:
+    name: Recover a failed lane pass
+    needs: [lane]
+    if: ${{ always() && needs.lane.result == 'failure' && github.event_name != 'workflow_dispatch' && github.event.inputs.recovered != 'true' && github.event.workflow_run.event != 'workflow_dispatch' && !(github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository) }}
+    # dynamic-runner-allowed(recover, #402): the same caller-scoped label as the lane job
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    # The wait is capped at 900s; the rest is the checkout and one POST.
+    timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check out the lane's implementation
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ inputs.implementation-repository }}
+          ref: ${{ inputs.implementation-ref || github.job_workflow_sha }}
+          persist-credentials: false
+
+      - name: Wait for the App's window, then dispatch one more pass
+        env:
+          DISPATCH_TOKEN: ${{ github.token }}
+          RECOVER_WORKFLOW: ${{ inputs.recover-workflow }}
+          APP_RESET: ${{ needs.lane.outputs.app-reset }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash scripts/ci/merge-lane-recover.sh dispatch

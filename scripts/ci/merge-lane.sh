@@ -119,7 +119,7 @@ gh() {
       return
     fi
   fi
-  command gh "$@"
+  lane_gh_retry "$@"
 }
 lane_calls() { wc -c <"$LANE_CALLS" | tr -d '[:space:]'; }
 
