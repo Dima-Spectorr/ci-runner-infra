@@ -54,7 +54,16 @@ on:
   schedule:
     - cron: '*/15 * * * *'
 
+  # Also the target of the callee's `recover` job, which dispatches THIS file
+  # (not the events file other repositories have) once after a failed pass,
+  # marked `recovered: "true"`. GitHub refuses (422) an undeclared input.
   workflow_dispatch:
+    inputs:
+      recovered:
+        description: Set by the lane's recover job on the one pass it dispatches
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -110,10 +119,16 @@ jobs:
       group: merge-lane
       cancel-in-progress: false
     uses: ./.github/workflows/merge-lane.yml
+    # `actions: write` is for the callee's `recover` job. A called workflow
+    # asking for more than its caller grants is a startup_failure of the WHOLE
+    # run, not of that one job: measured 2026-10-10, every pass from #1523's
+    # merge onward refused to start, and nothing merged.
     permissions:
       contents: read
+      actions: write
     with:
       base: main
+      recover-workflow: merge-lane-self.yml
       # The three CI jobs, named exactly as they appear on a pull request, and
       # exactly the three that `.mergify.yml` named in its anchored condition
       # list before it was deleted. All three run on every pull request with no
