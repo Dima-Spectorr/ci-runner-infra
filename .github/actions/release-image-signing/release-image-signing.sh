@@ -149,17 +149,43 @@ load_refs() {
 
 # A key the verify pass trusts must be one the repository COMMITTED: a file
 # the release workflow generated or downloaded at run time would let the run
-# vouch for itself. And it must be the algorithm the platform provisions
-# (EC_SIGN_P256_SHA256), so a wrong file fails here, by name, not at verify.
+# vouch for itself. Being TRACKED is not enough — an earlier step of the
+# release job can overwrite a tracked file in the working tree — so the key
+# must also be unchanged from HEAD, and the verify pass reads the COMMITTED
+# content (`git show HEAD:<path>`), never the working-tree file. And it must be
+# the algorithm the platform provisions (EC_SIGN_P256_SHA256), so a wrong file
+# fails here, by name, not at verify.
+
+# Prints the repository-root path of a tracked file, for `git show HEAD:<path>`.
+committed_path() { git ls-files --full-name --error-unmatch -- "$1" 2>/dev/null; }
+
 check_one_key() { # <input name> <path>
-  local name="$1" pem="$2"
+  local name="$1" pem="$2" rel
   [[ $pem != *$'\n'* ]] || die "$name contains a newline."
   [ -f "$pem" ] || die "$name '$pem' does not exist — commit the product's public key and point this input at it."
-  git ls-files --error-unmatch -- "$pem" >/dev/null 2>&1 \
+  rel="$(committed_path "$pem")" \
     || die "$name '$pem' is not tracked by git. The key every attestation is checked against must be the one committed to the repository."
+  git cat-file -e "HEAD:$rel" 2>/dev/null \
+    || die "$name '$pem' is tracked but not in the checked-out commit (HEAD). The key must be COMMITTED, not only staged."
+  git diff --quiet HEAD -- "$pem" 2>/dev/null \
+    || die "$name '$pem' differs from its committed content at HEAD — a step before this one changed the file. Only the committed key is trusted; do not modify it during the release job."
   command -v openssl >/dev/null 2>&1 || die "openssl is not on PATH — the key and every signature are checked with it."
-  openssl pkey -pubin -in "$pem" -noout -text 2>/dev/null | grep -c 'prime256v1' >/dev/null \
+  git show "HEAD:$rel" 2>/dev/null | openssl pkey -pubin -noout -text 2>/dev/null | grep -c 'prime256v1' >/dev/null \
     || die "$name '$pem' is not an EC P-256 public key. Release signing keys are EC_SIGN_P256_SHA256."
+}
+
+# Writes the COMMITTED content of every trusted key into DIR and fills
+# VERIFY_KEYS with those copies. The verify pass uses only these.
+materialize_keys() { # <dir>
+  VERIFY_KEYS=()
+  local pem rel n=0
+  for pem in "$RIS_PUBLIC_KEY_PEM" ${RIS_PUBLIC_KEY_PEM_PREVIOUS:+"$RIS_PUBLIC_KEY_PEM_PREVIOUS"}; do
+    rel="$(committed_path "$pem")" || die "'$pem' is no longer tracked by git."
+    git show "HEAD:$rel" > "$1/committed-$n.pem" 2>/dev/null \
+      || die "could not read the committed content of '$pem' at HEAD."
+    VERIFY_KEYS+=("$1/committed-$n.pem")
+    n=$((n + 1))
+  done
 }
 
 check_keys() {
@@ -328,7 +354,8 @@ do_sign() {
     fi
   done
 
-  echo "── verifying against $(basename "$RIS_PUBLIC_KEY_PEM")"
+  materialize_keys "$work"
+  echo "── verifying against $(basename "$RIS_PUBLIC_KEY_PEM") as committed at HEAD"
   for ref in "${REFS[@]}"; do
     digest="${ref##*@}"
     rm -rf "$work/sig" && mkdir -p "$work/sig"
@@ -356,7 +383,7 @@ do_sign() {
     ok=""
     i=0
     while [ -z "$ok" ] && [ "$i" -lt "$count" ]; do
-      for key in "$RIS_PUBLIC_KEY_PEM" ${RIS_PUBLIC_KEY_PEM_PREVIOUS:+"$RIS_PUBLIC_KEY_PEM_PREVIOUS"}; do
+      for key in "${VERIFY_KEYS[@]}"; do
         if openssl dgst -sha256 -verify "$key" -signature "$work/sig/$i.sig" "$work/sig/$i.payload" >/dev/null 2>&1; then
           ok=1
           break

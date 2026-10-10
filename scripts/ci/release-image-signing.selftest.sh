@@ -12,6 +12,7 @@
 #   - `attestations list` itself fails:                                FAIL
 #   - required and an input missing, or no access token at sign:       FAIL
 #   - a key that is untracked by git, or not EC P-256:                 FAIL
+#   - a tracked key edited in the working tree, or staged not committed: FAIL
 #   - a newline in a value, a malformed attestor name or project:      FAIL
 #   - not required and unconfigured: a notice, armed=false, and gcloud never runs
 #   - the token reaches gcloud only as a 0600 file, never as RIS_ACCESS_TOKEN,
@@ -53,12 +54,25 @@ openssl ec -in "$T/keys/b.key" -pubout -out "$REPO/keys/b.pub.pem" 2>/dev/null
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$T/keys/rsa.key" 2>/dev/null
 openssl pkey -in "$T/keys/rsa.key" -pubout -out "$REPO/keys/rsa.pub.pem" 2>/dev/null
 cp "$REPO/keys/a.pub.pem" "$REPO/keys/untracked.pub.pem"
-for k in a b rsa untracked; do
+cp "$REPO/keys/a.pub.pem" "$REPO/keys/edited.pub.pem"
+for k in a b rsa untracked edited; do
   [ -s "$REPO/keys/$k.pub.pem" ] || { echo "  FAIL  could not generate test key $k"; exit 1; }
 done
-git -C "$REPO" add keys/a.pub.pem keys/b.pub.pem keys/rsa.pub.pem
+git -C "$REPO" add keys/a.pub.pem keys/b.pub.pem keys/rsa.pub.pem keys/edited.pub.pem
+# The script verifies against the COMMITTED content (HEAD), so the fixtures are
+# committed, not only staged.
+git -C "$REPO" -c user.name=selftest -c user.email=selftest@example.test -c commit.gpgsign=false \
+  commit -q -m "test keys" || { echo "  FAIL  could not commit the test keys"; exit 1; }
 git -C "$REPO" ls-files --error-unmatch -- keys/untracked.pub.pem >/dev/null 2>&1 \
   && { echo "  FAIL  the untracked fixture key is tracked — the case below would prove nothing"; exit 1; }
+# A tracked, committed key that an earlier release step overwrote in the working
+# tree — with another VALID EC P-256 key, so only the HEAD comparison can catch it.
+cp "$REPO/keys/b.pub.pem" "$REPO/keys/edited.pub.pem"
+git -C "$REPO" diff --quiet HEAD -- keys/edited.pub.pem \
+  && { echo "  FAIL  the edited fixture key matches HEAD — the case below would prove nothing"; exit 1; }
+# Tracked (staged) but never committed: not a committed key.
+cp "$REPO/keys/a.pub.pem" "$REPO/keys/staged.pub.pem"
+git -C "$REPO" add keys/staged.pub.pem
 
 D1="sha256:$(printf 'one' | openssl dgst -sha256 -r | cut -c1-64)"
 D2="sha256:$(printf 'two' | openssl dgst -sha256 -r | cut -c1-64)"
@@ -197,6 +211,19 @@ expect_fail "a key file git does not track: fails" "not tracked by git"
 run untracked-previous-pem decide RIS_PUBLIC_KEY_PEM_PREVIOUS="keys/untracked.pub.pem"
 expect_fail "an untracked previous key: fails" "previous-public-key-pem"
 
+run edited-pem decide RIS_PUBLIC_KEY_PEM="keys/edited.pub.pem"
+expect_fail "a tracked key edited in the working tree: fails" "differs from its committed content"
+
+run edited-pem-sign sign RIS_PUBLIC_KEY_PEM="keys/edited.pub.pem" STUB_KEY="$T/keys/b.key"
+expect_fail "sign with a tracked key edited to match the signer: fails before gcloud" "differs from its committed content"
+check "  ...gcloud never ran" is_empty "$LOG"
+
+run edited-previous-pem decide RIS_PUBLIC_KEY_PEM_PREVIOUS="keys/edited.pub.pem"
+expect_fail "an edited previous key: fails" "previous-public-key-pem"
+
+run staged-pem decide RIS_PUBLIC_KEY_PEM="keys/staged.pub.pem"
+expect_fail "a key staged but never committed: fails" "not in the checked-out commit"
+
 run rsa-pem decide RIS_PUBLIC_KEY_PEM="keys/rsa.pub.pem"
 expect_fail "an RSA key instead of EC P-256: fails" "not an EC P-256 public key"
 
@@ -323,6 +350,7 @@ check "action.yml splices no expression into any run: body" lacks "$(run_bodies 
 check "auth and sign are both gated on decide" count_is "$ACTION_TEXT" "if: steps.decide.outputs.armed == 'true'" 2
 check "auth action pinned by sha" has "$(grep -E 'uses: google-github-actions/auth@[0-9a-f]{40} # v' "$A")" "google-github-actions/auth@"
 check "auth mints an access token only" has "$ACTION_TEXT" "token_format: access_token"
+check "auth token lives ten minutes, not the default hour" has "$ACTION_TEXT" "access_token_lifetime: 600s"
 check "auth writes no credentials file" has "$ACTION_TEXT" "create_credentials_file: false"
 check "auth exports no GOOGLE_*/CLOUDSDK_* variables" has "$ACTION_TEXT" "export_environment_variables: false"
 check "the token output is referenced exactly once (the sign step's env)" count_is "$ACTION_TEXT" "steps.auth.outputs.access_token" 1

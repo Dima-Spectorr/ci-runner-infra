@@ -19,7 +19,8 @@
 # THE CALLER'S JOB needs `permissions: id-token: write`, `gcloud` with the
 # `beta` component, `python3` and `openssl` on PATH (all present on
 # GitHub-hosted Ubuntu runners and the full cloud-sdk image), and the committed
-# public key PEM checked out and committed (git-tracked).
+# public key PEM checked out and committed (git-tracked and unchanged from
+# HEAD; the verify pass reads the committed content, not the working tree).
 #
 # The signer's credential does NOT outlive this action. The auth step mints a
 # short-lived access token only — no credentials file, no exported GOOGLE_* or
@@ -124,6 +125,10 @@ runs:
         workload_identity_provider: ${{ inputs.wif-provider }}
         service_account: ${{ inputs.signer-sa }}
         token_format: access_token
+        # Ten minutes, not the default hour: signing and verifying a release's
+        # digests takes well under that, and a token that leaked would expire
+        # with the step instead of an hour later.
+        access_token_lifetime: 600s
         create_credentials_file: false
         export_environment_variables: false
 
