@@ -6,6 +6,13 @@
 > the caller's job ran as the release signer, and it did not require the
 > verifying key to be committed. v5.114.0 is the first release to carry the
 > fixes below. A pin to v5.113.0's commit must move.
+>
+> **v5.114.0 and later are fine to adopt; v5.115.0 is recommended.** v5.115.0
+> adds two hardenings from the security re-review, neither of which a caller
+> has to react to: the verify pass now checks against the key's COMMITTED
+> content (`git show HEAD:<path>`) and refuses a key that a step before the
+> action changed in the working tree, and the signer's access token lives ten
+> minutes (`access_token_lifetime: 600s`) instead of the default hour.
 
 `.github/actions/release-image-signing/` is the one step every Specaria
 product's release workflow calls to sign its released image digests and prove
@@ -73,10 +80,11 @@ digest verified).
    Partially configured and not required: a `::warning::`, `armed=false`.
    Required and anything missing: the step FAILS. Configured: every input is
    shape-checked, every ref must be digest-pinned (a tag is refused), and each
-   PEM must exist, be tracked by git and be an EC P-256 key — all before a
-   credential is minted.
+   PEM must exist, be committed at HEAD, be unchanged in the working tree and
+   be an EC P-256 key — all before a credential is minted.
 2. **Authenticate** with `google-github-actions/auth` (pinned by commit) as
-   the signer through the provider, minting a short-lived access token only.
+   the signer through the provider, minting an access token only, valid for
+   ten minutes (`access_token_lifetime: 600s`).
    The caller's job needs `permissions: id-token: write`.
 3. **Sign.** `gcloud beta container binauthz attestations sign-and-create`
    per digest, with `--project` explicit and billed to the attestor's project.
@@ -84,7 +92,7 @@ digest verified).
    counts.
 4. **Verify.** Read every attestation back and check, with `openssl`, that a
    signature over a payload naming THAT digest verifies against the committed
-   PEM. A missing attestation, a failed `attestations list`, a wrong key
+   PEM — read from HEAD with `git show`, never from the working tree. A missing attestation, a failed `attestations list`, a wrong key
    (including an attestation that already existed, signed by another key) or a
    payload naming another digest fails the step, so `publish` never names an
    unverified digest.
@@ -98,7 +106,8 @@ The signer's credential does not outlive the action, and no other step of the
 caller's job ever holds it.
 
 - The auth step runs with `token_format: access_token`,
-  `create_credentials_file: false` and `export_environment_variables: false`.
+  `access_token_lifetime: 600s`, `create_credentials_file: false` and
+  `export_environment_variables: false`.
   So there is **no `gha-creds-*.json` credentials file** in the workspace, and
   **no `GOOGLE_*` or `CLOUDSDK_*` variable** is written to `GITHUB_ENV`.
 - The token output is referenced ONCE, in the sign step's `env:`. The script
@@ -116,7 +125,11 @@ caller's job ever holds it.
   key (an RSA key, for example) by name, before it signs anything.
 - The public key PEM must be **committed: tracked by git** in the caller's
   repository. A file the release run generated or downloaded would let the run
-  vouch for itself, so an untracked PEM fails the step.
+  vouch for itself, so an untracked PEM fails the step. Tracked is not
+  enough: an earlier step of the release job could overwrite the file, so the
+  PEM must also be in HEAD and unchanged from it (`git diff --quiet HEAD`),
+  and the verify pass checks signatures against `git show HEAD:<path>`, never
+  the working-tree file.
 - **Rotation.** Commit the new key, point `public-key-pem` at it and
   `previous-public-key-pem` at the old one for the overlap window only. Once
   every release that customers may still admit is signed by the new key,
@@ -159,18 +172,19 @@ jobs:
 ## Pinning, versioning and upgrading
 
 The action is versioned with this repository. **Adopt it at `v5.114.0` or
-later; never at `v5.113.0`** (see the note at the top). Pin it the way the
+later (`v5.115.0` recommended); never at `v5.113.0`** (see the note at the
+top). Pin it the way the
 merge lane is pinned (`docs/merge-lane.md`): to the **commit** of a release
 tag, with the tag as a comment, because `check-action-pins.sh` (PIN1/PIN2)
 rejects a tag and requires the comment. Release tags are annotated, so
 dereference the tag object to its commit:
 
 ```bash
-TAG_OBJ=$(gh api repos/Dima-Spectorr/ci-runner-infra/git/ref/tags/v5.114.0 --jq .object.sha)
+TAG_OBJ=$(gh api repos/Dima-Spectorr/ci-runner-infra/git/ref/tags/v5.115.0 --jq .object.sha)
 gh api "repos/Dima-Spectorr/ci-runner-infra/git/tags/$TAG_OBJ" --jq .object.sha
 ```
 
-then write `uses: <that path>@<40-char commit> # v5.114.0` on the step.
+then write `uses: <that path>@<40-char commit> # v5.115.0` on the step.
 
 **Upgrading** is moving that pin. Dependabot's `github-actions` ecosystem
 rewrites the sha and the comment together; review the diff of
@@ -191,12 +205,14 @@ EC P-256 keys, so the verify pass does real `openssl` checks:
 - fails: a wrong key; an `ALREADY_EXISTS` attestation signed by the wrong key;
   a payload naming another digest; a missing attestation; `attestations list`
   exiting 1; a `sign-and-create` error; a missing input when required; a
-  missing access token; an untracked PEM; an RSA PEM; a newline in a value; a
+  missing access token; an untracked PEM; a tracked PEM edited in the
+  working tree (current or previous key); a PEM staged but never committed;
+  an RSA PEM; a newline in a value; a
   malformed attestor name or project.
 - the token reaches `gcloud` only as a `0600` file, never as an environment
   variable, and the file is gone after the step.
 - the action wiring: no `${{ }}` in any `run:` body (a fixture proves the scan
-  catches one inside a `run: |` block), the three auth settings above, and the
+  catches one inside a `run: |` block), the four auth settings above, and the
   token output referenced exactly once.
 
 Unconfigured and not required is a notice with no `gcloud` call.
